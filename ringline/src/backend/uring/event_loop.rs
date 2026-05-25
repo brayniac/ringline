@@ -723,6 +723,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             let errno = -result;
             if errno == libc::ENOBUFS {
                 metrics::POOL.increment(metrics::pool::BUFFER_RING_EMPTY);
+                crate::backend::uring::driver::rf_stats::enobufs();
                 if !has_more && self.driver.ring.submit_multishot_recv(conn_index).is_err() {
                     metrics::RING.increment(metrics::ring::RECV_ARM_FAILURES);
                     self.executor.wake_recv(conn_index);
@@ -844,6 +845,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 len: bytes_received,
                 ptr: buf_ptr,
             });
+            crate::backend::uring::driver::rf_stats::recv_buf();
             self.executor.wake_recv(conn_index);
         } else {
             // Plaintext path: route through recv sink if active, else zero-copy/accumulator.

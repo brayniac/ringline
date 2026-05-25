@@ -1021,6 +1021,7 @@ impl ConnCtx {
                     for _ in 0..n {
                         driver.recv_hold[conn_index as usize].pop_front();
                     }
+                    crate::backend::uring::driver::rf_stats::forward(n);
                     driver.send_queues[conn_index as usize].in_flight = true;
                     executor.owner_task[conn_index as usize] =
                         Some(CURRENT_TASK_ID.with(|c| c.get()));

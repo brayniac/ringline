@@ -20,6 +20,88 @@ use crate::config::Config;
 use crate::connection::{ConnectionTable, RecvMode};
 use crate::handler::{BuiltSend, ConnSendState, DriverCtx};
 
+/// TEMPORARY diagnostic: recv-forward backpressure churn + forward batch size.
+///
+/// Gated on `RINGLINE_RF_STATS` (=output file path). A daemon thread appends one
+/// line of per-second deltas to that file (survives SIGKILL). Confirms the
+/// real-network CPU-regression hypothesis: high `enobufs/s` (provided-buffer
+/// ring depleting because held bids aren't replenished until the ms-RTT forward
+/// completes) and a small `avg_batch` (few buffers per scatter-gather sendmsg).
+pub(crate) mod rf_stats {
+    use std::io::Write;
+    use std::sync::Once;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    pub static RECV_BUFS: AtomicU64 = AtomicU64::new(0); // recv CQEs pushed to the hold
+    pub static ENOBUFS: AtomicU64 = AtomicU64::new(0); // ENOBUFS recv completions (ring empty)
+    pub static FORWARDS: AtomicU64 = AtomicU64::new(0); // forward_held sendmsg submissions
+    pub static FWD_BUFS: AtomicU64 = AtomicU64::new(0); // buffers gathered across all forwards
+
+    static ENABLED: AtomicBool = AtomicBool::new(false);
+    static INIT: Once = Once::new();
+
+    fn enabled() -> bool {
+        INIT.call_once(|| {
+            if let Some(path) = std::env::var_os("RINGLINE_RF_STATS") {
+                ENABLED.store(true, Ordering::Relaxed);
+                std::thread::spawn(move || reporter(path));
+            }
+        });
+        ENABLED.load(Ordering::Relaxed)
+    }
+
+    fn reporter(path: std::ffi::OsString) {
+        let mut f = match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        let (mut lb, mut le, mut lf, mut lfb) = (0u64, 0u64, 0u64, 0u64);
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            let b = RECV_BUFS.load(Ordering::Relaxed);
+            let e = ENOBUFS.load(Ordering::Relaxed);
+            let fw = FORWARDS.load(Ordering::Relaxed);
+            let fb = FWD_BUFS.load(Ordering::Relaxed);
+            let (db, de, dfw, dfb) = (b - lb, e - le, fw - lf, fb - lfb);
+            lb = b;
+            le = e;
+            lf = fw;
+            lfb = fb;
+            let batch = if dfw > 0 { dfb as f64 / dfw as f64 } else { 0.0 };
+            let _ = writeln!(
+                f,
+                "[rf-stats] recv_bufs={db}/s enobufs={de}/s forwards={dfw}/s avg_batch={batch:.2} \
+                 (cum bufs={b} enobufs={e} fwd={fw})"
+            );
+            let _ = f.flush();
+        }
+    }
+
+    #[inline]
+    pub fn recv_buf() {
+        if enabled() {
+            RECV_BUFS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    #[inline]
+    pub fn enobufs() {
+        if enabled() {
+            ENOBUFS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    #[inline]
+    pub fn forward(n: usize) {
+        if enabled() {
+            FORWARDS.fetch_add(1, Ordering::Relaxed);
+            FWD_BUFS.fetch_add(n as u64, Ordering::Relaxed);
+        }
+    }
+}
+
 /// One in-flight UDP send slot. Owns the `sockaddr` + `iovec` + `msghdr`
 /// triple referenced by a single `sendmsg` SQE; returned to the freelist
 /// once the CQE arrives.
