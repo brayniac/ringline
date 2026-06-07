@@ -442,34 +442,55 @@ fn run_ringline(
             async move {
                 let (k, unit, zc_threshold, cache) = SEGCACHE.get().expect("SEGCACHE set");
                 let mut ctr: u64 = (conn.index() as u64).wrapping_mul(0x9E3779B97F4A7C15) | 1;
+                // Send-copy slot size = how many gathered values fit in one
+                // batched copy send (matches the recv-buffer / slot sizing).
+                let slot = unit.next_power_of_two().max(4096);
+                let cap_frames = (slot / unit).max(1);
+                let mut respbuf: Vec<u8> = Vec::with_capacity(slot);
                 loop {
                     let n = conn
                         .with_data(|data| {
-                            let frames = data.len() / unit;
-                            if frames == 0 {
-                                return ParseResult::NeedMore;
-                            }
-                            for _ in 0..frames {
-                                ctr = ctr.wrapping_mul(6364136223846793005).wrapping_add(1);
-                                let key = (ctr >> 16) % k;
-                                if let Some(vref) = cache.get_value_ref(&key.to_le_bytes()) {
-                                    let s = vref.as_slice();
-                                    if s.len() >= *zc_threshold {
-                                        // Large value: zero-copy send straight from segment.
+                            if *zc_threshold <= *unit {
+                                // Large value: one zero-copy send per request
+                                // (typically ~1 frame per recv at this size).
+                                let frames = data.len() / unit;
+                                if frames == 0 {
+                                    return ParseResult::NeedMore;
+                                }
+                                for _ in 0..frames {
+                                    ctr = ctr.wrapping_mul(6364136223846793005).wrapping_add(1);
+                                    let key = (ctr >> 16) % k;
+                                    if let Some(vref) = cache.get_value_ref(&key.to_le_bytes()) {
                                         let g = ValueRefGuard(vref);
                                         let _ = conn
                                             .send_parts()
                                             .build(move |b| b.guard(GuardBox::new(g)).submit());
-                                    } else {
-                                        // Small value: copying into the send pool is
-                                        // cheaper than the zero-copy notification overhead.
-                                        if let Err(e) = conn.send_nowait(s) {
-                                            eprintln!("segcache: copy send failed: {e}");
-                                        }
                                     }
                                 }
+                                ParseResult::Consumed(frames * unit)
+                            } else {
+                                // Small value: GATHER a recv's values into one
+                                // copy send (matches tokio's gathered write),
+                                // amortizing per-send overhead. Cap to one slot.
+                                let frames = (data.len() / unit).min(cap_frames);
+                                if frames == 0 {
+                                    return ParseResult::NeedMore;
+                                }
+                                respbuf.clear();
+                                for _ in 0..frames {
+                                    ctr = ctr.wrapping_mul(6364136223846793005).wrapping_add(1);
+                                    let key = (ctr >> 16) % k;
+                                    if let Some(vref) = cache.get_value_ref(&key.to_le_bytes()) {
+                                        respbuf.extend_from_slice(vref.as_slice());
+                                    }
+                                }
+                                if !respbuf.is_empty()
+                                    && let Err(e) = conn.send_nowait(&respbuf)
+                                {
+                                    eprintln!("segcache: batched copy send failed: {e}");
+                                }
+                                ParseResult::Consumed(frames * unit)
                             }
-                            ParseResult::Consumed(frames * unit)
                         })
                         .await;
                     if n == 0 {
