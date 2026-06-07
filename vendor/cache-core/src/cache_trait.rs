@@ -1,0 +1,814 @@
+//! Cache trait for compatibility with server implementations.
+//!
+//! This module provides a simple `Cache` trait that can be implemented by
+//! different cache backends (S3FifoCache, SegCache, etc.) for use with
+//! protocol servers like iou-cache and tokio-cache.
+
+use crate::error::CacheError;
+use crate::state::{Metadata, State};
+use crate::sync::{AtomicU32, AtomicU64, Ordering};
+use bytes::Bytes;
+use std::time::Duration;
+
+/// A simple guard that owns the cached value.
+///
+/// This is returned by cache get operations and provides access to the value.
+#[derive(Debug, Clone)]
+pub struct OwnedGuard {
+    value: Vec<u8>,
+}
+
+/// A zero-copy reference to a cached value.
+///
+/// This struct holds a reference to the value bytes directly in segment memory,
+/// keeping the segment's ref_count incremented to prevent eviction.
+///
+/// # Zero-Copy Design
+///
+/// `ValueRef` enables true zero-copy I/O by:
+/// - Holding a reference to segment memory via raw pointers
+/// - Incrementing ref_count on creation to prevent segment eviction
+/// - Using `Bytes::from_owner(self)` for zero-copy send with io_uring
+///
+/// # AwaitingRelease State Handling
+///
+/// The `Drop` implementation handles the sophisticated concurrency pattern
+/// for safe segment reclamation when a segment is condemned during eviction:
+///
+/// ```text
+/// Drop Path (when prev_count == 1):
+/// 1. Acquire fence - see AwaitingRelease written by eviction thread
+/// 2. Load metadata state
+/// 3. If state == AwaitingRelease:
+///    - CAS: AwaitingRelease -> Free
+///    - If CAS succeeds: push segment to free queue
+/// ```
+///
+/// This ensures the last reader is responsible for freeing the segment when
+/// eviction has already removed it from the hashtable.
+///
+/// # Safety
+///
+/// This type is `Send` because:
+/// - The ref_count pointer points to an AtomicU32 in a 'static MemoryPool
+/// - The value pointer points to memory in that same pool
+/// - The pool outlives all ValueRefs (pool is dropped after all refs are released)
+///
+/// This type is `Sync` because:
+/// - All access to the value is read-only (via `&[u8]`)
+/// - The ref_count uses atomic operations (FetchSub with Release ordering)
+///
+/// # Usage
+///
+/// Use this for zero-copy scatter-gather I/O where you need to send the value
+/// directly from cache memory without copying to an intermediate buffer.
+///
+/// ```ignore
+/// // Get zero-copy reference
+/// let value_ref = cache.get_value_ref(key)?;
+///
+/// // Use as slice (no copy)
+/// let data: &[u8] = value_ref.as_slice();
+///
+/// // Convert to Bytes for zero-copy send (holds segment ref)
+/// let bytes: Bytes = value_ref.into_bytes();
+/// ```
+pub struct ValueRef {
+    /// Pointer to the segment's ref_count for proper cleanup.
+    ref_count: *const AtomicU32,
+    /// Pointer to the value data in segment memory.
+    value_ptr: *const u8,
+    /// Length of the value in bytes.
+    value_len: usize,
+    /// Pointer to segment's packed metadata (AtomicU64) for AwaitingRelease detection.
+    /// Null if this ValueRef was not created from a segment (e.g., test mocks).
+    metadata: *const AtomicU64,
+    /// Pointer to the pool's free queue for returning segments after AwaitingRelease.
+    free_queue: *const crossbeam_deque::Injector<u32>,
+    /// Segment ID for returning to free queue.
+    segment_id: u32,
+}
+
+impl ValueRef {
+    /// Create a new ValueRef.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure:
+    /// - `ref_count` points to a valid AtomicU32 that has been incremented
+    /// - `value_ptr` and `value_len` describe valid memory that will remain
+    ///   valid as long as the ref_count is held
+    /// - `metadata` (if non-null) points to the segment's packed AtomicU64 metadata
+    /// - `free_queue` (if non-null) points to the pool's Injector free queue
+    #[inline]
+    pub unsafe fn new(
+        ref_count: *const AtomicU32,
+        value_ptr: *const u8,
+        value_len: usize,
+        metadata: *const AtomicU64,
+        free_queue: *const crossbeam_deque::Injector<u32>,
+        segment_id: u32,
+    ) -> Self {
+        Self {
+            ref_count,
+            value_ptr,
+            value_len,
+            metadata,
+            free_queue,
+            segment_id,
+        }
+    }
+
+    /// Get the value as a byte slice.
+    #[inline]
+    pub fn as_slice(&self) -> &[u8] {
+        // SAFETY: The ref_count being held guarantees the segment memory is valid
+        unsafe { std::slice::from_raw_parts(self.value_ptr, self.value_len) }
+    }
+
+    /// Get the length of the value.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.value_len
+    }
+
+    /// Check if the value is empty.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.value_len == 0
+    }
+
+    /// Get the raw pointer to the value data.
+    ///
+    /// This is useful for scatter-gather I/O where you need to pass
+    /// the buffer directly to the kernel.
+    #[inline]
+    pub fn as_ptr(&self) -> *const u8 {
+        self.value_ptr
+    }
+
+    /// Convert the ValueRef into an owned `Bytes` that keeps the segment ref alive.
+    ///
+    /// This is useful for zero-copy I/O where the buffer needs to outlive the
+    /// current scope (e.g., for io_uring operations that complete asynchronously).
+    /// The segment ref count is held until the returned `Bytes` is dropped.
+    #[inline]
+    pub fn into_bytes(self) -> Bytes {
+        Bytes::from_owner(self)
+    }
+}
+
+impl AsRef<[u8]> for ValueRef {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl std::ops::Deref for ValueRef {
+    type Target = [u8];
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl Drop for ValueRef {
+    /// Release the segment reference and handle AwaitingRelease state.
+    ///
+    /// # AwaitingRelease Release Pattern
+    ///
+    /// When the segment is in `AwaitingRelease` state (condemned by eviction
+    /// but still readable by in-flight readers), the last reader to drop its
+    /// `ValueRef` is responsible for freeing the segment.
+    ///
+    /// ## Why This Pattern?
+    ///
+    /// The race condition this solves:
+    /// ```text
+    /// Eviction Thread:                  Reader Thread:
+    /// --------------------------------  --------------------------------
+    /// 1. Check ref_count == 0
+    /// 2. CAS: Draining -> AwaitingRelease
+    /// 3. Update hashtable (remove key)
+    ///                                   4. Increment ref_count (too late)
+    ///                                   5. Read data
+    ///                                   6. Drop ValueRef (prev_count == 1)
+    ///                                   7. See AwaitingRelease state
+    ///                                   8. CAS: AwaitingRelease -> Free
+    ///                                   9. Push to free queue
+    /// ```
+    ///
+    /// ## Memory Ordering
+    ///
+    /// - `Ordering::Release` on fetch_sub: ensures all reads complete before
+    ///   checking the state
+    /// - `Ordering::Acquire` fence: ensures we see the AwaitingRelease state
+    ///   written by the eviction thread
+    /// - `Ordering::AcqRel` on CAS: combines acquire (see other threads' writes)
+    ///   and release (make our changes visible)
+    ///
+    /// ## Safety
+    ///
+    /// Only one thread can succeed in the final CAS (AwaitingRelease -> Free),
+    /// preventing double-free. The successful thread pushes the segment to
+    /// the free queue.
+    fn drop(&mut self) {
+        // SAFETY: ref_count is a valid AtomicU32 pointer from the segment
+        let prev_count = unsafe { (*self.ref_count).fetch_sub(1, Ordering::Release) };
+
+        // If we were the last reader and this segment has auto-release info,
+        // check if the segment is condemned (AwaitingRelease) and free it.
+        if prev_count == 1 && !self.metadata.is_null() {
+            // Acquire fence to see the AwaitingRelease state written by eviction thread
+            std::sync::atomic::fence(Ordering::Acquire);
+
+            let packed = unsafe { (*self.metadata).load(Ordering::Acquire) };
+            let meta = Metadata::unpack(packed);
+            if meta.state == State::AwaitingRelease {
+                // Try to transition AwaitingRelease -> Free
+                let new_meta = Metadata::new(State::Free);
+                if unsafe {
+                    (*self.metadata).compare_exchange(
+                        packed,
+                        new_meta.pack(),
+                        Ordering::AcqRel,
+                        Ordering::Relaxed,
+                    )
+                }
+                .is_ok()
+                {
+                    // Push segment back to free queue
+                    unsafe {
+                        (*self.free_queue).push(self.segment_id);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// SAFETY: ValueRef can be sent between threads because:
+// 1. The ref_count points to an AtomicU32 in a 'static MemoryPool
+// 2. The value memory is in the same pool
+// 3. The pool's lifetime exceeds all ValueRefs
+unsafe impl Send for ValueRef {}
+
+// SAFETY: ValueRef can be shared between threads because:
+// 1. All access to the value is read-only
+// 2. The ref_count uses atomic operations
+unsafe impl Sync for ValueRef {}
+
+impl OwnedGuard {
+    /// Create a new owned guard from a value.
+    pub fn new(value: Vec<u8>) -> Self {
+        Self { value }
+    }
+
+    /// Get the value as a byte slice.
+    pub fn value(&self) -> &[u8] {
+        &self.value
+    }
+
+    /// Consume the guard and return the owned value.
+    pub fn into_value(self) -> Vec<u8> {
+        self.value
+    }
+}
+
+impl AsRef<[u8]> for OwnedGuard {
+    fn as_ref(&self) -> &[u8] {
+        &self.value
+    }
+}
+
+/// Trait for cache implementations.
+///
+/// This trait defines the core operations that cache backends must support
+/// for use with protocol servers.
+///
+/// # Thread Safety
+///
+/// Implementations must be `Send + Sync` to allow concurrent access from
+/// multiple threads.
+pub trait Cache: Send + Sync + 'static {
+    /// Get a value from the cache.
+    ///
+    /// Returns `Some(guard)` if the key exists, `None` otherwise.
+    /// The guard provides access to the value.
+    ///
+    /// Note: This method copies the value into an owned buffer. For better
+    /// performance, use [`with_value`](Self::with_value) to avoid the copy.
+    fn get(&self, key: &[u8]) -> Option<OwnedGuard>;
+
+    /// Access a cached value without copying.
+    ///
+    /// Calls the provided function with the value bytes if the key exists.
+    /// The value is read directly from cache memory without copying.
+    ///
+    /// This is more efficient than [`get`](Self::get) when you only need
+    /// to read or copy the value to another buffer (e.g., a response buffer).
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Write value directly to response buffer without intermediate copy
+    /// cache.with_value(key, |value| {
+    ///     response_buf.extend_from_slice(value);
+    /// });
+    /// ```
+    fn with_value<F, R>(&self, key: &[u8], f: F) -> Option<R>
+    where
+        F: FnOnce(&[u8]) -> R;
+
+    /// Get a zero-copy reference to a cached value.
+    ///
+    /// Returns a [`ValueRef`] that holds a reference to the value directly
+    /// in cache memory, preventing the segment from being evicted while
+    /// the reference is held.
+    ///
+    /// This is the most efficient way to read values for scatter-gather I/O,
+    /// as the value bytes can be sent directly to the network without any
+    /// intermediate copies.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Get zero-copy reference for vectored write
+    /// if let Some(value_ref) = cache.get_value_ref(key) {
+    ///     // value_ref.as_slice() points directly into cache memory
+    ///     driver.send_vectored(conn_id, &[
+    ///         IoSlice::new(header.as_bytes()),
+    ///         IoSlice::new(value_ref.as_slice()),
+    ///         IoSlice::new(b"\r\n"),
+    ///     ]);
+    ///     // Segment stays pinned until value_ref is dropped
+    /// }
+    /// ```
+    ///
+    /// # Returns
+    ///
+    /// - `Some(ValueRef)` if the key exists
+    /// - `None` if the key is not found
+    ///
+    /// # Note
+    ///
+    /// Holding `ValueRef` prevents segment eviction. For long-lived references
+    /// or slow consumers (e.g., network writes to slow clients), prefer
+    /// copying the value to avoid blocking cache eviction.
+    fn get_value_ref(&self, key: &[u8]) -> Option<ValueRef>;
+
+    /// Set a key-value pair in the cache.
+    ///
+    /// `ttl` specifies the time-to-live for the entry. If `None`, a default
+    /// TTL is used (implementation-dependent).
+    fn set(&self, key: &[u8], value: &[u8], ttl: Option<Duration>) -> Result<(), CacheError>;
+
+    /// Begin a two-phase SET operation for zero-copy receive.
+    ///
+    /// Returns a reservation with a pre-sized buffer that the caller can
+    /// write to directly (e.g., from a network receive). Call `commit_set`
+    /// to finalize the operation.
+    ///
+    /// # Benefits
+    ///
+    /// - Single allocation of exact size (vs growing coalesce buffer)
+    /// - Buffer is correctly sized before receive starts
+    /// - Avoids multiple extend() calls during network receive
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Parse header to learn value size
+    /// let (key, value_len) = parse_set_header(buffer)?;
+    ///
+    /// // Reserve space
+    /// let mut reservation = cache.begin_set(key, value_len, None)?;
+    ///
+    /// // Receive directly into reservation buffer
+    /// socket.recv_exact(reservation.value_mut())?;
+    ///
+    /// // Commit
+    /// cache.commit_set(reservation)?;
+    /// ```
+    fn begin_set(
+        &self,
+        key: &[u8],
+        value_len: usize,
+        ttl: Option<Duration>,
+    ) -> Result<crate::SetReservation, CacheError> {
+        let ttl = ttl.unwrap_or(DEFAULT_TTL);
+        Ok(crate::SetReservation::new(key, value_len, &[], ttl))
+    }
+
+    /// Commit a two-phase SET operation.
+    ///
+    /// Writes the reservation's data to the cache. The reservation is consumed.
+    fn commit_set(&self, reservation: crate::SetReservation) -> Result<(), CacheError> {
+        let (key, value, _optional, ttl) = reservation.into_parts();
+        self.set(&key, &value, Some(ttl))
+    }
+
+    /// Delete a key from the cache.
+    ///
+    /// Returns `true` if the key was present and deleted, `false` otherwise.
+    fn delete(&self, key: &[u8]) -> bool;
+
+    /// Check if a key exists in the cache.
+    fn contains(&self, key: &[u8]) -> bool;
+
+    /// Flush all entries from the cache.
+    ///
+    /// Note: This may be a no-op for some implementations.
+    fn flush(&self);
+
+    /// Begin a two-phase SET for zero-copy receive into segment memory.
+    ///
+    /// Returns a `SegmentReservation` with a mutable pointer to segment memory.
+    /// The caller writes the value directly to this memory, then calls
+    /// `commit_segment_set` to finalize.
+    ///
+    /// # Default Implementation
+    ///
+    /// Returns `CacheError::Unsupported` - only TieredCache supports this.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let mut reservation = cache.begin_segment_set(key, value_len, ttl)?;
+    /// socket.recv_exact(reservation.value_mut())?;
+    /// cache.commit_segment_set(reservation)?;
+    /// ```
+    fn begin_segment_set(
+        &self,
+        _key: &[u8],
+        _value_len: usize,
+        _ttl: Option<Duration>,
+    ) -> Result<crate::SegmentReservation, CacheError> {
+        Err(CacheError::Unsupported)
+    }
+
+    /// Commit a segment-based SET operation.
+    ///
+    /// Finalizes the segment write and updates the hashtable.
+    ///
+    /// # Default Implementation
+    ///
+    /// Returns `CacheError::Unsupported` - only TieredCache supports this.
+    fn commit_segment_set(
+        &self,
+        _reservation: crate::SegmentReservation,
+    ) -> Result<(), CacheError> {
+        Err(CacheError::Unsupported)
+    }
+
+    /// Cancel a segment-based SET operation.
+    ///
+    /// Marks the reserved space as deleted. Call this if the receive fails.
+    fn cancel_segment_set(&self, _reservation: crate::SegmentReservation) {}
+
+    /// Get a value with its CAS token for GETS response.
+    ///
+    /// Returns the value and a CAS token that can be used for subsequent
+    /// CAS operations. The token is unique to this version of the item.
+    ///
+    /// # Default Implementation
+    ///
+    /// Returns `None` - only TieredCache-based implementations support this.
+    fn get_with_cas(&self, _key: &[u8]) -> Option<(Vec<u8>, u64)> {
+        None
+    }
+
+    /// Zero-copy variant of get_with_cas.
+    ///
+    /// Calls the provided function with the value bytes and returns
+    /// the result along with the CAS token.
+    ///
+    /// # Default Implementation
+    ///
+    /// Returns `None` - only TieredCache-based implementations support this.
+    fn with_value_cas<F, R>(&self, _key: &[u8], _f: F) -> Option<(R, u64)>
+    where
+        F: FnOnce(&[u8]) -> R,
+    {
+        None
+    }
+
+    /// Compare-and-swap: update an item only if the CAS token matches.
+    ///
+    /// This implements memcached CAS semantics:
+    /// - If the key doesn't exist, returns `Err(CacheError::KeyNotFound)`
+    /// - If the CAS token doesn't match, returns `Ok(false)` (EXISTS response)
+    /// - If the CAS token matches, updates the item and returns `Ok(true)` (STORED)
+    ///
+    /// # Default Implementation
+    ///
+    /// Returns `Err(CacheError::Unsupported)` - only TieredCache supports this.
+    fn cas(
+        &self,
+        _key: &[u8],
+        _value: &[u8],
+        _ttl: Option<Duration>,
+        _cas: u64,
+    ) -> Result<bool, CacheError> {
+        Err(CacheError::Unsupported)
+    }
+
+    /// Store an item only if the key doesn't exist (ADD/NX semantics).
+    ///
+    /// Returns `Ok(())` if the item was stored, `Err(CacheError::KeyExists)` if
+    /// the key already exists.
+    ///
+    /// # Default Implementation
+    ///
+    /// Returns `Err(CacheError::Unsupported)` - implementations should override.
+    fn add(&self, _key: &[u8], _value: &[u8], _ttl: Option<Duration>) -> Result<(), CacheError> {
+        Err(CacheError::Unsupported)
+    }
+
+    /// Update an existing item only (REPLACE/XX semantics).
+    ///
+    /// Returns `Ok(())` if the item was updated, `Err(CacheError::KeyNotFound)` if
+    /// the key doesn't exist.
+    ///
+    /// # Default Implementation
+    ///
+    /// Returns `Err(CacheError::Unsupported)` - implementations should override.
+    fn replace(
+        &self,
+        _key: &[u8],
+        _value: &[u8],
+        _ttl: Option<Duration>,
+    ) -> Result<(), CacheError> {
+        Err(CacheError::Unsupported)
+    }
+
+    /// Atomically increment a numeric value stored as ASCII decimal.
+    ///
+    /// If the key doesn't exist and `initial` is provided, creates the key
+    /// with the initial value and then applies the delta. If `initial` is `None`
+    /// and the key doesn't exist, returns `Err(CacheError::KeyNotFound)`.
+    ///
+    /// # Arguments
+    /// * `key` - The key to increment
+    /// * `delta` - Amount to add (for INCR this is 1, for INCRBY this is the value)
+    /// * `initial` - Initial value if key doesn't exist (memcache binary semantics)
+    /// * `ttl` - TTL for newly created keys
+    ///
+    /// # Returns
+    /// * `Ok(new_value)` - The value after incrementing
+    /// * `Err(CacheError::KeyNotFound)` - Key doesn't exist and no initial provided
+    /// * `Err(CacheError::NotNumeric)` - Value exists but isn't a valid ASCII number
+    /// * `Err(CacheError::Overflow)` - Operation would overflow u64
+    ///
+    /// # Default Implementation
+    ///
+    /// Returns `Err(CacheError::Unsupported)` - implementations should override.
+    fn increment(
+        &self,
+        _key: &[u8],
+        _delta: u64,
+        _initial: Option<u64>,
+        _ttl: Option<Duration>,
+    ) -> Result<u64, CacheError> {
+        Err(CacheError::Unsupported)
+    }
+
+    /// Atomically decrement a numeric value stored as ASCII decimal.
+    ///
+    /// If the key doesn't exist and `initial` is provided, creates the key
+    /// with the initial value and then applies the delta. If `initial` is `None`
+    /// and the key doesn't exist, returns `Err(CacheError::KeyNotFound)`.
+    ///
+    /// Memcache semantics: underflow clamps to 0 (saturating subtraction).
+    ///
+    /// # Arguments
+    /// * `key` - The key to decrement
+    /// * `delta` - Amount to subtract
+    /// * `initial` - Initial value if key doesn't exist (memcache binary semantics)
+    /// * `ttl` - TTL for newly created keys
+    ///
+    /// # Returns
+    /// * `Ok(new_value)` - The value after decrementing (clamped to 0 on underflow)
+    /// * `Err(CacheError::KeyNotFound)` - Key doesn't exist and no initial provided
+    /// * `Err(CacheError::NotNumeric)` - Value exists but isn't a valid ASCII number
+    ///
+    /// # Default Implementation
+    ///
+    /// Returns `Err(CacheError::Unsupported)` - implementations should override.
+    fn decrement(
+        &self,
+        _key: &[u8],
+        _delta: u64,
+        _initial: Option<u64>,
+        _ttl: Option<Duration>,
+    ) -> Result<u64, CacheError> {
+        Err(CacheError::Unsupported)
+    }
+
+    /// Append data to an existing value.
+    ///
+    /// Concatenates `data` to the end of the existing value for `key`.
+    /// If the key doesn't exist, returns `Err(CacheError::KeyNotFound)`.
+    ///
+    /// After appending, the cache checks if the result is a "simple numeric"
+    /// value and may store it more efficiently. This is transparent to the caller.
+    ///
+    /// # Arguments
+    /// * `key` - The key to append to
+    /// * `data` - Data to append to the existing value
+    ///
+    /// # Returns
+    /// * `Ok(new_length)` - The length of the value after appending
+    /// * `Err(CacheError::KeyNotFound)` - Key doesn't exist
+    ///
+    /// # Default Implementation
+    ///
+    /// Returns `Err(CacheError::Unsupported)` - implementations should override.
+    fn append(&self, _key: &[u8], _data: &[u8]) -> Result<usize, CacheError> {
+        Err(CacheError::Unsupported)
+    }
+
+    /// Prepend data to an existing value.
+    ///
+    /// Concatenates `data` to the beginning of the existing value for `key`.
+    /// If the key doesn't exist, returns `Err(CacheError::KeyNotFound)`.
+    ///
+    /// After prepending, the cache checks if the result is a "simple numeric"
+    /// value and may store it more efficiently. This is transparent to the caller.
+    ///
+    /// # Arguments
+    /// * `key` - The key to prepend to
+    /// * `data` - Data to prepend to the existing value
+    ///
+    /// # Returns
+    /// * `Ok(new_length)` - The length of the value after prepending
+    /// * `Err(CacheError::KeyNotFound)` - Key doesn't exist
+    ///
+    /// # Default Implementation
+    ///
+    /// Returns `Err(CacheError::Unsupported)` - implementations should override.
+    fn prepend(&self, _key: &[u8], _data: &[u8]) -> Result<usize, CacheError> {
+        Err(CacheError::Unsupported)
+    }
+
+    /// Get internal cache statistics (demotions, evictions).
+    ///
+    /// Returns `None` if the implementation does not track internal stats.
+    fn internal_stats(&self) -> Option<CacheInternalStats> {
+        None
+    }
+
+    /// Drain the io_uring disk tier's flush queue.
+    ///
+    /// Returns all pending [`crate::FlushRequest`]s that need to be submitted as
+    /// io_uring writes. The server should call this periodically (e.g., in
+    /// `on_tick`) and submit each request as a disk write, then call
+    /// [`complete_flush`](Self::complete_flush) when the write completes.
+    ///
+    /// # Default Implementation
+    ///
+    /// Returns an empty Vec — only caches with an io_uring disk tier produce flush requests.
+    fn take_flush_queue(&self) -> Vec<crate::FlushRequest> {
+        Vec::new()
+    }
+
+    /// Signal that a disk flush has completed for the given segment.
+    ///
+    /// Detaches the write buffer from the segment and returns it to the pool.
+    /// After this call, lookups for items in this segment will return
+    /// [`LookupResult::DiskRead`] instead of [`LookupResult::Hit`].
+    ///
+    /// # Default Implementation
+    ///
+    /// No-op — only caches with an io_uring disk tier need this.
+    fn complete_flush(&self, _segment_id: u32) {}
+
+    /// Release a disk segment's ref_count after an async disk read completes.
+    ///
+    /// Must be called after the server finishes processing a `DiskRead` response,
+    /// to allow the segment to be evicted if needed.
+    ///
+    /// # Default Implementation
+    ///
+    /// No-op — only caches with an io_uring disk tier need this.
+    fn release_disk_read(&self, _segment_id: u32, _pool_id: u8) {}
+
+    /// Look up a key, returning either an immediate hit or disk read params.
+    ///
+    /// For items in RAM (or in a disk segment's write buffer), returns
+    /// [`LookupResult::Hit`] with a zero-copy [`ValueRef`].
+    /// For items on committed disk segments, returns [`LookupResult::DiskRead`]
+    /// with the parameters needed to submit an io_uring read.
+    /// Returns [`LookupResult::Miss`] if the key is not found.
+    ///
+    /// # Default Implementation
+    ///
+    /// Falls back to `get_value_ref()` — returns Hit or Miss only (no disk path).
+    fn lookup(&self, key: &[u8]) -> LookupResult {
+        match self.get_value_ref(key) {
+            Some(vr) => LookupResult::Hit(vr),
+            None => LookupResult::Miss,
+        }
+    }
+}
+
+/// Default TTL used when None is provided (1 hour).
+pub const DEFAULT_TTL: Duration = Duration::from_secs(3600);
+
+/// Internal cache statistics for observability.
+///
+/// Provides counters for demotion and eviction events that are tracked
+/// inside the cache layers.
+#[derive(Debug, Clone, Default)]
+pub struct CacheInternalStats {
+    /// Items demoted from one layer to another (e.g., RAM to disk).
+    pub demotions: u64,
+    /// Segments evicted entirely (items discarded, not demoted).
+    pub evictions: u64,
+    /// Items that failed to demote (staging pool exhausted, discarded instead).
+    pub demotion_failures: u64,
+}
+
+/// Result of a cache lookup that may require async I/O.
+///
+/// For items in RAM (or in a disk segment's write buffer), the lookup
+/// returns an immediate [`LookupResult::Hit`] with a zero-copy [`ValueRef`].
+/// For items on committed disk segments (write buffer already flushed),
+/// returns [`LookupResult::DiskRead`] with parameters for submitting
+/// an io_uring read.
+pub enum LookupResult {
+    /// Item found in RAM or disk write buffer — immediately available.
+    Hit(ValueRef),
+    /// Item is on a committed disk segment — async I/O required.
+    ///
+    /// The caller should:
+    /// 1. Allocate a read buffer
+    /// 2. Submit an io_uring read using the provided parameters
+    /// 3. Parse the item from the read buffer on completion
+    /// 4. Call `release_read()` on the disk layer when done
+    DiskRead(crate::disk::DiskReadParams),
+    /// Item not found in any layer.
+    Miss,
+}
+
+#[cfg(all(test, not(feature = "loom")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_owned_guard_new() {
+        let data = vec![1, 2, 3, 4, 5];
+        let guard = OwnedGuard::new(data.clone());
+        assert_eq!(guard.value(), &data[..]);
+    }
+
+    #[test]
+    fn test_owned_guard_value() {
+        let guard = OwnedGuard::new(vec![10, 20, 30]);
+        assert_eq!(guard.value(), &[10, 20, 30]);
+    }
+
+    #[test]
+    fn test_owned_guard_into_value() {
+        let data = vec![1, 2, 3];
+        let guard = OwnedGuard::new(data.clone());
+        let extracted = guard.into_value();
+        assert_eq!(extracted, data);
+    }
+
+    #[test]
+    fn test_owned_guard_as_ref() {
+        let guard = OwnedGuard::new(vec![5, 6, 7]);
+        let slice: &[u8] = guard.as_ref();
+        assert_eq!(slice, &[5, 6, 7]);
+    }
+
+    #[test]
+    fn test_owned_guard_clone() {
+        let guard1 = OwnedGuard::new(vec![1, 2, 3]);
+        let guard2 = guard1.clone();
+        assert_eq!(guard1.value(), guard2.value());
+    }
+
+    #[test]
+    fn test_owned_guard_debug() {
+        let guard = OwnedGuard::new(vec![1, 2, 3]);
+        let debug_str = format!("{:?}", guard);
+        assert!(debug_str.contains("OwnedGuard"));
+    }
+
+    #[test]
+    fn test_owned_guard_empty() {
+        let guard = OwnedGuard::new(vec![]);
+        assert!(guard.value().is_empty());
+        assert_eq!(guard.into_value().len(), 0);
+    }
+
+    #[test]
+    fn test_default_ttl() {
+        assert_eq!(DEFAULT_TTL, Duration::from_secs(3600));
+        assert_eq!(DEFAULT_TTL.as_secs(), 3600);
+    }
+}

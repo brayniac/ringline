@@ -1,0 +1,22 @@
+[package]
+name = "cache-core"
+version = "0.4.2-alpha.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Vendored cache-core (from brayniac/crucible) for ringline-bench"
+
+[features]
+default = []
+validation = []
+loom = []
+
+[dependencies]
+ahash = "0.8"
+bytes = "1"
+clocksource = "1.0"
+crossbeam-deque = "0.8"
+libc = "0.2"
+memmap2 = "0.9"
+parking_lot = "0.12"
+rand = "0.9"
+tracing = "0.1"

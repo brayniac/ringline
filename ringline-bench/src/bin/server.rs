@@ -96,6 +96,27 @@ static RESPOND: std::sync::OnceLock<(usize, Vec<u8>)> = std::sync::OnceLock::new
 static CACHE: std::sync::OnceLock<(u64, usize, std::collections::HashMap<u64, Vec<u8>>)> =
     std::sync::OnceLock::new();
 
+/// Real Segcache (vendored from brayniac/crucible) for `--protocol segcache`:
+/// (num_keys, value unit size, cache). GET returns a zero-copy `ValueRef` that
+/// borrows segment memory — ringline sends it zero-copy (SendGuard, no copy);
+/// tokio must `write` it (one copy). This is the realistic cache hot path where
+/// ringline's zero-copy send composes with a borrow-capable cache.
+static SEGCACHE: std::sync::OnceLock<(u64, usize, segcache::SegCache)> = std::sync::OnceLock::new();
+
+/// Wraps a Segcache `ValueRef` (Send + 'static, ref-counts the segment) as a
+/// ringline `SendGuard` so the value can be sent zero-copy directly from
+/// segment memory; the guard keeps the segment alive until the ZC notification.
+struct ValueRefGuard(segcache::ValueRef);
+impl ringline::SendGuard for ValueRefGuard {
+    fn as_ptr_len(&self) -> (*const u8, u32) {
+        let s = self.0.as_slice();
+        (s.as_ptr(), s.len() as u32)
+    }
+    fn region(&self) -> ringline::RegionId {
+        ringline::RegionId::UNREGISTERED
+    }
+}
+
 /// Parse a cpu-list spec (`0-7,16-23` / `12,13,14,15`) into logical CPU ids.
 fn parse_cpu_list(spec: &str) -> Vec<usize> {
     let mut cpus = Vec::new();
@@ -185,8 +206,30 @@ fn main() {
         }
         CACHE.set((k, unit, map)).ok();
         eprintln!("bench-server: protocol=cache keys={k} value={unit}B");
+    } else if args.protocol == "segcache" {
+        let unit = args.msg_size.max(1);
+        let k = args.cache_keys.max(1);
+        // Heap sized to hold all values comfortably (avoid eviction): ~4x data.
+        let heap = ((k as usize * (unit + 96)) * 4).max(256 << 20);
+        let cache = segcache::SegCache::builder()
+            .heap_size(heap)
+            .segment_size(4 << 20)
+            .build()
+            .expect("segcache build");
+        let val = vec![0xCDu8; unit];
+        for key in 0..k {
+            cache
+                .set(
+                    &key.to_le_bytes(),
+                    &val,
+                    std::time::Duration::from_secs(3600),
+                )
+                .ok();
+        }
+        SEGCACHE.set((k, unit, cache)).ok();
+        eprintln!("bench-server: protocol=segcache keys={k} value={unit}B heap={heap}");
     } else if args.protocol != "echo" {
-        panic!("--protocol must be 'echo', 'respond', or 'cache'");
+        panic!("--protocol must be 'echo', 'respond', 'cache', or 'segcache'");
     }
 
     let workers = if args.workers == 0 {
@@ -376,6 +419,48 @@ fn run_ringline(
         }
     }
 
+    // Zero-copy Segcache GET: per request, look up a rotating key, get a
+    // `ValueRef` borrowing segment memory, and send it ZERO-COPY via a
+    // SendGuard (the value never leaves segment memory until the kernel's ZC
+    // notification). tokio must copy the value into the kernel on write.
+    use ringline::GuardBox;
+    struct SegcacheHandler;
+    impl AsyncEventHandler for SegcacheHandler {
+        fn on_accept(&self, conn: ConnCtx) -> impl std::future::Future<Output = ()> + 'static {
+            async move {
+                let (k, unit, cache) = SEGCACHE.get().expect("SEGCACHE set");
+                let mut ctr: u64 = (conn.index() as u64).wrapping_mul(0x9E3779B97F4A7C15) | 1;
+                loop {
+                    let n = conn
+                        .with_data(|data| {
+                            let frames = data.len() / unit;
+                            if frames == 0 {
+                                return ParseResult::NeedMore;
+                            }
+                            for _ in 0..frames {
+                                ctr = ctr.wrapping_mul(6364136223846793005).wrapping_add(1);
+                                let key = (ctr >> 16) % k;
+                                if let Some(vref) = cache.get_value_ref(&key.to_le_bytes()) {
+                                    let g = ValueRefGuard(vref);
+                                    let _ = conn
+                                        .send_parts()
+                                        .build(move |b| b.guard(GuardBox::new(g)).submit());
+                                }
+                            }
+                            ParseResult::Consumed(frames * unit)
+                        })
+                        .await;
+                    if n == 0 {
+                        break;
+                    }
+                }
+            }
+        }
+        fn create_for_worker(_id: usize) -> Self {
+            SegcacheHandler
+        }
+    }
+
     let mut config = Config::default();
     config.worker.threads = workers;
     // When --cpu-list set a process affinity mask, leave the OS to schedule
@@ -397,7 +482,10 @@ fn run_ringline(
     let builder = RinglineBuilder::new(config).bind(addr);
     let respond = RESPOND.get().is_some();
     let cache = CACHE.get().is_some();
-    let (shutdown, handles) = if cache {
+    let segcache = SEGCACHE.get().is_some();
+    let (shutdown, handles) = if segcache {
+        builder.launch::<SegcacheHandler>()
+    } else if cache {
         builder.launch::<CacheHandler>()
     } else if respond {
         builder.launch::<RespondHandler>()
@@ -449,6 +537,7 @@ fn run_tokio(addr: SocketAddr, workers: usize, msg_size: usize) {
             // ringline's handlers.
             let respond = RESPOND.get();
             let cache = CACHE.get();
+            let segcache = SEGCACHE.get();
             tokio::spawn(async move {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 let cap = msg_size.next_power_of_two().max(65536);
@@ -460,7 +549,20 @@ fn run_tokio(addr: SocketAddr, workers: usize, msg_size: usize) {
                         Ok(0) | Err(_) => break,
                         Ok(n) => n,
                     };
-                    let ok = if let Some((k, unit, map)) = cache {
+                    let ok = if let Some((k, unit, sc)) = segcache {
+                        // Same zero-copy GET (ValueRef borrow), but tokio must
+                        // copy the bytes into the kernel on write.
+                        let frames = n / unit;
+                        respbuf.clear();
+                        for _ in 0..frames {
+                            ctr = ctr.wrapping_mul(6364136223846793005).wrapping_add(1);
+                            let key = (ctr >> 16) % k;
+                            if let Some(vref) = sc.get_value_ref(&key.to_le_bytes()) {
+                                respbuf.extend_from_slice(vref.as_slice());
+                            }
+                        }
+                        stream.write_all(&respbuf).await.is_ok()
+                    } else if let Some((k, unit, map)) = cache {
                         let frames = n / unit;
                         respbuf.clear();
                         for _ in 0..frames {

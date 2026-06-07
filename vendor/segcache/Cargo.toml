@@ -1,0 +1,14 @@
+[package]
+name = "segcache"
+version = "0.4.2-alpha.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Vendored segcache (from brayniac/crucible) for ringline-bench"
+
+[features]
+default = []
+validation = ["cache-core/validation"]
+
+[dependencies]
+cache-core = { path = "../cache-core" }
+clocksource = "1.0"

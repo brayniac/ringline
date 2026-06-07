@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["vendor/cache-core", "vendor/segcache"]
 members = [
     "ringline",
     "ringline-redis",

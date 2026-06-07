@@ -23,6 +23,8 @@ level = "warn"
 check-cfg = ["cfg(has_io_uring)"]
 
 [dependencies]
+segcache = { path = "../vendor/segcache" }
+cache-core = { path = "../vendor/cache-core" }
 ringline = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "time"] }
 serde = { version = "1", features = ["derive"] }
