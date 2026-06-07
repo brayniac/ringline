@@ -71,19 +71,30 @@ struct Args {
     #[arg(long, default_value_t = 256)]
     sq_entries: u32,
 
-    /// Server protocol: `echo` (send the received bytes back — zero-copy
-    /// forwarding is possible) or `respond` (per `msg_size`-byte request, send a
-    /// server-owned constant `msg_size`-byte response — the realistic
-    /// request/response path that real protocols use, e.g. PING→PONG at
-    /// msg_size=6. No recv-forward shortcut; goes through the normal send copy).
+    /// Server protocol: `echo` (send received bytes back — zero-copy forward
+    /// possible), `respond` (per `msg_size`-byte request, send a server-owned
+    /// constant `msg_size`-byte response — realistic request/response, e.g.
+    /// PING→PONG at msg_size=6), or `cache` (per request, do a HashMap GET with
+    /// a rotating key and return the stored `msg_size`-byte value — a realistic
+    /// read-heavy cache hot path: protocol framing + hash lookup + value copy).
     #[arg(long, default_value = "echo")]
     protocol: String,
+
+    /// (cache protocol) number of pre-populated keys.
+    #[arg(long, default_value_t = 65536)]
+    cache_keys: u64,
 }
 
 /// Fixed server-owned response, set before launch when `--protocol respond`:
 /// (request/response unit size, a buffer of that unit repeated). The handler
 /// sends `frames * unit` of this per recv, never touching the recv bytes.
 static RESPOND: std::sync::OnceLock<(usize, Vec<u8>)> = std::sync::OnceLock::new();
+
+/// Pre-populated cache for `--protocol cache`: (num_keys, request/value unit
+/// size, key→value map). Each value is `unit` bytes. The server does a real
+/// hash lookup per request (rotating key) and returns the stored value.
+static CACHE: std::sync::OnceLock<(u64, usize, std::collections::HashMap<u64, Vec<u8>>)> =
+    std::sync::OnceLock::new();
 
 /// Parse a cpu-list spec (`0-7,16-23` / `12,13,14,15`) into logical CPU ids.
 fn parse_cpu_list(spec: &str) -> Vec<usize> {
@@ -164,8 +175,18 @@ fn main() {
         }
         RESPOND.set((unit, buf)).ok();
         eprintln!("bench-server: protocol=respond unit={unit}B");
+    } else if args.protocol == "cache" {
+        let unit = args.msg_size.max(1);
+        let k = args.cache_keys.max(1);
+        let mut map = std::collections::HashMap::with_capacity(k as usize);
+        for key in 0..k {
+            // Value = unit bytes seeded by key so values differ across keys.
+            map.insert(key, vec![(key & 0xff) as u8; unit]);
+        }
+        CACHE.set((k, unit, map)).ok();
+        eprintln!("bench-server: protocol=cache keys={k} value={unit}B");
     } else if args.protocol != "echo" {
-        panic!("--protocol must be 'echo' or 'respond'");
+        panic!("--protocol must be 'echo', 'respond', or 'cache'");
     }
 
     let workers = if args.workers == 0 {
@@ -309,6 +330,52 @@ fn run_ringline(
         }
     }
 
+    // Realistic read-heavy cache hot path: per `unit`-byte request, do a HashMap
+    // GET with a rotating (pseudo-random) key and return the stored value. Real
+    // application work (framing + hash lookup + value gather) — not echo, not a
+    // constant. Responses for a recv's frames are gathered into one send.
+    struct CacheHandler;
+    impl AsyncEventHandler for CacheHandler {
+        fn on_accept(&self, conn: ConnCtx) -> impl std::future::Future<Output = ()> + 'static {
+            async move {
+                let (k, unit, map) = CACHE.get().expect("CACHE set");
+                let mut ctr: u64 = (conn.index() as u64).wrapping_mul(0x9E3779B97F4A7C15) | 1;
+                let mut respbuf: Vec<u8> = Vec::with_capacity(64 * 1024);
+                loop {
+                    let n = conn
+                        .with_data(|data| {
+                            let frames = data.len() / unit;
+                            if frames == 0 {
+                                return ParseResult::NeedMore;
+                            }
+                            respbuf.clear();
+                            for _ in 0..frames {
+                                // LCG step → pseudo-random key (realistic cache
+                                // access pattern / cache-line spread).
+                                ctr = ctr.wrapping_mul(6364136223846793005).wrapping_add(1);
+                                let key = (ctr >> 16) % k;
+                                if let Some(v) = map.get(&key) {
+                                    respbuf.extend_from_slice(v);
+                                }
+                            }
+                            if let Err(e) = conn.send_nowait(&respbuf) {
+                                eprintln!("cache: send failed: {e}");
+                                return ParseResult::NeedMore;
+                            }
+                            ParseResult::Consumed(frames * unit)
+                        })
+                        .await;
+                    if n == 0 {
+                        break;
+                    }
+                }
+            }
+        }
+        fn create_for_worker(_id: usize) -> Self {
+            CacheHandler
+        }
+    }
+
     let mut config = Config::default();
     config.worker.threads = workers;
     // When --cpu-list set a process affinity mask, leave the OS to schedule
@@ -329,7 +396,10 @@ fn run_ringline(
 
     let builder = RinglineBuilder::new(config).bind(addr);
     let respond = RESPOND.get().is_some();
-    let (shutdown, handles) = if respond {
+    let cache = CACHE.get().is_some();
+    let (shutdown, handles) = if cache {
+        builder.launch::<CacheHandler>()
+    } else if respond {
         builder.launch::<RespondHandler>()
     } else if recv_forward {
         builder.launch::<RecvForwardEchoHandler>()
@@ -373,28 +443,41 @@ fn run_tokio(addr: SocketAddr, workers: usize, msg_size: usize) {
             };
             stream.set_nodelay(true).ok();
 
-            // `respond` mode: per `unit`-byte request, write a server-owned
-            // constant response (the realistic request/response path). Else
-            // bulk byte-echo (read available, echo in one write) — the natural
-            // efficient tokio echo, fair vs ringline's bulk recv path.
+            // `cache`: HashMap GET per request, return stored value (gathered).
+            // `respond`: per request, write a server-owned constant response.
+            // else bulk byte-echo. All three are the fair tokio counterparts to
+            // ringline's handlers.
             let respond = RESPOND.get();
+            let cache = CACHE.get();
             tokio::spawn(async move {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 let cap = msg_size.next_power_of_two().max(65536);
                 let mut buf = vec![0u8; cap];
+                let mut respbuf: Vec<u8> = Vec::with_capacity(64 * 1024);
+                let mut ctr: u64 = 0x9E3779B97F4A7C15;
                 loop {
                     let n = match stream.read(&mut buf).await {
                         Ok(0) | Err(_) => break,
                         Ok(n) => n,
                     };
-                    let out: &[u8] = match respond {
-                        Some((unit, resp)) => {
-                            let frames = (n / unit).min(resp.len() / unit);
-                            &resp[..frames * unit]
+                    let ok = if let Some((k, unit, map)) = cache {
+                        let frames = n / unit;
+                        respbuf.clear();
+                        for _ in 0..frames {
+                            ctr = ctr.wrapping_mul(6364136223846793005).wrapping_add(1);
+                            let key = (ctr >> 16) % k;
+                            if let Some(v) = map.get(&key) {
+                                respbuf.extend_from_slice(v);
+                            }
                         }
-                        None => &buf[..n],
+                        stream.write_all(&respbuf).await.is_ok()
+                    } else if let Some((unit, resp)) = respond {
+                        let frames = (n / unit).min(resp.len() / unit);
+                        stream.write_all(&resp[..frames * unit]).await.is_ok()
+                    } else {
+                        stream.write_all(&buf[..n]).await.is_ok()
                     };
-                    if stream.write_all(out).await.is_err() {
+                    if !ok {
                         break;
                     }
                 }
