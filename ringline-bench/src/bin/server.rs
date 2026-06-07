@@ -463,7 +463,9 @@ fn run_ringline(
                                     } else {
                                         // Small value: copying into the send pool is
                                         // cheaper than the zero-copy notification overhead.
-                                        let _ = conn.send_nowait(s);
+                                        if let Err(e) = conn.send_nowait(s) {
+                                            eprintln!("segcache: copy send failed: {e}");
+                                        }
                                     }
                                 }
                             }
@@ -495,7 +497,11 @@ fn run_ringline(
     };
     config.recv_buffer.buffer_size = recv_buf as u32;
     config.max_connections = 16384;
-    config.send_copy_count = 512;
+    // Send-copy pool must hold all in-flight copy sends. Small values produce
+    // many sends per recv (e.g. 16 at 256 B into a 4 KiB recv buffer) across
+    // hundreds of connections, so 512 slots exhaust and copy sends fail. Size
+    // generously for the copy path (respond/cache/segcache-small).
+    config.send_copy_count = 16384;
     config.send_copy_slot_size = msg_size.next_power_of_two().max(4096) as u32;
     config.conn_chunk_size = conn_chunk_size;
 
