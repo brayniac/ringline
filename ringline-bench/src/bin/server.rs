@@ -70,7 +70,20 @@ struct Args {
     /// (ringline only) io_uring submission-queue entries.
     #[arg(long, default_value_t = 256)]
     sq_entries: u32,
+
+    /// Server protocol: `echo` (send the received bytes back — zero-copy
+    /// forwarding is possible) or `respond` (per `msg_size`-byte request, send a
+    /// server-owned constant `msg_size`-byte response — the realistic
+    /// request/response path that real protocols use, e.g. PING→PONG at
+    /// msg_size=6. No recv-forward shortcut; goes through the normal send copy).
+    #[arg(long, default_value = "echo")]
+    protocol: String,
 }
+
+/// Fixed server-owned response, set before launch when `--protocol respond`:
+/// (request/response unit size, a buffer of that unit repeated). The handler
+/// sends `frames * unit` of this per recv, never touching the recv bytes.
+static RESPOND: std::sync::OnceLock<(usize, Vec<u8>)> = std::sync::OnceLock::new();
 
 /// Parse a cpu-list spec (`0-7,16-23` / `12,13,14,15`) into logical CPU ids.
 fn parse_cpu_list(spec: &str) -> Vec<usize> {
@@ -134,6 +147,27 @@ fn main() {
         None => true,
     };
 
+    // Realistic request/response mode: build the server-owned constant response
+    // (PING→PONG at msg_size=6, else a 0xCD-filled unit) and stash it for the
+    // handlers. Repeated to 256 KiB so one recv's worth of frames always fits.
+    if args.protocol == "respond" {
+        let unit = args.msg_size.max(1);
+        let pattern: Vec<u8> = if unit == 6 {
+            b"PONG\r\n".to_vec()
+        } else {
+            vec![0xCDu8; unit]
+        };
+        let reps = (262_144 / unit).max(1);
+        let mut buf = Vec::with_capacity(reps * unit);
+        for _ in 0..reps {
+            buf.extend_from_slice(&pattern);
+        }
+        RESPOND.set((unit, buf)).ok();
+        eprintln!("bench-server: protocol=respond unit={unit}B");
+    } else if args.protocol != "echo" {
+        panic!("--protocol must be 'echo' or 'respond'");
+    }
+
     let workers = if args.workers == 0 {
         ringline::physical_core_count()
     } else {
@@ -179,10 +213,7 @@ fn run_ringline(
     recv_ring_size: u16,
     sq_entries: u32,
 ) {
-    use ringline::{AsyncEventHandler, Config, ConnCtx, RinglineBuilder};
-    // ParseResult is only needed in the non-io_uring fallback path.
-    #[cfg(not(has_io_uring))]
-    use ringline::ParseResult;
+    use ringline::{AsyncEventHandler, Config, ConnCtx, ParseResult, RinglineBuilder};
 
     // Direct-echo path (default): no task wakeup per message — echo SQEs are
     // submitted directly from handle_recv_multi, bypassing collect_wakeups and
@@ -243,6 +274,41 @@ fn run_ringline(
         }
     }
 
+    // Realistic request/response path: for every `unit`-byte request, send a
+    // server-owned constant `unit`-byte response (never the recv bytes — so
+    // recv-forward / zero-copy echo does NOT apply; this is the normal
+    // copy-into-send-pool path real protocols use). PING→PONG at unit=6.
+    struct RespondHandler;
+    impl AsyncEventHandler for RespondHandler {
+        fn on_accept(&self, conn: ConnCtx) -> impl std::future::Future<Output = ()> + 'static {
+            async move {
+                let (unit, resp) = RESPOND.get().expect("RESPOND set");
+                let max_frames = resp.len() / unit;
+                loop {
+                    let n = conn
+                        .with_data(|data| {
+                            let frames = (data.len() / unit).min(max_frames);
+                            if frames == 0 {
+                                return ParseResult::NeedMore;
+                            }
+                            if let Err(e) = conn.send_nowait(&resp[..frames * unit]) {
+                                eprintln!("respond: send failed: {e}");
+                                return ParseResult::NeedMore;
+                            }
+                            ParseResult::Consumed(frames * unit)
+                        })
+                        .await;
+                    if n == 0 {
+                        break;
+                    }
+                }
+            }
+        }
+        fn create_for_worker(_id: usize) -> Self {
+            RespondHandler
+        }
+    }
+
     let mut config = Config::default();
     config.worker.threads = workers;
     // When --cpu-list set a process affinity mask, leave the OS to schedule
@@ -262,14 +328,17 @@ fn run_ringline(
     config.conn_chunk_size = conn_chunk_size;
 
     let builder = RinglineBuilder::new(config).bind(addr);
-    let (shutdown, handles) = if recv_forward {
+    let respond = RESPOND.get().is_some();
+    let (shutdown, handles) = if respond {
+        builder.launch::<RespondHandler>()
+    } else if recv_forward {
         builder.launch::<RecvForwardEchoHandler>()
     } else {
         builder.launch::<EchoHandler>()
     }
     .expect("failed to launch ringline server");
 
-    eprintln!("bench-server: ready (recv_forward={recv_forward})");
+    eprintln!("bench-server: ready (recv_forward={recv_forward} respond={respond})");
 
     // Block until SIGINT/SIGTERM, then trigger graceful shutdown so each
     // worker's event loop runs its shutdown path — including the
@@ -304,14 +373,13 @@ fn run_tokio(addr: SocketAddr, workers: usize, msg_size: usize) {
             };
             stream.set_nodelay(true).ok();
 
+            // `respond` mode: per `unit`-byte request, write a server-owned
+            // constant response (the realistic request/response path). Else
+            // bulk byte-echo (read available, echo in one write) — the natural
+            // efficient tokio echo, fair vs ringline's bulk recv path.
+            let respond = RESPOND.get();
             tokio::spawn(async move {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                // Bulk byte-echo: read whatever is available (many pipelined
-                // messages per syscall) and echo it back in one write. This is
-                // the natural efficient tokio echo — a fair counterpart to
-                // ringline's bulk recv/forward path. (A per-message
-                // read_exact(msg_size) would pay two syscalls per message and
-                // unfairly handicap tokio.) `msg_size` only sizes the buffer.
                 let cap = msg_size.next_power_of_two().max(65536);
                 let mut buf = vec![0u8; cap];
                 loop {
@@ -319,7 +387,14 @@ fn run_tokio(addr: SocketAddr, workers: usize, msg_size: usize) {
                         Ok(0) | Err(_) => break,
                         Ok(n) => n,
                     };
-                    if stream.write_all(&buf[..n]).await.is_err() {
+                    let out: &[u8] = match respond {
+                        Some((unit, resp)) => {
+                            let frames = (n / unit).min(resp.len() / unit);
+                            &resp[..frames * unit]
+                        }
+                        None => &buf[..n],
+                    };
+                    if stream.write_all(out).await.is_err() {
                         break;
                     }
                 }
