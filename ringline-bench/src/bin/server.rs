@@ -279,12 +279,20 @@ fn run_tokio(addr: SocketAddr, workers: usize, msg_size: usize) {
 
             tokio::spawn(async move {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                let mut buf = vec![0u8; msg_size];
+                // Bulk byte-echo: read whatever is available (many pipelined
+                // messages per syscall) and echo it back in one write. This is
+                // the natural efficient tokio echo — a fair counterpart to
+                // ringline's bulk recv/forward path. (A per-message
+                // read_exact(msg_size) would pay two syscalls per message and
+                // unfairly handicap tokio.) `msg_size` only sizes the buffer.
+                let cap = msg_size.next_power_of_two().max(65536);
+                let mut buf = vec![0u8; cap];
                 loop {
-                    if stream.read_exact(&mut buf).await.is_err() {
-                        break;
-                    }
-                    if stream.write_all(&buf).await.is_err() {
+                    let n = match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    if stream.write_all(&buf[..n]).await.is_err() {
                         break;
                     }
                 }
