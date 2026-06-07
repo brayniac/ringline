@@ -55,6 +55,21 @@ struct Args {
     /// Pass `--workers N` to match the number of physical cores in the list.
     #[arg(long)]
     cpu_list: Option<String>,
+
+    /// (ringline only) Override the recv provided-buffer size in bytes (how many
+    /// bytes — i.e. how many pipelined messages — one multishot-recv completion
+    /// can carry). 0 = msg_size rounded up, min 4096. Bigger amortizes per-op
+    /// cost across more messages (the knob that matches a bulk read()).
+    #[arg(long, default_value_t = 0)]
+    recv_buf_size: usize,
+
+    /// (ringline only) Number of recv provided buffers in the ring.
+    #[arg(long, default_value_t = 256)]
+    recv_ring_size: u16,
+
+    /// (ringline only) io_uring submission-queue entries.
+    #[arg(long, default_value_t = 256)]
+    sq_entries: u32,
 }
 
 /// Parse a cpu-list spec (`0-7,16-23` / `12,13,14,15`) into logical CPU ids.
@@ -143,12 +158,16 @@ fn main() {
             args.recv_forward,
             args.conn_chunk_size,
             pin_to_core,
+            args.recv_buf_size,
+            args.recv_ring_size,
+            args.sq_entries,
         ),
         Runtime::Tokio => run_tokio(args.addr, workers, args.msg_size),
     }
 }
 
 #[allow(clippy::manual_async_fn)]
+#[allow(clippy::too_many_arguments)]
 fn run_ringline(
     addr: SocketAddr,
     workers: usize,
@@ -156,6 +175,9 @@ fn run_ringline(
     recv_forward: bool,
     conn_chunk_size: usize,
     pin_to_core: bool,
+    recv_buf_size: usize,
+    recv_ring_size: u16,
+    sq_entries: u32,
 ) {
     use ringline::{AsyncEventHandler, Config, ConnCtx, RinglineBuilder};
     // ParseResult is only needed in the non-io_uring fallback path.
@@ -226,9 +248,14 @@ fn run_ringline(
     // When --cpu-list set a process affinity mask, leave the OS to schedule
     // workers within it; otherwise pin each worker to its own core (0..N).
     config.worker.pin_to_core = pin_to_core;
-    config.sq_entries = 256;
-    config.recv_buffer.ring_size = 256;
-    config.recv_buffer.buffer_size = msg_size.next_power_of_two().max(4096) as u32;
+    config.sq_entries = sq_entries;
+    config.recv_buffer.ring_size = recv_ring_size;
+    let recv_buf = if recv_buf_size > 0 {
+        recv_buf_size
+    } else {
+        msg_size.next_power_of_two().max(4096)
+    };
+    config.recv_buffer.buffer_size = recv_buf as u32;
     config.max_connections = 16384;
     config.send_copy_count = 512;
     config.send_copy_slot_size = msg_size.next_power_of_two().max(4096) as u32;
