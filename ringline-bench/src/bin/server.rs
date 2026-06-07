@@ -83,6 +83,14 @@ struct Args {
     /// (cache protocol) number of pre-populated keys.
     #[arg(long, default_value_t = 65536)]
     cache_keys: u64,
+
+    /// (segcache protocol, ringline) value size (bytes) at/above which to send
+    /// zero-copy via a SendGuard; below it, copy the value into the send pool
+    /// (plain send). Zero-copy send carries per-send notification/pinning
+    /// overhead and the kernel copies small payloads anyway, so copying small
+    /// values is faster. Set very high to force copy everywhere.
+    #[arg(long, default_value_t = 16384)]
+    zc_threshold: usize,
 }
 
 /// Fixed server-owned response, set before launch when `--protocol respond`:
@@ -101,7 +109,8 @@ static CACHE: std::sync::OnceLock<(u64, usize, std::collections::HashMap<u64, Ve
 /// borrows segment memory — ringline sends it zero-copy (SendGuard, no copy);
 /// tokio must `write` it (one copy). This is the realistic cache hot path where
 /// ringline's zero-copy send composes with a borrow-capable cache.
-static SEGCACHE: std::sync::OnceLock<(u64, usize, segcache::SegCache)> = std::sync::OnceLock::new();
+static SEGCACHE: std::sync::OnceLock<(u64, usize, usize, segcache::SegCache)> =
+    std::sync::OnceLock::new();
 
 /// Wraps a Segcache `ValueRef` (Send + 'static, ref-counts the segment) as a
 /// ringline `SendGuard` so the value can be sent zero-copy directly from
@@ -226,8 +235,11 @@ fn main() {
                 )
                 .ok();
         }
-        SEGCACHE.set((k, unit, cache)).ok();
-        eprintln!("bench-server: protocol=segcache keys={k} value={unit}B heap={heap}");
+        SEGCACHE.set((k, unit, args.zc_threshold, cache)).ok();
+        eprintln!(
+            "bench-server: protocol=segcache keys={k} value={unit}B heap={heap} zc_threshold={}",
+            args.zc_threshold
+        );
     } else if args.protocol != "echo" {
         panic!("--protocol must be 'echo', 'respond', 'cache', or 'segcache'");
     }
@@ -428,7 +440,7 @@ fn run_ringline(
     impl AsyncEventHandler for SegcacheHandler {
         fn on_accept(&self, conn: ConnCtx) -> impl std::future::Future<Output = ()> + 'static {
             async move {
-                let (k, unit, cache) = SEGCACHE.get().expect("SEGCACHE set");
+                let (k, unit, zc_threshold, cache) = SEGCACHE.get().expect("SEGCACHE set");
                 let mut ctr: u64 = (conn.index() as u64).wrapping_mul(0x9E3779B97F4A7C15) | 1;
                 loop {
                     let n = conn
@@ -441,10 +453,18 @@ fn run_ringline(
                                 ctr = ctr.wrapping_mul(6364136223846793005).wrapping_add(1);
                                 let key = (ctr >> 16) % k;
                                 if let Some(vref) = cache.get_value_ref(&key.to_le_bytes()) {
-                                    let g = ValueRefGuard(vref);
-                                    let _ = conn
-                                        .send_parts()
-                                        .build(move |b| b.guard(GuardBox::new(g)).submit());
+                                    let s = vref.as_slice();
+                                    if s.len() >= *zc_threshold {
+                                        // Large value: zero-copy send straight from segment.
+                                        let g = ValueRefGuard(vref);
+                                        let _ = conn
+                                            .send_parts()
+                                            .build(move |b| b.guard(GuardBox::new(g)).submit());
+                                    } else {
+                                        // Small value: copying into the send pool is
+                                        // cheaper than the zero-copy notification overhead.
+                                        let _ = conn.send_nowait(s);
+                                    }
                                 }
                             }
                             ParseResult::Consumed(frames * unit)
@@ -549,7 +569,7 @@ fn run_tokio(addr: SocketAddr, workers: usize, msg_size: usize) {
                         Ok(0) | Err(_) => break,
                         Ok(n) => n,
                     };
-                    let ok = if let Some((k, unit, sc)) = segcache {
+                    let ok = if let Some((k, unit, _zc, sc)) = segcache {
                         // Same zero-copy GET (ValueRef borrow), but tokio must
                         // copy the bytes into the kernel on write.
                         let frames = n / unit;
