@@ -823,6 +823,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     }
 
     fn handle_recv_multi(&mut self, ud: UserData, result: i32, flags: u32) {
+        crate::runtime::DBG_RECV_CQE.with(|c| c.set(c.get() + 1));
         let conn_index = ud.conn_index();
         let has_more = cqueue::more(flags);
 
@@ -847,6 +848,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
             let errno = -result;
             if errno == libc::ENOBUFS {
+                crate::runtime::DBG_RECV_ENOBUFS.with(|c| c.set(c.get() + 1));
                 metrics::POOL.increment(metrics::pool::BUFFER_RING_EMPTY);
                 if !has_more && self.driver.ring.submit_multishot_recv(conn_index).is_err() {
                     metrics::RING.increment(metrics::ring::RECV_ARM_FAILURES);
@@ -875,6 +877,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
         };
 
+        crate::runtime::DBG_RECV_DATA.with(|c| c.set(c.get() + 1));
         let bytes_received = result as u32;
         metrics::BYTES.add(metrics::bytes::RECEIVED, bytes_received as u64);
         let (buf_ptr, _) = self.driver.provided_bufs.get_buffer(bid);
@@ -2621,6 +2624,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// containing kernel timestamps. Otherwise, uses `RecvMulti` (plain
     /// multishot recv).
     fn arm_recv(&mut self, conn_index: u32) {
+        crate::runtime::DBG_ARM_RECV.with(|c| c.set(c.get() + 1));
         #[cfg(feature = "timestamps")]
         if self.driver.timestamps {
             let msghdr_ptr = &*self.driver.recvmsg_msghdr as *const libc::msghdr;
@@ -2630,6 +2634,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 .submit_multishot_recvmsg(conn_index, msghdr_ptr)
                 .is_err()
             {
+                crate::runtime::DBG_ARM_FAIL.with(|c| c.set(c.get() + 1));
                 metrics::RING.increment(metrics::ring::RECV_ARM_FAILURES);
                 self.executor.wake_recv(conn_index);
                 self.driver.close_connection(conn_index);
@@ -2641,6 +2646,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             return;
         }
         if self.driver.ring.submit_multishot_recv(conn_index).is_err() {
+            crate::runtime::DBG_ARM_FAIL.with(|c| c.set(c.get() + 1));
             metrics::RING.increment(metrics::ring::RECV_ARM_FAILURES);
             self.executor.wake_recv(conn_index);
             self.driver.close_connection(conn_index);

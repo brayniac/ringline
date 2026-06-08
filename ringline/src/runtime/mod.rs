@@ -174,6 +174,12 @@ thread_local! {
     pub(crate) static DBG_RECV_WAKE_NO_WAITER: Cell<u64> = const { Cell::new(0) };
     pub(crate) static DBG_CONNECT_WAKE_CALLS: Cell<u64> = const { Cell::new(0) };
     pub(crate) static DBG_CONNECT_WAKE_NO_WAITER: Cell<u64> = const { Cell::new(0) };
+    // Round 2: recv-delivery (multishot recv arming + CQE delivery).
+    pub(crate) static DBG_ARM_RECV: Cell<u64> = const { Cell::new(0) };
+    pub(crate) static DBG_ARM_FAIL: Cell<u64> = const { Cell::new(0) };
+    pub(crate) static DBG_RECV_CQE: Cell<u64> = const { Cell::new(0) };
+    pub(crate) static DBG_RECV_DATA: Cell<u64> = const { Cell::new(0) };
+    pub(crate) static DBG_RECV_ENOBUFS: Cell<u64> = const { Cell::new(0) };
 }
 
 /// Pool of timer slots backed by stable memory for the I/O backend.
@@ -604,7 +610,8 @@ impl Executor {
         eprintln!(
             "[ringline waiterdiag] recv_stuck={} connect_stuck={} send_stuck={} \
              recv_stuck_idx={:?} connect_stuck_idx={:?} | \
-             recv_wake_calls={} recv_wake_no_waiter={} connect_wake_calls={} connect_wake_no_waiter={}",
+             recv_wake_calls={} recv_wake_no_waiter={} connect_wake_calls={} connect_wake_no_waiter={} | \
+             arm_recv={} arm_fail={} recv_cqe={} recv_data={} recv_enobufs={}",
             recv_stuck.len(),
             connect_stuck.len(),
             send_stuck,
@@ -614,6 +621,11 @@ impl Executor {
             DBG_RECV_WAKE_NO_WAITER.with(|c| c.get()),
             DBG_CONNECT_WAKE_CALLS.with(|c| c.get()),
             DBG_CONNECT_WAKE_NO_WAITER.with(|c| c.get()),
+            DBG_ARM_RECV.with(|c| c.get()),
+            DBG_ARM_FAIL.with(|c| c.get()),
+            DBG_RECV_CQE.with(|c| c.get()),
+            DBG_RECV_DATA.with(|c| c.get()),
+            DBG_RECV_ENOBUFS.with(|c| c.get()),
         );
     }
 
