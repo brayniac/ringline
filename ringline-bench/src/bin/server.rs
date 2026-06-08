@@ -206,6 +206,24 @@ fn apply_cpu_affinity(cpus: &[usize]) {
     }
 }
 
+/// Pin the *current thread* to a single `core` via `sched_setaffinity`. Used to
+/// pin tokio worker threads one-per-core (the runtime does not pin them itself,
+/// and on an `isolcpus=...,domain` host the scheduler will not load-balance
+/// unpinned threads off the first core — they all pile onto core 0).
+#[cfg(target_os = "linux")]
+fn pin_thread_to_core(core: usize) {
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_ZERO(&mut set);
+        libc::CPU_SET(core, &mut set);
+        let _ = libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+    }
+}
+
+/// Per-thread CPU affinity is not supported on this platform (no-op).
+#[cfg(not(target_os = "linux"))]
+fn pin_thread_to_core(_core: usize) {}
+
 /// Process CPU affinity is not supported on this platform (no-op).
 #[cfg(not(target_os = "linux"))]
 fn apply_cpu_affinity(_cpus: &[usize]) {
@@ -606,8 +624,19 @@ fn run_ringline(
 }
 
 fn run_tokio(addr: SocketAddr, workers: usize, msg_size: usize) {
+    // Pin each tokio worker thread to its own core (worker i -> core i). tokio's
+    // multi_thread runtime does not pin threads; without this, on an
+    // `isolcpus=...,domain` host the unpinned threads all collapse onto core 0
+    // (the scheduler does not balance across the isolated domain). This mirrors
+    // ringline's per-worker pinning so both runtimes get the same core budget.
+    let next_core = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let nc = next_core.clone();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(workers)
+        .on_thread_start(move || {
+            let id = nc.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            pin_thread_to_core(id % workers);
+        })
         .enable_all()
         .build()
         .expect("failed to build tokio runtime");
