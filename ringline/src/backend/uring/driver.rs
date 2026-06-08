@@ -842,9 +842,11 @@ impl Driver {
     ) -> io::Result<()> {
         let state = &mut self.send_queues[conn_index as usize];
         if state.in_flight {
+            crate::runtime::DBG_SEND_QUEUED_PATH.with(|c| c.set(c.get() + 1));
             state.queue.push_back(built);
             Ok(())
         } else {
+            crate::runtime::DBG_SEND_SUBMIT_PATH.with(|c| c.set(c.get() + 1));
             let entry = built.entry.clone();
             match unsafe { self.ring.push_sqe(entry) } {
                 Ok(()) => {

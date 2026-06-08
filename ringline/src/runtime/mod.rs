@@ -185,6 +185,10 @@ thread_local! {
     pub(crate) static DBG_CONNECT_OK: Cell<u64> = const { Cell::new(0) };
     pub(crate) static DBG_CONNECT_ERR: Cell<u64> = const { Cell::new(0) };
     pub(crate) static DBG_SEND_CQE: Cell<u64> = const { Cell::new(0) };
+    // Round 4: which branch does submit_or_queue_send take? Splits
+    // "queued (in_flight already true)" vs "submitted directly".
+    pub(crate) static DBG_SEND_SUBMIT_PATH: Cell<u64> = const { Cell::new(0) };
+    pub(crate) static DBG_SEND_QUEUED_PATH: Cell<u64> = const { Cell::new(0) };
 }
 
 /// Pool of timer slots backed by stable memory for the I/O backend.
@@ -640,6 +644,11 @@ impl Executor {
             DBG_CONNECT_OK.with(|c| c.get()),
             DBG_CONNECT_ERR.with(|c| c.get()),
             DBG_SEND_CQE.with(|c| c.get()),
+        );
+        eprintln!(
+            "[ringline senddiag] send_submit_path={} send_queued_path={}",
+            DBG_SEND_SUBMIT_PATH.with(|c| c.get()),
+            DBG_SEND_QUEUED_PATH.with(|c| c.get()),
         );
     }
 
