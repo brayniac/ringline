@@ -74,6 +74,12 @@ pub struct ConnectionState {
     /// path, reducing per-message latency from ~2 event-loop iterations to ~1.
     #[cfg(has_io_uring)]
     pub direct_echo: bool,
+    /// When set, `handle_recv_multi` runs this responder synchronously on the
+    /// received bytes and copy-sends its output, bypassing the task wakeup —
+    /// the request/response analog of `direct_echo`. The fn appends the response
+    /// bytes to the provided buffer (it may read global state, e.g. a cache).
+    #[cfg(has_io_uring)]
+    pub direct_respond: Option<fn(&[u8], &mut Vec<u8>)>,
 }
 
 impl Default for ConnectionState {
@@ -96,6 +102,8 @@ impl ConnectionState {
             recv_timestamp_ns: 0,
             #[cfg(has_io_uring)]
             direct_echo: false,
+            #[cfg(has_io_uring)]
+            direct_respond: None,
         }
     }
 
@@ -126,6 +134,10 @@ impl ConnectionState {
         #[cfg(has_io_uring)]
         {
             self.direct_echo = false;
+        }
+        #[cfg(has_io_uring)]
+        {
+            self.direct_respond = None;
         }
         self.generation = self.generation.wrapping_add(1);
     }

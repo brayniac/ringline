@@ -84,6 +84,13 @@ struct Args {
     #[arg(long, default_value_t = 65536)]
     cache_keys: u64,
 
+    /// (segcache protocol, ringline io_uring) drive connections through the
+    /// `run_direct_respond` fast path — the responder (cache lookup + value
+    /// copy) runs in the event loop with NO task wakeup. Tests whether the
+    /// async task path is the small-value overhead vs tokio.
+    #[arg(long, default_value_t = false)]
+    direct_respond: bool,
+
     /// (segcache protocol, ringline) value size (bytes) at/above which to send
     /// zero-copy via a SendGuard; below it, copy the value into the send pool
     /// (plain send). Zero-copy send carries per-send notification/pinning
@@ -111,6 +118,40 @@ static CACHE: std::sync::OnceLock<(u64, usize, std::collections::HashMap<u64, Ve
 /// ringline's zero-copy send composes with a borrow-capable cache.
 static SEGCACHE: std::sync::OnceLock<(u64, usize, usize, segcache::SegCache)> =
     std::sync::OnceLock::new();
+
+/// When true, the segcache server drives connections via ringline's
+/// `run_direct_respond` fast path (responder runs in the event loop, no task
+/// wakeup) instead of the `with_data` task loop.
+#[cfg_attr(not(has_io_uring), allow(dead_code))]
+static DIRECT_RESPOND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Rotating key state for the direct-respond responder (a plain fn has no
+/// per-connection state, so the rotation is global — fine for the benchmark).
+#[cfg_attr(not(has_io_uring), allow(dead_code))]
+static RESP_CTR: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0x9E3779B97F4A7C15);
+
+/// Direct-respond responder: per `unit`-byte request, look up a rotating key in
+/// the segcache and append the stored value to `out`. Runs synchronously in the
+/// event loop (no task wakeup); `out` is then copy-sent by the core.
+#[cfg_attr(not(has_io_uring), allow(dead_code))]
+fn segcache_responder(req: &[u8], out: &mut Vec<u8>) {
+    use std::sync::atomic::Ordering;
+    let (k, unit, _zc, cache) = match SEGCACHE.get() {
+        Some(x) => x,
+        None => return,
+    };
+    let frames = req.len() / unit;
+    let mut c = RESP_CTR.load(Ordering::Relaxed);
+    for _ in 0..frames {
+        c = c.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let key = (c >> 16) % k;
+        if let Some(vref) = cache.get_value_ref(&key.to_le_bytes()) {
+            out.extend_from_slice(vref.as_slice());
+        }
+    }
+    RESP_CTR.store(c, Ordering::Relaxed);
+}
 
 /// Wraps a Segcache `ValueRef` (Send + 'static, ref-counts the segment) as a
 /// ringline `SendGuard` so the value can be sent zero-copy directly from
@@ -236,9 +277,10 @@ fn main() {
                 .ok();
         }
         SEGCACHE.set((k, unit, args.zc_threshold, cache)).ok();
+        DIRECT_RESPOND.store(args.direct_respond, std::sync::atomic::Ordering::Relaxed);
         eprintln!(
-            "bench-server: protocol=segcache keys={k} value={unit}B heap={heap} zc_threshold={}",
-            args.zc_threshold
+            "bench-server: protocol=segcache keys={k} value={unit}B heap={heap} zc_threshold={} direct_respond={}",
+            args.zc_threshold, args.direct_respond
         );
     } else if args.protocol != "echo" {
         panic!("--protocol must be 'echo', 'respond', 'cache', or 'segcache'");
@@ -440,6 +482,13 @@ fn run_ringline(
     impl AsyncEventHandler for SegcacheHandler {
         fn on_accept(&self, conn: ConnCtx) -> impl std::future::Future<Output = ()> + 'static {
             async move {
+                // Fast path: run the responder in the event loop with no task
+                // wakeup (io_uring only). Bypasses the with_data task loop below.
+                #[cfg(has_io_uring)]
+                if DIRECT_RESPOND.load(std::sync::atomic::Ordering::Relaxed) {
+                    conn.run_direct_respond(segcache_responder).await;
+                    return;
+                }
                 let (k, unit, zc_threshold, cache) = SEGCACHE.get().expect("SEGCACHE set");
                 let mut ctr: u64 = (conn.index() as u64).wrapping_mul(0x9E3779B97F4A7C15) | 1;
                 // Send-copy slot size = how many gathered values fit in one

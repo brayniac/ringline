@@ -143,6 +143,8 @@ pub(crate) struct Driver {
     pub(crate) recv_hold: Vec<std::collections::VecDeque<PendingRecvBuf>>,
     /// Per-connection opt-in flag for the zero-copy recv-forward path.
     pub(crate) recv_forward: Vec<bool>,
+    /// Reusable scratch buffer for the direct_respond fast path.
+    pub(crate) direct_respond_scratch: Vec<u8>,
     pub(crate) accept_rx: Option<crossbeam_channel::Receiver<(RawFd, SocketAddr)>>,
     pub(crate) eventfd: RawFd,
     pub(crate) eventfd_buf: [u8; 8],
@@ -403,6 +405,7 @@ impl Driver {
                 .map(|_| std::collections::VecDeque::new())
                 .collect(),
             recv_forward: vec![false; config.max_connections as usize],
+            direct_respond_scratch: Vec::with_capacity(65536),
             accept_rx,
             eventfd,
             eventfd_buf: [0u8; 8],

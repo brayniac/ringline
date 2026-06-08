@@ -957,6 +957,33 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     }
                 }
             }
+        } else if let Some(responder) = self
+            .driver
+            .connections
+            .get(conn_index)
+            .and_then(|c| c.direct_respond)
+        {
+            // Direct-respond fast path: run the user responder synchronously on
+            // the received bytes and copy-send its output directly from the CQE
+            // handler, bypassing the task wakeup (collect_wakeups →
+            // poll_ready_tasks). The recv buffer is replenished immediately (the
+            // response is constructed, not forwarded). Mirrors direct_echo for
+            // request/response workloads.
+            self.driver.pending_replenish.push(bid);
+            let generation = self
+                .driver
+                .connections
+                .get(conn_index)
+                .map(|c| c.generation)
+                .unwrap_or(0);
+            let mut scratch = std::mem::take(&mut self.driver.direct_respond_scratch);
+            scratch.clear();
+            responder(data, &mut scratch);
+            if !scratch.is_empty() {
+                let token = crate::handler::ConnToken::new(conn_index, generation);
+                let _ = self.driver.make_ctx().send(token, &scratch);
+            }
+            self.driver.direct_respond_scratch = scratch;
         } else if self.driver.recv_forward[conn_index as usize] {
             // Zero-copy recv-forward path: hold the provided buffer in-place
             // (bid NOT replenished) for scatter-gather forwarding via

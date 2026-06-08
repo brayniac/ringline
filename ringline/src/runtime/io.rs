@@ -943,6 +943,22 @@ impl ConnCtx {
         }
     }
 
+    /// Drive a connection in direct-respond mode (io_uring only): `handle_recv_multi`
+    /// runs `responder` synchronously on each recv and copy-sends its output,
+    /// bypassing the task wakeup — the request/response analog of
+    /// [`run_direct_echo`](Self::run_direct_echo). The returned future parks until
+    /// the connection closes. `responder` appends response bytes to the supplied
+    /// buffer and may read global state (e.g. a cache keyed off the request).
+    #[cfg(has_io_uring)]
+    pub fn run_direct_respond(&self, responder: fn(&[u8], &mut Vec<u8>)) -> DirectRespondFuture {
+        DirectRespondFuture {
+            conn_index: self.conn_index,
+            generation: self.generation,
+            responder,
+            armed: false,
+        }
+    }
+
     /// Enable the zero-copy recv-forward path for this connection.
     ///
     /// Once enabled, incoming provided recv buffers are *held in place* (not
@@ -2108,6 +2124,70 @@ impl Drop for DirectEchoFuture {
         let driver = unsafe { &mut *state.driver.as_mut() };
         // Verify the slot still belongs to this connection before clearing
         // its waiter — a close/reuse cycle gives the slot a new generation.
+        if driver.connections.generation(self.conn_index) != self.generation {
+            return;
+        }
+        let executor = unsafe { &mut *state.executor.as_mut() };
+        executor.recv_waiters[self.conn_index as usize] = false;
+    }
+}
+
+// ── DirectRespondFuture ──────────────────────────────────────────────
+
+/// Future that drives a connection in direct-respond mode (io_uring only).
+/// Mirrors [`DirectEchoFuture`] but for request/response: on first poll it
+/// installs the responder on the connection so `handle_recv_multi` services
+/// recvs without waking this task, then parks until the connection closes.
+///
+/// Created by [`ConnCtx::run_direct_respond`].
+#[cfg(has_io_uring)]
+pub struct DirectRespondFuture {
+    conn_index: u32,
+    generation: u32,
+    responder: fn(&[u8], &mut Vec<u8>),
+    armed: bool,
+}
+
+#[cfg(has_io_uring)]
+impl Future for DirectRespondFuture {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+        with_state(|driver, executor| {
+            if driver.connections.generation(self.conn_index) != self.generation {
+                return Poll::Ready(());
+            }
+            if !self.armed {
+                if let Some(cs) = driver.connections.get_mut(self.conn_index) {
+                    cs.direct_respond = Some(self.responder);
+                }
+                self.armed = true;
+            }
+            let is_closed = driver
+                .connections
+                .get(self.conn_index)
+                .map(|c| matches!(c.recv_mode, crate::connection::RecvMode::Closed))
+                .unwrap_or(true);
+            if is_closed {
+                return Poll::Ready(());
+            }
+            executor.owner_task[self.conn_index as usize] = Some(CURRENT_TASK_ID.with(|c| c.get()));
+            executor.recv_waiters[self.conn_index as usize] = true;
+            Poll::Pending
+        })
+    }
+}
+
+#[cfg(has_io_uring)]
+impl Drop for DirectRespondFuture {
+    fn drop(&mut self) {
+        let opt_non_null = CURRENT_DRIVER.with(|c| c.get());
+        if opt_non_null.is_none() {
+            return;
+        }
+        let mut non_null = opt_non_null.unwrap();
+        let state = unsafe { non_null.as_mut() };
+        let driver = unsafe { &mut *state.driver.as_mut() };
         if driver.connections.generation(self.conn_index) != self.generation {
             return;
         }
