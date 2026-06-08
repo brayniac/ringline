@@ -1394,6 +1394,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     }
 
     fn handle_send(&mut self, ud: UserData, result: i32) {
+        crate::runtime::DBG_SEND_CQE.with(|c| c.set(c.get() + 1));
         let conn_index = ud.conn_index();
         let pool_slot = ud.payload() as u16;
 

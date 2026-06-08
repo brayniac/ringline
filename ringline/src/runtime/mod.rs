@@ -180,6 +180,11 @@ thread_local! {
     pub(crate) static DBG_RECV_CQE: Cell<u64> = const { Cell::new(0) };
     pub(crate) static DBG_RECV_DATA: Cell<u64> = const { Cell::new(0) };
     pub(crate) static DBG_RECV_ENOBUFS: Cell<u64> = const { Cell::new(0) };
+    // Round 3: partition connect vs send vs recv (recv_cqe=0 alone can't tell
+    // "recv broken" from "PING never sent so no PONG to receive").
+    pub(crate) static DBG_CONNECT_OK: Cell<u64> = const { Cell::new(0) };
+    pub(crate) static DBG_CONNECT_ERR: Cell<u64> = const { Cell::new(0) };
+    pub(crate) static DBG_SEND_CQE: Cell<u64> = const { Cell::new(0) };
 }
 
 /// Pool of timer slots backed by stable memory for the I/O backend.
@@ -577,6 +582,11 @@ impl Executor {
     /// Wake a task that was waiting for connect completion.
     pub(crate) fn wake_connect(&mut self, conn_index: u32, result: stdio::Result<()>) {
         DBG_CONNECT_WAKE_CALLS.with(|c| c.set(c.get() + 1));
+        if result.is_ok() {
+            DBG_CONNECT_OK.with(|c| c.set(c.get() + 1));
+        } else {
+            DBG_CONNECT_ERR.with(|c| c.set(c.get() + 1));
+        }
         let idx = conn_index as usize;
         if idx < self.connect_waiters.len() && self.connect_waiters[idx] {
             self.connect_waiters[idx] = false;
@@ -611,7 +621,8 @@ impl Executor {
             "[ringline waiterdiag] recv_stuck={} connect_stuck={} send_stuck={} \
              recv_stuck_idx={:?} connect_stuck_idx={:?} | \
              recv_wake_calls={} recv_wake_no_waiter={} connect_wake_calls={} connect_wake_no_waiter={} | \
-             arm_recv={} arm_fail={} recv_cqe={} recv_data={} recv_enobufs={}",
+             arm_recv={} arm_fail={} recv_cqe={} recv_data={} recv_enobufs={} | \
+             connect_ok={} connect_err={} send_cqe={}",
             recv_stuck.len(),
             connect_stuck.len(),
             send_stuck,
@@ -626,6 +637,9 @@ impl Executor {
             DBG_RECV_CQE.with(|c| c.get()),
             DBG_RECV_DATA.with(|c| c.get()),
             DBG_RECV_ENOBUFS.with(|c| c.get()),
+            DBG_CONNECT_OK.with(|c| c.get()),
+            DBG_CONNECT_ERR.with(|c| c.get()),
+            DBG_SEND_CQE.with(|c| c.get()),
         );
     }
 
