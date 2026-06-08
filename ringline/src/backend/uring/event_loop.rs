@@ -213,6 +213,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     diag_wait_ns_max as f64 / 1_000_000.0,
                     diag_work_ns_max as f64 / 1_000_000.0,
                 );
+                self.executor.dump_stuck_waiters();
                 self.driver.run_shutdown();
                 return Ok(());
             }

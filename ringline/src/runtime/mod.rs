@@ -167,6 +167,13 @@ thread_local! {
     /// Standalone tasks: task_idx | STANDALONE_BIT.
     /// Used by SleepFuture to know which task to wake on timer completion.
     pub(crate) static CURRENT_TASK_ID: Cell<u32> = const { Cell::new(0) };
+
+    // DEBUG (wake-waiter regression hunt, ringline 0.2 valkey-lab precheck).
+    // Per-worker-thread counters; dumped at shutdown by dump_stuck_waiters().
+    pub(crate) static DBG_RECV_WAKE_CALLS: Cell<u64> = const { Cell::new(0) };
+    pub(crate) static DBG_RECV_WAKE_NO_WAITER: Cell<u64> = const { Cell::new(0) };
+    pub(crate) static DBG_CONNECT_WAKE_CALLS: Cell<u64> = const { Cell::new(0) };
+    pub(crate) static DBG_CONNECT_WAKE_NO_WAITER: Cell<u64> = const { Cell::new(0) };
 }
 
 /// Pool of timer slots backed by stable memory for the I/O backend.
@@ -518,11 +525,14 @@ impl Executor {
     /// Resolves through `owner_task` so that outbound connections correctly
     /// wake the task that owns them (which may differ from the conn_index).
     pub(crate) fn wake_recv(&mut self, conn_index: u32) {
+        DBG_RECV_WAKE_CALLS.with(|c| c.set(c.get() + 1));
         let idx = conn_index as usize;
         if idx < self.recv_waiters.len() && self.recv_waiters[idx] {
             self.recv_waiters[idx] = false;
             let task_id = self.owner_task[idx].unwrap_or(conn_index);
             self.wake_task(task_id);
+        } else {
+            DBG_RECV_WAKE_NO_WAITER.with(|c| c.set(c.get() + 1));
         }
     }
 
@@ -560,13 +570,51 @@ impl Executor {
 
     /// Wake a task that was waiting for connect completion.
     pub(crate) fn wake_connect(&mut self, conn_index: u32, result: stdio::Result<()>) {
+        DBG_CONNECT_WAKE_CALLS.with(|c| c.set(c.get() + 1));
         let idx = conn_index as usize;
         if idx < self.connect_waiters.len() && self.connect_waiters[idx] {
             self.connect_waiters[idx] = false;
             self.io_results[idx] = Some(IoResult::Connect(result));
             let task_id = self.owner_task[idx].unwrap_or(conn_index);
             self.wake_task(task_id);
+        } else {
+            DBG_CONNECT_WAKE_NO_WAITER.with(|c| c.set(c.get() + 1));
         }
+    }
+
+    /// DEBUG: dump connections left with a parked waiter at shutdown (stuck =
+    /// their recv/connect/send completion never woke the task), plus per-worker
+    /// wake-call counters. Used to localize the ringline 0.2 valkey-lab precheck
+    /// "no connectivity" regression. (Remove once root-caused.)
+    #[cfg_attr(not(has_io_uring), allow(dead_code))]
+    pub(crate) fn dump_stuck_waiters(&self) {
+        let recv_stuck: Vec<usize> = self
+            .recv_waiters
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &w)| w.then_some(i))
+            .collect();
+        let connect_stuck: Vec<usize> = self
+            .connect_waiters
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &w)| w.then_some(i))
+            .collect();
+        let send_stuck = self.send_waiters.iter().filter(|&&w| w).count();
+        eprintln!(
+            "[ringline waiterdiag] recv_stuck={} connect_stuck={} send_stuck={} \
+             recv_stuck_idx={:?} connect_stuck_idx={:?} | \
+             recv_wake_calls={} recv_wake_no_waiter={} connect_wake_calls={} connect_wake_no_waiter={}",
+            recv_stuck.len(),
+            connect_stuck.len(),
+            send_stuck,
+            &recv_stuck[..recv_stuck.len().min(12)],
+            &connect_stuck[..connect_stuck.len().min(12)],
+            DBG_RECV_WAKE_CALLS.with(|c| c.get()),
+            DBG_RECV_WAKE_NO_WAITER.with(|c| c.get()),
+            DBG_CONNECT_WAKE_CALLS.with(|c| c.get()),
+            DBG_CONNECT_WAKE_NO_WAITER.with(|c| c.get()),
+        );
     }
 
     /// Wake a task that was waiting for a disk I/O completion.
