@@ -790,17 +790,32 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             OpTag::RecvMulti => self.handle_recv_multi(ud, result, flags),
             OpTag::Send => self.handle_send(ud, result),
             OpTag::SendMsgZc => self.handle_send_msg_zc(ud, result, flags),
-            OpTag::Close => self.handle_close(ud),
+            OpTag::Close => {
+                crate::runtime::DBG_CQE_CLOSE.with(|c| c.set(c.get() + 1));
+                self.handle_close(ud)
+            }
             OpTag::Shutdown => {}
-            OpTag::EventFdRead => self.handle_eventfd_read(),
+            OpTag::EventFdRead => {
+                crate::runtime::DBG_CQE_EVENTFD.with(|c| c.set(c.get() + 1));
+                self.handle_eventfd_read()
+            }
             OpTag::TlsSend => self.handle_tls_send(ud, result),
             OpTag::Connect => self.handle_connect(ud, result),
-            OpTag::Timeout => self.handle_timeout(ud, result),
-            OpTag::Cancel => {}
+            OpTag::Timeout => {
+                crate::runtime::DBG_CQE_TIMEOUT.with(|c| c.set(c.get() + 1));
+                self.handle_timeout(ud, result)
+            }
+            OpTag::Cancel => {
+                crate::runtime::DBG_CQE_CANCEL.with(|c| c.set(c.get() + 1));
+            }
             OpTag::TickTimeout => {
+                crate::runtime::DBG_CQE_TICK.with(|c| c.set(c.get() + 1));
                 self.driver.tick_timeout_armed = false;
             }
-            OpTag::Timer => self.handle_timer(ud, result),
+            OpTag::Timer => {
+                crate::runtime::DBG_CQE_TIMER.with(|c| c.set(c.get() + 1));
+                self.handle_timer(ud, result)
+            }
             OpTag::RecvMsgUdp => self.handle_recv_msg_udp(ud, result, flags),
             OpTag::SendMsgUdp => self.handle_send_msg_udp(ud, result),
             OpTag::RecvUdp => self.handle_recv_udp(ud, result, flags),

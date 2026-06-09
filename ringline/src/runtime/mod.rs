@@ -189,6 +189,16 @@ thread_local! {
     // "queued (in_flight already true)" vs "submitted directly".
     pub(crate) static DBG_SEND_SUBMIT_PATH: Cell<u64> = const { Cell::new(0) };
     pub(crate) static DBG_SEND_QUEUED_PATH: Cell<u64> = const { Cell::new(0) };
+    // Round 6: per-OpTag CQE histogram — what is completing ~7×/iter on the
+    // busy-spinning workers? (recv/send/connect already known to be ~0.)
+    pub(crate) static DBG_CQE_EVENTFD: Cell<u64> = const { Cell::new(0) };
+    pub(crate) static DBG_CQE_TICK: Cell<u64> = const { Cell::new(0) };
+    pub(crate) static DBG_CQE_TIMEOUT: Cell<u64> = const { Cell::new(0) };
+    pub(crate) static DBG_CQE_TIMER: Cell<u64> = const { Cell::new(0) };
+    pub(crate) static DBG_CQE_CANCEL: Cell<u64> = const { Cell::new(0) };
+    pub(crate) static DBG_CQE_CLOSE: Cell<u64> = const { Cell::new(0) };
+    // Round 6: wake_task total calls (which wake source feeds the ready queue).
+    pub(crate) static DBG_WAKE_TASK: Cell<u64> = const { Cell::new(0) };
 }
 
 /// Pool of timer slots backed by stable memory for the I/O backend.
@@ -522,6 +532,7 @@ impl Executor {
     /// (index | STANDALONE_BIT). Returns true if the task was parked and
     /// is now ready.
     pub(crate) fn wake_task(&mut self, task_id: u32) -> bool {
+        DBG_WAKE_TASK.with(|c| c.set(c.get() + 1));
         if task_id & waker::STANDALONE_BIT != 0 {
             let idx = task_id & !waker::STANDALONE_BIT;
             if self.standalone_slab.wake(idx) {
@@ -649,6 +660,16 @@ impl Executor {
             "[ringline senddiag] send_submit_path={} send_queued_path={}",
             DBG_SEND_SUBMIT_PATH.with(|c| c.get()),
             DBG_SEND_QUEUED_PATH.with(|c| c.get()),
+        );
+        eprintln!(
+            "[ringline cqediag] eventfd={} tick={} timeout={} timer={} cancel={} close={} | wake_task={}",
+            DBG_CQE_EVENTFD.with(|c| c.get()),
+            DBG_CQE_TICK.with(|c| c.get()),
+            DBG_CQE_TIMEOUT.with(|c| c.get()),
+            DBG_CQE_TIMER.with(|c| c.get()),
+            DBG_CQE_CANCEL.with(|c| c.get()),
+            DBG_CQE_CLOSE.with(|c| c.get()),
+            DBG_WAKE_TASK.with(|c| c.get()),
         );
     }
 
