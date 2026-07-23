@@ -1050,6 +1050,9 @@ impl Driver {
             &mut self.send_copy_pool,
         );
         state.in_flight = false;
+        // Abandon any partially-accumulated logical send so the next one
+        // starts from zero.
+        state.acked_bytes = 0;
         // The queue is now empty and nothing is in flight — fire a deferred
         // close if one was pending so the connection can't leak.
         self.try_finalize_close(conn_index);
