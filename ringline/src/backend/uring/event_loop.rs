@@ -86,8 +86,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         })
     }
 
-    /// Run the async event loop. Blocks the current thread.
-    pub(crate) fn run(&mut self) -> Result<(), crate::error::Error> {
+    /// Complete the fallible backend setup known before the runtime is ready.
+    ///
+    /// The eventfd-read SQE points into this event loop, so the caller must not
+    /// move it between this method and `run()`. `run()` can still return an
+    /// error after the listener becomes live.
+    pub(crate) fn prepare_run(&mut self) -> Result<(), crate::error::Error> {
         // Always arm eventfd read — needed for shutdown wakeup even in client-only mode.
         self.driver
             .ring
@@ -104,6 +108,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             );
         }
 
+        Ok(())
+    }
+
+    /// Run the async event loop. Blocks the current thread.
+    pub(crate) fn run(&mut self) -> Result<(), crate::error::Error> {
         // Spawn UDP handler tasks for each bound UDP socket.
         for udp_idx in 0..self.driver.udp_sockets.len() {
             let udp_ctx = UdpCtx {

@@ -20,6 +20,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- `ringline` (core): listener creation is delayed until every worker has
+  completed its fallible backend preparation. A startup failure now rolls back
+  partial workers and runtime descriptors before `launch()` returns, allowing a
+  caller to retry safely without having exposed a listening socket. Listener
+  errors consequently surface only after worker startup and teardown, so errors
+  such as `AddrInUse` may take longer to return than before. Errors from a worker
+  event loop after the listener becomes live remain observable through its join
+  handle.
+
 - `ringline-http`: chunked-decoding arithmetic overflow on a chunk-size line
   near `usize::MAX` (e.g. `FFFFFFFFFFFFFFFc\r\n`). Reachable when
   `set_max_chunk_size` is raised to disable the cap (the default 16 MiB cap

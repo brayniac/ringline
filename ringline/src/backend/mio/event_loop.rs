@@ -99,8 +99,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         })
     }
 
-    /// Run the mio event loop until shutdown.
-    pub(crate) fn run(&mut self) -> Result<(), crate::error::Error> {
+    /// Complete the fallible backend setup known before the runtime is ready.
+    ///
+    /// `run()` can still return an error after the listener becomes live.
+    pub(crate) fn prepare_run(&mut self) -> Result<(), crate::error::Error> {
         // Register the wake pipe read-end with mio Poll.
         self.driver.poll.registry().register(
             &mut mio::unix::SourceFd(&self.driver.wake_pipe_fd),
@@ -108,6 +110,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             mio::Interest::READABLE,
         )?;
 
+        Ok(())
+    }
+
+    /// Run the mio event loop until shutdown.
+    pub(crate) fn run(&mut self) -> Result<(), crate::error::Error> {
         // Spawn UDP handler tasks for each bound UDP socket.
         for udp_index in 0..self.driver.udp_sockets.len() {
             let udp_ctx = UdpCtx {
