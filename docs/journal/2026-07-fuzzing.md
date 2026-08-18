@@ -106,6 +106,9 @@ quinn-proto endpoint — no sans-IO seam exists.
   accumulator grows more state transitions.
 - Open: seed corpora from real traffic captures would raise coverage; start
   with hand-written minimal seeds.
-- Open: a periodic corpus-persistence scheme (cache or artifact round-trip in
+- ~~Open: a periodic corpus-persistence scheme (cache or artifact round-trip in
   CI) would let coverage accumulate across runs instead of restarting from
-  seeds daily.
+  seeds daily.~~ Done (2026-08-18): per-target `actions/cache` round-trip with
+  rolling run-id keys, `cargo fuzz cmin` before each save so the persisted
+  corpus stays minimal, and save-on-failure so crash-finding runs keep their
+  coverage progress.
