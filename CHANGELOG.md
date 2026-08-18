@@ -18,6 +18,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   wrappers for the crate-private HTTP/1.1 parsers; no internal types are
   exported and there is no behavior change without the feature (#263).
 
+### Fixed
+
+- `ringline-http`: chunked-decoding arithmetic overflow on a chunk-size line
+  near `usize::MAX` (e.g. `FFFFFFFFFFFFFFFc\r\n`). Reachable when
+  `set_max_chunk_size` is raised to disable the cap (the default 16 MiB cap
+  rejects such sizes first): debug builds panicked on peer-controlled input;
+  release builds silently wrapped the chunk length. The framing offsets now use
+  checked arithmetic and reject the chunk as invalid. Found by the first
+  persistent-corpus fuzz CI run (#308).
+
 ## [0.5.3] - 2026-07-23
 
 Coordinated release of two `io_uring` correctness fixes surfaced by the cachecannon
