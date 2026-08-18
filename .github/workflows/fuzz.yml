@@ -34,7 +34,12 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@nightly
 
-      - uses: taiki-e/install-action@cargo-fuzz
+      # The `@cargo-fuzz` tag shorthand can resolve with an empty tool input
+      # (observed in run 32181559223: "no tool specified" warning, step
+      # succeeds without installing) — use the explicit `tool:` form.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
 
       - uses: Swatinem/rust-cache@v2
         with:
