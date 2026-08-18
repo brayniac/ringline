@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Fuzzing: eight cargo-fuzz/libFuzzer targets covering the wire-facing parsers
+  (h2 frame/HPACK/connection, h3 frame/QPACK, gRPC message/connection, HTTP/1.1
+  response), in an excluded `fuzz/` workspace with committed seed corpora, plus
+  a daily fuzz CI workflow (#263, #303, #305).
+- `ringline-http`: off-by-default `fuzzing` feature exposing `#[doc(hidden)]`
+  wrappers for the crate-private HTTP/1.1 parsers; no internal types are
+  exported and there is no behavior change without the feature (#263).
+
 ## [0.5.3] - 2026-07-23
 
 Coordinated release of two `io_uring` correctness fixes surfaced by the cachecannon
