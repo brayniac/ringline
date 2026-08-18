@@ -45,9 +45,13 @@ jobs:
         with:
           workspaces: fuzz
 
+      # --target is explicit because cargo-fuzz defaults to the triple it was
+      # itself built for; the prebuilt install-action binary is musl, and
+      # ASan can't link against static musl (run 32182376513).
       - name: Run fuzz target
         run: |
-          cargo +nightly fuzz run ${{ matrix.target }} -- \
+          cargo +nightly fuzz run ${{ matrix.target }} \
+            --target x86_64-unknown-linux-gnu -- \
             -max_total_time=${{ github.event.inputs.max_total_time || 300 }} \
             -rss_limit_mb=4096 \
             -timeout=30
