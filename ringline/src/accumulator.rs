@@ -20,6 +20,12 @@ pub struct RecvAccumulator {
     /// after an `append`. `append` reports overflow rather than growing
     /// past this.
     max_size: usize,
+    /// High-water total-size target announced via [`reserve`](Self::reserve)
+    /// (a length-prefixed parser that has seen its header). Consulted by
+    /// every growth site — `append` and the `unfreeze` merge — so a
+    /// multi-chunk message allocates once at full size instead of running
+    /// the doubling-regrowth cascade. Cleared when the contents drain.
+    reserve_target: usize,
 }
 
 impl RecvAccumulator {
@@ -40,6 +46,7 @@ impl RecvAccumulator {
             buf: BytesMut::with_capacity(capacity),
             frozen: None,
             max_size,
+            reserve_target: 0,
         }
     }
 
@@ -53,8 +60,15 @@ impl RecvAccumulator {
     /// `WithDataFuture::poll`). The authoritative cap-enforcement sites are
     /// the kernel-recv handlers in `backend/uring/event_loop.rs`.
     pub fn append(&mut self, data: &[u8]) -> bool {
-        if self.total_len().saturating_add(data.len()) > self.max_size {
+        let total = self.total_len();
+        if total.saturating_add(data.len()) > self.max_size {
             return false;
+        }
+        // When a growth is imminent and a reserve target was announced,
+        // size the allocation for the whole remaining message up front.
+        if self.buf.capacity() - self.buf.len() < data.len() {
+            let want = self.reserve_target.saturating_sub(total).max(data.len());
+            self.buf.reserve(want);
         }
         self.buf.extend_from_slice(data);
         true
@@ -63,6 +77,16 @@ impl RecvAccumulator {
     /// Total buffered bytes: held frozen remainder + mutable tail.
     fn total_len(&self) -> usize {
         self.frozen.as_ref().map_or(0, |f| f.len()) + self.buf.len()
+    }
+
+    /// Whether the accumulator holds no bytes at all — O(1), and unlike
+    /// `data().is_empty()` it never merges a held frozen remainder into
+    /// `buf`. Hot paths that only need emptiness (e.g. the zero-copy recv
+    /// fast-path check) must use this: a `data()` call while a remainder is
+    /// held and new bytes have arrived forces a full merge copy per call —
+    /// O(N·K) over an N-byte value arriving in K chunks.
+    pub fn is_empty(&self) -> bool {
+        self.total_len() == 0
     }
 
     /// Merge a held frozen remainder into `buf` so the contents are one
@@ -83,6 +107,16 @@ impl RecvAccumulator {
         match rem.try_into_mut() {
             Ok(mut recovered) => {
                 if !self.buf.is_empty() {
+                    // Honor a pending reserve target so the streaming
+                    // NeedAtLeast cycle merges into a full-size buffer once
+                    // instead of regrowing per appended chunk.
+                    let want = self
+                        .reserve_target
+                        .saturating_sub(recovered.len() + self.buf.len())
+                        .saturating_add(self.buf.len());
+                    if recovered.capacity() - recovered.len() < want {
+                        recovered.reserve(want);
+                    }
                     recovered.extend_from_slice(&self.buf);
                 }
                 self.buf = recovered;
@@ -91,7 +125,8 @@ impl RecvAccumulator {
                 if self.buf.is_empty() {
                     self.buf.extend_from_slice(&rem);
                 } else {
-                    let mut merged = BytesMut::with_capacity(rem.len() + self.buf.len());
+                    let merged_len = rem.len() + self.buf.len();
+                    let mut merged = BytesMut::with_capacity(merged_len.max(self.reserve_target));
                     merged.extend_from_slice(&rem);
                     merged.extend_from_slice(&self.buf);
                     self.buf = merged;
@@ -134,6 +169,9 @@ impl RecvAccumulator {
             if f.is_empty() {
                 self.frozen = None;
             }
+            if self.total_len() == 0 {
+                self.reserve_target = 0;
+            }
             return;
         }
         debug_assert!(
@@ -143,12 +181,31 @@ impl RecvAccumulator {
         );
         let n = n.min(self.buf.len());
         self.buf.advance(n);
+        if self.total_len() == 0 {
+            self.reserve_target = 0;
+        }
+    }
+
+    /// Announce that at least `additional` more bytes are expected beyond
+    /// the current contents (a length-prefixed parser that has seen its
+    /// header). Records a high-water total-size target — clamped to
+    /// `max_size` — that `append` and the `unfreeze` merge use to allocate
+    /// once at full size instead of running the doubling-regrowth cascade
+    /// (~2× the payload in extra memcpy for a multi-MB message arriving
+    /// in chunks). The target clears when the contents drain.
+    pub fn reserve(&mut self, additional: usize) {
+        let target = self
+            .total_len()
+            .saturating_add(additional)
+            .min(self.max_size);
+        self.reserve_target = self.reserve_target.max(target);
     }
 
     /// Reset the accumulator (discard all data).
     pub fn reset(&mut self) {
         self.frozen = None;
         self.buf.clear();
+        self.reserve_target = 0;
     }
 
     /// Return the current backing-buffer capacity. Test-only.
@@ -201,9 +258,22 @@ impl AccumulatorTable {
         self.accumulators[index as usize].data()
     }
 
+    /// Whether the accumulator at the given index is empty — O(1) and
+    /// non-merging, unlike `data(index).is_empty()` (see
+    /// [`RecvAccumulator::is_empty`]).
+    pub fn is_empty(&self, index: u32) -> bool {
+        self.accumulators[index as usize].is_empty()
+    }
+
     /// Consume `n` bytes from the accumulator at the given index.
     pub fn consume(&mut self, index: u32, n: usize) {
         self.accumulators[index as usize].consume(n);
+    }
+
+    /// Reserve capacity for `additional` more bytes at the given index
+    /// (clamped to the accumulator's `max_size`).
+    pub fn reserve(&mut self, index: u32, additional: usize) {
+        self.accumulators[index as usize].reserve(additional);
     }
 
     /// Reset the accumulator at the given index.
@@ -276,6 +346,19 @@ impl AccumulatorTable {
         );
         // `put_back` follows `take_frozen` within one poll, so `buf` holds
         // only data appended after the take (normally nothing).
+        //
+        // Drop `buf`'s handle when it is empty: `take_frozen`'s `split_to`
+        // left it sharing the remainder's allocation, and that extra
+        // reference makes `try_into_mut` in `unfreeze` fail — forcing a
+        // full-remainder copy on EVERY merge instead of an in-place append
+        // of just the new bytes. For an N-byte response streamed in K
+        // chunks that is O(N·K): measured 69 GB memcpy'd to receive 4.8 GB
+        // of 64 MiB values. Nothing is lost by dropping the handle — once
+        // the remainder is uniquely referenced, `try_into_mut` recovers the
+        // full original allocation (including this tail capacity).
+        if acc.buf.is_empty() {
+            acc.buf = BytesMut::new();
+        }
         acc.frozen = Some(data);
     }
 
@@ -315,6 +398,69 @@ impl AccumulatorTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reserve_sizes_append_growth_once() {
+        let mut acc = RecvAccumulator::new(64);
+        acc.append(b"header");
+        // Announce a 1MB remainder: the next growth allocates it all.
+        acc.reserve(1024 * 1024);
+        acc.append(&[0u8; 128]); // forces growth past the initial 64
+        let cap_after_first_growth = acc.capacity();
+        assert!(
+            cap_after_first_growth >= 6 + 1024 * 1024,
+            "growth ignored reserve target: cap {cap_after_first_growth}"
+        );
+        // Streaming the remainder never reallocates again.
+        for _ in 0..15 {
+            acc.append(&[0u8; 64 * 1024]);
+        }
+        assert_eq!(acc.capacity(), cap_after_first_growth);
+    }
+
+    #[test]
+    fn reserve_survives_freeze_merge_cycle() {
+        // The with_bytes cycle: take_frozen → NeedAtLeast → put_back →
+        // kernel appends → next take_frozen merges. The merge must land in
+        // a full-size buffer, not regrow per chunk.
+        let mut table = AccumulatorTable::new(1, 64);
+        table.append(0, b"$16\r\npartial");
+        let frozen = table.take_frozen(0);
+        table.put_back(0, frozen);
+        table.reserve(0, 1024 * 1024);
+        table.append(0, &[0u8; 1024]); // new data while remainder held
+        let _ = table.data(0); // forces the merge
+        let cap = table.capacity(0);
+        assert!(
+            cap >= 1024 * 1024,
+            "merge ignored reserve target: cap {cap}"
+        );
+    }
+
+    #[test]
+    fn reserve_clamps_to_max_size() {
+        let mut acc = RecvAccumulator::new_with_max(16, 1024);
+        acc.append(b"x");
+        acc.reserve(usize::MAX);
+        acc.append(&[0u8; 64]);
+        assert!(
+            acc.capacity() <= 4096,
+            "reserve target must clamp at max_size, cap {}",
+            acc.capacity()
+        );
+    }
+
+    #[test]
+    fn reserve_target_clears_when_drained() {
+        let mut acc = RecvAccumulator::new(16);
+        acc.append(b"abc");
+        acc.reserve(1024 * 1024);
+        acc.consume(3);
+        assert_eq!(acc.reserve_target, 0, "drain must clear the target");
+        // Post-drain appends grow normally, not to the stale megabyte.
+        acc.append(&[0u8; 64]);
+        assert!(acc.capacity() < 1024 * 1024);
+    }
 
     #[test]
     fn append_and_consume() {
@@ -432,6 +578,59 @@ mod tests {
             );
             drop(f);
         }
+    }
+
+    /// Streaming NeedMore cycles (take → put_back whole → new data arrives →
+    /// merge) must recover the remainder's allocation in place and append
+    /// only the new bytes — NOT re-copy the whole remainder each cycle.
+    /// This is the O(N·K) large-response path: the accumulator's empty `buf`
+    /// keeping a `split_to` handle to the remainder's allocation used to
+    /// defeat `try_into_mut` on every merge.
+    #[test]
+    fn streaming_merge_recovers_allocation_in_place() {
+        let mut table = AccumulatorTable::new(1, 1024);
+        assert!(table.append(0, b"0123456789"));
+        let frozen = table.take_frozen(0);
+        let alloc_ptr = frozen.as_ptr();
+        // Parser saw an incomplete message: put the whole view back.
+        table.put_back(0, frozen);
+        // Next chunk arrives; the merge must take the in-place path.
+        assert!(table.append(0, b"ABCDEF"));
+        let merged = table.take_frozen(0);
+        assert_eq!(&merged[..], b"0123456789ABCDEF");
+        assert_eq!(
+            merged.as_ptr(),
+            alloc_ptr,
+            "merge must recover the original allocation (try_into_mut), not copy"
+        );
+        // And again — every cycle of the stream, not just the first.
+        table.put_back(0, merged);
+        assert!(table.append(0, b"GHIJ"));
+        let merged2 = table.take_frozen(0);
+        assert_eq!(&merged2[..], b"0123456789ABCDEFGHIJ");
+        assert_eq!(
+            merged2.as_ptr(),
+            alloc_ptr,
+            "second cycle must also be in place"
+        );
+    }
+
+    #[test]
+    fn is_empty_is_non_merging() {
+        let mut table = AccumulatorTable::new(1, 64);
+        assert!(table.is_empty(0));
+        assert!(table.append(0, b"abcd"));
+        assert!(!table.is_empty(0));
+        let frozen = table.take_frozen(0);
+        assert!(table.is_empty(0));
+        table.put_back(0, frozen);
+        assert!(!table.is_empty(0));
+        // New data while a remainder is held: emptiness must be answerable
+        // without merging (can't observe the non-merge directly here, but
+        // the streaming test above fails if a merge sneaks in and copies).
+        assert!(table.append(0, b"ef"));
+        assert!(!table.is_empty(0));
+        assert_eq!(table.data(0), b"abcdef");
     }
 
     #[test]

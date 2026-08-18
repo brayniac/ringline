@@ -166,6 +166,28 @@ impl Ring {
         Ok(())
     }
 
+    /// Submit a one-shot fallback recv into fallback-pool memory for a
+    /// connection whose multishot recv is parked on ENOBUFS. The pool slot
+    /// is carried in the payload and released by `handle_recv_fallback`;
+    /// the pool owns `ptr` until that CQE arrives (SQE memory outlives the
+    /// operation even across close/slot-reuse).
+    pub fn submit_recv_fallback(
+        &mut self,
+        conn_index: u32,
+        ptr: *mut u8,
+        len: u32,
+        pool_slot: u16,
+    ) -> io::Result<()> {
+        let user_data = UserData::encode(OpTag::RecvFallback, conn_index, pool_slot as u32);
+        let entry = opcode::Recv::new(Fixed(conn_index), ptr, len)
+            .build()
+            .user_data(user_data.raw());
+        unsafe {
+            self.push_sqe(entry)?;
+        }
+        Ok(())
+    }
+
     /// Submit a multishot recv with provided buffer ring for a connection.
     pub fn submit_multishot_recv(&mut self, conn_index: u32) -> io::Result<()> {
         let user_data = UserData::encode(OpTag::RecvMulti, conn_index, 0);
@@ -286,6 +308,76 @@ impl Ring {
             slab_idx as u32,
         );
         let entry = opcode::PollAdd::new(Fixed(conn_index), libc::POLLOUT as u32)
+            .build()
+            .user_data(user_data.raw());
+        unsafe {
+            self.push_sqe(entry)?;
+        }
+        Ok(())
+    }
+
+    /// Submit a segmented-recv Mode A forward write to a **socket** sink.
+    ///
+    /// The source `buf`/`len` points into a held provided recv buffer (or an
+    /// owned copy) whose lifetime is tracked in `Driver::forward_write` until
+    /// this CQE arrives. `fd` is the sink socket (a non-fixed raw fd borrowed
+    /// for the forward's duration via `SinkFd`). `MSG_WAITALL` makes the kernel
+    /// retry short stream sends in place (5.19+).
+    ///
+    /// # Safety
+    /// `buf`/`len` must stay valid until the CQE arrives (the driver holds the
+    /// backing) and `fd` must stay open for the operation's lifetime.
+    pub unsafe fn submit_forward_write_socket(
+        &mut self,
+        fd: RawFd,
+        buf: *const u8,
+        len: u32,
+        user_data: UserData,
+    ) -> io::Result<()> {
+        let entry = opcode::Send::new(Fd(fd), buf, len)
+            .flags(crate::completion::STREAM_SEND_FLAGS)
+            .build()
+            .user_data(user_data.raw());
+        unsafe {
+            self.push_sqe(entry)?;
+        }
+        Ok(())
+    }
+
+    /// Submit a segmented-recv Mode A forward write to a **buffered file** sink
+    /// at an explicit offset (`pwrite` semantics). A short write is resubmitted
+    /// at the advanced offset by the completion handler.
+    ///
+    /// # Safety
+    /// `buf`/`len` must stay valid until the CQE arrives (the driver holds the
+    /// backing) and `fd` must stay open for the operation's lifetime.
+    pub unsafe fn submit_forward_write_file(
+        &mut self,
+        fd: RawFd,
+        buf: *const u8,
+        len: u32,
+        offset: u64,
+        user_data: UserData,
+    ) -> io::Result<()> {
+        let entry = opcode::Write::new(Fd(fd), buf, len)
+            .offset(offset)
+            .build()
+            .user_data(user_data.raw());
+        unsafe {
+            self.push_sqe(entry)?;
+        }
+        Ok(())
+    }
+
+    /// Arm a POLLOUT poll on a forward-write **socket** sink after a send
+    /// returned `-EAGAIN`; the handler resubmits the remaining bytes when the
+    /// sink becomes writable.
+    pub fn submit_forward_write_pollout(
+        &mut self,
+        fd: RawFd,
+        user_data: UserData,
+    ) -> io::Result<()> {
+        let entry = opcode::PollAdd::new(Fd(fd), libc::POLLOUT as u32)
             .build()
             .user_data(user_data.raw());
         unsafe {

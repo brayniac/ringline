@@ -7,6 +7,228 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-07-23
+
+Coordinated release of two `io_uring` correctness fixes surfaced by the cachecannon
+valkey-search harness (cachecannon/cachecannon#116). Core `ringline` 0.5.3 fixes a
+multi-chunk send-completion wake race; `ringline-redis` 0.6.6 lifts the recv-side
+collection cap. Other client crates are unchanged (`ringline-memcache` stays 0.6.4;
+`-ping` / `-h2` / `-h3` / `-quic` / `-http` / `-grpc` stay 0.5.2).
+
+### Fixed
+
+- `ringline` (core): send-completion wake race for a logical send larger than one
+  send-copy pool slot (16 KiB). Such a send is split into several chunks serialized
+  through the per-connection send queue, but a connection has a single send waiter;
+  it was woken on the *first* chunk's completion (a short byte count) and consumed, so
+  the remaining chunks' completions found no waiter and were dropped, hanging a caller
+  awaiting the full logical send. Each logical send's final chunk now carries an
+  `end_of_send` marker and the waiter is woken exactly once, on that completion, with
+  the whole logical byte count — while independent pipelined sends on one connection
+  still each wake with their own count. Timing/kernel-sensitive: deterministic on
+  Linux 6.1 aarch64, masked on 6.12 x86. (#299)
+- `ringline-redis`: `read_value` (behind `Client::cmd` and `Pipeline::execute`) no
+  longer caps array replies at resp-proto's 1024-element default, which surfaced as a
+  `CollectionTooLarge` protocol error that closed the connection on a large `LRANGE`,
+  an `FT.SEARCH` with large `k`, or a `SCAN` batch that overshot `COUNT`. The
+  collection caps are lifted to a bounded `1 << 20` — not `usize::MAX`, since array
+  parsing pre-allocates `Vec::with_capacity(announced_len)`, so an uncapped limit
+  would be an OOM vector on a hostile announced length. (#298)
+
+## [ringline-redis 0.6.5] - 2026-07-22
+
+Per-crate patch release (`ringline-redis` only; other crates unchanged). Adds
+RESP3 null handling to the GET reply parser so a `HELLO 3` connection classifies
+a GET miss correctly instead of erroring.
+
+### Fixed
+
+- `ringline-redis`: `parse_get_header` now treats the RESP3 null header (`_\r\n`)
+  as a GET miss (`GetHeader::Nil`), matching the RESP2 `$-1\r\n` behavior.
+  Previously a GET miss on a RESP3 (`HELLO 3`) connection hit the catch-all and
+  surfaced as `UnexpectedResponse`, poisoning the connection on the borrow/segments
+  path. Waiting for the CRLF means all three GET drain paths (io_uring state
+  machine, mio drain, sequential borrow) consume the 3-byte frame exactly, so no
+  call-site changes were needed. SET/DEL were already correct via `read_value`
+  (RESP3 null decoded through resp-proto's `resp3` feature). (#294)
+
+## [0.5.2] - 2026-07-21
+
+Coordinated minor release (additive — no breaking API changes). Core `ringline` 0.5.2 lands segmented zero-copy recv (Modes A/B/C) + occupancy; `ringline-redis` and `-memcache` 0.6.4 add the streaming/borrow clients (`recv_meta`, `get_stream`/`set_stream`, `OpKind`/`RespMeta`, memcache `get_cas`). Other client crates unchanged since 0.5.1 (`ringline-ping` / `-h2` / `-h3` / `-quic` / `-http` / `-grpc` stay 0.5.2).
+
+### Added
+
+- `ringline-redis`: streaming GET — `Client::get_stream(key) -> Option<ValueStream>`
+  (single-connection `Client` only). The value body is delivered over the
+  runtime's segmented-recv API instead of being materialized: `ValueStream`
+  exposes `len()`, `discard()` (consume without a gather copy), `next_segment()`
+  (owned chunks), and `collect()` (the one materialization). Bounded to the
+  parsed bulk length with an error on a short FIN; dropping a stream mid-value
+  poisons (closes) the connection. io_uring only. Pooled/sharded/cluster `get`
+  stay materialized. (`recv_streaming` fire/recv integration is deferred.)
+- `ringline-memcache`: streaming GET — `Client::get_stream(key) -> Option<StreamValue>`
+  (single-connection `Client` only). Mirrors the redis streaming API for the
+  memcache wire format (`VALUE <key> <flags> <bytes>\r\n<data>\r\nEND\r\n`):
+  the client parses the `VALUE` header, then streams the `<bytes>` value body
+  over the runtime's segmented-recv API. `StreamValue` exposes `flags()`, `len()`,
+  `discard()` (consume without a gather copy), `next_segment()` (owned chunks),
+  and `collect()` (the one materialization). Bounded to the parsed length with an
+  error on a short FIN; dropping a stream mid-value poisons (closes) the
+  connection. A miss (bare `END\r\n`) returns `Ok(None)`. io_uring only. The
+  multi-key `gets(keys)` stays eager; pooled/sharded `get` stay materialized.
+- `ringline-memcache`: streaming get-with-CAS —
+  `Client::get_cas(key) -> Option<CasStreamValue>` (single-connection `Client`
+  only). The CAS-carrying mirror of `get_stream`: issues `gets <key>`, parses the
+  5-token `VALUE <key> <flags> <bytes> <cas>\r\n` header (CAS exposed via
+  `CasStreamValue::cas()`), then streams the value body exactly like `get_stream`
+  (bounded to `<bytes>`, `\r\nEND\r\n` trailer, short-FIN error, undrained-drop
+  poison). A miss (bare `END\r\n`) returns `Ok(None)`. io_uring only.
+- `ringline-redis` / `ringline-memcache`: streaming SET — `Client::set_stream`
+  writes a large value from a caller-provided `SegmentSource` (a synchronous
+  chunk-yielding trait, blanket-implemented for `Iterator<Item = Bytes>`) without
+  gathering it into one contiguous buffer. The command framing declares the value
+  length up front; the client streams chunks, then reads the reply. `len` is the
+  authoritative contract: if the source yields fewer or more bytes, the connection
+  is closed and `Error::LengthMismatch` is returned (a partial frame is already on
+  the wire — the same poison discipline as the read side). Single-connection
+  `Client` only; works on both backends (v1 copies each chunk into the send pool —
+  zero-copy guarded streaming is a later optimization).
+- `ConnCtx::end_segments()` — end segmented-recv delivery and restore the default
+  `with_data`/`with_bytes` read path (gathering any still-held segments into the
+  accumulator). io_uring only.
+- `ConfigBuilder::forward_hold_cap` (default 64, 2× `MAX_IOVECS`) — per-connection
+  held-buffer cap for Mode A `forward_to`. When a forwarding connection's held
+  buffers reach the cap (a slow/high-latency sink, or a very large object), its
+  multishot recv is cancelled so its TCP receive window closes and the source
+  stops sending; the recv is re-armed once writes drain the hold below the cap.
+  This bounds one slow forward so it cannot deplete the shared per-worker recv
+  ring and `ENOBUFS`-starve other connections. New `forward_throttled` pool metric
+  counts throttle events. io_uring only.
+
+## [0.5.1] - 2026-07-17
+
+Coordinated patch release. The fix is in core `ringline`; all client
+crates are rebuilt against it and republished (`ringline-redis` 0.6.3,
+`ringline-memcache` 0.6.3, and `ringline-ping` / `-h2` / `-h3` /
+`-quic` / `-http` / `-grpc` 0.5.2). No client-crate API changes.
+
+### Fixed
+
+- `RecvAccumulator`: receiving a large response streamed across many recv
+  completions no longer re-copies the entire accumulated buffer on every
+  chunk (O(N·K) for an N-byte value in K chunks). Two causes: (1)
+  `put_back()` now drops the empty `buf`'s handle to the allocation it
+  shared with the frozen remainder (left behind by `take_frozen()`'s
+  `split_to`), so `unfreeze()`'s `try_into_mut()` can recover the
+  allocation and append only the new bytes instead of falling back to a
+  full-remainder copy; (2) hot-path emptiness checks (`dispatch_cqe`
+  zero-copy fast path, `WithDataFuture`, wait-readable) use a new
+  non-merging `AccumulatorTable::is_empty()` instead of
+  `data().is_empty()`, which forced a merge per recv CQE. This also makes
+  the in-place-recovery path that `NeedAtLeast` (0.5.0) added to
+  `unfreeze` actually reachable — until now `try_into_mut` always failed,
+  so the reserve-honoring merge branch never ran. Measured with
+  ringline-redis GETs of 64 MiB values (c8gn.16xlarge pair, io_uring):
+  69 GB memcpy'd to receive 4.8 GB, single-connection fetch 197 ms
+  (2.7 Gbps) → after the fix 0 full-remainder copies, 56 ms (9.5 Gbps,
+  the per-flow wire cap); 32 connections: 15.8 → 200 Gbps (NIC line
+  rate). 128 KiB pipelined workloads are unaffected (within noise).
+
+## [0.5.0] - 2026-07-17
+
+Coordinated release. Core `ringline` takes a breaking `ParseResult`
+change; all client crates are rebuilt against it and republished
+(`ringline-redis` 0.6.2, `ringline-memcache` 0.6.2, and
+`ringline-ping` / `-h2` / `-h3` / `-quic` / `-http` / `-grpc` 0.5.1).
+
+### Changed (BREAKING)
+
+- `ParseResult` gains a `NeedAtLeast(usize)` variant and is now
+  `#[non_exhaustive]`. A length-prefixed parser that has seen its header
+  can announce the remaining byte count; the runtime reserves the recv
+  accumulator once at full size instead of doubling through a multi-MB
+  message arriving in chunks (~2× the payload in avoided memcpy). Only
+  code that exhaustively matches `ParseResult` is affected — closures
+  that construct it are untouched.
+
+### Added
+
+- `RecvAccumulator::reserve` / `AccumulatorTable::reserve`: record a
+  high-water size target honored by every growth site (`append` and the
+  freeze-merge path), clamped to `max_size` and cleared when the
+  contents drain.
+- Graceful degradation for responses larger than the provided recv ring
+  (io_uring backend). A connection whose multishot recv parks on
+  `ENOBUFS` with a partial message already accumulated now degrades to
+  one-shot fallback recvs into pool-owned memory instead of stalling
+  until buffers recycle — a parked receiver stops draining the socket,
+  so the TCP window closes and the sender stalls for the park's
+  duration. Plaintext accumulator-path connections only (TLS, recv
+  sinks, zero-copy forward, and direct echo keep the park-until-
+  replenish behavior). New metrics: `pool/recv_fallback` submissions
+  and `bytes/fallback_received`; the shutdown `[ringline diag]` line
+  gains `fallbacks=`. Rig-validated (64KiB ring): 4MB GET 30→216 req/s,
+  16MB 1→22 req/s.
+- Starved connections holding an unconsumed zero-copy buffer
+  (`pending_recv_bufs`) now have the hold flushed to the accumulator on
+  the replenish pass, returning its bid to the ring instead of waiting
+  for the task to consume it.
+- `pool/recv_parked` metric (+ `parks=` in the shutdown diag line) and a
+  fix for the `ringline/ring` counter group being undersized (the
+  `cqe_unknown_tag` slot never counted).
+
+### ringline-redis 0.6.2
+
+- Incomplete bulk-string replies return `ParseResult::NeedAtLeast`
+  computed from the RESP `$<len>\r\n` header, so multi-MB values reserve
+  their accumulator once instead of regrowing per chunk.
+
+### Other client crates
+
+- `ringline-memcache` 0.6.2, `ringline-ping` / `ringline-h2` /
+  `ringline-h3` / `ringline-quic` / `ringline-http` / `ringline-grpc`
+  0.5.1: rebuilt against core 0.5.0. No API changes.
+
+## [ringline-memcache 0.6.1] - 2026-07-16
+
+### Fixed
+
+- Values larger than 1 MiB are no longer rejected client-side. The
+  `validate_value` / `validate_value_len` checks (and the
+  `MAX_VALUE_LEN` constant) were removed from the encode path —
+  memcached's `-I` item-size limit is a tunable server knob, so an
+  oversized value now goes on the wire and the server replies with a
+  clean `SERVER_ERROR object too large for cache` instead of the client
+  second-guessing it. The 250-byte `MAX_KEY_LEN` check is retained (an
+  oversized key corrupts the command frame).
+
+### Removed
+
+- `Error::ValueTooLong` variant and the `MAX_VALUE_LEN` constant.
+  Non-breaking: `Error` is `#[non_exhaustive]` and the constant is a
+  `pub const` downstream can redefine.
+
+## [ringline-redis 0.6.1] - 2026-07-16
+
+### Fixed
+
+- Bulk-string responses larger than 1 MiB no longer fail. `read_value()`
+  switched from resp-proto's default `Value::parse_bytes` (which caps bulk
+  strings at `DEFAULT_MAX_BULK_STRING_LEN`, 1 MiB) to
+  `Value::parse_bytes_with_options` with `max_bulk_string_len: usize::MAX`.
+  Previously a larger value from a real Redis server (Redis 7's
+  `proto-max-bulk-len` defaults to 512 MiB) hit `BulkStringTooLong` →
+  `Error::Protocol` → a deliberate connection close. The runtime
+  `RecvAccumulator` capacity remains the genuine backstop.
+
+## [0.4.1] - 2026-07-16
+
+### Security
+
+- Bumped `crossbeam-epoch` 0.9.18 → 0.9.20 in the committed lockfile for
+  RUSTSEC-2026-0204 (dev-dependency via criterion; does not affect
+  downstream consumers of the published crates).
+
 ## [0.4.0] - 2026-07-06
 
 Coordinated breaking release carrying the 2026-07 full correctness audit

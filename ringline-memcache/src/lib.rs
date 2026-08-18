@@ -201,41 +201,22 @@ pub enum Error {
     #[error("key too long (max 250 bytes)")]
     KeyTooLong,
 
-    /// Value exceeds memcache's default `-I` 1 MiB cap ([`MAX_VALUE_LEN`]).
-    /// Same rationale as [`Error::KeyTooLong`].
-    #[error("value too long (max 1048576 bytes)")]
-    ValueTooLong,
+    /// A streaming [`set_stream`](Client::set_stream) value source produced a
+    /// different number of bytes than the declared length. Because the command
+    /// header (which declares the length) is already on the wire, the framing is
+    /// now irrecoverably desynced, so the connection is closed — matching the
+    /// read-side poison rule.
+    #[error("streaming value length mismatch")]
+    LengthMismatch,
 }
 
 /// Maximum key length per memcache text-protocol spec.
 pub const MAX_KEY_LEN: usize = 250;
 
-/// Maximum value length matching the parser cap in `memcache-proto`
-/// (`MAX_VALUE_DATA_LEN`) and memcached's default `-I` 1 MiB item size.
-pub const MAX_VALUE_LEN: usize = 1024 * 1024;
-
 #[inline]
 fn validate_key(key: &[u8]) -> Result<(), Error> {
     if key.len() > MAX_KEY_LEN {
         Err(Error::KeyTooLong)
-    } else {
-        Ok(())
-    }
-}
-
-#[inline]
-fn validate_value(value: &[u8]) -> Result<(), Error> {
-    if value.len() > MAX_VALUE_LEN {
-        Err(Error::ValueTooLong)
-    } else {
-        Ok(())
-    }
-}
-
-#[inline]
-fn validate_value_len(value_len: usize) -> Result<(), Error> {
-    if value_len > MAX_VALUE_LEN {
-        Err(Error::ValueTooLong)
     } else {
         Ok(())
     }
@@ -1595,16 +1576,740 @@ impl Client {
     }
 }
 
+// ── Streaming SET (send-side, single-connection Client only) ──────────────
+//
+// `set_stream` writes a large value from a caller-provided [`SegmentSource`]
+// without gathering it into one contiguous buffer: the command header (which
+// declares the length) is sent, then value chunks are pulled from the source and
+// streamed to the wire, then the trailing `\r\n`. Works on both backends (send
+// works everywhere); v1 copies each chunk into the send pool (`send`) — zero-copy
+// guarded streaming is a later optimization.
+
+/// A source of exactly `len` value bytes for a streaming
+/// [`set_stream`](Client::set_stream), yielded in chunks.
+///
+/// The client pulls chunks with [`next_chunk`](SegmentSource::next_chunk) until
+/// it returns `Ok(None)` (exhausted), counting bytes as it goes. If the total
+/// number of bytes yielded differs from the `len` passed to `set_stream`, the
+/// send is a protocol desync and the connection is closed
+/// ([`Error::LengthMismatch`]).
+///
+/// `next_chunk` is **synchronous** by design: it avoids the `async_fn_in_trait`
+/// public-API lint and keeps v1 simple. A source backed by async I/O should
+/// pre-buffer each chunk before yielding it. (An async pull is a documented
+/// follow-up.)
+pub trait SegmentSource {
+    /// Yield the next chunk of value bytes, or `Ok(None)` once exhausted. An
+    /// empty chunk is skipped (treated as "no bytes this call", not end).
+    fn next_chunk(&mut self) -> Result<Option<Bytes>, Error>;
+}
+
+/// A [`SegmentSource`] that yields chunks from an in-memory iterator of
+/// [`Bytes`]. Convenience for callers that already have their value in chunks
+/// (or a single chunk); the streaming win is that ringline never gathers them
+/// into one contiguous buffer.
+impl<I: Iterator<Item = Bytes>> SegmentSource for I {
+    fn next_chunk(&mut self) -> Result<Option<Bytes>, Error> {
+        Ok(self.next())
+    }
+}
+
+impl Client {
+    /// Streaming SET (single-connection [`Client`] only).
+    ///
+    /// Sends `set <key> <flags> <exptime> <len>\r\n`, then streams exactly `len`
+    /// value bytes pulled from `src`, then the trailing `\r\n`, and reads the
+    /// `STORED\r\n` reply. The value is never gathered into one contiguous buffer
+    /// on the client side.
+    ///
+    /// # Length contract
+    ///
+    /// `len` is authoritative: it is written into the command header. The client
+    /// counts the bytes pulled from `src` and returns [`Error::LengthMismatch`]
+    /// (after closing the connection) if `src` yields fewer or more than `len`
+    /// bytes — because a partial/oversized value frame is already on the wire and
+    /// the connection is irrecoverably desynced (same discipline as the read-side
+    /// poison rule).
+    ///
+    /// # Backends
+    ///
+    /// Works on both io_uring and mio. v1 copies each chunk into the send pool
+    /// via [`ConnCtx::send`](ringline::ConnCtx::send) (awaited per chunk for
+    /// backpressure). Zero-copy guarded streaming is a later optimization.
+    pub async fn set_stream(
+        &mut self,
+        key: &[u8],
+        flags: u32,
+        exptime: u32,
+        len: usize,
+        src: impl SegmentSource,
+    ) -> Result<(), Error> {
+        // Header: `set <key> <flags> <exptime> <len>\r\n`. Build and validate it
+        // first — an oversized key is rejected here, before any byte hits the
+        // wire, so that error does NOT poison the connection.
+        self.encode_buf.clear();
+        append_set_guard_prefix(&mut self.encode_buf, key, len, flags, exptime)?;
+
+        // From the first send onward a partial value frame can be on the wire;
+        // any error before a *complete* reply is read leaves the connection
+        // desynced — a pooled reuse would feed the next caller's bytes into this
+        // frame's value. So poison (close) on any such error, matching the
+        // over/under-produce and read-side poison discipline. A complete reply
+        // (even a server error line, or an unexpected type) means the frame was
+        // fully sent and the wire is synced — that path must NOT poison.
+        match self.write_set_frame_and_read(len, src).await {
+            Ok(response) => {
+                check_error_bytes(&response)?;
+                match response {
+                    McResponseBytes::Stored => Ok(()),
+                    _ => Err(Error::UnexpectedResponse),
+                }
+            }
+            Err(e) => {
+                self.conn.close();
+                Err(e)
+            }
+        }
+    }
+
+    /// Write the streamed `set` frame (header already built in `encode_buf`) and
+    /// read its reply. Every `?` here is a wire-desync condition
+    /// ([`set_stream`](Self::set_stream) poisons on it); classifying the reply
+    /// happens in the caller, after a complete reply has been read.
+    async fn write_set_frame_and_read(
+        &mut self,
+        len: usize,
+        mut src: impl SegmentSource,
+    ) -> Result<McResponseBytes, Error> {
+        self.conn.send_nowait(&self.encode_buf)?;
+
+        // Stream the value body, enforcing the length contract.
+        let mut sent = 0usize;
+        while let Some(chunk) = src.next_chunk()? {
+            if chunk.is_empty() {
+                continue;
+            }
+            sent += chunk.len();
+            if sent > len {
+                // Over-produce: the value frame is already too long → desync.
+                return Err(Error::LengthMismatch);
+            }
+            // `send` copies into the pool synchronously and returns a future that
+            // resolves when the bytes reach the socket — awaiting bounds in-flight
+            // sends to one, so a large value can't exhaust the send pool.
+            self.conn.send(&chunk)?.await?;
+        }
+        if sent != len {
+            // Under-produce: header declared `len`, source gave fewer → desync.
+            return Err(Error::LengthMismatch);
+        }
+
+        // Trailing `\r\n`, then the `STORED\r\n` reply.
+        self.conn.send_nowait(b"\r\n")?;
+        self.read_response().await
+    }
+}
+
+// ── Streaming GET (segmented recv, single-connection Client only) ─────────
+//
+// `get_stream` returns a `StreamValue` instead of a materialized `Value`: the
+// value body is delivered as segments over the runtime's segmented-recv API
+// (`ConnCtx::recv_owned_segment`), so a consumer that discards or streams the
+// value never forces the whole thing into one contiguous allocation. Only
+// `collect()` materializes.
+//
+// io_uring only — segmented recv is backed by the provided-buffer ring, and the
+// underlying `recv_owned_segment` / `end_segments` methods are `#[cfg(has_io_uring)]`.
+// This crate's build.rs emits `has_io_uring` in lockstep with `ringline`.
+//
+// SCOPE (v1): memcache `get_stream` on the single-connection `Client` only.
+// Deferred (documented, not implemented here): `get_cas` streaming (the CAS
+// variant), streaming `set`, and `recv_streaming()` fire/recv integration. The
+// multi-key `gets(keys)` stays eager/materialized (one frame carries N values),
+// and pooled / sharded clients intentionally keep the materialized `get`.
+
+#[cfg(has_io_uring)]
+impl Client {
+    /// Streaming GET (single-connection [`Client`] only).
+    ///
+    /// Like [`get`](Self::get), but the value body is delivered as a
+    /// [`StreamValue`] of segments rather than a single materialized [`Value`].
+    /// A consumer that only needs to discard or checksum the value pays no
+    /// gather copy; [`StreamValue::collect`] is the one materialization. The
+    /// item flags are available via [`StreamValue::flags`].
+    ///
+    /// Returns `Ok(None)` for a missing key (bare `END\r\n` reply).
+    ///
+    /// # Sequential use only
+    ///
+    /// The returned stream borrows `&mut self`, so a second concurrent stream (or
+    /// any other client call) while it is alive is a compile error. `get_stream`
+    /// must be called on an *idle* connection — not interleaved with pending
+    /// `fire_*` operations or a half-read pipeline, whose responses would arrive
+    /// ahead of the GET reply and desync the segmented read.
+    ///
+    /// # Dropping mid-stream poisons the connection
+    ///
+    /// If a [`StreamValue`] is dropped before its value (and the trailing
+    /// `\r\nEND\r\n` delimiter) is fully consumed — via
+    /// [`collect`](StreamValue::collect), [`discard`](StreamValue::discard), or
+    /// reading [`next_segment`](StreamValue::next_segment) to the end — the
+    /// undrained wire bytes cannot be drained synchronously in `Drop`, so the
+    /// connection is **closed** (its slot generation bumped). The next operation
+    /// on this client then fails, matching the "poison = close" recovery
+    /// discipline.
+    pub async fn get_stream(
+        &mut self,
+        key: impl AsRef<[u8]>,
+    ) -> Result<Option<StreamValue<'_>>, Error> {
+        let key = key.as_ref();
+        // Fire the GET, then opt the connection into segmented delivery. The
+        // reply body then arrives as held segments instead of being gathered
+        // into the accumulator. `recv_owned_segment()` sets the domain
+        // synchronously (before we await), so the reply can't be processed under
+        // the default path first.
+        self.encode_buf.clear();
+        encode_request_into(&McRequest::get(key), &mut self.encode_buf)?;
+        self.conn.send_nowait(&self.encode_buf)?;
+
+        // Read the `VALUE <key> <flags> <bytes>\r\n` header line (or `END\r\n`).
+        // It always fits in the first received buffer; the rare split-across-
+        // buffers case is handled by accumulating into `acc` and retrying.
+        //
+        // Demarcation is exact: `parse_get_header` measures only the header line
+        // (`header_len`, up to and including its `\r\n`), never the value.
+        // Everything after `header_len` in the buffer we already pulled is
+        // value-body bytes, handed to the stream as an O(1) `Bytes::slice` — so
+        // no value byte is lost or double-read, and the read cursor is a single
+        // monotonic position across header + body + trailing `\r\nEND\r\n`.
+        let mut acc: Option<Vec<u8>> = None;
+        loop {
+            let seg = match self.conn.recv_owned_segment().await {
+                Ok(Some(b)) => b,
+                Ok(None) => {
+                    // Peer closed before any header arrived.
+                    let _ = self.conn.end_segments();
+                    return Err(Error::ConnectionClosed);
+                }
+                Err(e) => {
+                    // Recv I/O error mid-header: the read is broken and the
+                    // connection is still in the segmented domain. Poison it
+                    // (close) so it is not reused stuck in that domain / desynced.
+                    self.conn.close();
+                    return Err(e.into());
+                }
+            };
+            let combined: Bytes = match acc.take() {
+                None => seg,
+                Some(mut a) => {
+                    a.extend_from_slice(&seg);
+                    Bytes::from(a)
+                }
+            };
+            match parse_get_header(&combined) {
+                Ok(Some(GetHeader::Miss)) => {
+                    // Missing key. `END\r\n` carries no value/trailing; restore
+                    // the default read path so the next command works.
+                    self.conn.end_segments()?;
+                    return Ok(None);
+                }
+                Ok(Some(GetHeader::Value {
+                    flags,
+                    len,
+                    header_len,
+                })) => {
+                    let leftover = combined.slice(header_len..);
+                    return Ok(Some(StreamValue::new(self, flags, len, leftover)));
+                }
+                Ok(None) => {
+                    // Header line not yet complete — stash and pull the next buffer.
+                    acc = Some(combined.to_vec());
+                }
+                Err(e) => {
+                    // Server error line (`ERROR`, `SERVER_ERROR …`,
+                    // `CLIENT_ERROR …`) or a malformed header. In sequential use
+                    // the whole reply line is in `combined`; restore the read
+                    // path and surface the error.
+                    let _ = self.conn.end_segments();
+                    return Err(e);
+                }
+            }
+        }
+    }
+}
+
+/// Parsed shape of a memcache GET reply header line.
+#[cfg(has_io_uring)]
+enum GetHeader {
+    /// Bare `END\r\n` — the key does not exist.
+    Miss,
+    /// `VALUE <key> <flags> <bytes>\r\n` — `bytes` value bytes follow, then a
+    /// trailing `\r\nEND\r\n`. `header_len` is the byte length of the header line
+    /// itself (through its `\r\n`); `flags` is the stored item flags.
+    Value {
+        flags: u32,
+        len: usize,
+        header_len: usize,
+    },
+}
+
+/// Position of the first `\r\n` in `buf` (the index of the `\r`), or `None`.
+#[cfg(has_io_uring)]
+fn find_crlf(buf: &[u8]) -> Option<usize> {
+    buf.windows(2).position(|w| w == b"\r\n")
+}
+
+/// Parse a memcache GET reply header line from the **front** of `buf`, measuring
+/// only the header line (`VALUE <key> <flags> <bytes>\r\n` / `END\r\n`) — the
+/// value body and trailing `\r\nEND\r\n` are left for the caller to stream, so
+/// the header/value split loses no byte.
+///
+/// - `Ok(None)` — the header line is not yet fully buffered (need more bytes).
+/// - `Ok(Some(GetHeader::Miss))` — a bare `END` line (cache miss).
+/// - `Ok(Some(GetHeader::Value { .. }))` — a `VALUE` header.
+/// - `Err(Error::Memcache(_))` — a server error line (`ERROR` / `SERVER_ERROR …`
+///   / `CLIENT_ERROR …`).
+/// - `Err(Error::UnexpectedResponse)` — an unrecognized line or malformed
+///   integer field.
+#[cfg(has_io_uring)]
+fn parse_get_header(buf: &[u8]) -> Result<Option<GetHeader>, Error> {
+    // Every valid first line (VALUE / END / error) ends in `\r\n`; without one
+    // the line is incomplete.
+    let Some(cr) = find_crlf(buf) else {
+        return Ok(None);
+    };
+    let line = &buf[..cr];
+    let header_len = cr + 2; // line bytes + "\r\n"
+
+    if line == b"END" {
+        return Ok(Some(GetHeader::Miss));
+    }
+    if line.starts_with(b"VALUE ") {
+        // VALUE <key> <flags> <bytes> [<cas>]
+        let mut fields = line.split(|&b| b == b' ').filter(|f| !f.is_empty());
+        let _value_kw = fields.next(); // "VALUE"
+        let _key = fields.next().ok_or(Error::UnexpectedResponse)?;
+        let flags_tok = fields.next().ok_or(Error::UnexpectedResponse)?;
+        let bytes_tok = fields.next().ok_or(Error::UnexpectedResponse)?;
+        let flags = parse_uint::<u32>(flags_tok)?;
+        let len = parse_uint::<usize>(bytes_tok)?;
+        return Ok(Some(GetHeader::Value {
+            flags,
+            len,
+            header_len,
+        }));
+    }
+    // Error lines. `ERROR` is a bare token; `SERVER_ERROR`/`CLIENT_ERROR` carry a
+    // trailing message.
+    if line == b"ERROR" || line.starts_with(b"CLIENT_ERROR") || line.starts_with(b"SERVER_ERROR") {
+        return Err(Error::Memcache(String::from_utf8_lossy(line).into_owned()));
+    }
+    Err(Error::UnexpectedResponse)
+}
+
+/// Parse an ASCII unsigned integer field, mapping any malformation to
+/// [`Error::UnexpectedResponse`].
+#[cfg(has_io_uring)]
+fn parse_uint<T: std::str::FromStr>(tok: &[u8]) -> Result<T, Error> {
+    std::str::from_utf8(tok)
+        .ok()
+        .and_then(|s| s.parse::<T>().ok())
+        .ok_or(Error::UnexpectedResponse)
+}
+
+/// A streaming memcache GET value (see [`Client::get_stream`]).
+///
+/// Borrows the [`Client`] exclusively (`&mut`) and is bounded to the value length
+/// parsed from the `VALUE <key> <flags> <bytes>\r\n` header, so it can neither
+/// over-read into a following reply nor be used concurrently with another client
+/// operation.
+///
+/// The value body is delivered via the runtime's segmented-recv API. In v1 each
+/// [`next_segment`](Self::next_segment) chunk (and the [`collect`](Self::collect)
+/// gather) is an owned [`Bytes`] copied at delivery (Mode C). [`discard`](Self::discard)
+/// consumes each chunk at delivery but performs no *gather* copy.
+#[cfg(has_io_uring)]
+pub struct StreamValue<'a> {
+    client: &'a mut Client,
+    /// Item flags from the `VALUE` header.
+    flags: u32,
+    /// Full value length from the header.
+    len: usize,
+    /// Value bytes not yet handed to the caller.
+    value_left: usize,
+    /// Trailing `\r\nEND\r\n` bytes not yet consumed (starts at 7).
+    trail_left: usize,
+    /// Bytes pulled from the wire but not yet consumed (value + maybe trailing).
+    buf: Bytes,
+    /// Set once value + trailing delimiter are fully consumed and the recv
+    /// domain has been restored. `false` at drop time ⇒ the stream was abandoned
+    /// mid-value ⇒ poison (close) the connection.
+    finished: bool,
+}
+
+/// Length of the trailing `\r\nEND\r\n` after a memcache value body: the value's
+/// own CRLF (2) plus the `END\r\n` terminator (5).
+#[cfg(has_io_uring)]
+const TRAILER_LEN: usize = 7;
+
+#[cfg(has_io_uring)]
+impl<'a> StreamValue<'a> {
+    fn new(client: &'a mut Client, flags: u32, len: usize, leftover: Bytes) -> Self {
+        Self {
+            client,
+            flags,
+            len,
+            value_left: len,
+            trail_left: TRAILER_LEN,
+            buf: leftover,
+            finished: false,
+        }
+    }
+
+    /// The item flags from the `VALUE` header.
+    pub fn flags(&self) -> u32 {
+        self.flags
+    }
+
+    /// The value length in bytes, from the `VALUE <key> <flags> <bytes>` header.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the value is zero-length.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Pull the next non-empty received buffer into `self.buf`.
+    ///
+    /// A `None` from the runtime here means the peer closed (FIN) before the
+    /// whole value + trailing delimiter arrived — a **short FIN**, surfaced as an
+    /// error (never a truncated value), per the bounded-`len` contract.
+    async fn refill(&mut self) -> Result<(), Error> {
+        loop {
+            match self.client.conn.recv_owned_segment().await {
+                Ok(Some(b)) if !b.is_empty() => {
+                    self.buf = b;
+                    return Ok(());
+                }
+                Ok(Some(_)) => continue,
+                Ok(None) => return Err(Error::ConnectionClosed),
+                Err(e) => return Err(Error::Io(e)),
+            }
+        }
+    }
+
+    /// The next chunk of the value body, or `Ok(None)` once the whole value has
+    /// been delivered. Chunks are owned [`Bytes`] (Mode C copy-at-delivery); the
+    /// caller may hold them freely.
+    ///
+    /// After the final chunk the trailing `\r\nEND\r\n` is consumed and the
+    /// connection is restored for the next command, so a caller need not read
+    /// past the last value byte — though calling again simply returns `Ok(None)`.
+    pub async fn next_segment(&mut self) -> Result<Option<Bytes>, Error> {
+        if self.value_left == 0 {
+            self.finish().await?;
+            return Ok(None);
+        }
+        if self.buf.is_empty() {
+            self.refill().await?;
+        }
+        let take = self.value_left.min(self.buf.len());
+        let chunk = self.buf.split_to(take);
+        self.value_left -= take;
+        if self.value_left == 0 {
+            self.finish().await?;
+        }
+        Ok(Some(chunk))
+    }
+
+    /// Materialize the whole value into one contiguous [`Bytes`] (the copy).
+    ///
+    /// Single-buffer values return an O(1) `Bytes` slice with no extra gather;
+    /// multi-buffer values are gathered into one allocation (still one logical
+    /// copy of the value from the caller's perspective).
+    pub async fn collect(mut self) -> Result<Bytes, Error> {
+        // Fast path: the whole value is already contiguous in `buf`.
+        if self.buf.len() >= self.value_left {
+            let out = self.buf.split_to(self.value_left);
+            self.value_left = 0;
+            self.finish().await?;
+            return Ok(out);
+        }
+        let mut out = bytes::BytesMut::with_capacity(self.len);
+        while self.value_left > 0 {
+            if self.buf.is_empty() {
+                self.refill().await?;
+            }
+            let take = self.value_left.min(self.buf.len());
+            out.extend_from_slice(&self.buf.split_to(take));
+            self.value_left -= take;
+        }
+        self.finish().await?;
+        Ok(out.freeze())
+    }
+
+    /// Consume and release the whole value without materializing it, leaving the
+    /// connection usable for the next command. No gather copy.
+    pub async fn discard(mut self) -> Result<(), Error> {
+        while self.value_left > 0 {
+            if self.buf.is_empty() {
+                self.refill().await?;
+            }
+            let take = self.value_left.min(self.buf.len());
+            let _ = self.buf.split_to(take);
+            self.value_left -= take;
+        }
+        self.finish().await
+    }
+
+    /// Consume the trailing `\r\nEND\r\n`, restore the default
+    /// `with_data`/`with_bytes` read path, and mark the stream finished so `Drop`
+    /// does not poison the connection.
+    async fn finish(&mut self) -> Result<(), Error> {
+        if self.finished {
+            return Ok(());
+        }
+        while self.trail_left > 0 {
+            if self.buf.is_empty() {
+                self.refill().await?;
+            }
+            let take = self.trail_left.min(self.buf.len());
+            let _ = self.buf.split_to(take);
+            self.trail_left -= take;
+        }
+        // Restore the default read path. Any bytes still in `self.buf` past the
+        // trailing delimiter would belong to a *following* reply — none exist in
+        // the documented sequential use; they are dropped rather than reinjected.
+        self.client.conn.end_segments()?;
+        self.finished = true;
+        Ok(())
+    }
+}
+
+#[cfg(has_io_uring)]
+impl Drop for StreamValue<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            // Abandoned mid-value (or a short FIN left the stream broken):
+            // undrained bytes remain inbound and the wire cannot be drained
+            // synchronously here, so poison the connection. `close()` bumps the
+            // slot generation, making the client's stored handle stale so the
+            // next operation fails.
+            self.client.conn.close();
+        }
+    }
+}
+
+// ── Streaming get-with-CAS (segmented recv, single-connection Client only) ─
+//
+// `get_cas` is the CAS-carrying mirror of `get_stream`: it issues `gets <key>`
+// instead of `get <key>`, so the hit reply is
+// `VALUE <key> <flags> <bytes> <cas>\r\n<data>\r\nEND\r\n` (an extra `<cas>`
+// token). The value body then streams exactly like `get_stream` — `get_cas`
+// reuses `StreamValue` (bounded to `<bytes>`, `\r\nEND\r\n` trailer, short-FIN
+// error, undrained-drop poison) and layers the parsed `cas` token on top.
+
+#[cfg(has_io_uring)]
+impl Client {
+    /// Streaming get-with-CAS (single-connection [`Client`] only).
+    ///
+    /// Like [`get_stream`](Self::get_stream), but issues `gets <key>` so the
+    /// reply header carries a CAS token (`VALUE <key> <flags> <bytes> <cas>`),
+    /// exposed via [`CasStreamValue::cas`]. The value body is delivered as a
+    /// [`CasStreamValue`] of segments; a consumer that only discards or checksums
+    /// pays no gather copy, and [`CasStreamValue::collect`] is the one
+    /// materialization.
+    ///
+    /// Returns `Ok(None)` for a missing key (bare `END\r\n` reply).
+    ///
+    /// The same sequential-use, short-FIN-error, and undrained-drop-poison
+    /// contracts as [`get_stream`](Self::get_stream) apply.
+    pub async fn get_cas(
+        &mut self,
+        key: impl AsRef<[u8]>,
+    ) -> Result<Option<CasStreamValue<'_>>, Error> {
+        let key = key.as_ref();
+        // Fire `gets <key>\r\n`, then opt into segmented delivery (synchronous,
+        // before the await) so the reply arrives as held segments.
+        self.encode_buf.clear();
+        encode_request_into(&McRequest::gets(&[key]), &mut self.encode_buf)?;
+        self.conn.send_nowait(&self.encode_buf)?;
+
+        // Read the `VALUE <key> <flags> <bytes> <cas>\r\n` header (or `END\r\n`).
+        // Demarcation is exact — see `get_stream`.
+        let mut acc: Option<Vec<u8>> = None;
+        loop {
+            let seg = match self.conn.recv_owned_segment().await {
+                Ok(Some(b)) => b,
+                Ok(None) => {
+                    let _ = self.conn.end_segments();
+                    return Err(Error::ConnectionClosed);
+                }
+                Err(e) => {
+                    // Recv I/O error mid-header: the read is broken and the
+                    // connection is still in the segmented domain. Poison it
+                    // (close) so it is not reused stuck in that domain / desynced.
+                    self.conn.close();
+                    return Err(e.into());
+                }
+            };
+            let combined: Bytes = match acc.take() {
+                None => seg,
+                Some(mut a) => {
+                    a.extend_from_slice(&seg);
+                    Bytes::from(a)
+                }
+            };
+            match parse_gets_header(&combined) {
+                Ok(Some(CasHeader::Miss)) => {
+                    self.conn.end_segments()?;
+                    return Ok(None);
+                }
+                Ok(Some(CasHeader::Value {
+                    flags,
+                    len,
+                    cas,
+                    header_len,
+                })) => {
+                    let leftover = combined.slice(header_len..);
+                    let inner = StreamValue::new(self, flags, len, leftover);
+                    return Ok(Some(CasStreamValue { inner, cas }));
+                }
+                Ok(None) => {
+                    acc = Some(combined.to_vec());
+                }
+                Err(e) => {
+                    let _ = self.conn.end_segments();
+                    return Err(e);
+                }
+            }
+        }
+    }
+}
+
+/// Parsed shape of a memcache `gets` reply header line (like [`GetHeader`] but
+/// carrying the extra CAS token).
+#[cfg(has_io_uring)]
+enum CasHeader {
+    /// Bare `END\r\n` — the key does not exist.
+    Miss,
+    /// `VALUE <key> <flags> <bytes> <cas>\r\n`.
+    Value {
+        flags: u32,
+        len: usize,
+        cas: u64,
+        header_len: usize,
+    },
+}
+
+/// Parse a memcache `gets` reply header line from the **front** of `buf`,
+/// measuring only the header line (5-token
+/// `VALUE <key> <flags> <bytes> <cas>\r\n` / `END\r\n`). The value body and
+/// trailing `\r\nEND\r\n` are left for the caller to stream.
+///
+/// Same return contract as [`parse_get_header`], with the additional `<cas>`
+/// token extracted.
+#[cfg(has_io_uring)]
+fn parse_gets_header(buf: &[u8]) -> Result<Option<CasHeader>, Error> {
+    let Some(cr) = find_crlf(buf) else {
+        return Ok(None);
+    };
+    let line = &buf[..cr];
+    let header_len = cr + 2; // line bytes + "\r\n"
+
+    if line == b"END" {
+        return Ok(Some(CasHeader::Miss));
+    }
+    if line.starts_with(b"VALUE ") {
+        // VALUE <key> <flags> <bytes> <cas>
+        let mut fields = line.split(|&b| b == b' ').filter(|f| !f.is_empty());
+        let _value_kw = fields.next(); // "VALUE"
+        let _key = fields.next().ok_or(Error::UnexpectedResponse)?;
+        let flags_tok = fields.next().ok_or(Error::UnexpectedResponse)?;
+        let bytes_tok = fields.next().ok_or(Error::UnexpectedResponse)?;
+        let cas_tok = fields.next().ok_or(Error::UnexpectedResponse)?;
+        let flags = parse_uint::<u32>(flags_tok)?;
+        let len = parse_uint::<usize>(bytes_tok)?;
+        let cas = parse_uint::<u64>(cas_tok)?;
+        return Ok(Some(CasHeader::Value {
+            flags,
+            len,
+            cas,
+            header_len,
+        }));
+    }
+    if line == b"ERROR" || line.starts_with(b"CLIENT_ERROR") || line.starts_with(b"SERVER_ERROR") {
+        return Err(Error::Memcache(String::from_utf8_lossy(line).into_owned()));
+    }
+    Err(Error::UnexpectedResponse)
+}
+
+/// A streaming memcache get-with-CAS value (see [`Client::get_cas`]).
+///
+/// Wraps a [`StreamValue`] (the bounded value-body stream) with the CAS token
+/// parsed from the `VALUE <key> <flags> <bytes> <cas>\r\n` header. All the
+/// streaming semantics — bounded to the value length, short-FIN error,
+/// undrained-drop poison — come from the inner [`StreamValue`].
+#[cfg(has_io_uring)]
+pub struct CasStreamValue<'a> {
+    inner: StreamValue<'a>,
+    cas: u64,
+}
+
+#[cfg(has_io_uring)]
+impl CasStreamValue<'_> {
+    /// The item flags from the `VALUE` header.
+    pub fn flags(&self) -> u32 {
+        self.inner.flags()
+    }
+
+    /// The CAS (compare-and-swap) unique token from the `VALUE` header.
+    pub fn cas(&self) -> u64 {
+        self.cas
+    }
+
+    /// The value length in bytes, from the `VALUE <key> <flags> <bytes> <cas>`
+    /// header.
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// Whether the value is zero-length.
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    /// The next chunk of the value body, or `Ok(None)` once the whole value has
+    /// been delivered. See [`StreamValue::next_segment`].
+    pub async fn next_segment(&mut self) -> Result<Option<Bytes>, Error> {
+        self.inner.next_segment().await
+    }
+
+    /// Materialize the whole value into one contiguous [`Bytes`] (the copy).
+    /// See [`StreamValue::collect`].
+    pub async fn collect(self) -> Result<Bytes, Error> {
+        self.inner.collect().await
+    }
+
+    /// Consume and release the whole value without materializing it, leaving the
+    /// connection usable for the next command. See [`StreamValue::discard`].
+    pub async fn discard(self) -> Result<(), Error> {
+        self.inner.discard().await
+    }
+}
+
 // -- Zero-copy SET encoding helpers ------------------------------------------
 
 /// Append the memcache text SET prefix for guard-based sends to `buf`:
 /// `set {key} {flags} {exptime} {valuelen}\r\n`.
 /// The caller must append value bytes (via guard) + `\r\n` suffix.
 ///
-/// Validates `key` (≤ [`MAX_KEY_LEN`]) and `value_len` (≤ [`MAX_VALUE_LEN`]);
-/// returns the corresponding `Error` variant if either bound is exceeded so
-/// that no bytes hit the wire for a request the server will reject. On error
-/// nothing is appended to `buf`.
+/// Validates `key` (≤ [`MAX_KEY_LEN`]); returns [`Error::KeyTooLong`] if the
+/// bound is exceeded so that no bytes hit the wire for a request the server
+/// would misparse. Value length is not checked — see [`validate_request`].
+/// On error nothing is appended to `buf`.
 fn append_set_guard_prefix(
     buf: &mut Vec<u8>,
     key: &[u8],
@@ -1613,7 +2318,6 @@ fn append_set_guard_prefix(
     exptime: u32,
 ) -> Result<(), Error> {
     validate_key(key)?;
-    validate_value_len(value_len)?;
     let mut itoa_buf = itoa::Buffer::new();
     buf.extend_from_slice(b"set ");
     buf.extend_from_slice(key);
@@ -1629,7 +2333,10 @@ fn append_set_guard_prefix(
 
 // -- Encoding helpers --------------------------------------------------------
 
-/// Reject requests whose key or value exceeds the protocol-defined caps.
+/// Reject requests whose key exceeds the 250-byte protocol cap. Value
+/// length is not checked here — memcached's `-I` item-size limit is a
+/// server knob, so the client lets the server reject an oversized value
+/// with a normal `SERVER_ERROR` reply rather than second-guessing it.
 fn validate_request(req: &McRequest<'_>) -> Result<(), Error> {
     match req {
         McRequest::Get { key }
@@ -1642,22 +2349,19 @@ fn validate_request(req: &McRequest<'_>) -> Result<(), Error> {
             }
             Ok(())
         }
-        McRequest::Set { key, value, .. }
-        | McRequest::Add { key, value, .. }
-        | McRequest::Replace { key, value, .. }
-        | McRequest::Append { key, value }
-        | McRequest::Prepend { key, value }
-        | McRequest::Cas { key, value, .. } => {
-            validate_key(key)?;
-            validate_value(value)
-        }
+        McRequest::Set { key, .. }
+        | McRequest::Add { key, .. }
+        | McRequest::Replace { key, .. }
+        | McRequest::Append { key, .. }
+        | McRequest::Prepend { key, .. }
+        | McRequest::Cas { key, .. } => validate_key(key),
         McRequest::FlushAll | McRequest::Version | McRequest::Quit => Ok(()),
     }
 }
 
-/// Append the encoding of a `McRequest` to `buf`, rejecting oversized
-/// keys/values up-front (see [`validate_request`]). No allocation once
-/// `buf` has sufficient capacity. On error nothing is appended to `buf`.
+/// Append the encoding of a `McRequest` to `buf`, rejecting oversized keys
+/// up-front (see [`validate_request`]). No allocation once `buf` has
+/// sufficient capacity. On error nothing is appended to `buf`.
 pub(crate) fn encode_request_into(req: &McRequest<'_>, buf: &mut Vec<u8>) -> Result<(), Error> {
     validate_request(req)?;
     let size = match req {
@@ -1684,7 +2388,7 @@ pub(crate) fn encode_request_into(req: &McRequest<'_>, buf: &mut Vec<u8>) -> Res
 }
 
 /// Encode a `McRequest` into a freshly allocated `Vec<u8>`, rejecting
-/// oversized keys/values up-front (see [`validate_request`]). Hot paths in
+/// oversized keys up-front (see [`validate_request`]). Hot paths in
 /// [`Client`] use [`encode_request_into`] with a reusable buffer instead.
 pub(crate) fn encode_request(req: &McRequest<'_>) -> Result<Vec<u8>, Error> {
     let mut buf = Vec::new();
@@ -1947,18 +2651,6 @@ mod tests {
     }
 
     #[test]
-    fn validate_value_accepts_max_len() {
-        let v = vec![0u8; MAX_VALUE_LEN];
-        assert!(validate_value(&v).is_ok());
-    }
-
-    #[test]
-    fn validate_value_rejects_oversized() {
-        let v = vec![0u8; MAX_VALUE_LEN + 1];
-        assert!(matches!(validate_value(&v), Err(Error::ValueTooLong)));
-    }
-
-    #[test]
     fn encode_request_get_rejects_long_key() {
         let key = vec![b'k'; MAX_KEY_LEN + 1];
         let r = encode_request(&McRequest::get(&key));
@@ -1966,16 +2658,20 @@ mod tests {
     }
 
     #[test]
-    fn encode_request_set_rejects_long_value() {
+    fn encode_request_set_passes_large_value() {
+        // Value length is not checked client-side — memcached's `-I` item-size
+        // limit is a server knob, so an oversized value is allowed onto the
+        // wire and the server rejects it.
         let key = b"k";
-        let value = vec![0u8; MAX_VALUE_LEN + 1];
+        let value = vec![0u8; 2 * 1024 * 1024];
         let r = encode_request(&McRequest::Set {
             key,
             value: &value,
             flags: 0,
             exptime: 0,
         });
-        assert!(matches!(r, Err(Error::ValueTooLong)));
+        assert!(r.is_ok());
+        assert!(r.unwrap().starts_with(b"set "));
     }
 
     #[test]
@@ -1995,21 +2691,16 @@ mod tests {
     }
 
     #[test]
-    fn set_guard_prefix_rejects_long_value_len() {
-        let r = append_set_guard_prefix(&mut Vec::new(), b"k", MAX_VALUE_LEN + 1, 0, 0);
-        assert!(matches!(r, Err(Error::ValueTooLong)));
-    }
-
-    #[test]
-    fn set_guard_prefix_accepts_max_value_len() {
-        let r = append_set_guard_prefix(&mut Vec::new(), b"k", MAX_VALUE_LEN, 0, 0);
+    fn set_guard_prefix_passes_large_value_len() {
+        // Value length is not checked client-side (see `validate_request`).
+        let r = append_set_guard_prefix(&mut Vec::new(), b"k", 2 * 1024 * 1024, 0, 0);
         assert!(r.is_ok());
     }
 
     #[test]
-    fn encode_request_passes_through_at_caps() {
+    fn encode_request_passes_through_at_key_cap() {
         let key = vec![b'k'; MAX_KEY_LEN];
-        let value = vec![0u8; MAX_VALUE_LEN];
+        let value = vec![0u8; 1024];
         let r = encode_request(&McRequest::Set {
             key: &key,
             value: &value,
