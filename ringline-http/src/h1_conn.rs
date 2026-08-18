@@ -974,9 +974,17 @@ fn decode_chunk(data: &[u8], max_chunk_size: usize, max_trailer_section: usize) 
         }
     }
 
+    // `size` is peer-controlled up to `max_chunk_size`, and the setter
+    // accepts any cap (including usize::MAX to disable it) — checked math so
+    // a near-usize::MAX declared size is rejected instead of overflowing.
     let chunk_start = crlf + 2;
-    let chunk_end = chunk_start + size;
-    let total = chunk_end + 2; // trailing \r\n
+    let (chunk_end, total) = match chunk_start
+        .checked_add(size)
+        .and_then(|end| Some((end, end.checked_add(2)?))) // trailing \r\n
+    {
+        Some(v) => v,
+        None => return ChunkResult::Invalid("chunk size overflows usize"),
+    };
 
     if data.len() < total {
         return ChunkResult::NeedMore;
@@ -1120,6 +1128,20 @@ mod tests {
                 assert!(!is_last);
             }
             ChunkResult::NeedMore | ChunkResult::Invalid(_) => panic!("expected Complete"),
+        }
+    }
+
+    #[test]
+    fn decode_chunk_huge_size_rejected_without_overflow() {
+        // Fuzzer finding (fuzz run 32185137405): a chunk-size line near
+        // usize::MAX made `chunk_start + size` overflow when the caller's
+        // `max_chunk_size` doesn't cap it (the setter accepts any value).
+        let data = b"\nFFFFFFFFFFFFFFFc\r\nTOK\n";
+        match decode_chunk(data, usize::MAX, usize::MAX) {
+            ChunkResult::Invalid(_) => {}
+            ChunkResult::NeedMore | ChunkResult::Complete { .. } => {
+                panic!("expected Invalid for overflowing chunk size")
+            }
         }
     }
 

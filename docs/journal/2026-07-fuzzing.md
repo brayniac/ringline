@@ -95,6 +95,12 @@ The `H3Connection` state machine remains unfuzzed as scoped: its only byte
 ingress is `handle_quic_event(&mut QuicEndpoint, ...)`, which requires a live
 quinn-proto endpoint — no sans-IO seam exists.
 
+**First CI finding (2026-08-18):** the first persistent-corpus run (32185137405)
+crashed `http1_response` — an arithmetic overflow in `decode_chunk` on a
+chunk-size line near `usize::MAX`, reachable when `set_max_chunk_size` lifts
+the cap. Fixed with checked framing arithmetic (#308); the crash input is
+committed as `fuzz/corpus/http1_response/overflow_chunk_size.seed`.
+
 ## Lessons / open questions
 
 - The seam survey found the h1 parsers were the only in-scope code not
