@@ -1672,7 +1672,7 @@ dependencies = [
 
 [[package]]
 name = "ringline-http"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "brotli",
  "bytes",
@@ -1687,7 +1687,7 @@ dependencies = [
 
 [[package]]
 name = "ringline-memcache"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "bytes",
  "histogram 0.11.5",
