@@ -20,6 +20,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- `ringline-memcache`: bumped `memcache-proto` to 0.0.4, which fixes an ASCII
+  response framing bug on the `ResponseBytes` path this crate uses. A response
+  line containing a bare `\r` was never framed -- `find_crlf` inspected only the
+  first `\r` and gave up if it was not followed by `\n` -- so a complete,
+  CRLF-terminated line reported `Incomplete` forever and stalled the connection.
+  0.0.4 also bounds response line length, so a peer that never sends a newline
+  can no longer make the parser buffer without limit.
 - `ringline` (core): listener creation is delayed until every worker has
   completed its fallible backend preparation. A startup failure now rolls back
   partial workers and runtime descriptors before `launch()` returns, allowing a
