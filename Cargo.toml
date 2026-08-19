@@ -35,7 +35,7 @@ ringline-memcache = { path = "ringline-memcache" }
 ringline-grpc = { path = "ringline-grpc" }
 ringline-ping = { path = "ringline-ping" }
 resp-proto = "0.0.1"
-memcache-proto = "0.0.2"
+memcache-proto = "0.0.4"
 ping-proto = "0.0.1"
 ketama = "0.0.1"
 
