@@ -1,6 +1,6 @@
 [package]
 name = "ringline-redis"
-version = "0.6.6"
+version = "0.6.7"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -37,7 +37,7 @@ resp-proto = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-resp-proto = { version = "0.0.1", features = ["resp3"] }
+resp-proto = { version = "0.0.2", features = ["resp3"] }
 criterion = { version = "0.5", features = ["html_reports"] }
 ringline = { workspace = true, features = ["testing"] }
 

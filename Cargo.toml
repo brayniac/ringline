@@ -34,10 +34,10 @@ ringline-redis = { path = "ringline-redis" }
 ringline-memcache = { path = "ringline-memcache" }
 ringline-grpc = { path = "ringline-grpc" }
 ringline-ping = { path = "ringline-ping" }
-resp-proto = "0.0.1"
-memcache-proto = "0.0.4"
-ping-proto = "0.0.1"
-ketama = "0.0.1"
+resp-proto = "0.0.2"
+memcache-proto = "0.0.5"
+ping-proto = "0.0.2"
+ketama = "0.0.2"
 
 # External dependencies
 bytes = "1.11.1"

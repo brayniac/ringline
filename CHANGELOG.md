@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.5] - 2026-08-19
+
+Coordinated client release picking up parser fixes from the protocol crates.
+Core `ringline` has no functional change this cycle; it is bumped to carry the
+release. `ringline-redis` 0.6.7, `ringline-memcache` 0.6.6, `ringline-ping`
+0.5.3. Other crates unchanged (h2/h3/quic/http/grpc 0.5.2).
+
+### Fixed
+
+- `ringline-redis`: `resp-proto` 0.0.2 fixes RESP line framing. Both scanners
+  inspected only the first `\r` in the buffer and gave up if it was not
+  followed by `\n`, so a complete, CRLF-terminated line containing a stray `\r`
+  reported `Incomplete` forever and stalled the connection. Reachable in
+  practice: Redis keys are binary-safe and error replies echo user-supplied
+  arguments. 0.0.2 also bounds protocol line length, so a peer that never sends
+  a newline can no longer make the parser buffer without limit.
+- `ringline-redis`, `ringline-memcache`: `ketama` 0.0.2 rejects ring
+  configurations that previously misrouted or panicked -- more than `u16::MAX`
+  nodes silently wrapped shard indices, and a ring whose nodes all had weight 0
+  built successfully and then panicked inside `route`.
+- `ringline-memcache`: `memcache-proto` 0.0.5 makes `ParseOptions::max_line_len`
+  saturate instead of overflowing.
+- `ringline-ping`: `ping-proto` 0.0.2 bounds response line length.
+
 ## [0.5.4] - 2026-08-19
 
 Coordinated release covering a core startup-lifecycle fix, an HTTP/1.1 framing
