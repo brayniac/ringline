@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.4] - 2026-08-19
+
+Coordinated release covering a core startup-lifecycle fix, an HTTP/1.1 framing
+overflow found by the new fuzz CI, and a memcache ASCII parser fix pulled in
+from `memcache-proto` 0.0.4. Core `ringline` 0.5.4, `ringline-http` 0.5.3,
+`ringline-memcache` 0.6.5. Other client crates unchanged (`ringline-redis`
+0.6.6; ping/h2/h3/quic/grpc 0.5.2).
+
 ### Added
 
 - Fuzzing: eight cargo-fuzz/libFuzzer targets covering the wire-facing parsers
@@ -35,7 +43,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   such as `AddrInUse` may take longer to return than before. Errors from a worker
   event loop after the listener becomes live remain observable through its join
   handle.
-
 - `ringline-http`: chunked-decoding arithmetic overflow on a chunk-size line
   near `usize::MAX` (e.g. `FFFFFFFFFFFFFFFc\r\n`). Reachable when
   `set_max_chunk_size` is raised to disable the cap (the default 16 MiB cap
