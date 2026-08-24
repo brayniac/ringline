@@ -150,7 +150,7 @@ These are the recurring failure modes in this codebase — the 2026-07 audit (~3
 
 ## Copy Semantics
 
-Ringline aims to minimize data copies on the hot path. Understanding where copies happen is critical for performance work.
+Ringline aims to minimize data copies on the hot path. Understanding where copies happen is critical for performance work. The user-facing home for this analysis (plus per-backend syscall counting and measured numbers) is [docs/syscalls-and-copies.md](docs/syscalls-and-copies.md) — keep the two in sync when the counted paths change.
 
 ### Core Runtime Copy Counts
 

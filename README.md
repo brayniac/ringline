@@ -54,7 +54,9 @@ fn main() -> Result<(), ringline::Error> {
 
 For the code-derived runtime and request lifecycle diagrams, see
 [Architecture](docs/architecture.md). For the technology tradeoffs behind the
-Linux backend, see [Why consider io_uring?](docs/io-uring-primer.md).
+Linux backend, see [Why consider io_uring?](docs/io-uring-primer.md); for the
+counted syscalls and copies per request on each backend, backed by measurement,
+see [Syscalls and copies, counted](docs/syscalls-and-copies.md).
 
 The io_uring backend has this worker-local shape:
 
