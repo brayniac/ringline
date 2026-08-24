@@ -16,6 +16,35 @@ eliminating it), page faults, and cache/TLB effects. Fewer syscalls is a
 mechanism, not a verdict — the measured section is what connects the counts to
 throughput.
 
+## At a glance: one request-response exchange
+
+What each backend pays in kernel crossings to serve a single request, counted
+from the event loops (details and code references in the two sections that
+follow):
+
+| Step | epoll loop (mio backend) | io_uring loop |
+|---|---|---|
+| Learn the request arrived | share of one `epoll_wait` | share of one `io_uring_enter` — the CQE is already in the completion ring when it returns |
+| Read the request bytes | 1 `read()` — **plus 1 more** `read()` returning `EAGAIN` to finish the edge-triggered drain | **0** — the multishot-recv CQE *delivers a filled buffer*; no read call exists |
+| Send the response | 1 `writev()` | **0 dedicated** — a send SQE rides the iteration's shared enter |
+| Confirm the send completed | (return value of `writev`) | **0** — send CQE, drained in the same iteration |
+| Arm/fire a timeout | folded into the `epoll_wait` timeout | **0** — timeout SQE/CQE |
+| **Total, idle connection** | **~3–4 syscalls, every request** | **~2 enters** |
+| **Total, under load** | ~2–3 per request — the reads and writes never amortize, only the `epoll_wait` does | **(1–3 enters) ÷ requests in the batch** — *every* step amortizes |
+
+That last row is the whole argument. In the epoll loop, only the wait is
+shared; each request still owns its `read` and `writev`, so the floor is ~2
+syscalls per request no matter the load. In the io_uring loop *no step owns a
+syscall* — requests ride the ring as SQEs and CQEs, and the per-iteration
+enters divide across everything serviced that iteration. Load makes the
+io_uring loop *cheaper* per request while the epoll loop stays flat:
+
+| Pipeline depth (measured, sweep below) | io_uring client syscalls/req | epoll client syscalls/req |
+|--:|--:|--:|
+| 1 | 0.80 | 6.62 |
+| 8 | 0.035 | 1.23 |
+| 32 | 0.021 | 0.72 |
+
 ## Syscalls per request: io_uring backend
 
 The worker loop is `AsyncEventLoop::run()` in
