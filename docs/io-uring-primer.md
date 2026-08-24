@@ -133,6 +133,11 @@ These figures isolate only the assumed crossing cost. They do not say io_uring
 uses less total CPU: CQ processing, ring synchronization, cache behavior,
 copying, networking, and SQPOLL can erase or reverse the modeled difference.
 
+For this model walked through ringline's own event loops — the counted
+syscalls and copies per request on each backend, plus measured
+syscalls-per-request from a two-client rig sweep — see
+[Syscalls and copies, counted](syscalls-and-copies.md).
+
 ### Measured local example
 
 The following is one machine's result, not a portable prediction. Ringline's
