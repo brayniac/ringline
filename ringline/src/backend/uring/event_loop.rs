@@ -1782,6 +1782,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 .send_copy_pool
                 .try_advance(pool_slot, result as u32)
             {
+                if self.close_submitted(conn_index) {
+                    self.driver.send_copy_pool.release(pool_slot);
+                    self.executor.wake_send(
+                        conn_index,
+                        Err(io::Error::from_raw_os_error(libc::ECANCELED)),
+                    );
+                    return;
+                }
                 let generation = self.driver.connections.generation(conn_index);
                 if self
                     .driver
@@ -1838,6 +1846,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // the queue, don't wake the send waiter.
         let errno = -result;
         if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
+            if self.close_submitted(conn_index) {
+                self.driver.send_copy_pool.release(pool_slot);
+                self.executor.wake_send(
+                    conn_index,
+                    Err(io::Error::from_raw_os_error(libc::ECANCELED)),
+                );
+                return;
+            }
             let generation = self.driver.connections.generation(conn_index);
             if self
                 .driver
@@ -1909,6 +1925,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             return;
         }
 
+        if self.close_submitted(conn_index) {
+            self.driver.send_copy_pool.release(pool_slot);
+            self.executor.wake_send(
+                conn_index,
+                Err(io::Error::from_raw_os_error(libc::ECANCELED)),
+            );
+            return;
+        }
         let (ptr, remaining) = self.driver.send_copy_pool.current_ptr_remaining(pool_slot);
         let generation = self.driver.connections.generation(conn_index);
         let resubmit = if is_tls {
@@ -1939,6 +1963,16 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.driver.send_slab.conn_index(slab_idx) == conn_index
             && self.driver.send_slab.generation(slab_idx)
                 == self.driver.connections.generation(conn_index)
+    }
+
+    /// True when the Close SQE for this connection's current occupant has
+    /// been submitted (deferred close finalized, or force-finalized). Late
+    /// send CQEs must not push new SQEs (partial resubmits, POLLOUT arms)
+    /// after this point — they would race the in-flight Close. The queue is
+    /// already drained by then, so the caller just releases its resources
+    /// and fails the waiter.
+    fn close_submitted(&self, conn_index: u32) -> bool {
+        self.driver.send_queues[conn_index as usize].close_submitted
     }
 
     /// Release the backing pool slots of a coalesced send, then the slab entry.
@@ -1977,6 +2011,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         if result > 0 {
             // Partial send: advance the iovec array and resubmit the remainder.
             if let Some(msg_ptr) = self.driver.send_slab.try_advance(slab_idx, result as u32) {
+                if self.close_submitted(conn_index) {
+                    self.release_coalesced(slab_idx);
+                    self.executor.wake_send(
+                        conn_index,
+                        Err(io::Error::from_raw_os_error(libc::ECANCELED)),
+                    );
+                    return;
+                }
                 if self
                     .driver
                     .ring
@@ -2016,6 +2058,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // slab entry (and its data) alive, then resubmit the same sendmsg.
         let errno = -result;
         if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
+            if self.close_submitted(conn_index) {
+                self.release_coalesced(slab_idx);
+                self.executor.wake_send(
+                    conn_index,
+                    Err(io::Error::from_raw_os_error(libc::ECANCELED)),
+                );
+                return;
+            }
             if self
                 .driver
                 .ring
@@ -2067,6 +2117,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             return;
         }
 
+        if self.close_submitted(conn_index) {
+            self.release_coalesced(slab_idx);
+            self.executor.wake_send(
+                conn_index,
+                Err(io::Error::from_raw_os_error(libc::ECANCELED)),
+            );
+            return;
+        }
         let msg_ptr = self.driver.send_slab.msghdr_ptr(slab_idx);
         if self
             .driver
@@ -2121,6 +2179,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // Bids are NOT replenished yet — the provided-buffer memory must stay
             // valid for the resubmitted iovecs.
             if let Some(msg_ptr) = self.driver.send_slab.try_advance(slab_idx, result as u32) {
+                if self.close_submitted(conn_index) {
+                    self.release_recv_forward(slab_idx);
+                    self.executor.wake_send(
+                        conn_index,
+                        Err(io::Error::from_raw_os_error(libc::ECANCELED)),
+                    );
+                    return;
+                }
                 if self
                     .driver
                     .ring
@@ -2148,6 +2214,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // buffers) alive, then resubmit the same sendmsg.
         let errno = -result;
         if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
+            if self.close_submitted(conn_index) {
+                self.release_recv_forward(slab_idx);
+                self.executor.wake_send(
+                    conn_index,
+                    Err(io::Error::from_raw_os_error(libc::ECANCELED)),
+                );
+                return;
+            }
             if self
                 .driver
                 .ring
@@ -2199,6 +2273,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             return;
         }
 
+        if self.close_submitted(conn_index) {
+            self.release_recv_forward(slab_idx);
+            self.executor.wake_send(
+                conn_index,
+                Err(io::Error::from_raw_os_error(libc::ECANCELED)),
+            );
+            return;
+        }
         let msg_ptr = self.driver.send_slab.msghdr_ptr(slab_idx);
         if self
             .driver
@@ -2456,12 +2538,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// Payload encoding: `bid` in low 16 bits, `remaining_len` in high 16 bits.
     /// On partial send, resubmits from offset. On completion, replenishes the bid.
     fn handle_send_recv_buf(&mut self, ud: UserData, result: i32) {
-        // No liveness/identity guard, deliberately: these sends are
-        // in_flight-tracked, so the deferred close waits for this CQE, and
-        // the only in_flight-bypassing close (force_finalize_close) is
-        // armed exclusively on TLS connections while SendRecvBuf is
-        // plaintext-only. If a non-TLS force-close path is ever added,
-        // this handler needs the same generation check as its siblings.
+        // No liveness/identity guard and no close_submitted guard,
+        // deliberately: these sends are in_flight-tracked, so the deferred
+        // close waits for this CQE, and the only in_flight-bypassing close
+        // (force_finalize_close) is armed exclusively on TLS connections
+        // while SendRecvBuf is plaintext-only. If a non-TLS force-close
+        // path is ever added, this handler needs the same generation and
+        // close_submitted checks as its siblings.
         let conn_index = ud.conn_index();
         let payload = ud.payload();
         // Payload carries only the bid. The remaining byte count is in the driver
@@ -2622,6 +2705,24 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         #[allow(clippy::collapsible_if)]
         if result > 0 {
             if let Some(msg_ptr) = self.driver.send_slab.try_advance(slab_idx, result as u32) {
+                // Never resubmit a partial past a submitted Close: mirror the
+                // completion path's notification accounting minus the queue
+                // and wake bookkeeping (the notification for the sent prefix
+                // is still in flight).
+                if self.close_submitted(conn_index) {
+                    self.driver.send_slab.mark_awaiting_notifications(slab_idx);
+                    if self.driver.send_slab.should_release(slab_idx) {
+                        let ps = self.driver.send_slab.release(slab_idx);
+                        if ps != u16::MAX {
+                            self.driver.send_copy_pool.release(ps);
+                        }
+                    }
+                    self.executor.wake_send(
+                        conn_index,
+                        Err(io::Error::from_raw_os_error(libc::ECANCELED)),
+                    );
+                    return;
+                }
                 // Partial send — resubmit the remainder.
                 if self
                     .driver
@@ -2949,6 +3050,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 .send_copy_pool
                 .try_advance(pool_slot, result as u32)
         {
+            if self.close_submitted(conn_index) {
+                self.driver.send_copy_pool.release(pool_slot);
+                return;
+            }
             let generation = self.driver.connections.generation(conn_index);
             if self
                 .driver
@@ -2977,6 +3082,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         if result < 0 {
             let errno = -result;
             if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
+                if self.close_submitted(conn_index) {
+                    self.driver.send_copy_pool.release(pool_slot);
+                    return;
+                }
                 let generation = self.driver.connections.generation(conn_index);
                 if self
                     .driver
@@ -3587,10 +3696,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             if !self.driver.send_slab.in_use(slab_idx) {
                 continue; // slab was released in the meantime
             }
-            // Connection closed or reused — release the slab and nothing
-            // else: the slot may already belong to a new connection.
+            // Connection closed or reused (or its Close already submitted —
+            // no new SQEs may be pushed for it) — release the slab and
+            // nothing else: the slot may already belong to a new connection.
             if self.driver.connections.get(conn_index).is_none()
                 || self.driver.connections.generation(conn_index) != generation
+                || self.close_submitted(conn_index)
             {
                 self.release_zc_slab(slab_idx);
                 continue;
@@ -3651,10 +3762,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             if !self.driver.send_slab.in_use(slab_idx) {
                 continue; // slab released meanwhile
             }
-            // Connection closed or reused — release the slab only. Touching
-            // the send queue here would drain a *new* connection's sends.
+            // Connection closed or reused (or its Close already submitted) —
+            // release the slab only. Touching the send queue here would
+            // drain a *new* connection's sends.
             if self.driver.connections.get(conn_index).is_none()
                 || self.driver.connections.generation(conn_index) != generation
+                || self.close_submitted(conn_index)
             {
                 self.release_coalesced(slab_idx);
                 continue;
@@ -3705,6 +3818,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // Connection closed or reused — replenish bids and release only.
             if self.driver.connections.get(conn_index).is_none()
                 || self.driver.connections.generation(conn_index) != generation
+                || self.close_submitted(conn_index)
             {
                 self.release_recv_forward(slab_idx);
                 continue;
@@ -3752,9 +3866,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             if !self.driver.send_copy_pool.in_use(pool_slot) {
                 continue;
             }
-            // Connection closed or reused — release the slot only.
+            // Connection closed or reused (or its Close already submitted) —
+            // release the slot only.
             if self.driver.connections.get(conn_index).is_none()
                 || self.driver.connections.generation(conn_index) != generation
+                || self.close_submitted(conn_index)
             {
                 self.driver.send_copy_pool.release(pool_slot);
                 continue;
@@ -3867,6 +3983,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
             if self.driver.connections.get(conn_index).is_none()
                 || self.driver.connections.generation(conn_index) != generation
+                || self.close_submitted(conn_index)
             {
                 if self.driver.send_copy_pool.in_use(pool_slot) {
                     self.driver.send_copy_pool.release(pool_slot);
@@ -4440,6 +4557,72 @@ mod tests {
         assert!(!state.close_pending);
         assert_eq!(state.acked_bytes, 0);
         assert!(!el.driver.close_notify_armed.contains(&conn_index));
+    }
+
+    /// After the Close SQE is submitted (close_submitted), a late partial
+    /// send CQE must release its slot and fail the waiter instead of
+    /// resubmitting the remainder — the resubmit would race the in-flight
+    /// Close (post-force-close scenario).
+    #[test]
+    fn partial_send_after_close_submitted_releases_instead_of_resubmitting() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+
+        // A send in flight; close is forced past it (deadline path):
+        // in_flight cleared, close_pending set, finalize submits Close.
+        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(b"stuck send").unwrap();
+        el.driver.send_queues[conn_index as usize].close_pending = true;
+        el.driver.force_finalize_close(conn_index);
+        assert!(
+            el.driver.send_queues[conn_index as usize].close_submitted,
+            "finalize must mark close_submitted"
+        );
+
+        // The stuck send's partial CQE arrives pre-bump (generation still
+        // matches): the slot must be released, not resubmitted.
+        let ud = UserData::encode(
+            OpTag::Send,
+            conn_index,
+            UserData::send_payload(slot, generation),
+        );
+        el.test_dispatch_cqe(ud.raw(), 3, 0);
+        assert!(
+            !el.driver.send_copy_pool.in_use(slot),
+            "slot must be released instead of resubmitted past a submitted Close"
+        );
+    }
+
+    /// The guard predicate is `close_submitted`, deliberately NOT
+    /// `recv_mode == Closed`: during a deferred close's drain window
+    /// (recv side already Closed, Close SQE not yet submitted), in-flight
+    /// sends must still resubmit partials so their bytes reach the wire.
+    /// This test pins the predicate: Closed recv_mode alone must not
+    /// suppress a resubmit.
+    #[test]
+    fn half_close_does_not_suppress_partial_resubmit() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+
+        if let Some(cs) = el.driver.connections.get_mut(conn_index) {
+            cs.recv_mode = RecvMode::Closed; // peer FIN, no close initiated
+        }
+        assert!(!el.driver.send_queues[conn_index as usize].close_submitted);
+
+        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(b"response").unwrap();
+        let ud = UserData::encode(
+            OpTag::Send,
+            conn_index,
+            UserData::send_payload(slot, generation),
+        );
+        // Partial completion: the remainder must be resubmitted (slot stays
+        // in use), not cancelled.
+        el.test_dispatch_cqe(ud.raw(), 3, 0);
+        assert!(
+            el.driver.send_copy_pool.in_use(slot),
+            "half-close must not cancel a legitimate in-progress send"
+        );
     }
 
     /// close_connection must defer the Close SQE while a send chain's SQEs
@@ -9237,7 +9420,14 @@ mod tests {
                         1 if !live_conns.is_empty() => {
                             let ci = live_conns[0];
                             if let Some((slot, _, _)) = el.driver.send_copy_pool.copy_in(b"data") {
-                                let ud = UserData::encode(OpTag::Send, ci, slot as u32);
+                                let ud = UserData::encode(
+                                    OpTag::Send,
+                                    ci,
+                                    UserData::send_payload(
+                                        slot,
+                                        el.driver.connections.generation(ci),
+                                    ),
+                                );
                                 el.test_dispatch_cqe(ud.raw(), 4, 0);
                             }
                         }
@@ -9246,7 +9436,14 @@ mod tests {
                         2 if !live_conns.is_empty() => {
                             let ci = live_conns[0];
                             if let Some((slot, _, _)) = el.driver.send_copy_pool.copy_in(b"data") {
-                                let ud = UserData::encode(OpTag::Send, ci, slot as u32);
+                                let ud = UserData::encode(
+                                    OpTag::Send,
+                                    ci,
+                                    UserData::send_payload(
+                                        slot,
+                                        el.driver.connections.generation(ci),
+                                    ),
+                                );
                                 el.test_dispatch_cqe(ud.raw(), -104, 0);
                             }
                         }
@@ -9314,7 +9511,14 @@ mod tests {
                             let ci = live_conns.remove(0);
                             if let Some((slot, _, _)) = el.driver.send_copy_pool.copy_in(b"data") {
                                 pool_slots_in_flight.push(slot);
-                                let send_ud = UserData::encode(OpTag::Send, ci, slot as u32);
+                                let send_ud = UserData::encode(
+                                    OpTag::Send,
+                                    ci,
+                                    UserData::send_payload(
+                                        slot,
+                                        el.driver.connections.generation(ci),
+                                    ),
+                                );
                                 let recv_ud = UserData::encode(OpTag::RecvMulti, ci, 0);
                                 // EOF first, then stale send — the bug pattern.
                                 el.test_dispatch_cqe(recv_ud.raw(), 0, 0);
