@@ -303,6 +303,9 @@ fn dispatch_h2_events(
                 *connection_error = Some(HttpError::H2(e));
             }
             H2Event::PingAcknowledged { .. } => {}
+            // H2Event is #[non_exhaustive]; events this layer doesn't
+            // consume are ignored.
+            _ => {}
         }
     }
 

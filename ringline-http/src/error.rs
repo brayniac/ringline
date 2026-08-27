@@ -3,7 +3,11 @@ use std::io;
 use ringline_h2::H2Error;
 
 /// Errors produced by the HTTP client.
+///
+/// Marked `#[non_exhaustive]` so adding an error kind is not a breaking
+/// change, matching the other protocol crates' error enums.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum HttpError {
     /// The connection was closed unexpectedly.
     #[error("connection closed")]
