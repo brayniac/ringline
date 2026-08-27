@@ -633,7 +633,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 Ok(n) => {
                     // Check if the connection has a recv sink (direct-to-buffer).
                     let sink = &mut self.executor.recv_sinks[idx];
-                    if let Some(recv_sink) = sink {
+                    let appended = if let Some(recv_sink) = sink {
                         let remaining = recv_sink.cap - recv_sink.pos;
                         let to_copy = n.min(remaining);
                         if to_copy > 0 {
@@ -650,10 +650,21 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                         if n > to_copy {
                             self.driver
                                 .accumulators
-                                .append(conn_index, &recv_buf[to_copy..n]);
+                                .append(conn_index, &recv_buf[to_copy..n])
+                        } else {
+                            true
                         }
                     } else {
-                        self.driver.accumulators.append(conn_index, &recv_buf[..n]);
+                        self.driver.accumulators.append(conn_index, &recv_buf[..n])
+                    };
+                    if !appended {
+                        // Streamed past recv_accumulator_max. The bytes were
+                        // already read off the socket, so the stream cannot
+                        // continue coherently — close rather than OOM,
+                        // matching the uring and mio-TLS overflow paths.
+                        self.executor.wake_recv(conn_index);
+                        self.driver.close_connection(conn_index);
+                        break;
                     }
                     self.executor.wake_recv(conn_index);
                 }
