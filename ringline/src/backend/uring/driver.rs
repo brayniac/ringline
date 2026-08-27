@@ -828,6 +828,7 @@ impl Driver {
         );
         state.in_flight = false;
         state.close_pending = false;
+        state.close_submitted = false;
         state.shutdown_pending = false;
         state.acked_bytes = 0;
         state.close_notify_deadline = None;
@@ -1143,6 +1144,9 @@ impl Driver {
         }
         let st = &mut self.send_queues[conn_index as usize];
         st.close_pending = false;
+        // From here the Close is committed (submitted below, or queued for
+        // retry): late CQEs must not push new SQEs for this connection.
+        st.close_submitted = true;
         // Clear the deadline so the slot's next occupant doesn't inherit it.
         st.close_notify_deadline = None;
         // Disarm from the close_notify deadline set. swap_remove is

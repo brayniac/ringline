@@ -28,6 +28,15 @@ pub(crate) struct ConnSendState {
     /// silently truncated when the fd closed.
     #[cfg_attr(not(has_io_uring), allow(dead_code))]
     pub close_pending: bool,
+    /// Whether the Close SQE for the current occupant has been submitted
+    /// (deferred close finalized, or force-finalized). From this point any
+    /// still-in-flight send CQE must not push new SQEs (resubmits, POLLOUT
+    /// arms) for this connection — they would race the in-flight Close.
+    /// Cleared by `reset_send_state` at slot reactivation. Distinct from
+    /// `recv_mode == Closed`, which also covers half-close (peer FIN with
+    /// legitimate sends still flowing).
+    #[cfg_attr(not(has_io_uring), allow(dead_code))]
+    pub close_submitted: bool,
     /// Count of queued sends pushed during close. Each CQE decrements
     /// this; when it reaches zero, `try_finalize_close` fires.
     #[cfg_attr(not(has_io_uring), allow(dead_code))]
@@ -59,6 +68,7 @@ impl ConnSendState {
             queue: VecDeque::new(),
             shutdown_pending: false,
             close_pending: false,
+            close_submitted: false,
             close_send_count: 0,
             close_notify_deadline: None,
             acked_bytes: 0,

@@ -39,6 +39,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   every compressed message silently decoded as an empty payload (debug builds
   panicked on the overflow). The limit now saturates.
 
+- io_uring: after a connection's Close SQE is submitted, no new send SQEs are
+  pushed for it: late CQEs (partial resubmits, POLLOUT arms) release their
+  resources and fail the waiter, and new sends/`shutdown_write` from handler
+  callbacks are rejected with `NotConnected` instead of racing the in-flight
+  Close. The `close_submitted` flag distinguishes this from half-close (peer
+  FIN with legitimate sends still flowing), which is unaffected.
 - io_uring: send-family CQEs are now validated against the connection
   *generation* before touching per-connection state, closing a
   misattribution window where a Send CQE that outlived its connection slot
