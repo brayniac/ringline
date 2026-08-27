@@ -201,11 +201,10 @@ fn tls_echo_with_external_client() {
 /// the zero-scratch drain: any off-by-one in the chunk advance would corrupt
 /// the round-trip. A non-constant byte pattern makes mis-ordering detectable.
 ///
-/// Gated to the io_uring backend: this guards the `fill_buf`/`consume` recv
-/// drain (shared by both backends, but the change this regression-tests is in
-/// the io_uring path). The mio backend has a pre-existing large-payload TLS
-/// busy-spin (reproduces on `main` without this change), tracked separately;
-/// running this test there hangs for reasons unrelated to the drain.
+/// Runs on both backends. (It was briefly gated to io_uring while the mio
+/// backend had a large-payload TLS busy-spin; that was fixed by the #241
+/// TLS output-queueing parity work and the gate removed — both verified by
+/// this test passing on mio.)
 /// A handler that responds to the first received byte with one large
 /// `send()` — larger than rustls's 64 KiB ciphertext buffer cap
 /// (`DEFAULT_BUFFER_LIMIT`). Exercises the interleaved encrypt/drain loop:
@@ -310,7 +309,14 @@ fn tls_echo_large_multichunk() {
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
 
+    // The 1 MiB payload needs > 64 in-flight echo chunks at peak (the
+    // synchronous client writes the whole payload before reading, so echo
+    // sends queue until it turns around). The default 64×16 KiB test pool is
+    // exactly 1 MiB — sitting on the exhaustion cliff, and TlsEchoHandler's
+    // send_nowait errors are swallowed, which turned exhaustion into a
+    // silent short echo. Give this test 4× headroom.
     let config = test_config_builder()
+        .send_pool(256, 16384)
         .tls(TlsConfig::new(server_config))
         .build()
         .expect("valid config");
@@ -331,9 +337,11 @@ fn tls_echo_large_multichunk() {
 
     let mut stream = rustls::Stream::new(&mut tls_conn, &mut tcp);
 
-    // Two sizes, both well past rustls's ~16 KiB plaintext buffer so the
-    // drain loop must iterate over several chunks and several records.
-    for &size in &[64 * 1024usize, 100 * 1024usize, 200 * 1024usize] {
+    // All sizes well past rustls's ~16 KiB plaintext buffer so the drain
+    // loop must iterate over several chunks and several records; 1 MiB also
+    // exceeds rustls's 64 KiB ciphertext buffer cap many times over on the
+    // echo side.
+    for &size in &[64 * 1024usize, 100 * 1024, 200 * 1024, 1024 * 1024] {
         // Distinctive, position-dependent pattern so any chunk reorder or
         // off-by-one in the advance is caught by the byte-exact comparison.
         let msg: Vec<u8> = (0..size)
@@ -345,11 +353,23 @@ fn tls_echo_large_multichunk() {
 
         let mut buf = vec![0u8; size];
         let mut total = 0;
+        // Time-bounded no-progress deadline: each WouldBlock here costs the
+        // full 10s SO_RCVTIMEO, so an unbounded (or count-bounded) retry
+        // loop turned a dropped echo chunk into a 6-hour CI hang
+        // (run 33052650385) instead of a fast failure.
+        let mut last_progress = std::time::Instant::now();
         while total < size {
             match stream.read(&mut buf[total..]) {
                 Ok(0) => break,
-                Ok(n) => total += n,
+                Ok(n) => {
+                    total += n;
+                    last_progress = std::time::Instant::now();
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        last_progress.elapsed() < Duration::from_secs(30),
+                        "no echo progress for 30s at {total}/{size} bytes"
+                    );
                     std::thread::sleep(Duration::from_millis(5));
                     continue;
                 }
