@@ -498,6 +498,10 @@ impl<'a> DriverCtx<'a> {
                 return;
             }
             let idx = conn.index as usize;
+            // Close already submitted — a Shutdown SQE would race it.
+            if self.send_queues[idx].close_submitted {
+                return;
+            }
             if self.send_queues[idx].in_flight || !self.send_queues[idx].queue.is_empty() {
                 // Defer until send queue drains.
                 self.send_queues[idx].shutdown_pending = true;
@@ -2850,6 +2854,13 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
                 "stale connection",
             ));
         }
+        // Close already submitted — a new send SQE would race it.
+        if self.ctx.send_queues[self.conn.index as usize].close_submitted {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "connection closing",
+            ));
+        }
 
         // TLS path: gather all data, encrypt, copy-send. Drop guards immediately.
         if !self.ctx.tls_table.is_null() {
@@ -3269,6 +3280,15 @@ impl<'b, 'a> SendChainBuilder<'b, 'a> {
 
         let total_bytes = self.total_bytes;
         let conn_index = self.conn.index;
+
+        // Close already submitted — chain SQEs would race it. finished stays
+        // false so Drop releases the built entries' resources.
+        if self.ctx.send_queues[conn_index as usize].close_submitted {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "connection closing",
+            ));
+        }
 
         // Clone the SQE entries for submission, keeping self.built intact.
         // On failure, Drop will call release_all() on the original entries.

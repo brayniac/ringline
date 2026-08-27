@@ -2538,12 +2538,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// Payload encoding: `bid` in low 16 bits, `remaining_len` in high 16 bits.
     /// On partial send, resubmits from offset. On completion, replenishes the bid.
     fn handle_send_recv_buf(&mut self, ud: UserData, result: i32) {
-        // No liveness/identity guard, deliberately: these sends are
-        // in_flight-tracked, so the deferred close waits for this CQE, and
-        // the only in_flight-bypassing close (force_finalize_close) is
-        // armed exclusively on TLS connections while SendRecvBuf is
-        // plaintext-only. If a non-TLS force-close path is ever added,
-        // this handler needs the same generation check as its siblings.
+        // No liveness/identity guard and no close_submitted guard,
+        // deliberately: these sends are in_flight-tracked, so the deferred
+        // close waits for this CQE, and the only in_flight-bypassing close
+        // (force_finalize_close) is armed exclusively on TLS connections
+        // while SendRecvBuf is plaintext-only. If a non-TLS force-close
+        // path is ever added, this handler needs the same generation and
+        // close_submitted checks as its siblings.
         let conn_index = ud.conn_index();
         let payload = ud.payload();
         // Payload carries only the bid. The remaining byte count is in the driver
@@ -4592,9 +4593,12 @@ mod tests {
         );
     }
 
-    /// Half-close is not close: a peer FIN (recv_mode Closed) with no close
-    /// initiated must NOT suppress partial-send resubmits — the server may
-    /// legitimately still be writing.
+    /// The guard predicate is `close_submitted`, deliberately NOT
+    /// `recv_mode == Closed`: during a deferred close's drain window
+    /// (recv side already Closed, Close SQE not yet submitted), in-flight
+    /// sends must still resubmit partials so their bytes reach the wire.
+    /// This test pins the predicate: Closed recv_mode alone must not
+    /// suppress a resubmit.
     #[test]
     fn half_close_does_not_suppress_partial_resubmit() {
         let mut el = make_test_loop();
