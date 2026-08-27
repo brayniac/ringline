@@ -64,7 +64,7 @@ pub(crate) fn accept_encoding_value() -> Option<&'static str> {
 fn decompress_gzip(data: &[u8], max_size: usize) -> Result<Vec<u8>, GrpcError> {
     use std::io::Read;
     let decoder = flate2::read::GzDecoder::new(data);
-    let mut limited = decoder.take(max_size as u64 + 1);
+    let mut limited = decoder.take((max_size as u64).saturating_add(1));
     let mut buf = Vec::new();
     limited
         .read_to_end(&mut buf)
@@ -94,7 +94,7 @@ fn decompress_zstd(data: &[u8], max_size: usize) -> Result<Vec<u8>, GrpcError> {
     use std::io::Read;
     let decoder = zstd::Decoder::new(data)
         .map_err(|e| GrpcError::InvalidMessage(format!("zstd decompress: {e}")))?;
-    let mut limited = decoder.take(max_size as u64 + 1);
+    let mut limited = decoder.take((max_size as u64).saturating_add(1));
     let mut buf = Vec::new();
     limited
         .read_to_end(&mut buf)
@@ -154,6 +154,19 @@ mod tests {
         assert!(compressed.len() < 10_000);
         let result = super::decompress("gzip", &compressed, 1024);
         assert!(matches!(result, Err(crate::GrpcError::MaxSizeExceeded(_))));
+    }
+
+    #[cfg(feature = "gzip")]
+    #[test]
+    fn uncapped_max_size_decompresses_instead_of_wrapping() {
+        // max_size = usize::MAX is the "cap disabled" idiom. The old
+        // `max_size as u64 + 1` wrapped to `take(0)` in release — every
+        // compressed message silently decoded as empty (and panicked in
+        // debug). saturating_add keeps the limit effectively unbounded.
+        let original = b"payload that must survive an uncapped decompress".to_vec();
+        let compressed = super::compress("gzip", &original).unwrap();
+        let result = super::decompress("gzip", &compressed, usize::MAX).unwrap();
+        assert_eq!(result, original);
     }
 
     #[cfg(feature = "zstd")]
