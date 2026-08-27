@@ -4,6 +4,19 @@
 //! zero runtime dependencies -- the caller feeds bytes in via `recv()` and
 //! pulls bytes out via `take_pending_send()`.
 //!
+//! # API stance
+//!
+//! Unlike the runtime's opaque config types, this crate's wire-level value
+//! structs ([`frame::FrameHeader`], [`frame::Priority`], [`settings::Settings`],
+//! [`HeaderField`]) deliberately expose public fields: they mirror
+//! RFC-defined wire structures whose shape changes only when the protocol
+//! does, and a sans-IO caller assembles and inspects them directly. Error
+//! and event enums are `#[non_exhaustive]`; [`ErrorCode`] and [`Frame`] are
+//! deliberately exhaustive — both fold unknown wire values into an existing
+//! variant (`InternalError` and [`Frame::Unknown`] respectively) instead of
+//! growing the enum, so extension frame types and future error codes cannot
+//! break a match.
+//!
 //! # Architecture
 //!
 //! ```text

@@ -1,7 +1,11 @@
 use bytes::Bytes;
 
 /// Request body.
+///
+/// Marked `#[non_exhaustive]`: a streaming variant is a realistic addition,
+/// and the sibling crates mark their grow-prone value enums the same way.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub enum Body {
     /// No body.
     #[default]

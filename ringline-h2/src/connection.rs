@@ -121,7 +121,18 @@ const MAX_STREAM_ID: u32 = 0x7fff_ffff;
 pub const DEFAULT_MAX_RECV_BUF: usize = 262_144;
 
 /// Events produced by the HTTP/2 connection for the application.
+///
+/// Marked `#[non_exhaustive]` because the event surface grows as more of
+/// the protocol is exposed (e.g. `PingAcknowledged` was added after 0.1),
+/// matching `H3Event`/`QuicEvent` in the sibling crates.
+///
+/// **Contract for new variants:** downstream consumers compile with wildcard
+/// arms, so a new variant must be purely informational for existing
+/// consumers — it must never be the sole carrier of stream or connection
+/// termination, or an ignoring consumer hangs a pending request until peer
+/// close instead of failing fast.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum H2Event {
     /// Received response headers on a stream.
     Response {

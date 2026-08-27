@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Breaking (batched for the next release):** `ringline-h2`'s `H2Error` and
+  `H2Event`, and `ringline-http`'s `HttpError`, `Protocol`, `Body`, and
+  `StreamingResponse`, are now `#[non_exhaustive]`, matching the other
+  protocol crates' error/event enums and grow-prone value enums — adding a
+  variant is no longer a breaking change. External matches on these enums
+  need a wildcard arm (construction is unaffected). `ErrorCode` and `Frame`
+  stay deliberately exhaustive (RFC-fixed; unknown wire values fold to
+  `InternalError` / `Frame::Unknown`), and `ringline-h2`'s wire-level value
+  structs (`FrameHeader`, `Priority`, `Settings`, `HeaderField`) keep their
+  public fields as a documented sans-IO stance.
+
 - **`recv_accumulator_max` now defaults to 1 GiB (was unbounded).** A peer
   that streams data without ever completing a message now gets its connection
   closed at the cap instead of growing a worker's memory without limit. The

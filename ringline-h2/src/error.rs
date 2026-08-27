@@ -1,4 +1,9 @@
 /// HTTP/2 error codes (RFC 7540 Section 7).
+///
+/// Deliberately exhaustive (not `#[non_exhaustive]`): the set is fixed by
+/// the RFC, and unknown codes on the wire fold to [`ErrorCode::InternalError`]
+/// in [`ErrorCode::from_u32`] — the RFC-sanctioned treatment — rather than
+/// growing the enum. Callers can therefore match on it without a wildcard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum ErrorCode {
@@ -41,7 +46,11 @@ impl ErrorCode {
 }
 
 /// Errors produced by the HTTP/2 framing layer.
+///
+/// Marked `#[non_exhaustive]` so adding an error kind is not a breaking
+/// change, matching the other protocol crates' error enums.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum H2Error {
     /// Frame decoding error (truncated, invalid payload, etc.).
     FrameError,

@@ -26,6 +26,9 @@ use crate::h2_conn::H2StreamingResponse;
 ///     // process each body chunk as it arrives
 /// }
 /// ```
+/// Marked `#[non_exhaustive]`: an `H3` variant is a realistic addition.
+/// Consumers use the methods below rather than matching variants.
+#[non_exhaustive]
 pub enum StreamingResponse<'a> {
     H2(H2StreamingResponse<'a>),
     H1(H1StreamingResponse<'a>),

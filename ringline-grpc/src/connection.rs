@@ -343,6 +343,9 @@ impl GrpcConnection {
                     self.events.push_back(GrpcEvent::Error(GrpcError::H2(e)));
                 }
                 H2Event::PingAcknowledged { .. } => {}
+                // H2Event is #[non_exhaustive]; events this layer doesn't
+                // consume are ignored.
+                _ => {}
             }
         }
     }
