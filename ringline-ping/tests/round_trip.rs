@@ -196,12 +196,7 @@ impl AsyncEventHandler for PingPoolClientHandler {
     fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
         let server_addr = *POOL_SERVER_ADDR.get().expect("server addr not set");
         Some(Box::pin(async move {
-            let config = PoolConfig {
-                addr: server_addr,
-                pool_size: 2,
-                connect_timeout_ms: 5000,
-                tls_server_name: None,
-            };
+            let config = PoolConfig::new(server_addr, 2).connect_timeout_ms(5000);
             let mut pool = Pool::new(config);
 
             if let Err(e) = pool.connect_all().await {
