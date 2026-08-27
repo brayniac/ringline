@@ -1205,10 +1205,14 @@ impl Driver {
     /// sends are stuck). Deliberately abandons outstanding work: queued
     /// (never-submitted) sends are released here; the in-flight send / chain
     /// SQEs are left to the kernel — the Close cancels them, and their CQEs
-    /// fail the generation identity check in the completion handlers (or
-    /// arrive pre-bump and complete harmlessly on a closing connection), so
-    /// they release their own slots without touching the index's next
-    /// occupant.
+    /// fail the generation identity check in the completion handlers (post
+    /// Close-CQE), so they release their own slots without touching the
+    /// index's next occupant. A CQE that lands *before* the Close CQE still
+    /// matches the generation and takes the normal path: on this abandoned
+    /// connection that can burn a resubmit/POLLOUT SQE against the closing
+    /// fd (EBADF/ECANCELED follow-up) or wake the abandoned waiter — wasteful
+    /// but bounded, and confined to the force path. The next occupant is
+    /// protected by `reset_send_state` at reactivation.
     pub(crate) fn force_finalize_close(&mut self, conn_index: u32) {
         let state = &mut self.send_queues[conn_index as usize];
         Self::release_queued_sends(

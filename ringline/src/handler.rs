@@ -429,6 +429,13 @@ impl<'a> DriverCtx<'a> {
             if conn_state.generation != conn.generation {
                 return;
             }
+            // Already closing (e.g. a task-side close raced this one):
+            // re-running would queue a duplicate close_notify and, after the
+            // first finalize cleared close_pending, submit a duplicate Close
+            // SQE. Same guard as close_connection and the mio ctx close.
+            if matches!(conn_state.recv_mode, crate::connection::RecvMode::Closed) {
+                return;
+            }
             conn_state.recv_mode = crate::connection::RecvMode::Closed;
 
             // Graceful TLS shutdown: queue close_notify ciphertext through

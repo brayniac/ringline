@@ -2456,6 +2456,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// Payload encoding: `bid` in low 16 bits, `remaining_len` in high 16 bits.
     /// On partial send, resubmits from offset. On completion, replenishes the bid.
     fn handle_send_recv_buf(&mut self, ud: UserData, result: i32) {
+        // No liveness/identity guard, deliberately: these sends are
+        // in_flight-tracked, so the deferred close waits for this CQE, and
+        // the only in_flight-bypassing close (force_finalize_close) is
+        // armed exclusively on TLS connections while SendRecvBuf is
+        // plaintext-only. If a non-TLS force-close path is ever added,
+        // this handler needs the same generation check as its siblings.
         let conn_index = ud.conn_index();
         let payload = ud.payload();
         // Payload carries only the bid. The remaining byte count is in the driver
@@ -2534,10 +2540,16 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         if !self.slab_identity_ok(conn_index, slab_idx) {
             if cqueue::notif(flags) {
                 self.driver.send_slab.dec_pending_notifs(slab_idx);
-            } else if result > 0 {
-                self.driver.send_slab.inc_pending_notifs(slab_idx);
+            } else {
+                // Main CQE: the entry is now final for this op — a stale
+                // partial is never resubmitted. Mark awaiting only here
+                // (not on notif CQEs, which for a resubmitted partial can
+                // precede the remainder's main CQE), matching run_shutdown.
+                if result > 0 {
+                    self.driver.send_slab.inc_pending_notifs(slab_idx);
+                }
+                self.driver.send_slab.mark_awaiting_notifications(slab_idx);
             }
-            self.driver.send_slab.mark_awaiting_notifications(slab_idx);
             if self.driver.send_slab.should_release(slab_idx) {
                 let ps = self.driver.send_slab.release(slab_idx);
                 if ps != u16::MAX {
