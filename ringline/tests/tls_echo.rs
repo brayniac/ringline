@@ -309,7 +309,14 @@ fn tls_echo_large_multichunk() {
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
 
+    // The 1 MiB payload needs > 64 in-flight echo chunks at peak (the
+    // synchronous client writes the whole payload before reading, so echo
+    // sends queue until it turns around). The default 64×16 KiB test pool is
+    // exactly 1 MiB — sitting on the exhaustion cliff, and TlsEchoHandler's
+    // send_nowait errors are swallowed, which turned exhaustion into a
+    // silent short echo. Give this test 4× headroom.
     let config = test_config_builder()
+        .send_pool(256, 16384)
         .tls(TlsConfig::new(server_config))
         .build()
         .expect("valid config");
@@ -346,11 +353,23 @@ fn tls_echo_large_multichunk() {
 
         let mut buf = vec![0u8; size];
         let mut total = 0;
+        // Time-bounded no-progress deadline: each WouldBlock here costs the
+        // full 10s SO_RCVTIMEO, so an unbounded (or count-bounded) retry
+        // loop turned a dropped echo chunk into a 6-hour CI hang
+        // (run 33052650385) instead of a fast failure.
+        let mut last_progress = std::time::Instant::now();
         while total < size {
             match stream.read(&mut buf[total..]) {
                 Ok(0) => break,
-                Ok(n) => total += n,
+                Ok(n) => {
+                    total += n;
+                    last_progress = std::time::Instant::now();
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        last_progress.elapsed() < Duration::from_secs(30),
+                        "no echo progress for 30s at {total}/{size} bytes"
+                    );
                     std::thread::sleep(Duration::from_millis(5));
                     continue;
                 }
