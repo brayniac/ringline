@@ -371,6 +371,19 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
             drop(guard);
 
+            // Re-drive deferred finalizes for connections closed from the
+            // ctx callbacks above (`DriverCtx::close` sets close_pending and
+            // registers the index here). try_finalize_close is guarded, so a
+            // connection with sends/chains still outstanding just waits for
+            // its CQEs to re-drive via note_send_finalized.
+            if !self.driver.pending_finalize_closes.is_empty() {
+                let mut pending = std::mem::take(&mut self.driver.pending_finalize_closes);
+                for conn_index in pending.drain(..) {
+                    self.driver.try_finalize_close(conn_index);
+                }
+                self.driver.pending_finalize_closes = pending;
+            }
+
             // Record work-phase (everything except the blocking wait) duration.
             if let Some(start) = iter_start {
                 // wait_ns was filled by the wait_start guard above — iter_start
@@ -1131,6 +1144,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     sink,
                     &mut self.driver.send_copy_pool,
                     conn_index,
+                    self.driver.connections.generation(conn_index),
                     data,
                     &mut self.driver.tls_out_scratch,
                 );
@@ -1642,6 +1656,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 }
                 self.driver.accumulators.reset(conn_index);
                 self.driver.reset_segment_state(conn_index);
+                self.driver.reset_send_state(conn_index);
                 self.arm_recv(conn_index);
 
                 // TLS path: defer accept until handshake completes.
@@ -1726,11 +1741,28 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
     fn handle_send(&mut self, ud: UserData, result: i32) {
         let conn_index = ud.conn_index();
-        let pool_slot = ud.payload() as u16;
+        let payload = ud.payload();
+        let pool_slot = UserData::send_payload_slot(payload);
 
-        // Guard against stale CQE for an already-released pool slot
-        // (e.g., Close CQE processed before this Send CQE in the same batch).
+        // Slot-liveness guard: the slot was already released on a
+        // pre-submission error path (no CQE was expected) — nothing to do.
         if !self.driver.send_copy_pool.in_use(pool_slot) {
+            return;
+        }
+
+        // Identity guard: a Send CQE can outlive its connection slot (a close
+        // submitted while this send was still in flight). The slot is still
+        // in_use — owned by the orphaned send — so liveness alone would let
+        // this CQE be misattributed to whatever connection now occupies the
+        // reused index (resubmitting the dead connection's bytes onto the new
+        // occupant's socket, draining its queue, or failing its send). The
+        // payload carries the submitting connection's truncated generation;
+        // on mismatch this CQE is the kernel's last reference to the slot:
+        // release it and touch nothing else.
+        if self.driver.connections.generation(conn_index) & 0xFFFF
+            != u32::from(UserData::send_payload_gen(payload))
+        {
+            self.driver.send_copy_pool.release(pool_slot);
             return;
         }
 
@@ -1750,14 +1782,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 .send_copy_pool
                 .try_advance(pool_slot, result as u32)
             {
+                let generation = self.driver.connections.generation(conn_index);
                 if self
                     .driver
                     .ring
-                    .submit_send_copied(conn_index, ptr, remaining, pool_slot)
+                    .submit_send_copied(conn_index, generation, ptr, remaining, pool_slot)
                     .is_err()
                 {
                     // SQ full — queue for retry on next tick.
-                    let generation = self.driver.connections.generation(conn_index);
                     self.driver.pending_copy_retries.push((
                         conn_index,
                         generation,
@@ -1806,14 +1838,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // the queue, don't wake the send waiter.
         let errno = -result;
         if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
+            let generation = self.driver.connections.generation(conn_index);
             if self
                 .driver
                 .ring
-                .submit_send_pollout(conn_index, pool_slot, false)
+                .submit_send_pollout(conn_index, generation, pool_slot, false)
                 .is_err()
             {
                 // SQ full now — queue for retry on the next tick.
-                let generation = self.driver.connections.generation(conn_index);
                 self.driver
                     .pending_send_pollout_retries
                     .push((conn_index, generation, pool_slot, 0, false));
@@ -1843,17 +1875,25 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// tick picks it up.
     fn handle_send_pollout(&mut self, ud: UserData, result: i32) {
         let conn_index = ud.conn_index();
-        // Payload: pool_slot in the low 16 bits, is_tls flag in bit 16 —
-        // the resubmit must keep a TLS chunk on the TlsSend completion path.
-        let pool_slot = ud.payload() as u16;
-        let is_tls = ud.payload() & (1 << 16) != 0;
+        // Payload: pool_slot in the low 16 bits, is_tls flag in bit 16 (the
+        // resubmit must keep a TLS chunk on the TlsSend completion path),
+        // truncated connection generation in bits 17..31.
+        let payload = ud.payload();
+        let pool_slot = UserData::send_payload_slot(payload);
+        let is_tls = UserData::send_pollout_is_tls(payload);
 
-        // Connection may have been closed while we were waiting; in
-        // that case the pool slot was released and the queue drained
-        // by `close_connection`.
-        if !self.driver.send_copy_pool.in_use(pool_slot)
-            || self.driver.connections.get(conn_index).is_none()
+        // Liveness: released on a pre-submission error path — nothing to do.
+        if !self.driver.send_copy_pool.in_use(pool_slot) {
+            return;
+        }
+        // Identity: the connection may have been closed (and its index
+        // reused) while we were waiting for POLLOUT. The slot is still owned
+        // by the orphaned send — release it and touch nothing else, exactly
+        // as `handle_send` does on generation mismatch.
+        if self.driver.connections.generation(conn_index) & 0x7FFF
+            != u32::from(UserData::send_pollout_gen(payload))
         {
+            self.driver.send_copy_pool.release(pool_slot);
             return;
         }
 
@@ -1870,23 +1910,35 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
 
         let (ptr, remaining) = self.driver.send_copy_pool.current_ptr_remaining(pool_slot);
+        let generation = self.driver.connections.generation(conn_index);
         let resubmit = if is_tls {
             self.driver
                 .ring
-                .submit_tls_send(conn_index, ptr, remaining, pool_slot)
+                .submit_tls_send(conn_index, generation, ptr, remaining, pool_slot)
         } else {
             self.driver
                 .ring
-                .submit_send_copied(conn_index, ptr, remaining, pool_slot)
+                .submit_send_copied(conn_index, generation, ptr, remaining, pool_slot)
         };
         if resubmit.is_err() {
             // SQ full — pick up on the next tick.
-            let generation = self.driver.connections.generation(conn_index);
             let tag = if is_tls { OpTag::TlsSend } else { OpTag::Send };
             self.driver
                 .pending_copy_retries
                 .push((conn_index, generation, pool_slot, 0, tag));
         }
+    }
+
+    /// True when a send-family CQE's slab entry still belongs to the live
+    /// occupant of `conn_index`. False means the CQE outlived its connection
+    /// slot (closed with the send in flight, index possibly reused) — the
+    /// caller must release the entry's resources and touch no per-connection
+    /// state. Mirrors the generation checks in `handle_send` /
+    /// `handle_recv_fallback`.
+    fn slab_identity_ok(&self, conn_index: u32, slab_idx: u16) -> bool {
+        self.driver.send_slab.conn_index(slab_idx) == conn_index
+            && self.driver.send_slab.generation(slab_idx)
+                == self.driver.connections.generation(conn_index)
     }
 
     /// Release the backing pool slots of a coalesced send, then the slab entry.
@@ -1912,6 +1964,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
         // Guard against a stale CQE for an already-released slab entry.
         if !self.driver.send_slab.in_use(slab_idx) {
+            return;
+        }
+        // Identity: the CQE outlived its connection slot — release resources
+        // only (plain sendmsg, no notification coming; no resubmit either
+        // way, the connection is gone).
+        if !self.slab_identity_ok(conn_index, slab_idx) {
+            self.release_coalesced(slab_idx);
             return;
         }
 
@@ -1990,9 +2049,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let conn_index = ud.conn_index();
         let slab_idx = ud.payload() as u16;
 
-        if !self.driver.send_slab.in_use(slab_idx)
-            || self.driver.connections.get(conn_index).is_none()
-        {
+        if !self.driver.send_slab.in_use(slab_idx) {
+            return;
+        }
+        // Identity: closed (index possibly reused) while waiting for POLLOUT.
+        if !self.slab_identity_ok(conn_index, slab_idx) {
+            self.release_coalesced(slab_idx);
             return;
         }
 
@@ -2045,6 +2107,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let slab_idx = ud.payload() as u16;
 
         if !self.driver.send_slab.in_use(slab_idx) {
+            return;
+        }
+        // Identity: the CQE outlived its connection slot — replenish the held
+        // bids and release the entry; touch no per-connection state.
+        if !self.slab_identity_ok(conn_index, slab_idx) {
+            self.release_recv_forward(slab_idx);
             return;
         }
 
@@ -2113,9 +2181,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let conn_index = ud.conn_index();
         let slab_idx = ud.payload() as u16;
 
-        if !self.driver.send_slab.in_use(slab_idx)
-            || self.driver.connections.get(conn_index).is_none()
-        {
+        if !self.driver.send_slab.in_use(slab_idx) {
+            return;
+        }
+        // Identity: closed (index possibly reused) while waiting for POLLOUT.
+        if !self.slab_identity_ok(conn_index, slab_idx) {
+            self.release_recv_forward(slab_idx);
             return;
         }
 
@@ -2385,6 +2456,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// Payload encoding: `bid` in low 16 bits, `remaining_len` in high 16 bits.
     /// On partial send, resubmits from offset. On completion, replenishes the bid.
     fn handle_send_recv_buf(&mut self, ud: UserData, result: i32) {
+        // No liveness/identity guard, deliberately: these sends are
+        // in_flight-tracked, so the deferred close waits for this CQE, and
+        // the only in_flight-bypassing close (force_finalize_close) is
+        // armed exclusively on TLS connections while SendRecvBuf is
+        // plaintext-only. If a non-TLS force-close path is ever added,
+        // this handler needs the same generation check as its siblings.
         let conn_index = ud.conn_index();
         let payload = ud.payload();
         // Payload carries only the bid. The remaining byte count is in the driver
@@ -2451,6 +2528,34 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let slab_idx = ud.payload() as u16;
 
         if !self.driver.send_slab.in_use(slab_idx) {
+            return;
+        }
+
+        // Identity: the CQE outlived its connection slot. Resource-only
+        // handling, mirroring the normal completion minus all per-connection
+        // state: a notification CQE decrements and releases when done; a main
+        // CQE with result > 0 still has its notification in flight (count it,
+        // never resubmit the partial remainder — the connection is gone);
+        // otherwise no notification is coming and the entry releases now.
+        if !self.slab_identity_ok(conn_index, slab_idx) {
+            if cqueue::notif(flags) {
+                self.driver.send_slab.dec_pending_notifs(slab_idx);
+            } else {
+                // Main CQE: the entry is now final for this op — a stale
+                // partial is never resubmitted. Mark awaiting only here
+                // (not on notif CQEs, which for a resubmitted partial can
+                // precede the remainder's main CQE), matching run_shutdown.
+                if result > 0 {
+                    self.driver.send_slab.inc_pending_notifs(slab_idx);
+                }
+                self.driver.send_slab.mark_awaiting_notifications(slab_idx);
+            }
+            if self.driver.send_slab.should_release(slab_idx) {
+                let ps = self.driver.send_slab.release(slab_idx);
+                if ps != u16::MAX {
+                    self.driver.send_copy_pool.release(ps);
+                }
+            }
             return;
         }
 
@@ -2680,6 +2785,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
         self.driver.accumulators.reset(conn_index);
         self.driver.reset_segment_state(conn_index);
+        self.driver.reset_send_state(conn_index);
 
         // TLS client path
         if let Some(ref mut tls_table) = self.driver.tls_table
@@ -2689,6 +2795,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 tls_table,
                 &mut self.driver.send_copy_pool,
                 conn_index,
+                self.driver.connections.generation(conn_index),
                 &mut self.driver.tls_out_scratch,
             );
             if !self.driver.tls_out_scratch.is_empty() {
@@ -2818,12 +2925,21 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
     fn handle_tls_send(&mut self, ud: UserData, result: i32) {
         let conn_index = ud.conn_index();
-        let pool_slot = ud.payload() as u16;
+        let payload = ud.payload();
+        let pool_slot = UserData::send_payload_slot(payload);
 
         // Guard against stale CQE for an already-released pool slot, matching
         // handle_send. Without this, try_advance on a released slot would
         // wrap in release mode and resubmit a wild length.
         if !self.driver.send_copy_pool.in_use(pool_slot) {
+            return;
+        }
+        // Identity guard, matching handle_send: a TlsSend CQE that outlived
+        // its connection slot must only release the slot it owns.
+        if self.driver.connections.generation(conn_index) & 0xFFFF
+            != u32::from(UserData::send_payload_gen(payload))
+        {
+            self.driver.send_copy_pool.release(pool_slot);
             return;
         }
 
@@ -2833,16 +2949,16 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 .send_copy_pool
                 .try_advance(pool_slot, result as u32)
         {
+            let generation = self.driver.connections.generation(conn_index);
             if self
                 .driver
                 .ring
-                .submit_tls_send(conn_index, ptr, remaining, pool_slot)
+                .submit_tls_send(conn_index, generation, ptr, remaining, pool_slot)
                 .is_err()
             {
                 // SQ full — queue for retry on next tick. Use copy retry
                 // since TLS sends use SendCopyPool slots; the stored OpTag
                 // keeps the resubmission on the TlsSend completion path.
-                let generation = self.driver.connections.generation(conn_index);
                 self.driver.pending_copy_retries.push((
                     conn_index,
                     generation,
@@ -2861,13 +2977,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         if result < 0 {
             let errno = -result;
             if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
+                let generation = self.driver.connections.generation(conn_index);
                 if self
                     .driver
                     .ring
-                    .submit_send_pollout(conn_index, pool_slot, true)
+                    .submit_send_pollout(conn_index, generation, pool_slot, true)
                     .is_err()
                 {
-                    let generation = self.driver.connections.generation(conn_index);
                     self.driver
                         .pending_send_pollout_retries
                         .push((conn_index, generation, pool_slot, 0, true));
@@ -2915,6 +3031,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
 
         self.executor.wake_send(conn_index, io_result);
+
+        // A close_connection that arrived while the chain was active deferred
+        // its Close on chain_drained — the chain state was just taken, so
+        // re-drive the finalize.
+        self.driver.note_send_finalized(conn_index);
     }
 
     fn handle_timer(&mut self, ud: UserData, result: i32) {
@@ -3656,11 +3777,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             let result = if matches!(op, OpTag::TlsSend) {
                 self.driver
                     .ring
-                    .submit_tls_send(conn_index, ptr, remaining, pool_slot)
+                    .submit_tls_send(conn_index, generation, ptr, remaining, pool_slot)
             } else {
                 self.driver
                     .ring
-                    .submit_send_copied(conn_index, ptr, remaining, pool_slot)
+                    .submit_send_copied(conn_index, generation, ptr, remaining, pool_slot)
             };
             if result.is_err() {
                 self.driver.pending_copy_retries.push((
@@ -3716,8 +3837,17 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 self.driver.send_pollout_retry_scratch[idx];
             if retry >= 3 {
                 // Max retries exceeded — release pool + drain queue + close.
+                // Identity first (the other branches below check it too): if
+                // the connection died while the retry aged, only the slot may
+                // be touched — draining/waking/closing would hit the index's
+                // new occupant.
                 if self.driver.send_copy_pool.in_use(pool_slot) {
                     self.driver.send_copy_pool.release(pool_slot);
+                }
+                if self.driver.connections.get(conn_index).is_none()
+                    || self.driver.connections.generation(conn_index) != generation
+                {
+                    continue;
                 }
                 self.driver.drain_conn_send_queue(conn_index);
                 let err = io::Error::other("max retries during send pollout retry");
@@ -3746,7 +3876,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             if self
                 .driver
                 .ring
-                .submit_send_pollout(conn_index, pool_slot, is_tls)
+                .submit_send_pollout(conn_index, generation, pool_slot, is_tls)
                 .is_err()
             {
                 self.driver.pending_send_pollout_retries.push((
@@ -3840,7 +3970,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
         }
         for idx in timed_out {
-            self.driver.try_finalize_close(idx);
+            // try_finalize_close would wait forever here — the deadline fired
+            // precisely because the drain is stuck (peer stopped reading).
+            self.driver.force_finalize_close(idx);
         }
     }
 }
@@ -4179,6 +4311,203 @@ mod tests {
         }
     }
 
+    // ── Stale-send identity tests (CQE outlives its connection slot) ──
+
+    /// A Send CQE whose connection slot was released and reused must only
+    /// release the orphaned pool slot — never touch the new occupant's
+    /// state. The partial-send result is the nastiest case: misattribution
+    /// would resubmit the dead connection's bytes onto the new occupant's
+    /// socket.
+    #[test]
+    fn stale_send_cqe_for_reused_index_releases_slot_only() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let old_gen = el.driver.connections.generation(conn_index);
+
+        // A copy send in flight when the connection goes away.
+        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(b"orphaned bytes").unwrap();
+        let ud = UserData::encode(
+            OpTag::Send,
+            conn_index,
+            UserData::send_payload(slot, old_gen),
+        );
+
+        // Close + reuse: generation bumps, same index preferred by allocate.
+        el.driver.connections.release(conn_index);
+        let reused = el.driver.connections.allocate().unwrap();
+        assert_eq!(reused, conn_index, "test premise: index reused");
+        assert_ne!(el.driver.connections.generation(conn_index), old_gen);
+
+        // The new occupant has its own send slot outstanding.
+        let (slot2, _p2, _l2) = el.driver.send_copy_pool.copy_in(b"new occupant").unwrap();
+
+        // Stale partial-send CQE for the old occupant.
+        el.test_dispatch_cqe(ud.raw(), 3, 0);
+
+        assert!(
+            !el.driver.send_copy_pool.in_use(slot),
+            "orphaned slot must be released by its stale CQE"
+        );
+        assert!(
+            el.driver.send_copy_pool.in_use(slot2),
+            "new occupant's slot must be untouched"
+        );
+        assert_eq!(
+            el.driver.send_queues[conn_index as usize].acked_bytes, 0,
+            "stale CQE must not credit bytes to the new occupant"
+        );
+
+        // Error-result variant: must not drain the new occupant's queue or
+        // fail its send.
+        let (slot3, _p3, _l3) = el.driver.send_copy_pool.copy_in(b"orphan two").unwrap();
+        let ud3 = UserData::encode(
+            OpTag::Send,
+            conn_index,
+            UserData::send_payload(slot3, old_gen),
+        );
+        el.test_dispatch_cqe(ud3.raw(), -(libc::ECANCELED), 0);
+        assert!(!el.driver.send_copy_pool.in_use(slot3));
+        assert!(el.driver.send_copy_pool.in_use(slot2));
+    }
+
+    /// A ZC main+notification CQE pair that outlives its connection slot
+    /// must run the notification accounting and release the slab entry,
+    /// with no per-connection effects.
+    #[test]
+    fn stale_zc_cqe_for_reused_index_resource_only() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let old_gen = el.driver.connections.generation(conn_index);
+
+        let iovecs = [libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 100,
+        }];
+        let guards = [const { None }; crate::buffer::send_slab::MAX_GUARDS];
+        let (slab_idx, _ptr) = el
+            .driver
+            .send_slab
+            .allocate(conn_index, old_gen, &iovecs, u16::MAX, guards, 0, 100)
+            .unwrap();
+        let free_before = el.driver.send_slab.free_count();
+
+        el.driver.connections.release(conn_index);
+        let reused = el.driver.connections.allocate().unwrap();
+        assert_eq!(reused, conn_index);
+
+        let ud = UserData::encode(OpTag::SendMsgZc, conn_index, slab_idx as u32);
+        // Stale main CQE (success): notification still in flight — the entry
+        // must survive until it lands.
+        el.test_dispatch_cqe(ud.raw(), 100, 0);
+        assert!(el.driver.send_slab.in_use(slab_idx));
+        // Stale notification CQE: releases the entry.
+        el.test_dispatch_cqe(ud.raw(), 0, 8);
+        assert_eq!(
+            el.driver.send_slab.free_count(),
+            free_before + 1,
+            "slab entry must be released after the stale notification"
+        );
+        assert_eq!(el.driver.send_queues[conn_index as usize].acked_bytes, 0);
+    }
+
+    /// A reused connection slot must start with clean send state. The
+    /// previous occupant's close can leave `in_flight`/`close_pending` set
+    /// when its final send CQE outlives the slot (the identity check
+    /// correctly refuses to clear another occupant's flags) — without the
+    /// activation-time reset, the next occupant's first send parks forever
+    /// behind a completion that will never come. (Observed as
+    /// async_select_with_sleep hanging when run after any other test whose
+    /// probe connection recycled index 0.)
+    #[test]
+    fn reused_slot_starts_with_clean_send_state() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+
+        // Poison the state exactly as an orphaned deferred close leaves it.
+        el.driver.send_queues[conn_index as usize].in_flight = true;
+        el.driver.send_queues[conn_index as usize].close_pending = true;
+        el.driver.send_queues[conn_index as usize].acked_bytes = 7;
+        el.driver.close_notify_armed.push(conn_index);
+
+        // Slot recycles; the activation path resets send state.
+        el.driver.connections.release(conn_index);
+        let reused = el.driver.connections.allocate().unwrap();
+        assert_eq!(reused, conn_index);
+        el.driver.reset_send_state(conn_index);
+
+        let state = &el.driver.send_queues[conn_index as usize];
+        assert!(!state.in_flight, "reused slot must not inherit in_flight");
+        assert!(!state.close_pending);
+        assert_eq!(state.acked_bytes, 0);
+        assert!(!el.driver.close_notify_armed.contains(&conn_index));
+    }
+
+    /// close_connection must defer the Close SQE while a send chain's SQEs
+    /// are still in the kernel, and finalize once the chain drains.
+    #[test]
+    fn close_defers_while_chain_active() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+
+        el.driver.chain_table.start(conn_index, 1, 100);
+        el.driver.close_connection(conn_index);
+        assert!(
+            el.driver.send_queues[conn_index as usize].close_pending,
+            "close must stay pending while the chain is active"
+        );
+
+        // The chain's operation CQE arrives and completes it.
+        let event = el.driver.chain_table.on_operation_cqe(conn_index, 100);
+        assert!(matches!(event, ChainEvent::Complete { .. }));
+        el.fire_chain_complete(conn_index);
+        assert!(
+            !el.driver.send_queues[conn_index as usize].close_pending,
+            "close must finalize once the chain drains"
+        );
+    }
+
+    /// DriverCtx::close (the on_tick-context close) must defer behind an
+    /// in-flight send instead of forcing in_flight=false and submitting
+    /// Close directly (which orphaned the send's CQE).
+    #[test]
+    fn ctx_close_defers_behind_in_flight_send() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+
+        // A send SQE is in the kernel.
+        el.driver.send_queues[conn_index as usize].in_flight = true;
+        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(b"in flight").unwrap();
+
+        {
+            let mut ctx = el.driver.make_ctx();
+            ctx.close(crate::handler::ConnToken::new(conn_index, generation));
+        }
+        assert!(el.driver.send_queues[conn_index as usize].close_pending);
+
+        // The event loop's post-callback drain defers while in_flight.
+        let pending = std::mem::take(&mut el.driver.pending_finalize_closes);
+        for idx in pending {
+            el.driver.try_finalize_close(idx);
+        }
+        assert!(
+            el.driver.send_queues[conn_index as usize].close_pending,
+            "must not finalize with a send still in flight"
+        );
+
+        // The in-flight send completes; its CQE drives the deferred Close.
+        let ud = UserData::encode(
+            OpTag::Send,
+            conn_index,
+            UserData::send_payload(slot, generation),
+        );
+        el.test_dispatch_cqe(ud.raw(), b"in flight".len() as i32, 0);
+        assert!(
+            !el.driver.send_queues[conn_index as usize].close_pending,
+            "close must finalize after the in-flight send drains"
+        );
+    }
+
     // ── ZC send path tests ─────────────────────────────────────────
 
     #[test]
@@ -4195,7 +4524,15 @@ mod tests {
         let (slab_idx, _ptr) = el
             .driver
             .send_slab
-            .allocate(conn_index, &iovecs, u16::MAX, guards, 0, 100)
+            .allocate(
+                conn_index,
+                el.driver.connections.generation(conn_index),
+                &iovecs,
+                u16::MAX,
+                guards,
+                0,
+                100,
+            )
             .unwrap();
         let free_before = el.driver.send_slab.free_count();
 
@@ -4228,7 +4565,15 @@ mod tests {
         let (slab_idx, _ptr) = el
             .driver
             .send_slab
-            .allocate(conn_index, &iovecs, u16::MAX, guards, 0, 100)
+            .allocate(
+                conn_index,
+                el.driver.connections.generation(conn_index),
+                &iovecs,
+                u16::MAX,
+                guards,
+                0,
+                100,
+            )
             .unwrap();
 
         // Simulate error CQE (result < 0).
@@ -4255,7 +4600,15 @@ mod tests {
         let (slab_idx, _ptr) = el
             .driver
             .send_slab
-            .allocate(conn_index, &iovecs, u16::MAX, guards, 0, 100)
+            .allocate(
+                conn_index,
+                el.driver.connections.generation(conn_index),
+                &iovecs,
+                u16::MAX,
+                guards,
+                0,
+                100,
+            )
             .unwrap();
 
         // Simulate result == 0 CQE (no bytes sent, no notification expected).
@@ -7235,7 +7588,15 @@ mod tests {
         let (slab_idx, _ptr) = el
             .driver
             .send_slab
-            .allocate(conn_index, &iovecs, u16::MAX, guards, 0, 100)
+            .allocate(
+                conn_index,
+                el.driver.connections.generation(conn_index),
+                &iovecs,
+                u16::MAX,
+                guards,
+                0,
+                100,
+            )
             .unwrap();
 
         // Simulate ZC send error (ECONNRESET).
@@ -7373,7 +7734,15 @@ mod tests {
         let (slab_idx, _ptr) = el
             .driver
             .send_slab
-            .allocate(conn_index, &iovecs, u16::MAX, guards, 0, 100)
+            .allocate(
+                conn_index,
+                el.driver.connections.generation(conn_index),
+                &iovecs,
+                u16::MAX,
+                guards,
+                0,
+                100,
+            )
             .unwrap();
 
         // Inject ZC send error through real pipeline.
@@ -7436,7 +7805,15 @@ mod tests {
         let (slab_idx, _ptr) = el
             .driver
             .send_slab
-            .allocate(conn_index, &iovecs, u16::MAX, guards, 0, 100)
+            .allocate(
+                conn_index,
+                el.driver.connections.generation(conn_index),
+                &iovecs,
+                u16::MAX,
+                guards,
+                0,
+                100,
+            )
             .unwrap();
         let free_before = el.driver.send_slab.free_count();
 
@@ -7467,7 +7844,15 @@ mod tests {
         let (slab_idx, _ptr) = el
             .driver
             .send_slab
-            .allocate(conn_index, &iovecs, u16::MAX, guards, 0, 100)
+            .allocate(
+                conn_index,
+                el.driver.connections.generation(conn_index),
+                &iovecs,
+                u16::MAX,
+                guards,
+                0,
+                100,
+            )
             .unwrap();
 
         let ud = UserData::encode(OpTag::SendMsgZc, conn_index, slab_idx as u32);
@@ -7833,7 +8218,15 @@ mod tests {
         let (slab_idx, _ptr) = el
             .driver
             .send_slab
-            .allocate(conn_index, &iovecs, u16::MAX, guards, 0, 100)
+            .allocate(
+                conn_index,
+                el.driver.connections.generation(conn_index),
+                &iovecs,
+                u16::MAX,
+                guards,
+                0,
+                100,
+            )
             .unwrap();
 
         // Simulate: operation CQE already incremented pending_notifs.
@@ -8738,7 +9131,15 @@ mod tests {
                 for action in &actions {
                     let iovecs = [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 100 }];
                     let guards = [const { None }; crate::buffer::send_slab::MAX_GUARDS];
-                    let (slab_idx, _) = match el.driver.send_slab.allocate(conn_index, &iovecs, u16::MAX, guards, 0, 100) {
+                    let (slab_idx, _) = match el.driver.send_slab.allocate(
+                conn_index,
+                el.driver.connections.generation(conn_index),
+                &iovecs,
+                u16::MAX,
+                guards,
+                0,
+                100,
+            ) {
                         Some(s) => s,
                         None => break,
                     };
@@ -8858,9 +9259,7 @@ mod tests {
                                 iov_len: 50,
                             }];
                             let guards = [const { None }; crate::buffer::send_slab::MAX_GUARDS];
-                            if let Some((slab_idx, _)) = el.driver.send_slab.allocate(
-                                ci, &iovecs, u16::MAX, guards, 0, 50,
-                            ) {
+                            if let Some((slab_idx, _)) = el.driver.send_slab.allocate(ci, el.driver.connections.generation(ci), &iovecs, u16::MAX, guards, 0, 50) {
                                 let ud = UserData::encode(
                                     OpTag::SendMsgZc, ci, slab_idx as u32,
                                 );
@@ -8879,9 +9278,7 @@ mod tests {
                                 iov_len: 50,
                             }];
                             let guards = [const { None }; crate::buffer::send_slab::MAX_GUARDS];
-                            if let Some((slab_idx, _)) = el.driver.send_slab.allocate(
-                                ci, &iovecs, u16::MAX, guards, 0, 50,
-                            ) {
+                            if let Some((slab_idx, _)) = el.driver.send_slab.allocate(ci, el.driver.connections.generation(ci), &iovecs, u16::MAX, guards, 0, 50) {
                                 let ud = UserData::encode(
                                     OpTag::SendMsgZc, ci, slab_idx as u32,
                                 );

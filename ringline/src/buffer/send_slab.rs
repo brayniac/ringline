@@ -40,6 +40,10 @@ struct InFlightSendEntry {
     guards: [Option<GuardBox>; MAX_GUARDS],
     guard_count: u8,
     conn_index: u32,
+    /// Connection generation at allocation time. Completion handlers compare
+    /// this against the connection's current generation before touching
+    /// per-connection state — a send CQE can outlive its connection slot.
+    generation: u32,
     total_len: u32,
     /// Whether the last chunk gathered into this send is the final chunk of
     /// its logical send. A coalesced entry that ends mid logical-send (the run
@@ -73,6 +77,7 @@ impl InFlightSendSlab {
                 guards: [const { None }; MAX_GUARDS],
                 guard_count: 0,
                 conn_index: 0,
+                generation: 0,
                 total_len: 0,
                 end_of_send: true,
                 pending_notifs: 0,
@@ -90,9 +95,11 @@ impl InFlightSendSlab {
     /// `iovecs_slice` must have length <= MAX_IOVECS.
     /// `guards` is an array of `Option<GuardBox>` to move into the entry.
     /// `guard_count` is the number of Some guards.
+    #[allow(clippy::too_many_arguments)]
     pub fn allocate(
         &mut self,
         conn_index: u32,
+        generation: u32,
         iovecs_slice: &[libc::iovec],
         pool_slot: u16,
         guards: [Option<GuardBox>; MAX_GUARDS],
@@ -114,6 +121,7 @@ impl InFlightSendSlab {
         entry.guards = guards;
         entry.guard_count = guard_count;
         entry.conn_index = conn_index;
+        entry.generation = generation;
         entry.total_len = total_len;
         entry.end_of_send = true;
         entry.pending_notifs = 0;
@@ -135,6 +143,7 @@ impl InFlightSendSlab {
     pub fn allocate_coalesced(
         &mut self,
         conn_index: u32,
+        generation: u32,
         iovecs_slice: &[libc::iovec],
         pool_slots: &[u16],
         total_len: u32,
@@ -157,6 +166,7 @@ impl InFlightSendSlab {
         entry.pool_slot_count = pool_slots.len() as u8;
         entry.guard_count = 0;
         entry.conn_index = conn_index;
+        entry.generation = generation;
         entry.total_len = total_len;
         entry.end_of_send = end_of_send;
         entry.pending_notifs = 0;
@@ -184,6 +194,7 @@ impl InFlightSendSlab {
     pub fn allocate_recv_forward(
         &mut self,
         conn_index: u32,
+        generation: u32,
         iovecs_slice: &[libc::iovec],
         bids: &[u16],
         total_len: u32,
@@ -206,6 +217,7 @@ impl InFlightSendSlab {
         entry.bid_count = bids.len() as u8;
         entry.guard_count = 0;
         entry.conn_index = conn_index;
+        entry.generation = generation;
         entry.total_len = total_len;
         entry.end_of_send = true;
         entry.pending_notifs = 0;
@@ -331,9 +343,13 @@ impl InFlightSendSlab {
     }
 
     /// Get the connection index for an entry.
-    #[cfg(test)]
     pub fn conn_index(&self, idx: u16) -> u32 {
         self.entries[idx as usize].conn_index
+    }
+
+    /// Connection generation recorded at allocation time.
+    pub fn generation(&self, idx: u16) -> u32 {
+        self.entries[idx as usize].generation
     }
 
     /// Check if an entry is in use.
@@ -396,7 +412,7 @@ mod tests {
         }];
         let guards: [Option<GuardBox>; MAX_GUARDS] = [const { None }; MAX_GUARDS];
         let (idx, ptr) = slab
-            .allocate(42, &iovecs, u16::MAX, guards, 0, 100)
+            .allocate(42, 7, &iovecs, u16::MAX, guards, 0, 100)
             .unwrap();
         assert_eq!(slab.free_count(), 3);
         assert!(!ptr.is_null());
@@ -432,7 +448,9 @@ mod tests {
         ];
 
         let guards: [Option<GuardBox>; MAX_GUARDS] = [const { None }; MAX_GUARDS];
-        let (idx, _) = slab.allocate(0, &iovecs, u16::MAX, guards, 0, 100).unwrap();
+        let (idx, _) = slab
+            .allocate(0, 0, &iovecs, u16::MAX, guards, 0, 100)
+            .unwrap();
 
         // Partial send: 50 bytes (entire first iovec)
         let result = slab.try_advance(idx, 50);
@@ -457,7 +475,9 @@ mod tests {
             iov_len: 100,
         }];
         let guards: [Option<GuardBox>; MAX_GUARDS] = [const { None }; MAX_GUARDS];
-        let (idx, _) = slab.allocate(0, &iovecs, u16::MAX, guards, 0, 100).unwrap();
+        let (idx, _) = slab
+            .allocate(0, 0, &iovecs, u16::MAX, guards, 0, 100)
+            .unwrap();
 
         slab.inc_pending_notifs(idx);
         slab.inc_pending_notifs(idx);
@@ -502,7 +522,7 @@ mod tests {
         let mut guards: [Option<GuardBox>; MAX_GUARDS] = [const { None }; MAX_GUARDS];
         guards[0] = Some(g1);
         guards[1] = Some(g2);
-        let (idx, _) = slab.allocate(0, &iovecs, 5, guards, 2, 10).unwrap();
+        let (idx, _) = slab.allocate(0, 0, &iovecs, 5, guards, 2, 10).unwrap();
 
         assert_eq!(counter.load(Ordering::SeqCst), 0);
         let pool_slot = slab.release(idx);
@@ -520,7 +540,9 @@ mod tests {
             iov_len: 100,
         }];
         let guards: [Option<GuardBox>; MAX_GUARDS] = [const { None }; MAX_GUARDS];
-        let (idx, _) = slab.allocate(0, &iovecs, u16::MAX, guards, 0, 100).unwrap();
+        let (idx, _) = slab
+            .allocate(0, 0, &iovecs, u16::MAX, guards, 0, 100)
+            .unwrap();
 
         // Simulate result == 0: no inc_pending_notifs, just mark_awaiting.
         slab.mark_awaiting_notifications(idx);
@@ -546,7 +568,9 @@ mod tests {
             iov_len: 100,
         }];
         let guards: [Option<GuardBox>; MAX_GUARDS] = [const { None }; MAX_GUARDS];
-        let (idx, _) = slab.allocate(0, &iovecs, u16::MAX, guards, 0, 100).unwrap();
+        let (idx, _) = slab
+            .allocate(0, 0, &iovecs, u16::MAX, guards, 0, 100)
+            .unwrap();
 
         // Simulate error result (result < 0): do NOT call inc_pending_notifs.
         // This is what the shutdown handler should do for error CQEs.
@@ -569,7 +593,9 @@ mod tests {
             iov_len: 100,
         }];
         let guards: [Option<GuardBox>; MAX_GUARDS] = [const { None }; MAX_GUARDS];
-        let (idx, _) = slab.allocate(0, &iovecs, u16::MAX, guards, 0, 100).unwrap();
+        let (idx, _) = slab
+            .allocate(0, 0, &iovecs, u16::MAX, guards, 0, 100)
+            .unwrap();
 
         // Bug scenario: incorrectly calling inc_pending_notifs on error result.
         slab.inc_pending_notifs(idx);
@@ -596,11 +622,13 @@ mod tests {
             iov_len: 10,
         }];
         let guards: [Option<GuardBox>; MAX_GUARDS] = [const { None }; MAX_GUARDS];
-        let _ = slab.allocate(0, &iovecs, u16::MAX, guards, 0, 10).unwrap();
+        let _ = slab
+            .allocate(0, 0, &iovecs, u16::MAX, guards, 0, 10)
+            .unwrap();
 
         let guards2: [Option<GuardBox>; MAX_GUARDS] = [const { None }; MAX_GUARDS];
         assert!(
-            slab.allocate(0, &iovecs, u16::MAX, guards2, 0, 10)
+            slab.allocate(0, 0, &iovecs, u16::MAX, guards2, 0, 10)
                 .is_none()
         );
     }
