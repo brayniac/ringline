@@ -1,7 +1,7 @@
 # 2026-08: Evaluating the code against its own principles
 
 - **Status:** shipped
-- **Span:** 2026-08-26 → 2026-08-28 · PRs #322–#325 · unreleased (next release carries the batched breaking changes)
+- **Span:** 2026-08-26 → 2026-08-28 · PRs #322–#325, follow-ups #326–#329 · unreleased (next release carries the batched breaking changes)
 
 ## Goal
 
@@ -139,9 +139,15 @@ P5's "asymmetry is presumed defect" working as designed.
   known `buffer_ring_exhaustion_recovers` flake); the deterministic
   regression was distinguishable from the background rate only by running
   main under the identical loop.
-- **Open backlog** (from the #325 reviews; reopen conditions in the PR):
-  suppress wasteful resubmit SQEs from pre-bump CQEs on force-closed
-  connections; pack real generations in the `mixed_operations` proptest's
-  reused-index sends; a P6 checked-arithmetic sweep of `ringline-grpc` was
-  never done; the `PoolConfig` opaque-config decision awaits a coordinated
-  breaking release.
+- **Backlog: all resolved** (originally from the #325 reviews). #328
+  (458fd30) suppresses every SQE for a connection once its Close SQE is
+  submitted — CQE-side resubmits/POLLOUT arms plus, per its own adversarial
+  review, the front-door entry points (`send`/`send_parts`/`send_chain`/
+  `shutdown_write` now reject with `NotConnected`) — and restores the
+  proptest's real-generation coverage. #327 (b891913) is the `ringline-grpc`
+  P6 sweep: one real finding, the gzip/zstd decompression cap wrapping to
+  `take(0)` at `max_size = usize::MAX` (silent empty payloads in release);
+  the rest of the crate's wire arithmetic verified clean. #329 (8fdbaf7)
+  resolves the `PoolConfig` question by owner decision: opaque migration
+  (`PoolConfig::new` + setters, all four client crates), batched with this
+  release's breaking set.
