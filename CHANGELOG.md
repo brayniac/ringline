@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Breaking (batched for the next release):** `PoolConfig` in `ringline-ping`,
+  `ringline-redis`, `ringline-memcache`, and `ringline-http` is now opaque:
+  construct with `PoolConfig::new(...)` (required parameters) plus chained
+  setters (`connect_timeout_ms`, `tls_server_name`, and for redis
+  `password`/`username`) instead of struct literals. Aligns the client crates
+  with the workspace's no-public-fields API principle; adding a pool option is
+  no longer a breaking change.
+
 - **Breaking (batched for the next release):** `ringline-h2`'s `H2Error` and
   `H2Event`, and `ringline-http`'s `HttpError`, `Protocol`, `Body`, and
   `StreamingResponse`, are now `#[non_exhaustive]`, matching the other

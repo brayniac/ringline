@@ -12,15 +12,41 @@ use crate::error::HttpError;
 /// Configuration for an HTTP connection pool.
 pub struct PoolConfig {
     /// Server address to connect to.
-    pub addr: SocketAddr,
+    pub(crate) addr: SocketAddr,
     /// Host name (for TLS SNI and Host header).
-    pub host: String,
+    pub(crate) host: String,
     /// Number of connections in the pool.
-    pub pool_size: usize,
+    pub(crate) pool_size: usize,
     /// Protocol to use.
-    pub protocol: Protocol,
+    pub(crate) protocol: Protocol,
     /// Connect timeout in milliseconds. 0 means no timeout.
-    pub connect_timeout_ms: u64,
+    pub(crate) connect_timeout_ms: u64,
+}
+
+impl PoolConfig {
+    /// Create a pool config for `pool_size` connections to `addr`, speaking
+    /// `protocol` with `host` used for TLS SNI and the Host header.
+    /// Default: no connect timeout.
+    pub fn new(
+        addr: SocketAddr,
+        host: impl Into<String>,
+        protocol: Protocol,
+        pool_size: usize,
+    ) -> Self {
+        Self {
+            addr,
+            host: host.into(),
+            pool_size,
+            protocol,
+            connect_timeout_ms: 0,
+        }
+    }
+
+    /// Set the connect timeout in milliseconds. `0` (the default) disables it.
+    pub fn connect_timeout_ms(mut self, ms: u64) -> Self {
+        self.connect_timeout_ms = ms;
+        self
+    }
 }
 
 /// Which HTTP protocol to use.

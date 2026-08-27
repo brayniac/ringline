@@ -399,12 +399,7 @@ fn memcache_pool() {
             Some(Box::pin(async move {
                 let result = async {
                     let addr: SocketAddr = MEMCACHE_ADDR.parse().unwrap();
-                    let config = PoolConfig {
-                        addr,
-                        pool_size: 2,
-                        connect_timeout_ms: 5000,
-                        tls_server_name: None,
-                    };
+                    let config = PoolConfig::new(addr, 2).connect_timeout_ms(5000);
                     let mut pool = Pool::new(config);
                     pool.connect_all()
                         .await

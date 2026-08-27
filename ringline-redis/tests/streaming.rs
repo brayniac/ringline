@@ -665,14 +665,7 @@ async fn run_pool_stream(addr: SocketAddr) -> Result<(), String> {
     // `pool_size == 1` forces every checkout onto the SAME slot, so the poison
     // path below actually re-checks-out the poisoned connection (with 2+ slots
     // round-robin would dodge it, never exercising the eviction).
-    let mut pool = Pool::new(PoolConfig {
-        addr,
-        pool_size: 1,
-        connect_timeout_ms: 0,
-        tls_server_name: None,
-        password: None,
-        username: None,
-    });
+    let mut pool = Pool::new(PoolConfig::new(addr, 1));
 
     let expected_large = large_value();
 

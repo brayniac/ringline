@@ -10,14 +10,7 @@
 //! # use std::net::SocketAddr;
 //! # use ringline_redis::{Pool, PoolConfig};
 //! # async fn example() -> Result<(), ringline_redis::Error> {
-//! let config = PoolConfig {
-//!     addr: "127.0.0.1:6379".parse().unwrap(),
-//!     pool_size: 4,
-//!     connect_timeout_ms: 0,
-//!     tls_server_name: None,
-//!     password: None,
-//!     username: None,
-//! };
+//! let config = PoolConfig::new("127.0.0.1:6379".parse().unwrap(), 4);
 //! let mut pool = Pool::new(config);
 //! pool.connect_all().await?;
 //! pool.client().await?.set("k", "v").await?;
@@ -36,17 +29,57 @@ use crate::{Client, Error, Pipeline};
 /// Configuration for a connection pool.
 pub struct PoolConfig {
     /// Backend address to connect to.
-    pub addr: SocketAddr,
+    pub(crate) addr: SocketAddr,
     /// Number of connections in the pool.
-    pub pool_size: usize,
+    pub(crate) pool_size: usize,
     /// Connect timeout in milliseconds. 0 means no timeout.
-    pub connect_timeout_ms: u64,
+    pub(crate) connect_timeout_ms: u64,
     /// TLS server name (SNI) for outbound connections. `None` means plain TCP.
-    pub tls_server_name: Option<String>,
+    pub(crate) tls_server_name: Option<String>,
     /// Password for AUTH after connect. `None` skips authentication.
-    pub password: Option<String>,
+    pub(crate) password: Option<String>,
     /// Username for ACL-based AUTH (Redis 6.0+). Only used when `password` is set.
-    pub username: Option<String>,
+    pub(crate) username: Option<String>,
+}
+
+impl PoolConfig {
+    /// Create a pool config for `pool_size` connections to `addr`.
+    /// Defaults: no connect timeout, plain TCP (no TLS).
+    pub fn new(addr: SocketAddr, pool_size: usize) -> Self {
+        Self {
+            addr,
+            pool_size,
+            connect_timeout_ms: 0,
+            tls_server_name: None,
+            password: None,
+            username: None,
+        }
+    }
+
+    /// Set the connect timeout in milliseconds. `0` (the default) disables it.
+    pub fn connect_timeout_ms(mut self, ms: u64) -> Self {
+        self.connect_timeout_ms = ms;
+        self
+    }
+
+    /// Set the TLS server name (SNI) for outbound connections; enables TLS.
+    pub fn tls_server_name(mut self, name: impl Into<String>) -> Self {
+        self.tls_server_name = Some(name.into());
+        self
+    }
+
+    /// Set the password for AUTH after connect.
+    pub fn password(mut self, password: impl Into<String>) -> Self {
+        self.password = Some(password.into());
+        self
+    }
+
+    /// Set the username for ACL-based AUTH (Redis 6.0+). Only used when a
+    /// password is set.
+    pub fn username(mut self, username: impl Into<String>) -> Self {
+        self.username = Some(username.into());
+        self
+    }
 }
 
 enum Slot {
