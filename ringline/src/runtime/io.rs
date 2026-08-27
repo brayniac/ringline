@@ -1296,9 +1296,10 @@ impl ConnCtx {
                 total += p.len;
             }
 
+            let generation = driver.connections.generation(conn_index);
             let (slab_idx, msg_ptr) = driver
                 .send_slab
-                .allocate_recv_forward(conn_index, &iovecs[..n], &bids[..n], total)
+                .allocate_recv_forward(conn_index, generation, &iovecs[..n], &bids[..n], total)
                 .ok_or_else(|| io::Error::other("send slab exhausted"))?;
 
             match driver

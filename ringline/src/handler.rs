@@ -34,8 +34,8 @@ pub(crate) struct ConnSendState {
     #[allow(dead_code)]
     pub close_send_count: u32,
     /// Deadline for close_notify completion. Set when close_notify is
-    /// sent via `flush_close_notify_linked`. If elapsed while
-    /// `close_pending` is true, the runtime force-closes the connection.
+    /// queued by `DriverCtx::close`. If elapsed while `close_pending` is
+    /// true, the runtime force-closes the connection.
     #[cfg_attr(not(has_io_uring), allow(dead_code))]
     pub close_notify_deadline: Option<std::time::Instant>,
     /// Bytes acknowledged so far for the in-progress logical send.
@@ -171,8 +171,12 @@ pub struct DriverCtx<'a> {
     pub(crate) fs_cmd_slab: &'a mut Option<crate::fs::FsCmdSlab>,
     /// Base offset in the fixed file table for filesystem file fds.
     pub(crate) fs_fd_base: u32,
-    /// Pending close retries from failed submit_close calls.
-    pub(crate) pending_close_retries: &'a mut Vec<(u32, u8)>,
+    /// Connections whose `close_pending` was set from this ctx (e.g.
+    /// `DriverCtx::close`); the event loop re-drives `try_finalize_close`
+    /// for each after the callback returns. This keeps ctx-initiated closes
+    /// on the same deferred path as `close_connection` — the Close SQE is
+    /// only submitted once in-flight sends, queued sends, and chains drain.
+    pub(crate) pending_finalize_closes: &'a mut Vec<u32>,
     pub(crate) close_notify_timeout: std::time::Duration,
     pub(crate) next_disk_io_seq: &'a mut u16,
 }
@@ -237,8 +241,13 @@ impl<'a> DriverCtx<'a> {
         if !self.tls_table.is_null() {
             let tls_table = unsafe { &mut *self.tls_table };
             if tls_table.get_mut(conn.index).is_some() {
-                let sends =
-                    crate::tls::encrypt_to_sends(tls_table, self.send_copy_pool, conn.index, data)?;
+                let sends = crate::tls::encrypt_to_sends(
+                    tls_table,
+                    self.send_copy_pool,
+                    conn.index,
+                    conn.generation,
+                    data,
+                )?;
                 // Route every ciphertext chunk through the per-connection
                 // send queue: io_uring doesn't order independent SQEs, and
                 // a partial-send resubmit would interleave chunks on the
@@ -267,7 +276,7 @@ impl<'a> DriverCtx<'a> {
             let user_data = crate::completion::UserData::encode(
                 crate::completion::OpTag::Send,
                 conn.index,
-                slot as u32,
+                crate::completion::UserData::send_payload(slot, conn.generation),
             );
             let entry = io_uring::opcode::Send::new(io_uring::types::Fixed(conn.index), ptr, len)
                 .flags(crate::completion::STREAM_SEND_FLAGS)
@@ -407,6 +416,14 @@ impl<'a> DriverCtx<'a> {
     }
 
     /// Close a connection.
+    ///
+    /// The close is serialized behind the connection's outstanding work:
+    /// queued and in-flight sends drain first (their bytes still reach the
+    /// wire), then the deferred Close SQE is submitted by the event loop's
+    /// `try_finalize_close`. An earlier version drained the queue without
+    /// submitting it, forced `in_flight = false` while a send SQE was still
+    /// in the kernel, and submitted Close directly — orphaning the send's
+    /// CQE past its connection slot's lifetime.
     pub fn close(&mut self, conn: ConnToken) {
         if let Some(conn_state) = self.connections.get_mut(conn.index) {
             if conn_state.generation != conn.generation {
@@ -414,31 +431,27 @@ impl<'a> DriverCtx<'a> {
             }
             conn_state.recv_mode = crate::connection::RecvMode::Closed;
 
-            // Drain the send queue and release all queued resources.
-            let state = &mut self.send_queues[conn.index as usize];
-            for built in state.queue.drain(..) {
-                if built.slab_idx != u16::MAX {
-                    let pool_slot = self.send_slab.release(built.slab_idx);
-                    if pool_slot != u16::MAX {
-                        self.send_copy_pool.release(pool_slot);
-                    }
-                } else if built.pool_slot != u16::MAX {
-                    self.send_copy_pool.release(built.pool_slot);
-                }
-            }
-            state.in_flight = false;
-
-            // Graceful TLS shutdown: send close_notify before closing.
+            // Graceful TLS shutdown: queue close_notify ciphertext through
+            // the per-connection send queue so it serializes behind any
+            // in-flight sends (the linked-SQE variant is only sound when
+            // the Close SQE immediately follows in the same push).
             if !self.tls_table.is_null() {
                 let tls_table = unsafe { &mut *self.tls_table };
                 if tls_table.has(conn.index) {
-                    tls_table.send_close_notify(conn.index, self.ring, self.send_copy_pool);
-                    // Arm the close_notify deadline for timeout detection
-                    // and register this index in the armed set so the
-                    // event loop's `check_close_notify_deadlines` will
-                    // examine it. Avoids the full O(N) send_queues walk
-                    // for non-TLS workloads, which previously dominated
-                    // worker CPU at high request rates.
+                    let mut sends = Vec::new();
+                    tls_table.send_close_notify_queued(
+                        conn.index,
+                        conn.generation,
+                        self.send_copy_pool,
+                        &mut sends,
+                    );
+                    if !sends.is_empty() {
+                        let _ = self.queue_built_sends(conn.index, sends);
+                    }
+                    // Arm the close_notify deadline so the event loop
+                    // force-closes if the deferred Close never fires (peer
+                    // stops reading and the queue can't drain). Live now
+                    // that `close_pending` is actually set on this path.
                     let state = &mut self.send_queues[conn.index as usize];
                     state.close_notify_deadline =
                         Some(std::time::Instant::now() + self.close_notify_timeout);
@@ -448,9 +461,12 @@ impl<'a> DriverCtx<'a> {
                 }
             }
 
-            if self.ring.submit_close(conn.index).is_err() {
-                crate::metrics::RING.increment(crate::metrics::ring::CLOSE_SUBMIT_FAILURES);
-                self.pending_close_retries.push((conn.index, 0));
+            // Defer the Close behind whatever is outstanding; the event loop
+            // re-drives try_finalize_close after this callback returns, and
+            // each send CQE re-drives it via note_send_finalized.
+            self.send_queues[conn.index as usize].close_pending = true;
+            if !self.pending_finalize_closes.contains(&conn.index) {
+                self.pending_finalize_closes.push(conn.index);
             }
         }
     }
@@ -2873,6 +2889,7 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
             tls_table,
             self.ctx.send_copy_pool,
             self.conn.index,
+            self.conn.generation,
             &plaintext,
         )?;
         self.ctx.queue_built_sends(self.conn.index, sends)
@@ -2891,7 +2908,7 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
         let user_data = crate::completion::UserData::encode(
             crate::completion::OpTag::Send,
             self.conn.index,
-            slot as u32,
+            crate::completion::UserData::send_payload(slot, self.conn.generation),
         );
         let entry = io_uring::opcode::Send::new(io_uring::types::Fixed(self.conn.index), ptr, len)
             .flags(crate::completion::STREAM_SEND_FLAGS)
@@ -2972,6 +2989,7 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
                 .send_slab
                 .allocate(
                     self.conn.index,
+                    self.conn.generation,
                     iov_slice,
                     slot,
                     guards,
@@ -3033,6 +3051,7 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
                 .send_slab
                 .allocate(
                     self.conn.index,
+                    self.conn.generation,
                     iov_slice,
                     u16::MAX,
                     guards,
@@ -3113,7 +3132,7 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
         let user_data = crate::completion::UserData::encode(
             crate::completion::OpTag::Send,
             self.conn.index,
-            slot as u32,
+            crate::completion::UserData::send_payload(slot, self.conn.generation),
         );
         let entry = io_uring::opcode::Send::new(io_uring::types::Fixed(self.conn.index), ptr, len)
             .flags(crate::completion::STREAM_SEND_FLAGS)
@@ -3181,7 +3200,7 @@ impl<'b, 'a> SendChainBuilder<'b, 'a> {
         let user_data = crate::completion::UserData::encode(
             crate::completion::OpTag::Send,
             self.conn.index,
-            slot as u32,
+            crate::completion::UserData::send_payload(slot, self.conn.generation),
         );
         let entry = io_uring::opcode::Send::new(io_uring::types::Fixed(self.conn.index), ptr, len)
             .flags(crate::completion::STREAM_SEND_FLAGS)
@@ -3417,7 +3436,7 @@ impl<'b, 'a> ChainPartsBuilder<'b, 'a> {
                     let user_data = crate::completion::UserData::encode(
                         crate::completion::OpTag::Send,
                         conn_index,
-                        slot as u32,
+                        crate::completion::UserData::send_payload(slot, self.chain.conn.generation),
                     );
                     let entry =
                         io_uring::opcode::Send::new(io_uring::types::Fixed(conn_index), ptr, len)
@@ -3450,7 +3469,7 @@ impl<'b, 'a> ChainPartsBuilder<'b, 'a> {
                     let user_data = crate::completion::UserData::encode(
                         crate::completion::OpTag::Send,
                         conn_index,
-                        slot as u32,
+                        crate::completion::UserData::send_payload(slot, self.chain.conn.generation),
                     );
                     let entry =
                         io_uring::opcode::Send::new(io_uring::types::Fixed(conn_index), ptr, len)
@@ -3541,6 +3560,7 @@ impl<'b, 'a> ChainPartsBuilder<'b, 'a> {
                         let guards = std::mem::take(&mut self.guards);
                         match self.chain.ctx.send_slab.allocate(
                             conn_index,
+                            self.chain.conn.generation,
                             iov_slice,
                             slot,
                             guards,
@@ -3613,6 +3633,7 @@ impl<'b, 'a> ChainPartsBuilder<'b, 'a> {
                 let guards = std::mem::take(&mut self.guards);
                 match self.chain.ctx.send_slab.allocate(
                     conn_index,
+                    self.chain.conn.generation,
                     iov_slice,
                     u16::MAX,
                     guards,

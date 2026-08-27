@@ -134,6 +134,11 @@ Bits 55..32: ConnIndex (24 bits)
 Bits 31..0:  Payload (32 bits) — buffer id, slab slot, timer slot, etc.
 ```
 
+For pool-slot send ops (`Send`/`TlsSend`/`SendPollOut`) the payload's high bits
+carry the connection generation (truncated) so completion handlers can reject
+a CQE that outlived its connection slot; slab-backed sends record the
+generation in the slab entry instead. See `UserData::send_payload`.
+
 `OpTag` has grown to ~28 variants — read `completion.rs` rather than assuming the set.
 
 ## Domain Invariants (io_uring correctness rules)

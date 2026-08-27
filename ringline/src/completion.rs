@@ -175,6 +175,52 @@ impl UserData {
         (self.0 & Self::PAYLOAD_MASK) as u32
     }
 
+    /// Pack a send-family payload: pool slot (or slab index) in the low 16
+    /// bits, the connection generation's low 16 bits in the high 16.
+    ///
+    /// Completion handlers compare the packed generation against the
+    /// connection's current generation before touching per-connection state:
+    /// a Send CQE can outlive its connection slot (e.g. a close submitted
+    /// with a send still in flight), and after the index is reused the CQE
+    /// would otherwise be misattributed to the new occupant. 16 truncated
+    /// bits suffice — a false match needs 65536 reallocations of one index
+    /// while a single CQE is in flight.
+    #[inline]
+    pub fn send_payload(slot: u16, generation: u32) -> u32 {
+        (slot as u32) | ((generation & 0xFFFF) << 16)
+    }
+
+    /// Unpack the slot/slab half of a send-family payload.
+    #[inline]
+    pub fn send_payload_slot(payload: u32) -> u16 {
+        payload as u16
+    }
+
+    /// Unpack the truncated-generation half of a send-family payload.
+    #[inline]
+    pub fn send_payload_gen(payload: u32) -> u16 {
+        (payload >> 16) as u16
+    }
+
+    /// Pack a `SendPollOut` payload: pool slot (16 bits), `is_tls` flag
+    /// (bit 16), connection generation's low 15 bits (bits 17..31).
+    #[inline]
+    pub fn send_pollout_payload(slot: u16, is_tls: bool, generation: u32) -> u32 {
+        (slot as u32) | (u32::from(is_tls) << 16) | ((generation & 0x7FFF) << 17)
+    }
+
+    /// Unpack the `is_tls` flag of a `SendPollOut` payload.
+    #[inline]
+    pub fn send_pollout_is_tls(payload: u32) -> bool {
+        (payload >> 16) & 1 == 1
+    }
+
+    /// Unpack the truncated generation of a `SendPollOut` payload.
+    #[inline]
+    pub fn send_pollout_gen(payload: u32) -> u16 {
+        (payload >> 17) as u16 & 0x7FFF
+    }
+
     /// Get the raw u64 value.
     #[inline]
     pub fn raw(self) -> u64 {

@@ -8,7 +8,6 @@ use rustls::{ClientConnection, ServerConnection};
 #[allow(unused_imports)]
 use crate::accumulator::AccumulatorTable;
 #[cfg(has_io_uring)]
-use crate::backend::Ring;
 #[allow(unused_imports)]
 use crate::buffer::send_copy::SendCopyPool;
 
@@ -251,20 +250,23 @@ impl TlsTable {
         })
     }
 
-    /// Send a TLS close_notify alert and flush the resulting ciphertext.
-    /// All SQEs are submitted with IOSQE_IO_LINK so the caller's subsequent
-    /// Close SQE is chained and only runs after the close_notify is sent.
+    /// Send a TLS close_notify alert, encrypting the ciphertext into
+    /// `BuiltSend`s for the caller to route through the per-connection send
+    /// queue. Serializing through the queue (rather than pushing linked
+    /// SQEs directly) keeps the alert ordered behind any in-flight send and
+    /// lets the deferred Close fire only after it completes.
     #[cfg(has_io_uring)]
-    pub fn send_close_notify(
+    pub fn send_close_notify_queued(
         &mut self,
         conn_index: u32,
-        ring: &mut Ring,
+        generation: u32,
         send_copy_pool: &mut SendCopyPool,
+        out: &mut Vec<crate::handler::BuiltSend>,
     ) {
         if let Some(tls_conn) = self.get_mut(conn_index) {
             tls_conn.conn.send_close_notify();
             tls_conn.close_notify_sent = true;
-            flush_close_notify_linked(tls_conn, ring, send_copy_pool, conn_index);
+            let _ = take_tls_output_sends(tls_conn, send_copy_pool, conn_index, generation, out);
         }
     }
 }
@@ -382,6 +384,7 @@ pub fn feed_tls_recv(
     mut sink: PlaintextSink<'_>,
     send_copy_pool: &mut SendCopyPool,
     conn_index: u32,
+    generation: u32,
     ciphertext: &[u8],
     out_sends: &mut Vec<crate::handler::BuiltSend>,
 ) -> TlsRecvResult {
@@ -418,7 +421,13 @@ pub fn feed_tls_recv(
             Ok(state) => state,
             Err(e) => {
                 if tls_conn.conn.wants_write() {
-                    let _ = take_tls_output_sends(tls_conn, send_copy_pool, conn_index, out_sends);
+                    let _ = take_tls_output_sends(
+                        tls_conn,
+                        send_copy_pool,
+                        conn_index,
+                        generation,
+                        out_sends,
+                    );
                 }
                 return TlsRecvResult::Error(e);
             }
@@ -441,7 +450,13 @@ pub fn feed_tls_recv(
         Ok(state) => state,
         Err(e) => {
             if tls_conn.conn.wants_write() {
-                let _ = take_tls_output_sends(tls_conn, send_copy_pool, conn_index, out_sends);
+                let _ = take_tls_output_sends(
+                    tls_conn,
+                    send_copy_pool,
+                    conn_index,
+                    generation,
+                    out_sends,
+                );
             }
             return TlsRecvResult::Error(e);
         }
@@ -459,7 +474,7 @@ pub fn feed_tls_recv(
 
     // Collect any TLS output (handshake messages, alerts, etc.).
     if tls_conn.conn.wants_write()
-        && !take_tls_output_sends(tls_conn, send_copy_pool, conn_index, out_sends)
+        && !take_tls_output_sends(tls_conn, send_copy_pool, conn_index, generation, out_sends)
     {
         return TlsRecvResult::Error(rustls::Error::General(
             "send pool exhausted during TLS output flush".into(),
@@ -489,10 +504,11 @@ pub fn flush_tls_output(
     tls_table: &mut TlsTable,
     send_copy_pool: &mut SendCopyPool,
     conn_index: u32,
+    generation: u32,
     out_sends: &mut Vec<crate::handler::BuiltSend>,
 ) -> bool {
     if let Some(tls_conn) = tls_table.get_mut(conn_index) {
-        take_tls_output_sends(tls_conn, send_copy_pool, conn_index, out_sends)
+        take_tls_output_sends(tls_conn, send_copy_pool, conn_index, generation, out_sends)
     } else {
         true
     }
@@ -612,12 +628,17 @@ impl io::Write for PoolWriter<'_> {
 #[cfg(has_io_uring)]
 fn build_pool_send(
     conn_index: u32,
+    generation: u32,
     ptr: *const u8,
     len: u32,
     pool_slot: u16,
     tag: crate::completion::OpTag,
 ) -> crate::handler::BuiltSend {
-    let user_data = crate::completion::UserData::encode(tag, conn_index, pool_slot as u32);
+    let user_data = crate::completion::UserData::encode(
+        tag,
+        conn_index,
+        crate::completion::UserData::send_payload(pool_slot, generation),
+    );
     let entry = io_uring::opcode::Send::new(io_uring::types::Fixed(conn_index), ptr, len)
         .flags(crate::completion::STREAM_SEND_FLAGS)
         .build()
@@ -642,6 +663,7 @@ fn take_tls_output_sends(
     tls_conn: &mut TlsConn,
     send_copy_pool: &mut SendCopyPool,
     conn_index: u32,
+    generation: u32,
     out: &mut Vec<crate::handler::BuiltSend>,
 ) -> bool {
     let mut writer = PoolWriter::new(send_copy_pool);
@@ -661,6 +683,7 @@ fn take_tls_output_sends(
         let (ptr, _) = send_copy_pool.current_ptr_remaining(slot);
         out.push(build_pool_send(
             conn_index,
+            generation,
             ptr,
             len,
             slot,
@@ -670,61 +693,12 @@ fn take_tls_output_sends(
     true
 }
 
-/// Flush close_notify ciphertext using linked SQEs (IOSQE_IO_LINK).
-/// All TlsSend SQEs are linked so the caller's subsequent Close SQE
-/// is chained — the kernel won't close the fd until the alert is sent.
-#[cfg(has_io_uring)]
-fn flush_close_notify_linked(
-    tls_conn: &mut TlsConn,
-    ring: &mut Ring,
-    send_copy_pool: &mut SendCopyPool,
-    conn_index: u32,
-) {
-    let mut writer = PoolWriter::new(send_copy_pool);
-    while tls_conn.conn.wants_write() {
-        match tls_conn.conn.write_tls(&mut writer) {
-            Ok(0) | Err(_) => {
-                // Pool exhausted or write error — the connection closes
-                // without a complete alert, same as before.
-                writer.release_all();
-                return;
-            }
-            Ok(_) => {}
-        }
-    }
-    for (slot, len) in writer.into_filled() {
-        let (ptr, _) = send_copy_pool.current_ptr_remaining(slot);
-        if ring
-            .submit_tls_send_linked(conn_index, ptr, len, slot)
-            .is_err()
-        {
-            send_copy_pool.release(slot);
-            return;
-        }
-    }
-}
-
-/// Encrypt plaintext into pool-backed sends for the caller to route through
-/// the per-connection send queue. The final chunk is tagged `OpTag::Send`
-/// so its CQE wakes the send waiter; intermediates are `TlsSend`.
-///
-/// Ciphertext lands directly in pool slots via [`PoolWriter`]
-/// (rustls buffer → pool), one copy fewer than the old
-/// rustls → scratch → pool chain.
-///
-/// Encryption is interleaved with draining: rustls caps its ciphertext
-/// buffer at 64 KiB (`DEFAULT_BUFFER_LIMIT`), so a single `write_all` of a
-/// larger plaintext used to fail with `WriteZero` after the first 64 KiB
-/// was already encrypted and queued (a truncated prefix could then reach
-/// the wire). Writing and draining in a loop supports arbitrary sizes.
-///
-/// On error, pool slots already filled are released here — the caller sees
-/// only `Err` and queues nothing.
 #[cfg(has_io_uring)]
 pub fn encrypt_to_sends(
     tls_table: &mut TlsTable,
     send_copy_pool: &mut SendCopyPool,
     conn_index: u32,
+    generation: u32,
     plaintext: &[u8],
 ) -> io::Result<Vec<crate::handler::BuiltSend>> {
     let tls_conn = tls_table.get_mut(conn_index).ok_or_else(|| {
@@ -774,7 +748,7 @@ pub fn encrypt_to_sends(
         } else {
             crate::completion::OpTag::TlsSend
         };
-        built.push(build_pool_send(conn_index, ptr, len, slot, tag));
+        built.push(build_pool_send(conn_index, generation, ptr, len, slot, tag));
     }
     Ok(built)
 }

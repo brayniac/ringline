@@ -419,6 +419,9 @@ pub(crate) struct Driver {
     pub(crate) pending_recv_forward_retries: Vec<(u32, u32, u16, u8)>,
     /// Pending close retries: (conn_index, retries). Drained each tick.
     pub(crate) pending_close_retries: Vec<(u32, u8)>,
+    /// Connections whose close_pending was set from a DriverCtx callback;
+    /// the event loop re-drives `try_finalize_close` for each.
+    pub(crate) pending_finalize_closes: Vec<u32>,
     /// Scratch buffers swapped with the corresponding `pending_*_retries`
     /// queue at drain time so the per-tick drain reuses a single allocation
     /// across ticks (the primary queue is left empty for in-iteration
@@ -680,6 +683,7 @@ impl Driver {
             pending_coalesced_retries: Vec::new(),
             pending_recv_forward_retries: Vec::new(),
             pending_close_retries: Vec::new(),
+            pending_finalize_closes: Vec::new(),
             zc_retry_scratch: Vec::new(),
             copy_retry_scratch: Vec::new(),
             send_pollout_retry_scratch: Vec::new(),
@@ -796,7 +800,7 @@ impl Driver {
             fs_files: &mut self.fs_files,
             fs_cmd_slab: &mut self.fs_cmd_slab,
             fs_fd_base: self.fs_fd_base,
-            pending_close_retries: &mut self.pending_close_retries,
+            pending_finalize_closes: &mut self.pending_finalize_closes,
             close_notify_timeout: self.close_notify_timeout,
             next_disk_io_seq: &mut self.next_disk_io_seq,
         }
@@ -1032,8 +1036,14 @@ impl Driver {
         // generation-checked in handle_recv_fallback and only releases its
         // pool slot — it can no longer touch connection state.
         self.recv_fallback_inflight[conn_index as usize] = false;
-        // Cancel any active chain — per-SQE resources released as CQEs arrive.
-        self.chain_table.cancel(conn_index);
+        // An active chain keeps its state: its SQEs are already in the kernel
+        // and their CQEs drive the chain accounting to completion (an error
+        // in one linked op cancels the rest — still CQEs). `close_pending`
+        // is set below and `try_finalize_close` defers the Close until the
+        // chain drains, so the Close cannot recycle the slot while chain
+        // CQEs are outstanding. (An earlier version called
+        // `chain_table.cancel` here, which *dropped* the accounting and let
+        // the Close race the still-in-flight chain sends.)
         // Defer the actual `Close` SQE until every queued send has
         // drained through the regular `submit_next_queued` cycle and
         // its CQE has been handled. Two earlier mistakes are worth
@@ -1062,14 +1072,15 @@ impl Driver {
             // Something is in-flight; wait for its CQE to drain the queue.
             return;
         }
-        // Nothing in-flight but queue has items — push them into the SQ
-        // so their CQEs can fire and continue the serialized drain cycle.
+        // Nothing in-flight but queue has items — start the serialized drain:
+        // submit only the queue head (submit_next_queued coalesces a safe
+        // run) and let each CQE pull the next entry. Pushing the whole queue
+        // as parallel SQEs here would repeat "mistake (b)" above.
         if !state.queue.is_empty() {
-            let pushed = self.flush_queued_sends_or_release(conn_index);
-            if pushed == 0 {
-                // SQ was full and we gave up — the queue was drained
-                // by flush_queued_sends_or_release, so finalize immediately.
-                self.try_finalize_close(conn_index);
+            state.in_flight = true;
+            if !self.submit_next_queued(conn_index) {
+                // SQ was full — submit_next_queued released the queue and
+                // already fired try_finalize_close.
             }
         } else {
             self.try_finalize_close(conn_index);
@@ -1089,10 +1100,17 @@ impl Driver {
         // backing. `handle_forward_write` / `fail_forward_write` re-drive this
         // finalize once `forward_write[conn]` is cleared.
         let forward_drained = self.forward_write[conn_index as usize].is_none();
-        if !(state.close_pending && sends_drained && forward_drained) {
+        // An active send chain has SQEs in the kernel whose CQEs drive its
+        // accounting; the chain completion handlers re-drive this finalize
+        // once the chain drains.
+        let chain_drained = !self.chain_table.is_active(conn_index);
+        if !(state.close_pending && sends_drained && forward_drained && chain_drained) {
             return;
         }
-        self.send_queues[conn_index as usize].close_pending = false;
+        let st = &mut self.send_queues[conn_index as usize];
+        st.close_pending = false;
+        // Clear the deadline so the slot's next occupant doesn't inherit it.
+        st.close_notify_deadline = None;
         // Disarm from the close_notify deadline set. swap_remove is
         // O(n) but the set is bounded by concurrent TLS shutdowns
         // (typically 0 or single digits) — well below the cost we just
@@ -1148,37 +1166,26 @@ impl Driver {
         self.try_finalize_close(conn_index);
     }
 
-    /// Push all queued sends for a connection into the SQ. Returns the
-    /// number of sends successfully submitted. On SQ full, drains the
-    /// remaining queue (releasing slab/pool resources) and sets
-    /// `in_flight = false`.
-    pub(crate) fn flush_queued_sends_or_release(&mut self, conn_index: u32) -> usize {
+    /// Force a deferred close whose drain will never finish (close_notify
+    /// deadline elapsed — the peer stopped reading, so the queued/in-flight
+    /// sends are stuck). Deliberately abandons outstanding work: queued
+    /// (never-submitted) sends are released here; the in-flight send / chain
+    /// SQEs are left to the kernel — the Close cancels them, and their CQEs
+    /// fail the generation identity check in the completion handlers (or
+    /// arrive pre-bump and complete harmlessly on a closing connection), so
+    /// they release their own slots without touching the index's next
+    /// occupant.
+    pub(crate) fn force_finalize_close(&mut self, conn_index: u32) {
         let state = &mut self.send_queues[conn_index as usize];
-        let mut pushed = 0usize;
-        while let Some(built) = state.queue.pop_front() {
-            match unsafe { self.ring.push_sqe(built.entry) } {
-                Ok(()) => {
-                    pushed += 1;
-                }
-                Err(_) => {
-                    // SQ full — release this entry and drain remaining queue.
-                    Self::release_built_resources(
-                        &mut self.send_slab,
-                        &mut self.send_copy_pool,
-                        built.pool_slot,
-                        built.slab_idx,
-                    );
-                    Self::release_queued_sends(
-                        &mut state.queue,
-                        &mut self.send_slab,
-                        &mut self.send_copy_pool,
-                    );
-                    state.in_flight = false;
-                    break;
-                }
-            }
-        }
-        pushed
+        Self::release_queued_sends(
+            &mut state.queue,
+            &mut self.send_slab,
+            &mut self.send_copy_pool,
+        );
+        state.in_flight = false;
+        state.shutdown_pending = false;
+        self.chain_table.cancel(conn_index);
+        self.try_finalize_close(conn_index);
     }
 
     /// Submit a one-shot fallback recv into a pool slot for a connection
@@ -1285,6 +1292,7 @@ impl Driver {
             // through to single-submit (nothing popped yet).
             if let Some((slab_idx, msg_ptr)) = self.send_slab.allocate_coalesced(
                 conn_index,
+                self.connections.generation(conn_index),
                 &iovecs[..n],
                 &pool_slots[..n],
                 total,
@@ -1870,9 +1878,13 @@ impl Driver {
                 };
 
                 match tag {
-                    OpTag::Send => {
+                    OpTag::Send | OpTag::TlsSend | OpTag::SendPollOut => {
+                        // Payload low 16 bits are the pool slot (high bits
+                        // carry the truncated generation / is_tls flag).
                         let pool_slot = ud.payload() as u16;
-                        self.send_copy_pool.release(pool_slot);
+                        if self.send_copy_pool.in_use(pool_slot) {
+                            self.send_copy_pool.release(pool_slot);
+                        }
                     }
                     OpTag::SendMsgZc => {
                         let slab_idx = ud.payload() as u16;
@@ -1909,10 +1921,6 @@ impl Driver {
                             tls_table.remove(conn_index);
                         }
                         self.connections.release(conn_index);
-                    }
-                    OpTag::TlsSend => {
-                        let pool_slot = ud.payload() as u16;
-                        self.send_copy_pool.release(pool_slot);
                     }
                     _ => {}
                 }

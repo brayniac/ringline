@@ -34,6 +34,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- io_uring: send-family CQEs are now validated against the connection
+  *generation* before touching per-connection state, closing a
+  misattribution window where a Send CQE that outlived its connection slot
+  (a close racing an in-flight send) could be credited to whatever
+  connection reused the index — worst case resubmitting the dead
+  connection's bytes onto the new occupant's socket, or spuriously
+  failing/draining its sends. Pool-slot ops (`Send`/`TlsSend`/`SendPollOut`)
+  carry a truncated generation in the UserData payload; slab-backed ops
+  (`SendMsgZc`, coalesced, recv-forward) record it in the slab entry.
+- io_uring: closed the two producers of such orphaned CQEs. `close_connection`
+  no longer cancels an active `send_chain`'s accounting — the deferred Close
+  now waits for the chain's in-kernel SQEs to drain. `DriverCtx::close` no
+  longer forces `in_flight = false` and submits Close directly; it defers
+  through the same `close_pending` path as `close_connection`, so queued and
+  in-flight sends drain first (queued bytes now reach the wire instead of
+  being dropped). TLS `close_notify` is serialized through the per-connection
+  send queue instead of raw linked SQEs, and its timeout deadline —
+  previously dead code — now force-closes a connection whose drain is stuck.
 - mio backend: a plaintext connection that overflowed `recv_accumulator_max`
   dropped the overflowing bytes and kept the connection alive in a
   read-and-discard spin instead of closing it. Overflow now closes the

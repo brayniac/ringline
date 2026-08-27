@@ -205,11 +205,16 @@ impl Ring {
     pub fn submit_send_copied(
         &mut self,
         conn_index: u32,
+        generation: u32,
         ptr: *const u8,
         len: u32,
         pool_slot: u16,
     ) -> io::Result<()> {
-        let user_data = UserData::encode(OpTag::Send, conn_index, pool_slot as u32);
+        let user_data = UserData::encode(
+            OpTag::Send,
+            conn_index,
+            UserData::send_payload(pool_slot, generation),
+        );
         let entry = opcode::Send::new(Fixed(conn_index), ptr, len)
             .flags(crate::completion::STREAM_SEND_FLAGS)
             .build()
@@ -391,36 +396,20 @@ impl Ring {
     pub fn submit_tls_send(
         &mut self,
         conn_index: u32,
+        generation: u32,
         ptr: *const u8,
         len: u32,
         pool_slot: u16,
     ) -> io::Result<()> {
-        let user_data = UserData::encode(OpTag::TlsSend, conn_index, pool_slot as u32);
+        let user_data = UserData::encode(
+            OpTag::TlsSend,
+            conn_index,
+            UserData::send_payload(pool_slot, generation),
+        );
         let entry = opcode::Send::new(Fixed(conn_index), ptr, len)
             .flags(crate::completion::STREAM_SEND_FLAGS)
             .build()
             .user_data(user_data.raw());
-        unsafe {
-            self.push_sqe(entry)?;
-        }
-        Ok(())
-    }
-
-    /// Submit a TLS-internal send with IOSQE_IO_LINK. Used for close_notify
-    /// so the subsequent Close SQE is chained and only runs after the send completes.
-    pub fn submit_tls_send_linked(
-        &mut self,
-        conn_index: u32,
-        ptr: *const u8,
-        len: u32,
-        pool_slot: u16,
-    ) -> io::Result<()> {
-        let user_data = UserData::encode(OpTag::TlsSend, conn_index, pool_slot as u32);
-        let entry = opcode::Send::new(Fixed(conn_index), ptr, len)
-            .flags(crate::completion::STREAM_SEND_FLAGS)
-            .build()
-            .user_data(user_data.raw())
-            .flags(io_uring::squeue::Flags::IO_LINK);
         unsafe {
             self.push_sqe(entry)?;
         }
@@ -623,12 +612,15 @@ impl Ring {
     pub fn submit_send_pollout(
         &mut self,
         conn_index: u32,
+        generation: u32,
         pool_slot: u16,
         is_tls: bool,
     ) -> io::Result<()> {
-        // Payload: pool_slot in the low 16 bits, is_tls flag in bit 16 so
-        // the POLLOUT handler resubmits on the right completion path.
-        let payload = pool_slot as u32 | (u32::from(is_tls) << 16);
+        // Payload: pool_slot in the low 16 bits, is_tls flag in bit 16, and
+        // the connection generation's low 15 bits in bits 17..31 so the
+        // POLLOUT handler resubmits on the right completion path and can
+        // reject a CQE that outlived its connection slot.
+        let payload = UserData::send_pollout_payload(pool_slot, is_tls, generation);
         let user_data = UserData::encode(OpTag::SendPollOut, conn_index, payload);
         let entry = opcode::PollAdd::new(Fixed(conn_index), libc::POLLOUT as u32)
             .build()
