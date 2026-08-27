@@ -24,7 +24,11 @@ pub struct PoolConfig {
 }
 
 /// Which HTTP protocol to use.
+///
+/// Marked `#[non_exhaustive]`: `H3` is a realistic future variant (the
+/// workspace already ships `ringline-h3`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Protocol {
     /// HTTP/2 over TLS.
     H2,
