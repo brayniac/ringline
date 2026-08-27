@@ -85,11 +85,13 @@ pub struct Config {
     /// closes the connection once the cap is exceeded, protecting the
     /// worker from OOM.
     ///
-    /// **Default: `usize::MAX` (disabled).** A bounded value should be set
-    /// for any server that accepts data from untrusted peers. Sensible
-    /// values are 4–16× the typical request size; setting it too low
-    /// will close legitimate slow-consumer workloads (where kernel recv
-    /// CQEs batch faster than the handler runs).
+    /// **Default: 64 MiB.** Bounded by default so an unterminated input
+    /// fails (connection closed) rather than consumes the worker's memory;
+    /// `usize::MAX` disables the cap for workloads that genuinely need
+    /// unbounded messages. Sensible values are 4–16× the typical request
+    /// size; setting it too low will close legitimate slow-consumer
+    /// workloads (where kernel recv CQEs batch faster than the handler
+    /// runs).
     pub(crate) recv_accumulator_max: usize,
     /// Aggregate low-water reserve for segmented recv (see
     /// `docs/segmented-recv-design.md`, "Backpressure and ring safety").
@@ -320,7 +322,7 @@ impl Default for Config {
             backlog: 1024,
             max_connections: 16000,
             recv_accumulator_capacity: 4096,
-            recv_accumulator_max: usize::MAX,
+            recv_accumulator_max: 64 * 1024 * 1024,
             recv_segment_reserve: 64,
             forward_hold_cap: 64,
             accept_queue_capacity: 1024,
@@ -373,6 +375,12 @@ impl Config {
         if self.recv_buffer.buffer_size == 0 {
             return Err(crate::error::Error::RingSetup(
                 "recv_buffer.buffer_size must be > 0".into(),
+            ));
+        }
+        // A zero cap would close every connection on its first received byte.
+        if self.recv_accumulator_max == 0 {
+            return Err(crate::error::Error::RingSetup(
+                "recv_accumulator_max must be > 0 (use usize::MAX to disable the cap)".into(),
             ));
         }
         if self.max_connections == 0 || self.max_connections >= (1 << 24) {
@@ -700,7 +708,8 @@ impl ConfigBuilder {
     }
 
     /// Set the upper bound on a single per-connection recv accumulator.
-    /// `usize::MAX` (the default) disables the cap.
+    /// The connection is closed if the cap is exceeded. Defaults to 64 MiB;
+    /// `usize::MAX` disables the cap.
     pub fn recv_accumulator_max(mut self, n: usize) -> Self {
         self.config.recv_accumulator_max = n;
         self
@@ -985,6 +994,22 @@ mod tests {
         Config::default()
             .validate()
             .expect("default config should be valid");
+    }
+
+    #[test]
+    fn default_recv_accumulator_max_is_bounded() {
+        // Principle 7: growth that cannot terminate is bounded by default.
+        let c = Config::default();
+        assert_eq!(c.recv_accumulator_max, 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn validate_recv_accumulator_max_zero_rejected() {
+        assert!(
+            config_with(|c| c.recv_accumulator_max = 0)
+                .validate()
+                .is_err()
+        );
     }
 
     #[test]

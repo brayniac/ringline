@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **`recv_accumulator_max` now defaults to 64 MiB (was unbounded).** A peer
+  that streams data without ever completing a message now gets its connection
+  closed at the cap instead of growing a worker's memory without limit.
+  Workloads with legitimate messages larger than 64 MiB must set
+  `ConfigBuilder::recv_accumulator_max` explicitly (`usize::MAX` restores the
+  old behavior). `recv_accumulator_max = 0` is now rejected at config
+  validation (it would close every connection on its first byte).
+
 ## [0.5.5] - 2026-08-19
 
 Coordinated client release picking up parser fixes from the protocol crates.
