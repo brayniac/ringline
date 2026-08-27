@@ -85,13 +85,16 @@ pub struct Config {
     /// closes the connection once the cap is exceeded, protecting the
     /// worker from OOM.
     ///
-    /// **Default: 64 MiB.** Bounded by default so an unterminated input
+    /// **Default: 1 GiB.** Bounded by default so an unterminated input
     /// fails (connection closed) rather than consumes the worker's memory;
     /// `usize::MAX` disables the cap for workloads that genuinely need
-    /// unbounded messages. Sensible values are 4–16× the typical request
-    /// size; setting it too low will close legitimate slow-consumer
-    /// workloads (where kernel recv CQEs batch faster than the handler
-    /// runs).
+    /// unbounded messages. The default is deliberately above Redis's own
+    /// `proto-max-bulk-len` default (512 MiB) because the protocol client
+    /// crates parse whole replies from the accumulator; servers facing
+    /// untrusted peers should set something much smaller (4–16× the typical
+    /// request size). Setting it too low will close legitimate
+    /// slow-consumer workloads (where kernel recv CQEs batch faster than
+    /// the handler runs); it must be at least `recv_buffer_size`.
     pub(crate) recv_accumulator_max: usize,
     /// Aggregate low-water reserve for segmented recv (see
     /// `docs/segmented-recv-design.md`, "Backpressure and ring safety").
@@ -322,7 +325,7 @@ impl Default for Config {
             backlog: 1024,
             max_connections: 16000,
             recv_accumulator_capacity: 4096,
-            recv_accumulator_max: 64 * 1024 * 1024,
+            recv_accumulator_max: 1024 * 1024 * 1024,
             recv_segment_reserve: 64,
             forward_hold_cap: 64,
             accept_queue_capacity: 1024,
@@ -377,10 +380,14 @@ impl Config {
                 "recv_buffer.buffer_size must be > 0".into(),
             ));
         }
-        // A zero cap would close every connection on its first received byte.
-        if self.recv_accumulator_max == 0 {
+        // A cap below one recv buffer would overflow on the first full
+        // buffer, and some pending-buffer flush paths assume a single
+        // buffer's append into an empty accumulator cannot fail.
+        if self.recv_accumulator_max < self.recv_buffer.buffer_size as usize {
             return Err(crate::error::Error::RingSetup(
-                "recv_accumulator_max must be > 0 (use usize::MAX to disable the cap)".into(),
+                "recv_accumulator_max must be >= recv_buffer_size \
+                 (use usize::MAX to disable the cap)"
+                    .into(),
             ));
         }
         if self.max_connections == 0 || self.max_connections >= (1 << 24) {
@@ -708,8 +715,14 @@ impl ConfigBuilder {
     }
 
     /// Set the upper bound on a single per-connection recv accumulator.
-    /// The connection is closed if the cap is exceeded. Defaults to 64 MiB;
-    /// `usize::MAX` disables the cap.
+    /// The connection is closed if the cap is exceeded. Defaults to 1 GiB;
+    /// `usize::MAX` disables the cap. Must be at least `recv_buffer_size`.
+    ///
+    /// Servers accepting data from untrusted peers should set this to
+    /// 4–16× the typical request size. The parser must be able to see a
+    /// complete message within the cap: protocol clients that parse whole
+    /// replies from the accumulator (e.g. `ringline-redis`) need it larger
+    /// than the largest reply they expect.
     pub fn recv_accumulator_max(mut self, n: usize) -> Self {
         self.config.recv_accumulator_max = n;
         self
@@ -1000,15 +1013,26 @@ mod tests {
     fn default_recv_accumulator_max_is_bounded() {
         // Principle 7: growth that cannot terminate is bounded by default.
         let c = Config::default();
-        assert_eq!(c.recv_accumulator_max, 64 * 1024 * 1024);
+        assert_eq!(c.recv_accumulator_max, 1024 * 1024 * 1024);
     }
 
     #[test]
-    fn validate_recv_accumulator_max_zero_rejected() {
+    fn validate_recv_accumulator_max_below_buffer_size_rejected() {
+        // Also covers 0: any cap below one recv buffer is rejected.
         assert!(
             config_with(|c| c.recv_accumulator_max = 0)
                 .validate()
                 .is_err()
+        );
+        assert!(
+            config_with(|c| c.recv_accumulator_max = c.recv_buffer.buffer_size as usize - 1)
+                .validate()
+                .is_err()
+        );
+        assert!(
+            config_with(|c| c.recv_accumulator_max = c.recv_buffer.buffer_size as usize)
+                .validate()
+                .is_ok()
         );
     }
 

@@ -1706,8 +1706,11 @@ impl Client {
         // 512 MiB). Hit the wall and the parser consumes the whole
         // accumulator, forcing a connection close for a value the server
         // happily produced. Use `usize::MAX` — the `RecvAccumulator`'s own
-        // capacity is the genuine backstop — and let the server be the
-        // authority on what's too large.
+        // cap is the genuine backstop (`recv_accumulator_max`, default 1 GiB,
+        // deliberately above `proto-max-bulk-len`'s 512 MiB default) — and
+        // let the server be the authority on what's too large. Replies whose
+        // total size exceeds that cap require raising it on the runtime
+        // config; the whole reply must be resident to parse.
         // Also lift the collection caps well above resp-proto's 1024 defaults:
         // a real server returns arrays far larger than that (a big `LRANGE`,
         // `FT.SEARCH` with large `k`, an oversized `SCAN` batch), and hitting

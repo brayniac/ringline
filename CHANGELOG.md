@@ -9,13 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- **`recv_accumulator_max` now defaults to 64 MiB (was unbounded).** A peer
+- **`recv_accumulator_max` now defaults to 1 GiB (was unbounded).** A peer
   that streams data without ever completing a message now gets its connection
-  closed at the cap instead of growing a worker's memory without limit.
-  Workloads with legitimate messages larger than 64 MiB must set
-  `ConfigBuilder::recv_accumulator_max` explicitly (`usize::MAX` restores the
-  old behavior). `recv_accumulator_max = 0` is now rejected at config
-  validation (it would close every connection on its first byte).
+  closed at the cap instead of growing a worker's memory without limit. The
+  default is deliberately above Redis's `proto-max-bulk-len` default
+  (512 MiB) because the protocol clients (`ringline-redis`,
+  `ringline-memcache`) parse whole replies from the accumulator — a reply
+  larger than the cap (including a large aggregate like `MGET`/`LRANGE`)
+  closes the connection. Raise the cap (or restore `usize::MAX`) via
+  `ConfigBuilder::recv_accumulator_max` if you expect replies above 1 GiB;
+  servers facing untrusted peers should set something much smaller. Values
+  below `recv_buffer_size` are now rejected at config validation.
+
+### Fixed
+
+- mio backend: a plaintext connection that overflowed `recv_accumulator_max`
+  dropped the overflowing bytes and kept the connection alive in a
+  read-and-discard spin instead of closing it. Overflow now closes the
+  connection, matching the io_uring backend and the mio TLS path. (Latent —
+  unreachable with the previous unbounded default.)
 
 ## [0.5.5] - 2026-08-19
 
