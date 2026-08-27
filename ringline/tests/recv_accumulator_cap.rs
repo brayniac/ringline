@@ -31,11 +31,6 @@ impl AsyncEventHandler for NeverSatisfied {
     }
 }
 
-fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap().port()
-}
-
 fn wait_for_server(addr: &str) {
     for _ in 0..200 {
         if TcpStream::connect(addr).is_ok() {
@@ -60,12 +55,16 @@ fn overflow_closes_connection_instead_of_hanging() {
         .recv_accumulator_max(CAP)
         .build()
         .expect("valid config");
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
+    // Bind :0 and read the kernel-assigned port back — the drop-and-rebind
+    // free_port pattern races across parallel test binaries (AddrInUse).
     let (shutdown, handles) = RinglineBuilder::new(config)
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<NeverSatisfied>()
         .expect("launch failed");
+    let addr = shutdown
+        .bound_addr()
+        .expect("bound_addr after TCP bind")
+        .to_string();
     wait_for_server(&addr);
 
     let mut stream = TcpStream::connect(&addr).unwrap();
