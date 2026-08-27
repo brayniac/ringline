@@ -201,11 +201,10 @@ fn tls_echo_with_external_client() {
 /// the zero-scratch drain: any off-by-one in the chunk advance would corrupt
 /// the round-trip. A non-constant byte pattern makes mis-ordering detectable.
 ///
-/// Gated to the io_uring backend: this guards the `fill_buf`/`consume` recv
-/// drain (shared by both backends, but the change this regression-tests is in
-/// the io_uring path). The mio backend has a pre-existing large-payload TLS
-/// busy-spin (reproduces on `main` without this change), tracked separately;
-/// running this test there hangs for reasons unrelated to the drain.
+/// Runs on both backends. (It was briefly gated to io_uring while the mio
+/// backend had a large-payload TLS busy-spin; that was fixed by the #241
+/// TLS output-queueing parity work and the gate removed — both verified by
+/// this test passing on mio.)
 /// A handler that responds to the first received byte with one large
 /// `send()` — larger than rustls's 64 KiB ciphertext buffer cap
 /// (`DEFAULT_BUFFER_LIMIT`). Exercises the interleaved encrypt/drain loop:
@@ -331,9 +330,11 @@ fn tls_echo_large_multichunk() {
 
     let mut stream = rustls::Stream::new(&mut tls_conn, &mut tcp);
 
-    // Two sizes, both well past rustls's ~16 KiB plaintext buffer so the
-    // drain loop must iterate over several chunks and several records.
-    for &size in &[64 * 1024usize, 100 * 1024usize, 200 * 1024usize] {
+    // All sizes well past rustls's ~16 KiB plaintext buffer so the drain
+    // loop must iterate over several chunks and several records; 1 MiB also
+    // exceeds rustls's 64 KiB ciphertext buffer cap many times over on the
+    // echo side.
+    for &size in &[64 * 1024usize, 100 * 1024, 200 * 1024, 1024 * 1024] {
         // Distinctive, position-dependent pattern so any chunk reorder or
         // off-by-one in the advance is caught by the byte-exact comparison.
         let msg: Vec<u8> = (0..size)
