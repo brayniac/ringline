@@ -1656,6 +1656,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 }
                 self.driver.accumulators.reset(conn_index);
                 self.driver.reset_segment_state(conn_index);
+                self.driver.reset_send_state(conn_index);
                 self.arm_recv(conn_index);
 
                 // TLS path: defer accept until handshake completes.
@@ -2772,6 +2773,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
         self.driver.accumulators.reset(conn_index);
         self.driver.reset_segment_state(conn_index);
+        self.driver.reset_send_state(conn_index);
 
         // TLS client path
         if let Some(ref mut tls_table) = self.driver.tls_table
@@ -4394,6 +4396,38 @@ mod tests {
             "slab entry must be released after the stale notification"
         );
         assert_eq!(el.driver.send_queues[conn_index as usize].acked_bytes, 0);
+    }
+
+    /// A reused connection slot must start with clean send state. The
+    /// previous occupant's close can leave `in_flight`/`close_pending` set
+    /// when its final send CQE outlives the slot (the identity check
+    /// correctly refuses to clear another occupant's flags) — without the
+    /// activation-time reset, the next occupant's first send parks forever
+    /// behind a completion that will never come. (Observed as
+    /// async_select_with_sleep hanging when run after any other test whose
+    /// probe connection recycled index 0.)
+    #[test]
+    fn reused_slot_starts_with_clean_send_state() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+
+        // Poison the state exactly as an orphaned deferred close leaves it.
+        el.driver.send_queues[conn_index as usize].in_flight = true;
+        el.driver.send_queues[conn_index as usize].close_pending = true;
+        el.driver.send_queues[conn_index as usize].acked_bytes = 7;
+        el.driver.close_notify_armed.push(conn_index);
+
+        // Slot recycles; the activation path resets send state.
+        el.driver.connections.release(conn_index);
+        let reused = el.driver.connections.allocate().unwrap();
+        assert_eq!(reused, conn_index);
+        el.driver.reset_send_state(conn_index);
+
+        let state = &el.driver.send_queues[conn_index as usize];
+        assert!(!state.in_flight, "reused slot must not inherit in_flight");
+        assert!(!state.close_pending);
+        assert_eq!(state.acked_bytes, 0);
+        assert!(!el.driver.close_notify_armed.contains(&conn_index));
     }
 
     /// close_connection must defer the Close SQE while a send chain's SQEs

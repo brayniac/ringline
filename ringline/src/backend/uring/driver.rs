@@ -806,6 +806,40 @@ impl Driver {
         }
     }
 
+    /// Reset per-connection send state for a (re)activated slot.
+    ///
+    /// A previous occupant's close can leave `in_flight`/`close_pending` set:
+    /// its final send CQE can arrive after the slot was released, and the
+    /// CQE's identity check correctly refuses to touch the slot's state —
+    /// so nothing else clears it. (Before the identity checks, the stale
+    /// CQE's error path *was* what cleared these flags — misattributed
+    /// cleanup the next occupant accidentally depended on.) Without this
+    /// reset the next occupant's first send parks behind a completion that
+    /// will never come.
+    pub(crate) fn reset_send_state(&mut self, conn_index: u32) {
+        let state = &mut self.send_queues[conn_index as usize];
+        // Queued-but-unsubmitted sends from the previous occupant hold
+        // pool/slab resources; no SQE was submitted for them, so no CQE
+        // will release them — do it here.
+        Self::release_queued_sends(
+            &mut state.queue,
+            &mut self.send_slab,
+            &mut self.send_copy_pool,
+        );
+        state.in_flight = false;
+        state.close_pending = false;
+        state.shutdown_pending = false;
+        state.acked_bytes = 0;
+        state.close_notify_deadline = None;
+        if let Some(pos) = self
+            .close_notify_armed
+            .iter()
+            .position(|&i| i == conn_index)
+        {
+            self.close_notify_armed.swap_remove(pos);
+        }
+    }
+
     /// Reset segmented-recv delivery state for a (re)activated connection slot.
     /// The hold is already drained by `close_connection`, so this is defensive;
     /// it also restores the domain to the default in case a slot is reused

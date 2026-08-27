@@ -43,6 +43,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   failing/draining its sends. Pool-slot ops (`Send`/`TlsSend`/`SendPollOut`)
   carry a truncated generation in the UserData payload; slab-backed ops
   (`SendMsgZc`, coalesced, recv-forward) record it in the slab entry.
+  Per-connection send state is now also reset when a slot is reactivated:
+  previously a reused slot could inherit `in_flight`/`close_pending` from
+  its prior occupant's orphaned close — cleanup that had accidentally
+  depended on the very misattribution these checks remove.
 - io_uring: closed the two producers of such orphaned CQEs. `close_connection`
   no longer cancels an active `send_chain`'s accounting — the deferred Close
   now waits for the chain's in-kernel SQEs to drain. `DriverCtx::close` no
