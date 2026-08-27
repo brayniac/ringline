@@ -34,6 +34,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- `ringline-grpc`: `max_message_size = usize::MAX` (the "cap disabled" idiom)
+  made the gzip/zstd decompression limit wrap to zero in release builds —
+  every compressed message silently decoded as an empty payload (debug builds
+  panicked on the overflow). The limit now saturates.
+
 - io_uring: send-family CQEs are now validated against the connection
   *generation* before touching per-connection state, closing a
   misattribution window where a Send CQE that outlived its connection slot
