@@ -132,7 +132,8 @@ use std::io;
 use std::time::Instant;
 
 use bytes::Bytes;
-use memcache_proto::{Request as McRequest, ResponseBytes as McResponseBytes};
+use memcache_proto::binary::BinaryRequest;
+use memcache_proto::{Request as McRequest, ResponseBytes as McResponseBytes, ValueBytes};
 use ringline::{ConnCtx, GuardBox, ParseResult, SendGuard};
 
 /// Callback type invoked after each command completes.
@@ -392,6 +393,7 @@ pub struct ClientBuilder {
     max_batch_size: usize,
     max_in_flight: usize,
     zc_threshold: u32,
+    binary: bool,
     #[cfg(feature = "timestamps")]
     use_kernel_ts: bool,
     #[cfg(feature = "metrics")]
@@ -406,6 +408,7 @@ impl ClientBuilder {
             max_batch_size: 1,
             max_in_flight: usize::MAX,
             zc_threshold: DEFAULT_ZC_THRESHOLD,
+            binary: false,
             #[cfg(feature = "timestamps")]
             use_kernel_ts: false,
             #[cfg(feature = "metrics")]
@@ -469,6 +472,18 @@ impl ClientBuilder {
         self
     }
 
+    /// Use the Memcache **binary** protocol instead of ASCII.
+    ///
+    /// Requests are framed with the binary header (`BinaryRequest`) and
+    /// responses parsed from the 24-byte binary header. Response/request
+    /// correlation stays FIFO (opaque is set to 0), matching the ASCII path.
+    /// Enables benchmarking servers that only speak the binary protocol
+    /// (e.g. Datomic valcache).
+    pub fn binary(mut self, enabled: bool) -> Self {
+        self.binary = enabled;
+        self
+    }
+
     /// Build the client.
     pub fn build(self) -> Client {
         Client {
@@ -482,6 +497,7 @@ impl ClientBuilder {
             max_batch_size: self.max_batch_size,
             max_in_flight: self.max_in_flight,
             zc_threshold: self.zc_threshold,
+            binary: self.binary,
             buffered_ops: 0,
             encode_buf: Vec::new(),
             #[cfg(feature = "timestamps")]
@@ -528,6 +544,8 @@ pub struct Client {
     /// copy path by `fire_set_with_guard` instead of taking the
     /// scatter-gather guard path. `0` disables the fold.
     zc_threshold: u32,
+    /// Use the Memcache binary protocol (framing + parsing) instead of ASCII.
+    binary: bool,
     /// Number of ops buffered in `write_buf` that have not yet been flushed.
     buffered_ops: usize,
     /// Reusable scratch buffer for encoding requests. Cleared before each
@@ -556,6 +574,7 @@ impl Client {
             max_batch_size: 1,
             max_in_flight: usize::MAX,
             zc_threshold: DEFAULT_ZC_THRESHOLD,
+            binary: false,
             buffered_ops: 0,
             encode_buf: Vec::new(),
             #[cfg(feature = "timestamps")]
@@ -816,12 +835,12 @@ impl Client {
         if self.max_batch_size == 1 && self.write_guards.is_empty() && self.write_buf.is_empty() {
             // Direct send — skip write_buf round-trip.
             self.encode_buf.clear();
-            encode_request_into(&McRequest::get(key), &mut self.encode_buf)?;
+            append_get(self.binary, key, &mut self.encode_buf)?;
             tx_bytes = self.encode_buf.len() as u32;
             self.conn.send_nowait(&self.encode_buf)?;
         } else {
             let before = self.write_buf.len();
-            encode_request_into(&McRequest::get(key), &mut self.write_buf)?;
+            append_get(self.binary, key, &mut self.write_buf)?;
             tx_bytes = (self.write_buf.len() - before) as u32;
             self.buffered_ops += 1;
         }
@@ -855,22 +874,23 @@ impl Client {
         user_data: u64,
     ) -> Result<(), Error> {
         self.pre_flush_if_needed(false)?;
-        let req = McRequest::Set {
-            key,
-            value,
-            flags,
-            exptime,
-        };
         let tx_bytes;
         if self.max_batch_size == 1 && self.write_guards.is_empty() && self.write_buf.is_empty() {
             // Direct send — skip write_buf round-trip.
             self.encode_buf.clear();
-            encode_request_into(&req, &mut self.encode_buf)?;
+            append_set(
+                self.binary,
+                key,
+                value,
+                flags,
+                exptime,
+                &mut self.encode_buf,
+            )?;
             tx_bytes = self.encode_buf.len() as u32;
             self.conn.send_nowait(&self.encode_buf)?;
         } else {
             let before = self.write_buf.len();
-            encode_request_into(&req, &mut self.write_buf)?;
+            append_set(self.binary, key, value, flags, exptime, &mut self.write_buf)?;
             tx_bytes = (self.write_buf.len() - before) as u32;
             self.buffered_ops += 1;
         }
@@ -923,10 +943,24 @@ impl Client {
         // Append prefix, record guard insertion point, append suffix —
         // directly into write_buf, no intermediate allocation.
         let before = self.write_buf.len();
-        append_set_guard_prefix(&mut self.write_buf, key, value_len as usize, flags, exptime)?;
-        self.write_guards
-            .push((self.write_buf.len(), GuardBox::new(guard)));
-        self.write_buf.extend_from_slice(b"\r\n");
+        if self.binary {
+            // Binary SET framing: header + 8-byte extras + key, then the guard
+            // value follows zero-copy. No trailing CRLF (binary is length-framed).
+            append_bin_set_guard_prefix(
+                &mut self.write_buf,
+                key,
+                value_len as usize,
+                flags,
+                exptime,
+            );
+            self.write_guards
+                .push((self.write_buf.len(), GuardBox::new(guard)));
+        } else {
+            append_set_guard_prefix(&mut self.write_buf, key, value_len as usize, flags, exptime)?;
+            self.write_guards
+                .push((self.write_buf.len(), GuardBox::new(guard)));
+            self.write_buf.extend_from_slice(b"\r\n");
+        }
         let tx_bytes = (self.write_buf.len() - before + value_len as usize) as u32;
         self.buffered_ops += 1;
         let (send_ts, start) = self.timing_start_buffered();
@@ -948,12 +982,12 @@ impl Client {
         if self.max_batch_size == 1 && self.write_guards.is_empty() && self.write_buf.is_empty() {
             // Direct send — skip write_buf round-trip.
             self.encode_buf.clear();
-            encode_request_into(&McRequest::delete(key), &mut self.encode_buf)?;
+            append_delete(self.binary, key, &mut self.encode_buf)?;
             tx_bytes = self.encode_buf.len() as u32;
             self.conn.send_nowait(&self.encode_buf)?;
         } else {
             let before = self.write_buf.len();
-            encode_request_into(&McRequest::delete(key), &mut self.write_buf)?;
+            append_delete(self.binary, key, &mut self.write_buf)?;
             tx_bytes = (self.write_buf.len() - before) as u32;
             self.buffered_ops += 1;
         }
@@ -1119,10 +1153,24 @@ impl Client {
     /// silently desynced clients.
     pub(crate) async fn read_response(&self) -> Result<McResponseBytes, Error> {
         let mut result: Option<Result<McResponseBytes, Error>> = None;
+        let binary = self.binary;
         let n = self
             .conn
             .with_bytes(|bytes| {
                 let len = bytes.len();
+                if binary {
+                    return match parse_binary_response(&bytes) {
+                        Ok(Some((response, consumed))) => {
+                            result = Some(Ok(response));
+                            ParseResult::Consumed(consumed)
+                        }
+                        Ok(None) => ParseResult::Consumed(0),
+                        Err(e) => {
+                            result = Some(Err(Error::Protocol(e)));
+                            ParseResult::Consumed(len)
+                        }
+                    };
+                }
                 match McResponseBytes::parse(bytes) {
                     Ok((response, consumed)) => {
                         result = Some(Ok(response));
@@ -2357,6 +2405,155 @@ fn validate_request(req: &McRequest<'_>) -> Result<(), Error> {
         | McRequest::Cas { key, .. } => validate_key(key),
         McRequest::FlushAll | McRequest::Version | McRequest::Quit => Ok(()),
     }
+}
+
+// ── Binary protocol helpers ─────────────────────────────────────────────
+//
+// These append a binary-framed request when `binary` is set, otherwise fall
+// back to the ASCII `encode_request_into`. Opaque is always 0: the client
+// correlates responses to requests by FIFO order (the `pending` queue), the
+// same way it does for ASCII, so per-request opaque tagging is unnecessary.
+
+#[inline]
+fn append_get(binary: bool, key: &[u8], buf: &mut Vec<u8>) -> Result<(), Error> {
+    if binary {
+        let start = buf.len();
+        buf.resize(start + memcache_proto::binary::HEADER_SIZE + key.len(), 0);
+        let n = BinaryRequest::encode_get(&mut buf[start..], key, 0);
+        buf.truncate(start + n);
+        Ok(())
+    } else {
+        encode_request_into(&McRequest::get(key), buf)
+    }
+}
+
+#[inline]
+fn append_set(
+    binary: bool,
+    key: &[u8],
+    value: &[u8],
+    flags: u32,
+    exptime: u32,
+    buf: &mut Vec<u8>,
+) -> Result<(), Error> {
+    if binary {
+        let start = buf.len();
+        buf.resize(
+            start + memcache_proto::binary::HEADER_SIZE + 8 + key.len() + value.len(),
+            0,
+        );
+        let n = BinaryRequest::encode_set(&mut buf[start..], key, value, flags, exptime, 0, 0);
+        buf.truncate(start + n);
+        Ok(())
+    } else {
+        encode_request_into(
+            &McRequest::Set {
+                key,
+                value,
+                flags,
+                exptime,
+            },
+            buf,
+        )
+    }
+}
+
+#[inline]
+fn append_delete(binary: bool, key: &[u8], buf: &mut Vec<u8>) -> Result<(), Error> {
+    if binary {
+        let start = buf.len();
+        buf.resize(start + memcache_proto::binary::HEADER_SIZE + key.len(), 0);
+        let n = BinaryRequest::encode_delete(&mut buf[start..], key, 0, 0);
+        buf.truncate(start + n);
+        Ok(())
+    } else {
+        encode_request_into(&McRequest::delete(key), buf)
+    }
+}
+
+/// Append a binary SET header + 8-byte extras (flags, expiration) + key, with
+/// `total_body_length` sized for the value that follows zero-copy via a guard.
+/// Binary is length-framed, so there is no trailing CRLF.
+fn append_bin_set_guard_prefix(
+    buf: &mut Vec<u8>,
+    key: &[u8],
+    value_len: usize,
+    flags: u32,
+    exptime: u32,
+) {
+    const HDR: usize = memcache_proto::binary::HEADER_SIZE;
+    let total_body = 8 + key.len() + value_len;
+    let mut h = [0u8; HDR];
+    h[0] = memcache_proto::binary::REQUEST_MAGIC;
+    h[1] = 0x01; // Set opcode
+    h[2..4].copy_from_slice(&(key.len() as u16).to_be_bytes());
+    h[4] = 8; // extras length
+    h[8..12].copy_from_slice(&(total_body as u32).to_be_bytes());
+    buf.extend_from_slice(&h);
+    buf.extend_from_slice(&flags.to_be_bytes());
+    buf.extend_from_slice(&exptime.to_be_bytes());
+    buf.extend_from_slice(key);
+}
+
+/// Parse one binary response from `bytes`, mapping it into the ASCII
+/// `McResponseBytes` representation so recv/timing/callbacks stay
+/// protocol-agnostic. `Ok(None)` = need more bytes; `Err` = framing error
+/// (terminal — the caller closes the connection).
+fn parse_binary_response(
+    bytes: &bytes::Bytes,
+) -> Result<Option<(McResponseBytes, usize)>, memcache_proto::ParseError> {
+    const HDR: usize = memcache_proto::binary::HEADER_SIZE;
+    if bytes.len() < HDR {
+        return Ok(None);
+    }
+    let b = &bytes[..];
+    if b[0] != memcache_proto::binary::RESPONSE_MAGIC {
+        return Err(memcache_proto::ParseError::Protocol(
+            "invalid binary response magic",
+        ));
+    }
+    let opcode = b[1];
+    let key_len = u16::from_be_bytes([b[2], b[3]]) as usize;
+    let extras_len = b[4] as usize;
+    let status = u16::from_be_bytes([b[6], b[7]]);
+    let total_body = u32::from_be_bytes([b[8], b[9], b[10], b[11]]) as usize;
+    let total = HDR + total_body;
+    if bytes.len() < total {
+        return Ok(None);
+    }
+    if extras_len + key_len > total_body {
+        return Err(memcache_proto::ParseError::Protocol(
+            "binary header lengths exceed body",
+        ));
+    }
+    let resp = if status == 0 {
+        match opcode {
+            0x00 => {
+                let flags = if extras_len >= 4 {
+                    u32::from_be_bytes([b[HDR], b[HDR + 1], b[HDR + 2], b[HDR + 3]])
+                } else {
+                    0
+                };
+                let vstart = HDR + extras_len + key_len;
+                McResponseBytes::Values(vec![ValueBytes {
+                    key: bytes::Bytes::new(),
+                    flags,
+                    data: bytes.slice(vstart..total),
+                    cas: None,
+                }])
+            }
+            0x01 => McResponseBytes::Stored,
+            0x04 => McResponseBytes::Deleted,
+            _ => McResponseBytes::Ok,
+        }
+    } else {
+        match (opcode, status) {
+            (0x00, 0x0001) => McResponseBytes::Values(vec![]),
+            (0x04, 0x0001) => McResponseBytes::NotFound,
+            _ => McResponseBytes::ServerError(bytes.slice(HDR + extras_len + key_len..total)),
+        }
+    };
+    Ok(Some((resp, total)))
 }
 
 /// Append the encoding of a `McRequest` to `buf`, rejecting oversized keys
