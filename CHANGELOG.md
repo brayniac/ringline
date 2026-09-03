@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `ringline-memcache`: **binary protocol support**, via
+  `ClientBuilder::build_binary()`, which returns a new `BinaryClient`.
+  `fire_get`/`fire_set`/`fire_set_with_guard`/`fire_delete` frame requests
+  with the memcache binary protocol and responses are parsed from the 24-byte
+  binary header, mapped back into the existing response representation so
+  `recv()`, timing, and callbacks stay protocol-agnostic. Request/response
+  correlation is FIFO (opaque is always 0), matching the ASCII path, and the
+  zero-copy guarded-SET path is supported. This makes binary-only servers
+  (e.g. Datomic valcache) reachable and benchmarkable.
+
+  The binary protocol implements the fire/recv pipelining API only, and that
+  boundary is enforced by the type system: `BinaryClient` exposes just that
+  API, so the ASCII request/response methods (`get`, `set`, `gets`, `add`,
+  `replace`, `incr`, `decr`, `append`, `prepend`, `cas`, `delete`,
+  `flush_all`, `version`, `set_with_guard`, `set_stream`, `get_stream`,
+  `get_cas`) are absent from it rather than failing at runtime. `Client` is
+  unchanged and stays ASCII; `build()` still returns one.
+
 ### Changed
 
 - **Breaking (batched for the next release):** `PoolConfig` in `ringline-ping`,
@@ -41,6 +61,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   below `recv_buffer_size` are now rejected at config validation.
 
 ### Fixed
+
+- `ringline-memcache`: binary mode skipped client-side key validation, so the
+  documented `MAX_KEY_LEN` (250) / `Error::KeyTooLong` contract silently did
+  not hold with `.binary(true)`. Binary framing writes the key length into a
+  `u16` header field, so an over-long key wasted a round trip and a key of
+  64 KiB or more wrapped that field while the full key still went on the wire
+  — desyncing the connection permanently. All four binary request paths
+  (`fire_get`, `fire_set`, `fire_delete`, and the guarded-SET prefix) now
+  validate the key before appending any bytes, so a rejected request leaves no
+  partial frame in the write buffer and registers no guard or pending op.
 
 - `ringline-grpc`: `max_message_size = usize::MAX` (the "cap disabled" idiom)
   made the gzip/zstd decompression limit wrap to zero in release builds —

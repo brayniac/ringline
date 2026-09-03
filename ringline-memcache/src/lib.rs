@@ -393,7 +393,6 @@ pub struct ClientBuilder {
     max_batch_size: usize,
     max_in_flight: usize,
     zc_threshold: u32,
-    binary: bool,
     #[cfg(feature = "timestamps")]
     use_kernel_ts: bool,
     #[cfg(feature = "metrics")]
@@ -408,7 +407,6 @@ impl ClientBuilder {
             max_batch_size: 1,
             max_in_flight: usize::MAX,
             zc_threshold: DEFAULT_ZC_THRESHOLD,
-            binary: false,
             #[cfg(feature = "timestamps")]
             use_kernel_ts: false,
             #[cfg(feature = "metrics")]
@@ -472,16 +470,22 @@ impl ClientBuilder {
         self
     }
 
-    /// Use the Memcache **binary** protocol instead of ASCII.
+    /// Build a [`BinaryClient`] speaking the Memcache **binary** protocol.
     ///
     /// Requests are framed with the binary header (`BinaryRequest`) and
     /// responses parsed from the 24-byte binary header. Response/request
     /// correlation stays FIFO (opaque is set to 0), matching the ASCII path.
-    /// Enables benchmarking servers that only speak the binary protocol
-    /// (e.g. Datomic valcache).
-    pub fn binary(mut self, enabled: bool) -> Self {
-        self.binary = enabled;
-        self
+    /// Enables driving servers that only speak the binary protocol (e.g.
+    /// Datomic valcache).
+    ///
+    /// The binary protocol implements the fire/recv pipelining API only, so
+    /// this returns a [`BinaryClient`] rather than a [`Client`]: the ASCII
+    /// request/response methods are simply absent from its surface instead of
+    /// failing at runtime. Use [`build`](Self::build) for an ASCII [`Client`].
+    pub fn build_binary(self) -> BinaryClient {
+        let mut client = self.build();
+        client.binary = true;
+        BinaryClient { inner: client }
     }
 
     /// Build the client.
@@ -497,7 +501,7 @@ impl ClientBuilder {
             max_batch_size: self.max_batch_size,
             max_in_flight: self.max_in_flight,
             zc_threshold: self.zc_threshold,
-            binary: self.binary,
+            binary: false,
             buffered_ops: 0,
             encode_buf: Vec::new(),
             #[cfg(feature = "timestamps")]
@@ -952,7 +956,7 @@ impl Client {
                 value_len as usize,
                 flags,
                 exptime,
-            );
+            )?;
             self.write_guards
                 .push((self.write_buf.len(), GuardBox::new(guard)));
         } else {
@@ -2348,6 +2352,108 @@ impl CasStreamValue<'_> {
     }
 }
 
+/// A Memcache client speaking the **binary** protocol.
+///
+/// Built with [`ClientBuilder::build_binary`]. The binary protocol implements
+/// the fire/recv pipelining API only, so that is exactly the surface this type
+/// exposes — the ASCII request/response methods (`get`, `set`, `delete`, the
+/// arithmetic and streaming methods) are absent rather than failing at
+/// runtime. Framing and parsing are otherwise identical in shape to
+/// [`Client`]: requests carry the binary header, responses are parsed from the
+/// 24-byte binary header, and correlation stays FIFO (opaque is always 0).
+///
+/// ```no_run
+/// # use ringline_memcache::{Client, Error};
+/// # async fn demo(conn: ringline::ConnCtx) -> Result<(), Error> {
+/// let mut client = Client::builder(conn).max_batch_size(16).build_binary();
+/// client.fire_get(b"key", 1)?;
+/// let op = client.recv().await?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// [`conn`](Self::conn) hands back the underlying [`ConnCtx`]. Wrapping that in
+/// an ASCII [`Client`] and issuing ASCII commands on a binary connection will
+/// desync it, so treat the connection as owned by this client.
+pub struct BinaryClient {
+    inner: Client,
+}
+
+impl BinaryClient {
+    /// Returns the underlying connection handle.
+    ///
+    /// See the type-level note: the connection is speaking the binary
+    /// protocol, so do not drive it with an ASCII [`Client`].
+    pub fn conn(&self) -> ConnCtx {
+        self.inner.conn()
+    }
+
+    /// Returns the metrics collector, if `with_metrics` was set on the builder.
+    #[cfg(feature = "metrics")]
+    pub fn metrics(&self) -> Option<&ClientMetrics> {
+        self.inner.metrics()
+    }
+
+    /// Returns a mutable reference to the metrics collector, if enabled.
+    #[cfg(feature = "metrics")]
+    pub fn metrics_mut(&mut self) -> Option<&mut ClientMetrics> {
+        self.inner.metrics_mut()
+    }
+
+    /// Number of fired requests still awaiting [`recv`](Self::recv).
+    pub fn pending_count(&self) -> usize {
+        self.inner.pending_count()
+    }
+
+    /// Flush any buffered `fire_*` commands.
+    pub fn flush(&mut self) -> Result<(), Error> {
+        self.inner.flush()
+    }
+
+    /// Fire a GET without waiting for the response.
+    pub fn fire_get(&mut self, key: &[u8], user_data: u64) -> Result<(), Error> {
+        self.inner.fire_get(key, user_data)
+    }
+
+    /// Fire a SET without waiting for the response.
+    pub fn fire_set(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        flags: u32,
+        exptime: u32,
+        user_data: u64,
+    ) -> Result<(), Error> {
+        self.inner.fire_set(key, value, flags, exptime, user_data)
+    }
+
+    /// Fire a SET whose value stays in place behind a [`SendGuard`].
+    ///
+    /// Values below the client's `zc_threshold` fold into the coalescing copy
+    /// buffer instead of taking the scatter-gather path, as for [`Client`].
+    pub fn fire_set_with_guard<G: SendGuard>(
+        &mut self,
+        key: &[u8],
+        guard: G,
+        flags: u32,
+        exptime: u32,
+        user_data: u64,
+    ) -> Result<(), Error> {
+        self.inner
+            .fire_set_with_guard(key, guard, flags, exptime, user_data)
+    }
+
+    /// Fire a DELETE without waiting for the response.
+    pub fn fire_delete(&mut self, key: &[u8], user_data: u64) -> Result<(), Error> {
+        self.inner.fire_delete(key, user_data)
+    }
+
+    /// Receive the next response, in FIFO order with the fired requests.
+    pub async fn recv(&mut self) -> Result<CompletedOp, Error> {
+        self.inner.recv().await
+    }
+}
+
 // -- Zero-copy SET encoding helpers ------------------------------------------
 
 /// Append the memcache text SET prefix for guard-based sends to `buf`:
@@ -2413,10 +2519,18 @@ fn validate_request(req: &McRequest<'_>) -> Result<(), Error> {
 // back to the ASCII `encode_request_into`. Opaque is always 0: the client
 // correlates responses to requests by FIFO order (the `pending` queue), the
 // same way it does for ASCII, so per-request opaque tagging is unnecessary.
+//
+// Each binary branch validates the key itself (the ASCII branch gets this
+// from `encode_request_into` -> `validate_request`). Binary framing writes
+// the key length into a `u16` header field, so an unchecked key is worse
+// here than in ASCII: at >= 64 KiB the length wraps while the full key still
+// goes on the wire, desyncing the stream permanently. Validation runs before
+// any bytes are appended, so a rejected request leaves `buf` untouched.
 
 #[inline]
 fn append_get(binary: bool, key: &[u8], buf: &mut Vec<u8>) -> Result<(), Error> {
     if binary {
+        validate_key(key)?;
         let start = buf.len();
         buf.resize(start + memcache_proto::binary::HEADER_SIZE + key.len(), 0);
         let n = BinaryRequest::encode_get(&mut buf[start..], key, 0);
@@ -2437,6 +2551,7 @@ fn append_set(
     buf: &mut Vec<u8>,
 ) -> Result<(), Error> {
     if binary {
+        validate_key(key)?;
         let start = buf.len();
         buf.resize(
             start + memcache_proto::binary::HEADER_SIZE + 8 + key.len() + value.len(),
@@ -2461,6 +2576,7 @@ fn append_set(
 #[inline]
 fn append_delete(binary: bool, key: &[u8], buf: &mut Vec<u8>) -> Result<(), Error> {
     if binary {
+        validate_key(key)?;
         let start = buf.len();
         buf.resize(start + memcache_proto::binary::HEADER_SIZE + key.len(), 0);
         let n = BinaryRequest::encode_delete(&mut buf[start..], key, 0, 0);
@@ -2474,13 +2590,18 @@ fn append_delete(binary: bool, key: &[u8], buf: &mut Vec<u8>) -> Result<(), Erro
 /// Append a binary SET header + 8-byte extras (flags, expiration) + key, with
 /// `total_body_length` sized for the value that follows zero-copy via a guard.
 /// Binary is length-framed, so there is no trailing CRLF.
+///
+/// Validates `key` (≤ [`MAX_KEY_LEN`]) before appending, mirroring
+/// [`append_set_guard_prefix`]: returns [`Error::KeyTooLong`] with nothing
+/// appended to `buf`, so no partial frame can reach the wire.
 fn append_bin_set_guard_prefix(
     buf: &mut Vec<u8>,
     key: &[u8],
     value_len: usize,
     flags: u32,
     exptime: u32,
-) {
+) -> Result<(), Error> {
+    validate_key(key)?;
     const HDR: usize = memcache_proto::binary::HEADER_SIZE;
     let total_body = 8 + key.len() + value_len;
     let mut h = [0u8; HDR];
@@ -2493,6 +2614,7 @@ fn append_bin_set_guard_prefix(
     buf.extend_from_slice(&flags.to_be_bytes());
     buf.extend_from_slice(&exptime.to_be_bytes());
     buf.extend_from_slice(key);
+    Ok(())
 }
 
 /// Parse one binary response from `bytes`, mapping it into the ASCII
@@ -3029,5 +3151,411 @@ mod zc_threshold_tests {
         }
         assert_eq!(client.buffered_ops, N - 1);
         assert!(client.write_guards.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod binary_tests {
+    use super::*;
+    use ringline::{ConnCtx, RegionId, SendGuard};
+
+    const KEY: &[u8] = b"user:123456789";
+    const HDR: usize = memcache_proto::binary::HEADER_SIZE;
+
+    /// Heap-backed guard for tests (see `zc_threshold_tests::VecGuard`).
+    struct VecGuard(Vec<u8>);
+
+    impl SendGuard for VecGuard {
+        fn as_ptr_len(&self) -> (*const u8, u32) {
+            (self.0.as_ptr(), self.0.len() as u32)
+        }
+        fn region(&self) -> RegionId {
+            RegionId::UNREGISTERED
+        }
+    }
+
+    /// A [`BinaryClient`] backed by a dangling `ConnCtx`. A
+    /// `max_batch_size` above 1 keeps every `fire_*` in the buffered path (no
+    /// direct send, no recv), the only path safe to exercise without a live
+    /// connection.
+    fn binary_client(max_batch_size: usize, zc_threshold: u32) -> BinaryClient {
+        Client::builder(ConnCtx::for_test(0, 0))
+            .max_batch_size(max_batch_size)
+            .zc_threshold(zc_threshold)
+            .build_binary()
+    }
+
+    fn long_key() -> Vec<u8> {
+        vec![b'k'; MAX_KEY_LEN + 1]
+    }
+
+    // ── Key validation parity with the ASCII path ───────────────────────
+    //
+    // `MAX_KEY_LEN` / `Error::KeyTooLong` is documented public behavior. It
+    // must hold in binary mode too: the binary encoders write the key length
+    // as a `u16`, so a key that is merely over-long wastes a round trip, and
+    // a key >= 64 KiB truncates the header length while the full key still
+    // goes on the wire — desyncing the connection permanently.
+
+    #[test]
+    fn binary_get_rejects_long_key() {
+        let mut client = binary_client(4, 4096);
+        assert!(matches!(
+            client.fire_get(&long_key(), 1),
+            Err(Error::KeyTooLong)
+        ));
+    }
+
+    #[test]
+    fn binary_set_rejects_long_key() {
+        let mut client = binary_client(4, 4096);
+        assert!(matches!(
+            client.fire_set(&long_key(), b"v", 0, 0, 1),
+            Err(Error::KeyTooLong)
+        ));
+    }
+
+    #[test]
+    fn binary_delete_rejects_long_key() {
+        let mut client = binary_client(4, 4096);
+        assert!(matches!(
+            client.fire_delete(&long_key(), 1),
+            Err(Error::KeyTooLong)
+        ));
+    }
+
+    #[test]
+    fn binary_guarded_set_rejects_long_key() {
+        // zc_threshold = 0 forces the guard path (no fold into fire_set).
+        let mut client = binary_client(4, 0);
+        assert!(matches!(
+            client.fire_set_with_guard(&long_key(), VecGuard(vec![0u8; 64]), 0, 0, 1),
+            Err(Error::KeyTooLong)
+        ));
+    }
+
+    #[test]
+    fn binary_rejected_request_appends_no_bytes() {
+        // A rejected request must leave no partial frame in write_buf, and
+        // must not register a guard or a pending op — otherwise the next
+        // flush ships a corrupt frame and recv() desyncs.
+        let mut client = binary_client(4, 0);
+        client.fire_get(KEY, 1).unwrap();
+        let clean = client.inner.write_buf.clone();
+
+        assert!(client.fire_get(&long_key(), 2).is_err());
+        assert!(client.fire_set(&long_key(), b"v", 0, 0, 3).is_err());
+        assert!(client.fire_delete(&long_key(), 4).is_err());
+        assert!(
+            client
+                .fire_set_with_guard(&long_key(), VecGuard(vec![0u8; 64]), 0, 0, 5)
+                .is_err()
+        );
+
+        assert_eq!(
+            client.inner.write_buf, clean,
+            "no partial frame may be appended"
+        );
+        assert!(client.inner.write_guards.is_empty());
+        assert_eq!(client.inner.buffered_ops, 1);
+        assert_eq!(client.inner.pending.len(), 1);
+    }
+
+    #[test]
+    fn binary_accepts_max_len_key() {
+        let key = vec![b'k'; MAX_KEY_LEN];
+        let mut client = binary_client(4, 4096);
+        client.fire_get(&key, 1).unwrap();
+        client.fire_set(&key, b"v", 0, 0, 2).unwrap();
+        client.fire_delete(&key, 3).unwrap();
+        assert_eq!(client.inner.buffered_ops, 3);
+    }
+
+    // ── Request framing ─────────────────────────────────────────────────
+    //
+    // These pin the on-wire bytes of the binary encoders. The client talks to
+    // real servers (valcache, memcached -B binary), so header field placement
+    // is a wire contract, not an implementation detail.
+
+    /// Decode the fixed header fields of a request frame for assertions.
+    fn hdr(buf: &[u8]) -> (u8, u8, usize, usize, usize) {
+        (
+            buf[0],
+            buf[1],
+            u16::from_be_bytes([buf[2], buf[3]]) as usize,
+            buf[4] as usize,
+            u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]) as usize,
+        )
+    }
+
+    #[test]
+    fn binary_get_frames_header_then_key() {
+        let mut buf = Vec::new();
+        append_get(true, KEY, &mut buf).unwrap();
+        let (magic, opcode, key_len, extras_len, total_body) = hdr(&buf);
+        assert_eq!(magic, memcache_proto::binary::REQUEST_MAGIC);
+        assert_eq!(opcode, 0x00, "Get opcode");
+        assert_eq!(key_len, KEY.len());
+        assert_eq!(extras_len, 0, "Get carries no extras");
+        assert_eq!(total_body, KEY.len());
+        assert_eq!(&buf[HDR..], KEY);
+        assert_eq!(buf.len(), HDR + total_body);
+    }
+
+    #[test]
+    fn binary_delete_frames_header_then_key() {
+        let mut buf = Vec::new();
+        append_delete(true, KEY, &mut buf).unwrap();
+        let (magic, opcode, key_len, extras_len, total_body) = hdr(&buf);
+        assert_eq!(magic, memcache_proto::binary::REQUEST_MAGIC);
+        assert_eq!(opcode, 0x04, "Delete opcode");
+        assert_eq!(key_len, KEY.len());
+        assert_eq!(extras_len, 0);
+        assert_eq!(total_body, KEY.len());
+        assert_eq!(&buf[HDR..], KEY);
+    }
+
+    #[test]
+    fn binary_set_frames_extras_key_and_value() {
+        let value = b"hello world";
+        let mut buf = Vec::new();
+        append_set(true, KEY, value, 7, 42, &mut buf).unwrap();
+        let (magic, opcode, key_len, extras_len, total_body) = hdr(&buf);
+        assert_eq!(magic, memcache_proto::binary::REQUEST_MAGIC);
+        assert_eq!(opcode, 0x01, "Set opcode");
+        assert_eq!(key_len, KEY.len());
+        assert_eq!(extras_len, 8, "Set extras are flags + expiration");
+        assert_eq!(total_body, 8 + KEY.len() + value.len());
+        assert_eq!(buf.len(), HDR + total_body);
+        // Extras are flags then expiration, both big-endian.
+        assert_eq!(&buf[HDR..HDR + 4], &7u32.to_be_bytes());
+        assert_eq!(&buf[HDR + 4..HDR + 8], &42u32.to_be_bytes());
+        assert_eq!(&buf[HDR + 8..HDR + 8 + KEY.len()], KEY);
+        assert_eq!(&buf[HDR + 8 + KEY.len()..], value);
+    }
+
+    #[test]
+    fn binary_appends_leave_existing_bytes_untouched() {
+        // The coalescing layer appends commands back-to-back into write_buf.
+        let mut buf = b"EXISTING".to_vec();
+        append_get(true, KEY, &mut buf).unwrap();
+        assert_eq!(&buf[..8], b"EXISTING");
+        assert_eq!(buf.len(), 8 + HDR + KEY.len());
+    }
+
+    #[test]
+    fn binary_guarded_set_prefix_matches_a_plain_binary_set() {
+        // The guard path emits header+extras+key and lets the guarded value
+        // follow zero-copy. Prefix ++ value must be byte-identical to the
+        // copy-path encoding of the same SET, or the two paths disagree on
+        // the wire. (ASCII pins the same invariant in zc_threshold_tests.)
+        let value = vec![0xABu8; 8192];
+
+        let mut guarded = Vec::new();
+        append_bin_set_guard_prefix(&mut guarded, KEY, value.len(), 7, 42).unwrap();
+        guarded.extend_from_slice(&value);
+
+        let mut plain = Vec::new();
+        append_set(true, KEY, &value, 7, 42, &mut plain).unwrap();
+
+        assert_eq!(guarded, plain);
+    }
+
+    #[test]
+    fn binary_guarded_set_declares_the_full_body_length() {
+        // total_body must account for the value that follows via the guard,
+        // even though those bytes never enter write_buf.
+        let mut buf = Vec::new();
+        append_bin_set_guard_prefix(&mut buf, KEY, 8192, 0, 0).unwrap();
+        let (_, opcode, key_len, extras_len, total_body) = hdr(&buf);
+        assert_eq!(opcode, 0x01);
+        assert_eq!(key_len, KEY.len());
+        assert_eq!(extras_len, 8);
+        assert_eq!(total_body, 8 + KEY.len() + 8192);
+        assert_eq!(buf.len(), HDR + 8 + KEY.len(), "value is not copied in");
+        assert!(!buf.ends_with(b"\r\n"), "binary is length-framed, no CRLF");
+    }
+
+    #[test]
+    fn binary_guarded_set_splices_the_guard_after_the_key() {
+        let mut client = binary_client(4, 4096);
+        client
+            .fire_set_with_guard(KEY, VecGuard(vec![0u8; 8192]), 0, 0, 1)
+            .unwrap();
+        assert_eq!(client.inner.write_guards.len(), 1);
+        assert_eq!(client.inner.write_guards[0].0, HDR + 8 + KEY.len());
+    }
+
+    // ── Response parsing ────────────────────────────────────────────────
+
+    /// Build a binary response frame.
+    fn resp(opcode: u8, status: u16, extras: &[u8], key: &[u8], value: &[u8]) -> bytes::Bytes {
+        let total_body = extras.len() + key.len() + value.len();
+        let mut b = vec![0u8; HDR];
+        b[0] = memcache_proto::binary::RESPONSE_MAGIC;
+        b[1] = opcode;
+        b[2..4].copy_from_slice(&(key.len() as u16).to_be_bytes());
+        b[4] = extras.len() as u8;
+        b[6..8].copy_from_slice(&status.to_be_bytes());
+        b[8..12].copy_from_slice(&(total_body as u32).to_be_bytes());
+        b.extend_from_slice(extras);
+        b.extend_from_slice(key);
+        b.extend_from_slice(value);
+        bytes::Bytes::from(b)
+    }
+
+    #[test]
+    fn parse_get_hit_yields_value_and_flags() {
+        let frame = resp(0x00, 0, &7u32.to_be_bytes(), b"", b"payload");
+        let (r, consumed) = parse_binary_response(&frame).unwrap().unwrap();
+        assert_eq!(consumed, frame.len());
+        match r {
+            McResponseBytes::Values(v) => {
+                assert_eq!(v.len(), 1);
+                assert_eq!(v[0].flags, 7);
+                assert_eq!(&v[0].data[..], b"payload");
+                assert!(v[0].cas.is_none());
+            }
+            other => panic!("expected Values, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_get_miss_yields_empty_values() {
+        // KEY_ENOENT (0x0001) on a Get is a miss, not an error.
+        let frame = resp(0x00, 0x0001, b"", b"", b"Not found");
+        let (r, consumed) = parse_binary_response(&frame).unwrap().unwrap();
+        assert_eq!(consumed, frame.len());
+        assert!(matches!(r, McResponseBytes::Values(v) if v.is_empty()));
+    }
+
+    #[test]
+    fn parse_set_success_yields_stored() {
+        let frame = resp(0x01, 0, b"", b"", b"");
+        let (r, consumed) = parse_binary_response(&frame).unwrap().unwrap();
+        assert_eq!(consumed, HDR);
+        assert!(matches!(r, McResponseBytes::Stored));
+    }
+
+    #[test]
+    fn parse_delete_success_yields_deleted() {
+        let frame = resp(0x04, 0, b"", b"", b"");
+        let (r, _) = parse_binary_response(&frame).unwrap().unwrap();
+        assert!(matches!(r, McResponseBytes::Deleted));
+    }
+
+    #[test]
+    fn parse_delete_miss_yields_not_found() {
+        let frame = resp(0x04, 0x0001, b"", b"", b"Not found");
+        let (r, _) = parse_binary_response(&frame).unwrap().unwrap();
+        assert!(matches!(r, McResponseBytes::NotFound));
+    }
+
+    #[test]
+    fn parse_error_status_yields_server_error_with_body() {
+        // A non-zero status that is not a documented miss carries the
+        // server's error text as the body.
+        let frame = resp(0x01, 0x0004, b"", b"", b"Invalid arguments");
+        let (r, _) = parse_binary_response(&frame).unwrap().unwrap();
+        match r {
+            McResponseBytes::ServerError(msg) => assert_eq!(&msg[..], b"Invalid arguments"),
+            other => panic!("expected ServerError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_needs_more_on_partial_header() {
+        let frame = resp(0x01, 0, b"", b"", b"");
+        for n in 0..HDR {
+            assert!(
+                parse_binary_response(&frame.slice(..n)).unwrap().is_none(),
+                "{n} header bytes must not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_needs_more_on_partial_body() {
+        let frame = resp(0x00, 0, &[0u8; 4], b"", b"payload");
+        for n in HDR..frame.len() {
+            assert!(
+                parse_binary_response(&frame.slice(..n)).unwrap().is_none(),
+                "{n} of {} bytes must not parse",
+                frame.len()
+            );
+        }
+        assert!(parse_binary_response(&frame).unwrap().is_some());
+    }
+
+    #[test]
+    fn parse_consumes_exactly_one_frame_when_pipelined() {
+        // Responses arrive coalesced; the parser must stop after frame one so
+        // FIFO correlation with the pending queue stays aligned.
+        let first = resp(0x01, 0, b"", b"", b"");
+        let second = resp(0x04, 0, b"", b"", b"");
+        let mut both = first.to_vec();
+        both.extend_from_slice(&second);
+        let joined = bytes::Bytes::from(both);
+
+        let (r, consumed) = parse_binary_response(&joined).unwrap().unwrap();
+        assert!(matches!(r, McResponseBytes::Stored));
+        assert_eq!(consumed, first.len());
+
+        let (r2, _) = parse_binary_response(&joined.slice(consumed..))
+            .unwrap()
+            .unwrap();
+        assert!(matches!(r2, McResponseBytes::Deleted));
+    }
+
+    #[test]
+    fn parse_rejects_bad_magic() {
+        let mut b = resp(0x01, 0, b"", b"", b"").to_vec();
+        b[0] = 0x80; // request magic where a response magic belongs
+        assert!(parse_binary_response(&bytes::Bytes::from(b)).is_err());
+    }
+
+    #[test]
+    fn parse_rejects_lengths_exceeding_body() {
+        // key_len + extras_len > total_body would slice out of range.
+        let mut b = resp(0x00, 0, b"", b"", b"payload").to_vec();
+        b[2..4].copy_from_slice(&999u16.to_be_bytes());
+        assert!(parse_binary_response(&bytes::Bytes::from(b)).is_err());
+    }
+
+    // ── The binary surface is enforced by the type system ───────────────
+    //
+    // `build_binary` yields a `BinaryClient`, which exposes only the fire/recv
+    // API. The ASCII request/response methods are absent from that type, so a
+    // protocol mix-up (ASCII on the wire, binary parse on the way back) is a
+    // compile error rather than a runtime failure. These tests pin the two
+    // halves of that split.
+
+    #[test]
+    fn build_binary_yields_a_binary_client() {
+        let c = binary_client(4, 4096);
+        assert!(c.inner.binary, "build_binary must set the binary flag");
+    }
+
+    #[test]
+    fn build_yields_an_ascii_client() {
+        // The flag must not leak into the plain `build()` path.
+        let c = Client::builder(ConnCtx::for_test(0, 0))
+            .max_batch_size(4)
+            .build();
+        assert!(!c.binary);
+        let mut buf = Vec::new();
+        append_get(c.binary, KEY, &mut buf).unwrap();
+        assert!(buf.starts_with(b"get "), "ASCII mode still encodes ASCII");
+    }
+
+    #[test]
+    fn binary_client_exposes_the_fire_recv_api() {
+        let mut c = binary_client(8, 4096);
+        c.fire_get(KEY, 1).unwrap();
+        c.fire_set(KEY, b"v", 0, 0, 2).unwrap();
+        c.fire_delete(KEY, 3).unwrap();
+        c.fire_set_with_guard(KEY, VecGuard(vec![0u8; 8192]), 0, 0, 4)
+            .unwrap();
+        assert_eq!(c.pending_count(), 4);
     }
 }
