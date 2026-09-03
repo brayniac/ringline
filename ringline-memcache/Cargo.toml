@@ -34,7 +34,7 @@ itoa = { workspace = true }
 ketama = { workspace = true }
 libc = { workspace = true, optional = true }
 ringline = { workspace = true }
-memcache-proto = { workspace = true }
+memcache-proto = { workspace = true, features = ["binary"] }
 thiserror = { workspace = true }
 
 [dev-dependencies]
