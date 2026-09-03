@@ -29,6 +29,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Breaking (batched for the next release):** `ConnCtx` is no longer `Send` or
+  `Sync`. Ringline is thread-per-core: each worker owns its own driver and
+  `ConnectionTable`, and a `ConnCtx` is an `(index, generation)` pair into
+  *that* worker's table. Moving one to another worker did not fail loudly —
+  the index is still in bounds there, so it resolved against a different
+  table, and a matching generation meant I/O landed on an unrelated
+  connection: a silent wrong-socket write. That is now a compile error. It
+  also makes capturing a `ConnCtx` in a `spawn_blocking` closure a compile
+  error, which is correct (its pool threads have no driver); `spawn` is
+  unaffected, as it requires only `'static`, not `Send`. No runtime cost —
+  the opt-out is a zero-sized `PhantomData<*const ()>` field, which is how a
+  type declines these auto traits on stable Rust (`impl !Send` remains
+  nightly-only, rust-lang/rust#68318). Code that legitimately needs to reach
+  another worker should send the data, not the handle.
+
 - **Breaking (batched for the next release):** `PoolConfig` in `ringline-ping`,
   `ringline-redis`, `ringline-memcache`, and `ringline-http` is now opaque:
   construct with `PoolConfig::new(...)` (required parameters) plus chained
@@ -64,7 +79,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - `ringline-memcache`: binary mode skipped client-side key validation, so the
   documented `MAX_KEY_LEN` (250) / `Error::KeyTooLong` contract silently did
-  not hold with `.binary(true)`. Binary framing writes the key length into a
+  not hold in binary mode. Binary framing writes the key length into a
   `u16` header field, so an over-long key wasted a round trip and a key of
   64 KiB or more wrapped that field while the full key still went on the wire
   — desyncing the connection permanently. All four binary request paths

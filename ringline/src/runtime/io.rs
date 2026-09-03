@@ -2,7 +2,6 @@ use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::future::Future;
 use std::io;
-#[cfg(has_io_uring)]
 use std::marker::PhantomData;
 use std::net::SocketAddr;
 #[cfg(has_io_uring)]
@@ -745,10 +744,39 @@ pub fn request_shutdown() -> io::Result<()> {
 ///     fn create_for_worker(_id: usize) -> Self { SendExample }
 /// }
 /// ```
+/// # Thread affinity
+///
+/// A `ConnCtx` is meaningful only on the worker thread that owns the
+/// connection, so it is deliberately **neither `Send` nor `Sync`**:
+///
+/// ```compile_fail
+/// fn assert_send<T: Send>() {}
+/// assert_send::<ringline::ConnCtx>();
+/// ```
+///
+/// ```compile_fail
+/// fn assert_sync<T: Sync>() {}
+/// assert_sync::<ringline::ConnCtx>();
+/// ```
+///
+/// Ringline is thread-per-core: each worker owns its own driver and
+/// `ConnectionTable`, and a `ConnCtx` is just an `(index, generation)` pair
+/// into *that* worker's table. Used from another worker the index is still in
+/// bounds, so the lookup does not fail — it resolves against a different
+/// table, and if the generation happens to match too, I/O lands on an
+/// unrelated connection. That is a silent wrong-socket write rather than a
+/// crash, so the type system rules it out instead. This also makes capturing a
+/// `ConnCtx` in a [`spawn_blocking`] closure a compile error, which is correct:
+/// its pool threads have no driver. [`spawn`] is unaffected — it requires only
+/// `'static`, not `Send`.
 #[derive(Clone, Copy)]
 pub struct ConnCtx {
     pub(crate) conn_index: u32,
     pub(crate) generation: u32,
+    /// Pins the handle to its owning worker thread — see "Thread affinity".
+    /// `PhantomData<*const ()>` is how a type opts out of `Send`/`Sync` on
+    /// stable Rust; `impl !Send` is still nightly-only (rust-lang/rust#68318).
+    pub(crate) _not_send: PhantomData<*const ()>,
 }
 
 impl ConnCtx {
@@ -757,6 +785,7 @@ impl ConnCtx {
         ConnCtx {
             conn_index,
             generation,
+            _not_send: PhantomData,
         }
     }
 
