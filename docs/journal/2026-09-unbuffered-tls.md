@@ -215,6 +215,93 @@ server and the reverse — streams can't be byte-identical, so the assertion is
 interoperability, not equality), and the chunk-size rig sweep the design doc's
 open question 1 always deferred to measurement.
 
+### Pre-PR adversarial review (2026-09-04)
+
+Four adversarial reviewers went over the whole branch diff before the PR, one
+per risk cluster: send-completion contract and pool-slot lifecycle, wire record
+ordering, the ciphertext buffer's state machine, and close/EOF semantics.
+**21 of 22 focus areas came back safe**, including the three bug classes this
+effort had already been bitten by — `discard` applied exactly once on every exit
+of all four state-machine entry points, the 16383x compaction site confirmed
+gone rather than merely re-guarded (one call site, correctly gated), and sink
+overflow fatal on both arms rather than silently consuming.
+
+**The one finding, reached independently by two reviewers from different
+directions.** `encrypt_with` and `close_notify_with` funnelled every non-target
+`ConnectionState` into a catch-all, which silently swallowed two states that
+must not be swallowed:
+
+- `EncodeTlsData` is *destructive on construction* — `process_tls_records_common`
+  pops the chunk out of `sendable_tls` and never restores it, so dropping the
+  value discards an outgoing record permanently. In `close_notify_with` that
+  record can be the alert itself: on TLS 1.2 traffic-key exhaustion
+  `write_plaintext` calls `send_close_notify()` before returning
+  `EncryptExhausted`, so the catch-all popped the queued alert, dropped it, and
+  returned success with `close_notify_sent` false. The peer would see a bare FIN
+  instead of a clean shutdown.
+- `PeerClosed` is edge-triggered. If a send-path `process()` were the call that
+  deframed the peer's close_notify, the edge would be consumed with
+  `peer_sent_close_notify` left false, and the next FIN would be reported as a
+  *spurious truncation* — a false security signal.
+
+Neither was reachable on the normal path, but only because of an invariant that
+lived nowhere in the code. Both now have explicit arms, both tested, and the
+`EncodeTlsData` case turned out to be constructible after all (a server holding
+the client's first flight staged-but-undriven).
+
+**Also recorded: an accidental interlock.** `submit_next_queued` coalesces
+consecutive pool-backed sends into one `SendMsgCoalesced` without inspecting
+`OpTag`. Multi-slot TLS sends never coalesce today *only* because `copy_in` and
+`alloc_raw` default `slot_end_of_send = true` and the TLS builders never clear
+it. Clearing it for intermediates looks like an obvious tidy-up — they are parts
+of one blob — and would collapse a multi-slot send into a single wake with the
+wrong count. Both call sites now carry a comment saying so.
+
+### Backlog: pre-existing issues found while reviewing, not fixed here
+
+All of these reproduce against the **buffered** engine too, so this effort
+neither introduced nor worsened them. Recorded rather than fixed, to keep the
+PR scoped.
+
+1. **`SendFuture` reports ciphertext length, not plaintext length**, for TLS
+   sends. `handle_tls_send` never adds to `acked_bytes`, so a multi-chunk
+   `send().await` resolves with only the final chunk's ciphertext length. This is
+   the half of "exactly one waiter wake per logical send, with the right count"
+   that is currently wrong on both engines.
+2. **`ConnCtx::send(&[])` on a TLS connection never resolves** — the waiter is
+   set but no SQE is submitted. Same shape as the plaintext path.
+3. **`ConnCtx::close()` on io_uring sends a bare FIN.** It routes to
+   `Driver::close_connection`, which only sets `close_pending`; close_notify
+   queueing lives in `DriverCtx::close(ConnToken)`, which that path never
+   reaches. The peer cannot distinguish clean shutdown from truncation.
+   `DriverCtx::close` (the on_tick-context close) *is* now covered, by
+   `tls_tick_close_sends_close_notify`.
+4. **mio `finish_close` can write the alert past queued data.** `flush_sends`
+   may return with the FIFO non-empty on `WouldBlock`, after which
+   `flush_tls_output_mio_direct` writes the alert straight to the socket and
+   `pending_sends.clear()` discards the rest — a record-sequence gap the peer
+   reports as `bad_record_mac`.
+5. **Suspected mio fd/slot leak when the peer closes first** (unconfirmed). The
+   peer-FIN path sets `RecvMode::Closed` without pushing to `pending_closes`, so
+   `finish_close` never runs for that connection: no poll deregistration, no
+   `TcpStream` drop, no slot release.
+6. **`MAX_UNPROCESSABLE` lacks per-record framing headroom.** The constant bounds
+   the 0xffff plaintext handshake message but not the on-wire extent of the
+   records carrying it, so the no-deadlock derivation is empirically safe rather
+   than airtight. The window is *empty* at the default `recv_buffer.buffer_size`
+   of 16384 and only opens above ~64 KiB; worst case is one connection killed
+   with a clear error, not a hang or corruption. Suspected, not proven.
+7. **Buffered io_uring can miss a coalesced close_notify.** `feed_tls_recv`'s
+   buffered path returns `HandshakeJustCompleted` before the
+   `state.peer_has_closed()` check, so a peer coalescing its last handshake
+   flight with a close_notify leaves `peer_sent_close_notify` false. The
+   unbuffered engine handles this correctly — do not "fix" it toward parity.
+8. **`encrypt_with`'s catch-all also covers `ReadTraffic`**, the third member of
+   the swallowed-state family. Decrypted application data surfacing on a
+   send-path `process()` would be dropped rather than stashed into
+   `pending_plaintext` the way `drive_inner` does it. Same unreachability
+   argument as the two that were fixed.
+
 ## Lessons / open questions
 
 - **A test that asserts a bound while exercising the wrong regime is worse than
