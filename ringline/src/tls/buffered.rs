@@ -17,7 +17,7 @@ use crate::buffer::send_copy::SendCopyPool;
 use super::*;
 
 /// A rustls connection driven through the *buffered* API
-/// (`read_tls` / `process_new_packets` / `write_tls`).
+/// (`read_tls` / `process_new_packets` / `write_tls` / `send_close_notify`).
 pub enum BufferedKind {
     Server(ServerConnection),
     Client(ClientConnection),
@@ -101,6 +101,16 @@ impl BufferedKind {
         }
     }
 
+    /// Buffered-only, like `read_tls` et al. above -- not because rustls
+    /// scopes `CommonState::send_close_notify` to the buffered API (it
+    /// doesn't; `CommonState` is shared by both engines), but because it
+    /// isn't reachable through the unbuffered connection types regardless:
+    /// `UnbufferedConnectionCommon` implements `Deref` to `CommonState` but
+    /// not `DerefMut`, so a `&mut self` call can't reach it through
+    /// `UnbufferedServerConnection`/`UnbufferedClientConnection` (verified
+    /// against rustls 0.23.41's `src/conn.rs`). The unbuffered engine's
+    /// close_notify goes through `WriteTraffic::queue_close_notify` instead
+    /// -- see `docs/tls-unbuffered-design.md` ("### close_notify").
     pub fn send_close_notify(&mut self) {
         match self {
             BufferedKind::Server(c) => c.send_close_notify(),

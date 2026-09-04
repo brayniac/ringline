@@ -6,15 +6,23 @@
 //!
 //! `TlsConnKind` is tagged by engine: [`TlsConnKind::Buffered`] wraps
 //! [`buffered::BufferedKind`], which carries the buffered-only surface
-//! (`read_tls`/`write_tls`/`process_new_packets`/`reader`/`writer`).
-//! `TlsConnKind` itself keeps only the methods rustls exposes through
-//! `CommonState` — reachable via `Deref` from every engine's connection type
-//! — so a future `Unbuffered` variant adds a match arm to those, rather than
+//! (`read_tls`/`write_tls`/`process_new_packets`/`reader`/`writer`/
+//! `send_close_notify`). `send_close_notify` lives there rather than on
+//! `TlsConnKind` because it isn't actually `CommonState`-reachable from the
+//! unbuffered connection types (`UnbufferedConnectionCommon` derefs to
+//! `CommonState` but doesn't `DerefMut` to it) — a shared-looking method
+//! name that turned out to be buffered-only once checked against rustls
+//! 0.23.41, the same way `read_tls` et al. are. `TlsConnKind` itself keeps
+//! only the methods rustls exposes through `CommonState` and that are
+//! actually reachable that way from every engine's connection type — so the
+//! feature-gated [`TlsConnKind::Unbuffered`] variant (wrapping
+//! [`unbuffered::UnbufferedKind`]) adds a match arm to those, rather than
 //! forcing every caller to unwrap an engine first. `TlsConn`, `TlsTable` and
 //! `drain_tls_plaintext` still assume a buffered connection wherever they
 //! reach past `TlsConnKind` (e.g. `reader()` for plaintext draining, or
-//! constructing `BufferedKind` directly in `TlsTable::create`); threading a
-//! second engine through those is follow-on work.
+//! constructing `BufferedKind` directly in `TlsTable::create`); the
+//! unbuffered engine is constructible but not yet driven — threading it
+//! through those is follow-on work.
 
 #[allow(unused_imports)]
 use std::io::{self, Read as _, Write as _};
@@ -65,6 +73,18 @@ impl TlsInfo {
     }
 
     /// The SNI hostname the peer requested, if any.
+    ///
+    /// **Known limitation:** on a server connection driven by the
+    /// `tls-unbuffered` engine, this is always `None`. rustls does not
+    /// expose an equivalent of `ServerConnection::server_name()` on
+    /// `UnbufferedServerConnection` (verified against rustls 0.23.41 —
+    /// `server_name()` lives only on the handshake-callback `ClientHello`
+    /// type and on the buffered `ServerConnection`; `UnbufferedServerConnection`
+    /// derefs only as far as `CommonState`, which doesn't carry it either).
+    /// Buffered connections are unaffected. Recovering SNI for the
+    /// unbuffered engine would need a `ClientHello` callback on
+    /// `ServerConfig` to capture it at handshake time and stash it on
+    /// `TlsConn` — tracked as follow-on work, not yet implemented.
     pub fn sni_hostname(&self) -> Option<&str> {
         self.sni_hostname.as_deref()
     }
@@ -78,66 +98,98 @@ impl TlsInfo {
 /// which both engine families `Deref` to -- stay on this enum.
 pub enum TlsConnKind {
     Buffered(buffered::BufferedKind),
+    #[cfg(feature = "tls-unbuffered")]
+    // Not built by any production code path yet -- `TlsTable::create`/
+    // `create_client` only ever build `Buffered`; only `tls::unbuffered::tests`
+    // constructs one, to pin the plumbing. Without this, `-D warnings`
+    // dead_code fires "variant is never constructed" on the plain (non-test)
+    // `lib` build, since `tls` is `pub(crate)` and the test-only constructor
+    // isn't visible from that build. Wiring this engine into `TlsTable` is
+    // follow-on work; remove this once something does. (Same pattern as
+    // `TlsRecvResult::Error` below.)
+    #[allow(dead_code)]
+    Unbuffered(unbuffered::UnbufferedKind),
 }
 
 impl TlsConnKind {
     /// The buffered connection, or `None` if another engine drives this one.
     ///
-    /// Always `Some` today — there is only one engine — but the `Option` is
-    /// the point: it is what lets a future `Unbuffered` variant land without
-    /// changing every call site. Do not collapse this to an infallible
+    /// `Some` for every connection when only the buffered engine is
+    /// compiled in; `None` for a `tls-unbuffered`-engine connection once
+    /// that feature is enabled. Do not collapse this to an infallible
     /// accessor.
     #[allow(
         clippy::unnecessary_wraps,
-        reason = "always Some until a second TlsConnKind variant exists; kept fallible on purpose"
+        reason = "unconditionally Some without the tls-unbuffered feature; kept fallible so both configurations share one signature"
     )]
     pub fn as_buffered_mut(&mut self) -> Option<&mut buffered::BufferedKind> {
         match self {
             Self::Buffered(k) => Some(k),
+            #[cfg(feature = "tls-unbuffered")]
+            Self::Unbuffered(_) => None,
         }
     }
 
     pub fn wants_write(&self) -> bool {
         match self {
             Self::Buffered(k) => k.wants_write(),
+            #[cfg(feature = "tls-unbuffered")]
+            Self::Unbuffered(k) => k.wants_write(),
         }
     }
 
     pub fn is_handshaking(&self) -> bool {
         match self {
             Self::Buffered(k) => k.is_handshaking(),
+            #[cfg(feature = "tls-unbuffered")]
+            Self::Unbuffered(k) => k.is_handshaking(),
         }
     }
 
     pub fn alpn_protocol(&self) -> Option<&[u8]> {
         match self {
             Self::Buffered(k) => k.alpn_protocol(),
+            #[cfg(feature = "tls-unbuffered")]
+            Self::Unbuffered(k) => k.alpn_protocol(),
         }
     }
 
     pub fn negotiated_cipher_suite(&self) -> Option<rustls::SupportedCipherSuite> {
         match self {
             Self::Buffered(k) => k.negotiated_cipher_suite(),
+            #[cfg(feature = "tls-unbuffered")]
+            Self::Unbuffered(k) => k.negotiated_cipher_suite(),
         }
     }
 
     pub fn protocol_version(&self) -> Option<rustls::ProtocolVersion> {
         match self {
             Self::Buffered(k) => k.protocol_version(),
+            #[cfg(feature = "tls-unbuffered")]
+            Self::Unbuffered(k) => k.protocol_version(),
         }
     }
 
+    /// The SNI hostname the peer requested, if any.
+    ///
+    /// Unbuffered server connections always report `None` here — see
+    /// [`unbuffered::UnbufferedKind::sni_hostname`] for why no equivalent to
+    /// `ServerConnection::server_name()` is reachable from
+    /// `UnbufferedServerConnection`. This is a real, documented limitation
+    /// of the unbuffered engine (tracked on [`TlsInfo::sni_hostname`]), not
+    /// a bug in this accessor — the buffered path is unaffected.
     pub fn sni_hostname(&self) -> Option<&str> {
         match self {
             Self::Buffered(k) => k.sni_hostname(),
+            #[cfg(feature = "tls-unbuffered")]
+            Self::Unbuffered(k) => k.sni_hostname(),
         }
     }
 
-    pub fn send_close_notify(&mut self) {
-        match self {
-            Self::Buffered(k) => k.send_close_notify(),
-        }
-    }
+    // No `send_close_notify` here: it is buffered-only, like `read_tls` et
+    // al. -- see `buffered::BufferedKind::send_close_notify` for why, and
+    // `TlsTable::send_close_notify_queued` for the one caller, which goes
+    // through `as_buffered_mut()` instead.
 }
 
 /// Per-connection TLS state.
@@ -262,6 +314,17 @@ impl TlsTable {
     /// queue. Serializing through the queue (rather than pushing linked
     /// SQEs directly) keeps the alert ordered behind any in-flight send and
     /// lets the deferred Close fire only after it completes.
+    ///
+    /// `send_close_notify` is buffered-only (see
+    /// `buffered::BufferedKind::send_close_notify`), so this goes through
+    /// `as_buffered_mut()` -- consistent with `take_tls_output_sends` below,
+    /// which already reaches into the buffered engine directly. A
+    /// connection on an engine with no buffered close path (the
+    /// `tls-unbuffered` engine, once real connections use it) has nothing to
+    /// queue here; the `None` arm is a deliberate no-op, not an oversight.
+    /// That engine will drive close_notify through
+    /// `WriteTraffic::queue_close_notify` from inside `process_tls_records`
+    /// instead, per `docs/tls-unbuffered-design.md` ("### close_notify").
     #[cfg(has_io_uring)]
     pub fn send_close_notify_queued(
         &mut self,
@@ -270,8 +333,10 @@ impl TlsTable {
         send_copy_pool: &mut SendCopyPool,
         out: &mut Vec<crate::handler::BuiltSend>,
     ) {
-        if let Some(tls_conn) = self.get_mut(conn_index) {
-            tls_conn.conn.send_close_notify();
+        if let Some(tls_conn) = self.get_mut(conn_index)
+            && let Some(buffered) = tls_conn.conn.as_buffered_mut()
+        {
+            buffered.send_close_notify();
             tls_conn.close_notify_sent = true;
             let _ = take_tls_output_sends(tls_conn, send_copy_pool, conn_index, generation, out);
         }

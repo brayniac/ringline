@@ -353,8 +353,14 @@ impl Driver {
             if let Some(ref mut tls_table) = self.tls_table
                 && tls_table.has(conn_index)
             {
-                if let Some(tls_conn) = tls_table.get_mut(conn_index) {
-                    tls_conn.conn.send_close_notify();
+                if let Some(tls_conn) = tls_table.get_mut(conn_index)
+                    && let Some(buffered) = tls_conn.conn.as_buffered_mut()
+                {
+                    // `send_close_notify` is buffered-only -- see
+                    // `crate::tls::buffered::BufferedKind::send_close_notify`.
+                    // A connection on an engine with no buffered close path
+                    // has nothing to send here.
+                    buffered.send_close_notify();
                 }
                 crate::tls::flush_tls_output_mio_direct(tls_table, stream, conn_index);
                 tls_table.remove(conn_index);
