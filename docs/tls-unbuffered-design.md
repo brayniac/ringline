@@ -5,7 +5,7 @@ Three sections carry `> **Correction (PR #338)**` blocks where building the
 foundation falsified what was written here; read those before planning the
 engine.
 **Date:** 2026-09-03 (corrections 2026-09-04)
-**Related:** [`docs/syscalls-and-copies.md`](syscalls-and-copies.md), [`docs/send-completion-design.md`](send-completion-design.md), `ringline/src/tls.rs`
+**Related:** [`docs/syscalls-and-copies.md`](syscalls-and-copies.md), [`docs/send-completion-design.md`](send-completion-design.md), `ringline/src/tls/`
 **Follow-on:** kTLS (kernel TLS offload) — see *Why this is the stepping stone to kTLS*
 
 ## Goal
@@ -16,6 +16,60 @@ plaintext into rustls' internal buffer.
 
 The unbuffered path is built **alongside** the existing buffered one. Whether the
 buffered path is later feature-gated or deleted is deliberately deferred.
+
+## Design target: 800 GbE and beyond
+
+Every trade-off below is sized against **800 GbE**, not today's rigs.
+
+**What is structural.** The copy count on the TLS send path follows from the
+mechanism and can be verified by reading the code:
+
+| TLS send path | Copies on send |
+|---|---|
+| Today (buffered) | 2 — user → rustls' plaintext buffer → pool slot |
+| Unbuffered (this design) | 1 — user → pool slot, encrypting in transit |
+| kTLS, software | 1 — `sendmsg` copies plaintext in; kernel encrypts in place |
+| kTLS + NIC offload (`TLS_HW`) | 0 — in principle; unmeasured here |
+
+**What is not measured.** How much a copy *costs* at 800 GbE is unknown. The one
+number this codebase has is **~3.2 GiB/s/core**, from real 200 GbE on
+Graviton4 / kernel 6.12 ([`segmented-recv-design.md`](segmented-recv-design.md)).
+Dividing 800 GbE's ~93 GiB/s by it suggests one copy of a saturated stream is on
+the order of tens of cores — but that is a linear extrapolation onto hardware
+that does not exist yet, and it assumes per-core copy bandwidth holds at the new
+line rate, that copies parallelize cleanly across cores, and that copying stays
+the binding constraint rather than per-CQE processing, NIC queueing, or something
+unforeseen. **Treat it as a reason to measure, not as a projection**, and do not
+quote a core count as if it were a result. Where numbers appear below they are
+order-of-magnitude framing for prioritisation.
+
+Three consequences follow from the *structural* column, which is the part that
+does not depend on the extrapolation:
+
+1. **The value of removing a copy grows with line rate.** Trivially true given a
+   fixed per-core copy bandwidth; the interesting question is only how much,
+   which is unmeasured.
+2. **Software kTLS does not remove the remaining copy.** `sendmsg` copies
+   plaintext into the kernel, which encrypts in place — the same count as the
+   unbuffered path. Only NIC crypto offload can reach zero, and that is
+   unmeasured here too. See *Why this is the stepping stone to kTLS*.
+3. **Per-record overhead is a real term.** A saturated 800 GbE link carries on
+   the order of millions of TLS records per second (16 KiB max record), each
+   costing one `WriteTraffic::encrypt` call with `maybe_refresh_traffic_keys` and
+   fragmenter setup. `write_plaintext` fragments *internally*, so one call with
+   more plaintext emits several records and amortizes that. This argues for
+   larger plaintext chunks per call, hence larger contiguous output buffers
+   (`encrypt` is all-or-nothing on its output). It is **not** a licence to raise
+   `send_copy_slot_size` — the direction is argued, the value is not. Treat chunk
+   size as an internal knob and **measure on the rig** before touching any
+   `Config` default.
+
+A fourth consequence is a rule rather than a number, and it does not rest on the
+extrapolation at all: at high connection counts, **do not zero memory the peer
+has not sent**. The adaptive-recv journal's finding that big provided buffers are
+RSS-free relies on demand paging over *untouched* pages; anything that `memset`s
+forfeits it. `CiphertextBuf` must grow by appending received bytes, never by
+pre-filling.
 
 ## Motivation
 
@@ -337,14 +391,53 @@ Checked against CLAUDE.md's *Domain Invariants*:
 - **kTLS.** Follow-on, below.
 - **Guards under TLS.** Enabled by this work but separate: it touches
   `send_parts`, and the "guards are impossible under TLS" documentation.
-- **Reducing recv copies.** That is segmented recv's problem.
+- **Reducing recv copies.** That is segmented recv's problem — and the two do
+  **not** compose, which is worth stating so it is not rediscovered.
+
+  Segmented recv ([`segmented-recv-design.md`](segmented-recv-design.md), design
+  only, unimplemented) exists to avoid the copy into the contiguous
+  `RecvAccumulator` by delivering *discontiguous, buffer-sized segments*. But
+  `process_tls_records` takes a `&mut [u8]` whose front is the next unprocessed
+  byte and decrypts **in place**, so ciphertext ingest is contiguity-bound. That
+  is precisely why `CiphertextBuf` is a linear buffer with a start offset rather
+  than a ring.
+
+  So segmented recv's zero-copy Modes A and B cannot feed rustls: TLS ciphertext
+  must be gathered contiguously regardless, and TLS recv keeps paying that copy
+  whatever segmented recv does. The two efforts are on different axes — this one
+  is send-side only.
+
+  The one place they touch is `CiphertextBuf::MAX_SINGLE_APPEND` (64 KiB), which
+  the cap floor's no-deadlock argument depends on. A future segmented or
+  incremental-buffer (`IOU_PBUF_RING_INC`) recv path that coalesced into larger
+  chunks would violate it, and would have to either chunk its appends or raise
+  the floor in step. Note `IOU_PBUF_RING_INC` is **not** implemented today, and
+  self-adaptive recv buffering was measured **NO-GO** (2026-07-21) — see
+  `docs/journal/2026-07-self-adaptive-recv-buffering.md`, whose re-evaluation
+  trigger A is *"faster NICs (400/800 GbE)"*, i.e. exactly this design's target.
+  If that trigger fires, revisit this paragraph before the recv geometry changes.
 - **`sendfile` / NVMe-to-socket.** Needs kTLS first, and NVMe passthrough reads
   into *user* memory, so it does not compose into a zero-copy socket write the way
   `sendfile` does. Needs its own investigation before being counted on.
 
 ## Why this is the stepping stone to kTLS
 
-kTLS was the original request; this design is deliberately its first half.
+kTLS was the original request; this design is deliberately its first half — and
+at the 800 GbE target it is the *necessary* first half of a two-part answer, not
+a detour.
+
+**The remaining copy is a floor that only hardware offload removes.** This
+design takes TLS sends from 2 copies to 1, reaching parity with plaintext sends.
+It cannot go further: encryption must read plaintext and write ciphertext, and no
+userspace arrangement removes that. Software kTLS does not help — `sendmsg`
+copies plaintext into the kernel, which encrypts in place, so the count is
+unchanged. **Only NIC crypto offload (`TLS_HW`) can reach zero copies**, and
+reaching it requires kTLS as the delivery mechanism. That is the structural case
+for kTLS; `sendfile` is a secondary benefit, not the motivation.
+
+How much that floor actually costs at 800 GbE is unmeasured — see *Design
+target*. The argument here is about the copy count, which is structural, not
+about a core figure.
 
 `dangerous_extract_secrets` is implemented on `UnbufferedConnectionCommon`, so the
 unbuffered connection is exactly what a future kTLS path needs to hand keys to the
@@ -365,9 +458,20 @@ offload, which is where the *remaining* copy goes.
 
 ## Open questions
 
-1. **Chunk size policy.** Fill slots to `slot_size - overhead` (fewer, larger
-   records) or use a fixed 16 KiB record and a slot large enough to hold it? The
-   second is cleaner but changes the `send_pool` default. Wants a measurement.
+1. **Chunk size policy — resolved in direction, open in value.** Because
+   `write_plaintext` fragments internally, passing more plaintext per `encrypt`
+   call amortizes the per-call overhead across several records, which matters at
+   the millions of records per second a saturated 800 GbE link implies. So the
+   direction is *larger* chunks, bounded by `encrypt` needing its whole
+   ciphertext output contiguous.
+
+   The value is **not** settled and must not be guessed: implement chunk size as
+   an internal knob, sweep it (16 K / 64 K / 256 K plaintext per call) on the
+   rig, and report records/s/core and cycles/record before proposing any change
+   to `send_copy_slot_size`. The 800 GbE figures in this document are a
+   projection from a 200 GbE measurement; they justify measuring, nothing more.
+   If a larger slot does win, prefer giving TLS its own slot class over resizing
+   the shared `SendCopyPool` and charging non-TLS users for it.
 2. **`CiphertextBuf` capacity default and its config knob** — reuse
    `recv_buffer_size`, or a dedicated setting?
 3. **Does the buffered path stay as the mio default** while the unbuffered path
