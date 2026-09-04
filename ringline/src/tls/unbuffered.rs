@@ -37,7 +37,7 @@ use std::sync::Arc;
 use rustls::client::{ClientConnectionData, UnbufferedClientConnection};
 use rustls::pki_types::ServerName;
 use rustls::server::{ServerConnectionData, UnbufferedServerConnection};
-use rustls::unbuffered::{ConnectionState, EncodeError, UnbufferedStatus};
+use rustls::unbuffered::{ConnectionState, EncodeError, EncryptError, UnbufferedStatus};
 
 use super::ciphertext::{CiphertextBuf, INITIAL_SHRINK_TO, MAX_SINGLE_APPEND, MIN_CIPHERTEXT_CAP};
 use super::{PlaintextSink, TlsConn};
@@ -596,6 +596,195 @@ pub(crate) fn feed(
     last
 }
 
+/// Smallest destination buffer worth attempting. Below roughly this size the
+/// per-record overhead (5-byte header plus the AEAD tag, and on TLS 1.2 an
+/// explicit nonce) leaves too little room for the shrink loop to converge on:
+/// it would walk the chunk down to zero and fail anyway, so the caller is told
+/// straight away instead.
+const MIN_ENCRYPT_DST: usize = 64;
+
+/// Encrypt as much of `plaintext` as fits in `dst`, in one or more TLS
+/// records. Returns `(plaintext_consumed, ciphertext_written)`.
+///
+/// This is the copy the unbuffered engine exists to remove: the plaintext is
+/// read straight out of caller memory, and the ciphertext is written straight
+/// into the caller's destination, with no trip through rustls'
+/// `sendable_plaintext`.
+///
+/// `encrypt` is all-or-nothing on its output: too small a buffer writes
+/// nothing and reports `required_size` for the payload it was handed. The
+/// chunk size is therefore shrunk from that report — never from a hardcoded
+/// record overhead, which differs between TLS 1.2 (explicit nonce) and TLS 1.3
+/// (content-type byte). The converged size is cached on the connection so
+/// steady-state sends do not pay the retry.
+///
+/// `dst` also carries any TLS records rustls had queued for sending — a
+/// TLS 1.3 `key_update`, most notably: `write_plaintext` drains `sendable_tls`
+/// into the front of `outgoing_tls` ahead of the application-data fragments,
+/// and sizes `required_size` to include them (verified against rustls
+/// 0.23.41's `CommonState::{check_required_size, write_fragments}`). So the
+/// caller need only transmit `dst` in order; there is no second stream to
+/// interleave, and `ciphertext_written` can exceed what this chunk's own
+/// records account for.
+pub(crate) fn encrypt_chunk(
+    tls_conn: &mut TlsConn,
+    plaintext: &[u8],
+    dst: &mut [u8],
+) -> io::Result<(usize, usize)> {
+    if plaintext.is_empty() {
+        return Ok((0, 0));
+    }
+    if dst.len() < MIN_ENCRYPT_DST {
+        return Err(io::Error::other(
+            "TLS destination buffer too small to hold one record",
+        ));
+    }
+    let conn = tls_conn
+        .conn
+        .as_unbuffered_mut()
+        .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+
+    let hint = if conn.chunk_basis == dst.len() && conn.max_plaintext_per_chunk > 0 {
+        conn.max_plaintext_per_chunk
+    } else {
+        dst.len()
+    };
+    let mut chunk = plaintext.len().min(hint.max(1));
+
+    // Set only when rustls actually made us shrink. A short final send would
+    // otherwise cache its own tiny size as the connection's ceiling and every
+    // later send would start from there. The cache only ever shrinks for a
+    // given `dst` size, so a one-off inflation of `required_size` — a queued
+    // `key_update` riding along in the same buffer — leaves it slightly
+    // pessimistic until `dst` changes. That costs a few bytes per record, not
+    // correctness.
+    let mut learned: Option<usize> = None;
+
+    let (kind, incoming, _) = conn.split_mut();
+    let result = match kind {
+        UnbufferedKind::Server(c) => {
+            encrypt_with(c, incoming, plaintext, dst, &mut chunk, &mut learned)
+        }
+        UnbufferedKind::Client(c) => {
+            encrypt_with(c, incoming, plaintext, dst, &mut chunk, &mut learned)
+        }
+    };
+    let written = result?;
+
+    if let Some(learned) = learned {
+        let conn = tls_conn
+            .conn
+            .as_unbuffered_mut()
+            .expect("engine checked above");
+        conn.chunk_basis = dst.len();
+        conn.max_plaintext_per_chunk = learned;
+    }
+    Ok((chunk, written))
+}
+
+/// Obtain `WriteTraffic` and encrypt, shrinking `chunk` until the ciphertext
+/// fits `dst`. Returns bytes written into `dst`.
+///
+/// The state machine is entered exactly once and the retries reuse the same
+/// `WriteTraffic`. Re-entering `process_tls_records` between attempts would be
+/// wrong, not just wasteful: a failed `encrypt` has already moved a queued
+/// `key_update` reply into `sendable_tls` (`write_plaintext` calls
+/// `perhaps_write_key_update` before `check_required_size`), so the next
+/// `process_tls_records` would hand back `EncodeTlsData` instead of
+/// `WriteTraffic` and the retry would fail the send. Holding the state means
+/// the successful attempt flushes that record into `dst` itself.
+fn encrypt_with<C: UnbufferedEngine>(
+    conn: &mut C,
+    incoming: &mut CiphertextBuf,
+    plaintext: &[u8],
+    dst: &mut [u8],
+    chunk: &mut usize,
+    learned: &mut Option<usize>,
+) -> io::Result<usize> {
+    let status = conn.process(incoming.pending());
+    let discard = status.discard;
+    let result = match status.state {
+        Ok(ConnectionState::WriteTraffic(mut wt)) => loop {
+            match wt.encrypt(&plaintext[..*chunk], dst) {
+                Ok(n) => break Ok(n),
+                Err(EncryptError::InsufficientSize(need)) => {
+                    // Scale down proportionally, and always shrink by at least
+                    // one byte so the loop cannot stall.
+                    let scaled = chunk
+                        .saturating_mul(dst.len())
+                        .checked_div(need.required_size.max(1))
+                        .unwrap_or(0);
+                    let next = scaled.min(chunk.saturating_sub(1));
+                    if next == 0 {
+                        break Err(io::Error::other(
+                            "TLS destination buffer too small to hold one record",
+                        ));
+                    }
+                    *chunk = next;
+                    *learned = Some(next);
+                }
+                // Narrower than it looks: TLS 1.3 key exhaustion queues a
+                // `key_update` and keeps going, so this is only reached when
+                // the record layer refuses outright (or on TLS 1.2, which
+                // cannot rekey). Either way the connection is finished — there
+                // is no smaller payload that would succeed.
+                Err(EncryptError::EncryptExhausted) => {
+                    break Err(io::Error::other(
+                        "TLS traffic keys exhausted; connection must close",
+                    ));
+                }
+            }
+        },
+        // Not in steady state. The send path never sees these for a
+        // handshaked connection (ringline only hands out a ConnCtx after the
+        // handshake completes), so this is a guard, not a workflow.
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "TLS connection not ready to encrypt application data",
+        )),
+        Err(e) => Err(io::Error::other(e)),
+    };
+    incoming.discard(discard);
+    result
+}
+
+/// Encrypt all of `plaintext`, appending ciphertext to `out`. The mio backend
+/// and the unit tests use this; io_uring encrypts into pool slots instead
+/// (`encrypt_to_sends_unbuffered`, a later task).
+pub(crate) fn encrypt_to_vec(
+    tls_conn: &mut TlsConn,
+    plaintext: &[u8],
+    out: &mut Vec<u8>,
+) -> io::Result<()> {
+    // One record's worth of destination per call: large enough that the
+    // fragmenter amortizes its per-call setup, small enough that a failed
+    // shrink is cheap. Chunk size is an internal knob by design — see
+    // docs/tls-unbuffered-design.md, open question 1.
+    const DST: usize = 32 * 1024;
+    let mut offset = 0;
+    while offset < plaintext.len() {
+        let start = out.len();
+        out.resize(start + DST, 0);
+        // Every exit below trims `out` back: on failure the caller must not be
+        // handed the zeroed scratch this resize appended.
+        let (used_pt, used_ct) =
+            match encrypt_chunk(tls_conn, &plaintext[offset..], &mut out[start..]) {
+                Ok(used) => used,
+                Err(e) => {
+                    out.truncate(start);
+                    return Err(e);
+                }
+            };
+        if used_pt == 0 {
+            out.truncate(start);
+            return Err(io::Error::other("TLS encryption made no progress"));
+        }
+        out.truncate(start + used_ct);
+        offset += used_pt;
+    }
+    Ok(())
+}
+
 /// Move any stashed plaintext into `sink`, oldest first. Returns `false` if
 /// the sink hit its bound — the chunk is left in the stash and the caller must
 /// kill the connection, matching `drain_tls_plaintext`'s contract.
@@ -790,41 +979,6 @@ mod tests {
         (client_completions, server_completions)
     }
 
-    /// Test-only: drive to `WriteTraffic` and encrypt `plaintext` into `dst` in
-    /// one call, returning the ciphertext length. The real send path — with
-    /// chunk sizing against a pool slot — is a later task; this exists so the
-    /// recv-side sink bound can be tested before it lands.
-    fn encrypt_one_shot(
-        kind: &mut super::UnbufferedKind,
-        incoming: &mut super::CiphertextBuf,
-        plaintext: &[u8],
-        dst: &mut [u8],
-    ) -> usize {
-        match kind {
-            super::UnbufferedKind::Server(c) => encrypt_with(c, incoming, plaintext, dst),
-            super::UnbufferedKind::Client(c) => encrypt_with(c, incoming, plaintext, dst),
-        }
-    }
-
-    fn encrypt_with<C: super::UnbufferedEngine>(
-        conn: &mut C,
-        incoming: &mut super::CiphertextBuf,
-        plaintext: &[u8],
-        dst: &mut [u8],
-    ) -> usize {
-        let status = conn.process(incoming.pending());
-        assert_eq!(
-            status.discard, 0,
-            "a completed handshake leaves no ciphertext to discard"
-        );
-        match status.state {
-            Ok(super::ConnectionState::WriteTraffic(mut wt)) => wt
-                .encrypt(plaintext, dst)
-                .expect("dst is sized for the payload"),
-            _ => panic!("expected WriteTraffic after a completed handshake"),
-        }
-    }
-
     // A full handshake completes when each side's output is fed to the other
     // and both are driven by `drive()` alone. Both report
     // HandshakeJustCompleted exactly once.
@@ -859,12 +1013,7 @@ mod tests {
         // ciphertext goes in through one `CiphertextBuf::append`, which
         // debug-asserts a `MAX_SINGLE_APPEND` (64 KiB) bound.
         let plaintext = vec![0x7Eu8; 32 * 1024];
-        let mut cipher = vec![0u8; 48 * 1024];
-        let n = {
-            let (kind, incoming, _) = client.conn.as_unbuffered_mut().unwrap().split_mut();
-            encrypt_one_shot(kind, incoming, &plaintext, &mut cipher)
-        };
-        cipher.truncate(n);
+        let cipher = encrypt_all(&mut client, &plaintext);
 
         let (_, incoming, _) = server.conn.as_unbuffered_mut().unwrap().split_mut();
         incoming
@@ -950,7 +1099,7 @@ mod tests {
     }
 
     /// Test-only: queue a close_notify alert into `dst`, returning its length.
-    /// Reaches `WriteTraffic` the same way `encrypt_one_shot` does, so a test
+    /// Reaches `WriteTraffic` the way [`super::encrypt_chunk`] does, so a test
     /// can produce a close in the same feed as a handshake completion. The
     /// engine's real close path is a later task.
     fn close_notify_one_shot(
@@ -978,15 +1127,12 @@ mod tests {
         }
     }
 
-    /// Encrypt one application-data record on `conn`, returning its ciphertext.
-    fn encrypt_record(conn: &mut TlsConn, plaintext: &[u8]) -> Vec<u8> {
-        let mut buf = vec![0u8; plaintext.len() + 1024];
-        let n = {
-            let (kind, incoming, _) = conn.conn.as_unbuffered_mut().unwrap().split_mut();
-            encrypt_one_shot(kind, incoming, plaintext, &mut buf)
-        };
-        buf.truncate(n);
-        buf
+    /// Encrypt `plaintext` on `from`, returning all of its ciphertext, through
+    /// the same entry point the mio backend uses.
+    fn encrypt_all(from: &mut TlsConn, plaintext: &[u8]) -> Vec<u8> {
+        let mut cipher = Vec::new();
+        super::encrypt_to_vec(from, plaintext, &mut cipher).expect("encrypt");
+        cipher
     }
 
     // A feed that both completes the handshake and sees close_notify must
@@ -1009,7 +1155,7 @@ mod tests {
 
         let record = vec![0x5Au8; 8 * 1024];
         while coalesced.len() <= MAX_SINGLE_APPEND {
-            coalesced.extend_from_slice(&encrypt_record(&mut client, &record));
+            coalesced.extend_from_slice(&encrypt_all(&mut client, &record));
         }
         let mut alert = vec![0u8; 1024];
         let n = {
@@ -1073,9 +1219,9 @@ mod tests {
         handshake(&mut server, &mut client, &mut accs);
 
         // Encrypted in the order they are fed; TLS records are sequenced.
-        let marker = encrypt_record(&mut client, &[0xA1u8; 16]);
-        let held = encrypt_record(&mut client, &[0xB2u8; 2000]);
-        let next = encrypt_record(&mut client, &[0xC3u8; 2000]);
+        let marker = encrypt_all(&mut client, &[0xA1u8; 16]);
+        let held = encrypt_all(&mut client, &[0xB2u8; 2000]);
+        let next = encrypt_all(&mut client, &[0xC3u8; 2000]);
 
         // `cap == live + additional` is the tightest cap that still admits the
         // append on retry, so `append` must refuse it while `marker`'s
@@ -1136,9 +1282,9 @@ mod tests {
         let mut accs = AccumulatorTable::new(2, 4096);
         handshake(&mut server, &mut client, &mut accs);
 
-        let marker = encrypt_record(&mut client, &[0xA1u8; 16]);
-        let stuck = encrypt_record(&mut client, &[0xB2u8; 2000]);
-        let next = encrypt_record(&mut client, &[0xC3u8; 2000]);
+        let marker = encrypt_all(&mut client, &[0xA1u8; 16]);
+        let stuck = encrypt_all(&mut client, &[0xB2u8; 2000]);
+        let next = encrypt_all(&mut client, &[0xC3u8; 2000]);
 
         // Only half of `stuck` is ever delivered, so rustls buffers it waiting
         // for the rest and discards nothing — no drive can free a byte.
@@ -1168,6 +1314,94 @@ mod tests {
         assert!(
             err.to_string().contains("undrainable"),
             "must be the anti-spin guard, not an unrelated failure: {err}"
+        );
+    }
+
+    // Round-trip: encrypt on the client through the chunking path, decrypt on
+    // the server through `feed`. Exercises multi-record plaintext (> 16 KiB)
+    // so the fragmenter and the chunk-size retry both run.
+    #[test]
+    fn encrypt_round_trips_multi_record_plaintext() {
+        let (mut server, mut client) = conn_pair();
+        let mut accs = AccumulatorTable::new(2, 4 * 1024 * 1024);
+        handshake(&mut server, &mut client, &mut accs);
+        accs.reset(0);
+
+        let plaintext: Vec<u8> = (0..300_000u32)
+            .map(|i| i.wrapping_mul(2654435761) as u8)
+            .collect();
+        let cipher = encrypt_all(&mut client, &plaintext);
+
+        let mut out = Vec::new();
+        let mut sink = PlaintextSink::Accumulator(&mut accs);
+        let outcome = feed(&mut server, Some(&mut sink), &mut out, &cipher, 0);
+        assert!(matches!(outcome, DriveOutcome::Ok), "got {outcome:?}");
+        assert_eq!(accs.data(0), &plaintext[..]);
+    }
+
+    // A destination buffer far smaller than one record still makes progress:
+    // the chunk size shrinks from rustls' own `required_size` rather than a
+    // hardcoded overhead constant.
+    #[test]
+    fn encrypt_converges_on_a_small_destination() {
+        let (mut server, mut client) = conn_pair();
+        let mut accs = AccumulatorTable::new(2, 1024 * 1024);
+        handshake(&mut server, &mut client, &mut accs);
+        accs.reset(0);
+
+        let plaintext = vec![0x42u8; 20_000];
+        let mut cipher = Vec::new();
+        let mut offset = 0;
+        // 512-byte destinations: every call must fit, and the loop must
+        // terminate.
+        while offset < plaintext.len() {
+            let mut dst = vec![0u8; 512];
+            let (used_pt, used_ct) =
+                super::encrypt_chunk(&mut client, &plaintext[offset..], &mut dst)
+                    .expect("encrypt into a small buffer");
+            assert!(used_pt > 0, "must make progress");
+            assert!(used_ct <= 512);
+            cipher.extend_from_slice(&dst[..used_ct]);
+            offset += used_pt;
+        }
+
+        let mut out = Vec::new();
+        let mut sink = PlaintextSink::Accumulator(&mut accs);
+        let outcome = feed(&mut server, Some(&mut sink), &mut out, &cipher, 0);
+        assert!(matches!(outcome, DriveOutcome::Ok), "got {outcome:?}");
+        assert_eq!(accs.data(0), &plaintext[..]);
+    }
+
+    // A short send must not teach the connection a small chunk size. The cache
+    // is a starting point for every later send on the connection and only ever
+    // shrinks, so a 100-byte send that cached its own size would fragment
+    // every subsequent send into 100-byte records with no way back.
+    #[test]
+    fn a_short_send_does_not_poison_the_chunk_cache() {
+        let (mut server, mut client) = conn_pair();
+        let mut accs = AccumulatorTable::new(2, 4096);
+        handshake(&mut server, &mut client, &mut accs);
+
+        // Two big sends against the same destination size: the first learns
+        // the ceiling, the second confirms it has converged.
+        let big = vec![0x11u8; 64 * 1024];
+        let mut dst = vec![0u8; 4096];
+        super::encrypt_chunk(&mut client, &big, &mut dst).expect("encrypt");
+        let (converged, _) = super::encrypt_chunk(&mut client, &big, &mut dst).expect("encrypt");
+        assert!(
+            converged > 1024,
+            "a 4 KiB destination fits far more than that"
+        );
+
+        // A short send, same destination size.
+        let (used, _) =
+            super::encrypt_chunk(&mut client, &[0x22u8; 100], &mut dst).expect("encrypt");
+        assert_eq!(used, 100);
+
+        let (after, _) = super::encrypt_chunk(&mut client, &big, &mut dst).expect("encrypt");
+        assert_eq!(
+            after, converged,
+            "a short send must not shrink the cached chunk size"
         );
     }
 
