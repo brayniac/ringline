@@ -22,7 +22,7 @@ Within the core crate, the main boundaries are:
 - The portable executor and async API: `runtime/`, including `ConnCtx`, task
   slabs, timers, channels, futures, and wakers.
 - Shared connection and buffer state: `connection.rs`, `accumulator.rs`,
-  `recv/`, `handler.rs`, `buffer/`, and `tls.rs`.
+  `recv/`, `handler.rs`, `buffer/`, and `tls/`.
 - The io_uring backend: `backend/uring/`, with its ring wrapper, provided-buffer
   rings, driver, and completion-driven event loop.
 - The Mio backend: `backend/mio/`, with its poll driver and readiness-driven

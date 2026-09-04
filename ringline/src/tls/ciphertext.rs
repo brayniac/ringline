@@ -1,0 +1,415 @@
+//! Incoming-ciphertext buffer for the unbuffered TLS engine.
+//!
+//! rustls' `process_tls_records` takes a contiguous `&mut [u8]` whose front is
+//! the next unprocessed byte, and requires the caller to remove `discard` bytes
+//! from that front before calling again. A wrapping ring cannot satisfy the
+//! contiguity requirement, and a naive `drain(..discard)` memmoves the
+//! remainder on every call — the O(N*K) shape fixed in #279.
+//!
+//! This is a linear buffer with a start offset: `discard` is O(1). Relocation
+//! (compaction) is amortized O(1) per byte because compaction only runs when
+//! it pays for itself — when the bytes it moves are no more than the bytes it
+//! reclaims (`start >= live`) — and it is tried *before* growth, so the
+//! resident allocation tracks the working set rather than ballooning to `cap`.
+//! A buffer that is full of *live* data (no productive compaction possible and
+//! no room left to grow within `cap`) returns `WouldBlock` from `append`
+//! rather than degrading into an unamortized memmove; the caller must drain
+//! before appending more. `MIN_CIPHERTEXT_CAP` is sized so that `WouldBlock`
+//! can only fire when the caller already holds a complete, drainable message —
+//! see its doc comment for the argument. Halving it reintroduces a remotely
+//! triggerable hang.
+//!
+//! Callers must not `append` between reading an `UnbufferedStatus` from
+//! `process_tls_records` and calling the corresponding `discard`: `discard`'s
+//! byte count is relative to the slice length at the moment that status was
+//! produced, and an intervening `append` would shift what it actually removes.
+
+use std::io;
+
+/// Largest single TLS record rustls will deframe: a 5-byte header, a 16 KiB
+/// payload, and a 2 KiB overhead budget (AEAD expansion / TLS 1.2 explicit
+/// nonce / content-type byte) — rustls 0.23's `MAX_WIRE_SIZE`, not RFC 8446's
+/// smaller 2^14 + 256.
+#[allow(dead_code)] // Wired up by the unbuffered engine; see docs/journal/2026-09-unbuffered-tls.md
+pub(crate) const MAX_TLS_WIRE_RECORD: usize = 5 + 16_384 + 2_048;
+
+/// Largest live set rustls may leave unprocessed. Its unbuffered path joins
+/// handshake messages spanning records *inside the caller's buffer*, up to
+/// `MAX_HANDSHAKE_SIZE` (0xffff), returning `discard == 0` until the message
+/// completes. Until then the caller cannot drain a byte.
+#[allow(dead_code)] // Wired up by the unbuffered engine; see docs/journal/2026-09-unbuffered-tls.md
+pub(crate) const MAX_UNPROCESSABLE: usize = 0xffff + MAX_TLS_WIRE_RECORD;
+
+/// Largest single `append` the recv path may perform. `append` itself
+/// enforces this (`debug_assert`) because `MIN_CIPHERTEXT_CAP`'s no-deadlock
+/// derivation assumes it: the engine's recv buffer must be sized at or below
+/// this so every `append` call stays within the bound the derivation relies
+/// on.
+#[allow(dead_code)] // Wired up by the unbuffered engine; see docs/journal/2026-09-unbuffered-tls.md
+pub(crate) const MAX_SINGLE_APPEND: usize = 64 * 1024;
+
+/// Minimum workable `cap`.
+///
+/// Sized so `WouldBlock` can never fire while the engine is stuck. `WouldBlock`
+/// implies `live > (cap - additional)/2`; with this floor that exceeds
+/// `MAX_UNPROCESSABLE`, so a refused append proves the caller already holds a
+/// complete message and can drain. Halve this and you get a remotely
+/// triggerable hang: a peer positions `start` with application data, then sends
+/// a large incomplete handshake flight.
+#[allow(dead_code)] // Wired up by the unbuffered engine; see docs/journal/2026-09-unbuffered-tls.md
+pub(crate) const MIN_CIPHERTEXT_CAP: usize = 2 * MAX_UNPROCESSABLE + MAX_SINGLE_APPEND;
+
+/// Allocation a fully drained buffer falls back to. Above
+/// `MAX_TLS_WIRE_RECORD` so a single max-size record cannot trigger a
+/// grow/shrink cycle on every exchange.
+#[allow(dead_code)] // Wired up by the unbuffered engine; see docs/journal/2026-09-unbuffered-tls.md
+pub(crate) const INITIAL_SHRINK_TO: usize = 32 * 1024;
+
+/// Contiguous buffer of received ciphertext awaiting `process_tls_records`.
+#[allow(dead_code)] // Wired up by the unbuffered engine; see docs/journal/2026-09-unbuffered-tls.md
+pub(crate) struct CiphertextBuf {
+    buf: Vec<u8>,
+    /// First unprocessed byte.
+    start: usize,
+    /// One past the last byte written.
+    end: usize,
+    /// Hard ceiling on `buf.len()`.
+    cap: usize,
+    /// Caller-requested starting allocation, honored again by the post-drain
+    /// shrink target (not just on construction).
+    initial: usize,
+    /// Total bytes relocated by compaction. Diagnostic; asserted by tests to
+    /// stay linear in throughput.
+    bytes_moved: u64,
+}
+
+#[allow(dead_code)] // Wired up by the unbuffered engine; see docs/journal/2026-09-unbuffered-tls.md
+impl CiphertextBuf {
+    /// `initial` is the starting allocation; `cap` the hard ceiling, raised to
+    /// [`MIN_CIPHERTEXT_CAP`] if smaller. Tests may pass a smaller `cap` via
+    /// [`Self::with_cap_unchecked`].
+    pub(crate) fn new(initial: usize, cap: usize) -> Self {
+        Self::with_cap_unchecked(initial, cap.max(MIN_CIPHERTEXT_CAP))
+    }
+
+    /// Construct without raising `cap` to the floor. Tests only: a `cap` below
+    /// [`MIN_CIPHERTEXT_CAP`] cannot hold a real handshake flight, and can
+    /// deadlock — see the module doc.
+    pub(crate) fn with_cap_unchecked(initial: usize, cap: usize) -> Self {
+        Self {
+            buf: vec![0u8; initial.min(cap)],
+            start: 0,
+            end: 0,
+            cap,
+            initial,
+            bytes_moved: 0,
+        }
+    }
+
+    /// Unprocessed bytes, as the contiguous slice to hand to rustls.
+    pub(crate) fn pending(&mut self) -> &mut [u8] {
+        &mut self.buf[self.start..self.end]
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.end - self.start
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.start == self.end
+    }
+
+    pub(crate) fn bytes_moved(&self) -> u64 {
+        self.bytes_moved
+    }
+
+    /// Current backing allocation size (not the same as `len()`; includes
+    /// already-consumed and not-yet-written capacity).
+    pub(crate) fn capacity(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// Drop `n` bytes from the front, per rustls' `UnbufferedStatus::discard`
+    /// contract. O(1): the data does not move. `n` must not exceed the
+    /// currently pending length — panics rather than silently clamping, since
+    /// a caller that over-discards has a bug that would otherwise desync the
+    /// TLS record stream and surface later as an unrelated `bad_record_mac`.
+    pub(crate) fn discard(&mut self, n: usize) {
+        assert!(
+            n <= self.len(),
+            "discard {n} exceeds {} pending bytes",
+            self.len()
+        );
+        self.start += n;
+        if self.start == self.end {
+            self.start = 0;
+            self.end = 0;
+            // Hysteresis: only release a genuinely oversized allocation, so a
+            // connection oscillating near the threshold does not churn. This
+            // is a deliberate memory-for-churn trade, not a bug: a connection
+            // that saw exactly one flight sized just at or under 4x target
+            // (e.g. a single 64 KiB handshake against the default 32 KiB
+            // target) stays resident at that size rather than shrinking, in
+            // exchange for not reallocating on every exchange near the
+            // threshold. Measured at 4x: 4 reallocations per 500 flight/drain
+            // cycles; tightening the `>` to `>=` would catch that one-flight
+            // case but pushes the same measurement to ~1000 reallocations.
+            let target = self.initial.max(INITIAL_SHRINK_TO).min(self.cap);
+            if self.buf.len() > 4 * target {
+                self.buf = vec![0u8; target];
+            }
+            debug_assert!(self.buf.len() <= self.cap);
+        }
+    }
+
+    /// Append received ciphertext.
+    ///
+    /// All-or-nothing: on error nothing is consumed, so a caller that gets
+    /// `WouldBlock` must retain the chunk and retry after draining, or the
+    /// bytes are lost.
+    ///
+    /// `ErrorKind::WouldBlock` means the buffer is full of live data — drain
+    /// via `process_tls_records` + `discard` and retry. It is not fatal, and
+    /// it can persist across many appends (until `start` catches up to
+    /// `live`), so the caller must not spin on it.
+    ///
+    /// `ErrorKind::InvalidData` means the append cannot ever fit within `cap`
+    /// — a protocol error; close the connection.
+    pub(crate) fn append(&mut self, src: &[u8]) -> io::Result<()> {
+        debug_assert!(
+            src.len() <= MAX_SINGLE_APPEND,
+            "append of {} bytes exceeds MAX_SINGLE_APPEND ({MAX_SINGLE_APPEND}); \
+             MIN_CIPHERTEXT_CAP's no-deadlock derivation assumes this bound",
+            src.len()
+        );
+        if self.end + src.len() > self.buf.len() {
+            self.make_room(src.len())?;
+        }
+        let end = self.end;
+        self.buf[end..end + src.len()].copy_from_slice(src);
+        self.end += src.len();
+        Ok(())
+    }
+
+    /// Ensure `additional` bytes fit after `end`.
+    ///
+    /// Compaction is tried first, and only when it pays for itself
+    /// (`start >= live`, so bytes moved never exceed bytes reclaimed) — that
+    /// is what bounds relocation to O(1) amortized per byte, and it keeps the
+    /// resident allocation proportional to the working set rather than to
+    /// `cap`. Growth is the fallback when compaction would move more than it
+    /// reclaims.
+    ///
+    /// Every error path returns before any mutation. That is structural here,
+    /// not incidental: once `compact()` runs, `end == live` and
+    /// `live + additional <= cap` was already checked, so the remainder cannot
+    /// fail. Preserve that if you touch this.
+    fn make_room(&mut self, additional: usize) -> io::Result<()> {
+        let live = self.len();
+        if live + additional > self.cap {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "TLS ciphertext exceeds the configured buffer cap",
+            ));
+        }
+        if self.end + additional <= self.buf.len() {
+            return Ok(()); // already fits at the tail
+        }
+
+        if self.start >= live {
+            // Compaction pays for itself.
+            self.compact();
+            if self.end + additional > self.buf.len() {
+                self.grow_to(self.end + additional);
+            }
+            return Ok(());
+        }
+
+        // Compaction would move more than it reclaims; grow instead.
+        let needed = self.end + additional;
+        if needed > self.cap {
+            // Full of live data. By the MIN_CIPHERTEXT_CAP argument, `live`
+            // here exceeds MAX_UNPROCESSABLE whenever `cap` respects that
+            // floor, so the caller holds at least one complete message and
+            // can drain. The argument is conditional on the floor, so only
+            // check it when `cap` actually observes it -- `with_cap_unchecked`
+            // exists precisely to let tests use a smaller `cap` that can
+            // legitimately WouldBlock on a live set below MAX_UNPROCESSABLE
+            // (that is the deadlock risk its own doc comment calls out, not a
+            // bug here). If this assert ever fires with `cap >=
+            // MIN_CIPHERTEXT_CAP`, the floor's derivation is wrong and the
+            // connection would deadlock.
+            debug_assert!(
+                self.cap < MIN_CIPHERTEXT_CAP || live > MAX_UNPROCESSABLE,
+                "WouldBlock with an unprocessable live set ({live} bytes) despite \
+                 cap ({}) respecting the floor: would deadlock",
+                self.cap
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "TLS ciphertext buffer full; drain before appending",
+            ));
+        }
+        self.grow_to(needed);
+        Ok(())
+    }
+
+    /// Resize to hold at least `needed` bytes, never exceeding `cap`.
+    fn grow_to(&mut self, needed: usize) {
+        debug_assert!(needed <= self.cap, "grow_to past the cap");
+        let new_len = needed.next_power_of_two().min(self.cap).max(needed);
+        self.buf.resize(new_len, 0);
+        debug_assert!(self.buf.len() <= self.cap, "allocation exceeded the cap");
+    }
+
+    fn compact(&mut self) {
+        if self.start == 0 {
+            return;
+        }
+        let live = self.len();
+        self.buf.copy_within(self.start..self.end, 0);
+        self.bytes_moved += live as u64;
+        self.start = 0;
+        self.end = live;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn append_then_pending_returns_what_was_written() {
+        let mut b = CiphertextBuf::with_cap_unchecked(64, 1024);
+        b.append(b"hello").unwrap();
+        assert_eq!(b.pending(), b"hello");
+        assert_eq!(b.len(), 5);
+    }
+
+    #[test]
+    fn discard_advances_without_moving_bytes() {
+        let mut b = CiphertextBuf::with_cap_unchecked(64, 1024);
+        b.append(b"abcdef").unwrap();
+        b.discard(2);
+        assert_eq!(b.pending(), b"cdef");
+        assert_eq!(b.bytes_moved(), 0, "a partial discard must not compact");
+    }
+
+    #[test]
+    fn full_discard_resets_to_the_front() {
+        let mut b = CiphertextBuf::with_cap_unchecked(64, 1024);
+        b.append(b"abcdef").unwrap();
+        b.discard(6);
+        assert!(b.is_empty());
+        b.append(b"xy").unwrap();
+        assert_eq!(b.pending(), b"xy");
+        assert_eq!(b.bytes_moved(), 0, "reset is free; nothing to move");
+    }
+
+    #[test]
+    fn append_grows_up_to_the_cap() {
+        let mut b = CiphertextBuf::with_cap_unchecked(8, 1024);
+        let big = vec![7u8; 500];
+        b.append(&big).unwrap();
+        assert_eq!(b.len(), 500);
+        assert_eq!(b.pending(), &big[..]);
+    }
+
+    #[test]
+    fn append_beyond_cap_is_an_error_and_leaves_the_buffer_intact() {
+        let mut b = CiphertextBuf::with_cap_unchecked(8, 64);
+        b.append(b"keep").unwrap();
+        assert!(b.append(&[0u8; 128]).is_err());
+        assert_eq!(
+            b.pending(),
+            b"keep",
+            "a failed append must not corrupt state"
+        );
+    }
+
+    #[test]
+    fn compaction_reclaims_the_consumed_prefix() {
+        // Fill to capacity, consume most of it, then append again: the buffer
+        // must reclaim the prefix rather than fail.
+        let mut b = CiphertextBuf::with_cap_unchecked(16, 16);
+        b.append(&[1u8; 16]).unwrap();
+        b.discard(12);
+        b.append(&[2u8; 12]).unwrap();
+        assert_eq!(b.len(), 16);
+        assert_eq!(&b.pending()[..4], &[1u8; 4]);
+        assert_eq!(&b.pending()[4..], &[2u8; 12]);
+    }
+
+    /// The anti-#279 test. Streaming N bytes through the buffer in small
+    /// chunks must move O(N) bytes in total, not O(N^2). A naive
+    /// `drain(..discard)` moves the remainder on every call and fails this.
+    #[test]
+    fn streaming_moves_bytes_at_most_a_constant_factor_of_throughput() {
+        const CHUNK: usize = 64;
+        const ROUNDS: usize = 4096;
+        const TOTAL: u64 = (CHUNK * ROUNDS) as u64;
+
+        let mut b = CiphertextBuf::with_cap_unchecked(4096, 1 << 20);
+        for _ in 0..ROUNDS {
+            b.append(&[0u8; CHUNK]).unwrap();
+            // Consume all but a 16-byte "partial record" remainder, the
+            // pathological shape: never empty, so never a free reset.
+            let keep = 16.min(b.len());
+            let n = b.len() - keep;
+            b.discard(n);
+        }
+
+        assert!(
+            b.bytes_moved() <= 4 * TOTAL,
+            "moved {} bytes to stream {TOTAL}; compaction is not amortized",
+            b.bytes_moved()
+        );
+    }
+
+    /// The regression test for the unguarded second compaction. The existing
+    /// streaming test runs at ~0% occupancy, where the bound holds trivially;
+    /// this one runs the buffer nearly full, which is where it did not.
+    #[test]
+    fn high_occupancy_streaming_stays_amortized() {
+        const CAP: usize = 64 * 1024;
+        const CHUNK: usize = 1448; // MTU-sized segments
+        let live_target = CAP * 9 / 10;
+
+        let mut b = CiphertextBuf::with_cap_unchecked(CAP, CAP);
+        b.append(&vec![0u8; live_target]).unwrap();
+
+        let mut throughput = 0u64;
+        for _ in 0..2000 {
+            if b.append(&[0u8; CHUNK]).is_err() {
+                b.discard(CHUNK.min(b.len()));
+                continue;
+            }
+            throughput += CHUNK as u64;
+            b.discard(CHUNK.min(b.len()));
+        }
+
+        assert!(
+            b.bytes_moved() <= 4 * throughput.max(1),
+            "moved {} bytes for {throughput} of throughput at 90% occupancy",
+            b.bytes_moved()
+        );
+    }
+
+    #[test]
+    fn allocation_never_exceeds_the_cap() {
+        // Reach grow_to *after* a compaction that pays for itself
+        // (start=10 >= live=8) -- the path where a stale, pre-compaction
+        // `needed` used to defeat the `.min(cap)` clamp and overshoot the cap
+        // (verified against 453bc21: this exact sequence resizes to 41 there).
+        let mut b = CiphertextBuf::with_cap_unchecked(24, 32);
+        b.append(&[1u8; 18]).unwrap();
+        b.discard(10);
+        b.append(&[2u8; 23]).unwrap();
+        assert_eq!(b.len(), 31);
+        assert!(
+            b.capacity() <= 32,
+            "allocation {} exceeded cap 32",
+            b.capacity()
+        );
+    }
+}
