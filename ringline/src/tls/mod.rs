@@ -16,7 +16,7 @@
 //! only the methods rustls exposes through `CommonState` and that are
 //! actually reachable that way from every engine's connection type — so the
 //! feature-gated [`TlsConnKind::Unbuffered`] variant (wrapping
-//! [`unbuffered::UnbufferedKind`]) adds a match arm to those, rather than
+//! [`unbuffered::UnbufferedConn`]) adds a match arm to those, rather than
 //! forcing every caller to unwrap an engine first. `TlsConn`, `TlsTable` and
 //! `drain_tls_plaintext` still assume a buffered connection wherever they
 //! reach past `TlsConnKind` (e.g. `reader()` for plaintext draining, or

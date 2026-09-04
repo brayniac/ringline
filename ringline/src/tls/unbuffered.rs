@@ -8,7 +8,7 @@
 //! this module exists so the
 //! `tls-unbuffered` feature builds and is exercised by CI from the start.
 //!
-//! `TlsConnKind` now carries an [`UnbufferedKind`] arm (see `tls/mod.rs`), so
+//! `TlsConnKind` now carries an [`UnbufferedConn`] arm (see `tls/mod.rs`), so
 //! this engine is constructible and reachable through the shared
 //! `CommonState` accessors — but nothing yet feeds it ciphertext or drives a
 //! handshake. `TlsConn`, `TlsTable` and `drain_tls_plaintext` still assume
@@ -107,15 +107,18 @@ impl UnbufferedKind {
     // `TlsTable::send_close_notify_queued`, its one caller.
 }
 
-/// A TLS connection driven by the unbuffered engine, with the two pieces of
-/// state the buffered engine keeps inside rustls: the incoming-ciphertext
-/// buffer `process_tls_records` deframes out of, and a stash for plaintext
-/// that surfaced on a path with nowhere to put it.
+/// A TLS connection driven by the unbuffered engine, alongside the state the
+/// buffered engine instead keeps inside rustls: the incoming-ciphertext
+/// buffer, a stash for plaintext that surfaced on a path with nowhere to put
+/// it, and a chunk-sizing cache the send path will use once `encrypt` lands
+/// (write-only until then).
 pub struct UnbufferedConn {
     kind: UnbufferedKind,
-    /// Received ciphertext awaiting `process_tls_records`. Sized from the
-    /// module constants rather than a `Config` knob — see
-    /// `docs/superpowers/plans/2026-09-04-unbuffered-tls-engine.md`.
+    /// Received ciphertext awaiting `process_tls_records`. Deliberately sized
+    /// from the module constants rather than a `Config` knob: the cap only has
+    /// to clear `MIN_CIPHERTEXT_CAP`'s no-deadlock floor, and adding public
+    /// surface for it would be hard to walk back. Revisit if a rig sweep shows
+    /// the cap binding — see `docs/journal/2026-09-unbuffered-tls.md`.
     incoming: CiphertextBuf,
     /// Plaintext popped from `ReadTraffic` while no [`super::PlaintextSink`]
     /// was available (i.e. the send path drove the state machine and found
