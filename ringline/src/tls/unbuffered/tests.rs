@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use rustls::pki_types::ServerName;
 
-use super::{DriveOutcome, MAX_SINGLE_APPEND, UnbufferedConn, drive, feed};
+use super::{DriveOutcome, MAX_SINGLE_APPEND, UnbufferedConn, drive, feed, queue_close_notify};
 use crate::accumulator::AccumulatorTable;
 use crate::tls::{PlaintextSink, TlsConn, TlsConnKind};
 
@@ -265,35 +265,6 @@ fn handshake_holding_client_flight(
     to_server
 }
 
-/// Test-only: queue a close_notify alert into `dst`, returning its length.
-/// Reaches `WriteTraffic` the way [`super::encrypt_chunk`] does, so a test
-/// can produce a close in the same feed as a handshake completion. The
-/// engine's real close path is a later task.
-fn close_notify_one_shot(
-    kind: &mut super::UnbufferedKind,
-    incoming: &mut super::CiphertextBuf,
-    dst: &mut [u8],
-) -> usize {
-    match kind {
-        super::UnbufferedKind::Server(c) => close_notify_with(c, incoming, dst),
-        super::UnbufferedKind::Client(c) => close_notify_with(c, incoming, dst),
-    }
-}
-
-fn close_notify_with<C: super::UnbufferedEngine>(
-    conn: &mut C,
-    incoming: &mut super::CiphertextBuf,
-    dst: &mut [u8],
-) -> usize {
-    let status = conn.process(incoming.pending());
-    match status.state {
-        Ok(super::ConnectionState::WriteTraffic(mut wt)) => wt
-            .queue_close_notify(dst)
-            .expect("dst is sized for a close_notify alert"),
-        _ => panic!("expected WriteTraffic after a completed handshake"),
-    }
-}
-
 /// Encrypt `plaintext` on `from`, returning all of its ciphertext, through
 /// the same entry point the mio backend uses.
 fn encrypt_all(from: &mut TlsConn, plaintext: &[u8]) -> Vec<u8> {
@@ -324,12 +295,10 @@ fn handshake_completion_outranks_a_close_in_the_same_feed() {
     while coalesced.len() <= MAX_SINGLE_APPEND {
         coalesced.extend_from_slice(&encrypt_all(&mut client, &record));
     }
-    let mut alert = vec![0u8; 1024];
-    let n = {
-        let (kind, incoming, _) = client.conn.as_unbuffered_mut().unwrap().split_mut();
-        close_notify_one_shot(kind, incoming, &mut alert)
-    };
-    coalesced.extend_from_slice(&alert[..n]);
+    let mut alert = Vec::new();
+    queue_close_notify(&mut client, &mut alert).expect("queue close_notify");
+    assert!(!alert.is_empty(), "the close must be a real alert");
+    coalesced.extend_from_slice(&alert);
     assert!(
         coalesced.len() > MAX_SINGLE_APPEND,
         "the alert must fall in a later chunk than the flight"
@@ -345,6 +314,50 @@ fn handshake_completion_outranks_a_close_in_the_same_feed() {
     assert!(
         server.peer_sent_close_notify,
         "the close must still be recorded on the connection"
+    );
+}
+
+// A queued close_notify is a real encrypted alert: the peer sees it as a
+// clean close (PeerClosed -> Closed), not as a truncation.
+#[test]
+fn close_notify_is_seen_as_a_clean_close() {
+    let (mut server, mut client) = conn_pair();
+    let mut accs = AccumulatorTable::new(2, 1024 * 1024);
+    handshake(&mut server, &mut client, &mut accs);
+    accs.reset(0);
+
+    let mut alert = Vec::new();
+    queue_close_notify(&mut client, &mut alert).expect("queue close_notify");
+    assert!(!alert.is_empty(), "close_notify must produce ciphertext");
+    assert!(client.close_notify_sent);
+
+    let mut out = Vec::new();
+    let mut sink = PlaintextSink::Accumulator(&mut accs);
+    let outcome = feed(&mut server, Some(&mut sink), &mut out, &alert, 0);
+    assert!(matches!(outcome, DriveOutcome::Closed), "got {outcome:?}");
+    assert!(
+        server.peer_sent_close_notify,
+        "eof_truncated() depends on this flag being set"
+    );
+}
+
+// Closing a connection that never reached traffic state is a clean no-op,
+// not an error: there is no alert to encrypt, so nothing is queued and the
+// close-notify deadline is not armed for a record that was never sent. The
+// teardown path calls this unconditionally, including on connections that
+// died mid-handshake.
+#[test]
+fn close_notify_on_a_handshaking_connection_queues_nothing() {
+    let (mut server, _client) = conn_pair();
+    let mut out = Vec::new();
+    queue_close_notify(&mut server, &mut out).expect("a mid-handshake close is not an error");
+    assert!(
+        out.is_empty(),
+        "there is nothing to queue before traffic state"
+    );
+    assert!(
+        !server.close_notify_sent,
+        "arming the close deadline for an unsent alert invents a stall"
     );
 }
 

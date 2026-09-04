@@ -805,6 +805,105 @@ pub(crate) fn encrypt_to_vec(
     Ok(())
 }
 
+/// Encrypt a close_notify alert, appending it to `out`.
+///
+/// The caller routes `out` through the per-connection send queue, so the alert
+/// serializes behind any in-flight send and the deferred Close fires only once
+/// it completes — identical to the buffered path's contract, and to the
+/// `close_notify_timeout_ms` deadline armed alongside it.
+///
+/// The unbuffered engine has no `send_close_notify`: `CommonState`'s is
+/// unreachable from `UnbufferedConnectionCommon` (`Deref` but no `DerefMut`),
+/// and rustls expresses the operation as `WriteTraffic::queue_close_notify`
+/// instead — reachable only from inside the `process_tls_records` state
+/// machine. See `UnbufferedKind`'s note and `docs/tls-unbuffered-design.md`
+/// ("### close_notify").
+///
+/// A connection that never reached traffic state, or that is already closed,
+/// has nothing to queue: `out` is left untouched and `close_notify_sent` stays
+/// false. That is not an error — the caller is tearing the connection down
+/// either way, and arming the close-notify deadline for an alert that was
+/// never sent would only invent a stall to time out on.
+pub(crate) fn queue_close_notify(tls_conn: &mut TlsConn, out: &mut Vec<u8>) -> io::Result<()> {
+    let conn = tls_conn
+        .conn
+        .as_unbuffered_mut()
+        .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let (kind, incoming, _) = conn.split_mut();
+    let written = match kind {
+        UnbufferedKind::Server(c) => close_notify_with(c, incoming, out),
+        UnbufferedKind::Client(c) => close_notify_with(c, incoming, out),
+    }?;
+    if written > 0 {
+        tls_conn.close_notify_sent = true;
+    }
+    Ok(())
+}
+
+/// Obtain `WriteTraffic` and queue a close_notify into `out`. Returns the
+/// bytes appended.
+///
+/// Like `encrypt`, `queue_close_notify` is all-or-nothing on its output: too
+/// small a buffer writes nothing and reports the exact `required_size`. So the
+/// first attempt deliberately offers *no* room and takes rustls' answer, rather
+/// than guessing a size that would be either wrong or needlessly padded — the
+/// alert's wire length depends on the negotiated cipher suite and TLS version.
+/// `required_size` is strictly greater than the buffer that was refused, so the
+/// retry loop cannot fail to make progress.
+///
+/// The state machine is entered exactly once and the retry reuses the same
+/// `WriteTraffic`, for the same reason [`encrypt_with`] does — more sharply
+/// here: `eager_send_close_notify` queues the alert into `sendable_tls` *before*
+/// it checks the size, so a re-entered `process_tls_records` would find that
+/// queue non-empty and hand back `EncodeTlsData` instead of `WriteTraffic`,
+/// and the retry would silently report "nothing to queue" with the alert
+/// stranded inside rustls (verified against rustls 0.23.41's
+/// `CommonState::eager_send_close_notify` and `process_tls_records_common`).
+///
+/// Anything rustls had already queued for sending rides out in `out` ahead of
+/// the alert, because `write_fragments` drains `sendable_tls` into the front of
+/// the destination and `check_required_size` reserves the room for it. So `out`
+/// is transmitted as-is; there is nothing to flush afterwards, and driving the
+/// machine again to look would emit those records *after* the alert on the
+/// wire.
+fn close_notify_with<C: UnbufferedEngine>(
+    conn: &mut C,
+    incoming: &mut CiphertextBuf,
+    out: &mut Vec<u8>,
+) -> io::Result<usize> {
+    let start = out.len();
+    let status = conn.process(incoming.pending());
+    let discard = status.discard;
+    let result = match status.state {
+        Ok(ConnectionState::WriteTraffic(mut wt)) => {
+            let mut room = 0;
+            loop {
+                out.resize(start + room, 0);
+                match wt.queue_close_notify(&mut out[start..]) {
+                    Ok(n) => break Ok(n),
+                    Err(EncryptError::InsufficientSize(need)) => room = need.required_size,
+                    Err(e) => break Err(io::Error::other(e.to_string())),
+                }
+            }
+        }
+        // Already closed, or never reached traffic state: nothing to queue.
+        Ok(_) => Ok(0),
+        Err(e) => Err(io::Error::other(e)),
+    };
+    // `status` is dead here, so the ciphertext buffer is free again.
+    incoming.discard(discard);
+    match result {
+        Ok(n) => {
+            out.truncate(start + n);
+            Ok(n)
+        }
+        Err(e) => {
+            out.truncate(start);
+            Err(e)
+        }
+    }
+}
+
 /// Move any stashed plaintext into `sink`, oldest first. Returns `false` if
 /// the sink hit its bound — the chunk is left in the stash and the caller must
 /// kill the connection, matching `drain_tls_plaintext`'s contract.
