@@ -21,11 +21,13 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use rustls::client::UnbufferedClientConnection;
+use rustls::client::{ClientConnectionData, UnbufferedClientConnection};
 use rustls::pki_types::ServerName;
-use rustls::server::UnbufferedServerConnection;
+use rustls::server::{ServerConnectionData, UnbufferedServerConnection};
+use rustls::unbuffered::{ConnectionState, EncodeError, UnbufferedStatus};
 
 use super::ciphertext::{CiphertextBuf, INITIAL_SHRINK_TO, MIN_CIPHERTEXT_CAP};
+use super::{PlaintextSink, TlsConn};
 
 /// A rustls connection driven through the *unbuffered* API
 /// (`process_tls_records` + `WriteTraffic::encrypt`).
@@ -187,14 +189,313 @@ impl UnbufferedConn {
     }
 }
 
+/// `process_tls_records` is implemented separately on
+/// `UnbufferedConnectionCommon<ClientConnectionData>` and
+/// `<ServerConnectionData>` (the shared body is private), and
+/// `ConnectionState<'_, '_, Data>` differs between them — so one non-generic
+/// function cannot match on both. This trait dispatches once, at the top of
+/// [`drive`], and the state machine below monomorphizes over `Data`.
+trait UnbufferedEngine {
+    type Data;
+    fn process<'c, 'i>(
+        &'c mut self,
+        incoming: &'i mut [u8],
+    ) -> UnbufferedStatus<'c, 'i, Self::Data>;
+}
+
+impl UnbufferedEngine for UnbufferedClientConnection {
+    type Data = ClientConnectionData;
+    fn process<'c, 'i>(
+        &'c mut self,
+        incoming: &'i mut [u8],
+    ) -> UnbufferedStatus<'c, 'i, Self::Data> {
+        self.process_tls_records(incoming)
+    }
+}
+
+impl UnbufferedEngine for UnbufferedServerConnection {
+    type Data = ServerConnectionData;
+    fn process<'c, 'i>(
+        &'c mut self,
+        incoming: &'i mut [u8],
+    ) -> UnbufferedStatus<'c, 'i, Self::Data> {
+        self.process_tls_records(incoming)
+    }
+}
+
+/// What [`drive`] observed. Mapped to `TlsRecvResult` by the backend wiring.
+#[derive(Debug)]
+#[allow(dead_code)] // Wired to the backends in Task 6.
+pub(crate) enum DriveOutcome {
+    /// The machine ran to a blocking state with nothing else to report.
+    Ok,
+    /// The handshake completed on this call (edge-triggered, once).
+    HandshakeJustCompleted,
+    /// The peer sent close_notify, or the connection is fully closed.
+    Closed,
+    /// Fatal: the connection must be torn down.
+    Error(rustls::Error),
+}
+
+/// Drive the unbuffered state machine until it blocks.
+///
+/// Handshake ciphertext (`EncodeTlsData`) is appended to `out`; the caller
+/// transmits it in order. Decrypted plaintext goes to `sink` — `None` on the
+/// send path, where any plaintext found is stashed on the connection instead
+/// (see [`UnbufferedConn::pending_plaintext`]).
+///
+/// Application data is *not* encrypted here: that is the send path's
+/// `WriteTraffic::encrypt`, which writes straight into a pool slot. `out` only
+/// ever carries handshake records and alerts.
+#[allow(dead_code)] // Wired to the backends in Task 6.
+pub(crate) fn drive(
+    tls_conn: &mut TlsConn,
+    mut sink: Option<&mut PlaintextSink<'_>>,
+    out: &mut Vec<u8>,
+    conn_index: u32,
+) -> DriveOutcome {
+    let was_handshaking = !tls_conn.handshake_complete;
+
+    // Anything stashed by an earlier sink-less drive comes out first, so the
+    // application sees one ordered byte stream.
+    if let Some(s) = sink.as_deref_mut()
+        && !drain_pending_plaintext(tls_conn, s, conn_index)
+    {
+        return DriveOutcome::Error(rustls::Error::General(
+            "recv accumulator limit exceeded".into(),
+        ));
+    }
+
+    let Some(conn) = tls_conn.conn.as_unbuffered_mut() else {
+        return DriveOutcome::Error(rustls::Error::General(
+            "connection not driven by the unbuffered TLS engine".into(),
+        ));
+    };
+    let (kind, incoming, pending) = conn.split_mut();
+
+    // `sink` moves into whichever arm runs — the arms are exclusive, so no
+    // reborrow is needed here.
+    let (outcome, peer_closed) = match kind {
+        UnbufferedKind::Server(c) => drive_inner(c, incoming, pending, sink, out, conn_index),
+        UnbufferedKind::Client(c) => drive_inner(c, incoming, pending, sink, out, conn_index),
+    };
+
+    if peer_closed {
+        tls_conn.peer_sent_close_notify = true;
+    }
+    if matches!(outcome, DriveOutcome::Error(_)) {
+        return outcome;
+    }
+    if was_handshaking && !tls_conn.conn.is_handshaking() {
+        tls_conn.handshake_complete = true;
+        return DriveOutcome::HandshakeJustCompleted;
+    }
+    outcome
+}
+
+/// The state machine proper, monomorphized per connection role.
+///
+/// Returns the outcome plus whether the peer's close_notify was observed (the
+/// caller owns `TlsConn`'s flags; this function only sees the rustls half).
+fn drive_inner<C: UnbufferedEngine>(
+    conn: &mut C,
+    incoming: &mut CiphertextBuf,
+    pending: &mut VecDeque<Vec<u8>>,
+    mut sink: Option<&mut PlaintextSink<'_>>,
+    out: &mut Vec<u8>,
+    conn_index: u32,
+) -> (DriveOutcome, bool) {
+    let mut peer_closed = false;
+    let mut closed = false;
+    let mut sink_overflow = false;
+
+    loop {
+        let status = conn.process(incoming.pending());
+        let mut discard = status.discard;
+        // `blocked` means the machine cannot progress without more input from
+        // the peer or another call from us; that is the loop's exit condition.
+        let mut blocked = false;
+        let mut error: Option<rustls::Error> = None;
+
+        match status.state {
+            Err(e) => {
+                error = Some(e);
+            }
+            Ok(ConnectionState::ReadTraffic(mut rt)) => {
+                while let Some(record) = rt.next_record() {
+                    match record {
+                        Ok(r) => {
+                            // rustls' contract: this is *additional* discard on
+                            // top of `UnbufferedStatus::discard`. Zero in
+                            // 0.23.41; honoured so an in-place-decryption
+                            // release does not silently desynchronise us.
+                            discard += r.discard;
+                            match sink.as_deref_mut() {
+                                Some(PlaintextSink::Accumulator(accs)) => {
+                                    if !accs.append(conn_index, r.payload) {
+                                        sink_overflow = true;
+                                        break;
+                                    }
+                                }
+                                #[cfg(has_io_uring)]
+                                Some(PlaintextSink::Segments {
+                                    hold,
+                                    outstanding,
+                                    max,
+                                }) => {
+                                    if outstanding.saturating_add(r.payload.len()) > *max {
+                                        sink_overflow = true;
+                                        break;
+                                    }
+                                    hold.push_back(crate::backend::HeldRecvBuf::Owned(
+                                        bytes::Bytes::copy_from_slice(r.payload),
+                                    ));
+                                    *outstanding += r.payload.len();
+                                }
+                                None => pending.push_back(r.payload.to_vec()),
+                            }
+                        }
+                        Err(e) => {
+                            error = Some(e);
+                            break;
+                        }
+                    }
+                }
+            }
+            Ok(ConnectionState::EncodeTlsData(mut enc)) => {
+                // `encode` is all-or-nothing and needs one contiguous buffer,
+                // which can exceed a send-pool slot — hence the scratch `Vec`.
+                // Handshake-only; the data path never comes through here.
+                let start = out.len();
+                let mut room = out.capacity().saturating_sub(start).max(1024);
+                loop {
+                    out.resize(start + room, 0);
+                    match enc.encode(&mut out[start..]) {
+                        Ok(n) => {
+                            out.truncate(start + n);
+                            break;
+                        }
+                        Err(EncodeError::InsufficientSize(need)) => {
+                            room = need.required_size;
+                        }
+                        Err(e) => {
+                            out.truncate(start);
+                            error = Some(rustls::Error::General(e.to_string()));
+                            break;
+                        }
+                    }
+                }
+            }
+            Ok(ConnectionState::TransmitTlsData(mut transmit)) => {
+                // Everything encoded so far is in `out`, and the caller queues
+                // `out` through the per-connection send queue before any later
+                // record — so from rustls' point of view it is transmitted.
+                // `may_encrypt_app_data` is deliberately not consulted:
+                // ringline exposes no early-data API, so there is never app
+                // data waiting at this point.
+                let _ = transmit.may_encrypt_app_data();
+                transmit.done();
+            }
+            Ok(ConnectionState::BlockedHandshake) => blocked = true,
+            Ok(ConnectionState::WriteTraffic(_)) => blocked = true,
+            Ok(ConnectionState::PeerClosed) => {
+                peer_closed = true;
+            }
+            Ok(ConnectionState::Closed) => {
+                closed = true;
+                blocked = true;
+            }
+            Ok(ConnectionState::ReadEarlyData(_)) => {
+                // Ringline exposes no 0-RTT API. Treated as a protocol error
+                // rather than silently dropped, per the design doc.
+                error = Some(rustls::Error::General(
+                    "TLS early data received but not supported".into(),
+                ));
+            }
+            // `ConnectionState` is `#[non_exhaustive]`: a rustls upgrade can
+            // introduce a state this loop does not know how to service.
+            // Failing the connection beats spinning on it forever.
+            Ok(_) => {
+                error = Some(rustls::Error::General(
+                    "unhandled rustls unbuffered connection state".into(),
+                ));
+            }
+        }
+
+        // `status` is dead here, so the ciphertext buffer is free again.
+        incoming.discard(discard);
+
+        if let Some(e) = error {
+            return (DriveOutcome::Error(e), peer_closed);
+        }
+        if sink_overflow {
+            return (
+                DriveOutcome::Error(rustls::Error::General(
+                    "recv accumulator limit exceeded".into(),
+                )),
+                peer_closed,
+            );
+        }
+        if blocked {
+            break;
+        }
+    }
+
+    if closed || peer_closed {
+        (DriveOutcome::Closed, peer_closed)
+    } else {
+        (DriveOutcome::Ok, peer_closed)
+    }
+}
+
+/// Move any stashed plaintext into `sink`, oldest first. Returns `false` if
+/// the sink hit its bound — the chunk is left in the stash and the caller must
+/// kill the connection, matching `drain_tls_plaintext`'s contract.
+fn drain_pending_plaintext(
+    tls_conn: &mut TlsConn,
+    sink: &mut PlaintextSink<'_>,
+    conn_index: u32,
+) -> bool {
+    let Some(conn) = tls_conn.conn.as_unbuffered_mut() else {
+        return true;
+    };
+    let (_, _, pending) = conn.split_mut();
+    while let Some(chunk) = pending.front() {
+        match sink {
+            PlaintextSink::Accumulator(accs) => {
+                if !accs.append(conn_index, chunk) {
+                    return false;
+                }
+            }
+            #[cfg(has_io_uring)]
+            PlaintextSink::Segments {
+                hold,
+                outstanding,
+                max,
+            } => {
+                if outstanding.saturating_add(chunk.len()) > *max {
+                    return false;
+                }
+                *outstanding += chunk.len();
+                hold.push_back(crate::backend::HeldRecvBuf::Owned(
+                    bytes::Bytes::copy_from_slice(chunk),
+                ));
+            }
+        }
+        pending.pop_front();
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use rustls::pki_types::ServerName;
 
-    use super::UnbufferedConn;
-    use crate::tls::{TlsConn, TlsConnKind};
+    use super::{DriveOutcome, UnbufferedConn, drive};
+    use crate::accumulator::AccumulatorTable;
+    use crate::tls::{PlaintextSink, TlsConn, TlsConnKind};
 
     fn empty_client_config() -> Arc<rustls::ClientConfig> {
         rustls::ClientConfig::builder()
@@ -232,5 +533,126 @@ mod tests {
         let (_kind, incoming, pending) = conn.split_mut();
         assert!(incoming.is_empty());
         assert!(pending.is_empty());
+    }
+
+    fn test_certs() -> (
+        Vec<rustls::pki_types::CertificateDer<'static>>,
+        rustls::pki_types::PrivateKeyDer<'static>,
+    ) {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+        let cert_der = rustls::pki_types::CertificateDer::from(cert.cert);
+        (vec![cert_der], key.into())
+    }
+
+    fn conn_pair() -> (TlsConn, TlsConn) {
+        let (certs, key) = test_certs();
+        let server_config = Arc::new(
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(certs.clone(), key)
+                .unwrap(),
+        );
+        let mut roots = rustls::RootCertStore::empty();
+        for c in &certs {
+            roots.add(c.clone()).unwrap();
+        }
+        let client_config: Arc<rustls::ClientConfig> = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth()
+            .into();
+        let name: ServerName<'static> = "localhost".try_into().unwrap();
+
+        let wrap = |c| TlsConn {
+            conn: TlsConnKind::Unbuffered(c),
+            handshake_complete: false,
+            peer_sent_close_notify: false,
+            close_notify_sent: false,
+        };
+        (
+            wrap(UnbufferedConn::new_server(server_config).unwrap()),
+            wrap(UnbufferedConn::new_client(client_config, name).unwrap()),
+        )
+    }
+
+    /// Push `bytes` into `to`'s ciphertext buffer and drive it, collecting its
+    /// own output. Returns (outcome, output ciphertext).
+    fn pump(
+        to: &mut TlsConn,
+        bytes: &[u8],
+        accs: &mut AccumulatorTable,
+    ) -> (DriveOutcome, Vec<u8>) {
+        if !bytes.is_empty() {
+            let (_, incoming, _) = to.conn.as_unbuffered_mut().unwrap().split_mut();
+            incoming
+                .append(bytes)
+                .expect("test appends stay under the cap");
+        }
+        let mut out = Vec::new();
+        let mut sink = PlaintextSink::Accumulator(accs);
+        let outcome = drive(to, Some(&mut sink), &mut out, 0);
+        (outcome, out)
+    }
+
+    // A full handshake completes when each side's output is fed to the other
+    // and both are driven by `drive()` alone. Both report
+    // HandshakeJustCompleted exactly once.
+    #[test]
+    fn drive_completes_a_handshake() {
+        let (mut server, mut client) = conn_pair();
+        let mut accs = AccumulatorTable::new(2, 4096);
+
+        let mut client_completions = 0;
+        let mut server_completions = 0;
+
+        // Client speaks first (ClientHello) with no input.
+        let (outcome, mut to_server) = pump(&mut client, &[], &mut accs);
+        if matches!(outcome, DriveOutcome::HandshakeJustCompleted) {
+            client_completions += 1;
+        }
+        assert!(!to_server.is_empty(), "client must emit a ClientHello");
+
+        let mut to_client = Vec::new();
+        for _ in 0..10 {
+            if !to_server.is_empty() {
+                let (o, out) = pump(&mut server, &to_server, &mut accs);
+                assert!(!matches!(o, DriveOutcome::Error(_)), "server drive: {o:?}");
+                if matches!(o, DriveOutcome::HandshakeJustCompleted) {
+                    server_completions += 1;
+                }
+                to_server.clear();
+                to_client = out;
+            }
+            if !to_client.is_empty() {
+                let (o, out) = pump(&mut client, &to_client, &mut accs);
+                assert!(!matches!(o, DriveOutcome::Error(_)), "client drive: {o:?}");
+                if matches!(o, DriveOutcome::HandshakeJustCompleted) {
+                    client_completions += 1;
+                }
+                to_client.clear();
+                to_server = out;
+            }
+            if !server.conn.is_handshaking() && !client.conn.is_handshaking() {
+                break;
+            }
+        }
+
+        assert!(!client.conn.is_handshaking(), "client handshake stalled");
+        assert!(!server.conn.is_handshaking(), "server handshake stalled");
+        assert!(client.handshake_complete);
+        assert!(server.handshake_complete);
+        assert_eq!(client_completions, 1, "completion must be edge-triggered");
+        assert_eq!(server_completions, 1, "completion must be edge-triggered");
+    }
+
+    // `BlockedHandshake` with nothing to send is a quiet return, not an error
+    // and not a spin: a freshly-created server has no input and emits nothing.
+    #[test]
+    fn drive_on_a_blocked_server_is_quiet() {
+        let (mut server, _client) = conn_pair();
+        let mut accs = AccumulatorTable::new(2, 4096);
+        let (outcome, out) = pump(&mut server, &[], &mut accs);
+        assert!(matches!(outcome, DriveOutcome::Ok), "got {outcome:?}");
+        assert!(out.is_empty());
     }
 }
