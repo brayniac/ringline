@@ -649,10 +649,27 @@ fn tls_info_accessors() {
     );
     // rustls ServerConnection::server_name() returns the SNI hostname from the
     // client's ClientHello.  The client above used "localhost" as ServerName.
+    //
+    // The unbuffered engine cannot answer this: rustls exposes no equivalent of
+    // `ServerConnection::server_name()` on `UnbufferedServerConnection`
+    // (verified against rustls 0.23.41 — it lives only on the buffered type and
+    // on the handshake-callback `ClientHello`). That is the documented
+    // limitation on `TlsInfo::sni_hostname`, and recovering it needs a
+    // `ClientHello` callback on `ServerConfig`. Assert the documented value in
+    // each build rather than dropping the check, so a regression to `None` on
+    // the buffered path still fails here and an unbuffered engine that starts
+    // reporting SNI fails too, prompting the doc to be corrected.
+    #[cfg(not(feature = "tls-unbuffered"))]
     assert_eq!(
         snap.sni_hostname.as_deref(),
         Some("localhost"),
         "sni_hostname() should reflect the client's SNI value"
+    );
+    #[cfg(feature = "tls-unbuffered")]
+    assert_eq!(
+        snap.sni_hostname.as_deref(),
+        None,
+        "the unbuffered engine has no SNI accessor; see TlsInfo::sni_hostname"
     );
 }
 
@@ -783,6 +800,281 @@ fn tls_segmented_recv_reassembles_and_eofs() {
     assert!(
         saw_eof,
         "segmented TLS reader did not observe EOF (Ok(None)) after clean close"
+    );
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
+// ── Test 5: Server-initiated clean TLS close ────────────────────────────
+
+/// Echo one message, then close the connection from the server side.
+#[cfg(not(has_io_uring))]
+struct TlsCloseHandler;
+
+#[cfg(not(has_io_uring))]
+impl AsyncEventHandler for TlsCloseHandler {
+    #[allow(clippy::manual_async_fn)]
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            conn.with_data(|data| {
+                let _ = conn.send_nowait(data);
+                ParseResult::Consumed(data.len())
+            })
+            .await;
+            conn.close();
+        }
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        TlsCloseHandler
+    }
+}
+
+/// A ringline TLS server closing a connection must emit a close_notify alert
+/// before the FIN, so the peer can tell a clean shutdown from a truncation
+/// attack. Both engines owe this; they produce the alert differently (the
+/// buffered engine queues it with `send_close_notify`, the unbuffered one
+/// encrypts it through `WriteTraffic::queue_close_notify`), so this is the
+/// guard on the close path being engine-aware at all.
+///
+/// The assertion is `peer_has_closed()`, not "the read returned 0": a server
+/// that sends only a FIN also ends the client's reads, and rustls reports that
+/// as `UnexpectedEof` instead.
+///
+/// **mio only, and not because the contract is mio's.** `ConnCtx::close()`
+/// calls `Driver::close_connection`, and only the mio one reaches a TLS close
+/// path (`finish_close` → `flush_tls_output_mio_direct`). The io_uring
+/// `close_connection` just marks `close_pending`; the close_notify queueing
+/// lives in `DriverCtx::close(ConnToken)` instead, which `ConnCtx::close()`
+/// does not go through — so an io_uring server closing from inside its handler
+/// sends a bare FIN today. That gap predates the unbuffered engine (this test
+/// fails against the *buffered* engine on io_uring too) and fixing it is not
+/// this change's business; the gate is here so the guard on the path that does
+/// work is not lost.
+#[cfg(not(has_io_uring))]
+#[test]
+fn tls_server_close_sends_close_notify() {
+    let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
+
+    let (certs, key) = generate_self_signed();
+    let server_config = server_tls_config(certs.clone(), key);
+
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let config = test_config_builder()
+        .tls(TlsConfig::new(server_config))
+        .build()
+        .expect("valid config");
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind(addr.parse().unwrap())
+        .launch::<TlsCloseHandler>()
+        .expect("launch failed");
+
+    wait_for_server(&addr);
+
+    let client_config = client_tls_config(&certs);
+    let server_name: ServerName<'_> = "localhost".try_into().unwrap();
+    let mut tls_conn = rustls::ClientConnection::new(client_config, server_name).unwrap();
+    let mut tcp = TcpStream::connect(&addr).unwrap();
+    tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    tcp.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    {
+        let mut stream = rustls::Stream::new(&mut tls_conn, &mut tcp);
+        let msg = b"close me";
+        stream.write_all(msg).unwrap();
+        stream.flush().unwrap();
+        let mut buf = [0u8; 8];
+        stream.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, msg, "echo mismatch before close");
+    }
+
+    // Drain the rest of the connection by hand: `rustls::Stream` maps both a
+    // clean close and a truncation to a read of 0, which is exactly the
+    // distinction under test.
+    //
+    // Check before reading as well as after. The alert can arrive in the same
+    // TCP segment as the echo, in which case `Stream::read_exact` above already
+    // fed it to the deframer and there is nothing left on the socket — a loop
+    // that only inspected the state after a fresh read would see the FIN and
+    // wrongly report a truncation (this raced roughly one run in three).
+    let mut peer_closed = tls_conn
+        .process_new_packets()
+        .expect("server sent a malformed record")
+        .peer_has_closed();
+    while !peer_closed {
+        match tls_conn.read_tls(&mut tcp) {
+            Ok(0) => break, // FIN
+            Ok(_) => {}
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) => panic!("read_tls failed: {e}"),
+        }
+        peer_closed = tls_conn
+            .process_new_packets()
+            .expect("server sent a malformed record after echoing")
+            .peer_has_closed();
+    }
+
+    assert!(
+        peer_closed,
+        "server closed without close_notify — the peer cannot distinguish a \
+         clean shutdown from a truncated stream"
+    );
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
+// ── Test 6: Server-initiated clean TLS close from on_tick (io_uring) ─────
+
+/// Where `on_accept` parks the connection's `ConnToken` for `on_tick` to close.
+#[cfg(has_io_uring)]
+static TLS_TICK_CLOSE_TOKEN: Mutex<Option<ringline::ConnToken>> = Mutex::new(None);
+
+/// Echo one message, then hand the token to `on_tick`, which closes the
+/// connection through `DriverCtx::close`.
+///
+/// The task deliberately does **not** call `ConnCtx::close()`. That is a
+/// different path: it routes to `Driver::close_connection`, which on io_uring
+/// only sets `close_pending` and never queues close_notify, so a server closing
+/// that way emits a bare FIN. That gap predates the unbuffered engine and
+/// reproduces against the buffered one; this test is not about it.
+#[cfg(has_io_uring)]
+struct TlsTickCloseHandler;
+
+#[cfg(has_io_uring)]
+impl AsyncEventHandler for TlsTickCloseHandler {
+    #[allow(clippy::manual_async_fn)]
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            // Echo once so the connection reaches full TLS traffic state —
+            // `WriteTraffic::queue_close_notify` is only reachable there, and a
+            // handshaking connection would have no alert to produce.
+            conn.with_data(|data| {
+                let _ = conn.send_nowait(data);
+                ParseResult::Consumed(data.len())
+            })
+            .await;
+            *TLS_TICK_CLOSE_TOKEN.lock().unwrap() = Some(conn.token());
+            // Park until the connection goes away rather than returning, which
+            // would close it from the task side and race the tick-driven close
+            // under test.
+            loop {
+                if conn.with_data(|d| ParseResult::Consumed(d.len())).await == 0 {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn on_tick(&mut self, ctx: &mut ringline::DriverCtx<'_>) {
+        if let Some(token) = TLS_TICK_CLOSE_TOKEN.lock().unwrap().take() {
+            ctx.close(token);
+        }
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        TlsTickCloseHandler
+    }
+}
+
+/// A ringline TLS server closing a connection from `on_tick` must emit a
+/// close_notify alert before the FIN, so the peer can tell a clean shutdown
+/// from a truncation attack. Both engines owe this and produce the alert
+/// differently (the buffered engine queues it with `send_close_notify`, the
+/// unbuffered one encrypts it through `WriteTraffic::queue_close_notify`), so
+/// this is the guard on `TlsTable::send_close_notify_queued` dispatching by
+/// engine at all — it must pass in the default build and under
+/// `--features tls-unbuffered`.
+///
+/// **io_uring only, and `DriverCtx::close` specifically.** That is the
+/// handler-facing close reachable from `on_tick`/`on_notify` against any live
+/// connection, and it is the only io_uring path that queues close_notify.
+/// `ConnCtx::close()` from inside the task does not reach it — see
+/// [`TlsTickCloseHandler`]. The mio sibling is
+/// `tls_server_close_sends_close_notify`, which drives its backend's
+/// equivalent path.
+///
+/// The assertion is `peer_has_closed()`, not "the read returned 0": a server
+/// that sends only a FIN also ends the client's reads, and rustls reports that
+/// as `UnexpectedEof` instead.
+#[cfg(has_io_uring)]
+#[test]
+fn tls_tick_close_sends_close_notify() {
+    let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
+    *TLS_TICK_CLOSE_TOKEN.lock().unwrap() = None;
+
+    let (certs, key) = generate_self_signed();
+    let server_config = server_tls_config(certs.clone(), key);
+
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let config = test_config_builder()
+        .tls(TlsConfig::new(server_config))
+        .build()
+        .expect("valid config");
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind(addr.parse().unwrap())
+        .launch::<TlsTickCloseHandler>()
+        .expect("launch failed");
+
+    wait_for_server(&addr);
+
+    let client_config = client_tls_config(&certs);
+    let server_name: ServerName<'_> = "localhost".try_into().unwrap();
+    let mut tls_conn = rustls::ClientConnection::new(client_config, server_name).unwrap();
+    let mut tcp = TcpStream::connect(&addr).unwrap();
+    tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    tcp.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    {
+        let mut stream = rustls::Stream::new(&mut tls_conn, &mut tcp);
+        let msg = b"close me";
+        stream.write_all(msg).unwrap();
+        stream.flush().unwrap();
+        let mut buf = [0u8; 8];
+        stream.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, msg, "echo mismatch before close");
+    }
+
+    // Drain the rest of the connection by hand: `rustls::Stream` maps both a
+    // clean close and a truncation to a read of 0, which is exactly the
+    // distinction under test.
+    //
+    // Check before reading as well as after. The alert can arrive in the same
+    // TCP segment as the echo, in which case `Stream::read_exact` above already
+    // fed it to the deframer and there is nothing left on the socket — a loop
+    // that only inspected the state after a fresh read would see the FIN and
+    // wrongly report a truncation (this raced roughly one run in three on the
+    // mio sibling).
+    let mut peer_closed = tls_conn
+        .process_new_packets()
+        .expect("server sent a malformed record")
+        .peer_has_closed();
+    while !peer_closed {
+        match tls_conn.read_tls(&mut tcp) {
+            Ok(0) => break, // FIN
+            Ok(_) => {}
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) => panic!("read_tls failed: {e}"),
+        }
+        peer_closed = tls_conn
+            .process_new_packets()
+            .expect("server sent a malformed record after echoing")
+            .peer_has_closed();
+    }
+
+    assert!(
+        peer_closed,
+        "server closed from on_tick without close_notify — the peer cannot \
+         distinguish a clean shutdown from a truncated stream"
     );
 
     shutdown.shutdown();

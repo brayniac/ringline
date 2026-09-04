@@ -1,9 +1,9 @@
 # Unbuffered TLS send path — design
 
-**Status:** Draft / design — foundation shipped (PR #338), engine not yet built.
-Three sections carry `> **Correction (PR #338)**` blocks where building the
-foundation falsified what was written here; read those before planning the
-engine.
+**Status:** Implemented behind the default-off `tls-unbuffered` feature (PRs
+#338, #341, #345, and this engine). Interop testing and the chunk-size rig
+sweep remain. The `> **Correction**` blocks below record where building it
+falsified the design; read those before extending it.
 **Date:** 2026-09-03 (corrections 2026-09-04)
 **Related:** [`docs/syscalls-and-copies.md`](syscalls-and-copies.md), [`docs/send-completion-design.md`](send-completion-design.md), `ringline/src/tls/`
 **Follow-on:** kTLS (kernel TLS offload) — see *Why this is the stepping stone to kTLS*
@@ -321,6 +321,46 @@ one. Out of scope.
 | `Closed` | Terminal — close the connection. |
 | `ReadEarlyData` | Not supported. Ringline exposes no 0-RTT API; treated as a protocol error rather than silently ignored. |
 
+> **Correction (this engine).** Three things above did not survive building it.
+>
+> **`EncodeTlsData` does not "encode into a pool slot" on io_uring.**
+> `EncodeTlsData::encode` needs one contiguous `&mut [u8]` and takes no
+> `io::Write`, so a full-size handshake record can outgrow a single
+> `send_copy_slot_size` slot before the code even knows how many slots it will
+> need. Handshake output is encoded into a scratch `Vec` instead, then chunked
+> across as many pool slots as it takes — one copy more than this row implies,
+> and one more than the buffered engine's `PoolWriter` pays for the same
+> record. Application data does not go through this: `WriteTraffic::encrypt`
+> (steady state, the `ReadTraffic`/`WriteTraffic` rows) still writes straight
+> into the slot. mio has no pool-slot step for either engine, so it is
+> unaffected. See `docs/journal/2026-09-unbuffered-tls.md`, "Plan 3".
+>
+> **This table's per-state actions cannot be one non-generic function.**
+> `process_tls_records` — the call that produces every `ConnectionState` row
+> above — is implemented separately on `UnbufferedClientConnection` and
+> `UnbufferedServerConnection`, and the shared body is private, so
+> `ConnectionState<'_, '_, Data>` differs between the two. The engine needed a
+> private `UnbufferedEngine` trait with an associated `Data` type, dispatched
+> once per `drive()` call, not a single match over both connection kinds.
+>
+> **Retrying a sizing failure by re-entering `process_tls_records` is unsound**,
+> not just awkward as cost 2 in "The costs we take on" implies. `write_plaintext`
+> (`perhaps_write_key_update`) and `eager_send_close_notify`
+> (`send_close_notify`) both queue into `sendable_tls` *before* the caller can
+> even check the required size, and the next `process_tls_records` call pops
+> `sendable_tls` into the *next* `EncodeTlsData` rather than handing back the
+> same `WriteTraffic` — so "get `InsufficientSize`, re-enter, try again" lands
+> in the wrong state and drops what was queued. The close_notify case failed
+> silently this way: the alert stranded inside rustls, `close_notify_sent` was
+> never set, and the connection closed as a truncation instead of cleanly. The
+> engine now enters the state machine once per call and holds `WriteTraffic`
+> across the whole retry loop. The mirror-image mistake — driving the machine
+> again *after* a successful `encrypt`/`queue_close_notify` to flush anything
+> still queued — reorders a pending TLS 1.3 `key_update` to *after* the record
+> it should have preceded, which is `bad_record_mac` at the peer; both
+> `backend_uring.rs` and `backend_mio.rs` carry a top-of-file warning against
+> it.
+
 ### close_notify
 
 `queue_close_notify(outgoing_tls)` encrypts the alert into a pool slot, which is
@@ -474,5 +514,9 @@ offload, which is where the *remaining* copy goes.
    the shared `SendCopyPool` and charging non-TLS users for it.
 2. **`CiphertextBuf` capacity default and its config knob** — reuse
    `recv_buffer_size`, or a dedicated setting?
+
+   **Resolved provisionally:** no new config knob. Every connection gets
+   `CiphertextBuf::new(INITIAL_SHRINK_TO, MIN_CIPHERTEXT_CAP)`. Revisit if the
+   rig sweep shows the cap binding.
 3. **Does the buffered path stay as the mio default** while the unbuffered path
    proves out on the rig, or do both backends switch together?

@@ -169,6 +169,8 @@ Ringline aims to minimize data copies on the hot path. Understanding where copie
 | Accumulator → `with_bytes()` callback | `BytesMut::freeze()` → `Bytes` (O(1)), slicing via `Bytes::slice()` is O(1) refcount | 0 |
 | TLS recv | rustls plaintext drained into accumulator via `BufRead` | 1 |
 
+TLS recv is unchanged at 1 copy under the `tls-unbuffered` feature too: rustls 0.23's unbuffered `ReadTraffic::next_record` pops an owned plaintext chunk rather than decrypting in place, so the copy into the `RecvAccumulator` remains. The `tls-unbuffered` feature only changes the send path.
+
 The key difference: `with_data(|&[u8]|)` provides a borrowed slice — the parser must copy any values it wants to keep. `with_bytes(|Bytes|)` provides a refcounted handle — the parser can return `Bytes::slice()` sub-references with zero copies.
 
 **Send path** (user → kernel):
@@ -179,7 +181,8 @@ The key difference: `with_data(|&[u8]|)` provides a borrowed slice — the parse
 | `send_parts()` with `.copy()` only | All copy parts gathered into one `SendCopyPool` slot | 1 |
 | `send_parts()` with `.guard()` only | Guard memory used in-place via `SendMsgZc` iovec | 0 |
 | `send_parts()` mixed `.copy()` + `.guard()` | Copy parts → pool; guard parts zero-copy via iovec | 1 (copy parts only) |
-| Any send with TLS | Gather plaintext, then rustls encrypts **directly into a pool slot** | 2 |
+| Any send with TLS (buffered engine, default) | Gather plaintext, then rustls encrypts **directly into a pool slot** | 2 |
+| Application-data send with TLS (`tls-unbuffered` feature) | `WriteTraffic::encrypt` writes ciphertext into the pool slot (io_uring) or the queued buffer (mio), reading plaintext from caller memory — no intermediate copy | 1 |
 
 On the mio backend all of these degrade to copy sends (guards are consumed by copying).
 
@@ -214,6 +217,15 @@ Minimal — `with_data()` recv (pattern-match `PONG\r\n`, no value extraction), 
 2. **Send buffer ownership**: Ringline must own all memory referenced by SQEs (the submission must outlive the syscall). `SendCopyPool` provides pre-allocated slots for this. `SendGuard` is the escape hatch for zero-copy — it pins user memory and holds it alive until the kernel confirms completion.
 
 3. **TLS caps out at one extra copy**: encryption must read plaintext and write ciphertext, so `SendGuard` zero-copy is impossible under TLS — but ciphertext is encrypted directly into the send-pool slot (no intermediate scratch buffer), and it is serialized through the per-connection send queue for record ordering.
+
+   The `tls-unbuffered` cargo feature (default off) swaps the record layer for
+   rustls' unbuffered API, which encrypts application data from caller memory
+   straight into the pool slot — one copy instead of two. Recv is unchanged.
+   Handshake ciphertext on io_uring pays one copy *more* than the buffered
+   engine (`EncodeTlsData::encode` needs one contiguous buffer that can exceed
+   a pool slot, so it goes through a scratch `Vec` first) — a one-time
+   per-connection cost, not on the steady-state application-data path. See
+   `docs/tls-unbuffered-design.md`.
 
 4. **Client choice of `with_data` vs `with_bytes`**: This is the single biggest design decision for recv-side copy count. `with_bytes` enables true zero-copy parsing but requires the protocol parser to work with `Bytes` (refcounted slices). `with_data` is simpler but forces a copy.
 

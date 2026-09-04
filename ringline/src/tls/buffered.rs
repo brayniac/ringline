@@ -1,3 +1,13 @@
+// With `tls-unbuffered` on, `TlsTable::create`/`create_client` select the other
+// engine and the dispatchers in `backend_mio`/`backend_uring` never route here,
+// so every item in this file is compiled-but-unselected. That is the point of
+// the feature, not dead code to delete: dropping the feature must bring the
+// whole engine back, and an item-by-item allow would just spell the same
+// statement out nine times. On mio this is invisible (`lib.rs` masks the whole
+// `tls` module); a Linux io_uring build with the feature is what fails
+// `-D warnings` without it.
+#![cfg_attr(feature = "tls-unbuffered", allow(dead_code))]
+
 #[allow(unused_imports)]
 use std::io::{self, Read as _, Write as _};
 #[allow(unused_imports)]
@@ -18,6 +28,16 @@ use super::*;
 
 /// A rustls connection driven through the *buffered* API
 /// (`read_tls` / `process_new_packets` / `write_tls` / `send_close_notify`).
+///
+/// With `tls-unbuffered` on, `TlsTable::create`/`create_client` build the
+/// other engine, so nothing constructs these variants — the buffered engine
+/// is compiled but unselected. That is the point of the feature, not dead
+/// code to delete: dropping the feature must bring the whole engine back.
+/// Subsumed by the module-level allow at the top of this file, and kept
+/// anyway: these two constructors are the root of why the rest of the module
+/// is unselected, so the statement belongs on them even if the file-level
+/// attribute is what silences the lint.
+#[cfg_attr(feature = "tls-unbuffered", allow(dead_code))]
 pub enum BufferedKind {
     Server(ServerConnection),
     Client(ClientConnection),
@@ -120,10 +140,12 @@ impl BufferedKind {
 }
 
 /// Unwrap the buffered engine out of a `TlsConn`. Every `TlsConn` reaching
-/// this module is driven by the buffered engine today (it is the only
-/// engine); this panics rather than threading an `Option` through call sites
+/// this module is driven by the buffered engine: the dispatchers in
+/// `backend_mio`/`backend_uring` only route here in a build where
+/// `TlsTable::create` selects it, so `None` is a routing bug, not a runtime
+/// condition. This panics rather than threading an `Option` through call sites
 /// that don't return `io::Result` (those that do get a fallible version
-/// inline instead — see e.g. `encrypt_to_sends`).
+/// inline instead — see e.g. `encrypt_to_sends_buffered`).
 fn buffered_mut(tls_conn: &mut TlsConn) -> &mut BufferedKind {
     tls_conn
         .conn
@@ -141,7 +163,7 @@ fn buffered_mut(tls_conn: &mut TlsConn) -> &mut BufferedKind {
 /// default `with_data`/`with_bytes` path) or, for a connection in the segmented
 /// recv domain, owned segments pushed to its hold (see [`PlaintextSink`]).
 #[cfg(has_io_uring)]
-pub fn feed_tls_recv(
+pub(super) fn feed_tls_recv_buffered(
     tls_table: &mut TlsTable,
     mut sink: PlaintextSink<'_>,
     send_copy_pool: &mut SendCopyPool,
@@ -262,7 +284,7 @@ pub fn feed_tls_recv(
 /// `&mut TlsTable`. Returns `false` if pool exhaustion prevented draining
 /// all output; sends already appended must still be queued by the caller.
 #[cfg(has_io_uring)]
-pub fn flush_tls_output(
+pub(super) fn flush_tls_output_buffered(
     tls_table: &mut TlsTable,
     send_copy_pool: &mut SendCopyPool,
     conn_index: u32,
@@ -428,7 +450,7 @@ pub(super) fn take_tls_output_sends(
 }
 
 #[cfg(has_io_uring)]
-pub fn encrypt_to_sends(
+pub(super) fn encrypt_to_sends_buffered(
     tls_table: &mut TlsTable,
     send_copy_pool: &mut SendCopyPool,
     conn_index: u32,
@@ -493,13 +515,12 @@ pub fn encrypt_to_sends(
 
 // ── Mio backend TLS helpers ─────────────────────────────────────────────
 
-/// Feed received ciphertext into the TLS connection, decrypt plaintext into
-/// the accumulator, and flush any TLS output (handshake responses, alerts).
-///
-/// Mio version: writes ciphertext directly to the TcpStream instead of
-/// submitting io_uring SQEs.
+/// Buffered-engine half of [`super::backend_mio::feed_tls_recv_mio`]: feed
+/// received ciphertext into the TLS connection, decrypt plaintext into the
+/// accumulator, and queue any TLS output (handshake responses, alerts) onto
+/// the connection's send FIFO.
 #[cfg(not(has_io_uring))]
-pub fn feed_tls_recv_mio(
+pub(super) fn feed_tls_recv_mio_buffered(
     tls_table: &mut TlsTable,
     accumulators: &mut AccumulatorTable,
     pending: &mut std::collections::VecDeque<crate::backend::mio::driver::PendingSend>,
@@ -582,10 +603,10 @@ pub fn feed_tls_recv_mio(
     TlsRecvResult::Ok
 }
 
-/// Flush pending TLS output to the network via direct stream write.
-/// Public entry point takes `&mut TlsTable`.
+/// Buffered-engine half of [`super::backend_mio::flush_tls_output_mio_queued`]:
+/// drain rustls' pending TLS output onto the connection's send FIFO.
 #[cfg(not(has_io_uring))]
-pub fn flush_tls_output_mio_queued(
+pub(super) fn flush_tls_output_mio_queued_buffered(
     tls_table: &mut TlsTable,
     pending: &mut std::collections::VecDeque<crate::backend::mio::driver::PendingSend>,
     conn_index: u32,
@@ -620,11 +641,13 @@ fn flush_tls_output_mio_inner(
     pending.push_back((std::mem::take(write_buf), 0, None));
 }
 
-/// Direct-write flush for close paths (close_notify): the connection is
-/// being torn down, so best-effort nonblocking writes are appropriate —
-/// there is no later flush opportunity.
+/// Buffered-engine half of [`super::backend_mio::flush_tls_output_mio_direct`]:
+/// direct-write flush for close paths (close_notify). The connection is being
+/// torn down, so best-effort nonblocking writes are appropriate — there is no
+/// later flush opportunity. The alert itself was queued by the caller's
+/// `send_close_notify`; this only drains what rustls already holds.
 #[cfg(not(has_io_uring))]
-pub fn flush_tls_output_mio_direct(
+pub(super) fn flush_tls_output_mio_direct_buffered(
     tls_table: &mut TlsTable,
     stream: &mut mio::net::TcpStream,
     conn_index: u32,
@@ -646,12 +669,12 @@ pub fn flush_tls_output_mio_direct(
     }
 }
 
-/// Encrypt plaintext and return the ciphertext for buffered sending.
-/// Mio version: encrypts data and returns ciphertext bytes. The caller
-/// pushes the result into the pending_sends queue for the event loop to
-/// flush when the socket is writable.
+/// Buffered-engine half of [`super::backend_mio::encrypt_for_send_mio`]:
+/// encrypt plaintext and return the ciphertext bytes. The caller pushes the
+/// result into the pending_sends queue for the event loop to flush when the
+/// socket is writable.
 #[cfg(not(has_io_uring))]
-pub fn encrypt_for_send_mio(
+pub(super) fn encrypt_for_send_mio_buffered(
     tls_table: &mut TlsTable,
     conn_index: u32,
     plaintext: &[u8],
@@ -692,7 +715,7 @@ pub fn encrypt_for_send_mio(
 /// Borrow a connection slot and the shared write_buf from a TlsTable simultaneously.
 /// This is the borrow-splitting helper: `conns[i]` and `write_buf` are disjoint fields.
 #[cfg(not(has_io_uring))]
-fn borrow_conn_and_buf(
+pub(super) fn borrow_conn_and_buf(
     table: &mut TlsTable,
     conn_index: u32,
 ) -> (&mut Option<TlsConn>, &mut Vec<u8>) {
