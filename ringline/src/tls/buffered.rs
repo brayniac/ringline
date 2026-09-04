@@ -1,3 +1,13 @@
+// With `tls-unbuffered` on, `TlsTable::create`/`create_client` select the other
+// engine and the dispatchers in `backend_mio`/`backend_uring` never route here,
+// so every item in this file is compiled-but-unselected. That is the point of
+// the feature, not dead code to delete: dropping the feature must bring the
+// whole engine back, and an item-by-item allow would just spell the same
+// statement out nine times. On mio this is invisible (`lib.rs` masks the whole
+// `tls` module); a Linux io_uring build with the feature is what fails
+// `-D warnings` without it.
+#![cfg_attr(feature = "tls-unbuffered", allow(dead_code))]
+
 #[allow(unused_imports)]
 use std::io::{self, Read as _, Write as _};
 #[allow(unused_imports)]
@@ -22,11 +32,11 @@ use super::*;
 /// With `tls-unbuffered` on, `TlsTable::create`/`create_client` build the
 /// other engine, so nothing constructs these variants — the buffered engine
 /// is compiled but unselected. That is the point of the feature, not dead
-/// code to delete: dropping the feature must bring the whole engine back. The
-/// allow is scoped to the two constructors so the rest of the module still
-/// has to justify itself. Invisible on mio, where `lib.rs` masks the whole
-/// `tls` module; a Linux io_uring build with the feature is what fails
-/// `-D warnings` without it.
+/// code to delete: dropping the feature must bring the whole engine back.
+/// Subsumed by the module-level allow at the top of this file, and kept
+/// anyway: these two constructors are the root of why the rest of the module
+/// is unselected, so the statement belongs on them even if the file-level
+/// attribute is what silences the lint.
 #[cfg_attr(feature = "tls-unbuffered", allow(dead_code))]
 pub enum BufferedKind {
     Server(ServerConnection),
@@ -130,10 +140,12 @@ impl BufferedKind {
 }
 
 /// Unwrap the buffered engine out of a `TlsConn`. Every `TlsConn` reaching
-/// this module is driven by the buffered engine today (it is the only
-/// engine); this panics rather than threading an `Option` through call sites
+/// this module is driven by the buffered engine: the dispatchers in
+/// `backend_mio`/`backend_uring` only route here in a build where
+/// `TlsTable::create` selects it, so `None` is a routing bug, not a runtime
+/// condition. This panics rather than threading an `Option` through call sites
 /// that don't return `io::Result` (those that do get a fallible version
-/// inline instead — see e.g. `encrypt_to_sends`).
+/// inline instead — see e.g. `encrypt_to_sends_buffered`).
 fn buffered_mut(tls_conn: &mut TlsConn) -> &mut BufferedKind {
     tls_conn
         .conn
@@ -151,7 +163,7 @@ fn buffered_mut(tls_conn: &mut TlsConn) -> &mut BufferedKind {
 /// default `with_data`/`with_bytes` path) or, for a connection in the segmented
 /// recv domain, owned segments pushed to its hold (see [`PlaintextSink`]).
 #[cfg(has_io_uring)]
-pub fn feed_tls_recv(
+pub(super) fn feed_tls_recv_buffered(
     tls_table: &mut TlsTable,
     mut sink: PlaintextSink<'_>,
     send_copy_pool: &mut SendCopyPool,
@@ -272,7 +284,7 @@ pub fn feed_tls_recv(
 /// `&mut TlsTable`. Returns `false` if pool exhaustion prevented draining
 /// all output; sends already appended must still be queued by the caller.
 #[cfg(has_io_uring)]
-pub fn flush_tls_output(
+pub(super) fn flush_tls_output_buffered(
     tls_table: &mut TlsTable,
     send_copy_pool: &mut SendCopyPool,
     conn_index: u32,
@@ -438,7 +450,7 @@ pub(super) fn take_tls_output_sends(
 }
 
 #[cfg(has_io_uring)]
-pub fn encrypt_to_sends(
+pub(super) fn encrypt_to_sends_buffered(
     tls_table: &mut TlsTable,
     send_copy_pool: &mut SendCopyPool,
     conn_index: u32,

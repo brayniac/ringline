@@ -5,10 +5,11 @@
 //! buffer that the buffered engine pays.
 //!
 //! Selected per connection by the `tls-unbuffered` feature in
-//! `TlsTable::create`, and driven end-to-end on the mio backend through
-//! [`super::backend_mio`]. The io_uring entry points still assume the buffered
-//! engine, so the feature is mio-only for now (see
-//! `docs/journal/2026-09-unbuffered-tls.md`).
+//! `TlsTable::create`, and driven end-to-end on both backends through their
+//! dispatcher modules (`super::backend_mio`, `super::backend_uring`). The
+//! backends differ only in where the ciphertext lands: a `Vec` on the
+//! connection's pending-send FIFO for mio, `SendCopyPool` slots for io_uring
+//! (see `docs/journal/2026-09-unbuffered-tls.md`).
 //!
 //! [`feed`] ingests received ciphertext through
 //! [`super::ciphertext::CiphertextBuf`] and runs [`drive`], the
@@ -16,15 +17,6 @@
 //! in the caller's `out` buffer, decrypted plaintext in a [`PlaintextSink`].
 //! [`encrypt_to_vec`]/[`encrypt_chunk`] are the send path, and
 //! [`queue_close_notify`] the shutdown one.
-
-// The engine is reached only through `super::backend_mio`, so an io_uring
-// build compiles it with no consumer at all: `TlsTable::create` constructs an
-// `UnbufferedConn` and nothing ever drives it. Wiring the io_uring entry points
-// (`feed_tls_recv`/`flush_tls_output`/`encrypt_to_sends`) is the follow-on
-// task; DELETE THIS ATTRIBUTE THERE. Deliberately gated rather than blanket —
-// on mio the engine is live, so real dead code in it still fails `-D warnings`
-// (locally, on `Test (mio)`, and on `Test (macOS)`).
-#![cfg_attr(has_io_uring, allow(dead_code))]
 
 use std::collections::VecDeque;
 use std::io;
@@ -40,9 +32,6 @@ use super::{PlaintextSink, TlsConn};
 
 /// A rustls connection driven through the *unbuffered* API
 /// (`process_tls_records` + `WriteTraffic::encrypt`).
-///
-/// Constructible today; not yet driven — feeding ciphertext in and encrypting
-/// records out lands in a follow-on plan (see `docs/journal/2026-09-unbuffered-tls.md`).
 pub enum UnbufferedKind {
     Server(UnbufferedServerConnection),
     Client(UnbufferedClientConnection),
@@ -754,8 +743,11 @@ fn encrypt_with<C: UnbufferedEngine>(
 }
 
 /// Encrypt all of `plaintext`, appending ciphertext to `out`. The mio backend
-/// and the unit tests use this; io_uring encrypts into pool slots instead
-/// (`encrypt_to_sends_unbuffered`, a later task).
+/// and the unit tests use this; io_uring drives [`encrypt_chunk`] directly
+/// against a pool slot instead (`super::backend_uring::encrypt_to_sends`) —
+/// which is the whole point of the engine, so an io_uring lib build has no
+/// non-test caller for this and the allow is scoped to exactly that.
+#[cfg_attr(has_io_uring, allow(dead_code))]
 pub(crate) fn encrypt_to_vec(
     tls_conn: &mut TlsConn,
     plaintext: &[u8],

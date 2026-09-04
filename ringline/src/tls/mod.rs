@@ -21,12 +21,13 @@
 //!
 //! Which engine drives a connection is decided once, in
 //! [`TlsTable::create`]/[`TlsTable::create_client`], by the `tls-unbuffered`
-//! cargo feature. Backends never see that choice: `backend_mio` dispatches the
-//! mio entry points to whichever engine is compiled in. The io_uring entry
-//! points (`feed_tls_recv`/`flush_tls_output`/`encrypt_to_sends`) and
-//! `drain_tls_plaintext` still reach past `TlsConnKind` into the buffered
-//! engine and panic on an unbuffered connection — wiring those is follow-on
-//! work, so the feature is mio-only for now.
+//! cargo feature. Backends never see that choice: `backend_mio` and
+//! `backend_uring` each dispatch their backend's entry points to whichever
+//! engine is compiled in, keeping the names and signatures the backend already
+//! called. `drain_tls_plaintext` below is the buffered engine's plaintext
+//! drain and is reached only from `buffered` (the unbuffered engine drains
+//! `ReadTraffic` itself); it is not an engine-agnostic helper despite living
+//! here.
 
 #[allow(unused_imports)]
 use std::io::{self, Read as _, Write as _};
@@ -46,6 +47,8 @@ use crate::buffer::send_copy::SendCopyPool;
 
 #[cfg(not(has_io_uring))]
 mod backend_mio;
+#[cfg(has_io_uring)]
+mod backend_uring;
 mod buffered;
 // The incoming-ciphertext buffer belongs to the unbuffered engine and has no
 // other consumer, so it shares the engine's gate; without it every item in the
@@ -55,16 +58,14 @@ mod ciphertext;
 #[cfg(feature = "tls-unbuffered")]
 mod unbuffered;
 
-// Glob re-export keeps call sites at `crate::tls::*`. The io_uring entry
-// points (`feed_tls_recv`/`flush_tls_output`/`encrypt_to_sends`) still come
-// straight from the buffered engine; wiring them to a dispatcher the way the
-// mio ones are is follow-on work. On mio the glob would re-export nothing —
-// `buffered`'s mio halves are `pub(super)` under `*_buffered` names, reachable
-// only from `backend_mio`, which owns the shared names instead.
+// Glob re-export keeps call sites at `crate::tls::*`. Both backends' shared
+// names now live in their dispatcher module; nothing is re-exported from
+// `buffered`, whose halves are all `pub(super)` under `*_buffered` names and
+// reachable only from the dispatcher that picks between the engines.
 #[cfg(not(has_io_uring))]
 pub use backend_mio::*;
 #[cfg(has_io_uring)]
-pub use buffered::*;
+pub use backend_uring::*;
 
 /// Information about a negotiated TLS session.
 pub struct TlsInfo {
@@ -144,11 +145,12 @@ impl TlsConnKind {
 
     /// The unbuffered connection, or `None` if another engine drives this one.
     ///
-    /// Only `backend_mio` and the engine's own code call this, so an io_uring
-    /// build has no caller yet — see the note at the top of
-    /// [`unbuffered`][mod@unbuffered].
+    /// Only compiled in a `tls-unbuffered` build, where `TlsTable::create`
+    /// selects this engine for every connection — so the `Buffered` arm is
+    /// unreachable in practice today. It is still spelled out rather than
+    /// assumed: that build keeps both variants, and both backend dispatchers
+    /// route on the engine tag rather than on the feature alone.
     #[cfg(feature = "tls-unbuffered")]
-    #[cfg_attr(has_io_uring, allow(dead_code))]
     pub fn as_unbuffered_mut(&mut self) -> Option<&mut unbuffered::UnbufferedConn> {
         match self {
             Self::Buffered(_) => None,
@@ -226,8 +228,13 @@ pub struct TlsConn {
     /// FIN arriving while this is false is a truncation (possibly an
     /// attacker-injected FIN) and must not look like a clean EOF.
     pub peer_sent_close_notify: bool,
-    /// True when `send_close_notify` has been called. Used by the
-    /// close_notify timeout mechanism to detect stalled shutdowns.
+    /// True once this side's close_notify alert has been generated, by
+    /// whichever call the driving engine uses for it (the buffered engine's
+    /// `send_close_notify`, the unbuffered engine's
+    /// `WriteTraffic::queue_close_notify`). Recorded for the close_notify
+    /// timeout machinery; the deadline itself is armed by `DriverCtx::close`
+    /// for any TLS connection, without consulting this, so nothing outside
+    /// this module reads it today.
     pub close_notify_sent: bool,
 }
 
@@ -363,16 +370,17 @@ impl TlsTable {
     /// SQEs directly) keeps the alert ordered behind any in-flight send and
     /// lets the deferred Close fire only after it completes.
     ///
-    /// `send_close_notify` is buffered-only (see
-    /// `buffered::BufferedKind::send_close_notify`), so this goes through
-    /// `as_buffered_mut()` -- consistent with `take_tls_output_sends` below,
-    /// which already reaches into the buffered engine directly. A
-    /// connection on an engine with no buffered close path (the
-    /// `tls-unbuffered` engine, once real connections use it) has nothing to
-    /// queue here; the `None` arm is a deliberate no-op, not an oversight.
-    /// That engine will drive close_notify through
-    /// `WriteTraffic::queue_close_notify` from inside `process_tls_records`
-    /// instead, per `docs/tls-unbuffered-design.md` ("### close_notify").
+    /// Generating the alert is engine-specific. `send_close_notify` is
+    /// buffered-only (see `buffered::BufferedKind::send_close_notify`), so that
+    /// arm goes through `as_buffered_mut()` and then drains rustls' output. The
+    /// unbuffered engine has no such call at all -- rustls expresses the
+    /// operation as `WriteTraffic::queue_close_notify`, which encrypts the
+    /// alert into a caller buffer -- so that arm copies the result into pool
+    /// slots itself, per `docs/tls-unbuffered-design.md` ("### close_notify").
+    ///
+    /// A connection that never reached traffic state has nothing to queue and
+    /// leaves `out` untouched. That is not an error: the caller is tearing the
+    /// connection down either way.
     #[cfg(has_io_uring)]
     pub fn send_close_notify_queued(
         &mut self,
@@ -381,12 +389,50 @@ impl TlsTable {
         send_copy_pool: &mut SendCopyPool,
         out: &mut Vec<crate::handler::BuiltSend>,
     ) {
-        if let Some(tls_conn) = self.get_mut(conn_index)
-            && let Some(buffered) = tls_conn.conn.as_buffered_mut()
+        let Some(tls_conn) = self.get_mut(conn_index) else {
+            return;
+        };
+        #[cfg(feature = "tls-unbuffered")]
         {
-            buffered.send_close_notify();
+            // `queue_close_notify` signals "nothing to queue" by leaving
+            // `scratch` untouched, not by an error or a count. Anything rustls
+            // had already queued rides out inside `scratch` *ahead* of the
+            // alert (`write_fragments` drains `sendable_tls` into the front of
+            // the destination), so this transmits it as-is and does not drive
+            // the machine afterwards looking for leftovers -- that would put
+            // them after the alert on the wire.
+            let mut scratch = Vec::new();
+            if unbuffered::queue_close_notify(tls_conn, &mut scratch).is_err() {
+                return;
+            }
+            let slot_size = send_copy_pool.slot_size() as usize;
+            for chunk in scratch.chunks(slot_size) {
+                let Some((slot, ptr, len)) = send_copy_pool.copy_in(chunk) else {
+                    return;
+                };
+                out.push(build_pool_send(
+                    conn_index,
+                    generation,
+                    ptr,
+                    len,
+                    slot,
+                    crate::completion::OpTag::TlsSend,
+                ));
+            }
+        }
+        // Bound as `b`, not `buffered`: the module of that name is used on the
+        // next line, and a value/module name collision here reads as a bug.
+        #[cfg(not(feature = "tls-unbuffered"))]
+        if let Some(b) = tls_conn.conn.as_buffered_mut() {
+            b.send_close_notify();
             tls_conn.close_notify_sent = true;
-            let _ = take_tls_output_sends(tls_conn, send_copy_pool, conn_index, generation, out);
+            let _ = buffered::take_tls_output_sends(
+                tls_conn,
+                send_copy_pool,
+                conn_index,
+                generation,
+                out,
+            );
         }
     }
 }
