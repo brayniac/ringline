@@ -26,6 +26,8 @@ use crate::buffer::send_copy::SendCopyPool;
 
 mod buffered;
 mod ciphertext;
+#[cfg(feature = "tls-unbuffered")]
+mod unbuffered;
 
 // Glob re-export keeps call sites at `crate::tls::*`. When a second engine
 // module lands, two globs sharing a name compile fine and fail only at the

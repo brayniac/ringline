@@ -19,6 +19,10 @@ check-cfg = ["cfg(has_io_uring)"]
 force-mio = []
 testing = []
 timestamps = []
+# Selects rustls' unbuffered API for the TLS record layer, which encrypts
+# directly from caller memory into a send-pool slot (one fewer copy per TLS
+# send). Off by default while the engine proves out.
+tls-unbuffered = []
 
 [dependencies]
 futures-io = "0.3"
