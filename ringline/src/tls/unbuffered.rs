@@ -584,6 +584,12 @@ pub(crate) fn feed(
         }
         last = fold_outcome(last, outcome);
     }
+    // An empty feed is a deliberate flush, not a no-op: `chunks()` yields
+    // nothing for an empty slice, so without this the loop body never runs and
+    // the machine is never driven. Callers rely on it to make an idle
+    // connection emit — a fresh client has a ClientHello waiting with no input
+    // to deframe, which is exactly how the backends kick off an outbound
+    // handshake once the TCP connect completes.
     if ciphertext.is_empty() {
         return drive(tls_conn, sink, out, conn_index);
     }
@@ -1026,6 +1032,27 @@ mod tests {
         assert!(
             server.peer_sent_close_notify,
             "the close must still be recorded on the connection"
+        );
+    }
+
+    // An empty feed drives the machine rather than doing nothing. A fresh
+    // client has a ClientHello queued with no ciphertext to deframe, and the
+    // backends flush it exactly this way once the TCP connect completes — so
+    // if `feed` short-circuited on an empty slice, outbound TLS would never
+    // send its first flight.
+    #[test]
+    fn an_empty_feed_still_drives_the_machine() {
+        let (_server, mut client) = conn_pair();
+        let mut accs = AccumulatorTable::new(2, 4096);
+        let mut out = Vec::new();
+        let mut sink = PlaintextSink::Accumulator(&mut accs);
+
+        let outcome = feed(&mut client, Some(&mut sink), &mut out, &[], 0);
+
+        assert!(matches!(outcome, DriveOutcome::Ok), "got {outcome:?}");
+        assert!(
+            !out.is_empty(),
+            "an empty feed must still emit the ClientHello"
         );
     }
 
