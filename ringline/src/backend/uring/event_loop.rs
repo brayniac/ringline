@@ -215,8 +215,18 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // Commit buffer returns from the poll pass and revive
             // ENOBUFS-parked receivers before we block.
             self.flush_replenish_and_rearm();
-            let min_complete = u32::from(self.executor.ready_queue.is_empty());
-            self.driver.ring.submit_and_wait(min_complete)?;
+            // Declining to block still has to reap: under DEFER_TASKRUN the
+            // kernel runs task_work only on a GETEVENTS enter, and
+            // `submit_and_wait(0)` carries no such flag. Going through
+            // `submit_and_get_events` (same single syscall) keeps completions
+            // flowing while a task is runnable — otherwise a task that stays
+            // runnable without queueing SQEs (so `flush()` takes its empty-SQ
+            // shortcut) starves the whole worker of completions.
+            if self.executor.ready_queue.is_empty() {
+                self.driver.ring.submit_and_wait(1)?;
+            } else {
+                self.driver.ring.submit_and_get_events()?;
+            }
             let mut wait_ns: u64 = 0;
             if let Some(start) = wait_start {
                 wait_ns = start.elapsed().as_nanos() as u64;
@@ -493,9 +503,20 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         //
         // Dedup applies ONLY to entries at indices < initial_len (captured
         // before the loop). Entries appended to ready_queue *during* this call
-        // (via wake_task() called from within a polled future, which pushes
-        // directly to executor.ready_queue) have i >= initial_len and bypass
-        // the dedup check entirely — they are processed unconditionally.
+        // have i >= initial_len and bypass the dedup check entirely — they are
+        // processed unconditionally.
+        //
+        // Only the *internal* wake path appends mid-pass: executor.wake_task()
+        // pushes straight onto executor.ready_queue (and, for the task being
+        // polled right now, records woken_while_polling so the poll loop
+        // re-queues it after parking). A std::task::Waker does NOT — what a
+        // future gets from its Context pushes onto the thread-local queue in
+        // runtime/waker.rs, which only reaches executor.ready_queue via
+        // collect_wakeups() once this pass has ended. So a future that wakes
+        // itself through its Context (the usual "yield to the executor"
+        // pattern) resumes on the NEXT event-loop iteration — after
+        // submit_and_wait and drain_completions — not within this pass.
+        // tests/ready_queue_fairness.rs pins that property.
         //
         // This boundary is essential: without it, a future that parks itself
         // and then is immediately re-woken by another task in the same batch

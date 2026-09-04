@@ -10,25 +10,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Added
 
 - `AsyncSendBuilder::submit_batch_await` is back (both backends), returning a
-  `SendFuture` alongside the submitted part count. 0.3.0 removed it as dead
-  code along with `build_await`; it was not dead, just used out of tree
-  (crucible's cache server), and there is no equivalent substitute. A caller
-  that wants completion-paced backpressure on a scatter-gather send has only
-  `send()`, which copies the value and so gives up the zero-copy guard path,
-  or `send_chain()`, which is io_uring-only and therefore breaks mio builds.
+  `SendFuture` alongside the submitted part count. 0.3.0 (#231) removed it as
+  dead code along with `build_await`; it was not dead, just used out of tree
+  (crucible's cache server), and nothing in the API replaces it. A caller that
+  wants to know when a scatter-gather send has completed -- to pace itself
+  against the wire rather than filling the per-connection send queue as fast
+  as it can build responses -- has only `send()`, which copies the payload and
+  so gives up the zero-copy guard path that motivates gather sends in the
+  first place, or `send_chain()`, which is `#[cfg(has_io_uring)]` and so
+  unavailable to anything that also builds on mio.
 
-  Yielding to the executor is not a substitute either, which is the reason
-  this comes back rather than staying removed: the ready-queue drain is
-  `while i < ready_queue.len()` and a self-wake re-queues the task inside the
-  same pass, so it is re-polled before the loop returns to `submit_and_wait`
-  / `drain_completions`. A yield therefore never lets a send CQE land or a
-  send-pool slot recycle -- it only reorders among already-ready tasks. Only
-  parking on the completion hands control back to the ring.
+  This also restores the `nowait`/await symmetry the rest of the send API has
+  (`send_nowait`/`send`, `send_chain_nowait`/`send_chain`); the gather path
+  was the one place a caller could submit but not await.
 
   A batch that is empty or carries no bytes is now rejected with
   `InvalidInput` rather than returning a future that no completion could ever
-  wake (the pre-0.3.0 version rejected only the empty-`Vec` case). `build_await`
-  stays removed -- it really was unused.
+  wake (the pre-0.3.0 version rejected only the empty-`Vec` case).
+  `build_await` stays removed -- it really was unused.
+
+### Fixed
+
+- **io_uring: a worker starved of all completions while any task stayed
+  runnable.** Two individually-sound optimizations composed into a liveness
+  bug. The event loop declines to block when a task is ready
+  (`min_complete = u32::from(ready_queue.is_empty())`), and the io-uring
+  crate's `submit_and_wait(0)` does not set `IORING_ENTER_GETEVENTS`;
+  separately, `flush()` skips its syscall when the SQ is empty, on the
+  reasoning that "the next `submit_and_wait(1)`" would reap. Under
+  `IORING_SETUP_DEFER_TASKRUN` (on for every non-SQPOLL ring) the kernel runs
+  task_work only on a GETEVENTS enter — so a task that stays runnable without
+  queueing SQEs left neither path setting the flag, and the worker reaped
+  **zero** CQEs for as long as that task ran: no connections accepted, no recv
+  or send completions dispatched, and so no send-pool slots recycled. A
+  yield-style retry loop waiting on pool capacity would wait forever, since
+  only a completion can free it.
+
+  The loop now calls the new `Ring::submit_and_get_events()` on the
+  non-blocking path, which enters with GETEVENTS in the same single syscall
+  (delegating to the old behavior on SQPOLL rings, which cannot enable
+  DEFER_TASKRUN and post completions eagerly). `flush()`'s shortcut is
+  unchanged and now genuinely holds: every event-loop ring entry carries
+  GETEVENTS.
+
+  Caught by the new `tests/ready_queue_fairness.rs`, which fails on io_uring
+  before this change and passes after; the mio backend was never affected.
+
+- Documentation: `poll_ready_tasks` in both event loops claimed that entries
+  appended to `ready_queue` mid-pass come from "wake_task() called from within
+  a polled future, which pushes directly to executor.ready_queue". That is true
+  only of the *internal* `wake_task` path. A `std::task::Waker` -- what a
+  future gets from its `Context`, and so what any yield-style self-wake uses --
+  pushes onto the thread-local queue in `runtime/waker.rs` instead, and reaches
+  `executor.ready_queue` only via `collect_wakeups()` after the pass has ended.
+  The comment read as though a self-woken task is re-polled within the same
+  pass, monopolizing the worker; it is not, and that misreading sent the
+  starvation diagnosis above down the wrong path at first.
 
 ## [0.6.0] - 2026-09-03
 
