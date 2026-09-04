@@ -16,6 +16,111 @@ use crate::buffer::send_copy::SendCopyPool;
 
 use super::*;
 
+/// A rustls connection driven through the *buffered* API
+/// (`read_tls` / `process_new_packets` / `write_tls`).
+pub enum BufferedKind {
+    Server(ServerConnection),
+    Client(ClientConnection),
+}
+
+impl BufferedKind {
+    pub fn read_tls(&mut self, rd: &mut dyn io::Read) -> io::Result<usize> {
+        match self {
+            BufferedKind::Server(c) => c.read_tls(rd),
+            BufferedKind::Client(c) => c.read_tls(rd),
+        }
+    }
+
+    pub fn write_tls(&mut self, wr: &mut dyn io::Write) -> io::Result<usize> {
+        match self {
+            BufferedKind::Server(c) => c.write_tls(wr),
+            BufferedKind::Client(c) => c.write_tls(wr),
+        }
+    }
+
+    pub fn process_new_packets(&mut self) -> Result<rustls::IoState, rustls::Error> {
+        match self {
+            BufferedKind::Server(c) => c.process_new_packets(),
+            BufferedKind::Client(c) => c.process_new_packets(),
+        }
+    }
+
+    pub fn reader(&mut self) -> rustls::Reader<'_> {
+        match self {
+            BufferedKind::Server(c) => c.reader(),
+            BufferedKind::Client(c) => c.reader(),
+        }
+    }
+
+    pub fn writer(&mut self) -> rustls::Writer<'_> {
+        match self {
+            BufferedKind::Server(c) => c.writer(),
+            BufferedKind::Client(c) => c.writer(),
+        }
+    }
+
+    pub fn wants_write(&self) -> bool {
+        match self {
+            BufferedKind::Server(c) => c.wants_write(),
+            BufferedKind::Client(c) => c.wants_write(),
+        }
+    }
+
+    pub fn is_handshaking(&self) -> bool {
+        match self {
+            BufferedKind::Server(c) => c.is_handshaking(),
+            BufferedKind::Client(c) => c.is_handshaking(),
+        }
+    }
+
+    pub fn alpn_protocol(&self) -> Option<&[u8]> {
+        match self {
+            BufferedKind::Server(c) => c.alpn_protocol(),
+            BufferedKind::Client(c) => c.alpn_protocol(),
+        }
+    }
+
+    pub fn negotiated_cipher_suite(&self) -> Option<rustls::SupportedCipherSuite> {
+        match self {
+            BufferedKind::Server(c) => c.negotiated_cipher_suite(),
+            BufferedKind::Client(c) => c.negotiated_cipher_suite(),
+        }
+    }
+
+    pub fn protocol_version(&self) -> Option<rustls::ProtocolVersion> {
+        match self {
+            BufferedKind::Server(c) => c.protocol_version(),
+            BufferedKind::Client(c) => c.protocol_version(),
+        }
+    }
+
+    pub fn sni_hostname(&self) -> Option<&str> {
+        match self {
+            BufferedKind::Server(c) => c.server_name(),
+            BufferedKind::Client(_) => None,
+        }
+    }
+
+    pub fn send_close_notify(&mut self) {
+        match self {
+            BufferedKind::Server(c) => c.send_close_notify(),
+            BufferedKind::Client(c) => c.send_close_notify(),
+        }
+    }
+}
+
+/// Unwrap the buffered engine out of a `TlsConn`. Every `TlsConn` reaching
+/// this module is driven by the buffered engine today (it is the only
+/// engine); this panics rather than threading an `Option` through call sites
+/// that don't return `io::Result` (those that do get a fallible version
+/// inline instead — see e.g. `encrypt_to_sends`).
+fn buffered_mut(tls_conn: &mut TlsConn) -> &mut BufferedKind {
+    tls_conn
+        .conn
+        .as_buffered_mut()
+        .expect("TLS connection not driven by the buffered engine")
+}
+
 /// Feed received ciphertext into the TLS connection, decrypt plaintext into
 /// the accumulator, and flush any TLS output (handshake responses, alerts).
 /// Any TLS output produced (handshake responses, alerts) is appended to
@@ -54,7 +159,7 @@ pub fn feed_tls_recv(
     // permanently desynchronising the application from the wire.
     let mut cursor = io::Cursor::new(ciphertext);
     while cursor.position() < ciphertext.len() as u64 {
-        match tls_conn.conn.read_tls(&mut cursor) {
+        match buffered_mut(tls_conn).read_tls(&mut cursor) {
             Ok(0) => break,
             Ok(_) => {}
             Err(e) => {
@@ -64,7 +169,7 @@ pub fn feed_tls_recv(
         // Drive the state machine after each chunk so rustls can
         // free buffer space (by decrypting+queueing plaintext) and
         // accept the next chunk on the following iteration.
-        let state = match tls_conn.conn.process_new_packets() {
+        let state = match buffered_mut(tls_conn).process_new_packets() {
             Ok(state) => state,
             Err(e) => {
                 if tls_conn.conn.wants_write() {
@@ -93,7 +198,7 @@ pub fn feed_tls_recv(
 
     // Final state read for the wants_write / handshake / closed
     // checks below.
-    let state = match tls_conn.conn.process_new_packets() {
+    let state = match buffered_mut(tls_conn).process_new_packets() {
         Ok(state) => state,
         Err(e) => {
             if tls_conn.conn.wants_write() {
@@ -287,7 +392,7 @@ pub(super) fn take_tls_output_sends(
 ) -> bool {
     let mut writer = PoolWriter::new(send_copy_pool);
     while tls_conn.conn.wants_write() {
-        match tls_conn.conn.write_tls(&mut writer) {
+        match buffered_mut(tls_conn).write_tls(&mut writer) {
             Ok(0) | Err(_) => {
                 // Pool exhaustion or writer error: release what this call
                 // allocated. Sends appended to `out` by *earlier* calls are
@@ -323,11 +428,15 @@ pub fn encrypt_to_sends(
     let tls_conn = tls_table.get_mut(conn_index).ok_or_else(|| {
         io::Error::new(io::ErrorKind::NotConnected, "no TLS state for connection")
     })?;
+    let buffered = tls_conn
+        .conn
+        .as_buffered_mut()
+        .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
 
     let mut writer = PoolWriter::new(send_copy_pool);
     let mut offset = 0;
     while offset < plaintext.len() {
-        let n = match tls_conn.conn.writer().write(&plaintext[offset..]) {
+        let n = match buffered.writer().write(&plaintext[offset..]) {
             Ok(n) => n,
             Err(e) => {
                 writer.release_all();
@@ -338,8 +447,8 @@ pub fn encrypt_to_sends(
 
         // Drain whatever ciphertext this write produced.
         let mut drained = 0usize;
-        while tls_conn.conn.wants_write() {
-            match tls_conn.conn.write_tls(&mut writer) {
+        while buffered.wants_write() {
+            match buffered.write_tls(&mut writer) {
                 Ok(0) => break,
                 Ok(w) => drained += w,
                 Err(e) => {
@@ -406,7 +515,7 @@ pub fn feed_tls_recv_mio(
     // and retry with remaining ciphertext.
     while !remaining.is_empty() {
         let mut cursor = io::Cursor::new(remaining);
-        if let Err(e) = tls_conn.conn.read_tls(&mut cursor) {
+        if let Err(e) = buffered_mut(tls_conn).read_tls(&mut cursor) {
             return TlsRecvResult::Error(rustls::Error::General(e.to_string()));
         }
         let consumed = cursor.position() as usize;
@@ -418,7 +527,7 @@ pub fn feed_tls_recv_mio(
         remaining = &remaining[consumed..];
 
         // Drive the TLS state machine.
-        let state = match tls_conn.conn.process_new_packets() {
+        let state = match buffered_mut(tls_conn).process_new_packets() {
             Ok(state) => state,
             Err(e) => {
                 // Try to flush alert before returning error.
@@ -490,7 +599,7 @@ fn flush_tls_output_mio_inner(
     pending: &mut std::collections::VecDeque<crate::backend::mio::driver::PendingSend>,
 ) {
     write_buf.clear();
-    if tls_conn.conn.write_tls(write_buf).is_err() {
+    if buffered_mut(tls_conn).write_tls(write_buf).is_err() {
         return;
     }
 
@@ -513,7 +622,7 @@ pub fn flush_tls_output_mio_direct(
     let (conn_slot, write_buf) = borrow_conn_and_buf(tls_table, conn_index);
     let Some(tls_conn) = conn_slot else { return };
     write_buf.clear();
-    if tls_conn.conn.write_tls(write_buf).is_err() || write_buf.is_empty() {
+    if buffered_mut(tls_conn).write_tls(write_buf).is_err() || write_buf.is_empty() {
         return;
     }
     let mut offset = 0;
@@ -541,6 +650,10 @@ pub fn encrypt_for_send_mio(
     let tls_conn = conn_slot.as_mut().ok_or_else(|| {
         io::Error::new(io::ErrorKind::NotConnected, "no TLS state for connection")
     })?;
+    let buffered = tls_conn
+        .conn
+        .as_buffered_mut()
+        .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
 
     // Interleave writer().write with write_tls draining: rustls caps its
     // ciphertext buffer at 64 KiB, so a single write_all of a larger
@@ -549,15 +662,13 @@ pub fn encrypt_for_send_mio(
     let mut ciphertext = Vec::with_capacity(plaintext.len() + 128);
     let mut offset = 0;
     while offset < plaintext.len() {
-        let n = tls_conn
-            .conn
+        let n = buffered
             .writer()
             .write(&plaintext[offset..])
             .map_err(io::Error::other)?;
         offset += n;
         let before = ciphertext.len();
-        tls_conn
-            .conn
+        buffered
             .write_tls(&mut ciphertext)
             .map_err(io::Error::other)?;
         if n == 0 && ciphertext.len() == before {
@@ -604,7 +715,7 @@ mod segmented_tls_tests {
 
     /// Move all of `from`'s pending TLS output into `to`, driving `to`'s state
     /// machine. Used to pump a handshake to completion.
-    fn pump(from: &mut TlsConnKind, to: &mut TlsConnKind) {
+    fn pump(from: &mut BufferedKind, to: &mut BufferedKind) {
         let mut buf = Vec::new();
         while from.wants_write() {
             from.write_tls(&mut buf).unwrap();
@@ -623,7 +734,7 @@ mod segmented_tls_tests {
     }
 
     /// A completed in-memory TLS session: (server, client), both past handshake.
-    fn handshaked() -> (TlsConnKind, TlsConnKind) {
+    fn handshaked() -> (BufferedKind, BufferedKind) {
         let (certs, key) = test_certs();
         let server_config = Arc::new(
             rustls::ServerConfig::builder()
@@ -641,9 +752,9 @@ mod segmented_tls_tests {
             .into();
         let server_name: rustls::pki_types::ServerName<'_> = "localhost".try_into().unwrap();
 
-        let mut server = TlsConnKind::Server(ServerConnection::new(server_config).unwrap());
+        let mut server = BufferedKind::Server(ServerConnection::new(server_config).unwrap());
         let mut client =
-            TlsConnKind::Client(ClientConnection::new(client_config, server_name).unwrap());
+            BufferedKind::Client(ClientConnection::new(client_config, server_name).unwrap());
 
         for _ in 0..30 {
             pump(&mut client, &mut server);
@@ -659,9 +770,9 @@ mod segmented_tls_tests {
         (server, client)
     }
 
-    fn wrap_server(server: TlsConnKind) -> TlsConn {
+    fn wrap_server(server: BufferedKind) -> TlsConn {
         TlsConn {
-            conn: server,
+            conn: TlsConnKind::Buffered(server),
             handshake_complete: true,
             peer_sent_close_notify: false,
             close_notify_sent: false,
@@ -703,12 +814,11 @@ mod segmented_tls_tests {
         let mut hold: VecDeque<HeldRecvBuf> = VecDeque::new();
         let mut cursor = Cursor::new(&cipher[..]);
         while (cursor.position() as usize) < cipher.len() {
-            let n = tls_conn.conn.read_tls(&mut cursor).unwrap();
+            let n = buffered_mut(&mut tls_conn).read_tls(&mut cursor).unwrap();
             if n == 0 {
                 break;
             }
-            let pt = tls_conn
-                .conn
+            let pt = buffered_mut(&mut tls_conn)
                 .process_new_packets()
                 .unwrap()
                 .plaintext_bytes_to_read();
@@ -773,11 +883,11 @@ mod segmented_tls_tests {
         }
         let mut cursor = Cursor::new(&cipher[..]);
         while (cursor.position() as usize) < cipher.len() {
-            let n = tls_conn.conn.read_tls(&mut cursor).unwrap();
+            let n = buffered_mut(&mut tls_conn).read_tls(&mut cursor).unwrap();
             if n == 0 {
                 break;
             }
-            tls_conn.conn.process_new_packets().unwrap();
+            buffered_mut(&mut tls_conn).process_new_packets().unwrap();
         }
 
         // max below the chunk size: the first chunk breaches the bound, is left
