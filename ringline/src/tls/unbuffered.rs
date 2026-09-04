@@ -179,6 +179,24 @@ impl UnbufferedConn {
         }
     }
 
+    /// Test-only: rebuild the incoming-ciphertext buffer with a `cap` below
+    /// [`MIN_CIPHERTEXT_CAP`], via [`CiphertextBuf::with_cap_unchecked`], so
+    /// [`feed`]'s `WouldBlock` backpressure path becomes reachable. A
+    /// conforming peer cannot reach it on a real connection — the floor is
+    /// sized to prevent exactly that — which would otherwise leave both the
+    /// retry and the anti-spin guard untested.
+    ///
+    /// Panics if ciphertext is pending: the replacement would silently drop
+    /// it, and a test that re-caps mid-stream is measuring nothing.
+    #[cfg(test)]
+    pub(crate) fn set_ciphertext_cap_for_test(&mut self, initial: usize, cap: usize) {
+        assert!(
+            self.incoming.is_empty(),
+            "re-capping would drop pending ciphertext"
+        );
+        self.incoming = CiphertextBuf::with_cap_unchecked(initial, cap);
+    }
+
     pub fn kind(&self) -> &UnbufferedKind {
         &self.kind
     }
@@ -260,10 +278,10 @@ pub(crate) enum DriveOutcome {
 /// `WriteTraffic::encrypt`, which writes straight into a pool slot. `out` only
 /// ever carries handshake records and alerts.
 ///
-/// `HandshakeJustCompleted` takes precedence over `Closed` when both happen on
-/// one call: a caller reading only the return value learns of that close on
-/// its *next* `drive`. Nothing is lost — `peer_sent_close_notify` is already
-/// set, so `eof_truncated()` stays correct in the meantime.
+/// When a handshake completion and a close land on the same call, this returns
+/// `HandshakeJustCompleted`. That is the same precedence [`fold_outcome`]
+/// applies across the chunks of a [`feed`]; its doc comment carries the
+/// reasoning, and the rule is stated there alone so the two cannot drift.
 pub(crate) fn drive(
     tls_conn: &mut TlsConn,
     mut sink: Option<&mut PlaintextSink<'_>>,
@@ -470,15 +488,31 @@ fn drive_inner<C: UnbufferedEngine>(
     }
 }
 
-/// Combine the outcome of one `drive` within a [`feed`] with the running one.
+/// Fold a chunk's outcome into the running one. Edge-triggered signals must
+/// survive later chunks of the same feed, so this is a rank, not "last wins":
 ///
-/// `HandshakeJustCompleted` and `Closed` are edge-triggered — reported once,
-/// on the call that observed them — so a later plain `Ok` from another chunk
-/// of the same `feed` must not erase them. `drive` only re-reports handshake
-/// completion while `was_handshaking` holds, which it no longer does, so a
-/// dropped edge is dropped permanently.
+///   Error > HandshakeJustCompleted > Closed > Ok
+///
+/// `HandshakeJustCompleted` outranks `Closed` because the backends act on it
+/// to wake a connect waiter (`wake_connect`) or spawn the accept task, while
+/// the `Closed` arm does neither and `close_connection` does not wake connect
+/// waiters either — so dropping the completion edge hangs an outbound TLS
+/// connect until its timeout. A peer can produce both in one feed by putting
+/// its last handshake flight and a close_notify in the same segment. The close
+/// is not lost: `peer_sent_close_notify` is set, so the following FIN reads as
+/// a clean close rather than a truncation.
+///
+/// `Error` outranks everything, though `feed` returns early on it today.
 fn fold_outcome(last: DriveOutcome, next: DriveOutcome) -> DriveOutcome {
-    if !matches!(next, DriveOutcome::Ok) || matches!(last, DriveOutcome::Ok) {
+    fn rank(o: &DriveOutcome) -> u8 {
+        match o {
+            DriveOutcome::Ok => 0,
+            DriveOutcome::Closed => 1,
+            DriveOutcome::HandshakeJustCompleted => 2,
+            DriveOutcome::Error(_) => 3,
+        }
+    }
+    if rank(&next) >= rank(&last) {
         next
     } else {
         last
@@ -878,6 +912,235 @@ mod tests {
         assert!(
             matches!(outcome, DriveOutcome::Error(_)),
             "unparseable ciphertext must be a protocol error, got {outcome:?}"
+        );
+    }
+
+    /// Drive the handshake but hold back the client's final flight, returning
+    /// it undelivered. Lets a test put that flight and post-handshake records
+    /// into one `feed` — which is what a peer does by coalescing them onto a
+    /// single segment.
+    fn handshake_holding_client_flight(
+        server: &mut TlsConn,
+        client: &mut TlsConn,
+        accs: &mut AccumulatorTable,
+    ) -> Vec<u8> {
+        let (_, mut to_server) = pump(client, &[], accs);
+        for _ in 0..10 {
+            let (_, to_client) = pump(server, &to_server, accs);
+            assert!(!to_client.is_empty(), "server must answer");
+            let (_, out) = pump(client, &to_client, accs);
+            to_server = out;
+            if !client.conn.is_handshaking() {
+                break;
+            }
+        }
+        assert!(!client.conn.is_handshaking(), "client handshake stalled");
+        assert!(
+            server.conn.is_handshaking(),
+            "the server must still be waiting on the flight held back"
+        );
+        assert!(!to_server.is_empty(), "client must emit a final flight");
+        to_server
+    }
+
+    /// Test-only: queue a close_notify alert into `dst`, returning its length.
+    /// Reaches `WriteTraffic` the same way `encrypt_one_shot` does, so a test
+    /// can produce a close in the same feed as a handshake completion. The
+    /// engine's real close path is a later task.
+    fn close_notify_one_shot(
+        kind: &mut super::UnbufferedKind,
+        incoming: &mut super::CiphertextBuf,
+        dst: &mut [u8],
+    ) -> usize {
+        match kind {
+            super::UnbufferedKind::Server(c) => close_notify_with(c, incoming, dst),
+            super::UnbufferedKind::Client(c) => close_notify_with(c, incoming, dst),
+        }
+    }
+
+    fn close_notify_with<C: super::UnbufferedEngine>(
+        conn: &mut C,
+        incoming: &mut super::CiphertextBuf,
+        dst: &mut [u8],
+    ) -> usize {
+        let status = conn.process(incoming.pending());
+        match status.state {
+            Ok(super::ConnectionState::WriteTraffic(mut wt)) => wt
+                .queue_close_notify(dst)
+                .expect("dst is sized for a close_notify alert"),
+            _ => panic!("expected WriteTraffic after a completed handshake"),
+        }
+    }
+
+    /// Encrypt one application-data record on `conn`, returning its ciphertext.
+    fn encrypt_record(conn: &mut TlsConn, plaintext: &[u8]) -> Vec<u8> {
+        let mut buf = vec![0u8; plaintext.len() + 1024];
+        let n = {
+            let (kind, incoming, _) = conn.conn.as_unbuffered_mut().unwrap().split_mut();
+            encrypt_one_shot(kind, incoming, plaintext, &mut buf)
+        };
+        buf.truncate(n);
+        buf
+    }
+
+    // A feed that both completes the handshake and sees close_notify must
+    // report the completion: the backends wake a connect waiter only on
+    // `HandshakeJustCompleted` — the `Closed` arm does not, and
+    // `close_connection` does not either — so losing that edge hangs an
+    // outbound TLS connect until its timeout. The close is not lost:
+    // `peer_sent_close_notify` still carries it.
+    //
+    // The two signals must land in *different* chunks for this to exercise
+    // `fold_outcome`: one chunk is one `drive`, and `drive` already applies
+    // the precedence itself. Hence the application data padding the flight
+    // past `MAX_SINGLE_APPEND` — which is also how a real peer would produce
+    // it, by coalescing its last flight, some data and the alert.
+    #[test]
+    fn handshake_completion_outranks_a_close_in_the_same_feed() {
+        let (mut server, mut client) = conn_pair();
+        let mut accs = AccumulatorTable::new(2, 4096);
+        let mut coalesced = handshake_holding_client_flight(&mut server, &mut client, &mut accs);
+
+        let record = vec![0x5Au8; 8 * 1024];
+        while coalesced.len() <= MAX_SINGLE_APPEND {
+            coalesced.extend_from_slice(&encrypt_record(&mut client, &record));
+        }
+        let mut alert = vec![0u8; 1024];
+        let n = {
+            let (kind, incoming, _) = client.conn.as_unbuffered_mut().unwrap().split_mut();
+            close_notify_one_shot(kind, incoming, &mut alert)
+        };
+        coalesced.extend_from_slice(&alert[..n]);
+        assert!(
+            coalesced.len() > MAX_SINGLE_APPEND,
+            "the alert must fall in a later chunk than the flight"
+        );
+
+        let mut out = Vec::new();
+        let mut sink = PlaintextSink::Accumulator(&mut accs);
+        let outcome = feed(&mut server, Some(&mut sink), &mut out, &coalesced, 0);
+        assert!(
+            matches!(outcome, DriveOutcome::HandshakeJustCompleted),
+            "completion must outrank the close, got {outcome:?}"
+        );
+        assert!(
+            server.peer_sent_close_notify,
+            "the close must still be recorded on the connection"
+        );
+    }
+
+    // A `WouldBlock` that a drive can relieve is backpressure, not failure:
+    // `feed` drains, retries the *same* chunk, and delivers every byte in
+    // order. `append` is all-or-nothing, so a caller that dropped the chunk
+    // here would silently lose a whole record.
+    //
+    // The buffer is put into the refusing state directly — an unprocessed but
+    // complete record sitting behind a consumed prefix — because `feed` alone
+    // cannot produce it: every append it makes is followed by a drive that
+    // drains everything drainable. The branch exists so a `drive` that ever
+    // stops short is backpressure rather than data loss.
+    #[test]
+    fn feed_retries_an_append_a_drive_can_relieve() {
+        let (mut server, mut client) = conn_pair();
+        let mut accs = AccumulatorTable::new(2, 4096);
+        handshake(&mut server, &mut client, &mut accs);
+
+        // Encrypted in the order they are fed; TLS records are sequenced.
+        let marker = encrypt_record(&mut client, &[0xA1u8; 16]);
+        let held = encrypt_record(&mut client, &[0xB2u8; 2000]);
+        let next = encrypt_record(&mut client, &[0xC3u8; 2000]);
+
+        // `cap == live + additional` is the tightest cap that still admits the
+        // append on retry, so `append` must refuse it while `marker`'s
+        // consumed prefix keeps `end` ahead of `live`.
+        let cap = held.len() + next.len();
+        assert!(
+            marker.len() < held.len(),
+            "compaction must not pay for itself"
+        );
+        server
+            .conn
+            .as_unbuffered_mut()
+            .unwrap()
+            .set_ciphertext_cap_for_test(512, cap);
+
+        // Consume `marker` so `start > 0`, leaving `held` half-delivered.
+        let split = held.len() / 2;
+        let mut prefix = marker.clone();
+        prefix.extend_from_slice(&held[..split]);
+        let mut out = Vec::new();
+        {
+            let mut sink = PlaintextSink::Accumulator(&mut accs);
+            let outcome = feed(&mut server, Some(&mut sink), &mut out, &prefix, 0);
+            assert!(matches!(outcome, DriveOutcome::Ok), "{outcome:?}");
+        }
+
+        // Complete `held` without driving, so the refusing buffer is full of
+        // data a drive *can* consume.
+        {
+            let (_, incoming, _) = server.conn.as_unbuffered_mut().unwrap().split_mut();
+            incoming
+                .append(&held[split..])
+                .expect("completing the held record fits under the cap");
+        }
+        accs.reset(0);
+
+        let mut sink = PlaintextSink::Accumulator(&mut accs);
+        let outcome = feed(&mut server, Some(&mut sink), &mut out, &next, 0);
+        assert!(
+            matches!(outcome, DriveOutcome::Ok),
+            "relievable backpressure must not fail the connection, got {outcome:?}"
+        );
+        let mut expected = vec![0xB2u8; 2000];
+        expected.extend_from_slice(&[0xC3u8; 2000]);
+        assert_eq!(
+            accs.data(0),
+            &expected[..],
+            "the retried chunk must arrive intact and in order"
+        );
+    }
+
+    // A `WouldBlock` no drive can relieve fails the connection. Retrying it
+    // forever would pin a worker thread, and in a thread-per-core runtime
+    // that is a wedged core, not a slow one.
+    #[test]
+    fn feed_fails_rather_than_spinning_on_an_undrainable_buffer() {
+        let (mut server, mut client) = conn_pair();
+        let mut accs = AccumulatorTable::new(2, 4096);
+        handshake(&mut server, &mut client, &mut accs);
+
+        let marker = encrypt_record(&mut client, &[0xA1u8; 16]);
+        let stuck = encrypt_record(&mut client, &[0xB2u8; 2000]);
+        let next = encrypt_record(&mut client, &[0xC3u8; 2000]);
+
+        // Only half of `stuck` is ever delivered, so rustls buffers it waiting
+        // for the rest and discards nothing — no drive can free a byte.
+        let split = stuck.len() / 2;
+        let cap = split + next.len();
+        assert!(marker.len() < split, "compaction must not pay for itself");
+        server
+            .conn
+            .as_unbuffered_mut()
+            .unwrap()
+            .set_ciphertext_cap_for_test(512, cap);
+
+        let mut prefix = marker.clone();
+        prefix.extend_from_slice(&stuck[..split]);
+        let mut out = Vec::new();
+        {
+            let mut sink = PlaintextSink::Accumulator(&mut accs);
+            let outcome = feed(&mut server, Some(&mut sink), &mut out, &prefix, 0);
+            assert!(matches!(outcome, DriveOutcome::Ok), "{outcome:?}");
+        }
+
+        let mut sink = PlaintextSink::Accumulator(&mut accs);
+        let outcome = feed(&mut server, Some(&mut sink), &mut out, &next, 0);
+        let DriveOutcome::Error(err) = outcome else {
+            panic!("an undrainable buffer must fail the connection, got {outcome:?}");
+        };
+        assert!(
+            err.to_string().contains("undrainable"),
+            "must be the anti-spin guard, not an unrelated failure: {err}"
         );
     }
 
