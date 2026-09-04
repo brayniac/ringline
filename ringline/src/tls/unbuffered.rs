@@ -18,6 +18,18 @@
 //! the follow-on plan. [`super::ciphertext::CiphertextBuf`] is the
 //! incoming-ciphertext buffer this engine will drive.
 
+// The whole engine is unreferenced until `TlsTable::create` is pointed at it:
+// the constructors, the state machine, and the chunk-sizing cache are all
+// reachable only from code that does not exist yet. A module-level allow is
+// the honest granularity — the alternative is sprinkling six attributes that
+// all say the same thing. REMOVE THIS when engine selection is wired up;
+// leaving it would silence real dead code in the finished engine.
+//
+// This lint is invisible on macOS: `lib.rs` applies
+// `#[cfg_attr(not(has_io_uring), allow(dead_code))]` to the whole `tls`
+// module, so only a Linux build fails on it.
+#![allow(dead_code)]
+
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -225,7 +237,6 @@ impl UnbufferedEngine for UnbufferedServerConnection {
 
 /// What [`drive`] observed. Mapped to `TlsRecvResult` by the backend wiring.
 #[derive(Debug)]
-#[allow(dead_code)] // Wired to the backends in Task 6.
 pub(crate) enum DriveOutcome {
     /// The machine ran to a blocking state with nothing else to report.
     Ok,
@@ -247,7 +258,6 @@ pub(crate) enum DriveOutcome {
 /// Application data is *not* encrypted here: that is the send path's
 /// `WriteTraffic::encrypt`, which writes straight into a pool slot. `out` only
 /// ever carries handshake records and alerts.
-#[allow(dead_code)] // Wired to the backends in Task 6.
 pub(crate) fn drive(
     tls_conn: &mut TlsConn,
     mut sink: Option<&mut PlaintextSink<'_>>,
