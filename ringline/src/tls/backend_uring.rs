@@ -77,6 +77,16 @@ pub(super) fn ciphertext_to_sends(
     // `encrypt_to_sends` below.
     let mut staged: Vec<(u16, u32)> = Vec::new();
     for chunk in ciphertext.chunks(slot_size) {
+        // `copy_in` leaves `slot_end_of_send` at its default of `true`, and
+        // that must stay true for every TLS slot. `submit_next_queued`
+        // coalesces *consecutive* pool-backed sends into one
+        // `SendMsgCoalesced` and does not inspect `OpTag`; the only thing
+        // stopping TLS chunks from merging is that the coalescing run breaks
+        // at the first end-of-send slot, i.e. immediately. Clearing the flag
+        // here — an obvious-looking tidy-up, since these chunks really are
+        // parts of one blob — would merge them into a single send and destroy
+        // the one-wake-per-logical-send invariant the `TlsSend`/`Send` split
+        // exists to hold.
         match pool.copy_in(chunk) {
             Some((slot, _, len)) => staged.push((slot, len)),
             None => {
@@ -230,6 +240,13 @@ pub fn encrypt_to_sends(
         let mut filled: Vec<(u16, u32)> = Vec::new();
         let mut offset = 0;
         while offset < plaintext.len() {
+            // `alloc_raw` defaults `slot_end_of_send` to `true` and it must
+            // stay that way even for the intermediate chunks below.
+            // `submit_next_queued` coalesces consecutive pool-backed sends
+            // without looking at `OpTag`, and only the end-of-send flag breaks
+            // the run — so marking intermediates as not-end-of-send would fold
+            // a multi-slot TLS send into one SQE and collapse the
+            // `TlsSend`/`Send` tagging into a single wake with a wrong count.
             let Some((slot, ptr, cap)) = send_copy_pool.alloc_raw() else {
                 release_all(send_copy_pool, &filled);
                 return Err(io::Error::other("send copy pool exhausted for TLS"));

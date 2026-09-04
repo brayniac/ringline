@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use rustls::pki_types::ServerName;
 
-use super::{DriveOutcome, MAX_SINGLE_APPEND, UnbufferedConn, drive, feed, queue_close_notify};
+use super::{
+    DriveOutcome, MAX_SINGLE_APPEND, UnbufferedConn, drive, encrypt_chunk, feed, queue_close_notify,
+};
 use crate::accumulator::AccumulatorTable;
 use crate::tls::{PlaintextSink, TlsConn, TlsConnKind};
 
@@ -592,4 +594,138 @@ fn drive_on_a_blocked_server_is_quiet() {
     let (outcome, out) = pump(&mut server, &[], &mut accs);
     assert!(matches!(outcome, DriveOutcome::Ok), "got {outcome:?}");
     assert!(out.is_empty());
+}
+
+/// Stage `ciphertext` in `to`'s incoming buffer *without* driving, so the next
+/// call into the state machine — whichever path makes it — is the one that
+/// deframes it.
+fn stage_incoming(to: &mut TlsConn, ciphertext: &[u8]) {
+    let (_, incoming, _) = to.conn.as_unbuffered_mut().unwrap().split_mut();
+    incoming
+        .append(ciphertext)
+        .expect("test appends stay under the cap");
+}
+
+/// A handshaked server with the client's close_notify sitting undriven in its
+/// ciphertext buffer.
+fn server_with_undriven_peer_close() -> TlsConn {
+    let (mut server, mut client) = conn_pair();
+    let mut accs = AccumulatorTable::new(2, 1024 * 1024);
+    handshake(&mut server, &mut client, &mut accs);
+    accs.reset(0);
+
+    let mut alert = Vec::new();
+    queue_close_notify(&mut client, &mut alert).expect("queue close_notify");
+    assert!(!alert.is_empty(), "close_notify must produce ciphertext");
+    stage_incoming(&mut server, &alert);
+    assert!(
+        !server.peer_sent_close_notify,
+        "staging must not drive the machine"
+    );
+    server
+}
+
+// `ConnectionState::PeerClosed` is edge-triggered (`emitted_peer_closed_state`
+// in rustls): whichever `process_tls_records` call deframes the peer's
+// close_notify is the only one that will ever report it. The send path can be
+// that call — nothing serialises recv ahead of it — so it has to record the
+// flag rather than swallow the state. Dropping it leaves
+// `peer_sent_close_notify` false and makes the peer's following FIN read as a
+// truncation: `eof_truncated()` would report an attack that did not happen.
+#[test]
+fn encrypt_records_a_peer_close_it_deframes() {
+    let mut server = server_with_undriven_peer_close();
+
+    let mut dst = [0u8; 4096];
+    // The result is beside the point — a closed connection cannot encrypt.
+    // What matters is that the edge was not lost on the way to that answer.
+    let _ = encrypt_chunk(&mut server, b"hello", &mut dst);
+
+    assert!(
+        server.peer_sent_close_notify,
+        "the send path consumed the PeerClosed edge without recording it"
+    );
+}
+
+// Same edge, same argument, through the close path: tearing a connection down
+// is exactly when a lost `PeerClosed` would be mistaken for a truncation.
+#[test]
+fn close_notify_records_a_peer_close_it_deframes() {
+    let mut server = server_with_undriven_peer_close();
+
+    let mut out = Vec::new();
+    queue_close_notify(&mut server, &mut out).expect("a closed connection is not an error");
+
+    assert!(
+        server.peer_sent_close_notify,
+        "the close path consumed the PeerClosed edge without recording it"
+    );
+    assert!(
+        out.is_empty(),
+        "a peer that already closed leaves nothing to queue"
+    );
+}
+
+/// A server holding the client's first flight in its ciphertext buffer,
+/// undriven — so the next `process_tls_records` deframes it, queues the
+/// server's reply into `sendable_tls`, and hands back `EncodeTlsData`.
+fn server_with_undriven_peer_flight() -> TlsConn {
+    let (mut server, mut client) = conn_pair();
+    let mut accs = AccumulatorTable::new(2, 1024 * 1024);
+    let (_outcome, hello) = pump(&mut client, &[], &mut accs);
+    assert!(!hello.is_empty(), "client must emit a ClientHello");
+    stage_incoming(&mut server, &hello);
+    server
+}
+
+// `ConnectionState::EncodeTlsData` is destructive to construct: rustls pops the
+// record out of `sendable_tls` and moves it into the value, and never puts it
+// back. So a send path that lets it fall into a catch-all silently destroys a
+// TLS record that was queued for the wire. The engine must name that instead —
+// a generic `WouldBlock` reads as "try again later", which is precisely wrong
+// when a record has just been thrown away.
+//
+// ringline's own call sites cannot reach this (a `ConnCtx` is only handed out
+// once the handshake completes), but the engine is one call away from it, which
+// is why the arm is explicit rather than assumed-unreachable.
+#[test]
+fn encrypt_reports_a_dropped_queued_record() {
+    let mut server = server_with_undriven_peer_flight();
+
+    let mut dst = [0u8; 4096];
+    let err = encrypt_chunk(&mut server, b"hello", &mut dst)
+        .expect_err("a server mid-handshake cannot encrypt application data");
+
+    assert_ne!(
+        err.kind(),
+        std::io::ErrorKind::WouldBlock,
+        "a discarded record must not be reported as retryable backpressure"
+    );
+    assert!(
+        err.to_string().contains("queued TLS record was dropped"),
+        "the error must name what was lost, got: {err}"
+    );
+}
+
+// Same state, same hazard, through the close path — where it is worse: rustls
+// queues a close_notify into `sendable_tls` itself on TLS 1.2 traffic-key
+// exhaustion, so the record this arm refuses to swallow can be the very alert
+// the caller asked for.
+#[test]
+fn close_notify_reports_a_dropped_queued_record() {
+    let mut server = server_with_undriven_peer_flight();
+
+    let mut out = Vec::new();
+    let err = queue_close_notify(&mut server, &mut out)
+        .expect_err("dropping a queued record is not a silent no-op");
+
+    assert!(
+        err.to_string().contains("queued TLS record was dropped"),
+        "the error must name what was lost, got: {err}"
+    );
+    assert!(out.is_empty(), "nothing may be handed to the caller");
+    assert!(
+        !server.close_notify_sent,
+        "no alert was sent, so the close deadline must not be armed"
+    );
 }

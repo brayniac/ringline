@@ -655,7 +655,7 @@ pub(crate) fn encrypt_chunk(
     let mut learned: Option<usize> = None;
 
     let (kind, incoming, _) = conn.split_mut();
-    let result = match kind {
+    let (result, peer_closed) = match kind {
         UnbufferedKind::Server(c) => {
             encrypt_with(c, incoming, plaintext, dst, &mut chunk, &mut learned)
         }
@@ -663,6 +663,11 @@ pub(crate) fn encrypt_chunk(
             encrypt_with(c, incoming, plaintext, dst, &mut chunk, &mut learned)
         }
     };
+    // Recorded before the `?`: the edge is consumed either way, and an
+    // encrypt that fails on a closed connection still owes the flag.
+    if peer_closed {
+        tls_conn.peer_sent_close_notify = true;
+    }
     let written = result?;
 
     if let Some(learned) = learned {
@@ -694,7 +699,8 @@ fn encrypt_with<C: UnbufferedEngine>(
     dst: &mut [u8],
     chunk: &mut usize,
     learned: &mut Option<usize>,
-) -> io::Result<usize> {
+) -> (io::Result<usize>, bool) {
+    let mut peer_closed = false;
     let status = conn.process(incoming.pending());
     let discard = status.discard;
     let result = match status.state {
@@ -729,9 +735,38 @@ fn encrypt_with<C: UnbufferedEngine>(
                 }
             }
         },
-        // Not in steady state. The send path never sees these for a
-        // handshaked connection (ringline only hands out a ConnCtx after the
-        // handshake completes), so this is a guard, not a workflow.
+        // `EncodeTlsData` is destructive to *construct*: `process_tls_records`
+        // pops the record out of `sendable_tls` and moves it into this value
+        // (rustls 0.23.41 `conn/unbuffered.rs`), and never puts it back. So
+        // letting it fall into the catch-all below would drop a queued TLS
+        // record permanently while reporting a bland `WouldBlock`. Encoding it
+        // into `dst` is not the alternative: `dst` is an application-data pool
+        // slot mid-stream, and a handshake record written there reorders the
+        // wire. ringline's own call sites cannot reach this — a `ConnCtx` is
+        // only handed out once the handshake completes, and any successful
+        // `drive` leaves `sendable_tls` empty — but the engine is one direct
+        // call away from it, so the arm is explicit rather than
+        // assumed-unreachable. The catch-all is what made the hazard invisible.
+        Ok(ConnectionState::EncodeTlsData(_)) => Err(io::Error::other(
+            "a queued TLS record was dropped by the encrypt path",
+        )),
+        // `PeerClosed` is edge-triggered (`emitted_peer_closed_state`): if this
+        // `process` is the call that deframes the peer's close_notify, nothing
+        // else will ever report it. Hand it up so the caller can set
+        // `peer_sent_close_notify` — swallowing it turns the following FIN into
+        // a spurious truncation report, a false security signal.
+        Ok(ConnectionState::PeerClosed) => {
+            peer_closed = true;
+            Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "TLS connection not ready to encrypt application data",
+            ))
+        }
+        // Genuinely benign for this path: `BlockedHandshake`,
+        // `TransmitTlsData`, `ReadTraffic`, `Closed`, `ReadEarlyData`, and
+        // whatever `#[non_exhaustive]` adds next. The send path never sees
+        // these for a handshaked connection (ringline only hands out a ConnCtx
+        // after the handshake completes), so this is a guard, not a workflow.
         Ok(_) => Err(io::Error::new(
             io::ErrorKind::WouldBlock,
             "TLS connection not ready to encrypt application data",
@@ -739,7 +774,7 @@ fn encrypt_with<C: UnbufferedEngine>(
         Err(e) => Err(io::Error::other(e)),
     };
     incoming.discard(discard);
-    result
+    (result, peer_closed)
 }
 
 /// Encrypt all of `plaintext`, appending ciphertext to `out`. The mio backend
@@ -818,10 +853,17 @@ pub(crate) fn queue_close_notify(tls_conn: &mut TlsConn, out: &mut Vec<u8>) -> i
         .as_unbuffered_mut()
         .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
     let (kind, incoming, _) = conn.split_mut();
-    let written = match kind {
+    let (result, peer_closed) = match kind {
         UnbufferedKind::Server(c) => close_notify_with(c, incoming, out),
         UnbufferedKind::Client(c) => close_notify_with(c, incoming, out),
-    }?;
+    };
+    // Recorded before the `?`, as in `encrypt_chunk`: the edge is consumed
+    // whatever the result, and a teardown that loses it makes the FIN it is
+    // about to send look like a truncation to nobody's benefit.
+    if peer_closed {
+        tls_conn.peer_sent_close_notify = true;
+    }
+    let written = result?;
     if written > 0 {
         tls_conn.close_notify_sent = true;
     }
@@ -858,7 +900,8 @@ fn close_notify_with<C: UnbufferedEngine>(
     conn: &mut C,
     incoming: &mut CiphertextBuf,
     out: &mut Vec<u8>,
-) -> io::Result<usize> {
+) -> (io::Result<usize>, bool) {
+    let mut peer_closed = false;
     let start = out.len();
     let status = conn.process(incoming.pending());
     let discard = status.discard;
@@ -874,13 +917,35 @@ fn close_notify_with<C: UnbufferedEngine>(
                 }
             }
         }
+        // Destructive to construct, and dropping it discards the record for
+        // good — see the matching arm in [`encrypt_with`] for the rustls
+        // reference. It bites harder here: on TLS 1.2 traffic-key exhaustion
+        // `write_plaintext` calls `send_close_notify()` itself before returning
+        // `EncryptExhausted` (rustls 0.23.41 `common_state.rs`), so the alert
+        // this function exists to send can already be sitting in
+        // `sendable_tls`. The old catch-all popped it, dropped it and returned
+        // `Ok(0)`, leaving `close_notify_sent` false and the peer with a bare
+        // FIN. Encoding it into `out` is deliberately *not* the fix: this
+        // function enters the state machine exactly once on purpose (see
+        // above), so servicing an encode would mean re-entering it and
+        // stranding the alert — the failure this design already avoids.
+        // Named rather than swallowed; see the test.
+        Ok(ConnectionState::EncodeTlsData(_)) => Err(io::Error::other(
+            "a queued TLS record was dropped by the close_notify path",
+        )),
+        // Edge-triggered; see [`encrypt_with`]. Still "nothing to queue" —
+        // a closed connection has no alert to send — but the edge goes up.
+        Ok(ConnectionState::PeerClosed) => {
+            peer_closed = true;
+            Ok(0)
+        }
         // Already closed, or never reached traffic state: nothing to queue.
         Ok(_) => Ok(0),
         Err(e) => Err(io::Error::other(e)),
     };
     // `status` is dead here, so the ciphertext buffer is free again.
     incoming.discard(discard);
-    match result {
+    let result = match result {
         Ok(n) => {
             out.truncate(start + n);
             Ok(n)
@@ -889,7 +954,8 @@ fn close_notify_with<C: UnbufferedEngine>(
             out.truncate(start);
             Err(e)
         }
-    }
+    };
+    (result, peer_closed)
 }
 
 /// Move any stashed plaintext into `sink`, oldest first. Returns `false` if
