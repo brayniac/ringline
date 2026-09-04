@@ -99,16 +99,7 @@ impl TlsInfo {
 pub enum TlsConnKind {
     Buffered(buffered::BufferedKind),
     #[cfg(feature = "tls-unbuffered")]
-    // Not built by any production code path yet -- `TlsTable::create`/
-    // `create_client` only ever build `Buffered`; only `tls::unbuffered::tests`
-    // constructs one, to pin the plumbing. Without this, `-D warnings`
-    // dead_code fires "variant is never constructed" on the plain (non-test)
-    // `lib` build, since `tls` is `pub(crate)` and the test-only constructor
-    // isn't visible from that build. Wiring this engine into `TlsTable` is
-    // follow-on work; remove this once something does. (Same pattern as
-    // `TlsRecvResult::Error` below.)
-    #[allow(dead_code)]
-    Unbuffered(unbuffered::UnbufferedKind),
+    Unbuffered(unbuffered::UnbufferedConn),
 }
 
 impl TlsConnKind {
@@ -130,11 +121,20 @@ impl TlsConnKind {
         }
     }
 
+    /// The unbuffered connection, or `None` if another engine drives this one.
+    #[cfg(feature = "tls-unbuffered")]
+    pub fn as_unbuffered_mut(&mut self) -> Option<&mut unbuffered::UnbufferedConn> {
+        match self {
+            Self::Buffered(_) => None,
+            Self::Unbuffered(c) => Some(c),
+        }
+    }
+
     pub fn wants_write(&self) -> bool {
         match self {
             Self::Buffered(k) => k.wants_write(),
             #[cfg(feature = "tls-unbuffered")]
-            Self::Unbuffered(k) => k.wants_write(),
+            Self::Unbuffered(c) => c.kind().wants_write(),
         }
     }
 
@@ -142,7 +142,7 @@ impl TlsConnKind {
         match self {
             Self::Buffered(k) => k.is_handshaking(),
             #[cfg(feature = "tls-unbuffered")]
-            Self::Unbuffered(k) => k.is_handshaking(),
+            Self::Unbuffered(c) => c.kind().is_handshaking(),
         }
     }
 
@@ -150,7 +150,7 @@ impl TlsConnKind {
         match self {
             Self::Buffered(k) => k.alpn_protocol(),
             #[cfg(feature = "tls-unbuffered")]
-            Self::Unbuffered(k) => k.alpn_protocol(),
+            Self::Unbuffered(c) => c.kind().alpn_protocol(),
         }
     }
 
@@ -158,7 +158,7 @@ impl TlsConnKind {
         match self {
             Self::Buffered(k) => k.negotiated_cipher_suite(),
             #[cfg(feature = "tls-unbuffered")]
-            Self::Unbuffered(k) => k.negotiated_cipher_suite(),
+            Self::Unbuffered(c) => c.kind().negotiated_cipher_suite(),
         }
     }
 
@@ -166,7 +166,7 @@ impl TlsConnKind {
         match self {
             Self::Buffered(k) => k.protocol_version(),
             #[cfg(feature = "tls-unbuffered")]
-            Self::Unbuffered(k) => k.protocol_version(),
+            Self::Unbuffered(c) => c.kind().protocol_version(),
         }
     }
 
@@ -182,7 +182,7 @@ impl TlsConnKind {
         match self {
             Self::Buffered(k) => k.sni_hostname(),
             #[cfg(feature = "tls-unbuffered")]
-            Self::Unbuffered(k) => k.sni_hostname(),
+            Self::Unbuffered(c) => c.kind().sni_hostname(),
         }
     }
 

@@ -18,8 +18,14 @@
 //! the follow-on plan. [`super::ciphertext::CiphertextBuf`] is the
 //! incoming-ciphertext buffer this engine will drive.
 
+use std::collections::VecDeque;
+use std::sync::Arc;
+
 use rustls::client::UnbufferedClientConnection;
+use rustls::pki_types::ServerName;
 use rustls::server::UnbufferedServerConnection;
+
+use super::ciphertext::{CiphertextBuf, INITIAL_SHRINK_TO, MIN_CIPHERTEXT_CAP};
 
 /// A rustls connection driven through the *unbuffered* API
 /// (`process_tls_records` + `WriteTraffic::encrypt`).
@@ -27,15 +33,7 @@ use rustls::server::UnbufferedServerConnection;
 /// Constructible today; not yet driven — feeding ciphertext in and encrypting
 /// records out lands in a follow-on plan (see `docs/journal/2026-09-unbuffered-tls.md`).
 pub enum UnbufferedKind {
-    // Neither variant is built by production code yet (see `TlsConnKind::Unbuffered`
-    // in `tls/mod.rs`); `Client` is constructed by `tests::unbuffered_connection_is_not_buffered`
-    // below, but that's test-only and invisible to the plain `lib` build, and
-    // nothing constructs `Server` at all yet. `-D warnings` dead_code fires
-    // "variant is never constructed" without these -- remove once the engine
-    // is actually wired in.
-    #[allow(dead_code)]
     Server(UnbufferedServerConnection),
-    #[allow(dead_code)]
     Client(UnbufferedClientConnection),
 }
 
@@ -109,13 +107,90 @@ impl UnbufferedKind {
     // `TlsTable::send_close_notify_queued`, its one caller.
 }
 
+/// A TLS connection driven by the unbuffered engine, with the two pieces of
+/// state the buffered engine keeps inside rustls: the incoming-ciphertext
+/// buffer `process_tls_records` deframes out of, and a stash for plaintext
+/// that surfaced on a path with nowhere to put it.
+pub struct UnbufferedConn {
+    kind: UnbufferedKind,
+    /// Received ciphertext awaiting `process_tls_records`. Sized from the
+    /// module constants rather than a `Config` knob — see
+    /// `docs/superpowers/plans/2026-09-04-unbuffered-tls-engine.md`.
+    incoming: CiphertextBuf,
+    /// Plaintext popped from `ReadTraffic` while no [`super::PlaintextSink`]
+    /// was available (i.e. the send path drove the state machine and found
+    /// application data pending). The recv path drains this into the sink
+    /// before touching rustls again, so the byte stream keeps its order.
+    ///
+    /// Expected to stay empty: the recv path always drives until no plaintext
+    /// remains. It exists so that a state machine that surprises us loses
+    /// throughput, not bytes.
+    pending_plaintext: VecDeque<Vec<u8>>,
+    /// Largest plaintext slice known to encrypt into one output buffer of
+    /// `chunk_basis` bytes. Learned from rustls' `required_size` on the first
+    /// `InsufficientSize`, then reused. `0` means "not yet learned".
+    max_plaintext_per_chunk: usize,
+    /// Output buffer size `max_plaintext_per_chunk` was learned against. A
+    /// different size invalidates it.
+    chunk_basis: usize,
+}
+
+impl UnbufferedConn {
+    pub fn new_server(config: Arc<rustls::ServerConfig>) -> Result<Self, rustls::Error> {
+        Ok(Self::wrap(UnbufferedKind::Server(
+            UnbufferedServerConnection::new(config)?,
+        )))
+    }
+
+    pub fn new_client(
+        config: Arc<rustls::ClientConfig>,
+        server_name: ServerName<'static>,
+    ) -> Result<Self, rustls::Error> {
+        Ok(Self::wrap(UnbufferedKind::Client(
+            UnbufferedClientConnection::new(config, server_name)?,
+        )))
+    }
+
+    fn wrap(kind: UnbufferedKind) -> Self {
+        Self {
+            kind,
+            incoming: CiphertextBuf::new(INITIAL_SHRINK_TO, MIN_CIPHERTEXT_CAP),
+            pending_plaintext: VecDeque::new(),
+            max_plaintext_per_chunk: 0,
+            chunk_basis: 0,
+        }
+    }
+
+    pub fn kind(&self) -> &UnbufferedKind {
+        &self.kind
+    }
+
+    /// Borrow the rustls connection, the ciphertext buffer and the deferred
+    /// plaintext stash at once. `process_tls_records` borrows the connection
+    /// *and* the slice handed to it, so the state machine cannot reach these
+    /// through `&mut self` while a `ConnectionState` is alive.
+    pub fn split_mut(
+        &mut self,
+    ) -> (
+        &mut UnbufferedKind,
+        &mut CiphertextBuf,
+        &mut VecDeque<Vec<u8>>,
+    ) {
+        (
+            &mut self.kind,
+            &mut self.incoming,
+            &mut self.pending_plaintext,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use rustls::client::UnbufferedClientConnection;
     use rustls::pki_types::ServerName;
 
+    use super::UnbufferedConn;
     use crate::tls::{TlsConn, TlsConnKind};
 
     fn empty_client_config() -> Arc<rustls::ClientConfig> {
@@ -125,24 +200,34 @@ mod tests {
             .into()
     }
 
+    fn client_conn() -> UnbufferedConn {
+        let server_name: ServerName<'static> = "localhost".try_into().unwrap();
+        UnbufferedConn::new_client(empty_client_config(), server_name)
+            .expect("constructing an unbuffered client connection does not drive the handshake")
+    }
+
     // A connection built on the unbuffered engine reports itself as such:
     // `as_buffered_mut` returns `None` rather than panicking or silently
-    // handing back a buffered view. This only pins the plumbing — driving
-    // the connection (handshake, records) is a later plan.
+    // handing back a buffered view.
     #[test]
     fn unbuffered_connection_is_not_buffered() {
-        let config = empty_client_config();
-        let server_name: ServerName<'static> = "localhost".try_into().unwrap();
-        let client = UnbufferedClientConnection::new(config, server_name)
-            .expect("constructing an unbuffered client connection does not drive the handshake");
-
         let mut tls_conn = TlsConn {
-            conn: TlsConnKind::Unbuffered(super::UnbufferedKind::Client(client)),
+            conn: TlsConnKind::Unbuffered(client_conn()),
             handshake_complete: false,
             peer_sent_close_notify: false,
             close_notify_sent: false,
         };
-
         assert!(tls_conn.conn.as_buffered_mut().is_none());
+        assert!(tls_conn.conn.as_unbuffered_mut().is_some());
+    }
+
+    // A fresh connection starts with an empty ciphertext buffer and no
+    // deferred plaintext; `split_mut` hands back all three parts disjointly.
+    #[test]
+    fn fresh_conn_has_empty_buffers() {
+        let mut conn = client_conn();
+        let (_kind, incoming, pending) = conn.split_mut();
+        assert!(incoming.is_empty());
+        assert!(pending.is_empty());
     }
 }
