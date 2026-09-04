@@ -52,13 +52,20 @@ use crate::completion::OpTag;
 /// all tagged [`OpTag::TlsSend`] — this only ever carries handshake records and
 /// alerts, which never complete a logical application send.
 ///
-/// An empty `ciphertext` appends nothing and succeeds. Returns `false` on pool
-/// exhaustion; sends already appended must still be queued by the caller or
-/// their slots leak (the same contract
-/// [`buffered::take_tls_output_sends`][super::buffered::take_tls_output_sends]
-/// carries).
+/// **All-or-nothing.** Slots are staged locally and appended to `out` only once
+/// the whole blob has one; running out of pool partway releases everything this
+/// call took and appends nothing, returning `false`. Appending a prefix would
+/// put a truncated TLS record on the wire — half a Certificate message is
+/// strictly worse for the peer than none of it — and the callers tear the
+/// connection down on `false` either way. Sends appended to `out` by *earlier*
+/// calls are untouched, which is where this matches
+/// [`buffered::take_tls_output_sends`][super::buffered::take_tls_output_sends]:
+/// it stages into a `PoolWriter` and drains into the caller's vector only on
+/// success, for the same reason.
+///
+/// An empty `ciphertext` appends nothing and succeeds.
 #[cfg(feature = "tls-unbuffered")]
-fn ciphertext_to_sends(
+pub(super) fn ciphertext_to_sends(
     pool: &mut SendCopyPool,
     conn_index: u32,
     generation: u32,
@@ -66,18 +73,28 @@ fn ciphertext_to_sends(
     out: &mut Vec<BuiltSend>,
 ) -> bool {
     let slot_size = pool.slot_size() as usize;
+    // (slot, ciphertext length) in transmission order, same staging shape as
+    // `encrypt_to_sends` below.
+    let mut staged: Vec<(u16, u32)> = Vec::new();
     for chunk in ciphertext.chunks(slot_size) {
         match pool.copy_in(chunk) {
-            Some((slot, ptr, len)) => out.push(build_pool_send(
-                conn_index,
-                generation,
-                ptr,
-                len,
-                slot,
-                OpTag::TlsSend,
-            )),
-            None => return false,
+            Some((slot, _, len)) => staged.push((slot, len)),
+            None => {
+                release_all(pool, &staged);
+                return false;
+            }
         }
+    }
+    for &(slot, len) in &staged {
+        let (ptr, _) = pool.current_ptr_remaining(slot);
+        out.push(build_pool_send(
+            conn_index,
+            generation,
+            ptr,
+            len,
+            slot,
+            OpTag::TlsSend,
+        ));
     }
     true
 }
@@ -273,5 +290,87 @@ pub fn encrypt_to_sends(
 fn release_all(pool: &mut SendCopyPool, filled: &[(u16, u32)]) {
     for &(slot, _) in filled {
         pool.release(slot);
+    }
+}
+
+#[cfg(all(test, feature = "tls-unbuffered"))]
+mod tests {
+    use super::*;
+
+    // Pool exhaustion partway through a blob must append nothing and leak
+    // nothing. A prefix reaching the wire is a truncated TLS record at the
+    // peer, and staged slots have no CQE coming to release them.
+    #[test]
+    fn ciphertext_to_sends_is_all_or_nothing_on_exhaustion() {
+        let mut pool = SendCopyPool::new(2, 64);
+        let mut out = Vec::new();
+        // Three slots' worth of output into a two-slot pool: the third
+        // `copy_in` is the one that fails.
+        let ciphertext = vec![0xA5u8; 3 * 64];
+
+        assert!(
+            !ciphertext_to_sends(&mut pool, 0, 0, &ciphertext, &mut out),
+            "exhaustion must be reported to the caller"
+        );
+        assert!(
+            out.is_empty(),
+            "a partial blob must not reach the send queue"
+        );
+        assert_eq!(
+            pool.free_count(),
+            2,
+            "every slot this call took must be released"
+        );
+    }
+
+    // Output already in `out` from an earlier call is the caller's, and a
+    // later failure must not disturb it.
+    #[test]
+    fn ciphertext_to_sends_leaves_earlier_sends_alone() {
+        let mut pool = SendCopyPool::new(3, 64);
+        let mut out = Vec::new();
+
+        assert!(ciphertext_to_sends(&mut pool, 0, 0, &[7u8; 16], &mut out));
+        assert_eq!(out.len(), 1);
+
+        // Two slots left, three needed.
+        assert!(!ciphertext_to_sends(
+            &mut pool,
+            0,
+            0,
+            &[9u8; 3 * 64],
+            &mut out
+        ));
+        assert_eq!(out.len(), 1, "the earlier call's send must survive");
+        assert_eq!(pool.free_count(), 2, "only the first call still holds one");
+    }
+
+    // The success path splits across slots in order and appends one send each.
+    #[test]
+    fn ciphertext_to_sends_chunks_across_slots() {
+        let mut pool = SendCopyPool::new(4, 64);
+        let mut out = Vec::new();
+        let ciphertext = vec![0x5Au8; 130];
+
+        assert!(ciphertext_to_sends(&mut pool, 0, 0, &ciphertext, &mut out));
+        assert_eq!(out.len(), 3, "130 bytes over 64-byte slots is 64 + 64 + 2");
+        assert_eq!(
+            out.iter().map(|b| b.total_len).sum::<u32>(),
+            130,
+            "every byte must be accounted for exactly once"
+        );
+        assert_eq!(out[2].total_len, 2, "the tail slot carries the remainder");
+        assert_eq!(pool.free_count(), 1);
+    }
+
+    // An empty blob is a no-op, not a failure: `feed`/`flush` call this
+    // unconditionally and the steady state has no handshake output at all.
+    #[test]
+    fn ciphertext_to_sends_accepts_an_empty_blob() {
+        let mut pool = SendCopyPool::new(2, 64);
+        let mut out = Vec::new();
+        assert!(ciphertext_to_sends(&mut pool, 0, 0, &[], &mut out));
+        assert!(out.is_empty());
+        assert_eq!(pool.free_count(), 2);
     }
 }

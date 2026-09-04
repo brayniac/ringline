@@ -101,17 +101,17 @@ impl UnbufferedKind {
     // close_notify") already designs the real mechanism,
     // `WriteTraffic::queue_close_notify(&mut self, outgoing_tls: &mut
     // [u8])`, reachable only from inside the `process_tls_records` state
-    // machine. Wiring that in is part of driving the engine (a later plan).
-    // `TlsConnKind::send_close_notify` doesn't exist either, for the same
-    // reason -- see `buffered::BufferedKind::send_close_notify` and
+    // machine. That is what [`queue_close_notify`] below does, and both
+    // backends' close paths go through it. `TlsConnKind::send_close_notify`
+    // doesn't exist either, for the same reason -- see
+    // `buffered::BufferedKind::send_close_notify` and
     // `TlsTable::send_close_notify_queued`, its one caller.
 }
 
 /// A TLS connection driven by the unbuffered engine, alongside the state the
 /// buffered engine instead keeps inside rustls: the incoming-ciphertext
 /// buffer, a stash for plaintext that surfaced on a path with nowhere to put
-/// it, and a chunk-sizing cache the send path will use once `encrypt` lands
-/// (write-only until then).
+/// it, and the chunk-sizing cache [`encrypt_chunk`] reads on every send.
 pub struct UnbufferedConn {
     kind: UnbufferedKind,
     /// Received ciphertext awaiting `process_tls_records`. Deliberately sized

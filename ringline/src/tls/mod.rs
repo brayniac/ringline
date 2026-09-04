@@ -405,20 +405,16 @@ impl TlsTable {
             if unbuffered::queue_close_notify(tls_conn, &mut scratch).is_err() {
                 return;
             }
-            let slot_size = send_copy_pool.slot_size() as usize;
-            for chunk in scratch.chunks(slot_size) {
-                let Some((slot, ptr, len)) = send_copy_pool.copy_in(chunk) else {
-                    return;
-                };
-                out.push(build_pool_send(
-                    conn_index,
-                    generation,
-                    ptr,
-                    len,
-                    slot,
-                    crate::completion::OpTag::TlsSend,
-                ));
-            }
+            // Shared with the recv/flush paths rather than re-chunked here, so
+            // the all-or-nothing contract has one implementation: a truncated
+            // alert on the wire is worse than none.
+            let _ = backend_uring::ciphertext_to_sends(
+                send_copy_pool,
+                conn_index,
+                generation,
+                &scratch,
+                out,
+            );
         }
         // Bound as `b`, not `buffered`: the module of that name is used on the
         // next line, and a value/module name collision here reads as a bug.
