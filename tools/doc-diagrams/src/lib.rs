@@ -85,7 +85,7 @@ const CLAIMS: &[Claim] = &[
         meaning: "one in-flight send per connection",
     },
     Claim {
-        path: "ringline/src/tls.rs",
+        path: "ringline/src/tls/mod.rs",
         needle: "HandshakeJustCompleted",
         meaning: "TLS handshake gates application task",
     },
