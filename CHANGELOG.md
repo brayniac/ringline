@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-03
+
+Coordinated breaking release carrying four batched API changes (see Changed)
+and memcache binary protocol support. Crate versions: **ringline 0.6.0**;
+**ringline-redis / -memcache 0.7.0**;
+**ringline-ping / -http / -grpc / -quic / -h2 / -h3 0.6.0**.
+
 ### Added
 
 - `ringline-memcache`: **binary protocol support**, via
