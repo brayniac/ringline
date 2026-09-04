@@ -25,6 +25,7 @@ use crate::accumulator::AccumulatorTable;
 use crate::buffer::send_copy::SendCopyPool;
 
 mod buffered;
+mod ciphertext;
 
 // Glob re-export keeps call sites at `crate::tls::*`. When a second engine
 // module lands, two globs sharing a name compile fine and fail only at the
