@@ -4,7 +4,8 @@
 //! `WriteTraffic::encrypt`, removing the copy into rustls' internal plaintext
 //! buffer that the buffered engine pays.
 //!
-//! Implemented in a follow-on plan; this module exists so the
+//! Implemented in a follow-on (see `docs/journal/2026-09-unbuffered-tls.md`);
+//! this module exists so the
 //! `tls-unbuffered` feature builds and is exercised by CI from the start.
 //!
 //! Note the current `tls/mod.rs` split is by file size, not cleanly by engine:
