@@ -258,6 +258,11 @@ pub(crate) enum DriveOutcome {
 /// Application data is *not* encrypted here: that is the send path's
 /// `WriteTraffic::encrypt`, which writes straight into a pool slot. `out` only
 /// ever carries handshake records and alerts.
+///
+/// `HandshakeJustCompleted` takes precedence over `Closed` when both happen on
+/// one call: a caller reading only the return value learns of that close on
+/// its *next* `drive`. Nothing is lost — `peer_sent_close_notify` is already
+/// set, so `eof_truncated()` stays correct in the meantime.
 pub(crate) fn drive(
     tls_conn: &mut TlsConn,
     mut sink: Option<&mut PlaintextSink<'_>>,
@@ -340,6 +345,12 @@ fn drive_inner<C: UnbufferedEngine>(
                             // 0.23.41; honoured so an in-place-decryption
                             // release does not silently desynchronise us.
                             discard += r.discard;
+                            // Overflow drops this record where the `None` arm
+                            // below would stash it: `status.discard` was fixed
+                            // before the loop, so the ciphertext is gone either
+                            // way, and overflow returns `Error` — teardown, no
+                            // retry. Stashing would only defer bytes nobody
+                            // will read.
                             match sink.as_deref_mut() {
                                 Some(PlaintextSink::Accumulator(accs)) => {
                                     if !accs.append(conn_index, r.payload) {
@@ -486,10 +497,10 @@ fn drain_pending_plaintext(
                 if outstanding.saturating_add(chunk.len()) > *max {
                     return false;
                 }
-                *outstanding += chunk.len();
                 hold.push_back(crate::backend::HeldRecvBuf::Owned(
                     bytes::Bytes::copy_from_slice(chunk),
                 ));
+                *outstanding += chunk.len();
             }
         }
         pending.pop_front();
@@ -604,19 +615,19 @@ mod tests {
         (outcome, out)
     }
 
-    // A full handshake completes when each side's output is fed to the other
-    // and both are driven by `drive()` alone. Both report
-    // HandshakeJustCompleted exactly once.
-    #[test]
-    fn drive_completes_a_handshake() {
-        let (mut server, mut client) = conn_pair();
-        let mut accs = AccumulatorTable::new(2, 4096);
-
+    /// Run both sides to a completed handshake by feeding each one's output to
+    /// the other, using `drive()` alone. Returns how many times each side
+    /// reported `HandshakeJustCompleted`, as (client, server).
+    fn handshake(
+        server: &mut TlsConn,
+        client: &mut TlsConn,
+        accs: &mut AccumulatorTable,
+    ) -> (u32, u32) {
         let mut client_completions = 0;
         let mut server_completions = 0;
 
         // Client speaks first (ClientHello) with no input.
-        let (outcome, mut to_server) = pump(&mut client, &[], &mut accs);
+        let (outcome, mut to_server) = pump(client, &[], accs);
         if matches!(outcome, DriveOutcome::HandshakeJustCompleted) {
             client_completions += 1;
         }
@@ -625,7 +636,7 @@ mod tests {
         let mut to_client = Vec::new();
         for _ in 0..10 {
             if !to_server.is_empty() {
-                let (o, out) = pump(&mut server, &to_server, &mut accs);
+                let (o, out) = pump(server, &to_server, accs);
                 assert!(!matches!(o, DriveOutcome::Error(_)), "server drive: {o:?}");
                 if matches!(o, DriveOutcome::HandshakeJustCompleted) {
                     server_completions += 1;
@@ -634,7 +645,7 @@ mod tests {
                 to_client = out;
             }
             if !to_client.is_empty() {
-                let (o, out) = pump(&mut client, &to_client, &mut accs);
+                let (o, out) = pump(client, &to_client, accs);
                 assert!(!matches!(o, DriveOutcome::Error(_)), "client drive: {o:?}");
                 if matches!(o, DriveOutcome::HandshakeJustCompleted) {
                     client_completions += 1;
@@ -649,10 +660,96 @@ mod tests {
 
         assert!(!client.conn.is_handshaking(), "client handshake stalled");
         assert!(!server.conn.is_handshaking(), "server handshake stalled");
+        (client_completions, server_completions)
+    }
+
+    /// Test-only: drive to `WriteTraffic` and encrypt `plaintext` into `dst` in
+    /// one call, returning the ciphertext length. The real send path — with
+    /// chunk sizing against a pool slot — is a later task; this exists so the
+    /// recv-side sink bound can be tested before it lands.
+    fn encrypt_one_shot(
+        kind: &mut super::UnbufferedKind,
+        incoming: &mut super::CiphertextBuf,
+        plaintext: &[u8],
+        dst: &mut [u8],
+    ) -> usize {
+        match kind {
+            super::UnbufferedKind::Server(c) => encrypt_with(c, incoming, plaintext, dst),
+            super::UnbufferedKind::Client(c) => encrypt_with(c, incoming, plaintext, dst),
+        }
+    }
+
+    fn encrypt_with<C: super::UnbufferedEngine>(
+        conn: &mut C,
+        incoming: &mut super::CiphertextBuf,
+        plaintext: &[u8],
+        dst: &mut [u8],
+    ) -> usize {
+        let status = conn.process(incoming.pending());
+        assert_eq!(
+            status.discard, 0,
+            "a completed handshake leaves no ciphertext to discard"
+        );
+        match status.state {
+            Ok(super::ConnectionState::WriteTraffic(mut wt)) => wt
+                .encrypt(plaintext, dst)
+                .expect("dst is sized for the payload"),
+            _ => panic!("expected WriteTraffic after a completed handshake"),
+        }
+    }
+
+    // A full handshake completes when each side's output is fed to the other
+    // and both are driven by `drive()` alone. Both report
+    // HandshakeJustCompleted exactly once.
+    #[test]
+    fn drive_completes_a_handshake() {
+        let (mut server, mut client) = conn_pair();
+        let mut accs = AccumulatorTable::new(2, 4096);
+
+        let (client_completions, server_completions) =
+            handshake(&mut server, &mut client, &mut accs);
+
         assert!(client.handshake_complete);
         assert!(server.handshake_complete);
         assert_eq!(client_completions, 1, "completion must be edge-triggered");
         assert_eq!(server_completions, 1, "completion must be edge-triggered");
+    }
+
+    // A plaintext flood that overruns the accumulator's bound must fail the
+    // connection, not silently drop bytes: the caller's contract for
+    // `DriveOutcome::Error` is "tear this connection down". Mirrors
+    // `drain_tls_plaintext`'s `false` return in the buffered engine.
+    #[test]
+    fn plaintext_over_the_sink_bound_fails_the_connection() {
+        let (mut server, mut client) = conn_pair();
+        // Bound the accumulator well below the payload.
+        let mut accs = AccumulatorTable::new_with_max(2, 1024, 4096);
+        handshake(&mut server, &mut client, &mut accs);
+        accs.reset(0);
+
+        // Encrypt more application data than the accumulator will accept.
+        // 32 KiB (three records once framed) rather than more: the whole
+        // ciphertext goes in through one `CiphertextBuf::append`, which
+        // debug-asserts a `MAX_SINGLE_APPEND` (64 KiB) bound.
+        let plaintext = vec![0x7Eu8; 32 * 1024];
+        let mut cipher = vec![0u8; 48 * 1024];
+        let n = {
+            let (kind, incoming, _) = client.conn.as_unbuffered_mut().unwrap().split_mut();
+            encrypt_one_shot(kind, incoming, &plaintext, &mut cipher)
+        };
+        cipher.truncate(n);
+
+        let (_, incoming, _) = server.conn.as_unbuffered_mut().unwrap().split_mut();
+        incoming
+            .append(&cipher)
+            .expect("test append stays under the cap");
+        let mut out = Vec::new();
+        let mut sink = PlaintextSink::Accumulator(&mut accs);
+        let outcome = drive(&mut server, Some(&mut sink), &mut out, 0);
+        assert!(
+            matches!(outcome, DriveOutcome::Error(_)),
+            "over-bound plaintext must fail the connection, got {outcome:?}"
+        );
     }
 
     // `BlockedHandshake` with nothing to send is a quiet return, not an error
