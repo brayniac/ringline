@@ -31,6 +31,7 @@
 #![allow(dead_code)]
 
 use std::collections::VecDeque;
+use std::io;
 use std::sync::Arc;
 
 use rustls::client::{ClientConnectionData, UnbufferedClientConnection};
@@ -38,7 +39,7 @@ use rustls::pki_types::ServerName;
 use rustls::server::{ServerConnectionData, UnbufferedServerConnection};
 use rustls::unbuffered::{ConnectionState, EncodeError, UnbufferedStatus};
 
-use super::ciphertext::{CiphertextBuf, INITIAL_SHRINK_TO, MIN_CIPHERTEXT_CAP};
+use super::ciphertext::{CiphertextBuf, INITIAL_SHRINK_TO, MAX_SINGLE_APPEND, MIN_CIPHERTEXT_CAP};
 use super::{PlaintextSink, TlsConn};
 
 /// A rustls connection driven through the *unbuffered* API
@@ -469,6 +470,92 @@ fn drive_inner<C: UnbufferedEngine>(
     }
 }
 
+/// Combine the outcome of one `drive` within a [`feed`] with the running one.
+///
+/// `HandshakeJustCompleted` and `Closed` are edge-triggered — reported once,
+/// on the call that observed them — so a later plain `Ok` from another chunk
+/// of the same `feed` must not erase them. `drive` only re-reports handshake
+/// completion while `was_handshaking` holds, which it no longer does, so a
+/// dropped edge is dropped permanently.
+fn fold_outcome(last: DriveOutcome, next: DriveOutcome) -> DriveOutcome {
+    if !matches!(next, DriveOutcome::Ok) || matches!(last, DriveOutcome::Ok) {
+        next
+    } else {
+        last
+    }
+}
+
+/// Append received ciphertext and drive the state machine over it.
+///
+/// `ciphertext` is chunked at [`MAX_SINGLE_APPEND`]: `CiphertextBuf::append`
+/// `debug_assert`s that bound (silent in release), and it is reachable from
+/// public config — `ConfigBuilder::recv_buffer` accepts buffer sizes above
+/// 64 KiB and the io_uring recv path hands one whole provided buffer here.
+///
+/// `append` is all-or-nothing and returns `WouldBlock` when the buffer holds
+/// only live data. That is backpressure, not an error: drive first (which
+/// discards what rustls consumed), then retry. If a drive frees nothing and
+/// the append still refuses, the connection is unrecoverable — `append` would
+/// otherwise be retried forever. `MIN_CIPHERTEXT_CAP` is sized so this cannot
+/// happen for a conforming peer; the check is what stops a non-conforming one
+/// from spinning the worker.
+pub(crate) fn feed(
+    tls_conn: &mut TlsConn,
+    mut sink: Option<&mut PlaintextSink<'_>>,
+    out: &mut Vec<u8>,
+    ciphertext: &[u8],
+    conn_index: u32,
+) -> DriveOutcome {
+    let mut last = DriveOutcome::Ok;
+    for chunk in ciphertext.chunks(MAX_SINGLE_APPEND) {
+        loop {
+            let Some(conn) = tls_conn.conn.as_unbuffered_mut() else {
+                return DriveOutcome::Error(rustls::Error::General(
+                    "connection not driven by the unbuffered TLS engine".into(),
+                ));
+            };
+            let (_, incoming, _) = conn.split_mut();
+            let before = incoming.len();
+            match incoming.append(chunk) {
+                Ok(()) => break,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    // Drain, then retry. Each retry requires the drive to have
+                    // strictly shrunk the live set, so the loop terminates; a
+                    // drive that frees nothing means the buffer is full of data
+                    // rustls will not consume.
+                    let outcome = drive(tls_conn, sink.as_deref_mut(), out, conn_index);
+                    if let DriveOutcome::Error(err) = outcome {
+                        return DriveOutcome::Error(err);
+                    }
+                    let (_, incoming, _) = tls_conn
+                        .conn
+                        .as_unbuffered_mut()
+                        .expect("engine checked above")
+                        .split_mut();
+                    if incoming.len() >= before {
+                        return DriveOutcome::Error(rustls::Error::General(
+                            "TLS ciphertext buffer full and undrainable".into(),
+                        ));
+                    }
+                    last = fold_outcome(last, outcome);
+                }
+                Err(e) => {
+                    return DriveOutcome::Error(rustls::Error::General(e.to_string()));
+                }
+            }
+        }
+        let outcome = drive(tls_conn, sink.as_deref_mut(), out, conn_index);
+        if matches!(outcome, DriveOutcome::Error(_)) {
+            return outcome;
+        }
+        last = fold_outcome(last, outcome);
+    }
+    if ciphertext.is_empty() {
+        return drive(tls_conn, sink, out, conn_index);
+    }
+    last
+}
+
 /// Move any stashed plaintext into `sink`, oldest first. Returns `false` if
 /// the sink hit its bound — the chunk is left in the stash and the caller must
 /// kill the connection, matching `drain_tls_plaintext`'s contract.
@@ -514,7 +601,7 @@ mod tests {
 
     use rustls::pki_types::ServerName;
 
-    use super::{DriveOutcome, UnbufferedConn, drive};
+    use super::{DriveOutcome, MAX_SINGLE_APPEND, UnbufferedConn, drive, feed};
     use crate::accumulator::AccumulatorTable;
     use crate::tls::{PlaintextSink, TlsConn, TlsConnKind};
 
@@ -749,6 +836,48 @@ mod tests {
         assert!(
             matches!(outcome, DriveOutcome::Error(_)),
             "over-bound plaintext must fail the connection, got {outcome:?}"
+        );
+    }
+
+    // Handshake ciphertext delivered in one-byte pieces drives the machine
+    // without erroring: each partial record leaves it BlockedHandshake, and
+    // the byte that completes the ClientHello produces the response. This is
+    // the ingest path's basic contract — `feed` must never treat "not enough
+    // yet" as failure.
+    #[test]
+    fn feed_handshake_bytes_in_small_pieces() {
+        let (mut server, mut client) = conn_pair();
+        let mut accs = AccumulatorTable::new(2, 4096);
+        let (_, hello) = pump(&mut client, &[], &mut accs);
+
+        let mut out = Vec::new();
+        let mut sink = PlaintextSink::Accumulator(&mut accs);
+        for b in &hello {
+            let outcome = feed(&mut server, Some(&mut sink), &mut out, &[*b], 0);
+            assert!(!matches!(outcome, DriveOutcome::Error(_)), "{outcome:?}");
+        }
+        assert!(!out.is_empty(), "server must answer a complete ClientHello");
+    }
+
+    // A single `feed` call larger than MAX_SINGLE_APPEND is chunked rather
+    // than tripping `append`'s debug_assert. `ConfigBuilder::recv_buffer`
+    // accepts buffer sizes above 64 KiB, so this is reachable from public
+    // config; the assert is silent in release.
+    #[test]
+    fn feed_chunks_oversized_input() {
+        let (mut server, _client) = conn_pair();
+        let mut accs = AccumulatorTable::new(2, 4096);
+
+        // Garbage, but it must be *appended* in chunks before rustls rejects
+        // it — the assertion is that we get a clean protocol error rather
+        // than a debug_assert panic.
+        let junk = vec![0u8; MAX_SINGLE_APPEND * 2 + 7];
+        let mut out = Vec::new();
+        let mut sink = PlaintextSink::Accumulator(&mut accs);
+        let outcome = feed(&mut server, Some(&mut sink), &mut out, &junk, 0);
+        assert!(
+            matches!(outcome, DriveOutcome::Error(_)),
+            "unparseable ciphertext must be a protocol error, got {outcome:?}"
         );
     }
 
