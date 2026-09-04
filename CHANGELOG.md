@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `tls-unbuffered` cargo feature (default off): drives TLS through rustls'
+  unbuffered record layer, encrypting application data directly from caller
+  memory into a send-pool slot. Takes TLS application-data sends from 2 copies
+  to 1 on both backends; TLS recv is unchanged. Known limitations: the io_uring
+  handshake path (ClientHello/certificates/Finished, not the steady-state
+  application-data path) pays one copy more than the buffered engine, since
+  `EncodeTlsData::encode` needs one contiguous output buffer that can exceed a
+  pool slot; and `TlsInfo::sni_hostname()` is always `None` for server
+  connections on this engine (rustls exposes no equivalent of
+  `ServerConnection::server_name()` on `UnbufferedServerConnection` — would
+  need a `ClientHello` callback on `ServerConfig`, tracked as follow-on work).
+  See `docs/tls-unbuffered-design.md`.
+
 ## [0.6.1] - 2026-09-04
 
 Core-only patch release: **ringline 0.6.1**. No client crate changed since

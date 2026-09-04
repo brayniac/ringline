@@ -1,6 +1,6 @@
 # Unbuffered TLS send path
 
-- **Status:** open (foundation shipped; engine not yet built)
+- **Status:** open (engine shipped on both backends; interop and rig sweep are plan 4)
 - **Span:** 2026-09-03 → · PR #338 · unreleased (post-0.6.0)
 
 Written after the foundation landed rather than before it, contrary to this
@@ -108,6 +108,112 @@ risk but named the opposite direction — the one that is actually free.
 ## Outcome
 
 Foundation only. No copy has been removed yet; the engine is plan 2.
+(Superseded — the engine landed. See "Plan 3 — the engine" below.)
+
+### Plan 3 — the engine (2026-09-04)
+
+The engine is real: `drive()` runs rustls' eight-state machine, `encrypt_chunk`
+writes application-data ciphertext straight into a pool slot, and close_notify
+goes through `WriteTraffic::queue_close_notify`. Both backends build and test
+green under `--features tls-unbuffered`.
+
+**The copy win is application data only, and on io_uring it comes with a
+handshake-side cost.** `WriteTraffic::encrypt` reads plaintext from caller
+memory and writes ciphertext straight into the pool slot (io_uring) or the
+queued buffer (mio) — that path is genuinely 1 copy, down from 2, on both
+backends. But `EncodeTlsData::encode` — the handshake path — is all-or-nothing
+on one contiguous `&mut [u8]` and does not take an `io::Write`, and a full-size
+handshake record can exceed the default 16384-byte `send_copy_slot_size`. The
+buffered engine's `PoolWriter` wrote handshake output straight into pool slots
+(1 copy); the unbuffered engine can't, so handshake output goes rustls →
+scratch `Vec` → pool slot (2 copies) — one *more* than buffered, on io_uring
+only (mio has no pool-slot step either way, so its handshake output stays 1
+copy under both engines). Handshake is once per connection, not the
+steady-state path this work targets, but the copy tables now say so explicitly
+rather than claiming an unqualified win.
+
+**Recv is unchanged at 1 copy, on both engines.** rustls 0.23.41's
+`ReadTraffic::next_record` pops an owned `Vec` out of `received_plaintext`
+rather than decrypting in place — the unbuffered API's `_incoming_tls` field is
+kept only "for forwards compatibility; to support in-place decryption in the
+future" (that's rustls' own comment, not ours). So plaintext still has to be
+copied into the `RecvAccumulator`. Nobody should read the send-side win and
+assume recv moved too.
+
+**`TlsInfo::sni_hostname()` is always `None` for server connections on this
+engine**, and stays that way until follow-on work. rustls has no equivalent of
+`ServerConnection::server_name()` on `UnbufferedServerConnection` —
+`server_name()` lives only on the handshake-callback `ClientHello` type and on
+the buffered `ServerConnection`. Recovering it needs a `ClientHello` callback
+on `ServerConfig`. Real, user-visible, in the CHANGELOG.
+
+**A pre-existing io_uring bug, found but not fixed here.** `ConnCtx::close()`
+(`runtime/io.rs`) calls `Driver::close_connection`, which on io_uring only sets
+`recv_mode = Closed` and tears down recv/forward-write state — it never queues
+close_notify. The TLS close_notify queueing lives in `DriverCtx::close(conn:
+ConnToken)` (`handler.rs`), a different function the `ConnCtx::close()` path
+never reaches. So an io_uring TLS server that closes a connection from inside
+its own handler (the common case) sends a bare FIN, not a close_notify alert —
+the peer can't distinguish that from truncation. This reproduces against the
+**buffered** engine too; it predates this effort entirely and isn't caused by
+either engine. Filed here rather than fixed, since it's out of scope for a
+docs-only task and deserves its own change with its own tests.
+
+Five things the design doc did not anticipate, all found while building
+(design-doc `> **Correction**` blocks record the first three in place; the
+other two are here because they're more process than design):
+
+- **`process_tls_records` is not callable generically.** rustls implements it
+  separately per connection role, and the shared body is private, so
+  `ConnectionState<'_, '_, Data>` differs between `UnbufferedClientConnection`
+  and `UnbufferedServerConnection` — no single non-generic function can match
+  on both. The engine needed a private `UnbufferedEngine` trait with an
+  associated `Data` type, dispatched once at the top of `drive()`; the state
+  machine body monomorphizes from there.
+- **Re-entering `process_tls_records` on a sizing retry is unsound, and it bit
+  twice in two different functions before the pattern was recognized.**
+  `write_plaintext`'s `perhaps_write_key_update()` and
+  `eager_send_close_notify`'s `send_close_notify()` both queue into
+  `sendable_tls` *before* the caller ever calls `check_required_size`, and
+  `process_tls_records_common` pops `sendable_tls` into the next
+  `EncodeTlsData` before `WriteTraffic` is reachable again. A naive
+  "try `encrypt`, get `InsufficientSize`, re-enter the state machine and try
+  again" retry therefore lands on a *different* state than the one it started
+  in. The close_notify case failed silently: the alert got stranded inside
+  rustls, `close_notify_sent` was never set, and the connection closed as a
+  truncation rather than a clean shutdown — no panic, no error, just a wrong
+  answer that only a wire capture would catch. Both call sites now enter the
+  state machine once, hold the `WriteTraffic` handle across the whole retry
+  loop, and never re-enter for a sizing-only reason.
+- **Never drive the machine to "flush" after encrypting or queueing an
+  alert.** `write_fragments` drains `sendable_tls` into the *front* of the
+  destination buffer, and `check_required_size` reserves room for it — so
+  anything already queued (a TLS 1.3 `key_update`, most notably) rides out
+  ahead of the fragments about to be encrypted, correctly ordered, as a side
+  effect of the same `encrypt`/`queue_close_notify` call. Driving the machine
+  again afterwards and emitting that queued output as a *separate* send would
+  put it after the already-encrypted records on the wire instead of before —
+  the peer would see `bad_record_mac`. This only had to be gotten right once
+  because it was caught in review, not in a wire capture, but it's exactly the
+  kind of mistake this journal exists to keep someone from making twice.
+- **`MAX_SINGLE_APPEND` (64 KiB) is reachable from public config, not just an
+  internal assumption.** `ConfigBuilder::recv_buffer` accepts buffers larger
+  than that, and the io_uring recv path hands one whole provided buffer to the
+  TLS feed in one call. `CiphertextBuf::append`'s `debug_assert` on the 64 KiB
+  bound is silent in a release build, so `feed()` chunks its own appends at
+  `MAX_SINGLE_APPEND` rather than trusting the caller to stay under it.
+- **Dead-code lints are invisible on macOS for this whole module, and that
+  cost a red branch once and was rediscovered twice more.** `lib.rs` applies
+  `#[cfg_attr(not(has_io_uring), allow(dead_code))]` to all of `tls` (it
+  predates this feature — `buffer`, `chain`, `completion`, `fs`, `nvme` etc.
+  carry the same attribute), so a clean local `cargo clippy -D warnings` on
+  macOS says nothing about unwired unbuffered-engine surface. Only Linux CI
+  (or `hv01`) actually lints it.
+
+Still open, deferred to plan 4: interop testing (buffered client ↔ unbuffered
+server and the reverse — streams can't be byte-identical, so the assertion is
+interoperability, not equality), and the chunk-size rig sweep the design doc's
+open question 1 always deferred to measurement.
 
 ## Lessons / open questions
 

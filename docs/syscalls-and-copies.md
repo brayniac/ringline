@@ -192,8 +192,17 @@ fully zero-copy.
 | `send_parts()` with `.copy()` parts | 1 | All copy parts gathered into one pool slot. |
 | `send_parts()` with `.guard()` parts | 0 | `SendMsgZc` iovecs point at the caller's memory; the `SendGuard` is held in `InFlightSendSlab` until the kernel's notification CQE confirms the DMA. Routed through the copy path below `send_zc_threshold` (default 4096 — measured crossover is 1–4 KiB). |
 | Mixed `.copy()` + `.guard()` | 1 (copy parts only) | Copy parts → pool slot; guard parts zero-copy via iovec. |
-| Any send under TLS | 2 | Encryption must read plaintext and write ciphertext, so guard zero-copy is impossible — but rustls encrypts *directly into the pool slot* (an `io::Write` adapter over the slot in `tls/buffered.rs`), so TLS caps at one extra copy, and records are serialized through the per-connection send queue for ordering. |
+| Any send under TLS (buffered engine, default) | 2 | Encryption must read plaintext and write ciphertext, so guard zero-copy is impossible — but rustls encrypts *directly into the pool slot* (an `io::Write` adapter over the slot in `tls/buffered.rs`), so TLS caps at one extra copy, and records are serialized through the per-connection send queue for ordering. |
+| Application-data send under TLS (`tls-unbuffered` feature, both backends) | 1 | `WriteTraffic::encrypt` reads plaintext from caller memory and writes ciphertext straight into the pool slot (io_uring) or the queued `Vec` (mio) — no `sendable_plaintext` bounce. Parity with a plaintext send. See `ringline/src/tls/backend_uring.rs::encrypt_to_sends` / `backend_mio.rs::encrypt_for_send_mio`. |
+| TLS handshake output under `tls-unbuffered`, io_uring only | 2 | `EncodeTlsData::encode` needs one contiguous output buffer that can exceed the default 16384-byte `send_copy_slot_size`, and takes no `io::Write`. Handshake ciphertext goes rustls → a scratch `Vec` → pool slot — one copy *more* than the buffered engine's direct `PoolWriter`. Handshake-only; application data still encrypts straight into the slot. On mio there is no pool-slot step, so handshake output stays 1 copy on both engines. |
 | Any send on the mio backend | 1 | Zero-copy degrades: guards are consumed by copying. NVMe is unsupported and fs/direct I/O move to a thread pool. |
+
+TLS *receive* is unchanged at 1 copy on both engines: rustls 0.23.41's
+unbuffered `ReadTraffic::next_record` pops an owned plaintext chunk from
+`received_plaintext` rather than decrypting in place (the incoming-ciphertext
+buffer is kept only "for forwards compatibility"), so the copy into the
+`RecvAccumulator` remains. The `tls-unbuffered` feature is a send-path change
+only.
 
 ### Protocol clients
 
