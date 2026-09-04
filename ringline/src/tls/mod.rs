@@ -98,7 +98,14 @@ impl TlsInfo {
 /// which both engine families `Deref` to -- stay on this enum.
 pub enum TlsConnKind {
     Buffered(buffered::BufferedKind),
+    // Nothing constructs this until `TlsTable::create`/`create_client` select
+    // the unbuffered engine; until then the variant is genuinely dead and
+    // `-D warnings` fails on it. Not visible locally on macOS: `lib.rs`
+    // applies `#[cfg_attr(not(has_io_uring), allow(dead_code))]` to this whole
+    // module, so only a Linux build catches it. Remove when engine selection
+    // is wired up.
     #[cfg(feature = "tls-unbuffered")]
+    #[allow(dead_code)]
     Unbuffered(unbuffered::UnbufferedConn),
 }
 
