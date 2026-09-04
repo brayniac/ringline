@@ -150,6 +150,15 @@ pub struct UnbufferedConn {
     max_plaintext_per_chunk: usize,
     /// Output buffer size `max_plaintext_per_chunk` was learned against. A
     /// different size invalidates it.
+    ///
+    /// One entry, keyed on that size: a connection alternating between two
+    /// destination sizes never hits, and pays an `InsufficientSize` round-trip
+    /// on every send. Correct, just worthless. It cannot happen today —
+    /// `SendCopyPool::alloc_raw` hands back the uniform `slot_size` for every
+    /// slot — but `docs/tls-unbuffered-design.md`'s chunk-size open question
+    /// floats giving TLS its own slot class, which would introduce exactly
+    /// that. Widen the cache then, against the real io_uring shape, not
+    /// speculatively now.
     chunk_basis: usize,
 }
 
@@ -764,6 +773,17 @@ pub(crate) fn encrypt_to_vec(
     let mut offset = 0;
     while offset < plaintext.len() {
         let start = out.len();
+        // The zero-fill is redundant work: rustls writes the whole `used_ct`
+        // prefix before anything reads it, and the tail is truncated away. It
+        // costs roughly one extra pass over the payload, on a path whose point
+        // is removing a pass over the payload — but this function backs the
+        // mio path and the tests only. io_uring encrypts into pool slots and
+        // never comes through here, so the backend this effort targets does
+        // not pay it. Removing it means `reserve` + `set_len` and an
+        // accompanying safety argument; that trade is not worth taking on an
+        // unmeasured cost on the non-target backend. The chunk-size sweep in
+        // `docs/tls-unbuffered-design.md`'s open questions is what would
+        // measure it.
         out.resize(start + DST, 0);
         // Every exit below trims `out` back: on failure the caller must not be
         // handed the zeroed scratch this resize appended.
