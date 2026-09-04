@@ -17,18 +17,25 @@
 //! actually reachable that way from every engine's connection type — so the
 //! feature-gated [`TlsConnKind::Unbuffered`] variant (wrapping
 //! [`unbuffered::UnbufferedConn`]) adds a match arm to those, rather than
-//! forcing every caller to unwrap an engine first. `TlsConn`, `TlsTable` and
-//! `drain_tls_plaintext` still assume a buffered connection wherever they
-//! reach past `TlsConnKind` (e.g. `reader()` for plaintext draining, or
-//! constructing `BufferedKind` directly in `TlsTable::create`); the
-//! unbuffered engine is constructible but not yet driven — threading it
-//! through those is follow-on work.
+//! forcing every caller to unwrap an engine first.
+//!
+//! Which engine drives a connection is decided once, in
+//! [`TlsTable::create`]/[`TlsTable::create_client`], by the `tls-unbuffered`
+//! cargo feature. Backends never see that choice: `backend_mio` dispatches the
+//! mio entry points to whichever engine is compiled in. The io_uring entry
+//! points (`feed_tls_recv`/`flush_tls_output`/`encrypt_to_sends`) and
+//! `drain_tls_plaintext` still reach past `TlsConnKind` into the buffered
+//! engine and panic on an unbuffered connection — wiring those is follow-on
+//! work, so the feature is mio-only for now.
 
 #[allow(unused_imports)]
 use std::io::{self, Read as _, Write as _};
 use std::sync::Arc;
 
 use rustls::pki_types::ServerName;
+// Only the buffered engine constructs these directly; the unbuffered build
+// reaches rustls through `unbuffered::UnbufferedConn` instead.
+#[cfg(not(feature = "tls-unbuffered"))]
 use rustls::{ClientConnection, ServerConnection};
 
 #[allow(unused_imports)]
@@ -37,15 +44,26 @@ use crate::accumulator::AccumulatorTable;
 #[allow(unused_imports)]
 use crate::buffer::send_copy::SendCopyPool;
 
+#[cfg(not(has_io_uring))]
+mod backend_mio;
 mod buffered;
+// The incoming-ciphertext buffer belongs to the unbuffered engine and has no
+// other consumer, so it shares the engine's gate; without it every item in the
+// module is dead code in a default build.
+#[cfg(feature = "tls-unbuffered")]
 mod ciphertext;
 #[cfg(feature = "tls-unbuffered")]
 mod unbuffered;
 
-// Glob re-export keeps call sites at `crate::tls::*`. When a second engine
-// module lands, two globs sharing a name compile fine and fail only at the
-// call site with E0659; give the engines distinct names, cfg-gate so only one
-// glob is live, or switch to explicit re-exports at that point.
+// Glob re-export keeps call sites at `crate::tls::*`. The io_uring entry
+// points (`feed_tls_recv`/`flush_tls_output`/`encrypt_to_sends`) still come
+// straight from the buffered engine; wiring them to a dispatcher the way the
+// mio ones are is follow-on work. On mio the glob would re-export nothing —
+// `buffered`'s mio halves are `pub(super)` under `*_buffered` names, reachable
+// only from `backend_mio`, which owns the shared names instead.
+#[cfg(not(has_io_uring))]
+pub use backend_mio::*;
+#[cfg(has_io_uring)]
 pub use buffered::*;
 
 /// Information about a negotiated TLS session.
@@ -97,15 +115,11 @@ impl TlsInfo {
 /// runtime surprise. Only operations rustls exposes through `CommonState` --
 /// which both engine families `Deref` to -- stay on this enum.
 pub enum TlsConnKind {
+    /// Never constructed in a `tls-unbuffered` build — see
+    /// [`buffered::BufferedKind`] for why the allow is scoped this narrowly.
+    #[cfg_attr(feature = "tls-unbuffered", allow(dead_code))]
     Buffered(buffered::BufferedKind),
-    // Nothing constructs this until `TlsTable::create`/`create_client` select
-    // the unbuffered engine; until then the variant is genuinely dead and
-    // `-D warnings` fails on it. Not visible locally on macOS: `lib.rs`
-    // applies `#[cfg_attr(not(has_io_uring), allow(dead_code))]` to this whole
-    // module, so only a Linux build catches it. Remove when engine selection
-    // is wired up.
     #[cfg(feature = "tls-unbuffered")]
-    #[allow(dead_code)]
     Unbuffered(unbuffered::UnbufferedConn),
 }
 
@@ -129,7 +143,12 @@ impl TlsConnKind {
     }
 
     /// The unbuffered connection, or `None` if another engine drives this one.
+    ///
+    /// Only `backend_mio` and the engine's own code call this, so an io_uring
+    /// build has no caller yet — see the note at the top of
+    /// [`unbuffered`][mod@unbuffered].
     #[cfg(feature = "tls-unbuffered")]
+    #[cfg_attr(has_io_uring, allow(dead_code))]
     pub fn as_unbuffered_mut(&mut self) -> Option<&mut unbuffered::UnbufferedConn> {
         match self {
             Self::Buffered(_) => None,
@@ -255,14 +274,25 @@ impl TlsTable {
     }
 
     /// Create a new TLS server connection at the given index.
+    ///
+    /// The engine is selected here, once per connection, and fixed for its
+    /// lifetime: the `tls-unbuffered` feature picks rustls' unbuffered record
+    /// layer, otherwise the buffered one. See
+    /// `docs/tls-unbuffered-design.md` ("Path selection").
     pub fn create(&mut self, conn_index: u32) -> Result<(), rustls::Error> {
         let server_config = self
             .server_config
             .as_ref()
-            .expect("create() called without server_config");
-        let conn = ServerConnection::new(server_config.clone())?;
+            .expect("create() called without server_config")
+            .clone();
+        #[cfg(feature = "tls-unbuffered")]
+        let conn = TlsConnKind::Unbuffered(unbuffered::UnbufferedConn::new_server(server_config)?);
+        #[cfg(not(feature = "tls-unbuffered"))]
+        let conn = TlsConnKind::Buffered(buffered::BufferedKind::Server(ServerConnection::new(
+            server_config,
+        )?));
         self.conns[conn_index as usize] = Some(TlsConn {
-            conn: TlsConnKind::Buffered(buffered::BufferedKind::Server(conn)),
+            conn,
             handshake_complete: false,
             peer_sent_close_notify: false,
             close_notify_sent: false,
@@ -270,7 +300,8 @@ impl TlsTable {
         Ok(())
     }
 
-    /// Create a new TLS client connection at the given index.
+    /// Create a new TLS client connection at the given index. Engine selection
+    /// as in [`Self::create`].
     pub fn create_client(
         &mut self,
         conn_index: u32,
@@ -279,10 +310,20 @@ impl TlsTable {
         let client_config = self
             .client_config
             .as_ref()
-            .expect("create_client() called without client_config");
-        let conn = ClientConnection::new(client_config.clone(), server_name)?;
+            .expect("create_client() called without client_config")
+            .clone();
+        #[cfg(feature = "tls-unbuffered")]
+        let conn = TlsConnKind::Unbuffered(unbuffered::UnbufferedConn::new_client(
+            client_config,
+            server_name,
+        )?);
+        #[cfg(not(feature = "tls-unbuffered"))]
+        let conn = TlsConnKind::Buffered(buffered::BufferedKind::Client(ClientConnection::new(
+            client_config,
+            server_name,
+        )?));
         self.conns[conn_index as usize] = Some(TlsConn {
-            conn: TlsConnKind::Buffered(buffered::BufferedKind::Client(conn)),
+            conn,
             handshake_complete: false,
             peer_sent_close_notify: false,
             close_notify_sent: false,
@@ -481,5 +522,47 @@ fn build_pool_send(
         pool_slot,
         slab_idx: u16::MAX,
         total_len: len,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn server_config() -> Arc<rustls::ServerConfig> {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+        let cert_der = rustls::pki_types::CertificateDer::from(cert.cert);
+        Arc::new(
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert_der], key.into())
+                .unwrap(),
+        )
+    }
+
+    // Engine selection happens once, in `create`, and follows the cargo
+    // feature. Without this, every test in `tls_echo.rs` passes with the
+    // feature on and the unbuffered engine never actually selected — which is
+    // exactly the state this task starts from.
+    #[test]
+    fn create_selects_the_engine_the_build_asked_for() {
+        let mut table = TlsTable::new(4, Some(server_config()), None);
+        table.create(0).expect("create a server connection");
+        let conn = table.get_mut(0).expect("connection exists");
+
+        #[cfg(feature = "tls-unbuffered")]
+        {
+            assert!(
+                conn.conn.as_unbuffered_mut().is_some(),
+                "tls-unbuffered build must select the unbuffered engine"
+            );
+            assert!(conn.conn.as_buffered_mut().is_none());
+        }
+        #[cfg(not(feature = "tls-unbuffered"))]
+        assert!(
+            conn.conn.as_buffered_mut().is_some(),
+            "default build must select the buffered engine"
+        );
     }
 }

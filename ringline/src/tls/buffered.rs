@@ -18,6 +18,16 @@ use super::*;
 
 /// A rustls connection driven through the *buffered* API
 /// (`read_tls` / `process_new_packets` / `write_tls` / `send_close_notify`).
+///
+/// With `tls-unbuffered` on, `TlsTable::create`/`create_client` build the
+/// other engine, so nothing constructs these variants — the buffered engine
+/// is compiled but unselected. That is the point of the feature, not dead
+/// code to delete: dropping the feature must bring the whole engine back. The
+/// allow is scoped to the two constructors so the rest of the module still
+/// has to justify itself. Invisible on mio, where `lib.rs` masks the whole
+/// `tls` module; a Linux io_uring build with the feature is what fails
+/// `-D warnings` without it.
+#[cfg_attr(feature = "tls-unbuffered", allow(dead_code))]
 pub enum BufferedKind {
     Server(ServerConnection),
     Client(ClientConnection),
@@ -493,13 +503,12 @@ pub fn encrypt_to_sends(
 
 // ── Mio backend TLS helpers ─────────────────────────────────────────────
 
-/// Feed received ciphertext into the TLS connection, decrypt plaintext into
-/// the accumulator, and flush any TLS output (handshake responses, alerts).
-///
-/// Mio version: writes ciphertext directly to the TcpStream instead of
-/// submitting io_uring SQEs.
+/// Buffered-engine half of [`super::backend_mio::feed_tls_recv_mio`]: feed
+/// received ciphertext into the TLS connection, decrypt plaintext into the
+/// accumulator, and queue any TLS output (handshake responses, alerts) onto
+/// the connection's send FIFO.
 #[cfg(not(has_io_uring))]
-pub fn feed_tls_recv_mio(
+pub(super) fn feed_tls_recv_mio_buffered(
     tls_table: &mut TlsTable,
     accumulators: &mut AccumulatorTable,
     pending: &mut std::collections::VecDeque<crate::backend::mio::driver::PendingSend>,
@@ -582,10 +591,10 @@ pub fn feed_tls_recv_mio(
     TlsRecvResult::Ok
 }
 
-/// Flush pending TLS output to the network via direct stream write.
-/// Public entry point takes `&mut TlsTable`.
+/// Buffered-engine half of [`super::backend_mio::flush_tls_output_mio_queued`]:
+/// drain rustls' pending TLS output onto the connection's send FIFO.
 #[cfg(not(has_io_uring))]
-pub fn flush_tls_output_mio_queued(
+pub(super) fn flush_tls_output_mio_queued_buffered(
     tls_table: &mut TlsTable,
     pending: &mut std::collections::VecDeque<crate::backend::mio::driver::PendingSend>,
     conn_index: u32,
@@ -620,11 +629,13 @@ fn flush_tls_output_mio_inner(
     pending.push_back((std::mem::take(write_buf), 0, None));
 }
 
-/// Direct-write flush for close paths (close_notify): the connection is
-/// being torn down, so best-effort nonblocking writes are appropriate —
-/// there is no later flush opportunity.
+/// Buffered-engine half of [`super::backend_mio::flush_tls_output_mio_direct`]:
+/// direct-write flush for close paths (close_notify). The connection is being
+/// torn down, so best-effort nonblocking writes are appropriate — there is no
+/// later flush opportunity. The alert itself was queued by the caller's
+/// `send_close_notify`; this only drains what rustls already holds.
 #[cfg(not(has_io_uring))]
-pub fn flush_tls_output_mio_direct(
+pub(super) fn flush_tls_output_mio_direct_buffered(
     tls_table: &mut TlsTable,
     stream: &mut mio::net::TcpStream,
     conn_index: u32,
@@ -646,12 +657,12 @@ pub fn flush_tls_output_mio_direct(
     }
 }
 
-/// Encrypt plaintext and return the ciphertext for buffered sending.
-/// Mio version: encrypts data and returns ciphertext bytes. The caller
-/// pushes the result into the pending_sends queue for the event loop to
-/// flush when the socket is writable.
+/// Buffered-engine half of [`super::backend_mio::encrypt_for_send_mio`]:
+/// encrypt plaintext and return the ciphertext bytes. The caller pushes the
+/// result into the pending_sends queue for the event loop to flush when the
+/// socket is writable.
 #[cfg(not(has_io_uring))]
-pub fn encrypt_for_send_mio(
+pub(super) fn encrypt_for_send_mio_buffered(
     tls_table: &mut TlsTable,
     conn_index: u32,
     plaintext: &[u8],
@@ -692,7 +703,7 @@ pub fn encrypt_for_send_mio(
 /// Borrow a connection slot and the shared write_buf from a TlsTable simultaneously.
 /// This is the borrow-splitting helper: `conns[i]` and `write_buf` are disjoint fields.
 #[cfg(not(has_io_uring))]
-fn borrow_conn_and_buf(
+pub(super) fn borrow_conn_and_buf(
     table: &mut TlsTable,
     conn_index: u32,
 ) -> (&mut Option<TlsConn>, &mut Vec<u8>) {

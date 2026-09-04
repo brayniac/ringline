@@ -30,14 +30,12 @@ use std::io;
 /// payload, and a 2 KiB overhead budget (AEAD expansion / TLS 1.2 explicit
 /// nonce / content-type byte) — rustls 0.23's `MAX_WIRE_SIZE`, not RFC 8446's
 /// smaller 2^14 + 256.
-#[allow(dead_code)] // Wired up by the unbuffered engine; see docs/journal/2026-09-unbuffered-tls.md
 pub(crate) const MAX_TLS_WIRE_RECORD: usize = 5 + 16_384 + 2_048;
 
 /// Largest live set rustls may leave unprocessed. Its unbuffered path joins
 /// handshake messages spanning records *inside the caller's buffer*, up to
 /// `MAX_HANDSHAKE_SIZE` (0xffff), returning `discard == 0` until the message
 /// completes. Until then the caller cannot drain a byte.
-#[allow(dead_code)] // Wired up by the unbuffered engine; see docs/journal/2026-09-unbuffered-tls.md
 pub(crate) const MAX_UNPROCESSABLE: usize = 0xffff + MAX_TLS_WIRE_RECORD;
 
 /// Largest single `append` the recv path may perform. `append` itself
@@ -45,7 +43,6 @@ pub(crate) const MAX_UNPROCESSABLE: usize = 0xffff + MAX_TLS_WIRE_RECORD;
 /// derivation assumes it: the engine's recv buffer must be sized at or below
 /// this so every `append` call stays within the bound the derivation relies
 /// on.
-#[allow(dead_code)] // Wired up by the unbuffered engine; see docs/journal/2026-09-unbuffered-tls.md
 pub(crate) const MAX_SINGLE_APPEND: usize = 64 * 1024;
 
 /// Minimum workable `cap`.
@@ -56,13 +53,11 @@ pub(crate) const MAX_SINGLE_APPEND: usize = 64 * 1024;
 /// complete message and can drain. Halve this and you get a remotely
 /// triggerable hang: a peer positions `start` with application data, then sends
 /// a large incomplete handshake flight.
-#[allow(dead_code)] // Wired up by the unbuffered engine; see docs/journal/2026-09-unbuffered-tls.md
 pub(crate) const MIN_CIPHERTEXT_CAP: usize = 2 * MAX_UNPROCESSABLE + MAX_SINGLE_APPEND;
 
 /// Allocation a fully drained buffer falls back to. Above
 /// `MAX_TLS_WIRE_RECORD` so a single max-size record cannot trigger a
 /// grow/shrink cycle on every exchange.
-#[allow(dead_code)] // Wired up by the unbuffered engine; see docs/journal/2026-09-unbuffered-tls.md
 pub(crate) const INITIAL_SHRINK_TO: usize = 32 * 1024;
 
 /// Contiguous buffer of received ciphertext awaiting `process_tls_records`.
@@ -73,7 +68,6 @@ pub(crate) const INITIAL_SHRINK_TO: usize = 32 * 1024;
 /// `Vec::extend_from_slice` writing the bytes actually received. See
 /// `reserved`'s doc comment for why the allocation ceiling this type reports
 /// is tracked as a separate field rather than read back off `Vec::capacity()`.
-#[allow(dead_code)] // Wired up by the unbuffered engine; see docs/journal/2026-09-unbuffered-tls.md
 pub(crate) struct CiphertextBuf {
     buf: Vec<u8>,
     /// First unprocessed byte.
@@ -108,7 +102,6 @@ pub(crate) struct CiphertextBuf {
     bytes_moved: u64,
 }
 
-#[allow(dead_code)] // Wired up by the unbuffered engine; see docs/journal/2026-09-unbuffered-tls.md
 impl CiphertextBuf {
     /// `initial` is the starting allocation; `cap` the hard ceiling, raised to
     /// [`MIN_CIPHERTEXT_CAP`] if smaller. Tests may pass a smaller `cap` via
@@ -146,10 +139,16 @@ impl CiphertextBuf {
         self.end - self.start
     }
 
+    /// Test-only: the engine tracks emptiness through [`Self::len`]; this
+    /// backs `UnbufferedConn::set_ciphertext_cap_for_test`'s guard.
+    #[allow(dead_code)]
     pub(crate) fn is_empty(&self) -> bool {
         self.start == self.end
     }
 
+    /// Diagnostic only: asserted by the compaction tests, never consulted by
+    /// the engine.
+    #[allow(dead_code)]
     pub(crate) fn bytes_moved(&self) -> u64 {
         self.bytes_moved
     }
@@ -157,6 +156,9 @@ impl CiphertextBuf {
     /// Current backing allocation ceiling (not the same as `len()`; includes
     /// already-consumed and not-yet-written-but-reserved capacity). This is
     /// `reserved`, not `Vec::capacity()` -- see that field's doc comment.
+    ///
+    /// Diagnostic only, like [`Self::bytes_moved`].
+    #[allow(dead_code)]
     pub(crate) fn capacity(&self) -> usize {
         self.reserved
     }

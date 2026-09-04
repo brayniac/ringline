@@ -4,31 +4,27 @@
 //! `WriteTraffic::encrypt`, removing the copy into rustls' internal plaintext
 //! buffer that the buffered engine pays.
 //!
-//! Implemented in a follow-on (see `docs/journal/2026-09-unbuffered-tls.md`);
-//! this module exists so the
-//! `tls-unbuffered` feature builds and is exercised by CI from the start.
+//! Selected per connection by the `tls-unbuffered` feature in
+//! `TlsTable::create`, and driven end-to-end on the mio backend through
+//! [`super::backend_mio`]. The io_uring entry points still assume the buffered
+//! engine, so the feature is mio-only for now (see
+//! `docs/journal/2026-09-unbuffered-tls.md`).
 //!
-//! `TlsConnKind` now carries an [`UnbufferedConn`] arm (see `tls/mod.rs`), so
-//! this engine is constructible and reachable through the shared
-//! `CommonState` accessors — but nothing yet feeds it ciphertext or drives a
-//! handshake. `TlsConn`, `TlsTable` and `drain_tls_plaintext` still assume
-//! the buffered engine wherever they reach past `TlsConnKind` (e.g.
-//! `reader()` for plaintext draining, or constructing `BufferedKind`
-//! directly in `TlsTable::create`); wiring a second engine through those is
-//! the follow-on plan. [`super::ciphertext::CiphertextBuf`] is the
-//! incoming-ciphertext buffer this engine will drive.
+//! [`feed`] ingests received ciphertext through
+//! [`super::ciphertext::CiphertextBuf`] and runs [`drive`], the
+//! `ConnectionState` loop, until it blocks; handshake records and alerts land
+//! in the caller's `out` buffer, decrypted plaintext in a [`PlaintextSink`].
+//! [`encrypt_to_vec`]/[`encrypt_chunk`] are the send path, and
+//! [`queue_close_notify`] the shutdown one.
 
-// The whole engine is unreferenced until `TlsTable::create` is pointed at it:
-// the constructors, the state machine, and the chunk-sizing cache are all
-// reachable only from code that does not exist yet. A module-level allow is
-// the honest granularity — the alternative is sprinkling six attributes that
-// all say the same thing. REMOVE THIS when engine selection is wired up;
-// leaving it would silence real dead code in the finished engine.
-//
-// This lint is invisible on macOS: `lib.rs` applies
-// `#[cfg_attr(not(has_io_uring), allow(dead_code))]` to the whole `tls`
-// module, so only a Linux build fails on it.
-#![allow(dead_code)]
+// The engine is reached only through `super::backend_mio`, so an io_uring
+// build compiles it with no consumer at all: `TlsTable::create` constructs an
+// `UnbufferedConn` and nothing ever drives it. Wiring the io_uring entry points
+// (`feed_tls_recv`/`flush_tls_output`/`encrypt_to_sends`) is the follow-on
+// task; DELETE THIS ATTRIBUTE THERE. Deliberately gated rather than blanket —
+// on mio the engine is live, so real dead code in it still fails `-D warnings`
+// (locally, on `Test (mio)`, and on `Test (macOS)`).
+#![cfg_attr(has_io_uring, allow(dead_code))]
 
 use std::collections::VecDeque;
 use std::io;
