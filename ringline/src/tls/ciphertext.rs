@@ -66,18 +66,43 @@ pub(crate) const MIN_CIPHERTEXT_CAP: usize = 2 * MAX_UNPROCESSABLE + MAX_SINGLE_
 pub(crate) const INITIAL_SHRINK_TO: usize = 32 * 1024;
 
 /// Contiguous buffer of received ciphertext awaiting `process_tls_records`.
+///
+/// The backing `Vec<u8>` is never zero-filled: reserved-but-unwritten
+/// capacity is left uninitialized (demand-paged, untouched by the CPU) and
+/// `buf.len()` is kept equal to `end` at all times, extended only by
+/// `Vec::extend_from_slice` writing the bytes actually received. See
+/// `reserved`'s doc comment for why the allocation ceiling this type reports
+/// is tracked as a separate field rather than read back off `Vec::capacity()`.
 #[allow(dead_code)] // Wired up by the unbuffered engine; see docs/journal/2026-09-unbuffered-tls.md
 pub(crate) struct CiphertextBuf {
     buf: Vec<u8>,
     /// First unprocessed byte.
     start: usize,
-    /// One past the last byte written.
+    /// One past the last byte written. Invariant: `buf.len() == end` always
+    /// (compaction truncates to match; growth only reserves capacity, it
+    /// never extends `len`) — so the only bytes ever exposed as "logically
+    /// present" in `buf` are bytes this type actually wrote via `append`.
     end: usize,
-    /// Hard ceiling on `buf.len()`.
+    /// Hard ceiling on `reserved`.
     cap: usize,
     /// Caller-requested starting allocation, honored again by the post-drain
     /// shrink target (not just on construction).
     initial: usize,
+    /// Allocation ceiling this buffer has explicitly requested, via the
+    /// initial `Vec::with_capacity` or a subsequent `Vec::reserve_exact`.
+    ///
+    /// This is deliberately not `Vec::capacity()`: `reserve`/`reserve_exact`
+    /// are documented to allow the allocator to hand back more than asked
+    /// for ("the allocator may give the collection more space than it
+    /// requests"), and letting that rounding leak into `capacity()` would
+    /// mean the `cap` invariant is only as tight as whatever the allocator
+    /// felt like doing that day — not a property of this type's own
+    /// arithmetic. `reserved` mirrors exactly the value `grow_to` computes
+    /// (`needed.next_power_of_two().min(cap).max(needed)`), so a bug in that
+    /// arithmetic (e.g. a stale `needed` defeating the `.min(cap)` clamp)
+    /// still shows up here even if the allocator would have rounded a bad
+    /// value up to something that happened to look fine.
+    reserved: usize,
     /// Total bytes relocated by compaction. Diagnostic; asserted by tests to
     /// stay linear in throughput.
     bytes_moved: u64,
@@ -96,12 +121,18 @@ impl CiphertextBuf {
     /// [`MIN_CIPHERTEXT_CAP`] cannot hold a real handshake flight, and can
     /// deadlock — see the module doc.
     pub(crate) fn with_cap_unchecked(initial: usize, cap: usize) -> Self {
+        let reserved = initial.min(cap);
         Self {
-            buf: vec![0u8; initial.min(cap)],
+            // `with_capacity` reserves the allocation without initializing
+            // it -- unlike `vec![0u8; n]`, no memset, and the untouched
+            // pages stay demand-paged (never resident) until actually
+            // written by `append`.
+            buf: Vec::with_capacity(reserved),
             start: 0,
             end: 0,
             cap,
             initial,
+            reserved,
             bytes_moved: 0,
         }
     }
@@ -123,10 +154,11 @@ impl CiphertextBuf {
         self.bytes_moved
     }
 
-    /// Current backing allocation size (not the same as `len()`; includes
-    /// already-consumed and not-yet-written capacity).
+    /// Current backing allocation ceiling (not the same as `len()`; includes
+    /// already-consumed and not-yet-written-but-reserved capacity). This is
+    /// `reserved`, not `Vec::capacity()` -- see that field's doc comment.
     pub(crate) fn capacity(&self) -> usize {
-        self.buf.len()
+        self.reserved
     }
 
     /// Drop `n` bytes from the front, per rustls' `UnbufferedStatus::discard`
@@ -144,6 +176,10 @@ impl CiphertextBuf {
         if self.start == self.end {
             self.start = 0;
             self.end = 0;
+            // Keep the `buf.len() == end` invariant. Free: no data movement,
+            // no drop work for `u8`, and the allocation is retained -- same
+            // "reset is free" cost as before.
+            self.buf.clear();
             // Hysteresis: only release a genuinely oversized allocation, so a
             // connection oscillating near the threshold does not churn. This
             // is a deliberate memory-for-churn trade, not a bug: a connection
@@ -155,10 +191,14 @@ impl CiphertextBuf {
             // cycles; tightening the `>` to `>=` would catch that one-flight
             // case but pushes the same measurement to ~1000 reallocations.
             let target = self.initial.max(INITIAL_SHRINK_TO).min(self.cap);
-            if self.buf.len() > 4 * target {
-                self.buf = vec![0u8; target];
+            if self.reserved > 4 * target {
+                // Drop the oversized allocation and reserve a fresh,
+                // unfilled one -- same non-zero-fill discipline as
+                // construction.
+                self.buf = Vec::with_capacity(target);
+                self.reserved = target;
             }
-            debug_assert!(self.buf.len() <= self.cap);
+            debug_assert!(self.reserved <= self.cap);
         }
     }
 
@@ -182,13 +222,30 @@ impl CiphertextBuf {
              MIN_CIPHERTEXT_CAP's no-deadlock derivation assumes this bound",
             src.len()
         );
-        if self.end + src.len() > self.buf.len() {
+        if self.end + src.len() > self.buf.capacity() {
             self.make_room(src.len())?;
         }
-        let end = self.end;
-        self.buf[end..end + src.len()].copy_from_slice(src);
-        self.end += src.len();
+        self.write_tail(src);
         Ok(())
+    }
+
+    /// Write `src` at `end`, extending `buf`'s logical length to match.
+    ///
+    /// Uses `Vec::extend_from_slice` rather than indexing into a pre-sized
+    /// slice: it copies `src` directly into the already-reserved spare
+    /// capacity and only then advances `len`, so it never reads or exposes
+    /// bytes this type has not itself written -- the reserved-but-unused
+    /// tail of `buf` stays uninitialized (and, in practice, unfaulted) the
+    /// whole time. Capacity for `end + src.len()` bytes must already be
+    /// reserved by the caller (`append`'s `make_room` call).
+    fn write_tail(&mut self, src: &[u8]) {
+        debug_assert_eq!(self.buf.len(), self.end, "buf length must track `end`");
+        debug_assert!(
+            self.buf.capacity() >= self.end + src.len(),
+            "write_tail called without reserving room first"
+        );
+        self.buf.extend_from_slice(src);
+        self.end += src.len();
     }
 
     /// Ensure `additional` bytes fit after `end`.
@@ -212,14 +269,14 @@ impl CiphertextBuf {
                 "TLS ciphertext exceeds the configured buffer cap",
             ));
         }
-        if self.end + additional <= self.buf.len() {
+        if self.end + additional <= self.buf.capacity() {
             return Ok(()); // already fits at the tail
         }
 
         if self.start >= live {
             // Compaction pays for itself.
             self.compact();
-            if self.end + additional > self.buf.len() {
+            if self.end + additional > self.buf.capacity() {
                 self.grow_to(self.end + additional);
             }
             return Ok(());
@@ -254,12 +311,27 @@ impl CiphertextBuf {
         Ok(())
     }
 
-    /// Resize to hold at least `needed` bytes, never exceeding `cap`.
+    /// Reserve capacity for at least `needed` bytes, never exceeding `cap`.
+    /// Reserves only -- does not touch `buf`'s logical length or initialize
+    /// the new capacity; that happens lazily, in `write_tail`, only for
+    /// bytes actually received.
     fn grow_to(&mut self, needed: usize) {
         debug_assert!(needed <= self.cap, "grow_to past the cap");
         let new_len = needed.next_power_of_two().min(self.cap).max(needed);
-        self.buf.resize(new_len, 0);
-        debug_assert!(self.buf.len() <= self.cap, "allocation exceeded the cap");
+        debug_assert!(
+            new_len >= self.buf.len(),
+            "grow_to must never shrink below the current length"
+        );
+        // `reserve_exact`, not `reserve`: we already apply our own
+        // power-of-two growth policy above, so we don't also want Vec's
+        // amortized-growth heuristic padding on top of it.
+        self.buf.reserve_exact(new_len - self.buf.len());
+        self.reserved = new_len;
+        debug_assert!(
+            self.buf.capacity() >= new_len,
+            "reserve_exact under-reserved"
+        );
+        debug_assert!(self.reserved <= self.cap, "allocation exceeded the cap");
     }
 
     fn compact(&mut self) {
@@ -268,6 +340,12 @@ impl CiphertextBuf {
         }
         let live = self.len();
         self.buf.copy_within(self.start..self.end, 0);
+        // Keep the `buf.len() == end` invariant: the bytes past `live` are
+        // still-initialized (they're stale copies of real received data,
+        // not new zero-fill), but they're no longer part of the live
+        // window, so drop them from `buf`'s logical length rather than
+        // leaving `write_tail`'s invariant to reason about the gap.
+        self.buf.truncate(live);
         self.bytes_moved += live as u64;
         self.start = 0;
         self.end = live;
@@ -411,5 +489,44 @@ mod tests {
             "allocation {} exceeded cap 32",
             b.capacity()
         );
+    }
+
+    /// Pins the 800 GbE-motivated property directly: `CiphertextBuf` must
+    /// never initialize (zero-fill or otherwise touch) bytes the peer has
+    /// not sent, even when constructed with a large `cap`. RSS itself isn't
+    /// measurable in-process, so this asserts on the honest in-process proxy
+    /// -- `Vec::len()` vs `Vec::capacity()` -- rather than trying to sample
+    /// memory: a reservation-based buffer's `len()` tracks only what was
+    /// actually appended, never jumping up to `capacity()`/`cap` the way
+    /// `vec![0u8; n]` or `Vec::resize(n, 0)` would. A large, mostly-unwritten
+    /// reservation is exactly the case the repo's demand-paging finding
+    /// depends on: untouched pages behind `capacity()` are never faulted in,
+    /// so they cost no resident memory -- a property zero-filling forfeits
+    /// outright.
+    #[test]
+    fn growth_does_not_initialize_unreceived_bytes() {
+        const LARGE_CAP: usize = 1 << 20; // 1 MiB
+
+        let mut b = CiphertextBuf::with_cap_unchecked(LARGE_CAP, LARGE_CAP);
+        assert_eq!(
+            b.buf.len(),
+            0,
+            "constructing with a 1 MiB initial/cap must not eagerly fill it"
+        );
+
+        b.append(b"hello").unwrap();
+
+        assert_eq!(
+            b.buf.len(),
+            5,
+            "Vec length must track only the bytes actually received, not \
+             capacity or cap"
+        );
+        assert!(
+            b.buf.capacity() >= LARGE_CAP,
+            "capacity should still reflect the requested reservation"
+        );
+        assert_eq!(b.len(), 5);
+        assert_eq!(b.pending(), b"hello");
     }
 }
