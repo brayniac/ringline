@@ -4,12 +4,25 @@
 //! submodules. `buffered` drives rustls' buffered `Connection` API
 //! (`read_tls`/`process_new_packets`/`write_tls`).
 //!
-//! Note the split is currently by *file size*, not cleanly by engine:
-//! `TlsConnKind`, `TlsConn`, `TlsTable` and `drain_tls_plaintext` are still
-//! tied to the buffered API (`ClientConnection`/`ServerConnection`,
-//! `reader()`/`writer()`). Only `TlsInfo`, `TlsRecvResult`, `PlaintextSink`
-//! and `build_pool_send` are genuinely engine-agnostic. Adding a second
-//! engine will require threading an engine dimension through the former set.
+//! `TlsConnKind` is tagged by engine: [`TlsConnKind::Buffered`] wraps
+//! [`buffered::BufferedKind`], which carries the buffered-only surface
+//! (`read_tls`/`write_tls`/`process_new_packets`/`reader`/`writer`/
+//! `send_close_notify`). `send_close_notify` lives there rather than on
+//! `TlsConnKind` because it isn't actually `CommonState`-reachable from the
+//! unbuffered connection types (`UnbufferedConnectionCommon` derefs to
+//! `CommonState` but doesn't `DerefMut` to it) — a shared-looking method
+//! name that turned out to be buffered-only once checked against rustls
+//! 0.23.41, the same way `read_tls` et al. are. `TlsConnKind` itself keeps
+//! only the methods rustls exposes through `CommonState` and that are
+//! actually reachable that way from every engine's connection type — so the
+//! feature-gated [`TlsConnKind::Unbuffered`] variant (wrapping
+//! [`unbuffered::UnbufferedKind`]) adds a match arm to those, rather than
+//! forcing every caller to unwrap an engine first. `TlsConn`, `TlsTable` and
+//! `drain_tls_plaintext` still assume a buffered connection wherever they
+//! reach past `TlsConnKind` (e.g. `reader()` for plaintext draining, or
+//! constructing `BufferedKind` directly in `TlsTable::create`); the
+//! unbuffered engine is constructible but not yet driven — threading it
+//! through those is follow-on work.
 
 #[allow(unused_imports)]
 use std::io::{self, Read as _, Write as _};
@@ -60,101 +73,123 @@ impl TlsInfo {
     }
 
     /// The SNI hostname the peer requested, if any.
+    ///
+    /// **Known limitation:** on a server connection driven by the
+    /// `tls-unbuffered` engine, this is always `None`. rustls does not
+    /// expose an equivalent of `ServerConnection::server_name()` on
+    /// `UnbufferedServerConnection` (verified against rustls 0.23.41 —
+    /// `server_name()` lives only on the handshake-callback `ClientHello`
+    /// type and on the buffered `ServerConnection`; `UnbufferedServerConnection`
+    /// derefs only as far as `CommonState`, which doesn't carry it either).
+    /// Buffered connections are unaffected. Recovering SNI for the
+    /// unbuffered engine would need a `ClientHello` callback on
+    /// `ServerConfig` to capture it at handshake time and stash it on
+    /// `TlsConn` — tracked as follow-on work, not yet implemented.
     pub fn sni_hostname(&self) -> Option<&str> {
         self.sni_hostname.as_deref()
     }
 }
 
-/// TLS connection kind — server (inbound) or client (outbound).
+/// A TLS connection, tagged by which record-layer engine drives it.
+///
+/// Engine-specific surface lives on the inner kinds, so the compiler rejects
+/// (say) `read_tls` on an unbuffered connection rather than leaving it a
+/// runtime surprise. Only operations rustls exposes through `CommonState` --
+/// which both engine families `Deref` to -- stay on this enum.
 pub enum TlsConnKind {
-    Server(ServerConnection),
-    Client(ClientConnection),
+    Buffered(buffered::BufferedKind),
+    #[cfg(feature = "tls-unbuffered")]
+    // Not built by any production code path yet -- `TlsTable::create`/
+    // `create_client` only ever build `Buffered`; only `tls::unbuffered::tests`
+    // constructs one, to pin the plumbing. Without this, `-D warnings`
+    // dead_code fires "variant is never constructed" on the plain (non-test)
+    // `lib` build, since `tls` is `pub(crate)` and the test-only constructor
+    // isn't visible from that build. Wiring this engine into `TlsTable` is
+    // follow-on work; remove this once something does. (Same pattern as
+    // `TlsRecvResult::Error` below.)
+    #[allow(dead_code)]
+    Unbuffered(unbuffered::UnbufferedKind),
 }
 
 impl TlsConnKind {
-    pub fn read_tls(&mut self, rd: &mut dyn io::Read) -> io::Result<usize> {
+    /// The buffered connection, or `None` if another engine drives this one.
+    ///
+    /// `Some` for every connection when only the buffered engine is
+    /// compiled in; `None` for a `tls-unbuffered`-engine connection once
+    /// that feature is enabled. Do not collapse this to an infallible
+    /// accessor.
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "unconditionally Some without the tls-unbuffered feature; kept fallible so both configurations share one signature"
+    )]
+    pub fn as_buffered_mut(&mut self) -> Option<&mut buffered::BufferedKind> {
         match self {
-            TlsConnKind::Server(c) => c.read_tls(rd),
-            TlsConnKind::Client(c) => c.read_tls(rd),
-        }
-    }
-
-    pub fn write_tls(&mut self, wr: &mut dyn io::Write) -> io::Result<usize> {
-        match self {
-            TlsConnKind::Server(c) => c.write_tls(wr),
-            TlsConnKind::Client(c) => c.write_tls(wr),
-        }
-    }
-
-    pub fn process_new_packets(&mut self) -> Result<rustls::IoState, rustls::Error> {
-        match self {
-            TlsConnKind::Server(c) => c.process_new_packets(),
-            TlsConnKind::Client(c) => c.process_new_packets(),
-        }
-    }
-
-    pub fn reader(&mut self) -> rustls::Reader<'_> {
-        match self {
-            TlsConnKind::Server(c) => c.reader(),
-            TlsConnKind::Client(c) => c.reader(),
-        }
-    }
-
-    pub fn writer(&mut self) -> rustls::Writer<'_> {
-        match self {
-            TlsConnKind::Server(c) => c.writer(),
-            TlsConnKind::Client(c) => c.writer(),
+            Self::Buffered(k) => Some(k),
+            #[cfg(feature = "tls-unbuffered")]
+            Self::Unbuffered(_) => None,
         }
     }
 
     pub fn wants_write(&self) -> bool {
         match self {
-            TlsConnKind::Server(c) => c.wants_write(),
-            TlsConnKind::Client(c) => c.wants_write(),
+            Self::Buffered(k) => k.wants_write(),
+            #[cfg(feature = "tls-unbuffered")]
+            Self::Unbuffered(k) => k.wants_write(),
         }
     }
 
     pub fn is_handshaking(&self) -> bool {
         match self {
-            TlsConnKind::Server(c) => c.is_handshaking(),
-            TlsConnKind::Client(c) => c.is_handshaking(),
+            Self::Buffered(k) => k.is_handshaking(),
+            #[cfg(feature = "tls-unbuffered")]
+            Self::Unbuffered(k) => k.is_handshaking(),
         }
     }
 
     pub fn alpn_protocol(&self) -> Option<&[u8]> {
         match self {
-            TlsConnKind::Server(c) => c.alpn_protocol(),
-            TlsConnKind::Client(c) => c.alpn_protocol(),
+            Self::Buffered(k) => k.alpn_protocol(),
+            #[cfg(feature = "tls-unbuffered")]
+            Self::Unbuffered(k) => k.alpn_protocol(),
         }
     }
 
     pub fn negotiated_cipher_suite(&self) -> Option<rustls::SupportedCipherSuite> {
         match self {
-            TlsConnKind::Server(c) => c.negotiated_cipher_suite(),
-            TlsConnKind::Client(c) => c.negotiated_cipher_suite(),
+            Self::Buffered(k) => k.negotiated_cipher_suite(),
+            #[cfg(feature = "tls-unbuffered")]
+            Self::Unbuffered(k) => k.negotiated_cipher_suite(),
         }
     }
 
     pub fn protocol_version(&self) -> Option<rustls::ProtocolVersion> {
         match self {
-            TlsConnKind::Server(c) => c.protocol_version(),
-            TlsConnKind::Client(c) => c.protocol_version(),
+            Self::Buffered(k) => k.protocol_version(),
+            #[cfg(feature = "tls-unbuffered")]
+            Self::Unbuffered(k) => k.protocol_version(),
         }
     }
 
+    /// The SNI hostname the peer requested, if any.
+    ///
+    /// Unbuffered server connections always report `None` here — see
+    /// [`unbuffered::UnbufferedKind::sni_hostname`] for why no equivalent to
+    /// `ServerConnection::server_name()` is reachable from
+    /// `UnbufferedServerConnection`. This is a real, documented limitation
+    /// of the unbuffered engine (tracked on [`TlsInfo::sni_hostname`]), not
+    /// a bug in this accessor — the buffered path is unaffected.
     pub fn sni_hostname(&self) -> Option<&str> {
         match self {
-            TlsConnKind::Server(c) => c.server_name(),
-            TlsConnKind::Client(_) => None,
+            Self::Buffered(k) => k.sni_hostname(),
+            #[cfg(feature = "tls-unbuffered")]
+            Self::Unbuffered(k) => k.sni_hostname(),
         }
     }
 
-    pub fn send_close_notify(&mut self) {
-        match self {
-            TlsConnKind::Server(c) => c.send_close_notify(),
-            TlsConnKind::Client(c) => c.send_close_notify(),
-        }
-    }
+    // No `send_close_notify` here: it is buffered-only, like `read_tls` et
+    // al. -- see `buffered::BufferedKind::send_close_notify` for why, and
+    // `TlsTable::send_close_notify_queued` for the one caller, which goes
+    // through `as_buffered_mut()` instead.
 }
 
 /// Per-connection TLS state.
@@ -220,7 +255,7 @@ impl TlsTable {
             .expect("create() called without server_config");
         let conn = ServerConnection::new(server_config.clone())?;
         self.conns[conn_index as usize] = Some(TlsConn {
-            conn: TlsConnKind::Server(conn),
+            conn: TlsConnKind::Buffered(buffered::BufferedKind::Server(conn)),
             handshake_complete: false,
             peer_sent_close_notify: false,
             close_notify_sent: false,
@@ -240,7 +275,7 @@ impl TlsTable {
             .expect("create_client() called without client_config");
         let conn = ClientConnection::new(client_config.clone(), server_name)?;
         self.conns[conn_index as usize] = Some(TlsConn {
-            conn: TlsConnKind::Client(conn),
+            conn: TlsConnKind::Buffered(buffered::BufferedKind::Client(conn)),
             handshake_complete: false,
             peer_sent_close_notify: false,
             close_notify_sent: false,
@@ -279,6 +314,17 @@ impl TlsTable {
     /// queue. Serializing through the queue (rather than pushing linked
     /// SQEs directly) keeps the alert ordered behind any in-flight send and
     /// lets the deferred Close fire only after it completes.
+    ///
+    /// `send_close_notify` is buffered-only (see
+    /// `buffered::BufferedKind::send_close_notify`), so this goes through
+    /// `as_buffered_mut()` -- consistent with `take_tls_output_sends` below,
+    /// which already reaches into the buffered engine directly. A
+    /// connection on an engine with no buffered close path (the
+    /// `tls-unbuffered` engine, once real connections use it) has nothing to
+    /// queue here; the `None` arm is a deliberate no-op, not an oversight.
+    /// That engine will drive close_notify through
+    /// `WriteTraffic::queue_close_notify` from inside `process_tls_records`
+    /// instead, per `docs/tls-unbuffered-design.md` ("### close_notify").
     #[cfg(has_io_uring)]
     pub fn send_close_notify_queued(
         &mut self,
@@ -287,8 +333,10 @@ impl TlsTable {
         send_copy_pool: &mut SendCopyPool,
         out: &mut Vec<crate::handler::BuiltSend>,
     ) {
-        if let Some(tls_conn) = self.get_mut(conn_index) {
-            tls_conn.conn.send_close_notify();
+        if let Some(tls_conn) = self.get_mut(conn_index)
+            && let Some(buffered) = tls_conn.conn.as_buffered_mut()
+        {
+            buffered.send_close_notify();
             tls_conn.close_notify_sent = true;
             let _ = take_tls_output_sends(tls_conn, send_copy_pool, conn_index, generation, out);
         }
@@ -355,7 +403,11 @@ fn drain_tls_plaintext(
     conn_index: u32,
 ) -> bool {
     use std::io::BufRead;
-    let mut reader = tls_conn.conn.reader();
+    let mut reader = tls_conn
+        .conn
+        .as_buffered_mut()
+        .expect("drain_tls_plaintext: connection not driven by the buffered TLS engine")
+        .reader();
     loop {
         let chunk = match reader.fill_buf() {
             Ok([]) => break,
