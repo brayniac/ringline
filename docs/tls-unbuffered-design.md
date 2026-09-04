@@ -1,7 +1,10 @@
 # Unbuffered TLS send path — design
 
-**Status:** Draft / design (not yet planned or implemented)
-**Date:** 2026-09-03
+**Status:** Draft / design — foundation shipped (PR #338), engine not yet built.
+Three sections carry `> **Correction (PR #338)**` blocks where building the
+foundation falsified what was written here; read those before planning the
+engine.
+**Date:** 2026-09-03 (corrections 2026-09-04)
 **Related:** [`docs/syscalls-and-copies.md`](syscalls-and-copies.md), [`docs/send-completion-design.md`](send-completion-design.md), `ringline/src/tls.rs`
 **Follow-on:** kTLS (kernel TLS offload) — see *Why this is the stepping stone to kTLS*
 
@@ -121,6 +124,26 @@ ringline/src/tls/
 re-export. This is a pure move for the buffered code — no behavior change — and
 should land as its own commit so the diff for the new path is readable.
 
+> **Correction (PR #338).** The split as built is by *file size*, not cleanly by
+> engine, and `mod.rs` is **not** "shared types" as written above. Roughly 230 of
+> its 413 lines are bound to rustls' buffered API: `TlsConnKind` is an enum over
+> `ClientConnection`/`ServerConnection` and its 13 methods (`read_tls`,
+> `write_tls`, `process_new_packets`, `reader`, `writer`) *are* that API;
+> `TlsConn` and `TlsTable` are built on it; `drain_tls_plaintext` drives
+> `reader().fill_buf()`. The unbuffered API has no `reader()`, `writer()` or
+> `read_tls()`.
+>
+> Only `TlsInfo`, `TlsRecvResult`, `PlaintextSink` and `build_pool_send` are
+> genuinely engine-agnostic. **`unbuffered.rs` therefore cannot simply be dropped
+> in alongside `buffered.rs`**: an engine dimension has to be threaded through
+> `TlsConnKind`/`TlsConn`/`TlsTable` first, and an unbuffered counterpart to
+> `drain_tls_plaintext` written. That is unbudgeted work this design missed, and
+> it is the first thing the engine plan must address.
+>
+> One consequence already visible: `TlsTable::send_close_notify_queued` lives on
+> a `mod.rs` type but calls into the buffered engine, which is what forced
+> `take_tls_output_sends` to `pub(super)`.
+
 ### `CiphertextBuf` — the risky primitive, isolated
 
 `process_tls_records` needs a **contiguous** `&mut [u8]` whose front is the next
@@ -150,6 +173,44 @@ struct with its own tests rather than inline offset arithmetic.
 (16 KiB + overhead) or the handshake cannot progress. It is capped; a peer that
 sends a record larger than the cap is a protocol error and closes the connection,
 matching the `recv_accumulator_max` stance.
+
+> **Correction (PR #338).** The sketch above is right in shape and wrong in three
+> specifics. Isolating this primitive was worth it: three rounds of adversarial
+> review were needed to get it correct, and two of the bugs were remotely
+> triggerable.
+>
+> **The amortization argument needs a different guard.** "Bytes move at most once
+> per pass" does not follow from compacting on capacity pressure. The rule that
+> works is *compaction must pay for itself*: run it only when `start >= live`, so
+> bytes moved never exceed bytes reclaimed, and reclaimed bytes were already
+> discarded. An earlier revision guarded only one of two compaction sites and hit
+> **16383× amplification** at a 1 MiB cap once the buffer was backed up — the
+> O(N·K) shape of #279, reachable for free by any peer that outruns the reader.
+> Compaction is also tried *before* growth: growing first keeps resident memory
+> proportional to `cap` rather than to the working set (measured 64× worse).
+>
+> **A full buffer returns `WouldBlock`, and the engine must handle it.** New
+> contract this design did not anticipate. `append` is all-or-nothing, so a
+> caller that gets `WouldBlock` must retain the chunk and retry after draining,
+> must not treat it as fatal, and must not spin — the state can persist for many
+> appends. `ErrorKind::InvalidData` is the separate, fatal "cannot ever fit"
+> case.
+>
+> **The cap floor is much larger than one record**, and getting it wrong
+> deadlocks. `WouldBlock` implies `live > (cap − additional)/2`, so it is only
+> safe if `cap/2` exceeds the largest live set rustls can leave *unprocessable* —
+> and rustls' unbuffered path joins handshake messages spanning records inside
+> the caller's buffer up to `MAX_HANDSHAKE_SIZE` (0xffff), returning
+> `discard == 0` until complete. The floor is therefore
+> `2·(0xffff + MAX_TLS_WIRE_RECORD) + MAX_SINGLE_APPEND` ≈ 228 KiB, not one
+> record. Note also that `MAX_TLS_WIRE_RECORD` is rustls' `MAX_WIRE_SIZE`
+> (`5 + 16384 + 2048`), not RFC 8446's smaller `2^14 + 256`, because the crate
+> enables `tls12`.
+>
+> **`MAX_SINGLE_APPEND` is a cross-module coupling.** That floor's derivation
+> assumes no single `append` exceeds 64 KiB. `append` `debug_assert`s it, but the
+> engine's recv wiring must size its buffer accordingly — a constraint on the
+> send-path work that originates here.
 
 ### Send path
 
