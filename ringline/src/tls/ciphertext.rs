@@ -30,6 +30,15 @@ use std::io;
 /// payload, and a 2 KiB overhead budget (AEAD expansion / TLS 1.2 explicit
 /// nonce / content-type byte) — rustls 0.23's `MAX_WIRE_SIZE`, not RFC 8446's
 /// smaller 2^14 + 256.
+///
+/// **This is a receive-side bound, and only a receive-side bound.** It is how
+/// much this buffer must be prepared to hold for one inbound record, with
+/// deliberate slack. It is *not* the size of a record ringline emits: a
+/// full-size TLS 1.3 record on the wire is 16406 bytes (see
+/// `unbuffered::MAX_RECORD_WIRE_LEN`), 2 KiB smaller. Sizing a send-side
+/// buffer, slot, or chunk from this constant overshoots by that slack and has
+/// produced three separate wrong answers in this area — do not reach for it
+/// from the send path.
 pub(crate) const MAX_TLS_WIRE_RECORD: usize = 5 + 16_384 + 2_048;
 
 /// Largest live set rustls may leave unprocessed. Its unbuffered path joins

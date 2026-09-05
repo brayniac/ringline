@@ -585,6 +585,62 @@ fn a_short_send_does_not_poison_the_chunk_cache() {
     );
 }
 
+/// A destination that can hold whole maximum-size records must be filled with
+/// whole records — one full 2^14 fragment per record, no sliver.
+///
+/// Starting the chunk at `dst.len()` instead overshoots (ciphertext is bigger
+/// than plaintext), and the `InsufficientSize` retry scales down
+/// *proportionally*, landing just under a fragment boundary rather than on it.
+/// That costs an extra record on any send big enough to be split, and for a
+/// `dst` between one and two record wire sizes it converges on a full record
+/// plus a sliver — doubling the record count.
+#[test]
+fn a_whole_record_destination_encrypts_whole_records() {
+    let (mut server, mut client) = conn_pair();
+    let mut accs = AccumulatorTable::new(2, 4096);
+    handshake(&mut server, &mut client, &mut accs);
+
+    let big = vec![0x33u8; 512 * 1024];
+    for records in 1..=4usize {
+        let mut dst = vec![0u8; records * super::MAX_RECORD_WIRE_LEN];
+        // Twice: the first call may still learn, the second is steady state.
+        super::encrypt_chunk(&mut client, &big, &mut dst).expect("encrypt");
+        let (used_pt, used_ct) =
+            super::encrypt_chunk(&mut client, &big, &mut dst).expect("encrypt");
+        assert_eq!(
+            used_pt,
+            records * super::MAX_FRAGMENT_LEN,
+            "a {records}-record destination must take {records} full fragments"
+        );
+        assert_eq!(
+            used_ct,
+            records * super::MAX_RECORD_WIRE_LEN,
+            "and emit exactly {records} full records, filling dst"
+        );
+    }
+}
+
+/// The 16384-byte default send slot misses a full record by 22 bytes, so there
+/// is no whole-record answer for it. It must fall back to the retry loop and
+/// still converge on the largest chunk that fits, rather than failing or
+/// stalling.
+#[test]
+fn a_destination_below_one_record_still_converges() {
+    let (mut server, mut client) = conn_pair();
+    let mut accs = AccumulatorTable::new(2, 4096);
+    handshake(&mut server, &mut client, &mut accs);
+
+    let big = vec![0x44u8; 128 * 1024];
+    let mut dst = vec![0u8; 16384];
+    super::encrypt_chunk(&mut client, &big, &mut dst).expect("encrypt");
+    let (used_pt, used_ct) = super::encrypt_chunk(&mut client, &big, &mut dst).expect("encrypt");
+    assert!(used_ct <= dst.len(), "must not overrun dst");
+    assert!(
+        used_pt > super::MAX_FRAGMENT_LEN - 64,
+        "should still get within a few bytes of a full fragment, got {used_pt}"
+    );
+}
+
 // `BlockedHandshake` with nothing to send is a quiet return, not an error
 // and not a spin: a freshly-created server has no input and emits nothing.
 #[test]
