@@ -157,7 +157,7 @@ probe was run and its output is in the experiment log.
 | P-17 | The kernel's cipher set covers everything rustls can hand it | **Verified** | Kernel: `net/tls/tls_main.c:102-111` (AES-GCM-128/256, AES-CCM-128, ChaCha20-Poly1305, SM4-GCM/CCM, ARIA-GCM-128/256). rustls: `ConnectionTrafficSecrets` has exactly three variants — `Aes128Gcm`, `Aes256Gcm`, `Chacha20Poly1305` (`src/suites.rs:218-242`). All three are supported by the kernel |
 | P-18 | The unbuffered engine's rustls connection is in a **consumable owned position** | **Verified** | `TlsTable.conns: Vec<Option<TlsConn>>` (`tls/mod.rs:244`) → `TlsConn.conn: TlsConnKind` (`:224`) → `TlsConnKind::Unbuffered(UnbufferedConn)` (`:123`) → `UnbufferedConn.kind: UnbufferedKind` (`unbuffered/mod.rs:129`) → the rustls type. No `Rc`/`Arc`/pin/slab indirection. Only the *accessors* are `&mut`-only |
 | P-19 | **kTLS rejects `MSG_WAITALL` outright.** `tls_sw_sendmsg` and `tls_device_sendmsg` fail any flag outside a small allow-list with `-EOPNOTSUPP`, and ringline sets `MSG_WAITALL` on every stream send | **Verified in source and measured on hv01** | v6.12 `net/tls/tls_sw.c:1231-1234` — allow-list is `{MSG_MORE, MSG_DONTWAIT, MSG_NOSIGNAL, MSG_CMSG_COMPAT, MSG_SPLICE_PAGES, MSG_EOR, MSG_SENDPAGE_NOPOLICY}`; unchanged in v6.17 (`:1255-1258`). `tls_device.c:436-439` is narrower still. ringline: `STREAM_SEND_FLAGS = libc::MSG_WAITALL` (`ringline/src/completion.rs:1-10`), used by every stream send builder. Probe on hv01: `IORING_OP_SEND` with `MSG_WAITALL` on a kTLS fixed descriptor returned **-95 (`EOPNOTSUPP`)** |
-| P-20 | kTLS keys can be installed on an io_uring **fixed** descriptor | **Measured on hv01** | Probe: `IORING_OP_URING_CMD/SOCKET_URING_OP_SETSOCKOPT set SOL_TCP/TCP_ULP="tls" on a FIXED descriptor (res=0)` and `SetSockOpt(SOL_TLS, TLS_TX, aes-128-gcm) accepted on a FIXED descriptor (res=0)`. Confirms P-11 end to end |
+| P-20 | kTLS keys can be installed on an io_uring **fixed** descriptor | **Measured on hv01** | Probe: `IORING_OP_URING_CMD/SOCKET_URING_OP_SETSOCKOPT set SOL_TCP/TCP_ULP="tls" on a FIXED descriptor (res=0)` and `SetSockOpt(SOL_TLS, TLS_TX, aes-128-gcm) accepted on a FIXED descriptor (res=0)`. Confirms P-11 end to end. Experiment `01a07047-d6c4-719f-645b-f9e926bcc2b0` |
 | U-1 | Whether io_uring's `IORING_OP_SEND` actually reaches `sk_msg_zerocopy_from_iter` in practice | **UNVERIFIED** | Source says it should — io_uring builds `ITER_UBUF`, so `is_kvec` is false, and `eor` is true without `MSG_MORE`. But `iov_iter_get_pages2` needs the issuing context's `mm`, and io-wq offload is a different context. Not instrumented. **This is the single premise G0 exists to settle.** |
 | U-2 | Whether `IORING_OP_SEND_ZC` on a kTLS socket avoids the pool-slot copy | **UNVERIFIED, and suspected no** | `net/tls` contains no `MSG_ZEROCOPY`/`msg_ubuf` handling. The probe only records whether the CQEs are well-formed, which is not the same question |
 | U-3 | The cost of a copy at 400/800 GbE | **UNVERIFIED, and out of reach** | Inherited verbatim from `tls-unbuffered-design.md:122-133`. The one number this project has is ~3.2 GiB/s/core on 200 GbE Graviton4. Do not extrapolate it into a core count |
@@ -707,12 +707,25 @@ Repeating the register's `U-` rows here so they are not lost in a table:
    premise of the entire effort.** G0/N1.
 2. **[U-2] Whether `IORING_OP_SEND_ZC` avoids the pool-slot copy on a kTLS
    socket.** `net/tls` has no `MSG_ZEROCOPY`/`msg_ubuf` handling of its own;
-   suspected no. This matters for the `send_parts().guard()` payoff. Note the
-   probe's first attempt could not even reach this question, because
-   `MSG_WAITALL` failed first [P-19]; a follow-up run
-   (`experiments/ktls-uring-probe.toml`) tests plain `Send` and `SendZc`
-   separately. **If that run's result is not recorded below, it had not
-   completed when this document was written — do not assume it passed.**
+   suspected no. This matters for the `send_parts().guard()` payoff.
+
+   **Status: not answered, and the follow-up run did not happen.** The io_uring
+   probe's first attempt (experiment `01a07047-d6c4-719f-645b-f9e926bcc2b0`)
+   could not reach the question at all, because `MSG_WAITALL` failed first
+   [P-19] and the program stopped there. A second run with the flag removed
+   (`01a07052-6370-711d-3c67-2760b2f4b96a`) sat **unscheduled** behind hv01's
+   queue for eight hours and was **cancelled without executing**.
+   `experiments/ktls-uring-probe.toml` in this tree is that spec, ready to
+   resubmit when hv01 is free.
+
+   So two things remain genuinely open on the send side, and neither should be
+   assumed: **(a)** that a plain `IORING_OP_SEND` with *no* flags round-trips
+   correctly on a kTLS fixed descriptor, and **(b)** what `IORING_OP_SEND_ZC`
+   does there. (a) is very likely fine — the C probe's ordinary `send(2)`
+   round-tripped [P-8] — but "very likely" is the register's word for
+   unverified, and the `MSG_WAITALL` result is a standing reminder that flag
+   handling on this path does not behave the way the rest of ringline's send
+   path does.
 3. **[U-3] The cost of a copy at 400/800 GbE.** Inherited unverified from the
    previous design doc and still unverified. One measured number exists
    (~3.2 GiB/s/core at 200 GbE); do not extrapolate a core count from it.
