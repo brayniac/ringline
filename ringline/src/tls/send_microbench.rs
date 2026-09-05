@@ -1491,3 +1491,58 @@ fn alloc_vs_slot() {
     println!("# alloc_vs_slot loadavg_after={}", lp.trim());
     std::io::stdout().flush().ok();
 }
+
+/// Is the cliff a property of the slot size, or of *when in the process* a cell
+/// is measured?
+///
+/// [`small_send_alignment`] runs every slot size inside one process, in
+/// ascending order, each cell allocating and freeing its own ~16 MiB pool. So
+/// 16384 — the baseline every other column is divided by — is always the
+/// **first** cell measured, on a fresh heap, and every other column is measured
+/// after N previous 16 MiB alloc/free cycles have churned the allocator.
+///
+/// Each list here measures one slot size **twice, first and last**. If the same
+/// slot size differs between the two ends of the same process by about the size
+/// of the reported cliff, then position is the effect and slot size is not —
+/// and reversing the list moves the penalty onto whichever size now sits last.
+///
+/// `RL_PREHEAT=1` allocates and frees one pool before the first cell, so
+/// position 0 starts from the same allocator state as the others. If that alone
+/// flattens the sweep, the confound is allocator state specifically rather than
+/// anything about the slot.
+#[test]
+fn slot_order_control() {
+    let order = std::env::var("RL_ORDER").unwrap_or_else(|_| "fwd".to_string());
+    let size = env_usize("RL_SIZE", 1024);
+    let reps = env_usize("RL_REPS", SEND_REPS);
+    let bpr = env_usize("RL_BPR", SEND_BYTES_PER_REP);
+    let preheat = env_usize("RL_PREHEAT", 0) == 1;
+
+    // Same sizes as the original sweep; the first size repeats at the end.
+    let fwd: [u32; 8] = [16384, 16406, 16428, 16448, 20480, 32768, 65536, 16384];
+    let rev: [u32; 8] = [65536, 32768, 20480, 16448, 16428, 16406, 16384, 65536];
+    let list = if order == "rev" { rev } else { fwd };
+
+    let lp = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
+    println!(
+        "# slot_order_control engine={ENGINE} order={order} size={size} reps={reps} bytes_per_rep={bpr} preheat={preheat} loadavg_before={}",
+        lp.trim()
+    );
+
+    if preheat {
+        // One alloc/free cycle of the same shape the first cell would see, so
+        // position 0 no longer measures a pristine heap.
+        let h = handshaked(1024, 16384);
+        drop(h);
+    }
+
+    for (pos, &slot) in list.iter().enumerate() {
+        let r = measure_send2_pool(size, slot, 1024, bpr, reps);
+        for (i, ns) in r.iter().enumerate() {
+            println!("O\t{ENGINE}\t{order}\t{preheat}\t{pos}\t{slot}\t{i}\t{ns:.3}");
+        }
+    }
+    let lp = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
+    println!("# slot_order_control loadavg_after={}", lp.trim());
+    std::io::stdout().flush().ok();
+}
