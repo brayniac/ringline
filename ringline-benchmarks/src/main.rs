@@ -1,8 +1,10 @@
 use clap::Parser;
 use std::time::Duration;
 
-use ringline_benchmarks::bench::{ClientRuntime, ServerRuntime};
-use ringline_benchmarks::output::{BenchReport, ConfigResult, git_commit, timestamp, write_json};
+use ringline_benchmarks::bench::{BenchmarkDefinition, ClientRuntime, ServerRuntime};
+use ringline_benchmarks::output::{
+    BenchReport, ConfigResult, git_commit, print_tls_table, timestamp, write_json,
+};
 use ringline_benchmarks::port_manager::PortManager;
 use ringline_benchmarks::protocols::http1;
 use ringline_benchmarks::protocols::http2;
@@ -11,6 +13,7 @@ use ringline_benchmarks::protocols::memcache;
 use ringline_benchmarks::protocols::quic;
 use ringline_benchmarks::protocols::redis;
 use ringline_benchmarks::protocols::tcp;
+use ringline_benchmarks::protocols::tls;
 use ringline_benchmarks::protocols::udp;
 use ringline_benchmarks::stats::format_ns;
 use std::sync::Arc;
@@ -60,10 +63,48 @@ struct Args {
     /// Run only specific benchmark categories (comma-separated: tcp,udp,quic,http1,http2,http3,redis,memcache,all)
     #[arg(long)]
     only: Option<String>,
+
+    /// Run *only* the TLS echo benchmark: a ringline TLS echo server in a
+    /// child process, driven by a tokio + rustls client, reporting the
+    /// server's own CPU time per operation. This is the A/B harness for
+    /// ringline's `tls-unbuffered` feature — run it twice, once with
+    /// `--features tls-unbuffered` and once without, and diff `cpu_ns_per_op`.
+    /// A plaintext control cell runs alongside each TLS cell.
+    #[arg(long)]
+    tls: bool,
+
+    /// Tokio worker threads for the TLS bench's client side. The client is
+    /// co-located with the server, so this trades offered load against
+    /// contention. 0 = half of available parallelism (min 2).
+    #[arg(long, default_value_t = 0)]
+    tls_client_threads: usize,
+
+    /// Aggregate target rate for the TLS bench, in ops/sec across all clients.
+    /// 0 (default) is closed-loop: each client sends the next request as soon
+    /// as the previous response lands, so a faster server is offered more
+    /// load. A non-zero rate paces the clients so both arms do the same work,
+    /// which is the cleaner comparison when the server has headroom.
+    #[arg(long, default_value_t = 0)]
+    tls_rate: u64,
+
+    /// Internal: run as the TLS bench's server child process. Not for direct
+    /// use; the parent spawns itself with this flag.
+    #[arg(long, hide = true)]
+    tls_server_child: bool,
 }
 
 fn main() {
     let mut args = Args::parse();
+
+    // Child-server mode: never returns. Must be handled before anything else
+    // so the child does not print the banner the parent parses around.
+    if args.tls_server_child {
+        tls::run_server_child(tls::ChildArgs {
+            tls: args.tls,
+            msg_size: args.sizes.first().copied().unwrap_or(64),
+            clients: args.clients.first().copied().unwrap_or(1),
+        });
+    }
 
     if args.quick {
         args.clients = vec![4];
@@ -94,6 +135,98 @@ fn main() {
     eprintln!("  clients: {:?}", args.clients);
     eprintln!("  sizes:   {:?}", args.sizes);
     eprintln!();
+
+    // ── TLS echo benchmark (exclusive mode) ───────────────────────
+    //
+    // This is the A/B harness for ringline's `tls-unbuffered` feature. It runs
+    // alone rather than as one more section of the matrix because it needs a
+    // quiet box: its metric is the *server's* CPU time, and a co-resident
+    // benchmark would land in the same accounting for the process only by
+    // accident of scheduling, but would certainly steal cores.
+    if args.tls {
+        // The TLS axis is driven through `BenchmarkDefinition` so
+        // `TlsConfig::Required` has a real consumer: `.with_tls()` makes
+        // `combinations()` emit both a plaintext control and a TLS cell for
+        // every (size, concurrency), and `protocols::tls` selects the server
+        // and client for each.
+        //
+        // The client runtime is pinned to tokio and cannot be overridden. A
+        // ringline client would link the very engine under test, so an engine
+        // change would move both ends of the measurement at once.
+        let definition = BenchmarkDefinition::new()
+            .with_sizes(args.sizes.clone())
+            .with_concurrencies(args.clients.clone())
+            .with_ringline_server()
+            .with_tokio_client()
+            .with_tls()
+            .with_timing(warmup, duration);
+
+        let client_threads = if args.tls_client_threads == 0 {
+            (workers / 2).max(2)
+        } else {
+            args.tls_client_threads
+        };
+
+        eprintln!("=== TLS Echo Benchmark ===");
+        eprintln!("  engine:         {}", tls::engine_name());
+        eprintln!("  client:         tokio + rustls ({client_threads} threads)");
+        eprintln!("  server:         ringline, child process, 1 worker");
+        eprintln!(
+            "  offered load:   {}",
+            if args.tls_rate == 0 {
+                "closed loop".to_string()
+            } else {
+                format!("{} ops/s (paced)", args.tls_rate)
+            }
+        );
+        eprintln!();
+
+        let mut tls_results = Vec::new();
+        for combo in definition.combinations() {
+            match tls::run_tls_echo(
+                combo.tls,
+                combo.concurrency,
+                combo.size,
+                definition.warmup,
+                definition.duration,
+                client_threads,
+                args.tls_rate,
+            ) {
+                Ok(result) => {
+                    eprintln!(
+                        "  {:>5} {:>4}c x {:>7}: {:>9.0} ops/s  cpu {:>8.1} ns/op  {:>7.4} ns/B  p50 {}  p99 {}",
+                        result.tls,
+                        result.clients,
+                        format_size(result.msg_size),
+                        result.client.ops_per_sec,
+                        result.cpu_ns_per_op,
+                        result.cpu_ns_per_byte,
+                        format_ns(result.client.latency.p50_ns),
+                        format_ns(result.client.latency.p99_ns),
+                    );
+                    if let Some(w) = &result.warning {
+                        eprintln!("        !! {w}");
+                    }
+                    tls_results.push(result);
+                }
+                Err(e) => eprintln!("  TLS cell failed ({}, {}B): {e}", combo.tls, combo.size),
+            }
+        }
+
+        print_tls_table(&tls_results);
+
+        if let Some(ref path) = args.json {
+            let report = BenchReport {
+                timestamp: timestamp(),
+                git_commit: git_commit(),
+                tls_engine: tls::engine_name().to_string(),
+                configs: Vec::new(),
+                tls_echo: tls_results,
+            };
+            write_json(path, &report);
+        }
+        return;
+    }
 
     // Determine which benchmarks to run
     let (do_tcp, do_udp, do_quic, do_http1, do_http2, do_http3, do_redis, do_memcache, do_all) =
@@ -695,7 +828,9 @@ fn main() {
         let report = BenchReport {
             timestamp: timestamp(),
             git_commit: git_commit(),
+            tls_engine: tls::engine_name().to_string(),
             configs: all_results,
+            tls_echo: Vec::new(),
         };
         write_json(path, &report);
     }

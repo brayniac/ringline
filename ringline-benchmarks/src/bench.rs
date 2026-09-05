@@ -25,7 +25,14 @@ pub enum Protocol {
     Streaming,
 }
 
-/// Whether TLS is required.
+/// Whether a benchmark cell runs over TLS.
+///
+/// Consumed by [`crate::protocols::tls::run_tls_echo`], which selects a
+/// TLS-terminating ringline server + a tokio/rustls client for
+/// [`TlsConfig::Required`] and their plaintext equivalents for
+/// [`TlsConfig::None`]. A definition built with [`BenchmarkDefinition::with_tls`]
+/// yields both, so the plaintext cell acts as a control against which the TLS
+/// cell's cost is read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum TlsConfig {
     #[default]
@@ -91,6 +98,22 @@ impl BenchmarkDefinition {
     /// Add a concurrency level to benchmark.
     pub fn with_concurrency(mut self, concurrency: usize) -> Self {
         self.concurrencies.push(concurrency);
+        self
+    }
+
+    /// Replace the message-size sweep.
+    ///
+    /// Distinct from [`with_size`](Self::with_size), which *appends* to the
+    /// defaults — a CLI-supplied `--sizes` must replace them, or every run
+    /// silently also sweeps `64,512,4096,32768`.
+    pub fn with_sizes(mut self, sizes: Vec<usize>) -> Self {
+        self.sizes = sizes;
+        self
+    }
+
+    /// Replace the concurrency sweep. See [`with_sizes`](Self::with_sizes).
+    pub fn with_concurrencies(mut self, concurrencies: Vec<usize>) -> Self {
+        self.concurrencies = concurrencies;
         self
     }
 
@@ -223,5 +246,54 @@ impl fmt::Display for TlsConfig {
             TlsConfig::None => write!(f, "none"),
             TlsConfig::Required => write!(f, "tls"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn without_tls_only_plaintext_cells() {
+        let def = BenchmarkDefinition::new()
+            .with_sizes(vec![64, 1024])
+            .with_concurrencies(vec![4]);
+        let combos = def.combinations();
+        assert_eq!(combos.len(), 2);
+        assert!(combos.iter().all(|c| c.tls == TlsConfig::None));
+    }
+
+    /// `.with_tls()` must yield the TLS cell *and* keep the plaintext one: the
+    /// plaintext row is the control the TLS row is read against.
+    #[test]
+    fn with_tls_yields_control_and_tls_cells() {
+        let def = BenchmarkDefinition::new()
+            .with_sizes(vec![64, 1024])
+            .with_concurrencies(vec![4])
+            .with_tls();
+        let combos = def.combinations();
+        assert_eq!(combos.len(), 4);
+        assert_eq!(
+            combos
+                .iter()
+                .filter(|c| c.tls == TlsConfig::Required)
+                .count(),
+            2
+        );
+        assert_eq!(
+            combos.iter().filter(|c| c.tls == TlsConfig::None).count(),
+            2
+        );
+    }
+
+    /// `with_sizes` replaces; `with_size` appends. Mixing them up silently
+    /// sweeps the defaults too, which is why both exist explicitly.
+    #[test]
+    fn with_sizes_replaces_defaults() {
+        let def = BenchmarkDefinition::new().with_sizes(vec![7]);
+        assert_eq!(def.sizes, vec![7]);
+        let def = BenchmarkDefinition::new().with_size(7);
+        assert_eq!(def.sizes.last(), Some(&7));
+        assert!(def.sizes.len() > 1);
     }
 }

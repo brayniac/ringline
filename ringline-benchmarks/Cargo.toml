@@ -15,6 +15,11 @@ path = "src/main.rs"
 # Forward to ringline's mio fallback backend so the bench can A/B
 # the io_uring vs mio recv/send path on the same workload.
 force-mio = ["ringline/force-mio"]
+# Forward to ringline's unbuffered TLS record layer so the `--tls` bench can
+# A/B the server's TLS send path (2 copies -> 1) with everything else held
+# constant. Build this crate twice — once without, once with — and diff the
+# `cpu_ns_per_op` column. See `README.md`.
+tls-unbuffered = ["ringline/tls-unbuffered"]
 
 [dependencies]
 ringline = { workspace = true }

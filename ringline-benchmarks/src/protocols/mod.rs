@@ -6,4 +6,5 @@ pub mod memcache;
 pub mod quic;
 pub mod redis;
 pub mod tcp;
+pub mod tls;
 pub mod udp;

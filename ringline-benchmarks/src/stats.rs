@@ -70,23 +70,38 @@ pub struct BenchResult {
     pub cpu_ns: u64,
 }
 
-/// Read process CPU time (user + system) from /proc/self/stat.
-pub fn process_cpu_time_ns() -> u64 {
-    let stat = match std::fs::read_to_string("/proc/self/stat") {
-        Ok(s) => s,
-        Err(_) => return 0,
+/// Calling process CPU time (user + system) in nanoseconds, from
+/// `getrusage(RUSAGE_SELF)`.
+///
+/// This is the kernel's own accounting for the whole process (all threads),
+/// read directly rather than sampled or parsed. Preferred over the
+/// `/proc/self/stat` reader it replaces for two reasons: `/proc` quantises to
+/// `_SC_CLK_TCK` ticks (10 ms on most kernels), which is coarse next to a
+/// few-second measurement window, and it does not exist on macOS — where the
+/// old reader silently returned 0 and every `cpu_ns` in the output was a
+/// zero that looked like a measurement.
+///
+/// Returns 0 only if `getrusage` itself fails.
+pub fn self_cpu_time_ns() -> u64 {
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    // SAFETY: `usage` is a valid, correctly-sized, zero-initialised rusage.
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } != 0 {
+        return 0;
+    }
+    let to_ns = |tv: libc::timeval| {
+        (tv.tv_sec as u64).wrapping_mul(1_000_000_000) + (tv.tv_usec as u64).wrapping_mul(1_000)
     };
-    let fields: Vec<&str> = stat.split_whitespace().collect();
-    if fields.len() < 15 {
-        return 0;
-    }
-    let utime: u64 = fields[13].parse().unwrap_or(0);
-    let stime: u64 = fields[14].parse().unwrap_or(0);
-    let ticks_per_sec = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64;
-    if ticks_per_sec == 0 {
-        return 0;
-    }
-    (utime + stime) * 1_000_000_000 / ticks_per_sec
+    to_ns(usage.ru_utime) + to_ns(usage.ru_stime)
+}
+
+/// Read process CPU time (user + system).
+///
+/// Note that in the in-process benches this counts **client and server
+/// together** — both run in this process — so it cannot attribute CPU to one
+/// side. The TLS bench (`protocols::tls`) runs the server as a child process
+/// precisely to get around that.
+pub fn process_cpu_time_ns() -> u64 {
+    self_cpu_time_ns()
 }
 
 pub fn format_size(bytes: usize) -> String {
