@@ -1,0 +1,380 @@
+name = "tls-slot-cliff: is the >16384 send-slot penalty real?"
+
+# Investigation, not an A/B of a change we intend to ship.
+#
+# THE MYSTERY
+# An in-process microbench measured that *any* SendCopyPool slot size above
+# 16384 costs ~25 ns/op on small TLS sends, on both TLS engines, with the cliff
+# at exactly 16385 and flat above it:
+#
+#     payload | 16384 | 16406 | 16428 | 16448 | 20480 | 32768 | 65536
+#     512 B   |   0   | -0.9% | -0.6% | -0.7% | -0.5% | -0.7% | -0.6%
+#     1 KiB   |   0   | +4.8% | +4.6% | +5.6% | +4.2% | +5.4% | +4.7%
+#     4 KiB   |   0   | +2.0% | +2.0% | +1.8% | +1.8% | +2.1% | +2.1%
+#
+# Non-monotonic in payload, so not a plain "bigger is slower" effect. This
+# blocks adopting 16448 as the default slot size (holds exactly one 16406-byte
+# TLS record, 64-byte aligned, +0.4% memory, drops a 256 KiB send from 17
+# records to 16).
+#
+# Four hypotheses are already dead or suspect and are NOT re-tested here:
+# alignment (16448/20480/32768/65536 are all 64-byte aligned and all pay it),
+# pool footprint (2 MiB measured as fast as 16 MiB), and cache-set conflicts
+# from a power-of-two stride (predicts the wrong sign — 16384 measured
+# *faster*). THP is measured directly below rather than argued.
+#
+# DESIGN
+# One job, one host. Everything here is in-process or co-located, so a second
+# host would only add noise. Arms are interleaved *within* a step so that drift
+# on a host with permanent tenants (a qemu VM, rezolus, valkey) hits both arms
+# equally, and uptime/loadavg are recorded at both ends as evidence.
+#
+# host: hv01 = z2.baremetal = Ryzen Threadripper 3970X, 32C/64T, 4 NUMA nodes,
+#       L3 = 16 MiB per CCX (4 cores), L2 = 512 KiB/core, L1d = 32 KiB/core.
+#       qemu is pinned to CPU 0 with vcpus observed on 36-38 (NUMA node 0), so
+#       everything here pins to NUMA node 2 (CPUs 16-23, 48-55), which is
+#       isolated and away from that VM.
+#
+# STEP ORDER (deliberate — cheapest and most decisive first)
+#   1. end-to-end TLS echo at 16384 vs 16448. If ~5% does not survive real
+#      sockets and io_uring submission, the microbench result is an in-process
+#      artifact and 16448 is unblocked.
+#      CAVEAT, stated up front: co-located closed-loop server CPU at 1 KiB
+#      measured ~11,600 ns/op in a smoke run, so a 25 ns/op effect is ~0.2% of
+#      the end-to-end per-op budget — about 10x below this harness's noise
+#      floor. This step can therefore set an UPPER BOUND on the practical cost;
+#      it cannot prove the microbench effect false. The plaintext (tls=none)
+#      control row runs beside every TLS row and IS the noise floor.
+#   2. perf stat on the pinned microbench, both slot sizes, with a setup-only
+#      arm to subtract so the counters describe the measured loop and not the
+#      TLS handshake. Whatever moves is the answer.
+#   3. THP, measured not argued: AnonHugePages for the send pool's own VMA out
+#      of /proc/self/smaps, then a causal re-run with THP disabled for this
+#      process only. prctl(PR_SET_THP_DISABLE), never the system-wide
+#      /sys/kernel/mm/transparent_hugepage knob — this host is shared.
+#   4. a discriminator the original sweep could not run: it held the slot
+#      *count* at 1024, so growing the slot also grew the backing allocation.
+#      16384*1028 and 16448*1024 are both exactly 16,842,752 bytes, so a cell
+#      with the slow arm's footprint and the fast arm's slot size exists.
+#      If that cell is slow, the lever is the allocation, not the slot size.
+
+[params]
+ringline_repo = "https://github.com/brayniac/ringline"
+micro_ref     = "bench/tls-slot-cliff"
+e2e_ref       = "bench/tls-slot-cliff-e2e"
+# NUMA node 2 on the 3970X: isolated, and away from the qemu VM on node 0.
+micro_cpu     = "20"
+e2e_cpus      = "16-23,48-55"
+# ~10 s of measured loop at the ~500 ns/op the microbench reports for 1 KiB.
+perf_iters    = "20000000"
+e2e_clients   = "8"
+e2e_warmup    = "3"
+e2e_duration  = "25"
+e2e_rounds    = "6"
+
+[[jobs]]
+name = "slotcliff"
+tags = ["z2.baremetal"]
+
+# ── build everything up front ──────────────────────────────────────────────
+# All compilation happens here. No step after this one compiles anything: a
+# concurrent rustc is itself capable of manufacturing or masking a 5% delta at
+# 1 KiB, which is exactly the distinction this experiment exists to make.
+
+[[jobs.steps]]
+name = "build"
+type = "shell"
+command = """
+set -eu
+export DEBIAN_FRONTEND=noninteractive
+if ! command -v cargo >/dev/null && [ ! -f "$HOME/.cargo/env" ]; then
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+fi
+source "$HOME/.cargo/env"
+rustc --version
+
+mkdir -p /tmp/slotcliff
+
+clone_at() {
+    DIR="$1"; REF="$2"
+    if [ -d "$DIR/.git" ]; then
+        cd "$DIR" && git fetch --all -p && git checkout "$REF" && git reset --hard "origin/$REF"
+    else
+        rm -rf "$DIR" && git clone {ringline_repo} "$DIR" && cd "$DIR" && git checkout "$REF"
+    fi
+}
+
+# --- microbench, both TLS engines, separate target dirs so switching arms
+# --- never triggers a rebuild mid-measurement.
+clone_at /tmp/slotcliff/micro {micro_ref}
+cd /tmp/slotcliff/micro
+echo "micro at $(git rev-parse --short HEAD)"
+CARGO_TARGET_DIR=target-buf   cargo test --release -p ringline --lib --no-run 2>&1 | tee /tmp/slotcliff/build-buf.log
+CARGO_TARGET_DIR=target-unbuf cargo test --release -p ringline --lib --features tls-unbuffered --no-run 2>&1 | tee /tmp/slotcliff/build-unbuf.log
+
+# The test binary carries a content hash in its name; take it from cargo's own
+# output rather than globbing, so a stale binary can never be picked up.
+BUF=$(grep -o 'Executable unittests src/lib.rs ([^)]*)' /tmp/slotcliff/build-buf.log | tail -1 | sed 's/.*(\\(.*\\))/\\1/')
+UNBUF=$(grep -o 'Executable unittests src/lib.rs ([^)]*)' /tmp/slotcliff/build-unbuf.log | tail -1 | sed 's/.*(\\(.*\\))/\\1/')
+test -x "/tmp/slotcliff/micro/$BUF"   || { echo "ERROR: buffered test binary not found"; exit 1; }
+test -x "/tmp/slotcliff/micro/$UNBUF" || { echo "ERROR: unbuffered test binary not found"; exit 1; }
+
+# --- end-to-end TLS echo bench
+clone_at /tmp/slotcliff/e2e {e2e_ref}
+cd /tmp/slotcliff/e2e
+echo "e2e at $(git rev-parse --short HEAD)"
+cargo build --release -p ringline-benchmarks 2>&1 | tail -3
+test -x /tmp/slotcliff/e2e/target/release/ringline-benchmarks || { echo "ERROR: e2e binary missing"; exit 1; }
+
+cat > /tmp/slotcliff/env.sh <<EOF
+export MICRO_BUF=/tmp/slotcliff/micro/$BUF
+export MICRO_UNBUF=/tmp/slotcliff/micro/$UNBUF
+export E2E=/tmp/slotcliff/e2e/target/release/ringline-benchmarks
+EOF
+cat /tmp/slotcliff/env.sh
+echo "BUILD OK"
+"""
+
+# ── environment evidence ───────────────────────────────────────────────────
+
+[[jobs.steps]]
+name = "environment"
+type = "shell"
+command = """
+set -u
+source "$HOME/.cargo/env"
+{
+  echo "=== uptime (job start) ==="; uptime
+  echo "=== loadavg ==="; cat /proc/loadavg
+  echo "=== rustc ==="; rustc --version
+  echo "=== kernel ==="; uname -r
+  echo "=== THP (system-wide setting, READ ONLY) ==="
+  cat /sys/kernel/mm/transparent_hugepage/enabled
+  cat /sys/kernel/mm/transparent_hugepage/defrag
+  echo "=== cpu ==="; lscpu | grep -E 'Model name|Socket|Core|Thread|NUMA node[0-9]|L1d|L2 |L3 '
+  echo "=== isolated cpus ==="; cat /sys/devices/system/cpu/isolated
+  echo "=== busiest processes (permanent tenants expected: qemu, rezolus, valkey) ==="
+  ps -eo pcpu,pid,comm --sort=-pcpu | head -8
+  echo "=== compilation must be finished by now ==="
+  echo "cargo/rustc procs: $(pgrep -c -x 'cargo|rustc' || true)"
+} 2>&1 | tee environment.txt
+"""
+
+# ── STEP 1: does the cliff reproduce end to end? ───────────────────────────
+# Interleaved arms, one round = one 16384 run immediately followed by one
+# 16448 run. Each run also produces a tls=none control row; how far the control
+# rows move between arms is the noise floor and bounds what may be believed of
+# the TLS delta.
+
+[[jobs.steps]]
+name = "step1-e2e"
+type = "shell"
+command = """
+set -u
+source "$HOME/.cargo/env"
+source /tmp/slotcliff/env.sh
+mkdir -p e2e-json
+: > step1-e2e.txt
+echo "loadavg_start=$(cat /proc/loadavg)" | tee -a step1-e2e.txt
+for r in $(seq 1 {e2e_rounds}); do
+  for slot in 16384 16448; do
+    echo "== round=$r slot=$slot loadavg=$(cat /proc/loadavg)" | tee -a step1-e2e.txt
+    RL_SEND_SLOT_SIZE=$slot taskset -c {e2e_cpus} $E2E \
+        --tls --sizes 1024 --clients {e2e_clients} \
+        --warmup {e2e_warmup} --duration {e2e_duration} \
+        --json e2e-json/r${r}-s${slot}.json >> step1-e2e.txt 2>&1
+    echo "rc=$?" | tee -a step1-e2e.txt
+  done
+done
+echo "loadavg_end=$(cat /proc/loadavg)" | tee -a step1-e2e.txt
+
+echo "=== per-op server CPU, both arms ==="
+for f in e2e-json/*.json; do
+  python3 - "$f" <<'PY'
+import json,sys,re
+p=sys.argv[1]
+slot=re.search(r's(\\d+)\\.json',p).group(1)
+rnd=re.search(r'r(\\d+)-',p).group(1)
+d=json.load(open(p))
+for row in d.get('tls_echo',[]):
+    print("E\\t%s\\t%s\\t%s\\t%s\\t%.1f\\t%.0f\\t%s" % (
+        rnd, slot, row.get('tls'), row.get('msg_size'),
+        row.get('cpu_ns_per_op',0), row.get('client',{}).get('ops_per_sec',0),
+        row.get('warning','')))
+PY
+done | tee step1-summary.txt
+"""
+
+# ── STEP 2: counters, both slot sizes ──────────────────────────────────────
+# A ~25 ns/op gap at ~3 GHz is ~75 cycles. Something in this list must move
+# visibly. If nothing does, that is itself strong evidence the delta lives in
+# setup rather than in the measured region — which is what the setup-only arm
+# is there to separate.
+#
+# Events are run in three small groups rather than one big list, so the PMU
+# never multiplexes and scales the counts.
+
+[[jobs.steps]]
+name = "step2-perf-counters"
+type = "shell"
+command = """
+set -u
+source "$HOME/.cargo/env"
+source /tmp/slotcliff/env.sh
+: > step2-perf.txt
+echo "loadavg_start=$(cat /proc/loadavg)" | tee -a step2-perf.txt
+
+G1="cycles,instructions,branch-misses,page-faults"
+G2="L1-dcache-loads,L1-dcache-load-misses,LLC-loads,LLC-load-misses"
+G3="dTLB-loads,dTLB-load-misses,dTLB-stores,dTLB-store-misses,iTLB-load-misses"
+
+run_perf () {
+  rep="$1"; grp="$2"; ev="$3"; slot="$4"; setup="$5"
+  echo "### rep=$rep group=$grp slot=$slot setup_only=$setup iters={perf_iters}" >> step2-perf.txt
+  sudo perf stat -x, -e "$ev" -- \
+    taskset -c {micro_cpu} \
+    env RL_SLOT=$slot RL_SIZE=1024 RL_SLOTS=1024 RL_ITERS={perf_iters} RL_SETUP_ONLY=$setup \
+    "$MICRO_BUF" --exact tls::send_microbench::perf_single_cell --nocapture --test-threads=1 \
+    >> step2-perf.txt 2>&1
+  echo "rc=$?" >> step2-perf.txt
+}
+
+# Interleave: slot arms adjacent, groups and reps outermost.
+for rep in 1 2; do
+  for g in 1 2 3; do
+    case $g in 1) EV=$G1;; 2) EV=$G2;; 3) EV=$G3;; esac
+    for slot in 16384 16448; do
+      run_perf $rep $g "$EV" $slot 0
+    done
+    for slot in 16384 16448; do
+      run_perf $rep $g "$EV" $slot 1
+    done
+  done
+done
+echo "loadavg_end=$(cat /proc/loadavg)" | tee -a step2-perf.txt
+grep -E '^P\\s|^###|^rc=' step2-perf.txt | head -60
+"""
+
+# ── STEP 3: THP, measured ──────────────────────────────────────────────────
+# AnonHugePages for the pool's own VMA at each slot size, then the causal test:
+# the same timing with THP suppressed for this process only. If promotion does
+# differ and suppressing it collapses the gap, THP is the mechanism; if the gap
+# survives with THP off, it is not.
+
+[[jobs.steps]]
+name = "step3-thp"
+type = "shell"
+command = """
+set -u
+source "$HOME/.cargo/env"
+source /tmp/slotcliff/env.sh
+: > step3-thp.txt
+echo "=== AnonHugePages per slot size, THP as configured ===" | tee -a step3-thp.txt
+taskset -c {micro_cpu} "$MICRO_BUF" --exact tls::send_microbench::thp_accounting \
+    --nocapture --test-threads=1 >> step3-thp.txt 2>&1
+echo "rc=$?" >> step3-thp.txt
+
+echo "=== AnonHugePages with PR_SET_THP_DISABLE (this process only) ===" | tee -a step3-thp.txt
+RL_NOTHP=1 taskset -c {micro_cpu} "$MICRO_BUF" --exact tls::send_microbench::thp_accounting \
+    --nocapture --test-threads=1 >> step3-thp.txt 2>&1
+echo "rc=$?" >> step3-thp.txt
+
+echo "=== causal: timing at both slot sizes, THP on then THP off, interleaved ===" | tee -a step3-thp.txt
+for rep in 1 2 3; do
+  for nothp in 0 1; do
+    for slot in 16384 16448; do
+      echo "### rep=$rep nothp=$nothp slot=$slot" >> step3-thp.txt
+      RL_NOTHP=$nothp taskset -c {micro_cpu} \
+        env RL_SLOT=$slot RL_SIZE=1024 RL_SLOTS=1024 RL_ITERS=4000000 RL_THP=1 RL_NOTHP=$nothp \
+        "$MICRO_BUF" --exact tls::send_microbench::perf_single_cell \
+        --nocapture --test-threads=1 >> step3-thp.txt 2>&1
+      echo "rc=$?" >> step3-thp.txt
+    done
+  done
+done
+grep -E '^THP\\s|^P\\s|^###|PR_SET_THP' step3-thp.txt | head -60
+"""
+
+# ── STEP 4: slot size or allocation size? ──────────────────────────────────
+# Also re-runs the original sweep on this host and under this discipline, so
+# the reported table has a same-conditions counterpart, and repeats the
+# discriminator on the unbuffered engine because the effect was reported on
+# both.
+
+[[jobs.steps]]
+name = "step4-discriminator"
+type = "shell"
+command = """
+set -u
+source "$HOME/.cargo/env"
+source /tmp/slotcliff/env.sh
+: > step4.txt
+
+echo "=== reproduce the original sweep (buffered) ===" | tee -a step4.txt
+taskset -c {micro_cpu} "$MICRO_BUF" --exact tls::send_microbench::small_send_alignment \
+    --nocapture --test-threads=1 >> step4.txt 2>&1
+echo "rc=$?" >> step4.txt
+
+echo "=== reproduce the original sweep (unbuffered) ===" | tee -a step4.txt
+taskset -c {micro_cpu} "$MICRO_UNBUF" --exact tls::send_microbench::small_send_alignment \
+    --nocapture --test-threads=1 >> step4.txt 2>&1
+echo "rc=$?" >> step4.txt
+
+# mode=inter rebuilds every cell each round, re-rolling heap layout; mode=fixed
+# builds each cell once and runs its rounds back to back, which is what the
+# original sweep did. If the effect is a per-process layout accident, those two
+# modes disagree.
+for eng in BUF UNBUF; do
+  case $eng in BUF) B="$MICRO_BUF";; UNBUF) B="$MICRO_UNBUF";; esac
+  for mode in inter fixed; do
+    echo "=== alloc_vs_slot engine=$eng mode=$mode ===" | tee -a step4.txt
+    env RL_MODE=$mode RL_ROUNDS=11 RL_SIZE=1024 RL_ITERS=500000 \
+      taskset -c {micro_cpu} "$B" --exact tls::send_microbench::alloc_vs_slot \
+      --nocapture --test-threads=1 >> step4.txt 2>&1
+    echo "rc=$?" >> step4.txt
+  done
+done
+grep -E '^A\\s|^R\\s|^===|^rc=' step4.txt | head -80
+"""
+
+[[jobs.steps]]
+name = "environment-end"
+type = "shell"
+command = """
+{ echo "=== uptime (job end) ==="; uptime; echo "=== loadavg ==="; cat /proc/loadavg; } 2>&1 | tee environment-end.txt
+"""
+
+[[jobs.steps]]
+name = "upload-environment"
+type = "upload_artifact"
+path = "environment.txt"
+
+[[jobs.steps]]
+name = "upload-environment-end"
+type = "upload_artifact"
+path = "environment-end.txt"
+
+[[jobs.steps]]
+name = "upload-step1"
+type = "upload_artifact"
+path = "step1-e2e.txt"
+
+[[jobs.steps]]
+name = "upload-step1-summary"
+type = "upload_artifact"
+path = "step1-summary.txt"
+
+[[jobs.steps]]
+name = "upload-step2"
+type = "upload_artifact"
+path = "step2-perf.txt"
+
+[[jobs.steps]]
+name = "upload-step3"
+type = "upload_artifact"
+path = "step3-thp.txt"
+
+[[jobs.steps]]
+name = "upload-step4"
+type = "upload_artifact"
+path = "step4.txt"
