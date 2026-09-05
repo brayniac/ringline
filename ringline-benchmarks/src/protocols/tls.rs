@@ -246,6 +246,16 @@ pub fn run_server_child(args: ChildArgs) -> ! {
     // headroom. Too few slots and the server drops sends — which the parent
     // reports as a warning rather than quietly folding into the numbers.
     const SLOT_SIZE: u32 = 16384;
+    // INVESTIGATION ONLY: override the *send* pool slot size (recv buffers and
+    // the slot count stay pinned to SLOT_SIZE so only the one variable moves).
+    let send_slot_size: u32 = std::env::var("RL_SEND_SLOT_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(SLOT_SIZE);
+    eprintln!(
+        "CHILD send_slot_size={send_slot_size} msg_size={}",
+        args.msg_size
+    );
     let chunks_per_msg = args.msg_size.div_ceil(SLOT_SIZE as usize).max(1);
     let slots = (args.clients * chunks_per_msg * 2 + 64).clamp(256, 8192) as u16;
     let recv_bufs = (args.clients * 4).clamp(512, 4096) as u16;
@@ -266,7 +276,7 @@ pub fn run_server_child(args: ChildArgs) -> ! {
             .sq_entries(sq_entries)
             .recv_buffer(recv_bufs, SLOT_SIZE)
             .max_connections(16384)
-            .send_pool(slots, SLOT_SIZE);
+            .send_pool(slots, send_slot_size);
         if args.tls {
             let server_config = rustls::ServerConfig::builder()
                 .with_no_client_auth()
