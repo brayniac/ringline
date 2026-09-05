@@ -1,0 +1,107 @@
+name = "tls-slot-cliff: position control"
+
+# Follow-up to 01a0700d-2ba7-71a6-d6d8-5f15342526b2, which found:
+#
+#   * measured per-cell in its OWN process, 16384 vs 16448 at 1 KiB differ by
+#     nothing at all: 536.38 vs 535.82 ns/op, cycles +0.06%, instructions
+#     +0.00%, and no counter in the list moves enough to buy 75 cycles;
+#   * measured by the original in-process sweep, the ~5% cliff reproduces
+#     (1 KiB: +3.5% to +6.4% for every slot above 16384, both engines);
+#   * AnonHugePages is 0 for the pool's VMA at EVERY slot size, so THP backs
+#     none of it either way and cannot be the mechanism;
+#   * the penalty does not track slot size or allocation size consistently —
+#     with A's slot size and B's footprint it landed on the 16384 cell.
+#
+# The remaining structural difference is measurement position. The original
+# sweep runs every slot size in ONE process in ascending order, each cell
+# allocating and freeing its own ~16 MiB pool, so 16384 — the baseline every
+# other column is divided by — is always the first cell measured on a fresh
+# heap.
+#
+# This job measures one slot size twice, first and last in the same process,
+# and runs the list in both directions. Predictions, stated before the run:
+#
+#   * if position is the effect: in fwd, pos0=16384 is fast and pos7=16384 is
+#     slow by roughly the cliff; in rev the penalty follows onto 65536, which
+#     now sits last. Slot size then explains nothing.
+#   * if slot size is the effect: both 16384 cells agree in fwd, both 65536
+#     cells agree in rev, and the ordering by size is preserved in both.
+#
+# A preheat arm allocates and frees one pool before the first cell, so position
+# 0 no longer measures a pristine heap. If that alone flattens the sweep, the
+# confound is allocator state specifically.
+#
+# host: hv01 = z2.baremetal = 3970X. Pinned to CPU 20 (NUMA node 2, isolated,
+# away from the qemu VM on node 0), as in the first job.
+
+[params]
+ringline_repo = "https://github.com/brayniac/ringline"
+micro_ref     = "bench/tls-slot-cliff"
+micro_cpu     = "20"
+
+[[jobs]]
+name = "order"
+tags = ["z2.baremetal"]
+
+[[jobs.steps]]
+name = "build"
+type = "shell"
+command = """
+set -eu
+source "$HOME/.cargo/env"
+rustc --version
+DIR=/tmp/slotcliff/micro
+if [ -d "$DIR/.git" ]; then
+    cd "$DIR" && git fetch --all -p && git checkout {micro_ref} && git reset --hard origin/{micro_ref}
+else
+    rm -rf "$DIR" && git clone {ringline_repo} "$DIR" && cd "$DIR" && git checkout {micro_ref}
+fi
+cd "$DIR"
+echo "micro at $(git rev-parse --short HEAD)"
+CARGO_TARGET_DIR=target-buf   cargo test --release -p ringline --lib --no-run 2>&1 | tee /tmp/slotcliff/b1.log
+CARGO_TARGET_DIR=target-unbuf cargo test --release -p ringline --lib --features tls-unbuffered --no-run 2>&1 | tee /tmp/slotcliff/b2.log
+BUF=$(grep -o 'Executable unittests src/lib.rs ([^)]*)' /tmp/slotcliff/b1.log | tail -1 | sed 's/.*(\\(.*\\))/\\1/')
+UNBUF=$(grep -o 'Executable unittests src/lib.rs ([^)]*)' /tmp/slotcliff/b2.log | tail -1 | sed 's/.*(\\(.*\\))/\\1/')
+cat > /tmp/slotcliff/env2.sh <<EOF
+export MICRO_BUF=$DIR/$BUF
+export MICRO_UNBUF=$DIR/$UNBUF
+EOF
+cat /tmp/slotcliff/env2.sh
+test -x "$DIR/$BUF" && test -x "$DIR/$UNBUF" && echo "BUILD OK"
+"""
+
+[[jobs.steps]]
+name = "order-control"
+type = "shell"
+command = """
+set -u
+source "$HOME/.cargo/env"
+source /tmp/slotcliff/env2.sh
+: > order.txt
+{ echo "=== uptime (start) ==="; uptime; echo "cargo/rustc procs: $(pgrep -c -x 'cargo|rustc' || true)"; } | tee -a order.txt
+
+# Each invocation is a fresh process, exactly as the original sweep is. Six
+# independent processes per arm so a single unlucky process cannot carry the
+# result; arms interleaved so drift hits all of them.
+for rep in 1 2 3 4 5 6; do
+  for eng in BUF UNBUF; do
+    case $eng in BUF) B="$MICRO_BUF";; UNBUF) B="$MICRO_UNBUF";; esac
+    for order in fwd rev; do
+      for preheat in 0 1; do
+        echo "### rep=$rep eng=$eng order=$order preheat=$preheat" >> order.txt
+        env RL_ORDER=$order RL_PREHEAT=$preheat RL_SIZE=1024 \
+          taskset -c {micro_cpu} "$B" --exact tls::send_microbench::slot_order_control \
+          --nocapture --test-threads=1 >> order.txt 2>&1
+        echo "rc=$?" >> order.txt
+      done
+    done
+  done
+done
+{ echo "=== uptime (end) ==="; uptime; } | tee -a order.txt
+grep -cE '^O' order.txt
+"""
+
+[[jobs.steps]]
+name = "upload-order"
+type = "upload_artifact"
+path = "order.txt"
