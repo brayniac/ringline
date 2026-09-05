@@ -1583,3 +1583,91 @@ fn slot_order_control() {
     println!("# slot_order_control loadavg_after={}", lp.trim());
     std::io::stdout().flush().ok();
 }
+
+/// Reproduce the position effect in a process that measures exactly ONE cell,
+/// so `perf stat` can attribute it.
+///
+/// [`slot_order_control`] shows the penalty follows position, not slot size,
+/// but every cell after the first lives in the same process as the ones before
+/// it, so `perf stat` can only see the whole sweep. Here the "position" is
+/// synthesised: `RL_PRIOR_MS` milliseconds of the *same* encrypt loop run
+/// untimed before the measured loop, on the same connection and pool. Nothing
+/// else differs between the arms.
+///
+/// `RL_MEASURE=0` runs the prior work and skips the measured loop, so its
+/// counters can be subtracted and the remainder describes the measured loop
+/// alone — the same subtraction [`perf_single_cell`] uses.
+///
+/// The question this settles: with ns/op up ~4%, does **cycles/op** move with
+/// it (a microarchitectural cost) or stay flat while achieved GHz falls (a
+/// clock-residency artifact)? `/proc/cpuinfo` cannot answer that on this box —
+/// under acpi-cpufreq with the performance governor it reports a pinned 3700
+/// MHz regardless of boost — but `cycles` and `task-clock` together can.
+#[test]
+fn prior_work_control() {
+    let prior_ms = env_usize("RL_PRIOR_MS", 0) as u128;
+    let slot = env_usize("RL_SLOT", 16384) as u32;
+    let size = env_usize("RL_SIZE", 1024);
+    let iters = env_usize("RL_ITERS", 4_000_000);
+    let measure = env_usize("RL_MEASURE", 1) == 1;
+
+    let lp = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
+    println!(
+        "# prior_work_control engine={ENGINE} prior_ms={prior_ms} slot={slot} size={size} iters={iters} measure={measure} loadavg={}",
+        lp.trim()
+    );
+
+    let mut h = handshaked(1024, slot);
+    let pt: Vec<u8> = (0..size)
+        .map(|i| (i as u32).wrapping_mul(2654435761) as u8)
+        .collect();
+
+    // Where the pool actually landed. A dedicated mmap gives a page-aligned
+    // base plus malloc's 16-byte header; an arena-served chunk lands at an
+    // arbitrary offset. If slow cells correlate with one of those, the
+    // allocation path is worth chasing; if not, it is not.
+    let (idx, ptr, _) = h.pool.copy_in(&[0u8; 1]).expect("slot");
+    let base = ptr as usize;
+    h.pool.release(idx);
+    let ahp = smaps_for(base).map(|(_, _, _, a)| a as i64).unwrap_or(-1);
+    println!(
+        "B\t{ENGINE}\t{prior_ms}\t{slot}\tbase=0x{base:x}\tpage_off={}\tAnonHugePages_kB={ahp}",
+        base % 4096
+    );
+
+    for _ in 0..8 {
+        let s = encrypt_to_sends(&mut h.table, &mut h.pool, 0, 0, &pt).expect("encrypt");
+        release_only(&mut h.pool, s);
+    }
+
+    // Untimed prior work: identical to the measured loop in every respect.
+    if prior_ms > 0 {
+        let t0 = Instant::now();
+        while t0.elapsed().as_millis() < prior_ms {
+            for _ in 0..10_000 {
+                let s =
+                    encrypt_to_sends(&mut h.table, &mut h.pool, 0, 0, std::hint::black_box(&pt))
+                        .expect("encrypt");
+                let (_n, b) = release_only(&mut h.pool, s);
+                std::hint::black_box(b);
+            }
+        }
+    }
+
+    if measure {
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            let s = encrypt_to_sends(&mut h.table, &mut h.pool, 0, 0, std::hint::black_box(&pt))
+                .expect("encrypt");
+            let (_n, b) = release_only(&mut h.pool, s);
+            std::hint::black_box(b);
+        }
+        let el = t0.elapsed();
+        println!(
+            "W\t{ENGINE}\t{prior_ms}\t{slot}\t{iters}\t{:.3}",
+            el.as_nanos() as f64 / iters as f64
+        );
+    }
+    std::hint::black_box(&h.client);
+    std::io::stdout().flush().ok();
+}
