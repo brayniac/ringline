@@ -1,5 +1,22 @@
 name = "ktls-uring-fixedfd-probe"
 
+# STATUS (2026-09-05): SUPERSEDED, and NOT KNOWN TO COMPILE. Do not run as-is.
+#
+# The questions this was written to answer were both settled by G0 on hv02
+# (experiments 01a07207-0da5-714b-fcce-7e5bb5898f50 and
+# 01a0720b-b6ad-7169-1266-9ffa39288117) -- see docs/ktls-design.md P-21..P-24.
+#
+# Two important caveats if anyone revives this file:
+#   - The embedded Rust in THIS revision has never been compiled. The revision
+#     that did run (experiment 01a07047-d6c4-719f-645b-f9e926bcc2b0) used a
+#     closure over `ring` and failed with E0499 (two `ring.completion()`
+#     borrows) on its second step; that run still produced the MSG_WAITALL and
+#     fixed-fd setsockopt results (P-19, P-20) before stopping. This revision
+#     replaces the closure with a free fn but was cancelled before it ever
+#     built.
+#   - Agent hosts differ: hv01 has a pre-existing rustup at 1.85.0, hv02
+#     installed 1.97.1. Anything here must compile on 1.85.
+#
 # Follow-up premise check for docs/ktls-design.md: can kTLS keys be installed
 # on an io_uring FIXED descriptor (ringline closes the raw fd after
 # register_files_update), and does IORING_OP_SEND on such a socket produce

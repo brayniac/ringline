@@ -11,7 +11,8 @@ not be verified are labelled, not smoothed over.
 **Premise-check experiments (SystemsLab):**
 `experiments/ktls-premise-probe.toml` — hv01 / `z2.baremetal`, experiment
 `01a07046-b5fa-7182-77b8-d0800cb0c828`;
-`experiments/ktls-uring-probe.toml` — hv01, `01a07047-d6c4-719f-645b-f9e926bcc2b0`;
+`experiments/ktls-uring-probe.toml` — hv01, `01a07047-d6c4-719f-645b-f9e926bcc2b0`
+(superseded by G0; the in-tree revision has never been compiled — see its header);
 **G0** — hv02 / `z1.baremetal`, `01a07207-0da5-714b-fcce-7e5bb5898f50` and
 `01a0720b-b6ad-7169-1266-9ffa39288117`, both `success`
 
