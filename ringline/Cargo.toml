@@ -19,9 +19,13 @@ check-cfg = ["cfg(has_io_uring)"]
 force-mio = []
 testing = []
 timestamps = []
-# Selects rustls' unbuffered API for the TLS record layer, which encrypts
-# directly from caller memory into a send-pool slot (one fewer copy per TLS
-# send). Off by default while the engine proves out.
+# Selects rustls' unbuffered API (`UnbufferedConnectionCommon`) for the TLS
+# record layer instead of `writer()`/`write_tls()`. This does NOT reduce the
+# copy count -- application-data sends cost 2 copies on both engines, measured
+# and verified against rustls 0.23.41 (see docs/tls-unbuffered-design.md's
+# top correction block). It is kept as the prerequisite for kTLS, since
+# `dangerous_extract_secrets` is implemented on `UnbufferedConnectionCommon`.
+# Off by default.
 tls-unbuffered = []
 
 [dependencies]

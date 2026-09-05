@@ -182,7 +182,31 @@ The key difference: `with_data(|&[u8]|)` provides a borrowed slice — the parse
 | `send_parts()` with `.guard()` only | Guard memory used in-place via `SendMsgZc` iovec | 0 |
 | `send_parts()` mixed `.copy()` + `.guard()` | Copy parts → pool; guard parts zero-copy via iovec | 1 (copy parts only) |
 | Any send with TLS (buffered engine, default) | Gather plaintext, then rustls encrypts **directly into a pool slot** | 2 |
-| Application-data send with TLS (`tls-unbuffered` feature) | `WriteTraffic::encrypt` writes ciphertext into the pool slot (io_uring) or the queued buffer (mio), reading plaintext from caller memory — no intermediate copy | 1 |
+| Application-data send with TLS (`tls-unbuffered` feature) | Also 2. `WriteTraffic::encrypt` copies the plaintext into a fresh per-record `PrefixedPayload`, seals it in place, then `copy_from_slice`s the finished record into the pool slot (io_uring) or the queued buffer (mio). The engine changes *which* two copies are paid, not how many | 2 |
+
+The `tls-unbuffered` feature was merged (#350) claiming it took application-data
+sends from 2 copies to 1. **That claim was false and the row above corrects it.**
+The supposed removed copy — user bytes into rustls' `sendable_plaintext` — does
+not happen on an established connection: `CommonState::send_plain` (rustls
+0.23.41 `src/common_state.rs`) buffers into `sendable_plaintext` only while
+`!may_send_application_data`, i.e. before the handshake completes, and otherwise
+calls `send_plain_non_buffering`. And the unbuffered API does not encrypt into
+the destination either: `WriteTraffic::encrypt` → `write_plaintext` →
+`CommonState::write_fragments` allocates a `PrefixedPayload` per record
+(`Tls13MessageEncrypter::encrypt`), copies the plaintext in, seals in place, and
+then `copy_from_slice`s the record into `outgoing_tls`. Two passes over the
+plaintext on both engines. An allocation counter inside the measured call agrees:
+263,976 bytes/op buffered vs 264,000 unbuffered at a 256 KiB payload.
+
+What the feature *does* deliver, measured in isolation on hv01 (Linux 6.12,
+rustc 1.98.1, io_uring): a small (~1–2%) send-side bookkeeping win at ≥64 KiB, a 4–8%
+recv-side win, and a systematic **extra TLS record** whenever the payload is a
+multiple of `send_copy_slot_size` (the buffered path lets `PoolWriter` straddle
+one 16406-byte record across two slots; the unbuffered path must fit a whole
+record inside one slot, so it emits two) — worth +5.7% on a 16 KiB send. It
+remains the prerequisite for kTLS. See
+[docs/tls-unbuffered-design.md](docs/tls-unbuffered-design.md) and
+[docs/journal/2026-09-unbuffered-tls.md](docs/journal/2026-09-unbuffered-tls.md).
 
 On the mio backend all of these degrade to copy sends (guards are consumed by copying).
 
@@ -219,12 +243,16 @@ Minimal — `with_data()` recv (pattern-match `PONG\r\n`, no value extraction), 
 3. **TLS caps out at one extra copy**: encryption must read plaintext and write ciphertext, so `SendGuard` zero-copy is impossible under TLS — but ciphertext is encrypted directly into the send-pool slot (no intermediate scratch buffer), and it is serialized through the per-connection send queue for record ordering.
 
    The `tls-unbuffered` cargo feature (default off) swaps the record layer for
-   rustls' unbuffered API, which encrypts application data from caller memory
-   straight into the pool slot — one copy instead of two. Recv is unchanged.
-   Handshake ciphertext on io_uring pays one copy *more* than the buffered
-   engine (`EncodeTlsData::encode` needs one contiguous buffer that can exceed
-   a pool slot, so it goes through a scratch `Vec` first) — a one-time
-   per-connection cost, not on the steady-state application-data path. See
+   rustls' unbuffered API. It does **not** reduce the copy count: application
+   data still costs 2 copies, because rustls encrypts each record into a fresh
+   per-record buffer and copies the result into the destination
+   (`write_fragments`), and because the copy the feature was meant to remove
+   (`sendable_plaintext`) only happens *before* the handshake completes. Recv
+   is unchanged. Handshake ciphertext on io_uring pays one copy *more* than the
+   buffered engine (`EncodeTlsData::encode` needs one contiguous buffer that can
+   exceed a pool slot, so it goes through a scratch `Vec` first) — a one-time
+   per-connection cost. Getting the intended 1-copy send would require rustls
+   to encrypt in place into `outgoing_tls`, which it does not do. See
    `docs/tls-unbuffered-design.md`.
 
 4. **Client choice of `with_data` vs `with_bytes`**: This is the single biggest design decision for recv-side copy count. `with_bytes` enables true zero-copy parsing but requires the protocol parser to work with `Bytes` (refcounted slices). `with_data` is simpler but forces a copy.

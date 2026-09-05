@@ -1,13 +1,20 @@
 # Unbuffered TLS send path
 
-- **Status:** open (engine shipped on both backends; interop and rig sweep are plan 4)
-- **Span:** 2026-09-03 → · PR #338 · unreleased (post-0.6.0)
+- **Status:** **NO-GO on the stated GO criterion** (2026-09-04). The engine
+  shipped behind a default-off feature (#350) and stays, but the copy reduction
+  it was built for does not exist — see "Plan 4 — measurement" below. Interop
+  testing still open.
+- **Span:** 2026-09-03 → · PRs #338, #341, #345, #350 · unreleased (post-0.6.0)
 
 Written after the foundation landed rather than before it, contrary to this
 journal's own "land intent before building" rule. Recording that here because
 the omission is the kind of thing the rule exists to prevent.
 
 ## Goal
+
+> **Falsified, 2026-09-04.** The copy described as (1) below does not happen on
+> an established connection, and the unbuffered API does not remove a copy.
+> See "Plan 4 — measurement: NO-GO on the stated criterion". Original text kept.
 
 Remove one of the two copies TLS pays on every send.
 [`docs/syscalls-and-copies.md`](../syscalls-and-copies.md) records TLS sends at
@@ -41,6 +48,10 @@ kTLS was where this started. Two findings moved it to a follow-on:
 2. **The unbuffered path gets the same send-side copy count on *both* backends**,
    including macOS, with none of that — and is a prerequisite anyway, since
    `dangerous_extract_secrets` is implemented on `UnbufferedConnectionCommon`.
+   *(Corrected 2026-09-04: the first clause was the point of this effort and it
+   is false — the unbuffered path does not change the copy count at all. The
+   prerequisite clause is the part that survives, and is now the only standing
+   justification for the engine.)*
 
 kTLS remains the only route to `sendfile` and NIC crypto offload, which is where
 the *remaining* copy goes. Reopen it once the unbuffered engine is real.
@@ -118,7 +129,10 @@ goes through `WriteTraffic::queue_close_notify`. Both backends build and test
 green under `--features tls-unbuffered`.
 
 **The copy win is application data only, and on io_uring it comes with a
-handshake-side cost.** `WriteTraffic::encrypt` reads plaintext from caller
+handshake-side cost.** *(Corrected 2026-09-04: there is no copy win at all —
+`WriteTraffic::encrypt` also costs 2 copies. See "Plan 4 — measurement" below.
+The handshake-side cost recorded here is real and stands.)*
+`WriteTraffic::encrypt` reads plaintext from caller
 memory and writes ciphertext straight into the pool slot (io_uring) or the
 queued buffer (mio) — that path is genuinely 1 copy, down from 2, on both
 backends. But `EncodeTlsData::encode` — the handshake path — is all-or-nothing
@@ -302,8 +316,170 @@ PR scoped.
    `pending_plaintext` the way `drive_inner` does it. Same unreachability
    argument as the two that were fixed.
 
+### Plan 4 — measurement: NO-GO on the stated criterion (2026-09-04)
+
+**Verdict: NO-GO.** The GO criterion was *"TLS sends measurably drop to 1 copy
+with no regression in throughput or latency on the rig, on both backends."* The
+second half holds. The first half does not, and could not have: **there was no
+copy to remove.** The whole premise was a claim about rustls that was never
+checked against rustls.
+
+Recording this as a negative result because it is the more useful half. The
+engine is real, correct, and merged; what is false is the reason it was built,
+and that reason survived a design doc, four PRs, an eight-reviewer adversarial
+pass and a merge without anyone opening `common_state.rs`.
+
+#### Evidence 1 — rustls source (definitive)
+
+Verified in rustls 0.23.41, the version pinned in `Cargo.lock`.
+
+The design's "Copy 1" was user bytes copied into rustls' `sendable_plaintext` by
+`conn.writer().write()`. **That copy does not happen on an established
+connection.** `CommonState::send_plain` (`src/common_state.rs`):
+
+```rust
+if !self.may_send_application_data {
+    // If we haven't completed handshaking, buffer
+    // plaintext to send once we do.
+    ...
+}
+self.send_plain_non_buffering(payload, limit)
+```
+
+`sendable_plaintext` exists to hold plaintext written *before* the handshake
+completes. Every application-data send afterwards goes straight to
+`send_plain_non_buffering`, which fragments and encrypts immediately. The
+buffered engine was already doing what the unbuffered engine was built to make
+it do.
+
+#### Evidence 2 — rustls does not encrypt into the caller's buffer either
+
+`WriteTraffic::encrypt` → `write_plaintext` → `CommonState::write_fragments`:
+
+```rust
+for m in fragments {
+    let em = self.record_layer.encrypt_outgoing(m).encode();
+    let len = em.len();
+    outgoing_tls[written..written + len].copy_from_slice(&em);
+}
+```
+
+and `Tls13MessageEncrypter::encrypt` (`src/crypto/ring/tls13.rs`):
+
+```rust
+let total_len = self.encrypted_payload_len(msg.payload.len());
+let mut payload = PrefixedPayload::with_capacity(total_len);   // fresh alloc per record
+payload.extend_from_chunks(&msg.payload);                      // plaintext copied IN
+self.enc_key.seal_in_place_append_tag(nonce, aad, &mut payload)?;
+```
+
+So `encrypt(plaintext, dst)` is: plaintext → fresh per-record heap buffer → AEAD
+in place → `copy_from_slice` into `dst`. **Two passes**, the same two the
+buffered engine pays. `encrypt`'s signature *looks* like in-place encryption
+into the destination; its implementation is not. Reading the signature and
+inferring the mechanism is exactly the mistake made here.
+
+#### Evidence 3 — measured on Linux/io_uring
+
+hv01, kernel 6.12, rustc 1.98.1. Isolated in-process microbenchmark of the send
+path (harness on the local `bench/tls-send-microbench` branch, not merged).
+
+An allocation counter inside the measured call, 256 KiB payload: buffered
+**263,976** bytes/op, unbuffered **264,000** — 24 bytes apart. If the unbuffered
+path encrypted into the destination this would be ~0. That single number is
+what turned a suspicion into a conclusion, and it is cheap: it should have been
+the first thing measured, before the design was written.
+
+Isolated send path, ns/op, medians of 4 interleaved rounds, under 1% within-arm
+spread:
+
+| size | buffered | unbuffered | Δ |
+|---|---:|---:|---:|
+| 1 KiB | 538.6 | 521.7 | −3.1% |
+| 16 KiB | 4302 | 4547 | **+5.7%** |
+| 64 KiB | 17741 | 17613 | −0.7% |
+| 256 KiB | 71738 | 70196 | −2.2% |
+| 1 MiB | 287181 | 282071 | −1.8% |
+
+**A control that mattered:** running the payload cold made the copy ~4.5× more
+expensive and left the arm delta *unchanged* (−2.2% hot vs −2.1% cold at
+256 KiB). If a copy had been removed, making copies more expensive would have
+widened the gap sharply. It did not move. This is the cheap discriminator for
+"did a copy actually go away" and is worth reusing.
+
+Isolated **recv** path (mins of 8 reps, 10–20% spread — weaker numbers, treat
+as ±2%):
+
+| size | buffered | unbuffered | Δ |
+|---|---:|---:|---:|
+| 1 KiB | 580 | 544 | −6.2% |
+| 16 KiB | 5020 | 4630 | −7.8% |
+| 64 KiB | 23400 | 22270 | −4.8% |
+| 256 KiB | 91490 | 88580 | −3.2% |
+
+An end-to-end TLS echo comparison (server CPU per op, 4 interleaved runs per
+arm) was also run, but **client and server were co-located, so it is a relative
+signal only and its absolute figures are not publishable** — the mistake this
+project already made once and withdrew `BENCHMARKS.md` for in #205. It agreed
+with the microbenchmark: 64 B −0.4% and 1 KiB +0.7% (both noise); 16 KiB −2.5%
+and 256 KiB +1.0%, both with non-overlapping runs, the latter in the wrong
+direction. No throughput or latency regression anywhere.
+
+#### The 16 KiB send regression is structural
+
+At a payload that is an exact multiple of `send_copy_slot_size` (16384 by
+default), the buffered path emits **one** 16406-byte record and lets
+`PoolWriter` straddle it across two slots. The unbuffered path must fit a whole
+record inside one slot, so `encrypt_chunk` shrinks the chunk and emits **two**
+records — 17 vs 16 at 256 KiB, 65 vs 64 at 1 MiB. The extra record costs
+~245 ns, which is the entire +5.7%. This is a real, reproducible cost of the
+engine at slot-multiple payloads, not measurement noise, and it is the thing to
+attack if the engine is ever made default (see the design doc's open question 1
+on chunk size, which now has a concrete reason to be answered).
+
+#### What the feature actually delivers
+
+- A small (~1–2%) send-side win at ≥64 KiB. It is **bookkeeping**, not data
+  movement: fewer state transitions and no `wants_write()` loop, not a copy.
+- A **4–8% recv-side win** — genuine and *unanticipated*. This design explicitly
+  scoped recv out ("Recv copy count does not change", which remains true — the
+  copy count is the same, the path around it is cheaper). The one real win came
+  from the half of the work nobody was measuring.
+- A systematic extra TLS record at slot-multiple payloads.
+- The prerequisite for kTLS. `dangerous_extract_secrets` is implemented on
+  `UnbufferedConnectionCommon`, so this part of the original argument survives
+  intact and is now the *only* standing justification for the engine.
+
+Reaching the originally-claimed 1 copy would require **rustls** to encrypt in
+place into `outgoing_tls`. `write_fragments` does not, and that is not
+reachable from ringline — it is an upstream change, if it is anything.
+
+#### Consequences
+
+- Copy tables corrected in `CLAUDE.md`, `docs/syscalls-and-copies.md` and the
+  `## [Unreleased]` CHANGELOG entry; the design doc carries a correction block
+  at the top rather than being deleted.
+- The feature stays, default off, on the kTLS-prerequisite justification alone.
+  It should not be made default without first fixing the slot-multiple extra
+  record.
+- The recv-side win is the interesting thread and was found by accident. Worth
+  isolating properly before it is claimed anywhere user-facing.
+
 ## Lessons / open questions
 
+- **A performance premise that is a claim about a dependency must be checked
+  against that dependency's source before the design is written.** The whole of
+  this effort rested on "`writer().write()` copies into `sendable_plaintext`",
+  which is true only before the handshake completes — one `if` in
+  `common_state.rs`, ~30 lines, readable in a minute. It was instead assumed
+  from the shape of the API, restated in a design doc, a journal, four PRs and a
+  merged CHANGELOG entry, and never checked. Nothing about the *implementation*
+  review would have caught it: the engine does exactly what it was designed to
+  do.
+- **To test whether a copy was removed, make copies more expensive.** Running
+  the payload cold (4.5× the copy cost) and seeing the arm delta not move is a
+  cheaper and more direct discriminator than any timing table. An allocation
+  counter inside the measured call was cheaper still, and settled it outright.
 - **A test that asserts a bound while exercising the wrong regime is worse than
   no test**, because it converts an unexamined assumption into apparent
   evidence. Both amortization bugs here passed a green suite. The cheap
@@ -319,6 +495,11 @@ PR scoped.
   no-deadlock argument assumes no single `append` exceeds 64 KiB. `append`
   `debug_assert`s it, but plan 2's recv wiring must size its buffer accordingly.
 - Open: chunk-size policy for `encrypt` (fill slots to `slot_size − overhead`,
-  or a fixed 16 KiB record with a larger slot?) wants a measurement.
+  or a fixed 16 KiB record with a larger slot?) wants a measurement. This now
+  has a concrete target: the extra TLS record emitted at payloads that are exact
+  multiples of `send_copy_slot_size`, worth +5.7% at 16 KiB.
+- Open: **where does the 4–8% recv-side win come from?** It was not designed for
+  and is not a copy — recv copy count is identical on both engines. Isolate it
+  before claiming it anywhere user-facing.
 - Open: `CiphertextBuf`'s capacity default — reuse `recv_buffer_size`, or a
   dedicated setting? `MIN_CIPHERTEXT_CAP` is the floor.
