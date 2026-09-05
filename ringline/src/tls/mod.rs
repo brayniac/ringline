@@ -567,6 +567,10 @@ fn build_pool_send(
     }
 }
 
+// BENCH-ONLY SCAFFOLDING (investigation; not shipping code).
+#[cfg(all(test, has_io_uring))]
+mod send_microbench;
+
 #[cfg(test)]
 mod tests {
     use super::*;
