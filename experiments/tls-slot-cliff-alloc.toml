@@ -1,0 +1,99 @@
+name = "tls-slot-cliff: allocation path (rustc 1.98.1)"
+
+# Fifth and final job. Everything except the *cause* of the position effect is
+# already settled:
+#
+#   job 1 (01a0700d) per-cell in its own process, 16384 vs 16448 at 1 KiB is a
+#     dead heat (536.38 vs 535.82 ns/op; cycles +0.06%; instructions +0.00%);
+#     AnonHugePages is 0 for the pool's VMA at every slot size; end to end the
+#     arms differ +0.24% (TLS) and +0.35% (plaintext control).
+#   job 2 (01a0701f) the cliff is measurement POSITION: the same slot size
+#     first vs last in one process differs +2.5% to +5.4% in all 8 arms, and
+#     reversing the sweep moves the penalty onto whichever size now sits last.
+#   job 3 (01a07022) /proc/cpuinfo is a useless instrument here (pinned 3700 MHz
+#     under acpi-cpufreq + performance).
+#   job 4 (01a07027) 4 s of the IDENTICAL encrypt loop before the measured loop,
+#     in a single-cell process, changes nothing: 531.35 vs 531.42 ns/op. So the
+#     penalty is not elapsed time, not clock decay, and not cache/branch state
+#     built up by the work itself.
+#
+# What the sweep does that job 4 did not is allocate and free a fresh ~16 MiB
+# pool (and a fresh rustls connection) per cell. Job 1 already showed a pool in
+# a 7-pool process landing at page offset 704 rather than the 16 that a
+# dedicated mmap gives, i.e. served from the main arena instead. glibc raises
+# M_MMAP_THRESHOLD dynamically as mmap'd chunks are freed, so the allocation
+# path can change partway through a sweep.
+#
+# This job reports, per cell, both the timing and where the pool landed, and
+# adds the causal control: setting M_MMAP_THRESHOLD explicitly with mallopt
+# also disables glibc's dynamic adjustment, so every cell is served identically.
+#
+# Predictions, stated before the run:
+#   * if the allocation path is the confound: slow cells carry a page offset
+#     other than 16, and the arm with M_MMAP_THRESHOLD pinned is flat.
+#   * if not: page offset is 16 everywhere and pinning changes nothing, and the
+#     cause of the position effect remains unidentified — which is the answer I
+#     will report rather than inventing a mechanism to fit.
+#
+# host: hv01 = z2.baremetal = 3970X, pinned to CPU 20.
+
+[params]
+ringline_repo = "https://github.com/brayniac/ringline"
+micro_ref     = "bench/tls-slot-cliff"
+micro_cpu     = "20"
+toolchain     = "1.98.1"
+
+[[jobs]]
+name = "alloc"
+tags = ["z2.baremetal"]
+
+[[jobs.steps]]
+name = "build"
+type = "shell"
+command = """
+set -eu
+source "$HOME/.cargo/env"
+rustup toolchain install {toolchain} --profile minimal
+echo "pinned toolchain is: $(rustup run {toolchain} rustc --version)"
+DIR=/tmp/slotcliff/micro98
+cd "$DIR" && git fetch --all -p && git checkout {micro_ref} && git reset --hard origin/{micro_ref}
+echo "micro at $(git rev-parse --short HEAD)"
+CARGO_TARGET_DIR=target-buf rustup run {toolchain} cargo test --release -p ringline --lib --no-run 2>&1 | tee /tmp/slotcliff/e1.log
+BUF=$(grep -o 'Executable unittests src/lib.rs ([^)]*)' /tmp/slotcliff/e1.log | tail -1 | sed 's/.*(\\(.*\\))/\\1/')
+echo "export MICRO_BUF=$DIR/$BUF" > /tmp/slotcliff/env5.sh
+cat /tmp/slotcliff/env5.sh
+test -x "$DIR/$BUF" && echo "BUILD OK"
+"""
+
+[[jobs.steps]]
+name = "alloc-path"
+type = "shell"
+command = """
+set -u
+source "$HOME/.cargo/env"
+source /tmp/slotcliff/env5.sh
+: > alloc.txt
+{ echo "=== uptime (start) ==="; uptime; echo "cargo/rustc procs: $(pgrep -c -x 'cargo|rustc' || true)"; } | tee -a alloc.txt
+
+# thresh=0 leaves glibc's dynamic mmap_threshold alone (the status quo);
+# thresh=131072 pins it at the glibc default, which also switches the dynamic
+# adjustment off, so every ~16 MiB pool is mmap'd from first cell to last.
+for rep in 1 2 3 4 5 6; do
+  for order in fwd rev; do
+    for thresh in 0 131072; do
+      echo "### rep=$rep order=$order mmap_threshold=$thresh" >> alloc.txt
+      env RL_ORDER=$order RL_PREHEAT=0 RL_SIZE=1024 RL_CPU={micro_cpu} RL_MMAP_THRESHOLD=$thresh \
+        taskset -c {micro_cpu} "$MICRO_BUF" --exact tls::send_microbench::slot_order_control \
+        --nocapture --test-threads=1 >> alloc.txt 2>&1
+      echo "rc=$?" >> alloc.txt
+    done
+  done
+done
+{ echo "=== uptime (end) ==="; uptime; } | tee -a alloc.txt
+echo "O:$(grep -cE '^O' alloc.txt) B:$(grep -cE '^B' alloc.txt)"
+"""
+
+[[jobs.steps]]
+name = "upload-alloc"
+type = "upload_artifact"
+path = "alloc.txt"

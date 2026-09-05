@@ -1540,6 +1540,52 @@ fn alloc_vs_slot() {
 /// position 0 starts from the same allocator state as the others. If that alone
 /// flattens the sweep, the confound is allocator state specifically rather than
 /// anything about the slot.
+/// [`measure_send2_pool`] plus the address the pool's backing actually landed
+/// at. A chunk served by a dedicated `mmap` starts at a page boundary plus
+/// malloc's 16-byte header; one served from the main arena lands at an
+/// arbitrary offset. glibc raises `mmap_threshold` dynamically as mmap'd chunks
+/// are freed, so a sweep that allocates and frees a ~16 MiB pool per cell can
+/// silently change allocation path partway through.
+fn measure_cell_with_addr(
+    size: usize,
+    slot_size: u32,
+    slot_count: u16,
+    bytes_per_rep: usize,
+    reps: usize,
+) -> (Vec<f64>, usize) {
+    let mut h = handshaked(slot_count, slot_size);
+    let (idx, ptr, _) = h.pool.copy_in(&[0u8; 1]).expect("slot");
+    let base = ptr as usize;
+    h.pool.release(idx);
+
+    let pt: Vec<u8> = (0..size)
+        .map(|i| (i as u32).wrapping_mul(2654435761) as u8)
+        .collect();
+    let iters = (bytes_per_rep / size).max(16);
+    for _ in 0..8 {
+        let s = encrypt_to_sends(&mut h.table, &mut h.pool, 0, 0, &pt).expect("encrypt");
+        release_only(&mut h.pool, s);
+    }
+    let mut out = Vec::with_capacity(reps);
+    for _ in 0..reps {
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            let s = encrypt_to_sends(&mut h.table, &mut h.pool, 0, 0, std::hint::black_box(&pt))
+                .expect("encrypt");
+            let (_n, b) = release_only(&mut h.pool, s);
+            std::hint::black_box(b);
+        }
+        out.push(t0.elapsed().as_nanos() as f64 / iters as f64);
+    }
+    assert_eq!(
+        h.pool.free_count(),
+        slot_count as usize,
+        "pool leaked a slot"
+    );
+    std::hint::black_box(&h.client);
+    (out, base)
+}
+
 #[test]
 fn slot_order_control() {
     let order = std::env::var("RL_ORDER").unwrap_or_else(|_| "fwd".to_string());
@@ -1566,18 +1612,32 @@ fn slot_order_control() {
         drop(h);
     }
 
+    // Causal control for the allocator path. Setting M_MMAP_THRESHOLD
+    // explicitly also DISABLES glibc's dynamic adjustment of it, so every pool
+    // in the sweep is served the same way from first cell to last. If that
+    // alone flattens the sweep, the confound is the allocation path.
+    let mmap_thresh = env_usize("RL_MMAP_THRESHOLD", 0);
+    if mmap_thresh > 0 {
+        // SAFETY: mallopt takes two ints and touches no caller memory.
+        let rc = unsafe { libc::mallopt(libc::M_MMAP_THRESHOLD, mmap_thresh as libc::c_int) };
+        println!("# mallopt(M_MMAP_THRESHOLD, {mmap_thresh}) rc={rc}");
+    }
+
     let cpu = env_usize("RL_CPU", 20);
     for (pos, &slot) in list.iter().enumerate() {
         let mhz_before = cpu_mhz(cpu);
-        let r = measure_send2_pool(size, slot, 1024, bpr, reps);
+        let (r, base) = measure_cell_with_addr(size, slot, 1024, bpr, reps);
         let mhz_after = cpu_mhz(cpu);
         for (i, ns) in r.iter().enumerate() {
             println!("O\t{ENGINE}\t{order}\t{preheat}\t{pos}\t{slot}\t{i}\t{ns:.3}");
         }
-        // Frequency bracketing the cell. If ns/op tracks this and the earlier
-        // per-process counter run showed cycles/op flat, the sweep is measuring
-        // boost decay, not the slot size.
         println!("F\t{ENGINE}\t{order}\t{preheat}\t{pos}\t{slot}\t{mhz_before:.1}\t{mhz_after:.1}");
+        // page_off == 16 means a dedicated mmap; anything else means the chunk
+        // came from the main arena.
+        println!(
+            "B\t{ENGINE}\t{order}\t{preheat}\t{pos}\t{slot}\t0x{base:x}\t{}",
+            base % 4096
+        );
     }
     let lp = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
     println!("# slot_order_control loadavg_after={}", lp.trim());
