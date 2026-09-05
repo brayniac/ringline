@@ -787,6 +787,7 @@ pub fn run_tls_echo(
     let server_bytes = after.bytes.saturating_sub(before.bytes);
     let send_fails = after.send_fails.saturating_sub(before.send_fails);
 
+    let achieved_rate = client_ops as f64 / elapsed.as_secs_f64();
     let mut warning = None;
     if server_ops == 0 {
         warning = Some("server completed no operations in the window".into());
@@ -798,6 +799,19 @@ pub fn run_tls_echo(
         warning = Some(format!(
             "server saw {} connections, expected {num_clients}",
             after.conns
+        ));
+    } else if target_rate > 0
+        && (achieved_rate - target_rate as f64).abs() > 0.1 * target_rate as f64
+    {
+        // A paced run that silently misses its target is not the fixed-load
+        // comparison it claims to be, and the two arms can miss it by different
+        // amounts. Two ways to miss: the server could not keep up, or the pacer
+        // could not go fast enough. `tokio::time::sleep_until` runs on a ~1 ms
+        // timer wheel, so one client tops out near 1000 ops/s and a target
+        // above `1000 * clients` is unreachable however idle the server is.
+        warning = Some(format!(
+            "paced target {target_rate} ops/s, achieved {achieved_rate:.0} \
+             (pacer ceiling is ~1000 ops/s per client, and there are {num_clients})"
         ));
     }
 

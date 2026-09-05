@@ -83,7 +83,10 @@ struct Args {
     /// 0 (default) is closed-loop: each client sends the next request as soon
     /// as the previous response lands, so a faster server is offered more
     /// load. A non-zero rate paces the clients so both arms do the same work,
-    /// which is the cleaner comparison when the server has headroom.
+    /// which is the cleaner comparison when the server has headroom. Pacing
+    /// runs on tokio's ~1 ms timer, so one client tops out near 1000 ops/s:
+    /// a target above `1000 * --clients` cannot be reached, and the harness
+    /// flags any row that misses its target by more than 10%.
     #[arg(long, default_value_t = 0)]
     tls_rate: u64,
 

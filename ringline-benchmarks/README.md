@@ -91,6 +91,16 @@ backend (on macOS that is the only backend; on Linux it is the fallback path).
 | `--tls-rate` | aggregate target ops/sec across all clients; 0 (default) is closed-loop |
 | `--json` | write the full result set |
 
+Two things to know before using `--tls-rate`. Pacing runs on tokio's ~1 ms timer
+wheel, so **one client tops out near 1000 ops/s**: a target above
+`1000 * --clients` cannot be reached no matter how idle the server is, and any
+row that misses its target by more than 10% is flagged. And a paced run *well*
+below saturation measures a different regime — at roughly one wakeup per
+operation there is no batching to amortise the event loop over, so per-op CPU
+comes out several times higher than in a saturated closed-loop run and the copy
+is a much smaller share of it. Pace to just under the closed-loop throughput,
+not far under it.
+
 ### What it does, and why
 
 - **The server runs in a child process** (`current_exe --tls-server-child`).
