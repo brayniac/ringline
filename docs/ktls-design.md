@@ -66,8 +66,9 @@ the criteria below are written to fail the same way if the premises are wrong.
 must be run first.** Extend the microbenchmark harness that already exists on
 the local `bench/tls-send-microbench` branch (the one that produced the
 allocation counter) with a third arm: a real kTLS socket, keys installed by
-hand, plaintext sent with `IORING_OP_SEND`. On hv01, at 1 KiB / 16 KiB /
-64 KiB / 256 KiB / 1 MiB, report:
+hand, plaintext sent with `IORING_OP_SEND` **and no `MSG_WAITALL`** — kTLS
+refuses it [P-19], so ringline's own `STREAM_SEND_FLAGS` cannot be used
+verbatim. On hv01, at 1 KiB / 16 KiB / 64 KiB / 256 KiB / 1 MiB, report:
 
 - **bytes allocated per operation inside the measured call**, the number that
   settled the last effort. Prediction from source: the kTLS arm allocates
