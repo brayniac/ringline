@@ -1238,3 +1238,256 @@ fn small_send_slot_shape() {
     }
     std::io::stdout().flush().ok();
 }
+
+// ── INVESTIGATION: slot-size cliff ──────────────────────────────────────
+//
+// Scaffolding for the "any slot size > 16384 costs ~25 ns/op on small sends"
+// question. Everything below is driven from the environment so `perf stat` can
+// be pointed at a process whose runtime *is* the measured loop, and so a
+// setup-only arm can be subtracted from it.
+
+/// Per-process THP suppression, for the causal half of the huge-page question.
+/// `prctl(PR_SET_THP_DISABLE)` is inherited by the whole process and touches
+/// nothing outside it — hv01 is shared, so the system-wide
+/// `/sys/kernel/mm/transparent_hugepage/enabled` knob is off limits.
+fn disable_thp_for_this_process() -> bool {
+    const PR_SET_THP_DISABLE: libc::c_int = 41;
+    // SAFETY: plain prctl with the documented argument shape; no pointers.
+    let rc = unsafe { libc::prctl(PR_SET_THP_DISABLE, 1_u64, 0_u64, 0_u64, 0_u64) };
+    rc == 0
+}
+
+fn env_usize(k: &str, d: usize) -> usize {
+    std::env::var(k)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(d)
+}
+
+/// Read `AnonHugePages` (KiB) for the VMA containing `addr`, plus that VMA's
+/// start/end/size, out of this process's own smaps.
+fn smaps_for(addr: usize) -> Option<(usize, usize, usize, usize)> {
+    let s = std::fs::read_to_string("/proc/self/smaps").ok()?;
+    let mut cur: Option<(usize, usize)> = None;
+    let mut size_kb = 0usize;
+    for line in s.lines() {
+        if let Some((range, _)) = line.split_once(' ')
+            && let Some((a, b)) = range.split_once('-')
+            && let (Ok(a), Ok(b)) = (usize::from_str_radix(a, 16), usize::from_str_radix(b, 16))
+        {
+            cur = Some((a, b));
+            size_kb = 0;
+            continue;
+        }
+        let Some((lo, hi)) = cur else { continue };
+        if let Some(v) = line.strip_prefix("Size:") {
+            size_kb = v.trim().trim_end_matches(" kB").trim().parse().unwrap_or(0);
+        }
+        if let Some(v) = line.strip_prefix("AnonHugePages:")
+            && addr >= lo
+            && addr < hi
+        {
+            let ahp: usize = v.trim().trim_end_matches(" kB").trim().parse().unwrap_or(0);
+            return Some((lo, hi, size_kb, ahp));
+        }
+    }
+    None
+}
+
+/// One (slot_size, payload) cell and nothing else, so the process runtime is
+/// the measured loop. `RL_SETUP_ONLY=1` runs the identical setup and skips the
+/// loop, giving a baseline to subtract from `perf stat` totals.
+///
+/// Env: RL_SLOT, RL_SIZE, RL_SLOTS, RL_ITERS, RL_SETUP_ONLY, RL_THP.
+#[test]
+fn perf_single_cell() {
+    let slot = env_usize("RL_SLOT", 16384) as u32;
+    let size = env_usize("RL_SIZE", 1024);
+    let slot_count = env_usize("RL_SLOTS", 1024) as u16;
+    let iters = env_usize("RL_ITERS", 20_000_000);
+    let setup_only = env_usize("RL_SETUP_ONLY", 0) == 1;
+    let thp = env_usize("RL_THP", 0) == 1;
+    let nothp = env_usize("RL_NOTHP", 0) == 1;
+    if nothp {
+        let ok = disable_thp_for_this_process();
+        println!("# PR_SET_THP_DISABLE applied={ok}");
+    }
+
+    let lp = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
+    println!(
+        "# perf_single_cell engine={ENGINE} slot={slot} size={size} slots={slot_count} iters={iters} setup_only={setup_only} loadavg_before={}",
+        lp.trim()
+    );
+
+    let mut h = handshaked(slot_count, slot);
+    let pt: Vec<u8> = (0..size)
+        .map(|i| (i as u32).wrapping_mul(2654435761) as u8)
+        .collect();
+
+    // Warm up exactly as the sweep does.
+    for _ in 0..8 {
+        let s = encrypt_to_sends(&mut h.table, &mut h.pool, 0, 0, &pt).expect("encrypt");
+        release_only(&mut h.pool, s);
+    }
+
+    if thp {
+        // Base address of slot 0 == base of the pool's backing allocation.
+        let (idx, ptr, _) = h.pool.copy_in(&[0u8; 1]).expect("slot");
+        let base = ptr as usize;
+        h.pool.release(idx);
+        let total = slot_count as usize * slot as usize;
+        match smaps_for(base) {
+            Some((lo, hi, size_kb, ahp)) => println!(
+                "THP\t{ENGINE}\t{slot}\t{slot_count}\tbase=0x{base:x}\tbase_off_2M={}\tpool_bytes={total}\tvma=0x{lo:x}-0x{hi:x}\tvma_kb={size_kb}\tAnonHugePages_kB={ahp}",
+                base % (2 << 20)
+            ),
+            None => println!("THP\t{ENGINE}\t{slot}\t{slot_count}\tbase=0x{base:x}\tNO_VMA_FOUND"),
+        }
+    }
+
+    if !setup_only {
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            let s = encrypt_to_sends(&mut h.table, &mut h.pool, 0, 0, std::hint::black_box(&pt))
+                .expect("encrypt");
+            let (_n, b) = release_only(&mut h.pool, s);
+            std::hint::black_box(b);
+        }
+        let el = t0.elapsed();
+        println!(
+            "P\t{ENGINE}\t{slot}\t{size}\t{iters}\t{:.3}",
+            el.as_nanos() as f64 / iters as f64
+        );
+    }
+    assert_eq!(
+        h.pool.free_count(),
+        slot_count as usize,
+        "pool leaked a slot"
+    );
+    std::hint::black_box(&h.client);
+    std::io::stdout().flush().ok();
+}
+
+/// THP accounting alone, both slot sizes, in one process — no timing, so it can
+/// run without a quiet box.
+#[test]
+fn thp_accounting() {
+    let nothp = env_usize("RL_NOTHP", 0) == 1;
+    if nothp {
+        let ok = disable_thp_for_this_process();
+        println!("# PR_SET_THP_DISABLE applied={ok}");
+    }
+    println!("# thp_accounting engine={ENGINE} nothp={nothp}");
+    for &slot in &[16384u32, 16385, 16406, 16448, 20480, 32768, 65536] {
+        let slot_count = 1024u16;
+        let mut h = handshaked(slot_count, slot);
+        let pt: Vec<u8> = (0..1024)
+            .map(|i| (i as u32).wrapping_mul(2654435761) as u8)
+            .collect();
+        for _ in 0..100_000 {
+            let s = encrypt_to_sends(&mut h.table, &mut h.pool, 0, 0, &pt).expect("encrypt");
+            release_only(&mut h.pool, s);
+        }
+        let (idx, ptr, _) = h.pool.copy_in(&[0u8; 1]).expect("slot");
+        let base = ptr as usize;
+        h.pool.release(idx);
+        let total = slot_count as usize * slot as usize;
+        match smaps_for(base) {
+            Some((lo, hi, size_kb, ahp)) => println!(
+                "THP\t{ENGINE}\t{slot}\t{slot_count}\tbase=0x{base:x}\tbase_off_2M={}\tpool_bytes={total}\tvma=0x{lo:x}-0x{hi:x}\tvma_kb={size_kb}\tAnonHugePages_kB={ahp}",
+                base % (2 << 20)
+            ),
+            None => println!("THP\t{ENGINE}\t{slot}\t1024\tbase=0x{base:x}\tNO_VMA_FOUND"),
+        }
+        std::hint::black_box(&h.client);
+    }
+    std::io::stdout().flush().ok();
+}
+
+/// Separate "slot size" from "pool allocation size", which the original sweep
+/// confounds: it held the slot *count* at 1024, so growing the slot also grew
+/// the backing `Vec`.
+///
+/// `16384 * 1028` and `16448 * 1024` are both **exactly** 16,842,752 bytes, so:
+///
+/// | cell | slot | count | backing bytes |
+/// |---|---|---|---|
+/// | A | 16384 | 1024 | 16,777,216 (fast in the original sweep) |
+/// | B | 16448 | 1024 | 16,842,752 (slow in the original sweep) |
+/// | C | 16384 | 1028 | 16,842,752 — B's footprint, A's slot size |
+/// | D | 16448 | 1020 | 16,776,960 — A's footprint (−256 B), B's slot size |
+///
+/// If C is slow and D is fast, the lever is the allocation, not the slot size.
+///
+/// `RL_MODE=inter` rebuilds every cell each round (re-rolling heap layout);
+/// `RL_MODE=fixed` builds each cell once and runs its rounds back to back,
+/// which is what the original sweep did.
+#[test]
+fn alloc_vs_slot() {
+    let mode = std::env::var("RL_MODE").unwrap_or_else(|_| "inter".to_string());
+    if env_usize("RL_NOTHP", 0) == 1 {
+        let ok = disable_thp_for_this_process();
+        println!("# PR_SET_THP_DISABLE applied={ok}");
+    }
+    let rounds = env_usize("RL_ROUNDS", 7);
+    let size = env_usize("RL_SIZE", 1024);
+    let iters = env_usize("RL_ITERS", 200_000);
+    let cells: [(&str, u32, u16); 4] = [
+        ("A_16384x1024", 16384, 1024),
+        ("B_16448x1024", 16448, 1024),
+        ("C_16384x1028", 16384, 1028),
+        ("D_16448x1020", 16448, 1020),
+    ];
+    let lp = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
+    println!(
+        "# alloc_vs_slot engine={ENGINE} mode={mode} size={size} iters={iters} rounds={rounds} loadavg_before={}",
+        lp.trim()
+    );
+
+    let pt: Vec<u8> = (0..size)
+        .map(|i| (i as u32).wrapping_mul(2654435761) as u8)
+        .collect();
+
+    let run = |h: &mut Handshaked, pt: &[u8]| -> f64 {
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            let s = encrypt_to_sends(&mut h.table, &mut h.pool, 0, 0, std::hint::black_box(pt))
+                .expect("encrypt");
+            let (_n, b) = release_only(&mut h.pool, s);
+            std::hint::black_box(b);
+        }
+        t0.elapsed().as_nanos() as f64 / iters as f64
+    };
+
+    if mode == "fixed" {
+        for (label, slot, count) in cells {
+            let mut h = handshaked(count, slot);
+            for _ in 0..8 {
+                let s = encrypt_to_sends(&mut h.table, &mut h.pool, 0, 0, &pt).expect("encrypt");
+                release_only(&mut h.pool, s);
+            }
+            for r in 0..rounds {
+                let ns = run(&mut h, &pt);
+                println!("A\t{ENGINE}\tfixed\t{label}\t{slot}\t{count}\t{r}\t{ns:.3}");
+            }
+            std::hint::black_box(&h.client);
+        }
+    } else {
+        for r in 0..rounds {
+            for (label, slot, count) in cells {
+                let mut h = handshaked(count, slot);
+                for _ in 0..8 {
+                    let s =
+                        encrypt_to_sends(&mut h.table, &mut h.pool, 0, 0, &pt).expect("encrypt");
+                    release_only(&mut h.pool, s);
+                }
+                let ns = run(&mut h, &pt);
+                println!("A\t{ENGINE}\tinter\t{label}\t{slot}\t{count}\t{r}\t{ns:.3}");
+                std::hint::black_box(&h.client);
+            }
+        }
+    }
+    let lp = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
+    println!("# alloc_vs_slot loadavg_after={}", lp.trim());
+    std::io::stdout().flush().ok();
+}
