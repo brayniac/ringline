@@ -8,8 +8,12 @@ not be verified are labelled, not smoothed over.
 [`journal/2026-09-unbuffered-tls.md`](journal/2026-09-unbuffered-tls.md),
 [`send-completion-design.md`](send-completion-design.md),
 [`syscalls-and-copies.md`](syscalls-and-copies.md)
-**Premise-check experiments:** `experiments/ktls-premise-probe.toml`,
-`experiments/ktls-uring-probe.toml` (SystemsLab, hv01 / `z2.baremetal`)
+**Premise-check experiments (SystemsLab):**
+`experiments/ktls-premise-probe.toml` — hv01 / `z2.baremetal`, experiment
+`01a07046-b5fa-7182-77b8-d0800cb0c828`;
+`experiments/ktls-uring-probe.toml` — hv01, `01a07047-d6c4-719f-645b-f9e926bcc2b0`;
+**G0** — hv02 / `z1.baremetal`, `01a07207-0da5-714b-fcce-7e5bb5898f50` and
+`01a0720b-b6ad-7169-1266-9ffa39288117`, both `success`
 
 ---
 
@@ -54,6 +58,24 @@ Neither correction rescues the project: see
 [Question 2](#2-is-tls_hw-reachable-on-hardware-we-own) and the
 [recommendation](#recommendation).
 
+> **G0 has since run, and its premise passed.** The gate this document defines
+> below was executed on hv02 before the document shipped. Direct kernel
+> tracing shows that **every** kTLS send in every mode — `send(2)`, io_uring
+> `SEND` on a raw fd, on a **fixed** fd, and with `IOSQE_ASYNC` forcing io-wq
+> — takes `sk_msg_zerocopy_from_iter`, and `sk_msg_memcopy_from_iter` was
+> never called at all. [P-21]
+>
+> That converts this document's largest unverified premise into a measured
+> one, and it is *stronger* evidence than the allocation counter G0 originally
+> specified: it observes the kernel mechanism directly rather than inferring
+> it from timing. **`[U-1]` is resolved; `[U-2]` is resolved as a hard "no",
+> for a structural reason** [P-22].
+>
+> The decision does **not** change. G0 was only ever the cheapest way to
+> falsify the effort early. What remains — G2, N2, N3, N4, and the now-measured
+> N5 — is untouched by it, and `TLS_HW` remains unreachable [P-7], so software
+> kTLS is the ceiling.
+
 ---
 
 ## GO/NO-GO criteria
@@ -63,7 +85,13 @@ well-formed and the effort still failed it — that is the system working, and
 the criteria below are written to fail the same way if the premises are wrong.
 
 **G0 — premise gate. Runnable before a line of implementation code, and it
-must be run first.** Extend the microbenchmark harness that already exists on
+must be run first.** ✅ **RUN, 2026-09-05, on hv02. PASSED.** See
+*[G0 as executed](#g0-as-executed)* immediately below for what was actually
+measured and how it differs from — and improves on — the design below. The
+original formulation is kept unchanged, because the substitution is the
+interesting part.
+
+Extend the microbenchmark harness that already exists on
 the local `bench/tls-send-microbench` branch (the one that produced the
 allocation counter) with a third arm: a real kTLS socket, keys installed by
 hand, plaintext sent with `IORING_OP_SEND` **and no `MSG_WAITALL`** — kTLS
@@ -83,10 +111,60 @@ verbatim. On hv01, at 1 KiB / 16 KiB / 64 KiB / 256 KiB / 1 MiB, report:
 - **`/proc/net/tls_stat`** before and after, to prove the traffic went through
   `TlsTxSw` and not through some fallback. [P-8]
 
+#### G0 as executed
+
+What ran was **not** the allocation counter and cold-payload control specified
+above. It was better, and the swap is worth recording as method: instead of
+*inferring* from userspace whether a copy happened, the probe **attached ftrace
+kprobes to the kernel functions that decide it** —
+`sk_msg_zerocopy_from_iter` (the pinned-pages path), `sk_msg_memcopy_from_iter`
+(the copy path), `tls_sw_sendmsg`, `sock_sendmsg` and `io_send_zc` — and
+counted calls and return values directly.
+
+An allocation counter can only say "userspace allocated less". A kretprobe on
+`sk_msg_zerocopy_from_iter` says *which kernel branch executed*, which is the
+actual question. Where a cheaper direct observation of the mechanism exists,
+prefer it to a proxy — the previous effort's proxy was a timing table, and it
+took an allocation counter to overturn it.
+
+Results (experiment `01a07207-0da5-714b-fcce-7e5bb5898f50`, hv02, Linux
+6.12.74, 50 iterations per cell):
+
+| mode | 4 KiB | 16 KiB | 64 KiB | 256 KiB |
+|---|---:|---:|---:|---:|
+| `send(2)` | 50 | 50 | 200 | 800 |
+| io_uring `SEND`, raw fd | — | — | 200 | — |
+| io_uring `SEND`, **fixed fd** | 50 | 50 | 200 | 800 |
+| io_uring `SEND` + `IOSQE_ASYNC` | 50 | — | 200 | 800 |
+| idle control | 0 | | | |
+
+Those are `sk_msg_zerocopy_from_iter` call counts. Reading them:
+
+- **Every count is exactly `iters × ceil(size / 16 KiB)`** — one call per TLS
+  record, no more, no fewer, and summed `bytes` matches the payload exactly.
+- **`sk_msg_memcopy_from_iter` produced no `COUNT` row in any arm**: the copy
+  path was never entered.
+- **Every kretprobe returned 0** (`g0zcr ... bytes=0`, i.e. the summed return
+  value). A non-zero return is precisely what triggers
+  `goto fallback_to_reg_send` (`tls_sw.c:1109`). It never fired.
+- **The `IOSQE_ASYNC` arm is the one that matters most.** The doubt recorded in
+  the original `[U-1]` was that `iov_iter_get_pages2` needs the submitting
+  task's `mm`, and io-wq offload might run elsewhere. Forcing every send onto
+  io-wq gave *identical* counts. io-wq workers are threads of the submitting
+  process and share its `mm`; the doubt was unfounded, and is now closed by
+  measurement rather than by argument.
+- Accounting closes: `total_entries=8132 total_overrun=0`, so the trace buffer
+  lost nothing. `/proc/net/tls_stat` moved `TlsTxSw 0 → 15` with
+  `TlsTxDevice 0`, confirming the software path and not device offload.
+- Every arm reported `rx_bytes` equal to `sent` with `rx_corrupt_reads=0` —
+  so a plain `IORING_OP_SEND` on a kTLS **fixed** descriptor also round-trips
+  correctly [P-23].
+
 **GO** only if *all* of:
 
-1. **G1 — copies.** G0 shows the kTLS arm allocating ~0 in userspace **and**
-   the cold-payload control widening the gap. Both, not either.
+1. **G1 — copies.** ✅ **PASSED** (`01a07207-...`). Met by a stronger result
+   than the criterion asked for: not "allocated ~0", but *the copy branch was
+   never executed*, in every send mode including forced io-wq offload. [P-21]
 2. **G2 — throughput.** A two-machine TLS benchmark on the rig (never
    co-located — this project withdrew `BENCHMARKS.md` in #205 over exactly
    that) shows the kTLS server beating the rustls server by a margin larger
@@ -106,8 +184,10 @@ verbatim. On hv01, at 1 KiB / 16 KiB / 64 KiB / 256 KiB / 1 MiB, report:
 
 **NO-GO** if any of:
 
-- **N1** — G0's allocation counter shows no reduction, or the cold-payload
-  control does not widen the gap. *(Falsifies the whole premise, cheaply.)*
+- **N1** — ❌ **did not fire.** G0's replacement measurement (kernel kprobes on
+  the branch itself) showed the pinned-pages path taken 100% of the time and
+  the copy path never. *(This was the cheap early-falsification gate; the
+  premise survived it.)* [P-21]
 - **N2** — the rekey constraint [P-5] cannot be met on the target kernel and
   the fallback is "tear the connection down", **and** the deployment target is
   long-lived connections. At 2^24 records × 16 KiB = **256 GiB per direction**
@@ -121,9 +201,14 @@ verbatim. On hv01, at 1 KiB / 16 KiB / 64 KiB / 256 KiB / 1 MiB, report:
   answer within the per-connection send queue.
 - **N5** — reinstating a per-connection short-send resubmit loop for kTLS
   connections (forced by [P-19]: kTLS refuses `MSG_WAITALL`) costs more than
-  the copies kTLS removes. This is measurable in G2 and should be watched for
-  specifically, because it is a regression against a shipped, argued decision
-  ([`send-completion-design.md`](send-completion-design.md) §2).
+  the copies kTLS removes. This is a regression against a shipped, argued
+  decision ([`send-completion-design.md`](send-completion-design.md) §2), and
+  it is **now quantified** [P-24]: under a 64 KiB `SO_SNDBUF` with a slow
+  reader, **20 logical 256 KiB sends cost 74 SQEs — 54 of them short sends**,
+  with `tls_sw_sendmsg` entered 127 times. That is the cost G2 has to absorb,
+  and it lands on exactly the backpressured connections `MSG_WAITALL` was
+  introduced to help. **This is now the leading NO-GO candidate**, because it
+  is a measured cost on the same axis as the measured win.
 
 **Explicitly not a GO criterion:** `TLS_HW`. It is unreachable on every host we
 own [P-7] and cannot be a gate on work we could validate.
@@ -145,7 +230,7 @@ probe was run and its output is in the experiment log.
 | P-5 | Linux **6.12 cannot rekey** a kTLS socket; 6.14 can, TLS 1.3 only | **Verified in source and measured on hv01** | v6.12 `net/tls/tls_main.c:636-638` — `/* Currently we don't support set crypto info more than one time */ ... return -EBUSY;`. v6.14 `net/tls/tls_main.c:639-653` adds the TLS 1.3 update path (absent in v6.13; present in v6.14-rc1). Probe on hv01: `second TLS_TX setsockopt -> Device or resource busy (errno 16)` |
 | P-6 | `TLS_HW` (device offload) also copies plaintext into the kernel on the ordinary `sendmsg` path | **Verified** | `net/tls/tls_device.c:493-524` — `MSG_SPLICE_PAGES` branch does `iov_iter_extract_pages`; the `else if (copy)` branch does `tls_device_copy_data(...)`, which is `copy_from_iter` + `copy_from_iter_nocache` (`:393-416`) |
 | P-7 | **No host we own supports `TLS_HW`** | **Verified in source and measured on hv01** | Only four in-tree `tlsdev_ops` implementations in v6.12: mlx5 (`en_accel/ktls.c:89`, TX+RX), Chelsio ch_ktls (`chcr_ktls.c:2132`, TX), Netronome nfp (`crypto/tls.c:465`, TX+RX), Fungible funeth (`funeth_ktls.c:126`, TX). Sweeping **every** `.c`/`.h` file in `drivers/net/ethernet/amazon/ena` (14 files), `intel/i40e` (38) and `intel/ice` (121) for `NETIF_F_HW_TLS`/`tlsdev_ops`/`tls_dev_add` yields **zero** hits. hv01 probe: **every** interface reports `tls-hw-tx-offload: off [fixed]` |
-| P-8 | kTLS works end-to-end on hv01: ULP attach, key install, encrypt, decrypt | **Measured** | `experiments/ktls-premise-probe.toml`, experiment `01a07046-b5fa-7182-77b8-d0800cb0c828`: kernel `6.12.90+deb13.1-amd64`, `CONFIG_TLS=m`, `CONFIG_TLS_DEVICE=y`, `CONFIG_TLS_TOE` not set. 8/8 checks PASS |
+| P-8 | kTLS works end-to-end on hv01: ULP attach, key install, encrypt, decrypt | **Measured** | `experiments/ktls-premise-probe.toml`, hv01: kernel `6.12.90+deb13.1-amd64`, `CONFIG_TLS=m`, `CONFIG_TLS_DEVICE=y`, `CONFIG_TLS_TOE` not set. The C probe reported **8/8 PASS**. ⚠️ **The enclosing experiment `01a07046-b5fa-7182-77b8-d0800cb0c828` is recorded as `failure`**, because a *later, unrelated* step in the same job — the Rust io_uring probe — failed to compile (`E0499`, two `ring.completion()` borrows). Do not read the experiment's status as the probe's result; read the step's log. P-8 stands, this citation needed the correction |
 | P-9 | AES-GCM's confidentiality limit is 2^24 records under rustls; ChaCha20-Poly1305 has none | **Verified** | `rustls-0.23.41/src/crypto/ring/tls13.rs:28` (`u64::MAX` for ChaCha20), `:48` / `:70` (`1 << 24` for AES-256-GCM / AES-128-GCM). rustls' `KernelConnection` explicitly does **not** track this: `src/conn/kernel.rs:37-52` |
 | P-10 | A control record read with plain `recv()` fails with **EIO** | **Verified in source and measured** | `net/tls/tls_sw.c:1752-1772` — `tls_record_content_type` returns `-EIO` when the record is not `TLS_RECORD_TYPE_DATA` and `put_cmsg` failed or `MSG_CTRUNC` is set. hv01 probe: `PASS plain recv() of a control record fails with EIO` |
 | P-11 | `IORING_OP_URING_CMD` / `SOCKET_URING_OP_SETSOCKOPT` accepts **any** level, so kTLS keys can be installed on a **fixed** descriptor | **Verified in source** | `io_uring/uring_cmd.c:313-329` (`io_uring_cmd_setsockopt`) has **no** level check, unlike `io_uring_cmd_getsockopt` at `:287-297` which is `SOL_SOCKET`-only. Exposed by the pinned `io-uring` 0.7.12 crate as `opcode::SetSockOpt`, whose `fd` is `impl sealed::UseFixed` (`opcode.rs:645-673`). `io_uring_cmd_sock` also requires `prot->ioctl` to be non-NULL (`uring_cmd.c:337-341`); the TLS ULP copies the base `tcp_prot` wholesale (`net/tls/tls_main.c:904`, `prot[TLS_BASE][TLS_BASE] = *base;`) and never overrides `.ioctl`, so it survives the ULP swap |
@@ -158,10 +243,19 @@ probe was run and its output is in the experiment log.
 | P-18 | The unbuffered engine's rustls connection is in a **consumable owned position** | **Verified** | `TlsTable.conns: Vec<Option<TlsConn>>` (`tls/mod.rs:244`) → `TlsConn.conn: TlsConnKind` (`:224`) → `TlsConnKind::Unbuffered(UnbufferedConn)` (`:123`) → `UnbufferedConn.kind: UnbufferedKind` (`unbuffered/mod.rs:129`) → the rustls type. No `Rc`/`Arc`/pin/slab indirection. Only the *accessors* are `&mut`-only |
 | P-19 | **kTLS rejects `MSG_WAITALL` outright.** `tls_sw_sendmsg` and `tls_device_sendmsg` fail any flag outside a small allow-list with `-EOPNOTSUPP`, and ringline sets `MSG_WAITALL` on every stream send | **Verified in source and measured on hv01** | v6.12 `net/tls/tls_sw.c:1231-1234` — allow-list is `{MSG_MORE, MSG_DONTWAIT, MSG_NOSIGNAL, MSG_CMSG_COMPAT, MSG_SPLICE_PAGES, MSG_EOR, MSG_SENDPAGE_NOPOLICY}`; unchanged in v6.17 (`:1255-1258`). `tls_device.c:436-439` is narrower still. ringline: `STREAM_SEND_FLAGS = libc::MSG_WAITALL` (`ringline/src/completion.rs:1-10`), used by every stream send builder. Probe on hv01: `IORING_OP_SEND` with `MSG_WAITALL` on a kTLS fixed descriptor returned **-95 (`EOPNOTSUPP`)** |
 | P-20 | kTLS keys can be installed on an io_uring **fixed** descriptor | **Measured on hv01** | Probe: `IORING_OP_URING_CMD/SOCKET_URING_OP_SETSOCKOPT set SOL_TCP/TCP_ULP="tls" on a FIXED descriptor (res=0)` and `SetSockOpt(SOL_TLS, TLS_TX, aes-128-gcm) accepted on a FIXED descriptor (res=0)`. Confirms P-11 end to end. Experiment `01a07047-d6c4-719f-645b-f9e926bcc2b0` |
-| U-1 | Whether io_uring's `IORING_OP_SEND` actually reaches `sk_msg_zerocopy_from_iter` in practice | **UNVERIFIED** | Source says it should — io_uring builds `ITER_UBUF`, so `is_kvec` is false, and `eor` is true without `MSG_MORE`. But `iov_iter_get_pages2` needs the issuing context's `mm`, and io-wq offload is a different context. Not instrumented. **This is the single premise G0 exists to settle.** |
-| U-2 | Whether `IORING_OP_SEND_ZC` on a kTLS socket avoids the pool-slot copy | **UNVERIFIED, and suspected no** | `net/tls` contains no `MSG_ZEROCOPY`/`msg_ubuf` handling. The probe only records whether the CQEs are well-formed, which is not the same question |
+| P-21 | **io_uring `SEND` on a kTLS socket takes the pinned-pages path, always — including on a fixed descriptor and under forced io-wq offload.** *(Was `[U-1]`, the document's largest unverified premise.)* | **MEASURED** | ftrace kprobes, experiment `01a07207-0da5-714b-fcce-7e5bb5898f50`, hv02, Linux 6.12.74. `sk_msg_zerocopy_from_iter` counts of exactly `iters × ceil(size / 16 KiB)` in every mode (`send(2)`, io_uring raw fd, io_uring **fixed** fd, io_uring + `IOSQE_ASYNC`); `sk_msg_memcopy_from_iter` **never called**; every kretprobe returned 0, so `goto fallback_to_reg_send` (`tls_sw.c:1109`) never fired; `total_overrun=0`; `/proc/net/tls_stat` `TlsTxSw 0→15`, `TlsTxDevice 0`. The `IOSQE_ASYNC` arm specifically retires the `mm`-context doubt |
+| P-22 | **`SEND_ZC` / `SENDMSG_ZC` on a kTLS socket is structurally impossible, not merely unsupported.** *(Was `[U-2]`.)* | **Verified in source and measured** | `__tcp_set_ulp` clears the bit for *any* ULP: `net/ipv4/tcp_ulp.c:139-140`, `if (sk->sk_socket) clear_bit(SOCK_SUPPORT_ZC, &sk->sk_socket->flags);`. `io_send_zc` rejects on it at `io_uring/net.c:1377-1378`, **and so does `io_sendmsg_zc` at `:1445-1446`** — which is the one ringline actually uses for guards. Measured (`01a0720b-...`): kTLS `SEND_ZC` → `-95` with `io_send_zc` entered and `sock_sendmsg` never reached; a **plain-TCP control arm, same binary, same opcode, succeeded 3/3** with notification CQEs. Attributable, not inferred |
+| P-23 | A plain `IORING_OP_SEND` (no flags) on a kTLS **fixed** descriptor round-trips correctly | **Measured** | `01a07207-...` and `01a0720b-...`: every arm reports `rx_bytes == sent` with `rx_corrupt_reads=0` (e.g. `uring-fixed size=65536 iters=20 sqes=20 sent=1310720 rx_bytes=1310720 short_sends=0`) |
+| P-24 | The `MSG_WAITALL` loss [P-19] has a measured cost under backpressure | **Measured** | `01a0720b-...`, `mode=backpressure`: 64 KiB `SO_SNDBUF`, slow reader, 20 logical 256 KiB sends → `sqes=74 short_sends=54`, `tls_sw_sendmsg` entered 127 times, first CQEs `[131072, 16384, 98304, 16384]`. The pinned-pages path held throughout (320 calls, all returns 0), so this is purely resubmit overhead, not a copy regression |
 | U-3 | The cost of a copy at 400/800 GbE | **UNVERIFIED, and out of reach** | Inherited verbatim from `tls-unbuffered-design.md:122-133`. The one number this project has is ~3.2 GiB/s/core on 200 GbE Graviton4. Do not extrapolate it into a core count |
 | U-4 | Whether kTLS helps or hurts at ringline's *actual* payload sizes | **UNVERIFIED** | Every effect described here scales with payload. ringline's shipped benchmarks are dominated by 64 B–1 KiB ops, where per-syscall and per-record overhead dominate copies. G2 exists because of this |
+| U-5 | Whether G0's result reproduces on the **6.12.90** target kernel | **UNVERIFIED — different host, different point release** | G0 ran on **hv02**, Linux **6.12.74**, because hv01 has been stuck `busy` with no scheduled job for ~8 h. hv01 is 6.12.90. Same series and the v6.12 source read throughout this document is identical for every function cited, so the result is expected to hold — but the exact-host cross-check has not been done, and "expected to hold" is this register's phrase for unverified. Rerun `experiments/` G0 on `z2.baremetal` when hv01 frees |
+| U-6 | Toolchain floor for anything built through these jobs | **Noted, not a risk** | hv01 carries a pre-existing rustup at **1.85.0**; hv02 had none and rustup installed **1.97.1**. It is *not* the uniform 1.97.1 assumed earlier, so probe and harness code must compile on **1.85** to run on both hosts |
+
+**`U-1` and `U-2` are absent from this table deliberately** — they were the
+original unverified rows for the pinned-pages path and for `SEND_ZC`, and G0
+resolved both. They are now **P-21** and **P-22**. References to `[U-1]`/`[U-2]`
+elsewhere in this document are historical, and say so where they appear.
 
 ---
 
@@ -191,7 +285,7 @@ be quoted out of context.
 |---|---|---|---|---|
 | **ringline today** (buffered *or* unbuffered engine) | 2 | 1 | **3** | 2 |
 | **kTLS_SW, ordinary path** [P-2] | 1 (pool slot) | 1 | **2** | 1 |
-| **kTLS_SW, pinned-pages path** [P-3] | 1 (pool slot) | 0 | **1** | 1 |
+| **kTLS_SW, pinned-pages path** [P-3], **measured** [P-21] | 1 (pool slot) | 0 | **1** | 1 |
 | **kTLS_HW** [P-6] | 1 (pool slot) | 1 | **2**, and no CPU crypto at all | 1 |
 | kTLS + `MSG_SPLICE_PAGES` | 0 | 0 | **0** — but unreachable, see [Question 4](#4-what-breaks) | 0 |
 
@@ -271,12 +365,26 @@ gracefully to the 2-pass path: exceeding `MAX_MSG_FRAGS` scatter entries
 (`= MAX_SKB_FRAGS`, `include/linux/skmsg.h:16`), and any `-EFAULT` from the
 page pin (`goto fallback_to_reg_send` at `:1109`, label at `:1134`).
 
-**This is the load-bearing unverified step.** [U-1] The source says it should
-happen; nothing has confirmed io_uring actually lands there rather than in the
-copy path, and io-wq offload runs in a different context than the submitting
-task. **G0 exists precisely to test this, and N1 kills the effort if it fails.**
-Do not build on it before then. That is the whole lesson of the previous
-effort.
+**This was the load-bearing unverified step, and it is now measured.** [P-21]
+When this section was first written the source said the pinned-pages branch
+*should* be taken, but nothing had confirmed io_uring actually lands there
+rather than in the copy path — and io-wq offload plausibly runs in a different
+`mm` context than the submitting task.
+
+G0 settled it by attaching kprobes to the branch itself rather than inferring
+from userspace. In every mode — `send(2)`, io_uring `SEND` on a raw fd, on a
+**fixed** fd, and with `IOSQE_ASYNC` forcing io-wq —
+`sk_msg_zerocopy_from_iter` was called exactly `iters × ceil(size / 16 KiB)`
+times, `sk_msg_memcopy_from_iter` was **never called**, and every return was 0
+so `goto fallback_to_reg_send` never fired. The `IOSQE_ASYNC` arm retires the
+`mm` doubt directly: io-wq workers are threads of the submitting process and
+share its address space, and forcing offload changed nothing.
+
+**So the send-path count above is a measurement, not a prediction.** The
+discipline that produced it is worth keeping: where a direct observation of the
+mechanism is available and cheap, prefer it to a proxy. The previous effort's
+proxy was a timing table, and it took an allocation counter to overturn it;
+here a kretprobe answered the question outright.
 
 ### Receive path
 
@@ -318,11 +426,27 @@ trade-off, not a free knob.
 
 ### The honest caveat
 
-**Every number above is structural, from source, and unmeasured.** The last
-effort's failure was accepting exactly this kind of reasoning as settled. The
-difference here is that the numbers are being stated as *predictions with a
-named discriminator* (G0's allocation counter and cold-payload control) rather
-than as results — and the criterion N1 says what happens if they are wrong.
+**The send-path count is measured [P-21]. The recv-path count is not.**
+
+Send: G0 observed the kernel branch directly, in four send modes, with the
+copy path never entered. That is as settled as this document can make it short
+of running ringline itself.
+
+Recv: everything in the previous subsection is still *structural, from source,
+and unmeasured*. `darg.zc` was never traced; `TLS_RX_EXPECT_NO_PAD` was only
+shown to be **accepted** [P-16], not shown to change the copy count. A recv-side
+G0 — the same kprobe technique pointed at `tls_decrypt_sg` and the `darg.zc`
+decision at `tls_sw.c:2031-2033` — is the obvious next cheap measurement, and
+it has not been done. Do not quote the RX 2 → 1 improvement as a result.
+
+And two things remain unmeasured on **both** paths, either of which can make
+the whole win irrelevant:
+
+- **[U-4] whether any of it matters at ringline's payload sizes.** Every effect
+  here scales with payload; ringline's benchmarks are 64 B–1 KiB dominated.
+  G2 exists for this.
+- **[P-24] the measured `MSG_WAITALL` cost**, which pushes the *other* way and
+  lands on exactly the backpressured connections that care most.
 
 Also unmeasured, and possibly decisive [U-4]: **whether any of this matters at
 ringline's payload sizes.** At 64 B–1 KiB, copies are not the cost; syscalls,
@@ -397,7 +521,7 @@ reference point.
 | 1 | `enable_secret_extraction` on the rustls config | **Small, but a public-API decision** | It gates everything [P-15], defaults false, and ringline never builds a rustls config — it wraps a caller-supplied `Arc<ServerConfig>` (`config.rs:14`). So either the caller must set it (documented requirement, silently breaks kTLS if forgotten) or ringline must own config construction (a real public-surface change, against the project's "wrap, don't build" stance). **Decide this before anything else** |
 | 2 | By-value access to the rustls connection | **Small** | Two accessors: `TlsTable::take(conn_index) -> Option<TlsConn>` and `UnbufferedConn::into_kind(self)`. The ownership chain is already consumable [P-18] |
 | 3 | TCP `RecvMsgMulti` on **both** backends | **Large** | See 3.3 |
-| 4 | `setsockopt` on a fixed descriptor | **Small** | `opcode::SetSockOpt` exists in the pinned `io-uring` 0.7.12 and takes `impl UseFixed` [P-11]; the kernel imposes no level restriction on the setsockopt direction. Note the `optval` (which holds **key material**) must satisfy Domain Invariant 1 — live until the CQE — and be zeroized after |
+| 4 | `setsockopt` on a fixed descriptor | **Small** | `opcode::SetSockOpt` exists in the pinned `io-uring` 0.7.12 and takes `impl UseFixed` [P-11]; the kernel imposes no level restriction on the setsockopt direction, and both `TCP_ULP` and `TLS_TX` were **measured** installing successfully on a fixed descriptor [P-20]. Note the `optval` (which holds **key material**) must satisfy Domain Invariant 1 — live until the CQE — and be zeroized after |
 | 5 | A second short-send strategy | **Medium, and unbudgeted anywhere** | kTLS refuses `MSG_WAITALL` [P-19], so kTLS connections need the userspace partial-resubmit loop that `MSG_WAITALL` was landed to remove. Two strategies coexisting in `submit_next_queued`/`handle_send`, keyed on connection type |
 | 6 | A cmsg helper | **Small** | Two hardcoded single-option parsers duplicate the same walk today (`backend/uring/event_loop.rs:1589-1631`, `backend/udp_gro.rs:21-52`). Extract one iterator |
 
@@ -544,8 +668,22 @@ Under kTLS:
 - `send_parts().guard()`: today it is **not refused** under TLS — it silently
   copies the guard's bytes and drops the guard (`handler.rs:2893-2924`,
   contradicting `CLAUDE.md:243`). Under kTLS a guard could genuinely stay
-  zero-copy, since the kernel takes plaintext. That is the most attractive
-  downstream item here — and it depends on [U-1] and [U-2].
+  zero-copy, since the kernel takes plaintext.
+
+  **The route is now known, and it is not the obvious one.** `SendMsgZc` — what
+  ringline uses for guards today — is *structurally unavailable* on a kTLS
+  socket: attaching any ULP clears `SOCK_SUPPORT_ZC`, and `io_sendmsg_zc`
+  refuses on that bit [P-22]. But it is also unnecessary, because ordinary
+  `IORING_OP_SEND` already pins the caller's pages [P-21]. So a guarded send
+  under kTLS is a **plain `Send` from the guard's memory, with the guard held
+  until the CQE** — the same lifetime rule Domain Invariant 1 already states,
+  minus the ZC notification CQE.
+
+  That makes it the most attractive downstream item here, and it is the one
+  place kTLS reaches **zero** userspace passes: no `SendCopyPool` slot, no
+  kernel copy. Note it also means the send path would carry *three* shapes
+  (pool-slot copy, guard-with-notification for plaintext, guard-without for
+  kTLS), which is scope, not a freebie.
 - **`send_chain` has no TLS check at all** (`handler.rs`, last `tls` reference
   at `:2917`). `ConnCtx::send_chain` builds `Send`/`SendMsgZc` SQEs straight
   from user memory with no encryption. On a TLS connection today that is a
@@ -571,11 +709,20 @@ engine's precedent: a default-off cargo feature, decided later.
 compile nor lint the code**, and where the only available rig **cannot exercise
 the key-update half of the correctness envelope**.
 
-**The single biggest risk is not any of the above.** It is that the whole thing
-is built on [U-1] — an unmeasured claim about what the kernel does with an
-io_uring send — and that ringline has just spent four PRs learning what happens
-when a performance premise about a dependency is not checked against that
-dependency before the design is written.
+**The single biggest risk has changed since first draft, and it is worth
+recording why.** It was `[U-1]` — that the whole effort rested on an unmeasured
+claim about what the kernel does with an io_uring send, the same shape of
+mistake that had just cost four PRs. G0 retired that for the price of one
+probe [P-21].
+
+**What replaced it is N5 [P-24].** kTLS refuses `MSG_WAITALL`, and under
+backpressure that measured at 74 SQEs and 54 short sends for 20 logical
+256 KiB sends. So the effort now has a **measured win on data movement and a
+measured loss on syscall count, on the same connections**, and no measurement
+of which dominates at the payload sizes ringline actually serves [U-4]. That is
+a genuinely undecided cost/benefit question rather than an unexamined premise —
+a better place to be, but not a resolved one, and it is exactly what G2 exists
+to settle.
 
 ---
 
@@ -636,10 +783,24 @@ consecutive pool-backed sends into one `SendMsgCoalesced` without inspecting
 `OpTag`, and under kTLS a coalesced send is *one TLS record*, which changes
 what a "logical send" means on the wire.
 
-**This should be near the top of any implementation estimate.** It is what N5
-measures, it was not anticipated by any prior document, and it was found by
-running a probe rather than by reading — which is the argument for running G0
-before designing anything.
+**The cost is now measured, and it is not small** [P-24]. Under a 64 KiB
+`SO_SNDBUF` with a deliberately slow reader (experiment
+`01a0720b-b6ad-7169-1266-9ffa39288117`, `mode=backpressure`), **20 logical
+256 KiB sends cost 74 SQEs, 54 of them short sends**, with `tls_sw_sendmsg`
+entered 127 times and first CQEs of `[131072, 16384, 98304, 16384]`. The
+pinned-pages path held throughout (320 calls, all returns 0), so this is pure
+resubmit overhead — not a copy regression, and not something the copy win
+offsets automatically.
+
+Read the two measured results together: **G0 measured a win on data movement,
+and this measured a loss on syscall count, on the same connections.** They are
+not on the same axis and cannot be netted by argument. G2 is where they meet,
+and N5 is the criterion that decides it.
+
+**This should be near the top of any implementation estimate.** It was not
+anticipated by any prior document, and it was found by running a probe rather
+than by reading — which is the argument for running G0 before designing
+anything, and which is also how the win was found.
 
 ### The switch is the sharp edge
 
@@ -699,74 +860,97 @@ building that is a separate project with its own justification.
 
 ## Unverified, listed explicitly
 
-Repeating the register's `U-` rows here so they are not lost in a table:
+**Resolved since first draft** — kept here so the record shows what changed and
+why, not silently deleted:
 
-1. **[U-1] Whether io_uring's `IORING_OP_SEND` actually reaches
-   `sk_msg_zerocopy_from_iter`.** Source says the conditions hold; the issuing
-   context's `mm` under io-wq offload is the doubt. **This is the load-bearing
-   premise of the entire effort.** G0/N1.
-2. **[U-2] Whether `IORING_OP_SEND_ZC` avoids the pool-slot copy on a kTLS
-   socket.** `net/tls` has no `MSG_ZEROCOPY`/`msg_ubuf` handling of its own;
-   suspected no. This matters for the `send_parts().guard()` payoff.
+- **`[U-1]` → [P-21], MEASURED.** Whether io_uring's `IORING_OP_SEND` reaches
+  `sk_msg_zerocopy_from_iter`. Yes, in every mode, including on a fixed
+  descriptor and with `IOSQE_ASYNC` forcing io-wq — which is what retired the
+  `mm`-context doubt. `sk_msg_memcopy_from_iter` was never called.
+- **`[U-2]` → [P-22], resolved as a hard NO.** `SEND_ZC`/`SENDMSG_ZC` on a
+  kTLS socket is structurally impossible: any ULP clears `SOCK_SUPPORT_ZC`
+  (`net/ipv4/tcp_ulp.c:139-140`) and both `io_send_zc` (`io_uring/net.c:1377`)
+  and `io_sendmsg_zc` (`:1445`) refuse on that bit. Moot for the design,
+  because ordinary `Send` already pins the pages — see 3.6.
+- **Question (a) → [P-23].** A plain `IORING_OP_SEND` on a kTLS fixed
+  descriptor round-trips correctly: `rx_bytes == sent`, `rx_corrupt_reads=0`,
+  every arm.
 
-   **Status: not answered, and the follow-up run did not happen.** The io_uring
-   probe's first attempt (experiment `01a07047-d6c4-719f-645b-f9e926bcc2b0`)
-   could not reach the question at all, because `MSG_WAITALL` failed first
-   [P-19] and the program stopped there. A second run with the flag removed
-   (`01a07052-6370-711d-3c67-2760b2f4b96a`) sat **unscheduled** behind hv01's
-   queue for eight hours and was **cancelled without executing**.
-   `experiments/ktls-uring-probe.toml` in this tree is that spec, ready to
-   resubmit when hv01 is free.
+**Still unverified. Nothing below has been measured, and none of it should be
+quoted as a result:**
 
-   So two things remain genuinely open on the send side, and neither should be
-   assumed: **(a)** that a plain `IORING_OP_SEND` with *no* flags round-trips
-   correctly on a kTLS fixed descriptor, and **(b)** what `IORING_OP_SEND_ZC`
-   does there. (a) is very likely fine — the C probe's ordinary `send(2)`
-   round-tripped [P-8] — but "very likely" is the register's word for
-   unverified, and the `MSG_WAITALL` result is a standing reminder that flag
-   handling on this path does not behave the way the rest of ringline's send
-   path does.
-3. **[U-3] The cost of a copy at 400/800 GbE.** Inherited unverified from the
+1. **[U-3] The cost of a copy at 400/800 GbE.** Inherited unverified from the
    previous design doc and still unverified. One measured number exists
    (~3.2 GiB/s/core at 200 GbE); do not extrapolate a core count from it.
-4. **[U-4] Whether kTLS helps at ringline's actual payload sizes.** Everything
+2. **[U-4] Whether kTLS helps at ringline's actual payload sizes.** Everything
    here scales with payload; ringline's benchmarks are small-op dominated.
-5. **Not verified: whether any *other* in-tree driver implements TLS offload
-   under a filename my search missed.** The four in the table were confirmed by
-   reading their `tlsdev_ops` assignments; the file-name sweep that found them
-   ran against a GitHub tree listing that reported `truncated: true`. The
-   negative results for i40e/ice/ena are solid (their sources were fetched and
-   grepped directly, plus the hv01 `ethtool` measurement); the *completeness*
-   of the positive list is high-confidence, not certain.
-6. **Not verified: kTLS behaviour under io_uring multishot `recvmsg`
-   specifically.** The probe used blocking `recvmsg`. Multishot re-arm across
-   an `EIO`, and `MSG_CTRUNC` sizing with a shared per-worker msghdr, are
-   untested. Given that `MSG_WAITALL` turned out to be refused on the *send*
-   side [P-19], assume nothing about flag acceptance on the recv side either —
-   probe it before designing around it.
-7. **Not verified: whether hv02 or the AWS rigs have `CONFIG_TLS` at all.**
-   Only hv01 was probed. hv02 is the same Debian 13 family, so it is likely,
-   but "likely" is what this document exists to avoid.
+   **G0 measured the mechanism, not the benefit** — it counted kernel branches
+   at 4 KiB–256 KiB, which says nothing about whether removing those passes is
+   visible at 64 B. This is now the largest open question on the win side.
+3. **The entire receive-path analysis.** `darg.zc` was never traced;
+   `TLS_RX_EXPECT_NO_PAD` was shown only to be *accepted* [P-16], not to change
+   the copy count. The same kprobe technique pointed at `tls_decrypt_sg` and
+   the `darg.zc` decision (`tls_sw.c:2031-2033`) would settle it as cheaply as
+   G0 settled the send side. It has not been done.
+4. **[U-5] Whether G0 reproduces on the 6.12.90 target.** G0 ran on **hv02**,
+   Linux **6.12.74** — not hv01's 6.12.90 — because hv01 has been stuck `busy`
+   with no scheduled job for ~8 h. Same series, and the v6.12 source cited
+   throughout this document is identical for every function traced, so the
+   result is expected to hold. "Expected to hold" is this document's phrase for
+   unverified. Rerun on `z2.baremetal` when hv01 frees.
+5. **Whether any *other* in-tree driver implements TLS offload under a filename
+   the search missed.** The four in the table were confirmed by reading their
+   `tlsdev_ops` assignments; the filename sweep that found them ran against a
+   GitHub tree listing reporting `truncated: true`. The negative results for
+   i40e/ice/ena are solid (whole directories fetched and grepped, plus the hv01
+   `ethtool` measurement); the *completeness* of the positive list is
+   high-confidence, not certain.
+6. **kTLS behaviour under io_uring multishot `recvmsg` specifically.** The
+   probes used blocking `recvmsg`. Multishot re-arm across an `EIO`, and
+   `MSG_CTRUNC` sizing with a shared per-worker msghdr, are untested. Given
+   that `MSG_WAITALL` turned out to be refused on the send side [P-19], assume
+   nothing about flag acceptance on the recv side — probe it before designing
+   around it.
+7. **Whether the AWS rigs have `CONFIG_TLS` at all.** hv01 and hv02 both do
+   (hv02 ran G0). The AWS hosts were never probed; `TLS_HW` is absent there
+   regardless [P-7], but software kTLS availability is unchecked.
+8. **[U-6] Toolchain floor.** hv01 carries a pre-existing rustup at **1.85.0**;
+   hv02 had none and rustup installed **1.97.1**. Not the uniform 1.97.1
+   assumed earlier — anything built through these jobs must compile on **1.85**
+   to run on both hosts. Not a risk, but a constraint that has already bitten
+   once (the `E0499` that failed `01a07047`'s second step).
 
 ---
 
 ## Recommendation
 
-**Do not start kTLS. Run G0 first, as a standalone measurement, and let the
-number decide.**
+**Do not start kTLS. G0 has run and passed; the decision now turns on G2,
+carrying the measured N5 cost — and on N2, N3 and N4, none of which G0
+touched.**
+
+The shape of the recommendation is unchanged by G0, and that is the point: G0
+was the cheapest way to *falsify* the effort early, not to justify it. It did
+not fire, so the question moves on rather than closing.
 
 The case for kTLS is stronger than the previous design doc believed on one
 axis and weaker on the other, and the two do not cancel:
 
-- **Stronger:** software kTLS plausibly removes 2 of 3 send-path passes and 1
-  of 2 recv-path passes — not the "no change" the prior doc asserted. If [U-1]
-  holds, the AEAD reads ringline's pool slot directly and the plaintext never
-  enters the kernel. That is a real, structural, previously-unclaimed win.
-- **Weaker:** the endpoint the effort was aimed at is gone. `TLS_HW` is not
+- **Stronger, and now measured.** Software kTLS removes 2 of 3 send-path
+  passes: `IORING_OP_SEND` on a kTLS socket takes the pinned-pages path
+  100% of the time — on a fixed descriptor, and under forced io-wq offload —
+  and the copy path is never entered [P-21]. The AEAD reads ringline's pool
+  slot directly and the plaintext never enters the kernel. That is a real,
+  structural, previously-unclaimed win, and it is no longer a prediction.
+  Better still, since ordinary `Send` pins the pages, a `SendGuard` under kTLS
+  needs no `SendZc` at all [P-22] — guarded sends could reach **zero**
+  userspace passes (3.6).
+- **Weaker.** The endpoint the effort was aimed at is gone. `TLS_HW` is not
   zero-copy [P-6] and is unreachable on every machine we own [P-7]. The
   `sendfile` benefit does not compose with ringline's architecture [P-13].
-  What is left is a software win of unmeasured size at payload sizes we do not
-  benchmark [U-4].
+  What is left is a software win whose *benefit* — as opposed to its
+  mechanism — is still unmeasured, at payload sizes we do not benchmark [U-4].
+  **G0 counted kernel branches at 4 KiB–256 KiB. It did not show that anyone
+  goes faster.**
 
 And the cost is high and front-loaded: **kTLS refuses `MSG_WAITALL`** [P-19],
 so Domain Invariant 5's mechanism does not survive and the userspace
@@ -787,20 +971,28 @@ putting a kTLS socket on a rig.
 
 So the sequencing is:
 
-1. **Run G0.** It needs no new ringline code — the harness exists on the local
-   `bench/tls-send-microbench` branch, and it needs one extra arm plus the
-   `setsockopt` calls the probe already demonstrates. Report the allocation
-   counter and the cold-payload control. Cost: hours, not weeks.
-2. **If N1 fires, stop, and record the negative result** the way the unbuffered
-   effort's was recorded. That is a good outcome: it costs a day and closes the
-   question.
-3. **If G1 passes**, the *next* question is not "build it" but **"is the win
-   present at 1 KiB?"** [U-4]. If it is only visible at 256 KiB, kTLS is a
-   feature for a workload ringline does not currently have, and it should wait
-   for one.
+1. ~~**Run G0.**~~ ✅ **Done.** Passed, by direct kernel tracing rather than the
+   allocation-counter proxy originally specified. N1 did not fire. [P-21]
+2. **Next, and still cheap: two more measurements, not any code.**
+   - **A recv-side G0.** The same kprobe technique pointed at `tls_decrypt_sg`
+     and the `darg.zc` decision (`tls_sw.c:2031-2033`). The RX 2 → 1 claim is
+     currently source-only and should not be carried further unmeasured.
+   - **Rerun G0 on hv01** (6.12.90) when it frees, to close [U-5].
+3. **Then the question that actually decides it: "is the win present at
+   1 KiB?"** [U-4]. G0 measured the mechanism, not the benefit. If the win is
+   only visible at 256 KiB, kTLS is a feature for a workload ringline does not
+   currently have, and it should wait for one. This is a G2-shaped, two-machine
+   measurement, and it must carry the **measured** N5 cost [P-24] — 54 short
+   sends per 20 logical sends under backpressure — on the same connections.
 4. **Only then** scope the implementation — and get a 6.14+ kernel onto a rig
    first, because without rekey the correctness envelope cannot be tested at
-   all.
+   all [P-5].
+
+**The honest summary of where this stands:** the thing that was most likely to
+be false turned out to be true, and it was established for the price of one
+probe. What is left is not a premise question any more — it is a cost/benefit
+question (G2 against N5) and three scope questions (N2, N3, N4), and those are
+answered by building or by measuring end to end, not by reading more source.
 
 Two things worth doing **regardless** of the kTLS decision, both cheap:
 
