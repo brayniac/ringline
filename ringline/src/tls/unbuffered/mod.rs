@@ -1,8 +1,21 @@
 //! Unbuffered TLS record layer, built on rustls' `UnbufferedConnectionCommon`.
 //!
-//! Encrypts directly from caller memory into a send-pool slot via
-//! `WriteTraffic::encrypt`, removing the copy into rustls' internal plaintext
-//! buffer that the buffered engine pays.
+//! Encrypts via `WriteTraffic::encrypt` rather than
+//! `writer()`/`write_tls()`. **This engine does not reduce the send-side copy
+//! count.** It was built believing it removed a copy into rustls'
+//! `sendable_plaintext`; measurement and rustls 0.23.41's source say
+//! otherwise, on two counts: `CommonState::send_plain` buffers into
+//! `sendable_plaintext` only while `!may_send_application_data` (i.e. before
+//! the handshake completes), and `CommonState::write_fragments` seals each
+//! record into a freshly allocated `PrefixedPayload` before copying it into
+//! the destination. Application data costs 2 copies on either engine. See
+//! `docs/tls-unbuffered-design.md`'s top correction block and
+//! `docs/journal/2026-09-unbuffered-tls.md` ("Plan 4 — measurement").
+//!
+//! What the engine is still for: it is the prerequisite for kTLS
+//! (`dangerous_extract_secrets` is implemented on
+//! `UnbufferedConnectionCommon`). It also measures ~4-8% faster on the recv
+//! path, which is not a copy-count effect and is not yet explained.
 //!
 //! Selected per connection by the `tls-unbuffered` feature in
 //! `TlsTable::create`, and driven end-to-end on both backends through their
@@ -600,10 +613,15 @@ const MIN_ENCRYPT_DST: usize = 64;
 /// Encrypt as much of `plaintext` as fits in `dst`, in one or more TLS
 /// records. Returns `(plaintext_consumed, ciphertext_written)`.
 ///
-/// This is the copy the unbuffered engine exists to remove: the plaintext is
-/// read straight out of caller memory, and the ciphertext is written straight
-/// into the caller's destination, with no trip through rustls'
-/// `sendable_plaintext`.
+/// This was believed to remove a copy relative to the buffered engine. **It
+/// does not.** rustls 0.23.41's `write_fragments` seals every fragment into a
+/// freshly allocated `PrefixedPayload` and then `copy_from_slice`s the record
+/// into `dst`, so this path is plaintext -> per-record buffer -> `dst`, the
+/// same two passes the buffered engine pays. The `sendable_plaintext` copy it
+/// was meant to skip does not happen on an established connection either:
+/// `CommonState::send_plain` buffers there only while
+/// `!may_send_application_data`. See `docs/tls-unbuffered-design.md`'s top
+/// correction block.
 ///
 /// `encrypt` is all-or-nothing on its output: too small a buffer writes
 /// nothing and reports `required_size` for the payload it was handed. The

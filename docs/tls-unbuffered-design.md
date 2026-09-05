@@ -1,14 +1,99 @@
 # Unbuffered TLS send path — design
 
 **Status:** Implemented behind the default-off `tls-unbuffered` feature (PRs
-#338, #341, #345, and this engine). Interop testing and the chunk-size rig
-sweep remain. The `> **Correction**` blocks below record where building it
-falsified the design; read those before extending it.
+#338, #341, #345, #350). **This design's central premise is falsified — read
+the correction immediately below before anything else.** The `> **Correction**`
+blocks further down record where *building* it falsified the design; this one
+records where *measuring* it did.
 **Date:** 2026-09-03 (corrections 2026-09-04)
 **Related:** [`docs/syscalls-and-copies.md`](syscalls-and-copies.md), [`docs/send-completion-design.md`](send-completion-design.md), `ringline/src/tls/`
 **Follow-on:** kTLS (kernel TLS offload) — see *Why this is the stepping stone to kTLS*
 
+> **Correction (2026-09-04, post-merge): the premise of this design is false.**
+>
+> **This design's goal — "remove one of the two copies TLS pays on every send"
+> — cannot be met by switching to rustls' unbuffered API, and the shipped
+> feature does not meet it.** Application-data sends cost 2 copies on both
+> engines. Everything below that reasons from a 2 → 1 copy reduction is wrong,
+> including *Goal*, the copy table in *Design target*, *Motivation*, the
+> copy-count line in *Testing*, and the framing in *Why this is the stepping
+> stone to kTLS*. The rest of the document — `CiphertextBuf`, the state
+> mapping, the invariants, the earlier correction blocks — still holds.
+>
+> The original text is kept deliberately. Its value now is partly as a record
+> of how a plausible premise reached a merged feature without being checked
+> against the library it was a claim about.
+>
+> **1 — rustls source (definitive; version 0.23.41, the one in `Cargo.lock`).**
+> "Copy 1" below is user bytes copied into `sendable_plaintext` by
+> `conn.writer().write()`. *That copy does not happen on an established
+> connection.* `CommonState::send_plain` (`src/common_state.rs`) buffers into
+> `sendable_plaintext` only inside `if !self.may_send_application_data`, i.e.
+> before the handshake completes; otherwise it calls
+> `send_plain_non_buffering`, which fragments and encrypts immediately. There
+> was never a buffering copy on the steady-state path to remove.
+>
+> **2 — rustls source: the unbuffered API does not encrypt into the caller's
+> buffer either.** `WriteTraffic::encrypt` → `write_plaintext` →
+> `CommonState::write_fragments` does, per fragment, `let em =
+> self.record_layer.encrypt_outgoing(m).encode();` followed by
+> `outgoing_tls[written..written + len].copy_from_slice(&em);` — and
+> `Tls13MessageEncrypter::encrypt` (`src/crypto/ring/tls13.rs`) allocates a
+> `PrefixedPayload` per record, copies the plaintext in with
+> `extend_from_chunks`, and seals in place. So `encrypt(plaintext, dst)` is
+> plaintext → fresh per-record heap buffer → AEAD in place → `copy_from_slice`
+> into `dst`. Two passes. The buffered engine does the same two. Identical.
+>
+> **3 — measurement (isolated microbenchmark; Linux 6.12 / io_uring on hv01,
+> rustc 1.98.1).** An allocation counter inside the measured call reports
+> **263,976** bytes/op buffered against **264,000** unbuffered at a 256 KiB
+> payload — 24 bytes apart. A path that encrypted into the destination would
+> allocate ~0. Isolated send path, ns/op, medians of 4 interleaved rounds with
+> under 1% within-arm spread:
+>
+> | size | buffered | unbuffered | Δ |
+> |---|---:|---:|---:|
+> | 1 KiB | 538.6 | 521.7 | −3.1% |
+> | 16 KiB | 4302 | 4547 | **+5.7%** |
+> | 64 KiB | 17741 | 17613 | −0.7% |
+> | 256 KiB | 71738 | 70196 | −2.2% |
+> | 1 MiB | 287181 | 282071 | −1.8% |
+>
+> Running the payload cold made the copy about 4.5× more expensive and left the
+> arm delta unchanged (−2.2% hot vs −2.1% cold at 256 KiB). A genuinely removed
+> copy would have widened sharply there; this did not.
+>
+> **The +5.7% at 16 KiB is structural, not noise.** At a payload that is a
+> multiple of `send_copy_slot_size` (16384 by default) the buffered path emits
+> **one** 16406-byte record and lets `PoolWriter` straddle it across two slots.
+> The unbuffered path must fit a whole record inside one slot, so
+> `encrypt_chunk` shrinks the chunk and emits **two** records — 17 vs 16 at
+> 256 KiB, 65 vs 64 at 1 MiB. The extra record costs ~245 ns, which accounts
+> for the whole regression.
+>
+> **What the feature does deliver:** a small (~1–2%) send-side *bookkeeping*
+> win at ≥64 KiB — not data movement; a 4–8% win on the isolated recv path
+> (mins of 8 reps at 10–20% spread, so treat as ±2%); the extra record above;
+> and no throughput or latency regression anywhere measured. It remains the
+> prerequisite for kTLS, since `dangerous_extract_secrets` is implemented on
+> `UnbufferedConnectionCommon` — that part of the argument survives.
+>
+> An end-to-end TLS echo comparison was also run, but client and server were
+> co-located, so it is a **relative signal only and its absolute figures are
+> not publishable** (this project withdrew `BENCHMARKS.md` in PR #205 over
+> exactly that mistake). It agreed: 64 B and 1 KiB inside noise, 16 KiB −2.5%,
+> 256 KiB +1.0%.
+>
+> **Getting the originally-claimed copy would require rustls itself to encrypt
+> in place into `outgoing_tls`**, which `write_fragments` does not do. It is not
+> reachable from ringline. See
+> [`journal/2026-09-unbuffered-tls.md`](journal/2026-09-unbuffered-tls.md) for
+> the GO/NO-GO verdict.
+
 ## Goal
+
+> *Falsified — see the correction at the top of this document. Kept as
+> written.*
 
 Remove one of the two copies TLS currently pays on every send, by encrypting
 **directly from caller memory into a send-pool slot** instead of first copying
@@ -23,6 +108,10 @@ Every trade-off below is sized against **800 GbE**, not today's rigs.
 
 **What is structural.** The copy count on the TLS send path follows from the
 mechanism and can be verified by reading the code:
+
+> *The "Unbuffered" row is falsified: it is 2, not 1, and the "Today
+> (buffered)" row misattributes the first copy. See the correction at the top.
+> Table kept as written.*
 
 | TLS send path | Copies on send |
 |---|---|
@@ -73,6 +162,28 @@ pre-filling.
 
 ## Motivation
 
+> **Correction (2026-09-04, post-merge).** This section is the falsified core of
+> the design; see the full correction at the top. Two specific claims below are
+> wrong about rustls 0.23.41:
+>
+> - **"Copy 1 — user bytes into rustls' internal `sendable_plaintext` buffer"
+>   does not happen on an established connection.** `writer().write()` reaches
+>   `CommonState::send_plain`, which appends to `sendable_plaintext` only under
+>   `if !self.may_send_application_data` — i.e. only before the handshake
+>   completes, so early plaintext can be flushed once it becomes sendable. Every
+>   application-data write afterwards falls through to
+>   `send_plain_non_buffering` and is fragmented and encrypted on the spot. The
+>   copy this design set out to remove was not there. It should have been
+>   checked against `common_state.rs` before the design was written, not after
+>   the feature merged.
+> - **"Copy 2 is intrinsic" is right, but it is two passes, not one, on *both*
+>   engines.** `write_fragments` seals each fragment into a freshly allocated
+>   `PrefixedPayload` and then `copy_from_slice`s the finished record into the
+>   destination. Nothing in either API encrypts straight from caller memory into
+>   the destination buffer.
+>
+> The original text follows unchanged.
+
 `docs/syscalls-and-copies.md:195` records TLS sends at **2 copies**, versus 1 for
 plaintext. `tls.rs::encrypt_to_sends` shows exactly where they are:
 
@@ -121,7 +232,10 @@ impl<Data> WriteTraffic<'_, Data> {
 ```
 
 `encrypt` reads plaintext from a caller slice and writes ciphertext into a caller
-buffer, with no intermediate. `queue_close_notify` fits ringline's existing
+buffer. *(Correction: "with no intermediate", as this sentence originally read,
+is false — `write_fragments` seals each record into a fresh `PrefixedPayload`
+and copies it into the caller's buffer. See the correction at the top.)*
+`queue_close_notify` fits ringline's existing
 "close_notify is serialized through the per-connection send queue" rule.
 
 `WriteTraffic` is reachable only from `UnbufferedClientConnection` /
@@ -426,6 +540,12 @@ Checked against CLAUDE.md's *Domain Invariants*:
 - **Copy-count verification** — update `docs/syscalls-and-copies.md`; the TLS send
   row moves from 2 to 1. CLAUDE.md's copy table must move with it.
 
+  > **Correction (2026-09-04).** This step was performed but the premise it
+  > verified against was never checked, so it recorded a reduction that did not
+  > happen. Both tables now read 2 for the unbuffered engine. The check that
+  > would have caught it — an allocation counter inside the measured call, and
+  > reading `send_plain`/`write_fragments` — is what eventually did.
+
 ## Out of scope
 
 - **kTLS.** Follow-on, below.
@@ -466,7 +586,11 @@ kTLS was the original request; this design is deliberately its first half — an
 at the 800 GbE target it is the *necessary* first half of a two-part answer, not
 a detour.
 
-**The remaining copy is a floor that only hardware offload removes.** This
+**The remaining copy is a floor that only hardware offload removes.** *(The
+next sentence is falsified: the design does not take TLS sends from 2 copies to
+1 — see the correction at the top. The kTLS argument itself survives, since
+`dangerous_extract_secrets` lives on `UnbufferedConnectionCommon` and the
+unbuffered connection is still the prerequisite.)* This
 design takes TLS sends from 2 copies to 1, reaching parity with plaintext sends.
 It cannot go further: encryption must read plaintext and write ciphertext, and no
 userspace arrangement removes that. Software kTLS does not help — `sendmsg`
@@ -492,7 +616,9 @@ exists for the `timestamps` feature) to read TLS control records, plus KeyUpdate
 handling, kernel-version gating, and a fallback for every unsupported case.
 
 This design gets the same send-side copy count, on **both** backends including
-macOS, with none of that. kTLS then becomes an opt-in Linux fast path layered on
+macOS, with none of that. *(Correction: it does not — the copy count is
+unchanged at 2. What survives is that the unbuffered connection is the object
+kTLS needs.)* kTLS then becomes an opt-in Linux fast path layered on
 the same unbuffered connection — and the only route to `sendfile` and NIC crypto
 offload, which is where the *remaining* copy goes.
 

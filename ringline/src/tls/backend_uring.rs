@@ -19,9 +19,10 @@
 //! `EncodeTlsData::encode` is all-or-nothing on one contiguous buffer, and a
 //! full-size handshake record (`5 + 16384 + overhead`) does not fit the default
 //! 16384-byte `send_copy_slot_size` — so the engine writes it to a `Vec` and
-//! [`ciphertext_to_sends`] chunks it across slots. Application data — the path
-//! this engine exists for — is encrypted directly into a slot and never comes
-//! through that scratch.
+//! [`ciphertext_to_sends`] chunks it across slots. Application data does not
+//! come through that scratch: `WriteTraffic::encrypt` writes into the slot
+//! directly. (That is not a copy saving over the buffered engine — see the
+//! `unbuffered` module docs.)
 //!
 //! **Never drive the state machine to "flush" leftovers after encrypting or
 //! queueing an alert.** rustls' `write_fragments` drains `sendable_tls` into

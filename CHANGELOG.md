@@ -10,17 +10,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Added
 
 - `tls-unbuffered` cargo feature (default off): drives TLS through rustls'
-  unbuffered record layer, encrypting application data directly from caller
-  memory into a send-pool slot. Takes TLS application-data sends from 2 copies
-  to 1 on both backends; TLS recv is unchanged. Known limitations: the io_uring
-  handshake path (ClientHello/certificates/Finished, not the steady-state
-  application-data path) pays one copy more than the buffered engine, since
-  `EncodeTlsData::encode` needs one contiguous output buffer that can exceed a
-  pool slot; and `TlsInfo::sni_hostname()` is always `None` for server
-  connections on this engine (rustls exposes no equivalent of
+  unbuffered record layer (`UnbufferedConnectionCommon` /
+  `WriteTraffic::encrypt`) instead of the buffered `writer()`/`write_tls()`
+  API, on both backends.
+
+  **It does not change the copy count.** Application-data sends cost 2 copies
+  on both engines. The copy this feature was built to remove — user bytes into
+  rustls' `sendable_plaintext` — does not happen on an established connection:
+  `CommonState::send_plain` buffers there only before the handshake completes
+  and otherwise calls `send_plain_non_buffering`. Nor does the unbuffered API
+  encrypt into the caller's destination: `write_fragments` seals each record in
+  a fresh per-record buffer and then copies it into `outgoing_tls`. Verified
+  against rustls 0.23.41 and confirmed by an allocation counter inside the
+  measured call (263,976 bytes/op buffered vs 264,000 unbuffered at 256 KiB).
+
+  What it does deliver, measured in isolation on Linux/io_uring: a small
+  (~1–2%) send-side bookkeeping win at payloads ≥64 KiB, a 4–8% win on the
+  recv path, and no throughput or latency regression. It is also the
+  prerequisite for kTLS, since `dangerous_extract_secrets` is implemented on
+  `UnbufferedConnectionCommon`.
+
+  Known costs and limitations: a payload that is an exact multiple of
+  `send_copy_slot_size` costs one **extra TLS record**, because a whole record
+  must fit inside one pool slot (a 16 KiB send is ~5.7% slower for this
+  reason); the io_uring handshake path (ClientHello/certificates/Finished, not
+  the steady-state application-data path) pays one copy more than the buffered
+  engine, since `EncodeTlsData::encode` needs one contiguous output buffer that
+  can exceed a pool slot; and `TlsInfo::sni_hostname()` is always `None` for
+  server connections on this engine (rustls exposes no equivalent of
   `ServerConnection::server_name()` on `UnbufferedServerConnection` — would
   need a `ClientHello` callback on `ServerConfig`, tracked as follow-on work).
-  See `docs/tls-unbuffered-design.md`.
+  TLS recv copy count is unchanged. See `docs/tls-unbuffered-design.md`.
 
 ## [ringline-memcache 0.7.1] - 2026-09-04
 
