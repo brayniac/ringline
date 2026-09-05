@@ -160,6 +160,14 @@ pub struct Config {
     pub(crate) send_copy_count: u16,
     /// Size of each copy-send pool slot in bytes. A single `send()` or the
     /// combined copy parts of one `send_parts()` call must fit in one slot.
+    ///
+    /// The default is 16448, not 16384, so that one maximum-size TLS 1.3
+    /// record fits in a single slot: 5-byte record header + 2^14 plaintext +
+    /// the inner content-type byte + a 16-byte AEAD tag = 16406, rounded up to
+    /// a 64-byte boundary. A 16384-byte slot is 22 bytes short of that, which
+    /// forces the `tls-unbuffered` engine to shrink its plaintext chunk and
+    /// emit an extra record per send (17 rather than 16 for a 256 KiB
+    /// payload). Costs 64 bytes per slot — 0.4% of the pool.
     pub(crate) send_copy_slot_size: u32,
     /// Minimum total send size (bytes) for the zero-copy guard send path.
     ///
@@ -331,7 +339,7 @@ impl Default for Config {
             accept_queue_capacity: 1024,
             conn_chunk_size: 1,
             send_copy_count: 1024,
-            send_copy_slot_size: 16384,
+            send_copy_slot_size: 16448,
             send_zc_threshold: 4096,
             send_slab_slots: 512,
             flush_interval_us: 100,
