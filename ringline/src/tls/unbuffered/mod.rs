@@ -610,6 +610,31 @@ pub(crate) fn feed(
 /// straight away instead.
 const MIN_ENCRYPT_DST: usize = 64;
 
+/// RFC 8446's maximum `TLSPlaintext.length`: 2^14 bytes of plaintext in one
+/// record. This is a protocol constant, not a tuning knob — handing rustls
+/// more plaintext than this in a single `encrypt` call cannot produce a larger
+/// record, it just makes rustls fragment internally and emit more than one.
+/// rustls has the same value as `msgs::fragmenter::MAX_FRAGMENT_LEN`, but it
+/// is `pub(crate)` there, so ringline carries its own.
+const MAX_FRAGMENT_LEN: usize = 16384;
+
+/// Wire size of one maximum-size TLS 1.3 record: 5-byte record header,
+/// [`MAX_FRAGMENT_LEN`] of plaintext, the inner content-type byte, and a
+/// 16-byte AEAD tag — 16406 bytes.
+///
+/// Deliberately *not* derived from `MAX_TLS_WIRE_RECORD` (18437), which is the
+/// conservative bound on a record we must be prepared to **receive** and
+/// carries 2 KiB of slack for TLS 1.2's explicit nonce. Sizing anything we
+/// **emit** from that number has produced three separate wrong answers in this
+/// area already.
+///
+/// 16 is the tag length of every TLS 1.3 suite rustls offers, so this is exact
+/// for the suites reachable here. It is only ever used to pick the *starting*
+/// chunk in [`encrypt_chunk`]; if a future suite made it an underestimate, the
+/// `InsufficientSize` retry loop would still converge, just after one extra
+/// attempt. Correctness never depends on it.
+const MAX_RECORD_WIRE_LEN: usize = 5 + MAX_FRAGMENT_LEN + 1 + 16;
+
 /// Encrypt as much of `plaintext` as fits in `dst`, in one or more TLS
 /// records. Returns `(plaintext_consumed, ciphertext_written)`.
 ///
@@ -659,7 +684,35 @@ pub(crate) fn encrypt_chunk(
     let hint = if conn.chunk_basis == dst.len() && conn.max_plaintext_per_chunk > 0 {
         conn.max_plaintext_per_chunk
     } else {
-        dst.len()
+        // Start from the largest whole number of maximum-size records `dst`
+        // can hold, not from `dst.len()`.
+        //
+        // Asking for `dst.len()` bytes of plaintext always overshoots, because
+        // the ciphertext is larger than the plaintext: rustls fragments the
+        // request, reports `required_size`, and the retry loop scales the chunk
+        // down *proportionally* — which lands just under a fragment boundary
+        // rather than on it. At the 16384-byte default slot that caches 16362,
+        // so a 256 KiB send is split into 17 records where the buffered engine
+        // emits 16. Worse, for any `dst` in (16428, 2 * MAX_RECORD_WIRE_LEN)
+        // the loop converges on a chunk spanning a full record *plus a sliver*,
+        // doubling the record count outright (31 records for 256 KiB at a
+        // 16512-byte slot).
+        //
+        // Whole records avoid both: `whole * MAX_FRAGMENT_LEN` of plaintext
+        // encrypts to exactly `whole * MAX_RECORD_WIRE_LEN` of ciphertext,
+        // which fits by construction, so the common case needs no retry at all
+        // and each call fills `dst` with none of it wasted on a sliver record.
+        //
+        // `whole == 0` means `dst` cannot hold even one full record — the
+        // 16384-byte default slot is exactly this case, missing it by 22
+        // bytes. There is no whole-record answer, so fall back to the previous
+        // behaviour and let the retry loop find the largest chunk that fits.
+        let whole = dst.len() / MAX_RECORD_WIRE_LEN;
+        if whole == 0 {
+            dst.len()
+        } else {
+            whole * MAX_FRAGMENT_LEN
+        }
     };
     let mut chunk = plaintext.len().min(hint.max(1));
 
