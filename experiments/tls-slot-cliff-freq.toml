@@ -1,0 +1,108 @@
+name = "tls-slot-cliff: frequency control (rustc 1.98.1)"
+
+# Third and final job. Two purposes.
+#
+# 1. TOOLCHAIN. The first two jobs ran on rustc 1.97.1, because the SystemsLab
+#    agent's account has an older default toolchain than the interactive one
+#    (1.98.1). The brief calls for 1.98.1, so this job installs and pins it and
+#    prints the version it actually used.
+#
+# 2. MECHANISM. Job 2 (01a0701f) established that the "slot size cliff" is
+#    measurement position: the SAME slot size measured first and last in one
+#    process differs by +2.5% to +5.4% in all 8 arms, and reversing the sweep
+#    moves the penalty onto whichever size now sits last. What remains is why
+#    later cells are slower. Job 1 measured cycles/op as identical between the
+#    two slot sizes when each is measured in its own process (2253.33 vs
+#    2254.72, +0.06%), so the per-operation *work* does not change.
+#
+#    That leaves clock. This job samples the pinned core's achieved frequency
+#    (from /proc/cpuinfo, which is aperf/mperf-derived on this kernel) either
+#    side of every cell.
+#
+#    Prediction, stated before the run: if the sweep is measuring boost decay,
+#    frequency falls across positions by about the same percentage that ns/op
+#    rises, and the fall tracks position rather than slot size — including in
+#    reverse order, and arriving earlier in the preheat arm, which does extra
+#    work before the first cell.
+#
+# host: hv01 = z2.baremetal = 3970X, pinned to CPU 20 as in the previous jobs.
+
+[params]
+ringline_repo = "https://github.com/brayniac/ringline"
+micro_ref     = "bench/tls-slot-cliff"
+micro_cpu     = "20"
+toolchain     = "1.98.1"
+
+[[jobs]]
+name = "freq"
+tags = ["z2.baremetal"]
+
+[[jobs.steps]]
+name = "build"
+type = "shell"
+command = """
+set -eu
+source "$HOME/.cargo/env"
+echo "default toolchain was: $(rustc --version)"
+rustup toolchain install {toolchain} --profile minimal
+echo "pinned toolchain is: $(rustup run {toolchain} rustc --version)"
+rustup run {toolchain} rustc --version | grep -q '{toolchain}' || { echo "ERROR: wrong toolchain"; exit 1; }
+
+DIR=/tmp/slotcliff/micro98
+if [ -d "$DIR/.git" ]; then
+    cd "$DIR" && git fetch --all -p && git checkout {micro_ref} && git reset --hard origin/{micro_ref}
+else
+    rm -rf "$DIR" && git clone {ringline_repo} "$DIR" && cd "$DIR" && git checkout {micro_ref}
+fi
+cd "$DIR"
+echo "micro at $(git rev-parse --short HEAD)"
+CARGO_TARGET_DIR=target-buf   rustup run {toolchain} cargo test --release -p ringline --lib --no-run 2>&1 | tee /tmp/slotcliff/c1.log
+CARGO_TARGET_DIR=target-unbuf rustup run {toolchain} cargo test --release -p ringline --lib --features tls-unbuffered --no-run 2>&1 | tee /tmp/slotcliff/c2.log
+BUF=$(grep -o 'Executable unittests src/lib.rs ([^)]*)' /tmp/slotcliff/c1.log | tail -1 | sed 's/.*(\\(.*\\))/\\1/')
+UNBUF=$(grep -o 'Executable unittests src/lib.rs ([^)]*)' /tmp/slotcliff/c2.log | tail -1 | sed 's/.*(\\(.*\\))/\\1/')
+cat > /tmp/slotcliff/env3.sh <<EOF
+export MICRO_BUF=$DIR/$BUF
+export MICRO_UNBUF=$DIR/$UNBUF
+EOF
+cat /tmp/slotcliff/env3.sh
+test -x "$DIR/$BUF" && test -x "$DIR/$UNBUF" && echo "BUILD OK"
+"""
+
+[[jobs.steps]]
+name = "freq-and-order"
+type = "shell"
+command = """
+set -u
+source "$HOME/.cargo/env"
+source /tmp/slotcliff/env3.sh
+: > freq.txt
+{ echo "=== uptime (start) ==="; uptime
+  echo "cargo/rustc procs: $(pgrep -c -x 'cargo|rustc' || true)"
+  echo "=== governor / driver for cpu {micro_cpu} ==="
+  cat /sys/devices/system/cpu/cpu{micro_cpu}/cpufreq/scaling_governor 2>/dev/null || echo "no cpufreq sysfs"
+  cat /sys/devices/system/cpu/cpu{micro_cpu}/cpufreq/scaling_driver 2>/dev/null || true
+  cat /sys/devices/system/cpu/cpufreq/boost 2>/dev/null && echo "(1 = boost enabled)" || true
+} | tee -a freq.txt
+
+for rep in 1 2 3 4 5 6; do
+  for eng in BUF UNBUF; do
+    case $eng in BUF) B="$MICRO_BUF";; UNBUF) B="$MICRO_UNBUF";; esac
+    for order in fwd rev; do
+      for preheat in 0 1; do
+        echo "### rep=$rep eng=$eng order=$order preheat=$preheat" >> freq.txt
+        env RL_ORDER=$order RL_PREHEAT=$preheat RL_SIZE=1024 RL_CPU={micro_cpu} \
+          taskset -c {micro_cpu} "$B" --exact tls::send_microbench::slot_order_control \
+          --nocapture --test-threads=1 >> freq.txt 2>&1
+        echo "rc=$?" >> freq.txt
+      done
+    done
+  done
+done
+{ echo "=== uptime (end) ==="; uptime; } | tee -a freq.txt
+echo "O lines: $(grep -cE '^O' freq.txt)  F lines: $(grep -cE '^F' freq.txt)"
+"""
+
+[[jobs.steps]]
+name = "upload-freq"
+type = "upload_artifact"
+path = "freq.txt"

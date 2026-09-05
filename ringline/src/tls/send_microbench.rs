@@ -1257,6 +1257,36 @@ fn disable_thp_for_this_process() -> bool {
     rc == 0
 }
 
+/// Current clock for one CPU, from /proc/cpuinfo. On this kernel that field is
+/// derived from aperf/mperf, so it reflects the core's *actual* achieved
+/// frequency rather than a nominal setting — which is what distinguishes a
+/// boost-residency artifact from a microarchitectural one.
+fn cpu_mhz(cpu: usize) -> f64 {
+    let Ok(s) = std::fs::read_to_string("/proc/cpuinfo") else {
+        return f64::NAN;
+    };
+    let mut this: Option<usize> = None;
+    for line in s.lines() {
+        if let Some(v) = line.strip_prefix("processor") {
+            this = v
+                .trim_start_matches(&[' ', '\t', ':'][..])
+                .trim()
+                .parse()
+                .ok();
+        }
+        if let Some(v) = line.strip_prefix("cpu MHz")
+            && this == Some(cpu)
+        {
+            return v
+                .trim_start_matches(&[' ', '\t', ':'][..])
+                .trim()
+                .parse()
+                .unwrap_or(f64::NAN);
+        }
+    }
+    f64::NAN
+}
+
 fn env_usize(k: &str, d: usize) -> usize {
     std::env::var(k)
         .ok()
@@ -1536,11 +1566,18 @@ fn slot_order_control() {
         drop(h);
     }
 
+    let cpu = env_usize("RL_CPU", 20);
     for (pos, &slot) in list.iter().enumerate() {
+        let mhz_before = cpu_mhz(cpu);
         let r = measure_send2_pool(size, slot, 1024, bpr, reps);
+        let mhz_after = cpu_mhz(cpu);
         for (i, ns) in r.iter().enumerate() {
             println!("O\t{ENGINE}\t{order}\t{preheat}\t{pos}\t{slot}\t{i}\t{ns:.3}");
         }
+        // Frequency bracketing the cell. If ns/op tracks this and the earlier
+        // per-process counter run showed cycles/op flat, the sweep is measuring
+        // boost decay, not the slot size.
+        println!("F\t{ENGINE}\t{order}\t{preheat}\t{pos}\t{slot}\t{mhz_before:.1}\t{mhz_after:.1}");
     }
     let lp = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
     println!("# slot_order_control loadavg_after={}", lp.trim());
