@@ -41,7 +41,14 @@ kTLS was where this started. Two findings moved it to a follow-on:
 1. **kTLS is all-or-nothing per connection.** `dangerous_extract_secrets(self)`
    consumes the rustls connection on all three overloads, so there is no "kTLS
    for TX, rustls for RX" — extraction destroys the state machine that would
-   decrypt inbound records. That makes kTLS strictly larger than it looks:
+   decrypt inbound records.
+   *(Corrected 2026-09-06: the conclusion holds and is stronger than stated.
+   The method named here is `#[deprecated]`; its replacement
+   `dangerous_into_kernel_connection` also takes `self`, and the
+   `KernelConnection` it returns does no encryption or decryption at all — it
+   only computes new traffic secrets on a key update and absorbs session
+   tickets. So the RX conversion is on the critical path for any kTLS work,
+   not deferrable to a later phase.)* That makes kTLS strictly larger than it looks:
    Linux-only, kernel-cipher-restricted, needing the `RecvMsgMulti` + cmsg path
    to read TLS control records, plus KeyUpdate handling, kernel-version gating,
    and a fallback for every unsupported case.
@@ -52,6 +59,14 @@ kTLS was where this started. Two findings moved it to a follow-on:
    is false — the unbuffered path does not change the copy count at all. The
    prerequisite clause is the part that survives, and is now the only standing
    justification for the engine.)*
+   *(Corrected again 2026-09-06: the prerequisite clause survives, but its
+   stated reason never did. `dangerous_extract_secrets` is implemented on the
+   buffered types too — `ClientConnection`, `ServerConnection`,
+   `ConnectionCommon<Data>`, `Connection` — so it never distinguished the
+   engines. What does distinguish them is the replacement,
+   `dangerous_into_kernel_connection`, which is public only on
+   `UnbufferedClientConnection`/`UnbufferedServerConnection`. The engine's only
+   standing justification rested on a citation that did not support it.)*
 
 kTLS remains the only route to `sendfile` and NIC crypto offload, which is where
 the *remaining* copy goes. Reopen it once the unbuffered engine is real.
@@ -449,6 +464,10 @@ on chunk size, which now has a concrete reason to be answered).
 - The prerequisite for kTLS. `dangerous_extract_secrets` is implemented on
   `UnbufferedConnectionCommon`, so this part of the original argument survives
   intact and is now the *only* standing justification for the engine.
+  *(Corrected 2026-09-06: survives, but not "intact" — see the correction under
+  "Why not kTLS" above. That method is also on the buffered types, so it never
+  distinguished the engines; the argument stands on
+  `dangerous_into_kernel_connection`, which is unbuffered-only.)*
 
 Reaching the originally-claimed 1 copy would require **rustls** to encrypt in
 place into `outgoing_tls`. `write_fragments` does not, and that is not

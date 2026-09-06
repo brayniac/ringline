@@ -27,8 +27,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   What it does deliver, measured in isolation on Linux/io_uring: a small
   (~1–2%) send-side bookkeeping win at payloads ≥64 KiB, a 4–8% win on the
   recv path, and no throughput or latency regression. It is also the
-  prerequisite for kTLS, since `dangerous_extract_secrets` is implemented on
-  `UnbufferedConnectionCommon`.
+  prerequisite for kTLS, since rustls' `dangerous_into_kernel_connection` is
+  public only on `UnbufferedClientConnection`/`UnbufferedServerConnection`.
 
   Known costs and limitations: a payload that is an exact multiple of
   `send_copy_slot_size` costs one **extra TLS record**, because a whole record

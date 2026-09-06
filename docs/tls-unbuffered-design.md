@@ -75,8 +75,8 @@ records where *measuring* it did.
 > win at ≥64 KiB — not data movement; a 4–8% win on the isolated recv path
 > (mins of 8 reps at 10–20% spread, so treat as ±2%); the extra record above;
 > and no throughput or latency regression anywhere measured. It remains the
-> prerequisite for kTLS, since `dangerous_extract_secrets` is implemented on
-> `UnbufferedConnectionCommon` — that part of the argument survives.
+> prerequisite for kTLS — though not for the reason this document gave. See
+> the second correction block below.
 >
 > An end-to-end TLS echo comparison was also run, but client and server were
 > co-located, so it is a **relative signal only and its absolute figures are
@@ -109,16 +109,51 @@ Every trade-off below is sized against **800 GbE**, not today's rigs.
 **What is structural.** The copy count on the TLS send path follows from the
 mechanism and can be verified by reading the code:
 
-> *The "Unbuffered" row is falsified: it is 2, not 1, and the "Today
-> (buffered)" row misattributes the first copy. See the correction at the top.
-> Table kept as written.*
+> **Correction (PR #353 scoping).** *Every row of this table is wrong, and the
+> two kTLS rows are wrong in opposite directions. Table kept as written; the
+> corrected version follows it.*
+>
+> - The "Unbuffered" row is falsified: it is 2, not 1, and the "Today
+>   (buffered)" row misattributes the first copy — see the correction at the
+>   top of this document.
+> - **"kTLS, software" is better than 1, not equal to it.** `sendmsg` does
+>   *not* copy the plaintext in. `tls_sw_sendmsg_locked` takes
+>   `sk_msg_zerocopy_from_iter` (`net/tls/tls_sw.c:1103-1106`), which pins the
+>   caller's pages with `iov_iter_get_pages2`; the AEAD then reads those pages
+>   directly and writes separately allocated ciphertext pages. The plaintext
+>   never enters the kernel. Measured, not inferred: kprobes on hv02 counted
+>   that branch taken `iters × ceil(size / 16 KiB)` times in every send mode —
+>   including on an io_uring fixed descriptor and under forced `IOSQE_ASYNC`
+>   offload — with the copy path never entered.
+> - **"kTLS + NIC offload (`TLS_HW`)" is not 0.** `tls_device_sendmsg`'s
+>   ordinary path calls `tls_device_copy_data`
+>   (`net/tls/tls_device.c:493-524`), which is `copy_from_iter` +
+>   `copy_from_iter_nocache`. Device offload removes the CPU *crypto*, not the
+>   copy. Zero is reachable only via `MSG_SPLICE_PAGES`, which does not compose
+>   with ringline's pool-slot send path. This row was wrong in the same
+>   direction as the 1-copy claim already retracted above, and it was the
+>   number the whole 800 GbE argument below was aimed at.
 
-| TLS send path | Copies on send |
+| TLS send path | Copies on send *(as written — falsified)* |
 |---|---|
 | Today (buffered) | 2 — user → rustls' plaintext buffer → pool slot |
 | Unbuffered (this design) | 1 — user → pool slot, encrypting in transit |
 | kTLS, software | 1 — `sendmsg` copies plaintext in; kernel encrypts in place |
 | kTLS + NIC offload (`TLS_HW`) | 0 — in principle; unmeasured here |
+
+Corrected. "Userspace" counts memcpy-class passes ringline pays before the
+syscall; "kernel" counts passes the kernel makes before the NIC can DMA. The
+unavoidable AEAD read→write is not counted as a pass in either column. See
+[`ktls-design.md`](ktls-design.md) §1 for the derivation and the source
+citations.
+
+| TLS send path | userspace | kernel | total | status |
+|---|---|---|---|---|
+| Today, buffered **or** unbuffered engine | 2 | 1 | **3** | measured (allocation counter, #351) |
+| kTLS_SW, pinned-pages path | 1 (pool slot) | 0 | **1** | measured (kprobes, hv02) |
+| kTLS_SW, ordinary path | 1 (pool slot) | 1 | **2** | source; the fallback if the page pin fails |
+| kTLS_HW (`TLS_HW`) | 1 (pool slot) | 1 | **2**, and no CPU crypto | source; unreachable on any host we own |
+| kTLS + `MSG_SPLICE_PAGES` | 0 | 0 | **0** | does not compose with pool-slot sends |
 
 **What is not measured.** How much a copy *costs* at 800 GbE is unknown. The one
 number this codebase has is **~3.2 GiB/s/core**, from real 200 GbE on
@@ -586,11 +621,25 @@ kTLS was the original request; this design is deliberately its first half — an
 at the 800 GbE target it is the *necessary* first half of a two-part answer, not
 a detour.
 
-**The remaining copy is a floor that only hardware offload removes.** *(The
-next sentence is falsified: the design does not take TLS sends from 2 copies to
-1 — see the correction at the top. The kTLS argument itself survives, since
-`dangerous_extract_secrets` lives on `UnbufferedConnectionCommon` and the
-unbuffered connection is still the prerequisite.)* This
+> **Correction (PR #353 scoping).** The paragraph below is falsified twice
+> over, and is kept as written. It is also the origin of the error corrected in
+> the copy table earlier in this document.
+>
+> 1. The design does not take TLS sends from 2 copies to 1 — see the correction
+>    at the top.
+> 2. **Software kTLS does help, and `TLS_HW` does not reach zero.** The kernel
+>    pins the caller's pages rather than copying them in, so software kTLS is
+>    the *cheapest* row in the table and needs no special hardware; `TLS_HW`
+>    still copies via `tls_device_copy_data` and removes only the CPU crypto.
+>
+> The structural case for kTLS below is therefore real, but it points at
+> **software** kTLS on commodity NICs rather than at an offload endpoint. That
+> distinction matters: `TLS_HW` is unreachable on every host this project owns,
+> so an argument aimed at it is an argument we cannot act on, while the
+> software case is measurable on hardware we already have. See
+> [`ktls-design.md`](ktls-design.md) §1 and §2.
+
+**The remaining copy is a floor that only hardware offload removes.** This
 design takes TLS sends from 2 copies to 1, reaching parity with plaintext sends.
 It cannot go further: encryption must read plaintext and write ciphertext, and no
 userspace arrangement removes that. Software kTLS does not help — `sendmsg`
@@ -603,12 +652,33 @@ How much that floor actually costs at 800 GbE is unmeasured — see *Design
 target*. The argument here is about the copy count, which is structural, not
 about a core figure.
 
+> **Correction (PR #353 scoping).** The next sentence's *conclusion* is right
+> and its *reason* is not — worth flagging precisely, because after #351 this
+> is the only standing justification for the whole feature.
+>
+> `dangerous_extract_secrets` is implemented on the **buffered** types as well
+> — `ClientConnection` (`client_conn.rs:777`), `ServerConnection`
+> (`server_conn.rs:736`), `ConnectionCommon<Data>` (`conn.rs:472`) and
+> `Connection` (`conn.rs:125`) — so it never distinguished the two engines at
+> all. It is now `#[deprecated]`, for not supporting session tickets or key
+> updates.
+>
+> What does distinguish them is the replacement:
+> `dangerous_into_kernel_connection` is public **only** on
+> `UnbufferedClientConnection`/`UnbufferedServerConnection`, and returns a
+> `KernelConnection` that can still rekey and absorb session tickets. Its
+> preconditions — handshake complete and `sendable_tls` drained — are exactly
+> what driving an unbuffered connection to `WriteTraffic` produces. So the
+> unbuffered engine is the prerequisite, for a reason this document did not
+> have.
+
 `dangerous_extract_secrets` is implemented on `UnbufferedConnectionCommon`, so the
 unbuffered connection is exactly what a future kTLS path needs to hand keys to the
-kernel. More importantly, kTLS turns out to be **all-or-nothing per connection**:
-`dangerous_extract_secrets(self)` consumes the rustls connection on all three
-overloads, so there is no "kTLS for TX, rustls for RX" — extraction destroys the
-state machine that would decrypt inbound records.
+kernel. More importantly, kTLS turns out to be **all-or-nothing per
+connection**: both the deprecated method and its replacement take `self`, so
+there is no "kTLS for TX, rustls for RX" — the handover destroys the state
+machine that would decrypt inbound records, and `KernelConnection` does not
+decrypt at all.
 
 That makes kTLS strictly larger than it first appears: Linux-only, restricted to
 kernel-supported ciphers, requiring the `RecvMsgMulti` + cmsg path (which already

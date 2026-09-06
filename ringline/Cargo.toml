@@ -23,8 +23,9 @@ timestamps = []
 # record layer instead of `writer()`/`write_tls()`. This does NOT reduce the
 # copy count -- application-data sends cost 2 copies on both engines, measured
 # and verified against rustls 0.23.41 (see docs/tls-unbuffered-design.md's
-# top correction block). It is kept as the prerequisite for kTLS, since
-# `dangerous_extract_secrets` is implemented on `UnbufferedConnectionCommon`.
+# top correction block). It is kept as the prerequisite for kTLS: rustls'
+# `dangerous_into_kernel_connection` is public only on
+# `UnbufferedClientConnection`/`UnbufferedServerConnection`.
 # Off by default.
 tls-unbuffered = []
 
