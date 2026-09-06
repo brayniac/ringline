@@ -238,7 +238,8 @@ fully zero-copy.
 > inside one slot, so `encrypt_chunk` shrinks and emits two (17 records vs 16 at
 > 256 KiB, 65 vs 64 at 1 MiB). The extra record is ~245 ns, which is the whole
 > +5.7%. It also remains the prerequisite for kTLS —
-> `dangerous_extract_secrets` is implemented on `UnbufferedConnectionCommon`.
+> `dangerous_into_kernel_connection` is public only on the unbuffered
+> connection types.
 >
 > Reaching the originally-claimed 1 copy would require **rustls** to encrypt in
 > place into `outgoing_tls`, which `write_fragments` does not do. See

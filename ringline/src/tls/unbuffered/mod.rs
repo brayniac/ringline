@@ -12,10 +12,15 @@
 //! `docs/tls-unbuffered-design.md`'s top correction block and
 //! `docs/journal/2026-09-unbuffered-tls.md` ("Plan 4 — measurement").
 //!
-//! What the engine is still for: it is the prerequisite for kTLS
-//! (`dangerous_extract_secrets` is implemented on
-//! `UnbufferedConnectionCommon`). It also measures ~4-8% faster on the recv
-//! path, which is not a copy-count effect and is not yet explained.
+//! What the engine is still for: it is the prerequisite for kTLS. rustls'
+//! `dangerous_into_kernel_connection` — which yields both the extracted
+//! secrets and a `KernelConnection` that can still rekey and absorb session
+//! tickets — is public only on `UnbufferedClientConnection` and
+//! `UnbufferedServerConnection`. (The older `dangerous_extract_secrets`, which
+//! earlier revisions of this comment cited, is `#[deprecated]` and exists on
+//! the buffered types too, so it never justified this engine.) It also
+//! measures ~4-8% faster on the recv path, which is not a copy-count effect
+//! and is not yet explained.
 //!
 //! Selected per connection by the `tls-unbuffered` feature in
 //! `TlsTable::create`, and driven end-to-end on both backends through their

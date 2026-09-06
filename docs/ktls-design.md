@@ -529,9 +529,15 @@ reference point.
 ### 3.2 The unbuffered engine is genuinely the prerequisite — and better than we knew
 
 The prior effort's *only* surviving justification for the unbuffered engine is
-that `dangerous_extract_secrets` lives on `UnbufferedConnectionCommon`. That
-holds, and it is stronger than recorded: **rustls 0.23.41 ships a purpose-built
-kTLS API** [P-14] that the project's docs do not mention anywhere.
+that `dangerous_extract_secrets` lives on `UnbufferedConnectionCommon`. The
+conclusion holds; **the stated reason never did**, and that is worth recording,
+because it was the load-bearing sentence under a merged feature. That method is
+implemented on the *buffered* types too — `ClientConnection` (`client_conn.rs:777`),
+`ServerConnection` (`server_conn.rs:736`), `ConnectionCommon<Data>` (`conn.rs:472`)
+and `Connection` (`conn.rs:125`) — so it never distinguished the two engines at
+all. What does is the API that replaced it: **rustls 0.23.41 ships a
+purpose-built kTLS API** [P-14] that the project's docs do not mention
+anywhere, and it is unbuffered-only.
 
 ```
 UnbufferedServerConnection::dangerous_into_kernel_connection(self)
@@ -547,13 +553,30 @@ provides exactly two things:
   for a TLS 1.3 key update, with the sequence number reset to 0.
 - `handle_new_session_ticket(payload)` (client only), so resumption still works.
 
+**And nothing else — which decides the phasing of the whole effort.**
+`KernelConnection` does no encryption and no decryption (`src/conn/kernel.rs`
+module docs: "There are only two things that [`KernelConnection`] is able to
+do"). Both the deprecated method and its replacement take `self`, so the
+handover ends rustls' record layer in *both* directions at once. There is
+therefore no "kernel TX, rustls RX" staging: **the RX conversion of §3.3 — the
+one Large item — is on the critical path for any kTLS at all**, not a phase 2.
+Any plan that proposes shipping TX first should be checked against this
+paragraph.
+
 Every ringline document that cites `dangerous_extract_secrets` as the kTLS hook
-is out of date: `ringline/Cargo.toml:27`,
+was out of date: `ringline/Cargo.toml:27`,
 `ringline/src/tls/unbuffered/mod.rs:16`,
-`tls-unbuffered-design.md:78`/`:592`/`:606`/`:609`, and
-`journal/2026-09-unbuffered-tls.md:41`/`:50`/`:449`. (`CLAUDE.md:207` mentions
-kTLS but not the API, so it needs no change.) Fixing those citations is a
-docs-only follow-up worth doing regardless of whether kTLS proceeds.
+`tls-unbuffered-design.md:78`/`:592`/`:606`/`:609`,
+`journal/2026-09-unbuffered-tls.md:41`/`:50`/`:449`, plus
+`syscalls-and-copies.md:241` and `CHANGELOG.md`'s `Unreleased` entry, which
+this list originally missed. (`CLAUDE.md:207` mentions kTLS but not the API, so
+it needed no change.) ✅ **Corrected**, along with this section's own reasoning
+above.
+
+Note what the correction does *not* do: it does not make the engine's
+justification any stronger than "rustls put the kTLS handover on the unbuffered
+types". After #351 that is the whole case for the feature, and it is a claim
+about rustls' API surface, not about ringline going faster.
 
 The preconditions are strict and *shape the design*: the handshake must be
 complete, `enable_secret_extraction` must be set, and **`sendable_tls` must be
@@ -995,15 +1018,21 @@ probe. What is left is not a premise question any more — it is a cost/benefit
 question (G2 against N5) and three scope questions (N2, N3, N4), and those are
 answered by building or by measuring end to end, not by reading more source.
 
-Two things worth doing **regardless** of the kTLS decision, both cheap:
+Two things worth doing **regardless** of the kTLS decision, both cheap. ✅
+**Both done** — see §3.2 and the correction blocks in
+[`tls-unbuffered-design.md`](tls-unbuffered-design.md).
 
-- Correct every `dangerous_extract_secrets` citation to
-  `dangerous_into_kernel_connection`: `ringline/Cargo.toml:27`,
-  `ringline/src/tls/unbuffered/mod.rs:16`,
-  `tls-unbuffered-design.md:78`/`:592`/`:606`/`:609`, and
-  `journal/2026-09-unbuffered-tls.md:41`/`:50`/`:449`. The API we named as the
-  kTLS hook is deprecated, and the one that replaced it solves two of the
-  problems the journal listed as costs (key updates, session tickets).
-- Correct `tls-unbuffered-design.md:120-121`'s copy table rows for kTLS. Both
-  are wrong in the same direction as the row that was already retracted, and
-  leaving them uncorrected is how the next person inherits a false premise.
+- ~~Correct every `dangerous_extract_secrets` citation to
+  `dangerous_into_kernel_connection`.~~ Done, and it turned out to be more than
+  a rename: the old method is on the **buffered** connection types too, so the
+  citation never supported the claim that the unbuffered engine is the kTLS
+  prerequisite. The replacement is unbuffered-only, so the claim is true — for
+  a reason no ringline document had. It also solves two of the problems the
+  journal listed as costs (key updates, session tickets).
+- ~~Correct `tls-unbuffered-design.md:120-121`'s copy table rows for kTLS.~~
+  Done. They were wrong in *opposite* directions, not the same one: software
+  kTLS is cheaper than the table claimed (the kernel pins the pages), and
+  `TLS_HW` is more expensive (it still copies, and only removes the CPU
+  crypto). The row that was wrong in the same direction as the retracted
+  1-copy claim was the `TLS_HW` zero — the endpoint that document's 800 GbE
+  argument was aimed at.
