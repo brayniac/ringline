@@ -14,10 +14,12 @@ jobs:
       version-manifest: ringline/Cargo.toml
       # Forks run this on their own `main` too; only the upstream repo tags.
       only-repository: ringline-rs/ringline
-      # The shared workflow's dev bump runs `cargo release version` across the
-      # whole workspace, which would drag the satellite crates (redis,
-      # memcache, the unpublished tools) to the core version — a downgrade for
-      # some — and a `-alpha.0` core does not satisfy the workspace's
-      # `ringline = "0.6"` path requirement. Bump by hand in the release PR
-      # until the shared workflow supports a package-scoped bare-patch bump.
-      dev-bump: none
+      # After tagging, open a PR bumping only the core crate to the next bare
+      # patch version. Scoped to `ringline` because the satellite crates
+      # (redis, memcache, the unpublished tools) version on their own cadence
+      # and an unscoped bump would drag them to the core version; bare rather
+      # than `-alpha.0` because the workspace's `ringline = "0.6"` path
+      # requirement does not accept a prerelease.
+      dev-bump: pr
+      dev-bump-package: ringline
+      dev-bump-style: patch

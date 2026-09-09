@@ -336,7 +336,7 @@ Use the shared `release` skill from the custom-skills MCP server (it discovers t
 2. Update the committed `Cargo.lock` (CI is `--locked`).
 3. Move CHANGELOG `Unreleased` → the new version (Keep a Changelog format).
 4. PR commit message must start with `release: v` and name the version in `ringline/Cargo.toml`. After merge, `tag-release.yml` — a caller of the shared [`brayniac/rust-workflows`](https://github.com/brayniac/rust-workflows) `tag-release.yml@v1`, gated to `ringline-rs/ringline` — creates the `vX.Y.Z` tag → `release.yml` publishes unpublished crates to crates.io in dependency tiers.
-5. Follow up with a post-release dev bump of `ringline/Cargo.toml` to the next patch version plus `cargo update --workspace` (the caller sets `dev-bump: none`; the comment in the workflow file says why).
+5. After tagging, the shared workflow opens a `chore: begin next development iteration` PR bumping only `ringline/Cargo.toml` to the next patch version (`dev-bump-package: ringline`, `dev-bump-style: patch`; the comment in the workflow file says why it is scoped and bare). Merge it; the client crates stay at their published versions until the next coordinated release re-bumps them.
 
 **Per-crate releases** (`ringline-<crate>-vX.Y.Z` tags, used for a satellite crate on its own cadence) are not tagged by the shared workflow. Bump the crate, land the PR, then tag the merge commit by hand and push the tag to `ringline-rs/ringline`; `release.yml` publishes on the tag.
 
