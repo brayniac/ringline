@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- A refused `io_uring_setup(2)` now surfaces as `Error::RingSetup` instead of
+  a bare `Error::Io(PermissionDenied)`. The message names the errno and the
+  cause: for `EPERM` it reads `kernel.io_uring_disabled` and says whether the
+  sysctl (`2` refuses everyone including root; `1` refuses callers outside
+  `kernel.io_uring_group` without `CAP_SYS_ADMIN`) or a seccomp profile is
+  responsible, and gives the `sysctl` fix; `ENOSYS`/`EINVAL` point at the
+  kernel. Every variant mentions the `force-mio` feature. The `RingSetup` doc
+  comment and the crate-level platform notes no longer claim
+  `--no-default-features` selects mio — the backend is chosen by `build.rs`
+  and `force-mio` is the only opt-out (#355).
+
 ## [ringline-memcache 0.7.2] - 2026-09-09
 
 No changes. Published alongside the v0.6.2 workspace release because the
