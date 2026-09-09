@@ -132,16 +132,18 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.executor.ready_queue.push_back(idx | STANDALONE_BIT);
         }
 
-        // Wall-clock stall instrumentation costs ~4 clock reads per iteration,
-        // so it is opt-in: set RINGLINE_LOOP_DIAG=1 to record wait/work stall
-        // buckets (reported in the `[ringline stall]` line at shutdown). The
-        // cheap iteration-mix counters below are always on.
-        let loop_diag = std::env::var_os("RINGLINE_LOOP_DIAG").is_some();
+        // Event-loop diagnostics are opt-in via `Config::loop_diag`. When
+        // enabled, the wall-clock stall instrumentation (~4 clock reads per
+        // iteration) records wait/work stall buckets, and both the
+        // `[ringline diag]` iteration-mix line and the `[ringline stall]`
+        // line print at shutdown. The iteration-mix counters below are
+        // always maintained (a few u64 adds per iteration); only the
+        // clock reads and the output are gated.
+        let loop_diag = self.driver.loop_diag;
 
         // ── Diagnostic counters (printed to stderr at shutdown) ────────────────
         // These measure the event-loop iteration mix to help diagnose client
-        // throughput deficits.  All counters are u64 locals — zero overhead
-        // in release builds when the eprintln! at shutdown is compiled away.
+        // throughput deficits.
         let mut diag_iters: u64 = 0;
         let mut diag_dead_iters: u64 = 0; // iters where no tasks were polled in first poll_ready_tasks
         let mut diag_cqes_1st: u64 = 0; // CQEs from first drain_completions (after submit_and_wait)
@@ -250,23 +252,23 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // Check for shutdown after processing completions.
             if self.driver.shutdown_local || self.driver.shutdown_flag.load(Ordering::Relaxed) {
                 // Print per-worker diagnostics before exiting.
-                let dead_pct = if diag_iters > 0 {
-                    100.0 * diag_dead_iters as f64 / diag_iters as f64
-                } else {
-                    0.0
-                };
-                eprintln!(
-                    "[ringline diag] iters={diag_iters} dead={diag_dead_iters} ({dead_pct:.1}%) \
-                     cqes_1st_avg={:.2} cqes_2nd_avg={:.2} \
-                     tasks_1st_avg={:.2} tasks_fp_avg={:.2} parks={} fallbacks={}",
-                    diag_cqes_1st as f64 / diag_iters.max(1) as f64,
-                    diag_cqes_2nd as f64 / diag_iters.max(1) as f64,
-                    diag_tasks_1st as f64 / diag_iters.max(1) as f64,
-                    diag_tasks_fp as f64 / diag_iters.max(1) as f64,
-                    self.driver.recv_park_count,
-                    self.driver.recv_fallback_count,
-                );
                 if loop_diag {
+                    let dead_pct = if diag_iters > 0 {
+                        100.0 * diag_dead_iters as f64 / diag_iters as f64
+                    } else {
+                        0.0
+                    };
+                    eprintln!(
+                        "[ringline diag] iters={diag_iters} dead={diag_dead_iters} ({dead_pct:.1}%) \
+                         cqes_1st_avg={:.2} cqes_2nd_avg={:.2} \
+                         tasks_1st_avg={:.2} tasks_fp_avg={:.2} parks={} fallbacks={}",
+                        diag_cqes_1st as f64 / diag_iters.max(1) as f64,
+                        diag_cqes_2nd as f64 / diag_iters.max(1) as f64,
+                        diag_tasks_1st as f64 / diag_iters.max(1) as f64,
+                        diag_tasks_fp as f64 / diag_iters.max(1) as f64,
+                        self.driver.recv_park_count,
+                        self.driver.recv_fallback_count,
+                    );
                     eprintln!(
                         "[ringline stall] \
                          wait_ge_1ms={diag_wait_ge_1ms} wait_ge_5ms={diag_wait_ge_5ms} \
