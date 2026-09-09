@@ -202,6 +202,11 @@ pub struct Config {
     pub(crate) tls_client: Option<TlsClientConfig>,
     /// Enable TCP_NODELAY on all connections (accepted and outbound).
     pub(crate) tcp_nodelay: bool,
+    /// Print per-worker event-loop diagnostics to stderr at shutdown: the
+    /// iteration mix (`[ringline diag]`) and wait/work stall buckets
+    /// (`[ringline stall]`). The stall buckets cost ~4 clock reads per
+    /// iteration while enabled. io_uring backend only. Default: false.
+    pub(crate) loop_diag: bool,
     /// Enable SO_TIMESTAMPING for kernel-level receive timestamps.
     /// When enabled, connections use `RecvMsgMulti` instead of `RecvMulti`
     /// to receive ancillary data containing kernel RX timestamps.
@@ -347,6 +352,7 @@ impl Default for Config {
             tls: None,
             tls_client: None,
             tcp_nodelay: true,
+            loop_diag: false,
             #[cfg(feature = "timestamps")]
             timestamps: false,
             max_chain_length: 16,
@@ -672,6 +678,20 @@ impl ConfigBuilder {
     /// Enable or disable TCP_NODELAY on all connections.
     pub fn tcp_nodelay(mut self, enable: bool) -> Self {
         self.config.tcp_nodelay = enable;
+        self
+    }
+
+    // ── Diagnostics ──────────────────────────────────────────────────
+
+    /// Print per-worker event-loop diagnostics to stderr at shutdown.
+    ///
+    /// Each worker prints a `[ringline diag]` line (iteration mix: dead
+    /// iterations, CQEs and tasks per iteration, parks, fallbacks) and a
+    /// `[ringline stall]` line (wait/work stall buckets). Recording the
+    /// stall buckets costs ~4 clock reads per iteration, so this is off by
+    /// default. io_uring backend only; the mio backend prints nothing.
+    pub fn loop_diag(mut self, enable: bool) -> Self {
+        self.config.loop_diag = enable;
         self
     }
 
@@ -1015,6 +1035,13 @@ mod tests {
         Config::default()
             .validate()
             .expect("default config should be valid");
+    }
+
+    #[test]
+    fn loop_diag_defaults_off_and_builder_enables_it() {
+        assert!(!Config::default().loop_diag);
+        let c = ConfigBuilder::new().loop_diag(true).build().unwrap();
+        assert!(c.loop_diag);
     }
 
     #[test]

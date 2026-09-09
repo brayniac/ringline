@@ -311,6 +311,8 @@ pub(crate) struct Driver {
     pub(crate) region_rx: crate::region_registry::RegionControlRx,
     /// Whether to set TCP_NODELAY on connections.
     pub(crate) tcp_nodelay: bool,
+    /// Print event-loop diagnostics at shutdown (Config::loop_diag).
+    pub(crate) loop_diag: bool,
     /// Guard sends below this total length fall back to copy (0 = always ZC).
     pub(crate) send_zc_threshold: u32,
     /// Aggregate low-water reserve for segmented recv (Config::recv_segment_reserve).
@@ -625,6 +627,7 @@ impl Driver {
             connect_timespecs,
             cqe_batch: Vec::with_capacity(config.sq_entries as usize * 4),
             tcp_nodelay: config.tcp_nodelay,
+            loop_diag: config.loop_diag,
             send_zc_threshold: config.send_zc_threshold,
             recv_segment_reserve: config.recv_segment_reserve,
             recv_accumulator_max: config.recv_accumulator_max,

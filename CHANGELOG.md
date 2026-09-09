@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `ConfigBuilder::loop_diag(bool)` (default off): gates the per-worker
+  `[ringline diag]` / `[ringline stall]` shutdown lines on the io_uring
+  backend. Replaces the `RINGLINE_LOOP_DIAG` environment variable, and the
+  `[ringline diag]` line is no longer printed unconditionally.
+
 - `tls-unbuffered` cargo feature (default off): drives TLS through rustls'
   unbuffered record layer (`UnbufferedConnectionCommon` /
   `WriteTraffic::encrypt`) instead of the buffered `writer()`/`write_tls()`
