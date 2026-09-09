@@ -10,7 +10,7 @@ use crate::backend::ProvidedBufRing;
 use crate::buffer::fixed::FixedBufferRegistry;
 use crate::completion::{OpTag, UserData};
 use crate::config::Config;
-use crate::error::Error;
+use crate::error::{Error, MemlockLimit, describe_buffer_registration_failure, errno_name};
 use crate::nvme::{NVME_URING_CMD_IO, NvmeUringCmd};
 
 /// Wrapper around IoUring providing high-level SQE submission helpers.
@@ -80,13 +80,21 @@ impl Ring {
     ///
     /// The sparse path lets us add and remove regions dynamically after
     /// launch without re-registering the entire table.
-    pub fn register_buffers(&self, registry: &FixedBufferRegistry) -> io::Result<()> {
+    ///
+    /// Failures come back as [`Error::BufferRegistration`] naming the cause;
+    /// `ENOMEM` is the `RLIMIT_MEMLOCK` limit in practice.
+    pub fn register_buffers(&self, registry: &FixedBufferRegistry) -> Result<(), Error> {
         let iovecs = registry.iovecs();
         if iovecs.is_empty() {
             return Ok(());
         }
+        let total: u64 = iovecs.iter().map(|iov| iov.iov_len as u64).sum();
+        let attribute =
+            |e: io::Error| Error::buffer_registration(e, total, MemlockLimit::read().ok().as_ref());
         let submitter = self.ring.submitter();
-        submitter.register_buffers_sparse(iovecs.len() as u32)?;
+        submitter
+            .register_buffers_sparse(iovecs.len() as u32)
+            .map_err(attribute)?;
 
         // Apply each occupied slot. Empty slots stay zeroed in the kernel.
         for (slot, iov) in iovecs.iter().enumerate() {
@@ -96,7 +104,9 @@ impl Ring {
             // Safety: the iovec points at user memory documented to outlive
             // the runtime; tags are unused.
             unsafe {
-                submitter.register_buffers_update(slot as u32, std::slice::from_ref(iov), None)?;
+                submitter
+                    .register_buffers_update(slot as u32, std::slice::from_ref(iov), None)
+                    .map_err(attribute)?;
             }
         }
         Ok(())
@@ -117,18 +127,40 @@ impl Ring {
         iov: libc::iovec,
     ) -> io::Result<()> {
         unsafe {
-            self.ring.submitter().register_buffers_update(
-                slot as u32,
-                std::slice::from_ref(&iov),
-                None,
-            )?;
+            self.ring
+                .submitter()
+                .register_buffers_update(slot as u32, std::slice::from_ref(&iov), None)
+                .map_err(|e| {
+                    // Surfaces to the caller of `ShutdownHandle::register_region`
+                    // as an `io::Error`; keep the kind, replace the bare
+                    // "Cannot allocate memory" with the memlock guidance.
+                    let text = describe_buffer_registration_failure(
+                        &e,
+                        iov.iov_len as u64,
+                        MemlockLimit::read().ok().as_ref(),
+                    );
+                    io::Error::new(e.kind(), text)
+                })?;
         }
         Ok(())
     }
 
     /// Register a sparse file table for direct descriptors.
-    pub fn register_files_sparse(&self, count: u32) -> io::Result<()> {
-        self.ring.submitter().register_files_sparse(count)?;
+    ///
+    /// The kernel sizes this table against `RLIMIT_NOFILE`, so `EMFILE`
+    /// means the limit, not fd exhaustion, and is reported as such.
+    pub fn register_files_sparse(&self, count: u32) -> Result<(), Error> {
+        self.ring
+            .submitter()
+            .register_files_sparse(count)
+            .map_err(|e| match e.raw_os_error() {
+                Some(libc::EMFILE | libc::ENFILE) => Error::ResourceLimit(format!(
+                    "RLIMIT_NOFILE too low for the fixed file table: io_uring refused \
+                     {count} entries ({e}). Raise it with `ulimit -n` to at least \
+                     {count} plus overhead, or lower ConfigBuilder::max_connections"
+                )),
+                _ => Error::Io(e),
+            })?;
         Ok(())
     }
 
@@ -139,15 +171,30 @@ impl Ring {
     }
 
     /// Register the provided buffer ring with the kernel.
-    pub fn register_buf_ring(&self, provided: &ProvidedBufRing) -> io::Result<()> {
+    pub fn register_buf_ring(&self, provided: &ProvidedBufRing) -> Result<(), Error> {
         // Safety: ring_addr points to valid mmap'd memory that outlives the registration.
         unsafe {
-            self.ring.submitter().register_buf_ring_with_flags(
-                provided.ring_addr(),
-                provided.ring_entries() as u16,
-                provided.bgid(),
-                0,
-            )?;
+            self.ring
+                .submitter()
+                .register_buf_ring_with_flags(
+                    provided.ring_addr(),
+                    provided.ring_entries() as u16,
+                    provided.bgid(),
+                    0,
+                )
+                .map_err(|e| {
+                    let name = errno_name(&e)
+                        .map(|n| format!(" ({n})"))
+                        .unwrap_or_default();
+                    Error::BufferRegistration(format!(
+                        "provided buffer ring (bgid {}, {} entries): {e}{name}. \
+                         EINVAL here usually means a kernel older than 5.19 or a \
+                         ring size that is not a power of two; ENOMEM means the \
+                         kernel could not pin the ring pages",
+                        provided.bgid(),
+                        provided.ring_entries()
+                    ))
+                })?;
         }
         Ok(())
     }

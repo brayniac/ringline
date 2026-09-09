@@ -10,13 +10,13 @@ use thiserror::Error;
 /// |-------|-------|----------|
 /// | `Io` | System call failure | Check `io::ErrorKind`; transient network errors may be retryable |
 /// | `RingSetup` | io_uring refused or unsupported | Read the message: it names the sysctl/seccomp/kernel cause; or build with the `force-mio` feature |
-/// | `BufferRegistration` | `mmap()` or io_uring registration failed | Check system memory limits (`ulimit -v`) |
+/// | `BufferRegistration` | io_uring refused to register memory | `ENOMEM` is `RLIMIT_MEMLOCK`: raise with `ulimit -l` / `LimitMEMLOCK=`, or grant `CAP_IPC_LOCK`; `EFAULT` is a bad region pointer |
 /// | `ConnectionLimitReached` | All connection slots in use | Increase via `ConfigBuilder::max_connections(...)` or close idle connections |
 /// | `InvalidConnection` | Stale token, connection closed | Re-establish connection; do not reuse the `ConnCtx` |
 /// | `SendPoolExhausted` | All send buffer slots in use | Await pending sends to complete before sending more |
 /// | `InvalidRegion` | Region ID not registered | Check `MemoryRegion` registration; ensure region outlives usage |
 /// | `PointerOutOfRegion` | SendGuard pointer outside registered region | Verify pointer arithmetic; region boundaries are strict |
-/// | `ResourceLimit` | `RLIMIT_NOFILE` too low | Increase with `ulimit -n` (recommended: 65536+) |
+/// | `ResourceLimit` | `RLIMIT_NOFILE` or `RLIMIT_MEMLOCK` too low for the config | The message names the limit and the `ulimit` to run; checked before any worker starts |
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum Error {
@@ -47,10 +47,21 @@ pub enum Error {
     #[error("ring setup: {0}")]
     RingSetup(String),
 
-    /// Buffer registration with io_uring failed.
+    /// io_uring refused to register memory: fixed buffers
+    /// ([`ConfigBuilder::registered_regions`](crate::ConfigBuilder::registered_regions))
+    /// or a provided buffer ring.
     ///
-    /// This typically indicates a system resource limit (memory, VMAs) or
-    /// an invalid registration request. Check `ulimit -v` for virtual memory limits.
+    /// The message names the errno and the cause. `ENOMEM` on fixed buffers
+    /// is the `RLIMIT_MEMLOCK` limit in practice: io_uring pins registered
+    /// buffers and charges them to the caller's memlock limit unless the
+    /// process holds `CAP_IPC_LOCK`, and distros default the limit to 8 MiB
+    /// or 64 MiB. Raise it with `ulimit -l` (or `LimitMEMLOCK=` in a systemd
+    /// unit) or grant the capability. Regions in the startup config are
+    /// checked against the limit before any worker starts and reported as
+    /// [`Error::ResourceLimit`]; regions added later through
+    /// [`ShutdownHandle::register_region`](crate::ShutdownHandle::register_region)
+    /// report the same guidance as an `io::Error`. `EFAULT` means the
+    /// `MemoryRegion` pointer or length does not describe mapped memory.
     #[error("buffer registration: {0}")]
     BufferRegistration(String),
 
@@ -104,13 +115,17 @@ pub enum Error {
     #[error("pointer not within registered region")]
     PointerOutOfRegion,
 
-    /// System resource limit is too low.
+    /// A process resource limit is too low for this configuration.
     ///
-    /// Ringline requires sufficient file descriptors for connections.
-    /// The default `RLIMIT_NOFILE` (often 1024) is insufficient for
-    /// high-concurrency workloads.
-    ///
-    /// Set before running: `ulimit -n 65536` or higher.
+    /// Checked in `launch` before any worker thread exists, and the soft
+    /// limit is raised automatically when the hard limit allows; this error
+    /// means the hard limit itself is too low and names the `ulimit` to run.
+    /// - `RLIMIT_NOFILE`: connections need file descriptors (or fixed-file
+    ///   table entries on io_uring); the default 1024 is too low for
+    ///   high-concurrency workloads. `ulimit -n 65536` or higher.
+    /// - `RLIMIT_MEMLOCK` (io_uring): fixed buffers from
+    ///   [`ConfigBuilder::registered_regions`](crate::ConfigBuilder::registered_regions)
+    ///   are pinned against it. `ulimit -l <KiB>`, or `CAP_IPC_LOCK`.
     #[error("{0}")]
     ResourceLimit(String),
 }
@@ -155,7 +170,7 @@ const MIO_HINT: &str = "or build with the `force-mio` cargo feature \
 /// Name an errno the way strace and the man pages do, so the message can
 /// be searched for. `None` for non-OS errors.
 #[cfg(any(has_io_uring, test))]
-fn errno_name(err: &io::Error) -> Option<&'static str> {
+pub(crate) fn errno_name(err: &io::Error) -> Option<&'static str> {
     Some(match err.raw_os_error()? {
         libc::EPERM => "EPERM",
         libc::ENOSYS => "ENOSYS",
@@ -255,6 +270,135 @@ impl Error {
 
     pub(crate) fn ring_setup_with_probe(err: io::Error, probe: &RingSetupProbe) -> Self {
         Error::RingSetup(describe_ring_setup_failure(&err, probe))
+    }
+}
+
+/// The process's `RLIMIT_MEMLOCK`, in bytes. io_uring charges registered
+/// (fixed) buffers against it unless the process holds `CAP_IPC_LOCK`, and
+/// distros default it to 8 MiB or 64 MiB, so a large `registered_regions`
+/// config is the usual way to hit it.
+#[cfg(any(has_io_uring, test))]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MemlockLimit {
+    pub(crate) soft: u64,
+    pub(crate) hard: u64,
+}
+
+#[cfg(has_io_uring)]
+impl MemlockLimit {
+    pub(crate) fn read() -> io::Result<Self> {
+        let mut rlim: libc::rlimit = unsafe { std::mem::zeroed() };
+        if unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut rlim) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self {
+            soft: rlim.rlim_cur,
+            hard: rlim.rlim_max,
+        })
+    }
+}
+
+/// What to do about `RLIMIT_MEMLOCK` before registering `required` bytes.
+#[cfg(any(has_io_uring, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MemlockPlan {
+    Sufficient,
+    /// The soft limit is short but the hard limit allows raising it to this.
+    RaiseSoftTo(u64),
+    HardTooLow,
+}
+
+#[cfg(any(has_io_uring, test))]
+pub(crate) fn memlock_plan(required: u64, limit: &MemlockLimit) -> MemlockPlan {
+    if required == 0 || limit.soft >= required {
+        MemlockPlan::Sufficient
+    } else if limit.hard == libc::RLIM_INFINITY || limit.hard >= required {
+        MemlockPlan::RaiseSoftTo(required)
+    } else {
+        MemlockPlan::HardTooLow
+    }
+}
+
+#[cfg(any(has_io_uring, test))]
+fn kib_ceil(bytes: u64) -> u64 {
+    bytes.div_ceil(1024)
+}
+
+#[cfg(any(has_io_uring, test))]
+fn rlim_kib(v: u64) -> String {
+    if v == libc::RLIM_INFINITY {
+        "unlimited".to_string()
+    } else {
+        format!("{} KiB", kib_ceil(v))
+    }
+}
+
+/// The shortfall message shared by the launch-time preflight and a failed
+/// registration. `what` names the memory being pinned ("2 registered regions").
+#[cfg(any(has_io_uring, test))]
+pub(crate) fn describe_memlock_shortfall(
+    required: u64,
+    limit: &MemlockLimit,
+    what: &str,
+) -> String {
+    format!(
+        "RLIMIT_MEMLOCK too low: {what} need {} KiB of pinned memory but the \
+         hard limit is {} (soft {}). Raise it with `ulimit -l {}` before \
+         starting (or `LimitMEMLOCK=` in the systemd unit), or grant the \
+         process CAP_IPC_LOCK, which exempts it from the limit.",
+        kib_ceil(required),
+        rlim_kib(limit.hard),
+        rlim_kib(limit.soft),
+        kib_ceil(required),
+    )
+}
+
+/// Turn a failed `io_uring_register` of `bytes` of user memory into a message
+/// that names the cause. `ENOMEM` here is the memlock limit in practice; the
+/// kernel returns it rather than `EPERM` when the accounting fails.
+#[cfg(any(has_io_uring, test))]
+pub(crate) fn describe_buffer_registration_failure(
+    err: &io::Error,
+    bytes: u64,
+    limit: Option<&MemlockLimit>,
+) -> String {
+    let mut msg = format!("io_uring_register(2) of {} KiB: {err}", kib_ceil(bytes));
+    if let Some(name) = errno_name(err) {
+        msg.push_str(&format!(" ({name})"));
+    }
+    msg.push_str(". ");
+    match err.raw_os_error() {
+        Some(libc::ENOMEM) => match limit {
+            Some(limit) => msg.push_str(&describe_memlock_shortfall(
+                bytes,
+                limit,
+                "the buffers being registered",
+            )),
+            None => msg.push_str(
+                "The kernel refused to pin this much memory, which is the \
+                 RLIMIT_MEMLOCK limit in practice. Raise it with `ulimit -l` \
+                 (or `LimitMEMLOCK=` in the systemd unit), or grant the process \
+                 CAP_IPC_LOCK.",
+            ),
+        },
+        Some(libc::EFAULT) => msg.push_str(
+            "The region is not mapped in this process: the pointer or length \
+             passed to MemoryRegion::new is wrong, or the memory was freed.",
+        ),
+        _ => {}
+    }
+    msg
+}
+
+#[cfg(any(has_io_uring, test))]
+impl Error {
+    /// Wrap a failed buffer registration as [`Error::BufferRegistration`].
+    pub(crate) fn buffer_registration(
+        err: io::Error,
+        bytes: u64,
+        limit: Option<&MemlockLimit>,
+    ) -> Self {
+        Error::BufferRegistration(describe_buffer_registration_failure(&err, bytes, limit))
     }
 }
 
@@ -405,5 +549,112 @@ mod tests {
         let text = describe_ring_setup_failure(&err, &probe(None, None));
         assert!(text.starts_with("io_uring_setup(2): boom"), "{text}");
         assert!(!text.contains("()"), "{text}");
+    }
+
+    const MIB: u64 = 1024 * 1024;
+
+    fn limit(soft: u64, hard: u64) -> MemlockLimit {
+        MemlockLimit { soft, hard }
+    }
+
+    #[test]
+    fn memlock_plan_nothing_required_is_sufficient() {
+        assert!(matches!(
+            memlock_plan(0, &limit(0, 0)),
+            MemlockPlan::Sufficient
+        ));
+    }
+
+    #[test]
+    fn memlock_plan_soft_covers_it() {
+        assert!(matches!(
+            memlock_plan(8 * MIB, &limit(8 * MIB, 8 * MIB)),
+            MemlockPlan::Sufficient
+        ));
+    }
+
+    #[test]
+    fn memlock_plan_raises_soft_when_hard_allows() {
+        assert!(matches!(
+            memlock_plan(32 * MIB, &limit(8 * MIB, 64 * MIB)),
+            MemlockPlan::RaiseSoftTo(v) if v == 32 * MIB
+        ));
+    }
+
+    #[test]
+    fn memlock_plan_raises_soft_under_infinite_hard() {
+        assert!(matches!(
+            memlock_plan(32 * MIB, &limit(8 * MIB, libc::RLIM_INFINITY)),
+            MemlockPlan::RaiseSoftTo(v) if v == 32 * MIB
+        ));
+    }
+
+    #[test]
+    fn memlock_plan_hard_too_low() {
+        assert!(matches!(
+            memlock_plan(65 * MIB, &limit(8 * MIB, 64 * MIB)),
+            MemlockPlan::HardTooLow
+        ));
+    }
+
+    #[test]
+    fn memlock_shortfall_names_limit_fix_and_exemption() {
+        let text = describe_memlock_shortfall(
+            5 * MIB + 1,
+            &limit(8 * MIB, 8 * MIB),
+            "2 registered regions",
+        );
+        assert!(text.contains("RLIMIT_MEMLOCK too low"), "{text}");
+        assert!(text.contains("2 registered regions"), "{text}");
+        // 5 MiB + 1 byte rounds up to 5121 KiB for `ulimit -l`.
+        assert!(text.contains("ulimit -l 5121"), "{text}");
+        assert!(text.contains("hard limit is 8192 KiB"), "{text}");
+        assert!(text.contains("CAP_IPC_LOCK"), "{text}");
+    }
+
+    #[test]
+    fn memlock_shortfall_prints_infinite_hard_as_unlimited() {
+        let text =
+            describe_memlock_shortfall(MIB, &limit(0, libc::RLIM_INFINITY), "1 registered region");
+        assert!(text.contains("hard limit is unlimited"), "{text}");
+    }
+
+    #[test]
+    fn enomem_on_buffer_registration_blames_memlock() {
+        let err = io::Error::from_raw_os_error(libc::ENOMEM);
+        let e = Error::buffer_registration(err, 4 * MIB, Some(&limit(64 * 1024, 64 * 1024)));
+        assert!(matches!(e, Error::BufferRegistration(_)), "got {e:?}");
+        let text = e.to_string();
+        assert!(text.starts_with("buffer registration: "), "{text}");
+        assert!(text.contains("ENOMEM"), "{text}");
+        assert!(text.contains("RLIMIT_MEMLOCK"), "{text}");
+        assert!(text.contains("4096 KiB"), "{text}");
+        assert!(text.contains("ulimit -l"), "{text}");
+        assert!(text.contains("CAP_IPC_LOCK"), "{text}");
+    }
+
+    #[test]
+    fn enomem_without_a_readable_limit_still_blames_memlock() {
+        let err = io::Error::from_raw_os_error(libc::ENOMEM);
+        let text = describe_buffer_registration_failure(&err, 4 * MIB, None);
+        assert!(text.contains("RLIMIT_MEMLOCK"), "{text}");
+        assert!(text.contains("ulimit -l"), "{text}");
+    }
+
+    #[test]
+    fn efault_on_buffer_registration_blames_the_pointer() {
+        let err = io::Error::from_raw_os_error(libc::EFAULT);
+        let text = describe_buffer_registration_failure(&err, 4096, None);
+        assert!(text.contains("EFAULT"), "{text}");
+        assert!(text.contains("not mapped"), "{text}");
+        assert!(!text.contains("RLIMIT_MEMLOCK"), "{text}");
+    }
+
+    #[test]
+    fn other_buffer_registration_errors_keep_the_os_message() {
+        let err = io::Error::from_raw_os_error(libc::EINVAL);
+        let text = describe_buffer_registration_failure(&err, 4096, None);
+        assert!(text.contains("EINVAL"), "{text}");
+        assert!(!text.contains("RLIMIT_MEMLOCK"), "{text}");
     }
 }

@@ -4223,10 +4223,47 @@ mod tests {
                 region_rx,
             ) {
                 Ok(el) => return el,
-                Err(e) if attempts < 10 => {
+                // Transient: another test binary may hold the memory or fds
+                // this one needs for a moment. Retry, briefly.
+                Err(crate::error::Error::Io(ref io))
+                    if attempts < 10
+                        && matches!(
+                            io.raw_os_error(),
+                            Some(libc::ENOMEM | libc::EAGAIN | libc::EMFILE | libc::ENFILE)
+                        ) =>
+                {
                     attempts += 1;
-                    let _ = e;
                     std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                // Structural: io_uring is refused or unsupported on this host
+                // (kernel.io_uring_disabled, seccomp, an old kernel, a limit).
+                // Every test in this binary would fail the same way, so say it
+                // once and stop the binary instead of reporting it 134 times.
+                // Written straight to fd 2: libtest captures the print macros
+                // and would discard the message on process exit.
+                Err(
+                    e @ (crate::error::Error::RingSetup(_)
+                    | crate::error::Error::ResourceLimit(_)
+                    | crate::error::Error::BufferRegistration(_)),
+                ) => {
+                    use std::io::Write;
+                    use std::sync::atomic::{AtomicBool, Ordering};
+                    // Tests run in parallel; several can reach this arm before
+                    // the first one's exit lands. Only the first writes.
+                    static REPORTED: AtomicBool = AtomicBool::new(false);
+                    if !REPORTED.swap(true, Ordering::SeqCst) {
+                        let msg = format!(
+                            "\nringline: cannot create the test event loop on this host, \
+                             aborting the test binary so this is reported once:\n  {e}\n\n"
+                        );
+                        let _ = std::io::stderr().write_all(msg.as_bytes());
+                        std::process::exit(101);
+                    }
+                    // Another thread is exiting the process; block until it does
+                    // rather than reporting the same failure again.
+                    loop {
+                        std::thread::park();
+                    }
                 }
                 Err(e) => {
                     panic!("failed to create test event loop after {attempts} retries: {e:?}")

@@ -633,6 +633,8 @@ impl RinglineBuilder {
         };
 
         ensure_nofile_limit(self.config.max_connections, num_threads)?;
+        #[cfg(has_io_uring)]
+        ensure_memlock_limit(&self.config)?;
 
         crate::metrics::init_metadata();
 
@@ -1018,6 +1020,53 @@ fn ensure_nofile_limit(
              Raise it with: ulimit -n {}",
             required, hard, soft, required
         )))
+    }
+}
+
+/// Make sure `RLIMIT_MEMLOCK` covers the fixed buffers `Driver::new` will
+/// register, before any worker thread exists.
+///
+/// io_uring charges registered buffers against the memlock limit unless the
+/// process holds `CAP_IPC_LOCK`; distros default it to 8 MiB or 64 MiB, and
+/// the kernel reports the shortfall as a bare `ENOMEM`. Like the nofile
+/// check, this raises the soft limit when the hard limit allows and otherwise
+/// fails with the fix spelled out. Regions registered later through
+/// `ShutdownHandle::register_region` are checked at that call instead.
+#[cfg(has_io_uring)]
+fn ensure_memlock_limit(config: &Config) -> Result<(), crate::error::Error> {
+    use crate::error::{MemlockLimit, MemlockPlan, describe_memlock_shortfall, memlock_plan};
+
+    if config.registered_regions.is_empty() {
+        return Ok(());
+    }
+    // Pinning is per page, and a region that does not start on a page
+    // boundary pins one more than its length suggests.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as u64;
+    let required: u64 = config
+        .registered_regions
+        .iter()
+        .map(|r| (r.len() as u64).div_ceil(page) * page + page)
+        .sum();
+    let limit = MemlockLimit::read().map_err(crate::error::Error::Io)?;
+    match memlock_plan(required, &limit) {
+        MemlockPlan::Sufficient => Ok(()),
+        MemlockPlan::RaiseSoftTo(soft) => {
+            let rlim = libc::rlimit {
+                rlim_cur: soft,
+                rlim_max: limit.hard,
+            };
+            if unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &rlim) } != 0 {
+                return Err(crate::error::Error::Io(io::Error::last_os_error()));
+            }
+            Ok(())
+        }
+        MemlockPlan::HardTooLow => Err(crate::error::Error::ResourceLimit(
+            describe_memlock_shortfall(
+                required,
+                &limit,
+                &format!("{} registered region(s)", config.registered_regions.len()),
+            ),
+        )),
     }
 }
 
