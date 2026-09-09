@@ -4,175 +4,20 @@ on:
   push:
     branches: [main]
 
-env:
-  CARGO_TERM_COLOR: always
-
 jobs:
   tag-release:
-    name: Tag release
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      pull-requests: write
-    # Run on commits starting with "release: " (workspace or per-crate)
-    if: "startsWith(github.event.head_commit.message, 'release: ')"
-
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
-          token: ${{ secrets.RELEASE_TOKEN }}
-
-      - name: Configure git
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-      - name: Parse release type
-        id: parse
-        env:
-          # Pass the commit message through the environment, NOT via ${{ }}
-          # interpolation into the script body. GitHub substitutes ${{ }} as
-          # raw text before the shell runs, so a release commit whose body
-          # contains backticks, $(...), or quotes gets executed as shell. A
-          # `release: v0.5.1` body with `ringline` in backticks did exactly
-          # that and killed this step with `ringline: command not found`
-          # (exit 127), so the tag was never created. As an env var the value
-          # is inert data that the regex below matches against safely.
-          MSG: ${{ github.event.head_commit.message }}
-        run: |
-          echo "Commit message: $MSG"
-
-          if [[ "$MSG" =~ ^release:\ v([0-9]+\.[0-9]+\.[0-9]+) ]]; then
-            # Full workspace release: "release: v0.1.0"
-            echo "mode=workspace" >> $GITHUB_OUTPUT
-            echo "version=${BASH_REMATCH[1]}" >> $GITHUB_OUTPUT
-            echo "tag=v${BASH_REMATCH[1]}" >> $GITHUB_OUTPUT
-            echo "Detected workspace release: v${BASH_REMATCH[1]}"
-          elif [[ "$MSG" =~ ^release:\ ([a-z0-9-]+)\ v([0-9]+\.[0-9]+\.[0-9]+) ]]; then
-            # Per-crate release: "release: ringline-redis v0.2.1"
-            echo "mode=crate" >> $GITHUB_OUTPUT
-            echo "crate=${BASH_REMATCH[1]}" >> $GITHUB_OUTPUT
-            echo "version=${BASH_REMATCH[2]}" >> $GITHUB_OUTPUT
-            echo "tag=${BASH_REMATCH[1]}-v${BASH_REMATCH[2]}" >> $GITHUB_OUTPUT
-            echo "Detected crate release: ${BASH_REMATCH[1]} v${BASH_REMATCH[2]}"
-          else
-            echo "mode=none" >> $GITHUB_OUTPUT
-            echo "Commit message does not match release pattern, skipping"
-          fi
-
-      - name: Verify version matches Cargo.toml
-        if: steps.parse.outputs.mode != 'none'
-        run: |
-          MODE="${{ steps.parse.outputs.mode }}"
-          VERSION="${{ steps.parse.outputs.version }}"
-
-          if [ "$MODE" = "workspace" ]; then
-            CARGO_VERSION=$(grep '^version = ' ringline/Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
-            CRATE_PATH="ringline/Cargo.toml"
-          else
-            CRATE="${{ steps.parse.outputs.crate }}"
-            CRATE_PATH="${CRATE}/Cargo.toml"
-            CARGO_VERSION=$(grep '^version = ' "$CRATE_PATH" | head -1 | sed 's/version = "\(.*\)"/\1/')
-          fi
-
-          if [ "$CARGO_VERSION" != "$VERSION" ]; then
-            echo "ERROR: Tag version $VERSION does not match $CRATE_PATH version $CARGO_VERSION"
-            exit 1
-          fi
-          echo "Version $VERSION matches $CRATE_PATH"
-
-      - name: Check if tag exists
-        id: check_tag
-        if: steps.parse.outputs.mode != 'none'
-        run: |
-          TAG="${{ steps.parse.outputs.tag }}"
-          if git rev-parse "$TAG" >/dev/null 2>&1; then
-            echo "exists=true" >> $GITHUB_OUTPUT
-            echo "Tag $TAG already exists"
-          else
-            echo "exists=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Create and push tag
-        if: steps.parse.outputs.mode != 'none' && steps.check_tag.outputs.exists == 'false'
-        run: |
-          TAG="${{ steps.parse.outputs.tag }}"
-          git tag -a "$TAG" -m "Release $TAG"
-          git push origin "$TAG"
-          echo "Created and pushed tag $TAG"
-
-      - name: Bump to next dev version (workspace only)
-        if: steps.parse.outputs.mode == 'workspace' && steps.check_tag.outputs.exists == 'false'
-        env:
-          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
-        run: |
-          VERSION="${{ steps.parse.outputs.version }}"
-          IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
-          NEXT_DEV="${MAJOR}.${MINOR}.$((PATCH + 1))"
-          echo "Bumping to next dev version: $NEXT_DEV"
-
-          BRANCH="chore/bump-${NEXT_DEV}"
-          git checkout -b "$BRANCH"
-
-          # Only bump ringline/Cargo.toml. The workspace dep uses a semver
-          # range (e.g., "0.1") so it doesn't need updating for patch bumps.
-          sed -i "0,/^version = \"${VERSION}\"/s//version = \"${NEXT_DEV}\"/" ringline/Cargo.toml
-
-          # CI runs --locked against the committed Cargo.lock; refresh the
-          # workspace members' own entries or the bump PR is born red.
-          cargo update --workspace
-
-          git add ringline/Cargo.toml Cargo.lock
-          git commit -m "chore: bump to ${NEXT_DEV} for next development iteration"
-          git push origin "$BRANCH"
-
-          gh pr create \
-            --title "chore: bump to ${NEXT_DEV} for next development iteration" \
-            --body "Automated version bump after v${VERSION} release." \
-            --base main \
-            --head "$BRANCH"
-
-      - name: Bump to next dev version (per-crate)
-        if: steps.parse.outputs.mode == 'crate' && steps.check_tag.outputs.exists == 'false'
-        env:
-          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
-        run: |
-          CRATE="${{ steps.parse.outputs.crate }}"
-          VERSION="${{ steps.parse.outputs.version }}"
-          IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
-          NEXT_PATCH="${MAJOR}.${MINOR}.$((PATCH + 1))"
-          echo "Bumping $CRATE to next patch version: $NEXT_PATCH"
-
-          BRANCH="chore/bump-${CRATE}-${NEXT_PATCH}"
-          git checkout -b "$BRANCH"
-
-          sed -i "0,/^version = \"${VERSION}\"/s//version = \"${NEXT_PATCH}\"/" "${CRATE}/Cargo.toml"
-
-          # CI runs --locked against the committed Cargo.lock; refresh the
-          # workspace members' own entries or the bump PR is born red.
-          cargo update --workspace
-
-          git add "${CRATE}/Cargo.toml" Cargo.lock
-          git commit -m "chore: bump ${CRATE} to ${NEXT_PATCH} for next development iteration"
-          git push origin "$BRANCH"
-
-          gh pr create \
-            --title "chore: bump ${CRATE} to ${NEXT_PATCH}" \
-            --body "Automated version bump after ${CRATE} v${VERSION} release." \
-            --base main \
-            --head "$BRANCH"
-
-      - name: Summary
-        if: steps.parse.outputs.mode != 'none'
-        run: |
-          echo "## Release Tagged" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          if [ "${{ steps.check_tag.outputs.exists }}" == "true" ]; then
-            echo "Tag ${{ steps.parse.outputs.tag }} already existed, skipped." >> $GITHUB_STEP_SUMMARY
-          else
-            echo "- Created tag: ${{ steps.parse.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
-            echo "- Mode: ${{ steps.parse.outputs.mode }}" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "The release workflow will now build and publish." >> $GITHUB_STEP_SUMMARY
-          fi
+    uses: brayniac/rust-workflows/.github/workflows/tag-release.yml@v1
+    secrets: inherit
+    with:
+      # The root is a virtual manifest; the core crate carries the released
+      # version and its tag is `vX.Y.Z`.
+      version-manifest: ringline/Cargo.toml
+      # Forks run this on their own `main` too; only the upstream repo tags.
+      only-repository: ringline-rs/ringline
+      # The shared workflow's dev bump runs `cargo release version` across the
+      # whole workspace, which would drag the satellite crates (redis,
+      # memcache, the unpublished tools) to the core version — a downgrade for
+      # some — and a `-alpha.0` core does not satisfy the workspace's
+      # `ringline = "0.6"` path requirement. Bump by hand in the release PR
+      # until the shared workflow supports a package-scoped bare-patch bump.
+      dev-bump: none
