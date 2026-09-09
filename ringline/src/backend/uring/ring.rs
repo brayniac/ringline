@@ -10,6 +10,7 @@ use crate::backend::ProvidedBufRing;
 use crate::buffer::fixed::FixedBufferRegistry;
 use crate::completion::{OpTag, UserData};
 use crate::config::Config;
+use crate::error::Error;
 use crate::nvme::{NVME_URING_CMD_IO, NvmeUringCmd};
 
 /// Wrapper around IoUring providing high-level SQE submission helpers.
@@ -37,7 +38,11 @@ pub struct Ring {
 
 impl Ring {
     /// Create and configure the io_uring instance.
-    pub fn setup(config: &Config) -> io::Result<Self> {
+    ///
+    /// Returns [`Error::RingSetup`] rather than `Error::Io` so a refused
+    /// `io_uring_setup(2)` names the subsystem and, for `EPERM`, the
+    /// `kernel.io_uring_disabled` sysctl or seccomp profile behind it.
+    pub fn setup(config: &Config) -> Result<Self, Error> {
         let cq_entries = config
             .sq_entries
             .checked_mul(4)
@@ -58,7 +63,9 @@ impl Ring {
             builder.setup_defer_taskrun();
         }
 
-        let ring = builder.build(config.sq_entries)?;
+        let ring = builder
+            .build(config.sq_entries)
+            .map_err(Error::ring_setup)?;
 
         Ok(Ring {
             ring,

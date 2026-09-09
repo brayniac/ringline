@@ -119,13 +119,20 @@
 //!
 //! # Platform
 //!
-//! With `io-uring` feature (default): Linux 6.0+. Requires io_uring with
-//! multishot recv, ring-provided buffers, SendMsgZc, and fixed file table
-//! support.
+//! The backend is selected at build time by `build.rs`: a Linux host whose
+//! kernel is 6.0+ gets the io_uring backend, everything else gets mio.
 //!
-//! With `--no-default-features`: mio backend, works on Linux and macOS.
-//! NVMe passthrough and zero-copy sends are not available. Direct I/O and
-//! filesystem operations are supported via a dedicated thread pool.
+//! io_uring backend: Linux 6.0+. Requires io_uring with multishot recv,
+//! ring-provided buffers, SendMsgZc, and fixed file table support. If the
+//! kernel or a seccomp profile refuses `io_uring_setup(2)`, launch fails
+//! with [`Error::RingSetup`] naming the cause (for example the
+//! `kernel.io_uring_disabled` sysctl).
+//!
+//! mio backend: works on Linux and macOS; forced on Linux with the
+//! `force-mio` cargo feature (`--features ringline/force-mio` from a
+//! dependent crate). NVMe passthrough and zero-copy sends are not
+//! available. Direct I/O and filesystem operations are supported via a
+//! dedicated thread pool.
 
 // ── Internal modules ────────────────────────────────────────────────────
 pub(crate) mod acceptor;
