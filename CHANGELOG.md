@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- `RLIMIT_MEMLOCK` too low for `registered_regions` used to surface as a bare
+  `Cannot allocate memory` from the kernel (io_uring pins fixed buffers against
+  the memlock limit unless the process holds `CAP_IPC_LOCK`; distros default it
+  to 8 MiB or 64 MiB). `launch` now checks the limit before any worker starts,
+  raises the soft limit when the hard limit allows, and otherwise returns
+  `Error::ResourceLimit` naming the shortfall in KiB, the `ulimit -l` /
+  `LimitMEMLOCK=` fix, and the capability exemption. A region added later via
+  `ShutdownHandle::register_region` gets the same guidance as an `io::Error`.
+  Every kernel registration in driver setup (fixed buffers, the fixed file
+  table, provided buffer rings) now reports `Error::BufferRegistration` /
+  `Error::ResourceLimit` with the cause instead of `Error::Io`; the
+  `BufferRegistration` variant was previously never constructed.
+
+- io_uring test binaries on a host that refuses io_uring (e.g. Rocky 10 with
+  `kernel.io_uring_disabled=2`) reported the same `RingSetup` failure once per
+  test after ten retries each. The test event-loop helper now retries only
+  transient errors (`ENOMEM`/`EAGAIN`/`EMFILE`/`ENFILE`) and on a structural
+  one prints the message once and exits the binary. (#359)
+
 - A refused `io_uring_setup(2)` now surfaces as `Error::RingSetup` instead of
   a bare `Error::Io(PermissionDenied)`. The message names the errno and the
   cause: for `EPERM` it reads `kernel.io_uring_disabled` and says whether the
