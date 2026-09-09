@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [ringline-memcache 0.7.2] - 2026-09-09
+
+No changes. Published alongside the v0.6.2 workspace release because the
+crate's development version was already bumped past 0.7.1.
+
+## [0.6.2] - 2026-09-09
+
 ### Added
 
 - `ConfigBuilder::loop_diag(bool)` (default off): gates the per-worker
@@ -46,6 +53,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `ServerConnection::server_name()` on `UnbufferedServerConnection` — would
   need a `ClientHello` callback on `ServerConfig`, tracked as follow-on work).
   TLS recv copy count is unchanged. See `docs/tls-unbuffered-design.md`.
+
+### Changed
+
+- Default `send_copy_slot_size` is 16448 (was 16384) so one maximum-size TLS
+  1.3 record (16406 bytes) fits in a single send pool slot. Costs 0.4% more
+  send pool memory at the default slot count. (#352)
 
 ## [ringline-memcache 0.7.1] - 2026-09-04
 
