@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.3] - 2026-09-09
+
 ### Fixed
 
 - `RLIMIT_MEMLOCK` too low for `registered_regions` used to surface as a bare
@@ -20,7 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Every kernel registration in driver setup (fixed buffers, the fixed file
   table, provided buffer rings) now reports `Error::BufferRegistration` /
   `Error::ResourceLimit` with the cause instead of `Error::Io`; the
-  `BufferRegistration` variant was previously never constructed.
+  `BufferRegistration` variant was previously never constructed. (#361)
 
 - io_uring test binaries on a host that refuses io_uring (e.g. Rocky 10 with
   `kernel.io_uring_disabled=2`) reported the same `RingSetup` failure once per
