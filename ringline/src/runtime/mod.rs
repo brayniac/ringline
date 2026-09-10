@@ -430,6 +430,33 @@ pub(crate) struct Executor {
     waker_drain_scratch: VecDeque<u32>,
     /// Per-connection: task is awaiting recv data.
     pub(crate) recv_waiters: Vec<bool>,
+    /// Per-connection: the transport error that ended the stream, tagged
+    /// with the connection generation it belongs to. Written by
+    /// [`fail_recv`](Self::fail_recv), read once by
+    /// [`take_recv_error`](Self::take_recv_error). Only `with_data_result`
+    /// consults it; `with_data` keeps reporting EOF for both cases.
+    ///
+    /// Deliberately not cleared by `remove_connection`: the generation tag
+    /// already prevents a reused slot from seeing the old error, and leaving
+    /// it lets a task that polls after teardown learn the cause instead of a
+    /// bare `0`. The next `fail_recv` on the slot overwrites it, whatever its
+    /// generation (last writer wins; every backend error site is terminal
+    /// for the connection, so a second error for the same generation does
+    /// not occur in practice).
+    ///
+    /// Known exception on io_uring: a `RecvMulti` CQE carries no generation,
+    /// so if `close_connection`'s async-cancel could not be submitted (full
+    /// SQ) a stale error CQE can reach the error branch after the slot was
+    /// reused and be stored under the new occupant's generation. Pre-existing
+    /// hazard, recorded in `docs/journal/2026-09-backpressured-sends-series.md`,
+    /// to be closed when the multishot handlers are reworked (series PR 7).
+    ///
+    /// Contract for readers: `WithDataResultFuture` consults this slot with
+    /// the generation it captured at construction, *after* the inner
+    /// `WithDataFuture` reports `0` — including when that `0` came from the
+    /// generation-mismatch short-circuit. That is what lets a poll that lands
+    /// after teardown still see the error.
+    pub(crate) recv_errors: Vec<Option<(u32, stdio::Error)>>,
     /// Per-connection: task is awaiting send completion.
     pub(crate) send_waiters: Vec<bool>,
     /// Per-connection: task is awaiting connect result.
@@ -529,6 +556,11 @@ impl Executor {
             woken_while_polling: false,
             waker_drain_scratch: VecDeque::with_capacity(64),
             recv_waiters: vec![false; cap],
+            recv_errors: {
+                let mut v = Vec::with_capacity(cap);
+                v.resize_with(cap, || None);
+                v
+            },
             send_waiters: vec![false; cap],
             connect_waiters: vec![false; cap],
             io_results: {
@@ -657,6 +689,38 @@ impl Executor {
             self.recv_waiters[idx] = false;
             let task_id = self.owner_task[idx].unwrap_or(conn_index);
             self.wake_task(task_id);
+        }
+    }
+
+    /// Record the transport error that ended `conn_index`'s stream and wake
+    /// the recv waiter, exactly as [`wake_recv`](Self::wake_recv) would.
+    ///
+    /// Backends call this instead of `wake_recv` at every site where a recv
+    /// failed with a real (non-`WouldBlock`) socket error. `with_data`
+    /// callers still observe EOF; `with_data_result` callers observe the
+    /// error via [`take_recv_error`](Self::take_recv_error).
+    pub(crate) fn fail_recv(&mut self, conn_index: u32, generation: u32, error: stdio::Error) {
+        let idx = conn_index as usize;
+        if idx < self.recv_errors.len() {
+            self.recv_errors[idx] = Some((generation, error));
+        }
+        self.wake_recv(conn_index);
+    }
+
+    /// Take the recorded transport error for `conn_index`, if one was
+    /// recorded for exactly `generation`. One-shot: a second call returns
+    /// `None`.
+    pub(crate) fn take_recv_error(
+        &mut self,
+        conn_index: u32,
+        generation: u32,
+    ) -> Option<stdio::Error> {
+        let slot = self.recv_errors.get_mut(conn_index as usize)?;
+        match slot {
+            Some((stored_generation, _)) if *stored_generation == generation => {
+                slot.take().map(|(_, error)| error)
+            }
+            _ => None,
         }
     }
 
@@ -846,6 +910,66 @@ mod tests {
         );
     }
 
+    #[test]
+    fn fail_recv_stores_error_and_wakes_recv_waiter() {
+        let mut exec = Executor::new(8, 8, 8, 0, 0);
+        exec.task_slab.spawn(2, Box::pin(async {}));
+        let fut = exec.task_slab.take_ready(2).unwrap();
+        exec.task_slab.park(2, fut);
+        exec.recv_waiters[2] = true;
+
+        exec.fail_recv(2, 7, stdio::Error::from_raw_os_error(libc::ECONNRESET));
+
+        assert!(
+            !exec.recv_waiters[2],
+            "fail_recv must clear the waiter flag like wake_recv"
+        );
+        assert!(
+            exec.task_slab.take_ready(2).is_some(),
+            "fail_recv must wake the parked task"
+        );
+        let err = exec
+            .take_recv_error(2, 7)
+            .expect("error recorded for generation 7");
+        assert_eq!(err.raw_os_error(), Some(libc::ECONNRESET));
+        assert!(exec.take_recv_error(2, 7).is_none(), "take is one-shot");
+    }
+
+    #[test]
+    fn take_recv_error_rejects_other_generation() {
+        let mut exec = Executor::new(8, 8, 8, 0, 0);
+        exec.fail_recv(3, 7, stdio::Error::from_raw_os_error(libc::EPIPE));
+
+        assert!(
+            exec.take_recv_error(3, 8).is_none(),
+            "a reused slot must not see the old error"
+        );
+        assert!(
+            exec.take_recv_error(3, 7).is_some(),
+            "the original generation still can"
+        );
+    }
+
+    #[test]
+    fn recv_error_survives_remove_connection_for_its_generation() {
+        let mut exec = Executor::new(8, 8, 8, 0, 0);
+        exec.fail_recv(4, 7, stdio::Error::from_raw_os_error(libc::ECONNRESET));
+        exec.remove_connection(4);
+
+        assert!(
+            exec.take_recv_error(4, 7).is_some(),
+            "a late poll still learns the cause"
+        );
+        assert!(exec.take_recv_error(4, 9).is_none());
+    }
+
+    #[test]
+    fn fail_recv_out_of_range_is_a_no_op() {
+        let mut exec = Executor::new(8, 8, 8, 0, 0);
+        exec.fail_recv(200, 1, stdio::Error::from_raw_os_error(libc::EIO));
+        assert!(exec.take_recv_error(200, 1).is_none());
+    }
+
     #[cfg(not(has_io_uring))]
     #[test]
     fn timer_release_clears_mio_deadline() {
@@ -926,6 +1050,7 @@ mod tests {
         let exec = Executor::new(16, 8, 8, 0, 0);
         assert!(exec.ready_queue.is_empty());
         assert_eq!(exec.recv_waiters.len(), 16);
+        assert_eq!(exec.recv_errors.len(), 16);
         assert_eq!(exec.send_waiters.len(), 16);
         assert_eq!(exec.connect_waiters.len(), 16);
         assert_eq!(exec.io_results.len(), 16);

@@ -527,12 +527,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                         self.driver.tcp_streams[idx] = Some(stream);
                         break;
                     }
-                    Err(_) => {
+                    Err(error) => {
                         self.driver.tcp_streams[idx] = Some(stream);
+                        let generation = self.driver.connections.generation(conn_index);
                         if let Some(cs) = self.driver.connections.get_mut(conn_index) {
                             cs.recv_mode = RecvMode::Closed;
                         }
-                        self.executor.wake_recv(conn_index);
+                        self.executor.fail_recv(conn_index, generation, error);
                         break;
                     }
                 };
@@ -671,12 +672,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                     break;
                 }
-                Err(_) => {
-                    // Read error — mark as closed.
+                Err(error) => {
+                    // Read error — mark as closed and keep the exact error
+                    // for `with_data_result`; `with_data` still sees EOF.
+                    let generation = self.driver.connections.generation(conn_index);
                     if let Some(cs) = self.driver.connections.get_mut(conn_index) {
                         cs.recv_mode = RecvMode::Closed;
                     }
-                    self.executor.wake_recv(conn_index);
+                    self.executor.fail_recv(conn_index, generation, error);
                     break;
                 }
             }

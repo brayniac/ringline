@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `ConnCtx::with_data_result`: like `with_data`, but resolves to
+  `io::Result<usize>` so a handler can tell a clean peer close (`Ok(0)`)
+  from a transport failure (`Err(e)`, e.g. `ConnectionReset` after an RST).
+  Buffered bytes are delivered before the error, and the error is reported
+  once. `with_data` is unchanged and still reports `0` for both. First PR of
+  the series that lands #318 (design:
+  `docs/backpressured-sends-series-design.md`).
+
 ## [0.6.3] - 2026-09-09
 
 ### Fixed

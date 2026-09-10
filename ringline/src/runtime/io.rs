@@ -835,6 +835,44 @@ impl ConnCtx {
         }
     }
 
+    /// Like [`with_data`](Self::with_data), but the future distinguishes a
+    /// clean peer close from a transport failure.
+    ///
+    /// Resolves to:
+    /// - `Ok(n)` with `n > 0` — the closure consumed `n` bytes;
+    /// - `Ok(0)` — the peer closed cleanly (or this future is stale: the
+    ///   connection slot has been closed and reused) and no error was
+    ///   recorded;
+    /// - `Err(e)` — the socket read failed with a non-`WouldBlock` error
+    ///   (`ConnectionReset` after an RST, for example). Buffered bytes are
+    ///   always delivered before the error is surfaced.
+    ///
+    /// The error is reported once: a later `with_data_result` on the same
+    /// connection resolves to `Ok(0)`. And `Ok(n)` echoes whatever the
+    /// closure returned, including from the empty-slice call made once the
+    /// connection is closed — a closure that returns `Consumed(n > 0)` for
+    /// empty input will see `Ok(n)` there and the recorded error only on the
+    /// following call.
+    ///
+    /// Only a failed socket read is reported this way. A TLS record-layer
+    /// error (a bad record, a failed decrypt) still closes the connection
+    /// through the EOF path and resolves to `Ok(0)`, indistinguishable from a
+    /// clean close, exactly as with `with_data`.
+    ///
+    /// `with_data` keeps returning `0` for both cases; nothing about it
+    /// changes. Use this variant when a protocol handler must tell "the peer
+    /// hung up" from "the transport broke". Check
+    /// [`eof_truncated`](Self::eof_truncated) after `Ok(0)` on TLS
+    /// connections, exactly as with `with_data`.
+    pub fn with_data_result<F: FnMut(&[u8]) -> ParseResult>(
+        &self,
+        f: F,
+    ) -> WithDataResultFuture<F> {
+        WithDataResultFuture {
+            inner: self.with_data(f),
+        }
+    }
+
     /// Wait until recv data is available, then provide it as zero-copy `Bytes`.
     ///
     /// Like [`with_data()`](Self::with_data), but the closure receives a `Bytes`
@@ -2192,6 +2230,51 @@ impl<F: FnMut(&[u8]) -> ParseResult + Unpin> Future for WithDataFuture<F> {
             executor.recv_waiters[self.conn_index as usize] = true;
             Poll::Pending
         })
+    }
+}
+
+// ── WithDataResultFuture ─────────────────────────────────────────────
+
+/// Future returned by [`ConnCtx::with_data_result`].
+///
+/// Wraps [`WithDataFuture`] and adds one thing: when the inner future
+/// reports `0`, this one checks the executor's per-connection recv error
+/// slot (written by the backends at every real socket-read failure) and
+/// returns `Err(e)` if an error was recorded for this connection generation,
+/// `Ok(0)` otherwise. Data already buffered is delivered first, so a peer
+/// that sent bytes and then reset still gets its bytes parsed before the
+/// reset is reported.
+///
+/// The generation used for the lookup is the one captured at construction;
+/// `Executor::recv_errors` documents why that is what makes a post-teardown
+/// poll still see the cause.
+///
+/// Dropping the future before it resolves is inert: it registers no state
+/// beyond what `WithDataFuture` registers, and the error slot stays readable,
+/// until taken, by a later `with_data_result` on the same connection.
+pub struct WithDataResultFuture<F> {
+    inner: WithDataFuture<F>,
+}
+
+impl<F: FnMut(&[u8]) -> ParseResult + Unpin> Future for WithDataResultFuture<F> {
+    type Output = io::Result<usize>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let conn_index = self.inner.conn_index;
+        let generation = self.inner.generation;
+        match Pin::new(&mut self.inner).poll(cx) {
+            Poll::Ready(0) => {
+                let error = with_state(|_driver, executor| {
+                    executor.take_recv_error(conn_index, generation)
+                });
+                match error {
+                    Some(error) => Poll::Ready(Err(error)),
+                    None => Poll::Ready(Ok(0)),
+                }
+            }
+            Poll::Ready(consumed) => Poll::Ready(Ok(consumed)),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 

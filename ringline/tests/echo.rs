@@ -5261,3 +5261,167 @@ fn connection_task_panic_does_not_kill_worker() {
         let _ = h.join();
     }
 }
+
+// ── with_data_result ──────────────────────────────────────────────
+
+/// 0 = not yet observed; 1 = Err(ConnectionReset|ConnectionAborted);
+/// 2 = Err(other); 3 = Ok(0).
+static WITH_DATA_RESULT_OUTCOME: AtomicU32 = AtomicU32::new(0);
+
+/// Incremented when `WithDataResultHandler::on_accept` starts, so a test can
+/// wait for the server side to exist before doing anything to the socket.
+static WITH_DATA_RESULT_ACCEPTED: AtomicU32 = AtomicU32::new(0);
+
+struct WithDataResultHandler;
+
+impl AsyncEventHandler for WithDataResultHandler {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            WITH_DATA_RESULT_ACCEPTED.fetch_add(1, Ordering::AcqRel);
+            loop {
+                let outcome = match conn
+                    .with_data_result(|data| ParseResult::Consumed(data.len()))
+                    .await
+                {
+                    Ok(0) => 3,
+                    Ok(_) => continue,
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted
+                        ) =>
+                    {
+                        1
+                    }
+                    Err(_) => 2,
+                };
+                WITH_DATA_RESULT_OUTCOME.store(outcome, Ordering::Release);
+                break;
+            }
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        WithDataResultHandler
+    }
+}
+
+fn wait_for_with_data_result_outcome() -> u32 {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while WITH_DATA_RESULT_OUTCOME.load(Ordering::Acquire) == 0
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    WITH_DATA_RESULT_OUTCOME.load(Ordering::Acquire)
+}
+
+fn wait_for_with_data_result_accept(expected: u32) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while WITH_DATA_RESULT_ACCEPTED.load(Ordering::Acquire) < expected
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        WITH_DATA_RESULT_ACCEPTED.load(Ordering::Acquire) >= expected,
+        "server did not accept the connection"
+    );
+}
+
+/// Connect with retry until the server is accepting. Used instead of
+/// `wait_for_server`, whose probe connection would be accepted by the
+/// handler and would store an outcome of its own, so a test using it could
+/// pass without ever exercising the real connection.
+fn connect_with_retry(addr: &str) -> TcpStream {
+    (0..200)
+        .find_map(|_| match TcpStream::connect(addr) {
+            Ok(stream) => Some(stream),
+            Err(_) => {
+                std::thread::sleep(Duration::from_millis(10));
+                None
+            }
+        })
+        .expect("server did not accept connection")
+}
+
+/// Serialises the `with_data_result` tests, which share the outcome cell.
+static WITH_DATA_RESULT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[test]
+fn with_data_result_returns_ok_zero_on_clean_close() {
+    let _guard = WITH_DATA_RESULT_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    WITH_DATA_RESULT_OUTCOME.store(0, Ordering::Release);
+    WITH_DATA_RESULT_ACCEPTED.store(0, Ordering::Release);
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
+        .bind(addr.parse().unwrap())
+        .launch::<WithDataResultHandler>()
+        .expect("launch failed");
+
+    let mut stream = connect_with_retry(&addr);
+    wait_for_with_data_result_accept(1);
+    stream.write_all(b"hello").unwrap();
+    drop(stream); // orderly FIN
+
+    assert_eq!(
+        wait_for_with_data_result_outcome(),
+        3,
+        "clean close must be Ok(0)"
+    );
+
+    shutdown.shutdown();
+    for handle in handles {
+        handle.join().unwrap().unwrap();
+    }
+}
+
+#[test]
+fn with_data_result_surfaces_tcp_reset() {
+    use std::os::fd::AsRawFd;
+
+    let _guard = WITH_DATA_RESULT_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    WITH_DATA_RESULT_OUTCOME.store(0, Ordering::Release);
+    WITH_DATA_RESULT_ACCEPTED.store(0, Ordering::Release);
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
+        .bind(addr.parse().unwrap())
+        .launch::<WithDataResultHandler>()
+        .expect("launch failed");
+
+    let stream = connect_with_retry(&addr);
+    wait_for_with_data_result_accept(1);
+
+    // SO_LINGER with a zero timeout turns close() into an RST instead of a FIN.
+    let linger = libc::linger {
+        l_onoff: 1,
+        l_linger: 0,
+    };
+    let rc = unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_LINGER,
+            &linger as *const libc::linger as *const libc::c_void,
+            std::mem::size_of::<libc::linger>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(rc, 0, "setsockopt(SO_LINGER) failed");
+    drop(stream);
+
+    assert_eq!(
+        wait_for_with_data_result_outcome(),
+        1,
+        "an RST must surface as Err(ConnectionReset|ConnectionAborted)"
+    );
+
+    shutdown.shutdown();
+    for handle in handles {
+        handle.join().unwrap().unwrap();
+    }
+}

@@ -298,6 +298,8 @@ pub use runtime::io::UdpRecvFuture;
 pub use runtime::io::WithBytesFuture;
 /// Future that provides received data.
 pub use runtime::io::WithDataFuture;
+/// Future that resolves with recv data, `Ok(0)` on clean close, or the transport error.
+pub use runtime::io::WithDataResultFuture;
 /// Future returned by [`ConnCtx::with_segments()`] (segmented recv, Mode B).
 #[cfg(has_io_uring)]
 pub use runtime::io::WithSegmentsFuture;
