@@ -847,6 +847,13 @@ impl ConnCtx {
     ///   (`ConnectionReset` after an RST, for example). Buffered bytes are
     ///   always delivered before the error is surfaced.
     ///
+    /// The error is reported once: a later `with_data_result` on the same
+    /// connection resolves to `Ok(0)`. And `Ok(n)` echoes whatever the
+    /// closure returned, including from the empty-slice call made once the
+    /// connection is closed — a closure that returns `Consumed(n > 0)` for
+    /// empty input will see `Ok(n)` there and the recorded error only on the
+    /// following call.
+    ///
     /// `with_data` keeps returning `0` for both cases; nothing about it
     /// changes. Use this variant when a protocol handler must tell "the peer
     /// hung up" from "the transport broke". Check
@@ -2239,8 +2246,8 @@ impl<F: FnMut(&[u8]) -> ParseResult + Unpin> Future for WithDataFuture<F> {
 /// connection was torn down still learns the cause.
 ///
 /// Dropping the future before it resolves is inert: it registers no state
-/// beyond what `WithDataFuture` registers, and the error slot stays readable
-/// by a later `with_data_result` on the same connection.
+/// beyond what `WithDataFuture` registers, and the error slot stays readable,
+/// until taken, by a later `with_data_result` on the same connection.
 pub struct WithDataResultFuture<F> {
     inner: WithDataFuture<F>,
 }
