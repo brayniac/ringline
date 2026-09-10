@@ -10,9 +10,7 @@ use std::net::TcpStream;
 use std::pin::Pin;
 use std::time::Duration;
 
-use ringline::{
-    AsyncEventHandler, Config, ConfigBuilder, ConnCtx, DriverCtx, ParseResult, RinglineBuilder,
-};
+use ringline::{AsyncEventHandler, Config, ConfigBuilder, ConnCtx, ParseResult, RinglineBuilder};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 // ── Async echo handler ─────────────────────────────────────────────
@@ -5727,7 +5725,7 @@ impl AsyncEventHandler for RespondAfterEofCountingTicks {
             }
         }
     }
-    fn on_tick(&mut self, _ctx: &mut DriverCtx<'_>) {
+    fn on_tick(&mut self, _ctx: &mut ringline::DriverCtx<'_>) {
         DRAIN_TICKS.fetch_add(1, Ordering::Relaxed);
     }
     fn create_for_worker(_id: usize) -> Self {
