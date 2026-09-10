@@ -27,7 +27,11 @@ record gap) green on both backends.
   early-returned on it). Fixed by unifying on io_uring's model rather than
   adding a mio-only flag: `Closed` has one setter, `close_pending` marks
   teardown requested, and mio's `finish_close` is now deferred until
-  `pending_sends` drain, the same window io_uring already gives a task.
+  `pending_sends` drain. CI then showed io_uring does *not* give that
+  window when the queue was empty at the FIN (`try_finalize_close` runs
+  synchronously and commits the Close before the task polls; a post-EOF
+  response is never delivered) — #371, to be fixed with PR 7's handler
+  rework. The two post-FIN-send tests are mio-only until then.
   Review also caught that the deferral test's 4 MiB send would exhaust the
   default 64-slot test copy pool on io_uring (one slot per 16 KiB chunk,
   taken synchronously) — the test now uses an 8 MiB pool and asserts the
