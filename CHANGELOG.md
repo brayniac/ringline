@@ -35,6 +35,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   released, so every such connection permanently consumed one slot and one
   fd until `max_connections` was exhausted. `ConnCtx::close()` after EOF
   took the same early return. (#368)
+- mio: while queued sends drained to a peer that had half-closed, the event
+  loop re-registered READABLE interest on every iteration, which re-reported
+  the peer's EOF and spun the worker at 100% CPU until the peer read.
+  Interest is WRITABLE-only once the receive side is closed, and a closed
+  receive side is no longer read. (found while fixing #368)
 
 ## [0.6.3] - 2026-09-09
 
