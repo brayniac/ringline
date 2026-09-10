@@ -5425,3 +5425,353 @@ fn with_data_result_surfaces_tcp_reset() {
         handle.join().unwrap().unwrap();
     }
 }
+
+// ── Close lifecycle (#368) ────────────────────────────────────────
+
+/// Echo handler that returns as soon as recv reports EOF or an error.
+struct EchoUntilEof;
+
+impl AsyncEventHandler for EchoUntilEof {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            loop {
+                let n = conn
+                    .with_data(|data| {
+                        let _ = conn.send_nowait(data);
+                        ParseResult::Consumed(data.len())
+                    })
+                    .await;
+                if n == 0 {
+                    break;
+                }
+            }
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        EchoUntilEof
+    }
+}
+
+/// Like `EchoUntilEof`, but calls `conn.close()` after EOF before returning.
+struct EchoThenClose;
+
+impl AsyncEventHandler for EchoThenClose {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            loop {
+                let n = conn
+                    .with_data(|data| {
+                        let _ = conn.send_nowait(data);
+                        ParseResult::Consumed(data.len())
+                    })
+                    .await;
+                if n == 0 {
+                    conn.close();
+                    break;
+                }
+            }
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        EchoThenClose
+    }
+}
+
+/// Two connection slots, one worker.
+fn two_slot_config() -> Config {
+    test_config_builder()
+        .max_connections(2)
+        .build()
+        .expect("valid config")
+}
+
+/// How the client ends each connection in `assert_sequential_connections`.
+#[derive(Clone, Copy)]
+enum ClientClose {
+    /// Orderly FIN: drop the stream.
+    Fin,
+    /// RST: set `SO_LINGER 0`, then drop.
+    Reset,
+}
+
+fn set_linger_zero(stream: &TcpStream) {
+    use std::os::fd::AsRawFd;
+    let linger = libc::linger {
+        l_onoff: 1,
+        l_linger: 0,
+    };
+    let rc = unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_LINGER,
+            &linger as *const libc::linger as *const libc::c_void,
+            std::mem::size_of::<libc::linger>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(rc, 0, "setsockopt(SO_LINGER) failed");
+}
+
+/// Open `count` connections one after another against a two-slot server,
+/// echo one message on each, and close from the client side. Every
+/// connection must echo: a server that leaks the slot of a peer-closed
+/// connection refuses the third one.
+fn assert_sequential_connections<H: AsyncEventHandler>(count: usize, close: ClientClose) {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let (shutdown, handles) = RinglineBuilder::new(two_slot_config())
+        .bind(addr.parse().unwrap())
+        .launch::<H>()
+        .expect("launch failed");
+
+    let mut echoed = 0;
+    for i in 0..count {
+        // Retry the whole connect+echo until the deadline: a slot released a
+        // few milliseconds late is not a leak, a slot never released is.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut last_err = None;
+        let stream: Option<TcpStream> = loop {
+            let mut stream = connect_with_retry(&addr);
+            stream
+                .set_read_timeout(Some(Duration::from_millis(500)))
+                .unwrap();
+            stream.write_all(b"ping").unwrap();
+            let mut buf = [0u8; 4];
+            match stream.read_exact(&mut buf) {
+                Ok(()) => {
+                    assert_eq!(&buf, b"ping");
+                    echoed += 1;
+                    break Some(stream);
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    drop(stream);
+                    if std::time::Instant::now() >= deadline {
+                        break None;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        };
+        match stream {
+            Some(stream) => {
+                if let ClientClose::Reset = close {
+                    set_linger_zero(&stream);
+                }
+                drop(stream);
+            }
+            None => {
+                eprintln!("connection {i}: echo never succeeded before the deadline: {last_err:?}")
+            }
+        }
+        // Give the server an iteration to observe the close and tear down.
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    shutdown.shutdown();
+    for handle in handles {
+        handle.join().unwrap().unwrap();
+    }
+    assert_eq!(
+        echoed, count,
+        "only {echoed} of {count} sequential connections echoed"
+    );
+}
+
+#[test]
+fn peer_fin_releases_the_slot() {
+    assert_sequential_connections::<EchoUntilEof>(6, ClientClose::Fin);
+}
+
+#[test]
+fn peer_reset_releases_the_slot() {
+    assert_sequential_connections::<EchoUntilEof>(6, ClientClose::Reset);
+}
+
+#[test]
+fn close_after_eof_releases_the_slot() {
+    assert_sequential_connections::<EchoThenClose>(6, ClientClose::Fin);
+}
+
+// The two post-FIN send tests below run on mio only: on io_uring the FIN
+// path commits the Close SQE before the task is polled, so a response sent
+// after EOF is never delivered (ringline-rs/ringline#371). Re-enable on
+// io_uring when #371 lands.
+#[cfg(not(has_io_uring))]
+/// Handler that reads until EOF, then sends a large response and returns.
+struct RespondAfterEof;
+
+#[cfg(not(has_io_uring))]
+const RESPONSE_AFTER_EOF_LEN: usize = 4 * 1024 * 1024;
+
+#[cfg(not(has_io_uring))]
+/// Outcome of the post-EOF send in `RespondAfterEof`: 0 = not run,
+/// 1 = `send()` accepted the buffer and the await completed, 2 = `send()`
+/// refused it (e.g. copy pool exhausted), 3 = the await returned an error.
+static RESPONSE_AFTER_EOF_SEND: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(not(has_io_uring))]
+/// `test_config()` with an 8 MiB copy pool: the io_uring `send()` takes one
+/// pool slot per 16 KiB chunk synchronously, so a 4 MiB send needs 256 slots
+/// up front (the default 64-slot test pool fails at chunk 65).
+fn large_send_config() -> Config {
+    test_config_builder()
+        .send_pool(512, 16384)
+        .build()
+        .expect("valid config")
+}
+
+#[cfg(not(has_io_uring))]
+impl AsyncEventHandler for RespondAfterEof {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            loop {
+                let n = conn
+                    .with_data(|data| ParseResult::Consumed(data.len()))
+                    .await;
+                if n == 0 {
+                    break;
+                }
+            }
+            let response = vec![0xA5u8; RESPONSE_AFTER_EOF_LEN];
+            let outcome = match conn.send(&response) {
+                Ok(fut) => match fut.await {
+                    Ok(_) => 1,
+                    Err(_) => 3,
+                },
+                Err(_) => 2,
+            };
+            RESPONSE_AFTER_EOF_SEND.store(outcome, Ordering::Release);
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        RespondAfterEof
+    }
+}
+
+/// A response sent after the peer's FIN must still be delivered in full:
+/// teardown waits for queued sends to drain (on mio, `finish_close` is
+/// deferred; on io_uring the Close SQE already is).
+#[cfg(not(has_io_uring))]
+#[test]
+fn response_after_peer_fin_is_delivered() {
+    RESPONSE_AFTER_EOF_SEND.store(0, Ordering::Release);
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let (shutdown, handles) = RinglineBuilder::new(large_send_config())
+        .bind(addr.parse().unwrap())
+        .launch::<RespondAfterEof>()
+        .expect("launch failed");
+
+    let mut stream = connect_with_retry(&addr);
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    stream.write_all(b"request").unwrap();
+    stream.shutdown(std::net::Shutdown::Write).unwrap();
+
+    // Let the server's writev hit WouldBlock at least once so the retained
+    // pending_closes path is exercised.
+    std::thread::sleep(Duration::from_millis(100));
+
+    let mut received = Vec::with_capacity(RESPONSE_AFTER_EOF_LEN);
+    stream
+        .read_to_end(&mut received)
+        .expect("read response after half-close");
+    assert_eq!(
+        received.len(),
+        RESPONSE_AFTER_EOF_LEN,
+        "response truncated: teardown ran before the send drained"
+    );
+    assert!(received.iter().all(|&b| b == 0xA5));
+    assert_eq!(
+        RESPONSE_AFTER_EOF_SEND.load(Ordering::Acquire),
+        1,
+        "post-EOF send was refused or errored"
+    );
+
+    shutdown.shutdown();
+    for handle in handles {
+        handle.join().unwrap().unwrap();
+    }
+}
+
+#[cfg(not(has_io_uring))]
+/// Counts `on_tick` calls, i.e. event-loop iterations, while a response
+/// drains to a peer that half-closed and is slow to read. A loop that
+/// re-reports the peer's EOF every iteration spins at hundreds of
+/// thousands of iterations per second; a healthy loop blocks in poll and
+/// ticks at most every few milliseconds.
+static DRAIN_TICKS: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(not(has_io_uring))]
+struct RespondAfterEofCountingTicks;
+
+#[cfg(not(has_io_uring))]
+impl AsyncEventHandler for RespondAfterEofCountingTicks {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            loop {
+                let n = conn
+                    .with_data(|data| ParseResult::Consumed(data.len()))
+                    .await;
+                if n == 0 {
+                    break;
+                }
+            }
+            let response = vec![0x5Au8; RESPONSE_AFTER_EOF_LEN];
+            if let Ok(fut) = conn.send(&response) {
+                let _ = fut.await;
+            }
+        }
+    }
+    fn on_tick(&mut self, _ctx: &mut ringline::DriverCtx<'_>) {
+        DRAIN_TICKS.fetch_add(1, Ordering::Relaxed);
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        RespondAfterEofCountingTicks
+    }
+}
+
+#[cfg(not(has_io_uring))]
+#[test]
+fn deferred_close_does_not_spin_on_half_closed_peer() {
+    DRAIN_TICKS.store(0, Ordering::Relaxed);
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let (shutdown, handles) = RinglineBuilder::new(large_send_config())
+        .bind(addr.parse().unwrap())
+        .launch::<RespondAfterEofCountingTicks>()
+        .expect("launch failed");
+
+    let mut stream = connect_with_retry(&addr);
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    stream.write_all(b"request").unwrap();
+    stream.shutdown(std::net::Shutdown::Write).unwrap();
+
+    // Let the server queue the response and hit WouldBlock, then measure
+    // the loop's idle cadence while the peer does not read.
+    std::thread::sleep(Duration::from_millis(200));
+    let before = DRAIN_TICKS.load(Ordering::Relaxed);
+    std::thread::sleep(Duration::from_millis(500));
+    let ticks = DRAIN_TICKS.load(Ordering::Relaxed) - before;
+
+    let mut received = Vec::with_capacity(RESPONSE_AFTER_EOF_LEN);
+    stream
+        .read_to_end(&mut received)
+        .expect("read response after half-close");
+    assert_eq!(received.len(), RESPONSE_AFTER_EOF_LEN);
+
+    shutdown.shutdown();
+    for handle in handles {
+        handle.join().unwrap().unwrap();
+    }
+    // A spinning loop does ~250k+ iterations in 500 ms; the poll timeout
+    // is capped at 10 ms so a healthy loop does at most a few hundred.
+    assert!(
+        ticks < 5_000,
+        "event loop spun while a close was deferred: {ticks} ticks in 500 ms"
+    );
+}

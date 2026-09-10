@@ -80,9 +80,14 @@ pub(crate) struct Driver {
     pub(crate) wake_pipe_fd: RawFd,
     /// Whether to set TCP_NODELAY on accepted connections.
     pub(crate) tcp_nodelay: bool,
-    /// Connections closed this iteration, awaiting executor cleanup and
-    /// slot release by the event loop's `drain_pending_closes`. Deferring
-    /// the release (a) lets `Executor::remove_connection` run (stale parked
+    /// Connections whose teardown has been requested (`close_pending`),
+    /// awaiting executor cleanup and slot release by the event loop's
+    /// `drain_pending_closes`. An entry stays here until its
+    /// `pending_sends` have drained (or its stream is gone), so a response
+    /// queued after the peer's FIN is still delivered (io_uring's
+    /// `try_finalize_close` defers the same way for sends already queued at
+    /// the FIN; see #371 for the post-EOF send it does not yet cover). Deferring the release also
+    /// (a) lets `Executor::remove_connection` run first (stale parked
     /// futures, waiter flags, and recv sinks used to survive into the
     /// slot's next occupant — a use-after-free via the recv-sink raw
     /// pointer), and (b) closes the reuse window between a task closing a
@@ -313,11 +318,17 @@ impl Driver {
         }
     }
 
-    /// Close and clean up a connection.
+    /// Request teardown of a connection. The only place (with the
+    /// `DriverCtx` close) that sets `RecvMode::Closed` on this backend —
+    /// see the invariant on `RecvMode::Closed`.
+    ///
+    /// Teardown itself (socket, buffers, executor state, slot release)
+    /// happens in the event loop's `drain_pending_closes`, which has
+    /// Executor access and defers until `pending_sends` has drained.
+    /// Marking `Closed` here makes the call idempotent.
     pub(crate) fn close_connection(&mut self, conn_index: u32) {
         let idx = conn_index as usize;
 
-        // Check that the connection is active and not already closing.
         if let Some(conn) = self.connections.get_mut(conn_index) {
             if matches!(conn.recv_mode, RecvMode::Closed) {
                 return; // already closing
@@ -326,10 +337,7 @@ impl Driver {
         } else {
             return;
         }
-        let _ = idx;
-        // Teardown (socket, buffers, executor state, slot release) happens
-        // in the event loop's drain_pending_closes, which has Executor
-        // access. Marking Closed above makes this idempotent.
+        self.send_queues[idx].close_pending = true;
         self.pending_closes.push(conn_index);
     }
 
@@ -394,6 +402,7 @@ impl Driver {
 
         self.send_queues[idx].queue.clear();
         self.send_queues[idx].in_flight = false;
+        self.send_queues[idx].close_pending = false;
 
         if self.connections.get(conn_index).is_some() {
             self.connections.release(conn_index);
@@ -513,8 +522,17 @@ impl Driver {
             }
         }
 
-        // All sends flushed. Switch back to read-only interest.
-        if let Some(stream) = self.tcp_streams[idx].as_mut() {
+        // All sends flushed. Switch back to read-only interest — unless the
+        // receive side is already closed (peer FIN, read error, or a
+        // requested close), in which case re-adding READABLE would just
+        // make mio re-report the EOF once more; leave WRITABLE interest in
+        // place instead (a later `register_writable` no-op reasserts it if
+        // needed, and drop/close will deregister the stream entirely).
+        let recv_closed = self
+            .connections
+            .get(conn_index)
+            .is_some_and(|c| matches!(c.recv_mode, RecvMode::Closed));
+        if !recv_closed && let Some(stream) = self.tcp_streams[idx].as_mut() {
             let _ = self.poll.registry().reregister(
                 stream,
                 mio::Token(idx + 1),
@@ -528,12 +546,27 @@ impl Driver {
     /// pending send data).
     pub(crate) fn register_writable(&mut self, conn_index: u32) {
         let idx = conn_index as usize;
+        // Once the receive side is finished (`Closed`: peer FIN, read
+        // error, or a requested close) no more reads are wanted. Keeping
+        // READABLE interest on a half-closed socket makes every reregister
+        // re-report the EOF, and the loop spins at 100% CPU for as long as
+        // the queued sends take to drain. WRITABLE alone still delivers
+        // EOF/ERR on the write side (RST → `flush_sends` error →
+        // `fail_connection_on_send_error`), so the deferral still ends.
+        let recv_closed = self
+            .connections
+            .get(conn_index)
+            .is_some_and(|c| matches!(c.recv_mode, RecvMode::Closed));
+        let interest = if recv_closed {
+            mio::Interest::WRITABLE
+        } else {
+            mio::Interest::READABLE | mio::Interest::WRITABLE
+        };
         if let Some(stream) = self.tcp_streams[idx].as_mut() {
-            let _ = self.poll.registry().reregister(
-                stream,
-                mio::Token(idx + 1),
-                mio::Interest::READABLE | mio::Interest::WRITABLE,
-            );
+            let _ = self
+                .poll
+                .registry()
+                .reregister(stream, mio::Token(idx + 1), interest);
         }
     }
 }

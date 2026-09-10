@@ -483,6 +483,18 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             return;
         }
 
+        // The receive side is finished; the stream is only still registered
+        // because queued sends are draining (see `drain_pending_closes`).
+        // Nothing to read.
+        if self
+            .driver
+            .connections
+            .get(conn_index)
+            .is_some_and(|c| matches!(c.recv_mode, RecvMode::Closed))
+        {
+            return;
+        }
+
         // Check if this is a TLS connection.
         let is_tls = self
             .driver
@@ -513,13 +525,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                             .and_then(|t| t.get_mut(conn_index))
                             .map(|tc| tc.peer_sent_close_notify)
                             .unwrap_or(true);
-                        if let Some(cs) = self.driver.connections.get_mut(conn_index) {
-                            cs.recv_mode = RecvMode::Closed;
-                            if !close_notify_seen {
-                                cs.eof_truncated = true;
-                            }
+                        if !close_notify_seen
+                            && let Some(cs) = self.driver.connections.get_mut(conn_index)
+                        {
+                            cs.eof_truncated = true;
                         }
                         self.executor.wake_recv(conn_index);
+                        self.driver.close_connection(conn_index);
                         break;
                     }
                     Ok(n) => n,
@@ -530,10 +542,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     Err(error) => {
                         self.driver.tcp_streams[idx] = Some(stream);
                         let generation = self.driver.connections.generation(conn_index);
-                        if let Some(cs) = self.driver.connections.get_mut(conn_index) {
-                            cs.recv_mode = RecvMode::Closed;
-                        }
                         self.executor.fail_recv(conn_index, generation, error);
+                        self.driver.close_connection(conn_index);
                         break;
                     }
                 };
@@ -623,12 +633,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
             match stream.read(recv_buf) {
                 Ok(0) => {
-                    // EOF — mark connection as recv-closed.
-                    if let Some(cs) = self.driver.connections.get_mut(conn_index) {
-                        cs.recv_mode = RecvMode::Closed;
-                    }
-                    // Wake any task waiting for recv so it sees EOF.
+                    // EOF. Wake any recv waiter so it sees `0`, then request
+                    // teardown; finalize waits for queued sends to drain.
                     self.executor.wake_recv(conn_index);
+                    self.driver.close_connection(conn_index);
                     break;
                 }
                 Ok(n) => {
@@ -673,13 +681,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     break;
                 }
                 Err(error) => {
-                    // Read error — mark as closed and keep the exact error
-                    // for `with_data_result`; `with_data` still sees EOF.
+                    // Read error — keep the exact error for
+                    // `with_data_result` (`with_data` still sees EOF), then
+                    // request teardown.
                     let generation = self.driver.connections.generation(conn_index);
-                    if let Some(cs) = self.driver.connections.get_mut(conn_index) {
-                        cs.recv_mode = RecvMode::Closed;
-                    }
                     self.executor.fail_recv(conn_index, generation, error);
+                    self.driver.close_connection(conn_index);
                     break;
                 }
             }
@@ -910,12 +917,41 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
     }
 
-    /// Finish teardown for connections closed since the last drain.
+    /// Finish teardown for connections whose close was requested, once
+    /// their queued sends have drained.
+    ///
+    /// An entry whose `pending_sends` is still non-empty (and whose stream
+    /// is still registered) is retained for a later pass: the task stays
+    /// alive so its awaited sends can complete, `flush_all_pending_sends`
+    /// registers writable interest for it, and the writable event brings
+    /// the loop back here. A write error clears `pending_sends`
+    /// (`fail_connection_on_send_error`), which ends the deferral.
+    ///
+    /// The deferral is unbounded, as on io_uring for plaintext; mio has no
+    /// equivalent of io_uring's TLS `close_notify_deadline`, so a TLS peer
+    /// that half-closes and stops reading holds its slot until the write
+    /// errors. `close_notify_timeout_ms` is inert on mio.
+    ///
     /// Executor cleanup runs first — the slot must not be released (and
     /// reusable) while a stale parked future, waiter flags, or a recv-sink
     /// raw pointer still reference it.
     fn drain_pending_closes(&mut self) {
-        while let Some(conn_index) = self.driver.pending_closes.pop() {
+        let mut i = 0;
+        while i < self.driver.pending_closes.len() {
+            let conn_index = self.driver.pending_closes[i];
+            let idx = conn_index as usize;
+            debug_assert!(
+                self.driver.send_queues[idx].close_pending,
+                "pending_closes entry {conn_index} without close_pending"
+            );
+            let sends_drained =
+                self.driver.pending_sends[idx].is_empty() || self.driver.tcp_streams[idx].is_none();
+            if !sends_drained {
+                self.driver.mark_send_dirty(idx);
+                i += 1;
+                continue;
+            }
+            self.driver.pending_closes.swap_remove(i);
             self.executor.remove_connection(conn_index);
             self.driver.finish_close(conn_index);
         }
