@@ -835,6 +835,32 @@ impl ConnCtx {
         }
     }
 
+    /// Like [`with_data`](Self::with_data), but the future distinguishes a
+    /// clean peer close from a transport failure.
+    ///
+    /// Resolves to:
+    /// - `Ok(n)` with `n > 0` — the closure consumed `n` bytes;
+    /// - `Ok(0)` — the peer closed cleanly (or this future is stale: the
+    ///   connection slot has been closed and reused) and no error was
+    ///   recorded;
+    /// - `Err(e)` — the socket read failed with a non-`WouldBlock` error
+    ///   (`ConnectionReset` after an RST, for example). Buffered bytes are
+    ///   always delivered before the error is surfaced.
+    ///
+    /// `with_data` keeps returning `0` for both cases; nothing about it
+    /// changes. Use this variant when a protocol handler must tell "the peer
+    /// hung up" from "the transport broke". Check
+    /// [`eof_truncated`](Self::eof_truncated) after `Ok(0)` on TLS
+    /// connections, exactly as with `with_data`.
+    pub fn with_data_result<F: FnMut(&[u8]) -> ParseResult>(
+        &self,
+        f: F,
+    ) -> WithDataResultFuture<F> {
+        WithDataResultFuture {
+            inner: self.with_data(f),
+        }
+    }
+
     /// Wait until recv data is available, then provide it as zero-copy `Bytes`.
     ///
     /// Like [`with_data()`](Self::with_data), but the closure receives a `Bytes`
@@ -2192,6 +2218,52 @@ impl<F: FnMut(&[u8]) -> ParseResult + Unpin> Future for WithDataFuture<F> {
             executor.recv_waiters[self.conn_index as usize] = true;
             Poll::Pending
         })
+    }
+}
+
+// ── WithDataResultFuture ─────────────────────────────────────────────
+
+/// Future returned by [`ConnCtx::with_data_result`].
+///
+/// Wraps [`WithDataFuture`] and adds one thing: when the inner future
+/// reports `0`, this one checks the executor's per-connection recv error
+/// slot (written by the backends at every real socket-read failure) and
+/// returns `Err(e)` if an error was recorded for this connection generation,
+/// `Ok(0)` otherwise. Data already buffered is delivered first, so a peer
+/// that sent bytes and then reset still gets its bytes parsed before the
+/// reset is reported.
+///
+/// The slot is consulted with the generation captured at construction and
+/// only after the inner future reports `0` — including a `0` from the inner
+/// future's stale-generation short-circuit — so a poll that lands after the
+/// connection was torn down still learns the cause.
+///
+/// Dropping the future before it resolves is inert: it registers no state
+/// beyond what `WithDataFuture` registers, and the error slot stays readable
+/// by a later `with_data_result` on the same connection.
+pub struct WithDataResultFuture<F> {
+    inner: WithDataFuture<F>,
+}
+
+impl<F: FnMut(&[u8]) -> ParseResult + Unpin> Future for WithDataResultFuture<F> {
+    type Output = io::Result<usize>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let conn_index = self.inner.conn_index;
+        let generation = self.inner.generation;
+        match Pin::new(&mut self.inner).poll(cx) {
+            Poll::Ready(0) => {
+                let error = with_state(|_driver, executor| {
+                    executor.take_recv_error(conn_index, generation)
+                });
+                match error {
+                    Some(error) => Poll::Ready(Err(error)),
+                    None => Poll::Ready(Ok(0)),
+                }
+            }
+            Poll::Ready(consumed) => Poll::Ready(Ok(consumed)),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 

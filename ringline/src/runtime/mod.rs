@@ -705,8 +705,6 @@ impl Executor {
     /// Take the recorded transport error for `conn_index`, if one was
     /// recorded for exactly `generation`. One-shot: a second call returns
     /// `None`.
-    // Called by the backends and WithDataResultFuture (series PR 1, later tasks).
-    #[allow(dead_code)]
     pub(crate) fn take_recv_error(
         &mut self,
         conn_index: u32,
