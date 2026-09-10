@@ -915,6 +915,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// the loop back here. A write error clears `pending_sends`
     /// (`fail_connection_on_send_error`), which ends the deferral.
     ///
+    /// The deferral is unbounded, as on io_uring for plaintext; mio has no
+    /// equivalent of io_uring's TLS `close_notify_deadline`, so a TLS peer
+    /// that half-closes and stops reading holds its slot until the write
+    /// errors. `close_notify_timeout_ms` is inert on mio.
+    ///
     /// Executor cleanup runs first — the slot must not be released (and
     /// reusable) while a stale parked future, waiter flags, or a recv-sink
     /// raw pointer still reference it.
@@ -923,6 +928,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         while i < self.driver.pending_closes.len() {
             let conn_index = self.driver.pending_closes[i];
             let idx = conn_index as usize;
+            debug_assert!(
+                self.driver.send_queues[idx].close_pending,
+                "pending_closes entry {conn_index} without close_pending"
+            );
             let sends_drained =
                 self.driver.pending_sends[idx].is_empty() || self.driver.tcp_streams[idx].is_none();
             if !sends_drained {

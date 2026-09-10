@@ -5526,25 +5526,46 @@ fn assert_sequential_connections<H: AsyncEventHandler>(count: usize, close: Clie
 
     let mut echoed = 0;
     for i in 0..count {
-        let mut stream = connect_with_retry(&addr);
-        stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        stream.write_all(b"ping").unwrap();
-        let mut buf = [0u8; 4];
-        match stream.read_exact(&mut buf) {
-            Ok(()) => {
-                assert_eq!(&buf, b"ping");
-                echoed += 1;
+        // Retry the whole connect+echo until the deadline: a slot released a
+        // few milliseconds late is not a leak, a slot never released is.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut last_err = None;
+        let stream: Option<TcpStream> = loop {
+            let mut stream = connect_with_retry(&addr);
+            stream
+                .set_read_timeout(Some(Duration::from_millis(500)))
+                .unwrap();
+            stream.write_all(b"ping").unwrap();
+            let mut buf = [0u8; 4];
+            match stream.read_exact(&mut buf) {
+                Ok(()) => {
+                    assert_eq!(&buf, b"ping");
+                    echoed += 1;
+                    break Some(stream);
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    drop(stream);
+                    if std::time::Instant::now() >= deadline {
+                        break None;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
             }
-            Err(e) => eprintln!("connection {i}: echo failed: {e}"),
+        };
+        match stream {
+            Some(stream) => {
+                if let ClientClose::Reset = close {
+                    set_linger_zero(&stream);
+                }
+                drop(stream);
+            }
+            None => {
+                eprintln!("connection {i}: echo never succeeded before the deadline: {last_err:?}")
+            }
         }
-        if let ClientClose::Reset = close {
-            set_linger_zero(&stream);
-        }
-        drop(stream);
         // Give the server an iteration to observe the close and tear down.
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(20));
     }
 
     shutdown.shutdown();
@@ -5577,6 +5598,21 @@ struct RespondAfterEof;
 
 const RESPONSE_AFTER_EOF_LEN: usize = 4 * 1024 * 1024;
 
+/// Outcome of the post-EOF send in `RespondAfterEof`: 0 = not run,
+/// 1 = `send()` accepted the buffer and the await completed, 2 = `send()`
+/// refused it (e.g. copy pool exhausted), 3 = the await returned an error.
+static RESPONSE_AFTER_EOF_SEND: AtomicU32 = AtomicU32::new(0);
+
+/// `test_config()` with an 8 MiB copy pool: the io_uring `send()` takes one
+/// pool slot per 16 KiB chunk synchronously, so a 4 MiB send needs 256 slots
+/// up front (the default 64-slot test pool fails at chunk 65).
+fn large_send_config() -> Config {
+    test_config_builder()
+        .send_pool(512, 16384)
+        .build()
+        .expect("valid config")
+}
+
 impl AsyncEventHandler for RespondAfterEof {
     fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
         async move {
@@ -5589,9 +5625,14 @@ impl AsyncEventHandler for RespondAfterEof {
                 }
             }
             let response = vec![0xA5u8; RESPONSE_AFTER_EOF_LEN];
-            if let Ok(fut) = conn.send(&response) {
-                let _ = fut.await;
-            }
+            let outcome = match conn.send(&response) {
+                Ok(fut) => match fut.await {
+                    Ok(_) => 1,
+                    Err(_) => 3,
+                },
+                Err(_) => 2,
+            };
+            RESPONSE_AFTER_EOF_SEND.store(outcome, Ordering::Release);
         }
     }
     fn create_for_worker(_id: usize) -> Self {
@@ -5604,9 +5645,10 @@ impl AsyncEventHandler for RespondAfterEof {
 /// deferred; on io_uring the Close SQE already is).
 #[test]
 fn response_after_peer_fin_is_delivered() {
+    RESPONSE_AFTER_EOF_SEND.store(0, Ordering::Release);
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
-    let (shutdown, handles) = RinglineBuilder::new(test_config())
+    let (shutdown, handles) = RinglineBuilder::new(large_send_config())
         .bind(addr.parse().unwrap())
         .launch::<RespondAfterEof>()
         .expect("launch failed");
@@ -5618,6 +5660,10 @@ fn response_after_peer_fin_is_delivered() {
     stream.write_all(b"request").unwrap();
     stream.shutdown(std::net::Shutdown::Write).unwrap();
 
+    // Let the server's writev hit WouldBlock at least once so the retained
+    // pending_closes path is exercised.
+    std::thread::sleep(Duration::from_millis(100));
+
     let mut received = Vec::with_capacity(RESPONSE_AFTER_EOF_LEN);
     stream
         .read_to_end(&mut received)
@@ -5628,6 +5674,11 @@ fn response_after_peer_fin_is_delivered() {
         "response truncated: teardown ran before the send drained"
     );
     assert!(received.iter().all(|&b| b == 0xA5));
+    assert_eq!(
+        RESPONSE_AFTER_EOF_SEND.load(Ordering::Acquire),
+        1,
+        "post-EOF send was refused or errored"
+    );
 
     shutdown.shutdown();
     for handle in handles {
