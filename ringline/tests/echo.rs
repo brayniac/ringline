@@ -10,7 +10,9 @@ use std::net::TcpStream;
 use std::pin::Pin;
 use std::time::Duration;
 
-use ringline::{AsyncEventHandler, Config, ConfigBuilder, ConnCtx, ParseResult, RinglineBuilder};
+use ringline::{
+    AsyncEventHandler, Config, ConfigBuilder, ConnCtx, DriverCtx, ParseResult, RinglineBuilder,
+};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 // ── Async echo handler ─────────────────────────────────────────────
@@ -5684,4 +5686,80 @@ fn response_after_peer_fin_is_delivered() {
     for handle in handles {
         handle.join().unwrap().unwrap();
     }
+}
+
+/// Counts `on_tick` calls, i.e. event-loop iterations, while a response
+/// drains to a peer that half-closed and is slow to read. A loop that
+/// re-reports the peer's EOF every iteration spins at hundreds of
+/// thousands of iterations per second; a healthy loop blocks in poll and
+/// ticks at most every few milliseconds.
+static DRAIN_TICKS: AtomicU32 = AtomicU32::new(0);
+
+struct RespondAfterEofCountingTicks;
+
+impl AsyncEventHandler for RespondAfterEofCountingTicks {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            loop {
+                let n = conn
+                    .with_data(|data| ParseResult::Consumed(data.len()))
+                    .await;
+                if n == 0 {
+                    break;
+                }
+            }
+            let response = vec![0x5Au8; RESPONSE_AFTER_EOF_LEN];
+            if let Ok(fut) = conn.send(&response) {
+                let _ = fut.await;
+            }
+        }
+    }
+    fn on_tick(&mut self, _ctx: &mut DriverCtx<'_>) {
+        DRAIN_TICKS.fetch_add(1, Ordering::Relaxed);
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        RespondAfterEofCountingTicks
+    }
+}
+
+#[test]
+fn deferred_close_does_not_spin_on_half_closed_peer() {
+    DRAIN_TICKS.store(0, Ordering::Relaxed);
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let (shutdown, handles) = RinglineBuilder::new(large_send_config())
+        .bind(addr.parse().unwrap())
+        .launch::<RespondAfterEofCountingTicks>()
+        .expect("launch failed");
+
+    let mut stream = connect_with_retry(&addr);
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    stream.write_all(b"request").unwrap();
+    stream.shutdown(std::net::Shutdown::Write).unwrap();
+
+    // Let the server queue the response and hit WouldBlock, then measure
+    // the loop's idle cadence while the peer does not read.
+    std::thread::sleep(Duration::from_millis(200));
+    let before = DRAIN_TICKS.load(Ordering::Relaxed);
+    std::thread::sleep(Duration::from_millis(500));
+    let ticks = DRAIN_TICKS.load(Ordering::Relaxed) - before;
+
+    let mut received = Vec::with_capacity(RESPONSE_AFTER_EOF_LEN);
+    stream
+        .read_to_end(&mut received)
+        .expect("read response after half-close");
+    assert_eq!(received.len(), RESPONSE_AFTER_EOF_LEN);
+
+    shutdown.shutdown();
+    for handle in handles {
+        handle.join().unwrap().unwrap();
+    }
+    // A spinning loop does ~250k+ iterations in 500 ms; the poll timeout
+    // is capped at 10 ms so a healthy loop does at most a few hundred.
+    assert!(
+        ticks < 5_000,
+        "event loop spun while a close was deferred: {ticks} ticks in 500 ms"
+    );
 }

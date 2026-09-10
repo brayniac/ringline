@@ -521,8 +521,17 @@ impl Driver {
             }
         }
 
-        // All sends flushed. Switch back to read-only interest.
-        if let Some(stream) = self.tcp_streams[idx].as_mut() {
+        // All sends flushed. Switch back to read-only interest — unless the
+        // receive side is already closed (peer FIN, read error, or a
+        // requested close), in which case re-adding READABLE would just
+        // make mio re-report the EOF once more; leave WRITABLE interest in
+        // place instead (a later `register_writable` no-op reasserts it if
+        // needed, and drop/close will deregister the stream entirely).
+        let recv_closed = self
+            .connections
+            .get(conn_index)
+            .is_some_and(|c| matches!(c.recv_mode, RecvMode::Closed));
+        if !recv_closed && let Some(stream) = self.tcp_streams[idx].as_mut() {
             let _ = self.poll.registry().reregister(
                 stream,
                 mio::Token(idx + 1),
@@ -536,12 +545,27 @@ impl Driver {
     /// pending send data).
     pub(crate) fn register_writable(&mut self, conn_index: u32) {
         let idx = conn_index as usize;
+        // Once the receive side is finished (`Closed`: peer FIN, read
+        // error, or a requested close) no more reads are wanted. Keeping
+        // READABLE interest on a half-closed socket makes every reregister
+        // re-report the EOF, and the loop spins at 100% CPU for as long as
+        // the queued sends take to drain. WRITABLE alone still delivers
+        // EOF/ERR on the write side (RST → `flush_sends` error →
+        // `fail_connection_on_send_error`), so the deferral still ends.
+        let recv_closed = self
+            .connections
+            .get(conn_index)
+            .is_some_and(|c| matches!(c.recv_mode, RecvMode::Closed));
+        let interest = if recv_closed {
+            mio::Interest::WRITABLE
+        } else {
+            mio::Interest::READABLE | mio::Interest::WRITABLE
+        };
         if let Some(stream) = self.tcp_streams[idx].as_mut() {
-            let _ = self.poll.registry().reregister(
-                stream,
-                mio::Token(idx + 1),
-                mio::Interest::READABLE | mio::Interest::WRITABLE,
-            );
+            let _ = self
+                .poll
+                .registry()
+                .reregister(stream, mio::Token(idx + 1), interest);
         }
     }
 }

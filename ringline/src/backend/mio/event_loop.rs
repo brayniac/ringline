@@ -483,6 +483,18 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             return;
         }
 
+        // The receive side is finished; the stream is only still registered
+        // because queued sends are draining (see `drain_pending_closes`).
+        // Nothing to read.
+        if self
+            .driver
+            .connections
+            .get(conn_index)
+            .is_some_and(|c| matches!(c.recv_mode, RecvMode::Closed))
+        {
+            return;
+        }
+
         // Check if this is a TLS connection.
         let is_tls = self
             .driver
