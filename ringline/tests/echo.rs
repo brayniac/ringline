@@ -5425,3 +5425,212 @@ fn with_data_result_surfaces_tcp_reset() {
         handle.join().unwrap().unwrap();
     }
 }
+
+// ── Close lifecycle (#368) ────────────────────────────────────────
+
+/// Echo handler that returns as soon as recv reports EOF or an error.
+struct EchoUntilEof;
+
+impl AsyncEventHandler for EchoUntilEof {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            loop {
+                let n = conn
+                    .with_data(|data| {
+                        let _ = conn.send_nowait(data);
+                        ParseResult::Consumed(data.len())
+                    })
+                    .await;
+                if n == 0 {
+                    break;
+                }
+            }
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        EchoUntilEof
+    }
+}
+
+/// Like `EchoUntilEof`, but calls `conn.close()` after EOF before returning.
+struct EchoThenClose;
+
+impl AsyncEventHandler for EchoThenClose {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            loop {
+                let n = conn
+                    .with_data(|data| {
+                        let _ = conn.send_nowait(data);
+                        ParseResult::Consumed(data.len())
+                    })
+                    .await;
+                if n == 0 {
+                    conn.close();
+                    break;
+                }
+            }
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        EchoThenClose
+    }
+}
+
+/// Two connection slots, one worker.
+fn two_slot_config() -> Config {
+    test_config_builder()
+        .max_connections(2)
+        .build()
+        .expect("valid config")
+}
+
+/// How the client ends each connection in `assert_sequential_connections`.
+#[derive(Clone, Copy)]
+enum ClientClose {
+    /// Orderly FIN: drop the stream.
+    Fin,
+    /// RST: set `SO_LINGER 0`, then drop.
+    Reset,
+}
+
+fn set_linger_zero(stream: &TcpStream) {
+    use std::os::fd::AsRawFd;
+    let linger = libc::linger {
+        l_onoff: 1,
+        l_linger: 0,
+    };
+    let rc = unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_LINGER,
+            &linger as *const libc::linger as *const libc::c_void,
+            std::mem::size_of::<libc::linger>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(rc, 0, "setsockopt(SO_LINGER) failed");
+}
+
+/// Open `count` connections one after another against a two-slot server,
+/// echo one message on each, and close from the client side. Every
+/// connection must echo: a server that leaks the slot of a peer-closed
+/// connection refuses the third one.
+fn assert_sequential_connections<H: AsyncEventHandler>(count: usize, close: ClientClose) {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let (shutdown, handles) = RinglineBuilder::new(two_slot_config())
+        .bind(addr.parse().unwrap())
+        .launch::<H>()
+        .expect("launch failed");
+
+    let mut echoed = 0;
+    for i in 0..count {
+        let mut stream = connect_with_retry(&addr);
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream.write_all(b"ping").unwrap();
+        let mut buf = [0u8; 4];
+        match stream.read_exact(&mut buf) {
+            Ok(()) => {
+                assert_eq!(&buf, b"ping");
+                echoed += 1;
+            }
+            Err(e) => eprintln!("connection {i}: echo failed: {e}"),
+        }
+        if let ClientClose::Reset = close {
+            set_linger_zero(&stream);
+        }
+        drop(stream);
+        // Give the server an iteration to observe the close and tear down.
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    shutdown.shutdown();
+    for handle in handles {
+        handle.join().unwrap().unwrap();
+    }
+    assert_eq!(
+        echoed, count,
+        "only {echoed} of {count} sequential connections echoed"
+    );
+}
+
+#[test]
+fn peer_fin_releases_the_slot() {
+    assert_sequential_connections::<EchoUntilEof>(6, ClientClose::Fin);
+}
+
+#[test]
+fn peer_reset_releases_the_slot() {
+    assert_sequential_connections::<EchoUntilEof>(6, ClientClose::Reset);
+}
+
+#[test]
+fn close_after_eof_releases_the_slot() {
+    assert_sequential_connections::<EchoThenClose>(6, ClientClose::Fin);
+}
+
+/// Handler that reads until EOF, then sends a large response and returns.
+struct RespondAfterEof;
+
+const RESPONSE_AFTER_EOF_LEN: usize = 4 * 1024 * 1024;
+
+impl AsyncEventHandler for RespondAfterEof {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            loop {
+                let n = conn
+                    .with_data(|data| ParseResult::Consumed(data.len()))
+                    .await;
+                if n == 0 {
+                    break;
+                }
+            }
+            let response = vec![0xA5u8; RESPONSE_AFTER_EOF_LEN];
+            if let Ok(fut) = conn.send(&response) {
+                let _ = fut.await;
+            }
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        RespondAfterEof
+    }
+}
+
+/// A response sent after the peer's FIN must still be delivered in full:
+/// teardown waits for queued sends to drain (on mio, `finish_close` is
+/// deferred; on io_uring the Close SQE already is).
+#[test]
+fn response_after_peer_fin_is_delivered() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
+        .bind(addr.parse().unwrap())
+        .launch::<RespondAfterEof>()
+        .expect("launch failed");
+
+    let mut stream = connect_with_retry(&addr);
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    stream.write_all(b"request").unwrap();
+    stream.shutdown(std::net::Shutdown::Write).unwrap();
+
+    let mut received = Vec::with_capacity(RESPONSE_AFTER_EOF_LEN);
+    stream
+        .read_to_end(&mut received)
+        .expect("read response after half-close");
+    assert_eq!(
+        received.len(),
+        RESPONSE_AFTER_EOF_LEN,
+        "response truncated: teardown ran before the send drained"
+    );
+    assert!(received.iter().all(|&b| b == 0xA5));
+
+    shutdown.shutdown();
+    for handle in handles {
+        handle.join().unwrap().unwrap();
+    }
+}

@@ -19,14 +19,17 @@ pub(crate) struct ConnSendState {
     /// Deferred shutdown_write — submitted after the send queue drains.
     #[cfg_attr(not(has_io_uring), allow(dead_code))]
     pub shutdown_pending: bool,
-    /// Set when the application's connection task has returned while
-    /// there were still queued / in-flight sends. The runtime defers
-    /// the actual `Close` SQE until the serialized
-    /// `submit_next_queued` cycle drains both the queue and the
-    /// in-flight slot, then fires the close from
-    /// `try_finalize_close`. Without the deferral, queued bytes were
-    /// silently truncated when the fd closed.
-    #[cfg_attr(not(has_io_uring), allow(dead_code))]
+    /// Teardown has been requested for this connection (peer FIN, read
+    /// error, task return, or an explicit close) and is deferred until
+    /// queued sends drain. Set by the driver's `close_connection` and the
+    /// `DriverCtx` close on both backends, alongside `RecvMode::Closed`.
+    ///
+    /// io_uring: the `Close` SQE is submitted from `try_finalize_close`
+    /// once the serialized `submit_next_queued` cycle drains the queue and
+    /// the in-flight slot. mio: `drain_pending_closes` retains the entry
+    /// until `pending_sends` is empty, then runs executor cleanup and
+    /// `finish_close`. Without the deferral, queued bytes were silently
+    /// truncated when the fd closed.
     pub close_pending: bool,
     /// Whether the Close SQE for the current occupant has been submitted
     /// (deferred close finalized, or force-finalized). From this point any
@@ -2019,6 +2022,7 @@ impl<'a> DriverCtx<'a> {
         } else {
             return;
         }
+        self.send_queues[conn.index as usize].close_pending = true;
         self.pending_closes.push(conn.index);
     }
 

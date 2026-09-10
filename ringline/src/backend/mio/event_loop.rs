@@ -513,13 +513,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                             .and_then(|t| t.get_mut(conn_index))
                             .map(|tc| tc.peer_sent_close_notify)
                             .unwrap_or(true);
-                        if let Some(cs) = self.driver.connections.get_mut(conn_index) {
-                            cs.recv_mode = RecvMode::Closed;
-                            if !close_notify_seen {
-                                cs.eof_truncated = true;
-                            }
+                        if !close_notify_seen
+                            && let Some(cs) = self.driver.connections.get_mut(conn_index)
+                        {
+                            cs.eof_truncated = true;
                         }
                         self.executor.wake_recv(conn_index);
+                        self.driver.close_connection(conn_index);
                         break;
                     }
                     Ok(n) => n,
@@ -530,10 +530,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     Err(error) => {
                         self.driver.tcp_streams[idx] = Some(stream);
                         let generation = self.driver.connections.generation(conn_index);
-                        if let Some(cs) = self.driver.connections.get_mut(conn_index) {
-                            cs.recv_mode = RecvMode::Closed;
-                        }
                         self.executor.fail_recv(conn_index, generation, error);
+                        self.driver.close_connection(conn_index);
                         break;
                     }
                 };
@@ -623,12 +621,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
             match stream.read(recv_buf) {
                 Ok(0) => {
-                    // EOF — mark connection as recv-closed.
-                    if let Some(cs) = self.driver.connections.get_mut(conn_index) {
-                        cs.recv_mode = RecvMode::Closed;
-                    }
-                    // Wake any task waiting for recv so it sees EOF.
+                    // EOF. Wake any recv waiter so it sees `0`, then request
+                    // teardown; finalize waits for queued sends to drain.
                     self.executor.wake_recv(conn_index);
+                    self.driver.close_connection(conn_index);
                     break;
                 }
                 Ok(n) => {
@@ -673,13 +669,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     break;
                 }
                 Err(error) => {
-                    // Read error — mark as closed and keep the exact error
-                    // for `with_data_result`; `with_data` still sees EOF.
+                    // Read error — keep the exact error for
+                    // `with_data_result` (`with_data` still sees EOF), then
+                    // request teardown.
                     let generation = self.driver.connections.generation(conn_index);
-                    if let Some(cs) = self.driver.connections.get_mut(conn_index) {
-                        cs.recv_mode = RecvMode::Closed;
-                    }
                     self.executor.fail_recv(conn_index, generation, error);
+                    self.driver.close_connection(conn_index);
                     break;
                 }
             }

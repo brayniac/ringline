@@ -80,9 +80,13 @@ pub(crate) struct Driver {
     pub(crate) wake_pipe_fd: RawFd,
     /// Whether to set TCP_NODELAY on accepted connections.
     pub(crate) tcp_nodelay: bool,
-    /// Connections closed this iteration, awaiting executor cleanup and
-    /// slot release by the event loop's `drain_pending_closes`. Deferring
-    /// the release (a) lets `Executor::remove_connection` run (stale parked
+    /// Connections whose teardown has been requested (`close_pending`),
+    /// awaiting executor cleanup and slot release by the event loop's
+    /// `drain_pending_closes`. An entry stays here until its
+    /// `pending_sends` have drained (or its stream is gone), so a response
+    /// queued after the peer's FIN is still delivered — the mio half of the
+    /// io_uring `try_finalize_close` deferral. Deferring the release also
+    /// (a) lets `Executor::remove_connection` run first (stale parked
     /// futures, waiter flags, and recv sinks used to survive into the
     /// slot's next occupant — a use-after-free via the recv-sink raw
     /// pointer), and (b) closes the reuse window between a task closing a
@@ -313,11 +317,17 @@ impl Driver {
         }
     }
 
-    /// Close and clean up a connection.
+    /// Request teardown of a connection. The only place (with the
+    /// `DriverCtx` close) that sets `RecvMode::Closed` on this backend —
+    /// see the invariant on `RecvMode::Closed`.
+    ///
+    /// Teardown itself (socket, buffers, executor state, slot release)
+    /// happens in the event loop's `drain_pending_closes`, which has
+    /// Executor access and defers until `pending_sends` has drained.
+    /// Marking `Closed` here makes the call idempotent.
     pub(crate) fn close_connection(&mut self, conn_index: u32) {
         let idx = conn_index as usize;
 
-        // Check that the connection is active and not already closing.
         if let Some(conn) = self.connections.get_mut(conn_index) {
             if matches!(conn.recv_mode, RecvMode::Closed) {
                 return; // already closing
@@ -326,10 +336,7 @@ impl Driver {
         } else {
             return;
         }
-        let _ = idx;
-        // Teardown (socket, buffers, executor state, slot release) happens
-        // in the event loop's drain_pending_closes, which has Executor
-        // access. Marking Closed above makes this idempotent.
+        self.send_queues[idx].close_pending = true;
         self.pending_closes.push(conn_index);
     }
 
@@ -394,6 +401,7 @@ impl Driver {
 
         self.send_queues[idx].queue.clear();
         self.send_queues[idx].in_flight = false;
+        self.send_queues[idx].close_pending = false;
 
         if self.connections.get(conn_index).is_some() {
             self.connections.release(conn_index);

@@ -33,7 +33,15 @@ pub enum RecvMode {
     /// Multishot recvmsg armed with provided buffer ring (with cmsg for timestamps).
     #[cfg(feature = "timestamps")]
     MsgMulti,
-    /// Connection is closing, no recv armed.
+    /// The receive side is finished — peer FIN, a read error, or a
+    /// requested close — and no recv is armed. Recv futures read this to
+    /// return `0`.
+    ///
+    /// Invariant on both backends: only the driver's `close_connection`
+    /// and the `DriverCtx` close set this. Teardown is requested at the
+    /// same moment (`ConnSendState::close_pending`) and finalizes once
+    /// queued sends drain. A backend that marks `Closed` without going
+    /// through `close_connection` leaks the slot (#368).
     Closed,
     /// Outbound connect SQE in-flight, no recv armed yet.
     Connecting,
