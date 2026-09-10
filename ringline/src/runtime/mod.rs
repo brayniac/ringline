@@ -439,7 +439,16 @@ pub(crate) struct Executor {
     /// Deliberately not cleared by `remove_connection`: the generation tag
     /// already prevents a reused slot from seeing the old error, and leaving
     /// it lets a task that polls after teardown learn the cause instead of a
-    /// bare `0`. The next `fail_recv` on the slot overwrites it.
+    /// bare `0`. The next `fail_recv` on the slot overwrites it, whatever its
+    /// generation (last writer wins; every backend error site is terminal
+    /// for the connection, so a second error for the same generation does
+    /// not occur in practice).
+    ///
+    /// Contract for readers: `WithDataResultFuture` consults this slot with
+    /// the generation it captured at construction, *after* the inner
+    /// `WithDataFuture` reports `0` — including when that `0` came from the
+    /// generation-mismatch short-circuit. That is what lets a poll that lands
+    /// after teardown still see the error.
     pub(crate) recv_errors: Vec<Option<(u32, stdio::Error)>>,
     /// Per-connection: task is awaiting send completion.
     pub(crate) send_waiters: Vec<bool>,
@@ -1038,6 +1047,7 @@ mod tests {
         let exec = Executor::new(16, 8, 8, 0, 0);
         assert!(exec.ready_queue.is_empty());
         assert_eq!(exec.recv_waiters.len(), 16);
+        assert_eq!(exec.recv_errors.len(), 16);
         assert_eq!(exec.send_waiters.len(), 16);
         assert_eq!(exec.connect_waiters.len(), 16);
         assert_eq!(exec.io_results.len(), 16);
