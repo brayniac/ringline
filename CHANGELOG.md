@@ -17,6 +17,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the series that lands #318 (design:
   `docs/backpressured-sends-series-design.md`).
 
+### Changed
+
+- mio: the connection lifecycle now matches io_uring. A peer FIN or a read
+  error requests teardown immediately (`close_connection`), and teardown
+  finalizes once queued sends have drained — a response sent after the
+  peer's FIN is still delivered in full — after which the connection task
+  is dropped. Previously a mio task could keep running indefinitely after
+  EOF. `RecvMode::Closed` is now set only by `close_connection` on both
+  backends. The deferral is unbounded on mio (`close_notify_timeout_ms`
+  is inert there). Design: `docs/mio-close-lifecycle-design.md`.
+
+### Fixed
+
+- mio: a connection whose peer closed first, or whose read failed, was never
+  torn down — the `TcpStream` stayed registered and the slot was never
+  released, so every such connection permanently consumed one slot and one
+  fd until `max_connections` was exhausted. `ConnCtx::close()` after EOF
+  took the same early return. (#368)
+
 ## [0.6.3] - 2026-09-09
 
 ### Fixed

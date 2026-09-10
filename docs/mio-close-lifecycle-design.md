@@ -69,9 +69,7 @@ of these rules; backend code comments point at them.
    on the TLS sites are unchanged. The sites no longer assign `recv_mode`.
 2. **`Driver::close_connection`** keeps its `Closed` guard, sets
    `recv_mode = Closed`, sets `send_queues[idx].close_pending = true`,
-   queues the TLS close_notify through the normal pending-send path when
-   the connection is TLS (so it drains with the rest instead of being a
-   best-effort write inside `finish_close`), and pushes to
+   and pushes to
    `pending_closes`. The `DriverCtx` close in `handler.rs` (mio branch)
    does the same via the same code, not a copy.
 3. **Finalize is deferred.** `drain_pending_closes` finalizes an entry only
@@ -88,9 +86,13 @@ of these rules; backend code comments point at them.
 4. **Task-exit and panic arms unchanged.** They call `close_connection`
    then `remove_connection` immediately; finalize's later
    `remove_connection` on an already-cleared slot is a no-op.
-5. **`finish_close`** loses the inline close_notify generation (moved to
-   step 2) and keeps everything else: nonblocking flush attempt,
-   deregister + drop, buffer reset, slot release, metrics.
+5. **`finish_close`** is unchanged apart from clearing `close_pending`. TLS
+   close_notify stays generated and written best-effort there: because
+   finalize is now deferred until `pending_sends` is empty, it runs on a
+   drained socket and the write succeeds in practice, and keeping it there
+   avoids duplicating TLS logic between `Driver::close_connection` and the
+   `DriverCtx` close (which cannot reach the TLS table). Decided during
+   planning.
 
 ## io_uring
 
@@ -122,9 +124,10 @@ In `ringline/tests/echo.rs`, all run on both backends:
   request, `shutdown(Write)`, then reads to EOF and asserts the full
   length. Proves the deferral on mio and parity on io_uring.
 
-Unit tests on the mio driver where a harness exists: `close_connection`
-sets `Closed` and `close_pending` and pushes once; a second call is a
-no-op; `finish_close` clears `close_pending`.
+The mio driver has no unit-test harness (no `#[cfg(test)]` module in
+`backend/mio/`), so the `close_connection`/`finish_close` flag behaviour is
+covered by the integration tests above plus a `debug_assert!` in
+`drain_pending_closes` that every entry carries `close_pending`.
 
 ## Docs
 

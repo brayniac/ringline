@@ -21,6 +21,18 @@ record gap) green on both backends.
 
 ## What happened
 
+- **Prerequisite — #368, mio close lifecycle.** PR 1's adversarial review
+  found that mio never tore down a peer-first-closed or read-errored
+  connection (`Closed` set directly at the read sites; `close_connection`
+  early-returned on it). Fixed by unifying on io_uring's model rather than
+  adding a mio-only flag: `Closed` has one setter, `close_pending` marks
+  teardown requested, and mio's `finish_close` is now deferred until
+  `pending_sends` drain, the same window io_uring already gives a task.
+  Review also caught that the deferral test's 4 MiB send would exhaust the
+  default 64-slot test copy pool on io_uring (one slot per 16 KiB chunk,
+  taken synchronously) — the test now uses an 8 MiB pool and asserts the
+  send outcome. Design: `docs/mio-close-lifecycle-design.md`. PR 3 (mio
+  `shutdown_write` deferral) and PR 6 build on this.
 - **PR 1 — `with_data_result`.** `Executor` gains a generation-tagged
   `recv_errors` slot written by `fail_recv` at the five real socket-read
   failure sites (mio: TLS and plaintext read errors in
