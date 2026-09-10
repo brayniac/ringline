@@ -7,7 +7,12 @@ on:
 jobs:
   tag-release:
     uses: brayniac/rust-workflows/.github/workflows/tag-release.yml@v1
-    secrets: inherit
+    # By name, not `secrets: inherit`: GitHub only carries inherited secrets
+    # between repositories in the same organization, and the shared workflow
+    # lives under a different owner. With `inherit` the v0.6.3 release passed
+    # the gate and failed at checkout with an empty token (run 34414344980).
+    secrets:
+      RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
     with:
       # The root is a virtual manifest; the core crate carries the released
       # version and its tag is `vX.Y.Z`.
