@@ -5268,11 +5268,16 @@ fn connection_task_panic_does_not_kill_worker() {
 /// 2 = Err(other); 3 = Ok(0).
 static WITH_DATA_RESULT_OUTCOME: AtomicU32 = AtomicU32::new(0);
 
+/// Incremented when `WithDataResultHandler::on_accept` starts, so a test can
+/// wait for the server side to exist before doing anything to the socket.
+static WITH_DATA_RESULT_ACCEPTED: AtomicU32 = AtomicU32::new(0);
+
 struct WithDataResultHandler;
 
 impl AsyncEventHandler for WithDataResultHandler {
     fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
         async move {
+            WITH_DATA_RESULT_ACCEPTED.fetch_add(1, Ordering::AcqRel);
             loop {
                 let outcome = match conn
                     .with_data_result(|data| ParseResult::Consumed(data.len()))
@@ -5310,6 +5315,19 @@ fn wait_for_with_data_result_outcome() -> u32 {
     WITH_DATA_RESULT_OUTCOME.load(Ordering::Acquire)
 }
 
+fn wait_for_with_data_result_accept(expected: u32) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while WITH_DATA_RESULT_ACCEPTED.load(Ordering::Acquire) < expected
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        WITH_DATA_RESULT_ACCEPTED.load(Ordering::Acquire) >= expected,
+        "server did not accept the connection"
+    );
+}
+
 /// Connect with retry until the server is accepting. Used instead of
 /// `wait_for_server`, whose probe connection would be accepted by the
 /// handler and would store an outcome of its own, so a test using it could
@@ -5335,6 +5353,7 @@ fn with_data_result_returns_ok_zero_on_clean_close() {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     WITH_DATA_RESULT_OUTCOME.store(0, Ordering::Release);
+    WITH_DATA_RESULT_ACCEPTED.store(0, Ordering::Release);
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
     let (shutdown, handles) = RinglineBuilder::new(test_config())
@@ -5343,6 +5362,7 @@ fn with_data_result_returns_ok_zero_on_clean_close() {
         .expect("launch failed");
 
     let mut stream = connect_with_retry(&addr);
+    wait_for_with_data_result_accept(1);
     stream.write_all(b"hello").unwrap();
     drop(stream); // orderly FIN
 
@@ -5366,6 +5386,7 @@ fn with_data_result_surfaces_tcp_reset() {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     WITH_DATA_RESULT_OUTCOME.store(0, Ordering::Release);
+    WITH_DATA_RESULT_ACCEPTED.store(0, Ordering::Release);
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
     let (shutdown, handles) = RinglineBuilder::new(test_config())
@@ -5374,6 +5395,7 @@ fn with_data_result_surfaces_tcp_reset() {
         .expect("launch failed");
 
     let stream = connect_with_retry(&addr);
+    wait_for_with_data_result_accept(1);
 
     // SO_LINGER with a zero timeout turns close() into an RST instead of a FIN.
     let linger = libc::linger {
