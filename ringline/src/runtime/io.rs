@@ -854,6 +854,11 @@ impl ConnCtx {
     /// empty input will see `Ok(n)` there and the recorded error only on the
     /// following call.
     ///
+    /// Only a failed socket read is reported this way. A TLS record-layer
+    /// error (a bad record, a failed decrypt) still closes the connection
+    /// through the EOF path and resolves to `Ok(0)`, indistinguishable from a
+    /// clean close, exactly as with `with_data`.
+    ///
     /// `with_data` keeps returning `0` for both cases; nothing about it
     /// changes. Use this variant when a protocol handler must tell "the peer
     /// hung up" from "the transport broke". Check
@@ -2240,10 +2245,9 @@ impl<F: FnMut(&[u8]) -> ParseResult + Unpin> Future for WithDataFuture<F> {
 /// that sent bytes and then reset still gets its bytes parsed before the
 /// reset is reported.
 ///
-/// The slot is consulted with the generation captured at construction and
-/// only after the inner future reports `0` — including a `0` from the inner
-/// future's stale-generation short-circuit — so a poll that lands after the
-/// connection was torn down still learns the cause.
+/// The generation used for the lookup is the one captured at construction;
+/// `Executor::recv_errors` documents why that is what makes a post-teardown
+/// poll still see the cause.
 ///
 /// Dropping the future before it resolves is inert: it registers no state
 /// beyond what `WithDataFuture` registers, and the error slot stays readable,

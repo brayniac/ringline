@@ -29,7 +29,7 @@ record gap) green on both backends.
   branch under the `timestamps` feature in `backend/uring/event_loop.rs`).
   `WithDataResultFuture` wraps `WithDataFuture` and consults the slot, with
   the generation captured at construction, only when the inner future
-  reports `0`. Two departures from #318's version: no pre-poll check of the
+  reports `0`. Departures 7 and 8 in the design doc: no pre-poll check of the
   slot (redundant — every `fail_recv` site sets `RecvMode::Closed` or calls
   `close_connection`, so the inner future reports `0` on the same poll), and
   the slot is not cleared on teardown (the generation tag makes that safe,

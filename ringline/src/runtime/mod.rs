@@ -444,6 +444,13 @@ pub(crate) struct Executor {
     /// for the connection, so a second error for the same generation does
     /// not occur in practice).
     ///
+    /// Known exception on io_uring: a `RecvMulti` CQE carries no generation,
+    /// so if `close_connection`'s async-cancel could not be submitted (full
+    /// SQ) a stale error CQE can reach the error branch after the slot was
+    /// reused and be stored under the new occupant's generation. Pre-existing
+    /// hazard, recorded in `docs/journal/2026-09-backpressured-sends-series.md`,
+    /// to be closed when the multishot handlers are reworked (series PR 7).
+    ///
     /// Contract for readers: `WithDataResultFuture` consults this slot with
     /// the generation it captured at construction, *after* the inner
     /// `WithDataFuture` reports `0` — including when that `0` came from the

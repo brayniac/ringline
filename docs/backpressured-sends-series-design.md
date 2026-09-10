@@ -63,6 +63,17 @@ them cites this section.
 6. **Both new futures are documented** (admission semantics, cancellation,
    error kinds). #318 moved `SendFuture`'s comment onto the new future and
    left `WithDataResultFuture` bare.
+7. **`WithDataResultFuture` does not pre-check the error slot.** #318's
+   wrapper looked at the slot before polling the inner future. Redundant:
+   every `fail_recv` site sets `RecvMode::Closed` or calls
+   `close_connection`, so the inner future reports `0` on the same poll and
+   the wrapper consults the slot then, with the generation it captured at
+   construction.
+8. **The recv error slot is not cleared on teardown.** The generation tag
+   makes clearing unnecessary (a reused slot cannot hand the previous
+   occupant's error to the new connection), and leaving the entry lets a
+   poll that lands after teardown still learn the cause instead of a bare
+   `0`. Last writer wins.
 
 ## The series
 
@@ -94,7 +105,9 @@ Executor gains `recv_errors: Vec<Option<(generation, io::Error)>>`,
 `fail_recv`, `take_recv_error`. Both event loops call `fail_recv` where they
 currently `wake_recv` on a recv error (three sites on io_uring, two on mio).
 `with_data` is unchanged. Re-export `WithDataResultFuture`.
-Test: `with_data_result_surfaces_tcp_reset` (peer sets `SO_LINGER 0`).
+Departures 7 and 8 apply. Tests: `with_data_result_returns_ok_zero_on_clean_close`
+and `with_data_result_surfaces_tcp_reset` (peer sets `SO_LINGER 0` so `close()`
+sends RST), both gated on the handler having accepted.
 Changelog: Added.
 
 ### PR 2 — Worker startup rollback diagnostics
