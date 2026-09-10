@@ -905,12 +905,32 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
     }
 
-    /// Finish teardown for connections closed since the last drain.
+    /// Finish teardown for connections whose close was requested, once
+    /// their queued sends have drained.
+    ///
+    /// An entry whose `pending_sends` is still non-empty (and whose stream
+    /// is still registered) is retained for a later pass: the task stays
+    /// alive so its awaited sends can complete, `flush_all_pending_sends`
+    /// registers writable interest for it, and the writable event brings
+    /// the loop back here. A write error clears `pending_sends`
+    /// (`fail_connection_on_send_error`), which ends the deferral.
+    ///
     /// Executor cleanup runs first — the slot must not be released (and
     /// reusable) while a stale parked future, waiter flags, or a recv-sink
     /// raw pointer still reference it.
     fn drain_pending_closes(&mut self) {
-        while let Some(conn_index) = self.driver.pending_closes.pop() {
+        let mut i = 0;
+        while i < self.driver.pending_closes.len() {
+            let conn_index = self.driver.pending_closes[i];
+            let idx = conn_index as usize;
+            let sends_drained =
+                self.driver.pending_sends[idx].is_empty() || self.driver.tcp_streams[idx].is_none();
+            if !sends_drained {
+                self.driver.mark_send_dirty(idx);
+                i += 1;
+                continue;
+            }
+            self.driver.pending_closes.swap_remove(i);
             self.executor.remove_connection(conn_index);
             self.driver.finish_close(conn_index);
         }
