@@ -5357,3 +5357,49 @@ fn with_data_result_returns_ok_zero_on_clean_close() {
         handle.join().unwrap().unwrap();
     }
 }
+
+#[test]
+fn with_data_result_surfaces_tcp_reset() {
+    use std::os::fd::AsRawFd;
+
+    let _guard = WITH_DATA_RESULT_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    WITH_DATA_RESULT_OUTCOME.store(0, Ordering::Release);
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
+        .bind(addr.parse().unwrap())
+        .launch::<WithDataResultHandler>()
+        .expect("launch failed");
+
+    let stream = connect_with_retry(&addr);
+
+    // SO_LINGER with a zero timeout turns close() into an RST instead of a FIN.
+    let linger = libc::linger {
+        l_onoff: 1,
+        l_linger: 0,
+    };
+    let rc = unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_LINGER,
+            &linger as *const libc::linger as *const libc::c_void,
+            std::mem::size_of::<libc::linger>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(rc, 0, "setsockopt(SO_LINGER) failed");
+    drop(stream);
+
+    assert_eq!(
+        wait_for_with_data_result_outcome(),
+        1,
+        "an RST must surface as Err(ConnectionReset|ConnectionAborted)"
+    );
+
+    shutdown.shutdown();
+    for handle in handles {
+        handle.join().unwrap().unwrap();
+    }
+}

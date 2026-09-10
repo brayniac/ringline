@@ -905,7 +905,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 }
                 return;
             }
-            self.executor.wake_recv(conn_index);
+            self.executor
+                .fail_recv(conn_index, owner_gen, io::Error::from_raw_os_error(-result));
             self.driver.close_connection(conn_index);
             return;
         }
@@ -1088,7 +1089,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 self.maybe_rearm_throttled_forward(conn_index);
                 return;
             } else if !has_more {
-                self.executor.wake_recv(conn_index);
+                let generation = self.driver.connections.generation(conn_index);
+                self.executor.fail_recv(
+                    conn_index,
+                    generation,
+                    io::Error::from_raw_os_error(errno),
+                );
                 self.driver.close_connection(conn_index);
             }
             return;
@@ -1491,7 +1497,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             } else if errno == libc::ECANCELED {
                 return;
             } else if !has_more {
-                self.executor.wake_recv(conn_index);
+                let generation = self.driver.connections.generation(conn_index);
+                self.executor.fail_recv(
+                    conn_index,
+                    generation,
+                    io::Error::from_raw_os_error(errno),
+                );
                 self.driver.close_connection(conn_index);
             }
             return;

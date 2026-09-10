@@ -692,8 +692,6 @@ impl Executor {
     /// failed with a real (non-`WouldBlock`) socket error. `with_data`
     /// callers still observe EOF; `with_data_result` callers observe the
     /// error via [`take_recv_error`](Self::take_recv_error).
-    // Called by the backends and WithDataResultFuture (series PR 1, later tasks).
-    #[allow(dead_code)]
     pub(crate) fn fail_recv(&mut self, conn_index: u32, generation: u32, error: stdio::Error) {
         let idx = conn_index as usize;
         if idx < self.recv_errors.len() {
