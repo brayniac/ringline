@@ -28,7 +28,6 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use super::io::{ConnCtx, with_state};
-use crate::connection::RecvMode;
 use crate::runtime::CURRENT_TASK_ID;
 
 /// Wraps a [`ConnCtx`] and implements [`AsyncRead`], [`AsyncWrite`], and
@@ -77,7 +76,7 @@ impl ConnStream {
         driver
             .connections
             .get(conn_index)
-            .map(|c| matches!(c.recv_mode, RecvMode::Closed))
+            .map(|c| c.recv_finished())
             .unwrap_or(true)
     }
 

@@ -22,7 +22,7 @@ pub(crate) struct ConnSendState {
     /// Teardown has been requested for this connection (peer FIN, read
     /// error, task return, or an explicit close) and is deferred until
     /// queued sends drain. Set by the driver's `close_connection` and the
-    /// `DriverCtx` close on both backends, alongside `RecvMode::Closed`.
+    /// `DriverCtx` close on both backends, alongside `Lifecycle::Closing`.
     ///
     /// io_uring: the `Close` SQE is submitted from `try_finalize_close`,
     /// driven from the event loop's end-of-iteration drain of
@@ -39,7 +39,7 @@ pub(crate) struct ConnSendState {
     /// still-in-flight send CQE must not push new SQEs (resubmits, POLLOUT
     /// arms) for this connection — they would race the in-flight Close.
     /// Cleared by `reset_send_state` at slot reactivation. Distinct from
-    /// `recv_mode == Closed`, which also covers half-close (peer FIN with
+    /// `recv_finished()`, which also covers half-close (peer FIN with
     /// legitimate sends still flowing).
     #[cfg_attr(not(has_io_uring), allow(dead_code))]
     pub close_submitted: bool,
@@ -449,10 +449,10 @@ impl<'a> DriverCtx<'a> {
             // re-running would queue a duplicate close_notify and, after the
             // first finalize cleared close_pending, submit a duplicate Close
             // SQE. Same guard as close_connection and the mio ctx close.
-            if matches!(conn_state.recv_mode, crate::connection::RecvMode::Closed) {
+            if conn_state.close_requested() {
                 return;
             }
-            conn_state.recv_mode = crate::connection::RecvMode::Closed;
+            conn_state.lifecycle = crate::connection::Lifecycle::Closing;
 
             // Graceful TLS shutdown: queue close_notify ciphertext through
             // the per-connection send queue so it serializes behind any
@@ -904,13 +904,16 @@ impl<'a> DriverCtx<'a> {
         }
 
         // Determine target op to cancel.
-        let target_tag = match cs.recv_mode {
-            crate::connection::RecvMode::Connecting => crate::completion::OpTag::Connect,
-            crate::connection::RecvMode::Multi => crate::completion::OpTag::RecvMulti,
-            #[cfg(feature = "timestamps")]
-            crate::connection::RecvMode::MsgMulti => crate::completion::OpTag::RecvMsgMultiTs,
-            crate::connection::RecvMode::Closed => {
-                return Ok(()); // nothing to cancel
+        let target_tag = if matches!(cs.lifecycle, crate::connection::Lifecycle::Connecting) {
+            crate::completion::OpTag::Connect
+        } else {
+            match cs.recv_arm {
+                crate::connection::RecvArm::Multi => crate::completion::OpTag::RecvMulti,
+                #[cfg(feature = "timestamps")]
+                crate::connection::RecvArm::MsgMulti => crate::completion::OpTag::RecvMsgMultiTs,
+                crate::connection::RecvArm::Idle => {
+                    return Ok(()); // nothing to cancel
+                }
             }
         };
 
@@ -927,7 +930,13 @@ impl<'a> DriverCtx<'a> {
             let _ = self.ring.submit_async_cancel(timeout_ud.raw(), conn.index);
         }
 
-        cs.recv_mode = crate::connection::RecvMode::Closed;
+        // The application cancelled the receive: recv futures resolve to
+        // EOF from here on and nothing is armed. The lifecycle is untouched —
+        // cancel is not a close, so a later close_connection still tears the
+        // connection down (before the split, cancel set `Closed` and the later
+        // close was a no-op: the slot leaked).
+        cs.read = crate::connection::ReadHalf::Cancelled;
+        cs.recv_arm = crate::connection::RecvArm::Idle;
 
         let target_ud = crate::completion::UserData::encode(target_tag, conn.index, 0);
         self.ring.submit_async_cancel(target_ud.raw(), conn.index)?;
@@ -2018,10 +2027,10 @@ impl<'a> DriverCtx<'a> {
             if cs.generation != conn.generation {
                 return;
             }
-            if matches!(cs.recv_mode, crate::connection::RecvMode::Closed) {
+            if cs.close_requested() {
                 return;
             }
-            cs.recv_mode = crate::connection::RecvMode::Closed;
+            cs.lifecycle = crate::connection::Lifecycle::Closing;
         } else {
             return;
         }
