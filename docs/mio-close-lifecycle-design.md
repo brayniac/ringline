@@ -84,12 +84,14 @@ of these rules; backend code comments point at them.
    until its sends have drained. Deferral is unbounded, as on io_uring;
    a write error ends it.
 
-   **Correction from CI (#371):** io_uring's deferral covers only sends
-   that were already queued when the FIN arrived. With an empty queue,
-   `close_connection` runs `try_finalize_close` synchronously and commits
-   the Close SQE before the task is polled, so a response sent after EOF
-   is never delivered on io_uring today. mio after this change is the
-   more lenient backend; io_uring is fixed separately under #371.
+   **Correction from CI, resolved (#371):** at the time of #370, io_uring's
+   deferral covered only sends already queued when the FIN arrived; with an
+   empty queue `close_connection` ran `try_finalize_close` synchronously
+   and committed the Close before the task was polled, so a post-EOF
+   response was never delivered. #371 moved that finalize to the event
+   loop's end-of-iteration drain of `pending_finalize_closes` (where
+   `DriverCtx::close` already was), so both backends now give the task the
+   same poll window.
 4. **Task-exit and panic arms unchanged.** They call `close_connection`
    then `remove_connection` immediately; finalize's later
    `remove_connection` on an already-cleared slot is a no-op.
@@ -129,11 +131,11 @@ In `ringline/tests/echo.rs`, all run on both backends:
 - `response_after_peer_fin_is_delivered`: the handler reads to EOF, then
   sends a 4 MiB response and returns; the client connects, sends a short
   request, `shutdown(Write)`, then reads to EOF and asserts the full
-  length. Proves the deferral on mio. **mio-only** (`cfg(not(has_io_uring))`)
-  until #371: on io_uring it receives 0 bytes (CI, run 34530460078).
+  length. Proves the deferral on both backends (it received 0 bytes on
+  io_uring until #371 — CI run 34530460078).
 - `deferred_close_does_not_spin_on_half_closed_peer`: counts loop
   iterations while the response drains to a peer that does not read;
-  guards against the READABLE re-report spin. mio-only for the same reason.
+  guards against the READABLE re-report spin. Runs on both backends.
 
 The mio driver has no unit-test harness (no `#[cfg(test)]` module in
 `backend/mio/`), so the `close_connection`/`finish_close` flag behaviour is

@@ -383,11 +383,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
             drop(guard);
 
-            // Re-drive deferred finalizes for connections closed from the
-            // ctx callbacks above (`DriverCtx::close` sets close_pending and
-            // registers the index here). try_finalize_close is guarded, so a
-            // connection with sends/chains still outstanding just waits for
-            // its CQEs to re-drive via note_send_finalized.
+            // Finalize every close requested this iteration — by
+            // `close_connection` from a CQE handler or the task-exit arm, or
+            // by `DriverCtx::close` from a task. Deliberately after
+            // `poll_ready_tasks`, so a task woken by the peer's FIN gets its
+            // poll and a send it queues drains before the Close is committed
+            // (#371). try_finalize_close is guarded, so a connection with
+            // sends/chains still outstanding just waits for its CQEs to
+            // re-drive via note_send_finalized.
             if !self.driver.pending_finalize_closes.is_empty() {
                 let mut pending = std::mem::take(&mut self.driver.pending_finalize_closes);
                 for conn_index in pending.drain(..) {
@@ -4927,7 +4930,8 @@ mod tests {
 
         assert!(el.driver.connections.get(conn_index).is_some());
 
-        // Close the connection (sets recv_mode = Closed, submits Close SQE).
+        // Request the close (sets recv_mode = Closed; the Close SQE is
+        // committed by the event loop's drain, simulated by the CQE below).
         el.driver.close_connection(conn_index);
 
         // Simulate Close CQE.
@@ -4939,6 +4943,46 @@ mod tests {
             el.driver.connections.get(conn_index).is_none(),
             "connection slot not released after Close CQE"
         );
+    }
+
+    /// #371: a close requested by the driver (peer FIN, read error, task
+    /// exit) must not commit the Close SQE synchronously — the task gets its
+    /// poll window first. The event loop's end-of-iteration drain of
+    /// `pending_finalize_closes` commits it.
+    #[test]
+    fn close_connection_on_idle_connection_defers_finalize_to_the_drain() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+
+        el.driver.close_connection(conn_index);
+
+        let state = &el.driver.send_queues[conn_index as usize];
+        assert!(state.close_pending, "close must be pending");
+        assert!(
+            !state.close_submitted,
+            "Close must not be committed before the drain"
+        );
+        assert!(el.driver.pending_finalize_closes.contains(&conn_index));
+
+        // A repeated request is a no-op and does not double-register.
+        el.driver.close_connection(conn_index);
+        assert_eq!(
+            el.driver
+                .pending_finalize_closes
+                .iter()
+                .filter(|&&i| i == conn_index)
+                .count(),
+            1
+        );
+
+        // The drain commits it.
+        let pending = std::mem::take(&mut el.driver.pending_finalize_closes);
+        for idx in pending {
+            el.driver.try_finalize_close(idx);
+        }
+        let state = &el.driver.send_queues[conn_index as usize];
+        assert!(state.close_submitted, "drain must commit the Close");
+        assert!(!state.close_pending);
     }
 
     // ── Recv data delivery tests ───────────────────────────────────

@@ -31,7 +31,10 @@ record gap) green on both backends.
   window when the queue was empty at the FIN (`try_finalize_close` runs
   synchronously and commits the Close before the task polls; a post-EOF
   response is never delivered) — #371, to be fixed with PR 7's handler
-  rework. The two post-FIN-send tests are mio-only until then.
+  rework. **Closed the same day (#371 PR):** `close_connection`'s
+  empty-queue branch now defers to the event loop's `pending_finalize_closes`
+  drain instead of finalizing synchronously — a three-line change plus an
+  io_uring unit test — and the two post-FIN-send tests run on both backends.
   Review also caught that the deferral test's 4 MiB send would exhaust the
   default 64-slot test copy pool on io_uring (one slot per 16 KiB chunk,
   taken synchronously) — the test now uses an 8 MiB pool and asserts the

@@ -421,8 +421,13 @@ pub(crate) struct Driver {
     pub(crate) pending_recv_forward_retries: Vec<(u32, u32, u16, u8)>,
     /// Pending close retries: (conn_index, retries). Drained each tick.
     pub(crate) pending_close_retries: Vec<(u32, u8)>,
-    /// Connections whose close_pending was set from a DriverCtx callback;
-    /// the event loop re-drives `try_finalize_close` for each.
+    /// Connections whose close was requested this iteration — by
+    /// `close_connection` (peer FIN, read error, task exit, setup failure)
+    /// or by `DriverCtx::close` — and whose finalize is owed to the event
+    /// loop's end-of-iteration drain (after `poll_ready_tasks`, so the task
+    /// gets its poll window; #371). The drain re-drives
+    /// `try_finalize_close` for each; entries with sends still outstanding
+    /// are re-driven later by their CQEs via `note_send_finalized`.
     pub(crate) pending_finalize_closes: Vec<u32>,
     /// Scratch buffers swapped with the corresponding `pending_*_retries`
     /// queue at drain time so the per-tick drain reuses a single allocation
@@ -1121,7 +1126,16 @@ impl Driver {
                 // already fired try_finalize_close.
             }
         } else {
-            self.try_finalize_close(conn_index);
+            // Nothing queued: do NOT finalize here. Committing the Close SQE
+            // inside this call ran before the task was polled, so a task
+            // that read EOF and then sent a response found the Close already
+            // committed and its send refused (#371). Hand the finalize to the
+            // event loop's end-of-iteration drain — the same path an explicit
+            // `DriverCtx::close` takes — so the task gets its poll window and
+            // a send queued in it drains under `close_pending` first.
+            if !self.pending_finalize_closes.contains(&conn_index) {
+                self.pending_finalize_closes.push(conn_index);
+            }
         }
     }
 
