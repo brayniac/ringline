@@ -24,9 +24,12 @@ pub(crate) struct ConnSendState {
     /// queued sends drain. Set by the driver's `close_connection` and the
     /// `DriverCtx` close on both backends, alongside `RecvMode::Closed`.
     ///
-    /// io_uring: the `Close` SQE is submitted from `try_finalize_close`
-    /// once the serialized `submit_next_queued` cycle drains the queue and
-    /// the in-flight slot. mio: `drain_pending_closes` retains the entry
+    /// io_uring: the `Close` SQE is submitted from `try_finalize_close`,
+    /// driven from the event loop's end-of-iteration drain of
+    /// `pending_finalize_closes` (never synchronously inside the close
+    /// request, so the task gets its poll window — #371) and re-driven by
+    /// send CQEs until the serialized `submit_next_queued` cycle drains the
+    /// queue and the in-flight slot. mio: `drain_pending_closes` retains the entry
     /// until `pending_sends` is empty, then runs executor cleanup and
     /// `finish_close`. Without the deferral, queued bytes were silently
     /// truncated when the fd closed.

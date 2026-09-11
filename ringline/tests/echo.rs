@@ -5593,24 +5593,16 @@ fn close_after_eof_releases_the_slot() {
     assert_sequential_connections::<EchoThenClose>(6, ClientClose::Fin);
 }
 
-// The two post-FIN send tests below run on mio only: on io_uring the FIN
-// path commits the Close SQE before the task is polled, so a response sent
-// after EOF is never delivered (ringline-rs/ringline#371). Re-enable on
-// io_uring when #371 lands.
-#[cfg(not(has_io_uring))]
 /// Handler that reads until EOF, then sends a large response and returns.
 struct RespondAfterEof;
 
-#[cfg(not(has_io_uring))]
 const RESPONSE_AFTER_EOF_LEN: usize = 4 * 1024 * 1024;
 
-#[cfg(not(has_io_uring))]
 /// Outcome of the post-EOF send in `RespondAfterEof`: 0 = not run,
 /// 1 = `send()` accepted the buffer and the await completed, 2 = `send()`
 /// refused it (e.g. copy pool exhausted), 3 = the await returned an error.
 static RESPONSE_AFTER_EOF_SEND: AtomicU32 = AtomicU32::new(0);
 
-#[cfg(not(has_io_uring))]
 /// `test_config()` with an 8 MiB copy pool: the io_uring `send()` takes one
 /// pool slot per 16 KiB chunk synchronously, so a 4 MiB send needs 256 slots
 /// up front (the default 64-slot test pool fails at chunk 65).
@@ -5621,7 +5613,6 @@ fn large_send_config() -> Config {
         .expect("valid config")
 }
 
-#[cfg(not(has_io_uring))]
 impl AsyncEventHandler for RespondAfterEof {
     fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
         async move {
@@ -5652,7 +5643,6 @@ impl AsyncEventHandler for RespondAfterEof {
 /// A response sent after the peer's FIN must still be delivered in full:
 /// teardown waits for queued sends to drain (on mio, `finish_close` is
 /// deferred; on io_uring the Close SQE already is).
-#[cfg(not(has_io_uring))]
 #[test]
 fn response_after_peer_fin_is_delivered() {
     RESPONSE_AFTER_EOF_SEND.store(0, Ordering::Release);
@@ -5696,7 +5686,6 @@ fn response_after_peer_fin_is_delivered() {
     }
 }
 
-#[cfg(not(has_io_uring))]
 /// Counts `on_tick` calls, i.e. event-loop iterations, while a response
 /// drains to a peer that half-closed and is slow to read. A loop that
 /// re-reports the peer's EOF every iteration spins at hundreds of
@@ -5704,10 +5693,8 @@ fn response_after_peer_fin_is_delivered() {
 /// ticks at most every few milliseconds.
 static DRAIN_TICKS: AtomicU32 = AtomicU32::new(0);
 
-#[cfg(not(has_io_uring))]
 struct RespondAfterEofCountingTicks;
 
-#[cfg(not(has_io_uring))]
 impl AsyncEventHandler for RespondAfterEofCountingTicks {
     fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
         async move {
@@ -5733,7 +5720,6 @@ impl AsyncEventHandler for RespondAfterEofCountingTicks {
     }
 }
 
-#[cfg(not(has_io_uring))]
 #[test]
 fn deferred_close_does_not_spin_on_half_closed_peer() {
     DRAIN_TICKS.store(0, Ordering::Relaxed);
