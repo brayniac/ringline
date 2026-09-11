@@ -906,6 +906,13 @@ impl<'a> DriverCtx<'a> {
             ));
         }
 
+        // A close already requested owns the teardown (and its own recv
+        // cancel from try_finalize_close); a cancel in that window is a
+        // no-op, as it was when the old `Closed` state covered both.
+        if cs.close_requested() {
+            return Ok(());
+        }
+
         // Determine target op to cancel.
         let target_tag = if matches!(cs.lifecycle, crate::connection::Lifecycle::Connecting) {
             crate::completion::OpTag::Connect
@@ -938,7 +945,11 @@ impl<'a> DriverCtx<'a> {
         // cancel is not a close, so a later close_connection still tears the
         // connection down (before the split, cancel set `Closed` and the later
         // close was a no-op: the slot leaked).
-        cs.read = crate::connection::ReadHalf::Cancelled;
+        // Never relabel a read half the peer already finished (an
+        // `Eof { truncated: true }` must stay visible to `eof_truncated()`).
+        if matches!(cs.read, crate::connection::ReadHalf::Open) {
+            cs.read = crate::connection::ReadHalf::Cancelled;
+        }
         cs.recv_arm = crate::connection::RecvArm::Idle;
 
         let target_ud = crate::completion::UserData::encode(target_tag, conn.index, 0);

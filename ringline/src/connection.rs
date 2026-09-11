@@ -178,6 +178,7 @@ impl ConnectionState {
     /// multishot recv is (about to be) armed.
     pub fn mark_connected(&mut self) {
         self.lifecycle = Lifecycle::Open;
+        self.read = ReadHalf::Open;
         self.recv_arm = RecvArm::Multi;
     }
 

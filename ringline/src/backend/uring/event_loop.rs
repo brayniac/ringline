@@ -4698,7 +4698,10 @@ mod tests {
         let generation = el.driver.connections.generation(conn_index);
 
         if let Some(cs) = el.driver.connections.get_mut(conn_index) {
-            cs.note_eof(false); // peer FIN, no close initiated
+            // Peer FIN with the close requested but not yet committed: the
+            // deferred-close drain window this test exists to cover.
+            cs.note_eof(false);
+            cs.lifecycle = Lifecycle::Closing;
         }
         assert!(!el.driver.send_queues[conn_index as usize].close_submitted);
 
@@ -5001,6 +5004,36 @@ mod tests {
         let state = &el.driver.send_queues[conn_index as usize];
         assert!(state.close_submitted, "drain must commit the Close");
         assert!(!state.close_pending);
+    }
+
+    /// A cancel that lands after a close was requested is a no-op: the close
+    /// owns the teardown (and its own recv cancel), and a read half the peer
+    /// already finished must keep its `Eof { truncated }` for
+    /// `eof_truncated()`. Before the state split the old `Closed` state
+    /// covered both cases and `cancel` returned early.
+    #[test]
+    fn cancel_after_close_is_a_no_op_and_keeps_truncation() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        if let Some(cs) = el.driver.connections.get_mut(conn_index) {
+            cs.note_eof(true); // TLS FIN without close_notify
+        }
+        el.driver.close_connection(conn_index);
+        let before = el.driver.pending_finalize_closes.len();
+        {
+            let mut ctx = el.driver.make_ctx();
+            let _ = ctx.cancel(crate::handler::ConnToken::new(conn_index, generation));
+        }
+        let cs = el.driver.connections.get(conn_index).unwrap();
+        assert_eq!(
+            cs.read,
+            ReadHalf::Eof { truncated: true },
+            "cancel after close must not relabel a finished read half"
+        );
+        assert_eq!(cs.recv_arm, RecvArm::Multi, "cancel after close is a no-op");
+        assert!(cs.close_requested());
+        assert_eq!(el.driver.pending_finalize_closes.len(), before);
     }
 
     /// Cancelling the receive (`DriverCtx::cancel`) finishes the read half

@@ -34,7 +34,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `RecvMode` doing triple duty; readers use `recv_finished()` and
   `close_requested()`. No observable change except that a connection whose
   receive was cancelled via `DriverCtx::cancel` (io_uring) can now be
-  closed afterwards — it used to leak its slot. Design:
+  closed afterwards — it used to leak its slot — and reports
+  `is_alive() == true` until it is closed. Design:
   `docs/connection-state-model-design.md`.
 
 ### Fixed
