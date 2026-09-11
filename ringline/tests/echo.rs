@@ -5766,10 +5766,14 @@ fn deferred_close_does_not_spin_on_half_closed_peer() {
         handle.join().unwrap().unwrap();
     }
     // A spinning loop re-reports the peer's EOF every iteration and did
-    // ~270k ticks in 500 ms when this bug was live; a healthy loop stays
-    // within a small factor of its idle cadence. The floor keeps a
-    // near-zero baseline (mio) from making the bound too tight.
-    let bound = baseline.max(200) * 10;
+    // ~270k ticks in 500 ms when this bug was live — over 500x the idle
+    // cadence. A healthy loop with sends outstanding runs faster than idle
+    // but nowhere near that: io_uring's send-completion and flush-deadline
+    // traffic put it at ~11x idle on the validation host (473 idle vs 5,317
+    // retained per 500 ms), mio stays at its 10 ms poll cap. Fifty times
+    // idle separates the two by an order of magnitude either way; the floor
+    // keeps a near-zero baseline from making the bound too tight.
+    let bound = baseline.max(200) * 50;
     assert!(
         ticks < bound,
         "event loop spun while a close was deferred: {ticks} ticks in 500 ms \
