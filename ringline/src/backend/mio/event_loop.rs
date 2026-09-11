@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use crate::backend::Driver;
 use crate::config::Config;
-use crate::connection::RecvMode;
+use crate::connection::{Lifecycle, ReadHalf};
 use crate::metrics;
 use crate::runtime::handler::AsyncEventHandler;
 use crate::runtime::io::{ConnCtx, DriverState, UdpCtx, set_driver_state_guarded};
@@ -198,7 +198,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                             .driver
                             .connections
                             .get(conn_index)
-                            .is_some_and(|cs| matches!(cs.recv_mode, RecvMode::Connecting));
+                            .is_some_and(|cs| matches!(cs.lifecycle, Lifecycle::Connecting));
                         if connecting {
                             // Writable (or error — handle_writable reads
                             // SO_ERROR) resolves the connect FIRST. Handling
@@ -490,7 +490,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             .driver
             .connections
             .get(conn_index)
-            .is_some_and(|c| matches!(c.recv_mode, RecvMode::Closed))
+            .is_some_and(|c| c.recv_finished())
         {
             return;
         }
@@ -525,10 +525,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                             .and_then(|t| t.get_mut(conn_index))
                             .map(|tc| tc.peer_sent_close_notify)
                             .unwrap_or(true);
-                        if !close_notify_seen
-                            && let Some(cs) = self.driver.connections.get_mut(conn_index)
-                        {
-                            cs.eof_truncated = true;
+                        if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+                            cs.note_eof(!close_notify_seen);
                         }
                         self.executor.wake_recv(conn_index);
                         self.driver.close_connection(conn_index);
@@ -541,6 +539,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     }
                     Err(error) => {
                         self.driver.tcp_streams[idx] = Some(stream);
+                        if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+                            cs.read = ReadHalf::Error;
+                        }
                         let generation = self.driver.connections.generation(conn_index);
                         self.executor.fail_recv(conn_index, generation, error);
                         self.driver.close_connection(conn_index);
@@ -615,6 +616,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                         break;
                     }
                     crate::tls::TlsRecvResult::Closed => {
+                        if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+                            cs.note_eof(false);
+                        }
                         self.executor.wake_recv(conn_index);
                         self.driver.close_connection(conn_index);
                         break;
@@ -635,6 +639,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 Ok(0) => {
                     // EOF. Wake any recv waiter so it sees `0`, then request
                     // teardown; finalize waits for queued sends to drain.
+                    if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+                        cs.note_eof(false);
+                    }
                     self.executor.wake_recv(conn_index);
                     self.driver.close_connection(conn_index);
                     break;
@@ -684,6 +691,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     // Read error — keep the exact error for
                     // `with_data_result` (`with_data` still sees EOF), then
                     // request teardown.
+                    if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+                        cs.read = ReadHalf::Error;
+                    }
                     let generation = self.driver.connections.generation(conn_index);
                     self.executor.fail_recv(conn_index, generation, error);
                     self.driver.close_connection(conn_index);
@@ -699,7 +709,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
         // Check if this is a connecting socket completing its connect.
         if let Some(cs) = self.driver.connections.get_mut(conn_index)
-            && matches!(cs.recv_mode, RecvMode::Connecting)
+            && matches!(cs.lifecycle, Lifecycle::Connecting)
         {
             // Connect completed — check SO_ERROR for connect failure.
             // Clear any connect timeout.
@@ -718,7 +728,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             };
 
             if result.is_ok() {
-                cs.recv_mode = RecvMode::Multi;
+                cs.mark_connected();
 
                 // Set TCP_NODELAY if configured.
                 if self.driver.tcp_nodelay

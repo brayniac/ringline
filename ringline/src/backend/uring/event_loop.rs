@@ -10,7 +10,7 @@ use crate::backend::Driver;
 use crate::backend::sockaddr_to_socket_addr;
 use crate::chain::ChainEvent;
 use crate::completion::{OpTag, UserData};
-use crate::connection::RecvMode;
+use crate::connection::{Lifecycle, ReadHalf, RecvArm};
 use crate::metrics;
 use crate::runtime::handler::AsyncEventHandler;
 use crate::runtime::io::{ConnCtx, DriverState, UdpCtx, set_driver_state_guarded};
@@ -797,11 +797,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 i += 1;
                 continue;
             }
-            let alive = self
-                .driver
-                .connections
-                .get(conn_index)
-                .is_some_and(|c| matches!(c.recv_mode, RecvMode::Multi));
+            let alive = self.driver.connections.get(conn_index).is_some_and(|c| {
+                matches!(c.lifecycle, Lifecycle::Open) && matches!(c.recv_arm, RecvArm::Multi)
+            });
             if !alive {
                 self.driver.recv_starved.swap_remove(i);
                 continue;
@@ -908,6 +906,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 }
                 return;
             }
+            if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+                cs.read = ReadHalf::Error;
+            }
             self.executor
                 .fail_recv(conn_index, owner_gen, io::Error::from_raw_os_error(-result));
             self.driver.close_connection(conn_index);
@@ -923,6 +924,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 .as_mut()
                 .expect("checked in_use above")
                 .release(slot);
+            if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+                cs.note_eof(false);
+            }
             self.executor.wake_recv(conn_index);
             self.driver.close_connection(conn_index);
             return;
@@ -1059,13 +1063,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     .as_mut()
                     .and_then(|t| t.get_mut(conn_index))
                     .map(|tc| tc.peer_sent_close_notify);
-                if close_notify_seen == Some(false)
-                    && let Some(cs) = self.driver.connections.get_mut(conn_index)
-                {
-                    cs.eof_truncated = true;
+                if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+                    cs.note_eof(close_notify_seen == Some(false));
                 }
                 // Wake recv waiter before closing so the owning task can
-                // detect EOF (with_data will see RecvMode::Closed and return 0).
+                // detect EOF (with_data will see `recv_finished()` and return 0).
                 self.executor.wake_recv(conn_index);
                 self.driver.close_connection(conn_index);
                 return;
@@ -1092,6 +1094,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 self.maybe_rearm_throttled_forward(conn_index);
                 return;
             } else if !has_more {
+                if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+                    cs.read = ReadHalf::Error;
+                }
                 let generation = self.driver.connections.generation(conn_index);
                 self.executor.fail_recv(
                     conn_index,
@@ -1238,6 +1243,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                         self.driver.close_connection(conn_index);
                     }
                     crate::tls::TlsRecvResult::Closed => {
+                        if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+                            cs.note_eof(false);
+                        }
                         self.executor.wake_recv(conn_index);
                         self.driver.close_connection(conn_index);
                     }
@@ -1449,7 +1457,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         if !has_more
             && !self.driver.forward_hold_throttled[conn_index as usize]
             && let Some(conn) = self.driver.connections.get(conn_index)
-            && matches!(conn.recv_mode, RecvMode::Multi)
+            && matches!(conn.lifecycle, Lifecycle::Open)
+            && matches!(conn.recv_arm, RecvArm::Multi)
         {
             if self.driver.ring.submit_multishot_recv(conn_index).is_err() {
                 metrics::RING.increment(metrics::ring::RECV_ARM_FAILURES);
@@ -1483,6 +1492,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
         if result <= 0 {
             if result == 0 {
+                if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+                    cs.note_eof(false);
+                }
                 self.executor.wake_recv(conn_index);
                 self.driver.close_connection(conn_index);
                 return;
@@ -1500,6 +1512,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             } else if errno == libc::ECANCELED {
                 return;
             } else if !has_more {
+                if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+                    cs.read = ReadHalf::Error;
+                }
                 let generation = self.driver.connections.generation(conn_index);
                 self.executor.fail_recv(
                     conn_index,
@@ -1541,6 +1556,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let payload = msg_out.payload_data();
         if payload.is_empty() {
             // EOF via recvmsg.
+            if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+                cs.note_eof(false);
+            }
             self.executor.wake_recv(conn_index);
             self.driver.close_connection(conn_index);
             return;
@@ -1589,7 +1607,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
         if !has_more
             && let Some(conn) = self.driver.connections.get(conn_index)
-            && matches!(conn.recv_mode, RecvMode::MsgMulti)
+            && matches!(conn.lifecycle, Lifecycle::Open)
+            && matches!(conn.recv_arm, RecvArm::MsgMulti)
         {
             let msghdr_ptr = &*self.driver.recvmsg_msghdr as *const libc::msghdr;
             let _ = self
@@ -2426,11 +2445,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             return;
         }
         // Connection must still be open in multishot recv mode.
-        let open = self
-            .driver
-            .connections
-            .get(conn_index)
-            .is_some_and(|c| matches!(c.recv_mode, RecvMode::Multi));
+        let open = self.driver.connections.get(conn_index).is_some_and(|c| {
+            matches!(c.lifecycle, Lifecycle::Open) && matches!(c.recv_arm, RecvArm::Multi)
+        });
         if !open {
             self.driver.forward_hold_throttled[ci] = false;
             return;
@@ -2882,7 +2899,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 .driver
                 .connections
                 .get(conn_index)
-                .map(|c| matches!(c.recv_mode, RecvMode::Connecting))
+                .map(|c| matches!(c.lifecycle, Lifecycle::Connecting))
                 .unwrap_or(false);
             if !still_connecting {
                 if let Some(cs) = self.driver.connections.get_mut(conn_index) {
@@ -2948,7 +2965,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 return;
             }
             if let Some(cs) = self.driver.connections.get_mut(conn_index) {
-                cs.recv_mode = RecvMode::Multi;
+                cs.mark_connected();
             }
             self.arm_recv(conn_index);
             return;
@@ -2957,7 +2974,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // Plaintext path
         if let Some(cs) = self.driver.connections.get_mut(conn_index) {
             cs.established = true;
-            cs.recv_mode = RecvMode::Multi;
+            cs.mark_connected();
         }
         self.arm_recv(conn_index);
 
@@ -2982,7 +2999,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             return;
         }
 
-        if !matches!(conn.recv_mode, RecvMode::Connecting) {
+        if !matches!(conn.lifecycle, Lifecycle::Connecting) {
             return;
         }
 
@@ -3646,7 +3663,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 return;
             }
             if let Some(cs) = self.driver.connections.get_mut(conn_index) {
-                cs.recv_mode = RecvMode::MsgMulti;
+                cs.recv_arm = RecvArm::MsgMulti;
             }
             return;
         }
@@ -4292,9 +4309,10 @@ mod tests {
         let conn_index = el.driver.connections.allocate().expect("no free slots");
         el.driver.accumulators.reset(conn_index);
         // arm_recv needs to submit an SQE — skip in test since we inject CQEs directly.
-        // Just set recv_mode = Multi so the handlers work correctly.
+        // Just set lifecycle = Open / recv_arm = Multi so the handlers work correctly.
         if let Some(cs) = el.driver.connections.get_mut(conn_index) {
-            cs.recv_mode = RecvMode::Multi;
+            cs.lifecycle = Lifecycle::Open;
+            cs.recv_arm = RecvArm::Multi;
             cs.established = true;
         }
         conn_index
@@ -4668,10 +4686,10 @@ mod tests {
     }
 
     /// The guard predicate is `close_submitted`, deliberately NOT
-    /// `recv_mode == Closed`: during a deferred close's drain window
-    /// (recv side already Closed, Close SQE not yet submitted), in-flight
+    /// `recv_finished()`: during a deferred close's drain window
+    /// (read half already finished, Close SQE not yet submitted), in-flight
     /// sends must still resubmit partials so their bytes reach the wire.
-    /// This test pins the predicate: Closed recv_mode alone must not
+    /// This test pins the predicate: a finished read half alone must not
     /// suppress a resubmit.
     #[test]
     fn half_close_does_not_suppress_partial_resubmit() {
@@ -4680,7 +4698,10 @@ mod tests {
         let generation = el.driver.connections.generation(conn_index);
 
         if let Some(cs) = el.driver.connections.get_mut(conn_index) {
-            cs.recv_mode = RecvMode::Closed; // peer FIN, no close initiated
+            // Peer FIN with the close requested but not yet committed: the
+            // deferred-close drain window this test exists to cover.
+            cs.note_eof(false);
+            cs.lifecycle = Lifecycle::Closing;
         }
         assert!(!el.driver.send_queues[conn_index as usize].close_submitted);
 
@@ -4893,7 +4914,7 @@ mod tests {
         // Connection should be marked as closing.
         let conn = el.driver.connections.get(conn_index);
         assert!(
-            conn.is_none() || matches!(conn.unwrap().recv_mode, RecvMode::Closed),
+            conn.is_none() || conn.unwrap().close_requested(),
             "connection not closed after recv EOF"
         );
     }
@@ -4930,7 +4951,7 @@ mod tests {
 
         assert!(el.driver.connections.get(conn_index).is_some());
 
-        // Request the close (sets recv_mode = Closed; the Close SQE is
+        // Request the close (sets Lifecycle::Closing; the Close SQE is
         // committed by the event loop's drain, simulated by the CQE below).
         el.driver.close_connection(conn_index);
 
@@ -4983,6 +5004,59 @@ mod tests {
         let state = &el.driver.send_queues[conn_index as usize];
         assert!(state.close_submitted, "drain must commit the Close");
         assert!(!state.close_pending);
+    }
+
+    /// A cancel that lands after a close was requested is a no-op: the close
+    /// owns the teardown (and its own recv cancel), and a read half the peer
+    /// already finished must keep its `Eof { truncated }` for
+    /// `eof_truncated()`. Before the state split the old `Closed` state
+    /// covered both cases and `cancel` returned early.
+    #[test]
+    fn cancel_after_close_is_a_no_op_and_keeps_truncation() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        if let Some(cs) = el.driver.connections.get_mut(conn_index) {
+            cs.note_eof(true); // TLS FIN without close_notify
+        }
+        el.driver.close_connection(conn_index);
+        let before = el.driver.pending_finalize_closes.len();
+        {
+            let mut ctx = el.driver.make_ctx();
+            let _ = ctx.cancel(crate::handler::ConnToken::new(conn_index, generation));
+        }
+        let cs = el.driver.connections.get(conn_index).unwrap();
+        assert_eq!(
+            cs.read,
+            ReadHalf::Eof { truncated: true },
+            "cancel after close must not relabel a finished read half"
+        );
+        assert_eq!(cs.recv_arm, RecvArm::Multi, "cancel after close is a no-op");
+        assert!(cs.close_requested());
+        assert_eq!(el.driver.pending_finalize_closes.len(), before);
+    }
+
+    /// Cancelling the receive (`DriverCtx::cancel`) finishes the read half
+    /// but is not a close: a later `close_connection` must still tear the
+    /// connection down. Before the state split, cancel set `Closed`, so the
+    /// later close was a no-op and the slot leaked.
+    #[test]
+    fn cancel_then_close_still_requests_teardown() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        {
+            let mut ctx = el.driver.make_ctx();
+            let _ = ctx.cancel(crate::handler::ConnToken::new(conn_index, generation));
+        }
+        let cs = el.driver.connections.get(conn_index).unwrap();
+        assert!(cs.recv_finished(), "cancel finishes the read half");
+        assert!(!cs.close_requested(), "cancel is not a close");
+
+        el.driver.close_connection(conn_index);
+        let cs = el.driver.connections.get(conn_index).unwrap();
+        assert!(cs.close_requested(), "close after cancel must be honoured");
+        assert!(el.driver.pending_finalize_closes.contains(&conn_index));
     }
 
     // ── Recv data delivery tests ───────────────────────────────────
@@ -7233,7 +7307,7 @@ mod tests {
 
         let conn = el.driver.connections.get(conn_index);
         assert!(
-            conn.is_none() || matches!(conn.unwrap().recv_mode, RecvMode::Closed),
+            conn.is_none() || conn.unwrap().close_requested(),
             "connection not closed on unknown recv error"
         );
     }
@@ -7454,7 +7528,7 @@ mod tests {
             .driver
             .connections
             .get(conn_index)
-            .is_none_or(|c| matches!(c.recv_mode, RecvMode::Closed));
+            .is_none_or(|c| c.close_requested());
         assert!(closed, "FIN mid-message must close the connection");
     }
 
@@ -7473,7 +7547,7 @@ mod tests {
             .driver
             .connections
             .get(conn_index)
-            .is_none_or(|c| matches!(c.recv_mode, RecvMode::Closed));
+            .is_none_or(|c| c.close_requested());
         assert!(closed);
     }
 
@@ -7559,12 +7633,12 @@ mod tests {
             el.executor.io_results[conn_index as usize].is_some(),
             "connect result not stored"
         );
-        // Connection should be established with recv_mode = Multi.
+        // Connection should be established, open, with a multishot recv armed.
         let conn = el.driver.connections.get(conn_index).unwrap();
         assert!(conn.established, "connection not marked established");
         assert!(
-            matches!(conn.recv_mode, RecvMode::Multi),
-            "recv_mode not set to Multi after connect"
+            matches!(conn.lifecycle, Lifecycle::Open) && matches!(conn.recv_arm, RecvArm::Multi),
+            "connection not Open / recv_arm not Multi after connect"
         );
     }
 
@@ -7595,7 +7669,7 @@ mod tests {
         // Connection should be closing.
         let conn = el.driver.connections.get(conn_index);
         assert!(
-            conn.is_none() || matches!(conn.unwrap().recv_mode, RecvMode::Closed),
+            conn.is_none() || conn.unwrap().close_requested(),
             "connection not closed after connect error"
         );
     }
@@ -7687,7 +7761,7 @@ mod tests {
         // Connection should be closing.
         let conn = el.driver.connections.get(conn_index);
         assert!(
-            conn.is_none() || matches!(conn.unwrap().recv_mode, RecvMode::Closed),
+            conn.is_none() || conn.unwrap().close_requested(),
             "connection not closed after TLS send error"
         );
     }
@@ -7711,7 +7785,7 @@ mod tests {
         );
         let conn = el.driver.connections.get(conn_index);
         assert!(
-            conn.is_some() && !matches!(conn.unwrap().recv_mode, RecvMode::Closed),
+            conn.is_some() && !conn.unwrap().close_requested(),
             "EAGAIN must not close the connection"
         );
     }
@@ -7738,7 +7812,7 @@ mod tests {
         );
         let conn = el.driver.connections.get(conn_index);
         assert!(
-            conn.is_some() && !matches!(conn.unwrap().recv_mode, RecvMode::Closed),
+            conn.is_some() && !conn.unwrap().close_requested(),
             "stale TlsSend CQE must not close the connection"
         );
     }
@@ -8028,7 +8102,7 @@ mod tests {
 
         let conn = el.driver.connections.get(conn_index);
         assert!(
-            conn.is_none() || matches!(conn.unwrap().recv_mode, RecvMode::Closed),
+            conn.is_none() || conn.unwrap().close_requested(),
             "connection not closed on injected recv EOF"
         );
     }
@@ -8199,7 +8273,7 @@ mod tests {
         el.inject_and_dispatch(ud.raw(), -99);
 
         let conn = el.driver.connections.get(conn_index);
-        assert!(conn.is_none() || matches!(conn.unwrap().recv_mode, RecvMode::Closed),);
+        assert!(conn.is_none() || conn.unwrap().close_requested());
     }
 
     #[test]
@@ -8230,7 +8304,9 @@ mod tests {
         assert!(el.executor.io_results[conn_index as usize].is_some());
         let conn = el.driver.connections.get(conn_index).unwrap();
         assert!(conn.established);
-        assert!(matches!(conn.recv_mode, RecvMode::Multi));
+        assert!(
+            matches!(conn.lifecycle, Lifecycle::Open) && matches!(conn.recv_arm, RecvArm::Multi)
+        );
     }
 
     #[test]
@@ -8292,7 +8368,7 @@ mod tests {
 
         assert!(!el.driver.send_copy_pool.in_use(slot));
         let conn = el.driver.connections.get(conn_index);
-        assert!(conn.is_none() || matches!(conn.unwrap().recv_mode, RecvMode::Closed));
+        assert!(conn.is_none() || conn.unwrap().close_requested());
     }
 
     #[test]
@@ -8346,12 +8422,12 @@ mod tests {
         // Both should have processed. Pool slot released, connection closing.
         assert!(!el.driver.send_copy_pool.in_use(slot));
         let conn = el.driver.connections.get(conn_index);
-        assert!(conn.is_none() || matches!(conn.unwrap().recv_mode, RecvMode::Closed));
+        assert!(conn.is_none() || conn.unwrap().close_requested());
     }
 
     #[test]
     fn batch_recv_eof_then_stale_send_cqe() {
-        // Recv EOF closes the connection (sets recv_mode=Closed, submits
+        // Recv EOF closes the connection (sets Lifecycle::Closing, submits
         // Close SQE), then a stale send CQE arrives for the same
         // conn_index in the same batch. The send handler should not
         // panic on the closing connection.
@@ -8374,7 +8450,7 @@ mod tests {
         // Connection should be closing. Pool slot should be released
         // cleanly (no panic).
         let conn = el.driver.connections.get(conn_index);
-        assert!(conn.is_none() || matches!(conn.unwrap().recv_mode, RecvMode::Closed));
+        assert!(conn.is_none() || conn.unwrap().close_requested());
         assert!(!el.driver.send_copy_pool.in_use(slot));
     }
 
@@ -8603,7 +8679,7 @@ mod tests {
 
         let conn = el.driver.connections.get(conn_index);
         assert!(
-            conn.is_some() && matches!(conn.unwrap().recv_mode, RecvMode::Connecting),
+            conn.is_some() && matches!(conn.unwrap().lifecycle, Lifecycle::Connecting),
             "stale connect-timeout CQE must not kill the reused slot's connect"
         );
     }
@@ -8673,7 +8749,7 @@ mod tests {
         );
         let conn = el.driver.connections.get(conn_index);
         assert!(
-            conn.is_none() || matches!(conn.unwrap().recv_mode, RecvMode::Closed),
+            conn.is_none() || conn.unwrap().close_requested(),
             "give-up must close the connection"
         );
     }
@@ -9497,11 +9573,11 @@ mod tests {
 
                 for action in &actions {
                     // Skip if connection already closed.
-                    if el.driver.connections.get(conn_index).is_none()
-                        || matches!(
-                            el.driver.connections.get(conn_index).unwrap().recv_mode,
-                            RecvMode::Closed
-                        )
+                    if el
+                        .driver
+                        .connections
+                        .get(conn_index)
+                        .is_none_or(|c| c.close_requested())
                     {
                         break;
                     }

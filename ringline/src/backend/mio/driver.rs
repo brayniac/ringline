@@ -10,7 +10,7 @@ use std::sync::atomic::AtomicBool;
 use crate::accumulator::AccumulatorTable;
 use crate::buffer::send_copy::SendCopyPool;
 use crate::config::Config;
-use crate::connection::{ConnectionTable, RecvMode};
+use crate::connection::{ConnectionTable, Lifecycle};
 use crate::disk_io_pool::DiskIoPool;
 use crate::handler::{ConnSendState, DriverCtx};
 
@@ -319,21 +319,21 @@ impl Driver {
     }
 
     /// Request teardown of a connection. The only place (with the
-    /// `DriverCtx` close) that sets `RecvMode::Closed` on this backend —
-    /// see the invariant on `RecvMode::Closed`.
+    /// `DriverCtx` close) that sets `Lifecycle::Closing` on this backend —
+    /// see the invariant on `Lifecycle::Closing`.
     ///
     /// Teardown itself (socket, buffers, executor state, slot release)
     /// happens in the event loop's `drain_pending_closes`, which has
     /// Executor access and defers until `pending_sends` has drained.
-    /// Marking `Closed` here makes the call idempotent.
+    /// Marking `Closing` here makes the call idempotent.
     pub(crate) fn close_connection(&mut self, conn_index: u32) {
         let idx = conn_index as usize;
 
         if let Some(conn) = self.connections.get_mut(conn_index) {
-            if matches!(conn.recv_mode, RecvMode::Closed) {
+            if conn.close_requested() {
                 return; // already closing
             }
-            conn.recv_mode = RecvMode::Closed;
+            conn.lifecycle = Lifecycle::Closing;
         } else {
             return;
         }
@@ -531,7 +531,7 @@ impl Driver {
         let recv_closed = self
             .connections
             .get(conn_index)
-            .is_some_and(|c| matches!(c.recv_mode, RecvMode::Closed));
+            .is_some_and(|c| c.recv_finished());
         if !recv_closed && let Some(stream) = self.tcp_streams[idx].as_mut() {
             let _ = self.poll.registry().reregister(
                 stream,
@@ -546,8 +546,8 @@ impl Driver {
     /// pending send data).
     pub(crate) fn register_writable(&mut self, conn_index: u32) {
         let idx = conn_index as usize;
-        // Once the receive side is finished (`Closed`: peer FIN, read
-        // error, or a requested close) no more reads are wanted. Keeping
+        // Once the receive side is finished (`recv_finished()`: peer FIN,
+        // read error, or a requested close) no more reads are wanted. Keeping
         // READABLE interest on a half-closed socket makes every reregister
         // re-report the EOF, and the loop spins at 100% CPU for as long as
         // the queued sends take to drain. WRITABLE alone still delivers
@@ -556,7 +556,7 @@ impl Driver {
         let recv_closed = self
             .connections
             .get(conn_index)
-            .is_some_and(|c| matches!(c.recv_mode, RecvMode::Closed));
+            .is_some_and(|c| c.recv_finished());
         let interest = if recv_closed {
             mio::Interest::WRITABLE
         } else {

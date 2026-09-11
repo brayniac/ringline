@@ -1658,7 +1658,7 @@ impl ConnCtx {
                 .connections
                 .get(self.conn_index)
                 .filter(|c| c.generation == self.generation)
-                .map(|c| c.eof_truncated)
+                .map(|c| matches!(c.read, crate::connection::ReadHalf::Eof { truncated: true }))
                 .unwrap_or(false)
         })
     }
@@ -1761,8 +1761,8 @@ impl ConnCtx {
     ///
     /// Returns `false` if the slot has been released and its generation bumped
     /// (a stale handle after slot reuse) **or** if the connection is closing
-    /// (`close()` was called — `recv_mode` is `Closed` — even before the Close
-    /// CQE has released the slot). Because a proactive `close()` flips the mode
+    /// (`close()` was called — `lifecycle` is `Closing` — even before the Close
+    /// CQE has released the slot). Because a proactive `close()` flips the state
     /// synchronously, this is a *deterministic* poison probe: a caller that owns
     /// a `ConnCtx` copy (e.g. a connection pool) can detect an
     /// undrained-`ValueStream` poison on the very next turn, without waiting for
@@ -1776,10 +1776,7 @@ impl ConnCtx {
             driver
                 .connections
                 .get(self.conn_index)
-                .map(|cs| {
-                    cs.generation == self.generation
-                        && !matches!(cs.recv_mode, crate::connection::RecvMode::Closed)
-                })
+                .map(|cs| cs.generation == self.generation && !cs.close_requested())
                 .unwrap_or(false)
         })
     }
@@ -2177,7 +2174,7 @@ impl<F: FnMut(&[u8]) -> ParseResult + Unpin> Future for WithDataFuture<F> {
                 let is_closed = driver
                     .connections
                     .get(self.conn_index)
-                    .map(|c| matches!(c.recv_mode, crate::connection::RecvMode::Closed))
+                    .map(|c| c.recv_finished())
                     .unwrap_or(true); // connection already released
                 if is_closed {
                     let f = self.f.as_mut().expect("WithDataFuture polled after Ready");
@@ -2218,7 +2215,7 @@ impl<F: FnMut(&[u8]) -> ParseResult + Unpin> Future for WithDataFuture<F> {
             let is_closed = driver
                 .connections
                 .get(self.conn_index)
-                .map(|c| matches!(c.recv_mode, crate::connection::RecvMode::Closed))
+                .map(|c| c.recv_finished())
                 .unwrap_or(true);
             if is_closed {
                 self.f.take();
@@ -2303,10 +2300,7 @@ impl<F: FnMut(Bytes) -> ParseResult + Unpin> Future for WithBytesFuture<F> {
                     self.f.take();
                     return Poll::Ready(0);
                 }
-                Some(conn) => (
-                    conn.generation,
-                    matches!(conn.recv_mode, crate::connection::RecvMode::Closed),
-                ),
+                Some(conn) => (conn.generation, conn.recv_finished()),
             };
             if conn_generation != self.generation {
                 // Slot was recycled for a different connection.
@@ -2561,7 +2555,7 @@ impl<'a> Future for SegmentNext<'a> {
             let is_closed = driver
                 .connections
                 .get(conn)
-                .map(|c| matches!(c.recv_mode, crate::connection::RecvMode::Closed))
+                .map(|c| c.recv_finished())
                 .unwrap_or(true);
             if is_closed {
                 return Poll::Ready(Ok(None));
@@ -2827,7 +2821,7 @@ impl Future for RecvOwnedSegment {
             let is_closed = driver
                 .connections
                 .get(conn)
-                .map(|c| matches!(c.recv_mode, crate::connection::RecvMode::Closed))
+                .map(|c| c.recv_finished())
                 .unwrap_or(true);
             if is_closed {
                 return Poll::Ready(Ok(None));
@@ -3067,7 +3061,7 @@ impl Future for ForwardToFuture<'_> {
                 let is_closed = driver
                     .connections
                     .get(conn)
-                    .map(|c| matches!(c.recv_mode, crate::connection::RecvMode::Closed))
+                    .map(|c| c.recv_finished())
                     .unwrap_or(true);
                 if is_closed {
                     let _ = driver.settle_forward_end(conn);
@@ -3181,7 +3175,7 @@ impl<F: FnMut(&SegChain<'_>) -> SegConsumed + Unpin> Future for WithSegmentsFutu
                 let is_closed = driver
                     .connections
                     .get(conn)
-                    .map(|c| matches!(c.recv_mode, crate::connection::RecvMode::Closed))
+                    .map(|c| c.recv_finished())
                     .unwrap_or(true);
                 if is_closed {
                     self.f.take();
@@ -3326,7 +3320,7 @@ impl<F: FnMut(&SegChain<'_>) -> SegConsumed + Unpin> Future for WithSegmentsFutu
             let is_closed = driver
                 .connections
                 .get(conn)
-                .map(|c| matches!(c.recv_mode, crate::connection::RecvMode::Closed))
+                .map(|c| c.recv_finished())
                 .unwrap_or(true);
             if is_closed {
                 self.f.take();
@@ -3383,7 +3377,7 @@ impl Future for RecvReadyFuture {
             let is_closed = driver
                 .connections
                 .get(self.conn_index)
-                .map(|c| matches!(c.recv_mode, crate::connection::RecvMode::Closed))
+                .map(|c| c.recv_finished())
                 .unwrap_or(true);
             if is_closed {
                 return Poll::Ready(());
@@ -3530,7 +3524,7 @@ impl Future for DirectEchoFuture {
             let is_closed = driver
                 .connections
                 .get(self.conn_index)
-                .map(|c| matches!(c.recv_mode, crate::connection::RecvMode::Closed))
+                .map(|c| c.recv_finished())
                 .unwrap_or(true);
 
             if is_closed {

@@ -29,6 +29,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   backends. The deferral is unbounded on mio (`close_notify_timeout_ms`
   is inert there). Design: `docs/mio-close-lifecycle-design.md`.
 
+- Internal: connection lifecycle state is now three explicit fields on
+  `ConnectionState` (`recv_arm`, `read`, `lifecycle`) instead of
+  `RecvMode` doing triple duty; readers use `recv_finished()` and
+  `close_requested()`. No observable change except that a connection whose
+  receive was cancelled via `DriverCtx::cancel` (io_uring) can now be
+  closed afterwards — it used to leak its slot — and reports
+  `is_alive() == true` until it is closed. Design:
+  `docs/connection-state-model-design.md`.
+
 ### Fixed
 
 - mio: a connection whose peer closed first, or whose read failed, was never

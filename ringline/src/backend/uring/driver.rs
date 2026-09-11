@@ -17,7 +17,7 @@ use crate::buffer::send_slab::InFlightSendSlab;
 use crate::chain::SendChainTable;
 use crate::completion::{OpTag, UserData};
 use crate::config::Config;
-use crate::connection::{ConnectionTable, RecvMode};
+use crate::connection::{ConnectionTable, Lifecycle, RecvArm};
 use crate::handler::{BuiltSend, ConnSendState, DriverCtx};
 use crate::metrics;
 
@@ -914,10 +914,9 @@ impl Driver {
                 .connections
                 .get(conn_index)
                 .is_some_and(|c| c.recv_multishot_armed);
-            let open = self
-                .connections
-                .get(conn_index)
-                .is_some_and(|c| matches!(c.recv_mode, RecvMode::Multi));
+            let open = self.connections.get(conn_index).is_some_and(|c| {
+                matches!(c.lifecycle, Lifecycle::Open) && matches!(c.recv_arm, RecvArm::Multi)
+            });
             if !armed
                 && open
                 && self.ring.submit_multishot_recv(conn_index).is_ok()
@@ -994,10 +993,10 @@ impl Driver {
 
     pub(crate) fn close_connection(&mut self, conn_index: u32) {
         if let Some(conn) = self.connections.get_mut(conn_index) {
-            if matches!(conn.recv_mode, RecvMode::Closed) {
+            if conn.close_requested() {
                 return; // already closing — avoid double Close SQE
             }
-            conn.recv_mode = RecvMode::Closed;
+            conn.lifecycle = Lifecycle::Closing;
         } else {
             return;
         }

@@ -45,6 +45,11 @@ Chosen: unify on io_uring's model.
 
 ## State model (both backends)
 
+> Naming superseded by `docs/connection-state-model-design.md` (2026-09-11):
+> `RecvMode::Closed` became `Lifecycle::Closing`, with the TCP read half in a
+> separate `read: ReadHalf` field and recv arming in `recv_arm`. The
+> invariants below are unchanged; read `Closed` as `Closing` throughout.
+
 - `RecvMode::Closed`: the receive side is finished — by peer FIN, by a
   read error, or because a close was requested. **Invariant: only
   `close_connection` and the `DriverCtx` close set it.** This is already

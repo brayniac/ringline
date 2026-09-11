@@ -25,32 +25,67 @@ impl fmt::Display for PeerAddr {
     }
 }
 
-/// Recv mode for a connection.
-#[derive(Debug)]
-pub enum RecvMode {
-    /// Multishot recv armed with provided buffer ring.
+/// Which receive operation the driver currently has armed. Mechanism, not
+/// lifecycle: `Idle` says nothing about whether more data will arrive —
+/// read [`ConnectionState::recv_finished`] for that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecvArm {
+    /// Nothing armed: slot inactive, connect in flight, recv cancelled, or
+    /// the multishot self-terminated and has not been re-armed.
+    Idle,
+    /// Multishot recv with the provided buffer ring (io_uring) / readable
+    /// interest (mio).
     Multi,
-    /// Multishot recvmsg armed with provided buffer ring (with cmsg for timestamps).
+    /// Multishot recvmsg with cmsg timestamps (io_uring, `timestamps`).
     #[cfg(feature = "timestamps")]
     MsgMulti,
-    /// The receive side is finished — peer FIN, a read error, or a
-    /// requested close — and no recv is armed. Recv futures read this to
-    /// return `0`.
-    ///
-    /// Invariant on both backends: only the driver's `close_connection`
-    /// and the `DriverCtx` close set this. Teardown is requested at the
-    /// same moment (`ConnSendState::close_pending`) and finalizes once
-    /// queued sends drain. A backend that marks `Closed` without going
-    /// through `close_connection` leaks the slot (#368).
-    Closed,
-    /// Outbound connect SQE in-flight, no recv armed yet.
+}
+
+/// The TCP read half as this end observed it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadHalf {
+    /// The peer may still send.
+    Open,
+    /// The peer's FIN arrived. `truncated` is the TLS case where the FIN
+    /// came without a preceding close_notify: a length- or
+    /// delimiter-framed protocol should treat it as an error.
+    Eof { truncated: bool },
+    /// A socket read failed. The exact error, if a task wants it, is in
+    /// `Executor::recv_errors` (generation-tagged; see `with_data_result`).
+    Error,
+    /// The application cancelled the pending receive (`DriverCtx::cancel`;
+    /// io_uring only — mio's `cancel` is `Unsupported`).
+    #[cfg_attr(not(has_io_uring), allow(dead_code))]
+    Cancelled,
+}
+
+/// Where the connection is in its life.
+///
+/// Only the driver's `close_connection` and the `DriverCtx` close move a
+/// connection to `Closing`, on both backends; teardown then finalizes once
+/// queued sends drain. The sub-states of `Closing` live on
+/// `ConnSendState`: `close_pending` (waiting for the drain) and
+/// `close_submitted` (io_uring: Close SQE committed, no new SQEs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lifecycle {
+    /// Slot not allocated.
+    Inactive,
+    /// Outbound connect in flight; no recv armed yet.
     Connecting,
+    /// Accepted or connected; the task may send and receive.
+    Open,
+    /// Teardown requested; finalizing once queued sends drain.
+    Closing,
 }
 
 /// Per-connection state tracked by the driver.
 pub struct ConnectionState {
-    /// Current recv mode.
-    pub recv_mode: RecvMode,
+    /// Which receive operation is armed (mechanism; see `recv_finished`).
+    pub recv_arm: RecvArm,
+    /// The TCP read half as observed by this end.
+    pub read: ReadHalf,
+    /// Where the connection is in its life.
+    pub lifecycle: Lifecycle,
     /// Whether the connection is active.
     pub active: bool,
     /// Generation counter to detect stale ConnTokens.
@@ -72,11 +107,6 @@ pub struct ConnectionState {
     pub peer_addr: Option<PeerAddr>,
     /// Whether a connect timeout SQE is armed for this connection.
     pub connect_timeout_armed: bool,
-    /// TCP FIN arrived on a TLS connection before the peer's close_notify
-    /// alert. Distinguishes a truncation (possibly attacker-injected FIN)
-    /// from a clean TLS shutdown: recv futures surface `UnexpectedEof`
-    /// instead of a clean EOF.
-    pub eof_truncated: bool,
     /// Most recent kernel RX timestamp (nanoseconds since epoch, CLOCK_REALTIME).
     /// Set when a `RecvMsgMulti` completion delivers a `SCM_TIMESTAMPING` cmsg.
     #[cfg(feature = "timestamps")]
@@ -109,14 +139,15 @@ impl Default for ConnectionState {
 impl ConnectionState {
     pub fn new() -> Self {
         ConnectionState {
-            recv_mode: RecvMode::Closed,
+            recv_arm: RecvArm::Idle,
+            read: ReadHalf::Open,
+            lifecycle: Lifecycle::Inactive,
             active: false,
             generation: 0,
             outbound: false,
             established: false,
             peer_addr: None,
             connect_timeout_armed: false,
-            eof_truncated: false,
             #[cfg(feature = "timestamps")]
             recv_timestamp_ns: 0,
             #[cfg(has_io_uring)]
@@ -128,7 +159,9 @@ impl ConnectionState {
 
     pub fn activate(&mut self) {
         self.active = true;
-        self.recv_mode = RecvMode::Multi;
+        self.lifecycle = Lifecycle::Open;
+        self.read = ReadHalf::Open;
+        self.recv_arm = RecvArm::Multi;
     }
 
     /// Activate as an outbound (connect) connection.
@@ -136,17 +169,48 @@ impl ConnectionState {
         self.active = true;
         self.outbound = true;
         self.established = false;
-        self.recv_mode = RecvMode::Connecting;
+        self.lifecycle = Lifecycle::Connecting;
+        self.read = ReadHalf::Open;
+        self.recv_arm = RecvArm::Idle;
+    }
+
+    /// An outbound connect completed: the connection is open and its
+    /// multishot recv is (about to be) armed.
+    pub fn mark_connected(&mut self) {
+        self.lifecycle = Lifecycle::Open;
+        self.read = ReadHalf::Open;
+        self.recv_arm = RecvArm::Multi;
+    }
+
+    /// A recv future must resolve to EOF instead of parking: the peer
+    /// closed, the read failed, the receive was cancelled, or a close was
+    /// requested.
+    pub fn recv_finished(&self) -> bool {
+        !matches!(self.read, ReadHalf::Open) || matches!(self.lifecycle, Lifecycle::Closing)
+    }
+
+    /// A close has already been requested; a second request is a no-op.
+    pub fn close_requested(&self) -> bool {
+        matches!(self.lifecycle, Lifecycle::Closing)
+    }
+
+    /// Record that the peer's FIN arrived. Idempotent; never downgrades a
+    /// truncated EOF to a clean one.
+    pub fn note_eof(&mut self, truncated: bool) {
+        if !matches!(self.read, ReadHalf::Eof { truncated: true }) {
+            self.read = ReadHalf::Eof { truncated };
+        }
     }
 
     pub fn deactivate(&mut self) {
         self.active = false;
-        self.recv_mode = RecvMode::Closed;
+        self.lifecycle = Lifecycle::Inactive;
+        self.read = ReadHalf::Open;
+        self.recv_arm = RecvArm::Idle;
         self.outbound = false;
         self.established = false;
         self.peer_addr = None;
         self.connect_timeout_armed = false;
-        self.eof_truncated = false;
         #[cfg(feature = "timestamps")]
         {
             self.recv_timestamp_ns = 0;
@@ -243,7 +307,8 @@ mod tests {
         assert_eq!(table.active_count(), 1);
         assert!(table.get(idx).is_some());
         assert!(table.get(idx).unwrap().active);
-        assert!(matches!(table.get(idx).unwrap().recv_mode, RecvMode::Multi));
+        let cs = table.get(idx).unwrap();
+        assert!(cs.lifecycle == Lifecycle::Open && cs.recv_arm == RecvArm::Multi);
     }
 
     #[test]
@@ -254,7 +319,7 @@ mod tests {
         let conn = table.get(idx).unwrap();
         assert!(conn.outbound);
         assert!(!conn.established);
-        assert!(matches!(conn.recv_mode, RecvMode::Connecting));
+        assert!(conn.lifecycle == Lifecycle::Connecting);
     }
 
     #[test]
@@ -406,7 +471,60 @@ mod tests {
         assert!(!cs.established);
         assert!(!cs.connect_timeout_armed);
         assert!(cs.peer_addr.is_none());
-        assert!(matches!(cs.recv_mode, RecvMode::Closed));
+        assert!(cs.lifecycle == Lifecycle::Inactive);
+    }
+
+    #[test]
+    fn recv_finished_and_close_requested_follow_the_table() {
+        let mut cs = ConnectionState::new();
+        assert!(!cs.close_requested());
+        cs.activate();
+        assert!(!cs.recv_finished(), "open connection parks on recv");
+        cs.note_eof(false);
+        assert!(cs.recv_finished(), "peer FIN finishes the read half");
+        assert!(!cs.close_requested(), "FIN alone does not request a close");
+        cs.lifecycle = Lifecycle::Closing;
+        assert!(cs.close_requested());
+
+        let mut cs = ConnectionState::new();
+        cs.activate();
+        cs.lifecycle = Lifecycle::Closing;
+        assert!(
+            cs.recv_finished(),
+            "a requested close finishes the read half"
+        );
+
+        for read in [ReadHalf::Error, ReadHalf::Cancelled] {
+            let mut cs = ConnectionState::new();
+            cs.activate();
+            cs.read = read;
+            assert!(cs.recv_finished(), "{read:?} finishes the read half");
+        }
+    }
+
+    #[test]
+    fn note_eof_never_downgrades_truncation() {
+        let mut cs = ConnectionState::new();
+        cs.activate();
+        cs.note_eof(true);
+        cs.note_eof(false);
+        assert_eq!(cs.read, ReadHalf::Eof { truncated: true });
+    }
+
+    #[test]
+    fn outbound_lifecycle_transitions() {
+        let mut cs = ConnectionState::new();
+        cs.activate_outbound();
+        assert_eq!(cs.lifecycle, Lifecycle::Connecting);
+        assert_eq!(cs.recv_arm, RecvArm::Idle);
+        assert!(!cs.recv_finished(), "connecting is not finished");
+        cs.mark_connected();
+        assert_eq!(cs.lifecycle, Lifecycle::Open);
+        assert_eq!(cs.recv_arm, RecvArm::Multi);
+        cs.deactivate();
+        assert_eq!(cs.lifecycle, Lifecycle::Inactive);
+        assert_eq!(cs.read, ReadHalf::Open);
+        assert_eq!(cs.recv_arm, RecvArm::Idle);
     }
 
     #[test]
