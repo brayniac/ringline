@@ -65,7 +65,7 @@ them cites this section.
    left `WithDataResultFuture` bare.
 7. **`WithDataResultFuture` does not pre-check the error slot.** #318's
    wrapper looked at the slot before polling the inner future. Redundant:
-   every `fail_recv` site sets `RecvMode::Closed` or calls
+   every `fail_recv` site marks the read half finished and calls
    `close_connection`, so the inner future reports `0` on the same poll and
    the wrapper consults the slot then, with the generation it captured at
    construction.
