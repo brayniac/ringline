@@ -5734,11 +5734,22 @@ fn deferred_close_does_not_spin_on_half_closed_peer() {
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
+
+    // Baseline: the loop's own cadence with this connection open and idle.
+    // It is backend- and host-dependent (mio blocks in poll with a 10 ms cap:
+    // tens of ticks; io_uring arms a tick timeout and ran ~5,300 ticks per
+    // 500 ms on the validation host), so the spin check below is relative to
+    // it rather than a fixed number.
+    std::thread::sleep(Duration::from_millis(100));
+    let base_before = DRAIN_TICKS.load(Ordering::Relaxed);
+    std::thread::sleep(Duration::from_millis(500));
+    let baseline = DRAIN_TICKS.load(Ordering::Relaxed) - base_before;
+
     stream.write_all(b"request").unwrap();
     stream.shutdown(std::net::Shutdown::Write).unwrap();
 
     // Let the server queue the response and hit WouldBlock, then measure
-    // the loop's idle cadence while the peer does not read.
+    // the loop's cadence while the peer does not read.
     std::thread::sleep(Duration::from_millis(200));
     let before = DRAIN_TICKS.load(Ordering::Relaxed);
     std::thread::sleep(Duration::from_millis(500));
@@ -5754,10 +5765,14 @@ fn deferred_close_does_not_spin_on_half_closed_peer() {
     for handle in handles {
         handle.join().unwrap().unwrap();
     }
-    // A spinning loop does ~250k+ iterations in 500 ms; the poll timeout
-    // is capped at 10 ms so a healthy loop does at most a few hundred.
+    // A spinning loop re-reports the peer's EOF every iteration and did
+    // ~270k ticks in 500 ms when this bug was live; a healthy loop stays
+    // within a small factor of its idle cadence. The floor keeps a
+    // near-zero baseline (mio) from making the bound too tight.
+    let bound = baseline.max(200) * 10;
     assert!(
-        ticks < 5_000,
-        "event loop spun while a close was deferred: {ticks} ticks in 500 ms"
+        ticks < bound,
+        "event loop spun while a close was deferred: {ticks} ticks in 500 ms \
+         (idle baseline {baseline}, bound {bound})"
     );
 }
