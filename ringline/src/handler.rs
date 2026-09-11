@@ -32,7 +32,9 @@ pub(crate) struct ConnSendState {
     /// queue and the in-flight slot. mio: `drain_pending_closes` retains the entry
     /// until `pending_sends` is empty, then runs executor cleanup and
     /// `finish_close`. Without the deferral, queued bytes were silently
-    /// truncated when the fd closed.
+    /// truncated when the fd closed. The connection-level state is
+    /// `Lifecycle::Closing` (`connection.rs`); this flag is its "waiting
+    /// for the drain" sub-state.
     pub close_pending: bool,
     /// Whether the Close SQE for the current occupant has been submitted
     /// (deferred close finalized, or force-finalized). From this point any
@@ -40,7 +42,8 @@ pub(crate) struct ConnSendState {
     /// arms) for this connection — they would race the in-flight Close.
     /// Cleared by `reset_send_state` at slot reactivation. Distinct from
     /// `recv_finished()`, which also covers half-close (peer FIN with
-    /// legitimate sends still flowing).
+    /// legitimate sends still flowing). Sub-state of `Lifecycle::Closing`:
+    /// the Close SQE is committed.
     #[cfg_attr(not(has_io_uring), allow(dead_code))]
     pub close_submitted: bool,
     /// Count of queued sends pushed during close. Each CQE decrements

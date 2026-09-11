@@ -115,7 +115,9 @@ Async futures access the driver via `CURRENT_DRIVER` thread-local (raw pointer, 
 
 Inbound: acceptor → round-robin to worker → allocate `ConnectionTable` slot → submit multishot recv SQE → spawn `on_accept` task. Outbound: `connect(addr)` → allocate slot → submit connect SQE (optionally IO_LINK'd with timeout) → `ConnectFuture` resolves to new `ConnCtx`.
 
-Close, on both backends: only `close_connection` (and the `DriverCtx` close) sets `RecvMode::Closed`; it also sets `ConnSendState::close_pending`, and teardown finalizes once queued sends drain (io_uring: `try_finalize_close` submits the Close SQE; mio: `drain_pending_closes` defers `finish_close`). A backend site that marks `Closed` directly leaks the slot — that was #368.
+Close, on both backends: only `close_connection` (and the `DriverCtx` close) moves the connection to `Lifecycle::Closing`; it also sets `ConnSendState::close_pending`, and teardown finalizes once queued sends drain (io_uring: `try_finalize_close` submits the Close SQE; mio: `drain_pending_closes` defers `finish_close`). A backend site that marks the connection closing directly leaks the slot — that was #368.
+
+Connection state is three fields on `ConnectionState`: `recv_arm` (which recv op is armed: `Idle`/`Multi`/`MsgMulti` — mechanism, not lifecycle), `read` (the TCP read half as we observed it: `Open`, `Eof { truncated }`, `Error`, `Cancelled`), and `lifecycle` (`Inactive`/`Connecting`/`Open`/`Closing`). Readers ask `recv_finished()` ("resolve to EOF instead of parking?") or `close_requested()` ("is a close already pending?") rather than matching variants; a peer FIN sets `read` first and then requests the close, so the two steps stay visible. Design: `docs/connection-state-model-design.md`.
 
 Generation-based stale detection: `ConnToken(index, generation)` prevents use-after-close when slots are reused. Completion handlers must check the generation before acting on a CQE — slots recycle while CQEs for the old occupant may still be in flight.
 

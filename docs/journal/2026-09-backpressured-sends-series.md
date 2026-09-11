@@ -40,6 +40,15 @@ record gap) green on both backends.
   taken synchronously) — the test now uses an 8 MiB pool and asserts the
   send outcome. Design: `docs/mio-close-lifecycle-design.md`. PR 3 (mio
   `shutdown_write` deferral) and PR 6 build on this.
+- **Prerequisite — connection state model.** After #368/#371 the owner
+  asked whether the state names matched TCP. They did not: `RecvMode::Closed`
+  meant "read half finished", "close requested", and "nothing armed" at once.
+  Split into `recv_arm` / `read: ReadHalf` / `lifecycle` with `recv_finished()`
+  and `close_requested()` helpers, behaviour-preserving, verified on io_uring
+  in an anvil VM on the validation host before the PR. Design:
+  `docs/connection-state-model-design.md`. Follow-ups recorded there:
+  half-close policy (should a peer FIN request teardown at all?), `WriteHalf`
+  with PR 3, folding `active`/`recv_multishot_armed` after PR 7.
 - **PR 1 — `with_data_result`.** `Executor` gains a generation-tagged
   `recv_errors` slot written by `fail_recv` at the five real socket-read
   failure sites (mio: TLS and plaintext read errors in
