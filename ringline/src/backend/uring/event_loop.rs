@@ -5928,10 +5928,24 @@ mod tests {
             cs.recv_multishot_armed = true;
         }
 
-        // No queued sends (accept_connection leaves the send queue empty), so
-        // close_connection finalizes immediately (submits the recv-cancel +
-        // Close SQEs).
+        // No queued sends (accept_connection leaves the send queue empty).
+        // close_connection registers the close; the event loop's
+        // end-of-iteration drain finalizes it (submits the recv-cancel +
+        // Close SQEs) — #371 moved that out of close_connection so the task
+        // gets its poll window first. Run the drain here as the loop would.
         el.driver.close_connection(conn_index);
+        assert_eq!(
+            el.driver
+                .connections
+                .get(conn_index)
+                .map(|c| c.recv_multishot_armed),
+            Some(true),
+            "requesting the close must not touch the armed recv before the drain"
+        );
+        let pending = std::mem::take(&mut el.driver.pending_finalize_closes);
+        for idx in pending {
+            el.driver.try_finalize_close(idx);
+        }
 
         let armed = el
             .driver
