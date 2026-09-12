@@ -518,8 +518,13 @@ impl<'a> DriverCtx<'a> {
             // Defer until the send queue drains (submit_next_queued issues it).
             cs.write = crate::connection::WriteHalf::ShutdownPending;
         } else {
-            cs.write = crate::connection::WriteHalf::Shutdown;
-            let _ = self.ring.submit_shutdown(conn.index);
+            // Record `Shutdown` only once the SQE is accepted: a refused
+            // submission (ring backpressure) leaves the write half `Open`
+            // so a repeat `shutdown_write` can re-request the FIN, as the
+            // flag-based code allowed.
+            if self.ring.submit_shutdown(conn.index).is_ok() {
+                cs.write = crate::connection::WriteHalf::Shutdown;
+            }
         }
     }
 

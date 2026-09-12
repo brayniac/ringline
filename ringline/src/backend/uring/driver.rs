@@ -1427,8 +1427,14 @@ impl Driver {
                 if let Some(cs) = self.connections.get_mut(conn_index)
                     && matches!(cs.write, WriteHalf::ShutdownPending)
                 {
-                    cs.write = WriteHalf::Shutdown;
-                    let _ = self.ring.submit_shutdown(conn_index);
+                    // Refused (ring backpressure): fall back to `Open` so a
+                    // repeat `shutdown_write` can re-request the FIN rather
+                    // than stranding it as pending on an empty queue.
+                    cs.write = if self.ring.submit_shutdown(conn_index).is_ok() {
+                        WriteHalf::Shutdown
+                    } else {
+                        WriteHalf::Open
+                    };
                 }
                 // Fire a deferred close now that nothing is in flight and the
                 // queue is empty. The ZC and recv-forward completion paths
