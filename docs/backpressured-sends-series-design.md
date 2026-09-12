@@ -181,7 +181,10 @@ complete. No changelog line.
 after every `flush_sends`; `clear_pending_sends` fans out the ids it drops
 (the empty-iovec bail-out included); `pending_bounded_send_ids`. mio
 `DriverCtx::send_bounded(conn, data, id)` reserves via PR 4 and queues.
-Departure 4 applied at the teardown site in `mio/event_loop.rs`.
+Departure 4 applied in `SendCapacityQueue` (PR 5's module), where
+`remove_connection` records the provisional `Completion::Aborted` that
+`complete` overwrites — needed because `Executor::remove_connection` is
+also called from `poll_ready_tasks`, before the loop's flush.
 Test: `canceled_submitted_backpressured_send_cannot_complete_the_next_send`
 is deferred to PR 9 (needs the future); this PR's tests are `#[cfg(test)]`
 unit tests in the mio driver and event loop that drive `send_bounded`

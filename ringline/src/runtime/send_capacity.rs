@@ -17,12 +17,30 @@
 //! Lifecycle of one entry:
 //!
 //! ```text
-//! enqueue ──▶ waiting ──mark_submitted──▶ InFlight ──complete──▶ Done ──take_result──▶ gone
-//!               │                           │                    │
-//!               │ cancel / remove_connection│ cancel             │ cancel / remove_connection
-//!               ▼                           ▼                    ▼
-//!             gone / Done(Err)          Abandoned ──complete──▶ gone
+//! enqueue ─▶ waiting ─mark_submitted─▶ InFlight ─complete─▶ Done ─take_result─▶ gone
+//!              │                          │                       ▲
+//!              │ cancel ─▶ gone           │ cancel ─▶ Abandoned   │ complete
+//!              │                          │             └complete─▶ gone
+//!              │ remove_connection        │ remove_connection     │
+//!              ▼                          ▼                       │
+//!           Aborted ◀───────────────── Aborted ───────────────────┘
+//!              └─ take_result ─▶ gone
 //! ```
+//!
+//! **A synthetic teardown abort is provisional.** `remove_connection` runs
+//! from [`Executor::remove_connection`], and on mio that has three callers,
+//! not one: `drain_pending_closes` (step 6b of the run loop, after the
+//! flush) *and* `poll_ready_tasks` (step 6, before it) for a connection task
+//! that returned `Poll::Ready` or panicked. So a bounded send owned by a
+//! task that outlives the connection can be aborted by teardown at step 6
+//! and then written to the socket in full by step 6a's flush, in the same
+//! iteration. Teardown therefore records `Aborted`, not `Done`, and
+//! [`complete`](SendCapacityQueue::complete) overwrites it with the driver's
+//! result: a message that was fully delivered must never be reported to its
+//! caller as aborted. An `Aborted` that nothing overwrites still resolves
+//! the future ([`take_result`](SendCapacityQueue::take_result) takes it), so
+//! a genuinely torn-down send does not hang. "First result wins" survives
+//! only between two *driver* results for one id.
 //!
 //! Every entry records the task id that owns it. The owner is refreshed on
 //! each poll (`set_owner`, the same discipline `SendFuture` follows with
@@ -69,8 +87,15 @@ struct Waiter {
 enum Completion {
     /// Submitted to the driver; no completion yet.
     InFlight,
-    /// Completed; the result waits for `take_result`.
+    /// The driver reported; the result waits for `take_result`. Final — a
+    /// second driver result for the same id is ignored.
     Done(io::Result<u32>),
+    /// Teardown recorded this before the driver reported. Provisional: a
+    /// real driver result overwrites it (`complete`), and if none ever
+    /// arrives `take_result` hands this error to the future. See the module
+    /// docs for why teardown can run before the flush that completes the
+    /// send.
+    Aborted(io::Error),
     /// The future was dropped while the operation was in flight. The driver
     /// still owns the operation; its completion removes the entry.
     Abandoned,
@@ -192,20 +217,25 @@ impl SendCapacityQueue {
         }
     }
 
-    /// Deliver the completion of `id`.
+    /// Deliver the driver's completion of `id` — the authoritative result.
     ///
     /// `InFlight` becomes `Done(result)` and the owner's task id is returned
-    /// for waking. `Abandoned` entries are removed and `result` is discarded
-    /// (the future is gone). An unknown id is ignored: it is a stale
-    /// completion for an entry that [`remove_connection`](Self::remove_connection)
-    /// already resolved and the future already collected. An entry that is
-    /// already `Done` keeps its first result.
+    /// for waking. `Aborted` does the same: a teardown's synthetic abort is
+    /// provisional, and on mio it can be recorded *before* the flush that
+    /// puts the send's last byte on the socket (see the module docs), so a
+    /// fully delivered message would otherwise be reported to its caller as
+    /// `ConnectionAborted`. `Abandoned` entries are removed and `result` is
+    /// discarded (the future is gone). An entry that is already `Done` keeps
+    /// its result — between two *driver* results for one id the first wins.
+    /// An unknown id is ignored: it is a stale completion for an entry that
+    /// [`remove_connection`](Self::remove_connection) already resolved and
+    /// the future already collected.
     ///
     /// Called by the backends' send-completion handlers (PRs 6 and 7).
     pub(crate) fn complete(&mut self, id: BoundedSendId, result: io::Result<u32>) -> Option<u32> {
         let pos = self.submitted.iter().position(|s| s.id == id)?;
         match self.submitted[pos].state {
-            Completion::InFlight => {
+            Completion::InFlight | Completion::Aborted(_) => {
                 self.submitted[pos].state = Completion::Done(result);
                 Some(self.submitted[pos].task_id)
             }
@@ -217,18 +247,24 @@ impl SendCapacityQueue {
         }
     }
 
-    /// Take the result of `id` if it is `Done`, removing the entry.
-    /// Anything else (waiting, in flight, abandoned, unknown) is `None`.
+    /// Take the result of `id` if it has one — a driver result (`Done`) or
+    /// a teardown abort no driver result overwrote (`Aborted`) — removing
+    /// the entry. Anything else (waiting, in flight, abandoned, unknown) is
+    /// `None`.
+    ///
+    /// `Aborted` resolves here too, and must: a send whose connection really
+    /// was torn down before the driver ever reported has no other way to
+    /// finish, and would park forever.
     ///
     /// Called by PR 9's future on each poll after it submitted; `None`
     /// parks it until [`complete`](Self::complete) wakes it.
     pub(crate) fn take_result(&mut self, id: BoundedSendId) -> Option<io::Result<u32>> {
-        let pos = self
-            .submitted
-            .iter()
-            .position(|s| s.id == id && matches!(s.state, Completion::Done(_)))?;
+        let pos = self.submitted.iter().position(|s| {
+            s.id == id && matches!(s.state, Completion::Done(_) | Completion::Aborted(_))
+        })?;
         match self.submitted.swap_remove(pos).state {
             Completion::Done(result) => Some(result),
+            Completion::Aborted(err) => Some(Err(err)),
             Completion::InFlight | Completion::Abandoned => unreachable!("filtered by position"),
         }
     }
@@ -237,8 +273,9 @@ impl SendCapacityQueue {
     ///
     /// Waiting: removed; if it was the head, the new head's task id is
     /// returned for waking. `InFlight`: becomes `Abandoned` (the driver
-    /// still owns the operation; its completion removes the entry). `Done`:
-    /// removed, result discarded. Unknown: ignored.
+    /// still owns the operation; its completion removes the entry). `Done`
+    /// or `Aborted`: removed, result discarded (a driver result that arrives
+    /// afterwards finds no entry and is ignored). Unknown: ignored.
     ///
     /// Called from PR 9's `Drop` via `try_with_state`. A drop outside the
     /// executor skips this, as it does for every other future in the crate;
@@ -255,7 +292,7 @@ impl SendCapacityQueue {
         if let Some(pos) = self.submitted.iter().position(|s| s.id == id) {
             match self.submitted[pos].state {
                 Completion::InFlight => self.submitted[pos].state = Completion::Abandoned,
-                Completion::Done(_) => {
+                Completion::Done(_) | Completion::Aborted(_) => {
                     self.submitted.swap_remove(pos);
                 }
                 Completion::Abandoned => {}
@@ -279,11 +316,20 @@ impl SendCapacityQueue {
     /// The connection at `conn_index` is being torn down (any generation).
     ///
     /// Every waiting and in-flight entry for the connection becomes
-    /// `Done(Err(ConnectionAborted))` (waiting ones move to `submitted`) and
+    /// `Aborted(ConnectionAborted)` (waiting ones move to `submitted`) and
     /// its owner's task id is in the returned list — the owner may be a
     /// standalone task, or a connection task on another index, that
     /// outlives this connection. Abandoned entries are removed. If the head
     /// was removed, the new head's task id is appended as well.
+    ///
+    /// `Aborted` rather than `Done` because this abort is *provisional*: on
+    /// mio `Executor::remove_connection` is also called from
+    /// `poll_ready_tasks` (step 6), before the step-6a flush that can still
+    /// put the whole message on the socket, and the driver's `Ok(n)` must
+    /// win over the abort recorded here. See the module docs. (An entry
+    /// still waiting was never submitted, so no driver result can arrive for
+    /// it; it is recorded the same way so teardown has one rule, and
+    /// `take_result` resolves both alike.)
     ///
     /// Entries owned by *this* connection's own task (`task_id ==
     /// conn_index`) are the exception: `Executor::remove_connection` calls
@@ -312,7 +358,7 @@ impl SendCapacityQueue {
                     id: w.id,
                     conn_index: w.conn_index,
                     task_id: w.task_id,
-                    state: Completion::Done(Err(connection_aborted())),
+                    state: Completion::Aborted(connection_aborted()),
                 });
                 wakes.push(w.task_id);
             }
@@ -330,11 +376,13 @@ impl SendCapacityQueue {
                     true
                 }
                 Completion::InFlight => {
-                    s.state = Completion::Done(Err(connection_aborted()));
+                    s.state = Completion::Aborted(connection_aborted());
                     wakes.push(s.task_id);
                     true
                 }
-                Completion::Done(_) => !owner_gone,
+                // Already resolved (including by an earlier teardown of the
+                // same slot): keep it only while someone can still take it.
+                Completion::Done(_) | Completion::Aborted(_) => !owner_gone,
                 Completion::Abandoned => false,
             }
         });
@@ -352,6 +400,11 @@ impl SendCapacityQueue {
     ///
     /// PR 9's `shutdown_write` calls this with `BrokenPipe` so that bounded
     /// sends queued behind a write shutdown fail instead of waiting forever.
+    ///
+    /// Records `Done`, not the provisional `Aborted`
+    /// [`remove_connection`](Self::remove_connection) uses: these entries
+    /// were never submitted, so no driver result is coming to overwrite
+    /// them.
     ///
     /// Allocates the returned `Vec` and one boxed error per failed entry.
     pub(crate) fn fail_waiting(
@@ -660,6 +713,84 @@ mod tests {
         assert_eq!(q.complete(in_flight, Ok(1)), None, "abandoned: no wake");
         assert_eq!(q.submitted_len(), 0, "its completion removed it");
         assert!(q.turn(other, 1));
+    }
+
+    #[test]
+    fn a_real_result_overwrites_a_teardown_abort_but_not_another_result() {
+        // The mio loop tears a connection down in `poll_ready_tasks`
+        // (step 6) and flushes its queued sends in step 6a, so a send that
+        // reached the socket is completed *after* teardown aborted it. The
+        // driver's result is the authoritative one.
+        const A: u32 = 7;
+        let mut q = SendCapacityQueue::new();
+        let id = q.enqueue(A, 0, 1, task(1));
+        q.mark_submitted(id);
+
+        assert_eq!(
+            q.remove_connection(A),
+            vec![task(1)],
+            "teardown aborts the in-flight entry and wakes its owner"
+        );
+
+        assert_eq!(
+            q.complete(id, Ok(200)),
+            Some(task(1)),
+            "the driver's result must land, and wake the owner again"
+        );
+        assert_eq!(
+            q.take_result(id).expect("resolved").expect("delivered"),
+            200,
+            "a fully delivered message is not ConnectionAborted"
+        );
+        assert_eq!(q.submitted_len(), 0);
+
+        // Two driver results for one id: the first still wins.
+        let id = q.enqueue(A, 0, 1, task(2));
+        q.mark_submitted(id);
+        assert_eq!(q.complete(id, Ok(1)), Some(task(2)));
+        assert_eq!(q.complete(id, Ok(2)), None, "second driver result ignored");
+        assert_eq!(q.take_result(id).expect("resolved").expect("ok"), 1);
+    }
+
+    #[test]
+    fn a_teardown_abort_nothing_overwrites_still_resolves() {
+        // The other half of the provisional-abort rule: if no driver result
+        // ever arrives, `take_result` must still hand the abort to the
+        // future, or the send parks forever.
+        const A: u32 = 8;
+        let mut q = SendCapacityQueue::new();
+        let in_flight = q.enqueue(A, 0, 1, task(1));
+        q.mark_submitted(in_flight);
+        let waiting = q.enqueue(A, 0, 1, task(2));
+
+        q.remove_connection(A);
+
+        assert_eq!(
+            kind_of(q.take_result(in_flight)),
+            io::ErrorKind::ConnectionAborted
+        );
+        assert_eq!(
+            kind_of(q.take_result(waiting)),
+            io::ErrorKind::ConnectionAborted
+        );
+        assert_eq!(q.submitted_len(), 0, "both entries removed by the take");
+    }
+
+    #[test]
+    fn cancelling_an_aborted_entry_drops_it_and_its_late_result() {
+        // The future was dropped after teardown aborted its entry: nothing
+        // can take a result, so the entry goes and the driver's later
+        // completion finds no id.
+        const A: u32 = 9;
+        let mut q = SendCapacityQueue::new();
+        let id = q.enqueue(A, 0, 1, task(1));
+        q.mark_submitted(id);
+        q.remove_connection(A);
+
+        assert_eq!(q.cancel(id), None);
+        assert_eq!(q.submitted_len(), 0, "the aborted entry is gone");
+        assert_eq!(q.complete(id, Ok(4)), None, "a late result has no owner");
+        assert!(q.take_result(id).is_none());
     }
 
     #[test]

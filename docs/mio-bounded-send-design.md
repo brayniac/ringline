@@ -122,17 +122,26 @@ the compiler finds them.
   and a task woken from that point on is polled next iteration either way.
 - `fail_connection_on_send_error` uses `clear_pending_sends` with the real
   error, then `wake_send`/`wake_recv`/`close_connection` as today.
-- Departure 4 ("a real completion overwrites the synthetic abort"): with the
-  loop order `flush_all_pending_sends` → `drain_send_completions` →
-  `drain_pending_closes`, every completion produced by the final flush is
-  delivered to the queue *before* `Executor::remove_connection` marks the
-  connection's remaining entries `Done(Err(ConnectionAborted))`, and
-  `drain_pending_closes` only finalizes once `pending_sends` is empty. So
-  the race #318 patched cannot occur on `main`: a bounded send that reached
-  the socket is `Done(Ok)` before teardown, one that did not is failed by
-  `clear_pending_sends` with the real cause. `SendCapacityQueue::complete`
-  keeps "first result wins"; the design doc for PR 5 records why the
-  overwrite rule is not needed. A test pins the ordering.
+- Departure 4 ("a real completion overwrites the synthetic abort") is
+  **required**. An earlier version of this section claimed the loop order
+  `flush_all_pending_sends` → `drain_send_completions` →
+  `drain_pending_closes` made it moot. That analysis checked only
+  `drain_pending_closes`, which is one of `Executor::remove_connection`'s
+  three callers. The other two are in `poll_ready_tasks` — a connection task
+  that returns `Poll::Ready`, and one that panics — and `poll_ready_tasks`
+  is step 6, *before* step 6a's flush. So a bounded send owned by a task
+  that outlives connection X (a standalone task, or another connection's
+  task) is aborted when X's own task returns, and the flush that follows in
+  the same iteration still writes every byte to the socket: without the
+  overwrite rule the caller of a fully delivered message is told
+  `ConnectionAborted`. `SendCapacityQueue` therefore records teardown's
+  abort as `Completion::Aborted`, which `complete` overwrites with the
+  driver's result and `take_result` resolves if no driver result ever
+  arrives. "First result wins" holds only between two driver results.
+  `bounded_completion_is_delivered_before_teardown` covers the
+  `drain_pending_closes` route,
+  `bounded_send_owned_by_another_task_survives_its_connection_task_returning`
+  the `poll_ready_tasks` one.
 
 ### Executor
 
@@ -188,10 +197,16 @@ Driver-level:
   path (`fail_connection_on_send_error`) produces `Err` with the same
   `raw_os_error` per id.
 - `bounded_completion_is_delivered_before_teardown` (event-loop order,
-  departure 4): queue a bounded send, request close, run one loop
-  iteration's `flush_all_pending_sends` + `drain_send_completions` +
-  `drain_pending_closes` by hand; the executor sees `Done(Ok(len))` and the
-  slot is released, not `ConnectionAborted`.
+  departure 4, `drain_pending_closes` route): queue a bounded send, request
+  close, run one loop iteration's `flush_all_pending_sends` +
+  `drain_send_completions` + `drain_pending_closes` by hand; the executor
+  sees `Done(Ok(len))` and the slot is released, not `ConnectionAborted`.
+- `bounded_send_owned_by_another_task_survives_its_connection_task_returning`
+  (departure 4, `poll_ready_tasks` route): a standalone task owns the
+  bounded send; the connection's own task returns `Poll::Ready`, so
+  `poll_ready_tasks` tears the connection down *before* the flush. The
+  owner must still see `Ok(len)`, which only the provisional-abort rule
+  delivers.
 - `capacity_head_is_woken_once_per_iteration_when_permits_return`: two
   bounded sends complete in one flush; `wake_send_capacity` called once
   (observable as one wake of the queue head's task).

@@ -1286,13 +1286,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 mod tests {
     //! Event-loop tests for the bounded-send path.
     //!
-    //! The other six bounded-send tests are driver-level and live in
-    //! `backend/mio/driver.rs`. These two need an `Executor` as well —
-    //! one pins the order in which a completion and a teardown reach it,
-    //! the other the capacity wake the loop issues once per iteration — so
-    //! they build a whole `AsyncEventLoop` and call the run-loop steps
-    //! directly. The connection scaffolding (`attach_conn`, `token`) is
-    //! shared with the driver tests.
+    //! The driver-level bounded-send tests live in
+    //! `backend/mio/driver.rs`. The ones here need an `Executor` as well —
+    //! the two orders in which a completion and a teardown can reach it
+    //! (the close route and the returning-task route), and the capacity
+    //! wake the loop issues once per iteration — so they build a whole
+    //! `AsyncEventLoop` and call the run-loop steps directly. The
+    //! connection scaffolding (`attach_conn`, `token`) is shared with the
+    //! driver tests.
 
     use super::*;
     use crate::backend::mio::driver::tests::{attach_conn, token};
@@ -1378,10 +1379,16 @@ mod tests {
         executor.standalone_slab.park(idx, future);
     }
 
-    /// Departure 4 of the series design: with the loop's order — flush,
-    /// deliver completions, finalize closes — a bounded send whose bytes
-    /// reached the socket resolves `Ok`, even though the connection is torn
-    /// down in the same iteration.
+    /// Departure 4 of the series design, on the `drain_pending_closes`
+    /// route: a close requested while the send is still queued is finalized
+    /// at step 6b, *after* step 6a's flush and completion delivery, so the
+    /// send resolves `Ok` even though the connection is torn down in the
+    /// same iteration. Here the ordering alone is what saves the result.
+    ///
+    /// This covers only that route.
+    /// `Executor::remove_connection` has two other callers, both in
+    /// `poll_ready_tasks` — which runs *before* the flush; see
+    /// `bounded_send_owned_by_another_task_survives_its_connection_task_returning`.
     #[test]
     fn bounded_completion_is_delivered_before_teardown() {
         let config = test_config();
@@ -1435,6 +1442,85 @@ mod tests {
         client
             .read_exact(&mut buf)
             .expect("the peer got the whole message");
+    }
+
+    /// The `poll_ready_tasks` route into `Executor::remove_connection`:
+    /// teardown runs at step 6, *before* step 6a's flush, so ordering
+    /// cannot save the result and the provisional-abort rule has to.
+    ///
+    /// A standalone task owns a bounded send on connection X. X's own task
+    /// then returns `Poll::Ready`, so `poll_ready_tasks` closes and removes
+    /// X while the send is still queued; the flush that follows in the same
+    /// iteration writes every byte to the socket. The owner must be told
+    /// `Ok(len)`, not `ConnectionAborted`: the message was delivered.
+    ///
+    /// Before the fix (teardown recording `Done(Err(ConnectionAborted))`,
+    /// which `complete` then discarded as a second result) this failed with
+    /// `Custom { kind: ConnectionAborted, error: "connection closed" }`.
+    #[test]
+    fn bounded_send_owned_by_another_task_survives_its_connection_task_returning() {
+        let config = test_config();
+        let (mut event_loop, _wake) = test_loop(&config);
+        let (conn_index, mut client) = attach_conn(&mut event_loop.driver);
+        let conn = token(&event_loop.driver, conn_index);
+
+        // Owner: a standalone task, which outlives the connection.
+        let task_id = parked_standalone(&mut event_loop.executor);
+        let payload = vec![b'q'; 200];
+        let id = event_loop
+            .executor
+            .enqueue_send_capacity(conn_index, conn.generation, 4, task_id);
+        event_loop
+            .driver
+            .make_ctx()
+            .send_bounded(conn, &payload, id)
+            .expect("admitted");
+        event_loop.executor.mark_bounded_send_submitted(id);
+
+        // Step 6: the connection's own task runs and returns Ready.
+        // `NoopHandler::on_accept` is `async move {}`, so the first poll
+        // completes it and `poll_ready_tasks` takes the
+        // close_connection + remove_connection branch.
+        event_loop.spawn_accept_task(conn_index);
+        event_loop.poll_ready_tasks();
+        assert!(
+            event_loop.driver.send_queues[conn_index as usize].close_pending,
+            "the returning task requested the close"
+        );
+        assert!(
+            !event_loop.driver.pending_sends[conn_index as usize].is_empty(),
+            "teardown ran with the send still queued — the case under test"
+        );
+
+        // Steps 6a and 6b: flush, deliver completions, finalize the close.
+        event_loop.flush_all_pending_sends();
+        event_loop.drain_send_completions();
+        event_loop.drain_pending_closes();
+
+        let result = event_loop
+            .executor
+            .take_bounded_send_result(id)
+            .expect("the operation resolved");
+        assert_eq!(
+            result.expect("every byte reached the socket, so this is not an abort"),
+            200,
+            "a real driver result must overwrite the teardown's synthetic abort"
+        );
+        assert!(
+            event_loop.driver.tcp_streams[conn_index as usize].is_none(),
+            "the teardown did finish in the same iteration"
+        );
+        assert_eq!(
+            event_loop.driver.send_copy_pool.free_count(),
+            4,
+            "the permit came back with the completion"
+        );
+
+        let mut buf = vec![0u8; 200];
+        client
+            .read_exact(&mut buf)
+            .expect("the peer got the whole message");
+        assert!(buf.iter().all(|&b| b == b'q'));
     }
 
     /// Permits returning during an iteration wake the capacity head exactly
