@@ -101,12 +101,25 @@ the compiler finds them.
 ### Event loop (`backend/mio/event_loop.rs`)
 
 - `drain_send_completions` first drains `bounded_send_completions` into
-  `executor.complete_bounded_send(id, result)`, then the existing
-  `send_completions` pass. If it delivered any bounded completion, or
-  `clear_pending_sends` ran this iteration, it calls
-  `executor.wake_send_capacity(driver.send_copy_pool.free_count())` once.
-  A flag `capacity_released: bool` on the driver, set where permits are
-  released, keeps this to one wake per iteration.
+  `executor.complete_bounded_send(id, result)`, counting those towards its
+  `delivered` flag so a future woken by one is re-polled in the same call,
+  then runs the existing `send_completions` pass.
+- A flag `capacity_released: bool` on the driver is set wherever a permit is
+  returned, and `wake_capacity_if_released` calls
+  `executor.wake_send_capacity(driver.send_copy_pool.free_count())` once per
+  iteration. **It runs as the last step of the run loop, not inside
+  `drain_send_completions`** (an earlier draft of this design said the
+  latter). Permits come back at many points — a writable flush, either
+  `flush_all_pending_sends`, an accept-time slot reuse, a write error, a
+  task's own send, and `finish_close` inside `drain_pending_closes` — and
+  only the end of the loop covers all of them. In particular
+  `drain_pending_closes` runs *after* the final `drain_send_completions`, so
+  waking from inside the drain would leave a teardown's released permits
+  unsignalled until the next iteration's drain, which only runs after a
+  `poll` that may block on the timer deadline: a parked head could stall.
+  Waking last also means `free_count()` is the iteration's final figure.
+  Nothing is lost by waking late, since `poll_ready_tasks` has already run
+  and a task woken from that point on is polled next iteration either way.
 - `fail_connection_on_send_error` uses `clear_pending_sends` with the real
   error, then `wake_send`/`wake_recv`/`close_connection` as today.
 - Departure 4 ("a real completion overwrites the synthetic abort"): with the

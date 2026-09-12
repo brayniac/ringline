@@ -303,11 +303,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // already run, so a task woken anywhere from 6a onwards is
             // polled in the next iteration either way, and step 2 sees a
             // non-empty ready queue and polls with a zero timeout.
-            if self.driver.capacity_released {
-                self.driver.capacity_released = false;
-                self.executor
-                    .wake_send_capacity(self.driver.send_copy_pool.free_count());
-            }
+            self.wake_capacity_if_released();
 
             // 9. Check shutdown.
             if self.driver.shutdown_local || self.driver.shutdown_flag.load(Ordering::Relaxed) {
@@ -1022,6 +1018,20 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// Returned copy-pool permits are *not* signalled here: the driver sets
     /// `capacity_released` wherever a permit goes back, and the run loop
     /// issues one `wake_send_capacity` per iteration (see step 8a).
+    /// Wake the send-capacity FIFO head if any copy-pool permit came back
+    /// this iteration, and clear the flag. Called once, as the last thing in
+    /// the run loop; see the call site for why that point and not inside
+    /// [`drain_send_completions`](Self::drain_send_completions).
+    ///
+    /// Separate from the loop body so the tests can drive it directly.
+    fn wake_capacity_if_released(&mut self) {
+        if self.driver.capacity_released {
+            self.driver.capacity_released = false;
+            self.executor
+                .wake_send_capacity(self.driver.send_copy_pool.free_count());
+        }
+    }
+
     fn drain_send_completions(&mut self) {
         loop {
             let mut delivered = false;
