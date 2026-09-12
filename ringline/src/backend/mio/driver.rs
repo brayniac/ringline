@@ -38,9 +38,6 @@ pub(crate) struct PendingSend {
     pub(crate) data: Vec<u8>,
     pub(crate) offset: usize,
     pub(crate) notify_len: Option<u32>,
-    // Read by `flush_sends`/`clear_pending_sends` once the completion
-    // fan-out lands; nothing constructs a bounded entry yet.
-    #[allow(dead_code)]
     pub(crate) bounded: Option<(BoundedSendId, SlotReservation)>,
 }
 
@@ -71,14 +68,51 @@ impl PendingSend {
     }
 
     /// A bounded (`send_backpressured`) send holding its admission permit.
-    // No caller until `DriverCtx::send_bounded`.
-    #[allow(dead_code)]
+    ///
+    /// Built by `DriverCtx::send_bounded`; the permit is released (and `id`
+    /// completed) by [`Driver::flush_sends`] or
+    /// [`Driver::clear_pending_sends`], never by dropping the entry.
     pub(crate) fn bounded(data: Vec<u8>, id: BoundedSendId, permit: SlotReservation) -> Self {
         Self {
             data,
             offset: 0,
             notify_len: None,
             bounded: Some((id, permit)),
+        }
+    }
+}
+
+/// Clone an `io::Error` well enough to hand the same failure to several
+/// waiters. `io::Error` is not `Clone`, and a bounded-send fan-out has to
+/// give every discarded id an equivalent error: the OS errno is preserved
+/// where there is one (so `raw_os_error()`/`kind()` match the original),
+/// otherwise the kind and message are.
+pub(crate) fn clone_io_error(e: &io::Error) -> io::Error {
+    match e.raw_os_error() {
+        Some(code) => io::Error::from_raw_os_error(code),
+        None => io::Error::new(e.kind(), e.to_string()),
+    }
+}
+
+/// Discard every entry in one connection's send queue, releasing each
+/// bounded entry's copy-pool permit and failing its id with `err()`.
+///
+/// The field-wise form of [`Driver::clear_pending_sends`], so callers that
+/// hold a `DriverCtx` (or a live borrow of another `Driver` field) can use
+/// it too. A `PendingSend` must never be dropped any other way: its
+/// [`SlotReservation`] cannot release itself and debug-asserts on drop.
+pub(crate) fn clear_pending_sends_into(
+    queue: &mut VecDeque<PendingSend>,
+    pool: &mut SendCopyPool,
+    completions: &mut VecDeque<(BoundedSendId, io::Result<u32>)>,
+    capacity_released: &mut bool,
+    err: impl Fn() -> io::Error,
+) {
+    while let Some(entry) = queue.pop_front() {
+        if let Some((id, permit)) = entry.bounded {
+            pool.release_reservation(permit);
+            *capacity_released = true;
+            completions.push_back((id, Err(err())));
         }
     }
 }
@@ -154,6 +188,24 @@ pub(crate) struct Driver {
     /// `DriverCtx::send_await()` pushes len here; the event loop drains
     /// these and calls `Executor::wake_send()` for each.
     pub(crate) send_completions: Vec<VecDeque<u32>>,
+    /// Results of bounded (`send_backpressured`) sends, in completion order
+    /// and keyed by the id the submitting future holds. Not per-connection:
+    /// a [`BoundedSendId`] is unique on the worker, and the consumer
+    /// (`Executor::complete_bounded_send`) looks entries up by id.
+    ///
+    /// Produced here by [`Driver::flush_sends`] (`Ok(len)` when the entry's
+    /// last byte reaches the socket) and [`Driver::clear_pending_sends`]
+    /// (`Err` when the entry is discarded); drained by the event loop's
+    /// `drain_send_completions` (series PR 6, next task). The driver never
+    /// touches the `Executor` itself.
+    pub(crate) bounded_send_completions: VecDeque<(BoundedSendId, io::Result<u32>)>,
+    /// Set whenever a copy-pool permit goes back to the pool, so the event
+    /// loop can call `Executor::wake_send_capacity` once per iteration
+    /// instead of once per released permit. The event loop clears it.
+    // Written here, read by the event loop's capacity wake (the next task
+    // in series PR 6); nothing reads it yet.
+    #[allow(dead_code)]
+    pub(crate) capacity_released: bool,
     /// Bound UDP sockets (one per `config.udp_bind` address).
     pub(crate) udp_sockets: Vec<mio::net::UdpSocket>,
     /// Whether UDP GRO was requested; when set, the readable handler uses
@@ -302,6 +354,8 @@ impl Driver {
             wake_pipe_fd: eventfd,
             tcp_nodelay: config.tcp_nodelay,
             send_completions: (0..max_conn).map(|_| VecDeque::new()).collect(),
+            bounded_send_completions: VecDeque::new(),
+            capacity_released: false,
             udp_sockets,
             udp_gro: config.udp_gro,
             udp_token_base,
@@ -362,6 +416,8 @@ impl Driver {
             poll: &mut self.poll,
             writable: &mut self.writable,
             send_completions: &mut self.send_completions,
+            bounded_send_completions: &mut self.bounded_send_completions,
+            capacity_released: &mut self.capacity_released,
             connect_deadlines: &mut self.connect_deadlines,
             disk_io_pool: &self.disk_io_pool,
             disk_io_tx: &self.disk_io_tx,
@@ -449,7 +505,12 @@ impl Driver {
             .map(|c| c.established)
             .unwrap_or(false);
 
-        self.pending_sends[idx].clear();
+        self.clear_pending_sends(idx, || {
+            io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "connection closed before the send reached the socket",
+            )
+        });
         self.writable[idx] = false;
         if self.connect_deadlines[idx].take().is_some() {
             self.connect_pending -= 1;
@@ -472,6 +533,29 @@ impl Driver {
         if was_established {
             crate::metrics::CONNECTIONS_ACTIVE.decrement();
         }
+    }
+
+    /// Drop every queued send for `idx`, failing each bounded entry's id
+    /// with `err()` and returning its copy-pool permit.
+    ///
+    /// The only sanctioned way to discard a `PendingSend`: a plain
+    /// `pending_sends[idx].clear()` would drop a live [`SlotReservation`]
+    /// (debug-assert) and strand the `send_backpressured` future that owns
+    /// the entry's id. `err` is a closure because `io::Error` is not
+    /// `Clone` and one call may have to fail several ids — see
+    /// [`clone_io_error`].
+    ///
+    /// Callers pass `ConnectionAborted` at the teardown and slot-reuse
+    /// sites and the real write error at
+    /// `EventLoop::fail_connection_on_send_error`.
+    pub(crate) fn clear_pending_sends(&mut self, idx: usize, err: impl Fn() -> io::Error) {
+        clear_pending_sends_into(
+            &mut self.pending_sends[idx],
+            &mut self.send_copy_pool,
+            &mut self.bounded_send_completions,
+            &mut self.capacity_released,
+            err,
+        );
     }
 
     /// Record `idx` in the dirty-sends list so the event loop's flush pass
@@ -528,7 +612,22 @@ impl Driver {
             }
 
             if iovecs.is_empty() {
-                self.pending_sends[idx].clear();
+                // Every queued entry has nothing left to write (only a
+                // zero-length entry can get here; `send_bounded` never
+                // queues one). Discard them through the permit-aware path
+                // so a bounded entry cannot leak its reservation.
+                clear_pending_sends_into(
+                    &mut self.pending_sends[idx],
+                    &mut self.send_copy_pool,
+                    &mut self.bounded_send_completions,
+                    &mut self.capacity_released,
+                    || {
+                        io::Error::new(
+                            io::ErrorKind::ConnectionAborted,
+                            "queued send discarded with no bytes left to write",
+                        )
+                    },
+                );
                 break;
             }
 
@@ -561,12 +660,23 @@ impl Driver {
                     let avail = entry.data.len() - entry.offset;
                     if remaining >= avail {
                         remaining -= avail;
-                        if let Some(len) = entry.notify_len.take() {
+                        // Take both completions out of the entry before it
+                        // is popped: the bounded permit must go back to the
+                        // pool here, never by dropping the entry.
+                        let notify = entry.notify_len.take();
+                        let bounded = entry.bounded.take();
+                        let written = entry.data.len() as u32;
+                        if let Some(len) = notify {
                             self.send_completions[idx].push_back(len);
                             if !self.completions_dirty_flag[idx] {
                                 self.completions_dirty_flag[idx] = true;
                                 self.completions_dirty.push(idx as u32);
                             }
+                        }
+                        if let Some((id, permit)) = bounded {
+                            self.send_copy_pool.release_reservation(permit);
+                            self.capacity_released = true;
+                            self.bounded_send_completions.push_back((id, Ok(written)));
                         }
                         self.pending_sends[idx].pop_front();
                     } else {
@@ -641,6 +751,22 @@ impl Driver {
 
 impl Drop for Driver {
     fn drop(&mut self) {
+        // Hand back the copy-pool permits of any bounded sends still
+        // queued. Worker shutdown drops the driver with whatever is in
+        // `pending_sends`; a `PendingSend`'s `SlotReservation` cannot
+        // release itself and debug-asserts if it is dropped unfilled, so
+        // this is the last of the disposal paths (the others are
+        // `clear_pending_sends` and the completion in `flush_sends`). No
+        // completion is pushed: the executor is going away with the driver.
+        let pool = &mut self.send_copy_pool;
+        for queue in self.pending_sends.iter_mut() {
+            for entry in queue.drain(..) {
+                if let Some((_id, permit)) = entry.bounded {
+                    pool.release_reservation(permit);
+                }
+            }
+        }
+
         // Close the wake pipe's read end. The write end is held by
         // `WakeHandle` clones that may live longer than the worker;
         // those are closed by `ShutdownHandle::Drop`.
@@ -841,7 +967,9 @@ mod tests {
             .expect("register the accepted stream");
         driver.tcp_streams[idx] = Some(stream);
         driver.accumulators.reset(conn_index);
-        driver.pending_sends[idx].clear();
+        driver.clear_pending_sends(idx, || {
+            io::Error::new(io::ErrorKind::ConnectionAborted, "slot reused")
+        });
         driver.writable[idx] = true;
         if let Some(cs) = driver.connections.get_mut(conn_index) {
             cs.lifecycle = Lifecycle::Open;

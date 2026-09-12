@@ -365,7 +365,15 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             let idx = conn_index as usize;
             self.driver.tcp_streams[idx] = Some(mio_stream);
             self.driver.accumulators.reset(conn_index);
-            self.driver.pending_sends[idx].clear();
+            // Defensive: a freshly allocated slot should have an empty send
+            // queue, but if anything survived, its bounded entries must be
+            // failed and their permits returned rather than dropped.
+            self.driver.clear_pending_sends(idx, || {
+                io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "connection slot reused by a new accept",
+                )
+            });
             self.driver.writable[idx] = false;
 
             // TLS path: defer accept until handshake completes in handle_readable.
@@ -785,7 +793,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// error was swallowed — the queue was retried every loop iteration
     /// forever while send().await had already reported success.
     fn fail_connection_on_send_error(&mut self, conn_index: u32, e: io::Error) {
-        self.driver.pending_sends[conn_index as usize].clear();
+        // Every queued bounded send fails with the same error the write
+        // produced (cloned per id — `io::Error` is not `Clone`), and gives
+        // its copy-pool permit back.
+        self.driver.clear_pending_sends(conn_index as usize, || {
+            crate::backend::mio::driver::clone_io_error(&e)
+        });
         self.executor.wake_send(conn_index, Err(e));
         self.executor.wake_recv(conn_index);
         self.driver.close_connection(conn_index);
