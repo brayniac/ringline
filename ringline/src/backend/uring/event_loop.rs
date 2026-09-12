@@ -813,7 +813,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
             if replenished {
                 self.driver.recv_starved.swap_remove(i);
-                if self.driver.ring.submit_multishot_recv(conn_index).is_err() {
+                let generation = self.driver.connections.generation(conn_index);
+                if self
+                    .driver
+                    .ring
+                    .submit_multishot_recv(conn_index, generation)
+                    .is_err()
+                {
                     metrics::RING.increment(metrics::ring::RECV_ARM_FAILURES);
                     self.executor.wake_recv(conn_index);
                     self.driver.close_connection(conn_index);
@@ -1033,16 +1039,22 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let conn_index = ud.conn_index();
         let has_more = cqueue::more(flags);
 
-        // A completion without `IORING_CQE_F_MORE` means the kernel terminated
-        // this multishot recv. Record that the recv is no longer armed so the
-        // close path knows it need not cancel it (a re-arm below sets it back).
-        if !has_more && let Some(cs) = self.driver.connections.get_mut(conn_index) {
-            cs.recv_multishot_armed = false;
-        }
-
-        if self.driver.connections.get(conn_index).is_none() {
-            // Connection already released — but if result > 0, the kernel
-            // consumed a provided buffer that must be replenished.
+        // Identity check, before anything touches connection state. The slot
+        // must still be occupied AND by the same connection this recv was armed
+        // for: a multishot can outlive its fixed-file `Close` (the cancel in
+        // `try_finalize_close` is best-effort and is dropped when the SQ is
+        // full), so its terminal `-ECONNRESET` can land after the index has been
+        // handed to a new connection. `recv_multishot_armed` cannot tell the two
+        // apart — it is per-slot, and `arm_recv` sets it again for the new
+        // occupant. The arm-time generation, carried whole in the payload, can.
+        // See `docs/recv-multi-identity-design.md`.
+        if self.driver.connections.get(conn_index).is_none()
+            || self.driver.connections.generation(conn_index) != ud.payload()
+        {
+            // Connection already released, or the slot has been reused — but if
+            // result > 0, the kernel consumed a provided buffer that must be
+            // replenished. Exactly once: this early return is the only branch
+            // that can see this bid.
             if result > 0
                 && let Some(bid) = cqueue::buffer_select(flags)
             {
@@ -1050,6 +1062,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 self.driver.pending_replenish.push(bid);
             }
             return;
+        }
+
+        // A completion without `IORING_CQE_F_MORE` means the kernel terminated
+        // this multishot recv. Record that the recv is no longer armed so the
+        // close path knows it need not cancel it (a re-arm below sets it back).
+        if !has_more && let Some(cs) = self.driver.connections.get_mut(conn_index) {
+            cs.recv_multishot_armed = false;
         }
 
         if result <= 0 {
@@ -1320,8 +1339,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     // the fd — immune to reordering). `recv_multishot_armed` stays
                     // set until the ECANCELED CQE clears it (top of the handler),
                     // which gates re-arm so two multishots with the same user_data
-                    // never overlap.
-                    let recv_ud = UserData::encode(OpTag::RecvMulti, conn_index, 0);
+                    // never overlap. The payload must reproduce the arm-time
+                    // generation or the cancel matches nothing.
+                    let recv_ud = UserData::encode(
+                        OpTag::RecvMulti,
+                        conn_index,
+                        self.driver.connections.generation(conn_index),
+                    );
                     let _ = self
                         .driver
                         .ring
@@ -1461,7 +1485,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             && matches!(conn.lifecycle, Lifecycle::Open)
             && matches!(conn.recv_arm, RecvArm::Multi)
         {
-            if self.driver.ring.submit_multishot_recv(conn_index).is_err() {
+            let generation = self.driver.connections.generation(conn_index);
+            if self
+                .driver
+                .ring
+                .submit_multishot_recv(conn_index, generation)
+                .is_err()
+            {
                 metrics::RING.increment(metrics::ring::RECV_ARM_FAILURES);
                 self.executor.wake_recv(conn_index);
                 self.driver.close_connection(conn_index);
@@ -1481,7 +1511,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let conn_index = ud.conn_index();
         let has_more = cqueue::more(flags);
 
-        if self.driver.connections.get(conn_index).is_none() {
+        // Identity check — same reasoning as `handle_recv_multi`: the slot must
+        // still be occupied by the connection this recvmsg was armed for, or the
+        // completion belongs to a previous occupant of a reused index.
+        if self.driver.connections.get(conn_index).is_none()
+            || self.driver.connections.generation(conn_index) != ud.payload()
+        {
             if result > 0
                 && let Some(bid) = cqueue::buffer_select(flags)
             {
@@ -1504,11 +1539,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             if errno == libc::ENOBUFS {
                 metrics::POOL.increment(metrics::pool::BUFFER_RING_EMPTY);
                 if !has_more {
+                    let generation = self.driver.connections.generation(conn_index);
                     let msghdr_ptr = &*self.driver.recvmsg_msghdr as *const libc::msghdr;
                     let _ = self
                         .driver
                         .ring
-                        .submit_multishot_recvmsg(conn_index, msghdr_ptr);
+                        .submit_multishot_recvmsg(conn_index, generation, msghdr_ptr);
                 }
             } else if errno == libc::ECANCELED {
                 return;
@@ -1611,11 +1647,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             && matches!(conn.lifecycle, Lifecycle::Open)
             && matches!(conn.recv_arm, RecvArm::MsgMulti)
         {
+            let generation = self.driver.connections.generation(conn_index);
             let msghdr_ptr = &*self.driver.recvmsg_msghdr as *const libc::msghdr;
             let _ = self
                 .driver
                 .ring
-                .submit_multishot_recvmsg(conn_index, msghdr_ptr);
+                .submit_multishot_recvmsg(conn_index, generation, msghdr_ptr);
         }
     }
 
@@ -2465,7 +2502,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.driver.recv_starved.swap_remove(pos);
         }
         self.driver.forward_hold_throttled[ci] = false;
-        if self.driver.ring.submit_multishot_recv(conn_index).is_err() {
+        let generation = self.driver.connections.generation(conn_index);
+        if self
+            .driver
+            .ring
+            .submit_multishot_recv(conn_index, generation)
+            .is_err()
+        {
             metrics::RING.increment(metrics::ring::RECV_ARM_FAILURES);
             self.executor.wake_recv(conn_index);
             self.driver.close_connection(conn_index);
@@ -3649,13 +3692,17 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// containing kernel timestamps. Otherwise, uses `RecvMulti` (plain
     /// multishot recv).
     fn arm_recv(&mut self, conn_index: u32) {
+        // Carried in the completion's payload so a CQE that outlives this
+        // connection is rejected instead of being applied to the next occupant
+        // of the slot. Valid even for an inactive slot.
+        let generation = self.driver.connections.generation(conn_index);
         #[cfg(feature = "timestamps")]
         if self.driver.timestamps {
             let msghdr_ptr = &*self.driver.recvmsg_msghdr as *const libc::msghdr;
             if self
                 .driver
                 .ring
-                .submit_multishot_recvmsg(conn_index, msghdr_ptr)
+                .submit_multishot_recvmsg(conn_index, generation, msghdr_ptr)
                 .is_err()
             {
                 metrics::RING.increment(metrics::ring::RECV_ARM_FAILURES);
@@ -3668,7 +3715,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
             return;
         }
-        if self.driver.ring.submit_multishot_recv(conn_index).is_err() {
+        if self
+            .driver
+            .ring
+            .submit_multishot_recv(conn_index, generation)
+            .is_err()
+        {
             metrics::RING.increment(metrics::ring::RECV_ARM_FAILURES);
             self.executor.wake_recv(conn_index);
             self.driver.close_connection(conn_index);
@@ -5702,7 +5754,11 @@ mod tests {
         let conn_index = accept_connection(&mut el);
 
         // Simulate EOF CQE (result == 0).
-        let ud = UserData::encode(OpTag::RecvMulti, conn_index, 0);
+        let ud = UserData::encode(
+            OpTag::RecvMulti,
+            conn_index,
+            el.driver.connections.generation(conn_index),
+        );
         el.test_dispatch_cqe(ud.raw(), 0, 0);
 
         // Connection should be marked as closing.
@@ -5734,6 +5790,196 @@ mod tests {
             "buffer not replenished on stale connection CQE"
         );
         assert_eq!(el.driver.pending_replenish[0], bid);
+    }
+
+    // ── RecvMulti completion identity (generation) ─────────────────
+    //
+    // A multishot recv can outlive its connection: `try_finalize_close`
+    // cancels it best-effort and drops the cancel when the SQ is full, so the
+    // kernel's terminal completion can land after the `Close` CQE released the
+    // slot and a new connection took the index. The arm-time generation in the
+    // payload is what tells the two apart — `recv_multishot_armed` cannot, since
+    // it is per-slot and `arm_recv` sets it again for the new occupant.
+    // See `docs/recv-multi-identity-design.md`.
+
+    /// Close `conn_index` through its `Close` CQE (which releases the slot and
+    /// bumps its generation), then re-accept it. The free list is LIFO, so the
+    /// released index comes straight back — the reuse a stale completion races.
+    fn recycle_connection(el: &mut AsyncEventLoop<NoopHandler>, conn_index: u32) {
+        el.driver.close_connection(conn_index);
+        let close_ud = UserData::encode(OpTag::Close, conn_index, 0);
+        el.test_dispatch_cqe(close_ud.raw(), 0, 0);
+        assert!(
+            el.driver.connections.get(conn_index).is_none(),
+            "the Close CQE must release the slot"
+        );
+        // What the real accept path does before handing a reused slot out.
+        el.driver.reset_segment_state(conn_index);
+        el.driver.reset_send_state(conn_index);
+        let reused = accept_connection(el);
+        assert_eq!(
+            reused, conn_index,
+            "the free list must hand the same slot back"
+        );
+    }
+
+    #[test]
+    fn handle_recv_multi_stale_generation_error_does_not_touch_new_occupant() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let stale_generation = el.driver.connections.generation(conn_index);
+
+        recycle_connection(&mut el, conn_index);
+        assert_ne!(
+            el.driver.connections.generation(conn_index),
+            stale_generation,
+            "slot reuse must bump the generation"
+        );
+
+        // The new occupant has a task parked on recv and no recorded error.
+        el.executor.recv_waiters[conn_index as usize] = true;
+        el.executor.recv_errors[conn_index as usize] = None;
+
+        // The previous occupant's uncancelled multishot finally reports: a
+        // terminal error completion (no `F_MORE`).
+        let stale_ud = UserData::encode(OpTag::RecvMulti, conn_index, stale_generation);
+        el.test_dispatch_cqe(stale_ud.raw(), -libc::ECONNRESET, 0);
+
+        let conn = el
+            .driver
+            .connections
+            .get(conn_index)
+            .expect("the new occupant must still hold the slot");
+        assert!(
+            !conn.close_requested(),
+            "stale completion closed the new occupant"
+        );
+        assert!(
+            matches!(conn.read, ReadHalf::Open),
+            "stale completion poisoned the new occupant's read half"
+        );
+        assert!(
+            el.executor.recv_errors[conn_index as usize].is_none(),
+            "stale completion recorded a recv error on the new occupant"
+        );
+        assert!(
+            el.executor.recv_waiters[conn_index as usize],
+            "stale completion woke the new occupant's recv waiter"
+        );
+    }
+
+    #[test]
+    fn handle_recv_multi_stale_generation_replenishes_buffer_once() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let stale_generation = el.driver.connections.generation(conn_index);
+
+        recycle_connection(&mut el, conn_index);
+        el.driver.pending_replenish.clear();
+        let free_before = el.driver.provided_bufs.free();
+
+        // A data-bearing completion for the dead connection: the kernel did
+        // consume a provided buffer, so it must go back to the ring — but its
+        // bytes must not reach the new occupant.
+        let bid: u16 = 3;
+        let (buf_ptr, _) = el.driver.provided_bufs.get_buffer(bid);
+        unsafe {
+            std::ptr::copy_nonoverlapping(b"stale".as_ptr(), buf_ptr as *mut u8, 5);
+        }
+        let flags = 1u32 | 2u32 | ((bid as u32) << 16); // F_BUFFER | F_MORE, bid
+        let stale_ud = UserData::encode(OpTag::RecvMulti, conn_index, stale_generation);
+        el.test_dispatch_cqe(stale_ud.raw(), 5, flags);
+
+        assert_eq!(
+            el.driver
+                .pending_replenish
+                .iter()
+                .filter(|&&b| b == bid)
+                .count(),
+            1,
+            "the consumed provided buffer must be replenished exactly once"
+        );
+        assert_eq!(
+            el.driver.provided_bufs.free(),
+            free_before - 1,
+            "the handout must be accounted exactly once"
+        );
+        assert!(
+            el.driver.accumulators.data(conn_index).is_empty(),
+            "stale bytes leaked into the new occupant's accumulator"
+        );
+        assert!(
+            el.driver.pending_recv_bufs[conn_index as usize].is_none(),
+            "stale buffer pinned in the new occupant's zero-copy slot"
+        );
+
+        // The accounting closes: replenishing restores the free count.
+        let r: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
+        el.driver.provided_bufs.replenish_batch(&r);
+        assert_eq!(
+            el.driver.provided_bufs.free(),
+            free_before,
+            "no leak, no double replenish"
+        );
+    }
+
+    #[test]
+    fn handle_recv_multi_stale_generation_leaves_armed_flag_set() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let stale_generation = el.driver.connections.generation(conn_index);
+
+        recycle_connection(&mut el, conn_index);
+        el.driver
+            .connections
+            .get_mut(conn_index)
+            .unwrap()
+            .recv_multishot_armed = true;
+
+        // A terminal (`!has_more`) completion at the previous generation must
+        // not reach the prologue that clears `recv_multishot_armed` — otherwise
+        // the close path would skip cancelling a multishot that is really armed.
+        let stale_ud = UserData::encode(OpTag::RecvMulti, conn_index, stale_generation);
+        el.test_dispatch_cqe(stale_ud.raw(), -libc::ECONNRESET, 0);
+
+        assert!(
+            el.driver
+                .connections
+                .get(conn_index)
+                .unwrap()
+                .recv_multishot_armed,
+            "stale completion disarmed the live occupant's multishot"
+        );
+    }
+
+    #[test]
+    fn handle_recv_multi_current_generation_after_reuse_is_delivered() {
+        // The identity check must not over-reject: after the slot is reused, a
+        // completion bearing the *current* generation is delivered normally.
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        recycle_connection(&mut el, conn_index);
+        let generation = el.driver.connections.generation(conn_index);
+        assert_ne!(generation, 0, "the recycle must have bumped the generation");
+
+        let bid: u16 = 0;
+        let (buf_ptr, _) = el.driver.provided_bufs.get_buffer(bid);
+        unsafe {
+            std::ptr::copy_nonoverlapping(b"hello".as_ptr(), buf_ptr as *mut u8, 5);
+        }
+        let flags = 1u32 | 2u32 | ((bid as u32) << 16); // F_BUFFER | F_MORE, bid
+        let ud = UserData::encode(OpTag::RecvMulti, conn_index, generation);
+        assert_eq!(
+            ud.payload(),
+            generation,
+            "the RecvMulti payload carries the whole generation, untruncated"
+        );
+        el.test_dispatch_cqe(ud.raw(), 5, flags);
+
+        let pending = el.driver.pending_recv_bufs[conn_index as usize]
+            .expect("the live occupant's completion must be delivered");
+        assert_eq!(pending.bid, bid);
+        assert_eq!(pending.len, 5);
     }
 
     // ── Close path tests ───────────────────────────────────────────
@@ -5874,7 +6120,11 @@ mod tests {
             std::ptr::copy_nonoverlapping(b"hello".as_ptr(), buf_ptr as *mut u8, 5);
         }
 
-        let ud = UserData::encode(OpTag::RecvMulti, conn_index, 0);
+        let ud = UserData::encode(
+            OpTag::RecvMulti,
+            conn_index,
+            el.driver.connections.generation(conn_index),
+        );
         el.test_dispatch_cqe(ud.raw(), bytes_received, flags);
 
         // With zero-copy recv, first completion should be held in pending
@@ -5915,7 +6165,11 @@ mod tests {
         unsafe {
             std::ptr::copy_nonoverlapping(b"hi".as_ptr(), buf_ptr as *mut u8, 2);
         }
-        let ud = UserData::encode(OpTag::RecvMulti, conn_index, 0);
+        let ud = UserData::encode(
+            OpTag::RecvMulti,
+            conn_index,
+            el.driver.connections.generation(conn_index),
+        );
         el.test_dispatch_cqe(ud.raw(), 2, flags);
 
         // Handout accounted: exactly one fewer free.
@@ -5956,7 +6210,11 @@ mod tests {
         unsafe {
             std::ptr::copy_nonoverlapping(b"hello".as_ptr(), buf_ptr as *mut u8, 5);
         }
-        let ud = UserData::encode(OpTag::RecvMulti, conn_index, 0);
+        let ud = UserData::encode(
+            OpTag::RecvMulti,
+            conn_index,
+            el.driver.connections.generation(conn_index),
+        );
         el.test_dispatch_cqe(ud.raw(), bytes_received, flags);
 
         // (a) Buffer went to the segment hold, NOT the accumulator or the
@@ -6073,7 +6331,11 @@ mod tests {
             std::ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr as *mut u8, data.len());
         }
         let flags = 1u32 | 2u32 | ((bid as u32) << 16); // F_BUFFER | F_MORE
-        let ud = UserData::encode(OpTag::RecvMulti, conn_index, 0);
+        let ud = UserData::encode(
+            OpTag::RecvMulti,
+            conn_index,
+            el.driver.connections.generation(conn_index),
+        );
         el.test_dispatch_cqe(ud.raw(), data.len() as i32, flags);
     }
 
@@ -6747,7 +7009,11 @@ mod tests {
 
         // Deliver a peer FIN: multishot recv completion with result == 0 and no
         // F_MORE. This must wake the parked reader and close the recv side.
-        let ud = UserData::encode(OpTag::RecvMulti, conn_index, 0);
+        let ud = UserData::encode(
+            OpTag::RecvMulti,
+            conn_index,
+            el.driver.connections.generation(conn_index),
+        );
         el.test_dispatch_cqe(ud.raw(), 0, 0);
         assert!(
             !el.executor.recv_waiters[conn_index as usize],
@@ -7838,7 +8104,11 @@ mod tests {
 
         // ECANCELED lands: clears `recv_multishot_armed`; hold still full → stays
         // throttled (re-arm waits for the hold to drain).
-        let recv_ud = UserData::encode(OpTag::RecvMulti, conn_index, 0);
+        let recv_ud = UserData::encode(
+            OpTag::RecvMulti,
+            conn_index,
+            el.driver.connections.generation(conn_index),
+        );
         el.test_dispatch_cqe(recv_ud.raw(), -libc::ECANCELED, 0);
         assert!(
             !el.driver
@@ -7921,7 +8191,11 @@ mod tests {
         assert!(el.driver.segment_hold[conn_index as usize].len() < cap);
 
         // ECANCELED now lands with the hold already below the cap → re-arm here.
-        let recv_ud = UserData::encode(OpTag::RecvMulti, conn_index, 0);
+        let recv_ud = UserData::encode(
+            OpTag::RecvMulti,
+            conn_index,
+            el.driver.connections.generation(conn_index),
+        );
         el.test_dispatch_cqe(recv_ud.raw(), -libc::ECANCELED, 0);
         assert!(
             !el.driver.forward_hold_throttled[conn_index as usize],
@@ -8001,8 +8275,9 @@ mod tests {
             "bid 1 replenished exactly once"
         );
 
-        // A stale ECANCELED for the throttle-cancel after close is a no-op.
-        let recv_ud = UserData::encode(OpTag::RecvMulti, conn_index, 0);
+        // A stale ECANCELED for the throttle-cancel after close is a no-op — it
+        // bears the pre-close generation, which the slot no longer carries.
+        let recv_ud = UserData::encode(OpTag::RecvMulti, conn_index, generation);
         el.test_dispatch_cqe(recv_ud.raw(), -libc::ECANCELED, 0);
 
         let r: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
@@ -8045,7 +8320,11 @@ mod tests {
         unsafe {
             std::ptr::copy_nonoverlapping(b"hello".as_ptr(), buf_ptr as *mut u8, 5);
         }
-        let ud = UserData::encode(OpTag::RecvMulti, conn_index, 0);
+        let ud = UserData::encode(
+            OpTag::RecvMulti,
+            conn_index,
+            el.driver.connections.generation(conn_index),
+        );
         el.test_dispatch_cqe(ud.raw(), 5, flags);
 
         // Second recv: bid=1, " world"
@@ -8053,7 +8332,11 @@ mod tests {
         unsafe {
             std::ptr::copy_nonoverlapping(b" world".as_ptr(), buf_ptr as *mut u8, 6);
         }
-        let ud = UserData::encode(OpTag::RecvMulti, conn_index, 0);
+        let ud = UserData::encode(
+            OpTag::RecvMulti,
+            conn_index,
+            el.driver.connections.generation(conn_index),
+        );
         el.test_dispatch_cqe(ud.raw(), 6, flags | (1u32 << 16));
 
         // Both buffers should be replenished (first flushed, second appended directly).
@@ -8080,7 +8363,11 @@ mod tests {
         let conn_index = accept_connection(&mut el);
 
         // ENOBUFS = -105. has_more = false (bit 1 not set).
-        let ud = UserData::encode(OpTag::RecvMulti, conn_index, 0);
+        let ud = UserData::encode(
+            OpTag::RecvMulti,
+            conn_index,
+            el.driver.connections.generation(conn_index),
+        );
         el.test_dispatch_cqe(ud.raw(), -105, 0);
 
         // Connection should still be alive (ENOBUFS is recoverable).
@@ -8096,7 +8383,11 @@ mod tests {
         let conn_index = accept_connection(&mut el);
 
         // Unknown error, !has_more — should close.
-        let ud = UserData::encode(OpTag::RecvMulti, conn_index, 0);
+        let ud = UserData::encode(
+            OpTag::RecvMulti,
+            conn_index,
+            el.driver.connections.generation(conn_index),
+        );
         el.test_dispatch_cqe(ud.raw(), -99, 0); // -99 = unknown errno
 
         let conn = el.driver.connections.get(conn_index);
@@ -8112,7 +8403,11 @@ mod tests {
         let conn_index = accept_connection(&mut el);
 
         // ECANCELED = -125.
-        let ud = UserData::encode(OpTag::RecvMulti, conn_index, 0);
+        let ud = UserData::encode(
+            OpTag::RecvMulti,
+            conn_index,
+            el.driver.connections.generation(conn_index),
+        );
         el.test_dispatch_cqe(ud.raw(), -125, 0);
 
         // Connection should still be alive.
@@ -8127,7 +8422,11 @@ mod tests {
     /// Park a connection via an ENOBUFS multishot CQE and return its index.
     fn park_connection(el: &mut AsyncEventLoop<NoopHandler>) -> u32 {
         let conn_index = accept_connection(el);
-        let ud = UserData::encode(OpTag::RecvMulti, conn_index, 0);
+        let ud = UserData::encode(
+            OpTag::RecvMulti,
+            conn_index,
+            el.driver.connections.generation(conn_index),
+        );
         el.test_dispatch_cqe(ud.raw(), -libc::ENOBUFS, 0);
         assert!(el.driver.recv_starved.contains(&conn_index));
         conn_index
@@ -8225,7 +8524,11 @@ mod tests {
         // replenish pass must NOT arm a multishot alongside the
         // outstanding one-shot — the connection stays parked until the
         // fallback CQE hands off.
-        let ud = UserData::encode(OpTag::RecvMulti, conn_index, 0);
+        let ud = UserData::encode(
+            OpTag::RecvMulti,
+            conn_index,
+            el.driver.connections.generation(conn_index),
+        );
         el.test_dispatch_cqe(ud.raw(), -libc::ENOBUFS, 0);
         assert!(el.driver.recv_starved.contains(&conn_index));
 
@@ -8891,7 +9194,11 @@ mod tests {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
 
-        let ud = UserData::encode(OpTag::RecvMulti, conn_index, 0);
+        let ud = UserData::encode(
+            OpTag::RecvMulti,
+            conn_index,
+            el.driver.connections.generation(conn_index),
+        );
         el.inject_and_dispatch(ud.raw(), 0);
 
         let conn = el.driver.connections.get(conn_index);
@@ -9049,7 +9356,11 @@ mod tests {
         let conn_index = accept_connection(&mut el);
 
         // ENOBUFS = -105.
-        let ud = UserData::encode(OpTag::RecvMulti, conn_index, 0);
+        let ud = UserData::encode(
+            OpTag::RecvMulti,
+            conn_index,
+            el.driver.connections.generation(conn_index),
+        );
         el.inject_and_dispatch(ud.raw(), -105);
 
         assert!(
@@ -9063,7 +9374,11 @@ mod tests {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
 
-        let ud = UserData::encode(OpTag::RecvMulti, conn_index, 0);
+        let ud = UserData::encode(
+            OpTag::RecvMulti,
+            conn_index,
+            el.driver.connections.generation(conn_index),
+        );
         el.inject_and_dispatch(ud.raw(), -99);
 
         let conn = el.driver.connections.get(conn_index);
@@ -9075,7 +9390,11 @@ mod tests {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
 
-        let ud = UserData::encode(OpTag::RecvMulti, conn_index, 0);
+        let ud = UserData::encode(
+            OpTag::RecvMulti,
+            conn_index,
+            el.driver.connections.generation(conn_index),
+        );
         el.inject_and_dispatch(ud.raw(), -125); // ECANCELED
 
         assert!(el.driver.connections.get(conn_index).is_some());
@@ -9206,7 +9525,11 @@ mod tests {
         let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(b"data").unwrap();
 
         let send_ud = UserData::encode(OpTag::Send, conn_index, slot as u32);
-        let recv_ud = UserData::encode(OpTag::RecvMulti, conn_index, 0);
+        let recv_ud = UserData::encode(
+            OpTag::RecvMulti,
+            conn_index,
+            el.driver.connections.generation(conn_index),
+        );
 
         el.inject_batch_and_dispatch(&[
             (send_ud.raw(), -104), // send error
@@ -9233,7 +9556,11 @@ mod tests {
 
         // Recv EOF + stale send in the same batch.
         // The EOF handler calls close_connection internally.
-        let recv_ud = UserData::encode(OpTag::RecvMulti, conn_index, 0);
+        let recv_ud = UserData::encode(
+            OpTag::RecvMulti,
+            conn_index,
+            el.driver.connections.generation(conn_index),
+        );
         let send_ud = UserData::encode(OpTag::Send, conn_index, slot as u32);
 
         el.inject_batch_and_dispatch(&[
@@ -10376,7 +10703,7 @@ mod tests {
                         break;
                     }
 
-                    let ud = UserData::encode(OpTag::RecvMulti, conn_index, 0);
+                    let ud = UserData::encode(OpTag::RecvMulti, conn_index, el.driver.connections.generation(conn_index));
                     let result = match action {
                         RecvAction::Eof => 0,
                         RecvAction::Error => -99,
@@ -10491,7 +10818,7 @@ mod tests {
                         // Recv EOF — closes the connection.
                         5 if !live_conns.is_empty() => {
                             let ci = live_conns.remove(0);
-                            let ud = UserData::encode(OpTag::RecvMulti, ci, 0);
+                            let ud = UserData::encode(OpTag::RecvMulti, ci, el.driver.connections.generation(ci));
                             el.test_dispatch_cqe(ud.raw(), 0, 0);
                             // Simulate Close CQE.
                             let close_ud = UserData::encode(OpTag::Close, ci, 0);
@@ -10501,7 +10828,7 @@ mod tests {
                         // Recv error.
                         6 if !live_conns.is_empty() => {
                             let ci = live_conns[0];
-                            let ud = UserData::encode(OpTag::RecvMulti, ci, 0);
+                            let ud = UserData::encode(OpTag::RecvMulti, ci, el.driver.connections.generation(ci));
                             el.test_dispatch_cqe(ud.raw(), -105, 0); // ENOBUFS
                         }
 
@@ -10518,7 +10845,7 @@ mod tests {
                                         el.driver.connections.generation(ci),
                                     ),
                                 );
-                                let recv_ud = UserData::encode(OpTag::RecvMulti, ci, 0);
+                                let recv_ud = UserData::encode(OpTag::RecvMulti, ci, el.driver.connections.generation(ci));
                                 // EOF first, then stale send — the bug pattern.
                                 el.test_dispatch_cqe(recv_ud.raw(), 0, 0);
                                 el.test_dispatch_cqe(send_ud.raw(), 4, 0);

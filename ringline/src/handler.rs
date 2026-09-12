@@ -1000,7 +1000,14 @@ impl<'a> DriverCtx<'a> {
         }
         cs.recv_arm = crate::connection::RecvArm::Idle;
 
-        let target_ud = crate::completion::UserData::encode(target_tag, conn.index, 0);
+        // A cancel matches its target by `user_data`, so the payload must be
+        // exactly what the arm site submitted: the connection generation for
+        // the multishot recv families, zero for `Connect`.
+        let target_payload = match target_tag {
+            crate::completion::OpTag::Connect => 0,
+            _ => conn.generation,
+        };
+        let target_ud = crate::completion::UserData::encode(target_tag, conn.index, target_payload);
         self.ring.submit_async_cancel(target_ud.raw(), conn.index)?;
         Ok(())
     }
