@@ -126,6 +126,25 @@ the compiler finds them.
 No changes; PR 5's wrappers are the consumers' API. The dead-code
 allowance stays until PR 9 (io_uring still has no callers).
 
+### Two decisions made during implementation
+
+**`Driver::drop` is a sixth disposal path and releases permits.** Worker
+shutdown drops the driver with whatever is still queued. A `PendingSend`
+holding a permit would hit `SlotReservation`'s `Drop` debug-assert, so the
+existing `impl Drop for Driver` gains a pass that drains `pending_sends` and
+returns each permit. No completions are pushed: the executor is going away
+with the driver, and there is nobody left to read a result.
+
+**`send_bounded` does not refuse once a close is merely *pending*.** The
+`close_submitted` check is implemented so the two backends' entry points
+cannot drift, but it is inert on mio — only the io_uring close path sets that
+flag. mio's `close_pending` means "teardown requested, deferred until queued
+sends drain", and plain mio `send` happily queues behind it, so a bounded send
+queuing behind it too is the consistent behaviour and the send still reaches
+the socket before `drain_pending_closes` finalizes. Making mio refuse on
+`close_pending` would be a change to the close path's contract, not to this
+feature, and belongs with the close-lifecycle work if it is ever wanted.
+
 ## Tests
 
 mio has no event-loop unit-test module; tests are `#[cfg(test)]` unit
