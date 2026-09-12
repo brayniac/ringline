@@ -60,6 +60,14 @@ record gap) green on both backends.
   test had to make the client wait for the half-close before reading: a
   fast loopback reader can keep the socket buffer from filling and let the
   old code get away with it. Design: `docs/write-half-design.md`.
+- **PR 2 — worker startup errors.** #318's version sent a `String` over
+  the startup channel; after #360/#361 made setup failures typed and
+  actionable that would have flattened them, so the channel now carries
+  `crate::error::Error`. The failing worker's own error reaches `launch()`
+  (before: the first joined thread's, in handle order), and a startup panic
+  is caught and reported with its payload and worker id (before: a
+  disconnected channel and "worker setup failed"). Design:
+  `docs/worker-startup-errors-design.md`.
 - **PR 1 — `with_data_result`.** `Executor` gains a generation-tagged
   `recv_errors` slot written by `fail_recv` at the five real socket-read
   failure sites (mio: TLS and plaintext read errors in

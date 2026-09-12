@@ -67,6 +67,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   rest, and sent the FIN — a response larger than the socket buffer
   followed by a half-close was truncated. The FIN now goes out once the
   queue drains, as on io_uring.
+- `launch()` now returns the error the failing worker actually reported
+  (typed: `RingSetup`, `ResourceLimit`, `Io`) instead of whichever joined
+  thread's error came first, and a panic during worker startup surfaces as
+  an `Io` error naming the worker and the panic payload instead of the
+  generic "worker setup failed".
 
 ## [0.6.3] - 2026-09-09
 
