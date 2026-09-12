@@ -2038,7 +2038,8 @@ impl<'a> DriverCtx<'a> {
                 let ciphertext = crate::tls::encrypt_for_send_mio(tls_table, conn.index, data)?;
                 if !ciphertext.is_empty() {
                     let idx = conn.index as usize;
-                    self.pending_sends[idx].push_back((ciphertext, 0, None));
+                    self.pending_sends[idx]
+                        .push_back(crate::backend::mio::driver::PendingSend::plain(ciphertext));
                     self.mark_send_dirty(idx);
                 }
                 return Ok(());
@@ -2046,7 +2047,9 @@ impl<'a> DriverCtx<'a> {
         }
 
         let idx = conn.index as usize;
-        self.pending_sends[idx].push_back((data.to_vec(), 0, None));
+        self.pending_sends[idx].push_back(crate::backend::mio::driver::PendingSend::plain(
+            data.to_vec(),
+        ));
         self.mark_send_dirty(idx);
         Ok(())
     }
@@ -2065,8 +2068,8 @@ impl<'a> DriverCtx<'a> {
     /// fully reached the socket, not at queue time.
     pub(crate) fn mark_last_send_awaited(&mut self, conn_index: u32) {
         let idx = conn_index as usize;
-        if let Some((data, offset, notify)) = self.pending_sends[idx].back_mut() {
-            *notify = Some((data.len() - *offset) as u32);
+        if let Some(entry) = self.pending_sends[idx].back_mut() {
+            entry.notify_len = Some((entry.data.len() - entry.offset) as u32);
         } else {
             // The send was flushed... it can't have been (mio sends are
             // queued, never written inline) — but if the queue is somehow

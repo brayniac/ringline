@@ -8,23 +8,80 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use crate::accumulator::AccumulatorTable;
-use crate::buffer::send_copy::SendCopyPool;
+use crate::buffer::send_copy::{SendCopyPool, SlotReservation};
 use crate::config::Config;
 use crate::connection::{ConnectionTable, Lifecycle, WriteHalf};
 use crate::disk_io_pool::DiskIoPool;
 use crate::handler::{ConnSendState, DriverCtx};
+use crate::runtime::send_capacity::BoundedSendId;
 
 use mio::Interest;
 
 /// mio token 0 is reserved for the wake pipe.
 pub(crate) const WAKE_TOKEN: mio::Token = mio::Token(0);
 
-/// Per-connection pending send: `(data, offset, notify_len)` for partial
-/// writes. `notify_len` is `Some(len)` for awaitable sends: the completion
+/// Per-connection pending send: the bytes plus how far into them the socket
+/// has got, so a partial `writev` can resume where it stopped.
+///
+/// `notify_len` is `Some(len)` for awaitable sends: the completion
 /// (wake_send) is delivered only when the entry has fully reached the
 /// socket — completing at queue time reported success for bytes that were
 /// never written and swallowed write errors entirely.
-pub(crate) type PendingSend = (Vec<u8>, usize, Option<u32>);
+///
+/// `bounded` marks a `send_backpressured` entry: its [`BoundedSendId`]
+/// routes the exact result of *this* operation back to the future that
+/// submitted it, and the [`SlotReservation`] is the copy-pool permit that
+/// admitted it. The permit is held unfilled for the entry's whole life and
+/// released when the entry completes or is discarded — never dropped
+/// (`SlotReservation`'s `Drop` debug-asserts that).
+pub(crate) struct PendingSend {
+    pub(crate) data: Vec<u8>,
+    pub(crate) offset: usize,
+    pub(crate) notify_len: Option<u32>,
+    // Read by `flush_sends`/`clear_pending_sends` once the completion
+    // fan-out lands; nothing constructs a bounded entry yet.
+    #[allow(dead_code)]
+    pub(crate) bounded: Option<(BoundedSendId, SlotReservation)>,
+}
+
+impl PendingSend {
+    /// A fire-and-forget send: nothing is woken when it reaches the socket.
+    pub(crate) fn plain(data: Vec<u8>) -> Self {
+        Self {
+            data,
+            offset: 0,
+            notify_len: None,
+            bounded: None,
+        }
+    }
+
+    /// An awaitable send: `wake_send(Ok(len))` once its last byte is written.
+    // Unused today: the awaitable path pushes a plain entry and then has
+    // `DriverCtx::mark_last_send_awaited` set `notify_len` on it. This is the
+    // constructor form of the same entry.
+    #[allow(dead_code)]
+    pub(crate) fn awaited(data: Vec<u8>) -> Self {
+        let notify_len = Some(data.len() as u32);
+        Self {
+            data,
+            offset: 0,
+            notify_len,
+            bounded: None,
+        }
+    }
+
+    /// A bounded (`send_backpressured`) send holding its admission permit.
+    // No caller until `DriverCtx::send_bounded`.
+    #[allow(dead_code)]
+    pub(crate) fn bounded(data: Vec<u8>, id: BoundedSendId, permit: SlotReservation) -> Self {
+        Self {
+            data,
+            offset: 0,
+            notify_len: None,
+            bounded: Some((id, permit)),
+        }
+    }
+}
 
 /// Per-worker mio driver state.
 pub(crate) struct Driver {
@@ -457,11 +514,11 @@ impl Driver {
         while !self.pending_sends[idx].is_empty() {
             let mut iovecs: Vec<libc::iovec> =
                 Vec::with_capacity(self.pending_sends[idx].len().min(1024));
-            for (data, offset, _notify) in self.pending_sends[idx].iter() {
+            for entry in self.pending_sends[idx].iter() {
                 if iovecs.len() >= 1024 {
                     break;
                 }
-                let remaining = &data[*offset..];
+                let remaining = &entry.data[entry.offset..];
                 if !remaining.is_empty() {
                     iovecs.push(libc::iovec {
                         iov_base: remaining.as_ptr() as *mut libc::c_void,
@@ -500,11 +557,11 @@ impl Driver {
             let mut remaining = result as usize;
             total_written += result as u32;
             while remaining > 0 {
-                if let Some((data, offset, notify)) = self.pending_sends[idx].front_mut() {
-                    let avail = data.len() - *offset;
+                if let Some(entry) = self.pending_sends[idx].front_mut() {
+                    let avail = entry.data.len() - entry.offset;
                     if remaining >= avail {
                         remaining -= avail;
-                        if let Some(len) = notify.take() {
+                        if let Some(len) = entry.notify_len.take() {
                             self.send_completions[idx].push_back(len);
                             if !self.completions_dirty_flag[idx] {
                                 self.completions_dirty_flag[idx] = true;
@@ -513,7 +570,7 @@ impl Driver {
                         }
                         self.pending_sends[idx].pop_front();
                     } else {
-                        *offset += remaining;
+                        entry.offset += remaining;
                         remaining = 0;
                     }
                 } else {
