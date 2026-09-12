@@ -51,7 +51,7 @@ pub(crate) struct SendCapacityQueue {
 }
 struct Waiter    { id, conn_index: u32, generation: u32, required_slots: usize, task_id: u32 }
 struct Submitted { id, conn_index: u32, task_id: u32, state: Completion }
-enum Completion  { InFlight, Done(io::Result<u32>), Abandoned }
+enum Completion  { InFlight, Done(io::Result<u32>), Aborted(io::Error), Abandoned }
 
 impl SendCapacityQueue {
     fn enqueue(&mut self, conn_index, generation, required_slots, task_id) -> BoundedSendId;
@@ -75,20 +75,31 @@ Semantics:
   (`InFlight`). If it was the head, returns the new head's task id so the
   caller can wake it (it will re-check `turn`).
 - `complete(id, result)`: `InFlight` → `Done(result)`, returns the owner;
-  `Abandoned` → entry removed, result discarded (the future is gone);
-  unknown id → ignored (a stale completion after `remove_connection`).
-- `take_result(id)`: `Done` → removes and returns; anything else `None`.
+  `Aborted` → also `Done(result)`, returns the owner (the driver's outcome
+  is authoritative — see the abort rule below); `Done` → ignored, so between
+  two *driver* results for one id the first wins; `Abandoned` → entry
+  removed, result discarded (the future is gone); unknown id → ignored (a
+  stale completion after `remove_connection`).
+- `take_result(id)`: `Done` or `Aborted` → removes and returns; anything
+  else `None`. `Aborted` must resolve too, or a send whose connection really
+  was torn down before the driver reported would park forever.
 - `cancel(id)` (future dropped): waiting → removed, and if it was the head
   the next head's task is returned for waking; `InFlight` → `Abandoned`
   (the driver still owns the operation; its completion is dropped on
-  arrival); `Done` → removed.
+  arrival); `Done` or `Aborted` → removed.
 - `head_ready(free_slots)` → the head's task if `free_slots >=
   head.required_slots`. `wake_send_capacity` is this plus `wake_task`.
 - `remove_connection(conn)`: for every waiting and in-flight entry of the
   connection, if the owner is a task that outlives the connection (a
   standalone task, or another connection's task) the entry becomes
-  `Done(Err(ConnectionAborted))` (moved to `submitted` if it was waiting)
-  and the owner is returned for waking. If the owner is the connection's
+  `Aborted(ConnectionAborted)` (moved to `submitted` if it was waiting) and
+  the owner is returned for waking. `Aborted` and not `Done` because this
+  abort is **provisional** (series departure 4): `Executor::remove_connection`
+  is called from the mio loop's `poll_ready_tasks` (step 6) as well as from
+  `drain_pending_closes` (step 6b), and step 6 runs *before* the step-6a
+  flush that can still put the whole message on the socket. A driver result
+  arriving after the abort overwrites it, so a delivered message is never
+  reported as aborted. If the owner is the connection's
   own task (`task_id == conn_index`) nobody is left to read a result:
   `task_slab.remove` has already dropped that future outside a poll, so its
   `Drop` → `cancel` could not run. Those entries are cancelled instead —
@@ -98,8 +109,9 @@ Semantics:
   head's task is also returned. Called from `Executor::remove_connection`
   after `task_slab.remove`.
 - `fail_waiting(conn, generation, kind, msg)`: waiting entries for that
-  connection generation become `Done(Err(kind))` and their owners are
-  returned for waking, plus the new head's task if the head was among them;
+  connection generation become `Done(Err(kind))` — final, not the
+  provisional `Aborted`, since they were never submitted and no driver
+  result is coming — and their owners are returned for waking, plus the new head's task if the head was among them;
   in-flight ones are left alone. PR 9's `shutdown_write` uses it with
   `BrokenPipe`. `remove_connection` and `fail_waiting` return a `Vec<u32>`
   (teardown/shutdown paths; the allocation is acceptable there).
@@ -134,6 +146,11 @@ allowance is off):
   cancel → `Abandoned`; `complete` returns no owner and removes the entry;
   `take_result` is `None`.
 - `take_result_returns_exactly_once`.
+- `a_real_result_overwrites_a_teardown_abort_but_not_another_result`: the
+  provisional-abort rule, and that two driver results are still first-wins.
+- `a_teardown_abort_nothing_overwrites_still_resolves`: the other half —
+  an `Aborted` no driver result reaches is handed to the future.
+- `cancelling_an_aborted_entry_drops_it_and_its_late_result`.
 - `remove_connection_fails_waiting_and_in_flight_and_wakes_unrelated_head`:
   conn A head waiting, conn A in flight, conn B waiting behind; remove A →
   both A entries `Done(Err(ConnectionAborted))` with owners returned, B is

@@ -281,6 +281,30 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.drain_send_completions();
             self.drain_pending_closes();
 
+            // 8a. One send-capacity wake per iteration. A copy-pool permit
+            // can come back at many points above — `handle_writable`'s
+            // flush (4), either `flush_all_pending_sends` (6a, 8), a
+            // `clear_pending_sends` from an accept-time slot reuse (4), a
+            // write error, a task's own send (6), or `finish_close` inside
+            // either `drain_pending_closes` (6b, 8) — and each of those sets
+            // `capacity_released` rather than touching the executor.
+            //
+            // This is the single point that covers all of them, including
+            // both `drain_send_completions` call sites: it is the last
+            // thing in the iteration, so `free_count()` is the final figure
+            // and no release can slip past it into the blocking `poll` at
+            // the top of the next iteration. Waking from inside
+            // `drain_send_completions` instead would fire twice per
+            // iteration and would still leave step 8's teardown releases
+            // unsignalled until the next iteration's step 6a — which only
+            // runs after a `poll` that may block indefinitely.
+            //
+            // Nothing is lost by waking late: `poll_ready_tasks` (6) has
+            // already run, so a task woken anywhere from 6a onwards is
+            // polled in the next iteration either way, and step 2 sees a
+            // non-empty ready queue and polls with a zero timeout.
+            self.wake_capacity_if_released();
+
             // 9. Check shutdown.
             if self.driver.shutdown_local || self.driver.shutdown_flag.load(Ordering::Relaxed) {
                 return Ok(());
@@ -365,7 +389,15 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             let idx = conn_index as usize;
             self.driver.tcp_streams[idx] = Some(mio_stream);
             self.driver.accumulators.reset(conn_index);
-            self.driver.pending_sends[idx].clear();
+            // Defensive: a freshly allocated slot should have an empty send
+            // queue, but if anything survived, its bounded entries must be
+            // failed and their permits returned rather than dropped.
+            self.driver.clear_pending_sends(idx, || {
+                io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "connection slot reused by a new accept",
+                )
+            });
             self.driver.writable[idx] = false;
 
             // TLS path: defer accept until handshake completes in handle_readable.
@@ -785,7 +817,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// error was swallowed — the queue was retried every loop iteration
     /// forever while send().await had already reported success.
     fn fail_connection_on_send_error(&mut self, conn_index: u32, e: io::Error) {
-        self.driver.pending_sends[conn_index as usize].clear();
+        // Every queued bounded send fails with the same error the write
+        // produced (cloned per id — `io::Error` is not `Clone`), and gives
+        // its copy-pool permit back.
+        self.driver.clear_pending_sends(conn_index as usize, || {
+            crate::backend::mio::driver::clone_io_error(&e)
+        });
         self.executor.wake_send(conn_index, Err(e));
         self.executor.wake_recv(conn_index);
         self.driver.close_connection(conn_index);
@@ -967,14 +1004,50 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
     }
 
-    /// Drain per-connection send completion queues, calling wake_send for
-    /// each and re-polling tasks so that each SendFuture resolves. Visits
-    /// only connections marked dirty at completion-push time; a connection
-    /// with results left over (single waiter slot, or no waiter yet) is
-    /// re-marked for the next pass.
+    /// Wake the send-capacity FIFO head if any copy-pool permit came back
+    /// this iteration, and clear the flag. Called once, as the last thing in
+    /// the run loop; see the call site for why that point and not inside
+    /// [`drain_send_completions`](Self::drain_send_completions).
+    ///
+    /// Separate from the loop body so the tests can drive it directly.
+    fn wake_capacity_if_released(&mut self) {
+        if self.driver.capacity_released {
+            self.driver.capacity_released = false;
+            self.executor
+                .wake_send_capacity(self.driver.send_copy_pool.free_count());
+        }
+    }
+
+    /// Drain the driver's send completions and re-poll the tasks they woke.
+    ///
+    /// Two queues, in this order: the worker-wide bounded-send queue
+    /// (`Driver::bounded_send_completions`, routed by id through
+    /// `Executor::complete_bounded_send`), then the per-connection
+    /// `send_completions` queues, calling wake_send for each so that each
+    /// SendFuture resolves. The per-connection pass visits only connections
+    /// marked dirty at completion-push time; a connection with results left
+    /// over (single waiter slot, or no waiter yet) is re-marked for the next
+    /// pass.
+    ///
+    /// Returned copy-pool permits are *not* signalled here: the driver sets
+    /// `capacity_released` wherever a permit goes back, and the run loop
+    /// issues one `wake_send_capacity` per iteration (see step 8a).
     fn drain_send_completions(&mut self) {
         loop {
             let mut delivered = false;
+            // Bounded (`send_backpressured`) completions first. They are
+            // keyed by id rather than by connection, so they bypass the
+            // dirty-list entirely; the executor's FIFO routes each result
+            // to the exact operation that produced it. Draining them here
+            // (rather than after the per-connection pass) keeps them ahead
+            // of `drain_pending_closes`, so a bounded send whose last byte
+            // reached the socket is recorded `Ok` before
+            // `Executor::remove_connection` would resolve it as
+            // `ConnectionAborted`.
+            while let Some((id, result)) = self.driver.bounded_send_completions.pop_front() {
+                self.executor.complete_bounded_send(id, result);
+                delivered = true;
+            }
             let dirty = std::mem::take(&mut self.driver.completions_dirty);
             for conn_index in dirty {
                 let idx = conn_index as usize;
@@ -1206,5 +1279,552 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
         // Drain any wakeups that happened during polling.
         executor.collect_wakeups();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Event-loop tests for the bounded-send path.
+    //!
+    //! The driver-level bounded-send tests live in
+    //! `backend/mio/driver.rs`. The ones here need an `Executor` as well —
+    //! the two orders in which a completion and a teardown can reach it
+    //! (the close route and the returning-task route), and the capacity
+    //! wake the loop issues once per iteration — so they build a whole
+    //! `AsyncEventLoop` and call the run-loop steps directly. The
+    //! connection scaffolding (`attach_conn`, `token`) is shared with the
+    //! driver tests.
+
+    use super::*;
+    use crate::backend::mio::driver::tests::{attach_conn, token};
+    use crate::config::ConfigBuilder;
+    use crate::runtime::io::ConnCtx;
+    use std::future::Future;
+    use std::io::Read;
+
+    /// A handler that does nothing: these tests never accept a connection
+    /// through the loop, they attach one directly.
+    struct NoopHandler;
+
+    impl AsyncEventHandler for NoopHandler {
+        #[allow(clippy::manual_async_fn)]
+        fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+            async move {}
+        }
+
+        fn create_for_worker(_worker_id: usize) -> Self {
+            NoopHandler
+        }
+    }
+
+    /// Single-worker config with the driver tests' tiny 4 x 64-byte send
+    /// pool, and no filesystem subsystem so no disk-I/O threads start.
+    fn test_config() -> Config {
+        ConfigBuilder::new()
+            .workers(1)
+            .pin_to_core(false)
+            .max_connections(16)
+            .send_pool(4, 64)
+            .no_fs()
+            .build()
+            .expect("valid test config")
+    }
+
+    /// Build an event loop with no acceptor and no optional subsystems.
+    ///
+    /// `prepare_run` is deliberately not called (it only registers the wake
+    /// pipe, which nothing here polls). As in `driver::tests::test_driver`,
+    /// the returned `WakeHandle` must stay bound for the loop's lifetime.
+    fn test_loop(config: &Config) -> (AsyncEventLoop<NoopHandler>, crate::wakeup::WakeHandle) {
+        test_loop_with_accept(config, None)
+    }
+
+    /// [`test_loop`] with an acceptor channel, for the tests that drive
+    /// `drain_channels`' accept path.
+    fn test_loop_with_accept(
+        config: &Config,
+        accept_rx: Option<crossbeam_channel::Receiver<(RawFd, SocketAddr)>>,
+    ) -> (AsyncEventLoop<NoopHandler>, crate::wakeup::WakeHandle) {
+        let (read_fd, handle) = crate::wakeup::create_wake_fd().expect("wake fd");
+        let event_loop = AsyncEventLoop::new(
+            config,
+            NoopHandler,
+            accept_rx,
+            read_fd,
+            handle.as_wake_fd(),
+            Arc::new(AtomicBool::new(false)),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("build mio event loop");
+        (event_loop, handle)
+    }
+
+    /// A parked standalone task, so that waking it is observable (a task
+    /// that is already Ready is not re-queued).
+    fn parked_standalone(executor: &mut Executor) -> u32 {
+        let idx = executor
+            .standalone_slab
+            .spawn(Box::pin(std::future::pending::<()>()))
+            .expect("free standalone slot");
+        park(executor, idx | STANDALONE_BIT);
+        idx | STANDALONE_BIT
+    }
+
+    /// Return a Ready standalone task to Parked.
+    fn park(executor: &mut Executor, task_id: u32) {
+        let idx = task_id & !STANDALONE_BIT;
+        let future = executor
+            .standalone_slab
+            .take_ready(idx)
+            .expect("task is Ready");
+        executor.standalone_slab.park(idx, future);
+    }
+
+    /// Departure 4 of the series design, on the `drain_pending_closes`
+    /// route: a close requested while the send is still queued is finalized
+    /// at step 6b, *after* step 6a's flush and completion delivery, so the
+    /// send resolves `Ok` even though the connection is torn down in the
+    /// same iteration. Here the ordering alone is what saves the result.
+    ///
+    /// This covers only that route.
+    /// `Executor::remove_connection` has two other callers, both in
+    /// `poll_ready_tasks` — which runs *before* the flush; see
+    /// `bounded_send_owned_by_another_task_survives_its_connection_task_returning`.
+    #[test]
+    fn bounded_completion_is_delivered_before_teardown() {
+        let config = test_config();
+        let (mut event_loop, _wake) = test_loop(&config);
+        let (conn_index, mut client) = attach_conn(&mut event_loop.driver);
+        let conn = token(&event_loop.driver, conn_index);
+
+        // The submitting future is on a standalone task: one owned by the
+        // connection's own task is dropped by teardown before it could ever
+        // read a result (`SendCapacityQueue::remove_connection`).
+        let task_id = parked_standalone(&mut event_loop.executor);
+        let payload = vec![b'z'; 200];
+        let id = event_loop
+            .executor
+            .enqueue_send_capacity(conn_index, conn.generation, 4, task_id);
+        event_loop
+            .driver
+            .make_ctx()
+            .send_bounded(conn, &payload, id)
+            .expect("admitted");
+        event_loop.executor.mark_bounded_send_submitted(id);
+
+        // Close requested while the send is still queued.
+        event_loop.driver.close_connection(conn_index);
+
+        // One iteration's tail, in the run loop's order (steps 6a and 6b).
+        event_loop.flush_all_pending_sends();
+        event_loop.drain_send_completions();
+        event_loop.drain_pending_closes();
+
+        let result = event_loop
+            .executor
+            .take_bounded_send_result(id)
+            .expect("the operation resolved");
+        assert_eq!(
+            result.expect("the bytes reached the socket, so this is not ConnectionAborted"),
+            200,
+            "a real completion must beat the teardown's synthetic abort"
+        );
+        assert!(
+            event_loop.driver.tcp_streams[conn_index as usize].is_none(),
+            "the teardown did run in the same iteration"
+        );
+        assert_eq!(
+            event_loop.driver.send_copy_pool.free_count(),
+            4,
+            "the permit came back with the completion"
+        );
+
+        let mut buf = vec![0u8; 200];
+        client
+            .read_exact(&mut buf)
+            .expect("the peer got the whole message");
+    }
+
+    /// The `poll_ready_tasks` route into `Executor::remove_connection`:
+    /// teardown runs at step 6, *before* step 6a's flush, so ordering
+    /// cannot save the result and the provisional-abort rule has to.
+    ///
+    /// A standalone task owns a bounded send on connection X. X's own task
+    /// then returns `Poll::Ready`, so `poll_ready_tasks` closes and removes
+    /// X while the send is still queued; the flush that follows in the same
+    /// iteration writes every byte to the socket. The owner must be told
+    /// `Ok(len)`, not `ConnectionAborted`: the message was delivered.
+    ///
+    /// Before the fix (teardown recording `Done(Err(ConnectionAborted))`,
+    /// which `complete` then discarded as a second result) this failed with
+    /// `Custom { kind: ConnectionAborted, error: "connection closed" }`.
+    #[test]
+    fn bounded_send_owned_by_another_task_survives_its_connection_task_returning() {
+        let config = test_config();
+        let (mut event_loop, _wake) = test_loop(&config);
+        let (conn_index, mut client) = attach_conn(&mut event_loop.driver);
+        let conn = token(&event_loop.driver, conn_index);
+
+        // Owner: a standalone task, which outlives the connection.
+        let task_id = parked_standalone(&mut event_loop.executor);
+        let payload = vec![b'q'; 200];
+        let id = event_loop
+            .executor
+            .enqueue_send_capacity(conn_index, conn.generation, 4, task_id);
+        event_loop
+            .driver
+            .make_ctx()
+            .send_bounded(conn, &payload, id)
+            .expect("admitted");
+        event_loop.executor.mark_bounded_send_submitted(id);
+
+        // Step 6: the connection's own task runs and returns Ready.
+        // `NoopHandler::on_accept` is `async move {}`, so the first poll
+        // completes it and `poll_ready_tasks` takes the
+        // close_connection + remove_connection branch.
+        event_loop.spawn_accept_task(conn_index);
+        event_loop.poll_ready_tasks();
+        assert!(
+            event_loop.driver.send_queues[conn_index as usize].close_pending,
+            "the returning task requested the close"
+        );
+        assert!(
+            !event_loop.driver.pending_sends[conn_index as usize].is_empty(),
+            "teardown ran with the send still queued — the case under test"
+        );
+
+        // Steps 6a and 6b: flush, deliver completions, finalize the close.
+        event_loop.flush_all_pending_sends();
+        event_loop.drain_send_completions();
+        event_loop.drain_pending_closes();
+
+        let result = event_loop
+            .executor
+            .take_bounded_send_result(id)
+            .expect("the operation resolved");
+        assert_eq!(
+            result.expect("every byte reached the socket, so this is not an abort"),
+            200,
+            "a real driver result must overwrite the teardown's synthetic abort"
+        );
+        assert!(
+            event_loop.driver.tcp_streams[conn_index as usize].is_none(),
+            "the teardown did finish in the same iteration"
+        );
+        assert_eq!(
+            event_loop.driver.send_copy_pool.free_count(),
+            4,
+            "the permit came back with the completion"
+        );
+
+        let mut buf = vec![0u8; 200];
+        client
+            .read_exact(&mut buf)
+            .expect("the peer got the whole message");
+        assert!(buf.iter().all(|&b| b == b'q'));
+    }
+
+    /// Permits returning during an iteration wake the capacity head exactly
+    /// once, at the end of the iteration — not once per released permit.
+    ///
+    /// "Once" is counted at the source (`Executor::send_capacity_wakes`),
+    /// not inferred from `ready_queue.len()`: `wake_task` pushes only on a
+    /// Parked → Ready transition, so a second wake of the same head in the
+    /// same iteration would leave the queue length at 1 too. The last block
+    /// shows the counter does move when a wake really is issued.
+    #[test]
+    fn capacity_head_is_woken_once_per_iteration_when_permits_return() {
+        let config = test_config();
+        let (mut event_loop, _wake) = test_loop(&config);
+        let (conn_index, _client) = attach_conn(&mut event_loop.driver);
+        let conn = token(&event_loop.driver, conn_index);
+
+        // A waiter for three slots sits at the head of the FIFO. Two
+        // one-slot sends are in flight behind it, so only two slots are
+        // free: the head cannot be admitted until they complete.
+        let head_task = parked_standalone(&mut event_loop.executor);
+        let head =
+            event_loop
+                .executor
+                .enqueue_send_capacity(conn_index, conn.generation, 3, head_task);
+        for _ in 0..2 {
+            let task = parked_standalone(&mut event_loop.executor);
+            let id =
+                event_loop
+                    .executor
+                    .enqueue_send_capacity(conn_index, conn.generation, 1, task);
+            event_loop
+                .driver
+                .make_ctx()
+                .send_bounded(conn, b"sixty-odd bytes is one slot", id)
+                .expect("admitted");
+            event_loop.executor.mark_bounded_send_submitted(id);
+        }
+        assert_eq!(event_loop.driver.send_copy_pool.free_count(), 2);
+        assert!(
+            !event_loop.executor.send_capacity_turn(head, 2),
+            "the head needs three slots"
+        );
+        assert!(event_loop.executor.ready_queue.is_empty());
+
+        // Both sends reach the socket in one flush: two permits come back.
+        event_loop.flush_all_pending_sends();
+        assert_eq!(event_loop.driver.send_copy_pool.free_count(), 4);
+        assert!(
+            event_loop.driver.capacity_released,
+            "the driver records the release instead of waking"
+        );
+        assert!(
+            event_loop.executor.ready_queue.is_empty(),
+            "the driver must not touch the executor itself"
+        );
+
+        event_loop.wake_capacity_if_released();
+
+        assert_eq!(
+            event_loop.executor.send_capacity_wakes, 1,
+            "two released permits, one wake"
+        );
+        assert_eq!(
+            event_loop.executor.ready_queue.len(),
+            1,
+            "and that wake reached the head"
+        );
+        assert_eq!(event_loop.executor.ready_queue[0], head_task);
+        assert!(
+            event_loop.executor.send_capacity_turn(head, 4),
+            "the head can now be admitted"
+        );
+        assert!(
+            !event_loop.driver.capacity_released,
+            "the flag is consumed by the wake"
+        );
+
+        // Nothing was released since, so a further call wakes nobody —
+        // re-park the head first, so a second wake would be visible.
+        park(&mut event_loop.executor, head_task);
+        event_loop.executor.ready_queue.clear();
+        event_loop.wake_capacity_if_released();
+        assert_eq!(
+            event_loop.executor.send_capacity_wakes, 1,
+            "the head is woken once per iteration, not once per call"
+        );
+        assert!(event_loop.executor.ready_queue.is_empty());
+
+        // The counter is what the assertions above rest on, so show it can
+        // move: a permit released in the *next* iteration wakes the head
+        // again.
+        event_loop.driver.capacity_released = true;
+        event_loop.wake_capacity_if_released();
+        assert_eq!(
+            event_loop.executor.send_capacity_wakes, 2,
+            "a genuine second release does wake the head again"
+        );
+        assert_eq!(event_loop.executor.ready_queue, vec![head_task]);
+    }
+
+    /// A connected socket pair; the server end is handed over as a raw fd
+    /// (as the acceptor thread does), the client end returned so the test
+    /// keeps the connection alive.
+    fn accepted_socket() -> (RawFd, std::net::TcpStream, SocketAddr) {
+        use std::os::fd::IntoRawFd;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+        let addr = listener.local_addr().expect("listener address");
+        let client = std::net::TcpStream::connect(addr).expect("connect to the listener");
+        let (server, peer) = listener.accept().expect("accept the connection");
+        server
+            .set_nonblocking(true)
+            .expect("nonblocking server end");
+        (server.into_raw_fd(), client, peer)
+    }
+
+    /// The accept-time slot-reuse clear in `drain_channels` disposes of
+    /// whatever the previous occupant left queued: permit back, id failed.
+    ///
+    /// One of four permit-disposal sites; a bare `pending_sends[idx].clear()`
+    /// here strands the id and trips `SlotReservation`'s drop assert.
+    #[test]
+    fn accept_time_slot_reuse_fails_a_stale_bounded_send() {
+        let config = test_config();
+        let (accept_tx, accept_rx) = crossbeam_channel::unbounded();
+        let (mut event_loop, _wake) = test_loop_with_accept(&config, Some(accept_rx));
+        let (conn_index, _client) = attach_conn(&mut event_loop.driver);
+        let conn = token(&event_loop.driver, conn_index);
+
+        let task_id = parked_standalone(&mut event_loop.executor);
+        let id = event_loop
+            .executor
+            .enqueue_send_capacity(conn_index, conn.generation, 1, task_id);
+        event_loop
+            .driver
+            .make_ctx()
+            .send_bounded(conn, b"stranded", id)
+            .expect("admitted");
+        event_loop.executor.mark_bounded_send_submitted(id);
+        assert_eq!(event_loop.driver.send_copy_pool.free_count(), 3);
+
+        // Free the slot with its send queue still populated — the state the
+        // defensive clear exists for. No production path gets here today,
+        // which is exactly why nothing else would notice it regressing.
+        event_loop.driver.tcp_streams[conn_index as usize] = None;
+        event_loop.driver.connections.release(conn_index);
+
+        let (server_fd, _peer, peer_addr) = accepted_socket();
+        accept_tx
+            .send((server_fd, peer_addr))
+            .expect("queue the accept");
+        event_loop.drain_channels();
+        assert!(
+            event_loop.driver.tcp_streams[conn_index as usize].is_some(),
+            "the free list is LIFO, so the accept reused the same slot"
+        );
+        assert!(
+            event_loop.driver.pending_sends[conn_index as usize].is_empty(),
+            "the stale entry went"
+        );
+        assert_eq!(
+            event_loop.driver.send_copy_pool.free_count(),
+            4,
+            "its permit came back to the pool"
+        );
+
+        event_loop.drain_send_completions();
+        let err = event_loop
+            .executor
+            .take_bounded_send_result(id)
+            .expect("the stranded id must be told")
+            .expect_err("the send never went");
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
+        assert!(
+            err.to_string().contains("reused by a new accept"),
+            "unexpected message: {err}"
+        );
+    }
+
+    /// A write error fans out to every queued bounded id with the real
+    /// errno, not a synthetic abort — through the event loop's own
+    /// `fail_connection_on_send_error`, which is the third of the four
+    /// permit-disposal sites. Driving the helper rather than re-implementing
+    /// its body is the point: a bare `pending_sends[idx].clear()` there must
+    /// fail this test.
+    #[test]
+    fn write_error_fails_queued_bounded_sends_with_the_real_error() {
+        let config = test_config();
+        let (mut event_loop, _wake) = test_loop(&config);
+        let (conn_index, client) = attach_conn(&mut event_loop.driver);
+        let idx = conn_index as usize;
+        let conn = token(&event_loop.driver, conn_index);
+
+        // Abort the peer: SO_LINGER 0 makes the close an RST.
+        let linger = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        let rc = unsafe {
+            libc::setsockopt(
+                std::os::fd::AsRawFd::as_raw_fd(&client),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                &linger as *const libc::linger as *const libc::c_void,
+                std::mem::size_of::<libc::linger>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(rc, 0, "setsockopt: {}", io::Error::last_os_error());
+        drop(client);
+
+        // The RST is asynchronous: the first write after it may still
+        // succeed, so write until one fails.
+        let mut write_err = None;
+        for _ in 0..500 {
+            event_loop
+                .driver
+                .make_ctx()
+                .send(conn, b"x")
+                .expect("queued");
+            match event_loop.driver.flush_sends(conn_index) {
+                Ok(_) => std::thread::sleep(Duration::from_millis(2)),
+                Err(e) => {
+                    write_err = Some(e);
+                    break;
+                }
+            }
+        }
+        let write_err = write_err.expect("writing to an aborted peer must fail");
+        assert!(
+            write_err.raw_os_error().is_some(),
+            "the fan-out has an errno to preserve: {write_err:?}"
+        );
+        // Which errno the probe saw is not the property under test and is not
+        // stable across platforms: Linux reports ECONNRESET for the first
+        // write after the reset and EPIPE for every later one, macOS reports
+        // ECONNRESET throughout. What must hold is that whatever the *failing
+        // flush* returned reaches every queued id verbatim, rather than the
+        // synthetic `ConnectionAborted` that teardown would otherwise supply
+        // (that one carries no errno, which is what distinguishes it).
+
+        // Two bounded sends queued against the dead socket.
+        let mut ids = Vec::new();
+        for payload in [&b"a"[..], &b"b"[..]] {
+            let task_id = parked_standalone(&mut event_loop.executor);
+            let id =
+                event_loop
+                    .executor
+                    .enqueue_send_capacity(conn_index, conn.generation, 1, task_id);
+            event_loop
+                .driver
+                .make_ctx()
+                .send_bounded(conn, payload, id)
+                .expect("admission does not touch the socket");
+            event_loop.executor.mark_bounded_send_submitted(id);
+            ids.push(id);
+        }
+
+        // The flush pass hits the write error and routes it through
+        // `fail_connection_on_send_error`.
+        event_loop.flush_all_pending_sends();
+        assert!(
+            event_loop.driver.pending_sends[idx].is_empty(),
+            "the failed connection's queue is discarded"
+        );
+        assert_eq!(
+            event_loop.driver.send_copy_pool.free_count(),
+            4,
+            "a failed connection still returns its permits"
+        );
+        assert!(
+            event_loop.driver.send_queues[idx].close_pending,
+            "a hard write error closes the connection"
+        );
+
+        event_loop.drain_send_completions();
+        let mut seen: Option<(Option<i32>, io::ErrorKind)> = None;
+        for id in ids {
+            let err = event_loop
+                .executor
+                .take_bounded_send_result(id)
+                .unwrap_or_else(|| panic!("{id:?} was never told"))
+                .expect_err("the write failed");
+            assert!(
+                err.raw_os_error().is_some(),
+                "{id:?} got a synthetic error, not the real write failure: {err:?}"
+            );
+            // Every id was failed by one write, so they must agree.
+            match seen {
+                None => seen = Some((err.raw_os_error(), err.kind())),
+                Some(first) => assert_eq!(
+                    (err.raw_os_error(), err.kind()),
+                    first,
+                    "{id:?} disagrees with its queue-mate about the write error"
+                ),
+            }
+        }
     }
 }

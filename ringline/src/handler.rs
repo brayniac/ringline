@@ -1965,6 +1965,18 @@ pub struct DriverCtx<'a> {
     pub(crate) writable: &'a mut Vec<bool>,
     /// Per-connection send completion queue (byte counts for awaitable sends).
     pub(crate) send_completions: &'a mut Vec<std::collections::VecDeque<u32>>,
+    /// Worker-wide bounded-send results, keyed by the id the submitting
+    /// future holds (see `Driver::bounded_send_completions`). `send_bounded`
+    /// pushes here only when it completes an operation without queueing it;
+    /// the normal completion comes from `Driver::flush_sends`.
+    pub(crate) bounded_send_completions: &'a mut std::collections::VecDeque<(
+        crate::runtime::send_capacity::BoundedSendId,
+        io::Result<u32>,
+    )>,
+    /// Mirror of `Driver::capacity_released`: set when a copy-pool permit
+    /// goes back to the pool so the event loop wakes the send-capacity head
+    /// once per iteration.
+    pub(crate) capacity_released: &'a mut bool,
     /// Per-connection connect timeout deadlines.
     pub(crate) connect_deadlines: &'a mut Vec<Option<std::time::Instant>>,
     pub(crate) sends_dirty: &'a mut Vec<u32>,
@@ -2038,7 +2050,8 @@ impl<'a> DriverCtx<'a> {
                 let ciphertext = crate::tls::encrypt_for_send_mio(tls_table, conn.index, data)?;
                 if !ciphertext.is_empty() {
                     let idx = conn.index as usize;
-                    self.pending_sends[idx].push_back((ciphertext, 0, None));
+                    self.pending_sends[idx]
+                        .push_back(crate::backend::mio::driver::PendingSend::plain(ciphertext));
                     self.mark_send_dirty(idx);
                 }
                 return Ok(());
@@ -2046,9 +2059,158 @@ impl<'a> DriverCtx<'a> {
         }
 
         let idx = conn.index as usize;
-        self.pending_sends[idx].push_back((data.to_vec(), 0, None));
+        self.pending_sends[idx].push_back(crate::backend::mio::driver::PendingSend::plain(
+            data.to_vec(),
+        ));
         self.mark_send_dirty(idx);
         Ok(())
+    }
+
+    /// Queue a bounded (`send_backpressured`) send, admitting it against the
+    /// copy pool first.
+    ///
+    /// mio never copies into pool memory — the bytes go through a `Vec` like
+    /// every other mio send — so here the pool is purely the *admission
+    /// budget*: the call reserves `ceil(len / slot_size)` slots and holds
+    /// that reservation unfilled as the entry's permit, so the same
+    /// `Config::send_pool` knob throttles bounded sends identically on both
+    /// backends (`docs/mio-bounded-send-design.md`, "What a bounded send is
+    /// on mio", records the decision and the alternatives).
+    ///
+    /// Nothing is written synchronously: admission *is* the reservation.
+    /// On `Ok` the operation is queued and exactly one completion for `id`
+    /// will reach `Driver::bounded_send_completions` — `Ok(len)` when its
+    /// last byte reaches the socket (`Driver::flush_sends`), `Err` if it is
+    /// discarded first (`Driver::clear_pending_sends`). On `Err` nothing was
+    /// reserved or queued and no completion for `id` will ever be produced,
+    /// so the caller owns the failure.
+    ///
+    /// Called by series PR 9's `send_backpressured` future once
+    /// `Executor`'s send-capacity FIFO says it is this id's turn.
+    // No caller until that future exists (the driver tests reach it through
+    // `Driver::make_ctx`); series PR 9 removes this allowance, as it does
+    // the one on `runtime::send_capacity`.
+    #[allow(dead_code)]
+    pub(crate) fn send_bounded(
+        &mut self,
+        conn: ConnToken,
+        data: &[u8],
+        id: crate::runtime::send_capacity::BoundedSendId,
+    ) -> io::Result<()> {
+        let conn_state = self
+            .connections
+            .get(conn.index)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "invalid connection"))?;
+        if conn_state.generation != conn.generation {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "stale connection",
+            ));
+        }
+        // Same refusal, kind and message as the io_uring `send`. The flag is
+        // only ever set by the io_uring close path, so this is inert on mio
+        // today (a mio close defers teardown until `pending_sends` drains,
+        // and `clear_pending_sends` fails whatever is still queued); the
+        // check stays so the two entry points cannot drift.
+        if self.send_queues[conn.index as usize].close_submitted {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "connection closing",
+            ));
+        }
+
+        let idx = conn.index as usize;
+        let slot_size = self.send_copy_pool.slot_size() as usize;
+        let needed = data.len().div_ceil(slot_size);
+        let permit = match self.send_copy_pool.reserve_slots(needed) {
+            Ok(r) => r,
+            Err(crate::buffer::send_copy::ReserveError::Exhausted) => {
+                return Err(io::Error::other("send copy pool exhausted"));
+            }
+            Err(crate::buffer::send_copy::ReserveError::TooLarge { needed, capacity }) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "send of {} bytes needs {needed} send-pool slots but the pool has \
+                         {capacity} (raise Config::send_pool)",
+                        data.len()
+                    ),
+                ));
+            }
+        };
+
+        // TLS: encrypt first, then carry the id and permit on the ciphertext
+        // entry. The permit is sized by the *plaintext* length, so the
+        // ciphertext's record overhead is admitted for free — the design
+        // records this as series PR 8's gap (io_uring has the same
+        // plaintext-sized admission), not something to paper over here.
+        if !self.tls_table.is_null() {
+            let tls_table = unsafe { &mut *self.tls_table };
+            if tls_table.has(conn.index) {
+                let ciphertext = match crate::tls::encrypt_for_send_mio(tls_table, conn.index, data)
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        // rustls has already advanced; nothing is queued, so
+                        // give the permit back and let the caller see the
+                        // error (no completion for `id` is produced).
+                        self.release_permit(permit);
+                        return Err(e);
+                    }
+                };
+                if ciphertext.is_empty() {
+                    // Nothing to queue and therefore nothing that could ever
+                    // complete the id: settle it here.
+                    self.release_permit(permit);
+                    self.bounded_send_completions
+                        .push_back((id, Ok(data.len() as u32)));
+                    return Ok(());
+                }
+                self.pending_sends[idx].push_back(
+                    crate::backend::mio::driver::PendingSend::bounded(ciphertext, id, permit),
+                );
+                self.mark_send_dirty(idx);
+                return Ok(());
+            }
+        }
+
+        if data.is_empty() {
+            // A zero-length entry would produce no iovec and be swept by
+            // `flush_sends`'s empty-iovec bail-out as an error. Complete it
+            // here instead.
+            self.release_permit(permit);
+            self.bounded_send_completions.push_back((id, Ok(0)));
+            return Ok(());
+        }
+
+        self.pending_sends[idx].push_back(crate::backend::mio::driver::PendingSend::bounded(
+            data.to_vec(),
+            id,
+            permit,
+        ));
+        self.mark_send_dirty(idx);
+        Ok(())
+    }
+
+    /// Return an unfilled admission permit to the copy pool and record that
+    /// capacity came back, so the event loop wakes the send-capacity head.
+    fn release_permit(&mut self, permit: crate::buffer::send_copy::SlotReservation) {
+        self.send_copy_pool.release_reservation(permit);
+        *self.capacity_released = true;
+    }
+
+    /// Discard every queued send for `idx`, failing each bounded entry's id
+    /// with `err()` and returning its permit — the `DriverCtx` form of
+    /// [`crate::backend::mio::driver::Driver::clear_pending_sends`]. A bare
+    /// `pending_sends[idx].clear()` would drop live `SlotReservation`s.
+    fn clear_pending_sends(&mut self, idx: usize, err: impl Fn() -> io::Error) {
+        crate::backend::mio::driver::clear_pending_sends_into(
+            &mut self.pending_sends[idx],
+            self.send_copy_pool,
+            self.bounded_send_completions,
+            self.capacity_released,
+            err,
+        );
     }
 
     /// Record `idx` in the dirty-sends list so the event loop's flush pass
@@ -2065,8 +2227,8 @@ impl<'a> DriverCtx<'a> {
     /// fully reached the socket, not at queue time.
     pub(crate) fn mark_last_send_awaited(&mut self, conn_index: u32) {
         let idx = conn_index as usize;
-        if let Some((data, offset, notify)) = self.pending_sends[idx].back_mut() {
-            *notify = Some((data.len() - *offset) as u32);
+        if let Some(entry) = self.pending_sends[idx].back_mut() {
+            entry.notify_len = Some((entry.data.len() - entry.offset) as u32);
         } else {
             // The send was flushed... it can't have been (mio sends are
             // queued, never written inline) — but if the queue is somehow
@@ -2178,7 +2340,15 @@ impl<'a> DriverCtx<'a> {
         let idx = conn_index as usize;
         self.tcp_streams[idx] = Some(mio_stream);
         self.writable[idx] = false;
-        self.pending_sends[idx].clear();
+        // Defensive, as at accept: a freshly allocated slot should have an
+        // empty send queue, but anything left must go through the
+        // permit-aware clear rather than being dropped.
+        self.clear_pending_sends(idx, || {
+            io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "connection slot reused by a new connect",
+            )
+        });
         if let Some(cs) = self.connections.get_mut(conn_index) {
             cs.peer_addr = Some(crate::connection::PeerAddr::Tcp(addr));
         }

@@ -8,23 +8,99 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use crate::accumulator::AccumulatorTable;
-use crate::buffer::send_copy::SendCopyPool;
+use crate::buffer::send_copy::{SendCopyPool, SlotReservation};
 use crate::config::Config;
 use crate::connection::{ConnectionTable, Lifecycle, WriteHalf};
 use crate::disk_io_pool::DiskIoPool;
 use crate::handler::{ConnSendState, DriverCtx};
+use crate::runtime::send_capacity::BoundedSendId;
 
 use mio::Interest;
 
 /// mio token 0 is reserved for the wake pipe.
 pub(crate) const WAKE_TOKEN: mio::Token = mio::Token(0);
 
-/// Per-connection pending send: `(data, offset, notify_len)` for partial
-/// writes. `notify_len` is `Some(len)` for awaitable sends: the completion
+/// Per-connection pending send: the bytes plus how far into them the socket
+/// has got, so a partial `writev` can resume where it stopped.
+///
+/// `notify_len` is `Some(len)` for awaitable sends: the completion
 /// (wake_send) is delivered only when the entry has fully reached the
 /// socket — completing at queue time reported success for bytes that were
 /// never written and swallowed write errors entirely.
-pub(crate) type PendingSend = (Vec<u8>, usize, Option<u32>);
+///
+/// `bounded` marks a `send_backpressured` entry: its [`BoundedSendId`]
+/// routes the exact result of *this* operation back to the future that
+/// submitted it, and the [`SlotReservation`] is the copy-pool permit that
+/// admitted it. The permit is held unfilled for the entry's whole life and
+/// released when the entry completes or is discarded — never dropped
+/// (`SlotReservation`'s `Drop` debug-asserts that).
+pub(crate) struct PendingSend {
+    pub(crate) data: Vec<u8>,
+    pub(crate) offset: usize,
+    pub(crate) notify_len: Option<u32>,
+    pub(crate) bounded: Option<(BoundedSendId, SlotReservation)>,
+}
+
+impl PendingSend {
+    /// A fire-and-forget send: nothing is woken when it reaches the socket.
+    pub(crate) fn plain(data: Vec<u8>) -> Self {
+        Self {
+            data,
+            offset: 0,
+            notify_len: None,
+            bounded: None,
+        }
+    }
+
+    /// A bounded (`send_backpressured`) send holding its admission permit.
+    ///
+    /// Built by `DriverCtx::send_bounded`; the permit is released (and `id`
+    /// completed) by [`Driver::flush_sends`] or
+    /// [`Driver::clear_pending_sends`], never by dropping the entry.
+    pub(crate) fn bounded(data: Vec<u8>, id: BoundedSendId, permit: SlotReservation) -> Self {
+        Self {
+            data,
+            offset: 0,
+            notify_len: None,
+            bounded: Some((id, permit)),
+        }
+    }
+}
+
+/// Clone an `io::Error` well enough to hand the same failure to several
+/// waiters. `io::Error` is not `Clone`, and a bounded-send fan-out has to
+/// give every discarded id an equivalent error: the OS errno is preserved
+/// where there is one (so `raw_os_error()`/`kind()` match the original),
+/// otherwise the kind and message are.
+pub(crate) fn clone_io_error(e: &io::Error) -> io::Error {
+    match e.raw_os_error() {
+        Some(code) => io::Error::from_raw_os_error(code),
+        None => io::Error::new(e.kind(), e.to_string()),
+    }
+}
+
+/// Discard every entry in one connection's send queue, releasing each
+/// bounded entry's copy-pool permit and failing its id with `err()`.
+///
+/// The field-wise form of [`Driver::clear_pending_sends`], so callers that
+/// hold a `DriverCtx` (or a live borrow of another `Driver` field) can use
+/// it too. A `PendingSend` must never be dropped any other way: its
+/// [`SlotReservation`] cannot release itself and debug-asserts on drop.
+pub(crate) fn clear_pending_sends_into(
+    queue: &mut VecDeque<PendingSend>,
+    pool: &mut SendCopyPool,
+    completions: &mut VecDeque<(BoundedSendId, io::Result<u32>)>,
+    capacity_released: &mut bool,
+    err: impl Fn() -> io::Error,
+) {
+    while let Some(entry) = queue.pop_front() {
+        if let Some((id, permit)) = entry.bounded {
+            pool.release_reservation(permit);
+            *capacity_released = true;
+            completions.push_back((id, Err(err())));
+        }
+    }
+}
 
 /// Per-worker mio driver state.
 pub(crate) struct Driver {
@@ -97,6 +173,21 @@ pub(crate) struct Driver {
     /// `DriverCtx::send_await()` pushes len here; the event loop drains
     /// these and calls `Executor::wake_send()` for each.
     pub(crate) send_completions: Vec<VecDeque<u32>>,
+    /// Results of bounded (`send_backpressured`) sends, in completion order
+    /// and keyed by the id the submitting future holds. Not per-connection:
+    /// a [`BoundedSendId`] is unique on the worker, and the consumer
+    /// (`Executor::complete_bounded_send`) looks entries up by id.
+    ///
+    /// Produced here by [`Driver::flush_sends`] (`Ok(len)` when the entry's
+    /// last byte reaches the socket) and [`Driver::clear_pending_sends`]
+    /// (`Err` when the entry is discarded); drained by the event loop's
+    /// `drain_send_completions`. The driver never touches the `Executor`
+    /// itself.
+    pub(crate) bounded_send_completions: VecDeque<(BoundedSendId, io::Result<u32>)>,
+    /// Set whenever a copy-pool permit goes back to the pool, so the event
+    /// loop can call `Executor::wake_send_capacity` once per iteration
+    /// instead of once per released permit. The event loop clears it.
+    pub(crate) capacity_released: bool,
     /// Bound UDP sockets (one per `config.udp_bind` address).
     pub(crate) udp_sockets: Vec<mio::net::UdpSocket>,
     /// Whether UDP GRO was requested; when set, the readable handler uses
@@ -245,6 +336,8 @@ impl Driver {
             wake_pipe_fd: eventfd,
             tcp_nodelay: config.tcp_nodelay,
             send_completions: (0..max_conn).map(|_| VecDeque::new()).collect(),
+            bounded_send_completions: VecDeque::new(),
+            capacity_released: false,
             udp_sockets,
             udp_gro: config.udp_gro,
             udp_token_base,
@@ -305,6 +398,8 @@ impl Driver {
             poll: &mut self.poll,
             writable: &mut self.writable,
             send_completions: &mut self.send_completions,
+            bounded_send_completions: &mut self.bounded_send_completions,
+            capacity_released: &mut self.capacity_released,
             connect_deadlines: &mut self.connect_deadlines,
             disk_io_pool: &self.disk_io_pool,
             disk_io_tx: &self.disk_io_tx,
@@ -392,7 +487,12 @@ impl Driver {
             .map(|c| c.established)
             .unwrap_or(false);
 
-        self.pending_sends[idx].clear();
+        self.clear_pending_sends(idx, || {
+            io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "connection closed before the send reached the socket",
+            )
+        });
         self.writable[idx] = false;
         if self.connect_deadlines[idx].take().is_some() {
             self.connect_pending -= 1;
@@ -415,6 +515,29 @@ impl Driver {
         if was_established {
             crate::metrics::CONNECTIONS_ACTIVE.decrement();
         }
+    }
+
+    /// Drop every queued send for `idx`, failing each bounded entry's id
+    /// with `err()` and returning its copy-pool permit.
+    ///
+    /// The only sanctioned way to discard a `PendingSend`: a plain
+    /// `pending_sends[idx].clear()` would drop a live [`SlotReservation`]
+    /// (debug-assert) and strand the `send_backpressured` future that owns
+    /// the entry's id. `err` is a closure because `io::Error` is not
+    /// `Clone` and one call may have to fail several ids — see
+    /// [`clone_io_error`].
+    ///
+    /// Callers pass `ConnectionAborted` at the teardown and slot-reuse
+    /// sites and the real write error at
+    /// `EventLoop::fail_connection_on_send_error`.
+    pub(crate) fn clear_pending_sends(&mut self, idx: usize, err: impl Fn() -> io::Error) {
+        clear_pending_sends_into(
+            &mut self.pending_sends[idx],
+            &mut self.send_copy_pool,
+            &mut self.bounded_send_completions,
+            &mut self.capacity_released,
+            err,
+        );
     }
 
     /// Record `idx` in the dirty-sends list so the event loop's flush pass
@@ -457,11 +580,11 @@ impl Driver {
         while !self.pending_sends[idx].is_empty() {
             let mut iovecs: Vec<libc::iovec> =
                 Vec::with_capacity(self.pending_sends[idx].len().min(1024));
-            for (data, offset, _notify) in self.pending_sends[idx].iter() {
+            for entry in self.pending_sends[idx].iter() {
                 if iovecs.len() >= 1024 {
                     break;
                 }
-                let remaining = &data[*offset..];
+                let remaining = &entry.data[entry.offset..];
                 if !remaining.is_empty() {
                     iovecs.push(libc::iovec {
                         iov_base: remaining.as_ptr() as *mut libc::c_void,
@@ -471,7 +594,22 @@ impl Driver {
             }
 
             if iovecs.is_empty() {
-                self.pending_sends[idx].clear();
+                // Every queued entry has nothing left to write (only a
+                // zero-length entry can get here; `send_bounded` never
+                // queues one). Discard them through the permit-aware path
+                // so a bounded entry cannot leak its reservation.
+                clear_pending_sends_into(
+                    &mut self.pending_sends[idx],
+                    &mut self.send_copy_pool,
+                    &mut self.bounded_send_completions,
+                    &mut self.capacity_released,
+                    || {
+                        io::Error::new(
+                            io::ErrorKind::ConnectionAborted,
+                            "queued send discarded with no bytes left to write",
+                        )
+                    },
+                );
                 break;
             }
 
@@ -500,20 +638,31 @@ impl Driver {
             let mut remaining = result as usize;
             total_written += result as u32;
             while remaining > 0 {
-                if let Some((data, offset, notify)) = self.pending_sends[idx].front_mut() {
-                    let avail = data.len() - *offset;
+                if let Some(entry) = self.pending_sends[idx].front_mut() {
+                    let avail = entry.data.len() - entry.offset;
                     if remaining >= avail {
                         remaining -= avail;
-                        if let Some(len) = notify.take() {
+                        // Take both completions out of the entry before it
+                        // is popped: the bounded permit must go back to the
+                        // pool here, never by dropping the entry.
+                        let notify = entry.notify_len.take();
+                        let bounded = entry.bounded.take();
+                        let written = entry.data.len() as u32;
+                        if let Some(len) = notify {
                             self.send_completions[idx].push_back(len);
                             if !self.completions_dirty_flag[idx] {
                                 self.completions_dirty_flag[idx] = true;
                                 self.completions_dirty.push(idx as u32);
                             }
                         }
+                        if let Some((id, permit)) = bounded {
+                            self.send_copy_pool.release_reservation(permit);
+                            self.capacity_released = true;
+                            self.bounded_send_completions.push_back((id, Ok(written)));
+                        }
                         self.pending_sends[idx].pop_front();
                     } else {
-                        *offset += remaining;
+                        entry.offset += remaining;
                         remaining = 0;
                     }
                 } else {
@@ -584,6 +733,22 @@ impl Driver {
 
 impl Drop for Driver {
     fn drop(&mut self) {
+        // Hand back the copy-pool permits of any bounded sends still
+        // queued. Worker shutdown drops the driver with whatever is in
+        // `pending_sends`; a `PendingSend`'s `SlotReservation` cannot
+        // release itself and debug-asserts if it is dropped unfilled, so
+        // this is the last of the disposal paths (the others are
+        // `clear_pending_sends` and the completion in `flush_sends`). No
+        // completion is pushed: the executor is going away with the driver.
+        let pool = &mut self.send_copy_pool;
+        for queue in self.pending_sends.iter_mut() {
+            for entry in queue.drain(..) {
+                if let Some((_id, permit)) = entry.bounded {
+                    pool.release_reservation(permit);
+                }
+            }
+        }
+
         // Close the wake pipe's read end. The write end is held by
         // `WakeHandle` clones that may live longer than the worker;
         // those are closed by `ShutdownHandle::Drop`.
@@ -676,4 +841,707 @@ fn bind_udp_with_reuseport(addr: SocketAddr, udp_gro: bool) -> io::Result<std::n
     }
 
     Ok(unsafe { std::net::UdpSocket::from_raw_fd(fd) })
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    //! Driver-level tests for the mio backend.
+    //!
+    //! There is no mio event-loop test harness: these build a real `Driver`
+    //! around a real loopback socket pair and drive its methods directly
+    //! (`make_ctx()` for the `DriverCtx` entry points, `flush_sends` for the
+    //! write side). The three helpers below are the shared scaffolding —
+    //! `test_config` / `test_driver` / `attach_conn` — and are meant to be
+    //! reused by every test added here. `attach_conn` and `token` are
+    //! `pub(crate)` as well: the bounded-send tests that also need an
+    //! `Executor` live in `backend/mio/event_loop.rs` and attach their
+    //! connection the same way.
+
+    use super::*;
+    use crate::config::ConfigBuilder;
+    use crate::handler::ConnToken;
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    use std::time::Duration;
+
+    /// A minimal single-worker config for driver tests.
+    ///
+    /// Mirrors `backend/uring/event_loop.rs`'s `test_config_builder` minus the
+    /// io_uring-only knobs. The send pool is deliberately tiny — 4 slots of
+    /// 64 bytes — so tests can exhaust it and observe slot accounting with
+    /// small payloads.
+    fn test_config() -> Config {
+        ConfigBuilder::new()
+            .workers(1)
+            .pin_to_core(false)
+            .max_connections(16)
+            .send_pool(4, 64)
+            .build()
+            .expect("valid test config")
+    }
+
+    /// Build a `Driver` with no acceptor, resolver, spawner, blocking or
+    /// disk-I/O plumbing — every optional subsystem is `None`.
+    ///
+    /// The returned `WakeHandle` owns the write end of the wake pipe and
+    /// **must be bound for the lifetime of the driver**
+    /// (`let (mut driver, _wake) = test_driver(&config);`); dropping it closes
+    /// the fd the driver still holds. The read end is intentionally left
+    /// dangling: it is a per-test fd leak that the process exit reclaims,
+    /// which is simpler than handing tests a second guard to keep alive.
+    fn test_driver(config: &Config) -> (Driver, crate::wakeup::WakeHandle) {
+        let (read_fd, handle) = crate::wakeup::create_wake_fd().expect("wake fd");
+        let driver = Driver::new(
+            config,
+            None,
+            read_fd,
+            handle.as_wake_fd(),
+            Arc::new(AtomicBool::new(false)),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("build mio driver");
+        (driver, handle)
+    }
+
+    /// Attach a real, connected socket to a fresh connection slot, mirroring
+    /// the plaintext half of `event_loop.rs`'s accept path: allocate the slot,
+    /// register the accepted stream with the poll, reset the accumulator, and
+    /// mark the connection `Open` / established / writable.
+    ///
+    /// Returns the connection index and the *client* end of the pair, so a
+    /// test can read back whatever the driver wrote. The client end is
+    /// blocking with a 5 s read timeout: a read that the driver never
+    /// satisfies fails the test instead of hanging it.
+    ///
+    /// The listener is dropped before returning — an already accepted
+    /// connection is unaffected by closing the listening socket, so nothing
+    /// needs to keep the port bound.
+    pub(crate) fn attach_conn(driver: &mut Driver) -> (u32, std::net::TcpStream) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+        let addr = listener.local_addr().expect("listener address");
+        let client = std::net::TcpStream::connect(addr).expect("connect to the listener");
+        let (server, _peer) = listener.accept().expect("accept the connection");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("client read timeout");
+        server
+            .set_nonblocking(true)
+            .expect("nonblocking accepted side");
+
+        let conn_index = driver
+            .connections
+            .allocate()
+            .expect("no free connection slots");
+        let idx = conn_index as usize;
+
+        let mut stream = mio::net::TcpStream::from_std(server);
+        driver
+            .poll
+            .registry()
+            .register(&mut stream, mio::Token(idx + 1), Interest::READABLE)
+            .expect("register the accepted stream");
+        driver.tcp_streams[idx] = Some(stream);
+        driver.accumulators.reset(conn_index);
+        driver.clear_pending_sends(idx, || {
+            io::Error::new(io::ErrorKind::ConnectionAborted, "slot reused")
+        });
+        driver.writable[idx] = true;
+        if let Some(cs) = driver.connections.get_mut(conn_index) {
+            cs.lifecycle = Lifecycle::Open;
+            cs.established = true;
+        }
+
+        (conn_index, client)
+    }
+
+    /// The token for an attached connection, for the `DriverCtx` entry points.
+    pub(crate) fn token(driver: &Driver, conn_index: u32) -> ConnToken {
+        ConnToken::new(conn_index, driver.connections.generation(conn_index))
+    }
+
+    /// Smoke test for the scaffolding itself: a plain send queues on the
+    /// connection, `flush_sends` writes it all, and the peer reads the bytes.
+    #[test]
+    fn test_driver_builds_and_flushes_a_plain_send() {
+        let config = test_config();
+        let (mut driver, _wake) = test_driver(&config);
+        let (conn_index, mut client) = attach_conn(&mut driver);
+        let idx = conn_index as usize;
+
+        let conn = token(&driver, conn_index);
+        driver
+            .make_ctx()
+            .send(conn, b"hello")
+            .expect("queue a plain send");
+        assert_eq!(
+            driver.pending_sends[idx].len(),
+            1,
+            "mio sends are queued, never written inline"
+        );
+
+        let (all_flushed, written) = driver.flush_sends(conn_index).expect("flush");
+        assert!(
+            all_flushed,
+            "the whole queue should have reached the socket"
+        );
+        assert_eq!(written, 5);
+        assert!(driver.pending_sends[idx].is_empty());
+
+        let mut buf = [0u8; 5];
+        client.read_exact(&mut buf).expect("read the flushed bytes");
+        assert_eq!(&buf, b"hello");
+    }
+
+    /// Mint `n` distinct [`BoundedSendId`]s.
+    ///
+    /// Ids are only constructible through the executor's FIFO, and the
+    /// driver never looks inside one — it carries the id from `send_bounded`
+    /// to the completion queue. A throwaway queue is therefore enough here;
+    /// the two event-loop tests that need the executor to route the result
+    /// mint theirs from a real `Executor`.
+    pub(crate) fn bounded_ids(n: usize) -> Vec<BoundedSendId> {
+        let mut queue = crate::runtime::send_capacity::SendCapacityQueue::new();
+        (0..n).map(|i| queue.enqueue(0, 0, 1, i as u32)).collect()
+    }
+
+    /// Set `SO_SNDBUF`/`SO_RCVBUF` on a raw fd.
+    fn set_socket_buf(fd: RawFd, option: libc::c_int, bytes: libc::c_int) {
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                option,
+                &bytes as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(rc, 0, "setsockopt: {}", io::Error::last_os_error());
+    }
+
+    /// Drain and return the bounded completions the driver has queued.
+    fn take_completions(driver: &mut Driver) -> Vec<(BoundedSendId, io::Result<u32>)> {
+        driver.bounded_send_completions.drain(..).collect()
+    }
+
+    /// Admission is the reservation: `send_bounded` takes its copy-pool
+    /// permit up front, queues the bytes, and writes nothing.
+    #[test]
+    fn send_bounded_reserves_a_permit_and_queues_without_writing() {
+        let config = test_config();
+        let (mut driver, _wake) = test_driver(&config);
+        let (conn_index, mut client) = attach_conn(&mut driver);
+        let idx = conn_index as usize;
+        let conn = token(&driver, conn_index);
+        let id = bounded_ids(1)[0];
+
+        assert_eq!(driver.send_copy_pool.free_count(), 4);
+        // 200 bytes over 64-byte slots needs all four.
+        let payload = vec![b'a'; 200];
+        driver
+            .make_ctx()
+            .send_bounded(conn, &payload, id)
+            .expect("the pool can admit the whole message");
+
+        assert_eq!(
+            driver.send_copy_pool.free_count(),
+            0,
+            "the permit is held from admission until the last byte reaches the socket"
+        );
+        assert_eq!(driver.pending_sends[idx].len(), 1);
+        let entry = &driver.pending_sends[idx][0];
+        assert_eq!(entry.data.len(), 200);
+        assert_eq!(entry.offset, 0);
+        assert!(
+            entry.notify_len.is_none(),
+            "a bounded entry routes by id, not through the send() completion queue"
+        );
+        assert_eq!(
+            entry.bounded.as_ref().map(|(qid, _)| *qid),
+            Some(id),
+            "the entry carries its id and permit"
+        );
+        assert!(
+            driver.bounded_send_completions.is_empty(),
+            "queueing completes nothing"
+        );
+        assert!(
+            !driver.capacity_released,
+            "no permit came back, so the capacity head must not be woken"
+        );
+
+        // Nothing was written: the peer sees no bytes at all.
+        client
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .expect("short read timeout");
+        let mut buf = [0u8; 1];
+        let err = client
+            .read(&mut buf)
+            .expect_err("send_bounded must not write synchronously");
+        assert!(
+            matches!(
+                err.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ),
+            "expected an empty socket, got {err:?}"
+        );
+    }
+
+    /// The completion and the permit are produced together, by the flush
+    /// that puts the entry's last byte on the socket.
+    #[test]
+    fn flush_completes_bounded_entry_and_releases_permit() {
+        let config = test_config();
+        let (mut driver, _wake) = test_driver(&config);
+        let (conn_index, mut client) = attach_conn(&mut driver);
+        let idx = conn_index as usize;
+        let conn = token(&driver, conn_index);
+        let id = bounded_ids(1)[0];
+
+        let payload = vec![b'a'; 200];
+        driver
+            .make_ctx()
+            .send_bounded(conn, &payload, id)
+            .expect("admitted");
+
+        let (all_flushed, written) = driver.flush_sends(conn_index).expect("flush");
+        assert!(all_flushed);
+        assert_eq!(written, 200);
+        assert!(driver.pending_sends[idx].is_empty());
+        assert_eq!(
+            driver.send_copy_pool.free_count(),
+            4,
+            "the permit goes back when the message is on the socket"
+        );
+        assert!(
+            driver.capacity_released,
+            "the event loop must be told capacity came back"
+        );
+
+        let completions = take_completions(&mut driver);
+        assert_eq!(
+            completions.len(),
+            1,
+            "exactly one completion per bounded id"
+        );
+        assert_eq!(completions[0].0, id);
+        assert_eq!(
+            *completions[0].1.as_ref().expect("a flushed send succeeds"),
+            200
+        );
+
+        let mut buf = vec![0u8; 200];
+        client.read_exact(&mut buf).expect("read the whole message");
+        assert!(buf.iter().all(|&b| b == b'a'));
+    }
+
+    /// A message split across flushes keeps its id and its permit until the
+    /// final byte, then completes exactly once.
+    #[test]
+    fn partial_write_keeps_permit_and_id() {
+        // `test_config`'s four 64-byte slots cap a bounded send at 256
+        // bytes, which no socket buffer is small enough to split, so this
+        // test builds its own pool: 1 MiB over four 512 KiB slots reserves
+        // two slots and cannot fit in any plausible socket buffer, shrunk or
+        // not. The drain below is single-threaded and reads only bytes it
+        // already knows were written, so nothing here depends on the host's
+        // scheduling or on what a kernel does with `SO_SNDBUF` — two earlier
+        // shapes did, and disagreed between macOS and a Linux CI guest: a
+        // reader-thread race that never drained 2 MiB, then a 64 KiB payload
+        // that Linux swallowed whole in the first flush.
+        const PAYLOAD: usize = 1024 * 1024;
+        let config = ConfigBuilder::new()
+            .workers(1)
+            .pin_to_core(false)
+            .max_connections(16)
+            .send_pool(4, 512 * 1024)
+            .build()
+            .expect("valid test config");
+        let (mut driver, _wake) = test_driver(&config);
+        let (conn_index, client) = attach_conn(&mut driver);
+        let idx = conn_index as usize;
+        let conn = token(&driver, conn_index);
+        let id = bounded_ids(1)[0];
+
+        set_socket_buf(
+            driver.tcp_streams[idx]
+                .as_ref()
+                .expect("attached stream")
+                .as_raw_fd(),
+            libc::SO_SNDBUF,
+            4096,
+        );
+        // Explicitly sizing the peer's receive buffer also disables its
+        // autotuning, so the window cannot grow to swallow the message.
+        set_socket_buf(client.as_raw_fd(), libc::SO_RCVBUF, 4096);
+
+        let payload = vec![b'p'; PAYLOAD];
+        driver
+            .make_ctx()
+            .send_bounded(conn, &payload, id)
+            .expect("admitted");
+        let reserved_free = driver.send_copy_pool.free_count();
+        assert_eq!(
+            reserved_free, 2,
+            "1 MiB reserves two of the four 512 KiB slots"
+        );
+
+        let (all_flushed, written) = driver
+            .flush_sends(conn_index)
+            .expect("a short write is not an error");
+        assert!(
+            !all_flushed,
+            "no socket buffer takes a 1 MiB message in one writev"
+        );
+        assert!(
+            (written as usize) < PAYLOAD,
+            "expected a short write, got {written} of {PAYLOAD}"
+        );
+        assert_eq!(driver.pending_sends[idx].len(), 1, "the entry survives");
+        assert_eq!(driver.pending_sends[idx][0].offset, written as usize);
+        assert_eq!(
+            driver.pending_sends[idx][0]
+                .bounded
+                .as_ref()
+                .map(|(qid, _)| *qid),
+            Some(id),
+            "id and permit stay with the unfinished entry"
+        );
+        assert_eq!(
+            driver.send_copy_pool.free_count(),
+            reserved_free,
+            "the permit is not released mid-message"
+        );
+        assert!(
+            driver.bounded_send_completions.is_empty(),
+            "no completion before the last byte"
+        );
+
+        // Drain and flush alternately on this one thread. Each read asks for
+        // exactly the bytes the driver has already reported writing, so it
+        // can never block on bytes that are not there, and no sleep or
+        // timeout is involved: the loop is bounded by the socket buffer, not
+        // by the clock.
+        let mut client = client;
+        let mut sink: Vec<u8> = Vec::with_capacity(PAYLOAD);
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut written_total = written as usize;
+        let mut drained = 0usize;
+        let mut finished = false;
+
+        for _ in 0..10_000 {
+            while drained < written_total {
+                let want = (written_total - drained).min(buf.len());
+                client
+                    .read_exact(&mut buf[..want])
+                    .expect("the peer reads bytes the driver already wrote");
+                sink.extend_from_slice(&buf[..want]);
+                drained += want;
+            }
+            if finished {
+                break;
+            }
+            let (done, w) = driver.flush_sends(conn_index).expect("flush");
+            written_total += w as usize;
+            // Drain once more before leaving, so `sink` holds every byte.
+            finished = done;
+        }
+        assert!(finished, "the message never drained to the peer");
+        assert_eq!(
+            written_total, PAYLOAD,
+            "every byte was written exactly once"
+        );
+        assert_eq!(sink.len(), PAYLOAD, "the peer received the whole message");
+        assert!(
+            sink.iter().all(|&b| b == b'p'),
+            "the peer received the message intact"
+        );
+
+        let completions = take_completions(&mut driver);
+        assert_eq!(
+            completions.len(),
+            1,
+            "a message split across flushes still completes exactly once"
+        );
+        assert_eq!(completions[0].0, id);
+        assert_eq!(
+            *completions[0].1.as_ref().expect("the send succeeded") as usize,
+            PAYLOAD,
+            "the completion reports the whole message, not the last chunk"
+        );
+        assert_eq!(driver.send_copy_pool.free_count(), 4, "permit returned");
+
+        // Closing the socket ends the reader's `read_to_end`.
+        driver.tcp_streams[idx] = None;
+    }
+
+    /// A refused admission reserves nothing, queues nothing, and produces no
+    /// completion — the caller owns the failure.
+    #[test]
+    fn send_bounded_refuses_without_side_effects() {
+        let config = test_config();
+        let (mut driver, _wake) = test_driver(&config);
+        let (conn_index, _client) = attach_conn(&mut driver);
+        let idx = conn_index as usize;
+        let conn = token(&driver, conn_index);
+        let ids = bounded_ids(3);
+
+        // 129 bytes = three 64-byte slots, leaving one free.
+        driver
+            .make_ctx()
+            .send_bounded(conn, &[b'h'; 129], ids[0])
+            .expect("admitted");
+        assert_eq!(driver.send_copy_pool.free_count(), 1);
+
+        // Needs two slots; only one is free.
+        let err = driver
+            .make_ctx()
+            .send_bounded(conn, &[b'x'; 65], ids[1])
+            .expect_err("the pool cannot admit the whole message");
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert!(
+            err.to_string().contains("send copy pool exhausted"),
+            "unexpected message: {err}"
+        );
+        assert_eq!(driver.pending_sends[idx].len(), 1, "nothing was queued");
+        assert_eq!(
+            driver.send_copy_pool.free_count(),
+            1,
+            "a refusal must not consume capacity"
+        );
+        assert!(
+            driver.bounded_send_completions.is_empty(),
+            "a refused id never completes"
+        );
+
+        // Larger than the whole pool: a different, permanent failure.
+        let err = driver
+            .make_ctx()
+            .send_bounded(conn, &[b'y'; 257], ids[2])
+            .expect_err("no pool occupancy could ever admit this");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("raise Config::send_pool"),
+            "unexpected message: {err}"
+        );
+        assert_eq!(driver.pending_sends[idx].len(), 1);
+        assert_eq!(driver.send_copy_pool.free_count(), 1);
+        assert!(driver.bounded_send_completions.is_empty());
+    }
+
+    /// Discarding a send queue fails every bounded id in it, in queue order,
+    /// and returns every permit.
+    #[test]
+    fn clear_pending_sends_fans_out_and_releases() {
+        let config = test_config();
+        let (mut driver, _wake) = test_driver(&config);
+        let (conn_index, _client) = attach_conn(&mut driver);
+        let idx = conn_index as usize;
+        let conn = token(&driver, conn_index);
+        let ids = bounded_ids(2);
+
+        driver
+            .make_ctx()
+            .send_bounded(conn, b"first", ids[0])
+            .expect("admitted");
+        driver.make_ctx().send(conn, b"plain").expect("queued");
+        driver
+            .make_ctx()
+            .send_bounded(conn, b"second", ids[1])
+            .expect("admitted");
+        assert_eq!(driver.pending_sends[idx].len(), 3);
+        assert_eq!(
+            driver.send_copy_pool.free_count(),
+            2,
+            "one slot per bounded entry"
+        );
+        assert!(!driver.capacity_released);
+
+        driver.clear_pending_sends(idx, || {
+            io::Error::new(io::ErrorKind::ConnectionAborted, "connection closed")
+        });
+
+        assert!(driver.pending_sends[idx].is_empty());
+        assert_eq!(
+            driver.send_copy_pool.free_count(),
+            4,
+            "both permits came back"
+        );
+        assert!(driver.capacity_released);
+
+        let completions = take_completions(&mut driver);
+        assert_eq!(
+            completions.len(),
+            2,
+            "one completion per bounded entry; the plain entry has nobody to tell"
+        );
+        assert_eq!(
+            completions.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            ids,
+            "completions follow queue order"
+        );
+        for (id, result) in &completions {
+            let err = result.as_ref().expect_err("a discarded send fails");
+            assert_eq!(
+                err.kind(),
+                io::ErrorKind::ConnectionAborted,
+                "wrong kind for {id:?}"
+            );
+        }
+    }
+
+    /// `finish_close` disposes of whatever is still queued when the socket
+    /// is already gone — the one way teardown reaches its clear with a
+    /// non-empty queue (`drain_pending_closes` finalizes on
+    /// `pending_sends.is_empty() || tcp_streams[idx].is_none()`).
+    ///
+    /// One of the permit-disposal sites; a bare `pending_sends[idx].clear()`
+    /// here strands the id and trips `SlotReservation`'s drop assert.
+    #[test]
+    fn finish_close_fails_a_send_left_queued_by_a_gone_socket() {
+        let config = test_config();
+        let (mut driver, _wake) = test_driver(&config);
+        let (conn_index, _client) = attach_conn(&mut driver);
+        let idx = conn_index as usize;
+        let conn = token(&driver, conn_index);
+        let id = bounded_ids(1)[0];
+
+        driver
+            .make_ctx()
+            .send_bounded(conn, b"never sent", id)
+            .expect("admitted");
+        assert_eq!(driver.send_copy_pool.free_count(), 3);
+        driver.capacity_released = false;
+
+        // The stream is gone, so `finish_close`'s opening flush writes
+        // nothing and the entry survives to the clear.
+        driver.tcp_streams[idx] = None;
+        driver.close_connection(conn_index);
+        driver.finish_close(conn_index);
+
+        assert!(driver.pending_sends[idx].is_empty());
+        assert_eq!(
+            driver.send_copy_pool.free_count(),
+            4,
+            "teardown returns the permit"
+        );
+        assert!(driver.capacity_released);
+        let completions = take_completions(&mut driver);
+        assert_eq!(completions.len(), 1, "the stranded id must be told");
+        assert_eq!(completions[0].0, id);
+        let err = completions[0].1.as_ref().expect_err("the send never went");
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
+        assert!(
+            err.to_string()
+                .contains("closed before the send reached the socket"),
+            "unexpected message: {err}"
+        );
+    }
+
+    /// The connect-time slot-reuse clear (`DriverCtx::connect`) disposes of
+    /// whatever the previous occupant left queued: permit back, id failed.
+    ///
+    /// One of four permit-disposal sites; a bare `pending_sends[idx].clear()`
+    /// here strands the id and trips `SlotReservation`'s drop assert.
+    #[test]
+    fn connect_time_slot_reuse_fails_a_stale_bounded_send() {
+        let config = test_config();
+        let (mut driver, _wake) = test_driver(&config);
+        let (conn_index, _client) = attach_conn(&mut driver);
+        let idx = conn_index as usize;
+        let conn = token(&driver, conn_index);
+        let id = bounded_ids(1)[0];
+
+        driver
+            .make_ctx()
+            .send_bounded(conn, b"stranded", id)
+            .expect("admitted");
+        assert_eq!(driver.send_copy_pool.free_count(), 3);
+        driver.capacity_released = false;
+
+        // Free the slot with its send queue still populated — the state the
+        // defensive clear exists for. No production path gets here today,
+        // which is exactly why nothing else would notice it regressing.
+        driver.tcp_streams[idx] = None;
+        driver.connections.release(conn_index);
+
+        // Nobody has to accept: mio's connect is nonblocking.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+        let addr = listener.local_addr().expect("listener address");
+        let reused = driver.make_ctx().connect(addr).expect("connect");
+        assert_eq!(
+            reused.index, conn_index,
+            "the free list is LIFO, so this is the same slot"
+        );
+
+        assert!(driver.pending_sends[idx].is_empty(), "the stale entry went");
+        assert_eq!(
+            driver.send_copy_pool.free_count(),
+            4,
+            "its permit came back to the pool"
+        );
+        assert!(driver.capacity_released, "the capacity head must be woken");
+        let completions = take_completions(&mut driver);
+        assert_eq!(completions.len(), 1, "the stranded id must be told");
+        assert_eq!(completions[0].0, id);
+        let err = completions[0].1.as_ref().expect_err("the send never went");
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
+        assert!(
+            err.to_string().contains("reused by a new connect"),
+            "unexpected message: {err}"
+        );
+    }
+
+    /// `flush_sends`' empty-iovec bail-out disposes of what it discards.
+    ///
+    /// Only a zero-length entry reaches that branch and `send_bounded`
+    /// settles those itself, so the entry is built by hand — permit
+    /// included, exactly as `send_bounded` would hold it. One of four
+    /// permit-disposal sites.
+    #[test]
+    fn empty_iovec_bailout_fails_the_bounded_entry_it_discards() {
+        let config = test_config();
+        let (mut driver, _wake) = test_driver(&config);
+        let (conn_index, _client) = attach_conn(&mut driver);
+        let idx = conn_index as usize;
+        let id = bounded_ids(1)[0];
+
+        let permit = driver
+            .send_copy_pool
+            .reserve_slots(1)
+            .expect("a free slot to promise");
+        driver.pending_sends[idx].push_back(PendingSend::bounded(Vec::new(), id, permit));
+        assert_eq!(driver.send_copy_pool.free_count(), 3);
+
+        let (all_flushed, written) = driver.flush_sends(conn_index).expect("flush");
+        assert!(all_flushed, "nothing is left to write");
+        assert_eq!(written, 0);
+
+        assert!(driver.pending_sends[idx].is_empty());
+        assert_eq!(
+            driver.send_copy_pool.free_count(),
+            4,
+            "the discarded entry's permit came back"
+        );
+        assert!(driver.capacity_released);
+        let completions = take_completions(&mut driver);
+        assert_eq!(completions.len(), 1, "the discarded id must be told");
+        assert_eq!(completions[0].0, id);
+        let err = completions[0].1.as_ref().expect_err("discarded, not sent");
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
+        assert!(
+            err.to_string().contains("no bytes left to write"),
+            "unexpected message: {err}"
+        );
+    }
 }

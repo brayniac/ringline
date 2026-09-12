@@ -463,7 +463,8 @@ pub(crate) struct Executor {
     /// Worker-wide FIFO for bounded sends: who may reserve copy-pool slots
     /// next, and the result of each admitted operation. Driven through the
     /// wrappers in [`send_capacity`]; `remove_connection` resolves the
-    /// entries of a torn-down connection.
+    /// entries of a torn-down connection (provisionally — see that module's
+    /// docs on why a driver result still overwrites the abort).
     pub(crate) send_capacity: send_capacity::SendCapacityQueue,
     /// Per-connection: task is awaiting connect result.
     pub(crate) connect_waiters: Vec<bool>,
@@ -540,6 +541,17 @@ pub(crate) struct Executor {
     /// Indexed by `task_idx & !STANDALONE_BIT`. Same lifecycle as
     /// `poll_dedup_conn`. Sized to `standalone_task_capacity`.
     pub(crate) poll_dedup_standalone: Vec<bool>,
+    /// Test-only: how many times `wake_send_capacity` has actually woken the
+    /// send-capacity FIFO head.
+    ///
+    /// The mio loop promises *one* capacity wake per iteration however many
+    /// copy-pool permits came back during it, and the ready queue cannot
+    /// witness that: `wake_task` pushes only on a Parked → Ready transition,
+    /// so a second wake of the same head in the same iteration leaves
+    /// `ready_queue.len()` at 1 as well. Counting the wakes at their source
+    /// is what makes "once" observable.
+    #[cfg(test)]
+    pub(crate) send_capacity_wakes: u32,
 }
 
 impl Executor {
@@ -604,6 +616,8 @@ impl Executor {
             next_blocking_id: 0,
             poll_dedup_conn: vec![false; cap],
             poll_dedup_standalone: vec![false; standalone_capacity as usize],
+            #[cfg(test)]
+            send_capacity_wakes: 0,
         }
     }
 
@@ -634,7 +648,11 @@ impl Executor {
         self.task_slab.remove(conn_index);
         // Bounded sends waiting on or in flight for this connection resolve
         // to ConnectionAborted; wake their owners (standalone or cross-index
-        // tasks that outlive the connection) and the FIFO's new head. Runs
+        // tasks that outlive the connection) and the FIFO's new head. That
+        // abort is provisional: this method is also called from the mio
+        // loop's `poll_ready_tasks` (step 6), *before* the step-6a flush
+        // that can still deliver the message, so a driver result arriving
+        // afterwards overwrites it (`send_capacity`'s module docs). Runs
         // after `task_slab.remove` on purpose: the connection's own task is
         // already gone, and the queue drops its entries rather than parking
         // results nobody can take.

@@ -161,6 +161,16 @@ Open.
   a queued send is in flight — pre-existing; the `parked` flag keeps the
   retry drain out of that race but does not fix the chain path itself.
 
+- **PR 8/9 follow-up (adversarial review, 2026-09-12): a TLS bounded send
+  reports two different lengths depending on which branch it takes.**
+  `DriverCtx::send_bounded`'s empty-ciphertext early return completes the id
+  with `Ok(plaintext_len)`, while a queued TLS entry completes with
+  `Ok(ciphertext_len)` from `flush_sends` — two branches of one function
+  disagreeing about what the number means. It mirrors a pre-existing
+  `send().await` quirk on mio (the completion is the queued buffer's length),
+  so it is inherited rather than introduced; decide the contract once when
+  PR 8 lands TLS admission and PR 9 gives the caller something to read.
+
 - The io_uring sites cannot be type-checked on the macOS development host;
   Linux CI is the authority for those three edits.
 - **Pre-existing hazard, found in review, not introduced here:** the

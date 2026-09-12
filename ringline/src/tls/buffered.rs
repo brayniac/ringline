@@ -638,7 +638,9 @@ fn flush_tls_output_mio_inner(
         return;
     }
 
-    pending.push_back((std::mem::take(write_buf), 0, None));
+    pending.push_back(crate::backend::mio::driver::PendingSend::plain(
+        std::mem::take(write_buf),
+    ));
 }
 
 /// Buffered-engine half of [`super::backend_mio::flush_tls_output_mio_direct`]:

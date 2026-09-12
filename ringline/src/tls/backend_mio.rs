@@ -56,7 +56,7 @@ pub fn feed_tls_recv_mio(
         let outcome =
             unbuffered::feed(tls_conn, Some(&mut sink), write_buf, ciphertext, conn_index);
         if !write_buf.is_empty() {
-            pending.push_back((std::mem::take(write_buf), 0, None));
+            pending.push_back(PendingSend::plain(std::mem::take(write_buf)));
         }
         match outcome {
             unbuffered::DriveOutcome::Ok => TlsRecvResult::Ok,
@@ -90,7 +90,7 @@ pub fn flush_tls_output_mio_queued(
         // treats an empty slice as a deliberate flush for exactly this.
         let _ = unbuffered::feed(tls_conn, None, write_buf, &[], conn_index);
         if !write_buf.is_empty() {
-            pending.push_back((std::mem::take(write_buf), 0, None));
+            pending.push_back(PendingSend::plain(std::mem::take(write_buf)));
         }
     }
     #[cfg(not(feature = "tls-unbuffered"))]
