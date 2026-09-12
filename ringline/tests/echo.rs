@@ -5841,6 +5841,20 @@ fn half_close_waits_for_queued_sends_to_drain() {
         .unwrap();
     stream.write_all(b"go").unwrap();
 
+    // Do not read until the handler has queued the whole response and
+    // called shutdown_write: with the reader racing the writer, a fast
+    // loopback reader can keep the socket buffer from ever filling and the
+    // old truncating drain would sometimes get away with it.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while HALF_CLOSE_PROGRESS.load(Ordering::Acquire) != 1 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        HALF_CLOSE_PROGRESS.load(Ordering::Acquire),
+        1,
+        "handler did not half-close"
+    );
+
     let mut received = Vec::with_capacity(HALF_CLOSE_RESPONSE_LEN);
     stream
         .read_to_end(&mut received)
