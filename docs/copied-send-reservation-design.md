@@ -282,7 +282,7 @@ run on Linux CI and the delta VM job), config `send_pool(4, 64)`:
 - (A forced first-push failure no longer makes `send` return `Err`; it
   parks. That case is `first_push_failure_parks_and_completes_next_iteration`
   below.)
-- `multi_chunk_send_still_queues_all_chunks_in_order`: pool of 5 with one
+- `multi_chunk_send_still_queues_all_chunks_in_order`: pool of 6 with one
   slot held; with an in-flight send, `send(token, &[0; 200])` queues 4
   entries whose `pool_slot`s carry `end_of_send` false,false,false,true and
   lengths 64,64,64,8, and `free_count` == 1 afterwards (the reservation was
