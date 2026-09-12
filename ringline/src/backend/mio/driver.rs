@@ -52,21 +52,6 @@ impl PendingSend {
         }
     }
 
-    /// An awaitable send: `wake_send(Ok(len))` once its last byte is written.
-    // Unused today: the awaitable path pushes a plain entry and then has
-    // `DriverCtx::mark_last_send_awaited` set `notify_len` on it. This is the
-    // constructor form of the same entry.
-    #[allow(dead_code)]
-    pub(crate) fn awaited(data: Vec<u8>) -> Self {
-        let notify_len = Some(data.len() as u32);
-        Self {
-            data,
-            offset: 0,
-            notify_len,
-            bounded: None,
-        }
-    }
-
     /// A bounded (`send_backpressured`) send holding its admission permit.
     ///
     /// Built by `DriverCtx::send_bounded`; the permit is released (and `id`
