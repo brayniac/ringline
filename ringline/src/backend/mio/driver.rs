@@ -181,15 +181,12 @@ pub(crate) struct Driver {
     /// Produced here by [`Driver::flush_sends`] (`Ok(len)` when the entry's
     /// last byte reaches the socket) and [`Driver::clear_pending_sends`]
     /// (`Err` when the entry is discarded); drained by the event loop's
-    /// `drain_send_completions` (series PR 6, next task). The driver never
-    /// touches the `Executor` itself.
+    /// `drain_send_completions`. The driver never touches the `Executor`
+    /// itself.
     pub(crate) bounded_send_completions: VecDeque<(BoundedSendId, io::Result<u32>)>,
     /// Set whenever a copy-pool permit goes back to the pool, so the event
     /// loop can call `Executor::wake_send_capacity` once per iteration
     /// instead of once per released permit. The event loop clears it.
-    // Written here, read by the event loop's capacity wake (the next task
-    // in series PR 6); nothing reads it yet.
-    #[allow(dead_code)]
     pub(crate) capacity_released: bool,
     /// Bound UDP sockets (one per `config.udp_bind` address).
     pub(crate) udp_sockets: Vec<mio::net::UdpSocket>,

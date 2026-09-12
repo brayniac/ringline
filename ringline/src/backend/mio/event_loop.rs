@@ -281,6 +281,34 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.drain_send_completions();
             self.drain_pending_closes();
 
+            // 8a. One send-capacity wake per iteration. A copy-pool permit
+            // can come back at many points above — `handle_writable`'s
+            // flush (4), either `flush_all_pending_sends` (6a, 8), a
+            // `clear_pending_sends` from an accept-time slot reuse (4), a
+            // write error, a task's own send (6), or `finish_close` inside
+            // either `drain_pending_closes` (6b, 8) — and each of those sets
+            // `capacity_released` rather than touching the executor.
+            //
+            // This is the single point that covers all of them, including
+            // both `drain_send_completions` call sites: it is the last
+            // thing in the iteration, so `free_count()` is the final figure
+            // and no release can slip past it into the blocking `poll` at
+            // the top of the next iteration. Waking from inside
+            // `drain_send_completions` instead would fire twice per
+            // iteration and would still leave step 8's teardown releases
+            // unsignalled until the next iteration's step 6a — which only
+            // runs after a `poll` that may block indefinitely.
+            //
+            // Nothing is lost by waking late: `poll_ready_tasks` (6) has
+            // already run, so a task woken anywhere from 6a onwards is
+            // polled in the next iteration either way, and step 2 sees a
+            // non-empty ready queue and polls with a zero timeout.
+            if self.driver.capacity_released {
+                self.driver.capacity_released = false;
+                self.executor
+                    .wake_send_capacity(self.driver.send_copy_pool.free_count());
+            }
+
             // 9. Check shutdown.
             if self.driver.shutdown_local || self.driver.shutdown_flag.load(Ordering::Relaxed) {
                 return Ok(());
@@ -980,14 +1008,36 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
     }
 
-    /// Drain per-connection send completion queues, calling wake_send for
-    /// each and re-polling tasks so that each SendFuture resolves. Visits
-    /// only connections marked dirty at completion-push time; a connection
-    /// with results left over (single waiter slot, or no waiter yet) is
-    /// re-marked for the next pass.
+    /// Drain the driver's send completions and re-poll the tasks they woke.
+    ///
+    /// Two queues, in this order: the worker-wide bounded-send queue
+    /// (`Driver::bounded_send_completions`, routed by id through
+    /// `Executor::complete_bounded_send`), then the per-connection
+    /// `send_completions` queues, calling wake_send for each so that each
+    /// SendFuture resolves. The per-connection pass visits only connections
+    /// marked dirty at completion-push time; a connection with results left
+    /// over (single waiter slot, or no waiter yet) is re-marked for the next
+    /// pass.
+    ///
+    /// Returned copy-pool permits are *not* signalled here: the driver sets
+    /// `capacity_released` wherever a permit goes back, and the run loop
+    /// issues one `wake_send_capacity` per iteration (see step 8a).
     fn drain_send_completions(&mut self) {
         loop {
             let mut delivered = false;
+            // Bounded (`send_backpressured`) completions first. They are
+            // keyed by id rather than by connection, so they bypass the
+            // dirty-list entirely; the executor's FIFO routes each result
+            // to the exact operation that produced it. Draining them here
+            // (rather than after the per-connection pass) keeps them ahead
+            // of `drain_pending_closes`, so a bounded send whose last byte
+            // reached the socket is recorded `Ok` before
+            // `Executor::remove_connection` would resolve it as
+            // `ConnectionAborted`.
+            while let Some((id, result)) = self.driver.bounded_send_completions.pop_front() {
+                self.executor.complete_bounded_send(id, result);
+                delivered = true;
+            }
             let dirty = std::mem::take(&mut self.driver.completions_dirty);
             for conn_index in dirty {
                 let idx = conn_index as usize;
