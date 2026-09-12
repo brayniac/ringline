@@ -247,7 +247,10 @@ impl<'a> DriverCtx<'a> {
     /// transmitted and the same buffer may be sent again later. A send wider
     /// than the whole pool is refused with `InvalidInput`. Submission-queue
     /// pressure is absorbed by the per-connection queue and is not an error
-    /// here.
+    /// here. The TLS branch below is the exception: `encrypt_to_sends`
+    /// advances rustls before the pool refuses, so its `Err` is not
+    /// retryable (series PR 8). The user-facing contract lives on
+    /// `ConnCtx::send`.
     pub fn send(&mut self, conn: ConnToken, data: &[u8]) -> io::Result<()> {
         let conn_state = self
             .connections

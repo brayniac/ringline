@@ -141,14 +141,15 @@ while let Some(chunk) = chunks.next() {
     let (slot, ptr, len) = self.send_copy_pool.copy_in_reserved(&mut reservation, chunk);
     self.send_copy_pool.set_end_of_send(slot, chunks.peek().is_none());
     // ... build the SQE exactly as today ...
-    if let Err(e) = self.submit_or_queue(conn.index, built) {
-        self.send_copy_pool.release_reservation(reservation);
-        return Err(e);
-    }
+    self.submit_or_queue(conn.index, built); // infallible: parks under SQ pressure
 }
 self.send_copy_pool.release_reservation(reservation); // remaining == 0
 Ok(())
 ```
+
+(An earlier draft kept a release-on-error arm after `submit_or_queue`; once
+parking made `submit_or_queue` infallible that arm became unreachable and was
+removed.)
 
 Why this is transactional: `submit_or_queue` pushes to the ring only when
 the connection has no send in flight, i.e. only for chunk 1; once chunk 1 is
@@ -203,7 +204,8 @@ committed anything: stale token, or pool admission (Hole 1, now reserved
 up front). Its `# Errors` sections drop "or the submission queue is full".
 The one exception that remains is TLS pool exhaustion *during* encryption
 (`encrypt_to_sends` releases the staged ciphertext but rustls has advanced);
-that is series PR 8's pre-mutation bound and is named in the docs as such.
+that is series PR 8's pre-mutation bound, and the `ConnCtx::send` /
+`DriverCtx::send` docs name it.
 
 **Series departure 1, refined.** Departure 1 says a full SQ is terminal so
 that nothing parks and re-runs a logical send after rustls mutation. Parking
@@ -277,13 +279,15 @@ run on Linux CI and the delta VM job), config `send_pool(4, 64)`:
   `free_count` == 1; send queue empty; `in_flight` false.
 - `send_wider_than_the_pool_is_invalid_input`: `send(token, &[0; 300])` →
   `Err` kind `InvalidInput`; `free_count` == 4; nothing queued.
-- `send_with_full_sq_and_idle_queue_commits_nothing`:
-  `ring.force_push_failures(1)`; `send(token, &[0; 200])` → `Err`;
-  `free_count` == 4; queue empty; `in_flight` false; a following
-  `send(token, b"ok")` succeeds (the hook is consumed).
-- `multi_chunk_send_still_queues_all_chunks_in_order`: with an in-flight
-  send, `send(token, &[0; 200])` queues 4 entries whose `pool_slot`s carry
-  `end_of_send` false,false,false,true (guards the streaming rewrite).
+- (A forced first-push failure no longer makes `send` return `Err`; it
+  parks. That case is `first_push_failure_parks_and_completes_next_iteration`
+  below.)
+- `multi_chunk_send_still_queues_all_chunks_in_order`: pool of 5 with one
+  slot held; with an in-flight send, `send(token, &[0; 200])` queues 4
+  entries whose `pool_slot`s carry `end_of_send` false,false,false,true and
+  lengths 64,64,64,8, and `free_count` == 1 afterwards (the reservation was
+  consumed, not left outstanding). Guards the streaming rewrite; passes on
+  `main` by design.
 
 Parking tests (same file, `send_pool(8, 64)`):
 

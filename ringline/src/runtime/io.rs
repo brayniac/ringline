@@ -1179,13 +1179,12 @@ impl ConnCtx {
     ///
     /// # Errors
     ///
-    /// Returns `Err` if the send copy pool cannot admit the whole buffer
-    /// (`Other`, retryable once in-flight sends complete) or if the buffer
-    /// is wider than the entire pool (`InvalidInput`). On `Err` nothing was
-    /// queued or transmitted. Submission-queue pressure is not an error:
-    /// the send is queued and retried. Persistent submission-queue
-    /// starvation is reported like a write error: the awaited `SendFuture`
-    /// resolves `Err` and the connection is closed.
+    /// Same error contract as [`send()`](Self::send): pool admission errors
+    /// only (`Other` when the pool cannot admit the whole buffer,
+    /// `InvalidInput` when it never could), nothing committed on a plaintext
+    /// `Err`, TLS pool exhaustion not retryable, submission-queue pressure
+    /// absorbed by the queue. With no future to resolve, persistent
+    /// submission-queue starvation surfaces only as the connection closing.
     ///
     /// For backpressure-aware sending, use [`send()`](Self::send) instead.
     pub fn send_nowait(&self, data: &[u8]) -> io::Result<()> {
@@ -1481,11 +1480,16 @@ impl ConnCtx {
     ///
     /// Returns `Err` if the send copy pool cannot admit the whole buffer
     /// (`Other`, retryable once in-flight sends complete) or if the buffer
-    /// is wider than the entire pool (`InvalidInput`). On `Err` nothing was
-    /// queued or transmitted. Submission-queue pressure is not an error:
-    /// the send is queued and retried. Persistent submission-queue
-    /// starvation is reported like a write error: the awaited `SendFuture`
-    /// resolves `Err` and the connection is closed.
+    /// is wider than the entire pool (`InvalidInput`). On a plaintext
+    /// connection nothing was queued or transmitted on `Err`, so the same
+    /// buffer may be sent again later. On a TLS connection pool exhaustion
+    /// during encryption is not retryable: the record sequence has already
+    /// advanced, so close the connection instead (a pre-encryption admission
+    /// check is planned; see `docs/backpressured-sends-series-design.md`,
+    /// PR 8). Submission-queue pressure is not an error: the send is queued
+    /// and retried. Persistent submission-queue starvation is reported like
+    /// a write error: the awaited `SendFuture` resolves `Err` and the
+    /// connection is closed.
     pub fn send(&self, data: &[u8]) -> io::Result<SendFuture> {
         with_state(|driver, executor| {
             let mut ctx = driver.make_ctx();

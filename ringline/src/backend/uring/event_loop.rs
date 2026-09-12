@@ -4601,13 +4601,18 @@ mod tests {
     fn multi_chunk_send_still_queues_all_chunks_in_order() {
         let mut el = make_test_loop_with_config(
             test_config_builder()
-                .send_pool(4, 64)
+                .send_pool(5, 64)
                 .build()
                 .expect("valid config"),
         );
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
         let token = crate::handler::ConnToken::new(conn_index, generation);
+
+        // Hold one slot so the final free count can tell "reservation
+        // consumed" (1 free) from "reservation still outstanding" (0 free).
+        let (_held, _, _) = el.driver.send_copy_pool.copy_in(b"x").unwrap();
+        assert_eq!(el.driver.send_copy_pool.free_count(), 4);
 
         // With a send already in flight, every chunk is queued rather than
         // pushed to the ring, so the whole logical send is inspectable.
@@ -4637,7 +4642,7 @@ mod tests {
         assert_eq!(lens, vec![64, 64, 64, 8], "chunks queued in order");
         assert_eq!(
             el.driver.send_copy_pool.free_count(),
-            0,
+            1,
             "every reserved slot was filled and the reservation fully consumed"
         );
     }
