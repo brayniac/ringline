@@ -109,6 +109,21 @@ Open.
 
 ## Lessons / open questions
 
+- **PR 4 follow-ups (adversarial review, 2026-09-12).** (a)
+  `handle_send_recv_buf`'s partial-resubmit push failure still drops the
+  remainder of a recv-buffer forward on an open connection — a pre-existing
+  silent hole that the new Invariant 7 wording now contradicts; route it
+  through a retry list. (b) `ConnCtx::send(&[])` on io_uring returns a
+  `SendFuture` that never resolves (nothing is queued, so nothing writes
+  `io_results`); seed `Ok(0)` as `forward_to` already does. (c) No TLS-level
+  test of parking exists (the event-loop test module has no TLS harness);
+  `queue_built_sends_parks_under_sq_pressure` covers the mechanism only.
+  (d) `drain_send_retries` wakes the recv side on give-up while
+  `drain_copy_retries` does not; harmless asymmetry, pick one. (e) Send
+  chains (`send_chain`) bypass the per-connection queue and can push while
+  a queued send is in flight — pre-existing; the `parked` flag keeps the
+  retry drain out of that race but does not fix the chain path itself.
+
 - The io_uring sites cannot be type-checked on the macOS development host;
   Linux CI is the authority for those three edits.
 - **Pre-existing hazard, found in review, not introduced here:** the

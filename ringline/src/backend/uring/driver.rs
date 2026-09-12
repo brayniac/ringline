@@ -844,8 +844,10 @@ impl Driver {
             &mut state.queue,
             &mut self.send_slab,
             &mut self.send_copy_pool,
+            &mut self.pending_replenish,
         );
         state.in_flight = false;
+        state.parked = false;
         state.close_pending = false;
         state.close_submitted = false;
         state.acked_bytes = 0;
@@ -1250,8 +1252,10 @@ impl Driver {
             &mut state.queue,
             &mut self.send_slab,
             &mut self.send_copy_pool,
+            &mut self.pending_replenish,
         );
         state.in_flight = false;
+        state.parked = false;
         if let Some(cs) = self.connections.get_mut(conn_index) {
             cs.write = WriteHalf::Open;
         }
@@ -1397,6 +1401,7 @@ impl Driver {
                         for _ in 0..n {
                             self.send_queues[ci].queue.pop_front();
                         }
+                        self.send_queues[ci].parked = false;
                         return true;
                     }
                     Err(_) => {
@@ -1407,6 +1412,7 @@ impl Driver {
                         // queued in order, `in_flight` stays true, and
                         // `drain_send_retries` re-pushes next iteration.
                         self.send_slab.release(slab_idx);
+                        self.send_queues[ci].parked = true;
                         let generation = self.connections.generation(conn_index);
                         self.pending_send_retries
                             .push((conn_index, generation, attempts));
@@ -1428,12 +1434,14 @@ impl Driver {
             return match pushed {
                 Ok(()) => {
                     state.queue.pop_front();
+                    state.parked = false;
                     true
                 }
                 Err(_) => {
                     // SQ still full after submit: park at the head. Nothing
                     // is released and `in_flight` stays true; see
                     // `drain_send_retries` for the retry and the cap.
+                    state.parked = true;
                     let generation = self.connections.generation(conn_index);
                     self.pending_send_retries
                         .push((conn_index, generation, attempts));
@@ -1444,6 +1452,7 @@ impl Driver {
 
         // Queue empty: the connection is idle.
         state.in_flight = false;
+        state.parked = false;
         // Submit a deferred shutdown_write now that the queue is drained.
         if let Some(cs) = self.connections.get_mut(conn_index)
             && matches!(cs.write, WriteHalf::ShutdownPending)
@@ -1493,6 +1502,7 @@ impl Driver {
                 // iteration (see `drain_send_retries`). Nothing is dropped.
                 state.queue.push_back(built);
                 state.in_flight = true;
+                state.parked = true;
                 let generation = self.connections.generation(conn_index);
                 self.pending_send_retries.push((conn_index, generation, 0));
             }
@@ -1521,8 +1531,10 @@ impl Driver {
             &mut state.queue,
             &mut self.send_slab,
             &mut self.send_copy_pool,
+            &mut self.pending_replenish,
         );
         state.in_flight = false;
+        state.parked = false;
         // Abandon any partially-accumulated logical send so the next one
         // starts from zero.
         state.acked_bytes = 0;
@@ -1532,12 +1544,26 @@ impl Driver {
     }
 
     /// Release all entries from a send queue.
+    ///
+    /// A queued `SendRecvBuf` entry (recv-buffer forward / direct echo) owns
+    /// neither a pool slot nor a slab entry; it owns the provided recv buffer
+    /// whose bid is the SQE's payload. No CQE will ever replenish it, so the
+    /// bid is recovered from the entry's user_data here, exactly as the
+    /// completion handler would have done.
     pub(crate) fn release_queued_sends(
         queue: &mut VecDeque<BuiltSend>,
         send_slab: &mut InFlightSendSlab,
         send_copy_pool: &mut SendCopyPool,
+        pending_replenish: &mut Vec<u16>,
     ) {
         for built in queue.drain(..) {
+            if built.pool_slot == u16::MAX && built.slab_idx == u16::MAX {
+                let ud = crate::completion::UserData(built.entry.get_user_data());
+                if ud.tag() == Some(crate::completion::OpTag::SendRecvBuf) {
+                    pending_replenish.push(ud.payload() as u16);
+                }
+                continue;
+            }
             Self::release_built_resources(
                 send_slab,
                 send_copy_pool,

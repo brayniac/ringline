@@ -312,9 +312,15 @@ Parking tests (same file, `send_pool(8, 64)`):
 - `parked_send_defers_a_requested_close`: park a send, `close_connection`;
   `try_finalize_close` does not submit Close while parked; after the retry
   pushes it and its CQE lands, the close finalizes.
-- `tls_handshake_output_is_not_dropped_under_sq_pressure` (`tls` feature,
-  loopback TLS pair as in the existing TLS event-loop tests): force one
-  push failure during the ServerHello flight; the handshake still completes.
+- `queue_built_sends_parks_under_sq_pressure`: two built sends through
+  `queue_built_sends` with a forced first-push failure are both queued in
+  order, parked, and registered once. This is the path the TLS handshake
+  flight, alerts and close_notify take; there is no TLS harness in the
+  event-loop test module, so a TLS-level test of the same behaviour is not
+  included here (recorded as a follow-up in the journal).
+- `parked` idempotency: `drain_send_retries` acts only while
+  `ConnSendState::parked` is set, so a retry entry that outlives its park
+  cannot push a second SQE alongside one already in flight.
 
 Integration (`ringline/tests/echo.rs`, both backends, small pool): a handler
 that sends a response wider than the free pool, gets `Err`, waits one tick,

@@ -3993,12 +3993,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             {
                 continue;
             }
-            // Nothing parked any more (the queue was released by a give-up on
-            // another retry path): the entry is stale.
-            if self.driver.send_queues[conn_index as usize]
-                .queue
-                .is_empty()
-            {
+            // Nothing parked any more — the queue was released, or another
+            // path (a completed send chain) already pushed the head: the
+            // entry is stale, and pushing now would put a second SQE on the
+            // stream alongside the one in flight.
+            let state = &self.driver.send_queues[conn_index as usize];
+            if !state.parked || state.queue.is_empty() {
                 continue;
             }
             if attempts >= 2 {
@@ -5116,6 +5116,91 @@ mod tests {
     /// order. Previously the first entry was released, the rest released
     /// too, and three callers discarded the `Err` — a handshake reply or
     /// close_notify vanished silently under SQ pressure.
+    /// A retry entry that outlives its park must not push a second SQE.
+    /// Park A with B queued behind it, let "another path" push A directly
+    /// (`submit_next_queued` clears `parked`), then run the drain: B must
+    /// stay queued because A is now in flight.
+    #[test]
+    fn stale_retry_entry_does_not_push_a_second_sqe() {
+        let mut el = make_test_loop_with_config(
+            test_config_builder()
+                .send_pool(8, 64)
+                .build()
+                .expect("valid config"),
+        );
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+
+        let a = built_copy_send(&mut el, conn_index, b"aaa");
+        let b = built_copy_send(&mut el, conn_index, b"bbb");
+        let slot_b = b.pool_slot;
+        el.driver.ring.force_push_failures(1);
+        {
+            let mut ctx = el.driver.make_ctx();
+            ctx.queue_built_sends(conn_index, vec![a, b]);
+        }
+        assert!(el.driver.send_queues[conn_index as usize].parked);
+        assert_eq!(
+            el.driver.pending_send_retries,
+            vec![(conn_index, generation, 0)]
+        );
+
+        // Another path pushes the head first.
+        assert!(el.driver.submit_next_queued(conn_index));
+        {
+            let state = &el.driver.send_queues[conn_index as usize];
+            assert!(!state.parked, "a successful push clears parked");
+            assert_eq!(state.queue.len(), 1);
+            assert!(state.in_flight);
+        }
+
+        // The stale retry entry must be a no-op: B stays queued behind the
+        // in-flight A rather than becoming a parallel SQE on the stream.
+        el.drain_send_retries();
+        {
+            let state = &el.driver.send_queues[conn_index as usize];
+            assert_eq!(state.queue.len(), 1, "stale retry pushed a second SQE");
+            assert_eq!(state.queue[0].pool_slot, slot_b);
+            assert!(state.in_flight);
+        }
+        assert!(el.driver.pending_send_retries.is_empty());
+    }
+
+    /// A queued recv-buffer forward owns a provided buffer, not a pool slot.
+    /// Releasing the queue (give-up, force-finalize, slot reuse) must hand
+    /// its bid back to the ring instead of leaking it.
+    #[test]
+    fn releasing_a_queued_recv_buf_forward_replenishes_its_bid() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let bid: u16 = 7;
+        let ud = UserData::encode(OpTag::SendRecvBuf, conn_index, bid as u32);
+        let entry =
+            io_uring::opcode::Send::new(io_uring::types::Fixed(conn_index), std::ptr::null(), 0)
+                .flags(crate::completion::STREAM_SEND_FLAGS)
+                .build()
+                .user_data(ud.raw());
+        el.driver.send_queues[conn_index as usize]
+            .queue
+            .push_back(crate::handler::BuiltSend {
+                entry,
+                pool_slot: u16::MAX,
+                slab_idx: u16::MAX,
+                total_len: 0,
+            });
+        el.driver.send_queues[conn_index as usize].in_flight = true;
+        let before = el.driver.pending_replenish.len();
+
+        el.driver.drain_conn_send_queue(conn_index);
+
+        assert!(el.driver.send_queues[conn_index as usize].queue.is_empty());
+        assert_eq!(
+            &el.driver.pending_replenish[before..],
+            &[bid],
+            "the queued forward's bid must be replenished on release"
+        );
+    }
+
     #[test]
     fn queue_built_sends_parks_under_sq_pressure() {
         let mut el = make_test_loop_with_config(

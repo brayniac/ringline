@@ -16,6 +16,15 @@ use crate::guard::GuardBox;
 pub(crate) struct ConnSendState {
     pub in_flight: bool,
     pub queue: VecDeque<BuiltSend>,
+    /// The queue head could not be pushed (SQ still full after submit) and
+    /// waits for `drain_send_retries`. Set with `in_flight = true` at every
+    /// park site, cleared by any successful push and whenever the queue is
+    /// released. `drain_send_retries` acts only while this is set, so a
+    /// retry entry that outlives its park (another path pushed the head
+    /// first) cannot push a second SQE alongside it. io_uring only; mio
+    /// never parks (sends wait for writability, not for SQ room).
+    #[cfg_attr(not(has_io_uring), allow(dead_code))]
+    pub parked: bool,
     /// Teardown has been requested for this connection (peer FIN, read
     /// error, task return, or an explicit close) and is deferred until
     /// queued sends drain. Set by the driver's `close_connection` and the
@@ -71,6 +80,7 @@ impl ConnSendState {
     pub fn new() -> Self {
         ConnSendState {
             in_flight: false,
+            parked: false,
             queue: VecDeque::new(),
             close_pending: false,
             close_submitted: false,
@@ -262,6 +272,16 @@ impl<'a> DriverCtx<'a> {
                 "stale connection",
             ));
         }
+        // Close already submitted — a new send SQE would race it, and a
+        // parked one would never be re-driven (the retry drain skips
+        // connections whose Close is committed). Same refusal as
+        // `send_parts` and `send_chain`.
+        if self.send_queues[conn.index as usize].close_submitted {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "connection closing",
+            ));
+        }
 
         if !self.tls_table.is_null() {
             let tls_table = unsafe { &mut *self.tls_table };
@@ -401,6 +421,7 @@ impl<'a> DriverCtx<'a> {
                 // iteration (see `drain_send_retries`). Nothing is dropped.
                 state.queue.push_back(built);
                 state.in_flight = true;
+                state.parked = true;
                 let generation = self.connections.generation(conn_index);
                 self.pending_send_retries.push((conn_index, generation, 0));
             }
