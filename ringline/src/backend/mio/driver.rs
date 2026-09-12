@@ -853,7 +853,7 @@ pub(crate) mod tests {
     //! write side). The three helpers below are the shared scaffolding —
     //! `test_config` / `test_driver` / `attach_conn` — and are meant to be
     //! reused by every test added here. `attach_conn` and `token` are
-    //! `pub(crate)` as well: the two bounded-send tests that also need an
+    //! `pub(crate)` as well: the bounded-send tests that also need an
     //! `Executor` live in `backend/mio/event_loop.rs` and attach their
     //! connection the same way.
 
@@ -1374,86 +1374,148 @@ pub(crate) mod tests {
         }
     }
 
-    /// A write error fans out to every queued bounded id with the real
-    /// errno, not a synthetic abort.
+    /// `finish_close` disposes of whatever is still queued when the socket
+    /// is already gone — the one way teardown reaches its clear with a
+    /// non-empty queue (`drain_pending_closes` finalizes on
+    /// `pending_sends.is_empty() || tcp_streams[idx].is_none()`).
+    ///
+    /// One of the permit-disposal sites; a bare `pending_sends[idx].clear()`
+    /// here strands the id and trips `SlotReservation`'s drop assert.
     #[test]
-    fn write_error_fails_queued_bounded_sends_with_the_real_error() {
+    fn finish_close_fails_a_send_left_queued_by_a_gone_socket() {
         let config = test_config();
         let (mut driver, _wake) = test_driver(&config);
-        let (conn_index, client) = attach_conn(&mut driver);
+        let (conn_index, _client) = attach_conn(&mut driver);
         let idx = conn_index as usize;
         let conn = token(&driver, conn_index);
+        let id = bounded_ids(1)[0];
 
-        // Abort the peer: SO_LINGER 0 makes the close an RST.
-        let linger = libc::linger {
-            l_onoff: 1,
-            l_linger: 0,
-        };
-        let rc = unsafe {
-            libc::setsockopt(
-                client.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_LINGER,
-                &linger as *const libc::linger as *const libc::c_void,
-                std::mem::size_of::<libc::linger>() as libc::socklen_t,
-            )
-        };
-        assert_eq!(rc, 0, "setsockopt: {}", io::Error::last_os_error());
-        drop(client);
-
-        // The RST is asynchronous: the first write after it may still
-        // succeed, so write until one fails.
-        let mut write_err = None;
-        for _ in 0..500 {
-            driver.make_ctx().send(conn, b"x").expect("queued");
-            match driver.flush_sends(conn_index) {
-                Ok(_) => std::thread::sleep(Duration::from_millis(2)),
-                Err(e) => {
-                    write_err = Some(e);
-                    break;
-                }
-            }
-        }
-        let write_err = write_err.expect("writing to an aborted peer must fail");
-        assert!(
-            write_err.raw_os_error().is_some(),
-            "the fan-out has an errno to preserve: {write_err:?}"
-        );
-
-        // Bounded sends queued against the dead socket.
-        let ids = bounded_ids(2);
         driver
             .make_ctx()
-            .send_bounded(conn, b"a", ids[0])
-            .expect("admission does not touch the socket");
-        driver
-            .make_ctx()
-            .send_bounded(conn, b"b", ids[1])
-            .expect("admission does not touch the socket");
+            .send_bounded(conn, b"never sent", id)
+            .expect("admitted");
+        assert_eq!(driver.send_copy_pool.free_count(), 3);
+        driver.capacity_released = false;
 
-        // What `AsyncEventLoop::fail_connection_on_send_error` does with the
-        // error `flush_sends` returned.
-        driver.clear_pending_sends(idx, || clone_io_error(&write_err));
+        // The stream is gone, so `finish_close`'s opening flush writes
+        // nothing and the entry survives to the clear.
+        driver.tcp_streams[idx] = None;
+        driver.close_connection(conn_index);
+        driver.finish_close(conn_index);
 
-        let completions = take_completions(&mut driver);
-        assert_eq!(completions.len(), 2);
-        assert_eq!(
-            completions.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
-            ids
-        );
-        for (id, result) in &completions {
-            let err = result.as_ref().expect_err("the write failed");
-            assert_eq!(
-                err.raw_os_error(),
-                write_err.raw_os_error(),
-                "{id:?} must see the real errno, not a synthetic one"
-            );
-            assert_eq!(err.kind(), write_err.kind(), "wrong kind for {id:?}");
-        }
+        assert!(driver.pending_sends[idx].is_empty());
         assert_eq!(
             driver.send_copy_pool.free_count(),
             4,
-            "a failed connection still returns its permits"
+            "teardown returns the permit"
+        );
+        assert!(driver.capacity_released);
+        let completions = take_completions(&mut driver);
+        assert_eq!(completions.len(), 1, "the stranded id must be told");
+        assert_eq!(completions[0].0, id);
+        let err = completions[0].1.as_ref().expect_err("the send never went");
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
+        assert!(
+            err.to_string()
+                .contains("closed before the send reached the socket"),
+            "unexpected message: {err}"
+        );
+    }
+
+    /// The connect-time slot-reuse clear (`DriverCtx::connect`) disposes of
+    /// whatever the previous occupant left queued: permit back, id failed.
+    ///
+    /// One of four permit-disposal sites; a bare `pending_sends[idx].clear()`
+    /// here strands the id and trips `SlotReservation`'s drop assert.
+    #[test]
+    fn connect_time_slot_reuse_fails_a_stale_bounded_send() {
+        let config = test_config();
+        let (mut driver, _wake) = test_driver(&config);
+        let (conn_index, _client) = attach_conn(&mut driver);
+        let idx = conn_index as usize;
+        let conn = token(&driver, conn_index);
+        let id = bounded_ids(1)[0];
+
+        driver
+            .make_ctx()
+            .send_bounded(conn, b"stranded", id)
+            .expect("admitted");
+        assert_eq!(driver.send_copy_pool.free_count(), 3);
+        driver.capacity_released = false;
+
+        // Free the slot with its send queue still populated — the state the
+        // defensive clear exists for. No production path gets here today,
+        // which is exactly why nothing else would notice it regressing.
+        driver.tcp_streams[idx] = None;
+        driver.connections.release(conn_index);
+
+        // Nobody has to accept: mio's connect is nonblocking.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+        let addr = listener.local_addr().expect("listener address");
+        let reused = driver.make_ctx().connect(addr).expect("connect");
+        assert_eq!(
+            reused.index, conn_index,
+            "the free list is LIFO, so this is the same slot"
+        );
+
+        assert!(driver.pending_sends[idx].is_empty(), "the stale entry went");
+        assert_eq!(
+            driver.send_copy_pool.free_count(),
+            4,
+            "its permit came back to the pool"
+        );
+        assert!(driver.capacity_released, "the capacity head must be woken");
+        let completions = take_completions(&mut driver);
+        assert_eq!(completions.len(), 1, "the stranded id must be told");
+        assert_eq!(completions[0].0, id);
+        let err = completions[0].1.as_ref().expect_err("the send never went");
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
+        assert!(
+            err.to_string().contains("reused by a new connect"),
+            "unexpected message: {err}"
+        );
+    }
+
+    /// `flush_sends`' empty-iovec bail-out disposes of what it discards.
+    ///
+    /// Only a zero-length entry reaches that branch and `send_bounded`
+    /// settles those itself, so the entry is built by hand — permit
+    /// included, exactly as `send_bounded` would hold it. One of four
+    /// permit-disposal sites.
+    #[test]
+    fn empty_iovec_bailout_fails_the_bounded_entry_it_discards() {
+        let config = test_config();
+        let (mut driver, _wake) = test_driver(&config);
+        let (conn_index, _client) = attach_conn(&mut driver);
+        let idx = conn_index as usize;
+        let id = bounded_ids(1)[0];
+
+        let permit = driver
+            .send_copy_pool
+            .reserve_slots(1)
+            .expect("a free slot to promise");
+        driver.pending_sends[idx].push_back(PendingSend::bounded(Vec::new(), id, permit));
+        assert_eq!(driver.send_copy_pool.free_count(), 3);
+
+        let (all_flushed, written) = driver.flush_sends(conn_index).expect("flush");
+        assert!(all_flushed, "nothing is left to write");
+        assert_eq!(written, 0);
+
+        assert!(driver.pending_sends[idx].is_empty());
+        assert_eq!(
+            driver.send_copy_pool.free_count(),
+            4,
+            "the discarded entry's permit came back"
+        );
+        assert!(driver.capacity_released);
+        let completions = take_completions(&mut driver);
+        assert_eq!(completions.len(), 1, "the discarded id must be told");
+        assert_eq!(completions[0].0, id);
+        let err = completions[0].1.as_ref().expect_err("discarded, not sent");
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
+        assert!(
+            err.to_string().contains("no bytes left to write"),
+            "unexpected message: {err}"
         );
     }
 }

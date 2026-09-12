@@ -1336,11 +1336,20 @@ mod tests {
     /// pipe, which nothing here polls). As in `driver::tests::test_driver`,
     /// the returned `WakeHandle` must stay bound for the loop's lifetime.
     fn test_loop(config: &Config) -> (AsyncEventLoop<NoopHandler>, crate::wakeup::WakeHandle) {
+        test_loop_with_accept(config, None)
+    }
+
+    /// [`test_loop`] with an acceptor channel, for the tests that drive
+    /// `drain_channels`' accept path.
+    fn test_loop_with_accept(
+        config: &Config,
+        accept_rx: Option<crossbeam_channel::Receiver<(RawFd, SocketAddr)>>,
+    ) -> (AsyncEventLoop<NoopHandler>, crate::wakeup::WakeHandle) {
         let (read_fd, handle) = crate::wakeup::create_wake_fd().expect("wake fd");
         let event_loop = AsyncEventLoop::new(
             config,
             NoopHandler,
-            None,
+            accept_rx,
             read_fd,
             handle.as_wake_fd(),
             Arc::new(AtomicBool::new(false)),
@@ -1525,6 +1534,12 @@ mod tests {
 
     /// Permits returning during an iteration wake the capacity head exactly
     /// once, at the end of the iteration — not once per released permit.
+    ///
+    /// "Once" is counted at the source (`Executor::send_capacity_wakes`),
+    /// not inferred from `ready_queue.len()`: `wake_task` pushes only on a
+    /// Parked → Ready transition, so a second wake of the same head in the
+    /// same iteration would leave the queue length at 1 too. The last block
+    /// shows the counter does move when a wake really is issued.
     #[test]
     fn capacity_head_is_woken_once_per_iteration_when_permits_return() {
         let config = test_config();
@@ -1575,9 +1590,13 @@ mod tests {
         event_loop.wake_capacity_if_released();
 
         assert_eq!(
+            event_loop.executor.send_capacity_wakes, 1,
+            "two released permits, one wake"
+        );
+        assert_eq!(
             event_loop.executor.ready_queue.len(),
             1,
-            "two released permits, one wake"
+            "and that wake reached the head"
         );
         assert_eq!(event_loop.executor.ready_queue[0], head_task);
         assert!(
@@ -1594,9 +1613,203 @@ mod tests {
         park(&mut event_loop.executor, head_task);
         event_loop.executor.ready_queue.clear();
         event_loop.wake_capacity_if_released();
-        assert!(
-            event_loop.executor.ready_queue.is_empty(),
+        assert_eq!(
+            event_loop.executor.send_capacity_wakes, 1,
             "the head is woken once per iteration, not once per call"
         );
+        assert!(event_loop.executor.ready_queue.is_empty());
+
+        // The counter is what the assertions above rest on, so show it can
+        // move: a permit released in the *next* iteration wakes the head
+        // again.
+        event_loop.driver.capacity_released = true;
+        event_loop.wake_capacity_if_released();
+        assert_eq!(
+            event_loop.executor.send_capacity_wakes, 2,
+            "a genuine second release does wake the head again"
+        );
+        assert_eq!(event_loop.executor.ready_queue, vec![head_task]);
+    }
+
+    /// A connected socket pair; the server end is handed over as a raw fd
+    /// (as the acceptor thread does), the client end returned so the test
+    /// keeps the connection alive.
+    fn accepted_socket() -> (RawFd, std::net::TcpStream, SocketAddr) {
+        use std::os::fd::IntoRawFd;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+        let addr = listener.local_addr().expect("listener address");
+        let client = std::net::TcpStream::connect(addr).expect("connect to the listener");
+        let (server, peer) = listener.accept().expect("accept the connection");
+        server
+            .set_nonblocking(true)
+            .expect("nonblocking server end");
+        (server.into_raw_fd(), client, peer)
+    }
+
+    /// The accept-time slot-reuse clear in `drain_channels` disposes of
+    /// whatever the previous occupant left queued: permit back, id failed.
+    ///
+    /// One of four permit-disposal sites; a bare `pending_sends[idx].clear()`
+    /// here strands the id and trips `SlotReservation`'s drop assert.
+    #[test]
+    fn accept_time_slot_reuse_fails_a_stale_bounded_send() {
+        let config = test_config();
+        let (accept_tx, accept_rx) = crossbeam_channel::unbounded();
+        let (mut event_loop, _wake) = test_loop_with_accept(&config, Some(accept_rx));
+        let (conn_index, _client) = attach_conn(&mut event_loop.driver);
+        let conn = token(&event_loop.driver, conn_index);
+
+        let task_id = parked_standalone(&mut event_loop.executor);
+        let id = event_loop
+            .executor
+            .enqueue_send_capacity(conn_index, conn.generation, 1, task_id);
+        event_loop
+            .driver
+            .make_ctx()
+            .send_bounded(conn, b"stranded", id)
+            .expect("admitted");
+        event_loop.executor.mark_bounded_send_submitted(id);
+        assert_eq!(event_loop.driver.send_copy_pool.free_count(), 3);
+
+        // Free the slot with its send queue still populated — the state the
+        // defensive clear exists for. No production path gets here today,
+        // which is exactly why nothing else would notice it regressing.
+        event_loop.driver.tcp_streams[conn_index as usize] = None;
+        event_loop.driver.connections.release(conn_index);
+
+        let (server_fd, _peer, peer_addr) = accepted_socket();
+        accept_tx
+            .send((server_fd, peer_addr))
+            .expect("queue the accept");
+        event_loop.drain_channels();
+        assert!(
+            event_loop.driver.tcp_streams[conn_index as usize].is_some(),
+            "the free list is LIFO, so the accept reused the same slot"
+        );
+        assert!(
+            event_loop.driver.pending_sends[conn_index as usize].is_empty(),
+            "the stale entry went"
+        );
+        assert_eq!(
+            event_loop.driver.send_copy_pool.free_count(),
+            4,
+            "its permit came back to the pool"
+        );
+
+        event_loop.drain_send_completions();
+        let err = event_loop
+            .executor
+            .take_bounded_send_result(id)
+            .expect("the stranded id must be told")
+            .expect_err("the send never went");
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
+        assert!(
+            err.to_string().contains("reused by a new accept"),
+            "unexpected message: {err}"
+        );
+    }
+
+    /// A write error fans out to every queued bounded id with the real
+    /// errno, not a synthetic abort — through the event loop's own
+    /// `fail_connection_on_send_error`, which is the third of the four
+    /// permit-disposal sites. Driving the helper rather than re-implementing
+    /// its body is the point: a bare `pending_sends[idx].clear()` there must
+    /// fail this test.
+    #[test]
+    fn write_error_fails_queued_bounded_sends_with_the_real_error() {
+        let config = test_config();
+        let (mut event_loop, _wake) = test_loop(&config);
+        let (conn_index, client) = attach_conn(&mut event_loop.driver);
+        let idx = conn_index as usize;
+        let conn = token(&event_loop.driver, conn_index);
+
+        // Abort the peer: SO_LINGER 0 makes the close an RST.
+        let linger = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        let rc = unsafe {
+            libc::setsockopt(
+                std::os::fd::AsRawFd::as_raw_fd(&client),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                &linger as *const libc::linger as *const libc::c_void,
+                std::mem::size_of::<libc::linger>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(rc, 0, "setsockopt: {}", io::Error::last_os_error());
+        drop(client);
+
+        // The RST is asynchronous: the first write after it may still
+        // succeed, so write until one fails.
+        let mut write_err = None;
+        for _ in 0..500 {
+            event_loop
+                .driver
+                .make_ctx()
+                .send(conn, b"x")
+                .expect("queued");
+            match event_loop.driver.flush_sends(conn_index) {
+                Ok(_) => std::thread::sleep(Duration::from_millis(2)),
+                Err(e) => {
+                    write_err = Some(e);
+                    break;
+                }
+            }
+        }
+        let write_err = write_err.expect("writing to an aborted peer must fail");
+        assert!(
+            write_err.raw_os_error().is_some(),
+            "the fan-out has an errno to preserve: {write_err:?}"
+        );
+
+        // Two bounded sends queued against the dead socket.
+        let mut ids = Vec::new();
+        for payload in [&b"a"[..], &b"b"[..]] {
+            let task_id = parked_standalone(&mut event_loop.executor);
+            let id =
+                event_loop
+                    .executor
+                    .enqueue_send_capacity(conn_index, conn.generation, 1, task_id);
+            event_loop
+                .driver
+                .make_ctx()
+                .send_bounded(conn, payload, id)
+                .expect("admission does not touch the socket");
+            event_loop.executor.mark_bounded_send_submitted(id);
+            ids.push(id);
+        }
+
+        // The flush pass hits the write error and routes it through
+        // `fail_connection_on_send_error`.
+        event_loop.flush_all_pending_sends();
+        assert!(
+            event_loop.driver.pending_sends[idx].is_empty(),
+            "the failed connection's queue is discarded"
+        );
+        assert_eq!(
+            event_loop.driver.send_copy_pool.free_count(),
+            4,
+            "a failed connection still returns its permits"
+        );
+        assert!(
+            event_loop.driver.send_queues[idx].close_pending,
+            "a hard write error closes the connection"
+        );
+
+        event_loop.drain_send_completions();
+        for id in ids {
+            let err = event_loop
+                .executor
+                .take_bounded_send_result(id)
+                .unwrap_or_else(|| panic!("{id:?} was never told"))
+                .expect_err("the write failed");
+            assert_eq!(
+                err.raw_os_error(),
+                write_err.raw_os_error(),
+                "{id:?} must see the real errno, not a synthetic one"
+            );
+            assert_eq!(err.kind(), write_err.kind(), "wrong kind for {id:?}");
+        }
     }
 }

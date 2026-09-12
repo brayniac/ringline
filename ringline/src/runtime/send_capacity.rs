@@ -519,8 +519,16 @@ impl Executor {
     /// [`SendCapacityQueue::head_ready`] plus a wake of the head. The
     /// driver's copy-pool slot-release hook, PRs 6 and 7, with the number of
     /// slots now free.
+    ///
+    /// Counted under `cfg(test)` in [`Executor::send_capacity_wakes`]: the
+    /// mio loop's "one capacity wake per iteration" is otherwise invisible,
+    /// since waking an already-Ready head pushes nothing.
     pub(crate) fn wake_send_capacity(&mut self, free_slots: usize) {
         if let Some(head) = self.send_capacity.head_ready(free_slots) {
+            #[cfg(test)]
+            {
+                self.send_capacity_wakes += 1;
+            }
             let _ = self.wake_task(head);
         }
     }

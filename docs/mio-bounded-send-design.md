@@ -169,12 +169,23 @@ feature, and belongs with the close-lifecycle work if it is ever wanted.
 
 ## Tests
 
-mio has no event-loop unit-test module; tests are `#[cfg(test)]` unit
-tests in `backend/mio/driver.rs` that build a `Driver` around a real
-`socketpair`/`TcpStream` pair, plus integration tests in
-`ringline/tests/echo.rs` gated `#[cfg(not(has_io_uring))]` where a handler
-is needed. `send_bounded` has no public caller yet, so the driver tests
+Tests are `#[cfg(test)]` unit tests in `backend/mio/driver.rs` that build a
+`Driver` around a real `TcpStream` pair, plus a small event-loop module in
+`backend/mio/event_loop.rs` for the cases that also need an `Executor`
+(it reuses the driver module's `attach_conn` / `token`), plus integration
+tests in `ringline/tests/echo.rs` gated `#[cfg(not(has_io_uring))]` where a
+handler is needed. `send_bounded` has no public caller yet, so the tests
 call it through `make_ctx()`.
+
+A queued bounded entry's permit is disposed of at seven places:
+`Driver::clear_pending_sends` (from `finish_close`, from the accept-time
+slot reuse in `drain_channels`, and from `fail_connection_on_send_error`),
+`DriverCtx::clear_pending_sends` (the connect-time slot reuse),
+`flush_sends`' completion, `flush_sends`' empty-iovec bail-out, and
+`Driver::drop`. Every one has a test that fails if it is reverted to a bare
+`pending_sends[idx].clear()` — checked by reverting each in turn. That
+matters because `SlotReservation`'s drop assert only fires on a path some
+test actually walks, so an unexercised site is unprotected, not protected.
 
 Driver-level:
 - `send_bounded_reserves_a_permit_and_queues_without_writing`: pool(4,
@@ -192,11 +203,19 @@ Driver-level:
 - `clear_pending_sends_fans_out_and_releases`: two bounded + one plain
   queued; clear with `ConnectionAborted` → two `Err` completions in queue
   order, `free_count` restored, queue empty.
-- `write_error_fails_queued_bounded_sends_with_the_real_error`: peer
-  closed with RST; flush → `Err(EPIPE/ECONNRESET)`; the event-loop helper
-  path (`fail_connection_on_send_error`) produces `Err` with the same
-  `raw_os_error` per id.
-- `bounded_completion_is_delivered_before_teardown` (event-loop order,
+- `finish_close_fails_a_send_left_queued_by_a_gone_socket`: the socket is
+  already gone, so teardown's opening flush writes nothing and the clear is
+  what disposes of the entry.
+- `connect_time_slot_reuse_fails_a_stale_bounded_send`: a bounded send is
+  queued, the slot is released with the queue still populated, and
+  `DriverCtx::connect` reuses it (LIFO free list) → the stranded id gets
+  `ConnectionAborted` ("reused by a new connect") and its permit back.
+- `empty_iovec_bailout_fails_the_bounded_entry_it_discards`: a zero-length
+  bounded entry built by hand (only kind that reaches the bail-out;
+  `send_bounded` settles those itself) → flush returns `(true, 0)`, the id
+  is failed and the permit returned.
+
+Event-loop level (these need an `Executor` too):- `bounded_completion_is_delivered_before_teardown` (event-loop order,
   departure 4, `drain_pending_closes` route): queue a bounded send, request
   close, run one loop iteration's `flush_all_pending_sends` +
   `drain_send_completions` + `drain_pending_closes` by hand; the executor
@@ -207,9 +226,21 @@ Driver-level:
   `poll_ready_tasks` tears the connection down *before* the flush. The
   owner must still see `Ok(len)`, which only the provisional-abort rule
   delivers.
+- `accept_time_slot_reuse_fails_a_stale_bounded_send`: same shape as the
+  connect-time test, through `drain_channels`' accept path with a real
+  accepted fd on the channel.
+- `write_error_fails_queued_bounded_sends_with_the_real_error`: peer closed
+  with RST; `flush_all_pending_sends` hits the write error and routes it
+  through the real `fail_connection_on_send_error`, which fails every queued
+  bounded id with the same `raw_os_error` and returns the permits. It drives
+  the helper rather than re-implementing its body, so reverting the helper's
+  clear fails it.
 - `capacity_head_is_woken_once_per_iteration_when_permits_return`: two
-  bounded sends complete in one flush; `wake_send_capacity` called once
-  (observable as one wake of the queue head's task).
+  bounded sends complete in one flush; `wake_send_capacity` is called once.
+  Counted through `Executor::send_capacity_wakes` (a `cfg(test)` counter),
+  because `ready_queue.len()` cannot tell one wake from two — `wake_task`
+  pushes only on a Parked → Ready transition. The test also shows the
+  counter moving on a genuine second release.
 
 Integration (`tests/echo.rs`, mio-gated): none needed beyond the driver
 tests until PR 9 has a future to drive end to end.

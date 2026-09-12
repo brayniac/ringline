@@ -541,6 +541,17 @@ pub(crate) struct Executor {
     /// Indexed by `task_idx & !STANDALONE_BIT`. Same lifecycle as
     /// `poll_dedup_conn`. Sized to `standalone_task_capacity`.
     pub(crate) poll_dedup_standalone: Vec<bool>,
+    /// Test-only: how many times `wake_send_capacity` has actually woken the
+    /// send-capacity FIFO head.
+    ///
+    /// The mio loop promises *one* capacity wake per iteration however many
+    /// copy-pool permits came back during it, and the ready queue cannot
+    /// witness that: `wake_task` pushes only on a Parked → Ready transition,
+    /// so a second wake of the same head in the same iteration leaves
+    /// `ready_queue.len()` at 1 as well. Counting the wakes at their source
+    /// is what makes "once" observable.
+    #[cfg(test)]
+    pub(crate) send_capacity_wakes: u32,
 }
 
 impl Executor {
@@ -605,6 +616,8 @@ impl Executor {
             next_blocking_id: 0,
             poll_dedup_conn: vec![false; cap],
             poll_dedup_standalone: vec![false; standalone_capacity as usize],
+            #[cfg(test)]
+            send_capacity_wakes: 0,
         }
     }
 
