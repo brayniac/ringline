@@ -1004,20 +1004,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
     }
 
-    /// Drain the driver's send completions and re-poll the tasks they woke.
-    ///
-    /// Two queues, in this order: the worker-wide bounded-send queue
-    /// (`Driver::bounded_send_completions`, routed by id through
-    /// `Executor::complete_bounded_send`), then the per-connection
-    /// `send_completions` queues, calling wake_send for each so that each
-    /// SendFuture resolves. The per-connection pass visits only connections
-    /// marked dirty at completion-push time; a connection with results left
-    /// over (single waiter slot, or no waiter yet) is re-marked for the next
-    /// pass.
-    ///
-    /// Returned copy-pool permits are *not* signalled here: the driver sets
-    /// `capacity_released` wherever a permit goes back, and the run loop
-    /// issues one `wake_send_capacity` per iteration (see step 8a).
     /// Wake the send-capacity FIFO head if any copy-pool permit came back
     /// this iteration, and clear the flag. Called once, as the last thing in
     /// the run loop; see the call site for why that point and not inside
@@ -1032,6 +1018,20 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
     }
 
+    /// Drain the driver's send completions and re-poll the tasks they woke.
+    ///
+    /// Two queues, in this order: the worker-wide bounded-send queue
+    /// (`Driver::bounded_send_completions`, routed by id through
+    /// `Executor::complete_bounded_send`), then the per-connection
+    /// `send_completions` queues, calling wake_send for each so that each
+    /// SendFuture resolves. The per-connection pass visits only connections
+    /// marked dirty at completion-push time; a connection with results left
+    /// over (single waiter slot, or no waiter yet) is re-marked for the next
+    /// pass.
+    ///
+    /// Returned copy-pool permits are *not* signalled here: the driver sets
+    /// `capacity_released` wherever a permit goes back, and the run loop
+    /// issues one `wake_send_capacity` per iteration (see step 8a).
     fn drain_send_completions(&mut self) {
         loop {
             let mut delivered = false;
