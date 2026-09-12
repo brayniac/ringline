@@ -21,6 +21,43 @@ record gap) green on both backends.
 
 ## What happened
 
+- **Hardware A/B of #376 + #377 (2026-09-12).** Owner mandate: every
+  send-path PR is verified on Linux with the real X710 ports for both
+  backends, not only the single-guest clippy/test job. Harness landed as
+  #379 (`experiments/send-path-ab-build.toml`, `experiments/send-path-ab.toml`):
+  build once on the validation host, one arm per experiment, server guest
+  on hv02 (z1.c, 4×10G LAG), client guest on hv01 (z2.c), rezolus on both
+  sides, arms interleaved. Baseline c419d05 vs main 7ecc3fb; ringline echo
+  server with 8 workers, 64 closed-loop connections, 256 B and 64 KiB
+  phases, 20 s windows. io_uring arms n=6 each, mio arms n=3 each, plus a
+  discarded warm-up. Backend proven per arm from the server's syscall mix
+  (io_uring: only `io_uring_enter`, ~0.5/req at 256 B; mio: 2.35 poll +
+  2.0 read + 1.0 write per request).
+
+  Verdict: **within the run-to-run noise floor on every metric, both
+  backends.** Medians (min–max): 256 B ops/s io_uring 287k [274–301k] →
+  294k [285–300k], mio 275k [273–278k] → 279k [272–280k]; 256 B p99
+  io_uring 404 µs [360–427] → 383 [372–444], mio 420 [405–458] → 411
+  [401–430]; server CPU per request io_uring 16.5 → 17.3 µs (spread
+  15.8–18.2), mio 25.3 → 25.1 µs. 64 KiB is latency-bound at 64 in flight
+  (~42k ops/s ≈ 22 Gbps per direction, unchanged); its io_uring p99 is
+  bimodal on both sides (runs cluster at ~2.7–2.9 ms and ~3.6–3.9 ms:
+  before 3 low / 3 high, after 1 low / 5 high, medians 3.26 → 3.61 ms,
+  ranges overlapping, p999 10.4 → 10.5 ms). Not resolvable at n=6; each
+  later PR's A/B will show whether the slow mode's share keeps moving.
+  An initial n=3 read had shown a disjoint +4.4 % throughput win for
+  io_uring at 256 B that three more runs erased — three runs are not
+  enough on this LAG.
+
+  Measurement findings (now in infra `docs/guides/vm-jobs.md`): noise
+  floor ±3 % throughput, ±5 % cores, ±4–8 % p99 at 256 B, one-in-twelve
+  outlier reps; guest `network_bytes` double-counts bond0 plus its members
+  (tx/expected = 2.00 in all 24 windows); `tcp_retransmit` runs 10–30/s at
+  22 Gbps per direction on every arm, backend-independent. Per-window CSV:
+  systemslab artifact 01a09643-7742-733a-1c04-9b7a0f0e8d6c. anvil-vm
+  `upload = true` with a directory artifact failed at curl and cancelled the
+  server through the barrier; fixed upstream in anvil 0.8.3, the spec tars
+  its results meanwhile.
 - **PR 4 — transactional copied sends.** io_uring `DriverCtx::send` copied
   a multi-slot buffer chunk by chunk, so pool exhaustion on chunk *k* left
   chunks 1..k-1 queued behind the `Err` and a retry duplicated them. It now
