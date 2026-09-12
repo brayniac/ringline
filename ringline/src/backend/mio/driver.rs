@@ -677,3 +677,158 @@ fn bind_udp_with_reuseport(addr: SocketAddr, udp_gro: bool) -> io::Result<std::n
 
     Ok(unsafe { std::net::UdpSocket::from_raw_fd(fd) })
 }
+
+#[cfg(test)]
+mod tests {
+    //! Driver-level tests for the mio backend.
+    //!
+    //! There is no mio event-loop test harness: these build a real `Driver`
+    //! around a real loopback socket pair and drive its methods directly
+    //! (`make_ctx()` for the `DriverCtx` entry points, `flush_sends` for the
+    //! write side). The three helpers below are the shared scaffolding —
+    //! `test_config` / `test_driver` / `attach_conn` — and are meant to be
+    //! reused by every test added here.
+
+    use super::*;
+    use crate::config::ConfigBuilder;
+    use crate::handler::ConnToken;
+    use std::io::Read;
+    use std::time::Duration;
+
+    /// A minimal single-worker config for driver tests.
+    ///
+    /// Mirrors `backend/uring/event_loop.rs`'s `test_config_builder` minus the
+    /// io_uring-only knobs. The send pool is deliberately tiny — 4 slots of
+    /// 64 bytes — so tests can exhaust it and observe slot accounting with
+    /// small payloads.
+    fn test_config() -> Config {
+        ConfigBuilder::new()
+            .workers(1)
+            .pin_to_core(false)
+            .max_connections(16)
+            .send_pool(4, 64)
+            .build()
+            .expect("valid test config")
+    }
+
+    /// Build a `Driver` with no acceptor, resolver, spawner, blocking or
+    /// disk-I/O plumbing — every optional subsystem is `None`.
+    ///
+    /// The returned `WakeHandle` owns the write end of the wake pipe and
+    /// **must be bound for the lifetime of the driver**
+    /// (`let (mut driver, _wake) = test_driver(&config);`); dropping it closes
+    /// the fd the driver still holds. The read end is intentionally left
+    /// dangling: it is a per-test fd leak that the process exit reclaims,
+    /// which is simpler than handing tests a second guard to keep alive.
+    fn test_driver(config: &Config) -> (Driver, crate::wakeup::WakeHandle) {
+        let (read_fd, handle) = crate::wakeup::create_wake_fd().expect("wake fd");
+        let driver = Driver::new(
+            config,
+            None,
+            read_fd,
+            handle.as_wake_fd(),
+            Arc::new(AtomicBool::new(false)),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("build mio driver");
+        (driver, handle)
+    }
+
+    /// Attach a real, connected socket to a fresh connection slot, mirroring
+    /// the plaintext half of `event_loop.rs`'s accept path: allocate the slot,
+    /// register the accepted stream with the poll, reset the accumulator, and
+    /// mark the connection `Open` / established / writable.
+    ///
+    /// Returns the connection index and the *client* end of the pair, so a
+    /// test can read back whatever the driver wrote. The client end is
+    /// blocking with a 5 s read timeout: a read that the driver never
+    /// satisfies fails the test instead of hanging it.
+    ///
+    /// The listener is dropped before returning — an already accepted
+    /// connection is unaffected by closing the listening socket, so nothing
+    /// needs to keep the port bound.
+    fn attach_conn(driver: &mut Driver) -> (u32, std::net::TcpStream) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+        let addr = listener.local_addr().expect("listener address");
+        let client = std::net::TcpStream::connect(addr).expect("connect to the listener");
+        let (server, _peer) = listener.accept().expect("accept the connection");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("client read timeout");
+        server
+            .set_nonblocking(true)
+            .expect("nonblocking accepted side");
+
+        let conn_index = driver
+            .connections
+            .allocate()
+            .expect("no free connection slots");
+        let idx = conn_index as usize;
+
+        let mut stream = mio::net::TcpStream::from_std(server);
+        driver
+            .poll
+            .registry()
+            .register(&mut stream, mio::Token(idx + 1), Interest::READABLE)
+            .expect("register the accepted stream");
+        driver.tcp_streams[idx] = Some(stream);
+        driver.accumulators.reset(conn_index);
+        driver.pending_sends[idx].clear();
+        driver.writable[idx] = true;
+        if let Some(cs) = driver.connections.get_mut(conn_index) {
+            cs.lifecycle = Lifecycle::Open;
+            cs.established = true;
+        }
+
+        (conn_index, client)
+    }
+
+    /// The token for an attached connection, for the `DriverCtx` entry points.
+    fn token(driver: &Driver, conn_index: u32) -> ConnToken {
+        ConnToken::new(conn_index, driver.connections.generation(conn_index))
+    }
+
+    /// Smoke test for the scaffolding itself: a plain send queues on the
+    /// connection, `flush_sends` writes it all, and the peer reads the bytes.
+    #[test]
+    fn test_driver_builds_and_flushes_a_plain_send() {
+        let config = test_config();
+        let (mut driver, _wake) = test_driver(&config);
+        let (conn_index, mut client) = attach_conn(&mut driver);
+        let idx = conn_index as usize;
+
+        let conn = token(&driver, conn_index);
+        driver
+            .make_ctx()
+            .send(conn, b"hello")
+            .expect("queue a plain send");
+        assert_eq!(
+            driver.pending_sends[idx].len(),
+            1,
+            "mio sends are queued, never written inline"
+        );
+
+        let (all_flushed, written) = driver.flush_sends(conn_index).expect("flush");
+        assert!(
+            all_flushed,
+            "the whole queue should have reached the socket"
+        );
+        assert_eq!(written, 5);
+        assert!(driver.pending_sends[idx].is_empty());
+
+        let mut buf = [0u8; 5];
+        client.read_exact(&mut buf).expect("read the flushed bytes");
+        assert_eq!(&buf, b"hello");
+    }
+}
