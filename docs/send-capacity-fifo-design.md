@@ -84,17 +84,25 @@ Semantics:
   arrival); `Done` → removed.
 - `head_ready(free_slots)` → the head's task if `free_slots >=
   head.required_slots`. `wake_send_capacity` is this plus `wake_task`.
-- `remove_connection(conn)`: every waiting and in-flight entry for the
-  connection becomes `Done(Err(ConnectionAborted))` (moved to `submitted`
-  if it was waiting) and its owner is returned for waking — the owner may
-  be a standalone task that outlives the connection; abandoned entries are
-  removed. If the head was removed, the new head's task is also returned.
-  Called from `Executor::remove_connection` after `task_slab.remove`, so a
-  connection-bound task's future is already gone and its late `cancel`
-  cannot run.
+- `remove_connection(conn)`: for every waiting and in-flight entry of the
+  connection, if the owner is a task that outlives the connection (a
+  standalone task, or another connection's task) the entry becomes
+  `Done(Err(ConnectionAborted))` (moved to `submitted` if it was waiting)
+  and the owner is returned for waking. If the owner is the connection's
+  own task (`task_id == conn_index`) nobody is left to read a result:
+  `task_slab.remove` has already dropped that future outside a poll, so its
+  `Drop` → `cancel` could not run. Those entries are cancelled instead —
+  waiting removed, `InFlight` → `Abandoned` (the completion removes it),
+  `Done` removed — so a closed connection never leaves a `Done` entry
+  behind. Abandoned entries are removed. If the head was removed, the new
+  head's task is also returned. Called from `Executor::remove_connection`
+  after `task_slab.remove`.
 - `fail_waiting(conn, generation, kind, msg)`: waiting entries for that
-  connection generation become `Done(Err(kind))`; in-flight ones are left
-  alone. PR 9's `shutdown_write` uses it with `BrokenPipe`.
+  connection generation become `Done(Err(kind))` and their owners are
+  returned for waking, plus the new head's task if the head was among them;
+  in-flight ones are left alone. PR 9's `shutdown_write` uses it with
+  `BrokenPipe`. `remove_connection` and `fail_waiting` return a `Vec<u32>`
+  (teardown/shutdown paths; the allocation is acceptable there).
 
 `Executor` gains `send_capacity: SendCapacityQueue` and thin wrappers that
 call `wake_task` on whatever the queue returns:
@@ -111,7 +119,11 @@ naming the PRs that remove it (PR 9 deletes the attribute).
 
 ## Tests (`send_capacity.rs`, both backends)
 
-Queue-level, no driver:
+Queue-level, no driver (plus
+`remove_connection_drops_entries_owned_by_the_dead_connection_task` for the
+own-task rule above, and `send_capacity_wrappers_wake_through_wake_task` so
+every wrapper has a test caller under `cfg(test)`, where the dead-code
+allowance is off):
 
 - `fifo_admits_only_the_head_and_only_with_capacity`: two waiters (3 and 1
   slots); `turn(second, 8)` false; `turn(first, 2)` false; `turn(first, 3)`
