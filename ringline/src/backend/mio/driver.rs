@@ -1150,21 +1150,21 @@ pub(crate) mod tests {
     #[test]
     fn partial_write_keeps_permit_and_id() {
         // `test_config`'s four 64-byte slots cap a bounded send at 256
-        // bytes, which no socket buffer is small enough to split. 64 KiB
-        // over four 32 KiB slots is, once both ends' buffers are shrunk to
-        // 4 KiB — and it is the *smallest* size that both guarantees a short
-        // write and reserves more than one slot. Size matters here: the
-        // drain below is a live race between this thread's flush loop and a
-        // reader thread, so a payload needing hundreds of round trips makes
-        // the test a function of the host's scheduling rather than of the
-        // code (2 MiB over the same buffers took >20 s and never finished on
-        // a Linux CI guest).
-        const PAYLOAD: usize = 64 * 1024;
+        // bytes, which no socket buffer is small enough to split, so this
+        // test builds its own pool: 1 MiB over four 512 KiB slots reserves
+        // two slots and cannot fit in any plausible socket buffer, shrunk or
+        // not. The drain below is single-threaded and reads only bytes it
+        // already knows were written, so nothing here depends on the host's
+        // scheduling or on what a kernel does with `SO_SNDBUF` — two earlier
+        // shapes did, and disagreed between macOS and a Linux CI guest: a
+        // reader-thread race that never drained 2 MiB, then a 64 KiB payload
+        // that Linux swallowed whole in the first flush.
+        const PAYLOAD: usize = 1024 * 1024;
         let config = ConfigBuilder::new()
             .workers(1)
             .pin_to_core(false)
             .max_connections(16)
-            .send_pool(4, 32 * 1024)
+            .send_pool(4, 512 * 1024)
             .build()
             .expect("valid test config");
         let (mut driver, _wake) = test_driver(&config);
@@ -1193,7 +1193,7 @@ pub(crate) mod tests {
         let reserved_free = driver.send_copy_pool.free_count();
         assert_eq!(
             reserved_free, 2,
-            "64 KiB reserves two of the four 32 KiB slots"
+            "1 MiB reserves two of the four 512 KiB slots"
         );
 
         let (all_flushed, written) = driver
@@ -1201,7 +1201,7 @@ pub(crate) mod tests {
             .expect("a short write is not an error");
         assert!(
             !all_flushed,
-            "4 KiB of socket buffer cannot take a 64 KiB message"
+            "no socket buffer takes a 1 MiB message in one writev"
         );
         assert!(
             (written as usize) < PAYLOAD,
@@ -1227,32 +1227,45 @@ pub(crate) mod tests {
             "no completion before the last byte"
         );
 
-        // Drain the peer so the rest can go out. Read exactly `PAYLOAD`
-        // bytes rather than to EOF: the driver never closes this socket, so
-        // `read_to_end` would block until the client's read timeout, fail,
-        // and take the reader thread with it — leaving the flush loop below
-        // with nobody consuming.
-        let reader = std::thread::spawn(move || {
-            let mut client = client;
-            let mut sink = vec![0u8; PAYLOAD];
-            client.read_exact(&mut sink).expect("read the message");
-            sink.len()
-        });
-
-        // Only back off when a flush made no progress; while the peer is
-        // consuming, keep writing.
+        // Drain and flush alternately on this one thread. Each read asks for
+        // exactly the bytes the driver has already reported writing, so it
+        // can never block on bytes that are not there, and no sleep or
+        // timeout is involved: the loop is bounded by the socket buffer, not
+        // by the clock.
+        let mut client = client;
+        let mut sink: Vec<u8> = Vec::with_capacity(PAYLOAD);
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut written_total = written as usize;
+        let mut drained = 0usize;
         let mut finished = false;
-        for _ in 0..20_000 {
-            let (done, written) = driver.flush_sends(conn_index).expect("flush");
-            if done {
-                finished = true;
+
+        for _ in 0..10_000 {
+            while drained < written_total {
+                let want = (written_total - drained).min(buf.len());
+                client
+                    .read_exact(&mut buf[..want])
+                    .expect("the peer reads bytes the driver already wrote");
+                sink.extend_from_slice(&buf[..want]);
+                drained += want;
+            }
+            if finished {
                 break;
             }
-            if written == 0 {
-                std::thread::sleep(Duration::from_millis(1));
-            }
+            let (done, w) = driver.flush_sends(conn_index).expect("flush");
+            written_total += w as usize;
+            // Drain once more before leaving, so `sink` holds every byte.
+            finished = done;
         }
         assert!(finished, "the message never drained to the peer");
+        assert_eq!(
+            written_total, PAYLOAD,
+            "every byte was written exactly once"
+        );
+        assert_eq!(sink.len(), PAYLOAD, "the peer received the whole message");
+        assert!(
+            sink.iter().all(|&b| b == b'p'),
+            "the peer received the message intact"
+        );
 
         let completions = take_completions(&mut driver);
         assert_eq!(
@@ -1270,7 +1283,6 @@ pub(crate) mod tests {
 
         // Closing the socket ends the reader's `read_to_end`.
         driver.tcp_streams[idx] = None;
-        assert_eq!(reader.join().expect("reader thread"), PAYLOAD);
     }
 
     /// A refused admission reserves nothing, queues nothing, and produces no
