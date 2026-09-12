@@ -74,3 +74,29 @@ Verdict: large, worthwhile only after a workload shows the recv memcpy at
 the top of a profile on >=6.15 kernels with capable NICs. Not this phase.
 Prereq checklist for revisiting: kernel >= 6.15 on the rig, NIC with HDS
 (mlx5/bnxt/ice), a profile showing accumulator append >= ~5% of worker CPU.
+
+## 4. Admission and parking
+
+Copied sends are admitted transactionally. On io_uring `DriverCtx::send`
+reserves every send-pool slot the buffer needs (`SendCopyPool::reserve_slots`
+— a count, not popped slots) before copying the first byte, so a pool `Err`
+from `ConnCtx::send` / `send_nowait` means nothing was queued or transmitted
+and the same buffer may be resent; a buffer wider than the whole pool is
+refused up front with `InvalidInput`. The hole this closes (a retry after a
+mid-buffer refusal duplicated the already-queued prefix) and the design are
+in [copied-send-reservation-design.md](copied-send-reservation-design.md).
+
+A built SQE that cannot be pushed because the SQ is still full after
+`submit()` is parked, never dropped: it stays at the head of its connection's
+send queue with `in_flight = true`, the connection is registered on
+`pending_send_retries`, and the event loop's `drain_send_retries` re-pushes
+the same bytes on the next iteration. After two failed attempts the send
+waiter is failed and the connection closed, exactly as `drain_copy_retries`
+does for a partial-write resubmit, so a starved connection is never left open
+with a hole in its byte stream.
+
+Consequence: on io_uring `DriverCtx::send` fails only before it has committed
+anything (stale token, or pool admission). The one remaining exception is TLS
+pool exhaustion mid-encryption — rustls has advanced its record sequence but
+the pool refused the ciphertext — which series PR 8's pre-mutation bound
+closes.

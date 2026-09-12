@@ -21,6 +21,23 @@ record gap) green on both backends.
 
 ## What happened
 
+- **PR 4 — transactional copied sends.** io_uring `DriverCtx::send` copied
+  a multi-slot buffer chunk by chunk, so pool exhaustion on chunk *k* left
+  chunks 1..k-1 queued behind the `Err` and a retry duplicated them. It now
+  reserves every slot as a count before the first copy (`reserve_slots`, no
+  allocation, departure 3); wider than the pool is `InvalidInput` up front.
+  Designing it found a second hole: a queued send whose SQE could not be
+  pushed (SQ still full after `submit()`) was released with everything
+  queued behind it — no wake, no close, the `SendFuture` hung; the same
+  condition on a first TLS entry returned `Err` after rustls had advanced,
+  and three `let _ =` callers dropped handshake output and close_notify.
+  Fix: park the built SQE at its queue head and re-push it next iteration,
+  with `drain_copy_retries`' two-attempt cap and terminal close; departure 1
+  refined to "nothing re-runs a logical send", not "nothing parks". Lesson:
+  the io_uring lib build flagged `remaining`/`slot_count`/
+  `force_push_failures` as dead until they had non-test callers, invisible
+  on the mio host where `buffer` is `allow(dead_code)`. Design:
+  `docs/copied-send-reservation-design.md`.
 - **Prerequisite — #368, mio close lifecycle.** PR 1's adversarial review
   found that mio never tore down a peer-first-closed or read-errored
   connection (`Closed` set directly at the read sites; `close_connection`
