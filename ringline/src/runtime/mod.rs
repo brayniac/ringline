@@ -24,6 +24,7 @@ pub(crate) mod handler;
 pub(crate) mod io;
 pub(crate) mod join;
 pub(crate) mod select;
+pub(crate) mod send_capacity;
 pub(crate) mod stream;
 pub(crate) mod task;
 pub(crate) mod waker;
@@ -459,6 +460,11 @@ pub(crate) struct Executor {
     pub(crate) recv_errors: Vec<Option<(u32, stdio::Error)>>,
     /// Per-connection: task is awaiting send completion.
     pub(crate) send_waiters: Vec<bool>,
+    /// Worker-wide FIFO for bounded sends: who may reserve copy-pool slots
+    /// next, and the result of each admitted operation. Driven through the
+    /// wrappers in [`send_capacity`]; `remove_connection` resolves the
+    /// entries of a torn-down connection.
+    pub(crate) send_capacity: send_capacity::SendCapacityQueue,
     /// Per-connection: task is awaiting connect result.
     pub(crate) connect_waiters: Vec<bool>,
     /// Per-connection: CQE result storage for send/connect.
@@ -562,6 +568,7 @@ impl Executor {
                 v
             },
             send_waiters: vec![false; cap],
+            send_capacity: send_capacity::SendCapacityQueue::new(),
             connect_waiters: vec![false; cap],
             io_results: {
                 let mut v = Vec::with_capacity(cap);
@@ -625,6 +632,15 @@ impl Executor {
             self.recv_sinks[idx] = None;
         }
         self.task_slab.remove(conn_index);
+        // Bounded sends waiting on or in flight for this connection resolve
+        // to ConnectionAborted; wake their owners (standalone or cross-index
+        // tasks that outlive the connection) and the FIFO's new head. Runs
+        // after `task_slab.remove` on purpose: the connection's own task is
+        // already gone, and the queue drops its entries rather than parking
+        // results nobody can take.
+        for task_id in self.send_capacity.remove_connection(conn_index) {
+            let _ = self.wake_task(task_id);
+        }
         if idx < self.recv_waiters.len() {
             // If a *standalone* task was awaiting recv/send/connect on this
             // connection, it isn't removed by `task_slab.remove`. Push it
@@ -1102,6 +1118,116 @@ mod tests {
         assert!(exec.wake_task(task_id));
         assert_eq!(exec.ready_queue.len(), 1);
         assert_eq!(exec.ready_queue[0], task_id);
+    }
+
+    /// Spawn and park a standalone task; returns its full task id.
+    fn parked_standalone(exec: &mut Executor) -> u32 {
+        let idx = exec
+            .standalone_slab
+            .spawn(Box::pin(std::future::pending::<()>()))
+            .unwrap();
+        let fut = exec.standalone_slab.take_ready(idx).unwrap();
+        exec.standalone_slab.park(idx, fut);
+        idx | waker::STANDALONE_BIT
+    }
+
+    #[test]
+    fn remove_connection_wakes_bounded_send_owner_on_a_standalone_task() {
+        // A standalone task owns an in-flight bounded send on connection 3.
+        // Tearing down 3 must resolve the send and wake the task, which
+        // outlives the connection.
+        let mut exec = Executor::new(8, 8, 8, 0, 0);
+        let task_id = parked_standalone(&mut exec);
+        let id = exec.enqueue_send_capacity(3, 1, 1, task_id);
+        exec.mark_bounded_send_submitted(id);
+        assert!(exec.ready_queue.is_empty());
+
+        exec.remove_connection(3);
+
+        assert_eq!(exec.ready_queue.len(), 1);
+        assert_eq!(exec.ready_queue[0], task_id);
+        assert!(
+            exec.standalone_slab
+                .take_ready(task_id & !waker::STANDALONE_BIT)
+                .is_some(),
+            "owner must be Ready after teardown"
+        );
+        let err = exec
+            .take_bounded_send_result(id)
+            .expect("result recorded")
+            .expect_err("teardown fails the send");
+        assert_eq!(err.kind(), stdio::ErrorKind::ConnectionAborted);
+    }
+
+    #[test]
+    fn complete_bounded_send_wakes_the_refreshed_owner() {
+        // The future was enqueued from task A and later polled from task B
+        // (owner refreshed each poll). The completion must wake B, not A.
+        let mut exec = Executor::new(8, 8, 8, 0, 0);
+        let a = parked_standalone(&mut exec);
+        let b = parked_standalone(&mut exec);
+        let id = exec.enqueue_send_capacity(2, 1, 1, a);
+        exec.mark_bounded_send_submitted(id);
+        exec.set_bounded_send_owner(id, b);
+
+        exec.complete_bounded_send(id, Ok(7));
+
+        assert_eq!(exec.ready_queue.len(), 1);
+        assert_eq!(exec.ready_queue[0], b);
+        assert!(
+            exec.standalone_slab
+                .take_ready(b & !waker::STANDALONE_BIT)
+                .is_some(),
+            "refreshed owner is Ready"
+        );
+        assert!(
+            exec.standalone_slab
+                .take_ready(a & !waker::STANDALONE_BIT)
+                .is_none(),
+            "original owner stays parked"
+        );
+        assert_eq!(exec.take_bounded_send_result(id).unwrap().unwrap(), 7);
+    }
+
+    #[test]
+    fn send_capacity_wrappers_wake_through_wake_task() {
+        // The remaining wrappers: a slot release wakes the head only once it
+        // fits, a cancelled head promotes the next waiter, and a write
+        // shutdown fails the waiters of that connection generation.
+        let mut exec = Executor::new(8, 8, 8, 0, 0);
+        let a = parked_standalone(&mut exec);
+        let b = parked_standalone(&mut exec);
+        let c = parked_standalone(&mut exec);
+        let head = exec.enqueue_send_capacity(2, 1, 4, a);
+        let next = exec.enqueue_send_capacity(5, 1, 1, b);
+        let last = exec.enqueue_send_capacity(5, 1, 1, c);
+
+        assert!(!exec.send_capacity_turn(head, 3));
+        exec.wake_send_capacity(3);
+        assert!(exec.ready_queue.is_empty(), "head still cannot fit");
+        assert!(exec.send_capacity_turn(head, 4));
+        exec.wake_send_capacity(4);
+        assert_eq!(exec.ready_queue.pop_front(), Some(a));
+
+        exec.cancel_bounded_send(head);
+        assert_eq!(exec.ready_queue.pop_front(), Some(b), "next head woken");
+        assert!(exec.send_capacity_turn(next, 1));
+
+        exec.fail_waiting_bounded_sends(5, 1, stdio::ErrorKind::BrokenPipe, "shut down");
+        assert_eq!(
+            exec.ready_queue.pop_front(),
+            Some(c),
+            "c was still parked; b was already Ready so it is not re-queued"
+        );
+        assert!(exec.ready_queue.is_empty());
+        for id in [next, last] {
+            let err = exec
+                .take_bounded_send_result(id)
+                .expect("failed waiter has a result")
+                .expect_err("failed");
+            assert_eq!(err.kind(), stdio::ErrorKind::BrokenPipe);
+        }
+        assert!(!exec.send_capacity_turn(next, 8));
     }
 
     #[test]
