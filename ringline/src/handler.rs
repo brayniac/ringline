@@ -159,9 +159,6 @@ pub struct DriverCtx<'a> {
     /// Whether SO_TIMESTAMPING is enabled.
     #[cfg(feature = "timestamps")]
     pub(crate) timestamps: bool,
-    /// Pointer to the per-worker RecvMsgMulti msghdr template.
-    #[cfg(feature = "timestamps")]
-    pub(crate) recvmsg_msghdr: *const libc::msghdr,
     /// Pre-allocated timespec storage for connect timeouts (io_uring only).
     #[cfg(has_io_uring)]
     pub(crate) connect_timespecs: &'a mut Vec<io_uring::types::Timespec>,
@@ -1956,8 +1953,6 @@ pub struct DriverCtx<'a> {
     pub(crate) tcp_nodelay: bool,
     #[cfg(feature = "timestamps")]
     pub(crate) timestamps: bool,
-    #[cfg(feature = "timestamps")]
-    pub(crate) recvmsg_msghdr: *const libc::msghdr,
     pub(crate) send_queues: &'a mut Vec<ConnSendState>,
     /// Per-connection pending send buffers (mio backend).
     /// DriverCtx::send() pushes data here; the event loop flushes on writable.

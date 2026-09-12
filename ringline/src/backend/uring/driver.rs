@@ -801,8 +801,6 @@ impl Driver {
             send_zc_threshold: self.send_zc_threshold,
             #[cfg(feature = "timestamps")]
             timestamps: self.timestamps,
-            #[cfg(feature = "timestamps")]
-            recvmsg_msghdr: &*self.recvmsg_msghdr as *const libc::msghdr,
             connect_timespecs: &mut self.connect_timespecs,
             chain_table: &mut self.chain_table,
             max_chain_length: self.max_chain_length,

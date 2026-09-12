@@ -1605,10 +1605,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
         // Extract SCM_TIMESTAMPING from control data.
         let control = msg_out.control_data();
-        if let Some(ts_ns) = Self::parse_scm_timestamp(control) {
-            if let Some(cs) = self.driver.connections.get_mut(conn_index) {
-                cs.recv_timestamp_ns = ts_ns;
-            }
+        if let Some(ts_ns) = Self::parse_scm_timestamp(control)
+            && let Some(cs) = self.driver.connections.get_mut(conn_index)
+        {
+            cs.recv_timestamp_ns = ts_ns;
         }
 
         // Route payload through accumulator (same as plaintext RecvMulti path).
