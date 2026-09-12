@@ -12,21 +12,45 @@ machine and simpler than the io_uring CQE paths (PR 7).
 mio sends are `Vec`-backed: `DriverCtx::send` copies into a `Vec<u8>` and
 queues it on `pending_sends[idx]`; `flush_sends` writes with `writev` when
 the socket is writable. There is no per-connection SQE queue and no pool
-slot per send. The copied-send pool exists on mio (UDP uses it) but plain
-TCP sends never touch it.
+slot per send. In fact **`SendCopyPool` is never used at all on mio**: the
+driver allocates one per worker and hands it to `DriverCtx`, but every
+caller (`SendBuilder`, `SendChainBuilder`, the UDP send paths) is
+`#[cfg(has_io_uring)]` and nothing under `backend/mio/` touches it.
 
-For `send_backpressured` the pool is the *admission budget*, not the data
-path: a bounded send reserves `ceil(len / slot_size)` slots with PR 4's
-`reserve_slots` and holds that reservation as a permit until its last byte
-reaches the socket, then releases it. Data still goes through a `Vec` (one
-copy, like every mio send). This gives `send_backpressured` the same
-backpressure semantics on both backends — at most `send_pool` slots' worth
-of bounded bytes outstanding per worker — without a second copy into pool
-memory that `writev` would then have to gather from.
+For `send_backpressured` the pool is therefore the *admission budget* and
+nothing else: a bounded send reserves `ceil(len / slot_size)` slots with
+PR 4's `reserve_slots` and holds that reservation as an unfilled permit
+until its last byte reaches the socket, then releases it. The data still
+goes through a `Vec` (one copy, like every mio send); no byte is ever
+written into pool memory on this backend.
 
 The permit is the `SlotReservation` itself, kept unfilled. Its `Drop`
 debug-assert guarantees a permit is never silently dropped: every path that
 discards a `PendingSend` must release it explicitly.
+
+**Decision (owner, 2026-09-12): gate mio admission on the pool, accepting
+that the counter maps to no real mio resource.** The point of
+`send_backpressured` is a single documented rule — "waits until one whole
+message can be admitted" — and the same knob (`Config::send_pool`) tuning
+it on both backends. Two alternatives were considered and rejected:
+
+- *Cap bounded bytes queued in `pending_sends`* (sized from
+  `send_pool_count * slot_size`). This tracks what mio actually consumes,
+  heap plus socket backlog, but introduces a second admission mechanism and
+  two rounding rules — io_uring admits in whole slots, this would admit in
+  bytes — so the same call could be admitted on one backend and parked on
+  the other at the same occupancy.
+- *No admission cap on mio at all*, resolving only when the bytes reach the
+  socket. Simplest and honest about the absent pool, but it makes the API's
+  backpressure guarantee backend-dependent and lets a fast producer grow
+  `pending_sends` without bound — precisely the hazard the API exists to
+  prevent.
+
+The cost of the chosen option is that on mio `send_pool` becomes a knob
+whose *memory* is unused while its *count* throttles bounded sends. PR 9's
+documentation must say so plainly, and the mio-side allocation being dead
+weight is worth a separate follow-up (it is pre-existing, not introduced
+here).
 
 ## Changes
 
