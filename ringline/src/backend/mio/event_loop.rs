@@ -1281,3 +1281,236 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         executor.collect_wakeups();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Event-loop tests for the bounded-send path.
+    //!
+    //! The other six bounded-send tests are driver-level and live in
+    //! `backend/mio/driver.rs`. These two need an `Executor` as well —
+    //! one pins the order in which a completion and a teardown reach it,
+    //! the other the capacity wake the loop issues once per iteration — so
+    //! they build a whole `AsyncEventLoop` and call the run-loop steps
+    //! directly. The connection scaffolding (`attach_conn`, `token`) is
+    //! shared with the driver tests.
+
+    use super::*;
+    use crate::backend::mio::driver::tests::{attach_conn, token};
+    use crate::config::ConfigBuilder;
+    use crate::runtime::io::ConnCtx;
+    use std::future::Future;
+    use std::io::Read;
+
+    /// A handler that does nothing: these tests never accept a connection
+    /// through the loop, they attach one directly.
+    struct NoopHandler;
+
+    impl AsyncEventHandler for NoopHandler {
+        #[allow(clippy::manual_async_fn)]
+        fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+            async move {}
+        }
+
+        fn create_for_worker(_worker_id: usize) -> Self {
+            NoopHandler
+        }
+    }
+
+    /// Single-worker config with the driver tests' tiny 4 x 64-byte send
+    /// pool, and no filesystem subsystem so no disk-I/O threads start.
+    fn test_config() -> Config {
+        ConfigBuilder::new()
+            .workers(1)
+            .pin_to_core(false)
+            .max_connections(16)
+            .send_pool(4, 64)
+            .no_fs()
+            .build()
+            .expect("valid test config")
+    }
+
+    /// Build an event loop with no acceptor and no optional subsystems.
+    ///
+    /// `prepare_run` is deliberately not called (it only registers the wake
+    /// pipe, which nothing here polls). As in `driver::tests::test_driver`,
+    /// the returned `WakeHandle` must stay bound for the loop's lifetime.
+    fn test_loop(config: &Config) -> (AsyncEventLoop<NoopHandler>, crate::wakeup::WakeHandle) {
+        let (read_fd, handle) = crate::wakeup::create_wake_fd().expect("wake fd");
+        let event_loop = AsyncEventLoop::new(
+            config,
+            NoopHandler,
+            None,
+            read_fd,
+            handle.as_wake_fd(),
+            Arc::new(AtomicBool::new(false)),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("build mio event loop");
+        (event_loop, handle)
+    }
+
+    /// A parked standalone task, so that waking it is observable (a task
+    /// that is already Ready is not re-queued).
+    fn parked_standalone(executor: &mut Executor) -> u32 {
+        let idx = executor
+            .standalone_slab
+            .spawn(Box::pin(std::future::pending::<()>()))
+            .expect("free standalone slot");
+        park(executor, idx | STANDALONE_BIT);
+        idx | STANDALONE_BIT
+    }
+
+    /// Return a Ready standalone task to Parked.
+    fn park(executor: &mut Executor, task_id: u32) {
+        let idx = task_id & !STANDALONE_BIT;
+        let future = executor
+            .standalone_slab
+            .take_ready(idx)
+            .expect("task is Ready");
+        executor.standalone_slab.park(idx, future);
+    }
+
+    /// Departure 4 of the series design: with the loop's order — flush,
+    /// deliver completions, finalize closes — a bounded send whose bytes
+    /// reached the socket resolves `Ok`, even though the connection is torn
+    /// down in the same iteration.
+    #[test]
+    fn bounded_completion_is_delivered_before_teardown() {
+        let config = test_config();
+        let (mut event_loop, _wake) = test_loop(&config);
+        let (conn_index, mut client) = attach_conn(&mut event_loop.driver);
+        let conn = token(&event_loop.driver, conn_index);
+
+        // The submitting future is on a standalone task: one owned by the
+        // connection's own task is dropped by teardown before it could ever
+        // read a result (`SendCapacityQueue::remove_connection`).
+        let task_id = parked_standalone(&mut event_loop.executor);
+        let payload = vec![b'z'; 200];
+        let id = event_loop
+            .executor
+            .enqueue_send_capacity(conn_index, conn.generation, 4, task_id);
+        event_loop
+            .driver
+            .make_ctx()
+            .send_bounded(conn, &payload, id)
+            .expect("admitted");
+        event_loop.executor.mark_bounded_send_submitted(id);
+
+        // Close requested while the send is still queued.
+        event_loop.driver.close_connection(conn_index);
+
+        // One iteration's tail, in the run loop's order (steps 6a and 6b).
+        event_loop.flush_all_pending_sends();
+        event_loop.drain_send_completions();
+        event_loop.drain_pending_closes();
+
+        let result = event_loop
+            .executor
+            .take_bounded_send_result(id)
+            .expect("the operation resolved");
+        assert_eq!(
+            result.expect("the bytes reached the socket, so this is not ConnectionAborted"),
+            200,
+            "a real completion must beat the teardown's synthetic abort"
+        );
+        assert!(
+            event_loop.driver.tcp_streams[conn_index as usize].is_none(),
+            "the teardown did run in the same iteration"
+        );
+        assert_eq!(
+            event_loop.driver.send_copy_pool.free_count(),
+            4,
+            "the permit came back with the completion"
+        );
+
+        let mut buf = vec![0u8; 200];
+        client
+            .read_exact(&mut buf)
+            .expect("the peer got the whole message");
+    }
+
+    /// Permits returning during an iteration wake the capacity head exactly
+    /// once, at the end of the iteration — not once per released permit.
+    #[test]
+    fn capacity_head_is_woken_once_per_iteration_when_permits_return() {
+        let config = test_config();
+        let (mut event_loop, _wake) = test_loop(&config);
+        let (conn_index, _client) = attach_conn(&mut event_loop.driver);
+        let conn = token(&event_loop.driver, conn_index);
+
+        // A waiter for three slots sits at the head of the FIFO. Two
+        // one-slot sends are in flight behind it, so only two slots are
+        // free: the head cannot be admitted until they complete.
+        let head_task = parked_standalone(&mut event_loop.executor);
+        let head =
+            event_loop
+                .executor
+                .enqueue_send_capacity(conn_index, conn.generation, 3, head_task);
+        for _ in 0..2 {
+            let task = parked_standalone(&mut event_loop.executor);
+            let id =
+                event_loop
+                    .executor
+                    .enqueue_send_capacity(conn_index, conn.generation, 1, task);
+            event_loop
+                .driver
+                .make_ctx()
+                .send_bounded(conn, b"sixty-odd bytes is one slot", id)
+                .expect("admitted");
+            event_loop.executor.mark_bounded_send_submitted(id);
+        }
+        assert_eq!(event_loop.driver.send_copy_pool.free_count(), 2);
+        assert!(
+            !event_loop.executor.send_capacity_turn(head, 2),
+            "the head needs three slots"
+        );
+        assert!(event_loop.executor.ready_queue.is_empty());
+
+        // Both sends reach the socket in one flush: two permits come back.
+        event_loop.flush_all_pending_sends();
+        assert_eq!(event_loop.driver.send_copy_pool.free_count(), 4);
+        assert!(
+            event_loop.driver.capacity_released,
+            "the driver records the release instead of waking"
+        );
+        assert!(
+            event_loop.executor.ready_queue.is_empty(),
+            "the driver must not touch the executor itself"
+        );
+
+        event_loop.wake_capacity_if_released();
+
+        assert_eq!(
+            event_loop.executor.ready_queue.len(),
+            1,
+            "two released permits, one wake"
+        );
+        assert_eq!(event_loop.executor.ready_queue[0], head_task);
+        assert!(
+            event_loop.executor.send_capacity_turn(head, 4),
+            "the head can now be admitted"
+        );
+        assert!(
+            !event_loop.driver.capacity_released,
+            "the flag is consumed by the wake"
+        );
+
+        // Nothing was released since, so a further call wakes nobody —
+        // re-park the head first, so a second wake would be visible.
+        park(&mut event_loop.executor, head_task);
+        event_loop.executor.ready_queue.clear();
+        event_loop.wake_capacity_if_released();
+        assert!(
+            event_loop.executor.ready_queue.is_empty(),
+            "the head is woken once per iteration, not once per call"
+        );
+    }
+}
