@@ -34,6 +34,11 @@ pub struct Ring {
     /// set, the kernel runs task_work — and so posts the CQEs it generates —
     /// only on an `io_uring_enter` carrying `IORING_ENTER_GETEVENTS`.
     defer_taskrun: bool,
+    /// Test-only: number of upcoming `push_sqe`/`push_sqe128` calls that
+    /// fail as if the SQ were still full after a submit. See
+    /// [`Ring::force_push_failures`].
+    #[cfg(test)]
+    forced_push_failures: usize,
 }
 
 impl Ring {
@@ -72,6 +77,8 @@ impl Ring {
             bgid: config.recv_buffer.bgid,
             chain_scratch: Vec::new(),
             defer_taskrun: !config.sqpoll,
+            #[cfg(test)]
+            forced_push_failures: 0,
         })
     }
 
@@ -882,6 +889,13 @@ impl Ring {
     /// # Safety
     /// The SQE must reference valid memory for the lifetime of the operation.
     pub(crate) unsafe fn push_sqe128(&mut self, entry: squeue::Entry128) -> io::Result<()> {
+        #[cfg(test)]
+        if self.forced_push_failures > 0 {
+            self.forced_push_failures -= 1;
+            crate::metrics::RING.increment(crate::metrics::ring::SQE_SUBMIT_FAILURES);
+            return Err(io::Error::other("forced SQ push failure"));
+        }
+
         // Try to push; if SQ is full, submit first to make room.
         unsafe {
             if self.ring.submission().push(&entry).is_err() {
@@ -893,6 +907,20 @@ impl Ring {
             }
         }
         Ok(())
+    }
+
+    /// Test-only: make the next `count` `push_sqe`/`push_sqe128` calls fail.
+    ///
+    /// Each forced failure returns an error of the same kind (`Other`) as
+    /// the real "SQ still full after submit" path, increments the same
+    /// `SQE_SUBMIT_FAILURES` metric, and consumes one unit of `count`
+    /// before the real submission queue is touched. `push_sqe` routes
+    /// through `push_sqe128`, so every `submit_*` helper is covered.
+    /// `push_sqe_chain`'s multi-entry path (`push_multiple`) is not
+    /// affected.
+    #[cfg(test)]
+    pub(crate) fn force_push_failures(&mut self, count: usize) {
+        self.forced_push_failures = count;
     }
 
     /// Push a chain of linked SQEs atomically.
