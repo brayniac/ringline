@@ -1179,7 +1179,10 @@ impl ConnCtx {
     ///
     /// # Errors
     ///
-    /// Returns `Err` if the send copy pool is exhausted or the submission queue is full.
+    /// Returns `Err` if the send copy pool cannot admit the whole buffer
+    /// (`Other`, retryable once in-flight sends complete), if the buffer is
+    /// wider than the entire pool (`InvalidInput`), or if the submission
+    /// queue is full. On a pool error nothing was queued or transmitted.
     ///
     /// For backpressure-aware sending, use [`send()`](Self::send) instead.
     pub fn send_nowait(&self, data: &[u8]) -> io::Result<()> {
@@ -1473,7 +1476,10 @@ impl ConnCtx {
     ///
     /// # Errors
     ///
-    /// Returns `Err` if the send copy pool is exhausted or the submission queue is full.
+    /// Returns `Err` if the send copy pool cannot admit the whole buffer
+    /// (`Other`, retryable once in-flight sends complete), if the buffer is
+    /// wider than the entire pool (`InvalidInput`), or if the submission
+    /// queue is full. On a pool error nothing was queued or transmitted.
     pub fn send(&self, data: &[u8]) -> io::Result<SendFuture> {
         with_state(|driver, executor| {
             let mut ctx = driver.make_ctx();

@@ -236,11 +236,11 @@ impl<'a> DriverCtx<'a> {
 
     /// Regular (copying) send — copies data into library-owned pool before SQE submission.
     ///
-    /// Data larger than one send-pool slot is queued as multiple chunks. If
-    /// a chunk fails mid-loop (pool exhausted), the chunks queued before it
-    /// are already committed to the wire and `Err` is returned — retrying
-    /// the whole buffer would duplicate that prefix. Treat a mid-buffer
-    /// error as fatal for the connection (close it) rather than retrying.
+    /// Data larger than one send-pool slot is split across slots and queued
+    /// in order. Admission is transactional: every slot is reserved before
+    /// the first byte is copied, so on `Err` nothing has been queued or
+    /// transmitted and the same buffer may be sent again later. A send wider
+    /// than the whole pool is refused with `InvalidInput`.
     pub fn send(&mut self, conn: ConnToken, data: &[u8]) -> io::Result<()> {
         let conn_state = self
             .connections
@@ -273,18 +273,47 @@ impl<'a> DriverCtx<'a> {
 
         let slot_size = self.send_copy_pool.slot_size() as usize;
 
+        // Reserve every slot the buffer needs before copying the first byte.
+        // Without this, pool exhaustion on chunk k left chunks 1..k-1 queued
+        // (or on the wire) behind an `Err`, and a retry duplicated the prefix.
+        // The reservation is a count, not popped slots, so a refusal has no
+        // side effects (see `SendCopyPool::reserve_slots`).
+        let needed = data.len().div_ceil(slot_size);
+        let mut reservation = match self.send_copy_pool.reserve_slots(needed) {
+            Ok(r) => r,
+            Err(crate::buffer::send_copy::ReserveError::Exhausted) => {
+                return Err(io::Error::other("send copy pool exhausted"));
+            }
+            Err(crate::buffer::send_copy::ReserveError::TooLarge { needed, capacity }) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "send of {} bytes needs {needed} send-pool slots but the pool has \
+                         {capacity} (raise Config::send_pool)",
+                        data.len()
+                    ),
+                ));
+            }
+        };
+
         // Chunk data that exceeds the send copy slot size. Each chunk gets its
         // own pool slot and SQE; the per-connection send queue ensures they are
         // transmitted in order. Only the final chunk is marked end-of-send, so
         // the waiter is woken once for the whole logical send rather than once
         // per chunk (which would report a short count and, for pipelined sends,
         // wake the wrong future).
+        //
+        // `submit_or_queue` pushes to the ring only while nothing is in flight,
+        // i.e. only for the first chunk; once that is accepted every later
+        // chunk is queued, which cannot fail. So the only failure after the
+        // reservation is a full SQ on the first chunk, and `submit_or_queue`
+        // releases that chunk's slot before returning — nothing has been
+        // queued or transmitted, and the unfilled remainder goes back here.
         let mut chunks = data.chunks(slot_size).peekable();
         while let Some(chunk) = chunks.next() {
             let (slot, ptr, len) = self
                 .send_copy_pool
-                .copy_in(chunk)
-                .ok_or_else(|| io::Error::other("send copy pool exhausted"))?;
+                .copy_in_reserved(&mut reservation, chunk);
             self.send_copy_pool
                 .set_end_of_send(slot, chunks.peek().is_none());
 
@@ -305,9 +334,14 @@ impl<'a> DriverCtx<'a> {
                 total_len: chunk.len() as u32,
             };
 
-            self.submit_or_queue(conn.index, built)?;
+            if let Err(e) = self.submit_or_queue(conn.index, built) {
+                self.send_copy_pool.release_reservation(reservation);
+                return Err(e);
+            }
         }
 
+        // Every promised slot was filled; this returns a zero remainder.
+        self.send_copy_pool.release_reservation(reservation);
         Ok(())
     }
 
