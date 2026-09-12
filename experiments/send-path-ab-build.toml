@@ -1,0 +1,55 @@
+# Build the bench binaries once (delta, validation host), upload them as one
+# artifact, and let every measurement arm take them as an input. Four server
+# binaries (before/after x io_uring/mio) and one client binary (before, io_uring:
+# the load generator is held constant so only the server under test varies).
+# No target-cpu=native: delta is Zen4, the hypervisors are Zen2/Zen1.
+name = "ringline send-path A/B build (before={before_ref} after={after_ref})"
+
+[params]
+before_ref  = "c419d05"
+before_repo = "https://github.com/ringline-rs/ringline"
+after_ref   = "main"
+after_repo  = "https://github.com/ringline-rs/ringline"
+
+[[jobs]]
+name = "build"
+tags = ["validation"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+shape = "z4.c"
+image = "spool/images/debian-13-ci-20260912.1@golden"
+slots = 1
+memory_gib = 4
+ports = 0
+gpu = false
+payload_timeout = 3600
+artifacts = ["/home/anvil/bench-bins.tgz", "/home/anvil/build.log"]
+upload = true
+payload = '''
+set -uo pipefail
+cd /home/anvil
+{
+  cat /etc/anvil-instance.json
+  mkdir -p out
+  git clone -q {before_repo} before-src && git -C before-src checkout -q {before_ref}
+  git clone -q {after_repo} after-src && git -C after-src checkout -q {after_ref}
+  for src in before-src after-src; do
+    label=${src%-src}
+    ( cd $src
+      echo "== $label: $(git log --oneline -1)"
+      cargo build --release -p ringline-bench --bin bench-server --bin bench-client
+      cp target/release/bench-server ../out/bench-server-$label-uring
+      cp target/release/bench-client ../out/bench-client-$label-uring
+      cargo build --release -p ringline-bench --features ringline/force-mio --bin bench-server
+      cp target/release/bench-server ../out/bench-server-$label-mio
+      ( cd .. && ./out/bench-server-$label-mio --help >/dev/null )
+    ) || exit 1
+  done
+  ( cd out && sha256sum * )
+  tar czf bench-bins.tgz out
+} 2>&1 | tee /home/anvil/build.log
+rc=${PIPESTATUS[0]}
+echo "build_status=$rc" | tee -a /home/anvil/build.log
+exit 0
+'''

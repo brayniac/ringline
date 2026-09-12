@@ -1,0 +1,144 @@
+# Two guests on the X710 LAG: ringline bench-server on hv02 (z1, 24 vCPU),
+# ringline bench-client on hv01 (z2, 56 vCPU) so the load generator is never
+# the bottleneck. Binaries come from the send-path-ab-build job as one
+# artifact. rezolus records the server unit's whole life and the client's
+# measurement exec only. One arm per experiment; submit arms interleaved
+# (A B A B ...) with at least three of each and discard the first run.
+# arm is one of before-uring, after-uring, before-mio, after-mio.
+name = "ringline send-path A/B {arm} rep{rep}"
+
+[params]
+bins_artifact  = "REPLACE-WITH-ARTIFACT-ID"
+arm            = "before-uring"
+rep            = "1"
+image          = "spool/images/debian-13-base-20260912.1@golden"
+server_ip      = "172.31.0.1"
+client_ip      = "172.31.0.2"
+port           = "7878"
+server_workers = "8"
+client_bin     = "bench-client-before-uring"
+client_threads = "8"
+clients        = "64"
+warmup         = "5"
+duration       = "20"
+msg_sizes      = "256 65536"
+
+# ── server: hv02 ───────────────────────────────────────────────────────────
+
+[[jobs]]
+name = "server"
+tags = ["z1.baremetal"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "start"
+shape = "z1.c"
+image = "{image}"
+gpu = false
+data_address = "{server_ip}/24"
+boot_timeout = 600
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "exec"
+inputs = [{ artifact = "{bins_artifact}", name = "bench-bins.tgz", dest = "/home/anvil" }]
+payload = '''
+set -uo pipefail
+cd /home/anvil && tar xzf bench-bins.tgz && chmod +x out/*
+cat /etc/anvil-instance.json
+sudo sysctl -w net.core.somaxconn=65535 net.ipv4.tcp_max_syn_backlog=65535 net.core.rmem_max=134217728 net.core.wmem_max=134217728
+ip -4 -brief addr show
+ls -l out/bench-server-{arm}
+'''
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "exec"
+detach = true
+unit = "ringline-server"
+metrics = true
+payload = "exec /home/anvil/out/bench-server-{arm} --runtime ringline --addr {server_ip}:{port} --workers {server_workers}"
+
+[[jobs.steps]]
+type = "barrier"
+name = "server-ready"
+timeout = 1800
+
+[[jobs.steps]]
+type = "barrier"
+name = "bench-done"
+timeout = 3600
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "stop"
+upload = true
+
+# ── client: hv01 ───────────────────────────────────────────────────────────
+
+[[jobs]]
+name = "client"
+tags = ["z2.baremetal"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "start"
+shape = "z2.c"
+image = "{image}"
+gpu = false
+data_address = "{client_ip}/24"
+boot_timeout = 600
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "exec"
+inputs = [{ artifact = "{bins_artifact}", name = "bench-bins.tgz", dest = "/home/anvil" }]
+payload = '''
+set -uo pipefail
+cd /home/anvil && tar xzf bench-bins.tgz && chmod +x out/*
+cat /etc/anvil-instance.json
+sudo sysctl -w net.core.rmem_max=134217728 net.core.wmem_max=134217728 net.ipv4.ip_local_port_range="1024 65535"
+ip -4 -brief addr show
+ping -c 2 -W 2 {server_ip} || echo "WARN: server address not reachable yet"
+'''
+
+[[jobs.steps]]
+type = "barrier"
+name = "server-ready"
+timeout = 1800
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "exec"
+metrics = true
+upload = true
+artifacts = ["/home/anvil/results.tgz"]
+payload = '''
+set -uo pipefail
+cd /home/anvil
+mkdir -p results
+echo "arm={arm} rep={rep}" | tee results/arm.txt
+for i in $(seq 1 120); do
+  (exec 3<>/dev/tcp/{server_ip}/{port}) 2>/dev/null && { exec 3>&-; echo "server reachable after ${i}s"; break; }
+  sleep 1
+done
+for size in {msg_sizes}; do
+  ulimit -n 500000
+  ./out/{client_bin} --runtime ringline --addr {server_ip}:{port} --clients {clients} \
+    --msg-size $size --warmup {warmup} --duration {duration} --threads {client_threads} \
+    > results/results-$size.json 2> results/client-$size.log
+  echo "== msg_size=$size"; cat results/results-$size.json; echo
+  sleep 3
+done
+tar czf /home/anvil/results.tgz -C /home/anvil results
+exit 0
+'''
+
+[[jobs.steps]]
+type = "barrier"
+name = "bench-done"
+timeout = 3600
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "stop"
