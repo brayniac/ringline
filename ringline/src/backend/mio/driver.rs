@@ -1221,22 +1221,32 @@ pub(crate) mod tests {
             "no completion before the last byte"
         );
 
-        // Drain the peer so the rest can go out.
+        // Drain the peer so the rest can go out. Read exactly `PAYLOAD`
+        // bytes rather than to EOF: the driver never closes this socket, so
+        // `read_to_end` would block until the client's read timeout, fail,
+        // and take the reader thread with it — leaving the flush loop below
+        // with nobody consuming.
         let reader = std::thread::spawn(move || {
             let mut client = client;
-            let mut sink = Vec::new();
-            client.read_to_end(&mut sink).expect("read the message");
+            let mut sink = vec![0u8; PAYLOAD];
+            client.read_exact(&mut sink).expect("read the message");
             sink.len()
         });
 
+        // Only back off when a flush made no progress; while the peer is
+        // consuming, keep writing. 2 MiB through a 4 KiB socket buffer is
+        // hundreds of round trips and a fixed per-iteration sleep makes the
+        // budget depend on the host's scheduling.
         let mut finished = false;
-        for _ in 0..2000 {
-            let (done, _) = driver.flush_sends(conn_index).expect("flush");
+        for _ in 0..20_000 {
+            let (done, written) = driver.flush_sends(conn_index).expect("flush");
             if done {
                 finished = true;
                 break;
             }
-            std::thread::sleep(Duration::from_millis(1));
+            if written == 0 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
         }
         assert!(finished, "the message never drained to the peer");
 

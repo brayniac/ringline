@@ -1762,6 +1762,13 @@ mod tests {
             write_err.raw_os_error().is_some(),
             "the fan-out has an errno to preserve: {write_err:?}"
         );
+        // Which errno the probe saw is not the property under test and is not
+        // stable across platforms: Linux reports ECONNRESET for the first
+        // write after the reset and EPIPE for every later one, macOS reports
+        // ECONNRESET throughout. What must hold is that whatever the *failing
+        // flush* returned reaches every queued id verbatim, rather than the
+        // synthetic `ConnectionAborted` that teardown would otherwise supply
+        // (that one carries no errno, which is what distinguishes it).
 
         // Two bounded sends queued against the dead socket.
         let mut ids = Vec::new();
@@ -1798,18 +1805,26 @@ mod tests {
         );
 
         event_loop.drain_send_completions();
+        let mut seen: Option<(Option<i32>, io::ErrorKind)> = None;
         for id in ids {
             let err = event_loop
                 .executor
                 .take_bounded_send_result(id)
                 .unwrap_or_else(|| panic!("{id:?} was never told"))
                 .expect_err("the write failed");
-            assert_eq!(
-                err.raw_os_error(),
-                write_err.raw_os_error(),
-                "{id:?} must see the real errno, not a synthetic one"
+            assert!(
+                err.raw_os_error().is_some(),
+                "{id:?} got a synthetic error, not the real write failure: {err:?}"
             );
-            assert_eq!(err.kind(), write_err.kind(), "wrong kind for {id:?}");
+            // Every id was failed by one write, so they must agree.
+            match seen {
+                None => seen = Some((err.raw_os_error(), err.kind())),
+                Some(first) => assert_eq!(
+                    (err.raw_os_error(), err.kind()),
+                    first,
+                    "{id:?} disagrees with its queue-mate about the write error"
+                ),
+            }
         }
     }
 }
