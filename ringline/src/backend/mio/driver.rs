@@ -10,7 +10,7 @@ use std::sync::atomic::AtomicBool;
 use crate::accumulator::AccumulatorTable;
 use crate::buffer::send_copy::SendCopyPool;
 use crate::config::Config;
-use crate::connection::{ConnectionTable, Lifecycle};
+use crate::connection::{ConnectionTable, Lifecycle, WriteHalf};
 use crate::disk_io_pool::DiskIoPool;
 use crate::handler::{ConnSendState, DriverCtx};
 
@@ -519,6 +519,17 @@ impl Driver {
                 } else {
                     break;
                 }
+            }
+        }
+
+        // All sends flushed. A deferred half-close goes out only now, after
+        // the final byte reached the socket.
+        if let Some(cs) = self.connections.get_mut(conn_index)
+            && matches!(cs.write, WriteHalf::ShutdownPending)
+        {
+            cs.write = WriteHalf::Shutdown;
+            if let Some(stream) = self.tcp_streams[idx].as_mut() {
+                let _ = stream.shutdown(std::net::Shutdown::Write);
             }
         }
 

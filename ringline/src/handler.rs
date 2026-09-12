@@ -16,9 +16,6 @@ use crate::guard::GuardBox;
 pub(crate) struct ConnSendState {
     pub in_flight: bool,
     pub queue: VecDeque<BuiltSend>,
-    /// Deferred shutdown_write — submitted after the send queue drains.
-    #[cfg_attr(not(has_io_uring), allow(dead_code))]
-    pub shutdown_pending: bool,
     /// Teardown has been requested for this connection (peer FIN, read
     /// error, task return, or an explicit close) and is deferred until
     /// queued sends drain. Set by the driver's `close_connection` and the
@@ -75,7 +72,6 @@ impl ConnSendState {
         ConnSendState {
             in_flight: false,
             queue: VecDeque::new(),
-            shutdown_pending: false,
             close_pending: false,
             close_submitted: false,
             close_send_count: 0,
@@ -502,21 +498,28 @@ impl<'a> DriverCtx<'a> {
     /// If sends are in-flight or queued, the shutdown is deferred until the
     /// send queue drains to avoid racing with pending Send SQEs.
     pub fn shutdown_write(&mut self, conn: ConnToken) {
-        if let Some(conn_state) = self.connections.get(conn.index) {
-            if conn_state.generation != conn.generation {
-                return;
-            }
-            let idx = conn.index as usize;
-            // Close already submitted — a Shutdown SQE would race it.
-            if self.send_queues[idx].close_submitted {
-                return;
-            }
-            if self.send_queues[idx].in_flight || !self.send_queues[idx].queue.is_empty() {
-                // Defer until send queue drains.
-                self.send_queues[idx].shutdown_pending = true;
-            } else {
-                let _ = self.ring.submit_shutdown(conn.index);
-            }
+        let Some(cs) = self.connections.get_mut(conn.index) else {
+            return;
+        };
+        if cs.generation != conn.generation {
+            return;
+        }
+        // Idempotent: a second request while pending or after the FIN is a
+        // no-op.
+        if !matches!(cs.write, crate::connection::WriteHalf::Open) {
+            return;
+        }
+        let idx = conn.index as usize;
+        // Close already submitted — a Shutdown SQE would race it.
+        if self.send_queues[idx].close_submitted {
+            return;
+        }
+        if self.send_queues[idx].in_flight || !self.send_queues[idx].queue.is_empty() {
+            // Defer until the send queue drains (submit_next_queued issues it).
+            cs.write = crate::connection::WriteHalf::ShutdownPending;
+        } else {
+            cs.write = crate::connection::WriteHalf::Shutdown;
+            let _ = self.ring.submit_shutdown(conn.index);
         }
     }
 
@@ -2070,19 +2073,27 @@ impl<'a> DriverCtx<'a> {
     /// Flushes any buffered pending sends before issuing the TCP half-close.
     pub fn shutdown_write(&mut self, conn: ConnToken) {
         let idx = conn.index as usize;
-        if self.connections.get(conn.index).is_none()
-            || self.connections.get(conn.index).unwrap().generation != conn.generation
-        {
+        let Some(cs) = self.connections.get_mut(conn.index) else {
+            return;
+        };
+        if cs.generation != conn.generation {
             return;
         }
-        // Flush any pending send data before shutting down.
-        if let Some(ref mut stream) = self.tcp_streams[idx] {
-            use std::io::Write;
-            for (data, offset, _notify) in self.pending_sends[idx].drain(..) {
-                let _ = stream.write_all(&data[offset..]);
+        // Idempotent, and a requested close owns the socket from here on.
+        if !matches!(cs.write, crate::connection::WriteHalf::Open) || cs.close_requested() {
+            return;
+        }
+        if self.pending_sends[idx].is_empty() {
+            cs.write = crate::connection::WriteHalf::Shutdown;
+            if let Some(stream) = self.tcp_streams[idx].as_mut() {
+                let _ = stream.shutdown(std::net::Shutdown::Write);
             }
-            let _ = stream.flush();
-            let _ = stream.shutdown(std::net::Shutdown::Write);
+        } else {
+            // Defer the FIN until flush_sends drains the queue. Dirty the
+            // queue so the flush pass registers writable interest; the
+            // event that drains it issues the shutdown.
+            cs.write = crate::connection::WriteHalf::ShutdownPending;
+            self.mark_send_dirty(idx);
         }
     }
 

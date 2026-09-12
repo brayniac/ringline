@@ -78,6 +78,20 @@ pub enum Lifecycle {
     Closing,
 }
 
+/// The TCP write half as this end drives it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteHalf {
+    /// Sends are accepted.
+    Open,
+    /// `shutdown_write` was requested while sends were queued or in flight;
+    /// the FIN goes out once the queue drains.
+    ShutdownPending,
+    /// Our FIN has been issued (io_uring: Shutdown SQE submitted; mio:
+    /// `shutdown(Write)` called). This does not refuse later sends — that is
+    /// a policy decision left open; today they fail at the socket.
+    Shutdown,
+}
+
 /// Per-connection state tracked by the driver.
 pub struct ConnectionState {
     /// Which receive operation is armed (mechanism; see `recv_finished`).
@@ -86,6 +100,8 @@ pub struct ConnectionState {
     pub read: ReadHalf,
     /// Where the connection is in its life.
     pub lifecycle: Lifecycle,
+    /// The TCP write half as driven by this end.
+    pub write: WriteHalf,
     /// Whether the connection is active.
     pub active: bool,
     /// Generation counter to detect stale ConnTokens.
@@ -142,6 +158,7 @@ impl ConnectionState {
             recv_arm: RecvArm::Idle,
             read: ReadHalf::Open,
             lifecycle: Lifecycle::Inactive,
+            write: WriteHalf::Open,
             active: false,
             generation: 0,
             outbound: false,
@@ -162,6 +179,7 @@ impl ConnectionState {
         self.lifecycle = Lifecycle::Open;
         self.read = ReadHalf::Open;
         self.recv_arm = RecvArm::Multi;
+        self.write = WriteHalf::Open;
     }
 
     /// Activate as an outbound (connect) connection.
@@ -172,6 +190,7 @@ impl ConnectionState {
         self.lifecycle = Lifecycle::Connecting;
         self.read = ReadHalf::Open;
         self.recv_arm = RecvArm::Idle;
+        self.write = WriteHalf::Open;
     }
 
     /// An outbound connect completed: the connection is open and its
@@ -207,6 +226,7 @@ impl ConnectionState {
         self.lifecycle = Lifecycle::Inactive;
         self.read = ReadHalf::Open;
         self.recv_arm = RecvArm::Idle;
+        self.write = WriteHalf::Open;
         self.outbound = false;
         self.established = false;
         self.peer_addr = None;
@@ -472,6 +492,21 @@ mod tests {
         assert!(!cs.connect_timeout_armed);
         assert!(cs.peer_addr.is_none());
         assert!(cs.lifecycle == Lifecycle::Inactive);
+    }
+
+    #[test]
+    fn write_half_resets_with_the_slot() {
+        let mut cs = ConnectionState::new();
+        assert_eq!(cs.write, WriteHalf::Open);
+        cs.activate();
+        cs.write = WriteHalf::ShutdownPending;
+        cs.deactivate();
+        assert_eq!(cs.write, WriteHalf::Open);
+        cs.activate_outbound();
+        assert_eq!(cs.write, WriteHalf::Open);
+        cs.write = WriteHalf::Shutdown;
+        cs.activate();
+        assert_eq!(cs.write, WriteHalf::Open);
     }
 
     #[test]

@@ -17,7 +17,7 @@ use crate::buffer::send_slab::InFlightSendSlab;
 use crate::chain::SendChainTable;
 use crate::completion::{OpTag, UserData};
 use crate::config::Config;
-use crate::connection::{ConnectionTable, Lifecycle, RecvArm};
+use crate::connection::{ConnectionTable, Lifecycle, RecvArm, WriteHalf};
 use crate::handler::{BuiltSend, ConnSendState, DriverCtx};
 use crate::metrics;
 
@@ -837,7 +837,6 @@ impl Driver {
         state.in_flight = false;
         state.close_pending = false;
         state.close_submitted = false;
-        state.shutdown_pending = false;
         state.acked_bytes = 0;
         state.close_notify_deadline = None;
         if let Some(pos) = self
@@ -1241,7 +1240,9 @@ impl Driver {
             &mut self.send_copy_pool,
         );
         state.in_flight = false;
-        state.shutdown_pending = false;
+        if let Some(cs) = self.connections.get_mut(conn_index) {
+            cs.write = WriteHalf::Open;
+        }
         self.chain_table.cancel(conn_index);
         self.try_finalize_close(conn_index);
     }
@@ -1378,7 +1379,9 @@ impl Driver {
                             &mut self.send_copy_pool,
                         );
                         state.in_flight = false;
-                        state.shutdown_pending = false;
+                        if let Some(cs) = self.connections.get_mut(conn_index) {
+                            cs.write = WriteHalf::Open;
+                        }
                         self.try_finalize_close(conn_index);
                         return false;
                     }
@@ -1408,7 +1411,9 @@ impl Driver {
                             &mut self.send_copy_pool,
                         );
                         state.in_flight = false;
-                        state.shutdown_pending = false;
+                        if let Some(cs) = self.connections.get_mut(conn_index) {
+                            cs.write = WriteHalf::Open;
+                        }
                         // If a deferred close was pending, fire it now that
                         // the queue is drained.
                         self.try_finalize_close(conn_index);
@@ -1418,9 +1423,11 @@ impl Driver {
             }
             None => {
                 state.in_flight = false;
-                // Submit deferred shutdown_write now that the send queue is drained.
-                if state.shutdown_pending {
-                    state.shutdown_pending = false;
+                // Submit a deferred shutdown_write now that the queue is drained.
+                if let Some(cs) = self.connections.get_mut(conn_index)
+                    && matches!(cs.write, WriteHalf::ShutdownPending)
+                {
+                    cs.write = WriteHalf::Shutdown;
                     let _ = self.ring.submit_shutdown(conn_index);
                 }
                 // Fire a deferred close now that nothing is in flight and the
