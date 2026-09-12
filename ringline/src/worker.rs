@@ -40,15 +40,16 @@ fn startup_failure_placeholder() -> crate::error::Error {
     ))
 }
 
-/// Render a panic payload for the startup error. `panic!("..")` and
-/// `panic!("{x}")` give `&'static str` and `String`; anything else is opaque.
-fn panic_payload(payload: Box<dyn Any + Send>) -> String {
-    match payload.downcast::<String>() {
-        Ok(message) => *message,
-        Err(payload) => match payload.downcast::<&'static str>() {
-            Ok(message) => (*message).to_string(),
-            Err(_) => "non-string panic payload".to_string(),
-        },
+/// Render a panic payload for the startup error without consuming it, so
+/// the payload can still be re-raised. `panic!("..")` and `panic!("{x}")`
+/// give `&'static str` and `String`; anything else is opaque.
+fn panic_payload(payload: &(dyn Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else if let Some(message) = payload.downcast_ref::<&'static str>() {
+        (*message).to_string()
+    } else {
+        "non-string panic payload".to_string()
     }
 }
 
@@ -852,13 +853,11 @@ impl RinglineBuilder {
                     metriken::set_thread_shard(worker_id);
 
                     let accept_rx = if has_acceptor { Some(rx) } else { None };
-                    // A panic anywhere in the worker body must reach
-                    // `launch()` as an error naming the worker and the
-                    // payload, not as a disconnected channel and a generic
-                    // "worker setup failed". `panic_tx` is cloned first
-                    // because `worker_fn` consumes `startup_tx`; if setup
-                    // had already succeeded the send is a harmless no-op
-                    // on a receiver nobody reads.
+                    // A panic before startup completed must reach `launch()`
+                    // as an error naming the worker and the payload, not as
+                    // a disconnected channel and a generic "worker setup
+                    // failed". `panic_tx` is cloned first because
+                    // `worker_fn` consumes `startup_tx`.
                     let panic_tx = startup_tx.clone();
                     match catch_unwind(AssertUnwindSafe(|| {
                         worker_fn(
@@ -883,13 +882,28 @@ impl RinglineBuilder {
                         Ok(result) => result,
                         Err(payload) => {
                             let message = format!(
-                                "ringline worker {worker_id} panicked during startup: {}",
-                                panic_payload(payload)
+                                "ringline worker {worker_id} panicked: {}",
+                                panic_payload(&*payload)
                             );
-                            let _ = panic_tx.send(Err(crate::error::Error::Io(io::Error::other(
+                            // `try_send`, never `send`: during rollback the
+                            // launcher has stopped receiving but still holds
+                            // the receiver, and a blocking send into a full
+                            // channel would hang the join. `Full` means the
+                            // launcher already has an error to return.
+                            // `Disconnected` means `launch()` has returned:
+                            // this is a steady-state panic, and the join
+                            // result must stay `Err(payload)` as it always
+                            // was — re-raise instead of converting.
+                            match panic_tx.try_send(Err(crate::error::Error::Io(io::Error::other(
                                 message.clone(),
-                            ))));
-                            Err(crate::error::Error::Io(io::Error::other(message)))
+                            )))) {
+                                Ok(()) | Err(crossbeam_channel::TrySendError::Full(_)) => {
+                                    Err(crate::error::Error::Io(io::Error::other(message)))
+                                }
+                                Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                                    std::panic::resume_unwind(payload)
+                                }
+                            }
                         }
                     }
                 });
@@ -1402,16 +1416,52 @@ mod startup_gate_tests {
             .expect("startup panic must fail launch")
             .to_string();
         assert!(text.contains("injected bootstrap panic"), "{text}");
-        assert!(text.contains("worker 0 panicked during startup"), "{text}");
+        assert!(text.contains("worker 0 panicked"), "{text}");
+    }
+
+    /// A panic after `launch()` has returned is not a startup failure: the
+    /// worker's `JoinHandle` must still resolve to `Err(payload)` exactly as
+    /// before the startup channel learned to carry panics.
+    #[test]
+    fn post_startup_panic_keeps_the_join_panic_contract() {
+        let (go_tx, go_rx) = crossbeam_channel::bounded::<()>(1);
+        let launched = RinglineBuilder::new(one_worker_config())
+            .launch_inner(
+                move |_, _, _, _eventfd, _, _, _, _, _, _, _, _, _, _, _, startup_tx| {
+                    let _ = startup_tx.send(Ok(()));
+                    drop(startup_tx);
+                    let _ = go_rx.recv();
+                    panic!("injected steady-state panic")
+                },
+            )
+            .expect("startup succeeds");
+        let (shutdown, handles) = launched;
+        // launch() has returned, so the startup receiver is gone; now panic.
+        go_tx.send(()).unwrap();
+        let mut saw_panic = false;
+        for handle in handles {
+            match handle.join() {
+                Err(payload) => {
+                    saw_panic = true;
+                    assert_eq!(
+                        super::panic_payload(&*payload),
+                        "injected steady-state panic"
+                    );
+                }
+                Ok(other) => panic!("join must surface the panic, got {other:?}"),
+            }
+        }
+        assert!(saw_panic);
+        drop(shutdown);
     }
 
     #[test]
     fn panic_payload_renders_common_payload_types() {
         let s: Box<dyn std::any::Any + Send> = Box::new(String::from("owned"));
-        assert_eq!(super::panic_payload(s), "owned");
+        assert_eq!(super::panic_payload(&*s), "owned");
         let st: Box<dyn std::any::Any + Send> = Box::new("static");
-        assert_eq!(super::panic_payload(st), "static");
+        assert_eq!(super::panic_payload(&*st), "static");
         let other: Box<dyn std::any::Any + Send> = Box::new(42u32);
-        assert_eq!(super::panic_payload(other), "non-string panic payload");
+        assert_eq!(super::panic_payload(&*other), "non-string panic payload");
     }
 }

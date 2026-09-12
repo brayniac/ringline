@@ -38,17 +38,28 @@ channel would flatten those. So:
   ("startup failure reported to launch()") — `crate::error::Error` is not
   `Clone`, and after a reported failure the thread's return value is only
   ever read by `rollback_workers` as a fallback.
-- The spawned closure wraps `worker_fn` in `catch_unwind`. A panic becomes
-  `Error::Io(io::Error::other("ringline worker {id} panicked during
-  startup: {payload}"))`, sent on a clone of the channel sender taken
-  before `worker_fn` consumes the original, and returned from the thread.
-  `worker_fn` itself is `AssertUnwindSafe`: nothing it borrows outlives the
-  thread.
+- The spawned closure wraps `worker_fn` in `catch_unwind`. A panic is
+  rendered as `Error::Io(io::Error::other("ringline worker {id} panicked:
+  {payload}"))` and offered to the launcher with `try_send` on a clone of
+  the channel sender taken before `worker_fn` consumes the original. Never
+  a blocking `send`: during rollback the launcher holds the receiver but no
+  longer reads, and a full channel would hang the join. `Ok` or `Full`
+  (launch is still deciding, or already has an error) → the thread returns
+  that `Io` error. `Disconnected` (launch has returned; this is a
+  steady-state panic) → `resume_unwind(payload)`, so the worker's
+  `JoinHandle` still resolves to `Err(payload)` exactly as before.
+  `worker_fn` is `AssertUnwindSafe`: nothing it borrows outlives the thread.
+- Known window: a panic after a worker's `Ok(())` but before `launch()`
+  returns is buffered on the channel and never read; the join result then
+  carries the `Io` error rather than the raw payload. `launch()` still
+  returns `Ok` for that worker. Accepted; the message is not labelled
+  "startup" so it is not misleading.
 - `launch_inner`'s wait loop keeps the reported error
   (`Ok(Err(e))` → `Some(e)`) and, on a bare disconnect, falls back to
   `rollback_workers`' first joined error, then to the generic message.
   Rollback runs in every failure case, as today.
-- `WorkerHandle`'s join result on the success path is unchanged.
+- `WorkerHandle`'s join result on the success path is unchanged for a
+  panic after `launch()` returned (re-raised), and for `run()` errors.
 
 ## Tests (`ringline/src/worker.rs`, existing `startup_gate_tests` module)
 
