@@ -186,10 +186,11 @@ impl SendCopyPool {
     /// reservation. While the reservation is outstanding, `copy_in`,
     /// `copy_in_gather` and `alloc_raw` see `n` fewer free slots.
     pub fn reserve_slots(&mut self, n: usize) -> Result<SlotReservation, ReserveError> {
-        if n > self.count as usize {
+        let capacity = self.slot_count();
+        if n > capacity {
             return Err(ReserveError::TooLarge {
                 needed: n,
-                capacity: self.count as usize,
+                capacity,
             });
         }
         if n > self.free_count() {
@@ -226,6 +227,10 @@ impl SendCopyPool {
 
     /// Return the unfilled remainder of a reservation to the pool.
     pub fn release_reservation(&mut self, mut r: SlotReservation) {
+        debug_assert!(
+            r.remaining() <= self.reserved,
+            "reservation remainder exceeds the pool's outstanding reservations"
+        );
         self.reserved -= r.remaining;
         r.remaining = 0; // satisfies the Drop debug_assert
     }
