@@ -1150,15 +1150,21 @@ pub(crate) mod tests {
     #[test]
     fn partial_write_keeps_permit_and_id() {
         // `test_config`'s four 64-byte slots cap a bounded send at 256
-        // bytes, which no socket buffer is small enough to split. A 2 MiB
-        // message over four 1 MiB slots is, once both ends' buffers are
-        // shrunk to 4 KiB.
-        const PAYLOAD: usize = 2 * 1024 * 1024;
+        // bytes, which no socket buffer is small enough to split. 64 KiB
+        // over four 32 KiB slots is, once both ends' buffers are shrunk to
+        // 4 KiB — and it is the *smallest* size that both guarantees a short
+        // write and reserves more than one slot. Size matters here: the
+        // drain below is a live race between this thread's flush loop and a
+        // reader thread, so a payload needing hundreds of round trips makes
+        // the test a function of the host's scheduling rather than of the
+        // code (2 MiB over the same buffers took >20 s and never finished on
+        // a Linux CI guest).
+        const PAYLOAD: usize = 64 * 1024;
         let config = ConfigBuilder::new()
             .workers(1)
             .pin_to_core(false)
             .max_connections(16)
-            .send_pool(4, 1024 * 1024)
+            .send_pool(4, 32 * 1024)
             .build()
             .expect("valid test config");
         let (mut driver, _wake) = test_driver(&config);
@@ -1187,7 +1193,7 @@ pub(crate) mod tests {
         let reserved_free = driver.send_copy_pool.free_count();
         assert_eq!(
             reserved_free, 2,
-            "2 MiB reserves two of the four 1 MiB slots"
+            "64 KiB reserves two of the four 32 KiB slots"
         );
 
         let (all_flushed, written) = driver
@@ -1195,7 +1201,7 @@ pub(crate) mod tests {
             .expect("a short write is not an error");
         assert!(
             !all_flushed,
-            "4 KiB of socket buffer cannot take a 2 MiB message"
+            "4 KiB of socket buffer cannot take a 64 KiB message"
         );
         assert!(
             (written as usize) < PAYLOAD,
@@ -1234,9 +1240,7 @@ pub(crate) mod tests {
         });
 
         // Only back off when a flush made no progress; while the peer is
-        // consuming, keep writing. 2 MiB through a 4 KiB socket buffer is
-        // hundreds of round trips and a fixed per-iteration sleep makes the
-        // budget depend on the host's scheduling.
+        // consuming, keep writing.
         let mut finished = false;
         for _ in 0..20_000 {
             let (done, written) = driver.flush_sends(conn_index).expect("flush");
