@@ -1252,12 +1252,12 @@ impl ConnCtx {
                             total_len: pending.len,
                         };
 
-                        let result = driver.submit_or_queue_send(conn_index, built);
-                        if result.is_err() {
-                            // Submit failed — replenish the recv buffer.
-                            driver.pending_replenish.push(pending.bid);
-                        }
-                        return result;
+                        // Infallible: under SQ pressure the entry is parked in
+                        // the connection's queue and keeps its bid exactly as
+                        // a queued entry does; `handle_send_recv_buf`
+                        // replenishes it on completion.
+                        driver.submit_or_queue_send(conn_index, built);
+                        return Ok(());
                     }
 
                     // Pointer mismatch �� put it back and fall through to copy path.
@@ -3526,9 +3526,9 @@ impl Future for DirectEchoFuture {
                         total_len: pending.len,
                     };
                     driver.send_recv_buf_original_lens[self.conn_index as usize] = pending.len;
-                    if driver.submit_or_queue_send(self.conn_index, built).is_err() {
-                        driver.pending_replenish.push(pending.bid);
-                    }
+                    // Infallible: a parked entry keeps its bid like a queued
+                    // one; the completion replenishes it.
+                    driver.submit_or_queue_send(self.conn_index, built);
                 }
             }
 
