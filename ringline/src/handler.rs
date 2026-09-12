@@ -192,6 +192,11 @@ pub struct DriverCtx<'a> {
     /// on the same deferred path as `close_connection` — the Close SQE is
     /// only submitted once in-flight sends, queued sends, and chains drain.
     pub(crate) pending_finalize_closes: &'a mut Vec<u32>,
+    /// Connections whose queued head send could not be pushed (SQ still
+    /// full after submit); `submit_or_queue` parks the entry here instead of
+    /// failing. Same list as `backend::uring::driver::Driver::pending_send_retries`,
+    /// drained by the event loop's `drain_send_retries`.
+    pub(crate) pending_send_retries: &'a mut Vec<(u32, u32, u8)>,
     pub(crate) close_notify_timeout: std::time::Duration,
     pub(crate) next_disk_io_seq: &'a mut u16,
 }
@@ -240,7 +245,9 @@ impl<'a> DriverCtx<'a> {
     /// in order. Admission is transactional: every slot is reserved before
     /// the first byte is copied, so on `Err` nothing has been queued or
     /// transmitted and the same buffer may be sent again later. A send wider
-    /// than the whole pool is refused with `InvalidInput`.
+    /// than the whole pool is refused with `InvalidInput`. Submission-queue
+    /// pressure is absorbed by the per-connection queue and is not an error
+    /// here.
     pub fn send(&mut self, conn: ConnToken, data: &[u8]) -> io::Result<()> {
         let conn_state = self
             .connections
@@ -266,8 +273,11 @@ impl<'a> DriverCtx<'a> {
                 // Route every ciphertext chunk through the per-connection
                 // send queue: io_uring doesn't order independent SQEs, and
                 // a partial-send resubmit would interleave chunks on the
-                // wire (bad_record_mac at the peer).
-                return self.queue_built_sends(conn.index, sends);
+                // wire (bad_record_mac at the peer). Infallible: rustls has
+                // already advanced its record sequence, so the ciphertext
+                // must reach the wire — SQ pressure parks it, never drops it.
+                self.queue_built_sends(conn.index, sends);
+                return Ok(());
             }
         }
 
@@ -303,12 +313,11 @@ impl<'a> DriverCtx<'a> {
         // per chunk (which would report a short count and, for pipelined sends,
         // wake the wrong future).
         //
-        // `submit_or_queue` pushes to the ring only while nothing is in flight,
-        // i.e. only for the first chunk; once that is accepted every later
-        // chunk is queued, which cannot fail. So the only failure after the
-        // reservation is a full SQ on the first chunk, and `submit_or_queue`
-        // releases that chunk's slot before returning — nothing has been
-        // queued or transmitted, and the unfilled remainder goes back here.
+        // `submit_or_queue` is infallible: it pushes to the ring only while
+        // nothing is in flight (the first chunk) and parks that chunk at the
+        // queue head if the SQ is full; every later chunk is queued behind
+        // it. So once the reservation is granted the whole buffer is
+        // committed, in order.
         let mut chunks = data.chunks(slot_size).peekable();
         while let Some(chunk) = chunks.next() {
             let (slot, ptr, len) = self
@@ -334,10 +343,7 @@ impl<'a> DriverCtx<'a> {
                 total_len: chunk.len() as u32,
             };
 
-            if let Err(e) = self.submit_or_queue(conn.index, built) {
-                self.send_copy_pool.release_reservation(reservation);
-                return Err(e);
-            }
+            self.submit_or_queue(conn.index, built);
         }
 
         // Every promised slot was filled; this returns a zero remainder.
@@ -360,64 +366,40 @@ impl<'a> DriverCtx<'a> {
         ((seq as u32) << 16) | slab_idx as u32
     }
 
-    /// Queue a batch of built sends in order; on a submit failure the
-    /// remaining entries' resources are released so nothing leaks.
-    pub(crate) fn queue_built_sends(
-        &mut self,
-        conn_index: u32,
-        sends: Vec<BuiltSend>,
-    ) -> io::Result<()> {
-        let mut it = sends.into_iter();
-        while let Some(built) = it.next() {
-            if let Err(e) = self.submit_or_queue(conn_index, built) {
-                for rest in it {
-                    if rest.slab_idx != u16::MAX {
-                        let pool_slot = self.send_slab.release(rest.slab_idx);
-                        if pool_slot != u16::MAX {
-                            self.send_copy_pool.release(pool_slot);
-                        }
-                    } else if rest.pool_slot != u16::MAX {
-                        self.send_copy_pool.release(rest.pool_slot);
-                    }
-                }
-                return Err(e);
-            }
+    /// Queue a batch of built sends in order through the per-connection
+    /// send queue. Infallible: `submit_or_queue` parks under SQ pressure
+    /// rather than failing, so every entry is committed in order and nothing
+    /// needs releasing here.
+    pub(crate) fn queue_built_sends(&mut self, conn_index: u32, sends: Vec<BuiltSend>) {
+        for built in sends {
+            self.submit_or_queue(conn_index, built);
         }
-        Ok(())
     }
 
-    /// Submit a built send SQE or queue it if a send is already in-flight.
-    pub(crate) fn submit_or_queue(&mut self, conn_index: u32, built: BuiltSend) -> io::Result<()> {
+    /// Submit a built send SQE, or queue it if a send is already in flight.
+    ///
+    /// Infallible: the entry is committed to the connection's stream on
+    /// return. If the push fails (SQ still full after submit) the entry is
+    /// parked at the head of the (empty) queue with `in_flight = true` and
+    /// the connection is registered on `pending_send_retries`; the event
+    /// loop's `drain_send_retries` re-pushes it next iteration and, after
+    /// two failed attempts, fails the send waiter and closes the connection.
+    /// Nothing is dropped or released here (Domain Invariant 7).
+    pub(crate) fn submit_or_queue(&mut self, conn_index: u32, built: BuiltSend) {
         let state = &mut self.send_queues[conn_index as usize];
         if state.in_flight {
             state.queue.push_back(built);
-            Ok(())
-        } else {
-            // Destructure instead of cloning the 64-byte SQE: the fields are
-            // only needed on the error branch.
-            let BuiltSend {
-                entry,
-                pool_slot,
-                slab_idx,
-                total_len: _,
-            } = built;
-            match unsafe { self.ring.push_sqe(entry) } {
-                Ok(()) => {
-                    state.in_flight = true;
-                    Ok(())
-                }
-                Err(e) => {
-                    // Release resources that would otherwise leak.
-                    if slab_idx != u16::MAX {
-                        let pool_slot = self.send_slab.release(slab_idx);
-                        if pool_slot != u16::MAX {
-                            self.send_copy_pool.release(pool_slot);
-                        }
-                    } else if pool_slot != u16::MAX {
-                        self.send_copy_pool.release(pool_slot);
-                    }
-                    Err(e)
-                }
+            return;
+        }
+        match unsafe { self.ring.push_sqe(&built.entry) } {
+            Ok(()) => state.in_flight = true,
+            Err(_) => {
+                // SQ still full after submit: park at the head and retry next
+                // iteration (see `drain_send_retries`). Nothing is dropped.
+                state.queue.push_back(built);
+                state.in_flight = true;
+                let generation = self.connections.generation(conn_index);
+                self.pending_send_retries.push((conn_index, generation, 0));
             }
         }
     }
@@ -502,7 +484,7 @@ impl<'a> DriverCtx<'a> {
                         &mut sends,
                     );
                     if !sends.is_empty() {
-                        let _ = self.queue_built_sends(conn.index, sends);
+                        self.queue_built_sends(conn.index, sends);
                     }
                     // Arm the close_notify deadline so the event loop
                     // force-closes if the deferred Close never fires (peer
@@ -3000,7 +2982,8 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
             self.conn.generation,
             &plaintext,
         )?;
-        self.ctx.queue_built_sends(self.conn.index, sends)
+        self.ctx.queue_built_sends(self.conn.index, sends);
+        Ok(())
     }
 
     /// Copy-only path: gather all copy parts into one pool slot, return built SQE.
@@ -3190,7 +3173,8 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
     /// Copy-only path: gather all copy parts, submit or queue.
     fn submit_copy_only(mut self) -> io::Result<()> {
         let built = self.build_copy_only()?;
-        self.ctx.submit_or_queue(self.conn.index, built)
+        self.ctx.submit_or_queue(self.conn.index, built);
+        Ok(())
     }
 
     /// Small-send fallback: gather all parts (copy + guard memory, in part order)
@@ -3254,14 +3238,15 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
             total_len: self.total_len,
         };
         // Data is in the pool slot now — guards can die with `self` after return.
-        self.ctx.submit_or_queue(self.conn.index, built)?;
+        self.ctx.submit_or_queue(self.conn.index, built);
         Ok(true)
     }
 
     /// Mixed copy+guard path: submit or queue.
     fn submit_with_guards(mut self) -> io::Result<()> {
         let built = self.build_with_guards()?;
-        self.ctx.submit_or_queue(self.conn.index, built)
+        self.ctx.submit_or_queue(self.conn.index, built);
+        Ok(())
     }
 }
 
@@ -3370,12 +3355,11 @@ impl<'b, 'a> SendChainBuilder<'b, 'a> {
             ));
         }
 
-        // Clone the SQE entries for submission, keeping self.built intact.
+        // Submit from self.built without moving the entries out of it.
         // On failure, Drop will call release_all() on the original entries.
         if count == 1 {
-            let entry = self.built[0].entry.clone();
             unsafe {
-                self.ctx.ring.push_sqe(entry)?;
+                self.ctx.ring.push_sqe(&self.built[0].entry)?;
             }
             self.ctx.chain_table.start(conn_index, 1, total_bytes);
         } else {

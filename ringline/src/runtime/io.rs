@@ -1180,9 +1180,12 @@ impl ConnCtx {
     /// # Errors
     ///
     /// Returns `Err` if the send copy pool cannot admit the whole buffer
-    /// (`Other`, retryable once in-flight sends complete), if the buffer is
-    /// wider than the entire pool (`InvalidInput`), or if the submission
-    /// queue is full. On a pool error nothing was queued or transmitted.
+    /// (`Other`, retryable once in-flight sends complete) or if the buffer
+    /// is wider than the entire pool (`InvalidInput`). On `Err` nothing was
+    /// queued or transmitted. Submission-queue pressure is not an error:
+    /// the send is queued and retried. Persistent submission-queue
+    /// starvation is reported like a write error: the awaited `SendFuture`
+    /// resolves `Err` and the connection is closed.
     ///
     /// For backpressure-aware sending, use [`send()`](Self::send) instead.
     pub fn send_nowait(&self, data: &[u8]) -> io::Result<()> {
@@ -1477,9 +1480,12 @@ impl ConnCtx {
     /// # Errors
     ///
     /// Returns `Err` if the send copy pool cannot admit the whole buffer
-    /// (`Other`, retryable once in-flight sends complete), if the buffer is
-    /// wider than the entire pool (`InvalidInput`), or if the submission
-    /// queue is full. On a pool error nothing was queued or transmitted.
+    /// (`Other`, retryable once in-flight sends complete) or if the buffer
+    /// is wider than the entire pool (`InvalidInput`). On `Err` nothing was
+    /// queued or transmitted. Submission-queue pressure is not an error:
+    /// the send is queued and retried. Persistent submission-queue
+    /// starvation is reported like a write error: the awaited `SendFuture`
+    /// resolves `Err` and the connection is closed.
     pub fn send(&self, data: &[u8]) -> io::Result<SendFuture> {
         with_state(|driver, executor| {
             let mut ctx = driver.make_ctx();

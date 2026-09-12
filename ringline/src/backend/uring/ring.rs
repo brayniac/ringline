@@ -227,7 +227,7 @@ impl Ring {
             .build()
             .user_data(user_data.raw());
         unsafe {
-            self.push_sqe(entry)?;
+            self.push_sqe(&entry)?;
         }
         Ok(())
     }
@@ -249,7 +249,7 @@ impl Ring {
             .build()
             .user_data(user_data.raw());
         unsafe {
-            self.push_sqe(entry)?;
+            self.push_sqe(&entry)?;
         }
         Ok(())
     }
@@ -261,7 +261,7 @@ impl Ring {
             .build()
             .user_data(user_data.raw());
         unsafe {
-            self.push_sqe(entry)?;
+            self.push_sqe(&entry)?;
         }
         Ok(())
     }
@@ -286,7 +286,7 @@ impl Ring {
             .build()
             .user_data(user_data.raw());
         unsafe {
-            self.push_sqe(entry)?;
+            self.push_sqe(&entry)?;
         }
         Ok(())
     }
@@ -304,7 +304,7 @@ impl Ring {
             .build()
             .user_data(user_data.raw());
         unsafe {
-            self.push_sqe(entry)?;
+            self.push_sqe(&entry)?;
         }
         Ok(())
     }
@@ -323,7 +323,7 @@ impl Ring {
             .build()
             .user_data(user_data.raw());
         unsafe {
-            self.push_sqe(entry)?;
+            self.push_sqe(&entry)?;
         }
         Ok(())
     }
@@ -341,7 +341,7 @@ impl Ring {
             .build()
             .user_data(user_data.raw());
         unsafe {
-            self.push_sqe(entry)?;
+            self.push_sqe(&entry)?;
         }
         Ok(())
     }
@@ -361,7 +361,7 @@ impl Ring {
             .build()
             .user_data(user_data.raw());
         unsafe {
-            self.push_sqe(entry)?;
+            self.push_sqe(&entry)?;
         }
         Ok(())
     }
@@ -382,7 +382,7 @@ impl Ring {
             .build()
             .user_data(user_data.raw());
         unsafe {
-            self.push_sqe(entry)?;
+            self.push_sqe(&entry)?;
         }
         Ok(())
     }
@@ -410,7 +410,7 @@ impl Ring {
             .build()
             .user_data(user_data.raw());
         unsafe {
-            self.push_sqe(entry)?;
+            self.push_sqe(&entry)?;
         }
         Ok(())
     }
@@ -435,7 +435,7 @@ impl Ring {
             .build()
             .user_data(user_data.raw());
         unsafe {
-            self.push_sqe(entry)?;
+            self.push_sqe(&entry)?;
         }
         Ok(())
     }
@@ -452,7 +452,7 @@ impl Ring {
             .build()
             .user_data(user_data.raw());
         unsafe {
-            self.push_sqe(entry)?;
+            self.push_sqe(&entry)?;
         }
         Ok(())
     }
@@ -477,7 +477,7 @@ impl Ring {
             .build()
             .user_data(user_data.raw());
         unsafe {
-            self.push_sqe(entry)?;
+            self.push_sqe(&entry)?;
         }
         Ok(())
     }
@@ -489,7 +489,7 @@ impl Ring {
             .build()
             .user_data(user_data.raw());
         unsafe {
-            self.push_sqe(entry)?;
+            self.push_sqe(&entry)?;
         }
         Ok(())
     }
@@ -501,7 +501,7 @@ impl Ring {
             .build()
             .user_data(user_data.raw());
         unsafe {
-            self.push_sqe(entry)?;
+            self.push_sqe(&entry)?;
         }
         Ok(())
     }
@@ -518,7 +518,7 @@ impl Ring {
             .build()
             .user_data(user_data.raw());
         unsafe {
-            self.push_sqe(entry)?;
+            self.push_sqe(&entry)?;
         }
         Ok(())
     }
@@ -533,7 +533,7 @@ impl Ring {
             .build()
             .user_data(user_data.raw());
         unsafe {
-            self.push_sqe(entry)?;
+            self.push_sqe(&entry)?;
         }
         Ok(())
     }
@@ -551,7 +551,7 @@ impl Ring {
             .build()
             .user_data(user_data.raw());
         unsafe {
-            self.push_sqe(entry)?;
+            self.push_sqe(&entry)?;
         }
         Ok(())
     }
@@ -567,7 +567,7 @@ impl Ring {
             .build()
             .user_data(ud.raw());
         unsafe {
-            self.push_sqe(entry)?;
+            self.push_sqe(&entry)?;
         }
         Ok(())
     }
@@ -579,7 +579,7 @@ impl Ring {
             .build()
             .user_data(user_data.raw());
         unsafe {
-            self.push_sqe(entry)?;
+            self.push_sqe(&entry)?;
         }
         Ok(())
     }
@@ -602,7 +602,7 @@ impl Ring {
             .build()
             .user_data(user_data.raw());
         unsafe {
-            self.push_sqe(entry)?;
+            self.push_sqe(&entry)?;
         }
         Ok(())
     }
@@ -618,7 +618,7 @@ impl Ring {
             .build()
             .user_data(user_data.raw());
         unsafe {
-            self.push_sqe(entry)?;
+            self.push_sqe(&entry)?;
         }
         Ok(())
     }
@@ -637,7 +637,7 @@ impl Ring {
             .build()
             .user_data(user_data.raw());
         unsafe {
-            self.push_sqe(entry)?;
+            self.push_sqe(&entry)?;
         }
         Ok(())
     }
@@ -656,7 +656,7 @@ impl Ring {
             .build()
             .user_data(user_data.raw());
         unsafe {
-            self.push_sqe(entry)?;
+            self.push_sqe(&entry)?;
         }
         Ok(())
     }
@@ -665,7 +665,7 @@ impl Ring {
     pub fn submit_poll_add(&mut self, fd: RawFd, mask: u32, ud: u64) -> io::Result<()> {
         let entry = opcode::PollAdd::new(Fd(fd), mask).build().user_data(ud);
         unsafe {
-            self.push_sqe(entry)?;
+            self.push_sqe(&entry)?;
         }
         Ok(())
     }
@@ -692,7 +692,7 @@ impl Ring {
             .build()
             .user_data(user_data.raw());
         unsafe {
-            self.push_sqe(entry)?;
+            self.push_sqe(&entry)?;
         }
         Ok(())
     }
@@ -764,7 +764,7 @@ impl Ring {
     ) -> io::Result<()> {
         let entry = opcode::Timeout::new(ts).build().user_data(user_data);
         unsafe {
-            self.push_sqe(entry)?;
+            self.push_sqe(&entry)?;
         }
         Ok(())
     }
@@ -848,7 +848,7 @@ impl Ring {
             // nop_flags (union with rw_flags) is at byte offset 28
             std::ptr::write_unaligned(ptr.add(28) as *mut u32, 1); // IORING_NOP_INJECT_RESULT
         }
-        unsafe { self.push_sqe(entry) }
+        unsafe { self.push_sqe(&entry) }
     }
 
     /// Like `submit_nop_inject` but with IOSQE_IO_LINK set, so the
@@ -868,13 +868,20 @@ impl Ring {
             std::ptr::write_unaligned(ptr.add(24) as *mut u32, result as u32);
             std::ptr::write_unaligned(ptr.add(28) as *mut u32, 1); // IORING_NOP_INJECT_RESULT
         }
-        unsafe { self.push_sqe(entry) }
+        unsafe { self.push_sqe(&entry) }
     }
 
+    /// Push a 64-byte SQE to the submission queue.
+    ///
+    /// Takes the entry by reference so a caller that must keep the entry on
+    /// failure (a queued send parked for retry) can do so without a
+    /// speculative clone; the 64-byte copy into the ring's 128-byte entry
+    /// happens here either way.
+    ///
     /// # Safety
     /// The SQE must reference valid memory for the lifetime of the operation.
-    pub(crate) unsafe fn push_sqe(&mut self, entry: squeue::Entry) -> io::Result<()> {
-        let entry128: squeue::Entry128 = entry.into();
+    pub(crate) unsafe fn push_sqe(&mut self, entry: &squeue::Entry) -> io::Result<()> {
+        let entry128: squeue::Entry128 = entry.clone().into();
         unsafe {
             self.push_sqe128(entry128)?;
         }
@@ -939,7 +946,7 @@ impl Ring {
             return Ok(());
         }
         if entries.len() == 1 {
-            return unsafe { self.push_sqe(entries[0].clone()) };
+            return unsafe { self.push_sqe(&entries[0]) };
         }
 
         // Set IO_LINK on all entries except the last.
@@ -1030,7 +1037,7 @@ impl Ring {
             .build()
             .user_data(user_data.raw());
         unsafe {
-            self.push_sqe(entry)?;
+            self.push_sqe(&entry)?;
         }
         Ok(())
     }
@@ -1057,7 +1064,7 @@ impl Ring {
             .build()
             .user_data(user_data.raw());
         unsafe {
-            self.push_sqe(entry)?;
+            self.push_sqe(&entry)?;
         }
         Ok(())
     }
@@ -1070,7 +1077,7 @@ impl Ring {
             .build()
             .user_data(user_data.raw());
         unsafe {
-            self.push_sqe(entry)?;
+            self.push_sqe(&entry)?;
         }
         Ok(())
     }
@@ -1100,7 +1107,7 @@ impl Ring {
             .build()
             .user_data(ud);
         unsafe {
-            self.push_sqe(entry)?;
+            self.push_sqe(&entry)?;
         }
         Ok(())
     }
@@ -1127,7 +1134,7 @@ impl Ring {
         .build()
         .user_data(ud);
         unsafe {
-            self.push_sqe(entry)?;
+            self.push_sqe(&entry)?;
         }
         Ok(())
     }
@@ -1147,7 +1154,7 @@ impl Ring {
             .build()
             .user_data(ud);
         unsafe {
-            self.push_sqe(entry)?;
+            self.push_sqe(&entry)?;
         }
         Ok(())
     }
@@ -1168,7 +1175,7 @@ impl Ring {
             .build()
             .user_data(ud);
         unsafe {
-            self.push_sqe(entry)?;
+            self.push_sqe(&entry)?;
         }
         Ok(())
     }
@@ -1189,7 +1196,7 @@ impl Ring {
             .build()
             .user_data(ud);
         unsafe {
-            self.push_sqe(entry)?;
+            self.push_sqe(&entry)?;
         }
         Ok(())
     }
