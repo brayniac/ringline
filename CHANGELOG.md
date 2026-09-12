@@ -72,6 +72,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   thread's error came first, and a panic during worker startup surfaces as
   an `Io` error naming the worker and the panic payload instead of the
   generic "worker setup failed".
+- io_uring: a copied send wider than one send-pool slot is admitted
+  transactionally — every slot is reserved before the first byte is copied,
+  so a pool-exhaustion `Err` from `ConnCtx::send`/`send_nowait` means nothing
+  was queued and the buffer may be resent (previously a prefix could already
+  be on the wire, and a retry duplicated it). A send wider than the whole
+  pool is refused up front with `InvalidInput`. Submission-queue pressure on
+  a queued send now parks the entry and retries it on the next loop
+  iteration instead of silently dropping the tail of the stream and hanging
+  the awaiting `send`; persistent starvation fails the waiter and closes the
+  connection, like a write error. Series PR 4 of #318 (design:
+  `docs/copied-send-reservation-design.md`).
 
 ## [0.6.3] - 2026-09-09
 

@@ -21,6 +21,23 @@ record gap) green on both backends.
 
 ## What happened
 
+- **PR 4 — transactional copied sends.** io_uring `DriverCtx::send` copied
+  a multi-slot buffer chunk by chunk, so pool exhaustion on chunk *k* left
+  chunks 1..k-1 queued behind the `Err` and a retry duplicated them. It now
+  reserves every slot as a count before the first copy (`reserve_slots`, no
+  allocation, departure 3); wider than the pool is `InvalidInput` up front.
+  Designing it found a second hole: a queued send whose SQE could not be
+  pushed (SQ still full after `submit()`) was released with everything
+  queued behind it — no wake, no close, the `SendFuture` hung; the same
+  condition on a first TLS entry returned `Err` after rustls had advanced,
+  and three `let _ =` callers dropped handshake output and close_notify.
+  Fix: park the built SQE at its queue head and re-push it next iteration,
+  with `drain_copy_retries`' two-attempt cap and terminal close; departure 1
+  refined to "nothing re-runs a logical send", not "nothing parks". Lesson:
+  the io_uring lib build flagged `remaining`/`slot_count`/
+  `force_push_failures` as dead until they had non-test callers, invisible
+  on the mio host where `buffer` is `allow(dead_code)`. Design:
+  `docs/copied-send-reservation-design.md`.
 - **Prerequisite — #368, mio close lifecycle.** PR 1's adversarial review
   found that mio never tore down a peer-first-closed or read-errored
   connection (`Closed` set directly at the read sites; `close_connection`
@@ -91,6 +108,21 @@ record gap) green on both backends.
 Open.
 
 ## Lessons / open questions
+
+- **PR 4 follow-ups (adversarial review, 2026-09-12).** (a)
+  `handle_send_recv_buf`'s partial-resubmit push failure still drops the
+  remainder of a recv-buffer forward on an open connection — a pre-existing
+  silent hole that the new Invariant 7 wording now contradicts; route it
+  through a retry list. (b) `ConnCtx::send(&[])` on io_uring returns a
+  `SendFuture` that never resolves (nothing is queued, so nothing writes
+  `io_results`); seed `Ok(0)` as `forward_to` already does. (c) No TLS-level
+  test of parking exists (the event-loop test module has no TLS harness);
+  `queue_built_sends_parks_under_sq_pressure` covers the mechanism only.
+  (d) `drain_send_retries` wakes the recv side on give-up while
+  `drain_copy_retries` does not; harmless asymmetry, pick one. (e) Send
+  chains (`send_chain`) bypass the per-connection queue and can push while
+  a queued send is in flight — pre-existing; the `parked` flag keeps the
+  retry drain out of that race but does not fix the chain path itself.
 
 - The io_uring sites cannot be type-checked on the macOS development host;
   Linux CI is the authority for those three edits.

@@ -40,7 +40,13 @@ them cites this section.
    transmitted prefix, rustls state), any later failure fails *that
    operation* and closes the connection through the `close_submitted` /
    `pending_finalize_closes` machinery from #328. Nothing parks after
-   mutation.
+   mutation. Refined in PR 4: what must never happen is a task-level retry
+   that re-runs the logical send after rustls mutation. Parking a *built*
+   SQE at the driver level and re-pushing the same bytes on the next
+   iteration re-runs nothing and is the model the ring already uses for
+   partial resubmits and `Close`; persistent starvation past the retry cap
+   is terminal for the connection, with the waiter failed, never a silent
+   drop.
 2. **The TLS ciphertext bound gates only bounded sends.** The bound is
    conservative (record header plus rustls' maximum overhead per 16 KiB
    record, rounded to whole slots). #318 applied it to `send`/`send_nowait`
@@ -84,7 +90,7 @@ Sizes are approximate net lines from the #318 diff, re-derived on `main`.
 | 1 | `with_data_result` | – | ~120 | no |
 | 2 | Worker startup rollback diagnostics | – | ~140 | no |
 | 3 | mio `shutdown_write` deferral | – | ~40 | mio |
-| 4 | Transactional copied-send reservation + ring push-failure test hook | – | ~80 | both |
+| 4 | Transactional copied-send reservation + SQ-pressure parking + ring push-failure test hook | – | ~600 | both |
 | 5 | Executor send-capacity FIFO (no callers) | – | ~300 | no |
 | 6 | mio completion identity + mio bounded-send driver path | 4, 5 | ~200 | mio |
 | 7 | io_uring completion identity, on top of #325/#328 | 4, 5 | ~300 | io_uring |
@@ -128,17 +134,31 @@ queue is empty. Test uses plain `send` (the #318 test used the future):
 `mio_half_close_waits_for_partial_send_to_finish_before_fin`. Changelog:
 Fixed (mio).
 
-### PR 4 — Transactional copied-send reservation
+### PR 4 — Transactional copied-send reservation + SQ-pressure parking
 
-`SendCopyPool::reserve_slots(n) -> Option<SlotReservation>`; the reservation
-either receives every chunk or is dropped and releases. `free_count` and
-`slot_count` become `pub(crate)` outside `cfg(test)`. io_uring
-`DriverCtx::send` reserves `ceil(len / slot_size)` slots before copying, then
-streams chunks as today (departure 3). Ring gains
-`#[cfg(test)] force_push_failures(n)`; the error kind is unchanged
-(departure 1). Unit tests on the pool. No changelog line (no observable
-change on success paths; on failure the observable change is "no partial
-send", which PR 9's changelog line describes).
+`SendCopyPool::reserve_slots(n) -> Result<SlotReservation, ReserveError>`
+(`Exhausted` is retryable, `TooLarge` never is); the reservation either
+receives every chunk or is released. `free_count` and `slot_count` become
+`pub(crate)` outside `cfg(test)`. io_uring `DriverCtx::send` reserves
+`ceil(len / slot_size)` slots before copying, then streams chunks as today
+(departure 3); a send wider than the whole pool is refused with
+`InvalidInput`. Designing it exposed a second hole: a queued send whose SQE
+could not be pushed (SQ still full after `submit()`) was released together
+with everything queued behind it, with no wake and no close, and the same
+condition on a first TLS entry returned `Err` after rustls had advanced.
+`submit_or_queue` / `queue_built_sends` are now infallible — a built SQE that
+cannot be pushed is parked at its queue head with `in_flight = true` and
+re-pushed by `drain_send_retries` next iteration; two failed attempts fail
+the waiter and close the connection, mirroring `drain_copy_retries`
+(departure 1, refined above). Ring gains `#[cfg(test)]
+force_push_failures(n)`; the error kind stays `Other`. Unit tests on the
+pool, io_uring event-loop tests for admission and parking, and an echo
+integration test on both backends. This PR gets a changelog `Fixed` line
+after all: the earlier plan said none on the assumption that only PR 9 would
+surface the change, but the retry hazard was observable through the public
+`send`/`send_nowait` — a handler that retried a refused multi-slot send
+duplicated the committed prefix. Design:
+`docs/copied-send-reservation-design.md`.
 
 ### PR 5 — Executor send-capacity FIFO
 

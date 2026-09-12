@@ -157,7 +157,7 @@ These are the recurring failure modes in this codebase — the 2026-07 audit (~3
 4. **CQE-skip (`IOSQE_CQE_SKIP_SUCCESS`) is unsound for pool-backed sends** — slot lifecycle needs the CQE, and short sends would be silent. See `docs/send-completion-design.md` before any send-path change.
 5. **Short sends happen.** Stream sends use `MSG_WAITALL` (5.19+) so the kernel retries in-place; any new send variant must handle partial completion explicitly.
 6. **`ENOBUFS` on multishot recv means the provided ring is empty** — re-arm is event-driven (on replenish), not retried in a loop.
-7. **Errors like `EINTR`/`EBUSY` on submit are backpressure, not failures.**
+7. **Errors like `EINTR`/`EBUSY` on submit are backpressure, not failures.** A queued send whose SQE cannot be pushed is parked at its queue head and retried next iteration (`drain_send_retries`), never dropped.
 
 ## Copy Semantics
 
