@@ -5780,3 +5780,107 @@ fn deferred_close_does_not_spin_on_half_closed_peer() {
          (idle baseline {baseline}, bound {bound})"
     );
 }
+
+// ── Write half (series PR 3) ─────────────────────────────────────
+
+/// 0 = not started; 1 = response queued and shutdown_write called;
+/// 2 = read after the half-close returned EOF (peer closed).
+static HALF_CLOSE_PROGRESS: AtomicU32 = AtomicU32::new(0);
+
+const HALF_CLOSE_RESPONSE_LEN: usize = 4 * 1024 * 1024;
+
+/// Reads one request, queues a response larger than any socket buffer,
+/// half-closes, then keeps reading until the peer closes.
+struct RespondThenHalfClose;
+
+impl AsyncEventHandler for RespondThenHalfClose {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            let n = conn
+                .with_data(|data| ParseResult::Consumed(data.len()))
+                .await;
+            if n == 0 {
+                return;
+            }
+            let response = vec![b'x'; HALF_CLOSE_RESPONSE_LEN];
+            conn.send_nowait(&response).expect("queue response");
+            conn.shutdown_write();
+            HALF_CLOSE_PROGRESS.store(1, Ordering::Release);
+            loop {
+                let n = conn
+                    .with_data(|data| ParseResult::Consumed(data.len()))
+                    .await;
+                if n == 0 {
+                    break;
+                }
+            }
+            HALF_CLOSE_PROGRESS.store(2, Ordering::Release);
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        RespondThenHalfClose
+    }
+}
+
+/// `shutdown_write` with sends still queued must let them drain before the
+/// FIN: the peer receives the whole response and only then sees EOF. mio
+/// used to write what fit, drop the rest, and FIN immediately.
+#[test]
+fn half_close_waits_for_queued_sends_to_drain() {
+    HALF_CLOSE_PROGRESS.store(0, Ordering::Release);
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let (shutdown, handles) = RinglineBuilder::new(large_send_config())
+        .bind(addr.parse().unwrap())
+        .launch::<RespondThenHalfClose>()
+        .expect("launch failed");
+
+    let mut stream = connect_with_retry(&addr);
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    stream.write_all(b"go").unwrap();
+
+    // Do not read until the handler has queued the whole response and
+    // called shutdown_write: with the reader racing the writer, a fast
+    // loopback reader can keep the socket buffer from ever filling and the
+    // old truncating drain would sometimes get away with it.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while HALF_CLOSE_PROGRESS.load(Ordering::Acquire) != 1 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        HALF_CLOSE_PROGRESS.load(Ordering::Acquire),
+        1,
+        "handler did not half-close"
+    );
+
+    let mut received = Vec::with_capacity(HALF_CLOSE_RESPONSE_LEN);
+    stream
+        .read_to_end(&mut received)
+        .expect("read to the server's FIN");
+    assert_eq!(
+        received.len(),
+        HALF_CLOSE_RESPONSE_LEN,
+        "response truncated: FIN was sent before the queue drained"
+    );
+    assert!(received.iter().all(|&b| b == b'x'));
+    assert_eq!(HALF_CLOSE_PROGRESS.load(Ordering::Acquire), 1);
+
+    // Our FIN: the handler's post-half-close read must see EOF and finish.
+    drop(stream);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while HALF_CLOSE_PROGRESS.load(Ordering::Acquire) != 2 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        HALF_CLOSE_PROGRESS.load(Ordering::Acquire),
+        2,
+        "handler did not see the peer's EOF after half-close"
+    );
+
+    shutdown.shutdown();
+    for handle in handles {
+        handle.join().unwrap().unwrap();
+    }
+}

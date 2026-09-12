@@ -49,6 +49,17 @@ record gap) green on both backends.
   `docs/connection-state-model-design.md`. Follow-ups recorded there:
   half-close policy (should a peer FIN request teardown at all?), `WriteHalf`
   with PR 3, folding `active`/`recv_multishot_armed` after PR 7.
+- **PR 3 — mio `shutdown_write` deferral + `WriteHalf`.** Done out of
+  series order because it sits on the close machinery #368/#371/#373 just
+  settled. mio's `shutdown_write` truncated any response larger than the
+  socket buffer (nonblocking `write_all`, remainder dropped on
+  `WouldBlock`, FIN sent). It now defers the FIN until `flush_sends`
+  drains the queue, as io_uring's `submit_next_queued` already did, and
+  both backends record the write half as `ConnectionState::write`
+  (`Open`/`ShutdownPending`/`Shutdown`) instead of a flag. The regression
+  test had to make the client wait for the half-close before reading: a
+  fast loopback reader can keep the socket buffer from filling and let the
+  old code get away with it. Design: `docs/write-half-design.md`.
 - **PR 1 — `with_data_result`.** `Executor` gains a generation-tagged
   `recv_errors` slot written by `fail_recv` at the five real socket-read
   failure sites (mio: TLS and plaintext read errors in

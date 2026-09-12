@@ -38,6 +38,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `is_alive() == true` until it is closed. Design:
   `docs/connection-state-model-design.md`.
 
+- Internal: the write half is explicit state on both backends
+  (`ConnectionState::write`: `Open` / `ShutdownPending` / `Shutdown`),
+  replacing the `shutdown_pending` flag on the send state. No policy
+  change: sends after `shutdown_write` still fail at the socket. Design:
+  `docs/write-half-design.md`.
+
 ### Fixed
 
 - mio: a connection whose peer closed first, or whose read failed, was never
@@ -57,6 +63,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   finalizes from the event loop's end-of-iteration drain, where an explicit
   `close()` already did, giving the task its poll window and letting a send
   queued in it drain first. Both backends now give the same window. (#371)
+- mio: `shutdown_write` with sends still queued wrote what fit, dropped the
+  rest, and sent the FIN — a response larger than the socket buffer
+  followed by a half-close was truncated. The FIN now goes out once the
+  queue drains, as on io_uring.
 
 ## [0.6.3] - 2026-09-09
 
