@@ -184,7 +184,7 @@ so it can be reconsidered separately (see Follow-ups).
   whether a peer FIN should request teardown at all, or leave the task
   free to keep writing until it closes (true TCP half-close). That is a
   behaviour change with its own design and tests.
-- `WriteHalf { Open, ShutdownPending, Shutdown }` when series PR 3 touches
+- **Done (series PR 3, `docs/write-half-design.md`):** `WriteHalf { Open, ShutdownPending, Shutdown }` when series PR 3 touches
   `shutdown_write`; `shutdown_pending` moves there.
 - Fold `active` into `Lifecycle::Inactive` and reconcile
   `recv_multishot_armed` with `recv_arm` once PR 7 has reworked the
