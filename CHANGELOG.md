@@ -16,6 +16,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   once. `with_data` is unchanged and still reports `0` for both. First PR of
   the series that lands #318 (design:
   `docs/backpressured-sends-series-design.md`).
+- `ConnCtx::send_backpressured` and `BackpressuredSendFuture`: a send that
+  waits for send-pool capacity instead of failing when the pool is full.
+  Admission is first-come-first-served per worker, so a large message cannot
+  be starved by a stream of small ones, and a message that could never fit
+  the pool is rejected with `InvalidInput` before it joins the queue rather
+  than waiting forever. Nothing is submitted until the future is polled, so
+  dropping one you never awaited does nothing; dropping a parked one hands
+  the queue to the next waiter. `send` is unchanged and still fails fast —
+  use it when a full pool means you would rather shed the message than wait.
+  On a TLS connection admission is sized by the *ciphertext* bound. Final PR
+  of the series that lands #318.
+
+### Fixed
+
+- Copied sends can no longer transmit a prefix and then fail. Pool slots for
+  a multi-chunk copy send are reserved up front, so the send is admitted
+  whole or not at all, and a submission queue that is still full after a
+  submit parks the built SQE and re-pushes the same bytes rather than
+  re-running the logical send. Under TLS the latter mattered most: re-running
+  meant re-encrypting after rustls had already advanced its record sequence,
+  which the peer sees as a gap and rejects with `bad_record_mac`.
 
 ### Changed
 
