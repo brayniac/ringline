@@ -90,6 +90,27 @@ size is not a function of the plaintext. The unbuffered engine exposes no
 byte count for it at all (`tls_bytes_to_write` is buffered-only). The bound
 therefore adds **one whole record** of headroom unconditionally.
 
+### The unbuffered threshold is tighter than it looks
+
+`slots_unbuffered` can only express a bound when one whole record fits in a
+slot, i.e. `slot_size >= F + 29`. In the shipped default that is
+`send_copy_slot_size = 16448` against `F + 29 = 16413` — **a margin of 35
+bytes**. Any configuration that lowers the slot size a little, or raises the
+fragment size, makes the bound inexpressible.
+
+What matters is what happens below that threshold, and it is not a progress
+failure: the unbuffered engine still encrypts (its shrink loop converges,
+and its minimum destination is far smaller), it just emits more records than
+`ceil(len / F)`. So `slots = records` stops being an over-estimate and
+becomes an **under**-estimate — the connection-closing direction.
+
+Therefore the call site must treat `None` as a refusal, not as a reason to
+fall back to the byte formula: a bounded TLS send on a connection whose slot
+size cannot hold a whole record is rejected up front with `InvalidInput`,
+naming `send_copy_slot_size`, the same shape as the existing
+"wider than the whole pool" refusal. Silently proceeding with an
+under-estimate is the one outcome this PR exists to prevent.
+
 ## Where the check goes
 
 **Departure 2 holds with no signature changes.** Both bounded call sites are
