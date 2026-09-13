@@ -6,7 +6,7 @@ use super::{
     DriveOutcome, MAX_SINGLE_APPEND, UnbufferedConn, drive, encrypt_chunk, feed, queue_close_notify,
 };
 use crate::accumulator::AccumulatorTable;
-use crate::tls::{PlaintextSink, TlsConn, TlsConnKind};
+use crate::tls::{DEFAULT_MAX_PLAINTEXT_PER_RECORD, PlaintextSink, TlsConn, TlsConnKind};
 
 fn empty_client_config() -> Arc<rustls::ClientConfig> {
     rustls::ClientConfig::builder()
@@ -31,6 +31,7 @@ fn unbuffered_connection_is_not_buffered() {
         handshake_complete: false,
         peer_sent_close_notify: false,
         close_notify_sent: false,
+        max_plaintext_per_record: DEFAULT_MAX_PLAINTEXT_PER_RECORD,
     };
     assert!(tls_conn.conn.as_buffered_mut().is_none());
     assert!(tls_conn.conn.as_unbuffered_mut().is_some());
@@ -79,6 +80,7 @@ fn conn_pair() -> (TlsConn, TlsConn) {
         handshake_complete: false,
         peer_sent_close_notify: false,
         close_notify_sent: false,
+        max_plaintext_per_record: DEFAULT_MAX_PLAINTEXT_PER_RECORD,
     };
     (
         wrap(UnbufferedConn::new_server(server_config).unwrap()),

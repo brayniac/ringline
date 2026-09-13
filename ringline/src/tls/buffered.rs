@@ -811,6 +811,7 @@ mod segmented_tls_tests {
             handshake_complete: true,
             peer_sent_close_notify: false,
             close_notify_sent: false,
+            max_plaintext_per_record: crate::tls::DEFAULT_MAX_PLAINTEXT_PER_RECORD,
         }
     }
 
