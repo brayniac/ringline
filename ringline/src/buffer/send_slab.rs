@@ -1,4 +1,5 @@
 use crate::guard::GuardBox;
+use crate::runtime::send_capacity::BoundedSendId;
 
 pub(crate) const MAX_IOVECS: usize = 32;
 /// Raised from 4 after rig measurement showed the guard-flush batching cap
@@ -51,6 +52,21 @@ struct InFlightSendEntry {
     /// send waiter is woken only when the entry that carries the final chunk
     /// completes. Single (non-coalesced) sends are always end-of-send.
     end_of_send: bool,
+    /// The bounded send (`ConnCtx::send_backpressured`) this entry settles,
+    /// and the logical (plaintext) length it reports on success — lifted off
+    /// the run's end-of-send pool slot by `submit_next_queued_inner`.
+    ///
+    /// Only `allocate_coalesced` ever sets it. A coalesced op releases the
+    /// pool slots it gathered, so the id cannot stay on the slot that
+    /// carried it into the run; the slab entry is what outlives the slots
+    /// and reaches the completion handler. The run stops at the first
+    /// end-of-send slot, so one entry covers at most one logical send's tail
+    /// and a single `Option` suffices.
+    ///
+    /// `None` for every other allocator: `allocate` backs zero-copy guard
+    /// sends and `allocate_recv_forward` backs `forward_to`, neither of
+    /// which a bounded send can reach (`send_backpressured` is copy-only).
+    bounded_send: Option<(BoundedSendId, u32)>,
     pending_notifs: u8,
     awaiting_notifications: bool,
     in_use: bool,
@@ -80,6 +96,7 @@ impl InFlightSendSlab {
                 generation: 0,
                 total_len: 0,
                 end_of_send: true,
+                bounded_send: None,
                 pending_notifs: 0,
                 awaiting_notifications: false,
                 in_use: false,
@@ -124,6 +141,9 @@ impl InFlightSendSlab {
         entry.generation = generation;
         entry.total_len = total_len;
         entry.end_of_send = true;
+        // A recycled entry must never name a dead operation; this allocator
+        // has no bounded send of its own to record (see the field's docs).
+        entry.bounded_send = None;
         entry.pending_notifs = 0;
         entry.awaiting_notifications = false;
         entry.in_use = true;
@@ -140,6 +160,7 @@ impl InFlightSendSlab {
     /// point into `pool_slots` (one per gathered message). No guards, no ZC
     /// notifications — the pool slots are released together on the operation CQE.
     /// `iovecs_slice` and `pool_slots` must be the same length and <= MAX_IOVECS.
+    #[allow(clippy::too_many_arguments)]
     pub fn allocate_coalesced(
         &mut self,
         conn_index: u32,
@@ -148,9 +169,16 @@ impl InFlightSendSlab {
         pool_slots: &[u16],
         total_len: u32,
         end_of_send: bool,
+        bounded_send: Option<(BoundedSendId, u32)>,
     ) -> Option<(u16, *const libc::msghdr)> {
         debug_assert!(iovecs_slice.len() <= MAX_IOVECS);
         debug_assert_eq!(iovecs_slice.len(), pool_slots.len());
+        // The run stops at the first end-of-send slot, so an id can only
+        // ride the entry that also carries its logical send's final chunk.
+        debug_assert!(
+            bounded_send.is_none() || end_of_send,
+            "a bounded send's id was lifted onto a coalesced entry that is not end-of-send",
+        );
         let idx = self.free_list.pop()?;
         let entry = &mut self.entries[idx as usize];
 
@@ -169,6 +197,7 @@ impl InFlightSendSlab {
         entry.generation = generation;
         entry.total_len = total_len;
         entry.end_of_send = end_of_send;
+        entry.bounded_send = bounded_send;
         entry.pending_notifs = 0;
         entry.awaiting_notifications = false;
         entry.in_use = true;
@@ -220,6 +249,9 @@ impl InFlightSendSlab {
         entry.generation = generation;
         entry.total_len = total_len;
         entry.end_of_send = true;
+        // As in `allocate`: no bounded send can reach this allocator, and a
+        // recycled entry must not carry a previous occupant's id.
+        entry.bounded_send = None;
         entry.pending_notifs = 0;
         entry.awaiting_notifications = false;
         entry.in_use = true;
@@ -324,6 +356,13 @@ impl InFlightSendSlab {
         entry.pool_slot = u16::MAX;
         entry.pool_slot_count = 0;
         entry.bid_count = 0;
+        // Cleared unconditionally so a recycled entry cannot name a dead
+        // operation. A handler that means to settle the send must call
+        // `take_coalesced_bounded_send` *before* releasing; there is no
+        // tripwire here (unlike `SendCopyPool::release`) because
+        // `Driver::run_shutdown` releases slab entries with the executor
+        // already going away, where a lost settle is correct.
+        entry.bounded_send = None;
         entry.in_use = false;
         entry.awaiting_notifications = false;
         entry.pending_notifs = 0;
@@ -340,6 +379,20 @@ impl InFlightSendSlab {
     /// Whether this entry carries the final chunk of its logical send.
     pub fn is_end_of_send(&self, idx: u16) -> bool {
         self.entries[idx as usize].end_of_send
+    }
+
+    /// Take the bounded send this entry settles, if any, leaving `None`.
+    ///
+    /// Take-not-peek for the same reason as
+    /// `SendCopyPool::take_bounded_send`: an id may be settled exactly once,
+    /// and taking is what lets the completion handler release the entry
+    /// afterwards without settling it twice.
+    ///
+    /// Called by the coalesced-send completion handler and the coalesced
+    /// error/retry branches; the result ultimately resolves PR 9's
+    /// `send_backpressured` future.
+    pub fn take_coalesced_bounded_send(&mut self, idx: u16) -> Option<(BoundedSendId, u32)> {
+        self.entries[idx as usize].bounded_send.take()
     }
 
     /// Get the connection index for an entry.

@@ -204,6 +204,23 @@ pub struct DriverCtx<'a> {
     /// failing. Same list as `backend::uring::driver::Driver::pending_send_retries`,
     /// drained by the event loop's `drain_send_retries`.
     pub(crate) pending_send_retries: &'a mut Vec<(u32, u32, u8)>,
+    /// Worker-wide bounded-send results that no CQE will carry, keyed by
+    /// the id the submitting future holds. Same queue as
+    /// `backend::uring::driver::Driver::bounded_send_completions`, drained by
+    /// the event loop into `Executor::complete_bounded_send`.
+    ///
+    /// `send_bounded` needs it for the same reason mio's `DriverCtx` has
+    /// one: a `DriverCtx` is a borrow of driver fields and has no executor
+    /// access, so an operation it settles synchronously has nowhere else to
+    /// go.
+    pub(crate) bounded_send_completions: &'a mut std::collections::VecDeque<(
+        crate::runtime::send_capacity::BoundedSendId,
+        io::Result<u32>,
+    )>,
+    /// Mirror of `Driver::capacity_released`: set when a copy-pool slot goes
+    /// back to the pool so the event loop wakes the send-capacity head once
+    /// per iteration rather than once per released slot.
+    pub(crate) capacity_released: &'a mut bool,
     pub(crate) close_notify_timeout: std::time::Duration,
     pub(crate) next_disk_io_seq: &'a mut u16,
 }
@@ -369,6 +386,211 @@ impl<'a> DriverCtx<'a> {
         // Every promised slot was filled; this returns a zero remainder.
         self.send_copy_pool.release_reservation(reservation);
         Ok(())
+    }
+
+    /// Submit a bounded (`ConnCtx::send_backpressured`) send, tagging the
+    /// operation's identity onto the slot whose completion settles it.
+    ///
+    /// Byte-for-byte [`send`](Self::send) — the same generation check, the
+    /// same `close_submitted` refusal, the same two `reserve_slots` error
+    /// mappings, the same TLS branch, the same chunk loop — plus one thing:
+    /// `id` and the **logical (plaintext) length** are attached to the
+    /// end-of-send slot, so the completion handler can resolve exactly this
+    /// operation with exactly the number the caller passed. The length
+    /// travels because nothing downstream can recompute it: `handle_send`
+    /// accumulates wire bytes, and a TLS send's final `OpTag::Send` chunk is
+    /// one ciphertext record.
+    ///
+    /// Admission is the caller's: `Executor`'s send-capacity FIFO only lets
+    /// this id's turn come up when the pool can take the whole message
+    /// (series PR 9's future). The plaintext-sized budget is what both
+    /// backends use; bounding the ciphertext is series PR 8.
+    ///
+    /// Unlike mio, the reservation is *not* the permit and is not held
+    /// across the TLS branch. It cannot be: on io_uring `encrypt_to_sends`
+    /// allocates the ciphertext's slots out of this same pool, and an
+    /// outstanding reservation hides them from `alloc_raw` (see
+    /// `SendCopyPool::reserve_slots`). So the TLS branch returns before the
+    /// reservation, exactly as `send` does.
+    ///
+    /// On `Ok` exactly one completion for `id` is coming: from a send CQE,
+    /// from a teardown that destroys the queued entry
+    /// (`Driver::bounded_send_completions`), or — when the message produced no
+    /// SQE at all — from this call, synchronously. On `Err` nothing was
+    /// queued and no completion for `id` will ever be produced, so the
+    /// caller owns the failure.
+    ///
+    /// Departure 1 (`docs/uring-bounded-send-design.md`): a TLS failure here
+    /// lands after `encrypt_to_sends` has advanced rustls' record sequence,
+    /// so the connection cannot carry further records. It fails *this*
+    /// operation and closes the connection.
+    // No caller until series PR 9's `send_backpressured` future exists; the
+    // event-loop half of this PR reaches the rest of the machinery through
+    // the driver. PR 9 removes this allowance.
+    #[allow(dead_code)]
+    pub(crate) fn send_bounded(
+        &mut self,
+        conn: ConnToken,
+        data: &[u8],
+        id: crate::runtime::send_capacity::BoundedSendId,
+    ) -> io::Result<()> {
+        let conn_state = self
+            .connections
+            .get(conn.index)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "invalid connection"))?;
+        if conn_state.generation != conn.generation {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "stale connection",
+            ));
+        }
+        // Close already submitted: same refusal, kind and message as `send`
+        // — a new send SQE would race the Close, and a parked one would
+        // never be re-driven. Nothing was reserved yet, so the caller owns
+        // the failure and no completion for `id` is coming.
+        if self.send_queues[conn.index as usize].close_submitted {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "connection closing",
+            ));
+        }
+
+        if !self.tls_table.is_null() {
+            let tls_table = unsafe { &mut *self.tls_table };
+            if tls_table.get_mut(conn.index).is_some() {
+                let sends = match crate::tls::encrypt_to_sends(
+                    tls_table,
+                    self.send_copy_pool,
+                    conn.index,
+                    conn.generation,
+                    data,
+                ) {
+                    Ok(sends) => sends,
+                    Err(e) => {
+                        // Departure 1. `encrypt_to_sends` has already
+                        // released every slot it took, so there is nothing
+                        // to reclaim — but records it encrypted before the
+                        // failure consumed sequence numbers whose ciphertext
+                        // will never reach the wire, which is fatal for the
+                        // connection, not just for this send.
+                        self.close(conn);
+                        return Err(e);
+                    }
+                };
+                // Only the final ciphertext chunk is tagged `OpTag::Send`;
+                // the rest are `OpTag::TlsSend` and are TLS-internal. That
+                // last chunk is the one whose completion ends the logical
+                // send, so it is the one that carries the id — with the
+                // *plaintext* length, which is what the caller asked to
+                // send and the only number meaningful to it (the chunk's
+                // own length is one TLS record's).
+                match sends.last() {
+                    Some(last) => {
+                        debug_assert_eq!(
+                            crate::completion::UserData(last.entry.get_user_data()).tag(),
+                            Some(crate::completion::OpTag::Send),
+                            "encrypt_to_sends must tag its final chunk OpTag::Send",
+                        );
+                        debug_assert_ne!(last.pool_slot, u16::MAX);
+                        self.send_copy_pool
+                            .set_bounded_send(last.pool_slot, id, data.len() as u32);
+                    }
+                    // Empty plaintext produces no records and therefore no
+                    // CQE; nothing will ever settle the id but this call.
+                    None => {
+                        self.bounded_send_completions_push(id, Ok(data.len() as u32));
+                        return Ok(());
+                    }
+                }
+                self.queue_built_sends(conn.index, sends);
+                return Ok(());
+            }
+        }
+
+        let slot_size = self.send_copy_pool.slot_size() as usize;
+        let needed = data.len().div_ceil(slot_size);
+        let mut reservation = match self.send_copy_pool.reserve_slots(needed) {
+            Ok(r) => r,
+            Err(crate::buffer::send_copy::ReserveError::Exhausted) => {
+                return Err(io::Error::other("send copy pool exhausted"));
+            }
+            Err(crate::buffer::send_copy::ReserveError::TooLarge { needed, capacity }) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "send of {} bytes needs {needed} send-pool slots but the pool has \
+                         {capacity} (raise Config::send_pool)",
+                        data.len()
+                    ),
+                ));
+            }
+        };
+
+        let mut chunks = data.chunks(slot_size).peekable();
+        let mut attached = false;
+        while let Some(chunk) = chunks.next() {
+            let (slot, ptr, len) = self
+                .send_copy_pool
+                .copy_in_reserved(&mut reservation, chunk);
+            let end_of_send = chunks.peek().is_none();
+            self.send_copy_pool.set_end_of_send(slot, end_of_send);
+            if end_of_send {
+                // Exactly one slot per logical send carries the id, and it
+                // is the one every success path already reads
+                // (`is_end_of_send`) before releasing.
+                self.send_copy_pool
+                    .set_bounded_send(slot, id, data.len() as u32);
+                attached = true;
+            }
+
+            let user_data = crate::completion::UserData::encode(
+                crate::completion::OpTag::Send,
+                conn.index,
+                crate::completion::UserData::send_payload(slot, conn.generation),
+            );
+            let entry = io_uring::opcode::Send::new(io_uring::types::Fixed(conn.index), ptr, len)
+                .flags(crate::completion::STREAM_SEND_FLAGS)
+                .build()
+                .user_data(user_data.raw());
+
+            let built = BuiltSend {
+                entry,
+                pool_slot: slot,
+                slab_idx: u16::MAX,
+                total_len: chunk.len() as u32,
+            };
+
+            self.submit_or_queue(conn.index, built);
+        }
+
+        // Every promised slot was filled; this returns a zero remainder.
+        self.send_copy_pool.release_reservation(reservation);
+
+        if !attached {
+            // `[].chunks(n)` yields nothing, so a zero-length send queues no
+            // SQE and no CQE is coming. `send` silently does nothing here; a
+            // bounded send must still resolve, so settle it now.
+            self.bounded_send_completions_push(id, Ok(0));
+        }
+        Ok(())
+    }
+
+    /// Record a bounded-send result that no completion will ever carry, and
+    /// note that pool capacity came back.
+    ///
+    /// `DriverCtx` is a borrow of driver fields with no executor access —
+    /// the same reason mio's driver owns a completion queue — so a
+    /// synchronous settle goes onto `Driver::bounded_send_completions` for the
+    /// event loop to hand to `Executor::complete_bounded_send`. The queue
+    /// carries successes too despite its name: what unites its entries is
+    /// that no CQE is coming for them.
+    fn bounded_send_completions_push(
+        &mut self,
+        id: crate::runtime::send_capacity::BoundedSendId,
+        result: io::Result<u32>,
+    ) {
+        self.bounded_send_completions.push_back((id, result));
+        *self.capacity_released = true;
     }
 
     /// Allocate a unique 32-bit disk-I/O completion key: monotonic sequence
