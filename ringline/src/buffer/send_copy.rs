@@ -1,3 +1,5 @@
+use crate::runtime::send_capacity::BoundedSendId;
+
 /// A promise of `remaining` free slots made by [`SendCopyPool::reserve_slots`].
 /// Filled with [`SendCopyPool::copy_in_reserved`]; the unfilled remainder must
 /// go back through [`SendCopyPool::release_reservation`]. Holding one across
@@ -62,6 +64,12 @@ pub struct SendCopyPool {
     // is marked, so the send waiter is woken once per logical send rather
     // than once per chunk. Independent single-slot sends are always final.
     slot_end_of_send: Vec<bool>,
+    // The bounded send (`ConnCtx::send_backpressured`) whose completion this
+    // slot carries, and the logical (plaintext) length that operation reports
+    // on success. Parallel to `slot_end_of_send` and set only on the slot that
+    // is marked end-of-send, so at most one entry exists per logical send.
+    // `None` on every freshly allocated slot; see `set_bounded_send`.
+    slot_bounded_send: Vec<Option<(BoundedSendId, u32)>>,
     // Free-list slots promised to outstanding `SlotReservation`s but not yet
     // popped. Every allocator subtracts this from `free_list.len()` before
     // taking a slot, so a reservation is honoured even if another allocation
@@ -85,6 +93,7 @@ impl SendCopyPool {
             slot_remaining: vec![0u32; n],
             in_use: vec![false; n],
             slot_end_of_send: vec![true; n],
+            slot_bounded_send: vec![None; n],
             reserved: 0,
         }
     }
@@ -112,6 +121,7 @@ impl SendCopyPool {
         self.slot_remaining[idx as usize] = data.len() as u32;
         self.in_use[idx as usize] = true;
         self.slot_end_of_send[idx as usize] = true;
+        self.slot_bounded_send[idx as usize] = None;
         (idx, ptr, data.len() as u32)
     }
 
@@ -151,6 +161,7 @@ impl SendCopyPool {
         self.slot_remaining[idx as usize] = total_len as u32;
         self.in_use[idx as usize] = true;
         self.slot_end_of_send[idx as usize] = true;
+        self.slot_bounded_send[idx as usize] = None;
         Some((idx, out_ptr, total_len as u32))
     }
 
@@ -167,6 +178,7 @@ impl SendCopyPool {
         self.slot_remaining[idx as usize] = 0;
         self.in_use[idx as usize] = true;
         self.slot_end_of_send[idx as usize] = true;
+        self.slot_bounded_send[idx as usize] = None;
         let ptr = self.backing.as_mut_ptr().wrapping_add(offset);
         Some((idx, ptr, self.slot_size))
     }
@@ -236,8 +248,30 @@ impl SendCopyPool {
     }
 
     /// Release a slot back to the free list (called on Send CQE).
+    ///
+    /// A slot must not still carry a bounded send when it is released: every
+    /// disposal path has to take the id with
+    /// [`take_bounded_send`](Self::take_bounded_send) and settle the operation
+    /// first, or the caller's `send_backpressured` future never resolves. The
+    /// `debug_assert` below is that audit's tripwire (it is what makes
+    /// "delete a settle site and watch a test fail" work), and it sits
+    /// *before* the `!in_use` double-free early return on purpose: the
+    /// invariant is "no slot carries an id at release", and it holds for free
+    /// slots too — the three allocators reset the entry and this method clears
+    /// it. Putting the check after the early return would exempt exactly the
+    /// slots whose bookkeeping is already suspect (a slot released twice, or
+    /// one that had an id attached while free), which are the shapes a buggy
+    /// disposal path produces. The clear is unconditional for the same reason,
+    /// so a release build degrades to a lost completion rather than to a
+    /// recycled slot that still names a dead operation.
     pub fn release(&mut self, idx: u16) {
         debug_assert!((idx as usize) < self.count as usize);
+        let carried = self.slot_bounded_send[idx as usize].take();
+        debug_assert!(
+            carried.is_none(),
+            "slot {idx} released while still carrying bounded send {carried:?}; \
+             every disposal path must take the id and complete or fail it first",
+        );
         if !self.in_use[idx as usize] {
             return; // already released — prevent double-free
         }
@@ -304,6 +338,46 @@ impl SendCopyPool {
         self.slot_end_of_send[slot as usize]
     }
 
+    /// Attach a bounded send's identity to this slot, together with the
+    /// **logical (plaintext) length** the operation reports on success.
+    ///
+    /// Set only on the slot that is marked
+    /// [`end_of_send`](Self::set_end_of_send), so one logical send owns at
+    /// most one entry. The length travels with the id because no completion
+    /// handler can recompute it: `handle_send` accumulates wire bytes and a
+    /// TLS send's final `OpTag::Send` chunk is one ciphertext record, neither
+    /// of which is the number the caller passed.
+    ///
+    /// Written by `DriverCtx::send_bounded` (series PR 7b); read back by the
+    /// send completion handlers and the teardown paths of the same PR, and
+    /// ultimately by PR 9's `send_backpressured` future, which is what the
+    /// settled result resolves.
+    // No caller outside this module's tests until series PR 7b wires the
+    // driver up; the `buffer` module's dead-code allow only covers non-uring
+    // builds, so the attribute is what keeps the io_uring build warning-free
+    // in the meantime. PR 7b removes it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn set_bounded_send(&mut self, slot: u16, id: BoundedSendId, logical_len: u32) {
+        self.slot_bounded_send[slot as usize] = Some((id, logical_len));
+    }
+
+    /// Take the bounded send attached to this slot, if any, leaving `None`.
+    ///
+    /// Taking — rather than peeking — is the point: an id can only be settled
+    /// once, and the fact that it is gone is what lets
+    /// [`release`](Self::release) assert that some disposal path settled the
+    /// operation. A handler that means to settle must take here and must not
+    /// look again.
+    ///
+    /// Called by series PR 7b's send/TLS-send completion handlers, its error
+    /// and `close_submitted` branches, and its teardown paths; PR 9's
+    /// `send_backpressured` future is the ultimate consumer of the result.
+    // See `set_bounded_send` for why the dead-code allow is here.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn take_bounded_send(&mut self, slot: u16) -> Option<(BoundedSendId, u32)> {
+        self.slot_bounded_send[slot as usize].take()
+    }
+
     /// Bytes per slot.
     pub fn slot_size(&self) -> u32 {
         self.slot_size
@@ -324,6 +398,13 @@ impl SendCopyPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::send_capacity::SendCapacityQueue;
+
+    /// `BoundedSendId` has no public constructor — the admission queue is the
+    /// only source of ids, which is exactly how the driver gets one too.
+    fn an_id() -> BoundedSendId {
+        SendCapacityQueue::new().enqueue(0, 1, 1, 0)
+    }
 
     #[test]
     fn copy_in_and_release() {
@@ -587,5 +668,115 @@ mod tests {
         let r = full.reserve_slots(0).unwrap();
         assert_eq!(full.free_count(), 0);
         full.release_reservation(r);
+    }
+
+    #[test]
+    fn set_then_take_returns_the_pair_once() {
+        let mut pool = SendCopyPool::new(2, 32);
+        let id = an_id();
+        let (idx, _ptr, _len) = pool.copy_in(b"payload").unwrap();
+
+        // Freshly allocated slots carry nothing.
+        assert_eq!(pool.take_bounded_send(idx), None);
+
+        // The logical length is the caller's, not the slot's byte count —
+        // under TLS they differ, which is the whole reason it is carried.
+        pool.set_bounded_send(idx, id, 4096);
+        assert_eq!(pool.take_bounded_send(idx), Some((id, 4096)));
+        // Taking settles the operation, so a second take must find nothing.
+        assert_eq!(pool.take_bounded_send(idx), None);
+
+        // The id is per-slot: attaching to one leaves its neighbour alone.
+        let (other, _p, _l) = pool.copy_in(b"other").unwrap();
+        assert_ne!(other, idx);
+        pool.set_bounded_send(idx, id, 7);
+        assert_eq!(pool.take_bounded_send(other), None);
+        assert_eq!(pool.take_bounded_send(idx), Some((id, 7)));
+
+        pool.release(idx);
+        pool.release(other);
+    }
+
+    #[test]
+    fn every_allocator_hands_out_a_slot_without_a_bounded_send() {
+        let mut pool = SendCopyPool::new(4, 32);
+
+        let (a, _p, _l) = pool.copy_in(b"a").unwrap();
+        assert_eq!(pool.take_bounded_send(a), None);
+
+        let data = b"gather";
+        let parts: &[(*const u8, usize)] = &[(data.as_ptr(), data.len())];
+        let (b, _p, _l) = unsafe { pool.copy_in_gather(parts, data.len()) }.unwrap();
+        assert_eq!(pool.take_bounded_send(b), None);
+
+        let (c, _p, _cap) = pool.alloc_raw().unwrap();
+        assert_eq!(pool.take_bounded_send(c), None);
+
+        let mut r = pool.reserve_slots(1).unwrap();
+        let (d, _p, _l) = pool.copy_in_reserved(&mut r, b"reserved");
+        assert_eq!(pool.take_bounded_send(d), None);
+        pool.release_reservation(r);
+
+        // A slot recycled from the free list after carrying an id comes back
+        // clean: the disposal path takes the id and the allocator resets the
+        // entry regardless.
+        let id = an_id();
+        pool.set_bounded_send(a, id, 11);
+        assert_eq!(pool.take_bounded_send(a), Some((id, 11)));
+        pool.release(a);
+        let (again, _p, _l) = pool.copy_in(b"recycled").unwrap();
+        assert_eq!(again, a, "LIFO free list should hand back the same slot");
+        assert_eq!(pool.take_bounded_send(again), None);
+
+        for slot in [again, b, c, d] {
+            pool.release(slot);
+        }
+        assert_eq!(pool.free_count(), 4);
+    }
+
+    #[test]
+    fn release_of_a_slot_without_an_id_is_unaffected() {
+        let mut pool = SendCopyPool::new(2, 32);
+        let (idx, _ptr, _len) = pool.copy_in(b"plain send").unwrap();
+        assert_eq!(pool.free_count(), 1);
+
+        pool.release(idx);
+        assert_eq!(pool.free_count(), 2);
+        assert!(!pool.in_use(idx));
+        // The double-free early return still short-circuits.
+        pool.release(idx);
+        assert_eq!(pool.free_count(), 2);
+    }
+
+    /// Releasing a slot that still names a live bounded send means some
+    /// disposal path forgot to settle it; the tripwire fires in debug builds
+    /// (where tests normally run), which is what makes the PR 7b audit
+    /// mechanical rather than asserted.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "still carrying bounded send")]
+    fn release_with_a_live_bounded_send_trips_debug_assert() {
+        let mut pool = SendCopyPool::new(1, 32);
+        let id = an_id();
+        let (idx, _ptr, _len) = pool.copy_in(b"unsettled").unwrap();
+        pool.set_bounded_send(idx, id, 9);
+        pool.release(idx);
+    }
+
+    /// In a release build the tripwire is compiled out, so the documented
+    /// degradation is what must hold: the entry is cleared anyway, and the
+    /// recycled slot never reports a dead operation's id.
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn release_clears_a_live_bounded_send_without_the_tripwire() {
+        let mut pool = SendCopyPool::new(1, 32);
+        let id = an_id();
+        let (idx, _ptr, _len) = pool.copy_in(b"unsettled").unwrap();
+        pool.set_bounded_send(idx, id, 9);
+        pool.release(idx);
+        assert_eq!(pool.take_bounded_send(idx), None);
+        let (again, _p, _l) = pool.copy_in(b"next").unwrap();
+        assert_eq!(again, idx);
+        assert_eq!(pool.take_bounded_send(again), None);
     }
 }
