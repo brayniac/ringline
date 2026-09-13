@@ -11006,6 +11006,12 @@ mod tests {
         // Past the cap: the operation fails and the connection goes down.
         el.drain_send_retries();
         assert!(el.driver.pending_send_retries.is_empty());
+        // The give-up path does not settle the id directly — the parked entry
+        // is still queued, so `drain_conn_send_queue` -> `release_queued_sends`
+        // takes it off the pool slot and fails it through the driver's
+        // completion queue, which the run loop drains. Skipping this step is
+        // what makes the settle look like it never happened.
+        el.drain_bounded_send_completions();
         let result = el
             .executor
             .take_bounded_send_result(id)
