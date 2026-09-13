@@ -2814,6 +2814,97 @@ fn backpressured_send_waits_for_pool_capacity_without_duplication() {
     }
 }
 
+/// Polls `f` exactly once with the *current* task's context, then returns.
+/// Used to park a `send_backpressured` future in one task before moving it to
+/// another, which is the situation the queue's owner tracking exists for.
+struct PollOnce<'f, F>(&'f mut F);
+
+impl<F: Future + Unpin> Future for PollOnce<'_, F> {
+    type Output = ();
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        let _ = std::pin::Pin::new(&mut *self.0).poll(cx);
+        std::task::Poll::Ready(())
+    }
+}
+
+const MOVED_HOG: &[u8] = &[b'H'; 4096];
+const MOVED_MSG: &[u8] = &[b'M'; 4096];
+
+/// Parks a bounded send in the connection task, then moves it to a spawned
+/// task and awaits it there.
+///
+/// The FIFO wakes owners by task id. If the future did not re-register its
+/// owner on the poll after the move, the wake would go to the connection task
+/// — which is no longer polling this future — and the send would hang
+/// forever. The pool is one slot wide and a first send is holding it, so the
+/// moved future is guaranteed to be parked at the moment it changes tasks.
+struct OwnerMoveHandler;
+
+impl AsyncEventHandler for OwnerMoveHandler {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            // Occupies the only pool slot until the client starts reading.
+            let hog_conn = conn;
+            let hog = ringline::spawn_with_handle(hog_conn.send_backpressured(MOVED_HOG))
+                .expect("spawn hog");
+
+            // Park the second send in *this* task...
+            let mut moved = conn.send_backpressured(MOVED_MSG);
+            PollOnce(&mut moved).await;
+
+            // ...then hand it to a different task to finish.
+            let finisher = ringline::spawn_with_handle(moved).expect("spawn finisher");
+
+            let _ = hog.await;
+            let n = finisher.await.expect("the moved send resolved");
+            assert_eq!(n as usize, MOVED_MSG.len());
+            conn.shutdown_write();
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        OwnerMoveHandler
+    }
+}
+
+#[test]
+fn backpressured_send_refreshes_owner_after_first_poll_move() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let config = test_config_builder()
+        .workers(1)
+        .send_pool(1, 4096)
+        .build()
+        .expect("valid config");
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind(addr.parse().unwrap())
+        .launch::<OwnerMoveHandler>()
+        .expect("launch failed");
+    wait_for_server(&addr);
+
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    // Let the hog take the slot and the second send park before draining.
+    std::thread::sleep(Duration::from_millis(200));
+
+    let mut got = Vec::new();
+    stream.read_to_end(&mut got).expect("read to FIN");
+    assert_eq!(
+        got.len(),
+        MOVED_HOG.len() + MOVED_MSG.len(),
+        "both sends completed; the moved one was woken in its new task"
+    );
+
+    shutdown.shutdown();
+    for h in handles {
+        let _ = h.join();
+    }
+}
+
 /// Handler asserting the future is inert until polled: build one, drop it
 /// without awaiting, then do a normal send. If construction had enqueued or
 /// submitted anything, the queue would hold a phantom head and the send
