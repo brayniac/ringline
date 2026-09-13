@@ -775,9 +775,25 @@ pub(crate) mod test_support {
 
     /// A completed in-memory TLS session: (server, client), both past handshake.
     pub(crate) fn handshaked() -> (BufferedKind, BufferedKind) {
+        handshaked_with_versions(rustls::DEFAULT_VERSIONS)
+    }
+
+    /// As [`handshaked`], pinned to the given protocol versions.
+    ///
+    /// `&[&rustls::version::TLS12]` is the reason this exists: the ciphertext
+    /// bound budgets 29 bytes of per-record overhead for TLS 1.2 GCM's
+    /// explicit nonce plus tag, against TLS 1.3's 22, and a worst case that is
+    /// only ever asserted against the cheaper version is not a worst case.
+    /// The library build negotiates TLS 1.3 only (rustls is pulled without
+    /// `tls12`), but `ringline/Cargo.toml` enables `tls12` for
+    /// dev-dependencies and resolver 2 unifies that into every test target —
+    /// so this is reachable here and a downstream crate can unify it in too.
+    pub(crate) fn handshaked_with_versions(
+        versions: &[&'static rustls::SupportedProtocolVersion],
+    ) -> (BufferedKind, BufferedKind) {
         let (certs, key) = test_certs();
         let server_config = Arc::new(
-            rustls::ServerConfig::builder()
+            rustls::ServerConfig::builder_with_protocol_versions(versions)
                 .with_no_client_auth()
                 .with_single_cert(certs.clone(), key)
                 .unwrap(),
@@ -786,10 +802,11 @@ pub(crate) mod test_support {
         for c in &certs {
             roots.add(c.clone()).unwrap();
         }
-        let client_config: Arc<rustls::ClientConfig> = rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth()
-            .into();
+        let client_config: Arc<rustls::ClientConfig> =
+            rustls::ClientConfig::builder_with_protocol_versions(versions)
+                .with_root_certificates(roots)
+                .with_no_client_auth()
+                .into();
         let server_name: rustls::pki_types::ServerName<'_> = "localhost".try_into().unwrap();
 
         let mut server = BufferedKind::Server(ServerConnection::new(server_config).unwrap());

@@ -1040,6 +1040,105 @@ mod tests {
         );
     }
 
+    /// Encrypt `plaintext` on a real handshaked session pinned to `versions`
+    /// and return the ciphertext rustls actually emitted.
+    fn real_ciphertext(
+        versions: &[&'static rustls::SupportedProtocolVersion],
+        plaintext: &[u8],
+    ) -> Vec<u8> {
+        use std::io::Write as _;
+        let (_server, mut client) = buffered::test_support::handshaked_with_versions(versions);
+        client.writer().write_all(plaintext).unwrap();
+        let mut cipher = Vec::new();
+        while client.wants_write() {
+            client.write_tls(&mut cipher).unwrap();
+        }
+        cipher
+    }
+
+    // The bound budgets 29 bytes per record for TLS 1.2 GCM (explicit nonce +
+    // tag) rather than TLS 1.3's 22. A worst case only ever checked against
+    // the cheaper version is not a worst case, so check it against records the
+    // expensive version produced.
+    #[test]
+    fn the_bound_covers_real_tls12_records() {
+        let table = table_with_server(None);
+        for len in [1usize, 100, 16384, 16385, 16384 * 3 + 7] {
+            let plaintext = vec![0xA5u8; len];
+            let cipher = real_ciphertext(&[&rustls::version::TLS12], &plaintext);
+            let bound = table.ciphertext_capacity(0, len).unwrap();
+            assert!(
+                cipher.len() <= bound.bytes(),
+                "TLS 1.2: {len} plaintext bytes became {} ciphertext bytes, over a bound of {}",
+                cipher.len(),
+                bound.bytes()
+            );
+        }
+    }
+
+    // The same records under TLS 1.3, which is what the library build actually
+    // negotiates. Both versions must fit under the one bound — that is the
+    // whole reason it budgets for the more expensive of the two.
+    #[test]
+    fn the_bound_covers_real_tls13_records() {
+        let table = table_with_server(None);
+        for len in [1usize, 100, 16384, 16385, 16384 * 3 + 7] {
+            let plaintext = vec![0xA5u8; len];
+            let cipher = real_ciphertext(&[&rustls::version::TLS13], &plaintext);
+            let bound = table.ciphertext_capacity(0, len).unwrap();
+            assert!(
+                cipher.len() <= bound.bytes(),
+                "TLS 1.3: {len} plaintext bytes became {} ciphertext bytes, over a bound of {}",
+                cipher.len(),
+                bound.bytes()
+            );
+        }
+    }
+
+    /// Bytes rustls adds to one full-size record, measured.
+    fn measured_record_overhead(versions: &[&'static rustls::SupportedProtocolVersion]) -> usize {
+        const ONE_RECORD: usize = DEFAULT_MAX_PLAINTEXT_PER_RECORD;
+        let cipher = real_ciphertext(versions, &vec![0xA5u8; ONE_RECORD]);
+        cipher.len() - ONE_RECORD
+    }
+
+    // `the_bound_covers_real_tls12_records` cannot pin [`MAX_RECORD_OVERHEAD`]
+    // on its own: the bound's slack record is ~16 KiB of headroom, which
+    // swallows a seven-byte-per-record error whole. Verified by mutation —
+    // dropping the constant to TLS 1.3's 22 leaves that test green. So measure
+    // one record's overhead directly and pin the constant to it.
+    #[test]
+    fn max_record_overhead_is_the_measured_tls12_worst_case() {
+        assert_eq!(
+            measured_record_overhead(&[&rustls::version::TLS12]),
+            MAX_RECORD_OVERHEAD,
+            "TLS 1.2 GCM: 5-byte header + 8-byte explicit nonce + 16-byte tag"
+        );
+        assert_eq!(
+            measured_record_overhead(&[&rustls::version::TLS13]),
+            TLS_RECORD_HEADER_LEN + 17,
+            "TLS 1.3: 5-byte header + content-type byte + 16-byte tag"
+        );
+        assert!(
+            measured_record_overhead(&[&rustls::version::TLS12])
+                > measured_record_overhead(&[&rustls::version::TLS13]),
+            "the bound must budget for the more expensive version"
+        );
+    }
+
+    // TLS 1.2 really is the more expensive of the two, so the test above is
+    // not silently checking the same thing twice.
+    #[test]
+    fn tls12_records_are_larger_than_tls13_records() {
+        let plaintext = vec![0xA5u8; 16384 * 2];
+        let twelve = real_ciphertext(&[&rustls::version::TLS12], &plaintext).len();
+        let thirteen = real_ciphertext(&[&rustls::version::TLS13], &plaintext).len();
+        assert!(
+            twelve > thirteen,
+            "TLS 1.2 produced {twelve} bytes, TLS 1.3 produced {thirteen}"
+        );
+    }
+
     // The call sites must not pick an engine themselves: the wrong pick is
     // silent, and picking `slots_buffered` for an unbuffered connection is the
     // under-estimate that closes connections.

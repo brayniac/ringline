@@ -239,6 +239,15 @@ impl SendCopyPool {
 
     /// Give back all but `keep` of a reservation's unfilled slots.
     ///
+    /// mio-only, and gated rather than `allow(dead_code)`d, because io_uring
+    /// has no way to reach it: its bounded TLS path cannot hold a reservation
+    /// across encryption at all (encryption allocates from this same pool and
+    /// the reservation would hide those slots from it), so it admits with a
+    /// plain capacity check and never over-reserves. Its plain path reserves
+    /// exactly what it needs. mio queues an owned buffer instead, so its
+    /// permit is pure admission accounting and *can* be narrowed after the
+    /// fact.
+    ///
     /// A bounded TLS send has to reserve against a conservative *ciphertext*
     /// bound before rustls mutates, and only learns the true cost once the
     /// records exist. This narrows the promise in place. Release-then-
@@ -249,6 +258,7 @@ impl SendCopyPool {
     /// `keep` must not exceed what is left (`debug_assert`ed): a reservation
     /// cannot grow, because growing can fail and this method cannot report
     /// that.
+    #[cfg(not(has_io_uring))]
     pub fn shrink_reservation(&mut self, r: &mut SlotReservation, keep: usize) {
         debug_assert!(
             keep <= r.remaining,
@@ -553,6 +563,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(has_io_uring))]
     fn shrink_reservation_returns_the_difference_and_keeps_the_rest_usable() {
         let mut pool = SendCopyPool::new(4, 8);
 
@@ -578,6 +589,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(has_io_uring))]
     fn shrink_reservation_to_zero_is_a_full_release() {
         let mut pool = SendCopyPool::new(2, 8);
         let mut r = pool.reserve_slots(2).unwrap();
@@ -596,6 +608,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(has_io_uring))]
     fn shrink_reservation_to_its_current_size_changes_nothing() {
         let mut pool = SendCopyPool::new(4, 8);
         let mut r = pool.reserve_slots(2).unwrap();
