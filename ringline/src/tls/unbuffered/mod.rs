@@ -613,7 +613,7 @@ pub(crate) fn feed(
 /// explicit nonce) leaves too little room for the shrink loop to converge on:
 /// it would walk the chunk down to zero and fail anyway, so the caller is told
 /// straight away instead.
-const MIN_ENCRYPT_DST: usize = 64;
+pub(crate) const MIN_ENCRYPT_DST: usize = 64;
 
 /// Encrypt as much of `plaintext` as fits in `dst`, in one or more TLS
 /// records. Returns `(plaintext_consumed, ciphertext_written)`.
