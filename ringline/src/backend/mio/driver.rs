@@ -1032,6 +1032,141 @@ pub(crate) mod tests {
         driver.bounded_send_completions.drain(..).collect()
     }
 
+    /// An already-handshaked `TlsConn` driven by whichever record-layer engine
+    /// this build compiled in. Admission maths is only worth testing against
+    /// records the engine under test actually produced, and the two engines
+    /// size slots differently — the buffered one straddles them, the
+    /// unbuffered one cannot.
+    fn handshaked_tls_conn() -> crate::tls::TlsConn {
+        #[cfg(feature = "tls-unbuffered")]
+        {
+            crate::tls::unbuffered::tests::handshaked_server()
+        }
+        #[cfg(not(feature = "tls-unbuffered"))]
+        {
+            let (server, _peer) = crate::tls::buffered::test_support::handshaked();
+            crate::tls::buffered::test_support::wrap_server(server)
+        }
+    }
+
+    /// The whole point of series PR 8: a bounded TLS send is admitted against
+    /// the *ciphertext* bound, not the plaintext length. Getting this wrong is
+    /// asymmetric — too large only delays the caller, too small lets rustls
+    /// advance its record sequence and then run out of pool, which by
+    /// departure 1 closes the connection.
+    #[test]
+    fn send_bounded_admits_a_tls_send_against_the_ciphertext_bound() {
+        // Slots big enough to hold a whole worst-case record, so the bound is
+        // expressible; the default 64-byte test slot is not.
+        let config = ConfigBuilder::new()
+            .workers(1)
+            .pin_to_core(false)
+            .max_connections(16)
+            .send_pool(8, 16448)
+            .build()
+            .expect("valid test config");
+        let (mut driver, _wake) = test_driver(&config);
+        let (conn_index, _client) = attach_conn(&mut driver);
+        let idx = conn_index as usize;
+        let conn = token(&driver, conn_index);
+        let id = bounded_ids(1)[0];
+
+        // A real, already-handshaked rustls session — the admission maths is
+        // only worth testing against records rustls actually produced.
+        let mut table = crate::tls::TlsTable::new(config.max_connections, None, None);
+        table.insert_for_test(conn_index, handshaked_tls_conn());
+        // One byte-slot's worth of plaintext, chosen so the two sizings give
+        // different answers: it fits in ONE slot as plaintext but spans two
+        // records, so the ciphertext cannot. Sizing the permit by
+        // `data.len()` would admit this send against one slot and then need
+        // two — the under-admission this PR exists to prevent.
+        const PLAINTEXT: usize = 16448;
+        assert_eq!(PLAINTEXT.div_ceil(16448), 1, "one slot as plaintext");
+
+        let bound = table
+            .ciphertext_capacity(conn_index, PLAINTEXT)
+            .expect("the connection has TLS state");
+        driver.tls_table = Some(table);
+
+        // Two records for the plaintext plus the unconditional slack record.
+        assert_eq!(bound.records(), 3);
+        assert_eq!(bound.slots(16448), Some(3));
+
+        assert_eq!(driver.send_copy_pool.free_count(), 8);
+        driver
+            .make_ctx()
+            .send_bounded(conn, &[b'z'; PLAINTEXT], id)
+            .expect("the pool can admit the bound");
+
+        assert_eq!(
+            driver.send_copy_pool.free_count(),
+            6,
+            "admitted against the three-slot ciphertext bound, then shrunk to \
+             the two the records actually cost"
+        );
+
+        let entry = &driver.pending_sends[idx][0];
+        assert!(
+            entry.data.len() > PLAINTEXT,
+            "the queued bytes are ciphertext, not the plaintext"
+        );
+        assert!(
+            entry.data.len() <= bound.bytes(),
+            "the bound must cover what rustls produced"
+        );
+        assert_eq!(entry.bounded.as_ref().map(|(qid, _)| *qid), Some(id));
+        assert_eq!(
+            entry.bounded.as_ref().map(|(_, p)| p.remaining()),
+            Some(2),
+            "the permit left on the entry is the shrunk one"
+        );
+    }
+
+    /// A slot too small for the ciphertext bound refuses the send outright
+    /// rather than admitting it against a smaller number. Which refusal you
+    /// get depends on the engine, and both are correct: the buffered engine
+    /// straddles slots, so a 64-byte slot is merely expensive (513 of them) and
+    /// the pool-size refusal fires; the unbuffered engine cannot straddle, so
+    /// no bound is expressible at all and the slot-size refusal fires. What
+    /// must never happen in either build is a send admitted against a bound
+    /// that is too small.
+    #[test]
+    fn send_bounded_refuses_a_tls_send_a_64_byte_slot_cannot_bound() {
+        let config = test_config(); // 64-byte slots
+        let (mut driver, _wake) = test_driver(&config);
+        let (conn_index, _client) = attach_conn(&mut driver);
+        let conn = token(&driver, conn_index);
+        let id = bounded_ids(1)[0];
+
+        let mut table = crate::tls::TlsTable::new(config.max_connections, None, None);
+        table.insert_for_test(conn_index, handshaked_tls_conn());
+        driver.tls_table = Some(table);
+
+        let err = driver
+            .make_ctx()
+            .send_bounded(conn, &[b'z'; 100], id)
+            .expect_err("a 64-byte slot cannot bound a TLS send");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        // Either way the message has to name the knob the operator can change.
+        let msg = err.to_string();
+        #[cfg(feature = "tls-unbuffered")]
+        assert!(
+            msg.contains("send_copy_slot_size"),
+            "no bound is expressible, so the refusal names the slot size: {msg}"
+        );
+        #[cfg(not(feature = "tls-unbuffered"))]
+        assert!(
+            msg.contains("send-pool slots") && msg.contains("Config::send_pool"),
+            "the bound is expressible but exceeds the pool: {msg}"
+        );
+        assert_eq!(
+            driver.send_copy_pool.free_count(),
+            4,
+            "a refusal reserves nothing"
+        );
+        assert!(driver.bounded_send_completions.is_empty());
+    }
+
     /// Admission is the reservation: `send_bounded` takes its copy-pool
     /// permit up front, queues the bytes, and writes nothing.
     #[test]

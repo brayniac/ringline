@@ -458,6 +458,54 @@ impl<'a> DriverCtx<'a> {
         if !self.tls_table.is_null() {
             let tls_table = unsafe { &mut *self.tls_table };
             if tls_table.get_mut(conn.index).is_some() {
+                // Admission has to happen *before* rustls mutates: past the
+                // first record, departure 1 turns a shortfall into a closed
+                // connection rather than backpressure. The permit is sized by
+                // the ciphertext bound, not the plaintext length.
+                //
+                // A plain capacity check is enough here and a reservation is
+                // not: `encrypt_to_sends` allocates from this same pool, and
+                // an outstanding reservation would hide those slots from it.
+                // The worker is single-threaded and nothing allocates between
+                // this check and the first allocation inside the call.
+                let slot_size = self.send_copy_pool.slot_size() as usize;
+                let bound = tls_table
+                    .ciphertext_capacity(conn.index, data.len())
+                    .expect("connection has TLS state: checked above");
+                let needed = match bound.slots(slot_size) {
+                    Some(n) => n,
+                    // No bound is expressible for this slot size, so the only
+                    // honest answer is a refusal. Falling back to the byte
+                    // formula here would under-estimate the unbuffered engine
+                    // — the one direction that closes connections.
+                    None => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "a bounded TLS send needs a send-pool slot of at least {} bytes \
+                                 to hold one whole record, but \
+                                 Config::send_copy_slot_size is {slot_size}",
+                                bound.min_slot_size()
+                            ),
+                        ));
+                    }
+                };
+                if needed > self.send_copy_pool.slot_count() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "a bounded TLS send of {} bytes needs up to {needed} send-pool \
+                             slots but the pool has {} (raise Config::send_pool)",
+                            data.len(),
+                            self.send_copy_pool.slot_count()
+                        ),
+                    ));
+                }
+                if self.send_copy_pool.free_count() < needed {
+                    crate::metrics::POOL.increment(crate::metrics::pool::SEND_EXHAUSTED);
+                    return Err(io::Error::other("send copy pool exhausted"));
+                }
+                let free_before = self.send_copy_pool.free_count();
                 let sends = match crate::tls::encrypt_to_sends(
                     tls_table,
                     self.send_copy_pool,
@@ -477,6 +525,18 @@ impl<'a> DriverCtx<'a> {
                         return Err(e);
                     }
                 };
+                // The tripwire. Three hazards are modelled rather than
+                // measured — unbuffered record waste, a pessimistic
+                // `max_plaintext_per_chunk` cache, and rustls draining a
+                // queued alert or key_update into the same destination — and
+                // a bound that is only checked by the tests written for it
+                // drifts. If any of them is ever beaten, a debug build says
+                // so here instead of closing a connection in production.
+                debug_assert!(
+                    free_before.saturating_sub(self.send_copy_pool.free_count()) <= needed,
+                    "TLS ciphertext bound beaten: reserved {needed} slots, encryption took {}",
+                    free_before.saturating_sub(self.send_copy_pool.free_count()),
+                );
                 // Only the final ciphertext chunk is tagged `OpTag::Send`;
                 // the rest are `OpTag::TlsSend` and are TLS-internal. That
                 // last chunk is the one whose completion ends the logical
@@ -2345,8 +2405,38 @@ impl<'a> DriverCtx<'a> {
 
         let idx = conn.index as usize;
         let slot_size = self.send_copy_pool.slot_size() as usize;
-        let needed = data.len().div_ceil(slot_size);
-        let permit = match self.send_copy_pool.reserve_slots(needed) {
+
+        // A TLS connection is admitted against the *ciphertext* bound, sized
+        // before rustls mutates: past the first record a shortfall would
+        // close the connection instead of applying backpressure. Plain sends
+        // keep the plaintext sizing they have always had.
+        let tls_bound = if self.tls_table.is_null() {
+            None
+        } else {
+            let tls_table = unsafe { &*self.tls_table };
+            tls_table.ciphertext_capacity(conn.index, data.len())
+        };
+        let needed = match &tls_bound {
+            Some(bound) => match bound.slots(slot_size) {
+                Some(n) => n,
+                // No bound is expressible for this slot size; the byte
+                // formula would under-estimate the unbuffered engine, which
+                // is the direction that closes connections. Refuse instead.
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "a bounded TLS send needs a send-pool slot of at least {} bytes to \
+                             hold one whole record, but Config::send_copy_slot_size is \
+                             {slot_size}",
+                            bound.min_slot_size()
+                        ),
+                    ));
+                }
+            },
+            None => data.len().div_ceil(slot_size),
+        };
+        let mut permit = match self.send_copy_pool.reserve_slots(needed) {
             Ok(r) => r,
             Err(crate::buffer::send_copy::ReserveError::Exhausted) => {
                 return Err(io::Error::other("send copy pool exhausted"));
@@ -2364,38 +2454,56 @@ impl<'a> DriverCtx<'a> {
         };
 
         // TLS: encrypt first, then carry the id and permit on the ciphertext
-        // entry. The permit is sized by the *plaintext* length, so the
-        // ciphertext's record overhead is admitted for free — the design
-        // records this as series PR 8's gap (io_uring has the same
-        // plaintext-sized admission), not something to paper over here.
-        if !self.tls_table.is_null() {
+        // entry. The permit was sized by the conservative bound above; once
+        // the records exist the true cost is known, so the surplus goes back
+        // to the pool rather than sitting on a queued entry until it flushes.
+        if let Some(bound) = tls_bound {
             let tls_table = unsafe { &mut *self.tls_table };
-            if tls_table.has(conn.index) {
-                let ciphertext = match crate::tls::encrypt_for_send_mio(tls_table, conn.index, data)
-                {
-                    Ok(c) => c,
-                    Err(e) => {
-                        // rustls has already advanced; nothing is queued, so
-                        // give the permit back and let the caller see the
-                        // error (no completion for `id` is produced).
-                        self.release_permit(permit);
-                        return Err(e);
-                    }
-                };
-                if ciphertext.is_empty() {
-                    // Nothing to queue and therefore nothing that could ever
-                    // complete the id: settle it here.
+            let ciphertext = match crate::tls::encrypt_for_send_mio(tls_table, conn.index, data) {
+                Ok(c) => c,
+                Err(e) => {
+                    // rustls has already advanced; nothing is queued, so
+                    // give the permit back and let the caller see the
+                    // error (no completion for `id` is produced).
                     self.release_permit(permit);
-                    self.bounded_send_completions
-                        .push_back((id, Ok(data.len() as u32)));
-                    return Ok(());
+                    return Err(e);
                 }
-                self.pending_sends[idx].push_back(
-                    crate::backend::mio::driver::PendingSend::bounded(ciphertext, id, permit),
-                );
-                self.mark_send_dirty(idx);
+            };
+            // The tripwire. Three hazards are modelled rather than measured —
+            // unbuffered record waste, a pessimistic `max_plaintext_per_chunk`
+            // cache, and rustls draining a queued alert or key_update into the
+            // same destination. A bound checked only by the tests written for
+            // it drifts; if one is ever beaten, a debug build says so here
+            // rather than closing a connection in production.
+            debug_assert!(
+                ciphertext.len() <= bound.bytes(),
+                "TLS ciphertext bound beaten: bounded {} bytes, rustls produced {}",
+                bound.bytes(),
+                ciphertext.len(),
+            );
+            if ciphertext.is_empty() {
+                // Nothing to queue and therefore nothing that could ever
+                // complete the id: settle it here.
+                self.release_permit(permit);
+                self.bounded_send_completions
+                    .push_back((id, Ok(data.len() as u32)));
                 return Ok(());
             }
+            // `.min(needed)` cannot normally bind — the tripwire above fires
+            // first if it would — but in a release build it keeps a beaten
+            // bound from turning into a grow, which `shrink_reservation`
+            // refuses. Holding the larger permit is the safe direction.
+            let keep = ciphertext.len().div_ceil(slot_size).min(needed);
+            if keep < permit.remaining() {
+                self.send_copy_pool.shrink_reservation(&mut permit, keep);
+                // Slots came back, so the send-capacity head may now fit.
+                *self.capacity_released = true;
+            }
+            self.pending_sends[idx].push_back(crate::backend::mio::driver::PendingSend::bounded(
+                ciphertext, id, permit,
+            ));
+            self.mark_send_dirty(idx);
+            return Ok(());
         }
 
         if data.is_empty() {

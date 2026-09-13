@@ -615,31 +615,6 @@ pub(crate) fn feed(
 /// straight away instead.
 const MIN_ENCRYPT_DST: usize = 64;
 
-/// RFC 8446's maximum `TLSPlaintext.length`: 2^14 bytes of plaintext in one
-/// record. This is a protocol constant, not a tuning knob — handing rustls
-/// more plaintext than this in a single `encrypt` call cannot produce a larger
-/// record, it just makes rustls fragment internally and emit more than one.
-/// rustls has the same value as `msgs::fragmenter::MAX_FRAGMENT_LEN`, but it
-/// is `pub(crate)` there, so ringline carries its own.
-const MAX_FRAGMENT_LEN: usize = 16384;
-
-/// Wire size of one maximum-size TLS 1.3 record: 5-byte record header,
-/// [`MAX_FRAGMENT_LEN`] of plaintext, the inner content-type byte, and a
-/// 16-byte AEAD tag — 16406 bytes.
-///
-/// Deliberately *not* derived from `MAX_TLS_WIRE_RECORD` (18437), which is the
-/// conservative bound on a record we must be prepared to **receive** and
-/// carries 2 KiB of slack for TLS 1.2's explicit nonce. Sizing anything we
-/// **emit** from that number has produced three separate wrong answers in this
-/// area already.
-///
-/// 16 is the tag length of every TLS 1.3 suite rustls offers, so this is exact
-/// for the suites reachable here. It is only ever used to pick the *starting*
-/// chunk in [`encrypt_chunk`]; if a future suite made it an underestimate, the
-/// `InsufficientSize` retry loop would still converge, just after one extra
-/// attempt. Correctness never depends on it.
-const MAX_RECORD_WIRE_LEN: usize = 5 + MAX_FRAGMENT_LEN + 1 + 16;
-
 /// Encrypt as much of `plaintext` as fits in `dst`, in one or more TLS
 /// records. Returns `(plaintext_consumed, ciphertext_written)`.
 ///
@@ -681,6 +656,10 @@ pub(crate) fn encrypt_chunk(
             "TLS destination buffer too small to hold one record",
         ));
     }
+    // Read before the borrow below: the hint has to be denominated in *this*
+    // connection's records, not the default ones.
+    let fragment_len = tls_conn.max_plaintext_per_record;
+    let record_overhead = crate::tls::negotiated_record_overhead(&tls_conn.conn);
     let conn = tls_conn
         .conn
         .as_unbuffered_mut()
@@ -712,11 +691,29 @@ pub(crate) fn encrypt_chunk(
         // 16384-byte default slot is exactly this case, missing it by 22
         // bytes. There is no whole-record answer, so fall back to the previous
         // behaviour and let the retry loop find the largest chunk that fits.
-        let whole = dst.len() / MAX_RECORD_WIRE_LEN;
+        //
+        // Both terms are the *connection's* record size, not
+        // `MAX_FRAGMENT_LEN`/`MAX_RECORD_WIRE_LEN`. Those constants describe a
+        // default-configured TLS 1.3 connection, and using them for a
+        // connection with an overridden `max_fragment_size` is not a
+        // pessimisation but a correctness bug: any `F` below ~16382 makes
+        // `whole == 0` for every slot the caller can reasonably size, the retry
+        // loop then converges *below* `F`, and that converged value is cached
+        // for the rest of the connection. Series PR 8's unbuffered slot bound
+        // (`slots = records`) is an upper bound only while a slot carries at
+        // least one whole record, so caching less than `F` turns admission
+        // into an under-estimate — and by departure 1 an under-estimate closes
+        // the connection rather than applying backpressure. The wire term uses
+        // the TLS 1.2 worst case for the same reason the bound does: the hint
+        // must fit under whichever version this connection negotiated — the
+        // admission bound's version-agnostic worst case would leave a whole
+        // TLS 1.3 record of `dst` unused and drop back into the retry loop.
+        let record_wire_len = fragment_len + record_overhead;
+        let whole = dst.len() / record_wire_len;
         if whole == 0 {
             dst.len()
         } else {
-            whole * MAX_FRAGMENT_LEN
+            whole * fragment_len
         }
     };
     let mut chunk = plaintext.len().min(hint.max(1));
@@ -1074,4 +1071,4 @@ fn drain_pending_plaintext(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

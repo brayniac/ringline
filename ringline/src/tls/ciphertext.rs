@@ -35,7 +35,7 @@ use std::io;
 /// much this buffer must be prepared to hold for one inbound record, with
 /// deliberate slack. It is *not* the size of a record ringline emits: a
 /// full-size TLS 1.3 record on the wire is 16406 bytes (see
-/// `unbuffered::MAX_RECORD_WIRE_LEN`), 2 KiB smaller. Sizing a send-side
+/// one maximum-size TLS 1.3 record, 16406 bytes), 2 KiB smaller. Sizing a send-side
 /// buffer, slot, or chunk from this constant overshoots by that slack and has
 /// produced three separate wrong answers in this area — do not reach for it
 /// from the send path.

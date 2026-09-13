@@ -731,14 +731,19 @@ pub(super) fn borrow_conn_and_buf(
 /// networking), then feeds the server ciphertext and drains its plaintext into a
 /// [`PlaintextSink::Segments`], asserting decrypted plaintext lands as owned
 /// segments and that the outstanding-plaintext bound kills an over-limit flood.
-#[cfg(all(test, has_io_uring))]
-mod segmented_tls_tests {
+/// In-memory rustls handshake harness shared by the TLS tests.
+///
+/// Portable on purpose: it builds real rustls records with no sockets and no
+/// backend, so both the io_uring-only segmented tests below and the
+/// backend-agnostic admission tests elsewhere use the same records. It used to
+/// live inside `segmented_tls_tests` behind `has_io_uring`, which kept it off
+/// the development machine for no reason.
+#[cfg(test)]
+pub(crate) mod test_support {
     use super::*;
-    use crate::backend::HeldRecvBuf;
-    use std::collections::VecDeque;
     use std::io::Cursor;
 
-    fn test_certs() -> (
+    pub(crate) fn test_certs() -> (
         Vec<rustls::pki_types::CertificateDer<'static>>,
         rustls::pki_types::PrivateKeyDer<'static>,
     ) {
@@ -750,7 +755,7 @@ mod segmented_tls_tests {
 
     /// Move all of `from`'s pending TLS output into `to`, driving `to`'s state
     /// machine. Used to pump a handshake to completion.
-    fn pump(from: &mut BufferedKind, to: &mut BufferedKind) {
+    pub(crate) fn pump(from: &mut BufferedKind, to: &mut BufferedKind) {
         let mut buf = Vec::new();
         while from.wants_write() {
             from.write_tls(&mut buf).unwrap();
@@ -769,10 +774,26 @@ mod segmented_tls_tests {
     }
 
     /// A completed in-memory TLS session: (server, client), both past handshake.
-    fn handshaked() -> (BufferedKind, BufferedKind) {
+    pub(crate) fn handshaked() -> (BufferedKind, BufferedKind) {
+        handshaked_with_versions(rustls::DEFAULT_VERSIONS)
+    }
+
+    /// As [`handshaked`], pinned to the given protocol versions.
+    ///
+    /// `&[&rustls::version::TLS12]` is the reason this exists: the ciphertext
+    /// bound budgets 29 bytes of per-record overhead for TLS 1.2 GCM's
+    /// explicit nonce plus tag, against TLS 1.3's 22, and a worst case that is
+    /// only ever asserted against the cheaper version is not a worst case.
+    /// The library build negotiates TLS 1.3 only (rustls is pulled without
+    /// `tls12`), but `ringline/Cargo.toml` enables `tls12` for
+    /// dev-dependencies and resolver 2 unifies that into every test target —
+    /// so this is reachable here and a downstream crate can unify it in too.
+    pub(crate) fn handshaked_with_versions(
+        versions: &[&'static rustls::SupportedProtocolVersion],
+    ) -> (BufferedKind, BufferedKind) {
         let (certs, key) = test_certs();
         let server_config = Arc::new(
-            rustls::ServerConfig::builder()
+            rustls::ServerConfig::builder_with_protocol_versions(versions)
                 .with_no_client_auth()
                 .with_single_cert(certs.clone(), key)
                 .unwrap(),
@@ -781,10 +802,11 @@ mod segmented_tls_tests {
         for c in &certs {
             roots.add(c.clone()).unwrap();
         }
-        let client_config: Arc<rustls::ClientConfig> = rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth()
-            .into();
+        let client_config: Arc<rustls::ClientConfig> =
+            rustls::ClientConfig::builder_with_protocol_versions(versions)
+                .with_root_certificates(roots)
+                .with_no_client_auth()
+                .into();
         let server_name: rustls::pki_types::ServerName<'_> = "localhost".try_into().unwrap();
 
         let mut server = BufferedKind::Server(ServerConnection::new(server_config).unwrap());
@@ -805,14 +827,24 @@ mod segmented_tls_tests {
         (server, client)
     }
 
-    fn wrap_server(server: BufferedKind) -> TlsConn {
+    pub(crate) fn wrap_server(server: BufferedKind) -> TlsConn {
         TlsConn {
             conn: TlsConnKind::Buffered(server),
             handshake_complete: true,
             peer_sent_close_notify: false,
             close_notify_sent: false,
+            max_plaintext_per_record: crate::tls::DEFAULT_MAX_PLAINTEXT_PER_RECORD,
         }
     }
+}
+
+#[cfg(all(test, has_io_uring))]
+mod segmented_tls_tests {
+    use super::test_support::*;
+    use super::*;
+    use crate::backend::HeldRecvBuf;
+    use std::collections::VecDeque;
+    use std::io::Cursor;
 
     fn held_len(hold: &VecDeque<HeldRecvBuf>) -> usize {
         hold.iter()

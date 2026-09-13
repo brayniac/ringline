@@ -49,14 +49,14 @@ use crate::buffer::send_copy::SendCopyPool;
 mod backend_mio;
 #[cfg(has_io_uring)]
 mod backend_uring;
-mod buffered;
+pub(crate) mod buffered;
 // The incoming-ciphertext buffer belongs to the unbuffered engine and has no
 // other consumer, so it shares the engine's gate; without it every item in the
 // module is dead code in a default build.
 #[cfg(feature = "tls-unbuffered")]
 mod ciphertext;
 #[cfg(feature = "tls-unbuffered")]
-mod unbuffered;
+pub(crate) mod unbuffered;
 
 // Glob re-export keeps call sites at `crate::tls::*`. Both backends' shared
 // names now live in their dispatcher module; nothing is re-exported from
@@ -158,6 +158,18 @@ impl TlsConnKind {
         }
     }
 
+    /// Whether the unbuffered record layer drives this connection.
+    ///
+    /// Always `false` without the `tls-unbuffered` feature, because the
+    /// variant does not exist there.
+    pub fn is_unbuffered(&self) -> bool {
+        match self {
+            Self::Buffered(_) => false,
+            #[cfg(feature = "tls-unbuffered")]
+            Self::Unbuffered(_) => true,
+        }
+    }
+
     pub fn wants_write(&self) -> bool {
         match self {
             Self::Buffered(k) => k.wants_write(),
@@ -236,6 +248,248 @@ pub struct TlsConn {
     /// for any TLS connection, without consulting this, so nothing outside
     /// this module reads it today.
     pub close_notify_sent: bool,
+    /// Plaintext bytes rustls will put in one outgoing record on this
+    /// connection, **with the 5-byte record header already subtracted**.
+    ///
+    /// Recorded once, at [`TlsTable::create`]/[`TlsTable::create_client`],
+    /// from `ServerConfig::max_fragment_size` / `ClientConfig::max_fragment_size`
+    /// — the only source there is. The `max_fragment_length` extension is
+    /// never negotiated by rustls 0.23.41, so there is no per-connection value
+    /// to learn later.
+    ///
+    /// The config field *includes* the header (rustls'
+    /// `MessageFragmenter::set_max_fragment_size` subtracts `PACKET_OVERHEAD`
+    /// before storing it, 0.23.41 `src/msgs/fragmenter.rs:65`). Storing it
+    /// already subtracted is the point of the field: no call site can repeat
+    /// the off-by-five.
+    ///
+    /// Read by [`TlsTable::ciphertext_capacity`].
+    // Live only through the capacity API until PR 8's call-site task wires
+    // that into `DriverCtx::send_bounded`; removed with the allow on
+    // `CiphertextCapacity`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub max_plaintext_per_record: usize,
+}
+
+/// Bytes of TLS record header on the wire: content type (1) + legacy record
+/// version (2) + length (2).
+///
+/// rustls calls this `PACKET_OVERHEAD` (0.23.41 `src/msgs/fragmenter.rs:5`).
+/// It is `pub(crate)` there, so ringline keeps its own copy — as
+/// `tls::unbuffered` already does for the fragment constants, and for the same
+/// reason.
+const TLS_RECORD_HEADER_LEN: usize = 5;
+
+/// The smallest `max_fragment_size` rustls accepts; anything below it is
+/// `Error::BadMaxFragmentSize` and the connection never gets built (0.23.41
+/// `src/msgs/fragmenter.rs:65`).
+const MIN_MAX_FRAGMENT_SIZE: usize = 32;
+
+/// The largest `max_fragment_size` rustls accepts, and the size a `None`
+/// config means: 16384 bytes of plaintext plus the 5-byte header (0.23.41
+/// `src/msgs/fragmenter.rs:6`, `MAX_FRAGMENT_SIZE`).
+const MAX_MAX_FRAGMENT_SIZE: usize = 16384 + TLS_RECORD_HEADER_LEN;
+
+/// Plaintext bytes per record when no `max_fragment_size` is configured:
+/// rustls' `msgs::fragmenter::MAX_FRAGMENT_LEN`, which is `pub(crate)` there.
+pub(crate) const DEFAULT_MAX_PLAINTEXT_PER_RECORD: usize =
+    MAX_MAX_FRAGMENT_SIZE - TLS_RECORD_HEADER_LEN;
+
+/// Worst-case wire overhead of one record ringline **emits**: the 5-byte
+/// header plus the largest AEAD expansion reachable here.
+///
+/// TLS 1.2 GCM expands by 24 — an 8-byte explicit nonce and a 16-byte tag
+/// (0.23.41 `src/crypto/ring/tls12.rs:306`, `encrypted_payload_len`). TLS 1.3
+/// expands by 17 (inner content-type byte + 16-byte tag,
+/// `src/crypto/ring/tls13.rs:230`) and TLS 1.2 ChaCha20-Poly1305 by 16, so 29
+/// covers every suite either engine can negotiate.
+///
+/// **29, not 22, deliberately.** The library build resolves rustls without the
+/// `tls12` feature, so it negotiates only TLS 1.3 — but `ringline/Cargo.toml`
+/// enables `tls12` for dev-dependencies, and resolver 2 unifies that into every
+/// test target. TLS 1.2 is therefore reachable under `cargo test`, and in any
+/// downstream crate that unifies the feature in. A bound that is right for the
+/// library build and wrong under test is not a bound.
+///
+/// Deliberately *not* derived from one maximum-size TLS 1.3 record, which
+/// assumes TLS 1.3 and explicitly disclaims correctness dependence. Sizing
+/// something we emit from the wrong record constant has already produced three
+/// separate wrong answers in this area.
+pub(crate) const MAX_RECORD_OVERHEAD: usize = TLS_RECORD_HEADER_LEN + 8 + 16;
+
+/// Turn a rustls `max_fragment_size` config value into plaintext bytes per
+/// record, with the header subtracted exactly as
+/// `MessageFragmenter::set_max_fragment_size` does.
+///
+/// Values outside rustls' accepted `32..=16389` range fall back to the default.
+/// They cannot reach a live connection — `ServerConnection::new` /
+/// `ClientConnection::new` propagate `BadMaxFragmentSize` and
+/// [`TlsTable::create`] returns the error — but keeping this total means the
+/// bound has no panicking input.
+pub(crate) fn plaintext_per_record(max_fragment_size: Option<usize>) -> usize {
+    match max_fragment_size {
+        Some(sz) if (MIN_MAX_FRAGMENT_SIZE..=MAX_MAX_FRAGMENT_SIZE).contains(&sz) => {
+            sz - TLS_RECORD_HEADER_LEN
+        }
+        _ => DEFAULT_MAX_PLAINTEXT_PER_RECORD,
+    }
+}
+
+/// Bytes rustls adds to one record on a connection that has already
+/// negotiated a version: 24 for TLS 1.2 GCM (explicit nonce + tag), 17 for
+/// TLS 1.3 (inner content type + tag), plus the 5-byte header either way.
+///
+/// [`MAX_RECORD_OVERHEAD`] is the version-agnostic worst case and is what the
+/// admission bound budgets, because admission must be right before it knows
+/// anything. This is the *exact* figure and is for callers that have a
+/// handshaked connection in hand — sizing an encryption chunk with the worst
+/// case would leave a TLS 1.3 record's worth of destination unused and push
+/// the engine into its retry loop for nothing.
+///
+/// Falls back to the worst case before a version is negotiated.
+///
+/// Deliberately **not** derived from `ciphertext::MAX_TLS_WIRE_RECORD`, which
+/// bounds a record we must be prepared to *receive* and carries 2 KiB of slack.
+/// Sizing anything we *emit* from that number has produced three separate wrong
+/// answers in this area already.
+/// Only the unbuffered engine sizes encryption chunks against a destination,
+/// so it is the only caller; gated rather than `allow(dead_code)`d.
+#[cfg(feature = "tls-unbuffered")]
+pub(crate) fn negotiated_record_overhead(conn: &TlsConnKind) -> usize {
+    match conn.protocol_version() {
+        Some(rustls::ProtocolVersion::TLSv1_3) => TLS_RECORD_HEADER_LEN + 1 + 16,
+        Some(_) => MAX_RECORD_OVERHEAD,
+        None => MAX_RECORD_OVERHEAD,
+    }
+}
+
+/// How much ciphertext a plaintext send may turn into, computed **before**
+/// rustls is allowed to mutate.
+///
+/// A bounded TLS send has to decide admission up front: once rustls has
+/// encrypted a record it has advanced its sequence number, and running out of
+/// pool mid-message is not recoverable — the send fails and the connection is
+/// closed. So this is a bound, not an estimate, and every term errs upward.
+/// Over-reserving costs admission latency; under-reserving costs a connection.
+///
+/// Obtained from [`TlsTable::ciphertext_capacity`], which supplies the
+/// connection's fragment size. The three quantities it answers are the design's
+/// `ciphertext_capacity_bytes` ([`Self::bytes`]),
+/// `ciphertext_capacity_slots_buffered` ([`Self::slots_buffered`]) and
+/// `ciphertext_capacity_slots_unbuffered` ([`Self::slots_unbuffered`]);
+/// they are methods on one value rather than three lookups so that the record
+/// count is derived once and cannot drift between them.
+///
+/// See `docs/tls-premutation-bound-design.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CiphertextCapacity {
+    /// Records the bound accounts for: `ceil(plaintext_len / F)` plus the
+    /// slack record described on [`TlsTable::ciphertext_capacity`].
+    records: usize,
+    /// The connection's plaintext bytes per record.
+    max_plaintext_per_record: usize,
+    /// Which engine drives the connection this bound was taken for. Read from
+    /// the connection's own tag, not from the cargo feature: the two agree
+    /// today, and a call site that assumed so would be silently wrong on the
+    /// day they stop agreeing.
+    unbuffered: bool,
+}
+
+// Same rationale as the `allow` on the struct: PR 8's call-site task removes it.
+#[cfg_attr(not(test), allow(dead_code))]
+impl CiphertextCapacity {
+    /// Records the bound covers, including the slack record — so this is never
+    /// zero, even for an empty plaintext.
+    pub fn records(&self) -> usize {
+        self.records
+    }
+
+    /// Upper bound on ciphertext bytes: `records * (F + 29)`.
+    ///
+    /// Correct for both engines and both backends. `F + 29` is the worst-case
+    /// wire size of one record ([`MAX_RECORD_OVERHEAD`]).
+    pub fn bytes(&self) -> usize {
+        self.records * (self.max_plaintext_per_record + MAX_RECORD_OVERHEAD)
+    }
+
+    /// Upper bound on [`crate::buffer::send_copy::SendCopyPool`] slots for the
+    /// **buffered** engine: `ceil(bytes / slot_size)`.
+    ///
+    /// Exact, because the buffered path writes ciphertext through `PoolWriter`,
+    /// which packs slots contiguously and lets a single record straddle a slot
+    /// boundary. Nothing is wasted at the seam.
+    ///
+    /// `None` only for `slot_size == 0`, which `ConfigBuilder` already rejects;
+    /// the shape matches [`Self::slots_unbuffered`] so a caller handles one
+    /// "cannot express a bound for this slot size" arm rather than two.
+    pub fn slots_buffered(&self, slot_size: usize) -> Option<usize> {
+        if slot_size == 0 {
+            return None;
+        }
+        Some(self.bytes().div_ceil(slot_size))
+    }
+
+    /// Upper bound on [`crate::buffer::send_copy::SendCopyPool`] slots for the
+    /// **unbuffered** engine: one record per slot, i.e. [`Self::records`].
+    ///
+    /// `encrypt_chunk` writes whole records into one slot and cannot straddle,
+    /// so the byte formula *under*-estimates this engine — at a 32768-byte slot
+    /// and 49152 bytes of plaintext the byte formula says 2 slots and the
+    /// engine takes 3. One record per slot is the engine's own worst case and
+    /// is always safe. It over-reserves whenever a slot holds several records,
+    /// which costs admission latency and nothing else.
+    ///
+    /// The engine's real per-slot capacity is **not** a closed form and must
+    /// not be derived from one: it is a cached `max_plaintext_per_chunk` that
+    /// only ever shrinks for a given destination size, and the hint seeding it
+    /// hardcodes the *default* fragment constants — so with an overridden
+    /// fragment size the hint is wrong and the shrink loop converges instead.
+    /// A tighter bound has to be **measured**, not calculated.
+    ///
+    /// Returns `None` when `slot_size` cannot hold one whole worst-case record
+    /// (`F + 29`). That is not a nicety: below that size the shrink loop
+    /// converges on a chunk smaller than `F`, so the connection emits *more*
+    /// records than `ceil(plaintext_len / F)` and this bound would be too
+    /// small — the one failure mode that closes connections. At `slot_size`
+    /// under `unbuffered::MIN_ENCRYPT_DST` the engine cannot make progress at
+    /// all. Callers must turn `None` into an error rather than a guess.
+    ///
+    /// The default `send_copy_slot_size` (16448) clears `F + 29` = 16413 for
+    /// the default fragment size, so the common configuration is `Some`.
+    pub fn slots_unbuffered(&self, slot_size: usize) -> Option<usize> {
+        if slot_size < self.max_plaintext_per_record + MAX_RECORD_OVERHEAD {
+            return None;
+        }
+        Some(self.records)
+    }
+
+    /// The smallest `send_copy_slot_size` for which a bound is expressible.
+    ///
+    /// One whole worst-case record, `F + 29`. Only meaningful when
+    /// [`Self::slots`] returned `None`; it is what the refusal names so the
+    /// operator can fix the configuration rather than guess at it.
+    pub fn min_slot_size(&self) -> usize {
+        self.max_plaintext_per_record + MAX_RECORD_OVERHEAD
+    }
+
+    /// The slot bound for the engine that actually drives this connection.
+    ///
+    /// This is what admission call sites must use. The two primitives above
+    /// are the tested arithmetic; choosing between them at a call site is how
+    /// a connection ends up admitted against the buffered formula and then
+    /// encrypted by the unbuffered engine, which is the under-estimate that
+    /// closes connections.
+    ///
+    /// `None` carries the same meaning as [`Self::slots_unbuffered`]: no bound
+    /// can be expressed for this slot size, and the caller must refuse the
+    /// send rather than guess.
+    pub fn slots(&self, slot_size: usize) -> Option<usize> {
+        if self.unbuffered {
+            self.slots_unbuffered(slot_size)
+        } else {
+            self.slots_buffered(slot_size)
+        }
+    }
 }
 
 /// Table of TLS connections, indexed by connection slot.
@@ -292,6 +546,9 @@ impl TlsTable {
             .as_ref()
             .expect("create() called without server_config")
             .clone();
+        // Read before the config is moved into the connection, and before any
+        // engine selection: the value is the same either way.
+        let max_plaintext_per_record = plaintext_per_record(server_config.max_fragment_size);
         #[cfg(feature = "tls-unbuffered")]
         let conn = TlsConnKind::Unbuffered(unbuffered::UnbufferedConn::new_server(server_config)?);
         #[cfg(not(feature = "tls-unbuffered"))]
@@ -303,6 +560,7 @@ impl TlsTable {
             handshake_complete: false,
             peer_sent_close_notify: false,
             close_notify_sent: false,
+            max_plaintext_per_record,
         });
         Ok(())
     }
@@ -319,6 +577,7 @@ impl TlsTable {
             .as_ref()
             .expect("create_client() called without client_config")
             .clone();
+        let max_plaintext_per_record = plaintext_per_record(client_config.max_fragment_size);
         #[cfg(feature = "tls-unbuffered")]
         let conn = TlsConnKind::Unbuffered(unbuffered::UnbufferedConn::new_client(
             client_config,
@@ -334,8 +593,64 @@ impl TlsTable {
             handshake_complete: false,
             peer_sent_close_notify: false,
             close_notify_sent: false,
+            max_plaintext_per_record,
         });
         Ok(())
+    }
+
+    /// The pre-mutation ciphertext bound for encrypting `plaintext_len` bytes
+    /// on the connection at `conn_index`, or `None` if that slot has no TLS
+    /// state.
+    ///
+    /// `records = ceil(plaintext_len / F) + 1`, where `F` is the connection's
+    /// [`TlsConn::max_plaintext_per_record`]. Zero plaintext still costs one
+    /// record.
+    ///
+    /// **The `+ 1` is a whole record of slack and is not optional.** rustls
+    /// drains whatever is already sitting in `sendable_tls` — a TLS 1.3
+    /// `key_update`, an alert — into the *front* of the same destination
+    /// buffer (0.23.41 `CommonState::write_fragments`, and
+    /// `check_required_size` sizes `required_size` to include it). Its size is
+    /// not a function of `plaintext_len`, and the unbuffered engine exposes no
+    /// byte count for it at all: `tls_bytes_to_write` is buffered-only. So the
+    /// bound carries headroom for it unconditionally rather than pretending it
+    /// can be predicted.
+    ///
+    /// **This is the single source of that number.** PR 9's bounded-send
+    /// future must compute the `required_slots` it hands
+    /// `SendCapacityQueue::enqueue` with this same function, and its
+    /// oversize-rejection test must use it too. If the FIFO admits on a
+    /// different number than the backend checks, the queue will admit a
+    /// message the backend then refuses — which is the failure this bound
+    /// exists to prevent.
+    ///
+    /// See `docs/tls-premutation-bound-design.md`.
+    // PR 8's call-site task is what gives this a non-test caller.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn ciphertext_capacity(
+        &self,
+        conn_index: u32,
+        plaintext_len: usize,
+    ) -> Option<CiphertextCapacity> {
+        let tls_conn = self.conns[conn_index as usize].as_ref()?;
+        let f = tls_conn.max_plaintext_per_record;
+        debug_assert!(f > 0, "fragment size is validated at create()");
+        Some(CiphertextCapacity {
+            records: plaintext_len.div_ceil(f.max(1)) + 1,
+            max_plaintext_per_record: f,
+            unbuffered: tls_conn.conn.is_unbuffered(),
+        })
+    }
+
+    /// Install a ready-made connection at `conn_index`.
+    ///
+    /// Test seam: `create`/`create_client` build a connection that still has
+    /// to handshake over a socket, which a unit test has no way to drive.
+    /// `buffered::test_support::handshaked` produces a real, already-handshaked
+    /// rustls session in memory; this puts one where the driver looks for it.
+    #[cfg(test)]
+    pub(crate) fn insert_for_test(&mut self, conn_index: u32, conn: TlsConn) {
+        self.conns[conn_index as usize] = Some(conn);
     }
 
     /// Get a mutable reference to the TLS connection at the given index.
@@ -606,5 +921,320 @@ mod tests {
             conn.conn.as_buffered_mut().is_some(),
             "default build must select the buffered engine"
         );
+    }
+
+    /// A server config whose `max_fragment_size` is overridden. 2048 is inside
+    /// rustls' accepted `32..=16389`, so the connection still builds.
+    fn server_config_with_fragment(max_fragment_size: usize) -> Arc<rustls::ServerConfig> {
+        let mut config = Arc::try_unwrap(server_config()).expect("sole owner");
+        config.max_fragment_size = Some(max_fragment_size);
+        Arc::new(config)
+    }
+
+    fn client_config() -> Arc<rustls::ClientConfig> {
+        Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth(),
+        )
+    }
+
+    fn table_with_server(max_fragment_size: Option<usize>) -> TlsTable {
+        let config = match max_fragment_size {
+            Some(sz) => server_config_with_fragment(sz),
+            None => server_config(),
+        };
+        let mut table = TlsTable::new(4, Some(config), Some(client_config()));
+        table.create(0).expect("create a server connection");
+        table
+    }
+
+    // The whole point of storing the fragment size already subtracted. The
+    // rustls config value *includes* the 5-byte record header; a build that
+    // dropped the subtraction would report 16389 / 2048 here.
+    #[test]
+    fn max_plaintext_per_record_subtracts_the_record_header() {
+        let mut table = table_with_server(None);
+        assert_eq!(
+            table.get_mut(0).unwrap().max_plaintext_per_record,
+            16384,
+            "default `None` config means one whole maximum-size fragment of plaintext"
+        );
+
+        let mut table = table_with_server(Some(2048));
+        assert_eq!(
+            table.get_mut(0).unwrap().max_plaintext_per_record,
+            2043,
+            "a configured max_fragment_size includes the 5-byte header"
+        );
+    }
+
+    // `create_client` must record the same thing from the client config, or an
+    // outbound TLS connection gets a bound computed from the wrong fragment
+    // size.
+    #[test]
+    fn create_client_records_the_client_configs_fragment_size() {
+        let mut config = Arc::try_unwrap(client_config()).expect("sole owner");
+        config.max_fragment_size = Some(2048);
+        let mut table = TlsTable::new(4, None, Some(Arc::new(config)));
+        let name: rustls::pki_types::ServerName<'static> = "localhost".try_into().unwrap();
+        table.create_client(1, name).expect("create a client");
+        assert_eq!(table.get_mut(1).unwrap().max_plaintext_per_record, 2043);
+    }
+
+    // Out-of-range values never reach a live connection (rustls refuses them),
+    // but the helper must stay total rather than underflow.
+    #[test]
+    fn out_of_range_fragment_sizes_fall_back_to_the_default() {
+        assert_eq!(plaintext_per_record(Some(0)), 16384);
+        assert_eq!(plaintext_per_record(Some(31)), 16384);
+        assert_eq!(plaintext_per_record(Some(16390)), 16384);
+        assert_eq!(plaintext_per_record(Some(32)), 27);
+        assert_eq!(plaintext_per_record(Some(16389)), 16384);
+        assert_eq!(plaintext_per_record(None), 16384);
+    }
+
+    #[test]
+    fn capacity_is_none_for_a_slot_without_tls() {
+        let table = table_with_server(None);
+        assert!(table.ciphertext_capacity(1, 100).is_none());
+    }
+
+    // Record counting across every boundary that matters, including the
+    // unconditional slack record.
+    #[test]
+    fn record_count_covers_the_boundaries_plus_one_slack_record() {
+        let table = table_with_server(None);
+        let records = |len: usize| table.ciphertext_capacity(0, len).unwrap().records();
+
+        assert_eq!(
+            records(0),
+            1,
+            "an empty plaintext still owes the slack record"
+        );
+        assert_eq!(records(1), 2);
+        assert_eq!(records(16384), 2, "exactly one record");
+        assert_eq!(records(16385), 3, "one byte over");
+        assert_eq!(records(16384 * 4), 5);
+        assert_eq!(records(16384 * 4 + 1), 6);
+    }
+
+    #[test]
+    fn byte_bound_is_records_times_the_worst_case_record() {
+        let table = table_with_server(None);
+        let cap = table.ciphertext_capacity(0, 16384 * 4).unwrap();
+        assert_eq!(cap.records(), 5);
+        assert_eq!(cap.bytes(), 5 * (16384 + 29));
+
+        // Zero plaintext is one whole record of slack, not zero bytes.
+        let empty = table.ciphertext_capacity(0, 0).unwrap();
+        assert_eq!(empty.bytes(), 16384 + 29);
+    }
+
+    // The buffered engine packs `PoolWriter` slots contiguously, so the slot
+    // count is exactly the byte count divided by the slot size.
+    #[test]
+    fn buffered_slots_divide_the_byte_bound() {
+        let table = table_with_server(None);
+        let cap = table.ciphertext_capacity(0, 16384 * 4).unwrap();
+        let bytes = cap.bytes();
+        assert_eq!(bytes, 82065);
+        assert_eq!(cap.slots_buffered(16448), Some(bytes.div_ceil(16448)));
+        assert_eq!(cap.slots_buffered(16448), Some(5));
+        // A slot size that divides the bound exactly must not round up.
+        assert_eq!(cap.slots_buffered(bytes), Some(1));
+        assert_eq!(cap.slots_buffered(bytes / 5), Some(5));
+        // Zero is config-rejected; the API stays total.
+        assert_eq!(cap.slots_buffered(0), None);
+    }
+
+    // One record per slot: the unbuffered engine's own worst case. It
+    // over-reserves when a slot holds several records, which is the safe
+    // direction.
+    #[test]
+    fn unbuffered_slots_are_one_record_each() {
+        let table = table_with_server(None);
+        let cap = table.ciphertext_capacity(0, 16384 * 4).unwrap();
+        assert_eq!(cap.slots_unbuffered(16448), Some(5));
+        // A slot big enough for several records still reserves one per record.
+        assert_eq!(cap.slots_unbuffered(16448 * 4), Some(5));
+        assert!(
+            cap.slots_unbuffered(16448 * 4).unwrap() > cap.slots_buffered(16448 * 4).unwrap(),
+            "the byte formula under-estimates the unbuffered engine"
+        );
+    }
+
+    /// Encrypt `plaintext` on a real handshaked session pinned to `versions`
+    /// and return the ciphertext rustls actually emitted.
+    fn real_ciphertext(
+        versions: &[&'static rustls::SupportedProtocolVersion],
+        plaintext: &[u8],
+    ) -> Vec<u8> {
+        use std::io::Write as _;
+        let (_server, mut client) = buffered::test_support::handshaked_with_versions(versions);
+        client.writer().write_all(plaintext).unwrap();
+        let mut cipher = Vec::new();
+        while client.wants_write() {
+            client.write_tls(&mut cipher).unwrap();
+        }
+        cipher
+    }
+
+    // The bound budgets 29 bytes per record for TLS 1.2 GCM (explicit nonce +
+    // tag) rather than TLS 1.3's 22. A worst case only ever checked against
+    // the cheaper version is not a worst case, so check it against records the
+    // expensive version produced.
+    #[test]
+    fn the_bound_covers_real_tls12_records() {
+        let table = table_with_server(None);
+        for len in [1usize, 100, 16384, 16385, 16384 * 3 + 7] {
+            let plaintext = vec![0xA5u8; len];
+            let cipher = real_ciphertext(&[&rustls::version::TLS12], &plaintext);
+            let bound = table.ciphertext_capacity(0, len).unwrap();
+            assert!(
+                cipher.len() <= bound.bytes(),
+                "TLS 1.2: {len} plaintext bytes became {} ciphertext bytes, over a bound of {}",
+                cipher.len(),
+                bound.bytes()
+            );
+        }
+    }
+
+    // The same records under TLS 1.3, which is what the library build actually
+    // negotiates. Both versions must fit under the one bound — that is the
+    // whole reason it budgets for the more expensive of the two.
+    #[test]
+    fn the_bound_covers_real_tls13_records() {
+        let table = table_with_server(None);
+        for len in [1usize, 100, 16384, 16385, 16384 * 3 + 7] {
+            let plaintext = vec![0xA5u8; len];
+            let cipher = real_ciphertext(&[&rustls::version::TLS13], &plaintext);
+            let bound = table.ciphertext_capacity(0, len).unwrap();
+            assert!(
+                cipher.len() <= bound.bytes(),
+                "TLS 1.3: {len} plaintext bytes became {} ciphertext bytes, over a bound of {}",
+                cipher.len(),
+                bound.bytes()
+            );
+        }
+    }
+
+    /// Bytes rustls adds to one full-size record, measured.
+    fn measured_record_overhead(versions: &[&'static rustls::SupportedProtocolVersion]) -> usize {
+        const ONE_RECORD: usize = DEFAULT_MAX_PLAINTEXT_PER_RECORD;
+        let cipher = real_ciphertext(versions, &vec![0xA5u8; ONE_RECORD]);
+        cipher.len() - ONE_RECORD
+    }
+
+    // `the_bound_covers_real_tls12_records` cannot pin [`MAX_RECORD_OVERHEAD`]
+    // on its own: the bound's slack record is ~16 KiB of headroom, which
+    // swallows a seven-byte-per-record error whole. Verified by mutation —
+    // dropping the constant to TLS 1.3's 22 leaves that test green. So measure
+    // one record's overhead directly and pin the constant to it.
+    #[test]
+    fn max_record_overhead_is_the_measured_tls12_worst_case() {
+        assert_eq!(
+            measured_record_overhead(&[&rustls::version::TLS12]),
+            MAX_RECORD_OVERHEAD,
+            "TLS 1.2 GCM: 5-byte header + 8-byte explicit nonce + 16-byte tag"
+        );
+        assert_eq!(
+            measured_record_overhead(&[&rustls::version::TLS13]),
+            TLS_RECORD_HEADER_LEN + 17,
+            "TLS 1.3: 5-byte header + content-type byte + 16-byte tag"
+        );
+        assert!(
+            measured_record_overhead(&[&rustls::version::TLS12])
+                > measured_record_overhead(&[&rustls::version::TLS13]),
+            "the bound must budget for the more expensive version"
+        );
+    }
+
+    // TLS 1.2 really is the more expensive of the two, so the test above is
+    // not silently checking the same thing twice.
+    #[test]
+    fn tls12_records_are_larger_than_tls13_records() {
+        let plaintext = vec![0xA5u8; 16384 * 2];
+        let twelve = real_ciphertext(&[&rustls::version::TLS12], &plaintext).len();
+        let thirteen = real_ciphertext(&[&rustls::version::TLS13], &plaintext).len();
+        assert!(
+            twelve > thirteen,
+            "TLS 1.2 produced {twelve} bytes, TLS 1.3 produced {thirteen}"
+        );
+    }
+
+    // The call sites must not pick an engine themselves: the wrong pick is
+    // silent, and picking `slots_buffered` for an unbuffered connection is the
+    // under-estimate that closes connections.
+    #[test]
+    fn slots_follows_the_connections_own_engine() {
+        let table = table_with_server(None);
+        let cap = table.ciphertext_capacity(0, 16384 * 4).unwrap();
+
+        #[cfg(feature = "tls-unbuffered")]
+        assert_eq!(cap.slots(16448 * 4), cap.slots_unbuffered(16448 * 4));
+        #[cfg(not(feature = "tls-unbuffered"))]
+        assert_eq!(cap.slots(16448 * 4), cap.slots_buffered(16448 * 4));
+
+        // The two disagree at this slot size, so the assertion above is not
+        // satisfied by both answers at once.
+        assert_ne!(
+            cap.slots_unbuffered(16448 * 4),
+            cap.slots_buffered(16448 * 4)
+        );
+    }
+
+    // Below one whole worst-case record the engine's shrink loop converges on
+    // a chunk smaller than F, emitting more records than `ceil(len / F)` — so
+    // `records` would be an under-estimate and the caller must get an error
+    // instead of a number.
+    #[test]
+    fn unbuffered_refuses_a_slot_smaller_than_one_record() {
+        let table = table_with_server(None);
+        let cap = table.ciphertext_capacity(0, 16384).unwrap();
+        assert_eq!(
+            cap.slots_unbuffered(16384 + 29),
+            Some(2),
+            "exactly one record fits"
+        );
+        assert_eq!(cap.slots_unbuffered(16384 + 28), None);
+        assert_eq!(
+            cap.slots_unbuffered(16384),
+            None,
+            "a bare fragment is not a record"
+        );
+        assert_eq!(cap.slots_unbuffered(0), None);
+
+        // The shipped default clears the threshold, so the common
+        // configuration is not silently unusable.
+        let default_slot = crate::config::Config::default().send_copy_slot_size as usize;
+        assert!(
+            default_slot >= 16384 + 29,
+            "default send_copy_slot_size {default_slot} must hold one whole record"
+        );
+        assert!(cap.slots_unbuffered(default_slot).is_some());
+    }
+
+    // The off-by-five is visible here and nowhere else: at F = 2043 a
+    // 2048-byte plaintext spans two records, while the unsubtracted F = 2048
+    // would say one. Both the record count and the byte bound would be short.
+    #[test]
+    fn overridden_fragment_size_counts_records_against_the_subtracted_size() {
+        let table = table_with_server(Some(2048));
+        let cap = table.ciphertext_capacity(0, 2048).unwrap();
+        assert_eq!(
+            cap.records(),
+            3,
+            "2048 bytes spans two 2043-byte records, plus the slack record"
+        );
+        assert_eq!(cap.bytes(), 3 * (2043 + 29));
+
+        // Exactly on the subtracted boundary, and one byte past it.
+        assert_eq!(table.ciphertext_capacity(0, 2043).unwrap().records(), 2);
+        assert_eq!(table.ciphertext_capacity(0, 2044).unwrap().records(), 3);
+
+        // The overridden size also moves the unbuffered threshold.
+        assert_eq!(cap.slots_unbuffered(2043 + 29), Some(3));
+        assert_eq!(cap.slots_unbuffered(2043 + 28), None);
     }
 }

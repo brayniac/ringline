@@ -6,7 +6,14 @@ use super::{
     DriveOutcome, MAX_SINGLE_APPEND, UnbufferedConn, drive, encrypt_chunk, feed, queue_close_notify,
 };
 use crate::accumulator::AccumulatorTable;
-use crate::tls::{PlaintextSink, TlsConn, TlsConnKind};
+use crate::tls::{DEFAULT_MAX_PLAINTEXT_PER_RECORD, PlaintextSink, TlsConn, TlsConnKind};
+
+/// Wire size of one maximum-size TLS 1.3 record on a default-configured
+/// connection: the 5-byte header, 16384 bytes of plaintext, the inner
+/// content-type byte and a 16-byte AEAD tag. Production derives the same
+/// number per connection via `tls::negotiated_record_overhead`; this is the
+/// default-config value the tests below pin.
+const DEFAULT_RECORD_WIRE_LEN: usize = DEFAULT_MAX_PLAINTEXT_PER_RECORD + 5 + 1 + 16;
 
 fn empty_client_config() -> Arc<rustls::ClientConfig> {
     rustls::ClientConfig::builder()
@@ -31,6 +38,7 @@ fn unbuffered_connection_is_not_buffered() {
         handshake_complete: false,
         peer_sent_close_notify: false,
         close_notify_sent: false,
+        max_plaintext_per_record: DEFAULT_MAX_PLAINTEXT_PER_RECORD,
     };
     assert!(tls_conn.conn.as_buffered_mut().is_none());
     assert!(tls_conn.conn.as_unbuffered_mut().is_some());
@@ -57,33 +65,106 @@ fn test_certs() -> (
 }
 
 fn conn_pair() -> (TlsConn, TlsConn) {
+    conn_pair_with_fragment(None)
+}
+
+/// A connection pair whose configs pin `max_fragment_size`.
+///
+/// rustls' field counts the 5-byte record header, so the plaintext per record
+/// is `max_fragment_size - 5`; `TlsConn::max_plaintext_per_record` stores the
+/// subtracted value, exactly as `TlsTable::create` records it.
+fn conn_pair_with_fragment(max_fragment_size: Option<usize>) -> (TlsConn, TlsConn) {
     let (certs, key) = test_certs();
-    let server_config = Arc::new(
-        rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certs.clone(), key)
-            .unwrap(),
-    );
+    let mut server_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs.clone(), key)
+        .unwrap();
+    server_config.max_fragment_size = max_fragment_size;
+    let server_config = Arc::new(server_config);
     let mut roots = rustls::RootCertStore::empty();
     for c in &certs {
         roots.add(c.clone()).unwrap();
     }
-    let client_config: Arc<rustls::ClientConfig> = rustls::ClientConfig::builder()
+    let mut client_config = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
-        .with_no_client_auth()
-        .into();
+        .with_no_client_auth();
+    client_config.max_fragment_size = max_fragment_size;
+    let client_config: Arc<rustls::ClientConfig> = client_config.into();
     let name: ServerName<'static> = "localhost".try_into().unwrap();
 
+    let f = crate::tls::plaintext_per_record(max_fragment_size);
     let wrap = |c| TlsConn {
         conn: TlsConnKind::Unbuffered(c),
         handshake_complete: false,
         peer_sent_close_notify: false,
         close_notify_sent: false,
+        max_plaintext_per_record: f,
     };
     (
         wrap(UnbufferedConn::new_server(server_config).unwrap()),
         wrap(UnbufferedConn::new_client(client_config, name).unwrap()),
     )
+}
+
+/// An already-handshaked unbuffered **server** connection, for tests outside
+/// this module that need real records from the engine this build compiled in.
+/// The buffered twin is `tls::buffered::test_support::handshaked`.
+pub(crate) fn handshaked_server() -> TlsConn {
+    let (mut server, mut client) = conn_pair();
+    let mut accs = AccumulatorTable::new_with_max(4, 64 * 1024, 1 << 20);
+    handshake(&mut server, &mut client, &mut accs);
+    assert!(
+        !server.conn.is_handshaking(),
+        "in-memory unbuffered handshake did not complete"
+    );
+    server
+}
+
+/// PR 8's unbuffered slot bound is `slots = records`, which is only an upper
+/// bound if each slot carries at least `F` plaintext bytes. `encrypt_chunk`'s
+/// whole-record hint decides that, and it must read the connection's own
+/// fragment size: with the hardcoded default constants, any overridden
+/// `max_fragment_size` below ~16382 makes `whole == 0`, the retry loop
+/// converges *below* `F`, and the converged value is cached for every later
+/// slot — so a long send silently needs more slots than it was admitted for.
+/// By departure 1 that closes the connection instead of applying backpressure,
+/// which is the one outcome the bound exists to prevent.
+#[test]
+fn the_chunk_hint_never_caches_less_than_one_record() {
+    // 2048 - 5 = 2043 bytes of plaintext per record; the smallest slot for
+    // which `CiphertextCapacity::slots_unbuffered` will express a bound is
+    // `F + 29`, and that is exactly what the refusal message tells operators
+    // to configure — so it is the size that must work.
+    const FRAGMENT: usize = 2048;
+    let f = crate::tls::plaintext_per_record(Some(FRAGMENT));
+    assert_eq!(f, 2043);
+    let dst_len = f + crate::tls::MAX_RECORD_OVERHEAD;
+
+    let (mut server, mut client) = conn_pair_with_fragment(Some(FRAGMENT));
+    let mut accs = AccumulatorTable::new_with_max(4, 64 * 1024, 1 << 20);
+    handshake(&mut server, &mut client, &mut accs);
+
+    // Enough plaintext that the hint, not the message, decides the chunk.
+    let plaintext = vec![0xC3u8; 64 * 1024];
+    let mut dst = vec![0u8; dst_len];
+    let (chunk, _written) =
+        encrypt_chunk(&mut server, &plaintext, &mut dst).expect("a slot of F + 29 must encrypt");
+
+    assert!(
+        chunk >= f,
+        "a slot of {dst_len} bytes took only {chunk} plaintext bytes, under one \
+         {f}-byte record — `slots = records` is then an under-estimate"
+    );
+    let cached = server
+        .conn
+        .as_unbuffered_mut()
+        .unwrap()
+        .max_plaintext_per_chunk;
+    assert!(
+        cached == 0 || cached >= f,
+        "the cache keeps {cached} plaintext bytes per slot, under one {f}-byte \
+         record; every later slot inherits it"
+    );
 }
 
 /// Push `bytes` into `to`'s ciphertext buffer and drive it, collecting its
@@ -602,19 +683,19 @@ fn a_whole_record_destination_encrypts_whole_records() {
 
     let big = vec![0x33u8; 512 * 1024];
     for records in 1..=4usize {
-        let mut dst = vec![0u8; records * super::MAX_RECORD_WIRE_LEN];
+        let mut dst = vec![0u8; records * DEFAULT_RECORD_WIRE_LEN];
         // Twice: the first call may still learn, the second is steady state.
         super::encrypt_chunk(&mut client, &big, &mut dst).expect("encrypt");
         let (used_pt, used_ct) =
             super::encrypt_chunk(&mut client, &big, &mut dst).expect("encrypt");
         assert_eq!(
             used_pt,
-            records * super::MAX_FRAGMENT_LEN,
+            records * DEFAULT_MAX_PLAINTEXT_PER_RECORD,
             "a {records}-record destination must take {records} full fragments"
         );
         assert_eq!(
             used_ct,
-            records * super::MAX_RECORD_WIRE_LEN,
+            records * DEFAULT_RECORD_WIRE_LEN,
             "and emit exactly {records} full records, filling dst"
         );
     }
@@ -636,7 +717,7 @@ fn a_destination_below_one_record_still_converges() {
     let (used_pt, used_ct) = super::encrypt_chunk(&mut client, &big, &mut dst).expect("encrypt");
     assert!(used_ct <= dst.len(), "must not overrun dst");
     assert!(
-        used_pt > super::MAX_FRAGMENT_LEN - 64,
+        used_pt > DEFAULT_MAX_PLAINTEXT_PER_RECORD - 64,
         "should still get within a few bytes of a full fragment, got {used_pt}"
     );
 }

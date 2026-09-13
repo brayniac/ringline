@@ -237,6 +237,43 @@ impl SendCopyPool {
         self.fill_slot(idx, data)
     }
 
+    /// Give back all but `keep` of a reservation's unfilled slots.
+    ///
+    /// mio-only, and gated rather than `allow(dead_code)`d, because io_uring
+    /// has no way to reach it: its bounded TLS path cannot hold a reservation
+    /// across encryption at all (encryption allocates from this same pool and
+    /// the reservation would hide those slots from it), so it admits with a
+    /// plain capacity check and never over-reserves. Its plain path reserves
+    /// exactly what it needs. mio queues an owned buffer instead, so its
+    /// permit is pure admission accounting and *can* be narrowed after the
+    /// fact.
+    ///
+    /// A bounded TLS send has to reserve against a conservative *ciphertext*
+    /// bound before rustls mutates, and only learns the true cost once the
+    /// records exist. This narrows the promise in place. Release-then-
+    /// re-reserve would be wrong here: the re-reservation can fail, and it
+    /// would only be sound because nothing runs in between — an invariant
+    /// that stops being true the moment someone adds a call.
+    ///
+    /// `keep` must not exceed what is left (`debug_assert`ed): a reservation
+    /// cannot grow, because growing can fail and this method cannot report
+    /// that.
+    #[cfg(not(has_io_uring))]
+    pub fn shrink_reservation(&mut self, r: &mut SlotReservation, keep: usize) {
+        debug_assert!(
+            keep <= r.remaining,
+            "shrink_reservation cannot grow a reservation from {} to {keep}",
+            r.remaining
+        );
+        let returned = r.remaining.saturating_sub(keep);
+        debug_assert!(
+            returned <= self.reserved,
+            "reservation remainder exceeds the pool's outstanding reservations"
+        );
+        self.reserved -= returned;
+        r.remaining -= returned;
+    }
+
     /// Return the unfilled remainder of a reservation to the pool.
     pub fn release_reservation(&mut self, mut r: SlotReservation) {
         debug_assert!(
@@ -523,6 +560,65 @@ mod tests {
         assert_eq!(idx2, idx);
         assert_eq!(len2, 3);
         assert_eq!(pool.original_len(idx2), 3);
+    }
+
+    #[test]
+    #[cfg(not(has_io_uring))]
+    fn shrink_reservation_returns_the_difference_and_keeps_the_rest_usable() {
+        let mut pool = SendCopyPool::new(4, 8);
+
+        // The TLS bounded path reserves a conservative ciphertext bound, then
+        // learns the real cost once rustls has produced the records.
+        let mut r = pool.reserve_slots(3).unwrap();
+        assert_eq!(pool.free_count(), 1);
+
+        pool.shrink_reservation(&mut r, 1);
+        assert_eq!(r.remaining(), 1);
+        // The two over-reserved slots are available to everyone again.
+        assert_eq!(pool.free_count(), 3);
+        assert_eq!(pool.reserved, 1);
+
+        // The kept slot is still promised: filling it takes no more than it.
+        let (idx, _, _) = pool.copy_in_reserved(&mut r, b"x");
+        assert_eq!(r.remaining(), 0);
+        assert_eq!(pool.free_count(), 3);
+        assert!(pool.in_use(idx));
+
+        pool.release_reservation(r);
+        assert_eq!(pool.reserved, 0);
+    }
+
+    #[test]
+    #[cfg(not(has_io_uring))]
+    fn shrink_reservation_to_zero_is_a_full_release() {
+        let mut pool = SendCopyPool::new(2, 8);
+        let mut r = pool.reserve_slots(2).unwrap();
+        assert_eq!(pool.free_count(), 0);
+
+        pool.shrink_reservation(&mut r, 0);
+        assert_eq!(r.remaining(), 0);
+        assert_eq!(pool.free_count(), 2);
+        assert_eq!(pool.reserved, 0);
+
+        // Dropping the emptied reservation must not trip the Drop assert, and
+        // releasing it again must stay a no-op rather than double-count.
+        pool.release_reservation(r);
+        assert_eq!(pool.reserved, 0);
+        assert_eq!(pool.free_count(), 2);
+    }
+
+    #[test]
+    #[cfg(not(has_io_uring))]
+    fn shrink_reservation_to_its_current_size_changes_nothing() {
+        let mut pool = SendCopyPool::new(4, 8);
+        let mut r = pool.reserve_slots(2).unwrap();
+
+        pool.shrink_reservation(&mut r, 2);
+        assert_eq!(r.remaining(), 2);
+        assert_eq!(pool.free_count(), 2);
+        assert_eq!(pool.reserved, 2);
+
+        pool.release_reservation(r);
     }
 
     #[test]
