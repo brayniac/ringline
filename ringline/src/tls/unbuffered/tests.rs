@@ -8,6 +8,13 @@ use super::{
 use crate::accumulator::AccumulatorTable;
 use crate::tls::{DEFAULT_MAX_PLAINTEXT_PER_RECORD, PlaintextSink, TlsConn, TlsConnKind};
 
+/// Wire size of one maximum-size TLS 1.3 record on a default-configured
+/// connection: the 5-byte header, 16384 bytes of plaintext, the inner
+/// content-type byte and a 16-byte AEAD tag. Production derives the same
+/// number per connection via `tls::negotiated_record_overhead`; this is the
+/// default-config value the tests below pin.
+const DEFAULT_RECORD_WIRE_LEN: usize = DEFAULT_MAX_PLAINTEXT_PER_RECORD + 5 + 1 + 16;
+
 fn empty_client_config() -> Arc<rustls::ClientConfig> {
     rustls::ClientConfig::builder()
         .with_root_certificates(rustls::RootCertStore::empty())
@@ -676,19 +683,19 @@ fn a_whole_record_destination_encrypts_whole_records() {
 
     let big = vec![0x33u8; 512 * 1024];
     for records in 1..=4usize {
-        let mut dst = vec![0u8; records * super::MAX_RECORD_WIRE_LEN];
+        let mut dst = vec![0u8; records * DEFAULT_RECORD_WIRE_LEN];
         // Twice: the first call may still learn, the second is steady state.
         super::encrypt_chunk(&mut client, &big, &mut dst).expect("encrypt");
         let (used_pt, used_ct) =
             super::encrypt_chunk(&mut client, &big, &mut dst).expect("encrypt");
         assert_eq!(
             used_pt,
-            records * super::MAX_FRAGMENT_LEN,
+            records * DEFAULT_MAX_PLAINTEXT_PER_RECORD,
             "a {records}-record destination must take {records} full fragments"
         );
         assert_eq!(
             used_ct,
-            records * super::MAX_RECORD_WIRE_LEN,
+            records * DEFAULT_RECORD_WIRE_LEN,
             "and emit exactly {records} full records, filling dst"
         );
     }
@@ -710,7 +717,7 @@ fn a_destination_below_one_record_still_converges() {
     let (used_pt, used_ct) = super::encrypt_chunk(&mut client, &big, &mut dst).expect("encrypt");
     assert!(used_ct <= dst.len(), "must not overrun dst");
     assert!(
-        used_pt > super::MAX_FRAGMENT_LEN - 64,
+        used_pt > DEFAULT_MAX_PLAINTEXT_PER_RECORD - 64,
         "should still get within a few bytes of a full fragment, got {used_pt}"
     );
 }

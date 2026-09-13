@@ -291,7 +291,7 @@ const MIN_MAX_FRAGMENT_SIZE: usize = 32;
 const MAX_MAX_FRAGMENT_SIZE: usize = 16384 + TLS_RECORD_HEADER_LEN;
 
 /// Plaintext bytes per record when no `max_fragment_size` is configured:
-/// rustls' `MAX_FRAGMENT_LEN`.
+/// rustls' `msgs::fragmenter::MAX_FRAGMENT_LEN`, which is `pub(crate)` there.
 pub(crate) const DEFAULT_MAX_PLAINTEXT_PER_RECORD: usize =
     MAX_MAX_FRAGMENT_SIZE - TLS_RECORD_HEADER_LEN;
 
@@ -311,7 +311,7 @@ pub(crate) const DEFAULT_MAX_PLAINTEXT_PER_RECORD: usize =
 /// downstream crate that unifies the feature in. A bound that is right for the
 /// library build and wrong under test is not a bound.
 ///
-/// Deliberately *not* derived from `unbuffered::MAX_RECORD_WIRE_LEN`, which
+/// Deliberately *not* derived from one maximum-size TLS 1.3 record, which
 /// assumes TLS 1.3 and explicitly disclaims correctness dependence. Sizing
 /// something we emit from the wrong record constant has already produced three
 /// separate wrong answers in this area.
@@ -347,6 +347,14 @@ pub(crate) fn plaintext_per_record(max_fragment_size: Option<usize>) -> usize {
 /// the engine into its retry loop for nothing.
 ///
 /// Falls back to the worst case before a version is negotiated.
+///
+/// Deliberately **not** derived from `ciphertext::MAX_TLS_WIRE_RECORD`, which
+/// bounds a record we must be prepared to *receive* and carries 2 KiB of slack.
+/// Sizing anything we *emit* from that number has produced three separate wrong
+/// answers in this area already.
+/// Only the unbuffered engine sizes encryption chunks against a destination,
+/// so it is the only caller; gated rather than `allow(dead_code)`d.
+#[cfg(feature = "tls-unbuffered")]
 pub(crate) fn negotiated_record_overhead(conn: &TlsConnKind) -> usize {
     match conn.protocol_version() {
         Some(rustls::ProtocolVersion::TLSv1_3) => TLS_RECORD_HEADER_LEN + 1 + 16,
@@ -950,7 +958,7 @@ mod tests {
         assert_eq!(
             table.get_mut(0).unwrap().max_plaintext_per_record,
             16384,
-            "default `None` config means MAX_FRAGMENT_LEN of plaintext"
+            "default `None` config means one whole maximum-size fragment of plaintext"
         );
 
         let mut table = table_with_server(Some(2048));
