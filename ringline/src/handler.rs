@@ -2486,11 +2486,16 @@ impl<'a> DriverCtx<'a> {
                     .push_back((id, Ok(data.len() as u32)));
                 return Ok(());
             }
-            self.send_copy_pool.shrink_reservation(
-                &mut permit,
-                ciphertext.len().div_ceil(slot_size).min(needed),
-            );
-            *self.capacity_released = true;
+            // `.min(needed)` cannot normally bind — the tripwire above fires
+            // first if it would — but in a release build it keeps a beaten
+            // bound from turning into a grow, which `shrink_reservation`
+            // refuses. Holding the larger permit is the safe direction.
+            let keep = ciphertext.len().div_ceil(slot_size).min(needed);
+            if keep < permit.remaining() {
+                self.send_copy_pool.shrink_reservation(&mut permit, keep);
+                // Slots came back, so the send-capacity head may now fit.
+                *self.capacity_released = true;
+            }
             self.pending_sends[idx].push_back(crate::backend::mio::driver::PendingSend::bounded(
                 ciphertext, id, permit,
             ));
