@@ -1122,6 +1122,65 @@ pub(crate) mod tests {
         );
     }
 
+    /// The contract series PR 9's FIFO depends on: if `bounded_send_slots`
+    /// says N, then `send_bounded` must succeed with exactly N slots free.
+    /// The FIFO releases a waiter the moment `free_count() >= required_slots`,
+    /// so N free slots is the designed operating point, not a margin.
+    ///
+    /// This is a **smoke check, not a proof**, and the distinction matters.
+    /// The failure it guards against — the future enqueueing one number while
+    /// the backend reserves another — is prevented structurally: both go
+    /// through `bounded_send_slots`, so an inconsistent pair cannot be
+    /// expressed. Verified by mutation: shrinking that function's result by
+    /// one leaves this test green, because it shrinks *both* callers at once
+    /// and the bound's slack record absorbs the difference. A test cannot
+    /// catch a disagreement the type system has made impossible; what this
+    /// does catch is someone reintroducing a second, separate computation.
+    #[test]
+    fn the_admitted_slot_count_is_enough_to_actually_send() {
+        let config = ConfigBuilder::new()
+            .workers(1)
+            .pin_to_core(false)
+            .max_connections(16)
+            .send_pool(8, 16448)
+            .build()
+            .expect("valid test config");
+        let (mut driver, _wake) = test_driver(&config);
+        let (conn_index, _client) = attach_conn(&mut driver);
+        let conn = token(&driver, conn_index);
+        let id = bounded_ids(1)[0];
+
+        let mut table = crate::tls::TlsTable::new(config.max_connections, None, None);
+        table.insert_for_test(conn_index, handshaked_tls_conn());
+        driver.tls_table = Some(table);
+
+        const PLAINTEXT: usize = 16448;
+        let needed = crate::handler::bounded_send_slots(
+            &driver.send_copy_pool,
+            driver.tls_table.as_mut().unwrap() as *mut _,
+            conn_index,
+            PLAINTEXT,
+        )
+        .expect("the default slot size can bound this");
+
+        // Starve the pool down to exactly what was admitted.
+        let mut held = Vec::new();
+        while driver.send_copy_pool.free_count() > needed {
+            let (slot, _p, _l) = driver.send_copy_pool.copy_in(b"x").unwrap();
+            held.push(slot);
+        }
+        assert_eq!(driver.send_copy_pool.free_count(), needed);
+
+        driver
+            .make_ctx()
+            .send_bounded(conn, &[b'z'; PLAINTEXT], id)
+            .expect("admitted at N free slots, so it must send at N free slots");
+
+        for slot in held {
+            driver.send_copy_pool.release(slot);
+        }
+    }
+
     /// A slot too small for the ciphertext bound refuses the send outright
     /// rather than admitting it against a smaller number. Which refusal you
     /// get depends on the engine, and both are correct: the buffered engine
