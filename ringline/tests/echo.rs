@@ -2825,7 +2825,14 @@ impl<F: Future + Unpin> Future for PollOnce<'_, F> {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<()> {
-        let _ = std::pin::Pin::new(&mut *self.0).poll(cx);
+        // Assert rather than discard: a `Ready` swallowed here leaves the
+        // inner future resolved, and the next poll of it panics inside a
+        // spawned task where the panic is caught and the await hangs instead
+        // of failing. Every use below depends on the inner future parking.
+        assert!(
+            std::pin::Pin::new(&mut *self.0).poll(cx).is_pending(),
+            "PollOnce expects the inner future to park on its first poll"
+        );
         std::task::Poll::Ready(())
     }
 }
@@ -3219,14 +3226,32 @@ struct ShutdownWhileParkedHandler;
 impl AsyncEventHandler for ShutdownWhileParkedHandler {
     fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
         async move {
-            // A send that cannot be admitted until capacity frees, issued
-            // after the write half is already shut: it must refuse, not park.
+            // Fill the one-slot pool, then park a second send behind it, so
+            // there is a genuine waiting entry when the FIN is requested.
+            // An earlier version shut the write half *first* and only
+            // exercised the up-front refusal, leaving `shutdown_write`'s
+            // `fail_waiting_bounded_sends` — the actual change — untested.
+            let mut occupied = conn.send_backpressured(SHUTDOWN_HOG);
+            PollOnce(&mut occupied).await;
+            let mut parked = conn.send_backpressured(SHUTDOWN_PARKED);
+            PollOnce(&mut parked).await;
+
             conn.shutdown_write();
-            let err = conn
+
+            let err = parked
+                .await
+                .expect_err("a parked send cannot outlive the write half");
+            assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe, "{err}");
+
+            // And a send issued *after* the shutdown is refused up front.
+            let late = conn
                 .send_backpressured(b"after shutdown")
                 .await
                 .expect_err("write half is shut down");
-            assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe, "{err}");
+            assert_eq!(late.kind(), std::io::ErrorKind::BrokenPipe, "{late}");
+
+            let n = occupied.await.expect("the submitted send still delivers");
+            assert_eq!(n as usize, SHUTDOWN_HOG.len());
         }
     }
     fn create_for_worker(_id: usize) -> Self {
@@ -3234,11 +3259,19 @@ impl AsyncEventHandler for ShutdownWhileParkedHandler {
     }
 }
 
+const SHUTDOWN_HOG: &[u8] = &[b'O'; 4096];
+const SHUTDOWN_PARKED: &[u8] = &[b'P'; 4096];
+
 #[test]
 fn shutdown_drops_parked_backpressured_send_without_hanging() {
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
-    let (shutdown, handles) = RinglineBuilder::new(test_config())
+    let config = test_config_builder()
+        .workers(1)
+        .send_pool(1, 4096)
+        .build()
+        .expect("valid config");
+    let (shutdown, handles) = RinglineBuilder::new(config)
         .bind(addr.parse().unwrap())
         .launch::<ShutdownWhileParkedHandler>()
         .expect("launch failed");
@@ -3246,12 +3279,18 @@ fn shutdown_drops_parked_backpressured_send_without_hanging() {
 
     let mut stream = TcpStream::connect(&addr).unwrap();
     stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
+        .set_read_timeout(Some(Duration::from_secs(15)))
         .unwrap();
+    // Let the pool fill and the second send park before draining.
+    std::thread::sleep(Duration::from_millis(200));
     let mut got = Vec::new();
     // The FIN arrives; the parked send failed rather than hanging the task.
     stream.read_to_end(&mut got).expect("read to FIN");
-    assert!(got.is_empty());
+    assert_eq!(
+        got.len(),
+        SHUTDOWN_HOG.len(),
+        "the submitted send delivered; the parked one never did"
+    );
 
     shutdown.shutdown();
     for h in handles {

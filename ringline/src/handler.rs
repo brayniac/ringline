@@ -494,10 +494,6 @@ impl<'a> DriverCtx<'a> {
     /// lands after `encrypt_to_sends` has advanced rustls' record sequence,
     /// so the connection cannot carry further records. It fails *this*
     /// operation and closes the connection.
-    // No caller until series PR 9's `send_backpressured` future exists; the
-    // event-loop half of this PR reaches the rest of the machinery through
-    // the driver. PR 9 removes this allowance.
-    #[allow(dead_code)]
     pub(crate) fn send_bounded(
         &mut self,
         conn: ConnToken,
@@ -525,9 +521,9 @@ impl<'a> DriverCtx<'a> {
             ));
         }
 
-        if !self.tls_table.is_null() {
-            let tls_table = unsafe { &mut *self.tls_table };
-            if tls_table.get_mut(conn.index).is_some() {
+        // SAFETY: read-only probe; see the `tls_table` field's contract.
+        if !self.tls_table.is_null() && unsafe { (*self.tls_table).has(conn.index) } {
+            {
                 // Admission has to happen *before* rustls mutates: past the
                 // first record, departure 1 turns a shortfall into a closed
                 // connection rather than backpressure. The permit is sized by
@@ -538,8 +534,14 @@ impl<'a> DriverCtx<'a> {
                 // an outstanding reservation would hide those slots from it.
                 // The worker is single-threaded and nothing allocates between
                 // this check and the first allocation inside the call.
+                //
                 // The same number `send_backpressured`'s future enqueued, by
-                // construction rather than by agreement.
+                // construction rather than by agreement. It is computed
+                // *before* the `&mut` below is created on purpose: taking a
+                // shared reborrow of `tls_table` while a `&mut` to it is live
+                // and used afterwards is aliasing UB, benign on today's
+                // codegen and exactly what this module's unsafe discipline
+                // exists to keep out.
                 let needed = bounded_send_slots(
                     self.send_copy_pool,
                     self.tls_table,
@@ -551,6 +553,7 @@ impl<'a> DriverCtx<'a> {
                     return Err(io::Error::other("send copy pool exhausted"));
                 }
                 let free_before = self.send_copy_pool.free_count();
+                let tls_table = unsafe { &mut *self.tls_table };
                 let sends = match crate::tls::encrypt_to_sends(
                     tls_table,
                     self.send_copy_pool,
@@ -2416,10 +2419,6 @@ impl<'a> DriverCtx<'a> {
     ///
     /// Called by series PR 9's `send_backpressured` future once
     /// `Executor`'s send-capacity FIFO says it is this id's turn.
-    // No caller until that future exists (the driver tests reach it through
-    // `Driver::make_ctx`); series PR 9 removes this allowance, as it does
-    // the one on `runtime::send_capacity`.
-    #[allow(dead_code)]
     pub(crate) fn send_bounded(
         &mut self,
         conn: ConnToken,

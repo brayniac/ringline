@@ -52,12 +52,6 @@
 //! Design: `docs/send-capacity-fifo-design.md` (series PR 5 of
 //! `docs/backpressured-sends-series-design.md`).
 
-// No callers outside this module's tests until series PRs 6 and 7 (the
-// driver's slot-release hook calls `wake_send_capacity`, the backends call
-// `complete_bounded_send`) and PR 9 (`send_backpressured` drives the rest).
-// PR 9 removes this attribute.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::collections::VecDeque;
 use std::io;
 
@@ -343,14 +337,28 @@ impl SendCapacityQueue {
     /// Allocates the returned `Vec`; this is the teardown path.
     pub(crate) fn remove_connection(&mut self, conn_index: u32) -> Vec<u32> {
         let mut wakes = Vec::new();
+        // `conn_index` names two things that both die here: the connection
+        // whose entries must be aborted, and the *task* that owns entries
+        // possibly targeting other connections. The second is not a corner
+        // case — it is the shape the public API advertises, a proxy task on
+        // connection C with a bounded send outstanding on connection D. When
+        // C's task is dropped its futures' `Drop` does not run (teardown is
+        // not inside a driver-state guard on either backend), so nothing
+        // else will ever take those entries off the queue. Left behind, an
+        // entry whose owner can never be woken sits at the head and stalls
+        // every bounded send on the worker.
+        let dead_owner = |w_conn: u32, task_id: u32| {
+            w_conn == conn_index
+                || (task_id & crate::runtime::waker::STANDALONE_BIT == 0 && task_id == conn_index)
+        };
         let head_removed = self
             .waiting
             .front()
-            .is_some_and(|w| w.conn_index == conn_index);
+            .is_some_and(|w| dead_owner(w.conn_index, w.task_id));
 
         let submitted = &mut self.submitted;
         self.waiting.retain(|w| {
-            if w.conn_index != conn_index {
+            if !dead_owner(w.conn_index, w.task_id) {
                 return true;
             }
             if w.task_id != conn_index {
@@ -366,7 +374,7 @@ impl SendCapacityQueue {
         });
 
         self.submitted.retain_mut(|s| {
-            if s.conn_index != conn_index {
+            if !dead_owner(s.conn_index, s.task_id) {
                 return true;
             }
             let owner_gone = s.task_id == conn_index;
@@ -864,5 +872,36 @@ mod tests {
         // Unknown id: ignored.
         q.set_owner(BoundedSendId(u64::MAX), task(9));
         assert_eq!(q.head_ready(1), Some(task(6)));
+    }
+    // A proxy task on connection C with a bounded send outstanding on
+    // connection D — the shape `send_backpressured`'s own docs advertise.
+    // When C is torn down its future's `Drop` does not run (teardown is not
+    // inside a driver-state guard on either backend), so the queue has to
+    // recognise that the *owner* died even though the entry names a
+    // different connection. Left behind, the entry's task id can never be
+    // woken, and at the head it stalls every bounded send on the worker.
+    #[test]
+    fn removing_a_connection_clears_entries_its_task_owned_on_other_connections() {
+        let mut q = SendCapacityQueue::new();
+        const C: u32 = 3;
+        const D: u32 = 7;
+
+        // Owned by C's task, targeting D, and at the head.
+        let stranded = q.enqueue(D, 1, 1, C);
+        // A healthy entry behind it, owned by a standalone task.
+        let behind = q.enqueue(D, 1, 1, 9 | STANDALONE_BIT);
+
+        q.remove_connection(C);
+
+        assert!(
+            q.turn(behind, 1),
+            "the entry behind must reach the head once its dead-owner blocker is gone"
+        );
+        assert!(
+            q.take_result(stranded).is_none(),
+            "the stranded entry is cancelled outright, not parked for an owner that cannot run"
+        );
+        assert_eq!(q.waiting_len(), 1);
+        assert_eq!(q.submitted_len(), 0);
     }
 }
