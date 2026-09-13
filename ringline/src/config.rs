@@ -383,6 +383,51 @@ impl Config {
     }
 
     /// Validate configuration values. Returns an error if any value is out of range.
+    /// A TLS connection encrypts into the same `SendCopyPool` slots that plain
+    /// sends copy into, so `send_copy_slot_size` quietly carries two unrelated
+    /// contracts: the chunking granularity for plain sends, and the
+    /// destination for one TLS record.
+    ///
+    /// This rejects only the case that **cannot work at all**: the unbuffered
+    /// record layer writes whole records into a slot and gives up below
+    /// `MIN_ENCRYPT_DST`, so every send on every TLS connection would fail.
+    /// Catching it here names the knob instead of surfacing it per-send.
+    ///
+    /// It deliberately does *not* enforce the larger "one whole record per
+    /// slot" threshold (`F + 29`, which the shipped default clears by only 35
+    /// bytes). That threshold governs whether a **bounded** send's admission
+    /// bound is expressible on the unbuffered engine — see
+    /// `docs/tls-premutation-bound-design.md`. Plain TLS sends work below it on
+    /// both engines: the buffered engine straddles slots freely, and the
+    /// unbuffered engine still encrypts, just emitting more records. This
+    /// repo's own `tls_echo` tests run at 16384, 29 bytes under it. Rejecting
+    /// that at startup would break working deployments to pre-empt a hazard
+    /// that only reaches bounded sends, which already refuse themselves with a
+    /// message naming the same knob.
+    #[cfg(feature = "tls-unbuffered")]
+    fn validate_tls_slot_size(&self) -> Result<(), crate::error::Error> {
+        if self.tls.is_none() && self.tls_client.is_none() {
+            return Ok(());
+        }
+        let min = crate::tls::unbuffered::MIN_ENCRYPT_DST;
+        if (self.send_copy_slot_size as usize) < min {
+            return Err(crate::error::Error::RingSetup(format!(
+                "send_copy_slot_size is {} but the tls-unbuffered record layer cannot encrypt \
+                 into a destination smaller than {min} bytes, so every TLS send would fail; \
+                 raise send_copy_slot_size",
+                self.send_copy_slot_size,
+            )));
+        }
+        Ok(())
+    }
+
+    /// The buffered record layer packs ciphertext across slots through
+    /// `PoolWriter`, so no slot size is too small for it to make progress.
+    #[cfg(not(feature = "tls-unbuffered"))]
+    fn validate_tls_slot_size(&self) -> Result<(), crate::error::Error> {
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), crate::error::Error> {
         if !self.recv_buffer.ring_size.is_power_of_two() {
             return Err(crate::error::Error::RingSetup(
@@ -437,6 +482,7 @@ impl Config {
                 "send_copy_count must be > 0".into(),
             ));
         }
+        self.validate_tls_slot_size()?;
         // The provided ring can hold at most u16::MAX buffers, so a reserve above
         // that is nonsensical (it would force-copy every segmented delivery). A
         // reserve >= the configured ring_size is *allowed* (it simply makes
@@ -792,6 +838,30 @@ impl ConfigBuilder {
     }
 
     /// Set the number and size of copy-send pool slots.
+    ///
+    /// Default: 1024 slots of 16448 bytes. One slot is consumed per chunk of a
+    /// copy send regardless of how few bytes that chunk holds, so `count`
+    /// bounds how many sends can be in flight per worker, and `slot_size`
+    /// decides how many slots (and therefore SQEs) a large send costs.
+    ///
+    /// **`slot_size` also sizes TLS records.** Ciphertext is encrypted into
+    /// these same slots, so the knob carries a second, less obvious contract:
+    ///
+    /// - One whole worst-case record is `F + 29` bytes, where `F` is rustls'
+    ///   `max_fragment_size` **minus its 5-byte header** (so 16384 by default)
+    ///   and 29 is the TLS 1.2 GCM overhead. The shipped default of 16448
+    ///   clears that by **35 bytes**.
+    /// - Below `F + 29`, plain TLS sends still work on both engines — the
+    ///   buffered record layer straddles slots, and the unbuffered one emits
+    ///   more records — but a **bounded** send (`send_backpressured`) can no
+    ///   longer express a safe admission bound on the unbuffered engine and is
+    ///   refused with an error naming this knob. See
+    ///   `docs/tls-premutation-bound-design.md`.
+    /// - Below 64 bytes the unbuffered record layer cannot encrypt at all;
+    ///   that is rejected by [`ConfigBuilder::build`] rather than per-send.
+    ///
+    /// So if you lower `slot_size` for plain-send efficiency, or raise
+    /// `max_fragment_size`, check it against `F + 29` first.
     pub fn send_pool(mut self, count: u16, slot_size: u32) -> Self {
         self.config.send_copy_count = count;
         self.config.send_copy_slot_size = slot_size;
@@ -1215,6 +1285,113 @@ mod tests {
                 .validate()
                 .is_err()
         );
+    }
+
+    /// A TLS server config with `max_fragment_size` pinned, for the slot-size
+    /// checks below. The certificate is irrelevant to validation — only the
+    /// fragment size is read.
+    #[cfg(test)]
+    fn tls_server_config(max_fragment_size: Option<usize>) -> TlsConfig {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+        let cert_der = rustls::pki_types::CertificateDer::from(cert.cert);
+        let mut sc = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key.into())
+            .unwrap();
+        sc.max_fragment_size = max_fragment_size;
+        TlsConfig::new(std::sync::Arc::new(sc))
+    }
+
+    // The shipped default clears the TLS record minimum by 35 bytes
+    // (16448 against F + 29 = 16413). That is the configuration everyone runs,
+    // so it must validate.
+    #[test]
+    fn validate_default_slot_size_accepts_default_tls() {
+        config_with(|c| c.tls = Some(tls_server_config(None)))
+            .validate()
+            .expect("the shipped default must accept TLS");
+    }
+
+    // Without TLS the slot size means only "chunking granularity", and a small
+    // one is a legitimate tuning choice. Validation must not touch it.
+    #[test]
+    fn validate_small_slot_size_is_fine_without_tls() {
+        config_with(|c| c.send_copy_slot_size = 512)
+            .validate()
+            .expect("a small slot size is only a TLS concern");
+    }
+
+    // The repo's own tls_echo tests run at 16384 — 29 bytes under the "one
+    // whole record" threshold — and they pass, because plain TLS sends work
+    // below it on both engines. Validation must not reject a configuration
+    // that works.
+    #[test]
+    fn validate_accepts_a_slot_just_under_one_whole_record() {
+        config_with(|c| {
+            c.tls = Some(tls_server_config(None));
+            c.send_copy_slot_size = 16384;
+        })
+        .validate()
+        .expect("16384 with TLS is in use in this repo's own tests and works");
+    }
+
+    // Likewise a slot far below the threshold: the buffered engine straddles
+    // slots, and the unbuffered engine still encrypts, just in more records.
+    // Only a *bounded* send needs the larger threshold, and it refuses itself.
+    #[test]
+    fn validate_accepts_a_small_slot_with_tls() {
+        config_with(|c| {
+            c.tls = Some(tls_server_config(None));
+            c.send_copy_slot_size = 4096;
+        })
+        .validate()
+        .expect("plain TLS sends work at 4096 on both engines");
+    }
+
+    // What is rejected is the slot that cannot work at all: below
+    // `MIN_ENCRYPT_DST` the unbuffered record layer refuses every encrypt, so
+    // every TLS send on every connection fails. Better at startup than
+    // per-send. The buffered engine has no such floor, so this is gated.
+    #[test]
+    #[cfg(feature = "tls-unbuffered")]
+    fn validate_rejects_a_slot_the_unbuffered_engine_cannot_encrypt_into() {
+        let err = config_with(|c| {
+            c.tls = Some(tls_server_config(None));
+            c.send_copy_slot_size = 32;
+        })
+        .validate()
+        .expect_err("32 is below MIN_ENCRYPT_DST");
+        assert!(
+            err.to_string().contains("send_copy_slot_size"),
+            "the error must name the knob: {err}"
+        );
+    }
+
+    // A client config reaches the same check — outbound TLS connections
+    // encrypt through the same pool.
+    #[test]
+    #[cfg(feature = "tls-unbuffered")]
+    fn validate_checks_the_client_config_too() {
+        let cc: std::sync::Arc<rustls::ClientConfig> = rustls::ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth()
+            .into();
+        config_with(|c| {
+            c.tls_client = Some(TlsClientConfig::new(cc.clone()));
+            c.send_copy_slot_size = 32;
+        })
+        .validate()
+        .expect_err("an outbound TLS connection uses the same pool");
+    }
+
+    // Without TLS there is no floor at all: the slot size is purely a
+    // plain-send tuning knob.
+    #[test]
+    fn validate_tiny_slot_size_is_fine_without_tls() {
+        config_with(|c| c.send_copy_slot_size = 32)
+            .validate()
+            .expect("no TLS, no record to hold");
     }
 
     #[test]
