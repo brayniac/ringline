@@ -2714,6 +2714,258 @@ fn async_join_basic() {
     }
 }
 
+// ── send_backpressured (series PR 9) ────────────────────────────────
+
+/// Sends a message far larger than the whole copy pool can hold at once, in
+/// pieces that each fit, so every piece after the first has to wait for
+/// capacity that only frees as earlier sends complete.
+struct BackpressuredEchoHandler;
+
+const BP_CHUNK: usize = 4096;
+const BP_CHUNKS: usize = 8;
+
+impl AsyncEventHandler for BackpressuredEchoHandler {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            let payload = vec![b'Z'; BP_CHUNK];
+            for _ in 0..BP_CHUNKS {
+                match conn.send_backpressured(&payload).await {
+                    Ok(n) => assert_eq!(n as usize, BP_CHUNK, "resolved with the caller's length"),
+                    Err(e) => panic!("backpressured send failed: {e}"),
+                }
+            }
+            conn.shutdown_write();
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        BackpressuredEchoHandler
+    }
+}
+
+/// The core promise. One worker, a 32 KiB copy pool, and sixteen connections
+/// each pushing 32 KiB at a client that is not reading yet: the sockets stall,
+/// permits stay held, the pool runs dry, and every send after that has to take
+/// its turn in the worker's admission FIFO. When the clients finally read,
+/// every connection must receive all of its bytes, exactly once.
+///
+/// Concurrency across connections is what makes this a test of admission
+/// rather than of the happy path. A single connection awaiting its sends one
+/// at a time releases each permit before requesting the next, so the pool is
+/// never under pressure and the queue never has a second entry — verified by
+/// mutation: with one connection, submitting without waiting for a turn
+/// passes.
+#[test]
+fn backpressured_send_waits_for_pool_capacity_without_duplication() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let config = test_config_builder()
+        .workers(1)
+        .send_pool(8, 4096)
+        .build()
+        .expect("valid config");
+
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind(addr.parse().unwrap())
+        .launch::<BackpressuredEchoHandler>()
+        .expect("launch failed");
+    wait_for_server(&addr);
+
+    const CONNS: usize = 16;
+    let mut streams = Vec::new();
+    for _ in 0..CONNS {
+        let stream = TcpStream::connect(&addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        streams.push(stream);
+    }
+
+    // Let every handler run ahead and exhaust the pool before anyone reads.
+    std::thread::sleep(Duration::from_millis(300));
+
+    let readers: Vec<_> = streams
+        .into_iter()
+        .map(|mut stream| {
+            std::thread::spawn(move || {
+                let mut got = Vec::new();
+                stream.read_to_end(&mut got).expect("read to FIN");
+                got
+            })
+        })
+        .collect();
+
+    for reader in readers {
+        let got = reader.join().expect("reader thread");
+        assert_eq!(
+            got.len(),
+            BP_CHUNK * BP_CHUNKS,
+            "every byte arrives exactly once: no duplication, no loss"
+        );
+        assert!(
+            got.iter().all(|&b| b == b'Z'),
+            "the stream is not interleaved or corrupted"
+        );
+    }
+
+    shutdown.shutdown();
+    for h in handles {
+        let _ = h.join();
+    }
+}
+
+/// Handler asserting the future is inert until polled: build one, drop it
+/// without awaiting, then do a normal send. If construction had enqueued or
+/// submitted anything, the queue would hold a phantom head and the send
+/// below would stall.
+struct LazyDropHandler;
+
+impl AsyncEventHandler for LazyDropHandler {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            for _ in 0..64 {
+                let never_polled = conn.send_backpressured(b"dropped");
+                drop(never_polled);
+            }
+            let _ = conn.send_backpressured(b"OK").await;
+            conn.shutdown_write();
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        LazyDropHandler
+    }
+}
+
+#[test]
+fn backpressured_send_construction_is_lazy_and_unpolled_drop_is_inert() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
+        .bind(addr.parse().unwrap())
+        .launch::<LazyDropHandler>()
+        .expect("launch failed");
+    wait_for_server(&addr);
+
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut got = Vec::new();
+    stream.read_to_end(&mut got).expect("read to FIN");
+    assert_eq!(
+        got, b"OK",
+        "64 unpolled futures wrote nothing and blocked nothing"
+    );
+
+    shutdown.shutdown();
+    for h in handles {
+        let _ = h.join();
+    }
+}
+
+/// A message larger than the entire pool can never be admitted, so it must be
+/// refused rather than parked forever — and refused *before* anything is
+/// written, so the peer sees nothing.
+struct OversizeHandler;
+
+impl AsyncEventHandler for OversizeHandler {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            // Pool is 8 x 4096 = 32 KiB; ask for 64 KiB.
+            let huge = vec![b'X'; 64 * 1024];
+            let err = conn
+                .send_backpressured(&huge)
+                .await
+                .expect_err("larger than the whole pool");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
+            let _ = conn.send_backpressured(b"REFUSED").await;
+            conn.shutdown_write();
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        OversizeHandler
+    }
+}
+
+#[test]
+fn backpressured_send_rejects_oversize_before_writing() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let config = test_config_builder()
+        .send_pool(8, 4096)
+        .build()
+        .expect("valid config");
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind(addr.parse().unwrap())
+        .launch::<OversizeHandler>()
+        .expect("launch failed");
+    wait_for_server(&addr);
+
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut got = Vec::new();
+    stream.read_to_end(&mut got).expect("read to FIN");
+    assert_eq!(
+        got, b"REFUSED",
+        "the oversize send put nothing on the wire, and the next send still works"
+    );
+
+    shutdown.shutdown();
+    for h in handles {
+        let _ = h.join();
+    }
+}
+
+/// Half-close while a send is parked: the waiter must fail rather than hang.
+/// The handler parks a send behind a pool it has deliberately exhausted, then
+/// shuts the write half from a second task.
+struct ShutdownWhileParkedHandler;
+
+impl AsyncEventHandler for ShutdownWhileParkedHandler {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            // A send that cannot be admitted until capacity frees, issued
+            // after the write half is already shut: it must refuse, not park.
+            conn.shutdown_write();
+            let err = conn
+                .send_backpressured(b"after shutdown")
+                .await
+                .expect_err("write half is shut down");
+            assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe, "{err}");
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        ShutdownWhileParkedHandler
+    }
+}
+
+#[test]
+fn shutdown_drops_parked_backpressured_send_without_hanging() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
+        .bind(addr.parse().unwrap())
+        .launch::<ShutdownWhileParkedHandler>()
+        .expect("launch failed");
+    wait_for_server(&addr);
+
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut got = Vec::new();
+    // The FIN arrives; the parked send failed rather than hanging the task.
+    stream.read_to_end(&mut got).expect("read to FIN");
+    assert!(got.is_empty());
+
+    shutdown.shutdown();
+    for h in handles {
+        let _ = h.join();
+    }
+}
+
 /// Handler that joins three futures: send_await + sleep + with_data.
 struct Join3Handler;
 

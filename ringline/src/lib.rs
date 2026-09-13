@@ -243,6 +243,8 @@ pub use runtime::handler::AsyncEventHandler;
 #[cfg(has_io_uring)]
 /// Async scatter-gather send builder.
 pub use runtime::io::AsyncSendBuilder;
+/// Future that completes when a send finishes.
+pub use runtime::io::BackpressuredSendFuture;
 /// Future returned by [`spawn_blocking()`]. Resolves to the closure's return value.
 pub use runtime::io::BlockingJoinHandle;
 /// Async connection context with send/recv futures.
@@ -281,7 +283,6 @@ pub use runtime::io::SegConsumed;
 /// Async lending iterator over received provided buffers (segmented recv, Mode B).
 #[cfg(has_io_uring)]
 pub use runtime::io::SegmentReader;
-/// Future that completes when a send finishes.
 pub use runtime::io::SendFuture;
 /// Non-raw sink descriptor for [`ConnCtx::forward_to()`] (segmented recv, Mode A).
 #[cfg(has_io_uring)]
