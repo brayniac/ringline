@@ -160,6 +160,7 @@ impl InFlightSendSlab {
     /// point into `pool_slots` (one per gathered message). No guards, no ZC
     /// notifications — the pool slots are released together on the operation CQE.
     /// `iovecs_slice` and `pool_slots` must be the same length and <= MAX_IOVECS.
+    #[allow(clippy::too_many_arguments)]
     pub fn allocate_coalesced(
         &mut self,
         conn_index: u32,
