@@ -109,7 +109,7 @@ pool slot may carry an id. Rather than threading a failure queue through a
 free function with four `&mut` parameters — the survey's highest-risk,
 lowest-visibility change — `release_queued_sends` *returns* them and each
 of its callers puts them on
-`Driver::bounded_send_failures: VecDeque<(BoundedSendId, io::Result<u32>)>`,
+`Driver::bounded_send_completions: VecDeque<(BoundedSendId, io::Result<u32>)>`,
 which the event loop drains beside the completions. (`#[must_use]` is what
 stops a caller dropping them.) The payload is an `io::Result`, not an
 `io::Error` as first written here: the queue's defining property is the
@@ -119,7 +119,7 @@ queue nobody reads, which is correct and is commented as such: the executor
 is going away with the driver, exactly as mio's `Driver::drop` does not push
 completions.
 
-`bounded_send_failures` also carries the synchronous settles from
+`bounded_send_completions` also carries the synchronous settles from
 `DriverCtx::send_bounded`, which has no executor access — the same reason
 mio has a completion queue at all.
 
@@ -141,7 +141,7 @@ is the same plaintext-sized budget the "TLS admission sizing stays as it is"
 decision above already records as PR 8's gap.
 
 A message that produces no SQE has no completion coming, so `send_bounded`
-settles it itself, through `bounded_send_failures`, with the value mio
+settles it itself, through `bounded_send_completions`, with the value mio
 reports: a zero-length plaintext send (`[].chunks(n)` yields nothing) and a
 TLS send whose plaintext produced no record both settle `Ok(data.len())`.
 Everything else is written by a CQE.

@@ -206,14 +206,14 @@ pub struct DriverCtx<'a> {
     pub(crate) pending_send_retries: &'a mut Vec<(u32, u32, u8)>,
     /// Worker-wide bounded-send results that no CQE will carry, keyed by
     /// the id the submitting future holds. Same queue as
-    /// `backend::uring::driver::Driver::bounded_send_failures`, drained by
+    /// `backend::uring::driver::Driver::bounded_send_completions`, drained by
     /// the event loop into `Executor::complete_bounded_send`.
     ///
     /// `send_bounded` needs it for the same reason mio's `DriverCtx` has
     /// one: a `DriverCtx` is a borrow of driver fields and has no executor
     /// access, so an operation it settles synchronously has nowhere else to
     /// go.
-    pub(crate) bounded_send_failures: &'a mut std::collections::VecDeque<(
+    pub(crate) bounded_send_completions: &'a mut std::collections::VecDeque<(
         crate::runtime::send_capacity::BoundedSendId,
         io::Result<u32>,
     )>,
@@ -415,7 +415,7 @@ impl<'a> DriverCtx<'a> {
     ///
     /// On `Ok` exactly one completion for `id` is coming: from a send CQE,
     /// from a teardown that destroys the queued entry
-    /// (`Driver::bounded_send_failures`), or — when the message produced no
+    /// (`Driver::bounded_send_completions`), or — when the message produced no
     /// SQE at all — from this call, synchronously. On `Err` nothing was
     /// queued and no completion for `id` will ever be produced, so the
     /// caller owns the failure.
@@ -498,7 +498,7 @@ impl<'a> DriverCtx<'a> {
                     // Empty plaintext produces no records and therefore no
                     // CQE; nothing will ever settle the id but this call.
                     None => {
-                        self.bounded_send_failures_push(id, Ok(data.len() as u32));
+                        self.bounded_send_completions_push(id, Ok(data.len() as u32));
                         return Ok(());
                     }
                 }
@@ -570,7 +570,7 @@ impl<'a> DriverCtx<'a> {
             // `[].chunks(n)` yields nothing, so a zero-length send queues no
             // SQE and no CQE is coming. `send` silently does nothing here; a
             // bounded send must still resolve, so settle it now.
-            self.bounded_send_failures_push(id, Ok(0));
+            self.bounded_send_completions_push(id, Ok(0));
         }
         Ok(())
     }
@@ -580,16 +580,16 @@ impl<'a> DriverCtx<'a> {
     ///
     /// `DriverCtx` is a borrow of driver fields with no executor access —
     /// the same reason mio's driver owns a completion queue — so a
-    /// synchronous settle goes onto `Driver::bounded_send_failures` for the
+    /// synchronous settle goes onto `Driver::bounded_send_completions` for the
     /// event loop to hand to `Executor::complete_bounded_send`. The queue
     /// carries successes too despite its name: what unites its entries is
     /// that no CQE is coming for them.
-    fn bounded_send_failures_push(
+    fn bounded_send_completions_push(
         &mut self,
         id: crate::runtime::send_capacity::BoundedSendId,
         result: io::Result<u32>,
     ) {
-        self.bounded_send_failures.push_back((id, result));
+        self.bounded_send_completions.push_back((id, result));
         *self.capacity_released = true;
     }
 

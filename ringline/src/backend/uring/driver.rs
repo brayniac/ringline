@@ -453,7 +453,7 @@ pub(crate) struct Driver {
     /// `run_shutdown` pushes here too, into a queue nobody will drain. That
     /// is correct: the executor is going away with the driver, exactly as
     /// mio's `Driver::drop` produces no completions.
-    pub(crate) bounded_send_failures: VecDeque<(BoundedSendId, io::Result<u32>)>,
+    pub(crate) bounded_send_completions: VecDeque<(BoundedSendId, io::Result<u32>)>,
     /// Set whenever a copy-pool slot goes back to the pool, so the event
     /// loop can call `Executor::wake_send_capacity` once per iteration
     /// instead of once per released slot. The event loop clears it.
@@ -737,7 +737,7 @@ impl Driver {
             pending_recv_forward_retries: Vec::new(),
             pending_close_retries: Vec::new(),
             pending_send_retries: Vec::new(),
-            bounded_send_failures: VecDeque::new(),
+            bounded_send_completions: VecDeque::new(),
             capacity_released: false,
             pending_finalize_closes: Vec::new(),
             zc_retry_scratch: Vec::new(),
@@ -857,7 +857,7 @@ impl Driver {
             fs_fd_base: self.fs_fd_base,
             pending_finalize_closes: &mut self.pending_finalize_closes,
             pending_send_retries: &mut self.pending_send_retries,
-            bounded_send_failures: &mut self.bounded_send_failures,
+            bounded_send_completions: &mut self.bounded_send_completions,
             capacity_released: &mut self.capacity_released,
             close_notify_timeout: self.close_notify_timeout,
             next_disk_io_seq: &mut self.next_disk_io_seq,
@@ -1645,7 +1645,7 @@ impl Driver {
     /// its caller's future hangs — and `SendCopyPool::release` debug-asserts
     /// rather than let the id be dropped silently. The ids are *returned*
     /// instead of pushed, so the three callers can put them on
-    /// `Driver::bounded_send_failures` themselves: every caller already
+    /// `Driver::bounded_send_completions` themselves: every caller already
     /// holds `&mut self` while this takes four disjoint field borrows, and
     /// threading a failures queue and an error constructor through a fifth
     /// `&mut` parameter is the change with the most call-site risk and the
@@ -1655,7 +1655,7 @@ impl Driver {
     /// The returned `Vec` does not allocate unless a bounded send was
     /// actually queued, so the common teardown (and `reset_send_state`, run
     /// on every slot reactivation) pays nothing.
-    #[must_use = "queued bounded sends must be failed onto Driver::bounded_send_failures"]
+    #[must_use = "queued bounded sends must be failed onto Driver::bounded_send_completions"]
     pub(crate) fn release_queued_sends(
         queue: &mut VecDeque<BuiltSend>,
         send_slab: &mut InFlightSendSlab,
@@ -1700,7 +1700,7 @@ impl Driver {
     /// reached the wire, and its connection is going away.
     fn fail_bounded_sends(&mut self, bounded: Vec<BoundedSendId>) {
         for id in bounded {
-            self.bounded_send_failures.push_back((
+            self.bounded_send_completions.push_back((
                 id,
                 Err(io::Error::new(
                     io::ErrorKind::ConnectionAborted,
@@ -2127,7 +2127,7 @@ impl Driver {
                             if let Some((id, _logical_len)) =
                                 self.send_copy_pool.take_bounded_send(pool_slot)
                             {
-                                self.bounded_send_failures.push_back((
+                                self.bounded_send_completions.push_back((
                                     id,
                                     Err(io::Error::new(
                                         io::ErrorKind::ConnectionAborted,
