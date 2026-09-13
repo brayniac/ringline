@@ -3021,6 +3021,92 @@ fn canceled_submitted_backpressured_send_cannot_complete_the_next_send() {
     }
 }
 
+const HALF_CLOSE_A: &[u8] = &[b'S'; 4096];
+const HALF_CLOSE_B: &[u8] = &[b'W'; 4096];
+
+/// mio's half-close is deferred until queued sends drain, so the two kinds of
+/// bounded send must be treated differently when the write half shuts:
+/// one already submitted still has its bytes to deliver, while one merely
+/// waiting for capacity can never use the turn it is waiting for.
+///
+/// The submitted send must complete `Ok`; the waiting one must fail
+/// `BrokenPipe` rather than sit in the queue holding the head.
+#[cfg(not(has_io_uring))]
+struct MioHalfCloseHandler;
+
+#[cfg(not(has_io_uring))]
+impl AsyncEventHandler for MioHalfCloseHandler {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            // Poll each exactly once, in order, so the states are not left to
+            // scheduler timing: spawning the first and polling the second
+            // immediately races — the spawned task has not run yet, the pool
+            // is still free, and the "waiting" send submits instead.
+            let mut submitted = conn.send_backpressured(HALF_CLOSE_A);
+            PollOnce(&mut submitted).await; // takes the only slot
+            let mut waiting = conn.send_backpressured(HALF_CLOSE_B);
+            PollOnce(&mut waiting).await; // parks: the pool is now empty
+
+            conn.shutdown_write();
+
+            let waiting_err = waiting
+                .await
+                .expect_err("a parked send cannot survive a FIN");
+            assert_eq!(
+                waiting_err.kind(),
+                std::io::ErrorKind::BrokenPipe,
+                "{waiting_err}"
+            );
+
+            let n = submitted
+                .await
+                .expect("the already-submitted send still delivers its bytes");
+            assert_eq!(n as usize, HALF_CLOSE_A.len());
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        MioHalfCloseHandler
+    }
+}
+
+#[cfg(not(has_io_uring))]
+#[test]
+fn mio_half_close_completes_submitted_send_and_cancels_capacity_waiter() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let config = test_config_builder()
+        .workers(1)
+        .send_pool(1, 4096)
+        .build()
+        .expect("valid config");
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind(addr.parse().unwrap())
+        .launch::<MioHalfCloseHandler>()
+        .expect("launch failed");
+    wait_for_server(&addr);
+
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    // Let the first send occupy the pool and the second park before draining.
+    std::thread::sleep(Duration::from_millis(200));
+
+    let mut got = Vec::new();
+    stream.read_to_end(&mut got).expect("read to FIN");
+    assert_eq!(
+        got.len(),
+        HALF_CLOSE_A.len(),
+        "the submitted send's bytes arrived; the parked one's never did"
+    );
+    assert!(got.iter().all(|&b| b == b'S'));
+
+    shutdown.shutdown();
+    for h in handles {
+        let _ = h.join();
+    }
+}
+
 /// Handler asserting the future is inert until polled: build one, drop it
 /// without awaiting, then do a normal send. If construction had enqueued or
 /// submitted anything, the queue would hold a phantom head and the send
