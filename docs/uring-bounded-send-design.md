@@ -107,9 +107,14 @@ beside the existing `wake_send(Err(..))`.
 `force_finalize_close` and `run_shutdown`): each destroyed `BuiltSend`'s
 pool slot may carry an id. Rather than threading a failure queue through a
 free function with four `&mut` parameters — the survey's highest-risk,
-lowest-visibility change — the ids are collected into
-`Driver::bounded_send_failures: VecDeque<(BoundedSendId, io::Error)>`, which
-the event loop drains beside the completions. `run_shutdown` drains into a
+lowest-visibility change — `release_queued_sends` *returns* them and each
+of its callers puts them on
+`Driver::bounded_send_failures: VecDeque<(BoundedSendId, io::Result<u32>)>`,
+which the event loop drains beside the completions. (`#[must_use]` is what
+stops a caller dropping them.) The payload is an `io::Result`, not an
+`io::Error` as first written here: the queue's defining property is the
+*missing completion*, not the failure, and `send_bounded`'s two no-SQE cases
+below settle `Ok` through it — as mio's equivalent queue does. `run_shutdown` drains into a
 queue nobody reads, which is correct and is commented as such: the executor
 is going away with the driver, exactly as mio's `Driver::drop` does not push
 completions.
@@ -120,10 +125,26 @@ mio has a completion queue at all.
 
 ### `DriverCtx::send_bounded` (io_uring)
 
-Mirrors mio's: generation check, `close_submitted` refusal, `reserve_slots`
-with the same two error mappings, TLS via `encrypt_to_sends`, then the
-existing chunk loop with the id and logical length attached to the last
-slot. Admission is the reservation; nothing is written synchronously.
+Mirrors `DriverCtx::send`: generation check, `close_submitted` refusal,
+TLS via `encrypt_to_sends`, `reserve_slots` with the same two error
+mappings, then the existing chunk loop with the id and logical length
+attached to the last slot.
+
+**Where it departs from mio**: mio takes the reservation *first* and holds
+it unfilled as the entry's permit, because mio's ciphertext never comes out
+of the pool. On io_uring it cannot: `encrypt_to_sends` allocates the
+ciphertext's slots from this same pool, and an outstanding reservation hides
+them from `alloc_raw` (`SendCopyPool::reserve_slots`). So the TLS branch
+returns before the reservation, exactly as `send` does, and a bounded TLS
+send's admission is the capacity FIFO's plaintext-sized `turn` alone — which
+is the same plaintext-sized budget the "TLS admission sizing stays as it is"
+decision above already records as PR 8's gap.
+
+A message that produces no SQE has no completion coming, so `send_bounded`
+settles it itself, through `bounded_send_failures`, with the value mio
+reports: a zero-length plaintext send (`[].chunks(n)` yields nothing) and a
+TLS send whose plaintext produced no record both settle `Ok(data.len())`.
+Everything else is written by a CQE.
 
 **Departure 1 applies unchanged**: a TLS failure after `encrypt_to_sends`
 has advanced rustls fails *that operation* and closes the connection. Post

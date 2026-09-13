@@ -348,15 +348,11 @@ impl SendCopyPool {
     /// TLS send's final `OpTag::Send` chunk is one ciphertext record, neither
     /// of which is the number the caller passed.
     ///
-    /// Written by `DriverCtx::send_bounded` (series PR 7b); read back by the
-    /// send completion handlers and the teardown paths of the same PR, and
-    /// ultimately by PR 9's `send_backpressured` future, which is what the
-    /// settled result resolves.
-    // No caller outside this module's tests until series PR 7b wires the
-    // driver up; the `buffer` module's dead-code allow only covers non-uring
-    // builds, so the attribute is what keeps the io_uring build warning-free
-    // in the meantime. PR 7b removes it.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Written by `DriverCtx::send_bounded` and, when a coalescing run is
+    /// unwound, by `Driver::submit_next_queued_inner`; read back by the send
+    /// completion handlers and the teardown paths, and ultimately by PR 9's
+    /// `send_backpressured` future, which is what the settled result
+    /// resolves.
     pub fn set_bounded_send(&mut self, slot: u16, id: BoundedSendId, logical_len: u32) {
         self.slot_bounded_send[slot as usize] = Some((id, logical_len));
     }
@@ -369,11 +365,11 @@ impl SendCopyPool {
     /// operation. A handler that means to settle must take here and must not
     /// look again.
     ///
-    /// Called by series PR 7b's send/TLS-send completion handlers, its error
-    /// and `close_submitted` branches, and its teardown paths; PR 9's
-    /// `send_backpressured` future is the ultimate consumer of the result.
-    // See `set_bounded_send` for why the dead-code allow is here.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Called by the send/TLS-send completion handlers, their error and
+    /// `close_submitted` branches, the teardown paths, and
+    /// `Driver::submit_next_queued_inner` when it lifts the id onto a
+    /// coalesced slab entry; PR 9's `send_backpressured` future is the
+    /// ultimate consumer of the result.
     pub fn take_bounded_send(&mut self, slot: u16) -> Option<(BoundedSendId, u32)> {
         self.slot_bounded_send[slot as usize].take()
     }
