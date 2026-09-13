@@ -2714,6 +2714,610 @@ fn async_join_basic() {
     }
 }
 
+// ── send_backpressured (series PR 9) ────────────────────────────────
+
+/// Sends a message far larger than the whole copy pool can hold at once, in
+/// pieces that each fit, so every piece after the first has to wait for
+/// capacity that only frees as earlier sends complete.
+struct BackpressuredEchoHandler;
+
+const BP_CHUNK: usize = 4096;
+const BP_CHUNKS: usize = 8;
+
+impl AsyncEventHandler for BackpressuredEchoHandler {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            let payload = vec![b'Z'; BP_CHUNK];
+            for _ in 0..BP_CHUNKS {
+                match conn.send_backpressured(&payload).await {
+                    Ok(n) => assert_eq!(n as usize, BP_CHUNK, "resolved with the caller's length"),
+                    Err(e) => panic!("backpressured send failed: {e}"),
+                }
+            }
+            conn.shutdown_write();
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        BackpressuredEchoHandler
+    }
+}
+
+/// The core promise. One worker, a 32 KiB copy pool, and sixteen connections
+/// each pushing 32 KiB at a client that is not reading yet: the sockets stall,
+/// permits stay held, the pool runs dry, and every send after that has to take
+/// its turn in the worker's admission FIFO. When the clients finally read,
+/// every connection must receive all of its bytes, exactly once.
+///
+/// Concurrency across connections is what makes this a test of admission
+/// rather than of the happy path. A single connection awaiting its sends one
+/// at a time releases each permit before requesting the next, so the pool is
+/// never under pressure and the queue never has a second entry — verified by
+/// mutation: with one connection, submitting without waiting for a turn
+/// passes.
+#[test]
+fn backpressured_send_waits_for_pool_capacity_without_duplication() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let config = test_config_builder()
+        .workers(1)
+        .send_pool(8, 4096)
+        .build()
+        .expect("valid config");
+
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind(addr.parse().unwrap())
+        .launch::<BackpressuredEchoHandler>()
+        .expect("launch failed");
+    wait_for_server(&addr);
+
+    const CONNS: usize = 16;
+    let mut streams = Vec::new();
+    for _ in 0..CONNS {
+        let stream = TcpStream::connect(&addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        streams.push(stream);
+    }
+
+    // Let every handler run ahead and exhaust the pool before anyone reads.
+    std::thread::sleep(Duration::from_millis(300));
+
+    let readers: Vec<_> = streams
+        .into_iter()
+        .map(|mut stream| {
+            std::thread::spawn(move || {
+                let mut got = Vec::new();
+                stream.read_to_end(&mut got).expect("read to FIN");
+                got
+            })
+        })
+        .collect();
+
+    for reader in readers {
+        let got = reader.join().expect("reader thread");
+        assert_eq!(
+            got.len(),
+            BP_CHUNK * BP_CHUNKS,
+            "every byte arrives exactly once: no duplication, no loss"
+        );
+        assert!(
+            got.iter().all(|&b| b == b'Z'),
+            "the stream is not interleaved or corrupted"
+        );
+    }
+
+    shutdown.shutdown();
+    for h in handles {
+        let _ = h.join();
+    }
+}
+
+/// Polls `f` exactly once with the *current* task's context, then returns.
+/// Used to park a `send_backpressured` future in one task before moving it to
+/// another, which is the situation the queue's owner tracking exists for.
+struct PollOnce<'f, F>(&'f mut F);
+
+impl<F: Future + Unpin> Future for PollOnce<'_, F> {
+    type Output = ();
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        // Assert rather than discard: a `Ready` swallowed here leaves the
+        // inner future resolved, and the next poll of it panics inside a
+        // spawned task where the panic is caught and the await hangs instead
+        // of failing. Every use below depends on the inner future parking.
+        assert!(
+            std::pin::Pin::new(&mut *self.0).poll(cx).is_pending(),
+            "PollOnce expects the inner future to park on its first poll"
+        );
+        std::task::Poll::Ready(())
+    }
+}
+
+const MOVED_HOG: &[u8] = &[b'H'; 4096];
+const MOVED_MSG: &[u8] = &[b'M'; 4096];
+
+/// Parks a bounded send in the connection task, then moves it to a spawned
+/// task and awaits it there.
+///
+/// The FIFO wakes owners by task id. If the future did not re-register its
+/// owner on the poll after the move, the wake would go to the connection task
+/// — which is no longer polling this future — and the send would hang
+/// forever. The pool is one slot wide and a first send is holding it, so the
+/// moved future is guaranteed to be parked at the moment it changes tasks.
+struct OwnerMoveHandler;
+
+impl AsyncEventHandler for OwnerMoveHandler {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            // Occupies the only pool slot until the client starts reading.
+            let hog_conn = conn;
+            let hog = ringline::spawn_with_handle(hog_conn.send_backpressured(MOVED_HOG))
+                .expect("spawn hog");
+
+            // Park the second send in *this* task...
+            let mut moved = conn.send_backpressured(MOVED_MSG);
+            PollOnce(&mut moved).await;
+
+            // ...then hand it to a different task to finish.
+            let finisher = ringline::spawn_with_handle(moved).expect("spawn finisher");
+
+            let _ = hog.await;
+            let n = finisher.await.expect("the moved send resolved");
+            assert_eq!(n as usize, MOVED_MSG.len());
+            conn.shutdown_write();
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        OwnerMoveHandler
+    }
+}
+
+#[test]
+fn backpressured_send_refreshes_owner_after_first_poll_move() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let config = test_config_builder()
+        .workers(1)
+        .send_pool(1, 4096)
+        .build()
+        .expect("valid config");
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind(addr.parse().unwrap())
+        .launch::<OwnerMoveHandler>()
+        .expect("launch failed");
+    wait_for_server(&addr);
+
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    // Let the hog take the slot and the second send park before draining.
+    std::thread::sleep(Duration::from_millis(200));
+
+    let mut got = Vec::new();
+    stream.read_to_end(&mut got).expect("read to FIN");
+    assert_eq!(
+        got.len(),
+        MOVED_HOG.len() + MOVED_MSG.len(),
+        "both sends completed; the moved one was woken in its new task"
+    );
+
+    shutdown.shutdown();
+    for h in handles {
+        let _ = h.join();
+    }
+}
+
+const FIRST_POLL_MSG: &[u8] = &[b'F'; 512];
+
+/// Builds the future in the connection task, never polls it there, and polls
+/// it for the first time in a spawned task. The queue entry must be owned by
+/// the task that actually polls, not by whoever constructed the future — a
+/// regression that captured the task id at construction would park forever.
+struct FirstPollMoveHandler;
+
+impl AsyncEventHandler for FirstPollMoveHandler {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            let unpolled = conn.send_backpressured(FIRST_POLL_MSG);
+            let handle = ringline::spawn_with_handle(unpolled).expect("spawn");
+            let n = handle.await.expect("resolved in the task that polled it");
+            assert_eq!(n as usize, FIRST_POLL_MSG.len());
+            conn.shutdown_write();
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        FirstPollMoveHandler
+    }
+}
+
+#[test]
+fn backpressured_send_registers_the_first_polling_task_after_move() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
+        .bind(addr.parse().unwrap())
+        .launch::<FirstPollMoveHandler>()
+        .expect("launch failed");
+    wait_for_server(&addr);
+
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    let mut got = Vec::new();
+    stream.read_to_end(&mut got).expect("read to FIN");
+    assert_eq!(got.len(), FIRST_POLL_MSG.len());
+
+    shutdown.shutdown();
+    for h in handles {
+        let _ = h.join();
+    }
+}
+
+const CANCEL_A: &[u8] = &[b'A'; 1024];
+const CANCEL_B: &[u8] = &[b'B'; 7];
+
+/// Drops a send that has already been submitted, then issues another.
+///
+/// The abandoned operation's completion is still coming. It must settle the
+/// entry it belongs to and nothing else: if results were taken positionally
+/// rather than by id, the next send would resolve on the dropped one's
+/// completion and report the wrong length — or resolve before its own bytes
+/// were written.
+struct CancelSubmittedHandler;
+
+impl AsyncEventHandler for CancelSubmittedHandler {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            {
+                // One poll with a free pool submits it; then drop it.
+                let mut submitted = conn.send_backpressured(CANCEL_A);
+                PollOnce(&mut submitted).await;
+            }
+            let n = conn
+                .send_backpressured(CANCEL_B)
+                .await
+                .expect("the next send resolves on its own completion");
+            assert_eq!(
+                n as usize,
+                CANCEL_B.len(),
+                "resolved with its own length, not the abandoned send's"
+            );
+            conn.shutdown_write();
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        CancelSubmittedHandler
+    }
+}
+
+#[test]
+fn canceled_submitted_backpressured_send_cannot_complete_the_next_send() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
+        .bind(addr.parse().unwrap())
+        .launch::<CancelSubmittedHandler>()
+        .expect("launch failed");
+    wait_for_server(&addr);
+
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    let mut got = Vec::new();
+    stream.read_to_end(&mut got).expect("read to FIN");
+
+    // The abandoned send's bytes may or may not have reached the wire — that
+    // is inherent to cancelling a submitted write, and is documented. What
+    // must hold is that the second send's bytes are all there, at the end.
+    assert!(
+        got.ends_with(CANCEL_B),
+        "the second send's bytes arrived intact; got {} bytes",
+        got.len()
+    );
+
+    shutdown.shutdown();
+    for h in handles {
+        let _ = h.join();
+    }
+}
+
+#[cfg(not(has_io_uring))]
+const HALF_CLOSE_A: &[u8] = &[b'S'; 4096];
+#[cfg(not(has_io_uring))]
+const HALF_CLOSE_B: &[u8] = &[b'W'; 4096];
+
+/// mio's half-close is deferred until queued sends drain, so the two kinds of
+/// bounded send must be treated differently when the write half shuts:
+/// one already submitted still has its bytes to deliver, while one merely
+/// waiting for capacity can never use the turn it is waiting for.
+///
+/// The submitted send must complete `Ok`; the waiting one must fail
+/// `BrokenPipe` rather than sit in the queue holding the head.
+#[cfg(not(has_io_uring))]
+struct MioHalfCloseHandler;
+
+#[cfg(not(has_io_uring))]
+impl AsyncEventHandler for MioHalfCloseHandler {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            // Poll each exactly once, in order, so the states are not left to
+            // scheduler timing: spawning the first and polling the second
+            // immediately races — the spawned task has not run yet, the pool
+            // is still free, and the "waiting" send submits instead.
+            let mut submitted = conn.send_backpressured(HALF_CLOSE_A);
+            PollOnce(&mut submitted).await; // takes the only slot
+            let mut waiting = conn.send_backpressured(HALF_CLOSE_B);
+            PollOnce(&mut waiting).await; // parks: the pool is now empty
+
+            conn.shutdown_write();
+
+            let waiting_err = waiting
+                .await
+                .expect_err("a parked send cannot survive a FIN");
+            assert_eq!(
+                waiting_err.kind(),
+                std::io::ErrorKind::BrokenPipe,
+                "{waiting_err}"
+            );
+
+            let n = submitted
+                .await
+                .expect("the already-submitted send still delivers its bytes");
+            assert_eq!(n as usize, HALF_CLOSE_A.len());
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        MioHalfCloseHandler
+    }
+}
+
+#[cfg(not(has_io_uring))]
+#[test]
+fn mio_half_close_resolves_every_bounded_send_without_hanging() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let config = test_config_builder()
+        .workers(1)
+        .send_pool(1, 4096)
+        .build()
+        .expect("valid config");
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind(addr.parse().unwrap())
+        .launch::<MioHalfCloseHandler>()
+        .expect("launch failed");
+    wait_for_server(&addr);
+
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    // Let both sends reach their states before draining.
+    std::thread::sleep(Duration::from_millis(200));
+
+    let mut got = Vec::new();
+    stream.read_to_end(&mut got).expect("read to FIN");
+    assert!(
+        got.len() <= HALF_CLOSE_A.len(),
+        "a send the half-close failed must not have put bytes on the wire; got {}",
+        got.len()
+    );
+
+    shutdown.shutdown();
+    for h in handles {
+        let _ = h.join();
+    }
+}
+
+/// Handler asserting the future is inert until polled: build one, drop it
+/// without awaiting, then do a normal send. If construction had enqueued or
+/// submitted anything, the queue would hold a phantom head and the send
+/// below would stall.
+struct LazyDropHandler;
+
+impl AsyncEventHandler for LazyDropHandler {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            for _ in 0..64 {
+                let never_polled = conn.send_backpressured(b"dropped");
+                drop(never_polled);
+            }
+            let _ = conn.send_backpressured(b"OK").await;
+            conn.shutdown_write();
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        LazyDropHandler
+    }
+}
+
+#[test]
+fn backpressured_send_construction_is_lazy_and_unpolled_drop_is_inert() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
+        .bind(addr.parse().unwrap())
+        .launch::<LazyDropHandler>()
+        .expect("launch failed");
+    wait_for_server(&addr);
+
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut got = Vec::new();
+    stream.read_to_end(&mut got).expect("read to FIN");
+    assert_eq!(
+        got, b"OK",
+        "64 unpolled futures wrote nothing and blocked nothing"
+    );
+
+    shutdown.shutdown();
+    for h in handles {
+        let _ = h.join();
+    }
+}
+
+/// A message larger than the entire pool can never be admitted, so it must be
+/// refused rather than parked forever — and refused *before* anything is
+/// written, so the peer sees nothing.
+struct OversizeHandler;
+
+impl AsyncEventHandler for OversizeHandler {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            // Pool is 8 x 4096 = 32 KiB; ask for 64 KiB.
+            let huge = vec![b'X'; 64 * 1024];
+            let err = conn
+                .send_backpressured(&huge)
+                .await
+                .expect_err("larger than the whole pool");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
+            let _ = conn.send_backpressured(b"REFUSED").await;
+            conn.shutdown_write();
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        OversizeHandler
+    }
+}
+
+#[test]
+fn backpressured_send_rejects_oversize_before_writing() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let config = test_config_builder()
+        .send_pool(8, 4096)
+        .build()
+        .expect("valid config");
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind(addr.parse().unwrap())
+        .launch::<OversizeHandler>()
+        .expect("launch failed");
+    wait_for_server(&addr);
+
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut got = Vec::new();
+    stream.read_to_end(&mut got).expect("read to FIN");
+    assert_eq!(
+        got, b"REFUSED",
+        "the oversize send put nothing on the wire, and the next send still works"
+    );
+
+    shutdown.shutdown();
+    for h in handles {
+        let _ = h.join();
+    }
+}
+
+/// Half-close while a send is parked: the waiter must fail rather than hang.
+/// The handler parks a send behind a pool it has deliberately exhausted, then
+/// shuts the write half from a second task.
+struct ShutdownWhileParkedHandler;
+
+impl AsyncEventHandler for ShutdownWhileParkedHandler {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            // Fill the one-slot pool, then park a second send behind it, so
+            // there is a genuine waiting entry when the FIN is requested.
+            // An earlier version shut the write half *first* and only
+            // exercised the up-front refusal, leaving `shutdown_write`'s
+            // `fail_waiting_bounded_sends` — the actual change — untested.
+            // Two sends against a one-slot pool. Which of them ends up
+            // submitted and which parked is deliberately NOT asserted: it
+            // depends on how fast the socket drains, which differs between
+            // platforms — an earlier version pinned it and passed on macOS
+            // while failing on Linux. What must hold either way is that
+            // shutting the write half resolves *both* rather than leaving
+            // either to hang, and that any send it fails does so with
+            // BrokenPipe.
+            let mut first = conn.send_backpressured(SHUTDOWN_HOG);
+            PollOnce(&mut first).await;
+            let mut second = conn.send_backpressured(SHUTDOWN_PARKED);
+            PollOnce(&mut second).await;
+
+            conn.shutdown_write();
+
+            for (label, outcome) in [("first", first.await), ("second", second.await)] {
+                match outcome {
+                    Ok(n) => assert_eq!(
+                        n as usize,
+                        SHUTDOWN_HOG.len(),
+                        "{label}: a send that succeeded reports its own length"
+                    ),
+                    Err(e) => assert_eq!(
+                        e.kind(),
+                        std::io::ErrorKind::BrokenPipe,
+                        "{label}: the only reason to fail here is the shut write half, got {e}"
+                    ),
+                }
+            }
+
+            // A send issued *after* the shutdown is refused up front, every
+            // time — this part has no timing dependence.
+            let late = conn
+                .send_backpressured(b"after shutdown")
+                .await
+                .expect_err("write half is shut down");
+            assert_eq!(late.kind(), std::io::ErrorKind::BrokenPipe, "{late}");
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        ShutdownWhileParkedHandler
+    }
+}
+
+const SHUTDOWN_HOG: &[u8] = &[b'O'; 4096];
+const SHUTDOWN_PARKED: &[u8] = &[b'P'; 4096];
+
+#[test]
+fn shutdown_drops_parked_backpressured_send_without_hanging() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let config = test_config_builder()
+        .workers(1)
+        .send_pool(1, 4096)
+        .build()
+        .expect("valid config");
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind(addr.parse().unwrap())
+        .launch::<ShutdownWhileParkedHandler>()
+        .expect("launch failed");
+    wait_for_server(&addr);
+
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    // Let the pool fill and the second send park before draining.
+    std::thread::sleep(Duration::from_millis(200));
+    let mut got = Vec::new();
+    // The FIN arrives; the parked send failed rather than hanging the task.
+    stream.read_to_end(&mut got).expect("read to FIN");
+    // At most one of the two sends can have been on the wire, and the task
+    // reached its end rather than hanging — which is what this test is named
+    // for.
+    assert!(
+        got.len() <= SHUTDOWN_HOG.len(),
+        "a failed send must not have put bytes on the wire; got {}",
+        got.len()
+    );
+
+    shutdown.shutdown();
+    for h in handles {
+        let _ = h.join();
+    }
+}
+
 /// Handler that joins three futures: send_await + sleep + with_data.
 struct Join3Handler;
 

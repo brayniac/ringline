@@ -45,6 +45,21 @@ const CLAIMS: &[Claim] = &[
         meaning: "acceptor wakes the selected worker",
     },
     Claim {
+        path: "ringline/src/handler.rs",
+        needle: "pub(crate) fn bounded_send_slots",
+        meaning: "one definition of a bounded send's admitted slot cost",
+    },
+    Claim {
+        path: "ringline/src/runtime/io.rs",
+        needle: "pub fn send_backpressured",
+        meaning: "the send that waits for pool capacity rather than failing",
+    },
+    Claim {
+        path: "ringline/src/runtime/send_capacity.rs",
+        needle: "pub(crate) fn turn",
+        meaning: "admission is head-of-FIFO plus enough free slots",
+    },
+    Claim {
         path: "ringline/src/backend/uring/ring.rs",
         needle: "submit_and_wait(&self, min_complete: u32)",
         meaning: "io_uring submit/completion boundary",

@@ -130,6 +130,76 @@ impl UdpToken {
 // ChainPartsBuilder are io_uring-specific. On the mio backend, a minimal
 // DriverCtx is provided below.
 
+/// How many send-copy-pool slots a **bounded** send of `len` bytes on
+/// `conn_index` can need, or why it can never be admitted.
+///
+/// This is the single definition of that number, and it exists because two
+/// call sites need it to agree exactly:
+///
+/// - `send_backpressured`'s future passes it to `SendCapacityQueue::enqueue`,
+///   which will not release the future until the pool's free count covers it;
+/// - `DriverCtx::send_bounded` then reserves (mio) or capacity-checks
+///   (io_uring) against it.
+///
+/// If the future's number were the smaller of the two, the FIFO would admit a
+/// message the backend immediately refuses. On the TLS path that refusal
+/// arrives *after* rustls has mutated, and by departure 1 that closes the
+/// connection rather than applying backpressure. Too large only delays. So
+/// the asymmetry is the same one `CiphertextCapacity` was built around, and
+/// the way to honour it is one function rather than two that agree today.
+///
+/// Errors are `InvalidInput` and permanent: no amount of waiting makes the
+/// pool bigger, so the future must reject rather than park.
+pub(crate) fn bounded_send_slots(
+    pool: &SendCopyPool,
+    tls_table: *mut crate::tls::TlsTable,
+    conn_index: u32,
+    len: usize,
+) -> io::Result<usize> {
+    let slot_size = pool.slot_size() as usize;
+    let needed = if tls_table.is_null() {
+        len.div_ceil(slot_size)
+    } else {
+        // SAFETY: same single-threaded borrow-splitting contract as every
+        // other `tls_table` use in this module; read-only here.
+        let table = unsafe { &*tls_table };
+        match table.ciphertext_capacity(conn_index, len) {
+            // A TLS connection is admitted against the ciphertext bound, not
+            // the plaintext length (#385).
+            Some(bound) => match bound.slots(slot_size) {
+                Some(n) => n,
+                // No bound is expressible for this slot size. Falling back to
+                // the byte formula would under-estimate the unbuffered
+                // engine, which is the direction that closes connections.
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "a bounded TLS send needs a send-pool slot of at least {} bytes to \
+                             hold one whole record, but Config::send_copy_slot_size is \
+                             {slot_size}",
+                            bound.min_slot_size()
+                        ),
+                    ));
+                }
+            },
+            // The table exists but this connection is plaintext.
+            None => len.div_ceil(slot_size),
+        }
+    };
+    let capacity = pool.slot_count();
+    if needed > capacity {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "a bounded send of {len} bytes needs up to {needed} send-pool slots but the \
+                 pool has {capacity} (raise Config::send_pool)"
+            ),
+        ));
+    }
+    Ok(needed)
+}
+
 #[cfg(has_io_uring)]
 /// The context provided to handler callbacks for issuing operations.
 ///
@@ -424,10 +494,6 @@ impl<'a> DriverCtx<'a> {
     /// lands after `encrypt_to_sends` has advanced rustls' record sequence,
     /// so the connection cannot carry further records. It fails *this*
     /// operation and closes the connection.
-    // No caller until series PR 9's `send_backpressured` future exists; the
-    // event-loop half of this PR reaches the rest of the machinery through
-    // the driver. PR 9 removes this allowance.
-    #[allow(dead_code)]
     pub(crate) fn send_bounded(
         &mut self,
         conn: ConnToken,
@@ -455,9 +521,9 @@ impl<'a> DriverCtx<'a> {
             ));
         }
 
-        if !self.tls_table.is_null() {
-            let tls_table = unsafe { &mut *self.tls_table };
-            if tls_table.get_mut(conn.index).is_some() {
+        // SAFETY: read-only probe; see the `tls_table` field's contract.
+        if !self.tls_table.is_null() && unsafe { (*self.tls_table).has(conn.index) } {
+            {
                 // Admission has to happen *before* rustls mutates: past the
                 // first record, departure 1 turns a shortfall into a closed
                 // connection rather than backpressure. The permit is sized by
@@ -468,44 +534,26 @@ impl<'a> DriverCtx<'a> {
                 // an outstanding reservation would hide those slots from it.
                 // The worker is single-threaded and nothing allocates between
                 // this check and the first allocation inside the call.
-                let slot_size = self.send_copy_pool.slot_size() as usize;
-                let bound = tls_table
-                    .ciphertext_capacity(conn.index, data.len())
-                    .expect("connection has TLS state: checked above");
-                let needed = match bound.slots(slot_size) {
-                    Some(n) => n,
-                    // No bound is expressible for this slot size, so the only
-                    // honest answer is a refusal. Falling back to the byte
-                    // formula here would under-estimate the unbuffered engine
-                    // — the one direction that closes connections.
-                    None => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            format!(
-                                "a bounded TLS send needs a send-pool slot of at least {} bytes \
-                                 to hold one whole record, but \
-                                 Config::send_copy_slot_size is {slot_size}",
-                                bound.min_slot_size()
-                            ),
-                        ));
-                    }
-                };
-                if needed > self.send_copy_pool.slot_count() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!(
-                            "a bounded TLS send of {} bytes needs up to {needed} send-pool \
-                             slots but the pool has {} (raise Config::send_pool)",
-                            data.len(),
-                            self.send_copy_pool.slot_count()
-                        ),
-                    ));
-                }
+                //
+                // The same number `send_backpressured`'s future enqueued, by
+                // construction rather than by agreement. It is computed
+                // *before* the `&mut` below is created on purpose: taking a
+                // shared reborrow of `tls_table` while a `&mut` to it is live
+                // and used afterwards is aliasing UB, benign on today's
+                // codegen and exactly what this module's unsafe discipline
+                // exists to keep out.
+                let needed = bounded_send_slots(
+                    self.send_copy_pool,
+                    self.tls_table,
+                    conn.index,
+                    data.len(),
+                )?;
                 if self.send_copy_pool.free_count() < needed {
                     crate::metrics::POOL.increment(crate::metrics::pool::SEND_EXHAUSTED);
                     return Err(io::Error::other("send copy pool exhausted"));
                 }
                 let free_before = self.send_copy_pool.free_count();
+                let tls_table = unsafe { &mut *self.tls_table };
                 let sends = match crate::tls::encrypt_to_sends(
                     tls_table,
                     self.send_copy_pool,
@@ -2371,10 +2419,6 @@ impl<'a> DriverCtx<'a> {
     ///
     /// Called by series PR 9's `send_backpressured` future once
     /// `Executor`'s send-capacity FIFO says it is this id's turn.
-    // No caller until that future exists (the driver tests reach it through
-    // `Driver::make_ctx`); series PR 9 removes this allowance, as it does
-    // the one on `runtime::send_capacity`.
-    #[allow(dead_code)]
     pub(crate) fn send_bounded(
         &mut self,
         conn: ConnToken,
@@ -2416,26 +2460,10 @@ impl<'a> DriverCtx<'a> {
             let tls_table = unsafe { &*self.tls_table };
             tls_table.ciphertext_capacity(conn.index, data.len())
         };
-        let needed = match &tls_bound {
-            Some(bound) => match bound.slots(slot_size) {
-                Some(n) => n,
-                // No bound is expressible for this slot size; the byte
-                // formula would under-estimate the unbuffered engine, which
-                // is the direction that closes connections. Refuse instead.
-                None => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!(
-                            "a bounded TLS send needs a send-pool slot of at least {} bytes to \
-                             hold one whole record, but Config::send_copy_slot_size is \
-                             {slot_size}",
-                            bound.min_slot_size()
-                        ),
-                    ));
-                }
-            },
-            None => data.len().div_ceil(slot_size),
-        };
+        // The same number `send_backpressured`'s future enqueued, by
+        // construction rather than by agreement.
+        let needed =
+            bounded_send_slots(self.send_copy_pool, self.tls_table, conn.index, data.len())?;
         let mut permit = match self.send_copy_pool.reserve_slots(needed) {
             Ok(r) => r,
             Err(crate::buffer::send_copy::ReserveError::Exhausted) => {

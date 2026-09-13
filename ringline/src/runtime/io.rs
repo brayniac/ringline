@@ -23,6 +23,7 @@ use crate::error::TimerExhausted;
 use crate::handler::ConnToken;
 #[cfg(has_io_uring)]
 use crate::runtime::TimerSlotPool;
+use crate::runtime::send_capacity::BoundedSendId;
 use crate::runtime::task::TaskId;
 use crate::runtime::waker::STANDALONE_BIT;
 use crate::runtime::{CURRENT_TASK_ID, Executor, IoResult};
@@ -1509,6 +1510,39 @@ impl ConnCtx {
         })
     }
 
+    /// Send `data`, waiting for send-pool capacity instead of failing when
+    /// the pool is full.
+    ///
+    /// The counterpart to [`send`](Self::send), which fails immediately when
+    /// the copy pool is exhausted. Reach for this when the peer should set
+    /// the pace rather than the pool — forwarding a fast source to a slow
+    /// sink, for instance — and for `send` when a full pool means you would
+    /// rather drop the message than wait.
+    ///
+    /// Nothing is submitted, and no queue is joined, until the returned
+    /// future is polled; dropping one you never awaited does nothing. See
+    /// [`BackpressuredSendFuture`] for admission order, cancellation
+    /// semantics and the error kinds.
+    ///
+    /// `data` is borrowed until the future resolves, so it is read at
+    /// submission time rather than copied up front.
+    ///
+    /// ```no_run
+    /// # async fn f(conn: &ringline::ConnCtx, body: &[u8]) -> std::io::Result<()> {
+    /// let sent = conn.send_backpressured(body).await?;
+    /// assert_eq!(sent as usize, body.len());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn send_backpressured<'a>(&self, data: &'a [u8]) -> BackpressuredSendFuture<'a> {
+        BackpressuredSendFuture {
+            conn_index: self.conn_index,
+            generation: self.generation,
+            data,
+            state: BackpressuredState::Fresh,
+        }
+    }
+
     // ── Connect ──────────────────────────────────────────────────────
 
     /// Initiate an outbound TCP connection and await the result.
@@ -1624,10 +1658,23 @@ impl ConnCtx {
     /// Shutdown the write side of the connection (half-close).
     ///
     /// Sends a TCP FIN to the peer. The read side remains open.
+    ///
+    /// Any [`send_backpressured`](Self::send_backpressured) still waiting for
+    /// pool capacity on this connection fails with
+    /// [`BrokenPipe`](io::ErrorKind::BrokenPipe) rather than waiting for a
+    /// turn it could no longer use. Already-submitted sends are left alone —
+    /// their bytes may already be on the way, and the FIN is ordered behind
+    /// them. Plain [`send`](Self::send) is unaffected either way.
     pub fn shutdown_write(&self) {
-        with_state(|driver, _| {
+        with_state(|driver, executor| {
             let mut ctx = driver.make_ctx();
             ctx.shutdown_write(self.token());
+            executor.fail_waiting_bounded_sends(
+                self.conn_index,
+                self.generation,
+                io::ErrorKind::BrokenPipe,
+                "write half is shut down",
+            );
         })
     }
 
@@ -3404,6 +3451,271 @@ impl Future for RecvReadyFuture {
             executor.recv_waiters[self.conn_index as usize] = true;
             Poll::Pending
         })
+    }
+}
+
+// ── BackpressuredSendFuture ──────────────────────────────────────────
+
+/// Where a [`BackpressuredSendFuture`] is in the admission handshake.
+enum BackpressuredState {
+    /// Nothing has touched runtime state yet. Dropping here is inert, which
+    /// is what makes construction lazy.
+    Fresh,
+    /// Enqueued on the worker's send-capacity FIFO, waiting for its turn.
+    Waiting(BoundedSendId),
+    /// `send_bounded` has run; waiting for the backend to settle the id.
+    Submitted(BoundedSendId),
+    /// Resolved (or refused). Drop has nothing to undo.
+    Done,
+}
+
+/// Future returned by [`ConnCtx::send_backpressured`]: a send that **waits**
+/// for send-pool capacity instead of failing when the pool is full.
+///
+/// # How it differs from [`ConnCtx::send`]
+///
+/// `send` submits immediately and returns `Err` if the copy pool is
+/// exhausted. This parks instead, in a per-worker FIFO, and submits when its
+/// turn comes. Use it when the peer, not the pool, should set the pace —
+/// a proxy forwarding a fast source to a slow sink, say. Use `send` when a
+/// full pool means you would rather shed the message than wait.
+///
+/// # Admission
+///
+/// Nothing happens until the first poll: building the future touches no
+/// runtime state, so dropping one you never awaited is a no-op. On the first
+/// poll the message's worst-case pool cost is computed and the future joins
+/// the FIFO; it is released when it reaches the head *and* the pool can cover
+/// that cost. Admission is strictly first-come-first-served per worker, so a
+/// large message cannot be starved by a stream of small ones.
+///
+/// A message that could never fit the pool — even empty — is rejected with
+/// [`io::ErrorKind::InvalidInput`] before it joins the queue, because no
+/// amount of waiting would help. On a TLS connection the cost is the
+/// *ciphertext* bound, which is larger than `data.len()`.
+///
+/// # Cancellation
+///
+/// Dropping while waiting removes the entry and hands the queue to the next
+/// waiter. Dropping after submission abandons the result: the write may or
+/// may not have reached the wire, exactly as for any cancelled write. The
+/// future never submits twice.
+///
+/// # Errors
+///
+/// - [`InvalidInput`](io::ErrorKind::InvalidInput) — the message can never
+///   fit this connection's send pool.
+/// - [`BrokenPipe`](io::ErrorKind::BrokenPipe) — the write half is shut down,
+///   or was shut down while this send was waiting.
+/// - [`ConnectionAborted`](io::ErrorKind::ConnectionAborted) — the connection
+///   closed while waiting or in flight.
+/// - Anything the underlying send reports.
+///
+/// On success it resolves to the number of bytes **you passed in**, not the
+/// bytes on the wire; under TLS those differ.
+#[must_use = "a send_backpressured future does nothing until polled"]
+pub struct BackpressuredSendFuture<'a> {
+    conn_index: u32,
+    /// See `WithDataFuture` for the role of `generation`.
+    generation: u32,
+    data: &'a [u8],
+    state: BackpressuredState,
+}
+
+impl BackpressuredSendFuture<'_> {
+    /// Resolve and mark done in one step, so no error path forgets the
+    /// transition and leaves `Drop` trying to cancel an id that never was.
+    fn finish(&mut self, result: io::Result<u32>) -> Poll<io::Result<u32>> {
+        self.state = BackpressuredState::Done;
+        Poll::Ready(result)
+    }
+
+    /// Give up on `id` with `ConnectionAborted`, taking it off the queue on
+    /// the way out. Used when the connection slot has been recycled and no
+    /// result was parked: without the `cancel` the entry would sit in the
+    /// queue forever, scanned by every later operation, and if it were the
+    /// head it would stall every bounded send on the worker.
+    fn abandon(&mut self, executor: &mut Executor, id: BoundedSendId) -> Poll<io::Result<u32>> {
+        executor.cancel_bounded_send(id);
+        self.finish(Err(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "connection closed",
+        )))
+    }
+}
+
+impl Future for BackpressuredSendFuture<'_> {
+    type Output = io::Result<u32>;
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<u32>> {
+        let this = self.get_mut();
+        with_state(|driver, executor| {
+            let task_id = CURRENT_TASK_ID.with(|c| c.get());
+
+            match this.state {
+                BackpressuredState::Done => {
+                    panic!("BackpressuredSendFuture polled after completion")
+                }
+
+                BackpressuredState::Fresh => {
+                    // Slot-reuse safety, as every other connection future
+                    // does: a recycled index is a different connection.
+                    //
+                    // This check belongs *only* here. Once an id exists it
+                    // identifies the operation on its own — ids are monotonic
+                    // per worker and never reused — and the queue is the
+                    // authority on its outcome. Checking the generation in
+                    // the other states would throw away the result teardown
+                    // parked for this id, which on mio can be a real
+                    // `Ok(len)` that the final flush produced *after* the
+                    // provisional abort (departure 4), and would leave the
+                    // entry on the queue with nobody left to take it.
+                    if driver.connections.generation(this.conn_index) != this.generation {
+                        return this.finish(Err(io::Error::new(
+                            io::ErrorKind::ConnectionAborted,
+                            "connection closed",
+                        )));
+                    }
+                    // Waiting for capacity in order to write to a half-closed
+                    // socket is never useful, and a doomed entry at the head
+                    // of a shared FIFO delays every other connection on this
+                    // worker. `WriteHalf`'s docs leave this policy open for
+                    // plain sends; bounded sends decide it here.
+                    if let Some(conn) = driver.connections.get(this.conn_index)
+                        && conn.write != crate::connection::WriteHalf::Open
+                    {
+                        return this.finish(Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "write half is shut down",
+                        )));
+                    }
+                    let needed = {
+                        let ctx = driver.make_ctx();
+                        crate::handler::bounded_send_slots(
+                            ctx.send_copy_pool,
+                            ctx.tls_table,
+                            this.conn_index,
+                            this.data.len(),
+                        )
+                    };
+                    let needed = match needed {
+                        Ok(n) => n,
+                        // Permanent: no amount of waiting grows the pool.
+                        Err(e) => return this.finish(Err(e)),
+                    };
+                    let id = executor.enqueue_send_capacity(
+                        this.conn_index,
+                        this.generation,
+                        needed,
+                        task_id,
+                    );
+                    this.state = BackpressuredState::Waiting(id);
+                    // Fall through: the pool is usually free, and costing the
+                    // common case a wake-up round-trip would be a poor
+                    // default for the API reached for under load.
+                    this.poll_waiting(driver, executor, id)
+                }
+
+                BackpressuredState::Waiting(id) => {
+                    // Before anything else: a future can be polled from a
+                    // different task than the one that enqueued it (moved
+                    // into a `join!`, handed to a spawned task). The queue
+                    // wakes owners by task id, and a stale owner on the head
+                    // stalls the whole FIFO, not just this send.
+                    executor.set_bounded_send_owner(id, task_id);
+                    // Teardown moves waiting entries to `submitted` with a
+                    // result, so consult the queue before asking for a turn.
+                    if let Some(result) = executor.take_bounded_send_result(id) {
+                        return this.finish(result);
+                    }
+                    if driver.connections.generation(this.conn_index) != this.generation {
+                        return this.abandon(executor, id);
+                    }
+                    this.poll_waiting(driver, executor, id)
+                }
+
+                BackpressuredState::Submitted(id) => {
+                    executor.set_bounded_send_owner(id, task_id);
+                    match executor.take_bounded_send_result(id) {
+                        Some(result) => this.finish(result),
+                        // A recycled slot means teardown ran but left no
+                        // result for this id — take the entry off the queue
+                        // rather than leaving it for nobody.
+                        None if driver.connections.generation(this.conn_index)
+                            != this.generation =>
+                        {
+                            this.abandon(executor, id)
+                        }
+                        None => Poll::Pending,
+                    }
+                }
+            }
+        })
+    }
+}
+
+impl BackpressuredSendFuture<'_> {
+    /// The waiting half of `poll`, shared by the first poll and later ones.
+    fn poll_waiting(
+        &mut self,
+        driver: &mut Driver,
+        executor: &mut Executor,
+        id: BoundedSendId,
+    ) -> Poll<io::Result<u32>> {
+        let free = driver.send_copy_pool.free_count();
+        if !executor.send_capacity_turn(id, free) {
+            return Poll::Pending;
+        }
+        let token = ConnToken::new(self.conn_index, self.generation);
+        let submit = {
+            let mut ctx = driver.make_ctx();
+            ctx.send_bounded(token, self.data, id)
+        };
+        match submit {
+            Ok(()) => {
+                // Promotes this id to `submitted` and wakes the new head.
+                executor.mark_bounded_send_submitted(id);
+                self.state = BackpressuredState::Submitted(id);
+                // A synchronous settle (an empty message, or a mio send
+                // that needed no socket write) lands on the *driver's*
+                // completion queue, not the executor's, so this never sees
+                // it. What stops such a send hanging is that both run loops
+                // drain that queue every iteration. Kept as a cheap
+                // belt-and-braces read rather than an assumption about which
+                // side settled.
+                match executor.take_bounded_send_result(id) {
+                    Some(result) => self.finish(result),
+                    None => Poll::Pending,
+                }
+            }
+            Err(e) => {
+                // Nothing was queued and no completion is coming, so the id
+                // has to leave the queue or it holds the head forever.
+                executor.cancel_bounded_send(id);
+                self.finish(Err(e))
+            }
+        }
+    }
+}
+
+impl Drop for BackpressuredSendFuture<'_> {
+    fn drop(&mut self) {
+        let id = match self.state {
+            BackpressuredState::Waiting(id) | BackpressuredState::Submitted(id) => id,
+            // Never polled, or already resolved: nothing was left behind.
+            BackpressuredState::Fresh | BackpressuredState::Done => return,
+        };
+        // Drop runs outside a poll, so the thread-local may be gone (worker
+        // teardown). Same guard as `SendFuture::drop`.
+        let Some(mut non_null) = CURRENT_DRIVER.with(|c| c.get()) else {
+            return;
+        };
+        let state = unsafe { non_null.as_mut() };
+        let executor = unsafe { &mut *state.executor.as_mut() };
+        // Waiting: removed, and the next waiter takes the head. Submitted:
+        // marked abandoned, so the completion that is still coming removes
+        // it rather than parking a result nobody will take.
+        executor.cancel_bounded_send(id);
     }
 }
 

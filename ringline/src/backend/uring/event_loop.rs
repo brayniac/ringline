@@ -10955,6 +10955,84 @@ mod tests {
         el.driver.tls_table = Some(table);
     }
 
+    /// Departure 1, end to end on the path the series was built for: a
+    /// bounded **TLS** send whose SQE cannot be pushed.
+    ///
+    /// This is the case #318's original design got wrong. Its fix was to
+    /// return `WouldBlock` and let the future retry the whole logical send —
+    /// but by then rustls has advanced its record sequence for ciphertext
+    /// that never reached the wire, so the re-encrypted records carry
+    /// sequence numbers the peer is not expecting and it fails the connection
+    /// with `bad_record_mac`. PR 4 refined the rule: park the *built* SQE and
+    /// re-push the same bytes, which re-runs no encryption at all, and if the
+    /// SQ stays full past the cap, fail the operation and close the
+    /// connection rather than drop it silently.
+    ///
+    /// What this pins is that a bounded TLS send takes that path: it never
+    /// re-encrypts, the caller is told, and the connection goes down instead
+    /// of emitting a record gap.
+    #[test]
+    fn bounded_tls_send_parks_and_then_fails_rather_than_re_encrypting() {
+        let mut el = tls_bounded_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let token = crate::handler::ConnToken::new(conn_index, generation);
+        let (_ours, _peer) = attach_socketpair(&mut el, conn_index);
+        install_handshaked_tls(&mut el, conn_index);
+
+        let free_before = el.driver.send_copy_pool.free_count();
+
+        // The initial push and every retry are refused.
+        el.driver.ring.force_push_failures(4);
+        let id = admit_bounded_send(&mut el, token, &[b'z'; 512], 2);
+
+        // Parked, not failed, and nothing resolved yet: the bytes are still
+        // committed to this connection's stream.
+        assert_eq!(
+            el.driver.pending_send_retries,
+            vec![(conn_index, generation, 0)],
+            "a full SQ parks the built SQE rather than failing the send"
+        );
+        assert!(
+            el.executor.take_bounded_send_result(id).is_none(),
+            "nothing resolves while the entry is merely parked"
+        );
+
+        el.drain_send_retries();
+        assert!(el.executor.take_bounded_send_result(id).is_none());
+        el.drain_send_retries();
+        assert!(el.executor.take_bounded_send_result(id).is_none());
+
+        // Past the cap: the operation fails and the connection goes down.
+        el.drain_send_retries();
+        assert!(el.driver.pending_send_retries.is_empty());
+        // The give-up path does not settle the id directly — the parked entry
+        // is still queued, so `drain_conn_send_queue` -> `release_queued_sends`
+        // takes it off the pool slot and fails it through the driver's
+        // completion queue, which the run loop drains. Skipping this step is
+        // what makes the settle look like it never happened.
+        el.drain_bounded_send_completions();
+        let result = el
+            .executor
+            .take_bounded_send_result(id)
+            .expect("the retry cap must settle the bounded send, not drop it");
+        assert!(
+            result.is_err(),
+            "the caller learns the message did not go out"
+        );
+        let conn = el.driver.connections.get(conn_index);
+        assert!(
+            conn.is_none() || conn.unwrap().close_requested(),
+            "a TLS send that cannot reach the wire closes the connection, \
+             because the records it already sealed left a gap"
+        );
+        assert_eq!(
+            el.driver.send_copy_pool.free_count(),
+            free_before,
+            "giving up returns every slot the encryption took"
+        );
+    }
+
     /// Series PR 8 on the io_uring side: a bounded TLS send is admitted
     /// against the *ciphertext* bound before `encrypt_to_sends` runs, and the
     /// encryption never beats that bound.

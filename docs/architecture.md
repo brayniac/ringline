@@ -191,6 +191,28 @@ the completion is required to release pool or slab resources and advance the
 queue. On io_uring, `send_parts` can retain guarded user memory for zero-copy
 sends; on Mio guards are consumed by copying.
 
+`send_backpressured` differs from all of these in *when* it is admitted. The
+others decide at call time and fail if the send-copy pool is exhausted; this
+one joins a per-worker FIFO and submits at its turn, when the pool can cover
+the message's worst-case slot cost. That makes the peer, rather than the
+pool, set the pace — the shape a proxy forwarding a fast source to a slow
+sink wants. Admission is strictly first-come-first-served, so a large message
+cannot be starved by a stream of small ones, and it is the whole reason the
+cost is computed up front: the queue will not release a waiter until the pool
+can satisfy the number it was admitted with.
+
+Two consequences follow from that ordering. Nothing is submitted until the
+future is polled, so the message is read at submission time rather than
+copied when the call is made, and a future that is built and dropped without
+being awaited has done nothing at all. And a message that could never fit the
+pool is rejected rather than queued, because no amount of waiting would help.
+
+On a TLS connection the admitted cost is the *ciphertext* bound, not the
+plaintext length, and the asymmetry there is deliberate: over-reserving
+delays a caller, while under-reserving lets rustls advance its record
+sequence and then run out of pool mid-message, which costs the connection.
+See `docs/tls-premutation-bound-design.md`.
+
 ## TLS
 
 TLS is implemented with rustls in the worker thread; it is not a separate
@@ -227,7 +249,8 @@ Backpressure is bounded and explicit at each layer:
   later sends in a `VecDeque`. This preserves stream and TLS order.
 - Send-copy-pool, zero-copy slab, task-slab, and timer-slot exhaustion surface
   as errors. A caller using `send` can await completion; `send_nowait` reports
-  immediate admission failures.
+  immediate admission failures. `send_backpressured` is the exception: copy-pool
+  exhaustion parks it in the worker's admission FIFO instead of failing it.
 - Short sends retain their backing and resubmit the remainder. Socket `EAGAIN`
   retains the send and waits for POLLOUT/writable readiness. Transient ring
   submission pressure is handled by retry lists where the operation permits it.
