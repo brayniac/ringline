@@ -482,7 +482,9 @@ impl<'a> DriverCtx<'a> {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidInput,
                             format!(
-                                "a bounded TLS send needs a send-pool slot of at least {} bytes                                  to hold one whole record, but Config::send_copy_slot_size is                                  {slot_size}",
+                                "a bounded TLS send needs a send-pool slot of at least {} bytes \
+                                 to hold one whole record, but \
+                                 Config::send_copy_slot_size is {slot_size}",
                                 bound.min_slot_size()
                             ),
                         ));
@@ -492,7 +494,8 @@ impl<'a> DriverCtx<'a> {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
                         format!(
-                            "a bounded TLS send of {} bytes needs up to {needed} send-pool slots                              but the pool has {} (raise Config::send_pool)",
+                            "a bounded TLS send of {} bytes needs up to {needed} send-pool \
+                             slots but the pool has {} (raise Config::send_pool)",
                             data.len(),
                             self.send_copy_pool.slot_count()
                         ),

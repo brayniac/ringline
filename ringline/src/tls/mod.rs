@@ -326,12 +326,32 @@ pub(crate) const MAX_RECORD_OVERHEAD: usize = TLS_RECORD_HEADER_LEN + 8 + 16;
 /// `ClientConnection::new` propagate `BadMaxFragmentSize` and
 /// [`TlsTable::create`] returns the error — but keeping this total means the
 /// bound has no panicking input.
-fn plaintext_per_record(max_fragment_size: Option<usize>) -> usize {
+pub(crate) fn plaintext_per_record(max_fragment_size: Option<usize>) -> usize {
     match max_fragment_size {
         Some(sz) if (MIN_MAX_FRAGMENT_SIZE..=MAX_MAX_FRAGMENT_SIZE).contains(&sz) => {
             sz - TLS_RECORD_HEADER_LEN
         }
         _ => DEFAULT_MAX_PLAINTEXT_PER_RECORD,
+    }
+}
+
+/// Bytes rustls adds to one record on a connection that has already
+/// negotiated a version: 24 for TLS 1.2 GCM (explicit nonce + tag), 17 for
+/// TLS 1.3 (inner content type + tag), plus the 5-byte header either way.
+///
+/// [`MAX_RECORD_OVERHEAD`] is the version-agnostic worst case and is what the
+/// admission bound budgets, because admission must be right before it knows
+/// anything. This is the *exact* figure and is for callers that have a
+/// handshaked connection in hand — sizing an encryption chunk with the worst
+/// case would leave a TLS 1.3 record's worth of destination unused and push
+/// the engine into its retry loop for nothing.
+///
+/// Falls back to the worst case before a version is negotiated.
+pub(crate) fn negotiated_record_overhead(conn: &TlsConnKind) -> usize {
+    match conn.protocol_version() {
+        Some(rustls::ProtocolVersion::TLSv1_3) => TLS_RECORD_HEADER_LEN + 1 + 16,
+        Some(_) => MAX_RECORD_OVERHEAD,
+        None => MAX_RECORD_OVERHEAD,
     }
 }
 
@@ -354,10 +374,6 @@ fn plaintext_per_record(max_fragment_size: Option<usize>) -> usize {
 ///
 /// See `docs/tls-premutation-bound-design.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-// The only consumers so far are this module's tests. PR 8's remaining tasks
-// (the `DriverCtx::send_bounded` call sites on both backends) are what make
-// this live in a non-test build, and are what should remove this attribute.
-#[cfg_attr(not(test), allow(dead_code))]
 pub struct CiphertextCapacity {
     /// Records the bound accounts for: `ceil(plaintext_len / F)` plus the
     /// slack record described on [`TlsTable::ciphertext_capacity`].

@@ -58,29 +58,40 @@ fn test_certs() -> (
 }
 
 fn conn_pair() -> (TlsConn, TlsConn) {
+    conn_pair_with_fragment(None)
+}
+
+/// A connection pair whose configs pin `max_fragment_size`.
+///
+/// rustls' field counts the 5-byte record header, so the plaintext per record
+/// is `max_fragment_size - 5`; `TlsConn::max_plaintext_per_record` stores the
+/// subtracted value, exactly as `TlsTable::create` records it.
+fn conn_pair_with_fragment(max_fragment_size: Option<usize>) -> (TlsConn, TlsConn) {
     let (certs, key) = test_certs();
-    let server_config = Arc::new(
-        rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certs.clone(), key)
-            .unwrap(),
-    );
+    let mut server_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs.clone(), key)
+        .unwrap();
+    server_config.max_fragment_size = max_fragment_size;
+    let server_config = Arc::new(server_config);
     let mut roots = rustls::RootCertStore::empty();
     for c in &certs {
         roots.add(c.clone()).unwrap();
     }
-    let client_config: Arc<rustls::ClientConfig> = rustls::ClientConfig::builder()
+    let mut client_config = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
-        .with_no_client_auth()
-        .into();
+        .with_no_client_auth();
+    client_config.max_fragment_size = max_fragment_size;
+    let client_config: Arc<rustls::ClientConfig> = client_config.into();
     let name: ServerName<'static> = "localhost".try_into().unwrap();
 
+    let f = crate::tls::plaintext_per_record(max_fragment_size);
     let wrap = |c| TlsConn {
         conn: TlsConnKind::Unbuffered(c),
         handshake_complete: false,
         peer_sent_close_notify: false,
         close_notify_sent: false,
-        max_plaintext_per_record: DEFAULT_MAX_PLAINTEXT_PER_RECORD,
+        max_plaintext_per_record: f,
     };
     (
         wrap(UnbufferedConn::new_server(server_config).unwrap()),
@@ -100,6 +111,53 @@ pub(crate) fn handshaked_server() -> TlsConn {
         "in-memory unbuffered handshake did not complete"
     );
     server
+}
+
+/// PR 8's unbuffered slot bound is `slots = records`, which is only an upper
+/// bound if each slot carries at least `F` plaintext bytes. `encrypt_chunk`'s
+/// whole-record hint decides that, and it must read the connection's own
+/// fragment size: with the hardcoded default constants, any overridden
+/// `max_fragment_size` below ~16382 makes `whole == 0`, the retry loop
+/// converges *below* `F`, and the converged value is cached for every later
+/// slot — so a long send silently needs more slots than it was admitted for.
+/// By departure 1 that closes the connection instead of applying backpressure,
+/// which is the one outcome the bound exists to prevent.
+#[test]
+fn the_chunk_hint_never_caches_less_than_one_record() {
+    // 2048 - 5 = 2043 bytes of plaintext per record; the smallest slot for
+    // which `CiphertextCapacity::slots_unbuffered` will express a bound is
+    // `F + 29`, and that is exactly what the refusal message tells operators
+    // to configure — so it is the size that must work.
+    const FRAGMENT: usize = 2048;
+    let f = crate::tls::plaintext_per_record(Some(FRAGMENT));
+    assert_eq!(f, 2043);
+    let dst_len = f + crate::tls::MAX_RECORD_OVERHEAD;
+
+    let (mut server, mut client) = conn_pair_with_fragment(Some(FRAGMENT));
+    let mut accs = AccumulatorTable::new_with_max(4, 64 * 1024, 1 << 20);
+    handshake(&mut server, &mut client, &mut accs);
+
+    // Enough plaintext that the hint, not the message, decides the chunk.
+    let plaintext = vec![0xC3u8; 64 * 1024];
+    let mut dst = vec![0u8; dst_len];
+    let (chunk, _written) =
+        encrypt_chunk(&mut server, &plaintext, &mut dst).expect("a slot of F + 29 must encrypt");
+
+    assert!(
+        chunk >= f,
+        "a slot of {dst_len} bytes took only {chunk} plaintext bytes, under one \
+         {f}-byte record — `slots = records` is then an under-estimate"
+    );
+    let cached = server
+        .conn
+        .as_unbuffered_mut()
+        .unwrap()
+        .max_plaintext_per_chunk;
+    assert!(
+        cached == 0 || cached >= f,
+        "the cache keeps {cached} plaintext bytes per slot, under one {f}-byte \
+         record; every later slot inherits it"
+    );
 }
 
 /// Push `bytes` into `to`'s ciphertext buffer and drive it, collecting its

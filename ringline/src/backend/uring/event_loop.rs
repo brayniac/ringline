@@ -10920,8 +10920,6 @@ mod tests {
         got
     }
 
-    /// One id, one settle: a single-slot bounded send resolves `Ok` with the
-    /// length its caller passed, when its own CQE lands and not before.
     /// A test loop whose slots can hold one whole worst-case TLS record, so
     /// the ciphertext bound is expressible. The 64-byte slots the other
     /// bounded tests use cannot.
@@ -11053,6 +11051,8 @@ mod tests {
         }
     }
 
+    /// One id, one settle: a single-slot bounded send resolves `Ok` with the
+    /// length its caller passed, when its own CQE lands and not before.
     #[test]
     fn bounded_send_single_slot_settles_ok_with_the_logical_length() {
         let mut el = bounded_test_loop();
