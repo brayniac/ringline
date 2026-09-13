@@ -3028,7 +3028,9 @@ fn canceled_submitted_backpressured_send_cannot_complete_the_next_send() {
     }
 }
 
+#[cfg(not(has_io_uring))]
 const HALF_CLOSE_A: &[u8] = &[b'S'; 4096];
+#[cfg(not(has_io_uring))]
 const HALF_CLOSE_B: &[u8] = &[b'W'; 4096];
 
 /// mio's half-close is deferred until queued sends drain, so the two kinds of
