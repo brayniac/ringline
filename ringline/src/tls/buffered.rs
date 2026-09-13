@@ -731,14 +731,19 @@ pub(super) fn borrow_conn_and_buf(
 /// networking), then feeds the server ciphertext and drains its plaintext into a
 /// [`PlaintextSink::Segments`], asserting decrypted plaintext lands as owned
 /// segments and that the outstanding-plaintext bound kills an over-limit flood.
-#[cfg(all(test, has_io_uring))]
-mod segmented_tls_tests {
+/// In-memory rustls handshake harness shared by the TLS tests.
+///
+/// Portable on purpose: it builds real rustls records with no sockets and no
+/// backend, so both the io_uring-only segmented tests below and the
+/// backend-agnostic admission tests elsewhere use the same records. It used to
+/// live inside `segmented_tls_tests` behind `has_io_uring`, which kept it off
+/// the development machine for no reason.
+#[cfg(test)]
+pub(crate) mod test_support {
     use super::*;
-    use crate::backend::HeldRecvBuf;
-    use std::collections::VecDeque;
     use std::io::Cursor;
 
-    fn test_certs() -> (
+    pub(crate) fn test_certs() -> (
         Vec<rustls::pki_types::CertificateDer<'static>>,
         rustls::pki_types::PrivateKeyDer<'static>,
     ) {
@@ -750,7 +755,7 @@ mod segmented_tls_tests {
 
     /// Move all of `from`'s pending TLS output into `to`, driving `to`'s state
     /// machine. Used to pump a handshake to completion.
-    fn pump(from: &mut BufferedKind, to: &mut BufferedKind) {
+    pub(crate) fn pump(from: &mut BufferedKind, to: &mut BufferedKind) {
         let mut buf = Vec::new();
         while from.wants_write() {
             from.write_tls(&mut buf).unwrap();
@@ -769,7 +774,7 @@ mod segmented_tls_tests {
     }
 
     /// A completed in-memory TLS session: (server, client), both past handshake.
-    fn handshaked() -> (BufferedKind, BufferedKind) {
+    pub(crate) fn handshaked() -> (BufferedKind, BufferedKind) {
         let (certs, key) = test_certs();
         let server_config = Arc::new(
             rustls::ServerConfig::builder()
@@ -805,7 +810,7 @@ mod segmented_tls_tests {
         (server, client)
     }
 
-    fn wrap_server(server: BufferedKind) -> TlsConn {
+    pub(crate) fn wrap_server(server: BufferedKind) -> TlsConn {
         TlsConn {
             conn: TlsConnKind::Buffered(server),
             handshake_complete: true,
@@ -814,6 +819,15 @@ mod segmented_tls_tests {
             max_plaintext_per_record: crate::tls::DEFAULT_MAX_PLAINTEXT_PER_RECORD,
         }
     }
+}
+
+#[cfg(all(test, has_io_uring))]
+mod segmented_tls_tests {
+    use super::test_support::*;
+    use super::*;
+    use crate::backend::HeldRecvBuf;
+    use std::collections::VecDeque;
+    use std::io::Cursor;
 
     fn held_len(hold: &VecDeque<HeldRecvBuf>) -> usize {
         hold.iter()

@@ -88,6 +88,20 @@ fn conn_pair() -> (TlsConn, TlsConn) {
     )
 }
 
+/// An already-handshaked unbuffered **server** connection, for tests outside
+/// this module that need real records from the engine this build compiled in.
+/// The buffered twin is `tls::buffered::test_support::handshaked`.
+pub(crate) fn handshaked_server() -> TlsConn {
+    let (mut server, mut client) = conn_pair();
+    let mut accs = AccumulatorTable::new_with_max(4, 64 * 1024, 1 << 20);
+    handshake(&mut server, &mut client, &mut accs);
+    assert!(
+        !server.conn.is_handshaking(),
+        "in-memory unbuffered handshake did not complete"
+    );
+    server
+}
+
 /// Push `bytes` into `to`'s ciphertext buffer and drive it, collecting its
 /// own output. Returns (outcome, output ciphertext).
 fn pump(to: &mut TlsConn, bytes: &[u8], accs: &mut AccumulatorTable) -> (DriveOutcome, Vec<u8>) {

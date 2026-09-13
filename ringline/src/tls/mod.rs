@@ -49,14 +49,14 @@ use crate::buffer::send_copy::SendCopyPool;
 mod backend_mio;
 #[cfg(has_io_uring)]
 mod backend_uring;
-mod buffered;
+pub(crate) mod buffered;
 // The incoming-ciphertext buffer belongs to the unbuffered engine and has no
 // other consumer, so it shares the engine's gate; without it every item in the
 // module is dead code in a default build.
 #[cfg(feature = "tls-unbuffered")]
 mod ciphertext;
 #[cfg(feature = "tls-unbuffered")]
-mod unbuffered;
+pub(crate) mod unbuffered;
 
 // Glob re-export keeps call sites at `crate::tls::*`. Both backends' shared
 // names now live in their dispatcher module; nothing is re-exported from
@@ -155,6 +155,18 @@ impl TlsConnKind {
         match self {
             Self::Buffered(_) => None,
             Self::Unbuffered(c) => Some(c),
+        }
+    }
+
+    /// Whether the unbuffered record layer drives this connection.
+    ///
+    /// Always `false` without the `tls-unbuffered` feature, because the
+    /// variant does not exist there.
+    pub fn is_unbuffered(&self) -> bool {
+        match self {
+            Self::Buffered(_) => false,
+            #[cfg(feature = "tls-unbuffered")]
+            Self::Unbuffered(_) => true,
         }
     }
 
@@ -352,6 +364,11 @@ pub struct CiphertextCapacity {
     records: usize,
     /// The connection's plaintext bytes per record.
     max_plaintext_per_record: usize,
+    /// Which engine drives the connection this bound was taken for. Read from
+    /// the connection's own tag, not from the cargo feature: the two agree
+    /// today, and a call site that assumed so would be silently wrong on the
+    /// day they stop agreeing.
+    unbuffered: bool,
 }
 
 // Same rationale as the `allow` on the struct: PR 8's call-site task removes it.
@@ -420,6 +437,34 @@ impl CiphertextCapacity {
             return None;
         }
         Some(self.records)
+    }
+
+    /// The smallest `send_copy_slot_size` for which a bound is expressible.
+    ///
+    /// One whole worst-case record, `F + 29`. Only meaningful when
+    /// [`Self::slots`] returned `None`; it is what the refusal names so the
+    /// operator can fix the configuration rather than guess at it.
+    pub fn min_slot_size(&self) -> usize {
+        self.max_plaintext_per_record + MAX_RECORD_OVERHEAD
+    }
+
+    /// The slot bound for the engine that actually drives this connection.
+    ///
+    /// This is what admission call sites must use. The two primitives above
+    /// are the tested arithmetic; choosing between them at a call site is how
+    /// a connection ends up admitted against the buffered formula and then
+    /// encrypted by the unbuffered engine, which is the under-estimate that
+    /// closes connections.
+    ///
+    /// `None` carries the same meaning as [`Self::slots_unbuffered`]: no bound
+    /// can be expressed for this slot size, and the caller must refuse the
+    /// send rather than guess.
+    pub fn slots(&self, slot_size: usize) -> Option<usize> {
+        if self.unbuffered {
+            self.slots_unbuffered(slot_size)
+        } else {
+            self.slots_buffered(slot_size)
+        }
     }
 }
 
@@ -569,7 +614,19 @@ impl TlsTable {
         Some(CiphertextCapacity {
             records: plaintext_len.div_ceil(f.max(1)) + 1,
             max_plaintext_per_record: f,
+            unbuffered: tls_conn.conn.is_unbuffered(),
         })
+    }
+
+    /// Install a ready-made connection at `conn_index`.
+    ///
+    /// Test seam: `create`/`create_client` build a connection that still has
+    /// to handshake over a socket, which a unit test has no way to drive.
+    /// `buffered::test_support::handshaked` produces a real, already-handshaked
+    /// rustls session in memory; this puts one where the driver looks for it.
+    #[cfg(test)]
+    pub(crate) fn insert_for_test(&mut self, conn_index: u32, conn: TlsConn) {
+        self.conns[conn_index as usize] = Some(conn);
     }
 
     /// Get a mutable reference to the TLS connection at the given index.
@@ -980,6 +1037,27 @@ mod tests {
         assert!(
             cap.slots_unbuffered(16448 * 4).unwrap() > cap.slots_buffered(16448 * 4).unwrap(),
             "the byte formula under-estimates the unbuffered engine"
+        );
+    }
+
+    // The call sites must not pick an engine themselves: the wrong pick is
+    // silent, and picking `slots_buffered` for an unbuffered connection is the
+    // under-estimate that closes connections.
+    #[test]
+    fn slots_follows_the_connections_own_engine() {
+        let table = table_with_server(None);
+        let cap = table.ciphertext_capacity(0, 16384 * 4).unwrap();
+
+        #[cfg(feature = "tls-unbuffered")]
+        assert_eq!(cap.slots(16448 * 4), cap.slots_unbuffered(16448 * 4));
+        #[cfg(not(feature = "tls-unbuffered"))]
+        assert_eq!(cap.slots(16448 * 4), cap.slots_buffered(16448 * 4));
+
+        // The two disagree at this slot size, so the assertion above is not
+        // satisfied by both answers at once.
+        assert_ne!(
+            cap.slots_unbuffered(16448 * 4),
+            cap.slots_buffered(16448 * 4)
         );
     }
 

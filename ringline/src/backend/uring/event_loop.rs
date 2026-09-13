@@ -10922,6 +10922,137 @@ mod tests {
 
     /// One id, one settle: a single-slot bounded send resolves `Ok` with the
     /// length its caller passed, when its own CQE lands and not before.
+    /// A test loop whose slots can hold one whole worst-case TLS record, so
+    /// the ciphertext bound is expressible. The 64-byte slots the other
+    /// bounded tests use cannot.
+    fn tls_bounded_test_loop() -> AsyncEventLoop<NoopHandler> {
+        make_test_loop_with_config(
+            test_config_builder()
+                .send_pool(8, 16448)
+                .build()
+                .expect("valid config"),
+        )
+    }
+
+    /// Install an already-handshaked TLS connection at `conn_index`, driven by
+    /// whichever record-layer engine this build compiled in. `accept_connection`
+    /// deliberately does not create one (the table has no server config), so
+    /// this is the only TLS a bounded-send test sees.
+    fn install_handshaked_tls(el: &mut AsyncEventLoop<NoopHandler>, conn_index: u32) {
+        let max = el.driver.connections.max_slots();
+        let mut table = crate::tls::TlsTable::new(max, None, None);
+        #[cfg(feature = "tls-unbuffered")]
+        table.insert_for_test(
+            conn_index,
+            crate::tls::unbuffered::tests::handshaked_server(),
+        );
+        #[cfg(not(feature = "tls-unbuffered"))]
+        {
+            let (server, _peer) = crate::tls::buffered::test_support::handshaked();
+            table.insert_for_test(
+                conn_index,
+                crate::tls::buffered::test_support::wrap_server(server),
+            );
+        }
+        el.driver.tls_table = Some(table);
+    }
+
+    /// Series PR 8 on the io_uring side: a bounded TLS send is admitted
+    /// against the *ciphertext* bound before `encrypt_to_sends` runs, and the
+    /// encryption never beats that bound.
+    #[test]
+    fn bounded_tls_send_is_admitted_against_the_ciphertext_bound() {
+        let mut el = tls_bounded_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let token = crate::handler::ConnToken::new(conn_index, generation);
+        let (_ours, _peer) = attach_socketpair(&mut el, conn_index);
+        install_handshaked_tls(&mut el, conn_index);
+
+        // Fits in one slot as plaintext but spans two records, so plaintext
+        // sizing and ciphertext sizing give different answers.
+        const PLAINTEXT: usize = 16448;
+        let bound = el
+            .driver
+            .tls_table
+            .as_ref()
+            .unwrap()
+            .ciphertext_capacity(conn_index, PLAINTEXT)
+            .expect("the connection has TLS state");
+        assert_eq!(bound.records(), 3);
+        assert_eq!(bound.slots(16448), Some(3));
+
+        let free_before = el.driver.send_copy_pool.free_count();
+        assert_eq!(free_before, 8);
+        let _id = admit_bounded_send(
+            &mut el,
+            token,
+            &[b'z'; PLAINTEXT],
+            bound.slots(16448).unwrap(),
+        );
+
+        let used = free_before - el.driver.send_copy_pool.free_count();
+        assert!(
+            used > PLAINTEXT.div_ceil(16448),
+            "the ciphertext genuinely costs more slots than the plaintext \
+             would have reserved ({used} used)"
+        );
+        assert!(
+            used <= 3,
+            "encryption must never beat the bound it was admitted against \
+             ({used} used against a bound of 3)"
+        );
+    }
+
+    /// The refusal has to happen *before* rustls mutates. Once a record is
+    /// sealed the sequence number is spent, so by departure 1 a shortfall
+    /// discovered mid-encryption closes the connection instead of applying
+    /// backpressure. With only enough free slots for the plaintext, admission
+    /// must still refuse.
+    #[test]
+    fn bounded_tls_send_refuses_before_encrypting_when_the_bound_does_not_fit() {
+        let mut el = tls_bounded_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let token = crate::handler::ConnToken::new(conn_index, generation);
+        let (_ours, _peer) = attach_socketpair(&mut el, conn_index);
+        install_handshaked_tls(&mut el, conn_index);
+
+        // Leave two free slots: enough for one slot of plaintext, short of the
+        // three-slot ciphertext bound.
+        let mut held = Vec::new();
+        while el.driver.send_copy_pool.free_count() > 2 {
+            let (slot, _p, _l) = el.driver.send_copy_pool.copy_in(b"x").unwrap();
+            held.push(slot);
+        }
+
+        const PLAINTEXT: usize = 16448;
+        let task_id = parked_standalone(&mut el.executor);
+        let id = el
+            .executor
+            .enqueue_send_capacity(conn_index, generation, 3, task_id);
+        let err = {
+            let mut ctx = el.driver.make_ctx();
+            ctx.send_bounded(token, &[b'z'; PLAINTEXT], id)
+                .expect_err("two free slots cannot cover a three-slot bound")
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::Other, "{err}");
+
+        assert_eq!(
+            el.driver.send_copy_pool.free_count(),
+            2,
+            "a refusal must not have encrypted anything"
+        );
+        assert!(
+            el.driver.connections.get(conn_index).is_some(),
+            "backpressure, not a closed connection"
+        );
+
+        for slot in held {
+            el.driver.send_copy_pool.release(slot);
+        }
+    }
+
     #[test]
     fn bounded_send_single_slot_settles_ok_with_the_logical_length() {
         let mut el = bounded_test_loop();
