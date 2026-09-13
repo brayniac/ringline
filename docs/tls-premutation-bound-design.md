@@ -111,6 +111,34 @@ naming `send_copy_slot_size`, the same shape as the existing
 "wider than the whole pool" refusal. Silently proceeding with an
 under-estimate is the one outcome this PR exists to prevent.
 
+### The call site does not choose the engine
+
+The two slot formulas above are the tested arithmetic, but a call site that
+picks between them can pick wrong, and picking `slots_buffered` for an
+unbuffered connection is precisely the silent under-estimate this PR exists
+to prevent. `CiphertextCapacity` therefore records which engine drives the
+connection it was taken for — read from the connection's own
+`TlsConnKind` tag, not from the cargo feature — and exposes
+`slots(slot_size)`, which dispatches. That is what admission calls;
+`slots_buffered`/`slots_unbuffered` remain as the directly-tested
+primitives. The tag and the feature agree today. A call site that assumed
+so would be silently wrong on the day they stop agreeing, and nothing would
+fail until a connection closed in production.
+
+`min_slot_size()` (`F + 29`) exists so the refusal can name the number the
+operator has to clear, rather than saying only that the slot is too small.
+
+### The two refusals are not the same refusal
+
+`None` from `slots` is **unbuffered-only**. The buffered engine straddles
+slots, so a slot far smaller than one record still yields a valid bound —
+just a large one (a 64-byte slot against a 16 KiB record asks for 513
+slots). That request then fails the ordinary pool-capacity check and the
+caller gets the existing "needs N slots but the pool has M (raise
+Config::send_pool)" error. Both refusals are correct and both are
+`InvalidInput`; what must not happen in either engine is a send admitted
+against a bound that is too small.
+
 ## Where the check goes
 
 **Departure 2 holds with no signature changes.** Both bounded call sites are
