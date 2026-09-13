@@ -2905,6 +2905,122 @@ fn backpressured_send_refreshes_owner_after_first_poll_move() {
     }
 }
 
+const FIRST_POLL_MSG: &[u8] = &[b'F'; 512];
+
+/// Builds the future in the connection task, never polls it there, and polls
+/// it for the first time in a spawned task. The queue entry must be owned by
+/// the task that actually polls, not by whoever constructed the future — a
+/// regression that captured the task id at construction would park forever.
+struct FirstPollMoveHandler;
+
+impl AsyncEventHandler for FirstPollMoveHandler {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            let unpolled = conn.send_backpressured(FIRST_POLL_MSG);
+            let handle = ringline::spawn_with_handle(unpolled).expect("spawn");
+            let n = handle.await.expect("resolved in the task that polled it");
+            assert_eq!(n as usize, FIRST_POLL_MSG.len());
+            conn.shutdown_write();
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        FirstPollMoveHandler
+    }
+}
+
+#[test]
+fn backpressured_send_registers_the_first_polling_task_after_move() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
+        .bind(addr.parse().unwrap())
+        .launch::<FirstPollMoveHandler>()
+        .expect("launch failed");
+    wait_for_server(&addr);
+
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    let mut got = Vec::new();
+    stream.read_to_end(&mut got).expect("read to FIN");
+    assert_eq!(got.len(), FIRST_POLL_MSG.len());
+
+    shutdown.shutdown();
+    for h in handles {
+        let _ = h.join();
+    }
+}
+
+const CANCEL_A: &[u8] = &[b'A'; 1024];
+const CANCEL_B: &[u8] = &[b'B'; 7];
+
+/// Drops a send that has already been submitted, then issues another.
+///
+/// The abandoned operation's completion is still coming. It must settle the
+/// entry it belongs to and nothing else: if results were taken positionally
+/// rather than by id, the next send would resolve on the dropped one's
+/// completion and report the wrong length — or resolve before its own bytes
+/// were written.
+struct CancelSubmittedHandler;
+
+impl AsyncEventHandler for CancelSubmittedHandler {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            {
+                // One poll with a free pool submits it; then drop it.
+                let mut submitted = conn.send_backpressured(CANCEL_A);
+                PollOnce(&mut submitted).await;
+            }
+            let n = conn
+                .send_backpressured(CANCEL_B)
+                .await
+                .expect("the next send resolves on its own completion");
+            assert_eq!(
+                n as usize,
+                CANCEL_B.len(),
+                "resolved with its own length, not the abandoned send's"
+            );
+            conn.shutdown_write();
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        CancelSubmittedHandler
+    }
+}
+
+#[test]
+fn canceled_submitted_backpressured_send_cannot_complete_the_next_send() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
+        .bind(addr.parse().unwrap())
+        .launch::<CancelSubmittedHandler>()
+        .expect("launch failed");
+    wait_for_server(&addr);
+
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    let mut got = Vec::new();
+    stream.read_to_end(&mut got).expect("read to FIN");
+
+    // The abandoned send's bytes may or may not have reached the wire — that
+    // is inherent to cancelling a submitted write, and is documented. What
+    // must hold is that the second send's bytes are all there, at the end.
+    assert!(
+        got.ends_with(CANCEL_B),
+        "the second send's bytes arrived intact; got {} bytes",
+        got.len()
+    );
+
+    shutdown.shutdown();
+    for h in handles {
+        let _ = h.join();
+    }
+}
+
 /// Handler asserting the future is inert until polled: build one, drop it
 /// without awaiting, then do a normal send. If construction had enqueued or
 /// submitted anything, the queue would hold a phantom head and the send
