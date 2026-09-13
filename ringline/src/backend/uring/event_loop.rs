@@ -14,6 +14,7 @@ use crate::connection::{Lifecycle, ReadHalf, RecvArm};
 use crate::metrics;
 use crate::runtime::handler::AsyncEventHandler;
 use crate::runtime::io::{ConnCtx, DriverState, UdpCtx, set_driver_state_guarded};
+use crate::runtime::send_capacity::BoundedSendId;
 use crate::runtime::waker::{STANDALONE_BIT, conn_waker, standalone_waker};
 use crate::runtime::{CURRENT_TASK_ID, Executor, TimerSlotPool};
 
@@ -399,6 +400,33 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 }
                 self.driver.pending_finalize_closes = pending;
             }
+
+            // Hand the executor every bounded-send result that no CQE
+            // carried. Two producers fill this queue and both of them have
+            // run by now: `DriverCtx::send_bounded`, from `poll_ready_tasks`
+            // and from `on_tick` (a message that queued no SQE at all), and
+            // teardown, from any `drain_conn_send_queue` /
+            // `force_finalize_close` / `reset_send_state` above — including
+            // the `try_finalize_close` pass immediately preceding. Draining
+            // once, here, is therefore the single point that covers all of
+            // them, and nothing waits on it: `complete_bounded_send` wakes
+            // the owner straight onto `Executor::ready_queue`, which the top
+            // of the next iteration collects *before* deciding whether to
+            // block, so a settled send is polled without a `submit_and_wait`
+            // in between.
+            self.drain_bounded_send_completions();
+
+            // One send-capacity wake per iteration, last — same placement,
+            // and for the same reason, as the mio loop (#381). Copy-pool
+            // slots come back at many points above (every send-family CQE
+            // handler, the retry drains, `drain_conn_send_queue`, the
+            // teardown inside `pending_finalize_closes`), and each of those
+            // sets `capacity_released` rather than touching the executor.
+            // Waking from inside `drain_completions` instead would leave the
+            // slots that teardown released here unsignalled until after the
+            // next `submit_and_wait`, which can block indefinitely — and a
+            // parked bounded send would stall behind it.
+            self.wake_capacity_if_released();
 
             // Record work-phase (everything except the blocking wait) duration.
             if let Some(start) = iter_start {
@@ -1856,13 +1884,37 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         if self.driver.connections.generation(conn_index) & 0xFFFF
             != u32::from(UserData::send_payload_gen(payload))
         {
-            self.driver.send_copy_pool.release(pool_slot);
+            // The slot may still name a bounded send, and `release`
+            // debug-asserts rather than drop a live id — so take it. It is
+            // deliberately *not* settled: this completion belongs to the
+            // connection the CQE outlived, and `Executor::remove_connection`
+            // already recorded a provisional `Aborted` for that operation
+            // when the connection went away. Per #381 a driver result
+            // overrides that abort, which is exactly what must not happen
+            // here — the result describes a dead occupant's send.
+            let _ = self.driver.send_copy_pool.take_bounded_send(pool_slot);
+            self.release_pool_slot(pool_slot);
             return;
         }
 
         // Chain path.
         if self.driver.chain_table.is_active(conn_index) {
-            self.driver.send_copy_pool.release(pool_slot);
+            // A chain's SQEs are tagged `OpTag::Send` and bypass the send
+            // queue, so while one is active this branch claims *every* Send
+            // CQE on the connection — including one belonging to a bounded
+            // send submitted alongside it. That aliasing predates this PR and
+            // is not fixed here, but the id must not be dropped on the floor:
+            // take it (or `release` trips) and report this CQE's own outcome.
+            let bounded = self.driver.send_copy_pool.take_bounded_send(pool_slot);
+            self.release_pool_slot(pool_slot);
+            if let Some((id, logical_len)) = bounded {
+                let settled = if result > 0 {
+                    Ok(logical_len)
+                } else {
+                    Err(Self::bounded_send_error(result))
+                };
+                self.settle_bounded(id, settled);
+            }
             let event = self.driver.chain_table.on_operation_cqe(conn_index, result);
             if matches!(event, ChainEvent::Complete { .. }) {
                 self.fire_chain_complete(conn_index);
@@ -1877,7 +1929,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 .try_advance(pool_slot, result as u32)
             {
                 if self.close_submitted(conn_index) {
-                    self.driver.send_copy_pool.release(pool_slot);
+                    let bounded = self.driver.send_copy_pool.take_bounded_send(pool_slot);
+                    self.release_pool_slot(pool_slot);
+                    if let Some((id, _logical_len)) = bounded {
+                        self.settle_bounded(id, Err(io::Error::from_raw_os_error(libc::ECANCELED)));
+                    }
                     self.executor.wake_send(
                         conn_index,
                         Err(io::Error::from_raw_os_error(libc::ECANCELED)),
@@ -1903,10 +1959,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 return;
             }
             let total = self.driver.send_copy_pool.original_len(pool_slot);
-            // Read the end-of-send flag before releasing the slot.
+            // Read the end-of-send flag before releasing the slot — and, for
+            // the same reason, take the bounded send that slot settles: the
+            // slot is about to be recycled, and `release` debug-asserts
+            // rather than let a live id go with it.
             let end_of_send = self.driver.send_copy_pool.is_end_of_send(pool_slot);
+            let bounded = self.driver.send_copy_pool.take_bounded_send(pool_slot);
             metrics::BYTES.add(metrics::bytes::SENT, total as u64);
-            self.driver.send_copy_pool.release(pool_slot);
+            self.release_pool_slot(pool_slot);
 
             // Accumulate this chunk's bytes against the logical send.
             self.driver.send_queues[conn_index as usize].acked_bytes += total;
@@ -1918,6 +1978,16 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // close_pending connection is ready to actually close.
             self.driver.submit_next_queued(conn_index);
             self.driver.note_send_finalized(conn_index);
+
+            // A bounded send reports the *logical* (plaintext) length it was
+            // handed, never `acked`: `acked` counts wire bytes, which differ
+            // from the caller's length under TLS and would be exactly the
+            // truncated count the design forbids. Only an end-of-send slot
+            // ever carries an id, but the settle sits outside that branch so
+            // that a stray one still cannot be lost.
+            if let Some((id, logical_len)) = bounded {
+                self.settle_bounded(id, Ok(logical_len));
+            }
 
             // Wake the send waiter once, when this logical send's final chunk
             // completes, reporting its whole byte count. Intermediate chunks of
@@ -1941,7 +2011,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let errno = -result;
         if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
             if self.close_submitted(conn_index) {
-                self.driver.send_copy_pool.release(pool_slot);
+                let bounded = self.driver.send_copy_pool.take_bounded_send(pool_slot);
+                self.release_pool_slot(pool_slot);
+                if let Some((id, _logical_len)) = bounded {
+                    self.settle_bounded(id, Err(io::Error::from_raw_os_error(libc::ECANCELED)));
+                }
                 self.executor.wake_send(
                     conn_index,
                     Err(io::Error::from_raw_os_error(libc::ECANCELED)),
@@ -1964,7 +2038,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             return;
         }
 
-        self.driver.send_copy_pool.release(pool_slot);
+        let bounded = self.driver.send_copy_pool.take_bounded_send(pool_slot);
+        self.release_pool_slot(pool_slot);
         self.driver.drain_conn_send_queue(conn_index);
         self.driver.note_send_finalized(conn_index);
 
@@ -1973,6 +2048,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         } else {
             Err(io::Error::from_raw_os_error(-result))
         };
+        if let Some((id, _logical_len)) = bounded {
+            self.settle_bounded(id, Err(Self::bounded_send_error(result)));
+        }
         self.executor.wake_send(conn_index, io_result);
     }
 
@@ -2003,7 +2081,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         if self.driver.connections.generation(conn_index) & 0x7FFF
             != u32::from(UserData::send_pollout_gen(payload))
         {
-            self.driver.send_copy_pool.release(pool_slot);
+            // Take-and-discard, exactly as in `handle_send`'s identity
+            // guard: the id must leave the slot so `release` does not trip,
+            // and it must not be settled, because teardown already aborted
+            // the dead occupant's operation and a driver result would
+            // override that abort (#381).
+            let _ = self.driver.send_copy_pool.take_bounded_send(pool_slot);
+            self.release_pool_slot(pool_slot);
             return;
         }
 
@@ -2011,16 +2095,24 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // the same as a generic send failure: drop everything for
         // this connection.
         if result < 0 {
-            self.driver.send_copy_pool.release(pool_slot);
+            let bounded = self.driver.send_copy_pool.take_bounded_send(pool_slot);
+            self.release_pool_slot(pool_slot);
             self.driver.drain_conn_send_queue(conn_index);
             self.driver.note_send_finalized(conn_index);
+            if let Some((id, _logical_len)) = bounded {
+                self.settle_bounded(id, Err(io::Error::from_raw_os_error(-result)));
+            }
             self.executor
                 .wake_send(conn_index, Err(io::Error::from_raw_os_error(-result)));
             return;
         }
 
         if self.close_submitted(conn_index) {
-            self.driver.send_copy_pool.release(pool_slot);
+            let bounded = self.driver.send_copy_pool.take_bounded_send(pool_slot);
+            self.release_pool_slot(pool_slot);
+            if let Some((id, _logical_len)) = bounded {
+                self.settle_bounded(id, Err(io::Error::from_raw_os_error(libc::ECANCELED)));
+            }
             self.executor.wake_send(
                 conn_index,
                 Err(io::Error::from_raw_os_error(libc::ECANCELED)),
@@ -2069,7 +2161,77 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.driver.send_queues[conn_index as usize].close_submitted
     }
 
+    /// Settle one bounded (`ConnCtx::send_backpressured`) operation.
+    ///
+    /// Every site that resolves a bounded send goes through here so that no
+    /// handler open-codes the rule: an id is settled exactly once, is routed
+    /// by id rather than by connection, and carries the *logical* length on
+    /// success. `Executor::complete_bounded_send` wakes the owning task and
+    /// overrides a provisional teardown `Aborted` with this result (#381).
+    fn settle_bounded(&mut self, id: BoundedSendId, result: io::Result<u32>) {
+        self.executor.complete_bounded_send(id, result);
+    }
+
+    /// The failure a bounded send reports for a terminal send CQE.
+    ///
+    /// `result == 0` on a stream send means no bytes reached the wire and the
+    /// handler is tearing the send down; `send().await` reports `Ok(0)` there,
+    /// but a bounded send must never resolve with a truncated count (it would
+    /// look like a short write of the caller's message), so it reports
+    /// `WriteZero` — the same shape mio's flush reports for a zero-length
+    /// write.
+    fn bounded_send_error(result: i32) -> io::Error {
+        if result == 0 {
+            io::Error::new(io::ErrorKind::WriteZero, "send made no progress")
+        } else {
+            io::Error::from_raw_os_error(-result)
+        }
+    }
+
+    /// Return a copy-pool slot and note that send capacity came back.
+    ///
+    /// Every copy-pool release in this file goes through here. The
+    /// bounded-send admission FIFO parks its head until the pool can take a
+    /// whole message, and `wake_capacity_if_released` at the end of the run
+    /// loop is the only thing that unparks it — so a release that forgets the
+    /// flag strands a parked send until some unrelated release happens to set
+    /// it. The driver sets the same flag on its own teardown paths.
+    fn release_pool_slot(&mut self, slot: u16) {
+        self.driver.send_copy_pool.release(slot);
+        self.driver.capacity_released = true;
+    }
+
+    /// Wake the send-capacity FIFO head if any copy-pool slot came back this
+    /// iteration, and clear the flag. Called once, as the last thing in the
+    /// run loop; see the call site for why that point.
+    ///
+    /// Separate from the loop body so tests can drive it directly.
+    fn wake_capacity_if_released(&mut self) {
+        if self.driver.capacity_released {
+            self.driver.capacity_released = false;
+            self.executor
+                .wake_send_capacity(self.driver.send_copy_pool.free_count());
+        }
+    }
+
+    /// Hand the executor the bounded-send results that no CQE will carry:
+    /// `DriverCtx::send_bounded`'s synchronous settles (a message that queued
+    /// no SQE) and teardown's destroyed queue entries. Mirrors the first half
+    /// of mio's `drain_send_completions`; the per-connection `SendFuture`
+    /// wakes have no equivalent queue here, since an io_uring completion
+    /// handler calls `wake_send` directly.
+    fn drain_bounded_send_completions(&mut self) {
+        while let Some((id, result)) = self.driver.bounded_send_completions.pop_front() {
+            self.settle_bounded(id, result);
+        }
+    }
+
     /// Release the backing pool slots of a coalesced send, then the slab entry.
+    ///
+    /// Callers that mean to settle the run's bounded send must take it with
+    /// `InFlightSendSlab::take_coalesced_bounded_send` *before* calling this:
+    /// the slab release clears the entry's id silently (no tripwire, unlike
+    /// the copy pool's).
     fn release_coalesced(&mut self, slab_idx: u16) {
         let mut slots = [u16::MAX; crate::buffer::send_slab::MAX_IOVECS];
         let mut n = 0;
@@ -2078,7 +2240,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             n += 1;
         }
         for &s in &slots[..n] {
-            self.driver.send_copy_pool.release(s);
+            self.release_pool_slot(s);
         }
         self.driver.send_slab.release(slab_idx);
     }
@@ -2098,6 +2260,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // only (plain sendmsg, no notification coming; no resubmit either
         // way, the connection is gone).
         if !self.slab_identity_ok(conn_index, slab_idx) {
+            // The entry may still name the bounded send lifted off the run's
+            // end-of-send pool slot. Take it so nothing can claim it twice,
+            // and settle nothing: the operation belonged to the connection
+            // this CQE outlived, whose teardown already recorded the abort,
+            // and a driver result would override that abort (#381) with a
+            // dead occupant's outcome.
+            let _ = self.driver.send_slab.take_coalesced_bounded_send(slab_idx);
             self.release_coalesced(slab_idx);
             return;
         }
@@ -2106,7 +2275,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // Partial send: advance the iovec array and resubmit the remainder.
             if let Some(msg_ptr) = self.driver.send_slab.try_advance(slab_idx, result as u32) {
                 if self.close_submitted(conn_index) {
+                    let bounded = self.driver.send_slab.take_coalesced_bounded_send(slab_idx);
                     self.release_coalesced(slab_idx);
+                    if let Some((id, _logical_len)) = bounded {
+                        self.settle_bounded(id, Err(io::Error::from_raw_os_error(libc::ECANCELED)));
+                    }
                     self.executor.wake_send(
                         conn_index,
                         Err(io::Error::from_raw_os_error(libc::ECANCELED)),
@@ -2128,8 +2301,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
             // Fully sent.
             let total = self.driver.send_slab.total_len(slab_idx);
-            // Read the end-of-send flag before releasing the slab entry.
+            // Read the end-of-send flag before releasing the slab entry —
+            // and, for the same reason, take the bounded send it settles.
             let end_of_send = self.driver.send_slab.is_end_of_send(slab_idx);
+            let bounded = self.driver.send_slab.take_coalesced_bounded_send(slab_idx);
             metrics::BYTES.add(metrics::bytes::SENT, total as u64);
             self.release_coalesced(slab_idx);
 
@@ -2140,6 +2315,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.driver.send_queues[conn_index as usize].acked_bytes += total;
             self.driver.submit_next_queued(conn_index);
             self.driver.note_send_finalized(conn_index);
+            // The carried logical (plaintext) length, not `acked` — see
+            // `handle_send`'s success path.
+            if let Some((id, logical_len)) = bounded {
+                self.settle_bounded(id, Ok(logical_len));
+            }
             if end_of_send {
                 let acked =
                     std::mem::take(&mut self.driver.send_queues[conn_index as usize].acked_bytes);
@@ -2153,7 +2333,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let errno = -result;
         if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
             if self.close_submitted(conn_index) {
+                let bounded = self.driver.send_slab.take_coalesced_bounded_send(slab_idx);
                 self.release_coalesced(slab_idx);
+                if let Some((id, _logical_len)) = bounded {
+                    self.settle_bounded(id, Err(io::Error::from_raw_os_error(libc::ECANCELED)));
+                }
                 self.executor.wake_send(
                     conn_index,
                     Err(io::Error::from_raw_os_error(libc::ECANCELED)),
@@ -2176,6 +2360,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
 
         // Real error — release everything and drain the connection's queue.
+        let bounded = self.driver.send_slab.take_coalesced_bounded_send(slab_idx);
         self.release_coalesced(slab_idx);
         self.driver.drain_conn_send_queue(conn_index);
         self.driver.note_send_finalized(conn_index);
@@ -2184,6 +2369,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         } else {
             Err(io::Error::from_raw_os_error(-result))
         };
+        if let Some((id, _logical_len)) = bounded {
+            self.settle_bounded(id, Err(Self::bounded_send_error(result)));
+        }
         self.executor.wake_send(conn_index, io_result);
     }
 
@@ -2198,21 +2386,32 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
         // Identity: closed (index possibly reused) while waiting for POLLOUT.
         if !self.slab_identity_ok(conn_index, slab_idx) {
+            // Take-and-discard, as in `handle_send_msg_coalesced`: the dead
+            // occupant's operation was already aborted by its teardown.
+            let _ = self.driver.send_slab.take_coalesced_bounded_send(slab_idx);
             self.release_coalesced(slab_idx);
             return;
         }
 
         if result < 0 {
+            let bounded = self.driver.send_slab.take_coalesced_bounded_send(slab_idx);
             self.release_coalesced(slab_idx);
             self.driver.drain_conn_send_queue(conn_index);
             self.driver.note_send_finalized(conn_index);
+            if let Some((id, _logical_len)) = bounded {
+                self.settle_bounded(id, Err(io::Error::from_raw_os_error(-result)));
+            }
             self.executor
                 .wake_send(conn_index, Err(io::Error::from_raw_os_error(-result)));
             return;
         }
 
         if self.close_submitted(conn_index) {
+            let bounded = self.driver.send_slab.take_coalesced_bounded_send(slab_idx);
             self.release_coalesced(slab_idx);
+            if let Some((id, _logical_len)) = bounded {
+                self.settle_bounded(id, Err(io::Error::from_raw_os_error(libc::ECANCELED)));
+            }
             self.executor.wake_send(
                 conn_index,
                 Err(io::Error::from_raw_os_error(libc::ECANCELED)),
@@ -2734,7 +2933,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             if self.driver.send_slab.should_release(slab_idx) {
                 let ps = self.driver.send_slab.release(slab_idx);
                 if ps != u16::MAX {
-                    self.driver.send_copy_pool.release(ps);
+                    self.release_pool_slot(ps);
                 }
             }
             return;
@@ -2747,7 +2946,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 if self.driver.send_slab.should_release(slab_idx) {
                     let ps = self.driver.send_slab.release(slab_idx);
                     if ps != u16::MAX {
-                        self.driver.send_copy_pool.release(ps);
+                        self.release_pool_slot(ps);
                     }
                 }
                 let event = self.driver.chain_table.on_notif_cqe(conn_index);
@@ -2759,7 +2958,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             if result == -libc::ECANCELED {
                 let ps = self.driver.send_slab.release(slab_idx);
                 if ps != u16::MAX {
-                    self.driver.send_copy_pool.release(ps);
+                    self.release_pool_slot(ps);
                 }
             } else if result > 0 {
                 // Kernel sends a ZC notification only when result > 0.
@@ -2772,7 +2971,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 // release immediately — no ZC notification coming.
                 let ps = self.driver.send_slab.release(slab_idx);
                 if ps != u16::MAX {
-                    self.driver.send_copy_pool.release(ps);
+                    self.release_pool_slot(ps);
                 }
             }
             let event = self.driver.chain_table.on_operation_cqe(conn_index, result);
@@ -2787,7 +2986,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             if self.driver.send_slab.should_release(slab_idx) {
                 let pool_slot = self.driver.send_slab.release(slab_idx);
                 if pool_slot != u16::MAX {
-                    self.driver.send_copy_pool.release(pool_slot);
+                    self.release_pool_slot(pool_slot);
                 }
             }
             return;
@@ -2812,7 +3011,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     if self.driver.send_slab.should_release(slab_idx) {
                         let ps = self.driver.send_slab.release(slab_idx);
                         if ps != u16::MAX {
-                            self.driver.send_copy_pool.release(ps);
+                            self.release_pool_slot(ps);
                         }
                     }
                     self.executor.wake_send(
@@ -2850,7 +3049,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         if should_release {
             let pool_slot = self.driver.send_slab.release(slab_idx);
             if pool_slot != u16::MAX {
-                self.driver.send_copy_pool.release(pool_slot);
+                self.release_pool_slot(pool_slot);
             }
         }
 
@@ -3138,7 +3337,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         if self.driver.connections.generation(conn_index) & 0xFFFF
             != u32::from(UserData::send_payload_gen(payload))
         {
-            self.driver.send_copy_pool.release(pool_slot);
+            // Take-and-discard, as in `handle_send`'s identity guard.
+            let _ = self.driver.send_copy_pool.take_bounded_send(pool_slot);
+            self.release_pool_slot(pool_slot);
             return;
         }
 
@@ -3149,7 +3350,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 .try_advance(pool_slot, result as u32)
         {
             if self.close_submitted(conn_index) {
-                self.driver.send_copy_pool.release(pool_slot);
+                // One of this handler's two silent returns. `send().await`
+                // is left hanging here (a pre-existing hole this PR does not
+                // fix), but a bounded send must not reproduce it.
+                let bounded = self.driver.send_copy_pool.take_bounded_send(pool_slot);
+                self.release_pool_slot(pool_slot);
+                if let Some((id, _logical_len)) = bounded {
+                    self.settle_bounded(id, Err(io::Error::from_raw_os_error(libc::ECANCELED)));
+                }
                 return;
             }
             let generation = self.driver.connections.generation(conn_index);
@@ -3181,7 +3389,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             let errno = -result;
             if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
                 if self.close_submitted(conn_index) {
-                    self.driver.send_copy_pool.release(pool_slot);
+                    // The handler's other silent return; same reasoning.
+                    let bounded = self.driver.send_copy_pool.take_bounded_send(pool_slot);
+                    self.release_pool_slot(pool_slot);
+                    if let Some((id, _logical_len)) = bounded {
+                        self.settle_bounded(id, Err(io::Error::from_raw_os_error(libc::ECANCELED)));
+                    }
                     return;
                 }
                 let generation = self.driver.connections.generation(conn_index);
@@ -3200,7 +3413,22 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
         }
 
-        self.driver.send_copy_pool.release(pool_slot);
+        let bounded = self.driver.send_copy_pool.take_bounded_send(pool_slot);
+        self.release_pool_slot(pool_slot);
+        // By construction no id reaches this handler: `send_bounded` attaches
+        // it to the *final* ciphertext chunk, which `encrypt_to_sends` tags
+        // `OpTag::Send`, so the id-carrying slot completes in `handle_send`.
+        // Taking it anyway is what keeps `SendCopyPool::release`'s tripwire
+        // honest if that ever changes, and settling it is what keeps the
+        // caller from hanging on the `drain_conn_send_queue` path below.
+        if let Some((id, logical_len)) = bounded {
+            let settled = if result > 0 {
+                Ok(logical_len)
+            } else {
+                Err(Self::bounded_send_error(result))
+            };
+            self.settle_bounded(id, settled);
+        }
 
         // Intermediate TLS chunks are serialized through the per-connection
         // send queue, so a completion must pop the next queued send and let
@@ -3428,7 +3656,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             crate::backend::uring::driver::decode_udp_send_payload(ud.payload());
         let idx = udp_index as usize;
 
-        self.driver.send_copy_pool.release(pool_slot);
+        self.release_pool_slot(pool_slot);
 
         let mut slot_returned = false;
         if idx < self.driver.udp_sockets.len() {
@@ -3849,7 +4077,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         if self.driver.send_slab.should_release(slab_idx) {
             let pool_slot = self.driver.send_slab.release(slab_idx);
             if pool_slot != u16::MAX {
-                self.driver.send_copy_pool.release(pool_slot);
+                self.release_pool_slot(pool_slot);
             }
         }
     }
@@ -3872,18 +4100,36 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // Connection closed or reused (or its Close already submitted) —
             // release the slab only. Touching the send queue here would
             // drain a *new* connection's sends.
-            if self.driver.connections.get(conn_index).is_none()
-                || self.driver.connections.generation(conn_index) != generation
-                || self.close_submitted(conn_index)
-            {
+            let identity_ok = self.driver.connections.get(conn_index).is_some()
+                && self.driver.connections.generation(conn_index) == generation;
+            if !identity_ok || self.close_submitted(conn_index) {
+                // Take the lifted id either way — the slab release clears it
+                // silently — but settle it only when the connection is still
+                // the one that submitted it (the `close_submitted` reason).
+                // The `!identity_ok` reason is a dead occupant's entry, whose
+                // operation teardown already aborted; a driver result would
+                // override that abort (#381).
+                let bounded = self.driver.send_slab.take_coalesced_bounded_send(slab_idx);
                 self.release_coalesced(slab_idx);
+                if identity_ok && let Some((id, _logical_len)) = bounded {
+                    self.settle_bounded(id, Err(io::Error::from_raw_os_error(libc::ECANCELED)));
+                }
                 continue;
             }
             if retries >= 2 {
                 // Give up: fail the waiter and close so the connection isn't
                 // left open with a hole in its byte stream.
+                let bounded = self.driver.send_slab.take_coalesced_bounded_send(slab_idx);
                 self.release_coalesced(slab_idx);
                 self.driver.drain_conn_send_queue(conn_index);
+                if let Some((id, _logical_len)) = bounded {
+                    self.settle_bounded(
+                        id,
+                        Err(io::Error::other(
+                            "max retries during coalesced send resubmit",
+                        )),
+                    );
+                }
                 let err = io::Error::other("max retries during coalesced send resubmit");
                 self.executor.wake_send(conn_index, Err(err));
                 self.driver.close_connection(conn_index);
@@ -3975,18 +4221,34 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
             // Connection closed or reused (or its Close already submitted) —
             // release the slot only.
-            if self.driver.connections.get(conn_index).is_none()
-                || self.driver.connections.generation(conn_index) != generation
-                || self.close_submitted(conn_index)
-            {
-                self.driver.send_copy_pool.release(pool_slot);
+            let identity_ok = self.driver.connections.get(conn_index).is_some()
+                && self.driver.connections.generation(conn_index) == generation;
+            if !identity_ok || self.close_submitted(conn_index) {
+                // Take before releasing (`release` debug-asserts rather than
+                // drop a live id), but settle only when the connection is
+                // still the one that submitted this slot. The `!identity_ok`
+                // reason is a dead occupant's slot: teardown already recorded
+                // that operation's abort, and a driver result would override
+                // it (#381) on behalf of a connection that is gone.
+                let bounded = self.driver.send_copy_pool.take_bounded_send(pool_slot);
+                self.release_pool_slot(pool_slot);
+                if identity_ok && let Some((id, _logical_len)) = bounded {
+                    self.settle_bounded(id, Err(io::Error::from_raw_os_error(libc::ECANCELED)));
+                }
                 continue;
             }
             if retries >= 2 {
                 // Give up: fail the waiter and close so the connection isn't
                 // left open with a hole in its byte stream.
-                self.driver.send_copy_pool.release(pool_slot);
+                let bounded = self.driver.send_copy_pool.take_bounded_send(pool_slot);
+                self.release_pool_slot(pool_slot);
                 self.driver.drain_conn_send_queue(conn_index);
+                if let Some((id, _logical_len)) = bounded {
+                    self.settle_bounded(
+                        id,
+                        Err(io::Error::other("max retries during send resubmit")),
+                    );
+                }
                 let err = io::Error::other("max retries during send resubmit");
                 self.executor.wake_send(conn_index, Err(err));
                 self.driver.close_connection(conn_index);
@@ -4057,6 +4319,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 // Give up: release the parked entry and everything behind it,
                 // fail the waiter and close so the connection isn't left open
                 // with a hole in its byte stream.
+                //
+                // No bounded send is settled here because none is in hand:
+                // the parked entry is still *queued*, so
+                // `drain_conn_send_queue` -> `release_queued_sends` takes its
+                // id off the pool slot and fails it (as `ConnectionAborted`)
+                // through `Driver::bounded_send_completions`, which the run
+                // loop drains.
                 self.driver.drain_conn_send_queue(conn_index);
                 let err = io::Error::other("max retries during send submit");
                 self.executor.wake_send(conn_index, Err(err));
@@ -4118,15 +4387,28 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 // the connection died while the retry aged, only the slot may
                 // be touched — draining/waking/closing would hit the index's
                 // new occupant.
+                let mut bounded = None;
                 if self.driver.send_copy_pool.in_use(pool_slot) {
-                    self.driver.send_copy_pool.release(pool_slot);
+                    bounded = self.driver.send_copy_pool.take_bounded_send(pool_slot);
+                    self.release_pool_slot(pool_slot);
                 }
                 if self.driver.connections.get(conn_index).is_none()
                     || self.driver.connections.generation(conn_index) != generation
                 {
+                    // A dead occupant's slot. The id was taken so `release`
+                    // could not trip on it, and it is deliberately dropped
+                    // here rather than settled: teardown already aborted that
+                    // operation, and a driver result would override the abort
+                    // (#381) for a connection that no longer exists.
                     continue;
                 }
                 self.driver.drain_conn_send_queue(conn_index);
+                if let Some((id, _logical_len)) = bounded {
+                    self.settle_bounded(
+                        id,
+                        Err(io::Error::other("max retries during send pollout retry")),
+                    );
+                }
                 let err = io::Error::other("max retries during send pollout retry");
                 self.executor.wake_send(conn_index, Err(err));
                 self.driver.close_connection(conn_index);
@@ -4142,12 +4424,19 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             if !self.driver.send_copy_pool.in_use(pool_slot) {
                 continue;
             }
-            if self.driver.connections.get(conn_index).is_none()
-                || self.driver.connections.generation(conn_index) != generation
-                || self.close_submitted(conn_index)
-            {
+            let identity_ok = self.driver.connections.get(conn_index).is_some()
+                && self.driver.connections.generation(conn_index) == generation;
+            if !identity_ok || self.close_submitted(conn_index) {
                 if self.driver.send_copy_pool.in_use(pool_slot) {
-                    self.driver.send_copy_pool.release(pool_slot);
+                    // Same split as `drain_copy_retries`: settle only when
+                    // the slot still belongs to the live occupant (the
+                    // `close_submitted` reason); a dead occupant's id is
+                    // taken and discarded.
+                    let bounded = self.driver.send_copy_pool.take_bounded_send(pool_slot);
+                    self.release_pool_slot(pool_slot);
+                    if identity_ok && let Some((id, _logical_len)) = bounded {
+                        self.settle_bounded(id, Err(io::Error::from_raw_os_error(libc::ECANCELED)));
+                    }
                 }
                 continue;
             }

@@ -388,12 +388,8 @@ impl InFlightSendSlab {
     /// afterwards without settling it twice.
     ///
     /// Called by the coalesced-send completion handler and the coalesced
-    /// error/retry branches (the event-loop half of series PR 7b); the
-    /// result ultimately resolves PR 9's `send_backpressured` future.
-    // The event-loop half of this PR is the only non-test caller; until it
-    // lands this is written but never read on an io_uring build, and the
-    // `buffer` module's dead-code allow only covers non-uring builds.
-    #[allow(dead_code)]
+    /// error/retry branches; the result ultimately resolves PR 9's
+    /// `send_backpressured` future.
     pub fn take_coalesced_bounded_send(&mut self, idx: u16) -> Option<(BoundedSendId, u32)> {
         self.entries[idx as usize].bounded_send.take()
     }
