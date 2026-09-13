@@ -232,6 +232,70 @@ impl UserData {
 mod tests {
     use super::*;
 
+    /// The send-family payload truncates the connection generation — 16 bits
+    /// for `send_payload`, 15 for `send_pollout_payload` — and the completion
+    /// handlers compare the packed half against the live generation masked the
+    /// same way. Every event-loop test recycles a slot only a handful of times,
+    /// so none of them ever reaches a generation where the truncation actually
+    /// bites; reaching 0x8000 through `ConnectionTable` would take 32768
+    /// recycles. These pin the boundary directly.
+    ///
+    /// Found because a mutation that narrowed `send_payload`'s mask from
+    /// 0xFFFF to 0x7FFF failed no test at all: the generation those tests use
+    /// (0x2A3) fits in 15 bits, so both masks agree and the mutation was a
+    /// no-op. The encoding was fine; the coverage was not.
+    #[test]
+    fn send_payload_truncates_the_generation_at_sixteen_bits() {
+        for generation in [
+            0u32,
+            1,
+            0x7FFF,
+            0x8000, // first value the 15- and 16-bit masks disagree on
+            0xFFFF,
+            0x1_0000, // truncates to 0
+            0x1_2A3,
+            u32::MAX,
+        ] {
+            let payload = UserData::send_payload(0xBEEF, generation);
+            assert_eq!(
+                UserData::send_payload_slot(payload),
+                0xBEEF,
+                "slot half corrupted at generation {generation:#x}"
+            );
+            assert_eq!(
+                UserData::send_payload_gen(payload),
+                (generation & 0xFFFF) as u16,
+                "generation half is not the low 16 bits at {generation:#x}"
+            );
+        }
+    }
+
+    /// The `SendPollOut` layout keeps only 15 generation bits and carries the
+    /// `is_tls` flag at bit 16, so its truncation boundary is 0x8000 and a
+    /// mask of 0xFFFF here would collide with that flag.
+    #[test]
+    fn send_pollout_payload_truncates_the_generation_at_fifteen_bits() {
+        for generation in [0u32, 1, 0x7FFF, 0x8000, 0xFFFF, 0x1_0000, u32::MAX] {
+            for is_tls in [false, true] {
+                let payload = UserData::send_pollout_payload(0xBEEF, is_tls, generation);
+                assert_eq!(
+                    payload as u16, 0xBEEF,
+                    "slot half corrupted at generation {generation:#x}"
+                );
+                assert_eq!(
+                    (payload >> 16) & 1 == 1,
+                    is_tls,
+                    "is_tls flag corrupted at generation {generation:#x}"
+                );
+                assert_eq!(
+                    (payload >> 17) as u16,
+                    (generation & 0x7FFF) as u16,
+                    "generation half is not the low 15 bits at {generation:#x}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn round_trip_all_tags() {
         for tag_val in 0..=10u8 {
