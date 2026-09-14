@@ -19,8 +19,10 @@ impl AsyncEventHandler for EchoHandler {
             // Falls back to the forward_recv_buf loop on non-io_uring builds.
             #[cfg(has_io_uring)]
             {
+                // No `return` needed: the fallback below is cfg'd out whenever
+                // this arm is compiled in. (Never linted before #402, because
+                // this block was dead on every platform.)
                 conn.run_direct_echo().await;
-                return;
             }
             #[cfg(not(has_io_uring))]
             loop {
