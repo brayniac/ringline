@@ -26,6 +26,7 @@ pub(crate) mod diag {
     use std::sync::Once;
     use std::sync::atomic::{AtomicU64, Ordering};
     pub static HELD: AtomicU64 = AtomicU64::new(0);
+    pub static PLAIN_CQE: AtomicU64 = AtomicU64::new(0);
     pub static FLUSH_CALL: AtomicU64 = AtomicU64::new(0);
     pub static NOT_DE: AtomicU64 = AtomicU64::new(0);
     pub static BUSY: AtomicU64 = AtomicU64::new(0);
@@ -40,7 +41,8 @@ pub(crate) mod diag {
                 loop {
                     std::thread::sleep(std::time::Duration::from_secs(5));
                     println!(
-                        "DE held={} flush={} not_de={} busy={} empty={} single={} gathered={}",
+                        "DE plain_cqe={} held={} flush={} not_de={} busy={} empty={} single={} gathered={}",
+                        PLAIN_CQE.load(Ordering::Relaxed),
                         HELD.load(Ordering::Relaxed),
                         FLUSH_CALL.load(Ordering::Relaxed),
                         NOT_DE.load(Ordering::Relaxed),
@@ -697,7 +699,10 @@ impl Driver {
                 .map(|_| std::collections::VecDeque::new())
                 .collect(),
             recv_forward: vec![false; config.max_connections as usize],
-            direct_echo_pending: Vec::new(),
+            direct_echo_pending: {
+                diag::start();
+                Vec::new()
+            },
             direct_echo_queued: vec![false; config.max_connections as usize],
             recv_domain: vec![
                 crate::recv::domain::RecvDomain::default();

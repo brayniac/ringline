@@ -1446,6 +1446,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 .get(conn_index)
                 .is_some_and(|c| c.direct_echo);
 
+            crate::backend::uring::driver::diag::PLAIN_CQE
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if is_direct_echo {
                 // Stage the buffer rather than submitting a Send for it now.
                 // The flush pass at the end of this drain gathers everything
