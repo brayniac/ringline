@@ -54,12 +54,13 @@ thiserror = "2"
 # AES panic). Downstream consumers respect this min-version pin even
 # though the lockfile may resolve higher.
 quinn-proto = { version = "0.11.14", default-features = false, features = ["rustls-ring"] }
-# rustls >= 0.23.18 patches RUSTSEC-2024-0399 (Acceptor::accept panic on
-# fragmented ClientHello, CVE-2024-11738) and is also past
-# RUSTSEC-2024-0336 (complete_io infinite loop). Pin to the patched
-# baseline so downstream resolvers can't accidentally land on a
-# vulnerable 0.23.x.
-rustls = { version = "0.23.18", default-features = false }
+# rustls >= 0.23.45 patches RUSTSEC-2026-0285 (TLS 1.3 handshake messages
+# accepted across an encryption-level boundary, GHSA-2mjx-qc3c-rqvc). It is
+# also past RUSTSEC-2024-0399 (Acceptor::accept panic on fragmented
+# ClientHello, CVE-2024-11738) and RUSTSEC-2024-0336 (complete_io infinite
+# loop). Pin to the patched baseline so downstream resolvers can't
+# accidentally land on a vulnerable 0.23.x.
+rustls = { version = "0.23.45", default-features = false }
 slab = "0.4"
 rcgen = "0.13"
 rustls-pki-types = "1"
