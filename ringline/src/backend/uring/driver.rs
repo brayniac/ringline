@@ -221,9 +221,18 @@ pub(crate) struct Driver {
     /// in one coalesced `sendmsg` via `forward_held`. Backpressure is natural:
     /// unreplenished bids deplete the provided-buffer ring (ENOBUFS) until a
     /// forward completes and replenishes them.
+    /// `recv_hold` is also the staging area for direct-echo connections, which
+    /// gather it the same way from the CQE handler (see `flush_direct_echo`).
     pub(crate) recv_hold: Vec<std::collections::VecDeque<PendingRecvBuf>>,
     /// Per-connection opt-in flag for the zero-copy recv-forward path.
     pub(crate) recv_forward: Vec<bool>,
+    /// Direct-echo connections with buffers waiting in `recv_hold`. Entries
+    /// persist until the hold drains, so the end-of-drain flush pass never has
+    /// to ask which completion handler should have re-armed it.
+    pub(crate) direct_echo_pending: Vec<u32>,
+    /// Membership test for `direct_echo_pending` (one bool per connection),
+    /// so a burst of recv CQEs on one connection enqueues it once.
+    pub(crate) direct_echo_queued: Vec<bool>,
     /// Per-connection recv delivery domain (segmented-recv). `CopyOrConsume`
     /// (default) uses the accumulator / single-buffer zero-copy path;
     /// `Segmented` holds arriving provided buffers in `segment_hold` instead.
@@ -652,6 +661,8 @@ impl Driver {
                 .map(|_| std::collections::VecDeque::new())
                 .collect(),
             recv_forward: vec![false; config.max_connections as usize],
+            direct_echo_pending: Vec::new(),
+            direct_echo_queued: vec![false; config.max_connections as usize],
             recv_domain: vec![
                 crate::recv::domain::RecvDomain::default();
                 config.max_connections as usize
@@ -1063,12 +1074,13 @@ impl Driver {
         // bids aren't leaked, and clear the opt-in flag for slot reuse. An
         // in-flight forward's bids live in its slab entry (already drained from
         // recv_hold) and are replenished by its own completion handler.
-        if self.recv_forward[conn_index as usize] {
-            for pending in self.recv_hold[conn_index as usize].drain(..) {
-                self.pending_replenish.push(pending.bid);
-            }
-            self.recv_forward[conn_index as usize] = false;
+        // Direct-echo connections stage in the same hold, so this drains
+        // unconditionally rather than only under the recv-forward flag; the
+        // flush pass drops the queue entry once it sees an empty hold.
+        for pending in self.recv_hold[conn_index as usize].drain(..) {
+            self.pending_replenish.push(pending.bid);
         }
+        self.recv_forward[conn_index as usize] = false;
         // Do NOT drain held segmented-recv buffers here. When a peer FIN drives
         // this close, a parked Mode B reader must still consume the bytes already
         // held — draining them now (before the woken reader is polled) would
@@ -1571,6 +1583,124 @@ impl Driver {
     /// `pending_send_retries`; `drain_send_retries` re-pushes it. A parked
     /// `SendRecvBuf` keeps its provided buffer exactly as a queued one does —
     /// the bid is replenished by its completion, not by the caller.
+    /// Stage a direct-echo recv buffer for the next flush.
+    ///
+    /// The connection stays on `direct_echo_pending` until its hold drains, so
+    /// the flush pass never has to work out which completion handler owed it a
+    /// re-arm.
+    pub(crate) fn hold_direct_echo(&mut self, conn_index: u32, pending: PendingRecvBuf) {
+        let ci = conn_index as usize;
+        self.recv_hold[ci].push_back(pending);
+        if !self.direct_echo_queued[ci] {
+            self.direct_echo_queued[ci] = true;
+            self.direct_echo_pending.push(conn_index);
+        }
+    }
+
+    /// Submit the next direct-echo send for `conn_index`, gathering every
+    /// buffer currently held (up to `MAX_IOVECS`) into one operation.
+    ///
+    /// Direct echo used to submit one `Send` per recv completion. A message
+    /// larger than a single completion's worth of bytes therefore left as
+    /// several segments — the tail was already sitting in the send queue behind
+    /// the head, but as a separate, non-coalescable op. Gathering here makes
+    /// the reply's packetization follow the message rather than the arrival
+    /// pattern of the request (#397).
+    ///
+    /// A lone held buffer still takes the plain `Send` path: it needs neither a
+    /// slab entry nor an `msghdr`, and it is the common case for any message
+    /// that fits one completion.
+    pub(crate) fn flush_direct_echo(&mut self, conn_index: u32) {
+        use crate::buffer::send_slab::MAX_IOVECS;
+        let ci = conn_index as usize;
+
+        // One send in flight per connection; anything that arrives meanwhile
+        // accumulates in the hold and goes out in the next gather. A non-empty
+        // queue implies `in_flight`, but both are checked so this can never
+        // overtake a send that is already ordered ahead of it.
+        if self.send_queues[ci].in_flight || !self.send_queues[ci].queue.is_empty() {
+            return;
+        }
+        let n = self.recv_hold[ci].len().min(MAX_IOVECS);
+        if n == 0 {
+            return;
+        }
+
+        if n >= 2 {
+            let mut iovecs = [libc::iovec {
+                iov_base: std::ptr::null_mut(),
+                iov_len: 0,
+            }; MAX_IOVECS];
+            let mut bids = [0u16; MAX_IOVECS];
+            let mut total: u32 = 0;
+            for i in 0..n {
+                let p = self.recv_hold[ci][i];
+                iovecs[i] = libc::iovec {
+                    iov_base: p.ptr as *mut libc::c_void,
+                    iov_len: p.len as usize,
+                };
+                bids[i] = p.bid;
+                total += p.len;
+            }
+            let generation = self.connections.generation(conn_index);
+            if let Some((slab_idx, msg_ptr)) = self.send_slab.allocate_recv_forward(
+                conn_index,
+                generation,
+                &iovecs[..n],
+                &bids[..n],
+                total,
+            ) {
+                // The slab entry owns the buffers from here: its completion
+                // replenishes the bids whether the send succeeds, is retried,
+                // or is released on close.
+                for _ in 0..n {
+                    self.recv_hold[ci].pop_front();
+                }
+                self.send_queues[ci].in_flight = true;
+                if self
+                    .ring
+                    .submit_send_recv_bufs_coalesced(conn_index, msg_ptr, slab_idx)
+                    .is_err()
+                {
+                    // SQ full: the same retry path the coalesced completion
+                    // handler uses. Nothing is dropped and no bid is leaked.
+                    self.pending_recv_forward_retries
+                        .push((conn_index, generation, slab_idx, 0));
+                }
+                return;
+            }
+            // Slab exhausted — fall through and send the head buffer alone
+            // rather than stalling the connection.
+        }
+
+        let pending = self.recv_hold[ci]
+            .pop_front()
+            .expect("hold is non-empty: n >= 1 was checked above");
+        let ud = UserData::encode(OpTag::SendRecvBuf, conn_index, pending.bid as u32);
+        let entry = io_uring::opcode::Send::new(
+            io_uring::types::Fixed(conn_index),
+            pending.ptr,
+            pending.len,
+        )
+        .flags(crate::completion::STREAM_SEND_FLAGS)
+        .build()
+        .user_data(ud.raw());
+        self.send_recv_buf_original_lens[ci] = pending.len;
+        self.send_recv_buf_remaining[ci] = pending.len;
+        // Infallible: under SQ pressure the echo is parked at the queue head
+        // and retried, holding its provided buffer exactly as a queued echo
+        // does; the bid is replenished by its completion.
+        self.submit_or_queue_send(
+            conn_index,
+            crate::handler::BuiltSend {
+                entry,
+                pool_slot: u16::MAX,
+                slab_idx: u16::MAX,
+                total_len: pending.len,
+            },
+        );
+    }
+
     pub(crate) fn submit_or_queue_send(
         &mut self,
         conn_index: u32,
