@@ -11,10 +11,20 @@
 #   tokio    tokio reference
 #   rfwd     ringline io_uring with the zero-copy recv-forward path
 #
+# One message size per arm, deliberately: the server's rezolus recording spans
+# the whole arm, and there is no way to slice a recording by time after the
+# fact, so a multi-size arm cannot attribute CPU or syscalls to a size. One
+# size per arm makes each recording map to exactly one cell.
+#
+# There is no hand-rolled CPU sampler here. rezolus already records per-CPU
+# `cpu_usage` by state and per-task `task_cpu_usage` by comm on this guest; a
+# /proc/stat sampler was redundant and got the accounting wrong (it counted
+# iowait as busy, which makes an io_uring server blocked in submit_and_wait
+# look like it is burning every core).
+#
 # Phase 1's output is the saturation point each phase 2 open-loop rate is
-# expressed as a fraction of. Every arm must pass experiments/phase0-gate.py
-# before its numbers are used; see docs/journal/2026-09-release-comparison-campaign.md.
-name = "ringline campaign p1 {config} c{clients} rep{rep}"
+# expressed as a fraction of; see docs/journal/2026-09-release-comparison-campaign.md.
+name = "ringline campaign p1 {config} c{clients} s{msg_size} rep{rep}"
 
 [params]
 bins_artifact = "REPLACE"
@@ -24,7 +34,7 @@ runtime       = "ringline"
 server_flags  = ""
 rep           = "1"
 workers       = "8"
-msg_sizes     = "256 1024 4096 16384"
+msg_size      = "256"
 image         = "spool/images/debian-13-base-20260912.1@golden"
 server_ip     = "172.31.0.1"
 client_ip     = "172.31.0.2"
@@ -74,41 +84,6 @@ payload = "exec /home/anvil/out/{server_bin} --runtime {runtime} --addr {server_
 type = "barrier"
 name = "server-ready"
 timeout = 1800
-
-# Sample per-core utilization across the client's measurement window. Read
-# straight from /proc/stat so the guest needs no extra packages: two snapshots
-# and a delta, emitted as `cpuN <busy percent>` — the format phase0-gate.py
-# parses.
-[[jobs.steps]]
-type = "anvil-vm"
-mode = "exec"
-upload = true
-artifacts = ["/home/anvil/percore.txt"]
-payload = '''
-set -uo pipefail
-cd /home/anvil
-# busy = user+nice+system+irq+softirq+steal. iowait ($6) is deliberately
-# EXCLUDED: a worker blocked in io_uring's `submit_and_wait` is accounted as
-# iowait, not idle, so counting it as busy makes an idle io_uring server look
-# like it is burning every core. Measured at 1 connection: cores showed
-# iowait=97%, user=0.2%, sys=2.5% — i.e. ~22% of one core in total, against a
-# naive reading of 806%. epoll-based runtimes do not have this accounting
-# quirk, so including iowait does not merely add noise, it biases the
-# comparison against io_uring specifically.
-snap() { awk '/^cpu[0-9]/ {print $1, $2+$3+$4+$7+$8+$9, $5+$6}' /proc/stat; }
-# Cover the whole size sweep: placement is not size-dependent, so one window
-# spanning every size is the right sample for a funnel check.
-sleep 8
-snap > /tmp/s1
-sleep 80
-snap > /tmp/s2
-join /tmp/s1 /tmp/s2 \
-  | awk '{b=$4-$2; i=$5-$3; t=b+i; if (t>0) printf "%s %.1f\n", $1, 100*b/t}' \
-  > percore.txt
-echo "== per-core busy% over the measurement window"; cat percore.txt
-echo "== hottest / median"
-sort -k2 -n percore.txt | awk '{v[NR]=$2} END {printf "hottest=%.1f median=%.1f cores=%d\n", v[NR], v[int(NR/2)+1], NR}'
-'''
 
 [[jobs.steps]]
 type = "barrier"
@@ -167,13 +142,11 @@ for i in $(seq 1 120); do
 done
 ulimit -n 500000
 mkdir -p results
-echo "config={config} clients={clients} rep={rep} workers={workers}" | tee results/arm.txt
-for size in {msg_sizes}; do
-  ./out/bench-client --runtime ringline --addr {server_ip}:{port} --clients {clients} \
-    --msg-size $size --warmup {warmup} --duration {duration} --threads {client_threads} \
-    > results/results-$size.json 2> results/client-$size.log
-  echo "== msg_size=$size"; cat results/results-$size.json; echo
-done
+echo "config={config} clients={clients} rep={rep} workers={workers} size={msg_size}" | tee results/arm.txt
+./out/bench-client --runtime ringline --addr {server_ip}:{port} --clients {clients} \
+  --msg-size {msg_size} --warmup {warmup} --duration {duration} --threads {client_threads} \
+  > results/results-{msg_size}.json 2> results/client.log
+cat results/results-{msg_size}.json
 tar czf results.tgz results
 '''
 
