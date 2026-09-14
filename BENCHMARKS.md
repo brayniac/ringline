@@ -4,17 +4,190 @@ Point-in-time performance numbers for the ringline **server**, alongside a
 tokio reference. Checked in so future changes have a baseline to beat (or to
 flag a regression against).
 
-**Run:** June 2026, ringline 0.1.3 (commit `c77cfba`), tokio reference in the
-same `bench-server` binary. Not yet re-run on the current release.
+Two runs are recorded here, on different rigs and different workloads. Both are
+two-machine (client and server on separate physical hosts); neither is
+co-located.
 
-These numbers are from a **clean two-machine run** — two separate EC2 instances,
-not the co-located/single-host configuration whose unreliable tail-latency
-numbers were withdrawn previously. The workload is a realistic cache server, not
-echo.
+| | workload | rig | date / commit |
+|---|---|---|---|
+| [TCP echo](#tcp-echo-comparison-two-machine-x710-40g) | TCP echo, 4 message sizes x 4 connection counts | bare metal, Xeon, X710 40G LAG | Sept 2026, `afcccfb` (pre-0.7) |
+| [Segcache](#segcache-cache-server-comparison-two-machine-aws-graviton4) | Segcache GET, read-heavy | AWS Graviton4 c8g | June 2026, `c77cfba` (0.1.3) |
+
+The echo run is the current one and the one to measure against; it also covers
+the io_uring-vs-mio backend comparison, which the segcache run does not. The
+segcache run is kept because it measures a realistic cache server rather than a
+byte pipe, and nothing has re-run it on the current release.
+
+---
+
+## TCP echo comparison (two-machine, X710 40G)
+
+Four server configurations over the same closed-loop TCP echo workload:
+
+- **ringline io_uring** — the default production path.
+- **ringline io_uring + `--recv-forward`** — recv buffers forwarded straight to
+  the send path without passing through the accumulator. A byte-pipe mode, not
+  a general tuning knob (see the caveat below).
+- **ringline mio** — the epoll fallback backend, same binary, `force-mio`.
+- **tokio** — reference, same `bench-server` binary, bulk-echo loop.
+
+### Test rig
+
+| Item | Value |
+|:-----|:------|
+| Server | bare metal, 24 vCPU Xeon |
+| Client | bare metal, 56 vCPU Xeon |
+| Network | 4x Intel X710 in a 40G LAG, direct-attached, no switch hop |
+| Guests | one ephemeral VM per host with all four PFs passed through |
+| Server workers | 12 |
+| Load | closed loop, `conns` connections, depth 1, 20 s steady window after warmup |
+| Reps | 3 per cell; tables report the median |
+
+### Validity gates
+
+Every one of the 192 arms was gated before it entered these tables:
+
+- **Little's law** — `connections = throughput x mean latency` within 15%. A
+  closed-loop arm that violates it is not measuring what it claims to.
+- **Load floor** — at least 1.2 server cores busy, so an arm is not reporting
+  client-side idle.
+- **Funnel** — the hottest core holds no more than 60% of total busy server CPU
+  when loaded, which catches the IRQ/flow-steering single-core funnel that has
+  masqueraded as a ringline regression before.
+
+CPU comes from rezolus `cpu_usage` (BPF-derived on-CPU nanoseconds, `user` +
+`system`), not from `/proc/stat` — see the caveat on iowait below.
+
+**189 of 192 arms passed.** The three failures are the same cell in all three
+reps (tokio, 2048 connections, 16 KiB, Little's law 18% out), so that one cell is
+excluded rather than reported.
+
+### Throughput — median ops/s, n=3
+
+| conns | uring | recv-fwd | tokio | mio |
+|------:|------:|---------:|------:|----:|
+| **256 B** ||||
+| 1 | 6,632 | **6,741** | 6,064 | 5,940 |
+| 64 | 285,133 | **291,397** | 173,721 | 265,479 |
+| 512 | **621,570** | 602,873 | 431,515 | 450,541 |
+| 2048 | **531,199** | 507,381 | 420,798 | 437,845 |
+| **1 KiB** ||||
+| 64 | **273,884** | 272,464 | 170,598 | 250,618 |
+| 512 | **592,973** | 572,676 | 418,075 | 431,819 |
+| 2048 | **513,275** | 488,172 | 418,494 | 408,636 |
+| **4 KiB** ||||
+| 64 | **198,679** | 195,186 | 127,555 | 183,599 |
+| 512 | **322,848** | 314,260 | 238,755 | 260,061 |
+| 2048 | **300,284** | 289,419 | 234,501 | 232,425 |
+| **16 KiB** ||||
+| 64 | 118,395 | 145,213 | 89,028 | **152,303** |
+| 512 | 122,592 | **159,903** | 107,377 | 130,407 |
+| 2048 | 109,015 | **151,735** | — | 125,759 |
+
+At 64 connections and above, ringline io_uring leads at 256 B through 4 KiB by
+**23–64%** over tokio and by **7–38%** over its own mio backend. At a single
+connection the four are within 9% of each other — nothing is saturated. At
+**16 KiB io_uring loses to both** mio and recv-forward; that is a known defect,
+not a property of the design (see *The 16 KiB regression* below).
+
+### Latency — median of 3, ms
+
+| conns | | uring p50 | tokio p50 | uring p99 | tokio p99 |
+|------:|---|---:|---:|---:|---:|
+| **256 B** ||||||
+| 1 | | **0.146** | 0.166 | **0.214** | 0.217 |
+| 64 | | **0.212** | 0.365 | **0.415** | 0.627 |
+| 512 | | **0.814** | 1.132 | **1.221** | 2.538 |
+| 2048 | | 3.932 | **3.911** | **6.155** | 12.356 |
+| **4 KiB** ||||||
+| 64 | | **0.309** | 0.494 | **0.615** | 0.877 |
+| 512 | | **1.576** | 2.015 | **2.217** | 4.897 |
+| 2048 | | **7.157** | 7.395 | **9.861** | 20.633 |
+
+The tail is where the gap is widest: at 512 connections ringline's p99 is **half**
+tokio's (1.22 ms vs 2.54 ms at 256 B, 2.22 ms vs 4.90 ms at 4 KiB), and at 2048
+connections tokio's p99 is 2x ringline's at both sizes even where the medians are
+level.
+
+### CPU efficiency — 512 connections, ops per server core-second
+
+| size | uring | tokio | mio |
+|-----:|------:|------:|----:|
+| 256 B | **47,261** | 37,320 | 38,477 |
+| 1 KiB | **45,178** | 36,896 | 37,848 |
+| 4 KiB | **23,566** | 19,579 | 20,493 |
+
+The throughput lead is not bought with CPU: ringline is **20–27% more efficient
+per core** than tokio while serving **35–44% more operations** at the same
+connection count.
+
+### Syscall amortization
+
+At 512 connections the io_uring server issues **0.08 `io_uring_enter` per
+operation** — about 12 operations submitted and completed per syscall. The mio
+backend's epoll path issues none by construction (it uses `epoll_wait` +
+`read`/`write`), and the comparison is one of syscall *shape*, not count.
+
+### The 16 KiB regression (issue #397)
+
+At 16 KiB the best alternative configuration — mio at 64 connections,
+`--recv-forward` at 512 and 2048 — delivers **29–39% more throughput** than the
+default io_uring path. Root cause: `run_direct_echo` submits one `Send` per
+recv completion, and a 16 KiB message spans more than one completion, so the
+reply leaves as roughly two 8 KiB segments instead of one 15 KiB one. Packets per
+operation is flat at 1.00 for 256 B, 1 KiB and 4 KiB and jumps to **1.97 at
+16 KiB** — exactly the size at which a message stops fitting one completion.
+
+Tracked as **#397**. Until it is fixed, `--recv-forward` (or the mio backend) is
+the faster choice for large-message byte-pipe workloads.
+
+### `--recv-forward` is a mode, not a tuning knob
+
+It wins at 16 KiB and is roughly neutral below it, which makes it look like a
+candidate for the default. It is not. While recv-forward is enabled,
+**`with_data` / `with_bytes` never observe the data** — buffers are held for
+forwarding and never reach the accumulator. It turns the connection into a byte
+pipe, so every handler that parses its input would break. Use it for echo and
+proxy workloads; the path to a competitive default at 16 KiB is #397.
+
+### Caveats specific to this run
+
+- **The 2048-connection column is directional, not quotable.** Little's law
+  errors climb to 6–8% even in the arms that pass, and it is the only column
+  with a gated-out cell.
+- **Echo is a byte pipe.** It measures the runtime's I/O path with no parsing,
+  allocation, or application work. The segcache tables below are the closer
+  proxy for a real server.
+- **Do not measure server CPU from `/proc/stat`.** A worker blocked in
+  io_uring's `submit_and_wait` is accounted as **iowait**, not idle. A
+  `/proc/stat` sampler that counts iowait as busy reads an idle io_uring server
+  at 806% CPU against tokio's 33%, and the error biases against io_uring
+  specifically, since epoll runtimes have no equivalent accounting quirk. These
+  figures come from rezolus `cpu_usage`, which has only `user`/`system` states.
+- **Depends on a client-side fairness fix.** Before #392 the tokio echo server
+  read with `read_exact`, costing one syscall per message while ringline read in
+  bulk. Numbers taken before that fix are not comparable to these.
+
+### Reproducing
+
+Build both servers on the rack's build host, then run one arm per
+configuration through SystemsLab anvil-vm jobs on two hosts with the X710 PFs
+passed through (`ports = 4`, bonded, fixed `172.31.0.1/.2`). The campaign spec
+is `experiments/campaign-phase1.toml`, the gate script is
+`experiments/phase0-gate.py`, and the server records rezolus metrics to a `.rez`
+per arm.
+
+Server: `bench-server --runtime <ringline|tokio> --protocol echo --workers 12
+[--recv-forward]`, built with `--features force-mio` for the mio arm.
+Client: `bench-client --clients <conns> --msg-size <bytes> --depth 1`.
 
 ---
 
 ## Segcache cache-server comparison (two-machine, AWS Graviton4)
+
+**Run:** June 2026, ringline 0.1.3 (commit `c77cfba`). Not re-run on the current
+release — treat it as the realistic-workload reference, and the echo tables
+above as the current baseline.
 
 This compares the **ringline server** against a **tokio server**, both serving the
 same read-heavy cache workload: a real Segcache (segment-structured TTL cache)
@@ -144,7 +317,7 @@ is excluded pending investigation; ringline served ~109 k ops/s at 16 KiB.)
 
 ---
 
-## Caveats
+## Caveats (segcache run)
 
 - **Single rig, aarch64 Graviton4.** Absolute numbers are specific to this
   instance pair; ratios should travel better than absolutes, but a different CPU
@@ -161,7 +334,7 @@ is excluded pending investigation; ringline served ~109 k ops/s at 16 KiB.)
   server are separate EC2 instances in a cluster placement group; there is no
   shared-host or shared-switch incast artifact.
 
-## Reproducing
+## Reproducing (segcache run)
 
 The distributed runs are SystemsLab experiments against an EC2 Graviton pair
 (`aws.server` / `aws.client` tags). The `--protocol segcache` support on
