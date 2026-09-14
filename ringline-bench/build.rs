@@ -1,0 +1,46 @@
+//! `has_io_uring` is emitted per crate, and a `check-cfg` entry only tells the
+//! lint the cfg is expected — it never sets it. Without this file every
+//! `#[cfg(has_io_uring)]` block in this crate is dead on every platform, and
+//! `bench-server --runtime ringline` silently measures the
+//! `with_data`/`forward_recv_buf` fallback instead of `run_direct_echo`.
+//!
+//! Must stay in step with `ringline/build.rs`; the two decide the same thing
+//! and disagreeing would put the bench on a different path than the runtime it
+//! is benchmarking.
+
+fn main() {
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let force_mio = std::env::var("CARGO_FEATURE_FORCE_MIO").is_ok();
+
+    if target_os == "linux" && !force_mio && kernel_version_sufficient() {
+        println!("cargo:rustc-cfg=has_io_uring");
+    }
+}
+
+/// Check that the running kernel is 6.1+. `Ring::setup` unconditionally sets
+/// `IORING_SETUP_DEFER_TASKRUN` (non-SQPOLL) and the send path uses
+/// `IORING_OP_SENDMSG_ZC`; both landed in 6.1. Multishot recv, provided
+/// buffers, and `SINGLE_ISSUER` are 6.0.
+///
+/// When cross-compiling, `/proc/sys/kernel/osrelease` reflects the *host* kernel
+/// which may differ from the target. In that case we optimistically emit the cfg
+/// and let the runtime fail fast if the target kernel is too old.
+fn kernel_version_sufficient() -> bool {
+    let Ok(release) = std::fs::read_to_string("/proc/sys/kernel/osrelease") else {
+        // Not on Linux (cross-compile from macOS) or /proc not mounted.
+        // Optimistically enable — the io-uring crate itself will fail to
+        // compile if the target truly cannot support it.
+        return true;
+    };
+    let mut parts = release.trim().split('.');
+    let major: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let minor: u32 = parts
+        .next()
+        .and_then(|s| {
+            // Strip trailing non-digit suffix (e.g., "0-generic" → "0").
+            let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+            digits.parse().ok()
+        })
+        .unwrap_or(0);
+    (major, minor) >= (6, 1)
+}
