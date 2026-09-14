@@ -48,8 +48,18 @@ fn client_config(certs: &[CertificateDer<'static>]) -> QuicConfig {
 /// Drive both endpoints to a stable state by ferrying any pending packets
 /// across, draining timers, and emitting events. Loops until one full
 /// pass produces no movement, or until `cap` iterations have run.
-fn drain(client: &mut QuicEndpoint, server: &mut QuicEndpoint, ca: SocketAddr, sa: SocketAddr) {
+/// Returns whether any datagram crossed in either direction — the caller's
+/// progress signal. "Application bytes arrived" is *not* sufficient: the stream
+/// FIN can need several exchanges after the last data byte, and during those
+/// rounds no data grows while packets are very much still moving.
+fn drain(
+    client: &mut QuicEndpoint,
+    server: &mut QuicEndpoint,
+    ca: SocketAddr,
+    sa: SocketAddr,
+) -> bool {
     let now = Instant::now();
+    let mut moved_any = false;
     for _ in 0..64 {
         let mut moved = false;
         while let Some(pkt) = client.poll_send() {
@@ -66,10 +76,12 @@ fn drain(client: &mut QuicEndpoint, server: &mut QuicEndpoint, ca: SocketAddr, s
         }
         client.drive_timers(now);
         server.drive_timers(now);
+        moved_any |= moved;
         if !moved {
             break;
         }
     }
+    moved_any
 }
 
 /// Drive both endpoints until either `pred` reports done or we run out of
@@ -206,14 +218,34 @@ fn read_until_fin(
         }
         // Need more data — let the wire deliver it.
         rx_endpoint.flush(Instant::now());
-        drain(tx_endpoint, rx_endpoint, tx_addr, rx_addr);
-        if acc.len() > before {
-            // Still arriving: this round earned its keep, so restore the
-            // budget rather than counting down toward an arbitrary cap.
+        let packets_moved = drain(tx_endpoint, rx_endpoint, tx_addr, rx_addr);
+        // Progress is *either* application bytes arriving or datagrams still
+        // crossing. The FIN routinely needs rounds after the last data byte,
+        // and those rounds grow `acc` by nothing — counting only data growth
+        // gives up in exactly the state the FIN is waiting on, which is why
+        // the first attempt at this loop (#389) did not fix the flake.
+        if acc.len() > before || packets_moved {
             stall_budget = 64;
         } else {
             stall_budget -= 1;
         }
+    }
+    // A failure here is rare and load-dependent, so say which bound fired
+    // rather than leaving the next person to guess. Two previous fixes for
+    // this flake (#386, #389) were reasoned rather than measured and both
+    // missed: "both endpoints went quiet" and "packets kept moving but no FIN
+    // arrived" are different bugs with different fixes, and the assertion
+    // alone cannot tell them apart.
+    if !fin {
+        eprintln!(
+            "read_until_fin gave up: acc={} expected={} rounds={} stall_budget={} \
+             (stall_budget==0 => both endpoints went quiet; rounds at cap => \
+             packets kept moving without the FIN)",
+            acc.len(),
+            expected_len,
+            rounds,
+            stall_budget
+        );
     }
     (acc, fin)
 }
