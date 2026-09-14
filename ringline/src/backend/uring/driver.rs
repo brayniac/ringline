@@ -1637,6 +1637,37 @@ impl Driver {
             return;
         }
 
+        // DIAGNOSTIC ONLY - not for merge. Counts how often a flush actually
+        // has something to gather, to tell "the gather is ineffective" apart
+        // from "the gather never fires".
+        {
+            use std::sync::Once;
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static SINGLE: AtomicU64 = AtomicU64::new(0);
+            static GATHERED: AtomicU64 = AtomicU64::new(0);
+            static HELD_TOTAL: AtomicU64 = AtomicU64::new(0);
+            static START: Once = Once::new();
+            START.call_once(|| {
+                std::thread::spawn(|| {
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_secs(5));
+                        eprintln!(
+                            "DIRECT_ECHO_FLUSH single={} gathered={} buffers={}",
+                            SINGLE.load(Ordering::Relaxed),
+                            GATHERED.load(Ordering::Relaxed),
+                            HELD_TOTAL.load(Ordering::Relaxed),
+                        );
+                    }
+                });
+            });
+            HELD_TOTAL.fetch_add(n as u64, Ordering::Relaxed);
+            if n >= 2 {
+                GATHERED.fetch_add(1, Ordering::Relaxed);
+            } else {
+                SINGLE.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
         if n >= 2 {
             let mut iovecs = [libc::iovec {
                 iov_base: std::ptr::null_mut(),
