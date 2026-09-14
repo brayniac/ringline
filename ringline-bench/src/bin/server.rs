@@ -280,12 +280,28 @@ fn run_tokio(addr: SocketAddr, workers: usize, msg_size: usize) {
 
             tokio::spawn(async move {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                let mut buf = vec![0u8; msg_size];
+                // Bulk byte echo, matching what the ringline side does: take
+                // whatever arrived and echo exactly that many bytes. Neither
+                // server frames.
+                //
+                // This used to be `read_exact(&mut buf[..msg_size])`, which
+                // forces **one read syscall per message** however much data is
+                // already available, while ringline's `with_data` hands the
+                // handler everything that arrived. That is not a tuning
+                // difference, it is a pathology, and it manufactured a ~9.6x
+                // ringline "win" in a previous campaign before it was caught.
+                //
+                // The read buffer deliberately matches ringline's per-buffer
+                // recv size (`recv_buffer(256, ...)` below), so neither side
+                // gets a structurally larger read quantum.
+                let read_buf = msg_size.next_power_of_two().max(4096);
+                let mut buf = vec![0u8; read_buf];
                 loop {
-                    if stream.read_exact(&mut buf).await.is_err() {
-                        break;
-                    }
-                    if stream.write_all(&buf).await.is_err() {
+                    let n = match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    if stream.write_all(&buf[..n]).await.is_err() {
                         break;
                     }
                 }

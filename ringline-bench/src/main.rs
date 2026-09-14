@@ -73,6 +73,7 @@ fn run_server_bench(
         addr,
         num_clients,
         msg_size,
+        1, // depth: the multi-protocol runner is send-one-wait-one
         warmup,
         duration,
         ringline_client,

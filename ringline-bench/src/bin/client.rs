@@ -56,6 +56,15 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     threads: usize,
 
+    /// Closed-loop pipeline depth: requests sent per batch on each connection,
+    /// with each response's latency recorded against the batch's send time.
+    /// 1 (the default) is send-one-wait-one. Higher values amortize the send
+    /// and recv syscalls across `depth` requests, which is what makes the
+    /// syscall-per-op claim measurable in closed loop — `--max-inflight`
+    /// only applies to `--open`.
+    #[arg(long, default_value_t = 1)]
+    depth: usize,
+
     /// Open-loop mode: offer requests at a fixed rate instead of one in-flight
     /// per connection (closed loop). Requires --rate.
     #[arg(long)]
@@ -149,6 +158,7 @@ fn main() {
         &args.addr,
         args.clients,
         args.msg_size,
+        args.depth,
         Duration::from_secs(args.warmup),
         Duration::from_secs(args.duration),
         args.runtime == Runtime::Ringline,

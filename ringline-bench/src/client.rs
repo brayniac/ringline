@@ -23,14 +23,16 @@ pub struct OpenLoop {
 async fn run_tokio_client(
     addr: String,
     msg_size: usize,
+    depth: usize,
     stop: Arc<AtomicBool>,
     ops_counter: Arc<AtomicU64>,
 ) -> LatencyHistogram {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
-    let msg = vec![0xABu8; msg_size];
-    let mut recv_buf = vec![0u8; msg_size];
+    let depth = depth.max(1);
+    let batch = vec![0xABu8; msg_size * depth];
+    let mut recv_buf = vec![0u8; msg_size * depth];
     let mut histogram = LatencyHistogram::new();
 
     let mut stream = match TcpStream::connect(&addr).await {
@@ -47,25 +49,32 @@ async fn run_tokio_client(
     while !stop.load(Ordering::Relaxed) {
         let t0 = Instant::now();
 
-        if stream.write_all(&msg).await.is_err() {
+        if stream.write_all(&batch).await.is_err() {
             break;
         }
 
+        // Responses arrive in order, so response `i` is complete once
+        // `(i+1) * msg_size` bytes have been read. Each is recorded against the
+        // single send time, because all `depth` requests were in flight from
+        // that moment.
         let mut total_read = 0;
-        while total_read < msg_size {
+        let mut recorded = 0usize;
+        while total_read < batch.len() {
             match stream.read(&mut recv_buf[total_read..]).await {
                 Ok(0) => return histogram,
                 Ok(n) => total_read += n,
                 Err(_) => return histogram,
             }
+            while recorded < depth && (recorded + 1) * msg_size <= total_read {
+                histogram.record(t0.elapsed().as_nanos() as u64);
+                recorded += 1;
+            }
         }
 
-        let elapsed_ns = t0.elapsed().as_nanos() as u64;
-        histogram.record(elapsed_ns);
-
-        local_ops += 1;
-        if local_ops & 0xFF == 0 {
-            ops_counter.fetch_add(256, Ordering::Relaxed);
+        local_ops += depth as u64;
+        if local_ops >= 256 {
+            ops_counter.fetch_add(local_ops & !0xFF, Ordering::Relaxed);
+            local_ops &= 0xFF;
         }
     }
 
@@ -266,6 +275,9 @@ mod ringline_client {
         pub msg_size: usize,
         /// Total client connections (used to split the aggregate open-loop rate).
         pub num_clients: usize,
+        /// Closed-loop pipeline depth: requests sent per batch, each recorded
+        /// against the batch's send time. 1 is send-one-wait-one.
+        pub depth: usize,
         /// Number of ringline worker threads. Used by each worker's `on_start`
         /// to compute its chunk-based slice of connections.
         pub num_workers: usize,
@@ -360,7 +372,6 @@ mod ringline_client {
     static GLOBAL_STATE: Mutex<Option<Arc<ClientState>>> = Mutex::new(None);
 
     async fn run_ringline_client(state: Arc<ClientState>) {
-        let msg = vec![0xABu8; state.msg_size];
         let msg_size = state.msg_size;
 
         let connect_future = match connect(state.target) {
@@ -382,16 +393,29 @@ mod ringline_client {
         let mut local_ops: u64 = 0;
         let mut samples: Vec<u64> = Vec::with_capacity(1_000_000);
 
+        // Pipeline depth: `depth` requests go out in one send, then their
+        // responses are matched in order. At depth 1 this is byte-identical to
+        // the previous send-one-wait-one loop. Above 1 it is what makes the
+        // syscall-amortization claim measurable in closed loop — `--open`'s
+        // `max_inflight` only covers the rate-controlled mode.
+        let depth = state.depth.max(1);
+        let batch = vec![0xABu8; msg_size * depth];
+
         while !state.stop.load(Ordering::Relaxed) {
             let t0 = Instant::now();
 
-            if conn.send_nowait(&msg).is_err() {
+            if conn.send_nowait(&batch).is_err() {
                 break;
             }
 
-            // Read exactly msg_size bytes.
-            let mut remaining = msg_size;
-            while remaining > 0 {
+            // Responses come back in order, so response `i` is complete once
+            // `(i+1) * msg_size` bytes have arrived. Each is recorded against
+            // the single send time — all `depth` requests genuinely were in
+            // flight from that moment.
+            let mut got = 0usize;
+            let mut recorded = 0usize;
+            while got < batch.len() {
+                let remaining = batch.len() - got;
                 let consumed = conn
                     .with_data(|data| {
                         let take = data.len().min(remaining);
@@ -404,22 +428,27 @@ mod ringline_client {
                         .lock()
                         .unwrap()
                         .push(std::mem::take(&mut samples));
-                    state.ops.fetch_add(local_ops & 0xFF, Ordering::Relaxed);
+                    state.ops.fetch_add(local_ops, Ordering::Relaxed);
                     return;
                 }
-                remaining -= consumed;
+                got += consumed;
+                while recorded < depth && (recorded + 1) * msg_size <= got {
+                    samples.push(t0.elapsed().as_nanos() as u64);
+                    recorded += 1;
+                }
             }
 
-            let elapsed_ns = t0.elapsed().as_nanos() as u64;
-            samples.push(elapsed_ns);
-
-            local_ops += 1;
-            if local_ops & 0xFF == 0 {
-                state.ops.fetch_add(256, Ordering::Relaxed);
+            // Every response was recorded above as it completed; `depth`
+            // operations finished in this pass, not one.
+            debug_assert_eq!(recorded, depth);
+            local_ops += depth as u64;
+            if local_ops >= 256 {
+                state.ops.fetch_add(local_ops & !0xFF, Ordering::Relaxed);
+                local_ops &= 0xFF;
             }
         }
 
-        state.ops.fetch_add(local_ops & 0xFF, Ordering::Relaxed);
+        state.ops.fetch_add(local_ops, Ordering::Relaxed);
         state
             .histograms
             .lock()
@@ -562,20 +591,48 @@ mod ringline_client {
     impl RinglineClientRuntime {
         pub fn start(state: Arc<ClientState>, workers: usize) -> Result<Self, ringline::Error> {
             let msg_size = state.msg_size;
+            // Read before `state` is moved into GLOBAL_STATE below.
+            let clients = state.num_clients;
+            let inflight = state.open.as_ref().map_or(1, |o| o.max_inflight.max(1));
 
             *GLOBAL_STATE.lock().unwrap() = Some(state);
+
+            // Both of these used to be fixed (`max_connections(4096)` and
+            // `send_pool(32768, ..)`), which silently made the *client* the
+            // thing under test at high connection counts: 32768 slots across
+            // 4096 connections is 8 per connection, and the client collapsed
+            // from ~187k to ~33k ops/s there. An arm that measures the load
+            // generator is worse than no arm, so both now scale with the load
+            // actually requested.
+            let max_conns = (clients as u32).next_power_of_two().max(4096);
+
+            // One slot per in-flight message per connection, doubled for
+            // headroom, floored at the old value so small runs are unchanged.
+            let want_slots = clients
+                .saturating_mul(inflight)
+                .saturating_mul(2)
+                .max(32768);
+            // `send_copy_count` is a u16, so the pool cannot exceed 65535 slots
+            // however much we ask for. Say so rather than silently clamping:
+            // a clamped pool is exactly the condition that produced the
+            // collapse above, and it must not look like a server result.
+            let slots = want_slots.min(u16::MAX as usize);
+            if slots < want_slots {
+                eprintln!(
+                    "bench-client: WARNING send-copy pool clamped to {slots} slots \
+                     (wanted {want_slots} for {clients} conns x {inflight} in-flight). \
+                     Only {:.1} slots/conn — the client may bound this measurement.",
+                    slots as f64 / clients as f64
+                );
+            }
 
             let config = ConfigBuilder::new()
                 .workers(workers)
                 .pin_to_core(false)
                 .sq_entries(4096)
                 .recv_buffer(4096, msg_size.next_power_of_two().max(4096) as u32)
-                .max_connections(4096)
-                // The send-copy pool is the open-loop in-flight ceiling: it must
-                // comfortably exceed max_inflight * (conns per worker), or sends fail
-                // below capacity. Keep a generous slot count; don't reserve 4 KiB per
-                // slot for tiny messages.
-                .send_pool(32768, msg_size.next_power_of_two().max(256) as u32)
+                .max_connections(max_conns)
+                .send_pool(slots as u16, msg_size.next_power_of_two().max(256) as u32)
                 .build()
                 .expect("valid config");
 
@@ -616,6 +673,7 @@ pub fn run_bench(
     addr: &str,
     num_clients: usize,
     msg_size: usize,
+    depth: usize,
     warmup: Duration,
     duration: Duration,
     ringline_client: bool,
@@ -633,6 +691,7 @@ pub fn run_bench(
             addr,
             num_clients,
             msg_size,
+            depth,
             warmup,
             duration,
             stop,
@@ -646,6 +705,7 @@ pub fn run_bench(
             addr,
             num_clients,
             msg_size,
+            depth,
             warmup,
             duration,
             stop,
@@ -661,6 +721,7 @@ fn run_bench_tokio(
     addr: &str,
     num_clients: usize,
     msg_size: usize,
+    depth: usize,
     warmup: Duration,
     duration: Duration,
     stop: Arc<AtomicBool>,
@@ -701,7 +762,7 @@ fn run_bench_tokio(
                 lag.clone(),
             )));
         } else {
-            task_handles.push(client_rt.spawn(run_tokio_client(addr, msg_size, stop, ops)));
+            task_handles.push(client_rt.spawn(run_tokio_client(addr, msg_size, depth, stop, ops)));
         }
     }
 
@@ -780,6 +841,7 @@ fn run_bench_ringline(
     addr: &str,
     num_clients: usize,
     msg_size: usize,
+    depth: usize,
     warmup: Duration,
     duration: Duration,
     stop: Arc<AtomicBool>,
@@ -797,6 +859,7 @@ fn run_bench_ringline(
         target: addr.parse().expect("invalid addr for ringline client"),
         msg_size,
         num_clients,
+        depth,
         num_workers: workers.max(1),
         conn_chunk_size,
         stop: stop.clone(),
