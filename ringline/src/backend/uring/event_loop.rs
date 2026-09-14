@@ -766,7 +766,18 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         while i < self.driver.direct_echo_pending.len() {
             let conn_index = self.driver.direct_echo_pending[i];
             self.driver.flush_direct_echo(conn_index);
-            if self.driver.recv_hold[conn_index as usize].is_empty() {
+            // Drop the entry once the hold drains, and also if the slot is no
+            // longer a direct-echo connection: `recv_hold` is shared with
+            // recv-forward, whose hold is the task's to drain, and a stale
+            // entry left over from a closed connection must not start
+            // gathering for whatever occupies the slot next.
+            if !self
+                .driver
+                .connections
+                .get(conn_index)
+                .is_some_and(|c| c.direct_echo)
+                || self.driver.recv_hold[conn_index as usize].is_empty()
+            {
                 self.driver.direct_echo_queued[conn_index as usize] = false;
                 self.driver.direct_echo_pending.swap_remove(i);
             } else {
@@ -8850,6 +8861,34 @@ mod tests {
         el.flush_direct_echoes();
         assert!(el.driver.direct_echo_pending.is_empty());
         assert!(!el.driver.direct_echo_queued[conn_index as usize]);
+    }
+
+    #[test]
+    fn direct_echo_flush_leaves_a_recv_forward_hold_alone() {
+        // `recv_hold` is shared with recv-forward, where the owning task
+        // drains it. A queue entry that outlived its direct-echo connection
+        // must not start gathering for whatever takes the slot next.
+        let mut el = make_test_loop();
+        let conn_index = stage_direct_echo(&mut el, &[0, 1], 4096);
+
+        // The slot is now a recv-forward connection instead.
+        if let Some(cs) = el.driver.connections.get_mut(conn_index) {
+            cs.direct_echo = false;
+        }
+        el.driver.recv_forward[conn_index as usize] = true;
+
+        el.flush_direct_echoes();
+
+        assert_eq!(
+            el.driver.recv_hold[conn_index as usize].len(),
+            2,
+            "the hold belongs to forward_held now"
+        );
+        assert!(!el.driver.send_slab.in_use(0));
+        assert!(
+            el.driver.direct_echo_pending.is_empty(),
+            "the stale entry must still be dropped"
+        );
     }
 
     #[test]
