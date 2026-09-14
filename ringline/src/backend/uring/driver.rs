@@ -1651,12 +1651,14 @@ impl Driver {
                 std::thread::spawn(|| {
                     loop {
                         std::thread::sleep(std::time::Duration::from_secs(5));
-                        eprintln!(
+                        println!(
                             "DIRECT_ECHO_FLUSH single={} gathered={} buffers={}",
                             SINGLE.load(Ordering::Relaxed),
                             GATHERED.load(Ordering::Relaxed),
                             HELD_TOTAL.load(Ordering::Relaxed),
                         );
+                        use std::io::Write;
+                        let _ = std::io::stdout().flush();
                     }
                 });
             });
