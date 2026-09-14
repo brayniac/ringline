@@ -780,6 +780,44 @@ pub struct ConnCtx {
     pub(crate) _not_send: PhantomData<*const ()>,
 }
 
+// DIAGNOSTIC ONLY - not for merge. Measures how much each forward actually
+// sends, to tell "one send per message" apart from "one send per arriving
+// chunk" on the path bench-server really runs.
+#[cfg(has_io_uring)]
+pub(crate) mod fwddiag {
+    use std::sync::Once;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    pub static ZC_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static ZC_BYTES: AtomicU64 = AtomicU64::new(0);
+    pub static COPY_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static COPY_BYTES: AtomicU64 = AtomicU64::new(0);
+    pub static HELD_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static HELD_BYTES: AtomicU64 = AtomicU64::new(0);
+    pub static HELD_BUFS: AtomicU64 = AtomicU64::new(0);
+    static START: Once = Once::new();
+    pub fn start() {
+        START.call_once(|| {
+            std::thread::spawn(|| {
+                use std::io::Write;
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    println!(
+                        "FWD zc_calls={} zc_bytes={} copy_calls={} copy_bytes={} held_calls={} held_bytes={} held_bufs={}",
+                        ZC_CALLS.load(Ordering::Relaxed),
+                        ZC_BYTES.load(Ordering::Relaxed),
+                        COPY_CALLS.load(Ordering::Relaxed),
+                        COPY_BYTES.load(Ordering::Relaxed),
+                        HELD_CALLS.load(Ordering::Relaxed),
+                        HELD_BYTES.load(Ordering::Relaxed),
+                        HELD_BUFS.load(Ordering::Relaxed),
+                    );
+                    let _ = std::io::stdout().flush();
+                }
+            });
+        });
+    }
+}
+
 impl ConnCtx {
     /// Create a new ConnCtx for the given connection.
     pub(crate) fn new(conn_index: u32, generation: u32) -> Self {
@@ -1256,6 +1294,10 @@ impl ConnCtx {
                         // the connection's queue and keeps its bid exactly as
                         // a queued entry does; `handle_send_recv_buf`
                         // replenishes it on completion.
+                        fwddiag::start();
+                        fwddiag::ZC_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        fwddiag::ZC_BYTES
+                            .fetch_add(pending.len as u64, std::sync::atomic::Ordering::Relaxed);
                         driver.submit_or_queue_send(conn_index, built);
                         return Ok(());
                     }
@@ -1266,6 +1308,13 @@ impl ConnCtx {
             }
 
             // No pending recv buffer (or mio backend) — fall back to copy send.
+            #[cfg(has_io_uring)]
+            {
+                fwddiag::start();
+                fwddiag::COPY_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                fwddiag::COPY_BYTES
+                    .fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            }
             let mut ctx = driver.make_ctx();
             ctx.send(self.token(), data)
         })
@@ -1369,6 +1418,10 @@ impl ConnCtx {
                 total += p.len;
             }
 
+            fwddiag::start();
+            fwddiag::HELD_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            fwddiag::HELD_BYTES.fetch_add(total as u64, std::sync::atomic::Ordering::Relaxed);
+            fwddiag::HELD_BUFS.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
             let generation = driver.connections.generation(conn_index);
             let (slab_idx, msg_ptr) = driver
                 .send_slab
