@@ -168,15 +168,19 @@ lead is not bought with CPU.
 At **16 KiB the default io_uring path loses to its own mio fallback** (118k vs
 152k at 64 connections) and to `--recv-forward` by 25-41%. Root-caused and
 filed as #397: `run_direct_echo` submits one `Send` per recv completion, and a
-16 KiB message spans several completions, so the reply leaves as ~2 segments of
-8 KiB instead of ~1 of 15 KiB. Packets per operation is flat at 1.00 for 256 B,
-1 KiB and 4 KiB and jumps to 1.97 at 16 KiB — exactly the size where a message
-stops fitting one completion.
+16 KiB message spans several completions, so the reply leaves in more segments
+than the message needs. Transmit packets per operation at 512 connections are
+identical across all three configurations at 256 B (1.99), 1 KiB (1.99) and
+4 KiB (3.97) and separate only at 16 KiB: 6.29 for io_uring against 4.65 for
+recv-forward and 4.26 for mio — 35% more packets for the same work, at exactly
+the size where a message stops fitting one completion.
 
 ### Syscall amortization confirmed
 
-0.08 `io_uring_enter` per operation at 512 connections — about 12 operations per
-syscall. mio's epoll path shows none, by construction.
+0.032 `event` syscalls per operation at 512 connections and 256 B — about 31
+operations submitted and reaped per `io_uring_enter` — against tokio's 1.04
+reads plus 1.04 writes and mio's 1.99 reads plus 1.00 writes. mio's second read
+is edge-triggered epoll reading until `EAGAIN`.
 
 ### recv-forward cannot be the default, and this is not a tuning question
 
@@ -193,7 +197,7 @@ default at 16 KiB is #397, not flipping this flag.
 
 ## Lessons / open questions
 
-**Three instrumentation errors, each of which produced a plausible wrong
+**Four instrumentation errors, each of which produced a plausible wrong
 number.** Recorded because the pattern matters more than any of them.
 
 1. A hand-rolled `/proc/stat` sampler counted **iowait as busy**. A worker
@@ -215,10 +219,23 @@ number.** Recorded because the pattern matters more than any of them.
    -count rejected every lightly loaded arm and did so for the correctly-idle
    runtimes while passing the anomalous one.
 
+4. The packets-per-operation and syscalls-per-operation figures in the first
+   version of this entry were **wrong in absolute terms** — published as "1.00
+   flat below 4 KiB, 1.97 at 16 KiB" and "0.08 `io_uring_enter` per op", against
+   real values of 1.99/3.97/6.29 and 0.032. They were derived ad hoc during the
+   analysis rather than by the procedure used for every other number here, and
+   nobody re-derived them before they were written down. The *comparison* they
+   supported survived re-derivation intact — identical across configurations up
+   to 4 KiB, io_uring 35% worse at 16 KiB — which is exactly why the error was
+   invisible: the conclusion was right, so the numbers looked right. Corrected
+   against the recordings, with one script over every arm.
+
 The common thread: each produced a number that was wrong in a way that flattered
 or damned the thing under test, and each would have survived review by anyone
 reading only the conclusion. The habit worth keeping is not "use rezolus" but
-**ask what floor the work imposes and check the measurement can clear it**.
+**ask what floor the work imposes and check the measurement can clear it** —
+and, from the fourth, that a figure quoted in a conclusion has to come from the
+same re-runnable procedure as the rest, not from a one-off query nobody repeats.
 
 **A negative result is only evidence once the setup could have produced a
 positive.** A probe built to show recording dilution produced "both recordings
