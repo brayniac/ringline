@@ -23,30 +23,39 @@ import json
 import pathlib
 import sys
 
-# A core at or above this is doing real work. The funnel is not "one core is
-# hot" — a thread-per-core runtime is *supposed* to saturate exactly as many
-# cores as it has workers and leave the rest idle. The funnel is work
-# collapsing onto FEWER cores than the runtime was configured to use.
-BUSY_CORE_MIN = 50.0
-# Little's law tolerance. A good closed-loop arm lands within a couple of
-# percent — the first real rig arm closed to 0.2% — so 15% leaves room for
-# warmup edges and sampling without admitting a broken arm.
+# The funnel is work *concentrated* on one core, so it is a ratio, not a level.
+# One core carrying this share of all busy CPU is the fingerprint.
+FUNNEL_SHARE = 0.6
+# Below this much total busy CPU the arm is simply lightly loaded and the
+# concentration question is meaningless — at one connection nothing should be
+# saturated, and demanding otherwise rejects the correctly-idle runtimes.
+MIN_LOAD_PERCENT = 120.0
+# Little's law tolerance. A good closed-loop arm lands within a fraction of a
+# percent — the real rig arms closed to 0.1-0.3% — so 15% leaves room for
+# warmup edges without admitting a broken arm.
 LITTLE_TOLERANCE = 0.15
 
 
 def check_percore(path, workers):
-    """percore.txt: one `cpu<N> <busy_percent>` per line, sampled over the run.
+    """percore.txt: `cpu<N> <busy_percent>` per line, iowait excluded.
 
     Rejects the single-core funnel that invalidated a previous bare-metal
     campaign here: IRQ and wakeup locality pulled all work onto one core and
     capped every arm at the same number regardless of what was under test.
 
-    The first version of this check compared the hottest core against the
-    median and would have rejected every healthy arm in the campaign. On the
-    real rig an 8-worker server on a 24-core guest runs 8 cores at 100% and 16
-    at ~0%, so hottest=100 and median=0 — indistinguishable, by that rule, from
-    one core doing everything. Counting busy cores against the configured
-    worker count is the distinction that actually matters.
+    Two earlier versions of this check were wrong, both found by running it
+    against real arms rather than fixtures:
+
+    1. hottest-vs-median rejected every healthy arm — a thread-per-core runtime
+       *should* saturate exactly its worker count and leave the rest idle.
+    2. counting busy cores against the worker count rejected every *lightly
+       loaded* arm, where nothing should be saturated at all, and did so for
+       tokio and mio while passing ringline — backwards, because the ringline
+       numbers were inflated by the iowait accounting described in the spec.
+
+    What survives both: the funnel is concentration, so compare the hottest
+    core's share of total busy CPU, and only when there is enough load for the
+    question to mean anything.
     """
     if not path.exists():
         return ["no per-core sample: cannot rule out the single-core funnel"]
@@ -60,20 +69,17 @@ def check_percore(path, workers):
                 pass
     if not busy:
         return ["per-core sample present but unparseable"]
-    busy_cores = sum(1 for b in busy if b >= BUSY_CORE_MIN)
-    if workers > 1 and busy_cores <= 1:
+    total = sum(busy)
+    hottest = max(busy)
+    if total < MIN_LOAD_PERCENT:
+        return []  # too little load for concentration to be meaningful
+    share = hottest / total
+    if share >= FUNNEL_SHARE:
         return [
-            f"single-core funnel: {busy_cores} core(s) above {BUSY_CORE_MIN:.0f}% "
-            f"busy for a {workers}-worker server across {len(busy)} cores — this "
-            f"is the artifact that invalidated a previous campaign, not a result"
-        ]
-    # Short of the full collapse, work spread over less than half the workers
-    # still means the arm is not measuring what it claims to.
-    if workers > 1 and busy_cores * 2 < workers:
-        return [
-            f"work collapsed onto {busy_cores} of {workers} configured workers "
-            f"({len(busy)} cores sampled): the arm is bounded by placement, not "
-            f"by the runtime under test"
+            f"single-core funnel: the hottest core carries {share * 100:.0f}% of "
+            f"{total:.0f}% total busy CPU across {len(busy)} cores "
+            f"({workers} workers configured) — this is the artifact that "
+            f"invalidated a previous campaign, not a result"
         ]
     return []
 
