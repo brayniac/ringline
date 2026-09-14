@@ -217,6 +217,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.executor.collect_wakeups();
             // Commit buffer returns from the poll pass and revive
             // ENOBUFS-parked receivers before we block.
+            self.flush_direct_echoes();
             self.flush_replenish_and_rearm();
             // Declining to block still has to reap: under DEFER_TASKRUN the
             // kernel runs task_work only on a GETEVENTS enter, and
@@ -740,9 +741,38 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
         }
 
+        // Gather the batch's direct-echo arrivals before anything is submitted,
+        // so a message that spanned several recv CQEs leaves as one send.
+        self.flush_direct_echoes();
+
         // Eagerly return consumed recv buffers to the kernel ring in the same
         // iteration they were consumed, keeping the ring fuller under burst.
         self.flush_replenish_and_rearm();
+    }
+
+    /// Flush every direct-echo connection holding staged buffers.
+    ///
+    /// A connection stays on the queue while its hold is non-empty — because a
+    /// send is already in flight, because the gather hit `MAX_IOVECS`, or
+    /// because more arrived during the flush — and drops off once it drains
+    /// (including when `close_connection` drains it). That means no completion
+    /// handler has to remember to re-arm the connection: the next drain's pass
+    /// finds it still queued.
+    fn flush_direct_echoes(&mut self) {
+        if self.driver.direct_echo_pending.is_empty() {
+            return;
+        }
+        let mut i = 0;
+        while i < self.driver.direct_echo_pending.len() {
+            let conn_index = self.driver.direct_echo_pending[i];
+            self.driver.flush_direct_echo(conn_index);
+            if self.driver.recv_hold[conn_index as usize].is_empty() {
+                self.driver.direct_echo_queued[conn_index as usize] = false;
+                self.driver.direct_echo_pending.swap_remove(i);
+            } else {
+                i += 1;
+            }
+        }
     }
 
     /// Commit pending provided-buffer returns to the kernel ring and re-arm
@@ -1406,29 +1436,19 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 .is_some_and(|c| c.direct_echo);
 
             if is_direct_echo {
-                // Payload carries only the bid; remaining is in send_recv_buf_remaining.
-                let payload = bid as u32;
-                let ud = UserData::encode(OpTag::SendRecvBuf, conn_index, payload);
-                let entry = io_uring::opcode::Send::new(
-                    io_uring::types::Fixed(conn_index),
-                    buf_ptr,
-                    bytes_received,
-                )
-                .flags(crate::completion::STREAM_SEND_FLAGS)
-                .build()
-                .user_data(ud.raw());
-                let built = crate::handler::BuiltSend {
-                    entry,
-                    pool_slot: u16::MAX,
-                    slab_idx: u16::MAX,
-                    total_len: bytes_received,
-                };
-                self.driver.send_recv_buf_original_lens[conn_index as usize] = bytes_received;
-                self.driver.send_recv_buf_remaining[conn_index as usize] = bytes_received;
-                // Infallible: under SQ pressure the echo is parked at the queue
-                // head and retried, holding its provided buffer exactly as a
-                // queued echo does; the bid is replenished by its completion.
-                self.driver.submit_or_queue_send(conn_index, built);
+                // Stage the buffer rather than submitting a Send for it now.
+                // The flush pass at the end of this drain gathers everything
+                // that arrived in the batch into one operation, so a message
+                // spanning several recv completions echoes as one message
+                // instead of one segment per completion (#397).
+                self.driver.hold_direct_echo(
+                    conn_index,
+                    crate::backend::PendingRecvBuf {
+                        bid,
+                        len: bytes_received,
+                        ptr: buf_ptr,
+                    },
+                );
                 // Do NOT call wake_recv here. DirectEchoFuture only needs to
                 // be woken on connection close (handled by the result <= 0 path
                 // above), not on every incoming buffer.
@@ -8719,6 +8739,117 @@ mod tests {
         el.test_dispatch_cqe(ud.raw(), -libc::ENOBUFS, 0);
         assert!(el.driver.recv_starved.contains(&conn_index));
         conn_index
+    }
+
+    // ── Direct-echo gather (#397) ──────────────────────────────────
+
+    /// Arm a connection for direct echo and stage `bids` worth of held
+    /// buffers, as `handle_recv_multi` would for arrivals in one drain.
+    fn stage_direct_echo(el: &mut AsyncEventLoop<NoopHandler>, bids: &[u16], len: u32) -> u32 {
+        let conn_index = accept_connection(el);
+        if let Some(cs) = el.driver.connections.get_mut(conn_index) {
+            cs.direct_echo = true;
+        }
+        for &bid in bids {
+            let (ptr, _) = el.driver.provided_bufs.get_buffer(bid);
+            el.driver
+                .hold_direct_echo(conn_index, crate::backend::PendingRecvBuf { bid, len, ptr });
+        }
+        conn_index
+    }
+
+    #[test]
+    fn direct_echo_gathers_a_multi_buffer_message_into_one_send() {
+        // The #397 regression: two recv completions carrying one message used
+        // to produce two Sends, so the reply left as two segments.
+        let mut el = make_test_loop();
+        let conn_index = stage_direct_echo(&mut el, &[0, 1], 8192);
+
+        el.flush_direct_echoes();
+
+        assert!(
+            el.driver.recv_hold[conn_index as usize].is_empty(),
+            "both buffers should have been gathered"
+        );
+        assert!(
+            el.driver.send_slab.in_use(0),
+            "no coalesced entry allocated"
+        );
+        assert_eq!(
+            el.driver.send_slab.recv_forward_bids(0),
+            &[0, 1],
+            "both bids must be owned by the one send"
+        );
+        assert!(el.driver.send_queues[conn_index as usize].in_flight);
+        assert!(
+            !el.driver.direct_echo_queued[conn_index as usize],
+            "a drained connection should leave the flush queue"
+        );
+    }
+
+    #[test]
+    fn direct_echo_sends_a_lone_buffer_without_a_slab_entry() {
+        // The common case — a message that fits one completion — must not pay
+        // for an msghdr and a slab entry.
+        let mut el = make_test_loop();
+        let conn_index = stage_direct_echo(&mut el, &[0], 256);
+
+        el.flush_direct_echoes();
+
+        assert!(el.driver.recv_hold[conn_index as usize].is_empty());
+        assert!(
+            !el.driver.send_slab.in_use(0),
+            "single buffer should take the plain Send path"
+        );
+        assert_eq!(el.driver.send_recv_buf_remaining[conn_index as usize], 256);
+        assert_eq!(
+            el.driver.send_recv_buf_original_lens[conn_index as usize],
+            256
+        );
+    }
+
+    #[test]
+    fn direct_echo_holds_arrivals_behind_an_in_flight_send() {
+        // One send in flight per connection: the rest accumulate for the next
+        // gather rather than racing ahead of it.
+        let mut el = make_test_loop();
+        let conn_index = stage_direct_echo(&mut el, &[0, 1], 4096);
+        el.driver.send_queues[conn_index as usize].in_flight = true;
+
+        el.flush_direct_echoes();
+
+        assert_eq!(
+            el.driver.recv_hold[conn_index as usize].len(),
+            2,
+            "nothing may be submitted while a send is in flight"
+        );
+        assert!(
+            el.driver.direct_echo_queued[conn_index as usize],
+            "connection must stay queued so the next flush retries it"
+        );
+
+        // The send completes and the connection is picked back up without any
+        // handler having re-armed it.
+        el.driver.send_queues[conn_index as usize].in_flight = false;
+        el.flush_direct_echoes();
+        assert!(el.driver.recv_hold[conn_index as usize].is_empty());
+    }
+
+    #[test]
+    fn direct_echo_close_replenishes_staged_buffers() {
+        let mut el = make_test_loop();
+        let conn_index = stage_direct_echo(&mut el, &[0, 1], 1024);
+
+        el.driver.close_connection(conn_index);
+
+        assert!(el.driver.recv_hold[conn_index as usize].is_empty());
+        assert!(el.driver.pending_replenish.contains(&0));
+        assert!(el.driver.pending_replenish.contains(&1));
+
+        // And the stale queue entry is dropped by the next pass.
+        el.flush_direct_echoes();
+        assert!(el.driver.direct_echo_pending.is_empty());
+        assert!(!el.driver.direct_echo_queued[conn_index as usize]);
     }
 
     #[test]
