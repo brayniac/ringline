@@ -683,49 +683,16 @@ impl Driver {
         // All sends flushed. Switch back to read-only interest — unless the
         // receive side is already closed (peer FIN, read error, or a
         // requested close), in which case re-adding READABLE would just
-        // make mio re-report the EOF once more; leave WRITABLE interest in
-        // place instead (a later `register_writable` no-op reasserts it if
-        // needed, and drop/close will deregister the stream entirely).
-        let recv_closed = self
-            .connections
-            .get(conn_index)
-            .is_some_and(|c| c.recv_finished());
-        if !recv_closed && let Some(stream) = self.tcp_streams[idx].as_mut() {
-            let _ = self.poll.registry().reregister(
-                stream,
-                mio::Token(idx + 1),
-                mio::Interest::READABLE,
-            );
-        }
+        // No re-arm here any more. Interest is registered once, as
+        // READABLE|WRITABLE, and never modified: dropping WRITABLE after each
+        // drain and re-adding it on the next send cost two `epoll_ctl(MOD)`
+        // per operation, because an echo workload makes that queue transition
+        // on every single request (#395).
+        //
+        // It also removes the hazard this code used to work around: it was a
+        // `reregister` that re-reported EOF on a half-closed socket and span
+        // the loop at 100% CPU. Not re-registering cannot re-report anything.
         Ok((true, total_written))
-    }
-
-    /// Register writable interest for a connection (because we have
-    /// pending send data).
-    pub(crate) fn register_writable(&mut self, conn_index: u32) {
-        let idx = conn_index as usize;
-        // Once the receive side is finished (`recv_finished()`: peer FIN,
-        // read error, or a requested close) no more reads are wanted. Keeping
-        // READABLE interest on a half-closed socket makes every reregister
-        // re-report the EOF, and the loop spins at 100% CPU for as long as
-        // the queued sends take to drain. WRITABLE alone still delivers
-        // EOF/ERR on the write side (RST → `flush_sends` error →
-        // `fail_connection_on_send_error`), so the deferral still ends.
-        let recv_closed = self
-            .connections
-            .get(conn_index)
-            .is_some_and(|c| c.recv_finished());
-        let interest = if recv_closed {
-            mio::Interest::WRITABLE
-        } else {
-            mio::Interest::READABLE | mio::Interest::WRITABLE
-        };
-        if let Some(stream) = self.tcp_streams[idx].as_mut() {
-            let _ = self
-                .poll
-                .registry()
-                .reregister(stream, mio::Token(idx + 1), interest);
-        }
     }
 }
 

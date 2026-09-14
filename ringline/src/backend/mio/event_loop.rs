@@ -373,13 +373,22 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
             let mut mio_stream = mio::net::TcpStream::from_std(std_stream);
 
-            // Register with poll for READABLE interest.
+            // READABLE *and* WRITABLE, registered once and never modified
+            // afterwards. mio's epoll is edge-triggered, so a socket that is
+            // already writable fires one edge and then stays quiet — it does
+            // not spin. The outbound path (`handler.rs`) has always registered
+            // both; matching it here is what lets the per-send `epoll_ctl`
+            // toggling go away (ringline-rs/ringline#395).
             let mio_token = mio::Token(conn_index as usize + 1);
             if self
                 .driver
                 .poll
                 .registry()
-                .register(&mut mio_stream, mio_token, mio::Interest::READABLE)
+                .register(
+                    &mut mio_stream,
+                    mio_token,
+                    mio::Interest::READABLE | mio::Interest::WRITABLE,
+                )
                 .is_err()
             {
                 self.driver.connections.release(conn_index);
@@ -762,6 +771,28 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             if result.is_ok() {
                 cs.mark_connected();
 
+                // Re-arm interest exactly once, here, when the outbound
+                // connection becomes established.
+                //
+                // This is load-bearing and was found by deleting it: mio
+                // registers the stream while the connect is still in flight,
+                // and with edge-triggered epoll the readiness that matters
+                // arrives around establishment. Without a MOD at this point
+                // the first readable edge can be missed and the connection
+                // never delivers its response — every outbound echo test
+                // fails, which is how this came back.
+                //
+                // Once per connection is not the cost #395 is about: that was
+                // two `epoll_ctl(MOD)` on *every operation*, from toggling
+                // WRITABLE around each deferred send.
+                if let Some(stream) = self.driver.tcp_streams[idx].as_mut() {
+                    let _ = self.driver.poll.registry().reregister(
+                        stream,
+                        mio::Token(idx + 1),
+                        mio::Interest::READABLE | mio::Interest::WRITABLE,
+                    );
+                }
+
                 // Set TCP_NODELAY if configured.
                 if self.driver.tcp_nodelay
                     && let Some(ref stream) = self.driver.tcp_streams[idx]
@@ -782,7 +813,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     if !self.driver.pending_sends[idx].is_empty() {
                         self.driver.mark_send_dirty(idx);
                     }
-                    self.driver.register_writable(conn_index);
                     let _ = self.driver.flush_sends(conn_index);
                     return;
                 }
@@ -948,9 +978,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             if self.driver.pending_sends[idx].is_empty() {
                 continue;
             }
-            // Register writable interest so mio tells us when we can write.
-            self.driver.register_writable(conn_index);
-            // If we already know the socket is writable, try flushing now.
+            // Interest is registered once at accept/connect as
+            // READABLE|WRITABLE and never modified, so there is nothing to arm
+            // here. If we already know the socket is writable, flush now.
             if self.driver.writable[idx]
                 && let Err(e) = self.driver.flush_sends(conn_index)
             {
