@@ -31,6 +31,7 @@ impl LatencyHistogram {
         let n = self.samples.len();
         if n == 0 {
             return LatencyStats {
+                mean_ns: 0,
                 p50_ns: 0,
                 p90_ns: 0,
                 p99_ns: 0,
@@ -41,6 +42,12 @@ impl LatencyHistogram {
             };
         }
         LatencyStats {
+            // Little's law is N = X * E[R] — the *mean*, not a percentile.
+            // Checking it against p50 would be checking the wrong quantity:
+            // service-time distributions here are right-skewed, so p50 sits
+            // below the mean and the check would either false-alarm or need a
+            // tolerance loose enough to pass a genuinely broken arm.
+            mean_ns: (self.samples.iter().map(|&v| v as u128).sum::<u128>() / n as u128) as u64,
             p50_ns: self.samples[n * 50 / 100],
             p90_ns: self.samples[n * 90 / 100],
             p99_ns: self.samples[n * 99 / 100],
@@ -54,6 +61,10 @@ impl LatencyHistogram {
 
 #[derive(Clone, Serialize)]
 pub struct LatencyStats {
+    /// Arithmetic mean. Present so a closed-loop arm can be checked against
+    /// Little's law (`connections == throughput * mean_latency`), which is the
+    /// cheapest detector of coordinated omission or a client-side bottleneck.
+    pub mean_ns: u64,
     pub p50_ns: u64,
     pub p90_ns: u64,
     pub p99_ns: u64,
