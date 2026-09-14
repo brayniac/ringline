@@ -20,6 +20,42 @@ use crate::config::Config;
 use crate::connection::{ConnectionTable, Lifecycle, RecvArm, WriteHalf};
 use crate::handler::{BuiltSend, ConnSendState, DriverCtx};
 use crate::metrics;
+
+// DIAGNOSTIC ONLY - not for merge.
+pub(crate) mod diag {
+    use std::sync::Once;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    pub static HELD: AtomicU64 = AtomicU64::new(0);
+    pub static FLUSH_CALL: AtomicU64 = AtomicU64::new(0);
+    pub static NOT_DE: AtomicU64 = AtomicU64::new(0);
+    pub static BUSY: AtomicU64 = AtomicU64::new(0);
+    pub static EMPTY: AtomicU64 = AtomicU64::new(0);
+    pub static SINGLE: AtomicU64 = AtomicU64::new(0);
+    pub static GATHERED: AtomicU64 = AtomicU64::new(0);
+    static START: Once = Once::new();
+    pub fn start() {
+        START.call_once(|| {
+            std::thread::spawn(|| {
+                use std::io::Write;
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    println!(
+                        "DE held={} flush={} not_de={} busy={} empty={} single={} gathered={}",
+                        HELD.load(Ordering::Relaxed),
+                        FLUSH_CALL.load(Ordering::Relaxed),
+                        NOT_DE.load(Ordering::Relaxed),
+                        BUSY.load(Ordering::Relaxed),
+                        EMPTY.load(Ordering::Relaxed),
+                        SINGLE.load(Ordering::Relaxed),
+                        GATHERED.load(Ordering::Relaxed),
+                    );
+                    let _ = std::io::stdout().flush();
+                }
+            });
+        });
+    }
+}
+
 use crate::runtime::send_capacity::BoundedSendId;
 
 /// Slots in the lazily-constructed fallback recv pool. At most one
@@ -1589,6 +1625,8 @@ impl Driver {
     /// the flush pass never has to work out which completion handler owed it a
     /// re-arm.
     pub(crate) fn hold_direct_echo(&mut self, conn_index: u32, pending: PendingRecvBuf) {
+        diag::start();
+        diag::HELD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let ci = conn_index as usize;
         self.recv_hold[ci].push_back(pending);
         if !self.direct_echo_queued[ci] {
@@ -1612,6 +1650,9 @@ impl Driver {
     /// that fits one completion.
     pub(crate) fn flush_direct_echo(&mut self, conn_index: u32) {
         use crate::buffer::send_slab::MAX_IOVECS;
+        use std::sync::atomic::Ordering as DiagOrd;
+        diag::start();
+        diag::FLUSH_CALL.fetch_add(1, DiagOrd::Relaxed);
         let ci = conn_index as usize;
 
         // `recv_hold` is shared with recv-forward, where draining the hold is
@@ -1622,6 +1663,7 @@ impl Driver {
             .get(conn_index)
             .is_some_and(|c| c.direct_echo)
         {
+            diag::NOT_DE.fetch_add(1, DiagOrd::Relaxed);
             return;
         }
 
@@ -1630,44 +1672,18 @@ impl Driver {
         // queue implies `in_flight`, but both are checked so this can never
         // overtake a send that is already ordered ahead of it.
         if self.send_queues[ci].in_flight || !self.send_queues[ci].queue.is_empty() {
+            diag::BUSY.fetch_add(1, DiagOrd::Relaxed);
             return;
         }
         let n = self.recv_hold[ci].len().min(MAX_IOVECS);
         if n == 0 {
+            diag::EMPTY.fetch_add(1, DiagOrd::Relaxed);
             return;
         }
-
-        // DIAGNOSTIC ONLY - not for merge. Counts how often a flush actually
-        // has something to gather, to tell "the gather is ineffective" apart
-        // from "the gather never fires".
-        {
-            use std::sync::Once;
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static SINGLE: AtomicU64 = AtomicU64::new(0);
-            static GATHERED: AtomicU64 = AtomicU64::new(0);
-            static HELD_TOTAL: AtomicU64 = AtomicU64::new(0);
-            static START: Once = Once::new();
-            START.call_once(|| {
-                std::thread::spawn(|| {
-                    loop {
-                        std::thread::sleep(std::time::Duration::from_secs(5));
-                        println!(
-                            "DIRECT_ECHO_FLUSH single={} gathered={} buffers={}",
-                            SINGLE.load(Ordering::Relaxed),
-                            GATHERED.load(Ordering::Relaxed),
-                            HELD_TOTAL.load(Ordering::Relaxed),
-                        );
-                        use std::io::Write;
-                        let _ = std::io::stdout().flush();
-                    }
-                });
-            });
-            HELD_TOTAL.fetch_add(n as u64, Ordering::Relaxed);
-            if n >= 2 {
-                GATHERED.fetch_add(1, Ordering::Relaxed);
-            } else {
-                SINGLE.fetch_add(1, Ordering::Relaxed);
-            }
+        if n >= 2 {
+            diag::GATHERED.fetch_add(1, DiagOrd::Relaxed);
+        } else {
+            diag::SINGLE.fetch_add(1, DiagOrd::Relaxed);
         }
 
         if n >= 2 {
