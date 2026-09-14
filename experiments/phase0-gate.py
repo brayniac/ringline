@@ -16,26 +16,38 @@ because of two recorded failures, not as ceremony:
   that forced the 2026-05 withdrawal. Checked against the *mean*, because a
   percentile is not the quantity the law is about.
 
-Usage: phase0-gate.py <arm-dir>   # expects results-*.json and percore.txt
+Usage: phase0-gate.py <arm-dir> <server-workers>
 Exit 0 = PASS, 1 = REJECT.
 """
 import json
 import pathlib
 import sys
 
-# One core this busy while the median core is below IDLE_CORE_MAX is the
-# single-core funnel. Thresholds are deliberately wide: this catches a
-# pathology, not a mild imbalance.
-HOT_CORE_MIN = 90.0
-IDLE_CORE_MAX = 30.0
+# A core at or above this is doing real work. The funnel is not "one core is
+# hot" — a thread-per-core runtime is *supposed* to saturate exactly as many
+# cores as it has workers and leave the rest idle. The funnel is work
+# collapsing onto FEWER cores than the runtime was configured to use.
+BUSY_CORE_MIN = 50.0
 # Little's law tolerance. A good closed-loop arm lands within a couple of
-# percent (1.4% measured locally with the mean); 15% leaves room for warmup
-# edges and sampling without admitting a broken arm.
+# percent — the first real rig arm closed to 0.2% — so 15% leaves room for
+# warmup edges and sampling without admitting a broken arm.
 LITTLE_TOLERANCE = 0.15
 
 
-def check_percore(path):
-    """percore.txt: one `cpu<N> <busy_percent>` per line, sampled over the run."""
+def check_percore(path, workers):
+    """percore.txt: one `cpu<N> <busy_percent>` per line, sampled over the run.
+
+    Rejects the single-core funnel that invalidated a previous bare-metal
+    campaign here: IRQ and wakeup locality pulled all work onto one core and
+    capped every arm at the same number regardless of what was under test.
+
+    The first version of this check compared the hottest core against the
+    median and would have rejected every healthy arm in the campaign. On the
+    real rig an 8-worker server on a 24-core guest runs 8 cores at 100% and 16
+    at ~0%, so hottest=100 and median=0 — indistinguishable, by that rule, from
+    one core doing everything. Counting busy cores against the configured
+    worker count is the distinction that actually matters.
+    """
     if not path.exists():
         return ["no per-core sample: cannot rule out the single-core funnel"]
     busy = []
@@ -48,14 +60,20 @@ def check_percore(path):
                 pass
     if not busy:
         return ["per-core sample present but unparseable"]
-    busy.sort()
-    hottest = busy[-1]
-    median = busy[len(busy) // 2]
-    if hottest >= HOT_CORE_MIN and median <= IDLE_CORE_MAX:
+    busy_cores = sum(1 for b in busy if b >= BUSY_CORE_MIN)
+    if workers > 1 and busy_cores <= 1:
         return [
-            f"single-core funnel: hottest core {hottest:.0f}% busy, median core "
-            f"{median:.0f}% across {len(busy)} cores — this is the artifact that "
-            f"invalidated a previous campaign, not a result"
+            f"single-core funnel: {busy_cores} core(s) above {BUSY_CORE_MIN:.0f}% "
+            f"busy for a {workers}-worker server across {len(busy)} cores — this "
+            f"is the artifact that invalidated a previous campaign, not a result"
+        ]
+    # Short of the full collapse, work spread over less than half the workers
+    # still means the arm is not measuring what it claims to.
+    if workers > 1 and busy_cores * 2 < workers:
+        return [
+            f"work collapsed onto {busy_cores} of {workers} configured workers "
+            f"({len(busy)} cores sampled): the arm is bounded by placement, not "
+            f"by the runtime under test"
         ]
     return []
 
@@ -84,7 +102,11 @@ def check_littles_law(result):
 
 def main():
     arm = pathlib.Path(sys.argv[1])
-    problems = check_percore(arm / "percore.txt")
+    # The configured server worker count: the per-core check is meaningless
+    # without it, because "how many cores should be busy" is exactly what it
+    # decides.
+    workers = int(sys.argv[2]) if len(sys.argv) > 2 else 1
+    problems = check_percore(arm / "percore.txt", workers)
     results = sorted(arm.glob("results-*.json"))
     if not results:
         problems.append("no results-*.json in the arm directory")
