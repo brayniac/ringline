@@ -1,6 +1,6 @@
 # Release comparison campaign: ringline vs tokio, io_uring vs mio
 
-- **Status:** open — intent only. No measurements yet.
+- **Status:** phase 1 complete (192 arms, 189 gated in). Phases 2-4 open.
 - **Span:** 2026-09-13 → · PRs TBD · pre-release (post-0.6.4)
 
 Opened **before** the work, per this journal's "land intent before building"
@@ -119,10 +119,113 @@ Stated now so the analysis cannot be steered later:
   campaign stops and the rig is fixed first. Measuring harder against a broken
   rig is what produced the last withdrawal.
 
-## Outcome
+## Outcome — phase 1
 
-Open.
+192 arms, 4 configs x 4 connection counts x 4 message sizes x 3 reps, one size
+per arm. **189 passed the gates; 3 were rejected**, and all three are the same
+cell in all three reps (tokio at 2048 connections x 16 KiB, Little's law 18%
+out), so that corner is systematically unmeasurable on this rig rather than
+noisy. A 1.6% rejection rate is well inside the "stop and fix the rig" bar set
+above.
+
+### The connection-scaled latency penalty has inverted
+
+This was the reason connection count became a first-class axis, and the finding
+this campaign most needed to re-test. It does not reproduce. Mean latency,
+ringline io_uring against tokio:
+
+| conns | 256 B | | | 4 KiB | | |
+|---|---|---|---|---|---|---|
+| | uring | tokio | delta | uring | tokio | delta |
+| 1 | 0.152 ms | 0.165 ms | −8.2% | 0.196 ms | 0.200 ms | −1.9% |
+| 64 | 0.225 | 0.370 | **−39.1%** | 0.323 | 0.504 | **−35.8%** |
+| 512 | 0.829 | 1.193 | **−30.5%** | 1.604 | 2.160 | **−25.8%** |
+| 2048 | 3.948 | 5.024 | −21.4% | 7.183 | 8.945 | −19.7% |
+
+The prior measurement had ringline 25-38% *slower*, worsening with connection
+count (+0.15 ms at 64, +1.3 ms at 512). It is now 20-39% faster at those same
+points. `BENCHMARKS.md` would have had to carry a disclosure section for that
+regime; on current `main` it does not.
+
+Not attributed to any single change — the send-path series (#369-#389) reworked
+much of this path between the two measurements, and nothing isolated the cause.
+Recorded as "does not reproduce", not as "fixed by X".
+
+### Throughput: io_uring wins everywhere except 16 KiB
+
+Median ops/s, n=3:
+
+| conns | 256 B uring | tokio | mio | 4 KiB uring | tokio | mio |
+|---|---|---|---|---|---|---|
+| 64 | 285,133 | 173,721 | 265,479 | 198,679 | 127,555 | 183,599 |
+| 512 | 621,570 | 431,515 | 450,541 | 322,848 | 238,755 | 260,061 |
+| 2048 | 531,199 | 420,798 | 437,845 | 300,284 | 234,501 | 232,425 |
+
+CPU efficiency at 512 connections (ops per server core-second, from
+`cpu_usage`): 256 B — uring 47,261, mio 38,477, tokio 37,320. So the throughput
+lead is not bought with CPU.
+
+At **16 KiB the default io_uring path loses to its own mio fallback** (118k vs
+152k at 64 connections) and to `--recv-forward` by 25-41%. Root-caused and
+filed as #397: `run_direct_echo` submits one `Send` per recv completion, and a
+16 KiB message spans several completions, so the reply leaves as ~2 segments of
+8 KiB instead of ~1 of 15 KiB. Packets per operation is flat at 1.00 for 256 B,
+1 KiB and 4 KiB and jumps to 1.97 at 16 KiB — exactly the size where a message
+stops fitting one completion.
+
+### Syscall amortization confirmed
+
+0.08 `io_uring_enter` per operation at 512 connections — about 12 operations per
+syscall. mio's epoll path shows none, by construction.
+
+### recv-forward cannot be the default, and this is not a tuning question
+
+Worth recording because the measurements make it tempting. `--recv-forward`
+wins at 16 KiB and is roughly neutral below it, which looks like an argument for
+making it opt-out. It is not: while enabled, **`with_data` / `with_bytes` never
+observe the data** — buffers are held for forwarding and never reach the
+accumulator. It turns the connection into a byte pipe.
+
+So it is not a performance knob with a tradeoff; it is a different mode that
+disables the primary recv API. Every handler that parses its input — every
+protocol client in this workspace — would break. The path to a competitive
+default at 16 KiB is #397, not flipping this flag.
 
 ## Lessons / open questions
 
-Open.
+**Three instrumentation errors, each of which produced a plausible wrong
+number.** Recorded because the pattern matters more than any of them.
+
+1. A hand-rolled `/proc/stat` sampler counted **iowait as busy**. A worker
+   blocked in io_uring's `submit_and_wait` is accounted as iowait, not idle, so
+   an idle io_uring server read as **806% busy against tokio's 33%** — about to
+   be reported as "24x the CPU for 7% more throughput". True figure ~22% of one
+   core. The error does not add noise evenly: epoll runtimes have no such
+   accounting quirk, so it biased the comparison against the runtime under
+   test. rezolus `cpu_usage` is BPF-derived on-CPU time with only `user`/`system`
+   states and is structurally incapable of the mistake.
+2. Per-op syscall rates taken as the **mean over a whole recording** rather than
+   the loaded window. That gave 0.83 reads/op for an echo server, which is
+   impossible — it must read every request it echoes. The loaded-window figure
+   is 1.27. A per-op count below the floor the protocol demands means the window
+   is wrong.
+3. The funnel gate was written **twice wrong**, both caught only by real arms.
+   hottest-vs-median rejected every healthy arm (a thread-per-core runtime is
+   supposed to saturate its worker count and idle the rest); busy-cores-vs-worker
+   -count rejected every lightly loaded arm and did so for the correctly-idle
+   runtimes while passing the anomalous one.
+
+The common thread: each produced a number that was wrong in a way that flattered
+or damned the thing under test, and each would have survived review by anyone
+reading only the conclusion. The habit worth keeping is not "use rezolus" but
+**ask what floor the work imposes and check the measurement can clear it**.
+
+**A negative result is only evidence once the setup could have produced a
+positive.** A probe built to show recording dilution produced "both recordings
+agree" — because `mode = "stop"` had truncated the long recording and there was
+no dilution to detect. It read as a clean null and was an unarmed experiment.
+
+**Open:** phases 2 (open-loop latency vs load), 3 (workers, pipeline depth) and
+4 (segcache). The 2048-connection column is the weakest part of this grid —
+Little's law errors climb to 6-8% even where they pass — and should be treated
+as directional rather than quotable. #397 is the one actionable defect found.
