@@ -1614,6 +1614,17 @@ impl Driver {
         use crate::buffer::send_slab::MAX_IOVECS;
         let ci = conn_index as usize;
 
+        // `recv_hold` is shared with recv-forward, where draining the hold is
+        // the owning task's job. Only gather for a slot that is still in
+        // direct-echo mode.
+        if !self
+            .connections
+            .get(conn_index)
+            .is_some_and(|c| c.direct_echo)
+        {
+            return;
+        }
+
         // One send in flight per connection; anything that arrives meanwhile
         // accumulates in the hold and goes out in the next gather. A non-empty
         // queue implies `in_flight`, but both are checked so this can never
