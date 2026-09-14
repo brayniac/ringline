@@ -142,9 +142,24 @@ has to read until `EAGAIN`, so the second read exists to see the empty socket.
 
 At 16 KiB the best alternative configuration — mio at 64 connections,
 `--recv-forward` at 512 and 2048 — delivers **29–39% more throughput** than the
-default io_uring path. Root cause: `run_direct_echo` submits one `Send` per
-recv completion, and a 16 KiB message spans more than one completion, so the
-reply leaves in more segments than the message needs.
+default io_uring path.
+
+Root cause, re-derived by instrumenting the path on the rig: **a lost
+zero-copy**. `forward_recv_buf` sends without copying only when the `with_data`
+slice is exactly the single buffer held in `pending_recv_bufs`, which holds one
+buffer. Multishot recv completes as soon as data is available rather than when
+a message is complete, so a 16 KiB request arrives in several partial
+completions; the second one finds the hold occupied, flushes it to the
+accumulator, and from there the pointer check fails and the whole message is
+copied into a send-pool slot. At 64 connections **93.9% of forwards are copy
+sends** averaging 15,261 bytes, against `--recv-forward`, which copies nothing
+and gathers 3.63 held buffers per `sendmsg`. That costs 27% more CPU per
+operation (91.9 µs against 72.4 µs).
+
+Both paths issue roughly one send per operation of ~15 KB, so this is not send
+fragmentation. It also explains why the effect is confined to 16 KiB: below
+that a message arrives in one completion, the pointer matches, and the send is
+zero-copy.
 
 Server-side transmit packets per operation at 512 connections. The count
 includes pure ACKs, so read it as a comparison between configurations at a
@@ -159,11 +174,22 @@ size rather than as an absolute segment count:
 
 The three are indistinguishable at every size up to 4 KiB and separate only at
 16 KiB, where io_uring emits **35% more packets** than recv-forward for the same
-work (5,183 bytes per transmit packet against 7,002 and 7,645) — exactly the
-size at which a message stops fitting one recv completion.
+work (5,183 bytes per transmit packet against 7,002 and 7,645) — the same size
+at which a message stops arriving in one recv completion. The copy above
+accounts for the throughput and CPU gap but not for this packet-rate gap, which
+is unexplained and untraced.
 
 Tracked as **#397**. Until it is fixed, `--recv-forward` (or the mio backend) is
 the faster choice for large-message byte-pipe workloads.
+
+One caveat on what the io_uring arm measured. `ringline-bench` had no
+`build.rs`, so `has_io_uring` was never set for that crate and its
+`#[cfg(has_io_uring)]` blocks were dead: `bench-server --runtime ringline` ran
+the `with_data` + `forward_recv_buf` loop throughout this campaign, never
+`run_direct_echo`. #402 fixes the cfg. The ringline-vs-tokio-vs-mio comparison
+stands as measured — every arm ran the code it ran — but the io_uring arm
+exercised the forward path rather than the direct-echo path, and needs re-running
+before these numbers describe the default.
 
 ### `--recv-forward` is a mode, not a tuning knob
 

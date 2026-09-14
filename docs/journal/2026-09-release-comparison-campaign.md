@@ -167,9 +167,15 @@ lead is not bought with CPU.
 
 At **16 KiB the default io_uring path loses to its own mio fallback** (118k vs
 152k at 64 connections) and to `--recv-forward` by 25-41%. Root-caused and
-filed as #397: `run_direct_echo` submits one `Send` per recv completion, and a
-16 KiB message spans several completions, so the reply leaves in more segments
-than the message needs. Transmit packets per operation at 512 connections are
+filed as #397. The root cause in that issue was wrong twice over and has been
+re-derived: the benchmark never ran `run_direct_echo` at all (`ringline-bench`
+had no `build.rs`, so `has_io_uring` was never set for it and every
+`#[cfg(has_io_uring)]` block was dead — #402), and the defect on the path it did
+run is a **lost zero-copy** rather than a lost coalesce. `forward_recv_buf`
+sends without copying only when the `with_data` slice is the single buffer in
+`pending_recv_bufs`; a message arriving in several partial completions goes to
+the accumulator instead, and 93.9% of forwards then copy the whole message into
+a send-pool slot, at 27% more CPU per operation. Transmit packets per operation at 512 connections are
 identical across all three configurations at 256 B (1.99), 1 KiB (1.99) and
 4 KiB (3.97) and separate only at 16 KiB: 6.29 for io_uring against 4.65 for
 recv-forward and 4.26 for mio — 35% more packets for the same work, at exactly
