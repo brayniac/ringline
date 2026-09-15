@@ -18,6 +18,9 @@
 
 use std::net::SocketAddr;
 
+// `slice` on an owned buffer comes from this trait, not from Vec.
+use tokio_uring::buf::BoundedBuf;
+
 /// Run one `tokio-uring` runtime per worker, each with its own listener.
 pub fn run(addr: SocketAddr, workers: usize, msg_size: usize, pin_to_core: bool) {
     let mut handles = Vec::with_capacity(workers);
