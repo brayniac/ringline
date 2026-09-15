@@ -261,8 +261,6 @@ pub use runtime::io::Elapsed;
 /// Future returned by [`ConnCtx::forward_to()`] (segmented recv, Mode A).
 #[cfg(has_io_uring)]
 pub use runtime::io::ForwardToFuture;
-#[cfg(has_io_uring)]
-pub use runtime::io::{SpliceForward, SpliceForwardFuture};
 /// Handle to a spawned task's return value, obtained from [`spawn_with_handle()`].
 pub use runtime::io::JoinHandle;
 /// Result of a parse closure: consumed bytes or need more data.
@@ -358,6 +356,8 @@ pub use runtime::io::try_sleep_until;
 pub use runtime::io::try_timeout;
 /// Fallible timeout_at that returns an error if the timer pool is exhausted.
 pub use runtime::io::try_timeout_at;
+#[cfg(has_io_uring)]
+pub use runtime::io::{SpliceForward, SpliceForwardFuture};
 /// Future returned by [`join()`].
 pub use runtime::join::Join;
 /// Future returned by [`join3()`].

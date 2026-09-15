@@ -1370,7 +1370,6 @@ impl ConnCtx {
         }
     }
 
-
     /// Forward the next `len` received bytes to `sink` with `splice(2)`, so the
     /// bytes move between descriptors inside the kernel and never enter user
     /// space **or the provided-buffer ring** (#407).
