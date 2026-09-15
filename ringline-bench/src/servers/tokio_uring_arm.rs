@@ -23,8 +23,12 @@ use tokio_uring::buf::BoundedBuf;
 
 /// Run one `tokio-uring` runtime per worker, each with its own listener.
 pub fn run(addr: SocketAddr, workers: usize, msg_size: usize, pin_to_core: bool) {
+    // Same readiness discipline as the epoll per-core arm: the "ready" line
+    // must mean the listeners exist, not that the threads were spawned.
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
     let mut handles = Vec::with_capacity(workers);
     for core in 0..workers {
+        let ready_tx = ready_tx.clone();
         handles.push(std::thread::spawn(move || {
             if pin_to_core {
                 super::tokio_arms::pin_current_thread(core);
@@ -36,6 +40,7 @@ pub fn run(addr: SocketAddr, workers: usize, msg_size: usize, pin_to_core: bool)
                 .expect("failed to bind SO_REUSEPORT listener");
             tokio_uring::start(async move {
                 let listener = tokio_uring::net::TcpListener::from_std(std_listener);
+                ready_tx.send(()).ok();
                 loop {
                     let (stream, _) = match listener.accept().await {
                         Ok(c) => c,
@@ -45,6 +50,11 @@ pub fn run(addr: SocketAddr, workers: usize, msg_size: usize, pin_to_core: bool)
                 }
             });
         }));
+    }
+    for _ in 0..workers {
+        ready_rx
+            .recv()
+            .expect("a tokio-uring worker died before binding");
     }
     eprintln!("bench-server: ready (tokio-uring per-core x{workers})");
     for h in handles {

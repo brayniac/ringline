@@ -85,8 +85,12 @@ fn run_per_core(
     echo: TokioEcho,
     pin_to_core: bool,
 ) {
+    // Report ready only once every listener is bound: the client connects as
+    // soon as it sees the line, and a premature one races the bind.
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
     let mut handles = Vec::with_capacity(workers);
     for core in 0..workers {
+        let ready_tx = ready_tx.clone();
         handles.push(std::thread::spawn(move || {
             if pin_to_core {
                 pin_current_thread(core);
@@ -102,9 +106,15 @@ fn run_per_core(
                 // would feed N runtimes and re-introduce the cross-thread
                 // handoff the arm exists to remove.
                 let listener = bind_listener(addr, true).expect("failed to bind");
+                ready_tx.send(()).ok();
                 accept_loop(listener, msg_size, echo).await;
             });
         }));
+    }
+    for _ in 0..workers {
+        ready_rx
+            .recv()
+            .expect("a per-core worker died before binding");
     }
     eprintln!("bench-server: ready (tokio per-core x{workers}, echo={echo:?})");
     for h in handles {
@@ -115,14 +125,65 @@ fn run_per_core(
 /// A plain `std` listener with `SO_REUSEPORT` set, for runtimes that take one
 /// by `from_std` (the `tokio-uring` arm). Gated on that arm's cfg: its only
 /// caller is compiled out otherwise, and `-D dead-code` is a CI failure.
+///
+/// Built from raw syscalls rather than `tokio::net::TcpSocket`, because
+/// `TcpSocket::listen` constructs a `tokio::net::TcpListener` and panics with
+/// "there is no reactor running" — the tokio-uring arm's threads run a
+/// tokio-uring runtime, not a tokio one.
 #[cfg(all(target_os = "linux", feature = "tokio-uring-arm"))]
 pub(crate) fn reuseport_std_listener(addr: SocketAddr) -> std::io::Result<std::net::TcpListener> {
-    let socket = tokio::net::TcpSocket::new_v4()?;
-    socket.set_reuseaddr(true)?;
-    socket.set_reuseport(true)?;
-    socket.bind(addr)?;
-    let listener = socket.listen(1024)?;
-    listener.into_std()
+    use std::os::fd::FromRawFd;
+
+    let SocketAddr::V4(v4) = addr else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "tokio-uring arm supports IPv4 only",
+        ));
+    };
+
+    let err = || std::io::Error::last_os_error();
+    unsafe {
+        let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+        if fd < 0 {
+            return Err(err());
+        }
+        // Owns the fd from here, so every early return closes it.
+        let listener = std::net::TcpListener::from_raw_fd(fd);
+        let on: libc::c_int = 1;
+        let optlen = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        for opt in [libc::SO_REUSEADDR, libc::SO_REUSEPORT] {
+            if libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                opt,
+                &on as *const _ as *const libc::c_void,
+                optlen,
+            ) != 0
+            {
+                return Err(err());
+            }
+        }
+        let sa = libc::sockaddr_in {
+            sin_family: libc::AF_INET as libc::sa_family_t,
+            sin_port: v4.port().to_be(),
+            sin_addr: libc::in_addr {
+                s_addr: u32::from_ne_bytes(v4.ip().octets()),
+            },
+            sin_zero: [0; 8],
+        };
+        if libc::bind(
+            fd,
+            &sa as *const _ as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        ) != 0
+        {
+            return Err(err());
+        }
+        if libc::listen(fd, 1024) != 0 {
+            return Err(err());
+        }
+        Ok(listener)
+    }
 }
 
 fn bind_listener(addr: SocketAddr, reuseport: bool) -> std::io::Result<tokio::net::TcpListener> {
