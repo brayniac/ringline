@@ -1419,8 +1419,10 @@ impl ConnCtx {
         });
 
         if !reserved {
+            eprintln!("SPLICEDIAG forward_to_splice: NOT reserved -> Mode A fallback");
             return SpliceForward::Fallback(self.forward_to(sink, len));
         }
+        eprintln!("SPLICEDIAG forward_to_splice: reserved, len={len}");
         SpliceForward::Splice(SpliceForwardFuture {
             conn_index: self.conn_index,
             generation: self.generation,
@@ -3199,7 +3201,9 @@ impl Future for SpliceForwardFuture<'_> {
                         driver.connections.generation(conn),
                     );
                     let _ = driver.ring.submit_async_cancel(recv_ud.raw(), conn);
+                    eprintln!("SPLICEDIAG cancel submitted for multishot recv");
                 } else {
+                    eprintln!("SPLICEDIAG no recv armed, starting immediately");
                     // Nothing was reading the socket, so start immediately.
                     driver.start_pending_splice(conn);
                 }
