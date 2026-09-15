@@ -94,6 +94,12 @@ pub enum OpTag {
     /// `IORING_OP_SPLICE` moving bytes from the pipe out to the sink. Payload =
     /// the connection generation at submit time.
     SpliceOut = 32,
+    /// `PollAdd(POLLIN)` armed after a splice forward's socket -> pipe leg
+    /// returned `-EAGAIN`. Payload = the connection generation at submit time.
+    SplicePollIn = 33,
+    /// `PollAdd(POLLOUT)` armed after a splice forward's pipe -> sink leg
+    /// returned `-EAGAIN`. Payload = the connection generation at submit time.
+    SplicePollOut = 34,
 }
 
 impl OpTag {
@@ -132,6 +138,8 @@ impl OpTag {
             30 => Some(OpTag::ForwardWritePollOut),
             31 => Some(OpTag::SpliceIn),
             32 => Some(OpTag::SpliceOut),
+            33 => Some(OpTag::SplicePollIn),
+            34 => Some(OpTag::SplicePollOut),
             _ => None,
         }
     }

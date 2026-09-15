@@ -261,6 +261,8 @@ pub use runtime::io::Elapsed;
 /// Future returned by [`ConnCtx::forward_to()`] (segmented recv, Mode A).
 #[cfg(has_io_uring)]
 pub use runtime::io::ForwardToFuture;
+#[cfg(has_io_uring)]
+pub use runtime::io::{SpliceForward, SpliceForwardFuture};
 /// Handle to a spawned task's return value, obtained from [`spawn_with_handle()`].
 pub use runtime::io::JoinHandle;
 /// Result of a parse closure: consumed bytes or need more data.
