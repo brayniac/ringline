@@ -6732,3 +6732,124 @@ fn half_close_waits_for_queued_sends_to_drain() {
         handle.join().unwrap().unwrap();
     }
 }
+
+// ── Splice forward, end to end (#407) ───────────────────────────────
+//
+// The unit tests inject the CQE results they expect. This one moves real
+// bytes through a real pipe and checks what comes out the other side, which
+// is the only way to catch a wrong `off_in`/`off_out`, a mis-sized leg, or a
+// reordered chunk.
+
+#[cfg(has_io_uring)]
+static SPLICE_SINK_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+#[cfg(has_io_uring)]
+static SPLICE_FORWARD_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(has_io_uring)]
+static SPLICE_FORWARDED: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
+
+#[cfg(has_io_uring)]
+struct SpliceProxy;
+
+#[cfg(has_io_uring)]
+impl AsyncEventHandler for SpliceProxy {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            use std::sync::atomic::Ordering;
+            let fd = SPLICE_SINK_FD.load(Ordering::SeqCst);
+            let len = SPLICE_FORWARD_LEN.load(Ordering::SeqCst);
+            if fd < 0 {
+                return;
+            }
+            // Safety: the test owns the socket and keeps it alive until after
+            // the server shuts down.
+            let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+            let sink = ringline::SinkFd::socket(borrowed);
+            match conn.forward_to_splice(&sink, len).await {
+                Ok(n) => SPLICE_FORWARDED.store(n as i64, Ordering::SeqCst),
+                Err(e) => {
+                    eprintln!("splice forward failed: {e}");
+                    SPLICE_FORWARDED.store(-2, Ordering::SeqCst);
+                }
+            }
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        SpliceProxy
+    }
+}
+
+#[test]
+#[cfg(has_io_uring)]
+fn splice_forward_proxies_bytes_end_to_end() {
+    use std::os::fd::AsRawFd;
+    use std::sync::atomic::Ordering;
+
+    // 200 KiB against a 64 KiB default pipe: several chunks, so the
+    // drain-before-refill ordering is exercised for real rather than asserted.
+    const LEN: usize = 200 * 1024;
+    let payload: Vec<u8> = (0..LEN).map(|i| (i % 251) as u8).collect();
+
+    let (sink, sink_peer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+    sink_peer
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    SPLICE_SINK_FD.store(sink.as_raw_fd(), Ordering::SeqCst);
+    SPLICE_FORWARD_LEN.store(LEN, Ordering::SeqCst);
+    SPLICE_FORWARDED.store(-1, Ordering::SeqCst);
+
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
+        .bind(addr.parse().unwrap())
+        .launch::<SpliceProxy>()
+        .expect("launch failed");
+    wait_for_server(&addr);
+
+    let writer = std::thread::spawn({
+        let addr = addr.clone();
+        let payload = payload.clone();
+        move || {
+            let mut s = TcpStream::connect(&addr).unwrap();
+            s.set_nodelay(true).unwrap();
+            // Chunked with gaps so the source goes empty mid-forward and the
+            // socket -> pipe leg has to park on POLLIN and resume.
+            for chunk in payload.chunks(17_000) {
+                s.write_all(chunk).unwrap();
+                s.flush().unwrap();
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            s
+        }
+    });
+
+    let mut got = vec![0u8; LEN];
+    {
+        let mut reader = &sink_peer;
+        reader.read_exact(&mut got).expect("sink read");
+    }
+    let _client = writer.join().unwrap();
+
+    assert_eq!(
+        got, payload,
+        "spliced bytes must arrive byte-exact and in order"
+    );
+
+    // The handler's own view has to agree with the sink's.
+    for _ in 0..100 {
+        if SPLICE_FORWARDED.load(Ordering::SeqCst) >= 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        SPLICE_FORWARDED.load(Ordering::SeqCst),
+        LEN as i64,
+        "forward_to_splice must report the full length it moved"
+    );
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+    drop(sink);
+}
