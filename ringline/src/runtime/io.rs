@@ -1405,7 +1405,6 @@ impl ConnCtx {
     #[cfg(has_io_uring)]
     pub fn forward_to_splice<'a>(&self, sink: &'a SinkFd<'a>, len: usize) -> SpliceForward<'a> {
         let reserved = with_state(|driver, _| {
-            let ci = self.conn_index as usize;
             if driver.connections.generation(self.conn_index) != self.generation {
                 return false;
             }
