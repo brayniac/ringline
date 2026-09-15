@@ -1121,14 +1121,6 @@ impl Driver {
                 .connections
                 .get(conn_index)
                 .is_some_and(|c| c.recv_multishot_armed);
-        eprintln!(
-            "SPLICEDIAG start_pending: state={} armed={} ready={}",
-            self.splice_forward[ci].is_some(),
-            self.connections
-                .get(conn_index)
-                .is_some_and(|c| c.recv_multishot_armed),
-            ready
-        );
         if !ready {
             return;
         }
@@ -1162,9 +1154,6 @@ impl Driver {
             st.eof,
         );
 
-        eprintln!(
-            "SPLICEDIAG advance: in_pipe={in_pipe} forwarded={forwarded} len={len} eof={eof}"
-        );
         if in_pipe > 0 {
             let ud = UserData::encode(OpTag::SpliceOut, conn_index, generation);
             let off = if is_file { Some(forwarded) } else { None };
