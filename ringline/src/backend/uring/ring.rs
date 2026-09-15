@@ -447,7 +447,7 @@ impl Ring {
         // is); the pipe is not. `Splice` takes each end independently, so the
         // pair can mix fixed and raw descriptors.
         let entry = opcode::Splice::new(Fixed(conn_index), -1, Fd(pipe_w), -1, len)
-            .flags((libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK) as u32)
+            .flags(libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK)
             .build()
             .user_data(user_data.raw());
         unsafe { self.push_sqe(&entry) }
@@ -471,7 +471,7 @@ impl Ring {
             None => -1,
         };
         let entry = opcode::Splice::new(Fd(pipe_r), -1, Fd(sink_fd), off_out, len)
-            .flags((libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK) as u32)
+            .flags(libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK)
             .build()
             .user_data(user_data.raw());
         unsafe { self.push_sqe(&entry) }

@@ -3117,12 +3117,6 @@ impl<'a> SinkFd<'a> {
     }
 }
 
-/// Future returned by [`ConnCtx::forward_to`]. Drives the recv/write interleave
-/// that forwards `len` received bytes to the sink, one serialized write at a
-/// time. Borrows the [`SinkFd`] (`'a`) so the sink descriptor stays open for the
-/// whole forward.
-#[cfg(has_io_uring)]
-
 /// Future returned by [`ConnCtx::forward_to_splice`].
 ///
 /// Either the splice path or, when splice does not apply, the Mode A
@@ -3223,6 +3217,10 @@ impl Future for SpliceForwardFuture<'_> {
     }
 }
 
+/// Future returned by [`ConnCtx::forward_to`]. Drives the recv/write interleave
+/// that forwards `len` received bytes to the sink, one serialized write at a
+/// time. Borrows the [`SinkFd`] (`'a`) so the sink descriptor stays open for the
+/// whole forward.
 #[cfg(has_io_uring)]
 pub struct ForwardToFuture<'a> {
     conn_index: u32,
