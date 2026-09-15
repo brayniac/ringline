@@ -1309,6 +1309,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 // top of the handler, so try to re-arm now if the hold has already
                 // drained below the cap (otherwise a later write completion will).
                 self.maybe_rearm_throttled_forward(conn_index);
+                // Or it is the cancel a splice forward issued to get the socket
+                // buffer to itself. Start it here: this branch wakes nothing, so
+                // a future waiting to see the armed flag clear would never be
+                // polled again.
+                #[cfg(target_os = "linux")]
+                self.driver.start_pending_splice(conn_index);
                 return;
             } else if !has_more {
                 if let Some(cs) = self.driver.connections.get_mut(conn_index) {

@@ -163,6 +163,10 @@ pub(crate) struct SpliceForwardState {
     pub(crate) in_pipe: u32,
     /// Peer sent FIN: stop splicing in, drain what the pipe still holds.
     pub(crate) eof: bool,
+    /// First leg submitted. Stays false while the connection's multishot recv
+    /// is still cancelling — splice cannot touch the socket buffer until the
+    /// recv has actually stopped reading it.
+    pub(crate) started: bool,
 }
 
 /// Bytes moved per splice leg. The kernel pipe buffer defaults to 64 KiB and
@@ -1095,8 +1099,35 @@ impl Driver {
             forwarded: 0,
             in_pipe: 0,
             eof: false,
+            started: false,
         });
         true
+    }
+
+    /// Start a splice forward whose connection has finished cancelling its
+    /// multishot recv.
+    ///
+    /// Called from the recv handler's `ECANCELED` branch rather than from the
+    /// future, because that branch wakes nothing: a future parked waiting to
+    /// observe `recv_multishot_armed` clear would never be polled again, and
+    /// the forward would hang with the client's bytes sitting in the socket.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn start_pending_splice(&mut self, conn_index: u32) {
+        let ci = conn_index as usize;
+        let ready = self.splice_forward[ci]
+            .as_ref()
+            .is_some_and(|st| !st.started)
+            && !self
+                .connections
+                .get(conn_index)
+                .is_some_and(|c| c.recv_multishot_armed);
+        if !ready {
+            return;
+        }
+        if let Some(st) = self.splice_forward[ci].as_mut() {
+            st.started = true;
+        }
+        self.advance_splice(conn_index);
     }
 
     /// Submit the next leg of a splice forward.

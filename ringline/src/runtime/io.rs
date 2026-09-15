@@ -1425,7 +1425,6 @@ impl ConnCtx {
             conn_index: self.conn_index,
             generation: self.generation,
             disarm_sent: false,
-            submitted: false,
             _sink: PhantomData,
         })
     }
@@ -3151,10 +3150,10 @@ impl Future for SpliceForward<'_> {
 pub struct SpliceForwardFuture<'a> {
     conn_index: u32,
     generation: u32,
-    /// Cancel submitted for the connection's multishot recv.
+    /// Disarm handled on the first poll: either a cancel was submitted for the
+    /// connection's multishot recv, or there was nothing to cancel and the
+    /// forward started immediately.
     disarm_sent: bool,
-    /// First splice leg submitted (only after the recv has finished cancelling).
-    submitted: bool,
     _sink: PhantomData<&'a SinkFd<'a>>,
 }
 
@@ -3182,32 +3181,28 @@ impl Future for SpliceForwardFuture<'_> {
                 };
             }
 
-            if !me.submitted {
+            if !me.disarm_sent {
+                me.disarm_sent = true;
                 let armed = driver
                     .connections
                     .get(conn)
                     .is_some_and(|c| c.recv_multishot_armed);
                 if armed {
-                    if !me.disarm_sent {
-                        // Cancel by the RecvMulti user_data, not the fd: it
-                        // targets the request and is immune to reordering. The
-                        // armed flag clears when the ECANCELED CQE lands, which
-                        // is what gates the first splice.
-                        let recv_ud = crate::completion::UserData::encode(
-                            crate::completion::OpTag::RecvMulti,
-                            conn,
-                            driver.connections.generation(conn),
-                        );
-                        let _ = driver.ring.submit_async_cancel(recv_ud.raw(), conn);
-                        me.disarm_sent = true;
-                    }
-                    executor.owner_task[ci] = Some(CURRENT_TASK_ID.with(|c| c.get()));
-                    executor.recv_waiters[ci] = true;
-                    return Poll::Pending;
+                    // Cancel by the RecvMulti user_data, not the fd: it targets
+                    // the request and is immune to reordering. The forward is
+                    // started by the recv handler's ECANCELED branch, not here
+                    // — that branch wakes nothing, so a future parked waiting to
+                    // observe the armed flag clear would never be polled again.
+                    let recv_ud = crate::completion::UserData::encode(
+                        crate::completion::OpTag::RecvMulti,
+                        conn,
+                        driver.connections.generation(conn),
+                    );
+                    let _ = driver.ring.submit_async_cancel(recv_ud.raw(), conn);
+                } else {
+                    // Nothing was reading the socket, so start immediately.
+                    driver.start_pending_splice(conn);
                 }
-                // Recv is quiet; the socket buffer is splice's now.
-                me.submitted = true;
-                driver.advance_splice(conn);
             }
 
             executor.owner_task[ci] = Some(CURRENT_TASK_ID.with(|c| c.get()));
