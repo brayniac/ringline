@@ -8151,6 +8151,206 @@ mod tests {
             .expect("temp file");
         (f, path)
     }
+    // ── Splice forward (#407) ──────────────────────────────────────
+
+    /// Happy path: reserve a pipe, splice in, splice out, resolve, and give
+    /// the pipe back to the pool.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn splice_forward_runs_both_legs_and_returns_the_pipe() {
+        use std::os::fd::AsFd;
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let idle_before = el.driver.pipe_pool.idle_len();
+
+        let (sink, _peer) = make_socketpair();
+        let sinkfd = crate::runtime::io::SinkFd::socket(sink.as_fd());
+        let conn = ConnCtx::new(conn_index, generation);
+        let waker = noop_waker();
+        let mut fut =
+            std::pin::pin!(with_driver_state(&mut el, || conn.forward_to_splice(&sinkfd, 5)));
+
+        let p1 = with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            fut.as_mut().poll(&mut cx)
+        });
+        assert!(matches!(p1, std::task::Poll::Pending), "parks on the CQE");
+        assert!(
+            el.driver.splice_forward[conn_index as usize].is_some(),
+            "forward state recorded"
+        );
+
+        // socket -> pipe moved 5 bytes.
+        let ud = UserData::encode(OpTag::SpliceIn, conn_index, generation);
+        el.test_dispatch_cqe(ud.raw(), 5, 0);
+        assert_eq!(
+            el.driver.splice_forward[conn_index as usize]
+                .as_ref()
+                .unwrap()
+                .in_pipe,
+            5,
+            "bytes are resident in the pipe between the legs"
+        );
+
+        // pipe -> sink moved them out.
+        let ud = UserData::encode(OpTag::SpliceOut, conn_index, generation);
+        el.test_dispatch_cqe(ud.raw(), 5, 0);
+        assert!(
+            el.driver.splice_forward[conn_index as usize].is_none(),
+            "forward settled"
+        );
+        assert_eq!(el.driver.splice_done[conn_index as usize], Some(Ok(5)));
+        assert_eq!(
+            el.driver.pipe_pool.idle_len(),
+            idle_before + 1,
+            "an emptied pipe goes back to the pool"
+        );
+
+        let p2 = with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            fut.as_mut().poll(&mut cx)
+        });
+        assert!(matches!(p2, std::task::Poll::Ready(Ok(5))));
+    }
+
+    /// A short splice out leaves bytes in the pipe, and the next leg drains
+    /// them rather than splicing more in. Getting this backwards would
+    /// interleave a second chunk behind a partly-drained first one and
+    /// reorder the stream.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn splice_forward_drains_the_pipe_before_refilling_it() {
+        use std::os::fd::AsFd;
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let (sink, _peer) = make_socketpair();
+        let sinkfd = crate::runtime::io::SinkFd::socket(sink.as_fd());
+        let conn = ConnCtx::new(conn_index, generation);
+        let waker = noop_waker();
+        let mut fut =
+            std::pin::pin!(with_driver_state(&mut el, || conn.forward_to_splice(&sinkfd, 100)));
+        let _ = with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            fut.as_mut().poll(&mut cx)
+        });
+
+        let ud_in = UserData::encode(OpTag::SpliceIn, conn_index, generation);
+        el.test_dispatch_cqe(ud_in.raw(), 40, 0);
+        // Sink took only 15 of the 40.
+        let ud_out = UserData::encode(OpTag::SpliceOut, conn_index, generation);
+        el.test_dispatch_cqe(ud_out.raw(), 15, 0);
+
+        let st = el.driver.splice_forward[conn_index as usize]
+            .as_ref()
+            .expect("forward still running");
+        assert_eq!(st.in_pipe, 25, "the undrained remainder stays in the pipe");
+        assert_eq!(st.forwarded, 15);
+    }
+
+    /// EOF mid-forward resolves short rather than hanging for bytes that are
+    /// not coming, and still drains what the pipe already holds.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn splice_forward_truncates_on_eof() {
+        use std::os::fd::AsFd;
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let (sink, _peer) = make_socketpair();
+        let sinkfd = crate::runtime::io::SinkFd::socket(sink.as_fd());
+        let conn = ConnCtx::new(conn_index, generation);
+        let waker = noop_waker();
+        let mut fut =
+            std::pin::pin!(with_driver_state(&mut el, || conn.forward_to_splice(&sinkfd, 1000)));
+        let _ = with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            fut.as_mut().poll(&mut cx)
+        });
+
+        let ud_in = UserData::encode(OpTag::SpliceIn, conn_index, generation);
+        el.test_dispatch_cqe(ud_in.raw(), 30, 0);
+        let ud_out = UserData::encode(OpTag::SpliceOut, conn_index, generation);
+        el.test_dispatch_cqe(ud_out.raw(), 30, 0);
+        // Peer closed: the next splice in reports 0, like read.
+        el.test_dispatch_cqe(ud_in.raw(), 0, 0);
+
+        assert_eq!(
+            el.driver.splice_done[conn_index as usize],
+            Some(Ok(30)),
+            "resolves with what was forwarded before FIN"
+        );
+        let p = with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            fut.as_mut().poll(&mut cx)
+        });
+        assert!(matches!(p, std::task::Poll::Ready(Ok(30))));
+    }
+
+    /// A CQE that outlived its connection must touch nothing: the slot may
+    /// already belong to someone else.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn splice_forward_ignores_a_stale_completion() {
+        use std::os::fd::AsFd;
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let (sink, _peer) = make_socketpair();
+        let sinkfd = crate::runtime::io::SinkFd::socket(sink.as_fd());
+        let conn = ConnCtx::new(conn_index, generation);
+        let waker = noop_waker();
+        let mut fut =
+            std::pin::pin!(with_driver_state(&mut el, || conn.forward_to_splice(&sinkfd, 50)));
+        let _ = with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            fut.as_mut().poll(&mut cx)
+        });
+
+        let stale = UserData::encode(OpTag::SpliceIn, conn_index, generation.wrapping_add(1));
+        el.test_dispatch_cqe(stale.raw(), 25, 0);
+        assert_eq!(
+            el.driver.splice_forward[conn_index as usize]
+                .as_ref()
+                .unwrap()
+                .in_pipe,
+            0,
+            "a stale splice CQE must not advance the live forward"
+        );
+    }
+
+    /// Teardown with bytes still in the pipe closes it instead of pooling it —
+    /// a leaked byte would prepend itself to the next borrower's stream.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn splice_forward_teardown_discards_a_loaded_pipe() {
+        use std::os::fd::AsFd;
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let idle_before = el.driver.pipe_pool.idle_len();
+        let (sink, _peer) = make_socketpair();
+        let sinkfd = crate::runtime::io::SinkFd::socket(sink.as_fd());
+        let conn = ConnCtx::new(conn_index, generation);
+        let waker = noop_waker();
+        let mut fut =
+            std::pin::pin!(with_driver_state(&mut el, || conn.forward_to_splice(&sinkfd, 500)));
+        let _ = with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            fut.as_mut().poll(&mut cx)
+        });
+        let ud_in = UserData::encode(OpTag::SpliceIn, conn_index, generation);
+        el.test_dispatch_cqe(ud_in.raw(), 64, 0);
+
+        el.driver.close_connection(conn_index);
+        assert!(el.driver.splice_forward[conn_index as usize].is_none());
+        assert_eq!(
+            el.driver.pipe_pool.idle_len(),
+            idle_before,
+            "a pipe still holding bytes is closed, not returned"
+        );
+    }
 
     /// (a) Forward a held buffer to a socket sink: the first poll pops the
     /// buffer, submits a write, and parks with the bid held; the write CQE
