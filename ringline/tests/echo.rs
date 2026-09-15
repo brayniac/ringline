@@ -6746,6 +6746,13 @@ static SPLICE_SINK_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI
 static SPLICE_FORWARD_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 #[cfg(has_io_uring)]
 static SPLICE_FORWARDED: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
+/// Set once the handler has called `forward_to_splice`, so the client does not
+/// write before the forward owns the socket. `forward_to_splice` forwards what
+/// arrives from then on; bytes sent earlier would sit in the connection's
+/// buffers and take the Mode A fallback instead, which is a different path
+/// than the one under test.
+#[cfg(has_io_uring)]
+static SPLICE_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(has_io_uring)]
 struct SpliceProxy;
@@ -6764,7 +6771,9 @@ impl AsyncEventHandler for SpliceProxy {
             // the server shuts down.
             let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
             let sink = ringline::SinkFd::socket(borrowed);
-            match conn.forward_to_splice(&sink, len).await {
+            let fut = conn.forward_to_splice(&sink, len);
+            SPLICE_ARMED.store(true, Ordering::SeqCst);
+            match fut.await {
                 Ok(n) => SPLICE_FORWARDED.store(n as i64, Ordering::SeqCst),
                 Err(e) => {
                     eprintln!("splice forward failed: {e}");
@@ -6796,6 +6805,7 @@ fn splice_forward_proxies_bytes_end_to_end() {
     SPLICE_SINK_FD.store(sink.as_raw_fd(), Ordering::SeqCst);
     SPLICE_FORWARD_LEN.store(LEN, Ordering::SeqCst);
     SPLICE_FORWARDED.store(-1, Ordering::SeqCst);
+    SPLICE_ARMED.store(false, Ordering::SeqCst);
 
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
@@ -6809,8 +6819,23 @@ fn splice_forward_proxies_bytes_end_to_end() {
         let addr = addr.clone();
         let payload = payload.clone();
         move || {
+            use std::sync::atomic::Ordering;
             let mut s = TcpStream::connect(&addr).unwrap();
             s.set_nodelay(true).unwrap();
+            // Wait until the handler has the forward established. Writing
+            // first would leave the opening bytes in the connection's buffers,
+            // which sends the call down the Mode A fallback — a different path
+            // than this test is for.
+            for _ in 0..500 {
+                if SPLICE_ARMED.load(Ordering::SeqCst) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                SPLICE_ARMED.load(Ordering::SeqCst),
+                "handler never armed the splice forward"
+            );
             // Chunked with gaps so the source goes empty mid-forward and the
             // socket -> pipe leg has to park on POLLIN and resume.
             for chunk in payload.chunks(17_000) {
