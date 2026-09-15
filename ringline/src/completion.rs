@@ -87,6 +87,13 @@ pub enum OpTag {
     /// PollAdd for POLLOUT after a forward write to a socket sink returned
     /// `-EAGAIN`. Payload = the connection generation at submit time.
     ForwardWritePollOut = 30,
+    /// `IORING_OP_SPLICE` moving bytes from the connection into the forward's
+    /// borrowed pipe (`forward_to_splice`). Payload = the connection
+    /// generation at submit time.
+    SpliceIn = 31,
+    /// `IORING_OP_SPLICE` moving bytes from the pipe out to the sink. Payload =
+    /// the connection generation at submit time.
+    SpliceOut = 32,
 }
 
 impl OpTag {
@@ -123,6 +130,8 @@ impl OpTag {
             28 => Some(OpTag::RecvFallback),
             29 => Some(OpTag::ForwardWrite),
             30 => Some(OpTag::ForwardWritePollOut),
+            31 => Some(OpTag::SpliceIn),
+            32 => Some(OpTag::SpliceOut),
             _ => None,
         }
     }

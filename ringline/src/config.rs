@@ -137,6 +137,19 @@ pub struct Config {
     ///
     /// **Default: 64** (2× `MAX_IOVECS`, the per-`sendmsg` iovec bound).
     pub(crate) forward_hold_cap: usize,
+    /// Per-worker pipe pairs available to `forward_to_splice`.
+    ///
+    /// A splice forward borrows one pipe pair for its duration. A pair costs
+    /// two descriptors and a kernel pipe buffer (64 KiB by default), so this
+    /// bounds what a worker full of proxying connections can pin — the
+    /// unpooled shape collapses at high connection counts.
+    ///
+    /// When the pool is empty a splice forward **falls back to the Mode A
+    /// `forward_to` path** rather than failing, so raising this is a
+    /// throughput knob, never a correctness one.
+    ///
+    /// **Default: 16.**
+    pub(crate) splice_pipes: usize,
     /// Bound on the per-worker accept channel. If a worker can't drain its
     /// queue fast enough, the acceptor will skip past it (and possibly
     /// close the incoming fd if every worker is full) rather than
@@ -341,6 +354,7 @@ impl Default for Config {
             recv_accumulator_max: 1024 * 1024 * 1024,
             recv_segment_reserve: 64,
             forward_hold_cap: 64,
+            splice_pipes: 16,
             accept_queue_capacity: 1024,
             conn_chunk_size: 1,
             send_copy_count: 1024,
@@ -834,6 +848,19 @@ impl ConfigBuilder {
     /// Default: 64 (2× `MAX_IOVECS`).
     pub fn forward_hold_cap(mut self, cap: usize) -> Self {
         self.config.forward_hold_cap = cap;
+        self
+    }
+
+    /// Set the per-worker pipe-pair pool available to `forward_to_splice`.
+    ///
+    /// Each in-flight splice forward borrows one pair (two descriptors plus a
+    /// kernel pipe buffer). When the pool is empty, splice forwards fall back
+    /// to the Mode A `forward_to` path, so this trades descriptors for how many
+    /// forwards per worker get the splice data path — never correctness.
+    ///
+    /// Default: 16.
+    pub fn splice_pipes(mut self, pipes: usize) -> Self {
+        self.config.splice_pipes = pipes;
         self
     }
 

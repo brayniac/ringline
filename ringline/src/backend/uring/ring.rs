@@ -431,6 +431,49 @@ impl Ring {
         Ok(())
     }
 
+    /// Submit the socket -> pipe leg of a splice forward.
+    ///
+    /// `SPLICE_F_NONBLOCK` so a full pipe reports `-EAGAIN` rather than parking
+    /// a kernel worker; `off_in`/`off_out` are `-1` because neither end is
+    /// seekable here (the source is a socket, the destination a pipe).
+    pub fn submit_splice_in(
+        &mut self,
+        conn_fd: RawFd,
+        pipe_w: RawFd,
+        len: u32,
+        user_data: UserData,
+    ) -> io::Result<()> {
+        let entry = opcode::Splice::new(Fd(conn_fd), -1, Fd(pipe_w), -1, len)
+            .flags((libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK) as u32)
+            .build()
+            .user_data(user_data.raw());
+        unsafe { self.push_sqe(&entry) }
+    }
+
+    /// Submit the pipe -> sink leg of a splice forward.
+    ///
+    /// `offset` is the file offset for a seekable sink, or `None` for a socket
+    /// (passed as `-1`). `len` must not exceed what the pipe actually holds, or
+    /// the operation blocks waiting for bytes that are not coming.
+    pub fn submit_splice_out(
+        &mut self,
+        pipe_r: RawFd,
+        sink_fd: RawFd,
+        len: u32,
+        offset: Option<u64>,
+        user_data: UserData,
+    ) -> io::Result<()> {
+        let off_out = match offset {
+            Some(o) => o as i64,
+            None => -1,
+        };
+        let entry = opcode::Splice::new(Fd(pipe_r), -1, Fd(sink_fd), off_out, len)
+            .flags((libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK) as u32)
+            .build()
+            .user_data(user_data.raw());
+        unsafe { self.push_sqe(&entry) }
+    }
+
     /// Submit a segmented-recv Mode A forward write to a **buffered file** sink
     /// at an explicit offset (`pwrite` semantics). A short write is resubmitted
     /// at the advanced offset by the completion handler.
