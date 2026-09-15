@@ -9,6 +9,17 @@ use std::net::SocketAddr;
 
 use clap::Parser;
 
+/// Which ringline echo strategy `bench-server` drives.
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum EchoMode {
+    /// `run_direct_echo` — submit the echo from the CQE handler.
+    Direct,
+    /// `with_data` + `forward_recv_buf`.
+    Forward,
+    /// `enable_recv_forward` + `forward_held`.
+    RecvForward,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum Runtime {
     Ringline,
@@ -37,11 +48,24 @@ struct Args {
     #[arg(long, default_value_t = 4096)]
     msg_size: usize,
 
-    /// (ringline only) Echo via the multi-buffer zero-copy recv-forward path
-    /// (`enable_recv_forward` + `forward_held`): held provided recv buffers are
-    /// scatter-gathered into one `sendmsg` with no accumulator copy.
+    /// (ringline only) Echo via the multi-buffer zero-copy recv-forward path.
+    /// Equivalent to `--echo-mode recv-forward`; kept because the campaign
+    /// specs pass it.
     #[arg(long, default_value_t = false)]
     recv_forward: bool,
+
+    /// (ringline only) Which echo strategy the handler uses. These are three
+    /// genuinely different runtime paths, and which one a measurement
+    /// exercises has been easy to get wrong:
+    ///
+    /// - `direct` (default): `run_direct_echo`, echo submitted straight from
+    ///   the CQE handler with no task wakeup. io_uring only.
+    /// - `forward`: `with_data` + `forward_recv_buf` — the ordinary
+    ///   parse-then-forward loop a protocol server would write.
+    /// - `recv-forward`: `enable_recv_forward` + `forward_held`. A byte pipe;
+    ///   `with_data`/`with_bytes` observe nothing while it is on.
+    #[arg(long, value_enum, default_value_t = EchoMode::Direct)]
+    echo_mode: EchoMode,
 
     /// (ringline only) Connections assigned to each worker before moving to the next.
     /// 1 = classic round-robin. Higher values pack connections onto fewer workers
@@ -141,7 +165,11 @@ fn main() {
             args.addr,
             workers,
             args.msg_size,
-            args.recv_forward,
+            if args.recv_forward {
+                EchoMode::RecvForward
+            } else {
+                args.echo_mode
+            },
             args.conn_chunk_size,
             pin_to_core,
         ),
@@ -154,14 +182,12 @@ fn run_ringline(
     addr: SocketAddr,
     workers: usize,
     msg_size: usize,
-    recv_forward: bool,
+    echo_mode: EchoMode,
     conn_chunk_size: usize,
     pin_to_core: bool,
 ) {
-    use ringline::{AsyncEventHandler, ConnCtx, RinglineBuilder};
-    // ParseResult is only needed in the non-io_uring fallback path.
-    #[cfg(not(has_io_uring))]
     use ringline::ParseResult;
+    use ringline::{AsyncEventHandler, ConnCtx, RinglineBuilder};
 
     // Direct-echo path (default): no task wakeup per message — echo SQEs are
     // submitted directly from handle_recv_multi, bypassing collect_wakeups and
@@ -179,24 +205,40 @@ fn run_ringline(
                     conn.run_direct_echo().await;
                 }
                 #[cfg(not(has_io_uring))]
-                loop {
-                    let n = conn
-                        .with_data(|data| {
-                            if let Err(e) = conn.forward_recv_buf(data) {
-                                eprintln!("echo: forward_recv_buf failed: {e}");
-                                return ParseResult::NeedMore;
-                            }
-                            ParseResult::Consumed(data.len())
-                        })
-                        .await;
-                    if n == 0 {
-                        break;
-                    }
-                }
+                forward_echo_loop(conn).await;
             }
         }
         fn create_for_worker(_id: usize) -> Self {
             EchoHandler
+        }
+    }
+
+    /// `with_data` + `forward_recv_buf` — what a protocol server's read loop
+    /// looks like, and the only mode available on the mio backend.
+    async fn forward_echo_loop(conn: ConnCtx) {
+        loop {
+            let n = conn
+                .with_data(|data| {
+                    if let Err(e) = conn.forward_recv_buf(data) {
+                        eprintln!("echo: forward_recv_buf failed: {e}");
+                        return ParseResult::NeedMore;
+                    }
+                    ParseResult::Consumed(data.len())
+                })
+                .await;
+            if n == 0 {
+                break;
+            }
+        }
+    }
+
+    struct ForwardEchoHandler;
+    impl AsyncEventHandler for ForwardEchoHandler {
+        fn on_accept(&self, conn: ConnCtx) -> impl std::future::Future<Output = ()> + 'static {
+            async move { forward_echo_loop(conn).await }
+        }
+        fn create_for_worker(_id: usize) -> Self {
+            ForwardEchoHandler
         }
     }
 
@@ -238,14 +280,27 @@ fn run_ringline(
         .expect("valid config");
 
     let builder = RinglineBuilder::new(config).bind(addr);
-    let (shutdown, handles) = if recv_forward {
-        builder.launch::<RecvForwardEchoHandler>()
-    } else {
-        builder.launch::<EchoHandler>()
+    let (shutdown, handles) = match echo_mode {
+        EchoMode::RecvForward => builder.launch::<RecvForwardEchoHandler>(),
+        EchoMode::Forward => builder.launch::<ForwardEchoHandler>(),
+        EchoMode::Direct => builder.launch::<EchoHandler>(),
     }
     .expect("failed to launch ringline server");
 
-    eprintln!("bench-server: ready (recv_forward={recv_forward})");
+    let mode = match echo_mode {
+        EchoMode::Direct => "direct",
+        EchoMode::Forward => "forward",
+        EchoMode::RecvForward => "recv-forward",
+    };
+    // Say which path is live: on a non-io_uring build `direct` silently means
+    // the forward loop, and a run that reported the wrong path is how #397
+    // ended up with the wrong root cause.
+    let effective = if cfg!(has_io_uring) {
+        mode
+    } else {
+        "forward (no io_uring)"
+    };
+    eprintln!("bench-server: ready (echo_mode={mode}, effective={effective})");
 
     // Block until SIGINT/SIGTERM, then trigger graceful shutdown so each
     // worker's event loop runs its shutdown path — including the
