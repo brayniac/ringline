@@ -175,9 +175,12 @@ size rather than as an absolute segment count:
 The three are indistinguishable at every size up to 4 KiB and separate only at
 16 KiB, where io_uring emits **35% more packets** than recv-forward for the same
 work (5,183 bytes per transmit packet against 7,002 and 7,645) — the same size
-at which a message stops arriving in one recv completion. The copy above
-accounts for the throughput and CPU gap but not for this packet-rate gap, which
-is unexplained and untraced.
+at which a message stops arriving in one recv completion.
+
+An earlier version of this section said the copy accounted for the throughput
+and CPU gap but not this packet-rate gap. It accounts for that too: removing
+the copy moves transmit packets per operation from 6.24 to 4.62 at 512
+connections, against recv-forward's 4.54.
 
 Tracked as **#397**. Until it is fixed, `--recv-forward` (or the mio backend) is
 the faster choice for large-message byte-pipe workloads.
