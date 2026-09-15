@@ -19,6 +19,13 @@ path = "src/bin/server.rs"
 name = "bench-client"
 path = "src/bin/client.rs"
 
+# Mirrors ringline's own feature so `build.rs` sees CARGO_FEATURE_FORCE_MIO.
+# Building the mio arm as `--features ringline/force-mio` alone would leave
+# this crate's has_io_uring set while the runtime dropped it, and the
+# `#[cfg(has_io_uring)]` calls here would not compile.
+[features]
+force-mio = ["ringline/force-mio"]
+
 [lints.rust.unexpected_cfgs]
 level = "warn"
 check-cfg = ["cfg(has_io_uring)"]
