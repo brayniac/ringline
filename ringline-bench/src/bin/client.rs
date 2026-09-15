@@ -101,6 +101,12 @@ struct ClientReport {
     duration_secs: u64,
     ops_per_sec: f64,
     total_ops: u64,
+    /// Arithmetic mean, for the closed-loop Little's law gate. Reported here
+    /// and not only in `LatencyStats`, because this flat struct -- not
+    /// `BenchResult` -- is what the client actually serializes. #404 added the
+    /// field to `LatencyStats` alone, so it never reached a results file and
+    /// the gate silently passed every arm.
+    mean_ns: u64,
     p50_ns: u64,
     p90_ns: u64,
     p99_ns: u64,
@@ -177,6 +183,7 @@ fn main() {
         duration_secs: args.duration,
         ops_per_sec: result.ops_per_sec,
         total_ops: result.total_ops,
+        mean_ns: result.latency.mean_ns,
         p50_ns: result.latency.p50_ns,
         p90_ns: result.latency.p90_ns,
         p99_ns: result.latency.p99_ns,
@@ -191,8 +198,9 @@ fn main() {
 
     // Human-readable summary to stderr.
     eprintln!(
-        "bench-client: {:.0} ops/s, p50={:.1}us p99={:.1}us p999={:.1}us ({} samples)",
+        "bench-client: {:.0} ops/s, mean={:.1}us p50={:.1}us p99={:.1}us p999={:.1}us ({} samples)",
         report.ops_per_sec,
+        report.mean_ns as f64 / 1000.0,
         report.p50_ns as f64 / 1000.0,
         report.p99_ns as f64 / 1000.0,
         report.p999_ns as f64 / 1000.0,
