@@ -1399,9 +1399,16 @@ impl ConnCtx {
     ///
     /// Falls back to [`forward_to`](Self::forward_to) — same semantics, same
     /// result, more per-operation work — when the pipe pool is empty, when the
-    /// connection is TLS, or when the accumulator still holds bytes (those
-    /// precede anything splice would move, and reordering them would corrupt
-    /// the stream). Splice is an optimisation, never a failure mode.
+    /// connection is TLS, or when bytes are already buffered for this
+    /// connection. Splice is an optimisation, never a failure mode.
+    ///
+    /// # Drain first
+    ///
+    /// Like [`forward_to`](Self::forward_to), this forwards what arrives from
+    /// *now on*. Call it with the connection's buffers drained — the usual
+    /// proxy shape, where `with_data` consumes the parsed prefix and reports
+    /// it consumed, then the remainder is forwarded. Bytes still buffered at
+    /// the call take the Mode A fallback rather than being skipped.
     #[cfg(has_io_uring)]
     pub fn forward_to_splice<'a>(&self, sink: &'a SinkFd<'a>, len: usize) -> SpliceForward<'a> {
         let reserved = with_state(|driver, _| {
@@ -1412,7 +1419,14 @@ impl ConnCtx {
                 .tls_table
                 .as_ref()
                 .is_some_and(|t| t.has(self.conn_index));
-            if is_tls || !driver.accumulators.is_empty(self.conn_index) {
+            // Bytes already received precede anything splice would move, and
+            // splice starts from the socket — so anything buffered here would
+            // be silently skipped. Both holds have to be empty, not just the
+            // accumulator: the zero-copy single-buffer hold is where a small
+            // arrival usually sits.
+            let buffered = !driver.accumulators.is_empty(self.conn_index)
+                || driver.pending_recv_bufs[self.conn_index as usize].is_some();
+            if is_tls || buffered {
                 return false;
             }
             driver.begin_splice_forward(self.conn_index, sink.fd, sink.is_file, len as u64)
