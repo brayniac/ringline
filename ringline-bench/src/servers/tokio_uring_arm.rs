@@ -46,6 +46,11 @@ pub fn run(addr: SocketAddr, workers: usize, msg_size: usize, pin_to_core: bool)
                         Ok(c) => c,
                         Err(_) => continue,
                     };
+                    // The epoll arms get this from tokio's set_nodelay. Without
+                    // it this arm measured 219 ops/s against the others' ~130k
+                    // -- about 36ms per operation, which is the delayed-ACK
+                    // timer, not the runtime.
+                    set_nodelay(&stream);
                     tokio_uring::spawn(echo(stream, msg_size));
                 }
             });
@@ -59,6 +64,22 @@ pub fn run(addr: SocketAddr, workers: usize, msg_size: usize, pin_to_core: bool)
     eprintln!("bench-server: ready (tokio-uring per-core x{workers})");
     for h in handles {
         h.join().ok();
+    }
+}
+
+/// `TCP_NODELAY` on an accepted stream, by raw fd: `tokio-uring`'s `TcpStream`
+/// does not expose a setter for it.
+fn set_nodelay(stream: &tokio_uring::net::TcpStream) {
+    use std::os::fd::AsRawFd;
+    let on: libc::c_int = 1;
+    unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_NODELAY,
+            &on as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
     }
 }
 
