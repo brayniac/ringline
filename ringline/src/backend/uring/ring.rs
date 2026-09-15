@@ -438,12 +438,15 @@ impl Ring {
     /// seekable here (the source is a socket, the destination a pipe).
     pub fn submit_splice_in(
         &mut self,
-        conn_fd: RawFd,
+        conn_index: u32,
         pipe_w: RawFd,
         len: u32,
         user_data: UserData,
     ) -> io::Result<()> {
-        let entry = opcode::Splice::new(Fd(conn_fd), -1, Fd(pipe_w), -1, len)
+        // The connection side is a registered file (every ringline connection
+        // is); the pipe is not. `Splice` takes each end independently, so the
+        // pair can mix fixed and raw descriptors.
+        let entry = opcode::Splice::new(Fixed(conn_index), -1, Fd(pipe_w), -1, len)
             .flags((libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK) as u32)
             .build()
             .user_data(user_data.raw());
