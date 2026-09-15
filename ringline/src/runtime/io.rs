@@ -3903,31 +3903,10 @@ impl Future for DirectEchoFuture {
                 // Drain any buffer that arrived before the flag was set.
                 // After this, all new bufs are echoed directly by handle_recv_multi.
                 if let Some(pending) = driver.pending_recv_bufs[self.conn_index as usize].take() {
-                    assert!(
-                        pending.len <= 0xFFFF,
-                        "DirectEchoFuture: data length {} exceeds 16-bit payload capacity",
-                        pending.len,
-                    );
-                    let payload = (pending.bid as u32) | (pending.len << 16);
-                    let ud = UserData::encode(OpTag::SendRecvBuf, self.conn_index, payload);
-                    let entry = io_uring::opcode::Send::new(
-                        io_uring::types::Fixed(self.conn_index),
-                        pending.ptr,
-                        pending.len,
-                    )
-                    .flags(crate::completion::STREAM_SEND_FLAGS)
-                    .build()
-                    .user_data(ud.raw());
-                    let built = crate::handler::BuiltSend {
-                        entry,
-                        pool_slot: u16::MAX,
-                        slab_idx: u16::MAX,
-                        total_len: pending.len,
-                    };
-                    driver.send_recv_buf_original_lens[self.conn_index as usize] = pending.len;
-                    // Infallible: a parked entry keeps its bid like a queued
-                    // one; the completion replenishes it.
-                    driver.submit_or_queue_send(self.conn_index, built);
+                    // Staged like any other direct-echo arrival; the event
+                    // loop's flush pass submits it before the next blocking
+                    // wait, gathered with anything that landed alongside it.
+                    driver.hold_direct_echo(self.conn_index, pending);
                 }
             }
 
