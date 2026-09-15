@@ -5858,8 +5858,9 @@ fn forward_echo_message_larger_than_buffer() {
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
 
-    // Buffer is 4KB but message is 8KB — forces accumulator fallback
-    // (forward_recv_buf falls back to send_nowait when data is from accumulator).
+    // Buffer is 4KB but message is 8KB — forces the accumulator path, where
+    // forward_recv_buf detaches the accumulator and sends it under a guard
+    // rather than copying it into the send pool (#397).
     let (shutdown, handles) = RinglineBuilder::new(test_config())
         .bind(addr.parse().unwrap())
         .launch::<ForwardEcho>()
@@ -5871,6 +5872,66 @@ fn forward_echo_message_larger_than_buffer() {
     let response = echo_round_trip(&addr, &msg);
     assert_eq!(response, msg);
 
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
+#[test]
+fn forward_echo_chunked_message_then_more_traffic() {
+    // The accumulator-backed forward detaches the accumulator instead of
+    // copying it (#397), so the delivery path must advance by what the closure
+    // consumed *minus* what the forward already removed. Get that wrong in
+    // either direction and this test fails rather than merely running slower:
+    // over-advancing panics or drops bytes, under-advancing re-forwards them
+    // and corrupts every message after the first.
+    //
+    // The first message is written in chunks with gaps so it lands across
+    // several recv completions (the accumulator path). The two that follow
+    // then have to arrive intact on the same connection.
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
+        .bind(addr.parse().unwrap())
+        .launch::<ForwardEcho>()
+        .expect("launch failed");
+
+    wait_for_server(&addr);
+
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream.set_nodelay(true).unwrap();
+
+    let first: Vec<u8> = (0..24576).map(|i| (i % 251) as u8).collect();
+    for chunk in first.chunks(3000) {
+        stream.write_all(chunk).unwrap();
+        stream.flush().unwrap();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let mut echoed = vec![0u8; first.len()];
+    stream.read_exact(&mut echoed).unwrap();
+    assert_eq!(echoed, first, "chunked message came back altered");
+
+    // Anything still mis-accounted in the accumulator shows up here.
+    for round in 0..2u8 {
+        let msg: Vec<u8> = (0..4096)
+            .map(|i| ((i + round as usize) % 251) as u8)
+            .collect();
+        stream.write_all(&msg).unwrap();
+        stream.flush().unwrap();
+        let mut back = vec![0u8; msg.len()];
+        stream.read_exact(&mut back).unwrap();
+        assert_eq!(
+            back, msg,
+            "message {round} after a chunked forward came back altered"
+        );
+    }
+
+    drop(stream);
     shutdown.shutdown();
     for h in handles {
         h.join().unwrap().unwrap();

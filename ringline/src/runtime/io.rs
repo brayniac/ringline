@@ -780,6 +780,40 @@ pub struct ConnCtx {
     pub(crate) _not_send: PhantomData<*const ()>,
 }
 
+/// Bytes a zero-copy `forward_recv_buf` detached from the accumulator during
+/// the closure that just ran, cleared as it is read.
+///
+/// The forward already removed them, so the delivery path must advance by what
+/// the closure reported consuming *minus* this. Read it unconditionally after
+/// every closure call, including the ones that report consuming nothing, or a
+/// stale count would shorten a later consume.
+#[cfg(has_io_uring)]
+#[inline]
+fn take_forward_zc_consumed(driver: &mut crate::backend::Driver, conn_index: u32) -> usize {
+    std::mem::replace(&mut driver.forward_zc_consumed[conn_index as usize], 0) as usize
+}
+
+/// Zero-copy send guard over a detached slice of a connection's receive
+/// accumulator.
+///
+/// `forward_recv_buf` uses this when the bytes it was handed are
+/// accumulator-backed rather than a single kernel buffer. Holding the `Bytes`
+/// keeps the allocation alive until the kernel posts the ZC notification, so
+/// the message reaches the wire without being copied into a send-pool slot.
+/// The memory is a plain heap allocation, not a registered region.
+#[cfg(has_io_uring)]
+struct AccumulatorGuard(bytes::Bytes);
+
+#[cfg(has_io_uring)]
+impl crate::guard::SendGuard for AccumulatorGuard {
+    fn as_ptr_len(&self) -> (*const u8, u32) {
+        (self.0.as_ptr(), self.0.len() as u32)
+    }
+    fn region(&self) -> crate::buffer::fixed::RegionId {
+        crate::buffer::fixed::RegionId::UNREGISTERED
+    }
+}
+
 impl ConnCtx {
     /// Create a new ConnCtx for the given connection.
     pub(crate) fn new(conn_index: u32, generation: u32) -> Self {
@@ -1163,8 +1197,14 @@ impl ConnCtx {
                 return None;
             }
             let result = f(data);
+            #[cfg(has_io_uring)]
+            let forwarded = take_forward_zc_consumed(driver, self.conn_index);
+            #[cfg(not(has_io_uring))]
+            let forwarded = 0usize;
             if let ParseResult::Consumed(consumed) = result {
-                driver.accumulators.consume(self.conn_index, consumed);
+                driver
+                    .accumulators
+                    .consume(self.conn_index, consumed.saturating_sub(forwarded));
             }
             Some(result)
         })
@@ -1262,6 +1302,43 @@ impl ConnCtx {
 
                     // Pointer mismatch �� put it back and fall through to copy path.
                     driver.pending_recv_bufs[conn_index as usize] = Some(pending);
+                }
+            }
+
+            // The bytes are accumulator-backed: either they arrived across
+            // several recv completions, or a previous parse left a remainder.
+            // Copying the whole message into a send-pool slot is what made
+            // ringline lose to its own mio fallback at 16 KiB (#397) — 93.9%
+            // of forwards took this path, averaging 15 KB copied per
+            // operation. Detach the accumulator instead (O(1) freeze) and send
+            // it under a guard, so the message reaches the wire uncopied.
+            //
+            // Only when the forward covers the whole accumulator: then the
+            // detach is a single `take_frozen` with no remainder to put back,
+            // and "forwarded" and "consumed" cannot disagree about which bytes
+            // went out. Anything else keeps the copy path.
+            #[cfg(has_io_uring)]
+            {
+                let whole = {
+                    let acc = driver.accumulators.data(conn_index);
+                    !acc.is_empty()
+                        && acc.len() == data.len()
+                        && std::ptr::eq(acc.as_ptr(), data.as_ptr())
+                };
+                if whole {
+                    let frozen = driver.accumulators.take_frozen(conn_index);
+                    debug_assert_eq!(frozen.len(), data.len());
+                    // The delivery future must not also advance past these
+                    // bytes — they are no longer in the accumulator.
+                    driver.forward_zc_consumed[conn_index as usize] = frozen.len() as u32;
+                    let token = self.token();
+                    let mut ctx = driver.make_ctx();
+                    // `guard()` honours `send_zc_threshold`, so a forward below
+                    // it still folds into a copy exactly as before.
+                    return ctx
+                        .send_parts(token)
+                        .guard(crate::guard::GuardBox::new(AccumulatorGuard(frozen)))
+                        .submit();
                 }
             }
 
@@ -2259,9 +2336,15 @@ impl<F: FnMut(&[u8]) -> ParseResult + Unpin> Future for WithDataFuture<F> {
             // Data available — call closure immediately (zero-overhead hot path).
             let f = self.f.as_mut().expect("WithDataFuture polled after Ready");
             let result = f(data);
+            #[cfg(has_io_uring)]
+            let forwarded = take_forward_zc_consumed(driver, self.conn_index);
+            #[cfg(not(has_io_uring))]
+            let forwarded = 0usize;
             match result {
                 ParseResult::Consumed(consumed) if consumed > 0 => {
-                    driver.accumulators.consume(self.conn_index, consumed);
+                    driver
+                        .accumulators
+                        .consume(self.conn_index, consumed.saturating_sub(forwarded));
                     self.f.take();
                     return Poll::Ready(consumed);
                 }

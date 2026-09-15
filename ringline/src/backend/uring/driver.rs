@@ -224,6 +224,12 @@ pub(crate) struct Driver {
     pub(crate) recv_hold: Vec<std::collections::VecDeque<PendingRecvBuf>>,
     /// Per-connection opt-in flag for the zero-copy recv-forward path.
     pub(crate) recv_forward: Vec<bool>,
+    /// Bytes already detached from the accumulator by a zero-copy
+    /// `forward_recv_buf` during the current `with_data` / `with_bytes`
+    /// closure. The delivery future subtracts this from what the closure
+    /// reports consuming, because the forward already removed those bytes
+    /// (see `ConnCtx::forward_recv_buf`).
+    pub(crate) forward_zc_consumed: Vec<u32>,
     /// Per-connection recv delivery domain (segmented-recv). `CopyOrConsume`
     /// (default) uses the accumulator / single-buffer zero-copy path;
     /// `Segmented` holds arriving provided buffers in `segment_hold` instead.
@@ -652,6 +658,7 @@ impl Driver {
                 .map(|_| std::collections::VecDeque::new())
                 .collect(),
             recv_forward: vec![false; config.max_connections as usize],
+            forward_zc_consumed: vec![0; config.max_connections as usize],
             recv_domain: vec![
                 crate::recv::domain::RecvDomain::default();
                 config.max_connections as usize
@@ -1069,6 +1076,7 @@ impl Driver {
             }
             self.recv_forward[conn_index as usize] = false;
         }
+        self.forward_zc_consumed[conn_index as usize] = 0;
         // Do NOT drain held segmented-recv buffers here. When a peer FIN drives
         // this close, a parked Mode B reader must still consume the bytes already
         // held — draining them now (before the woken reader is polled) would
