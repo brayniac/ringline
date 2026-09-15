@@ -948,10 +948,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     #[cfg(target_os = "linux")]
     fn handle_splice_in(&mut self, ud: UserData, result: i32) {
         let conn_index = ud.conn_index();
-        eprintln!(
-            "SPLICEDIAG IN cqe result={result} live={}",
-            self.splice_live(conn_index, ud)
-        );
         if !self.splice_live(conn_index, ud) {
             return;
         }
@@ -996,10 +992,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     #[cfg(target_os = "linux")]
     fn handle_splice_out(&mut self, ud: UserData, result: i32) {
         let conn_index = ud.conn_index();
-        eprintln!(
-            "SPLICEDIAG OUT cqe result={result} live={}",
-            self.splice_live(conn_index, ud)
-        );
         if !self.splice_live(conn_index, ud) {
             return;
         }
