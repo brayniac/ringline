@@ -474,6 +474,27 @@ impl Ring {
         unsafe { self.push_sqe(&entry) }
     }
 
+    /// Arm a `POLLIN` on the connection for a splice forward whose
+    /// socket -> pipe leg returned `-EAGAIN`. A splice forward has no multishot
+    /// recv running (it is cancelled for the forward's duration so the kernel
+    /// socket buffer is splice's to move), so this poll is the only thing that
+    /// can say "there is data now".
+    pub fn submit_splice_poll_in(&mut self, conn_index: u32, user_data: UserData) -> io::Result<()> {
+        let entry = opcode::PollAdd::new(Fixed(conn_index), libc::POLLIN as u32)
+            .build()
+            .user_data(user_data.raw());
+        unsafe { self.push_sqe(&entry) }
+    }
+
+    /// Arm a `POLLOUT` on the sink for a splice forward whose pipe -> sink leg
+    /// returned `-EAGAIN`.
+    pub fn submit_splice_poll_out(&mut self, sink_fd: RawFd, user_data: UserData) -> io::Result<()> {
+        let entry = opcode::PollAdd::new(Fd(sink_fd), libc::POLLOUT as u32)
+            .build()
+            .user_data(user_data.raw());
+        unsafe { self.push_sqe(&entry) }
+    }
+
     /// Submit a segmented-recv Mode A forward write to a **buffered file** sink
     /// at an explicit offset (`pwrite` semantics). A short write is resubmitted
     /// at the advanced offset by the completion handler.

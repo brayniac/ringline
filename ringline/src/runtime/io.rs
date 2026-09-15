@@ -1370,6 +1370,68 @@ impl ConnCtx {
         }
     }
 
+
+    /// Forward the next `len` received bytes to `sink` with `splice(2)`, so the
+    /// bytes move between descriptors inside the kernel and never enter user
+    /// space **or the provided-buffer ring** (#407).
+    ///
+    /// This is the proxy path. Unlike [`forward_to`](Self::forward_to) it holds
+    /// no buffers, consumes no bids, and is not protected by the low-water
+    /// reserve, because the shared ring is not involved at all. What it costs
+    /// instead is a pipe pair from the per-worker pool
+    /// (`ConfigBuilder::splice_pipes`).
+    ///
+    /// The connection's multishot recv is cancelled for the forward's duration
+    /// and re-armed when it resolves: splice moves the kernel socket buffer
+    /// directly, so nothing else may be reading it.
+    ///
+    /// Resolves to `Ok(bytes_forwarded)`; a value `< len` means the peer sent
+    /// FIN first, exactly as `forward_to` reports truncation.
+    ///
+    /// # When this is the wrong tool
+    ///
+    /// Spliced bytes are never visible to the handler — no parsing, no TLS
+    /// termination, no inspection. It is for relaying an opaque remainder after
+    /// a parsed prefix (`CONNECT` tunnels, TLS passthrough, TCP-mode load
+    /// balancing). Below roughly 16 KiB per message it is also a pessimisation:
+    /// it adds syscalls to save copies that were not costing anything.
+    ///
+    /// # Fallback
+    ///
+    /// Falls back to [`forward_to`](Self::forward_to) — same semantics, same
+    /// result, more per-operation work — when the pipe pool is empty, when the
+    /// connection is TLS, or when the accumulator still holds bytes (those
+    /// precede anything splice would move, and reordering them would corrupt
+    /// the stream). Splice is an optimisation, never a failure mode.
+    #[cfg(has_io_uring)]
+    pub fn forward_to_splice<'a>(&self, sink: &'a SinkFd<'a>, len: usize) -> SpliceForward<'a> {
+        let reserved = with_state(|driver, _| {
+            let ci = self.conn_index as usize;
+            if driver.connections.generation(self.conn_index) != self.generation {
+                return false;
+            }
+            let is_tls = driver
+                .tls_table
+                .as_ref()
+                .is_some_and(|t| t.has(self.conn_index));
+            if is_tls || !driver.accumulators.is_empty(self.conn_index) {
+                return false;
+            }
+            driver.begin_splice_forward(self.conn_index, sink.fd, sink.is_file, len as u64)
+        });
+
+        if !reserved {
+            return SpliceForward::Fallback(self.forward_to(sink, len));
+        }
+        SpliceForward::Splice(SpliceForwardFuture {
+            conn_index: self.conn_index,
+            generation: self.generation,
+            disarm_sent: false,
+            submitted: false,
+            _sink: PhantomData,
+        })
+    }
+
     /// Enable the zero-copy recv-forward path for this connection.
     ///
     /// Once enabled, incoming provided recv buffers are *held in place* (not
@@ -3061,6 +3123,108 @@ impl<'a> SinkFd<'a> {
 /// that forwards `len` received bytes to the sink, one serialized write at a
 /// time. Borrows the [`SinkFd`] (`'a`) so the sink descriptor stays open for the
 /// whole forward.
+#[cfg(has_io_uring)]
+
+/// Future returned by [`ConnCtx::forward_to_splice`].
+///
+/// Either the splice path or, when splice does not apply, the Mode A
+/// [`forward_to`](ConnCtx::forward_to) future — the caller sees one type and
+/// the same result either way.
+#[cfg(has_io_uring)]
+pub enum SpliceForward<'a> {
+    Splice(SpliceForwardFuture<'a>),
+    Fallback(ForwardToFuture<'a>),
+}
+
+#[cfg(has_io_uring)]
+impl Future for SpliceForward<'_> {
+    type Output = io::Result<usize>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // Safety: neither variant is structurally pinned beyond what its own
+        // poll requires; both are Unpin in practice (no self-references).
+        match self.get_mut() {
+            SpliceForward::Splice(f) => Pin::new(f).poll(cx),
+            SpliceForward::Fallback(f) => Pin::new(f).poll(cx),
+        }
+    }
+}
+
+/// Drives one splice forward: cancel the connection's multishot recv, run the
+/// socket -> pipe -> sink legs from the completion handlers, then re-arm.
+///
+/// The future itself only parks: the driver advances the legs, so a forward of
+/// many chunks wakes the task once at the end rather than once per chunk.
+#[cfg(has_io_uring)]
+pub struct SpliceForwardFuture<'a> {
+    conn_index: u32,
+    generation: u32,
+    /// Cancel submitted for the connection's multishot recv.
+    disarm_sent: bool,
+    /// First splice leg submitted (only after the recv has finished cancelling).
+    submitted: bool,
+    _sink: PhantomData<&'a SinkFd<'a>>,
+}
+
+#[cfg(has_io_uring)]
+impl Future for SpliceForwardFuture<'_> {
+    type Output = io::Result<usize>;
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let me = self.get_mut();
+        with_state(|driver, executor| {
+            let conn = me.conn_index;
+            let ci = conn as usize;
+
+            // Slot closed or reused: teardown already returned the pipe.
+            if driver.connections.generation(conn) != me.generation {
+                return Poll::Ready(Ok(0));
+            }
+
+            // Terminal result recorded by the driver.
+            if let Some(res) = driver.splice_done[ci].take() {
+                driver.rearm_after_splice(conn);
+                return match res {
+                    Ok(n) => Poll::Ready(Ok(n as usize)),
+                    Err(errno) => Poll::Ready(Err(io::Error::from_raw_os_error(errno))),
+                };
+            }
+
+            if !me.submitted {
+                let armed = driver
+                    .connections
+                    .get(conn)
+                    .is_some_and(|c| c.recv_multishot_armed);
+                if armed {
+                    if !me.disarm_sent {
+                        // Cancel by the RecvMulti user_data, not the fd: it
+                        // targets the request and is immune to reordering. The
+                        // armed flag clears when the ECANCELED CQE lands, which
+                        // is what gates the first splice.
+                        let recv_ud = crate::completion::UserData::encode(
+                            crate::completion::OpTag::RecvMulti,
+                            conn,
+                            driver.connections.generation(conn),
+                        );
+                        let _ = driver.ring.submit_async_cancel(recv_ud.raw(), conn);
+                        me.disarm_sent = true;
+                    }
+                    executor.owner_task[ci] = Some(CURRENT_TASK_ID.with(|c| c.get()));
+                    executor.recv_waiters[ci] = true;
+                    return Poll::Pending;
+                }
+                // Recv is quiet; the socket buffer is splice's now.
+                me.submitted = true;
+                driver.advance_splice(conn);
+            }
+
+            executor.owner_task[ci] = Some(CURRENT_TASK_ID.with(|c| c.get()));
+            executor.recv_waiters[ci] = true;
+            Poll::Pending
+        })
+    }
+}
+
 #[cfg(has_io_uring)]
 pub struct ForwardToFuture<'a> {
     conn_index: u32,

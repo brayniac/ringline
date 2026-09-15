@@ -135,6 +135,41 @@ pub(crate) enum HeldRecvBuf {
 /// backing (a pinned provided-buffer bid or an owned copy) is kept alive here
 /// until the write CQE arrives (SQE memory must outlive the op), then released
 /// exactly once by `handle_forward_write`.
+/// In-flight state for a `forward_to_splice` forward (#407).
+///
+/// Unlike [`ForwardWriteState`] there is no backing buffer to own: the bytes
+/// live in the borrowed pipe between the two legs and never enter user space.
+/// What has to be tracked instead is how many of them are *resident in the
+/// pipe*, because the pipe is the only place partial state can sit, and it
+/// must drain completely before the next chunk is spliced in or the stream
+/// reorders.
+#[cfg(target_os = "linux")]
+pub(crate) struct SpliceForwardState {
+    /// The borrowed pipe pair. Returned to the pool when empty, closed when
+    /// torn down with bytes still in it.
+    pub(crate) pipe: crate::buffer::pipe_pool::PipePair,
+    /// Sink fd, borrowed for the forward's lifetime via `SinkFd`.
+    pub(crate) sink_fd: RawFd,
+    /// Seekable sink: `off_out` advances with `forwarded`.
+    pub(crate) is_file: bool,
+    /// Connection generation at start; every CQE carries it so a completion
+    /// that outlived the slot is ignored.
+    pub(crate) generation: u32,
+    /// Total bytes the caller asked to forward.
+    pub(crate) len: u64,
+    /// Bytes fully written to the sink.
+    pub(crate) forwarded: u64,
+    /// Bytes spliced into the pipe but not yet out of it.
+    pub(crate) in_pipe: u32,
+    /// Peer sent FIN: stop splicing in, drain what the pipe still holds.
+    pub(crate) eof: bool,
+}
+
+/// Bytes moved per splice leg. The kernel pipe buffer defaults to 64 KiB and
+/// splice stops at capacity, so asking for more buys nothing.
+#[cfg(target_os = "linux")]
+pub(crate) const SPLICE_CHUNK: u32 = 64 * 1024;
+
 pub(crate) struct ForwardWriteState {
     /// Where the bytes being written live. `Pinned` releases its bid on
     /// completion; `Owned` just drops its heap bytes.
@@ -263,6 +298,17 @@ pub(crate) struct Driver {
     /// enforces the one-write-in-flight invariant and keeps the write's backing
     /// alive until its CQE. `close_connection` drains it (releasing a pinned
     /// bid); the write CQE clears it on completion.
+    /// Per-connection splice forward state (`forward_to_splice`). `Some` while
+    /// a splice forward is running on that connection.
+    #[cfg(target_os = "linux")]
+    pub(crate) splice_forward: Vec<Option<SpliceForwardState>>,
+    /// Terminal result of a splice forward, set once by the driver and consumed
+    /// by the `SpliceForwardFuture`: `Ok(bytes)` or `Err(errno)`.
+    #[cfg(target_os = "linux")]
+    pub(crate) splice_done: Vec<Option<Result<u64, i32>>>,
+    /// Per-worker pipe pairs backing splice forwards.
+    #[cfg(target_os = "linux")]
+    pub(crate) pipe_pool: crate::buffer::pipe_pool::PipePool,
     pub(crate) forward_write: Vec<Option<ForwardWriteState>>,
     /// Per-connection completed-forward-write result, produced by
     /// `handle_forward_write` and consumed by the `ForwardToFuture`: `Ok(n)` =
@@ -678,6 +724,12 @@ impl Driver {
                 .map(|_| std::collections::VecDeque::new())
                 .collect(),
             segment_pinned: vec![None; config.max_connections as usize],
+            #[cfg(target_os = "linux")]
+            splice_forward: (0..config.max_connections).map(|_| None).collect(),
+            #[cfg(target_os = "linux")]
+            splice_done: vec![None; config.max_connections as usize],
+            #[cfg(target_os = "linux")]
+            pipe_pool: crate::buffer::pipe_pool::PipePool::new(config.splice_pipes),
             forward_write: (0..config.max_connections).map(|_| None).collect(),
             forward_done: (0..config.max_connections).map(|_| None).collect(),
             forward_recv_active: vec![false; config.max_connections as usize],
@@ -1012,6 +1064,151 @@ impl Driver {
     /// On submission failure the backing is released here (a pinned bid returns
     /// to the ring) and the error is propagated — the forward future surfaces it
     /// to the caller.
+    /// Reserve a pipe and record the forward's state, without submitting
+    /// anything yet. Returns `false` when no pipe is available, which is a
+    /// normal state: the caller falls back to the Mode A `forward_to` path
+    /// rather than failing (see `docs/splice-forward-design.md`).
+    ///
+    /// Submission waits for [`advance_splice`](Self::advance_splice), which the
+    /// future calls once the connection's multishot recv has finished
+    /// cancelling — splice moves the kernel socket buffer directly, so a recv
+    /// still running would steal bytes from the middle of the stream.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn begin_splice_forward(
+        &mut self,
+        conn_index: u32,
+        sink_fd: RawFd,
+        is_file: bool,
+        len: u64,
+    ) -> bool {
+        let ci = conn_index as usize;
+        debug_assert!(self.splice_forward[ci].is_none());
+        let Some(pipe) = self.pipe_pool.acquire() else {
+            return false;
+        };
+        self.splice_forward[ci] = Some(SpliceForwardState {
+            pipe,
+            sink_fd,
+            is_file,
+            generation: self.connections.generation(conn_index),
+            len,
+            forwarded: 0,
+            in_pipe: 0,
+            eof: false,
+        });
+        true
+    }
+
+    /// Submit the next leg of a splice forward.
+    ///
+    /// Drain before fill: while the pipe holds bytes they go out to the sink,
+    /// and only an empty pipe takes more in. Doing it the other way would let a
+    /// second chunk stack behind a partially drained first one, and the stream
+    /// would reorder.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn advance_splice(&mut self, conn_index: u32) {
+        use crate::completion::{OpTag, UserData};
+        let ci = conn_index as usize;
+        let Some(st) = self.splice_forward[ci].as_ref() else {
+            return;
+        };
+        let (pipe, sink_fd, is_file, gen, in_pipe, forwarded, len, eof) = (
+            st.pipe, st.sink_fd, st.is_file, st.generation, st.in_pipe, st.forwarded, st.len, st.eof,
+        );
+
+        if in_pipe > 0 {
+            let ud = UserData::encode(OpTag::SpliceOut, conn_index, gen);
+            let off = if is_file { Some(forwarded) } else { None };
+            if self
+                .ring
+                .submit_splice_out(pipe.read, sink_fd, in_pipe, off, ud)
+                .is_err()
+            {
+                self.fail_splice(conn_index, libc::EAGAIN);
+            }
+            return;
+        }
+
+        // Pipe empty. If the peer is done, so are we.
+        if eof || forwarded >= len {
+            self.finish_splice(conn_index);
+            return;
+        }
+
+        let want = (len - forwarded).min(SPLICE_CHUNK as u64) as u32;
+        let ud = UserData::encode(OpTag::SpliceIn, conn_index, gen);
+        if self
+            .ring
+            .submit_splice_in(conn_index, pipe.write, want, ud)
+            .is_err()
+        {
+            self.fail_splice(conn_index, libc::EAGAIN);
+        }
+    }
+
+    /// Settle a splice forward that ran to completion (or to EOF) and hand the
+    /// byte count to the waiting future.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn finish_splice(&mut self, conn_index: u32) {
+        let ci = conn_index as usize;
+        let Some(st) = self.splice_forward[ci].take() else {
+            return;
+        };
+        self.return_pipe(st.pipe, st.in_pipe);
+        self.splice_done[ci] = Some(Ok(st.forwarded));
+    }
+
+    /// Settle a splice forward that failed.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn fail_splice(&mut self, conn_index: u32, errno: i32) {
+        let ci = conn_index as usize;
+        let Some(st) = self.splice_forward[ci].take() else {
+            return;
+        };
+        self.return_pipe(st.pipe, st.in_pipe);
+        self.splice_done[ci] = Some(Err(errno));
+    }
+
+    /// Put the connection back on multishot recv after a splice forward.
+    ///
+    /// Only for a connection that is still open and still in multishot mode:
+    /// a forward that ended because the peer sent FIN, or because the slot was
+    /// torn down, has nothing to re-arm.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn rearm_after_splice(&mut self, conn_index: u32) {
+        let open = self.connections.get(conn_index).is_some_and(|c| {
+            matches!(c.lifecycle, Lifecycle::Open)
+                && matches!(c.recv_arm, RecvArm::Multi)
+                && !c.recv_multishot_armed
+        });
+        if !open {
+            return;
+        }
+        let generation = self.connections.generation(conn_index);
+        if self
+            .ring
+            .submit_multishot_recv(conn_index, generation)
+            .is_err()
+        {
+            metrics::RING.increment(metrics::ring::RECV_ARM_FAILURES);
+            self.close_connection(conn_index);
+        } else if let Some(cs) = self.connections.get_mut(conn_index) {
+            cs.recv_multishot_armed = true;
+        }
+    }
+
+    /// A pipe with bytes still in it is closed, not pooled: draining it would
+    /// cost a syscall on the teardown path, and a leaked byte would prepend
+    /// itself to whatever the next borrower forwards.
+    #[cfg(target_os = "linux")]
+    fn return_pipe(&mut self, pipe: crate::buffer::pipe_pool::PipePair, in_pipe: u32) {
+        if in_pipe == 0 {
+            self.pipe_pool.release(pipe);
+        } else {
+            self.pipe_pool.discard(pipe);
+        }
+    }
+
     pub(crate) fn start_forward_write(
         &mut self,
         conn_index: u32,
@@ -1088,6 +1285,14 @@ impl Driver {
             self.pending_replenish.push(pending.bid);
         }
         self.forward_zc_consumed[conn_index as usize] = 0;
+        // A splice forward in flight loses its pipe here. Its CQEs will still
+        // arrive and are dropped by the generation check in `splice_live`; the
+        // pipe cannot wait for them, because the slot is about to be reused.
+        #[cfg(target_os = "linux")]
+        if let Some(st) = self.splice_forward[conn_index as usize].take() {
+            self.return_pipe(st.pipe, st.in_pipe);
+            self.splice_done[conn_index as usize] = Some(Ok(st.forwarded));
+        }
         self.recv_forward[conn_index as usize] = false;
         // Do NOT drain held segmented-recv buffers here. When a peer FIN drives
         // this close, a parked Mode B reader must still consume the bytes already

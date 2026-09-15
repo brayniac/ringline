@@ -931,6 +931,128 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         !self.driver.accumulators.data(conn_index).is_empty()
     }
 
+    // ── Splice forward (#407) ──────────────────────────────────────
+
+    /// Is this CQE still for the forward that submitted it?
+    ///
+    /// Slots recycle; a splice CQE that outlived its connection must touch
+    /// nothing, and its pipe was already returned by the teardown path.
+    #[cfg(target_os = "linux")]
+    fn splice_live(&self, conn_index: u32, ud: UserData) -> bool {
+        self.driver.splice_forward[conn_index as usize]
+            .as_ref()
+            .is_some_and(|st| st.generation == ud.payload())
+    }
+
+    /// socket -> pipe leg completed.
+    #[cfg(target_os = "linux")]
+    fn handle_splice_in(&mut self, ud: UserData, result: i32) {
+        let conn_index = ud.conn_index();
+        if !self.splice_live(conn_index, ud) {
+            return;
+        }
+        let ci = conn_index as usize;
+        if result > 0 {
+            if let Some(st) = self.driver.splice_forward[ci].as_mut() {
+                st.in_pipe = result as u32;
+            }
+            self.driver.advance_splice(conn_index);
+            return;
+        }
+        if result == 0 {
+            // EOF, exactly as `read` reports it. Whatever is already in the
+            // pipe still belongs to the stream, so drain before resolving.
+            if let Some(st) = self.driver.splice_forward[ci].as_mut() {
+                st.eof = true;
+            }
+            self.driver.advance_splice(conn_index);
+            return;
+        }
+        let errno = -result;
+        if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
+            // No multishot recv runs during a splice forward, so this poll is
+            // the only thing that can say "there is data now".
+            let poll_ud = UserData::encode(OpTag::SplicePollIn, conn_index, ud.payload());
+            if self
+                .driver
+                .ring
+                .submit_splice_poll_in(conn_index, poll_ud)
+                .is_err()
+            {
+                self.driver.fail_splice(conn_index, libc::EAGAIN);
+                self.executor.wake_recv(conn_index);
+            }
+            return;
+        }
+        self.driver.fail_splice(conn_index, errno);
+        self.executor.wake_recv(conn_index);
+    }
+
+    /// pipe -> sink leg completed.
+    #[cfg(target_os = "linux")]
+    fn handle_splice_out(&mut self, ud: UserData, result: i32) {
+        let conn_index = ud.conn_index();
+        if !self.splice_live(conn_index, ud) {
+            return;
+        }
+        let ci = conn_index as usize;
+        if result > 0 {
+            let done = {
+                let st = self.driver.splice_forward[ci].as_mut().expect("live");
+                st.in_pipe -= (result as u32).min(st.in_pipe);
+                st.forwarded += result as u64;
+                st.in_pipe == 0 && (st.eof || st.forwarded >= st.len)
+            };
+            if done {
+                self.driver.finish_splice(conn_index);
+                self.executor.wake_recv(conn_index);
+            } else {
+                self.driver.advance_splice(conn_index);
+            }
+            return;
+        }
+        // A zero-length splice out with bytes still in the pipe means the sink
+        // is gone; there is no progress to be made by retrying.
+        let errno = if result == 0 { libc::EPIPE } else { -result };
+        if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
+            let sink = self.driver.splice_forward[ci]
+                .as_ref()
+                .map(|st| st.sink_fd)
+                .expect("live");
+            let poll_ud = UserData::encode(OpTag::SplicePollOut, conn_index, ud.payload());
+            if self
+                .driver
+                .ring
+                .submit_splice_poll_out(sink, poll_ud)
+                .is_err()
+            {
+                self.driver.fail_splice(conn_index, libc::EAGAIN);
+                self.executor.wake_recv(conn_index);
+            }
+            return;
+        }
+        self.driver.fail_splice(conn_index, errno);
+        self.executor.wake_recv(conn_index);
+    }
+
+    /// A `POLLIN`/`POLLOUT` armed for a blocked splice leg fired: retry it.
+    ///
+    /// Which leg blocked does not need remembering — `advance_splice`
+    /// re-derives it from whether the pipe currently holds bytes.
+    #[cfg(target_os = "linux")]
+    fn handle_splice_poll(&mut self, ud: UserData, result: i32) {
+        let conn_index = ud.conn_index();
+        if !self.splice_live(conn_index, ud) {
+            return;
+        }
+        if result < 0 {
+            self.driver.fail_splice(conn_index, -result);
+            self.executor.wake_recv(conn_index);
+            return;
+        }
+        self.driver.advance_splice(conn_index);
+    }
+
     /// Completion of a fallback one-shot recv (`OpTag::RecvFallback`).
     ///
     /// The payload carries the fallback pool slot; the recorded
@@ -1099,6 +1221,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
             OpTag::ForwardWrite => self.handle_forward_write(ud, result),
             OpTag::ForwardWritePollOut => self.handle_forward_write_pollout(ud, result),
+            #[cfg(target_os = "linux")]
+            OpTag::SpliceIn => self.handle_splice_in(ud, result),
+            #[cfg(target_os = "linux")]
+            OpTag::SpliceOut => self.handle_splice_out(ud, result),
+            #[cfg(target_os = "linux")]
+            OpTag::SplicePollIn | OpTag::SplicePollOut => self.handle_splice_poll(ud, result),
             #[cfg(feature = "timestamps")]
             OpTag::RecvMsgMultiTs => self.handle_recv_msg_multi_ts(ud, result, flags),
         }
