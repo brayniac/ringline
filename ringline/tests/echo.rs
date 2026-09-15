@@ -6753,6 +6753,12 @@ static SPLICE_FORWARDED: std::sync::atomic::AtomicI64 = std::sync::atomic::Atomi
 /// than the one under test.
 #[cfg(has_io_uring)]
 static SPLICE_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// `wait_for_server` opens a probe connection, and its handler would reserve a
+/// pipe and arm a forward that never carries data — and would set
+/// `SPLICE_ARMED` before the connection under test even exists. The handler
+/// ignores connections until the test turns this on.
+#[cfg(has_io_uring)]
+static SPLICE_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(has_io_uring)]
 struct SpliceProxy;
@@ -6762,6 +6768,9 @@ impl AsyncEventHandler for SpliceProxy {
     fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
         async move {
             use std::sync::atomic::Ordering;
+            if !SPLICE_ENABLED.load(Ordering::SeqCst) {
+                return;
+            }
             let fd = SPLICE_SINK_FD.load(Ordering::SeqCst);
             let len = SPLICE_FORWARD_LEN.load(Ordering::SeqCst);
             if fd < 0 {
@@ -6806,6 +6815,7 @@ fn splice_forward_proxies_bytes_end_to_end() {
     SPLICE_FORWARD_LEN.store(LEN, Ordering::SeqCst);
     SPLICE_FORWARDED.store(-1, Ordering::SeqCst);
     SPLICE_ARMED.store(false, Ordering::SeqCst);
+    SPLICE_ENABLED.store(false, Ordering::SeqCst);
 
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
@@ -6814,6 +6824,10 @@ fn splice_forward_proxies_bytes_end_to_end() {
         .launch::<SpliceProxy>()
         .expect("launch failed");
     wait_for_server(&addr);
+    // The probe connection above has been accepted and ignored; from here on
+    // the handler forwards.
+    std::thread::sleep(Duration::from_millis(100));
+    SPLICE_ENABLED.store(true, Ordering::SeqCst);
 
     let writer = std::thread::spawn({
         let addr = addr.clone();
