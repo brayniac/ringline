@@ -31,6 +31,7 @@ impl LatencyHistogram {
         let n = self.samples.len();
         if n == 0 {
             return LatencyStats {
+                mean_ns: 0,
                 p50_ns: 0,
                 p90_ns: 0,
                 p99_ns: 0,
@@ -41,6 +42,11 @@ impl LatencyHistogram {
             };
         }
         LatencyStats {
+            // Little's law is stated in the mean, not the median: a closed-loop
+            // arm is only measuring what it claims to if
+            // `connections == throughput * mean latency`. Checking it against
+            // p50 passes arms whose tail has quietly taken over.
+            mean_ns: (self.samples.iter().map(|&s| s as u128).sum::<u128>() / n as u128) as u64,
             p50_ns: self.samples[n * 50 / 100],
             p90_ns: self.samples[n * 90 / 100],
             p99_ns: self.samples[n * 99 / 100],
@@ -54,6 +60,8 @@ impl LatencyHistogram {
 
 #[derive(Clone, Serialize)]
 pub struct LatencyStats {
+    /// Arithmetic mean, for the closed-loop Little's law check.
+    pub mean_ns: u64,
     pub p50_ns: u64,
     pub p90_ns: u64,
     pub p99_ns: u64,
