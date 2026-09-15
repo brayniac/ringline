@@ -1112,12 +1112,19 @@ impl Driver {
         let Some(st) = self.splice_forward[ci].as_ref() else {
             return;
         };
-        let (pipe, sink_fd, is_file, gen, in_pipe, forwarded, len, eof) = (
-            st.pipe, st.sink_fd, st.is_file, st.generation, st.in_pipe, st.forwarded, st.len, st.eof,
+        let (pipe, sink_fd, is_file, generation, in_pipe, forwarded, len, eof) = (
+            st.pipe,
+            st.sink_fd,
+            st.is_file,
+            st.generation,
+            st.in_pipe,
+            st.forwarded,
+            st.len,
+            st.eof,
         );
 
         if in_pipe > 0 {
-            let ud = UserData::encode(OpTag::SpliceOut, conn_index, gen);
+            let ud = UserData::encode(OpTag::SpliceOut, conn_index, generation);
             let off = if is_file { Some(forwarded) } else { None };
             if self
                 .ring
@@ -1136,7 +1143,7 @@ impl Driver {
         }
 
         let want = (len - forwarded).min(SPLICE_CHUNK as u64) as u32;
-        let ud = UserData::encode(OpTag::SpliceIn, conn_index, gen);
+        let ud = UserData::encode(OpTag::SpliceIn, conn_index, generation);
         if self
             .ring
             .submit_splice_in(conn_index, pipe.write, want, ud)

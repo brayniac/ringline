@@ -479,7 +479,11 @@ impl Ring {
     /// recv running (it is cancelled for the forward's duration so the kernel
     /// socket buffer is splice's to move), so this poll is the only thing that
     /// can say "there is data now".
-    pub fn submit_splice_poll_in(&mut self, conn_index: u32, user_data: UserData) -> io::Result<()> {
+    pub fn submit_splice_poll_in(
+        &mut self,
+        conn_index: u32,
+        user_data: UserData,
+    ) -> io::Result<()> {
         let entry = opcode::PollAdd::new(Fixed(conn_index), libc::POLLIN as u32)
             .build()
             .user_data(user_data.raw());
@@ -488,7 +492,11 @@ impl Ring {
 
     /// Arm a `POLLOUT` on the sink for a splice forward whose pipe -> sink leg
     /// returned `-EAGAIN`.
-    pub fn submit_splice_poll_out(&mut self, sink_fd: RawFd, user_data: UserData) -> io::Result<()> {
+    pub fn submit_splice_poll_out(
+        &mut self,
+        sink_fd: RawFd,
+        user_data: UserData,
+    ) -> io::Result<()> {
         let entry = opcode::PollAdd::new(Fd(sink_fd), libc::POLLOUT as u32)
             .build()
             .user_data(user_data.raw());
