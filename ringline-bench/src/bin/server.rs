@@ -9,6 +9,17 @@ use std::net::SocketAddr;
 
 use clap::Parser;
 
+/// Which forwarding API the proxy mode drives. The two differ only in the
+/// call, which is the point: it isolates the forward path from everything else
+/// in the measurement.
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum ForwardMode {
+    /// `forward_to` — Mode A, provided buffers held and written to the sink.
+    ModeA,
+    /// `forward_to_splice` — socket -> pipe -> sink, no provided-buffer ring.
+    Splice,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum TokioScheduler {
     MultiThread,
@@ -96,6 +107,17 @@ struct Args {
     /// to ringline's recv-forward byte pipe. Linux only.
     #[arg(long, value_enum, default_value_t = TokioEcho::Copy)]
     tokio_echo: TokioEcho,
+
+    /// (ringline, io_uring only) Run as a one-way proxy to this backend
+    /// instead of echoing: every accepted connection is forwarded to a fresh
+    /// connection to `--proxy-backend`. This is what `forward_to` is for, and
+    /// the only shape that exercises it.
+    #[arg(long)]
+    proxy_backend: Option<SocketAddr>,
+
+    /// (ringline, io_uring only) Which forwarding API `--proxy-backend` uses.
+    #[arg(long, value_enum, default_value_t = ForwardMode::ModeA)]
+    forward_mode: ForwardMode,
 
     /// (ringline only) Connections assigned to each worker before moving to the next.
     /// 1 = classic round-robin. Higher values pack connections onto fewer workers
@@ -192,6 +214,15 @@ fn main() {
     );
 
     match args.runtime {
+        Runtime::Ringline if args.proxy_backend.is_some() => run_ringline_proxy(
+            args.addr,
+            workers,
+            args.msg_size,
+            args.proxy_backend.expect("checked"),
+            args.forward_mode,
+            args.conn_chunk_size,
+            pin_to_core,
+        ),
         Runtime::Ringline => run_ringline(
             args.addr,
             workers,
@@ -236,6 +267,113 @@ fn run_tokio_uring(_addr: SocketAddr, _workers: usize, _msg_size: usize, _pin_to
         "bench-server: --runtime tokio-uring needs a Linux build with \
          --features tokio-uring-arm"
     );
+    std::process::exit(2);
+}
+
+/// One-way proxy: forward every accepted connection's stream to a fresh
+/// connection to `backend`, using whichever forwarding API `mode` names.
+///
+/// io_uring only, because `forward_to` and `forward_to_splice` are (#410).
+#[cfg(has_io_uring)]
+#[allow(clippy::manual_async_fn)]
+fn run_ringline_proxy(
+    addr: SocketAddr,
+    workers: usize,
+    msg_size: usize,
+    backend: SocketAddr,
+    mode: ForwardMode,
+    conn_chunk_size: usize,
+    pin_to_core: bool,
+) {
+    use ringline::{AsyncEventHandler, ConnCtx, RinglineBuilder, SinkFd};
+    use std::os::fd::AsFd;
+
+    /// Forward for the life of the connection: the caller asks for a byte
+    /// count, and a proxy does not know one, so ask for more than any run will
+    /// carry and let the peer's FIN end it (both APIs resolve short on FIN).
+    const UNTIL_EOF: usize = usize::MAX / 2;
+
+    static BACKEND: std::sync::OnceLock<SocketAddr> = std::sync::OnceLock::new();
+    static MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    let _ = BACKEND.set(backend);
+    MODE.store(
+        match mode {
+            ForwardMode::ModeA => 0,
+            ForwardMode::Splice => 1,
+        },
+        std::sync::atomic::Ordering::SeqCst,
+    );
+
+    struct ProxyHandler;
+    impl AsyncEventHandler for ProxyHandler {
+        fn on_accept(&self, conn: ConnCtx) -> impl std::future::Future<Output = ()> + 'static {
+            async move {
+                let addr = *BACKEND.get().expect("backend set before launch");
+                // Blocking connect, once per connection, before any traffic —
+                // the alternative is an outbound ringline connection whose fd
+                // cannot be named as a sink (#410).
+                let Ok(sink_sock) = std::net::TcpStream::connect(addr) else {
+                    eprintln!("proxy: backend connect failed");
+                    return;
+                };
+                sink_sock.set_nodelay(true).ok();
+                let sink = SinkFd::socket(sink_sock.as_fd());
+                let splice = MODE.load(std::sync::atomic::Ordering::SeqCst) == 1;
+                let res = if splice {
+                    conn.forward_to_splice(&sink, UNTIL_EOF).await
+                } else {
+                    conn.forward_to(&sink, UNTIL_EOF).await
+                };
+                if let Err(e) = res {
+                    eprintln!("proxy: forward failed: {e}");
+                }
+            }
+        }
+        fn create_for_worker(_id: usize) -> Self {
+            ProxyHandler
+        }
+    }
+
+    let config = ConfigBuilder::new()
+        .workers(workers)
+        .pin_to_core(pin_to_core)
+        .sq_entries(256)
+        .recv_buffer(256, msg_size.next_power_of_two().max(4096) as u32)
+        .max_connections(16384)
+        .send_pool(512, msg_size.next_power_of_two().max(4096) as u32)
+        .conn_chunk_size(conn_chunk_size)
+        .build()
+        .expect("valid config");
+
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind(addr)
+        .launch::<ProxyHandler>()
+        .expect("failed to launch ringline proxy");
+    eprintln!(
+        "bench-server: ready (proxy -> {backend}, forward_mode={})",
+        if mode == ForwardMode::Splice {
+            "splice"
+        } else {
+            "mode-a"
+        }
+    );
+    shutdown.wait_on_signal();
+    for h in handles {
+        h.join().ok();
+    }
+}
+
+#[cfg(not(has_io_uring))]
+fn run_ringline_proxy(
+    _addr: SocketAddr,
+    _workers: usize,
+    _msg_size: usize,
+    _backend: SocketAddr,
+    _mode: ForwardMode,
+    _conn_chunk_size: usize,
+    _pin_to_core: bool,
+) {
+    eprintln!("bench-server: --proxy-backend needs an io_uring build (see #410)");
     std::process::exit(2);
 }
 
