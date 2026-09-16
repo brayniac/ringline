@@ -83,12 +83,23 @@ behaviour; a socket sink passes `-1`.
 Both descriptors go through `impl UseFixed`, so the connection side uses the
 registered-file index it already has.
 
-### mio
+### mio: out of scope
 
-The same two `splice(2)` calls, issued from the readable/writable handlers with
-`SPLICE_F_NONBLOCK`, retried on `EAGAIN` via the existing interest machinery.
-No batching to be had here; the point is parity, so a `force-mio` build of a
-proxy keeps working rather than losing the API.
+An earlier version of this document argued for a mio `splice(2)` path "so a
+`force-mio` build of a proxy keeps working rather than losing the API". That
+premise was wrong: **mio has no proxy API to lose.** `forward_to` and `SinkFd`
+are both `#[cfg(has_io_uring)]`, so a `force-mio` build cannot proxy today with
+or without splice, and there is no regression to prevent.
+
+It would also break this design's central safety property. Pool exhaustion,
+TLS, and already-buffered data all fall back to Mode A — and on mio there is no
+Mode A to fall back to, so those cases would have to fail instead, making
+splice a failure mode rather than an optimisation.
+
+`forward_to_splice` therefore joins `forward_to` as io_uring-only. Giving mio a
+proxy path means first giving it a `forward_to` — its own buffering and
+write-readiness handling — which is a larger piece of work than the splice path
+and is tracked separately.
 
 ## Pipe pool
 
@@ -103,8 +114,7 @@ gets slower.
 
 ## Guards
 
-- Linux only (`has_io_uring` or the mio backend on Linux); elsewhere
-  `forward_to_splice` falls back to Mode A.
+- io_uring only, like `forward_to` itself.
 - TLS connections rejected with `InvalidInput`: splice would move ciphertext
   past the record layer.
 - `O_DIRECT` sinks rejected, as `forward_to` already does.
@@ -133,7 +143,7 @@ gets slower.
 - FIN mid-forward truncates and reports the short count.
 - pipe-pool exhaustion falls back to Mode A and still forwards correctly.
 - TLS connection is rejected rather than silently relaying ciphertext.
-- both backends.
+- io_uring only (see "mio: out of scope").
 
 ## Measurement
 
