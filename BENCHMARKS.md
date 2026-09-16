@@ -10,237 +10,220 @@ co-located.
 
 | | workload | rig | date / commit |
 |---|---|---|---|
-| [TCP echo](#tcp-echo-comparison-two-machine-x710-40g) | TCP echo, 4 message sizes x 4 connection counts | bare metal, Xeon, X710 40G LAG | Sept 2026, `afcccfb` (pre-0.7) |
+| [TCP echo](#tcp-echo-comparison-two-machine-x710-40g) | TCP echo, 9 configurations x 4 sizes x 4 connection counts | bare metal, Xeon, X710 40G LAG | Sept 2026, `a685e16` (pre-0.7) |
 | [Segcache](#segcache-cache-server-comparison-two-machine-aws-graviton4) | Segcache GET, read-heavy | AWS Graviton4 c8g | June 2026, `c77cfba` (0.1.3) |
 
-The echo run is the current one and the one to measure against; it also covers
-the io_uring-vs-mio backend comparison, which the segcache run does not. The
-segcache run is kept because it measures a realistic cache server rather than a
-byte pipe, and nothing has re-run it on the current release.
+### Read this first
+
+**Against a well-configured tokio, ringline is roughly 0–10% faster — not the
+27–71% this file used to lead with.** That larger number is real, but it is
+measured against tokio's *default* runtime, and an earlier version of this file
+quoted it while implying the stronger claim. Both figures are in the echo
+section, labelled.
+
+**Neither run measures a protocol server.** Echo is a byte pipe: no parsing, no
+response building, no application work. Segcache is the closer proxy and has
+not been re-run since June 2026. Any claim about ringline serving a real
+protocol rests on the segcache section, which is the older and thinner of the
+two.
 
 ---
 
 ## TCP echo comparison (two-machine, X710 40G)
 
-Four server configurations over the same closed-loop TCP echo workload:
+**Run:** September 2026, commit `a685e16`. 432 arms, 9 server configurations x
+4 connection counts x 4 message sizes x 3 repetitions.
 
-- **ringline io_uring** — the default production path.
-- **ringline io_uring + `--recv-forward`** — recv buffers forwarded straight to
-  the send path without passing through the accumulator. A byte-pipe mode, not
-  a general tuning knob (see the caveat below).
-- **ringline mio** — the epoll fallback backend, same binary, `force-mio`.
-- **tokio** — reference, same `bench-server` binary, bulk-echo loop.
+### "ringline" and "tokio" are each more than one thing
+
+The single most important thing this run established is that a two-bar chart
+of "ringline vs tokio" hides the answer. Both runtimes have several ways to
+serve this workload, they differ by more than the gap between the runtimes,
+and an earlier version of this file compared ringline's best against tokio's
+default without saying so.
+
+| config | what it is | can a protocol use it? |
+|---|---|---|
+| `uring` | `run_direct_echo` — echo submitted from the completion handler, no task wakeup | no, echo only |
+| `uring-fwd` | `with_data` + `forward_recv_buf` — the ordinary read loop | **yes, this is the general path** |
+| `rfwd` | `enable_recv_forward` + `forward_held` — byte pipe | no, proxy only |
+| `mio` | ringline's epoll fallback (always the forward loop) | yes |
+| `tokio` | multi-thread work-stealing, canonical echo loop | yes, **tokio's default** |
+| `tokio-pc` | one `current_thread` runtime per core + `SO_REUSEPORT` | yes |
+| `tokio-splice` | multi-thread, `splice(2)` socket → pipe → socket | no, byte pipe |
+| `tokio-pc-splice` | per-core + splice | no, byte pipe |
+| `tokio-uring` | tokio futures on `tokio-uring` (inherently per-core) | yes |
+
+`rfwd`, `tokio-splice` and `tokio-pc-splice` never let the handler see a byte —
+no parsing, no TLS, no inspection. They belong in a proxy comparison, not a
+server one.
 
 ### Test rig
 
 | Item | Value |
 |:-----|:------|
-| Server | bare metal, 24 vCPU Xeon |
-| Client | bare metal, 56 vCPU Xeon |
+| Server | bare metal, 24 vCPU Xeon (hv02 guest) |
+| Client | bare metal, 56 vCPU Xeon (hv01 guest) |
 | Network | 4x Intel X710 in a 40G LAG, direct-attached, no switch hop |
-| Guests | one ephemeral VM per host with all four PFs passed through |
 | Server workers | 8 |
-| Load | closed loop, `conns` connections, depth 1, 20 s steady window after warmup |
+| Client threads | 16 |
+| Load | closed loop, 20 s steady window after 5 s warmup |
 | Reps | 3 per cell; tables report the median |
 
 ### Validity gates
 
-Every one of the 192 arms was gated before it entered these tables:
+Every arm was gated on **Little's law** — `connections = throughput x mean
+latency` within 15% — plus a load floor and a funnel check on per-core CPU
+concentration.
 
-- **Little's law** — `connections = throughput x mean latency` within 15%. A
-  closed-loop arm that violates it is not measuring what it claims to.
-- **Load floor** — at least 1.2 server cores busy, so an arm is not reporting
-  client-side idle.
-- **Funnel** — the hottest core holds no more than 60% of total busy server CPU
-  when loaded, which catches the IRQ/flow-steering single-core funnel that has
-  masqueraded as a ringline regression before.
+**426 of 432 passed.** The six rejections are one cell in three reps for each
+of two configurations: `tokio` and `tokio-uring` at 2048 connections x 16 KiB,
+16–25% out. The same cell was the only rejection in the previous campaign, so
+that corner is systematically unmeasurable on this rig rather than noisy.
 
-CPU comes from rezolus `cpu_usage` (BPF-derived on-CPU nanoseconds, `user` +
-`system`), not from `/proc/stat` — see the caveat on iowait below.
+The gate is checked against the **mean**, not p50. A closed-loop arm whose tail
+has taken over still has a healthy median, and that is exactly the arm the gate
+exists to catch.
 
-**189 of 192 arms passed.** The three failures are the same cell in all three
-reps (tokio, 2048 connections, 16 KiB, Little's law 18% out), so that one cell is
-excluded rather than reported.
+### Headline: it depends entirely on which tokio you mean
 
-### Throughput — median ops/s, n=3
+**Against the best of the five tokio configurations**, ringline leads in 13 of
+16 cells, by roughly 0–10%:
 
-| conns | uring | recv-fwd | tokio | mio |
-|------:|------:|---------:|------:|----:|
-| **256 B** ||||
-| 1 | 6,632 | **6,741** | 6,064 | 5,940 |
-| 64 | 285,133 | **291,397** | 173,721 | 265,479 |
-| 512 | **621,570** | 602,873 | 431,515 | 450,541 |
-| 2048 | **531,199** | 507,381 | 420,798 | 437,845 |
-| **1 KiB** ||||
-| 64 | **273,884** | 272,464 | 170,598 | 250,618 |
-| 512 | **592,973** | 572,676 | 418,075 | 431,819 |
-| 2048 | **513,275** | 488,172 | 418,494 | 408,636 |
-| **4 KiB** ||||
-| 64 | **198,679** | 195,186 | 127,555 | 183,599 |
-| 512 | **322,848** | 314,260 | 238,755 | 260,061 |
-| 2048 | **300,284** | 289,419 | 234,501 | 232,425 |
-| **16 KiB** ||||
-| 64 | 118,395 | 145,213 | 89,028 | **152,303** |
-| 512 | 122,592 | **159,903** | 107,377 | 130,407 |
-| 2048 | 109,015 | **151,735** | — | 125,759 |
+| size | 1 conn | 64 | 512 | 2048 |
+|---|---|---|---|---|
+| 256 B | +4.5% | +1.5% | +4.7% | +3.5% |
+| 1 KiB | +5.2% | +2.3% | +5.7% | +6.1% |
+| 4 KiB | +5.7% | −0.1% | +5.1% | +5.7% |
+| 16 KiB | +1.5% | **−10.3%** | **−4.9%** | +8.9% |
 
-At 64 connections and above, ringline io_uring leads at 256 B through 4 KiB by
-**23–64%** over tokio and by **7–38%** over its own mio backend. At a single
-connection the four are within 9% of each other — nothing is saturated. At
-**16 KiB io_uring loses to both** mio and recv-forward; that is a known defect,
-not a property of the design (see *The 16 KiB regression* below).
+**Against tokio's default configuration** — the multi-thread work-stealing
+runtime, which is what a tokio service runs unless someone deliberately builds
+otherwise — the same data says:
 
-### Latency — median of 3, ms
+| size | 1 conn | 64 | 512 | 2048 |
+|---|---|---|---|---|
+| 256 B | +4% | +70% | +46% | +27% |
+| 4 KiB | +16% | +57% | +36% | +33% |
+| 16 KiB | +42% | +71% | +51% | — |
 
-| conns | | uring p50 | tokio p50 | uring p99 | tokio p99 |
-|------:|---|---:|---:|---:|---:|
-| **256 B** ||||||
-| 1 | | **0.146** | 0.166 | **0.214** | 0.217 |
-| 64 | | **0.212** | 0.365 | **0.415** | 0.627 |
-| 512 | | **0.814** | 1.132 | **1.221** | 2.538 |
-| 2048 | | 3.932 | **3.911** | **6.155** | 12.356 |
-| **4 KiB** ||||||
-| 64 | | **0.309** | 0.494 | **0.615** | 0.877 |
-| 512 | | **1.576** | 2.015 | **2.217** | 4.897 |
-| 2048 | | **7.157** | 7.395 | **9.861** | 20.633 |
+Both tables are true and they answer different questions. The first is "is
+ringline's architecture faster than tokio's"; the second is "will switching a
+default tokio service to ringline make it faster". **Quoting the second while
+implying the first is the mistake this file previously made.**
 
-The tail is where the gap is widest: at 512 connections ringline's p99 is **half**
-tokio's (1.22 ms vs 2.54 ms at 256 B, 2.22 ms vs 4.90 ms at 4 KiB), and at 2048
-connections tokio's p99 is 2x ringline's at both sizes even where the medians are
-level.
+### Where the difference actually comes from
 
-### CPU efficiency — 512 connections, ops per server core-second
+Most of it is the scheduler, not io_uring. Giving tokio thread-per-core
+(`tokio-pc`) recovers the bulk of the gap on its own:
 
-| size | uring | tokio | mio |
-|-----:|------:|------:|----:|
-| 256 B | **47,261** | 37,320 | 38,477 |
-| 1 KiB | **45,178** | 36,896 | 37,848 |
-| 4 KiB | **23,566** | 19,579 | 20,493 |
+| effect on tokio | 256 B / 64 conns | 4 KiB / 64 | 16 KiB / 64 |
+|---|---|---|---|
+| per-core scheduler | **+67.6%** | **+55.4%** | +24.0% |
+| splice data path | −8.5% | −0.9% | **+34.4%** |
+| both | +63.8% | +57.4% | **+90.7%** |
 
-The throughput lead is not bought with CPU: ringline is **20–27% more efficient
-per core** than tokio while serving **35–44% more operations** at the same
-connection count.
+The two effects are not separable — at 16 KiB/64 they are superadditive (+90.7%
+against +66.6% predicted from the parts), at 512 subadditive. A 2x2 was needed
+to see that; either change alone would have misattributed the gap.
 
-### Syscall amortization
+`tokio-uring` is the strongest tokio arm in 7 of 16 cells and comes within 4.7%
+of ringline at 256 B / 512 connections (591,854 against 619,863). Same
+interface, same per-core shape — it is the closest like-for-like comparison in
+the grid, and it says ringline's io_uring implementation is good rather than
+categorically ahead.
 
-Per-operation syscall counts at 512 connections and 256 B, from rezolus
-`syscall` — whose `op` label is a 16-way category, not a syscall name, so an
-`io_uring_enter` lands in `event`:
+### Mechanism — 512 connections, 256 B
 
-| | event | read | write | poll |
+| config | ops/s | ops/core-s | µs-CPU/op | syscalls/op |
 |---|---:|---:|---:|---:|
-| ringline io_uring | **0.032** | 0.005 | 0.001 | 0.001 |
-| ringline mio | 0.000 | 1.989 | 0.995 | 0.026 |
-| tokio | 0.000 | 1.041 | 1.040 | 0.010 |
+| uring-fwd | 619,863 | **47,728** | **20.95** | **0.06** |
+| uring | 606,096 | 47,032 | 21.26 | 0.06 |
+| rfwd | 594,712 | 46,582 | 21.47 | 0.07 |
+| tokio-uring | 591,854 | 45,030 | 22.21 | 0.11 |
+| tokio-pc | 536,651 | 41,923 | 23.85 | 2.05 |
+| tokio-pc-splice | 455,828 | 38,321 | 26.10 | 3.04 |
+| mio | 451,482 | 38,423 | 26.03 | 3.04 |
+| tokio | 425,486 | 37,262 | 26.84 | 2.08 |
+| tokio-splice | 361,576 | 32,915 | 30.38 | 3.16 |
 
-io_uring submits and reaps about **31 operations per syscall** and makes
-essentially no read/write calls at all. The two epoll runtimes pay per
-operation: tokio one read and one write, mio two reads — edge-triggered epoll
-has to read until `EAGAIN`, so the second read exists to see the empty socket.
+Two things worth reading off this:
 
-### The 16 KiB regression (issue #397)
+**Syscall count is not what separates the runtimes.** ringline's mio backend
+issues 3.04 syscalls per operation against tokio's 2.08 — *more* — and is
+faster. io_uring's 0.06 is a genuine ~35x amortization, but it buys about 20%
+CPU efficiency, not the 50%+ that separates the default configurations.
 
-At 16 KiB the best alternative configuration — mio at 64 connections,
-`--recv-forward` at 512 and 2048 — delivers **29–39% more throughput** than the
-default io_uring path.
+**splice costs syscalls to save copies**, which is only worth it when there are
+copies worth saving: it is the slowest arm here at 256 B and the fastest at
+16 KiB.
 
-Root cause, re-derived by instrumenting the path on the rig: **a lost
-zero-copy**. `forward_recv_buf` sends without copying only when the `with_data`
-slice is exactly the single buffer held in `pending_recv_bufs`, which holds one
-buffer. Multishot recv completes as soon as data is available rather than when
-a message is complete, so a 16 KiB request arrives in several partial
-completions; the second one finds the hold occupied, flushes it to the
-accumulator, and from there the pointer check fails and the whole message is
-copied into a send-pool slot. At 64 connections **93.9% of forwards are copy
-sends** averaging 15,261 bytes, against `--recv-forward`, which copies nothing
-and gathers 3.63 held buffers per `sendmsg`. That costs 27% more CPU per
-operation (91.9 µs against 72.4 µs).
+### 16 KiB: the one regime where ringline loses
 
-Both paths issue roughly one send per operation of ~15 KB, so this is not send
-fragmentation. It also explains why the effect is confined to 16 KiB: below
-that a message arrives in one completion, the pointer matches, and the send is
-zero-copy.
+At 16 KiB and moderate concurrency a zero-copy tokio beats every ringline
+configuration — `tokio-pc-splice` 165,699 against ringline's best 148,659 at 64
+connections. `splice(2)` moves bytes between descriptors without them entering
+user space at all, and no user-space runtime beats a kernel-side tee at
+forwarding bytes it never has to see.
 
-Server-side transmit packets per operation at 512 connections. The count
-includes pure ACKs, so read it as a comparison between configurations at a
-size rather than as an absolute segment count:
-
-| size | io_uring | recv-fwd | mio |
-|-----:|---------:|---------:|----:|
-| 256 B | 1.99 | 1.99 | 1.99 |
-| 1 KiB | 1.99 | 1.99 | 1.99 |
-| 4 KiB | 3.97 | 3.97 | 3.96 |
-| 16 KiB | **6.29** | 4.65 | 4.26 |
-
-The three are indistinguishable at every size up to 4 KiB and separate only at
-16 KiB, where io_uring emits **35% more packets** than recv-forward for the same
-work (5,183 bytes per transmit packet against 7,002 and 7,645) — the same size
-at which a message stops arriving in one recv completion.
-
-An earlier version of this section said the copy accounted for the throughput
-and CPU gap but not this packet-rate gap. It accounts for that too: removing
-the copy moves transmit packets per operation from 6.24 to 4.62 at 512
-connections, against recv-forward's 4.54.
-
-Tracked as **#397**. Until it is fixed, `--recv-forward` (or the mio backend) is
-the faster choice for large-message byte-pipe workloads.
-
-One caveat on what the io_uring arm measured. `ringline-bench` had no
-`build.rs`, so `has_io_uring` was never set for that crate and its
-`#[cfg(has_io_uring)]` blocks were dead: `bench-server --runtime ringline` ran
-the `with_data` + `forward_recv_buf` loop throughout this campaign, never
-`run_direct_echo`. #402 fixes the cfg. The ringline-vs-tokio-vs-mio comparison
-stands as measured — every arm ran the code it ran — but the io_uring arm
-exercised the forward path rather than the direct-echo path, and needs re-running
-before these numbers describe the default.
-
-### `--recv-forward` is a mode, not a tuning knob
-
-It wins at 16 KiB and is roughly neutral below it, which makes it look like a
-candidate for the default. It is not. While recv-forward is enabled,
-**`with_data` / `with_bytes` never observe the data** — buffers are held for
-forwarding and never reach the accumulator. It turns the connection into a byte
-pipe, so every handler that parses its input would break. Use it for echo and
-proxy workloads; the path to a competitive default at 16 KiB is #397.
+The loss is bounded in three directions. Below 16 KiB splice *costs* tokio
+8–15%. At 2048 connections it collapses — a pipe pair per connection is two
+descriptors and a 64 KiB kernel buffer, and `tokio-splice` falls from 169,660
+at 512 connections to 121,202 at 2048 while ringline holds near 161,000. And
+splice cannot surface a byte to a handler, so the cells ringline loses are the
+ones where tokio is doing strictly less work.
 
 ### Caveats specific to this run
 
-- **The 2048-connection column is directional, not quotable.** Little's law
-  errors climb to 6–8% even in the arms that pass, and it is the only column
-  with a gated-out cell.
-- **Echo is a byte pipe.** It measures the runtime's I/O path with no parsing,
-  allocation, or application work. The segcache tables below are the closer
-  proxy for a real server.
+- **Echo is a byte pipe.** It measures the I/O path with no parsing,
+  allocation, or application work. `uring-fwd` is an upper bound on what a
+  parsing server would see, not an estimate of it. The segcache tables below
+  are the closer proxy for a real server.
+- **The 2048-connection column is directional**, not quotable. Little's law
+  errors reach 6–8% even where they pass, and it holds the only rejected cell.
 - **Do not measure server CPU from `/proc/stat`.** A worker blocked in
-  io_uring's `submit_and_wait` is accounted as **iowait**, not idle. A
-  `/proc/stat` sampler that counts iowait as busy reads an idle io_uring server
-  at 806% CPU against tokio's 33%, and the error biases against io_uring
-  specifically, since epoll runtimes have no equivalent accounting quirk. These
-  figures come from rezolus `cpu_usage`, which has only `user`/`system` states.
+  io_uring's `submit_and_wait` is accounted as **iowait**, not idle. A sampler
+  counting iowait as busy reads an idle io_uring server at 806% CPU against
+  tokio's 33%, and the error biases against io_uring specifically, since epoll
+  runtimes have no equivalent quirk. These figures come from rezolus
+  `cpu_usage`, which has only `user`/`system` states.
 - **Depends on a client-side fairness fix.** Before #392 the tokio echo server
-  read with `read_exact`, costing one syscall per message while ringline read in
-  bulk. Numbers taken before that fix are not comparable to these.
+  read with `read_exact`, one syscall per message, while ringline read in bulk.
+  Numbers from before that fix are not comparable to these.
+- **`tokio-pc` is ~40 lines nobody gets for free.** It is `SO_REUSEPORT` plus a
+  `current_thread` runtime per core, written for this comparison. That it
+  closes most of the gap is a fact about architecture, not about what a tokio
+  service does today.
 
 ### Reproducing
 
-Build both servers on the rack's build host, then run one arm per
-configuration through SystemsLab anvil-vm jobs on two hosts with the X710 PFs
-passed through (`ports = 4`, bonded, fixed `172.31.0.1/.2`). The campaign spec
-is `experiments/campaign-phase1.toml`, the gate script is
-`experiments/phase0-gate.py`, and the server records rezolus metrics to a `.rez`
-per arm.
+Build both servers on the rack's build host, then run one arm per configuration
+through SystemsLab anvil-vm jobs on two hosts with the X710 PFs passed through
+(`ports = 4`, bonded, fixed `172.31.0.1/.2`).
 
-Server: `bench-server --runtime <ringline|tokio> --protocol echo --workers 12
-[--recv-forward]`, built with `--features force-mio` for the mio arm.
-Client: `bench-client --clients <conns> --msg-size <bytes> --depth 1`.
+Server: `bench-server --runtime <ringline|tokio|tokio-uring> --workers 8`, plus
+`--echo-mode {direct,forward,recv-forward}` for ringline and
+`--tokio-scheduler {multi-thread,per-core}` / `--tokio-echo {copy,splice}` for
+tokio. The mio arm is a `--features force-mio` build; `tokio-uring` needs
+`--features tokio-uring-arm`.
+
+Client: `bench-client --clients <n> --msg-size <bytes> --threads 16 --warmup 5
+--duration 20`.
 
 ---
 
 ## Segcache cache-server comparison (two-machine, AWS Graviton4)
 
 **Run:** June 2026, ringline 0.1.3 (commit `c77cfba`). Not re-run on the current
-release — treat it as the realistic-workload reference, and the echo tables
-above as the current baseline.
+release.
+
+This is the only workload here that parses a request and builds a response, so
+it is the only one that says anything about ringline as a *protocol server*
+rather than as a byte pipe — and it is fifteen months of development stale. It
+also predates the harness fairness fix (#392) and compares against a single
+tokio configuration, so the "which tokio?" caveat that reshaped the echo
+section above has not been applied to it. Treat the ratios as indicative and
+the absolutes as historical.
 
 This compares the **ringline server** against a **tokio server**, both serving the
 same read-heavy cache workload: a real Segcache (segment-structured TTL cache)
@@ -404,6 +387,30 @@ open-loop saturation sweep is `experiments/tcp-aws-segcache.toml` on that branch
 ## Updating this file
 
 Re-run the experiments above on an equivalent two-machine rig, re-derive the
-ratios from the raw `ops_per_sec` / latency / CPU figures, and update the tables.
-Keep the methodology notes honest: state the worker counts, whether load was
-sub-saturation, and how CPU was attributed.
+ratios from the raw `ops_per_sec` / latency / CPU figures, and update the
+tables. State the worker counts, whether load was sub-saturation, and how CPU
+was attributed.
+
+Four traps this file has actually fallen into, each of which produced a
+plausible wrong number that survived review:
+
+1. **Comparing your best against their default.** ringline has four ways to
+   serve echo and tokio has five; they differ by more than the runtimes do.
+   Name the configuration on both sides or the number means nothing.
+2. **Measuring CPU from `/proc/stat`.** iowait is not idle, and a worker parked
+   in `submit_and_wait` is accounted to it — which biases against io_uring
+   specifically. Use rezolus `cpu_usage`.
+3. **Picking a statistic by habit.** `Mean` over a whole recording diluted
+   syscall rates below the floor the protocol demands (0.83 reads/op for an
+   echo server, which is impossible). `Max` over a rate window fixed that — and
+   then over-reported a bursty allocation metric by 100x. Ask whether the
+   quantity is sustained or bursty before choosing.
+4. **Reporting a null from a setup that could not have produced a positive.**
+   Three separate runs here came back flat because the baseline did not
+   reproduce the defect, because nothing exercised the code under test, or
+   because the bottleneck was the harness. Before believing a null, check the
+   configuration could have shown the effect.
+
+The gate script and per-arm rezolus recordings are the evidence for the current
+tables; a re-run that cannot reproduce the gate results should be treated as a
+rig problem before it is treated as a result.
