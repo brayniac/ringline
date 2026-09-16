@@ -23,6 +23,17 @@ impl std::fmt::Display for EncodeTooLarge {
 
 impl std::error::Error for EncodeTooLarge {}
 
+/// The 32-bit length prefix for a payload of `len` bytes, or [`EncodeTooLarge`]
+/// if it does not fit.
+///
+/// Split out from [`encode`] so the bound can be tested as the arithmetic it
+/// is. The previous test allocated a 5 GiB buffer and then a 3 GiB one to
+/// reach it, which made the workspace suite unrunnable under ~10 GiB of RAM
+/// and never examined a single one of those bytes.
+fn length_prefix(len: usize) -> Result<u32, EncodeTooLarge> {
+    u32::try_from(len).map_err(|_| EncodeTooLarge { len })
+}
+
 /// Encode a gRPC length-prefixed message (uncompressed).
 ///
 /// Format: 1 byte compress flag (0 = uncompressed) + 4 byte big-endian length + payload.
@@ -30,7 +41,7 @@ impl std::error::Error for EncodeTooLarge {}
 /// without this guard the `as u32` cast truncates and produces a frame
 /// with a wrong-length prefix.
 pub fn encode(payload: &[u8], out: &mut Vec<u8>) -> Result<(), EncodeTooLarge> {
-    let len = u32::try_from(payload.len()).map_err(|_| EncodeTooLarge { len: payload.len() })?;
+    let len = length_prefix(payload.len())?;
     out.push(0); // compress flag: uncompressed
     out.extend_from_slice(&len.to_be_bytes());
     out.extend_from_slice(payload);
@@ -44,9 +55,7 @@ pub fn encode_compressed(
     compressed_payload: &[u8],
     out: &mut Vec<u8>,
 ) -> Result<(), EncodeTooLarge> {
-    let len = u32::try_from(compressed_payload.len()).map_err(|_| EncodeTooLarge {
-        len: compressed_payload.len(),
-    })?;
+    let len = length_prefix(compressed_payload.len())?;
     out.push(1); // compress flag: compressed
     out.extend_from_slice(&len.to_be_bytes());
     out.extend_from_slice(compressed_payload);
@@ -252,14 +261,48 @@ mod tests {
         }
     }
 
+    /// The u32 length-prefix bound, tested at its edges rather than by
+    /// allocating past it.
+    ///
+    /// This replaces a test that built a 5 GiB `Vec` and then a 3 GiB one to
+    /// assert the same thing. Besides costing 8 GiB and the time to zero it,
+    /// that test aborted on any machine with less RAM — and on a machine with
+    /// slightly more it thrashed instead, which presents as a hang with no
+    /// diagnostic rather than as a failure. Neither told you anything the
+    /// arithmetic doesn't.
     #[test]
-    fn encode_too_large_error() {
-        // 5 GiB payload would exceed u32::MAX.
-        let data = vec![0u8; 5 * 1024 * 1024 * 1024];
-        assert!(encode(&data, &mut Vec::new()).is_err());
-        // 3 GiB fits.
-        let data = vec![0u8; 3 * 1024 * 1024 * 1024];
-        assert!(encode(&data, &mut Vec::new()).is_ok());
+    fn length_prefix_rejects_payloads_past_u32_max() {
+        assert_eq!(length_prefix(0), Ok(0));
+        assert_eq!(length_prefix(4 * 1024 * 1024), Ok(4 * 1024 * 1024));
+        // The largest payload that fits, and the first that does not.
+        assert_eq!(length_prefix(u32::MAX as usize), Ok(u32::MAX));
+        #[cfg(target_pointer_width = "64")]
+        {
+            assert_eq!(
+                length_prefix(u32::MAX as usize + 1),
+                Err(EncodeTooLarge {
+                    len: u32::MAX as usize + 1
+                })
+            );
+            assert!(length_prefix(5 * 1024 * 1024 * 1024).is_err());
+        }
+    }
+
+    /// The bound reaches `encode` and `encode_compressed`, not just the
+    /// helper — at a size that costs nothing to allocate.
+    #[test]
+    fn encode_writes_the_length_prefix_it_computed() {
+        let payload = vec![7u8; 1024];
+        let mut out = Vec::new();
+        encode(&payload, &mut out).expect("1 KiB encodes");
+        assert_eq!(out[0], 0, "uncompressed flag");
+        assert_eq!(&out[1..5], &1024u32.to_be_bytes(), "big-endian length");
+        assert_eq!(&out[5..], &payload[..]);
+
+        let mut out = Vec::new();
+        encode_compressed(&payload, &mut out).expect("1 KiB encodes");
+        assert_eq!(out[0], 1, "compressed flag");
+        assert_eq!(&out[1..5], &1024u32.to_be_bytes());
     }
 
     #[test]
