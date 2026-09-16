@@ -9,6 +9,25 @@ use std::net::SocketAddr;
 
 use clap::Parser;
 
+/// Everything the proxy mode needs, bundled because the argument list had
+/// outgrown what clippy will accept and most of it travels together anyway.
+// Every field is read by the io_uring definition of `run_ringline_proxy`,
+// which is the only one that exists on Linux. The allow is scoped to builds
+// where that definition is compiled out, so it cannot mask an unused field on
+// the platform the proxy actually runs on.
+#[cfg_attr(not(has_io_uring), allow(dead_code))]
+#[derive(Clone, Copy)]
+struct ProxyCfg {
+    addr: SocketAddr,
+    workers: usize,
+    msg_size: usize,
+    backend: SocketAddr,
+    mode: ForwardMode,
+    recv_buffer_bytes: u32,
+    conn_chunk_size: usize,
+    pin_to_core: bool,
+}
+
 /// Which forwarding API the proxy mode drives. The two differ only in the
 /// call, which is the point: it isolates the forward path from everything else
 /// in the measurement.
@@ -119,6 +138,14 @@ struct Args {
     #[arg(long, value_enum, default_value_t = ForwardMode::ModeA)]
     forward_mode: ForwardMode,
 
+    /// (ringline) Provided recv buffer size in bytes. 0 (default) derives it
+    /// from `--msg-size`, which is the right default for echo but ties Mode A's
+    /// per-completion payload to the message size — at 256 B messages it gets
+    /// 4 KiB buffers against splice's 64 KiB pipe chunk, so a forwarding A/B
+    /// that does not set this is partly measuring the harness.
+    #[arg(long, default_value_t = 0)]
+    recv_buffer_bytes: u32,
+
     /// (ringline only) Connections assigned to each worker before moving to the next.
     /// 1 = classic round-robin. Higher values pack connections onto fewer workers
     /// at low connection counts, keeping per-worker CQE density high for batching.
@@ -214,15 +241,16 @@ fn main() {
     );
 
     match args.runtime {
-        Runtime::Ringline if args.proxy_backend.is_some() => run_ringline_proxy(
-            args.addr,
+        Runtime::Ringline if args.proxy_backend.is_some() => run_ringline_proxy(ProxyCfg {
+            addr: args.addr,
             workers,
-            args.msg_size,
-            args.proxy_backend.expect("checked"),
-            args.forward_mode,
-            args.conn_chunk_size,
+            msg_size: args.msg_size,
+            backend: args.proxy_backend.expect("checked"),
+            mode: args.forward_mode,
+            recv_buffer_bytes: args.recv_buffer_bytes,
+            conn_chunk_size: args.conn_chunk_size,
             pin_to_core,
-        ),
+        }),
         Runtime::Ringline => run_ringline(
             args.addr,
             workers,
@@ -276,15 +304,17 @@ fn run_tokio_uring(_addr: SocketAddr, _workers: usize, _msg_size: usize, _pin_to
 /// io_uring only, because `forward_to` and `forward_to_splice` are (#410).
 #[cfg(has_io_uring)]
 #[allow(clippy::manual_async_fn)]
-fn run_ringline_proxy(
-    addr: SocketAddr,
-    workers: usize,
-    msg_size: usize,
-    backend: SocketAddr,
-    mode: ForwardMode,
-    conn_chunk_size: usize,
-    pin_to_core: bool,
-) {
+fn run_ringline_proxy(cfg: ProxyCfg) {
+    let ProxyCfg {
+        addr,
+        workers,
+        msg_size,
+        backend,
+        mode,
+        recv_buffer_bytes,
+        conn_chunk_size,
+        pin_to_core,
+    } = cfg;
     use ringline::{AsyncEventHandler, ConnCtx, RinglineBuilder, SinkFd};
     use std::os::fd::AsFd;
 
@@ -334,11 +364,16 @@ fn run_ringline_proxy(
         }
     }
 
+    let recv_buf = if recv_buffer_bytes > 0 {
+        recv_buffer_bytes
+    } else {
+        msg_size.next_power_of_two().max(4096) as u32
+    };
     let config = ConfigBuilder::new()
         .workers(workers)
         .pin_to_core(pin_to_core)
         .sq_entries(256)
-        .recv_buffer(256, msg_size.next_power_of_two().max(4096) as u32)
+        .recv_buffer(256, recv_buf)
         .max_connections(16384)
         .send_pool(512, msg_size.next_power_of_two().max(4096) as u32)
         .conn_chunk_size(conn_chunk_size)
@@ -350,7 +385,7 @@ fn run_ringline_proxy(
         .launch::<ProxyHandler>()
         .expect("failed to launch ringline proxy");
     eprintln!(
-        "bench-server: ready (proxy -> {backend}, forward_mode={})",
+        "bench-server: ready (proxy -> {backend}, forward_mode={}, recv_buffer={recv_buf})",
         if mode == ForwardMode::Splice {
             "splice"
         } else {
@@ -364,15 +399,14 @@ fn run_ringline_proxy(
 }
 
 #[cfg(not(has_io_uring))]
-fn run_ringline_proxy(
-    _addr: SocketAddr,
-    _workers: usize,
-    _msg_size: usize,
-    _backend: SocketAddr,
-    _mode: ForwardMode,
-    _conn_chunk_size: usize,
-    _pin_to_core: bool,
-) {
+fn run_ringline_proxy(cfg: ProxyCfg) {
+    // Naming the fields keeps them read on this platform too: the io_uring
+    // definition is compiled out here, and an unused-field lint would
+    // otherwise fire on a struct that is fully used where it matters.
+    eprintln!(
+        "bench-server: would proxy {} -> {} ({} workers)",
+        cfg.addr, cfg.backend, cfg.workers
+    );
     eprintln!("bench-server: --proxy-backend needs an io_uring build (see #410)");
     std::process::exit(2);
 }
