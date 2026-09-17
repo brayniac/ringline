@@ -880,7 +880,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 self.driver.recv_starved.swap_remove(i);
                 continue;
             }
-            if replenished {
+            // Re-arm whenever the ring can actually feed a multishot, not only
+            // on a pass that just returned bids. A connection parked while the
+            // ring was dry, whose bids came back in a pass that did not visit
+            // it — a fallback completion re-parks it *after* the flush — would
+            // otherwise sit parked against a full ring with nothing left to
+            // trigger another replenish: no further recv, so no further bid
+            // return, so no further pass with `replenished`. Forever.
+            if replenished || self.driver.provided_bufs.free() > 0 {
                 self.driver.recv_starved.swap_remove(i);
                 let generation = self.driver.connections.generation(conn_index);
                 if self
@@ -1035,7 +1042,23 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             .expect("checked in_use above");
         let (ptr, _) = pool.current_ptr_remaining(slot);
         let data = unsafe { std::slice::from_raw_parts(ptr, bytes_received as usize) };
-        let appended = self.driver.accumulators.append(conn_index, data);
+        // `fallback_eligible` refuses a segmented connection, but the domain can
+        // flip *while a fallback is in flight* — a handler that parses a length
+        // header and then starts a forward does exactly that. These bytes are
+        // the newest on the stream, so they go to the back of the hold, where
+        // the segmented reader will find them; appending them to the
+        // accumulator would stand them in front of the held bytes and strand
+        // them besides, since a forward never reads the accumulator.
+        let appended = if self.driver.recv_domain[conn_index as usize]
+            == crate::recv::domain::RecvDomain::Segmented
+        {
+            self.driver.segment_hold[conn_index as usize].push_back(
+                crate::backend::HeldRecvBuf::Owned(bytes::Bytes::copy_from_slice(data)),
+            );
+            true
+        } else {
+            self.driver.accumulators.append(conn_index, data)
+        };
         self.driver
             .fallback_recv_pool
             .as_mut()
@@ -9238,6 +9261,76 @@ mod tests {
             el.driver.recv_starved.contains(&conn_index),
             "connection should stay parked"
         );
+    }
+
+    /// A fallback already in flight when the domain flips must land in the
+    /// hold, not the accumulator.
+    ///
+    /// `fallback_eligible` refuses a segmented connection, but a handler that
+    /// reads a length header and *then* starts a forward flips the domain
+    /// underneath an outstanding fallback. Those bytes are the newest on the
+    /// stream; in the accumulator they would sit in front of the held bytes and
+    /// be stranded besides, because a forward never reads the accumulator.
+    #[test]
+    fn fallback_completing_after_the_domain_flips_lands_in_the_hold() {
+        let mut el = make_test_loop();
+        let conn_index = park_connection(&mut el);
+        assert!(el.driver.accumulators.append(conn_index, b"header tail"));
+        el.flush_replenish_and_rearm();
+        assert!(
+            el.driver.recv_fallback_inflight[conn_index as usize],
+            "the fallback is submitted while the connection is still plain"
+        );
+
+        // The handler starts a forward: domain flips, the accumulator is
+        // drained into the hold (what `arm_forward_source` does).
+        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
+        el.driver.forward_recv_active[conn_index as usize] = true;
+        let buffered = el.driver.accumulators.take_frozen(conn_index);
+        el.driver.segment_hold[conn_index as usize]
+            .push_front(crate::backend::HeldRecvBuf::Owned(buffered));
+
+        let ud = UserData::encode(OpTag::RecvFallback, conn_index, 0);
+        el.test_dispatch_cqe(ud.raw(), 5, 0);
+
+        assert_eq!(
+            el.driver.accumulators.data(conn_index).len(),
+            0,
+            "nothing may be left where the forward cannot see it"
+        );
+        assert_eq!(
+            el.driver.segment_hold[conn_index as usize].len(),
+            2,
+            "the late bytes join the hold, behind what was already there"
+        );
+    }
+
+    /// A parked connection must come back when the ring has buffers, even if
+    /// this pass returned none.
+    ///
+    /// The re-arm used to be gated on a replenish happening in the same pass.
+    /// A connection re-parked *after* that pass — a fallback completion does
+    /// exactly this — then sat against a full ring with nothing left to
+    /// trigger another replenish: no recv armed, so no bid returned, so no
+    /// further pass with `replenished`.
+    #[test]
+    fn parked_connection_rearms_against_a_full_ring_without_a_replenish() {
+        let mut el = make_test_loop();
+        let conn_index = park_connection(&mut el);
+        assert!(el.driver.pending_replenish.is_empty(), "nothing to return");
+        assert!(el.driver.provided_bufs.free() > 0, "the ring has buffers");
+
+        el.flush_replenish_and_rearm();
+
+        assert!(
+            el.driver
+                .connections
+                .get(conn_index)
+                .unwrap()
+                .recv_multishot_armed,
+            "a parked connection must re-arm while the ring can feed it"
+        );
+        assert!(!el.driver.recv_starved.contains(&conn_index));
     }
 
     /// A segmented connection must never take the fallback recv.
