@@ -8155,7 +8155,7 @@ mod tests {
             let st = el.driver.forward_write[conn_index as usize]
                 .as_ref()
                 .unwrap();
-            assert!(st.is_file);
+            assert!(st.target.is_file());
             assert_eq!(st.base_offset, 0, "first buffer writes at offset 0");
             assert_eq!(st.total, 5);
         }
