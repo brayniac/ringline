@@ -24,6 +24,7 @@ struct ProxyCfg {
     backend: SocketAddr,
     mode: ForwardMode,
     recv_buffer_bytes: u32,
+    recv_ring_size: u16,
     conn_chunk_size: usize,
     pin_to_core: bool,
 }
@@ -146,6 +147,12 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     recv_buffer_bytes: u32,
 
+    /// (ringline) Number of provided recv buffers. Total pinned memory is this
+    /// times `--recv-buffer-bytes`, so sweeping buffer size at a fixed count
+    /// also sweeps total memory — this makes the two separable.
+    #[arg(long, default_value_t = 256)]
+    recv_ring_size: u16,
+
     /// (ringline only) Connections assigned to each worker before moving to the next.
     /// 1 = classic round-robin. Higher values pack connections onto fewer workers
     /// at low connection counts, keeping per-worker CQE density high for batching.
@@ -248,6 +255,7 @@ fn main() {
             backend: args.proxy_backend.expect("checked"),
             mode: args.forward_mode,
             recv_buffer_bytes: args.recv_buffer_bytes,
+            recv_ring_size: args.recv_ring_size,
             conn_chunk_size: args.conn_chunk_size,
             pin_to_core,
         }),
@@ -312,6 +320,7 @@ fn run_ringline_proxy(cfg: ProxyCfg) {
         backend,
         mode,
         recv_buffer_bytes,
+        recv_ring_size,
         conn_chunk_size,
         pin_to_core,
     } = cfg;
@@ -373,7 +382,7 @@ fn run_ringline_proxy(cfg: ProxyCfg) {
         .workers(workers)
         .pin_to_core(pin_to_core)
         .sq_entries(256)
-        .recv_buffer(256, recv_buf)
+        .recv_buffer(recv_ring_size, recv_buf)
         .max_connections(16384)
         .send_pool(512, msg_size.next_power_of_two().max(4096) as u32)
         .conn_chunk_size(conn_chunk_size)
@@ -385,12 +394,13 @@ fn run_ringline_proxy(cfg: ProxyCfg) {
         .launch::<ProxyHandler>()
         .expect("failed to launch ringline proxy");
     eprintln!(
-        "bench-server: ready (proxy -> {backend}, forward_mode={}, recv_buffer={recv_buf})",
+        "bench-server: ready (proxy -> {backend}, forward_mode={}, recv_buffer={recv_ring_size}x{recv_buf} = {} MiB)",
         if mode == ForwardMode::Splice {
             "splice"
         } else {
             "mode-a"
-        }
+        },
+        (recv_ring_size as u64 * recv_buf as u64) / (1024 * 1024)
     );
     shutdown.wait_on_signal();
     for h in handles {
