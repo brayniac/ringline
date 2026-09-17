@@ -1101,6 +1101,24 @@ impl ConnCtx {
                 let buffered = driver.accumulators.take_frozen(self.conn_index);
                 driver.segment_hold[idx].push_front(crate::backend::HeldRecvBuf::Owned(buffered));
             }
+            // The plaintext path holds the most recent provided buffer in
+            // place rather than copying it (the zero-copy `with_data` read),
+            // so buffered bytes can be sitting *behind* an empty accumulator.
+            // They are the newest, hence the back of the hold. Missing them
+            // stranded the buffer for good: a forward never reads this slot,
+            // and the bid it pins is only replenished when the slot is
+            // cleared, so the ring lost an entry too.
+            if let Some(pending) = driver.pending_recv_bufs[idx].take() {
+                // SAFETY: the slot owns an unreplenished provided buffer with
+                // `len` bytes received into it; taking the slot transfers that
+                // ownership here, and the bid goes back at the same moment the
+                // copy is made.
+                let data = unsafe { std::slice::from_raw_parts(pending.ptr, pending.len as usize) };
+                driver.segment_hold[idx].push_back(crate::backend::HeldRecvBuf::Owned(
+                    Bytes::copy_from_slice(data),
+                ));
+                driver.pending_replenish.push(pending.bid);
+            }
         });
     }
 

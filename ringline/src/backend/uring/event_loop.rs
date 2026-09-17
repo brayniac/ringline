@@ -8794,6 +8794,64 @@ mod tests {
         );
     }
 
+    /// Arming a forward must also take the zero-copy pending recv buffer, not
+    /// just the accumulator.
+    ///
+    /// The plaintext read path holds the most recent provided buffer in place
+    /// instead of copying it, so buffered bytes can sit *behind* an empty
+    /// accumulator. A forward that only drained the accumulator left them
+    /// there for good — nothing on the forward path reads that slot — and the
+    /// bid stayed pinned, so the provided ring lost an entry too.
+    ///
+    /// This is the shape the proxy test hit ~3% of the time: the backend's
+    /// first echo chunk landed on the connection just before the return-leg
+    /// forward was armed, and the forward then waited forever for bytes it
+    /// already had.
+    #[test]
+    fn arming_a_forward_takes_the_pending_recv_buffer() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let free_before = el.driver.provided_bufs.free();
+
+        // A plaintext arrival with an empty accumulator is held in place
+        // (`deliver_segment` is just a recv CQE; the domain is still the
+        // default here, so it takes the plaintext route).
+        deliver_segment(&mut el, conn_index, 0, b"early bytes");
+        assert!(
+            el.driver.pending_recv_bufs[conn_index as usize].is_some(),
+            "the arrival should be held zero-copy, not copied"
+        );
+        assert!(el.driver.accumulators.is_empty(conn_index));
+
+        let conn = ConnCtx::new(conn_index, generation);
+        let sink = accept_connection(&mut el);
+        let sink_ctx = ConnCtx::new(sink, el.driver.connections.generation(sink));
+        let _fut = with_driver_state(&mut el, || conn.forward_to_conn(&sink_ctx, 1024));
+
+        assert!(
+            el.driver.pending_recv_bufs[conn_index as usize].is_none(),
+            "the held buffer must be taken, not left where the forward cannot see it"
+        );
+        assert_eq!(
+            el.driver.segment_hold[conn_index as usize].len(),
+            1,
+            "its bytes belong in the hold"
+        );
+        let held = match &el.driver.segment_hold[conn_index as usize][0] {
+            crate::backend::HeldRecvBuf::Owned(b) => b.clone(),
+            crate::backend::HeldRecvBuf::Pinned { .. } => {
+                panic!("expected an owned copy of the taken buffer")
+            }
+        };
+        assert_eq!(&held[..], b"early bytes");
+
+        // And its bid goes back, or the ring bleeds an entry per forward.
+        let r: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
+        el.driver.provided_bufs.replenish_batch(&r);
+        assert_eq!(el.driver.provided_bufs.free(), free_before);
+    }
+
     /// An ECANCELED that still carries `IORING_CQE_F_MORE` must not leave the
     /// connection believing it is armed.
     ///
