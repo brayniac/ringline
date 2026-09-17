@@ -128,6 +128,25 @@ pub(crate) enum HeldRecvBuf {
     Owned(bytes::Bytes),
 }
 
+/// A running Mode A forward, driver-side.
+///
+/// This used to live in `ForwardToFuture`, which is why every completed write
+/// had to wake the task just so the future could pop the next held buffer and
+/// submit it. Holding it here lets the completion handler do that itself —
+/// `run_direct_echo` has always worked this way, and the mio backend's
+/// `MioForwardState` has held the equivalent since #415. Measured motivation:
+/// Mode A ran 1.26 instructions/byte against direct echo's 0.985 at the same
+/// 16 KiB buffer, over a ~0.86 kernel floor (#416).
+#[derive(Clone, Copy)]
+pub(crate) struct ForwardProgress {
+    /// Where the bytes go; a file sink writes at `forwarded` as its offset.
+    pub(crate) target: SinkTarget,
+    /// Bytes the caller asked to forward.
+    pub(crate) len: u64,
+    /// Bytes whose write has completed.
+    pub(crate) forwarded: u64,
+}
+
 /// In-flight segmented-recv Mode A forward write (see
 /// `docs/segmented-recv-design.md`, "Mode A — Forward to an fd"). One per
 /// connection at a time — writes to a sink are serialized (io_uring does not
@@ -282,7 +301,13 @@ pub(crate) struct Driver {
     /// Per-connection completed-forward-write result, produced by
     /// `handle_forward_write` and consumed by the `ForwardToFuture`: `Ok(n)` =
     /// bytes of the just-completed backing, `Err(errno)` = write failure.
-    pub(crate) forward_done: Vec<Option<Result<u32, i32>>>,
+    /// Terminal result of a Mode A forward: total bytes forwarded, or an
+    /// errno. Set once, by whichever handler drives the forward to its end,
+    /// and consumed by `ForwardToFuture`. (It used to carry *per-write* byte
+    /// counts, because the future accumulated them itself.)
+    pub(crate) forward_done: Vec<Option<Result<u64, i32>>>,
+    /// Per-connection Mode A forward state, indexed by source.
+    pub(crate) forward_progress: Vec<Option<ForwardProgress>>,
     /// Per-connection flag: `true` while a Mode A `forward_to` is driving this
     /// connection (set by `ConnCtx::forward_to`, cleared by `settle_forward_end`
     /// / `reset_segment_state` / `close_connection`). Gates the `forward_hold_cap`
@@ -705,6 +730,7 @@ impl Driver {
             segment_pinned: vec![None; config.max_connections as usize],
             forward_write: (0..config.max_connections).map(|_| None).collect(),
             forward_done: (0..config.max_connections).map(|_| None).collect(),
+            forward_progress: (0..config.max_connections).map(|_| None).collect(),
             forward_recv_active: vec![false; config.max_connections as usize],
             forward_hold_throttled: vec![false; config.max_connections as usize],
             forward_hold_cap: config.forward_hold_cap,
@@ -962,6 +988,7 @@ impl Driver {
         // slot's forward.
         self.forward_write[conn_index as usize] = None;
         self.forward_done[conn_index as usize] = None;
+        self.forward_progress[conn_index as usize] = None;
         self.forward_recv_active[conn_index as usize] = false;
         self.forward_hold_throttled[conn_index as usize] = false;
     }
@@ -1039,6 +1066,121 @@ impl Driver {
             }
         }
         ok
+    }
+
+    /// Drive a Mode A forward as far as it can go without a task poll.
+    ///
+    /// Returns `Some(result)` when the forward has reached a terminal state —
+    /// requested length reached, peer FIN, or a submission error — and `None`
+    /// while it is still running (a write in flight, or waiting for bytes).
+    /// The caller is responsible for recording the result in `forward_done`
+    /// and waking the task; nothing else wakes it, which is the point.
+    ///
+    /// This is the body that used to live in `ForwardToFuture::poll`. Keeping
+    /// it here lets `handle_forward_write` and the segmented recv branch submit
+    /// the next write directly, so the task is woken once per *forward* rather
+    /// than once per *provided buffer*.
+    ///
+    /// Ordering is unchanged: one write in flight per connection, held buffers
+    /// in arrival order. Only the caller changes.
+    pub(crate) fn advance_forward(&mut self, conn_index: u32) -> Option<Result<u64, io::Error>> {
+        let idx = conn_index as usize;
+        let progress = (*self.forward_progress.get(idx)?)?;
+
+        // A write is already in flight — its completion re-enters here.
+        if self.forward_write[idx].is_some() {
+            return None;
+        }
+
+        if progress.forwarded >= progress.len {
+            let forwarded = progress.forwarded;
+            self.forward_progress[idx] = None;
+            if !self.settle_forward_end(conn_index) {
+                self.close_connection(conn_index);
+                return Some(Err(io::Error::other(
+                    "recv accumulator overflow settling forward tail",
+                )));
+            }
+            return Some(Ok(forwarded));
+        }
+
+        let Some(held) = self.segment_hold[idx].pop_front() else {
+            // Nothing held. A finished recv side means the forward is truncated
+            // — resolve short rather than wait for bytes that are not coming.
+            let closed = self
+                .connections
+                .get(conn_index)
+                .map(|c| c.recv_finished())
+                .unwrap_or(true);
+            if closed {
+                let forwarded = progress.forwarded;
+                self.forward_progress[idx] = None;
+                let _ = self.settle_forward_end(conn_index);
+                return Some(Ok(forwarded));
+            }
+            return None;
+        };
+
+        // Bytes past `len` belong to whoever reads this connection next, so a
+        // held buffer that straddles the boundary is split and its tail stashed
+        // in the accumulator.
+        let remaining = progress.len - progress.forwarded;
+        let started = match held {
+            HeldRecvBuf::Pinned { bid, len } => {
+                if (len as u64) <= remaining {
+                    Some((HeldRecvBuf::Pinned { bid, len }, len))
+                } else {
+                    let chunk = remaining as u32;
+                    let (ptr, _) = self.provided_bufs.get_buffer(bid);
+                    // SAFETY: `bid` is pinned (unreplenished) and `len` bytes
+                    // were received into it, so `[chunk..len]` is initialised
+                    // and is copied out before anything can replenish the bid.
+                    let suffix = unsafe {
+                        std::slice::from_raw_parts(ptr.add(chunk as usize), (len - chunk) as usize)
+                    };
+                    if !self.accumulators.append(conn_index, suffix) {
+                        self.pending_replenish.push(bid);
+                        self.forward_progress[idx] = None;
+                        self.close_connection(conn_index);
+                        return Some(Err(io::Error::other(
+                            "recv accumulator overflow stashing forward tail",
+                        )));
+                    }
+                    Some((HeldRecvBuf::Pinned { bid, len: chunk }, chunk))
+                }
+            }
+            HeldRecvBuf::Owned(bytes) => {
+                if (bytes.len() as u64) <= remaining {
+                    let total = bytes.len() as u32;
+                    Some((HeldRecvBuf::Owned(bytes), total))
+                } else {
+                    let chunk = remaining as usize;
+                    if !self.accumulators.append(conn_index, &bytes[chunk..]) {
+                        self.forward_progress[idx] = None;
+                        self.close_connection(conn_index);
+                        return Some(Err(io::Error::other(
+                            "recv accumulator overflow stashing forward tail",
+                        )));
+                    }
+                    Some((HeldRecvBuf::Owned(bytes.slice(0..chunk)), chunk as u32))
+                }
+            }
+        };
+
+        let (backing, total) = started.expect("set on both arms");
+        let base_offset = if progress.target.is_file() {
+            progress.forwarded
+        } else {
+            0
+        };
+        match self.start_forward_write(conn_index, backing, total, base_offset, progress.target) {
+            Ok(()) => None,
+            Err(e) => {
+                self.forward_progress[idx] = None;
+                let _ = self.settle_forward_end(conn_index);
+                Some(Err(e))
+            }
+        }
     }
 
     /// Submit the first write of a segmented-recv Mode A forward `backing`
@@ -1193,6 +1335,7 @@ impl Driver {
         } else {
             // No forward write in flight — safe to clear a stale completed result.
             self.forward_done[conn_index as usize] = None;
+            self.forward_progress[conn_index as usize] = None;
         }
         // Clear the Mode A forward flags for slot reuse. Any held bids were
         // already drained above (segment_hold / segment_pinned / forward_write);

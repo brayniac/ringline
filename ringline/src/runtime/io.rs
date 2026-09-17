@@ -1092,9 +1092,20 @@ impl ConnCtx {
     /// bytes are the front of the forward; leaving them behind would strand
     /// them and shift the stream by however much arrived with the header.
     #[cfg(has_io_uring)]
-    fn arm_forward_source(&self) {
+    fn arm_forward_source(&self, target: crate::backend::uring::driver::SinkTarget, len: u64) {
         with_state(|driver, _executor| {
             let idx = self.conn_index as usize;
+            // The driver owns the forward from here: it submits each write from
+            // the completion handler, so the task is woken once at the end
+            // rather than once per provided buffer.
+            driver.forward_progress[idx] = Some(crate::backend::uring::driver::ForwardProgress {
+                target,
+                len,
+                forwarded: 0,
+            });
+            // A result left by the slot's previous occupant is not this
+            // forward's.
+            driver.forward_done[idx] = None;
             driver.recv_domain[idx] = crate::recv::domain::RecvDomain::Segmented;
             driver.forward_recv_active[idx] = true;
             if !driver.accumulators.is_empty(self.conn_index) {
@@ -1210,16 +1221,14 @@ impl ConnCtx {
     /// io_uring only — Mode A is backed by the provided-buffer ring.
     #[cfg(has_io_uring)]
     pub fn forward_to<'a>(&self, sink: &'a SinkFd<'a>, len: usize) -> ForwardToFuture<'a> {
-        self.arm_forward_source();
+        let target = crate::backend::uring::driver::SinkTarget::Fd {
+            fd: sink.fd,
+            is_file: sink.is_file,
+        };
+        self.arm_forward_source(target, len as u64);
         ForwardToFuture {
             conn_index: self.conn_index,
             generation: self.generation,
-            len: len as u64,
-            forwarded: 0,
-            target: crate::backend::uring::driver::SinkTarget::Fd {
-                fd: sink.fd,
-                is_file: sink.is_file,
-            },
             _borrow: PhantomData,
         }
     }
@@ -1496,16 +1505,14 @@ impl ConnCtx {
     /// the `not(has_io_uring)` sibling below.
     #[cfg(has_io_uring)]
     pub fn forward_to_conn<'a>(&self, sink: &'a ConnCtx, len: usize) -> ForwardToFuture<'a> {
-        self.arm_forward_source();
+        let target = crate::backend::uring::driver::SinkTarget::Conn {
+            index: sink.conn_index,
+            generation: sink.generation,
+        };
+        self.arm_forward_source(target, len as u64);
         ForwardToFuture {
             conn_index: self.conn_index,
             generation: self.generation,
-            len: len as u64,
-            forwarded: 0,
-            target: crate::backend::uring::driver::SinkTarget::Conn {
-                index: sink.conn_index,
-                generation: sink.generation,
-            },
             _borrow: PhantomData,
         }
     }
@@ -3375,13 +3382,6 @@ impl Drop for ForwardToConnFuture<'_> {
 pub struct ForwardToFuture<'a> {
     conn_index: u32,
     generation: u32,
-    /// Total bytes to forward.
-    len: u64,
-    /// Bytes whose write has completed.
-    forwarded: u64,
-    /// Where the bytes go: a borrowed descriptor (a file sink is written with
-    /// `pwrite` at `forwarded`) or another connection on this worker.
-    target: crate::backend::uring::driver::SinkTarget,
     /// Ties the future to whatever the caller borrowed — a `SinkFd`, or the
     /// sink `ConnCtx` — so the sink cannot be dropped mid-forward.
     _borrow: PhantomData<&'a ()>,
@@ -3396,133 +3396,43 @@ impl Future for ForwardToFuture<'_> {
         with_state(|driver, executor| {
             let conn = me.conn_index;
             let idx = conn as usize;
-            // Single pass: consume any completed write, then either park (write in
-            // flight / awaiting data), resolve (done / EOF / stale), or start the
-            // next write. No loop — each poll makes exactly one transition.
-            {
-                // Stale handle (slot closed/reused): the driver already released
-                // any held/in-flight backing on close. Resolve with what we sent.
-                if driver.connections.generation(conn) != me.generation {
-                    return Poll::Ready(Ok(me.forwarded as usize));
-                }
 
-                // Consume a completed write result (set by `handle_forward_write`).
-                if let Some(res) = driver.forward_done[idx].take() {
-                    match res {
-                        Ok(n) => me.forwarded += n as u64,
-                        Err(errno) => {
-                            let _ = driver.settle_forward_end(conn);
-                            return Poll::Ready(Err(io::Error::from_raw_os_error(errno)));
-                        }
-                    }
-                }
-
-                // A write is still in flight — one at a time. Park for its CQE.
-                if driver.forward_write[idx].is_some() {
-                    executor.owner_task[idx] = Some(CURRENT_TASK_ID.with(|c| c.get()));
-                    executor.recv_waiters[idx] = true;
-                    return Poll::Pending;
-                }
-
-                // Done: forwarded the requested length. Settle carried-over bytes
-                // (received past `len`) into the accumulator and reset the domain.
-                if me.forwarded >= me.len {
-                    if !driver.settle_forward_end(conn) {
-                        executor.wake_recv(conn);
-                        driver.close_connection(conn);
-                        return Poll::Ready(Err(io::Error::other(
-                            "recv accumulator overflow settling forward tail",
-                        )));
-                    }
-                    return Poll::Ready(Ok(me.forwarded as usize));
-                }
-
-                // Start the next write from a held buffer, if any.
-                if let Some(held) = driver.segment_hold[idx].pop_front() {
-                    let remaining = me.len - me.forwarded;
-                    // Determine the prefix to forward and stash any overshoot
-                    // suffix (bytes past `len`) at the front of the accumulator.
-                    let started = match held {
-                        crate::backend::HeldRecvBuf::Pinned { bid, len } => {
-                            if (len as u64) <= remaining {
-                                Some((crate::backend::HeldRecvBuf::Pinned { bid, len }, len))
-                            } else {
-                                let chunk = remaining as u32;
-                                let (ptr, _) = driver.provided_bufs.get_buffer(bid);
-                                // SAFETY: `bid` is pinned (unreplenished) and `len`
-                                // bytes were received into it; the suffix slice
-                                // `[chunk..len]` is valid and copied out now.
-                                let suffix = unsafe {
-                                    std::slice::from_raw_parts(
-                                        ptr.add(chunk as usize),
-                                        (len - chunk) as usize,
-                                    )
-                                };
-                                if !driver.accumulators.append(conn, suffix) {
-                                    driver.pending_replenish.push(bid);
-                                    executor.wake_recv(conn);
-                                    driver.close_connection(conn);
-                                    return Poll::Ready(Err(io::Error::other(
-                                        "recv accumulator overflow stashing forward tail",
-                                    )));
-                                }
-                                Some((
-                                    crate::backend::HeldRecvBuf::Pinned { bid, len: chunk },
-                                    chunk,
-                                ))
-                            }
-                        }
-                        crate::backend::HeldRecvBuf::Owned(bytes) => {
-                            if (bytes.len() as u64) <= remaining {
-                                let total = bytes.len() as u32;
-                                Some((crate::backend::HeldRecvBuf::Owned(bytes), total))
-                            } else {
-                                let chunk = remaining as usize;
-                                let overflow = !driver.accumulators.append(conn, &bytes[chunk..]);
-                                if overflow {
-                                    executor.wake_recv(conn);
-                                    driver.close_connection(conn);
-                                    return Poll::Ready(Err(io::Error::other(
-                                        "recv accumulator overflow stashing forward tail",
-                                    )));
-                                }
-                                let prefix = bytes.slice(0..chunk);
-                                Some((crate::backend::HeldRecvBuf::Owned(prefix), chunk as u32))
-                            }
-                        }
-                    };
-                    let (backing, total) = started.expect("started set on both arms");
-                    let base_offset = if me.target.is_file() { me.forwarded } else { 0 };
-                    match driver.start_forward_write(conn, backing, total, base_offset, me.target) {
-                        Ok(()) => {
-                            executor.owner_task[idx] = Some(CURRENT_TASK_ID.with(|c| c.get()));
-                            executor.recv_waiters[idx] = true;
-                            return Poll::Pending;
-                        }
-                        Err(e) => {
-                            let _ = driver.settle_forward_end(conn);
-                            return Poll::Ready(Err(e));
-                        }
-                    }
-                }
-
-                // Hold empty. If the recv side is closed (peer FIN), the forward is
-                // truncated — resolve with what we managed to forward.
-                let is_closed = driver
-                    .connections
-                    .get(conn)
-                    .map(|c| c.recv_finished())
-                    .unwrap_or(true);
-                if is_closed {
-                    let _ = driver.settle_forward_end(conn);
-                    return Poll::Ready(Ok(me.forwarded as usize));
-                }
-
-                // Open and nothing held — park for the next arrival (`wake_recv`).
-                executor.owner_task[idx] = Some(CURRENT_TASK_ID.with(|c| c.get()));
-                executor.recv_waiters[idx] = true;
-                Poll::Pending
+            // The terminal result wins over a stale-handle check: a forward
+            // that ended as its connection closed still owes its caller the
+            // count.
+            if let Some(res) = driver.forward_done[idx].take() {
+                driver.forward_progress[idx] = None;
+                return Poll::Ready(match res {
+                    Ok(n) => Ok(n as usize),
+                    Err(errno) => Err(io::Error::from_raw_os_error(errno)),
+                });
             }
+
+            // Stale handle (slot closed/reused): the driver already released any
+            // held or in-flight backing on close.
+            if driver.connections.generation(conn) != me.generation {
+                let forwarded = driver.forward_progress[idx]
+                    .take()
+                    .map_or(0, |p| p.forwarded);
+                return Poll::Ready(Ok(forwarded as usize));
+            }
+
+            // Drive it on every poll, not just the first. The completion
+            // handlers submit each write themselves, so in the common path this
+            // finds a write already in flight and simply parks — but *any* other
+            // wake has to be able to finish the forward. A peer FIN is the case
+            // that matters: `handle_recv_multi` notes EOF and wakes, and if this
+            // only parked, a forward ending in a truncation would park forever.
+            // (It did: 47 of 60 proxy runs hung before this line looked like
+            // this.)
+            if let Some(res) = driver.advance_forward(conn) {
+                driver.forward_progress[idx] = None;
+                return Poll::Ready(res.map(|n| n as usize));
+            }
+
+            executor.owner_task[idx] = Some(CURRENT_TASK_ID.with(|c| c.get()));
+            executor.recv_waiters[idx] = true;
+            Poll::Pending
         })
     }
 }

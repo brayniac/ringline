@@ -1483,7 +1483,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     metrics::POOL.increment(metrics::pool::FORWARD_THROTTLED);
                 }
             }
-            self.executor.wake_recv(conn_index);
+            // A forwarder can submit its write straight from here; only a
+            // Mode B/C segment reader needs its task woken to look at the hold.
+            if self.driver.forward_progress[conn_index as usize].is_some() {
+                self.finish_forward_if_done(conn_index);
+            } else {
+                self.executor.wake_recv(conn_index);
+            }
         } else if self.driver.recv_forward[conn_index as usize] {
             // Zero-copy recv-forward path: hold the provided buffer in-place
             // (bid NOT replenished) for scatter-gather forwarding via
@@ -2697,6 +2703,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.driver.try_finalize_close(conn_index);
             return;
         }
+        self.driver.forward_progress[conn_index as usize] = None;
         self.driver.forward_done[conn_index as usize] = Some(Err(errno));
         self.executor.wake_recv(conn_index);
     }
@@ -2770,6 +2777,21 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// waits for the old multishot to fully terminate (its ECANCELED clears
     /// `recv_multishot_armed` at the top of `handle_recv_multi`) so two multishots
     /// with the same `RecvMulti` user_data never overlap.
+    /// Drive a Mode A forward, and wake its task only if it finished.
+    ///
+    /// Every caller of `Driver::advance_forward` wants the same follow-up:
+    /// record a terminal result and wake the waiting future, or do nothing
+    /// because the forward is still running. Keeping that in one place is what
+    /// makes "the task is woken once per forward" checkable rather than a
+    /// property spread across two handlers.
+    fn finish_forward_if_done(&mut self, conn_index: u32) {
+        if let Some(result) = self.driver.advance_forward(conn_index) {
+            self.driver.forward_done[conn_index as usize] =
+                Some(result.map_err(|e| e.raw_os_error().unwrap_or(libc::EIO)));
+            self.executor.wake_recv(conn_index);
+        }
+    }
+
     /// Re-arm a connection's multishot recv if it should be receiving and
     /// nothing is armed.
     ///
@@ -2917,12 +2939,18 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 return;
             }
             metrics::BYTES.add(metrics::bytes::SENT, total as u64);
-            self.driver.forward_done[conn_index as usize] = Some(Ok(total));
-            self.executor.wake_recv(conn_index);
-            // A write completed, so the forward future will pop the next held
-            // buffer — draining the hold. If the recv was throttled by the hold
-            // cap and the hold is now below it (and the throttle-cancel's ECANCELED
-            // has been observed), re-arm the multishot so the source resumes.
+            if let Some(p) = self.driver.forward_progress[conn_index as usize].as_mut() {
+                p.forwarded = p.forwarded.saturating_add(total as u64);
+            }
+            // Submit the next held buffer from here rather than waking the task
+            // to do it. The task is woken only when the forward ends, which is
+            // what takes Mode A from one scheduler round-trip per provided
+            // buffer to one per forward.
+            self.finish_forward_if_done(conn_index);
+            // A write completed, so the hold is draining. If the recv was
+            // throttled by the hold cap and the hold is now below it (and the
+            // throttle-cancel's ECANCELED has been observed), re-arm the
+            // multishot so the source resumes.
             self.maybe_rearm_throttled_forward(conn_index);
             return;
         }
