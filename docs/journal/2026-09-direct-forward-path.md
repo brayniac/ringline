@@ -1,6 +1,7 @@
 # Direct-forward: submitting Mode A writes from the completion handler
 
-- **Status:** open — intent recorded before building, per the journal ground rules
+- **Status:** **NO-GO (2026-09-17)** — built, measured, theory falsified. The
+  prototype is correct and ~3% slower; see Outcome. Redirects to gathering.
 - **Span:** 2026-09-17 → (open) · follows #415 (282773b) and #416 Phase A
 
 ## Goal
@@ -65,6 +66,72 @@ payload-per-completion has a ceiling set by the socket, and buying it with ring
 depth is what produced the 1.03-second p99 at 256 B × 1024 connections
 (137,895,774 starvations on a 4-deep ring). Tuning geometry cannot reach what
 removing the per-buffer wake-up can.
+
+## Outcome: the scheduler round-trip was not the cost
+
+Built it, and it works: driver-side `ForwardProgress`, `advance_forward` called
+from `handle_forward_write` and the segmented recv branch, the task woken once
+per forward instead of once per provided buffer. Correctness gate on io_uring:
+clippy clean, full suite green, the #415 proxy regression test **0/60**.
+
+It is not faster. Two guests, 2 workers so the proxy is the bottleneck, arms
+interleaved against a baseline built from the same commit minus this change:
+
+| geometry | baseline | direct-forward | delta |
+|---|---|---|---|
+| 16 KiB × 256 (default) | 11.32 Gbit/s | 10.96 | −3.2% |
+| 64 KiB × 64 | 14.29 | 13.78 | −3.6% |
+
+And the diagnostic that settles *why*, rather than leaving it at "no effect":
+
+| | instructions/byte |
+|---|---|
+| baseline | **1.236** |
+| direct-forward | **1.243** |
+
+**Unchanged.** The wake path — `wake_recv` → `collect_wakeups` →
+`poll_ready_tasks` → future poll → `with_state` — costs essentially nothing at
+this scale. The ~6,600 instructions per completion solved for in #415 is real,
+but it does not live where this entry assumed.
+
+GO criterion 1 required >10% and a visible drop toward the 0.86 floor. Neither
+happened, so this closes NO-GO. The ~3% regression is within run-to-run spread
+(baseline 11.29–11.61, prototype 10.89–11.70) and is not itself the finding; the
+flat instructions/byte is.
+
+## Where the cost actually is
+
+Eliminating the wake leaves exactly one difference between Mode A and
+`run_direct_echo`, and it is the one this entry deferred:
+
+> **Direct echo gathers; Mode A cannot.** #397 made direct echo stage arriving
+> buffers and coalesce a drain's worth into one send. Mode A writes exactly one
+> held buffer per write.
+
+Per N buffers, direct echo costs N recv CQEs + **1** send CQE; Mode A costs N
+recv + **N** write CQEs, plus N SQE constructions and N bid replenishes. At
+16 KiB that difference is 0.26 instructions/byte (1.24 vs direct echo's 0.985),
+or roughly 4,300 instructions per buffer — which is most of the gap and is now
+the only remaining explanation.
+
+So the next attempt is **gathering**: pop several held buffers and write them as
+one `writev`/`SendMsg` iovec. Ordering survives (one vectored write, in hold
+order, still one in flight per connection); the work is partial-write handling
+across iovecs, releasing several bids on one completion, and what the hold cap
+means when a write covers many buffers.
+
+## Should the prototype land anyway?
+
+**Not on its own merits.** It is a correct −3% change, and the repo's stance is
+that performance claims require measurement — this one measured as a small
+regression.
+
+It is, however, a *prerequisite* for gathering: to write several held buffers
+from the completion handler, the driver must own the forward state, which is
+precisely what this does (and what `MioForwardState` already does on mio). Kept
+on a branch rather than landed, to be revived by the gathering attempt or
+discarded with it. Landing a regression against speculation about a future
+change would be the wrong trade.
 
 ## Design sketch
 
