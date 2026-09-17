@@ -1145,6 +1145,26 @@ impl ConnCtx {
     /// the front of the forward and are moved into the hold, not left behind in
     /// the accumulator.
     ///
+    /// # Size the provided buffers for forwarding, not for echo
+    ///
+    /// This path pays its per-completion cost **once per provided buffer**: a
+    /// CQE, a push to the hold, a task wake, a future poll, one write SQE, one
+    /// write CQE, one bid replenish — about 6,600 instructions, measured. One
+    /// write is in flight per connection at a time, so the buffer size sets
+    /// how many bytes that cycle covers.
+    ///
+    /// Relaying a byte stream between two 40 GbE hosts, moving
+    /// `recv_buffer(256, 16384)` to `recv_buffer(64, 65536)` — the same 4 MiB
+    /// of provided-buffer memory, a quarter as many buffers, four times the
+    /// size — took the proxy from 11.2 to 14.0 Gbit/s at the same CPU, and
+    /// from 1.26 to 0.96 instructions per byte. The fixed cost falls from 32%
+    /// of all work to 10%; the remaining ~0.86 instructions/byte is the
+    /// kernel's copy and TCP work, which no buffer size touches.
+    ///
+    /// The default (derived from the echo-shaped `recv_buffer` sizing, where
+    /// the knee is 8–16 KiB) is therefore the wrong end of this trade for a
+    /// forwarding workload. A proxy should ask for 64 KiB buffers explicitly.
+    ///
     /// Resolves to `Ok(bytes_forwarded)`. `bytes_forwarded == len` on success; a
     /// value `< len` means the peer closed (FIN) before `len` bytes arrived — the
     /// forward is truncated (any received-but-unwritten tail is dropped as the
@@ -1483,10 +1503,21 @@ impl ConnCtx {
     /// The io_uring version holds provided recv buffers and writes them
     /// straight to the sink, touching the bytes zero times in user space. mio
     /// has no provided-buffer ring, so bytes are read into a queued send on
-    /// the sink and copied on the way. **It exists so that a proxy built on
-    /// ringline runs at all without io_uring, not to be fast** — expect the
-    /// io_uring backend to be materially better at this, and measure rather
-    /// than assume the two are interchangeable.
+    /// the sink and copied on the way. It exists so that a proxy built on
+    /// ringline runs at all without io_uring.
+    ///
+    /// It is not, however, automatically the slower of the two. Measured on
+    /// two 40 GbE hosts relaying a byte stream (64 connections, one proxy
+    /// worker pair, medians of three interleaved runs): this path moved
+    /// **12.8 Gbit/s at 1.12 instructions per byte**, against **11.2 Gbit/s
+    /// at 1.26** for the io_uring path using 16 KiB provided buffers — the
+    /// copy path ahead by 14%. Raising the io_uring side to 64 KiB provided
+    /// buffers put it back in front at **14.0 Gbit/s and 0.96
+    /// instructions/byte**. The bookkeeping io_uring adds per buffer (hold,
+    /// bid lifecycle, task wake, one serialized write per buffer — about
+    /// 6,600 instructions a completion) costs more than the copy it removes,
+    /// until the buffer is large enough to amortize it. `forward_to`, which
+    /// exists only on the io_uring backend, carries the sizing guidance.
     ///
     /// # Backpressure
     ///
