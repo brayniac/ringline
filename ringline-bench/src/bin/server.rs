@@ -76,8 +76,8 @@ enum Runtime {
 )]
 struct Args {
     /// Server runtime
-    #[arg(long)]
-    runtime: Runtime,
+    #[arg(long, required_unless_present = "print_backend")]
+    runtime: Option<Runtime>,
 
     /// Listen address
     #[arg(long, default_value = "0.0.0.0:7878")]
@@ -131,6 +131,16 @@ struct Args {
     /// the only shape that exercises it.
     #[arg(long)]
     proxy_backend: Option<SocketAddr>,
+
+    /// Print which ringline backend this binary was built against and exit.
+    ///
+    /// The backend is a compile-time choice, so an io_uring build and a mio
+    /// build are two different binaries that look identical from the outside.
+    /// An A/B harness that builds both must verify it got both — a build that
+    /// fails and leaves the previous binary in place otherwise measures the
+    /// same arm twice and reports a dead heat.
+    #[arg(long)]
+    print_backend: bool,
 
     /// (ringline, `--proxy-backend` only) Which forwarding API the proxy uses.
     /// `conn` (`forward_to_conn`) runs on both backends and is what an
@@ -213,8 +223,20 @@ fn apply_cpu_affinity(_cpus: &[usize]) {
     eprintln!("bench-server: --cpu-list ignored (CPU affinity unsupported on this platform)");
 }
 
+/// The backend this binary was compiled against, as a word.
+const RINGLINE_BACKEND: &str = if cfg!(has_io_uring) {
+    "io_uring"
+} else {
+    "mio"
+};
+
 fn main() {
     let args = Args::parse();
+
+    if args.print_backend {
+        println!("{RINGLINE_BACKEND}");
+        return;
+    }
 
     // Apply process CPU affinity before launch so worker threads inherit it.
     // Disables ringline's own per-worker pinning (see run_ringline) to avoid
@@ -236,7 +258,10 @@ fn main() {
         args.workers
     };
 
-    let runtime_name = match args.runtime {
+    // `--print-backend` is the only path that may omit it, and that returned
+    // above.
+    let runtime = args.runtime.expect("--runtime is required");
+    let runtime_name = match runtime {
         Runtime::Ringline => "ringline",
         Runtime::Tokio => "tokio",
         Runtime::TokioUring => "tokio-uring",
@@ -247,7 +272,7 @@ fn main() {
         runtime_name, workers, args.addr,
     );
 
-    match args.runtime {
+    match runtime {
         Runtime::Ringline if args.proxy_backend.is_some() => run_ringline_proxy(ProxyCfg {
             addr: args.addr,
             workers,
@@ -428,7 +453,7 @@ fn run_ringline_proxy(cfg: ProxyCfg) {
         ProxyApi::SinkFd => "forward_to",
     };
     eprintln!(
-        "bench-server: ready (proxy -> {backend}, api={api_name}, recv_buffer={recv_ring_size}x{recv_buf} = {} MiB)",
+        "bench-server: ready (backend={RINGLINE_BACKEND}, proxy -> {backend}, api={api_name}, recv_buffer={recv_ring_size}x{recv_buf} = {} MiB)",
         (recv_ring_size as u64 * recv_buf as u64) / (1024 * 1024)
     );
     shutdown.wait_on_signal();
@@ -560,7 +585,9 @@ fn run_ringline(
     } else {
         "forward (no io_uring)"
     };
-    eprintln!("bench-server: ready (echo_mode={mode}, effective={effective})");
+    eprintln!(
+        "bench-server: ready (backend={RINGLINE_BACKEND}, echo_mode={mode}, effective={effective})"
+    );
 
     // Block until SIGINT/SIGTERM, then trigger graceful shutdown so each
     // worker's event loop runs its shutdown path — including the
