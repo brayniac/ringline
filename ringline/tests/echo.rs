@@ -6812,7 +6812,7 @@ impl AsyncEventHandler for ForwardToConnProxy {
 /// whole request at once instead usually lands every byte in the accumulator
 /// before the handler parses the header, which exercises the other route in.
 /// Both have to work, so the test drives both.
-fn proxy_round_trip(stream: &mut TcpStream, payload: &[u8], split: bool) -> Vec<u8> {
+fn proxy_round_trip(stream: &mut TcpStream, payload: &[u8], split: bool, case: &str) -> Vec<u8> {
     let header = (payload.len() as u32).to_be_bytes();
     if split {
         stream.write_all(&header).unwrap();
@@ -6828,7 +6828,9 @@ fn proxy_round_trip(stream: &mut TcpStream, payload: &[u8], split: bool) -> Vec<
     stream.flush().unwrap();
 
     let mut buf = vec![0u8; payload.len()];
-    stream.read_exact(&mut buf).expect("proxy reply");
+    if let Err(e) = stream.read_exact(&mut buf) {
+        panic!("no proxy reply for {case}: {e}");
+    }
     buf
 }
 
@@ -6879,7 +6881,9 @@ fn forward_to_conn_proxies_both_directions() {
         for split in [false, true] {
             for (i, size) in [7usize, 1024, 8192, 65536, 262144].into_iter().enumerate() {
                 let payload: Vec<u8> = (0..size).map(|b| (b.wrapping_mul(31) + i) as u8).collect();
-                let got = proxy_round_trip(&mut stream, &payload, split);
+                let case = format!("{size}B, cap {hold_cap}, split {split}");
+                eprintln!("proxy case: {case}");
+                let got = proxy_round_trip(&mut stream, &payload, split, &case);
                 assert_eq!(
                     got.len(),
                     payload.len(),
