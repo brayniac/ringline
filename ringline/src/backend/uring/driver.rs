@@ -1043,13 +1043,13 @@ impl Driver {
         // the sink's generation has moved the caller is holding a stale handle
         // and this write would land on whoever owns the slot now. Checked here
         // rather than only on resubmit, so the very first write is covered too.
-        if let SinkTarget::Conn { index, generation } = target {
-            if self.connections.generation(index) != generation {
-                if let HeldRecvBuf::Pinned { bid, .. } = backing {
-                    self.pending_replenish.push(bid);
-                }
-                return Err(io::Error::from_raw_os_error(libc::EPIPE));
+        if let SinkTarget::Conn { index, generation } = target
+            && self.connections.generation(index) != generation
+        {
+            if let HeldRecvBuf::Pinned { bid, .. } = backing {
+                self.pending_replenish.push(bid);
             }
+            return Err(io::Error::from_raw_os_error(libc::EPIPE));
         }
         let generation = self.connections.generation(conn_index);
         let ud = crate::completion::UserData::encode(
