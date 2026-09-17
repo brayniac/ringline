@@ -113,9 +113,22 @@ even affordable:
 
 Both, every arm. The interesting output is the frontier between them.
 
-**5. Concurrency** — **64 and 512 connections.** Ring depth pressure is a function
-of concurrent arrivals, so the constant-memory policy can only fail at fan-in.
-64 alone would hide it.
+**5. Concurrency** — **64 and 1024+ connections**, as separate passes rather
+than a matrix axis. Ring depth pressure is a function of concurrent arrivals, so
+the constant-memory policy can only fail at fan-in, and 64 connections never
+pressures a 256-deep ring at all.
+
+High fan-in is also the *realistic* way to saturate a server — production runs
+thousands of connections, not 64 — which matters because **an arm that is not
+server-bound measures the harness.** The first Phase A run proved that the hard
+way: at 8 workers and 64 connections the proxy guest sat at ~8 of 24 cores on
+the echo arms and ~9 on the forward arms, with every forward arm from 16 KiB to
+1 MiB pinned to the ~22 Gbit/s wire ceiling — including a 1 MiB × 4 arm that
+starved 441,351 times and still tied the clean arms. That surface was flat
+because the server had headroom, not because geometry is irrelevant, and the two
+are indistinguishable in the data. Each pass must be checked for saturation
+(server CPU, or throughput that moves when the geometry does) *before* its
+numbers are read as a result.
 
 **6. Reference lines** — mio, tokio multi-thread, tokio per-core at each message
 size, at their own defaults. These do not vary with ringline's ring geometry; they
