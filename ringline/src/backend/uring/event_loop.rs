@@ -8043,6 +8043,94 @@ mod tests {
         (f, path)
     }
 
+    /// A connection sink: the write goes to the sink's slot, and the forward
+    /// resolves on its completion exactly as a descriptor sink does.
+    #[test]
+    fn forward_to_conn_writes_to_the_sink_connection() {
+        let mut el = make_test_loop();
+        let src = accept_connection(&mut el);
+        let sink = accept_connection(&mut el);
+        let src_gen = el.driver.connections.generation(src);
+        let sink_gen = el.driver.connections.generation(sink);
+        el.driver.recv_domain[src as usize] = crate::recv::domain::RecvDomain::Segmented;
+        deliver_segment(&mut el, src, 0, b"hello");
+
+        let source = ConnCtx::new(src, src_gen);
+        let sink_ctx = ConnCtx::new(sink, sink_gen);
+        let waker = noop_waker();
+        let mut fut =
+            std::pin::pin!(with_driver_state(&mut el, || source.forward_to_conn(&sink_ctx, 5)));
+
+        let p1 = with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            fut.as_mut().poll(&mut cx)
+        });
+        assert!(matches!(p1, std::task::Poll::Pending));
+        let st = el.driver.forward_write[src as usize]
+            .as_ref()
+            .expect("write in flight");
+        assert!(
+            matches!(
+                st.target,
+                crate::backend::uring::driver::SinkTarget::Conn { index, .. } if index == sink
+            ),
+            "the write must target the sink connection's slot"
+        );
+
+        let ud = UserData::encode(OpTag::ForwardWrite, src, src_gen);
+        el.test_dispatch_cqe(ud.raw(), 5, 0);
+        let p2 = with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            fut.as_mut().poll(&mut cx)
+        });
+        assert!(matches!(p2, std::task::Poll::Ready(Ok(5))));
+    }
+
+    /// A stale sink handle must not write. Slots recycle, so a forward started
+    /// against a closed-and-reused sink would deliver this stream to whoever
+    /// owns that slot now — silently, and to the wrong peer.
+    #[test]
+    fn forward_to_conn_refuses_a_recycled_sink_slot() {
+        let mut el = make_test_loop();
+        let src = accept_connection(&mut el);
+        let sink = accept_connection(&mut el);
+        let src_gen = el.driver.connections.generation(src);
+        let stale_gen = el.driver.connections.generation(sink).wrapping_add(1);
+        el.driver.recv_domain[src as usize] = crate::recv::domain::RecvDomain::Segmented;
+        let entries = el.driver.provided_bufs.ring_entries();
+        deliver_segment(&mut el, src, 0, b"hello");
+
+        let source = ConnCtx::new(src, src_gen);
+        let stale_sink = ConnCtx::new(sink, stale_gen);
+        let waker = noop_waker();
+        let mut fut =
+            std::pin::pin!(with_driver_state(&mut el, || source.forward_to_conn(&stale_sink, 5)));
+
+        let p = with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            fut.as_mut().poll(&mut cx)
+        });
+        match p {
+            std::task::Poll::Ready(Err(e)) => {
+                assert_eq!(e.raw_os_error(), Some(libc::EPIPE), "stale sink is EPIPE")
+            }
+            other => panic!("expected EPIPE, got {other:?}"),
+        }
+        assert!(
+            el.driver.forward_write[src as usize].is_none(),
+            "nothing may be left in flight"
+        );
+        // The held buffer's bid has to come back, or a refused forward leaks a
+        // provided buffer per attempt.
+        let r: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
+        el.driver.provided_bufs.replenish_batch(&r);
+        assert_eq!(
+            el.driver.provided_bufs.free(),
+            entries,
+            "the refused write must release its backing"
+        );
+    }
+
     /// (a) Forward a held buffer to a socket sink: the first poll pops the
     /// buffer, submits a write, and parks with the bid held; the write CQE
     /// releases the bid exactly once and the future resolves with the bytes
