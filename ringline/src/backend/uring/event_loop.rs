@@ -2645,14 +2645,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// pointer, length, and (for files) offset advance. On submit failure the
     /// forward is failed (releasing the backing).
     fn resubmit_forward_write(&mut self, conn_index: u32) {
-        let (sink_fd, is_file, ptr, len, offset, generation) = {
+        let (target, ptr, len, offset, generation) = {
             let Some(state) = self.driver.forward_write[conn_index as usize].as_ref() else {
                 return;
             };
             let (ptr, len) = state.remainder(&self.driver.provided_bufs);
             (
-                state.sink_fd,
-                state.is_file,
+                state.target,
                 ptr,
                 len,
                 state.base_offset + state.written as u64,
@@ -2660,17 +2659,33 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             )
         };
         let ud = UserData::encode(OpTag::ForwardWrite, conn_index, generation);
-        let res = if is_file {
-            unsafe {
+        let res = match target {
+            crate::backend::uring::driver::SinkTarget::Fd { fd, is_file: true } => unsafe {
                 self.driver
                     .ring
-                    .submit_forward_write_file(sink_fd, ptr, len, offset, ud)
-            }
-        } else {
-            unsafe {
+                    .submit_forward_write_file(fd, ptr, len, offset, ud)
+            },
+            crate::backend::uring::driver::SinkTarget::Fd { fd, is_file: false } => unsafe {
                 self.driver
                     .ring
-                    .submit_forward_write_socket(sink_fd, ptr, len, ud)
+                    .submit_forward_write_socket(fd, ptr, len, ud)
+            },
+            crate::backend::uring::driver::SinkTarget::Conn {
+                index,
+                generation: g,
+            } => {
+                // The sink's slot may have been recycled since the forward
+                // started; writing to a reused index would send this stream's
+                // bytes to someone else's connection.
+                if self.driver.connections.generation(index) != g {
+                    self.fail_forward_write(conn_index, libc::EPIPE);
+                    return;
+                }
+                unsafe {
+                    self.driver
+                        .ring
+                        .submit_forward_write_conn(index, ptr, len, ud)
+                }
             }
         };
         if res.is_err() {
@@ -2814,17 +2829,21 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let errno = -result;
         if !closing && (errno == libc::EAGAIN || errno == libc::EWOULDBLOCK) {
             // Socket sink buffer full: arm POLLOUT, then resubmit when writable.
-            let sink_fd = self.driver.forward_write[conn_index as usize]
+            let target = self.driver.forward_write[conn_index as usize]
                 .as_ref()
                 .expect("checked live above")
-                .sink_fd;
+                .target;
             let pud = UserData::encode(OpTag::ForwardWritePollOut, conn_index, submit_gen);
-            if self
-                .driver
-                .ring
-                .submit_forward_write_pollout(sink_fd, pud)
-                .is_err()
-            {
+            let armed = match target {
+                crate::backend::uring::driver::SinkTarget::Fd { fd, .. } => {
+                    self.driver.ring.submit_forward_write_pollout(fd, pud)
+                }
+                crate::backend::uring::driver::SinkTarget::Conn { index, .. } => self
+                    .driver
+                    .ring
+                    .submit_forward_write_pollout_conn(index, pud),
+            };
+            if armed.is_err() {
                 self.fail_forward_write(conn_index, libc::EAGAIN);
             }
             metrics::POOL.increment(metrics::pool::SEND_EAGAIN);

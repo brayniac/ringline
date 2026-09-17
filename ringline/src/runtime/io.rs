@@ -1138,9 +1138,11 @@ impl ConnCtx {
             generation: self.generation,
             len: len as u64,
             forwarded: 0,
-            sink_fd: sink.fd,
-            is_file: sink.is_file,
-            _sink: PhantomData,
+            target: crate::backend::uring::driver::SinkTarget::Fd {
+                fd: sink.fd,
+                is_file: sink.is_file,
+            },
+            _borrow: PhantomData,
         }
     }
 
@@ -1367,6 +1369,70 @@ impl ConnCtx {
             conn_index: self.conn_index,
             generation: self.generation,
             armed: false,
+        }
+    }
+
+    /// Forward the next `len` received bytes to **another connection on this
+    /// worker**, with no copy through user space.
+    ///
+    /// The proxy form of [`forward_to`](Self::forward_to). Where `forward_to`
+    /// names its sink as a borrowed descriptor, this names it as a
+    /// [`ConnCtx`] — which is what makes a *bidirectional* proxy expressible:
+    /// the return direction needs the client named as a sink, and a
+    /// connection's descriptor is deliberately not public.
+    ///
+    /// ```ignore
+    /// let backend = ringline::connect(addr)?.await?;
+    /// // client -> backend; a second task forwards backend -> client
+    /// conn.forward_to_conn(&backend, len).await?;
+    /// ```
+    ///
+    /// Same mechanics and same truncation semantics as `forward_to`: arriving
+    /// provided buffers are held driver-side and written straight to the sink,
+    /// one serialized write at a time, each bid released on its own write
+    /// completion; a result `< len` means the peer sent FIN first.
+    ///
+    /// # Thread affinity
+    ///
+    /// Both connections must belong to this worker. That is not a rule you can
+    /// break: [`ConnCtx`] is `!Send`, so a handle from another worker cannot
+    /// reach this call. A sink obtained from [`connect`](crate::connect) inside
+    /// the handler is always on the right worker.
+    ///
+    /// # Do not send on the sink concurrently
+    ///
+    /// The forward writes to the sink directly rather than through its send
+    /// queue, so a `send` on the sink from elsewhere while a forward is running
+    /// is not ordered against it and will interleave on the wire. io_uring does
+    /// not order independent SQEs. Forward *or* send on a given connection, not
+    /// both at once.
+    ///
+    /// # Errors
+    ///
+    /// Resolves `Err(EPIPE)` if the sink connection closes mid-forward — its
+    /// slot may be reused, and writing to a recycled index would deliver this
+    /// stream to a different peer. The sink's generation is checked before
+    /// every write.
+    ///
+    /// io_uring only, like `forward_to`; the mio backend has no proxy path
+    /// (#410).
+    #[cfg(has_io_uring)]
+    pub fn forward_to_conn<'a>(&self, sink: &'a ConnCtx, len: usize) -> ForwardToFuture<'a> {
+        with_state(|driver, _executor| {
+            driver.recv_domain[self.conn_index as usize] =
+                crate::recv::domain::RecvDomain::Segmented;
+            driver.forward_recv_active[self.conn_index as usize] = true;
+        });
+        ForwardToFuture {
+            conn_index: self.conn_index,
+            generation: self.generation,
+            len: len as u64,
+            forwarded: 0,
+            target: crate::backend::uring::driver::SinkTarget::Conn {
+                index: sink.conn_index,
+                generation: sink.generation,
+            },
+            _borrow: PhantomData,
         }
     }
 
@@ -3070,10 +3136,11 @@ pub struct ForwardToFuture<'a> {
     /// Bytes whose write has completed.
     forwarded: u64,
     /// Sink descriptor (borrowed via `SinkFd` for `'a`).
-    sink_fd: RawFd,
+    target: crate::backend::uring::driver::SinkTarget,
     /// File sink (`pwrite` at `forwarded` as the offset) vs. socket sink.
-    is_file: bool,
-    _sink: PhantomData<&'a SinkFd<'a>>,
+    /// Ties the future to whatever the caller borrowed — a `SinkFd`, or the
+    /// sink `ConnCtx` — so the sink cannot be dropped mid-forward.
+    _borrow: PhantomData<&'a ()>,
 }
 
 #[cfg(has_io_uring)]
@@ -3181,15 +3248,8 @@ impl Future for ForwardToFuture<'_> {
                         }
                     };
                     let (backing, total) = started.expect("started set on both arms");
-                    let base_offset = if me.is_file { me.forwarded } else { 0 };
-                    match driver.start_forward_write(
-                        conn,
-                        backing,
-                        total,
-                        base_offset,
-                        me.sink_fd,
-                        me.is_file,
-                    ) {
+                    let base_offset = if me.target.is_file() { me.forwarded } else { 0 };
+                    match driver.start_forward_write(conn, backing, total, base_offset, me.target) {
                         Ok(()) => {
                             executor.owner_task[idx] = Some(CURRENT_TASK_ID.with(|c| c.get()));
                             executor.recv_waiters[idx] = true;

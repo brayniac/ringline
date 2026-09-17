@@ -431,6 +431,40 @@ impl Ring {
         Ok(())
     }
 
+    /// `POLLOUT` on a connection sink whose forward write returned `-EAGAIN`,
+    /// by registered file index rather than raw descriptor.
+    pub fn submit_forward_write_pollout_conn(
+        &mut self,
+        sink_index: u32,
+        user_data: UserData,
+    ) -> io::Result<()> {
+        let entry = opcode::PollAdd::new(Fixed(sink_index), libc::POLLOUT as u32)
+            .build()
+            .user_data(user_data.raw());
+        unsafe { self.push_sqe(&entry) }
+    }
+
+    /// Submit a Mode A forward write to another **connection** on this worker,
+    /// through its registered file index.
+    ///
+    /// # Safety
+    /// `buf`/`len` must stay valid until the CQE arrives — the driver holds the
+    /// backing — and the sink connection's slot must not be recycled meanwhile,
+    /// which the caller checks by generation before each submit.
+    pub unsafe fn submit_forward_write_conn(
+        &mut self,
+        sink_index: u32,
+        buf: *const u8,
+        len: u32,
+        user_data: UserData,
+    ) -> io::Result<()> {
+        let entry = opcode::Send::new(Fixed(sink_index), buf, len)
+            .flags(crate::completion::STREAM_SEND_FLAGS)
+            .build()
+            .user_data(user_data.raw());
+        unsafe { self.push_sqe(&entry) }
+    }
+
     /// Submit a segmented-recv Mode A forward write to a **buffered file** sink
     /// at an explicit offset (`pwrite` semantics). A short write is resubmitted
     /// at the advanced offset by the completion handler.
