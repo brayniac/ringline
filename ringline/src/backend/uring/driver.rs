@@ -561,11 +561,17 @@ impl Driver {
         let fixed_buffers =
             FixedBufferRegistry::new(&config.registered_regions, config.max_registered_regions);
 
-        let provided_bufs = ProvidedBufRing::new(
+        let mut provided_bufs = ProvidedBufRing::new(
             config.recv_buffer.bgid,
             config.recv_buffer.ring_size,
             config.recv_buffer.buffer_size,
         )?;
+        // On the worker thread, which `worker.rs` has already pinned — so the
+        // pages fault in on this worker's NUMA node rather than the launching
+        // thread's.
+        if config.prefault_buffers {
+            provided_bufs.prefault();
+        }
 
         let udp_count = config.udp_bind.len() as u32;
         let udp_provided_bufs = if udp_count > 0 {
@@ -600,7 +606,11 @@ impl Driver {
         }
 
         let connections = ConnectionTable::new(config.max_connections);
-        let send_copy_pool = SendCopyPool::new(config.send_copy_count, config.send_copy_slot_size);
+        let mut send_copy_pool =
+            SendCopyPool::new(config.send_copy_count, config.send_copy_slot_size);
+        if config.prefault_buffers {
+            send_copy_pool.prefault();
+        }
         let send_slab = InFlightSendSlab::new(config.send_slab_slots);
         let accumulators = AccumulatorTable::new_with_max(
             config.max_connections,

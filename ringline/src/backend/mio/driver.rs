@@ -334,7 +334,17 @@ impl Driver {
                 config.recv_buffer.buffer_size as usize,
                 config.recv_accumulator_max,
             ),
-            send_copy_pool: SendCopyPool::new(config.send_copy_count, config.send_copy_slot_size),
+            send_copy_pool: {
+                let mut pool =
+                    SendCopyPool::new(config.send_copy_count, config.send_copy_slot_size);
+                // Built on the pinned worker thread, so the pages stay local to
+                // it. mio has no provided recv ring; the send pool is the only
+                // pre-allocated buffer memory here.
+                if config.prefault_buffers {
+                    pool.prefault();
+                }
+                pool
+            },
             send_queues: (0..max_conn).map(|_| ConnSendState::new()).collect(),
             accept_rx,
             // The pipe's WRITE end: handed to worker-pool threads (disk I/O,

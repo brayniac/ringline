@@ -137,6 +137,9 @@ pub struct Config {
     ///
     /// **Default: 64** (2× `MAX_IOVECS`, the per-`sendmsg` iovec bound).
     pub(crate) forward_hold_cap: usize,
+    /// Fault recv and send buffer pages in at worker startup instead of on
+    /// first use. See `ConfigBuilder::prefault_buffers`.
+    pub(crate) prefault_buffers: bool,
     /// Bound on the per-worker accept channel. If a worker can't drain its
     /// queue fast enough, the acceptor will skip past it (and possibly
     /// close the incoming fd if every worker is full) rather than
@@ -341,6 +344,11 @@ impl Default for Config {
             recv_accumulator_max: 1024 * 1024 * 1024,
             recv_segment_reserve: 64,
             forward_hold_cap: 64,
+            // Off by default while the trade is being measured: prefaulting
+            // converts a latent memory cost into an immediate one, which is
+            // the intent but is also a behaviour change for anything that
+            // over-provisions today and never touches what it asked for.
+            prefault_buffers: false,
             accept_queue_capacity: 1024,
             conn_chunk_size: 1,
             send_copy_count: 1024,
@@ -832,6 +840,34 @@ impl ConfigBuilder {
     /// pinned ring buffers / held heap under a slow sink. Must be `>= 1`.
     ///
     /// Default: 64 (2× `MAX_IOVECS`).
+    /// Fault buffer pages in at worker startup rather than on first use.
+    ///
+    /// The provided recv ring and the send copy pool are allocated zeroed,
+    /// which means mapped but untouched: every page is the shared zero page
+    /// until something writes to it. On the recv path that first write is the
+    /// kernel copying an skb into the buffer, so the minor fault lands on the
+    /// completion path. Enabling this walks both allocations once at startup,
+    /// on the worker thread that owns them (so the pages stay NUMA-local to
+    /// that worker).
+    ///
+    /// What it buys is predictability rather than throughput: faults stop
+    /// appearing as ramp-phase p99 outliers, and RSS after startup equals RSS
+    /// under load — so a ring the machine cannot back fails at launch instead
+    /// of during a traffic burst, which is how `RLIMIT_NOFILE` and
+    /// `RLIMIT_MEMLOCK` are already handled.
+    ///
+    /// What it costs is that over-provisioning stops being free. A
+    /// `recv_buffer(256, 1 << 20)` ring is 256 MiB per worker whether or not
+    /// the workload ever touches all of it; without this it is mostly virtual,
+    /// with it the memory is resident from startup. Startup grows by roughly
+    /// one pass over the allocation.
+    ///
+    /// **Default: false** while the trade is being measured (#416).
+    pub fn prefault_buffers(mut self, enabled: bool) -> Self {
+        self.config.prefault_buffers = enabled;
+        self
+    }
+
     pub fn forward_hold_cap(mut self, cap: usize) -> Self {
         self.config.forward_hold_cap = cap;
         self

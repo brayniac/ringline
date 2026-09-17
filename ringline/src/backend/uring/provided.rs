@@ -90,6 +90,16 @@ impl ProvidedBufRing {
         Ok(ring)
     }
 
+    /// Fault every provided buffer in before the ring is armed.
+    ///
+    /// The recv path's first touch of a buffer is the *kernel* copying an skb
+    /// into it, so an unfaulted page costs a minor fault on the completion
+    /// path. See [`crate::buffer::prefault`]; this must run on the worker
+    /// thread that owns the ring, which is where the driver is built.
+    pub(crate) fn prefault(&mut self) {
+        crate::buffer::prefault::prefault(&mut self.buf_backing);
+    }
+
     /// Get the ring pointer for `register_buf_ring()`.
     pub fn ring_addr(&self) -> u64 {
         self.ring_ptr as u64
