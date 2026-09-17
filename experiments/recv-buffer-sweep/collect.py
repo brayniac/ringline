@@ -155,6 +155,39 @@ def main():
             f"{ring_empty:>12}{parked:>10}{star}"
         )
 
+    # ── the comparison the decision rule actually turns on ─────────────────
+    # Per workload: what the shipped default gets, the best arm that fits the
+    # default memory budget, and the best arm at any budget. The first two are
+    # the honest comparison (same memory); the third says what more memory buys.
+    DEFAULT_BUF, DEFAULT_RING, BUDGET_MIB = 16384, 256, 4.0
+    groups = {}
+    for r in rows:
+        groups.setdefault((r["mode"], r["msg"], r["conns"]), []).append(r)
+
+    def score(r):
+        return r["ops_per_sec"] or r["gbit_per_sec"] or 0
+
+    print(f"\n{'workload':<22}{'default':>12}{'best <=4MiB':>14}{'delta':>8}"
+          f"{'best any':>12}{'delta':>8}  geometry of best <=4MiB")
+    print("-" * 100)
+    for (mode, msg, conns), rs in sorted(groups.items()):
+        base = next(
+            (r for r in rs if r["buf"] == DEFAULT_BUF and r["ring"] == DEFAULT_RING), None
+        )
+        if not base or not score(base):
+            continue
+        budget = [r for r in rs if r["mib_per_worker"] <= BUDGET_MIB and score(r)]
+        best_b = max(budget, key=score) if budget else None
+        best_a = max((r for r in rs if score(r)), key=score, default=None)
+        b = score(base)
+        db = f"{(score(best_b) / b - 1) * 100:+.1f}%" if best_b else "-"
+        da = f"{(score(best_a) / b - 1) * 100:+.1f}%" if best_a else "-"
+        geo = f"{best_b['buf'] // 1024}KiB x {best_b['ring']}" if best_b else "-"
+        print(
+            f"{mode + ' ' + msg + ' c' + str(conns):<22}{b:>12,.0f}"
+            f"{score(best_b):>14,.0f}{db:>8}{score(best_a):>12,.0f}{da:>8}  {geo}"
+        )
+
     if args.json_out:
         with open(args.json_out, "w") as f:
             json.dump(rows, f, indent=2)
