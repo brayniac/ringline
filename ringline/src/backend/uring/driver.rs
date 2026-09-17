@@ -135,6 +135,25 @@ pub(crate) enum HeldRecvBuf {
 /// backing (a pinned provided-buffer bid or an owned copy) is kept alive here
 /// until the write CQE arrives (SQE memory must outlive the op), then released
 /// exactly once by `handle_forward_write`.
+/// Where a Mode A forward writes.
+///
+/// `Fd` is a borrowed descriptor named by [`SinkFd`](crate::SinkFd) — a socket
+/// or a seekable file. `Conn` is another ringline connection on this worker,
+/// addressed by its registered-file index; `ConnCtx` is `!Send`, so "on this
+/// worker" is enforced by the type system rather than by documentation.
+#[derive(Clone, Copy)]
+pub(crate) enum SinkTarget {
+    Fd { fd: RawFd, is_file: bool },
+    Conn { index: u32, generation: u32 },
+}
+
+impl SinkTarget {
+    /// A seekable sink writes at an advancing offset; a stream does not.
+    pub(crate) fn is_file(&self) -> bool {
+        matches!(self, SinkTarget::Fd { is_file: true, .. })
+    }
+}
+
 pub(crate) struct ForwardWriteState {
     /// Where the bytes being written live. `Pinned` releases its bid on
     /// completion; `Owned` just drops its heap bytes.
@@ -148,12 +167,8 @@ pub(crate) struct ForwardWriteState {
     pub(crate) written: u32,
     /// Absolute file offset for byte 0 of this backing (0 for socket sinks).
     pub(crate) base_offset: u64,
-    /// Sink fd (a non-fixed raw fd borrowed for the forward's lifetime via the
-    /// non-raw `SinkFd` handle the caller passed to `forward_to`).
-    pub(crate) sink_fd: RawFd,
-    /// Whether the sink is a seekable buffered file (uses `pwrite` at offset)
-    /// rather than a socket (`send` with `MSG_WAITALL`).
-    pub(crate) is_file: bool,
+    /// Where this write goes.
+    pub(crate) target: SinkTarget,
     /// Connection generation captured at submit; the write CQE carries it in its
     /// payload so a stale completion (slot closed/reused) is ignored.
     pub(crate) generation: u32,
@@ -1018,13 +1033,24 @@ impl Driver {
         backing: HeldRecvBuf,
         total: u32,
         base_offset: u64,
-        sink_fd: RawFd,
-        is_file: bool,
+        target: SinkTarget,
     ) -> io::Result<()> {
         debug_assert!(
             self.forward_write[conn_index as usize].is_none(),
             "start_forward_write while a forward write is already in flight"
         );
+        // A connection sink is addressed by slot index, and slots recycle. If
+        // the sink's generation has moved the caller is holding a stale handle
+        // and this write would land on whoever owns the slot now. Checked here
+        // rather than only on resubmit, so the very first write is covered too.
+        if let SinkTarget::Conn { index, generation } = target
+            && self.connections.generation(index) != generation
+        {
+            if let HeldRecvBuf::Pinned { bid, .. } = backing {
+                self.pending_replenish.push(bid);
+            }
+            return Err(io::Error::from_raw_os_error(libc::EPIPE));
+        }
         let generation = self.connections.generation(conn_index);
         let ud = crate::completion::UserData::encode(
             crate::completion::OpTag::ForwardWrite,
@@ -1035,16 +1061,19 @@ impl Driver {
             HeldRecvBuf::Pinned { bid, .. } => self.provided_bufs.get_buffer(*bid).0,
             HeldRecvBuf::Owned(bytes) => bytes.as_ptr(),
         };
-        let res = if is_file {
-            unsafe {
+        let res = match target {
+            SinkTarget::Fd { fd, is_file: true } => unsafe {
                 self.ring
-                    .submit_forward_write_file(sink_fd, ptr, total, base_offset, ud)
-            }
-        } else {
-            unsafe {
-                self.ring
-                    .submit_forward_write_socket(sink_fd, ptr, total, ud)
-            }
+                    .submit_forward_write_file(fd, ptr, total, base_offset, ud)
+            },
+            SinkTarget::Fd { fd, is_file: false } => unsafe {
+                self.ring.submit_forward_write_socket(fd, ptr, total, ud)
+            },
+            // A connection sink writes through its registered file index, the
+            // same way every other send on that connection does.
+            SinkTarget::Conn { index, .. } => unsafe {
+                self.ring.submit_forward_write_conn(index, ptr, total, ud)
+            },
         };
         match res {
             Ok(()) => {
@@ -1053,8 +1082,7 @@ impl Driver {
                     total,
                     written: 0,
                     base_offset,
-                    sink_fd,
-                    is_file,
+                    target,
                     generation,
                 });
                 Ok(())
