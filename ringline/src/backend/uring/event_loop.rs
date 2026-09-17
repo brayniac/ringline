@@ -9257,9 +9257,18 @@ mod tests {
             !el.driver.recv_fallback_inflight[conn_index as usize],
             "fallback submitted with nothing half-delivered"
         );
+        // Nothing is torn, so the connection does not degrade to a fallback —
+        // it goes back to an ordinary multishot, which this test's ring (never
+        // drained) can feed. The park is for a dry ring, and the wake
+        // condition is "the ring has buffers"; a replenish is just the usual
+        // way that becomes true.
         assert!(
-            el.driver.recv_starved.contains(&conn_index),
-            "connection should stay parked"
+            el.driver
+                .connections
+                .get(conn_index)
+                .unwrap()
+                .recv_multishot_armed,
+            "an untorn connection re-arms once the ring can feed it"
         );
     }
 
@@ -9366,8 +9375,12 @@ mod tests {
         );
         assert_eq!(el.driver.recv_fallback_count, 0);
         assert!(
-            el.driver.recv_starved.contains(&conn_index),
-            "it stays parked until buffers come back, as before the fallback existed"
+            el.driver
+                .connections
+                .get(conn_index)
+                .unwrap()
+                .recv_multishot_armed,
+            "it takes an ordinary multishot instead — segments need provided buffers"
         );
     }
 
