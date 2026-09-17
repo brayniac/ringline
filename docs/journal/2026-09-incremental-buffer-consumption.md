@@ -119,23 +119,59 @@ capability rather than parsing a version string — the same reason the existing
 
 The rack can measure this today: the anvil guests run **6.12.63**.
 
-## GO / NO-GO — written before the data
+## The criteria this started with were framed wrong
+
+The first version of this entry asked INC to win on peak throughput for a
+**tuned, homogeneous** workload. That is the case INC is *least* likely to win:
+if you know the message size and can pick the geometry for it, a fixed ring
+already gets the payload-per-completion you want. Owner's framing, 2026-09-17,
+and it is the right one: the value of INC is **robustness without tuning**, and
+mixed traffic is where fixed geometry actually hurts.
+
+The mechanism, stated so it can be falsified:
+
+- Size the buffer for the large messages and, at a fixed memory budget, the ring
+  gets shallow — so the *small* messages starve on depth. Measured: 3,066,467
+  starvations at 4-deep (Phase A chunk 1).
+- Size it for the small messages and the large ones fragment across many
+  completions — so the per-completion cost multiplies. Measured: 4 KiB buffers
+  cost 34% of the forward path's throughput against 16 KiB (14.52 vs 21.99
+  Gbit/s, Phase A chunk 4), and #415 measured the same axis worth 25% between
+  16 and 64 KiB.
+- INC serves many small arrivals from one large buffer, which is both.
+
+A homogeneous sweep cannot see this, because each arm gets to be tuned for its
+own single size. **Phase A is entirely homogeneous** — one `--msg-size` per arm
+— so its flat copy-path surface is evidence about tuned workloads only and says
+nothing about the mixed case. The 2026-07 NO-GO's GO gate was itself "a mixed
+small+huge workload showing fixed-buffer waste", and it went unmet in part
+because nothing was measured there. Repeating that omission would reach the same
+non-answer by the same route.
+
+## GO / NO-GO — revised
 
 Proceed to implementation only if **all** of:
 
-1. **#416 Phase A shows the depth/size conflict is real beyond one workload** —
-   at least one non-exotic (mode, message size) where the constant-memory policy
-   starves at the buffer size that is otherwise fastest. Chunk 1 is one such
-   point; one point is an anecdote.
-2. **A prototype beats the best fixed geometry** on the forward path by >10% at
-   equal memory, or matches it at materially less memory — measured on two
-   guests, arms interleaved, three reps.
-3. **The copying path does not regress**, since the 2026-07 entry measured that
-   bigger buffers hurt it. INC should be neutral there (same bytes, same copies,
-   fewer bids) — if it is not, that is a finding worth the entry on its own.
+1. **A mixed workload costs a fixed geometry something an oracle would not
+   pay.** Run a size distribution (small + large) against: (a) the geometry an
+   operator would pick *without* knowing the distribution — the shipped default;
+   (b) the best fixed geometry chosen *with hindsight*, by sweeping it; and
+   (c) the worst plausible misconfiguration. The gap between (a) and (b) is the
+   tuning burden INC would remove, and it has to be worth removing — call it
+   >10% throughput or >20% p99 — or there is nothing here.
+2. **A prototype closes most of that gap without being tuned**: at the default
+   memory budget, within a few percent of (b) while beating (a), on a
+   distribution it was not configured for.
+3. **Neither path regresses when homogeneous.** The copying path in particular:
+   the 2026-07 entry measured bigger buffers hurting it, and Phase A measured
+   buffer size as flat for it across a 64× range. INC should be neutral there —
+   same bytes, same copies, fewer bids. If it is not, that is its own finding.
 4. **The bid lifecycle rework passes the existing invariants**: no double
    replenish, no leak, correct close-drain with a partially consumed bid, and
    the Mode A hold cap still bounds one slow forward.
+
+Abandon and record if (1) is small. A tuning burden nobody is paying is not a
+problem, however elegant the mechanism that would remove it.
 
 Abandon and record if the prototype cannot hold invariant 4 without making the
 recv path materially harder to reason about. A 10% throughput win is not worth
@@ -143,12 +179,24 @@ re-opening the class of bug that #236–#244 and #415 spent their time closing.
 
 ## Plan
 
-1. Land #416 Phase A; read the surface for the criterion-1 evidence.
-2. Prototype behind a runtime probe, no config surface yet: INC ring, `F_BUF_MORE`
-   handling, partially-consumed bid state, replenish only on final completion.
-3. Measure against Phase A's best fixed geometry on the same harness.
+0. **Harness prerequisite:** `bench-client` has no size distribution —
+   `--msg-size` is scalar, and its op accounting counts bytes
+   (`(recorded + 1) * msg_size <= total_read`), which only works for a uniform
+   size. A per-*operation* mix would mean reworking that accounting. A
+   per-*connection* draw from a weighted distribution gets the property that
+   matters — one ring serving 256 B and 1 MiB arrivals concurrently — while each
+   connection stays uniform and the accounting stands. Document that it does not
+   exercise within-connection variation; the ring is shared per worker, so
+   across-connection mixing is what it sees anyway.
+1. Land #416 Phase A; read the homogeneous surface, which bounds criterion 3 but
+   cannot decide criterion 1.
+2. Measure the oracle gap: default vs hindsight-best vs misconfigured, on a
+   mixed distribution. **This is the go/no-go.**
+3. Only if the gap is worth it: prototype behind a runtime probe, no config
+   surface — INC ring, `F_BUF_MORE` handling, partially-consumed bid state,
+   replenish only on final completion.
 4. Either: design doc + criterion E in the 2026-07 entry + implementation PR; or
-   NO-GO here with the mechanism recorded.
+   NO-GO here with the mechanism and the measured gap recorded.
 
 ## Open questions
 
@@ -163,9 +211,27 @@ re-opening the class of bug that #236–#244 and #415 spent their time closing.
   fallback recv (#274) exists because a small ring starves; INC changes what
   "small" means, and #415 had to exclude segmented connections from the fallback
   entirely.
-- **Is the win just "bigger buffers" in disguise?** If Phase A shows a deep ring
-  of large buffers (constant-count, 256 MiB/worker) is affordable in RSS terms —
-  the 2026-07 entry's finding that big buffers cost virtual, not resident,
-  memory — then the cheap answer may be to raise the memory budget rather than
-  rework the recv path. Measure RSS at 512 connections before assuming INC is
-  the only route.
+- **Is the win just "bigger buffers" in disguise?** If a deep ring of large
+  buffers (constant-count, 256 MiB/worker) is affordable in RSS terms, the cheap
+  answer may be to raise the memory budget rather than rework the recv path.
+  But the affordability claim needs re-testing rather than inheriting, and the
+  mechanism matters:
+
+  The provided ring's backing is a plain `vec![0u8; ring_size * buf_size]`
+  (`backend/uring/provided.rs:54`) — **not** `mlock`ed, no `MAP_LOCKED`, no
+  `MAP_POPULATE`, and not charged to `RLIMIT_MEMLOCK` (that limit covers
+  *registered fixed buffers* from `ConfigBuilder::registered_regions`;
+  `register_buf_ring` pins only the ring structure, entries × 16 B). So
+  over-provisioning costs virtual address space up front, exactly as the
+  2026-07 entry found.
+
+  The catch is that `alloc_zeroed` pages become resident **when touched, and
+  stay resident**. The 2026-07 measurement (~11 MB RSS for a 256 KiB-buffer
+  ring) was taken on a steady workload: it is a statement about what that
+  benchmark touched, not a guarantee about what production touches. A burst that
+  reaches every buffer converts the whole ring to RSS — 256 MiB/worker, 2 GiB
+  across 8 workers, permanently. Over-provisioning to avoid tuning is therefore
+  cheap under steady load and expensive under bursty load, which is the case an
+  operator cannot predict and the reason this question is not settled by the
+  earlier number. Measure RSS *and* peak-touched pages under a bursty mixed
+  workload before treating a deep ring as free.
