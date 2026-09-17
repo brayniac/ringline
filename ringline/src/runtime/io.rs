@@ -3273,6 +3273,31 @@ impl Future for ForwardToConnFuture<'_> {
     }
 }
 
+#[cfg(not(has_io_uring))]
+impl Drop for ForwardToConnFuture<'_> {
+    /// Cancel a forward that is dropped before it resolves.
+    ///
+    /// This matters more here than on io_uring, where writes only happen while
+    /// the future is being polled. On mio the event loop relays autonomously
+    /// once the forward is installed, so a `select!` or `timeout` that drops
+    /// the future would otherwise leave bytes flowing to the sink with nobody
+    /// waiting for the result. Whatever was already queued on the sink stays
+    /// queued — it is on its way and cannot be recalled — but no further bytes
+    /// are taken from the source.
+    fn drop(&mut self) {
+        let _ = try_with_state(|driver, _executor| {
+            let idx = self.conn_index as usize;
+            if driver.connections.generation(self.conn_index) != self.generation {
+                return;
+            }
+            if let Some(st) = driver.forward_conn[idx].take() {
+                driver.forward_feeder[st.sink_index as usize] = None;
+            }
+            driver.forward_done[idx] = None;
+        });
+    }
+}
+
 /// Future returned by [`ConnCtx::forward_to`]. Drives the recv/write interleave
 /// that forwards `len` received bytes to the sink, one serialized write at a
 /// time. Borrows the [`SinkFd`] (`'a`) so the sink descriptor stays open for the

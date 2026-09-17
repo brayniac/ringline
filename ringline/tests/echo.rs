@@ -6908,3 +6908,118 @@ fn forward_to_conn_proxies_both_directions() {
         h.join().unwrap().unwrap();
     }
 }
+
+/// Dropping a `forward_to_conn` future stops the relay.
+///
+/// On mio the event loop relays on its own once the forward is installed, so a
+/// dropped future — a `select!` losing a race, a timeout — has to take the
+/// forward with it. Otherwise bytes keep reaching the sink with nobody waiting
+/// on the result, and the next forward on that connection starts behind.
+///
+/// mio-only: on io_uring the writes are driven by polling the future, so
+/// dropping it stops them by itself.
+#[cfg(not(has_io_uring))]
+struct DroppedForwardProxy {
+    backend_addr: SocketAddr,
+}
+
+#[cfg(not(has_io_uring))]
+static DROPPED_FORWARD_BACKEND: std::sync::OnceLock<SocketAddr> = std::sync::OnceLock::new();
+
+#[cfg(not(has_io_uring))]
+impl AsyncEventHandler for DroppedForwardProxy {
+    fn on_accept(&self, client: ConnCtx) -> impl Future<Output = ()> + 'static {
+        let backend_addr = self.backend_addr;
+        async move {
+            let backend = match client.connect(backend_addr) {
+                Ok(fut) => match fut.await {
+                    Ok(ctx) => ctx,
+                    Err(_) => return,
+                },
+                Err(_) => return,
+            };
+
+            // Arm a forward for far more than the client will ever send, then
+            // drop it without awaiting it to completion.
+            {
+                let _fut = client.forward_to_conn(&backend, 1 << 30);
+            }
+
+            // Everything the client sends must now come to *this* task, not to
+            // the sink. Echo it back so the test can see where it went.
+            loop {
+                let n = client
+                    .with_data(|data| {
+                        let _ = client.send_nowait(data);
+                        ParseResult::Consumed(data.len())
+                    })
+                    .await;
+                if n == 0 {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        DroppedForwardProxy {
+            backend_addr: *DROPPED_FORWARD_BACKEND.get().expect("backend addr not set"),
+        }
+    }
+}
+
+#[cfg(not(has_io_uring))]
+#[test]
+fn dropping_a_forward_to_conn_future_cancels_the_relay() {
+    let backend_port = free_port();
+    let backend_addr = format!("127.0.0.1:{backend_port}");
+    let (backend_shutdown, backend_handles) = RinglineBuilder::new(test_config())
+        .bind(backend_addr.parse().unwrap())
+        .launch::<AsyncEcho>()
+        .expect("backend launch failed");
+    wait_for_server(&backend_addr);
+    DROPPED_FORWARD_BACKEND
+        .set(backend_addr.parse().unwrap())
+        .expect("backend addr set once");
+
+    let proxy_port = free_port();
+    let proxy_addr = format!("127.0.0.1:{proxy_port}");
+    let (proxy_shutdown, proxy_handles) = RinglineBuilder::new(test_config())
+        .bind(proxy_addr.parse().unwrap())
+        .launch::<DroppedForwardProxy>()
+        .expect("proxy launch failed");
+    wait_for_server(&proxy_addr);
+
+    // Connect first and pause, so the handler has armed and dropped its
+    // forward before any byte arrives. Bytes already buffered when a forward
+    // is armed are part of that forward and are queued on the sink
+    // immediately; the cancel can only stop what has not been read yet, which
+    // is the case worth asserting.
+    let mut stream = TcpStream::connect(&proxy_addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+
+    // The handler echoes, so a reply proves the bytes reached the handler. If
+    // the dropped forward were still installed they would have gone to the
+    // backend instead and this read would time out.
+    let msg = b"the forward was cancelled";
+    stream.write_all(msg).unwrap();
+    stream.flush().unwrap();
+    let mut got = vec![0u8; msg.len()];
+    stream
+        .read_exact(&mut got)
+        .expect("no echo: the bytes went to the sink instead of the handler");
+    assert_eq!(got, msg);
+    drop(stream);
+
+    proxy_shutdown.shutdown();
+    for h in proxy_handles {
+        h.join().unwrap().unwrap();
+    }
+    backend_shutdown.shutdown();
+    for h in backend_handles {
+        h.join().unwrap().unwrap();
+    }
+}
