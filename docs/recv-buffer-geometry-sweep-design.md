@@ -177,6 +177,16 @@ Outcomes, in preference order:
    in `forward_to`, and record why a single default cannot serve both. This is a
    real outcome, not a failure: it is what #415's docs already say locally.
 
+## If the answer is "neither size nor depth, but both"
+
+The two policies exist because size and depth are one knob at a fixed memory
+budget. They need not be: `IOU_PBUF_RING_INC` (Linux 6.12) consumes one buffer
+incrementally across many completions, which would let a ring be deep *and*
+carry a large payload per completion. That is a recv-path rework rather than a
+flag, and it has its own entry —
+`docs/journal/2026-09-incremental-buffer-consumption.md` — whose GO criterion 1
+is precisely what this sweep is measuring.
+
 ## What would make this worth re-running later
 
 Faster NICs. #284's criterion A (400/800 GbE) applies here too, and more strongly:
