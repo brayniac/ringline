@@ -1181,6 +1181,17 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 // top of the handler, so try to re-arm now if the hold has already
                 // drained below the cap (otherwise a later write completion will).
                 self.maybe_rearm_throttled_forward(conn_index);
+                // The cancel may also have landed on a *different* multishot
+                // than the one it was aimed at: it matches by user_data, and a
+                // throttled recv that terminated on its own (`!has_more`) is
+                // re-armed with that same user_data as soon as the forward
+                // settles — before the kernel gets to the queued cancel. The
+                // connection is no longer throttled by then, so neither this
+                // branch's re-arm nor the one at the end of the handler (which
+                // this `return` skips) would fire, and the connection sat
+                // `Open`/`Multi` with no recv armed and its bytes piling up in
+                // the accumulator, forever.
+                self.rearm_multishot_if_idle(conn_index);
                 return;
             } else if !has_more {
                 if let Some(cs) = self.driver.connections.get_mut(conn_index) {
@@ -2709,6 +2720,46 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// waits for the old multishot to fully terminate (its ECANCELED clears
     /// `recv_multishot_armed` at the top of `handle_recv_multi`) so two multishots
     /// with the same `RecvMulti` user_data never overlap.
+    /// Re-arm a connection's multishot recv if it should be receiving and
+    /// nothing is armed.
+    ///
+    /// The backstop for a cancel that outlived its target. `submit_async_cancel`
+    /// matches a request by `user_data`, and a connection's multishot recv
+    /// re-uses one user_data for the life of the slot (generation included), so
+    /// a cancel queued against one arming can be applied by the kernel to the
+    /// next one. Whoever cancelled has by then moved on, so no other path
+    /// re-arms; without this the connection goes quiet for good.
+    ///
+    /// Deliberately does nothing for a connection that is closing, is not in
+    /// multishot mode, or is throttled by the Mode A hold cap — that last one
+    /// owns its own re-arm and must not have a second multishot armed under it.
+    fn rearm_multishot_if_idle(&mut self, conn_index: u32) {
+        if self.driver.forward_hold_throttled[conn_index as usize] {
+            return;
+        }
+        let should_arm = self.driver.connections.get(conn_index).is_some_and(|c| {
+            !c.recv_multishot_armed
+                && matches!(c.lifecycle, Lifecycle::Open)
+                && matches!(c.recv_arm, RecvArm::Multi)
+        });
+        if !should_arm {
+            return;
+        }
+        let generation = self.driver.connections.generation(conn_index);
+        if self
+            .driver
+            .ring
+            .submit_multishot_recv(conn_index, generation)
+            .is_err()
+        {
+            metrics::RING.increment(metrics::ring::RECV_ARM_FAILURES);
+            self.executor.wake_recv(conn_index);
+            self.driver.close_connection(conn_index);
+        } else if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+            cs.recv_multishot_armed = true;
+        }
+    }
+
     fn maybe_rearm_throttled_forward(&mut self, conn_index: u32) {
         let ci = conn_index as usize;
         if !self.driver.forward_hold_throttled[ci] {
@@ -8690,6 +8741,86 @@ mod tests {
                 .unwrap()
                 .recv_multishot_armed,
             "the connection must be reading again once the forward is over"
+        );
+    }
+
+    /// A cancel that the kernel applies to a *later* multishot must not leave
+    /// the connection unarmed.
+    ///
+    /// The throttle-cancel matches by `user_data`, which a connection's
+    /// multishot recv re-uses for the life of the slot. If the throttled recv
+    /// terminates on its own (`!has_more`) and the forward then settles and
+    /// re-arms, the queued cancel lands on the *new* multishot. By then the
+    /// connection is no longer throttled, so the throttle re-arm declines and
+    /// the ECANCELED branch used to return before the handler's ordinary
+    /// re-arm — leaving a healthy `Open`/`Multi` connection with nothing armed
+    /// and its bytes accumulating unread. Found by the proxy test in
+    /// `tests/echo.rs`, which hung on 22 of 25 runs at `forward_hold_cap(1)`;
+    /// a stuck-state dump showed exactly this shape.
+    #[test]
+    fn ecanceled_for_a_superseded_multishot_rearms_the_connection() {
+        let mut el = make_test_loop_with_config(config_with_forward_cap(1));
+        let conn_index = accept_connection(&mut el);
+        let ci = conn_index as usize;
+
+        // The state the race leaves behind: armed cleared by the ECANCELED that
+        // is about to arrive, no throttle (the forward already settled), the
+        // connection otherwise healthy and expected to be reading.
+        el.driver
+            .connections
+            .get_mut(conn_index)
+            .unwrap()
+            .recv_multishot_armed = true;
+        assert!(!el.driver.forward_hold_throttled[ci]);
+
+        let recv_ud = UserData::encode(
+            OpTag::RecvMulti,
+            conn_index,
+            el.driver.connections.generation(conn_index),
+        );
+        el.test_dispatch_cqe(recv_ud.raw(), -libc::ECANCELED, 0);
+
+        assert!(
+            el.driver
+                .connections
+                .get(conn_index)
+                .unwrap()
+                .recv_multishot_armed,
+            "an unthrottled Open/Multi connection must come back armed"
+        );
+        assert!(
+            matches!(
+                el.driver.connections.get(conn_index).unwrap().lifecycle,
+                Lifecycle::Open
+            ),
+            "and must not have been closed"
+        );
+    }
+
+    /// The same ECANCELED must NOT re-arm a connection that is closing — that
+    /// cancel is `close_connection` releasing the recv's reference on the fd so
+    /// the Close actually FINs, and re-arming would pin it again.
+    #[test]
+    fn ecanceled_during_close_does_not_rearm() {
+        let mut el = make_test_loop_with_config(config_with_forward_cap(1));
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        el.driver
+            .connections
+            .get_mut(conn_index)
+            .unwrap()
+            .recv_multishot_armed = true;
+        el.driver.close_connection(conn_index);
+
+        let recv_ud = UserData::encode(OpTag::RecvMulti, conn_index, generation);
+        el.test_dispatch_cqe(recv_ud.raw(), -libc::ECANCELED, 0);
+
+        assert!(
+            !el.driver
+                .connections
+                .get(conn_index)
+                .is_some_and(|c| c.recv_multishot_armed),
+            "a closing connection must stay unarmed"
         );
     }
 
