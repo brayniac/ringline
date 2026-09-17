@@ -1,6 +1,7 @@
 # Recv buffer geometry sweep — design
 
-**Status:** specified, not yet run. Queued behind #415.
+**Status:** Phase 0 landed (#417 — the dump, its gate, and the bug the gate
+found); Phase A running (#416). #415 merged as 282773b.
 
 **Question:** ringline's provided recv ring defaults to `recv_buffer(256, 16384)`
 — 256 buffers of 16 KiB, 4 MiB per worker. Is that the right default, and is one
@@ -67,6 +68,14 @@ sweep diagnostic rather than descriptive.
 Gate: an arm run at a deliberately tiny ring (`recv_buffer(8, 4096)`) must show
 non-zero `buffer_ring_empty` and `recv_parked`. If those stay zero the dump is
 not wired to anything and the sweep is blind — fix before proceeding.
+
+**The gate fired.** Its first run reported zero starvation on an 8 × 4 KiB ring,
+which is only possible if the flags did nothing — and they did nothing: the echo
+arm hardcoded `recv_buffer(256, msg_size-derived)` and read neither flag, so all
+27 echo arms of Phase A would have run one configuration under 27 labels. Fixed
+in #417, with the effective geometry now printed on the ready line so a log
+proves what ran. After the fix, 8 × 4 KiB counts 11,950,066 `buffer_ring_empty`
+and moves 12.4 GB, against 0 and 28.4 GB at 256 × 64 KiB.
 
 ## Axes
 
