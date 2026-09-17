@@ -9,6 +9,25 @@ use std::net::SocketAddr;
 
 use clap::Parser;
 
+/// Everything the proxy mode needs, bundled because the argument list had
+/// outgrown what clippy will accept and most of it travels together anyway.
+// Every field is read by the io_uring definition of `run_ringline_proxy`,
+// which is the only one that exists on Linux. The allow is scoped to builds
+// where that definition is compiled out, so it cannot mask an unused field on
+// the platform the proxy actually runs on.
+#[cfg_attr(not(has_io_uring), allow(dead_code))]
+#[derive(Clone, Copy)]
+struct ProxyCfg {
+    addr: SocketAddr,
+    workers: usize,
+    msg_size: usize,
+    backend: SocketAddr,
+    recv_buffer_bytes: u32,
+    recv_ring_size: u16,
+    conn_chunk_size: usize,
+    pin_to_core: bool,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum TokioScheduler {
     MultiThread,
@@ -96,6 +115,27 @@ struct Args {
     /// to ringline's recv-forward byte pipe. Linux only.
     #[arg(long, value_enum, default_value_t = TokioEcho::Copy)]
     tokio_echo: TokioEcho,
+
+    /// (ringline, io_uring only) Run as a one-way proxy to this backend
+    /// instead of echoing: every accepted connection is forwarded to a fresh
+    /// connection to `--proxy-backend`. This is what `forward_to` is for, and
+    /// the only shape that exercises it.
+    #[arg(long)]
+    proxy_backend: Option<SocketAddr>,
+
+    /// (ringline) Provided recv buffer size in bytes. 0 (default) derives it
+    /// from `--msg-size`, which is the right default for echo but ties Mode A's
+    /// per-completion payload to the message size — at 256 B messages it gets
+    /// 4 KiB buffers against splice's 64 KiB pipe chunk, so a forwarding A/B
+    /// that does not set this is partly measuring the harness.
+    #[arg(long, default_value_t = 0)]
+    recv_buffer_bytes: u32,
+
+    /// (ringline) Number of provided recv buffers. Total pinned memory is this
+    /// times `--recv-buffer-bytes`, so sweeping buffer size at a fixed count
+    /// also sweeps total memory — this makes the two separable.
+    #[arg(long, default_value_t = 256)]
+    recv_ring_size: u16,
 
     /// (ringline only) Connections assigned to each worker before moving to the next.
     /// 1 = classic round-robin. Higher values pack connections onto fewer workers
@@ -192,6 +232,16 @@ fn main() {
     );
 
     match args.runtime {
+        Runtime::Ringline if args.proxy_backend.is_some() => run_ringline_proxy(ProxyCfg {
+            addr: args.addr,
+            workers,
+            msg_size: args.msg_size,
+            backend: args.proxy_backend.expect("checked"),
+            recv_buffer_bytes: args.recv_buffer_bytes,
+            recv_ring_size: args.recv_ring_size,
+            conn_chunk_size: args.conn_chunk_size,
+            pin_to_core,
+        }),
         Runtime::Ringline => run_ringline(
             args.addr,
             workers,
@@ -236,6 +286,102 @@ fn run_tokio_uring(_addr: SocketAddr, _workers: usize, _msg_size: usize, _pin_to
         "bench-server: --runtime tokio-uring needs a Linux build with \
          --features tokio-uring-arm"
     );
+    std::process::exit(2);
+}
+
+/// One-way proxy: forward every accepted connection's stream to a fresh
+/// connection to `backend`, using whichever forwarding API `mode` names.
+///
+/// io_uring only, because `forward_to` and `SinkFd` are — mio has no proxy
+/// path at all (#410).
+#[cfg(has_io_uring)]
+#[allow(clippy::manual_async_fn)]
+fn run_ringline_proxy(cfg: ProxyCfg) {
+    let ProxyCfg {
+        addr,
+        workers,
+        msg_size,
+        backend,
+        recv_buffer_bytes,
+        recv_ring_size,
+        conn_chunk_size,
+        pin_to_core,
+    } = cfg;
+    use ringline::{AsyncEventHandler, ConnCtx, RinglineBuilder, SinkFd};
+    use std::os::fd::AsFd;
+
+    /// Forward for the life of the connection: the caller asks for a byte
+    /// count, and a proxy does not know one, so ask for more than any run will
+    /// carry and let the peer's FIN end it (both APIs resolve short on FIN).
+    const UNTIL_EOF: usize = usize::MAX / 2;
+
+    static BACKEND: std::sync::OnceLock<SocketAddr> = std::sync::OnceLock::new();
+    let _ = BACKEND.set(backend);
+
+    struct ProxyHandler;
+    impl AsyncEventHandler for ProxyHandler {
+        fn on_accept(&self, conn: ConnCtx) -> impl std::future::Future<Output = ()> + 'static {
+            async move {
+                let addr = *BACKEND.get().expect("backend set before launch");
+                // Blocking connect, once per connection, before any traffic —
+                // the alternative is an outbound ringline connection whose fd
+                // cannot be named as a sink (#410).
+                let Ok(sink_sock) = std::net::TcpStream::connect(addr) else {
+                    eprintln!("proxy: backend connect failed");
+                    return;
+                };
+                sink_sock.set_nodelay(true).ok();
+                let sink = SinkFd::socket(sink_sock.as_fd());
+                if let Err(e) = conn.forward_to(&sink, UNTIL_EOF).await {
+                    eprintln!("proxy: forward failed: {e}");
+                }
+            }
+        }
+        fn create_for_worker(_id: usize) -> Self {
+            ProxyHandler
+        }
+    }
+
+    let recv_buf = if recv_buffer_bytes > 0 {
+        recv_buffer_bytes
+    } else {
+        msg_size.next_power_of_two().max(4096) as u32
+    };
+    let config = ConfigBuilder::new()
+        .workers(workers)
+        .pin_to_core(pin_to_core)
+        .sq_entries(256)
+        .recv_buffer(recv_ring_size, recv_buf)
+        .max_connections(16384)
+        .send_pool(512, msg_size.next_power_of_two().max(4096) as u32)
+        .conn_chunk_size(conn_chunk_size)
+        .build()
+        .expect("valid config");
+
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind(addr)
+        .launch::<ProxyHandler>()
+        .expect("failed to launch ringline proxy");
+    eprintln!(
+        "bench-server: ready (proxy -> {backend}, recv_buffer={recv_ring_size}x{recv_buf} = {} MiB)",
+        (recv_ring_size as u64 * recv_buf as u64) / (1024 * 1024)
+    );
+    shutdown.wait_on_signal();
+    for h in handles {
+        h.join().ok();
+    }
+}
+
+#[cfg(not(has_io_uring))]
+fn run_ringline_proxy(cfg: ProxyCfg) {
+    // Naming the fields keeps them read on this platform too: the io_uring
+    // definition is compiled out here, and an unused-field lint would
+    // otherwise fire on a struct that is fully used where it matters.
+    eprintln!(
+        "bench-server: would proxy {} -> {} ({} workers)",
+        cfg.addr, cfg.backend, cfg.workers
+    );
+    eprintln!("bench-server: --proxy-backend needs an io_uring build (see #410)");
     std::process::exit(2);
 }
 
