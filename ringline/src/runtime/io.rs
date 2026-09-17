@@ -1081,6 +1081,47 @@ impl ConnCtx {
         }
     }
 
+    /// Put this connection into the Mode A forwarding state: switch delivery to
+    /// the segmented domain, mark it a forwarder (so the recv handler applies
+    /// the `forward_hold_cap` throttle rather than treating it as a plain Mode
+    /// B segment reader), and move anything already buffered into the hold.
+    ///
+    /// That last step is what makes a proxy expressible. The length a forward
+    /// needs comes from a header, and reading a header means `with_data`,
+    /// which leaves the rest of the segment sitting in the accumulator. Those
+    /// bytes are the front of the forward; leaving them behind would strand
+    /// them and shift the stream by however much arrived with the header.
+    #[cfg(has_io_uring)]
+    fn arm_forward_source(&self) {
+        with_state(|driver, _executor| {
+            let idx = self.conn_index as usize;
+            driver.recv_domain[idx] = crate::recv::domain::RecvDomain::Segmented;
+            driver.forward_recv_active[idx] = true;
+            if !driver.accumulators.is_empty(self.conn_index) {
+                let buffered = driver.accumulators.take_frozen(self.conn_index);
+                driver.segment_hold[idx].push_front(crate::backend::HeldRecvBuf::Owned(buffered));
+            }
+            // The plaintext path holds the most recent provided buffer in
+            // place rather than copying it (the zero-copy `with_data` read),
+            // so buffered bytes can be sitting *behind* an empty accumulator.
+            // They are the newest, hence the back of the hold. Missing them
+            // stranded the buffer for good: a forward never reads this slot,
+            // and the bid it pins is only replenished when the slot is
+            // cleared, so the ring lost an entry too.
+            if let Some(pending) = driver.pending_recv_bufs[idx].take() {
+                // SAFETY: the slot owns an unreplenished provided buffer with
+                // `len` bytes received into it; taking the slot transfers that
+                // ownership here, and the bid goes back at the same moment the
+                // copy is made.
+                let data = unsafe { std::slice::from_raw_parts(pending.ptr, pending.len as usize) };
+                driver.segment_hold[idx].push_back(crate::backend::HeldRecvBuf::Owned(
+                    Bytes::copy_from_slice(data),
+                ));
+                driver.pending_replenish.push(pending.bid);
+            }
+        });
+    }
+
     /// Forward the next `len` received bytes straight to `sink` (Mode A —
     /// "Forward", zero userspace copy; see `docs/segmented-recv-design.md`).
     ///
@@ -1098,6 +1139,31 @@ impl ConnCtx {
     /// reserve (`recv_segment_reserve`): when the ring runs low, arriving buffers
     /// are force-copied and their bids returned immediately, so a slow sink cannot
     /// deplete the shared ring and starve other connections.
+    ///
+    /// Bytes already buffered on this connection when the forward starts — the
+    /// remainder of the segment that carried the length header, typically — are
+    /// the front of the forward and are moved into the hold, not left behind in
+    /// the accumulator.
+    ///
+    /// # Size the provided buffers for forwarding, not for echo
+    ///
+    /// This path pays its per-completion cost **once per provided buffer**: a
+    /// CQE, a push to the hold, a task wake, a future poll, one write SQE, one
+    /// write CQE, one bid replenish — about 6,600 instructions, measured. One
+    /// write is in flight per connection at a time, so the buffer size sets
+    /// how many bytes that cycle covers.
+    ///
+    /// Relaying a byte stream between two 40 GbE hosts, moving
+    /// `recv_buffer(256, 16384)` to `recv_buffer(64, 65536)` — the same 4 MiB
+    /// of provided-buffer memory, a quarter as many buffers, four times the
+    /// size — took the proxy from 11.2 to 14.0 Gbit/s at the same CPU, and
+    /// from 1.26 to 0.96 instructions per byte. The fixed cost falls from 32%
+    /// of all work to 10%; the remaining ~0.86 instructions/byte is the
+    /// kernel's copy and TCP work, which no buffer size touches.
+    ///
+    /// The default (derived from the echo-shaped `recv_buffer` sizing, where
+    /// the knee is 8–16 KiB) is therefore the wrong end of this trade for a
+    /// forwarding workload. A proxy should ask for 64 KiB buffers explicitly.
     ///
     /// Resolves to `Ok(bytes_forwarded)`. `bytes_forwarded == len` on success; a
     /// value `< len` means the peer closed (FIN) before `len` bytes arrived — the
@@ -1124,15 +1190,7 @@ impl ConnCtx {
     /// io_uring only — Mode A is backed by the provided-buffer ring.
     #[cfg(has_io_uring)]
     pub fn forward_to<'a>(&self, sink: &'a SinkFd<'a>, len: usize) -> ForwardToFuture<'a> {
-        with_state(|driver, _executor| {
-            driver.recv_domain[self.conn_index as usize] =
-                crate::recv::domain::RecvDomain::Segmented;
-            // Mark this connection as a forwarder so the recv handler applies the
-            // `forward_hold_cap` throttle (bounded hold + TCP-window backpressure)
-            // — distinguishing it from a pure Mode B segment reader that also uses
-            // the `Segmented` domain but is drained by a `SegmentReader`.
-            driver.forward_recv_active[self.conn_index as usize] = true;
-        });
+        self.arm_forward_source();
         ForwardToFuture {
             conn_index: self.conn_index,
             generation: self.generation,
@@ -1414,15 +1472,11 @@ impl ConnCtx {
     /// stream to a different peer. The sink's generation is checked before
     /// every write.
     ///
-    /// io_uring only, like `forward_to`; the mio backend has no proxy path
-    /// (#410).
+    /// The mio backend exposes the same signature, but as a copy path — see
+    /// the `not(has_io_uring)` sibling below.
     #[cfg(has_io_uring)]
     pub fn forward_to_conn<'a>(&self, sink: &'a ConnCtx, len: usize) -> ForwardToFuture<'a> {
-        with_state(|driver, _executor| {
-            driver.recv_domain[self.conn_index as usize] =
-                crate::recv::domain::RecvDomain::Segmented;
-            driver.forward_recv_active[self.conn_index as usize] = true;
-        });
+        self.arm_forward_source();
         ForwardToFuture {
             conn_index: self.conn_index,
             generation: self.generation,
@@ -1432,6 +1486,107 @@ impl ConnCtx {
                 index: sink.conn_index,
                 generation: sink.generation,
             },
+            _borrow: PhantomData,
+        }
+    }
+
+    /// Forward the next `len` received bytes to another connection on this
+    /// worker.
+    ///
+    /// The mio counterpart of the io_uring `forward_to_conn`, with the same
+    /// signature, the same truncation semantics — a result `< len` means the
+    /// peer sent FIN first — and the same thread affinity, which [`ConnCtx`]
+    /// being `!Send` enforces for free.
+    ///
+    /// # This is a copy path
+    ///
+    /// The io_uring version holds provided recv buffers and writes them
+    /// straight to the sink, touching the bytes zero times in user space. mio
+    /// has no provided-buffer ring, so bytes are read into a queued send on
+    /// the sink and copied on the way. It exists so that a proxy built on
+    /// ringline runs at all without io_uring.
+    ///
+    /// It is not, however, automatically the slower of the two. Measured on
+    /// two 40 GbE hosts relaying a byte stream (64 connections, one proxy
+    /// worker pair, medians of three interleaved runs): this path moved
+    /// **12.8 Gbit/s at 1.12 instructions per byte**, against **11.2 Gbit/s
+    /// at 1.26** for the io_uring path using 16 KiB provided buffers — the
+    /// copy path ahead by 14%. Raising the io_uring side to 64 KiB provided
+    /// buffers put it back in front at **14.0 Gbit/s and 0.96
+    /// instructions/byte**. The bookkeeping io_uring adds per buffer (hold,
+    /// bid lifecycle, task wake, one serialized write per buffer — about
+    /// 6,600 instructions a completion) costs more than the copy it removes,
+    /// until the buffer is large enough to amortize it. `forward_to`, which
+    /// exists only on the io_uring backend, carries the sizing guidance.
+    ///
+    /// # Backpressure
+    ///
+    /// The source stops reading once the sink has `forward_hold_cap` queued
+    /// sends outstanding, which closes the source's TCP window rather than
+    /// growing the queue without bound, and resumes when the sink drains.
+    ///
+    /// # TLS
+    ///
+    /// The **source** may be a TLS connection: rustls' plaintext is collected
+    /// and forwarded, which is what makes a TLS-terminating proxy work. The
+    /// **sink** may not — the forward queues bytes as they are, with nothing
+    /// on the path to encrypt them — and a TLS sink is refused with
+    /// `EPROTOTYPE` rather than put plaintext on the wire.
+    ///
+    /// # Errors
+    ///
+    /// `EPIPE` if the sink closes or its slot is recycled mid-forward;
+    /// `EPROTOTYPE` if the sink is a TLS connection; `EBUSY` if a forward is
+    /// already running on this connection.
+    #[cfg(not(has_io_uring))]
+    pub fn forward_to_conn<'a>(&self, sink: &'a ConnCtx, len: usize) -> ForwardToConnFuture<'a> {
+        let (sink_index, sink_generation) = (sink.conn_index, sink.generation);
+        let source = self.conn_index;
+        let generation = self.generation;
+        let armed = with_state(|driver, _executor| {
+            let src = source as usize;
+            if driver.connections.generation(source) != generation
+                || driver.connections.generation(sink_index) != sink_generation
+            {
+                return Err(libc::EPIPE);
+            }
+            debug_assert!(
+                driver.forward_conn[src].is_none(),
+                "forward_to_conn while a forward is already running on {source}"
+            );
+            if driver.forward_conn[src].is_some() {
+                return Err(libc::EBUSY);
+            }
+            // A forward writes bytes onto the sink as they are — nothing on
+            // this path encrypts. Queuing plaintext on a TLS connection would
+            // put it on the wire in the clear, so refuse rather than do it.
+            if driver.tls_table.as_ref().is_some_and(|t| t.has(sink_index)) {
+                return Err(libc::EPROTOTYPE);
+            }
+            driver.forward_conn[src] = Some(crate::backend::mio::driver::MioForwardState {
+                sink_index,
+                sink_generation,
+                len: len as u64,
+                forwarded: 0,
+            });
+            driver.forward_feeder[sink_index as usize] = Some(source);
+            // A forward that ended with its slot's previous occupant may have
+            // left a result nobody took; it is not this forward's.
+            driver.forward_done[src] = None;
+
+            // Bytes the connection already received but the handler never
+            // consumed are part of the forward — the same bytes the io_uring
+            // path picks up out of the accumulator when the domain flips. This
+            // also settles a forward that is satisfied on the spot (`len == 0`,
+            // or the accumulator already covered it), which must not park for a
+            // read that is never coming.
+            driver.forward_take_accumulated(source);
+            Ok(())
+        });
+        ForwardToConnFuture {
+            conn_index: source,
+            generation,
+            refused: armed.err(),
             _borrow: PhantomData,
         }
     }
@@ -3123,6 +3278,75 @@ impl<'a> SinkFd<'a> {
     }
 }
 
+/// Future returned by the mio [`ConnCtx::forward_to_conn`]. Parks on the
+/// source's recv waiter slot; the event loop resolves it by writing into
+/// `Driver::forward_done` and calling `wake_recv`. Borrows the sink `ConnCtx`
+/// (`'a`) so it cannot be dropped mid-forward.
+#[cfg(not(has_io_uring))]
+pub struct ForwardToConnFuture<'a> {
+    conn_index: u32,
+    generation: u32,
+    /// Set when the forward could not be installed at all (stale handle, or a
+    /// forward already running); reported on the first poll.
+    refused: Option<i32>,
+    _borrow: PhantomData<&'a ()>,
+}
+
+#[cfg(not(has_io_uring))]
+impl Future for ForwardToConnFuture<'_> {
+    type Output = io::Result<usize>;
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let me = self.get_mut();
+        if let Some(errno) = me.refused {
+            return Poll::Ready(Err(io::Error::from_raw_os_error(errno)));
+        }
+        with_state(|driver, executor| {
+            let idx = me.conn_index as usize;
+            // The terminal result wins over a stale-handle check: the loop
+            // records it before teardown releases the slot.
+            if let Some(res) = driver.forward_done[idx].take() {
+                return Poll::Ready(match res {
+                    Ok(n) => Ok(n as usize),
+                    Err(errno) => Err(io::Error::from_raw_os_error(errno)),
+                });
+            }
+            if driver.connections.generation(me.conn_index) != me.generation {
+                let forwarded = driver.forward_conn[idx].take().map_or(0, |st| st.forwarded);
+                return Poll::Ready(Ok(forwarded as usize));
+            }
+            executor.owner_task[idx] = Some(CURRENT_TASK_ID.with(|c| c.get()));
+            executor.recv_waiters[idx] = true;
+            Poll::Pending
+        })
+    }
+}
+
+#[cfg(not(has_io_uring))]
+impl Drop for ForwardToConnFuture<'_> {
+    /// Cancel a forward that is dropped before it resolves.
+    ///
+    /// This matters more here than on io_uring, where writes only happen while
+    /// the future is being polled. On mio the event loop relays autonomously
+    /// once the forward is installed, so a `select!` or `timeout` that drops
+    /// the future would otherwise leave bytes flowing to the sink with nobody
+    /// waiting for the result. Whatever was already queued on the sink stays
+    /// queued — it is on its way and cannot be recalled — but no further bytes
+    /// are taken from the source.
+    fn drop(&mut self) {
+        let _ = try_with_state(|driver, _executor| {
+            let idx = self.conn_index as usize;
+            if driver.connections.generation(self.conn_index) != self.generation {
+                return;
+            }
+            if let Some(st) = driver.forward_conn[idx].take() {
+                driver.forward_feeder[st.sink_index as usize] = None;
+            }
+            driver.forward_done[idx] = None;
+        });
+    }
+}
+
 /// Future returned by [`ConnCtx::forward_to`]. Drives the recv/write interleave
 /// that forwards `len` received bytes to the sink, one serialized write at a
 /// time. Borrows the [`SinkFd`] (`'a`) so the sink descriptor stays open for the
@@ -3135,9 +3359,9 @@ pub struct ForwardToFuture<'a> {
     len: u64,
     /// Bytes whose write has completed.
     forwarded: u64,
-    /// Sink descriptor (borrowed via `SinkFd` for `'a`).
+    /// Where the bytes go: a borrowed descriptor (a file sink is written with
+    /// `pwrite` at `forwarded`) or another connection on this worker.
     target: crate::backend::uring::driver::SinkTarget,
-    /// File sink (`pwrite` at `forwarded` as the offset) vs. socket sink.
     /// Ties the future to whatever the caller borrowed — a `SinkFd`, or the
     /// sink `ConnCtx` — so the sink cannot be dropped mid-forward.
     _borrow: PhantomData<&'a ()>,

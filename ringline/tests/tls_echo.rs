@@ -1082,3 +1082,195 @@ fn tls_tick_close_sends_close_notify() {
         h.join().unwrap().unwrap();
     }
 }
+
+// ── TLS source for forward_to_conn ──────────────────────────────────────
+
+/// A TLS-terminating proxy: decrypt the client's stream and forward the
+/// plaintext body to a cleartext backend with `forward_to_conn`, then read the
+/// backend's echo normally and send it back over TLS.
+///
+/// Only one direction can be a forward. The forward writes bytes onto the sink
+/// as they are, with nothing on the path to encrypt them, so a TLS sink is
+/// refused — the return leg uses an ordinary `send`.
+struct TlsForwardProxy {
+    backend_addr: SocketAddr,
+}
+
+static TLS_FORWARD_BACKEND: OnceLock<SocketAddr> = OnceLock::new();
+
+impl AsyncEventHandler for TlsForwardProxy {
+    #[allow(clippy::manual_async_fn)]
+    fn on_accept(&self, client: ConnCtx) -> impl Future<Output = ()> + 'static {
+        let backend_addr = self.backend_addr;
+        async move {
+            let backend = match client.connect(backend_addr) {
+                Ok(fut) => match fut.await {
+                    Ok(ctx) => ctx,
+                    Err(_) => return,
+                },
+                Err(_) => return,
+            };
+
+            loop {
+                let mut hdr = [0u8; 4];
+                let n = client
+                    .with_data(|data| {
+                        if data.len() < 4 {
+                            return ParseResult::NeedMore;
+                        }
+                        hdr.copy_from_slice(&data[..4]);
+                        ParseResult::Consumed(4)
+                    })
+                    .await;
+                if n == 0 {
+                    break;
+                }
+                let len = u32::from_be_bytes(hdr) as usize;
+
+                match client.forward_to_conn(&backend, len).await {
+                    Ok(f) if f == len => {}
+                    other => {
+                        eprintln!("tls proxy: forward {other:?}, wanted {len}");
+                        break;
+                    }
+                }
+
+                // Return leg: the client is a TLS connection, so it cannot be
+                // a forward sink. Read the echo and send it encrypted.
+                let mut echo = Vec::with_capacity(len);
+                while echo.len() < len {
+                    let remaining = len - echo.len();
+                    let got = backend
+                        .with_data(|data| {
+                            let take = data.len().min(remaining);
+                            echo.extend_from_slice(&data[..take]);
+                            ParseResult::Consumed(take)
+                        })
+                        .await;
+                    if got == 0 {
+                        return;
+                    }
+                }
+                if client.send_nowait(&echo).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        TlsForwardProxy {
+            backend_addr: *TLS_FORWARD_BACKEND.get().expect("backend addr not set"),
+        }
+    }
+}
+
+/// Plaintext echo backend for the TLS forward proxy.
+struct PlainEcho;
+
+impl AsyncEventHandler for PlainEcho {
+    #[allow(clippy::manual_async_fn)]
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            loop {
+                let n = conn
+                    .with_data(|data| {
+                        let _ = conn.send_nowait(data);
+                        ParseResult::Consumed(data.len())
+                    })
+                    .await;
+                if n == 0 {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        PlainEcho
+    }
+}
+
+/// `forward_to_conn` with a TLS source: the bytes come out of rustls, not off
+/// the socket, so they reach the sink by a different route than the plaintext
+/// path uses. Sizes span several TLS records and force the sink to back up.
+#[test]
+fn forward_to_conn_from_a_tls_source() {
+    let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
+
+    let backend_port = free_port();
+    let backend_addr = format!("127.0.0.1:{backend_port}");
+    let (backend_shutdown, backend_handles) =
+        RinglineBuilder::new(test_config_builder().build().expect("valid config"))
+            .bind(backend_addr.parse().unwrap())
+            .launch::<PlainEcho>()
+            .expect("backend launch failed");
+    wait_for_server(&backend_addr);
+    TLS_FORWARD_BACKEND
+        .set(backend_addr.parse().unwrap())
+        .expect("backend addr set once");
+
+    let (certs, key) = generate_self_signed();
+    let proxy_port = free_port();
+    let proxy_addr = format!("127.0.0.1:{proxy_port}");
+    let config = test_config_builder()
+        .tls(TlsConfig::new(server_tls_config(certs.clone(), key)))
+        .forward_hold_cap(1)
+        .build()
+        .expect("valid config");
+    let (proxy_shutdown, proxy_handles) = RinglineBuilder::new(config)
+        .bind(proxy_addr.parse().unwrap())
+        .launch::<TlsForwardProxy>()
+        .expect("proxy launch failed");
+    wait_for_server(&proxy_addr);
+
+    let client_config = client_tls_config(&certs);
+    let server_name: ServerName<'_> = "localhost".try_into().unwrap();
+    let mut tls_conn = rustls::ClientConnection::new(client_config, server_name).unwrap();
+    let mut tcp = TcpStream::connect(&proxy_addr).unwrap();
+    tcp.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    tcp.set_write_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    let mut stream = rustls::Stream::new(&mut tls_conn, &mut tcp);
+
+    for (i, size) in [7usize, 1024, 20_000, 70_000].into_iter().enumerate() {
+        let payload: Vec<u8> = (0..size).map(|b| (b.wrapping_mul(17) + i) as u8).collect();
+        // Header alone first, then the body in pieces. If the whole request
+        // arrives before the handler parses the header, every byte is already
+        // in the accumulator when the forward starts and the path that routes
+        // freshly decrypted plaintext into a *running* forward never runs.
+        stream.write_all(&(size as u32).to_be_bytes()).unwrap();
+        stream.flush().unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        for chunk in payload.chunks(4096) {
+            stream.write_all(chunk).unwrap();
+            stream.flush().unwrap();
+        }
+
+        let mut got = vec![0u8; size];
+        let mut total = 0;
+        while total < size {
+            match stream.read(&mut got[total..]) {
+                Ok(0) => panic!("proxy closed at {size}B after {total}B"),
+                Ok(n) => total += n,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => panic!("TLS read error at {size}B: {e}"),
+            }
+        }
+        assert_eq!(got, payload, "payload mismatch at {size}B");
+    }
+
+    // `stream` borrows `tcp`; ending the borrow is what lets the socket close.
+    let _ = stream;
+    drop(tcp);
+    proxy_shutdown.shutdown();
+    for h in proxy_handles {
+        h.join().unwrap().unwrap();
+    }
+    backend_shutdown.shutdown();
+    for h in backend_handles {
+        h.join().unwrap().unwrap();
+    }
+}

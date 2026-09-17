@@ -258,6 +258,9 @@ pub use runtime::io::Deadline;
 pub use runtime::io::DiskIoFuture;
 /// Error returned when a [`timeout()`] expires.
 pub use runtime::io::Elapsed;
+/// Future returned by the mio [`ConnCtx::forward_to_conn()`] (copy path).
+#[cfg(not(has_io_uring))]
+pub use runtime::io::ForwardToConnFuture;
 /// Future returned by [`ConnCtx::forward_to()`] (segmented recv, Mode A).
 #[cfg(has_io_uring)]
 pub use runtime::io::ForwardToFuture;

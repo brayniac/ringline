@@ -67,6 +67,23 @@ impl PendingSend {
     }
 }
 
+/// An in-flight `forward_to_conn` on the mio backend, indexed by source.
+///
+/// mio has no provided-buffer ring to hold, so unlike the io_uring Mode A
+/// state this carries no backing — the bytes are copied into a queued send on
+/// the sink as they are read, and all that survives between reads is where
+/// they are going and how many are left.
+pub(crate) struct MioForwardState {
+    pub(crate) sink_index: u32,
+    /// Sink generation at the start. Slots recycle; a forward that kept
+    /// writing to a reused index would deliver this stream to another peer.
+    pub(crate) sink_generation: u32,
+    /// Bytes the caller asked to forward.
+    pub(crate) len: u64,
+    /// Bytes queued on the sink so far.
+    pub(crate) forwarded: u64,
+}
+
 /// Clone an `io::Error` well enough to hand the same failure to several
 /// waiters. `io::Error` is not `Clone`, and a bounded-send fan-out has to
 /// give every discarded id an equivalent error: the OS errno is preserved
@@ -169,6 +186,24 @@ pub(crate) struct Driver {
     /// pointer), and (b) closes the reuse window between a task closing a
     /// connection and its own post-poll cleanup.
     pub(crate) pending_closes: Vec<u32>,
+    /// Per-connection `forward_to_conn` state, indexed by the **source**.
+    pub(crate) forward_conn: Vec<Option<MioForwardState>>,
+    /// Terminal result of a forward, set once by the event loop and consumed
+    /// by the future: `Ok(bytes forwarded)` or `Err(errno)`.
+    pub(crate) forward_done: Vec<Option<Result<u64, i32>>>,
+    /// Reverse index, sink → source, so a sink's teardown can fail the forward
+    /// that feeds it instead of leaving its future parked forever.
+    pub(crate) forward_feeder: Vec<Option<u32>>,
+    /// Sources that stopped reading because their sink hit `forward_hold_cap`
+    /// and must be re-read once it drains. Edge-triggered epoll will not
+    /// re-notify a socket we chose not to drain, so the loop keeps the list.
+    pub(crate) forward_resume: Vec<u32>,
+    /// Membership flag for `forward_resume` (no duplicate entries).
+    pub(crate) forward_resume_flag: Vec<bool>,
+    /// Queued sends allowed on a sink before its source stops reading. Shares
+    /// `Config::forward_hold_cap` with the io_uring hold cap: same intent —
+    /// bound one slow forward — applied to the queue mio actually has.
+    pub(crate) forward_hold_cap: usize,
     /// Per-connection queue of awaitable-send byte counts.
     /// `DriverCtx::send_await()` pushes len here; the event loop drains
     /// these and calls `Executor::wake_send()` for each.
@@ -335,6 +370,12 @@ impl Driver {
             connect_deadlines: vec![None; max_conn],
             wake_pipe_fd: eventfd,
             tcp_nodelay: config.tcp_nodelay,
+            forward_conn: (0..max_conn).map(|_| None).collect(),
+            forward_done: vec![None; max_conn],
+            forward_feeder: vec![None; max_conn],
+            forward_resume: Vec::new(),
+            forward_resume_flag: vec![false; max_conn],
+            forward_hold_cap: config.forward_hold_cap,
             send_completions: (0..max_conn).map(|_| VecDeque::new()).collect(),
             bounded_send_completions: VecDeque::new(),
             capacity_released: false,
@@ -536,6 +577,90 @@ impl Driver {
             &mut self.capacity_released,
             err,
         );
+    }
+
+    /// Queue forwarded bytes on the sink. Returns false if the sink is gone or
+    /// its slot was recycled, which fails the forward.
+    pub(crate) fn forward_push(&mut self, source: u32, data: &[u8]) -> bool {
+        let Some(st) = self.forward_conn[source as usize].as_ref() else {
+            return false;
+        };
+        let (sink, sink_gen) = (st.sink_index, st.sink_generation);
+        if self.connections.generation(sink) != sink_gen
+            || self.tcp_streams[sink as usize].is_none()
+        {
+            return false;
+        }
+        self.pending_sends[sink as usize].push_back(PendingSend::plain(data.to_vec()));
+        self.mark_send_dirty(sink as usize);
+        if let Some(st) = self.forward_conn[source as usize].as_mut() {
+            st.forwarded += data.len() as u64;
+        }
+        true
+    }
+
+    /// Move what the accumulator is holding into a running forward, up to its
+    /// remaining length, and settle the forward if that satisfies it.
+    ///
+    /// Two callers need this. A forward starts after the handler parsed a
+    /// length header, so the body bytes that arrived with the header are
+    /// already in the accumulator and are the front of the forward. And a TLS
+    /// source has no other route: `feed_tls_recv_mio` decrypts into the
+    /// accumulator, so forwarded plaintext is collected from there rather than
+    /// from the socket read.
+    ///
+    /// Returns the settled result if the forward ended here, so the caller can
+    /// wake the waiting task.
+    pub(crate) fn forward_take_accumulated(&mut self, source: u32) -> Option<Result<u64, i32>> {
+        let st = self.forward_conn[source as usize].as_ref()?;
+        let remaining = st.len.saturating_sub(st.forwarded) as usize;
+        let available = self.accumulators.data(source).len().min(remaining);
+        if available > 0 {
+            let head = self.accumulators.data(source)[..available].to_vec();
+            self.accumulators.consume(source, available);
+            if !self.forward_push(source, &head) {
+                self.finish_forward(source, Err(libc::EPIPE));
+                return Some(Err(libc::EPIPE));
+            }
+        }
+        if available >= remaining {
+            let forwarded = self.forward_conn[source as usize]
+                .as_ref()
+                .map_or(0, |st| st.forwarded);
+            self.finish_forward(source, Ok(forwarded));
+            return Some(Ok(forwarded));
+        }
+        None
+    }
+
+    /// Whether the sink's queue has reached the cap that stops the source
+    /// reading. Without this a slow sink grows the queue without bound: mio
+    /// cannot decline to read the way a depleted provided ring does.
+    pub(crate) fn forward_sink_full(&self, source: u32) -> bool {
+        self.forward_conn[source as usize]
+            .as_ref()
+            .is_some_and(|st| {
+                self.pending_sends[st.sink_index as usize].len() >= self.forward_hold_cap
+            })
+    }
+
+    /// Mark a source to be re-read once its sink drains. Edge-triggered epoll
+    /// will not tell us again, so the loop has to come back on its own.
+    pub(crate) fn mark_forward_resume(&mut self, source: u32) {
+        let i = source as usize;
+        if !self.forward_resume_flag[i] {
+            self.forward_resume_flag[i] = true;
+            self.forward_resume.push(source);
+        }
+    }
+
+    /// Settle a forward and leave the result for the waiting future.
+    pub(crate) fn finish_forward(&mut self, source: u32, result: Result<u64, i32>) {
+        let i = source as usize;
+        if let Some(st) = self.forward_conn[i].take() {
+            self.forward_feeder[st.sink_index as usize] = None;
+        }
+        self.forward_done[i] = Some(result);
     }
 
     /// Record `idx` in the dirty-sends list so the event loop's flush pass

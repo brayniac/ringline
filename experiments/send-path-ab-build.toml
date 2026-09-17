@@ -41,12 +41,28 @@ cd /home/anvil
       cargo build --release -p ringline-bench --bin bench-server --bin bench-client
       cp target/release/bench-server ../out/bench-server-$label-uring
       cp target/release/bench-client ../out/bench-client-$label-uring
-      cargo build --release -p ringline-bench --features ringline/force-mio --bin bench-server
+      # `--features force-mio`, not `--features ringline/force-mio`: the
+      # latter flips ringline's backend without flipping ringline-bench's own
+      # `has_io_uring` cfg (its build.rs keys off the bench crate's feature,
+      # added in #402), so the bench compiles io_uring-only calls against a
+      # mio runtime and fails — leaving the previous binary in place.
+      cargo build --release -p ringline-bench --features force-mio --bin bench-server
       cp target/release/bench-server ../out/bench-server-$label-mio
-      ( cd .. && ./out/bench-server-$label-mio --help >/dev/null )
     ) || exit 1
   done
   ( cd out && sha256sum * )
+  # Prove each binary is the backend its name claims. A failed build leaves
+  # the previous binary in place, and two arms that are secretly the same
+  # binary report a dead heat — which looks like a result.
+  for label in before after; do
+    for want in uring mio; do
+      got=$(./out/bench-server-$label-$want --print-backend)
+      case "$want:$got" in
+        uring:io_uring|mio:mio) echo "backend ok: $label-$want -> $got" ;;
+        *) echo "BACKEND MISMATCH: $label-$want built as $got"; exit 1 ;;
+      esac
+    done
+  done
   tar czf bench-bins.tgz out
 } 2>&1 | tee /home/anvil/build.log
 rc=${PIPESTATUS[0]}
