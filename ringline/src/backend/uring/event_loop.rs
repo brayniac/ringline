@@ -1214,11 +1214,22 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     metrics::POOL.increment(metrics::pool::RECV_PARKED);
                 }
             } else if errno == libc::ECANCELED {
-                // A cancel terminated the multishot. If this connection was
-                // throttled by the Mode A hold cap, this is the ECANCELED for that
-                // throttle-cancel — `recv_multishot_armed` was just cleared at the
-                // top of the handler, so try to re-arm now if the hold has already
-                // drained below the cap (otherwise a later write completion will).
+                // A cancel terminated the multishot. Whatever was armed is gone
+                // now, `IORING_CQE_F_MORE` or not: a cancel posts `-ECANCELED`
+                // only for a request it actually found live, and at most one
+                // multishot recv per (connection, generation) is ever live, so
+                // this CQE belongs to the current arming even when the flag
+                // says the request continues. Trusting the flag left the
+                // connection marked armed against a multishot the kernel had
+                // already killed — no data ever arrived again, and every
+                // re-arm path declined because it looked armed.
+                if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+                    cs.recv_multishot_armed = false;
+                }
+                // If this connection was throttled by the Mode A hold cap, this
+                // is the ECANCELED for that throttle-cancel: re-arm now if the
+                // hold has already drained below the cap (otherwise a later
+                // write completion will).
                 self.maybe_rearm_throttled_forward(conn_index);
                 // The cancel may also have landed on a *different* multishot
                 // than the one it was aimed at: it matches by user_data, and a
@@ -8780,6 +8791,45 @@ mod tests {
                 .unwrap()
                 .recv_multishot_armed,
             "the connection must be reading again once the forward is over"
+        );
+    }
+
+    /// An ECANCELED that still carries `IORING_CQE_F_MORE` must not leave the
+    /// connection believing it is armed.
+    ///
+    /// `-ECANCELED` is posted only for a request the cancel found live, and a
+    /// connection has at most one live multishot recv per generation — so the
+    /// CQE belongs to the current arming whatever the flag says. Trusting the
+    /// flag left `recv_multishot_armed` set against a multishot the kernel had
+    /// already killed, and every re-arm path then declined because the
+    /// connection looked armed. Observed as a forward parked at 4096 of 8192
+    /// bytes, flagged armed, with no data ever arriving.
+    #[test]
+    fn ecanceled_with_more_flag_still_rearms() {
+        const IORING_CQE_F_MORE: u32 = 1 << 1;
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        el.driver
+            .connections
+            .get_mut(conn_index)
+            .unwrap()
+            .recv_multishot_armed = true;
+
+        let recv_ud = UserData::encode(
+            OpTag::RecvMulti,
+            conn_index,
+            el.driver.connections.generation(conn_index),
+        );
+        el.test_dispatch_cqe(recv_ud.raw(), -libc::ECANCELED, IORING_CQE_F_MORE);
+
+        assert!(
+            el.driver
+                .connections
+                .get(conn_index)
+                .unwrap()
+                .recv_multishot_armed,
+            "the connection must end up armed again — by a fresh multishot, not \
+             by a stale flag"
         );
     }
 
