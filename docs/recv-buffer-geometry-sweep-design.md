@@ -1,7 +1,7 @@
 # Recv buffer geometry sweep — design
 
-**Status:** Phase 0 landed (#417 — the dump, its gate, and the bug the gate
-found); Phase A running (#416). #415 merged as 282773b.
+**Status:** **Phase A complete — the default stands.** Phase 0 landed (#417);
+#415 merged as 282773b. Outcome below.
 
 **Question:** ringline's provided recv ring defaults to `recv_buffer(256, 16384)`
 — 256 buffers of 16 KiB, 4 MiB per worker. Is that the right default, and is one
@@ -11,6 +11,60 @@ default right for every delivery mode?
 14.0 Gbit/s at `recv_buffer(64, 65536)` — same memory, a quarter as many buffers,
 four times the size. That is a 25% throughput difference sitting behind a knob
 nobody turns.
+
+## Outcome (Phase A, 2026-09-17)
+
+**Do not change the default.** `recv_buffer(256, 16384)` is minimax-optimal
+across the measured space: it never wins a workload and never loses badly,
+which is what a default is for.
+
+Two saturated passes at 2 workers, identical but for fan-in — 64 and 1024
+connections — 6 message shapes each, 108 arms. Worst-case deficit against the
+best geometry that fits the same 4 MiB budget:
+
+| geometry (≤4 MiB) | worst | median |
+|---|---|---|
+| **16 KiB × 256 (default)** | **−34%** | −6% |
+| 64 KiB × 64 | −36% | −5% |
+| 256 KiB × 16 | −59% | −8% |
+| 4 KiB × 1024 | −70% | −24% |
+| 1 MiB × 4 | −83% | −6% |
+
+Every alternative is excellent somewhere and catastrophic elsewhere. 1 MiB × 4
+wins four workloads outright and is 83% down on another (with a **1.03-second
+p99** at 256 B × 1024 connections, from 137,895,774 ring starvations). 4 KiB ×
+1024 wins small-message/high-fan-in and loses 70% on forwarding.
+
+**Why no geometry wins: the optimum moves along two axes, in opposite
+directions.** Six different geometries win the twelve workloads.
+
+- **Message size** pulls toward *bigger* buffers — payload per completion
+  amortises a fixed ~6,600-instruction per-completion cost (#415).
+- **Fan-in** pulls toward *deeper* rings — depth bounds concurrent arrivals, and
+  at a fixed memory budget depth and size trade directly.
+
+At 64 connections the first dominates and 64 KiB × 64 is best; at 1024 the
+second does, the same geometry falls 33% behind, and 4 KiB × 1024 wins. A
+library cannot know either axis in advance, so a fixed default can only be
+*mediocre everywhere*, which this one is: within ~6% of best on 9 of 12
+workloads.
+
+**The one exception is forwarding**, and it is systematic: the default is
+**−34%** at 64 connections and **−18%** at 1024. `forward_to`'s sizing note is
+therefore load-bearing rather than advisory. Note the recommendation itself is
+fan-in dependent — 1 MiB × 4 is best at c64 (17.07 Gbit/s vs 11.32) while 256
+KiB × 16 is best at c1024 (11.96 vs 9.82) — so the note should give a range and
+say why, not a number.
+
+**Cross-validation.** The forward arms reproduce #415 on an independently built
+harness: 11.32 Gbit/s at the default here vs 11.2 there, 14.26 at 64 KiB vs
+14.0. Two harnesses, same operating point, within 2%.
+
+**What this bounds for #416's remaining phases.** The tuning burden a
+geometry-aware runtime could remove is ~6% median and ~11% worst for
+request/response, and 18–34% for forwarding. Phase B's refinement pass is
+therefore only worth running around the forwarding knee; refining 4/8/16/32 KiB
+for echo would be chasing single-digit percentages that the fan-in axis swamps.
 
 ## The contradiction this has to resolve
 

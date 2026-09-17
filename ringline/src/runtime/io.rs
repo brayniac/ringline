@@ -1161,9 +1161,29 @@ impl ConnCtx {
     /// of all work to 10%; the remaining ~0.86 instructions/byte is the
     /// kernel's copy and TCP work, which no buffer size touches.
     ///
-    /// The default (derived from the echo-shaped `recv_buffer` sizing, where
-    /// the knee is 8–16 KiB) is therefore the wrong end of this trade for a
-    /// forwarding workload. A proxy should ask for 64 KiB buffers explicitly.
+    /// A geometry sweep (#416) put a number on how much the default costs a
+    /// forwarding workload: **34% at 64 connections, 18% at 1024**. It is the
+    /// only workload measured where the default is systematically far from
+    /// best — for request/response it is within ~6%.
+    ///
+    /// # How big, though
+    ///
+    /// **64 KiB to 256 KiB**, and the right end depends on fan-in, because
+    /// buffer size and ring depth trade against each other at a fixed memory
+    /// budget:
+    ///
+    /// - few connections per worker → payload per completion dominates.
+    ///   `recv_buffer(4, 1 << 20)` measured 17.07 Gbit/s against the default's
+    ///   11.32 at 64 connections.
+    /// - many connections per worker → ring depth dominates, and the same
+    ///   4-deep ring collapses. At 1024 connections it managed 11.03 Gbit/s
+    ///   with 16.8 million ring starvations, while `recv_buffer(16, 1 << 18)`
+    ///   led at 11.96.
+    ///
+    /// `recv_buffer(16, 1 << 18)` (256 KiB × 16, still 4 MiB) is the safer
+    /// default for a proxy: near-best at high fan-in and within 13% of best at
+    /// low. Go larger only if the connection count per worker is known to be
+    /// small.
     ///
     /// Resolves to `Ok(bytes_forwarded)`. `bytes_forwarded == len` on success; a
     /// value `< len` means the peer closed (FIN) before `len` bytes arrived — the

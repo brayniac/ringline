@@ -1,6 +1,8 @@
 # Incremental provided-buffer consumption (`IOU_PBUF_RING_INC`)
 
-- **Status:** open — intent recorded before building, per the journal ground rules
+- **Status:** open — intent recorded before building, per the journal ground
+  rules. **Phase A (2026-09-17) narrowed the case: see "What Phase A did to
+  criterion 1".**
 - **Span:** 2026-09-17 → (open) · follows #415 (282773b), blocks on #416 Phase A
 
 ## Goal
@@ -82,6 +84,41 @@ found.** Mode A is not starving and not memory-bound; it is paying a fixed
 per-completion cost that only a larger payload per completion amortises. If this
 effort proceeds, it should add a **criterion E** to that entry rather than
 quietly contradict it.
+
+## What Phase A did to criterion 1
+
+Two saturated passes (#416, 2 workers, 64 vs 1024 connections, 108 arms)
+measured the gap between the shipped default and the best geometry chosen with
+hindsight at the same memory budget — the "tuning burden" criterion 1 asks
+about. The homogeneous version of that gap is now known:
+
+| workload | default vs best-with-hindsight |
+|---|---|
+| echo, 5 message sizes, both fan-ins | −4% to −11% (one −19%) |
+| **forward stream, 64 conns** | **−34%** |
+| **forward stream, 1024 conns** | **−18%** |
+
+**This is narrower than the case this entry opened with, and the entry should
+say so.** For request/response traffic the default is within ~6% of the best
+tuned geometry, so there is little burden for INC to remove — criterion 1's
+">10% throughput" bar is not met there. The case now rests on **forwarding and
+streaming**, where the gap is 18–34% and systematic across both fan-ins.
+
+What Phase A *did* confirm is the mechanism, in a stronger form than expected.
+The optimum moves along **two** axes in opposite directions — message size pulls
+toward bigger buffers (payload per completion), fan-in pulls toward deeper rings
+(concurrent arrivals) — and at fixed memory those trade directly. Six different
+geometries win the twelve workloads; 1 MiB × 4 is the outright winner on four of
+them and 83% down on another, with a **1.03-second p99** at 256 B × 1024
+connections. So "you cannot pick one geometry" is established. What is *not*
+established is that the resulting loss is large enough to justify a recv-path
+rework, except for forwarding.
+
+Criterion 1 therefore stands, with its target changed: measure the oracle gap on
+a **mixed** workload **on the forwarding path**, where the homogeneous gap is
+already 18–34%, rather than on request/response where it is ~6%. If a mixture
+does not exceed the worst of its components there, this should be recorded
+NO-GO.
 
 ## Why this is not a flag flip
 
