@@ -902,10 +902,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     }
 
     /// Whether a parked connection may take the fallback recv path:
-    /// plaintext accumulator route only (no TLS, recv sink, zero-copy
-    /// forward, or direct echo — those paths keep the park-until-replenish
-    /// behavior) with a partial message already accumulated. The caller
-    /// has already checked liveness and that no fallback is in flight.
+    /// plaintext accumulator route only (no TLS, recv sink, segmented
+    /// delivery, zero-copy forward, or direct echo — those paths keep the
+    /// park-until-replenish behavior) with a partial message already
+    /// accumulated. The caller has already checked liveness and that no
+    /// fallback is in flight.
     fn fallback_eligible(&mut self, conn_index: u32) -> bool {
         let ci = conn_index as usize;
         let is_tls = self
@@ -918,8 +919,23 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             .connections
             .get(conn_index)
             .is_some_and(|c| c.direct_echo);
+        // Segmented delivery (`forward_to`/`forward_to_conn`, `with_segments`)
+        // is defined over provided buffers: a segment is a held bid, and the
+        // hold is where a reader looks. The fallback reads into a pool slot and
+        // can only append to the accumulator, so on a segmented connection it
+        // does not merely bypass the reader — it reorders the stream, since
+        // bytes already held are earlier than the ones it appends. A forward
+        // source is the worst case: it never looks at the accumulator at all,
+        // so the fallback chain feeds bytes into a buffer nobody reads while
+        // the forward waits for a segment that cannot arrive, forever. It is
+        // reachable because a forward's own overshoot tail (bytes past `len`)
+        // lands in the accumulator, which is exactly the "half-delivered
+        // message" this path takes as its cue.
+        let is_segmented =
+            self.driver.recv_domain[ci] == crate::recv::domain::RecvDomain::Segmented;
         if is_tls
             || is_direct_echo
+            || is_segmented
             || self.driver.recv_forward[ci]
             || self.executor.recv_sinks[ci].is_some()
         {
@@ -9221,6 +9237,44 @@ mod tests {
         assert!(
             el.driver.recv_starved.contains(&conn_index),
             "connection should stay parked"
+        );
+    }
+
+    /// A segmented connection must never take the fallback recv.
+    ///
+    /// The fallback reads into a pool slot and can only append to the
+    /// accumulator, while a segmented reader takes its bytes from the hold —
+    /// so the fallback both bypasses the reader and reorders the stream
+    /// (held bytes are earlier than anything it appends). For a `forward_to`
+    /// source it is fatal: the forward never reads the accumulator, so the
+    /// fallback chain feeds a buffer nobody reads while the forward waits for
+    /// a segment that cannot come. The proxy test in `tests/echo.rs` hung this
+    /// way on 29 of 30 runs; an in-memory trace ring showed an unbroken
+    /// `fb-submit`/`fb-done` loop with the accumulator climbing.
+    ///
+    /// The trigger is the forward's own doing: bytes past `len` are stashed in
+    /// the accumulator, which is exactly the half-delivered message this path
+    /// takes as its cue to degrade.
+    #[test]
+    fn segmented_connection_never_takes_the_fallback_recv() {
+        let mut el = make_test_loop();
+        let conn_index = park_connection(&mut el);
+        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
+        el.driver.forward_recv_active[conn_index as usize] = true;
+        // The overshoot tail a forward stashes when a held buffer runs past
+        // `len` — a non-empty accumulator is what makes fallback eligible.
+        assert!(el.driver.accumulators.append(conn_index, b"tail past len"));
+
+        el.flush_replenish_and_rearm();
+
+        assert!(
+            !el.driver.recv_fallback_inflight[conn_index as usize],
+            "a segmented connection must not take the fallback recv"
+        );
+        assert_eq!(el.driver.recv_fallback_count, 0);
+        assert!(
+            el.driver.recv_starved.contains(&conn_index),
+            "it stays parked until buffers come back, as before the fallback existed"
         );
     }
 
