@@ -179,15 +179,20 @@ re-opening the class of bug that #236–#244 and #415 spent their time closing.
 
 ## Plan
 
-0. **Harness prerequisite:** `bench-client` has no size distribution —
-   `--msg-size` is scalar, and its op accounting counts bytes
+0. **Mixed traffic needs no new client code.** `bench-client` has no size
+   distribution — `--msg-size` is scalar, and its op accounting counts bytes
    (`(recorded + 1) * msg_size <= total_read`), which only works for a uniform
-   size. A per-*operation* mix would mean reworking that accounting. A
-   per-*connection* draw from a weighted distribution gets the property that
-   matters — one ring serving 256 B and 1 MiB arrivals concurrently — while each
-   connection stays uniform and the accounting stands. Document that it does not
-   exercise within-connection variation; the ring is shared per worker, so
-   across-connection mixing is what it sees anyway.
+   size — but the property that matters is *one ring serving two size
+   populations at once*, and two concurrent client processes against one server
+   produce exactly that. It is also the better experiment: each population
+   reports its own throughput and p99, so the table shows **which** population
+   pays. An aggregate would hide the failure mode worth finding, which is the
+   small messages starving while the large ones hold the ring.
+
+   What it does not exercise is *within-connection* size variation. The ring is
+   shared per worker and sees arrivals from every connection, so across-connection
+   mixing is what reaches it either way; a per-operation mix would test the
+   consumer's framing, not the ring's geometry.
 1. Land #416 Phase A; read the homogeneous surface, which bounds criterion 3 but
    cannot decide criterion 1.
 2. Measure the oracle gap: default vs hindsight-best vs misconfigured, on a
