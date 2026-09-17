@@ -758,6 +758,7 @@ impl Driver {
             }
 
             // Advance through the pending sends by the number of bytes written.
+            crate::metrics::BYTES.add(crate::metrics::bytes::SENT, result as u64);
             let mut remaining = result as usize;
             total_written += result as u32;
             while remaining > 0 {

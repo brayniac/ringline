@@ -11,7 +11,7 @@ use clap::Parser;
 
 /// Everything the proxy mode needs, bundled because the argument list had
 /// outgrown what clippy will accept and most of it travels together anyway.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct ProxyCfg {
     addr: SocketAddr,
     workers: usize,
@@ -22,6 +22,7 @@ struct ProxyCfg {
     conn_chunk_size: usize,
     pin_to_core: bool,
     api: ProxyApi,
+    metrics_out: Option<std::path::PathBuf>,
 }
 
 /// Which forwarding entry point the proxy arm drives.
@@ -142,6 +143,17 @@ struct Args {
     #[arg(long)]
     print_backend: bool,
 
+    /// (ringline) Write ringline's runtime counters to this path as JSON when
+    /// the server shuts down, and print the interesting ones to stderr.
+    ///
+    /// `buffer_ring_empty`, `recv_parked`, `recv_fallback`,
+    /// `forward_throttled` and friends are what separate "this arm was slower"
+    /// from "this arm starved its provided ring", which a throughput number
+    /// alone cannot say. A sweep over buffer geometry is guesswork without
+    /// them.
+    #[arg(long)]
+    metrics_out: Option<std::path::PathBuf>,
+
     /// (ringline, `--proxy-backend` only) Which forwarding API the proxy uses.
     /// `conn` (`forward_to_conn`) runs on both backends and is what an
     /// io_uring-vs-mio comparison must use; `sink-fd` (`forward_to` over a
@@ -223,6 +235,23 @@ fn apply_cpu_affinity(_cpus: &[usize]) {
     eprintln!("bench-server: --cpu-list ignored (CPU affinity unsupported on this platform)");
 }
 
+/// Print ringline's runtime counters, and write them to `path` if one was
+/// given. Called after the shutdown signal so the numbers cover the whole run.
+fn dump_runtime_metrics(path: Option<&std::path::Path>) {
+    ringline_bench::runtime_metrics::print_summary();
+    if let Some(path) = path {
+        match ringline_bench::runtime_metrics::dump_to(path) {
+            Ok(()) => eprintln!("bench-server: wrote runtime metrics to {}", path.display()),
+            // Loud: an arm whose counters did not land cannot be explained
+            // later, and a silently missing file looks like a healthy run.
+            Err(e) => eprintln!(
+                "bench-server: FAILED to write runtime metrics to {}: {e}",
+                path.display()
+            ),
+        }
+    }
+}
+
 /// The backend this binary was compiled against, as a word.
 const RINGLINE_BACKEND: &str = if cfg!(has_io_uring) {
     "io_uring"
@@ -283,11 +312,13 @@ fn main() {
             conn_chunk_size: args.conn_chunk_size,
             pin_to_core,
             api: args.proxy_api,
+            metrics_out: args.metrics_out.clone(),
         }),
         Runtime::Ringline => run_ringline(
             args.addr,
             workers,
             args.msg_size,
+            args.metrics_out.clone(),
             if args.recv_forward {
                 EchoMode::RecvForward
             } else {
@@ -350,6 +381,7 @@ fn run_ringline_proxy(cfg: ProxyCfg) {
         conn_chunk_size,
         pin_to_core,
         api,
+        metrics_out,
     } = cfg;
     use ringline::{AsyncEventHandler, ConnCtx, RinglineBuilder};
 
@@ -457,6 +489,7 @@ fn run_ringline_proxy(cfg: ProxyCfg) {
         (recv_ring_size as u64 * recv_buf as u64) / (1024 * 1024)
     );
     shutdown.wait_on_signal();
+    dump_runtime_metrics(metrics_out.as_deref());
     for h in handles {
         h.join().ok();
     }
@@ -467,6 +500,7 @@ fn run_ringline(
     addr: SocketAddr,
     workers: usize,
     msg_size: usize,
+    metrics_out: Option<std::path::PathBuf>,
     echo_mode: EchoMode,
     conn_chunk_size: usize,
     pin_to_core: bool,
@@ -594,6 +628,7 @@ fn run_ringline(
     // `[ringline diag]`/`[ringline stall]` counter dump. (A SIGKILL at
     // teardown skips that, hiding the server-side loop diagnostics.)
     shutdown.wait_on_signal();
+    dump_runtime_metrics(metrics_out.as_deref());
 
     for h in handles {
         h.join().ok();
