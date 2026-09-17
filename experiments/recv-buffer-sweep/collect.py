@@ -104,7 +104,12 @@ def collect(exp_ids):
                     "mib_per_worker": int(arm["buf"]) * int(arm["ring"]) / (1024 * 1024),
                     "ops_per_sec": res.get("ops_per_sec"),
                     "gbit_per_sec": res.get("gbit_per_sec"),
-                    "p99_ns": (res.get("latency") or {}).get("p99_ns"),
+                    # bench-client emits the percentiles at the top level, not
+                    # under a `latency` object. Reading the wrong shape yields
+                    # None for every arm, which silently drops the p99 half of
+                    # the decision rule — so accept both and assert below.
+                    "p50_ns": res.get("p50_ns"),
+                    "p99_ns": res.get("p99_ns") or (res.get("latency") or {}).get("p99_ns"),
                     "have_metrics": have_metrics,
                     "ring_empty": counter(metrics, "ringline/pool", "buffer_ring_empty"),
                     "recv_parked": counter(metrics, "ringline/pool", "recv_parked"),
@@ -128,7 +133,12 @@ def main():
         sys.exit(1)
 
     rows.sort(key=lambda r: (r["mode"], r["msg"], r["conns"], r["buf"], r["ring"]))
-    hdr = f"{'arm':<46}{'MiB/wkr':>9}{'ops/s':>12}{'Gbit/s':>9}{'ring_empty':>12}{'parked':>10}{'fallback':>10}"
+    # A silently-absent latency would drop half the decision rule. Echo arms
+    # always have one; a stream arm reports throughput only.
+    missing = [r["arm"] for r in rows if r["mode"] == "echo" and r["p99_ns"] is None]
+    if missing:
+        print(f"  ! {len(missing)} echo arms have no p99: {missing[:3]}", file=sys.stderr)
+    hdr = f"{'arm':<46}{'MiB/wkr':>9}{'ops/s':>12}{'Gbit/s':>9}{'p99 us':>9}{'ring_empty':>12}{'parked':>10}"
     print(hdr)
     print("-" * len(hdr))
     for r in rows:
@@ -139,10 +149,10 @@ def main():
         star = "" if r["have_metrics"] else "  (no metrics)"
         ring_empty = f"{r['ring_empty']:,}" if r["have_metrics"] else "?"
         parked = f"{r['recv_parked']:,}" if r["have_metrics"] else "?"
-        fb = f"{r['recv_fallback']:,}" if r["have_metrics"] else "?"
+        p99 = f"{r['p99_ns'] / 1000:,.0f}" if r["p99_ns"] else "-"
         print(
-            f"{r['arm']:<46}{r['mib_per_worker']:>9.1f}{ops:>12}{gb:>9}"
-            f"{ring_empty:>12}{parked:>10}{fb:>10}{star}"
+            f"{r['arm']:<46}{r['mib_per_worker']:>9.1f}{ops:>12}{gb:>9}{p99:>9}"
+            f"{ring_empty:>12}{parked:>10}{star}"
         )
 
     if args.json_out:
