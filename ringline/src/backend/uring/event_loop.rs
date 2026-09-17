@@ -8638,6 +8638,61 @@ mod tests {
         );
     }
 
+    /// A forward that ends while its throttle-cancel is still in flight must
+    /// still leave the connection reading.
+    ///
+    /// `settle_forward_end` used to clear `forward_hold_throttled` in that case
+    /// and re-arm nothing — it cannot re-arm while the old multishot is still
+    /// live, two with the same user_data must never overlap. But the ECANCELED
+    /// branch's re-arm is gated on exactly that flag, and nothing else re-arms a
+    /// connection that has stopped forwarding, so the connection stayed unarmed
+    /// and the handler's next `with_data` parked forever. Found by the
+    /// length-prefixed proxy test in `tests/echo.rs` at `forward_hold_cap(1)`,
+    /// where it reproduced about one run in three.
+    #[test]
+    fn settle_forward_end_with_cancel_in_flight_rearms_from_ecanceled() {
+        let cap = 1;
+        let mut el = make_test_loop_with_config(config_with_forward_cap(cap));
+        let conn_index = accept_connection(&mut el);
+        let ci = conn_index as usize;
+        el.driver.recv_domain[ci] = crate::recv::domain::RecvDomain::Segmented;
+        el.driver.forward_recv_active[ci] = true;
+        el.driver
+            .connections
+            .get_mut(conn_index)
+            .unwrap()
+            .recv_multishot_armed = true;
+
+        // One segment reaches the cap, so the recv is cancelled.
+        deliver_segment(&mut el, conn_index, 0, b"x");
+        assert!(el.driver.forward_hold_throttled[ci], "throttled at the cap");
+
+        // The forward finishes first: the future drains the hold and settles,
+        // all before the cancel's ECANCELED comes back.
+        el.driver.segment_hold[ci].pop_front();
+        assert!(el.driver.settle_forward_end(conn_index));
+        assert!(
+            el.driver.forward_hold_throttled[ci],
+            "the flag has to survive settle, or the ECANCELED re-arm is skipped"
+        );
+
+        let recv_ud = UserData::encode(
+            OpTag::RecvMulti,
+            conn_index,
+            el.driver.connections.generation(conn_index),
+        );
+        el.test_dispatch_cqe(recv_ud.raw(), -libc::ECANCELED, 0);
+        assert!(!el.driver.forward_hold_throttled[ci]);
+        assert!(
+            el.driver
+                .connections
+                .get(conn_index)
+                .unwrap()
+                .recv_multishot_armed,
+            "the connection must be reading again once the forward is over"
+        );
+    }
+
     /// Mode A hold cap: closing a connection while it is throttled drains its held
     /// bids exactly once (no leak, no double-replenish), and a later stale
     /// ECANCELED for the throttle-cancel is a no-op.
