@@ -244,6 +244,22 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.flush_all_pending_sends();
             self.drain_send_completions();
 
+            // 6a-bis. A forwarding source that stopped reading because its
+            // sink was backed up gets no further readable event from
+            // edge-triggered epoll (interest is registered once and never
+            // toggled), so the loop has to come back to it deliberately once
+            // the flush above drained the sink.
+            //
+            // This alternates rather than running once: the resumed read
+            // queues more on the sink, and nothing else will wake the loop for
+            // bytes we queued ourselves. It ends when every waiting source is
+            // either drained to EWOULDBLOCK (nothing left to resume) or blocked
+            // again on a sink the flush could not empty.
+            while self.drain_forward_resumes(&mut recv_buf) {
+                self.flush_all_pending_sends();
+                self.drain_send_completions();
+            }
+
             // 6b. Finish teardown of connections closed during this
             // iteration: executor cleanup (parked futures, waiter flags,
             // recv sinks) before the slot is released for reuse.
@@ -515,6 +531,118 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
     }
 
+    /// Route bytes just read from a forwarding source to its sink.
+    ///
+    /// Returns false only when the socket must not be read again this pass —
+    /// an accumulator overflow, which closes the connection. A forward that
+    /// *ends* here (sink gone, or `len` reached) returns true with
+    /// `forward_conn` cleared: the read loop keeps going on the ordinary path,
+    /// because edge-triggered epoll will not re-notify us about bytes already
+    /// sitting in the socket behind the forward's last one.
+    fn forward_bytes(&mut self, conn_index: u32, data: &[u8]) -> bool {
+        let idx = conn_index as usize;
+        let remaining = match self.driver.forward_conn[idx].as_ref() {
+            Some(st) => st.len.saturating_sub(st.forwarded),
+            None => return true,
+        };
+        // Bytes past `len` are not ours to forward: they belong to whoever
+        // reads this connection next, so they go to the accumulator — the same
+        // place the io_uring path settles its carried-over tail.
+        let take = (data.len() as u64).min(remaining) as usize;
+        let (fwd, rest) = data.split_at(take);
+
+        if !fwd.is_empty() && !self.driver.forward_push(conn_index, fwd) {
+            // Sink gone or its slot recycled. The source itself is still
+            // healthy, so the remaining bytes go to the accumulator and the
+            // handler decides what to do with the EPIPE.
+            self.driver.finish_forward(conn_index, Err(libc::EPIPE));
+            self.executor.wake_recv(conn_index);
+            return self.append_or_close(conn_index, data);
+        }
+
+        let done = self.driver.forward_conn[idx]
+            .as_ref()
+            .is_some_and(|st| st.forwarded >= st.len);
+        if done {
+            let forwarded = self.driver.forward_conn[idx]
+                .as_ref()
+                .map_or(0, |st| st.forwarded);
+            self.driver.finish_forward(conn_index, Ok(forwarded));
+            self.executor.wake_recv(conn_index);
+        }
+        if rest.is_empty() {
+            return true;
+        }
+        self.append_or_close(conn_index, rest)
+    }
+
+    /// Append to the accumulator, or close the connection if that would run
+    /// past `recv_accumulator_max`. Returns false when the connection was
+    /// closed — the bytes are already off the socket, so the stream cannot
+    /// continue coherently.
+    fn append_or_close(&mut self, conn_index: u32, data: &[u8]) -> bool {
+        if self.driver.accumulators.append(conn_index, data) {
+            self.executor.wake_recv(conn_index);
+            return true;
+        }
+        self.executor.wake_recv(conn_index);
+        self.driver.close_connection(conn_index);
+        false
+    }
+
+    /// Resume sources whose sink queue has drained below the cap.
+    ///
+    /// The counterpart to the `break` in the read loop. Returns true if any
+    /// source was actually re-read, which is the caller's signal that the sink
+    /// may now have newly queued bytes to flush.
+    fn drain_forward_resumes(&mut self, recv_buf: &mut [u8]) -> bool {
+        if self.driver.forward_resume.is_empty() {
+            return false;
+        }
+        let queued = std::mem::take(&mut self.driver.forward_resume);
+        let mut still_blocked = Vec::new();
+        let mut ready = Vec::new();
+        for source in queued {
+            let i = source as usize;
+            if self.driver.forward_conn[i].is_none() {
+                self.driver.forward_resume_flag[i] = false;
+                continue;
+            }
+            if self.driver.forward_sink_full(source) {
+                // Still backed up: stays queued, flag stays set.
+                still_blocked.push(source);
+                continue;
+            }
+            self.driver.forward_resume_flag[i] = false;
+            ready.push(source);
+        }
+        self.driver.forward_resume = still_blocked;
+        let progressed = !ready.is_empty();
+        for source in ready {
+            // A TLS source's plaintext is already decrypted into the
+            // accumulator, so it has to be moved on before another read is
+            // attempted — a read that may well return EWOULDBLOCK.
+            if self.driver.forward_conn[source as usize].is_some()
+                && self.driver.forward_take_accumulated(source).is_some()
+            {
+                self.executor.wake_recv(source);
+            }
+            self.handle_readable(source, recv_buf);
+        }
+        progressed
+    }
+
+    /// Settle a running forward short at EOF: the requested length is not
+    /// coming, and a truncated forward resolves `Ok` with what it moved (the
+    /// io_uring path resolves the same way).
+    fn finish_forward_at_eof(&mut self, conn_index: u32) {
+        if let Some(st) = self.driver.forward_conn[conn_index as usize].as_ref() {
+            let forwarded = st.forwarded;
+            self.driver.finish_forward(conn_index, Ok(forwarded));
+            self.executor.wake_recv(conn_index);
+        }
+    }
+
     /// Handle a connection becoming readable: read data into accumulator.
     fn handle_readable(&mut self, conn_index: u32, recv_buf: &mut [u8]) {
         let idx = conn_index as usize;
@@ -566,6 +694,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                             .and_then(|t| t.get_mut(conn_index))
                             .map(|tc| tc.peer_sent_close_notify)
                             .unwrap_or(true);
+                        self.finish_forward_at_eof(conn_index);
                         if let Some(cs) = self.driver.connections.get_mut(conn_index) {
                             cs.note_eof(!close_notify_seen);
                         }
@@ -639,6 +768,21 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     }
                     crate::tls::TlsRecvResult::Ok => {
                         self.executor.wake_recv(conn_index);
+                        // A TLS source forwards from the accumulator, which is
+                        // where rustls just wrote the plaintext — there is no
+                        // socket read to intercept the way the plaintext path
+                        // does. Stop pulling ciphertext while the sink is
+                        // backed up, exactly as the plaintext path stops
+                        // reading.
+                        if self.driver.forward_conn[idx].is_some() {
+                            self.driver.forward_take_accumulated(conn_index);
+                            if self.driver.forward_conn[idx].is_some()
+                                && self.driver.forward_sink_full(conn_index)
+                            {
+                                self.driver.mark_forward_resume(conn_index);
+                                break;
+                            }
+                        }
                     }
                     crate::tls::TlsRecvResult::Error(e) => {
                         // Wake connect waiter if handshake hasn't completed yet.
@@ -657,6 +801,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                         break;
                     }
                     crate::tls::TlsRecvResult::Closed => {
+                        self.finish_forward_at_eof(conn_index);
                         if let Some(cs) = self.driver.connections.get_mut(conn_index) {
                             cs.note_eof(false);
                         }
@@ -678,6 +823,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
             match stream.read(recv_buf) {
                 Ok(0) => {
+                    self.finish_forward_at_eof(conn_index);
                     // EOF. Wake any recv waiter so it sees `0`, then request
                     // teardown; finalize waits for queued sends to drain.
                     if let Some(cs) = self.driver.connections.get_mut(conn_index) {
@@ -688,6 +834,23 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     break;
                 }
                 Ok(n) => {
+                    // A forward owns this connection's bytes: they go to the
+                    // sink's send queue, not to the accumulator or a recv sink.
+                    if self.driver.forward_conn[idx].is_some() {
+                        if !self.forward_bytes(conn_index, &recv_buf[..n]) {
+                            break;
+                        }
+                        // Stop draining if the sink is backed up. Edge-triggered
+                        // epoll will not re-notify, so the source is queued for
+                        // an explicit resume when the sink drains.
+                        if self.driver.forward_conn[idx].is_some()
+                            && self.driver.forward_sink_full(conn_index)
+                        {
+                            self.driver.mark_forward_resume(conn_index);
+                            break;
+                        }
+                        continue;
+                    }
                     // Check if the connection has a recv sink (direct-to-buffer).
                     let sink = &mut self.executor.recv_sinks[idx];
                     let appended = if let Some(recv_sink) = sink {
@@ -1029,6 +1192,27 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 continue;
             }
             self.driver.pending_closes.swap_remove(i);
+
+            // A forward feeding this connection cannot make progress once the
+            // sink is gone, and the source gets no further readable event if
+            // its peer goes quiet — so fail it here rather than leave the
+            // future parked forever.
+            if let Some(source) = self.driver.forward_feeder[idx].take() {
+                self.driver.finish_forward(source, Err(libc::EPIPE));
+                self.executor.wake_recv(source);
+            }
+            // This connection's own forward, if it is a source. The awaiting
+            // task usually lives at *another* index — a proxy's inbound task
+            // owns the upstream connection — so the result is recorded rather
+            // than dropped; `remove_connection` re-wakes that owner below, and
+            // the future reads the count before checking the generation.
+            // A new forward on a reused slot clears the slot's stale result.
+            if let Some(st) = self.driver.forward_conn[idx].take() {
+                self.driver.forward_feeder[st.sink_index as usize] = None;
+                self.driver.forward_done[idx] = Some(Ok(st.forwarded));
+            }
+            self.driver.forward_resume_flag[idx] = false;
+
             self.executor.remove_connection(conn_index);
             self.driver.finish_close(conn_index);
         }

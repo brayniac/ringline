@@ -6732,3 +6732,175 @@ fn half_close_waits_for_queued_sends_to_drain() {
         handle.join().unwrap().unwrap();
     }
 }
+
+// ── Cross-connection forward (proxy) ────────────────────────────────
+
+/// A length-prefixed proxy built on `forward_to_conn`: read a 4-byte
+/// big-endian length, hand exactly that many bytes to the backend without
+/// copying them out of the runtime, then hand the backend's reply back the
+/// same way.
+///
+/// The point of running it on both backends is that the same handler has to
+/// behave identically on each — zero-copy through held provided buffers on
+/// io_uring, a queued copy on mio. It also pins the case the API exists for:
+/// the length comes from a header, so bytes of the body have already landed in
+/// the accumulator by the time the forward starts, and they must come out
+/// first.
+struct ForwardToConnProxy {
+    backend_addr: SocketAddr,
+}
+
+static PROXY_BACKEND_ADDR: std::sync::OnceLock<SocketAddr> = std::sync::OnceLock::new();
+
+impl AsyncEventHandler for ForwardToConnProxy {
+    fn on_accept(&self, client: ConnCtx) -> impl Future<Output = ()> + 'static {
+        let backend_addr = self.backend_addr;
+        async move {
+            let backend = match client.connect(backend_addr) {
+                Ok(fut) => match fut.await {
+                    Ok(ctx) => ctx,
+                    Err(_) => return,
+                },
+                Err(_) => return,
+            };
+
+            loop {
+                let mut hdr = [0u8; 4];
+                let n = client
+                    .with_data(|data| {
+                        if data.len() < 4 {
+                            return ParseResult::NeedMore;
+                        }
+                        hdr.copy_from_slice(&data[..4]);
+                        ParseResult::Consumed(4)
+                    })
+                    .await;
+                if n == 0 {
+                    break;
+                }
+                let len = u32::from_be_bytes(hdr) as usize;
+
+                match client.forward_to_conn(&backend, len).await {
+                    Ok(f) if f == len => {}
+                    other => {
+                        eprintln!("proxy: client->backend forward {other:?}, wanted {len}");
+                        break;
+                    }
+                }
+                match backend.forward_to_conn(&client, len).await {
+                    Ok(f) if f == len => {}
+                    other => {
+                        eprintln!("proxy: backend->client forward {other:?}, wanted {len}");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        ForwardToConnProxy {
+            backend_addr: *PROXY_BACKEND_ADDR.get().expect("backend addr not set"),
+        }
+    }
+}
+
+/// Send one length-prefixed request and read exactly `payload.len()` bytes back.
+///
+/// `split` sends the header on its own and pauses before the body. That is the
+/// case where the forward is already armed when the bytes arrive; sending the
+/// whole request at once instead usually lands every byte in the accumulator
+/// before the handler parses the header, which exercises the other route in.
+/// Both have to work, so the test drives both.
+fn proxy_round_trip(stream: &mut TcpStream, payload: &[u8], split: bool) -> Vec<u8> {
+    let header = (payload.len() as u32).to_be_bytes();
+    if split {
+        stream.write_all(&header).unwrap();
+        stream.flush().unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        stream.write_all(payload).unwrap();
+    } else {
+        let mut req = Vec::with_capacity(4 + payload.len());
+        req.extend_from_slice(&header);
+        req.extend_from_slice(payload);
+        stream.write_all(&req).unwrap();
+    }
+    stream.flush().unwrap();
+
+    let mut buf = vec![0u8; payload.len()];
+    stream.read_exact(&mut buf).expect("proxy reply");
+    buf
+}
+
+/// `forward_to_conn` in both directions, several sizes, on one connection.
+///
+/// Sizes straddle the interesting boundaries: under one read, over the 4 KiB
+/// recv buffer, over the 16 KiB send-pool slot, and large enough (256 KiB) to
+/// span many reads.
+///
+/// Run twice against the same backend. The second proxy sets
+/// `forward_hold_cap(1)`, which is what actually exercises backpressure: on
+/// mio the source stops reading after a single queued send and only resumes
+/// when the sink drains, and on io_uring it holds one provided buffer at a
+/// time. At the default cap a localhost sink never backs up, so the resume
+/// path would go untested.
+#[test]
+fn forward_to_conn_proxies_both_directions() {
+    let backend_port = free_port();
+    let backend_addr = format!("127.0.0.1:{backend_port}");
+    let (backend_shutdown, backend_handles) = RinglineBuilder::new(test_config())
+        .bind(backend_addr.parse().unwrap())
+        .launch::<AsyncEcho>()
+        .expect("backend launch failed");
+    wait_for_server(&backend_addr);
+
+    PROXY_BACKEND_ADDR
+        .set(backend_addr.parse().unwrap())
+        .expect("only one test may install the proxy backend address");
+
+    for hold_cap in [64usize, 1] {
+        let config = test_config_builder()
+            .forward_hold_cap(hold_cap)
+            .build()
+            .expect("valid config");
+        let proxy_port = free_port();
+        let proxy_addr = format!("127.0.0.1:{proxy_port}");
+        let (proxy_shutdown, proxy_handles) = RinglineBuilder::new(config)
+            .bind(proxy_addr.parse().unwrap())
+            .launch::<ForwardToConnProxy>()
+            .expect("proxy launch failed");
+        wait_for_server(&proxy_addr);
+
+        let mut stream = TcpStream::connect(&proxy_addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .unwrap();
+
+        for split in [false, true] {
+            for (i, size) in [7usize, 1024, 8192, 65536, 262144].into_iter().enumerate() {
+                let payload: Vec<u8> = (0..size).map(|b| (b.wrapping_mul(31) + i) as u8).collect();
+                let got = proxy_round_trip(&mut stream, &payload, split);
+                assert_eq!(
+                    got.len(),
+                    payload.len(),
+                    "short reply at {size}B, cap {hold_cap}, split {split}"
+                );
+                assert_eq!(
+                    got, payload,
+                    "payload mismatch at {size}B, cap {hold_cap}, split {split}"
+                );
+            }
+        }
+
+        drop(stream);
+        proxy_shutdown.shutdown();
+        for h in proxy_handles {
+            h.join().unwrap().unwrap();
+        }
+    }
+
+    backend_shutdown.shutdown();
+    for h in backend_handles {
+        h.join().unwrap().unwrap();
+    }
+}
