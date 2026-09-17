@@ -403,34 +403,6 @@ impl Ring {
         Ok(())
     }
 
-    /// Submit a segmented-recv Mode A forward write to a **socket** sink.
-    ///
-    /// The source `buf`/`len` points into a held provided recv buffer (or an
-    /// owned copy) whose lifetime is tracked in `Driver::forward_write` until
-    /// this CQE arrives. `fd` is the sink socket (a non-fixed raw fd borrowed
-    /// for the forward's duration via `SinkFd`). `MSG_WAITALL` makes the kernel
-    /// retry short stream sends in place (5.19+).
-    ///
-    /// # Safety
-    /// `buf`/`len` must stay valid until the CQE arrives (the driver holds the
-    /// backing) and `fd` must stay open for the operation's lifetime.
-    pub unsafe fn submit_forward_write_socket(
-        &mut self,
-        fd: RawFd,
-        buf: *const u8,
-        len: u32,
-        user_data: UserData,
-    ) -> io::Result<()> {
-        let entry = opcode::Send::new(Fd(fd), buf, len)
-            .flags(crate::completion::STREAM_SEND_FLAGS)
-            .build()
-            .user_data(user_data.raw());
-        unsafe {
-            self.push_sqe(&entry)?;
-        }
-        Ok(())
-    }
-
     /// `POLLOUT` on a connection sink whose forward write returned `-EAGAIN`,
     /// by registered file index rather than raw descriptor.
     pub fn submit_forward_write_pollout_conn(
@@ -444,50 +416,76 @@ impl Ring {
         unsafe { self.push_sqe(&entry) }
     }
 
-    /// Submit a Mode A forward write to another **connection** on this worker,
-    /// through its registered file index.
+    /// Submit a **gathered** Mode A forward write to a socket sink: several
+    /// held provided buffers in one `sendmsg`.
+    ///
+    /// This is what makes forwarding cost one completion per *batch* rather
+    /// than one per provided buffer — the asymmetry `run_direct_echo` has
+    /// always exploited by gathering a drain's worth into a single send (#397).
+    /// Ordering is preserved: `sendmsg` writes the iovecs in order, and the
+    /// caller still keeps one write in flight per connection.
     ///
     /// # Safety
-    /// `buf`/`len` must stay valid until the CQE arrives — the driver holds the
-    /// backing — and the sink connection's slot must not be recycled meanwhile,
-    /// which the caller checks by generation before each submit.
-    pub unsafe fn submit_forward_write_conn(
+    /// `msghdr`, the iovec array it points at, and every buffer those iovecs
+    /// point at must stay valid until the CQE arrives. The driver owns all
+    /// three in `ForwardWriteState`, which is neither moved nor rebuilt while a
+    /// write is in flight.
+    pub unsafe fn submit_forward_writev_socket(
         &mut self,
-        sink_index: u32,
-        buf: *const u8,
-        len: u32,
+        fd: RawFd,
+        msghdr: *const libc::msghdr,
         user_data: UserData,
     ) -> io::Result<()> {
-        let entry = opcode::Send::new(Fixed(sink_index), buf, len)
-            .flags(crate::completion::STREAM_SEND_FLAGS)
+        let entry = opcode::SendMsg::new(Fd(fd), msghdr)
+            // `SendMsg` takes u32 flags where `Send` takes i32; the cast is what
+            // every other SendMsg call site here does.
+            .flags(crate::completion::STREAM_SEND_FLAGS as u32)
             .build()
             .user_data(user_data.raw());
         unsafe { self.push_sqe(&entry) }
     }
 
-    /// Submit a segmented-recv Mode A forward write to a **buffered file** sink
-    /// at an explicit offset (`pwrite` semantics). A short write is resubmitted
-    /// at the advanced offset by the completion handler.
+    /// Gathered Mode A forward write to another **connection** on this worker,
+    /// through its registered file index. See
+    /// [`submit_forward_writev_socket`](Self::submit_forward_writev_socket).
     ///
     /// # Safety
-    /// `buf`/`len` must stay valid until the CQE arrives (the driver holds the
-    /// backing) and `fd` must stay open for the operation's lifetime.
-    pub unsafe fn submit_forward_write_file(
+    /// As `submit_forward_writev_socket`, plus: the sink connection's slot must
+    /// not be recycled before the CQE, which the caller checks by generation.
+    pub unsafe fn submit_forward_writev_conn(
+        &mut self,
+        sink_index: u32,
+        msghdr: *const libc::msghdr,
+        user_data: UserData,
+    ) -> io::Result<()> {
+        let entry = opcode::SendMsg::new(Fixed(sink_index), msghdr)
+            .flags(crate::completion::STREAM_SEND_FLAGS as u32)
+            .build()
+            .user_data(user_data.raw());
+        unsafe { self.push_sqe(&entry) }
+    }
+
+    /// Gathered Mode A forward write to a **file** sink, at `offset`.
+    ///
+    /// `writev` rather than `sendmsg`: a file sink has an offset and no message
+    /// semantics.
+    ///
+    /// # Safety
+    /// The iovec array and the buffers it points at must stay valid until the
+    /// CQE arrives; the driver owns both.
+    pub unsafe fn submit_forward_writev_file(
         &mut self,
         fd: RawFd,
-        buf: *const u8,
-        len: u32,
+        iovecs: *const libc::iovec,
+        count: u32,
         offset: u64,
         user_data: UserData,
     ) -> io::Result<()> {
-        let entry = opcode::Write::new(Fd(fd), buf, len)
+        let entry = opcode::Writev::new(Fd(fd), iovecs, count)
             .offset(offset)
             .build()
             .user_data(user_data.raw());
-        unsafe {
-            self.push_sqe(&entry)?;
-        }
-        Ok(())
+        unsafe { self.push_sqe(&entry) }
     }
 
     /// Arm a POLLOUT poll on a forward-write **socket** sink after a send

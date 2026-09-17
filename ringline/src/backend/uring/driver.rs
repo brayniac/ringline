@@ -128,6 +128,15 @@ pub(crate) enum HeldRecvBuf {
     Owned(bytes::Bytes),
 }
 
+/// Held buffers gathered into one forward write.
+///
+/// Bounded rather than unbounded: a batch is one operation whose completion
+/// releases every bid in it, so a very large batch delays those bids' return to
+/// the ring and coarsens the hold-cap throttle. 16 × 16 KiB is 256 KiB per
+/// write, which is past the point where a socket has more queued anyway
+/// (#416 measured recv completions plateauing near 100 KB).
+const MAX_FORWARD_IOV: usize = 16;
+
 /// A running Mode A forward, driver-side.
 ///
 /// This used to live in `ForwardToFuture`, which is why every completed write
@@ -174,14 +183,26 @@ impl SinkTarget {
 }
 
 pub(crate) struct ForwardWriteState {
-    /// Where the bytes being written live. `Pinned` releases its bid on
-    /// completion; `Owned` just drops its heap bytes.
-    pub(crate) backing: HeldRecvBuf,
-    /// Total bytes to write from this backing — the prefix length, which may be
-    /// shorter than the backing buffer when `len` ends mid-buffer (the suffix
-    /// was already stashed into the accumulator by the forward future).
+    /// Where the bytes being written live, in wire order. `Pinned` entries
+    /// release their bid on completion; `Owned` just drops its heap bytes.
+    ///
+    /// Several at once: one `sendmsg`/`writev` carries a whole batch of held
+    /// buffers, so forwarding costs one completion per batch instead of one per
+    /// buffer. Each entry's *prefix length* is in `lens` — a batch's last
+    /// buffer can be truncated when the forward's `len` ends mid-buffer.
+    pub(crate) backings: Vec<HeldRecvBuf>,
+    /// Prefix length to write from each backing, parallel to `backings`.
+    pub(crate) lens: Vec<u32>,
+    /// The iovec array handed to the kernel. Owned here because an SQE's
+    /// memory must outlive its operation, and rebuilt only between operations
+    /// (a short write rebuilds it before resubmitting).
+    pub(crate) iovecs: Vec<libc::iovec>,
+    /// The `msghdr` handed to `sendmsg`, pointing at `iovecs`. Same lifetime
+    /// rule, same reason.
+    pub(crate) msghdr: libc::msghdr,
+    /// Total bytes to write across the whole batch.
     pub(crate) total: u32,
-    /// Bytes already written from this backing; advanced on short writes so the
+    /// Bytes already written from this batch; advanced on short writes so the
     /// remainder resubmits at the correct source offset (and file offset).
     pub(crate) written: u32,
     /// Absolute file offset for byte 0 of this backing (0 for socket sinks).
@@ -194,15 +215,43 @@ pub(crate) struct ForwardWriteState {
 }
 
 impl ForwardWriteState {
-    /// Source pointer + remaining length for the next (re)submission, honoring
-    /// bytes already written on a short write.
-    pub(crate) fn remainder(&self, provided_bufs: &ProvidedBufRing) -> (*const u8, u32) {
-        let base = match &self.backing {
+    /// Base pointer of one backing.
+    fn base_ptr(backing: &HeldRecvBuf, provided_bufs: &ProvidedBufRing) -> *const u8 {
+        match backing {
             HeldRecvBuf::Pinned { bid, .. } => provided_bufs.get_buffer(*bid).0,
             HeldRecvBuf::Owned(bytes) => bytes.as_ptr(),
-        };
-        let ptr = unsafe { base.add(self.written as usize) };
-        (ptr, self.total - self.written)
+        }
+    }
+
+    /// Rebuild `iovecs` (and point `msghdr` at it) to cover exactly the bytes
+    /// not yet written.
+    ///
+    /// Called before every submission, including a resubmit after a short
+    /// write: `written` may land mid-buffer, so the first surviving iovec
+    /// starts at an offset and whole buffers ahead of it are skipped. Never
+    /// called while an operation is in flight — the kernel is reading this
+    /// array.
+    pub(crate) fn rebuild_iovecs(&mut self, provided_bufs: &ProvidedBufRing) {
+        self.iovecs.clear();
+        let mut skip = self.written;
+        for (backing, &len) in self.backings.iter().zip(self.lens.iter()) {
+            if skip >= len {
+                skip -= len;
+                continue;
+            }
+            let base = Self::base_ptr(backing, provided_bufs);
+            // SAFETY: `skip < len` and `len` bytes from `base` are initialised
+            // and owned by this state until its CQE arrives.
+            let ptr = unsafe { base.add(skip as usize) };
+            self.iovecs.push(libc::iovec {
+                iov_base: ptr as *mut libc::c_void,
+                iov_len: (len - skip) as usize,
+            });
+            skip = 0;
+        }
+        self.msghdr = unsafe { std::mem::zeroed() };
+        self.msghdr.msg_iov = self.iovecs.as_mut_ptr();
+        self.msghdr.msg_iovlen = self.iovecs.len();
     }
 }
 
@@ -1104,7 +1153,7 @@ impl Driver {
             return Some(Ok(forwarded));
         }
 
-        let Some(held) = self.segment_hold[idx].pop_front() else {
+        if self.segment_hold[idx].is_empty() {
             // Nothing held. A finished recv side means the forward is truncated
             // — resolve short rather than wait for bytes that are not coming.
             let closed = self
@@ -1119,61 +1168,99 @@ impl Driver {
                 return Some(Ok(forwarded));
             }
             return None;
-        };
+        }
 
-        // Bytes past `len` belong to whoever reads this connection next, so a
-        // held buffer that straddles the boundary is split and its tail stashed
-        // in the accumulator.
-        let remaining = progress.len - progress.forwarded;
-        let started = match held {
-            HeldRecvBuf::Pinned { bid, len } => {
-                if (len as u64) <= remaining {
-                    Some((HeldRecvBuf::Pinned { bid, len }, len))
-                } else {
-                    let chunk = remaining as u32;
-                    let (ptr, _) = self.provided_bufs.get_buffer(bid);
-                    // SAFETY: `bid` is pinned (unreplenished) and `len` bytes
-                    // were received into it, so `[chunk..len]` is initialised
-                    // and is copied out before anything can replenish the bid.
-                    let suffix = unsafe {
-                        std::slice::from_raw_parts(ptr.add(chunk as usize), (len - chunk) as usize)
-                    };
-                    if !self.accumulators.append(conn_index, suffix) {
-                        self.pending_replenish.push(bid);
-                        self.forward_progress[idx] = None;
-                        self.close_connection(conn_index);
-                        return Some(Err(io::Error::other(
-                            "recv accumulator overflow stashing forward tail",
-                        )));
+        // Gather a batch: as many held buffers as the remaining length and the
+        // iovec cap allow, written as one `sendmsg`/`writev`. This is the whole
+        // point — `run_direct_echo` has always coalesced a drain's worth into a
+        // single send (#397), and doing one completion per buffer is what left
+        // Mode A at 1.24 instructions/byte against direct echo's 0.985.
+        let mut remaining = progress.len - progress.forwarded;
+        let mut backings: Vec<HeldRecvBuf> = Vec::new();
+        let mut lens: Vec<u32> = Vec::new();
+        while backings.len() < MAX_FORWARD_IOV && remaining > 0 {
+            let Some(held) = self.segment_hold[idx].pop_front() else {
+                break;
+            };
+            // Bytes past `len` belong to whoever reads this connection next, so
+            // a held buffer that straddles the boundary is split and its tail
+            // stashed in the accumulator. That can only happen to the last
+            // buffer of a batch, since it ends the forward.
+            match held {
+                HeldRecvBuf::Pinned { bid, len } => {
+                    if (len as u64) <= remaining {
+                        remaining -= len as u64;
+                        backings.push(HeldRecvBuf::Pinned { bid, len });
+                        lens.push(len);
+                    } else {
+                        let chunk = remaining as u32;
+                        let (ptr, _) = self.provided_bufs.get_buffer(bid);
+                        // SAFETY: `bid` is pinned (unreplenished) and `len`
+                        // bytes were received into it, so `[chunk..len]` is
+                        // initialised and is copied out before anything can
+                        // replenish the bid.
+                        let suffix = unsafe {
+                            std::slice::from_raw_parts(
+                                ptr.add(chunk as usize),
+                                (len - chunk) as usize,
+                            )
+                        };
+                        if !self.accumulators.append(conn_index, suffix) {
+                            self.pending_replenish.push(bid);
+                            for b in backings {
+                                if let HeldRecvBuf::Pinned { bid, .. } = b {
+                                    self.pending_replenish.push(bid);
+                                }
+                            }
+                            self.forward_progress[idx] = None;
+                            self.close_connection(conn_index);
+                            return Some(Err(io::Error::other(
+                                "recv accumulator overflow stashing forward tail",
+                            )));
+                        }
+                        remaining = 0;
+                        backings.push(HeldRecvBuf::Pinned { bid, len: chunk });
+                        lens.push(chunk);
                     }
-                    Some((HeldRecvBuf::Pinned { bid, len: chunk }, chunk))
+                }
+                HeldRecvBuf::Owned(bytes) => {
+                    if (bytes.len() as u64) <= remaining {
+                        remaining -= bytes.len() as u64;
+                        let total = bytes.len() as u32;
+                        backings.push(HeldRecvBuf::Owned(bytes));
+                        lens.push(total);
+                    } else {
+                        let chunk = remaining as usize;
+                        if !self.accumulators.append(conn_index, &bytes[chunk..]) {
+                            for b in backings {
+                                if let HeldRecvBuf::Pinned { bid, .. } = b {
+                                    self.pending_replenish.push(bid);
+                                }
+                            }
+                            self.forward_progress[idx] = None;
+                            self.close_connection(conn_index);
+                            return Some(Err(io::Error::other(
+                                "recv accumulator overflow stashing forward tail",
+                            )));
+                        }
+                        remaining = 0;
+                        backings.push(HeldRecvBuf::Owned(bytes.slice(0..chunk)));
+                        lens.push(chunk as u32);
+                    }
                 }
             }
-            HeldRecvBuf::Owned(bytes) => {
-                if (bytes.len() as u64) <= remaining {
-                    let total = bytes.len() as u32;
-                    Some((HeldRecvBuf::Owned(bytes), total))
-                } else {
-                    let chunk = remaining as usize;
-                    if !self.accumulators.append(conn_index, &bytes[chunk..]) {
-                        self.forward_progress[idx] = None;
-                        self.close_connection(conn_index);
-                        return Some(Err(io::Error::other(
-                            "recv accumulator overflow stashing forward tail",
-                        )));
-                    }
-                    Some((HeldRecvBuf::Owned(bytes.slice(0..chunk)), chunk as u32))
-                }
-            }
-        };
+        }
 
-        let (backing, total) = started.expect("set on both arms");
+        if backings.is_empty() {
+            return None;
+        }
+
         let base_offset = if progress.target.is_file() {
             progress.forwarded
         } else {
             0
         };
-        match self.start_forward_write(conn_index, backing, total, base_offset, progress.target) {
+        match self.start_forward_write(conn_index, backings, lens, base_offset, progress.target) {
             Ok(()) => None,
             Err(e) => {
                 self.forward_progress[idx] = None;
@@ -1193,8 +1280,8 @@ impl Driver {
     pub(crate) fn start_forward_write(
         &mut self,
         conn_index: u32,
-        backing: HeldRecvBuf,
-        total: u32,
+        backings: Vec<HeldRecvBuf>,
+        lens: Vec<u32>,
         base_offset: u64,
         target: SinkTarget,
     ) -> io::Result<()> {
@@ -1202,6 +1289,10 @@ impl Driver {
             self.forward_write[conn_index as usize].is_none(),
             "start_forward_write while a forward write is already in flight"
         );
+        debug_assert_eq!(backings.len(), lens.len(), "one length per backing");
+        let idx = conn_index as usize;
+        let total: u32 = lens.iter().sum();
+
         // A connection sink is addressed by slot index, and slots recycle. If
         // the sink's generation has moved the caller is holding a stale handle
         // and this write would land on whoever owns the slot now. Checked here
@@ -1209,53 +1300,122 @@ impl Driver {
         if let SinkTarget::Conn { index, generation } = target
             && self.connections.generation(index) != generation
         {
-            if let HeldRecvBuf::Pinned { bid, .. } = backing {
-                self.pending_replenish.push(bid);
+            for backing in &backings {
+                if let HeldRecvBuf::Pinned { bid, .. } = backing {
+                    self.pending_replenish.push(*bid);
+                }
             }
             return Err(io::Error::from_raw_os_error(libc::EPIPE));
         }
+
         let generation = self.connections.generation(conn_index);
         let ud = crate::completion::UserData::encode(
             crate::completion::OpTag::ForwardWrite,
             conn_index,
             generation,
         );
-        let ptr = match &backing {
-            HeldRecvBuf::Pinned { bid, .. } => self.provided_bufs.get_buffer(*bid).0,
-            HeldRecvBuf::Owned(bytes) => bytes.as_ptr(),
+
+        let mut state = ForwardWriteState {
+            iovecs: Vec::with_capacity(backings.len()),
+            // SAFETY: `msghdr` is a plain C struct; zeroed is its valid empty
+            // state, and `rebuild_iovecs` fills the fields that matter.
+            msghdr: unsafe { std::mem::zeroed() },
+            backings,
+            lens,
+            total,
+            written: 0,
+            base_offset,
+            target,
+            generation,
         };
+        state.rebuild_iovecs(&self.provided_bufs);
+
+        // Install *before* submitting: the SQE points at `msghdr` and the iovec
+        // array inside this state, and both must stay put until the CQE. Moving
+        // the state after taking those pointers would invalidate `msg_iov`'s
+        // owner even though the iovec heap block itself would survive.
+        self.forward_write[idx] = Some(state);
+        let (hdr_ptr, iov_ptr, iov_count) = {
+            let st = self.forward_write[idx].as_ref().expect("just installed");
+            (
+                &st.msghdr as *const libc::msghdr,
+                st.iovecs.as_ptr(),
+                st.iovecs.len() as u32,
+            )
+        };
+
         let res = match target {
             SinkTarget::Fd { fd, is_file: true } => unsafe {
                 self.ring
-                    .submit_forward_write_file(fd, ptr, total, base_offset, ud)
+                    .submit_forward_writev_file(fd, iov_ptr, iov_count, base_offset, ud)
             },
             SinkTarget::Fd { fd, is_file: false } => unsafe {
-                self.ring.submit_forward_write_socket(fd, ptr, total, ud)
+                self.ring.submit_forward_writev_socket(fd, hdr_ptr, ud)
             },
             // A connection sink writes through its registered file index, the
             // same way every other send on that connection does.
             SinkTarget::Conn { index, .. } => unsafe {
-                self.ring.submit_forward_write_conn(index, ptr, total, ud)
+                self.ring.submit_forward_writev_conn(index, hdr_ptr, ud)
             },
         };
         match res {
-            Ok(()) => {
-                self.forward_write[conn_index as usize] = Some(ForwardWriteState {
-                    backing,
-                    total,
-                    written: 0,
-                    base_offset,
-                    target,
-                    generation,
-                });
-                Ok(())
-            }
+            Ok(()) => Ok(()),
             Err(e) => {
-                if let HeldRecvBuf::Pinned { bid, .. } = backing {
-                    self.pending_replenish.push(bid);
+                // Nothing is in flight, so the state comes back out and its
+                // bids go home — exactly once.
+                if let Some(state) = self.forward_write[idx].take() {
+                    for backing in state.backings {
+                        if let HeldRecvBuf::Pinned { bid, .. } = backing {
+                            self.pending_replenish.push(bid);
+                        }
+                    }
                 }
                 Err(e)
             }
+        }
+    }
+
+    /// Rebuild the in-flight write's iovecs and resubmit what is left of it.
+    ///
+    /// Used after a short write and after a `POLLOUT` re-arm. The batch's
+    /// backings do not change; only which bytes of them are still owed.
+    pub(crate) fn resubmit_forward_writev(&mut self, conn_index: u32) -> io::Result<()> {
+        let idx = conn_index as usize;
+        let Some(mut state) = self.forward_write[idx].take() else {
+            return Ok(());
+        };
+        state.rebuild_iovecs(&self.provided_bufs);
+        let ud = crate::completion::UserData::encode(
+            crate::completion::OpTag::ForwardWrite,
+            conn_index,
+            state.generation,
+        );
+        let (target, base_offset, written) = (state.target, state.base_offset, state.written);
+        self.forward_write[idx] = Some(state);
+        let (hdr_ptr, iov_ptr, iov_count) = {
+            let st = self.forward_write[idx].as_ref().expect("just reinstalled");
+            (
+                &st.msghdr as *const libc::msghdr,
+                st.iovecs.as_ptr(),
+                st.iovecs.len() as u32,
+            )
+        };
+        match target {
+            SinkTarget::Fd { fd, is_file: true } => unsafe {
+                self.ring.submit_forward_writev_file(
+                    fd,
+                    iov_ptr,
+                    iov_count,
+                    base_offset + written as u64,
+                    ud,
+                )
+            },
+            SinkTarget::Fd { fd, is_file: false } => unsafe {
+                self.ring.submit_forward_writev_socket(fd, hdr_ptr, ud)
+            },
+            SinkTarget::Conn { index, .. } => unsafe {
+                self.ring.submit_forward_writev_conn(index, hdr_ptr, ud)
+            },
         }
     }
 
