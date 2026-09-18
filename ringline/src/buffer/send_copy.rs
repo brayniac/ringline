@@ -98,6 +98,13 @@ impl SendCopyPool {
         }
     }
 
+    /// Fault every slot in before traffic arrives. See
+    /// [`crate::buffer::prefault`] for why, and why it must run on the worker
+    /// thread that owns the pool.
+    pub(crate) fn prefault(&mut self) {
+        crate::buffer::prefault::prefault(&mut self.backing);
+    }
+
     /// Pop an unreserved slot from the free list, or `None` (with the
     /// `SEND_EXHAUSTED` metric) when every free slot is either gone or
     /// promised to an outstanding reservation.
@@ -870,5 +877,41 @@ mod tests {
         let (again, _p, _l) = pool.copy_in(b"next").unwrap();
         assert_eq!(again, idx);
         assert_eq!(pool.take_bounded_send(again), None);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod prefault_tests {
+    use super::*;
+
+    /// The pool's `prefault` must actually make its backing resident.
+    ///
+    /// Asserts on RSS, not on "the method ran": a `prefault` wired to the
+    /// wrong allocation, or optimized away, would still return cleanly.
+    #[test]
+    fn prefault_grows_rss_by_about_the_pool_size() {
+        let slots = 512u16;
+        let slot = 64 * 1024u32;
+        let total = slots as usize * slot as usize; // 32 MiB
+
+        let before = crate::buffer::prefault::resident_bytes();
+        let mut pool = SendCopyPool::new(slots, slot);
+        let allocated = crate::buffer::prefault::resident_bytes();
+        pool.prefault();
+        let after = crate::buffer::prefault::resident_bytes();
+
+        // Allocation alone should not have made it resident...
+        assert!(
+            allocated - before < total / 2,
+            "allocation already resident ({} of {total} bytes) — the test cannot \
+             show prefaulting does anything",
+            allocated - before
+        );
+        // ...and prefaulting should.
+        assert!(
+            after - before >= total * 9 / 10,
+            "expected ~{total} bytes resident after prefault, saw {}",
+            after - before
+        );
     }
 }
