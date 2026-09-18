@@ -50,7 +50,15 @@ library cannot know either axis in advance, so a fixed default can only be
 workloads.
 
 **The one exception is forwarding**, and it is systematic: the default is
-**−34%** at 64 connections and **−18%** at 1024. `forward_to`'s sizing note is
+**−34%** at 64 connections and **−18%** at 1024.
+
+> **Superseded for forwarding.** That deficit was an artifact of Mode A writing
+> one held buffer per write. Gathering (`docs/journal/2026-09-direct-forward-path.md`)
+> takes the default from 11.23 to 14.60 Gbit/s, against 15.13 at 64 KiB and 14.22
+> at 256 KiB — **within 3.5% of best**, the same order as every echo workload, and
+> 256 KiB becomes *worse* than the default. Treat the forwarding rows below as a
+> record of the pre-gathering runtime; the arms should be re-run on a gathered
+> build before they are cited. `forward_to`'s sizing note is
 therefore load-bearing rather than advisory. Note the recommendation itself is
 fan-in dependent — 1 MiB × 4 is best at c64 (17.07 Gbit/s vs 11.32) while 256
 KiB × 16 is best at c1024 (11.96 vs 9.82) — so the note should give a range and
@@ -62,9 +70,9 @@ harness: 11.32 Gbit/s at the default here vs 11.2 there, 14.26 at 64 KiB vs
 
 **What this bounds for #416's remaining phases.** The tuning burden a
 geometry-aware runtime could remove is ~6% median and ~11% worst for
-request/response, and 18–34% for forwarding. Phase B's refinement pass is
-therefore only worth running around the forwarding knee; refining 4/8/16/32 KiB
-for echo would be chasing single-digit percentages that the fan-in axis swamps.
+request/response, and 18–34% for forwarding *before gathering* — ~3.5% after.
+Phase B's refinement pass therefore has little left to chase on either path:
+single-digit percentages that the fan-in axis swamps.
 
 ## The contradiction this has to resolve
 
