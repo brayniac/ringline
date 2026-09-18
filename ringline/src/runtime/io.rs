@@ -1110,20 +1110,40 @@ impl ConnCtx {
     ) -> Result<u32, i32> {
         with_state(|driver, _executor| {
             let idx = self.conn_index as usize;
+            // A stale source owns nothing worth settling — its slot has already
+            // been recycled, and touching it would reach a different connection.
+            // Teardown released its buffers when the slot was cleared.
             if driver.connections.generation(self.conn_index) != self.generation {
                 return Err(libc::EPIPE);
             }
             // Arming over a running forward would strand its held bids and
-            // hand its caller a result belonging to someone else.
+            // hand its caller a result belonging to someone else. The running
+            // forward owns this connection's hold, so leave it strictly alone.
             if driver.forward_progress[idx].is_some() {
                 return Err(libc::EBUSY);
             }
+            // Sink-side refusals: the source is live and no forward owns its
+            // hold, so anything already held would be stranded — the provided
+            // buffer leaked per attempt that
+            // `forward_to_conn_refuses_a_recycled_sink_slot` exists to catch.
+            // Before these checks moved to arm time the write path refused and
+            // released the backing on the way out; settling here is what keeps
+            // that true. `settle_forward_end` returns the bytes to the
+            // accumulator, replenishes the bids, and resets the delivery
+            // domain, which is what a connection that is not forwarding wants.
             if let crate::backend::uring::driver::SinkTarget::Conn { index, generation } = target {
-                if driver.connections.generation(index) != generation {
-                    return Err(libc::EPIPE);
-                }
-                if driver.tls_table.as_ref().is_some_and(|t| t.has(index)) {
-                    return Err(libc::EPROTOTYPE);
+                let refusal = if driver.connections.generation(index) != generation {
+                    Some(libc::EPIPE)
+                } else if driver.tls_table.as_ref().is_some_and(|t| t.has(index)) {
+                    Some(libc::EPROTOTYPE)
+                } else {
+                    None
+                };
+                if let Some(errno) = refusal {
+                    if !driver.settle_forward_end(self.conn_index) {
+                        driver.close_connection(self.conn_index);
+                    }
+                    return Err(errno);
                 }
             }
             // The driver owns the forward from here: it submits each write from
