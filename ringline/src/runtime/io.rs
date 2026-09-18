@@ -1177,24 +1177,27 @@ impl ConnCtx {
     /// only workload measured where the default is systematically far from
     /// best — for request/response it is within ~6%.
     ///
-    /// # How big, though
+    /// # Sizing
     ///
-    /// **64 KiB to 256 KiB**, and the right end depends on fan-in, because
-    /// buffer size and ring depth trade against each other at a fixed memory
-    /// budget:
+    /// **The default is fine.** A forward write gathers up to 16 held buffers
+    /// into one `sendmsg`, so the payload per completion follows what the
+    /// socket had queued rather than what one buffer holds. Measured on two
+    /// 40 GbE hosts at the same 4 MiB/worker budget: 14.60 Gbit/s at the
+    /// default `recv_buffer(256, 16384)`, 15.13 at `recv_buffer(64, 65536)`,
+    /// 14.22 at `recv_buffer(16, 262144)`. A few percent, either way.
     ///
-    /// - few connections per worker → payload per completion dominates.
-    ///   `recv_buffer(4, 1 << 20)` measured 17.07 Gbit/s against the default's
-    ///   11.32 at 64 connections.
-    /// - many connections per worker → ring depth dominates, and the same
-    ///   4-deep ring collapses. At 1024 connections it managed 11.03 Gbit/s
-    ///   with 16.8 million ring starvations, while `recv_buffer(16, 1 << 18)`
-    ///   led at 11.96.
+    /// This used to matter a great deal. Before gathering, one write carried
+    /// one buffer, so buffer size *was* payload per completion: the same
+    /// default measured 11.23 Gbit/s against 14.29 at 64 KiB, and #416 found
+    /// forwarding 34% behind the best geometry — the one workload where
+    /// ringline's default was badly wrong. Gathering removed the cause, and
+    /// with it the need to tune.
     ///
-    /// `recv_buffer(16, 1 << 18)` (256 KiB × 16, still 4 MiB) is the safer
-    /// default for a proxy: near-best at high fan-in and within 13% of best at
-    /// low. Go larger only if the connection count per worker is known to be
-    /// small.
+    /// Going *larger* is now mildly counterproductive: at 256 KiB a
+    /// sixteen-buffer batch would be 4 MiB of iovec against a socket that
+    /// rarely has more than ~100 KB queued, so batches stay short while the
+    /// ring gets shallower — and ring depth is what bounds concurrent arrivals
+    /// at high fan-in, where a 4-deep ring measured a 1.03-second p99.
     ///
     /// Resolves to `Ok(bytes_forwarded)`. `bytes_forwarded == len` on success; a
     /// value `< len` means the peer closed (FIN) before `len` bytes arrived — the

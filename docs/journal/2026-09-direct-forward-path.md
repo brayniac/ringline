@@ -1,7 +1,9 @@
 # Direct-forward: submitting Mode A writes from the completion handler
 
-- **Status:** **NO-GO (2026-09-17)** — built, measured, theory falsified. The
-  prototype is correct and ~3% slower; see Outcome. Redirects to gathering.
+- **Status:** **NO-GO on the stated theory; the redirect it produced SHIPPED.**
+  Submitting from the completion handler bought nothing (instructions/byte
+  unchanged). Gathering — the alternative this entry isolated by elimination —
+  is worth **+30%** and closes #416's forwarding exception. Both outcomes below.
 - **Span:** 2026-09-17 → (open) · follows #415 (282773b) and #416 Phase A
 
 ## Goal
@@ -98,6 +100,64 @@ GO criterion 1 required >10% and a visible drop toward the 0.86 floor. Neither
 happened, so this closes NO-GO. The ~3% regression is within run-to-run spread
 (baseline 11.29–11.61, prototype 10.89–11.70) and is not itself the finding; the
 flat instructions/byte is.
+
+## The redirect worked: gathering is +30%
+
+Built as this entry predicted: up to 16 held buffers per `sendmsg`/`writev`,
+ordering unchanged, bids released per batch. Gate on io_uring — clippy clean,
+full suite green, the #415 proxy regression test 0/60.
+
+Three interleaved reps each at the default geometry, 2 workers, two guests:
+
+| | instructions/byte | Gbit/s |
+|---|---|---|
+| baseline (one buffer per write) | 1.236 | 11.23 (12.03, 11.19, 11.23) |
+| **gathered (≤16 per write)** | **0.906** | **14.60 (15.14, 14.58, 14.60)** |
+| direct echo, reference | 0.985 | — |
+| kernel floor | ~0.86 | — |
+
+**+30% throughput, and instructions/byte past direct echo to within 5% of the
+floor.** Per-buffer overhead falls from 0.38 instr/byte to 0.05: **87% of Mode
+A's avoidable cost was the completion count.** Ranges do not overlap.
+
+Taken with the failed attempt, this decomposes the ~6,600 instructions per
+completion cleanly:
+
+- **scheduler round-trip: ~0.** Direct submission moved instructions/byte from
+  1.236 to 1.243.
+- **completion count: ~all of it.** Gathering moved it to 0.906.
+
+The NO-GO was worth its cost: it eliminated the wrong explanation, which is what
+left only the right one.
+
+## It also closes #416's forwarding exception
+
+#416 concluded that `recv_buffer(256, 16384)` is minimax-optimal everywhere
+*except* forwarding, where it ran 34% behind the best geometry at 64
+connections. That exception was an artifact of one-buffer-per-write. Gathered,
+at the same 4 MiB/worker budget:
+
+| geometry | gathered | ungathered |
+|---|---|---|
+| 16 KiB × 256 (default) | **14.60** | 11.23 |
+| 64 KiB × 64 | 15.13 | 14.29 |
+| 256 KiB × 16 | 14.22 | ~14.80 |
+
+The default is now within **3.5%** of the best forwarding geometry — the same
+order as its deficit on every echo workload (−4% to −11%). 256 KiB has become
+*worse* than the default, which fits: a sixteen-buffer batch at 256 KiB is 4 MiB
+of iovec against a socket that rarely has ~100 KB queued, so batches stay short
+while the ring gets shallower.
+
+So the tuning advice `forward_to` carried since #415 is retired rather than
+revised, and ringline's answer to "what buffer geometry should I use" is now
+**the default, for everything measured**.
+
+Caveat, stated rather than buried: this is 64 connections and three buffer
+sizes. The c1024 depth axis is untouched by gathering (a batch cannot conjure
+buffers a shallow ring does not have), so small-buffer/deep-ring should still
+win there — which argues *for* the default, not against it. #416's forward arms
+should be re-run on a gathered build before the sweep's conclusion is rewritten.
 
 ## Where the cost actually is
 
