@@ -1,6 +1,7 @@
 # Recv buffer geometry sweep — design
 
-**Status:** specified, not yet run. Queued behind #415.
+**Status:** **Phase A complete — the default stands.** Phase 0 landed (#417);
+#415 merged as 282773b. Outcome below.
 
 **Question:** ringline's provided recv ring defaults to `recv_buffer(256, 16384)`
 — 256 buffers of 16 KiB, 4 MiB per worker. Is that the right default, and is one
@@ -10,6 +11,60 @@ default right for every delivery mode?
 14.0 Gbit/s at `recv_buffer(64, 65536)` — same memory, a quarter as many buffers,
 four times the size. That is a 25% throughput difference sitting behind a knob
 nobody turns.
+
+## Outcome (Phase A, 2026-09-17)
+
+**Do not change the default.** `recv_buffer(256, 16384)` is minimax-optimal
+across the measured space: it never wins a workload and never loses badly,
+which is what a default is for.
+
+Two saturated passes at 2 workers, identical but for fan-in — 64 and 1024
+connections — 6 message shapes each, 108 arms. Worst-case deficit against the
+best geometry that fits the same 4 MiB budget:
+
+| geometry (≤4 MiB) | worst | median |
+|---|---|---|
+| **16 KiB × 256 (default)** | **−34%** | −6% |
+| 64 KiB × 64 | −36% | −5% |
+| 256 KiB × 16 | −59% | −8% |
+| 4 KiB × 1024 | −70% | −24% |
+| 1 MiB × 4 | −83% | −6% |
+
+Every alternative is excellent somewhere and catastrophic elsewhere. 1 MiB × 4
+wins four workloads outright and is 83% down on another (with a **1.03-second
+p99** at 256 B × 1024 connections, from 137,895,774 ring starvations). 4 KiB ×
+1024 wins small-message/high-fan-in and loses 70% on forwarding.
+
+**Why no geometry wins: the optimum moves along two axes, in opposite
+directions.** Six different geometries win the twelve workloads.
+
+- **Message size** pulls toward *bigger* buffers — payload per completion
+  amortises a fixed ~6,600-instruction per-completion cost (#415).
+- **Fan-in** pulls toward *deeper* rings — depth bounds concurrent arrivals, and
+  at a fixed memory budget depth and size trade directly.
+
+At 64 connections the first dominates and 64 KiB × 64 is best; at 1024 the
+second does, the same geometry falls 33% behind, and 4 KiB × 1024 wins. A
+library cannot know either axis in advance, so a fixed default can only be
+*mediocre everywhere*, which this one is: within ~6% of best on 9 of 12
+workloads.
+
+**The one exception is forwarding**, and it is systematic: the default is
+**−34%** at 64 connections and **−18%** at 1024. `forward_to`'s sizing note is
+therefore load-bearing rather than advisory. Note the recommendation itself is
+fan-in dependent — 1 MiB × 4 is best at c64 (17.07 Gbit/s vs 11.32) while 256
+KiB × 16 is best at c1024 (11.96 vs 9.82) — so the note should give a range and
+say why, not a number.
+
+**Cross-validation.** The forward arms reproduce #415 on an independently built
+harness: 11.32 Gbit/s at the default here vs 11.2 there, 14.26 at 64 KiB vs
+14.0. Two harnesses, same operating point, within 2%.
+
+**What this bounds for #416's remaining phases.** The tuning burden a
+geometry-aware runtime could remove is ~6% median and ~11% worst for
+request/response, and 18–34% for forwarding. Phase B's refinement pass is
+therefore only worth running around the forwarding knee; refining 4/8/16/32 KiB
+for echo would be chasing single-digit percentages that the fan-in axis swamps.
 
 ## The contradiction this has to resolve
 
@@ -68,6 +123,14 @@ Gate: an arm run at a deliberately tiny ring (`recv_buffer(8, 4096)`) must show
 non-zero `buffer_ring_empty` and `recv_parked`. If those stay zero the dump is
 not wired to anything and the sweep is blind — fix before proceeding.
 
+**The gate fired.** Its first run reported zero starvation on an 8 × 4 KiB ring,
+which is only possible if the flags did nothing — and they did nothing: the echo
+arm hardcoded `recv_buffer(256, msg_size-derived)` and read neither flag, so all
+27 echo arms of Phase A would have run one configuration under 27 labels. Fixed
+in #417, with the effective geometry now printed on the ready line so a log
+proves what ran. After the fix, 8 × 4 KiB counts 11,950,066 `buffer_ring_empty`
+and moves 12.4 GB, against 0 and 28.4 GB at 256 × 64 KiB.
+
 ## Axes
 
 **1. Delivery mode** — the axis the contradiction says matters most.
@@ -104,9 +167,22 @@ even affordable:
 
 Both, every arm. The interesting output is the frontier between them.
 
-**5. Concurrency** — **64 and 512 connections.** Ring depth pressure is a function
-of concurrent arrivals, so the constant-memory policy can only fail at fan-in.
-64 alone would hide it.
+**5. Concurrency** — **64 and 1024+ connections**, as separate passes rather
+than a matrix axis. Ring depth pressure is a function of concurrent arrivals, so
+the constant-memory policy can only fail at fan-in, and 64 connections never
+pressures a 256-deep ring at all.
+
+High fan-in is also the *realistic* way to saturate a server — production runs
+thousands of connections, not 64 — which matters because **an arm that is not
+server-bound measures the harness.** The first Phase A run proved that the hard
+way: at 8 workers and 64 connections the proxy guest sat at ~8 of 24 cores on
+the echo arms and ~9 on the forward arms, with every forward arm from 16 KiB to
+1 MiB pinned to the ~22 Gbit/s wire ceiling — including a 1 MiB × 4 arm that
+starved 441,351 times and still tied the clean arms. That surface was flat
+because the server had headroom, not because geometry is irrelevant, and the two
+are indistinguishable in the data. Each pass must be checked for saturation
+(server CPU, or throughput that moves when the geometry does) *before* its
+numbers are read as a result.
 
 **6. Reference lines** — mio, tokio multi-thread, tokio per-core at each message
 size, at their own defaults. These do not vary with ringline's ring geometry; they
@@ -176,6 +252,16 @@ Outcomes, in preference order:
 3. **Neither.** Document per-workload recipes on `ConfigBuilder::recv_buffer` and
    in `forward_to`, and record why a single default cannot serve both. This is a
    real outcome, not a failure: it is what #415's docs already say locally.
+
+## If the answer is "neither size nor depth, but both"
+
+The two policies exist because size and depth are one knob at a fixed memory
+budget. They need not be: `IOU_PBUF_RING_INC` (Linux 6.12) consumes one buffer
+incrementally across many completions, which would let a ring be deep *and*
+carry a large payload per completion. That is a recv-path rework rather than a
+flag, and it has its own entry —
+`docs/journal/2026-09-incremental-buffer-consumption.md` — whose GO criterion 1
+is precisely what this sweep is measuring.
 
 ## What would make this worth re-running later
 
