@@ -1092,13 +1092,60 @@ impl ConnCtx {
     /// bytes are the front of the forward; leaving them behind would strand
     /// them and shift the stream by however much arrived with the header.
     #[cfg(has_io_uring)]
+    /// Install a Mode A forward on this connection, or refuse it.
+    ///
+    /// The refusals mirror the mio sibling's, which stated the contract for
+    /// both backends while only one enforced it: a forward already running is
+    /// `EBUSY`, a stale source or sink slot is `EPIPE`, and a TLS sink is
+    /// `EPROTOTYPE`. That last one matters most — a forward writes bytes to
+    /// the sink as they are, with nothing on the path to encrypt them, so
+    /// forwarding into a TLS connection would put plaintext on the wire.
+    ///
+    /// Every check happens **before** any state is touched, so a refusal
+    /// leaves an in-progress forward and the recv domain exactly as they were.
     fn arm_forward_source(
         &self,
         target: crate::backend::uring::driver::SinkTarget,
         len: u64,
-    ) -> u32 {
+    ) -> Result<u32, i32> {
         with_state(|driver, _executor| {
             let idx = self.conn_index as usize;
+            // A stale source owns nothing worth settling — its slot has already
+            // been recycled, and touching it would reach a different connection.
+            // Teardown released its buffers when the slot was cleared.
+            if driver.connections.generation(self.conn_index) != self.generation {
+                return Err(libc::EPIPE);
+            }
+            // Arming over a running forward would strand its held bids and
+            // hand its caller a result belonging to someone else. The running
+            // forward owns this connection's hold, so leave it strictly alone.
+            if driver.forward_progress[idx].is_some() {
+                return Err(libc::EBUSY);
+            }
+            // Sink-side refusals: the source is live and no forward owns its
+            // hold, so anything already held would be stranded — the provided
+            // buffer leaked per attempt that
+            // `forward_to_conn_refuses_a_recycled_sink_slot` exists to catch.
+            // Before these checks moved to arm time the write path refused and
+            // released the backing on the way out; settling here is what keeps
+            // that true. `settle_forward_end` returns the bytes to the
+            // accumulator, replenishes the bids, and resets the delivery
+            // domain, which is what a connection that is not forwarding wants.
+            if let crate::backend::uring::driver::SinkTarget::Conn { index, generation } = target {
+                let refusal = if driver.connections.generation(index) != generation {
+                    Some(libc::EPIPE)
+                } else if driver.tls_table.as_ref().is_some_and(|t| t.has(index)) {
+                    Some(libc::EPROTOTYPE)
+                } else {
+                    None
+                };
+                if let Some(errno) = refusal {
+                    if !driver.settle_forward_end(self.conn_index) {
+                        driver.close_connection(self.conn_index);
+                    }
+                    return Err(errno);
+                }
+            }
             // The driver owns the forward from here: it submits each write from
             // the completion handler, so the task is woken once at the end
             // rather than once per provided buffer.
@@ -1137,7 +1184,7 @@ impl ConnCtx {
                 ));
                 driver.pending_replenish.push(pending.bid);
             }
-            epoch
+            Ok(epoch)
         })
     }
 
@@ -1230,17 +1277,26 @@ impl ConnCtx {
     /// **rejects** an `O_DIRECT` descriptor with [`io::ErrorKind::InvalidInput`].
     ///
     /// io_uring only — Mode A is backed by the provided-buffer ring.
+    ///
+    /// # Errors
+    ///
+    /// Refused at the call, resolving on the first poll without having
+    /// installed anything: `EBUSY` if a forward is already running on this
+    /// connection, `EPIPE` if this connection's slot is already stale. (The
+    /// sink is a borrowed descriptor, so the sink-side `EPIPE`/`EPROTOTYPE`
+    /// of [`forward_to_conn`](Self::forward_to_conn) do not apply.)
     #[cfg(has_io_uring)]
     pub fn forward_to<'a>(&self, sink: &'a SinkFd<'a>, len: usize) -> ForwardToFuture<'a> {
         let target = crate::backend::uring::driver::SinkTarget::Fd {
             fd: sink.fd,
             is_file: sink.is_file,
         };
-        let epoch = self.arm_forward_source(target, len as u64);
+        let armed = self.arm_forward_source(target, len as u64);
         ForwardToFuture {
             conn_index: self.conn_index,
             generation: self.generation,
-            epoch,
+            epoch: armed.unwrap_or(0),
+            refused: armed.err(),
             _borrow: PhantomData,
         }
     }
@@ -1506,26 +1562,41 @@ impl ConnCtx {
     /// not order independent SQEs. Forward *or* send on a given connection, not
     /// both at once.
     ///
+    /// # TLS
+    ///
+    /// The **source** may be a TLS connection: rustls' plaintext is collected
+    /// and forwarded, which is what makes a TLS-terminating proxy work. The
+    /// **sink** may not — the forward writes bytes as they are, with nothing
+    /// on the path to encrypt them — and a TLS sink is refused with
+    /// `EPROTOTYPE` rather than put plaintext on the wire.
+    ///
     /// # Errors
     ///
-    /// Resolves `Err(EPIPE)` if the sink connection closes mid-forward — its
+    /// Refused at the call, resolving on the first poll without having
+    /// installed anything: `EBUSY` if a forward is already running on this
+    /// connection, `EPIPE` if the source or sink slot is already stale, and
+    /// `EPROTOTYPE` if the sink is a TLS connection.
+    ///
+    /// Resolves `Err(EPIPE)` if the sink connection closes *mid*-forward — its
     /// slot may be reused, and writing to a recycled index would deliver this
     /// stream to a different peer. The sink's generation is checked before
     /// every write.
     ///
     /// The mio backend exposes the same signature, but as a copy path — see
-    /// the `not(has_io_uring)` sibling below.
+    /// the `not(has_io_uring)` sibling below. Both backends refuse the same
+    /// three conditions with the same errnos.
     #[cfg(has_io_uring)]
     pub fn forward_to_conn<'a>(&self, sink: &'a ConnCtx, len: usize) -> ForwardToFuture<'a> {
         let target = crate::backend::uring::driver::SinkTarget::Conn {
             index: sink.conn_index,
             generation: sink.generation,
         };
-        let epoch = self.arm_forward_source(target, len as u64);
+        let armed = self.arm_forward_source(target, len as u64);
         ForwardToFuture {
             conn_index: self.conn_index,
             generation: self.generation,
-            epoch,
+            epoch: armed.unwrap_or(0),
+            refused: armed.err(),
             _borrow: PhantomData,
         }
     }
@@ -1590,10 +1661,11 @@ impl ConnCtx {
             {
                 return Err(libc::EPIPE);
             }
-            debug_assert!(
-                driver.forward_conn[src].is_none(),
-                "forward_to_conn while a forward is already running on {source}"
-            );
+            // Returned, not asserted: `EBUSY` is a documented error of this
+            // function, and a `debug_assert` here made that documented path
+            // unreachable in every debug build — which is every test run and
+            // all of CI. A caller matching on EBUSY worked in release and
+            // panicked under test.
             if driver.forward_conn[src].is_some() {
                 return Err(libc::EBUSY);
             }
@@ -3396,8 +3468,13 @@ pub struct ForwardToFuture<'a> {
     conn_index: u32,
     generation: u32,
     /// Which forward on this connection this future owns; see
-    /// [`ForwardProgress::epoch`]. Drop cancels only its own.
+    /// [`ForwardProgress::epoch`]. Drop cancels only its own. Meaningless
+    /// when `refused` is set, which is why Drop checks that first.
     epoch: u32,
+    /// Set when the forward could not be installed at all — a forward already
+    /// running (`EBUSY`), a stale source or sink slot (`EPIPE`), or a TLS sink
+    /// (`EPROTOTYPE`). Reported on the first poll; nothing was mutated.
+    refused: Option<i32>,
     /// Ties the future to whatever the caller borrowed — a `SinkFd`, or the
     /// sink `ConnCtx` — so the sink cannot be dropped mid-forward.
     _borrow: PhantomData<&'a ()>,
@@ -3428,6 +3505,12 @@ impl Drop for ForwardToFuture<'_> {
     /// dropped, via the same `settle_forward_end` the normal end of a forward
     /// uses — so a cancel loses no data the peer already sent.
     fn drop(&mut self) {
+        // A refused forward installed nothing — in particular it may have been
+        // refused *because* another forward is running, which this must not
+        // cancel.
+        if self.refused.is_some() {
+            return;
+        }
         let _ = try_with_state(|driver, _executor| {
             let idx = self.conn_index as usize;
             if driver.connections.generation(self.conn_index) != self.generation {
@@ -3457,6 +3540,9 @@ impl Future for ForwardToFuture<'_> {
 
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
         let me = self.get_mut();
+        if let Some(errno) = me.refused {
+            return Poll::Ready(Err(io::Error::from_raw_os_error(errno)));
+        }
         with_state(|driver, executor| {
             let conn = me.conn_index;
             let idx = conn as usize;

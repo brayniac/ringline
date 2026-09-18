@@ -1274,3 +1274,129 @@ fn forward_to_conn_from_a_tls_source() {
         h.join().unwrap().unwrap();
     }
 }
+
+// ── A TLS connection may not be a forward sink (EPROTOTYPE, both backends) ──
+
+/// Forwarding *into* a TLS connection must be refused.
+///
+/// A forward writes bytes to the sink as they are — `sendmsg` straight to the
+/// sink's descriptor on io_uring, a queued send on mio — with nothing on the
+/// path to encrypt them. So a TLS sink would put plaintext on a wire the peer
+/// is decrypting, which is a confidentiality failure, not a protocol error.
+///
+/// mio refused this from the start. io_uring had no guard anywhere on the
+/// forward path and would have written the plaintext; the invariant was only
+/// ever honoured because `forward_to_conn_from_a_tls_source` above avoids the
+/// return leg by hand ("the client is a TLS connection, so it cannot be a
+/// forward sink").
+struct TlsSinkRefusedProxy {
+    backend_addr: SocketAddr,
+}
+
+static TLS_SINK_REFUSED_BACKEND: std::sync::OnceLock<SocketAddr> = std::sync::OnceLock::new();
+
+impl AsyncEventHandler for TlsSinkRefusedProxy {
+    #[allow(clippy::manual_async_fn)]
+    fn on_accept(&self, client: ConnCtx) -> impl Future<Output = ()> + 'static {
+        let backend_addr = self.backend_addr;
+        async move {
+            let backend = match client.connect(backend_addr) {
+                Ok(fut) => match fut.await {
+                    Ok(ctx) => ctx,
+                    Err(_) => return,
+                },
+                Err(_) => return,
+            };
+
+            // `client` is the TLS connection. Forwarding backend -> client is
+            // the case that must be refused.
+            let errno = match backend.forward_to_conn(&client, 16).await {
+                Ok(_) => -1,
+                Err(e) => e.raw_os_error().unwrap_or(-1),
+            };
+            // Reported over TLS, so a plaintext leak could not masquerade as
+            // the answer.
+            let _ = client.send(&errno.to_be_bytes());
+        }
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        TlsSinkRefusedProxy {
+            backend_addr: *TLS_SINK_REFUSED_BACKEND
+                .get()
+                .expect("backend addr not set"),
+        }
+    }
+}
+
+#[test]
+fn a_tls_connection_is_refused_as_a_forward_sink() {
+    let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
+
+    let backend_port = free_port();
+    let backend_addr = format!("127.0.0.1:{backend_port}");
+    let (backend_shutdown, backend_handles) =
+        RinglineBuilder::new(test_config_builder().build().expect("valid config"))
+            .bind(backend_addr.parse().unwrap())
+            .launch::<PlainEcho>()
+            .expect("backend launch failed");
+    wait_for_server(&backend_addr);
+    TLS_SINK_REFUSED_BACKEND
+        .set(backend_addr.parse().unwrap())
+        .expect("backend addr set once");
+
+    let (certs, key) = generate_self_signed();
+    let proxy_port = free_port();
+    let proxy_addr = format!("127.0.0.1:{proxy_port}");
+    let config = test_config_builder()
+        .tls(TlsConfig::new(server_tls_config(certs.clone(), key)))
+        .build()
+        .expect("valid config");
+    let (proxy_shutdown, proxy_handles) = RinglineBuilder::new(config)
+        .bind(proxy_addr.parse().unwrap())
+        .launch::<TlsSinkRefusedProxy>()
+        .expect("proxy launch failed");
+    wait_for_server(&proxy_addr);
+
+    let client_config = client_tls_config(&certs);
+    let server_name: ServerName<'_> = "localhost".try_into().unwrap();
+    let mut tls_conn = rustls::ClientConnection::new(client_config, server_name).unwrap();
+    let mut tcp = TcpStream::connect(&proxy_addr).unwrap();
+    tcp.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    tcp.set_write_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    let mut stream = rustls::Stream::new(&mut tls_conn, &mut tcp);
+
+    // Wake the handler so it reaches the forward attempt.
+    stream.write_all(b"go").unwrap();
+    stream.flush().unwrap();
+
+    let mut got = [0u8; 4];
+    let mut total = 0;
+    while total < got.len() {
+        match stream.read(&mut got[total..]) {
+            Ok(0) => panic!("proxy closed before reporting the refusal"),
+            Ok(n) => total += n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(e) => panic!("TLS read error: {e}"),
+        }
+    }
+    assert_eq!(
+        i32::from_be_bytes(got),
+        libc::EPROTOTYPE,
+        "a TLS connection must be refused as a forward sink, not written in the clear"
+    );
+
+    let _ = stream;
+    drop(tcp);
+    proxy_shutdown.shutdown();
+    for h in proxy_handles {
+        h.join().unwrap().unwrap();
+    }
+    backend_shutdown.shutdown();
+    for h in backend_handles {
+        h.join().unwrap().unwrap();
+    }
+}

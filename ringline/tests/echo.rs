@@ -7279,3 +7279,100 @@ fn forward_to_file_stops_at_len_and_leaves_the_tail_readable() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ── Refusing a second forward on one connection (EBUSY, both backends) ──────
+
+/// A forward already running must be refused, not silently replaced.
+///
+/// mio has always refused it; io_uring armed unconditionally, overwriting
+/// `forward_progress` — which strands the running forward's held bids and
+/// hands its caller a result belonging to a different forward. The contract
+/// was stated only on the mio sibling's docs, so the two backends disagreed
+/// behind one signature.
+struct BusyForwardProxy {
+    backend_addr: SocketAddr,
+}
+
+static BUSY_FORWARD_BACKEND: std::sync::OnceLock<SocketAddr> = std::sync::OnceLock::new();
+static BUSY_FORWARD_ERRNO: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+
+impl AsyncEventHandler for BusyForwardProxy {
+    fn on_accept(&self, client: ConnCtx) -> impl Future<Output = ()> + 'static {
+        let backend_addr = self.backend_addr;
+        async move {
+            let backend = match client.connect(backend_addr) {
+                Ok(fut) => match fut.await {
+                    Ok(ctx) => ctx,
+                    Err(_) => return,
+                },
+                Err(_) => return,
+            };
+
+            // Hold one forward open (far more than the client will send), then
+            // ask for a second on the same connection while the first is live.
+            let first = client.forward_to_conn(&backend, 1 << 30);
+            let second = client.forward_to_conn(&backend, 16);
+            let errno = match second.await {
+                Ok(_) => -1,
+                Err(e) => e.raw_os_error().unwrap_or(-1),
+            };
+            let _ = BUSY_FORWARD_ERRNO.set(errno);
+            // Report it on the wire so the test sees it without shared state
+            // timing games.
+            let _ = client.send_nowait(&errno.to_be_bytes());
+            drop(first);
+        }
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        BusyForwardProxy {
+            backend_addr: *BUSY_FORWARD_BACKEND.get().expect("backend addr not set"),
+        }
+    }
+}
+
+#[test]
+fn a_second_forward_on_one_connection_is_refused_with_ebusy() {
+    let backend_port = free_port();
+    let backend_addr = format!("127.0.0.1:{backend_port}");
+    let (backend_shutdown, backend_handles) = RinglineBuilder::new(test_config())
+        .bind(backend_addr.parse().unwrap())
+        .launch::<AsyncEcho>()
+        .expect("backend launch failed");
+    wait_for_server(&backend_addr);
+    BUSY_FORWARD_BACKEND
+        .set(backend_addr.parse().unwrap())
+        .expect("backend addr set once");
+
+    let proxy_port = free_port();
+    let proxy_addr = format!("127.0.0.1:{proxy_port}");
+    let (proxy_shutdown, proxy_handles) = RinglineBuilder::new(test_config())
+        .bind(proxy_addr.parse().unwrap())
+        .launch::<BusyForwardProxy>()
+        .expect("proxy launch failed");
+    wait_for_server(&proxy_addr);
+
+    let mut stream = TcpStream::connect(&proxy_addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut got = [0u8; 4];
+    stream
+        .read_exact(&mut got)
+        .expect("proxy never reported the second forward's result");
+    assert_eq!(
+        i32::from_be_bytes(got),
+        libc::EBUSY,
+        "a second forward while one is running must resolve EBUSY, not replace it"
+    );
+    drop(stream);
+
+    proxy_shutdown.shutdown();
+    for h in proxy_handles {
+        h.join().unwrap().unwrap();
+    }
+    backend_shutdown.shutdown();
+    for h in backend_handles {
+        h.join().unwrap().unwrap();
+    }
+}
