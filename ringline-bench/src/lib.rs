@@ -3,6 +3,7 @@
 
 pub mod client;
 pub mod output;
+pub mod runtime_metrics;
 
 /// Re-export from ringline for use in bench binaries.
 pub use ringline::physical_core_count;

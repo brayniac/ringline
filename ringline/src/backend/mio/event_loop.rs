@@ -702,7 +702,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                         self.driver.close_connection(conn_index);
                         break;
                     }
-                    Ok(n) => n,
+                    Ok(n) => {
+                        metrics::BYTES.add(metrics::bytes::RECEIVED, n as u64);
+                        n
+                    }
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                         self.driver.tcp_streams[idx] = Some(stream);
                         break;
@@ -834,6 +837,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     break;
                 }
                 Ok(n) => {
+                    metrics::BYTES.add(metrics::bytes::RECEIVED, n as u64);
                     // A forward owns this connection's bytes: they go to the
                     // sink's send queue, not to the accumulator or a recv sink.
                     if self.driver.forward_conn[idx].is_some() {
