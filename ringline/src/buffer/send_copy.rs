@@ -884,34 +884,49 @@ mod tests {
 mod prefault_tests {
     use super::*;
 
-    /// The pool's `prefault` must actually make its backing resident.
+    /// The pool's `prefault` must make *its own* backing resident.
     ///
-    /// Asserts on RSS, not on "the method ran": a `prefault` wired to the
-    /// wrong allocation, or optimized away, would still return cleanly.
+    /// Asserts residency of the pool's pages via `mincore`, not process RSS:
+    /// `/proc/self/statm` is process-wide and the suite runs in parallel, so an
+    /// unrelated thread freeing memory between samples makes the delta
+    /// meaningless — and, when it goes negative, panics. (It did, on CI.)
+    /// `mincore` answers the question this test is actually asking.
     #[test]
-    fn prefault_grows_rss_by_about_the_pool_size() {
+    fn prefault_makes_the_pools_own_pages_resident() {
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as usize;
         let slots = 512u16;
         let slot = 64 * 1024u32;
-        let total = slots as usize * slot as usize; // 32 MiB
-
-        let before = crate::buffer::prefault::resident_bytes();
         let mut pool = SendCopyPool::new(slots, slot);
-        let allocated = crate::buffer::prefault::resident_bytes();
-        pool.prefault();
-        let after = crate::buffer::prefault::resident_bytes();
 
-        // Allocation alone should not have made it resident...
+        // Page-aligned window inside the pool's backing.
+        let base = pool.backing.as_ptr() as usize;
+        let aligned = base.div_ceil(page) * page;
+        let pages = (pool.backing.len() - (aligned - base)) / page;
+        let ptr = aligned as *mut libc::c_void;
+        let len = pages * page;
+
+        let resident = |ptr: *mut libc::c_void, len: usize| -> usize {
+            let mut vec = vec![0u8; len / page];
+            // SAFETY: `ptr` is page-aligned and `len` bytes from it lie inside
+            // the pool's live backing; `vec` has one byte per page.
+            let rc = unsafe { libc::mincore(ptr, len, vec.as_mut_ptr()) };
+            assert_eq!(rc, 0, "mincore: {}", std::io::Error::last_os_error());
+            vec.iter().filter(|b| *b & 1 == 1).count()
+        };
+
+        let before = resident(ptr, len);
         assert!(
-            allocated - before < total / 2,
-            "allocation already resident ({} of {total} bytes) — the test cannot \
-             show prefaulting does anything",
-            allocated - before
+            before < pages / 2,
+            "the pool should start mostly cold, found {before}/{pages} resident — \
+             the test cannot show prefaulting does anything otherwise"
         );
-        // ...and prefaulting should.
-        assert!(
-            after - before >= total * 9 / 10,
-            "expected ~{total} bytes resident after prefault, saw {}",
-            after - before
+
+        pool.prefault();
+
+        assert_eq!(
+            resident(ptr, len),
+            pages,
+            "every page of the pool's backing must be resident after prefault"
         );
     }
 }

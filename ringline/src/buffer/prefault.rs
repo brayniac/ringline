@@ -68,21 +68,6 @@ pub(crate) fn prefault(buf: &mut [u8]) {
     unsafe { std::ptr::write_volatile(ptr.add(len - 1), 0) };
 }
 
-/// Resident pages of a process, from `/proc/self/statm`.
-///
-/// Test-only: the point of prefaulting is a change in RSS, so the end-to-end
-/// test has to observe RSS rather than trust that a flag reached a field.
-#[cfg(all(test, target_os = "linux"))]
-pub(crate) fn resident_bytes() -> usize {
-    let statm = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
-    let rss_pages: usize = statm
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    rss_pages * page_size()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
