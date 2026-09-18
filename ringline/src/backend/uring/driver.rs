@@ -128,6 +128,38 @@ pub(crate) enum HeldRecvBuf {
     Owned(bytes::Bytes),
 }
 
+/// Held buffers gathered into one forward write.
+///
+/// Bounded rather than unbounded: a batch is one operation whose completion
+/// releases every bid in it, so a very large batch delays those bids' return to
+/// the ring and coarsens the hold-cap throttle. 16 × 16 KiB is 256 KiB per
+/// write, which is past the point where a socket has more queued anyway
+/// (#416 measured recv completions plateauing near 100 KB).
+const MAX_FORWARD_IOV: usize = 16;
+
+/// A running Mode A forward, driver-side.
+///
+/// This used to live in `ForwardToFuture`, which is why every completed write
+/// had to wake the task just so the future could pop the next held buffer and
+/// submit it. Holding it here lets the completion handler do that itself —
+/// `run_direct_echo` has always worked this way, and the mio backend's
+/// `MioForwardState` has held the equivalent since #415. Measured motivation:
+/// Mode A ran 1.26 instructions/byte against direct echo's 0.985 at the same
+/// 16 KiB buffer, over a ~0.86 kernel floor (#416).
+#[derive(Clone, Copy)]
+pub(crate) struct ForwardProgress {
+    /// Where the bytes go; a file sink writes at `forwarded` as its offset.
+    pub(crate) target: SinkTarget,
+    /// Bytes the caller asked to forward.
+    pub(crate) len: u64,
+    /// Bytes whose write has completed.
+    pub(crate) forwarded: u64,
+    /// Identifies *which* forward this is, so a `ForwardToFuture` dropped after
+    /// its own forward ended cannot cancel a later one that reused the slot.
+    /// Bumped per arm, per connection.
+    pub(crate) epoch: u32,
+}
+
 /// In-flight segmented-recv Mode A forward write (see
 /// `docs/segmented-recv-design.md`, "Mode A — Forward to an fd"). One per
 /// connection at a time — writes to a sink are serialized (io_uring does not
@@ -155,14 +187,26 @@ impl SinkTarget {
 }
 
 pub(crate) struct ForwardWriteState {
-    /// Where the bytes being written live. `Pinned` releases its bid on
-    /// completion; `Owned` just drops its heap bytes.
-    pub(crate) backing: HeldRecvBuf,
-    /// Total bytes to write from this backing — the prefix length, which may be
-    /// shorter than the backing buffer when `len` ends mid-buffer (the suffix
-    /// was already stashed into the accumulator by the forward future).
+    /// Where the bytes being written live, in wire order. `Pinned` entries
+    /// release their bid on completion; `Owned` just drops its heap bytes.
+    ///
+    /// Several at once: one `sendmsg`/`writev` carries a whole batch of held
+    /// buffers, so forwarding costs one completion per batch instead of one per
+    /// buffer. Each entry's *prefix length* is in `lens` — a batch's last
+    /// buffer can be truncated when the forward's `len` ends mid-buffer.
+    pub(crate) backings: Vec<HeldRecvBuf>,
+    /// Prefix length to write from each backing, parallel to `backings`.
+    pub(crate) lens: Vec<u32>,
+    /// The iovec array handed to the kernel. Owned here because an SQE's
+    /// memory must outlive its operation, and rebuilt only between operations
+    /// (a short write rebuilds it before resubmitting).
+    pub(crate) iovecs: Vec<libc::iovec>,
+    /// The `msghdr` handed to `sendmsg`, pointing at `iovecs`. Same lifetime
+    /// rule, same reason.
+    pub(crate) msghdr: libc::msghdr,
+    /// Total bytes to write across the whole batch.
     pub(crate) total: u32,
-    /// Bytes already written from this backing; advanced on short writes so the
+    /// Bytes already written from this batch; advanced on short writes so the
     /// remainder resubmits at the correct source offset (and file offset).
     pub(crate) written: u32,
     /// Absolute file offset for byte 0 of this backing (0 for socket sinks).
@@ -175,15 +219,43 @@ pub(crate) struct ForwardWriteState {
 }
 
 impl ForwardWriteState {
-    /// Source pointer + remaining length for the next (re)submission, honoring
-    /// bytes already written on a short write.
-    pub(crate) fn remainder(&self, provided_bufs: &ProvidedBufRing) -> (*const u8, u32) {
-        let base = match &self.backing {
+    /// Base pointer of one backing.
+    fn base_ptr(backing: &HeldRecvBuf, provided_bufs: &ProvidedBufRing) -> *const u8 {
+        match backing {
             HeldRecvBuf::Pinned { bid, .. } => provided_bufs.get_buffer(*bid).0,
             HeldRecvBuf::Owned(bytes) => bytes.as_ptr(),
-        };
-        let ptr = unsafe { base.add(self.written as usize) };
-        (ptr, self.total - self.written)
+        }
+    }
+
+    /// Rebuild `iovecs` (and point `msghdr` at it) to cover exactly the bytes
+    /// not yet written.
+    ///
+    /// Called before every submission, including a resubmit after a short
+    /// write: `written` may land mid-buffer, so the first surviving iovec
+    /// starts at an offset and whole buffers ahead of it are skipped. Never
+    /// called while an operation is in flight — the kernel is reading this
+    /// array.
+    pub(crate) fn rebuild_iovecs(&mut self, provided_bufs: &ProvidedBufRing) {
+        self.iovecs.clear();
+        let mut skip = self.written;
+        for (backing, &len) in self.backings.iter().zip(self.lens.iter()) {
+            if skip >= len {
+                skip -= len;
+                continue;
+            }
+            let base = Self::base_ptr(backing, provided_bufs);
+            // SAFETY: `skip < len` and `len` bytes from `base` are initialised
+            // and owned by this state until its CQE arrives.
+            let ptr = unsafe { base.add(skip as usize) };
+            self.iovecs.push(libc::iovec {
+                iov_base: ptr as *mut libc::c_void,
+                iov_len: (len - skip) as usize,
+            });
+            skip = 0;
+        }
+        self.msghdr = unsafe { std::mem::zeroed() };
+        self.msghdr.msg_iov = self.iovecs.as_mut_ptr();
+        self.msghdr.msg_iovlen = self.iovecs.len();
     }
 }
 
@@ -282,7 +354,15 @@ pub(crate) struct Driver {
     /// Per-connection completed-forward-write result, produced by
     /// `handle_forward_write` and consumed by the `ForwardToFuture`: `Ok(n)` =
     /// bytes of the just-completed backing, `Err(errno)` = write failure.
-    pub(crate) forward_done: Vec<Option<Result<u32, i32>>>,
+    /// Terminal result of a Mode A forward: total bytes forwarded, or an
+    /// errno. Set once, by whichever handler drives the forward to its end,
+    /// and consumed by `ForwardToFuture`. (It used to carry *per-write* byte
+    /// counts, because the future accumulated them itself.)
+    pub(crate) forward_done: Vec<Option<Result<u64, i32>>>,
+    /// Per-connection Mode A forward state, indexed by source.
+    pub(crate) forward_progress: Vec<Option<ForwardProgress>>,
+    /// Monotonic per-connection forward counter; see [`ForwardProgress::epoch`].
+    pub(crate) forward_epoch: Vec<u32>,
     /// Per-connection flag: `true` while a Mode A `forward_to` is driving this
     /// connection (set by `ConnCtx::forward_to`, cleared by `settle_forward_end`
     /// / `reset_segment_state` / `close_connection`). Gates the `forward_hold_cap`
@@ -695,6 +775,8 @@ impl Driver {
             segment_pinned: vec![None; config.max_connections as usize],
             forward_write: (0..config.max_connections).map(|_| None).collect(),
             forward_done: (0..config.max_connections).map(|_| None).collect(),
+            forward_progress: (0..config.max_connections).map(|_| None).collect(),
+            forward_epoch: vec![0; config.max_connections as usize],
             forward_recv_active: vec![false; config.max_connections as usize],
             forward_hold_throttled: vec![false; config.max_connections as usize],
             forward_hold_cap: config.forward_hold_cap,
@@ -952,6 +1034,7 @@ impl Driver {
         // slot's forward.
         self.forward_write[conn_index as usize] = None;
         self.forward_done[conn_index as usize] = None;
+        self.forward_progress[conn_index as usize] = None;
         self.forward_recv_active[conn_index as usize] = false;
         self.forward_hold_throttled[conn_index as usize] = false;
     }
@@ -1031,6 +1114,159 @@ impl Driver {
         ok
     }
 
+    /// Drive a Mode A forward as far as it can go without a task poll.
+    ///
+    /// Returns `Some(result)` when the forward has reached a terminal state —
+    /// requested length reached, peer FIN, or a submission error — and `None`
+    /// while it is still running (a write in flight, or waiting for bytes).
+    /// The caller is responsible for recording the result in `forward_done`
+    /// and waking the task; nothing else wakes it, which is the point.
+    ///
+    /// This is the body that used to live in `ForwardToFuture::poll`. Keeping
+    /// it here lets `handle_forward_write` and the segmented recv branch submit
+    /// the next write directly, so the task is woken once per *forward* rather
+    /// than once per *provided buffer*.
+    ///
+    /// Ordering is unchanged: one write in flight per connection, held buffers
+    /// in arrival order. Only the caller changes.
+    pub(crate) fn advance_forward(&mut self, conn_index: u32) -> Option<Result<u64, io::Error>> {
+        let idx = conn_index as usize;
+        let progress = (*self.forward_progress.get(idx)?)?;
+
+        // A write is already in flight — its completion re-enters here.
+        if self.forward_write[idx].is_some() {
+            return None;
+        }
+
+        if progress.forwarded >= progress.len {
+            let forwarded = progress.forwarded;
+            self.forward_progress[idx] = None;
+            if !self.settle_forward_end(conn_index) {
+                self.close_connection(conn_index);
+                return Some(Err(io::Error::other(
+                    "recv accumulator overflow settling forward tail",
+                )));
+            }
+            return Some(Ok(forwarded));
+        }
+
+        if self.segment_hold[idx].is_empty() {
+            // Nothing held. A finished recv side means the forward is truncated
+            // — resolve short rather than wait for bytes that are not coming.
+            let closed = self
+                .connections
+                .get(conn_index)
+                .map(|c| c.recv_finished())
+                .unwrap_or(true);
+            if closed {
+                let forwarded = progress.forwarded;
+                self.forward_progress[idx] = None;
+                let _ = self.settle_forward_end(conn_index);
+                return Some(Ok(forwarded));
+            }
+            return None;
+        }
+
+        // Gather a batch: as many held buffers as the remaining length and the
+        // iovec cap allow, written as one `sendmsg`/`writev`. This is the whole
+        // point — `run_direct_echo` has always coalesced a drain's worth into a
+        // single send (#397), and doing one completion per buffer is what left
+        // Mode A at 1.24 instructions/byte against direct echo's 0.985.
+        let mut remaining = progress.len - progress.forwarded;
+        let mut backings: Vec<HeldRecvBuf> = Vec::new();
+        let mut lens: Vec<u32> = Vec::new();
+        while backings.len() < MAX_FORWARD_IOV && remaining > 0 {
+            let Some(held) = self.segment_hold[idx].pop_front() else {
+                break;
+            };
+            // Bytes past `len` belong to whoever reads this connection next, so
+            // a held buffer that straddles the boundary is split and its tail
+            // stashed in the accumulator. That can only happen to the last
+            // buffer of a batch, since it ends the forward.
+            match held {
+                HeldRecvBuf::Pinned { bid, len } => {
+                    if (len as u64) <= remaining {
+                        remaining -= len as u64;
+                        backings.push(HeldRecvBuf::Pinned { bid, len });
+                        lens.push(len);
+                    } else {
+                        let chunk = remaining as u32;
+                        let (ptr, _) = self.provided_bufs.get_buffer(bid);
+                        // SAFETY: `bid` is pinned (unreplenished) and `len`
+                        // bytes were received into it, so `[chunk..len]` is
+                        // initialised and is copied out before anything can
+                        // replenish the bid.
+                        let suffix = unsafe {
+                            std::slice::from_raw_parts(
+                                ptr.add(chunk as usize),
+                                (len - chunk) as usize,
+                            )
+                        };
+                        if !self.accumulators.append(conn_index, suffix) {
+                            self.pending_replenish.push(bid);
+                            for b in backings {
+                                if let HeldRecvBuf::Pinned { bid, .. } = b {
+                                    self.pending_replenish.push(bid);
+                                }
+                            }
+                            self.forward_progress[idx] = None;
+                            self.close_connection(conn_index);
+                            return Some(Err(io::Error::other(
+                                "recv accumulator overflow stashing forward tail",
+                            )));
+                        }
+                        remaining = 0;
+                        backings.push(HeldRecvBuf::Pinned { bid, len: chunk });
+                        lens.push(chunk);
+                    }
+                }
+                HeldRecvBuf::Owned(bytes) => {
+                    if (bytes.len() as u64) <= remaining {
+                        remaining -= bytes.len() as u64;
+                        let total = bytes.len() as u32;
+                        backings.push(HeldRecvBuf::Owned(bytes));
+                        lens.push(total);
+                    } else {
+                        let chunk = remaining as usize;
+                        if !self.accumulators.append(conn_index, &bytes[chunk..]) {
+                            for b in backings {
+                                if let HeldRecvBuf::Pinned { bid, .. } = b {
+                                    self.pending_replenish.push(bid);
+                                }
+                            }
+                            self.forward_progress[idx] = None;
+                            self.close_connection(conn_index);
+                            return Some(Err(io::Error::other(
+                                "recv accumulator overflow stashing forward tail",
+                            )));
+                        }
+                        remaining = 0;
+                        backings.push(HeldRecvBuf::Owned(bytes.slice(0..chunk)));
+                        lens.push(chunk as u32);
+                    }
+                }
+            }
+        }
+
+        if backings.is_empty() {
+            return None;
+        }
+
+        let base_offset = if progress.target.is_file() {
+            progress.forwarded
+        } else {
+            0
+        };
+        match self.start_forward_write(conn_index, backings, lens, base_offset, progress.target) {
+            Ok(()) => None,
+            Err(e) => {
+                self.forward_progress[idx] = None;
+                let _ = self.settle_forward_end(conn_index);
+                Some(Err(e))
+            }
+        }
+    }
+
     /// Submit the first write of a segmented-recv Mode A forward `backing`
     /// (`total` bytes) to `sink_fd` and record the in-flight state. One write is
     /// in flight per connection; the completion handler releases the backing.
@@ -1041,8 +1277,8 @@ impl Driver {
     pub(crate) fn start_forward_write(
         &mut self,
         conn_index: u32,
-        backing: HeldRecvBuf,
-        total: u32,
+        backings: Vec<HeldRecvBuf>,
+        lens: Vec<u32>,
         base_offset: u64,
         target: SinkTarget,
     ) -> io::Result<()> {
@@ -1050,6 +1286,10 @@ impl Driver {
             self.forward_write[conn_index as usize].is_none(),
             "start_forward_write while a forward write is already in flight"
         );
+        debug_assert_eq!(backings.len(), lens.len(), "one length per backing");
+        let idx = conn_index as usize;
+        let total: u32 = lens.iter().sum();
+
         // A connection sink is addressed by slot index, and slots recycle. If
         // the sink's generation has moved the caller is holding a stale handle
         // and this write would land on whoever owns the slot now. Checked here
@@ -1057,53 +1297,122 @@ impl Driver {
         if let SinkTarget::Conn { index, generation } = target
             && self.connections.generation(index) != generation
         {
-            if let HeldRecvBuf::Pinned { bid, .. } = backing {
-                self.pending_replenish.push(bid);
+            for backing in &backings {
+                if let HeldRecvBuf::Pinned { bid, .. } = backing {
+                    self.pending_replenish.push(*bid);
+                }
             }
             return Err(io::Error::from_raw_os_error(libc::EPIPE));
         }
+
         let generation = self.connections.generation(conn_index);
         let ud = crate::completion::UserData::encode(
             crate::completion::OpTag::ForwardWrite,
             conn_index,
             generation,
         );
-        let ptr = match &backing {
-            HeldRecvBuf::Pinned { bid, .. } => self.provided_bufs.get_buffer(*bid).0,
-            HeldRecvBuf::Owned(bytes) => bytes.as_ptr(),
+
+        let mut state = ForwardWriteState {
+            iovecs: Vec::with_capacity(backings.len()),
+            // SAFETY: `msghdr` is a plain C struct; zeroed is its valid empty
+            // state, and `rebuild_iovecs` fills the fields that matter.
+            msghdr: unsafe { std::mem::zeroed() },
+            backings,
+            lens,
+            total,
+            written: 0,
+            base_offset,
+            target,
+            generation,
         };
+        state.rebuild_iovecs(&self.provided_bufs);
+
+        // Install *before* submitting: the SQE points at `msghdr` and the iovec
+        // array inside this state, and both must stay put until the CQE. Moving
+        // the state after taking those pointers would invalidate `msg_iov`'s
+        // owner even though the iovec heap block itself would survive.
+        self.forward_write[idx] = Some(state);
+        let (hdr_ptr, iov_ptr, iov_count) = {
+            let st = self.forward_write[idx].as_ref().expect("just installed");
+            (
+                &st.msghdr as *const libc::msghdr,
+                st.iovecs.as_ptr(),
+                st.iovecs.len() as u32,
+            )
+        };
+
         let res = match target {
             SinkTarget::Fd { fd, is_file: true } => unsafe {
                 self.ring
-                    .submit_forward_write_file(fd, ptr, total, base_offset, ud)
+                    .submit_forward_writev_file(fd, iov_ptr, iov_count, base_offset, ud)
             },
             SinkTarget::Fd { fd, is_file: false } => unsafe {
-                self.ring.submit_forward_write_socket(fd, ptr, total, ud)
+                self.ring.submit_forward_writev_socket(fd, hdr_ptr, ud)
             },
             // A connection sink writes through its registered file index, the
             // same way every other send on that connection does.
             SinkTarget::Conn { index, .. } => unsafe {
-                self.ring.submit_forward_write_conn(index, ptr, total, ud)
+                self.ring.submit_forward_writev_conn(index, hdr_ptr, ud)
             },
         };
         match res {
-            Ok(()) => {
-                self.forward_write[conn_index as usize] = Some(ForwardWriteState {
-                    backing,
-                    total,
-                    written: 0,
-                    base_offset,
-                    target,
-                    generation,
-                });
-                Ok(())
-            }
+            Ok(()) => Ok(()),
             Err(e) => {
-                if let HeldRecvBuf::Pinned { bid, .. } = backing {
-                    self.pending_replenish.push(bid);
+                // Nothing is in flight, so the state comes back out and its
+                // bids go home — exactly once.
+                if let Some(state) = self.forward_write[idx].take() {
+                    for backing in state.backings {
+                        if let HeldRecvBuf::Pinned { bid, .. } = backing {
+                            self.pending_replenish.push(bid);
+                        }
+                    }
                 }
                 Err(e)
             }
+        }
+    }
+
+    /// Rebuild the in-flight write's iovecs and resubmit what is left of it.
+    ///
+    /// Used after a short write and after a `POLLOUT` re-arm. The batch's
+    /// backings do not change; only which bytes of them are still owed.
+    pub(crate) fn resubmit_forward_writev(&mut self, conn_index: u32) -> io::Result<()> {
+        let idx = conn_index as usize;
+        let Some(mut state) = self.forward_write[idx].take() else {
+            return Ok(());
+        };
+        state.rebuild_iovecs(&self.provided_bufs);
+        let ud = crate::completion::UserData::encode(
+            crate::completion::OpTag::ForwardWrite,
+            conn_index,
+            state.generation,
+        );
+        let (target, base_offset, written) = (state.target, state.base_offset, state.written);
+        self.forward_write[idx] = Some(state);
+        let (hdr_ptr, iov_ptr, iov_count) = {
+            let st = self.forward_write[idx].as_ref().expect("just reinstalled");
+            (
+                &st.msghdr as *const libc::msghdr,
+                st.iovecs.as_ptr(),
+                st.iovecs.len() as u32,
+            )
+        };
+        match target {
+            SinkTarget::Fd { fd, is_file: true } => unsafe {
+                self.ring.submit_forward_writev_file(
+                    fd,
+                    iov_ptr,
+                    iov_count,
+                    base_offset + written as u64,
+                    ud,
+                )
+            },
+            SinkTarget::Fd { fd, is_file: false } => unsafe {
+                self.ring.submit_forward_writev_socket(fd, hdr_ptr, ud)
+            },
+            SinkTarget::Conn { index, .. } => unsafe {
+                self.ring.submit_forward_writev_conn(index, hdr_ptr, ud)
+            },
         }
     }
 
@@ -1183,6 +1492,7 @@ impl Driver {
         } else {
             // No forward write in flight — safe to clear a stale completed result.
             self.forward_done[conn_index as usize] = None;
+            self.forward_progress[conn_index as usize] = None;
         }
         // Clear the Mode A forward flags for slot reuse. Any held bids were
         // already drained above (segment_hold / segment_pinned / forward_write);

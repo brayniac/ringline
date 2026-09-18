@@ -6911,22 +6911,23 @@ fn forward_to_conn_proxies_both_directions() {
 
 /// Dropping a `forward_to_conn` future stops the relay.
 ///
-/// On mio the event loop relays on its own once the forward is installed, so a
-/// dropped future — a `select!` losing a race, a timeout — has to take the
-/// forward with it. Otherwise bytes keep reaching the sink with nobody waiting
-/// on the result, and the next forward on that connection starts behind.
+/// Both backends relay on their own once the forward is installed — mio from
+/// its event loop, io_uring from the write-completion handler — so a dropped
+/// future (a `select!` losing a race, a timeout) has to take the forward with
+/// it. Otherwise bytes keep reaching the sink with nobody waiting on the
+/// result, and the next forward on that connection starts behind.
 ///
-/// mio-only: on io_uring the writes are driven by polling the future, so
-/// dropping it stops them by itself.
-#[cfg(not(has_io_uring))]
+/// This was mio-only until gathering moved io_uring's submission out of
+/// `ForwardToFuture::poll` and into `handle_forward_write`. Before that, the
+/// io_uring writes really were driven by polling and a drop stopped them by
+/// itself; afterwards the driver owns the progress and keeps going. The test
+/// covers both backends so that asymmetry cannot come back silently.
 struct DroppedForwardProxy {
     backend_addr: SocketAddr,
 }
 
-#[cfg(not(has_io_uring))]
 static DROPPED_FORWARD_BACKEND: std::sync::OnceLock<SocketAddr> = std::sync::OnceLock::new();
 
-#[cfg(not(has_io_uring))]
 impl AsyncEventHandler for DroppedForwardProxy {
     fn on_accept(&self, client: ConnCtx) -> impl Future<Output = ()> + 'static {
         let backend_addr = self.backend_addr;
@@ -6968,7 +6969,6 @@ impl AsyncEventHandler for DroppedForwardProxy {
     }
 }
 
-#[cfg(not(has_io_uring))]
 #[test]
 fn dropping_a_forward_to_conn_future_cancels_the_relay() {
     let backend_port = free_port();
@@ -7022,4 +7022,260 @@ fn dropping_a_forward_to_conn_future_cancels_the_relay() {
     for h in backend_handles {
         h.join().unwrap().unwrap();
     }
+}
+
+// ── forward_to a file sink (io_uring Mode A, gathered writev) ───────────────
+
+/// Forward a length-prefixed body straight to a file, then acknowledge the
+/// byte count so the client knows the write is done.
+///
+/// The file path is the interesting part: a file sink uses `writev` at an
+/// advancing offset, where a socket sink uses `sendmsg` and ignores offsets
+/// entirely. Gathering made one write cover many held buffers, so the offset
+/// now has to advance by the size of a *batch* and, after a short write, by a
+/// partial batch. Nothing but a unit test covered that until this.
+#[cfg(has_io_uring)]
+struct FileForwarder;
+
+#[cfg(has_io_uring)]
+static FILE_SINK_PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+#[cfg(has_io_uring)]
+impl AsyncEventHandler for FileForwarder {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            use std::os::fd::AsFd;
+            let mut hdr = [0u8; 4];
+            let n = conn
+                .with_data(|data| {
+                    if data.len() < 4 {
+                        return ParseResult::NeedMore;
+                    }
+                    hdr.copy_from_slice(&data[..4]);
+                    ParseResult::Consumed(4)
+                })
+                .await;
+            if n == 0 {
+                return;
+            }
+            let len = u32::from_be_bytes(hdr) as usize;
+
+            let path = FILE_SINK_PATH.get().expect("path set before launch");
+            let file = match std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(path)
+            {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("file forwarder: open failed: {e}");
+                    return;
+                }
+            };
+            let sink = match ringline::SinkFd::file(file.as_fd()) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("file forwarder: SinkFd::file failed: {e}");
+                    return;
+                }
+            };
+            let forwarded = conn.forward_to(&sink, len).await.unwrap_or(0);
+            // `sink` borrows `file` immutably and `sync_all` takes `&self`, so
+            // the two coexist — no drop needed to release anything.
+            //
+            // fsync before acking: the client reads the file as soon as it sees
+            // the ack, and a buffered write need not be visible yet.
+            let _ = file.sync_all();
+
+            // Ack the count, then echo whatever arrived past `len` — which is
+            // what `settle_forward_end` put back in the accumulator, and the
+            // half of the split a gathered batch can get wrong.
+            let _ = conn.send_nowait(&(forwarded as u32).to_be_bytes());
+            let tail = conn
+                .with_data(|data| {
+                    if data.is_empty() {
+                        return ParseResult::NeedMore;
+                    }
+                    ParseResult::Consumed(data.len())
+                })
+                .await;
+            let _ = tail;
+        }
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        FileForwarder
+    }
+}
+
+/// A body far larger than one provided buffer lands in the file byte-exact.
+///
+/// 1 MiB against a 4 KiB buffer ring is ~256 buffers, so the forward is many
+/// gathered batches: this fails if a batch writes at the wrong offset, if
+/// iovecs go out of order, or if a short write resubmits from the wrong place.
+#[cfg(has_io_uring)]
+#[test]
+fn forward_to_file_writes_a_large_body_byte_exact() {
+    let dir = std::env::temp_dir().join(format!("ringline-file-fwd-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("sink.bin");
+    FILE_SINK_PATH.set(path.clone()).expect("set once");
+
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
+        .bind(addr.parse().unwrap())
+        .launch::<FileForwarder>()
+        .expect("launch failed");
+    wait_for_server(&addr);
+
+    let size = 1024 * 1024;
+    // A position-dependent pattern: a misordered or misplaced batch changes
+    // bytes rather than merely truncating, so the mismatch is visible.
+    let payload: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    stream.write_all(&(size as u32).to_be_bytes()).unwrap();
+    stream.write_all(&payload).unwrap();
+    stream.flush().unwrap();
+
+    let mut ack = [0u8; 4];
+    stream.read_exact(&mut ack).expect("ack");
+    assert_eq!(
+        u32::from_be_bytes(ack) as usize,
+        size,
+        "the forward should report every byte written"
+    );
+
+    let written = std::fs::read(&path).expect("read back the sink file");
+    assert_eq!(written.len(), size, "file length");
+    assert_eq!(written, payload, "file contents differ from what was sent");
+
+    drop(stream);
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Bytes past `len` do not reach the file, and are still readable afterwards.
+///
+/// The overshoot split: a batch's last held buffer straddles the end of the
+/// forward, so its prefix is written and its suffix goes back to the
+/// accumulator. With gathering that split happens inside a multi-buffer batch,
+/// which is a different code path from the single-buffer one it replaced.
+#[cfg(has_io_uring)]
+#[test]
+fn forward_to_file_stops_at_len_and_leaves_the_tail_readable() {
+    let dir = std::env::temp_dir().join(format!("ringline-file-tail-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("sink.bin");
+    // A second static: the two tests run in the same binary and must not share
+    // a path.
+    static TAIL_PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    TAIL_PATH.set(path.clone()).expect("set once");
+
+    struct TailForwarder;
+    impl AsyncEventHandler for TailForwarder {
+        fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+            async move {
+                use std::os::fd::AsFd;
+                let mut hdr = [0u8; 4];
+                let n = conn
+                    .with_data(|data| {
+                        if data.len() < 4 {
+                            return ParseResult::NeedMore;
+                        }
+                        hdr.copy_from_slice(&data[..4]);
+                        ParseResult::Consumed(4)
+                    })
+                    .await;
+                if n == 0 {
+                    return;
+                }
+                let len = u32::from_be_bytes(hdr) as usize;
+                let path = TAIL_PATH.get().expect("path set");
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(path)
+                    .expect("open sink");
+                let sink = ringline::SinkFd::file(file.as_fd()).expect("file sink");
+                let forwarded = conn.forward_to(&sink, len).await.unwrap_or(0);
+                let _ = file.sync_all();
+                let _ = conn.send_nowait(&(forwarded as u32).to_be_bytes());
+
+                // Echo the overshoot back, so the test can prove those bytes
+                // survived the split rather than being written or dropped.
+                let mut tail = Vec::new();
+                while tail.len() < 64 {
+                    let got = conn
+                        .with_data(|data| {
+                            tail.extend_from_slice(data);
+                            ParseResult::Consumed(data.len())
+                        })
+                        .await;
+                    if got == 0 {
+                        break;
+                    }
+                }
+                let _ = conn.send_nowait(&tail);
+            }
+        }
+        fn create_for_worker(_id: usize) -> Self {
+            TailForwarder
+        }
+    }
+
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
+        .bind(addr.parse().unwrap())
+        .launch::<TailForwarder>()
+        .expect("launch failed");
+    wait_for_server(&addr);
+
+    // Forward 100_000 bytes, but send 64 more. With a 4 KiB ring the boundary
+    // lands mid-buffer, inside a batch.
+    let size = 100_000usize;
+    let body: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+    let tail: Vec<u8> = (0..64u8).map(|i| i.wrapping_add(7)).collect();
+
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    stream.write_all(&(size as u32).to_be_bytes()).unwrap();
+    stream.write_all(&body).unwrap();
+    stream.write_all(&tail).unwrap();
+    stream.flush().unwrap();
+
+    let mut ack = [0u8; 4];
+    stream.read_exact(&mut ack).expect("ack");
+    assert_eq!(u32::from_be_bytes(ack) as usize, size);
+
+    let mut echoed = vec![0u8; tail.len()];
+    stream.read_exact(&mut echoed).expect("tail echo");
+    assert_eq!(echoed, tail, "the overshoot must survive the split intact");
+
+    let written = std::fs::read(&path).expect("read back");
+    assert_eq!(
+        written.len(),
+        size,
+        "the file must hold exactly `len` bytes — no overshoot written"
+    );
+    assert_eq!(written, body);
+
+    drop(stream);
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }

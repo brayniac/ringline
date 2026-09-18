@@ -1483,7 +1483,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     metrics::POOL.increment(metrics::pool::FORWARD_THROTTLED);
                 }
             }
-            self.executor.wake_recv(conn_index);
+            // A forwarder can submit its write straight from here; only a
+            // Mode B/C segment reader needs its task woken to look at the hold.
+            if self.driver.forward_progress[conn_index as usize].is_some() {
+                self.finish_forward_if_done(conn_index);
+            } else {
+                self.executor.wake_recv(conn_index);
+            }
         } else if self.driver.recv_forward[conn_index as usize] {
             // Zero-copy recv-forward path: hold the provided buffer in-place
             // (bid NOT replenished) for scatter-gather forwarding via
@@ -2683,12 +2689,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// Release the backing of the in-flight forward write, record an error for
     /// the `ForwardToFuture`, and wake it. A pinned bid returns to the ring.
     fn fail_forward_write(&mut self, conn_index: u32, errno: i32) {
-        if let Some(crate::backend::HeldRecvBuf::Pinned { bid, .. }) = self.driver.forward_write
-            [conn_index as usize]
-            .take()
-            .map(|s| s.backing)
-        {
-            self.driver.pending_replenish.push(bid);
+        if let Some(state) = self.driver.forward_write[conn_index as usize].take() {
+            // A batch holds several bids; every pinned one goes back, exactly
+            // once.
+            for backing in state.backings {
+                if let crate::backend::HeldRecvBuf::Pinned { bid, .. } = backing {
+                    self.driver.pending_replenish.push(bid);
+                }
+            }
         }
         // On a closing connection this is the cancelled-write's (ECANCELED) CQE:
         // the backing is now released, so continue the deferred close instead of
@@ -2697,6 +2705,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.driver.try_finalize_close(conn_index);
             return;
         }
+        self.driver.forward_progress[conn_index as usize] = None;
         self.driver.forward_done[conn_index as usize] = Some(Err(errno));
         self.executor.wake_recv(conn_index);
     }
@@ -2706,54 +2715,23 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// pointer, length, and (for files) offset advance. On submit failure the
     /// forward is failed (releasing the backing).
     fn resubmit_forward_write(&mut self, conn_index: u32) {
-        let (target, ptr, len, offset, generation) = {
-            let Some(state) = self.driver.forward_write[conn_index as usize].as_ref() else {
-                return;
-            };
-            let (ptr, len) = state.remainder(&self.driver.provided_bufs);
-            (
-                state.target,
-                ptr,
-                len,
-                state.base_offset + state.written as u64,
-                state.generation,
-            )
-        };
-        let ud = UserData::encode(OpTag::ForwardWrite, conn_index, generation);
-        let res = match target {
-            crate::backend::uring::driver::SinkTarget::Fd { fd, is_file: true } => unsafe {
-                self.driver
-                    .ring
-                    .submit_forward_write_file(fd, ptr, len, offset, ud)
-            },
-            crate::backend::uring::driver::SinkTarget::Fd { fd, is_file: false } => unsafe {
-                self.driver
-                    .ring
-                    .submit_forward_write_socket(fd, ptr, len, ud)
-            },
-            crate::backend::uring::driver::SinkTarget::Conn {
-                index,
-                generation: g,
-            } => {
-                // The sink's slot may have been recycled since the forward
-                // started; writing to a reused index would send this stream's
-                // bytes to someone else's connection.
-                if self.driver.connections.generation(index) != g {
-                    self.fail_forward_write(conn_index, libc::EPIPE);
-                    return;
+        // A connection sink's slot may have been recycled since the forward
+        // started; writing to a reused index would deliver this stream to
+        // whoever owns it now.
+        let stale = self.driver.forward_write[conn_index as usize]
+            .as_ref()
+            .is_some_and(|st| match st.target {
+                crate::backend::uring::driver::SinkTarget::Conn { index, generation } => {
+                    self.driver.connections.generation(index) != generation
                 }
-                unsafe {
-                    self.driver
-                        .ring
-                        .submit_forward_write_conn(index, ptr, len, ud)
-                }
-            }
-        };
-        if res.is_err() {
-            // SQ full on a mid-forward resubmit: surface an error so the caller
-            // recovers (a partial forward already reached the sink, so the stream
-            // is desynced and the connection should be torn down).
-            self.fail_forward_write(conn_index, libc::EAGAIN);
+                crate::backend::uring::driver::SinkTarget::Fd { .. } => false,
+            });
+        if stale {
+            self.fail_forward_write(conn_index, libc::EPIPE);
+            return;
+        }
+        if let Err(e) = self.driver.resubmit_forward_writev(conn_index) {
+            self.fail_forward_write(conn_index, e.raw_os_error().unwrap_or(libc::EIO));
         }
     }
 
@@ -2770,6 +2748,21 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// waits for the old multishot to fully terminate (its ECANCELED clears
     /// `recv_multishot_armed` at the top of `handle_recv_multi`) so two multishots
     /// with the same `RecvMulti` user_data never overlap.
+    /// Drive a Mode A forward, and wake its task only if it finished.
+    ///
+    /// Every caller of `Driver::advance_forward` wants the same follow-up:
+    /// record a terminal result and wake the waiting future, or do nothing
+    /// because the forward is still running. Keeping that in one place is what
+    /// makes "the task is woken once per forward" checkable rather than a
+    /// property spread across two handlers.
+    fn finish_forward_if_done(&mut self, conn_index: u32) {
+        if let Some(result) = self.driver.advance_forward(conn_index) {
+            self.driver.forward_done[conn_index as usize] =
+                Some(result.map_err(|e| e.raw_os_error().unwrap_or(libc::EIO)));
+            self.executor.wake_recv(conn_index);
+        }
+    }
+
     /// Re-arm a connection's multishot recv if it should be receiving and
     /// nothing is armed.
     ///
@@ -2907,8 +2900,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 .take()
                 .expect("checked live above");
             let total = state.total;
-            if let crate::backend::HeldRecvBuf::Pinned { bid, .. } = state.backing {
-                self.driver.pending_replenish.push(bid);
+            for backing in state.backings {
+                if let crate::backend::HeldRecvBuf::Pinned { bid, .. } = backing {
+                    self.driver.pending_replenish.push(bid);
+                }
             }
             if closing {
                 // The forward write was the last thing pinning this slot; its bid
@@ -2917,12 +2912,18 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 return;
             }
             metrics::BYTES.add(metrics::bytes::SENT, total as u64);
-            self.driver.forward_done[conn_index as usize] = Some(Ok(total));
-            self.executor.wake_recv(conn_index);
-            // A write completed, so the forward future will pop the next held
-            // buffer — draining the hold. If the recv was throttled by the hold
-            // cap and the hold is now below it (and the throttle-cancel's ECANCELED
-            // has been observed), re-arm the multishot so the source resumes.
+            if let Some(p) = self.driver.forward_progress[conn_index as usize].as_mut() {
+                p.forwarded = p.forwarded.saturating_add(total as u64);
+            }
+            // Submit the next held buffer from here rather than waking the task
+            // to do it. The task is woken only when the forward ends, which is
+            // what takes Mode A from one scheduler round-trip per provided
+            // buffer to one per forward.
+            self.finish_forward_if_done(conn_index);
+            // A write completed, so the hold is draining. If the recv was
+            // throttled by the hold cap and the hold is now below it (and the
+            // throttle-cancel's ECANCELED has been observed), re-arm the
+            // multishot so the source resumes.
             self.maybe_rearm_throttled_forward(conn_index);
             return;
         }
@@ -8335,7 +8336,8 @@ mod tests {
         let waker = noop_waker();
         let mut fut = std::pin::pin!(with_driver_state(&mut el, || conn.forward_to(&sinkfd, 10)));
 
-        // Poll: submit write of buffer 0 at offset 0.
+        // Poll: both held buffers go out as ONE gathered writev at offset 0.
+        // (Before gathering this submitted buffer 0 alone, `total == 5`.)
         let _ = with_driver_state(&mut el, || {
             let mut cx = std::task::Context::from_waker(&waker);
             fut.as_mut().poll(&mut cx)
@@ -8345,11 +8347,15 @@ mod tests {
                 .as_ref()
                 .unwrap();
             assert!(st.target.is_file());
-            assert_eq!(st.base_offset, 0, "first buffer writes at offset 0");
-            assert_eq!(st.total, 5);
+            assert_eq!(st.base_offset, 0, "the batch writes from offset 0");
+            assert_eq!(st.total, 10, "both held buffers in one write");
+            assert_eq!(st.backings.len(), 2, "gathered, not one buffer per write");
+            assert_eq!(st.iovecs.len(), 2, "one iovec per backing");
         }
 
-        // Short write: only 3 of 5 bytes → resubmit remainder, bid still held.
+        // Short write: 3 of 10 bytes. The remainder resubmits from *inside*
+        // buffer 0, so its bid is still held and the rebuilt iovec array starts
+        // mid-buffer.
         let ud = UserData::encode(OpTag::ForwardWrite, conn_index, generation);
         el.test_dispatch_cqe(ud.raw(), 3, 0);
         {
@@ -8357,42 +8363,39 @@ mod tests {
                 .as_ref()
                 .expect("still in flight after a short write");
             assert_eq!(st.written, 3, "short write advanced `written`");
-            assert_eq!(st.total, 5);
+            assert_eq!(st.total, 10);
+            assert_eq!(
+                st.iovecs.iter().map(|v| v.iov_len).sum::<usize>(),
+                7,
+                "the rebuilt iovecs cover exactly the bytes still owed"
+            );
         }
         assert!(
             !el.driver.pending_replenish.contains(&0),
             "bid 0 stays held across the short-write resubmit"
         );
 
-        // Remainder completes (2 bytes) → buffer 0 done, bid 0 replenished once.
-        el.test_dispatch_cqe(ud.raw(), 2, 0);
-        assert_eq!(
-            el.driver
-                .pending_replenish
-                .iter()
-                .filter(|&&b| b == 0)
-                .count(),
-            1,
-            "buffer 0 bid replenished exactly once on full completion"
+        // A further short write that finishes buffer 0 and part of buffer 1:
+        // no bid comes back yet, because the batch completes as a unit.
+        el.test_dispatch_cqe(ud.raw(), 4, 0);
+        assert!(
+            el.driver.pending_replenish.is_empty(),
+            "a batch releases its bids together, on full completion"
         );
-
-        // Re-poll: pops buffer 1, submits at the advanced file offset 5.
-        let _ = with_driver_state(&mut el, || {
-            let mut cx = std::task::Context::from_waker(&waker);
-            fut.as_mut().poll(&mut cx)
-        });
         {
             let st = el.driver.forward_write[conn_index as usize]
                 .as_ref()
-                .unwrap();
+                .expect("still in flight");
+            assert_eq!(st.written, 7);
             assert_eq!(
-                st.base_offset, 5,
-                "second buffer writes at the advanced offset"
+                st.iovecs.len(),
+                1,
+                "buffer 0 is fully written, so it drops out of the iovecs"
             );
-            assert_eq!(st.total, 5);
         }
-        // Complete buffer 1.
-        el.test_dispatch_cqe(ud.raw(), 5, 0);
+
+        // The last 3 bytes complete the batch.
+        el.test_dispatch_cqe(ud.raw(), 3, 0);
         let p = with_driver_state(&mut el, || {
             let mut cx = std::task::Context::from_waker(&waker);
             fut.as_mut().poll(&mut cx)
@@ -8663,19 +8666,30 @@ mod tests {
             let mut cx = std::task::Context::from_waker(&waker);
             fut.as_mut().poll(&mut cx)
         });
+        // The batch takes the whole hold — before gathering this popped one
+        // buffer and left one behind. What the test is about is unchanged: the
+        // hold falls below the cap, and the re-arm waits for the write.
         assert_eq!(
             el.driver.segment_hold[conn_index as usize].len(),
-            1,
-            "one buffer popped into the in-flight write"
+            0,
+            "the gathered write took both held buffers"
+        );
+        assert_eq!(
+            el.driver.forward_write[conn_index as usize]
+                .as_ref()
+                .map(|st| st.backings.len()),
+            Some(2),
+            "both buffers are in the one in-flight write"
         );
         assert!(
             el.driver.forward_hold_throttled[conn_index as usize],
             "not yet re-armed — waiting for the write to complete"
         );
 
-        // Write completes → handle_forward_write drains + re-arms (hold 1 < cap 2).
+        // Write completes → handle_forward_write drains + re-arms (hold 0 < cap 2).
+        // 10 bytes now, because the write covers both buffers.
         let fw_ud = UserData::encode(OpTag::ForwardWrite, conn_index, generation);
-        el.test_dispatch_cqe(fw_ud.raw(), 5, 0);
+        el.test_dispatch_cqe(fw_ud.raw(), 10, 0);
         assert!(
             !el.driver.forward_hold_throttled[conn_index as usize],
             "re-armed after the hold drained below the cap"
