@@ -6911,22 +6911,23 @@ fn forward_to_conn_proxies_both_directions() {
 
 /// Dropping a `forward_to_conn` future stops the relay.
 ///
-/// On mio the event loop relays on its own once the forward is installed, so a
-/// dropped future — a `select!` losing a race, a timeout — has to take the
-/// forward with it. Otherwise bytes keep reaching the sink with nobody waiting
-/// on the result, and the next forward on that connection starts behind.
+/// Both backends relay on their own once the forward is installed — mio from
+/// its event loop, io_uring from the write-completion handler — so a dropped
+/// future (a `select!` losing a race, a timeout) has to take the forward with
+/// it. Otherwise bytes keep reaching the sink with nobody waiting on the
+/// result, and the next forward on that connection starts behind.
 ///
-/// mio-only: on io_uring the writes are driven by polling the future, so
-/// dropping it stops them by itself.
-#[cfg(not(has_io_uring))]
+/// This was mio-only until gathering moved io_uring's submission out of
+/// `ForwardToFuture::poll` and into `handle_forward_write`. Before that, the
+/// io_uring writes really were driven by polling and a drop stopped them by
+/// itself; afterwards the driver owns the progress and keeps going. The test
+/// covers both backends so that asymmetry cannot come back silently.
 struct DroppedForwardProxy {
     backend_addr: SocketAddr,
 }
 
-#[cfg(not(has_io_uring))]
 static DROPPED_FORWARD_BACKEND: std::sync::OnceLock<SocketAddr> = std::sync::OnceLock::new();
 
-#[cfg(not(has_io_uring))]
 impl AsyncEventHandler for DroppedForwardProxy {
     fn on_accept(&self, client: ConnCtx) -> impl Future<Output = ()> + 'static {
         let backend_addr = self.backend_addr;
@@ -6968,7 +6969,6 @@ impl AsyncEventHandler for DroppedForwardProxy {
     }
 }
 
-#[cfg(not(has_io_uring))]
 #[test]
 fn dropping_a_forward_to_conn_future_cancels_the_relay() {
     let backend_port = free_port();

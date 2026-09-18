@@ -154,6 +154,10 @@ pub(crate) struct ForwardProgress {
     pub(crate) len: u64,
     /// Bytes whose write has completed.
     pub(crate) forwarded: u64,
+    /// Identifies *which* forward this is, so a `ForwardToFuture` dropped after
+    /// its own forward ended cannot cancel a later one that reused the slot.
+    /// Bumped per arm, per connection.
+    pub(crate) epoch: u32,
 }
 
 /// In-flight segmented-recv Mode A forward write (see
@@ -357,6 +361,8 @@ pub(crate) struct Driver {
     pub(crate) forward_done: Vec<Option<Result<u64, i32>>>,
     /// Per-connection Mode A forward state, indexed by source.
     pub(crate) forward_progress: Vec<Option<ForwardProgress>>,
+    /// Monotonic per-connection forward counter; see [`ForwardProgress::epoch`].
+    pub(crate) forward_epoch: Vec<u32>,
     /// Per-connection flag: `true` while a Mode A `forward_to` is driving this
     /// connection (set by `ConnCtx::forward_to`, cleared by `settle_forward_end`
     /// / `reset_segment_state` / `close_connection`). Gates the `forward_hold_cap`
@@ -770,6 +776,7 @@ impl Driver {
             forward_write: (0..config.max_connections).map(|_| None).collect(),
             forward_done: (0..config.max_connections).map(|_| None).collect(),
             forward_progress: (0..config.max_connections).map(|_| None).collect(),
+            forward_epoch: vec![0; config.max_connections as usize],
             forward_recv_active: vec![false; config.max_connections as usize],
             forward_hold_throttled: vec![false; config.max_connections as usize],
             forward_hold_cap: config.forward_hold_cap,

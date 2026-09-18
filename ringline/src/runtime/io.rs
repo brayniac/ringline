@@ -1092,16 +1092,23 @@ impl ConnCtx {
     /// bytes are the front of the forward; leaving them behind would strand
     /// them and shift the stream by however much arrived with the header.
     #[cfg(has_io_uring)]
-    fn arm_forward_source(&self, target: crate::backend::uring::driver::SinkTarget, len: u64) {
+    fn arm_forward_source(
+        &self,
+        target: crate::backend::uring::driver::SinkTarget,
+        len: u64,
+    ) -> u32 {
         with_state(|driver, _executor| {
             let idx = self.conn_index as usize;
             // The driver owns the forward from here: it submits each write from
             // the completion handler, so the task is woken once at the end
             // rather than once per provided buffer.
+            let epoch = driver.forward_epoch[idx].wrapping_add(1);
+            driver.forward_epoch[idx] = epoch;
             driver.forward_progress[idx] = Some(crate::backend::uring::driver::ForwardProgress {
                 target,
                 len,
                 forwarded: 0,
+                epoch,
             });
             // A result left by the slot's previous occupant is not this
             // forward's.
@@ -1130,7 +1137,8 @@ impl ConnCtx {
                 ));
                 driver.pending_replenish.push(pending.bid);
             }
-        });
+            epoch
+        })
     }
 
     /// Forward the next `len` received bytes straight to `sink` (Mode A —
@@ -1228,10 +1236,11 @@ impl ConnCtx {
             fd: sink.fd,
             is_file: sink.is_file,
         };
-        self.arm_forward_source(target, len as u64);
+        let epoch = self.arm_forward_source(target, len as u64);
         ForwardToFuture {
             conn_index: self.conn_index,
             generation: self.generation,
+            epoch,
             _borrow: PhantomData,
         }
     }
@@ -1512,10 +1521,11 @@ impl ConnCtx {
             index: sink.conn_index,
             generation: sink.generation,
         };
-        self.arm_forward_source(target, len as u64);
+        let epoch = self.arm_forward_source(target, len as u64);
         ForwardToFuture {
             conn_index: self.conn_index,
             generation: self.generation,
+            epoch,
             _borrow: PhantomData,
         }
     }
@@ -3385,9 +3395,60 @@ impl Drop for ForwardToConnFuture<'_> {
 pub struct ForwardToFuture<'a> {
     conn_index: u32,
     generation: u32,
+    /// Which forward on this connection this future owns; see
+    /// [`ForwardProgress::epoch`]. Drop cancels only its own.
+    epoch: u32,
     /// Ties the future to whatever the caller borrowed — a `SinkFd`, or the
     /// sink `ConnCtx` — so the sink cannot be dropped mid-forward.
     _borrow: PhantomData<&'a ()>,
+}
+
+#[cfg(has_io_uring)]
+impl Drop for ForwardToFuture<'_> {
+    /// Cancel a forward that is dropped before it resolves.
+    ///
+    /// Gathering moved submission out of `poll` and into
+    /// `handle_forward_write`, so the driver now advances a forward on its own
+    /// once armed. Before that, dropping this future stopped the relay for
+    /// free: nothing popped the hold unless someone polled. Now a `select!`
+    /// that loses, or a `timeout` that fires, would otherwise leave bytes
+    /// streaming to a sink with nobody waiting on the result — and leave the
+    /// connection in the segmented recv domain, so the caller's next
+    /// `with_data` would park while its bytes went to the sink.
+    ///
+    /// The in-flight write is deliberately *not* touched: its backing buffers
+    /// are being read by the kernel, and returning those bids to the provided
+    /// ring here would let an arriving packet overwrite a `sendmsg` in
+    /// progress. Its CQE releases them exactly once, and with the progress
+    /// cleared `advance_forward` submits no successor — so what is already
+    /// queued completes, and no further bytes are taken from the source. That
+    /// is the same contract the mio sibling documents.
+    ///
+    /// Held-but-not-yet-written bytes go to the accumulator rather than being
+    /// dropped, via the same `settle_forward_end` the normal end of a forward
+    /// uses — so a cancel loses no data the peer already sent.
+    fn drop(&mut self) {
+        let _ = try_with_state(|driver, _executor| {
+            let idx = self.conn_index as usize;
+            if driver.connections.generation(self.conn_index) != self.generation {
+                return;
+            }
+            // Only cancel *this* forward. A future dropped after its own
+            // forward resolved must not settle a later one that armed on the
+            // same connection in between.
+            let mine = driver.forward_progress[idx].is_some_and(|p| p.epoch == self.epoch);
+            if !mine {
+                return;
+            }
+            driver.forward_progress[idx] = None;
+            driver.forward_done[idx] = None;
+            if !driver.settle_forward_end(self.conn_index) {
+                // Accumulator overflow settling the tail: the bytes have
+                // nowhere to go, so the connection cannot continue.
+                driver.close_connection(self.conn_index);
+            }
+        });
+    }
 }
 
 #[cfg(has_io_uring)]
