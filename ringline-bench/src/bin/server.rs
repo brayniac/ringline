@@ -11,7 +11,7 @@ use clap::Parser;
 
 /// Everything the proxy mode needs, bundled because the argument list had
 /// outgrown what clippy will accept and most of it travels together anyway.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct ProxyCfg {
     addr: SocketAddr,
     workers: usize,
@@ -22,6 +22,23 @@ struct ProxyCfg {
     conn_chunk_size: usize,
     pin_to_core: bool,
     api: ProxyApi,
+    metrics_out: Option<std::path::PathBuf>,
+}
+
+/// Everything the echo arm needs. A struct for the same reason `ProxyCfg` is
+/// one: the argument list had outgrown what clippy accepts, and these travel
+/// together anyway.
+#[derive(Clone)]
+struct EchoCfg {
+    addr: SocketAddr,
+    workers: usize,
+    msg_size: usize,
+    metrics_out: Option<std::path::PathBuf>,
+    recv_buffer_bytes: u32,
+    recv_ring_size: u16,
+    echo_mode: EchoMode,
+    conn_chunk_size: usize,
+    pin_to_core: bool,
 }
 
 /// Which forwarding entry point the proxy arm drives.
@@ -142,6 +159,17 @@ struct Args {
     #[arg(long)]
     print_backend: bool,
 
+    /// (ringline) Write ringline's runtime counters to this path as JSON when
+    /// the server shuts down, and print the interesting ones to stderr.
+    ///
+    /// `buffer_ring_empty`, `recv_parked`, `recv_fallback`,
+    /// `forward_throttled` and friends are what separate "this arm was slower"
+    /// from "this arm starved its provided ring", which a throughput number
+    /// alone cannot say. A sweep over buffer geometry is guesswork without
+    /// them.
+    #[arg(long)]
+    metrics_out: Option<std::path::PathBuf>,
+
     /// (ringline, `--proxy-backend` only) Which forwarding API the proxy uses.
     /// `conn` (`forward_to_conn`) runs on both backends and is what an
     /// io_uring-vs-mio comparison must use; `sink-fd` (`forward_to` over a
@@ -223,6 +251,23 @@ fn apply_cpu_affinity(_cpus: &[usize]) {
     eprintln!("bench-server: --cpu-list ignored (CPU affinity unsupported on this platform)");
 }
 
+/// Print ringline's runtime counters, and write them to `path` if one was
+/// given. Called after the shutdown signal so the numbers cover the whole run.
+fn dump_runtime_metrics(path: Option<&std::path::Path>) {
+    ringline_bench::runtime_metrics::print_summary();
+    if let Some(path) = path {
+        match ringline_bench::runtime_metrics::dump_to(path) {
+            Ok(()) => eprintln!("bench-server: wrote runtime metrics to {}", path.display()),
+            // Loud: an arm whose counters did not land cannot be explained
+            // later, and a silently missing file looks like a healthy run.
+            Err(e) => eprintln!(
+                "bench-server: FAILED to write runtime metrics to {}: {e}",
+                path.display()
+            ),
+        }
+    }
+}
+
 /// The backend this binary was compiled against, as a word.
 const RINGLINE_BACKEND: &str = if cfg!(has_io_uring) {
     "io_uring"
@@ -283,19 +328,23 @@ fn main() {
             conn_chunk_size: args.conn_chunk_size,
             pin_to_core,
             api: args.proxy_api,
+            metrics_out: args.metrics_out.clone(),
         }),
-        Runtime::Ringline => run_ringline(
-            args.addr,
+        Runtime::Ringline => run_ringline(EchoCfg {
+            addr: args.addr,
             workers,
-            args.msg_size,
-            if args.recv_forward {
+            msg_size: args.msg_size,
+            metrics_out: args.metrics_out.clone(),
+            recv_buffer_bytes: args.recv_buffer_bytes,
+            recv_ring_size: args.recv_ring_size,
+            echo_mode: if args.recv_forward {
                 EchoMode::RecvForward
             } else {
                 args.echo_mode
             },
-            args.conn_chunk_size,
+            conn_chunk_size: args.conn_chunk_size,
             pin_to_core,
-        ),
+        }),
         Runtime::Tokio => {
             use ringline_bench::servers::tokio_arms;
             tokio_arms::run(
@@ -350,6 +399,7 @@ fn run_ringline_proxy(cfg: ProxyCfg) {
         conn_chunk_size,
         pin_to_core,
         api,
+        metrics_out,
     } = cfg;
     use ringline::{AsyncEventHandler, ConnCtx, RinglineBuilder};
 
@@ -457,20 +507,25 @@ fn run_ringline_proxy(cfg: ProxyCfg) {
         (recv_ring_size as u64 * recv_buf as u64) / (1024 * 1024)
     );
     shutdown.wait_on_signal();
+    dump_runtime_metrics(metrics_out.as_deref());
     for h in handles {
         h.join().ok();
     }
 }
 
 #[allow(clippy::manual_async_fn)]
-fn run_ringline(
-    addr: SocketAddr,
-    workers: usize,
-    msg_size: usize,
-    echo_mode: EchoMode,
-    conn_chunk_size: usize,
-    pin_to_core: bool,
-) {
+fn run_ringline(cfg: EchoCfg) {
+    let EchoCfg {
+        addr,
+        workers,
+        msg_size,
+        metrics_out,
+        recv_buffer_bytes,
+        recv_ring_size,
+        echo_mode,
+        conn_chunk_size,
+        pin_to_core,
+    } = cfg;
     use ringline::ParseResult;
     use ringline::{AsyncEventHandler, ConnCtx, RinglineBuilder};
 
@@ -551,13 +606,22 @@ fn run_ringline(
         }
     }
 
+    let recv_buf = if recv_buffer_bytes > 0 {
+        recv_buffer_bytes
+    } else {
+        msg_size.next_power_of_two().max(4096) as u32
+    };
     let config = ConfigBuilder::new()
         .workers(workers)
         // When --cpu-list set a process affinity mask, leave the OS to schedule
         // workers within it; otherwise pin each worker to its own core (0..N).
         .pin_to_core(pin_to_core)
         .sq_entries(256)
-        .recv_buffer(256, msg_size.next_power_of_two().max(4096) as u32)
+        // Honour the geometry flags, exactly as the proxy arm does. These
+        // used to be proxy-only and silently ignored here, so a
+        // buffer-geometry sweep over the echo path would have run every arm at
+        // the same derived size and could only ever have reported "no effect".
+        .recv_buffer(recv_ring_size, recv_buf)
         .max_connections(16384)
         .send_pool(512, msg_size.next_power_of_two().max(4096) as u32)
         .conn_chunk_size(conn_chunk_size)
@@ -586,7 +650,8 @@ fn run_ringline(
         "forward (no io_uring)"
     };
     eprintln!(
-        "bench-server: ready (backend={RINGLINE_BACKEND}, echo_mode={mode}, effective={effective})"
+        "bench-server: ready (backend={RINGLINE_BACKEND}, echo_mode={mode}, effective={effective}, recv_buffer={recv_ring_size}x{recv_buf} = {} MiB/worker)",
+        (recv_ring_size as u64 * recv_buf as u64) / (1024 * 1024)
     );
 
     // Block until SIGINT/SIGTERM, then trigger graceful shutdown so each
@@ -594,6 +659,7 @@ fn run_ringline(
     // `[ringline diag]`/`[ringline stall]` counter dump. (A SIGKILL at
     // teardown skips that, hiding the server-side loop diagnostics.)
     shutdown.wait_on_signal();
+    dump_runtime_metrics(metrics_out.as_deref());
 
     for h in handles {
         h.join().ok();
