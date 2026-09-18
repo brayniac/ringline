@@ -159,6 +159,50 @@ buffers a shallow ring does not have), so small-buffer/deep-ring should still
 win there — which argues *for* the default, not against it. #416's forward arms
 should be re-run on a gathered build before the sweep's conclusion is rewritten.
 
+## What the speedup cost, and did not announce
+
+Gathering is only reachable because the driver submits each write from
+`handle_forward_write` rather than from `ForwardToFuture::poll`. That is the
+state the failed direct-forward attempt left behind, kept precisely so a batch
+could be assembled outside a future polled once per buffer.
+
+It also, silently, voided a guarantee. **Before this work, dropping a forward
+future stopped the relay for free** — nothing popped the hold unless someone
+polled, so a `select!` that lost or a `timeout` that fired ended the forward by
+construction. After it, the driver keeps going: bytes stream to a sink nobody
+awaits, the connection stays in the segmented recv domain, and the caller's
+next `with_data` parks while its data goes to the sink.
+
+Nothing caught it. The proxy regression test passed 100/100, the file-sink
+tests 100/100, and the full suite 1,122 tests × 5 — because the only test that
+covers a dropped forward is `#[cfg(not(has_io_uring))]`. It was gated off on a
+premise that this change is what falsified:
+
+> mio-only: on io_uring the writes are driven by polling the future, so
+> dropping it stops them by itself.
+
+The mio `Drop` impl carried the same claim in its doc comment. Both read as
+descriptions of the design; both had become false, and a comment does not fail
+a test run. Ungated, the test failed **20/20** on io_uring.
+
+Two things generalise from this:
+
+- **Moving work from a future into a completion handler moves its cancellation
+  semantics too.** The performance argument for doing so says nothing about
+  who stops the work, and the answer changes from "the caller, by dropping" to
+  "nobody" unless something is written.
+- **A cfg-gate on a test is an assertion about behaviour**, and it is the one
+  kind of assertion that gets quieter as it gets wronger. The gate's stated
+  reason should be re-read whenever the mechanism it names is what changed.
+
+The fix mirrors what mio already did, with one addition the index-keyed driver
+state forced: `ForwardProgress` carries an epoch, so a future dropped *after*
+its own forward resolved cannot cancel a later one that armed on the same
+connection. The in-flight write is left alone — its bids are under a `sendmsg`
+the kernel is still reading, and returning them to the provided ring would let
+an arriving packet overwrite it — so what is queued completes and no further
+bytes are taken from the source, which is the contract mio documents.
+
 ## Where the cost actually is
 
 Eliminating the wake leaves exactly one difference between Mode A and
