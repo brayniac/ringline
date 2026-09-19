@@ -21,6 +21,7 @@ struct ProxyCfg {
     recv_ring_size: u16,
     conn_chunk_size: usize,
     pin_to_core: bool,
+    prefault_buffers: bool,
     api: ProxyApi,
     metrics_out: Option<std::path::PathBuf>,
 }
@@ -39,6 +40,7 @@ struct EchoCfg {
     echo_mode: EchoMode,
     conn_chunk_size: usize,
     pin_to_core: bool,
+    prefault_buffers: bool,
 }
 
 /// Which forwarding entry point the proxy arm drives.
@@ -197,6 +199,12 @@ struct Args {
     #[arg(long, default_value_t = 1)]
     conn_chunk_size: usize,
 
+    /// (ringline) Touch every provided-recv-buffer and send-pool page at
+    /// startup so the minor faults are paid before traffic instead of on the
+    /// completion path. The knob under measurement in #419.
+    #[arg(long, default_value_t = false)]
+    prefault_buffers: bool,
+
     /// Restrict the whole process to these logical CPUs, e.g. `0-7,16-23` or
     /// `12,13,14,15` (the "taskset the task" model). When set, the process
     /// affinity mask is applied before launch and ringline's per-worker core
@@ -327,6 +335,7 @@ fn main() {
             recv_ring_size: args.recv_ring_size,
             conn_chunk_size: args.conn_chunk_size,
             pin_to_core,
+            prefault_buffers: args.prefault_buffers,
             api: args.proxy_api,
             metrics_out: args.metrics_out.clone(),
         }),
@@ -337,6 +346,7 @@ fn main() {
             metrics_out: args.metrics_out.clone(),
             recv_buffer_bytes: args.recv_buffer_bytes,
             recv_ring_size: args.recv_ring_size,
+            prefault_buffers: args.prefault_buffers,
             echo_mode: if args.recv_forward {
                 EchoMode::RecvForward
             } else {
@@ -398,6 +408,7 @@ fn run_ringline_proxy(cfg: ProxyCfg) {
         recv_ring_size,
         conn_chunk_size,
         pin_to_core,
+        prefault_buffers,
         api,
         metrics_out,
     } = cfg;
@@ -480,6 +491,7 @@ fn run_ringline_proxy(cfg: ProxyCfg) {
         .pin_to_core(pin_to_core)
         .sq_entries(256)
         .recv_buffer(recv_ring_size, recv_buf)
+        .prefault_buffers(prefault_buffers)
         .max_connections(16384)
         .send_pool(512, msg_size.next_power_of_two().max(4096) as u32)
         .conn_chunk_size(conn_chunk_size)
@@ -525,6 +537,7 @@ fn run_ringline(cfg: EchoCfg) {
         echo_mode,
         conn_chunk_size,
         pin_to_core,
+        prefault_buffers,
     } = cfg;
     use ringline::ParseResult;
     use ringline::{AsyncEventHandler, ConnCtx, RinglineBuilder};
@@ -622,6 +635,7 @@ fn run_ringline(cfg: EchoCfg) {
         // buffer-geometry sweep over the echo path would have run every arm at
         // the same derived size and could only ever have reported "no effect".
         .recv_buffer(recv_ring_size, recv_buf)
+        .prefault_buffers(prefault_buffers)
         .max_connections(16384)
         .send_pool(512, msg_size.next_power_of_two().max(4096) as u32)
         .conn_chunk_size(conn_chunk_size)
