@@ -98,6 +98,13 @@ impl SendCopyPool {
         }
     }
 
+    /// Fault every slot in before traffic arrives. See
+    /// [`crate::buffer::prefault`] for why, and why it must run on the worker
+    /// thread that owns the pool.
+    pub(crate) fn prefault(&mut self) {
+        crate::buffer::prefault::prefault(&mut self.backing);
+    }
+
     /// Pop an unreserved slot from the free list, or `None` (with the
     /// `SEND_EXHAUSTED` metric) when every free slot is either gone or
     /// promised to an outstanding reservation.
@@ -870,5 +877,56 @@ mod tests {
         let (again, _p, _l) = pool.copy_in(b"next").unwrap();
         assert_eq!(again, idx);
         assert_eq!(pool.take_bounded_send(again), None);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod prefault_tests {
+    use super::*;
+
+    /// The pool's `prefault` must make *its own* backing resident.
+    ///
+    /// Asserts residency of the pool's pages via `mincore`, not process RSS:
+    /// `/proc/self/statm` is process-wide and the suite runs in parallel, so an
+    /// unrelated thread freeing memory between samples makes the delta
+    /// meaningless — and, when it goes negative, panics. (It did, on CI.)
+    /// `mincore` answers the question this test is actually asking.
+    #[test]
+    fn prefault_makes_the_pools_own_pages_resident() {
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as usize;
+        let slots = 512u16;
+        let slot = 64 * 1024u32;
+        let mut pool = SendCopyPool::new(slots, slot);
+
+        // Page-aligned window inside the pool's backing.
+        let base = pool.backing.as_ptr() as usize;
+        let aligned = base.div_ceil(page) * page;
+        let pages = (pool.backing.len() - (aligned - base)) / page;
+        let ptr = aligned as *mut libc::c_void;
+        let len = pages * page;
+
+        let resident = |ptr: *mut libc::c_void, len: usize| -> usize {
+            let mut vec = vec![0u8; len / page];
+            // SAFETY: `ptr` is page-aligned and `len` bytes from it lie inside
+            // the pool's live backing; `vec` has one byte per page.
+            let rc = unsafe { libc::mincore(ptr, len, vec.as_mut_ptr()) };
+            assert_eq!(rc, 0, "mincore: {}", std::io::Error::last_os_error());
+            vec.iter().filter(|b| *b & 1 == 1).count()
+        };
+
+        let before = resident(ptr, len);
+        assert!(
+            before < pages / 2,
+            "the pool should start mostly cold, found {before}/{pages} resident — \
+             the test cannot show prefaulting does anything otherwise"
+        );
+
+        pool.prefault();
+
+        assert_eq!(
+            resident(ptr, len),
+            pages,
+            "every page of the pool's backing must be resident after prefault"
+        );
     }
 }
