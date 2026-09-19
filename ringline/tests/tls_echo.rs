@@ -9,7 +9,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ringline::{
     AsyncEventHandler, ConfigBuilder, ConnCtx, ParseResult, RinglineBuilder, TlsConfig, TlsInfo,
@@ -19,6 +19,45 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, Serve
 // ── Helpers ─────────────────────────────────────────────────────────────
 
 static TEST_SERIALIZE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Read until `buf` is full, **failing at a deadline** rather than retrying
+/// forever.
+///
+/// `TcpStream::set_read_timeout` surfaces a timed-out read as
+/// `ErrorKind::WouldBlock`, which is indistinguishable from "no data yet". So
+/// a `WouldBlock` arm that retries unconditionally makes the read timeout
+/// **inert**: any stall becomes an unbounded hang instead of a failure. That
+/// is why a stalled TLS echo presented in CI as a 1200-second job timeout with
+/// no failing test name, and why `tls_segmented_recv_reassembles_and_eofs`
+/// could hang ~40% of runs under `--test-threads=1` without anyone getting a
+/// diagnosable signal out of it.
+///
+/// Returns the byte count so callers keep asserting on short reads; panics
+/// with how far it got, which is the number that localises the stall.
+fn read_until_full_or_deadline(
+    stream: &mut impl Read,
+    buf: &mut [u8],
+    budget: Duration,
+    what: &str,
+) -> usize {
+    let deadline = Instant::now() + budget;
+    let want = buf.len();
+    let mut total = 0;
+    while total < want {
+        if Instant::now() >= deadline {
+            panic!("{what}: stalled with {total} of {want} bytes after {budget:?}");
+        }
+        match stream.read(&mut buf[total..]) {
+            Ok(0) => break,
+            Ok(n) => total += n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(e) => panic!("{what}: read error with {total} of {want} bytes: {e}"),
+        }
+    }
+    total
+}
 
 fn test_config_builder() -> ConfigBuilder {
     ConfigBuilder::new()
@@ -765,18 +804,12 @@ fn tls_segmented_recv_reassembles_and_eofs() {
         stream.flush().unwrap();
 
         let mut buf = vec![0u8; SIZE];
-        let mut total = 0;
-        while total < SIZE {
-            match stream.read(&mut buf[total..]) {
-                Ok(0) => break,
-                Ok(n) => total += n,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(5));
-                    continue;
-                }
-                Err(e) => panic!("TLS read error: {e}"),
-            }
-        }
+        let total = read_until_full_or_deadline(
+            &mut stream,
+            &mut buf,
+            Duration::from_secs(30),
+            "segmented TLS echo",
+        );
         assert_eq!(total, SIZE, "short read reassembling segmented echo");
         assert_eq!(buf, msg, "segmented TLS echo byte-exact mismatch");
     }
@@ -1372,17 +1405,17 @@ fn a_tls_connection_is_refused_as_a_forward_sink() {
     stream.flush().unwrap();
 
     let mut got = [0u8; 4];
-    let mut total = 0;
-    while total < got.len() {
-        match stream.read(&mut got[total..]) {
-            Ok(0) => panic!("proxy closed before reporting the refusal"),
-            Ok(n) => total += n,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            Err(e) => panic!("TLS read error: {e}"),
-        }
-    }
+    let total = read_until_full_or_deadline(
+        &mut stream,
+        &mut got,
+        Duration::from_secs(30),
+        "forward-sink refusal report",
+    );
+    assert_eq!(
+        total,
+        got.len(),
+        "proxy closed before reporting the refusal"
+    );
     assert_eq!(
         i32::from_be_bytes(got),
         libc::EPROTOTYPE,
