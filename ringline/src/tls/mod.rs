@@ -1238,3 +1238,12 @@ mod tests {
         assert_eq!(cap.slots_unbuffered(2043 + 28), None);
     }
 }
+
+/// INVESTIGATION (#423): counts ciphertext abandoned by the `read_tls` ->
+/// `Ok(0) => break` path in the buffered feed loop. Non-zero means received
+/// bytes were dropped before reaching rustls, which desynchronises the
+/// connection permanently.
+pub static TLS_ABANDONED_EVENTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Total bytes abandoned by that path. See [`TLS_ABANDONED_EVENTS`].
+pub static TLS_ABANDONED_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

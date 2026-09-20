@@ -99,11 +99,14 @@ fn read_until_full_or_stalled(
                         "{what}: no progress for {stall_budget:?} at {total}/{want} bytes\n\
                          worker loop ticks: {t0} -> {t1} (delta {})\n\
                          handler: segments={} bytes={} send_errors={}\n\
+                         tls ciphertext abandoned: {} events, {} bytes\n\
                          runtime counters at the stall:\n{}",
                         t1 - t0,
                         TLS_SEG_SEGMENTS.load(std::sync::atomic::Ordering::Relaxed),
                         TLS_SEG_BYTES.load(std::sync::atomic::Ordering::Relaxed),
                         TLS_SEG_SEND_ERRS.load(std::sync::atomic::Ordering::Relaxed),
+                        ringline::TLS_ABANDONED_EVENTS.load(std::sync::atomic::Ordering::Relaxed),
+                        ringline::TLS_ABANDONED_BYTES.load(std::sync::atomic::Ordering::Relaxed),
                         stall_counters()
                     );
                 }

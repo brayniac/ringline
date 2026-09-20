@@ -192,7 +192,14 @@ pub(super) fn feed_tls_recv_buffered(
     let mut cursor = io::Cursor::new(ciphertext);
     while cursor.position() < ciphertext.len() as u64 {
         match buffered_mut(tls_conn).read_tls(&mut cursor) {
-            Ok(0) => break,
+            Ok(0) => {
+                // INVESTIGATION (#423): does this break abandon ciphertext?
+                let abandoned = ciphertext.len() as u64 - cursor.position();
+                crate::tls::TLS_ABANDONED_EVENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::tls::TLS_ABANDONED_BYTES
+                    .fetch_add(abandoned, std::sync::atomic::Ordering::Relaxed);
+                break;
+            }
             Ok(_) => {}
             Err(e) => {
                 return TlsRecvResult::Error(rustls::Error::General(e.to_string()));

@@ -161,6 +161,10 @@ pub(crate) mod disk_io_pool;
 #[cfg_attr(not(has_io_uring), allow(dead_code))]
 pub mod fs;
 pub mod metrics;
+
+// INVESTIGATION (#423): temporary re-export so an integration test can read the
+// abandoned-ciphertext counters. Not for merge.
+pub use crate::tls::{TLS_ABANDONED_BYTES, TLS_ABANDONED_EVENTS};
 #[cfg_attr(not(has_io_uring), allow(dead_code))]
 pub mod nvme;
 pub mod process;
