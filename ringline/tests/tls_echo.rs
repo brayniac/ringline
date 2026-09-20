@@ -850,6 +850,11 @@ fn tls_segmented_recv_reassembles_and_eofs() {
 
     wait_for_server(&addr);
 
+    // Scope the transition trace to this exchange; the ring is process-global
+    // and would otherwise show an earlier test's history.
+    ringline::TRACE_423.lock().unwrap().clear();
+    *ringline::TRACE_423_EPOCH.lock().unwrap() = Some(Instant::now());
+
     let client_config = client_tls_config(&certs);
     let server_name: ServerName<'_> = "localhost".try_into().unwrap();
     let mut tls_conn = rustls::ClientConnection::new(client_config, server_name).unwrap();

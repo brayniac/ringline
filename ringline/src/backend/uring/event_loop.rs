@@ -794,11 +794,16 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// INVESTIGATION (#423): record a multishot arm/terminate transition.
     /// In-memory, because stderr tracing perturbs this race away.
     fn trace_423(&mut self, what: &'static str, conn: u32, detail: i64) {
+        let ms = crate::TRACE_423_EPOCH
+            .lock()
+            .unwrap()
+            .map(|e| e.elapsed().as_millis() as u64)
+            .unwrap_or(0);
         let mut t = crate::TRACE_423.lock().unwrap();
         if t.len() >= 512 {
             t.remove(0);
         }
-        t.push((what, conn, detail));
+        t.push((what, conn, detail, ms));
     }
 
     fn debug_dump_423(&mut self) {
@@ -814,7 +819,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 .iter()
                 .rev()
                 .take(24)
-                .map(|(w, c, d)| format!("{w}(c{c},{d})"))
+                .map(|(w, c, d, ms)| format!("{ms}ms:{w}(c{c},{d})"))
                 .collect();
             eprintln!("[423] last transitions (newest first): {}", tail.join(" "));
         }
@@ -972,6 +977,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     self.driver.close_connection(conn_index);
                 } else if let Some(cs) = self.driver.connections.get_mut(conn_index) {
                     cs.recv_multishot_armed = true;
+                    self.trace_423("arm:flush", conn_index, 0);
                 }
                 continue;
             }
@@ -2874,6 +2880,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.driver.close_connection(conn_index);
         } else if let Some(cs) = self.driver.connections.get_mut(conn_index) {
             cs.recv_multishot_armed = true;
+            self.trace_423("arm:idle", conn_index, 0);
         }
     }
 
@@ -2927,6 +2934,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.driver.close_connection(conn_index);
         } else if let Some(cs) = self.driver.connections.get_mut(conn_index) {
             cs.recv_multishot_armed = true;
+            self.trace_423("arm:unthrottle", conn_index, 0);
         }
     }
 
@@ -4180,6 +4188,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.driver.close_connection(conn_index);
         } else if let Some(cs) = self.driver.connections.get_mut(conn_index) {
             cs.recv_multishot_armed = true;
+            self.trace_423("arm:arm_recv", conn_index, 0);
         }
     }
 
