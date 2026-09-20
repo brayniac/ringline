@@ -1835,7 +1835,7 @@ impl Client {
         // monotonic position across header + body + trailing `\r\nEND\r\n`.
         let mut acc: Option<Vec<u8>> = None;
         loop {
-            let seg = match self.conn.recv_owned_segment().await {
+            let seg = match self.conn.recv_owned_segment()?.await {
                 Ok(Some(b)) => b,
                 Ok(None) => {
                     // Peer closed before any header arrived.
@@ -2039,7 +2039,7 @@ impl<'a> StreamValue<'a> {
     /// error (never a truncated value), per the bounded-`len` contract.
     async fn refill(&mut self) -> Result<(), Error> {
         loop {
-            match self.client.conn.recv_owned_segment().await {
+            match self.client.conn.recv_owned_segment()?.await {
                 Ok(Some(b)) if !b.is_empty() => {
                     self.buf = b;
                     return Ok(());
@@ -2192,7 +2192,7 @@ impl Client {
         // Demarcation is exact — see `get_stream`.
         let mut acc: Option<Vec<u8>> = None;
         loop {
-            let seg = match self.conn.recv_owned_segment().await {
+            let seg = match self.conn.recv_owned_segment()?.await {
                 Ok(Some(b)) => b,
                 Ok(None) => {
                     let _ = self.conn.end_segments();

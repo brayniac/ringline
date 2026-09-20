@@ -725,7 +725,10 @@ impl AsyncEventHandler for TlsSegmentedHandler {
             // Opt this TLS connection into segmented delivery: decrypted
             // plaintext arrives as owned segments in the hold, not the
             // accumulator.
-            let mut reader = conn.segments();
+            let mut reader = match conn.segments() {
+                Ok(r) => r,
+                Err(_) => return,
+            };
             loop {
                 match reader.next().await {
                     Ok(Some(seg)) => {
@@ -1447,7 +1450,10 @@ impl AsyncEventHandler for TlsLateSegmentReader {
             // decrypted into the accumulator *before* the reader exists.
             ringline::sleep(Duration::from_millis(300)).await;
 
-            let mut reader = conn.segments();
+            let mut reader = match conn.segments() {
+                Ok(r) => r,
+                Err(_) => return,
+            };
             loop {
                 match reader.next().await {
                     Ok(Some(seg)) => {

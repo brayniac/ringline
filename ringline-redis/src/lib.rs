@@ -3095,7 +3095,7 @@ impl Client {
         // read cursor is a single monotonic position across header + body.
         let mut acc: Option<Vec<u8>> = None;
         loop {
-            let seg = match self.conn.recv_owned_segment().await {
+            let seg = match self.conn.recv_owned_segment()?.await {
                 Ok(Some(b)) => b,
                 Ok(None) => {
                     // Peer closed before any header arrived.
@@ -3271,7 +3271,7 @@ impl<'a> ValueStream<'a> {
     /// error (never a truncated value), per the design's bounded-`len` contract.
     async fn refill(&mut self) -> Result<(), Error> {
         loop {
-            match self.client.conn.recv_owned_segment().await {
+            match self.client.conn.recv_owned_segment()?.await {
                 Ok(Some(b)) if !b.is_empty() => {
                     self.buf = b;
                     return Ok(());

@@ -944,7 +944,7 @@ impl ConnCtx {
     /// not. Ordering matches it: accumulator bytes are the oldest and go to the
     /// front, the pinned buffer is the newest and goes to the back.
     #[cfg(has_io_uring)]
-    fn enter_segmented_domain(&self) {
+    fn enter_segmented_domain(&self, exclusive: bool) -> io::Result<()> {
         with_state(|driver, _executor| {
             let idx = self.conn_index as usize;
             // A stale handle must not touch the slot's new occupant. Without
@@ -953,7 +953,7 @@ impl ConnCtx {
             // on an innocent third party. `arm_forward_source` refuses the same
             // way (EPIPE); the caller's own poll then resolves to EOF.
             if driver.connections.generation(self.conn_index) != self.generation {
-                return;
+                return Err(io::Error::from_raw_os_error(libc::EPIPE));
             }
             // A running Mode A forward owns this connection's hold, and its
             // `advance_forward` gathers whatever is in front. Adopting the
@@ -962,7 +962,16 @@ impl ConnCtx {
             // forwarding connection strictly alone — exactly as
             // `arm_forward_source` refuses a second forward with EBUSY.
             if driver.forward_progress[idx].is_some() {
-                return;
+                return Err(io::Error::from_raw_os_error(libc::EBUSY));
+            }
+            // A live `SegmentReader` owns the delivery discipline until it
+            // drops (its `Drop` settles the hold back into the accumulator), so
+            // a second reader or an owned-segment read alongside it conflicts.
+            if driver.segment_reader_live[idx] {
+                return Err(io::Error::from_raw_os_error(libc::EBUSY));
+            }
+            if exclusive {
+                driver.segment_reader_live[idx] = true;
             }
             driver.recv_domain[idx] = crate::recv::domain::RecvDomain::Segmented;
             if !driver.accumulators.is_empty(self.conn_index) {
@@ -980,7 +989,8 @@ impl ConnCtx {
                 ));
                 driver.pending_replenish.push(pending.bid);
             }
-        });
+            Ok(())
+        })
     }
 
     /// Borrow a segmented-recv reader (Mode B "Borrow", the sound lending-iterator
@@ -997,16 +1007,26 @@ impl ConnCtx {
     /// domain but does not retroactively segment bytes already gathered into the
     /// accumulator under the default `with_data`/`with_bytes` path.
     ///
+    /// # Errors
+    ///
+    /// Refused before any reader exists, so a conflict is reported where it is
+    /// caused rather than one poll later:
+    ///
+    /// - `EBUSY` — a [`SegmentReader`] is already live on this connection, or a
+    ///   Mode A forward is running (the forward owns the hold).
+    /// - `EPIPE` — this handle is stale: the slot was closed and recycled for a
+    ///   different connection.
+    ///
     /// io_uring only — segmented delivery is backed by the provided-buffer ring.
     #[cfg(has_io_uring)]
-    pub fn segments(&self) -> SegmentReader<'_> {
-        self.enter_segmented_domain();
-        SegmentReader {
+    pub fn segments(&self) -> io::Result<SegmentReader<'_>> {
+        self.enter_segmented_domain(true)?;
+        Ok(SegmentReader {
             conn_index: self.conn_index,
             generation: self.generation,
             _borrow: PhantomData,
             _not_send: PhantomData,
-        }
+        })
     }
 
     /// Await the next received segment as an owned, freely holdable [`Bytes`]
@@ -1028,14 +1048,24 @@ impl ConnCtx {
     /// when the recv completion handler holds a buffer and calls `wake_recv` (the
     /// same waiter mechanism as [`segments`](Self::segments) / [`with_data`](Self::with_data)).
     ///
+    /// # Errors
+    ///
+    /// Refused before any reader exists, so a conflict is reported where it is
+    /// caused rather than one poll later:
+    ///
+    /// - `EBUSY` — a [`SegmentReader`] is already live on this connection, or a
+    ///   Mode A forward is running (the forward owns the hold).
+    /// - `EPIPE` — this handle is stale: the slot was closed and recycled for a
+    ///   different connection.
+    ///
     /// io_uring only — segmented delivery is backed by the provided-buffer ring.
     #[cfg(has_io_uring)]
-    pub fn recv_owned_segment(&self) -> RecvOwnedSegment {
-        self.enter_segmented_domain();
-        RecvOwnedSegment {
+    pub fn recv_owned_segment(&self) -> io::Result<RecvOwnedSegment> {
+        self.enter_segmented_domain(false)?;
+        Ok(RecvOwnedSegment {
             conn_index: self.conn_index,
             generation: self.generation,
-        }
+        })
     }
 
     /// End segmented-recv delivery on this connection and restore the default
@@ -2928,7 +2958,7 @@ impl<F: FnMut(Bytes) -> ParseResult + Unpin> Future for WithBytesFuture<F> {
 /// iterators). Typical use:
 ///
 /// ```ignore
-/// let mut r = conn.segments();
+/// let mut r = conn.segments()?;
 /// while let Some(seg) = r.next().await? {
 ///     process(&seg);        // seg: Deref<Target = [u8]>, held across the await below
 ///     downstream.send(&seg).await?;
@@ -2980,6 +3010,15 @@ impl SegmentReader<'_> {
 #[cfg(has_io_uring)]
 impl Drop for SegmentReader<'_> {
     fn drop(&mut self) {
+        // Release the exclusivity claim first, and unconditionally: a reader
+        // that is gone must never keep the next `segments()` locked out, and
+        // the settle below has early returns.
+        let _ = try_with_state(|driver, _executor| {
+            if let Some(live) = driver.segment_reader_live.get_mut(self.conn_index as usize) {
+                *live = false;
+            }
+        });
+
         // Auto-settle on drop: if the reader is dropped while the connection is
         // still in the segmented domain (i.e. `end_segments()` was not called —
         // the common pattern drops the reader first, then calls `end_segments`),

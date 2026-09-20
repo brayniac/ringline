@@ -151,7 +151,9 @@ impl AsyncEventHandler for Bench {
                             "segments" => {
                                 let mut g = 0usize;
                                 {
-                                    let mut reader = conn.segments();
+                                    let Ok(mut reader) = conn.segments() else {
+                                        return;
+                                    };
                                     while g < want {
                                         match reader.next().await {
                                             Ok(Some(seg)) => g += seg.len(),
