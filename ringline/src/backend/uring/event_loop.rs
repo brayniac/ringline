@@ -7867,22 +7867,27 @@ mod tests {
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
 
-        // Segmented domain, empty hold, bytes only in the accumulator — the
-        // state left behind by a settle.
+        // Order matters. `segments()` adopts at entry, so stranding the bytes
+        // first would leave the poll-entry path with nothing to do and test the
+        // wrong thing. Install the reader first, *then* strand — which is what
+        // a settle (`SegmentReader::drop`, `with_segments`) actually does.
+        let conn = ConnCtx::new(conn_index, generation);
+        let mut reader = with_driver_state(&mut el, || conn.segments());
+
         el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
         assert!(
             el.driver.accumulators.append(conn_index, b"stranded"),
             "accumulator append"
         );
-        assert!(el.driver.segment_hold[conn_index as usize].is_empty());
+        assert!(
+            el.driver.segment_hold[conn_index as usize].is_empty(),
+            "hold must be empty so only the accumulator can satisfy this read"
+        );
 
         use metriken::CounterGroupMetric;
         let before = crate::metrics::POOL
             .counter_value(crate::metrics::pool::SEGMENT_STRANDED_ADOPTED)
             .unwrap_or(0);
-
-        let conn = ConnCtx::new(conn_index, generation);
-        let mut reader = with_driver_state(&mut el, || conn.segments());
         let waker = noop_waker();
         let mut fut = std::pin::pin!(reader.next());
         let got = match with_driver_state(&mut el, || {
