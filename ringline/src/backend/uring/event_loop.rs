@@ -379,11 +379,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 let mut ctx = unsafe { (*driver_ptr).make_ctx() };
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     handler.on_tick(&mut ctx);
-                }
-                if crate::DEBUG_DUMP_STATE.swap(false, std::sync::atomic::Ordering::Relaxed) {
-                    self.debug_dump_423();
-                }
-                {
                 }));
                 if result.is_err() {
                     eprintln!("ringline: handler on_tick panicked; continuing");
