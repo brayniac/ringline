@@ -1410,8 +1410,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 } else {
                     crate::tls::PlaintextSink::Accumulator(&mut self.driver.accumulators)
                 };
-                let hold_before = self.driver.segment_hold[conn_index as usize].len();
-                let _ = hold_before;
                 let result = crate::tls::feed_tls_recv(
                     tls_table,
                     sink,
