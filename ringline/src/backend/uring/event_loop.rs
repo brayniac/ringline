@@ -822,6 +822,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 .map(|(w, c, d, ms)| format!("{ms}ms:{w}(c{c},{d})"))
                 .collect();
             eprintln!("[423] last transitions (newest first): {}", tail.join(" "));
+            eprintln!(
+                "[423] bytes: fed_ciphertext={} consumed_by_rustls={} drained_plaintext={}",
+                crate::FED_CIPHERTEXT.load(std::sync::atomic::Ordering::Relaxed),
+                crate::CONSUMED_CIPHERTEXT.load(std::sync::atomic::Ordering::Relaxed),
+                crate::DRAINED_PLAINTEXT.load(std::sync::atomic::Ordering::Relaxed),
+            );
         }
         for idx in 0..self.driver.recv_domain.len() {
             let i = idx as u32;

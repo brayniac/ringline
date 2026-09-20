@@ -190,6 +190,10 @@ pub(super) fn feed_tls_recv_buffered(
     // buffer space — would otherwise leave the tail unfed,
     // permanently desynchronising the application from the wire.
     let mut cursor = io::Cursor::new(ciphertext);
+    crate::FED_CIPHERTEXT.fetch_add(
+        ciphertext.len() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     while cursor.position() < ciphertext.len() as u64 {
         match buffered_mut(tls_conn).read_tls(&mut cursor) {
             Ok(0) => {
@@ -234,6 +238,8 @@ pub(super) fn feed_tls_recv_buffered(
             ));
         }
     }
+
+    crate::CONSUMED_CIPHERTEXT.fetch_add(cursor.position(), std::sync::atomic::Ordering::Relaxed);
 
     // Final state read for the wants_write / handshake / closed
     // checks below.

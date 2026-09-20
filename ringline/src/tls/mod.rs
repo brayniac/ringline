@@ -845,6 +845,7 @@ fn drain_tls_plaintext(
                 ));
                 *outstanding += n;
                 crate::trace_423_global("seg:push", conn_index, n as i64);
+                crate::DRAINED_PLAINTEXT.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
             }
         }
         reader.consume(n);

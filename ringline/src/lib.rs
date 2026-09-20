@@ -177,6 +177,13 @@ pub static TRACE_423: std::sync::Mutex<Vec<(&'static str, u32, i64, u64)>> =
 pub static TRACE_423_EPOCH: std::sync::Mutex<Option<std::time::Instant>> =
     std::sync::Mutex::new(None);
 
+/// INVESTIGATION (#423): byte accounting across the TLS feed.
+pub static FED_CIPHERTEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Ciphertext rustls actually consumed (cursor position at loop exit).
+pub static CONSUMED_CIPHERTEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Plaintext drained out of rustls into the segment hold.
+pub static DRAINED_PLAINTEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// INVESTIGATION (#423): trace from anywhere in the crate.
 pub(crate) fn trace_423_global(what: &'static str, conn: u32, detail: i64) {
     let ms = TRACE_423_EPOCH

@@ -854,6 +854,9 @@ fn tls_segmented_recv_reassembles_and_eofs() {
     // and would otherwise show an earlier test's history.
     ringline::TRACE_423.lock().unwrap().clear();
     *ringline::TRACE_423_EPOCH.lock().unwrap() = Some(Instant::now());
+    ringline::FED_CIPHERTEXT.store(0, std::sync::atomic::Ordering::Relaxed);
+    ringline::CONSUMED_CIPHERTEXT.store(0, std::sync::atomic::Ordering::Relaxed);
+    ringline::DRAINED_PLAINTEXT.store(0, std::sync::atomic::Ordering::Relaxed);
 
     let client_config = client_tls_config(&certs);
     let server_name: ServerName<'_> = "localhost".try_into().unwrap();
