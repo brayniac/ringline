@@ -1443,6 +1443,28 @@ impl Driver {
         }
     }
 
+    /// Clear the recv-side exclusivity claims for a slot that is being reused.
+    ///
+    /// `RecvHalf::drop` and `SegmentReader::drop` release their own claims, but
+    /// both go through `try_with_state`, which is a **no-op during unguarded
+    /// teardown** — `executor.remove_connection` drops a parked task's future
+    /// with `CURRENT_DRIVER` unset. A claim can therefore outlive its claimant,
+    /// and since the flags are indexed by slot rather than by generation, the
+    /// *next* occupant would inherit it and have its reads refused with `EBUSY`
+    /// forever.
+    ///
+    /// Clearing here, at the recycle point, makes that impossible regardless of
+    /// how the previous occupant died.
+    pub(crate) fn clear_recv_claims(&mut self, conn_index: u32) {
+        let idx = conn_index as usize;
+        if let Some(live) = self.segment_reader_live.get_mut(idx) {
+            *live = false;
+        }
+        if let Some(taken) = self.recv_half_taken.get_mut(idx) {
+            *taken = false;
+        }
+    }
+
     pub(crate) fn close_connection(&mut self, conn_index: u32) {
         if let Some(conn) = self.connections.get_mut(conn_index) {
             if conn.close_requested() {
@@ -2697,6 +2719,7 @@ impl Driver {
                         if let Some(ref mut tls_table) = self.tls_table {
                             tls_table.remove(conn_index);
                         }
+                        self.clear_recv_claims(conn_index);
                         self.connections.release(conn_index);
                     }
                     _ => {}

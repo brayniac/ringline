@@ -3470,6 +3470,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
         // Remove the async task (drops the future).
         self.executor.remove_connection(conn_index);
+        // The future just dropped may have owned a `RecvHalf` or a
+        // `SegmentReader`, whose `Drop` is a no-op here (unguarded teardown).
+        // Clear their claims before the slot is reused, or the next occupant
+        // inherits them.
+        self.driver.clear_recv_claims(conn_index);
         self.driver.connections.release(conn_index);
     }
 
@@ -7857,6 +7862,89 @@ mod tests {
         );
         // Pinned: the buffer is still outstanding.
         assert_eq!(el.driver.provided_bufs.free(), entries - 1);
+    }
+
+    /// `take_recv` hands out the read side exactly once, and dropping it hands
+    /// the connection back.
+    #[test]
+    fn recv_half_is_exclusive_and_released_on_drop() {
+        let mut el = make_test_loop_with_config(config_with_reserve(16));
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let conn = ConnCtx::new(conn_index, generation);
+
+        let half = with_driver_state(&mut el, || conn.take_recv()).expect("first take_recv");
+        assert!(el.driver.recv_half_taken[conn_index as usize]);
+
+        match with_driver_state(&mut el, || conn.take_recv()) {
+            Err(e) => assert_eq!(
+                e.raw_os_error(),
+                Some(libc::EBUSY),
+                "a second take_recv must be refused with EBUSY"
+            ),
+            Ok(_) => panic!("the read side was handed out twice"),
+        }
+
+        // The `ConnCtx` segmented path must defer to the half wherever the
+        // signature can report it.
+        match with_driver_state(&mut el, || conn.segments()) {
+            Err(e) => assert_eq!(e.raw_os_error(), Some(libc::EBUSY)),
+            Ok(_) => panic!("ConnCtx::segments() must not bypass a live RecvHalf"),
+        }
+
+        with_driver_state(&mut el, || drop(half));
+        assert!(
+            !el.driver.recv_half_taken[conn_index as usize],
+            "dropping the half releases the claim"
+        );
+        let _again = with_driver_state(&mut el, || conn.take_recv())
+            .expect("the half is available again after drop");
+    }
+
+    /// A stale handle must not take the read side of the slot's new occupant.
+    #[test]
+    fn take_recv_refuses_a_stale_handle() {
+        let mut el = make_test_loop_with_config(config_with_reserve(16));
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let stale = ConnCtx::new(conn_index, generation.wrapping_add(1));
+        match with_driver_state(&mut el, || stale.take_recv()) {
+            Err(e) => assert_eq!(e.raw_os_error(), Some(libc::EPIPE)),
+            Ok(_) => panic!("a stale handle must not take the read side"),
+        }
+        assert!(
+            !el.driver.recv_half_taken[conn_index as usize],
+            "a refused take must not leave a claim behind"
+        );
+    }
+
+    /// A claim must not outlive the slot it was made on.
+    ///
+    /// `RecvHalf::drop` and `SegmentReader::drop` both release through
+    /// `try_with_state`, which is a no-op during unguarded teardown — so a
+    /// claim can survive its claimant. The flags are indexed by slot, not by
+    /// generation, so without an explicit clear at the recycle point the *next*
+    /// occupant inherits the claim and has its reads refused forever.
+    #[test]
+    fn recv_claims_do_not_survive_slot_reuse() {
+        let mut el = make_test_loop_with_config(config_with_reserve(16));
+        let conn_index = accept_connection(&mut el);
+
+        // Simulate the claims outliving their owners, which is what an
+        // unguarded teardown produces.
+        el.driver.recv_half_taken[conn_index as usize] = true;
+        el.driver.segment_reader_live[conn_index as usize] = true;
+
+        el.driver.clear_recv_claims(conn_index);
+
+        assert!(
+            !el.driver.recv_half_taken[conn_index as usize],
+            "a recycled slot must not inherit a recv-half claim"
+        );
+        assert!(
+            !el.driver.segment_reader_live[conn_index as usize],
+            "a recycled slot must not inherit a reader claim"
+        );
     }
 
     /// A segmented reader must deliver bytes that are sitting in the
