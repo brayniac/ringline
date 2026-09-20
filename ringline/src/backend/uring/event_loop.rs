@@ -7986,8 +7986,13 @@ mod tests {
         }
 
         // Dropping only the send half must NOT release the read claim: the
-        // reader is still live and still exclusive.
-        drop(tx);
+        // reader is still live and still exclusive. `SendHalf` has no `Drop`
+        // today, so this holds trivially — but `clear_recv_claims` clears
+        // *both* flags, so the day the write side grows a claim of its own and
+        // reaches for that helper, this is what catches it.
+        {
+            let _tx = tx;
+        }
         assert!(
             el.driver.recv_half_taken[conn_index as usize],
             "dropping the send half must not release the read claim"
