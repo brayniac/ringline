@@ -390,6 +390,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 }
             }
             drop(guard);
+            if crate::DEBUG_DUMP_STATE.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                self.debug_dump_423();
+            }
 
             // Finalize every close requested this iteration — by
             // `close_connection` from a CQE handler or the task-exit arm, or
@@ -832,6 +835,37 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 self.driver.recv_fallback_inflight[idx],
                 self.executor.recv_waiters[idx],
                 self.executor.owner_task[idx],
+            );
+        }
+    }
+
+    /// INVESTIGATION (#423): print the state that decides whether a parked
+    /// connection ever receives again. Not for merge.
+    fn debug_dump_423(&self) {
+        eprintln!(
+            "[423] provided_bufs.free={} pending_replenish={} recv_starved={:?}",
+            self.driver.provided_bufs.free(),
+            self.driver.pending_replenish.len(),
+            self.driver.recv_starved,
+        );
+        for idx in 0..self.driver.recv_domain.len() {
+            let i = idx as u32;
+            let Some(c) = self.driver.connections.get(i) else {
+                continue;
+            };
+            if !matches!(c.lifecycle, Lifecycle::Open) {
+                continue;
+            }
+            eprintln!(
+                "[423]   conn {i}: arm={:?} armed={} read={:?} domain={:?} hold={} starved={} fallback={} waiter={}",
+                c.recv_arm,
+                c.recv_multishot_armed,
+                c.read,
+                self.driver.recv_domain[idx],
+                self.driver.segment_hold[idx].len(),
+                self.driver.recv_starved.contains(&i),
+                self.driver.recv_fallback_inflight[idx],
+                self.executor.recv_waiters[idx],
             );
         }
     }
