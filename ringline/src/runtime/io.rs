@@ -900,7 +900,7 @@ impl ConnCtx {
                 return Err(io::Error::from_raw_os_error(libc::EPIPE));
             }
             let idx = self.conn_index as usize;
-            if via == SegmentedEntry::ViaConn && driver.recv_half_taken[idx] {
+            if driver.recv_half_taken[idx] {
                 return Err(io::Error::from_raw_os_error(libc::EBUSY));
             }
             driver.recv_half_taken[idx] = true;
@@ -1036,7 +1036,10 @@ impl ConnCtx {
             // the mixing this design exists to stop, so refuse it wherever the
             // signature can say so. (`with_data` and friends still cannot
             // report it — that is what step 3 removes.)
-            if driver.recv_half_taken[idx] {
+            //
+            // `ViaHalf` is exempt: the half holds this claim by construction,
+            // so treating it like any other caller made it refuse itself.
+            if via == SegmentedEntry::ViaConn && driver.recv_half_taken[idx] {
                 return Err(io::Error::from_raw_os_error(libc::EBUSY));
             }
             if exclusive {
