@@ -837,12 +837,14 @@ fn drain_tls_plaintext(
                 // accumulator path bounds its buffer: an over-limit chunk is
                 // NOT consumed from rustls, and the caller kills the connection.
                 if outstanding.saturating_add(n) > *max {
+                    crate::trace_423_global("seg:refused", conn_index, n as i64);
                     return false;
                 }
                 hold.push_back(crate::backend::HeldRecvBuf::Owned(
                     bytes::Bytes::copy_from_slice(chunk),
                 ));
                 *outstanding += n;
+                crate::trace_423_global("seg:push", conn_index, n as i64);
             }
         }
         reader.consume(n);

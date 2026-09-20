@@ -3001,6 +3001,7 @@ impl<'a> Future for SegmentNext<'a> {
 
             // A held buffer is available: hand it to a `RecvSegment`.
             if let Some(held) = driver.segment_hold[idx].pop_front() {
+                crate::trace_423_global("seg:pop:reader", conn, 0);
                 match held {
                     crate::backend::HeldRecvBuf::Pinned { bid, len } => {
                         // Zero-copy: check the bid out into the (guaranteed-empty)
@@ -3277,6 +3278,7 @@ impl Future for RecvOwnedSegment {
             // never touches `segment_pinned`, so it can never deplete the ring by
             // holding. (INC ordering: copy-before-replenish, no await between.)
             if let Some(held) = driver.segment_hold[idx].pop_front() {
+                crate::trace_423_global("seg:pop:copy", conn, 0);
                 match held {
                     crate::backend::HeldRecvBuf::Pinned { bid, len } => {
                         let (ptr, _) = driver.provided_bufs.get_buffer(bid);
@@ -3752,6 +3754,7 @@ impl<F: FnMut(&SegChain<'_>) -> SegConsumed + Unpin> Future for WithSegmentsFutu
             // front; each bid is either replenished (consumed) or gathered +
             // replenished (remainder). Net: hold empties, un-consumed bytes live
             // contiguously at the accumulator front, in order.
+            crate::trace_423_global("seg:clear", conn, driver.segment_hold[idx].len() as i64);
             driver.segment_hold[idx].clear();
 
             let mut rem_n = consumed;

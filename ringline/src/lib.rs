@@ -177,6 +177,20 @@ pub static TRACE_423: std::sync::Mutex<Vec<(&'static str, u32, i64, u64)>> =
 pub static TRACE_423_EPOCH: std::sync::Mutex<Option<std::time::Instant>> =
     std::sync::Mutex::new(None);
 
+/// INVESTIGATION (#423): trace from anywhere in the crate.
+pub(crate) fn trace_423_global(what: &'static str, conn: u32, detail: i64) {
+    let ms = TRACE_423_EPOCH
+        .lock()
+        .unwrap()
+        .map(|e| e.elapsed().as_millis() as u64)
+        .unwrap_or(0);
+    let mut t = TRACE_423.lock().unwrap();
+    if t.len() >= 512 {
+        t.remove(0);
+    }
+    t.push((what, conn, detail, ms));
+}
+
 pub static DEBUG_DUMP_STATE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 #[cfg_attr(not(has_io_uring), allow(dead_code))]
