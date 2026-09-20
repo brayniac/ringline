@@ -893,6 +893,28 @@ impl ConnCtx {
     ///
     /// io_uring only, for now: the mio backend shares the recv entry points but
     /// not the driver-side claim.
+    /// Split this connection into its write and read halves.
+    ///
+    /// The read side is exclusive and the write side is single-owner; see
+    /// [`SendHalf`] and [`RecvHalf`]. Fan-in to one connection is an explicit
+    /// queue with the owning task draining it, not a shared handle.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`take_recv`](Self::take_recv): `EBUSY` if the read side is
+    /// already out, `EPIPE` if this handle is stale.
+    #[cfg(has_io_uring)]
+    pub fn split(&self) -> io::Result<(SendHalf, RecvHalf)> {
+        let rx = self.take_recv()?;
+        Ok((
+            SendHalf {
+                conn: *self,
+                _not_send: PhantomData,
+            },
+            rx,
+        ))
+    }
+
     #[cfg(has_io_uring)]
     pub fn take_recv(&self) -> io::Result<RecvHalf> {
         with_state(|driver, _executor| {
@@ -3084,11 +3106,6 @@ pub struct RecvHalf {
 
 #[cfg(has_io_uring)]
 impl RecvHalf {
-    /// The connection this half reads. Sends and close still go through it.
-    pub fn conn(&self) -> ConnCtx {
-        self.conn
-    }
-
     /// See [`ConnCtx::with_data`].
     pub fn with_data<F: FnMut(&[u8]) -> ParseResult>(&mut self, f: F) -> WithDataFuture<F> {
         self.conn.with_data(f)
@@ -3126,6 +3143,12 @@ impl RecvHalf {
         self.conn.with_segments(f)
     }
 
+    /// See [`ConnCtx::end_segments`]. Leaves the segmented domain and restores
+    /// the default read path; the half stays valid and can read again.
+    pub fn end_segments(&mut self) -> io::Result<()> {
+        self.conn.end_segments()
+    }
+
     /// See [`ConnCtx::recv_ready`].
     pub fn recv_ready(&mut self) -> RecvReadyFuture {
         self.conn.recv_ready()
@@ -3147,6 +3170,88 @@ impl RecvHalf {
         len: usize,
     ) -> ForwardToFuture<'h> {
         self.conn.forward_to_conn(sink, len)
+    }
+}
+
+/// The **write side** of a connection, from [`ConnCtx::split`].
+///
+/// Not `Copy` and not `Clone`, so one task owns the writes. Several producers
+/// feeding one connection is an explicit queue — `runtime::channel`'s
+/// `Sender`/`Receiver` — with the owning task draining it, rather than a shared
+/// handle. That is deliberate: the per-connection send queue provides
+/// *non-corruption* (one `send`'s bytes reach the wire contiguously, TLS
+/// records do not interleave) but it cannot provide *ordering*, because which
+/// task's message goes first is whichever the executor polled. Message order is
+/// a protocol property and only the application knows the intended order, so a
+/// shared send handle would advertise a guarantee the transport cannot keep.
+///
+/// Unlike [`RecvHalf`], this does not borrow the read side: sending while a
+/// reader is live is ordinary (an echo does exactly that), so the two halves
+/// are independent.
+///
+/// Note the write side has an exclusivity rule of its own that is **not yet
+/// enforced** — a connection that is the sink of a `forward_to_conn` must not
+/// be sent to concurrently. See `docs/connection-handle-ownership-design.md`.
+///
+/// io_uring only, for now.
+#[cfg(has_io_uring)]
+pub struct SendHalf {
+    conn: ConnCtx,
+    _not_send: PhantomData<*const ()>,
+}
+
+#[cfg(has_io_uring)]
+impl SendHalf {
+    /// See [`ConnCtx::send`].
+    pub fn send(&mut self, data: &[u8]) -> io::Result<SendFuture> {
+        self.conn.send(data)
+    }
+
+    /// See [`ConnCtx::send_nowait`].
+    pub fn send_nowait(&mut self, data: &[u8]) -> io::Result<()> {
+        self.conn.send_nowait(data)
+    }
+
+    /// See [`ConnCtx::send_parts`].
+    pub fn send_parts(&mut self) -> AsyncSendBuilder {
+        self.conn.send_parts()
+    }
+
+    /// See [`ConnCtx::send_backpressured`].
+    pub fn send_backpressured<'a>(&mut self, data: &'a [u8]) -> BackpressuredSendFuture<'a> {
+        self.conn.send_backpressured(data)
+    }
+
+    /// See [`ConnCtx::close`].
+    pub fn close(&mut self) {
+        self.conn.close();
+    }
+
+    /// See [`ConnCtx::peer_addr`].
+    pub fn peer_addr(&self) -> Option<crate::connection::PeerAddr> {
+        self.conn.peer_addr()
+    }
+
+    /// See [`ConnCtx::is_outbound`].
+    pub fn is_outbound(&self) -> bool {
+        self.conn.is_outbound()
+    }
+
+    /// See [`ConnCtx::connect`]. Opening another connection is a runtime
+    /// capability rather than a write on this one, but it is reachable from
+    /// here so a task holding only the halves can still build a proxy.
+    pub fn connect(&self, addr: std::net::SocketAddr) -> io::Result<ConnectFuture> {
+        self.conn.connect(addr)
+    }
+
+    /// The underlying handle, for the APIs that still take a `ConnCtx` — most
+    /// notably as a `forward_to_conn` sink.
+    ///
+    /// This is an escape hatch, and it hands back the full `Copy` surface: the
+    /// ownership model is only advisory until step 4 takes the recv methods off
+    /// `ConnCtx` entirely. Do not use it to read.
+    pub fn as_conn(&self) -> ConnCtx {
+        self.conn
     }
 }
 
