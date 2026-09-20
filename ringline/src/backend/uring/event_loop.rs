@@ -832,12 +832,16 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 && let Some(tc) = tls.get_mut(i)
                 && let Some(b) = tc.conn.as_buffered_mut()
             {
+                // `fill_buf` is the ground truth for "plaintext rustls is
+                // holding that nobody drained": `plaintext_bytes_to_read` only
+                // reports what the last state tick produced.
+                use std::io::BufRead;
+                let st = b.process_new_packets();
+                let pending = st.as_ref().map(|s| s.plaintext_bytes_to_read());
+                let buffered_now = b.reader().fill_buf().map(<[u8]>::len);
                 eprintln!(
-                    "[423]     rustls: plaintext_to_read={} wants_read={} handshaking={}",
-                    b.process_new_packets()
-                        .map(|st| st.plaintext_bytes_to_read())
-                        .unwrap_or(usize::MAX),
-                    b.wants_read(),
+                    "[423]     rustls: plaintext_to_read={pending:?} reader_buffered={buffered_now:?} wants_write={} handshaking={}",
+                    b.wants_write(),
                     b.is_handshaking(),
                 );
             }
