@@ -173,6 +173,11 @@ pub fn init_metadata() {
         "op".into(),
         "forward_throttled".into(),
     );
+    POOL.insert_metadata(
+        pool::SEGMENT_STRANDED_ADOPTED,
+        "op".into(),
+        "segment_stranded_adopted".into(),
+    );
 
     UDP.insert_metadata(
         udp::DATAGRAMS_RECEIVED,
@@ -224,6 +229,7 @@ mod tests {
             pool::RECV_PARKED,
             pool::RECV_FALLBACK,
             pool::FORWARD_THROTTLED,
+            pool::SEGMENT_STRANDED_ADOPTED,
         ] {
             assert!(POOL.increment(idx), "POOL[{idx}] out of bounds");
         }

@@ -947,6 +947,23 @@ impl ConnCtx {
     fn enter_segmented_domain(&self) {
         with_state(|driver, _executor| {
             let idx = self.conn_index as usize;
+            // A stale handle must not touch the slot's new occupant. Without
+            // this, a recycled connection has its accumulator drained into a
+            // hold its own `with_data` reader never looks at — #423 inflicted
+            // on an innocent third party. `arm_forward_source` refuses the same
+            // way (EPIPE); the caller's own poll then resolves to EOF.
+            if driver.connections.generation(self.conn_index) != self.generation {
+                return;
+            }
+            // A running Mode A forward owns this connection's hold, and its
+            // `advance_forward` gathers whatever is in front. Adopting the
+            // accumulator here would push post-`len` overshoot into the
+            // forward's next write and corrupt the relayed stream, so leave a
+            // forwarding connection strictly alone — exactly as
+            // `arm_forward_source` refuses a second forward with EBUSY.
+            if driver.forward_progress[idx].is_some() {
+                return;
+            }
             driver.recv_domain[idx] = crate::recv::domain::RecvDomain::Segmented;
             if !driver.accumulators.is_empty(self.conn_index) {
                 let buffered = driver.accumulators.take_frozen(self.conn_index);
@@ -2994,43 +3011,42 @@ impl Drop for SegmentReader<'_> {
     }
 }
 
-/// Liveness guard for segmented readers (#423).
+/// Deliver bytes a segmented reader would otherwise never see (#423).
 ///
-/// A segmented reader consumes only `segment_hold`. If it is about to park
-/// while the `RecvAccumulator` holds bytes, those bytes are unreachable and the
-/// connection hangs — with every other signal reading healthy: provided ring
-/// full, multishot armed and live, no ENOBUFS, no errors, rustls empty. That
-/// combination is invisible to every counter in the runtime, which is what made
-/// #423 cost months to find.
+/// A segmented reader consumes only `segment_hold`; the `RecvAccumulator` is
+/// invisible to it. Reaching a poll with a non-empty accumulator therefore
+/// means those bytes are stranded, and the connection hangs with every other
+/// signal healthy — provided ring full, multishot armed and live, no ENOBUFS,
+/// no errors. That combination is invisible to every other counter here, which
+/// is what made #423 cost months to find.
 ///
-/// `enter_segmented_domain` adopts whatever is already buffered, so reaching
-/// here means some path entered segmented delivery without adopting. Assert
-/// loudly under test; in release, adopt and wake so a live system recovers
-/// rather than hanging, and count it so the anomaly is visible.
+/// Called at the **top** of the poll, before the hold is examined, so adopted
+/// bytes are returned by that same poll. Adopting after the park decision
+/// instead would be useless: `Executor::wake_recv` is gated on the waiter flag
+/// the caller has not set yet, so the wake would be a silent no-op and the
+/// reader would still hang.
 ///
-/// Returns `true` if bytes were adopted. The caller still parks — the
-/// `wake_recv` re-polls immediately and the hold is no longer empty.
+/// This is a recovery path, not an assertion. The accumulator can legitimately
+/// be non-empty here — `SegmentReader::drop` settles the hold into it, and
+/// `with_segments` leaves its un-consumed remainder there — and in every such
+/// case adopting is simply the correct answer. (`SegmentNext::poll` already
+/// treats a second concurrent reader as a recoverable misuse rather than a
+/// panic; asserting here would contradict that.)
+///
+/// `enter_segmented_domain` adopts on entry, so a non-zero
+/// `SEGMENT_STRANDED_ADOPTED` means bytes were stranded *after* entry and this
+/// path is the only reason the connection kept working.
 #[cfg(has_io_uring)]
-fn guard_segmented_park(driver: &mut Driver, executor: &mut Executor, conn: u32) -> bool {
+fn adopt_stranded_accumulator(driver: &mut Driver, conn: u32) {
     if driver.accumulators.is_empty(conn) {
-        return false;
+        return;
     }
-    debug_assert!(
-        false,
-        "segmented reader on conn {conn} parked with bytes stranded in the accumulator — \
-         a path entered the segmented domain without adopting them (#423)"
-    );
     let idx = conn as usize;
     let buffered = driver.accumulators.take_frozen(conn);
     driver.segment_hold[idx].push_front(crate::backend::HeldRecvBuf::Owned(buffered));
     crate::metrics::POOL.increment(crate::metrics::pool::SEGMENT_STRANDED_ADOPTED);
-    executor.wake_recv(conn);
-    true
 }
 
-/// Future returned by [`SegmentReader::next`]. Borrows the reader (`&mut`) for
-/// `'a`; the yielded [`RecvSegment`] shares that borrow, keeping the reader
-/// exclusively locked while the segment is alive.
 #[cfg(has_io_uring)]
 pub struct SegmentNext<'a> {
     conn_index: u32,
@@ -3053,6 +3069,10 @@ impl<'a> Future for SegmentNext<'a> {
             if driver.connections.generation(conn) != self.generation {
                 return Poll::Ready(Ok(None));
             }
+
+            // Before anything else: bytes stranded in the accumulator are
+            // invisible to this reader. Adopt them so this poll can return them.
+            adopt_stranded_accumulator(driver, conn);
 
             // One live pinned segment per connection at a time. A *single* reader
             // is kept sound by `&mut self` (a live `RecvSegment` borrows the reader
@@ -3109,10 +3129,6 @@ impl<'a> Future for SegmentNext<'a> {
             if is_closed {
                 return Poll::Ready(Ok(None));
             }
-
-            // Never park while the accumulator holds bytes this reader cannot
-            // see; see `guard_segmented_park`.
-            guard_segmented_park(driver, executor, conn);
 
             // Open and nothing held yet — park as a recv waiter. `handle_recv_multi`
             // pushes into `segment_hold` and calls `wake_recv` on the next arrival.
@@ -3346,6 +3362,10 @@ impl Future for RecvOwnedSegment {
                 return Poll::Ready(Ok(None));
             }
 
+            // Before anything else: bytes stranded in the accumulator are
+            // invisible to this reader. Adopt them so this poll can return them.
+            adopt_stranded_accumulator(driver, conn);
+
             // A held buffer is available: COPY it into an owned `Bytes` and
             // replenish the bid immediately. The copy is the release — this path
             // never touches `segment_pinned`, so it can never deplete the ring by
@@ -3379,10 +3399,6 @@ impl Future for RecvOwnedSegment {
             if is_closed {
                 return Poll::Ready(Ok(None));
             }
-
-            // Never park while the accumulator holds bytes this reader cannot
-            // see; see `guard_segmented_park`.
-            guard_segmented_park(driver, executor, conn);
 
             // Open and nothing held yet — park as a recv waiter, resumed by
             // `handle_recv_multi`'s `wake_recv` on the next arrival.
