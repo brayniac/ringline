@@ -345,6 +345,14 @@ pub(crate) struct Driver {
     /// under `try_with_state`, or `close_connection` under `&mut Driver`)
     /// replenishes the bid exactly once; the other sees `None` and does nothing.
     pub(crate) segment_pinned: Vec<Option<HeldRecvBuf>>,
+    /// A `SegmentReader` is live on this connection.
+    ///
+    /// A reader owns the connection's delivery discipline for its whole
+    /// lifetime — its `Drop` settles the hold back into the accumulator — so a
+    /// second reader, or an owned-segment read, alongside it is a bug. Entry
+    /// refuses with `EBUSY` while this is set, rather than letting the conflict
+    /// surface later as a stranded read (#423, #427).
+    pub(crate) segment_reader_live: Vec<bool>,
     /// Per-connection in-flight segmented-recv Mode A forward write (see
     /// [`ForwardWriteState`]). `Some` while a write to the sink is outstanding;
     /// enforces the one-write-in-flight invariant and keeps the write's backing
@@ -783,6 +791,7 @@ impl Driver {
                 .map(|_| std::collections::VecDeque::new())
                 .collect(),
             segment_pinned: vec![None; config.max_connections as usize],
+            segment_reader_live: vec![false; config.max_connections as usize],
             forward_write: (0..config.max_connections).map(|_| None).collect(),
             forward_done: (0..config.max_connections).map(|_| None).collect(),
             forward_progress: (0..config.max_connections).map(|_| None).collect(),

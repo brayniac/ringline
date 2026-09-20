@@ -6796,7 +6796,7 @@ mod tests {
         // Drive the reader: next() moves the held buffer into the pin slot and
         // hands out a segment.
         let conn = ConnCtx::new(conn_index, generation);
-        let mut reader = with_driver_state(&mut el, || conn.segments());
+        let mut reader = with_driver_state(&mut el, || conn.segments()).expect("segments()");
         let waker = noop_waker();
         let mut fut = std::pin::pin!(reader.next());
         let seg = match with_driver_state(&mut el, || {
@@ -6846,7 +6846,7 @@ mod tests {
         el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
 
         let conn = ConnCtx::new(conn_index, generation);
-        let mut reader = with_driver_state(&mut el, || conn.segments());
+        let mut reader = with_driver_state(&mut el, || conn.segments()).expect("segments()");
         let waker = noop_waker();
         let mut fut = std::pin::pin!(reader.next());
 
@@ -6908,7 +6908,7 @@ mod tests {
         let bid: u16 = 0;
         deliver_segment(&mut el, conn_index, bid, b"hello");
         let conn = ConnCtx::new(conn_index, generation);
-        let mut reader = with_driver_state(&mut el, || conn.segments());
+        let mut reader = with_driver_state(&mut el, || conn.segments()).expect("segments()");
         let waker = noop_waker();
         let mut fut = std::pin::pin!(reader.next());
         let seg = match with_driver_state(&mut el, || {
@@ -6983,7 +6983,7 @@ mod tests {
         let bid: u16 = 0;
         deliver_segment(&mut el, conn_index, bid, b"hello");
         let conn = ConnCtx::new(conn_index, generation);
-        let mut reader = with_driver_state(&mut el, || conn.segments());
+        let mut reader = with_driver_state(&mut el, || conn.segments()).expect("segments()");
         let waker = noop_waker();
         let mut fut = std::pin::pin!(reader.next());
         let seg = match with_driver_state(&mut el, || {
@@ -7052,7 +7052,7 @@ mod tests {
         el.driver.close_connection(conn_index);
 
         let conn = ConnCtx::new(conn_index, generation);
-        let mut reader = with_driver_state(&mut el, || conn.segments());
+        let mut reader = with_driver_state(&mut el, || conn.segments()).expect("segments()");
         let waker = noop_waker();
 
         // The reader still sees the held response — the data was not lost at close.
@@ -7101,7 +7101,7 @@ mod tests {
         let waker = noop_waker();
 
         // Reader A checks out the first segment → pins bid 0.
-        let mut reader_a = with_driver_state(&mut el, || conn.segments());
+        let mut reader_a = with_driver_state(&mut el, || conn.segments()).expect("segments()");
         let mut fut_a = std::pin::pin!(reader_a.next());
         let seg_a = match with_driver_state(&mut el, || {
             let mut cx = std::task::Context::from_waker(&waker);
@@ -7115,17 +7115,16 @@ mod tests {
             Some(crate::backend::HeldRecvBuf::Pinned { bid: 0, .. })
         ));
 
-        // Reader B tries to check out a second segment while A's is still live: the
-        // pin slot is occupied → error, and it must NOT pop the next held buffer.
-        let mut reader_b = with_driver_state(&mut el, || conn.segments());
-        let mut fut_b = std::pin::pin!(reader_b.next());
-        let res_b = with_driver_state(&mut el, || {
-            let mut cx = std::task::Context::from_waker(&waker);
-            fut_b.as_mut().poll(&mut cx)
-        });
-        assert!(
-            matches!(res_b, std::task::Poll::Ready(Err(_))),
-            "a second concurrent reader must error, not overwrite the pin slot"
+        // Reader B is now refused at `segments()` rather than at its first poll:
+        // the conflict is reported where it is caused, before a second reader
+        // exists at all (#427 step 1). Previously this surfaced one poll later,
+        // as an error from `next()`.
+        let err_b = with_driver_state(&mut el, || conn.segments())
+            .expect_err("a second reader must be refused while A is live");
+        assert_eq!(
+            err_b.raw_os_error(),
+            Some(libc::EBUSY),
+            "a live reader refuses a second one with EBUSY"
         );
         assert!(
             matches!(
@@ -7170,7 +7169,7 @@ mod tests {
         // Create a reader, consume nothing, drop it — guarded (CURRENT_DRIVER set),
         // as it would be inside a real task poll.
         with_driver_state(&mut el, || {
-            let reader = conn.segments();
+            let reader = conn.segments().expect("segments()");
             drop(reader);
         });
 
@@ -7197,7 +7196,7 @@ mod tests {
         el.driver.close_connection(conn_index);
 
         let conn = ConnCtx::new(conn_index, generation);
-        let mut reader = with_driver_state(&mut el, || conn.segments());
+        let mut reader = with_driver_state(&mut el, || conn.segments()).expect("segments()");
         let waker = noop_waker();
         let mut fut = std::pin::pin!(reader.next());
         let done = with_driver_state(&mut el, || {
@@ -7224,7 +7223,7 @@ mod tests {
         let bid: u16 = 0;
         deliver_segment(&mut el, conn_index, bid, b"hello");
         let conn = ConnCtx::new(conn_index, generation);
-        let mut reader = with_driver_state(&mut el, || conn.segments());
+        let mut reader = with_driver_state(&mut el, || conn.segments()).expect("segments()");
         let waker = noop_waker();
         let mut fut = std::pin::pin!(reader.next());
         let seg = match with_driver_state(&mut el, || {
@@ -7285,7 +7284,9 @@ mod tests {
 
         // recv_owned_segment opts into segmented delivery itself.
         let conn = ConnCtx::new(conn_index, generation);
-        let mut fut = std::pin::pin!(with_driver_state(&mut el, || conn.recv_owned_segment()));
+        let mut fut = std::pin::pin!(
+            with_driver_state(&mut el, || conn.recv_owned_segment()).expect("recv_owned_segment()")
+        );
         // First poll opts in + parks (nothing delivered yet).
         let waker = noop_waker();
         let p0 = with_driver_state(&mut el, || {
@@ -7355,7 +7356,9 @@ mod tests {
         let generation = el.driver.connections.generation(conn_index);
 
         let conn = ConnCtx::new(conn_index, generation);
-        let mut fut = std::pin::pin!(with_driver_state(&mut el, || conn.recv_owned_segment()));
+        let mut fut = std::pin::pin!(
+            with_driver_state(&mut el, || conn.recv_owned_segment()).expect("recv_owned_segment()")
+        );
         let waker = noop_waker();
 
         // First poll: hold empty, connection open → parks as a recv waiter.
@@ -7401,7 +7404,9 @@ mod tests {
         el.driver.close_connection(conn_index);
 
         let conn = ConnCtx::new(conn_index, generation);
-        let mut fut = std::pin::pin!(with_driver_state(&mut el, || conn.recv_owned_segment()));
+        let mut fut = std::pin::pin!(
+            with_driver_state(&mut el, || conn.recv_owned_segment()).expect("recv_owned_segment()")
+        );
         let waker = noop_waker();
         let done = with_driver_state(&mut el, || {
             let mut cx = std::task::Context::from_waker(&waker);
@@ -7433,7 +7438,9 @@ mod tests {
 
         // Park the reader: empty hold, connection open → Pending + recv waiter.
         let conn = ConnCtx::new(conn_index, generation);
-        let mut fut = std::pin::pin!(with_driver_state(&mut el, || conn.recv_owned_segment()));
+        let mut fut = std::pin::pin!(
+            with_driver_state(&mut el, || conn.recv_owned_segment()).expect("recv_owned_segment()")
+        );
         let waker = noop_waker();
         let p1 = with_driver_state(&mut el, || {
             let mut cx = std::task::Context::from_waker(&waker);
@@ -7872,7 +7879,7 @@ mod tests {
         // wrong thing. Install the reader first, *then* strand — which is what
         // a settle (`SegmentReader::drop`, `with_segments`) actually does.
         let conn = ConnCtx::new(conn_index, generation);
-        let mut reader = with_driver_state(&mut el, || conn.segments());
+        let mut reader = with_driver_state(&mut el, || conn.segments()).expect("segments()");
 
         el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
         assert!(
@@ -7943,7 +7950,7 @@ mod tests {
 
         // Read the owned segment out via the lending-iterator reader.
         let conn = ConnCtx::new(conn_index, generation);
-        let mut reader = with_driver_state(&mut el, || conn.segments());
+        let mut reader = with_driver_state(&mut el, || conn.segments()).expect("segments()");
         let waker = noop_waker();
         let mut fut = std::pin::pin!(reader.next());
         let seg = match with_driver_state(&mut el, || {
@@ -8000,7 +8007,9 @@ mod tests {
         );
 
         let conn = ConnCtx::new(conn_index, generation);
-        let mut fut = std::pin::pin!(with_driver_state(&mut el, || conn.recv_owned_segment()));
+        let mut fut = std::pin::pin!(
+            with_driver_state(&mut el, || conn.recv_owned_segment()).expect("recv_owned_segment()")
+        );
         let waker = noop_waker();
         let owned = match with_driver_state(&mut el, || {
             let mut cx = std::task::Context::from_waker(&waker);

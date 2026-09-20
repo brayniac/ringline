@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking (io_uring):** `ConnCtx::segments()` and
+  `ConnCtx::recv_owned_segment()` now return `io::Result<_>` and refuse a
+  conflicting entry instead of silently producing a reader that can never
+  deliver: `EBUSY` while a `SegmentReader` is live or a Mode A forward is
+  running, `EPIPE` on a stale handle whose slot was recycled. Previously the
+  conflict either surfaced one poll later as an error from `next()`, or — for
+  the forward and stale cases added in #425 — could only be refused silently,
+  because the signature had no error channel. Callers add `?` or a `match`.
+  Step 1 of `docs/connection-handle-ownership-design.md`.
+
 ### Added
 
 - `ConnCtx::with_data_result`: like `with_data`, but resolves to
