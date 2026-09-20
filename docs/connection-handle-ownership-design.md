@@ -99,10 +99,47 @@ flag day:
 
 Step 1 is independently valuable and cheap. Steps 2–4 are the real fix.
 
-## Open questions
+## Decided: channels only, no blessed `Rc<SendHalf>`
 
-- Does any in-tree or downstream user need fan-out send badly enough that
-  `Rc<SendHalf>` should be blessed rather than the channel pattern?
+Fan-out send has no surviving use case, and the two hardest many-to-one users
+in this tree already chose the queue design without being asked to:
+
+- **HTTP/2** — the canonical many-streams-to-one-connection case — is a pump
+  loop wrapping `H2Connection` and *one* `ConnCtx` (`ringline-http/src/h2_conn.rs`).
+  Streams feed the pump; the pump owns the socket.
+- **Redis pipelining** — `Client` owns the `ConnCtx` and tracks a `VecDeque` of
+  pending ops bounded by `max_in_flight`. Callers share the `Client`, never the
+  handle.
+
+Neither reached for a shared handle, because both need response-order
+correspondence and a shared handle cannot provide it.
+
+The candidates that fold on inspection:
+
+| case | why it does not need a shared handle |
+|---|---|
+| pub/sub broadcast | fan-out *across* connections; each is still single-writer |
+| keepalive `PING` from a timer task | a PING landing mid-response corrupts framing — needs ordering |
+| supervisor sending `GOAWAY`/shutdown | must follow in-flight responses — needs ordering |
+| `on_tick` flushing batched data | same ordering question |
+| HTTP/2 multiplexing | already a pump loop |
+| Redis pipelining | already single-owner + queue |
+
+The keepalive row is the important one: it is the case a developer would reach
+for sharing, and it is exactly the case that would silently interleave.
+
+**Cost, stated plainly:** double queueing — a userspace channel in front of the
+runtime's per-connection send queue. The runtime's queue cannot absorb the job,
+because there is no order for it to be deterministic *about*; only the
+application knows the intended order. The channel is `!Send` and
+`Rc<RefCell<...>>` (`runtime/channel.rs`), so the marginal cost is a push and a
+task wake, not an atomic. Worth measuring if anyone objects on latency grounds.
+
+Users can still wrap their own type in `Rc`. The question is what the API
+*endorses*: blessing `Rc<SendHalf>` would advertise an unsound pattern as
+supported.
+
+## Open questions
 - Should the recv half be a single type with `&mut self` methods, or a typestate
   (`RecvHalf<Default>` / `RecvHalf<Segmented>`) so a mode switch is visible in
   the type? Typestate is stricter but interacts badly with `'static` futures.
