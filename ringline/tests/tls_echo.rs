@@ -20,6 +20,41 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, Serve
 
 static TEST_SERIALIZE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Runtime counters that separate the candidate causes of a stalled echo:
+/// a starved provided ring, a parked recv, a failed re-arm, or an exhausted
+/// send pool whose error the handler discarded.
+///
+/// `counter_value` yields `None` for a counter that was never incremented, so
+/// these report 0 explicitly — a genuine zero and an untouched counter must
+/// not be indistinguishable.
+fn stall_counters() -> String {
+    use metriken::CounterGroupMetric;
+    use ringline::metrics::{BYTES, POOL, RING, bytes, pool, ring};
+    let g = |grp: &metriken::ShardedCounterGroup, i: usize| -> u64 {
+        grp.counter_value(i).unwrap_or(0)
+    };
+    format!(
+        "  pool.SEND_EXHAUSTED      {}\n  \
+           pool.BUFFER_RING_EMPTY   {}\n  \
+           pool.RECV_PARKED         {}\n  \
+           pool.SEND_EAGAIN         {}\n  \
+           ring.RECV_ARM_FAILURES   {}\n  \
+           ring.SQE_SUBMIT_FAILURES {}\n  \
+           bytes.RECEIVED           {}\n  \
+           bytes.SENT               {}\n  \
+           bytes.FALLBACK_RECEIVED  {}",
+        g(&POOL, pool::SEND_EXHAUSTED),
+        g(&POOL, pool::BUFFER_RING_EMPTY),
+        g(&POOL, pool::RECV_PARKED),
+        g(&POOL, pool::SEND_EAGAIN),
+        g(&RING, ring::RECV_ARM_FAILURES),
+        g(&RING, ring::SQE_SUBMIT_FAILURES),
+        g(&BYTES, bytes::RECEIVED),
+        g(&BYTES, bytes::SENT),
+        g(&BYTES, bytes::FALLBACK_RECEIVED),
+    )
+}
+
 /// Read until `buf` is full, **failing when progress stalls** rather than
 /// retrying forever.
 ///
@@ -51,10 +86,13 @@ fn read_until_full_or_stalled(
                 last_progress = Instant::now();
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                assert!(
-                    last_progress.elapsed() < stall_budget,
-                    "{what}: no progress for {stall_budget:?} at {total}/{want} bytes"
-                );
+                if last_progress.elapsed() >= stall_budget {
+                    panic!(
+                        "{what}: no progress for {stall_budget:?} at {total}/{want} bytes\n\
+                         runtime counters at the stall:\n{}",
+                        stall_counters()
+                    );
+                }
                 std::thread::sleep(Duration::from_millis(5));
             }
             Err(e) => panic!("{what}: read error at {total}/{want} bytes: {e}"),
