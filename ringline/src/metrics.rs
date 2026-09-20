@@ -21,7 +21,7 @@ pub static BYTES: ShardedCounterGroup = ShardedCounterGroup::new(3);
 pub static RING: ShardedCounterGroup = ShardedCounterGroup::new(5);
 
 #[metric(name = "ringline/pool", description = "Pool exhaustion counters")]
-pub static POOL: ShardedCounterGroup = ShardedCounterGroup::new(7);
+pub static POOL: ShardedCounterGroup = ShardedCounterGroup::new(8);
 
 #[metric(name = "ringline/udp", description = "UDP counters")]
 pub static UDP: ShardedCounterGroup = ShardedCounterGroup::new(4);
@@ -97,6 +97,20 @@ pub mod pool {
     /// per-connection backpressure that prevents one slow forward from depleting
     /// the shared recv ring.
     pub const FORWARD_THROTTLED: usize = 6;
+    /// A segmented reader was about to park while the `RecvAccumulator` still
+    /// held bytes, and those bytes were adopted into the segment hold instead.
+    ///
+    /// A segmented reader only ever reads `segment_hold`, so parking with a
+    /// non-empty accumulator strands those bytes permanently: the connection
+    /// hangs while every other signal reads healthy — ring full, multishot
+    /// live, no errors. That was #423, and it was invisible to every counter
+    /// here, which is why this one exists.
+    ///
+    /// Entering the segmented domain adopts what is already buffered, so a
+    /// non-zero count means some path reached segmented delivery without
+    /// adopting. The adoption keeps a live system correct; the count is how
+    /// you find out it happened.
+    pub const SEGMENT_STRANDED_ADOPTED: usize = 7;
 }
 
 /// Counter slot indices for UDP metrics.

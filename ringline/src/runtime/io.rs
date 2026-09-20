@@ -2994,6 +2994,40 @@ impl Drop for SegmentReader<'_> {
     }
 }
 
+/// Liveness guard for segmented readers (#423).
+///
+/// A segmented reader consumes only `segment_hold`. If it is about to park
+/// while the `RecvAccumulator` holds bytes, those bytes are unreachable and the
+/// connection hangs — with every other signal reading healthy: provided ring
+/// full, multishot armed and live, no ENOBUFS, no errors, rustls empty. That
+/// combination is invisible to every counter in the runtime, which is what made
+/// #423 cost months to find.
+///
+/// `enter_segmented_domain` adopts whatever is already buffered, so reaching
+/// here means some path entered segmented delivery without adopting. Assert
+/// loudly under test; in release, adopt and wake so a live system recovers
+/// rather than hanging, and count it so the anomaly is visible.
+///
+/// Returns `true` if bytes were adopted. The caller still parks — the
+/// `wake_recv` re-polls immediately and the hold is no longer empty.
+#[cfg(has_io_uring)]
+fn guard_segmented_park(driver: &mut Driver, executor: &mut Executor, conn: u32) -> bool {
+    if driver.accumulators.is_empty(conn) {
+        return false;
+    }
+    debug_assert!(
+        false,
+        "segmented reader on conn {conn} parked with bytes stranded in the accumulator — \
+         a path entered the segmented domain without adopting them (#423)"
+    );
+    let idx = conn as usize;
+    let buffered = driver.accumulators.take_frozen(conn);
+    driver.segment_hold[idx].push_front(crate::backend::HeldRecvBuf::Owned(buffered));
+    crate::metrics::POOL.increment(crate::metrics::pool::SEGMENT_STRANDED_ADOPTED);
+    executor.wake_recv(conn);
+    true
+}
+
 /// Future returned by [`SegmentReader::next`]. Borrows the reader (`&mut`) for
 /// `'a`; the yielded [`RecvSegment`] shares that borrow, keeping the reader
 /// exclusively locked while the segment is alive.
@@ -3075,6 +3109,10 @@ impl<'a> Future for SegmentNext<'a> {
             if is_closed {
                 return Poll::Ready(Ok(None));
             }
+
+            // Never park while the accumulator holds bytes this reader cannot
+            // see; see `guard_segmented_park`.
+            guard_segmented_park(driver, executor, conn);
 
             // Open and nothing held yet — park as a recv waiter. `handle_recv_multi`
             // pushes into `segment_hold` and calls `wake_recv` on the next arrival.
@@ -3341,6 +3379,10 @@ impl Future for RecvOwnedSegment {
             if is_closed {
                 return Poll::Ready(Ok(None));
             }
+
+            // Never park while the accumulator holds bytes this reader cannot
+            // see; see `guard_segmented_park`.
+            guard_segmented_park(driver, executor, conn);
 
             // Open and nothing held yet — park as a recv waiter, resumed by
             // `handle_recv_multi`'s `wake_recv` on the next arrival.
