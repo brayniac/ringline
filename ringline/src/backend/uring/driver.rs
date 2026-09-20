@@ -353,6 +353,13 @@ pub(crate) struct Driver {
     /// refuses with `EBUSY` while this is set, rather than letting the conflict
     /// surface later as a stranded read (#423, #427).
     pub(crate) segment_reader_live: Vec<bool>,
+    /// The connection's [`RecvHalf`] has been taken.
+    ///
+    /// The recv side of a connection is exclusive — nine entry points that
+    /// cannot run concurrently — but `ConnCtx` is `Copy`, so exclusivity has to
+    /// be claimed rather than owned. Taking the half claims it; dropping the
+    /// half releases it. See `docs/connection-handle-ownership-design.md`.
+    pub(crate) recv_half_taken: Vec<bool>,
     /// Per-connection in-flight segmented-recv Mode A forward write (see
     /// [`ForwardWriteState`]). `Some` while a write to the sink is outstanding;
     /// enforces the one-write-in-flight invariant and keeps the write's backing
@@ -792,6 +799,7 @@ impl Driver {
                 .collect(),
             segment_pinned: vec![None; config.max_connections as usize],
             segment_reader_live: vec![false; config.max_connections as usize],
+            recv_half_taken: vec![false; config.max_connections as usize],
             forward_write: (0..config.max_connections).map(|_| None).collect(),
             forward_done: (0..config.max_connections).map(|_| None).collect(),
             forward_progress: (0..config.max_connections).map(|_| None).collect(),

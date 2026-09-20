@@ -851,6 +851,53 @@ impl ConnCtx {
 
     // ── Recv ─────────────────────────────────────────────────────────
 
+    /// Take this connection's exclusive **recv half**.
+    ///
+    /// The recv side of a connection is exclusive: nine entry points
+    /// (`with_data`, `with_bytes`, `segments`, `recv_owned_segment`,
+    /// `with_segments`, `forward_to`, `forward_to_conn`, `recv_ready` and
+    /// `with_data_result`) all drive one stream and none of them may run
+    /// concurrently with another. `ConnCtx` is `Copy`, so that exclusivity
+    /// cannot be owned — every rule has to be re-checked at run time, and the
+    /// ones that are missed are silent hangs (#423) or interleaved wire bytes.
+    ///
+    /// [`RecvHalf`] is neither `Copy` nor `Clone`, and its methods take
+    /// `&mut self`, so the borrow checker enforces what those checks
+    /// approximate. A second `segments()` while a reader is live stops being an
+    /// `EBUSY` you must remember to handle and becomes a compile error.
+    ///
+    /// Step 2 of `docs/connection-handle-ownership-design.md`: additive. The
+    /// equivalent `ConnCtx` methods still exist and still work, so nothing has
+    /// to migrate at once — but a connection whose half is out refuses the
+    /// segmented entry points on the `ConnCtx` path, so the two cannot be mixed
+    /// where that is checkable.
+    ///
+    /// # Errors
+    ///
+    /// - `EBUSY` — the half is already out for this connection.
+    /// - `EPIPE` — this handle is stale; the slot was closed and recycled.
+    ///
+    /// io_uring only, for now: the mio backend shares the recv entry points but
+    /// not the driver-side claim.
+    #[cfg(has_io_uring)]
+    pub fn take_recv(&self) -> io::Result<RecvHalf> {
+        with_state(|driver, _executor| {
+            if driver.connections.generation(self.conn_index) != self.generation {
+                return Err(io::Error::from_raw_os_error(libc::EPIPE));
+            }
+            let idx = self.conn_index as usize;
+            if driver.recv_half_taken[idx] {
+                return Err(io::Error::from_raw_os_error(libc::EBUSY));
+            }
+            driver.recv_half_taken[idx] = true;
+            Ok(())
+        })?;
+        Ok(RecvHalf {
+            conn: *self,
+            _not_send: PhantomData,
+        })
+    }
+
     /// Wait until recv data is available, then process it.
     ///
     /// The closure receives accumulated bytes and returns a [`ParseResult`]:
@@ -968,6 +1015,14 @@ impl ConnCtx {
             // drops (its `Drop` settles the hold back into the accumulator), so
             // a second reader or an owned-segment read alongside it conflicts.
             if driver.segment_reader_live[idx] {
+                return Err(io::Error::from_raw_os_error(libc::EBUSY));
+            }
+            // The recv half owns this connection's read side. Entering the
+            // segmented domain through the `ConnCtx` path behind its back is
+            // the mixing this design exists to stop, so refuse it wherever the
+            // signature can say so. (`with_data` and friends still cannot
+            // report it — that is what step 3 removes.)
+            if driver.recv_half_taken[idx] {
                 return Err(io::Error::from_raw_os_error(libc::EBUSY));
             }
             if exclusive {
@@ -2941,6 +2996,123 @@ impl<F: FnMut(Bytes) -> ParseResult + Unpin> Future for WithBytesFuture<F> {
             executor.recv_waiters[self.conn_index as usize] = true;
             Poll::Pending
         })
+    }
+}
+
+// ── RecvHalf — the exclusive read side of a connection ───────────────
+
+/// The exclusive **read side** of a connection.
+///
+/// Obtained from [`ConnCtx::take_recv`]. Neither `Copy` nor `Clone`, and every
+/// method takes `&mut self`, so the compiler enforces what the runtime
+/// otherwise has to re-check on every entry: exactly one reader, one delivery
+/// discipline, one forward at a time.
+///
+/// Concretely, these stop being runtime refusals you must remember to handle:
+///
+/// ```ignore
+/// let mut rx = conn.take_recv()?;
+/// let mut a = rx.segments()?;
+/// let mut b = rx.segments()?;   // compile error: `rx` is already borrowed
+/// ```
+///
+/// ```ignore
+/// let mut rx = conn.take_recv()?;
+/// let mut r = rx.segments()?;
+/// rx.with_data(|_| ParseResult::Consumed(0)).await;  // compile error
+/// ```
+///
+/// Dropping the half releases the claim, so a connection can be handed on.
+///
+/// Sends stay on [`ConnCtx`], which is still `Copy` — that half has its own
+/// exclusivity rule ("forward *or* send, not both") that this step does not yet
+/// enforce. See `docs/connection-handle-ownership-design.md`.
+///
+/// io_uring only, for now.
+#[cfg(has_io_uring)]
+pub struct RecvHalf {
+    conn: ConnCtx,
+    /// Same reason as [`ConnCtx`]: pinned to its owning worker thread.
+    _not_send: PhantomData<*const ()>,
+}
+
+#[cfg(has_io_uring)]
+impl RecvHalf {
+    /// The connection this half reads. Sends and close still go through it.
+    pub fn conn(&self) -> ConnCtx {
+        self.conn
+    }
+
+    /// See [`ConnCtx::with_data`].
+    pub fn with_data<F: FnMut(&[u8]) -> ParseResult>(&mut self, f: F) -> WithDataFuture<F> {
+        self.conn.with_data(f)
+    }
+
+    /// See [`ConnCtx::with_data_result`].
+    pub fn with_data_result<F: FnMut(&[u8]) -> ParseResult>(
+        &mut self,
+        f: F,
+    ) -> WithDataResultFuture<F> {
+        self.conn.with_data_result(f)
+    }
+
+    /// See [`ConnCtx::with_bytes`].
+    pub fn with_bytes<F: FnMut(Bytes) -> ParseResult>(&mut self, f: F) -> WithBytesFuture<F> {
+        self.conn.with_bytes(f)
+    }
+
+    /// See [`ConnCtx::segments`]. The returned reader borrows this half, so a
+    /// second one is a compile error rather than an `EBUSY`.
+    pub fn segments(&mut self) -> io::Result<SegmentReader<'_>> {
+        self.conn.segments()
+    }
+
+    /// See [`ConnCtx::recv_owned_segment`].
+    pub fn recv_owned_segment(&mut self) -> io::Result<RecvOwnedSegment> {
+        self.conn.recv_owned_segment()
+    }
+
+    /// See [`ConnCtx::with_segments`].
+    pub fn with_segments<F>(&mut self, f: F) -> WithSegmentsFuture<F>
+    where
+        F: FnMut(&SegChain<'_>) -> SegConsumed + Unpin,
+    {
+        self.conn.with_segments(f)
+    }
+
+    /// See [`ConnCtx::recv_ready`].
+    pub fn recv_ready(&mut self) -> RecvReadyFuture {
+        self.conn.recv_ready()
+    }
+
+    /// See [`ConnCtx::forward_to`].
+    pub fn forward_to<'a>(&'a mut self, sink: &'a SinkFd<'a>, len: usize) -> ForwardToFuture<'a> {
+        self.conn.forward_to(sink, len)
+    }
+
+    /// See [`ConnCtx::forward_to_conn`].
+    pub fn forward_to_conn<'a>(&'a mut self, sink: &'a ConnCtx, len: usize) -> ForwardToFuture<'a> {
+        self.conn.forward_to_conn(sink, len)
+    }
+}
+
+#[cfg(has_io_uring)]
+impl Drop for RecvHalf {
+    /// Release the claim so the connection can be handed on.
+    ///
+    /// Unconditional and generation-independent: a half that is gone must never
+    /// keep the next `take_recv()` locked out, and if the slot was recycled the
+    /// flag belongs to whoever holds it now — which is nobody, because
+    /// `close_connection` clears it.
+    fn drop(&mut self) {
+        let _ = try_with_state(|driver, _executor| {
+            if let Some(taken) = driver
+                .recv_half_taken
+                .get_mut(self.conn.conn_index as usize)
+            {
+                *taken = false;
+            }
+        });
     }
 }
 
