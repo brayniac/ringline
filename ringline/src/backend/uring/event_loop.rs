@@ -7876,6 +7876,7 @@ mod tests {
         );
         assert!(el.driver.segment_hold[conn_index as usize].is_empty());
 
+        use metriken::CounterGroupMetric;
         let before = crate::metrics::POOL
             .counter_value(crate::metrics::pool::SEGMENT_STRANDED_ADOPTED)
             .unwrap_or(0);
@@ -7889,7 +7890,15 @@ mod tests {
             fut.as_mut().poll(&mut cx)
         }) {
             std::task::Poll::Ready(Ok(Some(seg))) => seg,
-            other => panic!("reader parked on stranded bytes instead of adopting: {other:?}"),
+            // `RecvSegment` has no `Debug`, so describe the outcome instead of
+            // formatting it.
+            std::task::Poll::Ready(Ok(None)) => {
+                panic!("reader reported EOF instead of adopting the stranded bytes")
+            }
+            std::task::Poll::Ready(Err(e)) => panic!("reader errored: {e}"),
+            std::task::Poll::Pending => {
+                panic!("reader parked on stranded bytes instead of adopting them")
+            }
         };
         with_driver_state(&mut el, || {
             assert_eq!(&got[..], b"stranded", "the stranded bytes, in order");
