@@ -789,51 +789,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
     }
 
-    /// Commit pending provided-buffer returns to the kernel ring and re-arm
-    /// any connections whose multishot recv was parked on ENOBUFS.
-    ///
-    /// Safe because every bid pushed to `pending_replenish` had its contents
-    /// copied out (into the accumulator / recv sink / TLS state) before being
-    /// pushed — dispatch has fully completed, so no handler still references
-    /// these buffers. Zero-copy held buffers are tracked in
-    /// `pending_recv_bufs` / `recv_hold` slots and are never in this queue.
-    ///
-    /// Also called from the run loop right before the blocking wait: bids
-    /// released by tasks during the poll pass would otherwise sit uncommitted
-    /// (and starved connections parked) until the next unrelated CQE.
-    /// INVESTIGATION (#423): print the state that decides whether a parked
-    /// connection ever receives again. Not for merge.
-    fn debug_dump_423(&self) {
-        eprintln!(
-            "[423] provided_bufs.free={} pending_replenish={} recv_starved={:?}",
-            self.driver.provided_bufs.free(),
-            self.driver.pending_replenish.len(),
-            self.driver.recv_starved,
-        );
-        for idx in 0..self.driver.connections.capacity() {
-            let i = idx as u32;
-            let Some(c) = self.driver.connections.get(i) else {
-                continue;
-            };
-            if !matches!(c.lifecycle, Lifecycle::Open) {
-                continue;
-            }
-            eprintln!(
-                "[423]   conn {i}: arm={:?} multishot_armed={} read={:?} domain={:?} \
-                 hold={} starved={} fallback_inflight={} recv_waiter={} owner_task={:?}",
-                c.recv_arm,
-                c.recv_multishot_armed,
-                c.read,
-                self.driver.recv_domain[idx],
-                self.driver.segment_hold[idx].len(),
-                self.driver.recv_starved.contains(&i),
-                self.driver.recv_fallback_inflight[idx],
-                self.executor.recv_waiters[idx],
-                self.executor.owner_task[idx],
-            );
-        }
-    }
-
     /// INVESTIGATION (#423): print the state that decides whether a parked
     /// connection ever receives again. Not for merge.
     fn debug_dump_423(&self) {
