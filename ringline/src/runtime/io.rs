@@ -814,6 +814,20 @@ impl crate::guard::SendGuard for AccumulatorGuard {
     }
 }
 
+/// Which route is entering the segmented domain.
+///
+/// The `RecvHalf` claim must block the `ConnCtx` route and *not* the half's own
+/// route — the half holds the claim by construction, so treating it like any
+/// other caller made `RecvHalf::segments()` permanently `EBUSY`.
+#[cfg(has_io_uring)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SegmentedEntry {
+    /// Through `ConnCtx`. Refused while a `RecvHalf` owns the read side.
+    ViaConn,
+    /// Through the `RecvHalf` that already owns the read side.
+    ViaHalf,
+}
+
 impl ConnCtx {
     /// Create a new ConnCtx for the given connection.
     pub(crate) fn new(conn_index: u32, generation: u32) -> Self {
@@ -991,7 +1005,7 @@ impl ConnCtx {
     /// not. Ordering matches it: accumulator bytes are the oldest and go to the
     /// front, the pinned buffer is the newest and goes to the back.
     #[cfg(has_io_uring)]
-    fn enter_segmented_domain(&self, exclusive: bool) -> io::Result<()> {
+    fn enter_segmented_domain(&self, exclusive: bool, via: SegmentedEntry) -> io::Result<()> {
         with_state(|driver, _executor| {
             let idx = self.conn_index as usize;
             // A stale handle must not touch the slot's new occupant. Without
@@ -1075,7 +1089,12 @@ impl ConnCtx {
     /// io_uring only — segmented delivery is backed by the provided-buffer ring.
     #[cfg(has_io_uring)]
     pub fn segments(&self) -> io::Result<SegmentReader<'_>> {
-        self.enter_segmented_domain(true)?;
+        self.segments_via(SegmentedEntry::ViaConn)
+    }
+
+    #[cfg(has_io_uring)]
+    pub(crate) fn segments_via(&self, via: SegmentedEntry) -> io::Result<SegmentReader<'_>> {
+        self.enter_segmented_domain(true, via)?;
         Ok(SegmentReader {
             conn_index: self.conn_index,
             generation: self.generation,
@@ -1116,7 +1135,15 @@ impl ConnCtx {
     /// io_uring only — segmented delivery is backed by the provided-buffer ring.
     #[cfg(has_io_uring)]
     pub fn recv_owned_segment(&self) -> io::Result<RecvOwnedSegment> {
-        self.enter_segmented_domain(false)?;
+        self.recv_owned_segment_via(SegmentedEntry::ViaConn)
+    }
+
+    #[cfg(has_io_uring)]
+    pub(crate) fn recv_owned_segment_via(
+        &self,
+        via: SegmentedEntry,
+    ) -> io::Result<RecvOwnedSegment> {
+        self.enter_segmented_domain(false, via)?;
         Ok(RecvOwnedSegment {
             conn_index: self.conn_index,
             generation: self.generation,
@@ -3064,12 +3091,12 @@ impl RecvHalf {
     /// See [`ConnCtx::segments`]. The returned reader borrows this half, so a
     /// second one is a compile error rather than an `EBUSY`.
     pub fn segments(&mut self) -> io::Result<SegmentReader<'_>> {
-        self.conn.segments()
+        self.conn.segments_via(SegmentedEntry::ViaHalf)
     }
 
     /// See [`ConnCtx::recv_owned_segment`].
     pub fn recv_owned_segment(&mut self) -> io::Result<RecvOwnedSegment> {
-        self.conn.recv_owned_segment()
+        self.conn.recv_owned_segment_via(SegmentedEntry::ViaHalf)
     }
 
     /// See [`ConnCtx::with_segments`].

@@ -7864,6 +7864,68 @@ mod tests {
         assert_eq!(el.driver.provided_bufs.free(), entries - 1);
     }
 
+    /// The half must actually be able to read.
+    ///
+    /// Regression for a self-inflicted deadlock: the `ConnCtx` segmented path
+    /// refuses while a `RecvHalf` is out, and `RecvHalf::segments()` delegated
+    /// straight to it — so the half, which holds that claim by construction,
+    /// refused itself and every segmented read through it returned `EBUSY`.
+    /// The full gate passed anyway, because nothing exercised the happy path.
+    #[test]
+    fn recv_half_can_actually_read_segments() {
+        let mut el = make_test_loop_with_config(config_with_reserve(16));
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
+        deliver_segment(&mut el, conn_index, 0, b"hello");
+
+        let conn = ConnCtx::new(conn_index, generation);
+        let mut half = with_driver_state(&mut el, || conn.take_recv()).expect("take_recv");
+
+        let waker = noop_waker();
+        let mut reader = with_driver_state(&mut el, || half.segments())
+            .expect("the half must be able to enter the segmented domain it owns");
+        let mut fut = std::pin::pin!(reader.next());
+        let seg = match with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            fut.as_mut().poll(&mut cx)
+        }) {
+            std::task::Poll::Ready(Ok(Some(s))) => s,
+            std::task::Poll::Ready(Ok(None)) => panic!("half read EOF instead of the segment"),
+            std::task::Poll::Ready(Err(e)) => panic!("half read errored: {e}"),
+            std::task::Poll::Pending => panic!("half parked with a segment held"),
+        };
+        with_driver_state(&mut el, || assert_eq!(&seg[..], b"hello"));
+        with_driver_state(&mut el, || drop(seg));
+        drop(reader);
+        with_driver_state(&mut el, || drop(half));
+    }
+
+    /// The owned-segment route through the half must work too.
+    #[test]
+    fn recv_half_can_actually_read_owned_segments() {
+        let mut el = make_test_loop_with_config(config_with_reserve(16));
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
+        deliver_segment(&mut el, conn_index, 0, b"owned");
+
+        let conn = ConnCtx::new(conn_index, generation);
+        let mut half = with_driver_state(&mut el, || conn.take_recv()).expect("take_recv");
+        let waker = noop_waker();
+        let mut fut = std::pin::pin!(
+            with_driver_state(&mut el, || half.recv_owned_segment())
+                .expect("the half must be able to read owned segments")
+        );
+        match with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            fut.as_mut().poll(&mut cx)
+        }) {
+            std::task::Poll::Ready(Ok(Some(b))) => assert_eq!(&b[..], b"owned"),
+            other => panic!("expected owned bytes through the half, got {other:?}"),
+        }
+    }
+
     /// `take_recv` hands out the read side exactly once, and dropping it hands
     /// the connection back.
     #[test]
