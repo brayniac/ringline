@@ -268,6 +268,9 @@ pub use runtime::io::ForwardToFuture;
 pub use runtime::io::JoinHandle;
 /// Result of a parse closure: consumed bytes or need more data.
 pub use runtime::io::ParseResult;
+/// The exclusive read side of a connection, from [`ConnCtx::take_recv()`].
+#[cfg(has_io_uring)]
+pub use runtime::io::RecvHalf;
 /// Future returned by [`ConnCtx::recv_owned_segment()`] (segmented recv, Mode C).
 #[cfg(has_io_uring)]
 pub use runtime::io::RecvOwnedSegment;

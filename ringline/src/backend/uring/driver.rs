@@ -353,6 +353,13 @@ pub(crate) struct Driver {
     /// refuses with `EBUSY` while this is set, rather than letting the conflict
     /// surface later as a stranded read (#423, #427).
     pub(crate) segment_reader_live: Vec<bool>,
+    /// The connection's [`RecvHalf`] has been taken.
+    ///
+    /// The recv side of a connection is exclusive — nine entry points that
+    /// cannot run concurrently — but `ConnCtx` is `Copy`, so exclusivity has to
+    /// be claimed rather than owned. Taking the half claims it; dropping the
+    /// half releases it. See `docs/connection-handle-ownership-design.md`.
+    pub(crate) recv_half_taken: Vec<bool>,
     /// Per-connection in-flight segmented-recv Mode A forward write (see
     /// [`ForwardWriteState`]). `Some` while a write to the sink is outstanding;
     /// enforces the one-write-in-flight invariant and keeps the write's backing
@@ -792,6 +799,7 @@ impl Driver {
                 .collect(),
             segment_pinned: vec![None; config.max_connections as usize],
             segment_reader_live: vec![false; config.max_connections as usize],
+            recv_half_taken: vec![false; config.max_connections as usize],
             forward_write: (0..config.max_connections).map(|_| None).collect(),
             forward_done: (0..config.max_connections).map(|_| None).collect(),
             forward_progress: (0..config.max_connections).map(|_| None).collect(),
@@ -1432,6 +1440,28 @@ impl Driver {
             SinkTarget::Conn { index, .. } => unsafe {
                 self.ring.submit_forward_writev_conn(index, hdr_ptr, ud)
             },
+        }
+    }
+
+    /// Clear the recv-side exclusivity claims for a slot that is being reused.
+    ///
+    /// `RecvHalf::drop` and `SegmentReader::drop` release their own claims, but
+    /// both go through `try_with_state`, which is a **no-op during unguarded
+    /// teardown** — `executor.remove_connection` drops a parked task's future
+    /// with `CURRENT_DRIVER` unset. A claim can therefore outlive its claimant,
+    /// and since the flags are indexed by slot rather than by generation, the
+    /// *next* occupant would inherit it and have its reads refused with `EBUSY`
+    /// forever.
+    ///
+    /// Clearing here, at the recycle point, makes that impossible regardless of
+    /// how the previous occupant died.
+    pub(crate) fn clear_recv_claims(&mut self, conn_index: u32) {
+        let idx = conn_index as usize;
+        if let Some(live) = self.segment_reader_live.get_mut(idx) {
+            *live = false;
+        }
+        if let Some(taken) = self.recv_half_taken.get_mut(idx) {
+            *taken = false;
         }
     }
 
@@ -2689,6 +2719,7 @@ impl Driver {
                         if let Some(ref mut tls_table) = self.tls_table {
                             tls_table.remove(conn_index);
                         }
+                        self.clear_recv_claims(conn_index);
                         self.connections.release(conn_index);
                     }
                     _ => {}
