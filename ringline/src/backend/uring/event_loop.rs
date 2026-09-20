@@ -1252,6 +1252,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // A completion without `IORING_CQE_F_MORE` means the kernel terminated
         // this multishot recv. Record that the recv is no longer armed so the
         // close path knows it need not cancel it (a re-arm below sets it back).
+        self.trace_423(
+            if has_more { "cqe+more" } else { "cqe-last" },
+            conn_index,
+            result as i64,
+        );
         if !has_more && let Some(cs) = self.driver.connections.get_mut(conn_index) {
             cs.recv_multishot_armed = false;
             self.trace_423("term", conn_index, result as i64);
@@ -1405,6 +1410,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 } else {
                     crate::tls::PlaintextSink::Accumulator(&mut self.driver.accumulators)
                 };
+                let hold_before = self.driver.segment_hold[conn_index as usize].len();
+                let _ = hold_before;
                 let result = crate::tls::feed_tls_recv(
                     tls_table,
                     sink,
