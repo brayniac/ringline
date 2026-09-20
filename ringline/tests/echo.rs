@@ -7419,13 +7419,20 @@ fn a_second_forward_on_one_connection_is_refused_with_ebusy() {
 #[cfg(has_io_uring)]
 #[test]
 fn split_halves_echo_round_trip() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
+    // Bind :0 and read the resolved port back, rather than going through
+    // `free_port()`. That helper probes with a throwaway listener and drops it
+    // before the server binds, so another process can take the port in the
+    // window between — which is exactly the `AddrInUse` launch failure this
+    // suite hits under parallel load. Letting the server own the bind closes
+    // the window instead of narrowing it.
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<SplitEcho>()
         .expect("launch failed");
+    let addr = shutdown
+        .bound_addr()
+        .expect("bound_addr after a TCP bind")
+        .to_string();
 
     wait_for_server(&addr);
 
