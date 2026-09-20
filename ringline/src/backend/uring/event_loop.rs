@@ -7119,8 +7119,11 @@ mod tests {
         // the conflict is reported where it is caused, before a second reader
         // exists at all (#427 step 1). Previously this surfaced one poll later,
         // as an error from `next()`.
-        let err_b = with_driver_state(&mut el, || conn.segments())
-            .expect_err("a second reader must be refused while A is live");
+        // `expect_err` would require `SegmentReader: Debug`, which it is not.
+        let err_b = match with_driver_state(&mut el, || conn.segments()) {
+            Err(e) => e,
+            Ok(_) => panic!("a second reader must be refused while A is live"),
+        };
         assert_eq!(
             err_b.raw_os_error(),
             Some(libc::EBUSY),
