@@ -791,7 +791,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
     /// INVESTIGATION (#423): print the state that decides whether a parked
     /// connection ever receives again. Not for merge.
-    fn debug_dump_423(&self) {
+    fn debug_dump_423(&mut self) {
         eprintln!(
             "[423] provided_bufs.free={} pending_replenish={} recv_starved={:?}",
             self.driver.provided_bufs.free(),
@@ -800,23 +800,47 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         );
         for idx in 0..self.driver.recv_domain.len() {
             let i = idx as u32;
-            let Some(c) = self.driver.connections.get(i) else {
+            let Some((arm, armed, read, open)) = self.driver.connections.get(i).map(|c| {
+                (
+                    c.recv_arm,
+                    c.recv_multishot_armed,
+                    c.read,
+                    matches!(c.lifecycle, Lifecycle::Open),
+                )
+            }) else {
                 continue;
             };
-            if !matches!(c.lifecycle, Lifecycle::Open) {
+            if !open {
                 continue;
             }
             eprintln!(
                 "[423]   conn {i}: arm={:?} armed={} read={:?} domain={:?} hold={} starved={} fallback={} waiter={}",
-                c.recv_arm,
-                c.recv_multishot_armed,
-                c.read,
+                arm,
+                armed,
+                read,
                 self.driver.recv_domain[idx],
                 self.driver.segment_hold[idx].len(),
                 self.driver.recv_starved.contains(&i),
                 self.driver.recv_fallback_inflight[idx],
                 self.executor.recv_waiters[idx],
             );
+            // Where are the missing bytes? Two places are possible and they
+            // imply opposite fixes: still unread in the kernel (the armed flag
+            // is lying — a ghost multishot), or inside rustls (decrypted or
+            // decryptable but never drained, with no CQE left to trigger it).
+            if let Some(tls) = self.driver.tls_table.as_mut()
+                && let Some(tc) = tls.get_mut(i)
+                && let Some(b) = tc.conn.as_buffered_mut()
+            {
+                eprintln!(
+                    "[423]     rustls: plaintext_to_read={} wants_read={} handshaking={}",
+                    b.process_new_packets()
+                        .map(|st| st.plaintext_bytes_to_read())
+                        .unwrap_or(usize::MAX),
+                    b.wants_read(),
+                    b.is_handshaking(),
+                );
+            }
         }
     }
 
