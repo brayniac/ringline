@@ -924,6 +924,48 @@ impl ConnCtx {
         }
     }
 
+    /// Enter the segmented recv domain, **adopting bytes that already arrived**.
+    ///
+    /// Flipping `recv_domain` is not enough. Anything received before the
+    /// reader was installed is already in the `RecvAccumulator` (or pinned as
+    /// the zero-copy `pending_recv_bufs` slot), and a segmented reader only
+    /// ever looks at `segment_hold` — so without this those bytes are
+    /// invisible forever: the reader parks, the data sits in the accumulator,
+    /// and every health signal reads normal (ring full, multishot live, no
+    /// errors). That is #423.
+    ///
+    /// The race is easy to lose and hard to see. A handler installs its reader
+    /// on the task's first poll, which is strictly after `on_accept`; under TLS
+    /// the handshake round-trip all but guarantees application data is already
+    /// in flight by then. How much is stranded depends purely on timing, which
+    /// is why the symptom was an intermittent hang at a varying offset.
+    ///
+    /// `arm_forward_source` (Mode A) has always done this; Modes B and C did
+    /// not. Ordering matches it: accumulator bytes are the oldest and go to the
+    /// front, the pinned buffer is the newest and goes to the back.
+    #[cfg(has_io_uring)]
+    fn enter_segmented_domain(&self) {
+        with_state(|driver, _executor| {
+            let idx = self.conn_index as usize;
+            driver.recv_domain[idx] = crate::recv::domain::RecvDomain::Segmented;
+            if !driver.accumulators.is_empty(self.conn_index) {
+                let buffered = driver.accumulators.take_frozen(self.conn_index);
+                driver.segment_hold[idx].push_front(crate::backend::HeldRecvBuf::Owned(buffered));
+            }
+            if let Some(pending) = driver.pending_recv_bufs[idx].take() {
+                // SAFETY: the slot owns an unreplenished provided buffer with
+                // `len` bytes received into it; taking the slot transfers that
+                // ownership here, and the bid goes back at the same moment the
+                // copy is made.
+                let data = unsafe { std::slice::from_raw_parts(pending.ptr, pending.len as usize) };
+                driver.segment_hold[idx].push_back(crate::backend::HeldRecvBuf::Owned(
+                    Bytes::copy_from_slice(data),
+                ));
+                driver.pending_replenish.push(pending.bid);
+            }
+        });
+    }
+
     /// Borrow a segmented-recv reader (Mode B "Borrow", the sound lending-iterator
     /// face — see `docs/segmented-recv-design.md`).
     ///
@@ -941,10 +983,7 @@ impl ConnCtx {
     /// io_uring only — segmented delivery is backed by the provided-buffer ring.
     #[cfg(has_io_uring)]
     pub fn segments(&self) -> SegmentReader<'_> {
-        with_state(|driver, _executor| {
-            driver.recv_domain[self.conn_index as usize] =
-                crate::recv::domain::RecvDomain::Segmented;
-        });
+        self.enter_segmented_domain();
         SegmentReader {
             conn_index: self.conn_index,
             generation: self.generation,
@@ -975,10 +1014,7 @@ impl ConnCtx {
     /// io_uring only — segmented delivery is backed by the provided-buffer ring.
     #[cfg(has_io_uring)]
     pub fn recv_owned_segment(&self) -> RecvOwnedSegment {
-        with_state(|driver, _executor| {
-            driver.recv_domain[self.conn_index as usize] =
-                crate::recv::domain::RecvDomain::Segmented;
-        });
+        self.enter_segmented_domain();
         RecvOwnedSegment {
             conn_index: self.conn_index,
             generation: self.generation,
