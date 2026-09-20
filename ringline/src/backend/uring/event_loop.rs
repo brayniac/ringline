@@ -7980,6 +7980,48 @@ mod tests {
         );
     }
 
+    /// A stale half must not steal the *new* occupant's claim.
+    ///
+    /// The claim is per slot and a half can outlive its connection (`spawn`
+    /// needs only `'static`, not `Send`). If the slot recycles and the new
+    /// occupant takes its own half, a stale half dropping afterwards must not
+    /// clear that claim — doing so would permit a second `RecvHalf` on a live
+    /// connection, which is the whole thing this type prevents.
+    #[test]
+    fn a_stale_recv_half_drop_does_not_steal_the_new_claim() {
+        let mut el = make_test_loop_with_config(config_with_reserve(16));
+        let conn_index = accept_connection(&mut el);
+        let old_gen = el.driver.connections.generation(conn_index);
+        let old_conn = ConnCtx::new(conn_index, old_gen);
+        let stale_half = with_driver_state(&mut el, || old_conn.take_recv()).expect("take_recv");
+
+        // Recycle the slot, as teardown does.
+        el.driver.clear_recv_claims(conn_index);
+        el.driver.connections.release(conn_index);
+        let new_index = accept_connection(&mut el);
+        assert_eq!(new_index, conn_index, "the test needs the slot reused");
+        let new_gen = el.driver.connections.generation(conn_index);
+        assert_ne!(new_gen, old_gen, "release must bump the generation");
+
+        // New occupant claims the read side.
+        let new_conn = ConnCtx::new(conn_index, new_gen);
+        let _new_half = with_driver_state(&mut el, || new_conn.take_recv())
+            .expect("the new occupant takes its own half");
+        assert!(el.driver.recv_half_taken[conn_index as usize]);
+
+        // The stale half finally drops.
+        with_driver_state(&mut el, || drop(stale_half));
+
+        assert!(
+            el.driver.recv_half_taken[conn_index as usize],
+            "a stale half must not release the new occupant's claim"
+        );
+        match with_driver_state(&mut el, || new_conn.take_recv()) {
+            Err(e) => assert_eq!(e.raw_os_error(), Some(libc::EBUSY)),
+            Ok(_) => panic!("two live RecvHalfs on one connection"),
+        }
+    }
+
     /// A claim must not outlive the slot it was made on.
     ///
     /// `RecvHalf::drop` and `SegmentReader::drop` both release through

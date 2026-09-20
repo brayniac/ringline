@@ -900,7 +900,7 @@ impl ConnCtx {
                 return Err(io::Error::from_raw_os_error(libc::EPIPE));
             }
             let idx = self.conn_index as usize;
-            if driver.recv_half_taken[idx] {
+            if via == SegmentedEntry::ViaConn && driver.recv_half_taken[idx] {
                 return Err(io::Error::from_raw_os_error(libc::EBUSY));
             }
             driver.recv_half_taken[idx] = true;
@@ -3031,11 +3031,27 @@ impl<F: FnMut(Bytes) -> ParseResult + Unpin> Future for WithBytesFuture<F> {
 /// The exclusive **read side** of a connection.
 ///
 /// Obtained from [`ConnCtx::take_recv`]. Neither `Copy` nor `Clone`, and every
-/// method takes `&mut self`, so the compiler enforces what the runtime
-/// otherwise has to re-check on every entry: exactly one reader, one delivery
-/// discipline, one forward at a time.
+/// method takes `&mut self`.
 ///
-/// Concretely, these stop being runtime refusals you must remember to handle:
+/// # How much the compiler actually enforces
+///
+/// `&mut self` only prevents a second call while the **return value carries the
+/// borrow**. Three methods do that, and for them the conflict is a compile
+/// error rather than a runtime refusal:
+///
+/// - [`segments`](Self::segments) — returns `SegmentReader<'_>`
+/// - [`forward_to`](Self::forward_to) / [`forward_to_conn`](Self::forward_to_conn)
+///   — return `ForwardToFuture<'_>`
+///
+/// The rest — `with_data`, `with_data_result`, `with_bytes`, `with_segments`,
+/// `recv_ready`, `recv_owned_segment` — return futures built from
+/// `conn_index`/`generation` by value, with no lifetime parameter, so the
+/// borrow ends at the end of the call expression and two of them can be held at
+/// once. Those still rely on the runtime checks. Giving them a borrow-carrying
+/// wrapper is what would make the type enforce the whole rule; until then this
+/// section is the honest statement of what it buys.
+///
+/// The three that are enforced:
 ///
 /// ```ignore
 /// let mut rx = conn.take_recv()?;
@@ -3102,7 +3118,7 @@ impl RecvHalf {
     /// See [`ConnCtx::with_segments`].
     pub fn with_segments<F>(&mut self, f: F) -> WithSegmentsFuture<F>
     where
-        F: FnMut(&SegChain<'_>) -> SegConsumed + Unpin,
+        F: FnMut(&SegChain<'_>) -> SegConsumed,
     {
         self.conn.with_segments(f)
     }
@@ -3113,26 +3129,42 @@ impl RecvHalf {
     }
 
     /// See [`ConnCtx::forward_to`].
-    pub fn forward_to<'a>(&'a mut self, sink: &'a SinkFd<'a>, len: usize) -> ForwardToFuture<'a> {
+    pub fn forward_to<'h, 's: 'h>(
+        &'h mut self,
+        sink: &'s SinkFd<'s>,
+        len: usize,
+    ) -> ForwardToFuture<'h> {
         self.conn.forward_to(sink, len)
     }
 
     /// See [`ConnCtx::forward_to_conn`].
-    pub fn forward_to_conn<'a>(&'a mut self, sink: &'a ConnCtx, len: usize) -> ForwardToFuture<'a> {
+    pub fn forward_to_conn<'h, 's: 'h>(
+        &'h mut self,
+        sink: &'s ConnCtx,
+        len: usize,
+    ) -> ForwardToFuture<'h> {
         self.conn.forward_to_conn(sink, len)
     }
 }
 
 #[cfg(has_io_uring)]
 impl Drop for RecvHalf {
-    /// Release the claim so the connection can be handed on.
+    /// Release the claim, **if it is still ours**.
     ///
-    /// Unconditional and generation-independent: a half that is gone must never
-    /// keep the next `take_recv()` locked out, and if the slot was recycled the
-    /// flag belongs to whoever holds it now — which is nobody, because
-    /// `close_connection` clears it.
+    /// The claim is per *slot*, and a half can outlive its connection:
+    /// [`spawn`] requires only `'static`, not `Send`, so a standalone task can
+    /// hold one past teardown. If the slot has since been recycled and its new
+    /// occupant has taken its own half, clearing unconditionally would steal
+    /// that claim and permit a second `RecvHalf` on a live connection.
+    ///
+    /// `Driver::clear_recv_claims` at the recycle point is what guarantees a
+    /// fresh slot starts clean; this only releases a claim of our own
+    /// generation.
     fn drop(&mut self) {
         let _ = try_with_state(|driver, _executor| {
+            if driver.connections.generation(self.conn.conn_index) != self.conn.generation {
+                return;
+            }
             if let Some(taken) = driver
                 .recv_half_taken
                 .get_mut(self.conn.conn_index as usize)
@@ -3209,10 +3241,15 @@ impl SegmentReader<'_> {
 #[cfg(has_io_uring)]
 impl Drop for SegmentReader<'_> {
     fn drop(&mut self) {
-        // Release the exclusivity claim first, and unconditionally: a reader
-        // that is gone must never keep the next `segments()` locked out, and
-        // the settle below has early returns.
+        // Release the exclusivity claim before the settle below, which has
+        // early returns. Generation-gated for the same reason as
+        // `RecvHalf::drop`: the flag is per slot, a reader can outlive its
+        // connection inside a standalone task, and clearing after the slot was
+        // recycled would steal the new occupant's claim.
         let _ = try_with_state(|driver, _executor| {
+            if driver.connections.generation(self.conn_index) != self.generation {
+                return;
+            }
             if let Some(live) = driver.segment_reader_live.get_mut(self.conn_index as usize) {
                 *live = false;
             }
