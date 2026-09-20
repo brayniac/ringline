@@ -379,6 +379,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 let mut ctx = unsafe { (*driver_ptr).make_ctx() };
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     handler.on_tick(&mut ctx);
+                }
+                if crate::DEBUG_DUMP_STATE.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                    self.debug_dump_423();
+                }
+                {
                 }));
                 if result.is_err() {
                     eprintln!("ringline: handler on_tick panicked; continuing");
@@ -798,6 +803,39 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// Also called from the run loop right before the blocking wait: bids
     /// released by tasks during the poll pass would otherwise sit uncommitted
     /// (and starved connections parked) until the next unrelated CQE.
+    /// INVESTIGATION (#423): print the state that decides whether a parked
+    /// connection ever receives again. Not for merge.
+    fn debug_dump_423(&self) {
+        eprintln!(
+            "[423] provided_bufs.free={} pending_replenish={} recv_starved={:?}",
+            self.driver.provided_bufs.free(),
+            self.driver.pending_replenish.len(),
+            self.driver.recv_starved,
+        );
+        for idx in 0..self.driver.connections.capacity() {
+            let i = idx as u32;
+            let Some(c) = self.driver.connections.get(i) else {
+                continue;
+            };
+            if !matches!(c.lifecycle, Lifecycle::Open) {
+                continue;
+            }
+            eprintln!(
+                "[423]   conn {i}: arm={:?} multishot_armed={} read={:?} domain={:?} \
+                 hold={} starved={} fallback_inflight={} recv_waiter={} owner_task={:?}",
+                c.recv_arm,
+                c.recv_multishot_armed,
+                c.read,
+                self.driver.recv_domain[idx],
+                self.driver.segment_hold[idx].len(),
+                self.driver.recv_starved.contains(&i),
+                self.driver.recv_fallback_inflight[idx],
+                self.executor.recv_waiters[idx],
+                self.executor.owner_task[idx],
+            );
+        }
+    }
+
     fn flush_replenish_and_rearm(&mut self) {
         // Starved connections holding a zero-copy single-buffer hold
         // (`pending_recv_bufs`) with data the parser hasn't consumed: flush

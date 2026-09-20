@@ -93,6 +93,9 @@ fn read_until_full_or_stalled(
                     // if it moves, the loop is alive and the connection is
                     // never re-armed (or the reader never woken).
                     let t0 = TLS_SEG_TICKS.load(std::sync::atomic::Ordering::Relaxed);
+                    // Ask the worker to print the state that decides whether a
+                    // parked connection ever receives again.
+                    ringline::DEBUG_DUMP_STATE.store(true, std::sync::atomic::Ordering::Relaxed);
                     std::thread::sleep(Duration::from_secs(1));
                     let t1 = TLS_SEG_TICKS.load(std::sync::atomic::Ordering::Relaxed);
                     panic!(

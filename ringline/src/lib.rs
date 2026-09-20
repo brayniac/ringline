@@ -165,6 +165,11 @@ pub mod metrics;
 // INVESTIGATION (#423): temporary re-export so an integration test can read the
 // abandoned-ciphertext counters. Not for merge.
 pub use crate::tls::{TLS_ABANDONED_BYTES, TLS_ABANDONED_EVENTS};
+
+/// INVESTIGATION (#423): set to request a one-shot event-loop state dump on
+/// the next iteration, printed from the worker thread. Not for merge.
+pub static DEBUG_DUMP_STATE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 #[cfg_attr(not(has_io_uring), allow(dead_code))]
 pub mod nvme;
 pub mod process;
