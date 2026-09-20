@@ -87,9 +87,23 @@ fn read_until_full_or_stalled(
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 if last_progress.elapsed() >= stall_budget {
+                    // Is the worker loop still turning while the client sees
+                    // nothing? Sample the tick counter across a second: if it
+                    // does not move the loop is wedged in `submit_and_wait`;
+                    // if it moves, the loop is alive and the connection is
+                    // never re-armed (or the reader never woken).
+                    let t0 = TLS_SEG_TICKS.load(std::sync::atomic::Ordering::Relaxed);
+                    std::thread::sleep(Duration::from_secs(1));
+                    let t1 = TLS_SEG_TICKS.load(std::sync::atomic::Ordering::Relaxed);
                     panic!(
                         "{what}: no progress for {stall_budget:?} at {total}/{want} bytes\n\
+                         worker loop ticks: {t0} -> {t1} (delta {})\n\
+                         handler: segments={} bytes={} send_errors={}\n\
                          runtime counters at the stall:\n{}",
+                        t1 - t0,
+                        TLS_SEG_SEGMENTS.load(std::sync::atomic::Ordering::Relaxed),
+                        TLS_SEG_BYTES.load(std::sync::atomic::Ordering::Relaxed),
+                        TLS_SEG_SEND_ERRS.load(std::sync::atomic::Ordering::Relaxed),
                         stall_counters()
                     );
                 }
@@ -755,8 +769,22 @@ static TLS_SEG_SAW_EOF: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 #[cfg(has_io_uring)]
 struct TlsSegmentedHandler;
 
+static TLS_SEG_TICKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TLS_SEG_SEGMENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TLS_SEG_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TLS_SEG_SEND_ERRS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 #[cfg(has_io_uring)]
 impl AsyncEventHandler for TlsSegmentedHandler {
+    /// Runs on the worker thread every event-loop iteration. If this stops
+    /// advancing while the client sees no progress, the loop is wedged in
+    /// `submit_and_wait`; if it keeps advancing, the loop is alive and the
+    /// connection is simply never re-armed or the reader never woken. Those
+    /// are different bugs.
+    fn on_tick(&mut self, _ctx: &mut ringline::DriverCtx<'_>) {
+        TLS_SEG_TICKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     #[allow(clippy::manual_async_fn)]
     fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
         async move {
@@ -769,7 +797,12 @@ impl AsyncEventHandler for TlsSegmentedHandler {
                     Ok(Some(seg)) => {
                         // Echo each decrypted plaintext segment straight back;
                         // the client reassembles and byte-compares.
-                        let _ = conn.send_nowait(&seg);
+                        TLS_SEG_SEGMENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        TLS_SEG_BYTES
+                            .fetch_add(seg.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                        if conn.send_nowait(&seg).is_err() {
+                            TLS_SEG_SEND_ERRS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                     }
                     Ok(None) => {
                         // Clean TLS close surfaced as EOF (not a hang).
