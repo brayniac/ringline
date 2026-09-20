@@ -791,6 +791,16 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
     /// INVESTIGATION (#423): print the state that decides whether a parked
     /// connection ever receives again. Not for merge.
+    /// INVESTIGATION (#423): record a multishot arm/terminate transition.
+    /// In-memory, because stderr tracing perturbs this race away.
+    fn trace_423(&mut self, what: &'static str, conn: u32, detail: i64) {
+        let mut t = crate::TRACE_423.lock().unwrap();
+        if t.len() >= 512 {
+            t.remove(0);
+        }
+        t.push((what, conn, detail));
+    }
+
     fn debug_dump_423(&mut self) {
         eprintln!(
             "[423] provided_bufs.free={} pending_replenish={} recv_starved={:?}",
@@ -798,6 +808,16 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.driver.pending_replenish.len(),
             self.driver.recv_starved,
         );
+        {
+            let t = crate::TRACE_423.lock().unwrap();
+            let tail: Vec<String> = t
+                .iter()
+                .rev()
+                .take(24)
+                .map(|(w, c, d)| format!("{w}(c{c},{d})"))
+                .collect();
+            eprintln!("[423] last transitions (newest first): {}", tail.join(" "));
+        }
         for idx in 0..self.driver.recv_domain.len() {
             let i = idx as u32;
             let Some((arm, armed, read, open)) = self.driver.connections.get(i).map(|c| {
@@ -939,6 +959,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // return, so no further pass with `replenished`. Forever.
             if replenished || self.driver.provided_bufs.free() > 0 {
                 self.driver.recv_starved.swap_remove(i);
+                self.trace_423("arm:starved", conn_index, 0);
                 let generation = self.driver.connections.generation(conn_index);
                 if self
                     .driver
@@ -1227,6 +1248,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // close path knows it need not cancel it (a re-arm below sets it back).
         if !has_more && let Some(cs) = self.driver.connections.get_mut(conn_index) {
             cs.recv_multishot_armed = false;
+            self.trace_423("term", conn_index, result as i64);
         }
 
         if result <= 0 {
@@ -1262,6 +1284,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     self.driver.recv_starved.push(conn_index);
                     self.driver.recv_park_count += 1;
                     metrics::POOL.increment(metrics::pool::RECV_PARKED);
+                    self.trace_423("park:enobufs", conn_index, 0);
                 }
             } else if errno == libc::ECANCELED {
                 // A cancel terminated the multishot. Whatever was armed is gone
@@ -1673,6 +1696,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 self.driver.close_connection(conn_index);
             } else if let Some(cs) = self.driver.connections.get_mut(conn_index) {
                 cs.recv_multishot_armed = true;
+                self.trace_423("arm:recvpath", conn_index, 0);
             }
         }
     }

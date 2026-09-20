@@ -168,6 +168,10 @@ pub use crate::tls::{TLS_ABANDONED_BYTES, TLS_ABANDONED_EVENTS};
 
 /// INVESTIGATION (#423): set to request a one-shot event-loop state dump on
 /// the next iteration, printed from the worker thread. Not for merge.
+/// INVESTIGATION (#423): in-memory transition trace. Not for merge.
+pub static TRACE_423: std::sync::Mutex<Vec<(&'static str, u32, i64)>> =
+    std::sync::Mutex::new(Vec::new());
+
 pub static DEBUG_DUMP_STATE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 #[cfg_attr(not(has_io_uring), allow(dead_code))]
