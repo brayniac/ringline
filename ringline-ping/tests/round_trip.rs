@@ -129,7 +129,7 @@ impl AsyncEventHandler for PingClientHandler {
                 }
             };
 
-            let mut client = ringline_ping::Client::new(conn);
+            let mut client = ringline_ping::Client::new(conn).expect("split the connection");
             match client.ping().await {
                 Ok(()) => {
                     PING_RESULT.set("OK".to_string()).ok();
@@ -332,7 +332,7 @@ impl AsyncEventHandler for BadPingClientHandler {
                 }
             };
 
-            let mut client = ringline_ping::Client::new(conn);
+            let mut client = ringline_ping::Client::new(conn).expect("split the connection");
             match client.ping().await {
                 Ok(()) => {
                     BAD_RESULT.set("UNEXPECTED_OK".to_string()).ok();

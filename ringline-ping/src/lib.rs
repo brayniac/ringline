@@ -10,7 +10,7 @@
 //! use ringline_ping::Client;
 //!
 //! async fn example(conn: ConnCtx) -> Result<(), ringline_ping::Error> {
-//!     let mut client = Client::new(conn);
+//!     let mut client = Client::new(conn)?;
 //!     client.ping().await?;
 //!     Ok(())
 //! }
@@ -31,7 +31,7 @@ use std::io;
 use std::time::Instant;
 
 use ping_proto::{Request as PingRequest, Response as PingResponse};
-use ringline::{ConnCtx, ParseResult};
+use ringline::{ConnCtx, ParseResult, RecvHalf, SendHalf};
 
 // -- Error -------------------------------------------------------------------
 
@@ -171,9 +171,15 @@ impl ClientBuilder {
     }
 
     /// Build the client.
-    pub fn build(self) -> Client {
-        Client {
-            conn: self.conn,
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Client::new`]: the read side must be free.
+    pub fn build(self) -> Result<Client, Error> {
+        let (tx, rx) = self.conn.split()?;
+        Ok(Client {
+            tx,
+            rx,
             on_result: self.on_result,
             last_rx_bytes: Cell::new(0),
             #[cfg(feature = "timestamps")]
@@ -184,7 +190,7 @@ impl ClientBuilder {
             } else {
                 None
             },
-        }
+        })
     }
 }
 
@@ -196,7 +202,8 @@ impl ClientBuilder {
 /// metrics. Use `Client::builder(conn)` to configure per-request callbacks,
 /// kernel timestamps, and built-in histogram tracking.
 pub struct Client {
-    conn: ConnCtx,
+    tx: SendHalf,
+    rx: RecvHalf,
     on_result: Option<ResultCallback>,
     last_rx_bytes: Cell<u32>,
     #[cfg(feature = "timestamps")]
@@ -209,16 +216,26 @@ impl Client {
     /// Create a new client wrapping an established connection.
     ///
     /// No callbacks, no metrics, no kernel timestamps — zero overhead.
-    pub fn new(conn: ConnCtx) -> Self {
-        Self {
-            conn,
+    ///
+    /// # Errors
+    ///
+    /// Takes exclusive ownership of the connection's read side via
+    /// [`ConnCtx::split`], so this fails with `EBUSY` if another client (or
+    /// any other reader) already holds it, and `EPIPE` if `conn` is stale.
+    /// Two clients driving one connection used to be silently allowed, and it
+    /// interleaved their reads; now it is refused.
+    pub fn new(conn: ConnCtx) -> Result<Self, Error> {
+        let (tx, rx) = conn.split()?;
+        Ok(Self {
+            tx,
+            rx,
             on_result: None,
             last_rx_bytes: Cell::new(0),
             #[cfg(feature = "timestamps")]
             use_kernel_ts: false,
             #[cfg(feature = "metrics")]
             metrics: None,
-        }
+        })
     }
 
     /// Create a builder for a client with per-request callbacks.
@@ -226,9 +243,19 @@ impl Client {
         ClientBuilder::new(conn)
     }
 
-    /// Returns the underlying connection context.
-    pub fn conn(&self) -> ConnCtx {
-        self.conn
+    /// Close the connection.
+    pub fn close(&mut self) {
+        self.tx.close();
+    }
+
+    /// The connection's identity token, for pool bookkeeping.
+    pub fn token(&self) -> ringline::ConnToken {
+        self.tx.token()
+    }
+
+    /// Is the connection still usable?
+    pub fn is_alive(&self) -> bool {
+        self.tx.is_alive()
     }
 
     /// Returns a reference to the built-in metrics, if enabled.
@@ -277,7 +304,7 @@ impl Client {
     #[inline]
     fn finish_timing(&self, send_ts: u64, start: Instant) -> u64 {
         if self.use_kernel_ts {
-            let recv_ts = self.conn.recv_timestamp();
+            let recv_ts = self.rx.recv_timestamp();
             if recv_ts > 0 && recv_ts > send_ts {
                 return recv_ts - send_ts;
             }
@@ -311,10 +338,10 @@ impl Client {
     /// the next `ping()` would read garbage. Surfacing `Protocol` as a
     /// terminal error matches the memcache client (PR #177) and avoids
     /// silently desynced clients.
-    pub(crate) async fn read_response(&self) -> Result<PingResponse, Error> {
+    pub(crate) async fn read_response(&mut self) -> Result<PingResponse, Error> {
         let mut result: Option<Result<PingResponse, Error>> = None;
         let n = self
-            .conn
+            .rx
             .with_data(|data| match PingResponse::parse(data) {
                 Ok((response, consumed)) => {
                     result = Some(Ok(response));
@@ -333,14 +360,14 @@ impl Client {
         }
         let r = result.unwrap();
         if matches!(r, Err(Error::Protocol(_))) {
-            self.conn.close();
+            self.tx.close();
         }
         r
     }
 
     /// Send an encoded command and read the response.
-    async fn execute(&self, encoded: &[u8]) -> Result<PingResponse, Error> {
-        self.conn.send(encoded)?;
+    async fn execute(&mut self, encoded: &[u8]) -> Result<PingResponse, Error> {
+        self.tx.send(encoded)?;
         self.read_response().await
     }
 

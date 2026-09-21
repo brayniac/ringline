@@ -3153,6 +3153,23 @@ impl RecvHalf {
         self.conn.end_segments()
     }
 
+    /// See [`ConnCtx::token`].
+    pub fn token(&self) -> ConnToken {
+        self.conn.token()
+    }
+
+    /// See [`ConnCtx::is_alive`].
+    pub fn is_alive(&self) -> bool {
+        self.conn.is_alive()
+    }
+
+    /// See [`ConnCtx::recv_timestamp`]. Read-side state, so it lives here
+    /// rather than on [`SendHalf`].
+    #[cfg(feature = "timestamps")]
+    pub fn recv_timestamp(&self) -> u64 {
+        self.conn.recv_timestamp()
+    }
+
     /// See [`ConnCtx::recv_ready`].
     pub fn recv_ready(&mut self) -> RecvReadyFuture {
         self.conn.recv_ready()
@@ -3243,6 +3260,16 @@ impl SendHalf {
     /// See [`ConnCtx::close`].
     pub fn close(&mut self) {
         self.conn.close();
+    }
+
+    /// See [`ConnCtx::token`].
+    pub fn token(&self) -> ConnToken {
+        self.conn.token()
+    }
+
+    /// See [`ConnCtx::is_alive`].
+    pub fn is_alive(&self) -> bool {
+        self.conn.is_alive()
     }
 
     /// See [`ConnCtx::peer_addr`].
