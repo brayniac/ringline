@@ -24,7 +24,7 @@ use ringline::ConnCtx;
 
 #[cfg(has_io_uring)]
 use crate::ValueStream;
-use crate::{Client, Error, Pipeline};
+use crate::{Client, Error};
 
 /// Configuration for a connection pool.
 pub struct PoolConfig {
@@ -221,10 +221,10 @@ impl Pool {
 
     /// Get a [`Client`] on the next healthy connection, ready to pipeline.
     ///
-    /// This used to return the [`Pipeline`] directly, which is no longer
+    /// This used to return the [`Pipeline`](crate::Pipeline) directly, which is no longer
     /// possible: a pipeline borrows its client's connection halves for its
     /// lifetime, so it cannot outlive a client created inside this method.
-    /// Hold the client and call [`Client::pipeline`] on it:
+    /// Hold the client and call [`Client::pipeline`](crate::Client::pipeline) on it:
     ///
     /// ```ignore
     /// let mut client = pool.client().await?;

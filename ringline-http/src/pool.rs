@@ -139,7 +139,7 @@ impl Pool {
     /// Mark a slot as disconnected by index, closing the underlying connection.
     pub fn mark_disconnected(&mut self, idx: usize) {
         if idx < self.slots.len() {
-            if let Slot::Connected(client) = &self.slots[idx] {
+            if let Slot::Connected(client) = &mut self.slots[idx] {
                 client.close();
             }
             self.slots[idx] = Slot::Disconnected;

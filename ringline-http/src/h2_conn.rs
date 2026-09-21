@@ -8,7 +8,7 @@ use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 
 use bytes::{Bytes, BytesMut};
-use ringline::ConnCtx;
+use ringline::{ConnCtx, RecvHalf, SendHalf};
 // `ParseResult` is only used by the mio/portable `with_data` recv path; the
 // io_uring path feeds h2 via `with_segments` (returns `SegConsumed`).
 #[cfg(not(has_io_uring))]
@@ -336,7 +336,8 @@ fn dispatch_h2_events(
 /// Wraps a sans-IO `H2Connection` and a `ConnCtx`, providing a pump loop
 /// that bridges bytes between the transport and the H2 state machine.
 pub struct H2AsyncConn {
-    conn: ConnCtx,
+    tx: SendHalf,
+    rx: RecvHalf,
     h2: H2Connection,
     pending_streams: HashMap<u32, PendingStream>,
     blocked_sends: VecDeque<BlockedSend>,
@@ -411,8 +412,10 @@ impl H2AsyncConn {
     pub async fn from_conn(conn: ConnCtx) -> Result<Self, HttpError> {
         let h2 = H2Connection::new(Settings::client_default());
 
+        let (tx, rx) = conn.split()?;
         let mut this = Self {
-            conn,
+            tx,
+            rx,
             h2,
             pending_streams: HashMap::new(),
             blocked_sends: VecDeque::new(),
@@ -435,13 +438,19 @@ impl H2AsyncConn {
         Ok(this)
     }
 
-    /// Returns the underlying connection context.
-    pub fn close(&self) {
-        self.conn.close();
+    /// Close the connection.
+    pub fn close(&mut self) {
+        self.tx.close();
     }
 
-    pub fn conn(&self) -> ConnCtx {
-        self.conn
+    /// The connection's identity token, for pool bookkeeping.
+    pub fn token(&self) -> ringline::ConnToken {
+        self.tx.token()
+    }
+
+    /// Is the connection still usable?
+    pub fn is_alive(&self) -> bool {
+        self.tx.is_alive()
     }
 
     /// Number of in-flight streams.
@@ -599,7 +608,7 @@ impl H2AsyncConn {
         // internally, so we consume all input.
         #[cfg(has_io_uring)]
         let n = self
-            .conn
+            .rx
             .with_segments(|chain| {
                 // Feed each borrowed segment, in order, to H2. Stop on the
                 // first codec error (h2 is now dead) — mirrors the `with_data`
@@ -632,7 +641,7 @@ impl H2AsyncConn {
 
         #[cfg(not(has_io_uring))]
         let n = self
-            .conn
+            .rx
             .with_data(|data| {
                 // Feed bytes to H2.
                 if let Err(e) = h2.recv(data) {
@@ -731,7 +740,7 @@ impl H2AsyncConn {
     fn flush_pending_send(&mut self) -> Result<(), HttpError> {
         let pending = self.h2.take_pending_send();
         if !pending.is_empty() {
-            self.conn.send_nowait(&pending)?;
+            self.tx.send_nowait(&pending)?;
         }
         Ok(())
     }
