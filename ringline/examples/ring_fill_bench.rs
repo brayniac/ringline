@@ -123,6 +123,11 @@ impl AsyncEventHandler for Bench {
                         .expect("connect submit")
                         .await
                         .expect("connect");
+                    // Reading an outbound connection goes through its read half.
+                    let mut conn_rx = match conn.take_recv() {
+                        Ok(rx) => rx,
+                        Err(_) => return,
+                    };
                     // MODE=forward forwards each response straight to a discard
                     // sink (/dev/null) with no userspace copy. Opened once per task.
                     #[cfg(has_io_uring)]
@@ -153,7 +158,7 @@ impl AsyncEventHandler for Bench {
                             "segments" => {
                                 let mut g = 0usize;
                                 {
-                                    let Ok(mut reader) = conn.segments() else {
+                                    let Ok(mut reader) = conn_rx.segments() else {
                                         return;
                                     };
                                     while g < want {
@@ -163,7 +168,7 @@ impl AsyncEventHandler for Bench {
                                         }
                                     }
                                 }
-                                let _ = conn.end_segments();
+                                let _ = conn_rx.end_segments();
                                 g
                             }
                             // Mode A: forward the response straight to the sink fd,
@@ -174,24 +179,26 @@ impl AsyncEventHandler for Bench {
                                 None => 0,
                             },
                             "bytes" => {
-                                conn.with_bytes(move |b| {
-                                    if b.len() >= want {
-                                        ParseResult::Consumed(want)
-                                    } else {
-                                        ParseResult::NeedMore
-                                    }
-                                })
-                                .await
+                                conn_rx
+                                    .with_bytes(move |b| {
+                                        if b.len() >= want {
+                                            ParseResult::Consumed(want)
+                                        } else {
+                                            ParseResult::NeedMore
+                                        }
+                                    })
+                                    .await
                             }
                             _ => {
-                                conn.with_data(move |d| {
-                                    if d.len() >= want {
-                                        ParseResult::Consumed(want)
-                                    } else {
-                                        ParseResult::NeedMore
-                                    }
-                                })
-                                .await
+                                conn_rx
+                                    .with_data(move |d| {
+                                        if d.len() >= want {
+                                            ParseResult::Consumed(want)
+                                        } else {
+                                            ParseResult::NeedMore
+                                        }
+                                    })
+                                    .await
                             }
                         };
                         if got == 0 {

@@ -1024,6 +1024,11 @@ impl AsyncEventHandler for ForwarderHandler {
                     return;
                 }
             };
+            // Reading an outbound connection goes through its read half.
+            let mut backend_rx = match backend.take_recv() {
+                Ok(rx) => rx,
+                Err(_) => return,
+            };
 
             // Forward loop: read from client, send to backend, read echo, send back.
             loop {
@@ -1048,7 +1053,7 @@ impl AsyncEventHandler for ForwarderHandler {
                 let target_len = data_copy.len();
                 while echo.len() < target_len {
                     let remaining = target_len - echo.len();
-                    let got = backend
+                    let got = backend_rx
                         .with_data(|data| {
                             let take = data.len().min(remaining);
                             echo.extend_from_slice(&data[..take]);
@@ -1243,6 +1248,11 @@ impl AsyncEventHandler for MultiOutboundHandler {
                     return;
                 }
             };
+            // Reading an outbound connection goes through its read half.
+            let mut backend1_rx = match backend1.take_recv() {
+                Ok(rx) => rx,
+                Err(_) => return,
+            };
 
             let backend2 = match client.connect(backend_addr) {
                 Ok(fut) => match fut.await {
@@ -1257,6 +1267,11 @@ impl AsyncEventHandler for MultiOutboundHandler {
                     return;
                 }
             };
+            // Reading an outbound connection goes through its read half.
+            let mut backend2_rx = match backend2.take_recv() {
+                Ok(rx) => rx,
+                Err(_) => return,
+            };
 
             // Send "AA" through backend1, "BB" through backend2.
             if backend1.send_nowait(b"AA").is_err() {
@@ -1266,7 +1281,7 @@ impl AsyncEventHandler for MultiOutboundHandler {
             let mut echo1 = Vec::new();
             while echo1.len() < 2 {
                 let remaining = 2 - echo1.len();
-                let got = backend1
+                let got = backend1_rx
                     .with_data(|data| {
                         let take = data.len().min(remaining);
                         echo1.extend_from_slice(&data[..take]);
@@ -1285,7 +1300,7 @@ impl AsyncEventHandler for MultiOutboundHandler {
             let mut echo2 = Vec::new();
             while echo2.len() < 2 {
                 let remaining = 2 - echo2.len();
-                let got = backend2
+                let got = backend2_rx
                     .with_data(|data| {
                         let take = data.len().min(remaining);
                         echo2.extend_from_slice(&data[..take]);
@@ -1405,6 +1420,11 @@ impl AsyncEventHandler for SelectTwoHandler {
                     return;
                 }
             };
+            // Reading an outbound connection goes through its read half.
+            let mut backend1_rx = match backend1.take_recv() {
+                Ok(rx) => rx,
+                Err(_) => return,
+            };
             let backend2 = match client.connect(addr2) {
                 Ok(fut) => match fut.await {
                     Ok(ctx) => ctx,
@@ -1418,6 +1438,11 @@ impl AsyncEventHandler for SelectTwoHandler {
                     return;
                 }
             };
+            // Reading an outbound connection goes through its read half.
+            let mut backend2_rx = match backend2.take_recv() {
+                Ok(rx) => rx,
+                Err(_) => return,
+            };
 
             // Send data to backend1 only.
             if backend1.send_nowait(b"HELLO").is_err() {
@@ -1430,11 +1455,11 @@ impl AsyncEventHandler for SelectTwoHandler {
             let mut buf1 = Vec::new();
             let mut buf2 = Vec::new();
             match ringline::select(
-                backend1.with_data(|data| {
+                backend1_rx.with_data(|data| {
                     buf1.extend_from_slice(data);
                     ParseResult::Consumed(data.len())
                 }),
-                backend2.with_data(|data| {
+                backend2_rx.with_data(|data| {
                     buf2.extend_from_slice(data);
                     ParseResult::Consumed(data.len())
                 }),
@@ -1564,6 +1589,11 @@ impl AsyncEventHandler for SelectSecondWinsHandler {
                     return;
                 }
             };
+            // Reading an outbound connection goes through its read half.
+            let mut backend1_rx = match backend1.take_recv() {
+                Ok(rx) => rx,
+                Err(_) => return,
+            };
             let backend2 = match client.connect(addr2) {
                 Ok(fut) => match fut.await {
                     Ok(ctx) => ctx,
@@ -1577,6 +1607,11 @@ impl AsyncEventHandler for SelectSecondWinsHandler {
                     return;
                 }
             };
+            // Reading an outbound connection goes through its read half.
+            let mut backend2_rx = match backend2.take_recv() {
+                Ok(rx) => rx,
+                Err(_) => return,
+            };
 
             // Send data to backend2 only.
             if backend2.send_nowait(b"WORLD").is_err() {
@@ -1587,11 +1622,11 @@ impl AsyncEventHandler for SelectSecondWinsHandler {
             let mut buf1 = Vec::new();
             let mut buf2 = Vec::new();
             match ringline::select(
-                backend1.with_data(|data| {
+                backend1_rx.with_data(|data| {
                     buf1.extend_from_slice(data);
                     ParseResult::Consumed(data.len())
                 }),
-                backend2.with_data(|data| {
+                backend2_rx.with_data(|data| {
                     buf2.extend_from_slice(data);
                     ParseResult::Consumed(data.len())
                 }),
@@ -1812,6 +1847,11 @@ impl AsyncEventHandler for Select3Handler {
                     return;
                 }
             };
+            // Reading an outbound connection goes through its read half.
+            let mut backend_rx = match backend.take_recv() {
+                Ok(rx) => rx,
+                Err(_) => return,
+            };
 
             // Send data to backend so it echoes.
             if backend.send_nowait(b"ECHO3").is_err() {
@@ -1828,7 +1868,7 @@ impl AsyncEventHandler for Select3Handler {
                     client_buf.extend_from_slice(data);
                     ParseResult::Consumed(data.len())
                 }),
-                backend.with_data(|data| {
+                backend_rx.with_data(|data| {
                     backend_buf.extend_from_slice(data);
                     ParseResult::Consumed(data.len())
                 }),
@@ -3768,6 +3808,11 @@ impl AsyncEventHandler for StandaloneConnectHandler {
                         return;
                     }
                 };
+                // Reading an outbound connection goes through its read half.
+                let mut backend_rx = match backend.take_recv() {
+                    Ok(rx) => rx,
+                    Err(_) => return,
+                };
 
                 // Send data to backend, read echo.
                 if backend.send_nowait(b"STANDALONE").is_err() {
@@ -3777,7 +3822,7 @@ impl AsyncEventHandler for StandaloneConnectHandler {
                 let mut echo = Vec::new();
                 while echo.len() < 10 {
                     let remaining = 10 - echo.len();
-                    let got = backend
+                    let got = backend_rx
                         .with_data(|data| {
                             let take = data.len().min(remaining);
                             echo.extend_from_slice(&data[..take]);
@@ -3926,11 +3971,16 @@ impl AsyncEventHandler for GreetingClientHandler {
                     return;
                 }
             };
+            // Reading an outbound connection goes through its read half.
+            let mut conn_rx = match conn.take_recv() {
+                Ok(rx) => rx,
+                Err(_) => return,
+            };
 
             let mut greeting = Vec::new();
             while greeting.len() < 8 {
                 let remaining = 8 - greeting.len();
-                let got = conn
+                let got = conn_rx
                     .with_data(|data| {
                         let take = data.len().min(remaining);
                         greeting.extend_from_slice(&data[..take]);
@@ -4014,6 +4064,11 @@ impl AsyncEventHandler for OnStartClientHandler {
                     return;
                 }
             };
+            // Reading an outbound connection goes through its read half.
+            let mut backend_rx = match backend.take_recv() {
+                Ok(rx) => rx,
+                Err(_) => return,
+            };
 
             if backend.send_nowait(b"ON_START").is_err() {
                 ON_START_RESULT.set("SEND_ERR".to_string()).ok();
@@ -4024,7 +4079,7 @@ impl AsyncEventHandler for OnStartClientHandler {
             let mut echo = Vec::new();
             while echo.len() < 8 {
                 let remaining = 8 - echo.len();
-                let got = backend
+                let got = backend_rx
                     .with_data(|data| {
                         let take = data.len().min(remaining);
                         echo.extend_from_slice(&data[..take]);
@@ -4650,11 +4705,16 @@ impl AsyncEventHandler for OutboundEofClient {
                     return;
                 }
             };
+            // Reading an outbound connection goes through its read half.
+            let mut conn_rx = match conn.take_recv() {
+                Ok(rx) => rx,
+                Err(_) => return,
+            };
 
             // Send data and read echo, with a timeout.
             let _ = conn.send_nowait(b"hello");
             let mut echoed = Vec::new();
-            let echo_fut = conn.with_data(|data| {
+            let echo_fut = conn_rx.with_data(|data| {
                 echoed.extend_from_slice(data);
                 ParseResult::Consumed(data.len())
             });
@@ -4678,7 +4738,7 @@ impl AsyncEventHandler for OutboundEofClient {
             }
 
             // Now wait for EOF — the std server thread closes after echoing.
-            let eof_fut = conn.with_data(|data| ParseResult::Consumed(data.len()));
+            let eof_fut = conn_rx.with_data(|data| ParseResult::Consumed(data.len()));
             match ringline::timeout(Duration::from_secs(5), eof_fut).await {
                 Ok(0) => {
                     OUTBOUND_EOF_RESULT.set("OK".to_string()).ok();

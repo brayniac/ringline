@@ -3,7 +3,7 @@
 //! Wraps a connection in the standard `AsyncRead + AsyncWrite + AsyncBufRead`
 //! interface for ecosystem compatibility (codecs, tower, hyper, etc.).
 //!
-//! The callback-based [`ConnCtx::with_data`] / [`ConnCtx::with_bytes`] API
+//! The callback-based [`Connection::with_data`] / [`Connection::with_bytes`] API
 //! remains the zero-copy hot path for protocol implementations. `ConnStream`
 //! is the streaming alternative when trait compatibility matters more than
 //! minimising copies on the recv side.

@@ -125,7 +125,27 @@ The ownership claim is recorded by the event loop at accept time
 (`Connection::for_accept` plus `driver.recv_half_taken[idx] = true`), because
 `spawn_accept_task` runs outside a task poll and cannot reach `CURRENT_DRIVER`.
 
-**4b — demote `ConnCtx`'s recv methods to `pub(crate)`.** This is what makes
+**4b — demote `ConnCtx`'s recv methods to `pub(crate)`.** *(landed)*
+
+The read entry points — `with_data`, `with_data_result`, `with_bytes`,
+`recv_ready`, `segments`, `recv_owned_segment`, `with_segments`,
+`end_segments`, `recv_timestamp`, `try_with_data`, `eof_truncated`,
+`take_recv_sink` — are crate-private. Reading goes through `Connection` or
+`RecvHalf`, neither of which is `Copy`, so the read side cannot be aliased.
+`ConnCtx` is now a send/identity/lifecycle handle plus a way to *obtain* the
+read side (`take_recv`, `split`).
+
+The **forwarding** entry points stay public on purpose: `forward_to`,
+`forward_to_conn`, `forward_held`, `enable_recv_forward` and `run_direct_echo`
+move bytes kernel-side from source to sink and never surface them to the
+caller, so they cannot be used to observe a stream another reader owns. Their
+own "one forward at a time" rule is refused at runtime by the driver — and with
+the read methods private, that refusal is now reachable *only* through
+`ConnCtx`, because `&mut RecvHalf` turns a second concurrent forward into a
+compile error. Keeping them public is what keeps that runtime check testable.
+
+Original sketch of this step:
+ This is what makes
 the model *enforced* rather than advisory, and it is a separate change with its
 own call sites: outbound connections from `connect()`, which take their read
 half with `take_recv()`. Roughly 21 sites, all in tests, examples and the

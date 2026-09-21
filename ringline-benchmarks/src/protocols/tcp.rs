@@ -348,6 +348,11 @@ impl ringline::AsyncEventHandler for RinglineTcpBench {
                         },
                         Err(_) => return,
                     };
+                    // Reading an outbound connection goes through its read half.
+                    let mut conn_rx = match conn.take_recv() {
+                        Ok(rx) => rx,
+                        Err(_) => return,
+                    };
 
                     let msg = vec![0xABu8; msg_size];
                     let mut local_ops: u64 = 0;
@@ -363,7 +368,7 @@ impl ringline::AsyncEventHandler for RinglineTcpBench {
                             break;
                         }
 
-                        let n = conn
+                        let n = conn_rx
                             .with_data(|data| {
                                 if data.len() >= msg_size {
                                     ringline::ParseResult::Consumed(msg_size)
