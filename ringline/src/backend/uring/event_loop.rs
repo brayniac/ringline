@@ -4723,7 +4723,7 @@ mod tests {
 
     impl AsyncEventHandler for NoopHandler {
         #[allow(clippy::manual_async_fn)]
-        fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
+        fn on_accept(&self, _conn: crate::Connection) -> impl Future<Output = ()> + 'static {
             async {}
         }
         fn create_for_worker(_id: usize) -> Self {

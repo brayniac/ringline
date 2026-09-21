@@ -107,8 +107,9 @@ impl AsyncEventHandler for StreamStubServer {
     #[allow(clippy::manual_async_fn)]
     fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
+            let (mut tx, mut rx) = tx.split();
             loop {
-                let n = conn
+                let n = rx
                     .with_bytes(|bytes| {
                         let len = bytes.len();
                         match Value::parse_bytes(bytes) {
@@ -128,15 +129,15 @@ impl AsyncEventHandler for StreamStubServer {
                                             }
                                             _ => b"-ERR value mismatch\r\n",
                                         };
-                                        let _ = conn.send_nowait(reply);
+                                        let _ = tx.send_nowait(reply);
                                     } else if verb.eq_ignore_ascii_case(b"DEL") {
                                         // `DEL <key>`: reply with the deleted-key
                                         // count (a RESP integer).
-                                        let _ = conn.send_nowait(b":1\r\n");
+                                        let _ = tx.send_nowait(b":1\r\n");
                                     } else if let Some(Value::BulkString(key)) = items.get(1) {
                                         // `GET <key>`.
                                         let (reply, should_close) = decide(&key[..]);
-                                        let _ = conn.send_nowait(&reply);
+                                        let _ = tx.send_nowait(&reply);
                                         close_after = should_close;
                                     }
                                 }
@@ -144,7 +145,7 @@ impl AsyncEventHandler for StreamStubServer {
                                     // Send has been queued; closing the connection
                                     // FINs after the queued bytes drain, giving the
                                     // client a short reply followed by peer EOF.
-                                    conn.close();
+                                    tx.close();
                                 }
                                 ParseResult::Consumed(consumed)
                             }

@@ -724,10 +724,11 @@ impl AsyncEventHandler for TlsSegmentedHandler {
     #[allow(clippy::manual_async_fn)]
     fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
+            let (mut tx, mut rx) = conn.split();
             // Opt this TLS connection into segmented delivery: decrypted
             // plaintext arrives as owned segments in the hold, not the
             // accumulator.
-            let mut reader = match conn.segments() {
+            let mut reader = match rx.segments() {
                 Ok(r) => r,
                 Err(_) => return,
             };
@@ -736,7 +737,7 @@ impl AsyncEventHandler for TlsSegmentedHandler {
                     Ok(Some(seg)) => {
                         // Echo each decrypted plaintext segment straight back;
                         // the client reassembles and byte-compares.
-                        let _ = conn.send_nowait(&seg);
+                        let _ = tx.send_nowait(&seg);
                     }
                     Ok(None) => {
                         // Clean TLS close surfaced as EOF (not a hang).
@@ -982,20 +983,21 @@ impl AsyncEventHandler for TlsTickCloseHandler {
     #[allow(clippy::manual_async_fn)]
     fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
+            let (mut tx, mut rx) = conn.split();
             // Echo once so the connection reaches full TLS traffic state —
             // `WriteTraffic::queue_close_notify` is only reachable there, and a
             // handshaking connection would have no alert to produce.
-            conn.with_data(|data| {
-                let _ = conn.send_nowait(data);
+            rx.with_data(|data| {
+                let _ = tx.send_nowait(data);
                 ParseResult::Consumed(data.len())
             })
             .await;
-            *TLS_TICK_CLOSE_TOKEN.lock().unwrap() = Some(conn.token());
+            *TLS_TICK_CLOSE_TOKEN.lock().unwrap() = Some(tx.token());
             // Park until the connection goes away rather than returning, which
             // would close it from the task side and race the tick-driven close
             // under test.
             loop {
-                if conn.with_data(|d| ParseResult::Consumed(d.len())).await == 0 {
+                if rx.with_data(|d| ParseResult::Consumed(d.len())).await == 0 {
                     break;
                 }
             }
@@ -1450,18 +1452,19 @@ impl AsyncEventHandler for TlsLateSegmentReader {
     #[allow(clippy::manual_async_fn)]
     fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
+            let (mut tx, mut rx) = conn.split();
             // Let the handshake finish and the client's payload arrive and be
             // decrypted into the accumulator *before* the reader exists.
             ringline::sleep(Duration::from_millis(300)).await;
 
-            let mut reader = match conn.segments() {
+            let mut reader = match rx.segments() {
                 Ok(r) => r,
                 Err(_) => return,
             };
             loop {
                 match reader.next().await {
                     Ok(Some(seg)) => {
-                        let _ = conn.send_nowait(&seg);
+                        let _ = tx.send_nowait(&seg);
                     }
                     Ok(None) => break,
                     Err(_) => break,

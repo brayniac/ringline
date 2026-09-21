@@ -22,10 +22,11 @@ use crate::runtime::io::{Connection, UdpCtx};
 /// impl AsyncEventHandler for EchoHandler {
 ///     fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
 ///         async move {
+///             let (mut tx, mut rx) = conn.split();
 ///             loop {
-///                 let n = conn.with_data(|data| {
+///                 let n = rx.with_data(|data| {
 ///                     // Echo back everything received.
-///                     conn.send_nowait(data).ok();
+///                     tx.send_nowait(data).ok();
 ///                     ringline::ParseResult::Consumed(data.len())
 ///                 }).await;
 ///                 if n == 0 {

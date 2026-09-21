@@ -8,16 +8,17 @@
 //! # Quick Start
 //!
 //! ```rust,no_run
-//! use ringline::{AsyncEventHandler, Config, ConnCtx, Connection, ParseResult, RinglineBuilder};
+//! use ringline::{AsyncEventHandler, Config, Connection, ParseResult, RinglineBuilder};
 //!
 //! struct Echo;
 //!
 //! impl AsyncEventHandler for Echo {
 //!     fn on_accept(&self, mut conn: Connection) -> impl std::future::Future<Output = ()> + 'static {
 //!         async move {
+//!             let (mut tx, mut rx) = conn.split();
 //!             loop {
-//!                 let n = conn.with_data(|data| {
-//!                     conn.send_nowait(data).ok();
+//!                 let n = rx.with_data(|data| {
+//!                     tx.send_nowait(data).ok();
 //!                     ParseResult::Consumed(data.len())
 //!                 }).await;
 //!                 if n == 0 { break; }

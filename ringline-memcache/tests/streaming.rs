@@ -143,8 +143,9 @@ impl AsyncEventHandler for StreamStubServer {
     #[allow(clippy::manual_async_fn)]
     fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
+            let (mut tx, mut rx) = tx.split();
             loop {
-                let n = conn
+                let n = rx
                     .with_bytes(|bytes| {
                         // Parse one command line per call.
                         let Some(cr) = find_crlf(&bytes) else {
@@ -155,19 +156,19 @@ impl AsyncEventHandler for StreamStubServer {
                         if let Some(key) = line.strip_prefix(b"gets ") {
                             // `gets <key>` — CAS-carrying reply.
                             let (reply, should_close) = decide_cas(key);
-                            let _ = conn.send_nowait(&reply);
+                            let _ = tx.send_nowait(&reply);
                             if should_close {
-                                conn.close();
+                                tx.close();
                             }
                             ParseResult::Consumed(header_len)
                         } else if let Some(key) = line.strip_prefix(b"get ") {
                             let (reply, should_close) = decide(key);
-                            let _ = conn.send_nowait(&reply);
+                            let _ = tx.send_nowait(&reply);
                             if should_close {
                                 // Send has been queued; closing the connection
                                 // FINs after the queued bytes drain, giving the
                                 // client a short reply followed by peer EOF.
-                                conn.close();
+                                tx.close();
                             }
                             ParseResult::Consumed(header_len)
                         } else if line.starts_with(b"set ") {
@@ -194,7 +195,7 @@ impl AsyncEventHandler for StreamStubServer {
                             } else {
                                 b"SERVER_ERROR value mismatch\r\n"
                             };
-                            let _ = conn.send_nowait(reply);
+                            let _ = tx.send_nowait(reply);
                             ParseResult::Consumed(total)
                         } else {
                             // Unknown line — consume it.

@@ -627,17 +627,18 @@ pub fn request_shutdown() -> io::Result<()> {
 /// # Example: Echo Handler
 ///
 /// ```no_run
-/// use ringline::{AsyncEventHandler, ConnCtx, Connection, ParseResult};
+/// use ringline::{AsyncEventHandler, Connection, ParseResult};
 ///
 /// struct Echo;
 ///
 /// impl AsyncEventHandler for Echo {
 ///     fn on_accept(&self, mut conn: Connection) -> impl std::future::Future<Output = ()> + 'static {
 ///         async move {
+///             let (mut tx, mut rx) = conn.split();
 ///             loop {
-///                 let n = conn.with_data(|data| {
+///                 let n = rx.with_data(|data| {
 ///                     // Echo back whatever we received
-///                     conn.send_nowait(data).ok();
+///                     tx.send_nowait(data).ok();
 ///                     ParseResult::Consumed(data.len())
 ///                 }).await;
 ///                 // n == 0 means connection closed (EOF)
@@ -652,19 +653,20 @@ pub fn request_shutdown() -> io::Result<()> {
 /// # Example: Line-Based Protocol
 ///
 /// ```no_run
-/// use ringline::{AsyncEventHandler, ConnCtx, ParseResult};
+/// use ringline::{AsyncEventHandler, Connection, ParseResult};
 ///
 /// struct LineEcho;
 ///
 /// impl AsyncEventHandler for LineEcho {
 ///     fn on_accept(&self, mut conn: Connection) -> impl std::future::Future<Output = ()> + 'static {
 ///         async move {
+///             let (mut tx, mut rx) = conn.split();
 ///             loop {
-///                 let n = conn.with_data(|data| {
+///                 let n = rx.with_data(|data| {
 ///                     // Find newline
 ///                     if let Some(pos) = data.iter().position(|&b| b == b'\n') {
 ///                         let line = &data[..=pos];
-///                         conn.send_nowait(line).ok();
+///                         tx.send_nowait(line).ok();
 ///                         ParseResult::Consumed(pos + 1)
 ///                     } else {
 ///                         ParseResult::NeedMore
@@ -684,7 +686,7 @@ pub fn request_shutdown() -> io::Result<()> {
 /// [`with_bytes`](Self::with_bytes) which provides `Bytes` handles:
 ///
 /// ```no_run
-/// use ringline::{AsyncEventHandler, ConnCtx, ParseResult};
+/// use ringline::{AsyncEventHandler, Connection, ParseResult};
 /// use bytes::Bytes;
 ///
 /// struct ZeroCopyHandler;
@@ -692,8 +694,9 @@ pub fn request_shutdown() -> io::Result<()> {
 /// impl AsyncEventHandler for ZeroCopyHandler {
 ///     fn on_accept(&self, mut conn: Connection) -> impl std::future::Future<Output = ()> + 'static {
 ///         async move {
+///             let (mut tx, mut rx) = conn.split();
 ///             loop {
-///                 let n = conn.with_bytes(|bytes| {
+///                 let n = rx.with_bytes(|bytes| {
 ///                     // Parse protocol, return Bytes::slice() for the value
 ///                     // The slice stays valid even after the accumulator advances
 ///                     if let Some((consumed, value)) = parse_message(&bytes) {
@@ -727,18 +730,19 @@ pub fn request_shutdown() -> io::Result<()> {
 /// # Send Patterns
 ///
 /// ```no_run
-/// use ringline::{AsyncEventHandler, ConnCtx, ParseResult};
+/// use ringline::{AsyncEventHandler, Connection, ParseResult};
 ///
 /// struct SendExample;
 ///
 /// impl AsyncEventHandler for SendExample {
 ///     fn on_accept(&self, mut conn: Connection) -> impl std::future::Future<Output = ()> + 'static {
 ///         async move {
+///             let (mut tx, mut rx) = conn.split();
 ///             // Fire-and-forget (returns Err if send pool exhausted)
-///             conn.send_nowait(b"hello").ok();
+///             tx.send_nowait(b"hello").ok();
 ///
 ///             // Await send completion
-///             if let Ok(future) = conn.send(b"world") {
+///             if let Ok(future) = tx.send(b"world") {
 ///                 future.await.ok();
 ///             }
 ///         }

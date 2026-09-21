@@ -7366,8 +7366,13 @@ impl AsyncEventHandler for BusyForwardProxy {
 
             // Hold one forward open (far more than the client will send), then
             // ask for a second on the same connection while the first is live.
-            let first = client.forward_to_conn(&backend, 1 << 30);
-            let second = client.forward_to_conn(&backend, 16);
+            // Two forwards *in flight at once* is what this test is about, and
+            // `&mut RecvHalf` makes that a compile error rather than the
+            // runtime `EBUSY` being asserted here. Go through the `Copy`
+            // handle so the refusal is still exercised.
+            let client_ctx = client.as_conn();
+            let first = client_ctx.forward_to_conn(&backend, 1 << 30);
+            let second = client_ctx.forward_to_conn(&backend, 16);
             let errno = match second.await {
                 Ok(_) => -1,
                 Err(e) => e.raw_os_error().unwrap_or(-1),
