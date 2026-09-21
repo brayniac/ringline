@@ -14,7 +14,7 @@
 use std::future::Future;
 
 use ringline::{
-    AsyncEventHandler, ConfigBuilder, ConnCtx, Connection, Error, MemoryRegion, RinglineBuilder,
+    AsyncEventHandler, ConfigBuilder, Connection, Error, MemoryRegion, RinglineBuilder,
 };
 
 struct Idle;

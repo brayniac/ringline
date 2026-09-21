@@ -722,7 +722,7 @@ struct TlsSegmentedHandler;
 #[cfg(has_io_uring)]
 impl AsyncEventHandler for TlsSegmentedHandler {
     #[allow(clippy::manual_async_fn)]
-    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             let (mut tx, mut rx) = conn.split();
             // Opt this TLS connection into segmented delivery: decrypted
@@ -981,7 +981,7 @@ struct TlsTickCloseHandler;
 #[cfg(has_io_uring)]
 impl AsyncEventHandler for TlsTickCloseHandler {
     #[allow(clippy::manual_async_fn)]
-    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             let (mut tx, mut rx) = conn.split();
             // Echo once so the connection reaches full TLS traffic state —
@@ -1450,7 +1450,7 @@ struct TlsLateSegmentReader;
 #[cfg(has_io_uring)]
 impl AsyncEventHandler for TlsLateSegmentReader {
     #[allow(clippy::manual_async_fn)]
-    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             let (mut tx, mut rx) = conn.split();
             // Let the handshake finish and the client's payload arrive and be

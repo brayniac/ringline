@@ -8,7 +8,7 @@ use std::future::Future;
 use std::time::Duration;
 
 use ringline::{
-    AsyncEventHandler, Config, ConfigBuilder, ConnCtx, Connection, MemoryRegion, RinglineBuilder,
+    AsyncEventHandler, Config, ConfigBuilder, Connection, MemoryRegion, RinglineBuilder,
 };
 
 struct Idle;

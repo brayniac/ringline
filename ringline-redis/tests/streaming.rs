@@ -19,7 +19,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use resp_proto::Value;
 use ringline::{
-    AsyncEventHandler, Config, ConfigBuilder, ConnCtx, Connection, ParseResult, RinglineBuilder,
+    AsyncEventHandler, Config, ConfigBuilder, Connection, ParseResult, RinglineBuilder,
 };
 use ringline_redis::{Client, Error, OpKind, SegmentSource};
 
