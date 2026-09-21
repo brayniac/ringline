@@ -14,7 +14,7 @@ use quinn_proto::{
     ServerConfig,
 };
 use ringline::{
-    AsyncEventHandler, Config, ConfigBuilder, ConnCtx, RinglineBuilder, UdpCtx, select, sleep,
+    AsyncEventHandler, Config, ConfigBuilder, Connection, RinglineBuilder, UdpCtx, select, sleep,
 };
 use ringline_quic::{QuicConfig, QuicEndpoint, QuicEvent};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -111,7 +111,7 @@ struct QuicEchoServer;
 
 #[allow(clippy::manual_async_fn)]
 impl AsyncEventHandler for QuicEchoServer {
-    fn on_accept(&self, _conn: ConnCtx) -> impl std::future::Future<Output = ()> + 'static {
+    fn on_accept(&self, _conn: Connection) -> impl std::future::Future<Output = ()> + 'static {
         async move {}
     }
 

@@ -155,7 +155,7 @@ be read independently.
 Their shared text equivalent is: an accepted descriptor enters a worker's
 bounded channel; the worker allocates and initializes a generation-tagged slot,
 arms receive, and either starts TLS or marks the plaintext connection
-established. Once established, the worker places one `on_accept(ConnCtx)`
+established. Once established, the worker places one `on_accept(Connection)`
 future in the connection task slab. That task parses buffered input immediately
 or registers itself as the connection's receive waiter and parks. A backend
 event makes bytes available and calls `Executor::wake_recv`; the executor wakes

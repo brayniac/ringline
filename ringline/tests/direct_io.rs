@@ -15,7 +15,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use ringline::{
-    AsyncEventHandler, Config, ConfigBuilder, ConnCtx, DirectIoConfig, RinglineBuilder,
+    AsyncEventHandler, Config, ConfigBuilder, Connection, DirectIoConfig, RinglineBuilder,
 };
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -101,7 +101,7 @@ static ROUNDTRIP_ERR: OnceLock<String> = OnceLock::new();
 struct RoundtripTickHandler;
 
 impl AsyncEventHandler for RoundtripTickHandler {
-    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
         async {}
     }
 
@@ -193,7 +193,7 @@ static MULTI_FILE_ERR: OnceLock<String> = OnceLock::new();
 struct MultiFileTickHandler;
 
 impl AsyncEventHandler for MultiFileTickHandler {
-    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
         async {}
     }
 

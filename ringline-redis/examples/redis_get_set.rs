@@ -10,14 +10,14 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::OnceLock;
 
-use ringline::{AsyncEventHandler, ConfigBuilder, ConnCtx, RinglineBuilder};
+use ringline::{AsyncEventHandler, ConfigBuilder, Connection, RinglineBuilder};
 
 static REDIS_ADDR: OnceLock<std::net::SocketAddr> = OnceLock::new();
 
 struct RedisHandler;
 
 impl AsyncEventHandler for RedisHandler {
-    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
         async {}
     }
 

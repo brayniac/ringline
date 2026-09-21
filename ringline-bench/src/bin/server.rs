@@ -4,7 +4,7 @@
 //!   bench-server --runtime ringline --addr 0.0.0.0:7878 --workers 4 --msg-size 64
 //!   bench-server --runtime tokio --addr 0.0.0.0:7878 --workers 4
 
-use ringline::ConfigBuilder;
+use ringline::{ConfigBuilder, Connection};
 use std::net::SocketAddr;
 
 use clap::Parser;
@@ -412,7 +412,7 @@ fn run_ringline_proxy(cfg: ProxyCfg) {
         api,
         metrics_out,
     } = cfg;
-    use ringline::{AsyncEventHandler, ConnCtx, RinglineBuilder};
+    use ringline::{AsyncEventHandler, Connection, RinglineBuilder};
 
     /// Forward for the life of the connection: the caller asks for a byte
     /// count, and a proxy does not know one, so ask for more than any run will
@@ -430,7 +430,10 @@ fn run_ringline_proxy(cfg: ProxyCfg) {
     struct SinkFdProxy;
     #[cfg(has_io_uring)]
     impl AsyncEventHandler for SinkFdProxy {
-        fn on_accept(&self, conn: ConnCtx) -> impl std::future::Future<Output = ()> + 'static {
+        fn on_accept(
+            &self,
+            mut conn: Connection,
+        ) -> impl std::future::Future<Output = ()> + 'static {
             async move {
                 use std::os::fd::AsFd;
                 let addr = *BACKEND.get().expect("backend set before launch");
@@ -455,7 +458,10 @@ fn run_ringline_proxy(cfg: ProxyCfg) {
     /// async round trip instead of a blocking syscall on the worker.
     struct ConnProxy;
     impl AsyncEventHandler for ConnProxy {
-        fn on_accept(&self, conn: ConnCtx) -> impl std::future::Future<Output = ()> + 'static {
+        fn on_accept(
+            &self,
+            mut conn: Connection,
+        ) -> impl std::future::Future<Output = ()> + 'static {
             async move {
                 let addr = *BACKEND.get().expect("backend set before launch");
                 let sink = match conn.connect(addr) {
@@ -540,7 +546,7 @@ fn run_ringline(cfg: EchoCfg) {
         prefault_buffers,
     } = cfg;
     use ringline::ParseResult;
-    use ringline::{AsyncEventHandler, ConnCtx, RinglineBuilder};
+    use ringline::{AsyncEventHandler, RinglineBuilder};
 
     // Direct-echo path (default): no task wakeup per message — echo SQEs are
     // submitted directly from handle_recv_multi, bypassing collect_wakeups and
@@ -548,7 +554,7 @@ fn run_ringline(cfg: EchoCfg) {
     // mio backend (macOS / non-io_uring builds).
     struct EchoHandler;
     impl AsyncEventHandler for EchoHandler {
-        fn on_accept(&self, conn: ConnCtx) -> impl std::future::Future<Output = ()> + 'static {
+        fn on_accept(&self, conn: Connection) -> impl std::future::Future<Output = ()> + 'static {
             async move {
                 #[cfg(has_io_uring)]
                 {
@@ -568,11 +574,14 @@ fn run_ringline(cfg: EchoCfg) {
 
     /// `with_data` + `forward_recv_buf` — what a protocol server's read loop
     /// looks like, and the only mode available on the mio backend.
-    async fn forward_echo_loop(conn: ConnCtx) {
+    async fn forward_echo_loop(conn: Connection) {
+        // The send happens inside the recv closure, so the two halves have to
+        // be separately borrowable.
+        let (mut tx, mut rx) = conn.split();
         loop {
-            let n = conn
+            let n = rx
                 .with_data(|data| {
-                    if let Err(e) = conn.forward_recv_buf(data) {
+                    if let Err(e) = tx.forward_recv_buf(data) {
                         eprintln!("echo: forward_recv_buf failed: {e}");
                         return ParseResult::NeedMore;
                     }
@@ -587,7 +596,7 @@ fn run_ringline(cfg: EchoCfg) {
 
     struct ForwardEchoHandler;
     impl AsyncEventHandler for ForwardEchoHandler {
-        fn on_accept(&self, conn: ConnCtx) -> impl std::future::Future<Output = ()> + 'static {
+        fn on_accept(&self, conn: Connection) -> impl std::future::Future<Output = ()> + 'static {
             async move { forward_echo_loop(conn).await }
         }
         fn create_for_worker(_id: usize) -> Self {
@@ -599,7 +608,10 @@ fn run_ringline(cfg: EchoCfg) {
     // scatter-gather them back in one sendmsg — no accumulator copy at all.
     struct RecvForwardEchoHandler;
     impl AsyncEventHandler for RecvForwardEchoHandler {
-        fn on_accept(&self, conn: ConnCtx) -> impl std::future::Future<Output = ()> + 'static {
+        fn on_accept(
+            &self,
+            mut conn: Connection,
+        ) -> impl std::future::Future<Output = ()> + 'static {
             async move {
                 conn.enable_recv_forward();
                 loop {

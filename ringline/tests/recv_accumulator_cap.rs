@@ -9,14 +9,14 @@ use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
-use ringline::{AsyncEventHandler, ConfigBuilder, ConnCtx, ParseResult, RinglineBuilder};
+use ringline::{AsyncEventHandler, ConfigBuilder, Connection, ParseResult, RinglineBuilder};
 
 /// A handler whose parser never completes: every poll reports `NeedMore`, so
 /// the accumulator grows with every arriving byte until the cap is hit.
 struct NeverSatisfied;
 
 impl AsyncEventHandler for NeverSatisfied {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             loop {
                 let n = conn.with_data(|_| ParseResult::NeedMore).await;

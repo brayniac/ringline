@@ -260,7 +260,7 @@ impl ringline::AsyncEventHandler for RinglineRedisBench {
     #[allow(clippy::manual_async_fn)]
     fn on_accept(
         &self,
-        _conn: ringline::ConnCtx,
+        _conn: ringline::Connection,
     ) -> impl std::future::Future<Output = ()> + 'static {
         async {}
     }

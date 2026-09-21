@@ -1,5 +1,5 @@
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
-use ringline::{AsyncEventHandler, Config, ConnCtx, ParseResult, RinglineBuilder};
+use ringline::{AsyncEventHandler, Config, Connection, ParseResult, RinglineBuilder};
 use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::thread;
@@ -12,12 +12,13 @@ struct EchoHandler;
 
 #[allow(clippy::manual_async_fn)]
 impl AsyncEventHandler for EchoHandler {
-    fn on_accept(&self, conn: ConnCtx) -> impl std::future::Future<Output = ()> + 'static {
+    fn on_accept(&self, conn: Connection) -> impl std::future::Future<Output = ()> + 'static {
         async move {
+            let (mut tx, mut rx) = conn.split();
             loop {
-                let n = conn
+                let n = rx
                     .with_data(|data| {
-                        conn.send_nowait(data).ok();
+                        tx.send_nowait(data).ok();
                         ParseResult::Consumed(data.len())
                     })
                     .await;

@@ -11,7 +11,7 @@ use std::pin::Pin;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use ringline::{AsyncEventHandler, Config, ConfigBuilder, ConnCtx, RinglineBuilder};
+use ringline::{AsyncEventHandler, Config, ConfigBuilder, Connection, RinglineBuilder};
 use ringline_memcache::{Client, Pool, PoolConfig};
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -60,7 +60,7 @@ macro_rules! run_memcache_test {
 
         impl AsyncEventHandler for Handler {
             #[allow(clippy::manual_async_fn)]
-            fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+            fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
                 async {}
             }
 
@@ -391,7 +391,7 @@ fn memcache_pool() {
 
     impl AsyncEventHandler for Handler {
         #[allow(clippy::manual_async_fn)]
-        fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
             async {}
         }
 

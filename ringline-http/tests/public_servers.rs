@@ -11,7 +11,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 
-use ringline::{AsyncEventHandler, Config, ConfigBuilder, ConnCtx, TlsClientConfig};
+use ringline::{AsyncEventHandler, Config, ConfigBuilder, Connection, TlsClientConfig};
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
@@ -64,7 +64,7 @@ fn h2_google() {
     struct H2GoogleHandler;
     impl AsyncEventHandler for H2GoogleHandler {
         #[allow(clippy::manual_async_fn)]
-        fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
             async {}
         }
 
@@ -137,7 +137,7 @@ fn h2_cloudflare() {
     struct H2CloudflareHandler;
     impl AsyncEventHandler for H2CloudflareHandler {
         #[allow(clippy::manual_async_fn)]
-        fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
             async {}
         }
 
@@ -210,7 +210,7 @@ fn h2_multiplexed() {
     struct H2MultiplexHandler;
     impl AsyncEventHandler for H2MultiplexHandler {
         #[allow(clippy::manual_async_fn)]
-        fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
             async {}
         }
 
@@ -297,7 +297,7 @@ fn h1_google() {
     struct H1GoogleHandler;
     impl AsyncEventHandler for H1GoogleHandler {
         #[allow(clippy::manual_async_fn)]
-        fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
             async {}
         }
 
@@ -372,7 +372,7 @@ fn h2_streaming() {
     struct H2StreamingHandler;
     impl AsyncEventHandler for H2StreamingHandler {
         #[allow(clippy::manual_async_fn)]
-        fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
             async {}
         }
 

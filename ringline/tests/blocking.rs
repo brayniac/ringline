@@ -5,7 +5,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use ringline::{AsyncEventHandler, Config, ConfigBuilder, ConnCtx, RinglineBuilder};
+use ringline::{AsyncEventHandler, Config, ConfigBuilder, Connection, RinglineBuilder};
 
 fn test_config_builder() -> ConfigBuilder {
     ConfigBuilder::new()
@@ -38,7 +38,7 @@ impl AsyncEventHandler for BlockingBasicHandler {
         }))
     }
 
-    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
         async {}
     }
     fn create_for_worker(_id: usize) -> Self {
@@ -86,7 +86,7 @@ impl AsyncEventHandler for BlockingConcurrentHandler {
         }))
     }
 
-    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
         async {}
     }
     fn create_for_worker(_id: usize) -> Self {
@@ -128,7 +128,7 @@ impl AsyncEventHandler for BlockingMultiHandler {
         }))
     }
 
-    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
         async {}
     }
     fn create_for_worker(_id: usize) -> Self {
@@ -167,7 +167,7 @@ impl AsyncEventHandler for BlockingDisabledHandler {
         }))
     }
 
-    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
         async {}
     }
     fn create_for_worker(_id: usize) -> Self {
@@ -212,7 +212,7 @@ impl AsyncEventHandler for BlockingStringHandler {
         }))
     }
 
-    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
         async {}
     }
     fn create_for_worker(_id: usize) -> Self {

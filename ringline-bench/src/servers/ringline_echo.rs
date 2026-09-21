@@ -3,7 +3,7 @@
 use std::net::SocketAddr;
 use std::thread::JoinHandle;
 
-use ringline::{AsyncEventHandler, ConfigBuilder, ConnCtx, RinglineBuilder, ShutdownHandle};
+use ringline::{AsyncEventHandler, ConfigBuilder, Connection, RinglineBuilder, ShutdownHandle};
 // ParseResult is only needed in the non-io_uring fallback path.
 #[cfg(not(has_io_uring))]
 use ringline::ParseResult;
@@ -11,8 +11,9 @@ use ringline::ParseResult;
 struct EchoHandler;
 
 impl AsyncEventHandler for EchoHandler {
-    fn on_accept(&self, conn: ConnCtx) -> impl std::future::Future<Output = ()> + 'static {
+    fn on_accept(&self, conn: Connection) -> impl std::future::Future<Output = ()> + 'static {
         async move {
+            let (mut tx, mut rx) = conn.split();
             // Direct-echo path: on io_uring, echo SQEs are submitted directly
             // from the CQE handler without waking this task — eliminating
             // the collect_wakeups → poll_ready_tasks roundtrip per message.
@@ -22,13 +23,13 @@ impl AsyncEventHandler for EchoHandler {
                 // No `return` needed: the fallback below is cfg'd out whenever
                 // this arm is compiled in. (Never linted before #402, because
                 // this block was dead on every platform.)
-                conn.run_direct_echo().await;
+                tx.run_direct_echo().await;
             }
             #[cfg(not(has_io_uring))]
             loop {
-                let n = conn
+                let n = rx
                     .with_data(|data| {
-                        if let Err(e) = conn.forward_recv_buf(data) {
+                        if let Err(e) = tx.forward_recv_buf(data) {
                             eprintln!("echo: forward_recv_buf failed: {e}");
                             return ParseResult::NeedMore;
                         }

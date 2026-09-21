@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ringline::{
-    AsyncEventHandler, ConfigBuilder, ConnCtx, ParseResult, RinglineBuilder, TlsConfig,
+    AsyncEventHandler, ConfigBuilder, Connection, ParseResult, RinglineBuilder, TlsConfig,
 };
 use ringline_h2::hpack::{Decoder, Encoder};
 use ringline_h2::{Frame, H2Connection, H2Event, HeaderField, Settings};
@@ -98,7 +98,7 @@ struct H2Server;
 
 impl AsyncEventHandler for H2Server {
     #[allow(clippy::manual_async_fn)]
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             // Create server-side H2 connection (we handle the server role manually).
             let mut recv_buf = Vec::new();

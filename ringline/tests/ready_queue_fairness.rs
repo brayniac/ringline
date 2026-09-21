@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
-use ringline::{AsyncEventHandler, ConnCtx, ParseResult, RinglineBuilder};
+use ringline::{AsyncEventHandler, Connection, ParseResult, RinglineBuilder};
 
 /// Set by the test to release the spinning task so shutdown can complete.
 static STOP: AtomicBool = AtomicBool::new(false);
@@ -46,7 +46,7 @@ fn yield_once() -> impl Future<Output = ()> {
 struct SpinOrPong;
 
 impl AsyncEventHandler for SpinOrPong {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             let mut spin = false;
             let n = conn

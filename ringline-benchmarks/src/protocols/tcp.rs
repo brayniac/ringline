@@ -124,13 +124,14 @@ impl ringline::AsyncEventHandler for RinglineEchoHandler {
     #[allow(clippy::manual_async_fn)]
     fn on_accept(
         &self,
-        conn: ringline::ConnCtx,
+        conn: ringline::Connection,
     ) -> impl std::future::Future<Output = ()> + 'static {
         async move {
+            let (mut tx, mut rx) = conn.split();
             loop {
-                let n = conn
+                let n = rx
                     .with_data(|data| {
-                        if conn.forward_recv_buf(data).is_err() {
+                        if tx.forward_recv_buf(data).is_err() {
                             return ringline::ParseResult::NeedMore;
                         }
                         ringline::ParseResult::Consumed(data.len())
@@ -318,7 +319,7 @@ impl ringline::AsyncEventHandler for RinglineTcpBench {
     #[allow(clippy::manual_async_fn)]
     fn on_accept(
         &self,
-        _conn: ringline::ConnCtx,
+        _conn: ringline::Connection,
     ) -> impl std::future::Future<Output = ()> + 'static {
         async {}
     }

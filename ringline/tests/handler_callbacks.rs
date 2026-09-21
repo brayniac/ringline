@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use ringline::{AsyncEventHandler, ConfigBuilder, ConnCtx, DriverCtx, RinglineBuilder};
+use ringline::{AsyncEventHandler, ConfigBuilder, ConnCtx, Connection, DriverCtx, RinglineBuilder};
 
 struct OnTickSpawner {
     spawn_attempted: Arc<AtomicBool>,
@@ -20,7 +20,7 @@ struct OnTickSpawner {
 }
 
 impl AsyncEventHandler for OnTickSpawner {
-    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
         async {}
     }
 
@@ -64,7 +64,7 @@ struct ObservedTickSpawner {
 }
 
 impl AsyncEventHandler for ObservedTickSpawner {
-    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
         async {}
     }
 
@@ -142,7 +142,7 @@ mod notify_observer {
 }
 
 impl AsyncEventHandler for OnNotifySpawner {
-    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
         async {}
     }
 

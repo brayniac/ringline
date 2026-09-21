@@ -17,7 +17,7 @@
 //! use ringline::{Config, RinglineBuilder};
 //! # struct H;
 //! # impl ringline::AsyncEventHandler for H {
-//! #     fn on_accept(&self, _: ringline::ConnCtx) -> impl std::future::Future<Output = ()> + 'static { async {} }
+//! #     fn on_accept(&self, _: ringline::Connection) -> impl std::future::Future<Output = ()> + 'static { async {} }
 //! #     fn create_for_worker(_: usize) -> Self { H }
 //! # }
 //!

@@ -37,7 +37,9 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use ringline::{AsyncEventHandler, ConfigBuilder, ConnCtx, ParseResult, RinglineBuilder, connect};
+use ringline::{
+    AsyncEventHandler, ConfigBuilder, Connection, ParseResult, RinglineBuilder, connect,
+};
 
 static TOTAL_BYTES: AtomicU64 = AtomicU64::new(0);
 static TOTAL_ROUNDS: AtomicU64 = AtomicU64::new(0);
@@ -95,7 +97,7 @@ fn size_for_round(mode: &str, i: u64, msg: usize, small: usize, large: usize) ->
 struct Bench;
 
 impl AsyncEventHandler for Bench {
-    fn on_accept(&self, _c: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, _c: Connection) -> impl Future<Output = ()> + 'static {
         async {}
     }
 

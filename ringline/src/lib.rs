@@ -8,12 +8,12 @@
 //! # Quick Start
 //!
 //! ```rust,no_run
-//! use ringline::{AsyncEventHandler, Config, ConnCtx, ParseResult, RinglineBuilder};
+//! use ringline::{AsyncEventHandler, Config, ConnCtx, Connection, ParseResult, RinglineBuilder};
 //!
 //! struct Echo;
 //!
 //! impl AsyncEventHandler for Echo {
-//!     fn on_accept(&self, conn: ConnCtx) -> impl std::future::Future<Output = ()> + 'static {
+//!     fn on_accept(&self, mut conn: Connection) -> impl std::future::Future<Output = ()> + 'static {
 //!         async move {
 //!             loop {
 //!                 let n = conn.with_data(|data| {
@@ -82,7 +82,7 @@
 //!
 //! ## Key Abstractions
 //!
-//! - **[`AsyncEventHandler`]** — Users implement this trait. `on_accept(ConnCtx)`
+//! - **[`AsyncEventHandler`]** — Users implement this trait. `on_accept(Connection)`
 //!   returns a future that runs for the connection's lifetime.
 //!
 //! - **[`ConnCtx`]** — Async connection handle. `with_data()`/`with_bytes()` for recv,
@@ -252,6 +252,8 @@ pub use runtime::io::BlockingJoinHandle;
 pub use runtime::io::ConnCtx;
 /// Future that completes when a connect finishes.
 pub use runtime::io::ConnectFuture;
+/// An accepted connection: the owned pair of halves handed to `on_accept`.
+pub use runtime::io::Connection;
 /// A monotonic clock deadline for absolute timers.
 pub use runtime::io::Deadline;
 /// Future that awaits a disk I/O completion (NVMe or Direct I/O).

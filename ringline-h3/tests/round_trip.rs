@@ -15,7 +15,7 @@ use quinn_proto::{
     ServerConfig,
 };
 use ringline::{
-    AsyncEventHandler, Config, ConfigBuilder, ConnCtx, RinglineBuilder, UdpCtx, select, sleep,
+    AsyncEventHandler, Config, ConfigBuilder, Connection, RinglineBuilder, UdpCtx, select, sleep,
 };
 use ringline_h3::{H3Connection, H3Event, HeaderField, Settings};
 use ringline_quic::{QuicConfig, QuicEndpoint};
@@ -111,7 +111,7 @@ struct H3Server;
 
 impl AsyncEventHandler for H3Server {
     #[allow(clippy::manual_async_fn)]
-    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
         async {}
     }
 

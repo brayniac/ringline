@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use ringline::{
-    AsyncEventHandler, ConfigBuilder, ConnCtx, ParseResult, RinglineBuilder, TlsConfig,
+    AsyncEventHandler, ConfigBuilder, Connection, ParseResult, RinglineBuilder, TlsConfig,
 };
 
 struct TlsEcho {
@@ -9,18 +9,19 @@ struct TlsEcho {
 }
 
 impl AsyncEventHandler for TlsEcho {
-    fn on_accept(&self, conn: ConnCtx) -> impl std::future::Future<Output = ()> + 'static {
+    fn on_accept(&self, conn: Connection) -> impl std::future::Future<Output = ()> + 'static {
         let worker_id = self.worker_id;
         async move {
+            let (mut tx, mut rx) = conn.split();
             eprintln!(
                 "[worker {worker_id}] TLS connection accepted {}",
-                conn.index()
+                tx.index()
             );
             loop {
-                let consumed = conn
+                let consumed = rx
                     .with_data(|data| {
                         // Handler sees plaintext — TLS is transparent.
-                        if let Err(e) = conn.send_nowait(data) {
+                        if let Err(e) = tx.send_nowait(data) {
                             eprintln!("[worker {worker_id}] send error: {e}");
                         }
                         ParseResult::Consumed(data.len())
@@ -30,10 +31,7 @@ impl AsyncEventHandler for TlsEcho {
                     break;
                 }
             }
-            eprintln!(
-                "[worker {worker_id}] TLS connection {} closed",
-                conn.index()
-            );
+            eprintln!("[worker {worker_id}] TLS connection {} closed", tx.index());
         }
     }
 

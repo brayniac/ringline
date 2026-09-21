@@ -10,7 +10,9 @@ use std::pin::Pin;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use ringline::{AsyncEventHandler, Config, ConfigBuilder, ConnCtx, ParseResult, RinglineBuilder};
+use ringline::{
+    AsyncEventHandler, Config, ConfigBuilder, Connection, ParseResult, RinglineBuilder,
+};
 use ringline_redis::Client;
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -63,9 +65,10 @@ struct BadRedisServer;
 
 impl AsyncEventHandler for BadRedisServer {
     #[allow(clippy::manual_async_fn)]
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
-            let n = conn
+            let (mut tx, mut rx) = conn.split();
+            let n = rx
                 .with_data(|data| {
                     if data.is_empty() {
                         return ParseResult::NeedMore;
@@ -73,7 +76,7 @@ impl AsyncEventHandler for BadRedisServer {
                     // Respond with something that looks like RESP but isn't valid.
                     // A valid RESP value starts with +, -, :, $, or *.
                     // This starts with 'X' which is not a valid RESP type byte.
-                    let _ = conn.send_nowait(b"XGARBAGE_NOT_RESP\r\n");
+                    let _ = tx.send_nowait(b"XGARBAGE_NOT_RESP\r\n");
                     ParseResult::Consumed(data.len())
                 })
                 .await;
@@ -98,7 +101,7 @@ struct BadRedisClientHandler;
 
 impl AsyncEventHandler for BadRedisClientHandler {
     #[allow(clippy::manual_async_fn)]
-    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
         async {}
     }
 

@@ -21,7 +21,7 @@ use std::net::TcpStream;
 use std::time::Duration;
 
 use ringline::{
-    AsyncEventHandler, Config, ConnCtx, GuardBox, ParseResult, RegionId, RinglineBuilder,
+    AsyncEventHandler, Config, Connection, GuardBox, ParseResult, RegionId, RinglineBuilder,
     SendGuard, SendPart,
 };
 
@@ -64,7 +64,7 @@ impl SendGuard for VecGuard {
 struct AwaitedBatchSender;
 
 impl AsyncEventHandler for AwaitedBatchSender {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             let n = conn
                 .with_data(|data| ParseResult::Consumed(data.len()))
@@ -113,7 +113,7 @@ impl AsyncEventHandler for AwaitedBatchSender {
 struct EmptyBatchSender;
 
 impl AsyncEventHandler for EmptyBatchSender {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             let n = conn
                 .with_data(|data| ParseResult::Consumed(data.len()))

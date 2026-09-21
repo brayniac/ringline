@@ -18,7 +18,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use resp_proto::Value;
-use ringline::{AsyncEventHandler, Config, ConfigBuilder, ConnCtx, ParseResult, RinglineBuilder};
+use ringline::{
+    AsyncEventHandler, Config, ConfigBuilder, ConnCtx, Connection, ParseResult, RinglineBuilder,
+};
 use ringline_redis::{Client, Error, OpKind, SegmentSource};
 
 // ── Config ───────────────────────────────────────────────────────────────
@@ -103,7 +105,7 @@ struct StreamStubServer;
 
 impl AsyncEventHandler for StreamStubServer {
     #[allow(clippy::manual_async_fn)]
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             loop {
                 let n = conn
@@ -172,7 +174,7 @@ struct ClientHandler;
 
 impl AsyncEventHandler for ClientHandler {
     #[allow(clippy::manual_async_fn)]
-    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
         async {}
     }
 

@@ -15,7 +15,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use resp_proto::{Request, Value};
-use ringline::{AsyncEventHandler, ConfigBuilder, ConnCtx, RinglineBuilder};
+use ringline::{AsyncEventHandler, ConfigBuilder, Connection, RinglineBuilder};
 use ringline_redis::Client;
 
 const ADDR: &str = "127.0.0.1:6379";
@@ -40,7 +40,7 @@ fn lrange_over_1024_elements_round_trips() {
     struct H;
     impl AsyncEventHandler for H {
         #[allow(clippy::manual_async_fn)]
-        fn on_accept(&self, _c: ConnCtx) -> impl Future<Output = ()> + 'static {
+        fn on_accept(&self, _c: Connection) -> impl Future<Output = ()> + 'static {
             async {}
         }
         fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {

@@ -19,19 +19,22 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use ringline::{AsyncEventHandler, Config, ConfigBuilder, ConnCtx, ParseResult, RinglineBuilder};
+use ringline::{
+    AsyncEventHandler, Config, ConfigBuilder, Connection, ParseResult, RinglineBuilder,
+};
 
 // ── Async echo handler ──────────────────────────────────────────────
 
 struct AsyncEcho;
 
 impl AsyncEventHandler for AsyncEcho {
-    fn on_accept(&self, conn: ConnCtx) -> impl std::future::Future<Output = ()> + 'static {
+    fn on_accept(&self, conn: Connection) -> impl std::future::Future<Output = ()> + 'static {
         async move {
+            let (mut tx, mut rx) = conn.split();
             loop {
-                let n = conn
+                let n = rx
                     .with_data(|data| {
-                        let _ = conn.send_nowait(data);
+                        let _ = tx.send_nowait(data);
                         ParseResult::Consumed(data.len())
                     })
                     .await;

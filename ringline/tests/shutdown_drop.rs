@@ -13,12 +13,12 @@
 use std::future::Future;
 use std::time::{Duration, Instant};
 
-use ringline::{AsyncEventHandler, Config, ConfigBuilder, ConnCtx, RinglineBuilder};
+use ringline::{AsyncEventHandler, Config, ConfigBuilder, ConnCtx, Connection, RinglineBuilder};
 
 struct NoopHandler;
 
 impl AsyncEventHandler for NoopHandler {
-    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
         async {}
     }
 

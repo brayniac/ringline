@@ -15,12 +15,12 @@
 use std::future::Future;
 use std::io;
 
-use ringline::{AsyncEventHandler, ConfigBuilder, ConnCtx, Error, RinglineBuilder};
+use ringline::{AsyncEventHandler, ConfigBuilder, ConnCtx, Connection, Error, RinglineBuilder};
 
 struct NoopHandler;
 
 impl AsyncEventHandler for NoopHandler {
-    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
         async {}
     }
 

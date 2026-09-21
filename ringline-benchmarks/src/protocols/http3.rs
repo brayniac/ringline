@@ -355,7 +355,7 @@ impl ringline::AsyncEventHandler for H3EchoHandler {
     #[allow(clippy::manual_async_fn)]
     fn on_accept(
         &self,
-        _conn: ringline::ConnCtx,
+        _conn: ringline::Connection,
     ) -> impl std::future::Future<Output = ()> + 'static {
         async {}
     }
@@ -508,7 +508,7 @@ impl ringline::AsyncEventHandler for RinglineH3Bench {
     #[allow(clippy::manual_async_fn)]
     fn on_accept(
         &self,
-        _conn: ringline::ConnCtx,
+        _conn: ringline::Connection,
     ) -> impl std::future::Future<Output = ()> + 'static {
         async {}
     }

@@ -17,6 +17,7 @@ use crate::runtime::io::{ConnCtx, DriverState, UdpCtx, set_driver_state_guarded}
 use crate::runtime::send_capacity::BoundedSendId;
 use crate::runtime::waker::{STANDALONE_BIT, conn_waker, standalone_waker};
 use crate::runtime::{CURRENT_TASK_ID, Executor, TimerSlotPool};
+use ringline::Connection;
 
 /// Async event loop that reuses `Driver` infrastructure with an `Executor`
 /// for polling connection futures instead of push-based callbacks.
@@ -4126,12 +4127,17 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     fn spawn_accept_task(&mut self, conn_index: u32) {
         let generation = self.driver.connections.generation(conn_index);
         let conn_ctx = ConnCtx::new(conn_index, generation);
+        // The handler owns the read side for the connection's lifetime; record
+        // the claim here, since `Connection::for_accept` cannot reach the
+        // driver from outside a task poll.
+        self.driver.recv_half_taken[conn_index as usize] = true;
+        let conn = crate::Connection::for_accept(conn_ctx);
         // SAFETY: `AssertUnwindSafe` is required because `self.handler` is
         // not `UnwindSafe`. A panic here is treated like a fatal handler
         // error — the connection is closed; the worker continues serving
         // others.
         let future_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            Box::pin(self.handler.on_accept(conn_ctx))
+            Box::pin(self.handler.on_accept(conn))
         }));
         let future = match future_result {
             Ok(f) => f,
@@ -4718,7 +4724,7 @@ mod tests {
 
     impl AsyncEventHandler for NoopHandler {
         #[allow(clippy::manual_async_fn)]
-        fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
             async {}
         }
         fn create_for_worker(_id: usize) -> Self {
