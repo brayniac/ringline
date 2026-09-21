@@ -447,6 +447,11 @@ impl AsyncEventHandler for TlsClientHandler {
                     return;
                 }
             };
+            // Reading an outbound connection goes through its read half.
+            let mut conn_rx = match conn.take_recv() {
+                Ok(rx) => rx,
+                Err(_) => return,
+            };
 
             // Send data over TLS and read back.
             let msg = b"ringline-to-ringline TLS echo";
@@ -457,7 +462,7 @@ impl AsyncEventHandler for TlsClientHandler {
             }
 
             let mut received = Vec::new();
-            let n = conn
+            let n = conn_rx
                 .with_data(|data| {
                     received.extend_from_slice(data);
                     ParseResult::Consumed(data.len())
@@ -1141,6 +1146,11 @@ impl AsyncEventHandler for TlsForwardProxy {
                 },
                 Err(_) => return,
             };
+            // Reading an outbound connection goes through its read half.
+            let mut backend_rx = match backend.take_recv() {
+                Ok(rx) => rx,
+                Err(_) => return,
+            };
 
             loop {
                 let mut hdr = [0u8; 4];
@@ -1171,7 +1181,7 @@ impl AsyncEventHandler for TlsForwardProxy {
                 let mut echo = Vec::with_capacity(len);
                 while echo.len() < len {
                     let remaining = len - echo.len();
-                    let got = backend
+                    let got = backend_rx
                         .with_data(|data| {
                             let take = data.len().min(remaining);
                             echo.extend_from_slice(&data[..take]);

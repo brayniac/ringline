@@ -389,6 +389,11 @@ mod ringline_client {
                 return;
             }
         };
+        // Reading an outbound connection goes through its read half.
+        let mut conn_rx = match conn.take_recv() {
+            Ok(rx) => rx,
+            Err(_) => return,
+        };
 
         let mut local_ops: u64 = 0;
         let mut samples: Vec<u64> = Vec::with_capacity(1_000_000);
@@ -416,7 +421,7 @@ mod ringline_client {
             let mut recorded = 0usize;
             while got < batch.len() {
                 let remaining = batch.len() - got;
-                let consumed = conn
+                let consumed = conn_rx
                     .with_data(|data| {
                         let take = data.len().min(remaining);
                         ParseResult::Consumed(take)
@@ -472,6 +477,11 @@ mod ringline_client {
                 eprintln!("  ringline client connect setup failed: {e}");
                 return;
             }
+        };
+        // Reading an outbound connection goes through its read half.
+        let mut conn_rx = match conn.take_recv() {
+            Ok(rx) => rx,
+            Err(_) => return,
         };
 
         let msg_size = state.msg_size;
@@ -552,7 +562,7 @@ mod ringline_client {
             // a fixed msg_size, the number of newly-complete responses is
             // (partial + consumed) / msg_size; the leftover is carried in
             // `partial`.
-            let consumed = conn
+            let consumed = conn_rx
                 .with_data(|data| ParseResult::Consumed(data.len()))
                 .await;
             if consumed == 0 {

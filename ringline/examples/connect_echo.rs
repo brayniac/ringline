@@ -37,12 +37,20 @@ impl AsyncEventHandler for ConnectHandler {
             match connect_future.await {
                 Ok(conn) => {
                     eprintln!("[worker {worker_id}] connected to {target}");
+                    // Reading an outbound connection goes through its read half.
+                    let mut conn_rx = match conn.take_recv() {
+                        Ok(rx) => rx,
+                        Err(e) => {
+                            eprintln!("[worker {worker_id}] take_recv error: {e}");
+                            return;
+                        }
+                    };
                     let msg: &[u8] = b"Hello from ringline!\n";
                     if let Err(e) = conn.send_nowait(msg) {
                         eprintln!("[worker {worker_id}] send error: {e}");
                         return;
                     }
-                    let n = conn
+                    let n = conn_rx
                         .with_data(|data| {
                             let text = String::from_utf8_lossy(data);
                             eprintln!("[worker {worker_id}] received: {}", text.trim());

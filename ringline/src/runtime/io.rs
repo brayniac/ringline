@@ -614,6 +614,24 @@ pub fn request_shutdown() -> io::Result<()> {
 
 /// Async connection context providing send, recv, and connect operations.
 ///
+/// # The read entry points are crate-private
+///
+/// `with_data`, `with_bytes`, `segments`, `recv_owned_segment`, `end_segments`
+/// and friends are `pub(crate)` as of step 4b: reading a connection goes
+/// through [`Connection`] or [`RecvHalf`], which are not `Copy`, so the read
+/// side cannot be aliased. A `ConnCtx` is now a send/identity/lifecycle handle
+/// plus a way to *obtain* the read side ([`take_recv`](Self::take_recv),
+/// [`split`](Self::split)).
+///
+/// The forwarding entry points (`forward_to`, `forward_to_conn`,
+/// `forward_held`, `enable_recv_forward`, `run_direct_echo`) stay public on
+/// purpose: they move bytes kernel-side from source to sink and never surface
+/// them to the caller, so they cannot be used to observe a stream someone else
+/// is reading. Their own "one forward at a time" rule is refused at runtime by
+/// the driver, and that refusal stays reachable — and therefore testable —
+/// only through this handle, because `&mut RecvHalf` turns a second concurrent
+/// forward into a compile error.
+///
 /// Outbound connections come back as a `ConnCtx` from [`connect`](crate::connect);
 /// accepted ones arrive as a [`Connection`] in [`AsyncEventHandler::on_accept`](crate::AsyncEventHandler::on_accept).
 /// It exposes an async API for reading data ([`with_data`](Self::with_data),
@@ -971,7 +989,7 @@ impl ConnCtx {
     /// If the closure returns `NeedMore` or `Consumed(0)` on non-empty data
     /// (incomplete parse), the future parks and retries when more data arrives.
     /// The closure must therefore be safe to call multiple times (`FnMut`).
-    pub fn with_data<F: FnMut(&[u8]) -> ParseResult>(&self, f: F) -> WithDataFuture<F> {
+    pub(crate) fn with_data<F: FnMut(&[u8]) -> ParseResult>(&self, f: F) -> WithDataFuture<F> {
         WithDataFuture {
             conn_index: self.conn_index,
             generation: self.generation,
@@ -1008,7 +1026,7 @@ impl ConnCtx {
     /// hung up" from "the transport broke". Check
     /// [`eof_truncated`](Self::eof_truncated) after `Ok(0)` on TLS
     /// connections, exactly as with `with_data`.
-    pub fn with_data_result<F: FnMut(&[u8]) -> ParseResult>(
+    pub(crate) fn with_data_result<F: FnMut(&[u8]) -> ParseResult>(
         &self,
         f: F,
     ) -> WithDataResultFuture<F> {
@@ -1025,7 +1043,7 @@ impl ConnCtx {
     ///
     /// This enables zero-copy RESP parsing: the parser can call `bytes.slice()`
     /// to extract sub-ranges without allocating.
-    pub fn with_bytes<F: FnMut(Bytes) -> ParseResult>(&self, f: F) -> WithBytesFuture<F> {
+    pub(crate) fn with_bytes<F: FnMut(Bytes) -> ParseResult>(&self, f: F) -> WithBytesFuture<F> {
         WithBytesFuture {
             conn_index: self.conn_index,
             generation: self.generation,
@@ -1139,7 +1157,7 @@ impl ConnCtx {
     ///
     /// io_uring only — segmented delivery is backed by the provided-buffer ring.
     #[cfg(has_io_uring)]
-    pub fn segments(&self) -> io::Result<SegmentReader<'_>> {
+    pub(crate) fn segments(&self) -> io::Result<SegmentReader<'_>> {
         self.segments_via(SegmentedEntry::ViaConn)
     }
 
@@ -1185,7 +1203,7 @@ impl ConnCtx {
     ///
     /// io_uring only — segmented delivery is backed by the provided-buffer ring.
     #[cfg(has_io_uring)]
-    pub fn recv_owned_segment(&self) -> io::Result<RecvOwnedSegment> {
+    pub(crate) fn recv_owned_segment(&self) -> io::Result<RecvOwnedSegment> {
         self.recv_owned_segment_via(SegmentedEntry::ViaConn)
     }
 
@@ -1220,7 +1238,7 @@ impl ConnCtx {
     ///
     /// io_uring only — segmented delivery is backed by the provided-buffer ring.
     #[cfg(has_io_uring)]
-    pub fn end_segments(&self) -> io::Result<()> {
+    pub(crate) fn end_segments(&self) -> io::Result<()> {
         // `settle_forward_end` is the shared "drain held segments into the
         // accumulator, reset the delivery domain to default" routine (named for
         // its first caller, the Mode A `forward_to` completion). Reused here for
@@ -1282,7 +1300,7 @@ impl ConnCtx {
     ///
     /// io_uring only — segmented delivery is backed by the provided-buffer ring.
     #[cfg(has_io_uring)]
-    pub fn with_segments<F>(&self, f: F) -> WithSegmentsFuture<F>
+    pub(crate) fn with_segments<F>(&self, f: F) -> WithSegmentsFuture<F>
     where
         F: FnMut(&SegChain<'_>) -> SegConsumed,
     {
@@ -1540,7 +1558,7 @@ impl ConnCtx {
 
     /// Remove the recv sink and return the number of bytes written to it.
     /// Returns 0 if no sink was active.
-    pub fn take_recv_sink(&self) -> usize {
+    pub(crate) fn take_recv_sink(&self) -> usize {
         with_state(
             |_driver, executor| match executor.recv_sinks[self.conn_index as usize].take() {
                 Some(sink) => sink.pos,
@@ -1554,7 +1572,7 @@ impl ConnCtx {
     ///
     /// Use this with [`set_recv_sink()`](Self::set_recv_sink) to wait for
     /// direct-to-buffer writes without processing accumulator data.
-    pub fn recv_ready(&self) -> RecvReadyFuture {
+    pub(crate) fn recv_ready(&self) -> RecvReadyFuture {
         RecvReadyFuture {
             conn_index: self.conn_index,
             generation: self.generation,
@@ -1563,7 +1581,10 @@ impl ConnCtx {
 
     /// Non-blocking accumulator access. Calls `f` with buffered data if any,
     /// returning `Some(result)`. Returns `None` if the accumulator is empty.
-    pub fn try_with_data<F: FnOnce(&[u8]) -> ParseResult>(&self, f: F) -> Option<ParseResult> {
+    pub(crate) fn try_with_data<F: FnOnce(&[u8]) -> ParseResult>(
+        &self,
+        f: F,
+    ) -> Option<ParseResult> {
         with_state(|driver, _executor| {
             let data = driver.accumulators.data(self.conn_index);
             if data.is_empty() {
@@ -2341,7 +2362,7 @@ impl ConnCtx {
     /// that delivered the EOF and this check run before the slot is
     /// recycled); it returns `false` for plaintext connections, for clean
     /// TLS shutdowns, and once the slot has been reused.
-    pub fn eof_truncated(&self) -> bool {
+    pub(crate) fn eof_truncated(&self) -> bool {
         with_state(|driver, _| {
             driver
                 .connections
@@ -2400,7 +2421,7 @@ impl ConnCtx {
     /// `SCM_TIMESTAMPING` cmsg. Only available when the `timestamps` feature
     /// is enabled and `Config::timestamps(true)` is set.
     #[cfg(feature = "timestamps")]
-    pub fn recv_timestamp(&self) -> u64 {
+    pub(crate) fn recv_timestamp(&self) -> u64 {
         with_state(|driver, _| {
             driver
                 .connections
