@@ -82,10 +82,8 @@ impl AsyncEventHandler for BurstSender {
 /// mutably borrowed by the in-flight recv future. That is the whole point of
 /// the split: a `SendHalf` that borrowed the `RecvHalf` would not compile here,
 /// and an echo is the most ordinary thing a connection does.
-#[cfg(has_io_uring)]
 struct SplitEcho;
 
-#[cfg(has_io_uring)]
 impl AsyncEventHandler for SplitEcho {
     fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
         async move {
@@ -7416,7 +7414,6 @@ fn a_second_forward_on_one_connection_is_refused_with_ebusy() {
 
 /// A connection driven entirely through the split halves round-trips, and does
 /// so with the send issued while the read side is borrowed.
-#[cfg(has_io_uring)]
 #[test]
 fn split_halves_echo_round_trip() {
     // Bind :0 and read the resolved port back, rather than going through
@@ -7444,6 +7441,68 @@ fn split_halves_echo_round_trip() {
     let big: Vec<u8> = (0..8192).map(|i| (i % 256) as u8).collect();
     assert_eq!(echo_round_trip(&addr, &big), big);
 
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
+/// The read side is exclusive on **both** backends: a second `split()` on a
+/// connection whose half is still out must be refused with `EBUSY`.
+///
+/// The verdict travels over the wire because the mio event loop has no
+/// in-process test harness for driver state — asserting through a real
+/// connection is what works uniformly on both.
+struct DoubleSplitReporter;
+
+impl AsyncEventHandler for DoubleSplitReporter {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            let (mut tx, _rx) = match conn.split() {
+                Ok(halves) => halves,
+                Err(e) => panic!("first split must succeed: {e}"),
+            };
+            // `_rx` is still alive, so the read side is still claimed.
+            let verdict = match conn.split() {
+                Err(e) if e.raw_os_error() == Some(libc::EBUSY) => "EBUSY",
+                Err(_) => "WRONG-ERRNO",
+                Ok(_) => "HANDED-OUT-TWICE",
+            };
+            let _ = tx.send_nowait(verdict.as_bytes());
+            // Hold the halves until the client has read the verdict.
+            ringline::sleep(Duration::from_millis(200)).await;
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        DoubleSplitReporter
+    }
+}
+
+#[test]
+fn a_second_split_is_refused_on_both_backends() {
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
+        .bind("127.0.0.1:0".parse().unwrap())
+        .launch::<DoubleSplitReporter>()
+        .expect("launch failed");
+    let addr = shutdown
+        .bound_addr()
+        .expect("bound_addr after a TCP bind")
+        .to_string();
+    wait_for_server(&addr);
+
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut buf = [0u8; 32];
+    let n = stream.read(&mut buf).expect("verdict from the handler");
+    assert_eq!(
+        &buf[..n],
+        b"EBUSY",
+        "a second split while the read half is live must be refused with EBUSY"
+    );
+
+    drop(stream);
     shutdown.shutdown();
     for h in handles {
         h.join().unwrap().unwrap();

@@ -200,6 +200,12 @@ pub(crate) struct Driver {
     pub(crate) forward_resume: Vec<u32>,
     /// Membership flag for `forward_resume` (no duplicate entries).
     pub(crate) forward_resume_flag: Vec<bool>,
+    /// Per connection index: is a [`RecvHalf`](crate::RecvHalf) currently out?
+    ///
+    /// The mio backend has no segmented recv domain, so unlike the io_uring
+    /// driver there is no companion `segment_reader_live` — this is the whole
+    /// recv claim here.
+    pub(crate) recv_half_taken: Vec<bool>,
     /// Queued sends allowed on a sink before its source stops reading. Shares
     /// `Config::forward_hold_cap` with the io_uring hold cap: same intent —
     /// bound one slow forward — applied to the queue mio actually has.
@@ -385,6 +391,7 @@ impl Driver {
             forward_feeder: vec![None; max_conn],
             forward_resume: Vec::new(),
             forward_resume_flag: vec![false; max_conn],
+            recv_half_taken: vec![false; max_conn],
             forward_hold_cap: config.forward_hold_cap,
             send_completions: (0..max_conn).map(|_| VecDeque::new()).collect(),
             bounded_send_completions: VecDeque::new(),
@@ -470,6 +477,18 @@ impl Driver {
     /// happens in the event loop's `drain_pending_closes`, which has
     /// Executor access and defers until `pending_sends` has drained.
     /// Marking `Closing` here makes the call idempotent.
+    /// Drop any recv-side exclusivity claims held against `conn_index`.
+    ///
+    /// Called at the slot's recycle point. Named to match
+    /// `uring::driver::Driver::clear_recv_claims`, which additionally clears
+    /// `segment_reader_live` — mio has no segmented domain, so there is only
+    /// the one flag here.
+    pub(crate) fn clear_recv_claims(&mut self, conn_index: u32) {
+        if let Some(taken) = self.recv_half_taken.get_mut(conn_index as usize) {
+            *taken = false;
+        }
+    }
+
     pub(crate) fn close_connection(&mut self, conn_index: u32) {
         let idx = conn_index as usize;
 
@@ -552,6 +571,12 @@ impl Driver {
         self.send_queues[idx].queue.clear();
         self.send_queues[idx].in_flight = false;
         self.send_queues[idx].close_pending = false;
+
+        // A future dropped during teardown may have owned a `RecvHalf` whose
+        // `Drop` could not run (no driver in scope). Clear the claim before the
+        // slot is reused, or its next occupant inherits it and can never take
+        // its own read side.
+        self.clear_recv_claims(conn_index);
 
         if self.connections.get(conn_index).is_some() {
             self.connections.release(conn_index);

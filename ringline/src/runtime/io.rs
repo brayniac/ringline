@@ -903,7 +903,6 @@ impl ConnCtx {
     ///
     /// Same as [`take_recv`](Self::take_recv): `EBUSY` if the read side is
     /// already out, `EPIPE` if this handle is stale.
-    #[cfg(has_io_uring)]
     pub fn split(&self) -> io::Result<(SendHalf, RecvHalf)> {
         let rx = self.take_recv()?;
         Ok((
@@ -915,7 +914,6 @@ impl ConnCtx {
         ))
     }
 
-    #[cfg(has_io_uring)]
     pub fn take_recv(&self) -> io::Result<RecvHalf> {
         with_state(|driver, _executor| {
             if driver.connections.generation(self.conn_index) != self.generation {
@@ -3096,15 +3094,17 @@ impl<F: FnMut(Bytes) -> ParseResult + Unpin> Future for WithBytesFuture<F> {
 /// exclusivity rule ("forward *or* send, not both") that this step does not yet
 /// enforce. See `docs/connection-handle-ownership-design.md`.
 ///
-/// io_uring only, for now.
-#[cfg(has_io_uring)]
+/// Available on both backends. The segmented-recv methods
+/// ([`segments`](Self::segments), [`recv_owned_segment`](Self::recv_owned_segment),
+/// [`with_segments`](Self::with_segments), [`end_segments`](Self::end_segments)
+/// and [`forward_to`](Self::forward_to)) are io_uring-only, exactly as they are
+/// on [`ConnCtx`] — mio has no segmented recv domain.
 pub struct RecvHalf {
     conn: ConnCtx,
     /// Same reason as [`ConnCtx`]: pinned to its owning worker thread.
     _not_send: PhantomData<*const ()>,
 }
 
-#[cfg(has_io_uring)]
 impl RecvHalf {
     /// See [`ConnCtx::with_data`].
     pub fn with_data<F: FnMut(&[u8]) -> ParseResult>(&mut self, f: F) -> WithDataFuture<F> {
@@ -3126,16 +3126,19 @@ impl RecvHalf {
 
     /// See [`ConnCtx::segments`]. The returned reader borrows this half, so a
     /// second one is a compile error rather than an `EBUSY`.
+    #[cfg(has_io_uring)]
     pub fn segments(&mut self) -> io::Result<SegmentReader<'_>> {
         self.conn.segments_via(SegmentedEntry::ViaHalf)
     }
 
     /// See [`ConnCtx::recv_owned_segment`].
+    #[cfg(has_io_uring)]
     pub fn recv_owned_segment(&mut self) -> io::Result<RecvOwnedSegment> {
         self.conn.recv_owned_segment_via(SegmentedEntry::ViaHalf)
     }
 
     /// See [`ConnCtx::with_segments`].
+    #[cfg(has_io_uring)]
     pub fn with_segments<F>(&mut self, f: F) -> WithSegmentsFuture<F>
     where
         F: FnMut(&SegChain<'_>) -> SegConsumed,
@@ -3145,6 +3148,7 @@ impl RecvHalf {
 
     /// See [`ConnCtx::end_segments`]. Leaves the segmented domain and restores
     /// the default read path; the half stays valid and can read again.
+    #[cfg(has_io_uring)]
     pub fn end_segments(&mut self) -> io::Result<()> {
         self.conn.end_segments()
     }
@@ -3155,6 +3159,7 @@ impl RecvHalf {
     }
 
     /// See [`ConnCtx::forward_to`].
+    #[cfg(has_io_uring)]
     pub fn forward_to<'h, 's: 'h>(
         &'h mut self,
         sink: &'s SinkFd<'s>,
@@ -3164,11 +3169,26 @@ impl RecvHalf {
     }
 
     /// See [`ConnCtx::forward_to_conn`].
+    #[cfg(has_io_uring)]
     pub fn forward_to_conn<'h, 's: 'h>(
         &'h mut self,
         sink: &'s ConnCtx,
         len: usize,
     ) -> ForwardToFuture<'h> {
+        self.conn.forward_to_conn(sink, len)
+    }
+
+    /// See [`ConnCtx::forward_to_conn`].
+    ///
+    /// The two backends return different futures (io_uring forwards from the
+    /// held provided buffers; mio pumps through the accumulator), so this is
+    /// two signatures rather than one.
+    #[cfg(not(has_io_uring))]
+    pub fn forward_to_conn<'h, 's: 'h>(
+        &'h mut self,
+        sink: &'s ConnCtx,
+        len: usize,
+    ) -> ForwardToConnFuture<'s> {
         self.conn.forward_to_conn(sink, len)
     }
 }
@@ -3193,14 +3213,12 @@ impl RecvHalf {
 /// enforced** — a connection that is the sink of a `forward_to_conn` must not
 /// be sent to concurrently. See `docs/connection-handle-ownership-design.md`.
 ///
-/// io_uring only, for now.
-#[cfg(has_io_uring)]
+/// Available on both backends.
 pub struct SendHalf {
     conn: ConnCtx,
     _not_send: PhantomData<*const ()>,
 }
 
-#[cfg(has_io_uring)]
 impl SendHalf {
     /// See [`ConnCtx::send`].
     pub fn send(&mut self, data: &[u8]) -> io::Result<SendFuture> {
@@ -3255,7 +3273,6 @@ impl SendHalf {
     }
 }
 
-#[cfg(has_io_uring)]
 impl Drop for RecvHalf {
     /// Release the claim, **if it is still ours**.
     ///
