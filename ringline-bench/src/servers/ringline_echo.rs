@@ -23,7 +23,9 @@ impl AsyncEventHandler for EchoHandler {
                 // No `return` needed: the fallback below is cfg'd out whenever
                 // this arm is compiled in. (Never linted before #402, because
                 // this block was dead on every platform.)
-                tx.run_direct_echo().await;
+                // A whole-connection operation: it belongs to neither half,
+                // so it goes through the handle underneath.
+                tx.as_conn().run_direct_echo().await;
             }
             #[cfg(not(has_io_uring))]
             loop {

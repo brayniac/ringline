@@ -143,7 +143,7 @@ impl AsyncEventHandler for StreamStubServer {
     #[allow(clippy::manual_async_fn)]
     fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
-            let (mut tx, mut rx) = tx.split();
+            let (mut tx, mut rx) = conn.split();
             loop {
                 let n = rx
                     .with_bytes(|bytes| {
