@@ -7991,22 +7991,82 @@ mod tests {
             Ok(_) => panic!("the read side was handed out twice"),
         }
 
-        // Dropping only the send half must NOT release the read claim: the
-        // reader is still live and still exclusive. `SendHalf` has no `Drop`
-        // today, so this holds trivially — but `clear_conn_claims` clears
-        // *both* flags, so the day the write side grows a claim of its own and
-        // reaches for that helper, this is what catches it.
-        {
-            let _tx = tx;
-        }
+        // Dropping only the send half releases the *write* claim and leaves
+        // the read claim alone — the reader is still live and still exclusive.
+        //
+        // The drop happens inside `with_driver_state` on purpose: both halves'
+        // `Drop` go through `try_with_state`, so a half dropped with no driver
+        // in scope cannot release anything. In production that is covered by
+        // `clear_conn_claims` at the slot's recycle point; in a unit test there
+        // is no recycle, so dropping outside the driver would strand the claim
+        // and the re-split below would fail with `EBUSY`. It did, before this
+        // was fixed.
+        with_driver_state(&mut el, || drop(tx));
         assert!(
             el.driver.recv_half_taken[conn_index as usize],
             "dropping the send half must not release the read claim"
+        );
+        assert!(
+            !el.driver.send_half_taken[conn_index as usize],
+            "dropping the send half releases the write claim"
         );
 
         with_driver_state(&mut el, || drop(rx));
         assert!(!el.driver.recv_half_taken[conn_index as usize]);
         let _again = with_driver_state(&mut el, || conn.split()).expect("splittable again");
+    }
+
+    /// Taking the write side twice is refused, and dropping it hands it back.
+    #[test]
+    fn take_send_is_exclusive_and_released_on_drop() {
+        let mut el = make_test_loop_with_config(config_with_reserve(16));
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let conn = ConnCtx::new(conn_index, generation);
+
+        let tx = with_driver_state(&mut el, || conn.take_send()).expect("first take_send");
+        assert!(el.driver.send_half_taken[conn_index as usize]);
+
+        match with_driver_state(&mut el, || conn.take_send()) {
+            Err(e) => assert_eq!(
+                e.raw_os_error(),
+                Some(libc::EBUSY),
+                "a second take_send must be refused with EBUSY"
+            ),
+            Ok(_) => panic!("the write side was handed out twice"),
+        }
+
+        // `split` needs both, so it is refused too — and must not strand the
+        // read claim on its way out.
+        match with_driver_state(&mut el, || conn.split()) {
+            Err(e) => assert_eq!(e.raw_os_error(), Some(libc::EBUSY)),
+            Ok(_) => panic!("split must not succeed while the write side is out"),
+        }
+        assert!(
+            !el.driver.recv_half_taken[conn_index as usize],
+            "a split refused on the write claim must release the read claim it took"
+        );
+
+        with_driver_state(&mut el, || drop(tx));
+        assert!(!el.driver.send_half_taken[conn_index as usize]);
+        let _again = with_driver_state(&mut el, || conn.take_send()).expect("available again");
+    }
+
+    /// A stale handle must not take the write side of the slot's new occupant.
+    #[test]
+    fn take_send_refuses_a_stale_handle() {
+        let mut el = make_test_loop_with_config(config_with_reserve(16));
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let stale = ConnCtx::new(conn_index, generation.wrapping_add(1));
+        match with_driver_state(&mut el, || stale.take_send()) {
+            Err(e) => assert_eq!(e.raw_os_error(), Some(libc::EPIPE)),
+            Ok(_) => panic!("a stale handle must not take the write side"),
+        }
+        assert!(
+            !el.driver.send_half_taken[conn_index as usize],
+            "a refused take_send must not leave a claim behind"
+        );
     }
 
     /// A stale handle must not split the slot's new occupant, for the same
