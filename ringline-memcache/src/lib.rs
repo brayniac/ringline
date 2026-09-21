@@ -17,7 +17,7 @@
 //! use ringline_memcache::Client;
 //!
 //! async fn example(conn: ConnCtx) -> Result<(), ringline_memcache::Error> {
-//!     let mut client = Client::new(conn);
+//!     let mut client = Client::new(conn)?;
 //!     client.set("hello", "world").await?;
 //!     let val = client.get("hello").await?;
 //!     assert_eq!(val.unwrap().data.as_ref(), b"world");
@@ -54,7 +54,7 @@
 //! use ringline_memcache::{Client, CompletedOp};
 //!
 //! async fn pipelined_example(conn: ConnCtx) -> Result<(), ringline_memcache::Error> {
-//!     let mut client = Client::new(conn);
+//!     let mut client = Client::new(conn)?;
 //!
 //!     // Fire multiple requests (synchronous, non-blocking)
 //!     client.fire_get(b"session:abc", 1)?;
@@ -134,7 +134,7 @@ use std::time::Instant;
 use bytes::Bytes;
 use memcache_proto::binary::BinaryRequest;
 use memcache_proto::{Request as McRequest, ResponseBytes as McResponseBytes, ValueBytes};
-use ringline::{ConnCtx, GuardBox, ParseResult, SendGuard};
+use ringline::{ConnCtx, GuardBox, ParseResult, RecvHalf, SendGuard, SendHalf};
 
 /// Callback type invoked after each command completes.
 type ResultCallback = Box<dyn Fn(&CommandResult)>;
@@ -481,16 +481,51 @@ impl ClientBuilder {
     /// this returns a [`BinaryClient`] rather than a [`Client`]: the ASCII
     /// request/response methods are simply absent from its surface instead of
     /// failing at runtime. Use [`build`](Self::build) for an ASCII [`Client`].
-    pub fn build_binary(self) -> BinaryClient {
-        let mut client = self.build();
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Client::new`]: the read side must be free.
+    pub fn build_binary(self) -> Result<BinaryClient, Error> {
+        let mut client = self.build()?;
+        client.binary = true;
+        Ok(BinaryClient { inner: client })
+    }
+
+    /// [`build_binary`](Self::build_binary) without the driver. See
+    /// [`build_for_test`](Self::build_for_test).
+    #[cfg(test)]
+    pub(crate) fn build_binary_for_test(self) -> BinaryClient {
+        let mut client = self.build_for_test();
         client.binary = true;
         BinaryClient { inner: client }
     }
 
     /// Build the client.
-    pub fn build(self) -> Client {
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Client::new`]: the read side must be free.
+    pub fn build(self) -> Result<Client, Error> {
+        let (tx, rx) = self.conn.split()?;
+        Ok(self.finish(tx, rx))
+    }
+
+    /// `build` without the driver, for the in-memory unit tests.
+    ///
+    /// See [`ConnCtx::split_for_test`]: the halves are unclaimed and the
+    /// connection is dangling, so the result is only safe on the buffered
+    /// paths (encoders, write buffer, pending queue) that never reach the
+    /// wire — the same contract `ConnCtx::for_test` already carries.
+    #[cfg(test)]
+    pub(crate) fn build_for_test(self) -> Client {
+        let (tx, rx) = self.conn.split_for_test();
+        self.finish(tx, rx)
+    }
+
+    fn finish(self, tx: SendHalf, rx: RecvHalf) -> Client {
         Client {
-            conn: self.conn,
+            tx,
+            rx,
             on_result: self.on_result,
             pending: VecDeque::with_capacity(16),
             last_rx_bytes: Cell::new(0),
@@ -523,7 +558,8 @@ impl ClientBuilder {
 /// metrics. Use `Client::builder(conn)` to configure per-request callbacks,
 /// kernel timestamps, and built-in histogram tracking.
 pub struct Client {
-    conn: ConnCtx,
+    tx: SendHalf,
+    rx: RecvHalf,
     on_result: Option<ResultCallback>,
     pending: VecDeque<PendingOp>,
     last_rx_bytes: Cell<u32>,
@@ -565,9 +601,18 @@ impl Client {
     /// Create a new client wrapping an established connection.
     ///
     /// No callbacks, no metrics, no kernel timestamps — zero overhead.
-    pub fn new(conn: ConnCtx) -> Self {
-        Self {
-            conn,
+    /// # Errors
+    ///
+    /// Takes exclusive ownership of the connection's read side via
+    /// [`ConnCtx::split`], so this fails with `EBUSY` if another client (or
+    /// any other reader) already holds it, and `EPIPE` if `conn` is stale.
+    /// Two clients driving one connection used to be silently allowed, and it
+    /// interleaved their reads; now it is refused.
+    pub fn new(conn: ConnCtx) -> Result<Self, Error> {
+        let (tx, rx) = conn.split()?;
+        Ok(Self {
+            tx,
+            rx,
             on_result: None,
             pending: VecDeque::new(),
             last_rx_bytes: Cell::new(0),
@@ -584,7 +629,7 @@ impl Client {
             use_kernel_ts: false,
             #[cfg(feature = "metrics")]
             metrics: None,
-        }
+        })
     }
 
     /// Create a builder for a client with per-request callbacks.
@@ -592,9 +637,19 @@ impl Client {
         ClientBuilder::new(conn)
     }
 
-    /// Returns the underlying connection context.
-    pub fn conn(&self) -> ConnCtx {
-        self.conn
+    /// Close the connection.
+    pub fn close(&mut self) {
+        self.tx.close();
+    }
+
+    /// The connection's identity token, for pool bookkeeping.
+    pub fn token(&self) -> ringline::ConnToken {
+        self.tx.token()
+    }
+
+    /// Is the connection still usable?
+    pub fn is_alive(&self) -> bool {
+        self.tx.is_alive()
     }
 
     /// Returns a reference to the built-in metrics, if enabled.
@@ -643,7 +698,7 @@ impl Client {
     #[inline]
     fn finish_timing(&self, send_ts: u64, start: Instant) -> u64 {
         if self.use_kernel_ts {
-            let recv_ts = self.conn.recv_timestamp();
+            let recv_ts = self.rx.recv_timestamp();
             if recv_ts > 0 && recv_ts > send_ts {
                 return recv_ts - send_ts;
             }
@@ -710,7 +765,7 @@ impl Client {
     #[inline]
     fn compute_ttfb(&self, send_ts: u64) -> Option<u64> {
         if self.use_kernel_ts {
-            let recv_ts = self.conn.recv_timestamp();
+            let recv_ts = self.rx.recv_timestamp();
             if recv_ts > 0 && recv_ts > send_ts {
                 return Some(recv_ts - send_ts);
             }
@@ -774,7 +829,7 @@ impl Client {
         // a request that was never on the wire and then hang forever
         // awaiting a response that will never come.
         let send_outcome: Result<(), Error> = if self.write_guards.is_empty() {
-            self.conn
+            self.tx
                 .send_nowait(&self.write_buf)
                 .map(|_| ())
                 .map_err(Error::from)
@@ -792,7 +847,7 @@ impl Client {
             if pos < self.write_buf.len() {
                 parts.push(SendPart::Copy(&self.write_buf[pos..]));
             }
-            self.conn
+            self.tx
                 .send_parts()
                 .submit_batch(parts)
                 .map(|_| ())
@@ -840,7 +895,7 @@ impl Client {
             self.encode_buf.clear();
             append_get(self.binary, key, &mut self.encode_buf)?;
             tx_bytes = self.encode_buf.len() as u32;
-            self.conn.send_nowait(&self.encode_buf)?;
+            self.tx.send_nowait(&self.encode_buf)?;
         } else {
             let before = self.write_buf.len();
             append_get(self.binary, key, &mut self.write_buf)?;
@@ -890,7 +945,7 @@ impl Client {
                 &mut self.encode_buf,
             )?;
             tx_bytes = self.encode_buf.len() as u32;
-            self.conn.send_nowait(&self.encode_buf)?;
+            self.tx.send_nowait(&self.encode_buf)?;
         } else {
             let before = self.write_buf.len();
             append_set(self.binary, key, value, flags, exptime, &mut self.write_buf)?;
@@ -987,7 +1042,7 @@ impl Client {
             self.encode_buf.clear();
             append_delete(self.binary, key, &mut self.encode_buf)?;
             tx_bytes = self.encode_buf.len() as u32;
-            self.conn.send_nowait(&self.encode_buf)?;
+            self.tx.send_nowait(&self.encode_buf)?;
         } else {
             let before = self.write_buf.len();
             append_delete(self.binary, key, &mut self.write_buf)?;
@@ -1154,11 +1209,11 @@ impl Client {
     /// any further command would read garbage. Surfacing `Protocol` as a
     /// terminal error matches the recv() pending-queue clear and avoids
     /// silently desynced clients.
-    pub(crate) async fn read_response(&self) -> Result<McResponseBytes, Error> {
+    pub(crate) async fn read_response(&mut self) -> Result<McResponseBytes, Error> {
         let mut result: Option<Result<McResponseBytes, Error>> = None;
         let binary = self.binary;
         let n = self
-            .conn
+            .rx
             .with_bytes(|bytes| {
                 let len = bytes.len();
                 if binary {
@@ -1193,15 +1248,30 @@ impl Client {
         }
         let r = result.unwrap();
         if matches!(r, Err(Error::Protocol(_))) {
-            self.conn.close();
+            self.tx.close();
         }
         r
     }
 
     /// Send an encoded command and read the response, converting error
     /// responses into `Error::Memcache`.
-    async fn execute(&self, encoded: &[u8]) -> Result<McResponseBytes, Error> {
-        self.conn.send(encoded)?;
+    async fn execute(&mut self, encoded: &[u8]) -> Result<McResponseBytes, Error> {
+        self.tx.send(encoded)?;
+        let response = self.read_response().await?;
+        check_error_bytes(&response)?;
+        Ok(response)
+    }
+
+    /// Like [`Client::execute`], but sends the reusable `encode_buf` in place.
+    ///
+    /// `self.execute(&self.encode_buf)` no longer type-checks: reading now
+    /// needs `&mut self`, so passing a borrow of one of `self`'s own fields as
+    /// the argument holds an immutable borrow of all of `self` across the
+    /// call. Borrowing `tx` and `encode_buf` as separate fields *inside* the
+    /// method is disjoint, so the scratch buffer keeps being reused — no copy
+    /// and no per-op allocation, which is the whole point of `encode_buf`.
+    async fn execute_encoded(&mut self) -> Result<McResponseBytes, Error> {
+        self.tx.send(&self.encode_buf)?;
         let response = self.read_response().await?;
         check_error_bytes(&response)?;
         Ok(response)
@@ -1216,7 +1286,7 @@ impl Client {
         encode_request_into(&McRequest::get(key), &mut self.encode_buf)?;
 
         if !self.is_instrumented() {
-            let response = self.execute(&self.encode_buf).await?;
+            let response = self.execute_encoded().await?;
             return match response {
                 McResponseBytes::Values(mut values) => {
                     if values.is_empty() {
@@ -1236,7 +1306,7 @@ impl Client {
         let tx_bytes = self.encode_buf.len() as u32;
         let send_ts = self.send_timestamp();
         let start = Instant::now();
-        let response = self.execute(&self.encode_buf).await;
+        let response = self.execute_encoded().await;
         let latency_ns = self.finish_timing(send_ts, start);
         let rx_bytes = self.last_rx_bytes.get();
 
@@ -1325,7 +1395,7 @@ impl Client {
         )?;
 
         if !self.is_instrumented() {
-            let response = self.execute(&self.encode_buf).await?;
+            let response = self.execute_encoded().await?;
             return match response {
                 McResponseBytes::Stored => Ok(()),
                 _ => Err(Error::UnexpectedResponse),
@@ -1335,7 +1405,7 @@ impl Client {
         let tx_bytes = self.encode_buf.len() as u32;
         let send_ts = self.send_timestamp();
         let start = Instant::now();
-        let response = self.execute(&self.encode_buf).await;
+        let response = self.execute_encoded().await;
         let latency_ns = self.finish_timing(send_ts, start);
         let rx_bytes = self.last_rx_bytes.get();
 
@@ -1487,7 +1557,7 @@ impl Client {
         encode_request_into(&McRequest::delete(key), &mut self.encode_buf)?;
 
         if !self.is_instrumented() {
-            let response = self.execute(&self.encode_buf).await?;
+            let response = self.execute_encoded().await?;
             return match response {
                 McResponseBytes::Deleted => Ok(true),
                 McResponseBytes::NotFound => Ok(false),
@@ -1498,7 +1568,7 @@ impl Client {
         let tx_bytes = self.encode_buf.len() as u32;
         let send_ts = self.send_timestamp();
         let start = Instant::now();
-        let response = self.execute(&self.encode_buf).await;
+        let response = self.execute_encoded().await;
         let latency_ns = self.finish_timing(send_ts, start);
         let rx_bytes = self.last_rx_bytes.get();
 
@@ -1563,7 +1633,7 @@ impl Client {
             )?;
 
             let prefix: &[u8] = &self.encode_buf;
-            self.conn.send_parts().build(move |b| {
+            self.tx.send_parts().build(move |b| {
                 b.copy(prefix)
                     .guard(GuardBox::new(guard))
                     .copy(b"\r\n")
@@ -1593,7 +1663,7 @@ impl Client {
         let start = Instant::now();
 
         let prefix: &[u8] = &self.encode_buf;
-        self.conn.send_parts().build(move |b| {
+        self.tx.send_parts().build(move |b| {
             b.copy(prefix)
                 .guard(GuardBox::new(guard))
                 .copy(b"\r\n")
@@ -1717,7 +1787,7 @@ impl Client {
                 }
             }
             Err(e) => {
-                self.conn.close();
+                self.tx.close();
                 Err(e)
             }
         }
@@ -1732,7 +1802,7 @@ impl Client {
         len: usize,
         mut src: impl SegmentSource,
     ) -> Result<McResponseBytes, Error> {
-        self.conn.send_nowait(&self.encode_buf)?;
+        self.tx.send_nowait(&self.encode_buf)?;
 
         // Stream the value body, enforcing the length contract.
         let mut sent = 0usize;
@@ -1748,7 +1818,7 @@ impl Client {
             // `send` copies into the pool synchronously and returns a future that
             // resolves when the bytes reach the socket — awaiting bounds in-flight
             // sends to one, so a large value can't exhaust the send pool.
-            self.conn.send(&chunk)?.await?;
+            self.tx.send(&chunk)?.await?;
         }
         if sent != len {
             // Under-produce: header declared `len`, source gave fewer → desync.
@@ -1756,7 +1826,7 @@ impl Client {
         }
 
         // Trailing `\r\n`, then the `STORED\r\n` reply.
-        self.conn.send_nowait(b"\r\n")?;
+        self.tx.send_nowait(b"\r\n")?;
         self.read_response().await
     }
 }
@@ -1821,7 +1891,7 @@ impl Client {
         // the default path first.
         self.encode_buf.clear();
         encode_request_into(&McRequest::get(key), &mut self.encode_buf)?;
-        self.conn.send_nowait(&self.encode_buf)?;
+        self.tx.send_nowait(&self.encode_buf)?;
 
         // Read the `VALUE <key> <flags> <bytes>\r\n` header line (or `END\r\n`).
         // It always fits in the first received buffer; the rare split-across-
@@ -1835,18 +1905,18 @@ impl Client {
         // monotonic position across header + body + trailing `\r\nEND\r\n`.
         let mut acc: Option<Vec<u8>> = None;
         loop {
-            let seg = match self.conn.recv_owned_segment()?.await {
+            let seg = match self.rx.recv_owned_segment()?.await {
                 Ok(Some(b)) => b,
                 Ok(None) => {
                     // Peer closed before any header arrived.
-                    let _ = self.conn.end_segments();
+                    let _ = self.rx.end_segments();
                     return Err(Error::ConnectionClosed);
                 }
                 Err(e) => {
                     // Recv I/O error mid-header: the read is broken and the
                     // connection is still in the segmented domain. Poison it
                     // (close) so it is not reused stuck in that domain / desynced.
-                    self.conn.close();
+                    self.tx.close();
                     return Err(e.into());
                 }
             };
@@ -1861,7 +1931,7 @@ impl Client {
                 Ok(Some(GetHeader::Miss)) => {
                     // Missing key. `END\r\n` carries no value/trailing; restore
                     // the default read path so the next command works.
-                    self.conn.end_segments()?;
+                    self.rx.end_segments()?;
                     return Ok(None);
                 }
                 Ok(Some(GetHeader::Value {
@@ -1881,7 +1951,7 @@ impl Client {
                     // `CLIENT_ERROR …`) or a malformed header. In sequential use
                     // the whole reply line is in `combined`; restore the read
                     // path and surface the error.
-                    let _ = self.conn.end_segments();
+                    let _ = self.rx.end_segments();
                     return Err(e);
                 }
             }
@@ -2186,23 +2256,23 @@ impl Client {
         // before the await) so the reply arrives as held segments.
         self.encode_buf.clear();
         encode_request_into(&McRequest::gets(&[key]), &mut self.encode_buf)?;
-        self.conn.send_nowait(&self.encode_buf)?;
+        self.tx.send_nowait(&self.encode_buf)?;
 
         // Read the `VALUE <key> <flags> <bytes> <cas>\r\n` header (or `END\r\n`).
         // Demarcation is exact — see `get_stream`.
         let mut acc: Option<Vec<u8>> = None;
         loop {
-            let seg = match self.conn.recv_owned_segment()?.await {
+            let seg = match self.rx.recv_owned_segment()?.await {
                 Ok(Some(b)) => b,
                 Ok(None) => {
-                    let _ = self.conn.end_segments();
+                    let _ = self.rx.end_segments();
                     return Err(Error::ConnectionClosed);
                 }
                 Err(e) => {
                     // Recv I/O error mid-header: the read is broken and the
                     // connection is still in the segmented domain. Poison it
                     // (close) so it is not reused stuck in that domain / desynced.
-                    self.conn.close();
+                    self.tx.close();
                     return Err(e.into());
                 }
             };
@@ -2215,7 +2285,7 @@ impl Client {
             };
             match parse_gets_header(&combined) {
                 Ok(Some(CasHeader::Miss)) => {
-                    self.conn.end_segments()?;
+                    self.rx.end_segments()?;
                     return Ok(None);
                 }
                 Ok(Some(CasHeader::Value {
@@ -2232,7 +2302,7 @@ impl Client {
                     acc = Some(combined.to_vec());
                 }
                 Err(e) => {
-                    let _ = self.conn.end_segments();
+                    let _ = self.rx.end_segments();
                     return Err(e);
                 }
             }
@@ -2364,27 +2434,35 @@ impl CasStreamValue<'_> {
 /// ```no_run
 /// # use ringline_memcache::{Client, Error};
 /// # async fn demo(conn: ringline::ConnCtx) -> Result<(), Error> {
-/// let mut client = Client::builder(conn).max_batch_size(16).build_binary();
+/// let mut client = Client::builder(conn).max_batch_size(16).build_binary()?;
 /// client.fire_get(b"key", 1)?;
 /// let op = client.recv().await?;
 /// # Ok(())
 /// # }
 /// ```
 ///
-/// [`conn`](Self::conn) hands back the underlying [`ConnCtx`]. Wrapping that in
-/// an ASCII [`Client`] and issuing ASCII commands on a binary connection will
-/// desync it, so treat the connection as owned by this client.
+/// This client owns the connection outright: it holds both halves, so there is
+/// no way to hand the `ConnCtx` back out and drive the same connection with an
+/// ASCII [`Client`]. That used to be possible through `conn()`, and doing it
+/// desynced the connection.
 pub struct BinaryClient {
     inner: Client,
 }
 
 impl BinaryClient {
-    /// Returns the underlying connection handle.
-    ///
-    /// See the type-level note: the connection is speaking the binary
-    /// protocol, so do not drive it with an ASCII [`Client`].
-    pub fn conn(&self) -> ConnCtx {
-        self.inner.conn()
+    /// Close the connection.
+    pub fn close(&mut self) {
+        self.inner.close();
+    }
+
+    /// The connection's identity token, for pool bookkeeping.
+    pub fn token(&self) -> ringline::ConnToken {
+        self.inner.token()
+    }
+
+    /// Is the connection still usable?
+    pub fn is_alive(&self) -> bool {
+        self.inner.is_alive()
     }
 
     /// Returns the metrics collector, if `with_metrics` was set on the builder.
@@ -3059,7 +3137,7 @@ mod zc_threshold_tests {
         Client::builder(conn)
             .max_batch_size(max_batch_size)
             .zc_threshold(zc_threshold)
-            .build()
+            .build_for_test()
     }
 
     #[test]
@@ -3181,7 +3259,7 @@ mod binary_tests {
         Client::builder(ConnCtx::for_test(0, 0))
             .max_batch_size(max_batch_size)
             .zc_threshold(zc_threshold)
-            .build_binary()
+            .build_binary_for_test()
     }
 
     fn long_key() -> Vec<u8> {
@@ -3540,7 +3618,7 @@ mod binary_tests {
         // The flag must not leak into the plain `build()` path.
         let c = Client::builder(ConnCtx::for_test(0, 0))
             .max_batch_size(4)
-            .build();
+            .build_for_test();
         assert!(!c.binary);
         let mut buf = Vec::new();
         append_get(c.binary, KEY, &mut buf).unwrap();

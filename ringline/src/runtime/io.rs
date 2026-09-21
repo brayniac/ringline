@@ -914,6 +914,29 @@ impl ConnCtx {
         ))
     }
 
+    /// [`split`](Self::split) without the driver.
+    ///
+    /// `split` records the read claim in the driver, so it cannot run outside
+    /// a worker. This hands back unclaimed halves for the same narrow case
+    /// [`for_test`](Self::for_test) exists for: tests that exercise in-memory
+    /// client state (encoders, write buffers, pending queues) and never reach
+    /// the wire. Calling any I/O method on the result is undefined, exactly as
+    /// it is for a `for_test` handle.
+    #[cfg(feature = "testing")]
+    #[doc(hidden)]
+    pub fn split_for_test(&self) -> (SendHalf, RecvHalf) {
+        (
+            SendHalf {
+                conn: *self,
+                _not_send: PhantomData,
+            },
+            RecvHalf {
+                conn: *self,
+                _not_send: PhantomData,
+            },
+        )
+    }
+
     pub fn take_recv(&self) -> io::Result<RecvHalf> {
         with_state(|driver, _executor| {
             if driver.connections.generation(self.conn_index) != self.generation {

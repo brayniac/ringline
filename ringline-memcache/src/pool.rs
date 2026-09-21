@@ -108,6 +108,16 @@ impl Pool {
     /// Advances the round-robin cursor and returns a client for a connected
     /// slot. Disconnected slots are lazily reconnected. If all slots fail,
     /// returns [`Error::AllConnectionsFailed`].
+    ///
+    /// # One live client per slot
+    ///
+    /// The returned [`Client`] takes exclusive ownership of its connection's
+    /// read side, so holding two clients for the *same* slot at once is now
+    /// refused with `EBUSY` rather than silently allowed. That was never
+    /// sound: two clients reading one connection interleave their responses
+    /// and desynchronise the protocol. Drop a client before asking for
+    /// another that may land on the same slot, or size the pool so each
+    /// concurrent user gets its own.
     pub async fn client(&mut self) -> Result<Client, Error> {
         let size = self.slots.len();
         for _ in 0..size {
@@ -115,11 +125,11 @@ impl Pool {
             self.next = (self.next + 1) % size;
 
             match &self.slots[idx] {
-                Slot::Connected(conn) => return Ok(Client::new(*conn)),
+                Slot::Connected(conn) => return Client::new(*conn),
                 Slot::Disconnected => {
                     if let Ok(conn) = self.do_connect().await {
                         self.slots[idx] = Slot::Connected(conn);
-                        return Ok(Client::new(conn));
+                        return Client::new(conn);
                     }
                 }
             }
