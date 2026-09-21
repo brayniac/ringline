@@ -194,7 +194,7 @@ async fn connect(addr: SocketAddr) -> Result<Client, String> {
         .map_err(|e| format!("submit: {e}"))?
         .await
         .map_err(|e| format!("connect: {e}"))?;
-    Ok(Client::new(conn))
+    Client::new(conn).map_err(|e| format!("split: {e}"))
 }
 
 async fn run_client(addr: SocketAddr) -> Result<(), String> {

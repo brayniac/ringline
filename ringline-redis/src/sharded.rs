@@ -170,7 +170,7 @@ impl ShardedClient {
         let opts = self.connect_opts();
         let shard = &mut self.shards[index];
         let conn = get_conn(shard, &opts).await?;
-        Ok(Client::new(conn))
+        Client::new(conn)
     }
 
     // ── Core routing ────────────────────────────────────────────────────
@@ -200,7 +200,7 @@ impl ShardedClient {
                 conn.close();
                 return Err(Error::Io(e));
             }
-            match Client::new(conn).read_value().await {
+            match Client::new(conn)?.read_value().await {
                 Ok(value) => {
                     // Advance round-robin past the connection we used.
                     shard.next = (idx + 1) % size;
@@ -1036,7 +1036,7 @@ impl ShardedClient {
         for shard in &mut self.shards {
             if let Some(conn) = get_connected_conn(shard) {
                 conn.send(&ping_cmd)?;
-                let value = Client::new(conn).read_value().await?;
+                let value = Client::new(conn)?.read_value().await?;
                 if let Value::Error(ref msg) = value {
                     return Err(Error::Redis(String::from_utf8_lossy(msg).into_owned()));
                 }
@@ -1119,7 +1119,7 @@ async fn do_connect(addr: SocketAddr, opts: &ConnectOpts) -> Result<ConnCtx, Err
         fut.await?
     };
 
-    Client::new(conn)
+    Client::new(conn)?
         .maybe_auth(opts.password.as_deref(), opts.username.as_deref())
         .await?;
     Ok(conn)

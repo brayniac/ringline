@@ -174,7 +174,7 @@ impl ClusterClient {
                     }
                     continue;
                 }
-                match Client::new(*conn).read_value().await {
+                match Client::new(*conn)?.read_value().await {
                     Ok(value) => {
                         slots_value = Some(value);
                         break;
@@ -201,7 +201,7 @@ impl ClusterClient {
                             conn.close();
                             continue;
                         }
-                        match Client::new(conn).read_value().await {
+                        match Client::new(conn)?.read_value().await {
                             Ok(value) => {
                                 let key = seed_addr.to_string();
                                 self.nodes.insert(key, NodeState::Connected(conn));
@@ -297,7 +297,7 @@ impl ClusterClient {
             fut.await?
         };
 
-        Client::new(conn)
+        Client::new(conn)?
             .maybe_auth(self.password.as_deref(), self.username.as_deref())
             .await?;
         Ok(conn)
@@ -356,7 +356,7 @@ impl ClusterClient {
                 self.mark_disconnected(&target_addr);
                 return Err(Error::Io(e));
             }
-            let value = match Client::new(conn).read_value().await {
+            let value = match Client::new(conn)?.read_value().await {
                 Ok(v) => v,
                 Err(Error::ConnectionClosed) => {
                     if !retried_after_refresh {
@@ -453,13 +453,13 @@ impl ClusterClient {
         // Validate the ASKING response — if the server replies with an
         // error here, propagate it instead of silently moving on to send
         // the real command on a misconfigured connection.
-        let asking_resp = Client::new(ask_conn).read_value().await?;
+        let asking_resp = Client::new(ask_conn)?.read_value().await?;
         if let Value::Error(ref msg) = asking_resp {
             return Err(Error::Redis(String::from_utf8_lossy(msg).into_owned()));
         }
 
         ask_conn.send(encoded)?;
-        let ask_value = Client::new(ask_conn).read_value().await?;
+        let ask_value = Client::new(ask_conn)?.read_value().await?;
         if let Some(redirect) = parse_redirect(&ask_value) {
             return Ok(AskOutcome::Followup(redirect));
         }
@@ -1296,7 +1296,7 @@ impl ClusterClient {
 
         let conn = self.conn_for_addr(&addr).await?;
         conn.send(&ping_cmd)?;
-        let value = Client::new(conn).read_value().await?;
+        let value = Client::new(conn)?.read_value().await?;
         if let Value::Error(ref msg) = value {
             return Err(Error::Redis(String::from_utf8_lossy(msg).into_owned()));
         }
@@ -1331,7 +1331,7 @@ impl ClusterClient {
     /// like CONFIG, CLUSTER INFO, etc.).
     pub async fn node_client(&mut self, addr: &str) -> Result<Client, Error> {
         let conn = self.conn_for_addr(addr).await?;
-        Ok(Client::new(conn))
+        Client::new(conn)
     }
 }
 
