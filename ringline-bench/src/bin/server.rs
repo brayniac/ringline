@@ -561,7 +561,7 @@ fn run_ringline(cfg: EchoCfg) {
                     // No `return` needed: the fallback below is cfg'd out
                     // whenever this arm is compiled in. (Never linted before
                     // #402, because this block was dead on every platform.)
-                    conn.run_direct_echo().await;
+                    conn.as_conn().run_direct_echo().await;
                 }
                 #[cfg(not(has_io_uring))]
                 forward_echo_loop(conn).await;
