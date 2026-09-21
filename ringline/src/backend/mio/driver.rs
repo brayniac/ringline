@@ -206,6 +206,9 @@ pub(crate) struct Driver {
     /// driver there is no companion `segment_reader_live` — this is the whole
     /// recv claim here.
     pub(crate) recv_half_taken: Vec<bool>,
+    /// Per connection index: is a [`SendHalf`](crate::SendHalf) currently out?
+    /// The write-side twin of `recv_half_taken`; see the io_uring driver.
+    pub(crate) send_half_taken: Vec<bool>,
     /// Queued sends allowed on a sink before its source stops reading. Shares
     /// `Config::forward_hold_cap` with the io_uring hold cap: same intent —
     /// bound one slow forward — applied to the queue mio actually has.
@@ -392,6 +395,7 @@ impl Driver {
             forward_resume: Vec::new(),
             forward_resume_flag: vec![false; max_conn],
             recv_half_taken: vec![false; max_conn],
+            send_half_taken: vec![false; max_conn],
             forward_hold_cap: config.forward_hold_cap,
             send_completions: (0..max_conn).map(|_| VecDeque::new()).collect(),
             bounded_send_completions: VecDeque::new(),
@@ -480,11 +484,14 @@ impl Driver {
     /// Drop any recv-side exclusivity claims held against `conn_index`.
     ///
     /// Called at the slot's recycle point. Named to match
-    /// `uring::driver::Driver::clear_recv_claims`, which additionally clears
+    /// `uring::driver::Driver::clear_conn_claims`, which additionally clears
     /// `segment_reader_live` — mio has no segmented domain, so there is only
     /// the one flag here.
-    pub(crate) fn clear_recv_claims(&mut self, conn_index: u32) {
+    pub(crate) fn clear_conn_claims(&mut self, conn_index: u32) {
         if let Some(taken) = self.recv_half_taken.get_mut(conn_index as usize) {
+            *taken = false;
+        }
+        if let Some(taken) = self.send_half_taken.get_mut(conn_index as usize) {
             *taken = false;
         }
     }
@@ -576,7 +583,7 @@ impl Driver {
         // `Drop` could not run (no driver in scope). Clear the claim before the
         // slot is reused, or its next occupant inherits it and can never take
         // its own read side.
-        self.clear_recv_claims(conn_index);
+        self.clear_conn_claims(conn_index);
 
         if self.connections.get(conn_index).is_some() {
             self.connections.release(conn_index);

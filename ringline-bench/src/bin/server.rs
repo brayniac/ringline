@@ -477,7 +477,17 @@ fn run_ringline_proxy(cfg: ProxyCfg) {
                         return;
                     }
                 };
-                if let Err(e) = conn.forward_to_conn(&sink, UNTIL_EOF).await {
+                // The sink is presented as its write half: holding it is the
+                // permission to write, and the borrow keeps anything else from
+                // sending to that socket while the forward runs.
+                let mut sink_tx = match sink.take_send() {
+                    Ok(tx) => tx,
+                    Err(e) => {
+                        eprintln!("proxy: backend take_send failed: {e}");
+                        return;
+                    }
+                };
+                if let Err(e) = conn.forward_to_conn(&mut sink_tx, UNTIL_EOF).await {
                     eprintln!("proxy: forward failed: {e}");
                 }
             }

@@ -1346,6 +1346,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // the claim here, since `Connection::for_accept` cannot reach the
         // driver from outside a task poll.
         self.driver.recv_half_taken[conn_index as usize] = true;
+        self.driver.send_half_taken[conn_index as usize] = true;
         let conn = crate::Connection::for_accept(conn_ctx);
         let future = Box::pin(self.handler.on_accept(conn));
         self.executor.owner_task[conn_index as usize] = Some(conn_index);

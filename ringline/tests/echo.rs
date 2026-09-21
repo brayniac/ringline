@@ -6865,23 +6865,29 @@ struct ForwardToConnProxy {
 static PROXY_BACKEND_ADDR: std::sync::OnceLock<SocketAddr> = std::sync::OnceLock::new();
 
 impl AsyncEventHandler for ForwardToConnProxy {
-    fn on_accept(&self, mut client: Connection) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, client: Connection) -> impl Future<Output = ()> + 'static {
         let backend_addr = self.backend_addr;
         async move {
-            let backend = match client.connect(backend_addr) {
+            // Each direction forwards into the *other* connection's write
+            // half, borrowed for the duration. That borrow is what makes a
+            // proxy safe to express: nothing else can send to a socket while a
+            // forward is writing to it.
+            let (mut client_tx, mut client_rx) = client.split();
+            let backend = match client_tx.connect(backend_addr) {
                 Ok(fut) => match fut.await {
                     Ok(ctx) => ctx,
                     Err(_) => return,
                 },
                 Err(_) => return,
             };
-            // The backend forwards *into* this client, and `forward_to_conn`
-            // takes a `&ConnCtx` sink — the client's own half stays the reader.
-            let client_ctx = client.as_conn();
+            let (mut backend_tx, mut backend_rx) = match backend.split() {
+                Ok(halves) => halves,
+                Err(_) => return,
+            };
 
             loop {
                 let mut hdr = [0u8; 4];
-                let n = client
+                let n = client_rx
                     .with_data(|data| {
                         if data.len() < 4 {
                             return ParseResult::NeedMore;
@@ -6895,14 +6901,14 @@ impl AsyncEventHandler for ForwardToConnProxy {
                 }
                 let len = u32::from_be_bytes(hdr) as usize;
 
-                match client.forward_to_conn(&backend, len).await {
+                match client_rx.forward_to_conn(&mut backend_tx, len).await {
                     Ok(f) if f == len => {}
                     other => {
                         eprintln!("proxy: client->backend forward {other:?}, wanted {len}");
                         break;
                     }
                 }
-                match backend.forward_to_conn(&client_ctx, len).await {
+                match backend_rx.forward_to_conn(&mut client_tx, len).await {
                     Ok(f) if f == len => {}
                     other => {
                         eprintln!("proxy: backend->client forward {other:?}, wanted {len}");
@@ -7056,10 +7062,15 @@ impl AsyncEventHandler for DroppedForwardProxy {
                 Err(_) => return,
             };
 
+            let mut backend_tx = match backend.take_send() {
+                Ok(tx) => tx,
+                Err(_) => return,
+            };
+
             // Arm a forward for far more than the client will ever send, then
             // drop it without awaiting it to completion.
             {
-                let _fut = rx.forward_to_conn(&backend, 1 << 30);
+                let _fut = rx.forward_to_conn(&mut backend_tx, 1 << 30);
             }
 
             // Everything the client sends must now come to *this* task, not to
