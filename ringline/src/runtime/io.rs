@@ -2284,8 +2284,8 @@ impl ConnCtx {
     /// submission time rather than copied up front.
     ///
     /// ```no_run
-    /// # async fn f(conn: &ringline::ConnCtx, body: &[u8]) -> std::io::Result<()> {
-    /// let sent = conn.send_backpressured(body).await?;
+    /// # async fn f(tx: &mut ringline::SendHalf, body: &[u8]) -> std::io::Result<()> {
+    /// let sent = tx.send_backpressured(body).await?;
     /// assert_eq!(sent as usize, body.len());
     /// # Ok(())
     /// # }
@@ -2623,8 +2623,8 @@ impl AsyncSendBuilder {
     ///
     /// # Example
     /// ```no_run
-    /// # fn example(conn: ringline::ConnCtx) -> std::io::Result<()> {
-    /// conn.send_parts().build(|b| {
+    /// # fn example(tx: &mut ringline::SendHalf) -> std::io::Result<()> {
+    /// tx.send_parts().build(|b| {
     ///     b.copy(b"header").submit()
     /// })?;
     /// # Ok(())
