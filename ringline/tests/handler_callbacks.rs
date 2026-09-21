@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use ringline::{AsyncEventHandler, ConfigBuilder, ConnCtx, Connection, DriverCtx, RinglineBuilder};
+use ringline::{AsyncEventHandler, ConfigBuilder, Connection, DriverCtx, RinglineBuilder};
 
 struct OnTickSpawner {
     spawn_attempted: Arc<AtomicBool>,

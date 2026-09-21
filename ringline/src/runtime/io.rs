@@ -3382,7 +3382,7 @@ impl Connection {
     #[cfg(has_io_uring)]
     pub fn with_segments<F>(&mut self, f: F) -> WithSegmentsFuture<F>
     where
-        F: FnMut(&[u8]) -> ParseResult,
+        F: FnMut(&SegChain<'_>) -> SegConsumed,
     {
         self.rx.with_segments(f)
     }

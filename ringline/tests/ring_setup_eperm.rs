@@ -15,7 +15,7 @@
 use std::future::Future;
 use std::io;
 
-use ringline::{AsyncEventHandler, ConfigBuilder, ConnCtx, Connection, Error, RinglineBuilder};
+use ringline::{AsyncEventHandler, ConfigBuilder, Connection, Error, RinglineBuilder};
 
 struct NoopHandler;
 

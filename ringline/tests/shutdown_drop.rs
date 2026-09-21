@@ -13,7 +13,7 @@
 use std::future::Future;
 use std::time::{Duration, Instant};
 
-use ringline::{AsyncEventHandler, Config, ConfigBuilder, ConnCtx, Connection, RinglineBuilder};
+use ringline::{AsyncEventHandler, Config, ConfigBuilder, Connection, RinglineBuilder};
 
 struct NoopHandler;
 

@@ -7,7 +7,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
 use ringline::process::Command;
-use ringline::{AsyncEventHandler, Config, ConfigBuilder, ConnCtx, Connection, RinglineBuilder};
+use ringline::{AsyncEventHandler, Config, ConfigBuilder, Connection, RinglineBuilder};
 
 fn test_config_builder() -> ConfigBuilder {
     ConfigBuilder::new()
