@@ -3531,7 +3531,7 @@ impl Connection {
     #[cfg(has_io_uring)]
     pub fn send_chain<F>(&mut self, f: F) -> io::Result<SendFuture>
     where
-        F: FnOnce(SendChainBuilder<'_>) -> io::Result<SendFuture>,
+        F: FnOnce(crate::handler::SendChainBuilder<'_, '_>) -> io::Result<()>,
     {
         self.tx.as_conn().send_chain(f)
     }
@@ -3540,7 +3540,7 @@ impl Connection {
     #[cfg(has_io_uring)]
     pub fn send_chain_nowait<F, R>(&mut self, f: F) -> R
     where
-        F: FnOnce(SendChainBuilder<'_>) -> R,
+        F: FnOnce(crate::handler::SendChainBuilder<'_, '_>) -> R,
     {
         self.tx.as_conn().send_chain_nowait(f)
     }
@@ -3683,7 +3683,7 @@ impl SendHalf {
     #[cfg(has_io_uring)]
     pub fn send_chain<F>(&mut self, f: F) -> io::Result<SendFuture>
     where
-        F: FnOnce(SendChainBuilder<'_>) -> io::Result<SendFuture>,
+        F: FnOnce(crate::handler::SendChainBuilder<'_, '_>) -> io::Result<()>,
     {
         self.conn.send_chain(f)
     }
@@ -3692,7 +3692,7 @@ impl SendHalf {
     #[cfg(has_io_uring)]
     pub fn send_chain_nowait<F, R>(&mut self, f: F) -> R
     where
-        F: FnOnce(SendChainBuilder<'_>) -> R,
+        F: FnOnce(crate::handler::SendChainBuilder<'_, '_>) -> R,
     {
         self.conn.send_chain_nowait(f)
     }

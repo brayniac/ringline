@@ -17,7 +17,6 @@ use crate::runtime::io::{ConnCtx, DriverState, UdpCtx, set_driver_state_guarded}
 use crate::runtime::send_capacity::BoundedSendId;
 use crate::runtime::waker::{STANDALONE_BIT, conn_waker, standalone_waker};
 use crate::runtime::{CURRENT_TASK_ID, Executor, TimerSlotPool};
-use ringline::Connection;
 
 /// Async event loop that reuses `Driver` infrastructure with an `Executor`
 /// for polling connection futures instead of push-based callbacks.
