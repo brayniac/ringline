@@ -8078,7 +8078,7 @@ mod tests {
         // Merely constructing the future must not touch the driver.
         let waker = noop_waker();
         let mut fut = std::pin::pin!(with_driver_state(&mut el, || {
-            stale.with_segments(|_chain| crate::SegConsumed::All)
+            stale.with_segments(|_chain| crate::SegConsumed(0))
         }));
         assert_eq!(
             el.driver.recv_domain[conn_index as usize],
@@ -8140,13 +8140,15 @@ mod tests {
         let generation = el.driver.connections.generation(conn_index);
         let stale = ConnCtx::new(conn_index, generation.wrapping_add(1));
 
-        el.driver
-            .accumulators
-            .append(conn_index, b"the new occupant's bytes")
-            .expect("append");
+        assert!(
+            el.driver
+                .accumulators
+                .append(conn_index, b"the new occupant's bytes"),
+            "append into the live occupant's accumulator"
+        );
 
         let seen = with_driver_state(&mut el, || {
-            stale.try_with_data(|data| ParseResult::Consumed(data.len()))
+            stale.try_with_data(|data| crate::ParseResult::Consumed(data.len()))
         });
         assert!(
             seen.is_none(),
