@@ -1599,7 +1599,8 @@ impl ConnCtx {
             fd: sink.fd,
             is_file: sink.is_file,
         };
-        let armed = self.arm_forward_source(target, len as u64);
+        // An fd sink is not a connection, so it carries no send claim to check.
+        let armed = self.arm_forward_source(target, len as u64, true);
         ForwardToFuture {
             conn_index: self.conn_index,
             generation: self.generation,
