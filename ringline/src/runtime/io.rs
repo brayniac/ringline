@@ -28,7 +28,7 @@ use crate::runtime::task::TaskId;
 use crate::runtime::waker::STANDALONE_BIT;
 use crate::runtime::{CURRENT_TASK_ID, Executor, IoResult};
 
-/// Result of a parse closure passed to [`ConnCtx::with_data`] or [`ConnCtx::with_bytes`].
+/// Result of a parse closure passed to [`Connection::with_data`] or [`Connection::with_bytes`].
 ///
 /// When the closure returns `NeedMore` or `Consumed(0)`, the future parks and
 /// retries when more data arrives. `Consumed(0)` on a non-empty buffer is
@@ -634,8 +634,8 @@ pub fn request_shutdown() -> io::Result<()> {
 ///
 /// Outbound connections come back as a `ConnCtx` from [`connect`](crate::connect);
 /// accepted ones arrive as a [`Connection`] in [`AsyncEventHandler::on_accept`](crate::AsyncEventHandler::on_accept).
-/// It exposes an async API for reading data ([`with_data`](Self::with_data),
-/// [`with_bytes`](Self::with_bytes)), sending data ([`send`](Self::send),
+/// It exposes an async API for reading data (`with_data`,
+/// `with_bytes`), sending data ([`send`](Self::send),
 /// [`send_nowait`](Self::send_nowait)), and initiating outbound connections
 /// ([`connect`](Self::connect)).
 ///
@@ -701,7 +701,7 @@ pub fn request_shutdown() -> io::Result<()> {
 /// # Example: Zero-Copy with `with_bytes`
 ///
 /// For protocols where you want to avoid copying parsed values, use
-/// [`with_bytes`](Self::with_bytes) which provides `Bytes` handles:
+/// `with_bytes` which provides `Bytes` handles:
 ///
 /// ```no_run
 /// use ringline::{AsyncEventHandler, Connection, ParseResult};
@@ -997,7 +997,7 @@ impl ConnCtx {
         }
     }
 
-    /// Like [`with_data`](Self::with_data), but the future distinguishes a
+    /// Like `with_data`, but the future distinguishes a
     /// clean peer close from a transport failure.
     ///
     /// Resolves to:
@@ -1024,7 +1024,7 @@ impl ConnCtx {
     /// `with_data` keeps returning `0` for both cases; nothing about it
     /// changes. Use this variant when a protocol handler must tell "the peer
     /// hung up" from "the transport broke". Check
-    /// [`eof_truncated`](Self::eof_truncated) after `Ok(0)` on TLS
+    /// `eof_truncated` after `Ok(0)` on TLS
     /// connections, exactly as with `with_data`.
     pub(crate) fn with_data_result<F: FnMut(&[u8]) -> ParseResult>(
         &self,
@@ -1156,7 +1156,14 @@ impl ConnCtx {
     ///   different connection.
     ///
     /// io_uring only — segmented delivery is backed by the provided-buffer ring.
+    ///
+    /// Crate-private since step 4b. It is the only constructor of
+    /// [`SegmentedEntry::ViaConn`], whose `EBUSY` gate ("refuse when a half is
+    /// already out") is exercised by the driver's own unit tests — so it has no
+    /// caller in the library target and is kept for those tests rather than
+    /// deleted, which would take the gate's coverage with it.
     #[cfg(has_io_uring)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn segments(&self) -> io::Result<SegmentReader<'_>> {
         self.segments_via(SegmentedEntry::ViaConn)
     }
@@ -1189,7 +1196,7 @@ impl ConnCtx {
     ///
     /// Parks when no buffer is held and the connection is still open, resuming
     /// when the recv completion handler holds a buffer and calls `wake_recv` (the
-    /// same waiter mechanism as `segments` / [`with_data`](Self::with_data)).
+    /// same waiter mechanism as `segments` / `with_data`).
     ///
     /// # Errors
     ///
@@ -1202,7 +1209,14 @@ impl ConnCtx {
     ///   different connection.
     ///
     /// io_uring only — segmented delivery is backed by the provided-buffer ring.
+    ///
+    /// Crate-private since step 4b. It is the only constructor of
+    /// [`SegmentedEntry::ViaConn`], whose `EBUSY` gate ("refuse when a half is
+    /// already out") is exercised by the driver's own unit tests — so it has no
+    /// caller in the library target and is kept for those tests rather than
+    /// deleted, which would take the gate's coverage with it.
     #[cfg(has_io_uring)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn recv_owned_segment(&self) -> io::Result<RecvOwnedSegment> {
         self.recv_owned_segment_via(SegmentedEntry::ViaConn)
     }
@@ -1220,7 +1234,7 @@ impl ConnCtx {
     }
 
     /// End segmented-recv delivery on this connection and restore the default
-    /// [`with_data`](Self::with_data) / [`with_bytes`](Self::with_bytes) path.
+    /// `with_data` / `with_bytes` path.
     ///
     /// `segments` and `recv_owned_segment`
     /// leave the connection in the *segmented* domain: arriving buffers are held
@@ -1265,7 +1279,7 @@ impl ConnCtx {
     /// 2. each held provided buffer, in arrival order.
     ///
     /// The callback borrows those slices for the call only (they cannot escape,
-    /// like [`with_data`](Self::with_data)) and returns a [`SegConsumed`] — the
+    /// like `with_data`) and returns a [`SegConsumed`] — the
     /// number of bytes it consumed **from the front** of that concatenation.
     ///
     /// After the callback returns, the runtime settles state so that all
@@ -1280,7 +1294,7 @@ impl ConnCtx {
     ///
     /// So the fully-draining consumer (h2/grpc: extend-each + consume-all) pays
     /// **zero** ringline copies, while an under-draining or whole-frame consumer
-    /// degrades to the [`with_data`](Self::with_data) copy — never a deadlock or a
+    /// degrades to the `with_data` copy — never a deadlock or a
     /// bid leak. The next `with_segments` / `with_data` / `with_bytes` call sees
     /// the carried-over bytes first, in order.
     ///
@@ -1542,7 +1556,7 @@ impl ConnCtx {
     ///
     /// The caller must ensure that `target` points to writable memory of at
     /// least `len` bytes, and that the memory remains valid until
-    /// [`take_recv_sink()`](Self::take_recv_sink) is called. In practice this
+    /// `take_recv_sink()` is called. In practice this
     /// is guaranteed because ringline is single-threaded: the task sets the sink,
     /// yields, and the CQE handler (same thread) writes to it before the task
     /// resumes and clears the sink.
@@ -1947,7 +1961,7 @@ impl ConnCtx {
     /// [`forward_held`](Self::forward_held), which gathers all held buffers into
     /// one scatter-gather `sendmsg`. Intended for byte-pipe workloads (echo,
     /// proxy) where the handler does not parse the stream. While enabled,
-    /// [`with_data`](Self::with_data) / [`with_bytes`](Self::with_bytes) will not
+    /// `with_data` / `with_bytes` will not
     /// observe data (it never reaches the accumulator).
     ///
     /// Backpressure is automatic: held buffer ids are not returned to the
@@ -1965,7 +1979,7 @@ impl ConnCtx {
     /// [`SendFuture`] that resolves with the bytes sent. Requires
     /// [`enable_recv_forward`](Self::enable_recv_forward).
     ///
-    /// Gate calls on [`recv_ready`](Self::recv_ready), which becomes ready when
+    /// Gate calls on `recv_ready`, which becomes ready when
     /// the hold is non-empty (or the connection closed). When the hold is empty
     /// (e.g. the connection closed), the returned future resolves to `0`.
     ///
@@ -2064,7 +2078,7 @@ impl ConnCtx {
     ///
     /// mio fallback: drains the accumulator and copy-sends it, returning a
     /// [`SendFuture`] that resolves with the bytes sent (`0` when empty). Gate
-    /// calls on [`recv_ready`](Self::recv_ready) as on the io_uring backend.
+    /// calls on `recv_ready` as on the io_uring backend.
     #[cfg(not(has_io_uring))]
     pub fn forward_held(&self) -> io::Result<SendFuture> {
         with_state(|driver, executor| {
@@ -2787,7 +2801,7 @@ impl<'a> MioSendBuilder<'a> {
 
 // ── WithDataFuture ───────────────────────────────────────────────────
 
-/// Future returned by [`ConnCtx::with_data`].
+/// Future returned by [`Connection::with_data`].
 pub struct WithDataFuture<F> {
     conn_index: u32,
     /// Generation snapshot from `ConnCtx` at construction time. Compared on
@@ -2948,7 +2962,7 @@ impl<F: FnMut(&[u8]) -> ParseResult + Unpin> Future for WithDataFuture<F> {
 
 // ── WithDataResultFuture ─────────────────────────────────────────────
 
-/// Future returned by [`ConnCtx::with_data_result`].
+/// Future returned by [`Connection::with_data_result`].
 ///
 /// Wraps [`WithDataFuture`] and adds one thing: when the inner future
 /// reports `0`, this one checks the executor's per-connection recv error
@@ -2993,7 +3007,7 @@ impl<F: FnMut(&[u8]) -> ParseResult + Unpin> Future for WithDataResultFuture<F> 
 
 // ── WithBytesFuture ──────────────────────────────────────────────────
 
-/// Future returned by [`ConnCtx::with_bytes`].
+/// Future returned by [`Connection::with_bytes`].
 pub struct WithBytesFuture<F> {
     conn_index: u32,
     /// See `WithDataFuture` for the role of `generation`.
@@ -3155,12 +3169,12 @@ pub struct RecvHalf {
 }
 
 impl RecvHalf {
-    /// See [`ConnCtx::with_data`].
+    /// See [`Connection::with_data`].
     pub fn with_data<F: FnMut(&[u8]) -> ParseResult>(&mut self, f: F) -> WithDataFuture<F> {
         self.conn.with_data(f)
     }
 
-    /// See [`ConnCtx::with_data_result`].
+    /// See [`Connection::with_data_result`].
     pub fn with_data_result<F: FnMut(&[u8]) -> ParseResult>(
         &mut self,
         f: F,
@@ -3168,25 +3182,25 @@ impl RecvHalf {
         self.conn.with_data_result(f)
     }
 
-    /// See [`ConnCtx::with_bytes`].
+    /// See [`Connection::with_bytes`].
     pub fn with_bytes<F: FnMut(Bytes) -> ParseResult>(&mut self, f: F) -> WithBytesFuture<F> {
         self.conn.with_bytes(f)
     }
 
-    /// See [`ConnCtx::segments`]. The returned reader borrows this half, so a
+    /// See [`Connection::segments`]. The returned reader borrows this half, so a
     /// second one is a compile error rather than an `EBUSY`.
     #[cfg(has_io_uring)]
     pub fn segments(&mut self) -> io::Result<SegmentReader<'_>> {
         self.conn.segments_via(SegmentedEntry::ViaHalf)
     }
 
-    /// See [`ConnCtx::recv_owned_segment`].
+    /// See [`Connection::recv_owned_segment`].
     #[cfg(has_io_uring)]
     pub fn recv_owned_segment(&mut self) -> io::Result<RecvOwnedSegment> {
         self.conn.recv_owned_segment_via(SegmentedEntry::ViaHalf)
     }
 
-    /// See [`ConnCtx::with_segments`].
+    /// See [`Connection::with_segments`].
     #[cfg(has_io_uring)]
     pub fn with_segments<F>(&mut self, f: F) -> WithSegmentsFuture<F>
     where
@@ -3195,7 +3209,7 @@ impl RecvHalf {
         self.conn.with_segments(f)
     }
 
-    /// See [`ConnCtx::end_segments`]. Leaves the segmented domain and restores
+    /// See [`Connection::end_segments`]. Leaves the segmented domain and restores
     /// the default read path; the half stays valid and can read again.
     #[cfg(has_io_uring)]
     pub fn end_segments(&mut self) -> io::Result<()> {
@@ -3228,29 +3242,29 @@ impl RecvHalf {
         self.conn.forward_held()
     }
 
-    /// See [`ConnCtx::eof_truncated`].
+    /// See [`Connection::eof_truncated`].
     pub fn eof_truncated(&self) -> bool {
         self.conn.eof_truncated()
     }
 
-    /// See [`ConnCtx::try_with_data`].
+    /// See [`Connection::try_with_data`].
     pub fn try_with_data<F: FnOnce(&[u8]) -> ParseResult>(&mut self, f: F) -> Option<ParseResult> {
         self.conn.try_with_data(f)
     }
 
-    /// See [`ConnCtx::take_recv_sink`].
+    /// See [`Connection::take_recv_sink`].
     pub fn take_recv_sink(&mut self) -> usize {
         self.conn.take_recv_sink()
     }
 
-    /// See [`ConnCtx::recv_timestamp`]. Read-side state, so it lives here
+    /// See [`Connection::recv_timestamp`]. Read-side state, so it lives here
     /// rather than on [`SendHalf`].
     #[cfg(feature = "timestamps")]
     pub fn recv_timestamp(&self) -> u64 {
         self.conn.recv_timestamp()
     }
 
-    /// See [`ConnCtx::recv_ready`].
+    /// See [`Connection::recv_ready`].
     pub fn recv_ready(&mut self) -> RecvReadyFuture {
         self.conn.recv_ready()
     }
@@ -3368,12 +3382,12 @@ impl Connection {
 
     // ── recv ────────────────────────────────────────────────────────────
 
-    /// See [`ConnCtx::with_data`].
+    /// See [`Connection::with_data`].
     pub fn with_data<F: FnMut(&[u8]) -> ParseResult>(&mut self, f: F) -> WithDataFuture<F> {
         self.rx.with_data(f)
     }
 
-    /// See [`ConnCtx::with_data_result`].
+    /// See [`Connection::with_data_result`].
     pub fn with_data_result<F: FnMut(&[u8]) -> ParseResult>(
         &mut self,
         f: F,
@@ -3381,29 +3395,29 @@ impl Connection {
         self.rx.with_data_result(f)
     }
 
-    /// See [`ConnCtx::with_bytes`].
+    /// See [`Connection::with_bytes`].
     pub fn with_bytes<F: FnMut(Bytes) -> ParseResult>(&mut self, f: F) -> WithBytesFuture<F> {
         self.rx.with_bytes(f)
     }
 
-    /// See [`ConnCtx::recv_ready`].
+    /// See [`Connection::recv_ready`].
     pub fn recv_ready(&mut self) -> RecvReadyFuture {
         self.rx.recv_ready()
     }
 
-    /// See [`ConnCtx::segments`].
+    /// See [`Connection::segments`].
     #[cfg(has_io_uring)]
     pub fn segments(&mut self) -> io::Result<SegmentReader<'_>> {
         self.rx.segments()
     }
 
-    /// See [`ConnCtx::recv_owned_segment`].
+    /// See [`Connection::recv_owned_segment`].
     #[cfg(has_io_uring)]
     pub fn recv_owned_segment(&mut self) -> io::Result<RecvOwnedSegment> {
         self.rx.recv_owned_segment()
     }
 
-    /// See [`ConnCtx::with_segments`].
+    /// See [`Connection::with_segments`].
     #[cfg(has_io_uring)]
     pub fn with_segments<F>(&mut self, f: F) -> WithSegmentsFuture<F>
     where
@@ -3412,7 +3426,7 @@ impl Connection {
         self.rx.with_segments(f)
     }
 
-    /// See [`ConnCtx::end_segments`].
+    /// See [`Connection::end_segments`].
     #[cfg(has_io_uring)]
     pub fn end_segments(&mut self) -> io::Result<()> {
         self.rx.end_segments()
@@ -3448,7 +3462,7 @@ impl Connection {
         self.rx.forward_to_conn(sink, len)
     }
 
-    /// See [`ConnCtx::recv_timestamp`].
+    /// See [`Connection::recv_timestamp`].
     #[cfg(feature = "timestamps")]
     pub fn recv_timestamp(&self) -> u64 {
         self.rx.recv_timestamp()
@@ -3516,17 +3530,17 @@ impl Connection {
 
     // ── the rest of the ConnCtx surface ─────────────────────────────────
 
-    /// See [`ConnCtx::eof_truncated`].
+    /// See [`Connection::eof_truncated`].
     pub fn eof_truncated(&self) -> bool {
         self.rx.as_conn_ref().eof_truncated()
     }
 
-    /// See [`ConnCtx::try_with_data`].
+    /// See [`Connection::try_with_data`].
     pub fn try_with_data<F: FnOnce(&[u8]) -> ParseResult>(&mut self, f: F) -> Option<ParseResult> {
         self.rx.as_conn_ref().try_with_data(f)
     }
 
-    /// See [`ConnCtx::take_recv_sink`].
+    /// See [`Connection::take_recv_sink`].
     pub fn take_recv_sink(&mut self) -> usize {
         self.rx.as_conn_ref().take_recv_sink()
     }
@@ -3790,7 +3804,7 @@ impl Drop for RecvHalf {
 // ── Segmented recv (Mode B — Borrow) ─────────────────────────────────
 
 /// An async **lending iterator** over a connection's received provided buffers,
-/// obtained from [`ConnCtx::segments`] (io_uring only).
+/// obtained from [`Connection::segments`] (io_uring only).
 ///
 /// Each [`next`](Self::next) yields one zero-copy [`RecvSegment`] borrowing the
 /// reader exclusively (`&mut self`). Because the segment holds that `&mut`
@@ -3835,7 +3849,7 @@ impl SegmentReader<'_> {
     ///
     /// Parks when no buffer is held and the connection is still open, resuming
     /// when the recv completion handler holds a buffer and calls `wake_recv`
-    /// (the same waiter mechanism as [`ConnCtx::with_data`]).
+    /// (the same waiter mechanism as [`Connection::with_data`]).
     // This is a *lending* iterator: `next` borrows `&mut self` and yields a
     // segment tied to that borrow, which `std::iter::Iterator` cannot express.
     // The name is deliberate (it reads as an iterator to callers); it genuinely
@@ -4225,7 +4239,7 @@ impl Drop for RecvSegment<'_> {
 
 // ── Segmented recv (Mode C — Own, copy-at-delivery) ──────────────────
 
-/// Future returned by [`ConnCtx::recv_owned_segment`]. Copies each arriving
+/// Future returned by [`Connection::recv_owned_segment`]. Copies each arriving
 /// provided buffer into an owned [`Bytes`] and replenishes its bid at delivery,
 /// so it never pins the ring (the ring-safe owned-delivery path).
 #[cfg(has_io_uring)]
@@ -4621,7 +4635,7 @@ enum SegSettle {
     Owned(Bytes),
 }
 
-/// Future returned by [`ConnCtx::with_segments`]. Resolves to the total bytes
+/// Future returned by [`Connection::with_segments`]. Resolves to the total bytes
 /// the callback consumed this call (`Ok(0)` at EOF / on a stale handle).
 #[cfg(has_io_uring)]
 pub struct WithSegmentsFuture<F> {
@@ -4826,7 +4840,7 @@ impl<F: FnMut(&SegChain<'_>) -> SegConsumed + Unpin> Future for WithSegmentsFutu
 
 // ── RecvReadyFuture ──────────────────────────────────────────────────
 
-/// Future returned by [`ConnCtx::recv_ready`]. Resolves when:
+/// Future returned by [`Connection::recv_ready`]. Resolves when:
 /// 1. The recv sink has received data (`pos > 0`), OR
 /// 2. The accumulator has data, OR
 /// 3. The connection is closed.
