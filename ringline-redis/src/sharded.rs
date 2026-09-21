@@ -195,7 +195,7 @@ impl ShardedClient {
                 },
             };
 
-            if let Err(e) = conn.send(encoded) {
+            if let Err(e) = conn.take_send().and_then(|mut tx| tx.send(encoded)) {
                 shard.conns[idx] = ShardConn::Disconnected;
                 conn.close();
                 return Err(Error::Io(e));
@@ -1035,7 +1035,7 @@ impl ShardedClient {
         let ping_cmd = Client::encode_request(&Request::ping());
         for shard in &mut self.shards {
             if let Some(conn) = get_connected_conn(shard) {
-                conn.send(&ping_cmd)?;
+                conn.take_send()?.send(&ping_cmd)?;
                 let value = Client::new(conn)?.read_value().await?;
                 if let Value::Error(ref msg) = value {
                     return Err(Error::Redis(String::from_utf8_lossy(msg).into_owned()));

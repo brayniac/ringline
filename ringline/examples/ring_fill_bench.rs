@@ -124,8 +124,8 @@ impl AsyncEventHandler for Bench {
                         .await
                         .expect("connect");
                     // Reading an outbound connection goes through its read half.
-                    let mut conn_rx = match conn.take_recv() {
-                        Ok(rx) => rx,
+                    let (mut conn_tx, mut conn_rx) = match conn.split() {
+                        Ok(halves) => halves,
                         Err(_) => return,
                     };
                     // MODE=forward forwards each response straight to a discard
@@ -148,7 +148,7 @@ impl AsyncEventHandler for Bench {
                     while Instant::now() < deadline {
                         let want = size_for_round(&mode, rounds, msg, small, large);
                         let req = (want as u32).to_le_bytes();
-                        if conn.send_nowait(&req).is_err() {
+                        if conn_tx.send_nowait(&req).is_err() {
                             break;
                         }
                         let got = match mode.as_str() {

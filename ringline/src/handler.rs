@@ -461,7 +461,7 @@ impl<'a> DriverCtx<'a> {
     /// Submit a bounded (`ConnCtx::send_backpressured`) send, tagging the
     /// operation's identity onto the slot whose completion settles it.
     ///
-    /// Byte-for-byte [`send`](Self::send) — the same generation check, the
+    /// Byte-for-byte `send` — the same generation check, the
     /// same `close_submitted` refusal, the same two `reserve_slots` error
     /// mappings, the same TLS branch, the same chunk loop — plus one thing:
     /// `id` and the **logical (plaintext) length** are attached to the

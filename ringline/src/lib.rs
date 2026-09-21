@@ -244,7 +244,7 @@ pub use runtime::handler::AsyncEventHandler;
 #[cfg(has_io_uring)]
 /// Async scatter-gather send builder.
 pub use runtime::io::AsyncSendBuilder;
-/// Future returned by [`ConnCtx::send_backpressured()`]: a send that waits
+/// Future returned by [`SendHalf::send_backpressured()`]: a send that waits
 /// for send-pool capacity instead of failing when the pool is full.
 pub use runtime::io::BackpressuredSendFuture;
 /// Future returned by [`spawn_blocking()`]. Resolves to the closure's return value.

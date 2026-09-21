@@ -247,3 +247,48 @@ refusal, and Modes B and C, written later against the same driver state,
 inherited none of them. Divergent siblings against shared mutable state is the
 recurring defect. Ownership is the mechanism that makes divergence impossible
 rather than merely discouraged.
+
+## The end state
+
+Both sides are now capabilities you must hold, and `ConnCtx` is a token.
+
+| | read | write |
+|---|---|---|
+| capability type | `RecvHalf` | `SendHalf` |
+| `Copy`/`Clone` | neither | neither |
+| claim | `recv_half_taken` | `send_half_taken` |
+| taken by | `take_recv` / `split` | `take_send` / `split` |
+| released by | `Drop` (generation-gated) | `Drop` (generation-gated) |
+| recycle-point reset | `clear_conn_claims` | `clear_conn_claims` |
+
+`ConnCtx` keeps identity (`token`, `index`, `peer_addr`, `is_outbound`,
+`is_alive`, `tls_info`), lifecycle (`close`, `cancel`, `request_shutdown`),
+outbound connects, the forwarding entry points, and the three that mint the
+halves. It grants no read or write of its own — which is what makes it being
+`Copy` fine. **Copying a name is harmless; copying a capability was the bug.**
+
+### Why forwarding stayed on the token
+
+`forward_to`, `forward_to_conn`, `forward_held`, `enable_recv_forward` and
+`run_direct_echo` move bytes kernel-side and never surface them to the caller,
+so they cannot be used to observe a stream another reader owns. With the read
+*and* write methods private they also cannot be paired with an external
+operation on the same connection. Their own exclusivity is enforced two ways:
+`RecvHalf::forward_to_conn` takes the sink's `&mut SendHalf` (compile time),
+and the token-named form refuses `EBUSY` when the sink's write half is out
+(run time). Keeping the latter reachable is what keeps that runtime refusal
+testable.
+
+### Fan-in is a queue, and the tests now show it
+
+With no `Clone` on either half and no capability on the token, several
+producers feeding one connection *has* to be an explicit queue drained by the
+owning task. `SleepEchoHandler` and `TimeoutTestHandler` in `tests/echo.rs`
+were rewritten onto `mpsc::channel` for exactly this reason — they had been
+using `as_conn()` to hand a spawned task a second writer, which is the thing
+this whole arc exists to prevent.
+
+Single *ownership* is not the same as one operation at a time: `send` and
+`send_backpressured` return owned futures, so the `&mut` ends at the call and
+two sends can still be in flight from one half. `JoinHandler` and
+`OwnerMoveHandler` demonstrate that.

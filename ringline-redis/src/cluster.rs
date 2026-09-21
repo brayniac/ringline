@@ -165,7 +165,11 @@ impl ClusterClient {
                 // down and try the next one instead of failing the whole
                 // refresh (which also failed the caller's command even
                 // though healthy nodes could serve it).
-                if conn.send(&cluster_slots_cmd).is_err() {
+                if conn
+                    .take_send()
+                    .and_then(|mut tx| tx.send(&cluster_slots_cmd))
+                    .is_err()
+                {
                     if let Some(state) = self.nodes.get_mut(addr) {
                         if let NodeState::Connected(conn) = state {
                             conn.close();
@@ -197,7 +201,11 @@ impl ClusterClient {
             for &seed_addr in &self.seeds {
                 match self.do_connect(seed_addr).await {
                     Ok(conn) => {
-                        if conn.send(&cluster_slots_cmd).is_err() {
+                        if conn
+                            .take_send()
+                            .and_then(|mut tx| tx.send(&cluster_slots_cmd))
+                            .is_err()
+                        {
                             conn.close();
                             continue;
                         }
@@ -352,7 +360,7 @@ impl ClusterClient {
                 Err(e) => return Err(e),
             };
 
-            if let Err(e) = conn.send(encoded) {
+            if let Err(e) = conn.take_send().and_then(|mut tx| tx.send(encoded)) {
                 self.mark_disconnected(&target_addr);
                 return Err(Error::Io(e));
             }
@@ -449,7 +457,7 @@ impl ClusterClient {
     ) -> Result<AskOutcome, Error> {
         let ask_conn = self.conn_for_addr(ask_addr).await?;
         let asking_cmd = Client::encode_request(&Request::cmd(b"ASKING"));
-        ask_conn.send(&asking_cmd)?;
+        ask_conn.take_send()?.send(&asking_cmd)?;
         // Validate the ASKING response — if the server replies with an
         // error here, propagate it instead of silently moving on to send
         // the real command on a misconfigured connection.
@@ -458,7 +466,7 @@ impl ClusterClient {
             return Err(Error::Redis(String::from_utf8_lossy(msg).into_owned()));
         }
 
-        ask_conn.send(encoded)?;
+        ask_conn.take_send()?.send(encoded)?;
         let ask_value = Client::new(ask_conn)?.read_value().await?;
         if let Some(redirect) = parse_redirect(&ask_value) {
             return Ok(AskOutcome::Followup(redirect));
@@ -1295,7 +1303,7 @@ impl ClusterClient {
             .ok_or(Error::AllConnectionsFailed)?;
 
         let conn = self.conn_for_addr(&addr).await?;
-        conn.send(&ping_cmd)?;
+        conn.take_send()?.send(&ping_cmd)?;
         let value = Client::new(conn)?.read_value().await?;
         if let Value::Error(ref msg) = value {
             return Err(Error::Redis(String::from_utf8_lossy(msg).into_owned()));

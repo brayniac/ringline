@@ -205,7 +205,11 @@ impl ShardedClient {
                 },
             };
 
-            if conn.send(encoded).is_err() {
+            if conn
+                .take_send()
+                .and_then(|mut tx| tx.send(encoded))
+                .is_err()
+            {
                 // Synchronous send failure (EPIPE, ECONNRESET, etc.) — the
                 // conn is dead. Previously this branch returned `Err(Io)`
                 // immediately, bypassing the rest of the pool. Mark the

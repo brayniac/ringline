@@ -390,8 +390,8 @@ mod ringline_client {
             }
         };
         // Reading an outbound connection goes through its read half.
-        let mut conn_rx = match conn.take_recv() {
-            Ok(rx) => rx,
+        let (mut conn_tx, mut conn_rx) = match conn.split() {
+            Ok(halves) => halves,
             Err(_) => return,
         };
 
@@ -409,7 +409,7 @@ mod ringline_client {
         while !state.stop.load(Ordering::Relaxed) {
             let t0 = Instant::now();
 
-            if conn.send_nowait(&batch).is_err() {
+            if conn_tx.send_nowait(&batch).is_err() {
                 break;
             }
 
@@ -479,8 +479,8 @@ mod ringline_client {
             }
         };
         // Reading an outbound connection goes through its read half.
-        let mut conn_rx = match conn.take_recv() {
-            Ok(rx) => rx,
+        let (mut conn_tx, mut conn_rx) = match conn.split() {
+            Ok(halves) => halves,
             Err(_) => return,
         };
 
@@ -525,7 +525,7 @@ mod ringline_client {
                 if Instant::now() < target {
                     break; // next request not due yet
                 }
-                if conn.send_nowait(&msg).is_err() {
+                if conn_tx.send_nowait(&msg).is_err() {
                     pool_full = true;
                     break; // send pool full; drain responses first
                 }

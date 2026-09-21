@@ -468,14 +468,14 @@ impl AsyncEventHandler for TlsClientHandler {
                 }
             };
             // Reading an outbound connection goes through its read half.
-            let mut conn_rx = match conn.take_recv() {
-                Ok(rx) => rx,
+            let (mut conn_tx, mut conn_rx) = match conn.split() {
+                Ok(halves) => halves,
                 Err(_) => return,
             };
 
             // Send data over TLS and read back.
             let msg = b"ringline-to-ringline TLS echo";
-            if let Err(e) = conn.send(msg) {
+            if let Err(e) = conn_tx.send(msg) {
                 TLS_CONNECT_RESULT.set(format!("SEND_ERR:{e}")).ok();
                 ringline::request_shutdown().ok();
                 return;

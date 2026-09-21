@@ -814,20 +814,31 @@ struct SleepEchoHandler;
 impl AsyncEventHandler for SleepEchoHandler {
     fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
-            let (tx, mut rx) = conn.split();
+            let (mut tx, mut rx) = conn.split();
+
+            // Several producers feeding one connection is an explicit queue
+            // drained by the task that owns the write half — the documented
+            // alternative to a shared send handle, and now the only one: the
+            // send half is not `Clone`, and `ConnCtx` no longer carries the
+            // capability. See `docs/connection-handle-ownership-design.md`.
+            let (outbox, drain) = ringline::mpsc::channel::<Vec<u8>>(8);
+            ringline::spawn(async move {
+                while let Some(msg) = drain.recv().await {
+                    let _ = tx.send_nowait(&msg);
+                }
+            })
+            .unwrap();
+
             loop {
                 let n = rx
                     .with_data(|data| {
                         let len = data.len();
                         // Sleep 50ms then echo.
                         let data_copy = data.to_vec();
-                        // The spawned task only *sends*; the read side stays
-                        // here. `as_conn()` hands it a send-capable handle
-                        // without cloning the (exclusive) reader.
-                        let conn2 = tx.as_conn();
+                        let producer = outbox.clone();
                         ringline::spawn(async move {
                             ringline::sleep(Duration::from_millis(50)).await;
-                            let _ = conn2.send_nowait(&data_copy);
+                            let _ = producer.send(data_copy).await;
                         })
                         .unwrap();
                         ParseResult::Consumed(len)
@@ -882,28 +893,39 @@ struct TimeoutTestHandler;
 impl AsyncEventHandler for TimeoutTestHandler {
     fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
-            let (tx, mut rx) = conn.split();
+            let (mut tx, mut rx) = conn.split();
+
+            // Same fan-in shape as `SleepEchoHandler`: the spawned tasks are
+            // producers, and the half stays with the one task that drains.
+            let (outbox, drain) = ringline::mpsc::channel::<&'static [u8]>(4);
+            ringline::spawn(async move {
+                while let Some(msg) = drain.recv().await {
+                    let _ = tx.send_nowait(msg);
+                }
+            })
+            .unwrap();
+
             rx.with_data(|data| -> ParseResult {
                 let msg = std::str::from_utf8(data).unwrap_or("");
                 if msg == "test-timeout-ok" {
                     // Timeout wrapping an immediate future should succeed.
-                    let conn2 = tx.as_conn();
+                    let producer = outbox.clone();
                     ringline::spawn(async move {
                         let result =
                             ringline::timeout(Duration::from_secs(10), async { 42u32 }).await;
                         match result {
                             Ok(42) => {
-                                let _ = conn2.send_nowait(b"OK");
+                                let _ = producer.send(b"OK").await;
                             }
                             _ => {
-                                let _ = conn2.send_nowait(b"FAIL");
+                                let _ = producer.send(b"FAIL").await;
                             }
                         }
                     })
                     .unwrap();
                 } else if msg == "test-timeout-expire" {
                     // Timeout wrapping a long sleep should expire.
-                    let conn2 = tx.as_conn();
+                    let producer = outbox.clone();
                     ringline::spawn(async move {
                         let result = ringline::timeout(
                             Duration::from_millis(20),
@@ -912,10 +934,10 @@ impl AsyncEventHandler for TimeoutTestHandler {
                         .await;
                         match result {
                             Err(_elapsed) => {
-                                let _ = conn2.send_nowait(b"ELAPSED");
+                                let _ = producer.send(b"ELAPSED").await;
                             }
                             Ok(()) => {
-                                let _ = conn2.send_nowait(b"FAIL");
+                                let _ = producer.send(b"FAIL").await;
                             }
                         }
                     })
@@ -1045,8 +1067,8 @@ impl AsyncEventHandler for ForwarderHandler {
                 }
             };
             // Reading an outbound connection goes through its read half.
-            let mut backend_rx = match backend.take_recv() {
-                Ok(rx) => rx,
+            let (mut backend_tx, mut backend_rx) = match backend.split() {
+                Ok(halves) => halves,
                 Err(_) => return,
             };
 
@@ -1064,7 +1086,7 @@ impl AsyncEventHandler for ForwarderHandler {
                 }
 
                 // Forward to backend.
-                if backend.send_nowait(&data_copy).is_err() {
+                if backend_tx.send_nowait(&data_copy).is_err() {
                     break;
                 }
 
@@ -1270,8 +1292,8 @@ impl AsyncEventHandler for MultiOutboundHandler {
                 }
             };
             // Reading an outbound connection goes through its read half.
-            let mut backend1_rx = match backend1.take_recv() {
-                Ok(rx) => rx,
+            let (mut backend1_tx, mut backend1_rx) = match backend1.split() {
+                Ok(halves) => halves,
                 Err(_) => return,
             };
 
@@ -1289,13 +1311,13 @@ impl AsyncEventHandler for MultiOutboundHandler {
                 }
             };
             // Reading an outbound connection goes through its read half.
-            let mut backend2_rx = match backend2.take_recv() {
-                Ok(rx) => rx,
+            let (mut backend2_tx, mut backend2_rx) = match backend2.split() {
+                Ok(halves) => halves,
                 Err(_) => return,
             };
 
             // Send "AA" through backend1, "BB" through backend2.
-            if backend1.send_nowait(b"AA").is_err() {
+            if backend1_tx.send_nowait(b"AA").is_err() {
                 let _ = client.send_nowait(b"SEND_ERR1");
                 return;
             }
@@ -1314,7 +1336,7 @@ impl AsyncEventHandler for MultiOutboundHandler {
                 }
             }
 
-            if backend2.send_nowait(b"BB").is_err() {
+            if backend2_tx.send_nowait(b"BB").is_err() {
                 let _ = client.send_nowait(b"SEND_ERR2");
                 return;
             }
@@ -1442,8 +1464,8 @@ impl AsyncEventHandler for SelectTwoHandler {
                 }
             };
             // Reading an outbound connection goes through its read half.
-            let mut backend1_rx = match backend1.take_recv() {
-                Ok(rx) => rx,
+            let (mut backend1_tx, mut backend1_rx) = match backend1.split() {
+                Ok(halves) => halves,
                 Err(_) => return,
             };
             let backend2 = match client.connect(addr2) {
@@ -1466,7 +1488,7 @@ impl AsyncEventHandler for SelectTwoHandler {
             };
 
             // Send data to backend1 only.
-            if backend1.send_nowait(b"HELLO").is_err() {
+            if backend1_tx.send_nowait(b"HELLO").is_err() {
                 let _ = client.send_nowait(b"SEND_ERR");
                 return;
             }
@@ -1629,13 +1651,13 @@ impl AsyncEventHandler for SelectSecondWinsHandler {
                 }
             };
             // Reading an outbound connection goes through its read half.
-            let mut backend2_rx = match backend2.take_recv() {
-                Ok(rx) => rx,
+            let (mut backend2_tx, mut backend2_rx) = match backend2.split() {
+                Ok(halves) => halves,
                 Err(_) => return,
             };
 
             // Send data to backend2 only.
-            if backend2.send_nowait(b"WORLD").is_err() {
+            if backend2_tx.send_nowait(b"WORLD").is_err() {
                 let _ = client.send_nowait(b"SEND_ERR");
                 return;
             }
@@ -1869,13 +1891,13 @@ impl AsyncEventHandler for Select3Handler {
                 }
             };
             // Reading an outbound connection goes through its read half.
-            let mut backend_rx = match backend.take_recv() {
-                Ok(rx) => rx,
+            let (mut backend_tx, mut backend_rx) = match backend.split() {
+                Ok(halves) => halves,
                 Err(_) => return,
             };
 
             // Send data to backend so it echoes.
-            if backend.send_nowait(b"ECHO3").is_err() {
+            if backend_tx.send_nowait(b"ECHO3").is_err() {
                 let _ = client.send_nowait(b"SEND_ERR");
                 return;
             }
@@ -2739,22 +2761,20 @@ impl AsyncEventHandler for JoinHandler {
                 return;
             }
 
-            // Join two send calls. The point of this test is two sends
-            // *in flight at once*, which `&mut SendHalf` deliberately forbids
-            // — one owner, one send at a time. Concurrency here is the test's
-            // subject, so it goes through the `Copy` handle underneath.
-            let ctx = tx.as_conn();
-            let fut_a = async {
-                match ctx.send(b"HELLO") {
-                    Ok(f) => f.await,
-                    Err(e) => Err(e),
-                }
+            // Two sends in flight at once, from the one owned write half.
+            //
+            // `send` returns an owned `SendFuture`, so the `&mut tx` borrow
+            // ends at the call — arming both and joining them needs no shared
+            // handle. Single *ownership* was never the same thing as one
+            // operation at a time; the per-connection send queue is what keeps
+            // these two from interleaving on the wire.
+            let fut_a = match tx.send(b"HELLO") {
+                Ok(f) => f,
+                Err(_) => return,
             };
-            let fut_b = async {
-                match ctx.send(b"WORLD") {
-                    Ok(f) => f.await,
-                    Err(e) => Err(e),
-                }
+            let fut_b = match tx.send(b"WORLD") {
+                Ok(f) => f,
+                Err(_) => return,
             };
             let (a, b) = ringline::join(fut_a, fut_b).await;
             let msg = format!("JOIN:{}:{}", a.unwrap_or(0), b.unwrap_or(0));
@@ -2959,17 +2979,20 @@ const MOVED_MSG: &[u8] = &[b'M'; 4096];
 struct OwnerMoveHandler;
 
 impl AsyncEventHandler for OwnerMoveHandler {
-    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             // Occupies the only pool slot until the client starts reading.
-            // Both sends go through `ConnCtx`: the moved one outlives this
-            // task, so it cannot borrow the half that lives here.
-            let hog_conn = conn.as_conn();
-            let hog = ringline::spawn_with_handle(hog_conn.send_backpressured(MOVED_HOG))
-                .expect("spawn hog");
+            //
+            // Both sends come from the one write half: `send_backpressured`
+            // returns a future borrowing only the *data*, so the `&mut` on the
+            // half ends at the call and the future can outlive it — which is
+            // what lets the second one move to another task below.
+            let (mut tx, _rx) = conn.split();
+            let hog =
+                ringline::spawn_with_handle(tx.send_backpressured(MOVED_HOG)).expect("spawn hog");
 
             // Park the second send in *this* task...
-            let mut moved = conn.send_backpressured(MOVED_MSG);
+            let mut moved = tx.send_backpressured(MOVED_MSG);
             PollOnce(&mut moved).await;
 
             // ...then hand it to a different task to finish.
@@ -2978,7 +3001,7 @@ impl AsyncEventHandler for OwnerMoveHandler {
             let _ = hog.await;
             let n = finisher.await.expect("the moved send resolved");
             assert_eq!(n as usize, MOVED_MSG.len());
-            conn.shutdown_write();
+            tx.shutdown_write();
         }
     }
     fn create_for_worker(_id: usize) -> Self {
@@ -3830,13 +3853,13 @@ impl AsyncEventHandler for StandaloneConnectHandler {
                     }
                 };
                 // Reading an outbound connection goes through its read half.
-                let mut backend_rx = match backend.take_recv() {
-                    Ok(rx) => rx,
+                let (mut backend_tx, mut backend_rx) = match backend.split() {
+                    Ok(halves) => halves,
                     Err(_) => return,
                 };
 
                 // Send data to backend, read echo.
-                if backend.send_nowait(b"STANDALONE").is_err() {
+                if backend_tx.send_nowait(b"STANDALONE").is_err() {
                     return;
                 }
 
@@ -4086,12 +4109,12 @@ impl AsyncEventHandler for OnStartClientHandler {
                 }
             };
             // Reading an outbound connection goes through its read half.
-            let mut backend_rx = match backend.take_recv() {
-                Ok(rx) => rx,
+            let (mut backend_tx, mut backend_rx) = match backend.split() {
+                Ok(halves) => halves,
                 Err(_) => return,
             };
 
-            if backend.send_nowait(b"ON_START").is_err() {
+            if backend_tx.send_nowait(b"ON_START").is_err() {
                 ON_START_RESULT.set("SEND_ERR".to_string()).ok();
                 ringline::request_shutdown().ok();
                 return;
@@ -4727,13 +4750,13 @@ impl AsyncEventHandler for OutboundEofClient {
                 }
             };
             // Reading an outbound connection goes through its read half.
-            let mut conn_rx = match conn.take_recv() {
-                Ok(rx) => rx,
+            let (mut conn_tx, mut conn_rx) = match conn.split() {
+                Ok(halves) => halves,
                 Err(_) => return,
             };
 
             // Send data and read echo, with a timeout.
-            let _ = conn.send_nowait(b"hello");
+            let _ = conn_tx.send_nowait(b"hello");
             let mut echoed = Vec::new();
             let echo_fut = conn_rx.with_data(|data| {
                 echoed.extend_from_slice(data);
