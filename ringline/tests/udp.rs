@@ -38,15 +38,56 @@ fn base_config() -> Config {
     base_config_builder().build().expect("valid config")
 }
 
+/// Reserve a port from *below* the ephemeral range.
+///
+/// Same fix as `free_port` in `echo.rs` (#431): binding `:0` and dropping the
+/// socket returns the port to the pool the kernel auto-assigns from, so
+/// anything can take it between the probe and the real bind. Ports down here
+/// are only ever taken by number.
+fn reserve_test_port(kind: PortKind) -> u16 {
+    use std::sync::Mutex;
+    static CLAIMED: Mutex<Option<std::collections::HashSet<u16>>> = Mutex::new(None);
+    const BASE: u16 = 20_000;
+    const SPAN: u16 = 10_000;
+
+    let stride = ((std::process::id() % 40) as u16).saturating_mul(250);
+    for step in 0..SPAN {
+        let port = BASE + (stride + step) % SPAN;
+        {
+            let mut guard = CLAIMED.lock().unwrap();
+            if !guard.get_or_insert_with(Default::default).insert(port) {
+                continue;
+            }
+        }
+        let free = match kind {
+            PortKind::Udp => std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok(),
+            PortKind::UdpV6 => std::net::UdpSocket::bind(("::1", port)).is_ok(),
+            PortKind::Tcp => std::net::TcpListener::bind(("127.0.0.1", port)).is_ok(),
+        };
+        if free {
+            return port;
+        }
+    }
+    panic!("no free port in the test range {BASE}..{}", BASE + SPAN);
+}
+
+#[derive(Clone, Copy)]
+enum PortKind {
+    Tcp,
+    Udp,
+    UdpV6,
+}
+
 fn free_udp_port() -> u16 {
-    // Bind a UDP socket to :0, read the port, drop the socket.
-    let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    s.local_addr().unwrap().port()
+    reserve_test_port(PortKind::Udp)
 }
 
 fn free_udp_port_v6() -> u16 {
-    let s = std::net::UdpSocket::bind("[::1]:0").unwrap();
-    s.local_addr().unwrap().port()
+    reserve_test_port(PortKind::UdpV6)
+}
+
+fn free_port() -> u16 {
+    reserve_test_port(PortKind::Tcp)
 }
 
 fn await_handler_started(flag: &AtomicUsize) {
@@ -1028,10 +1069,7 @@ fn udp_and_tcp_coexist() {
         .get_or_init(Default::default)
         .store(0, Ordering::SeqCst);
 
-    let tcp_port = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().port()
-    };
+    let tcp_port = free_port();
     let udp_port = free_udp_port();
     let tcp_addr: SocketAddr = format!("127.0.0.1:{tcp_port}").parse().unwrap();
     let udp_addr: SocketAddr = format!("127.0.0.1:{udp_port}").parse().unwrap();

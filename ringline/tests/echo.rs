@@ -154,22 +154,42 @@ fn test_config() -> Config {
 
 /// Find an available port by binding to :0.
 fn free_port() -> u16 {
-    // Tests run on many threads; the naive bind(:0)-drop-rebind pattern
-    // races (the kernel can hand the same port to two tests before either
-    // rebinds), which shows up as AddrInUse launch failures or clients
-    // connecting to another test's server. A process-global claimed set
-    // makes each handed-out port unique within the test binary.
+    // Ports come from *below* the ephemeral range (Linux's `ip_local_port_range`
+    // starts at 32768, macOS at 49152). That is the whole fix for #431: the
+    // kernel never auto-assigns a port down here, so the probe-bind/drop/rebind
+    // window stops being a race. Nothing can take one of these out from under
+    // the caller except another process asking for it by number.
+    //
+    // The old version probed with `bind(":0")` and dropped the listener, which
+    // left the port in the ephemeral pool. Between the drop and the server's
+    // real bind, the kernel could hand it to anyone — surfacing either as an
+    // `AddrInUse` launch failure, or (worse, in
+    // `async_outbound_connect_refused`) as a connection *succeeding* to a port
+    // the test believed was dead.
+    //
+    // `cargo test` runs binaries concurrently, so the window is offset per
+    // process; `CLAIMED` keeps threads inside one binary from colliding.
     use std::sync::Mutex;
     static CLAIMED: Mutex<Option<std::collections::HashSet<u16>>> = Mutex::new(None);
-    loop {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        let mut guard = CLAIMED.lock().unwrap();
-        if guard.get_or_insert_with(Default::default).insert(port) {
+    const BASE: u16 = 20_000;
+    const SPAN: u16 = 10_000;
+
+    let stride = ((std::process::id() % 40) as u16).saturating_mul(250);
+    for step in 0..SPAN {
+        let port = BASE + (stride + step) % SPAN;
+        {
+            let mut guard = CLAIMED.lock().unwrap();
+            if !guard.get_or_insert_with(Default::default).insert(port) {
+                continue;
+            }
+        }
+        // Confirm nothing currently holds it. Unlike the old probe, dropping
+        // this listener does not return the port to a pool anyone draws from.
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
             return port;
         }
     }
+    panic!("no free port in the test range {BASE}..{}", BASE + SPAN);
 }
 
 fn wait_for_server(addr: &str) {
@@ -1164,10 +1184,11 @@ impl AsyncEventHandler for ConnectRefusedHandler {
 
 #[test]
 fn async_outbound_connect_refused() {
-    // Bind to a port, then drop the listener so nothing is listening.
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let dead_port = listener.local_addr().unwrap().port();
-    drop(listener);
+    // A port from the test allocator, never bound. `free_port` hands out ports
+    // from below the ephemeral range, so nothing will take this one behind our
+    // back — which is what used to make this test fail with `CONNECTED`
+    // instead of a refusal (#431).
+    let dead_port = free_port();
 
     CONNECT_REFUSED_PORT.store(dead_port as u32, Ordering::SeqCst);
 
@@ -4181,10 +4202,10 @@ impl AsyncEventHandler for StandaloneConnectRefusedHandler {
 
 #[test]
 fn async_standalone_connect_refused() {
-    // Bind to a port then drop it so nothing is listening.
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let dead_port = listener.local_addr().unwrap().port();
-    drop(listener);
+    // A port from the test allocator, never bound — see #431 and the note on
+    // `free_port`. The old probe-then-drop left it in the ephemeral pool,
+    // where anything could take it and turn "refused" into "connected".
+    let dead_port = free_port();
 
     STANDALONE_REFUSED_PORT.store(dead_port as u32, Ordering::SeqCst);
 
