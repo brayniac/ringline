@@ -361,16 +361,17 @@ fn getsockname_v4_v6(fd: RawFd) -> Option<SocketAddr> {
 /// # Example: Echo Server
 ///
 /// ```no_run
-/// use ringline::{AsyncEventHandler, Config, ConnCtx, ParseResult, RinglineBuilder};
+/// use ringline::{AsyncEventHandler, Config, Connection, ParseResult, RinglineBuilder};
 ///
 /// struct Echo;
 ///
 /// impl AsyncEventHandler for Echo {
-///     fn on_accept(&self, conn: ConnCtx) -> impl std::future::Future<Output = ()> + 'static {
+///     fn on_accept(&self, mut conn: Connection) -> impl std::future::Future<Output = ()> + 'static {
 ///         async move {
+///             let (mut tx, mut rx) = conn.split();
 ///             loop {
-///                 let n = conn.with_data(|data| {
-///                     conn.send_nowait(data).ok();
+///                 let n = rx.with_data(|data| {
+///                     tx.send_nowait(data).ok();
 ///                     ParseResult::Consumed(data.len())
 ///                 }).await;
 ///                 if n == 0 { break; }
@@ -420,7 +421,7 @@ fn getsockname_v4_v6(fd: RawFd) -> Option<SocketAddr> {
 ///             }
 ///         }))
 ///     }
-///     fn on_accept(&self, _conn: ringline::ConnCtx) -> impl std::future::Future<Output = ()> + 'static {
+///     fn on_accept(&self, _conn: ringline::Connection) -> impl std::future::Future<Output = ()> + 'static {
 ///         async {} // No inbound connections in client-only mode
 ///     }
 ///     fn create_for_worker(_id: usize) -> Self { ClientHandler }
@@ -441,14 +442,15 @@ fn getsockname_v4_v6(fd: RawFd) -> Option<SocketAddr> {
 /// # Example: Unix Domain Socket
 ///
 /// ```no_run
-/// use ringline::{AsyncEventHandler, Config, ConnCtx, ParseResult, RinglineBuilder};
+/// use ringline::{AsyncEventHandler, Config, Connection, ParseResult, RinglineBuilder};
 ///
 /// struct Handler;
 /// impl AsyncEventHandler for Handler {
-///     fn on_accept(&self, conn: ConnCtx) -> impl std::future::Future<Output = ()> + 'static {
+///     fn on_accept(&self, mut conn: Connection) -> impl std::future::Future<Output = ()> + 'static {
 ///         async move {
+///             let (mut tx, mut rx) = conn.split();
 ///             loop {
-///                 let n = conn.with_data(|_data| ParseResult::Consumed(0)).await;
+///                 let n = rx.with_data(|_data| ParseResult::Consumed(0)).await;
 ///                 if n == 0 { break; }
 ///             }
 ///         }

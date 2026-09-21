@@ -10,7 +10,9 @@ use std::net::TcpStream;
 use std::pin::Pin;
 use std::time::Duration;
 
-use ringline::{AsyncEventHandler, Config, ConfigBuilder, ConnCtx, ParseResult, RinglineBuilder};
+use ringline::{
+    AsyncEventHandler, Config, ConfigBuilder, Connection, ParseResult, RinglineBuilder,
+};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 // ── Async echo handler ─────────────────────────────────────────────
@@ -18,12 +20,13 @@ use std::sync::atomic::{AtomicU32, Ordering};
 struct AsyncEcho;
 
 impl AsyncEventHandler for AsyncEcho {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
+            let (mut tx, mut rx) = conn.split();
             loop {
-                let n = conn
+                let n = rx
                     .with_data(|data| {
-                        let _ = conn.send_nowait(data);
+                        let _ = tx.send_nowait(data);
                         ParseResult::Consumed(data.len())
                     })
                     .await;
@@ -51,7 +54,7 @@ const BURST_MSG: usize = 64;
 struct BurstSender;
 
 impl AsyncEventHandler for BurstSender {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             for i in 0..BURST_N {
                 let msg = [(i % 251) as u8; BURST_MSG];
@@ -85,12 +88,9 @@ impl AsyncEventHandler for BurstSender {
 struct SplitEcho;
 
 impl AsyncEventHandler for SplitEcho {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
-            let (mut tx, mut rx) = match conn.split() {
-                Ok(halves) => halves,
-                Err(e) => panic!("split() on a fresh connection: {e}"),
-            };
+            let (mut tx, mut rx) = conn.split();
             loop {
                 let n = rx
                     .with_data(|data| {
@@ -116,7 +116,7 @@ impl AsyncEventHandler for SplitEcho {
 struct RecvForwardEcho;
 
 impl AsyncEventHandler for RecvForwardEcho {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             conn.enable_recv_forward();
             loop {
@@ -594,19 +594,20 @@ fn graceful_shutdown() {
 struct ShutdownWriteEcho;
 
 impl AsyncEventHandler for ShutdownWriteEcho {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
-            let n = conn
+            let (mut tx, mut rx) = conn.split();
+            let n = rx
                 .with_data(|data| {
-                    let _ = conn.send_nowait(data);
+                    let _ = tx.send_nowait(data);
                     ParseResult::Consumed(data.len())
                 })
                 .await;
             if n > 0 {
-                conn.shutdown_write();
+                tx.shutdown_write();
             }
             // Keep the task alive to receive more (should get EOF).
-            let _ = conn.with_data(|_data| ParseResult::Consumed(0)).await;
+            let _ = rx.with_data(|_data| ParseResult::Consumed(0)).await;
         }
     }
     fn create_for_worker(_id: usize) -> Self {
@@ -669,12 +670,13 @@ fn async_shutdown_write_triggers_eof() {
 struct RequestShutdownHandler;
 
 impl AsyncEventHandler for RequestShutdownHandler {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
-            conn.with_data(|data| {
+            let (mut tx, mut rx) = conn.split();
+            rx.with_data(|data| {
                 // Echo back, then request shutdown.
-                let _ = conn.send_nowait(data);
-                conn.request_shutdown();
+                let _ = tx.send_nowait(data);
+                tx.request_shutdown();
                 ParseResult::Consumed(data.len())
             })
             .await;
@@ -729,8 +731,9 @@ static SPAWN_COUNTER: AtomicU32 = AtomicU32::new(0);
 struct SpawnTestHandler;
 
 impl AsyncEventHandler for SpawnTestHandler {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
+            let (mut tx, mut rx) = conn.split();
             // Spawn a standalone task that increments the counter.
             ringline::spawn(async {
                 SPAWN_COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -738,8 +741,8 @@ impl AsyncEventHandler for SpawnTestHandler {
             .unwrap();
 
             // Echo one message to signal readiness.
-            conn.with_data(|data| {
-                let _ = conn.send_nowait(data);
+            rx.with_data(|data| {
+                let _ = tx.send_nowait(data);
                 ParseResult::Consumed(data.len())
             })
             .await;
@@ -789,15 +792,19 @@ fn async_spawn_standalone_task() {
 struct SleepEchoHandler;
 
 impl AsyncEventHandler for SleepEchoHandler {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
+            let (tx, mut rx) = conn.split();
             loop {
-                let n = conn
+                let n = rx
                     .with_data(|data| {
                         let len = data.len();
                         // Sleep 50ms then echo.
                         let data_copy = data.to_vec();
-                        let conn2 = conn;
+                        // The spawned task only *sends*; the read side stays
+                        // here. `as_conn()` hands it a send-capable handle
+                        // without cloning the (exclusive) reader.
+                        let conn2 = tx.as_conn();
                         ringline::spawn(async move {
                             ringline::sleep(Duration::from_millis(50)).await;
                             let _ = conn2.send_nowait(&data_copy);
@@ -853,13 +860,14 @@ fn async_sleep_completes() {
 struct TimeoutTestHandler;
 
 impl AsyncEventHandler for TimeoutTestHandler {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
-            conn.with_data(|data| -> ParseResult {
+            let (tx, mut rx) = conn.split();
+            rx.with_data(|data| -> ParseResult {
                 let msg = std::str::from_utf8(data).unwrap_or("");
                 if msg == "test-timeout-ok" {
                     // Timeout wrapping an immediate future should succeed.
-                    let conn2 = conn;
+                    let conn2 = tx.as_conn();
                     ringline::spawn(async move {
                         let result =
                             ringline::timeout(Duration::from_secs(10), async { 42u32 }).await;
@@ -875,7 +883,7 @@ impl AsyncEventHandler for TimeoutTestHandler {
                     .unwrap();
                 } else if msg == "test-timeout-expire" {
                     // Timeout wrapping a long sleep should expire.
-                    let conn2 = conn;
+                    let conn2 = tx.as_conn();
                     ringline::spawn(async move {
                         let result = ringline::timeout(
                             Duration::from_millis(20),
@@ -999,7 +1007,7 @@ use std::net::SocketAddr;
 static FORWARDER_BACKEND_ADDR: std::sync::OnceLock<SocketAddr> = std::sync::OnceLock::new();
 
 impl AsyncEventHandler for ForwarderHandler {
-    fn on_accept(&self, client: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut client: Connection) -> impl Future<Output = ()> + 'static {
         let backend_addr = self.backend_addr;
         async move {
             // Connect to the backend echo server.
@@ -1121,7 +1129,7 @@ struct ConnectRefusedHandler;
 static CONNECT_REFUSED_PORT: AtomicU32 = AtomicU32::new(0);
 
 impl AsyncEventHandler for ConnectRefusedHandler {
-    fn on_accept(&self, client: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut client: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             // Wait for trigger byte from client before connecting.
             client
@@ -1216,7 +1224,7 @@ struct MultiOutboundHandler;
 static MULTI_OUTBOUND_BACKEND_ADDR: std::sync::OnceLock<SocketAddr> = std::sync::OnceLock::new();
 
 impl AsyncEventHandler for MultiOutboundHandler {
-    fn on_accept(&self, client: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut client: Connection) -> impl Future<Output = ()> + 'static {
         let backend_addr = *MULTI_OUTBOUND_BACKEND_ADDR
             .get()
             .expect("backend addr not set");
@@ -1379,7 +1387,7 @@ static SELECT_BACKEND1_ADDR: std::sync::OnceLock<SocketAddr> = std::sync::OnceLo
 static SELECT_BACKEND2_ADDR: std::sync::OnceLock<SocketAddr> = std::sync::OnceLock::new();
 
 impl AsyncEventHandler for SelectTwoHandler {
-    fn on_accept(&self, client: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut client: Connection) -> impl Future<Output = ()> + 'static {
         let addr1 = *SELECT_BACKEND1_ADDR.get().expect("backend1 addr not set");
         let addr2 = *SELECT_BACKEND2_ADDR.get().expect("backend2 addr not set");
         async move {
@@ -1539,7 +1547,7 @@ static SELECT2_BACKEND1_ADDR: std::sync::OnceLock<SocketAddr> = std::sync::OnceL
 static SELECT2_BACKEND2_ADDR: std::sync::OnceLock<SocketAddr> = std::sync::OnceLock::new();
 
 impl AsyncEventHandler for SelectSecondWinsHandler {
-    fn on_accept(&self, client: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut client: Connection) -> impl Future<Output = ()> + 'static {
         let addr1 = *SELECT2_BACKEND1_ADDR.get().expect("backend1 addr not set");
         let addr2 = *SELECT2_BACKEND2_ADDR.get().expect("backend2 addr not set");
         async move {
@@ -1690,16 +1698,17 @@ fn async_select_second_wins() {
 struct SelectSleepHandler;
 
 impl AsyncEventHandler for SelectSleepHandler {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
+            let (mut tx, mut rx) = conn.split();
             // Run 300 iterations of select(with_data, sleep).
             // Each iteration where data arrives drops the SleepFuture,
             // which must correctly cancel the io_uring timeout and release
             // the timer slot. If slots leak, we'll exhaust the pool and panic.
             for _ in 0..300 {
                 match ringline::select(
-                    conn.with_data(|data| {
-                        let _ = conn.send_nowait(data);
+                    rx.with_data(|data| {
+                        let _ = tx.send_nowait(data);
                         ParseResult::Consumed(data.len())
                     }),
                     ringline::sleep(Duration::from_secs(60)),
@@ -1710,12 +1719,12 @@ impl AsyncEventHandler for SelectSleepHandler {
                     ringline::Either::Left(_) => {} // got data, sleep was dropped
                     ringline::Either::Right(()) => {
                         // Timeout — shouldn't happen with 60s timeout.
-                        let _ = conn.send_nowait(b"TIMEOUT");
+                        let _ = tx.send_nowait(b"TIMEOUT");
                         break;
                     }
                 }
             }
-            let _ = conn.send_nowait(b"DONE");
+            let _ = tx.send_nowait(b"DONE");
         }
     }
     fn create_for_worker(_id: usize) -> Self {
@@ -1787,7 +1796,7 @@ struct Select3Handler;
 static SELECT3_BACKEND_ADDR: std::sync::OnceLock<SocketAddr> = std::sync::OnceLock::new();
 
 impl AsyncEventHandler for Select3Handler {
-    fn on_accept(&self, client: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut client: Connection) -> impl Future<Output = ()> + 'static {
         let backend_addr = *SELECT3_BACKEND_ADDR.get().expect("backend addr not set");
         async move {
             let backend = match client.connect(backend_addr) {
@@ -1915,7 +1924,7 @@ fn async_select3_basic() {
 struct TrySpawnHandler;
 
 impl AsyncEventHandler for TrySpawnHandler {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             let n = conn
                 .with_data(|data| ParseResult::Consumed(data.len()))
@@ -2010,7 +2019,7 @@ fn async_spawn_exhaustion() {
 struct CancelTaskHandler;
 
 impl AsyncEventHandler for CancelTaskHandler {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             let n = conn
                 .with_data(|data| ParseResult::Consumed(data.len()))
@@ -2107,7 +2116,7 @@ fn async_cancel_running_task() {
 struct CancelCompletedHandler;
 
 impl AsyncEventHandler for CancelCompletedHandler {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             let n = conn
                 .with_data(|data| ParseResult::Consumed(data.len()))
@@ -2276,7 +2285,7 @@ fn multi_worker_graceful_shutdown() {
 struct SendAwaitHandler;
 
 impl AsyncEventHandler for SendAwaitHandler {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             let n = conn
                 .with_data(|data| ParseResult::Consumed(data.len()))
@@ -2373,7 +2382,7 @@ struct SendChainAwaitHandler;
 
 #[cfg(has_io_uring)]
 impl AsyncEventHandler for SendChainAwaitHandler {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             let n = conn
                 .with_data(|data| ParseResult::Consumed(data.len()))
@@ -2472,7 +2481,7 @@ fn async_send_chain_await_basic() {
 struct TrySleepHandler;
 
 impl AsyncEventHandler for TrySleepHandler {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             let n = conn
                 .with_data(|data| ParseResult::Consumed(data.len()))
@@ -2562,7 +2571,7 @@ fn async_try_sleep_exhaustion() {
 struct TryTimeoutHandler;
 
 impl AsyncEventHandler for TryTimeoutHandler {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             let n = conn
                 .with_data(|data| ParseResult::Consumed(data.len()))
@@ -2661,31 +2670,34 @@ fn async_try_timeout_exhaustion() {
 struct JoinHandler;
 
 impl AsyncEventHandler for JoinHandler {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
-            let n = conn
-                .with_data(|data| ParseResult::Consumed(data.len()))
-                .await;
+            let (mut tx, mut rx) = conn.split();
+            let n = rx.with_data(|data| ParseResult::Consumed(data.len())).await;
             if n == 0 {
                 return;
             }
 
-            // Join two send calls.
+            // Join two send calls. The point of this test is two sends
+            // *in flight at once*, which `&mut SendHalf` deliberately forbids
+            // — one owner, one send at a time. Concurrency here is the test's
+            // subject, so it goes through the `Copy` handle underneath.
+            let ctx = tx.as_conn();
             let fut_a = async {
-                match conn.send(b"HELLO") {
+                match ctx.send(b"HELLO") {
                     Ok(f) => f.await,
                     Err(e) => Err(e),
                 }
             };
             let fut_b = async {
-                match conn.send(b"WORLD") {
+                match ctx.send(b"WORLD") {
                     Ok(f) => f.await,
                     Err(e) => Err(e),
                 }
             };
             let (a, b) = ringline::join(fut_a, fut_b).await;
             let msg = format!("JOIN:{}:{}", a.unwrap_or(0), b.unwrap_or(0));
-            let _ = conn.send_nowait(msg.as_bytes());
+            let _ = tx.send_nowait(msg.as_bytes());
 
             // Wait for send to drain before closing.
             ringline::sleep(Duration::from_millis(20)).await;
@@ -2760,7 +2772,7 @@ const BP_CHUNK: usize = 4096;
 const BP_CHUNKS: usize = 8;
 
 impl AsyncEventHandler for BackpressuredEchoHandler {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             let payload = vec![b'Z'; BP_CHUNK];
             for _ in 0..BP_CHUNKS {
@@ -2886,10 +2898,12 @@ const MOVED_MSG: &[u8] = &[b'M'; 4096];
 struct OwnerMoveHandler;
 
 impl AsyncEventHandler for OwnerMoveHandler {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             // Occupies the only pool slot until the client starts reading.
-            let hog_conn = conn;
+            // Both sends go through `ConnCtx`: the moved one outlives this
+            // task, so it cannot borrow the half that lives here.
+            let hog_conn = conn.as_conn();
             let hog = ringline::spawn_with_handle(hog_conn.send_backpressured(MOVED_HOG))
                 .expect("spawn hog");
 
@@ -2956,7 +2970,7 @@ const FIRST_POLL_MSG: &[u8] = &[b'F'; 512];
 struct FirstPollMoveHandler;
 
 impl AsyncEventHandler for FirstPollMoveHandler {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             let unpolled = conn.send_backpressured(FIRST_POLL_MSG);
             let handle = ringline::spawn_with_handle(unpolled).expect("spawn");
@@ -3007,7 +3021,7 @@ const CANCEL_B: &[u8] = &[b'B'; 7];
 struct CancelSubmittedHandler;
 
 impl AsyncEventHandler for CancelSubmittedHandler {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             {
                 // One poll with a free pool submits it; then drop it.
@@ -3080,7 +3094,7 @@ struct MioHalfCloseHandler;
 
 #[cfg(not(has_io_uring))]
 impl AsyncEventHandler for MioHalfCloseHandler {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             // Poll each exactly once, in order, so the states are not left to
             // scheduler timing: spawning the first and polling the second
@@ -3157,7 +3171,7 @@ fn mio_half_close_resolves_every_bounded_send_without_hanging() {
 struct LazyDropHandler;
 
 impl AsyncEventHandler for LazyDropHandler {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             for _ in 0..64 {
                 let never_polled = conn.send_backpressured(b"dropped");
@@ -3205,7 +3219,7 @@ fn backpressured_send_construction_is_lazy_and_unpolled_drop_is_inert() {
 struct OversizeHandler;
 
 impl AsyncEventHandler for OversizeHandler {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             // Pool is 8 x 4096 = 32 KiB; ask for 64 KiB.
             let huge = vec![b'X'; 64 * 1024];
@@ -3260,7 +3274,7 @@ fn backpressured_send_rejects_oversize_before_writing() {
 struct ShutdownWhileParkedHandler;
 
 impl AsyncEventHandler for ShutdownWhileParkedHandler {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             // Fill the one-slot pool, then park a second send behind it, so
             // there is a genuine waiting entry when the FIN is requested.
@@ -3357,17 +3371,16 @@ fn shutdown_drops_parked_backpressured_send_without_hanging() {
 struct Join3Handler;
 
 impl AsyncEventHandler for Join3Handler {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
-            let n = conn
-                .with_data(|data| ParseResult::Consumed(data.len()))
-                .await;
+            let (mut tx, mut rx) = conn.split();
+            let n = rx.with_data(|data| ParseResult::Consumed(data.len())).await;
             if n == 0 {
                 return;
             }
 
             let fut_a = async {
-                match conn.send(b"ABC") {
+                match tx.send(b"ABC") {
                     Ok(f) => f.await.unwrap_or(0),
                     Err(_) => 0,
                 }
@@ -3378,15 +3391,13 @@ impl AsyncEventHandler for Join3Handler {
             };
             let fut_c = async {
                 // This will wait for new data from the client.
-                let n = conn
-                    .with_data(|data| ParseResult::Consumed(data.len()))
-                    .await;
+                let n = rx.with_data(|data| ParseResult::Consumed(data.len())).await;
                 n as u32
             };
 
             let (a, b, c) = ringline::join3(fut_a, fut_b, fut_c).await;
             let msg = format!("JOIN3:{a}:{b}:{c}");
-            let _ = conn.send_nowait(msg.as_bytes());
+            let _ = tx.send_nowait(msg.as_bytes());
 
             ringline::sleep(Duration::from_millis(20)).await;
         }
@@ -3490,7 +3501,7 @@ fn async_join3_mixed() {
 struct SleepUntilHandler;
 
 impl AsyncEventHandler for SleepUntilHandler {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             let n = conn
                 .with_data(|data| ParseResult::Consumed(data.len()))
@@ -3571,7 +3582,7 @@ fn async_sleep_until_basic() {
 struct TimeoutAtHandler;
 
 impl AsyncEventHandler for TimeoutAtHandler {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             let n = conn
                 .with_data(|data| ParseResult::Consumed(data.len()))
@@ -3652,7 +3663,7 @@ fn async_timeout_at_expires() {
 struct UdpEchoAsync;
 
 impl AsyncEventHandler for UdpEchoAsync {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             loop {
                 let n = conn
@@ -3728,7 +3739,7 @@ struct StandaloneConnectHandler;
 static STANDALONE_CONNECT_BACKEND: std::sync::OnceLock<SocketAddr> = std::sync::OnceLock::new();
 
 impl AsyncEventHandler for StandaloneConnectHandler {
-    fn on_accept(&self, client: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut client: Connection) -> impl Future<Output = ()> + 'static {
         let backend_addr = *STANDALONE_CONNECT_BACKEND
             .get()
             .expect("backend addr not set");
@@ -3863,7 +3874,7 @@ fn async_standalone_connect() {
 struct GreetingServer;
 
 impl AsyncEventHandler for GreetingServer {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             let _ = conn.send_nowait(b"WELCOME!");
             // Keep the connection open until the peer disconnects.
@@ -3893,7 +3904,7 @@ static GREETING_RESULT: std::sync::OnceLock<String> = std::sync::OnceLock::new()
 struct GreetingClientHandler;
 
 impl AsyncEventHandler for GreetingClientHandler {
-    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
         async {}
     }
 
@@ -3980,7 +3991,7 @@ static ON_START_BACKEND_ADDR: std::sync::OnceLock<SocketAddr> = std::sync::OnceL
 static ON_START_RESULT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 impl AsyncEventHandler for OnStartClientHandler {
-    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
         // No inbound connections expected in client-only mode.
         async {}
     }
@@ -4080,7 +4091,7 @@ struct StandaloneConnectRefusedHandler;
 static STANDALONE_REFUSED_PORT: AtomicU32 = AtomicU32::new(0);
 
 impl AsyncEventHandler for StandaloneConnectRefusedHandler {
-    fn on_accept(&self, client: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut client: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             let n = client
                 .with_data(|data| ParseResult::Consumed(data.len()))
@@ -4181,13 +4192,14 @@ struct PeerCloseHandler;
 static PEER_CLOSE_RESULT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 impl AsyncEventHandler for PeerCloseHandler {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
+            let (mut tx, mut rx) = conn.split();
             // Read until EOF. Each chunk is echoed back.
             loop {
-                let n = conn
+                let n = rx
                     .with_data(|data| {
-                        let _ = conn.send_nowait(data);
+                        let _ = tx.send_nowait(data);
                         ParseResult::Consumed(data.len())
                     })
                     .await;
@@ -4261,7 +4273,7 @@ static POOL_EXHAUSTION_RESULT: std::sync::OnceLock<String> = std::sync::OnceLock
 
 #[cfg(has_io_uring)]
 impl AsyncEventHandler for PoolExhaustionHandler {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             // Read one message to know the client is connected.
             conn.with_data(|data| ParseResult::Consumed(data.len()))
@@ -4356,7 +4368,7 @@ static MULTI_SLOT_RETRY_RESULT: std::sync::OnceLock<Result<(), String>> =
 struct RetryAfterPoolPressure;
 
 impl AsyncEventHandler for RetryAfterPoolPressure {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             conn.with_data(|data| ParseResult::Consumed(data.len()))
                 .await;
@@ -4532,7 +4544,7 @@ struct SendPartsHandler;
 
 #[cfg(has_io_uring)]
 impl AsyncEventHandler for SendPartsHandler {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             let n = conn
                 .with_data(|data| ParseResult::Consumed(data.len()))
@@ -4616,7 +4628,7 @@ static OUTBOUND_EOF_RESULT: std::sync::OnceLock<String> = std::sync::OnceLock::n
 struct OutboundEofClient;
 
 impl AsyncEventHandler for OutboundEofClient {
-    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
         async {}
     }
 
@@ -4796,7 +4808,7 @@ static TIMEOUT_RESULT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 struct ConnectTimeoutClient;
 
 impl AsyncEventHandler for ConnectTimeoutClient {
-    fn on_accept(&self, _conn: ConnCtx) -> impl std::future::Future<Output = ()> + 'static {
+    fn on_accept(&self, _conn: Connection) -> impl std::future::Future<Output = ()> + 'static {
         async {}
     }
 
@@ -4882,7 +4894,7 @@ static JOIN_RESULT: AtomicU32 = AtomicU32::new(0);
 struct JoinHandleHandler;
 
 impl AsyncEventHandler for JoinHandleHandler {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             let n = conn
                 .with_data(|data| ParseResult::Consumed(data.len()))
@@ -4937,7 +4949,7 @@ struct ImmediateJoinHandler;
 static IMMEDIATE_RESULT: AtomicU32 = AtomicU32::new(0);
 
 impl AsyncEventHandler for ImmediateJoinHandler {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             let n = conn
                 .with_data(|data| ParseResult::Consumed(data.len()))
@@ -4990,7 +5002,7 @@ struct DetachHandler;
 static DETACH_RAN: AtomicU32 = AtomicU32::new(0);
 
 impl AsyncEventHandler for DetachHandler {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             let n = conn
                 .with_data(|data| ParseResult::Consumed(data.len()))
@@ -5044,7 +5056,7 @@ fn spawn_with_handle_detach_on_drop() {
 struct AbortHandler;
 
 impl AsyncEventHandler for AbortHandler {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             let n = conn
                 .with_data(|data| ParseResult::Consumed(data.len()))
@@ -5098,7 +5110,7 @@ struct MultiJoinHandler;
 static MULTI_SUM: AtomicU32 = AtomicU32::new(0);
 
 impl AsyncEventHandler for MultiJoinHandler {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             let n = conn
                 .with_data(|data| ParseResult::Consumed(data.len()))
@@ -5153,7 +5165,7 @@ static ONESHOT_RESULT: AtomicU32 = AtomicU32::new(0);
 struct OneshotHandler;
 
 impl AsyncEventHandler for OneshotHandler {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             let n = conn
                 .with_data(|data| ParseResult::Consumed(data.len()))
@@ -5210,7 +5222,7 @@ static ONESHOT_CLOSED: AtomicU32 = AtomicU32::new(0);
 struct OneshotClosedHandler;
 
 impl AsyncEventHandler for OneshotClosedHandler {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             let n = conn
                 .with_data(|data| ParseResult::Consumed(data.len()))
@@ -5270,7 +5282,7 @@ static MPSC_SUM: AtomicU32 = AtomicU32::new(0);
 struct MpscHandler;
 
 impl AsyncEventHandler for MpscHandler {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             let n = conn
                 .with_data(|data| ParseResult::Consumed(data.len()))
@@ -5337,7 +5349,7 @@ static MPSC_BACKPRESSURE: AtomicU32 = AtomicU32::new(0);
 struct MpscBackpressureHandler;
 
 impl AsyncEventHandler for MpscBackpressureHandler {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             let n = conn
                 .with_data(|data| ParseResult::Consumed(data.len()))
@@ -5402,7 +5414,7 @@ static RESOLVE_RESULT: AtomicU32 = AtomicU32::new(0);
 struct ResolveHandler;
 
 impl AsyncEventHandler for ResolveHandler {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             let n = conn
                 .with_data(|data| ParseResult::Consumed(data.len()))
@@ -5463,7 +5475,7 @@ static RESOLVE_ERR: AtomicU32 = AtomicU32::new(0);
 struct ResolveErrorHandler;
 
 impl AsyncEventHandler for ResolveErrorHandler {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             let n = conn
                 .with_data(|data| ParseResult::Consumed(data.len()))
@@ -5535,7 +5547,7 @@ fn resolve_invalid_hostname() {
 struct ResolveDisabledHandler;
 
 impl AsyncEventHandler for ResolveDisabledHandler {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             let n = conn
                 .with_data(|data| ParseResult::Consumed(data.len()))
@@ -5646,14 +5658,15 @@ fn peer_addr_tcp_regression() {
 
     struct PeerAddrHandler;
     impl AsyncEventHandler for PeerAddrHandler {
-        fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
             async move {
-                if let Some(ringline::PeerAddr::Tcp(_)) = conn.peer_addr() {
+                let (mut tx, mut rx) = conn.split();
+                if let Some(ringline::PeerAddr::Tcp(_)) = tx.peer_addr() {
                     TCP_PEER.store(1, Ordering::SeqCst);
                 }
-                let _ = conn
+                let _ = rx
                     .with_data(|data| {
-                        let _ = conn.send_nowait(data);
+                        let _ = tx.send_nowait(data);
                         ParseResult::Consumed(data.len())
                     })
                     .await;
@@ -5691,7 +5704,7 @@ static CANCEL_RESULT: AtomicU32 = AtomicU32::new(0);
 struct CancellationHandler;
 
 impl AsyncEventHandler for CancellationHandler {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             let n = conn
                 .with_data(|data| ParseResult::Consumed(data.len()))
@@ -5754,7 +5767,7 @@ static SELECT_CANCEL: AtomicU32 = AtomicU32::new(0);
 struct SelectCancelHandler;
 
 impl AsyncEventHandler for SelectCancelHandler {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             let n = conn
                 .with_data(|data| ParseResult::Consumed(data.len()))
@@ -5815,12 +5828,13 @@ fn cancellation_token_with_select() {
 struct ForwardEcho;
 
 impl AsyncEventHandler for ForwardEcho {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
+            let (mut tx, mut rx) = conn.split();
             loop {
-                let n = conn
+                let n = rx
                     .with_data(|data| {
-                        if let Err(e) = conn.forward_recv_buf(data) {
+                        if let Err(e) = tx.forward_recv_buf(data) {
                             eprintln!("echo: forward_recv_buf failed: {e}");
                             return ParseResult::NeedMore;
                         }
@@ -6075,15 +6089,16 @@ struct PanickingThenEcho;
 
 #[allow(clippy::manual_async_fn)]
 impl AsyncEventHandler for PanickingThenEcho {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
+            let (mut tx, mut rx) = conn.split();
             loop {
-                let n = conn
+                let n = rx
                     .with_data(|data| {
                         if data.starts_with(b"die") {
                             panic!("intentional panic in connection task");
                         }
-                        let _ = conn.send_nowait(data);
+                        let _ = tx.send_nowait(data);
                         ParseResult::Consumed(data.len())
                     })
                     .await;
@@ -6158,7 +6173,7 @@ static WITH_DATA_RESULT_ACCEPTED: AtomicU32 = AtomicU32::new(0);
 struct WithDataResultHandler;
 
 impl AsyncEventHandler for WithDataResultHandler {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             WITH_DATA_RESULT_ACCEPTED.fetch_add(1, Ordering::AcqRel);
             loop {
@@ -6315,12 +6330,13 @@ fn with_data_result_surfaces_tcp_reset() {
 struct EchoUntilEof;
 
 impl AsyncEventHandler for EchoUntilEof {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
+            let (mut tx, mut rx) = conn.split();
             loop {
-                let n = conn
+                let n = rx
                     .with_data(|data| {
-                        let _ = conn.send_nowait(data);
+                        let _ = tx.send_nowait(data);
                         ParseResult::Consumed(data.len())
                     })
                     .await;
@@ -6339,17 +6355,18 @@ impl AsyncEventHandler for EchoUntilEof {
 struct EchoThenClose;
 
 impl AsyncEventHandler for EchoThenClose {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
+            let (mut tx, mut rx) = conn.split();
             loop {
-                let n = conn
+                let n = rx
                     .with_data(|data| {
-                        let _ = conn.send_nowait(data);
+                        let _ = tx.send_nowait(data);
                         ParseResult::Consumed(data.len())
                     })
                     .await;
                 if n == 0 {
-                    conn.close();
+                    tx.close();
                     break;
                 }
             }
@@ -6497,7 +6514,7 @@ fn large_send_config() -> Config {
 }
 
 impl AsyncEventHandler for RespondAfterEof {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             loop {
                 let n = conn
@@ -6579,7 +6596,7 @@ static DRAIN_TICKS: AtomicU32 = AtomicU32::new(0);
 struct RespondAfterEofCountingTicks;
 
 impl AsyncEventHandler for RespondAfterEofCountingTicks {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             loop {
                 let n = conn
@@ -6677,7 +6694,7 @@ const HALF_CLOSE_RESPONSE_LEN: usize = 4 * 1024 * 1024;
 struct RespondThenHalfClose;
 
 impl AsyncEventHandler for RespondThenHalfClose {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             let n = conn
                 .with_data(|data| ParseResult::Consumed(data.len()))
@@ -6788,7 +6805,7 @@ struct ForwardToConnProxy {
 static PROXY_BACKEND_ADDR: std::sync::OnceLock<SocketAddr> = std::sync::OnceLock::new();
 
 impl AsyncEventHandler for ForwardToConnProxy {
-    fn on_accept(&self, client: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut client: Connection) -> impl Future<Output = ()> + 'static {
         let backend_addr = self.backend_addr;
         async move {
             let backend = match client.connect(backend_addr) {
@@ -6798,6 +6815,9 @@ impl AsyncEventHandler for ForwardToConnProxy {
                 },
                 Err(_) => return,
             };
+            // The backend forwards *into* this client, and `forward_to_conn`
+            // takes a `&ConnCtx` sink — the client's own half stays the reader.
+            let client_ctx = client.as_conn();
 
             loop {
                 let mut hdr = [0u8; 4];
@@ -6822,7 +6842,7 @@ impl AsyncEventHandler for ForwardToConnProxy {
                         break;
                     }
                 }
-                match backend.forward_to_conn(&client, len).await {
+                match backend.forward_to_conn(&client_ctx, len).await {
                     Ok(f) if f == len => {}
                     other => {
                         eprintln!("proxy: backend->client forward {other:?}, wanted {len}");
@@ -6964,10 +6984,11 @@ struct DroppedForwardProxy {
 static DROPPED_FORWARD_BACKEND: std::sync::OnceLock<SocketAddr> = std::sync::OnceLock::new();
 
 impl AsyncEventHandler for DroppedForwardProxy {
-    fn on_accept(&self, client: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, client: Connection) -> impl Future<Output = ()> + 'static {
         let backend_addr = self.backend_addr;
         async move {
-            let backend = match client.connect(backend_addr) {
+            let (mut tx, mut rx) = client.split();
+            let backend = match tx.connect(backend_addr) {
                 Ok(fut) => match fut.await {
                     Ok(ctx) => ctx,
                     Err(_) => return,
@@ -6978,15 +6999,15 @@ impl AsyncEventHandler for DroppedForwardProxy {
             // Arm a forward for far more than the client will ever send, then
             // drop it without awaiting it to completion.
             {
-                let _fut = client.forward_to_conn(&backend, 1 << 30);
+                let _fut = rx.forward_to_conn(&backend, 1 << 30);
             }
 
             // Everything the client sends must now come to *this* task, not to
             // the sink. Echo it back so the test can see where it went.
             loop {
-                let n = client
+                let n = rx
                     .with_data(|data| {
-                        let _ = client.send_nowait(data);
+                        let _ = tx.send_nowait(data);
                         ParseResult::Consumed(data.len())
                     })
                     .await;
@@ -7077,7 +7098,7 @@ static FILE_SINK_PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::Once
 
 #[cfg(has_io_uring)]
 impl AsyncEventHandler for FileForwarder {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             use std::os::fd::AsFd;
             let mut hdr = [0u8; 4];
@@ -7217,7 +7238,7 @@ fn forward_to_file_stops_at_len_and_leaves_the_tail_readable() {
 
     struct TailForwarder;
     impl AsyncEventHandler for TailForwarder {
-        fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
             async move {
                 use std::os::fd::AsFd;
                 let mut hdr = [0u8; 4];
@@ -7332,7 +7353,7 @@ static BUSY_FORWARD_BACKEND: std::sync::OnceLock<SocketAddr> = std::sync::OnceLo
 static BUSY_FORWARD_ERRNO: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
 
 impl AsyncEventHandler for BusyForwardProxy {
-    fn on_accept(&self, client: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut client: Connection) -> impl Future<Output = ()> + 'static {
         let backend_addr = self.backend_addr;
         async move {
             let backend = match client.connect(backend_addr) {
@@ -7345,8 +7366,13 @@ impl AsyncEventHandler for BusyForwardProxy {
 
             // Hold one forward open (far more than the client will send), then
             // ask for a second on the same connection while the first is live.
-            let first = client.forward_to_conn(&backend, 1 << 30);
-            let second = client.forward_to_conn(&backend, 16);
+            // Two forwards *in flight at once* is what this test is about, and
+            // `&mut RecvHalf` makes that a compile error rather than the
+            // runtime `EBUSY` being asserted here. Go through the `Copy`
+            // handle so the refusal is still exercised.
+            let client_ctx = client.as_conn();
+            let first = client_ctx.forward_to_conn(&backend, 1 << 30);
+            let second = client_ctx.forward_to_conn(&backend, 16);
             let errno = match second.await {
                 Ok(_) => -1,
                 Err(e) => e.raw_os_error().unwrap_or(-1),
@@ -7456,14 +7482,14 @@ fn split_halves_echo_round_trip() {
 struct DoubleSplitReporter;
 
 impl AsyncEventHandler for DoubleSplitReporter {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
-            let (mut tx, _rx) = match conn.split() {
-                Ok(halves) => halves,
-                Err(e) => panic!("first split must succeed: {e}"),
-            };
-            // `_rx` is still alive, so the read side is still claimed.
-            let verdict = match conn.split() {
+            let ctx = conn.as_conn();
+            let (mut tx, _rx) = conn.split();
+            // `_rx` is still alive, so the read side is still claimed. The
+            // handler was handed the only legitimate claim at accept time, so
+            // this asks the underlying handle for a second one.
+            let verdict = match ctx.take_recv() {
                 Err(e) if e.raw_os_error() == Some(libc::EBUSY) => "EBUSY",
                 Err(_) => "WRONG-ERRNO",
                 Ok(_) => "HANDED-OUT-TWICE",

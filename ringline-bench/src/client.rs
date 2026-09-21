@@ -263,7 +263,7 @@ mod ringline_client {
     use std::time::{Duration, Instant};
 
     use ringline::{
-        AsyncEventHandler, ConfigBuilder, ConnCtx, ParseResult, RinglineBuilder, ShutdownHandle,
+        AsyncEventHandler, ConfigBuilder, Connection, ParseResult, RinglineBuilder, ShutdownHandle,
         connect, sleep, spawn,
     };
 
@@ -310,7 +310,7 @@ mod ringline_client {
 
     #[allow(clippy::manual_async_fn)]
     impl AsyncEventHandler for ClientHandler {
-        fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
             async {}
         }
 

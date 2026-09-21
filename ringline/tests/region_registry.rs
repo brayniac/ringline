@@ -7,12 +7,14 @@
 use std::future::Future;
 use std::time::Duration;
 
-use ringline::{AsyncEventHandler, Config, ConfigBuilder, ConnCtx, MemoryRegion, RinglineBuilder};
+use ringline::{
+    AsyncEventHandler, Config, ConfigBuilder, Connection, MemoryRegion, RinglineBuilder,
+};
 
 struct Idle;
 
 impl AsyncEventHandler for Idle {
-    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
         async {}
     }
     fn create_for_worker(_id: usize) -> Self {

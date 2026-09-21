@@ -3,7 +3,9 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use ringline::{AsyncEventHandler, ConfigBuilder, ConnCtx, ParseResult, RinglineBuilder, connect};
+use ringline::{
+    AsyncEventHandler, ConfigBuilder, Connection, ParseResult, RinglineBuilder, connect,
+};
 
 /// Demonstrates outbound `connect()`. On start, connects to a remote
 /// echo server, sends "Hello from ringline!\n", prints the echoed response,
@@ -14,7 +16,7 @@ struct ConnectHandler {
 }
 
 impl AsyncEventHandler for ConnectHandler {
-    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
         // Not used in this example.
         async {}
     }

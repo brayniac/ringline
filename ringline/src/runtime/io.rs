@@ -614,7 +614,8 @@ pub fn request_shutdown() -> io::Result<()> {
 
 /// Async connection context providing send, recv, and connect operations.
 ///
-/// Each accepted connection receives a `ConnCtx` in [`AsyncEventHandler::on_accept`](crate::AsyncEventHandler::on_accept).
+/// Outbound connections come back as a `ConnCtx` from [`connect`](crate::connect);
+/// accepted ones arrive as a [`Connection`] in [`AsyncEventHandler::on_accept`](crate::AsyncEventHandler::on_accept).
 /// It exposes an async API for reading data ([`with_data`](Self::with_data),
 /// [`with_bytes`](Self::with_bytes)), sending data ([`send`](Self::send),
 /// [`send_nowait`](Self::send_nowait)), and initiating outbound connections
@@ -626,17 +627,18 @@ pub fn request_shutdown() -> io::Result<()> {
 /// # Example: Echo Handler
 ///
 /// ```no_run
-/// use ringline::{AsyncEventHandler, ConnCtx, ParseResult};
+/// use ringline::{AsyncEventHandler, Connection, ParseResult};
 ///
 /// struct Echo;
 ///
 /// impl AsyncEventHandler for Echo {
-///     fn on_accept(&self, conn: ConnCtx) -> impl std::future::Future<Output = ()> + 'static {
+///     fn on_accept(&self, mut conn: Connection) -> impl std::future::Future<Output = ()> + 'static {
 ///         async move {
+///             let (mut tx, mut rx) = conn.split();
 ///             loop {
-///                 let n = conn.with_data(|data| {
+///                 let n = rx.with_data(|data| {
 ///                     // Echo back whatever we received
-///                     conn.send_nowait(data).ok();
+///                     tx.send_nowait(data).ok();
 ///                     ParseResult::Consumed(data.len())
 ///                 }).await;
 ///                 // n == 0 means connection closed (EOF)
@@ -651,19 +653,20 @@ pub fn request_shutdown() -> io::Result<()> {
 /// # Example: Line-Based Protocol
 ///
 /// ```no_run
-/// use ringline::{AsyncEventHandler, ConnCtx, ParseResult};
+/// use ringline::{AsyncEventHandler, Connection, ParseResult};
 ///
 /// struct LineEcho;
 ///
 /// impl AsyncEventHandler for LineEcho {
-///     fn on_accept(&self, conn: ConnCtx) -> impl std::future::Future<Output = ()> + 'static {
+///     fn on_accept(&self, mut conn: Connection) -> impl std::future::Future<Output = ()> + 'static {
 ///         async move {
+///             let (mut tx, mut rx) = conn.split();
 ///             loop {
-///                 let n = conn.with_data(|data| {
+///                 let n = rx.with_data(|data| {
 ///                     // Find newline
 ///                     if let Some(pos) = data.iter().position(|&b| b == b'\n') {
 ///                         let line = &data[..=pos];
-///                         conn.send_nowait(line).ok();
+///                         tx.send_nowait(line).ok();
 ///                         ParseResult::Consumed(pos + 1)
 ///                     } else {
 ///                         ParseResult::NeedMore
@@ -683,16 +686,17 @@ pub fn request_shutdown() -> io::Result<()> {
 /// [`with_bytes`](Self::with_bytes) which provides `Bytes` handles:
 ///
 /// ```no_run
-/// use ringline::{AsyncEventHandler, ConnCtx, ParseResult};
+/// use ringline::{AsyncEventHandler, Connection, ParseResult};
 /// use bytes::Bytes;
 ///
 /// struct ZeroCopyHandler;
 ///
 /// impl AsyncEventHandler for ZeroCopyHandler {
-///     fn on_accept(&self, conn: ConnCtx) -> impl std::future::Future<Output = ()> + 'static {
+///     fn on_accept(&self, mut conn: Connection) -> impl std::future::Future<Output = ()> + 'static {
 ///         async move {
+///             let (mut tx, mut rx) = conn.split();
 ///             loop {
-///                 let n = conn.with_bytes(|bytes| {
+///                 let n = rx.with_bytes(|bytes| {
 ///                     // Parse protocol, return Bytes::slice() for the value
 ///                     // The slice stays valid even after the accumulator advances
 ///                     if let Some((consumed, value)) = parse_message(&bytes) {
@@ -726,18 +730,19 @@ pub fn request_shutdown() -> io::Result<()> {
 /// # Send Patterns
 ///
 /// ```no_run
-/// use ringline::{AsyncEventHandler, ConnCtx, ParseResult};
+/// use ringline::{AsyncEventHandler, Connection, ParseResult};
 ///
 /// struct SendExample;
 ///
 /// impl AsyncEventHandler for SendExample {
-///     fn on_accept(&self, conn: ConnCtx) -> impl std::future::Future<Output = ()> + 'static {
+///     fn on_accept(&self, mut conn: Connection) -> impl std::future::Future<Output = ()> + 'static {
 ///         async move {
+///             let (mut tx, mut rx) = conn.split();
 ///             // Fire-and-forget (returns Err if send pool exhausted)
-///             conn.send_nowait(b"hello").ok();
+///             tx.send_nowait(b"hello").ok();
 ///
 ///             // Await send completion
-///             if let Ok(future) = conn.send(b"world") {
+///             if let Ok(future) = tx.send(b"world") {
 ///                 future.await.ok();
 ///             }
 ///         }
@@ -3186,6 +3191,37 @@ impl RecvHalf {
         self.conn.is_alive()
     }
 
+    /// The underlying handle, for the read-side APIs that are still only on
+    /// `ConnCtx`. Crate-internal: it hands back the full surface.
+    pub(crate) fn as_conn_ref(&self) -> ConnCtx {
+        self.conn
+    }
+
+    /// See [`ConnCtx::enable_recv_forward`].
+    pub fn enable_recv_forward(&mut self) {
+        self.conn.enable_recv_forward();
+    }
+
+    /// See [`ConnCtx::forward_held`].
+    pub fn forward_held(&mut self) -> io::Result<SendFuture> {
+        self.conn.forward_held()
+    }
+
+    /// See [`ConnCtx::eof_truncated`].
+    pub fn eof_truncated(&self) -> bool {
+        self.conn.eof_truncated()
+    }
+
+    /// See [`ConnCtx::try_with_data`].
+    pub fn try_with_data<F: FnOnce(&[u8]) -> ParseResult>(&mut self, f: F) -> Option<ParseResult> {
+        self.conn.try_with_data(f)
+    }
+
+    /// See [`ConnCtx::take_recv_sink`].
+    pub fn take_recv_sink(&mut self) -> usize {
+        self.conn.take_recv_sink()
+    }
+
     /// See [`ConnCtx::recv_timestamp`]. Read-side state, so it lives here
     /// rather than on [`SendHalf`].
     #[cfg(feature = "timestamps")]
@@ -3230,6 +3266,343 @@ impl RecvHalf {
         len: usize,
     ) -> ForwardToConnFuture<'s> {
         self.conn.forward_to_conn(sink, len)
+    }
+}
+
+/// An accepted connection: the owned pair of halves, handed to
+/// [`AsyncEventHandler::on_accept`](crate::AsyncEventHandler::on_accept).
+///
+/// Not `Copy`, not `Clone`, and `!Send`, so **one task owns one connection**.
+/// That is the whole point: the old `ConnCtx` was a `Copy` handle carrying the
+/// full read surface, so nothing stopped two readers from interleaving on one
+/// connection and desynchronising the protocol — the failure behind #423,
+/// #425 and #429.
+///
+/// Most handlers can use this directly: the read and write methods are the
+/// same ones `ConnCtx` used to carry.
+///
+/// ```ignore
+/// async move {
+///     loop {
+///         let n = conn.with_data(|d| ParseResult::Consumed(d.len())).await;
+///         if n == 0 { break; }
+///     }
+/// }
+/// ```
+///
+/// Sending *while a read is in flight* — an echo writing from inside its own
+/// `with_data` closure — needs the two halves to be separately borrowable, so
+/// call [`split`](Self::split):
+///
+/// ```ignore
+/// let (mut tx, mut rx) = conn.split();
+/// let n = rx.with_data(|d| { let _ = tx.send_nowait(d); ParseResult::Consumed(d.len()) }).await;
+/// ```
+///
+/// Fan-in from several tasks to one connection is an explicit queue
+/// (`runtime::channel`) drained by the owning task, not a shared handle. See
+/// `docs/connection-handle-ownership-design.md`.
+pub struct Connection {
+    tx: SendHalf,
+    rx: RecvHalf,
+}
+
+impl Connection {
+    /// The connection handed to `on_accept`, built without going through
+    /// [`ConnCtx::split`].
+    ///
+    /// `split` records the read claim via `with_state`, but `spawn_accept_task`
+    /// runs *outside* a task poll, so there is no `CURRENT_DRIVER` to reach.
+    /// The event loop owns `&mut Driver` at that point and sets the claim
+    /// itself; the slot is freshly accepted, so the claim is always free.
+    pub(crate) fn for_accept(conn: ConnCtx) -> Self {
+        Self {
+            tx: SendHalf {
+                conn,
+                _not_send: PhantomData,
+            },
+            rx: RecvHalf {
+                conn,
+                _not_send: PhantomData,
+            },
+        }
+    }
+
+    /// Split into the independently borrowable write and read halves.
+    ///
+    /// Needed whenever a send has to happen while a read borrow is live.
+    pub fn split(self) -> (SendHalf, RecvHalf) {
+        (self.tx, self.rx)
+    }
+
+    /// The write half alone, borrowed.
+    pub fn send_half(&mut self) -> &mut SendHalf {
+        &mut self.tx
+    }
+
+    /// The read half alone, borrowed.
+    pub fn recv_half(&mut self) -> &mut RecvHalf {
+        &mut self.rx
+    }
+
+    // ── recv ────────────────────────────────────────────────────────────
+
+    /// See [`ConnCtx::with_data`].
+    pub fn with_data<F: FnMut(&[u8]) -> ParseResult>(&mut self, f: F) -> WithDataFuture<F> {
+        self.rx.with_data(f)
+    }
+
+    /// See [`ConnCtx::with_data_result`].
+    pub fn with_data_result<F: FnMut(&[u8]) -> ParseResult>(
+        &mut self,
+        f: F,
+    ) -> WithDataResultFuture<F> {
+        self.rx.with_data_result(f)
+    }
+
+    /// See [`ConnCtx::with_bytes`].
+    pub fn with_bytes<F: FnMut(Bytes) -> ParseResult>(&mut self, f: F) -> WithBytesFuture<F> {
+        self.rx.with_bytes(f)
+    }
+
+    /// See [`ConnCtx::recv_ready`].
+    pub fn recv_ready(&mut self) -> RecvReadyFuture {
+        self.rx.recv_ready()
+    }
+
+    /// See [`ConnCtx::segments`].
+    #[cfg(has_io_uring)]
+    pub fn segments(&mut self) -> io::Result<SegmentReader<'_>> {
+        self.rx.segments()
+    }
+
+    /// See [`ConnCtx::recv_owned_segment`].
+    #[cfg(has_io_uring)]
+    pub fn recv_owned_segment(&mut self) -> io::Result<RecvOwnedSegment> {
+        self.rx.recv_owned_segment()
+    }
+
+    /// See [`ConnCtx::with_segments`].
+    #[cfg(has_io_uring)]
+    pub fn with_segments<F>(&mut self, f: F) -> WithSegmentsFuture<F>
+    where
+        F: FnMut(&SegChain<'_>) -> SegConsumed,
+    {
+        self.rx.with_segments(f)
+    }
+
+    /// See [`ConnCtx::end_segments`].
+    #[cfg(has_io_uring)]
+    pub fn end_segments(&mut self) -> io::Result<()> {
+        self.rx.end_segments()
+    }
+
+    /// See [`ConnCtx::forward_to`].
+    #[cfg(has_io_uring)]
+    pub fn forward_to<'h, 's: 'h>(
+        &'h mut self,
+        sink: &'s SinkFd<'s>,
+        len: usize,
+    ) -> ForwardToFuture<'h> {
+        self.rx.forward_to(sink, len)
+    }
+
+    /// See [`ConnCtx::forward_to_conn`].
+    #[cfg(has_io_uring)]
+    pub fn forward_to_conn<'h, 's: 'h>(
+        &'h mut self,
+        sink: &'s ConnCtx,
+        len: usize,
+    ) -> ForwardToFuture<'h> {
+        self.rx.forward_to_conn(sink, len)
+    }
+
+    /// See [`ConnCtx::forward_to_conn`].
+    #[cfg(not(has_io_uring))]
+    pub fn forward_to_conn<'h, 's: 'h>(
+        &'h mut self,
+        sink: &'s ConnCtx,
+        len: usize,
+    ) -> ForwardToConnFuture<'s> {
+        self.rx.forward_to_conn(sink, len)
+    }
+
+    /// See [`ConnCtx::recv_timestamp`].
+    #[cfg(feature = "timestamps")]
+    pub fn recv_timestamp(&self) -> u64 {
+        self.rx.recv_timestamp()
+    }
+
+    // ── send ────────────────────────────────────────────────────────────
+
+    /// See [`ConnCtx::send`].
+    pub fn send(&mut self, data: &[u8]) -> io::Result<SendFuture> {
+        self.tx.send(data)
+    }
+
+    /// See [`ConnCtx::send_nowait`].
+    pub fn send_nowait(&mut self, data: &[u8]) -> io::Result<()> {
+        self.tx.send_nowait(data)
+    }
+
+    /// See [`ConnCtx::send_parts`].
+    pub fn send_parts(&mut self) -> AsyncSendBuilder {
+        self.tx.send_parts()
+    }
+
+    /// See [`ConnCtx::send_backpressured`].
+    pub fn send_backpressured<'a>(&mut self, data: &'a [u8]) -> BackpressuredSendFuture<'a> {
+        self.tx.send_backpressured(data)
+    }
+
+    // ── lifecycle and identity ──────────────────────────────────────────
+
+    /// See [`ConnCtx::close`].
+    pub fn close(&mut self) {
+        self.tx.close();
+    }
+
+    /// See [`ConnCtx::token`].
+    pub fn token(&self) -> ConnToken {
+        self.tx.token()
+    }
+
+    /// See [`ConnCtx::is_alive`].
+    pub fn is_alive(&self) -> bool {
+        self.tx.is_alive()
+    }
+
+    /// See [`ConnCtx::peer_addr`].
+    pub fn peer_addr(&self) -> Option<crate::connection::PeerAddr> {
+        self.tx.peer_addr()
+    }
+
+    /// See [`ConnCtx::is_outbound`].
+    pub fn is_outbound(&self) -> bool {
+        self.tx.is_outbound()
+    }
+
+    /// See [`ConnCtx::connect`].
+    pub fn connect(&self, addr: std::net::SocketAddr) -> io::Result<ConnectFuture> {
+        self.tx.connect(addr)
+    }
+
+    /// The underlying `ConnCtx`, for the APIs that still take one — most
+    /// notably as a `forward_to_conn` sink. See [`SendHalf::as_conn`].
+    pub fn as_conn(&self) -> ConnCtx {
+        self.tx.as_conn()
+    }
+
+    // ── the rest of the ConnCtx surface ─────────────────────────────────
+
+    /// See [`ConnCtx::eof_truncated`].
+    pub fn eof_truncated(&self) -> bool {
+        self.rx.as_conn_ref().eof_truncated()
+    }
+
+    /// See [`ConnCtx::try_with_data`].
+    pub fn try_with_data<F: FnOnce(&[u8]) -> ParseResult>(&mut self, f: F) -> Option<ParseResult> {
+        self.rx.as_conn_ref().try_with_data(f)
+    }
+
+    /// See [`ConnCtx::take_recv_sink`].
+    pub fn take_recv_sink(&mut self) -> usize {
+        self.rx.as_conn_ref().take_recv_sink()
+    }
+
+    /// See [`ConnCtx::enable_recv_forward`].
+    pub fn enable_recv_forward(&mut self) {
+        self.rx.enable_recv_forward();
+    }
+
+    /// See [`ConnCtx::forward_held`].
+    pub fn forward_held(&mut self) -> io::Result<SendFuture> {
+        self.rx.forward_held()
+    }
+
+    /// See [`ConnCtx::forward_recv_buf`].
+    pub fn forward_recv_buf(&mut self, data: &[u8]) -> io::Result<()> {
+        self.tx.as_conn().forward_recv_buf(data)
+    }
+
+    /// See [`ConnCtx::run_direct_echo`].
+    #[cfg(has_io_uring)]
+    pub fn run_direct_echo(&mut self) -> DirectEchoFuture {
+        self.tx.as_conn().run_direct_echo()
+    }
+
+    /// See [`ConnCtx::send_chain`].
+    #[cfg(has_io_uring)]
+    pub fn send_chain<F>(&mut self, f: F) -> io::Result<SendFuture>
+    where
+        F: FnOnce(crate::handler::SendChainBuilder<'_, '_>) -> io::Result<()>,
+    {
+        self.tx.as_conn().send_chain(f)
+    }
+
+    /// See [`ConnCtx::send_chain_nowait`].
+    #[cfg(has_io_uring)]
+    pub fn send_chain_nowait<F, R>(&mut self, f: F) -> R
+    where
+        F: FnOnce(crate::handler::SendChainBuilder<'_, '_>) -> R,
+    {
+        self.tx.as_conn().send_chain_nowait(f)
+    }
+
+    /// See [`ConnCtx::shutdown_write`].
+    pub fn shutdown_write(&mut self) {
+        self.tx.as_conn().shutdown_write();
+    }
+
+    /// See [`ConnCtx::cancel`].
+    pub fn cancel(self) {
+        let _ = self.tx.as_conn().cancel();
+    }
+
+    /// See [`ConnCtx::tls_info`].
+    pub fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
+        self.tx.as_conn().tls_info()
+    }
+
+    /// See [`ConnCtx::index`].
+    pub fn index(&self) -> usize {
+        self.tx.as_conn().index()
+    }
+
+    /// See [`ConnCtx::request_shutdown`].
+    pub fn request_shutdown(&self) {
+        self.tx.as_conn().request_shutdown();
+    }
+
+    /// See [`ConnCtx::connect_with_timeout`].
+    pub fn connect_with_timeout(
+        &self,
+        addr: std::net::SocketAddr,
+        timeout_ms: u64,
+    ) -> io::Result<ConnectFuture> {
+        self.tx.as_conn().connect_with_timeout(addr, timeout_ms)
+    }
+
+    /// See [`ConnCtx::connect_unix`].
+    pub fn connect_unix(&self, path: impl AsRef<std::path::Path>) -> io::Result<ConnectFuture> {
+        self.tx.as_conn().connect_unix(path)
+    }
+
+    /// See [`ConnCtx::connect_tls`].
+    pub fn connect_tls(&self, addr: SocketAddr, server_name: &str) -> io::Result<ConnectFuture> {
+        self.tx.as_conn().connect_tls(addr, server_name)
+    }
+
+    /// See [`ConnCtx::connect_tls_with_timeout`].
+    pub fn connect_tls_with_timeout(
+        &self,
+        addr: SocketAddr,
+        server_name: &str,
+        timeout_ms: u64,
+    ) -> io::Result<ConnectFuture> {
+        self.tx
+            .as_conn()
+            .connect_tls_with_timeout(addr, server_name, timeout_ms)
     }
 }
 
@@ -3283,6 +3656,49 @@ impl SendHalf {
     /// See [`ConnCtx::close`].
     pub fn close(&mut self) {
         self.conn.close();
+    }
+
+    /// See [`ConnCtx::forward_recv_buf`].
+    pub fn forward_recv_buf(&mut self, data: &[u8]) -> io::Result<()> {
+        self.conn.forward_recv_buf(data)
+    }
+
+    /// See [`ConnCtx::shutdown_write`].
+    pub fn shutdown_write(&mut self) {
+        self.conn.shutdown_write();
+    }
+
+    /// See [`ConnCtx::index`].
+    pub fn index(&self) -> usize {
+        self.conn.index()
+    }
+
+    /// See [`ConnCtx::tls_info`].
+    pub fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
+        self.conn.tls_info()
+    }
+
+    /// See [`ConnCtx::request_shutdown`].
+    pub fn request_shutdown(&self) {
+        self.conn.request_shutdown();
+    }
+
+    /// See [`ConnCtx::send_chain`].
+    #[cfg(has_io_uring)]
+    pub fn send_chain<F>(&mut self, f: F) -> io::Result<SendFuture>
+    where
+        F: FnOnce(crate::handler::SendChainBuilder<'_, '_>) -> io::Result<()>,
+    {
+        self.conn.send_chain(f)
+    }
+
+    /// See [`ConnCtx::send_chain_nowait`].
+    #[cfg(has_io_uring)]
+    pub fn send_chain_nowait<F, R>(&mut self, f: F) -> R
+    where
+        F: FnOnce(crate::handler::SendChainBuilder<'_, '_>) -> R,
+    {
+        self.conn.send_chain_nowait(f)
     }
 
     /// See [`ConnCtx::token`].

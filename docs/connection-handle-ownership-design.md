@@ -97,6 +97,41 @@ flag day:
 4. Deprecate the direct methods; remove them in the next breaking release,
    flipping `on_accept` to hand out the halves directly.
 
+### Step 4, split in two
+
+Step 4 turned out to be two independent breaking axes, and they land as two
+PRs rather than one:
+
+**4a — `on_accept` hands out an owned `Connection`.** Not the two halves
+directly, which is what this doc originally said. Measured across the 214
+handler bodies in the tree:
+
+| shape | count |
+|---|---|
+| ignores the connection entirely | 98 |
+| recv only | 62 |
+| send inside a recv closure (needs two handles) | 32 |
+| send only | 16 |
+| both, but sequential | 6 |
+
+Two parameters would have churned every signature *and* every body. A single
+owned, non-`Copy`, `!Send` `Connection` that delegates both sides — with
+`split()` for the minority that need independently borrowable halves — leaves
+most bodies untouched and gives the identical guarantee: the handler cannot
+alias its own read side, because it never holds a `Copy` handle. In the event
+only 16 bodies needed `split()`.
+
+The ownership claim is recorded by the event loop at accept time
+(`Connection::for_accept` plus `driver.recv_half_taken[idx] = true`), because
+`spawn_accept_task` runs outside a task poll and cannot reach `CURRENT_DRIVER`.
+
+**4b — demote `ConnCtx`'s recv methods to `pub(crate)`.** This is what makes
+the model *enforced* rather than advisory, and it is a separate change with its
+own call sites: outbound connections from `connect()`, which take their read
+half with `take_recv()`. Roughly 21 sites, all in tests, examples and the
+bench crates. Until 4b lands, `Connection::as_conn()` and `SendHalf::as_conn()`
+remain reachable escape hatches.
+
 Step 1 is independently valuable and cheap. Steps 2–4 are the real fix.
 
 ### Step 2, as actually landed

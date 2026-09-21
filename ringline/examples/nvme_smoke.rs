@@ -16,14 +16,14 @@
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use ringline::{AsyncEventHandler, ConfigBuilder, ConnCtx, ParseResult, RinglineBuilder};
+use ringline::{AsyncEventHandler, ConfigBuilder, Connection, ParseResult, RinglineBuilder};
 
 static DONE: AtomicBool = AtomicBool::new(false);
 
 struct SmokeHandler;
 
 impl AsyncEventHandler for SmokeHandler {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             // Server side unused — client-only mode.
             let _ = conn.with_data(|d| ParseResult::Consumed(d.len())).await;

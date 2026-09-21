@@ -13,7 +13,7 @@ use std::net::ToSocketAddrs;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 
-use ringline::{AsyncEventHandler, ConfigBuilder, ConnCtx, RinglineBuilder, TlsClientConfig};
+use ringline::{AsyncEventHandler, ConfigBuilder, Connection, RinglineBuilder, TlsClientConfig};
 
 #[derive(Debug)]
 struct Target {
@@ -27,7 +27,7 @@ static TARGET: OnceLock<Target> = OnceLock::new();
 struct HttpHandler;
 
 impl AsyncEventHandler for HttpHandler {
-    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
         async {}
     }
 

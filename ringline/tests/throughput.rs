@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use futures_util::{AsyncReadExt, AsyncWriteExt};
 use ringline::{
-    AsyncEventHandler, Config, ConnCtx, ConnStream, RinglineBuilder, UdpCtx, UdpSendError,
+    AsyncEventHandler, Config, ConnStream, Connection, RinglineBuilder, UdpCtx, UdpSendError,
 };
 
 // ── Shared test config ────────────────────────────────────────────────
@@ -174,9 +174,9 @@ fn run_tcp_echo_chunked(addr: &str, payload: &[u8], chunk_size: usize) -> (Durat
 struct AsyncTcpEcho;
 
 impl AsyncEventHandler for AsyncTcpEcho {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
-            let mut stream = ConnStream::new(conn);
+            let mut stream = ConnStream::new(conn.as_conn());
             let mut buf = vec![0u8; 32 * 1024];
             loop {
                 let n = match stream.read(&mut buf).await {
@@ -310,7 +310,7 @@ fn udp_request_reply_std(count: usize, payload_size: usize) -> Duration {
 struct AsyncUdpEcho;
 
 impl AsyncEventHandler for AsyncUdpEcho {
-    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {}
     }
     fn create_for_worker(_id: usize) -> Self {

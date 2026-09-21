@@ -1342,7 +1342,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     fn spawn_accept_task(&mut self, conn_index: u32) {
         let generation = self.driver.connections.generation(conn_index);
         let conn_ctx = ConnCtx::new(conn_index, generation);
-        let future = Box::pin(self.handler.on_accept(conn_ctx));
+        // The handler owns the read side for the connection's lifetime; record
+        // the claim here, since `Connection::for_accept` cannot reach the
+        // driver from outside a task poll.
+        self.driver.recv_half_taken[conn_index as usize] = true;
+        let conn = crate::Connection::for_accept(conn_ctx);
+        let future = Box::pin(self.handler.on_accept(conn));
         self.executor.owner_task[conn_index as usize] = Some(conn_index);
         self.executor.task_slab.spawn(conn_index, future);
         self.executor.ready_queue.push_back(conn_index);
@@ -1516,7 +1521,7 @@ mod tests {
     use super::*;
     use crate::backend::mio::driver::tests::{attach_conn, token};
     use crate::config::ConfigBuilder;
-    use crate::runtime::io::ConnCtx;
+
     use std::future::Future;
     use std::io::Read;
 
@@ -1526,7 +1531,7 @@ mod tests {
 
     impl AsyncEventHandler for NoopHandler {
         #[allow(clippy::manual_async_fn)]
-        fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        fn on_accept(&self, _conn: crate::Connection) -> impl Future<Output = ()> + 'static {
             async move {}
         }
 

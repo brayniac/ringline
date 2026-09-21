@@ -22,7 +22,8 @@ use std::net::TcpStream;
 use std::time::Duration;
 
 use ringline::{
-    AsyncEventHandler, Config, ConnCtx, GuardBox, ParseResult, RegionId, RinglineBuilder, SendGuard,
+    AsyncEventHandler, Config, Connection, GuardBox, ParseResult, RegionId, RinglineBuilder,
+    SendGuard,
 };
 
 const PREFIX: &[u8] = b"PFX:";
@@ -72,7 +73,7 @@ impl SendGuard for VecGuard {
 struct GuardPartsSender<const VLEN: usize>;
 
 impl<const VLEN: usize> AsyncEventHandler for GuardPartsSender<VLEN> {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             let n = conn
                 .with_data(|data| ParseResult::Consumed(data.len()))
@@ -112,7 +113,7 @@ struct ChainGuardPartsSender<const VLEN: usize>;
 
 #[cfg(has_io_uring)]
 impl<const VLEN: usize> AsyncEventHandler for ChainGuardPartsSender<VLEN> {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             let n = conn
                 .with_data(|data| ParseResult::Consumed(data.len()))

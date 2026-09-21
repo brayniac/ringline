@@ -10,7 +10,9 @@ use std::pin::Pin;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use ringline::{AsyncEventHandler, Config, ConfigBuilder, ConnCtx, ParseResult, RinglineBuilder};
+use ringline::{
+    AsyncEventHandler, Config, ConfigBuilder, Connection, ParseResult, RinglineBuilder,
+};
 use ringline_ping::{Pool, PoolConfig};
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -67,20 +69,21 @@ struct PingServer;
 
 impl AsyncEventHandler for PingServer {
     #[allow(clippy::manual_async_fn)]
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
+            let (mut tx, mut rx) = conn.split();
             loop {
-                let n = conn
+                let n = rx
                     .with_data(|data| {
                         // Look for PING\r\n
                         if data.len() < 6 {
                             return ParseResult::NeedMore;
                         }
                         if data.starts_with(b"PING\r\n") {
-                            let _ = conn.send_nowait(b"PONG\r\n");
+                            let _ = tx.send_nowait(b"PONG\r\n");
                             ParseResult::Consumed(6)
                         } else {
-                            let _ = conn.send_nowait(b"-ERR\r\n");
+                            let _ = tx.send_nowait(b"-ERR\r\n");
                             ParseResult::Consumed(data.len())
                         }
                     })
@@ -106,7 +109,7 @@ struct PingClientHandler;
 
 impl AsyncEventHandler for PingClientHandler {
     #[allow(clippy::manual_async_fn)]
-    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
         async {}
     }
 
@@ -189,7 +192,7 @@ struct PingPoolClientHandler;
 
 impl AsyncEventHandler for PingPoolClientHandler {
     #[allow(clippy::manual_async_fn)]
-    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
         async {}
     }
 
@@ -278,15 +281,16 @@ struct BadPingServer;
 
 impl AsyncEventHandler for BadPingServer {
     #[allow(clippy::manual_async_fn)]
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
-            let n = conn
+            let (mut tx, mut rx) = conn.split();
+            let n = rx
                 .with_data(|data| {
                     if data.len() < 6 {
                         return ParseResult::NeedMore;
                     }
                     // Respond with malformed data instead of PONG\r\n.
-                    let _ = conn.send_nowait(b"GARBAGE_NOT_A_PONG\r\n");
+                    let _ = tx.send_nowait(b"GARBAGE_NOT_A_PONG\r\n");
                     ParseResult::Consumed(data.len())
                 })
                 .await;
@@ -309,7 +313,7 @@ struct BadPingClientHandler;
 
 impl AsyncEventHandler for BadPingClientHandler {
     #[allow(clippy::manual_async_fn)]
-    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
         async {}
     }
 

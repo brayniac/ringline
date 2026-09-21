@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use ringline::{
-    AsyncEventHandler, Config, ConnCtx, ParseResult, RinglineBuilder, UdpCtx, UdpSendError,
+    AsyncEventHandler, Config, Connection, ParseResult, RinglineBuilder, UdpCtx, UdpSendError,
 };
 
 // ── Helpers ────────────────────────────────────────────────────────────
@@ -72,7 +72,7 @@ struct UdpEcho {
 }
 
 impl AsyncEventHandler for UdpEcho {
-    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {}
     }
 
@@ -449,7 +449,7 @@ static SEND_STRESS_SENT: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
 static SEND_STRESS_PEER: OnceLock<Mutex<Option<SocketAddr>>> = OnceLock::new();
 
 impl AsyncEventHandler for SendStress {
-    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {}
     }
     fn create_for_worker(_id: usize) -> Self {
@@ -611,7 +611,7 @@ static OVER_ERR: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
 static OVER_OK: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
 
 impl AsyncEventHandler for OversizedSend {
-    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {}
     }
     fn create_for_worker(_id: usize) -> Self {
@@ -727,7 +727,7 @@ static COUNT_STARTED: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
 static COUNT_RECV: OnceLock<Arc<AtomicU64>> = OnceLock::new();
 
 impl AsyncEventHandler for CountingEcho {
-    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {}
     }
     fn create_for_worker(_id: usize) -> Self {
@@ -830,7 +830,7 @@ struct ReuseportEcho {
 static REUSE_STARTED: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
 
 impl AsyncEventHandler for ReuseportEcho {
-    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {}
     }
     fn create_for_worker(id: usize) -> Self {
@@ -988,12 +988,13 @@ struct TcpUdpHandler {
 static TCP_UDP_STARTED: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
 
 impl AsyncEventHandler for TcpUdpHandler {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
+            let (mut tx, mut rx) = conn.split();
             loop {
-                let n = conn
+                let n = rx
                     .with_data(|data| {
-                        let _ = conn.send_nowait(data);
+                        let _ = tx.send_nowait(data);
                         ParseResult::Consumed(data.len())
                     })
                     .await;
@@ -1089,7 +1090,7 @@ struct ExitingUdpHandler {
 static EXITING_STARTED: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
 
 impl AsyncEventHandler for ExitingUdpHandler {
-    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {}
     }
     fn create_for_worker(_id: usize) -> Self {
@@ -1212,7 +1213,7 @@ struct PanickingUdpHandler {
 static PANIC_STARTED: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
 
 impl AsyncEventHandler for PanickingUdpHandler {
-    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {}
     }
     fn create_for_worker(_id: usize) -> Self {
@@ -1313,7 +1314,7 @@ struct InFlightSendHandler {
 static INFLIGHT_STARTED: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
 
 impl AsyncEventHandler for InFlightSendHandler {
-    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {}
     }
     fn create_for_worker(_id: usize) -> Self {
@@ -1394,7 +1395,7 @@ static CONC_STARTED: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
 static CONC_SENT: OnceLock<Arc<AtomicU64>> = OnceLock::new();
 
 impl AsyncEventHandler for ConcurrentSenders {
-    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {}
     }
     fn create_for_worker(_id: usize) -> Self {
@@ -1576,7 +1577,7 @@ static BLOCKED_STARTED: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
 static BLOCKED_UNBLOCK: OnceLock<Arc<AtomicBool>> = OnceLock::new();
 
 impl AsyncEventHandler for BlockedThenEcho {
-    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {}
     }
     fn create_for_worker(_id: usize) -> Self {
@@ -1715,7 +1716,7 @@ static UNREACH_STARTED: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
 static UNREACH_FOLLOWUP: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
 
 impl AsyncEventHandler for UnreachableProbe {
-    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {}
     }
     fn create_for_worker(_id: usize) -> Self {
@@ -1889,7 +1890,7 @@ static GSO_SEG_SIZE: AtomicU64 = AtomicU64::new(0);
 static GSO_SEG_COUNT: AtomicU64 = AtomicU64::new(0);
 
 impl AsyncEventHandler for GsoSendHandler {
-    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {}
     }
     fn create_for_worker(_id: usize) -> Self {
@@ -2035,7 +2036,7 @@ fn udp_gso_invalid_segment_size_returns_error() {
     }
     static SANE_OK: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
     impl AsyncEventHandler for GsoArgCheck {
-        fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
             async move {}
         }
         fn create_for_worker(_id: usize) -> Self {
@@ -2107,7 +2108,7 @@ struct BatchEcho {
 }
 
 impl AsyncEventHandler for BatchEcho {
-    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {}
     }
 
@@ -2172,7 +2173,7 @@ struct TimedBatchEcho {
 }
 
 impl AsyncEventHandler for TimedBatchEcho {
-    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {}
     }
 

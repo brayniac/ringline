@@ -19,18 +19,21 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
-use ringline::{AsyncEventHandler, Config, ConfigBuilder, ConnCtx, ParseResult, RinglineBuilder};
+use ringline::{
+    AsyncEventHandler, Config, ConfigBuilder, Connection, ParseResult, RinglineBuilder,
+};
 
 struct AsyncEcho;
 
 impl AsyncEventHandler for AsyncEcho {
-    fn on_accept(&self, conn: ConnCtx) -> impl std::future::Future<Output = ()> + 'static {
+    fn on_accept(&self, conn: Connection) -> impl std::future::Future<Output = ()> + 'static {
         async move {
+            let (mut tx, mut rx) = conn.split();
             loop {
-                let n = conn
+                let n = rx
                     .with_data(|data| {
                         let owned = data.to_vec();
-                        let _ = conn.send_nowait(&owned);
+                        let _ = tx.send_nowait(&owned);
                         ParseResult::Consumed(owned.len())
                     })
                     .await;

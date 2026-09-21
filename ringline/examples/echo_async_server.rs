@@ -4,21 +4,22 @@
 //!   cargo run --example echo_async_server [BIND_ADDR]
 //!   # default: 127.0.0.1:7878
 
-use ringline::{AsyncEventHandler, ConfigBuilder, ConnCtx, ParseResult, RinglineBuilder};
+use ringline::{AsyncEventHandler, ConfigBuilder, Connection, ParseResult, RinglineBuilder};
 
 struct AsyncEcho {
     worker_id: usize,
 }
 
 impl AsyncEventHandler for AsyncEcho {
-    fn on_accept(&self, conn: ConnCtx) -> impl std::future::Future<Output = ()> + 'static {
+    fn on_accept(&self, conn: Connection) -> impl std::future::Future<Output = ()> + 'static {
         let worker_id = self.worker_id;
         async move {
-            eprintln!("[worker {worker_id}] accepted connection {}", conn.index());
+            let (mut tx, mut rx) = conn.split();
+            eprintln!("[worker {worker_id}] accepted connection {}", tx.index());
             loop {
-                let consumed = conn
+                let consumed = rx
                     .with_data(|data| {
-                        if let Err(e) = conn.send_nowait(data) {
+                        if let Err(e) = tx.send_nowait(data) {
                             eprintln!("[worker {worker_id}] send error: {e}");
                         }
                         ParseResult::Consumed(data.len())
@@ -28,7 +29,7 @@ impl AsyncEventHandler for AsyncEcho {
                     break;
                 }
             }
-            eprintln!("[worker {worker_id}] connection {} closed", conn.index());
+            eprintln!("[worker {worker_id}] connection {} closed", tx.index());
         }
     }
 

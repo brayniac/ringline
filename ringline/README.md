@@ -28,7 +28,7 @@ use ringline::{AsyncEventHandler, Config, ConnCtx, ParseResult, RinglineBuilder}
 struct Echo;
 
 impl AsyncEventHandler for Echo {
-    fn on_accept(&self, conn: ConnCtx) -> impl std::future::Future<Output = ()> + 'static {
+    fn on_accept(&self, mut conn: Connection) -> impl std::future::Future<Output = ()> + 'static {
         async move {
             loop {
                 let n = conn.with_data(|data| {
@@ -108,7 +108,7 @@ io_uring backend, each worker also owns:
 
 | Type | Description |
 |------|-------------|
-| `AsyncEventHandler` | Trait: `on_accept(ConnCtx) -> Future` — one task per connection |
+| `AsyncEventHandler` | Trait: `on_accept(Connection) -> Future` — one task per connection |
 | `ConnCtx` | Async connection context: `send()`, `send_nowait()`, `with_data()` |
 | `WithDataFuture` | Future that resolves when recv data is available |
 | `SendFuture` | Future that resolves when a send completes |

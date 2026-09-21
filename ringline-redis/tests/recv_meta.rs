@@ -15,7 +15,9 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use resp_proto::Value;
-use ringline::{AsyncEventHandler, Config, ConfigBuilder, ConnCtx, ParseResult, RinglineBuilder};
+use ringline::{
+    AsyncEventHandler, Config, ConfigBuilder, Connection, ParseResult, RinglineBuilder,
+};
 use ringline_redis::{Client, Error, OpKind};
 
 // ── Config / helpers ──────────────────────────────────────────────────────
@@ -95,10 +97,11 @@ struct MetaStubServer;
 
 impl AsyncEventHandler for MetaStubServer {
     #[allow(clippy::manual_async_fn)]
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
+            let (mut tx, mut rx) = conn.split();
             loop {
-                let n = conn
+                let n = rx
                     .with_bytes(|bytes| {
                         let len = bytes.len();
                         match Value::parse_bytes(bytes) {
@@ -115,11 +118,11 @@ impl AsyncEventHandler for MetaStubServer {
                                             }
                                             _ => b"-ERR value mismatch\r\n",
                                         };
-                                        let _ = conn.send_nowait(reply);
+                                        let _ = tx.send_nowait(reply);
                                     } else if verb.eq_ignore_ascii_case(b"DEL") {
-                                        let _ = conn.send_nowait(b":1\r\n");
+                                        let _ = tx.send_nowait(b":1\r\n");
                                     } else if let Some(Value::BulkString(key)) = items.get(1) {
-                                        let _ = conn.send_nowait(&reply_for_key(&key[..]));
+                                        let _ = tx.send_nowait(&reply_for_key(&key[..]));
                                     }
                                 }
                                 ParseResult::Consumed(consumed)
@@ -150,7 +153,7 @@ struct ClientHandler;
 
 impl AsyncEventHandler for ClientHandler {
     #[allow(clippy::manual_async_fn)]
-    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
         async {}
     }
 

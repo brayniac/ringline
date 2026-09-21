@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ringline::{
-    AsyncEventHandler, ConfigBuilder, ConnCtx, ParseResult, RinglineBuilder, TlsConfig,
+    AsyncEventHandler, ConfigBuilder, Connection, ParseResult, RinglineBuilder, TlsConfig,
 };
 use ringline_h2::frame::{self, Frame};
 use ringline_h2::hpack::{Decoder, Encoder, HeaderField};
@@ -102,7 +102,7 @@ struct GrpcEchoServer;
 
 impl AsyncEventHandler for GrpcEchoServer {
     #[allow(clippy::manual_async_fn)]
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             let mut recv_buf = Vec::new();
             let mut encoder = Encoder::new(4096);

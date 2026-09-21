@@ -7,7 +7,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
 use ringline::process::Command;
-use ringline::{AsyncEventHandler, Config, ConfigBuilder, ConnCtx, RinglineBuilder};
+use ringline::{AsyncEventHandler, Config, ConfigBuilder, Connection, RinglineBuilder};
 
 fn test_config_builder() -> ConfigBuilder {
     ConfigBuilder::new()
@@ -42,7 +42,7 @@ impl AsyncEventHandler for SpawnTrueHandler {
         }))
     }
 
-    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
         async {}
     }
     fn create_for_worker(_id: usize) -> Self {
@@ -80,7 +80,7 @@ impl AsyncEventHandler for SpawnFalseHandler {
         }))
     }
 
-    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
         async {}
     }
     fn create_for_worker(_id: usize) -> Self {
@@ -128,7 +128,7 @@ impl AsyncEventHandler for SpawnArgsHandler {
         }))
     }
 
-    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
         async {}
     }
     fn create_for_worker(_id: usize) -> Self {
@@ -175,7 +175,7 @@ impl AsyncEventHandler for KillHandler {
         }))
     }
 
-    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
         async {}
     }
     fn create_for_worker(_id: usize) -> Self {
@@ -214,7 +214,7 @@ impl AsyncEventHandler for SpawnerDisabledHandler {
         }))
     }
 
-    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
         async {}
     }
     fn create_for_worker(_id: usize) -> Self {
@@ -264,7 +264,7 @@ impl AsyncEventHandler for ArgsBuilderHandler {
         }))
     }
 
-    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
         async {}
     }
     fn create_for_worker(_id: usize) -> Self {

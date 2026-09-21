@@ -9,16 +9,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use futures_util::io::{AsyncReadExt, AsyncWriteExt};
-use ringline::{AsyncEventHandler, Config, ConfigBuilder, ConnCtx, ConnStream, RinglineBuilder};
+use ringline::{AsyncEventHandler, Config, ConfigBuilder, ConnStream, Connection, RinglineBuilder};
 
 // ── Stream-based echo handler ────────────────────────────────────────
 
 struct StreamEcho;
 
 impl AsyncEventHandler for StreamEcho {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
-            let mut stream = ConnStream::new(conn);
+            let mut stream = ConnStream::new(conn.as_conn());
             loop {
                 let data = match futures_util::AsyncBufReadExt::fill_buf(&mut stream).await {
                     Ok([]) => break, // EOF
@@ -43,9 +43,9 @@ impl AsyncEventHandler for StreamEcho {
 struct ReadEcho;
 
 impl AsyncEventHandler for ReadEcho {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
-            let mut stream = ConnStream::new(conn);
+            let mut stream = ConnStream::new(conn.as_conn());
             let mut buf = [0u8; 4096];
             loop {
                 let n = match stream.read(&mut buf).await {
@@ -71,10 +71,10 @@ struct CloseCounter {
 }
 
 impl AsyncEventHandler for CloseCounter {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         let closed = self.closed.clone();
         async move {
-            let mut stream = ConnStream::new(conn);
+            let mut stream = ConnStream::new(conn.as_conn());
             // Echo once, then close.
             let mut buf = [0u8; 256];
             if let Ok(n) = stream.read(&mut buf).await
@@ -99,9 +99,9 @@ impl AsyncEventHandler for CloseCounter {
 struct TinyReadEcho;
 
 impl AsyncEventHandler for TinyReadEcho {
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
-            let mut stream = ConnStream::new(conn);
+            let mut stream = ConnStream::new(conn.as_conn());
             let mut byte = [0u8; 1];
             loop {
                 match stream.read(&mut byte).await {

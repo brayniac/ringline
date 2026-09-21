@@ -2,7 +2,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::handler::DriverCtx;
-use crate::runtime::io::{ConnCtx, UdpCtx};
+use crate::runtime::io::{Connection, UdpCtx};
 
 /// Trait for async connection handlers.
 ///
@@ -15,17 +15,18 @@ use crate::runtime::io::{ConnCtx, UdpCtx};
 ///
 /// ```no_run
 /// use std::future::Future;
-/// use ringline::{AsyncEventHandler, ConnCtx, ParseResult};
+/// use ringline::{AsyncEventHandler, Connection, ParseResult};
 ///
 /// struct EchoHandler;
 ///
 /// impl AsyncEventHandler for EchoHandler {
-///     fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+///     fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
 ///         async move {
+///             let (mut tx, mut rx) = conn.split();
 ///             loop {
-///                 let n = conn.with_data(|data| {
+///                 let n = rx.with_data(|data| {
 ///                     // Echo back everything received.
-///                     conn.send_nowait(data).ok();
+///                     tx.send_nowait(data).ok();
 ///                     ringline::ParseResult::Consumed(data.len())
 ///                 }).await;
 ///                 if n == 0 {
@@ -43,7 +44,12 @@ use crate::runtime::io::{ConnCtx, UdpCtx};
 pub trait AsyncEventHandler: Send + 'static {
     /// Handle an accepted connection. Runs for the connection's lifetime.
     /// When the returned future completes, the connection is closed.
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static;
+    ///
+    /// The handler is given an owned [`Connection`], not a `Copy` handle: one
+    /// task owns one connection, and the read side cannot be aliased. Call
+    /// [`Connection::split`] when a send has to happen while a read borrow is
+    /// live (an echo writing from inside its own `with_data` closure).
+    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static;
 
     /// Periodic tick (synchronous). Called on each io_uring completion cycle.
     fn on_tick(&mut self, _ctx: &mut DriverCtx<'_>) {}

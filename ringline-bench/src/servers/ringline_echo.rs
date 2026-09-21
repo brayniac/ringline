@@ -3,7 +3,7 @@
 use std::net::SocketAddr;
 use std::thread::JoinHandle;
 
-use ringline::{AsyncEventHandler, ConfigBuilder, ConnCtx, RinglineBuilder, ShutdownHandle};
+use ringline::{AsyncEventHandler, ConfigBuilder, Connection, RinglineBuilder, ShutdownHandle};
 // ParseResult is only needed in the non-io_uring fallback path.
 #[cfg(not(has_io_uring))]
 use ringline::ParseResult;
@@ -11,32 +11,39 @@ use ringline::ParseResult;
 struct EchoHandler;
 
 impl AsyncEventHandler for EchoHandler {
-    fn on_accept(&self, conn: ConnCtx) -> impl std::future::Future<Output = ()> + 'static {
+    fn on_accept(&self, conn: Connection) -> impl std::future::Future<Output = ()> + 'static {
         async move {
             // Direct-echo path: on io_uring, echo SQEs are submitted directly
             // from the CQE handler without waking this task — eliminating
             // the collect_wakeups → poll_ready_tasks roundtrip per message.
             // Falls back to the forward_recv_buf loop on non-io_uring builds.
+            //
+            // Only the fallback needs the halves: `run_direct_echo` is a
+            // whole-connection operation that belongs to neither, so the
+            // split lives in the branch that actually uses it.
             #[cfg(has_io_uring)]
             {
                 // No `return` needed: the fallback below is cfg'd out whenever
                 // this arm is compiled in. (Never linted before #402, because
                 // this block was dead on every platform.)
-                conn.run_direct_echo().await;
+                conn.as_conn().run_direct_echo().await;
             }
             #[cfg(not(has_io_uring))]
-            loop {
-                let n = conn
-                    .with_data(|data| {
-                        if let Err(e) = conn.forward_recv_buf(data) {
-                            eprintln!("echo: forward_recv_buf failed: {e}");
-                            return ParseResult::NeedMore;
-                        }
-                        ParseResult::Consumed(data.len())
-                    })
-                    .await;
-                if n == 0 {
-                    break;
+            {
+                let (mut tx, mut rx) = conn.split();
+                loop {
+                    let n = rx
+                        .with_data(|data| {
+                            if let Err(e) = tx.forward_recv_buf(data) {
+                                eprintln!("echo: forward_recv_buf failed: {e}");
+                                return ParseResult::NeedMore;
+                            }
+                            ParseResult::Consumed(data.len())
+                        })
+                        .await;
+                    if n == 0 {
+                        break;
+                    }
                 }
             }
         }

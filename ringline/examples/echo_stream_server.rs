@@ -10,18 +10,18 @@
 //!   # default: 127.0.0.1:7878
 
 use futures_util::io::AsyncWriteExt;
-use ringline::{AsyncEventHandler, ConfigBuilder, ConnCtx, ConnStream, RinglineBuilder};
+use ringline::{AsyncEventHandler, ConfigBuilder, ConnStream, Connection, RinglineBuilder};
 
 struct StreamEcho {
     worker_id: usize,
 }
 
 impl AsyncEventHandler for StreamEcho {
-    fn on_accept(&self, conn: ConnCtx) -> impl std::future::Future<Output = ()> + 'static {
+    fn on_accept(&self, conn: Connection) -> impl std::future::Future<Output = ()> + 'static {
         let worker_id = self.worker_id;
         async move {
             eprintln!("[worker {worker_id}] accepted connection {}", conn.index());
-            let mut stream = ConnStream::new(conn);
+            let mut stream = ConnStream::new(conn.as_conn());
 
             // AsyncBufRead::fill_buf returns a zero-copy slice into the recv
             // accumulator. No memcpy on the read side.

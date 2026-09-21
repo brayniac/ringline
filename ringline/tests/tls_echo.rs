@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use ringline::{
-    AsyncEventHandler, ConfigBuilder, ConnCtx, ParseResult, RinglineBuilder, TlsConfig, TlsInfo,
+    AsyncEventHandler, ConfigBuilder, Connection, ParseResult, RinglineBuilder, TlsConfig, TlsInfo,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 
@@ -137,12 +137,13 @@ struct TlsEchoHandler;
 
 impl AsyncEventHandler for TlsEchoHandler {
     #[allow(clippy::manual_async_fn)]
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
+            let (mut tx, mut rx) = conn.split();
             loop {
-                let n = conn
+                let n = rx
                     .with_data(|data| {
-                        let _ = conn.send_nowait(data);
+                        let _ = tx.send_nowait(data);
                         ParseResult::Consumed(data.len())
                     })
                     .await;
@@ -257,7 +258,7 @@ fn big_send_payload() -> Vec<u8> {
 
 impl AsyncEventHandler for TlsBigSendHandler {
     #[allow(clippy::manual_async_fn)]
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             let n = conn
                 .with_data(|data| ParseResult::Consumed(data.len()))
@@ -424,7 +425,7 @@ struct TlsClientHandler;
 
 impl AsyncEventHandler for TlsClientHandler {
     #[allow(clippy::manual_async_fn)]
-    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
         async {}
     }
 
@@ -548,17 +549,18 @@ struct TlsInfoHandler;
 
 impl AsyncEventHandler for TlsInfoHandler {
     #[allow(clippy::manual_async_fn)]
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
+            let (mut tx, mut rx) = conn.split();
             let mut recorded = false;
             loop {
-                let n = conn
+                let n = rx
                     .with_data(|data| {
                         // Record TlsInfo on the first data arrival (handshake is
                         // already complete — data is decrypted plaintext).
                         if !recorded {
                             recorded = true;
-                            let info: Option<TlsInfo> = conn.tls_info();
+                            let info: Option<TlsInfo> = tx.tls_info();
                             let snapshot = TlsInfoSnapshot {
                                 is_some: info.is_some(),
                                 protocol_version_some: info
@@ -580,7 +582,7 @@ impl AsyncEventHandler for TlsInfoHandler {
                             };
                             *TLS_INFO_SNAPSHOT.lock().unwrap() = Some(snapshot);
                         }
-                        let _ = conn.send_nowait(data);
+                        let _ = tx.send_nowait(data);
                         ParseResult::Consumed(data.len())
                     })
                     .await;
@@ -720,12 +722,13 @@ struct TlsSegmentedHandler;
 #[cfg(has_io_uring)]
 impl AsyncEventHandler for TlsSegmentedHandler {
     #[allow(clippy::manual_async_fn)]
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
+            let (mut tx, mut rx) = conn.split();
             // Opt this TLS connection into segmented delivery: decrypted
             // plaintext arrives as owned segments in the hold, not the
             // accumulator.
-            let mut reader = match conn.segments() {
+            let mut reader = match rx.segments() {
                 Ok(r) => r,
                 Err(_) => return,
             };
@@ -734,7 +737,7 @@ impl AsyncEventHandler for TlsSegmentedHandler {
                     Ok(Some(seg)) => {
                         // Echo each decrypted plaintext segment straight back;
                         // the client reassembles and byte-compares.
-                        let _ = conn.send_nowait(&seg);
+                        let _ = tx.send_nowait(&seg);
                     }
                     Ok(None) => {
                         // Clean TLS close surfaced as EOF (not a hang).
@@ -843,14 +846,15 @@ struct TlsCloseHandler;
 #[cfg(not(has_io_uring))]
 impl AsyncEventHandler for TlsCloseHandler {
     #[allow(clippy::manual_async_fn)]
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
-            conn.with_data(|data| {
-                let _ = conn.send_nowait(data);
+            let (mut tx, mut rx) = conn.split();
+            rx.with_data(|data| {
+                let _ = tx.send_nowait(data);
                 ParseResult::Consumed(data.len())
             })
             .await;
-            conn.close();
+            tx.close();
         }
     }
 
@@ -977,22 +981,23 @@ struct TlsTickCloseHandler;
 #[cfg(has_io_uring)]
 impl AsyncEventHandler for TlsTickCloseHandler {
     #[allow(clippy::manual_async_fn)]
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
+            let (mut tx, mut rx) = conn.split();
             // Echo once so the connection reaches full TLS traffic state —
             // `WriteTraffic::queue_close_notify` is only reachable there, and a
             // handshaking connection would have no alert to produce.
-            conn.with_data(|data| {
-                let _ = conn.send_nowait(data);
+            rx.with_data(|data| {
+                let _ = tx.send_nowait(data);
                 ParseResult::Consumed(data.len())
             })
             .await;
-            *TLS_TICK_CLOSE_TOKEN.lock().unwrap() = Some(conn.token());
+            *TLS_TICK_CLOSE_TOKEN.lock().unwrap() = Some(tx.token());
             // Park until the connection goes away rather than returning, which
             // would close it from the task side and race the tick-driven close
             // under test.
             loop {
-                if conn.with_data(|d| ParseResult::Consumed(d.len())).await == 0 {
+                if rx.with_data(|d| ParseResult::Consumed(d.len())).await == 0 {
                     break;
                 }
             }
@@ -1126,7 +1131,7 @@ static TLS_FORWARD_BACKEND: OnceLock<SocketAddr> = OnceLock::new();
 
 impl AsyncEventHandler for TlsForwardProxy {
     #[allow(clippy::manual_async_fn)]
-    fn on_accept(&self, client: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut client: Connection) -> impl Future<Output = ()> + 'static {
         let backend_addr = self.backend_addr;
         async move {
             let backend = match client.connect(backend_addr) {
@@ -1196,12 +1201,13 @@ struct PlainEcho;
 
 impl AsyncEventHandler for PlainEcho {
     #[allow(clippy::manual_async_fn)]
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
+            let (mut tx, mut rx) = conn.split();
             loop {
-                let n = conn
+                let n = rx
                     .with_data(|data| {
-                        let _ = conn.send_nowait(data);
+                        let _ = tx.send_nowait(data);
                         ParseResult::Consumed(data.len())
                     })
                     .await;
@@ -1319,7 +1325,7 @@ static TLS_SINK_REFUSED_BACKEND: std::sync::OnceLock<SocketAddr> = std::sync::On
 
 impl AsyncEventHandler for TlsSinkRefusedProxy {
     #[allow(clippy::manual_async_fn)]
-    fn on_accept(&self, client: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, mut client: Connection) -> impl Future<Output = ()> + 'static {
         let backend_addr = self.backend_addr;
         async move {
             let backend = match client.connect(backend_addr) {
@@ -1332,7 +1338,7 @@ impl AsyncEventHandler for TlsSinkRefusedProxy {
 
             // `client` is the TLS connection. Forwarding backend -> client is
             // the case that must be refused.
-            let errno = match backend.forward_to_conn(&client, 16).await {
+            let errno = match backend.forward_to_conn(&client.as_conn(), 16).await {
                 Ok(_) => -1,
                 Err(e) => e.raw_os_error().unwrap_or(-1),
             };
@@ -1444,20 +1450,21 @@ struct TlsLateSegmentReader;
 #[cfg(has_io_uring)]
 impl AsyncEventHandler for TlsLateSegmentReader {
     #[allow(clippy::manual_async_fn)]
-    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
+            let (mut tx, mut rx) = conn.split();
             // Let the handshake finish and the client's payload arrive and be
             // decrypted into the accumulator *before* the reader exists.
             ringline::sleep(Duration::from_millis(300)).await;
 
-            let mut reader = match conn.segments() {
+            let mut reader = match rx.segments() {
                 Ok(r) => r,
                 Err(_) => return,
             };
             loop {
                 match reader.next().await {
                     Ok(Some(seg)) => {
-                        let _ = conn.send_nowait(&seg);
+                        let _ = tx.send_nowait(&seg);
                     }
                     Ok(None) => break,
                     Err(_) => break,

@@ -13,12 +13,14 @@
 
 use std::future::Future;
 
-use ringline::{AsyncEventHandler, ConfigBuilder, ConnCtx, Error, MemoryRegion, RinglineBuilder};
+use ringline::{
+    AsyncEventHandler, ConfigBuilder, Connection, Error, MemoryRegion, RinglineBuilder,
+};
 
 struct Idle;
 
 impl AsyncEventHandler for Idle {
-    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
         async {}
     }
     fn create_for_worker(_id: usize) -> Self {
