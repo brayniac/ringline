@@ -1129,7 +1129,7 @@ impl ConnCtx {
     /// Await the next received segment as an owned, freely holdable [`Bytes`]
     /// (Mode C — "Own", copy-at-delivery; see `docs/segmented-recv-design.md`).
     ///
-    /// Opts this connection into *segmented* delivery (like [`segments`](Self::segments)),
+    /// Opts this connection into *segmented* delivery (like `segments`),
     /// then, for each arriving provided buffer, **copies** its bytes into an owned
     /// heap `Bytes` and replenishes the bid **immediately at delivery** — the copy
     /// *is* the release, so this path never pins the ring and cannot deplete it by
@@ -1143,7 +1143,7 @@ impl ConnCtx {
     ///
     /// Parks when no buffer is held and the connection is still open, resuming
     /// when the recv completion handler holds a buffer and calls `wake_recv` (the
-    /// same waiter mechanism as [`segments`](Self::segments) / [`with_data`](Self::with_data)).
+    /// same waiter mechanism as `segments` / [`with_data`](Self::with_data)).
     ///
     /// # Errors
     ///
@@ -1176,7 +1176,7 @@ impl ConnCtx {
     /// End segmented-recv delivery on this connection and restore the default
     /// [`with_data`](Self::with_data) / [`with_bytes`](Self::with_bytes) path.
     ///
-    /// [`segments`](Self::segments) and [`recv_owned_segment`](Self::recv_owned_segment)
+    /// `segments` and `recv_owned_segment`
     /// leave the connection in the *segmented* domain: arriving buffers are held
     /// for the segment reader instead of being gathered into the accumulator. A
     /// consumer that has finished pulling its segments **must** call this before
@@ -1718,7 +1718,7 @@ impl ConnCtx {
     /// Forward the next `len` received bytes to **another connection on this
     /// worker**, with no copy through user space.
     ///
-    /// The proxy form of [`forward_to`](Self::forward_to). Where `forward_to`
+    /// The proxy form of `forward_to`. Where `forward_to`
     /// names its sink as a borrowed descriptor, this names it as a
     /// [`ConnCtx`] — which is what makes a *bidirectional* proxy expressible:
     /// the return direction needs the client named as a sink, and a
@@ -3062,8 +3062,8 @@ impl<F: FnMut(Bytes) -> ParseResult + Unpin> Future for WithBytesFuture<F> {
 /// borrow**. Three methods do that, and for them the conflict is a compile
 /// error rather than a runtime refusal:
 ///
-/// - [`segments`](Self::segments) — returns `SegmentReader<'_>`
-/// - [`forward_to`](Self::forward_to) / [`forward_to_conn`](Self::forward_to_conn)
+/// - `segments` — returns `SegmentReader<'_>`
+/// - `forward_to` / [`forward_to_conn`](Self::forward_to_conn)
 ///   — return `ForwardToFuture<'_>`
 ///
 /// The rest — `with_data`, `with_data_result`, `with_bytes`, `with_segments`,
@@ -3095,9 +3095,9 @@ impl<F: FnMut(Bytes) -> ParseResult + Unpin> Future for WithBytesFuture<F> {
 /// enforce. See `docs/connection-handle-ownership-design.md`.
 ///
 /// Available on both backends. The segmented-recv methods
-/// ([`segments`](Self::segments), [`recv_owned_segment`](Self::recv_owned_segment),
-/// [`with_segments`](Self::with_segments), [`end_segments`](Self::end_segments)
-/// and [`forward_to`](Self::forward_to)) are io_uring-only, exactly as they are
+/// (`segments`, `recv_owned_segment`,
+/// `with_segments`, `end_segments`
+/// and `forward_to`) are io_uring-only, exactly as they are
 /// on [`ConnCtx`] — mio has no segmented recv domain.
 pub struct RecvHalf {
     conn: ConnCtx,
