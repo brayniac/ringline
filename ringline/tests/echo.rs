@@ -74,6 +74,43 @@ impl AsyncEventHandler for BurstSender {
     }
 }
 
+// ── Split-halves echo handler ──────────────────────
+
+/// Echoes through `ConnCtx::split()`.
+///
+/// The send happens *inside* the `with_data` closure, while the read side is
+/// mutably borrowed by the in-flight recv future. That is the whole point of
+/// the split: a `SendHalf` that borrowed the `RecvHalf` would not compile here,
+/// and an echo is the most ordinary thing a connection does.
+#[cfg(has_io_uring)]
+struct SplitEcho;
+
+#[cfg(has_io_uring)]
+impl AsyncEventHandler for SplitEcho {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            let (mut tx, mut rx) = match conn.split() {
+                Ok(halves) => halves,
+                Err(e) => panic!("split() on a fresh connection: {e}"),
+            };
+            loop {
+                let n = rx
+                    .with_data(|data| {
+                        let _ = tx.send_nowait(data);
+                        ParseResult::Consumed(data.len())
+                    })
+                    .await;
+                if n == 0 {
+                    break;
+                }
+            }
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        SplitEcho
+    }
+}
+
 // ── Zero-copy recv-forward echo handler ────────────────────────────
 
 /// Echo via the multi-buffer zero-copy recv-forward path: held provided recv
@@ -7373,6 +7410,42 @@ fn a_second_forward_on_one_connection_is_refused_with_ebusy() {
     }
     backend_shutdown.shutdown();
     for h in backend_handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
+/// A connection driven entirely through the split halves round-trips, and does
+/// so with the send issued while the read side is borrowed.
+#[cfg(has_io_uring)]
+#[test]
+fn split_halves_echo_round_trip() {
+    // Bind :0 and read the resolved port back, rather than going through
+    // `free_port()`. That helper probes with a throwaway listener and drops it
+    // before the server binds, so another process can take the port in the
+    // window between — which is exactly the `AddrInUse` launch failure this
+    // suite hits under parallel load. Letting the server own the bind closes
+    // the window instead of narrowing it.
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
+        .bind("127.0.0.1:0".parse().unwrap())
+        .launch::<SplitEcho>()
+        .expect("launch failed");
+    let addr = shutdown
+        .bound_addr()
+        .expect("bound_addr after a TCP bind")
+        .to_string();
+
+    wait_for_server(&addr);
+
+    let msg = b"split halves echo";
+    assert_eq!(echo_round_trip(&addr, msg), msg.to_vec());
+
+    // A second message, over several reads: the halves survive across
+    // iterations rather than being a one-shot.
+    let big: Vec<u8> = (0..8192).map(|i| (i % 256) as u8).collect();
+    assert_eq!(echo_round_trip(&addr, &big), big);
+
+    shutdown.shutdown();
+    for h in handles {
         h.join().unwrap().unwrap();
     }
 }

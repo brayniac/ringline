@@ -7963,6 +7963,96 @@ mod tests {
             .expect("the half is available again after drop");
     }
 
+    /// `split()` takes the read claim, so it is refused exactly like a second
+    /// `take_recv`. The write half carries no claim of its own yet, so it is
+    /// dropping the *read* half that makes the connection splittable again.
+    #[test]
+    fn split_is_refused_while_the_read_side_is_out() {
+        let mut el = make_test_loop_with_config(config_with_reserve(16));
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let conn = ConnCtx::new(conn_index, generation);
+
+        let (tx, rx) = with_driver_state(&mut el, || conn.split()).expect("first split");
+        assert!(el.driver.recv_half_taken[conn_index as usize]);
+
+        match with_driver_state(&mut el, || conn.split()) {
+            Err(e) => assert_eq!(
+                e.raw_os_error(),
+                Some(libc::EBUSY),
+                "a second split must be refused with EBUSY"
+            ),
+            Ok(_) => panic!("the read side was handed out twice"),
+        }
+
+        // Dropping only the send half must NOT release the read claim: the
+        // reader is still live and still exclusive. `SendHalf` has no `Drop`
+        // today, so this holds trivially — but `clear_recv_claims` clears
+        // *both* flags, so the day the write side grows a claim of its own and
+        // reaches for that helper, this is what catches it.
+        {
+            let _tx = tx;
+        }
+        assert!(
+            el.driver.recv_half_taken[conn_index as usize],
+            "dropping the send half must not release the read claim"
+        );
+
+        with_driver_state(&mut el, || drop(rx));
+        assert!(!el.driver.recv_half_taken[conn_index as usize]);
+        let _again = with_driver_state(&mut el, || conn.split()).expect("splittable again");
+    }
+
+    /// A stale handle must not split the slot's new occupant, for the same
+    /// reason it must not `take_recv` it.
+    #[test]
+    fn split_refuses_a_stale_handle() {
+        let mut el = make_test_loop_with_config(config_with_reserve(16));
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let stale = ConnCtx::new(conn_index, generation.wrapping_add(1));
+        match with_driver_state(&mut el, || stale.split()) {
+            Err(e) => assert_eq!(e.raw_os_error(), Some(libc::EPIPE)),
+            Ok(_) => panic!("a stale handle must not split the connection"),
+        }
+        assert!(
+            !el.driver.recv_half_taken[conn_index as usize],
+            "a refused split must not leave a claim behind"
+        );
+    }
+
+    /// `end_segments()` through the half leaves the segmented domain, and the
+    /// half keeps its read claim afterwards. Migrating the client crates needs
+    /// this: redis/memcache call `end_segments` on the handle they hold.
+    #[test]
+    fn end_segments_through_the_half_restores_the_default_domain() {
+        let mut el = make_test_loop_with_config(config_with_reserve(16));
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let conn = ConnCtx::new(conn_index, generation);
+
+        let mut half = with_driver_state(&mut el, || conn.take_recv()).expect("take_recv");
+        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
+
+        with_driver_state(&mut el, || half.end_segments()).expect("end_segments through the half");
+        assert_eq!(
+            el.driver.recv_domain[conn_index as usize],
+            crate::recv::domain::RecvDomain::CopyOrConsume,
+            "the half must return the connection to the default read path"
+        );
+        assert!(
+            el.driver.recv_half_taken[conn_index as usize],
+            "ending the segmented domain must not release the read claim"
+        );
+
+        // And the half is still the exclusive reader.
+        match with_driver_state(&mut el, || conn.take_recv()) {
+            Err(e) => assert_eq!(e.raw_os_error(), Some(libc::EBUSY)),
+            Ok(_) => panic!("end_segments() must not hand the read side back"),
+        }
+        with_driver_state(&mut el, || drop(half));
+    }
+
     /// A stale handle must not take the read side of the slot's new occupant.
     #[test]
     fn take_recv_refuses_a_stale_handle() {

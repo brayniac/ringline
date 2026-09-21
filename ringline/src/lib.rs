@@ -292,6 +292,9 @@ pub use runtime::io::SegConsumed;
 pub use runtime::io::SegmentReader;
 /// Future that completes when a send finishes.
 pub use runtime::io::SendFuture;
+/// The single-owner write side of a connection, from [`ConnCtx::split()`].
+#[cfg(has_io_uring)]
+pub use runtime::io::SendHalf;
 /// Non-raw sink descriptor for [`ConnCtx::forward_to()`] (segmented recv, Mode A).
 #[cfg(has_io_uring)]
 pub use runtime::io::SinkFd;

@@ -99,6 +99,43 @@ flag day:
 
 Step 1 is independently valuable and cheap. Steps 2–4 are the real fix.
 
+### Step 2, as actually landed
+
+Step 2 shipped in two parts, because the first half had a hole.
+
+`take_recv()` + `RecvHalf` landed first (#430). The adversarial review then
+found that `RecvHalf::conn()` returned a `Copy` `ConnCtx` carrying the **full
+recv surface** — so the "exclusive" read side could be reached around by the
+task that held it, and every migrated consumer in step 3 would have had to call
+`.conn()` for its sends, cementing the hole into all six client crates before
+anyone noticed.
+
+So `conn()` is gone and `ConnCtx::split() -> io::Result<(SendHalf, RecvHalf)>`
+replaces it. Two consequences worth recording, because both were arrived at by
+being wrong first:
+
+- **`SendHalf` does not borrow `RecvHalf`.** The obvious design — a send handle
+  borrowed from the read side — makes the write side unreachable for as long as
+  a reader is live. That is not an edge case: an echo sends from *inside* its
+  `with_data` closure, while the recv future holds the read half `&mut`. The
+  halves are therefore independent, and
+  `split_halves_echo_round_trip` in `tests/echo.rs` is the executable form of
+  that argument — it would not compile under a borrowing design.
+- **`SendHalf::as_conn()` is a deliberate remaining escape hatch**, not an
+  oversight. `forward_to_conn` takes a `&ConnCtx` sink, so without it a proxy
+  holding halves for its backend could not forward into that backend. It hands
+  back the full surface, so the model stays *advisory* until step 4 takes the
+  recv methods off `ConnCtx` — but it sits on the write side, where a consumer
+  reaches for it once (to name a sink) rather than on every send.
+
+`SendHalf` carries no claim flag of its own yet: `ConnCtx` is still `Copy` and
+can still send, so refusing a second sender would be enforcement the additive
+phase cannot deliver. Single-ownership of the write side is expressed by the
+type (not `Copy`, not `Clone`) and becomes enforced in step 4.
+
+`RecvHalf::end_segments()` was also added here: redis and memcache call
+`end_segments` on the handle they hold, so step 3 is blocked without it.
+
 ## Decided: channels only, no blessed `Rc<SendHalf>`
 
 Fan-out send has no surviving use case, and the two hardest many-to-one users
