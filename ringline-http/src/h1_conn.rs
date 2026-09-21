@@ -6,7 +6,7 @@
 use std::net::SocketAddr;
 
 use bytes::{Bytes, BytesMut};
-use ringline::{ConnCtx, ParseResult};
+use ringline::{ConnCtx, ParseResult, RecvHalf, SendHalf};
 
 use crate::error::HttpError;
 use crate::response::Response;
@@ -31,7 +31,8 @@ pub const DEFAULT_MAX_BODY_SIZE: usize = 16 * 1024 * 1024;
 
 /// An HTTP/1.1 connection wrapping a `ConnCtx`.
 pub struct H1Conn {
-    conn: ConnCtx,
+    tx: SendHalf,
+    rx: RecvHalf,
     host: String,
     /// Whether the peer asked us to close after this response (`Connection: close`
     /// or we're talking to an HTTP/1.0 server without `keep-alive`).
@@ -44,9 +45,11 @@ pub struct H1Conn {
 }
 
 impl H1Conn {
-    fn new(conn: ConnCtx, host: &str) -> Self {
-        Self {
-            conn,
+    fn new(conn: ConnCtx, host: &str) -> Result<Self, HttpError> {
+        let (tx, rx) = conn.split()?;
+        Ok(Self {
+            tx,
+            rx,
             host: host.to_string(),
             peer_will_close: false,
             max_header_section: DEFAULT_MAX_HEADER_SECTION,
@@ -54,19 +57,19 @@ impl H1Conn {
             max_trailer_section: DEFAULT_MAX_TRAILER_SECTION,
             max_body_size: DEFAULT_MAX_BODY_SIZE,
             max_decompressed_size: crate::compress::DEFAULT_MAX_DECOMPRESSED_SIZE,
-        }
+        })
     }
 
     /// Connect to an HTTP/1.1 server over TLS.
     pub async fn connect_tls(addr: SocketAddr, host: &str) -> Result<Self, HttpError> {
         let conn = ringline::connect_tls(addr, host)?.await?;
-        Ok(Self::new(conn, host))
+        Self::new(conn, host)
     }
 
     /// Connect to an HTTP/1.1 server over plaintext TCP.
     pub async fn connect_plain(addr: SocketAddr, host: &str) -> Result<Self, HttpError> {
         let conn = ringline::connect(addr)?.await?;
-        Ok(Self::new(conn, host))
+        Self::new(conn, host)
     }
 
     /// Override the cap on the response header section size (bytes from
@@ -109,14 +112,19 @@ impl H1Conn {
         self.peer_will_close
     }
 
-    /// Returns the underlying connection context.
-    pub fn conn(&self) -> ConnCtx {
-        self.conn
+    /// The connection's identity token, for pool bookkeeping.
+    pub fn token(&self) -> ringline::ConnToken {
+        self.tx.token()
     }
 
-    /// Returns the host name.
-    pub fn close(&self) {
-        self.conn.close();
+    /// Is the connection still usable?
+    pub fn is_alive(&self) -> bool {
+        self.tx.is_alive()
+    }
+
+    /// Close the connection.
+    pub fn close(&mut self) {
+        self.tx.close();
     }
 
     pub fn host(&self) -> &str {
@@ -156,7 +164,7 @@ impl H1Conn {
             while body_buf.len() < cl {
                 let target_len = cl;
                 let n = self
-                    .conn
+                    .rx
                     .with_data(|data| {
                         body_buf.extend_from_slice(data);
                         if body_buf.len() >= target_len {
@@ -203,7 +211,7 @@ impl H1Conn {
                     ChunkResult::NeedMore => {
                         // Read more data.
                         let n = self
-                            .conn
+                            .rx
                             .with_data(|data| {
                                 leftover.extend_from_slice(data);
                                 ParseResult::Consumed(data.len())
@@ -235,7 +243,7 @@ impl H1Conn {
                     )));
                 }
                 let n = self
-                    .conn
+                    .rx
                     .with_data(|data| {
                         body_buf.extend_from_slice(data);
                         ParseResult::Consumed(data.len())
@@ -306,7 +314,7 @@ impl H1Conn {
         };
 
         Ok(H1StreamingResponse {
-            conn: &mut self.conn,
+            rx: &mut self.rx,
             status: hdr.status,
             headers: hdr.headers,
             state,
@@ -379,7 +387,7 @@ impl H1Conn {
             req.extend_from_slice(b);
         }
 
-        self.conn.send_nowait(&req)?;
+        self.tx.send_nowait(&req)?;
 
         // Parse response headers. Cap the header section size to bound a
         // peer that dribbles bytes forever.
@@ -402,7 +410,7 @@ impl H1Conn {
 
         while !headers_done {
             let n = self
-                .conn
+                .rx
                 .with_data(|data| {
                     bytes_seen = data.len();
                     if bytes_seen > max_section {
@@ -517,7 +525,7 @@ enum H1StreamState {
 ///
 /// Body chunks are yielded one at a time via [`next_chunk()`](Self::next_chunk).
 pub struct H1StreamingResponse<'a> {
-    conn: &'a mut ConnCtx,
+    rx: &'a mut RecvHalf,
     status: u16,
     headers: Vec<(String, String)>,
     state: H1StreamState,
@@ -565,7 +573,7 @@ impl<'a> H1StreamingResponse<'a> {
                     let rem = *remaining;
                     let mut got = BytesMut::new();
                     let n = self
-                        .conn
+                        .rx
                         .with_data(|data| {
                             let take = data.len().min(rem);
                             got.extend_from_slice(&data[..take]);
@@ -604,7 +612,7 @@ impl<'a> H1StreamingResponse<'a> {
                         ChunkResult::NeedMore => {
                             // Read more data.
                             let n = self
-                                .conn
+                                .rx
                                 .with_data(|data| {
                                     leftover.extend_from_slice(data);
                                     ParseResult::Consumed(data.len())

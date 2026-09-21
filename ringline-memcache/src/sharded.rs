@@ -167,7 +167,7 @@ impl ShardedClient {
         let opts = self.connect_opts();
         let shard = &mut self.shards[index];
         let conn = get_conn(shard, &opts).await?;
-        Ok(Client::new(conn))
+        Client::new(conn)
     }
 
     // -- Core routing --------------------------------------------------------
@@ -215,7 +215,7 @@ impl ShardedClient {
                 conn.close();
                 continue;
             }
-            match Client::new(conn).read_response().await {
+            match Client::new(conn)?.read_response().await {
                 Ok(response) => {
                     shard.next = (idx + 1) % size;
                     check_error_bytes(&response)?;
@@ -532,7 +532,7 @@ async fn flush_all_on_shard(shard: &mut Shard, opts: &ConnectOpts) -> Result<(),
                 Err(_) => continue,
             },
         };
-        match Client::new(conn).flush_all().await {
+        match Client::new(conn)?.flush_all().await {
             Ok(()) => return Ok(()),
             Err(Error::ConnectionClosed) => {
                 shard.conns[idx] = ShardConn::Disconnected;
@@ -561,7 +561,7 @@ async fn version_on_shard(shard: &mut Shard, opts: &ConnectOpts) -> Result<Box<s
                 Err(_) => continue,
             },
         };
-        match Client::new(conn).version().await {
+        match Client::new(conn)?.version().await {
             Ok(v) => return Ok(v),
             Err(Error::ConnectionClosed) => {
                 shard.conns[idx] = ShardConn::Disconnected;

@@ -40,7 +40,7 @@ async fn connect_redis() -> Result<Client, String> {
         .map_err(|e| format!("submit: {e}"))?
         .await
         .map_err(|e| format!("connect: {e}"))?;
-    Ok(Client::new(conn))
+    Client::new(conn).map_err(|e| format!("split: {e}"))
 }
 
 /// Run a client-only test: launch a 1-worker ringline with `on_start`, wait

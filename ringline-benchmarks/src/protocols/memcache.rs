@@ -277,7 +277,10 @@ impl ringline::AsyncEventHandler for RinglineMemcacheBench {
                         },
                         Err(_) => return,
                     };
-                    let mut client = ringline_memcache::Client::new(conn);
+                    let mut client = match ringline_memcache::Client::new(conn) {
+                        Ok(c) => c,
+                        Err(_) => return,
+                    };
 
                     let key: &[u8] = b"k";
                     let mut local_ops: u64 = 0;

@@ -51,7 +51,7 @@ fn lrange_over_1024_elements_round_trips() {
                         .map_err(|e| format!("submit: {e}"))?
                         .await
                         .map_err(|e| format!("connect: {e:?}"))?;
-                    let mut client = Client::builder(conn).build();
+                    let mut client = Client::builder(conn).build().expect("split the connection");
                     let n = n_from_env();
 
                     client

@@ -121,7 +121,7 @@ impl AsyncEventHandler for BadRedisClientHandler {
                 }
             };
 
-            let mut client = Client::new(conn);
+            let mut client = Client::new(conn).expect("split the connection");
             // GET will send *2\r\n$3\r\nGET\r\n$4\r\ntest\r\n
             // and the server will respond with garbage RESP.
             match client.get(b"test").await {

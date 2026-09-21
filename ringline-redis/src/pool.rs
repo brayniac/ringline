@@ -24,7 +24,7 @@ use ringline::ConnCtx;
 
 #[cfg(has_io_uring)]
 use crate::ValueStream;
-use crate::{Client, Error, Pipeline};
+use crate::{Client, Error};
 
 /// Configuration for a connection pool.
 pub struct PoolConfig {
@@ -153,7 +153,7 @@ impl Pool {
     pub async fn client(&mut self) -> Result<Client, Error> {
         self.reconcile_stream_slot();
         let (_idx, conn) = self.checkout().await?;
-        Ok(Client::new(conn))
+        Client::new(conn)
     }
 
     /// Select the next healthy slot (round-robin, lazily reconnecting a
@@ -219,10 +219,24 @@ impl Pool {
     #[inline]
     fn reconcile_stream_slot(&mut self) {}
 
-    /// Get a [`Pipeline`] on the next healthy connection.
-    pub async fn pipeline(&mut self) -> Result<Pipeline, Error> {
-        let client = self.client().await?;
-        Ok(client.pipeline())
+    /// Get a [`Client`] on the next healthy connection, ready to pipeline.
+    ///
+    /// This used to return the [`Pipeline`](crate::Pipeline) directly, which is no longer
+    /// possible: a pipeline borrows its client's connection halves for its
+    /// lifetime, so it cannot outlive a client created inside this method.
+    /// Hold the client and call [`Client::pipeline`](crate::Client::pipeline) on it:
+    ///
+    /// ```ignore
+    /// let mut client = pool.client().await?;
+    /// let results = client.pipeline().get(b"a").get(b"b").execute().await?;
+    /// ```
+    ///
+    /// The borrow is the point, not an inconvenience: pipeline responses are
+    /// positional, so a command issued on the side mid-batch would consume one
+    /// of them and desync the rest.
+    #[deprecated(note = "call `Client::pipeline` on a client from `Pool::client`")]
+    pub async fn pipeline(&mut self) -> Result<Client, Error> {
+        self.client().await
     }
 
     /// Streaming GET on the next healthy pooled connection (io_uring only).
@@ -266,7 +280,7 @@ impl Pool {
         // its whole lifetime; record the slot so the next checkout can re-check
         // this connection's health and evict it if the stream poisoned it.
         self.stream_slot = Some(idx);
-        self.stream_client = Some(Client::new(conn));
+        self.stream_client = Some(Client::new(conn)?);
         let client = self.stream_client.as_mut().expect("just set");
         client.get_stream(key).await
     }
@@ -328,7 +342,7 @@ impl Pool {
             fut.await?
         };
 
-        Client::new(conn)
+        Client::new(conn)?
             .maybe_auth(self.password.as_deref(), self.username.as_deref())
             .await?;
 

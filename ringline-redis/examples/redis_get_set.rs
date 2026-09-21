@@ -41,7 +41,13 @@ impl AsyncEventHandler for RedisHandler {
                 }
             };
 
-            let mut client = ringline_redis::Client::new(conn);
+            let mut client = match ringline_redis::Client::new(conn) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("split failed: {e}");
+                    return;
+                }
+            };
 
             // SET a key.
             match client.set(b"ringline:hello", b"world").await {

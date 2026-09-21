@@ -40,7 +40,7 @@ async fn connect_memcache() -> Result<Client, String> {
         .map_err(|e| format!("submit: {e}"))?
         .await
         .map_err(|e| format!("connect: {e}"))?;
-    Ok(Client::new(conn))
+    Client::new(conn).map_err(|e| format!("split: {e}"))
 }
 
 macro_rules! run_memcache_test {

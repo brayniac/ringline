@@ -18,7 +18,7 @@
 //! use ringline_redis::Client;
 //!
 //! async fn example(conn: ConnCtx) -> Result<(), ringline_redis::Error> {
-//!     let mut client = Client::new(conn);
+//!     let mut client = Client::new(conn)?;
 //!     client.set("hello", "world").await?;
 //!     let val = client.get("hello").await?;
 //!     assert_eq!(val.as_deref(), Some(&b"world"[..]));
@@ -55,7 +55,7 @@
 //! use ringline_redis::{Client, CompletedOp};
 //!
 //! async fn pipelined_example(conn: ConnCtx) -> Result<(), ringline_redis::Error> {
-//!     let mut client = Client::new(conn);
+//!     let mut client = Client::new(conn)?;
 //!
 //!     // Fire multiple requests (synchronous, non-blocking)
 //!     client.fire_get(b"session:abc", 1)?;
@@ -141,7 +141,7 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use resp_proto::{Request, Value};
-use ringline::{ConnCtx, GuardBox, ParseResult, SendGuard};
+use ringline::{ConnCtx, GuardBox, ParseResult, RecvHalf, SendGuard, SendHalf};
 
 /// Maximum guards per scatter-gather send (matches ringline core limit).
 const MAX_FLUSH_GUARDS: usize = 8;
@@ -527,9 +527,31 @@ impl ClientBuilder {
     }
 
     /// Build the client.
-    pub fn build(self) -> Client {
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Client::new`]: the read side must be free.
+    pub fn build(self) -> Result<Client, Error> {
+        let (tx, rx) = self.conn.split()?;
+        Ok(self.finish(tx, rx))
+    }
+
+    /// `build` without the driver, for the in-memory unit tests.
+    ///
+    /// See [`ConnCtx::split_for_test`]: the halves are unclaimed and the
+    /// connection is dangling, so the result is only safe on the buffered
+    /// paths (encoders, write buffer, pending queue) that never reach the
+    /// wire — the same contract `ConnCtx::for_test` already carries.
+    #[cfg(test)]
+    pub(crate) fn build_for_test(self) -> Client {
+        let (tx, rx) = self.conn.split_for_test();
+        self.finish(tx, rx)
+    }
+
+    fn finish(self, tx: SendHalf, rx: RecvHalf) -> Client {
         Client {
-            conn: self.conn,
+            tx,
+            rx,
             on_result: self.on_result,
             pending: VecDeque::with_capacity(16),
             last_rx_bytes: Cell::new(0),
@@ -561,7 +583,8 @@ impl ClientBuilder {
 /// metrics. Use `Client::builder(conn)` to configure per-request callbacks,
 /// kernel timestamps, and built-in histogram tracking.
 pub struct Client {
-    conn: ConnCtx,
+    tx: SendHalf,
+    rx: RecvHalf,
     on_result: Option<ResultCallback>,
     pending: VecDeque<PendingOp>,
     last_rx_bytes: Cell<u32>,
@@ -598,14 +621,101 @@ pub struct Client {
     metrics: Option<ClientMetrics>,
 }
 
+/// Read one RESP value using only a connection's borrowed halves.
+///
+/// A free function rather than a `Client` method so [`Pipeline`] can use it
+/// while holding just the halves. The old code built a *temporary `Client`*
+/// to read pipeline responses — a second reader on a connection someone else
+/// was already reading, which is precisely what the split forbids.
+///
+/// Returns the value and the byte count, so the caller can update its own
+/// `last_rx_bytes` bookkeeping.
+pub(crate) async fn read_value_from(
+    rx: &mut RecvHalf,
+    tx: &mut SendHalf,
+) -> (Result<Value, Error>, usize) {
+    let mut result: Option<Result<Value, Error>> = None;
+    // resp-proto's `parse_bytes` defaults to a 1 MiB bulk-string cap
+    // (`DEFAULT_MAX_BULK_STRING_LEN`), which is far below what a real
+    // Redis server can return (Redis 7's `proto-max-bulk-len` defaults to
+    // 512 MiB). Hit the wall and the parser consumes the whole
+    // accumulator, forcing a connection close for a value the server
+    // happily produced. Use `usize::MAX` — the `RecvAccumulator`'s own
+    // cap is the genuine backstop (`recv_accumulator_max`, default 1 GiB,
+    // deliberately above `proto-max-bulk-len`'s 512 MiB default) — and
+    // let the server be the authority on what's too large. Replies whose
+    // total size exceeds that cap require raising it on the runtime
+    // config; the whole reply must be resident to parse.
+    // Also lift the collection caps well above resp-proto's 1024 defaults:
+    // a real server returns arrays far larger than that (a big `LRANGE`,
+    // `FT.SEARCH` with large `k`, an oversized `SCAN` batch), and hitting
+    // the cap surfaces as a protocol error that closes the connection.
+    // Unlike `max_bulk_string_len` (whose bytes must actually arrive, so the
+    // accumulator is the real backstop), array parsing pre-allocates
+    // `Vec::with_capacity(announced_len)`, so this stays a bounded ceiling
+    // rather than `usize::MAX` to keep a hostile length from OOMing.
+    const MAX_COLLECTION: usize = 1 << 20;
+    let options = resp_proto::ParseOptions::new()
+        .max_bulk_string_len(usize::MAX)
+        .max_collection_elements(MAX_COLLECTION)
+        .max_total_items(MAX_COLLECTION);
+    let n = rx
+        .with_bytes(|bytes| {
+            let len = bytes.len();
+            // Peek the bulk-string header before the parse takes
+            // ownership: RESP announces payload length up front, so an
+            // incomplete parse can tell the runtime exactly how much
+            // more is coming and the recv accumulator reserves once
+            // instead of doubling through a multi-MB value.
+            let hint = bulk_remainder_hint(&bytes);
+            match Value::parse_bytes_with_options(bytes, &options) {
+                Ok((value, consumed)) => {
+                    result = Some(Ok(value));
+                    ParseResult::Consumed(consumed)
+                }
+                Err(e) if e.is_incomplete() => match hint {
+                    Some(additional) => ParseResult::NeedAtLeast(additional),
+                    None => ParseResult::Consumed(0),
+                },
+                Err(e) => {
+                    result = Some(Err(Error::Protocol(e)));
+                    ParseResult::Consumed(len)
+                }
+            }
+        })
+        .await;
+    if n == 0 {
+        return (result.unwrap_or(Err(Error::ConnectionClosed)), n);
+    }
+    let value = result.unwrap();
+    // A protocol error means the RESP framing is irrecoverably
+    // misaligned (the failed parse consumed the whole accumulator,
+    // possibly swallowing the fronts of pipelined responses). Close the
+    // connection so it can't serve stale responses to later commands —
+    // matching the memcache and ping clients.
+    if matches!(value, Err(Error::Protocol(_))) {
+        tx.close();
+    }
+    (value, n)
+}
+
 impl Client {
     /// Create a new client wrapping an established connection.
     ///
     /// No callbacks, no metrics, no kernel timestamps — zero overhead.
     /// `max_batch_size` defaults to 1 (each `fire_*` sends immediately).
-    pub fn new(conn: ConnCtx) -> Self {
-        Self {
-            conn,
+    /// # Errors
+    ///
+    /// Takes exclusive ownership of the connection's read side via
+    /// [`ConnCtx::split`], so this fails with `EBUSY` if another client (or
+    /// any other reader) already holds it, and `EPIPE` if `conn` is stale.
+    /// Two clients driving one connection used to be silently allowed, and it
+    /// interleaved their reads; now it is refused.
+    pub fn new(conn: ConnCtx) -> Result<Self, Error> {
+        let (tx, rx) = conn.split()?;
+        Ok(Self {
+            tx,
+            rx,
             on_result: None,
             pending: VecDeque::new(),
             last_rx_bytes: Cell::new(0),
@@ -621,7 +731,7 @@ impl Client {
             use_kernel_ts: false,
             #[cfg(feature = "metrics")]
             metrics: None,
-        }
+        })
     }
 
     /// Create a builder for a client with per-request callbacks.
@@ -629,9 +739,19 @@ impl Client {
         ClientBuilder::new(conn)
     }
 
-    /// Returns the underlying connection context.
-    pub fn conn(&self) -> ConnCtx {
-        self.conn
+    /// Close the connection.
+    pub fn close(&mut self) {
+        self.tx.close();
+    }
+
+    /// The connection's identity token, for pool bookkeeping.
+    pub fn token(&self) -> ringline::ConnToken {
+        self.tx.token()
+    }
+
+    /// Is the connection still usable?
+    pub fn is_alive(&self) -> bool {
+        self.tx.is_alive()
     }
 
     /// Returns a reference to the built-in metrics, if enabled.
@@ -680,7 +800,7 @@ impl Client {
     #[inline]
     fn finish_timing(&self, send_ts: u64, start: Instant) -> u64 {
         if self.use_kernel_ts {
-            let recv_ts = self.conn.recv_timestamp();
+            let recv_ts = self.rx.recv_timestamp();
             if recv_ts > 0 && recv_ts > send_ts {
                 return recv_ts - send_ts;
             }
@@ -749,7 +869,7 @@ impl Client {
     #[inline]
     fn compute_ttfb(&self, send_ts: u64) -> Option<u64> {
         if self.use_kernel_ts {
-            let recv_ts = self.conn.recv_timestamp();
+            let recv_ts = self.rx.recv_timestamp();
             if recv_ts > 0 && recv_ts > send_ts {
                 return Some(recv_ts - send_ts);
             }
@@ -816,7 +936,7 @@ impl Client {
         // request that was never on the wire and then hang forever
         // awaiting a response that will never come.
         let send_outcome: Result<(), Error> = if self.write_guards.is_empty() {
-            self.conn
+            self.tx
                 .send_nowait(&self.write_buf)
                 .map(|_| ())
                 .map_err(Error::from)
@@ -834,7 +954,7 @@ impl Client {
             if pos < self.write_buf.len() {
                 parts.push(SendPart::Copy(&self.write_buf[pos..]));
             }
-            self.conn
+            self.tx
                 .send_parts()
                 .submit_batch(parts)
                 .map(|_| ())
@@ -883,7 +1003,7 @@ impl Client {
             self.encode_buf.clear();
             Self::encode_request_into(&req, &mut self.encode_buf);
             tx_bytes = self.encode_buf.len() as u32;
-            self.conn.send_nowait(&self.encode_buf)?;
+            self.tx.send_nowait(&self.encode_buf)?;
         } else {
             let before = self.write_buf.len();
             Self::encode_request_into(&req, &mut self.write_buf);
@@ -920,7 +1040,7 @@ impl Client {
             self.encode_buf.clear();
             Self::encode_set_request_into(&set_req, &mut self.encode_buf);
             tx_bytes = self.encode_buf.len() as u32;
-            self.conn.send_nowait(&self.encode_buf)?;
+            self.tx.send_nowait(&self.encode_buf)?;
         } else {
             let before = self.write_buf.len();
             Self::encode_set_request_into(&set_req, &mut self.write_buf);
@@ -1008,7 +1128,7 @@ impl Client {
             self.encode_buf.clear();
             Self::encode_set_request_into(&set_req, &mut self.encode_buf);
             tx_bytes = self.encode_buf.len() as u32;
-            self.conn.send_nowait(&self.encode_buf)?;
+            self.tx.send_nowait(&self.encode_buf)?;
         } else {
             let before = self.write_buf.len();
             Self::encode_set_request_into(&set_req, &mut self.write_buf);
@@ -1091,7 +1211,7 @@ impl Client {
             self.encode_buf.clear();
             Self::encode_request_into(&req, &mut self.encode_buf);
             tx_bytes = self.encode_buf.len() as u32;
-            self.conn.send_nowait(&self.encode_buf)?;
+            self.tx.send_nowait(&self.encode_buf)?;
         } else {
             let before = self.write_buf.len();
             Self::encode_request_into(&req, &mut self.write_buf);
@@ -1318,7 +1438,7 @@ impl Client {
 
         loop {
             let n = self
-                .conn
+                .rx
                 .with_segments(|chain| {
                     let mut consumed = 0usize;
                     'outer: for slice in chain.iter() {
@@ -1384,7 +1504,7 @@ impl Client {
             }
             if n == 0 {
                 // EOF before the reply completed (short FIN) — desynced.
-                let _ = self.conn.end_segments();
+                let _ = self.rx.end_segments();
                 return Err(Error::ConnectionClosed);
             }
         }
@@ -1392,7 +1512,7 @@ impl Client {
         // Restore the default read path (the next reply's leftover bytes were
         // already gathered into the accumulator by the last `with_segments`
         // settle, and are presented to the following read).
-        self.conn.end_segments()?;
+        self.rx.end_segments()?;
 
         // Metrics, mirroring `recv()`.
         let ttfb_ns = self.compute_ttfb(pending.send_ts);
@@ -1426,7 +1546,7 @@ impl Client {
         // arm, so the wire stays aligned and the connection stays valid — surface
         // it as the inner `outcome` `Err`, not the outer one.
         if let Err(Error::UnexpectedResponse) = &outcome {
-            self.conn.close();
+            self.tx.close();
             self.pending.clear();
             self.flushed_count = 0;
             return Err(Error::UnexpectedResponse);
@@ -1467,7 +1587,7 @@ impl Client {
 
         loop {
             let n = self
-                .conn
+                .rx
                 .with_bytes(|bytes| {
                     let mut consumed = 0usize;
                     let mut pos = 0usize;
@@ -1566,7 +1686,7 @@ impl Client {
         // server error (`-...`) consumed its whole line → wire aligned, surfaced
         // as the inner `outcome` Err.
         if let Err(Error::UnexpectedResponse) = &outcome {
-            self.conn.close();
+            self.tx.close();
             self.pending.clear();
             self.flushed_count = 0;
             return Err(Error::UnexpectedResponse);
@@ -1698,83 +1818,21 @@ impl Client {
     /// Uses zero-copy parsing via `with_bytes` + `Value::parse_bytes_with_options`:
     /// bulk string values are `Bytes::slice()` references into the
     /// accumulator's buffer rather than freshly allocated `Vec<u8>`.
-    pub(crate) async fn read_value(&self) -> Result<Value, Error> {
-        let mut result: Option<Result<Value, Error>> = None;
-        // resp-proto's `parse_bytes` defaults to a 1 MiB bulk-string cap
-        // (`DEFAULT_MAX_BULK_STRING_LEN`), which is far below what a real
-        // Redis server can return (Redis 7's `proto-max-bulk-len` defaults to
-        // 512 MiB). Hit the wall and the parser consumes the whole
-        // accumulator, forcing a connection close for a value the server
-        // happily produced. Use `usize::MAX` — the `RecvAccumulator`'s own
-        // cap is the genuine backstop (`recv_accumulator_max`, default 1 GiB,
-        // deliberately above `proto-max-bulk-len`'s 512 MiB default) — and
-        // let the server be the authority on what's too large. Replies whose
-        // total size exceeds that cap require raising it on the runtime
-        // config; the whole reply must be resident to parse.
-        // Also lift the collection caps well above resp-proto's 1024 defaults:
-        // a real server returns arrays far larger than that (a big `LRANGE`,
-        // `FT.SEARCH` with large `k`, an oversized `SCAN` batch), and hitting
-        // the cap surfaces as a protocol error that closes the connection.
-        // Unlike `max_bulk_string_len` (whose bytes must actually arrive, so the
-        // accumulator is the real backstop), array parsing pre-allocates
-        // `Vec::with_capacity(announced_len)`, so this stays a bounded ceiling
-        // rather than `usize::MAX` to keep a hostile length from OOMing.
-        const MAX_COLLECTION: usize = 1 << 20;
-        let options = resp_proto::ParseOptions::new()
-            .max_bulk_string_len(usize::MAX)
-            .max_collection_elements(MAX_COLLECTION)
-            .max_total_items(MAX_COLLECTION);
-        let n = self
-            .conn
-            .with_bytes(|bytes| {
-                let len = bytes.len();
-                // Peek the bulk-string header before the parse takes
-                // ownership: RESP announces payload length up front, so an
-                // incomplete parse can tell the runtime exactly how much
-                // more is coming and the recv accumulator reserves once
-                // instead of doubling through a multi-MB value.
-                let hint = bulk_remainder_hint(&bytes);
-                match Value::parse_bytes_with_options(bytes, &options) {
-                    Ok((value, consumed)) => {
-                        result = Some(Ok(value));
-                        ParseResult::Consumed(consumed)
-                    }
-                    Err(e) if e.is_incomplete() => match hint {
-                        Some(additional) => ParseResult::NeedAtLeast(additional),
-                        None => ParseResult::Consumed(0),
-                    },
-                    Err(e) => {
-                        result = Some(Err(Error::Protocol(e)));
-                        ParseResult::Consumed(len)
-                    }
-                }
-            })
-            .await;
+    pub(crate) async fn read_value(&mut self) -> Result<Value, Error> {
+        let (value, n) = read_value_from(&mut self.rx, &mut self.tx).await;
         self.last_rx_bytes.set(n as u32);
-        if n == 0 {
-            return result.unwrap_or(Err(Error::ConnectionClosed));
-        }
-        let value = result.unwrap();
-        // A protocol error means the RESP framing is irrecoverably
-        // misaligned (the failed parse consumed the whole accumulator,
-        // possibly swallowing the fronts of pipelined responses). Close the
-        // connection so it can't serve stale responses to later commands —
-        // matching the memcache and ping clients.
-        if matches!(value, Err(Error::Protocol(_))) {
-            self.conn.close();
-        }
         value
     }
 
     /// Send a SET command via scatter-gather (prefix + value + suffix as
     /// separate iovecs) and read the response.
     async fn execute_set(
-        &self,
+        &mut self,
         set_req: &resp_proto::SetRequest<'_>,
         value: &[u8],
     ) -> Result<Value, Error> {
         let (prefix, suffix) = set_req.encode_parts();
-        self.conn
+        self.tx
             .send_parts()
             .build(|b| b.copy(&prefix).copy(value).copy(&suffix).submit())?;
         let resp = self.read_value().await?;
@@ -1786,8 +1844,24 @@ impl Client {
 
     /// Send an encoded command and read the response, converting Redis
     /// error responses into `Error::Redis`.
-    async fn execute(&self, encoded: &[u8]) -> Result<Value, Error> {
-        self.conn.send(encoded)?;
+    /// Like [`Client::execute`], but sends the reusable `encode_buf` in place.
+    ///
+    /// `self.execute(&self.encode_buf)` no longer type-checks: reading needs
+    /// `&mut self`, so passing a borrow of one of `self`'s own fields holds an
+    /// immutable borrow of all of `self` across the call. Borrowing `tx` and
+    /// `encode_buf` as separate fields inside the method is disjoint, so the
+    /// scratch buffer keeps being reused — no copy, no per-op allocation.
+    async fn execute_encoded(&mut self) -> Result<Value, Error> {
+        self.tx.send(&self.encode_buf)?;
+        let value = self.read_value().await?;
+        if let Value::Error(ref msg) = value {
+            return Err(Error::Redis(String::from_utf8_lossy(msg).into_owned()));
+        }
+        Ok(value)
+    }
+
+    async fn execute(&mut self, encoded: &[u8]) -> Result<Value, Error> {
+        self.tx.send(encoded)?;
         let value = self.read_value().await?;
         if let Value::Error(ref msg) = value {
             return Err(Error::Redis(String::from_utf8_lossy(msg).into_owned()));
@@ -1796,7 +1870,7 @@ impl Client {
     }
 
     /// Execute a command and expect a SimpleString response (e.g. +OK).
-    async fn execute_ok(&self, encoded: &[u8]) -> Result<(), Error> {
+    async fn execute_ok(&mut self, encoded: &[u8]) -> Result<(), Error> {
         let value = self.execute(encoded).await?;
         match value {
             Value::SimpleString(_) => Ok(()),
@@ -1805,7 +1879,26 @@ impl Client {
     }
 
     /// Execute a command and expect an Integer response.
-    async fn execute_int(&self, encoded: &[u8]) -> Result<i64, Error> {
+    /// [`execute_int`](Self::execute_int) over the reusable `encode_buf`.
+    /// See [`execute_encoded`](Self::execute_encoded) for why this exists.
+    async fn execute_int_encoded(&mut self) -> Result<i64, Error> {
+        match self.execute_encoded().await? {
+            Value::Integer(n) => Ok(n),
+            _ => Err(Error::UnexpectedResponse),
+        }
+    }
+
+    /// [`execute_bulk`](Self::execute_bulk) over the reusable `encode_buf`.
+    /// See [`execute_encoded`](Self::execute_encoded) for why this exists.
+    async fn execute_bulk_encoded(&mut self) -> Result<Option<Bytes>, Error> {
+        match self.execute_encoded().await? {
+            Value::BulkString(data) => Ok(Some(data)),
+            Value::Null => Ok(None),
+            _ => Err(Error::UnexpectedResponse),
+        }
+    }
+
+    async fn execute_int(&mut self, encoded: &[u8]) -> Result<i64, Error> {
         let value = self.execute(encoded).await?;
         match value {
             Value::Integer(n) => Ok(n),
@@ -1814,7 +1907,7 @@ impl Client {
     }
 
     /// Execute a command and expect a BulkString or Null response.
-    async fn execute_bulk(&self, encoded: &[u8]) -> Result<Option<Bytes>, Error> {
+    async fn execute_bulk(&mut self, encoded: &[u8]) -> Result<Option<Bytes>, Error> {
         let value = self.execute(encoded).await?;
         match value {
             Value::BulkString(data) => Ok(Some(data)),
@@ -1865,12 +1958,12 @@ impl Client {
         self.encode_buf.clear();
         Self::encode_request_into(&Request::get(key), &mut self.encode_buf);
         if !self.is_instrumented() {
-            return self.execute_bulk(&self.encode_buf).await;
+            return self.execute_bulk_encoded().await;
         }
         let tx_bytes = self.encode_buf.len() as u32;
         let send_ts = self.send_timestamp();
         let start = Instant::now();
-        let result = self.execute_bulk(&self.encode_buf).await;
+        let result = self.execute_bulk_encoded().await;
         let latency_ns = self.finish_timing(send_ts, start);
         let rx_bytes = self.last_rx_bytes.get();
         let (success, hit) = match &result {
@@ -2013,12 +2106,12 @@ impl Client {
         self.encode_buf.clear();
         Self::encode_request_into(&Request::del(key), &mut self.encode_buf);
         if !self.is_instrumented() {
-            return self.execute_int(&self.encode_buf).await.map(|n| n as u64);
+            return self.execute_int_encoded().await.map(|n| n as u64);
         }
         let tx_bytes = self.encode_buf.len() as u32;
         let send_ts = self.send_timestamp();
         let start = Instant::now();
-        let result = self.execute_int(&self.encode_buf).await.map(|n| n as u64);
+        let result = self.execute_int_encoded().await.map(|n| n as u64);
         let latency_ns = self.finish_timing(send_ts, start);
         let rx_bytes = self.last_rx_bytes.get();
         self.record(&CommandResult {
@@ -2659,7 +2752,7 @@ impl Client {
         self.encode_buf.clear();
         Self::encode_request_into(&Request::ping(), &mut self.encode_buf);
         if !self.is_instrumented() {
-            let value = self.execute(&self.encode_buf).await?;
+            let value = self.execute_encoded().await?;
             return match value {
                 Value::SimpleString(_) => Ok(()),
                 _ => Err(Error::UnexpectedResponse),
@@ -2668,7 +2761,7 @@ impl Client {
         let tx_bytes = self.encode_buf.len() as u32;
         let send_ts = self.send_timestamp();
         let start = Instant::now();
-        let result = self.execute(&self.encode_buf).await;
+        let result = self.execute_encoded().await;
         let latency_ns = self.finish_timing(send_ts, start);
         let rx_bytes = self.last_rx_bytes.get();
         let success = result.is_ok();
@@ -2757,8 +2850,13 @@ impl Client {
     // ── Pipeline ────────────────────────────────────────────────────────
 
     /// Create a pipeline for batched command execution.
-    pub fn pipeline(&self) -> Pipeline {
-        Pipeline::new(self.conn)
+    ///
+    /// The pipeline borrows the client's halves for its lifetime, so the
+    /// client cannot be used concurrently with it. That is deliberate:
+    /// pipeline responses are positional, and a command issued on the side
+    /// would consume one of them and desync the batch.
+    pub fn pipeline(&mut self) -> Pipeline<'_> {
+        Pipeline::new(&mut self.tx, &mut self.rx)
     }
 
     // ── Zero-copy SET ───────────────────────────────────────────────────
@@ -2775,7 +2873,7 @@ impl Client {
             self.encode_buf.clear();
             append_set_guard_prefix(&mut self.encode_buf, key, value_len as usize);
             let prefix: &[u8] = &self.encode_buf;
-            self.conn.send_parts().build(move |b| {
+            self.tx.send_parts().build(move |b| {
                 b.copy(prefix)
                     .guard(GuardBox::new(guard))
                     .copy(b"\r\n")
@@ -2797,7 +2895,7 @@ impl Client {
         let send_ts = self.send_timestamp();
         let start = Instant::now();
         let prefix: &[u8] = &self.encode_buf;
-        self.conn.send_parts().build(move |b| {
+        self.tx.send_parts().build(move |b| {
             b.copy(prefix)
                 .guard(GuardBox::new(guard))
                 .copy(b"\r\n")
@@ -2840,7 +2938,7 @@ impl Client {
             let split = self.encode_buf.len();
             append_set_guard_suffix_ex(&mut self.encode_buf, ttl_secs);
             let (prefix, suffix) = self.encode_buf.split_at(split);
-            self.conn.send_parts().build(move |b| {
+            self.tx.send_parts().build(move |b| {
                 b.copy(prefix)
                     .guard(GuardBox::new(guard))
                     .copy(suffix)
@@ -2864,7 +2962,7 @@ impl Client {
         let send_ts = self.send_timestamp();
         let start = Instant::now();
         let (prefix, suffix) = self.encode_buf.split_at(split);
-        self.conn.send_parts().build(move |b| {
+        self.tx.send_parts().build(move |b| {
             b.copy(prefix)
                 .guard(GuardBox::new(guard))
                 .copy(suffix)
@@ -2975,7 +3073,7 @@ impl Client {
             Ok(Value::Error(msg)) => Err(Error::Redis(String::from_utf8_lossy(&msg).into_owned())),
             Ok(_) => Err(Error::UnexpectedResponse),
             Err(e) => {
-                self.conn.close();
+                self.tx.close();
                 Err(e)
             }
         }
@@ -2995,7 +3093,7 @@ impl Client {
         // `*3\r\n$3\r\nSET\r\n$<klen>\r\n<key>\r\n$<len>\r\n`.
         self.encode_buf.clear();
         append_set_guard_prefix(&mut self.encode_buf, key, len);
-        self.conn.send_nowait(&self.encode_buf)?;
+        self.tx.send_nowait(&self.encode_buf)?;
 
         // Stream the value body, enforcing the length contract.
         let mut sent = 0usize;
@@ -3011,7 +3109,7 @@ impl Client {
             // `send` copies into the pool synchronously and returns a future that
             // resolves when the bytes reach the socket — awaiting bounds in-flight
             // sends to one, so a large value can't exhaust the send pool.
-            self.conn.send(&chunk)?.await?;
+            self.tx.send(&chunk)?.await?;
         }
         if sent != len {
             // Under-produce: header declared `len`, source gave fewer → desync.
@@ -3019,7 +3117,7 @@ impl Client {
         }
 
         // Trailing `\r\n`, then the `+OK` reply.
-        self.conn.send_nowait(b"\r\n")?;
+        self.tx.send_nowait(b"\r\n")?;
         self.read_value().await
     }
 }
@@ -3082,7 +3180,7 @@ impl Client {
         // the default path first.
         self.encode_buf.clear();
         Self::encode_request_into(&Request::get(key), &mut self.encode_buf);
-        self.conn.send_nowait(&self.encode_buf)?;
+        self.tx.send_nowait(&self.encode_buf)?;
 
         // Read the tiny `$<len>\r\n` (or `$-1\r\n`) bulk-string header. It always
         // fits in the first received buffer; the rare split-across-buffers case is
@@ -3095,11 +3193,11 @@ impl Client {
         // read cursor is a single monotonic position across header + body.
         let mut acc: Option<Vec<u8>> = None;
         loop {
-            let seg = match self.conn.recv_owned_segment()?.await {
+            let seg = match self.rx.recv_owned_segment()?.await {
                 Ok(Some(b)) => b,
                 Ok(None) => {
                     // Peer closed before any header arrived.
-                    let _ = self.conn.end_segments();
+                    let _ = self.rx.end_segments();
                     return Err(Error::ConnectionClosed);
                 }
                 Err(e) => {
@@ -3107,7 +3205,7 @@ impl Client {
                     // connection is still in the segmented domain. Poison it
                     // (close) so it is not reused stuck in that domain / desynced,
                     // rather than leaking the error while leaving the domain set.
-                    self.conn.close();
+                    self.tx.close();
                     return Err(e.into());
                 }
             };
@@ -3122,7 +3220,7 @@ impl Client {
                 Ok(Some(GetHeader::Nil)) => {
                     // Missing key. `$-1\r\n` carries no value/trailing; restore
                     // the default read path so the next command works.
-                    self.conn.end_segments()?;
+                    self.rx.end_segments()?;
                     return Ok(None);
                 }
                 Ok(Some(GetHeader::Bulk { len, header_len })) => {
@@ -3137,7 +3235,7 @@ impl Client {
                     // Server error reply (e.g. `-WRONGTYPE`) or malformed header.
                     // In sequential use the whole reply line is in `combined`;
                     // restore the read path and surface the error.
-                    let _ = self.conn.end_segments();
+                    let _ = self.rx.end_segments();
                     return Err(e);
                 }
             }
@@ -3271,7 +3369,7 @@ impl<'a> ValueStream<'a> {
     /// error (never a truncated value), per the design's bounded-`len` contract.
     async fn refill(&mut self) -> Result<(), Error> {
         loop {
-            match self.client.conn.recv_owned_segment()?.await {
+            match self.client.rx.recv_owned_segment()?.await {
                 Ok(Some(b)) if !b.is_empty() => {
                     self.buf = b;
                     return Ok(());
@@ -3365,7 +3463,7 @@ impl<'a> ValueStream<'a> {
         // Restore the default read path. Any bytes still in `self.buf` past the
         // trailing CRLF would belong to a *following* reply — none exist in the
         // documented sequential use; they are dropped rather than reinjected.
-        self.client.conn.end_segments()?;
+        self.client.rx.end_segments()?;
         self.finished = true;
         Ok(())
     }
@@ -3380,7 +3478,7 @@ impl Drop for ValueStream<'_> {
             // synchronously here, so poison the connection. `close()` bumps the
             // slot generation, making the client's stored handle stale so the
             // next operation fails.
-            self.client.conn.close();
+            self.client.tx.close();
         }
     }
 }
@@ -3457,7 +3555,7 @@ fn append_set_guard_suffix_ex(buf: &mut Vec<u8>, ttl_secs: u64) {
 /// # use ringline::ConnCtx;
 /// # use ringline_redis::Client;
 /// # async fn example(conn: ConnCtx) -> Result<(), ringline_redis::Error> {
-/// let mut client = Client::new(conn);
+/// let mut client = Client::new(conn)?;
 /// let results = client.pipeline()
 ///     .set(b"k1", b"v1")
 ///     .set(b"k2", b"v2")
@@ -3467,16 +3565,18 @@ fn append_set_guard_suffix_ex(buf: &mut Vec<u8>, ttl_secs: u64) {
 /// # Ok(())
 /// # }
 /// ```
-pub struct Pipeline {
-    conn: ConnCtx,
+pub struct Pipeline<'a> {
+    tx: &'a mut SendHalf,
+    rx: &'a mut RecvHalf,
     buf: Vec<u8>,
     count: usize,
 }
 
-impl Pipeline {
-    fn new(conn: ConnCtx) -> Self {
+impl<'a> Pipeline<'a> {
+    fn new(tx: &'a mut SendHalf, rx: &'a mut RecvHalf) -> Self {
         Self {
-            conn,
+            tx,
+            rx,
             buf: Vec::new(),
             count: 0,
         }
@@ -3529,16 +3629,14 @@ impl Pipeline {
         if self.count == 0 {
             return Ok(Vec::new());
         }
-        self.conn.send(&self.buf)?;
+        self.tx.send(&self.buf)?;
 
-        // Use a temporary Client to read values.
-        let client = Client::new(self.conn);
         let mut results = Vec::with_capacity(self.count);
         for _ in 0..self.count {
-            let value = match client.read_value().await {
+            let value = match read_value_from(self.rx, self.tx).await.0 {
                 Ok(v) => v,
                 Err(e) => {
-                    self.conn.close();
+                    self.tx.close();
                     return Err(e);
                 }
             };
@@ -3551,9 +3649,9 @@ impl Pipeline {
                 // behaviour and is correct for pipelined Redis.)
                 let err = Error::Redis(String::from_utf8_lossy(msg).into_owned());
                 for _ in (results.len() + 1)..self.count {
-                    if client.read_value().await.is_err() {
+                    if read_value_from(self.rx, self.tx).await.0.is_err() {
                         // *Now* the stream is broken — close.
-                        self.conn.close();
+                        self.tx.close();
                         return Err(err);
                     }
                 }
@@ -3826,7 +3924,7 @@ mod zc_threshold_tests {
         let conn = ConnCtx::for_test(0, 0);
         let mut client = Client::builder(conn).max_batch_size(max_batch_size);
         client = client.zc_threshold(zc_threshold);
-        client.build()
+        client.build_for_test()
     }
 
     #[test]
