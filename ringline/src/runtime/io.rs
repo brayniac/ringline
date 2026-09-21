@@ -928,13 +928,44 @@ impl ConnCtx {
     /// already out, `EPIPE` if this handle is stale.
     pub fn split(&self) -> io::Result<(SendHalf, RecvHalf)> {
         let rx = self.take_recv()?;
-        Ok((
-            SendHalf {
-                conn: *self,
-                _not_send: PhantomData,
-            },
-            rx,
-        ))
+        // If the write side is already out, the read claim must not be left
+        // stuck: `rx` drops on the `?` and its `Drop` releases it.
+        let tx = self.take_send()?;
+        Ok((tx, rx))
+    }
+
+    /// Take the connection's **write side**, exclusively.
+    ///
+    /// The twin of [`take_recv`](Self::take_recv). One owner of the writes is
+    /// now a claim rather than a convention: several producers feeding one
+    /// connection is an explicit queue drained by the owning task.
+    ///
+    /// It is also what lets a forward refuse a sink somebody else is already
+    /// writing to. A forward submits its own SQE straight to the ring instead
+    /// of going through the per-connection send queue, so a concurrent send to
+    /// that socket interleaves with it — and io_uring does not order
+    /// independent SQEs (Domain Invariant 2).
+    ///
+    /// # Errors
+    ///
+    /// `EBUSY` if the write side is already out, `EPIPE` if this handle is
+    /// stale.
+    pub fn take_send(&self) -> io::Result<SendHalf> {
+        with_state(|driver, _executor| {
+            if driver.connections.generation(self.conn_index) != self.generation {
+                return Err(io::Error::from_raw_os_error(libc::EPIPE));
+            }
+            let idx = self.conn_index as usize;
+            if driver.send_half_taken[idx] {
+                return Err(io::Error::from_raw_os_error(libc::EBUSY));
+            }
+            driver.send_half_taken[idx] = true;
+            Ok(())
+        })?;
+        Ok(SendHalf {
+            conn: *self,
+            _not_send: PhantomData,
+        })
     }
 
     /// [`split`](Self::split) without the driver.
@@ -1365,10 +1396,16 @@ impl ConnCtx {
     ///
     /// Every check happens **before** any state is touched, so a refusal
     /// leaves an in-progress forward and the recv domain exactly as they were.
+    /// `sink_owned` says the caller presented the sink's [`SendHalf`] by
+    /// mutable borrow, which *is* the permission to write to it and, for as
+    /// long as the forward future lives, the proof nobody else can. When the
+    /// sink is named by a bare `ConnCtx` instead, there is no such proof, so
+    /// the claim is checked below.
     fn arm_forward_source(
         &self,
         target: crate::backend::uring::driver::SinkTarget,
         len: u64,
+        sink_owned: bool,
     ) -> Result<u32, i32> {
         with_state(|driver, _executor| {
             let idx = self.conn_index as usize;
@@ -1398,6 +1435,15 @@ impl ConnCtx {
                     Some(libc::EPIPE)
                 } else if driver.tls_table.as_ref().is_some_and(|t| t.has(index)) {
                     Some(libc::EPROTOTYPE)
+                } else if !sink_owned && driver.send_half_taken[index as usize] {
+                    // Somebody else owns this sink's writes. A forward submits
+                    // its own SQE straight to the ring rather than going
+                    // through the sink's send queue, so their sends and these
+                    // writes would interleave on one socket — and io_uring
+                    // does not order independent SQEs (Domain Invariant 2).
+                    // This is the "forward *or* send, not both" rule, enforced
+                    // for the first time.
+                    Some(libc::EBUSY)
                 } else {
                     None
                 };
@@ -1553,7 +1599,8 @@ impl ConnCtx {
             fd: sink.fd,
             is_file: sink.is_file,
         };
-        let armed = self.arm_forward_source(target, len as u64);
+        // An fd sink is not a connection, so it carries no send claim to check.
+        let armed = self.arm_forward_source(target, len as u64, true);
         ForwardToFuture {
             conn_index: self.conn_index,
             generation: self.generation,
@@ -1862,7 +1909,7 @@ impl ConnCtx {
             index: sink.conn_index,
             generation: sink.generation,
         };
-        let armed = self.arm_forward_source(target, len as u64);
+        let armed = self.arm_forward_source(target, len as u64, false);
         ForwardToFuture {
             conn_index: self.conn_index,
             generation: self.generation,
@@ -3305,17 +3352,44 @@ impl RecvHalf {
         self.conn.forward_to(sink, len)
     }
 
-    /// See [`ConnCtx::forward_to_conn`].
+    /// Forward the next `len` received bytes into another connection.
+    ///
+    /// The sink is its [`SendHalf`], borrowed mutably for as long as the
+    /// forward runs. That borrow is the point: a forward submits its own SQE
+    /// straight to the ring rather than through the sink's send queue, so a
+    /// concurrent `send` to the same socket would interleave with it — and
+    /// io_uring does not order independent SQEs (Domain Invariant 2). Holding
+    /// the half is both the permission to write and the proof that nobody else
+    /// is; the borrow checker now says so instead of a comment.
     #[cfg(has_io_uring)]
     pub fn forward_to_conn<'h, 's: 'h>(
         &'h mut self,
-        sink: &'s ConnCtx,
+        sink: &'s mut SendHalf,
         len: usize,
     ) -> ForwardToFuture<'h> {
-        self.conn.forward_to_conn(sink, len)
+        let target = crate::backend::uring::driver::SinkTarget::Conn {
+            index: sink.conn.conn_index,
+            generation: sink.conn.generation,
+        };
+        let armed = self.conn.arm_forward_source(target, len as u64, true);
+        ForwardToFuture {
+            conn_index: self.conn.conn_index,
+            generation: self.conn.generation,
+            epoch: armed.unwrap_or(0),
+            refused: armed.err(),
+            _borrow: PhantomData,
+        }
     }
 
-    /// See [`ConnCtx::forward_to_conn`].
+    /// Forward the next `len` received bytes into another connection.
+    ///
+    /// The sink is its [`SendHalf`], borrowed mutably for as long as the
+    /// forward runs. That borrow is the point: a forward submits its own SQE
+    /// straight to the ring rather than through the sink's send queue, so a
+    /// concurrent `send` to the same socket would interleave with it — and
+    /// io_uring does not order independent SQEs (Domain Invariant 2). Holding
+    /// the half is both the permission to write and the proof that nobody else
+    /// is; the borrow checker now says so instead of a comment.
     ///
     /// The two backends return different futures (io_uring forwards from the
     /// held provided buffers; mio pumps through the accumulator), so this is
@@ -3323,10 +3397,10 @@ impl RecvHalf {
     #[cfg(not(has_io_uring))]
     pub fn forward_to_conn<'h, 's: 'h>(
         &'h mut self,
-        sink: &'s ConnCtx,
+        sink: &'s mut SendHalf,
         len: usize,
     ) -> ForwardToConnFuture<'s> {
-        self.conn.forward_to_conn(sink, len)
+        self.conn.forward_to_conn(&sink.conn, len)
     }
 }
 
@@ -3472,7 +3546,7 @@ impl Connection {
     #[cfg(has_io_uring)]
     pub fn forward_to_conn<'h, 's: 'h>(
         &'h mut self,
-        sink: &'s ConnCtx,
+        sink: &'s mut SendHalf,
         len: usize,
     ) -> ForwardToFuture<'h> {
         self.rx.forward_to_conn(sink, len)
@@ -3482,7 +3556,7 @@ impl Connection {
     #[cfg(not(has_io_uring))]
     pub fn forward_to_conn<'h, 's: 'h>(
         &'h mut self,
-        sink: &'s ConnCtx,
+        sink: &'s mut SendHalf,
         len: usize,
     ) -> ForwardToConnFuture<'s> {
         self.rx.forward_to_conn(sink, len)
@@ -3800,6 +3874,28 @@ impl SendHalf {
     }
 }
 
+impl Drop for SendHalf {
+    /// Release the write claim, **if it is still ours**.
+    ///
+    /// Generation-gated for the same reason as [`RecvHalf`]'s: the claim is per
+    /// *slot*, and a half can outlive its connection inside a standalone task,
+    /// so clearing unconditionally would steal the claim of whoever owns the
+    /// slot now.
+    fn drop(&mut self) {
+        let _ = try_with_state(|driver, _executor| {
+            if driver.connections.generation(self.conn.conn_index) != self.conn.generation {
+                return;
+            }
+            if let Some(taken) = driver
+                .send_half_taken
+                .get_mut(self.conn.conn_index as usize)
+            {
+                *taken = false;
+            }
+        });
+    }
+}
+
 impl Drop for RecvHalf {
     /// Release the claim, **if it is still ours**.
     ///
@@ -3809,7 +3905,7 @@ impl Drop for RecvHalf {
     /// occupant has taken its own half, clearing unconditionally would steal
     /// that claim and permit a second `RecvHalf` on a live connection.
     ///
-    /// `Driver::clear_recv_claims` at the recycle point is what guarantees a
+    /// `Driver::clear_conn_claims` at the recycle point is what guarantees a
     /// fresh slot starts clean; this only releases a claim of our own
     /// generation.
     fn drop(&mut self) {

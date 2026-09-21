@@ -3474,7 +3474,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // `SegmentReader`, whose `Drop` is a no-op here (unguarded teardown).
         // Clear their claims before the slot is reused, or the next occupant
         // inherits them.
-        self.driver.clear_recv_claims(conn_index);
+        self.driver.clear_conn_claims(conn_index);
         self.driver.connections.release(conn_index);
     }
 
@@ -4130,6 +4130,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // the claim here, since `Connection::for_accept` cannot reach the
         // driver from outside a task poll.
         self.driver.recv_half_taken[conn_index as usize] = true;
+        self.driver.send_half_taken[conn_index as usize] = true;
         let conn = crate::Connection::for_accept(conn_ctx);
         // SAFETY: `AssertUnwindSafe` is required because `self.handler` is
         // not `UnwindSafe`. A panic here is treated like a fatal handler
@@ -7990,22 +7991,82 @@ mod tests {
             Ok(_) => panic!("the read side was handed out twice"),
         }
 
-        // Dropping only the send half must NOT release the read claim: the
-        // reader is still live and still exclusive. `SendHalf` has no `Drop`
-        // today, so this holds trivially — but `clear_recv_claims` clears
-        // *both* flags, so the day the write side grows a claim of its own and
-        // reaches for that helper, this is what catches it.
-        {
-            let _tx = tx;
-        }
+        // Dropping only the send half releases the *write* claim and leaves
+        // the read claim alone — the reader is still live and still exclusive.
+        //
+        // The drop happens inside `with_driver_state` on purpose: both halves'
+        // `Drop` go through `try_with_state`, so a half dropped with no driver
+        // in scope cannot release anything. In production that is covered by
+        // `clear_conn_claims` at the slot's recycle point; in a unit test there
+        // is no recycle, so dropping outside the driver would strand the claim
+        // and the re-split below would fail with `EBUSY`. It did, before this
+        // was fixed.
+        with_driver_state(&mut el, || drop(tx));
         assert!(
             el.driver.recv_half_taken[conn_index as usize],
             "dropping the send half must not release the read claim"
+        );
+        assert!(
+            !el.driver.send_half_taken[conn_index as usize],
+            "dropping the send half releases the write claim"
         );
 
         with_driver_state(&mut el, || drop(rx));
         assert!(!el.driver.recv_half_taken[conn_index as usize]);
         let _again = with_driver_state(&mut el, || conn.split()).expect("splittable again");
+    }
+
+    /// Taking the write side twice is refused, and dropping it hands it back.
+    #[test]
+    fn take_send_is_exclusive_and_released_on_drop() {
+        let mut el = make_test_loop_with_config(config_with_reserve(16));
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let conn = ConnCtx::new(conn_index, generation);
+
+        let tx = with_driver_state(&mut el, || conn.take_send()).expect("first take_send");
+        assert!(el.driver.send_half_taken[conn_index as usize]);
+
+        match with_driver_state(&mut el, || conn.take_send()) {
+            Err(e) => assert_eq!(
+                e.raw_os_error(),
+                Some(libc::EBUSY),
+                "a second take_send must be refused with EBUSY"
+            ),
+            Ok(_) => panic!("the write side was handed out twice"),
+        }
+
+        // `split` needs both, so it is refused too — and must not strand the
+        // read claim on its way out.
+        match with_driver_state(&mut el, || conn.split()) {
+            Err(e) => assert_eq!(e.raw_os_error(), Some(libc::EBUSY)),
+            Ok(_) => panic!("split must not succeed while the write side is out"),
+        }
+        assert!(
+            !el.driver.recv_half_taken[conn_index as usize],
+            "a split refused on the write claim must release the read claim it took"
+        );
+
+        with_driver_state(&mut el, || drop(tx));
+        assert!(!el.driver.send_half_taken[conn_index as usize]);
+        let _again = with_driver_state(&mut el, || conn.take_send()).expect("available again");
+    }
+
+    /// A stale handle must not take the write side of the slot's new occupant.
+    #[test]
+    fn take_send_refuses_a_stale_handle() {
+        let mut el = make_test_loop_with_config(config_with_reserve(16));
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let stale = ConnCtx::new(conn_index, generation.wrapping_add(1));
+        match with_driver_state(&mut el, || stale.take_send()) {
+            Err(e) => assert_eq!(e.raw_os_error(), Some(libc::EPIPE)),
+            Ok(_) => panic!("a stale handle must not take the write side"),
+        }
+        assert!(
+            !el.driver.send_half_taken[conn_index as usize],
+            "a refused take_send must not leave a claim behind"
+        );
     }
 
     /// A stale handle must not split the slot's new occupant, for the same
@@ -8056,6 +8117,67 @@ mod tests {
             Ok(_) => panic!("end_segments() must not hand the read side back"),
         }
         with_driver_state(&mut el, || drop(half));
+    }
+
+    /// A forward must refuse a sink whose write half somebody else owns.
+    ///
+    /// This is the "forward *or* send, not both" rule, enforced for the first
+    /// time. It matters because a forward does **not** go through the sink's
+    /// per-connection send queue — `resubmit_forward_writev` submits its own
+    /// SQE straight to the ring — so a concurrent `send` to that socket
+    /// interleaves with the forward's writes, and io_uring does not order
+    /// independent SQEs (Domain Invariant 2). The result is a corrupted
+    /// stream, not merely reordered messages.
+    #[test]
+    fn a_forward_refuses_a_sink_whose_send_half_is_out() {
+        let mut el = make_test_loop_with_config(config_with_reserve(16));
+        let src = accept_connection(&mut el);
+        let sink = accept_connection(&mut el);
+        let src_gen = el.driver.connections.generation(src);
+        let sink_gen = el.driver.connections.generation(sink);
+        el.driver.recv_domain[src as usize] = crate::recv::domain::RecvDomain::Segmented;
+        deliver_segment(&mut el, src, 0, b"hello");
+
+        let source = ConnCtx::new(src, src_gen);
+        let sink_ctx = ConnCtx::new(sink, sink_gen);
+
+        // Someone owns the sink's writes.
+        let tx = with_driver_state(&mut el, || sink_ctx.take_send()).expect("take_send");
+
+        let waker = noop_waker();
+        let mut fut =
+            std::pin::pin!(with_driver_state(&mut el, || source.forward_to_conn(&sink_ctx, 5)));
+        let p = with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            fut.as_mut().poll(&mut cx)
+        });
+        match p {
+            std::task::Poll::Ready(Err(e)) => assert_eq!(
+                e.raw_os_error(),
+                Some(libc::EBUSY),
+                "forwarding into a sink someone else writes must be EBUSY"
+            ),
+            other => panic!("expected EBUSY, got {other:?}"),
+        }
+        assert!(
+            el.driver.forward_progress[src as usize].is_none(),
+            "a refused forward must not leave the source armed"
+        );
+
+        // Once the owner lets go, the same forward is allowed.
+        with_driver_state(&mut el, || drop(tx));
+        deliver_segment(&mut el, src, 1, b"hello");
+        el.driver.recv_domain[src as usize] = crate::recv::domain::RecvDomain::Segmented;
+        let mut fut2 =
+            std::pin::pin!(with_driver_state(&mut el, || source.forward_to_conn(&sink_ctx, 5)));
+        let p2 = with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            fut2.as_mut().poll(&mut cx)
+        });
+        assert!(
+            matches!(p2, std::task::Poll::Pending),
+            "with the write half released the forward arms, got {p2:?}"
+        );
     }
 
     /// A stale handle must not put the slot's new occupant into the segmented
@@ -8210,7 +8332,7 @@ mod tests {
         let stale_half = with_driver_state(&mut el, || old_conn.take_recv()).expect("take_recv");
 
         // Recycle the slot, as teardown does.
-        el.driver.clear_recv_claims(conn_index);
+        el.driver.clear_conn_claims(conn_index);
         el.driver.connections.release(conn_index);
         let new_index = accept_connection(&mut el);
         assert_eq!(new_index, conn_index, "the test needs the slot reused");
@@ -8253,7 +8375,7 @@ mod tests {
         el.driver.recv_half_taken[conn_index as usize] = true;
         el.driver.segment_reader_live[conn_index as usize] = true;
 
-        el.driver.clear_recv_claims(conn_index);
+        el.driver.clear_conn_claims(conn_index);
 
         assert!(
             !el.driver.recv_half_taken[conn_index as usize],

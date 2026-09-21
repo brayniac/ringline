@@ -360,6 +360,12 @@ pub(crate) struct Driver {
     /// be claimed rather than owned. Taking the half claims it; dropping the
     /// half releases it. See `docs/connection-handle-ownership-design.md`.
     pub(crate) recv_half_taken: Vec<bool>,
+    /// Per connection index: is a [`SendHalf`](crate::SendHalf) currently out?
+    ///
+    /// The write-side twin of `recv_half_taken`. It makes "one owner of the
+    /// writes" a real claim rather than a convention, and it is what lets a
+    /// forward refuse a sink somebody else is already writing to.
+    pub(crate) send_half_taken: Vec<bool>,
     /// Per-connection in-flight segmented-recv Mode A forward write (see
     /// [`ForwardWriteState`]). `Some` while a write to the sink is outstanding;
     /// enforces the one-write-in-flight invariant and keeps the write's backing
@@ -800,6 +806,7 @@ impl Driver {
             segment_pinned: vec![None; config.max_connections as usize],
             segment_reader_live: vec![false; config.max_connections as usize],
             recv_half_taken: vec![false; config.max_connections as usize],
+            send_half_taken: vec![false; config.max_connections as usize],
             forward_write: (0..config.max_connections).map(|_| None).collect(),
             forward_done: (0..config.max_connections).map(|_| None).collect(),
             forward_progress: (0..config.max_connections).map(|_| None).collect(),
@@ -1455,12 +1462,15 @@ impl Driver {
     ///
     /// Clearing here, at the recycle point, makes that impossible regardless of
     /// how the previous occupant died.
-    pub(crate) fn clear_recv_claims(&mut self, conn_index: u32) {
+    pub(crate) fn clear_conn_claims(&mut self, conn_index: u32) {
         let idx = conn_index as usize;
         if let Some(live) = self.segment_reader_live.get_mut(idx) {
             *live = false;
         }
         if let Some(taken) = self.recv_half_taken.get_mut(idx) {
+            *taken = false;
+        }
+        if let Some(taken) = self.send_half_taken.get_mut(idx) {
             *taken = false;
         }
     }
@@ -2719,7 +2729,7 @@ impl Driver {
                         if let Some(ref mut tls_table) = self.tls_table {
                             tls_table.remove(conn_index);
                         }
-                        self.clear_recv_claims(conn_index);
+                        self.clear_conn_claims(conn_index);
                         self.connections.release(conn_index);
                     }
                     _ => {}

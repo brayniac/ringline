@@ -1166,9 +1166,10 @@ impl AsyncEventHandler for TlsForwardProxy {
                 },
                 Err(_) => return,
             };
-            // Reading an outbound connection goes through its read half.
-            let mut backend_rx = match backend.take_recv() {
-                Ok(rx) => rx,
+            // The backend is both read (for the return leg) and written (as
+            // the forward sink), so take both halves.
+            let (mut backend_tx, mut backend_rx) = match backend.split() {
+                Ok(halves) => halves,
                 Err(_) => return,
             };
 
@@ -1188,7 +1189,7 @@ impl AsyncEventHandler for TlsForwardProxy {
                 }
                 let len = u32::from_be_bytes(hdr) as usize;
 
-                match client.forward_to_conn(&backend, len).await {
+                match client.forward_to_conn(&mut backend_tx, len).await {
                     Ok(f) if f == len => {}
                     other => {
                         eprintln!("tls proxy: forward {other:?}, wanted {len}");
