@@ -3369,7 +3369,7 @@ impl<'a> ValueStream<'a> {
     /// error (never a truncated value), per the design's bounded-`len` contract.
     async fn refill(&mut self) -> Result<(), Error> {
         loop {
-            match self.client.conn.recv_owned_segment()?.await {
+            match self.client.rx.recv_owned_segment()?.await {
                 Ok(Some(b)) if !b.is_empty() => {
                     self.buf = b;
                     return Ok(());
@@ -3463,7 +3463,7 @@ impl<'a> ValueStream<'a> {
         // Restore the default read path. Any bytes still in `self.buf` past the
         // trailing CRLF would belong to a *following* reply — none exist in the
         // documented sequential use; they are dropped rather than reinjected.
-        self.client.conn.end_segments()?;
+        self.client.rx.end_segments()?;
         self.finished = true;
         Ok(())
     }
@@ -3478,7 +3478,7 @@ impl Drop for ValueStream<'_> {
             // synchronously here, so poison the connection. `close()` bumps the
             // slot generation, making the client's stored handle stale so the
             // next operation fails.
-            self.client.conn.close();
+            self.client.tx.close();
         }
     }
 }
