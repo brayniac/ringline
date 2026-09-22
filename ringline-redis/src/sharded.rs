@@ -57,7 +57,16 @@ pub struct ShardedConfig {
 }
 
 enum ShardConn {
-    Connected(ConnCtx),
+    /// A pooled connection *is* a client.
+    ///
+    /// The slot used to hold a bare `ConnCtx` and `route_command` built a
+    /// throwaway `Client` per command. Once the halves became claims (#439,
+    /// #440) that meant a `split()` — two driver round trips and two claim
+    /// writes — plus a client construction, on every command. Owning the
+    /// client here costs one split per *connection* instead.
+    ///
+    /// Boxed so the enum is a pointer rather than a whole `Client` per slot.
+    Connected(Box<Client>),
     Disconnected,
 }
 
@@ -133,7 +142,7 @@ impl ShardedClient {
         for shard in &mut self.shards {
             for slot in &mut shard.conns {
                 let conn = do_connect(shard.addr, &opts).await?;
-                *slot = ShardConn::Connected(conn);
+                *slot = ShardConn::Connected(Box::new(Client::new(conn)?));
             }
         }
         Ok(())
@@ -166,11 +175,15 @@ impl ShardedClient {
     }
 
     /// Get a [`Client`] for a specific shard by index (for node-level commands).
-    pub async fn shard_client(&mut self, index: usize) -> Result<Client, Error> {
+    /// Borrow the client for a shard, connecting it if needed.
+    ///
+    /// Returns a borrow rather than an owned `Client`: the pool owns one
+    /// client per connection now, so handing out a second would be a second
+    /// reader on the same socket — which `RecvHalf` refuses anyway.
+    pub async fn shard_client(&mut self, index: usize) -> Result<&mut Client, Error> {
         let opts = self.connect_opts();
         let shard = &mut self.shards[index];
-        let conn = get_conn(shard, &opts).await?;
-        Client::new(conn)
+        get_conn(shard, &opts).await
     }
 
     // ── Core routing ────────────────────────────────────────────────────
@@ -184,35 +197,29 @@ impl ShardedClient {
 
         for attempt in 0..size {
             let idx = (shard.next + attempt) % size;
-            let conn = match &shard.conns[idx] {
-                ShardConn::Connected(c) => *c,
-                ShardConn::Disconnected => match do_connect(shard.addr, &opts).await {
-                    Ok(c) => {
-                        shard.conns[idx] = ShardConn::Connected(c);
-                        c
-                    }
+            if matches!(shard.conns[idx], ShardConn::Disconnected) {
+                match do_connect(shard.addr, &opts).await {
+                    Ok(c) => match Client::new(c) {
+                        Ok(client) => shard.conns[idx] = ShardConn::Connected(Box::new(client)),
+                        Err(_) => continue,
+                    },
                     Err(_) => continue,
-                },
-            };
+                }
+            }
 
-            // One split per command: taking the write half and then letting
-            // `Client::new` split the same connection again cost two extra
-            // driver round trips and a redundant claim set/clear on the
-            // per-command path.
-            let (mut tx, mut rx) = match conn.split() {
-                Ok(halves) => halves,
-                Err(e) => {
-                    shard.conns[idx] = ShardConn::Disconnected;
-                    conn.close();
-                    return Err(Error::Io(e));
+            // Borrow the slot's client only for the exchange: the error arms
+            // below reset the slot, which needs the borrow to have ended.
+            let outcome = {
+                let ShardConn::Connected(client) = &mut shard.conns[idx] else {
+                    continue;
+                };
+                match client.send_raw(encoded) {
+                    Ok(()) => client.read_value().await,
+                    Err(e) => Err(e),
                 }
             };
-            if let Err(e) = tx.send(encoded) {
-                shard.conns[idx] = ShardConn::Disconnected;
-                conn.close();
-                return Err(Error::Io(e));
-            }
-            match crate::read_value_from(&mut rx, &mut tx).await.0 {
+
+            match outcome {
                 Ok(value) => {
                     // Advance round-robin past the connection we used.
                     shard.next = (idx + 1) % size;
@@ -1047,8 +1054,8 @@ impl ShardedClient {
         let ping_cmd = Client::encode_request(&Request::ping());
         for shard in &mut self.shards {
             if let Some(conn) = get_connected_conn(shard) {
-                conn.take_send()?.send(&ping_cmd)?;
-                let value = Client::new(conn)?.read_value().await?;
+                conn.send_raw(&ping_cmd)?;
+                let value = conn.read_value().await?;
                 if let Value::Error(ref msg) = value {
                     return Err(Error::Redis(String::from_utf8_lossy(msg).into_owned()));
                 }
@@ -1084,34 +1091,47 @@ struct ConnectOpts {
     username: Option<String>,
 }
 
-/// Get the first connected ConnCtx from a shard without reconnecting.
-fn get_connected_conn(shard: &Shard) -> Option<ConnCtx> {
-    for conn in &shard.conns {
+/// Borrow the first connected client on a shard, without reconnecting.
+fn get_connected_conn(shard: &mut Shard) -> Option<&mut Client> {
+    for conn in &mut shard.conns {
         if let ShardConn::Connected(c) = conn {
-            return Some(*c);
+            return Some(c);
         }
     }
     None
 }
 
-/// Get a ConnCtx from a shard, lazily reconnecting if needed.
-async fn get_conn(shard: &mut Shard, opts: &ConnectOpts) -> Result<ConnCtx, Error> {
+/// Borrow a client from a shard, lazily reconnecting if needed.
+///
+/// Two passes rather than one: the connect has to finish and be stored before
+/// the borrow is taken, or the returned reference would keep `shard` borrowed
+/// across the `await`.
+async fn get_conn<'a>(shard: &'a mut Shard, opts: &ConnectOpts) -> Result<&'a mut Client, Error> {
     let size = shard.conns.len();
+    let mut chosen = None;
     for _ in 0..size {
         let idx = shard.next;
         shard.next = (shard.next + 1) % size;
 
-        match &shard.conns[idx] {
-            ShardConn::Connected(c) => return Ok(*c),
-            ShardConn::Disconnected => {
-                if let Ok(conn) = do_connect(shard.addr, opts).await {
-                    shard.conns[idx] = ShardConn::Connected(conn);
-                    return Ok(conn);
-                }
-            }
+        if matches!(shard.conns[idx], ShardConn::Connected(_)) {
+            chosen = Some(idx);
+            break;
+        }
+        if let Ok(conn) = do_connect(shard.addr, opts).await
+            && let Ok(client) = Client::new(conn)
+        {
+            shard.conns[idx] = ShardConn::Connected(Box::new(client));
+            chosen = Some(idx);
+            break;
         }
     }
-    Err(Error::AllConnectionsFailed)
+    match chosen {
+        Some(idx) => match &mut shard.conns[idx] {
+            ShardConn::Connected(c) => Ok(c),
+            ShardConn::Disconnected => Err(Error::AllConnectionsFailed),
+        },
+        None => Err(Error::AllConnectionsFailed),
+    }
 }
 
 async fn do_connect(addr: SocketAddr, opts: &ConnectOpts) -> Result<ConnCtx, Error> {
