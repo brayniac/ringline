@@ -2,7 +2,6 @@
 
 use std::io;
 use std::io::Read;
-use std::net::SocketAddr;
 use std::os::fd::{FromRawFd, RawFd};
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -34,7 +33,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     pub(crate) fn new(
         config: &Config,
         handler: A,
-        accept_rx: Option<crossbeam_channel::Receiver<(RawFd, SocketAddr)>>,
+        accept_rx: Option<crossbeam_channel::Receiver<(RawFd, crate::connection::PeerAddr)>>,
         eventfd: RawFd,
         wake_fd: crate::wakeup::WakeFd,
         shutdown_flag: Arc<AtomicBool>,
@@ -378,7 +377,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
             // Set peer address.
             if let Some(cs) = self.driver.connections.get_mut(conn_index) {
-                cs.peer_addr = Some(crate::connection::PeerAddr::Tcp(peer_addr));
+                cs.peer_addr = Some(peer_addr);
             }
 
             // Convert raw fd to mio TcpStream.
@@ -1567,7 +1566,7 @@ mod tests {
     /// `drain_channels`' accept path.
     fn test_loop_with_accept(
         config: &Config,
-        accept_rx: Option<crossbeam_channel::Receiver<(RawFd, SocketAddr)>>,
+        accept_rx: Option<crossbeam_channel::Receiver<(RawFd, crate::connection::PeerAddr)>>,
     ) -> (AsyncEventLoop<NoopHandler>, crate::wakeup::WakeHandle) {
         let (read_fd, handle) = crate::wakeup::create_wake_fd().expect("wake fd");
         let event_loop = AsyncEventLoop::new(
@@ -1858,7 +1857,7 @@ mod tests {
     /// A connected socket pair; the server end is handed over as a raw fd
     /// (as the acceptor thread does), the client end returned so the test
     /// keeps the connection alive.
-    fn accepted_socket() -> (RawFd, std::net::TcpStream, SocketAddr) {
+    fn accepted_socket() -> (RawFd, std::net::TcpStream, std::net::SocketAddr) {
         use std::os::fd::IntoRawFd;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
         let addr = listener.local_addr().expect("listener address");
@@ -1903,7 +1902,7 @@ mod tests {
 
         let (server_fd, _peer, peer_addr) = accepted_socket();
         accept_tx
-            .send((server_fd, peer_addr))
+            .send((server_fd, crate::connection::PeerAddr::Tcp(peer_addr)))
             .expect("queue the accept");
         event_loop.drain_channels();
         assert!(

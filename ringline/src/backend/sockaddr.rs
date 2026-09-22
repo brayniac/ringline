@@ -31,7 +31,6 @@ pub(crate) fn sockaddr_to_socket_addr(
 }
 
 /// Convert a libc sockaddr_storage to a `PeerAddr` (TCP or Unix).
-#[allow(dead_code)]
 pub(crate) fn sockaddr_to_peer_addr(
     addr: &libc::sockaddr_storage,
     len: u32,

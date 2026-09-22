@@ -5755,6 +5755,83 @@ fn unix_socket_echo() {
     let _ = std::fs::remove_file(&sock_path);
 }
 
+/// peer_addr reports `Unix` for a connection accepted on a Unix listener.
+///
+/// Regression: the acceptor substituted a `SocketAddr` of `0.0.0.0:0` for
+/// Unix accepts (`accept4` fills no usable one) and the accept path wrapped
+/// whatever arrived in `PeerAddr::Tcp`, so an accepted UDS connection
+/// reported `Tcp(0.0.0.0:0)`. `PeerAddr::Unix` was only ever produced for
+/// *outbound* `connect_unix`.
+#[test]
+fn peer_addr_unix_regression() {
+    use std::os::unix::net::UnixStream;
+
+    // 0 = never ran, 1 = Unix (correct), 2 = anything else.
+    static UNIX_PEER: AtomicU32 = AtomicU32::new(0);
+
+    struct UnixPeerHandler;
+    impl AsyncEventHandler for UnixPeerHandler {
+        fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
+            async move {
+                let (mut tx, mut rx) = conn.split();
+                match tx.peer_addr() {
+                    Some(ringline::PeerAddr::Unix(_)) => UNIX_PEER.store(1, Ordering::SeqCst),
+                    _ => UNIX_PEER.store(2, Ordering::SeqCst),
+                }
+                let _ = rx
+                    .with_data(|data| {
+                        let _ = tx.send_nowait(data);
+                        ParseResult::Consumed(data.len())
+                    })
+                    .await;
+            }
+        }
+        fn create_for_worker(_id: usize) -> Self {
+            UnixPeerHandler
+        }
+    }
+
+    UNIX_PEER.store(0, Ordering::SeqCst);
+    let dir = std::env::temp_dir();
+    let sock_path = dir.join(format!("ringline-peeraddr-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&sock_path);
+
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
+        .bind_unix(&sock_path)
+        .launch::<UnixPeerHandler>()
+        .expect("launch failed");
+
+    for _ in 0..200 {
+        if sock_path.exists() {
+            std::thread::sleep(Duration::from_millis(10));
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(sock_path.exists(), "socket file not created");
+
+    let mut stream = UnixStream::connect(&sock_path).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream.write_all(b"x").unwrap();
+    stream.flush().unwrap();
+    let mut buf = [0u8; 1];
+    stream.read_exact(&mut buf).unwrap();
+
+    assert_eq!(
+        UNIX_PEER.load(Ordering::SeqCst),
+        1,
+        "accepted UDS connection did not report PeerAddr::Unix (0 = handler never ran)"
+    );
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+    let _ = std::fs::remove_file(&sock_path);
+}
+
 /// peer_addr returns PeerAddr::Tcp for TCP connections (regression).
 #[test]
 fn peer_addr_tcp_regression() {

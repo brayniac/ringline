@@ -632,7 +632,7 @@ impl RinglineBuilder {
         F: Fn(
                 usize,
                 Config,
-                Option<crossbeam_channel::Receiver<(RawFd, SocketAddr)>>,
+                Option<crossbeam_channel::Receiver<(RawFd, crate::connection::PeerAddr)>>,
                 (WorkerReadFd, crate::wakeup::WakeFd),
                 Arc<AtomicBool>,
                 Option<crossbeam_channel::Receiver<crate::resolver::ResolveResponse>>,
@@ -687,7 +687,7 @@ impl RinglineBuilder {
             // tries the next worker; if every worker is full, the incoming
             // fd is closed so the kernel can signal connection-refused to
             // the peer instead of letting the listen queue overflow.
-            let (tx, rx) = crossbeam_channel::bounded::<(RawFd, SocketAddr)>(
+            let (tx, rx) = crossbeam_channel::bounded::<(RawFd, crate::connection::PeerAddr)>(
                 self.config.accept_queue_capacity,
             );
             let (read_fd, wake_handle) =
