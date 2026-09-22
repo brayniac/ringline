@@ -300,11 +300,21 @@ impl Driver {
         let tls_table = {
             let server_config = config.tls.as_ref().map(|t| t.server_config.clone());
             let client_config = config.tls_client.as_ref().map(|t| t.client_config.clone());
-            if server_config.is_some() || client_config.is_some() {
-                Some(crate::tls::TlsTable::new(
+            let listener_configs: Vec<_> = config
+                .listener_tls
+                .iter()
+                .map(|slot| slot.as_ref().map(|t| t.server_config.clone()))
+                .collect();
+            // Any per-listener config counts — see the io_uring driver.
+            if server_config.is_some()
+                || client_config.is_some()
+                || listener_configs.iter().any(|c| c.is_some())
+            {
+                Some(crate::tls::TlsTable::with_listener_configs(
                     config.max_connections,
                     server_config,
                     client_config,
+                    listener_configs,
                 ))
             } else {
                 None

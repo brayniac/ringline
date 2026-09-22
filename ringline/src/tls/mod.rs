@@ -496,7 +496,11 @@ impl CiphertextCapacity {
 /// Stored as a separate EventLoop field for borrow splitting.
 pub struct TlsTable {
     conns: Vec<Option<TlsConn>>,
+    /// Process-wide fallback, used by any listener without its own config.
     server_config: Option<Arc<rustls::ServerConfig>>,
+    /// Per-listener configs indexed by `ListenerId`. A `None` entry, or an
+    /// index past the end, falls back to `server_config`.
+    listener_configs: Vec<Option<Arc<rustls::ServerConfig>>>,
     client_config: Option<Arc<rustls::ClientConfig>>,
     /// Single shared ciphertext scratch buffer (one per worker thread).
     /// Only used synchronously — we process one connection at a time.
@@ -513,15 +517,47 @@ impl TlsTable {
         server_config: Option<Arc<rustls::ServerConfig>>,
         client_config: Option<Arc<rustls::ClientConfig>>,
     ) -> Self {
+        Self::with_listener_configs(max_connections, server_config, client_config, Vec::new())
+    }
+
+    /// Create a table that can serve a different server config per listener.
+    ///
+    /// `listener_configs` is indexed by `ListenerId`; a `None` entry falls back
+    /// to `server_config`.
+    pub fn with_listener_configs(
+        max_connections: u32,
+        server_config: Option<Arc<rustls::ServerConfig>>,
+        client_config: Option<Arc<rustls::ClientConfig>>,
+        listener_configs: Vec<Option<Arc<rustls::ServerConfig>>>,
+    ) -> Self {
         let mut conns = Vec::with_capacity(max_connections as usize);
         conns.resize_with(max_connections as usize, || None);
         TlsTable {
             conns,
             server_config,
+            listener_configs,
             client_config,
             #[cfg(not(has_io_uring))]
             write_buf: Vec::new(),
         }
+    }
+
+    /// The server config that should terminate a connection accepted on
+    /// `listener`: that listener's own if it has one, else the process-wide
+    /// fallback.
+    fn server_config_for(
+        &self,
+        listener: Option<crate::ListenerId>,
+    ) -> Option<&Arc<rustls::ServerConfig>> {
+        listener
+            .and_then(|l| self.listener_configs.get(l.index() as usize))
+            .and_then(|slot| slot.as_ref())
+            .or(self.server_config.as_ref())
+    }
+
+    /// Whether connections accepted on `listener` should terminate TLS.
+    pub fn has_server_config_for(&self, listener: Option<crate::ListenerId>) -> bool {
+        self.server_config_for(listener).is_some()
     }
 
     /// Whether a server config is present (for TLS accept on inbound connections).
@@ -540,11 +576,14 @@ impl TlsTable {
     /// lifetime: the `tls-unbuffered` feature picks rustls' unbuffered record
     /// layer, otherwise the buffered one. See
     /// `docs/tls-unbuffered-design.md` ("Path selection").
-    pub fn create(&mut self, conn_index: u32) -> Result<(), rustls::Error> {
+    pub fn create(
+        &mut self,
+        conn_index: u32,
+        listener: Option<crate::ListenerId>,
+    ) -> Result<(), rustls::Error> {
         let server_config = self
-            .server_config
-            .as_ref()
-            .expect("create() called without server_config")
+            .server_config_for(listener)
+            .expect("create() called without a server config for this listener")
             .clone();
         // Read before the config is moved into the connection, and before any
         // engine selection: the value is the same either way.
@@ -905,7 +944,7 @@ mod tests {
     #[test]
     fn create_selects_the_engine_the_build_asked_for() {
         let mut table = TlsTable::new(4, Some(server_config()), None);
-        table.create(0).expect("create a server connection");
+        table.create(0, None).expect("create a server connection");
         let conn = table.get_mut(0).expect("connection exists");
 
         #[cfg(feature = "tls-unbuffered")]
@@ -945,7 +984,7 @@ mod tests {
             None => server_config(),
         };
         let mut table = TlsTable::new(4, Some(config), Some(client_config()));
-        table.create(0).expect("create a server connection");
+        table.create(0, None).expect("create a server connection");
         table
     }
 

@@ -1887,9 +1887,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
                 // TLS path: defer accept until handshake completes.
                 if let Some(ref mut tls_table) = self.driver.tls_table
-                    && tls_table.has_server_config()
+                    && tls_table.has_server_config_for(Some(listener))
                 {
-                    if tls_table.create(conn_index).is_err() {
+                    if tls_table.create(conn_index, Some(listener)).is_err() {
                         self.driver.close_connection(conn_index);
                     }
                     continue;

@@ -368,6 +368,16 @@ impl BindAddr {
     }
 }
 
+/// What a `bind*()` call asked for, before anything is bound. One per call, in
+/// call order, so its position becomes its
+/// [`ListenerId`](crate::ListenerId).
+struct ListenerSpec {
+    addr: BindAddr,
+    /// TLS for this listener only. `None` falls back to the process-wide
+    /// `ConfigBuilder::tls()`, so single-listener setups are unchanged.
+    tls: Option<crate::config::TlsConfig>,
+}
+
 /// A listener the runtime owns, after binding. One per `bind*()` call, in
 /// call order, so its position is its [`ListenerId`](crate::ListenerId).
 struct ListenerHandle {
@@ -539,7 +549,7 @@ fn getsockname_v4_v6(fd: RawFd) -> Option<SocketAddr> {
 /// ```
 pub struct RinglineBuilder {
     config: Config,
-    bind_addrs: Vec<BindAddr>,
+    listeners: Vec<ListenerSpec>,
 }
 
 impl RinglineBuilder {
@@ -547,14 +557,17 @@ impl RinglineBuilder {
     pub fn new(config: Config) -> Self {
         RinglineBuilder {
             config,
-            bind_addrs: Vec::new(),
+            listeners: Vec::new(),
         }
     }
 
     /// Set the bind address for the TCP listener. If not set, no listener
     /// or acceptor thread is created (client-only mode).
     pub fn bind(mut self, addr: SocketAddr) -> Self {
-        self.bind_addrs.push(BindAddr::Tcp(addr));
+        self.listeners.push(ListenerSpec {
+            addr: BindAddr::Tcp(addr),
+            tls: None,
+        });
         self
     }
 
@@ -563,8 +576,29 @@ impl RinglineBuilder {
     ///
     /// Any existing socket file at the given path is unlinked before binding.
     pub fn bind_unix(mut self, path: impl AsRef<Path>) -> Self {
-        self.bind_addrs
-            .push(BindAddr::Unix(path.as_ref().to_path_buf()));
+        self.listeners.push(ListenerSpec {
+            addr: BindAddr::Unix(path.as_ref().to_path_buf()),
+            tls: None,
+        });
+        self
+    }
+
+    /// Bind a TCP listener that terminates TLS with its own configuration.
+    ///
+    /// The config applies to this listener alone, so one process can serve
+    /// plaintext on one port and TLS on another — or two ports with different
+    /// certificates. Accumulates like [`bind`](Self::bind).
+    ///
+    /// A listener bound with plain `bind()` falls back to the process-wide
+    /// [`ConfigBuilder::tls`](crate::ConfigBuilder::tls) if one is set, which
+    /// is how single-listener TLS setups behaved before per-listener configs
+    /// existed. To serve a plaintext listener alongside a TLS one, leave the
+    /// process-wide config unset and use `bind_tls` for the TLS listener.
+    pub fn bind_tls(mut self, addr: SocketAddr, tls: crate::config::TlsConfig) -> Self {
+        self.listeners.push(ListenerSpec {
+            addr: BindAddr::Tcp(addr),
+            tls: Some(tls),
+        });
         self
     }
 
@@ -823,8 +857,12 @@ impl RinglineBuilder {
 
         // Retain only bind intent and worker senders until every worker has
         // completed fallible setup. No socket is bound or listening yet.
-        let pending_bind_addrs = std::mem::take(&mut self.bind_addrs);
-        let has_acceptor = !pending_bind_addrs.is_empty();
+        let pending_listeners = std::mem::take(&mut self.listeners);
+        let has_acceptor = !pending_listeners.is_empty();
+        // Hand the per-listener TLS configs to every worker: the driver's
+        // `TlsTable` selects by `ListenerId` at accept time, so it needs the
+        // whole list, indexed the same way.
+        self.config.listener_tls = pending_listeners.iter().map(|l| l.tls.clone()).collect();
         let pending_worker_txs = if has_acceptor {
             Some(worker_txs)
         } else {
@@ -1032,10 +1070,10 @@ impl RinglineBuilder {
         // `ListenerId` so the handler can tell them apart.
         let listeners: Vec<ListenerHandle> = if has_acceptor {
             let worker_txs = pending_worker_txs.expect("worker senders must exist");
-            let mut listeners: Vec<ListenerHandle> = Vec::with_capacity(pending_bind_addrs.len());
+            let mut listeners: Vec<ListenerHandle> = Vec::with_capacity(pending_listeners.len());
 
-            for (idx, bind) in pending_bind_addrs.iter().enumerate() {
-                let created = match bind {
+            for (idx, spec) in pending_listeners.iter().enumerate() {
+                let created = match &spec.addr {
                     BindAddr::Tcp(addr) => create_listener(*addr, self.config.backlog)
                         .map(|fd| (fd, getsockname_v4_v6(fd))),
                     BindAddr::Unix(path) => {
@@ -1064,7 +1102,7 @@ impl RinglineBuilder {
                     // A Unix listener has no TCP_NODELAY to set. This used to be
                     // a runtime `if is_unix` branch over one global flag; with a
                     // listener list each one simply answers for itself.
-                    tcp_nodelay: !bind.is_unix() && self.config.tcp_nodelay,
+                    tcp_nodelay: !spec.addr.is_unix() && self.config.tcp_nodelay,
                     #[cfg(feature = "timestamps")]
                     timestamps: self.config.timestamps,
                     conn_chunk_size: self.config.conn_chunk_size,

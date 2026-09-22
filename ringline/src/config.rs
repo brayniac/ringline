@@ -201,6 +201,10 @@ pub struct Config {
     pub(crate) tick_timeout_us: u64,
     /// Optional TLS configuration. When set, all accepted connections use TLS.
     pub(crate) tls: Option<TlsConfig>,
+    /// Per-listener TLS, indexed by `ListenerId`. Populated by `launch()` from
+    /// the `bind*()` calls; an entry of `None` falls back to `tls` above.
+    /// Empty in client-only mode.
+    pub(crate) listener_tls: Vec<Option<TlsConfig>>,
     /// Optional TLS client configuration for outbound `connect_tls()` calls.
     pub(crate) tls_client: Option<TlsClientConfig>,
     /// Enable TCP_NODELAY on all connections (accepted and outbound).
@@ -358,6 +362,7 @@ impl Default for Config {
             flush_interval_us: 100,
             tick_timeout_us: 1000,
             tls: None,
+            listener_tls: Vec::new(),
             tls_client: None,
             tcp_nodelay: true,
             loop_diag: false,
