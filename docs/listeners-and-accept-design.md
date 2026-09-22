@@ -126,6 +126,35 @@ it** — without explicit placement the merged mode cannot be the default.
   updates the map at run time, so a worker leaves the rotation with no
   `setsockopt` and no socket close. Needs BPF load privileges.
 
+**Measured, 2026-09-22** — Debian 13, kernel 6.12.63, four listeners in one
+reuseport group, 40 connections, `experiments/reuseport-steering-spike.toml`:
+
+| case | Recv-Q across the four listeners | accepted |
+|---|---|---|
+| CBPF selects index 0 | `0, 0, 0, 40` | `40, 0, 0, 0` |
+| CBPF selects index 2 | `0, 40, 0, 0` | `0, 0, 40, 0` |
+| no BPF (kernel hash) | `12, 10, 8, 10` | `10, 8, 10, 12` |
+
+**A socket the selection program never picks accrues nothing** — zero pending
+backlog, zero accepted. "Not selected" and "not queued on" are the same thing,
+so tier 2 works: a worker leaves the rotation without closing its listener, and
+nothing is sitting there to be reset. The no-BPF row is what makes that
+trustworthy — the same measurement reports non-zero backlogs on all four
+sockets, so the zeros are a result rather than an instrument that can only
+print zero.
+
+Re-attaching a different program moves the target, so **unprivileged CBPF is
+enough to take a worker out of the rotation** — no BPF load privileges needed.
+CBPF cannot read a userspace map, so a policy change re-attaches a program
+mapping to the remaining set; eBPF with a `REUSEPORT_SOCKARRAY` stays the
+option if per-connection policy is ever wanted, at the cost of those
+privileges.
+
+Not yet measured, and load-bearing before tier 2 ships: what happens to
+connections **already queued** on a socket when it leaves the rotation. They
+stay where they landed, so exclusion stops new arrivals but does not empty the
+queue — taking a worker out still needs a drain before its listener closes.
+
 Recorded hazard: closing a `SO_REUSEPORT` listener **resets** connections still
 queued on it. Graceful shutdown in merged mode must stop accepting, drain, then
 close.
@@ -267,11 +296,15 @@ measurement before it is more than a knob.
 
 ## Open questions
 
-1. Does a `SO_REUSEPORT` socket excluded by a BPF selection program still
-   accrue a backlog? Decides whether tier 2 works at all.
-2. CBPF re-attach cost under churn — is unprivileged steering practical, or
-   does useful steering require BPF privileges we do not want to demand of a
-   server process?
+1. ~~Does a `SO_REUSEPORT` socket excluded by a BPF selection program still
+   accrue a backlog?~~ **Answered 2026-09-22: no** — zero Recv-Q, zero
+   accepted (§5). Tier 2 works.
+2. ~~Is unprivileged steering practical, or does useful steering need BPF
+   privileges?~~ **Answered: unprivileged CBPF suffices** to exclude a worker;
+   re-attach moves the target.
+3. What happens to connections **already queued** on a socket when it leaves
+   the rotation? They stay, so tier 2 needs a drain before any close. Not
+   measured.
 3. Does the `tls-unbuffered` engine hold partial-record state that complicates
    moving a `ServerConnection` between workers? (Tier 3.)
 4. Can a `Bytes` handed out by `with_bytes` still be alive at a park point? The
@@ -306,8 +339,8 @@ send-path A/B mandate.
    + `ListenerId` on `Connection` (breaking builder change).
 2. Acceptor payload `(RawFd, ListenerId, PeerAddr)`; retire the fake peer addr.
 3. Merged accept mode behind config, io_uring multishot; mio keeps the pool.
-4. BPF steering spike → tier 1 and tier 2 placement. Gates whether merged mode
-   can ever be the default.
+4. BPF steering → tier 1 and tier 2 placement. The kernel-behaviour spike is
+   done (§5); what remains is wiring it into the runtime.
 5. Park and adopt (tier 3): quiesce reuse, fd handover, `on_adopt`.
 6. Shed hint (tier 4).
 7. Handshake offload knob, gated on its prototype measuring well.
