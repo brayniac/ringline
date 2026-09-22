@@ -1253,6 +1253,17 @@ impl Client {
         r
     }
 
+    /// Send an already-encoded command on this client's write half.
+    ///
+    /// Lets the sharded/cluster routers do their one send *through the client*
+    /// they are about to build anyway, instead of taking the connection's write
+    /// half separately first — which cost an extra driver round trip and a
+    /// redundant claim set/clear on the per-command path.
+    pub(crate) fn send_raw(&mut self, encoded: &[u8]) -> Result<(), Error> {
+        self.tx.send(encoded)?;
+        Ok(())
+    }
+
     /// Send an encoded command and read the response, converting error
     /// responses into `Error::Memcache`.
     async fn execute(&mut self, encoded: &[u8]) -> Result<McResponseBytes, Error> {

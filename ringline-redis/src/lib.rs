@@ -1844,6 +1844,16 @@ impl Client {
 
     /// Send an encoded command and read the response, converting Redis
     /// error responses into `Error::Redis`.
+    /// Send an already-encoded command on this client's write half.
+    ///
+    /// Lets the sharded/cluster routers own a `Client` per pooled connection
+    /// and do their one send through it, rather than holding a bare `ConnCtx`
+    /// and building a throwaway client — plus a `split()` — per command.
+    pub(crate) fn send_raw(&mut self, encoded: &[u8]) -> Result<(), Error> {
+        self.tx.send(encoded)?;
+        Ok(())
+    }
+
     /// Like [`Client::execute`], but sends the reusable `encode_buf` in place.
     ///
     /// `self.execute(&self.encode_buf)` no longer type-checks: reading needs

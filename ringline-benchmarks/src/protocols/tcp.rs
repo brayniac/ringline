@@ -349,8 +349,8 @@ impl ringline::AsyncEventHandler for RinglineTcpBench {
                         Err(_) => return,
                     };
                     // Reading an outbound connection goes through its read half.
-                    let mut conn_rx = match conn.take_recv() {
-                        Ok(rx) => rx,
+                    let (mut conn_tx, mut conn_rx) = match conn.split() {
+                        Ok(halves) => halves,
                         Err(_) => return,
                     };
 
@@ -364,7 +364,7 @@ impl ringline::AsyncEventHandler for RinglineTcpBench {
 
                         let t0 = Instant::now();
 
-                        if conn.send_nowait(&msg).is_err() {
+                        if conn_tx.send_nowait(&msg).is_err() {
                             break;
                         }
 

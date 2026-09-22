@@ -37,16 +37,17 @@ impl AsyncEventHandler for ConnectHandler {
             match connect_future.await {
                 Ok(conn) => {
                     eprintln!("[worker {worker_id}] connected to {target}");
-                    // Reading an outbound connection goes through its read half.
-                    let mut conn_rx = match conn.take_recv() {
-                        Ok(rx) => rx,
+                    // An outbound connection is driven through its halves,
+                    // exactly like an accepted one.
+                    let (mut conn_tx, mut conn_rx) = match conn.split() {
+                        Ok(halves) => halves,
                         Err(e) => {
-                            eprintln!("[worker {worker_id}] take_recv error: {e}");
+                            eprintln!("[worker {worker_id}] split error: {e}");
                             return;
                         }
                     };
                     let msg: &[u8] = b"Hello from ringline!\n";
-                    if let Err(e) = conn.send_nowait(msg) {
+                    if let Err(e) = conn_tx.send_nowait(msg) {
                         eprintln!("[worker {worker_id}] send error: {e}");
                         return;
                     }

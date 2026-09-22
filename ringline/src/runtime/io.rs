@@ -614,6 +614,28 @@ pub fn request_shutdown() -> io::Result<()> {
 
 /// Async connection context providing send, recv, and connect operations.
 ///
+/// # `ConnCtx` is a token, not a capability
+///
+/// As of step 4 and the write-claim work it grants no I/O of its own. The read
+/// entry points are crate-private (below) and so are the write ones — `send`,
+/// `send_nowait`, `send_parts`, `send_backpressured`, `send_chain`,
+/// `send_chain_nowait`, `forward_recv_buf`, `shutdown_write`. Reading goes
+/// through [`RecvHalf`], writing through [`SendHalf`], and neither is `Copy`.
+///
+/// That is what makes `ConnCtx` being `Copy` fine rather than a wart. Copying a
+/// *name* is harmless; copying a *capability* was the bug — it let two tasks
+/// write to one socket, which for a forward sink means interleaved SQEs on the
+/// wire, because a forward submits its own SQE instead of going through the
+/// connection's send queue (Domain Invariant 2).
+///
+/// What a `ConnCtx` still does: identify a connection (`token`, `index`,
+/// `peer_addr`, `is_outbound`, `is_alive`, `tls_info`), manage its lifecycle
+/// (`close`, `cancel`, `request_shutdown`), open new connections
+/// (`connect`/`connect_tls`/…), name a forward sink, and — the important one —
+/// *mint the halves* with [`take_recv`](Self::take_recv),
+/// [`take_send`](Self::take_send) and [`split`](Self::split), each of which is
+/// exclusive.
+///
 /// # The read entry points are crate-private
 ///
 /// `with_data`, `with_bytes`, `segments`, `recv_owned_segment`, `end_segments`
@@ -635,8 +657,8 @@ pub fn request_shutdown() -> io::Result<()> {
 /// Outbound connections come back as a `ConnCtx` from [`connect`](crate::connect);
 /// accepted ones arrive as a [`Connection`] in [`AsyncEventHandler::on_accept`](crate::AsyncEventHandler::on_accept).
 /// It exposes an async API for reading data (`with_data`,
-/// `with_bytes`), sending data ([`send`](Self::send),
-/// [`send_nowait`](Self::send_nowait)), and initiating outbound connections
+/// `with_bytes`), sending data (`send`,
+/// `send_nowait`), and initiating outbound connections
 /// ([`connect`](Self::connect)).
 ///
 /// A `ConnCtx` is valid for the lifetime of the connection's async task.
@@ -1695,15 +1717,15 @@ impl ConnCtx {
     ///
     /// # Errors
     ///
-    /// Same error contract as [`send()`](Self::send): pool admission errors
+    /// Same error contract as `send()`: pool admission errors
     /// only (`Other` when the pool cannot admit the whole buffer,
     /// `InvalidInput` when it never could), nothing committed on a plaintext
     /// `Err`, TLS pool exhaustion not retryable, submission-queue pressure
     /// absorbed by the queue. With no future to resolve, persistent
     /// submission-queue starvation surfaces only as the connection closing.
     ///
-    /// For backpressure-aware sending, use [`send()`](Self::send) instead.
-    pub fn send_nowait(&self, data: &[u8]) -> io::Result<()> {
+    /// For backpressure-aware sending, use `send()` instead.
+    pub(crate) fn send_nowait(&self, data: &[u8]) -> io::Result<()> {
         with_state(|driver, _| {
             let mut ctx = driver.make_ctx();
             ctx.send(self.token(), data)
@@ -1722,7 +1744,7 @@ impl ConnCtx {
     ///
     /// Only works for plaintext connections; TLS connections always copy.
     /// On the mio backend, this always uses the copy path.
-    pub fn forward_recv_buf(&self, data: &[u8]) -> io::Result<()> {
+    pub(crate) fn forward_recv_buf(&self, data: &[u8]) -> io::Result<()> {
         with_state(|driver, _| {
             #[cfg_attr(not(has_io_uring), allow(unused_variables))]
             let conn_index = self.conn_index;
@@ -2196,7 +2218,7 @@ impl ConnCtx {
     /// and `.guard(guard)` for zero-copy parts backed by `SendGuard`. Call `.submit()`
     /// to submit the SQE. Fire-and-forget: no future returned.
     #[cfg(has_io_uring)]
-    pub fn send_parts(&self) -> AsyncSendBuilder {
+    pub(crate) fn send_parts(&self) -> AsyncSendBuilder {
         AsyncSendBuilder {
             token: self.token(),
         }
@@ -2209,7 +2231,7 @@ impl ConnCtx {
     /// sent (or error).
     ///
     /// Use this when you need backpressure or send completion notification.
-    /// For fire-and-forget sending, use [`send_nowait()`](Self::send_nowait).
+    /// For fire-and-forget sending, use `send_nowait()`.
     ///
     /// # Errors
     ///
@@ -2225,7 +2247,7 @@ impl ConnCtx {
     /// and retried. Persistent submission-queue starvation is reported like
     /// a write error: the awaited `SendFuture` resolves `Err` and the
     /// connection is closed.
-    pub fn send(&self, data: &[u8]) -> io::Result<SendFuture> {
+    pub(crate) fn send(&self, data: &[u8]) -> io::Result<SendFuture> {
         with_state(|driver, executor| {
             let mut ctx = driver.make_ctx();
             ctx.send(self.token(), data)?;
@@ -2247,7 +2269,7 @@ impl ConnCtx {
     /// Send `data`, waiting for send-pool capacity instead of failing when
     /// the pool is full.
     ///
-    /// The counterpart to [`send`](Self::send), which fails immediately when
+    /// The counterpart to `send`, which fails immediately when
     /// the copy pool is exhausted. Reach for this when the peer should set
     /// the pace rather than the pool — forwarding a fast source to a slow
     /// sink, for instance — and for `send` when a full pool means you would
@@ -2262,13 +2284,13 @@ impl ConnCtx {
     /// submission time rather than copied up front.
     ///
     /// ```no_run
-    /// # async fn f(conn: &ringline::ConnCtx, body: &[u8]) -> std::io::Result<()> {
-    /// let sent = conn.send_backpressured(body).await?;
+    /// # async fn f(tx: &mut ringline::SendHalf, body: &[u8]) -> std::io::Result<()> {
+    /// let sent = tx.send_backpressured(body).await?;
     /// assert_eq!(sent as usize, body.len());
     /// # Ok(())
     /// # }
     /// ```
-    pub fn send_backpressured<'a>(&self, data: &'a [u8]) -> BackpressuredSendFuture<'a> {
+    pub(crate) fn send_backpressured<'a>(&self, data: &'a [u8]) -> BackpressuredSendFuture<'a> {
         BackpressuredSendFuture {
             conn_index: self.conn_index,
             generation: self.generation,
@@ -2346,9 +2368,9 @@ impl ConnCtx {
     /// constructing linked SQEs. Call `.copy()`, `.parts()...add()` to add SQEs,
     /// then `.finish()` to submit the chain.
     ///
-    /// For backpressure-aware chained sending, use [`send_chain()`](Self::send_chain).
+    /// For backpressure-aware chained sending, use `send_chain()`.
     #[cfg(has_io_uring)]
-    pub fn send_chain_nowait<F, R>(&self, f: F) -> R
+    pub(crate) fn send_chain_nowait<F, R>(&self, f: F) -> R
     where
         F: FnOnce(crate::handler::SendChainBuilder<'_, '_>) -> R,
     {
@@ -2367,9 +2389,9 @@ impl ConnCtx {
     /// chain, then `.finish()` to submit it. Returns a [`SendFuture`] that
     /// resolves with total bytes sent.
     ///
-    /// For fire-and-forget chained sending, use [`send_chain_nowait()`](Self::send_chain_nowait).
+    /// For fire-and-forget chained sending, use `send_chain_nowait()`.
     #[cfg(has_io_uring)]
-    pub fn send_chain<F>(&self, f: F) -> io::Result<SendFuture>
+    pub(crate) fn send_chain<F>(&self, f: F) -> io::Result<SendFuture>
     where
         F: FnOnce(crate::handler::SendChainBuilder<'_, '_>) -> io::Result<()>,
     {
@@ -2393,13 +2415,13 @@ impl ConnCtx {
     ///
     /// Sends a TCP FIN to the peer. The read side remains open.
     ///
-    /// Any [`send_backpressured`](Self::send_backpressured) still waiting for
+    /// Any `send_backpressured` still waiting for
     /// pool capacity on this connection fails with
     /// [`BrokenPipe`](io::ErrorKind::BrokenPipe) rather than waiting for a
     /// turn it could no longer use. Already-submitted sends are left alone —
     /// their bytes may already be on the way, and the FIN is ordered behind
-    /// them. Plain [`send`](Self::send) is unaffected either way.
-    pub fn shutdown_write(&self) {
+    /// them. Plain `send` is unaffected either way.
+    pub(crate) fn shutdown_write(&self) {
         with_state(|driver, executor| {
             let mut ctx = driver.make_ctx();
             ctx.shutdown_write(self.token());
@@ -2601,8 +2623,8 @@ impl AsyncSendBuilder {
     ///
     /// # Example
     /// ```no_run
-    /// # fn example(conn: ringline::ConnCtx) -> std::io::Result<()> {
-    /// conn.send_parts().build(|b| {
+    /// # fn example(tx: &mut ringline::SendHalf) -> std::io::Result<()> {
+    /// tx.send_parts().build(|b| {
     ///     b.copy(b"header").submit()
     /// })?;
     /// # Ok(())
@@ -2740,7 +2762,7 @@ impl ConnCtx {
     /// Begin building a scatter-gather send.
     ///
     /// On the mio backend, this degrades to copy-only sends.
-    pub fn send_parts(&self) -> AsyncSendBuilder {
+    pub(crate) fn send_parts(&self) -> AsyncSendBuilder {
         AsyncSendBuilder {
             token: self.token(),
         }
@@ -3570,22 +3592,22 @@ impl Connection {
 
     // ── send ────────────────────────────────────────────────────────────
 
-    /// See [`ConnCtx::send`].
+    /// See [`SendHalf::send`].
     pub fn send(&mut self, data: &[u8]) -> io::Result<SendFuture> {
         self.tx.send(data)
     }
 
-    /// See [`ConnCtx::send_nowait`].
+    /// See [`SendHalf::send_nowait`].
     pub fn send_nowait(&mut self, data: &[u8]) -> io::Result<()> {
         self.tx.send_nowait(data)
     }
 
-    /// See [`ConnCtx::send_parts`].
+    /// See [`SendHalf::send_parts`].
     pub fn send_parts(&mut self) -> AsyncSendBuilder {
         self.tx.send_parts()
     }
 
-    /// See [`ConnCtx::send_backpressured`].
+    /// See [`SendHalf::send_backpressured`].
     pub fn send_backpressured<'a>(&mut self, data: &'a [u8]) -> BackpressuredSendFuture<'a> {
         self.tx.send_backpressured(data)
     }
@@ -3655,7 +3677,7 @@ impl Connection {
         self.rx.forward_held()
     }
 
-    /// See [`ConnCtx::forward_recv_buf`].
+    /// See [`SendHalf::forward_recv_buf`].
     pub fn forward_recv_buf(&mut self, data: &[u8]) -> io::Result<()> {
         self.tx.as_conn().forward_recv_buf(data)
     }
@@ -3666,7 +3688,7 @@ impl Connection {
         self.tx.as_conn().run_direct_echo()
     }
 
-    /// See [`ConnCtx::send_chain`].
+    /// See [`SendHalf::send_chain`].
     #[cfg(has_io_uring)]
     pub fn send_chain<F>(&mut self, f: F) -> io::Result<SendFuture>
     where
@@ -3675,7 +3697,7 @@ impl Connection {
         self.tx.as_conn().send_chain(f)
     }
 
-    /// See [`ConnCtx::send_chain_nowait`].
+    /// See [`SendHalf::send_chain_nowait`].
     #[cfg(has_io_uring)]
     pub fn send_chain_nowait<F, R>(&mut self, f: F) -> R
     where
@@ -3684,7 +3706,7 @@ impl Connection {
         self.tx.as_conn().send_chain_nowait(f)
     }
 
-    /// See [`ConnCtx::shutdown_write`].
+    /// See [`SendHalf::shutdown_write`].
     pub fn shutdown_write(&mut self) {
         self.tx.as_conn().shutdown_write();
     }
@@ -3768,22 +3790,22 @@ pub struct SendHalf {
 }
 
 impl SendHalf {
-    /// See [`ConnCtx::send`].
+    /// See [`SendHalf::send`].
     pub fn send(&mut self, data: &[u8]) -> io::Result<SendFuture> {
         self.conn.send(data)
     }
 
-    /// See [`ConnCtx::send_nowait`].
+    /// See [`SendHalf::send_nowait`].
     pub fn send_nowait(&mut self, data: &[u8]) -> io::Result<()> {
         self.conn.send_nowait(data)
     }
 
-    /// See [`ConnCtx::send_parts`].
+    /// See [`SendHalf::send_parts`].
     pub fn send_parts(&mut self) -> AsyncSendBuilder {
         self.conn.send_parts()
     }
 
-    /// See [`ConnCtx::send_backpressured`].
+    /// See [`SendHalf::send_backpressured`].
     pub fn send_backpressured<'a>(&mut self, data: &'a [u8]) -> BackpressuredSendFuture<'a> {
         self.conn.send_backpressured(data)
     }
@@ -3793,12 +3815,12 @@ impl SendHalf {
         self.conn.close();
     }
 
-    /// See [`ConnCtx::forward_recv_buf`].
+    /// See [`SendHalf::forward_recv_buf`].
     pub fn forward_recv_buf(&mut self, data: &[u8]) -> io::Result<()> {
         self.conn.forward_recv_buf(data)
     }
 
-    /// See [`ConnCtx::shutdown_write`].
+    /// See [`SendHalf::shutdown_write`].
     pub fn shutdown_write(&mut self) {
         self.conn.shutdown_write();
     }
@@ -3818,7 +3840,7 @@ impl SendHalf {
         self.conn.request_shutdown();
     }
 
-    /// See [`ConnCtx::send_chain`].
+    /// See [`SendHalf::send_chain`].
     #[cfg(has_io_uring)]
     pub fn send_chain<F>(&mut self, f: F) -> io::Result<SendFuture>
     where
@@ -3827,7 +3849,7 @@ impl SendHalf {
         self.conn.send_chain(f)
     }
 
-    /// See [`ConnCtx::send_chain_nowait`].
+    /// See [`SendHalf::send_chain_nowait`].
     #[cfg(has_io_uring)]
     pub fn send_chain_nowait<F, R>(&mut self, f: F) -> R
     where
@@ -5049,10 +5071,10 @@ enum BackpressuredState {
     Done,
 }
 
-/// Future returned by [`ConnCtx::send_backpressured`]: a send that **waits**
+/// Future returned by [`SendHalf::send_backpressured`]: a send that **waits**
 /// for send-pool capacity instead of failing when the pool is full.
 ///
-/// # How it differs from [`ConnCtx::send`]
+/// # How it differs from [`SendHalf::send`]
 ///
 /// `send` submits immediately and returns `Err` if the copy pool is
 /// exhausted. This parks instead, in a per-worker FIFO, and submits when its
@@ -5302,7 +5324,7 @@ impl Drop for BackpressuredSendFuture<'_> {
 // ── SendFuture ───────────────────────────────────────────────────────
 
 /// Future that awaits send completion. The SQE was already submitted eagerly
-/// by [`ConnCtx::send`] — this future only waits for the CQE result.
+/// by [`SendHalf::send`] — this future only waits for the CQE result.
 /// No data stored in the future. No allocation.
 pub struct SendFuture {
     conn_index: u32,

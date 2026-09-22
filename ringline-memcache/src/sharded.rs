@@ -53,7 +53,11 @@ pub struct ShardedConfig {
 }
 
 enum ShardConn {
-    Connected(ConnCtx),
+    /// A pooled connection *is* a client — see the note in
+    /// `ringline-redis`'s `sharded.rs`. Holding a bare `ConnCtx` meant a
+    /// `split()` plus a throwaway client on every command once the halves
+    /// became claims.
+    Connected(Box<Client>),
     Disconnected,
 }
 
@@ -125,7 +129,7 @@ impl ShardedClient {
         for shard in &mut self.shards {
             for slot in &mut shard.conns {
                 let conn = do_connect(shard.addr, &opts).await?;
-                *slot = ShardConn::Connected(conn);
+                *slot = ShardConn::Connected(Box::new(Client::new(conn)?));
             }
         }
         Ok(())
@@ -163,11 +167,14 @@ impl ShardedClient {
     /// dead, and subsequent calls (including via [`ShardedClient::get`])
     /// may keep hitting the same broken slot until reconnected
     /// explicitly. Prefer routed commands when possible.
-    pub async fn shard_client(&mut self, index: usize) -> Result<Client, Error> {
+    /// Borrow the client for a shard, connecting it if needed.
+    ///
+    /// A borrow, not an owned `Client`: the pool owns one client per
+    /// connection, and a second would be a second reader on the same socket.
+    pub async fn shard_client(&mut self, index: usize) -> Result<&mut Client, Error> {
         let opts = self.connect_opts();
         let shard = &mut self.shards[index];
-        let conn = get_conn(shard, &opts).await?;
-        Client::new(conn)
+        get_conn(shard, &opts).await
     }
 
     // -- Core routing --------------------------------------------------------
@@ -194,28 +201,31 @@ impl ShardedClient {
 
         for attempt in 0..size {
             let idx = (shard.next + attempt) % size;
-            let conn = match &shard.conns[idx] {
-                ShardConn::Connected(c) => *c,
-                ShardConn::Disconnected => match do_connect(shard.addr, &opts).await {
-                    Ok(c) => {
-                        shard.conns[idx] = ShardConn::Connected(c);
-                        c
-                    }
+            if matches!(shard.conns[idx], ShardConn::Disconnected) {
+                match do_connect(shard.addr, &opts).await {
+                    Ok(c) => match Client::new(c) {
+                        Ok(client) => shard.conns[idx] = ShardConn::Connected(Box::new(client)),
+                        Err(_) => continue,
+                    },
                     Err(_) => continue,
-                },
+                }
+            }
+            let ShardConn::Connected(client) = &mut shard.conns[idx] else {
+                continue;
             };
-
-            if conn.send(encoded).is_err() {
+            if client.send_raw(encoded).is_err() {
                 // Synchronous send failure (EPIPE, ECONNRESET, etc.) — the
                 // conn is dead. Previously this branch returned `Err(Io)`
                 // immediately, bypassing the rest of the pool. Mark the
                 // slot dead and try the next slot, matching the
                 // `ConnectionClosed` branch below.
+                if let ShardConn::Connected(c) = &mut shard.conns[idx] {
+                    c.close();
+                }
                 shard.conns[idx] = ShardConn::Disconnected;
-                conn.close();
                 continue;
             }
-            match Client::new(conn)?.read_response().await {
+            match client.read_response().await {
                 Ok(response) => {
                     shard.next = (idx + 1) % size;
                     check_error_bytes(&response)?;
@@ -522,21 +532,28 @@ async fn flush_all_on_shard(shard: &mut Shard, opts: &ConnectOpts) -> Result<(),
     for _ in 0..size {
         let idx = shard.next;
         shard.next = (shard.next + 1) % size;
-        let conn = match &shard.conns[idx] {
-            ShardConn::Connected(c) => *c,
-            ShardConn::Disconnected => match do_connect(shard.addr, opts).await {
-                Ok(c) => {
-                    shard.conns[idx] = ShardConn::Connected(c);
-                    c
-                }
+        if matches!(shard.conns[idx], ShardConn::Disconnected) {
+            match do_connect(shard.addr, opts).await {
+                Ok(c) => match Client::new(c) {
+                    Ok(client) => shard.conns[idx] = ShardConn::Connected(Box::new(client)),
+                    Err(_) => continue,
+                },
                 Err(_) => continue,
-            },
+            }
+        }
+        let outcome = {
+            let ShardConn::Connected(client) = &mut shard.conns[idx] else {
+                continue;
+            };
+            client.flush_all().await
         };
-        match Client::new(conn)?.flush_all().await {
+        match outcome {
             Ok(()) => return Ok(()),
             Err(Error::ConnectionClosed) => {
+                if let ShardConn::Connected(c) = &mut shard.conns[idx] {
+                    c.close();
+                }
                 shard.conns[idx] = ShardConn::Disconnected;
-                conn.close();
                 continue;
             }
             Err(e) => return Err(e),
@@ -551,21 +568,28 @@ async fn version_on_shard(shard: &mut Shard, opts: &ConnectOpts) -> Result<Box<s
     for _ in 0..size {
         let idx = shard.next;
         shard.next = (shard.next + 1) % size;
-        let conn = match &shard.conns[idx] {
-            ShardConn::Connected(c) => *c,
-            ShardConn::Disconnected => match do_connect(shard.addr, opts).await {
-                Ok(c) => {
-                    shard.conns[idx] = ShardConn::Connected(c);
-                    c
-                }
+        if matches!(shard.conns[idx], ShardConn::Disconnected) {
+            match do_connect(shard.addr, opts).await {
+                Ok(c) => match Client::new(c) {
+                    Ok(client) => shard.conns[idx] = ShardConn::Connected(Box::new(client)),
+                    Err(_) => continue,
+                },
                 Err(_) => continue,
-            },
+            }
+        }
+        let outcome = {
+            let ShardConn::Connected(client) = &mut shard.conns[idx] else {
+                continue;
+            };
+            client.version().await
         };
-        match Client::new(conn)?.version().await {
+        match outcome {
             Ok(v) => return Ok(v),
             Err(Error::ConnectionClosed) => {
+                if let ShardConn::Connected(c) = &mut shard.conns[idx] {
+                    c.close();
+                }
                 shard.conns[idx] = ShardConn::Disconnected;
-                conn.close();
                 continue;
             }
             Err(e) => return Err(e),
@@ -581,24 +605,37 @@ struct ConnectOpts {
     tls_server_name: Option<String>,
 }
 
-/// Get a ConnCtx from a shard, lazily reconnecting if needed.
-async fn get_conn(shard: &mut Shard, opts: &ConnectOpts) -> Result<ConnCtx, Error> {
+/// Borrow a client from a shard, lazily reconnecting if needed.
+///
+/// Two passes: the connect must finish and be stored before the borrow is
+/// taken, or the returned reference would hold `shard` borrowed across the
+/// `await`.
+async fn get_conn<'a>(shard: &'a mut Shard, opts: &ConnectOpts) -> Result<&'a mut Client, Error> {
     let size = shard.conns.len();
+    let mut chosen = None;
     for _ in 0..size {
         let idx = shard.next;
         shard.next = (shard.next + 1) % size;
 
-        match &shard.conns[idx] {
-            ShardConn::Connected(c) => return Ok(*c),
-            ShardConn::Disconnected => {
-                if let Ok(conn) = do_connect(shard.addr, opts).await {
-                    shard.conns[idx] = ShardConn::Connected(conn);
-                    return Ok(conn);
-                }
-            }
+        if matches!(shard.conns[idx], ShardConn::Connected(_)) {
+            chosen = Some(idx);
+            break;
+        }
+        if let Ok(conn) = do_connect(shard.addr, opts).await
+            && let Ok(client) = Client::new(conn)
+        {
+            shard.conns[idx] = ShardConn::Connected(Box::new(client));
+            chosen = Some(idx);
+            break;
         }
     }
-    Err(Error::AllConnectionsFailed)
+    match chosen {
+        Some(idx) => match &mut shard.conns[idx] {
+            ShardConn::Connected(c) => Ok(c),
+            ShardConn::Disconnected => Err(Error::AllConnectionsFailed),
+        },
+        None => Err(Error::AllConnectionsFailed),
+    }
 }
 
 async fn do_connect(addr: SocketAddr, opts: &ConnectOpts) -> Result<ConnCtx, Error> {
