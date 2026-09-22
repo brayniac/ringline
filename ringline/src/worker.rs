@@ -152,7 +152,7 @@ pub struct ShutdownHandle {
     shutdown_flag: Arc<AtomicBool>,
     worker_wake_handles: Vec<crate::wakeup::WakeHandle>,
     /// One entry per listener, in `bind()` call order — the same order that
-    /// gives each its [`ListenerId`].
+    /// gives each its [`ListenerId`](crate::ListenerId).
     listeners: Vec<ListenerHandle>,
     /// Read on the io_uring backend by `register_region` /
     /// `unregister_region`; on the mio backend it sits unused but is kept
@@ -176,7 +176,7 @@ impl ShutdownHandle {
         self.listeners.iter().find_map(|l| l.bound_addr)
     }
 
-    /// The address a specific listener bound to, by the [`ListenerId`] its
+    /// The address a specific listener bound to, by the [`ListenerId`](crate::ListenerId) its
     /// `bind()` call order gives it. `None` for a Unix listener or an id
     /// past the end.
     pub fn bound_addr_of(&self, listener: crate::ListenerId) -> Option<SocketAddr> {
@@ -187,7 +187,7 @@ impl ShutdownHandle {
 
     /// Every listener's bound address, in `bind()` call order. Unix
     /// listeners contribute `None`, so the indices line up with
-    /// [`ListenerId`].
+    /// [`ListenerId`](crate::ListenerId).
     pub fn bound_addrs(&self) -> Vec<Option<SocketAddr>> {
         self.listeners.iter().map(|l| l.bound_addr).collect()
     }
@@ -369,7 +369,7 @@ impl BindAddr {
 }
 
 /// A listener the runtime owns, after binding. One per `bind*()` call, in
-/// call order, so its position is its [`ListenerId`].
+/// call order, so its position is its [`ListenerId`](crate::ListenerId).
 struct ListenerHandle {
     fd: RawFd,
     /// Set once by whoever closes `fd` — `shutdown()` or the acceptor thread
