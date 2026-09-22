@@ -16,7 +16,7 @@ struct Claim {
 const CLAIMS: &[Claim] = &[
     Claim {
         path: "ringline/src/worker.rs",
-        needle: "crossbeam_channel::bounded::<(RawFd, crate::connection::PeerAddr)>",
+        needle: "crossbeam_channel::bounded::<crate::acceptor::AcceptedConn>",
         meaning: "bounded accepted-fd queue",
     },
     Claim {
@@ -26,7 +26,7 @@ const CLAIMS: &[Claim] = &[
     },
     Claim {
         path: "ringline/src/worker.rs",
-        needle: ".name(\"ringline-acceptor\".to_string())",
+        needle: ".name(format!(\"ringline-acceptor-{idx}\"))",
         meaning: "literal acceptor thread name",
     },
     Claim {
@@ -36,7 +36,7 @@ const CLAIMS: &[Claim] = &[
     },
     Claim {
         path: "ringline/src/acceptor.rs",
-        needle: "try_send((fd, peer_addr.clone()))",
+        needle: "try_send(accepted)",
         meaning: "acceptor never blocks on a full worker queue",
     },
     Claim {
@@ -201,14 +201,14 @@ pub fn verify_source_claims(root: &Path) -> io::Result<()> {
     require_order(
         &worker,
         "startup_rx.recv()",
-        "create_listener(addr, self.config.backlog)",
-        "every worker reports readiness before the TCP listener is created",
+        "create_listener(*addr, self.config.backlog)",
+        "every worker reports readiness before any listener is created",
     )?;
     require_order(
         &worker,
-        "create_listener(addr, self.config.backlog)",
-        ".name(\"ringline-acceptor\".to_string())",
-        "the listener is created before the acceptor thread starts",
+        "create_listener(*addr, self.config.backlog)",
+        ".name(format!(\"ringline-acceptor-{idx}\"))",
+        "each listener is created before its acceptor thread starts",
     )?;
 
     let runtime = fs::read_to_string(root.join("ringline/src/runtime/mod.rs"))?;

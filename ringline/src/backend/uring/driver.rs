@@ -402,7 +402,7 @@ pub(crate) struct Driver {
     /// length reaches this, its multishot recv is cancelled (TCP window closes)
     /// and re-armed once the hold drains below the cap.
     pub(crate) forward_hold_cap: usize,
-    pub(crate) accept_rx: Option<crossbeam_channel::Receiver<(RawFd, crate::connection::PeerAddr)>>,
+    pub(crate) accept_rx: Option<crossbeam_channel::Receiver<crate::acceptor::AcceptedConn>>,
     pub(crate) eventfd: RawFd,
     pub(crate) eventfd_buf: [u8; 8],
     /// Wake handle for cross-thread wakeup (wraps the eventfd).
@@ -642,7 +642,7 @@ impl Driver {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         config: &Config,
-        accept_rx: Option<crossbeam_channel::Receiver<(RawFd, crate::connection::PeerAddr)>>,
+        accept_rx: Option<crossbeam_channel::Receiver<crate::acceptor::AcceptedConn>>,
         eventfd: RawFd,
         shutdown_flag: Arc<AtomicBool>,
         resolve_rx: Option<crossbeam_channel::Receiver<crate::resolver::ResolveResponse>>,

@@ -2554,6 +2554,21 @@ impl ConnCtx {
         driver.close_connection(self.conn_index);
     }
 
+    /// Which listener accepted this connection, or `None` if it is outbound.
+    ///
+    /// A runtime can bind several listeners and they all feed the same
+    /// `on_accept`; this is how a handler tells them apart. Ids follow
+    /// `bind()` call order — see [`ListenerId`](crate::ListenerId).
+    pub fn listener(&self) -> Option<crate::ListenerId> {
+        with_state(|driver, _| {
+            let conn = driver.connections.get(self.conn_index)?;
+            if conn.generation != self.generation {
+                return None;
+            }
+            conn.listener
+        })
+    }
+
     /// Access peer address.
     pub fn peer_addr(&self) -> Option<crate::connection::PeerAddr> {
         with_state(|driver, _| {
@@ -3634,6 +3649,11 @@ impl Connection {
         self.tx.peer_addr()
     }
 
+    /// See [`ConnCtx::listener`].
+    pub fn listener(&self) -> Option<crate::ListenerId> {
+        self.tx.listener()
+    }
+
     /// See [`ConnCtx::is_outbound`].
     pub fn is_outbound(&self) -> bool {
         self.tx.is_outbound()
@@ -3871,6 +3891,11 @@ impl SendHalf {
     /// See [`ConnCtx::peer_addr`].
     pub fn peer_addr(&self) -> Option<crate::connection::PeerAddr> {
         self.conn.peer_addr()
+    }
+
+    /// See [`ConnCtx::listener`].
+    pub fn listener(&self) -> Option<crate::ListenerId> {
+        self.conn.listener()
     }
 
     /// See [`ConnCtx::is_outbound`].

@@ -5702,6 +5702,124 @@ fn resolve_disabled_returns_error() {
 
 // ── Unix domain socket tests ────────────────────────────────────────
 
+/// One process, a TCP listener and a Unix listener, one `on_accept`.
+///
+/// Before the listener list a runtime could bind exactly one socket —
+/// `bind()` and `bind_unix()` overwrote each other — so this arrangement was
+/// not expressible at all. Both halves matter: that each connection arrives
+/// with the `ListenerId` of the listener that accepted it, and that ids follow
+/// `bind()` call order.
+#[test]
+fn mixed_tcp_and_unix_listeners_are_distinguishable() {
+    use std::os::unix::net::UnixStream;
+
+    // Records the listener id each accepted connection reported, keyed by the
+    // first byte the peer sends: 'T' from the TCP client, 'U' from the Unix one.
+    static TCP_LISTENER: AtomicU32 = AtomicU32::new(u32::MAX);
+    static UNIX_LISTENER: AtomicU32 = AtomicU32::new(u32::MAX);
+
+    struct ListenerReporter;
+    impl AsyncEventHandler for ListenerReporter {
+        fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
+            async move {
+                let id = conn.listener().map(|l| l.index()).unwrap_or(u32::MAX);
+                let (mut tx, mut rx) = conn.split();
+                let _ = rx
+                    .with_data(|data| {
+                        match data.first() {
+                            Some(b'T') => TCP_LISTENER.store(id, Ordering::SeqCst),
+                            Some(b'U') => UNIX_LISTENER.store(id, Ordering::SeqCst),
+                            _ => {}
+                        }
+                        let _ = tx.send_nowait(data);
+                        ParseResult::Consumed(data.len())
+                    })
+                    .await;
+            }
+        }
+        fn create_for_worker(_id: usize) -> Self {
+            ListenerReporter
+        }
+    }
+
+    TCP_LISTENER.store(u32::MAX, Ordering::SeqCst);
+    UNIX_LISTENER.store(u32::MAX, Ordering::SeqCst);
+
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let sock_path =
+        std::env::temp_dir().join(format!("ringline-mixed-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&sock_path);
+
+    // TCP binds first, so it is listener 0 and the Unix socket is listener 1.
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
+        .bind(addr.parse().unwrap())
+        .bind_unix(&sock_path)
+        .launch::<ListenerReporter>()
+        .expect("launch failed");
+
+    assert_eq!(
+        shutdown.listener_count(),
+        2,
+        "both binds must produce listeners; one overwriting the other is the bug this fixes"
+    );
+
+    wait_for_server(&addr);
+    for _ in 0..200 {
+        if sock_path.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(sock_path.exists(), "unix socket file not created");
+
+    let _ = echo_round_trip(&addr, b"T");
+
+    let mut ustream = UnixStream::connect(&sock_path).unwrap();
+    ustream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    ustream.write_all(b"U").unwrap();
+    ustream.flush().unwrap();
+    let mut buf = [0u8; 1];
+    ustream.read_exact(&mut buf).unwrap();
+
+    let tcp_id = TCP_LISTENER.load(Ordering::SeqCst);
+    let unix_id = UNIX_LISTENER.load(Ordering::SeqCst);
+    assert_eq!(
+        tcp_id, 0,
+        "TCP bound first, so it is listener 0 (u32::MAX = handler never ran)"
+    );
+    assert_eq!(
+        unix_id, 1,
+        "Unix bound second, so it is listener 1 (u32::MAX = handler never ran)"
+    );
+
+    // The whole point: the handler can tell them apart.
+    assert_ne!(tcp_id, unix_id);
+
+    // The ids index the right listeners: only the TCP one has an address, and
+    // `bound_addrs()` keeps Unix listeners as `None` so positions stay aligned
+    // with `ListenerId`.
+    let addrs = shutdown.bound_addrs();
+    assert_eq!(addrs.len(), 2);
+    assert_eq!(
+        addrs[tcp_id as usize].map(|a| a.port()),
+        Some(port),
+        "the TCP listener's id should index its own bound address"
+    );
+    assert!(
+        addrs[unix_id as usize].is_none(),
+        "a Unix listener has no SocketAddr, but still holds its slot"
+    );
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+    let _ = std::fs::remove_file(&sock_path);
+}
+
 /// UDS echo server: bind_unix, connect via std UnixStream, echo round trip.
 #[test]
 fn unix_socket_echo() {

@@ -32,9 +32,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     pub(crate) fn new(
         config: &crate::config::Config,
         handler: A,
-        accept_rx: Option<
-            crossbeam_channel::Receiver<(std::os::fd::RawFd, crate::connection::PeerAddr)>,
-        >,
+        accept_rx: Option<crossbeam_channel::Receiver<crate::acceptor::AcceptedConn>>,
         eventfd: std::os::fd::RawFd,
         shutdown_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
         resolve_rx: Option<crossbeam_channel::Receiver<crate::resolver::ResolveResponse>>,
@@ -1839,7 +1837,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     Some(ref rx) => rx.try_recv().ok(),
                     None => None,
                 };
-                let Some((raw_fd, peer_addr)) = item else {
+                let Some(crate::acceptor::AcceptedConn {
+                    fd: raw_fd,
+                    listener,
+                    peer: peer_addr,
+                }) = item
+                else {
                     break;
                 };
 
@@ -1855,6 +1858,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
                 if let Some(cs) = self.driver.connections.get_mut(conn_index) {
                     cs.peer_addr = Some(peer_addr);
+                    cs.listener = Some(listener);
                 }
 
                 if self

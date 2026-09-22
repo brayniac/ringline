@@ -49,8 +49,8 @@
 //!                              │
 //!                              ▼
 //! ┌─────────────────────────────────────────────────────────────────┐
-//! │                     Acceptors Thread                            │
-//! │              (accept4() with SO_REUSEPORT)                      │
+//! │        Acceptor Thread, one per listener (TCP or Unix)          │
+//! │      blocking accept4() -> round-robin to worker channels       │
 //! └─────────────────────────────────────────────────────────────────┘
 //!                              │
 //!              ┌───────────────┼───────────────┐
@@ -228,6 +228,8 @@ pub use connection::PeerAddr;
 pub use handler::ConnToken;
 /// I/O context passed to [`AsyncEventHandler::on_tick`] and [`AsyncEventHandler::on_notify`].
 pub use handler::DriverCtx;
+/// Identifies which listener a connection arrived on.
+pub use handler::ListenerId;
 /// Pre-classified part for scatter-gather sends via `submit_batch`.
 pub use handler::SendPart;
 /// Opaque handle for a UDP socket.

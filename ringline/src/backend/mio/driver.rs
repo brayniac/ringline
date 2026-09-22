@@ -125,7 +125,7 @@ pub(crate) struct Driver {
     pub(crate) accumulators: AccumulatorTable,
     pub(crate) send_copy_pool: SendCopyPool,
     pub(crate) send_queues: Vec<ConnSendState>,
-    pub(crate) accept_rx: Option<crossbeam_channel::Receiver<(RawFd, crate::connection::PeerAddr)>>,
+    pub(crate) accept_rx: Option<crossbeam_channel::Receiver<crate::acceptor::AcceptedConn>>,
     pub(crate) wake_handle: crate::wakeup::WakeFd,
     pub(crate) shutdown_flag: Arc<AtomicBool>,
     pub(crate) shutdown_local: bool,
@@ -276,7 +276,7 @@ impl Driver {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         config: &Config,
-        accept_rx: Option<crossbeam_channel::Receiver<(RawFd, crate::connection::PeerAddr)>>,
+        accept_rx: Option<crossbeam_channel::Receiver<crate::acceptor::AcceptedConn>>,
         eventfd: RawFd,
         wake_fd: crate::wakeup::WakeFd,
         shutdown_flag: Arc<AtomicBool>,
