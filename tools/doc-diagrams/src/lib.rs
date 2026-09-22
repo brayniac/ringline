@@ -16,7 +16,7 @@ struct Claim {
 const CLAIMS: &[Claim] = &[
     Claim {
         path: "ringline/src/worker.rs",
-        needle: "crossbeam_channel::bounded::<(RawFd, SocketAddr)>",
+        needle: "crossbeam_channel::bounded::<(RawFd, crate::connection::PeerAddr)>",
         meaning: "bounded accepted-fd queue",
     },
     Claim {
@@ -36,7 +36,7 @@ const CLAIMS: &[Claim] = &[
     },
     Claim {
         path: "ringline/src/acceptor.rs",
-        needle: "try_send((fd, peer_addr))",
+        needle: "try_send((fd, peer_addr.clone()))",
         meaning: "acceptor never blocks on a full worker queue",
     },
     Claim {

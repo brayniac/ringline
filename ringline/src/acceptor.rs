@@ -10,7 +10,7 @@ pub struct AcceptorConfig {
     /// The listening socket fd.
     pub listen_fd: RawFd,
     /// Per-worker channels to send accepted (fd, peer_addr) pairs.
-    pub worker_channels: Vec<Sender<(RawFd, SocketAddr)>>,
+    pub worker_channels: Vec<Sender<(RawFd, crate::connection::PeerAddr)>>,
     /// Per-worker wake handles to wake the event loop after sending a connection.
     pub worker_wake_handles: Vec<crate::wakeup::WakeFd>,
     /// Shared flag set by ShutdownHandle to signal the acceptor to stop.
@@ -101,8 +101,17 @@ pub fn run_acceptor(config: AcceptorConfig) {
         }
 
         // Parse peer address from the sockaddr_storage filled by accept4.
-        let peer_addr = sockaddr_to_socket_addr(&addr_storage)
-            .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
+        // A Unix accept has no `SocketAddr` — its peer is normally unnamed, so
+        // the kernel returns family-only and `sockaddr_to_peer_addr` yields
+        // `Unix("")`. Substituting a `SocketAddr` here is how an accepted Unix
+        // connection used to reach the handler as `Tcp(0.0.0.0:0)`.
+        //
+        // The fallback covers only address families the helper does not know;
+        // AF_INET, AF_INET6 and AF_UNIX all resolve above.
+        let peer_addr = crate::backend::sockaddr::sockaddr_to_peer_addr(&addr_storage, addr_len)
+            .unwrap_or_else(|| {
+                crate::connection::PeerAddr::Tcp(SocketAddr::from(([0, 0, 0, 0], 0)))
+            });
 
         // Pick a target worker based on chunk assignment, then fall back to
         // adjacent workers if that worker's channel is full or it has exited.
@@ -119,7 +128,7 @@ pub fn run_acceptor(config: AcceptorConfig) {
                 continue;
             }
 
-            match config.worker_channels[worker_idx].try_send((fd, peer_addr)) {
+            match config.worker_channels[worker_idx].try_send((fd, peer_addr.clone())) {
                 Ok(()) => {
                     config.worker_wake_handles[worker_idx].wake();
                     conn_count = conn_count.wrapping_add(1);
@@ -199,24 +208,5 @@ fn accept_nonblock(
             }
         }
         fd
-    }
-}
-
-/// Convert a `sockaddr_storage` (from accept) to a Rust `SocketAddr`.
-fn sockaddr_to_socket_addr(storage: &libc::sockaddr_storage) -> Option<SocketAddr> {
-    match storage.ss_family as libc::c_int {
-        libc::AF_INET => {
-            let sa = unsafe { &*(storage as *const _ as *const libc::sockaddr_in) };
-            let ip = std::net::Ipv4Addr::from(u32::from_be(sa.sin_addr.s_addr));
-            let port = u16::from_be(sa.sin_port);
-            Some(SocketAddr::from((ip, port)))
-        }
-        libc::AF_INET6 => {
-            let sa = unsafe { &*(storage as *const _ as *const libc::sockaddr_in6) };
-            let ip = std::net::Ipv6Addr::from(sa.sin6_addr.s6_addr);
-            let port = u16::from_be(sa.sin6_port);
-            Some(SocketAddr::from((ip, port)))
-        }
-        _ => None,
     }
 }
