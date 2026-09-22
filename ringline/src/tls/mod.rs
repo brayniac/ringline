@@ -511,16 +511,8 @@ pub struct TlsTable {
 }
 
 impl TlsTable {
-    /// Create a table with capacity for `max_connections`.
-    pub fn new(
-        max_connections: u32,
-        server_config: Option<Arc<rustls::ServerConfig>>,
-        client_config: Option<Arc<rustls::ClientConfig>>,
-    ) -> Self {
-        Self::with_listener_configs(max_connections, server_config, client_config, Vec::new())
-    }
-
-    /// Create a table that can serve a different server config per listener.
+    /// Create a table with capacity for `max_connections`, able to serve a
+    /// different server config per listener.
     ///
     /// `listener_configs` is indexed by `ListenerId`; a `None` entry falls back
     /// to `server_config`.
@@ -558,11 +550,6 @@ impl TlsTable {
     /// Whether connections accepted on `listener` should terminate TLS.
     pub fn has_server_config_for(&self, listener: Option<crate::ListenerId>) -> bool {
         self.server_config_for(listener).is_some()
-    }
-
-    /// Whether a server config is present (for TLS accept on inbound connections).
-    pub fn has_server_config(&self) -> bool {
-        self.server_config.is_some()
     }
 
     /// Whether a client config is present (for TLS connect on outbound connections).
@@ -943,7 +930,7 @@ mod tests {
     // exactly the state this task starts from.
     #[test]
     fn create_selects_the_engine_the_build_asked_for() {
-        let mut table = TlsTable::new(4, Some(server_config()), None);
+        let mut table = TlsTable::with_listener_configs(4, Some(server_config()), None, Vec::new());
         table.create(0, None).expect("create a server connection");
         let conn = table.get_mut(0).expect("connection exists");
 
@@ -983,7 +970,8 @@ mod tests {
             Some(sz) => server_config_with_fragment(sz),
             None => server_config(),
         };
-        let mut table = TlsTable::new(4, Some(config), Some(client_config()));
+        let mut table =
+            TlsTable::with_listener_configs(4, Some(config), Some(client_config()), Vec::new());
         table.create(0, None).expect("create a server connection");
         table
     }
@@ -1015,7 +1003,8 @@ mod tests {
     fn create_client_records_the_client_configs_fragment_size() {
         let mut config = Arc::try_unwrap(client_config()).expect("sole owner");
         config.max_fragment_size = Some(2048);
-        let mut table = TlsTable::new(4, None, Some(Arc::new(config)));
+        let mut table =
+            TlsTable::with_listener_configs(4, None, Some(Arc::new(config)), Vec::new());
         let name: rustls::pki_types::ServerName<'static> = "localhost".try_into().unwrap();
         table.create_client(1, name).expect("create a client");
         assert_eq!(table.get_mut(1).unwrap().max_plaintext_per_record, 2043);

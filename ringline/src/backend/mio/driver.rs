@@ -1218,7 +1218,12 @@ pub(crate) mod tests {
 
         // A real, already-handshaked rustls session — the admission maths is
         // only worth testing against records rustls actually produced.
-        let mut table = crate::tls::TlsTable::new(config.max_connections, None, None);
+        let mut table = crate::tls::TlsTable::with_listener_configs(
+            config.max_connections,
+            None,
+            None,
+            Vec::new(),
+        );
         table.insert_for_test(conn_index, handshaked_tls_conn());
         // One byte-slot's worth of plaintext, chosen so the two sizings give
         // different answers: it fits in ONE slot as plaintext but spans two
@@ -1295,7 +1300,12 @@ pub(crate) mod tests {
         let conn = token(&driver, conn_index);
         let id = bounded_ids(1)[0];
 
-        let mut table = crate::tls::TlsTable::new(config.max_connections, None, None);
+        let mut table = crate::tls::TlsTable::with_listener_configs(
+            config.max_connections,
+            None,
+            None,
+            Vec::new(),
+        );
         table.insert_for_test(conn_index, handshaked_tls_conn());
         driver.tls_table = Some(table);
 
@@ -1342,7 +1352,12 @@ pub(crate) mod tests {
         let conn = token(&driver, conn_index);
         let id = bounded_ids(1)[0];
 
-        let mut table = crate::tls::TlsTable::new(config.max_connections, None, None);
+        let mut table = crate::tls::TlsTable::with_listener_configs(
+            config.max_connections,
+            None,
+            None,
+            Vec::new(),
+        );
         table.insert_for_test(conn_index, handshaked_tls_conn());
         driver.tls_table = Some(table);
 

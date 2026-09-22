@@ -12303,7 +12303,7 @@ mod tests {
     /// this is the only TLS a bounded-send test sees.
     fn install_handshaked_tls(el: &mut AsyncEventLoop<NoopHandler>, conn_index: u32) {
         let max = el.driver.connections.max_slots();
-        let mut table = crate::tls::TlsTable::new(max, None, None);
+        let mut table = crate::tls::TlsTable::with_listener_configs(max, None, None, Vec::new());
         #[cfg(feature = "tls-unbuffered")]
         table.insert_for_test(
             conn_index,
