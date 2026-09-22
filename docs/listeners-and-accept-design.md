@@ -97,72 +97,156 @@ mio has no multishot accept. It keeps the pool, or registers the shared
 listener per worker with `EPOLLEXCLUSIVE`. Correct and non-pathological is the
 bar there, not optimal.
 
-### 5. Placement and steering
+### 5. Placement, and why it is not a detail
 
 The pool mode's real advantage over the merged mode is *placement*: explicit
-round-robin versus the kernel's 4-tuple hash, which is not uniform at low
-connection counts. Connection distribution is the axis on which this project
-has had its worst performance bug, so the merged mode needs an answer.
+round-robin versus the kernel's 4-tuple hash. That difference is much larger
+than it sounds, because of the topology every real client uses.
+
+**A pooled client is the adversarial case for hashing.** N connections from one
+client to one host vary only in source port, so `SO_REUSEPORT` spreads them
+approximately uniformly at random. That is balls-in-bins: at N = W — the
+canonical "one connection per server core" pool — the expected fraction of
+*empty* workers is (1 - 1/W)^W → 1/e ≈ **37%**. Eight connections across eight
+workers typically leaves three workers idle and stacks three on one. Round-robin
+gives exactly one each, deterministically.
+
+A third of the machine dark on the most common client pattern is not a marginal
+distribution difference, and it is the topology all of our load generators use.
+So **BPF steering is a prerequisite for the merged mode, not a refinement of
+it** — without explicit placement the merged mode cannot be the default.
 
 `SO_REUSEPORT` groups accept a BPF program that chooses the target socket:
 
 - `SO_ATTACH_REUSEPORT_CBPF` — classic BPF returning an index into the group.
-  Unprivileged. Cannot read a map, so changing the policy means re-attaching a
-  new program via `setsockopt`. Coarse but sufficient for "exclude worker 3".
+  Unprivileged. Cannot read a map, so changing policy means re-attaching a new
+  program via `setsockopt`. Coarse, but enough for "exclude worker 3".
 - `SO_ATTACH_REUSEPORT_EBPF` — `BPF_PROG_TYPE_SK_REUSEPORT` with a
   `BPF_MAP_TYPE_REUSEPORT_SOCKARRAY` and `bpf_sk_select_reuseport()`. Userspace
   updates the map at run time, so a worker leaves the rotation with no
   `setsockopt` and no socket close. Needs BPF load privileges.
 
-Either gives the merged mode explicit placement. **Both need a kernel-behavior
-spike before anything depends on them** — in particular whether a worker
-removed from selection still accrues a backlog on its own socket.
-
 Recorded hazard: closing a `SO_REUSEPORT` listener **resets** connections still
-queued on it. Graceful shutdown in merged mode must stop accepting, drain the
-queue, then close.
+queued on it. Graceful shutdown in merged mode must stop accepting, drain, then
+close.
 
-### 6. Rebalancing, in three tiers
+### 5a. Spread versus pack
 
-Live migration is impossible by construction and is not proposed. The
+Spreading a client's pool across workers is not unconditionally right, and the
+codebase already contains the opposing argument. `conn_chunk_size`
+(`config.rs:145`) exists to do the opposite:
+
+> Higher values pack connections onto fewer workers at low connection counts,
+> keeping each active worker's CQE density high enough for io_uring batching to
+> pay off. Rule of thumb: set to the minimum connections-per-worker at which
+> your workload sees good batching (typically 16-64).
+
+Follow that rule of thumb and a 16-64 connection client pool lands **entirely on
+one worker**. The knob's own caveat — no effect once total connections exceed
+`conn_chunk_size * num_workers` — covers the many-client case and is exactly
+wrong for the single pooled client.
+
+The tension is real, not an oversight. Packing buys CQE batching density;
+spreading buys parallelism and tail latency. Both regimes have been measured
+here: the throughput work where batching paid, and the server-latency finding
+where ringline lost ~28% to tokio in the idle-CPU, latency-bound case — which is
+precisely where packing hurts.
+
+This does not resolve to a single default. It resolves to **placement policy as
+the configured thing**, with `conn_chunk_size` as one point in that space, and
+documentation that names the regime each setting serves rather than a rule of
+thumb that is hostile to pooled clients.
+
+### 6. Rebalancing, in four tiers
+
+Live migration of a running connection is impossible and is not proposed. The
 `ConnectionTable` slot, `RecvAccumulator`, send queue and task-slab entry are
-all thread-local, and `Connection`, `SendHalf`, `RecvHalf` and `ConnCtx` are
-`!Send` via `PhantomData<*const ()>`. Moving a live connection means moving all
-of that across a thread boundary, which is the negation of the design.
+thread-local, and `Connection`, `SendHalf`, `RecvHalf` and `ConnCtx` are
+`!Send` via `PhantomData<*const ()>`.
 
-What is possible, cheapest first:
+But the *connection* is not what blocks a move — the *task* is. Cheapest first:
 
-**Tier 1 — prevent.** Place at accept time, before the connection has any
+**Tier 1 - prevent.** Place at accept time, before the connection has any
 state. In pool mode that is the existing round-robin. In merged mode, a worker
-that accepts while over its share forwards the **raw fd** to the least-loaded
-worker via the existing channel — at that point nothing exists but an integer,
-so it is cheap and safe. One mechanism, two policies: the fd channel is the
-primary path in pool mode and the exception path in merged mode.
+accepting while over its share forwards the **raw fd** to the least-loaded
+worker over the existing channel; at that point nothing exists but an integer.
+One mechanism, two policies.
 
-**Tier 2 — steer.** Take an overloaded worker out of the accept rotation via
+**Tier 2 - steer.** Take an overloaded worker out of the accept rotation via
 §5. No closes, no handshakes, reversible.
 
-**Tier 3 — shed.** For imbalance that has already formed under long-lived
-connections, hang up slowly so clients reconnect elsewhere.
+**Tier 3 - park and adopt.** Move the connection to another worker without the
+client noticing.
 
-Tier 3 is a **hint, not an action**: the runtime marks a worker as shedding and
-the handler sheds when convenient. "Graceful" is protocol-specific — H2 has
-GOAWAY, H1 has `Connection: close`, raw TCP has only FIN, and a request may be
-in flight. The runtime knows the load; only the handler knows what a polite
-goodbye looks like. A hint also keeps this inside the thread-local model:
-nothing crosses a thread, a task simply decides to finish.
+Everything the connection *is* can move. Inside one process an fd is an integer,
+so there is no `SCM_RIGHTS` dance; the accumulator is `BytesMut`; the TLS state
+is a `rustls::ServerConnection`. What cannot move is the future `on_accept`
+returned — it is `!Send` and `'static` and lives in worker A's `TaskSlab`.
+Making it `Send` would put `Send` bounds across the whole user-facing API, which
+is the thread-per-core design's entire benefit. So the future is **dropped on A
+and recreated on B**, which makes park a cooperative operation at a point where
+the handler holds no state it cannot hand over.
 
-The economics are why this is last. Each shed connection costs a reconnect plus
-a full TLS handshake — the expense §7 exists to reduce. And under an unsteered
-hash, the replacement lands uniformly: with 8 workers a shed connection has a
-1-in-8 chance of returning to the same worker, so it is a random walk toward
-balance paid for in handshakes. Tier 2 makes it targeted — a shed connection
-cannot return to the worker that shed it — which is the main reason tier 2 is
-worth building before tier 3.
+The quiesce this needs already exists. Deferred teardown is implemented and
+tested — `ctx_close_defers_behind_in_flight_send`,
+`close_defers_while_chain_active`, `close_while_segment_pinned_defers_bid_release`
+— because Domain Invariant 1 requires waiting for in-flight sends, active chains
+and pinned segments before releasing a slot. Park is that path stopped one step
+early: quiesce, then hand the fd over instead of closing it. Fd movement between
+workers is likewise already supported —
+`register_files_update(fd_index, &[fd])` (`backend/uring/driver.rs:1635`) is how
+an fd enters a worker's fixed-file table.
 
-Guardrails: rate limit, hysteresis so it does not oscillate, prefer idle
-connections, floor on per-worker count. Only triggers on live-connection counts
-under heterogeneous lifetimes; uniform short-lived traffic re-hashes itself.
+Sequence: quiesce via the deferred-close path → unregister the fd from A →
+package `(OwnedFd, leftover accumulator bytes, TLS state, ListenerId, PeerAddr,
+handler payload)`, all `Send` → send over the tier-1 channel → B allocates a
+slot, registers the fd, seeds the accumulator, re-arms multishot recv, and calls
+a new `on_adopt` hook.
+
+`on_adopt` is **optional**, and the handler payload is the new public surface:
+since the future dies, anything the handler kept — negotiated protocol,
+authenticated identity, subscriptions — is rebuilt or carried as an opaque
+`Box<dyn Any + Send>` returned at park and handed back at adopt.
+
+Viability is not cache-versus-web, it is **request/response versus multiplexed**:
+
+| shape | quiescent point | payload | verdict |
+|---|---|---|---|
+| RESP, memcache | after every response | empty, or a DB index / auth flag | easy |
+| HTTP/1.1 keep-alive | after every response | near none | easy |
+| HTTP/2 | zero open streams | `H2Connection` is plain data (`ringline-h2/src/connection.rs:190`) — sans-IO, so it moves | idle connections yes, saturated no |
+| HTTP/3 | — | rides `UdpCtx`, not the connection table; QUIC migrates at the protocol level | out of scope |
+
+The h2 gate predicate is already written and public: `H2Conn::pending_count()`
+(`ringline-http/src/h2_conn.rs:448`). `pending_count() == 0` is the park gate.
+
+The requirement is also less restrictive than it first appears, because **you
+park idle connections, not busy ones**. Rebalancing targets long-lived
+connections, and long-lived connections are idle between bursts.
+
+**Tier 4 - shed.** For handlers that cannot park, hang up slowly so clients
+reconnect elsewhere. A hint, not an action: "graceful" is protocol-specific —
+H2 has GOAWAY, H1 has `Connection: close`, raw TCP has only FIN, and a request
+may be in flight. The runtime knows the load; only the handler knows what a
+polite goodbye looks like.
+
+Shed is last because it is expensive and imprecise. Each shed connection costs a
+reconnect plus a full TLS handshake — the expense §7 exists to reduce — and
+under an unsteered hash the replacement lands uniformly, so with 8 workers it
+has a 1-in-8 chance of returning to the same worker. Park has neither problem:
+nothing is client-visible, and placement is **exact** because you choose the
+target worker. That is also why park, not steering, is what makes rebalance
+converge.
+
+Guardrails for tiers 3 and 4: rate limit, hysteresis so it does not oscillate,
+prefer idle connections, floor on per-worker count.
+
+**Non-goal, stated so it is not filed as a bug later.** If a worker is hot
+because of *one* saturated connection, none of this helps. Park cannot — there
+is no quiescent point. Shed cannot — it relocates the load and charges a
+handshake for it. Rebalancing addresses **count** imbalance, not **load**
+imbalance from a single heavy connection. That is inherent to thread-per-core
+without work stealing.
 
 ### 7. Handshake offload as its own knob
 
@@ -184,39 +268,56 @@ measurement before it is more than a knob.
 ## Open questions
 
 1. Does a `SO_REUSEPORT` socket excluded by a BPF selection program still
-   accrue a backlog? Decides whether tier 2 is sufficient alone.
+   accrue a backlog? Decides whether tier 2 works at all.
 2. CBPF re-attach cost under churn — is unprivileged steering practical, or
-   does useful steering require BPF privileges we do not want to demand?
-3. Does any client crate need to be generic over transport (redis and
-   memcached both speak Unix sockets)? Decides whether §1's transport erasure
-   is also needed on the outbound side.
-4. Is per-listener TLS reachable without restructuring the handshake path, or
+   does useful steering require BPF privileges we do not want to demand of a
+   server process?
+3. Does the `tls-unbuffered` engine hold partial-record state that complicates
+   moving a `ServerConnection` between workers? (Tier 3.)
+4. Can a `Bytes` handed out by `with_bytes` still be alive at a park point? The
+   quiescent-point rule should preclude it; it needs to be an assertion, not an
+   assumption. (Tier 3.)
+5. Does any client crate need to be generic over transport (redis and memcached
+   both speak Unix sockets)? Decides whether §1's transport erasure is also
+   needed on the outbound side.
+6. Is per-listener TLS reachable without restructuring the handshake path, or
    does `TlsConfig` need to become per-connection state?
 
 ## Measurement
 
-Two measurements decide the default accept mode, and the second must be able
-to show a regression or it is not evidence:
+Two measurements decide the default accept mode. The second is the one that
+constrains the design, and **its topology is the whole point**: measured from N
+independent client addresses, hash placement looks fine and hides §5 entirely.
+It must be a *single client host opening a pool*, which is the adversarial case
+and also what every load generator here actually does.
 
 - **Connect rate** under a connect storm — what merged mode should improve.
-- **Per-worker connection counts** at 8, 16 and 64 connections across 8
-  workers — what merged mode could regress, and the axis of the single-core
-  funnel bug.
+- **Per-worker connection counts**, one client host opening 8, 16 and 64
+  connections to 8 workers. Expect round-robin to give exact thirds-free
+  placement and an unsteered hash to leave ~37% of workers idle at N = W. A run
+  that cannot show that difference is not evidence.
 
 Both on two X710 guests, io_uring and mio, before and after, per the standing
 send-path A/B mandate.
 
 ## Staging
 
-1. Listener list + per-listener config + `ListenerId` (breaking builder change).
+1. Listener list + per-listener config (TLS, nodelay, backlog, bound address)
+   + `ListenerId` on `Connection` (breaking builder change).
 2. Acceptor payload `(RawFd, ListenerId, PeerAddr)`; retire the fake peer addr.
 3. Merged accept mode behind config, io_uring multishot; mio keeps the pool.
-4. BPF steering spike → tier 1 and tier 2 placement.
-5. Shed hint (tier 3).
-6. Handshake offload knob, gated on its prototype measuring well.
+4. BPF steering spike → tier 1 and tier 2 placement. Gates whether merged mode
+   can ever be the default.
+5. Park and adopt (tier 3): quiesce reuse, fd handover, `on_adopt`.
+6. Shed hint (tier 4).
+7. Handshake offload knob, gated on its prototype measuring well.
 
 Fix the stale `lib.rs:52` diagram in step 1 — it is the crate's front page and
 it currently describes `SO_REUSEPORT` that does not exist.
+
+Placement policy documentation (§5a) belongs with step 3 or 4, whichever lands
+the second placement mechanism: the existing `conn_chunk_size` rule of thumb is
+actively wrong for pooled clients and should not survive this work unqualified.
 
 This is a breaking builder change, so it batches with the naming work already
 queued for the next release: `connect() -> Connection`, `UdpCtx -> UdpSocket`,
