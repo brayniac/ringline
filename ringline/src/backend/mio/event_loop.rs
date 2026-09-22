@@ -33,7 +33,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     pub(crate) fn new(
         config: &Config,
         handler: A,
-        accept_rx: Option<crossbeam_channel::Receiver<(RawFd, crate::connection::PeerAddr)>>,
+        accept_rx: Option<crossbeam_channel::Receiver<crate::acceptor::AcceptedConn>>,
         eventfd: RawFd,
         wake_fd: crate::wakeup::WakeFd,
         shutdown_flag: Arc<AtomicBool>,
@@ -361,7 +361,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 Some(ref rx) => rx.try_recv().ok(),
                 None => None,
             };
-            let Some((raw_fd, peer_addr)) = item else {
+            let Some(crate::acceptor::AcceptedConn {
+                fd: raw_fd,
+                listener,
+                peer: peer_addr,
+            }) = item
+            else {
                 break;
             };
 
@@ -378,6 +383,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // Set peer address.
             if let Some(cs) = self.driver.connections.get_mut(conn_index) {
                 cs.peer_addr = Some(peer_addr);
+                cs.listener = Some(listener);
             }
 
             // Convert raw fd to mio TcpStream.
@@ -1566,7 +1572,7 @@ mod tests {
     /// `drain_channels`' accept path.
     fn test_loop_with_accept(
         config: &Config,
-        accept_rx: Option<crossbeam_channel::Receiver<(RawFd, crate::connection::PeerAddr)>>,
+        accept_rx: Option<crossbeam_channel::Receiver<crate::acceptor::AcceptedConn>>,
     ) -> (AsyncEventLoop<NoopHandler>, crate::wakeup::WakeHandle) {
         let (read_fd, handle) = crate::wakeup::create_wake_fd().expect("wake fd");
         let event_loop = AsyncEventLoop::new(
@@ -1902,7 +1908,11 @@ mod tests {
 
         let (server_fd, _peer, peer_addr) = accepted_socket();
         accept_tx
-            .send((server_fd, crate::connection::PeerAddr::Tcp(peer_addr)))
+            .send(crate::acceptor::AcceptedConn {
+                fd: server_fd,
+                listener: crate::ListenerId::from_index(0),
+                peer: crate::connection::PeerAddr::Tcp(peer_addr),
+            })
             .expect("queue the accept");
         event_loop.drain_channels();
         assert!(

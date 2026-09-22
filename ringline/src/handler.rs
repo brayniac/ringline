@@ -110,6 +110,40 @@ impl ConnToken {
     }
 }
 
+/// Identifies which listener a connection arrived on.
+///
+/// A runtime can bind several listeners — any mix of TCP and Unix — and every
+/// one of them feeds the same [`on_accept`]. Without this a handler serving,
+/// say, plaintext on one port and a Unix admin socket on another has no way to
+/// tell the two apart.
+///
+/// Ids are assigned in `bind()` / `bind_unix()` call order, starting at 0, so
+/// a caller that knows the order it bound in knows the id. Pair it with
+/// [`ShutdownHandle::bound_addr_of`] to recover the address a given id landed
+/// on — useful when binding port 0.
+///
+/// [`on_accept`]: crate::AsyncEventHandler::on_accept
+/// [`ShutdownHandle::bound_addr_of`]: crate::ShutdownHandle::bound_addr_of
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ListenerId(pub(crate) u32);
+
+impl ListenerId {
+    /// The listener's position in `bind()` call order, from 0.
+    pub fn index(&self) -> u32 {
+        self.0
+    }
+
+    pub(crate) fn from_index(index: u32) -> Self {
+        ListenerId(index)
+    }
+}
+
+impl std::fmt::Display for ListenerId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "listener {}", self.0)
+    }
+}
+
 /// Opaque handle for a UDP socket.
 ///
 /// Each worker that binds a UDP address gets its own socket (via `SO_REUSEPORT`).

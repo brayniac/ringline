@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Breaking:** `RinglineBuilder::bind()` and `bind_unix()` now **accumulate**
+  listeners instead of overwriting each other, so a runtime can serve any mix of
+  TCP and Unix listeners. Previously `bind_addr` was a single `Option`, calling
+  both silently discarded the first, and per-connection settings were therefore
+  process-global — `tcp_nodelay(true)` was accepted, documented, and then
+  suppressed at run time for Unix binds. Each listener now answers for itself.
+
+  Connections carry the [`ListenerId`] of the listener that accepted them,
+  exposed as `listener()` on `ConnCtx`, `Connection` and `SendHalf` (`None` for
+  outbound), so one `on_accept` can dispatch across listeners. Ids follow
+  `bind()` call order. `ShutdownHandle` gains `bound_addr_of()`, `bound_addrs()`
+  and `listener_count()`; `bound_addr()` still returns the first TCP listener's
+  address, so single-listener callers are unaffected at the call site.
+
+  Per-listener TLS is not included — `TlsTable` holds one server config and both
+  accept paths gate on it, so keying it by listener is a separate change.
+  Step 1 of `docs/listeners-and-accept-design.md` (#443).
+
 - **Breaking (io_uring):** `ConnCtx::segments()` and
   `ConnCtx::recv_owned_segment()` now return `io::Result<_>` and refuse a
   conflicting entry instead of silently producing a reader that can never

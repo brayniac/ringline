@@ -53,6 +53,27 @@ fn panic_payload(payload: &(dyn Any + Send)) -> String {
     }
 }
 
+/// Close listeners already bound when a later bind or acceptor spawn fails.
+///
+/// Without this a failure on the second `bind()` would leave the first socket
+/// listening with an acceptor thread feeding channels nobody drains — the
+/// port stays taken and peers get accepted into a runtime that is being torn
+/// down. `shutdown(SHUT_RD)` first for the same reason `ShutdownHandle` does
+/// it: it wakes a thread parked in `accept4` and frees the port immediately.
+fn close_listeners(listeners: &[ListenerHandle]) {
+    for listener in listeners {
+        if !listener
+            .closed
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            unsafe {
+                libc::shutdown(listener.fd, libc::SHUT_RD);
+                libc::close(listener.fd);
+            }
+        }
+    }
+}
+
 fn rollback_workers(
     shutdown_flag: &Arc<AtomicBool>,
     worker_wake_fds: &[crate::wakeup::WakeFd],
@@ -130,9 +151,9 @@ impl WorkerReadFd {
 pub struct ShutdownHandle {
     shutdown_flag: Arc<AtomicBool>,
     worker_wake_handles: Vec<crate::wakeup::WakeHandle>,
-    listen_fd: Option<RawFd>,
-    listen_fd_closed: Option<Arc<AtomicBool>>,
-    bound_addr: Option<SocketAddr>,
+    /// One entry per listener, in `bind()` call order — the same order that
+    /// gives each its [`ListenerId`](crate::ListenerId).
+    listeners: Vec<ListenerHandle>,
     /// Read on the io_uring backend by `register_region` /
     /// `unregister_region`; on the mio backend it sits unused but is kept
     /// so the field layout is identical across backends.
@@ -141,11 +162,39 @@ pub struct ShutdownHandle {
 }
 
 impl ShutdownHandle {
-    /// The actual TCP address the listener bound to, if any. Returns `Some`
-    /// for TCP `bind()` (port may have been zero-resolved) and `None` for
-    /// client-only mode or Unix-socket binds.
+    /// The actual TCP address of the **first** TCP listener, if any. Returns
+    /// `Some` for a TCP `bind()` (the port may have been zero-resolved) and
+    /// `None` for client-only mode or when every listener is a Unix socket.
+    ///
+    /// With more than one listener, prefer [`bound_addr_of`] or
+    /// [`bound_addrs`]: this returns the first TCP bind and cannot express
+    /// the rest.
+    ///
+    /// [`bound_addr_of`]: ShutdownHandle::bound_addr_of
+    /// [`bound_addrs`]: ShutdownHandle::bound_addrs
     pub fn bound_addr(&self) -> Option<SocketAddr> {
-        self.bound_addr
+        self.listeners.iter().find_map(|l| l.bound_addr)
+    }
+
+    /// The address a specific listener bound to, by the [`ListenerId`](crate::ListenerId) its
+    /// `bind()` call order gives it. `None` for a Unix listener or an id
+    /// past the end.
+    pub fn bound_addr_of(&self, listener: crate::ListenerId) -> Option<SocketAddr> {
+        self.listeners
+            .get(listener.index() as usize)
+            .and_then(|l| l.bound_addr)
+    }
+
+    /// Every listener's bound address, in `bind()` call order. Unix
+    /// listeners contribute `None`, so the indices line up with
+    /// [`ListenerId`](crate::ListenerId).
+    pub fn bound_addrs(&self) -> Vec<Option<SocketAddr>> {
+        self.listeners.iter().map(|l| l.bound_addr).collect()
+    }
+
+    /// How many listeners this runtime bound. Zero in client-only mode.
+    pub fn listener_count(&self) -> usize {
+        self.listeners.len()
     }
 
     /// Number of worker threads launched.
@@ -249,9 +298,11 @@ impl ShutdownHandle {
     /// Also closes the listen fd to unblock the acceptor's `accept()`.
     pub fn shutdown(&self) {
         self.shutdown_flag.store(true, Ordering::Release);
-        if let (Some(fd), Some(closed)) = (self.listen_fd, &self.listen_fd_closed)
-            && !closed.swap(true, Ordering::AcqRel)
-        {
+        for listener in &self.listeners {
+            if listener.closed.swap(true, Ordering::AcqRel) {
+                continue;
+            }
+            let fd = listener.fd;
             unsafe {
                 // shutdown(SHUT_RD) first: on Linux this wakes a thread
                 // blocked in accept4 (with EINVAL) and releases the bound
@@ -309,6 +360,23 @@ impl Drop for ShutdownHandle {
 enum BindAddr {
     Tcp(SocketAddr),
     Unix(PathBuf),
+}
+
+impl BindAddr {
+    fn is_unix(&self) -> bool {
+        matches!(self, BindAddr::Unix(_))
+    }
+}
+
+/// A listener the runtime owns, after binding. One per `bind*()` call, in
+/// call order, so its position is its [`ListenerId`](crate::ListenerId).
+struct ListenerHandle {
+    fd: RawFd,
+    /// Set once by whoever closes `fd` — `shutdown()` or the acceptor thread
+    /// on exit — so the close happens exactly once.
+    closed: Arc<AtomicBool>,
+    /// `Some` for a TCP listener (after zero-port resolution), `None` for Unix.
+    bound_addr: Option<SocketAddr>,
 }
 
 /// Resolve the actual bound address of a TCP listen fd via `getsockname(2)`.
@@ -471,7 +539,7 @@ fn getsockname_v4_v6(fd: RawFd) -> Option<SocketAddr> {
 /// ```
 pub struct RinglineBuilder {
     config: Config,
-    bind_addr: Option<BindAddr>,
+    bind_addrs: Vec<BindAddr>,
 }
 
 impl RinglineBuilder {
@@ -479,14 +547,14 @@ impl RinglineBuilder {
     pub fn new(config: Config) -> Self {
         RinglineBuilder {
             config,
-            bind_addr: None,
+            bind_addrs: Vec::new(),
         }
     }
 
     /// Set the bind address for the TCP listener. If not set, no listener
     /// or acceptor thread is created (client-only mode).
     pub fn bind(mut self, addr: SocketAddr) -> Self {
-        self.bind_addr = Some(BindAddr::Tcp(addr));
+        self.bind_addrs.push(BindAddr::Tcp(addr));
         self
     }
 
@@ -495,7 +563,8 @@ impl RinglineBuilder {
     ///
     /// Any existing socket file at the given path is unlinked before binding.
     pub fn bind_unix(mut self, path: impl AsRef<Path>) -> Self {
-        self.bind_addr = Some(BindAddr::Unix(path.as_ref().to_path_buf()));
+        self.bind_addrs
+            .push(BindAddr::Unix(path.as_ref().to_path_buf()));
         self
     }
 
@@ -627,12 +696,12 @@ impl RinglineBuilder {
     /// Common infrastructure setup for launch.
     #[allow(clippy::needless_range_loop)]
     #[allow(clippy::type_complexity)]
-    fn launch_inner<F>(self, worker_fn: F) -> LaunchResult
+    fn launch_inner<F>(mut self, worker_fn: F) -> LaunchResult
     where
         F: Fn(
                 usize,
                 Config,
-                Option<crossbeam_channel::Receiver<(RawFd, crate::connection::PeerAddr)>>,
+                Option<crossbeam_channel::Receiver<crate::acceptor::AcceptedConn>>,
                 (WorkerReadFd, crate::wakeup::WakeFd),
                 Arc<AtomicBool>,
                 Option<crossbeam_channel::Receiver<crate::resolver::ResolveResponse>>,
@@ -687,7 +756,7 @@ impl RinglineBuilder {
             // tries the next worker; if every worker is full, the incoming
             // fd is closed so the kernel can signal connection-refused to
             // the peer instead of letting the listen queue overflow.
-            let (tx, rx) = crossbeam_channel::bounded::<(RawFd, crate::connection::PeerAddr)>(
+            let (tx, rx) = crossbeam_channel::bounded::<crate::acceptor::AcceptedConn>(
                 self.config.accept_queue_capacity,
             );
             let (read_fd, wake_handle) =
@@ -754,8 +823,8 @@ impl RinglineBuilder {
 
         // Retain only bind intent and worker senders until every worker has
         // completed fallible setup. No socket is bound or listening yet.
-        let pending_bind_addr = self.bind_addr;
-        let has_acceptor = pending_bind_addr.is_some();
+        let pending_bind_addrs = std::mem::take(&mut self.bind_addrs);
+        let has_acceptor = !pending_bind_addrs.is_empty();
         let pending_worker_txs = if has_acceptor {
             Some(worker_txs)
         } else {
@@ -953,63 +1022,86 @@ impl RinglineBuilder {
             }));
         }
 
-        // Commit the listener only after every worker has completed fallible
+        // Commit the listeners only after every worker has completed fallible
         // initialization. Before this point clients cannot connect or enter a
         // kernel listen backlog.
-        let (listen_fd, listen_fd_closed, bound_addr) = if has_acceptor {
-            let listener = match pending_bind_addr.expect("bind intent must exist") {
-                BindAddr::Tcp(addr) => create_listener(addr, self.config.backlog)
-                    .map(|fd| (fd, false, getsockname_v4_v6(fd))),
-                BindAddr::Unix(ref path) => {
-                    create_unix_listener(path, self.config.backlog).map(|fd| (fd, true, None))
-                }
-            };
-            let (fd, is_unix, bound_addr) = match listener {
-                Ok(listener) => listener,
-                Err(error) => {
-                    rollback_workers(&shutdown_flag, &worker_wake_fds, handles);
-                    return Err(error);
-                }
-            };
-            let closed = Arc::new(AtomicBool::new(false));
-            let acceptor_config = AcceptorConfig {
-                listen_fd: fd,
-                worker_channels: pending_worker_txs.expect("worker senders must exist"),
-                worker_wake_handles: worker_wake_fds.clone(),
-                shutdown_flag: shutdown_flag.clone(),
-                tcp_nodelay: if is_unix {
-                    false
-                } else {
-                    self.config.tcp_nodelay
-                },
-                #[cfg(feature = "timestamps")]
-                timestamps: self.config.timestamps,
-                conn_chunk_size: self.config.conn_chunk_size,
-            };
-            let acceptor_closed = closed.clone();
-            let spawn_result = thread::Builder::new()
-                .name("ringline-acceptor".to_string())
-                .spawn(move || {
-                    run_acceptor(acceptor_config);
-                    if !acceptor_closed.swap(true, Ordering::AcqRel) {
+        //
+        // One acceptor thread per listener, each blocking in its own accept4
+        // and feeding the same worker channels. Accepts from different
+        // listeners interleave on those channels; each carries its own
+        // `ListenerId` so the handler can tell them apart.
+        let listeners: Vec<ListenerHandle> = if has_acceptor {
+            let worker_txs = pending_worker_txs.expect("worker senders must exist");
+            let mut listeners: Vec<ListenerHandle> = Vec::with_capacity(pending_bind_addrs.len());
+
+            for (idx, bind) in pending_bind_addrs.iter().enumerate() {
+                let created = match bind {
+                    BindAddr::Tcp(addr) => create_listener(*addr, self.config.backlog)
+                        .map(|fd| (fd, getsockname_v4_v6(fd))),
+                    BindAddr::Unix(path) => {
+                        create_unix_listener(path, self.config.backlog).map(|fd| (fd, None))
+                    }
+                };
+                let (fd, bound_addr) = match created {
+                    Ok(created) => created,
+                    Err(error) => {
+                        // Roll back the listeners already bound, or a failure on
+                        // the second bind would leave the first one listening
+                        // with no acceptor and no way to reach it.
+                        close_listeners(&listeners);
+                        rollback_workers(&shutdown_flag, &worker_wake_fds, handles);
+                        return Err(error);
+                    }
+                };
+
+                let closed = Arc::new(AtomicBool::new(false));
+                let acceptor_config = AcceptorConfig {
+                    listen_fd: fd,
+                    listener: crate::ListenerId::from_index(idx as u32),
+                    worker_channels: worker_txs.clone(),
+                    worker_wake_handles: worker_wake_fds.clone(),
+                    shutdown_flag: shutdown_flag.clone(),
+                    // A Unix listener has no TCP_NODELAY to set. This used to be
+                    // a runtime `if is_unix` branch over one global flag; with a
+                    // listener list each one simply answers for itself.
+                    tcp_nodelay: !bind.is_unix() && self.config.tcp_nodelay,
+                    #[cfg(feature = "timestamps")]
+                    timestamps: self.config.timestamps,
+                    conn_chunk_size: self.config.conn_chunk_size,
+                };
+
+                let acceptor_closed = closed.clone();
+                let spawn_result = thread::Builder::new()
+                    .name(format!("ringline-acceptor-{idx}"))
+                    .spawn(move || {
+                        run_acceptor(acceptor_config);
+                        if !acceptor_closed.swap(true, Ordering::AcqRel) {
+                            unsafe {
+                                libc::close(fd);
+                            }
+                        }
+                    });
+
+                if let Err(error) = spawn_result {
+                    if !closed.swap(true, Ordering::AcqRel) {
                         unsafe {
                             libc::close(fd);
                         }
                     }
-                });
-
-            if let Err(error) = spawn_result {
-                if !closed.swap(true, Ordering::AcqRel) {
-                    unsafe {
-                        libc::close(fd);
-                    }
+                    close_listeners(&listeners);
+                    rollback_workers(&shutdown_flag, &worker_wake_fds, handles);
+                    return Err(crate::error::Error::Io(error));
                 }
-                rollback_workers(&shutdown_flag, &worker_wake_fds, handles);
-                return Err(crate::error::Error::Io(error));
+
+                listeners.push(ListenerHandle {
+                    fd,
+                    closed,
+                    bound_addr,
+                });
             }
-            (Some(fd), Some(closed), bound_addr)
+            listeners
         } else {
-            (None, None, None)
+            Vec::new()
         };
 
         let region_registrar = Arc::new(crate::region_registry::RegionRegistrar::new(
@@ -1022,9 +1114,7 @@ impl RinglineBuilder {
         let shutdown_handle = ShutdownHandle {
             shutdown_flag,
             worker_wake_handles,
-            listen_fd,
-            listen_fd_closed,
-            bound_addr,
+            listeners,
             region_registrar,
         };
 
@@ -1317,8 +1407,8 @@ mod startup_gate_tests {
                             .recv_timeout(Duration::from_millis(250))
                             .ok();
                         observed_tx.send(accepted.is_some()).unwrap();
-                        if let Some((fd, _)) = accepted {
-                            unsafe { libc::close(fd) };
+                        if let Some(accepted) = accepted {
+                            unsafe { libc::close(accepted.fd) };
                         }
                         let _ = startup_tx.send(Err(crate::error::Error::Io(io::Error::other(
                             "injected worker startup failure",

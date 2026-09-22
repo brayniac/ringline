@@ -121,6 +121,9 @@ pub struct ConnectionState {
     pub established: bool,
     /// Peer address (set on accept or connect).
     pub peer_addr: Option<PeerAddr>,
+    /// Which listener accepted this connection. `None` for outbound
+    /// connections, which arrived through `connect*()` rather than a listener.
+    pub listener: Option<crate::ListenerId>,
     /// Whether a connect timeout SQE is armed for this connection.
     pub connect_timeout_armed: bool,
     /// Most recent kernel RX timestamp (nanoseconds since epoch, CLOCK_REALTIME).
@@ -164,6 +167,7 @@ impl ConnectionState {
             outbound: false,
             established: false,
             peer_addr: None,
+            listener: None,
             connect_timeout_armed: false,
             #[cfg(feature = "timestamps")]
             recv_timestamp_ns: 0,
@@ -230,6 +234,9 @@ impl ConnectionState {
         self.outbound = false;
         self.established = false;
         self.peer_addr = None;
+        // Must clear with the rest of the slot: a stale id would attribute the
+        // next occupant of this slot to whichever listener used it last.
+        self.listener = None;
         self.connect_timeout_armed = false;
         #[cfg(feature = "timestamps")]
         {

@@ -5,12 +5,26 @@ use std::sync::atomic::AtomicBool;
 
 use crossbeam_channel::Sender;
 
-/// Configuration for the centralized acceptor thread.
+/// One accepted connection on its way to a worker.
+///
+/// A struct rather than a tuple: this grew from `(RawFd, SocketAddr)` to carry
+/// a real `PeerAddr` (#445) and now a `ListenerId`, and positional fields stop
+/// paying their way at three.
+pub struct AcceptedConn {
+    pub fd: RawFd,
+    pub listener: crate::ListenerId,
+    pub peer: crate::connection::PeerAddr,
+}
+
+/// Configuration for one acceptor thread.
 pub struct AcceptorConfig {
     /// The listening socket fd.
     pub listen_fd: RawFd,
+    /// Which listener this acceptor serves. Travels with every accepted fd so
+    /// the handler can tell connections from different listeners apart.
+    pub listener: crate::ListenerId,
     /// Per-worker channels to send accepted (fd, peer_addr) pairs.
-    pub worker_channels: Vec<Sender<(RawFd, crate::connection::PeerAddr)>>,
+    pub worker_channels: Vec<Sender<AcceptedConn>>,
     /// Per-worker wake handles to wake the event loop after sending a connection.
     pub worker_wake_handles: Vec<crate::wakeup::WakeFd>,
     /// Shared flag set by ShutdownHandle to signal the acceptor to stop.
@@ -26,10 +40,12 @@ pub struct AcceptorConfig {
     pub timestamps: bool,
 }
 
-/// Run the acceptor loop. Terminates when all channels disconnect.
+/// Run one listener's acceptor loop. Terminates when all channels disconnect.
 ///
 /// Accepts connections via blocking `accept4` and distributes raw fds
-/// to workers round-robin, waking each worker via eventfd.
+/// to workers round-robin, waking each worker via eventfd. One of these runs
+/// per listener; they share the worker channels, so accepts from different
+/// listeners interleave and each carries its own `ListenerId`.
 pub fn run_acceptor(config: AcceptorConfig) {
     let num_workers = config.worker_channels.len();
     if num_workers == 0 {
@@ -128,7 +144,12 @@ pub fn run_acceptor(config: AcceptorConfig) {
                 continue;
             }
 
-            match config.worker_channels[worker_idx].try_send((fd, peer_addr.clone())) {
+            let accepted = AcceptedConn {
+                fd,
+                listener: config.listener,
+                peer: peer_addr.clone(),
+            };
+            match config.worker_channels[worker_idx].try_send(accepted) {
                 Ok(()) => {
                     config.worker_wake_handles[worker_idx].wake();
                     conn_count = conn_count.wrapping_add(1);
