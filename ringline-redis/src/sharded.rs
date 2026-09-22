@@ -195,12 +195,24 @@ impl ShardedClient {
                 },
             };
 
-            if let Err(e) = conn.take_send().and_then(|mut tx| tx.send(encoded)) {
+            // One split per command: taking the write half and then letting
+            // `Client::new` split the same connection again cost two extra
+            // driver round trips and a redundant claim set/clear on the
+            // per-command path.
+            let (mut tx, mut rx) = match conn.split() {
+                Ok(halves) => halves,
+                Err(e) => {
+                    shard.conns[idx] = ShardConn::Disconnected;
+                    conn.close();
+                    return Err(Error::Io(e));
+                }
+            };
+            if let Err(e) = tx.send(encoded) {
                 shard.conns[idx] = ShardConn::Disconnected;
                 conn.close();
                 return Err(Error::Io(e));
             }
-            match Client::new(conn)?.read_value().await {
+            match crate::read_value_from(&mut rx, &mut tx).await.0 {
                 Ok(value) => {
                     // Advance round-robin past the connection we used.
                     shard.next = (idx + 1) % size;

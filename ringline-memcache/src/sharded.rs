@@ -205,11 +205,18 @@ impl ShardedClient {
                 },
             };
 
-            if conn
-                .take_send()
-                .and_then(|mut tx| tx.send(encoded))
-                .is_err()
-            {
+            // One client per command, and the send goes through it: taking
+            // the connection's write half separately first meant splitting the
+            // same connection twice per command.
+            let mut client = match Client::new(conn) {
+                Ok(c) => c,
+                Err(_) => {
+                    shard.conns[idx] = ShardConn::Disconnected;
+                    conn.close();
+                    continue;
+                }
+            };
+            if client.send_raw(encoded).is_err() {
                 // Synchronous send failure (EPIPE, ECONNRESET, etc.) — the
                 // conn is dead. Previously this branch returned `Err(Io)`
                 // immediately, bypassing the rest of the pool. Mark the
@@ -219,7 +226,7 @@ impl ShardedClient {
                 conn.close();
                 continue;
             }
-            match Client::new(conn)?.read_response().await {
+            match client.read_response().await {
                 Ok(response) => {
                     shard.next = (idx + 1) % size;
                     check_error_bytes(&response)?;

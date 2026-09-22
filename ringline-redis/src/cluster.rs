@@ -360,11 +360,23 @@ impl ClusterClient {
                 Err(e) => return Err(e),
             };
 
-            if let Err(e) = conn.take_send().and_then(|mut tx| tx.send(encoded)) {
+            // One split per command. Taking the write half here and then
+            // letting `Client::new` split the same connection again cost two
+            // extra driver round trips and a redundant claim set/clear on the
+            // per-command path — `read_value_from` reads through the halves we
+            // already hold, so there is no second client to build either.
+            let (mut tx, mut rx) = match conn.split() {
+                Ok(halves) => halves,
+                Err(e) => {
+                    self.mark_disconnected(&target_addr);
+                    return Err(Error::Io(e));
+                }
+            };
+            if let Err(e) = tx.send(encoded) {
                 self.mark_disconnected(&target_addr);
                 return Err(Error::Io(e));
             }
-            let value = match Client::new(conn)?.read_value().await {
+            let value = match crate::read_value_from(&mut rx, &mut tx).await.0 {
                 Ok(v) => v,
                 Err(Error::ConnectionClosed) => {
                     if !retried_after_refresh {
