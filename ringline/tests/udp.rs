@@ -2137,11 +2137,19 @@ fn udp_gso_invalid_segment_size_returns_error() {
 
 // ── recv_batch: drain multiple queued datagrams in one poll ─────────────
 
+/// Largest batch a single `recv_batch` call will drain here. The test asserts
+/// the first call returns exactly this, so the two must agree.
+const BATCH_MAX: usize = 16;
+
+/// Datagrams the test fires before the handler's first drain. Must exceed
+/// `BATCH_MAX` (so a full batch is provably a batch and not "everything that
+/// existed") and stay well under `udp_recv_queue_capacity` (1024) so nothing
+/// is dropped while the handler waits.
+const BATCH_BURST: usize = 32;
+
 struct BatchEcho {
     started: Arc<AtomicUsize>,
-    /// Records how many datagrams each `recv_batch` poll drained, so the
-    /// test can assert that batching actually fired (i.e. more than one
-    /// datagram was popped in at least one poll).
+    /// How many datagrams each `recv_batch` call drained, in order.
     poll_drains: Arc<Mutex<Vec<usize>>>,
 }
 
@@ -2169,10 +2177,22 @@ impl AsyncEventHandler for BatchEcho {
             // future returns so we test the drain semantics, not
             // send-from-inside-callback.
             let mut to_send: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
+
+            // Hold off the first drain so the whole burst is queued before it.
+            // The driver enqueues into the per-socket recv queue whether or not
+            // a task is polling — that is what `udp_recv_queue_capacity_drops_
+            // excess_datagrams` pins down — so after this the queue holds the
+            // burst and the first `recv_batch` has a full batch to take.
+            //
+            // Without this the test raced the sender: if the poll loop kept up,
+            // every drain was 1 and the assertion failed on a machine that was
+            // behaving correctly, just quickly (#446).
+            let _ = ringline::sleep(Duration::from_millis(250)).await;
+
             loop {
                 to_send.clear();
                 let drained = udp
-                    .recv_batch(16, |data, peer| {
+                    .recv_batch(BATCH_MAX, |data, peer| {
                         to_send.push((peer, data.to_vec()));
                     })
                     .await;
@@ -2324,7 +2344,17 @@ fn udp_recv_batch_timed_captures_arrival_before_callback() {
 }
 
 #[test]
-fn udp_recv_batch_drains_burst_in_fewer_polls_than_datagrams() {
+fn udp_recv_batch_drains_a_full_batch_in_one_call() {
+    // `recv_batch`'s contract is that ONE call drains up to `max` datagrams
+    // that are already queued — that is what makes it different from
+    // `with_datagram`. The handler waits before its first drain so the burst is
+    // provably queued when that call happens, and the first return value is
+    // then a direct measurement of the contract.
+    //
+    // The previous form asserted `max_drain > 1 || drains.len() < BURST` with
+    // no wait, which only held if the sender outran the poll loop. On a loaded
+    // runner the receiver kept up, every drain was 1, and a correct runtime
+    // failed the test (#446).
     let _guard = UDP_SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let started = BATCH_ECHO_STARTED.get_or_init(Default::default).clone();
     started.store(0, Ordering::SeqCst);
@@ -2343,29 +2373,22 @@ fn udp_recv_batch_drains_burst_in_fewer_polls_than_datagrams() {
 
     let client = UdpSocket::bind("127.0.0.1:0").unwrap();
     client
-        .set_read_timeout(Some(Duration::from_secs(2)))
+        .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
 
-    // Fire a burst of datagrams back-to-back so the handler's recv
-    // queue accumulates more than one entry per poll.
-    const BURST: usize = 32;
-    for i in 0..BURST {
+    for i in 0..BATCH_BURST {
         let payload = format!("batch-{i:04}");
         client.send_to(payload.as_bytes(), addr).unwrap();
     }
 
-    // Collect all echoes.
     let mut got = HashSet::new();
     let mut buf = [0u8; 64];
-    for _ in 0..BURST {
+    for _ in 0..BATCH_BURST {
         let (n, _src) = client.recv_from(&mut buf).unwrap();
         got.insert(std::str::from_utf8(&buf[..n]).unwrap().to_string());
     }
-    assert_eq!(got.len(), BURST, "every datagram must be echoed back");
+    assert_eq!(got.len(), BATCH_BURST, "every datagram must be echoed back");
 
-    // Now assert the handler actually drained more than one datagram
-    // per poll on at least one iteration — that's the contract that
-    // makes recv_batch different from with_datagram.
     shutdown.shutdown();
     for h in handles {
         h.join().unwrap().unwrap();
@@ -2374,18 +2397,25 @@ fn udp_recv_batch_drains_burst_in_fewer_polls_than_datagrams() {
     let drains = BATCH_POLL_DRAINS.get().unwrap().lock().unwrap().clone();
     let total: usize = drains.iter().sum();
     assert!(
-        total >= BURST,
-        "handler must have observed at least BURST datagrams (got {total})"
+        total >= BATCH_BURST,
+        "handler must have observed every datagram (got {total} of {BATCH_BURST}); drains={drains:?}"
     );
-    // Either: at least one poll drained multiple datagrams, OR the
-    // poll count is strictly less than BURST (proving the kernel
-    // delivered multiple per CQE batch). The first form is the more
-    // common case; both are acceptable evidence that batching took
-    // effect.
-    let max_drain = drains.iter().copied().max().unwrap_or(0);
+
+    // The measurement: the first call, made with the burst already queued,
+    // drained a full batch rather than one datagram.
+    assert_eq!(
+        drains.first().copied(),
+        Some(BATCH_MAX),
+        "first recv_batch should drain a full batch of {BATCH_MAX} from the \
+         queued burst of {BATCH_BURST}; drains={drains:?}"
+    );
+
+    // And it took ceil(BURST / MAX) calls, not one per datagram.
+    let expected_calls = BATCH_BURST.div_ceil(BATCH_MAX);
     assert!(
-        max_drain > 1 || drains.len() < BURST,
-        "expected at least one multi-datagram drain or fewer polls than datagrams; \
-         got drains={drains:?}"
+        drains.len() <= expected_calls,
+        "draining {BATCH_BURST} datagrams {BATCH_MAX} at a time should take at \
+         most {expected_calls} calls, took {}; drains={drains:?}",
+        drains.len()
     );
 }
