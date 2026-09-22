@@ -182,6 +182,69 @@ impl AsyncEventHandler for TlsEchoHandler {
 // ── Test 1: External rustls client → ringline TLS server ────────────────
 
 #[test]
+fn a_plaintext_and_a_tls_listener_coexist_in_one_process() {
+    // The combination per-listener TLS exists for, and the one the process-wide
+    // `ConfigBuilder::tls()` could never express: one runtime serving plaintext
+    // on one port and TLS on another. With a single global config every
+    // listener had to agree.
+    let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
+
+    let (certs, key) = generate_self_signed();
+    let server_config = server_tls_config(certs.clone(), key);
+
+    let plain_port = free_port();
+    let tls_port = free_port();
+    let plain_addr = format!("127.0.0.1:{plain_port}");
+    let tls_addr = format!("127.0.0.1:{tls_port}");
+
+    // No process-wide `.tls()`: the TLS listener carries its own config, and
+    // the plaintext one must stay plaintext.
+    let config = test_config_builder().build().expect("valid config");
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind(plain_addr.parse().unwrap())
+        .bind_tls(tls_addr.parse().unwrap(), TlsConfig::new(server_config))
+        .launch::<TlsEchoHandler>()
+        .expect("launch failed");
+
+    assert_eq!(shutdown.listener_count(), 2);
+
+    wait_for_server(&plain_addr);
+    wait_for_server(&tls_addr);
+
+    // Plaintext listener: a bare TCP echo, no handshake.
+    {
+        let mut tcp = TcpStream::connect(&plain_addr).unwrap();
+        tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        tcp.write_all(b"plain").unwrap();
+        tcp.flush().unwrap();
+        let mut buf = [0u8; 5];
+        tcp.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"plain", "listener 0 must speak plaintext");
+    }
+
+    // TLS listener: a full rustls handshake on the other port.
+    {
+        let client_config = client_tls_config(&certs);
+        let server_name: ServerName<'_> = "localhost".try_into().unwrap();
+        let mut tls_conn = rustls::ClientConnection::new(client_config, server_name).unwrap();
+        let mut tcp = TcpStream::connect(&tls_addr).unwrap();
+        tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        tcp.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut stream = rustls::Stream::new(&mut tls_conn, &mut tcp);
+        stream.write_all(b"secret").unwrap();
+        stream.flush().unwrap();
+        let mut buf = [0u8; 6];
+        stream.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"secret", "listener 1 must terminate TLS");
+    }
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
+#[test]
 fn tls_echo_with_external_client() {
     let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
 

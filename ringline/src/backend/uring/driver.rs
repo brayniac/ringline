@@ -727,16 +727,25 @@ impl Driver {
         };
 
         let tls_table = {
-            let has_server = config.tls.is_some();
+            // Any per-listener config counts: a process can terminate TLS on
+            // one listener with no process-wide config set at all, and without
+            // this the table would not exist for it to use.
+            let has_server =
+                config.tls.is_some() || config.listener_tls.iter().any(|t| t.is_some());
             let has_client = config.tls_client.is_some();
             if has_server || has_client {
-                Some(crate::tls::TlsTable::new(
+                Some(crate::tls::TlsTable::with_listener_configs(
                     config.max_connections,
                     config.tls.as_ref().map(|tc| tc.server_config.clone()),
                     config
                         .tls_client
                         .as_ref()
                         .map(|tc| tc.client_config.clone()),
+                    config
+                        .listener_tls
+                        .iter()
+                        .map(|slot| slot.as_ref().map(|tc| tc.server_config.clone()))
+                        .collect(),
                 ))
             } else {
                 None

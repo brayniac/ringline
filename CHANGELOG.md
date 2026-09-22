@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- `RinglineBuilder::bind_tls(addr, TlsConfig)` terminates TLS on one listener
+  with its own configuration, so a process can serve plaintext on one port and
+  TLS on another, or two ports with different certificates. Previously
+  `ConfigBuilder::tls()` was process-wide: every listener had to agree, which
+  made the combination unexpressible once `bind()` could be called more than
+  once. A listener bound with plain `bind()` still falls back to the
+  process-wide config, so existing single-listener TLS setups are unchanged.
+  Step 1b of `docs/listeners-and-accept-design.md` (#443).
+
 - **Breaking:** `RinglineBuilder::bind()` and `bind_unix()` now **accumulate**
   listeners instead of overwriting each other, so a runtime can serve any mix of
   TCP and Unix listeners. Previously `bind_addr` was a single `Option`, calling

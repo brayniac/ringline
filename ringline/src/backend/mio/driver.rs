@@ -300,11 +300,21 @@ impl Driver {
         let tls_table = {
             let server_config = config.tls.as_ref().map(|t| t.server_config.clone());
             let client_config = config.tls_client.as_ref().map(|t| t.client_config.clone());
-            if server_config.is_some() || client_config.is_some() {
-                Some(crate::tls::TlsTable::new(
+            let listener_configs: Vec<_> = config
+                .listener_tls
+                .iter()
+                .map(|slot| slot.as_ref().map(|t| t.server_config.clone()))
+                .collect();
+            // Any per-listener config counts — see the io_uring driver.
+            if server_config.is_some()
+                || client_config.is_some()
+                || listener_configs.iter().any(|c| c.is_some())
+            {
+                Some(crate::tls::TlsTable::with_listener_configs(
                     config.max_connections,
                     server_config,
                     client_config,
+                    listener_configs,
                 ))
             } else {
                 None
@@ -1208,7 +1218,12 @@ pub(crate) mod tests {
 
         // A real, already-handshaked rustls session — the admission maths is
         // only worth testing against records rustls actually produced.
-        let mut table = crate::tls::TlsTable::new(config.max_connections, None, None);
+        let mut table = crate::tls::TlsTable::with_listener_configs(
+            config.max_connections,
+            None,
+            None,
+            Vec::new(),
+        );
         table.insert_for_test(conn_index, handshaked_tls_conn());
         // One byte-slot's worth of plaintext, chosen so the two sizings give
         // different answers: it fits in ONE slot as plaintext but spans two
@@ -1285,7 +1300,12 @@ pub(crate) mod tests {
         let conn = token(&driver, conn_index);
         let id = bounded_ids(1)[0];
 
-        let mut table = crate::tls::TlsTable::new(config.max_connections, None, None);
+        let mut table = crate::tls::TlsTable::with_listener_configs(
+            config.max_connections,
+            None,
+            None,
+            Vec::new(),
+        );
         table.insert_for_test(conn_index, handshaked_tls_conn());
         driver.tls_table = Some(table);
 
@@ -1332,7 +1352,12 @@ pub(crate) mod tests {
         let conn = token(&driver, conn_index);
         let id = bounded_ids(1)[0];
 
-        let mut table = crate::tls::TlsTable::new(config.max_connections, None, None);
+        let mut table = crate::tls::TlsTable::with_listener_configs(
+            config.max_connections,
+            None,
+            None,
+            Vec::new(),
+        );
         table.insert_for_test(conn_index, handshaked_tls_conn());
         driver.tls_table = Some(table);
 

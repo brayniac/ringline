@@ -496,7 +496,11 @@ impl CiphertextCapacity {
 /// Stored as a separate EventLoop field for borrow splitting.
 pub struct TlsTable {
     conns: Vec<Option<TlsConn>>,
+    /// Process-wide fallback, used by any listener without its own config.
     server_config: Option<Arc<rustls::ServerConfig>>,
+    /// Per-listener configs indexed by `ListenerId`. A `None` entry, or an
+    /// index past the end, falls back to `server_config`.
+    listener_configs: Vec<Option<Arc<rustls::ServerConfig>>>,
     client_config: Option<Arc<rustls::ClientConfig>>,
     /// Single shared ciphertext scratch buffer (one per worker thread).
     /// Only used synchronously — we process one connection at a time.
@@ -507,26 +511,45 @@ pub struct TlsTable {
 }
 
 impl TlsTable {
-    /// Create a table with capacity for `max_connections`.
-    pub fn new(
+    /// Create a table with capacity for `max_connections`, able to serve a
+    /// different server config per listener.
+    ///
+    /// `listener_configs` is indexed by `ListenerId`; a `None` entry falls back
+    /// to `server_config`.
+    pub fn with_listener_configs(
         max_connections: u32,
         server_config: Option<Arc<rustls::ServerConfig>>,
         client_config: Option<Arc<rustls::ClientConfig>>,
+        listener_configs: Vec<Option<Arc<rustls::ServerConfig>>>,
     ) -> Self {
         let mut conns = Vec::with_capacity(max_connections as usize);
         conns.resize_with(max_connections as usize, || None);
         TlsTable {
             conns,
             server_config,
+            listener_configs,
             client_config,
             #[cfg(not(has_io_uring))]
             write_buf: Vec::new(),
         }
     }
 
-    /// Whether a server config is present (for TLS accept on inbound connections).
-    pub fn has_server_config(&self) -> bool {
-        self.server_config.is_some()
+    /// The server config that should terminate a connection accepted on
+    /// `listener`: that listener's own if it has one, else the process-wide
+    /// fallback.
+    fn server_config_for(
+        &self,
+        listener: Option<crate::ListenerId>,
+    ) -> Option<&Arc<rustls::ServerConfig>> {
+        listener
+            .and_then(|l| self.listener_configs.get(l.index() as usize))
+            .and_then(|slot| slot.as_ref())
+            .or(self.server_config.as_ref())
+    }
+
+    /// Whether connections accepted on `listener` should terminate TLS.
+    pub fn has_server_config_for(&self, listener: Option<crate::ListenerId>) -> bool {
+        self.server_config_for(listener).is_some()
     }
 
     /// Whether a client config is present (for TLS connect on outbound connections).
@@ -540,11 +563,14 @@ impl TlsTable {
     /// lifetime: the `tls-unbuffered` feature picks rustls' unbuffered record
     /// layer, otherwise the buffered one. See
     /// `docs/tls-unbuffered-design.md` ("Path selection").
-    pub fn create(&mut self, conn_index: u32) -> Result<(), rustls::Error> {
+    pub fn create(
+        &mut self,
+        conn_index: u32,
+        listener: Option<crate::ListenerId>,
+    ) -> Result<(), rustls::Error> {
         let server_config = self
-            .server_config
-            .as_ref()
-            .expect("create() called without server_config")
+            .server_config_for(listener)
+            .expect("create() called without a server config for this listener")
             .clone();
         // Read before the config is moved into the connection, and before any
         // engine selection: the value is the same either way.
@@ -904,8 +930,8 @@ mod tests {
     // exactly the state this task starts from.
     #[test]
     fn create_selects_the_engine_the_build_asked_for() {
-        let mut table = TlsTable::new(4, Some(server_config()), None);
-        table.create(0).expect("create a server connection");
+        let mut table = TlsTable::with_listener_configs(4, Some(server_config()), None, Vec::new());
+        table.create(0, None).expect("create a server connection");
         let conn = table.get_mut(0).expect("connection exists");
 
         #[cfg(feature = "tls-unbuffered")]
@@ -944,8 +970,9 @@ mod tests {
             Some(sz) => server_config_with_fragment(sz),
             None => server_config(),
         };
-        let mut table = TlsTable::new(4, Some(config), Some(client_config()));
-        table.create(0).expect("create a server connection");
+        let mut table =
+            TlsTable::with_listener_configs(4, Some(config), Some(client_config()), Vec::new());
+        table.create(0, None).expect("create a server connection");
         table
     }
 
@@ -976,7 +1003,8 @@ mod tests {
     fn create_client_records_the_client_configs_fragment_size() {
         let mut config = Arc::try_unwrap(client_config()).expect("sole owner");
         config.max_fragment_size = Some(2048);
-        let mut table = TlsTable::new(4, None, Some(Arc::new(config)));
+        let mut table =
+            TlsTable::with_listener_configs(4, None, Some(Arc::new(config)), Vec::new());
         let name: rustls::pki_types::ServerName<'static> = "localhost".try_into().unwrap();
         table.create_client(1, name).expect("create a client");
         assert_eq!(table.get_mut(1).unwrap().max_plaintext_per_record, 2043);
