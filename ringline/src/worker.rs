@@ -162,6 +162,10 @@ pub struct ShutdownHandle {
     /// worker out. Shared with the workers, whose accept-time placement must
     /// skip anyone steered out — otherwise the drop in that worker's load
     /// would make it the preferred handoff target and undo the steering.
+    ///
+    /// Only read by `set_worker_accepting`, which is Linux-only because
+    /// reuseport steering is.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     accepting: Arc<Vec<std::sync::atomic::AtomicBool>>,
     /// Read on the io_uring backend by `register_region` /
     /// `unregister_region`; on the mio backend it sits unused but is kept
@@ -474,6 +478,10 @@ struct ListenerHandle {
     /// Whether `fds` form a `SO_REUSEPORT` group that can be steered — true
     /// only for a merged-mode TCP listener, where `fds[i]` belongs to worker
     /// `i`. A pool-mode listener has a single socket and no group to steer.
+    ///
+    /// Only read by `set_worker_accepting`, which is Linux-only because
+    /// reuseport steering is.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     steerable: bool,
 }
 
