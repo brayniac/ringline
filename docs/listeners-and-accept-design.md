@@ -373,10 +373,31 @@ Worker-core busy %, three interleaved reps each:
 different pair each time, so it is the hash rather than a fixed bug. Two of
 eight is what (1-1/W)^W predicts.
 
+### After the fix (2026-09-23)
+
+`HANDOFF_MARGIN` drops to 1 when the quietest worker is idle (#457). Nine
+interleaved reps per arm, same harness, same N=W=8. The idle threshold was
+fixed at 10% busy *before* the data was read, justified by the pre-fix numbers
+— idle cores sat at 2.5–8.1% against 24–49% busy, so the line falls in a wide
+empty gap rather than being a knob to turn afterwards.
+
+| arm | reps | min | max | median | median spread | idle (<10%) |
+|---|---|---|---|---|---|---|
+| pool | 9 | 24.6 | 53.3 | 30.6 | 13.5 | **0** |
+| merged | 9 | 23.2 | 63.8 | 30.8 | 13.1 | **0** |
+
+**Merged now leaves no worker idle, 9 of 9**, against 2 idle in 3 of 3 before.
+Spread and median match pool's within noise. Both arms throw the occasional
+high outlier (pool 53.3, merged 63.8), so that is the rig, not the mode.
+
+This clears the distribution half of the default-mode decision. Connect rate
+remains unmeasured, so `Pool` stays the default until that exists.
+
 ### Conclusion
 
-**Merged accept mode stays behind its flag.** Tier 1's accept-time handoff does
-not fix the case it was built for. The mechanism is visible in its own
+**Merged accept mode stays behind its flag** — though the distribution defect
+below was fixed in #457; see "After the fix" above. As first measured, tier 1's
+accept-time handoff did not fix the case it was built for. The mechanism is visible in its own
 constants: a worker sheds only when it is `HANDOFF_MARGIN` (2) ahead of the
 quietest, but at N≈W most workers hold 0 or 1 connection, so a worker holding 2
 sheds only if it *sees* a zero — and the whole population arrives within
