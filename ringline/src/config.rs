@@ -254,6 +254,11 @@ pub struct Config {
     /// all of them when placing a newly accepted connection. Merged accept
     /// mode only — pool mode places explicitly in the acceptor thread.
     pub(crate) worker_loads: Option<std::sync::Arc<Vec<std::sync::atomic::AtomicU32>>>,
+    /// Which workers are in the accept rotation. Placement must not hand a
+    /// connection to a worker that has been steered out: taking it out of the
+    /// rotation drops its load, which would otherwise make it the most
+    /// attractive handoff target — the two mechanisms would fight.
+    pub(crate) worker_accepting: Option<std::sync::Arc<Vec<std::sync::atomic::AtomicBool>>>,
     /// Every worker's accept channel and wake handle, so a worker that accepts
     /// while over its share can hand the raw fd to a less-loaded peer. Empty
     /// in pool mode, where the acceptor thread owns these.
@@ -422,6 +427,7 @@ impl Default for Config {
             merged_accept_live: None,
             worker_index: 0,
             worker_loads: None,
+            worker_accepting: None,
             peer_accept: Vec::new(),
             loop_diag: false,
             #[cfg(feature = "timestamps")]
