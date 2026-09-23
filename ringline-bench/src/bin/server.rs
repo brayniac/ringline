@@ -63,6 +63,8 @@ struct EchoCfg {
     /// Terminate TLS on the listener, with a self-signed certificate generated
     /// at startup so nothing has to be staged onto a guest.
     tls: bool,
+    /// Event-loop tick interval, microseconds.
+    tick_timeout_us: u64,
 }
 
 /// Which accept path the echo arm runs, so a pool-vs-merged A/B does not need
@@ -180,6 +182,12 @@ struct Args {
     /// generated at startup.
     #[arg(long, default_value_t = false)]
     tls: bool,
+
+    /// (ringline only) Event-loop tick interval in microseconds. Exposed to
+    /// tell a stall that is waiting for the periodic tick from one that is
+    /// not: if throughput tracks this knob, the work is tick-driven.
+    #[arg(long, default_value_t = 1000)]
+    tick_timeout_us: u64,
 
     /// (tokio only) Scheduler shape. `multi-thread` is tokio's default
     /// work-stealing runtime; `per-core` gives each core its own
@@ -408,6 +416,7 @@ fn main() {
             pin_to_core,
             accept_mode: args.accept_mode,
             tls: args.tls,
+            tick_timeout_us: args.tick_timeout_us,
         }),
         Runtime::Tokio => {
             use ringline_bench::servers::tokio_arms;
@@ -610,6 +619,7 @@ fn run_ringline(cfg: EchoCfg) {
         prefault_buffers,
         accept_mode,
         tls,
+        tick_timeout_us,
     } = cfg;
     use ringline::ParseResult;
     use ringline::{AsyncEventHandler, RinglineBuilder};
@@ -717,7 +727,21 @@ fn run_ringline(cfg: EchoCfg) {
         .max_connections(16384)
         .send_pool(512, msg_size.next_power_of_two().max(4096) as u32)
         .conn_chunk_size(conn_chunk_size)
-        .accept_mode(accept_mode.into());
+        .accept_mode(accept_mode.into())
+        .tick_timeout_us(tick_timeout_us);
+    // `direct` echoes the bytes as they arrived, straight from the CQE
+    // handler. Under TLS those bytes are ciphertext, so the server would
+    // reflect the client's own ciphertext instead of re-encrypting plaintext —
+    // every handshake fails and the arm reports 0 conns/sec, which reads as a
+    // tie rather than as a broken run. Refuse the combination instead.
+    if tls && echo_mode == EchoMode::Direct {
+        eprintln!(
+            "bench-server: --tls needs --echo-mode forward; `direct` submits the \
+             echo from the CQE handler and would send ciphertext back unencrypted"
+        );
+        std::process::exit(2);
+    }
+
     let staged = if tls {
         staged.tls(ringline::TlsConfig::new(self_signed_server_config()))
     } else {
