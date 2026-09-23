@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Accept-time placement now hands a connection to an **idle** worker as soon as
+  the accepting worker holds one, instead of waiting for a gap of two. The flat
+  margin meant a worker first shed on its *third* connection, so when a pooled
+  client opened about as many connections as there are workers the placement
+  never ran at all — measured on the rack as 2 of 8 workers left idle in 3 of 3
+  reps, now 0 in 9 of 9. The margin of two still applies between two non-empty
+  workers. Merged accept mode only (#457).
+
 - `ShutdownHandle::set_worker_accepting()` takes a worker out of the accept
   rotation, or puts it back, for listeners in `AcceptMode::Merged`. It re-steers
   the `SO_REUSEPORT` group with an unprivileged classic-BPF program rather than

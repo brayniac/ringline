@@ -51,7 +51,22 @@ fn choose_placement(loads: &[u32], accepting: &[bool], me: usize, mine: u32) -> 
         .enumerate()
         .filter(|&(i, _)| accepting.get(i).copied().unwrap_or(true))
         .min_by_key(|&(_, l)| l)?;
-    if min_idx != me && mine >= min_load.saturating_add(HANDOFF_MARGIN) {
+    // An idle worker is qualitatively different from a merely quiet one:
+    // handing it this connection cannot make anything worse, and refusing to
+    // is how tier 1 came to do nothing at all in the case it exists for.
+    //
+    // `mine` is this worker's count *before* installing the arrival, so a
+    // margin of 2 means a worker first sheds on its **third** connection. When
+    // a pooled client opens about as many connections as there are workers,
+    // almost nobody receives a third — so placement never fired, and the rack
+    // measured 2 of 8 workers left idle in 3 of 3 reps (#457, #456). Dropping
+    // the margin to 1 against an idle worker lets a worker shed its *second*
+    // connection, which is the one that matters at that scale.
+    //
+    // The margin of 2 still applies between two non-empty workers, so the
+    // ping-pong it exists to prevent is unaffected.
+    let margin = if min_load == 0 { 1 } else { HANDOFF_MARGIN };
+    if min_idx != me && mine >= min_load.saturating_add(margin) {
         Some(min_idx)
     } else {
         None
@@ -14663,8 +14678,12 @@ mod placement_tests {
 
     #[test]
     fn keeps_it_when_the_gap_is_under_the_margin() {
-        // One ahead of the quietest is not worth a channel send and a wake.
-        assert_eq!(choose_placement(&[1, 0, 1, 1], &[true; 4], 0, 1), None);
+        // One ahead of the quietest is not worth a channel send and a wake —
+        // but only while the quietest is actually serving something. Against an
+        // *idle* worker the margin drops to 1, which
+        // `one_ahead_of_an_idle_worker_does_hand_off` covers, so this case has
+        // to use a non-empty minimum to exercise the margin it is named for.
+        assert_eq!(choose_placement(&[3, 2, 3, 3], &[true; 4], 0, 3), None);
     }
 
     #[test]
@@ -14708,6 +14727,66 @@ mod placement_tests {
             choose_placement(&[9, 0, 0, 0], &[true, false, false, false], 0, 9),
             None
         );
+    }
+
+    /// Replay a whole burst through the policy and report who ends up serving.
+    ///
+    /// `arrivals` is the worker the kernel handed each connection to, in order.
+    /// Mirrors the runtime: `mine` is the count *before* the arrival is
+    /// installed, and a handoff claims the target's slot immediately (as
+    /// `hand_off_accepted` does) so the next decision sees it.
+    fn replay(arrivals: &[usize], workers: usize) -> Vec<usize> {
+        let mut served = vec![0usize; workers];
+        let mut loads = vec![0u32; workers];
+        let accepting = vec![true; workers];
+        for &who in arrivals {
+            let mine = served[who] as u32;
+            let dst = choose_placement(&loads, &accepting, who, mine).unwrap_or(who);
+            served[dst] += 1;
+            loads[dst] += 1;
+        }
+        served
+    }
+
+    #[test]
+    fn a_pooled_client_leaves_no_worker_idle() {
+        // The arrival shape the kernel's hash actually produced on the rack:
+        // eight connections over eight workers, landing 2,2,1,1,1,1,0,0
+        // (#456). With a flat margin of 2 the policy never fired — a worker
+        // sheds on its third connection and nobody got a third — and two
+        // workers stayed idle in 3 of 3 reps.
+        let served = replay(&[0, 0, 1, 1, 2, 3, 4, 5], 8);
+        let idle = served.iter().filter(|&&c| c == 0).count();
+        assert_eq!(
+            idle, 0,
+            "a pooled client must not leave a worker idle; served {served:?}"
+        );
+    }
+
+    #[test]
+    fn the_worst_case_hash_still_spreads() {
+        // Everything lands on one worker. It cannot reach even, but it must
+        // not leave anyone at zero.
+        let served = replay(&[0; 8], 8);
+        assert_eq!(
+            served.iter().filter(|&&c| c == 0).count(),
+            0,
+            "served {served:?}"
+        );
+    }
+
+    #[test]
+    fn a_busy_fleet_is_not_churned_by_the_relaxed_margin() {
+        // Nobody idle, so the margin of 2 still governs: a worker one ahead of
+        // the quietest keeps its connection rather than ping-ponging it.
+        assert_eq!(choose_placement(&[4, 3, 5, 4], &[true; 4], 0, 4), None);
+    }
+
+    #[test]
+    fn one_ahead_of_an_idle_worker_does_hand_off() {
+        // The case the flat margin of 2 refused, and the whole point of the
+        // change: this worker holds one, someone holds none.
+        assert_eq!(choose_placement(&[1, 0, 1, 1], &[true; 4], 0, 1), Some(1));
     }
 
     #[test]
