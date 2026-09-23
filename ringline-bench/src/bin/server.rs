@@ -41,6 +41,27 @@ struct EchoCfg {
     conn_chunk_size: usize,
     pin_to_core: bool,
     prefault_buffers: bool,
+    accept_mode: AcceptModeArg,
+}
+
+/// Which accept path the echo arm runs, so a pool-vs-merged A/B does not need
+/// two builds. Mirrors `ringline::AcceptMode`; `Merged` is io_uring only and is
+/// ignored on a mio build.
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum AcceptModeArg {
+    /// One acceptor thread per listener, explicit round-robin placement.
+    Pool,
+    /// Each worker owns a SO_REUSEPORT listener and accepts on its own ring.
+    Merged,
+}
+
+impl From<AcceptModeArg> for ringline::AcceptMode {
+    fn from(a: AcceptModeArg) -> Self {
+        match a {
+            AcceptModeArg::Pool => ringline::AcceptMode::Pool,
+            AcceptModeArg::Merged => ringline::AcceptMode::Merged,
+        }
+    }
 }
 
 /// Which forwarding entry point the proxy arm drives.
@@ -126,6 +147,11 @@ struct Args {
     ///   parse-then-forward loop a protocol server would write.
     /// - `recv-forward`: `enable_recv_forward` + `forward_held`. A byte pipe;
     ///   `with_data`/`with_bytes` observe nothing while it is on.
+    /// Which accept path the ringline echo arm runs. `merged` is io_uring
+    /// only and is ignored on a mio build.
+    #[arg(long, value_enum, default_value_t = AcceptModeArg::Pool)]
+    accept_mode: AcceptModeArg,
+
     #[arg(long, value_enum, default_value_t = EchoMode::Direct)]
     echo_mode: EchoMode,
 
@@ -354,6 +380,7 @@ fn main() {
             },
             conn_chunk_size: args.conn_chunk_size,
             pin_to_core,
+            accept_mode: args.accept_mode,
         }),
         Runtime::Tokio => {
             use ringline_bench::servers::tokio_arms;
@@ -554,6 +581,7 @@ fn run_ringline(cfg: EchoCfg) {
         conn_chunk_size,
         pin_to_core,
         prefault_buffers,
+        accept_mode,
     } = cfg;
     use ringline::ParseResult;
     use ringline::{AsyncEventHandler, RinglineBuilder};
@@ -661,6 +689,7 @@ fn run_ringline(cfg: EchoCfg) {
         .max_connections(16384)
         .send_pool(512, msg_size.next_power_of_two().max(4096) as u32)
         .conn_chunk_size(conn_chunk_size)
+        .accept_mode(accept_mode.into())
         .build()
         .expect("valid config");
 
