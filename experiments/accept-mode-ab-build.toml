@@ -1,0 +1,58 @@
+# Build bench-server and bench-client once for the accept-mode A/B. One binary
+# serves both arms: --accept-mode switches pool vs merged at run time, so the
+# two arms cannot differ by anything but that flag.
+name = "ringline accept-mode A/B build"
+
+[params]
+branch = "perf/accept-mode-ab"
+repo   = "https://github.com/brayniac/ringline"
+
+[[jobs]]
+name = "build"
+tags = ["validation"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+shape = "z4.c"
+image = "spool/images/debian-13-ci-20260912.1@golden"
+slots = 1
+memory_gib = 4
+ports = 0
+gpu = false
+payload_timeout = 3600
+artifacts = ["/home/anvil/bench-bins.tgz", "/home/anvil/build.log"]
+upload = true
+payload = '''
+set -uo pipefail
+cd /home/anvil
+{
+  uname -srm
+  git clone -q {repo} src && git -C src checkout -q {branch}
+  cd src && git log --oneline -1
+  cargo build --release -p ringline-bench --bin bench-server --bin bench-client
+  mkdir -p /home/anvil/out
+  cp target/release/bench-server /home/anvil/out/
+  cp target/release/bench-client /home/anvil/out/
+  cd /home/anvil && sha256sum out/*
+  # Prove this is the io_uring build: a mio binary would make the whole A/B
+  # meaningless, since merged accept mode does not exist there.
+  got=$(./out/bench-server --print-backend)
+  [ "$got" = "io_uring" ] || { echo "BACKEND MISMATCH: $got"; exit 1; }
+  echo "backend ok: $got"
+  # And that the flag this A/B turns actually exists.
+  ./out/bench-server --help 2>&1 | grep -q 'accept-mode' || { echo "no --accept-mode flag"; exit 1; }
+  echo "accept-mode flag present"
+  tar czf bench-bins.tgz out
+} 2>&1 | tee /home/anvil/build.log
+rc=${PIPESTATUS[0]}
+echo "build_status=$rc" | tee -a /home/anvil/build.log
+exit 0
+'''
+
+[[jobs.steps]]
+type = "shell"
+command = '''
+grep -q "build_status=0" build.log || { echo "build failed"; exit 1; }
+grep -q "accept-mode flag present" build.log || { echo "flag missing"; exit 1; }
+echo ok
+'''

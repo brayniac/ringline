@@ -341,20 +341,51 @@ measurement before it is more than a knob.
 
 ## Measurement
 
-Two measurements decide the default accept mode. The second is the one that
-constrains the design, and **its topology is the whole point**: measured from N
-independent client addresses, hash placement looks fine and hides §5 entirely.
-It must be a *single client host opening a pool*, which is the adversarial case
-and also what every load generator here actually does.
+**Run 2026-09-23.** Two X710 guests, one client host opening a pool against an
+8-worker server, `experiments/accept-mode-ab.toml`. Distribution read as
+per-core busy time from `/proc/stat` diffed across the measured window —
+workers are pinned, so core *N* is worker *N*.
 
-- **Connect rate** under a connect storm — what merged mode should improve.
-- **Per-worker connection counts**, one client host opening 8, 16 and 64
-  connections to 8 workers. Expect round-robin to give exact thirds-free
-  placement and an unsteered hash to leave ~37% of workers idle at N = W. A run
-  that cannot show that difference is not evidence.
+### At 64 connections over 8 workers: no difference, and no information
 
-Both on two X710 guests, io_uring and mio, before and after, per the standing
-send-path A/B mandate.
+| | throughput | worker cores busy |
+|---|---|---|
+| pool | 294,321 ops/s | 8/8, 71.5–81.8% |
+| merged | 294,447 ops/s | 8/8, 71.6–82.2% |
+
+That looks like a clean pass and is worth nothing. At N=64 over W=8 the
+kernel's hash leaves a worker idle with probability about 0.2%, so this run
+cannot distinguish placement working from placement doing nothing. It is the
+"measured from N independent clients" mistake in another form: the topology was
+right, the *scale* was not.
+
+### At 8 connections over 8 workers: merged leaves workers idle
+
+Worker-core busy %, three interleaved reps each:
+
+| rep | pool | merged |
+|---|---|---|
+| a | 31.9 42.9 32.1 32.0 30.9 30.1 31.7 29.6 | 31.6 42.6 35.6 32.3 **4.8** 30.6 **4.0** 39.1 |
+| b | 35.0 32.6 30.1 30.4 32.0 49.2 29.1 27.4 | 39.5 **2.5** 27.1 26.5 35.6 38.9 34.6 **8.1** |
+| c | 30.5 28.3 23.9 24.7 30.6 29.5 29.8 37.0 | 40.0 37.9 **4.1** 35.7 29.4 39.2 39.4 **4.3** |
+
+**Pool leaves no worker idle, 3/3. Merged leaves exactly two idle, 3/3** — a
+different pair each time, so it is the hash rather than a fixed bug. Two of
+eight is what (1-1/W)^W predicts.
+
+### Conclusion
+
+**Merged accept mode stays behind its flag.** Tier 1's accept-time handoff does
+not fix the case it was built for. The mechanism is visible in its own
+constants: a worker sheds only when it is `HANDOFF_MARGIN` (2) ahead of the
+quietest, but at N≈W most workers hold 0 or 1 connection, so a worker holding 2
+sheds only if it *sees* a zero — and the whole population arrives within
+microseconds, before any worker has published a load update. The optimistic
+claim added for bursts spreads work across many connections; it has nothing to
+work with when there are only eight.
+
+Connect rate is still unmeasured — `bench-client` opens its pool once and holds
+it, so a connect storm needs load-generator work that has not been done.
 
 ## Staging
 
