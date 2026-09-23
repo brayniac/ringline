@@ -5256,6 +5256,94 @@ mod tests {
         }
     }
 
+    // ── Park drain (tier 3, #443) ──────────────────────────────────
+
+    /// Wire order is the property under test, and it is the one a
+    /// "did the bytes survive" assertion would miss: the accumulator holds
+    /// bytes that arrived before anything still held, and `segment_pinned`
+    /// was popped from the front of `segment_hold`.
+    #[test]
+    fn the_park_drain_returns_bytes_in_wire_order() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+
+        el.driver.accumulators.append(conn_index, b"first");
+        el.driver.segment_pinned[conn_index as usize] = Some(
+            crate::backend::uring::driver::HeldRecvBuf::Owned(bytes::Bytes::from_static(b"second")),
+        );
+        el.driver.segment_hold[conn_index as usize].push_back(
+            crate::backend::uring::driver::HeldRecvBuf::Owned(bytes::Bytes::from_static(b"third")),
+        );
+        el.driver.segment_hold[conn_index as usize].push_back(
+            crate::backend::uring::driver::HeldRecvBuf::Owned(bytes::Bytes::from_static(b"fourth")),
+        );
+
+        let drained = el.driver.take_pending_for_park(conn_index);
+        let joined: Vec<u8> = drained.iter().flat_map(|b| b.to_vec()).collect();
+        assert_eq!(
+            joined, b"firstsecondthirdfourth",
+            "accumulator, then pinned, then held in FIFO order"
+        );
+    }
+
+    #[test]
+    fn the_park_drain_copies_pinned_bytes_and_returns_the_bid() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
+
+        let bid: u16 = 0;
+        deliver_segment(&mut el, conn_index, bid, b"payload");
+        assert!(
+            !el.driver.segment_hold[conn_index as usize].is_empty(),
+            "precondition: the bytes are held as a bid, not already owned"
+        );
+        assert!(
+            !el.driver.pending_replenish.contains(&bid),
+            "precondition: the bid has not been returned yet"
+        );
+
+        let drained = el.driver.take_pending_for_park(conn_index);
+        let joined: Vec<u8> = drained.iter().flat_map(|b| b.to_vec()).collect();
+        assert_eq!(joined, b"payload", "the held bytes survive as owned copies");
+        assert!(
+            el.driver.pending_replenish.contains(&bid),
+            "the bid must go back to the ring, or park leaks a buffer per move"
+        );
+    }
+
+    #[test]
+    fn the_park_drain_leaves_every_holder_empty() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let idx = conn_index as usize;
+
+        el.driver.accumulators.append(conn_index, b"acc");
+        el.driver.segment_pinned[idx] = Some(crate::backend::uring::driver::HeldRecvBuf::Owned(
+            bytes::Bytes::from_static(b"pin"),
+        ));
+        el.driver.segment_hold[idx].push_back(crate::backend::uring::driver::HeldRecvBuf::Owned(
+            bytes::Bytes::from_static(b"held"),
+        ));
+
+        let _ = el.driver.take_pending_for_park(conn_index);
+
+        assert!(el.driver.accumulators.is_empty(conn_index), "accumulator");
+        assert!(el.driver.segment_pinned[idx].is_none(), "pin slot");
+        assert!(el.driver.segment_hold[idx].is_empty(), "segment hold");
+        assert!(el.driver.recv_hold[idx].is_empty(), "recv hold");
+    }
+
+    #[test]
+    fn the_park_drain_of_an_idle_connection_is_empty() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        assert!(
+            el.driver.take_pending_for_park(conn_index).is_empty(),
+            "no received bytes means no chunks, not one empty chunk"
+        );
+    }
+
     // ── Send path tests ────────────────────────────────────────────
 
     #[test]
