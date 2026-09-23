@@ -247,6 +247,20 @@ pub struct Config {
     /// socket. Until then a worker must not arm an accept: accept on a
     /// bound-but-unlistening socket fails with `EINVAL`.
     pub(crate) merged_accept_live: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// This worker's index, so it can find its own slot in `worker_loads` and
+    /// avoid handing a connection back to itself.
+    pub(crate) worker_index: usize,
+    /// Live connection count per worker, published by each worker and read by
+    /// all of them when placing a newly accepted connection. Merged accept
+    /// mode only — pool mode places explicitly in the acceptor thread.
+    pub(crate) worker_loads: Option<std::sync::Arc<Vec<std::sync::atomic::AtomicU32>>>,
+    /// Every worker's accept channel and wake handle, so a worker that accepts
+    /// while over its share can hand the raw fd to a less-loaded peer. Empty
+    /// in pool mode, where the acceptor thread owns these.
+    pub(crate) peer_accept: Vec<(
+        crossbeam_channel::Sender<crate::acceptor::AcceptedConn>,
+        crate::wakeup::WakeFd,
+    )>,
     /// Print per-worker event-loop diagnostics to stderr at shutdown: the
     /// iteration mix (`[ringline diag]`) and wait/work stall buckets
     /// (`[ringline stall]`). The stall buckets cost ~4 clock reads per
@@ -406,6 +420,9 @@ impl Default for Config {
             accept_mode: AcceptMode::Pool,
             merged_accept_fds: Vec::new(),
             merged_accept_live: None,
+            worker_index: 0,
+            worker_loads: None,
+            peer_accept: Vec::new(),
             loop_diag: false,
             #[cfg(feature = "timestamps")]
             timestamps: false,

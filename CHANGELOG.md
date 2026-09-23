@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Merged accept mode now places a connection at accept time instead of taking
+  the kernel's 4-tuple hash: a worker that accepts while ahead of the quietest
+  peer hands the raw fd over before the connection has any state. This is what
+  makes `AcceptMode::Merged` viable for a pooled client, whose connections
+  otherwise land by hash. Tier 1 of `docs/listeners-and-accept-design.md`
+  (#443).
+
 - `ConfigBuilder::accept_mode(AcceptMode::Merged)` gives each worker its own
   `SO_REUSEPORT` listener and a multishot accept on its own ring, removing the
   acceptor thread, the per-connection channel hop and the wake fd. Default
