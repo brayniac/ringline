@@ -282,6 +282,32 @@ impl Ring {
         Ok(())
     }
 
+    /// Arm a multishot accept on a listener this worker owns (merged accept
+    /// mode).
+    ///
+    /// The `conn_index` field of the user_data carries the **listener index**,
+    /// not a connection: no slot exists until a CQE arrives. One CQE per
+    /// accepted connection; `IORING_CQE_F_MORE` means the arm is still live,
+    /// and its absence means re-arm.
+    ///
+    /// The listener fd is a plain fd, not a fixed-file index — listeners live
+    /// outside the connection table, whose fixed slots are indexed by
+    /// `conn_index`.
+    ///
+    /// No `sockaddr` comes back with a multishot accept (the kernel has
+    /// nowhere per-completion to put it), so the caller must `getpeername(2)`
+    /// on the accepted fd to learn the peer.
+    pub fn submit_accept_multi(&mut self, listener_index: u32, listen_fd: RawFd) -> io::Result<()> {
+        let user_data = UserData::encode(OpTag::AcceptMulti, listener_index, 0);
+        let entry = opcode::AcceptMulti::new(Fd(listen_fd))
+            .build()
+            .user_data(user_data.raw());
+        unsafe {
+            self.push_sqe(&entry)?;
+        }
+        Ok(())
+    }
+
     /// Submit a copied send. The data must be in a SendCopyPool slot.
     /// The pool slot index is stored in the payload for release on CQE.
     pub fn submit_send_copied(

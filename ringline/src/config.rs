@@ -2,6 +2,32 @@ use std::net::SocketAddr;
 
 use crate::buffer::fixed::MemoryRegion;
 
+/// Where connections are accepted.
+///
+/// See `docs/listeners-and-accept-design.md`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum AcceptMode {
+    /// One acceptor thread per listener, handing accepted fds to workers over
+    /// a channel with explicit round-robin placement. The default.
+    ///
+    /// Placement is deterministic, and a worker that is full or has exited is
+    /// skipped — properties the merged mode has to reconstruct.
+    #[default]
+    Pool,
+    /// Each worker owns a `SO_REUSEPORT` listener and accepts on its own ring
+    /// with multishot accept. No acceptor thread, no channel, no wake fd, and
+    /// no cross-thread handoff per connection.
+    ///
+    /// Placement falls to the kernel's 4-tuple hash unless steered, which is
+    /// uneven for a client that opens a pool of connections: at N connections
+    /// over N workers roughly 1/e of workers get none. That is why this is not
+    /// the default. io_uring only — the mio backend always uses [`Pool`].
+    ///
+    /// [`Pool`]: AcceptMode::Pool
+    Merged,
+}
+
 /// TLS configuration. Pass a pre-built rustls ServerConfig.
 #[derive(Clone)]
 pub struct TlsConfig {
@@ -209,6 +235,18 @@ pub struct Config {
     pub(crate) tls_client: Option<TlsClientConfig>,
     /// Enable TCP_NODELAY on all connections (accepted and outbound).
     pub(crate) tcp_nodelay: bool,
+    /// Where connections are accepted. See [`AcceptMode`].
+    pub(crate) accept_mode: AcceptMode,
+    /// Merged accept mode: this worker's own `SO_REUSEPORT` listener sockets,
+    /// as `(listener index, fd)`. Bound but **not** listening when the worker
+    /// starts — `launch()` calls `listen(2)` only once every worker has
+    /// reported ready, so "listening" and "ready to serve" are the same
+    /// instant. Empty in pool mode and in client-only mode.
+    pub(crate) merged_accept_fds: Vec<(u32, std::os::fd::RawFd)>,
+    /// Set by `launch()` after it has called `listen(2)` on every merged
+    /// socket. Until then a worker must not arm an accept: accept on a
+    /// bound-but-unlistening socket fails with `EINVAL`.
+    pub(crate) merged_accept_live: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Print per-worker event-loop diagnostics to stderr at shutdown: the
     /// iteration mix (`[ringline diag]`) and wait/work stall buckets
     /// (`[ringline stall]`). The stall buckets cost ~4 clock reads per
@@ -365,6 +403,9 @@ impl Default for Config {
             listener_tls: Vec::new(),
             tls_client: None,
             tcp_nodelay: true,
+            accept_mode: AcceptMode::Pool,
+            merged_accept_fds: Vec::new(),
+            merged_accept_live: None,
             loop_diag: false,
             #[cfg(feature = "timestamps")]
             timestamps: false,
@@ -731,6 +772,15 @@ impl ConfigBuilder {
     /// Set the bound on the per-worker accept channel. Default: 1024.
     pub fn accept_queue_capacity(mut self, n: usize) -> Self {
         self.config.accept_queue_capacity = n;
+        self
+    }
+
+    /// Choose where connections are accepted. Default [`AcceptMode::Pool`].
+    ///
+    /// [`AcceptMode::Merged`] is io_uring only; on the mio backend it is
+    /// accepted and ignored, since mio has no multishot accept.
+    pub fn accept_mode(mut self, mode: AcceptMode) -> Self {
+        self.config.accept_mode = mode;
         self
     }
 

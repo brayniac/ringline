@@ -87,6 +87,12 @@ pub enum OpTag {
     /// PollAdd for POLLOUT after a forward write to a socket sink returned
     /// `-EAGAIN`. Payload = the connection generation at submit time.
     ForwardWritePollOut = 30,
+    /// Multishot accept on a listener the worker owns (merged accept mode).
+    /// The `conn_index` field carries the **listener index**, not a
+    /// connection: no slot exists yet when the SQE is submitted. Payload
+    /// unused. One CQE per accepted connection; `IORING_CQE_F_MORE` says the
+    /// arm is still live, and its absence means re-arm.
+    AcceptMulti = 31,
 }
 
 impl OpTag {
@@ -123,6 +129,7 @@ impl OpTag {
             28 => Some(OpTag::RecvFallback),
             29 => Some(OpTag::ForwardWrite),
             30 => Some(OpTag::ForwardWritePollOut),
+            31 => Some(OpTag::AcceptMulti),
             _ => None,
         }
     }

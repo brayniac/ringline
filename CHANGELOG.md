@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- `ConfigBuilder::accept_mode(AcceptMode::Merged)` gives each worker its own
+  `SO_REUSEPORT` listener and a multishot accept on its own ring, removing the
+  acceptor thread, the per-connection channel hop and the wake fd. Default
+  stays `AcceptMode::Pool`, whose explicit round-robin placement the kernel's
+  4-tuple hash does not match for a pooled client — at N connections over N
+  workers roughly 1/e of workers get none. io_uring only, TCP listeners only
+  (`SO_REUSEPORT` does not apply to Unix sockets, which keep their acceptor
+  thread). Step 3 of `docs/listeners-and-accept-design.md` (#443).
+
 - `RinglineBuilder::bind_tls(addr, TlsConfig)` terminates TLS on one listener
   with its own configuration, so a process can serve plaintext on one port and
   TLS on another, or two ports with different certificates. Previously

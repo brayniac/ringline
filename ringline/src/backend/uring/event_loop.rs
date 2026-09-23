@@ -114,6 +114,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
     /// Run the async event loop. Blocks the current thread.
     pub(crate) fn run(&mut self) -> Result<(), crate::error::Error> {
+        // Merged accept mode arms here rather than at construction: the
+        // listener sockets are bound but not listening until every worker has
+        // reported ready, and an accept on a non-listening socket is EINVAL.
+        self.arm_merged_accepts();
+
         // Spawn UDP handler tasks for each bound UDP socket.
         for udp_idx in 0..self.driver.udp_sockets.len() {
             let udp_ctx = UdpCtx {
@@ -1105,6 +1110,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         };
 
         match tag {
+            OpTag::AcceptMulti => self.handle_accept_multi(ud, result, flags),
             OpTag::RecvMulti => self.handle_recv_multi(ud, result, flags),
             OpTag::RecvFallback => self.handle_recv_fallback(ud, result),
             OpTag::Send => self.handle_send(ud, result),
@@ -1829,7 +1835,147 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         None
     }
 
+    /// Install an accepted fd into a connection slot and start serving it.
+    ///
+    /// Shared by the two ways a connection arrives: the acceptor channel (pool
+    /// mode) and a multishot accept CQE (merged mode). Consumes `raw_fd` — it
+    /// is registered into the fixed-file table and then closed, or closed on
+    /// any failure along the way.
+    fn install_accepted(
+        &mut self,
+        raw_fd: std::os::fd::RawFd,
+        listener: crate::ListenerId,
+        peer_addr: crate::connection::PeerAddr,
+    ) {
+        let conn_index = match self.driver.connections.allocate() {
+            Some(idx) => idx,
+            None => {
+                unsafe {
+                    libc::close(raw_fd);
+                }
+                return;
+            }
+        };
+
+        if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+            cs.peer_addr = Some(peer_addr);
+            cs.listener = Some(listener);
+        }
+
+        if self
+            .driver
+            .ring
+            .register_files_update(conn_index, &[raw_fd])
+            .is_err()
+        {
+            self.driver.connections.release(conn_index);
+            unsafe {
+                libc::close(raw_fd);
+            }
+            return;
+        }
+        unsafe {
+            libc::close(raw_fd);
+        }
+
+        if let Some(pending) = self.driver.pending_recv_bufs[conn_index as usize].take() {
+            self.driver.pending_replenish.push(pending.bid);
+        }
+        self.driver.accumulators.reset(conn_index);
+        self.driver.reset_segment_state(conn_index);
+        self.driver.reset_send_state(conn_index);
+        self.arm_recv(conn_index);
+
+        // TLS path: defer accept until handshake completes.
+        if let Some(ref mut tls_table) = self.driver.tls_table
+            && tls_table.has_server_config_for(Some(listener))
+        {
+            if tls_table.create(conn_index, Some(listener)).is_err() {
+                self.driver.close_connection(conn_index);
+            }
+            return;
+        }
+
+        // Plaintext path: mark established and spawn async task.
+        if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+            cs.established = true;
+        }
+        metrics::CONNECTIONS.increment(metrics::conn::ACCEPTED);
+        metrics::CONNECTIONS_ACTIVE.increment();
+        self.spawn_accept_task(conn_index);
+    }
+
+    /// Arm this worker's multishot accepts, once `launch()` has listened.
+    ///
+    /// Cheap to call every iteration: it is a relaxed load and an early return
+    /// after the first arm.
+    fn arm_merged_accepts(&mut self) {
+        if self.driver.merged_accept_armed || self.driver.merged_accept_fds.is_empty() {
+            return;
+        }
+        let live = match self.driver.merged_accept_live {
+            Some(ref flag) => flag.load(std::sync::atomic::Ordering::Acquire),
+            None => false,
+        };
+        if !live {
+            return;
+        }
+        // Arm all or none: a partial arm would leave one listener unserved
+        // with no later trigger to retry, since the flag only rises once.
+        let fds = self.driver.merged_accept_fds.clone();
+        for (listener_index, fd) in fds {
+            if let Err(error) = self.driver.ring.submit_accept_multi(listener_index, fd) {
+                // Submission queue full is backpressure, not failure
+                // (Domain Invariant 7) — leave `armed` false and retry next
+                // iteration, when the queue has drained.
+                let _ = error;
+                return;
+            }
+        }
+        self.driver.merged_accept_armed = true;
+    }
+
+    /// A multishot accept produced a connection (merged accept mode).
+    ///
+    /// `ud`'s conn_index field carries the listener index — there is no
+    /// connection yet. Multishot accept delivers no `sockaddr`, so the peer
+    /// comes from `getpeername(2)` on the accepted fd.
+    fn handle_accept_multi(&mut self, ud: UserData, result: i32, flags: u32) {
+        let listener_index = ud.conn_index();
+
+        if result < 0 {
+            let err = -result;
+            // ECANCELED/EBADF/EINVAL are the shapes shutdown takes: the
+            // listener was closed under us. Anything else is worth re-arming
+            // for, since losing the arm silently stops the worker accepting.
+            let terminal = err == libc::ECANCELED || err == libc::EBADF || err == libc::EINVAL;
+            if terminal {
+                self.driver.merged_accept_armed = false;
+                return;
+            }
+        } else {
+            let raw_fd = result;
+            let peer = crate::backend::sockaddr::getpeername_peer_addr(raw_fd).unwrap_or(
+                crate::connection::PeerAddr::Tcp(std::net::SocketAddr::from(([0, 0, 0, 0], 0))),
+            );
+            self.install_accepted(raw_fd, crate::ListenerId::from_index(listener_index), peer);
+        }
+
+        // Without IORING_CQE_F_MORE the kernel has dropped the arm; re-arm or
+        // this worker silently stops accepting.
+        if !cqueue::more(flags) {
+            self.driver.merged_accept_armed = false;
+            self.arm_merged_accepts();
+        }
+    }
+
     fn handle_eventfd_read(&mut self) {
+        // `launch()` wakes every worker right after it listens on the merged
+        // sockets, so this is where the arm actually happens — the call in
+        // `run()` runs before the gate is up and is only for a worker that
+        // starts late enough to find it already set.
+        self.arm_merged_accepts();
+
         // Drain accept channel (server mode only).
         {
             loop {
@@ -1845,63 +1991,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 else {
                     break;
                 };
-
-                let conn_index = match self.driver.connections.allocate() {
-                    Some(idx) => idx,
-                    None => {
-                        unsafe {
-                            libc::close(raw_fd);
-                        }
-                        continue;
-                    }
-                };
-
-                if let Some(cs) = self.driver.connections.get_mut(conn_index) {
-                    cs.peer_addr = Some(peer_addr);
-                    cs.listener = Some(listener);
-                }
-
-                if self
-                    .driver
-                    .ring
-                    .register_files_update(conn_index, &[raw_fd])
-                    .is_err()
-                {
-                    self.driver.connections.release(conn_index);
-                    unsafe {
-                        libc::close(raw_fd);
-                    }
-                    continue;
-                }
-                unsafe {
-                    libc::close(raw_fd);
-                }
-
-                if let Some(pending) = self.driver.pending_recv_bufs[conn_index as usize].take() {
-                    self.driver.pending_replenish.push(pending.bid);
-                }
-                self.driver.accumulators.reset(conn_index);
-                self.driver.reset_segment_state(conn_index);
-                self.driver.reset_send_state(conn_index);
-                self.arm_recv(conn_index);
-
-                // TLS path: defer accept until handshake completes.
-                if let Some(ref mut tls_table) = self.driver.tls_table
-                    && tls_table.has_server_config_for(Some(listener))
-                {
-                    if tls_table.create(conn_index, Some(listener)).is_err() {
-                        self.driver.close_connection(conn_index);
-                    }
-                    continue;
-                }
-
-                // Plaintext path: mark established and spawn async task.
-                if let Some(cs) = self.driver.connections.get_mut(conn_index) {
-                    cs.established = true;
-                }
-                metrics::CONNECTIONS.increment(metrics::conn::ACCEPTED);
-                metrics::CONNECTIONS_ACTIVE.increment();
-                self.spawn_accept_task(conn_index);
+                self.install_accepted(raw_fd, listener, peer_addr);
             }
         }
 

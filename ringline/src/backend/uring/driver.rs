@@ -403,6 +403,15 @@ pub(crate) struct Driver {
     /// and re-armed once the hold drains below the cap.
     pub(crate) forward_hold_cap: usize,
     pub(crate) accept_rx: Option<crossbeam_channel::Receiver<crate::acceptor::AcceptedConn>>,
+    /// Merged accept mode: this worker's own listener sockets, `(listener
+    /// index, fd)`. Empty in pool mode.
+    pub(crate) merged_accept_fds: Vec<(u32, std::os::fd::RawFd)>,
+    /// Goes true once `launch()` has called `listen(2)` on every merged socket.
+    /// Arming an accept before that fails with `EINVAL`.
+    pub(crate) merged_accept_live: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Whether this worker has already armed its multishot accepts, so the
+    /// arming runs once rather than on every loop iteration.
+    pub(crate) merged_accept_armed: bool,
     pub(crate) eventfd: RawFd,
     pub(crate) eventfd_buf: [u8; 8],
     /// Wake handle for cross-thread wakeup (wraps the eventfd).
@@ -824,6 +833,9 @@ impl Driver {
             forward_hold_throttled: vec![false; config.max_connections as usize],
             forward_hold_cap: config.forward_hold_cap,
             accept_rx,
+            merged_accept_fds: config.merged_accept_fds.clone(),
+            merged_accept_live: config.merged_accept_live.clone(),
+            merged_accept_armed: false,
             eventfd,
             eventfd_buf: [0u8; 8],
             wake_handle: crate::wakeup::WakeFd::from_raw_fd(eventfd),
