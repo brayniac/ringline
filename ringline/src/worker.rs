@@ -62,13 +62,16 @@ fn panic_payload(payload: &(dyn Any + Send)) -> String {
 /// it: it wakes a thread parked in `accept4` and frees the port immediately.
 fn close_listeners(listeners: &[ListenerHandle]) {
     for listener in listeners {
-        if !listener
+        if listener
             .closed
             .swap(true, std::sync::atomic::Ordering::AcqRel)
         {
+            continue;
+        }
+        for &fd in &listener.fds {
             unsafe {
-                libc::shutdown(listener.fd, libc::SHUT_RD);
-                libc::close(listener.fd);
+                libc::shutdown(fd, libc::SHUT_RD);
+                libc::close(fd);
             }
         }
     }
@@ -302,8 +305,7 @@ impl ShutdownHandle {
             if listener.closed.swap(true, Ordering::AcqRel) {
                 continue;
             }
-            let fd = listener.fd;
-            unsafe {
+            for &fd in &listener.fds {
                 // shutdown(SHUT_RD) first: on Linux this wakes a thread
                 // blocked in accept4 (with EINVAL) and releases the bound
                 // port immediately. close(2) alone does neither — the
@@ -312,8 +314,14 @@ impl ShutdownHandle {
                 // until one more peer connected (EADDRINUSE on prompt
                 // relaunch). The close below then runs after the acceptor
                 // can no longer loop into a reused fd number.
-                libc::shutdown(fd, libc::SHUT_RD);
-                libc::close(fd);
+                //
+                // In merged mode there is no acceptor thread, but a worker
+                // may be parked in the ring with a multishot accept armed on
+                // this fd; the same shutdown-then-close wakes it.
+                unsafe {
+                    libc::shutdown(fd, libc::SHUT_RD);
+                    libc::close(fd);
+                }
             }
         }
         // Wake all workers so they see the flag even if blocked on I/O.
@@ -381,9 +389,12 @@ struct ListenerSpec {
 /// A listener the runtime owns, after binding. One per `bind*()` call, in
 /// call order, so its position is its [`ListenerId`](crate::ListenerId).
 struct ListenerHandle {
-    fd: RawFd,
-    /// Set once by whoever closes `fd` — `shutdown()` or the acceptor thread
-    /// on exit — so the close happens exactly once.
+    /// One fd in pool mode. In merged mode, one `SO_REUSEPORT` socket per
+    /// worker, all bound to the same address — the worker at index `i` accepts
+    /// on `fds[i]`.
+    fds: Vec<RawFd>,
+    /// Set once by whoever closes these fds — `shutdown()` or the acceptor
+    /// thread on exit — so the close happens exactly once.
     closed: Arc<AtomicBool>,
     /// `Some` for a TCP listener (after zero-port resolution), `None` for Unix.
     bound_addr: Option<SocketAddr>,
@@ -892,8 +903,70 @@ impl RinglineBuilder {
             None
         };
 
+        // Merged accept mode: bind every worker's SO_REUSEPORT socket now, but
+        // do not listen yet. Binding reserves the port (and resolves a port-0
+        // bind once, so all workers share one port instead of scattering across
+        // ephemeral ones); listening is what makes the runtime reachable, and
+        // that waits until every worker has reported ready. "Listening" and
+        // "ready to serve" stay the same instant, which is the guarantee the
+        // pool mode gets from creating its listener after the startup barrier.
+        //
+        // TCP only: SO_REUSEPORT does not apply to Unix sockets, so a Unix
+        // listener keeps its acceptor thread even in merged mode.
+        let merged_mode =
+            self.config.accept_mode == crate::config::AcceptMode::Merged && cfg!(has_io_uring);
+        let mut merged_sockets: Vec<(u32, Vec<RawFd>, Option<SocketAddr>)> = Vec::new();
+        if merged_mode {
+            for (idx, spec) in pending_listeners.iter().enumerate() {
+                let BindAddr::Tcp(addr) = &spec.addr else {
+                    continue;
+                };
+                let mut fds: Vec<RawFd> = Vec::with_capacity(num_threads);
+                let mut resolved: Option<SocketAddr> = None;
+                let mut failure = None;
+                for _ in 0..num_threads {
+                    let target = resolved.unwrap_or(*addr);
+                    match bind_reuseport_socket(target) {
+                        Ok(fd) => {
+                            if resolved.is_none() {
+                                resolved = getsockname_v4_v6(fd);
+                            }
+                            fds.push(fd);
+                        }
+                        Err(e) => {
+                            failure = Some(e);
+                            break;
+                        }
+                    }
+                }
+                if let Some(e) = failure {
+                    for fd in fds {
+                        unsafe { libc::close(fd) };
+                    }
+                    for (_, fds, _) in &merged_sockets {
+                        for &fd in fds {
+                            unsafe { libc::close(fd) };
+                        }
+                    }
+                    rollback_workers(&shutdown_flag, &worker_wake_fds, handles);
+                    return Err(e);
+                }
+                merged_sockets.push((idx as u32, fds, resolved));
+            }
+        }
+        let merged_live = if merged_sockets.is_empty() {
+            None
+        } else {
+            Some(Arc::new(AtomicBool::new(false)))
+        };
+
         for worker_id in 0..num_threads {
-            let config = self.config.clone();
+            let mut config = self.config.clone();
+            config.merged_accept_fds = merged_sockets
+                .iter()
+                .map(|(idx, fds, _)| (*idx, fds[worker_id]))
+                .collect();
+            config.merged_accept_live = merged_live.clone();
             let rx = worker_rxs.remove(0);
             // (read end for polling, write end for cross-thread wakes —
             // on the mio backend these are the two ends of a pipe; the
@@ -1073,14 +1146,34 @@ impl RinglineBuilder {
             let mut listeners: Vec<ListenerHandle> = Vec::with_capacity(pending_listeners.len());
 
             for (idx, spec) in pending_listeners.iter().enumerate() {
-                let created = match &spec.addr {
-                    BindAddr::Tcp(addr) => create_listener(*addr, self.config.backlog)
-                        .map(|fd| (fd, getsockname_v4_v6(fd))),
-                    BindAddr::Unix(path) => {
-                        create_unix_listener(path, self.config.backlog).map(|fd| (fd, None))
-                    }
-                };
-                let (fd, bound_addr) = match created {
+                // Merged listeners were bound before the workers started; all
+                // that is left is to listen, which is the moment the runtime
+                // becomes reachable.
+                let merged_entry = merged_sockets.iter().find(|(i, _, _)| *i == idx as u32);
+
+                let created: Result<(Vec<RawFd>, Option<SocketAddr>), crate::error::Error> =
+                    match (&spec.addr, merged_entry) {
+                        (BindAddr::Tcp(_), Some((_, fds, resolved))) => {
+                            let mut err = None;
+                            for &fd in fds {
+                                if unsafe { libc::listen(fd, self.config.backlog) } < 0 {
+                                    err = Some(crate::error::Error::Io(io::Error::last_os_error()));
+                                    break;
+                                }
+                            }
+                            match err {
+                                Some(e) => Err(e),
+                                None => Ok((fds.clone(), *resolved)),
+                            }
+                        }
+                        (BindAddr::Tcp(addr), None) => create_listener(*addr, self.config.backlog)
+                            .map(|fd| (vec![fd], getsockname_v4_v6(fd))),
+                        (BindAddr::Unix(path), _) => {
+                            create_unix_listener(path, self.config.backlog)
+                                .map(|fd| (vec![fd], None))
+                        }
+                    };
+                let (fds, bound_addr) = match created {
                     Ok(created) => created,
                     Err(error) => {
                         // Roll back the listeners already bound, or a failure on
@@ -1093,8 +1186,21 @@ impl RinglineBuilder {
                 };
 
                 let closed = Arc::new(AtomicBool::new(false));
+
+                // Merged mode has no acceptor thread: the workers arm their own
+                // multishot accept on these fds. Record the listener and move on.
+                if merged_entry.is_some() {
+                    listeners.push(ListenerHandle {
+                        fds,
+                        closed,
+                        bound_addr,
+                    });
+                    continue;
+                }
+
+                let listen_fd = fds[0];
                 let acceptor_config = AcceptorConfig {
-                    listen_fd: fd,
+                    listen_fd,
                     listener: crate::ListenerId::from_index(idx as u32),
                     worker_channels: worker_txs.clone(),
                     worker_wake_handles: worker_wake_fds.clone(),
@@ -1115,7 +1221,7 @@ impl RinglineBuilder {
                         run_acceptor(acceptor_config);
                         if !acceptor_closed.swap(true, Ordering::AcqRel) {
                             unsafe {
-                                libc::close(fd);
+                                libc::close(listen_fd);
                             }
                         }
                     });
@@ -1123,7 +1229,7 @@ impl RinglineBuilder {
                 if let Err(error) = spawn_result {
                     if !closed.swap(true, Ordering::AcqRel) {
                         unsafe {
-                            libc::close(fd);
+                            libc::close(listen_fd);
                         }
                     }
                     close_listeners(&listeners);
@@ -1132,11 +1238,21 @@ impl RinglineBuilder {
                 }
 
                 listeners.push(ListenerHandle {
-                    fd,
+                    fds,
                     closed,
                     bound_addr,
                 });
             }
+            // Every merged socket is listening now, so the workers may arm.
+            // Publishing the flag before the wake means a worker that checks on
+            // its own schedule still sees it.
+            if let Some(ref live) = merged_live {
+                live.store(true, Ordering::Release);
+                for wh in &worker_wake_fds {
+                    wh.wake();
+                }
+            }
+
             listeners
         } else {
             Vec::new()
@@ -1292,6 +1408,50 @@ fn pin_to_core(core: usize) -> Result<(), crate::error::Error> {
 fn pin_to_core(_core: usize) -> Result<(), crate::error::Error> {
     // Thread pinning is not supported on this platform.
     Ok(())
+}
+
+/// Create a `SO_REUSEPORT` socket and bind it, without listening.
+///
+/// A bound-but-not-listening socket holds the port reservation but takes no
+/// connections, which is how `launch()` resolves a port-0 bind for merged mode
+/// without opening a listener before the workers are ready.
+fn bind_reuseport_socket(addr: SocketAddr) -> Result<RawFd, crate::error::Error> {
+    let domain = if addr.is_ipv4() {
+        libc::AF_INET
+    } else {
+        libc::AF_INET6
+    };
+    let fd = unsafe { libc::socket(domain, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        return Err(crate::error::Error::Io(io::Error::last_os_error()));
+    }
+    let optval: libc::c_int = 1;
+    for opt in [libc::SO_REUSEADDR, libc::SO_REUSEPORT] {
+        let ret = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                opt,
+                &optval as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if ret < 0 {
+            let err = io::Error::last_os_error();
+            unsafe { libc::close(fd) };
+            return Err(crate::error::Error::Io(err));
+        }
+    }
+
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let addr_len = crate::backend::socket_addr_to_sockaddr(addr, &mut storage);
+    let ret = unsafe { libc::bind(fd, &storage as *const _ as *const libc::sockaddr, addr_len) };
+    if ret < 0 {
+        let err = io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(crate::error::Error::Io(err));
+    }
+    Ok(fd)
 }
 
 /// Create a TCP listener without SO_REUSEPORT (just SO_REUSEADDR).

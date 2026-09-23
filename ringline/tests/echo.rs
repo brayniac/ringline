@@ -5702,6 +5702,103 @@ fn resolve_disabled_returns_error() {
 
 // ── Unix domain socket tests ────────────────────────────────────────
 
+/// Merged accept mode actually accepts, on several workers, over one port.
+///
+/// io_uring only: merged mode needs multishot accept, which mio has no
+/// equivalent for, so `AcceptMode::Merged` is ignored there.
+///
+/// Every other test runs the default `Pool` mode, so without this one the
+/// whole merged path could be a no-op and the suite would not notice.
+#[cfg(has_io_uring)]
+#[test]
+fn merged_accept_mode_serves_connections_across_workers() {
+    static SERVED: AtomicU32 = AtomicU32::new(0);
+    static SAW_PEER: AtomicU32 = AtomicU32::new(0);
+
+    struct MergedEcho;
+    impl AsyncEventHandler for MergedEcho {
+        fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
+            async move {
+                // Multishot accept carries no sockaddr; the runtime fills this
+                // in with getpeername. If that were skipped the peer would come
+                // back as the 0.0.0.0:0 placeholder.
+                let real_peer = matches!(
+                    conn.peer_addr(),
+                    Some(ringline::PeerAddr::Tcp(a)) if a.port() != 0
+                );
+                let (mut tx, mut rx) = conn.split();
+                let _ = rx
+                    .with_data(|data| {
+                        // Count only connections that carry data.
+                        // `wait_for_server` connects and drops to probe
+                        // reachability, and that probe is accepted like any
+                        // other connection — counting it made this assert 17
+                        // against 16 payloads.
+                        if !data.is_empty() {
+                            SERVED.fetch_add(1, Ordering::SeqCst);
+                            if real_peer {
+                                SAW_PEER.fetch_add(1, Ordering::SeqCst);
+                            }
+                        }
+                        let _ = tx.send_nowait(data);
+                        ParseResult::Consumed(data.len())
+                    })
+                    .await;
+            }
+        }
+        fn create_for_worker(_id: usize) -> Self {
+            MergedEcho
+        }
+    }
+
+    SERVED.store(0, Ordering::SeqCst);
+    SAW_PEER.store(0, Ordering::SeqCst);
+
+    const CONNS: usize = 16;
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let config = test_config_builder()
+        .workers(4)
+        .accept_mode(ringline::AcceptMode::Merged)
+        .build()
+        .expect("valid config");
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind(addr.parse().unwrap())
+        .launch::<MergedEcho>()
+        .expect("launch failed");
+
+    // Reachability is the real assertion here: in merged mode nothing listens
+    // until every worker has reported ready and launch has called listen(2).
+    wait_for_server(&addr);
+
+    for i in 0..CONNS {
+        let payload = format!("merged-{i:02}");
+        let got = echo_round_trip(&addr, payload.as_bytes());
+        assert_eq!(
+            got,
+            payload.as_bytes(),
+            "connection {i} did not echo under merged accept"
+        );
+    }
+
+    assert_eq!(
+        SERVED.load(Ordering::SeqCst) as usize,
+        CONNS,
+        "every connection must reach a handler (0 = merged accept never armed)"
+    );
+    assert_eq!(
+        SAW_PEER.load(Ordering::SeqCst) as usize,
+        CONNS,
+        "every connection must report a real peer port, not the placeholder"
+    );
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
 /// One process, a TCP listener and a Unix listener, one `on_accept`.
 ///
 /// Before the listener list a runtime could bind exactly one socket —

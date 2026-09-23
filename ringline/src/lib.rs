@@ -222,6 +222,8 @@ pub use topology::physical_core_count;
 
 // ── Re-exports: Handler types ─────────────────────────────────────────
 
+/// Where connections are accepted.
+pub use config::AcceptMode;
 /// Peer address for a connection — TCP or Unix domain socket.
 pub use connection::PeerAddr;
 /// Opaque connection handle.

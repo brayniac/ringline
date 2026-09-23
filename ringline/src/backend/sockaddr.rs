@@ -135,3 +135,20 @@ pub(crate) fn socket_addr_to_sockaddr(
         }
     }
 }
+
+/// The peer address of a connected socket, via `getpeername(2)`.
+///
+/// Multishot accept returns no `sockaddr` — the kernel has nowhere
+/// per-completion to put one — so merged accept mode asks for it here instead
+/// of getting it free with the completion, as `accept4(2)` does.
+#[cfg(has_io_uring)]
+pub(crate) fn getpeername_peer_addr(fd: std::os::fd::RawFd) -> Option<crate::connection::PeerAddr> {
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    let ret =
+        unsafe { libc::getpeername(fd, &mut storage as *mut _ as *mut libc::sockaddr, &mut len) };
+    if ret < 0 {
+        return None;
+    }
+    sockaddr_to_peer_addr(&storage, len)
+}
