@@ -249,11 +249,33 @@ workers is likewise already supported —
 `register_files_update(fd_index, &[fd])` (`backend/uring/driver.rs:2380`) is how
 an fd enters a worker's fixed-file table.
 
-Sequence: quiesce via the deferred-close path → unregister the fd from A →
-package `(OwnedFd, leftover accumulator bytes, TLS state, ListenerId, PeerAddr,
+The gate is not new either — it is `try_finalize_close`'s predicate
+(`backend/uring/driver.rs:1670`), which is already the definition of "this
+connection is quiescent":
+
+```rust
+!in_flight && queue.is_empty() && forward_write.is_none() && !chain_table.is_active()
+```
+
+with **one term that close does not need**: `segment_pinned[conn].is_none()`.
+A pinned entry is `HeldRecvBuf::Pinned { bid, len }`, a bid index into *this
+worker's* `ProvidedBufRing`; on the target worker it addresses a different
+ring's buffer. Close can defer until the reader releases it, but park has a
+cheaper option, and it is the rule segmented recv already follows: **convert
+`Pinned` to `Owned` by copying** before the move. Bounded work, always
+succeeds, and no connection becomes permanently unparkable because a reader is
+slow. `HeldRecvBuf::Owned(Bytes)` needs nothing.
+
+Sequence: quiesce on the predicate above → convert any pinned segment to owned
+→ cancel the multishot recv and unregister the fd from A → package
+`(OwnedFd, leftover accumulator bytes, TLS state, ListenerId, PeerAddr,
 handler payload)`, all `Send` → send over the tier-1 channel → B allocates a
 slot, registers the fd, seeds the accumulator, re-arms multishot recv, and calls
 a new `on_adopt` hook.
+
+"TLS state" is the whole `UnbufferedConn` (or its buffered counterpart) moved as
+one value, not a reconstructed session — see open question 4. Both engines take
+the same path.
 
 `on_adopt` is **optional**, and the handler payload is the new public surface:
 since the future dies, anything the handler kept — negotiated protocol,
@@ -328,15 +350,36 @@ measurement before it is more than a knob.
 3. What happens to connections **already queued** on a socket when it leaves
    the rotation? They stay, so tier 2 needs a drain before any close. Not
    measured.
-3. Does the `tls-unbuffered` engine hold partial-record state that complicates
-   moving a `ServerConnection` between workers? (Tier 3.)
-4. Can a `Bytes` handed out by `with_bytes` still be alive at a park point? The
-   quiescent-point rule should preclude it; it needs to be an assertion, not an
-   assumption. (Tier 3.)
-5. Does any client crate need to be generic over transport (redis and memcached
+4. ~~Does the `tls-unbuffered` engine hold partial-record state that complicates
+   moving a `ServerConnection` between workers?~~ **Answered 2026-09-23: it holds
+   the state, and it moves anyway.** `UnbufferedConn`
+   (`tls/unbuffered/mod.rs:133`) keeps `incoming: CiphertextBuf` — received
+   ciphertext awaiting `process_tls_records`, i.e. exactly the partial records
+   this asked about — plus `pending_plaintext: VecDeque<Vec<u8>>`. Both are
+   plain owned data: `CiphertextBuf` is a `Vec<u8>` and three `usize`
+   (`tls/ciphertext.rs:80`). The two cache fields
+   (`max_plaintext_per_chunk`, `chunk_basis`) are keyed on the `SendCopyPool`
+   slot size, which is uniform for every slot today, so they stay valid on the
+   target worker. Verified by compiling a `Send` bound over `UnbufferedConn`,
+   `CiphertextBuf` and `RecvAccumulator`, and by then adding an `Rc<u8>` to
+   confirm the assertion could fail. **Tier 3 therefore needs no
+   engine-specific path** — move the whole `UnbufferedConn` as one value
+   rather than reconstructing it. Revisit only if TLS ever gets its own slot
+   class, which would invalidate the chunk cache across workers; that is
+   already flagged at the field.
+5. ~~Can a `Bytes` handed out by `with_bytes` still be alive at a park
+   point?~~ **Answered 2026-09-23: it can, and it is not the hazard.** The
+   accumulator copies into its own `BytesMut` (`accumulator.rs:73`), so a
+   `Bytes` from `with_bytes` is a refcounted slice of owned memory — `Send`,
+   and dropped with the future that park discards regardless. The blocker is
+   one level down: `segment_pinned[conn]` can hold
+   `HeldRecvBuf::Pinned { bid, len }`, a bid index into **this worker's**
+   `ProvidedBufRing`, which means nothing on the target.
+   `HeldRecvBuf::Owned(Bytes)` moves fine. See the gate in §6.
+6. Does any client crate need to be generic over transport (redis and memcached
    both speak Unix sockets)? Decides whether §1's transport erasure is also
    needed on the outbound side.
-6. Is per-listener TLS reachable without restructuring the handshake path, or
+7. Is per-listener TLS reachable without restructuring the handshake path, or
    does `TlsConfig` need to become per-connection state?
 
 ## Measurement
