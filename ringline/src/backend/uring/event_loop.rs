@@ -5129,6 +5129,133 @@ mod tests {
         conn_index
     }
 
+    // ── Park gate (tier 3, #443) ───────────────────────────────────
+
+    use crate::backend::uring::driver::ParkBlocker;
+
+    /// The baseline every other park test leans on: this harness can produce a
+    /// connection the gate accepts. Without it a blocker test proves nothing —
+    /// it would pass just as well if `park_blocker` always refused.
+    #[test]
+    fn a_quiescent_connection_is_parkable() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        assert_eq!(
+            el.driver.park_blocker(conn_index),
+            None,
+            "a freshly accepted, idle connection is the canonical parkable case"
+        );
+        assert!(el.driver.is_parkable(conn_index));
+    }
+
+    #[test]
+    fn an_in_flight_send_blocks_the_park() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        el.driver.send_queues[conn_index as usize].in_flight = true;
+        assert_eq!(
+            el.driver.park_blocker(conn_index),
+            Some(ParkBlocker::Sends),
+            "the SQE references this worker's pool slot (Domain Invariant 1)"
+        );
+    }
+
+    #[test]
+    fn a_requested_close_blocks_the_park() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        el.driver.close_connection(conn_index);
+        assert_eq!(
+            el.driver.park_blocker(conn_index),
+            Some(ParkBlocker::Closing),
+            "park must lose the race to teardown, not run alongside it"
+        );
+    }
+
+    #[test]
+    fn a_connection_still_handshaking_is_not_parkable() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        if let Some(cs) = el.driver.connections.get_mut(conn_index) {
+            cs.established = false;
+        }
+        assert_eq!(
+            el.driver.park_blocker(conn_index),
+            Some(ParkBlocker::NotOpen),
+            "there is no connection state worth moving until the handshake lands"
+        );
+    }
+
+    #[test]
+    fn a_live_segment_reader_blocks_the_park() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        el.driver.segment_reader_live[conn_index as usize] = true;
+        assert_eq!(
+            el.driver.park_blocker(conn_index),
+            Some(ParkBlocker::SegmentReader),
+            "a reader owns delivery discipline for its lifetime: not quiescent"
+        );
+    }
+
+    /// The design decision this gate exists to encode, from the doc's open
+    /// question 5. A pinned bid is worker-local and genuinely cannot move —
+    /// but it is resolved by *copying* it to owned at move time, not by
+    /// refusing to park. Blocking here instead would let one slow reader make
+    /// a connection permanently unparkable, which is the failure mode park is
+    /// supposed to fix.
+    ///
+    /// The held buffer is placed directly rather than driven through a reader:
+    /// what is under test is the gate's treatment of a held bid, not the
+    /// lifecycle that produces one.
+    #[test]
+    fn held_ring_buffers_do_not_block_the_park() {
+        for (label, place) in [
+            (
+                "pinned",
+                Box::new(|el: &mut AsyncEventLoop<NoopHandler>, c: u32| {
+                    el.driver.segment_pinned[c as usize] =
+                        Some(crate::backend::uring::driver::HeldRecvBuf::Pinned { bid: 0, len: 5 });
+                }) as Box<dyn Fn(&mut AsyncEventLoop<NoopHandler>, u32)>,
+            ),
+            (
+                "held",
+                Box::new(|el: &mut AsyncEventLoop<NoopHandler>, c: u32| {
+                    el.driver.segment_hold[c as usize].push_back(
+                        crate::backend::uring::driver::HeldRecvBuf::Pinned { bid: 1, len: 5 },
+                    );
+                }),
+            ),
+            (
+                "recv_hold",
+                Box::new(|el: &mut AsyncEventLoop<NoopHandler>, c: u32| {
+                    el.driver.recv_hold[c as usize].push_back(
+                        crate::backend::uring::driver::PendingRecvBuf {
+                            bid: 2,
+                            len: 5,
+                            ptr: std::ptr::null(),
+                        },
+                    );
+                }),
+            ),
+        ] {
+            let mut el = make_test_loop();
+            let conn_index = accept_connection(&mut el);
+            assert_eq!(
+                el.driver.park_blocker(conn_index),
+                None,
+                "{label}: precondition — parkable before the buffer is held"
+            );
+            place(&mut el, conn_index);
+            assert_eq!(
+                el.driver.park_blocker(conn_index),
+                None,
+                "{label}: held ring buffers are converted at move time, \
+                 never a park refusal"
+            );
+        }
+    }
+
     // ── Send path tests ────────────────────────────────────────────
 
     #[test]

@@ -658,6 +658,50 @@ pub(crate) struct Driver {
     pub(crate) fs_fd_base: u32,
 }
 
+/// Why a connection cannot be parked (tier 3, #443) right now.
+///
+/// Park moves a live connection to another worker: quiesce, hand the fd over
+/// instead of closing it, drop the `!Send` future here and recreate it on the
+/// target. It is [`Driver::try_finalize_close`]'s path stopped one step early,
+/// so it gates on the same notion of "quiescent".
+///
+/// This names *why* a park was refused rather than returning a bare bool:
+/// every variant is transient, so a policy layer wants to tell "ask again in a
+/// moment" from "this connection is going away", and a failing test wants to
+/// say which term tripped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// No caller until the handover lands (#443 step 5c). The tests are the only
+// consumer today, and `--all-targets` clippy builds the lib without them.
+#[allow(dead_code)]
+pub(crate) enum ParkBlocker {
+    /// Not an established, open connection — still handshaking, still
+    /// connecting, or already tearing down. Nothing to move yet.
+    NotOpen,
+    /// Teardown is already requested. Park loses this race deliberately:
+    /// moving a connection the peer is closing buys nothing, and the close
+    /// path is the one carrying the invariants.
+    Closing,
+    /// Queued or in-flight sends. Their SQEs reference *this* worker's
+    /// `SendCopyPool` slots and `InFlightSendSlab` entries, which Domain
+    /// Invariant 1 requires outlive the operation, so the fd cannot leave
+    /// until they land.
+    Sends,
+    /// A Mode A forward write is in flight and the kernel is still reading a
+    /// buffer this worker owns as the write source.
+    ForwardWrite,
+    /// A send chain has SQEs in the kernel whose CQEs drive its own
+    /// accounting; it has to finish where it started.
+    Chain,
+    /// A `SegmentReader` is live. The reader owns the connection's delivery
+    /// discipline for its whole lifetime, so this is by definition not a
+    /// quiescent point.
+    SegmentReader,
+    /// A fallback recv is in flight against this worker's send pool.
+    RecvFallback,
+    /// A direct-echo response is queued for this worker's next flush.
+    DirectEcho,
+}
+
 impl Driver {
     /// Create a new driver for a worker thread.
     #[allow(clippy::too_many_arguments)]
@@ -1661,6 +1705,81 @@ impl Driver {
                 self.pending_finalize_closes.push(conn_index);
             }
         }
+    }
+
+    /// The park gate (tier 3, #443). `None` means quiescent and movable.
+    ///
+    /// Deliberately **not** blockers, because each would make park refuse
+    /// almost always or can be resolved without waiting:
+    ///
+    /// - `recv_half_taken` / `send_half_taken`. Since #427 the halves are the
+    ///   normal API and a typical handler holds both for the connection's
+    ///   whole life. They are owned by the future, which park drops, so they
+    ///   clear as part of the move rather than blocking it.
+    /// - `recv_hold`, `segment_hold`, `segment_pinned`. These can hold
+    ///   `HeldRecvBuf::Pinned { bid, .. }`, a bid index into *this* worker's
+    ///   `ProvidedBufRing` that addresses a different ring on the target.
+    ///   Waiting for a reader to drain them would let a slow reader make a
+    ///   connection permanently unparkable, so the move copies them to `Owned`
+    ///   instead — bounded work that always succeeds. That conversion is the
+    ///   next step; this predicate only decides whether the connection is
+    ///   quiescent enough to attempt it.
+    /// - The accumulator and the TLS state, which are plain owned data and
+    ///   move as values (see the design doc's open questions 4 and 5).
+    #[allow(dead_code)] // see `ParkBlocker`
+    pub(crate) fn park_blocker(&self, conn_index: u32) -> Option<ParkBlocker> {
+        let Some(conn) = self.connections.get(conn_index) else {
+            return Some(ParkBlocker::NotOpen);
+        };
+        // Order matters: teardown sets `Lifecycle::Closing`, which would
+        // otherwise fall into the catch-all below and be reported as
+        // `NotOpen` for a connection that is open and on its way out.
+        if conn.lifecycle == crate::connection::Lifecycle::Closing {
+            return Some(ParkBlocker::Closing);
+        }
+        if !conn.active || !conn.established || conn.lifecycle != crate::connection::Lifecycle::Open
+        {
+            return Some(ParkBlocker::NotOpen);
+        }
+        if conn.read != crate::connection::ReadHalf::Open
+            || conn.write != crate::connection::WriteHalf::Open
+        {
+            return Some(ParkBlocker::Closing);
+        }
+
+        let send = &self.send_queues[conn_index as usize];
+        if send.close_pending || send.close_submitted {
+            return Some(ParkBlocker::Closing);
+        }
+        if send.in_flight || !send.queue.is_empty() {
+            return Some(ParkBlocker::Sends);
+        }
+        if self.forward_write[conn_index as usize].is_some() {
+            return Some(ParkBlocker::ForwardWrite);
+        }
+        if self.chain_table.is_active(conn_index) {
+            return Some(ParkBlocker::Chain);
+        }
+        if self.segment_reader_live[conn_index as usize] {
+            return Some(ParkBlocker::SegmentReader);
+        }
+        if self.recv_fallback_inflight[conn_index as usize] {
+            return Some(ParkBlocker::RecvFallback);
+        }
+        // `direct_echo_queued` is the per-connection membership bool;
+        // `direct_echo_pending` is the queue of connection indices it guards,
+        // so it is not indexed by `conn_index` (it starts empty).
+        if self.direct_echo_queued[conn_index as usize] {
+            return Some(ParkBlocker::DirectEcho);
+        }
+        None
+    }
+
+    /// Convenience over [`Self::park_blocker`] for call sites that do not care
+    /// which term tripped.
+    #[allow(dead_code)] // see `ParkBlocker`
+    pub(crate) fn is_parkable(&self, conn_index: u32) -> bool {
+        self.park_blocker(conn_index).is_none()
     }
 
     /// Submit the deferred `Close` SQE once every pending send for
