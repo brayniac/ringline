@@ -670,7 +670,9 @@ pub(crate) struct Driver {
 /// moment" from "this connection is going away", and a failing test wants to
 /// say which term tripped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(has_io_uring), allow(dead_code))]
+// No caller until the handover lands (#443 step 5c). The tests are the only
+// consumer today, and `--all-targets` clippy builds the lib without them.
+#[allow(dead_code)]
 pub(crate) enum ParkBlocker {
     /// Not an established, open connection — still handshaking, still
     /// connecting, or already tearing down. Nothing to move yet.
@@ -1724,11 +1726,17 @@ impl Driver {
     ///   quiescent enough to attempt it.
     /// - The accumulator and the TLS state, which are plain owned data and
     ///   move as values (see the design doc's open questions 4 and 5).
-    #[cfg_attr(not(has_io_uring), allow(dead_code))]
+    #[allow(dead_code)] // see `ParkBlocker`
     pub(crate) fn park_blocker(&self, conn_index: u32) -> Option<ParkBlocker> {
         let Some(conn) = self.connections.get(conn_index) else {
             return Some(ParkBlocker::NotOpen);
         };
+        // Order matters: teardown sets `Lifecycle::Closing`, which would
+        // otherwise fall into the catch-all below and be reported as
+        // `NotOpen` for a connection that is open and on its way out.
+        if conn.lifecycle == crate::connection::Lifecycle::Closing {
+            return Some(ParkBlocker::Closing);
+        }
         if !conn.active || !conn.established || conn.lifecycle != crate::connection::Lifecycle::Open
         {
             return Some(ParkBlocker::NotOpen);
@@ -1758,9 +1766,10 @@ impl Driver {
         if self.recv_fallback_inflight[conn_index as usize] {
             return Some(ParkBlocker::RecvFallback);
         }
-        if self.direct_echo_queued[conn_index as usize]
-            || self.direct_echo_pending[conn_index as usize] != 0
-        {
+        // `direct_echo_queued` is the per-connection membership bool;
+        // `direct_echo_pending` is the queue of connection indices it guards,
+        // so it is not indexed by `conn_index` (it starts empty).
+        if self.direct_echo_queued[conn_index as usize] {
             return Some(ParkBlocker::DirectEcho);
         }
         None
@@ -1768,7 +1777,7 @@ impl Driver {
 
     /// Convenience over [`Self::park_blocker`] for call sites that do not care
     /// which term tripped.
-    #[cfg_attr(not(has_io_uring), allow(dead_code))]
+    #[allow(dead_code)] // see `ParkBlocker`
     pub(crate) fn is_parkable(&self, conn_index: u32) -> bool {
         self.park_blocker(conn_index).is_none()
     }

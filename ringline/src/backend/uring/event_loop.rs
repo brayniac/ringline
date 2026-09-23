@@ -5204,46 +5204,56 @@ mod tests {
     /// refusing to park. Blocking here instead would let one slow reader make
     /// a connection permanently unparkable, which is the failure mode park is
     /// supposed to fix.
+    ///
+    /// The held buffer is placed directly rather than driven through a reader:
+    /// what is under test is the gate's treatment of a held bid, not the
+    /// lifecycle that produces one.
     #[test]
-    fn a_pinned_segment_does_not_block_the_park() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
-
-        let bid: u16 = 0;
-        deliver_segment(&mut el, conn_index, bid, b"hello");
-        let conn = ConnCtx::new(conn_index, generation);
-        let mut reader = with_driver_state(&mut el, || conn.segments()).expect("segments()");
-        let waker = noop_waker();
-        let mut fut = std::pin::pin!(reader.next());
-        let seg = match with_driver_state(&mut el, || {
-            let mut cx = std::task::Context::from_waker(&waker);
-            fut.as_mut().poll(&mut cx)
-        }) {
-            std::task::Poll::Ready(Ok(Some(seg))) => seg,
-            _ => panic!("expected a pinned segment"),
-        };
-        assert!(
-            el.driver.segment_pinned[conn_index as usize].is_some(),
-            "precondition: the bid is pinned in this worker's ring"
-        );
-
-        // The live *reader* is what blocks; the pinned bid on its own does not.
-        drop(seg);
-        drop(fut);
-        drop(reader);
-        with_driver_state(&mut el, || {});
-        assert!(
-            el.driver.segment_pinned[conn_index as usize].is_some()
-                || !el.driver.segment_hold[conn_index as usize].is_empty(),
-            "precondition: held bytes remain after the reader is gone"
-        );
-        assert_eq!(
-            el.driver.park_blocker(conn_index),
-            None,
-            "held ring buffers are converted at move time, never a park refusal"
-        );
+    fn held_ring_buffers_do_not_block_the_park() {
+        for (label, place) in [
+            (
+                "pinned",
+                Box::new(|el: &mut AsyncEventLoop<NoopHandler>, c: u32| {
+                    el.driver.segment_pinned[c as usize] =
+                        Some(crate::backend::uring::driver::HeldRecvBuf::Pinned { bid: 0, len: 5 });
+                }) as Box<dyn Fn(&mut AsyncEventLoop<NoopHandler>, u32)>,
+            ),
+            (
+                "held",
+                Box::new(|el: &mut AsyncEventLoop<NoopHandler>, c: u32| {
+                    el.driver.segment_hold[c as usize].push_back(
+                        crate::backend::uring::driver::HeldRecvBuf::Pinned { bid: 1, len: 5 },
+                    );
+                }),
+            ),
+            (
+                "recv_hold",
+                Box::new(|el: &mut AsyncEventLoop<NoopHandler>, c: u32| {
+                    el.driver.recv_hold[c as usize].push_back(
+                        crate::backend::uring::driver::PendingRecvBuf {
+                            bid: 2,
+                            len: 5,
+                            ptr: std::ptr::null(),
+                        },
+                    );
+                }),
+            ),
+        ] {
+            let mut el = make_test_loop();
+            let conn_index = accept_connection(&mut el);
+            assert_eq!(
+                el.driver.park_blocker(conn_index),
+                None,
+                "{label}: precondition — parkable before the buffer is held"
+            );
+            place(&mut el, conn_index);
+            assert_eq!(
+                el.driver.park_blocker(conn_index),
+                None,
+                "{label}: held ring buffers are converted at move time, \
+                 never a park refusal"
+            );
+        }
     }
 
     // ── Send path tests ────────────────────────────────────────────
