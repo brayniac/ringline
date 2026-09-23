@@ -150,6 +150,29 @@ mapping to the remaining set; eBPF with a `REUSEPORT_SOCKARRAY` stays the
 option if per-connection policy is ever wanted, at the cost of those
 privileges.
 
+**The index source decides whether exclusion funnels (measured 2026-09-23).**
+Excluding a socket is only half of what the program must do; the other half is
+spreading over the ones that remain. Two ancillary loads were tried, same
+program shape otherwise (`idx = <source> % live_count`, then a jump chain to
+the live socket's group index), 40 connections over 4 listeners,
+`experiments/reuseport-exclude-spike.toml`:
+
+| index source | excluded socket | live set |
+|---|---|---|
+| `SKF_AD_CPU` | 0 | `0, 40, 0` |
+| `SKF_AD_RANDOM` | 0 | `12, 12, 16` |
+| `SKF_AD_RANDOM` (different exclusion) | 0 | `16, 10, 14` |
+
+Exclusion is absolute under both — the excluded socket accepts nothing. But
+`SKF_AD_CPU` is the *receiving* CPU, which is constant for a loopback client, so
+every connection funnels onto one live socket. Tier 1's handoff would then
+redistribute nearly every connection at a channel hop each, which is the
+single-core funnel shape this project has already root-caused once.
+
+So tier 2 attaches **`SKF_AD_RANDOM % live_count`**, unprivileged CBPF, with a
+jump chain mapping the result to the live socket's index. No packet parsing, no
+map, no privileges.
+
 Not yet measured, and load-bearing before tier 2 ships: what happens to
 connections **already queued** on a socket when it leaves the rotation. They
 stay where they landed, so exclusion stops new arrivals but does not empty the
