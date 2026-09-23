@@ -5129,6 +5129,123 @@ mod tests {
         conn_index
     }
 
+    // ── Park gate (tier 3, #443) ───────────────────────────────────
+
+    use crate::backend::uring::driver::ParkBlocker;
+
+    /// The baseline every other park test leans on: this harness can produce a
+    /// connection the gate accepts. Without it a blocker test proves nothing —
+    /// it would pass just as well if `park_blocker` always refused.
+    #[test]
+    fn a_quiescent_connection_is_parkable() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        assert_eq!(
+            el.driver.park_blocker(conn_index),
+            None,
+            "a freshly accepted, idle connection is the canonical parkable case"
+        );
+        assert!(el.driver.is_parkable(conn_index));
+    }
+
+    #[test]
+    fn an_in_flight_send_blocks_the_park() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        el.driver.send_queues[conn_index as usize].in_flight = true;
+        assert_eq!(
+            el.driver.park_blocker(conn_index),
+            Some(ParkBlocker::Sends),
+            "the SQE references this worker's pool slot (Domain Invariant 1)"
+        );
+    }
+
+    #[test]
+    fn a_requested_close_blocks_the_park() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        el.driver.close_connection(conn_index);
+        assert_eq!(
+            el.driver.park_blocker(conn_index),
+            Some(ParkBlocker::Closing),
+            "park must lose the race to teardown, not run alongside it"
+        );
+    }
+
+    #[test]
+    fn a_connection_still_handshaking_is_not_parkable() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        if let Some(cs) = el.driver.connections.get_mut(conn_index) {
+            cs.established = false;
+        }
+        assert_eq!(
+            el.driver.park_blocker(conn_index),
+            Some(ParkBlocker::NotOpen),
+            "there is no connection state worth moving until the handshake lands"
+        );
+    }
+
+    #[test]
+    fn a_live_segment_reader_blocks_the_park() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        el.driver.segment_reader_live[conn_index as usize] = true;
+        assert_eq!(
+            el.driver.park_blocker(conn_index),
+            Some(ParkBlocker::SegmentReader),
+            "a reader owns delivery discipline for its lifetime: not quiescent"
+        );
+    }
+
+    /// The design decision this gate exists to encode, from the doc's open
+    /// question 5. A pinned bid is worker-local and genuinely cannot move —
+    /// but it is resolved by *copying* it to owned at move time, not by
+    /// refusing to park. Blocking here instead would let one slow reader make
+    /// a connection permanently unparkable, which is the failure mode park is
+    /// supposed to fix.
+    #[test]
+    fn a_pinned_segment_does_not_block_the_park() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
+
+        let bid: u16 = 0;
+        deliver_segment(&mut el, conn_index, bid, b"hello");
+        let conn = ConnCtx::new(conn_index, generation);
+        let mut reader = with_driver_state(&mut el, || conn.segments()).expect("segments()");
+        let waker = noop_waker();
+        let mut fut = std::pin::pin!(reader.next());
+        let seg = match with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            fut.as_mut().poll(&mut cx)
+        }) {
+            std::task::Poll::Ready(Ok(Some(seg))) => seg,
+            _ => panic!("expected a pinned segment"),
+        };
+        assert!(
+            el.driver.segment_pinned[conn_index as usize].is_some(),
+            "precondition: the bid is pinned in this worker's ring"
+        );
+
+        // The live *reader* is what blocks; the pinned bid on its own does not.
+        drop(seg);
+        drop(fut);
+        drop(reader);
+        with_driver_state(&mut el, || {});
+        assert!(
+            el.driver.segment_pinned[conn_index as usize].is_some()
+                || !el.driver.segment_hold[conn_index as usize].is_empty(),
+            "precondition: held bytes remain after the reader is gone"
+        );
+        assert_eq!(
+            el.driver.park_blocker(conn_index),
+            None,
+            "held ring buffers are converted at move time, never a park refusal"
+        );
+    }
+
     // ── Send path tests ────────────────────────────────────────────
 
     #[test]
