@@ -26,6 +26,29 @@ pub(crate) struct AsyncEventLoop<A: AsyncEventHandler> {
     executor: Executor,
 }
 
+/// Hand off only on a real imbalance. A margin of one would ping-pong
+/// connections between workers that differ by a single connection, and every
+/// handoff costs a channel send and a wake on the far side.
+const HANDOFF_MARGIN: u32 = 2;
+
+/// Where a newly accepted connection should be served: `None` for "here",
+/// otherwise the index of a peer far enough below this worker to be worth the
+/// handoff.
+///
+/// Pure so it can be tested directly. The emergent distribution this produces
+/// is a property of a heuristic under real timing and belongs in the rack A/B
+/// (`docs/listeners-and-accept-design.md`, "Measurement"), not in an assertion
+/// here — an earlier version of this test asserted a spread bound and was
+/// flaky in both directions.
+fn choose_placement(loads: &[u32], me: usize, mine: u32) -> Option<usize> {
+    let (min_idx, min_load) = loads.iter().copied().enumerate().min_by_key(|&(_, l)| l)?;
+    if min_idx != me && mine >= min_load.saturating_add(HANDOFF_MARGIN) {
+        Some(min_idx)
+    } else {
+        None
+    }
+}
+
 impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// Create a new async event loop for a worker thread.
     #[allow(clippy::too_many_arguments)]
@@ -1124,6 +1147,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             OpTag::Cancel => {}
             OpTag::TickTimeout => {
                 self.driver.tick_timeout_armed = false;
+                // Republish the load: connections closing is the other way this
+                // worker's count moves, and without this a worker that shed all
+                // its work would still look busy to its peers.
+                self.publish_load();
             }
             OpTag::Timer => self.handle_timer(ud, result),
             OpTag::RecvMsgUdp => self.handle_recv_msg_udp(ud, result, flags),
@@ -1935,6 +1962,78 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.driver.merged_accept_armed = true;
     }
 
+    /// Publish this worker's live connection count for its peers to read.
+    ///
+    /// One relaxed store of a value the table already tracks, so a peer
+    /// choosing where to place a connection is not reading a stale number.
+    fn publish_load(&self) {
+        if let Some(ref loads) = self.driver.worker_loads {
+            let n = self.driver.connections.active_count() as u32;
+            loads[self.driver.worker_index].store(n, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Where a just-accepted connection should be served. `None` means here.
+    ///
+    /// Tier 1 of the rebalancing design: place while the connection is still
+    /// nothing but an integer. The kernel's 4-tuple hash chose this worker, and
+    /// for a client opening a pool of connections that hash is uneven — at N
+    /// connections over N workers roughly 1/e of workers get none. Moving the
+    /// fd now costs a channel send; moving it later is impossible, because
+    /// everything a live connection owns is thread-local.
+    fn placement_target(&self) -> Option<usize> {
+        let loads = self.driver.worker_loads.as_ref()?;
+        if self.driver.peer_accept.len() != loads.len() {
+            return None;
+        }
+        let snapshot: Vec<u32> = loads
+            .iter()
+            .map(|l| l.load(std::sync::atomic::Ordering::Relaxed))
+            .collect();
+        choose_placement(
+            &snapshot,
+            self.driver.worker_index,
+            self.driver.connections.active_count() as u32,
+        )
+    }
+
+    /// Hand a raw accepted fd to another worker.
+    ///
+    /// Returns it on failure so the caller serves it here instead — dropping it
+    /// would be a connection the peer silently never sees.
+    fn hand_off_accepted(
+        &self,
+        raw_fd: std::os::fd::RawFd,
+        listener: crate::ListenerId,
+        peer_addr: crate::connection::PeerAddr,
+        target: usize,
+    ) -> Result<(), (std::os::fd::RawFd, crate::connection::PeerAddr)> {
+        let Some((tx, wake)) = self.driver.peer_accept.get(target) else {
+            return Err((raw_fd, peer_addr));
+        };
+        match tx.try_send(crate::acceptor::AcceptedConn {
+            fd: raw_fd,
+            listener,
+            peer: peer_addr.clone(),
+        }) {
+            Ok(()) => {
+                // Claim the slot on the target's behalf straight away. The
+                // target only republishes once it drains, and a burst of
+                // accepts all read the table before that happens — so without
+                // this every worker in the burst picks the same "least loaded"
+                // peer and herds onto it. The target's own publish corrects the
+                // count a moment later.
+                if let Some(ref loads) = self.driver.worker_loads {
+                    loads[target].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                wake.wake();
+                Ok(())
+            }
+            // Full or gone: keep it here rather than drop it.
+            Err(_) => Err((raw_fd, peer_addr)),
+        }
+    }
+
     /// A multishot accept produced a connection (merged accept mode).
     ///
     /// `ud`'s conn_index field carries the listener index — there is no
@@ -1958,7 +2057,17 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             let peer = crate::backend::sockaddr::getpeername_peer_addr(raw_fd).unwrap_or(
                 crate::connection::PeerAddr::Tcp(std::net::SocketAddr::from(([0, 0, 0, 0], 0))),
             );
-            self.install_accepted(raw_fd, crate::ListenerId::from_index(listener_index), peer);
+            let listener = crate::ListenerId::from_index(listener_index);
+            match self.placement_target() {
+                Some(target) => {
+                    if let Err((fd, peer)) = self.hand_off_accepted(raw_fd, listener, peer, target)
+                    {
+                        self.install_accepted(fd, listener, peer);
+                    }
+                }
+                None => self.install_accepted(raw_fd, listener, peer),
+            }
+            self.publish_load();
         }
 
         // Without IORING_CQE_F_MORE the kernel has dropped the arm; re-arm or
@@ -1994,6 +2103,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 self.install_accepted(raw_fd, listener, peer_addr);
             }
         }
+        self.publish_load();
 
         // Drain DNS resolve responses.
         if let Some(ref rx) = self.driver.resolve_rx {
@@ -14522,5 +14632,50 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use super::{HANDOFF_MARGIN, choose_placement};
+
+    #[test]
+    fn keeps_the_connection_when_this_worker_is_the_quietest() {
+        assert_eq!(choose_placement(&[0, 5, 5, 5], 0, 0), None);
+    }
+
+    #[test]
+    fn keeps_it_when_the_gap_is_under_the_margin() {
+        // One ahead of the quietest is not worth a channel send and a wake.
+        assert_eq!(choose_placement(&[1, 0, 1, 1], 0, 1), None);
+    }
+
+    #[test]
+    fn hands_off_once_the_margin_is_reached() {
+        assert_eq!(
+            choose_placement(&[HANDOFF_MARGIN, 0, 5, 5], 0, HANDOFF_MARGIN),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn hands_off_to_the_quietest_not_merely_a_quieter_one() {
+        assert_eq!(choose_placement(&[9, 4, 1, 4], 0, 9), Some(2));
+    }
+
+    #[test]
+    fn never_hands_off_to_itself_even_when_it_is_the_minimum() {
+        // The minimum is this worker, so there is nowhere better to go.
+        assert_eq!(choose_placement(&[0, 3, 3, 3], 0, 0), None);
+    }
+
+    #[test]
+    fn a_single_worker_has_nowhere_to_hand_off_to() {
+        assert_eq!(choose_placement(&[99], 0, 99), None);
+    }
+
+    #[test]
+    fn an_empty_table_is_not_a_panic() {
+        assert_eq!(choose_placement(&[], 0, 0), None);
     }
 }

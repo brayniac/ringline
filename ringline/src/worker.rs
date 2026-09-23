@@ -874,6 +874,10 @@ impl RinglineBuilder {
         // `TlsTable` selects by `ListenerId` at accept time, so it needs the
         // whole list, indexed the same way.
         self.config.listener_tls = pending_listeners.iter().map(|l| l.tls.clone()).collect();
+        // Keep a copy for merged mode's fd handoff: `worker_txs` itself is
+        // moved into the acceptor config below, and in merged mode there is no
+        // acceptor to move it to.
+        let worker_txs_for_peers = worker_txs.clone();
         let pending_worker_txs = if has_acceptor {
             Some(worker_txs)
         } else {
@@ -959,6 +963,19 @@ impl RinglineBuilder {
         } else {
             Some(Arc::new(AtomicBool::new(false)))
         };
+        // Live connection count per worker. Merged mode reads it when placing a
+        // newly accepted connection; pool mode places in the acceptor thread and
+        // never looks at it.
+        let worker_loads: Option<Arc<Vec<std::sync::atomic::AtomicU32>>> =
+            if merged_sockets.is_empty() {
+                None
+            } else {
+                Some(Arc::new(
+                    (0..num_threads)
+                        .map(|_| std::sync::atomic::AtomicU32::new(0))
+                        .collect(),
+                ))
+            };
 
         for worker_id in 0..num_threads {
             let mut config = self.config.clone();
@@ -967,6 +984,18 @@ impl RinglineBuilder {
                 .map(|(idx, fds, _)| (*idx, fds[worker_id]))
                 .collect();
             config.merged_accept_live = merged_live.clone();
+            config.worker_index = worker_id;
+            config.worker_loads = worker_loads.clone();
+            if worker_loads.is_some() {
+                // Merged mode has no acceptor thread, so these channels are
+                // otherwise unused; they become the fd-handoff path for
+                // accept-time placement.
+                config.peer_accept = worker_txs_for_peers
+                    .iter()
+                    .cloned()
+                    .zip(worker_wake_fds.iter().copied())
+                    .collect();
+            }
             let rx = worker_rxs.remove(0);
             // (read end for polling, write end for cross-thread wakes —
             // on the mio backend these are the two ends of a pipe; the

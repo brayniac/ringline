@@ -412,6 +412,16 @@ pub(crate) struct Driver {
     /// Whether this worker has already armed its multishot accepts, so the
     /// arming runs once rather than on every loop iteration.
     pub(crate) merged_accept_armed: bool,
+    /// This worker's index into `worker_loads` / `peer_accept`.
+    pub(crate) worker_index: usize,
+    /// Live connection count per worker, for accept-time placement.
+    pub(crate) worker_loads: Option<std::sync::Arc<Vec<std::sync::atomic::AtomicU32>>>,
+    /// Every worker's accept channel and wake handle, for handing off a raw fd
+    /// to a less-loaded peer.
+    pub(crate) peer_accept: Vec<(
+        crossbeam_channel::Sender<crate::acceptor::AcceptedConn>,
+        crate::wakeup::WakeFd,
+    )>,
     pub(crate) eventfd: RawFd,
     pub(crate) eventfd_buf: [u8; 8],
     /// Wake handle for cross-thread wakeup (wraps the eventfd).
@@ -836,6 +846,9 @@ impl Driver {
             merged_accept_fds: config.merged_accept_fds.clone(),
             merged_accept_live: config.merged_accept_live.clone(),
             merged_accept_armed: false,
+            worker_index: config.worker_index,
+            worker_loads: config.worker_loads.clone(),
+            peer_accept: config.peer_accept.clone(),
             eventfd,
             eventfd_buf: [0u8; 8],
             wake_handle: crate::wakeup::WakeFd::from_raw_fd(eventfd),
