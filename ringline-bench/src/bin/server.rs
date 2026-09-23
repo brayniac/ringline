@@ -26,6 +26,24 @@ struct ProxyCfg {
     metrics_out: Option<std::path::PathBuf>,
 }
 
+/// A self-signed server config for the connect-rate arm.
+///
+/// Generated per process: the connect-rate benchmark is about handshake cost,
+/// not about key management, and generating here keeps cert material out of
+/// the repo and off the guests.
+fn self_signed_server_config() -> std::sync::Arc<rustls::ServerConfig> {
+    use rustls_pki_types::{CertificateDer, PrivatePkcs8KeyDer};
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+        .expect("generate self-signed cert");
+    let key = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+    let chain = vec![CertificateDer::from(cert.cert)];
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(chain, key.into())
+        .expect("valid server config");
+    std::sync::Arc::new(config)
+}
+
 /// Everything the echo arm needs. A struct for the same reason `ProxyCfg` is
 /// one: the argument list had outgrown what clippy accepts, and these travel
 /// together anyway.
@@ -41,6 +59,32 @@ struct EchoCfg {
     conn_chunk_size: usize,
     pin_to_core: bool,
     prefault_buffers: bool,
+    accept_mode: AcceptModeArg,
+    /// Terminate TLS on the listener, with a self-signed certificate generated
+    /// at startup so nothing has to be staged onto a guest.
+    tls: bool,
+    /// Event-loop tick interval, microseconds.
+    tick_timeout_us: u64,
+}
+
+/// Which accept path the echo arm runs, so a pool-vs-merged A/B does not need
+/// two builds. Mirrors `ringline::AcceptMode`; `Merged` is io_uring only and is
+/// ignored on a mio build.
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum AcceptModeArg {
+    /// One acceptor thread per listener, explicit round-robin placement.
+    Pool,
+    /// Each worker owns a SO_REUSEPORT listener and accepts on its own ring.
+    Merged,
+}
+
+impl From<AcceptModeArg> for ringline::AcceptMode {
+    fn from(a: AcceptModeArg) -> Self {
+        match a {
+            AcceptModeArg::Pool => ringline::AcceptMode::Pool,
+            AcceptModeArg::Merged => ringline::AcceptMode::Merged,
+        }
+    }
 }
 
 /// Which forwarding entry point the proxy arm drives.
@@ -128,6 +172,22 @@ struct Args {
     ///   `with_data`/`with_bytes` observe nothing while it is on.
     #[arg(long, value_enum, default_value_t = EchoMode::Direct)]
     echo_mode: EchoMode,
+
+    /// (ringline only) Which accept path the echo arm runs. `merged` is
+    /// io_uring only and is ignored on a mio build.
+    #[arg(long, value_enum, default_value_t = AcceptModeArg::Pool)]
+    accept_mode: AcceptModeArg,
+
+    /// (ringline only) Terminate TLS, with a self-signed certificate
+    /// generated at startup.
+    #[arg(long, default_value_t = false)]
+    tls: bool,
+
+    /// (ringline only) Event-loop tick interval in microseconds. Exposed to
+    /// tell a stall that is waiting for the periodic tick from one that is
+    /// not: if throughput tracks this knob, the work is tick-driven.
+    #[arg(long, default_value_t = 1000)]
+    tick_timeout_us: u64,
 
     /// (tokio only) Scheduler shape. `multi-thread` is tokio's default
     /// work-stealing runtime; `per-core` gives each core its own
@@ -354,6 +414,9 @@ fn main() {
             },
             conn_chunk_size: args.conn_chunk_size,
             pin_to_core,
+            accept_mode: args.accept_mode,
+            tls: args.tls,
+            tick_timeout_us: args.tick_timeout_us,
         }),
         Runtime::Tokio => {
             use ringline_bench::servers::tokio_arms;
@@ -554,6 +617,9 @@ fn run_ringline(cfg: EchoCfg) {
         conn_chunk_size,
         pin_to_core,
         prefault_buffers,
+        accept_mode,
+        tls,
+        tick_timeout_us,
     } = cfg;
     use ringline::ParseResult;
     use ringline::{AsyncEventHandler, RinglineBuilder};
@@ -646,7 +712,7 @@ fn run_ringline(cfg: EchoCfg) {
     } else {
         msg_size.next_power_of_two().max(4096) as u32
     };
-    let config = ConfigBuilder::new()
+    let staged = ConfigBuilder::new()
         .workers(workers)
         // When --cpu-list set a process affinity mask, leave the OS to schedule
         // workers within it; otherwise pin each worker to its own core (0..N).
@@ -661,8 +727,27 @@ fn run_ringline(cfg: EchoCfg) {
         .max_connections(16384)
         .send_pool(512, msg_size.next_power_of_two().max(4096) as u32)
         .conn_chunk_size(conn_chunk_size)
-        .build()
-        .expect("valid config");
+        .accept_mode(accept_mode.into())
+        .tick_timeout_us(tick_timeout_us);
+    // `direct` echoes the bytes as they arrived, straight from the CQE
+    // handler. Under TLS those bytes are ciphertext, so the server would
+    // reflect the client's own ciphertext instead of re-encrypting plaintext —
+    // every handshake fails and the arm reports 0 conns/sec, which reads as a
+    // tie rather than as a broken run. Refuse the combination instead.
+    if tls && echo_mode == EchoMode::Direct {
+        eprintln!(
+            "bench-server: --tls needs --echo-mode forward; `direct` submits the \
+             echo from the CQE handler and would send ciphertext back unencrypted"
+        );
+        std::process::exit(2);
+    }
+
+    let staged = if tls {
+        staged.tls(ringline::TlsConfig::new(self_signed_server_config()))
+    } else {
+        staged
+    };
+    let config = staged.build().expect("valid config");
 
     let builder = RinglineBuilder::new(config).bind(addr);
     let (shutdown, handles) = match echo_mode {

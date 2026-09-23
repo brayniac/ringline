@@ -23,6 +23,12 @@ path = "src/bin/client.rs"
 # load generator and sink are separate binaries rather than modes on
 # bench-client/bench-server, so the harness the comparison campaign depends on
 # is not perturbed by work that has nothing to do with it.
+# Connect-rate arm: its own binary for the same reason proxy-load is, so the
+# harness the accept-mode comparison depends on is not perturbed by it.
+[[bin]]
+name = "connect-bench"
+path = "src/bin/connect-bench.rs"
+
 [[bin]]
 name = "proxy-load"
 path = "src/bin/proxy-load.rs"
@@ -55,6 +61,11 @@ serde_json = "1"
 metriken = "0.9"
 libc = { workspace = true }
 clap = { version = "4", features = ["derive"] }
+# For the connect-rate arm: a self-signed cert generated at startup, so nothing
+# has to be staged onto a guest.
+rustls = { workspace = true, features = ["ring", "std"] }
+rustls-pki-types = { workspace = true }
+rcgen = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tokio-uring = { version = "0.5", optional = true }
