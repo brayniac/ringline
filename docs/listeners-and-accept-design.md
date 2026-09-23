@@ -257,14 +257,27 @@ connection is quiescent":
 !in_flight && queue.is_empty() && forward_write.is_none() && !chain_table.is_active()
 ```
 
-with **one term that close does not need**: `segment_pinned[conn].is_none()`.
-A pinned entry is `HeldRecvBuf::Pinned { bid, len }`, a bid index into *this
-worker's* `ProvidedBufRing`; on the target worker it addresses a different
-ring's buffer. Close can defer until the reader releases it, but park has a
+with the terms close does not need. `close_connection` drains **three**
+holders of worker-local provided-buffer bids, not one — `recv_hold`,
+`segment_hold` and `segment_pinned` — and a bid index means nothing on the
+target worker's ring. Close can defer until a reader releases them; park has a
 cheaper option, and it is the rule segmented recv already follows: **convert
-`Pinned` to `Owned` by copying** before the move. Bounded work, always
-succeeds, and no connection becomes permanently unparkable because a reader is
-slow. `HeldRecvBuf::Owned(Bytes)` needs nothing.
+every `Pinned` to `Owned` by copying** at move time. Bounded work, always
+succeeds, and no connection becomes permanently unparkable because one reader
+is slow. `HeldRecvBuf::Owned(Bytes)` needs nothing.
+
+So held buffers are *not* a park refusal. The refusals are the states where
+the handler or the kernel is mid-operation, and the gate names each one
+(`ParkBlocker`): not open or still handshaking; teardown already requested;
+queued or in-flight sends; an in-flight Mode A forward write; an active send
+chain; a live `SegmentReader`; an in-flight fallback recv; a queued
+direct-echo response.
+
+One non-obvious exclusion. `recv_half_taken` / `send_half_taken` look like
+blockers and are not: since #427 the halves are the normal API and a typical
+handler holds both for the connection's whole life, so gating on them would
+refuse essentially every park. They are owned by the future, which park drops
+as part of the move.
 
 Sequence: quiesce on the predicate above → convert any pinned segment to owned
 → cancel the multishot recv and unregister the fd from A → package
