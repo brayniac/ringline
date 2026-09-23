@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- `ShutdownHandle::set_worker_accepting()` takes a worker out of the accept
+  rotation, or puts it back, for listeners in `AcceptMode::Merged`. It re-steers
+  the `SO_REUSEPORT` group with an unprivileged classic-BPF program rather than
+  closing the worker's socket, because closing one resets whatever is already
+  queued on it. It does **not** drain: connections already queued on that
+  worker are still accepted, and live connections stay where they are. Tier 2
+  of `docs/listeners-and-accept-design.md` (#443).
+
 - Merged accept mode now places a connection at accept time instead of taking
   the kernel's 4-tuple hash: a worker that accepts while ahead of the quietest
   peer hands the raw fd over before the connection has any state. This is what

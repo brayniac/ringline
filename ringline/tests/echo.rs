@@ -5702,6 +5702,112 @@ fn resolve_disabled_returns_error() {
 
 // ── Unix domain socket tests ────────────────────────────────────────
 
+/// Taking a worker out of the accept rotation actually stops it accepting.
+///
+/// io_uring only: steering applies to merged mode's `SO_REUSEPORT` group.
+///
+/// The unit tests in `reuseport_bpf` cover the instruction encoding; only a
+/// real kernel can say whether the attached program does what it encodes.
+#[cfg(has_io_uring)]
+#[test]
+fn an_excluded_worker_stops_receiving_connections() {
+    use std::sync::Mutex;
+
+    static SEEN: std::sync::OnceLock<Mutex<Vec<usize>>> = std::sync::OnceLock::new();
+
+    const WORKERS: usize = 4;
+    const EXCLUDED: usize = 2;
+    const CONNS: usize = 40;
+
+    struct Reporter {
+        worker: usize,
+    }
+    impl AsyncEventHandler for Reporter {
+        fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
+            let worker = self.worker;
+            async move {
+                let (mut tx, mut rx) = conn.split();
+                let _ = rx
+                    .with_data(|data| {
+                        if !data.is_empty() {
+                            SEEN.get_or_init(Default::default)
+                                .lock()
+                                .unwrap()
+                                .push(worker);
+                        }
+                        let _ = tx.send_nowait(data);
+                        ParseResult::Consumed(data.len())
+                    })
+                    .await;
+            }
+        }
+        fn create_for_worker(id: usize) -> Self {
+            Reporter { worker: id }
+        }
+    }
+
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let config = test_config_builder()
+        .workers(WORKERS)
+        .accept_mode(ringline::AcceptMode::Merged)
+        .build()
+        .expect("valid config");
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind(addr.parse().unwrap())
+        .launch::<Reporter>()
+        .expect("launch failed");
+    wait_for_server(&addr);
+
+    shutdown
+        .set_worker_accepting(EXCLUDED, false)
+        .expect("steering should attach");
+
+    // Only count connections made *after* the exclusion.
+    SEEN.get_or_init(Default::default).lock().unwrap().clear();
+
+    let mut held = Vec::with_capacity(CONNS);
+    for i in 0..CONNS {
+        let mut c = TcpStream::connect(&addr).expect("connect");
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let payload = format!("excl-{i:02}");
+        c.write_all(payload.as_bytes()).unwrap();
+        c.flush().unwrap();
+        let mut buf = vec![0u8; payload.len()];
+        c.read_exact(&mut buf).unwrap();
+        held.push(c);
+    }
+
+    let seen = SEEN.get().unwrap().lock().unwrap().clone();
+    assert_eq!(seen.len(), CONNS, "every connection must still be served");
+
+    // Zero, not merely "below its share". The kernel stops choosing the
+    // excluded socket, and accept-time placement skips it too — without that
+    // second half, taking a worker out of rotation drops its load and makes it
+    // the *most* attractive handoff target, so tier 1 would put back exactly
+    // what tier 2 took out.
+    let on_excluded = seen.iter().filter(|&&w| w == EXCLUDED).count();
+    assert_eq!(
+        on_excluded, 0,
+        "excluded worker {EXCLUDED} served {on_excluded} of {CONNS}; counts {seen:?}"
+    );
+
+    // And the rest actually carried the load, so this is not passing because
+    // nothing was served at all.
+    let others: std::collections::HashSet<usize> =
+        seen.iter().copied().filter(|&w| w != EXCLUDED).collect();
+    assert!(
+        others.len() >= 2,
+        "the remaining workers should share the load; saw {others:?}"
+    );
+
+    drop(held);
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
 /// Merged accept mode actually accepts, on several workers, over one port.
 ///
 /// io_uring only: merged mode needs multishot accept, which mio has no

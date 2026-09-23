@@ -40,8 +40,17 @@ const HANDOFF_MARGIN: u32 = 2;
 /// (`docs/listeners-and-accept-design.md`, "Measurement"), not in an assertion
 /// here — an earlier version of this test asserted a spread bound and was
 /// flaky in both directions.
-fn choose_placement(loads: &[u32], me: usize, mine: u32) -> Option<usize> {
-    let (min_idx, min_load) = loads.iter().copied().enumerate().min_by_key(|&(_, l)| l)?;
+fn choose_placement(loads: &[u32], accepting: &[bool], me: usize, mine: u32) -> Option<usize> {
+    // Only consider workers still in the accept rotation. A worker steered out
+    // (tier 2) stops receiving from the kernel, so its load falls — and without
+    // this filter that drop would make it the *most* attractive handoff target,
+    // so placement would put back exactly what steering took out.
+    let (min_idx, min_load) = loads
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|&(i, _)| accepting.get(i).copied().unwrap_or(true))
+        .min_by_key(|&(_, l)| l)?;
     if min_idx != me && mine >= min_load.saturating_add(HANDOFF_MARGIN) {
         Some(min_idx)
     } else {
@@ -1990,8 +1999,16 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             .iter()
             .map(|l| l.load(std::sync::atomic::Ordering::Relaxed))
             .collect();
+        let accepting: Vec<bool> = match self.driver.worker_accepting {
+            Some(ref flags) => flags
+                .iter()
+                .map(|f| f.load(std::sync::atomic::Ordering::Relaxed))
+                .collect(),
+            None => vec![true; snapshot.len()],
+        };
         choose_placement(
             &snapshot,
+            &accepting,
             self.driver.worker_index,
             self.driver.connections.active_count() as u32,
         )
@@ -14641,41 +14658,60 @@ mod placement_tests {
 
     #[test]
     fn keeps_the_connection_when_this_worker_is_the_quietest() {
-        assert_eq!(choose_placement(&[0, 5, 5, 5], 0, 0), None);
+        assert_eq!(choose_placement(&[0, 5, 5, 5], &[true; 4], 0, 0), None);
     }
 
     #[test]
     fn keeps_it_when_the_gap_is_under_the_margin() {
         // One ahead of the quietest is not worth a channel send and a wake.
-        assert_eq!(choose_placement(&[1, 0, 1, 1], 0, 1), None);
+        assert_eq!(choose_placement(&[1, 0, 1, 1], &[true; 4], 0, 1), None);
     }
 
     #[test]
     fn hands_off_once_the_margin_is_reached() {
         assert_eq!(
-            choose_placement(&[HANDOFF_MARGIN, 0, 5, 5], 0, HANDOFF_MARGIN),
+            choose_placement(&[HANDOFF_MARGIN, 0, 5, 5], &[true; 4], 0, HANDOFF_MARGIN),
             Some(1)
         );
     }
 
     #[test]
     fn hands_off_to_the_quietest_not_merely_a_quieter_one() {
-        assert_eq!(choose_placement(&[9, 4, 1, 4], 0, 9), Some(2));
+        assert_eq!(choose_placement(&[9, 4, 1, 4], &[true; 4], 0, 9), Some(2));
     }
 
     #[test]
     fn never_hands_off_to_itself_even_when_it_is_the_minimum() {
         // The minimum is this worker, so there is nowhere better to go.
-        assert_eq!(choose_placement(&[0, 3, 3, 3], 0, 0), None);
+        assert_eq!(choose_placement(&[0, 3, 3, 3], &[true; 4], 0, 0), None);
     }
 
     #[test]
     fn a_single_worker_has_nowhere_to_hand_off_to() {
-        assert_eq!(choose_placement(&[99], 0, 99), None);
+        assert_eq!(choose_placement(&[99], &[true], 0, 99), None);
+    }
+
+    #[test]
+    fn never_hands_off_to_a_worker_steered_out_of_the_rotation() {
+        // Worker 1 is the least loaded precisely *because* it was steered out.
+        // Handing it work would undo the steering.
+        assert_eq!(
+            choose_placement(&[9, 0, 4, 9], &[true, false, true, true], 0, 9),
+            Some(2),
+            "should fall through to the quietest worker still accepting"
+        );
+    }
+
+    #[test]
+    fn keeps_the_connection_when_every_other_worker_is_out() {
+        assert_eq!(
+            choose_placement(&[9, 0, 0, 0], &[true, false, false, false], 0, 9),
+            None
+        );
     }
 
     #[test]
     fn an_empty_table_is_not_a_panic() {
-        assert_eq!(choose_placement(&[], 0, 0), None);
+        assert_eq!(choose_placement(&[], &[], 0, 0), None);
     }
 }

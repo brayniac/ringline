@@ -157,6 +157,16 @@ pub struct ShutdownHandle {
     /// One entry per listener, in `bind()` call order — the same order that
     /// gives each its [`ListenerId`](crate::ListenerId).
     listeners: Vec<ListenerHandle>,
+    /// Which workers are currently in the accept rotation, for merged-mode
+    /// listeners. Index is the worker id; all true until something takes a
+    /// worker out. Shared with the workers, whose accept-time placement must
+    /// skip anyone steered out — otherwise the drop in that worker's load
+    /// would make it the preferred handoff target and undo the steering.
+    ///
+    /// Only read by `set_worker_accepting`, which is Linux-only because
+    /// reuseport steering is.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    accepting: Arc<Vec<std::sync::atomic::AtomicBool>>,
     /// Read on the io_uring backend by `register_region` /
     /// `unregister_region`; on the mio backend it sits unused but is kept
     /// so the field layout is identical across backends.
@@ -193,6 +203,73 @@ impl ShutdownHandle {
     /// [`ListenerId`](crate::ListenerId).
     pub fn bound_addrs(&self) -> Vec<Option<SocketAddr>> {
         self.listeners.iter().map(|l| l.bound_addr).collect()
+    }
+
+    /// Take a worker out of the accept rotation, or put it back.
+    ///
+    /// Only affects listeners in [`AcceptMode::Merged`](crate::AcceptMode):
+    /// each worker owns a socket in a `SO_REUSEPORT` group, and this re-steers
+    /// the group so the kernel stops choosing that worker's socket. The socket
+    /// stays open, which is the point — closing one **resets** whatever is
+    /// already queued on it.
+    ///
+    /// Two things it does not do:
+    ///
+    /// - **It does not drain.** Connections already queued on that worker's
+    ///   socket stay there and are still accepted. Exclusion stops new
+    ///   arrivals; it does not empty the queue.
+    /// - **It does not move live connections.** Everything a running
+    ///   connection owns is thread-local, so a worker keeps serving what it
+    ///   already has.
+    ///
+    /// Returns `InvalidInput` if this would leave no worker accepting — a
+    /// group that can select nothing accepts nothing, which is worse than the
+    /// imbalance it was meant to fix.
+    ///
+    /// No-op when no listener is steerable (pool mode, Unix listeners,
+    /// client-only, or a non-Linux build).
+    #[cfg(target_os = "linux")]
+    pub fn set_worker_accepting(&self, worker: usize, accepting: bool) -> io::Result<()> {
+        use std::sync::atomic::Ordering;
+        if worker >= self.accepting.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "worker index out of range",
+            ));
+        }
+        if self.accepting[worker].load(Ordering::Acquire) == accepting {
+            return Ok(());
+        }
+        self.accepting[worker].store(accepting, Ordering::Release);
+
+        let live: Vec<u32> = self
+            .accepting
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.load(Ordering::Acquire))
+            .map(|(i, _)| i as u32)
+            .collect();
+        if live.is_empty() {
+            // Put it back before returning: the caller's view of the rotation
+            // must match the kernel's.
+            self.accepting[worker].store(true, Ordering::Release);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "refusing to leave no worker accepting",
+            ));
+        }
+
+        for listener in &self.listeners {
+            if !listener.steerable {
+                continue;
+            }
+            let Some(&fd) = listener.fds.first() else {
+                continue;
+            };
+            // The program governs the whole group, so one member is enough.
+            crate::reuseport_bpf::attach_live_set(fd, &live)?;
+        }
+        Ok(())
     }
 
     /// How many listeners this runtime bound. Zero in client-only mode.
@@ -398,6 +475,14 @@ struct ListenerHandle {
     closed: Arc<AtomicBool>,
     /// `Some` for a TCP listener (after zero-port resolution), `None` for Unix.
     bound_addr: Option<SocketAddr>,
+    /// Whether `fds` form a `SO_REUSEPORT` group that can be steered — true
+    /// only for a merged-mode TCP listener, where `fds[i]` belongs to worker
+    /// `i`. A pool-mode listener has a single socket and no group to steer.
+    ///
+    /// Only read by `set_worker_accepting`, which is Linux-only because
+    /// reuseport steering is.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    steerable: bool,
 }
 
 /// Resolve the actual bound address of a TCP listen fd via `getsockname(2)`.
@@ -977,6 +1062,15 @@ impl RinglineBuilder {
                 ))
             };
 
+        // Shared by `ShutdownHandle::set_worker_accepting` and every worker's
+        // accept-time placement: one mask, so steering and placement cannot
+        // disagree about who is in the rotation.
+        let worker_accepting: Arc<Vec<std::sync::atomic::AtomicBool>> = Arc::new(
+            (0..num_threads)
+                .map(|_| std::sync::atomic::AtomicBool::new(true))
+                .collect(),
+        );
+
         for worker_id in 0..num_threads {
             let mut config = self.config.clone();
             config.merged_accept_fds = merged_sockets
@@ -986,6 +1080,7 @@ impl RinglineBuilder {
             config.merged_accept_live = merged_live.clone();
             config.worker_index = worker_id;
             config.worker_loads = worker_loads.clone();
+            config.worker_accepting = Some(worker_accepting.clone());
             if worker_loads.is_some() {
                 // Merged mode has no acceptor thread, so these channels are
                 // otherwise unused; they become the fd-handoff path for
@@ -1223,6 +1318,7 @@ impl RinglineBuilder {
                         fds,
                         closed,
                         bound_addr,
+                        steerable: true,
                     });
                     continue;
                 }
@@ -1270,6 +1366,7 @@ impl RinglineBuilder {
                     fds,
                     closed,
                     bound_addr,
+                    steerable: false,
                 });
             }
             // Every merged socket is listening now, so the workers may arm.
@@ -1297,6 +1394,7 @@ impl RinglineBuilder {
         let shutdown_handle = ShutdownHandle {
             shutdown_flag,
             worker_wake_handles,
+            accepting: worker_accepting,
             listeners,
             region_registrar,
         };

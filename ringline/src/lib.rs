@@ -169,6 +169,8 @@ pub(crate) mod recv;
 #[cfg_attr(not(has_io_uring), allow(dead_code))]
 pub(crate) mod region_registry;
 pub(crate) mod resolver;
+#[cfg(target_os = "linux")]
+pub(crate) mod reuseport_bpf;
 pub(crate) mod runtime;
 pub(crate) mod spawner;
 #[cfg_attr(not(has_io_uring), allow(dead_code))]

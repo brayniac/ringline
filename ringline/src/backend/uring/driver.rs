@@ -416,6 +416,8 @@ pub(crate) struct Driver {
     pub(crate) worker_index: usize,
     /// Live connection count per worker, for accept-time placement.
     pub(crate) worker_loads: Option<std::sync::Arc<Vec<std::sync::atomic::AtomicU32>>>,
+    /// Which workers are in the accept rotation; placement skips the rest.
+    pub(crate) worker_accepting: Option<std::sync::Arc<Vec<std::sync::atomic::AtomicBool>>>,
     /// Every worker's accept channel and wake handle, for handing off a raw fd
     /// to a less-loaded peer.
     pub(crate) peer_accept: Vec<(
@@ -848,6 +850,7 @@ impl Driver {
             merged_accept_armed: false,
             worker_index: config.worker_index,
             worker_loads: config.worker_loads.clone(),
+            worker_accepting: config.worker_accepting.clone(),
             peer_accept: config.peer_accept.clone(),
             eventfd,
             eventfd_buf: [0u8; 8],
