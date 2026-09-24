@@ -1981,7 +1981,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         };
 
         // The slot may have been recycled while the install was in flight.
-        if self.driver.connections.generation(conn_index) != in_flight.generation {
+        // Checked against the arm-time generation carried in the payload,
+        // like every other completion handler (Domain Invariant 3); the copy
+        // in `in_flight` is only there to carry the target.
+        if self.driver.connections.generation(conn_index) != ud.payload()
+            || ud.payload() != in_flight.generation
+        {
             return; // `fd` drops, closing this reference.
         }
         // Quiesce can have broken across the round trip.
@@ -5385,23 +5390,48 @@ mod tests {
 
     // ── Park fd recovery (tier 3, #443) ────────────────────────────
 
-    /// Count open fds for this process. Used to prove the abandon paths
-    /// close the recovered fd rather than leaking a socket reference — a
-    /// leak would keep the peer from ever seeing a FIN, which no assertion
-    /// about connection state would reveal.
-    fn open_fd_count() -> usize {
-        std::fs::read_dir("/proc/self/fd")
-            .map(|d| d.count())
-            .unwrap_or(0)
+    /// A pipe whose **write** end stands in for the installed fd.
+    ///
+    /// Counting `/proc/self/fd` cannot work here: it is process-wide, and the
+    /// suite runs hundreds of tests in parallel in one process, each opening
+    /// rings and sockets. The count moves under you.
+    ///
+    /// A pipe is local. Hand the write end to the handler; the read end then
+    /// answers the only question that matters — if every write end has been
+    /// closed, a non-blocking read returns EOF; if one is still open it
+    /// returns `EAGAIN`. No other thread can perturb that.
+    struct FdProbe {
+        /// Handed to the code under test as the "installed" fd.
+        installed: i32,
+        read_end: i32,
     }
 
-    /// A pipe read-end stands in for the installed fd: the handler only ever
-    /// treats a non-negative result as an owned fd to close or keep.
-    fn a_spare_fd() -> i32 {
-        let mut fds = [0i32; 2];
-        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
-        unsafe { libc::close(fds[1]) };
-        fds[0]
+    impl FdProbe {
+        fn new() -> Self {
+            let mut fds = [0i32; 2];
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+            unsafe {
+                let fl = libc::fcntl(fds[0], libc::F_GETFL);
+                libc::fcntl(fds[0], libc::F_SETFL, fl | libc::O_NONBLOCK);
+            }
+            FdProbe {
+                installed: fds[1],
+                read_end: fds[0],
+            }
+        }
+
+        /// True once the handed-over fd has been closed.
+        fn was_closed(&self) -> bool {
+            let mut b = [0u8; 1];
+            let n = unsafe { libc::read(self.read_end, b.as_mut_ptr() as *mut libc::c_void, 1) };
+            n == 0
+        }
+    }
+
+    impl Drop for FdProbe {
+        fn drop(&mut self) {
+            unsafe { libc::close(self.read_end) };
+        }
     }
 
     fn park_install_ud(conn_index: u32, generation: u32) -> crate::completion::UserData {
@@ -5417,14 +5447,12 @@ mod tests {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
-        let fd = a_spare_fd();
-        let before = open_fd_count();
+        let probe = FdProbe::new();
 
-        el.handle_park_install(park_install_ud(conn_index, generation), fd);
+        el.handle_park_install(park_install_ud(conn_index, generation), probe.installed);
 
-        assert_eq!(
-            open_fd_count(),
-            before - 1,
+        assert!(
+            probe.was_closed(),
             "a stray install CQE must still close the fd it carries"
         );
     }
@@ -5439,17 +5467,15 @@ mod tests {
                 target: 1,
                 generation,
             });
-        let fd = a_spare_fd();
-        let before = open_fd_count();
+        let probe = FdProbe::new();
 
         // A CQE carrying a stale generation: the slot moved on.
-        el.handle_park_install(park_install_ud(conn_index, generation.wrapping_add(1)), fd);
-
-        assert_eq!(
-            open_fd_count(),
-            before - 1,
-            "stale generation must close it"
+        el.handle_park_install(
+            park_install_ud(conn_index, generation.wrapping_add(1)),
+            probe.installed,
         );
+
+        assert!(probe.was_closed(), "stale generation must close it");
         assert!(el.driver.park_ready.is_empty(), "and must not park");
     }
 
@@ -5467,11 +5493,10 @@ mod tests {
         el.driver.send_queues[conn_index as usize].in_flight = true;
         assert!(el.driver.park_blocker(conn_index).is_some(), "precondition");
 
-        let fd = a_spare_fd();
-        let before = open_fd_count();
-        el.handle_park_install(park_install_ud(conn_index, generation), fd);
+        let probe = FdProbe::new();
+        el.handle_park_install(park_install_ud(conn_index, generation), probe.installed);
 
-        assert_eq!(open_fd_count(), before - 1, "abandon must close the fd");
+        assert!(probe.was_closed(), "abandon must close the fd");
         assert!(el.driver.park_ready.is_empty(), "and must not park");
     }
 
@@ -5509,13 +5534,11 @@ mod tests {
                 generation,
             });
 
-        let fd = a_spare_fd();
-        let before = open_fd_count();
-        el.handle_park_install(park_install_ud(conn_index, generation), fd);
+        let probe = FdProbe::new();
+        el.handle_park_install(park_install_ud(conn_index, generation), probe.installed);
 
-        assert_eq!(
-            open_fd_count(),
-            before,
+        assert!(
+            !probe.was_closed(),
             "a parked connection keeps its socket: the fd moves, it does not close"
         );
         assert_eq!(el.driver.park_ready.len(), 1, "one connection lifted off");
