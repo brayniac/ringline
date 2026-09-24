@@ -1,3 +1,4 @@
+use crate::park::ParkedFd;
 use std::collections::VecDeque;
 use std::io;
 use std::net::SocketAddr;
@@ -349,6 +350,10 @@ pub(crate) struct Driver {
     /// Also the guard against submitting a second park for the same
     /// connection while the first is outstanding.
     pub(crate) park_in_flight: Vec<Option<ParkInFlight>>,
+    /// Every worker's park channel and wake handle.
+    pub(crate) peer_park: Vec<(crossbeam_channel::Sender<ParkedFd>, crate::wakeup::WakeFd)>,
+    /// This worker's receiving end: connections other workers parked here.
+    pub(crate) park_rx: Option<crossbeam_channel::Receiver<ParkedFd>>,
     /// Connections lifted off this worker, waiting to be handed over.
     /// `OwnedFd` means an entry left here is closed rather than leaked.
     pub(crate) park_ready: Vec<ParkedFd>,
@@ -665,24 +670,6 @@ pub(crate) struct Driver {
     pub(crate) fs_fd_base: u32,
 }
 
-/// A connection lifted off this worker and ready to hand to another
-/// (tier 3, #443). Every field is owned and `Send`.
-///
-/// The fd is a *second* reference to the socket, obtained via
-/// `IORING_OP_FIXED_FD_INSTALL`. That is what lets the ordinary teardown path
-/// run on the parking worker — closing the fixed-file entry drops per-worker
-/// state without sending a FIN, because this handle keeps the socket alive.
-#[allow(dead_code)] // consumed by the handover (#443, next step)
-pub(crate) struct ParkedFd {
-    pub fd: std::os::fd::OwnedFd,
-    pub listener: crate::ListenerId,
-    pub peer: crate::connection::PeerAddr,
-    /// Received but unconsumed bytes, in wire order.
-    pub pending: Vec<bytes::Bytes>,
-    /// Worker index this connection is bound for.
-    pub target: usize,
-}
-
 /// A park in flight: the `FixedFdInstall` has been submitted and its CQE has
 /// not landed yet.
 #[derive(Debug, Clone, Copy)]
@@ -915,6 +902,8 @@ impl Driver {
             segment_pinned: vec![None; config.max_connections as usize],
             park_in_flight: vec![None; config.max_connections as usize],
             park_ready: Vec::new(),
+            peer_park: config.peer_park.clone(),
+            park_rx: config.park_rx.clone(),
             segment_reader_live: vec![false; config.max_connections as usize],
             recv_half_taken: vec![false; config.max_connections as usize],
             send_half_taken: vec![false; config.max_connections as usize],

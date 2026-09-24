@@ -138,6 +138,7 @@
 // ── Internal modules ────────────────────────────────────────────────────
 pub(crate) mod acceptor;
 pub(crate) mod accumulator;
+pub(crate) mod park;
 
 /// Internal types re-exported for the crate's own criterion benches.
 /// Not public API — no stability guarantees.
