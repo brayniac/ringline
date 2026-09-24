@@ -5383,6 +5383,155 @@ mod tests {
         }
     }
 
+    // ── Park fd recovery (tier 3, #443) ────────────────────────────
+
+    /// Count open fds for this process. Used to prove the abandon paths
+    /// close the recovered fd rather than leaking a socket reference — a
+    /// leak would keep the peer from ever seeing a FIN, which no assertion
+    /// about connection state would reveal.
+    fn open_fd_count() -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .map(|d| d.count())
+            .unwrap_or(0)
+    }
+
+    /// A pipe read-end stands in for the installed fd: the handler only ever
+    /// treats a non-negative result as an owned fd to close or keep.
+    fn a_spare_fd() -> i32 {
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+        unsafe { libc::close(fds[1]) };
+        fds[0]
+    }
+
+    fn park_install_ud(conn_index: u32, generation: u32) -> crate::completion::UserData {
+        crate::completion::UserData::encode(
+            crate::completion::OpTag::ParkInstall,
+            conn_index,
+            generation,
+        )
+    }
+
+    #[test]
+    fn a_park_install_with_no_park_outstanding_closes_the_fd() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let fd = a_spare_fd();
+        let before = open_fd_count();
+
+        el.handle_park_install(park_install_ud(conn_index, generation), fd);
+
+        assert_eq!(
+            open_fd_count(),
+            before - 1,
+            "a stray install CQE must still close the fd it carries"
+        );
+    }
+
+    #[test]
+    fn a_park_install_for_a_recycled_slot_closes_the_fd() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        el.driver.park_in_flight[conn_index as usize] =
+            Some(crate::backend::uring::driver::ParkInFlight {
+                target: 1,
+                generation,
+            });
+        let fd = a_spare_fd();
+        let before = open_fd_count();
+
+        // A CQE carrying a stale generation: the slot moved on.
+        el.handle_park_install(park_install_ud(conn_index, generation.wrapping_add(1)), fd);
+
+        assert_eq!(
+            open_fd_count(),
+            before - 1,
+            "stale generation must close it"
+        );
+        assert!(el.driver.park_ready.is_empty(), "and must not park");
+    }
+
+    #[test]
+    fn a_park_abandoned_because_quiesce_broke_closes_the_fd() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        el.driver.park_in_flight[conn_index as usize] =
+            Some(crate::backend::uring::driver::ParkInFlight {
+                target: 1,
+                generation,
+            });
+        // Quiesce breaks while the install is in flight.
+        el.driver.send_queues[conn_index as usize].in_flight = true;
+        assert!(el.driver.park_blocker(conn_index).is_some(), "precondition");
+
+        let fd = a_spare_fd();
+        let before = open_fd_count();
+        el.handle_park_install(park_install_ud(conn_index, generation), fd);
+
+        assert_eq!(open_fd_count(), before - 1, "abandon must close the fd");
+        assert!(el.driver.park_ready.is_empty(), "and must not park");
+    }
+
+    #[test]
+    fn a_failed_park_install_leaves_no_park_outstanding() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        el.driver.park_in_flight[conn_index as usize] =
+            Some(crate::backend::uring::driver::ParkInFlight {
+                target: 1,
+                generation,
+            });
+
+        // ECANCELED: the linked recv-cancel failed, so the install never ran.
+        el.handle_park_install(park_install_ud(conn_index, generation), -libc::ECANCELED);
+
+        assert!(
+            el.driver.park_in_flight[conn_index as usize].is_none(),
+            "a failed park must clear its slot, or the connection can never \
+             be parked again"
+        );
+        assert!(el.driver.park_ready.is_empty());
+    }
+
+    #[test]
+    fn a_successful_park_lifts_the_connection_and_keeps_the_socket() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        el.driver.accumulators.append(conn_index, b"unconsumed");
+        el.driver.park_in_flight[conn_index as usize] =
+            Some(crate::backend::uring::driver::ParkInFlight {
+                target: 3,
+                generation,
+            });
+
+        let fd = a_spare_fd();
+        let before = open_fd_count();
+        el.handle_park_install(park_install_ud(conn_index, generation), fd);
+
+        assert_eq!(
+            open_fd_count(),
+            before,
+            "a parked connection keeps its socket: the fd moves, it does not close"
+        );
+        assert_eq!(el.driver.park_ready.len(), 1, "one connection lifted off");
+        let parked = &el.driver.park_ready[0];
+        assert_eq!(parked.target, 3);
+        let bytes: Vec<u8> = parked.pending.iter().flat_map(|b| b.to_vec()).collect();
+        assert_eq!(
+            bytes, b"unconsumed",
+            "bytes received but not consumed travel with the connection"
+        );
+        assert!(
+            el.driver.park_in_flight[conn_index as usize].is_none(),
+            "the in-flight slot clears on success too"
+        );
+    }
+
     // ── Opcode probe (tier 3, #443) ────────────────────────────────
 
     /// The guard that makes a *negative* park probe trustworthy.
