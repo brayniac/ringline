@@ -1819,7 +1819,6 @@ impl Driver {
     /// Follows the copy-before-replenish discipline of the segment reader
     /// (`runtime/io.rs`): the bid goes back to the ring only after its bytes
     /// have been copied out, with no await in between.
-    #[allow(dead_code)] // caller lands with the handover (#443 step 5c-ii)
     pub(crate) fn take_pending_for_park(&mut self, conn_index: u32) -> Vec<bytes::Bytes> {
         let idx = conn_index as usize;
         let mut out: Vec<bytes::Bytes> = Vec::new();
@@ -1864,7 +1863,6 @@ impl Driver {
     /// Copy first, replenish second, nothing in between — a bid handed back
     /// before its bytes are copied can be overwritten by another connection's
     /// recv.
-    #[allow(dead_code)] // see `take_pending_for_park`
     fn copy_out_bid(&mut self, bid: u16, len: u32) -> Option<bytes::Bytes> {
         let owned = if len == 0 {
             None
@@ -1899,7 +1897,6 @@ impl Driver {
     ///   quiescent enough to attempt it.
     /// - The accumulator and the TLS state, which are plain owned data and
     ///   move as values (see the design doc's open questions 4 and 5).
-    #[allow(dead_code)] // see `ParkBlocker`
     pub(crate) fn park_blocker(&self, conn_index: u32) -> Option<ParkBlocker> {
         let Some(conn) = self.connections.get(conn_index) else {
             return Some(ParkBlocker::NotOpen);
@@ -2002,7 +1999,6 @@ impl Driver {
 
     /// Convenience over [`Self::park_blocker`] for call sites that do not care
     /// which term tripped.
-    #[allow(dead_code)] // see `ParkBlocker`
     pub(crate) fn is_parkable(&self, conn_index: u32) -> bool {
         self.park_blocker(conn_index).is_none()
     }

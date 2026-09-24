@@ -31,6 +31,65 @@ pub(crate) struct AsyncEventLoop<A: AsyncEventHandler> {
 /// handoff costs a channel send and a wake on the far side.
 const HANDOFF_MARGIN: u32 = 2;
 
+/// How far above the least-loaded worker this one must sit before it will
+/// park an established connection (tier 3, #443).
+///
+/// Deliberately wider than [`HANDOFF_MARGIN`]. Tier 1 places a connection
+/// that does not exist yet and costs an integer; tier 3 moves a live one and
+/// costs a round trip through the kernel plus a handler restart. Letting the
+/// cheap mechanism act first, and only escalating when it could not keep up,
+/// is also what stops the two fighting: at this gap tier 1 has already been
+/// placing everything it sees onto the same target and the imbalance is
+/// standing rather than transient.
+const PARK_MARGIN: u32 = 8;
+
+/// A worker will not park below this many connections.
+///
+/// Without a floor, the last few connections ping-pong: a worker at 1 is
+/// always "above" a worker at 0 by whatever margin, so the pair never
+/// settles. It also stops a quiet server draining workers to nothing and
+/// then re-accepting onto them.
+const PARK_FLOOR: u32 = 4;
+
+/// Most parks one worker will start per [`Self::on_tick`] (tier 3, #443).
+///
+/// Park is a repair, not a scheduler. Moving one connection per tick
+/// converges a standing imbalance over a few hundred milliseconds while
+/// keeping the cost per tick bounded and leaving the load table time to
+/// reflect each move — a burst would decide every park from the same stale
+/// snapshot, which is how tier 1 first produced a thundering herd.
+const PARK_PER_TICK: usize = 1;
+
+/// Pick a worker to park a connection onto, or `None` to stay put.
+///
+/// Pure, like [`choose_placement`], so the policy can be tested without a
+/// ring. It answers only "should this worker shed, and to whom" — *which*
+/// connection to move is a separate question, and the answer there is
+/// whichever one the handler offered.
+fn choose_park_target(loads: &[u32], accepting: &[bool], me: usize, mine: u32) -> Option<usize> {
+    // A worker steered out of the accept rotation (tier 2) has a falling load
+    // precisely because it is being drained. Parking onto it would put back
+    // what steering just took out — the same trap `choose_placement` names.
+    let (min_idx, min_load) = loads
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|&(i, _)| accepting.get(i).copied().unwrap_or(true))
+        .min_by_key(|&(_, l)| l)?;
+
+    if min_idx == me || mine <= PARK_FLOOR {
+        return None;
+    }
+    // Compared against the *target's* load, not the mean: the question is
+    // whether moving one connection helps this pair, and a mean would keep
+    // firing while every worker was already within a connection of it.
+    if mine >= min_load.saturating_add(PARK_MARGIN) {
+        Some(min_idx)
+    } else {
+        None
+    }
+}
+
 /// Where a newly accepted connection should be served: `None` for "here",
 /// otherwise the index of a peer far enough below this worker to be worth the
 /// handoff.
@@ -442,6 +501,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 }
             }
             drop(guard);
+
+            // Rebalance after the handler's tick, not before: the tick is
+            // where a handler typically finishes work and offers a connection,
+            // so running first would act on last iteration's offers and always
+            // be one tick stale. After the guard, because `begin_park` takes
+            // `&mut self` and the guard holds a raw pointer to the driver.
+            self.maybe_park_one();
 
             // Finalize every close requested this iteration — by
             // `close_connection` from a CQE handler or the task-exit arm, or
@@ -1990,12 +2056,73 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
     }
 
+    /// Consider rebalancing one connection off this worker (tier 3, #443).
+    ///
+    /// Called once per tick rather than per completion: park repairs a
+    /// *standing* imbalance, and a decision made on every CQE would act on
+    /// load-table noise.
+    ///
+    /// Does nothing at all unless the kernel supports the fd recovery park
+    /// needs, this worker knows the other workers' loads (merged accept mode),
+    /// and some handler has offered a connection. In pool mode — the default —
+    /// placement is round-robin and there is no imbalance to repair, so this
+    /// returns immediately.
+    fn maybe_park_one(&mut self) {
+        if !self.driver.ring.supports_park() || self.driver.park_offered.is_empty() {
+            return;
+        }
+        let Some(loads) = self.driver.worker_loads.clone() else {
+            return;
+        };
+        if self.driver.peer_park.len() != loads.len() {
+            return;
+        }
+        let me = self.driver.worker_index;
+        let snapshot: Vec<u32> = loads
+            .iter()
+            .map(|l| l.load(std::sync::atomic::Ordering::Relaxed))
+            .collect();
+        let accepting: Vec<bool> = match self.driver.worker_accepting {
+            Some(ref flags) => flags
+                .iter()
+                .map(|f| f.load(std::sync::atomic::Ordering::Relaxed))
+                .collect(),
+            None => vec![true; snapshot.len()],
+        };
+        let mine = snapshot.get(me).copied().unwrap_or(0);
+        let Some(target) = choose_park_target(&snapshot, &accepting, me, mine) else {
+            return;
+        };
+
+        // Which connection: one the handler offered. That is the whole of the
+        // "prefer idle connections" guardrail — an offer is only made at a
+        // quiescent point, and it is withdrawn the moment bytes arrive, so an
+        // offered connection is idle by construction rather than by estimate.
+        let mut started = 0usize;
+        for conn_index in 0..self.driver.park_offered.len() as u32 {
+            if started >= PARK_PER_TICK {
+                break;
+            }
+            if !self.driver.park_offered[conn_index as usize] {
+                continue;
+            }
+            if self.begin_park(conn_index, target) {
+                started += 1;
+                // Claim the slot on the target's behalf immediately. The load
+                // table is only refreshed when a worker publishes, so without
+                // this every park in a burst would read the same stale
+                // snapshot and pile onto one target — the thundering herd
+                // tier 1 already hit (#457).
+                loads[target].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
     /// Begin parking `conn_index` onto worker `target` (tier 3, #443).
     ///
     /// Recovering the fd is asynchronous, so this only submits; the decision
     /// to actually move is taken in [`Self::handle_park_install`] once the
     /// CQE lands. Returns whether the submission went out.
-    #[allow(dead_code)] // driven by policy (#443 step 5e)
     fn begin_park(&mut self, conn_index: u32, target: usize) -> bool {
         if !self.driver.ring.supports_park() {
             return false;
@@ -15724,7 +15851,7 @@ mod tests {
 
 #[cfg(test)]
 mod placement_tests {
-    use super::{HANDOFF_MARGIN, choose_placement};
+    use super::{HANDOFF_MARGIN, PARK_FLOOR, PARK_MARGIN, choose_park_target, choose_placement};
 
     #[test]
     fn keeps_the_connection_when_this_worker_is_the_quietest() {
@@ -15801,6 +15928,82 @@ mod placement_tests {
             loads[dst] += 1;
         }
         served
+    }
+
+    // ── Park policy (tier 3, #443) ─────────────────────────────────
+
+    /// A balanced fleet must not park. Without this, every other policy test
+    /// could pass against a function that always sheds.
+    #[test]
+    fn a_balanced_worker_does_not_park() {
+        let loads = [20, 20, 21, 20];
+        let up = [true; 4];
+        assert_eq!(choose_park_target(&loads, &up, 2, 21), None);
+    }
+
+    #[test]
+    fn a_standing_imbalance_parks_onto_the_least_loaded() {
+        let loads = [40, 8, 30, 31];
+        let up = [true; 4];
+        assert_eq!(choose_park_target(&loads, &up, 0, 40), Some(1));
+    }
+
+    /// Tier 1 places arrivals and costs an integer; tier 3 moves a live
+    /// connection. The wider margin is what keeps the cheap mechanism in
+    /// front, and what stops the two fighting over the same pair.
+    #[test]
+    fn a_gap_tier_one_still_covers_does_not_escalate_to_park() {
+        let loads = [20, 20 - HANDOFF_MARGIN - 1, 20, 20];
+        let up = [true; 4];
+        assert!(
+            choose_placement(&loads, &up, 0, 20).is_some(),
+            "tier 1 acts"
+        );
+        assert_eq!(
+            choose_park_target(&loads, &up, 0, 20),
+            None,
+            "and tier 3 stays out of it"
+        );
+    }
+
+    /// The floor. Without it the last connections ping-pong: a worker at 1 is
+    /// forever "above" a worker at 0 by any margin, so the pair never settles.
+    #[test]
+    fn a_nearly_empty_worker_does_not_park_its_last_connections() {
+        let loads = [PARK_FLOOR, 0, PARK_FLOOR, PARK_FLOOR];
+        let up = [true; 4];
+        assert_eq!(
+            choose_park_target(&loads, &up, 0, PARK_FLOOR),
+            None,
+            "at the floor, hold"
+        );
+        // One above the floor, and far enough above the target, it moves.
+        let loads = [PARK_FLOOR + PARK_MARGIN, 0, 9, 9];
+        assert_eq!(
+            choose_park_target(&loads, &up, 0, PARK_FLOOR + PARK_MARGIN),
+            Some(1)
+        );
+    }
+
+    /// Parking onto a worker steered out of the rotation (tier 2) would put
+    /// back exactly what steering is draining — the trap `choose_placement`
+    /// already names, and it applies identically here.
+    #[test]
+    fn park_never_targets_a_worker_steered_out_of_the_rotation() {
+        let loads = [40, 0, 30, 31];
+        let up = [true, false, true, true];
+        assert_eq!(
+            choose_park_target(&loads, &up, 0, 40),
+            Some(2),
+            "the drained worker is skipped even though it is emptiest"
+        );
+    }
+
+    #[test]
+    fn a_worker_that_is_itself_the_least_loaded_does_not_park() {
+        let loads = [5, 40, 40, 40];
+        let up = [true; 4];
+        assert_eq!(choose_park_target(&loads, &up, 0, 5), None);
     }
 
     #[test]
