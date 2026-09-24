@@ -1707,6 +1707,93 @@ impl Driver {
         }
     }
 
+    /// Drain everything this connection has received but not yet consumed
+    /// into owned bytes, in wire order, releasing every provided-buffer bid
+    /// back to the ring (tier 3, #443).
+    ///
+    /// This is the step that makes a connection movable. A held bid is an
+    /// index into *this* worker's `ProvidedBufRing` and addresses a different
+    /// ring's buffer on the target, so it cannot travel — but waiting for a
+    /// reader to drain it would let one slow reader make a connection
+    /// permanently unparkable, which is the failure mode park exists to fix.
+    /// Copying is bounded and always succeeds, so park copies.
+    ///
+    /// **Order is the correctness property.** The accumulator holds bytes that
+    /// arrived before anything still held, and `segment_pinned` was popped
+    /// from the front of `segment_hold`, so the sequence is: accumulator,
+    /// pinned, held, then the Mode A hold. Getting this wrong reorders the
+    /// peer's byte stream, which no test of "did the bytes arrive" would
+    /// catch.
+    ///
+    /// `segment_hold` and `recv_hold` belong to different `RecvDomain`s, so at
+    /// most one is ever non-empty. Both are drained regardless: it costs a
+    /// pair of empty pops and leaves no dependence on which domain the
+    /// connection happened to be in.
+    ///
+    /// Follows the copy-before-replenish discipline of the segment reader
+    /// (`runtime/io.rs`): the bid goes back to the ring only after its bytes
+    /// have been copied out, with no await in between.
+    #[allow(dead_code)] // caller lands with the handover (#443 step 5c-ii)
+    pub(crate) fn take_pending_for_park(&mut self, conn_index: u32) -> Vec<bytes::Bytes> {
+        let idx = conn_index as usize;
+        let mut out: Vec<bytes::Bytes> = Vec::new();
+
+        let acc = self.accumulators.take_frozen(conn_index);
+        if !acc.is_empty() {
+            out.push(acc);
+        }
+
+        let pinned = self.segment_pinned[idx].take();
+        let held: Vec<HeldRecvBuf> = self.segment_hold[idx].drain(..).collect();
+        for entry in pinned.into_iter().chain(held) {
+            match entry {
+                HeldRecvBuf::Pinned { bid, len } => {
+                    if let Some(b) = self.copy_out_bid(bid, len) {
+                        out.push(b);
+                    }
+                }
+                // Force-copied at delivery; its bid was replenished then.
+                HeldRecvBuf::Owned(bytes) => {
+                    if !bytes.is_empty() {
+                        out.push(bytes);
+                    }
+                }
+            }
+        }
+
+        let forward: Vec<PendingRecvBuf> = self.recv_hold[idx].drain(..).collect();
+        for pending in forward {
+            if let Some(b) = self.copy_out_bid(pending.bid, pending.len) {
+                out.push(b);
+            }
+        }
+
+        out
+    }
+
+    /// Copy `len` bytes out of provided buffer `bid`, then return the bid to
+    /// the ring. `None` for an empty buffer, which carries no bytes and would
+    /// only add an empty chunk to the stream.
+    ///
+    /// Copy first, replenish second, nothing in between — a bid handed back
+    /// before its bytes are copied can be overwritten by another connection's
+    /// recv.
+    #[allow(dead_code)] // see `take_pending_for_park`
+    fn copy_out_bid(&mut self, bid: u16, len: u32) -> Option<bytes::Bytes> {
+        let owned = if len == 0 {
+            None
+        } else {
+            let (ptr, _) = self.provided_bufs.get_buffer(bid);
+            // SAFETY: `bid` is held (not yet replenished) and `len` bytes were
+            // received into its backing buffer. The slice is consumed by the
+            // copy before `self` is mutated below.
+            let slice = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+            Some(bytes::Bytes::copy_from_slice(slice))
+        };
+        self.pending_replenish.push(bid);
+        owned
+    }
+
     /// The park gate (tier 3, #443). `None` means quiescent and movable.
     ///
     /// Deliberately **not** blockers, because each would make park refuse

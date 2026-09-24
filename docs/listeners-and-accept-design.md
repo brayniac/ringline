@@ -290,6 +290,16 @@ a new `on_adopt` hook.
 one value, not a reconstructed session — see open question 4. Both engines take
 the same path.
 
+**Park is opt-in** (owner decision, 2026-09-23). The future is dropped and
+recreated, so a handler that kept anything — negotiated protocol,
+authenticated identity, subscriptions — has to hand it over or rebuild it. Most
+handlers keep nothing (echo, plain RESP) and would park safely by default, but
+the ones that do keep state would break silently rather than loudly, and a
+runtime that silently discards handler state is not a trade a default should
+make. So `on_adopt` stays off the mandatory `AsyncEventHandler` surface and
+only connections whose handler opts in are ever parked; everything else falls
+through to tier 4 (shed) or is simply left where it is.
+
 `on_adopt` is **optional**, and the handler payload is the new public surface:
 since the future dies, anything the handler kept — negotiated protocol,
 authenticated identity, subscriptions — is rebuilt or carried as an opaque
