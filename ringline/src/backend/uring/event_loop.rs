@@ -5988,7 +5988,11 @@ mod tests {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
-        el.driver.accumulators.append(conn_index, b"unconsumed");
+        // Deliberately no buffered bytes: `DataPending` refuses while
+        // anything is unconsumed, so a connection that reaches a successful
+        // park is idle by construction. Carrying leftovers was the earlier
+        // design and is superseded — see
+        // `held_ring_buffers_block_the_park_as_unconsumed_data`.
         el.driver.park_offered[conn_index as usize] = true;
         el.driver.park_in_flight[conn_index as usize] =
             Some(crate::backend::uring::driver::ParkInFlight {
@@ -6006,10 +6010,10 @@ mod tests {
         assert_eq!(el.driver.park_ready.len(), 1, "one connection lifted off");
         let parked = &el.driver.park_ready[0];
         assert_eq!(parked.target, 3);
-        let bytes: Vec<u8> = parked.pending.iter().flat_map(|b| b.to_vec()).collect();
-        assert_eq!(
-            bytes, b"unconsumed",
-            "bytes received but not consumed travel with the connection"
+        assert!(
+            parked.pending.is_empty(),
+            "an idle connection carries no bytes; the drain is defence in \
+             depth, not the normal path"
         );
         assert!(
             el.driver.park_in_flight[conn_index as usize].is_none(),
