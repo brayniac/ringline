@@ -1790,12 +1790,19 @@ impl Driver {
     /// into owned bytes, in wire order, releasing every provided-buffer bid
     /// back to the ring (tier 3, #443).
     ///
-    /// This is the step that makes a connection movable. A held bid is an
-    /// index into *this* worker's `ProvidedBufRing` and addresses a different
-    /// ring's buffer on the target, so it cannot travel — but waiting for a
-    /// reader to drain it would let one slow reader make a connection
-    /// permanently unparkable, which is the failure mode park exists to fix.
-    /// Copying is bounded and always succeeds, so park copies.
+    /// **Normally returns nothing, and that is the intended state.**
+    /// `park_blocker` refuses while any bytes are unconsumed
+    /// (`ParkBlocker::DataPending`), so a connection that reaches here has an
+    /// empty accumulator and empty holds. This stayed after that gate term
+    /// was added because it is the one thing standing between a gap in the
+    /// gate and silently discarding a peer's bytes: if anything does slip
+    /// through, the data travels rather than vanishing.
+    ///
+    /// It supersedes the rule in #463 that held bids should be copied and
+    /// carried rather than blocking a park. That reasoning was about the
+    /// close path; for park, unconsumed data means the quiescent point the
+    /// handler offered at has passed, so the right answer is to wait for the
+    /// next offer rather than to ship stale state alongside a live request.
     ///
     /// **Order is the correctness property.** The accumulator holds bytes that
     /// arrived before anything still held, and `segment_pinned` was popped

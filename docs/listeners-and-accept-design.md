@@ -257,16 +257,24 @@ connection is quiescent":
 !in_flight && queue.is_empty() && forward_write.is_none() && !chain_table.is_active()
 ```
 
-with the terms close does not need. `close_connection` drains **three**
-holders of worker-local provided-buffer bids, not one — `recv_hold`,
-`segment_hold` and `segment_pinned` — and a bid index means nothing on the
-target worker's ring. Close can defer until a reader releases them; park has a
-cheaper option, and it is the rule segmented recv already follows: **convert
-every `Pinned` to `Owned` by copying** at move time. Bounded work, always
-succeeds, and no connection becomes permanently unparkable because one reader
-is slow. `HeldRecvBuf::Owned(Bytes)` needs nothing.
+with the terms close does not need.
 
-So held buffers are *not* a park refusal. The refusals are the states where
+An earlier draft of this section had park *carry* held buffers: convert every
+`Pinned` bid to `Owned` at move time, on the grounds that waiting for a slow
+reader could make a connection permanently unparkable. **That was wrong, and
+the adversarial review of the API found why.** Unconsumed bytes mean the
+quiescent point the handler offered at has already passed, so carrying them
+ships handler state deposited *before* a request that is now in flight — the
+adopting worker gets a stale session next to a partial message. Nothing
+becomes permanently unparkable either: the handler re-offers at its next idle
+point and the park happens then. Park is best-effort by construction.
+
+So the gate refuses while anything is unconsumed —
+accumulator, `recv_hold`, `segment_hold` or `segment_pinned`
+(`ParkBlocker::DataPending`). Stating it as a property of *state* rather than
+as a withdraw hook on each delivery path is deliberate: the review found two
+recv paths that delivered bytes without withdrawing the offer, and a
+state-based gate means the next one added fails closed instead. The refusals are the states where
 the handler or the kernel is mid-operation, and the gate names each one
 (`ParkBlocker`): not open or still handshaking; teardown already requested;
 queued or in-flight sends; an in-flight Mode A forward write; an active send
