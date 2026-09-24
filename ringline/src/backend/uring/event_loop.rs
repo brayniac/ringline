@@ -5562,14 +5562,16 @@ mod tests {
 
         el.drain_adopted();
 
-        let installed = (0..el.driver.connections.capacity())
-            .find(|&i| {
-                el.driver
-                    .connections
-                    .get(i)
-                    .is_some_and(|c| c.active && c.peer_addr.is_some())
-            })
-            .expect("the adopted connection took a slot");
+        // Nothing else has allocated on this loop, so the adopted connection
+        // takes slot 0.
+        let installed = 0u32;
+        assert!(
+            el.driver
+                .connections
+                .get(installed)
+                .is_some_and(|c| c.active && c.peer_addr.is_some()),
+            "the adopted connection took a slot"
+        );
         assert_eq!(
             el.driver.accumulators.data(installed),
             b"before-the-move",
