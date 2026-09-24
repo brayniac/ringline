@@ -346,6 +346,21 @@ pub(crate) struct Driver {
     /// under `try_with_state`, or `close_connection` under `&mut Driver`)
     /// replenishes the bid exactly once; the other sees `None` and does nothing.
     pub(crate) segment_pinned: Vec<Option<HeldRecvBuf>>,
+    /// The handler has offered this connection for park (tier 3, #443).
+    ///
+    /// Depositing is the opt-in: a connection whose handler never offered it
+    /// is never parked. Cleared whenever recv delivers, because new data
+    /// means a new request began and the quiescent point the handler offered
+    /// at is gone — so the handler never has to remember to revoke.
+    pub(crate) park_offered: Vec<bool>,
+    /// State the handler deposited alongside the offer, carried to the
+    /// adopting worker and handed to `on_adopt`.
+    pub(crate) park_carry: Vec<Option<crate::park::ParkState>>,
+    /// Set for the duration of one adopt install, so `spawn_accept_task`
+    /// calls `on_adopt` rather than `on_accept`, and with what the handler
+    /// deposited. The outer `Option` is "this install is an adopt"; the inner
+    /// is "and here is the state, if any".
+    pub(crate) adopting: Option<Option<crate::park::ParkState>>,
     /// Parks awaiting their `FixedFdInstall` CQE, one slot per connection.
     /// Also the guard against submitting a second park for the same
     /// connection while the first is outstanding.
@@ -699,6 +714,12 @@ pub(crate) enum ParkBlocker {
     /// Not an established, open connection — still handshaking, still
     /// connecting, or already tearing down. Nothing to move yet.
     NotOpen,
+    /// The handler has not offered this connection via `offer_for_park`.
+    /// Park is opt-in, so this is the common answer, not an error.
+    NotOffered,
+    /// A TLS session that cannot travel yet. Temporary: the state is plain
+    /// owned data, it is the transfer that is unimplemented.
+    TlsSession,
     /// Teardown is already requested. Park loses this race deliberately:
     /// moving a connection the peer is closing buys nothing, and the close
     /// path is the one carrying the invariants.
@@ -900,6 +921,9 @@ impl Driver {
                 .map(|_| std::collections::VecDeque::new())
                 .collect(),
             segment_pinned: vec![None; config.max_connections as usize],
+            adopting: None,
+            park_offered: vec![false; config.max_connections as usize],
+            park_carry: (0..config.max_connections).map(|_| None).collect(),
             park_in_flight: vec![None; config.max_connections as usize],
             park_ready: Vec::new(),
             peer_park: config.peer_park.clone(),
@@ -1858,6 +1882,23 @@ impl Driver {
             || conn.write != crate::connection::WriteHalf::Open
         {
             return Some(ParkBlocker::Closing);
+        }
+
+        // A TLS connection's session lives in this worker's `TlsTable`, and
+        // carrying it is not implemented yet — adopting would install a fresh
+        // entry and the peer would face a renegotiation on an established
+        // session. Refused rather than silently broken; carrying the session
+        // is the next increment (open question 4 established that
+        // `UnbufferedConn` is plain owned data and moves as one value).
+        if self.tls_table.as_ref().is_some_and(|t| t.has(conn_index)) {
+            return Some(ParkBlocker::TlsSession);
+        }
+
+        // The handler's offer is the opt-in, and it is checked before any
+        // mechanical term: a connection nobody offered is not "not yet
+        // quiescent", it is simply never going to be parked.
+        if !self.park_offered[conn_index as usize] {
+            return Some(ParkBlocker::NotOffered);
         }
 
         let send = &self.send_queues[conn_index as usize];

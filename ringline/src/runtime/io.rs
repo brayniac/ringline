@@ -903,6 +903,42 @@ impl ConnCtx {
         self.conn_index as usize
     }
 
+    /// Offer this connection for rebalancing onto a less loaded worker
+    /// (tier 3, #443), carrying `state` across.
+    ///
+    /// Call it at a point where the handler holds nothing it cannot rebuild —
+    /// after finishing a response, not mid-request. Park drops the future and
+    /// makes a fresh one on the new worker via
+    /// [`AsyncEventHandler::on_adopt`](crate::AsyncEventHandler::on_adopt),
+    /// so `state` is the only thing that survives.
+    ///
+    /// **This is the opt-in.** A connection whose handler never calls this is
+    /// never parked, whatever the load imbalance.
+    ///
+    /// The offer is **cleared automatically when more data arrives**, since
+    /// that means a new request started and the boundary is gone. So a
+    /// handler offers once per idle point and never has to revoke.
+    ///
+    /// Park also requires Linux 6.8 (`IORING_OP_FIXED_FD_INSTALL`) and the
+    /// io_uring backend; elsewhere this is recorded and simply never acted
+    /// on.
+    pub fn offer_for_park(&self, state: Option<crate::park::ParkState>) {
+        let _ = try_with_state(|driver, _| {
+            #[cfg(has_io_uring)]
+            {
+                let idx = self.conn_index as usize;
+                if driver.connections.generation(self.conn_index) == self.generation {
+                    driver.park_offered[idx] = true;
+                    driver.park_carry[idx] = state;
+                }
+            }
+            #[cfg(not(has_io_uring))]
+            {
+                let _ = (driver, state);
+            }
+        });
+    }
+
     /// Returns the `ConnToken` for this connection.
     pub fn token(&self) -> ConnToken {
         ConnToken::new(self.conn_index, self.generation)
@@ -3326,6 +3362,12 @@ impl RecvHalf {
         self.conn.end_segments()
     }
 
+    /// Offer this connection for rebalancing. See
+    /// [`ConnCtx::offer_for_park`].
+    pub fn offer_for_park(&self, state: Option<crate::park::ParkState>) {
+        self.conn.offer_for_park(state);
+    }
+
     /// See [`ConnCtx::token`].
     pub fn token(&self) -> ConnToken {
         self.conn.token()
@@ -3634,6 +3676,12 @@ impl Connection {
         self.tx.close();
     }
 
+    /// Offer this connection for rebalancing. See
+    /// [`ConnCtx::offer_for_park`].
+    pub fn offer_for_park(&self, state: Option<crate::park::ParkState>) {
+        self.tx.offer_for_park(state);
+    }
+
     /// See [`ConnCtx::token`].
     pub fn token(&self) -> ConnToken {
         self.tx.token()
@@ -3876,6 +3924,12 @@ impl SendHalf {
         F: FnOnce(crate::handler::SendChainBuilder<'_, '_>) -> R,
     {
         self.conn.send_chain_nowait(f)
+    }
+
+    /// Offer this connection for rebalancing. See
+    /// [`ConnCtx::offer_for_park`].
+    pub fn offer_for_park(&self, state: Option<crate::park::ParkState>) {
+        self.conn.offer_for_park(state);
     }
 
     /// See [`ConnCtx::token`].

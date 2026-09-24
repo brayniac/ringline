@@ -51,6 +51,45 @@ pub trait AsyncEventHandler: Send + 'static {
     /// live (an echo writing from inside its own `with_data` closure).
     fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static;
 
+    /// Adopt a connection parked from another worker (tier 3, #443).
+    ///
+    /// Park moves an established connection to a less loaded worker. The
+    /// future returned by [`Self::on_accept`] is `!Send` and cannot travel,
+    /// so it is dropped on the old worker and this is called on the new one
+    /// to make a fresh one.
+    ///
+    /// `state` is whatever the handler deposited with
+    /// [`Connection::offer_for_park`] at the moment it allowed the park, or
+    /// `None` if it deposited nothing.
+    ///
+    /// **A connection is only ever parked if the handler offered it**, so
+    /// doing nothing here is safe: a handler that never calls
+    /// `offer_for_park` never sees this.
+    ///
+    /// The default treats the connection as freshly accepted, which is
+    /// correct for any handler that keeps no per-connection state — most of
+    /// them. Override it when there is state to restore.
+    ///
+    /// Returns a boxed future rather than `impl Future` for the same reason
+    /// [`Self::on_udp_bind`] does: a defaulted method cannot return an opaque
+    /// type.
+    fn on_adopt(
+        &self,
+        conn: Connection,
+        state: Option<crate::park::ParkState>,
+    ) -> Pin<Box<dyn Future<Output = ()> + 'static>> {
+        // Depositing state and not overriding this loses it silently, which
+        // would present as a connection that mysteriously forgot its session.
+        debug_assert!(
+            state.is_none(),
+            "park state was deposited as `{}` but this handler does not \
+             override `on_adopt`, so it would be dropped",
+            state.as_ref().map(|s| s.deposited_as()).unwrap_or(""),
+        );
+        let _ = state;
+        Box::pin(self.on_accept(conn))
+    }
+
     /// Periodic tick (synchronous). Called on each io_uring completion cycle.
     fn on_tick(&mut self, _ctx: &mut DriverCtx<'_>) {}
 
