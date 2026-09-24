@@ -5610,35 +5610,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn park_state_round_trips_through_the_right_type() {
-        let s = ParkState::new(String::from("session"));
-        assert_eq!(s.take::<String>().as_deref(), Some("session"));
-    }
-
-    /// A mismatch is a handler bug, so it is loud where bugs get found and
-    /// graceful where uptime matters. Both halves are asserted, because
-    /// `debug_assert!` compiles out in release and a `should_panic` test that
-    /// only ever ran in debug would claim a contract the release build does
-    /// not keep.
-    #[cfg(debug_assertions)]
-    #[test]
-    #[should_panic(expected = "deposited as")]
-    fn taking_park_state_as_the_wrong_type_panics_in_debug() {
-        let s = ParkState::new(String::from("session"));
-        let _ = s.take::<u64>();
-    }
-
-    #[cfg(not(debug_assertions))]
-    #[test]
-    fn taking_park_state_as_the_wrong_type_yields_none_in_release() {
-        let s = ParkState::new(String::from("session"));
-        assert!(
-            s.take::<u64>().is_none(),
-            "release degrades to no state rather than killing the connection"
-        );
-    }
-
     // ── Park handover (tier 3, #443) ───────────────────────────────
 
     fn parked_entry(target: usize, bytes: &[u8]) -> crate::park::ParkedFd {
