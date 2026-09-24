@@ -76,11 +76,16 @@ impl ParkState {
 
     /// Take the value back as `T`.
     ///
-    /// `None` if the deposited type was not `T`. In debug builds this panics
-    /// naming both types instead: depositing one type and taking another is a
-    /// bug in the handler, not a condition worth handling at runtime, and a
-    /// silent `None` would present as a connection that quietly lost its
-    /// session.
+    /// `None` if the deposited type was not `T`.
+    ///
+    /// In **debug** builds this panics first, naming both the deposited and
+    /// the requested type: depositing one type and taking another is a bug in
+    /// the handler, and it should fail on the first test run rather than
+    /// present later as a connection that quietly lost its session.
+    ///
+    /// In **release** it returns `None`, degrading to "adopted without state"
+    /// rather than taking down a connection for a mistake that debug builds
+    /// and tests already had every chance to catch.
     pub fn take<T: std::any::Any + Send>(self) -> Option<T> {
         let deposited_as = self.deposited_as;
         match self.value.downcast::<T>() {
