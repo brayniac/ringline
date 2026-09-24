@@ -5385,12 +5385,30 @@ mod tests {
     use std::sync::atomic::AtomicBool;
 
     /// Minimal handler for testing — does nothing.
+    use std::sync::atomic::{AtomicU32, Ordering};
+
     struct NoopHandler;
+
+    /// Counts `on_adopt` calls, and records what state arrived with them.
+    /// Nothing else proves an adopted connection takes the adopt branch
+    /// rather than being handed to `on_accept` like a fresh one — the driver
+    /// state looks identical either way.
+    static ADOPTS: AtomicU32 = AtomicU32::new(0);
+    static ADOPTED_STATE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
     impl AsyncEventHandler for NoopHandler {
         #[allow(clippy::manual_async_fn)]
         fn on_accept(&self, _conn: crate::Connection) -> impl Future<Output = ()> + 'static {
             async {}
+        }
+        fn on_adopt(
+            &self,
+            _conn: crate::Connection,
+            state: Option<crate::park::ParkState>,
+        ) -> std::pin::Pin<Box<dyn Future<Output = ()> + 'static>> {
+            ADOPTS.fetch_add(1, Ordering::SeqCst);
+            *ADOPTED_STATE.lock().unwrap() = state.and_then(|s| s.take::<String>());
+            Box::pin(async {})
         }
         fn create_for_worker(_id: usize) -> Self {
             NoopHandler
@@ -15928,6 +15946,122 @@ mod placement_tests {
             loads[dst] += 1;
         }
         served
+    }
+
+    // ── Park wiring, end to end within a worker (tier 3, #443) ─────
+
+    /// The claim #469 makes and nothing tested: that the policy actually
+    /// reaches the mechanism. Every other park test is either a pure policy
+    /// function or a hand-driven completion handler — if `maybe_park_one`
+    /// never called `begin_park` (wrong tick position, an inverted gate term,
+    /// a missing precondition), all of them would still pass.
+    #[test]
+    fn the_policy_starts_a_real_park() {
+        let mut el = make_test_loop();
+        if !el.driver.ring.supports_park() {
+            return; // pre-6.8: park is unavailable by design, nothing to test
+        }
+        let conn_index = accept_connection(&mut el);
+        el.driver.park_offered[conn_index as usize] = true;
+
+        // A standing imbalance: this worker well above the other. Faked,
+        // because tier 1 exists to stop one forming — which is exactly why
+        // park is hard to provoke in a live server and easy to leave untested.
+        let loads = std::sync::Arc::new(vec![AtomicU32::new(40), AtomicU32::new(0)]);
+        el.driver.worker_loads = Some(loads.clone());
+        el.driver.worker_index = 0;
+        let (tx, _rx) = crossbeam_channel::bounded::<crate::park::ParkedFd>(4);
+        let (_r0, w0) = crate::wakeup::create_wake_fd().expect("wake fd");
+        let (_r1, w1) = crate::wakeup::create_wake_fd().expect("wake fd");
+        el.driver.peer_park = vec![(tx.clone(), w0.as_wake_fd()), (tx, w1.as_wake_fd())];
+
+        assert!(
+            el.driver.park_in_flight[conn_index as usize].is_none(),
+            "precondition: nothing in flight"
+        );
+
+        el.maybe_park_one();
+
+        let started = el.driver.park_in_flight[conn_index as usize]
+            .expect("the policy must actually start a park");
+        assert_eq!(started.target, 1, "onto the least loaded worker");
+        assert_eq!(
+            loads[1].load(Ordering::Relaxed),
+            1,
+            "and claim the target's slot immediately, or a burst would all \
+             pick the same target from one stale snapshot"
+        );
+    }
+
+    /// The balanced case, so the test above cannot pass against a policy that
+    /// parks unconditionally.
+    #[test]
+    fn the_policy_starts_no_park_when_balanced() {
+        let mut el = make_test_loop();
+        if !el.driver.ring.supports_park() {
+            return;
+        }
+        let conn_index = accept_connection(&mut el);
+        el.driver.park_offered[conn_index as usize] = true;
+
+        let loads = std::sync::Arc::new(vec![AtomicU32::new(20), AtomicU32::new(20)]);
+        el.driver.worker_loads = Some(loads);
+        el.driver.worker_index = 0;
+        let (tx, _rx) = crossbeam_channel::bounded::<crate::park::ParkedFd>(4);
+        let (_r0, w0) = crate::wakeup::create_wake_fd().expect("wake fd");
+        let (_r1, w1) = crate::wakeup::create_wake_fd().expect("wake fd");
+        el.driver.peer_park = vec![(tx.clone(), w0.as_wake_fd()), (tx, w1.as_wake_fd())];
+
+        el.maybe_park_one();
+
+        assert!(
+            el.driver.park_in_flight[conn_index as usize].is_none(),
+            "a balanced fleet must not move anything"
+        );
+    }
+
+    /// Pool mode is the default and has no imbalance to repair. Park must be
+    /// inert there, not merely unlikely.
+    #[test]
+    fn the_policy_is_inert_without_worker_loads() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        el.driver.park_offered[conn_index as usize] = true;
+        assert!(el.driver.worker_loads.is_none(), "pool mode: no load table");
+
+        el.maybe_park_one();
+
+        assert!(el.driver.park_in_flight[conn_index as usize].is_none());
+    }
+
+    /// An adopted connection must reach `on_adopt`, with its state. The
+    /// driver state after an adopt and after a fresh accept is identical, so
+    /// only the handler can tell the two apart — and nothing was asking it.
+    #[test]
+    fn an_adopted_connection_reaches_on_adopt_with_its_state() {
+        let mut el = make_test_loop();
+        ADOPTS.store(0, Ordering::SeqCst);
+        *ADOPTED_STATE.lock().unwrap() = None;
+
+        let (tx, rx) = crossbeam_channel::bounded::<crate::park::ParkedFd>(4);
+        el.driver.park_rx = Some(rx);
+        let mut entry = parked_entry(0, b"");
+        entry.state = Some(ParkState::new(String::from("session-42")));
+        tx.try_send(entry).expect("queue");
+        drop(tx);
+
+        el.drain_adopted();
+
+        assert_eq!(
+            ADOPTS.load(Ordering::SeqCst),
+            1,
+            "an adopted connection takes on_adopt, not on_accept"
+        );
+        assert_eq!(
+            ADOPTED_STATE.lock().unwrap().as_deref(),
+            Some("session-42"),
+            "and the handler gets back exactly what it deposited"
+        );
     }
 
     // ── Park policy (tier 3, #443) ─────────────────────────────────
