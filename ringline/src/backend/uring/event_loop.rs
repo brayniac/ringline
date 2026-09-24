@@ -5387,6 +5387,9 @@ mod tests {
     fn a_quiescent_connection_is_parkable() {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
+        // Offered: these cover the mechanical blockers, so the opt-in must
+        // be out of the way or every one of them would report NotOffered.
+        el.driver.park_offered[conn_index as usize] = true;
         assert_eq!(
             el.driver.park_blocker(conn_index),
             None,
@@ -5399,6 +5402,9 @@ mod tests {
     fn an_in_flight_send_blocks_the_park() {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
+        // Offered: these cover the mechanical blockers, so the opt-in must
+        // be out of the way or every one of them would report NotOffered.
+        el.driver.park_offered[conn_index as usize] = true;
         el.driver.send_queues[conn_index as usize].in_flight = true;
         assert_eq!(
             el.driver.park_blocker(conn_index),
@@ -5437,6 +5443,9 @@ mod tests {
     fn a_live_segment_reader_blocks_the_park() {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
+        // Offered: these cover the mechanical blockers, so the opt-in must
+        // be out of the way or every one of them would report NotOffered.
+        el.driver.park_offered[conn_index as usize] = true;
         el.driver.segment_reader_live[conn_index as usize] = true;
         assert_eq!(
             el.driver.park_blocker(conn_index),
@@ -5488,6 +5497,7 @@ mod tests {
         ] {
             let mut el = make_test_loop();
             let conn_index = accept_connection(&mut el);
+            el.driver.park_offered[conn_index as usize] = true;
             assert_eq!(
                 el.driver.park_blocker(conn_index),
                 None,
@@ -5864,6 +5874,7 @@ mod tests {
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
         el.driver.accumulators.append(conn_index, b"unconsumed");
+        el.driver.park_offered[conn_index as usize] = true;
         el.driver.park_in_flight[conn_index as usize] =
             Some(crate::backend::uring::driver::ParkInFlight {
                 target: 3,
