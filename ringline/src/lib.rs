@@ -239,6 +239,8 @@ pub use handler::ListenerId;
 pub use handler::SendPart;
 /// Opaque handle for a UDP socket.
 pub use handler::UdpToken;
+/// Handler state carried across a park (tier 3, #443).
+pub use park::ParkState;
 
 // ── Re-exports: Async API ───────────────────────────────────────────────
 

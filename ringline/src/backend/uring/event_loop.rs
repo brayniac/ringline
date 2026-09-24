@@ -1088,6 +1088,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             return;
         }
 
+        // Withdraw before the append and before `recv_fallback_inflight`
+        // clears: that flag was the only term holding the park off, so
+        // delivering here would otherwise take the connection from blocked to
+        // "parkable with a half-received request" in one step.
+        self.withdraw_park_offer(conn_index);
+
         let bytes_received = result as u32;
         metrics::BYTES.add(metrics::bytes::RECEIVED, bytes_received as u64);
         metrics::BYTES.add(metrics::bytes::FALLBACK_RECEIVED, bytes_received as u64);
@@ -1233,6 +1239,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 self.driver.pending_replenish.push(bid);
             }
             return;
+        }
+
+        if result > 0 {
+            self.withdraw_park_offer(conn_index);
         }
 
         // A completion without `IORING_CQE_F_MORE` means the kernel terminated
@@ -1763,6 +1773,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
         };
 
+        // Same rule as the multishot and fallback paths: bytes are about to be
+        // delivered, so any park offer is stale (#443 tier 3).
+        self.withdraw_park_offer(conn_index);
+
         self.driver.provided_bufs.on_handout();
         let buf_len = result as u32;
         let (buf_ptr, _) = self.driver.provided_bufs.get_buffer(bid);
@@ -1944,12 +1958,35 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 listener,
                 peer,
                 pending,
+                state,
                 ..
             } = parked;
             // `install_accepted_with_pending` registers the fd and closes this
             // handle, exactly as it does for a freshly accepted one.
             let raw = std::os::fd::IntoRawFd::into_raw_fd(fd);
-            self.install_accepted_with_pending(raw, listener, peer, pending);
+            self.install_accepted_with_pending(raw, listener, peer, pending, Some(state));
+        }
+    }
+
+    /// Withdraw a park offer because bytes arrived (tier 3, #443).
+    ///
+    /// Arriving bytes mean a new request has begun, so the quiescent point the
+    /// handler offered at is gone. This is what makes `offer_for_park` a
+    /// one-shot: the handler offers once when idle and never has to remember
+    /// to revoke.
+    ///
+    /// **Every path that delivers bytes to a connection must call this**, and
+    /// missing one is not hypothetical — the fallback and timestamped recv
+    /// paths both did. `park_blocker` carries a state-based backstop
+    /// (`ParkBlocker::DataPending`) for exactly that reason, so a path added
+    /// later fails closed rather than parking mid-request.
+    fn withdraw_park_offer(&mut self, conn_index: u32) {
+        let idx = conn_index as usize;
+        // Read first: the common case is no offer, and a predictable branch
+        // beats two stores on every delivery.
+        if self.driver.park_offered.get(idx).copied().unwrap_or(false) {
+            self.driver.park_offered[idx] = false;
+            self.driver.park_carry.remove(&conn_index);
         }
     }
 
@@ -2055,17 +2092,24 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
 
         let (listener, peer) = match self.driver.connections.get(conn_index) {
-            Some(cs) => (
-                cs.listener.unwrap_or(crate::ListenerId::from_index(0)),
+            // `park_blocker` refuses a connection with no listener
+            // (`ParkBlocker::Outbound`), so this is unreachable rather than a
+            // default. Fabricating `ListenerId(0)` here is what let an
+            // outbound connection be adopted onto a TLS listener's identity.
+            Some(cs) if cs.listener.is_some() => (
+                cs.listener.expect("checked by the guard above"),
                 cs.peer_addr
                     .clone()
                     .unwrap_or(crate::connection::PeerAddr::Tcp(
                         std::net::SocketAddr::from(([0, 0, 0, 0], 0)),
                     )),
             ),
-            None => return,
+            // No slot, or an outbound connection that slipped past the gate:
+            // either way `fd` drops and closes this reference.
+            _ => return,
         };
         let pending = self.driver.take_pending_for_park(conn_index);
+        let state = self.driver.park_carry.remove(&conn_index);
 
         // Ordinary teardown. It closes the fixed-file entry and drops the
         // handler future, but does *not* FIN: `fd` above is a second
@@ -2078,6 +2122,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             listener,
             peer,
             pending,
+            state,
             target: in_flight.target,
         });
     }
@@ -2088,7 +2133,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         listener: crate::ListenerId,
         peer_addr: crate::connection::PeerAddr,
     ) {
-        self.install_accepted_with_pending(raw_fd, listener, peer_addr, Vec::new())
+        self.install_accepted_with_pending(raw_fd, listener, peer_addr, Vec::new(), None)
     }
 
     /// As [`Self::install_accepted`], but seeds the accumulator with bytes
@@ -2105,6 +2150,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         listener: crate::ListenerId,
         peer_addr: crate::connection::PeerAddr,
         pending: Vec<bytes::Bytes>,
+        // `adopt` is `Some` when this install is an adopt; the inner value is
+        // what the handler deposited. Recorded per connection so the TLS
+        // branch's deferred spawn still finds it.
+        adopt: Option<Option<crate::park::ParkState>>,
     ) {
         let conn_index = match self.driver.connections.allocate() {
             Some(idx) => idx,
@@ -2143,6 +2192,18 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.driver.accumulators.reset(conn_index);
         self.driver.reset_segment_state(conn_index);
         self.driver.reset_send_state(conn_index);
+        // A slot is recycled by generation, so without this a new occupant
+        // would inherit the previous one's park offer — and its state.
+        self.driver.park_offered[conn_index as usize] = false;
+        self.driver.park_carry.remove(&conn_index);
+        match adopt {
+            Some(state) => {
+                self.driver.adopt_pending.insert(conn_index, state);
+            }
+            None => {
+                self.driver.adopt_pending.remove(&conn_index);
+            }
+        }
         for chunk in &pending {
             self.driver.accumulators.append(conn_index, chunk);
         }
@@ -3803,6 +3864,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.driver.accumulators.reset(conn_index);
         self.driver.reset_segment_state(conn_index);
         self.driver.reset_send_state(conn_index);
+        // A slot is recycled by generation, so without this a new occupant
+        // would inherit the previous one's park offer — and its state.
+        self.driver.park_offered[conn_index as usize] = false;
+        self.driver.park_carry.remove(&conn_index);
 
         // TLS client path
         if let Some(ref mut tls_table) = self.driver.tls_table
@@ -4603,9 +4668,15 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // not `UnwindSafe`. A panic here is treated like a fatal handler
         // error — the connection is closed; the worker continues serving
         // others.
-        let future_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            Box::pin(self.handler.on_accept(conn))
-        }));
+        // An adopted connection gets `on_adopt`, not `on_accept`: it is not a
+        // new connection, and the handler may have state to restore.
+        let adopting = self.driver.adopt_pending.remove(&conn_index);
+        let future_result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match adopting {
+                Some(state) => self.handler.on_adopt(conn, state),
+                None => Box::pin(self.handler.on_accept(conn))
+                    as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'static>>,
+            }));
         let future = match future_result {
             Ok(f) => f,
             Err(_) => {
@@ -5340,6 +5411,9 @@ mod tests {
             cs.lifecycle = Lifecycle::Open;
             cs.recv_arm = RecvArm::Multi;
             cs.established = true;
+            // The real install records the listener; without it every test
+            // connection looks outbound, which park now refuses.
+            cs.listener = Some(crate::ListenerId::from_index(0));
         }
         conn_index
     }
@@ -5355,6 +5429,9 @@ mod tests {
     fn a_quiescent_connection_is_parkable() {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
+        // Offered: these cover the mechanical blockers, so the opt-in must
+        // be out of the way or every one of them would report NotOffered.
+        el.driver.park_offered[conn_index as usize] = true;
         assert_eq!(
             el.driver.park_blocker(conn_index),
             None,
@@ -5367,6 +5444,9 @@ mod tests {
     fn an_in_flight_send_blocks_the_park() {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
+        // Offered: these cover the mechanical blockers, so the opt-in must
+        // be out of the way or every one of them would report NotOffered.
+        el.driver.park_offered[conn_index as usize] = true;
         el.driver.send_queues[conn_index as usize].in_flight = true;
         assert_eq!(
             el.driver.park_blocker(conn_index),
@@ -5405,6 +5485,9 @@ mod tests {
     fn a_live_segment_reader_blocks_the_park() {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
+        // Offered: these cover the mechanical blockers, so the opt-in must
+        // be out of the way or every one of them would report NotOffered.
+        el.driver.park_offered[conn_index as usize] = true;
         el.driver.segment_reader_live[conn_index as usize] = true;
         assert_eq!(
             el.driver.park_blocker(conn_index),
@@ -5413,18 +5496,22 @@ mod tests {
         );
     }
 
-    /// The design decision this gate exists to encode, from the doc's open
-    /// question 5. A pinned bid is worker-local and genuinely cannot move —
-    /// but it is resolved by *copying* it to owned at move time, not by
-    /// refusing to park. Blocking here instead would let one slow reader make
-    /// a connection permanently unparkable, which is the failure mode park is
-    /// supposed to fix.
+    /// Supersedes an earlier decision, deliberately.
+    ///
+    /// #463 held that a pinned bid must not *block* a park, because waiting
+    /// for a slow reader could make a connection permanently unparkable; the
+    /// bid would be copied to owned at move time instead. That reasoning came
+    /// from the close path and does not carry: a held buffer is unconsumed
+    /// data, so the quiescent point the handler offered at has passed, and
+    /// parking would ship state deposited before a request already in flight.
+    /// Nothing becomes permanently unparkable — the handler re-offers at its
+    /// next idle point.
     ///
     /// The held buffer is placed directly rather than driven through a reader:
     /// what is under test is the gate's treatment of a held bid, not the
     /// lifecycle that produces one.
     #[test]
-    fn held_ring_buffers_do_not_block_the_park() {
+    fn held_ring_buffers_block_the_park_as_unconsumed_data() {
         for (label, place) in [
             (
                 "pinned",
@@ -5456,6 +5543,7 @@ mod tests {
         ] {
             let mut el = make_test_loop();
             let conn_index = accept_connection(&mut el);
+            el.driver.park_offered[conn_index as usize] = true;
             assert_eq!(
                 el.driver.park_blocker(conn_index),
                 None,
@@ -5464,11 +5552,189 @@ mod tests {
             place(&mut el, conn_index);
             assert_eq!(
                 el.driver.park_blocker(conn_index),
-                None,
-                "{label}: held ring buffers are converted at move time, \
-                 never a park refusal"
+                Some(ParkBlocker::DataPending),
+                "{label}: unconsumed data means the offer is stale"
             );
         }
+    }
+
+    // ── Park opt-in and carried state (tier 3, #443) ───────────────
+
+    use crate::park::ParkState;
+
+    /// The opt-in. Every other park test arms the offer by hand, so this is
+    /// the one that proves the default is *refusal* — without it, a gate that
+    /// had forgotten the check would look identical.
+    #[test]
+    fn a_connection_nobody_offered_is_never_parkable() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        assert_eq!(
+            el.driver.park_blocker(conn_index),
+            Some(ParkBlocker::NotOffered),
+            "park is opt-in: quiescent is not enough"
+        );
+        el.driver.park_offered[conn_index as usize] = true;
+        assert_eq!(
+            el.driver.park_blocker(conn_index),
+            None,
+            "and the offer is the only thing that was missing"
+        );
+    }
+
+    /// The property that makes `offer_for_park` a one-shot: arriving bytes
+    /// mean a new request, so the offer is withdrawn. Without this a park
+    /// could land mid-request and the handler would have to remember to
+    /// revoke at every entry point.
+    #[test]
+    fn arriving_data_withdraws_the_park_offer() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        el.driver.park_offered[conn_index as usize] = true;
+        el.driver
+            .park_carry
+            .insert(conn_index, ParkState::new(7u32));
+
+        // Drive the real completion path — the withdrawal has to live on the
+        // recv handler, not in a test-only helper. Same synthetic CQE shape
+        // `deliver_segment` uses: F_BUFFER | F_MORE with the bid in the high
+        // bits.
+        let data = b"GET x";
+        let bid: u16 = 0;
+        let (buf_ptr, _) = el.driver.provided_bufs.get_buffer(bid);
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr as *mut u8, data.len());
+        }
+        let flags = 1u32 | 2u32 | ((bid as u32) << 16);
+        let ud = UserData::encode(OpTag::RecvMulti, conn_index, generation);
+        el.test_dispatch_cqe(ud.raw(), data.len() as i32, flags);
+
+        assert!(
+            !el.driver.park_offered[conn_index as usize],
+            "new data means a new request: the offer must be withdrawn"
+        );
+        assert!(
+            !el.driver.park_carry.contains_key(&conn_index),
+            "and the state with it, or it would be carried at the wrong moment"
+        );
+    }
+
+    /// Slots are recycled by generation. A new occupant inheriting the
+    /// previous one's offer would be parked without asking — and would be
+    /// handed a stranger's session state.
+    #[test]
+    fn a_recycled_slot_does_not_inherit_the_park_offer() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        el.driver.park_offered[conn_index as usize] = true;
+        el.driver.park_carry.insert(conn_index, ParkState::new(1u8));
+
+        // Exercise the production clear, not a hand-written one: closing is
+        // what a recycled slot actually goes through. The previous version of
+        // this test set the flags itself and so would have passed even with
+        // every clear deleted.
+        el.driver.close_connection(conn_index);
+
+        assert!(
+            !el.driver.park_offered[conn_index as usize],
+            "close must clear the offer"
+        );
+        assert!(
+            !el.driver.park_carry.contains_key(&conn_index),
+            "and release the deposited state rather than hold it until reuse"
+        );
+    }
+
+    /// TLS state does not travel yet, so parking would hand the peer an
+    /// established session to a worker that knows nothing about it. Refused
+    /// loudly rather than silently renegotiating.
+    #[test]
+    fn a_tls_connection_is_not_parkable_yet() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        el.driver.park_offered[conn_index as usize] = true;
+        install_handshaked_tls(&mut el, conn_index);
+        assert_eq!(
+            el.driver.park_blocker(conn_index),
+            Some(ParkBlocker::TlsSession),
+            "carrying the session is unimplemented, so park must refuse"
+        );
+    }
+
+    /// The carry round trip had no coverage at all: the deposited state was
+    /// taken on one side and handed to `on_adopt` on the other, and no test
+    /// followed it across. Asserts the state actually reaches the adopting
+    /// worker's slot rather than being dropped somewhere in between.
+    #[test]
+    fn deposited_state_survives_the_park_and_reaches_the_adopt_slot() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        el.driver.park_offered[conn_index as usize] = true;
+        el.driver
+            .park_carry
+            .insert(conn_index, ParkState::new(String::from("session-7")));
+        el.driver.park_in_flight[conn_index as usize] =
+            Some(crate::backend::uring::driver::ParkInFlight {
+                target: 0,
+                generation,
+            });
+
+        let probe = FdProbe::new();
+        el.handle_park_install(park_install_ud(conn_index, generation), probe.installed);
+
+        let parked = el.driver.park_ready.pop().expect("lifted off");
+        let carried = parked
+            .state
+            .expect("the deposit travels with the connection")
+            .take::<String>()
+            .expect("and arrives as the type it was deposited as");
+        assert_eq!(carried, "session-7");
+        assert!(
+            !el.driver.park_carry.contains_key(&conn_index),
+            "and is moved, not copied — the old worker must not retain it"
+        );
+    }
+
+    /// An outbound connection has no listener, so it was never placed by
+    /// accept. Parking one used to fabricate `ListenerId(0)`; if any server
+    /// TLS config existed, the adopting worker would then install a server
+    /// session on an established outbound socket and wedge it.
+    #[test]
+    fn an_outbound_connection_is_never_parkable() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        el.driver.park_offered[conn_index as usize] = true;
+        if let Some(cs) = el.driver.connections.get_mut(conn_index) {
+            cs.listener = None;
+        }
+        assert_eq!(
+            el.driver.park_blocker(conn_index),
+            Some(ParkBlocker::Outbound),
+            "no listener means nothing for park to rebalance"
+        );
+    }
+
+    /// The backstop for the withdraw rule. Unconsumed bytes mean the
+    /// connection is not idle, whether or not the path that delivered them
+    /// remembered to withdraw the offer — so a delivery path added later
+    /// fails closed instead of parking mid-request.
+    #[test]
+    fn unconsumed_bytes_block_the_park_even_with_a_stale_offer() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        el.driver.park_offered[conn_index as usize] = true;
+        assert_eq!(el.driver.park_blocker(conn_index), None, "precondition");
+
+        // Data arrives by a path that forgot to withdraw.
+        el.driver.accumulators.append(conn_index, b"half a request");
+
+        assert_eq!(
+            el.driver.park_blocker(conn_index),
+            Some(ParkBlocker::DataPending),
+            "the gate must not rely on every delivery path remembering"
+        );
     }
 
     // ── Park handover (tier 3, #443) ───────────────────────────────
@@ -5488,6 +5754,7 @@ mod tests {
             } else {
                 vec![bytes::Bytes::copy_from_slice(bytes)]
             },
+            state: None,
             target,
         }
     }
@@ -5680,6 +5947,9 @@ mod tests {
                 target: 1,
                 generation,
             });
+        // Offered, or `NotOffered` short-circuits ahead of the term this
+        // test exists to exercise and it passes for the wrong reason.
+        el.driver.park_offered[conn_index as usize] = true;
         // Quiesce breaks while the install is in flight.
         el.driver.send_queues[conn_index as usize].in_flight = true;
         assert!(el.driver.park_blocker(conn_index).is_some(), "precondition");
@@ -5718,7 +5988,12 @@ mod tests {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
-        el.driver.accumulators.append(conn_index, b"unconsumed");
+        // Deliberately no buffered bytes: `DataPending` refuses while
+        // anything is unconsumed, so a connection that reaches a successful
+        // park is idle by construction. Carrying leftovers was the earlier
+        // design and is superseded — see
+        // `held_ring_buffers_block_the_park_as_unconsumed_data`.
+        el.driver.park_offered[conn_index as usize] = true;
         el.driver.park_in_flight[conn_index as usize] =
             Some(crate::backend::uring::driver::ParkInFlight {
                 target: 3,
@@ -5735,10 +6010,10 @@ mod tests {
         assert_eq!(el.driver.park_ready.len(), 1, "one connection lifted off");
         let parked = &el.driver.park_ready[0];
         assert_eq!(parked.target, 3);
-        let bytes: Vec<u8> = parked.pending.iter().flat_map(|b| b.to_vec()).collect();
-        assert_eq!(
-            bytes, b"unconsumed",
-            "bytes received but not consumed travel with the connection"
+        assert!(
+            parked.pending.is_empty(),
+            "an idle connection carries no bytes; the drain is defence in \
+             depth, not the normal path"
         );
         assert!(
             el.driver.park_in_flight[conn_index as usize].is_none(),
