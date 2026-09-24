@@ -5275,6 +5275,34 @@ mod tests {
         );
     }
 
+    /// Neither of the other two would notice the failure that actually
+    /// matters: a probe that answers correctly for `Send` and is cached
+    /// consistently, but reports `FixedFdInstall` unsupported on a kernel
+    /// that has it. Park would be silently dead everywhere and every test
+    /// would still be green.
+    ///
+    /// So tie the answer to the kernel actually running: at 6.8 or later the
+    /// opcode exists and `supports_park()` must be true; below it, false.
+    #[test]
+    fn park_support_agrees_with_the_running_kernel_version() {
+        let release = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+            .expect("every Linux has /proc/sys/kernel/osrelease");
+        let mut parts = release.trim().split(['.', '-', '+']);
+        let major: u32 = parts.next().unwrap_or("0").parse().unwrap_or(0);
+        let minor: u32 = parts.next().unwrap_or("0").parse().unwrap_or(0);
+        let has_opcode = (major, minor) >= (6, 8);
+
+        let el = make_test_loop();
+        assert_eq!(
+            el.driver.ring.supports_park(),
+            has_opcode,
+            "kernel {}.{} (from {release:?}) should{} support FIXED_FD_INSTALL",
+            major,
+            minor,
+            if has_opcode { "" } else { " not" }
+        );
+    }
+
     /// The stored answer must be the probed answer — catches probing or
     /// caching the wrong opcode, which no runtime behaviour would reveal
     /// until park silently never ran.
