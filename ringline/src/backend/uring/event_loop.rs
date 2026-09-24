@@ -5256,6 +5256,67 @@ mod tests {
         }
     }
 
+    // ── Opcode probe (tier 3, #443) ────────────────────────────────
+
+    /// The guard that makes a *negative* park probe trustworthy.
+    ///
+    /// `Send` is a 5.6 opcode and the crate floor is 6.1, so every kernel
+    /// that can run this backend has it. If this assertion ever fails, the
+    /// probe mechanism itself is broken — and a broken probe does not look
+    /// broken: it reports "unsupported" for everything, silently disabling
+    /// park on kernels that support it perfectly well.
+    #[test]
+    fn the_opcode_probe_answers_for_an_opcode_every_kernel_has() {
+        let el = make_test_loop();
+        assert!(
+            el.driver.ring.probe_supported(io_uring::opcode::Send::CODE),
+            "the probe reported a 5.6 opcode unsupported on a >=6.1 kernel, \
+             so the probe is broken rather than the kernel being old"
+        );
+    }
+
+    /// Neither of the other two would notice the failure that actually
+    /// matters: a probe that answers correctly for `Send` and is cached
+    /// consistently, but reports `FixedFdInstall` unsupported on a kernel
+    /// that has it. Park would be silently dead everywhere and every test
+    /// would still be green.
+    ///
+    /// So tie the answer to the kernel actually running: at 6.8 or later the
+    /// opcode exists and `supports_park()` must be true; below it, false.
+    #[test]
+    fn park_support_agrees_with_the_running_kernel_version() {
+        let release = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+            .expect("every Linux has /proc/sys/kernel/osrelease");
+        let mut parts = release.trim().split(['.', '-', '+']);
+        let major: u32 = parts.next().unwrap_or("0").parse().unwrap_or(0);
+        let minor: u32 = parts.next().unwrap_or("0").parse().unwrap_or(0);
+        let has_opcode = (major, minor) >= (6, 8);
+
+        let el = make_test_loop();
+        assert_eq!(
+            el.driver.ring.supports_park(),
+            has_opcode,
+            "kernel {}.{} (from {release:?}) should{} support FIXED_FD_INSTALL",
+            major,
+            minor,
+            if has_opcode { "" } else { " not" }
+        );
+    }
+
+    /// The stored answer must be the probed answer — catches probing or
+    /// caching the wrong opcode, which no runtime behaviour would reveal
+    /// until park silently never ran.
+    #[test]
+    fn park_support_matches_a_fresh_probe_of_the_opcode() {
+        let el = make_test_loop();
+        assert_eq!(
+            el.driver.ring.supports_park(),
+            el.driver
+                .ring
+                .probe_supported(io_uring::opcode::FixedFdInstall::CODE),
+        );
+    }
+
     // ── Park drain (tier 3, #443) ──────────────────────────────────
 
     /// Wire order is the property under test, and it is the one a

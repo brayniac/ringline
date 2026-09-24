@@ -34,6 +34,14 @@ pub struct Ring {
     /// set, the kernel runs task_work — and so posts the CQEs it generates —
     /// only on an `io_uring_enter` carrying `IORING_ENTER_GETEVENTS`.
     defer_taskrun: bool,
+    /// Whether the kernel supports `IORING_OP_FIXED_FD_INSTALL` (6.8+).
+    ///
+    /// Park (tier 3, #443) has to hand a real fd to another worker, but an
+    /// established connection's fd lives only in this ring's fixed-file
+    /// table — `install_accepted` closes the raw fd once it is registered.
+    /// This opcode is the only way to get one back, so it decides whether
+    /// park is available at all. See [`Ring::supports_park`].
+    fixed_fd_install: bool,
     /// Test-only: number of upcoming `push_sqe`/`push_sqe128` calls that
     /// fail as if the SQ were still full after a submit. See
     /// [`Ring::force_push_failures`].
@@ -72,14 +80,58 @@ impl Ring {
             .build(config.sq_entries)
             .map_err(Error::ring_setup)?;
 
+        // Probed once here rather than per park: the answer cannot change for
+        // the life of the ring, and a failed probe is not a setup failure —
+        // it only means park is unavailable.
+        let fixed_fd_install = {
+            let mut probe = io_uring::Probe::new();
+            match ring.submitter().register_probe(&mut probe) {
+                Ok(()) => probe.is_supported(opcode::FixedFdInstall::CODE),
+                // `IORING_REGISTER_PROBE` is 5.6 and the crate floor is 6.1,
+                // so this should not happen — but a refused probe means
+                // "assume not supported", never "fail to start".
+                Err(_) => false,
+            }
+        };
+
         Ok(Ring {
             ring,
             bgid: config.recv_buffer.bgid,
             chain_scratch: Vec::new(),
             defer_taskrun: !config.sqpoll,
+            fixed_fd_install,
             #[cfg(test)]
             forced_push_failures: 0,
         })
+    }
+
+    /// Whether this kernel can return a registered fd to the process table,
+    /// and so whether park (tier 3, #443) is available.
+    ///
+    /// Requires Linux 6.8 for `IORING_OP_FIXED_FD_INSTALL`. The crate floor
+    /// stays at 6.1: below 6.8 park is simply unavailable, and nothing else
+    /// changes. That is a smaller loss than it sounds, because park exists
+    /// only to repair the placement imbalance
+    /// [`AcceptMode::Merged`](crate::AcceptMode::Merged) introduces — the
+    /// default [`Pool`](crate::AcceptMode::Pool) mode places by round-robin
+    /// and has nothing to rebalance. A pre-6.8 deployment that wants even
+    /// placement stays on the default and loses nothing.
+    #[allow(dead_code)] // first caller lands with the handover (#443 step 5c)
+    pub(crate) fn supports_park(&self) -> bool {
+        self.fixed_fd_install
+    }
+
+    /// Re-probe an arbitrary opcode. Exists so tests can establish that the
+    /// probe mechanism answers at all — a probe that silently reported
+    /// everything unsupported would disable park permanently and look
+    /// exactly like an old kernel.
+    #[cfg(test)]
+    pub(crate) fn probe_supported(&self, code: u8) -> bool {
+        let mut probe = io_uring::Probe::new();
+        match self.ring.submitter().register_probe(&mut probe) {
+            Ok(()) => probe.is_supported(code),
+            Err(_) => false,
+        }
     }
 
     /// Register a sparse fixed-buffer table sized to the registry, then
