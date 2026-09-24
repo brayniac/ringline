@@ -2133,7 +2133,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         if self.driver.park_in_flight[conn_index as usize].is_some() {
             return false;
         }
-        if self.driver.park_blocker(conn_index).is_some() {
+        if !self.driver.is_parkable(conn_index) {
             return false;
         }
         let generation = self.driver.connections.generation(conn_index);
@@ -2214,7 +2214,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             return; // `fd` drops, closing this reference.
         }
         // Quiesce can have broken across the round trip.
-        if self.driver.park_blocker(conn_index).is_some() {
+        if !self.driver.is_parkable(conn_index) {
             return; // `fd` drops.
         }
 
