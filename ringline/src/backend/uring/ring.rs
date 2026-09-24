@@ -688,6 +688,47 @@ impl Ring {
     }
 
     /// Submit an async cancel targeting a specific user_data value.
+    /// Recover a real fd for a registered connection, so it can be handed to
+    /// another worker (tier 3, #443).
+    ///
+    /// When `cancel_recv_user_data` is given, an `AsyncCancel` for the armed
+    /// multishot recv is pushed first with `IOSQE_IO_LINK`, so the kernel
+    /// runs it *before* the install. That ordering is load-bearing: an armed
+    /// multishot recv pins the socket independently of the fixed-file table
+    /// (see `try_finalize_close`), so a recv left armed on this worker would
+    /// keep consuming bytes from a socket already handed to another one.
+    ///
+    /// A link is all-or-nothing: if the cancel fails — most likely `ENOENT`
+    /// because the recv self-terminated between the check and the kernel
+    /// running it — the install is completed with `ECANCELED` instead. The
+    /// caller treats that as "abandon this park and try again later", which
+    /// is the correct outcome rather than an error: park is best-effort.
+    pub fn submit_park_install(
+        &mut self,
+        conn_index: u32,
+        generation: u32,
+        cancel_recv_user_data: Option<u64>,
+    ) -> io::Result<()> {
+        if let Some(target) = cancel_recv_user_data {
+            let cancel_ud = UserData::encode(OpTag::Cancel, conn_index, 0);
+            let cancel = opcode::AsyncCancel::new(target)
+                .build()
+                .flags(squeue::Flags::IO_LINK)
+                .user_data(cancel_ud.raw());
+            unsafe {
+                self.push_sqe(&cancel)?;
+            }
+        }
+        let ud = UserData::encode(OpTag::ParkInstall, conn_index, generation);
+        let entry = opcode::FixedFdInstall::new(Fixed(conn_index), 0)
+            .build()
+            .user_data(ud.raw());
+        unsafe {
+            self.push_sqe(&entry)?;
+        }
+        Ok(())
+    }
+
     pub fn submit_async_cancel(
         &mut self,
         target_user_data: u64,

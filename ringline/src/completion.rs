@@ -93,6 +93,11 @@ pub enum OpTag {
     /// unused. One CQE per accepted connection; `IORING_CQE_F_MORE` says the
     /// arm is still live, and its absence means re-arm.
     AcceptMulti = 31,
+    /// `IORING_OP_FIXED_FD_INSTALL` issued to recover a real fd for a
+    /// connection being parked onto another worker (tier 3, #443). The
+    /// payload carries the connection generation, so a CQE that outlived
+    /// its slot is rejected.
+    ParkInstall = 32,
 }
 
 impl OpTag {
@@ -130,6 +135,7 @@ impl OpTag {
             29 => Some(OpTag::ForwardWrite),
             30 => Some(OpTag::ForwardWritePollOut),
             31 => Some(OpTag::AcceptMulti),
+            32 => Some(OpTag::ParkInstall),
             _ => None,
         }
     }

@@ -345,6 +345,13 @@ pub(crate) struct Driver {
     /// under `try_with_state`, or `close_connection` under `&mut Driver`)
     /// replenishes the bid exactly once; the other sees `None` and does nothing.
     pub(crate) segment_pinned: Vec<Option<HeldRecvBuf>>,
+    /// Parks awaiting their `FixedFdInstall` CQE, one slot per connection.
+    /// Also the guard against submitting a second park for the same
+    /// connection while the first is outstanding.
+    pub(crate) park_in_flight: Vec<Option<ParkInFlight>>,
+    /// Connections lifted off this worker, waiting to be handed over.
+    /// `OwnedFd` means an entry left here is closed rather than leaked.
+    pub(crate) park_ready: Vec<ParkedFd>,
     /// A `SegmentReader` is live on this connection.
     ///
     /// A reader owns the connection's delivery discipline for its whole
@@ -658,6 +665,34 @@ pub(crate) struct Driver {
     pub(crate) fs_fd_base: u32,
 }
 
+/// A connection lifted off this worker and ready to hand to another
+/// (tier 3, #443). Every field is owned and `Send`.
+///
+/// The fd is a *second* reference to the socket, obtained via
+/// `IORING_OP_FIXED_FD_INSTALL`. That is what lets the ordinary teardown path
+/// run on the parking worker — closing the fixed-file entry drops per-worker
+/// state without sending a FIN, because this handle keeps the socket alive.
+#[allow(dead_code)] // consumed by the handover (#443, next step)
+pub(crate) struct ParkedFd {
+    pub fd: std::os::fd::OwnedFd,
+    pub listener: crate::ListenerId,
+    pub peer: crate::connection::PeerAddr,
+    /// Received but unconsumed bytes, in wire order.
+    pub pending: Vec<bytes::Bytes>,
+    /// Worker index this connection is bound for.
+    pub target: usize,
+}
+
+/// A park in flight: the `FixedFdInstall` has been submitted and its CQE has
+/// not landed yet.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ParkInFlight {
+    pub target: usize,
+    /// Generation at submit time. A CQE carrying a different one belongs to a
+    /// previous occupant of the slot.
+    pub generation: u32,
+}
+
 /// Why a connection cannot be parked (tier 3, #443) right now.
 ///
 /// Park moves a live connection to another worker: quiesce, hand the fd over
@@ -878,6 +913,8 @@ impl Driver {
                 .map(|_| std::collections::VecDeque::new())
                 .collect(),
             segment_pinned: vec![None; config.max_connections as usize],
+            park_in_flight: vec![None; config.max_connections as usize],
+            park_ready: Vec::new(),
             segment_reader_live: vec![false; config.max_connections as usize],
             recv_half_taken: vec![false; config.max_connections as usize],
             send_half_taken: vec![false; config.max_connections as usize],
