@@ -355,12 +355,26 @@ pub(crate) struct Driver {
     pub(crate) park_offered: Vec<bool>,
     /// State the handler deposited alongside the offer, carried to the
     /// adopting worker and handed to `on_adopt`.
-    pub(crate) park_carry: Vec<Option<crate::park::ParkState>>,
-    /// Set for the duration of one adopt install, so `spawn_accept_task`
-    /// calls `on_adopt` rather than `on_accept`, and with what the handler
+    ///
+    /// Sparse on purpose. A dense `Vec<Option<ParkState>>` costs 32 bytes per
+    /// slot — half a megabyte per worker at the default `max_connections`,
+    /// tens of megabytes on a large box — for entries that only exist while a
+    /// handler is actively offering. The hot path never reaches here anyway:
+    /// `park_offered` is the dense bool that gates it.
+    pub(crate) park_carry: std::collections::HashMap<u32, crate::park::ParkState>,
+    /// Per connection: this slot is being adopted, so `spawn_accept_task`
+    /// calls `on_adopt` rather than `on_accept`, with what the handler
     /// deposited. The outer `Option` is "this install is an adopt"; the inner
     /// is "and here is the state, if any".
-    pub(crate) adopting: Option<Option<crate::park::ParkState>>,
+    ///
+    /// Per-connection rather than a single slot because the install is not
+    /// always synchronous: the TLS branch of `install_accepted_with_pending`
+    /// returns early and defers the spawn until the handshake completes. A
+    /// single slot cleared when the install returned would be empty by then,
+    /// and the adopt would silently become an accept.
+    /// Sparse for the same reason as `park_carry`: an entry exists only
+    /// between an adopt's install and its (possibly deferred) task spawn.
+    pub(crate) adopt_pending: std::collections::HashMap<u32, Option<crate::park::ParkState>>,
     /// Parks awaiting their `FixedFdInstall` CQE, one slot per connection.
     /// Also the guard against submitting a second park for the same
     /// connection while the first is outstanding.
@@ -714,6 +728,15 @@ pub(crate) enum ParkBlocker {
     /// Not an established, open connection — still handshaking, still
     /// connecting, or already tearing down. Nothing to move yet.
     NotOpen,
+    /// Bytes have arrived and not been consumed. Whatever the handler
+    /// offered at, this connection is no longer idle.
+    DataPending,
+    /// The armed recv is not one `begin_park` can cancel, so the socket
+    /// cannot safely leave this worker.
+    RecvArmNotCancellable,
+    /// An outbound connection. It has no listener, so it was never placed by
+    /// accept and there is no placement imbalance for park to repair.
+    Outbound,
     /// The handler has not offered this connection via `offer_for_park`.
     /// Park is opt-in, so this is the common answer, not an error.
     NotOffered,
@@ -921,9 +944,9 @@ impl Driver {
                 .map(|_| std::collections::VecDeque::new())
                 .collect(),
             segment_pinned: vec![None; config.max_connections as usize],
-            adopting: None,
+            adopt_pending: std::collections::HashMap::new(),
             park_offered: vec![false; config.max_connections as usize],
-            park_carry: (0..config.max_connections).map(|_| None).collect(),
+            park_carry: std::collections::HashMap::new(),
             park_in_flight: vec![None; config.max_connections as usize],
             park_ready: Vec::new(),
             peer_park: config.peer_park.clone(),
@@ -1627,6 +1650,12 @@ impl Driver {
         }
         self.forward_zc_consumed[conn_index as usize] = 0;
         self.recv_forward[conn_index as usize] = false;
+        // Release handler state here rather than waiting for the slot to be
+        // reused: a `ParkState` is an arbitrary user value, and a slot that is
+        // never reused would hold it for the life of the process.
+        self.park_offered[conn_index as usize] = false;
+        self.park_carry.remove(&conn_index);
+        self.adopt_pending.remove(&conn_index);
         // Do NOT drain held segmented-recv buffers here. When a peer FIN drives
         // this close, a parked Mode B reader must still consume the bytes already
         // held — draining them now (before the woken reader is polled) would
@@ -1884,6 +1913,18 @@ impl Driver {
             return Some(ParkBlocker::Closing);
         }
 
+        // Park exists to repair accept-time placement, and an outbound
+        // connection was never placed by accept — it has no listener at all.
+        // Refusing here also retires a fabricated identity downstream:
+        // `handle_park_install` used to fall back to `ListenerId(0)` for a
+        // connection that never had one, and if the process has any server
+        // TLS config the adopting worker would then install a *server* rustls
+        // session on an established outbound socket, defer the spawn, and
+        // wedge the connection waiting for a ClientHello.
+        if conn.listener.is_none() {
+            return Some(ParkBlocker::Outbound);
+        }
+
         // A TLS connection's session lives in this worker's `TlsTable`, and
         // carrying it is not implemented yet — adopting would install a fresh
         // entry and the peer would face a renegotiation on an established
@@ -1892,6 +1933,29 @@ impl Driver {
         // `UnbufferedConn` is plain owned data and moves as one value).
         if self.tls_table.as_ref().is_some_and(|t| t.has(conn_index)) {
             return Some(ParkBlocker::TlsSession);
+        }
+
+        // Backstop for the withdraw-on-recv rule, and the reason it is a
+        // state check rather than another event hook: bytes that arrived and
+        // have not been consumed make the connection un-idle whether or not
+        // the path that delivered them remembered to withdraw the offer. A
+        // delivery path added later gets this for free.
+        if !self.accumulators.is_empty(conn_index)
+            || !self.segment_hold[conn_index as usize].is_empty()
+            || !self.recv_hold[conn_index as usize].is_empty()
+            || self.segment_pinned[conn_index as usize].is_some()
+        {
+            return Some(ParkBlocker::DataPending);
+        }
+
+        // `begin_park` cancels the armed recv by its `RecvMulti` user_data.
+        // A `MsgMulti` arm (the `timestamps` feature) would not match, so the
+        // socket would be handed over with a recv still draining it here.
+        if !matches!(
+            self.connections.get(conn_index).map(|c| c.recv_arm),
+            Some(crate::connection::RecvArm::Multi) | Some(crate::connection::RecvArm::Idle)
+        ) {
+            return Some(ParkBlocker::RecvArmNotCancellable);
         }
 
         // The handler's offer is the opt-in, and it is checked before any

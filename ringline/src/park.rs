@@ -50,13 +50,23 @@ pub(crate) struct ParkedFd {
 /// types, so the wrong type fails on the first test run rather than silently
 /// adopting with no state.
 ///
-/// ```ignore
-/// // deposit, after finishing a response
-/// conn.offer_for_park(Some(ParkState::new(Session { db: 3 })));
+/// ```
+/// use ringline::ParkState;
+///
+/// struct Session { db: u8 }
+///
+/// // deposit, after finishing a response:
+/// //   conn.offer_for_park(Some(ParkState::new(Session { db: 3 })));
+/// let deposited = ParkState::new(Session { db: 3 });
 ///
 /// // and on the worker that adopts it
-/// let session = state.and_then(ParkState::take::<Session>);
+/// let session = deposited.take::<Session>().expect("same type");
+/// assert_eq!(session.db, 3);
 /// ```
+///
+/// This example is deliberately a real doctest rather than `ignore`: it is
+/// what proves the type is actually reachable from outside the crate. It was
+/// not, and nothing noticed.
 pub struct ParkState {
     value: Box<dyn std::any::Any + Send>,
     /// Captured at deposit so a mismatch can name both sides. A `dyn Any`
