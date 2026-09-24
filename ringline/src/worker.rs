@@ -898,6 +898,21 @@ impl RinglineBuilder {
             worker_wake_handles.push(wake_handle);
         }
 
+        // Park channels (tier 3, #443): a sibling of the accept channels so
+        // the mio backend, which has neither merged accept nor park, is not
+        // made to carry a variant it can never receive. Bounded for the same
+        // reason as the accept channels — a slow worker must apply
+        // backpressure rather than queue connections without limit.
+        let mut park_txs = Vec::with_capacity(num_threads);
+        let mut park_rxs = Vec::with_capacity(num_threads);
+        for _ in 0..num_threads {
+            let (tx, rx) = crossbeam_channel::bounded::<crate::park::ParkedFd>(
+                self.config.accept_queue_capacity,
+            );
+            park_txs.push(tx);
+            park_rxs.push(rx);
+        }
+
         let shutdown_flag = Arc::new(AtomicBool::new(false));
 
         // Create resolver pool if configured.
@@ -1091,6 +1106,14 @@ impl RinglineBuilder {
                     .zip(worker_wake_fds.iter().copied())
                     .collect();
             }
+            if worker_loads.is_some() {
+                config.peer_park = park_txs
+                    .iter()
+                    .cloned()
+                    .zip(worker_wake_fds.iter().copied())
+                    .collect();
+            }
+            config.park_rx = Some(park_rxs.remove(0));
             let rx = worker_rxs.remove(0);
             // (read end for polling, write end for cross-thread wakes —
             // on the mio backend these are the two ends of a pipe; the

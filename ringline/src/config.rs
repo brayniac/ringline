@@ -266,6 +266,19 @@ pub struct Config {
         crossbeam_channel::Sender<crate::acceptor::AcceptedConn>,
         crate::wakeup::WakeFd,
     )>,
+    /// Every worker's park channel and wake handle, for handing a connection
+    /// lifted off this worker to its new one (tier 3, #443).
+    ///
+    /// A sibling of `peer_accept` rather than a variant on it: the mio
+    /// backend drains `peer_accept` too, and has neither merged accept nor
+    /// park, so folding park into that type would put a permanently dead arm
+    /// in a backend that cannot reach it.
+    pub(crate) peer_park: Vec<(
+        crossbeam_channel::Sender<crate::park::ParkedFd>,
+        crate::wakeup::WakeFd,
+    )>,
+    /// This worker's receiving end of the park channel.
+    pub(crate) park_rx: Option<crossbeam_channel::Receiver<crate::park::ParkedFd>>,
     /// Print per-worker event-loop diagnostics to stderr at shutdown: the
     /// iteration mix (`[ringline diag]`) and wait/work stall buckets
     /// (`[ringline stall]`). The stall buckets cost ~4 clock reads per
@@ -429,6 +442,8 @@ impl Default for Config {
             worker_loads: None,
             worker_accepting: None,
             peer_accept: Vec::new(),
+            peer_park: Vec::new(),
+            park_rx: None,
             loop_diag: false,
             #[cfg(feature = "timestamps")]
             timestamps: false,

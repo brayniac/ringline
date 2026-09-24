@@ -302,6 +302,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
             self.drain_completions();
             diag_cqes_1st += self.driver.cqe_batch.len() as u64;
+            // `handle_park_install` fills `park_ready` from the completions
+            // just drained. Hand those over in the same iteration: the
+            // connections have already left this worker and only the
+            // `OwnedFd` is keeping their sockets alive.
+            self.drain_park_ready();
 
             // Check for shutdown after processing completions.
             if self.driver.shutdown_local || self.driver.shutdown_flag.load(Ordering::Relaxed) {
@@ -1893,6 +1898,61 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// mode) and a multishot accept CQE (merged mode). Consumes `raw_fd` — it
     /// is registered into the fixed-file table and then closed, or closed on
     /// any failure along the way.
+    /// Hand every lifted-off connection to the worker it was parked for.
+    ///
+    /// A connection in `park_ready` has already left this worker: its slot is
+    /// released and its future dropped. Only the `OwnedFd` keeps the socket
+    /// alive, so an entry dropped here closes a live client connection. That
+    /// is why a full channel puts the entry back rather than discarding it —
+    /// the target is busy, not gone, and the next iteration will retry.
+    ///
+    /// A disconnected channel is the one case with no recovery: the target
+    /// worker has exited, so the connection is dropped and the peer sees the
+    /// close. Nothing else can happen to it.
+    fn drain_park_ready(&mut self) {
+        if self.driver.park_ready.is_empty() {
+            return;
+        }
+        let mut retry = Vec::new();
+        for parked in std::mem::take(&mut self.driver.park_ready) {
+            let Some((tx, wake)) = self.driver.peer_park.get(parked.target) else {
+                continue; // no such worker; `parked` drops and closes.
+            };
+            match tx.try_send(parked) {
+                Ok(()) => wake.wake(),
+                Err(crossbeam_channel::TrySendError::Full(p)) => retry.push(p),
+                // Target gone: nothing to retry onto.
+                Err(crossbeam_channel::TrySendError::Disconnected(_)) => {}
+            }
+        }
+        self.driver.park_ready = retry;
+    }
+
+    /// Adopt connections other workers parked onto this one.
+    ///
+    /// The parking worker cancelled its multishot recv before recovering the
+    /// fd — linked ahead of the install, so the cancel is guaranteed to have
+    /// run by the time the entry reached its channel. That is what makes it
+    /// safe to arm a recv here: no other worker is still reading this socket.
+    fn drain_adopted(&mut self) {
+        let Some(rx) = self.driver.park_rx.clone() else {
+            return;
+        };
+        while let Ok(parked) = rx.try_recv() {
+            let crate::park::ParkedFd {
+                fd,
+                listener,
+                peer,
+                pending,
+                ..
+            } = parked;
+            // `install_accepted_with_pending` registers the fd and closes this
+            // handle, exactly as it does for a freshly accepted one.
+            let raw = std::os::fd::IntoRawFd::into_raw_fd(fd);
+            self.install_accepted_with_pending(raw, listener, peer, pending);
+        }
+    }
+
     /// Begin parking `conn_index` onto worker `target` (tier 3, #443).
     ///
     /// Recovering the fd is asynchronous, so this only submits; the decision
@@ -2013,15 +2073,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // shutdown could not have passed the gate, so no FIN is queued.
         self.driver.close_connection(conn_index);
 
-        self.driver
-            .park_ready
-            .push(crate::backend::uring::driver::ParkedFd {
-                fd,
-                listener,
-                peer,
-                pending,
-                target: in_flight.target,
-            });
+        self.driver.park_ready.push(crate::park::ParkedFd {
+            fd,
+            listener,
+            peer,
+            pending,
+            target: in_flight.target,
+        });
     }
 
     fn install_accepted(
@@ -2029,6 +2087,24 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         raw_fd: std::os::fd::RawFd,
         listener: crate::ListenerId,
         peer_addr: crate::connection::PeerAddr,
+    ) {
+        self.install_accepted_with_pending(raw_fd, listener, peer_addr, Vec::new())
+    }
+
+    /// As [`Self::install_accepted`], but seeds the accumulator with bytes
+    /// that arrived before the connection got here — the unconsumed remainder
+    /// carried by a park (tier 3, #443).
+    ///
+    /// Seeded *before* `arm_recv`, so a handler polled on this worker sees the
+    /// carried bytes ahead of anything the new recv delivers. Appending after
+    /// would put freshly received bytes in front of older ones and silently
+    /// reorder the peer's stream.
+    fn install_accepted_with_pending(
+        &mut self,
+        raw_fd: std::os::fd::RawFd,
+        listener: crate::ListenerId,
+        peer_addr: crate::connection::PeerAddr,
+        pending: Vec<bytes::Bytes>,
     ) {
         let conn_index = match self.driver.connections.allocate() {
             Some(idx) => idx,
@@ -2067,6 +2143,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.driver.accumulators.reset(conn_index);
         self.driver.reset_segment_state(conn_index);
         self.driver.reset_send_state(conn_index);
+        for chunk in &pending {
+            self.driver.accumulators.append(conn_index, chunk);
+        }
         self.arm_recv(conn_index);
 
         // TLS path: defer accept until handshake completes.
@@ -2257,6 +2336,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     }
 
     fn handle_eventfd_read(&mut self) {
+        // Parked connections share this wake. Drained first: a connection
+        // here has no worker at all until it is installed, where a queued
+        // accept is merely waiting.
+        self.drain_adopted();
         // `launch()` wakes every worker right after it listens on the merged
         // sockets, so this is where the arm actually happens — the call in
         // `run()` runs before the gate is up and is only for a worker that
@@ -5386,6 +5469,112 @@ mod tests {
                  never a park refusal"
             );
         }
+    }
+
+    // ── Park handover (tier 3, #443) ───────────────────────────────
+
+    fn parked_entry(target: usize, bytes: &[u8]) -> crate::park::ParkedFd {
+        let probe = FdProbe::new();
+        let fd = unsafe {
+            <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(probe.installed)
+        };
+        std::mem::forget(probe); // the fd now belongs to the ParkedFd
+        crate::park::ParkedFd {
+            fd,
+            listener: crate::ListenerId::from_index(0),
+            peer: crate::connection::PeerAddr::Tcp(std::net::SocketAddr::from(([127, 0, 0, 1], 9))),
+            pending: if bytes.is_empty() {
+                Vec::new()
+            } else {
+                vec![bytes::Bytes::copy_from_slice(bytes)]
+            },
+            target,
+        }
+    }
+
+    /// A full target channel must not drop the entry. The connection has
+    /// already left this worker — its slot is released and its future gone —
+    /// so only the `OwnedFd` keeps the socket alive. Dropping it here hangs
+    /// up on a live client because the target was momentarily busy.
+    #[test]
+    fn a_full_target_channel_retries_rather_than_hanging_up() {
+        let mut el = make_test_loop();
+        let (tx, _rx) = crossbeam_channel::bounded::<crate::park::ParkedFd>(1);
+        let (_read, wake) = crate::wakeup::create_wake_fd().expect("wake fd");
+        el.driver.peer_park = vec![(tx.clone(), wake.as_wake_fd())];
+
+        // Fill the channel, then queue one more than it can take.
+        tx.try_send(parked_entry(0, b"")).expect("first fits");
+        el.driver.park_ready.push(parked_entry(0, b"carried"));
+
+        el.drain_park_ready();
+
+        assert_eq!(
+            el.driver.park_ready.len(),
+            1,
+            "a busy target means retry next iteration, never drop the connection"
+        );
+    }
+
+    /// A target that no longer exists is the one unrecoverable case, and it
+    /// must not wedge the queue by retrying for ever.
+    #[test]
+    fn a_park_for_a_missing_worker_is_dropped_not_retried() {
+        let mut el = make_test_loop();
+        el.driver.peer_park = Vec::new();
+        el.driver.park_ready.push(parked_entry(7, b""));
+
+        el.drain_park_ready();
+
+        assert!(
+            el.driver.park_ready.is_empty(),
+            "no such worker: retrying would spin for ever"
+        );
+    }
+
+    #[test]
+    fn a_successful_handover_clears_the_queue_and_reaches_the_target() {
+        let mut el = make_test_loop();
+        let (tx, rx) = crossbeam_channel::bounded::<crate::park::ParkedFd>(4);
+        let (_read, wake) = crate::wakeup::create_wake_fd().expect("wake fd");
+        el.driver.peer_park = vec![(tx, wake.as_wake_fd())];
+        el.driver.park_ready.push(parked_entry(0, b"carried"));
+
+        el.drain_park_ready();
+
+        assert!(el.driver.park_ready.is_empty(), "handed over");
+        let got = rx.try_recv().expect("the target received it");
+        let bytes: Vec<u8> = got.pending.iter().flat_map(|b| b.to_vec()).collect();
+        assert_eq!(bytes, b"carried", "unconsumed bytes travel with it");
+    }
+
+    /// The adopting worker must present carried bytes to the handler before
+    /// anything its own recv delivers. Seeding after `arm_recv` would put
+    /// newer bytes ahead of older ones and silently reorder the stream.
+    #[test]
+    fn an_adopted_connection_starts_with_its_carried_bytes() {
+        let mut el = make_test_loop();
+        let (tx, rx) = crossbeam_channel::bounded::<crate::park::ParkedFd>(4);
+        el.driver.park_rx = Some(rx);
+        tx.try_send(parked_entry(0, b"before-the-move"))
+            .expect("queue");
+        drop(tx);
+
+        el.drain_adopted();
+
+        let installed = (0..el.driver.connections.capacity())
+            .find(|&i| {
+                el.driver
+                    .connections
+                    .get(i)
+                    .is_some_and(|c| c.active && c.peer_addr.is_some())
+            })
+            .expect("the adopted connection took a slot");
+        assert_eq!(
+            el.driver.accumulators.data(installed),
+            b"before-the-move",
+            "carried bytes are readable before the new recv delivers anything"
+        );
     }
 
     // ── Park fd recovery (tier 3, #443) ────────────────────────────
