@@ -1158,6 +1158,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
         match tag {
             OpTag::AcceptMulti => self.handle_accept_multi(ud, result, flags),
+            OpTag::ParkInstall => self.handle_park_install(ud, result),
             OpTag::RecvMulti => self.handle_recv_multi(ud, result, flags),
             OpTag::RecvFallback => self.handle_recv_fallback(ud, result),
             OpTag::Send => self.handle_send(ud, result),
@@ -1892,6 +1893,132 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// mode) and a multishot accept CQE (merged mode). Consumes `raw_fd` — it
     /// is registered into the fixed-file table and then closed, or closed on
     /// any failure along the way.
+    /// Begin parking `conn_index` onto worker `target` (tier 3, #443).
+    ///
+    /// Recovering the fd is asynchronous, so this only submits; the decision
+    /// to actually move is taken in [`Self::handle_park_install`] once the
+    /// CQE lands. Returns whether the submission went out.
+    #[allow(dead_code)] // driven by policy (#443 step 5e)
+    fn begin_park(&mut self, conn_index: u32, target: usize) -> bool {
+        if !self.driver.ring.supports_park() {
+            return false;
+        }
+        if target == self.driver.worker_index {
+            return false;
+        }
+        if self.driver.park_in_flight[conn_index as usize].is_some() {
+            return false;
+        }
+        if self.driver.park_blocker(conn_index).is_some() {
+            return false;
+        }
+        let generation = self.driver.connections.generation(conn_index);
+
+        // Cancel the armed multishot recv *ahead of* the install, linked, so
+        // the kernel orders them. A recv left armed here would keep draining a
+        // socket that now belongs to another worker.
+        let cancel_target = self
+            .driver
+            .connections
+            .get(conn_index)
+            .is_some_and(|c| c.recv_multishot_armed)
+            .then(|| {
+                crate::completion::UserData::encode(
+                    crate::completion::OpTag::RecvMulti,
+                    conn_index,
+                    generation,
+                )
+                .raw()
+            });
+
+        if self
+            .driver
+            .ring
+            .submit_park_install(conn_index, generation, cancel_target)
+            .is_err()
+        {
+            // SQ pressure is backpressure, not failure (Domain Invariant 7).
+            return false;
+        }
+        self.driver.park_in_flight[conn_index as usize] =
+            Some(crate::backend::uring::driver::ParkInFlight { target, generation });
+        true
+    }
+
+    /// The `FixedFdInstall` CQE: decide whether the park still makes sense.
+    ///
+    /// The connection was quiescent when the install was submitted, but it
+    /// stayed fully live across the round trip — data can have arrived, the
+    /// peer can have sent FIN, the handler can have queued a send, and the
+    /// slot can even have been recycled. So the gate is re-checked here, and
+    /// anything short of "still parkable" abandons the move.
+    ///
+    /// `result` is a real fd on success. Every abandon path must close it:
+    /// it is a second reference to the socket, and leaking it would keep the
+    /// peer from ever seeing a FIN.
+    fn handle_park_install(&mut self, ud: crate::completion::UserData, result: i32) {
+        let conn_index = ud.conn_index();
+        let Some(in_flight) = self.driver.park_in_flight[conn_index as usize].take() else {
+            // No park outstanding: a stray or duplicated CQE. Still close the
+            // fd, or the socket reference leaks.
+            if result >= 0 {
+                unsafe { libc::close(result) };
+            }
+            return;
+        };
+
+        // A failed install, or an `ECANCELED` from the linked recv-cancel
+        // failing (the recv self-terminated first). Neither is an error —
+        // park is best-effort and policy can try again later.
+        if result < 0 {
+            return;
+        }
+        // SAFETY: a non-negative `FixedFdInstall` result is a fresh fd owned
+        // by this process; nothing else holds it.
+        let fd = {
+            use std::os::fd::FromRawFd;
+            unsafe { std::os::fd::OwnedFd::from_raw_fd(result) }
+        };
+
+        // The slot may have been recycled while the install was in flight.
+        if self.driver.connections.generation(conn_index) != in_flight.generation {
+            return; // `fd` drops, closing this reference.
+        }
+        // Quiesce can have broken across the round trip.
+        if self.driver.park_blocker(conn_index).is_some() {
+            return; // `fd` drops.
+        }
+
+        let (listener, peer) = match self.driver.connections.get(conn_index) {
+            Some(cs) => (
+                cs.listener.unwrap_or(crate::ListenerId::from_index(0)),
+                cs.peer_addr
+                    .clone()
+                    .unwrap_or(crate::connection::PeerAddr::Tcp(
+                        std::net::SocketAddr::from(([0, 0, 0, 0], 0)),
+                    )),
+            ),
+            None => return,
+        };
+        let pending = self.driver.take_pending_for_park(conn_index);
+
+        // Ordinary teardown. It closes the fixed-file entry and drops the
+        // handler future, but does *not* FIN: `fd` above is a second
+        // reference keeping the socket open. A connection with a pending
+        // shutdown could not have passed the gate, so no FIN is queued.
+        self.driver.close_connection(conn_index);
+
+        self.driver
+            .park_ready
+            .push(crate::backend::uring::driver::ParkedFd {
+                fd,
+                listener,
+                peer,
+                pending,
+                target: in_flight.target,
+            });
+    }
+
     fn install_accepted(
         &mut self,
         raw_fd: std::os::fd::RawFd,
