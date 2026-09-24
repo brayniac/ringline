@@ -5256,6 +5256,39 @@ mod tests {
         }
     }
 
+    // ── Opcode probe (tier 3, #443) ────────────────────────────────
+
+    /// The guard that makes a *negative* park probe trustworthy.
+    ///
+    /// `Send` is a 5.6 opcode and the crate floor is 6.1, so every kernel
+    /// that can run this backend has it. If this assertion ever fails, the
+    /// probe mechanism itself is broken — and a broken probe does not look
+    /// broken: it reports "unsupported" for everything, silently disabling
+    /// park on kernels that support it perfectly well.
+    #[test]
+    fn the_opcode_probe_answers_for_an_opcode_every_kernel_has() {
+        let el = make_test_loop();
+        assert!(
+            el.driver.ring.probe_supported(io_uring::opcode::Send::CODE),
+            "the probe reported a 5.6 opcode unsupported on a >=6.1 kernel, \
+             so the probe is broken rather than the kernel being old"
+        );
+    }
+
+    /// The stored answer must be the probed answer — catches probing or
+    /// caching the wrong opcode, which no runtime behaviour would reveal
+    /// until park silently never ran.
+    #[test]
+    fn park_support_matches_a_fresh_probe_of_the_opcode() {
+        let el = make_test_loop();
+        assert_eq!(
+            el.driver.ring.supports_park(),
+            el.driver
+                .ring
+                .probe_supported(io_uring::opcode::FixedFdInstall::CODE),
+        );
+    }
+
     // ── Park drain (tier 3, #443) ──────────────────────────────────
 
     /// Wire order is the property under test, and it is the one a
