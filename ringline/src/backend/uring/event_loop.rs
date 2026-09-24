@@ -2150,9 +2150,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         listener: crate::ListenerId,
         peer_addr: crate::connection::PeerAddr,
         pending: Vec<bytes::Bytes>,
-        /// `Some` when this install is an adopt; the inner value is what the
-        /// handler deposited. Recorded per connection so the TLS branch's
-        /// deferred spawn still finds it.
+        // `adopt` is `Some` when this install is an adopt; the inner value is
+        // what the handler deposited. Recorded per connection so the TLS
+        // branch's deferred spawn still finds it.
         adopt: Option<Option<crate::park::ParkState>>,
     ) {
         let conn_index = match self.driver.connections.allocate() {

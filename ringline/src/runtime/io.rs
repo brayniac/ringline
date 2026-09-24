@@ -929,7 +929,16 @@ impl ConnCtx {
                 let idx = self.conn_index as usize;
                 if driver.connections.generation(self.conn_index) == self.generation {
                     driver.park_offered[idx] = true;
-                    driver.park_carry[idx] = state;
+                    match state {
+                        Some(s) => {
+                            driver.park_carry.insert(self.conn_index, s);
+                        }
+                        // An offer with nothing to carry still clears any
+                        // earlier deposit, so a stale one is never shipped.
+                        None => {
+                            driver.park_carry.remove(&self.conn_index);
+                        }
+                    }
                 }
             }
             #[cfg(not(has_io_uring))]
