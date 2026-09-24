@@ -33,7 +33,7 @@ pub(crate) struct ParkedFd {
 /// Park drops the future the handler was running and recreates it on the new
 /// worker, so anything the future held is gone. A handler that wants to keep
 /// something deposits it here at a quiescent point, and gets it back in
-/// [`AsyncEventHandler::on_adopt`].
+/// [`AsyncEventHandler::on_adopt`](crate::AsyncEventHandler::on_adopt).
 ///
 /// # Why this is not statically typed
 ///
