@@ -217,6 +217,21 @@ fn read_until_fin(
             break;
         }
         // Need more data — let the wire deliver it.
+        //
+        // BOTH sides get flushed. `flush` is what *generates* outgoing packets
+        // (`drain_transmits`); `poll_send` inside `drain` only yields ones
+        // already generated. Flushing the reader alone meant that once the
+        // sender's pre-generated packets ran out, nothing ever asked it for
+        // more: it sat on the rest of the payload while both endpoints went
+        // quiet, and the loop gave up. The write loop hides this whenever it
+        // manages to transfer the whole payload up front, which is why the test
+        // passes alone and fails under parallel-suite load — flow control
+        // leaves a remainder there, and the remainder can never move.
+        //
+        // This is the flake #386 and #389 were both aiming at. Neither found it
+        // because both treated "both endpoints went quiet" as needing more
+        // patience rather than asking why the sender had stopped sending.
+        tx_endpoint.flush(Instant::now());
         rx_endpoint.flush(Instant::now());
         let packets_moved = drain(tx_endpoint, rx_endpoint, tx_addr, rx_addr);
         // Progress is *either* application bytes arriving or datagrams still
@@ -1900,5 +1915,42 @@ fn stream_send_on_closing_connection_returns_connection_closing() {
     assert!(
         matches!(err, Error::InvalidConnection),
         "expected InvalidConnection after close_connection, got {err:?}",
+    );
+}
+
+/// `flush` is what *generates* outgoing packets; `poll_send` only hands back
+/// ones already generated. Anything that ferries packets between endpoints has
+/// to flush both sides or a peer holding buffered data will never transmit it.
+///
+/// This is the contract `read_until_fin` depends on, and violating it was the
+/// cause of the long-running `large_payload_round_trip_via_endpoint_api` flake
+/// (#386, #389): that loop flushed only the reader, so once the writer's
+/// already-generated packets ran out it sat on the rest of the payload while
+/// both endpoints went quiet. Asserted here so the contract is visible rather
+/// than rediscovered from a stalled transfer.
+#[test]
+fn poll_send_yields_nothing_until_flush() {
+    let (mut client, mut server, ca, sa, _certs) = make_pair();
+    let (cc, _) = handshake(&mut client, &mut server, ca, sa);
+    let stream = client.open_bi(cc).unwrap().unwrap();
+
+    // Start from an empty send queue so the handshake's packets cannot be
+    // mistaken for ones this stream generated.
+    while client.poll_send().is_some() {}
+
+    let buffered = client
+        .stream_send(cc, stream, &vec![7u8; 4096])
+        .expect("send");
+    assert!(buffered > 0, "the send buffer took some bytes");
+
+    assert!(
+        client.poll_send().is_none(),
+        "buffered bytes alone must not produce a packet: {buffered} bytes are \
+         queued and nothing has flushed them"
+    );
+    client.flush(Instant::now());
+    assert!(
+        client.poll_send().is_some(),
+        "flush must generate the packet for the buffered bytes"
     );
 }
