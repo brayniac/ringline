@@ -1,0 +1,254 @@
+# Does tier 3 park actually repair a standing imbalance?
+#
+# A healthy merged-mode fleet is balanced at accept by tier 1, so there is
+# normally nothing for park to do — measuring there would produce a confident
+# null that says tier 1 works, not that tier 3 does. So the imbalance is
+# manufactured: the upper half of the workers is steered out of the accept
+# rotation, the client establishes every connection on the lower half, and the
+# upper half is readmitted with no new arrivals. Tier 1 cannot touch that,
+# because tier 1 only acts at accept time.
+#
+# The `off` arm is the control and the more important one: if the imbalance
+# also disappears without --park, something other than park is rebalancing and
+# no `on` result means anything.
+name = "park {park} rep{rep}"
+
+[matrix]
+context_name = "ringline tier-3 park: does it repair a standing imbalance? (#443)"
+park = ["off", "on"]
+rep  = ["1", "2", "3"]
+
+[params]
+# Update to the artifact id of a fresh `ringline park rig build` before each run.
+bins_artifact = "01a0d726-860e-733a-8fe4-5b8c13937217"
+image         = "spool/images/debian-13-base-20260912.1@golden"
+server_ip     = "172.31.0.1"
+client_ip     = "172.31.0.2"
+port          = "7878"
+workers       = "8"
+clients       = "256"
+msg_size      = "64"
+warmup        = "5"
+duration      = "90"
+# Readmit at 30s, counted from SERVER PROCESS START -- not from client start.
+# The client only connects after the server-ready barrier, a reachability probe
+# and its warmup, so the steered-out window has to be wide enough to contain
+# all of that or connections land after readmit, where tier 1 spreads them and
+# there is no imbalance left to repair.
+imbalance_ms  = "30000"
+
+# ── server: hv02 ───────────────────────────────────────────────────────────
+
+[[jobs]]
+name = "server"
+tags = ["z1.baremetal"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "start"
+shape = "z1.c"
+image = "{image}"
+gpu = false
+data_address = "{server_ip}/24"
+boot_timeout = 600
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "exec"
+inputs = [{ artifact = "{bins_artifact}", name = "bench-bins.tgz", dest = "/home/anvil" }]
+payload = '''
+set -uo pipefail
+cd /home/anvil && tar xzf bench-bins.tgz && chmod +x out/*
+sudo sysctl -w net.core.somaxconn=65535 net.ipv4.tcp_max_syn_backlog=65535
+nproc
+uname -r
+'''
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "exec"
+detach = true
+unit = "ringline-server"
+payload = '''
+PARK=""
+[ "{park}" = "on" ] && PARK="--park"
+exec /home/anvil/out/bench-server --runtime ringline --addr {server_ip}:{port} \
+  --workers {workers} --msg-size {msg_size} --accept-mode merged \
+  --echo-mode forward $PARK --park-imbalance-ms {imbalance_ms} \
+  --metrics-out /home/anvil/metrics.json
+'''
+
+[[jobs.steps]]
+type = "barrier"
+name = "server-ready"
+timeout = 1800
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "exec"
+upload = true
+artifacts = ["/home/anvil/cpu.tgz"]
+payload = '''
+set -uo pipefail
+cd /home/anvil
+mkdir -p cpu
+echo "park={park} rep={rep} imbalance_ms={imbalance_ms}" > cpu/arm.txt
+
+# Workers are pinned one per core, so per-core busy IS the per-worker
+# distribution. Two windows, either side of the readmit: the before window
+# establishes that the imbalance was real, the after window is the result.
+sleep 12                       # t=12: load flowing, still steered out
+grep '^cpu[0-9]' /proc/stat > cpu/stat-before-open
+sleep 14                       # t=26, still steered out (readmit at t=30)
+grep '^cpu[0-9]' /proc/stat > cpu/stat-before-close
+sleep 10                       # t=36, readmitted at t=30 plus settling
+grep '^cpu[0-9]' /proc/stat > cpu/stat-after-open
+sleep 50                       # t=86, client load runs to ~t=97
+grep '^cpu[0-9]' /proc/stat > cpu/stat-after-close
+
+# Sample EVERY cpu, and score the question without assuming a worker->cpu
+# mapping. The guest enumerates SMT siblings adjacently (nproc=24 -> 12 physical
+# cores), so ringline's SMT-aware pinning puts worker W on cpu 2W: workers 4-7
+# live on cpu8/10/12/14, which an earlier cpu0..cpu7 window missed entirely --
+# the half whose convergence is the whole question sat outside the measurement.
+# `loaded_cores` (cpus above 50% busy) answers "how many cores carry load"
+# directly, and is immune to however the guest happens to enumerate cpus.
+busy() {
+  awk '
+    FNR==NR { for (i=2;i<=NF;i++) b[$1,i]=$i; next }
+    {
+      tot=0; for (i=2;i<=NF;i++) tot += $i - b[$1,i]
+      idle=($5-b[$1,5])+($6-b[$1,6])
+      pct = (tot>0 ? 100.0*(tot-idle)/tot : 0)
+      printf "%s %.1f\n", $1, pct
+      sum += pct; if (pct > 50) loaded++
+    }
+    END { printf "SUMMARY loaded_cores=%d total_busy_pct=%.1f\n", loaded+0, sum+0 }
+  ' "$1" "$2"
+}
+
+echo "--- before readmit (imbalance being built) ---" | tee -a cpu/per-core.txt
+busy cpu/stat-before-open cpu/stat-before-close | tee -a cpu/per-core.txt
+echo "--- after readmit (park's chance) ---" | tee -a cpu/per-core.txt
+busy cpu/stat-after-open cpu/stat-after-close | tee -a cpu/per-core.txt
+
+cp /home/anvil/metrics.json cpu/ 2>/dev/null || echo "no metrics.json yet" >> cpu/per-core.txt
+tar czf /home/anvil/cpu.tgz -C /home/anvil cpu
+exit 0
+'''
+
+[[jobs.steps]]
+type = "barrier"
+name = "bench-done"
+timeout = 3600
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "exec"
+upload = true
+artifacts = ["/home/anvil/metrics.json"]
+payload = '''
+# SIGTERM so the server runs its shutdown path and dumps counters.
+sudo systemctl stop ringline-server 2>/dev/null || true
+sleep 2
+echo "--- park counters ---"
+if command -v python3 >/dev/null 2>&1; then
+python3 - <<'EOF'
+import json,sys
+m = dict()
+for e in json.load(open("/home/anvil/metrics.json")):
+    m[(e["name"], e.get("op"))] = e["value"]
+def g(n, o):
+    return m.get(("ringline/" + n, o))
+acc = g("connections", "accepted")
+for k in ("accepted", "adopted", "park_started", "park_completed"):
+    print("%-16s= %s" % (k, g("connections", k)))
+print("%-16s= %s" % ("bytes_received", g("bytes", "received")))
+# The run has to prove it carried load before its park counters mean anything.
+# accepted==1 is the /dev/tcp reachability probe alone -- the signature of the
+# client never starting, which is what made the first six runs unreadable.
+want = {clients}
+if acc is None or acc < want:
+    print("FATAL: accepted=%s < clients=%s: no workload, counters uninterpretable" % (acc, want))
+    sys.exit(1)
+print("workload OK: accepted=%s >= clients=%s" % (acc, want))
+EOF
+rc=$?
+else
+  echo "python3 missing; raw counters:"; grep -E 'park_started|park_completed|adopted|accepted' /home/anvil/metrics.json
+  rc=0
+fi
+exit $rc
+'''
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "stop"
+upload = true
+
+# ── client: hv01 ───────────────────────────────────────────────────────────
+
+[[jobs]]
+name = "client"
+tags = ["z2.baremetal"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "start"
+shape = "z2.c"
+image = "{image}"
+gpu = false
+data_address = "{client_ip}/24"
+boot_timeout = 600
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "exec"
+inputs = [{ artifact = "{bins_artifact}", name = "bench-bins.tgz", dest = "/home/anvil" }]
+payload = '''
+set -uo pipefail
+cd /home/anvil && tar xzf bench-bins.tgz && chmod +x out/*
+sudo prlimit --nofile=1000000 --pid $$ 2>/dev/null || true
+echo "fd soft=$(ulimit -Sn) hard=$(ulimit -Hn) clients={clients}"
+ip -4 -brief addr show
+'''
+
+[[jobs.steps]]
+type = "barrier"
+name = "server-ready"
+timeout = 1800
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "exec"
+upload = true
+artifacts = ["/home/anvil/client.log"]
+payload = '''
+set -uo pipefail
+cd /home/anvil
+for i in $(seq 1 120); do
+  (exec 3<>/dev/tcp/{server_ip}/{port}) 2>/dev/null && { exec 3>&-; echo "server reachable after ${i}s"; break; }
+  sleep 1
+done
+# Connections are opened once and held for the whole run: park repairs a
+# standing imbalance, and a client that reconnects would let tier 1 rebalance
+# instead, which would make the on and off arms indistinguishable.
+./out/bench-client --runtime ringline --addr {server_ip}:{port} --clients {clients} \
+  --threads 8 --msg-size {msg_size} --warmup {warmup} --duration {duration} \
+  2>&1 | tee /home/anvil/client.log
+rc=${PIPESTATUS[0]}
+echo "client_rc=${rc}" | tee -a /home/anvil/client.log
+# A client that never ran produced no load, and a run with no load must not be
+# reportable as a result. Fail loudly instead of exiting 0 on a green-looking
+# experiment -- that is exactly how the first six runs were wasted.
+exit "$rc"
+'''
+
+[[jobs.steps]]
+type = "barrier"
+name = "bench-done"
+timeout = 3600
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "stop"
