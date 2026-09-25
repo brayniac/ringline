@@ -5392,18 +5392,24 @@ mod tests {
 
     struct NoopHandler;
 
-    /// Counts `on_adopt` calls, and records what state arrived with them.
-    /// Nothing else proves an adopted connection takes the adopt branch
-    /// rather than being handed to `on_accept` like a fresh one — the driver
-    /// state looks identical either way.
-    ///
-    /// Thread-local, not global: more than one test drains an adopt through
-    /// `NoopHandler`, and the harness runs them concurrently in one process.
-    /// As globals these raced — a second test's adopt could land between the
-    /// first's drain and its assertion, so the count read 2 instead of 1 and
-    /// the state read `None` instead of what was parked. Each test gets its
-    /// own thread, so thread-locals isolate them without a lock anyone has to
-    /// remember to take.
+    // Counts `on_adopt` calls, and records what state arrived with them.
+    // Nothing else proves an adopted connection takes the adopt branch rather
+    // than being handed to `on_accept` like a fresh one — the driver state
+    // looks identical either way.
+    //
+    // Thread-local, not global: more than one test drains an adopt through
+    // `NoopHandler`, and the harness runs them concurrently in one process. As
+    // globals these raced — a second test's adopt could land between the
+    // first's drain and its assertion, so the count read 2 instead of 1 and the
+    // state read `None` instead of what was parked. Measured on real io_uring,
+    // the two tests looped 150 times: 125 failures as globals, 0 as
+    // thread-locals. Each test gets its own thread, and `on_adopt` increments
+    // synchronously on the caller's, so this isolates them without a lock
+    // anyone has to remember to take.
+    //
+    // Plain comments, not doc comments: `thread_local!` does not carry them
+    // into its expansion, so `///` here is an `unused_doc_comments` error under
+    // `-D warnings`.
     thread_local! {
         static ADOPTS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
         static ADOPTED_STATE: std::cell::RefCell<Option<String>> =
