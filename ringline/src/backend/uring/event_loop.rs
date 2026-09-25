@@ -5396,8 +5396,19 @@ mod tests {
     /// Nothing else proves an adopted connection takes the adopt branch
     /// rather than being handed to `on_accept` like a fresh one — the driver
     /// state looks identical either way.
-    static ADOPTS: AtomicU32 = AtomicU32::new(0);
-    static ADOPTED_STATE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    ///
+    /// Thread-local, not global: more than one test drains an adopt through
+    /// `NoopHandler`, and the harness runs them concurrently in one process.
+    /// As globals these raced — a second test's adopt could land between the
+    /// first's drain and its assertion, so the count read 2 instead of 1 and
+    /// the state read `None` instead of what was parked. Each test gets its
+    /// own thread, so thread-locals isolate them without a lock anyone has to
+    /// remember to take.
+    thread_local! {
+        static ADOPTS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        static ADOPTED_STATE: std::cell::RefCell<Option<String>> =
+            const { std::cell::RefCell::new(None) };
+    }
 
     impl AsyncEventHandler for NoopHandler {
         #[allow(clippy::manual_async_fn)]
@@ -5409,8 +5420,10 @@ mod tests {
             _conn: crate::Connection,
             state: Option<crate::park::ParkState>,
         ) -> std::pin::Pin<Box<dyn Future<Output = ()> + 'static>> {
-            ADOPTS.fetch_add(1, Ordering::SeqCst);
-            *ADOPTED_STATE.lock().unwrap() = state.and_then(|s| s.take::<String>());
+            ADOPTS.with(|n| n.set(n.get() + 1));
+            ADOPTED_STATE.with(|c| {
+                *c.borrow_mut() = state.and_then(|s| s.take::<String>());
+            });
             Box::pin(async {})
         }
         fn create_for_worker(_id: usize) -> Self {
@@ -5798,8 +5811,8 @@ mod tests {
     #[test]
     fn an_adopted_connection_reaches_on_adopt_with_its_state() {
         let mut el = make_test_loop();
-        ADOPTS.store(0, Ordering::SeqCst);
-        *ADOPTED_STATE.lock().unwrap() = None;
+        ADOPTS.with(|n| n.set(0));
+        ADOPTED_STATE.with(|c| *c.borrow_mut() = None);
 
         let (tx, rx) = crossbeam_channel::bounded::<crate::park::ParkedFd>(4);
         el.driver.park_rx = Some(rx);
@@ -5811,12 +5824,12 @@ mod tests {
         el.drain_adopted();
 
         assert_eq!(
-            ADOPTS.load(Ordering::SeqCst),
+            ADOPTS.with(|n| n.get()),
             1,
             "an adopted connection takes on_adopt, not on_accept"
         );
         assert_eq!(
-            ADOPTED_STATE.lock().unwrap().as_deref(),
+            ADOPTED_STATE.with(|c| c.borrow().clone()).as_deref(),
             Some("session-42"),
             "and the handler gets back exactly what it deposited"
         );
