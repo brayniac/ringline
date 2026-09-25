@@ -109,6 +109,20 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked --all
+      # A run on 2026-09-22 aborted the release test binary with a bare ENOMEM
+      # from `register_buf_ring`. The error text blames RLIMIT_MEMLOCK, but that
+      # was measured and ruled out: on kernel 6.12 the whole uring test suite
+      # passes with the soft limit at 8 KiB, so the ring is not charged there.
+      # What is left is genuine kernel memory pressure, which nothing recorded.
+      # Capture it on failure so the next occurrence is diagnosable instead of
+      # being re-argued from the same empty log.
+      - name: Resource state (on failure)
+        if: failure()
+        run: |
+          echo "=== limits ==="; ulimit -a || true
+          echo "=== memory ==="; free -m || true
+          echo "=== kernel ring buffer (OOM evidence) ==="
+          (sudo dmesg | tail -40) 2>/dev/null || dmesg | tail -40 || true
       # The diagram freshness check shares this job: the claim tests already
       # run under `cargo test --all`, so the only unique work is the stale-SVG
       # comparison — not worth a dedicated runner.
@@ -122,6 +136,20 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked --all --release
+      # A run on 2026-09-22 aborted the release test binary with a bare ENOMEM
+      # from `register_buf_ring`. The error text blames RLIMIT_MEMLOCK, but that
+      # was measured and ruled out: on kernel 6.12 the whole uring test suite
+      # passes with the soft limit at 8 KiB, so the ring is not charged there.
+      # What is left is genuine kernel memory pressure, which nothing recorded.
+      # Capture it on failure so the next occurrence is diagnosable instead of
+      # being re-argued from the same empty log.
+      - name: Resource state (on failure)
+        if: failure()
+        run: |
+          echo "=== limits ==="; ulimit -a || true
+          echo "=== memory ==="; free -m || true
+          echo "=== kernel ring buffer (OOM evidence) ==="
+          (sudo dmesg | tail -40) 2>/dev/null || dmesg | tail -40 || true
 
   test-mio:
     name: Test (mio)
