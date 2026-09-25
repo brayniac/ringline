@@ -60,6 +60,8 @@ struct EchoCfg {
     pin_to_core: bool,
     prefault_buffers: bool,
     accept_mode: AcceptModeArg,
+    /// Offer every connection for park after each response.
+    park: bool,
     /// Terminate TLS on the listener, with a self-signed certificate generated
     /// at startup so nothing has to be staged onto a guest.
     tls: bool,
@@ -177,6 +179,16 @@ struct Args {
     /// io_uring only and is ignored on a mio build.
     #[arg(long, value_enum, default_value_t = AcceptModeArg::Pool)]
     accept_mode: AcceptModeArg,
+
+    /// (ringline only) Offer each connection for rebalancing after every
+    /// response (tier 3 park, #443).
+    ///
+    /// Park is opt-in, so without this nothing in the fleet ever offers and
+    /// the policy cannot fire — a run without it measures park's absence, not
+    /// park. The echo handler keeps no per-connection state, so it deposits
+    /// nothing and lets `on_adopt` default to `on_accept`.
+    #[arg(long, default_value_t = false)]
+    park: bool,
 
     /// (ringline only) Terminate TLS, with a self-signed certificate
     /// generated at startup.
@@ -415,6 +427,7 @@ fn main() {
             conn_chunk_size: args.conn_chunk_size,
             pin_to_core,
             accept_mode: args.accept_mode,
+            park: args.park,
             tls: args.tls,
             tick_timeout_us: args.tick_timeout_us,
         }),
@@ -618,6 +631,7 @@ fn run_ringline(cfg: EchoCfg) {
         pin_to_core,
         prefault_buffers,
         accept_mode,
+        park,
         tls,
         tick_timeout_us,
     } = cfg;
@@ -648,6 +662,11 @@ fn run_ringline(cfg: EchoCfg) {
         }
     }
 
+    /// Set from `--park`. A static rather than handler state: these handlers
+    /// are unit structs constructed per worker, and a bench switch does not
+    /// justify threading a field through every one of them.
+    static PARK_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
     /// `with_data` + `forward_recv_buf` — what a protocol server's read loop
     /// looks like, and the only mode available on the mio backend.
     async fn forward_echo_loop(conn: Connection) {
@@ -666,6 +685,14 @@ fn run_ringline(cfg: EchoCfg) {
                 .await;
             if n == 0 {
                 break;
+            }
+            // A response has gone out and nothing is half-read: the quiescent
+            // point park is defined against. The offer is withdrawn
+            // automatically the moment the next request's bytes arrive, so
+            // offering every time costs a bool store and can never leave a
+            // stale offer behind.
+            if PARK_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+                tx.offer_for_park(None);
             }
         }
     }
@@ -712,6 +739,8 @@ fn run_ringline(cfg: EchoCfg) {
     } else {
         msg_size.next_power_of_two().max(4096) as u32
     };
+    PARK_ENABLED.store(park, std::sync::atomic::Ordering::Relaxed);
+
     let staged = ConfigBuilder::new()
         .workers(workers)
         // When --cpu-list set a process affinity mask, leave the OS to schedule

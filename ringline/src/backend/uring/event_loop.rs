@@ -2030,6 +2030,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // `install_accepted_with_pending` registers the fd and closes this
             // handle, exactly as it does for a freshly accepted one.
             let raw = std::os::fd::IntoRawFd::into_raw_fd(fd);
+            metrics::CONNECTIONS.increment(metrics::conn::ADOPTED);
             self.install_accepted_with_pending(raw, listener, peer, pending, Some(state));
         }
     }
@@ -2164,6 +2165,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // SQ pressure is backpressure, not failure (Domain Invariant 7).
             return false;
         }
+        metrics::CONNECTIONS.increment(metrics::conn::PARK_STARTED);
         self.driver.park_in_flight[conn_index as usize] =
             Some(crate::backend::uring::driver::ParkInFlight { target, generation });
         true
@@ -2244,6 +2246,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // shutdown could not have passed the gate, so no FIN is queued.
         self.driver.close_connection(conn_index);
 
+        metrics::CONNECTIONS.increment(metrics::conn::PARK_COMPLETED);
         self.driver.park_ready.push(crate::park::ParkedFd {
             fd,
             listener,
