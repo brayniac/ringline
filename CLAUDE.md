@@ -49,10 +49,47 @@ The kernel check is a **build-host, compile-time** gate and is necessary but not
 
 Development reality on macOS:
 - You are always building/testing the **mio backend**; the io_uring path cannot even be type-checked here (cross-target builds fail in `ring`'s build script, which needs a cross gcc). The authoritative signal for io_uring code is Linux CI or a Linux host.
-- `cargo test --all` on macOS occasionally aborts partway with `ringline-quic/tests/peer.rs` `"server should observe FIN"` (`large_payload_round_trip_via_endpoint_api`). This is a known timing flake under full parallel-suite load, not a regression: rerun the test in isolation (`cargo test -p ringline-quic --test peer large_payload_round_trip_via_endpoint_api`) — if it passes, move on and trust Linux CI.
-- When piping cargo output (`| tail`, `| grep`), the pipe masks cargo's exit code — check `$pipestatus` (zsh) or avoid the pipe before claiming success.
+- When piping cargo output (`| tail`, `| grep`), the pipe masks cargo's exit code — check `$pipestatus` (zsh) or avoid the pipe before claiming success. The same trap applies inside an experiment payload: a piped `cargo` there reports success too, so check `${PIPESTATUS[0]}` before a step concludes anything.
+
+The `ringline-quic/tests/peer.rs` `"server should observe FIN"` flake
+(`large_payload_round_trip_via_endpoint_api`) was **fixed in #471** — do not
+rerun-and-move-on if you see it again, it means something new. It was described
+here for months as a macOS timing flake, and that was wrong twice over: it failed
+on Linux CI too, and the cause was not timing. `read_until_fin` flushed only the
+reader, and `flush` is what *generates* packets while `poll_send` only yields
+already-generated ones, so a sender holding the rest of the payload could never
+transmit it. Two earlier fixes (#386, #389) tuned the loop's round budget instead,
+because "both endpoints went quiet" reads as impatience. `poll_send_yields_nothing_until_flush`
+now asserts the contract. The general lesson: a test helper that ferries packets
+must flush **both** sides.
 
 Changes touching backend-shared code must compile and pass clippy on **both** backends. Behavior-sensitive tests that only make sense on one backend are gated with `#[cfg(has_io_uring)]` / `#[cfg(not(has_io_uring))]`.
+
+### Verifying io_uring code
+
+macOS cannot type-check the io_uring path at all, so it has to be built on Linux
+— and that means **a SystemsLab experiment, never a direct login to a rig host.**
+`experiments/accept-mode-ab-build.toml` is the pattern to copy: an `anvil-vm`
+step on a `validation`-tagged agent that clones the branch into an ephemeral VM
+and builds there.
+
+**Do not `ssh`/`rsync`/`scp` to hv01, hv02, delta, the pis, or any other host in
+the rig, for builds or for anything else.** Those machines are SystemsLab agents;
+hv01 and hv02 are also the two hypervisors every two-machine measurement runs on.
+A cargo build on one of them is a CPU-heavy load landing on a measurement host,
+which silently perturbs whatever experiment is in flight — someone else's as
+easily as your own. Submit an experiment and let the scheduler place it.
+
+Two things worth knowing wherever the uring tests run:
+
+- **Run clippy on the io_uring path too, not just the tests.** Lints behind
+  `has_io_uring` exist only there: a `///` doc comment above a `thread_local!`
+  block is an `unused_doc_comments` error under `-D warnings` that no macOS job
+  will ever show you. Tests passing on io_uring does not mean it is lint-clean —
+  that combination broke CI on #470.
+- **The uring test binary needs a generous `RLIMIT_NOFILE`.** At a 1024 soft
+  limit it aborts with `io_uring_setup(2): Too many open files (EMFILE)`, which
+  reads as a code failure and is not; raise the soft limit in the payload.
 
 ## Workspace Structure
 
