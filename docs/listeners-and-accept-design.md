@@ -418,7 +418,14 @@ measurement before it is more than a knob.
 **Run 2026-09-23.** Two X710 guests, one client host opening a pool against an
 8-worker server, `experiments/accept-mode-ab.toml`. Distribution read as
 per-core busy time from `/proc/stat` diffed across the measured window —
-workers are pinned, so core *N* is worker *N*.
+workers are pinned, so on *these guests* core *N* is worker *N*.
+
+> **That mapping is environment-specific, not a property of the runtime.**
+> `topology::physical_core_first_cpus()` takes the first logical CPU per
+> `(package, core_id)`, so on a host that enumerates SMT siblings adjacently
+> worker *W* lands on cpu *2W*. The tier-3 run below hit exactly that (a 24-vCPU
+> anvil guest) and initially sampled the wrong half of the machine. Verify the
+> mapping per environment, or use a statistic that does not depend on it.
 
 ### At 64 connections over 8 workers: no difference, and no information
 
@@ -466,6 +473,50 @@ high outlier (pool 53.3, merged 63.8), so that is the rig, not the mode.
 
 This clears the distribution half of the default-mode decision. Connect rate
 remains unmeasured, so `Pool` stays the default until that exists.
+
+### Tier 3 park: converges a standing imbalance, ~free when balanced (2026-09-25)
+
+`experiments/park-imbalance.toml` and `experiments/park-balanced.toml`. Anvil
+guests, 8 workers, 256 held connections, 64 B closed loop at depth 1, n=3 per
+arm. Full write-up and the harness faults that had to be fixed first:
+[docs/journal/2026-09-tier3-park.md](journal/2026-09-tier3-park.md).
+
+The imbalance is manufactured, because tier 1 leaves nothing for tier 3 to do in
+a healthy fleet: steer workers 4–7 out of the accept rotation, establish all 256
+connections on workers 0–3, readmit with no new arrivals.
+
+| | park off | park on |
+|---|---|---|
+| loaded cores, before → after readmit | 4 → 4 | 4 → **8** |
+| converges? | **never**, 66 s observed | **yes, 11 / 18 / 18 s** |
+| steady ops (t=60–90) | 377,958 ±1.1% | 592,446 ±2.6% — **+56.7%** |
+| `park_completed` = `adopted` | 0 | 264 / 310 / 191 |
+
+The control carries the result: workers 4–7 stay at 13–15% busy for the full 66 s
+after readmit, so the imbalance does not self-repair. Rezolus per-vCPU at 1 s
+resolution gives the curve — readmit at t=30, idle half 0.15 → 0.49 → 0.97 by
+t=42, pinned at 1.00 after, with the originally-hot half at 1.00 throughout.
+Park *adds* capacity rather than shuffling it.
+
+With no imbalance (`--park-imbalance-ms 0`), park costs nothing resolvable:
+
+| | park off | park on | on − off |
+|---|---|---|---|
+| steady ops | 592,739 ±3.6% | 585,640 ±2.3% | −1.2% |
+| p50 | 420.7 µs ±3.1% | 422.3 µs ±3.4% | +0.4% |
+| p99 | 753.8 µs ±4.9% | 764.0 µs ±7.0% | +1.3% |
+
+Pooled spread across the six balanced runs is 4.1%, so this bounds the penalty
+below ~4% rather than showing zero. The balanced 8-worker ceiling (592,739) and
+converged park (592,446) agree within 0.05%: park recovers the full headroom.
+
+Two caveats on reading these numbers. Closed loop at fixed concurrency means
+`ops = 256/latency` (holds to <2% on all twelve runs), so throughput and latency
+are one measurement and no throughput ceiling exists independent of latency.
+And because all 256 connections were identical saturating echoes, connection
+count and worker busyness were the same signal — this run cannot distinguish the
+count-based policy from a busyness-based one. See the journal entry's open
+questions.
 
 ### Conclusion
 

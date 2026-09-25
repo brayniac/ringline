@@ -60,6 +60,10 @@ struct EchoCfg {
     pin_to_core: bool,
     prefault_buffers: bool,
     accept_mode: AcceptModeArg,
+    /// Offer every connection for park after each response.
+    park: bool,
+    /// Steer the upper half of workers out, then back in after this long.
+    park_imbalance_ms: u64,
     /// Terminate TLS on the listener, with a self-signed certificate generated
     /// at startup so nothing has to be staged onto a guest.
     tls: bool,
@@ -177,6 +181,32 @@ struct Args {
     /// io_uring only and is ignored on a mio build.
     #[arg(long, value_enum, default_value_t = AcceptModeArg::Pool)]
     accept_mode: AcceptModeArg,
+
+    /// (ringline only) Offer each connection for rebalancing after every
+    /// response (tier 3 park, #443).
+    ///
+    /// Park is opt-in, so without this nothing in the fleet ever offers and
+    /// the policy cannot fire — a run without it measures park's absence, not
+    /// park. The echo handler keeps no per-connection state, so it deposits
+    /// nothing and lets `on_adopt` default to `on_accept`.
+    #[arg(long, default_value_t = false)]
+    park: bool,
+
+    /// (ringline only) Manufacture a post-accept imbalance for park to
+    /// repair, then hold it: steer the upper half of the workers out of the
+    /// accept rotation at startup and back in after this many milliseconds.
+    /// 0 disables.
+    ///
+    /// Tier 1 places arrivals onto the least loaded worker, so a healthy
+    /// merged-mode fleet is balanced at accept and there is nothing for tier 3
+    /// to do. Park exists for imbalance that appears *after* accept, and this
+    /// is the cheapest way to produce that deterministically: connections open
+    /// while half the fleet is excluded, then the excluded half is readmitted
+    /// with no new arrivals to rebalance through. Without it a park
+    /// measurement reads "never fired", which is indistinguishable from
+    /// "broken".
+    #[arg(long, default_value_t = 0)]
+    park_imbalance_ms: u64,
 
     /// (ringline only) Terminate TLS, with a self-signed certificate
     /// generated at startup.
@@ -415,6 +445,8 @@ fn main() {
             conn_chunk_size: args.conn_chunk_size,
             pin_to_core,
             accept_mode: args.accept_mode,
+            park: args.park,
+            park_imbalance_ms: args.park_imbalance_ms,
             tls: args.tls,
             tick_timeout_us: args.tick_timeout_us,
         }),
@@ -618,6 +650,8 @@ fn run_ringline(cfg: EchoCfg) {
         pin_to_core,
         prefault_buffers,
         accept_mode,
+        park,
+        park_imbalance_ms,
         tls,
         tick_timeout_us,
     } = cfg;
@@ -648,6 +682,11 @@ fn run_ringline(cfg: EchoCfg) {
         }
     }
 
+    /// Set from `--park`. A static rather than handler state: these handlers
+    /// are unit structs constructed per worker, and a bench switch does not
+    /// justify threading a field through every one of them.
+    static PARK_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
     /// `with_data` + `forward_recv_buf` — what a protocol server's read loop
     /// looks like, and the only mode available on the mio backend.
     async fn forward_echo_loop(conn: Connection) {
@@ -666,6 +705,14 @@ fn run_ringline(cfg: EchoCfg) {
                 .await;
             if n == 0 {
                 break;
+            }
+            // A response has gone out and nothing is half-read: the quiescent
+            // point park is defined against. The offer is withdrawn
+            // automatically the moment the next request's bytes arrive, so
+            // offering every time costs a bool store and can never leave a
+            // stale offer behind.
+            if PARK_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+                tx.offer_for_park(None);
             }
         }
     }
@@ -712,6 +759,8 @@ fn run_ringline(cfg: EchoCfg) {
     } else {
         msg_size.next_power_of_two().max(4096) as u32
     };
+    PARK_ENABLED.store(park, std::sync::atomic::Ordering::Relaxed);
+
     let staged = ConfigBuilder::new()
         .workers(workers)
         // When --cpu-list set a process affinity mask, leave the OS to schedule
@@ -756,6 +805,47 @@ fn run_ringline(cfg: EchoCfg) {
         EchoMode::Direct => builder.launch::<EchoHandler>(),
     }
     .expect("failed to launch ringline server");
+
+    // Manufacture the imbalance park exists to repair, then stand back.
+    // Steering only affects *new* accepts, so the sequence matters: exclude
+    // first, let the client establish everything on the remaining half, then
+    // readmit. What is left is a standing imbalance with no arrivals — which
+    // tier 1 cannot touch, because tier 1 only acts at accept time.
+    // `set_worker_accepting` is Linux-only, and so is park.
+    #[cfg(target_os = "linux")]
+    let shutdown = if park_imbalance_ms > 0 {
+        let half = workers / 2;
+        // `ShutdownHandle` is not `Clone`, and the readmit has to happen on a
+        // timer while the main thread waits on a signal — so share it.
+        let shutdown = std::sync::Arc::new(shutdown);
+        for w in half..workers {
+            if let Err(e) = shutdown.set_worker_accepting(w, false) {
+                eprintln!("bench-server: could not steer worker {w} out: {e}");
+            }
+        }
+        println!("park-imbalance: workers {half}..{workers} steered out");
+        let readmit = std::sync::Arc::clone(&shutdown);
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(park_imbalance_ms));
+            for w in half..workers {
+                if let Err(e) = readmit.set_worker_accepting(w, true) {
+                    eprintln!("bench-server: could not steer worker {w} back in: {e}");
+                }
+            }
+            // The marker the analysis keys on: everything before this is the
+            // imbalance being built, everything after is park's chance to
+            // repair it.
+            println!("park-imbalance: workers {half}..{workers} readmitted");
+        });
+        shutdown
+    } else {
+        std::sync::Arc::new(shutdown)
+    };
+    #[cfg(not(target_os = "linux"))]
+    let shutdown = {
+        let _ = park_imbalance_ms;
+        shutdown
+    };
 
     let mode = match echo_mode {
         EchoMode::Direct => "direct",

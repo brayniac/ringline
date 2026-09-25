@@ -12,7 +12,7 @@ use metriken::{Gauge, ShardedCounterGroup, metric};
     name = "ringline/connections",
     description = "Connection lifecycle counters"
 )]
-pub static CONNECTIONS: ShardedCounterGroup = ShardedCounterGroup::new(2);
+pub static CONNECTIONS: ShardedCounterGroup = ShardedCounterGroup::new(5);
 
 #[metric(name = "ringline/bytes", description = "Byte transfer counters")]
 pub static BYTES: ShardedCounterGroup = ShardedCounterGroup::new(3);
@@ -40,6 +40,19 @@ pub static CONNECTIONS_ACTIVE: Gauge = Gauge::new();
 pub mod conn {
     pub const ACCEPTED: usize = 0;
     pub const CLOSED: usize = 1;
+    /// Parks this worker started (tier 3, #443) — an imbalance it tried to
+    /// repair by moving a connection to a less loaded worker.
+    pub const PARK_STARTED: usize = 2;
+    /// Parks that completed: the connection left this worker.
+    ///
+    /// Reported separately from `PARK_STARTED` because the difference is the
+    /// interesting number. A park is abandoned whenever quiesce breaks across
+    /// the fd-recovery round trip, so a large gap means the policy is picking
+    /// connections that will not hold still, not that the mechanism is
+    /// broken.
+    pub const PARK_COMPLETED: usize = 3;
+    /// Connections adopted from another worker.
+    pub const ADOPTED: usize = 4;
 }
 
 /// Counter slot indices for byte metrics.
@@ -131,6 +144,9 @@ pub mod udp {
 pub fn init_metadata() {
     CONNECTIONS.insert_metadata(conn::ACCEPTED, "op".into(), "accepted".into());
     CONNECTIONS.insert_metadata(conn::CLOSED, "op".into(), "closed".into());
+    CONNECTIONS.insert_metadata(conn::PARK_STARTED, "op".into(), "park_started".into());
+    CONNECTIONS.insert_metadata(conn::PARK_COMPLETED, "op".into(), "park_completed".into());
+    CONNECTIONS.insert_metadata(conn::ADOPTED, "op".into(), "adopted".into());
 
     BYTES.insert_metadata(bytes::RECEIVED, "op".into(), "received".into());
     BYTES.insert_metadata(bytes::SENT, "op".into(), "sent".into());
