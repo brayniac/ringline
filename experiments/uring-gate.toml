@@ -1,0 +1,130 @@
+# The io_uring lint-and-test gate, for a branch that cannot be checked locally.
+#
+# macOS cannot even type-check the io_uring path (cross-target builds fail in
+# `ring`'s build script, which wants a cross gcc), so anything touching
+# `backend/uring/` has no local signal at all. The wrong fix is to log into a
+# rig host and build there: hv01 and hv02 are the two hypervisors every
+# two-machine measurement runs on, and a cargo build is CPU-heavy load landing
+# on a measurement host, which silently perturbs whatever is in flight —
+# someone else's run as easily as your own. This runs the same checks in an
+# ephemeral VM on the `validation` agent instead.
+#
+# Submit before opening a PR that touches uring code:
+#
+#   systemslab submit experiments/uring-gate.toml   # edit `branch` first
+#
+# It is not a replacement for CI, which has the authoritative matrix. It is the
+# faster loop that keeps you from pushing a branch that cannot compile on the
+# backend you cannot build.
+name = "ringline uring gate ({branch})"
+
+[params]
+# Upstream by default, so a bare submit gates what will actually be merged.
+# Override `repo` to gate a branch that only exists on a fork — and check the
+# `git log --oneline -1` line in the output before reading the result, because a
+# stale fork silently gates the wrong commit.
+branch = "main"
+repo   = "https://github.com/ringline-rs/ringline"
+
+[[jobs]]
+name = "gate"
+tags = ["validation"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+shape = "z4.c"
+image = "spool/images/debian-13-ci-20260912.1@golden"
+slots = 1
+# 4 GiB, because that is what the validation host can actually back: anvil backs
+# every guest with 1G hugepages, and `delta` has 4096 MiB of those free. Asking
+# for 8 fails at create time with "cannot back this guest" rather than falling
+# back, so this is a ceiling and not a preference.
+memory_gib = 4
+ports = 0
+gpu = false
+# Three clippy passes plus a debug test build of the whole workspace, from a
+# cold registry. The accept-mode build's 3600 is for one release binary.
+payload_timeout = 5400
+artifacts = ["/home/anvil/gate.log"]
+upload = true
+payload = '''
+set -uo pipefail
+cd /home/anvil
+{
+  uname -srm
+  # Necessary but not sufficient: the compile-time gate needs kernel >= 6.1,
+  # and at run time the kernel must also *permit* io_uring. Print both rather
+  # than discovering it as an unexplained abort inside the test run.
+  echo "io_uring_disabled=$(sysctl -n kernel.io_uring_disabled 2>/dev/null || echo unset)"
+  cargo --version
+  rustc --version
+
+  git clone -q {repo} src && git -C src checkout -q {branch}
+  cd src && git log --oneline -1
+
+  # The uring test binary opens a ring per test event loop. At the default 1024
+  # soft limit it aborts with `io_uring_setup(2): Too many open files (EMFILE)`,
+  # which reads as a code failure and is not one.
+  ulimit -Sn 65536
+  echo "nofile_soft=$(ulimit -Sn)"
+
+  # Assert this really is the io_uring build before trusting anything below. A
+  # gate that quietly ran the mio path would be worse than no gate: it would
+  # report green for exactly the code it never compiled.
+  cargo build --locked -q -p ringline-bench --bin bench-server
+  got=$(./target/debug/bench-server --print-backend)
+  [ "$got" = "io_uring" ] || { echo "BACKEND MISMATCH: $got"; echo "gate_backend=1"; exit 1; }
+  echo "gate_backend=0 (backend=$got)"
+
+  # Each check records its own status rather than aborting the run, so one
+  # failure does not hide the rest.
+  #
+  # `--locked` and `-D warnings` mirror CI exactly. CI runs every cargo
+  # invocation with `--locked`, and a dependency change that did not update the
+  # committed lockfile turns CI red on its own — a gate without it would pass a
+  # branch CI then rejects.
+  #
+  # The lints worth coming here for are the ones behind `has_io_uring`, which no
+  # macOS job can see: a `///` doc comment above a `thread_local!` block is an
+  # `unused_doc_comments` error that passing tests do not catch (#470). Running
+  # the tests alone is what let that through.
+  #
+  # Scope stays on the uring path. The force-mio and release matrices run fine
+  # on macOS and in CI, so duplicating them here buys nothing.
+  cargo fmt --all --check; echo "gate_fmt=$?"
+  cargo clippy --locked --all-targets -- -D warnings; echo "gate_clippy_uring=$?"
+  cargo clippy --locked --all-targets --features force-mio -- -D warnings; echo "gate_clippy_mio=$?"
+  cargo clippy --locked --all-targets --features tls-unbuffered -- -D warnings; echo "gate_clippy_tls=$?"
+  cargo test --locked --all; echo "gate_test_uring=$?"
+} 2>&1 | tee /home/anvil/gate.log
+# The tee pipeline masks the payload's own exit code, so the statuses above are
+# the record and the step below is the gate. Exiting 0 here is deliberate: it
+# lets the log upload before anything fails the job.
+exit 0
+'''
+
+[[jobs.steps]]
+type = "shell"
+command = '''
+# Every check must have *recorded* a zero. A missing marker fails too: it means
+# the payload died before reaching that check, which is not a pass.
+fail=0
+for gate in gate_backend gate_fmt gate_clippy_uring gate_clippy_mio gate_clippy_tls gate_test_uring; do
+  if ! grep -q "^${gate}=0" gate.log; then
+    got=$(grep -oE "^${gate}=[0-9]+" gate.log | head -1)
+    echo "FAIL ${gate}: ${got:-never reached}"
+    fail=1
+  else
+    echo "ok   ${gate}"
+  fi
+done
+# A test binary that aborts prints no `test result` line at all, so a run can
+# end with every assertion passing and still have died. Catch that separately
+# from a normal test failure — it is the signature of the open `Test (release)`
+# flake on main.
+if grep -qE "^error: test failed|panicked at" gate.log && ! grep -q "^gate_test_uring=[1-9]" gate.log; then
+  echo "FAIL: test binary died without a failing-test status (abort, not assertion)"
+  fail=1
+fi
+exit $fail
+'''
