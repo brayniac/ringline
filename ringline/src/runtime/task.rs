@@ -15,6 +15,10 @@ enum TaskSlot {
     /// because `StandaloneTaskSlab::remove` has to tell "this task just
     /// finished, reclaim its index" from "there was never a task here, do
     /// not push a duplicate onto the free list".
+    ///
+    /// `wake` cannot transition this state — there is no future here to mark
+    /// ready — which is why a task that wakes during its own poll is recorded
+    /// in `Executor::woken_while_polling` and re-queued after parking instead.
     Polling,
     /// Task is parked (waiting for a wakeup).
     Parked(BoxFuture),
