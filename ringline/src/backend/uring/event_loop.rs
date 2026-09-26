@@ -2197,6 +2197,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // failing (the recv self-terminated first). Neither is an error —
         // park is best-effort and policy can try again later.
         if result < 0 {
+            metrics::PARK_ABANDONED.increment(metrics::park_abandon::INSTALL_FAILED);
             return;
         }
         // SAFETY: a non-negative `FixedFdInstall` result is a fresh fd owned
@@ -2213,10 +2214,15 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         if self.driver.connections.generation(conn_index) != ud.payload()
             || ud.payload() != in_flight.generation
         {
+            metrics::PARK_ABANDONED.increment(metrics::park_abandon::SLOT_RECYCLED);
             return; // `fd` drops, closing this reference.
         }
-        // Quiesce can have broken across the round trip.
-        if !self.driver.is_parkable(conn_index) {
+        // Quiesce can have broken across the round trip. Record *which* gate
+        // closed: `park_started` minus `park_completed` is a large number under
+        // load and on its own it cannot say why, which left the dominant cause
+        // a matter of inference rather than measurement.
+        if let Some(blocker) = self.driver.park_blocker(conn_index) {
+            metrics::PARK_ABANDONED.increment(blocker.abandon_metric());
             return; // `fd` drops.
         }
 

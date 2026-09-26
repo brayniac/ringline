@@ -721,9 +721,6 @@ pub(crate) struct ParkInFlight {
 /// moment" from "this connection is going away", and a failing test wants to
 /// say which term tripped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-// No caller until the handover lands (#443 step 5c). The tests are the only
-// consumer today, and `--all-targets` clippy builds the lib without them.
-#[allow(dead_code)]
 pub(crate) enum ParkBlocker {
     /// Not an established, open connection — still handshaking, still
     /// connecting, or already tearing down. Nothing to move yet.
@@ -766,6 +763,86 @@ pub(crate) enum ParkBlocker {
     RecvFallback,
     /// A direct-echo response is queued for this worker's next flush.
     DirectEcho,
+}
+
+impl ParkBlocker {
+    /// The `ringline/park_abandoned` slot this blocker reports as.
+    ///
+    /// One slot per variant, deliberately. An earlier version collapsed the
+    /// variants believed unreachable at the install re-check into a single
+    /// catch-all, and that catch-all then held 97.8% of abandonments in a
+    /// saturated run — the grouping encoded an assumption and hid the cause it
+    /// was built to expose. Anything worth counting is worth counting
+    /// separately here.
+    pub(crate) fn abandon_metric(self) -> usize {
+        use crate::metrics::park_abandon as pa;
+        match self {
+            ParkBlocker::NotOpen => pa::NOT_OPEN,
+            ParkBlocker::DataPending => pa::DATA_PENDING,
+            ParkBlocker::RecvArmNotCancellable => pa::RECV_ARM_NOT_CANCELLABLE,
+            ParkBlocker::Outbound => pa::OUTBOUND,
+            ParkBlocker::NotOffered => pa::NOT_OFFERED,
+            ParkBlocker::TlsSession => pa::TLS_SESSION,
+            ParkBlocker::Closing => pa::CLOSING,
+            ParkBlocker::Sends => pa::SENDS,
+            ParkBlocker::ForwardWrite => pa::FORWARD_WRITE,
+            ParkBlocker::Chain => pa::CHAIN,
+            ParkBlocker::SegmentReader => pa::SEGMENT_READER,
+            ParkBlocker::RecvFallback => pa::RECV_FALLBACK,
+            ParkBlocker::DirectEcho => pa::DIRECT_ECHO,
+        }
+    }
+}
+
+#[cfg(test)]
+mod park_blocker_tests {
+    use super::*;
+
+    /// Every `ParkBlocker` maps to a distinct in-range slot.
+    ///
+    /// Distinctness is the property that matters: the counters exist to name
+    /// the dominant cause, and two blockers sharing a slot is how the previous
+    /// version lost the answer.
+    #[test]
+    fn every_park_blocker_maps_to_a_distinct_slot() {
+        use crate::metrics::park_abandon as pa;
+        let all = [
+            ParkBlocker::NotOpen,
+            ParkBlocker::DataPending,
+            ParkBlocker::RecvArmNotCancellable,
+            ParkBlocker::Outbound,
+            ParkBlocker::NotOffered,
+            ParkBlocker::TlsSession,
+            ParkBlocker::Closing,
+            ParkBlocker::Sends,
+            ParkBlocker::ForwardWrite,
+            ParkBlocker::Chain,
+            ParkBlocker::SegmentReader,
+            ParkBlocker::RecvFallback,
+            ParkBlocker::DirectEcho,
+        ];
+        let mut seen = std::collections::HashMap::new();
+        for b in all {
+            let slot = b.abandon_metric();
+            assert!(
+                slot < pa::COUNT,
+                "{b:?} mapped to slot {slot}, outside a group of {}",
+                pa::COUNT
+            );
+            if let Some(prev) = seen.insert(slot, b) {
+                panic!("{b:?} and {prev:?} share slot {slot}");
+            }
+        }
+        // The two non-blocker failures need slots of their own too, and must
+        // not collide with any blocker's.
+        for slot in [pa::SLOT_RECYCLED, pa::INSTALL_FAILED] {
+            assert!(slot < pa::COUNT);
+            assert!(
+                !seen.contains_key(&slot),
+                "slot {slot} is claimed by both a blocker and a failure"
+            );
+        }
+    }
 }
 
 impl Driver {

@@ -26,6 +26,18 @@ pub static POOL: ShardedCounterGroup = ShardedCounterGroup::new(8);
 #[metric(name = "ringline/udp", description = "UDP counters")]
 pub static UDP: ShardedCounterGroup = ShardedCounterGroup::new(4);
 
+/// Why a started park did not complete (tier 3, #443).
+///
+/// `park_started` minus `park_completed` is a large number under load — a rate
+/// sweep measured ~100% completion while the worker had headroom and ~1.6% once
+/// it was CPU-saturated — and those two counters cannot say which gate closed.
+/// One op per reason turns that gap into a named cause.
+#[metric(
+    name = "ringline/park_abandoned",
+    description = "Started parks that did not complete, by reason"
+)]
+pub static PARK_ABANDONED: ShardedCounterGroup = ShardedCounterGroup::new(park_abandon::COUNT);
+
 // ── Gauge (not sharded) ─────────────────────────────────────────
 
 #[metric(
@@ -53,6 +65,56 @@ pub mod conn {
     pub const PARK_COMPLETED: usize = 3;
     /// Connections adopted from another worker.
     pub const ADOPTED: usize = 4;
+}
+
+/// Counter slot indices for park-abandonment reasons.
+///
+/// One slot per `ParkBlocker`, plus the two failures that are not blockers.
+/// Nothing is collapsed: an earlier version grouped the variants believed
+/// unreachable at the install re-check into a single `other_blocker`, and that
+/// slot then absorbed 97.8% of abandonments (18,844 of 19,268 in a saturated
+/// run) -- the collapse hid the entire answer behind an assumption. A slot that
+/// reads zero forever costs nothing; a slot that hides a cause costs a wrong
+/// conclusion.
+pub mod park_abandon {
+    /// Not an established, open connection any more.
+    pub const NOT_OPEN: usize = 0;
+    /// Bytes arrived and were not consumed.
+    pub const DATA_PENDING: usize = 1;
+    /// The armed recv was not one `begin_park` could cancel.
+    pub const RECV_ARM_NOT_CANCELLABLE: usize = 2;
+    /// An outbound connection, which park does not move.
+    pub const OUTBOUND: usize = 3;
+    /// The handler's offer is no longer standing. The offer is withdrawn the
+    /// moment bytes arrive and is *not* restored when the handler consumes
+    /// them, so this can hold while the connection is otherwise quiescent.
+    pub const NOT_OFFERED: usize = 4;
+    /// A TLS session, whose transfer is unimplemented.
+    pub const TLS_SESSION: usize = 5;
+    /// Teardown was requested across the round trip.
+    pub const CLOSING: usize = 6;
+    /// Queued or in-flight sends hold this worker's pool slots.
+    pub const SENDS: usize = 7;
+    /// A Mode A forward write is in flight.
+    pub const FORWARD_WRITE: usize = 8;
+    /// A send chain has SQEs in the kernel.
+    pub const CHAIN: usize = 9;
+    /// A live `SegmentReader` owns the connection's delivery discipline, so
+    /// there is no quiescent point at all.
+    pub const SEGMENT_READER: usize = 10;
+    /// A fallback recv is in flight against this worker's send pool.
+    pub const RECV_FALLBACK: usize = 11;
+    /// A direct-echo response is queued for the next flush.
+    pub const DIRECT_ECHO: usize = 12;
+    /// The slot was recycled while the install was in flight.
+    pub const SLOT_RECYCLED: usize = 13;
+    /// The `FixedFdInstall` failed, or the linked recv-cancel returned
+    /// `ECANCELED` because the recv had self-terminated.
+    pub const INSTALL_FAILED: usize = 14;
+
+    /// Number of slots. Sizing the group from this keeps the width and the
+    /// range check from drifting apart.
+    pub const COUNT: usize = 15;
 }
 
 /// Counter slot indices for byte metrics.
@@ -147,6 +209,50 @@ pub fn init_metadata() {
     CONNECTIONS.insert_metadata(conn::PARK_STARTED, "op".into(), "park_started".into());
     CONNECTIONS.insert_metadata(conn::PARK_COMPLETED, "op".into(), "park_completed".into());
     CONNECTIONS.insert_metadata(conn::ADOPTED, "op".into(), "adopted".into());
+
+    PARK_ABANDONED.insert_metadata(park_abandon::NOT_OPEN, "op".into(), "not_open".into());
+    PARK_ABANDONED.insert_metadata(
+        park_abandon::DATA_PENDING,
+        "op".into(),
+        "data_pending".into(),
+    );
+    PARK_ABANDONED.insert_metadata(
+        park_abandon::RECV_ARM_NOT_CANCELLABLE,
+        "op".into(),
+        "recv_arm_not_cancellable".into(),
+    );
+    PARK_ABANDONED.insert_metadata(park_abandon::OUTBOUND, "op".into(), "outbound".into());
+    PARK_ABANDONED.insert_metadata(park_abandon::NOT_OFFERED, "op".into(), "not_offered".into());
+    PARK_ABANDONED.insert_metadata(park_abandon::TLS_SESSION, "op".into(), "tls_session".into());
+    PARK_ABANDONED.insert_metadata(park_abandon::CLOSING, "op".into(), "closing".into());
+    PARK_ABANDONED.insert_metadata(park_abandon::SENDS, "op".into(), "sends".into());
+    PARK_ABANDONED.insert_metadata(
+        park_abandon::FORWARD_WRITE,
+        "op".into(),
+        "forward_write".into(),
+    );
+    PARK_ABANDONED.insert_metadata(park_abandon::CHAIN, "op".into(), "chain".into());
+    PARK_ABANDONED.insert_metadata(
+        park_abandon::SEGMENT_READER,
+        "op".into(),
+        "segment_reader".into(),
+    );
+    PARK_ABANDONED.insert_metadata(
+        park_abandon::RECV_FALLBACK,
+        "op".into(),
+        "recv_fallback".into(),
+    );
+    PARK_ABANDONED.insert_metadata(park_abandon::DIRECT_ECHO, "op".into(), "direct_echo".into());
+    PARK_ABANDONED.insert_metadata(
+        park_abandon::SLOT_RECYCLED,
+        "op".into(),
+        "slot_recycled".into(),
+    );
+    PARK_ABANDONED.insert_metadata(
+        park_abandon::INSTALL_FAILED,
+        "op".into(),
+        "install_failed".into(),
+    );
 
     BYTES.insert_metadata(bytes::RECEIVED, "op".into(), "received".into());
     BYTES.insert_metadata(bytes::SENT, "op".into(), "sent".into());
