@@ -1,6 +1,6 @@
 # 2026-09 — Tier 3 park: does it repair a standing imbalance?
 
-- **Status:** shipped — mechanism validated, policy metric left as an open question
+- **Status:** shipped — mechanism validated; policy metric measured as count-based (2026-09-26)
 - **Span:** Sep 2026 · PRs #464–#469 (mechanism), this PR (rig + measurement) ·
   commits `cea2726`, `ee70863`
 
@@ -151,24 +151,50 @@ result of the measurement.
 
 ## Lessons / open questions
 
-**The policy is connection counts, not busyness — and this measurement cannot
-tell them apart.** `publish_load()` stores `connections.active_count()`, and
-`choose_park_target` compares those counts against `PARK_MARGIN = 8` /
-`PARK_FLOOR = 4`. All 256 connections here were identical saturating closed-loop
-echoes, so 32 connections/worker *was* 0.999 busy/worker: count and load were
-the same signal. Where they diverge, this effort says nothing —
+**The policy is connection counts, not busyness — measured, not inferred.**
+`publish_load()` stores `connections.active_count()`, and `choose_park_target`
+compares those counts against `PARK_MARGIN = 8` / `PARK_FLOOR = 4`. The run
+above could not tell the two signals apart: all 256 connections were identical
+saturating echoes, so 32 connections/worker *was* 0.999 busy/worker.
 
-- heterogeneous connections (8 idle keepalives vs 4 saturating streams: counts
-  pick the wrong worker to shed, and the wrong target);
-- a single hot connection (`PARK_FLOOR = 4` means that worker never sheds it,
-  and a worker at 1 connection looks like the *most* attractive target);
-- varying per-op cost at equal counts.
+`experiments/park-heterogeneous.toml` separates them, by making a small number
+of connections expensive instead of making many connections cheap. Twenty-four
+connections at `--depth 64`, six per active worker: the CPU gap against the
+readmitted half is roughly ninefold, while the *count* gap is 6 — below the
+margin of 8. Context `01a0dae3-665e-7002-ab1a-4ea7b9dea8cb`, n=3 per arm:
 
-A count is the only thing tier 1 *can* use — it places a connection that does
-not exist yet — and tier 3 inherits that table. Whether tier 3 should instead
-read busyness is open. The rig can answer it: a mixed workload (e.g. 32 idle +
-8 hot per worker) separates the two signals, and `publish_load` is one function
-away from publishing busy time.
+| | conns/worker | busy vs idle workers | parks started | outcome |
+|---|---|---|---|---|
+| the run above | 64 | 100% vs 13% | **31,409** | converges 4 → 8 in 11–18 s |
+| heterogeneous | **6** | **82.5% vs 7.7%** | **0** | imbalance stands |
+
+Zero in all three `park on` runs, across a 58-second window, with four workers
+idle the whole time. The `on` arm is indistinguishable from the `off` control
+because `6 >= 0 + 8` never holds, so `choose_park_target` returns `None` every
+tick. Same mechanism and same manufactured imbalance as the 256-connection run —
+only the count differs, which is what isolates the metric rather than the
+mechanism.
+
+The consequence in one line: **a worker saturated by a few expensive connections
+will never shed, however idle its peers are.** The cases this predicts, none of
+them measured yet, are heterogeneous connections (idle keepalives outnumbering
+saturating streams, so counts pick the wrong worker to shed *and* the wrong
+target), a single hot connection (`PARK_FLOOR = 4` pins it, and a worker at 1
+connection looks like the most attractive target), and varying per-op cost at
+equal counts.
+
+Two caveats on that table. The busy workers ran at 76–90%, not pegged — the
+prediction said "saturate" and the honest word is "heavily loaded"; it does not
+affect the conclusion, since a ninefold gap is exactly what a busyness-based
+policy exists to close. And throughput across the six runs spans 5.33–6.18M
+ops/s, a 14.6% spread against the 1.1% floor of the depth-1 runs, so **no
+performance delta should be read out of this matrix** — the result rests on
+`park_started` and the core counts, which were unanimous.
+
+Whether tier 3 *should* read busyness is still a design question rather than a
+measurement one. A count is the only thing tier 1 can use, since it places a
+connection that does not exist yet, and tier 3 inherits that table;
+`publish_load` is one function away from publishing busy time instead.
 
 **The policy constants are not caller-tunable.** `PARK_MARGIN`, `PARK_FLOOR` and
 `PARK_PER_TICK` are private consts in `backend/uring/event_loop.rs`. The caller
