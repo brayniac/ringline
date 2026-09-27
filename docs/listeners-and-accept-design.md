@@ -230,6 +230,12 @@ One mechanism, two policies.
 **Tier 3 - park and adopt.** Move the connection to another worker without the
 client noticing.
 
+> Park starts far more moves than it completes — 94% of attempts are abandoned
+> on a withdrawn offer rather than on the connection's state, and only when the
+> parking worker is CPU-saturated. Measured in
+> [park-abandonment-design.md](park-abandonment-design.md), which also collects
+> what park structurally cannot do and the case for de-emphasising the tier.
+
 Everything the connection *is* can move. Inside one process an fd is an integer,
 so there is no `SCM_RIGHTS` dance; the accumulator is `BytesMut`; the TLS state
 is a `rustls::ServerConnection`. What cannot move is the future `on_accept`
