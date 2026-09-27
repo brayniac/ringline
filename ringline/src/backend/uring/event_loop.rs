@@ -1365,6 +1365,21 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 if let Some(cs) = self.driver.connections.get_mut(conn_index) {
                     cs.recv_multishot_armed = false;
                 }
+                // A park cancelled this recv on purpose and wants it to stay
+                // cancelled: that is the whole point of the cancel, and the
+                // re-arms below would undo it, letting fresh data arrive during
+                // the install round trip and withdraw the handler's offer. Both
+                // re-arms are skipped, and `handle_park_install` re-arms on
+                // every path that stops the park.
+                if self
+                    .driver
+                    .park_draining
+                    .get(conn_index as usize)
+                    .copied()
+                    .unwrap_or(false)
+                {
+                    return;
+                }
                 // If this connection was throttled by the Mode A hold cap, this
                 // is the ECANCELED for that throttle-cancel: re-arm now if the
                 // hold has already drained below the cap (otherwise a later
@@ -2166,6 +2181,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             return false;
         }
         metrics::CONNECTIONS.increment(metrics::conn::PARK_STARTED);
+        // The cancel above is only meaningful if the recv stays cancelled; see
+        // `Driver::park_draining`. Set before the CQE can be handled.
+        if cancel_target.is_some() {
+            self.driver.park_draining[conn_index as usize] = true;
+        }
         self.driver.park_in_flight[conn_index as usize] =
             Some(crate::backend::uring::driver::ParkInFlight { target, generation });
         true
@@ -2182,6 +2202,26 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// `result` is a real fd on success. Every abandon path must close it:
     /// it is a second reference to the socket, and leaking it would keep the
     /// peer from ever seeing a FIN.
+    /// Give up on a draining park: clear the flag and put the recv back.
+    ///
+    /// The `ECANCELED` branch skips its re-arms while `park_draining` is set, so
+    /// whoever stops the park owes the connection a recv. Missing one leaves it
+    /// `Open` with nothing armed and its bytes piling up forever, which is the
+    /// failure the unconditional re-arm existed to prevent.
+    fn abandon_park_drain(&mut self, conn_index: u32) {
+        if !self
+            .driver
+            .park_draining
+            .get(conn_index as usize)
+            .copied()
+            .unwrap_or(false)
+        {
+            return;
+        }
+        self.driver.park_draining[conn_index as usize] = false;
+        self.rearm_multishot_if_idle(conn_index);
+    }
+
     fn handle_park_install(&mut self, ud: crate::completion::UserData, result: i32) {
         let conn_index = ud.conn_index();
         let Some(in_flight) = self.driver.park_in_flight[conn_index as usize].take() else {
@@ -2190,6 +2230,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             if result >= 0 {
                 unsafe { libc::close(result) };
             }
+            // A draining flag with no park behind it would strand the
+            // connection with no recv armed, so put it back either way.
+            self.abandon_park_drain(conn_index);
             return;
         };
 
@@ -2198,6 +2241,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // park is best-effort and policy can try again later.
         if result < 0 {
             metrics::PARK_ABANDONED.increment(metrics::park_abandon::INSTALL_FAILED);
+            self.abandon_park_drain(conn_index);
             return;
         }
         // SAFETY: a non-negative `FixedFdInstall` result is a fresh fd owned
@@ -2215,6 +2259,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             || ud.payload() != in_flight.generation
         {
             metrics::PARK_ABANDONED.increment(metrics::park_abandon::SLOT_RECYCLED);
+            // Clear without re-arming: the slot belongs to a different
+            // connection now, and that occupant armed its own recv at accept.
+            // Re-arming here would submit against the new generation.
+            self.driver.park_draining[conn_index as usize] = false;
             return; // `fd` drops, closing this reference.
         }
         // Quiesce can have broken across the round trip. Record *which* gate
@@ -2223,6 +2271,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // a matter of inference rather than measurement.
         if let Some(blocker) = self.driver.park_blocker(conn_index) {
             metrics::PARK_ABANDONED.increment(blocker.abandon_metric());
+            self.abandon_park_drain(conn_index);
             return; // `fd` drops.
         }
 
@@ -2331,6 +2380,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // A slot is recycled by generation, so without this a new occupant
         // would inherit the previous one's park offer — and its state.
         self.driver.park_offered[conn_index as usize] = false;
+        // Cleared, never re-armed here: on the handover path the fd has left
+        // this worker, and on the adopt path the caller arms recv itself.
+        self.driver.park_draining[conn_index as usize] = false;
         self.driver.park_carry.remove(&conn_index);
         match adopt {
             Some(state) => {
@@ -4003,6 +4055,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // A slot is recycled by generation, so without this a new occupant
         // would inherit the previous one's park offer — and its state.
         self.driver.park_offered[conn_index as usize] = false;
+        // Cleared, never re-armed here: on the handover path the fd has left
+        // this worker, and on the adopt path the caller arms recv itself.
+        self.driver.park_draining[conn_index as usize] = false;
         self.driver.park_carry.remove(&conn_index);
 
         // TLS client path
@@ -5800,6 +5855,60 @@ mod tests {
         assert!(
             el.driver.park_in_flight[conn_index as usize].is_none(),
             "a balanced fleet must not move anything"
+        );
+    }
+
+    /// A draining park must never leave the connection without a recv.
+    ///
+    /// The `ECANCELED` branch skips its re-arms while `park_draining` is set, so
+    /// every path that stops the park owes the connection a re-arm. Missing one
+    /// leaves it `Open` with nothing armed and its bytes piling up forever —
+    /// which is the exact failure the unconditional re-arm was added to prevent,
+    /// so this is the regression worth guarding.
+    #[test]
+    fn abandoning_a_draining_park_puts_the_recv_back() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        // As begin_park leaves it: recv cancelled, draining, nothing armed.
+        el.driver.park_draining[conn_index as usize] = true;
+        if let Some(cs) = el.driver.connections.get_mut(conn_index) {
+            cs.recv_multishot_armed = false;
+        }
+
+        el.abandon_park_drain(conn_index);
+
+        assert!(
+            !el.driver.park_draining[conn_index as usize],
+            "the draining flag must be cleared"
+        );
+        assert!(
+            el.driver
+                .connections
+                .get(conn_index)
+                .is_some_and(|c| c.recv_multishot_armed),
+            "the connection must have a recv armed again"
+        );
+    }
+
+    /// Abandoning when no park is draining is a no-op, so a stray install CQE
+    /// cannot re-arm a connection that never had its recv cancelled.
+    #[test]
+    fn abandoning_without_a_draining_park_changes_nothing() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        el.driver.park_draining[conn_index as usize] = false;
+        if let Some(cs) = el.driver.connections.get_mut(conn_index) {
+            cs.recv_multishot_armed = false;
+        }
+
+        el.abandon_park_drain(conn_index);
+
+        assert!(
+            el.driver
+                .connections
+                .get(conn_index)
+                .is_some_and(|c| !c.recv_multishot_armed),
+            "no park was draining, so nothing was owed"
         );
     }
 

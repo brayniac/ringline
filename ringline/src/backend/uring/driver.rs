@@ -353,6 +353,19 @@ pub(crate) struct Driver {
     /// means a new request began and the quiescent point the handler offered
     /// at is gone — so the handler never has to remember to revoke.
     pub(crate) park_offered: Vec<bool>,
+    /// Per connection: a park cancelled this connection's multishot recv and is
+    /// waiting for it to stay cancelled.
+    ///
+    /// Without this the cancel is close to a no-op for quiescence: the
+    /// `ECANCELED` branch of the recv handler re-arms unconditionally, so fresh
+    /// data arrives during the install round trip, withdraws the handler's offer
+    /// and the park is abandoned. That was 94% of abandonments
+    /// (`docs/park-abandonment-design.md`).
+    ///
+    /// Every path that stops a park must clear this *and* re-arm, or the
+    /// connection is left `Open` with no recv armed and its bytes piling up
+    /// forever — the failure the unconditional re-arm was added to prevent.
+    pub(crate) park_draining: Vec<bool>,
     /// State the handler deposited alongside the offer, carried to the
     /// adopting worker and handed to `on_adopt`.
     ///
@@ -1023,6 +1036,7 @@ impl Driver {
             segment_pinned: vec![None; config.max_connections as usize],
             adopt_pending: std::collections::HashMap::new(),
             park_offered: vec![false; config.max_connections as usize],
+            park_draining: vec![false; config.max_connections as usize],
             park_carry: std::collections::HashMap::new(),
             park_in_flight: vec![None; config.max_connections as usize],
             park_ready: Vec::new(),
@@ -1731,6 +1745,7 @@ impl Driver {
         // reused: a `ParkState` is an arbitrary user value, and a slot that is
         // never reused would hold it for the life of the process.
         self.park_offered[conn_index as usize] = false;
+        self.park_draining[conn_index as usize] = false;
         self.park_carry.remove(&conn_index);
         self.adopt_pending.remove(&conn_index);
         // Do NOT drain held segmented-recv buffers here. When a peer FIN drives
