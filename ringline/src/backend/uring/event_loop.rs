@@ -1378,6 +1378,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     .copied()
                     .unwrap_or(false)
                 {
+                    metrics::PARK_DIAG.increment(metrics::park_diag::REARM_SUPPRESSED);
                     return;
                 }
                 // If this connection was throttled by the Mode A hold cap, this
@@ -2067,6 +2068,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // Read first: the common case is no offer, and a predictable branch
         // beats two stores on every delivery.
         if self.driver.park_offered.get(idx).copied().unwrap_or(false) {
+            // Data reached a connection whose recv was cancelled for a park.
+            // If this tracks `not_offered`, the cancel is not stopping delivery.
+            if self.driver.park_draining.get(idx).copied().unwrap_or(false) {
+                metrics::PARK_DIAG.increment(metrics::park_diag::WITHDRAW_WHILE_DRAINING);
+            }
             self.driver.park_offered[idx] = false;
             self.driver.park_carry.remove(&conn_index);
         }
@@ -2185,6 +2191,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // `Driver::park_draining`. Set before the CQE can be handled.
         if cancel_target.is_some() {
             self.driver.park_draining[conn_index as usize] = true;
+            metrics::PARK_DIAG.increment(metrics::park_diag::CANCEL_SUBMITTED);
+        } else {
+            // No armed multishot to cancel, so no suppression either: whatever
+            // is delivering to this connection keeps delivering across the
+            // install round trip.
+            metrics::PARK_DIAG.increment(metrics::park_diag::CANCEL_ABSENT);
         }
         self.driver.park_in_flight[conn_index as usize] =
             Some(crate::backend::uring::driver::ParkInFlight { target, generation });

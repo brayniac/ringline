@@ -67,6 +67,39 @@ pub mod conn {
     pub const ADOPTED: usize = 4;
 }
 
+#[metric(
+    name = "ringline/park_diag",
+    description = "Park mechanism diagnostics: did the cancel happen, did the suppression hold"
+)]
+pub static PARK_DIAG: ShardedCounterGroup = ShardedCounterGroup::new(park_diag::COUNT);
+
+/// Why suppressing the `ECANCELED` re-arm did not stop offers being withdrawn.
+///
+/// Suppressing the re-arm left `not_offered` at 95.2% of abandonments, unchanged
+/// (`docs/journal/2026-09-two-phase-park.md`). These four answer the question the
+/// abandonment counters cannot: whether the cancel is submitted at all, whether
+/// the suppression fires, and whether data still reaches the connection while it
+/// is supposed to be draining. Between them there is only one consistent story,
+/// which is the point — six hypotheses have already died here.
+pub mod park_diag {
+    /// `begin_park` submitted a recv-cancel, because a multishot was armed.
+    pub const CANCEL_SUBMITTED: usize = 0;
+    /// `begin_park` started a park with *no* cancel, because no multishot was
+    /// armed. Such a park gets no suppression either, so anything still
+    /// delivering keeps delivering.
+    pub const CANCEL_ABSENT: usize = 1;
+    /// The `ECANCELED` branch took the draining early-return and skipped both
+    /// re-arms. If this is ~0 the suppression is dead code in practice.
+    pub const REARM_SUPPRESSED: usize = 2;
+    /// An offer was withdrawn while the connection was marked draining — data
+    /// reached it despite the cancel. If this tracks `not_offered`, the cancel
+    /// is not stopping delivery and the premise is wrong at the root.
+    pub const WITHDRAW_WHILE_DRAINING: usize = 3;
+
+    /// Number of slots.
+    pub const COUNT: usize = 4;
+}
+
 /// Counter slot indices for park-abandonment reasons.
 ///
 /// One slot per `ParkBlocker`, plus the two failures that are not blockers.
@@ -209,6 +242,27 @@ pub fn init_metadata() {
     CONNECTIONS.insert_metadata(conn::PARK_STARTED, "op".into(), "park_started".into());
     CONNECTIONS.insert_metadata(conn::PARK_COMPLETED, "op".into(), "park_completed".into());
     CONNECTIONS.insert_metadata(conn::ADOPTED, "op".into(), "adopted".into());
+
+    PARK_DIAG.insert_metadata(
+        park_diag::CANCEL_SUBMITTED,
+        "op".into(),
+        "cancel_submitted".into(),
+    );
+    PARK_DIAG.insert_metadata(
+        park_diag::CANCEL_ABSENT,
+        "op".into(),
+        "cancel_absent".into(),
+    );
+    PARK_DIAG.insert_metadata(
+        park_diag::REARM_SUPPRESSED,
+        "op".into(),
+        "rearm_suppressed".into(),
+    );
+    PARK_DIAG.insert_metadata(
+        park_diag::WITHDRAW_WHILE_DRAINING,
+        "op".into(),
+        "withdraw_while_draining".into(),
+    );
 
     PARK_ABANDONED.insert_metadata(park_abandon::NOT_OPEN, "op".into(), "not_open".into());
     PARK_ABANDONED.insert_metadata(
