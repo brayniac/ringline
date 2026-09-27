@@ -60,6 +60,15 @@ const PARK_FLOOR: u32 = 4;
 /// snapshot, which is how tier 1 first produced a thundering herd.
 const PARK_PER_TICK: usize = 1;
 
+/// Ticks a drained park waits for the handler to re-offer before giving up.
+///
+/// A handler that reaches a quiescent point re-offers on its very next poll, so
+/// this only has to outlast the in-flight recv CQEs the cancel could not retract
+/// plus one handler turn. It exists because a handler awaiting something
+/// external may never come back, and a connection with no recv armed and no
+/// deadline would wait forever — worse than not parking it.
+const PARK_DRAIN_TICKS: u16 = 64;
+
 /// Pick a worker to park a connection onto, or `None` to stay put.
 ///
 /// Pure, like [`choose_placement`], so the policy can be tested without a
@@ -507,6 +516,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // so running first would act on last iteration's offers and always
             // be one tick stale. After the guard, because `begin_park` takes
             // `&mut self` and the guard holds a raw pointer to the driver.
+            self.drive_park_drains();
             self.maybe_park_one();
 
             // Finalize every close requested this iteration — by
@@ -1373,10 +1383,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 // every path that stops the park.
                 if self
                     .driver
-                    .park_draining
+                    .park_drain
                     .get(conn_index as usize)
-                    .copied()
-                    .unwrap_or(false)
+                    .and_then(|d| *d)
+                    .is_some()
                 {
                     metrics::PARK_DIAG.increment(metrics::park_diag::REARM_SUPPRESSED);
                     return;
@@ -2070,7 +2080,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         if self.driver.park_offered.get(idx).copied().unwrap_or(false) {
             // Data reached a connection whose recv was cancelled for a park.
             // If this tracks `not_offered`, the cancel is not stopping delivery.
-            if self.driver.park_draining.get(idx).copied().unwrap_or(false) {
+            if self.driver.park_drain.get(idx).and_then(|d| *d).is_some() {
                 metrics::PARK_DIAG.increment(metrics::park_diag::WITHDRAW_WHILE_DRAINING);
             }
             self.driver.park_offered[idx] = false;
@@ -2089,6 +2099,68 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// and some handler has offered a connection. In pool mode — the default —
     /// placement is round-robin and there is no imbalance to repair, so this
     /// returns immediately.
+    /// Finish the parks whose recv-cancel is out, and time out the rest.
+    ///
+    /// A draining connection has no recv armed, so nothing can reach it once the
+    /// CQEs that were already posted have been delivered. When the handler comes
+    /// back to a quiescent point and re-offers, the install can go out and
+    /// cannot lose the race. That ordering is the whole of phase 2; linking the
+    /// install to the cancel is what made 9,427 of 9,427 abandonments
+    /// (`docs/journal/2026-09-two-phase-park.md`).
+    fn drive_park_drains(&mut self) {
+        if self.driver.park_drain.is_empty() {
+            return;
+        }
+        for conn_index in 0..self.driver.park_drain.len() as u32 {
+            let Some(drain) = self.driver.park_drain[conn_index as usize] else {
+                continue;
+            };
+            // A recycled slot must not inherit someone else's drain.
+            if self.driver.connections.generation(conn_index) != drain.generation {
+                self.driver.park_drain[conn_index as usize] = None;
+                metrics::PARK_DIAG.increment(metrics::park_diag::DRAIN_STALE);
+                continue;
+            }
+            // Still parkable *and* offered again: the handler is back at a
+            // quiescent point with fresh state deposited, which is exactly the
+            // condition the install needs.
+            if self.driver.park_blocker(conn_index).is_none() {
+                if self
+                    .driver
+                    .ring
+                    .submit_park_install(conn_index, drain.generation)
+                    .is_err()
+                {
+                    // Backpressure: keep the drain and retry next tick.
+                    continue;
+                }
+                self.driver.park_drain[conn_index as usize] = None;
+                self.driver.park_in_flight[conn_index as usize] =
+                    Some(crate::backend::uring::driver::ParkInFlight {
+                        target: drain.target,
+                        generation: drain.generation,
+                    });
+                metrics::PARK_DIAG.increment(metrics::park_diag::INSTALL_AFTER_DRAIN);
+                continue;
+            }
+            // Not ready yet. Spend a tick; on the last one give the connection
+            // its recv back rather than leaving it stranded.
+            match drain.ticks_left.checked_sub(1) {
+                Some(0) | None => {
+                    metrics::PARK_DIAG.increment(metrics::park_diag::DRAIN_TIMEOUT);
+                    self.abandon_park_drain(conn_index);
+                }
+                Some(left) => {
+                    self.driver.park_drain[conn_index as usize] =
+                        Some(crate::backend::uring::driver::ParkDrain {
+                            ticks_left: left,
+                            ..drain
+                        });
+                }
+            }
+        }
+    }
+
     fn maybe_park_one(&mut self) {
         if !self.driver.ring.supports_park() || self.driver.park_offered.is_empty() {
             return;
@@ -2177,29 +2249,46 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 .raw()
             });
 
-        if self
-            .driver
-            .ring
-            .submit_park_install(conn_index, generation, cancel_target)
-            .is_err()
-        {
-            // SQ pressure is backpressure, not failure (Domain Invariant 7).
-            return false;
+        // Phase 1: cancel the recv and wait. The install is NOT submitted here
+        // and NOT linked to the cancel — a cancel cannot retract recv CQEs the
+        // kernel already posted, so an install behind it lands while those are
+        // still being delivered and finds the offer withdrawn. Measured: that
+        // accounted for 9,427 of 9,427 abandonments.
+        match cancel_target {
+            Some(t) => {
+                if self
+                    .driver
+                    .ring
+                    .submit_park_recv_cancel(conn_index, t)
+                    .is_err()
+                {
+                    // SQ pressure is backpressure, not failure (Invariant 7).
+                    return false;
+                }
+                metrics::PARK_DIAG.increment(metrics::park_diag::CANCEL_SUBMITTED);
+                self.driver.park_drain[conn_index as usize] =
+                    Some(crate::backend::uring::driver::ParkDrain {
+                        target,
+                        generation,
+                        ticks_left: PARK_DRAIN_TICKS,
+                    });
+            }
+            None => {
+                // Nothing armed to cancel, so nothing can arrive: install now.
+                metrics::PARK_DIAG.increment(metrics::park_diag::CANCEL_ABSENT);
+                if self
+                    .driver
+                    .ring
+                    .submit_park_install(conn_index, generation)
+                    .is_err()
+                {
+                    return false;
+                }
+                self.driver.park_in_flight[conn_index as usize] =
+                    Some(crate::backend::uring::driver::ParkInFlight { target, generation });
+            }
         }
         metrics::CONNECTIONS.increment(metrics::conn::PARK_STARTED);
-        // The cancel above is only meaningful if the recv stays cancelled; see
-        // `Driver::park_draining`. Set before the CQE can be handled.
-        if cancel_target.is_some() {
-            self.driver.park_draining[conn_index as usize] = true;
-            metrics::PARK_DIAG.increment(metrics::park_diag::CANCEL_SUBMITTED);
-        } else {
-            // No armed multishot to cancel, so no suppression either: whatever
-            // is delivering to this connection keeps delivering across the
-            // install round trip.
-            metrics::PARK_DIAG.increment(metrics::park_diag::CANCEL_ABSENT);
-        }
-        self.driver.park_in_flight[conn_index as usize] =
-            Some(crate::backend::uring::driver::ParkInFlight { target, generation });
         true
     }
 
@@ -2216,21 +2305,21 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// peer from ever seeing a FIN.
     /// Give up on a draining park: clear the flag and put the recv back.
     ///
-    /// The `ECANCELED` branch skips its re-arms while `park_draining` is set, so
+    /// The `ECANCELED` branch skips its re-arms while `park_drain` is set, so
     /// whoever stops the park owes the connection a recv. Missing one leaves it
     /// `Open` with nothing armed and its bytes piling up forever, which is the
     /// failure the unconditional re-arm existed to prevent.
     fn abandon_park_drain(&mut self, conn_index: u32) {
-        if !self
+        if self
             .driver
-            .park_draining
+            .park_drain
             .get(conn_index as usize)
-            .copied()
-            .unwrap_or(false)
+            .and_then(|d| *d)
+            .is_none()
         {
             return;
         }
-        self.driver.park_draining[conn_index as usize] = false;
+        self.driver.park_drain[conn_index as usize] = None;
         self.rearm_multishot_if_idle(conn_index);
     }
 
@@ -2274,7 +2363,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // Clear without re-arming: the slot belongs to a different
             // connection now, and that occupant armed its own recv at accept.
             // Re-arming here would submit against the new generation.
-            self.driver.park_draining[conn_index as usize] = false;
+            self.driver.park_drain[conn_index as usize] = None;
             return; // `fd` drops, closing this reference.
         }
         // Quiesce can have broken across the round trip. Record *which* gate
@@ -2394,7 +2483,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.driver.park_offered[conn_index as usize] = false;
         // Cleared, never re-armed here: on the handover path the fd has left
         // this worker, and on the adopt path the caller arms recv itself.
-        self.driver.park_draining[conn_index as usize] = false;
+        self.driver.park_drain[conn_index as usize] = None;
         self.driver.park_carry.remove(&conn_index);
         match adopt {
             Some(state) => {
@@ -4069,7 +4158,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.driver.park_offered[conn_index as usize] = false;
         // Cleared, never re-armed here: on the handover path the fd has left
         // this worker, and on the adopt path the caller arms recv itself.
-        self.driver.park_draining[conn_index as usize] = false;
+        self.driver.park_drain[conn_index as usize] = None;
         self.driver.park_carry.remove(&conn_index);
 
         // TLS client path
@@ -5872,7 +5961,7 @@ mod tests {
 
     /// A draining park must never leave the connection without a recv.
     ///
-    /// The `ECANCELED` branch skips its re-arms while `park_draining` is set, so
+    /// The `ECANCELED` branch skips its re-arms while `park_drain` is set, so
     /// every path that stops the park owes the connection a re-arm. Missing one
     /// leaves it `Open` with nothing armed and its bytes piling up forever —
     /// which is the exact failure the unconditional re-arm was added to prevent,
@@ -5882,7 +5971,12 @@ mod tests {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
         // As begin_park leaves it: recv cancelled, draining, nothing armed.
-        el.driver.park_draining[conn_index as usize] = true;
+        el.driver.park_drain[conn_index as usize] =
+            Some(crate::backend::uring::driver::ParkDrain {
+                target: 1,
+                generation: el.driver.connections.generation(conn_index),
+                ticks_left: PARK_DRAIN_TICKS,
+            });
         if let Some(cs) = el.driver.connections.get_mut(conn_index) {
             cs.recv_multishot_armed = false;
         }
@@ -5890,7 +5984,7 @@ mod tests {
         el.abandon_park_drain(conn_index);
 
         assert!(
-            !el.driver.park_draining[conn_index as usize],
+            el.driver.park_drain[conn_index as usize].is_none(),
             "the draining flag must be cleared"
         );
         assert!(
@@ -5908,7 +6002,7 @@ mod tests {
     fn abandoning_without_a_draining_park_changes_nothing() {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
-        el.driver.park_draining[conn_index as usize] = false;
+        el.driver.park_drain[conn_index as usize] = None;
         if let Some(cs) = el.driver.connections.get_mut(conn_index) {
             cs.recv_multishot_armed = false;
         }

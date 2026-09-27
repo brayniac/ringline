@@ -96,8 +96,16 @@ pub mod park_diag {
     /// is not stopping delivery and the premise is wrong at the root.
     pub const WITHDRAW_WHILE_DRAINING: usize = 3;
 
+    /// The install went out after a drain, which is the path phase 2 added.
+    pub const INSTALL_AFTER_DRAIN: usize = 4;
+    /// A drain ran out of ticks waiting for the handler to re-offer, so the
+    /// connection got its recv back instead of waiting forever.
+    pub const DRAIN_TIMEOUT: usize = 5;
+    /// A drain was dropped because the slot had been recycled under it.
+    pub const DRAIN_STALE: usize = 6;
+
     /// Number of slots.
-    pub const COUNT: usize = 4;
+    pub const COUNT: usize = 7;
 }
 
 /// Counter slot indices for park-abandonment reasons.
@@ -263,6 +271,17 @@ pub fn init_metadata() {
         "op".into(),
         "withdraw_while_draining".into(),
     );
+    PARK_DIAG.insert_metadata(
+        park_diag::INSTALL_AFTER_DRAIN,
+        "op".into(),
+        "install_after_drain".into(),
+    );
+    PARK_DIAG.insert_metadata(
+        park_diag::DRAIN_TIMEOUT,
+        "op".into(),
+        "drain_timeout".into(),
+    );
+    PARK_DIAG.insert_metadata(park_diag::DRAIN_STALE, "op".into(), "drain_stale".into());
 
     PARK_ABANDONED.insert_metadata(park_abandon::NOT_OPEN, "op".into(), "not_open".into());
     PARK_ABANDONED.insert_metadata(
