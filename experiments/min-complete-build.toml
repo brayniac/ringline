@@ -1,0 +1,58 @@
+# Build bench-server and bench-client for the min_complete sweep. One binary
+# serves every arm: --wait-min-complete is a run-time flag, so the arms cannot
+# differ by anything but that value.
+name = "ringline min-complete build"
+
+[params]
+branch = "feat/wait-min-complete"
+repo   = "https://github.com/brayniac/ringline"
+
+[[jobs]]
+name = "build"
+tags = ["validation"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+shape = "z4.c"
+image = "spool/images/debian-13-ci-20260912.1@golden"
+slots = 1
+memory_gib = 4
+ports = 0
+gpu = false
+payload_timeout = 3600
+artifacts = ["/home/anvil/bench-bins.tgz", "/home/anvil/build.log"]
+upload = true
+payload = '''
+set -uo pipefail
+cd /home/anvil
+{
+  uname -srm
+  git clone -q {repo} src && git -C src checkout -q {branch}
+  cd src && git log --oneline -1
+  cargo build --release -p ringline-bench --bin bench-server --bin bench-client
+  mkdir -p /home/anvil/out
+  cp target/release/bench-server /home/anvil/out/
+  cp target/release/bench-client /home/anvil/out/
+  cd /home/anvil && sha256sum out/*
+  # min_complete is the `io_uring_enter` argument. A mio binary does not have
+  # one, so it would run every arm identically and report a flat sweep -- the
+  # exact shape of a refutation, from a build mistake rather than from physics.
+  got=$(./out/bench-server --print-backend)
+  [ "$got" = "io_uring" ] || { echo "BACKEND MISMATCH: $got"; exit 1; }
+  echo "backend ok: $got"
+  ./out/bench-server --help 2>&1 | grep -q 'wait-min-complete' || { echo "no --wait-min-complete flag"; exit 1; }
+  echo "wait-min-complete flag present"
+  tar czf bench-bins.tgz out
+} 2>&1 | tee /home/anvil/build.log
+rc=${PIPESTATUS[0]}
+echo "build_status=$rc" | tee -a /home/anvil/build.log
+exit 0
+'''
+
+[[jobs.steps]]
+type = "shell"
+command = '''
+grep -q "build_status=0" build.log || { echo "build failed"; exit 1; }
+grep -q "wait-min-complete flag present" build.log || { echo "flag missing"; exit 1; }
+echo ok
+'''
