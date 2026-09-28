@@ -709,22 +709,47 @@ This has to be applied to every claim in this section:
   These are the load-bearing results of this section.
 - **Survives.** The p50 trend, 3206.9 → 1530.8 → 767.4us across `w2` → `w4` →
   `w8`: 2x steps against a 32.8% floor.
-- **Likely but not established: the p99 advantage at `w4`.** The single `w4` run
-  measured 2601.9us. The `w8` configuration has since been run six times and
-  measured 9,208 / 10,154 / 10,888 / 16,967 / 27,131 / 46,162us — **every one of
-  them above the `w4` point**, the smallest by 3.5x. So the reps that exist are
-  one-sided *in favour* of the claim, not against it.
+- **ESTABLISHED: the p99 advantage at `w4`.** Five `w4` replicates against six
+  `w8` replicates, same binary, same 600k offered rate:
 
-  It is still not established, for one reason: `w4` has a single run and its own
-  variability is unmeasured. Treating the six `w8` values as a reference
-  distribution, a single `w4` draw falling below all six has probability 1/7 ≈
-  **14%** under a null of no difference — suggestive, short of conclusive. Five
-  `w4` replicates would settle it, and that is the cheap next measurement.
+  | | CQE/op | p50 | p99 |
+  |---|---|---|---|
+  | `w4`, n=5 | 0.86 0.87 0.87 0.88 0.94 | 1470 1560 1575 1584 1590us | 2511 2582 2673 2731 2797us |
+  | `w8`, n=6 | 1.64 1.81 1.86 1.93 1.94 1.95 | 693 695 707 768 777 921us | 9208 10154 10889 16967 27131 46162us |
 
-  (An earlier revision first called this "7x against a 67% floor, safe" and then
-  over-corrected to "withdrawn". Neither was right: the first used a two-run
-  floor, and the second reasoned from the invalid spread argument above while
-  ignoring that all six reference observations sit on the claim's side.)
+  **Complete separation on all three**: `w4` below `w8` in 30/30 cross pairs on
+  CQE/op and on p99, and above in 30/30 on p50. Exact two-sample probability of
+  complete separation under a null of no difference is 1/C(11,5) = **0.0022**.
+
+  So the trade is real and both directions of it are established: spreading a
+  fixed load buys p50 (1556us → 760us) and pays for it in per-operation cost
+  (CQE/op 0.88 → 1.85), CPU, and the tail (p99 2659us → 20085us).
+
+##### The variance is a property of the configuration, not the rig
+
+The more useful finding from those replicates is that **the two configurations
+are not equally reproducible**:
+
+| metric | `w4` CV (n=5) | `w8` CV (n=6) | ratio |
+|---|---|---|---|
+| CQE/op | 3.6% | 6.4% | 1.8x |
+| p50 | 3.2% | 11.4% | 3.6x |
+| p99 | **4.3%** | **71.8%** | **16.7x** |
+
+`w4`'s tail is tight — p99 2511–2797us across five runs — while `w8`'s ranges
+from 9.2ms to 46.2ms. The distribution shapes differ accordingly: mean p99/p50 is
+**1.71 at `w4` and 26.4 at `w8`**.
+
+Two consequences. First, an earlier revision of this section derived a noise floor
+from `w8` replicates alone and stated it as a rig-wide rule ("a single-run CQE/op
+difference under ~15% is not a result"). That was an over-generalisation from one
+operating point: `w4` reproduces CQE/op to 3.6%. A floor has to be quoted with the
+configuration it was measured at.
+
+Second, and more substantively: the heavy tail is not measurement noise to be
+averaged away, it *is* the `w8` result. Spreading the load does not merely raise
+p99, it makes p99 **unpredictable** — which is a worse property for anything with
+a latency objective than a higher but stable tail would be.
 - **Survives**, because it is categorical rather than a magnitude: every
   `recv_parked` / `buffer_ring_empty` / `recv_fallback` comparison. Zero versus
   285, and zero versus 36 million, are not noise.
