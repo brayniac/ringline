@@ -557,6 +557,32 @@ every run serves the same 600k ops/s.
 > for the 8-worker replicates; multiply any CQE/op figure elsewhere in the session
 > record by 1/1.0556 to compare.
 
+> **`w16` oversubscribes this guest and its row is confounded.** The guest has 24
+> logical CPUs on **12 physical cores** (adjacent SMT siblings), and ringline pins
+> SMT-aware — one worker per *physical* core. Sixteen workers therefore place four
+> pairs on shared physical cores. The Rezolus per-vCPU recording confirms it: at
+> `(600k, w16)` sixteen logical CPUs are busy at 0.98–1.00 where only twelve
+> physical cores exist. So that row measures *spreading plus SMT contention*, not
+> spreading, and its tail is the contention: p99 is 11,912us at 600k against
+> 1,250us at 300k on the same sixteen workers, where the lower rate leaves slack
+> to absorb it. **Read `w2`/`w4`/`w8` as the clean series and treat `w16` as
+> indicative only** — in particular, "CQE/op flattens against the ceiling above
+> `w8`" rests partly on this point and is not established by it.
+>
+> The same recording corrects a second thing. At 600k **every** arm has all of its
+> workers pinned at 1.00 — `w2` two cores, `w4` four, `w8` eight, `w16` sixteen —
+> so the CPU cost of spreading is close to *linear in worker count*, not merely
+> the 4x that CQE/op shows. And per-worker CPU barely responds to load: halving the
+> rate takes a `w4` worker from 1.00 to ~0.94 and a `w16` worker from ~0.99 to
+> ~0.82. A worker burns most of a core almost regardless of how much work it has,
+> which means fixed per-loop cost — not per-operation cost — dominates what
+> spreading actually charges.
+>
+> (This also kills an inference made while reading the matrix: that 37.5k ops/s per
+> worker at `w16` meant low utilisation. Those workers were saturated. Per-worker
+> *rate* does not imply per-worker *utilisation* when both the per-operation cost
+> and the fixed loop cost move with worker count.)
+
 Completions per operation **halve with every halving of the worker count**, then
 flatten against a ceiling of ~2.0 — one recv and one send completion per echo
 request, which is what "no batching at all" costs. At 128 connections per worker
