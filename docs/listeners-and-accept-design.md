@@ -635,9 +635,14 @@ from 256 to **32**, i.e. 1.0 provided buffer per connection:
 
 The control passes: the ring genuinely dries and the counter genuinely responds,
 so the zeros above are real zeros. And an **8x smaller ring bought no coalescing
-whatsoever** — CQE/op 1.71 against 1.64 — at full throughput and a worse p50. So
-the arm is not memory-starved and the comparison is valid; buffers-per-connection
-simply is not the lever.
+whatsoever**: 1.71 sits *inside* the baseline configuration's own run-to-run
+range of 1.64–1.95 (see the noise floor below), so there is no detectable effect
+at all. Throughput is unaffected (600,007 ops/s), so the arm is not
+memory-starved and the comparison is valid; buffers-per-connection simply is not
+the lever.
+
+The p50 difference (1058.7us against 920.5us) is **not** a result — it is inside
+a 32.8% latency floor and is withdrawn.
 
 `recv_fallback` explains why it never could be. ~36M fallback recvs against ~54M
 operations means two thirds of operations took the graceful-degradation path:
@@ -649,10 +654,47 @@ excluded by the design, and the counter says so by name.
 
 The same applies to `min_complete`, tested at 1/2/4/8 on this configuration:
 CQE/op 1.64, 1.65, —, 1.79 with `recv_parked` and `buffer_ring_empty` at 0
-throughout. Blocking the reaper for a few completions checks out a handful of
-buffers against 256 and never approaches the ring, so there is nothing for it to
-induce. **Both candidate ways of buying batching without concentration are
-dead**, and per-worker load stands as the explanation.
+throughout. That span is 8.8%, less than half the 18.6% floor, so the correct
+statement is **indistinguishable from flat**, not measured flat. Blocking the
+reaper for a few completions checks out a handful of buffers against 256 and
+never approaches the ring, so there was nothing for it to induce. **Both
+candidate ways of buying batching without concentration are dead**, and
+per-worker load stands as the explanation.
+
+##### The noise floor, and which comparisons survive it
+
+Two runs of one configuration — 8 workers, 256-buffer ring, `min_complete` 1,
+same binary, submitted as arms of two different sweeps:
+
+| metric | run A | run B | spread |
+|---|---|---|---|
+| ops/s | 599,978 | 599,995 | 0.003% |
+| CQE/op | 1.64 | 1.95 | **18.6%** |
+| p50 | 920.5us | 693.1us | **32.8%** |
+| p99 | 10,154us | 16,967us | **67.1%** |
+
+Offered load is reproduced to five figures; everything derived from timing is
+not. This has to be applied to every claim in this section:
+
+- **Survives.** The worker-count shape. 0.47 / 0.91 / 1.88 / 1.86 spans 4x
+  against an 18.6% floor, and the p99 advantage at `w4` (2601.9us against
+  18945.9us at `w8`) is 7x against a 67% floor.
+- **Survives**, because it is categorical rather than a magnitude: every
+  `recv_parked` / `buffer_ring_empty` / `recv_fallback` comparison. Zero versus
+  285, and zero versus 36 million, are not noise.
+- **Does not survive.** `w8` versus `w16` on p99 (14210.8 vs 18945.9, 33%) and
+  on p50 (734.6 vs 767.4, 4%). The `w16` row cannot be said to differ from `w8`
+  on latency at all, so "p50 is best at full spread" rests on the 2x steps below
+  `w8`, not on that last row.
+- **Does not survive.** Anything at all from the `min_complete` sweep, and the
+  b32 p50.
+
+`b256`'s 1.95 also lands on the original 1.88 reference, so the two sweeps are
+mutually comparable — an earlier note claiming the `n=1` arm failed to replicate
+was reading an 18.6% floor as a 13% discrepancy.
+
+Three further reps are queued and will tighten this; the floor above is two
+runs, which bounds it loosely rather than estimating it.
 
 ##### What is still not separated
 
