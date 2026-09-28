@@ -532,10 +532,30 @@ every run serves the same 600k ops/s.
 
 | workers | conns/worker | CQE/op | CPU (cores) | p50 | p99 | p999 |
 |---|---|---|---|---|---|---|
-| 2 | 128 | **0.47** | 4.83 | 3206.9 | 6093.5 | 6707.4 |
-| 4 | 64 | **0.91** | 7.73 | 1530.8 | **2601.9** | 6950.1 |
-| 8 | 32 | **1.88** | 12.88 | 767.4 | 18945.9 | 58455.1 |
-| 16 | 16 | 1.86 | 18.04 | **734.6** | 14210.8 | 67657.6 |
+| 2 | 128 | **0.44** | 4.83 | 3206.9 | 6093.5 | 6707.4 |
+| 4 | 64 | **0.86** | 7.73 | 1530.8 | **2601.9** | 6950.1 |
+| 8 | 32 | **1.78** | 12.88 | 767.4 | 18945.9 | 58455.1 |
+| 16 | 16 | 1.76 | 18.04 | **734.6** | 14210.8 | 67657.6 |
+
+> **CQE/op was overstated by 5.6% in every earlier revision of this section, and
+> the figures above are corrected.** `ring.cqe_processed` is a server counter
+> covering warmup *and* run; `total_ops` is a client counter covering the run
+> only. With `--warmup 5 --duration 90` the windows differ by 95/90 = 1.0556, and
+> the measured ratio of server messages (`bytes.received / msg_size`) to client
+> ops is 1.0557–1.0558 in all nine cells checked — the warmup, to four digits.
+> The corrected denominator is server-side (`bytes.received / msg_size`), so
+> numerator and denominator cover the same window.
+>
+> The bias is a uniform multiplicative factor, so **no relative comparison in this
+> section changes** — the separations, the CVs and the 30/30 result all stand.
+> What changes is the reading of the ceiling: the largest value yet measured,
+> `(300k, w4)`, corrects from 2.12 to **2.008**, landing *on* the predicted 2.0
+> rather than impossibly above it. That is independent support for the ceiling
+> being exactly one recv plus one send completion per echo.
+>
+> Earlier revisions quoted 0.47 / 0.91 / 1.88 / 1.86 for this table and 1.64–1.95
+> for the 8-worker replicates; multiply any CQE/op figure elsewhere in the session
+> record by 1/1.0556 to compare.
 
 Completions per operation **halve with every halving of the worker count**, then
 flatten against a ceiling of ~2.0 — one recv and one send completion per echo
