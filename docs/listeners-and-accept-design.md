@@ -587,9 +587,27 @@ Three responses, none of them yet measured:
    state is the tail it would wreck on arrival spikes. It also contradicts the
    thread-per-core premise of using every core.
 2. **Decouple batching from queueing** — keep spreading, but let a lightly loaded
-   worker accumulate arrivals deliberately (`tick_timeout_us` is the existing
-   knob). This is the only option that might get the batching benefit without the
-   queueing cost, and it is the one worth measuring first.
+   worker accumulate arrivals deliberately. This is the only option that might get
+   the batching benefit without the queueing cost, and it is the one worth
+   measuring first.
+
+   The lever is **`min_complete`**, not `tick_timeout_us`. An earlier draft of
+   this section named the latter, wrongly: `tick_timeout_us` bounds how long
+   `submit_and_wait` blocks *when there is nothing to do*, so it never delays a
+   completion that has already arrived and cannot affect batching. The loop always
+   calls `submit_and_wait(1)`, returning on the first CQE; waiting for N
+   completions or a timeout (`IORING_ENTER_EXT_ARG`) is the interrupt-coalescing
+   shape that would actually accumulate arrivals. Multishot recv delivers whatever
+   is in the socket buffer when it fires, so not reading for a while genuinely does
+   put more requests in each completion — the same mechanism as the queueing
+   above, induced on purpose.
+
+   Note what the sweep cannot separate: batching there arrived *bundled with*
+   load, so "delay causes batching" and "load causes both" are not distinguished
+   by it. A fixed `min_complete` sweep at 8 workers is the test — if CQE/op falls
+   toward 0.9 while p50 stays under the 4-worker figure, the premise holds and an
+   adaptive version is worth designing. If it only adds latency, the premise is
+   wrong and no controller would help.
 3. **Document and let the operator choose** worker count for the statistic they
    serve. The minimum, and what this section does.
 
