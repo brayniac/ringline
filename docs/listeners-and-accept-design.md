@@ -560,6 +560,46 @@ stops producing accumulation, and it moves with per-connection request rate,
 pipelining depth and per-request cost. **Do not read `w4` as an optimum to
 configure for**; read the shape.
 
+#### A competing explanation this sweep cannot rule out
+
+The paragraphs above name per-worker service rate as the cause. There is a
+second candidate that fits the same four points at least as well, and the sweep
+is confounded with respect to it: **provided recv buffers per connection.**
+
+`recv_ring_size` is *per worker* and was fixed at 256 for every arm, so changing
+the worker count changed buffers-per-connection by the same factor it changed
+connections-per-worker:
+
+| workers | conns/worker | buffers/conn | CQE/op | `min(buffers_per_conn / 4, 1.88)` |
+|---|---|---|---|---|
+| 2 | 128 | 2.0 | 0.47 | 0.50 |
+| 4 | 64 | 4.0 | 0.91 | 1.00 |
+| 8 | 32 | 8.0 | 1.88 | 1.88 |
+| 16 | 16 | 16.0 | 1.86 | 1.88 |
+
+The mechanism would be the buffer ring rather than the clock: a recv CQE checks
+out a provided buffer and the *application* returns it, so when buffers per
+connection get low the ring dries, `ENOBUFS` parks the multishot recv, bytes
+accumulate in the socket buffer, and the recv that follows replenishment carries
+several requests. That is the same observable coalescing, from a cause that has
+nothing to do with how busy the worker is.
+
+The two are perfectly correlated here — fewer workers means both more load per
+worker *and* fewer buffers per connection — so **this sweep does not distinguish
+them, and the mechanism paragraphs above should be read as one of two candidate
+explanations, not as established.** The fitted column is four points against a
+post-hoc formula; it is offered as motivation for the test, not as a result.
+
+The discriminating experiment holds load fixed and varies only the suspect:
+**8 workers throughout, sweeping `recv_ring_size` over 256 / 128 / 64 / 32**, so
+buffers-per-connection moves 8 → 4 → 2 → 1 while per-worker service rate does
+not move at all. If CQE/op tracks the ring down, buffers-per-connection is the
+mechanism — and then batching *is* separable from placement, because it can be
+bought at full spread by sizing the ring. If CQE/op stays flat at 1.88 while the
+ring shrinks by 8x, buffers-per-connection is refuted and per-worker load
+survives as the explanation, which would mean concentration really is required
+to get the batching.
+
 This is already known on the client side of the same repo. `bench-client`'s
 `--conn-chunk-size` exists precisely to pack connections onto fewer workers,
 "keeping per-worker CQE density high enough for io_uring batching to pay off".
