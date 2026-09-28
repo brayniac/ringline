@@ -666,30 +666,50 @@ per-worker load stands as the explanation.
 **Five** runs of one configuration — 8 workers, 256-buffer ring, `min_complete`
 1, same binary, landing as arms of three different sweeps:
 
+**Six** runs of one configuration — 8 workers, 256-buffer ring, `min_complete`
+1, same binary, landing as arms of three different sweeps:
+
 | replicate | CQE/op | p50 | p99 |
 |---|---|---|---|
 | A | 1.64 | 920.5us | 10,154us |
-| B | 1.86 | 777.3us | 10,888us |
-| C | 1.93 | 707.2us | 9,208us |
-| D | 1.94 | 695.4us | 27,131us |
-| E | 1.95 | 693.1us | 16,967us |
+| B | 1.81 | 767.8us | **46,162us** |
+| C | 1.86 | 777.3us | 10,888us |
+| D | 1.93 | 707.2us | 9,208us |
+| E | 1.94 | 695.4us | 27,131us |
+| F | 1.95 | 693.1us | 16,967us |
 
-| metric | min | max | mean | stdev | spread |
-|---|---|---|---|---|---|
-| ops/s | 599,978 | 600,005 | — | — | 0.005% |
-| CQE/op | 1.64 | 1.95 | 1.86 | 0.128 | **18.6%** |
-| p50 | 693.1us | 920.5us | 758.7us | 96.8 | **32.8%** |
-| p99 | 9,208us | 27,131us | 14,870us | 7,498 | **194.6%** |
+| metric | min | max | mean | stdev | CV | spread |
+|---|---|---|---|---|---|---|
+| ops/s | 599,978 | 600,005 | — | — | — | 0.005% |
+| CQE/op | 1.64 | 1.95 | 1.86 | 0.116 | 6.3% | **18.6%** |
+| p50 | 693.1us | 920.5us | 760.2us | 86.6 | 11.4% | **32.8%** |
+| p99 | 9,208us | 46,162us | 20,085us | 14,428 | 71.8% | **401.3%** |
 
 Offered load is reproduced to five figures; everything derived from timing is
-not. **p99 varies by a factor of three across identical runs** — it is not a
-usable statistic for single-run comparison at this scale, and the two-run
-estimate that first appeared here (67%) understated it by 3x. This has to be
-applied to every claim in this section:
+not. CQE/op and p50 converge — their spread was stable from four replicates on.
+**p99 does not converge.** Its measured spread grew at every sample size, 67% →
+84% → 195% → 401%, because the maximum keeps extending: that is a heavy tail, and
+it means no number of runs makes a single-run p99 comparison safe. It is not a
+usable statistic here at all.
 
-- **Survives.** The worker-count shape. 0.47 / 0.91 / 1.88 / 1.86 spans 4x
-  against an 18.6% floor, and the p99 advantage at `w4` (2601.9us against
-  18945.9us at `w8`) is 7x against a 67% floor.
+This has to be applied to every claim in this section:
+
+- **Survives.** The worker-count shape in CQE/op and CPU: 0.47 / 0.91 / 1.88 /
+  1.86 spans 4x against an 18.6% floor, and CPU 4.83 → 18.04 cores spans 3.7x.
+  These are the load-bearing results of this section.
+- **Survives.** The p50 trend, 3206.9 → 1530.8 → 767.4us across `w2` → `w4` →
+  `w8`: 2x steps against a 32.8% floor.
+- **UNRESOLVED, previously claimed as a result.** The p99 advantage at `w4`
+  (2601.9us against 18945.9us at `w8`). An earlier revision of this section
+  called it 7x against a 67% floor and therefore safe. Both figures were wrong:
+  the floor is 401% (4x) at the `w8` configuration, so the margin is 1.8x rather
+  than 10x, and worse, *both* sides are single runs of a heavy-tailed statistic —
+  the `w8` configuration alone was observed anywhere from 9,208us to 46,162us.
+  A single-run-versus-single-run comparison cannot establish the direction here.
+  **The claim that p99 is best at a middle worker count is withdrawn pending
+  replicates at both `w4` and `w8`** (five each, at minimum). Until then this
+  section supports "spreading costs per-operation efficiency and CPU", and does
+  *not* support any statement about which worker count serves the tail best.
 - **Survives**, because it is categorical rather than a magnitude: every
   `recv_parked` / `buffer_ring_empty` / `recv_fallback` comparison. Zero versus
   285, and zero versus 36 million, are not noise.
@@ -720,10 +740,12 @@ applied to every claim in this section:
 mutually comparable — an earlier note claiming the `n=1` arm failed to replicate
 was reading an 18.6% floor as a 13% discrepancy.
 
-Five runs bound this usefully for CQE/op and p50. It is still a bound and not a
-variance estimate — but the practical rule it yields is clear enough: on this rig
-and this workload, **a single-run CQE/op difference under ~20% is not a result,
-and a single-run p99 difference under ~3x is not a result.**
+The practical rule, on this rig and this workload: **a single-run CQE/op
+difference under ~20% is not a result, a single-run p50 difference under ~33% is
+not a result, and a single-run p99 difference is not a result at any magnitude
+short of an order of magnitude** — and even then it wants replicates, because the
+tail is what moves. Any future claim about the latency trade in this section has
+to come with reps on both sides.
 
 ##### What is still not separated
 
