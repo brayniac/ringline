@@ -590,15 +590,48 @@ them, and the mechanism paragraphs above should be read as one of two candidate
 explanations, not as established.** The fitted column is four points against a
 post-hoc formula; it is offered as motivation for the test, not as a result.
 
-The discriminating experiment holds load fixed and varies only the suspect:
-**8 workers throughout, sweeping `recv_ring_size` over 256 / 128 / 64 / 32**, so
-buffers-per-connection moves 8 → 4 → 2 → 1 while per-worker service rate does
-not move at all. If CQE/op tracks the ring down, buffers-per-connection is the
-mechanism — and then batching *is* separable from placement, because it can be
-bought at full spread by sizing the ring. If CQE/op stays flat at 1.88 while the
-ring shrinks by 8x, buffers-per-connection is refuted and per-worker load
-survives as the explanation, which would mean concentration really is required
-to get the batching.
+##### Refuted, by counters already in the artifacts (2026-09-28)
+
+The buffer-ring explanation above is **wrong**, and the runs that were going to
+test it were not needed: the existing artifacts already carry the counter that
+settles it. `pool.recv_parked` counts exactly the event the mechanism requires —
+a multishot recv completing `ENOBUFS` because the provided ring is empty — and
+`pool.buffer_ring_empty` counts the ring running dry:
+
+| workers | buffers/conn | CQE/op | `recv_parked` | `buffer_ring_empty` |
+|---|---|---|---|---|
+| 2 | 2.0 | 0.47 | 71 | 71 |
+| 4 | 4.0 | 0.91 | **0** | **0** |
+| 8 | 8.0 | 1.88 | 0 | 0 |
+| 16 | 16.0 | 1.86 | 0 | 0 |
+
+The `w4` arm coalesces heavily — 0.91 means a completion carries more than one
+request — with the ring **never once** running dry. And `w2`'s 71 park events
+span a 90-second run carrying ~54 million operations, which cannot move an
+aggregate ratio at all. So ring exhaustion is not the mechanism at any arm; the
+numeric fit in the table above was four points against a formula chosen after
+seeing them, and it was coincidence.
+
+**Per-worker load survives as the explanation**, which is what the section said
+before the detour. The correct reading of that is *unwelcome*: it means the
+batching cannot be bought at full spread by sizing the ring, and concentration
+really does appear to be required to get it.
+
+##### What is still not separated
+
+`CQE/op` conflates two completions — one recv and one send per echo, which is
+where the ~2.0 ceiling comes from — and the arms are consistent with *both*
+halves falling together (0.91 ≈ 0.5 + 0.5, 0.47 ≈ 0.25 + 0.25). A busier worker
+would plausibly do both: carry more requests per recv completion *and* coalesce
+more queued sends per loop iteration. Those are different levers with different
+fixes, and this measurement cannot tell them apart.
+
+It cannot be told apart from the current artifacts either, because there is no
+per-`OpTag` completion counter — `ring.cqe_processed` is a single total. Adding
+recv-completions and send-completions as separate counters is the prerequisite
+for any further work here, and is cheap: `dispatch_cqe` already has the `OpTag`
+in hand. Until then, "spreading costs per-operation efficiency" is the solid
+claim and every statement about *why* is underdetermined.
 
 This is already known on the client side of the same repo. `bench-client`'s
 `--conn-chunk-size` exists precisely to pack connections onto fewer workers,
