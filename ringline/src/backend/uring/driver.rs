@@ -738,6 +738,13 @@ pub(crate) struct ParkDrain {
     /// point, and a connection with no recv armed and no deadline would wait
     /// forever — which is worse than not parking it.
     pub ticks_left: u16,
+    /// When the cancel went out, so a completed drain can report how long the
+    /// connection was held with no recv armed.
+    ///
+    /// The point of measuring it is that park moves p50 down 43% and p99 up 4x,
+    /// and 230 drains cannot account for 9 ms of tail unless they are individually
+    /// long. This says which.
+    pub started: std::time::Instant,
 }
 
 /// Why a connection cannot be parked (tier 3, #443) right now.

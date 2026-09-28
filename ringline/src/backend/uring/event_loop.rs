@@ -2141,6 +2141,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                         generation: drain.generation,
                     });
                 metrics::PARK_DIAG.increment(metrics::park_diag::INSTALL_AFTER_DRAIN);
+                // How long the connection sat with no recv armed. One
+                // `Instant::now()` per completed park, not per tick.
+                let held_us = drain
+                    .started
+                    .elapsed()
+                    .as_micros()
+                    .min(u128::from(u64::MAX)) as u64;
+                metrics::PARK_DRAIN_US.increment(metrics::park_drain_us::bucket(held_us));
                 continue;
             }
             // Not ready yet. Spend a tick; on the last one give the connection
@@ -2271,6 +2279,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                         target,
                         generation,
                         ticks_left: PARK_DRAIN_TICKS,
+                        started: std::time::Instant::now(),
                     });
             }
             None => {
@@ -5976,6 +5985,7 @@ mod tests {
                 target: 1,
                 generation: el.driver.connections.generation(conn_index),
                 ticks_left: PARK_DRAIN_TICKS,
+                started: std::time::Instant::now(),
             });
         if let Some(cs) = el.driver.connections.get_mut(conn_index) {
             cs.recv_multishot_armed = false;
