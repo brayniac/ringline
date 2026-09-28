@@ -67,6 +67,25 @@ pub mod conn {
     pub const ADOPTED: usize = 4;
 }
 
+/// Completions processed, split by `OpTag`.
+///
+/// `ring/cqe_processed` is a single total, and every mechanism question about
+/// per-operation cost reduces to *which* completions. A 64-byte echo costs
+/// ~2.0 completions at full spread and ~0.44 concentrated, and that total is
+/// consistent with recv batching, send coalescing, or both moving together —
+/// the aggregate cannot distinguish them, and a measured ratio built from it
+/// conflates causes.
+///
+/// Slot index is the `OpTag` discriminant, so the array is sized to the largest
+/// one and slot 1 is permanently unused (the enum skips it). That wastes a slot
+/// and keeps the increment a plain cast with no lookup table to fall out of step
+/// with the enum.
+#[metric(
+    name = "ringline/cqe_by_tag",
+    description = "Completions processed, by operation tag"
+)]
+pub static CQE_BY_TAG: ShardedCounterGroup = ShardedCounterGroup::new(cqe_tag::COUNT);
+
 #[metric(
     name = "ringline/park_diag",
     description = "Park mechanism diagnostics: did the cancel happen, did the suppression hold"
@@ -226,6 +245,19 @@ pub mod ring {
     /// recognise. Indicates either a corrupted user_data or a future
     /// reorder of the `OpTag` enum that left a stale value in flight.
     pub const CQE_UNKNOWN_TAG: usize = 4;
+}
+
+/// Slot indices for per-`OpTag` completion counters: the slot *is* the
+/// discriminant.
+pub mod cqe_tag {
+    /// One past the largest `OpTag` discriminant (`ParkInstall = 32`).
+    ///
+    /// Deliberately not derived from the enum: `ShardedCounterGroup::new` needs
+    /// a const, and there is no const way to ask an enum for its maximum
+    /// discriminant. `count_covers_every_tag` in the tests below fails if a new
+    /// tag is added above this, which is the case that would otherwise drop
+    /// completions silently.
+    pub const COUNT: usize = 33;
 }
 
 /// Counter slot indices for pool exhaustion metrics.
@@ -408,6 +440,18 @@ pub fn init_metadata() {
         "op".into(),
         "recv_arm_failures".into(),
     );
+
+    // Names come from `OpTag::as_str` rather than a table here, so a new tag
+    // cannot be added with its counter left unlabelled. Slots the enum does not
+    // use (discriminant 1) are simply never registered.
+    for v in 0..=u8::MAX {
+        if let Some(tag) = crate::completion::OpTag::from_u8(v) {
+            let slot = v as usize;
+            if slot < cqe_tag::COUNT {
+                CQE_BY_TAG.insert_metadata(slot, "op".into(), tag.as_str().into());
+            }
+        }
+    }
     RING.insert_metadata(ring::CQE_UNKNOWN_TAG, "op".into(), "cqe_unknown_tag".into());
 
     POOL.insert_metadata(pool::SEND_EXHAUSTED, "op".into(), "send_exhausted".into());
@@ -521,5 +565,59 @@ mod park_drain_bucket_tests {
         for us in [0u64, 100, 250, 500, 1_000, 2_000, 5_000, 10_000] {
             assert!(pd::bucket(us) < pd::COUNT);
         }
+    }
+}
+
+#[cfg(test)]
+mod cqe_tag_tests {
+    use super::cqe_tag;
+    use crate::completion::OpTag;
+
+    /// `cqe_tag::COUNT` sizes the counter array and the increment indexes it by
+    /// raw discriminant, so a tag above `COUNT` would push completions into a
+    /// slot that does not exist. `ShardedCounterGroup::increment` returns false
+    /// for an out-of-range slot rather than panicking, so the failure mode is a
+    /// counter that silently stays at zero — indistinguishable from "that
+    /// operation never ran", which is precisely the reading this metric exists
+    /// to make trustworthy.
+    #[test]
+    fn count_covers_every_tag() {
+        let mut max = 0usize;
+        let mut found = 0usize;
+        for v in 0..=u8::MAX {
+            if OpTag::from_u8(v).is_some() {
+                max = max.max(v as usize);
+                found += 1;
+            }
+        }
+        assert!(
+            max < cqe_tag::COUNT,
+            "OpTag discriminant {max} needs cqe_tag::COUNT > {max}, but it is {}",
+            cqe_tag::COUNT
+        );
+        // Guard against the walk finding nothing and passing vacuously.
+        assert!(found >= 30, "expected the full tag set, found {found}");
+    }
+
+    /// The array is indexed by discriminant, which leaves gaps. Assert exactly
+    /// which gaps we expect, rather than letting an unnoticed new one look
+    /// normal — an unregistered slot reads as a counter stuck at zero.
+    ///
+    /// Slot 1 is skipped by the enum outright. Slot 17 (`RecvMsgMultiTs`) exists
+    /// only under the `timestamps` feature, so the expected gap set is
+    /// feature-dependent; this test found that the hard way.
+    #[test]
+    fn expected_slots_are_unused() {
+        let unused: Vec<usize> = (0..cqe_tag::COUNT)
+            .filter(|i| OpTag::from_u8(*i as u8).is_none())
+            .collect();
+        #[cfg(feature = "timestamps")]
+        let expected = vec![1];
+        #[cfg(not(feature = "timestamps"))]
+        let expected = vec![1, 17];
+        assert_eq!(
+            unused, expected,
+            "unexpected unused CQE_BY_TAG slots (timestamps feature changes this)"
+        );
     }
 }

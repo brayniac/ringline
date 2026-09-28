@@ -1242,6 +1242,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 return;
             }
         };
+        // Split the total by operation, because every question about
+        // per-operation cost is really "which completions". The slot is the
+        // discriminant; an unknown tag returned above and is counted by
+        // CQE_UNKNOWN_TAG instead, so this and that counter partition
+        // CQE_PROCESSED exactly.
+        metrics::CQE_BY_TAG.increment(tag as usize);
 
         match tag {
             OpTag::AcceptMulti => self.handle_accept_multi(ud, result, flags),
