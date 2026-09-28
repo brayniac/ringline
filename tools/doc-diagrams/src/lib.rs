@@ -65,6 +65,13 @@ const CLAIMS: &[Claim] = &[
         meaning: "io_uring submit/completion boundary",
     },
     Claim {
+        path: "ringline/src/backend/uring/driver.rs",
+        needle: "config.wait_min_complete.max(1)",
+        meaning: "the blocking ring entry always asks for at least one \
+                  completion, so GETEVENTS is set and DEFER_TASKRUN task_work \
+                  cannot be stranded",
+    },
+    Claim {
         path: "ringline/src/backend/uring/event_loop.rs",
         needle: "fn spawn_accept_task",
         meaning: "io_uring connection task creation",
@@ -260,14 +267,16 @@ pub fn verify_source_claims(root: &Path) -> io::Result<()> {
         "Mio drains disk I/O responses in the worker loop",
     )?;
     // Both ring-entry branches must precede the drain, and both must carry
-    // GETEVENTS: `submit_and_wait(1)` when the loop blocks, and
+    // GETEVENTS: `submit_and_wait(wait_min_complete)` when the loop blocks, and
     // `submit_and_get_events()` when it declines to because a task is
     // runnable. A plain `submit_and_wait(0)` here would set no GETEVENTS and,
-    // under DEFER_TASKRUN, strand task_work indefinitely.
+    // under DEFER_TASKRUN, strand task_work indefinitely -- which is why the
+    // configured minimum is clamped to at least 1 (claimed separately below,
+    // since this needle can no longer see the value).
     require_order_after(
         &uring_loop,
         "pub(crate) fn run",
-        "submit_and_wait(1)",
+        "submit_and_wait(self.driver.wait_min_complete)",
         "self.drain_completions()",
         "io_uring blocks for completions, then drains them",
     )?;
