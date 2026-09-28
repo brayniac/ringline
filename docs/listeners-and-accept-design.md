@@ -524,6 +524,91 @@ count and worker busyness were the same signal — this run cannot distinguish t
 count-based policy from a busyness-based one. See the journal entry's open
 questions.
 
+### Spreading a fixed load costs per-operation efficiency (2026-09-28)
+
+`experiments/coalesce-sweep.toml`. 600k offered in open loop, 256 connections held,
+park off, no manufactured imbalance — **worker count is the only variable**, and
+every run serves the same 600k ops/s.
+
+| workers | conns/worker | CQE/op | CPU (cores) | p50 | p99 | p999 |
+|---|---|---|---|---|---|---|
+| 2 | 128 | **0.47** | 4.83 | 3206.9 | 6093.5 | 6707.4 |
+| 4 | 64 | **0.91** | 7.73 | 1530.8 | **2601.9** | 6950.1 |
+| 8 | 32 | **1.88** | 12.88 | 767.4 | 18945.9 | 58455.1 |
+| 16 | 16 | 1.86 | 18.04 | **734.6** | 14210.8 | 67657.6 |
+
+Completions per operation **halve with every halving of the worker count**, then
+flatten against a ceiling of ~2.0 — one recv and one send completion per echo
+request, which is what "no batching at all" costs. At 128 connections per worker
+multishot recv is carrying more than four requests per completion.
+
+CPU tracks it: **two workers serve the same throughput on a quarter of the CPU of
+sixteen.**
+
+### Why that is the sizing
+
+The batching is a *consequence of queueing*, which is why the two move together.
+Per-connection arrival rate is identical across the sweep (256 connections, fixed
+600k) — what changes is per-worker service rate. A worker carrying 300k ops/s
+returns to each connection less often, so more requests accumulate between visits,
+so more arrive in one TCP segment and one completion carries several requests. A
+worker carrying 37k ops/s reaches each arrival immediately and pays a completion
+for each.
+
+So the knee is not a property of "64 connections". It is where per-worker load
+stops producing accumulation, and it moves with per-connection request rate,
+pipelining depth and per-request cost. **Do not read `w4` as an optimum to
+configure for**; read the shape.
+
+This is already known on the client side of the same repo. `bench-client`'s
+`--conn-chunk-size` exists precisely to pack connections onto fewer workers,
+"keeping per-worker CQE density high enough for io_uring batching to pay off".
+Tier 1 placement does the opposite on the server side, by design.
+
+### The trade, and whether placement should compensate
+
+The latency shape is monotone with a knee, and it is the opposite of what
+"balanced is better" predicts:
+
+- **p50 improves all the way**: 3207 → 1531 → 767 → 735 µs
+- **p99 improves to 4 workers** (6094 → 2602), then collapses (→ 18946)
+- **p999 is flat to 4 workers** (6707, 6950), then explodes (→ 58455)
+
+Past the knee you buy ~30 µs of p50 for a 7x worse p99 and an 8x worse p999.
+Saturated-and-queued gives a worse median and a much tighter tail; fully spread
+gives the best median and a far worse tail.
+
+Three responses, none of them yet measured:
+
+1. **Pack rather than spread** — fill workers toward a target utilisation and
+   leave the rest idle, recruiting more only as load rises. Maximises batching,
+   minimises CPU, and on this data gives better tails. The risk is that a worker
+   near saturation has no headroom for a burst, so the tail it protects in steady
+   state is the tail it would wreck on arrival spikes. It also contradicts the
+   thread-per-core premise of using every core.
+2. **Decouple batching from queueing** — keep spreading, but let a lightly loaded
+   worker accumulate arrivals deliberately (`tick_timeout_us` is the existing
+   knob). This is the only option that might get the batching benefit without the
+   queueing cost, and it is the one worth measuring first.
+3. **Document and let the operator choose** worker count for the statistic they
+   serve. The minimum, and what this section does.
+
+### What this does not establish
+
+The CQE/op and CPU columns repeat to within ~4–10% across runs of an identical
+configuration and can be relied on. **The tail columns cannot, single-run**: two
+runs of the 8-worker configuration gave p99 9,041 µs and 18,945 µs, a factor of
+two. So the 4-vs-8 comparison (7x on p99) is far outside that spread and worth
+believing; 8-vs-16 is inside it and means nothing here. A dedicated noise-floor
+measurement is the prerequisite for any finer tail claim, and several tail deltas
+quoted earlier in this effort were made without one.
+
+One workload, one box: 256 connections, 64 B echo, open loop at a fixed rate, on a
+24-vCPU guest with 12 physical cores. The 16-worker point also oversubscribes the
+physical cores, which is a second effect confounded with the first — note that
+CQE/op is flat from 8 to 16 while CPU still climbs 40%, so that CPU is contention
+and scheduling rather than completions.
+
 ### Conclusion
 
 **Merged accept mode stays behind its flag** — though the distribution defect
