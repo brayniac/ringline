@@ -617,6 +617,43 @@ before the detour. The correct reading of that is *unwelcome*: it means the
 batching cannot be bought at full spread by sizing the ring, and concentration
 really does appear to be required to get it.
 
+##### And refuted again by direct experiment, with the reason (2026-09-28)
+
+One arm of the ring sweep was kept as a positive control — `recv_parked = 0`
+everywhere is also exactly what a dead counter looks like — and it settles the
+question outright. 8 workers, 32 connections per worker, `recv_ring_size` cut 8x
+from 256 to **32**, i.e. 1.0 provided buffer per connection:
+
+| | b32 | baseline (b256) |
+|---|---|---|
+| ops/s | 600,007 | 599,978 |
+| CQE/op | **1.71** | 1.64 |
+| p50 | 1058.7us | 920.5us |
+| `recv_parked` | 285 | 0 |
+| `buffer_ring_empty` | 285 | 0 |
+| `recv_fallback` | **35,949,657** | 0 |
+
+The control passes: the ring genuinely dries and the counter genuinely responds,
+so the zeros above are real zeros. And an **8x smaller ring bought no coalescing
+whatsoever** — CQE/op 1.71 against 1.64 — at full throughput and a worse p50. So
+the arm is not memory-starved and the comparison is valid; buffers-per-connection
+simply is not the lever.
+
+`recv_fallback` explains why it never could be. ~36M fallback recvs against ~54M
+operations means two thirds of operations took the graceful-degradation path:
+**when the provided ring is dry, ringline submits a one-shot recv to keep
+draining the socket** rather than leaving the connection parked. Socket-buffer
+accumulation — the thing the hypothesis needed — is precisely what that path
+exists to prevent. The mechanism was not merely unsupported by the data, it is
+excluded by the design, and the counter says so by name.
+
+The same applies to `min_complete`, tested at 1/2/4/8 on this configuration:
+CQE/op 1.64, 1.65, —, 1.79 with `recv_parked` and `buffer_ring_empty` at 0
+throughout. Blocking the reaper for a few completions checks out a handful of
+buffers against 256 and never approaches the ring, so there is nothing for it to
+induce. **Both candidate ways of buying batching without concentration are
+dead**, and per-worker load stands as the explanation.
+
 ##### What is still not separated
 
 `CQE/op` conflates two completions — one recv and one send per echo, which is
