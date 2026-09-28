@@ -353,6 +353,22 @@ pub(crate) struct Driver {
     /// means a new request began and the quiescent point the handler offered
     /// at is gone — so the handler never has to remember to revoke.
     pub(crate) park_offered: Vec<bool>,
+    /// Per connection: a park cancelled this connection's multishot recv and is
+    /// waiting for the handler to come back to a quiescent point.
+    ///
+    /// Two measurements shaped this. Without the cancel staying cancelled the
+    /// `ECANCELED` branch re-arms and fresh data keeps arriving; with it, the
+    /// suppression fires on every park (9,809 of 9,809) and data *still* arrives,
+    /// because a cancel cannot retract recv CQEs the kernel had already posted —
+    /// which withdrew the offer 9,427 times out of 9,427 abandonments. So the
+    /// install cannot be linked to the cancel: it has to wait until the handler
+    /// re-offers, by which point nothing can be in flight.
+    /// See `docs/journal/2026-09-two-phase-park.md`.
+    ///
+    /// Every path that stops a drain must clear this *and* re-arm, or the
+    /// connection is left `Open` with no recv armed and its bytes piling up
+    /// forever — the failure the unconditional re-arm was added to prevent.
+    pub(crate) park_drain: Vec<Option<ParkDrain>>,
     /// State the handler deposited alongside the offer, carried to the
     /// adopting worker and handed to `on_adopt`.
     ///
@@ -709,6 +725,28 @@ pub(crate) struct ParkInFlight {
     pub generation: u32,
 }
 
+/// A park whose recv-cancel is out, waiting for the handler to re-offer.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ParkDrain {
+    /// Where the connection is headed once the install completes.
+    pub target: usize,
+    /// Generation at cancel time, so a recycled slot cannot inherit the drain.
+    pub generation: u32,
+    /// Ticks left to wait for a re-offer before giving up and re-arming.
+    ///
+    /// A handler awaiting something external may never come back to a quiescent
+    /// point, and a connection with no recv armed and no deadline would wait
+    /// forever — which is worse than not parking it.
+    pub ticks_left: u16,
+    /// When the cancel went out, so a completed drain can report how long the
+    /// connection was held with no recv armed.
+    ///
+    /// The point of measuring it is that park moves p50 down 43% and p99 up 4x,
+    /// and 230 drains cannot account for 9 ms of tail unless they are individually
+    /// long. This says which.
+    pub started: std::time::Instant,
+}
+
 /// Why a connection cannot be parked (tier 3, #443) right now.
 ///
 /// Park moves a live connection to another worker: quiesce, hand the fd over
@@ -1023,6 +1061,7 @@ impl Driver {
             segment_pinned: vec![None; config.max_connections as usize],
             adopt_pending: std::collections::HashMap::new(),
             park_offered: vec![false; config.max_connections as usize],
+            park_drain: vec![None; config.max_connections as usize],
             park_carry: std::collections::HashMap::new(),
             park_in_flight: vec![None; config.max_connections as usize],
             park_ready: Vec::new(),
@@ -1731,6 +1770,7 @@ impl Driver {
         // reused: a `ParkState` is an arbitrary user value, and a slot that is
         // never reused would hold it for the life of the process.
         self.park_offered[conn_index as usize] = false;
+        self.park_drain[conn_index as usize] = None;
         self.park_carry.remove(&conn_index);
         self.adopt_pending.remove(&conn_index);
         // Do NOT drain held segmented-recv buffers here. When a peer FIN drives

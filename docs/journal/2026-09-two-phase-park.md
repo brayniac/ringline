@@ -1,6 +1,6 @@
 # 2026-09 — Two-phase park: induce quiescence instead of sampling for it
 
-- **Status:** open — intent landed before building
+- **Status:** open — phase 1 shipped and GO; phase 2 not started
 - **Span:** Sep 2026 · follows #443 tier 3, #470, #477, #479
 
 ## Goal
@@ -93,6 +93,66 @@ This was established by reading the control flow rather than by measurement,
 which is decisive for a question of this shape — it is a branch that either runs
 or does not, not a timing property. The timing properties below still need
 measuring.
+
+### Phase 1 outcome: GO
+
+Built in two steps, because the first was necessary and not sufficient.
+
+**Step 1 — suppress the `ECANCELED` re-arm.** Measured on its own: the
+suppression fired on every single park (9,809 of 9,809) and changed nothing.
+`not_offered` stayed at 95.2%, completion 9.12% against a 50% bar. NO-GO.
+
+Four diagnostic counters said why, and it was not a hypothesis anyone could have
+reasoned to:
+
+```
+cancel_submitted         9809    every park
+cancel_absent               0
+rearm_suppressed         9809    suppression fires 100%
+withdraw_while_draining  9427    == every single abandonment
+```
+
+A cancel cannot retract recv CQEs the kernel has **already posted**. Those
+deliver, withdraw the offer, and the install — still linked behind the cancel —
+lands with nothing standing. The accumulator drains fine (`data_pending` 2.9%);
+it is the *offer* that in-flight data destroys.
+
+**Step 2 — unlink the install and submit it on the re-offer.** `begin_park` now
+submits only the cancel and enters a `ParkDrain` state; `drive_park_drains`
+submits the install once the connection is parkable and offered again, by which
+point nothing can be in flight.
+
+| | baseline | step 1 | step 2 |
+|---|---|---|---|
+| completion | 0.76–6.36% | 9.12% | **100.00%** (230/230) |
+| `not_offered` share | 94.1% | 95.2% | **0.0%** |
+| `park_started` | ~19,415 | 4,079 | **230** |
+| abandonments | ~19,268 | 3,707 | **0** |
+
+Both GO criteria met. `loaded_cores` still converges 4 → 8, and the retry storm
+is gone: 230 attempts for 230 moves where it previously took 19,415 for 264. The
+policy reaches its setpoint and stops, which is what the sub-saturation runs
+looked like all along.
+
+The counters confirm the mechanism rather than just the outcome:
+`install_after_drain` = 230 (every park took the new path),
+`withdraw_while_draining` = 136 (in-flight CQEs still arrive on 59% of parks and
+are now harmless), `drain_timeout` = 0, `drain_stale` = 0.
+
+`drain_timeout = 0` is worth noting because it was the predicted failure: a
+handler parked awaiting a read, with no recv armed, has nothing to wake it and
+might never re-offer. On this workload it always re-offers well inside the
+64-tick budget. That budget is a number chosen by hand and validated on one
+workload, which is the weakest part of this change.
+
+### The tail
+
+p99 was 11,989 µs with phase 1 complete, against 10,985 µs on the step-1 run
+where almost nothing parked. That points at most of the tail being inherent to
+saturated 600k rather than caused by draining, but step 1 still cancelled 4,079
+recvs so it is not a clean control. A park-off run at the same rate is the right
+comparison and is still pending on rig availability — the number here should be
+treated as bounded, not measured.
 
 **Costs to measure, not assume.** The stall lands in the tail, not the mean, so
 throughput may look unchanged while p99 moves — name that statistic when

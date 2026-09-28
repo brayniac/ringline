@@ -67,6 +67,95 @@ pub mod conn {
     pub const ADOPTED: usize = 4;
 }
 
+#[metric(
+    name = "ringline/park_diag",
+    description = "Park mechanism diagnostics: did the cancel happen, did the suppression hold"
+)]
+pub static PARK_DIAG: ShardedCounterGroup = ShardedCounterGroup::new(park_diag::COUNT);
+
+#[metric(
+    name = "ringline/park_drain_us",
+    description = "How long a park drain waited before its install went out, bucketed"
+)]
+pub static PARK_DRAIN_US: ShardedCounterGroup = ShardedCounterGroup::new(park_drain_us::COUNT);
+
+/// Wall-clock buckets for a completed park drain, in microseconds.
+///
+/// Bucketed counter slots rather than a metriken histogram on purpose:
+/// `runtime_metrics.rs` skips histograms when it walks the registry, so a
+/// histogram would dump nothing and the measurement would silently not exist.
+///
+/// Wall time rather than ticks, because the question is where 9 ms of p99 went.
+/// Park takes p50 down 43% and p99 up 4x (2.9 ms -> 12 ms), and 230 drains over
+/// 58 s stalling one of 256 connections cannot account for that on their own — so
+/// either drains are individually long, or the tail comes from somewhere the
+/// drain merely triggers. These buckets tell those apart; a tick count could not,
+/// since an event-loop iteration under saturation has no fixed duration.
+pub mod park_drain_us {
+    /// Under 100 us — the drain is not where the tail comes from.
+    pub const LT_100: usize = 0;
+    pub const LT_250: usize = 1;
+    pub const LT_500: usize = 2;
+    pub const LT_1MS: usize = 3;
+    pub const LT_2MS: usize = 4;
+    pub const LT_5MS: usize = 5;
+    pub const LT_10MS: usize = 6;
+    /// 10 ms or more — one drain this long would explain the p99 by itself.
+    pub const GE_10MS: usize = 7;
+
+    /// Number of buckets.
+    pub const COUNT: usize = 8;
+
+    /// The bucket an elapsed drain belongs in.
+    pub fn bucket(micros: u64) -> usize {
+        match micros {
+            0..=99 => LT_100,
+            100..=249 => LT_250,
+            250..=499 => LT_500,
+            500..=999 => LT_1MS,
+            1_000..=1_999 => LT_2MS,
+            2_000..=4_999 => LT_5MS,
+            5_000..=9_999 => LT_10MS,
+            _ => GE_10MS,
+        }
+    }
+}
+
+/// Why suppressing the `ECANCELED` re-arm did not stop offers being withdrawn.
+///
+/// Suppressing the re-arm left `not_offered` at 95.2% of abandonments, unchanged
+/// (`docs/journal/2026-09-two-phase-park.md`). These four answer the question the
+/// abandonment counters cannot: whether the cancel is submitted at all, whether
+/// the suppression fires, and whether data still reaches the connection while it
+/// is supposed to be draining. Between them there is only one consistent story,
+/// which is the point — six hypotheses have already died here.
+pub mod park_diag {
+    /// `begin_park` submitted a recv-cancel, because a multishot was armed.
+    pub const CANCEL_SUBMITTED: usize = 0;
+    /// `begin_park` started a park with *no* cancel, because no multishot was
+    /// armed. Such a park gets no suppression either, so anything still
+    /// delivering keeps delivering.
+    pub const CANCEL_ABSENT: usize = 1;
+    /// The `ECANCELED` branch took the draining early-return and skipped both
+    /// re-arms. If this is ~0 the suppression is dead code in practice.
+    pub const REARM_SUPPRESSED: usize = 2;
+    /// An offer was withdrawn while the connection was marked draining — data
+    /// reached it despite the cancel. If this tracks `not_offered`, the cancel
+    /// is not stopping delivery and the premise is wrong at the root.
+    pub const WITHDRAW_WHILE_DRAINING: usize = 3;
+
+    /// The install went out after a drain, which is the path phase 2 added.
+    pub const INSTALL_AFTER_DRAIN: usize = 4;
+    /// A drain ran out of ticks waiting for the handler to re-offer, so the
+    /// connection got its recv back instead of waiting forever.
+    pub const DRAIN_TIMEOUT: usize = 5;
+    /// A drain was dropped because the slot had been recycled under it.
+    pub const DRAIN_STALE: usize = 6;
+
+    /// Number of slots.
+    pub const COUNT: usize = 7;
+}
+
 /// Counter slot indices for park-abandonment reasons.
 ///
 /// One slot per `ParkBlocker`, plus the two failures that are not blockers.
@@ -209,6 +298,47 @@ pub fn init_metadata() {
     CONNECTIONS.insert_metadata(conn::PARK_STARTED, "op".into(), "park_started".into());
     CONNECTIONS.insert_metadata(conn::PARK_COMPLETED, "op".into(), "park_completed".into());
     CONNECTIONS.insert_metadata(conn::ADOPTED, "op".into(), "adopted".into());
+
+    PARK_DRAIN_US.insert_metadata(park_drain_us::LT_100, "op".into(), "lt_100us".into());
+    PARK_DRAIN_US.insert_metadata(park_drain_us::LT_250, "op".into(), "lt_250us".into());
+    PARK_DRAIN_US.insert_metadata(park_drain_us::LT_500, "op".into(), "lt_500us".into());
+    PARK_DRAIN_US.insert_metadata(park_drain_us::LT_1MS, "op".into(), "lt_1ms".into());
+    PARK_DRAIN_US.insert_metadata(park_drain_us::LT_2MS, "op".into(), "lt_2ms".into());
+    PARK_DRAIN_US.insert_metadata(park_drain_us::LT_5MS, "op".into(), "lt_5ms".into());
+    PARK_DRAIN_US.insert_metadata(park_drain_us::LT_10MS, "op".into(), "lt_10ms".into());
+    PARK_DRAIN_US.insert_metadata(park_drain_us::GE_10MS, "op".into(), "ge_10ms".into());
+
+    PARK_DIAG.insert_metadata(
+        park_diag::CANCEL_SUBMITTED,
+        "op".into(),
+        "cancel_submitted".into(),
+    );
+    PARK_DIAG.insert_metadata(
+        park_diag::CANCEL_ABSENT,
+        "op".into(),
+        "cancel_absent".into(),
+    );
+    PARK_DIAG.insert_metadata(
+        park_diag::REARM_SUPPRESSED,
+        "op".into(),
+        "rearm_suppressed".into(),
+    );
+    PARK_DIAG.insert_metadata(
+        park_diag::WITHDRAW_WHILE_DRAINING,
+        "op".into(),
+        "withdraw_while_draining".into(),
+    );
+    PARK_DIAG.insert_metadata(
+        park_diag::INSTALL_AFTER_DRAIN,
+        "op".into(),
+        "install_after_drain".into(),
+    );
+    PARK_DIAG.insert_metadata(
+        park_diag::DRAIN_TIMEOUT,
+        "op".into(),
+        "drain_timeout".into(),
+    );
+    PARK_DIAG.insert_metadata(park_diag::DRAIN_STALE, "op".into(), "drain_stale".into());
 
     PARK_ABANDONED.insert_metadata(park_abandon::NOT_OPEN, "op".into(), "not_open".into());
     PARK_ABANDONED.insert_metadata(
@@ -362,6 +492,34 @@ mod tests {
             udp::DATAGRAMS_DROPPED,
         ] {
             assert!(UDP.increment(idx), "UDP[{idx}] out of bounds");
+        }
+    }
+}
+
+#[cfg(test)]
+mod park_drain_bucket_tests {
+    use super::park_drain_us as pd;
+
+    /// Boundaries, because an off-by-one here silently misattributes the tail —
+    /// the whole point is telling "drains are sub-millisecond" from "a drain is
+    /// the 9 ms".
+    #[test]
+    fn buckets_split_where_they_say_they_do() {
+        assert_eq!(pd::bucket(0), pd::LT_100);
+        assert_eq!(pd::bucket(99), pd::LT_100);
+        assert_eq!(pd::bucket(100), pd::LT_250);
+        assert_eq!(pd::bucket(249), pd::LT_250);
+        assert_eq!(pd::bucket(250), pd::LT_500);
+        assert_eq!(pd::bucket(999), pd::LT_1MS);
+        assert_eq!(pd::bucket(1_000), pd::LT_2MS);
+        assert_eq!(pd::bucket(4_999), pd::LT_5MS);
+        assert_eq!(pd::bucket(5_000), pd::LT_10MS);
+        assert_eq!(pd::bucket(9_999), pd::LT_10MS);
+        assert_eq!(pd::bucket(10_000), pd::GE_10MS);
+        assert_eq!(pd::bucket(u64::MAX), pd::GE_10MS);
+        // every bucket in range
+        for us in [0u64, 100, 250, 500, 1_000, 2_000, 5_000, 10_000] {
+            assert!(pd::bucket(us) < pd::COUNT);
         }
     }
 }
