@@ -225,6 +225,23 @@ pub struct Config {
     /// 0 = no timeout (block indefinitely until a CQE arrives).
     /// Default: 1000 (1ms).
     pub(crate) tick_timeout_us: u64,
+    /// **Experimental.** Completions to wait for per event-loop iteration.
+    ///
+    /// The loop normally blocks for one CQE and processes whatever else has
+    /// landed. Waiting for more than one deliberately delays the first arrivals
+    /// so that a recv sees a fuller socket buffer, which is the interrupt
+    /// coalescing trade: fewer completions per operation, more latency per
+    /// request.
+    ///
+    /// Why it is experimental: `tick_timeout_us` is a Timeout SQE, so it
+    /// guarantees exactly *one* CQE per window. A value above 1 can therefore
+    /// still block waiting for the remainder, which is safe under steady load
+    /// and a stall at low load. A production version needs `IORING_ENTER_EXT_ARG`
+    /// so the wait itself carries a deadline.
+    ///
+    /// Default: 1 (block for the first completion, which is the historical
+    /// behaviour).
+    pub(crate) wait_min_complete: u32,
     /// Optional TLS configuration. When set, all accepted connections use TLS.
     pub(crate) tls: Option<TlsConfig>,
     /// Per-listener TLS, indexed by `ListenerId`. Populated by `launch()` from
@@ -431,6 +448,7 @@ impl Default for Config {
             send_slab_slots: 512,
             flush_interval_us: 100,
             tick_timeout_us: 1000,
+            wait_min_complete: 1,
             tls: None,
             listener_tls: Vec::new(),
             tls_client: None,
@@ -1028,6 +1046,17 @@ impl ConfigBuilder {
     /// Set the tick timeout in microseconds. 0 = block indefinitely.
     pub fn tick_timeout_us(mut self, us: u64) -> Self {
         self.config.tick_timeout_us = us;
+        self
+    }
+
+    /// **Experimental.** Completions to wait for per event-loop iteration.
+    ///
+    /// See [`Config::wait_min_complete`]. Values above 1 trade latency for
+    /// fewer completions per operation and can stall a worker at low load,
+    /// because `tick_timeout_us` only guarantees one CQE per window. 0 is
+    /// treated as 1.
+    pub fn wait_min_complete(mut self, n: u32) -> Self {
+        self.config.wait_min_complete = n.max(1);
         self
     }
 

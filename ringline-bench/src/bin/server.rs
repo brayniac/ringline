@@ -69,6 +69,8 @@ struct EchoCfg {
     tls: bool,
     /// Event-loop tick interval, microseconds.
     tick_timeout_us: u64,
+    /// Completions to wait for per event-loop iteration.
+    wait_min_complete: u32,
 }
 
 /// Which accept path the echo arm runs, so a pool-vs-merged A/B does not need
@@ -218,6 +220,16 @@ struct Args {
     /// not: if throughput tracks this knob, the work is tick-driven.
     #[arg(long, default_value_t = 1000)]
     tick_timeout_us: u64,
+
+    /// (ringline, io_uring only) Completions to wait for per event-loop
+    /// iteration. 1 is the current behaviour: return as soon as anything is
+    /// ready. A higher value blocks until that many completions are pending,
+    /// so each recv sees a fuller socket buffer and one wakeup covers more
+    /// operations — fewer completions per operation, at the cost of delaying
+    /// the first arrivals. Can stall a worker when fewer than `n` operations
+    /// are outstanding.
+    #[arg(long, default_value_t = 1)]
+    wait_min_complete: u32,
 
     /// (tokio only) Scheduler shape. `multi-thread` is tokio's default
     /// work-stealing runtime; `per-core` gives each core its own
@@ -449,6 +461,7 @@ fn main() {
             park_imbalance_ms: args.park_imbalance_ms,
             tls: args.tls,
             tick_timeout_us: args.tick_timeout_us,
+            wait_min_complete: args.wait_min_complete,
         }),
         Runtime::Tokio => {
             use ringline_bench::servers::tokio_arms;
@@ -654,6 +667,7 @@ fn run_ringline(cfg: EchoCfg) {
         park_imbalance_ms,
         tls,
         tick_timeout_us,
+        wait_min_complete,
     } = cfg;
     use ringline::ParseResult;
     use ringline::{AsyncEventHandler, RinglineBuilder};
@@ -777,7 +791,8 @@ fn run_ringline(cfg: EchoCfg) {
         .send_pool(512, msg_size.next_power_of_two().max(4096) as u32)
         .conn_chunk_size(conn_chunk_size)
         .accept_mode(accept_mode.into())
-        .tick_timeout_us(tick_timeout_us);
+        .tick_timeout_us(tick_timeout_us)
+        .wait_min_complete(wait_min_complete);
     // `direct` echoes the bytes as they arrived, straight from the CQE
     // handler. Under TLS those bytes are ciphertext, so the server would
     // reflect the client's own ciphertext instead of re-encrypting plaintext —

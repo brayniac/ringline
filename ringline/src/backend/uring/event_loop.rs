@@ -347,7 +347,15 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // runnable without queueing SQEs (so `flush()` takes its empty-SQ
             // shortcut) starves the whole worker of completions.
             if self.executor.ready_queue.is_empty() {
-                self.driver.ring.submit_and_wait(1)?;
+                // Normally 1: block for the first completion and process
+                // whatever else has landed. Above 1 (experimental) this waits
+                // for more, deliberately delaying the earliest arrivals so a
+                // recv sees a fuller socket buffer — fewer completions per
+                // operation at the cost of latency. See
+                // `Config::wait_min_complete`.
+                self.driver
+                    .ring
+                    .submit_and_wait(self.driver.wait_min_complete)?;
             } else {
                 self.driver.ring.submit_and_get_events()?;
             }

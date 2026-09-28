@@ -369,6 +369,8 @@ pub(crate) struct Driver {
     /// connection is left `Open` with no recv armed and its bytes piling up
     /// forever — the failure the unconditional re-arm was added to prevent.
     pub(crate) park_drain: Vec<Option<ParkDrain>>,
+    /// Completions to wait for per iteration; see `Config::wait_min_complete`.
+    pub(crate) wait_min_complete: u32,
     /// State the handler deposited alongside the offer, carried to the
     /// adopting worker and handed to `on_adopt`.
     ///
@@ -1062,6 +1064,7 @@ impl Driver {
             adopt_pending: std::collections::HashMap::new(),
             park_offered: vec![false; config.max_connections as usize],
             park_drain: vec![None; config.max_connections as usize],
+            wait_min_complete: config.wait_min_complete.max(1),
             park_carry: std::collections::HashMap::new(),
             park_in_flight: vec![None; config.max_connections as usize],
             park_ready: Vec::new(),
