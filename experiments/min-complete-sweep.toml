@@ -36,6 +36,25 @@
 #
 # Nothing adaptive gets built before this fixed sweep says which.
 #
+# MECHANISM, and why the response may be threshold-shaped rather than smooth.
+# Blocking the reaper does not by itself stop the kernel posting completions --
+# multishot recv re-arms in the kernel and fires on arrival whether or not the
+# application has reaped anything. The coupling runs through the provided buffer
+# ring instead: a recv CQE checks a buffer out, and it is the application that
+# returns it (`pending_replenish`, committed in `flush_replenish_and_rearm`).
+# While the worker is blocked in `io_uring_enter` those buffers stay checked
+# out, so a long enough block runs the ring dry -- and a kernel with no provided
+# buffer cannot post a recv completion, so bytes accumulate in the socket buffer
+# and the next recv carries more of them. That is the same mechanism the worker
+# count sweep exercised, induced by delay instead of by load.
+#
+# It predicts a threshold, not a proportionality: nothing should change until
+# the block is long enough to exhaust the ring. So a flat n=2 followed by a
+# drop at n=4 or n=8 is a CONFIRMATION with a threshold, not a refutation, and
+# flat-everywhere at these n is weak evidence -- the honest reading would be
+# "not with this buffer ring at this delay", and the follow-up is a smaller
+# recv ring rather than abandoning the idea.
+#
 # n=1 is a REPLICATE of the coalesce sweep's 8-worker point, not just a control
 # arm: same 256 connections, 600k offered, 64B, park off, merged accept. It
 # should land near 1.70 CQE/op and p50 862us. If it does not, the two sweeps are
