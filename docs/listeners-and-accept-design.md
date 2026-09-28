@@ -663,18 +663,29 @@ per-worker load stands as the explanation.
 
 ##### The noise floor, and which comparisons survive it
 
-Two runs of one configuration — 8 workers, 256-buffer ring, `min_complete` 1,
-same binary, submitted as arms of two different sweeps:
+**Five** runs of one configuration — 8 workers, 256-buffer ring, `min_complete`
+1, same binary, landing as arms of three different sweeps:
 
-| metric | run A | run B | spread |
+| replicate | CQE/op | p50 | p99 |
 |---|---|---|---|
-| ops/s | 599,978 | 599,995 | 0.003% |
-| CQE/op | 1.64 | 1.95 | **18.6%** |
-| p50 | 920.5us | 693.1us | **32.8%** |
-| p99 | 10,154us | 16,967us | **67.1%** |
+| A | 1.64 | 920.5us | 10,154us |
+| B | 1.86 | 777.3us | 10,888us |
+| C | 1.93 | 707.2us | 9,208us |
+| D | 1.94 | 695.4us | 27,131us |
+| E | 1.95 | 693.1us | 16,967us |
+
+| metric | min | max | mean | stdev | spread |
+|---|---|---|---|---|---|
+| ops/s | 599,978 | 600,005 | — | — | 0.005% |
+| CQE/op | 1.64 | 1.95 | 1.86 | 0.128 | **18.6%** |
+| p50 | 693.1us | 920.5us | 758.7us | 96.8 | **32.8%** |
+| p99 | 9,208us | 27,131us | 14,870us | 7,498 | **194.6%** |
 
 Offered load is reproduced to five figures; everything derived from timing is
-not. This has to be applied to every claim in this section:
+not. **p99 varies by a factor of three across identical runs** — it is not a
+usable statistic for single-run comparison at this scale, and the two-run
+estimate that first appeared here (67%) understated it by 3x. This has to be
+applied to every claim in this section:
 
 - **Survives.** The worker-count shape. 0.47 / 0.91 / 1.88 / 1.86 spans 4x
   against an 18.6% floor, and the p99 advantage at `w4` (2601.9us against
@@ -687,14 +698,32 @@ not. This has to be applied to every claim in this section:
   on latency at all, so "p50 is best at full spread" rests on the 2x steps below
   `w8`, not on that last row.
 - **Does not survive.** Anything at all from the `min_complete` sweep, and the
-  b32 p50.
+  b32 p50. The completed sweep is:
+
+  | `min_complete` | ops/s | CQE/op | p50 | p99 | `recv_parked` |
+  |---|---|---|---|---|---|
+  | 1 | 599,978 | 1.64 | 920.5us | 10,154us | 0 |
+  | 2 | 600,005 | 1.65 | 933.6us | 6,035us | 0 |
+  | 4 | 600,002 | 1.78 | 804.4us | 24,727us | 0 |
+  | 8 | 600,004 | 1.79 | 824.1us | 11,935us | 0 |
+
+  Every arm falls inside the baseline's own 1.64–1.95 range, and the whole span
+  is 8.8% against a 0.128 standard deviation — about one sigma. One oddity worth
+  recording rather than interpreting: CQE/op is monotone increasing across the
+  four arms, which has a ~4% chance under random ordering. But the values pair up
+  (1.64, 1.65) and (1.78, 1.79) more like two machine states than a trend, the
+  magnitude is inside the floor, and the *direction is opposite* to any mechanism
+  — more blocking producing **less** batching is not something to explain. It is
+  noted so the next person does not rediscover it and read it as signal.
 
 `b256`'s 1.95 also lands on the original 1.88 reference, so the two sweeps are
 mutually comparable — an earlier note claiming the `n=1` arm failed to replicate
 was reading an 18.6% floor as a 13% discrepancy.
 
-Three further reps are queued and will tighten this; the floor above is two
-runs, which bounds it loosely rather than estimating it.
+Five runs bound this usefully for CQE/op and p50. It is still a bound and not a
+variance estimate — but the practical rule it yields is clear enough: on this rig
+and this workload, **a single-run CQE/op difference under ~20% is not a result,
+and a single-run p99 difference under ~3x is not a result.**
 
 ##### What is still not separated
 
