@@ -686,11 +686,21 @@ per-worker load stands as the explanation.
 | p99 | 9,208us | 46,162us | 20,085us | 14,428 | 71.8% | **401.3%** |
 
 Offered load is reproduced to five figures; everything derived from timing is
-not. CQE/op and p50 converge — their spread was stable from four replicates on.
-**p99 does not converge.** Its measured spread grew at every sample size, 67% →
-84% → 195% → 401%, because the maximum keeps extending: that is a heavy tail, and
-it means no number of runs makes a single-run p99 comparison safe. It is not a
-usable statistic here at all.
+not. **Read the CV column, not the spread column.** Spread is `(max-min)/min`,
+which can only grow as samples accumulate — it is monotonically non-decreasing by
+construction, so its growth across sample sizes says nothing about the underlying
+distribution. An earlier revision of this section made exactly that mistake,
+quoting p99 spread going 67% → 84% → 195% → 401% as evidence of a heavy tail and
+concluding that "no number of runs" could make the comparison safe. Both halves
+were wrong: the growth was an artifact of the statistic, and more runs is
+precisely the remedy. For the record the p99 CV over the same accumulation ran
+35.5% → 35.0% → 29.7% → 50.4% → 71.8% — declining until the last two draws.
+
+What the numbers do support: CQE/op is stable (CV 6.3%), p50 is moderately noisy
+(CV 11.4%), and p99 is very noisy (CV 71.8%, 9.2ms to 46.2ms across identical
+runs). Single-run comparisons are safe for the first, marginal for the second and
+unsafe for the third — but "unsafe single-run" means *take replicates*, not
+"unusable".
 
 This has to be applied to every claim in this section:
 
@@ -699,17 +709,22 @@ This has to be applied to every claim in this section:
   These are the load-bearing results of this section.
 - **Survives.** The p50 trend, 3206.9 → 1530.8 → 767.4us across `w2` → `w4` →
   `w8`: 2x steps against a 32.8% floor.
-- **UNRESOLVED, previously claimed as a result.** The p99 advantage at `w4`
-  (2601.9us against 18945.9us at `w8`). An earlier revision of this section
-  called it 7x against a 67% floor and therefore safe. Both figures were wrong:
-  the floor is 401% (4x) at the `w8` configuration, so the margin is 1.8x rather
-  than 10x, and worse, *both* sides are single runs of a heavy-tailed statistic —
-  the `w8` configuration alone was observed anywhere from 9,208us to 46,162us.
-  A single-run-versus-single-run comparison cannot establish the direction here.
-  **The claim that p99 is best at a middle worker count is withdrawn pending
-  replicates at both `w4` and `w8`** (five each, at minimum). Until then this
-  section supports "spreading costs per-operation efficiency and CPU", and does
-  *not* support any statement about which worker count serves the tail best.
+- **Likely but not established: the p99 advantage at `w4`.** The single `w4` run
+  measured 2601.9us. The `w8` configuration has since been run six times and
+  measured 9,208 / 10,154 / 10,888 / 16,967 / 27,131 / 46,162us — **every one of
+  them above the `w4` point**, the smallest by 3.5x. So the reps that exist are
+  one-sided *in favour* of the claim, not against it.
+
+  It is still not established, for one reason: `w4` has a single run and its own
+  variability is unmeasured. Treating the six `w8` values as a reference
+  distribution, a single `w4` draw falling below all six has probability 1/7 ≈
+  **14%** under a null of no difference — suggestive, short of conclusive. Five
+  `w4` replicates would settle it, and that is the cheap next measurement.
+
+  (An earlier revision first called this "7x against a 67% floor, safe" and then
+  over-corrected to "withdrawn". Neither was right: the first used a two-run
+  floor, and the second reasoned from the invalid spread argument above while
+  ignoring that all six reference observations sit on the claim's side.)
 - **Survives**, because it is categorical rather than a magnitude: every
   `recv_parked` / `buffer_ring_empty` / `recv_fallback` comparison. Zero versus
   285, and zero versus 36 million, are not noise.
@@ -740,12 +755,13 @@ This has to be applied to every claim in this section:
 mutually comparable — an earlier note claiming the `n=1` arm failed to replicate
 was reading an 18.6% floor as a 13% discrepancy.
 
-The practical rule, on this rig and this workload: **a single-run CQE/op
-difference under ~20% is not a result, a single-run p50 difference under ~33% is
-not a result, and a single-run p99 difference is not a result at any magnitude
-short of an order of magnitude** — and even then it wants replicates, because the
-tail is what moves. Any future claim about the latency trade in this section has
-to come with reps on both sides.
+The practical rule, on this rig and this workload, stated in CVs because those
+are the sample-size-independent numbers: CQE/op CV 6.3%, p50 CV 11.4%, p99 CV
+71.8%. So a single-run CQE/op difference under ~15% is not a result, a p50
+difference under ~25% is not a result, and a p99 difference wants replicates on
+both sides at any magnitude under ~3x. Where only one side has been replicated,
+say so and give the one-sided reading rather than either asserting or withdrawing
+the claim.
 
 ##### What is still not separated
 
