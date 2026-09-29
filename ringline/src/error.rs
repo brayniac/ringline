@@ -400,6 +400,11 @@ pub(crate) fn describe_buffer_registration_failure(
 /// 6.12 (#426). Sending the reader to `ulimit -l` is sending them down the one
 /// road already known to be a dead end, and it was re-proposed twice because
 /// the refutation lived in a CI comment instead of next to the message.
+// Only the io_uring provided-buffer-ring path calls this, so on the mio backend
+// it has no caller. Kept compiled (rather than cfg'd out) so its two guard tests
+// run on every backend, including macOS where the io_uring path cannot build at
+// all -- the tests are about the wording of a finding, not about io_uring.
+#[cfg_attr(not(has_io_uring), allow(dead_code))]
 pub(crate) fn provided_ring_enomem_hint() -> &'static str {
     concat!(
         "ENOMEM here is NOT RLIMIT_MEMLOCK -- that was measured and ruled out ",
