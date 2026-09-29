@@ -583,6 +583,35 @@ every run serves the same 600k ops/s.
 > *rate* does not imply per-worker *utilisation* when both the per-operation cost
 > and the fixed loop cost move with worker count.)
 
+> **And a pinned worker is not a worker at capacity.** Holding the worker count at
+> 2 and sweeping offered load gives, per worker, 150k / 300k / 600k ops per second
+> at **1.00 CPU in every case**:
+>
+> | offered | ops/s/worker | worker CPU | ops per worker-CPU-sec | CQE/op | p50 | p99 |
+> |---|---|---|---|---|---|---|
+> | 300k | 150,000 | 1.00 | 150,436 | 1.04 | 2535us | 5772us |
+> | 600k | 300,000 | 1.00 | 300,034 | 0.46 | 3095us | 6304us |
+> | 1.2M | 600,000 | 1.00 | 600,114 | 0.17 | 5730us | 111,739us |
+>
+> Four times the work per CPU-second, on the same two cores, at the same
+> utilisation — because coalescing cuts completions per operation from 1.04 to
+> 0.17 (one completion carrying ~12 requests at the top). Two claims made earlier
+> in this session are wrong as a result: that `w2` at 600k was "right at the edge"
+> of capacity (it had 2x headroom), and that a worker has a fixed completion
+> budget from which ops-per-CPU-second follows. **Utilisation says nothing about
+> headroom here**, because the efficiency is itself a function of load.
+>
+> The cost is the tail, and it is not gentle: p50 grows 1.8x across that range
+> while p99 grows **19x**, almost all of it in the final doubling. That is the
+> same trade the worker-count series shows, driven from the other axis — and it is
+> why "read the shape, not the row" applies to the offered rate as much as to the
+> worker count. A `w4` knee at 600k is a `w8` knee at 1.2M.
+>
+> Softirq is worth noting alongside it: non-worker CPU on the same host goes 2.08
+> → 2.83 → 4.84 cores across those three rates, so by 1.2M the kernel network path
+> costs more than the runtime's own workers do. Any per-operation accounting that
+> stops at the worker threads is missing the larger half.
+
 Completions per operation **halve with every halving of the worker count**, then
 flatten against a ceiling of ~2.0 — one recv and one send completion per echo
 request, which is what "no batching at all" costs. At 128 connections per worker
