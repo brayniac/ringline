@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- io_uring: a `shutdown_write()` could half-close a **different, live**
+  connection. `Shutdown` names its socket as the registered-file slot
+  `Fixed(conn_index)`, not as an fd, and nothing pinned the slot for the
+  operation's lifetime: a `Shutdown` is not a queued send, so
+  `try_finalize_close` did not count it, and its completion was discarded
+  (`OpTag::Shutdown => {}`). The `Close` that frees the slot could therefore be
+  submitted and complete first, the next accept could register the slot, and the
+  kernel could then run the FIN against that new connection — whose next send
+  failed with `EPIPE` while its peer saw a clean, early end of stream. The close
+  now waits on the `Shutdown` CQE, and the SQE carries its connection generation
+  so a stale completion is rejected and counted as `ringline/ring`
+  `shutdown_stale` rather than clearing the new occupant's state. Measured on a
+  2-CPU guest at 46/400 rounds with 16 connections, 0/400 with the shutdown
+  removed, and 0/400 with this fix. Backport of #523 (#518).
+
 ## [0.6.8] - 2026-09-29
 
 ### Fixed

@@ -68,6 +68,25 @@ pub(crate) struct ConnSendState {
     /// the send queue fully drains, reporting the whole logical byte count.
     #[cfg_attr(not(has_io_uring), allow(dead_code))]
     pub acked_bytes: u32,
+    /// Whether a deferred-or-immediate `Shutdown` SQE for the current occupant
+    /// is still in the kernel.
+    ///
+    /// `Shutdown` names its socket as the *registered-file slot*
+    /// `Fixed(conn_index)`, not as an fd, so it must not execute after that slot
+    /// has been closed and handed to the next accept — the kernel would FIN
+    /// whoever now holds the slot, half-closing a live connection whose next
+    /// send then fails `EPIPE` (#518). Nothing pinned it before: a `Shutdown` is
+    /// not a queued send, so `try_finalize_close` could not see it, and its
+    /// completion was discarded (`OpTag::Shutdown => {}`). Set only when the SQE
+    /// is accepted, cleared by its CQE, and required by `try_finalize_close`
+    /// before the `Close` that frees the slot may be submitted.
+    ///
+    /// Set only on a successful push: both call sites on this branch discard the
+    /// result (`let _ = submit_shutdown(..)`), and setting the flag for an SQE
+    /// that was never accepted would hold the close forever and leak the fd and
+    /// slot — turning a half-close into a leak.
+    #[cfg_attr(not(has_io_uring), allow(dead_code))]
+    pub shutdown_inflight: bool,
 }
 
 impl ConnSendState {
@@ -82,6 +101,7 @@ impl ConnSendState {
             close_send_count: 0,
             close_notify_deadline: None,
             acked_bytes: 0,
+            shutdown_inflight: false,
         }
     }
 }
@@ -587,7 +607,11 @@ impl<'a> DriverCtx<'a> {
                 // Defer until send queue drains.
                 self.send_queues[idx].shutdown_pending = true;
             } else {
-                let _ = self.ring.submit_shutdown(conn.index);
+                // Only on a successful push: see `shutdown_inflight`.
+                let generation = conn.generation;
+                if self.ring.submit_shutdown(conn.index, generation).is_ok() {
+                    self.send_queues[idx].shutdown_inflight = true;
+                }
             }
         }
     }
