@@ -1,3 +1,7 @@
+# STATUS: LIVE. Both arms are built from `main`, so this keeps working as the
+# branches age out. It is the A/B to reach for when this bug needs reproducing:
+# the `unfixed` arm reverts the fix commit, so it must still fail.
+#
 # Does gating the close on the Shutdown CQE remove the half-close? (#518)
 #
 # THE BUG, established by measurement rather than by reading. Context 01a0eefd,
@@ -32,8 +36,16 @@
 # ARMS, paired in one run so the control is measured under the same conditions
 # rather than quoted from an earlier context:
 #
-#   unfixed  the diagnosis branch: instrument, no fix
-#   fixed    this branch: instrument + fix
+#   fixed    main as it stands
+#   unfixed  main with the fix commit reverted, then `ringline/tests/echo.rs` and
+#            `experiments/` restored from HEAD so the instrument survives
+#
+# RE-RUNNABLE ON PURPOSE. The `unfixed` arm used to be a topic branch, which
+# would have rotted the moment that branch was deleted. Reverting the fix on
+# whatever `main` is today is durable, and it says something stronger than an old
+# branch could: putting the bug back must bring the failure back. If a future
+# change makes the revert stop reproducing, either the revert no longer removes
+# the whole mechanism or something else now prevents it — both worth knowing.
 #
 # PREDICTION, written before the run:
 #
@@ -60,9 +72,15 @@ context_name = "ringline: does gating the close on the Shutdown CQE fix #518?"
 arm = ["unfixed", "fixed"]
 
 [params]
-repo        = "https://github.com/brayniac/ringline"
-unfixed_ref = "diag/518-epipe-on-early-slots"
-fixed_ref   = "fix/518-shutdown-sqe-outlives-its-slot"
+# Upstream, and `main` for both arms: the `unfixed` arm is made by reverting the
+# fix commit rather than by checking out a branch, so this spec keeps working
+# after the topic branches are deleted.
+repo        = "https://github.com/ringline-rs/ringline"
+branch      = "main"
+# The squashed merge of #523 on main. Reverting it also removes the instrument
+# (the cherry-picked instrument commits were squashed into it), so the payload
+# restores `ringline/tests/echo.rs` and `experiments/` from HEAD afterwards.
+fix_commit  = "8c5deb02754d839b1573cc3a38612ec89aa8023c"
 cpus        = "2"
 rounds      = "400"
 calib_iters = "200"
@@ -87,19 +105,28 @@ set -uo pipefail
 cd /home/anvil
 {
   uname -srm; nproc
-  if [ "{arm}" = "fixed" ]; then REF={fixed_ref}; else REF={unfixed_ref}; fi
   git clone -q {repo} src || { echo "FATAL: clone failed"; exit 1; }
-  git -C src checkout -q "$REF" || { echo "FATAL: no such ref: $REF"; exit 1; }
-  cd src && git log --oneline -1
+  cd src
+  git checkout -q {branch} || { echo "FATAL: no such ref: {branch}"; exit 1; }
+  git log --oneline -1
+  if [ "{arm}" = "unfixed" ]; then
+    git config user.email repro@example.com && git config user.name repro
+    git revert --no-commit {fix_commit} || { echo "FATAL: revert of {fix_commit} did not apply; main has moved under this spec"; exit 1; }
+    # The revert also removes the instrument, because the instrument commits were
+    # squashed into the same merge. Put the test file and the specs back.
+    git checkout -q HEAD -- ringline/tests/echo.rs experiments/ \
+      || { echo "FATAL: could not restore the instrument after the revert"; exit 1; }
+    echo "reverted {fix_commit}; instrument restored"
+  fi
 
   # The arms must differ, and in the direction claimed.
   if grep -q "shutdown_inflight" ringline/src/handler.rs; then HAS_FIX=yes; else HAS_FIX=no; fi
-  echo "arm={arm} ref=$REF has_fix=$HAS_FIX"
+  echo "arm={arm} branch={branch} has_fix=$HAS_FIX"
   if [ "{arm}" = "fixed" ] && [ "$HAS_FIX" != "yes" ]; then
-    echo "FATAL: fixed arm lacks shutdown_inflight; wrong or stale ref"; exit 1
+    echo "FATAL: fixed arm lacks shutdown_inflight; has the fix left main?"; exit 1
   fi
   if [ "{arm}" = "unfixed" ] && [ "$HAS_FIX" = "yes" ]; then
-    echo "FATAL: unfixed arm already carries the fix; the control is void"; exit 1
+    echo "FATAL: the revert left the fix in place; the control is void"; exit 1
   fi
   grep -q "RL518_SHUTDOWN" ringline/tests/echo.rs \
     || { echo "FATAL: branch lacks the instrument"; exit 1; }
@@ -170,7 +197,7 @@ cd /home/anvil
   done
   [ "$ran" != "{calib_iters}" ] && echo "INVALID: only $ran of {calib_iters} ran"
 
-  echo "RESULT arm={arm} cpus=$CPUS :: instrumented[$inst] original[ran=${ran}/{calib_iters} failed=${fails}]"
+  echo "RESULT arm={arm} branch={branch} cpus=$CPUS :: instrumented[$inst] original[ran=${ran}/{calib_iters} failed=${fails}]"
 } 2>&1 | tee /home/anvil/verify.log
 exit 0
 '''

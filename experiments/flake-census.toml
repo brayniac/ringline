@@ -1,0 +1,212 @@
+# A flake census: which tests fail under 2-vCPU scarcity, and how often.
+#
+# WHY THIS SHAPE. Confining to 2 CPUs and repeating found two real things in four
+# tests: #518 (a genuine data-loss race in `send_backpressured`, 2-7% per run) and
+# #378 (`buffer_ring_exhaustion_recovers`, 2% per run, which had resisted local
+# reproduction since 2026-09-11). Both need the parallel context of a whole test
+# binary; neither shows up at 4 or 8 CPUs in 400 runs. There are ~620 tests nobody
+# has looked at under that lever.
+#
+# So: run every `ringline` test target repeatedly at 2 vCPU and tally what fails.
+# A census, not a gate -- the output is a rate per test, not pass/fail.
+#
+# ON-DEMAND, AND NOT A CI HOOK. This is submitted by hand against a named branch,
+# which keeps it outside the trust boundary a CI hook would cross: no PR author's
+# code, no secrets, no untrusted build.rs. That distinction is the whole security
+# story, because a Rust build executes build.rs and proc macros at compile time --
+# there is no "compile but do not run" middle ground. If this is ever pointed at a
+# branch from a contributor other than the maintainer, it needs a security review
+# first: the guest has an sccache shared with other projects (cache poisoning
+# reaches slipway and the llama packaging jobs) and a DHCP lease on 10/8 (lateral
+# movement onto the rig network). The guest boundary contains a malicious build to
+# a VM, which is why this uses guests and never a bare host.
+#
+# TIME-BOXED, NOT COUNT-BOXED. Per-iteration cost varies more than 10x across
+# targets, so a fixed iteration count would give the slow binaries too few reps and
+# waste the budget on fast ones. Every arm gets the same minutes and reports how
+# many iterations it fit, so a rate is still computable.
+#
+# BASELINE FIRST, which is the part that keeps this honest. Several targets need
+# things a bare guest lacks -- a redis or memcached server, reachable public
+# endpoints, particular rlimits. Counting those as flakes would swamp the signal
+# with environmental noise. So each arm runs its target ONCE and, if that fails,
+# reports BASELINE_RED with the failing test names and does not census it. A target
+# that cannot pass once is a different problem from a target that passes 98 times
+# in 100.
+#
+# READ THE ZEROS WITH THIS IN MIND. A Pi guest suppresses this class of race by
+# roughly 4x relative to x86 at the same core count: #518 measures 0.5% on a Pi
+# guest against 2% on x86 at 2 CPUs, most likely because `sched_fifo` keeps the
+# vCPU threads off the ordinary preemption path. So zero failures in N Pi
+# iterations bounds the x86-equivalent rate near 12/N rather than 3/N -- 1800
+# iterations buys roughly "under 0.7% on x86", while a 357-iteration target buys
+# only "under 3.4%". Low-iteration targets are much weaker evidence than a clean
+# verdict suggests.
+#
+# EXPECTED, recorded so the census is read rather than skimmed:
+#  * `echo` should show buffer_ring_exhaustion_recovers (#378) and
+#    backpressured_send_waits_for_pool_capacity_without_duplication (#518).
+#    Those two are the positive controls -- if they do NOT appear, the census is
+#    not exercising the condition and its zeros mean nothing.
+#  * `throughput` asserts ringline is within 5x of std::net. In debug on 2 vCPU
+#    that bound is likely unsound, and a high rate there is a finding about the
+#    test rather than the runtime.
+#  * `guard_send_threshold` should be quiet: chain_guard (#513) stayed clean at
+#    2 CPUs in both modes across 200 runs.
+name = "census {target}"
+
+[matrix]
+context_name = "ringline: flake census under 2-vCPU scarcity"
+target = [
+  "lib", "echo", "udp", "fs", "tls_echo", "stream_echo", "throughput",
+  "guard_send_threshold", "submit_batch_await", "shutdown_drop", "signal_shutdown",
+  "blocking", "direct_io", "handler_callbacks", "process", "ready_queue_fairness",
+  "recv_accumulator_cap", "region_registry", "memlock_limit", "ring_setup_eperm",
+]
+
+[params]
+branch     = "main"
+repo       = "https://github.com/ringline-rs/ringline"
+budget_min = "20"
+
+[[jobs]]
+name = "census"
+tags = ["pi4b"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+shape = "a72.c"
+image = "debian-13-ci"
+memory_gib = 4
+gpu = false
+payload_timeout = 7200
+artifacts = ["/home/anvil/census.log", "/home/anvil/tally.txt"]
+upload = true
+payload = '''
+set -uo pipefail
+cd /home/anvil
+{
+  uname -srm; HAVE=$(nproc); echo "vcpus=$HAVE"
+  # 2 vCPU is the condition under test. More would be a different experiment.
+  [ "$HAVE" = "2" ] || echo "WARNING: expected 2 vCPU, got $HAVE -- rates not comparable to the #518 matrix"
+
+  sudo apt-get update -qq 2>/dev/null || true
+  export PATH="$HOME/.cargo/bin:$PATH"
+  cargo --version || { echo "no cargo in the CI image"; exit 1; }
+  git clone -q {repo} src && git -C src checkout -q {branch}
+  cd src && git log --oneline -1
+  # prlimit, not `ulimit -n`: the builtin cannot raise the soft limit past the
+  # hard one, so asking for 1e6 fails EPERM on these guests (hard is lower) and
+  # `sudo ulimit` is meaningless -- ulimit is a shell builtin and sudo cannot
+  # change the calling shell's limits. `sudo prlimit --pid $$` can, which is what
+  # coalesce-sweep.toml has always done. Echo BOTH limits: the uring test binary
+  # aborts with io_uring_setup EMFILE at a 1024 soft limit, and a reader needs to
+  # see the effective value to know whether a failure was the runtime or the fd
+  # ceiling.
+  sudo prlimit --nofile=1000000 --pid $$ 2>/dev/null || ulimit -n 65536 2>/dev/null || true
+  echo "fd soft=$(ulimit -Sn) hard=$(ulimit -Hn)"
+
+  case "{target}" in
+    lib) TARGET="-p ringline --lib" ;;
+    *)   TARGET="-p ringline --test {target}" ;;
+  esac
+  echo "target={target} cargo_args=$TARGET budget={budget_min}min"
+
+  cargo build --locked --tests -p ringline 2>&1 | tail -2
+  cargo run --locked -q -p ringline-bench --bin bench-server -- --print-backend > bk.txt 2>/dev/null || true
+  got=$(cat bk.txt 2>/dev/null || echo unknown)
+  [ "$got" = "io_uring" ] || { echo "BACKEND MISMATCH: $got"; exit 1; }
+  echo "backend ok: $got"
+
+  # ── baseline: BEST OF THREE, or this target is not censusable ──────────────
+  #
+  # Best of three and not one run, because a single attempt can be tripped by the
+  # very flake being censused: an `echo` baseline has roughly a 4% chance of
+  # failing at 2 vCPU from #518 and #378 alone, and a one-shot gate would then
+  # skip the census of the arm that carries both positive controls. A target that
+  # cannot pass in three attempts is genuinely broken or environmental, which is
+  # the distinction this gate is for.
+  base_ok=0
+  for attempt in 1 2 3; do
+    base=$(cargo test --locked -q $TARGET 2>&1)
+    echo "$base" | grep -qE "test result: .* [0-9]+ (passed|failed)" || {
+      echo "BASELINE_NORUN target={target} -- ran no tests, args wrong"; exit 1; }
+    if echo "$base" | grep -q "test result: FAILED"; then
+      echo "baseline attempt $attempt red:"
+      echo "$base" | grep -E "^test .* \.\.\. FAILED" | sed 's/^test //; s/ \.\.\. FAILED//' | sort -u | sed 's/^/    /'
+    else
+      base_ok=1; echo "baseline green for {target} on attempt $attempt"; break
+    fi
+  done
+  if [ "$base_ok" != "1" ]; then
+    echo "BASELINE_RED target={target} -- failed all 3 attempts, not censused"
+    echo "$base" | grep -E "^test .* \.\.\. FAILED" | sed 's/^test //; s/ \.\.\. FAILED//' | sort -u | sed 's/^/  BASELINE_FAIL /'
+    echo "CENSUS target={target} iters=0 status=baseline_red"
+    exit 0
+  fi
+
+  # ── census: repeat within the budget, tally by test name ───────────────────
+  : > /home/anvil/tally.txt
+  deadline=$(( $(date +%s) + {budget_min} * 60 ))
+  iters=0; runs_failed=0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    out=$(cargo test --locked -q $TARGET 2>&1)
+    rc=$?
+    echo "$out" | grep -qE "test result: .* [0-9]+ (passed|failed)" || {
+      echo "ITER $iters ran no tests -- aborting"; exit 1; }
+    iters=$((iters+1))
+    if [ "$rc" != "0" ]; then
+      runs_failed=$((runs_failed+1))
+      # Attribution, and why it is parsed this way: `cargo test -q` does NOT print
+      # per-test `test NAME ... FAILED` lines -- it prints dots, and names the
+      # failures only in the indented `failures:` block near the end. The first
+      # version of this census grepped for the FAILED lines, tallied nothing, and
+      # reported `runs_failed=11` and "no failures" in the same breath. Take the
+      # names from the failures block instead.
+      # `-q` output has TWO `failures:` lines: the first introduces the per-test
+      # stdout dumps, the second is the name list. Buffer from each and keep only
+      # the last block before `test result:`, so a test that printed a one-word
+      # line to stdout is not mistaken for a test name -- a naive version of this
+      # parse captured "boom" out of a stdout dump.
+      echo "$out" | awk '
+        /^failures:$/ { n=0; next }
+        /^test result:/ { for(i=1;i<=n;i++) print buf[i]; n=0; next }
+        /^----/ { n=0; next }
+        /^[ \t]+[A-Za-z_][A-Za-z0-9_:]*$/ { gsub(/^[ \t]+/,""); buf[++n]=$0 }
+      ' >> /home/anvil/tally.txt
+      echo "iter $iters FAILED (runs_failed=$runs_failed)"
+    fi
+  done
+  echo "CENSUS target={target} iters=$iters runs_failed=$runs_failed status=ok"
+  if [ -s /home/anvil/tally.txt ]; then
+    sort /home/anvil/tally.txt | uniq -c | sort -rn | while read -r n t; do
+      echo "FAIL $t $n/$iters"
+    done
+  elif [ "$runs_failed" -gt 0 ]; then
+    # Runs failed but nothing was attributed: the run count is authoritative and
+    # the parser missed something -- a binary that aborted before producing any
+    # test result, say. Say that, rather than printing "no failures" and
+    # contradicting runs_failed on the line above, which is what v1 did.
+    echo "ATTRIBUTION_MISSING $runs_failed/$iters runs failed, no test name captured"
+  else
+    echo "no failures in $iters iterations"
+  fi
+} 2>&1 | tee /home/anvil/census.log
+rc=${PIPESTATUS[0]}
+echo "payload_status=$rc" | tee -a /home/anvil/census.log
+exit 0
+'''
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "stop"
+upload = true
+
+[[jobs.steps]]
+type = "shell"
+command = '''
+grep -q "payload_status=0" census.log || { echo "payload failed"; exit 1; }
+grep -q "backend ok: io_uring" census.log || { echo "backend gate did not pass"; exit 1; }
+grep -qE "^(CENSUS |BASELINE_RED )" census.log || { echo "no census verdict"; exit 1; }
+grep -E "^(CENSUS |BASELINE_RED |BASELINE_FAIL |FAIL |WARNING: |no failures)" census.log
+'''
