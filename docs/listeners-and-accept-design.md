@@ -843,7 +843,15 @@ a latency objective than a higher but stable tail would be.
   | 8 | 600,004 | 1.79 | 824.1us | 11,935us | 0 |
 
   Every arm falls inside the baseline's own 1.64–1.95 range, and the whole span
-  is 8.8% against a 0.128 standard deviation — about one sigma. One oddity worth
+  is 8.8% against a 0.128 standard deviation — about one sigma.
+
+  **`min_complete` is not exposed in the tree.** It was measured with an
+  unmerged experimental patch adding a `wait_min_complete` config knob, kept off
+  `main` precisely because the result was NO-GO: there is no flag to look for, and
+  nothing to tune. The syscall counters later explained why it could not have
+  worked — `w8` was already reaping ~23 completions per `io_uring_enter` unaided,
+  so asking it to wait for 8 was asking for a third of the batch the loop already
+  achieved. One oddity worth
   recording rather than interpreting: CQE/op is monotone increasing across the
   four arms, which has a ~4% chance under random ordering. But the values pair up
   (1.64, 1.65) and (1.78, 1.79) more like two machine states than a trend, the
