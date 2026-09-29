@@ -524,6 +524,428 @@ count and worker busyness were the same signal — this run cannot distinguish t
 count-based policy from a busyness-based one. See the journal entry's open
 questions.
 
+### Spreading a fixed load costs per-operation efficiency (2026-09-28)
+
+`experiments/coalesce-sweep.toml`. 600k offered in open loop, 256 connections held,
+park off, no manufactured imbalance — **worker count is the only variable**, and
+every run serves the same 600k ops/s.
+
+| workers | conns/worker | CQE/op | CPU (cores) | p50 | p99 | p999 |
+|---|---|---|---|---|---|---|
+| 2 | 128 | **0.44** | 4.83 | 3206.9 | 6093.5 | 6707.4 |
+| 4 | 64 | **0.86** | 7.73 | 1530.8 | **2601.9** | 6950.1 |
+| 8 | 32 | **1.78** | 12.88 | 767.4 | 18945.9 | 58455.1 |
+| 16 | 16 | 1.76 | 18.04 | **734.6** | 14210.8 | 67657.6 |
+
+> **CQE/op was overstated by 5.6% in every earlier revision of this section, and
+> the figures above are corrected.** `ring.cqe_processed` is a server counter
+> covering warmup *and* run; `total_ops` is a client counter covering the run
+> only. With `--warmup 5 --duration 90` the windows differ by 95/90 = 1.0556, and
+> the measured ratio of server messages (`bytes.received / msg_size`) to client
+> ops is 1.0557–1.0558 in all nine cells checked — the warmup, to four digits.
+> The corrected denominator is server-side (`bytes.received / msg_size`), so
+> numerator and denominator cover the same window.
+>
+> The bias is a uniform multiplicative factor, so **no relative comparison in this
+> section changes** — the separations, the CVs and the 30/30 result all stand.
+> What changes is the reading of the ceiling: the largest value yet measured,
+> `(300k, w4)`, corrects from 2.12 to **2.008**, landing *on* the predicted 2.0
+> rather than impossibly above it. That is independent support for the ceiling
+> being exactly one recv plus one send completion per echo.
+>
+> Earlier revisions quoted 0.47 / 0.91 / 1.88 / 1.86 for this table and 1.64–1.95
+> for the 8-worker replicates; multiply any CQE/op figure elsewhere in the session
+> record by 1/1.0556 to compare.
+
+> **`w16` oversubscribes this guest and its row is confounded.** The guest has 24
+> logical CPUs on **12 physical cores** (adjacent SMT siblings), and ringline pins
+> SMT-aware — one worker per *physical* core. Sixteen workers therefore place four
+> pairs on shared physical cores. The Rezolus per-vCPU recording confirms it: at
+> `(600k, w16)` sixteen logical CPUs are busy at 0.98–1.00 where only twelve
+> physical cores exist. So that row measures *spreading plus SMT contention*, not
+> spreading, and its tail is the contention: p99 is 11,912us at 600k against
+> 1,250us at 300k on the same sixteen workers, where the lower rate leaves slack
+> to absorb it. **Read `w2`/`w4`/`w8` as the clean series and treat `w16` as
+> indicative only** — in particular, "CQE/op flattens against the ceiling above
+> `w8`" rests partly on this point and is not established by it.
+>
+> The same recording corrects a second thing. At 600k **every** arm has all of its
+> workers pinned at 1.00 — `w2` two cores, `w4` four, `w8` eight, `w16` sixteen —
+> so the CPU cost of spreading is close to *linear in worker count*, not merely
+> the 4x that CQE/op shows. And per-worker CPU barely responds to load: halving the
+> rate takes a `w4` worker from 1.00 to ~0.94 and a `w16` worker from ~0.99 to
+> ~0.82. A worker burns most of a core almost regardless of how much work it has,
+> which means fixed per-loop cost — not per-operation cost — dominates what
+> spreading actually charges.
+>
+> (This also kills an inference made while reading the matrix: that 37.5k ops/s per
+> worker at `w16` meant low utilisation. Those workers were saturated. Per-worker
+> *rate* does not imply per-worker *utilisation* when both the per-operation cost
+> and the fixed loop cost move with worker count.)
+
+> **And a pinned worker is not a worker at capacity.** Holding the worker count at
+> 2 and sweeping offered load gives, per worker, 150k / 300k / 600k ops per second
+> at **1.00 CPU in every case**:
+>
+> | offered | ops/s/worker | worker CPU | ops per worker-CPU-sec | CQE/op | p50 | p99 |
+> |---|---|---|---|---|---|---|
+> | 300k | 150,000 | 1.00 | 150,436 | 1.04 | 2535us | 5772us |
+> | 600k | 300,000 | 1.00 | 300,034 | 0.46 | 3095us | 6304us |
+> | 1.2M | 600,000 | 1.00 | 600,114 | 0.17 | 5730us | 111,739us |
+>
+> Four times the work per CPU-second, on the same two cores, at the same
+> utilisation — because coalescing cuts completions per operation from 1.04 to
+> 0.17 (one completion carrying ~12 requests at the top). Two claims made earlier
+> in this session are wrong as a result: that `w2` at 600k was "right at the edge"
+> of capacity (it had 2x headroom), and that a worker has a fixed completion
+> budget from which ops-per-CPU-second follows. **Utilisation says nothing about
+> headroom here**, because the efficiency is itself a function of load.
+>
+> The cost is the tail, and it is not gentle: p50 grows 1.8x across that range
+> while p99 grows **19x**, almost all of it in the final doubling. That is the
+> same trade the worker-count series shows, driven from the other axis — and it is
+> why "read the shape, not the row" applies to the offered rate as much as to the
+> worker count. A `w4` knee at 600k is a `w8` knee at 1.2M.
+>
+> Softirq is worth noting alongside it: non-worker CPU on the same host goes 2.08
+> → 2.83 → 4.84 cores across those three rates, so by 1.2M the kernel network path
+> costs more than the runtime's own workers do. Any per-operation accounting that
+> stops at the worker threads is missing the larger half.
+
+Completions per operation **halve with every halving of the worker count**, then
+flatten against a ceiling of ~2.0 — one recv and one send completion per echo
+request, which is what "no batching at all" costs. At 128 connections per worker
+multishot recv is carrying more than four requests per completion.
+
+CPU tracks it: **two workers serve the same throughput on a quarter of the CPU of
+sixteen.**
+
+### Why that is the sizing
+
+The batching is a *consequence of queueing*, which is why the two move together.
+Per-connection arrival rate is identical across the sweep (256 connections, fixed
+600k) — what changes is per-worker service rate. A worker carrying 300k ops/s
+returns to each connection less often, so more requests accumulate between visits,
+so more arrive in one TCP segment and one completion carries several requests. A
+worker carrying 37k ops/s reaches each arrival immediately and pays a completion
+for each.
+
+So the knee is not a property of "64 connections". It is where per-worker load
+stops producing accumulation, and it moves with per-connection request rate,
+pipelining depth and per-request cost. **Do not read `w4` as an optimum to
+configure for**; read the shape.
+
+#### A competing explanation this sweep cannot rule out
+
+The paragraphs above name per-worker service rate as the cause. There is a
+second candidate that fits the same four points at least as well, and the sweep
+is confounded with respect to it: **provided recv buffers per connection.**
+
+`recv_ring_size` is *per worker* and was fixed at 256 for every arm, so changing
+the worker count changed buffers-per-connection by the same factor it changed
+connections-per-worker:
+
+| workers | conns/worker | buffers/conn | CQE/op | `min(buffers_per_conn / 4, 1.88)` |
+|---|---|---|---|---|
+| 2 | 128 | 2.0 | 0.47 | 0.50 |
+| 4 | 64 | 4.0 | 0.91 | 1.00 |
+| 8 | 32 | 8.0 | 1.88 | 1.88 |
+| 16 | 16 | 16.0 | 1.86 | 1.88 |
+
+The mechanism would be the buffer ring rather than the clock: a recv CQE checks
+out a provided buffer and the *application* returns it, so when buffers per
+connection get low the ring dries, `ENOBUFS` parks the multishot recv, bytes
+accumulate in the socket buffer, and the recv that follows replenishment carries
+several requests. That is the same observable coalescing, from a cause that has
+nothing to do with how busy the worker is.
+
+The two are perfectly correlated here — fewer workers means both more load per
+worker *and* fewer buffers per connection — so **this sweep does not distinguish
+them, and the mechanism paragraphs above should be read as one of two candidate
+explanations, not as established.** The fitted column is four points against a
+post-hoc formula; it is offered as motivation for the test, not as a result.
+
+##### Refuted, by counters already in the artifacts (2026-09-28)
+
+The buffer-ring explanation above is **wrong**, and the runs that were going to
+test it were not needed: the existing artifacts already carry the counter that
+settles it. `pool.recv_parked` counts exactly the event the mechanism requires —
+a multishot recv completing `ENOBUFS` because the provided ring is empty — and
+`pool.buffer_ring_empty` counts the ring running dry:
+
+| workers | buffers/conn | CQE/op | `recv_parked` | `buffer_ring_empty` |
+|---|---|---|---|---|
+| 2 | 2.0 | 0.47 | 71 | 71 |
+| 4 | 4.0 | 0.91 | **0** | **0** |
+| 8 | 8.0 | 1.88 | 0 | 0 |
+| 16 | 16.0 | 1.86 | 0 | 0 |
+
+The `w4` arm coalesces heavily — 0.91 means a completion carries more than one
+request — with the ring **never once** running dry. And `w2`'s 71 park events
+span a 90-second run carrying ~54 million operations, which cannot move an
+aggregate ratio at all. So ring exhaustion is not the mechanism at any arm; the
+numeric fit in the table above was four points against a formula chosen after
+seeing them, and it was coincidence.
+
+**Per-worker load survives as the explanation**, which is what the section said
+before the detour. The correct reading of that is *unwelcome*: it means the
+batching cannot be bought at full spread by sizing the ring, and concentration
+really does appear to be required to get it.
+
+##### And refuted again by direct experiment, with the reason (2026-09-28)
+
+One arm of the ring sweep was kept as a positive control — `recv_parked = 0`
+everywhere is also exactly what a dead counter looks like — and it settles the
+question outright. 8 workers, 32 connections per worker, `recv_ring_size` cut 8x
+from 256 to **32**, i.e. 1.0 provided buffer per connection:
+
+| | b32 | baseline (b256) |
+|---|---|---|
+| ops/s | 600,007 | 599,978 |
+| CQE/op | **1.71** | 1.64 |
+| p50 | 1058.7us | 920.5us |
+| `recv_parked` | 285 | 0 |
+| `buffer_ring_empty` | 285 | 0 |
+| `recv_fallback` | **35,949,657** | 0 |
+
+The control passes: the ring genuinely dries and the counter genuinely responds,
+so the zeros above are real zeros. And an **8x smaller ring bought no coalescing
+whatsoever**: 1.71 sits *inside* the baseline configuration's own run-to-run
+range of 1.64–1.95 (see the noise floor below), so there is no detectable effect
+at all. Throughput is unaffected (600,007 ops/s), so the arm is not
+memory-starved and the comparison is valid; buffers-per-connection simply is not
+the lever.
+
+The p50 difference (1058.7us against 920.5us) is **not** a result — it is inside
+a 32.8% latency floor and is withdrawn.
+
+`recv_fallback` explains why it never could be. ~36M fallback recvs against ~54M
+operations means two thirds of operations took the graceful-degradation path:
+**when the provided ring is dry, ringline submits a one-shot recv to keep
+draining the socket** rather than leaving the connection parked. Socket-buffer
+accumulation — the thing the hypothesis needed — is precisely what that path
+exists to prevent. The mechanism was not merely unsupported by the data, it is
+excluded by the design, and the counter says so by name.
+
+The same applies to `min_complete`, tested at 1/2/4/8 on this configuration:
+CQE/op 1.64, 1.65, —, 1.79 with `recv_parked` and `buffer_ring_empty` at 0
+throughout. That span is 8.8%, less than half the 18.6% floor, so the correct
+statement is **indistinguishable from flat**, not measured flat. Blocking the
+reaper for a few completions checks out a handful of buffers against 256 and
+never approaches the ring, so there was nothing for it to induce. **Both
+candidate ways of buying batching without concentration are dead**, and
+per-worker load stands as the explanation.
+
+##### The noise floor, and which comparisons survive it
+
+**Five** runs of one configuration — 8 workers, 256-buffer ring, `min_complete`
+1, same binary, landing as arms of three different sweeps:
+
+**Six** runs of one configuration — 8 workers, 256-buffer ring, `min_complete`
+1, same binary, landing as arms of three different sweeps:
+
+| replicate | CQE/op | p50 | p99 |
+|---|---|---|---|
+| A | 1.64 | 920.5us | 10,154us |
+| B | 1.81 | 767.8us | **46,162us** |
+| C | 1.86 | 777.3us | 10,888us |
+| D | 1.93 | 707.2us | 9,208us |
+| E | 1.94 | 695.4us | 27,131us |
+| F | 1.95 | 693.1us | 16,967us |
+
+| metric | min | max | mean | stdev | CV | spread |
+|---|---|---|---|---|---|---|
+| ops/s | 599,978 | 600,005 | — | — | — | 0.005% |
+| CQE/op | 1.64 | 1.95 | 1.86 | 0.116 | 6.3% | **18.6%** |
+| p50 | 693.1us | 920.5us | 760.2us | 86.6 | 11.4% | **32.8%** |
+| p99 | 9,208us | 46,162us | 20,085us | 14,428 | 71.8% | **401.3%** |
+
+Offered load is reproduced to five figures; everything derived from timing is
+not. **Read the CV column, not the spread column.** Spread is `(max-min)/min`,
+which can only grow as samples accumulate — it is monotonically non-decreasing by
+construction, so its growth across sample sizes says nothing about the underlying
+distribution. An earlier revision of this section made exactly that mistake,
+quoting p99 spread going 67% → 84% → 195% → 401% as evidence of a heavy tail and
+concluding that "no number of runs" could make the comparison safe. Both halves
+were wrong: the growth was an artifact of the statistic, and more runs is
+precisely the remedy. For the record the p99 CV over the same accumulation ran
+35.5% → 35.0% → 29.7% → 50.4% → 71.8% — declining until the last two draws.
+
+What the numbers do support: CQE/op is stable (CV 6.3%), p50 is moderately noisy
+(CV 11.4%), and p99 is very noisy (CV 71.8%, 9.2ms to 46.2ms across identical
+runs). Single-run comparisons are safe for the first, marginal for the second and
+unsafe for the third — but "unsafe single-run" means *take replicates*, not
+"unusable".
+
+This has to be applied to every claim in this section:
+
+- **Survives.** The worker-count shape in CQE/op and CPU: 0.47 / 0.91 / 1.88 /
+  1.86 spans 4x against an 18.6% floor, and CPU 4.83 → 18.04 cores spans 3.7x.
+  These are the load-bearing results of this section.
+- **Survives.** The p50 trend, 3206.9 → 1530.8 → 767.4us across `w2` → `w4` →
+  `w8`: 2x steps against a 32.8% floor.
+- **ESTABLISHED: the p99 advantage at `w4`.** Five `w4` replicates against six
+  `w8` replicates, same binary, same 600k offered rate:
+
+  | | CQE/op | p50 | p99 |
+  |---|---|---|---|
+  | `w4`, n=5 | 0.86 0.87 0.87 0.88 0.94 | 1470 1560 1575 1584 1590us | 2511 2582 2673 2731 2797us |
+  | `w8`, n=6 | 1.64 1.81 1.86 1.93 1.94 1.95 | 693 695 707 768 777 921us | 9208 10154 10889 16967 27131 46162us |
+
+  **Complete separation on all three**: `w4` below `w8` in 30/30 cross pairs on
+  CQE/op and on p99, and above in 30/30 on p50. Exact two-sample probability of
+  complete separation under a null of no difference is 1/C(11,5) = **0.0022**.
+
+  So the trade is real and both directions of it are established: spreading a
+  fixed load buys p50 (1556us → 760us) and pays for it in per-operation cost
+  (CQE/op 0.88 → 1.85), CPU, and the tail (p99 2659us → 20085us).
+
+##### The variance is a property of the configuration, not the rig
+
+The more useful finding from those replicates is that **the two configurations
+are not equally reproducible**:
+
+| metric | `w4` CV (n=5) | `w8` CV (n=6) | ratio |
+|---|---|---|---|
+| CQE/op | 3.6% | 6.4% | 1.8x |
+| p50 | 3.2% | 11.4% | 3.6x |
+| p99 | **4.3%** | **71.8%** | **16.7x** |
+
+`w4`'s tail is tight — p99 2511–2797us across five runs — while `w8`'s ranges
+from 9.2ms to 46.2ms. The distribution shapes differ accordingly: mean p99/p50 is
+**1.71 at `w4` and 26.4 at `w8`**.
+
+Two consequences. First, an earlier revision of this section derived a noise floor
+from `w8` replicates alone and stated it as a rig-wide rule ("a single-run CQE/op
+difference under ~15% is not a result"). That was an over-generalisation from one
+operating point: `w4` reproduces CQE/op to 3.6%. A floor has to be quoted with the
+configuration it was measured at.
+
+Second, and more substantively: the heavy tail is not measurement noise to be
+averaged away, it *is* the `w8` result. Spreading the load does not merely raise
+p99, it makes p99 **unpredictable** — which is a worse property for anything with
+a latency objective than a higher but stable tail would be.
+- **Survives**, because it is categorical rather than a magnitude: every
+  `recv_parked` / `buffer_ring_empty` / `recv_fallback` comparison. Zero versus
+  285, and zero versus 36 million, are not noise.
+- **Does not survive.** `w8` versus `w16` on p99 (14210.8 vs 18945.9, 33%) and
+  on p50 (734.6 vs 767.4, 4%). The `w16` row cannot be said to differ from `w8`
+  on latency at all, so "p50 is best at full spread" rests on the 2x steps below
+  `w8`, not on that last row.
+- **Does not survive.** Anything at all from the `min_complete` sweep, and the
+  b32 p50. The completed sweep is:
+
+  | `min_complete` | ops/s | CQE/op | p50 | p99 | `recv_parked` |
+  |---|---|---|---|---|---|
+  | 1 | 599,978 | 1.64 | 920.5us | 10,154us | 0 |
+  | 2 | 600,005 | 1.65 | 933.6us | 6,035us | 0 |
+  | 4 | 600,002 | 1.78 | 804.4us | 24,727us | 0 |
+  | 8 | 600,004 | 1.79 | 824.1us | 11,935us | 0 |
+
+  Every arm falls inside the baseline's own 1.64–1.95 range, and the whole span
+  is 8.8% against a 0.128 standard deviation — about one sigma. One oddity worth
+  recording rather than interpreting: CQE/op is monotone increasing across the
+  four arms, which has a ~4% chance under random ordering. But the values pair up
+  (1.64, 1.65) and (1.78, 1.79) more like two machine states than a trend, the
+  magnitude is inside the floor, and the *direction is opposite* to any mechanism
+  — more blocking producing **less** batching is not something to explain. It is
+  noted so the next person does not rediscover it and read it as signal.
+
+`b256`'s 1.95 also lands on the original 1.88 reference, so the two sweeps are
+mutually comparable — an earlier note claiming the `n=1` arm failed to replicate
+was reading an 18.6% floor as a 13% discrepancy.
+
+The practical rule, on this rig and this workload, stated in CVs because those
+are the sample-size-independent numbers: CQE/op CV 6.3%, p50 CV 11.4%, p99 CV
+71.8%. So a single-run CQE/op difference under ~15% is not a result, a p50
+difference under ~25% is not a result, and a p99 difference wants replicates on
+both sides at any magnitude under ~3x. Where only one side has been replicated,
+say so and give the one-sided reading rather than either asserting or withdrawing
+the claim.
+
+##### What is still not separated
+
+`CQE/op` conflates two completions — one recv and one send per echo, which is
+where the ~2.0 ceiling comes from — and the arms are consistent with *both*
+halves falling together (0.91 ≈ 0.5 + 0.5, 0.47 ≈ 0.25 + 0.25). A busier worker
+would plausibly do both: carry more requests per recv completion *and* coalesce
+more queued sends per loop iteration. Those are different levers with different
+fixes, and this measurement cannot tell them apart.
+
+It cannot be told apart from the current artifacts either, because there is no
+per-`OpTag` completion counter — `ring.cqe_processed` is a single total. Adding
+recv-completions and send-completions as separate counters is the prerequisite
+for any further work here, and is cheap: `dispatch_cqe` already has the `OpTag`
+in hand. Until then, "spreading costs per-operation efficiency" is the solid
+claim and every statement about *why* is underdetermined.
+
+This is already known on the client side of the same repo. `bench-client`'s
+`--conn-chunk-size` exists precisely to pack connections onto fewer workers,
+"keeping per-worker CQE density high enough for io_uring batching to pay off".
+Tier 1 placement does the opposite on the server side, by design.
+
+### The trade, and whether placement should compensate
+
+The latency shape is monotone with a knee, and it is the opposite of what
+"balanced is better" predicts:
+
+- **p50 improves all the way**: 3207 → 1531 → 767 → 735 µs
+- **p99 improves to 4 workers** (6094 → 2602), then collapses (→ 18946)
+- **p999 is flat to 4 workers** (6707, 6950), then explodes (→ 58455)
+
+Past the knee you buy ~30 µs of p50 for a 7x worse p99 and an 8x worse p999.
+Saturated-and-queued gives a worse median and a much tighter tail; fully spread
+gives the best median and a far worse tail.
+
+Three responses, none of them yet measured:
+
+1. **Pack rather than spread** — fill workers toward a target utilisation and
+   leave the rest idle, recruiting more only as load rises. Maximises batching,
+   minimises CPU, and on this data gives better tails. The risk is that a worker
+   near saturation has no headroom for a burst, so the tail it protects in steady
+   state is the tail it would wreck on arrival spikes. It also contradicts the
+   thread-per-core premise of using every core.
+2. **Decouple batching from queueing** — keep spreading, but let a lightly loaded
+   worker accumulate arrivals deliberately. This is the only option that might get
+   the batching benefit without the queueing cost, and it is the one worth
+   measuring first.
+
+   The lever is **`min_complete`**, not `tick_timeout_us`. An earlier draft of
+   this section named the latter, wrongly: `tick_timeout_us` bounds how long
+   `submit_and_wait` blocks *when there is nothing to do*, so it never delays a
+   completion that has already arrived and cannot affect batching. The loop always
+   calls `submit_and_wait(1)`, returning on the first CQE; waiting for N
+   completions or a timeout (`IORING_ENTER_EXT_ARG`) is the interrupt-coalescing
+   shape that would actually accumulate arrivals. Multishot recv delivers whatever
+   is in the socket buffer when it fires, so not reading for a while genuinely does
+   put more requests in each completion — the same mechanism as the queueing
+   above, induced on purpose.
+
+   Note what the sweep cannot separate: batching there arrived *bundled with*
+   load, so "delay causes batching" and "load causes both" are not distinguished
+   by it. A fixed `min_complete` sweep at 8 workers is the test — if CQE/op falls
+   toward 0.9 while p50 stays under the 4-worker figure, the premise holds and an
+   adaptive version is worth designing. If it only adds latency, the premise is
+   wrong and no controller would help.
+3. **Document and let the operator choose** worker count for the statistic they
+   serve. The minimum, and what this section does.
+
+### What this does not establish
+
+The CQE/op and CPU columns repeat to within ~4–10% across runs of an identical
+configuration and can be relied on. **The tail columns cannot, single-run**: two
+runs of the 8-worker configuration gave p99 9,041 µs and 18,945 µs, a factor of
+two. So the 4-vs-8 comparison (7x on p99) is far outside that spread and worth
+believing; 8-vs-16 is inside it and means nothing here. A dedicated noise-floor
+measurement is the prerequisite for any finer tail claim, and several tail deltas
+quoted earlier in this effort were made without one.
+
+One workload, one box: 256 connections, 64 B echo, open loop at a fixed rate, on a
+24-vCPU guest with 12 physical cores. The 16-worker point also oversubscribes the
+physical cores, which is a second effect confounded with the first — note that
+CQE/op is flat from 8 to 16 while CPU still climbs 40%, so that CPU is contention
+and scheduling rather than completions.
+
 ### Conclusion
 
 **Merged accept mode stays behind its flag** — though the distribution defect
