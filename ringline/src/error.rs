@@ -391,6 +391,31 @@ pub(crate) fn describe_buffer_registration_failure(
     msg
 }
 
+/// What to check when registering a **provided buffer ring** fails.
+///
+/// Deliberately different from the fixed-buffer text above, which does blame
+/// `RLIMIT_MEMLOCK` and is right to: `IORING_REGISTER_BUFFERS` charges pinned
+/// pages against that limit. `IORING_REGISTER_PBUF_RING` does not, measurably —
+/// the test suite registers these rings with the soft limit at 8 KiB on kernel
+/// 6.12 (#426). Sending the reader to `ulimit -l` is sending them down the one
+/// road already known to be a dead end, and it was re-proposed twice because
+/// the refutation lived in a CI comment instead of next to the message.
+// Only the io_uring provided-buffer-ring path calls this, so on the mio backend
+// it has no caller. Kept compiled (rather than cfg'd out) so its two guard tests
+// run on every backend, including macOS where the io_uring path cannot build at
+// all -- the tests are about the wording of a finding, not about io_uring.
+#[cfg_attr(not(has_io_uring), allow(dead_code))]
+pub(crate) fn provided_ring_enomem_hint() -> &'static str {
+    concat!(
+        "ENOMEM here is NOT RLIMIT_MEMLOCK -- that was measured and ruled out ",
+        "(the test suite registers these rings with the soft limit at 8 KiB on ",
+        "6.12), so raising `ulimit -l` will not help. Check the cgroup memory ",
+        "limit instead (`memory.max` and `memory.events` under /sys/fs/cgroup), ",
+        "which is the usual cause in a container and which `free` cannot show, ",
+        "and `vm.max_map_count`",
+    )
+}
+
 #[cfg(any(has_io_uring, test))]
 impl Error {
     /// Wrap a failed buffer registration as [`Error::BufferRegistration`].
@@ -657,5 +682,48 @@ mod tests {
         let text = describe_buffer_registration_failure(&err, 4096, None);
         assert!(text.contains("EINVAL"), "{text}");
         assert!(!text.contains("RLIMIT_MEMLOCK"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod provided_ring_hint_tests {
+    use super::provided_ring_enomem_hint;
+
+    /// Guards the *finding*, not the wording. `RLIMIT_MEMLOCK` was measured and
+    /// ruled out for the provided-buffer-ring path (#426), and it was
+    /// nonetheless re-proposed as the cause twice, because the refutation lived
+    /// in a CI comment rather than beside the message. A future edit that
+    /// "helpfully" restores `ulimit -l` advice here fails this test.
+    #[test]
+    fn does_not_send_the_reader_to_ulimit_l() {
+        let h = provided_ring_enomem_hint();
+        assert!(
+            h.contains("NOT RLIMIT_MEMLOCK"),
+            "the hint must say memlock is ruled out: {h}"
+        );
+        // It may mention `ulimit -l` only to say it will not help.
+        if let Some(i) = h.find("ulimit -l") {
+            let around = &h[i.saturating_sub(40)..h.len().min(i + 40)];
+            assert!(
+                around.contains("not help") || around.contains("will not"),
+                "`ulimit -l` appears as advice rather than as a dead end: {around}"
+            );
+        }
+    }
+
+    /// The two causes the evidence actually points at, neither of which `free`
+    /// or `ulimit -a` can show.
+    #[test]
+    fn names_the_causes_that_are_still_open() {
+        let h = provided_ring_enomem_hint();
+        assert!(h.contains("cgroup"), "should name the cgroup limit: {h}");
+        assert!(
+            h.contains("memory.events"),
+            "should name the retrospective cgroup field: {h}"
+        );
+        assert!(
+            h.contains("vm.max_map_count"),
+            "should name the map-count ceiling: {h}"
+        );
     }
 }

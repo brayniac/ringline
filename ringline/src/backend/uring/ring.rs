@@ -248,10 +248,10 @@ impl Ring {
                     Error::BufferRegistration(format!(
                         "provided buffer ring (bgid {}, {} entries): {e}{name}. \
                          EINVAL here usually means a kernel older than 5.19 or a \
-                         ring size that is not a power of two; ENOMEM means the \
-                         kernel could not pin the ring pages",
+                         ring size that is not a power of two. {}",
                         provided.bgid(),
-                        provided.ring_entries()
+                        provided.ring_entries(),
+                        crate::error::provided_ring_enomem_hint()
                     ))
                 })?;
         }
