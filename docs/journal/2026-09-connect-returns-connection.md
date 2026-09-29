@@ -74,12 +74,19 @@ Two entry points, each returning its own builder type, both `IntoFuture`
 
 ```rust
 let conn = connect(addr).await?;                               // Connection
-let conn = connect(addr).timeout_ms(500).await?;
+let conn = connect(addr).timeout(Duration::from_millis(500)).await?;
 let conn = connect(addr).tls("example.com").await?;
-let conn = connect(addr).tls("example.com").timeout_ms(500).await?;
+let conn = connect(addr).tls("example.com").timeout(d).await?;
 let conn = connect_unix(path).await?;
-let conn = connect_unix(path).timeout_ms(500).await?;          // the missing cell
+let conn = connect_unix(path).timeout(d).await?;               // the missing cell
 ```
+
+**`timeout(Duration)`, not `timeout_ms(u64)`.** The existing neighbours spell it
+in milliseconds (`connect_with_timeout(addr, timeout_ms)`,
+`ConfigBuilder::close_notify_timeout_ms`), so this deliberately breaks with them:
+a new surface is the cheap moment to set the better precedent, and `Duration` is
+what a caller reaching for a timeout expects. The millisecond spellings stay
+wherever they already are; this does not start a migration.
 
 **Type-state, not one flat builder.** `connect` yields a TCP builder and
 `connect_unix` a Unix one, specifically so `connect_unix(path).tls(..)` stays
@@ -155,13 +162,38 @@ the driver cannot back. Separate question, later.
 
 ## Costs, stated before building
 
-- **Lazy submission is a behaviour change, not a rename.** Today `connect()`
-  submits at call time, so `let a = connect(x)?; let b = connect(y)?;` has both in
-  flight before either is awaited. A builder submits at first poll, so that
-  pattern serializes unless the two are `join`ed — `join` preserves the
-  parallelism, since each is polled and each submits before either waits. No
-  in-tree caller relies on the old shape, but it belongs in the CHANGELOG as a
-  behaviour change.
+- **Lazy submission is a behaviour change, not a rename**, and the cost is that
+  it is *silent*. Today `connect()` pushes the SQE inside `with_state` at call
+  time, so `let a = connect(x)?; let b = connect(y)?;` has both SYNs on the wire
+  before either is awaited: wall time ≈ max(A, B). A builder submits at first
+  poll, so the same shape becomes A + B — no compile error, no warning, just
+  N × RTT where it was one. A pool warm-up is where that would bite.
+
+  **Checked, and nothing in-tree overlaps connects.** `ringline-redis`'s
+  `Pool::connect_all` (`pool.rs:140`) is already a sequential
+  `for i in 0..slots.len() { do_connect().await? }`, and `do_connect`
+  (`pool.rs:328`) binds `let fut = …` only to pick the timeout variant, awaiting
+  on the next line. Same shape in `ringline-memcache`'s pool and the sharded
+  clients. So the regression is available to an external caller who wrote the
+  overlap deliberately, and to nobody here.
+
+  The recovery is `join`, but it is **not free**: `join` is
+  `join<A: Future, B: Future>` (`join.rs:94`), so `join(connect(a), connect(b))`
+  will not compile against a builder that is only `IntoFuture`. Relaxing
+  `join`/`join3` to `IntoFuture` bounds is part of this change — backward
+  compatible, since every `Future` is `IntoFuture`.
+
+  Two things cut the other way. Laziness is already the house contract:
+  `BackpressuredSendFuture` documents that "nothing is submitted, and no queue is
+  joined, until the returned future is polled", so eager `connect` is the odd one
+  out. And eager submission has its own rough edge — `ConnectFuture::Drop`
+  (`io.rs:5624`) clears only the waiter flag, so dropping an un-awaited connect
+  has already sent a SYN and, on success, leaves the slot established with no
+  owner. Lazy makes "built but never awaited" genuinely inert.
+
+  Noted separately, not folded in: `connect_all` being N × RTT is *pre-existing*
+  missed parallelism, not something laziness introduces. Relaxed `join` bounds
+  make it easier to fix later; it deserves its own issue.
 - Two new public types, and the crate's first `IntoFuture`.
 - Breaking for the four client crates, so `ringline-redis`, `ringline-memcache`,
   `ringline-ping` and `ringline-http` all need version bumps in the same
