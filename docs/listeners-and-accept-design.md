@@ -843,7 +843,15 @@ a latency objective than a higher but stable tail would be.
   | 8 | 600,004 | 1.79 | 824.1us | 11,935us | 0 |
 
   Every arm falls inside the baseline's own 1.64–1.95 range, and the whole span
-  is 8.8% against a 0.128 standard deviation — about one sigma. One oddity worth
+  is 8.8% against a 0.128 standard deviation — about one sigma.
+
+  **`min_complete` is not exposed in the tree.** It was measured with an
+  unmerged experimental patch adding a `wait_min_complete` config knob, kept off
+  `main` precisely because the result was NO-GO: there is no flag to look for, and
+  nothing to tune. The syscall counters later explained why it could not have
+  worked — `w8` was already reaping ~23 completions per `io_uring_enter` unaided,
+  so asking it to wait for 8 was asking for a third of the batch the loop already
+  achieved. One oddity worth
   recording rather than interpreting: CQE/op is monotone increasing across the
   four arms, which has a ~4% chance under random ordering. But the values pair up
   (1.64, 1.65) and (1.78, 1.79) more like two machine states than a trend, the
@@ -863,7 +871,60 @@ both sides at any magnitude under ~3x. Where only one side has been replicated,
 say so and give the one-sided reading rather than either asserting or withdrawing
 the claim.
 
-##### What is still not separated
+##### Separated, by splitting the completion counter (2026-09-28)
+
+`experiments/tag-split.toml`, on a build carrying `ringline/cqe_by_tag` (the
+completion counter split by `OpTag`). The question below — whether the coalescing
+is recv-side, send-side or both — is answered: **both, by the same factor.**
+
+| arm | CQE/op | recv/op | send/op | other/op |
+|---|---|---|---|---|
+| `w4` rep1 | 0.828 | 0.418 | 0.408 | 0.003 |
+| `w4` rep2 | 0.798 | 0.401 | 0.394 | 0.003 |
+| `w8` rep1 | 1.759 | 0.899 | 0.850 | 0.010 |
+| `w8` rep2 | 1.633 | 0.842 | 0.783 | 0.009 |
+| **`w4` mean** | **0.813** | **0.409** | **0.401** | 0.003 |
+| **`w8` mean** | **1.696** | **0.871** | **0.817** | 0.010 |
+| **ratio** | **2.09x** | **2.13x** | **2.04x** | — |
+
+Both halves roughly double from `w4` to `w8`, and within each arm recv/op and
+send/op are nearly equal. That pins the mechanism exactly: the forward echo path
+sends each received buffer back as **one** `send_recv_buf`, so a buffer carrying
+*k* pipelined requests costs one recv completion and one send completion —
+`CQE/op = 2/k`, with `recv/op = send/op = 1/k`. The 2.0 ceiling is *k*=1, and
+everything below it is queue depth. It was never recv batching *or* send
+coalescing; it is one buffer, one recv, one send, *k* requests.
+
+Only seven tags are non-zero, and three of them settle other questions:
+
+| tag | `w4` /op | `w8` /op |
+|---|---|---|
+| `recv_multi` | 0.4178 | 0.8419 |
+| `send_recv_buf` | 0.3980 | 0.7242 |
+| `send` | 0.0097 | 0.0586 |
+| `tick_timeout` | 0.0026 | 0.0088 |
+| `accept_multi`, `close`, `event_fd_read` | ~0 | ~0 |
+
+- **`recv_fallback` is absent**, so recv is entirely multishot. That corroborates
+  `recv_parked = 0` from an independent counter, and the ring-exhaustion refutation
+  above now rests on two measurements rather than one.
+- **Sends are slightly fewer than recvs** (0.398 against 0.418). In `forward` mode
+  a recv delivering a partial message waits for more before echoing, so two recvs
+  occasionally feed one send. The plain `send` fallback grows 6x at `w8` and is
+  still only 0.06/op.
+- **`tick_timeout` is negligible and fires *less* than configured** — 145,928
+  firings against the 360,000 that 1000/s/worker over 90 s on 4 workers would give,
+  because the loop is almost always woken by a real completion first. A third,
+  measured confirmation that `tick_timeout_us` was never the batching lever.
+
+All four arms pass the partition check exactly (`sum(cqe_by_tag) +
+cqe_unknown_tag == cqe_processed`, zero unknown in every arm), so the split is
+arithmetic rather than inference. Two replicates per worker count, and the two
+halves scale by 2.13x and 2.04x — indistinguishable from each other given the
+3.6% within-config CV, and both indistinguishable from the 2.09x that CQE/op
+itself moves.
+
+##### What was not separated before this
 
 `CQE/op` conflates two completions — one recv and one send per echo, which is
 where the ~2.0 ceiling comes from — and the arms are consistent with *both*
@@ -883,6 +944,111 @@ This is already known on the client side of the same repo. `bench-client`'s
 `--conn-chunk-size` exists precisely to pack connections onto fewer workers,
 "keeping per-worker CQE density high enough for io_uring batching to pay off".
 Tier 1 placement does the opposite on the server side, by design.
+
+### The coalescing is the queue (2026-09-28)
+
+`experiments/rate-workers.toml`. The section above swept worker count at one
+offered rate. Sweeping *both* — 300k / 600k / 1.2M against 2 / 4 / 8 / 16 workers,
+256 connections throughout — collapses the whole picture onto one variable, and it
+is not the one the section above was looking for.
+
+| offered | wkrs | worker CPU | total CPU | softirq | CQE/op | p50 | p99 | in flight per conn |
+|---|---|---|---|---|---|---|---|---|
+| 300k | 2 | **1.00** | 4.08 | 2.08 | 1.04 | 2535us | 5772us | 3.0 |
+| 300k | 4 | 0.94 | 6.70 | 2.93 | 2.01 | 620us | 1255us | 0.7 |
+| 300k | 8 | 0.83 | 9.42 | 2.81 | 2.03 | 525us | 1201us | 0.6 |
+| 300k | 16 | 0.76 | 13.64 | 1.50 | 2.05 | 578us | 1250us | 0.7 |
+| 600k | 2 | **1.00** | 4.83 | 2.83 | 0.46 | 3095us | 6304us | 7.3 |
+| 600k | 4 | **1.00** | 7.73 | 3.73 | 0.84 | 1556us | 2659us | 3.6 |
+| 600k | 8 | **1.00** | 12.88 | 4.89 | 1.78 | 760us | 20085us | 1.8 |
+| 600k | 16 | 0.96 | 17.71 | 2.34 | 1.70 | 727us | 11912us | 1.7 |
+| 1.2M | 2 | **1.00** | 6.84 | 4.84 | 0.17 | 5730us | 111739us | 26.9 |
+| 600k | 4 | **1.00** | 7.73 | 3.73 | 0.87 | 1508us | 2524us | 3.5 |
+| 1.2M | 4 | **1.00** | 9.67 | 5.67 | 0.30 | 4455us | 556500us | 20.9 |
+| 1.2M | 8 | **1.00** | 14.94 | 6.95 | 0.54 | 150288us | 1051204us | 704 |
+| 1.2M | 16 | **1.00** | 19.87 | 3.89 | 0.95 | 1290515us | 28749460us | 3900 |
+
+`in flight per conn` is Little's law — `offered_rate x p50 / connections`.
+
+**Worker CPU is the predictor, and coalescing is queue depth.** Every arm with a
+worker below 1.00 sits at the ~2.0 ceiling with *under one* request in flight per
+connection: no queue, so nothing to batch. Every arm at 1.00 has a queue, and
+CQE/op falls in step with how deep it is — 0.7 → 3.0 → 3.6 → 7.3 → 26.9 in
+flight against 2.01 → 1.04 → 0.84 → 0.46 → 0.17 completions per operation.
+
+That correspondence is mechanically necessary rather than fitted: if a connection
+has *k* requests waiting, one `recv` completion delivers all *k*, so completions
+per operation go as 1/*k*. **The per-operation efficiency and the latency are two
+views of the same queue.** The efficiency is not a win that spreading forfeits —
+it is what a saturated worker does instead of keeping up, and it cannot be bought
+without buying the latency.
+
+#### It is not cache topology
+
+The obvious hardware story — Zen 1 groups cores into 4-wide CCXs sharing an L3, so
+4 workers fit one CCX while 8 straddle two — is wrong, and the 300k row rules it
+out: `w4`, `w8` and `w16` are indistinguishable there (CQE/op 2.01 / 2.03 / 2.05,
+p99 1255 / 1201 / 1250us). A CCX penalty would appear at every rate. This one
+appears at no rate; what appears at 600k is a queue.
+
+What does bite is **total CPU demand against the physical core count**. The guest
+is 24 logical on **12 physical** cores, and demand is roughly
+`workers x 1.0 + softirq(rate)` — with softirq the growing term: 2.08 → 4.89 →
+6.95 cores as offered rate rises, so by 1.2M the kernel network path costs more
+than the runtime's own workers. At 600k, `w4` needs 7.73 cores and fits; `w8`
+needs 12.88 and `w16` needs 17.71, so both spill onto shared SMT siblings. That is
+the leading explanation for `w4` being the p99 optimum at 600k — **not** a hardware
+sweet spot, but the largest worker count that still fits the machine while being
+saturated enough to coalesce.
+
+Offered as the leading explanation rather than a proven one, because it needs two
+conditions and not one: `(300k, w16)` also exceeds 12 cores (13.64) with no tail
+penalty, since its workers have slack to absorb the contention.
+
+#### The 12-core boundary, measured
+
+The 1.2M row is not a trade at all, and it locates the boundary precisely. The
+guest has **12 physical cores**; every worker is pinned at 1.00 in all four arms:
+
+| 1.2M offered | achieved | worker CPU | softirq | **total** | fits 12? | p50 | p99 |
+|---|---|---|---|---|---|---|---|
+| `w2` | 100% | 1.00 | 4.84 | **6.84** | yes | 5730us | 111,739us |
+| `w4` | 100% | 1.00 | 5.67 | **9.67** | yes | **4455us** | 556,500us |
+| `w8` | 99.8% | 1.00 | 6.95 | **14.94** | no | 150,288us | 1,051,204us |
+| `w16` | **90.5%** | 1.00 | 3.89 | **19.87** | no | 1,290,515us | 28,749,460us |
+
+**p50 jumps 34x exactly where total demand crosses the physical core count** —
+9.67 cores fits and costs 4.5 ms; 14.94 does not and costs 150 ms. Nothing else in
+the row changes discontinuously there.
+
+The effect is **graded, not a step**, which is what makes it credible: at 600k,
+`w8` needs 12.88 cores — barely over — and its p50 is still healthy at 825us while
+its p99 is already blown at 35,568us. Crossing the boundary damages the tail first
+and reaches the median only well past it, which is how occasional contention should
+behave. (At 600k, `w8` and `w16` cannot be ordered against each other on p99: the
+`w8` figure sits inside the 9,208–46,162us range its own six replicates span.)
+
+**Two workers beat sixteen by 226x on p50, and sixteen cannot serve the load at
+all.** Concentration is not merely cheaper here; spreading is the thing that
+breaks. Tier 1/2/3 exist to spread connections across workers, and in this regime
+that is the harmful direction — worth stating plainly in the design doc that
+proposes them.
+
+Note what this makes of worker-count advice: the useful limit is not a worker count
+but `workers + softirq(rate) <= physical_cores`, and **softirq is the term that
+moves** — 4.84 to 6.95 cores across this row alone, exceeding the runtime's own
+workers at every arm below `w8`. A recommendation phrased in worker counts is
+implicitly a recommendation about packet rate.
+
+#### A methodological correction
+
+`(1.2M, w8)` served **99.8%** of its offered rate while running a 150 ms p50 with
+~704 requests in flight per connection. An earlier version of the spec gated
+validity on achieved rate at >=95%, and that arm passed it while being nowhere near
+a usable operating point. **In open loop, meeting the offered rate does not mean
+unsaturated** — a saturated server grows a queue instead of missing the target. The
+gate is now queue depth from Little's law, read alongside worker CPU, since a
+worker below 1.00 cannot be the cause of a queue.
 
 ### The trade, and whether placement should compensate
 
