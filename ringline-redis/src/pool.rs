@@ -326,21 +326,16 @@ impl Pool {
     }
 
     async fn do_connect(&self) -> Result<ConnCtx, Error> {
-        let conn = if let Some(sni) = &self.tls_server_name {
-            let fut = if self.connect_timeout_ms > 0 {
-                ringline::connect_tls_with_timeout(self.addr, sni, self.connect_timeout_ms)?
-            } else {
-                ringline::connect_tls(self.addr, sni)?
-            };
-            fut.await?
-        } else {
-            let fut = if self.connect_timeout_ms > 0 {
-                ringline::connect_with_timeout(self.addr, self.connect_timeout_ms)?
-            } else {
-                ringline::connect(self.addr)?
-            };
-            fut.await?
-        };
+        // Options compose on one builder instead of branching over four
+        // entry points (#528).
+        let mut connect = ringline::connect(self.addr);
+        if let Some(sni) = &self.tls_server_name {
+            connect = connect.tls(sni.as_str());
+        }
+        if self.connect_timeout_ms > 0 {
+            connect = connect.timeout(std::time::Duration::from_millis(self.connect_timeout_ms));
+        }
+        let conn = connect.await?;
 
         Client::new(conn)?
             .maybe_auth(self.password.as_deref(), self.username.as_deref())

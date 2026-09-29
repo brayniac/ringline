@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::future::IntoFuture;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -51,8 +52,11 @@ impl<A: Future, B: Future> Future for Select<A, B> {
 /// Safe with ringline I/O futures — data buffered for a dropped `WithDataFuture`
 /// remains in the accumulator and is consumed on the next `with_data()` call.
 /// Dropped `SleepFuture`s correctly cancel their io_uring timeout SQE.
-pub fn select<A: Future, B: Future>(a: A, b: B) -> Select<A, B> {
-    Select { a, b }
+pub fn select<A: IntoFuture, B: IntoFuture>(a: A, b: B) -> Select<A::IntoFuture, B::IntoFuture> {
+    Select {
+        a: a.into_future(),
+        b: b.into_future(),
+    }
 }
 
 /// Result of [`select3()`] — indicates which of three branches completed first.
@@ -108,6 +112,14 @@ impl<A: Future, B: Future, C: Future> Future for Select3<A, B, C> {
 /// simultaneously, the earliest in order wins. The losing futures are dropped.
 ///
 /// Useful for client + backend + timeout patterns.
-pub fn select3<A: Future, B: Future, C: Future>(a: A, b: B, c: C) -> Select3<A, B, C> {
-    Select3 { a, b, c }
+pub fn select3<A: IntoFuture, B: IntoFuture, C: IntoFuture>(
+    a: A,
+    b: B,
+    c: C,
+) -> Select3<A::IntoFuture, B::IntoFuture, C::IntoFuture> {
+    Select3 {
+        a: a.into_future(),
+        b: b.into_future(),
+        c: c.into_future(),
+    }
 }

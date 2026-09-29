@@ -262,7 +262,11 @@ pub use runtime::io::BlockingJoinHandle;
 pub use runtime::io::ConnCtx;
 /// Future that completes when a connect finishes.
 pub use runtime::io::ConnectFuture;
-/// An accepted connection: the owned pair of halves handed to `on_accept`.
+/// Builder for an outbound TCP connection, from [`connect`].
+pub use runtime::io::TcpConnect;
+/// Builder for an outbound Unix-domain connection, from [`connect_unix`].
+pub use runtime::io::UnixConnect;
+/// An owned connection: the pair of claimed halves, from `on_accept` or `connect`.
 pub use runtime::io::Connection;
 /// A monotonic clock deadline for absolute timers.
 pub use runtime::io::Deadline;
@@ -325,16 +329,10 @@ pub use runtime::io::WithDataResultFuture;
 /// Future returned by [`ConnCtx::with_segments()`] (segmented recv, Mode B).
 #[cfg(has_io_uring)]
 pub use runtime::io::WithSegmentsFuture;
-/// Initiate an outbound TCP connection from any async task.
+/// Begin an outbound TCP connection; awaiting resolves to a `Connection`.
 pub use runtime::io::connect;
-/// Initiate an outbound TLS connection from any async task.
-pub use runtime::io::connect_tls;
-/// Initiate an outbound TLS connection with a timeout from any async task.
-pub use runtime::io::connect_tls_with_timeout;
-/// Initiate an outbound Unix domain socket connection from any async task.
+/// Begin an outbound Unix-domain connection; awaiting resolves to a `Connection`.
 pub use runtime::io::connect_unix;
-/// Initiate an outbound TCP connection with a timeout from any async task.
-pub use runtime::io::connect_with_timeout;
 /// Submit a Direct I/O read and return a future for the result.
 pub use runtime::io::direct_io_read;
 /// Submit a Direct I/O write and return a future for the result.

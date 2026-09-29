@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::future::IntoFuture;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -91,10 +92,14 @@ impl<A: Future, B: Future> Future for Join<A, B> {
 /// backend requests.
 ///
 /// The futures are polled in order (a, then b) on each iteration.
-pub fn join<A: Future, B: Future>(a: A, b: B) -> Join<A, B> {
+pub fn join<A: IntoFuture, B: IntoFuture>(a: A, b: B) -> Join<A::IntoFuture, B::IntoFuture> {
     Join {
-        a: MaybeDone::Pending { future: a },
-        b: MaybeDone::Pending { future: b },
+        a: MaybeDone::Pending {
+            future: a.into_future(),
+        },
+        b: MaybeDone::Pending {
+            future: b.into_future(),
+        },
     }
 }
 
@@ -130,10 +135,20 @@ impl<A: Future, B: Future, C: Future> Future for Join3<A, B, C> {
 ///
 /// Waits for **all three** futures. Useful for fan-out patterns with three
 /// concurrent operations (e.g., three parallel backend requests).
-pub fn join3<A: Future, B: Future, C: Future>(a: A, b: B, c: C) -> Join3<A, B, C> {
+pub fn join3<A: IntoFuture, B: IntoFuture, C: IntoFuture>(
+    a: A,
+    b: B,
+    c: C,
+) -> Join3<A::IntoFuture, B::IntoFuture, C::IntoFuture> {
     Join3 {
-        a: MaybeDone::Pending { future: a },
-        b: MaybeDone::Pending { future: b },
-        c: MaybeDone::Pending { future: c },
+        a: MaybeDone::Pending {
+            future: a.into_future(),
+        },
+        b: MaybeDone::Pending {
+            future: b.into_future(),
+        },
+        c: MaybeDone::Pending {
+            future: c.into_future(),
+        },
     }
 }

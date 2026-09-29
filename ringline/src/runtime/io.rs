@@ -393,141 +393,166 @@ impl<T: 'static> Future for BlockingJoinHandle<T> {
     }
 }
 
-/// Initiate an outbound TCP connection from any async task (connection or standalone).
+/// Begin an outbound TCP connection.
 ///
-/// This is the free-function equivalent of [`ConnCtx::connect()`] — it can be
-/// called from standalone tasks spawned via [`spawn()`] or from an
-/// [`AsyncEventHandler::on_start()`](crate::AsyncEventHandler::on_start) future,
-/// where no `ConnCtx` is available.
+/// Returns a builder; **nothing is submitted until it is awaited**, the same
+/// contract [`BackpressuredSendFuture`] carries. Awaiting resolves to an owned
+/// [`Connection`], with both halves already claimed — the same capability
+/// `on_accept` receives, so inbound and outbound connections are the same type.
 ///
-/// Returns a [`ConnectFuture`] that resolves with a [`ConnCtx`] for the new connection.
+/// ```ignore
+/// let conn = connect(addr).await?;
+/// let conn = connect(addr).timeout(Duration::from_millis(500)).await?;
+/// let conn = connect(addr).tls("example.com").await?;
+/// let conn = connect(addr).tls("example.com").timeout(d).await?;
+/// ```
+///
+/// Callable from a connection task, a task spawned with [`spawn()`], or an
+/// [`on_start`](crate::AsyncEventHandler::on_start) future.
+///
+/// # Concurrency
+///
+/// Because submission is deferred to the first poll, two builders held side by
+/// side do **not** overlap:
+///
+/// ```ignore
+/// let a = connect(x);            // nothing submitted
+/// let b = connect(y);            // nothing submitted
+/// let (ca, cb) = (a.await?, b.await?);   // serial: A then B
+/// ```
+///
+/// Use [`join`](crate::join) for overlap, which submits both on their first
+/// poll and then waits for both:
+///
+/// ```ignore
+/// let (ca, cb) = join(connect(x), connect(y)).await;
+/// ```
 ///
 /// # Panics
 ///
-/// Panics if called outside the ringline async executor.
-pub fn connect(addr: SocketAddr) -> io::Result<ConnectFuture> {
-    with_state(|driver, executor| {
-        let mut ctx = driver.make_ctx();
-        let token = ctx
-            .connect(addr)
-            .map_err(io::Error::other::<crate::error::Error>)?;
-        let calling_task = CURRENT_TASK_ID.with(|c| c.get());
-        executor.owner_task[token.index as usize] = Some(calling_task);
-        executor.connect_waiters[token.index as usize] = true;
-        Ok(ConnectFuture {
-            conn_index: token.index,
-            generation: token.generation,
-        })
-    })
+/// Awaiting outside the ringline async executor panics.
+pub fn connect(addr: SocketAddr) -> TcpConnect {
+    TcpConnect {
+        addr,
+        server_name: None,
+        timeout: None,
+    }
 }
 
-/// Initiate an outbound TCP connection with a timeout from any async task.
+/// Begin an outbound Unix-domain connection.
 ///
-/// Free-function equivalent of [`ConnCtx::connect_with_timeout()`].
+/// The counterpart to [`connect`]; see it for the laziness and concurrency
+/// contract. There is deliberately no `.tls()` here: the driver terminates TLS
+/// on `SocketAddr` connections only, so TLS over a Unix socket is not
+/// *representable* rather than being refused at run time.
+///
+/// ```ignore
+/// let conn = connect_unix(path).await?;
+/// let conn = connect_unix(path).timeout(Duration::from_millis(500)).await?;
+/// ```
 ///
 /// # Panics
 ///
-/// Panics if called outside the ringline async executor.
-pub fn connect_with_timeout(addr: SocketAddr, timeout_ms: u64) -> io::Result<ConnectFuture> {
-    with_state(|driver, executor| {
-        let mut ctx = driver.make_ctx();
-        let token = ctx
-            .connect_with_timeout(addr, timeout_ms)
-            .map_err(io::Error::other::<crate::error::Error>)?;
-        let calling_task = CURRENT_TASK_ID.with(|c| c.get());
-        executor.owner_task[token.index as usize] = Some(calling_task);
-        executor.connect_waiters[token.index as usize] = true;
-        Ok(ConnectFuture {
-            conn_index: token.index,
-            generation: token.generation,
-        })
-    })
+/// Awaiting outside the ringline async executor panics.
+pub fn connect_unix(path: impl AsRef<std::path::Path>) -> UnixConnect {
+    UnixConnect {
+        path: path.as_ref().to_path_buf(),
+        timeout: None,
+    }
 }
 
-/// Initiate an outbound Unix domain socket connection from any async task.
+/// Builder for an outbound TCP connection, from [`connect`].
 ///
-/// Free-function equivalent of [`ConnCtx::connect_unix()`].
-///
-/// Returns a [`ConnectFuture`] that resolves with a [`ConnCtx`] for the new connection.
-///
-/// # Panics
-///
-/// Panics if called outside the ringline async executor.
-pub fn connect_unix(path: impl AsRef<std::path::Path>) -> io::Result<ConnectFuture> {
-    with_state(|driver, executor| {
-        let mut ctx = driver.make_ctx();
-        let token = ctx
-            .connect_unix(path.as_ref())
-            .map_err(io::Error::other::<crate::error::Error>)?;
-        let calling_task = CURRENT_TASK_ID.with(|c| c.get());
-        executor.owner_task[token.index as usize] = Some(calling_task);
-        executor.connect_waiters[token.index as usize] = true;
-        Ok(ConnectFuture {
-            conn_index: token.index,
-            generation: token.generation,
-        })
-    })
-}
-
-/// Initiate an outbound TLS connection from any async task (connection or standalone).
-///
-/// This is the free-function equivalent of [`ConnCtx::connect_tls()`] — it can be
-/// called from standalone tasks spawned via [`spawn()`] or from an
-/// [`AsyncEventHandler::on_start()`](crate::AsyncEventHandler::on_start) future,
-/// where no `ConnCtx` is available.
-///
-/// `server_name` is the SNI hostname for the TLS handshake.
-///
-/// Returns a [`ConnectFuture`] that resolves with a [`ConnCtx`] for the new connection
-/// once both the TCP and TLS handshakes complete.
-///
-/// # Panics
-///
-/// Panics if called outside the ringline async executor.
-pub fn connect_tls(addr: SocketAddr, server_name: &str) -> io::Result<ConnectFuture> {
-    with_state(|driver, executor| {
-        let mut ctx = driver.make_ctx();
-        let token = ctx
-            .connect_tls(addr, server_name)
-            .map_err(io::Error::other::<crate::error::Error>)?;
-        let calling_task = CURRENT_TASK_ID.with(|c| c.get());
-        executor.owner_task[token.index as usize] = Some(calling_task);
-        executor.connect_waiters[token.index as usize] = true;
-        Ok(ConnectFuture {
-            conn_index: token.index,
-            generation: token.generation,
-        })
-    })
-}
-
-/// Initiate an outbound TLS connection with a timeout from any async task.
-///
-/// Free-function equivalent of [`ConnCtx::connect_tls_with_timeout()`].
-///
-/// `server_name` is the SNI hostname for the TLS handshake.
-///
-/// # Panics
-///
-/// Panics if called outside the ringline async executor.
-pub fn connect_tls_with_timeout(
+/// Inert until awaited. Options compose rather than multiplying entry points:
+/// transport is fixed by which function produced the builder, and TLS and
+/// timeout are independent of it — which is why a Unix connect can now take a
+/// timeout, something the old `connect_unix` could not express (#528).
+#[must_use = "a connect builder does nothing until awaited"]
+pub struct TcpConnect {
     addr: SocketAddr,
-    server_name: &str,
-    timeout_ms: u64,
-) -> io::Result<ConnectFuture> {
-    with_state(|driver, executor| {
-        let mut ctx = driver.make_ctx();
-        let token = ctx
-            .connect_tls_with_timeout(addr, server_name, timeout_ms)
-            .map_err(io::Error::other::<crate::error::Error>)?;
-        let calling_task = CURRENT_TASK_ID.with(|c| c.get());
-        executor.owner_task[token.index as usize] = Some(calling_task);
-        executor.connect_waiters[token.index as usize] = true;
-        Ok(ConnectFuture {
-            conn_index: token.index,
-            generation: token.generation,
-        })
-    })
+    server_name: Option<String>,
+    timeout: Option<Duration>,
 }
+
+impl TcpConnect {
+    /// Terminate TLS on this connection, with `server_name` as the SNI hostname.
+    pub fn tls(mut self, server_name: impl Into<String>) -> Self {
+        self.server_name = Some(server_name.into());
+        self
+    }
+
+    /// Fail the connect if it has not completed within `timeout`.
+    ///
+    /// A zero duration arms a timeout that fires immediately; the sub-millisecond
+    /// part of any duration is truncated, since both backends arm in whole
+    /// milliseconds.
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+}
+
+/// Builder for an outbound Unix-domain connection, from [`connect_unix`].
+///
+/// Inert until awaited. Has no `.tls()`: see [`connect_unix`].
+#[must_use = "a connect builder does nothing until awaited"]
+pub struct UnixConnect {
+    path: std::path::PathBuf,
+    timeout: Option<Duration>,
+}
+
+impl UnixConnect {
+    /// Fail the connect if it has not completed within `timeout`.
+    ///
+    /// See [`TcpConnect::timeout`] for how the duration is rounded.
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+}
+
+impl std::future::IntoFuture for TcpConnect {
+    type Output = io::Result<Connection>;
+    type IntoFuture = ConnectFuture;
+
+    fn into_future(self) -> ConnectFuture {
+        ConnectFuture {
+            state: ConnectState::Unsubmitted {
+                target: ConnectTarget::Tcp {
+                    addr: self.addr,
+                    server_name: self.server_name,
+                },
+                timeout: self.timeout,
+            },
+        }
+    }
+}
+
+impl std::future::IntoFuture for UnixConnect {
+    type Output = io::Result<Connection>;
+    type IntoFuture = ConnectFuture;
+
+    fn into_future(self) -> ConnectFuture {
+        ConnectFuture {
+            state: ConnectState::Unsubmitted {
+                target: ConnectTarget::Unix { path: self.path },
+                timeout: self.timeout,
+            },
+        }
+    }
+}
+
+/// What a [`ConnectFuture`] will submit on its first poll.
+enum ConnectTarget {
+    Tcp {
+        addr: SocketAddr,
+        server_name: Option<String>,
+    },
+    Unix {
+        path: std::path::PathBuf,
+    },
+}
+
 
 // ── DNS Resolution ──────────────────────────────────────────────────
 
@@ -2365,65 +2390,6 @@ impl ConnCtx {
 
     // ── Connect ──────────────────────────────────────────────────────
 
-    /// Initiate an outbound TCP connection and await the result.
-    ///
-    /// Returns a new `ConnCtx` for the peer connection on success.
-    pub fn connect(&self, addr: SocketAddr) -> io::Result<ConnectFuture> {
-        with_state(|driver, executor| {
-            let mut ctx = driver.make_ctx();
-            let token = ctx
-                .connect(addr)
-                .map_err(io::Error::other::<crate::error::Error>)?;
-            let calling_task = CURRENT_TASK_ID.with(|c| c.get());
-            executor.owner_task[token.index as usize] = Some(calling_task);
-            executor.connect_waiters[token.index as usize] = true;
-            Ok(ConnectFuture {
-                conn_index: token.index,
-                generation: token.generation,
-            })
-        })
-    }
-
-    /// Initiate an outbound TCP connection with a timeout and await the result.
-    pub fn connect_with_timeout(
-        &self,
-        addr: SocketAddr,
-        timeout_ms: u64,
-    ) -> io::Result<ConnectFuture> {
-        with_state(|driver, executor| {
-            let mut ctx = driver.make_ctx();
-            let token = ctx
-                .connect_with_timeout(addr, timeout_ms)
-                .map_err(io::Error::other::<crate::error::Error>)?;
-            let calling_task = CURRENT_TASK_ID.with(|c| c.get());
-            executor.owner_task[token.index as usize] = Some(calling_task);
-            executor.connect_waiters[token.index as usize] = true;
-            Ok(ConnectFuture {
-                conn_index: token.index,
-                generation: token.generation,
-            })
-        })
-    }
-
-    /// Initiate an outbound Unix domain socket connection and await the result.
-    ///
-    /// Returns a new `ConnCtx` for the peer connection on success.
-    pub fn connect_unix(&self, path: impl AsRef<std::path::Path>) -> io::Result<ConnectFuture> {
-        with_state(|driver, executor| {
-            let mut ctx = driver.make_ctx();
-            let token = ctx
-                .connect_unix(path.as_ref())
-                .map_err(io::Error::other::<crate::error::Error>)?;
-            let calling_task = CURRENT_TASK_ID.with(|c| c.get());
-            executor.owner_task[token.index as usize] = Some(calling_task);
-            executor.connect_waiters[token.index as usize] = true;
-            Ok(ConnectFuture {
-                conn_index: token.index,
-                generation: token.generation,
-            })
-        })
-    }
-
     // ── Send chain ────────────────────────────────────────────────────
 
     /// Build an IO_LINK chained send on this connection (fire-and-forget).
@@ -2543,45 +2509,6 @@ impl ConnCtx {
                 .filter(|c| c.generation == self.generation)
                 .map(|c| matches!(c.read, crate::connection::ReadHalf::Eof { truncated: true }))
                 .unwrap_or(false)
-        })
-    }
-
-    /// Initiate an outbound TLS connection and await the result.
-    pub fn connect_tls(&self, addr: SocketAddr, server_name: &str) -> io::Result<ConnectFuture> {
-        with_state(|driver, executor| {
-            let mut ctx = driver.make_ctx();
-            let token = ctx
-                .connect_tls(addr, server_name)
-                .map_err(io::Error::other::<crate::error::Error>)?;
-            let calling_task = CURRENT_TASK_ID.with(|c| c.get());
-            executor.owner_task[token.index as usize] = Some(calling_task);
-            executor.connect_waiters[token.index as usize] = true;
-            Ok(ConnectFuture {
-                conn_index: token.index,
-                generation: token.generation,
-            })
-        })
-    }
-
-    /// Initiate an outbound TLS connection with a timeout and await the result.
-    pub fn connect_tls_with_timeout(
-        &self,
-        addr: SocketAddr,
-        server_name: &str,
-        timeout_ms: u64,
-    ) -> io::Result<ConnectFuture> {
-        with_state(|driver, executor| {
-            let mut ctx = driver.make_ctx();
-            let token = ctx
-                .connect_tls_with_timeout(addr, server_name, timeout_ms)
-                .map_err(io::Error::other::<crate::error::Error>)?;
-            let calling_task = CURRENT_TASK_ID.with(|c| c.get());
-            executor.owner_task[token.index as usize] = Some(calling_task);
-            executor.connect_waiters[token.index as usize] = true;
-            Ok(ConnectFuture {
-                conn_index: token.index,
-                generation: token.generation,
-            })
         })
     }
 
@@ -3558,6 +3485,18 @@ impl Connection {
     /// The event loop owns `&mut Driver` at that point and sets the claim
     /// itself; the slot is freshly accepted, so the claim is always free.
     pub(crate) fn for_accept(conn: ConnCtx) -> Self {
+        Self::from_claimed(conn)
+    }
+
+    /// Build the pair from a slot whose halves the **caller** has already
+    /// marked claimed.
+    ///
+    /// Both entry points need this, for different reasons: `spawn_accept_task`
+    /// runs outside a task poll and the event loop sets the claim while it owns
+    /// `&mut Driver`, while `ConnectFuture::poll` is already inside `with_state`
+    /// and sets it there. Neither can go through [`ConnCtx::split`], and
+    /// neither needs to.
+    pub(crate) fn from_claimed(conn: ConnCtx) -> Self {
         Self {
             tx: SendHalf {
                 conn,
@@ -3735,11 +3674,6 @@ impl Connection {
         self.tx.is_outbound()
     }
 
-    /// See [`ConnCtx::connect`].
-    pub fn connect(&self, addr: std::net::SocketAddr) -> io::Result<ConnectFuture> {
-        self.tx.connect(addr)
-    }
-
     /// The underlying `ConnCtx`, for the APIs that still take one — most
     /// notably as a `forward_to_conn` sink. See [`SendHalf::as_conn`].
     pub fn as_conn(&self) -> ConnCtx {
@@ -3827,36 +3761,6 @@ impl Connection {
         self.tx.as_conn().request_shutdown();
     }
 
-    /// See [`ConnCtx::connect_with_timeout`].
-    pub fn connect_with_timeout(
-        &self,
-        addr: std::net::SocketAddr,
-        timeout_ms: u64,
-    ) -> io::Result<ConnectFuture> {
-        self.tx.as_conn().connect_with_timeout(addr, timeout_ms)
-    }
-
-    /// See [`ConnCtx::connect_unix`].
-    pub fn connect_unix(&self, path: impl AsRef<std::path::Path>) -> io::Result<ConnectFuture> {
-        self.tx.as_conn().connect_unix(path)
-    }
-
-    /// See [`ConnCtx::connect_tls`].
-    pub fn connect_tls(&self, addr: SocketAddr, server_name: &str) -> io::Result<ConnectFuture> {
-        self.tx.as_conn().connect_tls(addr, server_name)
-    }
-
-    /// See [`ConnCtx::connect_tls_with_timeout`].
-    pub fn connect_tls_with_timeout(
-        &self,
-        addr: SocketAddr,
-        server_name: &str,
-        timeout_ms: u64,
-    ) -> io::Result<ConnectFuture> {
-        self.tx
-            .as_conn()
-            .connect_tls_with_timeout(addr, server_name, timeout_ms)
-    }
 }
 
 /// The **write side** of a connection, from [`ConnCtx::split`].
@@ -3983,13 +3887,6 @@ impl SendHalf {
     /// See [`ConnCtx::is_outbound`].
     pub fn is_outbound(&self) -> bool {
         self.conn.is_outbound()
-    }
-
-    /// See [`ConnCtx::connect`]. Opening another connection is a runtime
-    /// capability rather than a write on this one, but it is reachable from
-    /// here so a task holding only the halves can still build a proxy.
-    pub fn connect(&self, addr: std::net::SocketAddr) -> io::Result<ConnectFuture> {
-        self.conn.connect(addr)
     }
 
     /// The underlying handle, for the APIs that still take a `ConnCtx` — most
@@ -5587,33 +5484,137 @@ impl Drop for DirectEchoFuture {
 
 // ── ConnectFuture ────────────────────────────────────────────────────
 
-/// Future that awaits an outbound TCP connection. The connect SQE was submitted
-/// eagerly by [`ConnCtx::connect`] — this future waits for the CQE result.
+/// Future for an outbound connection, from awaiting [`TcpConnect`] or
+/// [`UnixConnect`].
+///
+/// Submits on its **first poll**, not at construction, then waits for the CQE
+/// and resolves to an owned [`Connection`] with both halves claimed. Building
+/// one and never awaiting it does nothing at all — no socket, no slot, no SYN.
+///
+/// That laziness is the one behavioural difference from the old eager
+/// `connect()`: two of these held side by side do not overlap unless they are
+/// [`join`](crate::join)ed. See [`connect`].
 pub struct ConnectFuture {
-    conn_index: u32,
-    generation: u32,
+    state: ConnectState,
+}
+
+enum ConnectState {
+    /// Nothing submitted yet.
+    Unsubmitted {
+        target: ConnectTarget,
+        timeout: Option<Duration>,
+    },
+    /// The connect is in the kernel; waiting for its completion.
+    Waiting { conn_index: u32, generation: u32 },
+    /// Resolved, or failed before submitting. Holds no slot.
+    Done,
+}
+
+impl ConnectFuture {
+    /// Submit the connect described by `target`, arming a timeout if one was
+    /// asked for.
+    ///
+    /// Transport, TLS and timeout compose here rather than in the driver: the
+    /// base connect is chosen by transport, TLS by whether a server name was
+    /// given, and the timeout armed afterwards by index. `arm_connect_timeout`
+    /// is transport-agnostic on both backends, which is what lets
+    /// `connect_unix(..).timeout(..)` exist at all.
+    fn submit(
+        target: &ConnectTarget,
+        timeout: Option<Duration>,
+        driver: &mut crate::backend::Driver,
+        executor: &mut crate::runtime::Executor,
+    ) -> io::Result<(u32, u32)> {
+        let mut ctx = driver.make_ctx();
+        let token = match target {
+            ConnectTarget::Tcp {
+                addr,
+                server_name: Some(name),
+            } => ctx.connect_tls(*addr, name),
+            ConnectTarget::Tcp {
+                addr,
+                server_name: None,
+            } => ctx.connect(*addr),
+            ConnectTarget::Unix { path } => ctx.connect_unix(path.as_path()),
+        }
+        .map_err(io::Error::other::<crate::error::Error>)?;
+        if let Some(timeout) = timeout {
+            let ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+            ctx.arm_connect_timeout(token.index, ms);
+        }
+        let calling_task = CURRENT_TASK_ID.with(|c| c.get());
+        executor.owner_task[token.index as usize] = Some(calling_task);
+        executor.connect_waiters[token.index as usize] = true;
+        Ok((token.index, token.generation))
+    }
 }
 
 impl Future for ConnectFuture {
-    type Output = io::Result<ConnCtx>;
+    type Output = io::Result<Connection>;
 
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<ConnCtx>> {
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<Connection>> {
+        let this = unsafe { self.get_unchecked_mut() };
         with_state(|driver, executor| {
+            // First poll: submit. A failure here is terminal and holds no slot,
+            // so the state goes straight to `Done` rather than leaving a
+            // half-built connect for `Drop` to reason about.
+            let (conn_index, generation) = match &this.state {
+                ConnectState::Unsubmitted { target, timeout } => {
+                    match Self::submit(target, *timeout, driver, executor) {
+                        Ok(pair) => {
+                            this.state = ConnectState::Waiting {
+                                conn_index: pair.0,
+                                generation: pair.1,
+                            };
+                            pair
+                        }
+                        Err(e) => {
+                            this.state = ConnectState::Done;
+                            return Poll::Ready(Err(e));
+                        }
+                    }
+                }
+                ConnectState::Waiting {
+                    conn_index,
+                    generation,
+                } => (*conn_index, *generation),
+                ConnectState::Done => {
+                    return Poll::Ready(Err(io::Error::other("connect future polled after completion")));
+                }
+            };
+
             // Slot-reuse safety.
-            if driver.connections.generation(self.conn_index) != self.generation {
+            if driver.connections.generation(conn_index) != generation {
+                this.state = ConnectState::Done;
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::ConnectionAborted,
                     "connection closed",
                 )));
             }
-            match executor.io_results[self.conn_index as usize].take() {
-                Some(IoResult::Connect(result)) => match result {
-                    Ok(()) => Poll::Ready(Ok(ConnCtx::new(self.conn_index, self.generation))),
-                    Err(e) => Poll::Ready(Err(e)),
-                },
+            match executor.io_results[conn_index as usize].take() {
+                Some(IoResult::Connect(result)) => {
+                    this.state = ConnectState::Done;
+                    match result {
+                        Ok(()) => {
+                            // Claim both halves here, which is what `split()`
+                            // used to make the caller do — and what made
+                            // construction fallible for a reason the caller did
+                            // not cause. A freshly connected slot cannot have a
+                            // half out already, and `Connection` is not `Copy`,
+                            // so there is no second handle to race (#528).
+                            let idx = conn_index as usize;
+                            driver.recv_half_taken[idx] = true;
+                            driver.send_half_taken[idx] = true;
+                            Poll::Ready(Ok(Connection::from_claimed(ConnCtx::new(
+                                conn_index, generation,
+                            ))))
+                        }
+                        Err(e) => Poll::Ready(Err(e)),
+                    }
+                }
                 _ => {
                     // Not ready yet — re-register waiter.
-                    executor.connect_waiters[self.conn_index as usize] = true;
+                    executor.connect_waiters[conn_index as usize] = true;
                     Poll::Pending
                 }
             }
@@ -5623,6 +5624,16 @@ impl Future for ConnectFuture {
 
 impl Drop for ConnectFuture {
     fn drop(&mut self) {
+        // Unsubmitted and Done hold nothing: an un-awaited builder never
+        // reached the driver, and a resolved future already handed its slot to
+        // the `Connection` (or failed and holds none).
+        let (conn_index, generation) = match self.state {
+            ConnectState::Waiting {
+                conn_index,
+                generation,
+            } => (conn_index, generation),
+            _ => return,
+        };
         let opt_non_null = CURRENT_DRIVER.with(|c| c.get());
         if opt_non_null.is_none() {
             return;
@@ -5634,11 +5645,11 @@ impl Drop for ConnectFuture {
         // already been reused. (Quite rare for connect: drop usually
         // happens before any close/reuse cycle on the same slot, but
         // belt-and-suspenders.)
-        if driver.connections.generation(self.conn_index) != self.generation {
+        if driver.connections.generation(conn_index) != generation {
             return;
         }
         let executor = unsafe { &mut *state.executor.as_mut() };
-        executor.connect_waiters[self.conn_index as usize] = false;
+        executor.connect_waiters[conn_index as usize] = false;
     }
 }
 

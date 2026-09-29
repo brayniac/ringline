@@ -2374,7 +2374,16 @@ impl<'a> DriverCtx<'a> {
 
     /// Arm a connect timeout for the given connection index.
     #[cfg(has_io_uring)]
-    fn arm_connect_timeout(&mut self, conn_index: u32, timeout_ms: u64) {
+    /// Arm a connect timeout on an already-submitted connect, whatever its
+    /// transport.
+    ///
+    /// Timing is orthogonal to the connect itself: `connect_with_timeout` and
+    /// `connect_tls_with_timeout` are both "base connect, then arm". Exposing
+    /// the arming step lets the connect builders compose transport × TLS ×
+    /// timeout instead of the driver carrying one entry point per combination —
+    /// which is how `connect_unix` ended up unable to take a timeout at all
+    /// (#528).
+    pub(crate) fn arm_connect_timeout(&mut self, conn_index: u32, timeout_ms: u64) {
         let ts = &mut self.connect_timespecs[conn_index as usize];
         *ts = io_uring::types::Timespec::new()
             .sec(timeout_ms / 1000)
@@ -2869,13 +2878,20 @@ impl<'a> DriverCtx<'a> {
         timeout_ms: u64,
     ) -> Result<ConnToken, crate::error::Error> {
         let token = self.connect(addr)?;
-        if self.connect_deadlines[token.index as usize]
+        self.arm_connect_timeout(token.index, timeout_ms);
+        Ok(token)
+    }
+
+    /// Arm a connect timeout on an already-submitted connect, whatever its
+    /// transport. The io_uring twin of the same name; see it for why the
+    /// arming step is separate from the connect (#528).
+    pub(crate) fn arm_connect_timeout(&mut self, conn_index: u32, timeout_ms: u64) {
+        if self.connect_deadlines[conn_index as usize]
             .replace(std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms))
             .is_none()
         {
             *self.connect_pending += 1;
         }
-        Ok(token)
     }
 
     /// Connect with TLS.
@@ -2930,12 +2946,7 @@ impl<'a> DriverCtx<'a> {
         timeout_ms: u64,
     ) -> Result<ConnToken, crate::error::Error> {
         let token = self.connect_tls(addr, server_name)?;
-        if self.connect_deadlines[token.index as usize]
-            .replace(std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms))
-            .is_none()
-        {
-            *self.connect_pending += 1;
-        }
+        self.arm_connect_timeout(token.index, timeout_ms);
         Ok(token)
     }
 

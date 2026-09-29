@@ -438,7 +438,7 @@ type ResultCallback = Box<dyn Fn(&CommandResult)>;
 
 /// Builder for creating a [`Client`] with per-request callbacks and metrics.
 pub struct ClientBuilder {
-    conn: ConnCtx,
+    conn: Connection,
     on_result: Option<ResultCallback>,
     max_batch_size: usize,
     max_in_flight: usize,
@@ -450,7 +450,7 @@ pub struct ClientBuilder {
 }
 
 impl ClientBuilder {
-    pub(crate) fn new(conn: ConnCtx) -> Self {
+    pub(crate) fn new(conn: Connection) -> Self {
         Self {
             conn,
             on_result: None,
@@ -528,12 +528,11 @@ impl ClientBuilder {
 
     /// Build the client.
     ///
-    /// # Errors
-    ///
-    /// Same as [`Client::new`]: the read side must be free.
-    pub fn build(self) -> Result<Client, Error> {
-        let (tx, rx) = self.conn.split()?;
-        Ok(self.finish(tx, rx))
+    /// Infallible, like [`Client::new`]: the builder holds a [`Connection`],
+    /// which already owns both halves (#528).
+    pub fn build(self) -> Client {
+        let (tx, rx) = self.conn.split();
+        self.finish(tx, rx)
     }
 
     /// `build` without the driver, for the in-memory unit tests.
@@ -704,16 +703,17 @@ impl Client {
     ///
     /// No callbacks, no metrics, no kernel timestamps — zero overhead.
     /// `max_batch_size` defaults to 1 (each `fire_*` sends immediately).
-    /// # Errors
     ///
-    /// Takes exclusive ownership of the connection's read side via
-    /// [`ConnCtx::split`], so this fails with `EBUSY` if another client (or
-    /// any other reader) already holds it, and `EPIPE` if `conn` is stale.
-    /// Two clients driving one connection used to be silently allowed, and it
-    /// interleaved their reads; now it is refused.
-    pub fn new(conn: ConnCtx) -> Result<Self, Error> {
-        let (tx, rx) = conn.split()?;
-        Ok(Self {
+    /// Infallible: a [`Connection`] *is* the claimed halves, so there is nothing
+    /// left to refuse. This used to take a `ConnCtx` and claim the read side
+    /// here via `split()`, which could fail `EBUSY`/`EPIPE` for reasons the
+    /// caller had not caused — a setup-failure path every caller had to carry
+    /// (#528). Two clients driving one connection is still impossible, now
+    /// because there is only one `Connection` rather than because a claim is
+    /// refused.
+    pub fn new(conn: Connection) -> Self {
+        let (tx, rx) = conn.split();
+        Self {
             tx,
             rx,
             on_result: None,
@@ -731,11 +731,11 @@ impl Client {
             use_kernel_ts: false,
             #[cfg(feature = "metrics")]
             metrics: None,
-        })
+        }
     }
 
     /// Create a builder for a client with per-request callbacks.
-    pub fn builder(conn: ConnCtx) -> ClientBuilder {
+    pub fn builder(conn: Connection) -> ClientBuilder {
         ClientBuilder::new(conn)
     }
 
