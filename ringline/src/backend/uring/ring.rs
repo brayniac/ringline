@@ -595,8 +595,11 @@ impl Ring {
     }
 
     /// Submit a shutdown(SHUT_WR) for a connection.
-    pub fn submit_shutdown(&mut self, conn_index: u32) -> io::Result<()> {
-        let user_data = UserData::encode(OpTag::Shutdown, conn_index, 0);
+    pub fn submit_shutdown(&mut self, conn_index: u32, generation: u32) -> io::Result<()> {
+        // The generation rides in the payload so the completion can reject a
+        // CQE that outlived its connection slot (domain invariant 3). It used
+        // to be a bare 0, and the completion was `{}`.
+        let user_data = UserData::encode(OpTag::Shutdown, conn_index, generation);
         let entry = opcode::Shutdown::new(Fixed(conn_index), libc::SHUT_WR)
             .build()
             .user_data(user_data.raw());

@@ -843,6 +843,10 @@ impl Driver {
         state.parked = false;
         state.close_pending = false;
         state.close_submitted = false;
+        // Defensive: the close now waits on this, so a slot should never be
+        // reactivated with a Shutdown still outstanding. If the gate ever leaks,
+        // the next occupant must not inherit the block (#518).
+        state.shutdown_inflight = false;
         state.shutdown_pending = false;
         state.acked_bytes = 0;
         state.close_notify_deadline = None;
@@ -1169,7 +1173,19 @@ impl Driver {
         // accounting; the chain completion handlers re-drive this finalize
         // once the chain drains.
         let chain_drained = !self.chain_table.is_active(conn_index);
-        if !(state.close_pending && sends_drained && forward_drained && chain_drained) {
+        // A `Shutdown` SQE still in the kernel names this slot as
+        // `Fixed(conn_index)`. `Close` frees the slot for the next accept to
+        // register, so submitting it now lets the FIN land on that next
+        // connection instead — a live peer, cleanly half-closed, whose next send
+        // fails `EPIPE`. `handle_shutdown` re-drives this finalize once the CQE
+        // clears the flag (#518).
+        let shutdown_drained = !state.shutdown_inflight;
+        if !(state.close_pending
+            && sends_drained
+            && forward_drained
+            && chain_drained
+            && shutdown_drained)
+        {
             return;
         }
         let st = &mut self.send_queues[conn_index as usize];
@@ -1465,7 +1481,12 @@ impl Driver {
         // Submit deferred shutdown_write now that the send queue is drained.
         if state.shutdown_pending {
             state.shutdown_pending = false;
-            let _ = self.ring.submit_shutdown(conn_index);
+            // Only on a successful push: see `shutdown_inflight`. A flag set for
+            // an SQE that was never accepted would hold the close forever.
+            let generation = self.connections.generation(conn_index);
+            if self.ring.submit_shutdown(conn_index, generation).is_ok() {
+                self.send_queues[conn_index as usize].shutdown_inflight = true;
+            }
         }
         // Fire a deferred close now that nothing is in flight and the
         // queue is empty. The ZC and recv-forward completion paths

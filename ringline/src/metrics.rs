@@ -18,7 +18,7 @@ pub static CONNECTIONS: ShardedCounterGroup = ShardedCounterGroup::new(2);
 pub static BYTES: ShardedCounterGroup = ShardedCounterGroup::new(3);
 
 #[metric(name = "ringline/ring", description = "Ring utilization counters")]
-pub static RING: ShardedCounterGroup = ShardedCounterGroup::new(5);
+pub static RING: ShardedCounterGroup = ShardedCounterGroup::new(6);
 
 #[metric(name = "ringline/pool", description = "Pool exhaustion counters")]
 pub static POOL: ShardedCounterGroup = ShardedCounterGroup::new(8);
@@ -62,6 +62,12 @@ pub mod ring {
     /// recognise. Indicates either a corrupted user_data or a future
     /// reorder of the `OpTag` enum that left a stale value in flight.
     pub const CQE_UNKNOWN_TAG: usize = 4;
+    /// A `Shutdown` CQE arrived for a connection slot whose generation had
+    /// already moved on — the FIN was executed against the slot's *next*
+    /// occupant. `try_finalize_close` now holds the `Close` that frees the slot
+    /// until the `Shutdown` CQE lands, so this should stay at zero; a nonzero
+    /// value means that gate leaked (#518).
+    pub const SHUTDOWN_STALE: usize = 5;
 }
 
 /// Counter slot indices for pool exhaustion metrics.
@@ -157,6 +163,7 @@ pub fn init_metadata() {
         "recv_arm_failures".into(),
     );
     RING.insert_metadata(ring::CQE_UNKNOWN_TAG, "op".into(), "cqe_unknown_tag".into());
+    RING.insert_metadata(ring::SHUTDOWN_STALE, "op".into(), "shutdown_stale".into());
 
     POOL.insert_metadata(pool::SEND_EXHAUSTED, "op".into(), "send_exhausted".into());
     POOL.insert_metadata(pool::TIMER_EXHAUSTED, "op".into(), "timer_exhausted".into());
@@ -218,6 +225,7 @@ mod tests {
             ring::CLOSE_SUBMIT_FAILURES,
             ring::RECV_ARM_FAILURES,
             ring::CQE_UNKNOWN_TAG,
+            ring::SHUTDOWN_STALE,
         ] {
             assert!(RING.increment(idx), "RING[{idx}] out of bounds");
         }
