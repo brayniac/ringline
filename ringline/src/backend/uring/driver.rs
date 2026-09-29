@@ -368,7 +368,21 @@ pub(crate) struct Driver {
     /// Every path that stops a drain must clear this *and* re-arm, or the
     /// connection is left `Open` with no recv armed and its bytes piling up
     /// forever — the failure the unconditional re-arm was added to prevent.
+    ///
+    /// Written only through [`Driver::set_park_drain`], which keeps
+    /// `park_drain_pending` in step.
     pub(crate) park_drain: Vec<Option<ParkDrain>>,
+    /// Connection indices with a drain outstanding, visited by
+    /// `drive_park_drains` each tick instead of scanning `park_drain`.
+    ///
+    /// `park_drain` is sized to `max_connections`, so walking it cost every
+    /// tick 16,000 slot checks per worker at the default with nothing parking,
+    /// measured at 37% of a client worker's cycles (#514). Same shape as the
+    /// retry lists: per-slot state plus a list of the slots with work.
+    ///
+    /// Holds no duplicates. May briefly hold an index whose drain was cleared
+    /// elsewhere; the next drive drops it.
+    pub(crate) park_drain_pending: Vec<u32>,
     /// State the handler deposited alongside the offer, carried to the
     /// adopting worker and handed to `on_adopt`.
     ///
@@ -1062,6 +1076,7 @@ impl Driver {
             adopt_pending: std::collections::HashMap::new(),
             park_offered: vec![false; config.max_connections as usize],
             park_drain: vec![None; config.max_connections as usize],
+            park_drain_pending: Vec::new(),
             park_carry: std::collections::HashMap::new(),
             park_in_flight: vec![None; config.max_connections as usize],
             park_ready: Vec::new(),
@@ -1745,6 +1760,17 @@ impl Driver {
         }
     }
 
+    /// Set or clear `conn_index`'s park drain. Every write to `park_drain`
+    /// goes through here so every drain is on `park_drain_pending`. Clearing
+    /// leaves the index on the list for `drive_park_drains` to drop.
+    pub(crate) fn set_park_drain(&mut self, conn_index: u32, drain: Option<ParkDrain>) {
+        let slot = &mut self.park_drain[conn_index as usize];
+        if slot.is_none() && drain.is_some() && !self.park_drain_pending.contains(&conn_index) {
+            self.park_drain_pending.push(conn_index);
+        }
+        *slot = drain;
+    }
+
     pub(crate) fn close_connection(&mut self, conn_index: u32) {
         if let Some(conn) = self.connections.get_mut(conn_index) {
             if conn.close_requested() {
@@ -1770,7 +1796,7 @@ impl Driver {
         // reused: a `ParkState` is an arbitrary user value, and a slot that is
         // never reused would hold it for the life of the process.
         self.park_offered[conn_index as usize] = false;
-        self.park_drain[conn_index as usize] = None;
+        self.set_park_drain(conn_index, None);
         self.park_carry.remove(&conn_index);
         self.adopt_pending.remove(&conn_index);
         // Do NOT drain held segmented-recv buffers here. When a peer FIN drives
