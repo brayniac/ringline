@@ -141,7 +141,7 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use resp_proto::{Request, Value};
-use ringline::{ConnCtx, GuardBox, ParseResult, RecvHalf, SendGuard, SendHalf};
+use ringline::{Connection, GuardBox, ParseResult, RecvHalf, SendGuard, SendHalf};
 
 /// Maximum guards per scatter-gather send (matches ringline core limit).
 const MAX_FLUSH_GUARDS: usize = 8;
@@ -531,8 +531,7 @@ impl ClientBuilder {
     /// Infallible, like [`Client::new`]: the builder holds a [`Connection`],
     /// which already owns both halves (#528).
     pub fn build(self) -> Client {
-        let (tx, rx) = self.conn.split();
-        self.finish(tx, rx)
+        self.finish(None)
     }
 
     /// `build` without the driver, for the in-memory unit tests.
@@ -543,29 +542,47 @@ impl ClientBuilder {
     /// wire — the same contract `ConnCtx::for_test` already carries.
     #[cfg(test)]
     pub(crate) fn build_for_test(self) -> Client {
-        let (tx, rx) = self.conn.split_for_test();
-        self.finish(tx, rx)
+        let halves = self.conn.as_conn().split_for_test();
+        self.finish(Some(halves))
     }
 
-    fn finish(self, tx: SendHalf, rx: RecvHalf) -> Client {
+    /// Assemble the client, taking the builder apart.
+    ///
+    /// `Connection::split` consumes the connection, which would partially move
+    /// a `self` the rest of this still reads — so the builder is destructured
+    /// first. `halves` overrides the connection's own, for the in-memory unit
+    /// tests whose handle is deliberately dangling.
+    fn finish(self, halves: Option<(SendHalf, RecvHalf)>) -> Client {
+        let Self {
+            conn,
+            on_result,
+            max_batch_size,
+            max_in_flight,
+            zc_threshold,
+            #[cfg(feature = "timestamps")]
+            use_kernel_ts,
+            #[cfg(feature = "metrics")]
+            with_metrics,
+        } = self;
+        let (tx, rx) = halves.unwrap_or_else(|| conn.split());
         Client {
             tx,
             rx,
-            on_result: self.on_result,
+            on_result,
             pending: VecDeque::with_capacity(16),
             last_rx_bytes: Cell::new(0),
             write_buf: Vec::new(),
             write_guards: Vec::new(),
             flushed_count: 0,
-            max_batch_size: self.max_batch_size,
-            max_in_flight: self.max_in_flight,
-            zc_threshold: self.zc_threshold,
+            max_batch_size,
+            max_in_flight,
+            zc_threshold,
             buffered_ops: 0,
             encode_buf: Vec::new(),
             #[cfg(feature = "timestamps")]
-            use_kernel_ts: self.use_kernel_ts,
+            use_kernel_ts,
             #[cfg(feature = "metrics")]
-            metrics: if self.with_metrics {
+            metrics: if with_metrics {
                 Some(ClientMetrics::new())
             } else {
                 None

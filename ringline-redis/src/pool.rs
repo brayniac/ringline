@@ -83,7 +83,20 @@ impl PoolConfig {
 }
 
 enum Slot {
-    Connected(ConnCtx),
+    /// A pooled connection *is* a client.
+    ///
+    /// The slot used to hold a bare `ConnCtx` and mint a throwaway `Client` per
+    /// checkout, which once the halves became claims meant a `split()` — two
+    /// driver round trips and two claim writes — on every call. `ShardedClient`
+    /// and `ClusterClient` moved to owning the client for exactly that reason
+    /// (#439, #440); `connect` resolving to a non-`Copy` `Connection` (#528)
+    /// finishes the job here. One split per *connection*, not per checkout.
+    ///
+    /// Boxed so the enum is a pointer rather than a whole `Client` per slot,
+    /// and so the client sits at a stable address — which is what lets
+    /// `get_stream` hand out a `ValueStream` borrowing it, with no separate
+    /// parking field.
+    Connected(Box<Client>),
     Disconnected,
 }
 
@@ -99,14 +112,6 @@ pub struct Pool {
     tls_server_name: Option<String>,
     password: Option<String>,
     username: Option<String>,
-    /// The ephemeral [`Client`] backing a live streaming [`get_stream`](Pool::get_stream).
-    ///
-    /// A [`ValueStream`] borrows `&mut Client`, so the client it borrows must
-    /// outlive the stream and live at a stable address — it is parked here for
-    /// the stream's lifetime (the returned stream borrows `&mut self` through
-    /// this field, blocking all other pool use until it is dropped).
-    #[cfg(has_io_uring)]
-    stream_client: Option<Client>,
     /// Index of the slot whose connection is/was lent to a streaming
     /// `get_stream`, pending a health re-check on the next checkout. See
     /// [`reconcile_stream_slot`](Pool::reconcile_stream_slot).
@@ -130,8 +135,6 @@ impl Pool {
             password: config.password,
             username: config.username,
             #[cfg(has_io_uring)]
-            stream_client: None,
-            #[cfg(has_io_uring)]
             stream_slot: None,
         }
     }
@@ -139,8 +142,8 @@ impl Pool {
     /// Eagerly connect all slots. Returns an error if any connection fails.
     pub async fn connect_all(&mut self) -> Result<(), Error> {
         for i in 0..self.slots.len() {
-            let conn = self.do_connect().await?;
-            self.slots[i] = Slot::Connected(conn);
+            let client = self.do_connect().await?;
+            self.slots[i] = Slot::Connected(Box::new(client));
         }
         Ok(())
     }
@@ -150,30 +153,36 @@ impl Pool {
     /// Advances the round-robin cursor and returns a client for a connected
     /// slot. Disconnected slots are lazily reconnected. If all slots fail,
     /// returns [`Error::AllConnectionsFailed`].
-    pub async fn client(&mut self) -> Result<Client, Error> {
+    pub async fn client(&mut self) -> Result<&mut Client, Error> {
         self.reconcile_stream_slot();
-        let (_idx, conn) = self.checkout().await?;
-        Client::new(conn)
+        let idx = self.checkout().await?;
+        match &mut self.slots[idx] {
+            Slot::Connected(client) => Ok(client),
+            // `checkout` only returns the index of a slot it left `Connected`.
+            Slot::Disconnected => Err(Error::AllConnectionsFailed),
+        }
     }
 
     /// Select the next healthy slot (round-robin, lazily reconnecting a
-    /// disconnected one) and return its index plus connection handle.
+    /// disconnected one) and return its index.
     ///
-    /// Shared by [`client`](Pool::client) and
-    /// [`get_stream`](Pool::get_stream); the latter needs the slot index to
-    /// re-check the connection's health after the stream ends.
-    async fn checkout(&mut self) -> Result<(usize, ConnCtx), Error> {
+    /// Returns the index rather than the client because the caller needs to
+    /// borrow it out of `self.slots`, which it cannot do while this method holds
+    /// `&mut self`. Both callers — [`client`](Pool::client) and
+    /// [`get_stream`](Pool::get_stream) — want the index anyway; `get_stream`
+    /// records it so the next checkout can re-check that connection's health.
+    async fn checkout(&mut self) -> Result<usize, Error> {
         let size = self.slots.len();
         for _ in 0..size {
             let idx = self.next;
             self.next = (self.next + 1) % size;
 
             match &self.slots[idx] {
-                Slot::Connected(conn) => return Ok((idx, *conn)),
+                Slot::Connected(_) => return Ok(idx),
                 Slot::Disconnected => {
-                    if let Ok(conn) = self.do_connect().await {
-                        self.slots[idx] = Slot::Connected(conn);
-                        return Ok((idx, conn));
+                    if let Ok(client) = self.do_connect().await {
+                        self.slots[idx] = Slot::Connected(Box::new(client));
+                        return Ok(idx);
                     }
                 }
             }
@@ -201,11 +210,8 @@ impl Pool {
         let Some(idx) = self.stream_slot.take() else {
             return;
         };
-        // Drop the parked streaming client (its `ConnCtx` is a cheap `Copy`; the
-        // underlying connection lives in the driver, untouched by this).
-        self.stream_client = None;
-        if let Slot::Connected(conn) = &self.slots[idx]
-            && !conn.is_alive()
+        if let Slot::Connected(client) = &self.slots[idx]
+            && !client.is_alive()
         {
             // Poisoned by an undrained-stream drop — evict so the next checkout
             // reconnects rather than reusing a closed/desynced connection. The
@@ -235,7 +241,7 @@ impl Pool {
     /// positional, so a command issued on the side mid-batch would consume one
     /// of them and desync the rest.
     #[deprecated(note = "call `Client::pipeline` on a client from `Pool::client`")]
-    pub async fn pipeline(&mut self) -> Result<Client, Error> {
+    pub async fn pipeline(&mut self) -> Result<&mut Client, Error> {
         self.client().await
     }
 
@@ -274,15 +280,17 @@ impl Pool {
         key: impl AsRef<[u8]>,
     ) -> Result<Option<ValueStream<'_>>, Error> {
         self.reconcile_stream_slot();
-        let (idx, conn) = self.checkout().await?;
-        // Park an ephemeral client at a stable address so the returned
-        // `ValueStream` (which borrows `&mut Client`) can borrow through it for
-        // its whole lifetime; record the slot so the next checkout can re-check
-        // this connection's health and evict it if the stream poisoned it.
+        let idx = self.checkout().await?;
+        // The slot's client is already at a stable address (it is boxed), so the
+        // returned `ValueStream` can borrow it directly — the separate parking
+        // field this used to need is gone. Record the slot so the next checkout
+        // re-checks this connection's health and evicts it if the stream
+        // poisoned it.
         self.stream_slot = Some(idx);
-        self.stream_client = Some(Client::new(conn)?);
-        let client = self.stream_client.as_mut().expect("just set");
-        client.get_stream(key).await
+        match &mut self.slots[idx] {
+            Slot::Connected(client) => client.get_stream(key).await,
+            Slot::Disconnected => Err(Error::AllConnectionsFailed),
+        }
     }
 
     /// Mark a connection as dead after a `ConnectionClosed` error.
@@ -325,7 +333,7 @@ impl Pool {
         self.slots.len()
     }
 
-    async fn do_connect(&self) -> Result<ConnCtx, Error> {
+    async fn do_connect(&self) -> Result<Client, Error> {
         // Options compose on one builder instead of branching over four
         // entry points (#528).
         let mut connect = ringline::connect(self.addr);
@@ -337,10 +345,13 @@ impl Pool {
         }
         let conn = connect.await?;
 
-        Client::new(conn)?
+        // The authed client itself, not the handle: with a non-`Copy`
+        // `Connection` there is no way to hand back a second handle to the same
+        // slot, and every caller was building a client from it anyway.
+        let mut client = Client::new(conn);
+        client
             .maybe_auth(self.password.as_deref(), self.username.as_deref())
             .await?;
-
-        Ok(conn)
+        Ok(client)
     }
 }

@@ -62,7 +62,15 @@ impl PoolConfig {
 }
 
 enum Slot {
-    Connected(ConnCtx),
+    /// A pooled connection *is* a client.
+    ///
+    /// The slot held a bare `ConnCtx` and minted a throwaway `Client` per
+    /// checkout, which once the halves became claims meant a `split()` — two
+    /// driver round trips and two claim writes — every call. `ShardedClient`
+    /// moved to owning the client for that reason; `connect` resolving to a
+    /// non-`Copy` `Connection` (#528) finishes it here. One split per
+    /// *connection*, not per checkout.
+    Connected(Box<Client>),
     Disconnected,
 }
 
@@ -97,8 +105,8 @@ impl Pool {
     /// Eagerly connect all slots. Returns an error if any connection fails.
     pub async fn connect_all(&mut self) -> Result<(), Error> {
         for i in 0..self.slots.len() {
-            let conn = self.do_connect().await?;
-            self.slots[i] = Slot::Connected(conn);
+            let client = self.do_connect().await?;
+            self.slots[i] = Slot::Connected(Box::new(client));
         }
         Ok(())
     }
@@ -111,25 +119,33 @@ impl Pool {
     ///
     /// # One live client per slot
     ///
-    /// The returned [`Client`] takes exclusive ownership of its connection's
-    /// read side, so holding two clients for the *same* slot at once is now
-    /// refused with `EBUSY` rather than silently allowed. That was never
-    /// sound: two clients reading one connection interleave their responses
-    /// and desynchronise the protocol. Drop a client before asking for
-    /// another that may land on the same slot, or size the pool so each
-    /// concurrent user gets its own.
-    pub async fn client(&mut self) -> Result<Client, Error> {
+    /// The pool owns each slot's client and lends it out, so two clients on one
+    /// slot is not representable — it used to be refused at run time with
+    /// `EBUSY`. Two clients reading one connection interleave their responses
+    /// and desynchronise the protocol, so this was never sound; now the borrow
+    /// checker says so instead of the driver (#528).
+    pub async fn client(&mut self) -> Result<&mut Client, Error> {
         let size = self.slots.len();
         for _ in 0..size {
             let idx = self.next;
             self.next = (self.next + 1) % size;
 
             match &self.slots[idx] {
-                Slot::Connected(conn) => return Client::new(*conn),
+                Slot::Connected(_) => {
+                    // Re-index rather than returning the borrow from the match:
+                    // the `Disconnected` arm below needs `&mut self`.
+                    let Slot::Connected(client) = &mut self.slots[idx] else {
+                        unreachable!("just matched Connected")
+                    };
+                    return Ok(client);
+                }
                 Slot::Disconnected => {
-                    if let Ok(conn) = self.do_connect().await {
-                        self.slots[idx] = Slot::Connected(conn);
-                        return Client::new(conn);
+                    if let Ok(client) = self.do_connect().await {
+                        self.slots[idx] = Slot::Connected(Box::new(client));
+                        let Slot::Connected(client) = &mut self.slots[idx] else {
+                            unreachable!("just stored Connected")
+                        };
+                        return Ok(client);
                     }
                 }
             }
@@ -177,7 +193,7 @@ impl Pool {
         self.slots.len()
     }
 
-    async fn do_connect(&self) -> Result<ConnCtx, Error> {
+    async fn do_connect(&self) -> Result<Client, Error> {
         // Options compose on one builder instead of branching over four
         // entry points (#528).
         let mut connect = ringline::connect(self.addr);
@@ -188,7 +204,6 @@ impl Pool {
             connect = connect.timeout(std::time::Duration::from_millis(self.connect_timeout_ms));
         }
         let conn = connect.await?;
-
-        Ok(conn)
+        Ok(Client::new(conn))
     }
 }

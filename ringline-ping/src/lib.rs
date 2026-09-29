@@ -31,7 +31,7 @@ use std::io;
 use std::time::Instant;
 
 use ping_proto::{Request as PingRequest, Response as PingResponse};
-use ringline::{ConnCtx, ParseResult, RecvHalf, SendHalf};
+use ringline::{Connection, ParseResult, RecvHalf, SendHalf};
 
 // -- Error -------------------------------------------------------------------
 
@@ -130,7 +130,7 @@ type ResultCallback = Box<dyn Fn(&CommandResult)>;
 
 /// Builder for creating a [`Client`] with per-request callbacks and metrics.
 pub struct ClientBuilder {
-    conn: ConnCtx,
+    conn: Connection,
     on_result: Option<ResultCallback>,
     #[cfg(feature = "timestamps")]
     use_kernel_ts: bool,
@@ -139,7 +139,7 @@ pub struct ClientBuilder {
 }
 
 impl ClientBuilder {
-    pub(crate) fn new(conn: ConnCtx) -> Self {
+    pub(crate) fn new(conn: Connection) -> Self {
         Self {
             conn,
             on_result: None,
@@ -175,22 +175,32 @@ impl ClientBuilder {
     /// # Errors
     ///
     /// Same as [`Client::new`]: the read side must be free.
-    pub fn build(self) -> Result<Client, Error> {
-        let (tx, rx) = self.conn.split()?;
-        Ok(Client {
+    pub fn build(self) -> Client {
+        // Destructured because `Connection::split` consumes the connection,
+        // which would partially move a `self` the rest of this still reads.
+        let Self {
+            conn,
+            on_result,
+            #[cfg(feature = "timestamps")]
+            use_kernel_ts,
+            #[cfg(feature = "metrics")]
+            with_metrics,
+        } = self;
+        let (tx, rx) = conn.split();
+        Client {
             tx,
             rx,
-            on_result: self.on_result,
+            on_result,
             last_rx_bytes: Cell::new(0),
             #[cfg(feature = "timestamps")]
-            use_kernel_ts: self.use_kernel_ts,
+            use_kernel_ts,
             #[cfg(feature = "metrics")]
-            metrics: if self.with_metrics {
+            metrics: if with_metrics {
                 Some(ClientMetrics::new())
             } else {
                 None
             },
-        })
+        }
     }
 }
 
@@ -224,9 +234,13 @@ impl Client {
     /// any other reader) already holds it, and `EPIPE` if `conn` is stale.
     /// Two clients driving one connection used to be silently allowed, and it
     /// interleaved their reads; now it is refused.
-    pub fn new(conn: ConnCtx) -> Result<Self, Error> {
-        let (tx, rx) = conn.split()?;
-        Ok(Self {
+    /// Infallible: a [`Connection`] *is* the claimed halves, so there is nothing
+    /// left to refuse. This took a `ConnCtx` and claimed the read side here via
+    /// `split()`, which could fail `EBUSY`/`EPIPE` for reasons the caller had
+    /// not caused (#528).
+    pub fn new(conn: Connection) -> Self {
+        let (tx, rx) = conn.split();
+        Self {
             tx,
             rx,
             on_result: None,
@@ -235,11 +249,11 @@ impl Client {
             use_kernel_ts: false,
             #[cfg(feature = "metrics")]
             metrics: None,
-        })
+        }
     }
 
     /// Create a builder for a client with per-request callbacks.
-    pub fn builder(conn: ConnCtx) -> ClientBuilder {
+    pub fn builder(conn: Connection) -> ClientBuilder {
         ClientBuilder::new(conn)
     }
 

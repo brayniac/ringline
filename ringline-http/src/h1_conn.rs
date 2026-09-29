@@ -62,13 +62,13 @@ impl H1Conn {
 
     /// Connect to an HTTP/1.1 server over TLS.
     pub async fn connect_tls(addr: SocketAddr, host: &str) -> Result<Self, HttpError> {
-        let conn = ringline::connect_tls(addr, host)?.await?;
+        let conn = ringline::connect(addr).tls(host).await?;
         Self::new(conn, host)
     }
 
     /// Connect to an HTTP/1.1 server over plaintext TCP.
     pub async fn connect_plain(addr: SocketAddr, host: &str) -> Result<Self, HttpError> {
-        let conn = ringline::connect(addr)?.await?;
+        let conn = ringline::connect(addr).await?;
         Self::new(conn, host)
     }
 

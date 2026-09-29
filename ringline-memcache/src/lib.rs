@@ -134,7 +134,7 @@ use std::time::Instant;
 use bytes::Bytes;
 use memcache_proto::binary::BinaryRequest;
 use memcache_proto::{Request as McRequest, ResponseBytes as McResponseBytes, ValueBytes};
-use ringline::{ConnCtx, GuardBox, ParseResult, RecvHalf, SendGuard, SendHalf};
+use ringline::{Connection, GuardBox, ParseResult, RecvHalf, SendGuard, SendHalf};
 
 /// Callback type invoked after each command completes.
 type ResultCallback = Box<dyn Fn(&CommandResult)>;
@@ -388,7 +388,7 @@ pub enum CompletedOp {
 
 /// Builder for creating a [`Client`] with per-request callbacks and metrics.
 pub struct ClientBuilder {
-    conn: ConnCtx,
+    conn: Connection,
     on_result: Option<ResultCallback>,
     max_batch_size: usize,
     max_in_flight: usize,
@@ -400,7 +400,7 @@ pub struct ClientBuilder {
 }
 
 impl ClientBuilder {
-    pub(crate) fn new(conn: ConnCtx) -> Self {
+    pub(crate) fn new(conn: Connection) -> Self {
         Self {
             conn,
             on_result: None,
@@ -485,10 +485,10 @@ impl ClientBuilder {
     /// # Errors
     ///
     /// Same as [`Client::new`]: the read side must be free.
-    pub fn build_binary(self) -> Result<BinaryClient, Error> {
-        let mut client = self.build()?;
+    pub fn build_binary(self) -> BinaryClient {
+        let mut client = self.build();
         client.binary = true;
-        Ok(BinaryClient { inner: client })
+        BinaryClient { inner: client }
     }
 
     /// [`build_binary`](Self::build_binary) without the driver. See
@@ -505,9 +505,8 @@ impl ClientBuilder {
     /// # Errors
     ///
     /// Same as [`Client::new`]: the read side must be free.
-    pub fn build(self) -> Result<Client, Error> {
-        let (tx, rx) = self.conn.split()?;
-        Ok(self.finish(tx, rx))
+    pub fn build(self) -> Client {
+        self.finish(None)
     }
 
     /// `build` without the driver, for the in-memory unit tests.
@@ -518,30 +517,47 @@ impl ClientBuilder {
     /// wire — the same contract `ConnCtx::for_test` already carries.
     #[cfg(test)]
     pub(crate) fn build_for_test(self) -> Client {
-        let (tx, rx) = self.conn.split_for_test();
-        self.finish(tx, rx)
+        let halves = self.conn.as_conn().split_for_test();
+        self.finish(Some(halves))
     }
 
-    fn finish(self, tx: SendHalf, rx: RecvHalf) -> Client {
+    /// Assemble the client, taking the builder apart.
+    ///
+    /// `Connection::split` consumes the connection, which would partially move
+    /// a `self` the rest of this still reads. `halves` overrides, for the
+    /// in-memory unit tests whose handle is deliberately dangling.
+    fn finish(self, halves: Option<(SendHalf, RecvHalf)>) -> Client {
+        let Self {
+            conn,
+            on_result,
+            max_batch_size,
+            max_in_flight,
+            zc_threshold,
+            #[cfg(feature = "timestamps")]
+            use_kernel_ts,
+            #[cfg(feature = "metrics")]
+            with_metrics,
+        } = self;
+        let (tx, rx) = halves.unwrap_or_else(|| conn.split());
         Client {
             tx,
             rx,
-            on_result: self.on_result,
+            on_result,
             pending: VecDeque::with_capacity(16),
             last_rx_bytes: Cell::new(0),
             write_buf: Vec::new(),
             write_guards: Vec::new(),
             flushed_count: 0,
-            max_batch_size: self.max_batch_size,
-            max_in_flight: self.max_in_flight,
-            zc_threshold: self.zc_threshold,
+            max_batch_size,
+            max_in_flight,
+            zc_threshold,
             binary: false,
             buffered_ops: 0,
             encode_buf: Vec::new(),
             #[cfg(feature = "timestamps")]
-            use_kernel_ts: self.use_kernel_ts,
+            use_kernel_ts,
             #[cfg(feature = "metrics")]
-            metrics: if self.with_metrics {
+            metrics: if with_metrics {
                 Some(ClientMetrics::new())
             } else {
                 None
@@ -608,9 +624,13 @@ impl Client {
     /// any other reader) already holds it, and `EPIPE` if `conn` is stale.
     /// Two clients driving one connection used to be silently allowed, and it
     /// interleaved their reads; now it is refused.
-    pub fn new(conn: ConnCtx) -> Result<Self, Error> {
-        let (tx, rx) = conn.split()?;
-        Ok(Self {
+    /// Infallible: a [`Connection`] *is* the claimed halves, so there is nothing
+    /// left to refuse. This took a `ConnCtx` and claimed the read side here via
+    /// `split()`, which could fail `EBUSY`/`EPIPE` for reasons the caller had
+    /// not caused (#528).
+    pub fn new(conn: Connection) -> Self {
+        let (tx, rx) = conn.split();
+        Self {
             tx,
             rx,
             on_result: None,
@@ -629,11 +649,11 @@ impl Client {
             use_kernel_ts: false,
             #[cfg(feature = "metrics")]
             metrics: None,
-        })
+        }
     }
 
     /// Create a builder for a client with per-request callbacks.
-    pub fn builder(conn: ConnCtx) -> ClientBuilder {
+    pub fn builder(conn: Connection) -> ClientBuilder {
         ClientBuilder::new(conn)
     }
 
