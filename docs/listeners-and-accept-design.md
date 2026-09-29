@@ -871,9 +871,13 @@ is recv-side, send-side or both — is answered: **both, by the same factor.**
 
 | arm | CQE/op | recv/op | send/op | other/op |
 |---|---|---|---|---|
-| `w4` | 0.828 | **0.418** | **0.408** | 0.003 |
-| `w8` | 1.633 | **0.842** | **0.783** | 0.009 |
-| ratio | 1.97x | **2.01x** | **1.92x** | — |
+| `w4` rep1 | 0.828 | 0.418 | 0.408 | 0.003 |
+| `w4` rep2 | 0.798 | 0.401 | 0.394 | 0.003 |
+| `w8` rep1 | 1.759 | 0.899 | 0.850 | 0.010 |
+| `w8` rep2 | 1.633 | 0.842 | 0.783 | 0.009 |
+| **`w4` mean** | **0.813** | **0.409** | **0.401** | 0.003 |
+| **`w8` mean** | **1.696** | **0.871** | **0.817** | 0.010 |
+| **ratio** | **2.09x** | **2.13x** | **2.04x** | — |
 
 Both halves roughly double from `w4` to `w8`, and within each arm recv/op and
 send/op are nearly equal. That pins the mechanism exactly: the forward echo path
@@ -905,9 +909,12 @@ Only seven tags are non-zero, and three of them settle other questions:
   because the loop is almost always woken by a real completion first. A third,
   measured confirmation that `tick_timeout_us` was never the batching lever.
 
-Both arms pass the partition check exactly (`sum(cqe_by_tag) + cqe_unknown_tag ==
-cqe_processed`, zero unknown), so the split is arithmetic rather than inference.
-One replicate per worker count here; two more are queued.
+All four arms pass the partition check exactly (`sum(cqe_by_tag) +
+cqe_unknown_tag == cqe_processed`, zero unknown in every arm), so the split is
+arithmetic rather than inference. Two replicates per worker count, and the two
+halves scale by 2.13x and 2.04x — indistinguishable from each other given the
+3.6% within-config CV, and both indistinguishable from the 2.09x that CQE/op
+itself moves.
 
 ##### What was not separated before this
 
