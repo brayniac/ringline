@@ -69,6 +69,56 @@ struct EchoCfg {
     tls: bool,
     /// Event-loop tick interval, microseconds.
     tick_timeout_us: u64,
+    /// Simulated per-request application work, microseconds.
+    service_time_us: u64,
+}
+
+/// Simulated per-request application work, nanoseconds. Same reason as
+/// `PARK_ENABLED` for being a static: handlers are unit structs.
+static SERVICE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Request size, so a recv buffer carrying several pipelined requests can be
+/// charged for each of them rather than once for the buffer.
+static SERVICE_MSG_SIZE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Burn `ns` nanoseconds of CPU.
+///
+/// A busy spin and deliberately **not** a sleep: the point is to model
+/// application work that occupies the core, and sleeping would yield it and
+/// let the worker serve other connections — which is the opposite of what
+/// CPU-bound request handling does, and would make the knob measure nothing.
+///
+/// `Instant::now()` costs ~20-25 ns, so this cannot resolve much below ~50 ns;
+/// the flag documents that floor. The clock read is also what stops the loop
+/// being optimised away.
+#[inline]
+fn burn_ns(ns: u64) {
+    if ns == 0 {
+        return;
+    }
+    let start = std::time::Instant::now();
+    while (start.elapsed().as_nanos() as u64) < ns {
+        std::hint::spin_loop();
+    }
+}
+
+/// Charge simulated work for every request in `data`.
+///
+/// A recv buffer under load carries several pipelined requests — that is the
+/// whole coalescing effect this harness exists to measure — so charging once
+/// per `with_data` call would bill per *buffer* and make simulated work get
+/// cheaper the more the runtime batches. Exactly backwards. Charge per
+/// `msg_size` chunk instead.
+#[inline]
+fn burn_for(data_len: usize) {
+    let ns = SERVICE_NS.load(std::sync::atomic::Ordering::Relaxed);
+    if ns == 0 {
+        return;
+    }
+    let msg = SERVICE_MSG_SIZE
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .max(1);
+    let requests = (data_len as u64 / msg).max(1);
+    burn_ns(ns.saturating_mul(requests));
 }
 
 /// Which accept path the echo arm runs, so a pool-vs-merged A/B does not need
@@ -218,6 +268,27 @@ struct Args {
     /// not: if throughput tracks this knob, the work is tick-driven.
     #[arg(long, default_value_t = 1000)]
     tick_timeout_us: u64,
+
+    /// Simulated per-request application work in MICROSECONDS, burned as a busy
+    /// spin before each response.
+    ///
+    /// Echo with no work is a byte pipe, so runtime overhead *is* its cost and
+    /// any change to that overhead shows up at full strength. A real server pays
+    /// parsing, lookup and response building on top, which dilutes it: at ~8us
+    /// per completion, the whole spread-vs-concentrate difference is ~12us per
+    /// request, worth 4x at 0us of work and ~1.06x at 200us. This knob makes that
+    /// dilution measurable instead of arithmetic.
+    ///
+    /// Charged **per request**, not per recv buffer: a buffer carrying several
+    /// pipelined requests is billed for each, otherwise simulated work would get
+    /// cheaper the more the runtime batches.
+    ///
+    /// A busy spin, not a sleep — sleeping would yield the core to other
+    /// connections, which CPU-bound request handling does not do. Resolution
+    /// floor is ~50ns (the cost of the clock read), so values below ~1us are
+    /// approximate. Needs `--echo-mode forward`.
+    #[arg(long, default_value_t = 0)]
+    service_time_us: u64,
 
     /// (tokio only) Scheduler shape. `multi-thread` is tokio's default
     /// work-stealing runtime; `per-core` gives each core its own
@@ -449,6 +520,7 @@ fn main() {
             park_imbalance_ms: args.park_imbalance_ms,
             tls: args.tls,
             tick_timeout_us: args.tick_timeout_us,
+            service_time_us: args.service_time_us,
         }),
         Runtime::Tokio => {
             use ringline_bench::servers::tokio_arms;
@@ -654,6 +726,7 @@ fn run_ringline(cfg: EchoCfg) {
         park_imbalance_ms,
         tls,
         tick_timeout_us,
+        service_time_us,
     } = cfg;
     use ringline::ParseResult;
     use ringline::{AsyncEventHandler, RinglineBuilder};
@@ -696,6 +769,8 @@ fn run_ringline(cfg: EchoCfg) {
         loop {
             let n = rx
                 .with_data(|data| {
+                    // Before the response: a real server parses, works, replies.
+                    burn_for(data.len());
                     if let Err(e) = tx.forward_recv_buf(data) {
                         eprintln!("echo: forward_recv_buf failed: {e}");
                         return ParseResult::NeedMore;
@@ -760,6 +835,29 @@ fn run_ringline(cfg: EchoCfg) {
         msg_size.next_power_of_two().max(4096) as u32
     };
     PARK_ENABLED.store(park, std::sync::atomic::Ordering::Relaxed);
+    // Simulated work is charged per request, so the handler needs the request
+    // size as well as the duration.
+    SERVICE_NS.store(
+        service_time_us.saturating_mul(1_000),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    SERVICE_MSG_SIZE.store(msg_size as u64, std::sync::atomic::Ordering::Relaxed);
+    // `direct` submits the echo from inside the CQE handler and never reaches a
+    // `with_data` closure, so simulated work would be silently ignored there --
+    // an arm that looks like "application work costs nothing", which is the most
+    // misleading result this knob could produce. Refuse instead.
+    if service_time_us > 0 && echo_mode != EchoMode::Forward {
+        eprintln!(
+            "bench-server: --service-time-us needs --echo-mode forward; `{}` never \
+             enters a with_data closure, so the work would be silently skipped",
+            match echo_mode {
+                EchoMode::Direct => "direct",
+                EchoMode::RecvForward => "recv-forward",
+                EchoMode::Forward => "forward",
+            }
+        );
+        std::process::exit(2);
+    }
 
     let staged = ConfigBuilder::new()
         .workers(workers)
@@ -861,7 +959,7 @@ fn run_ringline(cfg: EchoCfg) {
         "forward (no io_uring)"
     };
     eprintln!(
-        "bench-server: ready (backend={RINGLINE_BACKEND}, echo_mode={mode}, effective={effective}, recv_buffer={recv_ring_size}x{recv_buf} = {} MiB/worker)",
+        "bench-server: ready (backend={RINGLINE_BACKEND}, echo_mode={mode}, effective={effective}, service_time={service_time_us}us/req, recv_buffer={recv_ring_size}x{recv_buf} = {} MiB/worker)",
         (recv_ring_size as u64 * recv_buf as u64) / (1024 * 1024)
     );
 
@@ -874,5 +972,76 @@ fn run_ringline(cfg: EchoCfg) {
 
     for h in handles {
         h.join().ok();
+    }
+}
+
+#[cfg(test)]
+mod service_time_tests {
+    use super::{SERVICE_MSG_SIZE, SERVICE_NS, burn_for, burn_ns};
+    use std::sync::atomic::Ordering;
+    use std::time::Instant;
+
+    /// One test rather than several, deliberately: `SERVICE_NS` and
+    /// `SERVICE_MSG_SIZE` are process-global, and the test harness runs tests in
+    /// parallel threads, so separate tests touching them would race each other
+    /// and flake. A single test is single-threaded by construction.
+    #[test]
+    fn simulated_work_is_charged_per_request_not_per_buffer() {
+        // Zero is free, and must not consult the clock at all.
+        let t = Instant::now();
+        burn_ns(0);
+        assert!(t.elapsed().as_micros() < 50, "burn_ns(0) should be a no-op");
+
+        // A requested duration is actually burned. Generous lower bound only:
+        // the spin can overshoot (scheduling, clock granularity) but must never
+        // undershoot, or every arm using it would silently model less work than
+        // asked for -- the failure that makes a knob look inert.
+        let t = Instant::now();
+        burn_ns(2_000_000);
+        let took = t.elapsed();
+        assert!(
+            took.as_micros() >= 2_000,
+            "burn_ns(2ms) returned after {took:?}"
+        );
+
+        // Disabled by default: no service time set means no spin regardless of
+        // how much data arrives.
+        SERVICE_NS.store(0, Ordering::Relaxed);
+        SERVICE_MSG_SIZE.store(64, Ordering::Relaxed);
+        let t = Instant::now();
+        burn_for(64 * 100);
+        assert!(
+            t.elapsed().as_micros() < 50,
+            "burn_for with SERVICE_NS=0 should be a no-op"
+        );
+
+        // The point of the whole knob: a buffer holding several pipelined
+        // requests is charged for EACH. If this were per-buffer instead,
+        // simulated work would get cheaper the more the runtime coalesced --
+        // exactly backwards, and it would quietly cancel the effect being
+        // measured.
+        SERVICE_NS.store(200_000, Ordering::Relaxed); // 200us per request
+        let t = Instant::now();
+        burn_for(64); // one request
+        let one = t.elapsed();
+        let t = Instant::now();
+        burn_for(64 * 5); // five requests in one buffer
+        let five = t.elapsed();
+        assert!(
+            five.as_nanos() >= one.as_nanos() * 4,
+            "five requests ({five:?}) should cost ~5x one ({one:?}); \
+             charging per buffer would make them equal"
+        );
+
+        // A short buffer still costs one request rather than zero, so a partial
+        // read cannot be free.
+        let t = Instant::now();
+        burn_for(1);
+        assert!(
+            t.elapsed().as_micros() >= 150,
+            "a sub-request buffer should still be charged once"
+        );
+
+        SERVICE_NS.store(0, Ordering::Relaxed);
     }
 }

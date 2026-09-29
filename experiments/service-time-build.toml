@@ -1,0 +1,79 @@
+# Build bench-server and bench-client for the experiments in this directory, and
+# prove the binary carries `ringline/cqe_by_tag` before anything depends on it.
+name = "ringline service-time build"
+
+[params]
+branch = "feat/bench-service-time"
+repo   = "https://github.com/brayniac/ringline"
+
+[[jobs]]
+name = "build"
+tags = ["validation"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+shape = "z4.c"
+image = "spool/images/debian-13-ci-20260912.1@golden"
+slots = 1
+memory_gib = 4
+ports = 0
+gpu = false
+payload_timeout = 3600
+artifacts = ["/home/anvil/bench-bins.tgz", "/home/anvil/build.log"]
+upload = true
+payload = '''
+set -uo pipefail
+cd /home/anvil
+{
+  uname -srm
+  git clone -q {repo} src && git -C src checkout -q {branch}
+  cd src && git log --oneline -1
+  cargo build --release -p ringline-bench --bin bench-server --bin bench-client
+  mkdir -p /home/anvil/out
+  cp target/release/bench-server /home/anvil/out/
+  cp target/release/bench-client /home/anvil/out/
+  cd /home/anvil && sha256sum out/*
+  # The per-tag completion counter is incremented in the io_uring completion
+  # dispatcher, which does not exist on mio. A mio binary would report every tag
+  # at zero -- the exact shape of "that operation never ran", from a build
+  # mistake rather than from the runtime.
+  ./out/bench-server --help 2>&1 | grep -q 'service-time-us' || { echo "no --service-time-us flag"; exit 1; }
+  echo "service-time-us flag present"
+  got=$(./out/bench-server --print-backend)
+  [ "$got" = "io_uring" ] || { echo "BACKEND MISMATCH: $got"; exit 1; }
+  echo "backend ok: $got"
+  # Prove the per-tag counter is REGISTERED AND DUMPED, not merely that the
+  # source mentions it. A build from a stale ref would produce a binary whose
+  # tag counters are absent, and absent reads as zero downstream -- which is
+  # indistinguishable from "that operation never ran", the exact confusion this
+  # metric exists to remove. Run the server briefly and inspect its own dump.
+  ./out/bench-server --runtime ringline --addr 127.0.0.1:18099 --workers 1 \
+    --metrics-out /home/anvil/probe.json &
+  probe_pid=$!
+  for i in $(seq 1 30); do
+    (exec 3<>/dev/tcp/127.0.0.1/18099) 2>/dev/null && { exec 3>&-; break; }
+    sleep 1
+  done
+  kill -TERM "$probe_pid" 2>/dev/null || true
+  wait "$probe_pid" 2>/dev/null || true
+  grep -q 'cqe_by_tag' /home/anvil/probe.json || { echo "NO cqe_by_tag IN DUMP"; exit 1; }
+  echo "cqe_by_tag present in dump: $(grep -c 'cqe_by_tag' /home/anvil/probe.json) entries"
+  # And that the labels came from OpTag::as_str rather than the idx<n> fallback.
+  grep -q '"op": "recv_multi"' /home/anvil/probe.json || { echo "tag labels missing"; exit 1; }
+  echo "tag labels present"
+  tar czf bench-bins.tgz out
+} 2>&1 | tee /home/anvil/build.log
+rc=${PIPESTATUS[0]}
+echo "build_status=$rc" | tee -a /home/anvil/build.log
+exit 0
+'''
+
+[[jobs.steps]]
+type = "shell"
+command = '''
+grep -q "build_status=0" build.log || { echo "build failed"; exit 1; }
+grep -q "service-time-us flag present" build.log || { echo "service-time flag absent"; exit 1; }
+grep -q "cqe_by_tag present in dump" build.log || { echo "per-tag counter absent from dump"; exit 1; }
+grep -q "tag labels present" build.log || { echo "tag labels absent"; exit 1; }
+echo ok
+'''
