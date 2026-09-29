@@ -863,7 +863,53 @@ both sides at any magnitude under ~3x. Where only one side has been replicated,
 say so and give the one-sided reading rather than either asserting or withdrawing
 the claim.
 
-##### What is still not separated
+##### Separated, by splitting the completion counter (2026-09-28)
+
+`experiments/tag-split.toml`, on a build carrying `ringline/cqe_by_tag` (the
+completion counter split by `OpTag`). The question below — whether the coalescing
+is recv-side, send-side or both — is answered: **both, by the same factor.**
+
+| arm | CQE/op | recv/op | send/op | other/op |
+|---|---|---|---|---|
+| `w4` | 0.828 | **0.418** | **0.408** | 0.003 |
+| `w8` | 1.633 | **0.842** | **0.783** | 0.009 |
+| ratio | 1.97x | **2.01x** | **1.92x** | — |
+
+Both halves roughly double from `w4` to `w8`, and within each arm recv/op and
+send/op are nearly equal. That pins the mechanism exactly: the forward echo path
+sends each received buffer back as **one** `send_recv_buf`, so a buffer carrying
+*k* pipelined requests costs one recv completion and one send completion —
+`CQE/op = 2/k`, with `recv/op = send/op = 1/k`. The 2.0 ceiling is *k*=1, and
+everything below it is queue depth. It was never recv batching *or* send
+coalescing; it is one buffer, one recv, one send, *k* requests.
+
+Only seven tags are non-zero, and three of them settle other questions:
+
+| tag | `w4` /op | `w8` /op |
+|---|---|---|
+| `recv_multi` | 0.4178 | 0.8419 |
+| `send_recv_buf` | 0.3980 | 0.7242 |
+| `send` | 0.0097 | 0.0586 |
+| `tick_timeout` | 0.0026 | 0.0088 |
+| `accept_multi`, `close`, `event_fd_read` | ~0 | ~0 |
+
+- **`recv_fallback` is absent**, so recv is entirely multishot. That corroborates
+  `recv_parked = 0` from an independent counter, and the ring-exhaustion refutation
+  above now rests on two measurements rather than one.
+- **Sends are slightly fewer than recvs** (0.398 against 0.418). In `forward` mode
+  a recv delivering a partial message waits for more before echoing, so two recvs
+  occasionally feed one send. The plain `send` fallback grows 6x at `w8` and is
+  still only 0.06/op.
+- **`tick_timeout` is negligible and fires *less* than configured** — 145,928
+  firings against the 360,000 that 1000/s/worker over 90 s on 4 workers would give,
+  because the loop is almost always woken by a real completion first. A third,
+  measured confirmation that `tick_timeout_us` was never the batching lever.
+
+Both arms pass the partition check exactly (`sum(cqe_by_tag) + cqe_unknown_tag ==
+cqe_processed`, zero unknown), so the split is arithmetic rather than inference.
+One replicate per worker count here; two more are queued.
+
+##### What was not separated before this
 
 `CQE/op` conflates two completions — one recv and one send per echo, which is
 where the ~2.0 ceiling comes from — and the arms are consistent with *both*
