@@ -1,72 +1,67 @@
-# Rate x workers: the rate-vs-latency curve per worker count, and a collapse test.
+# Does per-request application work move the worker-count optimum?
 #
-# DERIVED from experiments/min-complete-sweep.toml -- matrix block and the rate/
-# workers params only, so the measurement scaffolding is identical to the 15 runs
-# already taken at 600k.
+# Everything measured on this workload so far had ZERO application work, which
+# makes echo the best case for concentrating connections: with no service time the
+# runtime's own overhead IS the cost, so cutting that overhead shows at full
+# strength. `--service-time-us` (a busy spin, charged per request) adds the work a
+# real protocol server does.
 #
-# WHY. Everything measured so far sits at one offered rate, 600k. The coalescing
-# effect is a function of per-worker SERVICE rate, not of worker count, so the
-# whole shape should move with offered rate -- and if it does, the knee is not a
-# property of "4 workers" at all.
+# THE ARITHMETIC UNDER TEST. Coalescing takes completions per operation from ~2.0
+# to ~0.5, and a completion costs ~8us on this rig, so concentration is worth
+# ~12us per request -- all of it overhead, none of it service time. As a fraction
+# of total cost that decays fast:
 #
-# ops/s PER WORKER for each cell:
+#   service   spread   concentrated   headroom coalescing can recover
+#      0us     16us          4us         75%
+#     25us     41us         29us         29%
+#    100us    116us        104us         10%
 #
-#            w2        w4        w8       w16
-#   300k    150k       75k     37.5k    18.75k
-#   600k    300k      150k       75k     37.5k
-#   1.2M    600k      300k      150k       75k
+# PREDICTIONS, written before the run.
 #
-# PREDICTION, written before the run. CQE/op collapses onto per-worker rate and
-# is independent of how that rate was reached:
+# 1. w2 keeps up at 0us and FAILS at 25us and 100us. Every row offers w2 twice its
+#    naive per-worker capacity, so w2 must recover ~50% from coalescing to serve
+#    it. Available: 75%, 29%, 10%. At 0us that already happened -- two workers
+#    served 600k, which naive capacity calls impossible. It cannot happen at 100us.
+# 2. The p99 optimum moves to a HIGHER worker count as service time rises, and the
+#    value of concentrating shrinks. Measure it as ops per worker-CPU-second, w2
+#    against w16: predicted ~4x at 0us, ~1.1x at 100us.
+# 3. The 12-physical-core budget stops binding. The budget is
+#    `workers + softirq(rate) <= physical cores`, and softirq scales with PACKET
+#    rate, which falls 12x across these rows. So the w8/w16 tail penalty measured
+#    at 600k should largely vanish at 48k -- a second, independent reason for the
+#    optimum to move up.
+# 4. CQE/op still falls with concentration in every row, because queue depth still
+#    rises. What shrinks is not the coalescing but its VALUE.
 #
-#   150k/wkr  -> (300k,w2), (600k,w4), (1.2M,w8)  should all give CQE/op ~0.87
-#   75k/wkr   -> (300k,w4), (600k,w8), (1.2M,w16) should all give CQE/op ~1.9
-#   300k/wkr  -> (600k,w2), (1.2M,w4)             should agree with each other
-#   37.5k/wkr -> (300k,w8), (600k,w16)            should agree with each other
+# NO-GO for the framing: if the optimum does not move and concentration keeps its
+# advantage at 100us, then service time is not diluting runtime overhead and the
+# arithmetic above is wrong somewhere.
 #
-# Measured anchors on this build: (600k,w4) = 0.86-0.94 over four reps, and
-# (600k,w8) = 1.64-1.95 over six. A collapse means the diagonals land on those.
-# A failure means worker count matters independently of per-worker rate, and the
-# "read the shape, not the row" advice in the design doc is wrong.
+# THE CONFOUND, stated plainly. Service time and packet rate cannot both be held
+# constant -- capacity collapses with service time, so the rate must fall with it,
+# and each row therefore differs in TWO ways. That is unavoidable here, and it is
+# why prediction 3 is separately checkable: softirq is measured per arm from the
+# Rezolus per-vCPU recording, so whether the core budget binds is read off the data
+# rather than assumed. Read "does the knee move" (comparable across rows) and not
+# "is throughput higher" (not comparable).
 #
-# The noise should collapse too, which is a second prediction: p99 at (600k,w4)
-# (150k/wkr) reproduced to 5.8% over four reps, while (600k,w8) (75k/wkr) spanned
-# 401% over six. So the low-per-worker-rate cells are the unreliable ones, and
-# single-run p99 in those cells should not be read as a result.
+# VALIDITY GATE: queue depth, not achieved rate. `offered x p50 / connections` is
+# requests in flight per connection -- under ~1 means keeping up, hundreds means
+# collapse. An arm that meets its offered rate while queueing deeply is a capacity
+# measurement, not a point on a cost curve. (1.2M, w8) passed a >=95%
+# achieved-rate gate at 150 ms p50, which is how that was learned.
 #
-# VALIDITY GATE. Every arm is OPEN loop at a fixed offered rate, so a saturated
-# arm does not necessarily miss its target -- it grows a queue instead. Achieved
-# rate is therefore NOT a sufficient saturation test, which this sweep proved the
-# hard way: (1.2M, w8) served 99.8% of offered while running a 150 ms p50 and
-# ~704 requests outstanding per connection. It passed a >=95% gate and was
-# nowhere near a usable operating point.
-#
-# Gate on QUEUE DEPTH instead, via Little's law: outstanding = offered_rate x p50,
-# and divided by the connection count that gives requests in flight per
-# connection. Under ~1 means the worker is keeping up; several means a queue;
-# hundreds means collapse. Read it alongside worker CPU from the Rezolus
-# per-vCPU recording -- a worker below 1.00 cannot be the queue's cause.
-#
-# So: discard the latency of any arm that misses its offered rate AND treat any
-# arm above a few requests outstanding per connection as a capacity measurement
-# rather than a point on a cost curve.
-#
-# Client-side ceiling is the other risk: the client is 8 threads for every arm,
-# held constant for comparability with the 600k runs already taken. If the 1.2M
-# row uniformly undershoots, suspect the CLIENT before the server and rerun that
-# row with more threads rather than reading it as server saturation.
-#
-name = "rw r{rate} w{workers} rep{rep}"
+name = "svc s{service_time_us} w{workers} rep{rep}"
 
 [matrix]
-context_name = "ringline: rate x workers, and does per-worker rate govern? (#443)"
-rate = ["300000", "600000", "1200000"]
+context_name = "ringline: does application work move the worker-count optimum? (#443)"
+service_time_us = ["0", "25", "100"]
 workers = ["2", "4", "8", "16"]
 rep = ["1"]
 
 [params]
 # Update to the artifact id of a fresh `ringline min-complete build`.
-bins_artifact = "01a0e921-ca58-731a-e957-3bf6e46b3e78"
+bins_artifact = "01a0eb8b-8db4-7362-8c1a-65c630f602da"
 image         = "spool/images/debian-13-base-20260912.1@golden"
 server_ip     = "172.31.0.1"
 client_ip     = "172.31.0.2"
@@ -111,7 +106,7 @@ unit = "ringline-server"
 payload = '''
 exec /home/anvil/out/bench-server --runtime ringline --addr {server_ip}:{port} \
   --workers {workers} --msg-size {msg_size} --accept-mode merged \
-  --echo-mode forward \
+  --echo-mode forward --service-time-us {service_time_us} \
   --metrics-out /home/anvil/metrics.json
 '''
 
@@ -129,7 +124,7 @@ payload = '''
 set -uo pipefail
 cd /home/anvil
 mkdir -p cpu
-echo "rate={rate} workers={workers} rep={rep}" > cpu/arm.txt
+echo "service_time_us={service_time_us} workers={workers} rep={rep}" > cpu/arm.txt
 
 # One window over the steady state: there is no readmit here, so the before/
 # after pair the park runs needed collapses to a single span.
@@ -247,12 +242,24 @@ for i in $(seq 1 120); do
   (exec 3<>/dev/tcp/{server_ip}/{port}) 2>/dev/null && { exec 3>&-; echo "server reachable after ${i}s"; break; }
   sleep 1
 done
+# Offered rate is a FUNCTION of service time, not an independent axis. A worker's
+# capacity is ~1/(service_time + overhead), so no single rate exercises all three
+# rows: 600k would put every arm of the 100us row 12x past capacity and measure
+# nothing but collapse. Each row gets the rate that lands w4 near saturation, so
+# "where is the knee" stays comparable across rows even though throughput cannot.
+case "{service_time_us}" in
+  0)   RATE=600000 ;;   # ~125k/worker capacity -> w4 at 150k/worker
+  25)  RATE=150000 ;;   # ~30k/worker           -> w4 at 37.5k/worker
+  100) RATE=48000  ;;   # ~9.3k/worker          -> w4 at 12k/worker
+  *)   echo "no rate defined for service_time_us={service_time_us}"; exit 1 ;;
+esac
+echo "service_time={service_time_us}us -> offered rate ${RATE}"
 # Open loop at a fixed offered rate: the question is the cost per operation at
 # constant throughput, so the load must not adapt to the server's latency the
 # way a closed loop would.
 ./out/bench-client --runtime ringline --addr {server_ip}:{port} --clients {clients} \
   --threads 8 --msg-size {msg_size} --warmup {warmup} --duration {duration} \
-  --open --rate {rate} \
+  --open --rate "$RATE" \
   2>&1 | tee /home/anvil/client.log
 rc=${PIPESTATUS[0]}
 echo "client_rc=${rc}" | tee -a /home/anvil/client.log
