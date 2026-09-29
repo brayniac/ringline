@@ -80,6 +80,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `metrics::CQE_BY_TAG`: completions processed, split by `OpTag`, with
+  `metrics::cqe_tag::COUNT` sizing the group. The slot index is the tag's
+  discriminant, and `CQE_BY_TAG` plus `ring::CQE_UNKNOWN_TAG` partition
+  `ring::CQE_PROCESSED` exactly, so the split is arithmetic rather than a
+  sample. `ring/cqe_processed` on its own is a single total, and questions
+  about per-operation cost reduce to *which* completions: a 64-byte echo
+  costs ~0.81 completions per operation at 4 workers and ~1.70 at 8, against
+  a ceiling of one recv plus one send, and that total is equally consistent
+  with recv batching, send coalescing, or both. The split answers it — both
+  halves move together, because the forward path returns each received
+  buffer as one send, so a buffer holding *k* pipelined requests costs one
+  recv completion and one send completion. Two slots are never registered
+  (the enum skips discriminant 1, and 17 exists only under the `timestamps`
+  feature); a metrics dump reports those as `idx1`/`idx17` at zero rather
+  than omitting them (#486).
 - `ConnCtx::with_data_result`: like `with_data`, but resolves to
   `io::Result<usize>` so a handler can tell a clean peer close (`Ok(0)`)
   from a transport failure (`Err(e)`, e.g. `ConnectionReset` after an RST).
