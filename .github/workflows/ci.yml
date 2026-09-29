@@ -112,6 +112,62 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked --all
+      # A run on 2026-09-22 aborted the release test binary with a bare ENOMEM
+      # from `register_buf_ring`. The error text blames RLIMIT_MEMLOCK, but that
+      # was measured and ruled out: on kernel 6.12 the whole uring test suite
+      # passes with the soft limit at 8 KiB, so the ring is not charged there.
+      # What is left is genuine kernel memory pressure, which nothing recorded.
+      # Capture it on failure so the next occurrence is diagnosable instead of
+      # being re-argued from the same empty log.
+      - name: Resource state (on failure)
+        if: failure()
+        run: |
+          # GitHub runs this with `bash -e`, and a diagnostic that aborts partway
+          # is worse than none: an unguarded non-zero status (a `for` whose last
+          # `[ -r ]` test fails, say) truncates the step right before whatever it
+          # was added to capture. This step only runs when the job has already
+          # failed, so nothing here should ever be fatal.
+          set +e
+          echo "=== limits ==="; ulimit -a || true
+          # `free` reads host-wide /proc/meminfo, so it cannot see a cgroup
+          # limit. A run on 2026-09-29 aborted with io_uring_setup ENOMEM while
+          # this reported 11.5 GiB free and 14.9 GiB available -- which rules
+          # host memory out and leaves the accounting that `free` is blind to.
+          echo "=== memory (HOST -- see cgroup below) ==="; free -m || true
+          # io_uring charges ring memory to the memcg on modern kernels, so a
+          # cgroup limit yields exactly this signature: ENOMEM at setup with the
+          # host showing gigabytes free. `memory.events` and `memory.peak` are
+          # retrospective -- they survive the death of the process that failed,
+          # which `memory.current` alone does not.
+          echo "=== cgroup memory (v2) ==="
+          for f in memory.max memory.high memory.current memory.peak memory.events memory.swap.max; do
+            [ -r "/sys/fs/cgroup/$f" ] && echo "--- $f ---" && cat "/sys/fs/cgroup/$f"
+          done || true
+          echo "=== cgroup memory of this process's own cgroup ==="
+          cg=$(awk -F: '$1=="0"{print $3}' /proc/self/cgroup 2>/dev/null)
+          if [ -n "$cg" ] && [ -d "/sys/fs/cgroup$cg" ]; then
+            for f in memory.max memory.current memory.peak memory.events; do
+              [ -r "/sys/fs/cgroup$cg/$f" ] && echo "--- $cg/$f ---" && cat "/sys/fs/cgroup$cg/$f"
+            done
+          else
+            echo "no cgroup v2 path for self; trying v1"
+            for f in limit_in_bytes usage_in_bytes max_usage_in_bytes failcnt; do
+              [ -r "/sys/fs/cgroup/memory/memory.$f" ] && echo "--- v1 memory.$f ---" && cat "/sys/fs/cgroup/memory/memory.$f"
+            done
+          fi
+          # PSI records memory stall even when nothing was OOM-killed.
+          echo "=== memory pressure (PSI) ==="; cat /proc/pressure/memory 2>/dev/null || echo "no PSI"
+          # io_uring_setup mmaps its rings, so the map-count ceiling is a
+          # candidate ENOMEM source that neither `ulimit -a` nor `free` shows.
+          # NOTE: this records the LIMIT only. The failing process is already
+          # gone by the time this step runs, so its own map count cannot be
+          # recovered here -- if the cgroup numbers come back clean, the next
+          # step is capturing the count in-process on the abort path.
+          echo "=== map count ceiling ==="
+          echo "vm.max_map_count = $(cat /proc/sys/vm/max_map_count 2>/dev/null || echo '?')"
+          echo "this shell's maps  = $(wc -l < /proc/self/maps 2>/dev/null || echo '?')"
+          echo "=== kernel ring buffer (OOM evidence) ==="
+          (sudo dmesg | tail -40) 2>/dev/null || dmesg | tail -40 || true
       # The diagram freshness check shares this job: the claim tests already
       # run under `cargo test --all`, so the only unique work is the stale-SVG
       # comparison — not worth a dedicated runner.
@@ -125,6 +181,62 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked --all --release
+      # A run on 2026-09-22 aborted the release test binary with a bare ENOMEM
+      # from `register_buf_ring`. The error text blames RLIMIT_MEMLOCK, but that
+      # was measured and ruled out: on kernel 6.12 the whole uring test suite
+      # passes with the soft limit at 8 KiB, so the ring is not charged there.
+      # What is left is genuine kernel memory pressure, which nothing recorded.
+      # Capture it on failure so the next occurrence is diagnosable instead of
+      # being re-argued from the same empty log.
+      - name: Resource state (on failure)
+        if: failure()
+        run: |
+          # GitHub runs this with `bash -e`, and a diagnostic that aborts partway
+          # is worse than none: an unguarded non-zero status (a `for` whose last
+          # `[ -r ]` test fails, say) truncates the step right before whatever it
+          # was added to capture. This step only runs when the job has already
+          # failed, so nothing here should ever be fatal.
+          set +e
+          echo "=== limits ==="; ulimit -a || true
+          # `free` reads host-wide /proc/meminfo, so it cannot see a cgroup
+          # limit. A run on 2026-09-29 aborted with io_uring_setup ENOMEM while
+          # this reported 11.5 GiB free and 14.9 GiB available -- which rules
+          # host memory out and leaves the accounting that `free` is blind to.
+          echo "=== memory (HOST -- see cgroup below) ==="; free -m || true
+          # io_uring charges ring memory to the memcg on modern kernels, so a
+          # cgroup limit yields exactly this signature: ENOMEM at setup with the
+          # host showing gigabytes free. `memory.events` and `memory.peak` are
+          # retrospective -- they survive the death of the process that failed,
+          # which `memory.current` alone does not.
+          echo "=== cgroup memory (v2) ==="
+          for f in memory.max memory.high memory.current memory.peak memory.events memory.swap.max; do
+            [ -r "/sys/fs/cgroup/$f" ] && echo "--- $f ---" && cat "/sys/fs/cgroup/$f"
+          done || true
+          echo "=== cgroup memory of this process's own cgroup ==="
+          cg=$(awk -F: '$1=="0"{print $3}' /proc/self/cgroup 2>/dev/null)
+          if [ -n "$cg" ] && [ -d "/sys/fs/cgroup$cg" ]; then
+            for f in memory.max memory.current memory.peak memory.events; do
+              [ -r "/sys/fs/cgroup$cg/$f" ] && echo "--- $cg/$f ---" && cat "/sys/fs/cgroup$cg/$f"
+            done
+          else
+            echo "no cgroup v2 path for self; trying v1"
+            for f in limit_in_bytes usage_in_bytes max_usage_in_bytes failcnt; do
+              [ -r "/sys/fs/cgroup/memory/memory.$f" ] && echo "--- v1 memory.$f ---" && cat "/sys/fs/cgroup/memory/memory.$f"
+            done
+          fi
+          # PSI records memory stall even when nothing was OOM-killed.
+          echo "=== memory pressure (PSI) ==="; cat /proc/pressure/memory 2>/dev/null || echo "no PSI"
+          # io_uring_setup mmaps its rings, so the map-count ceiling is a
+          # candidate ENOMEM source that neither `ulimit -a` nor `free` shows.
+          # NOTE: this records the LIMIT only. The failing process is already
+          # gone by the time this step runs, so its own map count cannot be
+          # recovered here -- if the cgroup numbers come back clean, the next
+          # step is capturing the count in-process on the abort path.
+          echo "=== map count ceiling ==="
+          echo "vm.max_map_count = $(cat /proc/sys/vm/max_map_count 2>/dev/null || echo '?')"
+          echo "this shell's maps  = $(wc -l < /proc/self/maps 2>/dev/null || echo '?')"
+          echo "=== kernel ring buffer (OOM evidence) ==="
+          (sudo dmesg | tail -40) 2>/dev/null || dmesg | tail -40 || true
 
   test-mio:
     name: Test (mio)
