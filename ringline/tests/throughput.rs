@@ -8,11 +8,23 @@
 //! "vanilla blocking" implementation, which would make the runtime
 //! pointless.
 //!
-//! These tests aren't precise benchmarks (kernel scheduling, CI
-//! variance, build profile), so the assertions are loose: ringline must
-//! complete and not be dramatically slower than std::net. The numbers
-//! are also printed via `eprintln!` so a human reading test output can
-//! spot drift.
+//! **These are completion tests, not performance gates.** They assert that the
+//! workload finishes and that every byte comes back correct, and they *print*
+//! the ringline-vs-std::net comparison without asserting on it.
+//!
+//! The ratio used to be asserted (`ringline < std::net * 5`) and it could not
+//! hold on a shared runner: the ratio is ringline's overhead divided by
+//! std::net's under whatever scheduling the host provides, so contention moves
+//! it without anything regressing. A census confined to 2 CPUs -- the width a
+//! GitHub runner gives -- failed 11 of 773 runs in debug on that assertion
+//! alone.
+//!
+//! Performance gates live where this repo already puts them: `ringline-bench`
+//! and `ringline-benchmarks` as the load generators, `experiments/` for the
+//! SystemsLab specs, and `BENCHMARKS.md` for the checked-in baselines, all on
+//! dedicated two-machine hardware. A 5x ratio inside the unit suite duplicated
+//! that badly and could not have caught a real 2x regression through its own
+//! false positives.
 
 use ringline::ConfigBuilder;
 use std::future::Future;
@@ -280,13 +292,36 @@ fn tcp_throughput_round_trip_vs_std_net() {
         rl_dur.as_secs_f64() / std_dur.as_secs_f64()
     );
 
-    // Generous bound — we're flagging regressions, not benchmarking.
-    // Ringline being more than 5× slower than blocking std::net means
-    // something got broken.
+    // Hard floor on completing the workload at all, and deliberately NOT a
+    // ratio against std::net.
+    //
+    // The ratio was asserted here (`rl_dur < std_dur * 5`) and it does not
+    // survive a contended host. It is not a property of ringline: it is
+    // ringline's overhead divided by std::net's, under whatever scheduling the
+    // machine happens to provide. Squeezed onto few CPUs both sides slow down
+    // and they do not slow down equally -- ringline runs workers plus an
+    // acceptor plus this client, where the baseline is one blocking loop -- so
+    // the ratio degrades for reasons that have nothing to do with this code.
+    // Measured: 11 failures in 773 runs (1.4%) confined to 2 CPUs in debug,
+    // which is the width a GitHub runner provides, and debug is where the gap
+    // is widest because unoptimised ringline inflates far more than a plain
+    // loop does.
+    //
+    // A 5x bound that fires on contention also cannot catch what it was for: a
+    // real 2x regression would be lost among its own false positives. So the
+    // performance gate lives where this repo already says performance lives --
+    // `ringline-bench` and `experiments/`, against the checked-in baselines in
+    // BENCHMARKS.md, on dedicated hardware. What stays here is the part a unit
+    // test can actually answer: did it finish, and were the bytes right.
+    //
+    // The numbers are still printed above, so drift remains visible to anyone
+    // reading test output; they are simply no longer an assertion.
     assert!(
-        rl_dur < std_dur * 5,
-        "ringline TCP echo is way slower than std::net baseline: \
-         ringline={rl_dur:?}, std::net={std_dur:?}"
+        rl_dur < Duration::from_secs(60),
+        "ringline TCP echo did not complete in reasonable time: {rl_dur:?} for \
+         {} MiB (std::net took {std_dur:?}) -- this bound catches a hang or a \
+         gross breakage, not a performance regression",
+        total_bytes / 1024 / 1024
     );
 }
 
@@ -440,14 +475,12 @@ fn udp_throughput_request_reply_vs_std_net() {
         rl_dur < Duration::from_secs(30),
         "ringline UDP req/reply took too long: {rl_dur:?} for {count} round-trips"
     );
-    // Loose bound — single-flight UDP req/reply on loopback is dominated
-    // by kernel syscall overhead; both implementations should be in
-    // the same order of magnitude.
-    assert!(
-        rl_dur < std_dur * 5,
-        "ringline UDP req/reply is way slower than std::net: \
-         ringline={rl_dur:?}, std::net={std_dur:?}"
-    );
+    // No ratio assert against std::net, for the reason given on the TCP test
+    // above: the ratio measures the host's scheduling as much as this code, and
+    // it false-positives under the CPU scarcity CI runners actually provide.
+    // The completion bound above is what a unit test can honestly assert; the
+    // performance gate belongs in `ringline-bench` and `experiments/` against
+    // BENCHMARKS.md. `std_dur` is still measured and printed for drift.
 }
 
 // ── TCP fire-and-forget large transfer (EAGAIN backpressure path) ──────
