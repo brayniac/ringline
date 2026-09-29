@@ -202,6 +202,32 @@ fn wait_for_server(addr: &str) {
     panic!("server did not start on {addr}");
 }
 
+/// Wait for the server *and* hand back the connection that proved it was up.
+///
+/// [`wait_for_server`] proves readiness by connecting and discarding the
+/// stream, and the server accepts that probe like any other client: it becomes
+/// a connection whose peer has already closed before its handler runs. For the
+/// reactive tests that is harmless — the probe sends nothing, so an echo
+/// handler never sends and simply parks until teardown. For a handler that
+/// sends *unprompted* on accept it is not harmless, and it is the whole of
+/// #518: the probe was connection 0, its handler pushed 4 KiB chunks at a
+/// closed peer, the FIN-driven close was finalized between two of them, and
+/// the parked send resolved `NotConnected("connection closing")` — which the
+/// handler turned into a panic. The test's own readiness check supplied the
+/// failure it then reported as data loss.
+///
+/// Every connection this returns has a live peer, so use it instead of
+/// `wait_for_server` + `TcpStream::connect` whenever the handler sends first.
+fn connect_retry(addr: &str) -> TcpStream {
+    for _ in 0..200 {
+        if let Ok(stream) = TcpStream::connect(addr) {
+            return stream;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("server did not start on {addr}");
+}
+
 fn echo_round_trip(addr: &str, msg: &[u8]) -> Vec<u8> {
     let mut stream = TcpStream::connect(addr).unwrap();
     stream
@@ -2897,12 +2923,13 @@ fn backpressured_send_waits_for_pool_capacity_without_duplication() {
         .bind(addr.parse().unwrap())
         .launch::<BackpressuredEchoHandler>()
         .expect("launch failed");
-    wait_for_server(&addr);
-
+    // `connect_retry`, not `wait_for_server` + `connect`: the discarded probe
+    // would be accepted as connection 0, and this handler sends unprompted at a
+    // peer that has already closed. See #518 and `connect_retry`'s comment.
     const CONNS: usize = 16;
     let mut streams = Vec::new();
     for _ in 0..CONNS {
-        let stream = TcpStream::connect(&addr).unwrap();
+        let stream = connect_retry(&addr);
         stream
             .set_read_timeout(Some(Duration::from_secs(30)))
             .unwrap();
@@ -3022,9 +3049,7 @@ fn backpressured_send_refreshes_owner_after_first_poll_move() {
         .bind(addr.parse().unwrap())
         .launch::<OwnerMoveHandler>()
         .expect("launch failed");
-    wait_for_server(&addr);
-
-    let mut stream = TcpStream::connect(&addr).unwrap();
+    let mut stream = connect_retry(&addr);
     stream
         .set_read_timeout(Some(Duration::from_secs(15)))
         .unwrap();
@@ -3076,9 +3101,7 @@ fn backpressured_send_registers_the_first_polling_task_after_move() {
         .bind(addr.parse().unwrap())
         .launch::<FirstPollMoveHandler>()
         .expect("launch failed");
-    wait_for_server(&addr);
-
-    let mut stream = TcpStream::connect(&addr).unwrap();
+    let mut stream = connect_retry(&addr);
     stream
         .set_read_timeout(Some(Duration::from_secs(15)))
         .unwrap();
@@ -3137,9 +3160,7 @@ fn canceled_submitted_backpressured_send_cannot_complete_the_next_send() {
         .bind(addr.parse().unwrap())
         .launch::<CancelSubmittedHandler>()
         .expect("launch failed");
-    wait_for_server(&addr);
-
-    let mut stream = TcpStream::connect(&addr).unwrap();
+    let mut stream = connect_retry(&addr);
     stream
         .set_read_timeout(Some(Duration::from_secs(15)))
         .unwrap();
@@ -3225,9 +3246,7 @@ fn mio_half_close_resolves_every_bounded_send_without_hanging() {
         .bind(addr.parse().unwrap())
         .launch::<MioHalfCloseHandler>()
         .expect("launch failed");
-    wait_for_server(&addr);
-
-    let mut stream = TcpStream::connect(&addr).unwrap();
+    let mut stream = connect_retry(&addr);
     stream
         .set_read_timeout(Some(Duration::from_secs(15)))
         .unwrap();
@@ -3278,9 +3297,7 @@ fn backpressured_send_construction_is_lazy_and_unpolled_drop_is_inert() {
         .bind(addr.parse().unwrap())
         .launch::<LazyDropHandler>()
         .expect("launch failed");
-    wait_for_server(&addr);
-
-    let mut stream = TcpStream::connect(&addr).unwrap();
+    let mut stream = connect_retry(&addr);
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
@@ -3333,9 +3350,7 @@ fn backpressured_send_rejects_oversize_before_writing() {
         .bind(addr.parse().unwrap())
         .launch::<OversizeHandler>()
         .expect("launch failed");
-    wait_for_server(&addr);
-
-    let mut stream = TcpStream::connect(&addr).unwrap();
+    let mut stream = connect_retry(&addr);
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
@@ -3425,9 +3440,7 @@ fn shutdown_drops_parked_backpressured_send_without_hanging() {
         .bind(addr.parse().unwrap())
         .launch::<ShutdownWhileParkedHandler>()
         .expect("launch failed");
-    wait_for_server(&addr);
-
-    let mut stream = TcpStream::connect(&addr).unwrap();
+    let mut stream = connect_retry(&addr);
     stream
         .set_read_timeout(Some(Duration::from_secs(15)))
         .unwrap();
@@ -3489,6 +3502,86 @@ impl AsyncEventHandler for Join3Handler {
     fn create_for_worker(_id: usize) -> Self {
         Join3Handler
     }
+}
+
+/// Counts accepts and send outcomes without ever panicking, so the probe's fate
+/// is observable instead of fatal.
+struct ProbeWitnessHandler;
+
+static PROBE_ACCEPTED: AtomicU32 = AtomicU32::new(0);
+static PROBE_SEND_OK: AtomicU32 = AtomicU32::new(0);
+
+impl AsyncEventHandler for ProbeWitnessHandler {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
+        async move {
+            PROBE_ACCEPTED.fetch_add(1, Ordering::SeqCst);
+            let payload = vec![b'Z'; BP_CHUNK];
+            for _ in 0..BP_CHUNKS {
+                if conn.send_backpressured(&payload).await.is_err() {
+                    return;
+                }
+                PROBE_SEND_OK.fetch_add(1, Ordering::SeqCst);
+            }
+            conn.shutdown_write();
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        ProbeWitnessHandler
+    }
+}
+
+/// The premise #518 got wrong, pinned down so it cannot be re-litigated.
+///
+/// #518 read the failure as "a parked send resolved `connection closing` on a
+/// connection the client had not closed". The client *had* closed it: that was
+/// not one of the test's sixteen readers but [`wait_for_server`]'s readiness
+/// probe, accepted as connection 0 with its peer already gone. This asserts
+/// both halves of that — the probe reaches a handler, and a handler that sends
+/// unprompted cannot complete its sends on it — which is why the
+/// send-on-accept tests use [`connect_retry`] instead.
+///
+/// Deliberately asserts "did not finish all eight", not a specific error: the
+/// handler either sees the failure (`EPIPE`, or `NotConnected` when the
+/// FIN-driven close is finalized first) or is dropped mid-sequence when the
+/// connection is torn down under it. Which one lands is a race, and the
+/// hazard is the same either way.
+#[test]
+fn wait_for_server_probe_reaches_a_send_on_accept_handler() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let config = test_config_builder()
+        .workers(1)
+        .send_pool(8, 4096)
+        .build()
+        .expect("valid config");
+
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind(addr.parse().unwrap())
+        .launch::<ProbeWitnessHandler>()
+        .expect("launch failed");
+
+    // The probe, and nothing else: no real client connects in this test.
+    wait_for_server(&addr);
+    std::thread::sleep(Duration::from_millis(500));
+
+    let accepted = PROBE_ACCEPTED.load(Ordering::SeqCst);
+    let oks = PROBE_SEND_OK.load(Ordering::SeqCst);
+
+    shutdown.shutdown();
+    for h in handles {
+        let _ = h.join();
+    }
+
+    assert!(
+        accepted >= 1,
+        "the readiness probe is accepted as a connection and runs a handler"
+    );
+    assert!(
+        oks < BP_CHUNKS as u32,
+        "a send-on-accept handler cannot complete its sends on the probe \
+         connection: its peer closed before the handler ran (got {oks} of {BP_CHUNKS})"
+    );
 }
 
 #[test]

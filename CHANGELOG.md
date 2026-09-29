@@ -116,6 +116,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Docs: `send_backpressured`'s documented error set omitted
+  `io::ErrorKind::NotConnected`, which is what a waiter actually gets when the
+  connection's close is *committed* while it sits in the capacity-admission
+  FIFO. A waiter there is neither in flight nor in the per-connection send
+  queue, so it does not hold off `try_finalize_close`; winning capacity
+  afterwards finds the Close already submitted and the send is refused. The
+  documented `ConnectionAborted` covers only the teardown-first ordering, and
+  which one a caller sees is a race. This is what made #518 read as a send
+  resolving on a live connection (#518).
+
 - io_uring: every event-loop iteration scanned all `max_connections` park
   drain slots, whether or not any connection was parking. The early return
   tested `park_drain.is_empty()` on a vector sized to `max_connections`,

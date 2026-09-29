@@ -1,0 +1,194 @@
+# Is the readiness probe the cause of #518? The control arm.
+#
+# #518 recorded `backpressured_send_waits_for_pool_capacity_without_duplication`
+# failing with 12288 of 32768 bytes, the first-order event being a parked send on
+# connection 0 resolving `NotConnected("connection closing")`. The issue read
+# that as happening "on a connection the client had not closed". That premise is
+# false, and this experiment is the control that proves it rather than arguing it.
+#
+# THE MECHANISM, localized by reading and verified locally by mutation:
+#
+#   `wait_for_server` (ringline/tests/echo.rs) proves readiness by connecting and
+#   DISCARDING the stream. The server accepts that probe like any other client, so
+#   it becomes connection 0 -- with its peer already gone. `BackpressuredEchoHandler`
+#   sends unprompted on accept, so it pushes 4 KiB chunks at a closed peer. The
+#   FIN sets the read half, requests the close, and `try_finalize_close` commits it
+#   (`close_submitted = true`) as soon as the send queue is momentarily empty --
+#   which it is, every time the handler is parked in the send-capacity admission
+#   FIFO, because a waiter there is neither `in_flight` nor in `state.queue`. The
+#   next send to win capacity then hits `send_bounded`'s `close_submitted` guard
+#   and returns `NotConnected("connection closing")`, and the handler's
+#   `panic!` turns a correct refusal into a reported data loss.
+#
+#   Locally (mio, macOS) the probe's handler completes send 1 and fails send 2
+#   with `Broken pipe (os error 32)` -- the same second error #518's log carries.
+#   Holding the probe open instead makes the same handler complete all 8 of 8.
+#   That mutation is now a test: `wait_for_server_probe_reaches_a_send_on_accept_handler`.
+#
+# WHY A CONTROL AND NOT A REPEAT. The mechanism predicts that removing the
+# discarded probe removes the failure and NOTHING ELSE changes: same pool, same
+# 16 connections, same 300 ms stall, same admission FIFO. That is a case where
+# the hypothesis predicts no effect from starvation any more, which is worth more
+# than another 100 reps of the baseline.
+#
+# ARMS. `fix` crossed with `mode`, all at 2 CPUs (the only budget that has ever
+# reproduced it: 2/100 alone and 7/100 suite at 2, 0/400 at 4 and 8).
+#
+#   fix=before  main, which still uses `wait_for_server` + a discarded probe
+#   fix=after   the branch that replaces it with `connect_retry`
+#
+# PREDICTION, written before the run:
+#
+#   before/alone  ~2/100      after/alone  0/100
+#   before/suite  ~7/100      after/suite  0/100
+#
+#   before reproduces and after is clean  -> localization confirmed, fix verified,
+#                                            and connection 1's `Broken pipe` in
+#                                            #518 was downstream of the panic
+#   both reproduce                        -> a SECOND mechanism exists; the probe
+#                                            is at most part of it, and the send
+#                                            path is back in scope
+#   neither reproduces                    -> the baseline rate moved under us;
+#                                            read `before` as the calibration and
+#                                            do not credit the fix
+#
+# The `before` arm is also the calibration: without it a clean `after` proves
+# nothing, because a 2%-per-run failure is absent from 100 runs 13% of the time.
+#
+# ONE HOST on purpose: the test is self-contained (client threads and server in
+# one process), so it runs on the `validation` agent rather than queueing for the
+# hv01/hv02 pair every two-machine measurement needs.
+#
+# Debug, not release: the job that failed was `Test`, not `Test (release)`.
+#
+# VALIDITY GATES, both of which have produced false negatives in this campaign:
+#
+#  1. The test must actually RUN. `cargo test <name>` with a filter that matches
+#     nothing runs zero tests and exits 0 -- indistinguishable from "did not
+#     reproduce". Every iteration asserts it saw a test result line.
+#  2. The backend must be io_uring. `send_bounded`'s `close_submitted` guard is
+#     written ONLY by the io_uring close path and is inert on mio, so a mio build
+#     cannot produce `connection closing` at all and would report a clean sweep
+#     for the wrong reason.
+#  3. The `after` arm must contain the fix. It greps the checked-out tree for
+#     `connect_retry` and fails the job if it is absent, so a stale or wrong
+#     branch name cannot masquerade as a fix that worked.
+name = "bpctl {fix} {mode}"
+
+[matrix]
+context_name = "ringline: is the readiness probe the cause of #518? (control)"
+fix  = ["before", "after"]
+mode = ["alone", "suite"]
+
+[params]
+# The fork, because that is where the `after` branch lives (the other
+# branch-based specs in this directory clone it for the same reason).
+repo       = "https://github.com/brayniac/ringline"
+# An exact SHA, not `main`: the merge base this branch was cut from, so the
+# control cannot silently drift if either main moves under it.
+before_ref = "36f8ac4"
+after_ref  = "fix/518-probe-reaches-send-on-accept-handler"
+cpus       = "2"
+iterations = "100"
+
+[[jobs]]
+name = "repro"
+tags = ["validation"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+shape = "z4.c"
+image = "spool/images/debian-13-ci-20260912.1@golden"
+slots = 1
+memory_gib = 4
+ports = 0
+gpu = false
+payload_timeout = 7200
+artifacts = ["/home/anvil/repro.log", "/home/anvil/failures.txt"]
+upload = true
+payload = '''
+set -uo pipefail
+cd /home/anvil
+{
+  uname -srm; nproc
+
+  if [ "{fix}" = "before" ]; then REF={before_ref}; else REF={after_ref}; fi
+  git clone -q {repo} src || { echo "FATAL: clone failed"; exit 1; }
+  git -C src checkout -q "$REF" || { echo "FATAL: no such ref: $REF"; exit 1; }
+  cd src && git log --oneline -1
+
+  # GATE 3: the arms must actually differ, and in the direction claimed.
+  if grep -q "fn connect_retry" ringline/tests/echo.rs; then HAS_FIX=yes; else HAS_FIX=no; fi
+  echo "arm={fix} ref=$REF has_connect_retry=$HAS_FIX"
+  if [ "{fix}" = "after" ] && [ "$HAS_FIX" != "yes" ]; then
+    echo "FATAL: after arm has no connect_retry; wrong or stale ref"; exit 1
+  fi
+  if [ "{fix}" = "before" ] && [ "$HAS_FIX" = "yes" ]; then
+    echo "FATAL: before arm already carries the fix; the control is void"; exit 1
+  fi
+
+  # prlimit, not `ulimit -n`: the builtin cannot raise the soft limit past the
+  # hard one, so 1e6 fails EPERM on these guests, and `sudo ulimit` is
+  # meaningless (ulimit is a shell builtin; sudo cannot change the calling
+  # shell's limits). Echo both: the uring test binary aborts with io_uring_setup
+  # EMFILE at a 1024 soft limit, which reads as a code failure and is not.
+  sudo prlimit --nofile=1000000 --pid $$ 2>/dev/null || ulimit -n 65536 2>/dev/null || true
+  echo "fd soft=$(ulimit -Sn) hard=$(ulimit -Hn)"
+
+  cargo build --locked --tests -p ringline 2>&1 | tail -3
+  # GATE 2: mio cannot produce `connection closing` and would sweep clean.
+  cargo run --locked -q -p ringline-bench --bin bench-server -- --print-backend > /home/anvil/backend.txt 2>/dev/null || true
+  got=$(cat /home/anvil/backend.txt 2>/dev/null || echo unknown)
+  [ "$got" = "io_uring" ] || { echo "BACKEND MISMATCH: $got"; exit 1; }
+  echo "backend ok: $got"
+
+  TEST=backpressured_send_waits_for_pool_capacity_without_duplication
+  # Clamp to what the guest has: taskset for cpu 1 on a 1-vCPU shape fails and
+  # would kill the arm rather than narrow it, reading as "did not reproduce".
+  HAVE=$(nproc)
+  CPUS=$(( {cpus} < HAVE ? {cpus} : HAVE ))
+  [ "$CPUS" != "{cpus}" ] && echo "NOTE: asked for {cpus} cpus, guest has $HAVE; using $CPUS"
+  LIST=$(seq -s, 0 $((CPUS-1)))
+  echo "confining to cpus $LIST (of $HAVE), mode={mode}, iterations={iterations}"
+
+  fails=0
+  ran=0
+  : > /home/anvil/failures.txt
+  for i in $(seq 1 {iterations}); do
+    if [ "{mode}" = "alone" ]; then
+      out=$(taskset -c "$LIST" cargo test --locked -q -p ringline --test echo "$TEST" -- --test-threads=1 --nocapture 2>&1)
+    else
+      out=$(taskset -c "$LIST" cargo test --locked -q -p ringline --test echo 2>&1)
+    fi
+    rc=$?
+    # GATE 1: a filter matching nothing exits 0 having run nothing.
+    if echo "$out" | grep -qE "^test result:"; then
+      ran=$((ran+1))
+    else
+      echo "iter $i: NO TEST RESULT LINE -- filter or build problem, not a pass"
+      echo "iter $i: no test result" >> /home/anvil/failures.txt
+      echo "$out" | tail -20 >> /home/anvil/failures.txt
+      continue
+    fi
+    if [ "$rc" != "0" ]; then
+      fails=$((fails+1))
+      echo "iter $i: FAILED (rc=$rc)"
+      {
+        echo "=== iter $i rc=$rc ==="
+        # Match on `... FAILED` and the panic lines: grepping the bare test name
+        # also matches the PASSING result line, which has already put a phantom
+        # occurrence into one issue body in this campaign.
+        echo "$out" | grep -E "FAILED|panicked|connection closing|Broken pipe|assertion|left:|right:" | head -40
+      } >> /home/anvil/failures.txt
+    fi
+  done
+
+  echo
+  echo "RESULT arm={fix} mode={mode} cpus=$CPUS ran=${ran}/{iterations} failed=${fails}"
+  # A run that never executed the test is not a clean arm.
+  if [ "$ran" != "{iterations}" ]; then
+    echo "INVALID: only $ran of {iterations} iterations produced a test result"
+  fi
+} 2>&1 | tee /home/anvil/repro.log
+exit 0
+'''

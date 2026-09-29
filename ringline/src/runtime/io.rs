@@ -5218,7 +5218,16 @@ enum BackpressuredState {
 ///   or was shut down while this send was waiting.
 /// - [`ConnectionAborted`](io::ErrorKind::ConnectionAborted) — the connection
 ///   closed while waiting or in flight.
-/// - Anything the underlying send reports.
+/// - [`NotConnected`](io::ErrorKind::NotConnected) — the connection's close was
+///   *committed* while this send waited for capacity. A waiter in the admission
+///   FIFO is neither in flight nor in the per-connection send queue, so it does
+///   not hold off `try_finalize_close`; if the close is finalized while it
+///   waits, winning capacity finds the Close already submitted and the send is
+///   refused rather than written. Which of this and `ConnectionAborted` you see
+///   is a race between the capacity wake and teardown — treat both as "the
+///   connection went away", and expect either on a peer that closed.
+/// - Anything the underlying send reports, including `BrokenPipe` (`EPIPE`) from
+///   the socket itself when the peer has reset.
 ///
 /// On success it resolves to the number of bytes **you passed in**, not the
 /// bytes on the wire; under TLS those differ.
