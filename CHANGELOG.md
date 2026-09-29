@@ -9,8 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [0.6.4] - 2026-09-29
 
-A patch release from 0.6.3 carrying two fixes from `main`. The breaking
-changes on `main` since 0.6.3 are not included; they are for 0.7.0.
+A patch release from 0.6.3 carrying fixes from `main`. The breaking changes
+on `main` since 0.6.3 are not included; they are for 0.7.0.
+
+### Security
+
+- The `rustls` floor is raised to 0.23.45 for RUSTSEC-2026-0285 (TLS 1.3
+  handshake messages incorrectly accepted across encryption level
+  boundaries). Downstream resolvers respect the pin, so they cannot land on
+  a vulnerable 0.23.x through ringline (#399).
 
 ### Fixed
 

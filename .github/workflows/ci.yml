@@ -2,7 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # release/** carries patch releases cut from a tag (e.g. 0.6.4 from
+    # v0.6.3); CI must run there too, since they are tagged by hand.
+    branches: [main, 'release/**']
   pull_request:
     branches: [main]
   workflow_call:
