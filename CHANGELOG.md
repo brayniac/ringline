@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.9] - 2026-09-29
+
 ### Fixed
 
 - io_uring: a `shutdown_write()` could half-close a **different, live**
