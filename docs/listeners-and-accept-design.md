@@ -884,6 +884,90 @@ This is already known on the client side of the same repo. `bench-client`'s
 "keeping per-worker CQE density high enough for io_uring batching to pay off".
 Tier 1 placement does the opposite on the server side, by design.
 
+### The coalescing is the queue (2026-09-28)
+
+`experiments/rate-workers.toml`. The section above swept worker count at one
+offered rate. Sweeping *both* — 300k / 600k / 1.2M against 2 / 4 / 8 / 16 workers,
+256 connections throughout — collapses the whole picture onto one variable, and it
+is not the one the section above was looking for.
+
+| offered | wkrs | worker CPU | total CPU | softirq | CQE/op | p50 | p99 | in flight per conn |
+|---|---|---|---|---|---|---|---|---|
+| 300k | 2 | **1.00** | 4.08 | 2.08 | 1.04 | 2535us | 5772us | 3.0 |
+| 300k | 4 | 0.94 | 6.70 | 2.93 | 2.01 | 620us | 1255us | 0.7 |
+| 300k | 8 | 0.83 | 9.42 | 2.81 | 2.03 | 525us | 1201us | 0.6 |
+| 300k | 16 | 0.76 | 13.64 | 1.50 | 2.05 | 578us | 1250us | 0.7 |
+| 600k | 2 | **1.00** | 4.83 | 2.83 | 0.46 | 3095us | 6304us | 7.3 |
+| 600k | 4 | **1.00** | 7.73 | 3.73 | 0.84 | 1556us | 2659us | 3.6 |
+| 600k | 8 | **1.00** | 12.88 | 4.89 | 1.78 | 760us | 20085us | 1.8 |
+| 600k | 16 | 0.96 | 17.71 | 2.34 | 1.70 | 727us | 11912us | 1.7 |
+| 1.2M | 2 | **1.00** | 6.84 | 4.84 | 0.17 | 5730us | 111739us | 26.9 |
+| 1.2M | 8 | **1.00** | 14.94 | 6.95 | 0.54 | 150288us | 1051204us | 704 |
+| 1.2M | 16 | **1.00** | ~23 | — | 0.95 | 1290515us | 28749460us | 3900 |
+
+`in flight per conn` is Little's law — `offered_rate x p50 / connections`.
+
+**Worker CPU is the predictor, and coalescing is queue depth.** Every arm with a
+worker below 1.00 sits at the ~2.0 ceiling with *under one* request in flight per
+connection: no queue, so nothing to batch. Every arm at 1.00 has a queue, and
+CQE/op falls in step with how deep it is — 0.7 → 3.0 → 3.6 → 7.3 → 26.9 in
+flight against 2.01 → 1.04 → 0.84 → 0.46 → 0.17 completions per operation.
+
+That correspondence is mechanically necessary rather than fitted: if a connection
+has *k* requests waiting, one `recv` completion delivers all *k*, so completions
+per operation go as 1/*k*. **The per-operation efficiency and the latency are two
+views of the same queue.** The efficiency is not a win that spreading forfeits —
+it is what a saturated worker does instead of keeping up, and it cannot be bought
+without buying the latency.
+
+#### It is not cache topology
+
+The obvious hardware story — Zen 1 groups cores into 4-wide CCXs sharing an L3, so
+4 workers fit one CCX while 8 straddle two — is wrong, and the 300k row rules it
+out: `w4`, `w8` and `w16` are indistinguishable there (CQE/op 2.01 / 2.03 / 2.05,
+p99 1255 / 1201 / 1250us). A CCX penalty would appear at every rate. This one
+appears at no rate; what appears at 600k is a queue.
+
+What does bite is **total CPU demand against the physical core count**. The guest
+is 24 logical on **12 physical** cores, and demand is roughly
+`workers x 1.0 + softirq(rate)` — with softirq the growing term: 2.08 → 4.89 →
+6.95 cores as offered rate rises, so by 1.2M the kernel network path costs more
+than the runtime's own workers. At 600k, `w4` needs 7.73 cores and fits; `w8`
+needs 12.88 and `w16` needs 17.71, so both spill onto shared SMT siblings. That is
+the leading explanation for `w4` being the p99 optimum at 600k — **not** a hardware
+sweet spot, but the largest worker count that still fits the machine while being
+saturated enough to coalesce.
+
+Offered as the leading explanation rather than a proven one, because it needs two
+conditions and not one: `(300k, w16)` also exceeds 12 cores (13.64) with no tail
+penalty, since its workers have slack to absorb the contention.
+
+#### At high rate, fewer workers wins outright
+
+The 1.2M row is not a trade at all:
+
+| 1.2M offered | achieved | total CPU | p50 | p99 |
+|---|---|---|---|---|
+| `w2` | 100% | 6.84 (fits) | **5730us** | 111,739us |
+| `w8` | 99.8% | 14.94 (spills) | 150,288us | 1,051,204us |
+| `w16` | **90.5%** | ~23 (spills hard) | 1,290,515us | 28,749,460us |
+
+**Two workers beat sixteen by 226x on p50, and sixteen cannot serve the load at
+all.** Concentration is not merely cheaper here; spreading is the thing that
+breaks. Tier 1/2/3 exist to spread connections across workers, and in this regime
+that is the harmful direction — worth stating plainly in the design doc that
+proposes them.
+
+#### A methodological correction
+
+`(1.2M, w8)` served **99.8%** of its offered rate while running a 150 ms p50 with
+~704 requests in flight per connection. An earlier version of the spec gated
+validity on achieved rate at >=95%, and that arm passed it while being nowhere near
+a usable operating point. **In open loop, meeting the offered rate does not mean
+unsaturated** — a saturated server grows a queue instead of missing the target. The
+gate is now queue depth from Little's law, read alongside worker CPU, since a
+worker below 1.00 cannot be the cause of a queue.
+
 ### The trade, and whether placement should compensate
 
 The latency shape is monotone with a knee, and it is the opposite of what
