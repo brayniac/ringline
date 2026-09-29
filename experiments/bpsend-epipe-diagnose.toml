@@ -1,3 +1,9 @@
+# STATUS, as of the fix landing (#523): this now runs as a REGRESSION DETECTOR, not
+# a reproducer. Against `main` every arm should report `anomalous=0/400`; the
+# rationale below is the record of the run that localized the bug, when the
+# numbers were 8, 21, 6 and 4 out of 400. A nonzero count here means the
+# half-close is back.
+#
 # What produces `Broken pipe (os error 32)` on the earliest connection slots? (#518)
 #
 # WHERE THIS PICKS UP. #522 replaced `wait_for_server`'s discarded probe with
@@ -81,8 +87,10 @@ context_name = "ringline: what produces EPIPE on the earliest connection slots? 
 arm = ["baseline", "nostall", "bigpool", "nostall-bigpool", "calibration"]
 
 [params]
-repo   = "https://github.com/brayniac/ringline"
-branch = "diag/518-epipe-on-early-slots"
+# Upstream and `main`: the instrument lives there now, so this spec does not
+# depend on a topic branch that will be deleted.
+repo   = "https://github.com/ringline-rs/ringline"
+branch = "main"
 cpus   = "2"
 rounds = "400"
 calib_iters = "200"

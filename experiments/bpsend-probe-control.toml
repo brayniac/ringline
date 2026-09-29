@@ -1,3 +1,20 @@
+# STATUS: HISTORICAL. Kept for the record, not re-runnable as written.
+#
+# This is the control that REFUTED its own PR's hypothesis: it predicted the
+# discarded readiness probe was the cause and that removing it would take the
+# failure to 0/100. The failure went UP (2/100 alone, 10/100 suite, against 0 and
+# 3). The probe was only shielding connection slot 0 by occupying it; the real
+# cause was a `Shutdown` SQE outliving its registered-file slot, fixed in #523.
+#
+# It cannot be re-run as-is: its arms are the topic branch
+# `fix/518-probe-reaches-send-on-accept-handler` (squashed to main as 60ff17f)
+# and the merge base `36f8ac4`, and it cannot be reconstructed by reverting that
+# merge either, because the instrument added later calls the `connect_retry` it
+# introduced. For a live A/B on this bug use `bpsend-shutdown-fix-verify.toml`.
+#
+# Worth keeping anyway: it is the reason the campaign stopped inferring mechanisms
+# from panic text, and the record of what a positive control is for.
+#
 # Is the readiness probe the cause of #518? The control arm.
 #
 # #518 recorded `backpressured_send_waits_for_pool_capacity_without_duplication`

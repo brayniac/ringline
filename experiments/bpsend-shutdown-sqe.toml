@@ -1,3 +1,9 @@
+# STATUS, as of the fix landing (#523): against `main` all three arms should now
+# report 0, including `withshutdown`, which is what made the bug visible at
+# 49/400. The rationale below is the record of the run that isolated the
+# `Shutdown` SQE as necessary. To reproduce the failure deliberately, use
+# `bpsend-shutdown-fix-verify.toml`, whose `unfixed` arm reverts the fix.
+#
 # Is the stale `Shutdown` SQE what FINs a live connection? (#518)
 #
 # WHERE THIS PICKS UP. The instrumented sweep (context 01a0eeee) measured, rather
@@ -78,8 +84,10 @@ context_name = "ringline: is a stale Shutdown SQE FINing live connections? (#518
 arm = ["withshutdown", "noshutdown", "conns1"]
 
 [params]
-repo   = "https://github.com/brayniac/ringline"
-branch = "diag/518-epipe-on-early-slots"
+# Upstream and `main`: the instrument lives there now, so this spec does not
+# depend on a topic branch that will be deleted.
+repo   = "https://github.com/ringline-rs/ringline"
+branch = "main"
 cpus   = "2"
 rounds = "400"
 

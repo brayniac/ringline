@@ -1,0 +1,177 @@
+# Is `connection closing` on a parked backpressured send a real lifecycle bug,
+# or the test's own teardown racing its handlers? (#518)
+#
+# `backpressured_send_waits_for_pool_capacity_without_duplication` failed once in
+# CI (run 36524008903, job `Test`, io_uring debug) with 12288 of 32768 bytes
+# arriving. The first-order event was a parked send on connection 0 resolving
+# `connection closing` on a connection whose peer had NOT closed -- the client was
+# sleeping 300 ms, then reading to FIN with a 30 s timeout. The `Broken pipe` on
+# connection 1 and the short read are plausibly downstream of the handler panic.
+#
+# `ConnCtx::send_backpressured` is new (#318 series, in Unreleased, shipping in
+# 0.7.0) and the failed assertion is the invariant it exists to hold: every byte
+# arrives exactly once. If the first-order event is real, a caller following the
+# documented pattern loses data. That is worth more than a re-run.
+#
+# ONE HOST on purpose. The test is self-contained -- client threads and server in
+# one process -- so it needs no second machine and runs on the `validation` agent
+# instead of the hv01/hv02 pair every two-machine measurement queues for.
+#
+# WHAT THIS DISCRIMINATES. Two arms crossed with two CPU budgets:
+#
+#   mode=alone  one test, --test-threads=1, nothing else running
+#   mode=suite  the whole `echo` test binary, which is the parallel context the
+#               failure actually occurred in
+#   cpus=2      taskset to 2 CPUs, approximating a GitHub runner
+#   cpus=4      the Pi's bare core count, and the untested middle: the first
+#               matrix measured 2 (fails, 4.5%) and 8 (clean, 0/200) and left the
+#               threshold between them unknown, which is exactly what "would the
+#               Pis have caught this" turns on
+#   cpus=8      room to breathe, as a control
+#
+#   fails in `alone`  -> points at a genuine lifecycle bug: a parked send
+#                        resolving `connection closing` with no teardown in sight
+#   fails only in `suite` -> points at contention or the test's own shutdown, and
+#                        the fix is the test rather than the send path
+#   fails only at cpus=2 -> starvation is the trigger; dose-response, not a guess
+#
+# PREDICTION, written before the run. #378 already records that these GitHub-only
+# failures do NOT reproduce on our anvil guests, so the honest base case is that
+# nothing fires. If so this is not a null result: 100 iterations per arm with zero
+# failures bounds the per-run rate under ~1% at 2 CPUs, and that combined with
+# #378's finding says the runner has something our VMs do not -- which is itself
+# the next question, not a shrug.
+#
+# Debug rather than release, because that is the job that failed (`Test`, not
+# `Test (release)`). A release arm is the follow-up if debug reproduces.
+#
+# VALIDITY GATES, both of which have burned this campaign before:
+#
+#  1. The test must actually RUN. `cargo test <name>` with a misspelled filter
+#     runs zero tests and exits 0, which reads as "did not reproduce" -- the exact
+#     shape of a false negative. Every iteration asserts it saw one test result.
+#  2. The backend must be io_uring. The test is not cfg-gated, so a mio build
+#     would run something else entirely and report a clean 100/100.
+name = "bpsend s{mode} c{cpus}"
+
+[matrix]
+context_name = "ringline: does a parked backpressured send really see `connection closing`? (#518)"
+mode = ["alone", "suite"]
+cpus = ["2", "4", "8"]
+
+[params]
+branch     = "main"
+repo       = "https://github.com/ringline-rs/ringline"
+iterations = "100"
+
+[[jobs]]
+name = "repro"
+tags = ["validation"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+shape = "z4.c"
+image = "spool/images/debian-13-ci-20260912.1@golden"
+slots = 1
+memory_gib = 4
+ports = 0
+gpu = false
+payload_timeout = 7200
+artifacts = ["/home/anvil/repro.log", "/home/anvil/failures.txt"]
+upload = true
+payload = '''
+set -uo pipefail
+cd /home/anvil
+{
+  uname -srm; nproc
+  git clone -q {repo} src && git -C src checkout -q {branch}
+  cd src && git log --oneline -1
+
+  # The uring test binary wants a generous fd limit: at 1024 it aborts with
+  # io_uring_setup(2) EMFILE, which reads as a code failure and is not.
+  # prlimit, not `ulimit -n`: the builtin cannot raise the soft limit past the
+  # hard one, so asking for 1e6 fails EPERM on these guests (hard is lower) and
+  # `sudo ulimit` is meaningless -- ulimit is a shell builtin and sudo cannot
+  # change the calling shell's limits. `sudo prlimit --pid $$` can, which is what
+  # coalesce-sweep.toml has always done. Echo BOTH limits: the uring test binary
+  # aborts with io_uring_setup EMFILE at a 1024 soft limit, and a reader needs to
+  # see the effective value to know whether a failure was the runtime or the fd
+  # ceiling.
+  sudo prlimit --nofile=1000000 --pid $$ 2>/dev/null || ulimit -n 65536 2>/dev/null || true
+  echo "fd soft=$(ulimit -Sn) hard=$(ulimit -Hn)"
+
+  cargo build --locked --tests -p ringline 2>&1 | tail -3
+  # GATE 2: a mio build runs something else and would report a clean sweep.
+  cargo run --locked -q -p ringline-bench --bin bench-server -- --print-backend > /home/anvil/backend.txt 2>/dev/null || true
+  got=$(cat /home/anvil/backend.txt 2>/dev/null || echo unknown)
+  [ "$got" = "io_uring" ] || { echo "BACKEND MISMATCH: $got"; exit 1; }
+  echo "backend ok: $got"
+
+  TEST=backpressured_send_waits_for_pool_capacity_without_duplication
+  # Clamp to what the guest actually has: asking taskset for cpu 7 on a 4-vCPU
+  # shape fails and would kill the wide arms rather than narrowing them, which
+  # would look like "the wide configuration does not reproduce it".
+  HAVE=$(nproc)
+  CPUS=$(( {cpus} < HAVE ? {cpus} : HAVE ))
+  [ "$CPUS" != "{cpus}" ] && echo "NOTE: asked for {cpus} cpus, guest has $HAVE; using $CPUS"
+  LIST=$(seq -s, 0 $((CPUS-1)))
+  echo "confining to cpus $LIST (of $HAVE), mode={mode}, iterations={iterations}"
+
+  fails=0
+  ran=0
+  : > /home/anvil/failures.txt
+  for i in $(seq 1 {iterations}); do
+    if [ "{mode}" = "alone" ]; then
+      out=$(taskset -c "$LIST" cargo test --locked -q -p ringline --test echo "$TEST" -- --test-threads=1 --nocapture 2>&1)
+    else
+      out=$(taskset -c "$LIST" cargo test --locked -q -p ringline --test echo 2>&1)
+    fi
+    rc=$?
+    # GATE 1: a filter that matches nothing exits 0 having run nothing, which
+    # would count as a pass forever. Require evidence a result was produced.
+    echo "$out" | grep -qE "test result: (ok|FAILED)" || {
+      echo "ITERATION $i PRODUCED NO TEST RESULT -- filter or build wrong, aborting"
+      echo "$out" | tail -20
+      exit 1
+    }
+    if [ "{mode}" = "alone" ]; then
+      echo "$out" | grep -qE "test result: .* 1 (passed|failed)" || {
+        echo "ITERATION $i did not run exactly one test -- filter wrong, aborting"
+        echo "$out" | grep "test result:"
+        exit 1
+      }
+    fi
+    ran=$((ran+1))
+    if [ "$rc" != "0" ]; then
+      fails=$((fails+1))
+      {
+        echo "════ iteration $i ════"
+        # The ORDER matters: which panic came first separates a real lifecycle
+        # bug from teardown fallout.
+        echo "$out" | grep -nE "panicked at|connection closing|Broken pipe|connection task panicked|assertion|test result:" | head -30
+      } >> /home/anvil/failures.txt
+      echo "iteration $i FAILED (running total $fails)"
+    fi
+  done
+  echo "RESULT mode={mode} cpus_asked={cpus} cpus_used=$CPUS of $HAVE ran=$ran failed=$fails"
+} 2>&1 | tee /home/anvil/repro.log
+rc=${PIPESTATUS[0]}
+echo "payload_status=$rc" | tee -a /home/anvil/repro.log
+exit 0
+'''
+
+[[jobs.steps]]
+type = "shell"
+command = '''
+grep -q "payload_status=0" repro.log || { echo "payload failed -- read repro.log"; exit 1; }
+grep -q "backend ok: io_uring" repro.log || { echo "backend gate did not pass"; exit 1; }
+grep -qE "RESULT .* ran=[1-9]" repro.log || { echo "no iterations ran"; exit 1; }
+echo "--- outcome ---"
+grep -E "^RESULT " repro.log
+if [ -s failures.txt ]; then
+  echo "--- first failures (order of panics is the discriminator) ---"
+  head -40 failures.txt
+else
+  echo "no failures in this arm"
+fi
+'''
