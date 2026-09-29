@@ -1,0 +1,182 @@
+# What produces `Broken pipe (os error 32)` on the earliest connection slots? (#518)
+#
+# WHERE THIS PICKS UP. #522 replaced `wait_for_server`'s discarded probe with
+# `connect_retry` and predicted the failure would go to 0/100. The control
+# (context 01a0eed9) refuted that:
+#
+#   before/alone 0/100    before/suite  3/100
+#   after/alone  2/100    after/suite  10/100
+#
+# Attribution: every `before` failure carried BOTH `connection 0: connection
+# closing` AND `connection 1: Broken pipe (os error 32)`. The `after` arm carried
+# 14 `Broken pipe` across connections 0 (8) and 1 (6) and ZERO `connection
+# closing`. So the probe mechanism explains the *string* it named -- that string
+# exists only where a discarded probe does -- and nothing else. The probe was
+# SHIELDING slot 0 by occupying it; removing it exposed two real client
+# connections instead of one, which is what 3/100 -> 10/100 looks like.
+#
+# `after/alone` failing 2/100 also rules out suite contention: it reproduces with
+# nothing else running on the box.
+#
+# WHAT IS UNEXPLAINED. `EPIPE` from a real send syscall, on the earliest
+# connection slots (0 and 1, never 5 or 12), whose peers are live client sockets
+# that have not closed and go on to read. `EPIPE` needs a peer RST or a locally
+# shut-down write half, and the test supplies neither on those connections: the
+# handler calls `shutdown_write()` only after all eight sends.
+#
+# WHY INSTRUMENTATION AND NOT ANOTHER HYPOTHESIS. Reading the panic text and
+# deducing a mechanism is exactly what produced the wrong answer last round. The
+# branch adds `repro518_instrumented`, which records per connection: which accept
+# it was, how many sends completed, the raw errno of the one that failed, whether
+# the handler reached `shutdown_write`, and what the client on the other end saw
+# (bytes plus any read error). It asserts nothing. Verified by mutation before
+# submitting: capped at 3 sends it reports `anomalous=2/2` with each reader's
+# 12288 bytes, so a clean arm means clean rather than blind.
+#
+# ARMS. A 2x2 over the two conditions the test deliberately creates, plus a
+# calibration arm:
+#
+#   baseline         stall 300 ms, pool 8   -- the failing configuration
+#   nostall          stall 0,      pool 8   -- clients read immediately
+#   bigpool          stall 300 ms, pool 64  -- pool covers all 16 at once
+#   nostall-bigpool  stall 0,      pool 64  -- neither condition
+#   calibration      the ORIGINAL test, 200x via cargo test, unmodified
+#
+# PREDICTION, written before the run:
+#
+#   fails only in `baseline`            -> needs BOTH the stall and a pool that
+#                                         forces parking: the admission FIFO is
+#                                         implicated and the send path is in scope
+#   fails in `bigpool` too             -> parking is NOT required; the trigger is
+#                                         the stall (sends into a socket nobody
+#                                         drains), and the FIFO is exonerated
+#   fails in `nostall` too             -> the stall is not required either, and
+#                                         the condition is just 16 connections on
+#                                         one worker
+#   fails in all four                  -> neither condition matters; look at
+#                                         accept and slot allocation, not sends
+#   fails in none, calibration DOES    -> the in-process loop is not a faithful
+#                                         reproduction; fall back to per-process
+#                                         iteration and say so
+#   fails in none, calibration does not-> the rate moved; do not read any arm
+#
+# The calibration arm is why a clean sweep is interpretable at all. Last round a
+# clean `after/alone` would have been read as a fix; it was 2/100 and the
+# prediction was 0/100. A sweep with no positive control cannot tell "the bug is
+# gone" from "the instrument is blind".
+#
+# 400 in-process rounds per arm, against a per-run rate near 2%: a true 2% is
+# missed by 400 rounds with probability under 1e-3.
+#
+# ONE HOST, `validation` agent: the test is self-contained, so it does not need
+# the hv01/hv02 pair. Debug, not release -- the job that failed was `Test`.
+#
+# GATES: the test must produce a result line (a filter matching nothing exits 0
+# having run nothing), and the backend must be io_uring (`close_submitted` is
+# written only by the io_uring close path, so mio cannot show this at all).
+name = "epipe {arm}"
+
+[matrix]
+context_name = "ringline: what produces EPIPE on the earliest connection slots? (#518)"
+arm = ["baseline", "nostall", "bigpool", "nostall-bigpool", "calibration"]
+
+[params]
+repo   = "https://github.com/brayniac/ringline"
+branch = "diag/518-epipe-on-early-slots"
+cpus   = "2"
+rounds = "400"
+calib_iters = "200"
+
+[[jobs]]
+name = "diagnose"
+tags = ["validation"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+shape = "z4.c"
+image = "spool/images/debian-13-ci-20260912.1@golden"
+slots = 1
+memory_gib = 4
+ports = 0
+gpu = false
+payload_timeout = 7200
+artifacts = ["/home/anvil/diag.log"]
+upload = true
+payload = '''
+set -uo pipefail
+cd /home/anvil
+{
+  uname -srm; nproc
+  git clone -q {repo} src || { echo "FATAL: clone failed"; exit 1; }
+  git -C src checkout -q {branch} || { echo "FATAL: no such ref: {branch}"; exit 1; }
+  cd src && git log --oneline -1
+  grep -q "fn repro518_instrumented" ringline/tests/echo.rs \
+    || { echo "FATAL: branch lacks repro518_instrumented"; exit 1; }
+
+  # prlimit, not `ulimit -n`: the builtin cannot raise the soft limit past the
+  # hard one, and `sudo ulimit` is meaningless (a shell builtin; sudo cannot
+  # change the calling shell's limits). The uring test binary aborts with
+  # io_uring_setup EMFILE at a 1024 soft limit, which reads as a code failure.
+  sudo prlimit --nofile=1000000 --pid $$ 2>/dev/null || ulimit -n 65536 2>/dev/null || true
+  echo "fd soft=$(ulimit -Sn) hard=$(ulimit -Hn)"
+
+  cargo build --locked --tests -p ringline 2>&1 | tail -3
+  cargo run --locked -q -p ringline-bench --bin bench-server -- --print-backend > bk.txt 2>/dev/null || true
+  got=$(cat bk.txt 2>/dev/null || echo unknown)
+  [ "$got" = "io_uring" ] || { echo "BACKEND MISMATCH: $got"; exit 1; }
+  echo "backend ok: $got"
+
+  HAVE=$(nproc)
+  CPUS=$(( {cpus} < HAVE ? {cpus} : HAVE ))
+  LIST=$(seq -s, 0 $((CPUS-1)))
+  echo "confining to cpus $LIST (of $HAVE), arm={arm}"
+
+  case "{arm}" in
+    baseline)        SLEEP=300; POOL=8  ;;
+    nostall)         SLEEP=0;   POOL=8  ;;
+    bigpool)         SLEEP=300; POOL=64 ;;
+    nostall-bigpool) SLEEP=0;   POOL=64 ;;
+    calibration)     SLEEP=-1;  POOL=-1 ;;
+    *) echo "FATAL: unknown arm {arm}"; exit 1 ;;
+  esac
+
+  if [ "{arm}" = "calibration" ]; then
+    # The unmodified test, one process per iteration: the recipe already known
+    # to reproduce (2/100 alone, 10/100 suite on the same shape).
+    TEST=backpressured_send_waits_for_pool_capacity_without_duplication
+    fails=0; ran=0
+    for i in $(seq 1 {calib_iters}); do
+      out=$(taskset -c "$LIST" cargo test --locked -q -p ringline --test echo "$TEST" -- --test-threads=1 2>&1)
+      rc=$?
+      if echo "$out" | grep -qE "^test result:"; then ran=$((ran+1)); else
+        echo "iter $i: NO TEST RESULT LINE"; continue
+      fi
+      if [ "$rc" != "0" ]; then
+        fails=$((fails+1))
+        echo "=== calib iter $i rc=$rc ==="
+        # `... FAILED` and panic lines only: grepping the bare test name also
+        # matches the PASSING result line, which already put a phantom
+        # occurrence into one issue body in this campaign.
+        echo "$out" | grep -E "FAILED|panicked|connection closing|Broken pipe|left:|right:" | head -20
+      fi
+    done
+    echo "RESULT arm=calibration cpus=$CPUS ran=${ran}/{calib_iters} failed=${fails}"
+    [ "$ran" != "{calib_iters}" ] && echo "INVALID: only $ran of {calib_iters} ran"
+  else
+    out=$(RL518_ITERS={rounds} RL518_SLEEP_MS=$SLEEP RL518_POOL_SLOTS=$POOL \
+          taskset -c "$LIST" cargo test --locked -q -p ringline --test echo \
+          repro518_instrumented -- --ignored --nocapture --test-threads=1 2>&1)
+    rc=$?
+    echo "$out" | grep -E "^REPRO518" | head -200
+    echo "instrument_rc=$rc"
+    if ! echo "$out" | grep -qE "^test result:"; then
+      echo "INVALID: no test result line -- the instrument did not run"
+      echo "$out" | tail -25
+    fi
+    got=$(echo "$out" | grep -E "^REPRO518 RESULT" | tail -1)
+    [ -z "$got" ] && echo "INVALID: no REPRO518 RESULT line"
+    echo "RESULT arm={arm} cpus=$CPUS sleep=$SLEEP pool=$POOL :: $got"
+  fi
+} 2>&1 | tee /home/anvil/diag.log
+exit 0
+'''

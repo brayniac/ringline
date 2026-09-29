@@ -3584,6 +3584,256 @@ fn wait_for_server_probe_reaches_a_send_on_accept_handler() {
     );
 }
 
+/// Instrumented reproducer for #518, run explicitly rather than in CI.
+///
+/// The control in #522 refuted the readiness-probe explanation: the failure is
+/// `Broken pipe (os error 32)` on the *earliest* connection slots, whose peers
+/// are live, and the probe only ever explained the `connection closing` string
+/// that accompanied it. Deducing a mechanism from the panic text is what
+/// produced the wrong answer, so this records what actually happened instead:
+/// per connection, how many sends completed, the raw `errno` of the one that
+/// failed, whether the handler reached `shutdown_write`, and what the client on
+/// the other end saw.
+///
+/// Parameterized by environment so one build can sweep the conditions:
+///
+/// - `RL518_ITERS` (50) — rounds per process.
+/// - `RL518_SLEEP_MS` (300) — the stall before any client reads. At 0 the
+///   clients read immediately, which is the control: no stall means no
+///   backpressure, so a failure there is not about the admission FIFO.
+/// - `RL518_POOL_SLOTS` (8) — send-pool slots. At 64 the pool covers every
+///   connection at once and nothing ever parks, the second control.
+/// - `RL518_CONNS` (16) — connections per round.
+///
+/// Prints one line per anomalous round and a final tally; it asserts nothing,
+/// because its job is to produce evidence rather than a verdict.
+#[test]
+#[ignore = "instrumentation for #518; run explicitly with RL518_* set"]
+fn repro518_instrumented() {
+    fn envn(key: &str, default: usize) -> usize {
+        std::env::var(key)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    }
+
+    let iters = envn("RL518_ITERS", 50);
+    let sleep_ms = envn("RL518_SLEEP_MS", 300);
+    let pool_slots = envn("RL518_POOL_SLOTS", 8);
+    let conns = envn("RL518_CONNS", 16);
+    // `RL518_SHUTDOWN=0` makes the handler never call `shutdown_write()`, so no
+    // `Shutdown` SQE is ever submitted. `submit_shutdown` targets the
+    // registered-file slot `Fixed(conn_index)` with a `user_data` payload of 0
+    // — no generation — so one that executes after its slot is recycled shuts
+    // down whichever connection now holds the slot, and the completion cannot
+    // tell. That is the shape of what the instrument measured: a clean FIN on a
+    // live connection, then `EPIPE` on the next send. If the anomalies vanish
+    // here, the shutdown path is implicated; if they persist, it is not.
+    let want_shutdown = envn("RL518_SHUTDOWN", 1) != 0;
+    R518_SHUTDOWN.store(want_shutdown, Ordering::SeqCst);
+    eprintln!(
+        "REPRO518 config iters={iters} sleep_ms={sleep_ms} pool_slots={pool_slots} conns={conns} shutdown={want_shutdown}"
+    );
+
+    let mut anomalous = 0usize;
+    for round in 0..iters {
+        let report = repro518_round(sleep_ms, pool_slots, conns);
+        if report.is_anomalous() {
+            anomalous += 1;
+            eprintln!("REPRO518 round {round}: {}", report.describe());
+        }
+    }
+    eprintln!(
+        "REPRO518 RESULT anomalous={anomalous}/{iters} sleep_ms={sleep_ms} pool_slots={pool_slots} conns={conns} shutdown={want_shutdown}"
+    );
+}
+
+/// One handler's fate: which accept it was, how many sends landed, and why it
+/// stopped.
+#[derive(Debug)]
+struct SendFate {
+    seq: u32,
+    sends_ok: usize,
+    err_os: Option<i32>,
+    err_msg: String,
+    reached_shutdown: bool,
+}
+
+/// One client's fate, so a server-side error can be read against what the peer
+/// actually observed rather than against an assumption about it.
+#[derive(Debug)]
+struct ReadFate {
+    bytes: usize,
+    err: Option<String>,
+}
+
+struct Repro518Report {
+    sends: Vec<SendFate>,
+    reads: Vec<ReadFate>,
+    expected_bytes: usize,
+}
+
+impl Repro518Report {
+    fn is_anomalous(&self) -> bool {
+        self.sends
+            .iter()
+            .any(|s| s.err_os.is_some() || !s.reached_shutdown)
+            || self
+                .reads
+                .iter()
+                .any(|r| r.err.is_some() || r.bytes != self.expected_bytes)
+    }
+
+    fn describe(&self) -> String {
+        let mut out = String::new();
+        for s in self
+            .sends
+            .iter()
+            .filter(|s| s.err_os.is_some() || !s.reached_shutdown)
+        {
+            out.push_str(&format!(
+                "[accept#{} sends_ok={} errno={:?} err={:?} shutdown={}] ",
+                s.seq, s.sends_ok, s.err_os, s.err_msg, s.reached_shutdown
+            ));
+        }
+        for (i, r) in self.reads.iter().enumerate() {
+            if r.err.is_some() || r.bytes != self.expected_bytes {
+                out.push_str(&format!("[reader{} bytes={} err={:?}] ", i, r.bytes, r.err));
+            }
+        }
+        out
+    }
+}
+
+static R518_SEQ: AtomicU32 = AtomicU32::new(0);
+static R518_SHUTDOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static R518_FATES: std::sync::Mutex<Vec<SendFate>> = std::sync::Mutex::new(Vec::new());
+
+struct Repro518Handler;
+
+impl AsyncEventHandler for Repro518Handler {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
+        async move {
+            let seq = R518_SEQ.fetch_add(1, Ordering::SeqCst);
+            let payload = vec![b'Z'; BP_CHUNK];
+            let mut sends_ok = 0usize;
+            let mut err_os = None;
+            let mut err_msg = String::new();
+            let mut reached_shutdown = false;
+            for _ in 0..BP_CHUNKS {
+                match conn.send_backpressured(&payload).await {
+                    Ok(_) => sends_ok += 1,
+                    Err(e) => {
+                        err_os = Some(e.raw_os_error().unwrap_or(-1));
+                        err_msg = format!("{e}");
+                        break;
+                    }
+                }
+            }
+            if err_os.is_none() && R518_SHUTDOWN.load(Ordering::Relaxed) {
+                conn.shutdown_write();
+                reached_shutdown = true;
+            } else if err_os.is_none() {
+                // No FIN from us: the task ending closes the connection, which
+                // FINs anyway, so the client still sees EOF. What disappears is
+                // every `Shutdown` SQE.
+                reached_shutdown = true;
+            }
+            if let Ok(mut g) = R518_FATES.lock() {
+                g.push(SendFate {
+                    seq,
+                    sends_ok,
+                    err_os,
+                    err_msg,
+                    reached_shutdown,
+                });
+            }
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        Repro518Handler
+    }
+}
+
+fn repro518_round(sleep_ms: usize, pool_slots: usize, conns: usize) -> Repro518Report {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    R518_SEQ.store(0, Ordering::SeqCst);
+    if let Ok(mut g) = R518_FATES.lock() {
+        g.clear();
+    }
+
+    let config = test_config_builder()
+        .workers(1)
+        .send_pool(pool_slots as u16, 4096)
+        .build()
+        .expect("valid config");
+
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind(addr.parse().unwrap())
+        .launch::<Repro518Handler>()
+        .expect("launch failed");
+
+    let mut streams = Vec::new();
+    for _ in 0..conns {
+        let stream = connect_retry(&addr);
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        streams.push(stream);
+    }
+
+    if sleep_ms > 0 {
+        std::thread::sleep(Duration::from_millis(sleep_ms as u64));
+    }
+
+    let readers: Vec<_> = streams
+        .into_iter()
+        .map(|mut stream| {
+            std::thread::spawn(move || {
+                let mut got = Vec::new();
+                match stream.read_to_end(&mut got) {
+                    Ok(_) => ReadFate {
+                        bytes: got.len(),
+                        err: None,
+                    },
+                    Err(e) => ReadFate {
+                        bytes: got.len(),
+                        err: Some(format!("{e}")),
+                    },
+                }
+            })
+        })
+        .collect();
+
+    let reads: Vec<ReadFate> = readers
+        .into_iter()
+        .map(|h| {
+            h.join().unwrap_or(ReadFate {
+                bytes: 0,
+                err: Some("reader thread panicked".into()),
+            })
+        })
+        .collect();
+
+    shutdown.shutdown();
+    for h in handles {
+        let _ = h.join();
+    }
+
+    let sends = R518_FATES
+        .lock()
+        .map(|mut g| std::mem::take(&mut *g))
+        .unwrap_or_default();
+
+    Repro518Report {
+        sends,
+        reads,
+        expected_bytes: BP_CHUNK * BP_CHUNKS,
+    }
+}
+
 #[test]
 fn async_join3_mixed() {
     let port = free_port();

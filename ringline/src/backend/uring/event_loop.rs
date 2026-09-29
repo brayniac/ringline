@@ -1257,7 +1257,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             OpTag::Send => self.handle_send(ud, result),
             OpTag::SendMsgZc => self.handle_send_msg_zc(ud, result, flags),
             OpTag::Close => self.handle_close(ud),
-            OpTag::Shutdown => {}
+            OpTag::Shutdown => self.handle_shutdown(ud),
             OpTag::EventFdRead => self.handle_eventfd_read(),
             OpTag::TlsSend => self.handle_tls_send(ud, result),
             OpTag::Connect => self.handle_connect(ud, result),
@@ -2714,6 +2714,33 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.driver.merged_accept_armed = false;
             self.arm_merged_accepts();
         }
+    }
+
+    /// A deferred `shutdown(SHUT_WR)` has completed.
+    ///
+    /// Its only job is to release the slot: `Shutdown` names its socket as the
+    /// registered-file slot `Fixed(conn_index)`, so `try_finalize_close` holds
+    /// the `Close` that frees the slot until this CQE lands. Without that, the
+    /// `Close` could complete first, the next accept could register the slot,
+    /// and the kernel could then run the FIN against *that* connection — a live
+    /// peer whose next send fails with `EPIPE` (#518).
+    ///
+    /// The generation in the payload is checked for form's sake and for the
+    /// counter: because the close now waits on this flag, a stale one should be
+    /// unreachable, and `shutdown_stale` existing at all would mean the gate
+    /// leaked somewhere.
+    fn handle_shutdown(&mut self, ud: UserData) {
+        let conn_index = ud.conn_index();
+        let idx = conn_index as usize;
+        if idx >= self.driver.send_queues.len() {
+            return;
+        }
+        if self.driver.connections.generation(conn_index) != ud.payload() {
+            crate::metrics::RING.increment(crate::metrics::ring::SHUTDOWN_STALE);
+            return;
+        }
+        self.driver.send_queues[idx].shutdown_inflight = false;
+        self.driver.try_finalize_close(conn_index);
     }
 
     fn handle_eventfd_read(&mut self) {
@@ -15268,6 +15295,70 @@ mod tests {
             ),
             _ => panic!("expected the send waiter to be woken with Send(Ok(30))"),
         }
+    }
+
+    /// The #518 gate. `Shutdown` names its socket as the registered-file slot
+    /// `Fixed(conn_index)`, so the `Close` that frees that slot for the next
+    /// accept must not be submitted while the `Shutdown` is still in the kernel
+    /// — otherwise the FIN can land on the slot's *next* occupant, half-closing
+    /// a live connection whose next send then fails `EPIPE`.
+    ///
+    /// Measured before the fix at 49/400 rounds with 16 connections and 0/400
+    /// with the handler's `shutdown_write()` removed, which is what identified
+    /// the op.
+    #[test]
+    fn close_waits_for_the_shutdown_cqe_before_freeing_the_slot() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+
+        // A deferred shutdown went out and its CQE has not landed.
+        el.driver.send_queues[conn_index as usize].shutdown_inflight = true;
+        el.driver.close_connection(conn_index);
+        assert!(
+            el.driver.send_queues[conn_index as usize].close_pending,
+            "the close is requested"
+        );
+        assert!(
+            !el.driver.send_queues[conn_index as usize].close_submitted,
+            "Close must not be submitted while a Shutdown SQE names this slot"
+        );
+        el.driver.try_finalize_close(conn_index);
+        assert!(
+            !el.driver.send_queues[conn_index as usize].close_submitted,
+            "re-driving the finalize must still hold off"
+        );
+
+        // The Shutdown CQE lands: the flag clears and the close proceeds.
+        let ud = UserData::encode(OpTag::Shutdown, conn_index, generation);
+        el.test_dispatch_cqe(ud.raw(), 0, 0);
+        assert!(
+            !el.driver.send_queues[conn_index as usize].shutdown_inflight,
+            "its own CQE clears the flag"
+        );
+        assert!(
+            el.driver.send_queues[conn_index as usize].close_submitted,
+            "the Shutdown CQE re-drives the finalize"
+        );
+    }
+
+    /// A `Shutdown` CQE whose slot has already been recycled must be rejected on
+    /// its generation and counted, not allowed to clear the new occupant's flag
+    /// (domain invariant 3). The gate above should make this unreachable, which
+    /// is why `shutdown_stale` being nonzero is worth knowing about.
+    #[test]
+    fn stale_shutdown_cqe_is_rejected_on_its_generation() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+
+        el.driver.send_queues[conn_index as usize].shutdown_inflight = true;
+        let stale = UserData::encode(OpTag::Shutdown, conn_index, generation.wrapping_add(1));
+        el.test_dispatch_cqe(stale.raw(), 0, 0);
+        assert!(
+            el.driver.send_queues[conn_index as usize].shutdown_inflight,
+            "a CQE from a previous occupant must not clear this occupant's flag"
+        );
     }
 
     /// `handle_send`'s `close_submitted` gate: a partial completion arriving
