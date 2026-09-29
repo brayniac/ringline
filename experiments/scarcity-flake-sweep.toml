@@ -1,0 +1,163 @@
+# Does CPU scarcity reproduce the other CI flakes, the way it reproduced #518?
+#
+# #518 turned out to be a race that needs a preempted worker, not load: confined
+# to 2 CPUs it fails 9 times in 200 runs, and at 8 CPUs it never fails in 200 --
+# including the arm that runs the whole 74-test binary each time. Scarcity is the
+# ingredient, and nobody had been supplying it, which is why #378 records these
+# failures as "not reproducible on our VMs" when the guests have 16 CPUs.
+#
+# So try the same lever on every other flake with an open issue.
+#
+#   buffer_ring  buffer_ring_exhaustion_recovers          #378, #349
+#   chain_guard  chain_guard_send_below_threshold_small_gather   #513
+#   quic_fin     large_payload_round_trip_via_endpoint_api #393
+#   prefault     prefault_makes_pages_resident            negative control
+#
+# PREDICTIONS, written before the run.
+#
+#  * buffer_ring and chain_guard reproduce at 2 CPUs. Both fail as a 5 s client
+#    read timeout with zero bytes received, which is what a starved worker that
+#    cannot get scheduled would look like, and #513 records that they share the
+#    signature exactly.
+#  * quic_fin does NOT reproduce. It was fixed in #471 -- the helper flushed only
+#    the reader, and flush is what generates packets -- and CLAUDE.md says a
+#    recurrence "means something new". If 2 CPUs resurrects it, that is a finding
+#    and not a flake, so it is here precisely to be given the chance.
+#  * prefault does NOT reproduce, at either width. It was fixed in #510 by taking
+#    its pages from mmap instead of a Vec, so residency no longer depends on the
+#    allocator. This is the negative control: if it fails, that fix is wrong and
+#    the whole 2-CPU story needs re-reading, because it would mean scarcity
+#    breaks things the fix was supposed to have made deterministic.
+#
+# A clean sweep at 2 CPUs would be informative too: it would say #518's race is
+# specific to the backpressured-send path rather than a general property of a
+# starved worker, and would leave the other flakes needing their own explanation.
+#
+# One host: every one of these is self-contained, so this runs on the validation
+# agent rather than queueing for the hv01/hv02 pair.
+#
+# GATES, unchanged from the #518 spec and for the same reasons. Each iteration
+# must show a test result and exactly one test, because a filter that matches
+# nothing exits 0 having run nothing and would read as "did not reproduce"
+# forever -- and the filter and the -p/--test target have to move together here,
+# which is a new way to get that wrong. Backend asserted io_uring.
+#
+name = "scarce {test} c{cpus}"
+
+[matrix]
+context_name = "ringline: does CPU scarcity reproduce the other flakes too? (#378 #349 #513 #393)"
+test = ["buffer_ring", "chain_guard", "quic_fin", "prefault"]
+cpus = ["2", "8"]
+
+[params]
+branch     = "main"
+repo       = "https://github.com/ringline-rs/ringline"
+iterations = "100"
+
+[[jobs]]
+name = "repro"
+tags = ["validation"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+shape = "z4.c"
+image = "spool/images/debian-13-ci-20260912.1@golden"
+slots = 1
+memory_gib = 4
+ports = 0
+gpu = false
+payload_timeout = 7200
+artifacts = ["/home/anvil/repro.log", "/home/anvil/failures.txt"]
+upload = true
+payload = '''
+set -uo pipefail
+cd /home/anvil
+{
+  uname -srm; nproc
+  git clone -q {repo} src && git -C src checkout -q {branch}
+  cd src && git log --oneline -1
+
+  # The uring test binary wants a generous fd limit: at 1024 it aborts with
+  # io_uring_setup(2) EMFILE, which reads as a code failure and is not.
+  ulimit -n 1000000 || ulimit -n 65536 || true
+  echo "fd soft=$(ulimit -Sn)"
+
+  cargo build --locked --tests -p ringline -p ringline-quic 2>&1 | tail -3
+  # GATE 2: a mio build runs something else and would report a clean sweep.
+  cargo run --locked -q -p ringline-bench --bin bench-server -- --print-backend > /home/anvil/backend.txt 2>/dev/null || true
+  got=$(cat /home/anvil/backend.txt 2>/dev/null || echo unknown)
+  [ "$got" = "io_uring" ] || { echo "BACKEND MISMATCH: $got"; exit 1; }
+  echo "backend ok: $got"
+
+  # Each flake lives in a different target, so the filter and the -p/--test pair
+  # travel together. Getting these out of step is the failure that runs zero
+  # tests and reports a clean sweep, which gate 1 below catches.
+  case "{test}" in
+    buffer_ring) TEST=buffer_ring_exhaustion_recovers;            TARGET="-p ringline --test echo" ;;
+    chain_guard) TEST=chain_guard_send_below_threshold_small_gather; TARGET="-p ringline --test guard_send_threshold" ;;
+    quic_fin)    TEST=large_payload_round_trip_via_endpoint_api;  TARGET="-p ringline-quic --test peer" ;;
+    prefault)    TEST=prefault_makes_pages_resident;              TARGET="-p ringline --lib" ;;
+    *) echo "unknown test {test}"; exit 1 ;;
+  esac
+  echo "test=$TEST target=$TARGET"
+  # Clamp to what the guest actually has: asking taskset for cpu 7 on a 4-vCPU
+  # shape fails and would kill the wide arms rather than narrowing them, which
+  # would look like "the wide configuration does not reproduce it".
+  HAVE=$(nproc)
+  CPUS=$(( {cpus} < HAVE ? {cpus} : HAVE ))
+  [ "$CPUS" != "{cpus}" ] && echo "NOTE: asked for {cpus} cpus, guest has $HAVE; using $CPUS"
+  LIST=$(seq -s, 0 $((CPUS-1)))
+  echo "confining to cpus $LIST (of $HAVE), test={test}, iterations={iterations}"
+
+  fails=0
+  ran=0
+  : > /home/anvil/failures.txt
+  for i in $(seq 1 {iterations}); do
+    out=$(taskset -c "$LIST" cargo test --locked -q $TARGET "$TEST" -- --test-threads=1 --nocapture 2>&1)
+    rc=$?
+    # GATE 1: a filter that matches nothing exits 0 having run nothing, which
+    # would count as a pass forever. Require evidence a result was produced.
+    echo "$out" | grep -qE "test result: (ok|FAILED)" || {
+      echo "ITERATION $i PRODUCED NO TEST RESULT -- filter or build wrong, aborting"
+      echo "$out" | tail -20
+      exit 1
+    }
+    echo "$out" | grep -qE "test result: .* 1 (passed|failed)" || {
+      echo "ITERATION $i did not run exactly one test -- filter/target out of step, aborting"
+      echo "$out" | grep "test result:"
+      exit 1
+    }
+    ran=$((ran+1))
+    if [ "$rc" != "0" ]; then
+      fails=$((fails+1))
+      {
+        echo "════ iteration $i ════"
+        # The ORDER matters: which panic came first separates a real lifecycle
+        # bug from teardown fallout.
+        echo "$out" | grep -nE "panicked at|connection closing|Broken pipe|connection task panicked|assertion|test result:" | head -30
+      } >> /home/anvil/failures.txt
+      echo "iteration $i FAILED (running total $fails)"
+    fi
+  done
+  echo "RESULT test={test} cpus_asked={cpus} cpus_used=$CPUS of $HAVE ran=$ran failed=$fails"
+} 2>&1 | tee /home/anvil/repro.log
+rc=${PIPESTATUS[0]}
+echo "payload_status=$rc" | tee -a /home/anvil/repro.log
+exit 0
+'''
+
+[[jobs.steps]]
+type = "shell"
+command = '''
+grep -q "payload_status=0" repro.log || { echo "payload failed -- read repro.log"; exit 1; }
+grep -q "backend ok: io_uring" repro.log || { echo "backend gate did not pass"; exit 1; }
+grep -qE "RESULT .* ran=[1-9]" repro.log || { echo "no iterations ran"; exit 1; }
+echo "--- outcome ---"
+grep -E "^RESULT " repro.log
+if [ -s failures.txt ]; then
+  echo "--- first failures (order of panics is the discriminator) ---"
+  head -40 failures.txt
+else
+  echo "no failures in this arm"
+fi
+'''
