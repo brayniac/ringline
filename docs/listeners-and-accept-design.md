@@ -902,8 +902,10 @@ is not the one the section above was looking for.
 | 600k | 8 | **1.00** | 12.88 | 4.89 | 1.78 | 760us | 20085us | 1.8 |
 | 600k | 16 | 0.96 | 17.71 | 2.34 | 1.70 | 727us | 11912us | 1.7 |
 | 1.2M | 2 | **1.00** | 6.84 | 4.84 | 0.17 | 5730us | 111739us | 26.9 |
+| 600k | 4 | **1.00** | 7.73 | 3.73 | 0.87 | 1508us | 2524us | 3.5 |
+| 1.2M | 4 | **1.00** | 9.67 | 5.67 | 0.30 | 4455us | 556500us | 20.9 |
 | 1.2M | 8 | **1.00** | 14.94 | 6.95 | 0.54 | 150288us | 1051204us | 704 |
-| 1.2M | 16 | **1.00** | ~23 | — | 0.95 | 1290515us | 28749460us | 3900 |
+| 1.2M | 16 | **1.00** | 19.87 | 3.89 | 0.95 | 1290515us | 28749460us | 3900 |
 
 `in flight per conn` is Little's law — `offered_rate x p50 / connections`.
 
@@ -942,21 +944,40 @@ Offered as the leading explanation rather than a proven one, because it needs tw
 conditions and not one: `(300k, w16)` also exceeds 12 cores (13.64) with no tail
 penalty, since its workers have slack to absorb the contention.
 
-#### At high rate, fewer workers wins outright
+#### The 12-core boundary, measured
 
-The 1.2M row is not a trade at all:
+The 1.2M row is not a trade at all, and it locates the boundary precisely. The
+guest has **12 physical cores**; every worker is pinned at 1.00 in all four arms:
 
-| 1.2M offered | achieved | total CPU | p50 | p99 |
-|---|---|---|---|---|
-| `w2` | 100% | 6.84 (fits) | **5730us** | 111,739us |
-| `w8` | 99.8% | 14.94 (spills) | 150,288us | 1,051,204us |
-| `w16` | **90.5%** | ~23 (spills hard) | 1,290,515us | 28,749,460us |
+| 1.2M offered | achieved | worker CPU | softirq | **total** | fits 12? | p50 | p99 |
+|---|---|---|---|---|---|---|---|
+| `w2` | 100% | 1.00 | 4.84 | **6.84** | yes | 5730us | 111,739us |
+| `w4` | 100% | 1.00 | 5.67 | **9.67** | yes | **4455us** | 556,500us |
+| `w8` | 99.8% | 1.00 | 6.95 | **14.94** | no | 150,288us | 1,051,204us |
+| `w16` | **90.5%** | 1.00 | 3.89 | **19.87** | no | 1,290,515us | 28,749,460us |
+
+**p50 jumps 34x exactly where total demand crosses the physical core count** —
+9.67 cores fits and costs 4.5 ms; 14.94 does not and costs 150 ms. Nothing else in
+the row changes discontinuously there.
+
+The effect is **graded, not a step**, which is what makes it credible: at 600k,
+`w8` needs 12.88 cores — barely over — and its p50 is still healthy at 825us while
+its p99 is already blown at 35,568us. Crossing the boundary damages the tail first
+and reaches the median only well past it, which is how occasional contention should
+behave. (At 600k, `w8` and `w16` cannot be ordered against each other on p99: the
+`w8` figure sits inside the 9,208–46,162us range its own six replicates span.)
 
 **Two workers beat sixteen by 226x on p50, and sixteen cannot serve the load at
 all.** Concentration is not merely cheaper here; spreading is the thing that
 breaks. Tier 1/2/3 exist to spread connections across workers, and in this regime
 that is the harmful direction — worth stating plainly in the design doc that
 proposes them.
+
+Note what this makes of worker-count advice: the useful limit is not a worker count
+but `workers + softirq(rate) <= physical_cores`, and **softirq is the term that
+moves** — 4.84 to 6.95 cores across this row alone, exceeding the runtime's own
+workers at every arm below `w8`. A recommendation phrased in worker counts is
+implicitly a recommendation about packet rate.
 
 #### A methodological correction
 
