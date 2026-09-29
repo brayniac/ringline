@@ -84,14 +84,51 @@ mod tests {
     fn prefault_makes_pages_resident() {
         let page = page_size();
         let pages = 512;
-        let mut buf = vec![0u8; page * (pages + 1)];
-
-        // mincore needs a page-aligned start; take the first aligned address
-        // inside the allocation.
-        let base = buf.as_mut_ptr();
-        let aligned = (base as usize).div_ceil(page) * page;
-        let ptr = aligned as *mut u8;
         let len = page * pages;
+
+        // Map the memory directly instead of using `vec![0u8; _]`.
+        //
+        // A zeroed Vec is *usually* fresh mmap'd zero pages, which is what this
+        // test needs, but not reliably: glibc raises `M_MMAP_THRESHOLD`
+        // dynamically as it observes freed mmap'd blocks, so after enough
+        // allocations in the test process a 2 MiB request is served from an
+        // already-faulted heap arena instead. The cold-allocation precondition
+        // below then fails with 512/512 pages resident, and the test reports a
+        // failure that says nothing about prefaulting. That depends on the
+        // allocation history of whatever ran first, which is why it fired in
+        // `Test` on one commit and `Test (tls-unbuffered)` on another.
+        //
+        // An anonymous private mapping without MAP_POPULATE is cold by
+        // definition, and it is also what prefaulting exists to warm.
+        //
+        // SAFETY: a fresh anonymous mapping; the length is non-zero and page
+        // aligned, and the result is checked against MAP_FAILED.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(
+            ptr,
+            libc::MAP_FAILED,
+            "mmap failed: {}",
+            std::io::Error::last_os_error()
+        );
+        let ptr = ptr as *mut u8;
+        // Returned by mmap, so already page aligned.
+        struct Unmap(*mut u8, usize);
+        impl Drop for Unmap {
+            fn drop(&mut self) {
+                // SAFETY: the mapping this guard owns, unmapped exactly once.
+                unsafe { libc::munmap(self.0 as *mut libc::c_void, self.1) };
+            }
+        }
+        let _unmap = Unmap(ptr, len);
 
         let resident = |ptr: *mut u8, len: usize| -> usize {
             let mut vec = vec![0u8; len / page];
@@ -102,11 +139,17 @@ mod tests {
             vec.iter().filter(|b| *b & 1 == 1).count()
         };
 
+        // Exactly zero, not merely "mostly cold": an untouched anonymous mapping
+        // has no pages allocated, so this is guaranteed rather than typical. The
+        // strict form is the point — it fails immediately if the allocation ever
+        // goes back to `vec![0u8; _]`, whose residency depends on the allocator's
+        // history and cannot be relied on.
         let before = resident(ptr, len);
-        assert!(
-            before < pages / 2,
-            "expected a mostly-cold allocation, found {before}/{pages} pages resident — \
-             the test cannot show prefaulting does anything if the pages are already in"
+        assert_eq!(
+            before, 0,
+            "a fresh anonymous mapping must be entirely cold, found {before}/{pages} \
+             pages resident — if this allocation is not coming straight from mmap, \
+             the test cannot show prefaulting does anything"
         );
 
         // SAFETY: the slice covers `len` bytes from an aligned offset inside
