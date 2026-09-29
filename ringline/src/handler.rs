@@ -74,6 +74,21 @@ pub(crate) struct ConnSendState {
     /// the send queue fully drains, reporting the whole logical byte count.
     #[cfg_attr(not(has_io_uring), allow(dead_code))]
     pub acked_bytes: u32,
+    /// Whether a deferred-or-immediate `Shutdown` SQE for the current occupant
+    /// is still in the kernel.
+    ///
+    /// `Shutdown` names its socket as the *registered-file slot*
+    /// `Fixed(conn_index)`, not as an fd, so it must not execute after that slot
+    /// has been closed and handed to the next accept — the kernel would FIN
+    /// whoever now holds the slot, half-closing a live connection whose next
+    /// send then fails `EPIPE` (#518). Nothing pinned it before: a `Shutdown` is
+    /// not a queued send, so `try_finalize_close` could not see it, and its
+    /// completion was discarded (`OpTag::Shutdown => {}`). Set when the SQE is
+    /// accepted, cleared by its CQE, and required by `try_finalize_close` before
+    /// the `Close` that frees the slot may be submitted. Cleared by
+    /// `reset_send_state` at slot reactivation, like `close_submitted`.
+    #[cfg_attr(not(has_io_uring), allow(dead_code))]
+    pub shutdown_inflight: bool,
 }
 
 impl ConnSendState {
@@ -87,6 +102,7 @@ impl ConnSendState {
             close_send_count: 0,
             close_notify_deadline: None,
             acked_bytes: 0,
+            shutdown_inflight: false,
         }
     }
 }
@@ -1005,8 +1021,11 @@ impl<'a> DriverCtx<'a> {
             // submission (ring backpressure) leaves the write half `Open`
             // so a repeat `shutdown_write` can re-request the FIN, as the
             // flag-based code allowed.
-            if self.ring.submit_shutdown(conn.index).is_ok() {
+            let generation = cs.generation;
+            if self.ring.submit_shutdown(conn.index, generation).is_ok() {
                 cs.write = crate::connection::WriteHalf::Shutdown;
+                // The slot must outlive the SQE: see `shutdown_inflight`.
+                self.send_queues[idx].shutdown_inflight = true;
             }
         }
     }

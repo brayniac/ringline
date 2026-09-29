@@ -1323,6 +1323,10 @@ impl Driver {
         state.parked = false;
         state.close_pending = false;
         state.close_submitted = false;
+        // Defensive: the close now waits on this, so a slot should never be
+        // reactivated with a Shutdown still outstanding. If the gate ever leaks,
+        // the next occupant must not inherit the block.
+        state.shutdown_inflight = false;
         state.acked_bytes = 0;
         state.close_notify_deadline = None;
         if let Some(pos) = self
@@ -2163,7 +2167,19 @@ impl Driver {
         // accounting; the chain completion handlers re-drive this finalize
         // once the chain drains.
         let chain_drained = !self.chain_table.is_active(conn_index);
-        if !(state.close_pending && sends_drained && forward_drained && chain_drained) {
+        // A `Shutdown` SQE still in the kernel names this slot as
+        // `Fixed(conn_index)`. `Close` frees the slot for the next accept to
+        // register, so submitting it now lets the FIN land on that next
+        // connection instead — a live peer, cleanly half-closed, whose next send
+        // fails `EPIPE`. `handle_shutdown` re-drives this finalize once the CQE
+        // clears the flag.
+        let shutdown_drained = !state.shutdown_inflight;
+        if !(state.close_pending
+            && sends_drained
+            && forward_drained
+            && chain_drained
+            && shutdown_drained)
+        {
             return;
         }
         let st = &mut self.send_queues[conn_index as usize];
@@ -2494,7 +2510,10 @@ impl Driver {
             // Refused (ring backpressure): fall back to `Open` so a
             // repeat `shutdown_write` can re-request the FIN rather
             // than stranding it as pending on an empty queue.
-            cs.write = if self.ring.submit_shutdown(conn_index).is_ok() {
+            let generation = cs.generation;
+            cs.write = if self.ring.submit_shutdown(conn_index, generation).is_ok() {
+                // The slot must now outlive the SQE: see `shutdown_inflight`.
+                self.send_queues[conn_index as usize].shutdown_inflight = true;
                 WriteHalf::Shutdown
             } else {
                 WriteHalf::Open
