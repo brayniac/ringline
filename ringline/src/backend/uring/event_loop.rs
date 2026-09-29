@@ -3898,9 +3898,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // Identity: the CQE outlived its connection slot. Resource-only
         // handling, mirroring the normal completion minus all per-connection
         // state: a notification CQE decrements and releases when done; a main
-        // CQE with result > 0 still has its notification in flight (count it,
-        // never resubmit the partial remainder — the connection is gone);
-        // otherwise no notification is coming and the entry releases now.
+        // CQE with IORING_CQE_F_MORE still has its notification in flight
+        // (count it, never resubmit the partial remainder — the connection is
+        // gone); otherwise no notification is coming and the entry releases now.
         if !self.slab_identity_ok(conn_index, slab_idx) {
             if cqueue::notif(flags) {
                 self.driver.send_slab.dec_pending_notifs(slab_idx);
@@ -3909,7 +3909,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 // partial is never resubmitted. Mark awaiting only here
                 // (not on notif CQEs, which for a resubmitted partial can
                 // precede the remainder's main CQE), matching run_shutdown.
-                if result > 0 {
+                if cqueue::more(flags) {
                     self.driver.send_slab.inc_pending_notifs(slab_idx);
                 }
                 self.driver.send_slab.mark_awaiting_notifications(slab_idx);
@@ -3939,20 +3939,16 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 }
                 return;
             }
-            if result == -libc::ECANCELED {
-                let ps = self.driver.send_slab.release(slab_idx);
-                if ps != u16::MAX {
-                    self.release_pool_slot(ps);
-                }
-            } else if result > 0 {
-                // Kernel sends a ZC notification only when result > 0.
-                // result == 0 means no bytes sent — no notification will arrive.
+            if cqueue::more(flags) {
+                // A notification follows whenever the main CQE carries
+                // IORING_CQE_F_MORE -- on error and on a zero result too
+                // (`io_sendrecv_fail`, `io_sendmsg_zc`), -ECANCELED included.
+                // Hold the entry until it arrives.
                 self.driver.send_slab.inc_pending_notifs(slab_idx);
                 self.driver.send_slab.mark_awaiting_notifications(slab_idx);
                 self.driver.chain_table.inc_zc_notif(conn_index);
             } else {
-                // result == 0 or result < 0 (excluding ECANCELED above):
-                // release immediately — no ZC notification coming.
+                // No F_MORE: no notification is coming; release now.
                 let ps = self.driver.send_slab.release(slab_idx);
                 if ps != u16::MAX {
                     self.release_pool_slot(ps);
@@ -3976,10 +3972,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             return;
         }
 
-        // Only increment pending notifications for successful sends — the kernel
-        // sends a ZC notification CQE only when result > 0. On error (result <= 0),
-        // no notification arrives, so incrementing would permanently leak the slab slot.
-        if result > 0 {
+        // Count a pending notification exactly when the kernel says one is
+        // coming: IORING_CQE_F_MORE on the main CQE. It is set on error and on
+        // a zero result too (`io_sendrecv_fail`, `io_sendmsg_zc`), so keying on
+        // `result > 0` released the entry early, and the late notification
+        // then decremented whichever send reused it (#487). Without F_MORE no
+        // notification follows, and counting one would leak the entry.
+        if cqueue::more(flags) {
             self.driver.send_slab.inc_pending_notifs(slab_idx);
         }
 
@@ -7717,8 +7716,10 @@ mod tests {
 
         let ud = UserData::encode(OpTag::SendMsgZc, conn_index, slab_idx as u32);
         // Stale main CQE (success): notification still in flight — the entry
-        // must survive until it lands.
-        el.test_dispatch_cqe(ud.raw(), 100, 0);
+        // must survive until it lands. IORING_CQE_F_MORE is how the kernel
+        // says a notification is coming, and a successful ZC send always
+        // carries it.
+        el.test_dispatch_cqe(ud.raw(), 100, 2);
         assert!(el.driver.send_slab.in_use(slab_idx));
         // Stale notification CQE: releases the entry.
         el.test_dispatch_cqe(ud.raw(), 0, 8);
@@ -7974,6 +7975,90 @@ mod tests {
             el.driver.send_slab.should_release(slab_idx) || !el.driver.send_slab.in_use(slab_idx),
             "slab entry leaked after ZC send error"
         );
+    }
+
+    /// Allocate a one-iovec ZC send entry for `conn_index`.
+    fn alloc_zc_entry(el: &mut AsyncEventLoop<NoopHandler>, conn_index: u32) -> u16 {
+        let iovecs = [libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 100,
+        }];
+        let guards = [const { None }; crate::buffer::send_slab::MAX_GUARDS];
+        let (slab_idx, _ptr) = el
+            .driver
+            .send_slab
+            .allocate(
+                conn_index,
+                el.driver.connections.generation(conn_index),
+                &iovecs,
+                u16::MAX,
+                guards,
+                0,
+                100,
+            )
+            .unwrap();
+        slab_idx
+    }
+
+    const CQE_F_MORE: u32 = 1 << 1; // IORING_CQE_F_MORE
+    const CQE_F_NOTIF: u32 = 1 << 3; // IORING_CQE_F_NOTIF
+
+    /// The kernel posts a ZC notification whenever the main CQE carries
+    /// `IORING_CQE_F_MORE` -- including on error (`io_sendrecv_fail`) and on
+    /// a zero result (`io_sendmsg_zc` sets it unconditionally). The entry must
+    /// stay in use until that notification arrives.
+    #[test]
+    fn handle_send_msg_zc_error_with_f_more_waits_for_its_notification() {
+        for result in [-libc::ECONNRESET, 0] {
+            let mut el = make_test_loop();
+            let conn_index = accept_connection(&mut el);
+            let slab_idx = alloc_zc_entry(&mut el, conn_index);
+            let ud = UserData::encode(OpTag::SendMsgZc, conn_index, slab_idx as u32);
+
+            el.test_dispatch_cqe(ud.raw(), result, CQE_F_MORE);
+            assert!(
+                el.driver.send_slab.in_use(slab_idx),
+                "result {result} with F_MORE: entry released before its notification"
+            );
+
+            el.test_dispatch_cqe(ud.raw(), 0, CQE_F_NOTIF);
+            assert!(
+                !el.driver.send_slab.in_use(slab_idx),
+                "result {result}: entry not released after its notification"
+            );
+        }
+    }
+
+    /// The CI panic (ringline-rs/ringline#487): an entry released on an error
+    /// CQE that carried F_MORE is reused by the next send, and the first
+    /// send's late notification then decrements the new send's count --
+    /// "notification underflow" in debug, and in release an entry released
+    /// while the kernel may still hold the new send's pages.
+    #[test]
+    fn a_late_notification_never_reaches_a_reused_entry() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let first = alloc_zc_entry(&mut el, conn_index);
+        let first_ud = UserData::encode(OpTag::SendMsgZc, conn_index, first as u32);
+        el.test_dispatch_cqe(first_ud.raw(), -libc::ECONNRESET, CQE_F_MORE);
+
+        // The next send, before the first one's notification arrives.
+        let second = alloc_zc_entry(&mut el, conn_index);
+        let second_ud = UserData::encode(OpTag::SendMsgZc, conn_index, second as u32);
+
+        // The first send's notification, late.
+        el.test_dispatch_cqe(first_ud.raw(), 0, CQE_F_NOTIF);
+
+        // The second send is untouched: still in use, and its own main CQE
+        // and notification complete it normally.
+        assert!(
+            el.driver.send_slab.in_use(second),
+            "the second send's entry was released"
+        );
+        el.test_dispatch_cqe(second_ud.raw(), 100, CQE_F_MORE);
+        assert!(el.driver.send_slab.in_use(second));
+        el.test_dispatch_cqe(second_ud.raw(), 0, CQE_F_NOTIF);
+        assert!(!el.driver.send_slab.in_use(second));
     }
 
     #[test]
@@ -15903,6 +15988,9 @@ mod tests {
             Error,
             /// ZC send result == 0.
             Zero,
+            /// ZC send fails with IORING_CQE_F_MORE, and its notification
+            /// follows -- what the kernel does for a failed ZC send (#487).
+            ErrorThenNotif,
         }
 
         /// Random recv CQE result.
@@ -15931,6 +16019,7 @@ mod tests {
                 Just(ZcAction::OkThenNotif),
                 Just(ZcAction::Error),
                 Just(ZcAction::Zero),
+                Just(ZcAction::ErrorThenNotif),
             ]
         }
 
@@ -16006,8 +16095,9 @@ mod tests {
 
                     match action {
                         ZcAction::OkThenNotif => {
-                            // Operation CQE with success.
-                            el.test_dispatch_cqe(ud.raw(), 100, 0);
+                            // Operation CQE with success; the kernel sets
+                            // IORING_CQE_F_MORE (2) because a notification follows.
+                            el.test_dispatch_cqe(ud.raw(), 100, 2);
                             // Notification CQE.
                             el.test_dispatch_cqe(ud.raw(), 0, 8); // IORING_CQE_F_NOTIF
                         }
@@ -16018,6 +16108,14 @@ mod tests {
                             if el.driver.send_slab.in_use(slab_idx) && el.driver.send_slab.should_release(slab_idx) {
                                 el.driver.send_slab.release(slab_idx);
                             }
+                        }
+                        ZcAction::ErrorThenNotif => {
+                            el.test_dispatch_cqe(ud.raw(), -104, 2); // F_MORE
+                            prop_assert!(
+                                el.driver.send_slab.in_use(slab_idx),
+                                "released before the notification F_MORE promised"
+                            );
+                            el.test_dispatch_cqe(ud.raw(), 0, 8); // IORING_CQE_F_NOTIF
                         }
                         ZcAction::Zero => {
                             el.test_dispatch_cqe(ud.raw(), 0, 0);
