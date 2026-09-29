@@ -81,8 +81,12 @@ fix  = ["before", "after"]
 mode = ["alone", "suite"]
 
 [params]
-repo       = "https://github.com/ringline-rs/ringline"
-before_ref = "main"
+# The fork, because that is where the `after` branch lives (the other
+# branch-based specs in this directory clone it for the same reason).
+repo       = "https://github.com/brayniac/ringline"
+# An exact SHA, not `main`: the merge base this branch was cut from, so the
+# control cannot silently drift if either main moves under it.
+before_ref = "36f8ac4"
 after_ref  = "fix/518-probe-reaches-send-on-accept-handler"
 cpus       = "2"
 iterations = "100"
