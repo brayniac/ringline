@@ -86,7 +86,16 @@ cd /home/anvil
   cargo --version || { echo "no cargo in the CI image"; exit 1; }
   git clone -q {repo} src && git -C src checkout -q {branch}
   cd src && git log --oneline -1
-  ulimit -n 1000000 || ulimit -n 65536 || true
+  # prlimit, not `ulimit -n`: the builtin cannot raise the soft limit past the
+  # hard one, so asking for 1e6 fails EPERM on these guests (hard is lower) and
+  # `sudo ulimit` is meaningless -- ulimit is a shell builtin and sudo cannot
+  # change the calling shell's limits. `sudo prlimit --pid $$` can, which is what
+  # coalesce-sweep.toml has always done. Echo BOTH limits: the uring test binary
+  # aborts with io_uring_setup EMFILE at a 1024 soft limit, and a reader needs to
+  # see the effective value to know whether a failure was the runtime or the fd
+  # ceiling.
+  sudo prlimit --nofile=1000000 --pid $$ 2>/dev/null || ulimit -n 65536 2>/dev/null || true
+  echo "fd soft=$(ulimit -Sn) hard=$(ulimit -Hn)"
 
   case "{target}" in
     lib) TARGET="-p ringline --lib" ;;
