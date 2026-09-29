@@ -3621,8 +3621,18 @@ fn repro518_instrumented() {
     let sleep_ms = envn("RL518_SLEEP_MS", 300);
     let pool_slots = envn("RL518_POOL_SLOTS", 8);
     let conns = envn("RL518_CONNS", 16);
+    // `RL518_SHUTDOWN=0` makes the handler never call `shutdown_write()`, so no
+    // `Shutdown` SQE is ever submitted. `submit_shutdown` targets the
+    // registered-file slot `Fixed(conn_index)` with a `user_data` payload of 0
+    // — no generation — so one that executes after its slot is recycled shuts
+    // down whichever connection now holds the slot, and the completion cannot
+    // tell. That is the shape of what the instrument measured: a clean FIN on a
+    // live connection, then `EPIPE` on the next send. If the anomalies vanish
+    // here, the shutdown path is implicated; if they persist, it is not.
+    let want_shutdown = envn("RL518_SHUTDOWN", 1) != 0;
+    R518_SHUTDOWN.store(want_shutdown, Ordering::SeqCst);
     eprintln!(
-        "REPRO518 config iters={iters} sleep_ms={sleep_ms} pool_slots={pool_slots} conns={conns}"
+        "REPRO518 config iters={iters} sleep_ms={sleep_ms} pool_slots={pool_slots} conns={conns} shutdown={want_shutdown}"
     );
 
     let mut anomalous = 0usize;
@@ -3634,7 +3644,7 @@ fn repro518_instrumented() {
         }
     }
     eprintln!(
-        "REPRO518 RESULT anomalous={anomalous}/{iters} sleep_ms={sleep_ms} pool_slots={pool_slots} conns={conns}"
+        "REPRO518 RESULT anomalous={anomalous}/{iters} sleep_ms={sleep_ms} pool_slots={pool_slots} conns={conns} shutdown={want_shutdown}"
     );
 }
 
@@ -3696,6 +3706,7 @@ impl Repro518Report {
 }
 
 static R518_SEQ: AtomicU32 = AtomicU32::new(0);
+static R518_SHUTDOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 static R518_FATES: std::sync::Mutex<Vec<SendFate>> = std::sync::Mutex::new(Vec::new());
 
 struct Repro518Handler;
@@ -3719,8 +3730,13 @@ impl AsyncEventHandler for Repro518Handler {
                     }
                 }
             }
-            if err_os.is_none() {
+            if err_os.is_none() && R518_SHUTDOWN.load(Ordering::Relaxed) {
                 conn.shutdown_write();
+                reached_shutdown = true;
+            } else if err_os.is_none() {
+                // No FIN from us: the task ending closes the connection, which
+                // FINs anyway, so the client still sees EOF. What disappears is
+                // every `Shutdown` SQE.
                 reached_shutdown = true;
             }
             if let Ok(mut g) = R518_FATES.lock() {

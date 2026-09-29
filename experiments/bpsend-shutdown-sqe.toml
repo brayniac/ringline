@@ -1,0 +1,150 @@
+# Is the stale `Shutdown` SQE what FINs a live connection? (#518)
+#
+# WHERE THIS PICKS UP. The instrumented sweep (context 01a0eeee) measured, rather
+# than deduced, what the failure is:
+#
+#   baseline        stall 300ms pool 8    8/400
+#   nostall         stall 0     pool 8   21/400
+#   bigpool         stall 300ms pool 64   6/400
+#   nostall-bigpool stall 0     pool 64   4/400
+#   calibration     unmodified test       2/200
+#
+# It fails in ALL FOUR, so neither the 300 ms stall nor a pool small enough to
+# force parking is required. The send-capacity admission FIFO is exonerated.
+# `nostall` is the WORST arm, which is the opposite of a backpressure story.
+#
+# Two facts from the per-round records reframe it:
+#
+#  1. ZERO reader errors, and `sends_ok * 4096 == bytes received` in 79 of 79
+#     accept/reader pairs. Nothing is lost or duplicated: the client saw a CLEAN
+#     FIN after exactly the bytes that succeeded. This is truncation by the
+#     server, not data loss, and the test's assertion message misdescribes it.
+#  2. In 33 of 38 anomalous rounds every failing connection shares ONE `sends_ok`
+#     value, in contiguous accept-order groups (sizes 2, 1, 3, 8, 4). They died on
+#     the same event-loop iteration, not in independent per-connection races.
+#
+# A clean FIN followed by `EPIPE` on the next send is the signature of
+# `shutdown(SHUT_WR)`, and every handler here calls `shutdown_write()` when it
+# finishes its eight sends.
+#
+# THE MECHANISM UNDER TEST. `Ring::submit_shutdown` (backend/uring/ring.rs:756)
+# builds `opcode::Shutdown::new(Fixed(conn_index), SHUT_WR)` with
+# `UserData::encode(OpTag::Shutdown, conn_index, 0)` -- the registered-file slot
+# indexed by connection slot, and a payload of 0 carrying NO generation. io_uring
+# does not order independent SQEs (invariant 2), and every completion must be
+# validated against the connection generation (invariant 3). A `Shutdown` that
+# executes after its slot has been closed and re-registered therefore shuts down
+# whichever connection now occupies the slot, and neither the operation nor its
+# completion can tell. That is exactly a clean FIN on a live connection followed
+# by `EPIPE`.
+#
+# This is a hypothesis about a mechanism, not a conclusion. The arms are built to
+# refute it.
+#
+# ARMS, all at sleep 0 / pool 8 (the strongest-signal configuration, 5.3%), 400
+# rounds each:
+#
+#   withshutdown  conns 16, handler calls shutdown_write   -- POSITIVE CONTROL
+#   noshutdown    conns 16, handler never calls it         -- no Shutdown SQE exists
+#   conns1        conns 1,  handler calls shutdown_write   -- no neighbour within a round
+#
+# PREDICTION, written before the run:
+#
+#   withshutdown ~21/400. If this is clean the sweep is uninterpretable and
+#     nothing else in it may be read -- the lesson from the round where a clean
+#     arm was mistaken for a fix.
+#
+#   noshutdown 0/400 -> the shutdown path is implicated: with no `Shutdown` SQE
+#     submitted at all, the FIN must have been coming from one.
+#   noshutdown still fails -> the shutdown path is NOT the source; the FIN comes
+#     from the close path or from something else, and this hypothesis is dead.
+#
+#   conns1 > 0 -> slot reuse ACROSS rounds is enough, and the victim need not be
+#     a concurrent neighbour. That is the stronger and more alarming form.
+#   conns1 == 0 while withshutdown fails -> it needs a concurrent occupant of a
+#     neighbouring slot, which points at the accept/registration batch rather
+#     than at cross-round recycling.
+#
+# Note what `noshutdown` does NOT change: the handler ending still closes the
+# connection, which FINs, so the client still sees EOF and the test still
+# measures the same thing. Only the `Shutdown` SQE disappears.
+#
+# GATES: the instrument must produce a result line, and the backend must be
+# io_uring (mio has no SQEs and cannot show this).
+name = "shutsqe {arm}"
+
+[matrix]
+context_name = "ringline: is a stale Shutdown SQE FINing live connections? (#518)"
+arm = ["withshutdown", "noshutdown", "conns1"]
+
+[params]
+repo   = "https://github.com/brayniac/ringline"
+branch = "diag/518-epipe-on-early-slots"
+cpus   = "2"
+rounds = "400"
+
+[[jobs]]
+name = "diagnose"
+tags = ["validation"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+shape = "z4.c"
+image = "spool/images/debian-13-ci-20260912.1@golden"
+slots = 1
+memory_gib = 4
+ports = 0
+gpu = false
+payload_timeout = 7200
+artifacts = ["/home/anvil/diag.log"]
+upload = true
+payload = '''
+set -uo pipefail
+cd /home/anvil
+{
+  uname -srm; nproc
+  git clone -q {repo} src || { echo "FATAL: clone failed"; exit 1; }
+  git -C src checkout -q {branch} || { echo "FATAL: no such ref: {branch}"; exit 1; }
+  cd src && git log --oneline -1
+  grep -q "RL518_SHUTDOWN" ringline/tests/echo.rs \
+    || { echo "FATAL: branch lacks the RL518_SHUTDOWN knob"; exit 1; }
+
+  sudo prlimit --nofile=1000000 --pid $$ 2>/dev/null || ulimit -n 65536 2>/dev/null || true
+  echo "fd soft=$(ulimit -Sn) hard=$(ulimit -Hn)"
+
+  cargo build --locked --tests -p ringline 2>&1 | tail -3
+  cargo run --locked -q -p ringline-bench --bin bench-server -- --print-backend > bk.txt 2>/dev/null || true
+  got=$(cat bk.txt 2>/dev/null || echo unknown)
+  [ "$got" = "io_uring" ] || { echo "BACKEND MISMATCH: $got"; exit 1; }
+  echo "backend ok: $got"
+
+  HAVE=$(nproc)
+  CPUS=$(( {cpus} < HAVE ? {cpus} : HAVE ))
+  LIST=$(seq -s, 0 $((CPUS-1)))
+  echo "confining to cpus $LIST (of $HAVE), arm={arm}"
+
+  case "{arm}" in
+    withshutdown) CONNS=16; SHUT=1 ;;
+    noshutdown)   CONNS=16; SHUT=0 ;;
+    conns1)       CONNS=1;  SHUT=1 ;;
+    *) echo "FATAL: unknown arm {arm}"; exit 1 ;;
+  esac
+  echo "arm={arm} conns=$CONNS shutdown=$SHUT sleep=0 pool=8 rounds={rounds}"
+
+  out=$(RL518_ITERS={rounds} RL518_SLEEP_MS=0 RL518_POOL_SLOTS=8 \
+        RL518_CONNS=$CONNS RL518_SHUTDOWN=$SHUT \
+        taskset -c "$LIST" cargo test --locked -q -p ringline --test echo \
+        repro518_instrumented -- --ignored --nocapture --test-threads=1 2>&1)
+  rc=$?
+  echo "$out" | grep -E "^REPRO518" | head -200
+  echo "instrument_rc=$rc"
+  if ! echo "$out" | grep -qE "^test result:"; then
+    echo "INVALID: no test result line -- the instrument did not run"
+    echo "$out" | tail -25
+  fi
+  got=$(echo "$out" | grep -E "^REPRO518 RESULT" | tail -1)
+  [ -z "$got" ] && echo "INVALID: no REPRO518 RESULT line"
+  echo "RESULT arm={arm} cpus=$CPUS conns=$CONNS shut=$SHUT :: $got"
+} 2>&1 | tee /home/anvil/diag.log
+exit 0
+'''
