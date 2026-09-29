@@ -1,0 +1,176 @@
+# Does gating the close on the Shutdown CQE remove the half-close? (#518)
+#
+# THE BUG, established by measurement rather than by reading. Context 01a0eefd,
+# 400 rounds per arm at 2 CPUs:
+#
+#   withshutdown  16 conns, handler calls shutdown_write   49/400
+#   noshutdown    16 conns, handler never calls it          0/400
+#   conns1         1 conn,  handler calls shutdown_write     0/400
+#
+# So the `Shutdown` SQE is necessary, and a *concurrent* second connection is
+# necessary. Every victim showed `sends_ok * 4096 == bytes the client received`
+# with no read error -- a clean FIN, not data loss -- and in 33 of 38 anomalous
+# rounds every victim shared one `sends_ok`, so they were half-closed together on
+# a single event-loop iteration.
+#
+# THE MECHANISM. `Shutdown::new(Fixed(conn_index), SHUT_WR)` names the socket as
+# the registered-file *slot*. Nothing pinned that slot for the op's lifetime: a
+# `Shutdown` is not a queued send, so `try_finalize_close` did not count it, and
+# `OpTag::Shutdown => {}` discarded its completion. io_uring does not order
+# independent SQEs, so the `Close` that frees the slot can complete first, the
+# next accept registers the slot, and the kernel then runs the FIN against that
+# new connection.
+#
+# THE FIX under test: `ConnSendState::shutdown_inflight` holds the close until
+# the `Shutdown` CQE lands, and the SQE carries its generation so a stale
+# completion is rejected and counted as `shutdown_stale`.
+#
+# WHY THIS EXPERIMENT AND NOT CI. Every line of the fix is behind `has_io_uring`,
+# which macOS cannot type-check, so the build, clippy and both new regression
+# tests are unverified until they run on Linux. This job is their first compile.
+#
+# ARMS, paired in one run so the control is measured under the same conditions
+# rather than quoted from an earlier context:
+#
+#   unfixed  the diagnosis branch: instrument, no fix
+#   fixed    this branch: instrument + fix
+#
+# PREDICTION, written before the run:
+#
+#   unfixed  instrumented ~49/400, original test ~2/200
+#   fixed    instrumented 0/400,   original test 0/200,  shutdown_stale = 0
+#
+#   fixed clean and unfixed reproducing -> the mechanism is confirmed and the fix
+#     works. `shutdown_stale` must ALSO be 0: nonzero would mean the gate leaked
+#     and a stale Shutdown still reached a recycled slot, so the fix would be
+#     incomplete even with a clean anomaly count.
+#   both clean -> the rate moved; read nothing from `fixed` (the mistake this
+#     campaign already made once, when a clean arm was taken for a fix).
+#   fixed still failing -> the gate is not sufficient. The remaining suspect is
+#     the immediate submission path in `DriverCtx::shutdown_write` versus the
+#     deferred one in `submit_next_queued`; the log records which.
+#
+# GATES: the io_uring build and clippy must pass (this is their first run), both
+# new regression tests must be present and pass, the backend must be io_uring,
+# and the instrument must emit its RESULT line.
+name = "shutfix {arm}"
+
+[matrix]
+context_name = "ringline: does gating the close on the Shutdown CQE fix #518?"
+arm = ["unfixed", "fixed"]
+
+[params]
+repo        = "https://github.com/brayniac/ringline"
+unfixed_ref = "diag/518-epipe-on-early-slots"
+fixed_ref   = "fix/518-shutdown-sqe-outlives-its-slot"
+cpus        = "2"
+rounds      = "400"
+calib_iters = "200"
+
+[[jobs]]
+name = "verify"
+tags = ["validation"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+shape = "z4.c"
+image = "spool/images/debian-13-ci-20260912.1@golden"
+slots = 1
+memory_gib = 4
+ports = 0
+gpu = false
+payload_timeout = 7200
+artifacts = ["/home/anvil/verify.log"]
+upload = true
+payload = '''
+set -uo pipefail
+cd /home/anvil
+{
+  uname -srm; nproc
+  if [ "{arm}" = "fixed" ]; then REF={fixed_ref}; else REF={unfixed_ref}; fi
+  git clone -q {repo} src || { echo "FATAL: clone failed"; exit 1; }
+  git -C src checkout -q "$REF" || { echo "FATAL: no such ref: $REF"; exit 1; }
+  cd src && git log --oneline -1
+
+  # The arms must differ, and in the direction claimed.
+  if grep -q "shutdown_inflight" ringline/src/handler.rs; then HAS_FIX=yes; else HAS_FIX=no; fi
+  echo "arm={arm} ref=$REF has_fix=$HAS_FIX"
+  if [ "{arm}" = "fixed" ] && [ "$HAS_FIX" != "yes" ]; then
+    echo "FATAL: fixed arm lacks shutdown_inflight; wrong or stale ref"; exit 1
+  fi
+  if [ "{arm}" = "unfixed" ] && [ "$HAS_FIX" = "yes" ]; then
+    echo "FATAL: unfixed arm already carries the fix; the control is void"; exit 1
+  fi
+  grep -q "RL518_SHUTDOWN" ringline/tests/echo.rs \
+    || { echo "FATAL: branch lacks the instrument"; exit 1; }
+
+  sudo prlimit --nofile=1000000 --pid $$ 2>/dev/null || ulimit -n 65536 2>/dev/null || true
+  echo "fd soft=$(ulimit -Sn) hard=$(ulimit -Hn)"
+
+  # FIRST COMPILE of the io_uring path for this change. Not piped into anything
+  # that would swallow the status: a piped cargo reports the pipe's exit code.
+  echo "=== clippy (io_uring) ==="
+  cargo clippy --locked --all-targets -- -D warnings > clippy.txt 2>&1
+  crc=$?
+  tail -20 clippy.txt
+  echo "clippy_rc=$crc"
+  [ "$crc" != "0" ] && { echo "FATAL: io_uring clippy failed"; exit 1; }
+
+  cargo build --locked --tests -p ringline > build.txt 2>&1
+  brc=$?
+  tail -5 build.txt
+  echo "build_rc=$brc"
+  [ "$brc" != "0" ] && { echo "FATAL: io_uring build failed"; exit 1; }
+
+  cargo run --locked -q -p ringline-bench --bin bench-server -- --print-backend > bk.txt 2>/dev/null || true
+  got=$(cat bk.txt 2>/dev/null || echo unknown)
+  [ "$got" = "io_uring" ] || { echo "BACKEND MISMATCH: $got"; exit 1; }
+  echo "backend ok: $got"
+
+  HAVE=$(nproc)
+  CPUS=$(( {cpus} < HAVE ? {cpus} : HAVE ))
+  LIST=$(seq -s, 0 $((CPUS-1)))
+  echo "confining to cpus $LIST (of $HAVE)"
+
+  # The fix's own unit tests, which have never been compiled before this job.
+  if [ "{arm}" = "fixed" ]; then
+    echo "=== regression tests ==="
+    cargo test --locked -p ringline --lib -- shutdown_cqe 2>&1 | tail -12
+    echo "unit_rc=${PIPESTATUS[0]}"
+  fi
+
+  echo "=== instrumented, 16 conns, shutdown on ==="
+  out=$(RL518_ITERS={rounds} RL518_SLEEP_MS=0 RL518_POOL_SLOTS=8 \
+        RL518_CONNS=16 RL518_SHUTDOWN=1 \
+        taskset -c "$LIST" cargo test --locked -q -p ringline --test echo \
+        repro518_instrumented -- --ignored --nocapture --test-threads=1 2>&1)
+  rc=$?
+  echo "$out" | grep -E "^REPRO518" | head -120
+  echo "instrument_rc=$rc"
+  echo "$out" | grep -qE "^test result:" || echo "INVALID: the instrument did not run"
+  inst=$(echo "$out" | grep -E "^REPRO518 RESULT" | tail -1)
+  [ -z "$inst" ] && echo "INVALID: no REPRO518 RESULT line"
+
+  echo "=== the original test, one process per iteration ==="
+  TEST=backpressured_send_waits_for_pool_capacity_without_duplication
+  fails=0; ran=0
+  for i in $(seq 1 {calib_iters}); do
+    o=$(taskset -c "$LIST" cargo test --locked -q -p ringline --test echo "$TEST" -- --test-threads=1 2>&1)
+    r=$?
+    if echo "$o" | grep -qE "^test result:"; then ran=$((ran+1)); else
+      echo "iter $i: NO TEST RESULT LINE"; continue
+    fi
+    if [ "$r" != "0" ]; then
+      fails=$((fails+1))
+      echo "=== orig iter $i rc=$r ==="
+      # `FAILED` and panic lines only: the bare test name also matches the
+      # PASSING result line, which already put a phantom occurrence in an issue.
+      echo "$o" | grep -E "FAILED|panicked|Broken pipe|connection closing|left:|right:" | head -12
+    fi
+  done
+  [ "$ran" != "{calib_iters}" ] && echo "INVALID: only $ran of {calib_iters} ran"
+
+  echo "RESULT arm={arm} cpus=$CPUS :: instrumented[$inst] original[ran=${ran}/{calib_iters} failed=${fails}]"
+} 2>&1 | tee /home/anvil/verify.log
+exit 0
+'''
