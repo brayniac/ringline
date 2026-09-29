@@ -1,0 +1,134 @@
+# Does #518 reproduce on aarch64, with core count held constant?
+#
+# On x86 the race needs a preempted worker: confined to 2 CPUs the test fails
+# 9 times in 200 runs, at 8 CPUs never in 200. A Pi guest boots with exactly
+# 2 vCPU by default, so this holds the reproducing core count fixed and varies
+# only the architecture -- which is the one variable that could expose ordering
+# the x86 memory model hides. aarch64 is weakly ordered where x86 is TSO, so if
+# the race involves an unsynchronised read of connection state, ARM permits
+# reorderings no amount of x86 confinement will produce.
+#
+# WHY A GUEST AND NOT THE BARE PI. Both, eventually, but the guest first: the
+# `debian-13-ci` image carries a Rust toolchain and an sccache pointed at delta,
+# where the bare host has no cargo on PATH at all (probe: `cargo: ABSENT`, though
+# ~/.cargo/bin exists). A cold build of the test binaries on four Cortex-A72
+# cores would cost most of an hour and occupy a Pi for it.
+#
+# The bare host is also a different question: it has 4 cores, and the x86 matrix
+# never tested 4 -- only 2 (fails) and 8 (clean). So "would the Pis have caught
+# this" needs the x86 4-CPU point before a bare-Pi run can be interpreted, and
+# that arm is nearly free. Running it separately.
+#
+# CAVEAT THAT MATTERS FOR THE COMPARISON. anvil sets `sched_fifo = true` on the
+# Pis: vCPU, emulator and I/O threads run under SCHED_FIFO, and a libvirt hook
+# does the same for the vhost tasks. FIFO threads are not preempted by ordinary
+# tasks, so a 2-vCPU Pi guest is NOT scheduling-equivalent to a 2-CPU x86 guest
+# -- the very preemption this race needs may be suppressed. A clean result here
+# therefore does not cleanly mean "aarch64 is immune"; it could mean "FIFO hid
+# it". Recorded now so the null is not over-read later, and the follow-up if it
+# comes back clean is a bare-Pi arm, where the test process is an ordinary
+# SCHED_OTHER task.
+#
+# PREDICTION. Genuinely uncertain, which is why it is worth running: weaker
+# ordering argues for reproducing, SCHED_FIFO argues against, and they pull in
+# opposite directions. A failure is the stronger outcome -- it would say the race
+# is not x86-specific and would hand whoever fixes it an arm64 reproducer.
+#
+# Two reps rather than one because 100 iterations at ~4.5% expects 4-5 failures
+# and a single arm seeing zero is weak evidence either way.
+name = "pi518 rep{rep}"
+
+[matrix]
+context_name = "ringline: does #518 reproduce on aarch64? (Pi guest, 2 vCPU)"
+rep = ["1", "2"]
+
+[params]
+branch     = "main"
+repo       = "https://github.com/ringline-rs/ringline"
+iterations = "100"
+
+[[jobs]]
+name = "repro"
+tags = ["pi4b"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+shape = "a72.c"
+image = "debian-13-ci"
+memory_gib = 4
+gpu = false
+# Four Cortex-A72 cores build this, with sccache against delta. Generous.
+payload_timeout = 7200
+artifacts = ["/home/anvil/repro.log", "/home/anvil/failures.txt"]
+upload = true
+payload = '''
+set -uo pipefail
+cd /home/anvil
+{
+  echo "=== guest ==="
+  uname -srm; nproc; echo "arch=$(uname -m)"
+  # The whole point is that this is 2 vCPU on aarch64. If the shape ever hands
+  # out more, the comparison to the x86 2-CPU arm is void -- say so rather than
+  # quietly reporting a different experiment.
+  HAVE=$(nproc)
+  echo "vcpus=$HAVE"
+  [ "$HAVE" = "2" ] || echo "WARNING: expected 2 vCPU, got $HAVE -- not comparable to the x86 2-CPU arm"
+  case "$(uname -m)" in aarch64|arm64) ;; *) echo "NOT AARCH64 -- wrong host class"; exit 1 ;; esac
+
+  sudo apt-get update -qq 2>/dev/null || true
+  export PATH="$HOME/.cargo/bin:$PATH"
+  cargo --version || { echo "no cargo in the CI image"; exit 1; }
+
+  git clone -q {repo} src && git -C src checkout -q {branch}
+  cd src && git log --oneline -1
+
+  ulimit -n 1000000 || ulimit -n 65536 || true
+  echo "fd soft=$(ulimit -Sn)"
+
+  cargo build --locked --tests -p ringline 2>&1 | tail -3
+  # aarch64 io_uring is the point; a force-mio fallback would test nothing.
+  cargo run --locked -q -p ringline-bench --bin bench-server -- --print-backend > /home/anvil/backend.txt 2>/dev/null || true
+  got=$(cat /home/anvil/backend.txt 2>/dev/null || echo unknown)
+  [ "$got" = "io_uring" ] || { echo "BACKEND MISMATCH: $got"; exit 1; }
+  echo "backend ok: $got on $(uname -m)"
+
+  TEST=backpressured_send_waits_for_pool_capacity_without_duplication
+  fails=0; ran=0
+  : > /home/anvil/failures.txt
+  for i in $(seq 1 {iterations}); do
+    out=$(cargo test --locked -q -p ringline --test echo "$TEST" -- --test-threads=1 --nocapture 2>&1)
+    rc=$?
+    # A filter that matches nothing exits 0 having run nothing, which would read
+    # as "aarch64 is fine" forever.
+    echo "$out" | grep -qE "test result: .* 1 (passed|failed)" || {
+      echo "ITERATION $i did not run exactly one test -- aborting"; echo "$out" | grep "test result:"; exit 1; }
+    ran=$((ran+1))
+    if [ "$rc" != "0" ]; then
+      fails=$((fails+1))
+      { echo "════ iteration $i ════"
+        echo "$out" | grep -nE "panicked at|connection closing|Broken pipe|connection task panicked|assertion|test result:" | head -30
+      } >> /home/anvil/failures.txt
+      echo "iteration $i FAILED (running total $fails)"
+    fi
+  done
+  echo "RESULT arch=$(uname -m) vcpus=$HAVE rep={rep} ran=$ran failed=$fails"
+} 2>&1 | tee /home/anvil/repro.log
+rc=${PIPESTATUS[0]}
+echo "payload_status=$rc" | tee -a /home/anvil/repro.log
+exit 0
+'''
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "stop"
+upload = true
+
+[[jobs.steps]]
+type = "shell"
+command = '''
+grep -q "payload_status=0" repro.log || { echo "payload failed -- read repro.log"; exit 1; }
+grep -q "backend ok: io_uring" repro.log || { echo "backend gate did not pass"; exit 1; }
+grep -qE "RESULT .* ran=[1-9]" repro.log || { echo "no iterations ran"; exit 1; }
+grep -E "^(RESULT |WARNING: )" repro.log
+[ -s failures.txt ] && { echo "--- failures (panic order is the discriminator) ---"; head -30 failures.txt; } || echo "no failures in this arm"
+'''

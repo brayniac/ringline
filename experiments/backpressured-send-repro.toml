@@ -23,6 +23,10 @@
 #   mode=suite  the whole `echo` test binary, which is the parallel context the
 #               failure actually occurred in
 #   cpus=2      taskset to 2 CPUs, approximating a GitHub runner
+#   cpus=4      the Pi's bare core count, and the untested middle: the first
+#               matrix measured 2 (fails, 4.5%) and 8 (clean, 0/200) and left the
+#               threshold between them unknown, which is exactly what "would the
+#               Pis have caught this" turns on
 #   cpus=8      room to breathe, as a control
 #
 #   fails in `alone`  -> points at a genuine lifecycle bug: a parked send
@@ -53,7 +57,7 @@ name = "bpsend s{mode} c{cpus}"
 [matrix]
 context_name = "ringline: does a parked backpressured send really see `connection closing`? (#518)"
 mode = ["alone", "suite"]
-cpus = ["2", "8"]
+cpus = ["2", "4", "8"]
 
 [params]
 branch     = "main"
