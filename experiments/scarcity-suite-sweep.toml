@@ -1,0 +1,148 @@
+# The other flakes under scarcity AND parallel load.
+#
+# The first scarcity sweep confined each test to 2 CPUs and ran it ALONE, filtered
+# to a single test. Nothing reproduced: 0 failures in 400 runs across buffer_ring,
+# chain_guard, quic_fin and prefault, while #518 failed 2/100 in that same
+# condition.
+#
+# That sweep was under-powered, and the omission was mine. For #518, `alone` at 2
+# CPUs gives 2/100 while the whole binary at 2 CPUs gives 7/100 -- parallel load
+# inside the binary triples the rate. Dropping the mode dimension tested the other
+# flakes only in the weaker of the two conditions, so their clean result does not
+# yet mean the lever misses them.
+#
+# So: the same two tests, 2 CPUs, running their WHOLE binary every iteration.
+#
+#   buffer_ring  -p ringline --test echo                 #378, #349
+#   chain_guard  -p ringline --test guard_send_threshold  #513
+#
+# PREDICTION, weaker than last time having already been wrong here once: if the
+# 5 s read-timeout signature these two share really comes from a starved worker,
+# the stronger condition should show it. If they stay clean with the binary fully
+# loaded at 2 CPUs, then scarcity genuinely misses them, #518's race is specific to
+# the backpressured-send path, and the shared timeout value is a coincidence rather
+# than a shared cause -- which matters, because that hypothesis is what #513 was
+# filed on.
+#
+# The gate changes with the mode: suite runs many tests, so "exactly one test ran"
+# no longer applies and the check becomes "a plausible number ran". It guards the
+# same failure -- a wrong target running nothing and exiting 0.
+#
+name = "scarce2 {test} suite"
+
+[matrix]
+context_name = "ringline: the flakes under scarcity AND parallel load (#378 #349 #513)"
+test = ["buffer_ring", "chain_guard"]
+
+[params]
+branch     = "main"
+repo       = "https://github.com/ringline-rs/ringline"
+iterations = "100"
+
+[[jobs]]
+name = "repro"
+tags = ["validation"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+shape = "z4.c"
+image = "spool/images/debian-13-ci-20260912.1@golden"
+slots = 1
+memory_gib = 4
+ports = 0
+gpu = false
+payload_timeout = 7200
+artifacts = ["/home/anvil/repro.log", "/home/anvil/failures.txt"]
+upload = true
+payload = '''
+set -uo pipefail
+cd /home/anvil
+{
+  uname -srm; nproc
+  git clone -q {repo} src && git -C src checkout -q {branch}
+  cd src && git log --oneline -1
+
+  # The uring test binary wants a generous fd limit: at 1024 it aborts with
+  # io_uring_setup(2) EMFILE, which reads as a code failure and is not.
+  ulimit -n 1000000 || ulimit -n 65536 || true
+  echo "fd soft=$(ulimit -Sn)"
+
+  cargo build --locked --tests -p ringline -p ringline-quic 2>&1 | tail -3
+  # GATE 2: a mio build runs something else and would report a clean sweep.
+  cargo run --locked -q -p ringline-bench --bin bench-server -- --print-backend > /home/anvil/backend.txt 2>/dev/null || true
+  got=$(cat /home/anvil/backend.txt 2>/dev/null || echo unknown)
+  [ "$got" = "io_uring" ] || { echo "BACKEND MISMATCH: $got"; exit 1; }
+  echo "backend ok: $got"
+
+  # Each flake lives in a different target, so the filter and the -p/--test pair
+  # travel together. Getting these out of step is the failure that runs zero
+  # tests and reports a clean sweep, which gate 1 below catches.
+  case "{test}" in
+    buffer_ring) TEST=buffer_ring_exhaustion_recovers;            TARGET="-p ringline --test echo" ;;
+    chain_guard) TEST=chain_guard_send_below_threshold_small_gather; TARGET="-p ringline --test guard_send_threshold" ;;
+    quic_fin)    TEST=large_payload_round_trip_via_endpoint_api;  TARGET="-p ringline-quic --test peer" ;;
+    prefault)    TEST=prefault_makes_pages_resident;              TARGET="-p ringline --lib" ;;
+    *) echo "unknown test {test}"; exit 1 ;;
+  esac
+  echo "test=$TEST target=$TARGET"
+  # Clamp to what the guest actually has: asking taskset for cpu 7 on a 4-vCPU
+  # shape fails and would kill the wide arms rather than narrowing them, which
+  # would look like "the wide configuration does not reproduce it".
+  HAVE=$(nproc)
+  CPUS=$(( 2 < HAVE ? 2 : HAVE ))
+  [ "$CPUS" != "2" ] && echo "NOTE: wanted 2 cpus, guest has $HAVE; using $CPUS"
+  LIST=$(seq -s, 0 $((CPUS-1)))
+  echo "confining to cpus $LIST (of $HAVE), test={test}, mode=suite, iters={iterations}"
+
+  fails=0
+  ran=0
+  : > /home/anvil/failures.txt
+  for i in $(seq 1 {iterations}); do
+    out=$(taskset -c "$LIST" cargo test --locked -q $TARGET 2>&1)
+    rc=$?
+    # GATE 1: a filter that matches nothing exits 0 having run nothing, which
+    # would count as a pass forever. Require evidence a result was produced.
+    echo "$out" | grep -qE "test result: (ok|FAILED)" || {
+      echo "ITERATION $i PRODUCED NO TEST RESULT -- filter or build wrong, aborting"
+      echo "$out" | tail -20
+      exit 1
+    }
+    echo "$out" | grep -qE "test result: .* [1-9][0-9]* (passed|failed)" || {
+      echo "ITERATION $i ran no tests -- target wrong, aborting"
+      echo "$out" | grep "test result:"
+      exit 1
+    }
+    ran=$((ran+1))
+    if [ "$rc" != "0" ]; then
+      fails=$((fails+1))
+      {
+        echo "════ iteration $i ════"
+        # The ORDER matters: which panic came first separates a real lifecycle
+        # bug from teardown fallout.
+        echo "$out" | grep -nE "panicked at|connection closing|Broken pipe|connection task panicked|assertion|test result:" | head -30
+      } >> /home/anvil/failures.txt
+      echo "iteration $i FAILED (running total $fails)"
+    fi
+  done
+  echo "RESULT test={test} mode=suite cpus_used=$CPUS of $HAVE ran=$ran failed=$fails"
+} 2>&1 | tee /home/anvil/repro.log
+rc=${PIPESTATUS[0]}
+echo "payload_status=$rc" | tee -a /home/anvil/repro.log
+exit 0
+'''
+
+[[jobs.steps]]
+type = "shell"
+command = '''
+grep -q "payload_status=0" repro.log || { echo "payload failed -- read repro.log"; exit 1; }
+grep -q "backend ok: io_uring" repro.log || { echo "backend gate did not pass"; exit 1; }
+grep -qE "RESULT .* ran=[1-9]" repro.log || { echo "no iterations ran"; exit 1; }
+echo "--- outcome ---"
+grep -E "^RESULT " repro.log
+if [ -s failures.txt ]; then
+  echo "--- first failures (order of panics is the discriminator) ---"
+  head -40 failures.txt
+else
+  echo "no failures in this arm"
+fi
+'''
