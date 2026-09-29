@@ -9,7 +9,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ringline::{
     AsyncEventHandler, ConfigBuilder, ConnCtx, ParseResult, RinglineBuilder, TlsConfig, TlsInfo,
@@ -19,6 +19,49 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, Serve
 // ── Helpers ─────────────────────────────────────────────────────────────
 
 static TEST_SERIALIZE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Read until `buf` is full, **failing when progress stalls** rather than
+/// retrying forever.
+///
+/// `TcpStream::set_read_timeout` surfaces a timed-out read as
+/// `ErrorKind::WouldBlock`, which is indistinguishable from "no data yet". So
+/// a `WouldBlock` arm that retries unconditionally makes the read timeout
+/// **inert**: any stall becomes an unbounded hang instead of a failure. This
+/// file already learned that once — see the `big_send` reader, whose comment
+/// records a six-hour CI hang from the same shape — and this is that fix,
+/// factored out so the remaining readers cannot regress to it.
+///
+/// The budget is *time without progress*, not total time, so a large transfer
+/// on a slow link still succeeds while a genuine stall fails fast. Panics
+/// report how far the read got, which is the number that localises the stall.
+fn read_until_full_or_stalled(
+    stream: &mut impl Read,
+    buf: &mut [u8],
+    stall_budget: Duration,
+    what: &str,
+) -> usize {
+    let want = buf.len();
+    let mut total = 0;
+    let mut last_progress = Instant::now();
+    while total < want {
+        match stream.read(&mut buf[total..]) {
+            Ok(0) => break,
+            Ok(n) => {
+                total += n;
+                last_progress = Instant::now();
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(
+                    last_progress.elapsed() < stall_budget,
+                    "{what}: no progress for {stall_budget:?} at {total}/{want} bytes"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(e) => panic!("{what}: read error at {total}/{want} bytes: {e}"),
+        }
+    }
+    total
+}
 
 fn test_config_builder() -> ConfigBuilder {
     ConfigBuilder::new()
@@ -171,20 +214,12 @@ fn tls_echo_with_external_client() {
     stream.flush().unwrap();
 
     let mut large_buf = vec![0u8; large_msg.len()];
-    let mut total = 0;
-    while total < large_msg.len() {
-        match stream.read(&mut large_buf[total..]) {
-            Ok(0) => break,
-            Ok(n) => total += n,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // rustls::Stream may return WouldBlock if the TLS record
-                // isn't fully available yet; retry after a short delay.
-                std::thread::sleep(Duration::from_millis(10));
-                continue;
-            }
-            Err(e) => panic!("TLS read error (large): {e}"),
-        }
-    }
+    let total = read_until_full_or_stalled(
+        &mut stream,
+        &mut large_buf,
+        Duration::from_secs(30),
+        "large TLS echo",
+    );
     assert_eq!(&large_buf[..total], &large_msg[..], "large echo mismatch");
 
     shutdown.shutdown();
@@ -278,18 +313,12 @@ fn tls_single_send_larger_than_rustls_buffer() {
 
     let expected = big_send_payload();
     let mut buf = vec![0u8; BIG_SEND_SIZE];
-    let mut total = 0;
-    while total < BIG_SEND_SIZE {
-        match stream.read(&mut buf[total..]) {
-            Ok(0) => break,
-            Ok(n) => total += n,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(5));
-                continue;
-            }
-            Err(e) => panic!("TLS read error: {e}"),
-        }
-    }
+    let total = read_until_full_or_stalled(
+        &mut stream,
+        &mut buf,
+        Duration::from_secs(30),
+        "single send larger than the rustls buffer",
+    );
     assert_eq!(total, BIG_SEND_SIZE, "short read");
     assert_eq!(buf, expected, "byte-exact mismatch — chunk reorder or loss");
 
@@ -765,18 +794,12 @@ fn tls_segmented_recv_reassembles_and_eofs() {
         stream.flush().unwrap();
 
         let mut buf = vec![0u8; SIZE];
-        let mut total = 0;
-        while total < SIZE {
-            match stream.read(&mut buf[total..]) {
-                Ok(0) => break,
-                Ok(n) => total += n,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(5));
-                    continue;
-                }
-                Err(e) => panic!("TLS read error: {e}"),
-            }
-        }
+        let total = read_until_full_or_stalled(
+            &mut stream,
+            &mut buf,
+            Duration::from_secs(30),
+            "segmented TLS echo",
+        );
         assert_eq!(total, SIZE, "short read reassembling segmented echo");
         assert_eq!(buf, msg, "segmented TLS echo byte-exact mismatch");
     }
@@ -1077,6 +1100,108 @@ fn tls_tick_close_sends_close_notify() {
          distinguish a clean shutdown from a truncated stream"
     );
 
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
+// ── Segmented recv must adopt bytes that arrived first (#423) ───────────────
+
+/// Installing a segmented reader *after* data has already arrived must still
+/// deliver that data.
+///
+/// `segments()` flips `recv_domain` to `Segmented`; anything received before
+/// that is already in the `RecvAccumulator`, which a segmented reader never
+/// looks at. Without adoption those bytes are invisible forever: the reader
+/// parks, the data sits in the accumulator, and the connection hangs with
+/// every health signal reading normal — ring full, multishot live, no errors.
+///
+/// The production symptom was intermittent (~30% of runs under
+/// `--test-threads=1`) because it depended on whether the handler's first poll
+/// beat the client's data. Sleeping before installing the reader makes the
+/// race deterministic: this test hangs 100% of the time without the fix.
+#[cfg(has_io_uring)]
+struct TlsLateSegmentReader;
+
+#[cfg(has_io_uring)]
+impl AsyncEventHandler for TlsLateSegmentReader {
+    #[allow(clippy::manual_async_fn)]
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            // Let the handshake finish and the client's payload arrive and be
+            // decrypted into the accumulator *before* the reader exists.
+            ringline::sleep(Duration::from_millis(300)).await;
+
+            let mut reader = conn.segments();
+            loop {
+                match reader.next().await {
+                    Ok(Some(seg)) => {
+                        let _ = conn.send_nowait(&seg);
+                    }
+                    Ok(None) => break,
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        TlsLateSegmentReader
+    }
+}
+
+#[cfg(has_io_uring)]
+#[test]
+fn tls_segments_installed_after_data_still_delivers_it() {
+    let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
+
+    let (certs, key) = generate_self_signed();
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let config = test_config_builder()
+        .tls(TlsConfig::new(server_tls_config(certs.clone(), key)))
+        .build()
+        .expect("valid config");
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind(addr.parse().unwrap())
+        .launch::<TlsLateSegmentReader>()
+        .expect("launch failed");
+    wait_for_server(&addr);
+
+    let client_config = client_tls_config(&certs);
+    let server_name: ServerName<'_> = "localhost".try_into().unwrap();
+    let mut tls_conn = rustls::ClientConnection::new(client_config, server_name).unwrap();
+    let mut tcp = TcpStream::connect(&addr).unwrap();
+    tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    tcp.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    // Small enough to sit in the accumulator whole, so a failure is
+    // unambiguously "none of it arrived" rather than a partial stall.
+    let msg: Vec<u8> = (0..4096u32)
+        .map(|i| i.wrapping_mul(2654435761) as u8)
+        .collect();
+    {
+        let mut stream = rustls::Stream::new(&mut tls_conn, &mut tcp);
+        stream.write_all(&msg).unwrap();
+        stream.flush().unwrap();
+
+        let mut buf = vec![0u8; msg.len()];
+        let total = read_until_full_or_stalled(
+            &mut stream,
+            &mut buf,
+            Duration::from_secs(20),
+            "late-installed segment reader",
+        );
+        assert_eq!(
+            total,
+            msg.len(),
+            "bytes that arrived before segments() were stranded in the accumulator"
+        );
+        assert_eq!(buf, msg, "late-installed segmented echo mismatch");
+    }
+
+    let _ = tcp;
     shutdown.shutdown();
     for h in handles {
         h.join().unwrap().unwrap();
