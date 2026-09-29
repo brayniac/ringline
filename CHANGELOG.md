@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.4] - 2026-09-29
+
+A patch release from 0.6.3 carrying two fixes from `main`. The breaking
+changes on `main` since 0.6.3 are not included; they are for 0.7.0.
+
+### Fixed
+
+- A `SendMsgZc` send that completed with an error or a zero result released
+  its send-slab entry at once, but the kernel still posts a notification for
+  it: `IORING_CQE_F_MORE` is set on error (`io_sendrecv_fail`) and on a zero
+  result (`io_sendmsg_zc`). If the next send reused the entry first, the late
+  notification decremented the new send's count -- a "notification underflow"
+  panic in debug, and in release an entry that wraps or is released while the
+  kernel may still hold the new send's pages. Notifications are now expected
+  exactly when the main CQE carries `IORING_CQE_F_MORE` (#487, #488).
+
+- A standalone task that ran to completion leaked its task-slab slot, so
+  after `standalone_task_capacity` completions `spawn()` returned `None` for
+  the life of the worker, and callers fell back to running work inline on
+  the event loop. A slot now reads as polling, not empty, while its future
+  is out, so `remove()` frees a finished task's slot and stays idempotent
+  for one that never had a task (#478).
+
 ## [0.6.3] - 2026-09-09
 
 ### Fixed

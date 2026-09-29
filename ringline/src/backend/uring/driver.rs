@@ -1915,7 +1915,7 @@ impl Driver {
             }
 
             for i in 0..self.cqe_batch.len() {
-                let (user_data_raw, result, flags) = self.cqe_batch[i];
+                let (user_data_raw, _, flags) = self.cqe_batch[i];
                 let ud = UserData(user_data_raw);
                 let tag = match ud.tag() {
                     Some(t) => t,
@@ -1945,10 +1945,10 @@ impl Driver {
                                 }
                             }
                         } else {
-                            // Only expect a ZC notification when result > 0.
-                            // On error/zero, no notification arrives — incrementing
-                            // would permanently leak the slab entry.
-                            if result > 0 {
+                            // A notification follows exactly when the main CQE
+                            // carries IORING_CQE_F_MORE, error and zero results
+                            // included (#487).
+                            if cqueue::more(flags) {
                                 self.send_slab.inc_pending_notifs(slab_idx);
                             }
                             self.send_slab.mark_awaiting_notifications(slab_idx);
