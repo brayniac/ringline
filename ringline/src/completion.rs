@@ -139,6 +139,97 @@ impl OpTag {
             _ => None,
         }
     }
+
+    /// Stable metric label for this tag.
+    ///
+    /// Paired with `from_u8` so the per-tag completion counters
+    /// (`metrics::CQE_BY_TAG`) can be registered by walking the discriminant
+    /// space: the names come from the enum rather than a parallel table that
+    /// could drift out of step with it. `snake_case` because these become
+    /// metric `op` labels.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OpTag::RecvMulti => "recv_multi",
+            OpTag::Send => "send",
+            OpTag::SendMsgZc => "send_msg_zc",
+            OpTag::Close => "close",
+            OpTag::Shutdown => "shutdown",
+            OpTag::EventFdRead => "event_fd_read",
+            OpTag::TlsSend => "tls_send",
+            OpTag::Connect => "connect",
+            OpTag::Timeout => "timeout",
+            OpTag::Cancel => "cancel",
+            OpTag::TickTimeout => "tick_timeout",
+            OpTag::Timer => "timer",
+            OpTag::RecvMsgUdp => "recv_msg_udp",
+            OpTag::SendMsgUdp => "send_msg_udp",
+            OpTag::NvmeCmd => "nvme_cmd",
+            OpTag::DirectIo => "direct_io",
+            #[cfg(feature = "timestamps")]
+            OpTag::RecvMsgMultiTs => "recv_msg_multi_ts",
+            OpTag::Fs => "fs",
+            OpTag::PidfdPoll => "pidfd_poll",
+            OpTag::SendRecvBuf => "send_recv_buf",
+            OpTag::SendPollOut => "send_poll_out",
+            OpTag::RecvUdp => "recv_udp",
+            OpTag::SendUdp => "send_udp",
+            OpTag::SendMsgCoalesced => "send_msg_coalesced",
+            OpTag::SendMsgCoalescedPollOut => "send_msg_coalesced_poll_out",
+            OpTag::SendRecvBufsCoalesced => "send_recv_bufs_coalesced",
+            OpTag::SendRecvBufsCoalescedPollOut => "send_recv_bufs_coalesced_poll_out",
+            OpTag::RecvFallback => "recv_fallback",
+            OpTag::ForwardWrite => "forward_write",
+            OpTag::ForwardWritePollOut => "forward_write_poll_out",
+            OpTag::AcceptMulti => "accept_multi",
+            OpTag::ParkInstall => "park_install",
+        }
+    }
+}
+
+#[cfg(test)]
+mod optag_label_tests {
+    use super::OpTag;
+
+    /// Every discriminant `from_u8` accepts must have a label, and no two tags
+    /// may share one — a duplicate would silently merge two counters into one
+    /// and read as "that operation never happened".
+    #[test]
+    fn labels_are_total_and_unique() {
+        let mut seen = std::collections::HashMap::new();
+        for v in 0..=u8::MAX {
+            let Some(tag) = OpTag::from_u8(v) else {
+                continue;
+            };
+            let label = tag.as_str();
+            assert!(!label.is_empty(), "{tag:?} has an empty label");
+            if let Some(prev) = seen.insert(label, tag) {
+                panic!("{tag:?} and {prev:?} share the label {label:?}");
+            }
+        }
+        // Sanity: the walk found the tags, rather than silently finding none.
+        assert!(
+            seen.len() >= 30,
+            "expected the full tag set, found {}",
+            seen.len()
+        );
+    }
+
+    /// The label is the metric `op` value, so it must stay shell- and
+    /// PromQL-safe: lowercase, digits and underscore only.
+    #[test]
+    fn labels_are_snake_case() {
+        for v in 0..=u8::MAX {
+            let Some(tag) = OpTag::from_u8(v) else {
+                continue;
+            };
+            let l = tag.as_str();
+            assert!(
+                l.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b == b'_' || b.is_ascii_digit()),
+                "{tag:?} label {l:?} is not snake_case"
+            );
+        }
+    }
 }
 
 /// Encoded user_data for io_uring CQE identification.
