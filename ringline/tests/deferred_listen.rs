@@ -33,31 +33,6 @@ fn test_config() -> Config {
         .expect("valid config")
 }
 
-/// Ports come from below the ephemeral range so the kernel never hands one out
-/// from under the test. Same reasoning as `ringline-ping/tests/round_trip.rs`
-/// (#431); duplicated because the test crates share no helper module.
-fn free_port() -> u16 {
-    use std::sync::Mutex;
-    static CLAIMED: Mutex<Option<std::collections::HashSet<u16>>> = Mutex::new(None);
-    const BASE: u16 = 20_000;
-    const SPAN: u16 = 10_000;
-
-    let stride = ((std::process::id() % 40) as u16).saturating_mul(250);
-    for step in 0..SPAN {
-        let port = BASE + (stride + step) % SPAN;
-        {
-            let mut guard = CLAIMED.lock().unwrap();
-            if !guard.get_or_insert_with(Default::default).insert(port) {
-                continue;
-            }
-        }
-        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
-            return port;
-        }
-    }
-    panic!("no free port in the test range {BASE}..{}", BASE + SPAN);
-}
-
 /// Connect and read the server's greeting. `Ok(())` means the listener served.
 fn probe(addr: SocketAddr) -> std::io::Result<()> {
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
@@ -163,14 +138,19 @@ impl AsyncEventHandler for ReleaseOnCue {
 
 #[test]
 fn a_gated_listener_refuses_until_the_handler_releases_it() {
-    let port = free_port();
-    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-
+    // Port 0, resolved after launch. `free_port`-style probing binds a socket
+    // and drops it before the runtime binds, and another test binary can take
+    // the port in that window — which is how this file first made
+    // `throughput.rs` fail with `AddrInUse`. Letting the kernel choose leaves
+    // no window: the runtime holds the port from `bind(2)` onward.
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr)
+        .bind("127.0.0.1:0".parse().unwrap())
         .defer_listen()
         .launch::<ReleaseOnCue>()
         .expect("launch");
+    let addr = shutdown
+        .bound_addr_of(ListenerId::from_index(0))
+        .expect("bound address");
 
     // The port is held — nothing else can bind it — but not listening.
     assert!(
@@ -211,13 +191,13 @@ fn a_gated_listener_refuses_until_the_handler_releases_it() {
 /// test above would be measuring a broken launch rather than a working gate.
 #[test]
 fn an_ungated_listener_serves_as_soon_as_launch_returns() {
-    let port = free_port();
-    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr)
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<Greeter>()
         .expect("launch");
+    let addr = shutdown
+        .bound_addr_of(ListenerId::from_index(0))
+        .expect("bound address");
 
     probe(addr).expect("an ungated listener must serve immediately");
 
@@ -231,18 +211,19 @@ fn an_ungated_listener_serves_as_soon_as_launch_returns() {
 
 #[test]
 fn defer_listen_applies_to_one_listener_not_the_process() {
-    let open_port = free_port();
-    let gated_port = free_port();
-    let open_addr: SocketAddr = format!("127.0.0.1:{open_port}").parse().unwrap();
-    let gated_addr: SocketAddr = format!("127.0.0.1:{gated_port}").parse().unwrap();
-
     // The health-port case: one listener serving at once, one held back.
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(open_addr)
-        .bind(gated_addr)
+        .bind("127.0.0.1:0".parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .defer_listen()
         .launch::<Greeter>()
         .expect("launch");
+    let open_addr = shutdown
+        .bound_addr_of(ListenerId::from_index(0))
+        .expect("bound address 0");
+    let gated_addr = shutdown
+        .bound_addr_of(ListenerId::from_index(1))
+        .expect("bound address 1");
 
     probe(open_addr).expect("the ungated listener must serve");
     assert_not_served(gated_addr, "the gated listener");
@@ -290,14 +271,14 @@ fn a_gated_listener_resolves_its_zero_port() {
 /// is covered by `acceptor::tests::a_gated_acceptor_exits_on_shutdown`.
 #[test]
 fn shutdown_terminates_a_listener_that_was_never_released() {
-    let port = free_port();
-    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr)
+        .bind("127.0.0.1:0".parse().unwrap())
         .defer_listen()
         .launch::<Greeter>()
         .expect("launch");
+    let addr = shutdown
+        .bound_addr_of(ListenerId::from_index(0))
+        .expect("bound address");
 
     assert_not_served(addr, "before shutdown");
     shutdown.shutdown();
