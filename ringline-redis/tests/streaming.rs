@@ -747,6 +747,7 @@ async fn run_pool_stream(addr: SocketAddr) -> Result<(), String> {
         .client()
         .await
         .map_err(|e| format!("pool client after poison: {e}"))?;
+    let reconnected = client.token();
     let after_poison = client
         .get_stream(b"stream:small")
         .await
@@ -758,14 +759,21 @@ async fn run_pool_stream(addr: SocketAddr) -> Result<(), String> {
     if after_poison.as_ref() != SMALL {
         return Err("pool desync after poison-evict-reconnect".into());
     }
+    // The pool has one slot. The guard has to go back before the next
+    // checkout, or that checkout is `PoolExhausted`.
+    drop(client);
 
     // A second op on the reconnected slot confirms steady-state reuse (a large
     // value, so any residual desync from the abandoned poison read would surface
     // as a mismatch).
-    let again = pool
+    let mut client = pool
         .client()
         .await
-        .map_err(|e| format!("pool client 2: {e}"))?
+        .map_err(|e| format!("pool client 2: {e}"))?;
+    if client.token() != reconnected {
+        return Err("the second checkout did not reuse the reconnected slot".into());
+    }
+    let again = client
         .get(b"stream:large")
         .await
         .map_err(|e| format!("pool get large after poison: {e}"))?
