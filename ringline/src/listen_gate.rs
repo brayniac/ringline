@@ -31,7 +31,7 @@ use crate::handler::ListenerId;
 /// The listen gates for one runtime, one entry per `bind*()` call.
 pub(crate) struct ListenGates {
     /// Whether each listener has begun listening. Published separately from
-    /// `inner` so a worker can read it on its hot path without the lock.
+    /// `inner` so `wait_open` can check it without the lock.
     open: Vec<AtomicBool>,
     inner: Mutex<GateInner>,
     /// Signalled when a gate opens and when the runtime shuts down. Pool-mode
@@ -209,9 +209,10 @@ impl ListenGates {
 
 /// `listen(2)` every socket of one listener, then mark it listened.
 ///
-/// All of them listen or none does: a partial listen would leave a
-/// merged-mode worker unserved with no later trigger, since a gate only rises
-/// once.
+/// Marks the listener listened only if every socket listened. On a failure the
+/// sockets before it stay listening and the gate stays closed; a retry calls
+/// `listen(2)` on all of them again, which Linux accepts on a socket that is
+/// already listening.
 fn listen_all(inner: &mut GateInner, idx: usize) -> io::Result<()> {
     let backlog = inner.backlog;
     for &fd in &inner.fds[idx] {
@@ -219,9 +220,12 @@ fn listen_all(inner: &mut GateInner, idx: usize) -> io::Result<()> {
         // reserved. It must be set again here: Linux re-runs the port conflict
         // check in `listen(2)` with the socket's current flag, and without it
         // a TIME_WAIT connection left by a previous instance on this port
-        // fails the listen with EADDRINUSE. A competitor cannot bind in
-        // between, because the flag was clear until this line. No effect on
-        // Unix sockets, and merged-mode sockets already have it set.
+        // fails the listen with EADDRINUSE. Between this call and `listen(2)`
+        // another SO_REUSEADDR socket can bind the port, but this socket
+        // listens first and the other's `listen(2)` then fails with
+        // EADDRINUSE. No effect on Unix sockets, and merged-mode sockets
+        // already have it set. A failure here is not checked: the `listen(2)`
+        // below reports any consequence.
         let reuse: libc::c_int = 1;
         unsafe {
             libc::setsockopt(
@@ -233,15 +237,7 @@ fn listen_all(inner: &mut GateInner, idx: usize) -> io::Result<()> {
             );
         }
         if unsafe { libc::listen(fd, backlog) } < 0 {
-            // Name the syscall. `bind(2)` and `listen(2)` both report
-            // EADDRINUSE, and a launch failure that does not say which one it
-            // came from does not say whether the port was taken before this
-            // listener bound it or between its bind and its listen.
-            let err = io::Error::last_os_error();
-            return Err(io::Error::new(
-                err.kind(),
-                format!("listen(2) on listener {idx}: {err}"),
-            ));
+            return Err(io::Error::last_os_error());
         }
     }
     inner.listened[idx] = true;
@@ -255,7 +251,7 @@ thread_local! {
     static GATES: RefCell<Option<Arc<ListenGates>>> = const { RefCell::new(None) };
 }
 
-/// Make the gates reachable from tasks on this worker.
+/// Make the gates reachable from any code on this worker thread.
 pub(crate) fn install(gates: Arc<ListenGates>) {
     GATES.with(|g| *g.borrow_mut() = Some(gates));
 }
@@ -270,6 +266,10 @@ fn with_gates<R>(f: impl FnOnce(&ListenGates) -> R) -> Option<R> {
 /// is bound but not listening, so a TCP readiness probe fails: on Linux the
 /// peer is refused, on macOS and the BSDs it times out.
 ///
+/// The listener is opened for every worker by the first call, from whichever
+/// worker makes it. To wait for warmup on every worker, count completions and
+/// call this from the last worker to finish.
+///
 /// Calling it for a listener that is already listening returns `Ok(())` and
 /// does nothing. A listener that was never deferred is already listening, so
 /// passing the wrong index returns `Ok(())` and leaves the deferred listener
@@ -281,6 +281,10 @@ fn with_gates<R>(f: impl FnOnce(&ListenGates) -> R) -> Option<R> {
 /// `listener` names no listener, if the runtime is shutting down, or if
 /// `listen(2)` itself fails. A `listen(2)` failure leaves the gate closed, so
 /// the call can be retried.
+///
+/// If called before `launch()` has bound the listener, which is possible from
+/// `on_start`, the call returns `Ok(())` and `launch()` performs the
+/// `listen(2)` and returns its error.
 ///
 /// ```no_run
 /// # use std::future::Future;
@@ -518,7 +522,24 @@ mod tests {
         let _ = client.read(&mut [0u8; 1]);
         drop(client);
         drop(listener);
+        #[cfg(target_os = "linux")]
+        assert!(
+            has_time_wait(port),
+            "no TIME_WAIT connection formed on port {port}"
+        );
         port
+    }
+
+    /// Whether `/proc/net/tcp` lists a TIME_WAIT (state `06`) socket whose
+    /// local port is `port`.
+    #[cfg(target_os = "linux")]
+    fn has_time_wait(port: u16) -> bool {
+        let table = std::fs::read_to_string("/proc/net/tcp").expect("read /proc/net/tcp");
+        let local = format!(":{port:04X}");
+        table.lines().skip(1).any(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            fields.len() > 3 && fields[1].ends_with(&local) && fields[3] == "06"
+        })
     }
 
     /// A restart on a port that still has TIME_WAIT connections from the
@@ -566,11 +587,17 @@ mod tests {
             );
         }
         let ret = unsafe { libc::bind(other, &storage as *const _ as *const libc::sockaddr, len) };
+        let err = io::Error::last_os_error();
         unsafe {
             libc::close(other);
             libc::close(fd);
         }
         assert!(ret < 0, "a second bind succeeded on a held listener's port");
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::EADDRINUSE),
+            "the second bind failed for a reason other than the port being held: {err}"
+        );
     }
 
     #[test]

@@ -153,7 +153,9 @@ impl ListenerId {
     ///
     /// Ids follow call order, so a caller that bound in a known order can name
     /// a listener before any connection has arrived, for example to pass to
-    /// [`begin_listening`](crate::begin_listening).
+    /// [`begin_listening`](crate::begin_listening). Ids are per runtime: in a
+    /// process running more than one, an id names the listener at that index
+    /// in the runtime of the worker that uses it.
     pub fn from_index(index: u32) -> Self {
         ListenerId(index)
     }

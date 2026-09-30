@@ -49,10 +49,10 @@ fn probe(addr: SocketAddr) -> std::io::Result<()> {
 /// than "any error".
 ///
 /// Linux answers a SYN to a bound, non-listening port with RST, so the peer is
-/// refused immediately. Darwin drops the SYN, so the peer times out. Measured on Darwin 25.6 with
-/// no ringline involved: a socket bound without `listen` times out, an unbound
-/// port on the same host is refused, and the same socket connects once it
-/// listens. The Linux half of this claim is asserted here so CI checks it.
+/// refused immediately. Darwin drops the SYN, so the peer times out. Measured
+/// on Darwin 25.6 with no ringline involved: a socket bound without `listen`
+/// times out, an unbound port on the same host is refused, and the same socket
+/// connects once it listens. The Linux half of this claim is asserted here so CI checks it.
 fn assert_not_served(addr: SocketAddr, context: &str) {
     match TcpStream::connect_timeout(&addr, NOT_SERVED_TIMEOUT) {
         Ok(_) => panic!("{context}: connect succeeded on a listener that has not been released"),
@@ -137,9 +137,8 @@ impl AsyncEventHandler for ReleaseOnCue {
 fn a_gated_listener_refuses_until_the_handler_releases_it() {
     // Port 0, resolved after launch. `free_port`-style probing binds a socket
     // and drops it before the runtime binds, and another test binary can take
-    // the port in that window — which is how this file first made
-    // `throughput.rs` fail with `AddrInUse`. Letting the kernel choose leaves
-    // no window: the runtime holds the port from `bind(2)` onward.
+    // the port in that window. Letting the kernel choose leaves no window: the
+    // runtime holds the port from `bind(2)` onward.
     let (shutdown, handles) = RinglineBuilder::new(test_config())
         .bind("127.0.0.1:0".parse().unwrap())
         .defer_listen()
@@ -264,8 +263,9 @@ fn a_gated_listener_resolves_its_zero_port() {
 /// the worker handles, and the listen fd is closed either way — verified by
 /// mutation: removing `ShutdownHandle::shutdown`'s call to
 /// `ListenGates::shutdown` leaves this test green. What that call prevents is
-/// a stranded thread, and no observable API state reflects it. The mechanism
-/// is covered by `acceptor::tests::a_gated_acceptor_exits_on_shutdown`.
+/// a stranded acceptor thread, which this test does not observe. The mechanism
+/// is covered by `acceptor::tests::a_gated_acceptor_exits_on_shutdown`, and a
+/// stranded thread after a failed launch by `deferred_listen_rollback.rs`.
 #[test]
 fn shutdown_terminates_a_listener_that_was_never_released() {
     let (shutdown, handles) = RinglineBuilder::new(test_config())
@@ -293,7 +293,7 @@ fn shutdown_terminates_a_listener_that_was_never_released() {
     }
     assert!(
         joiner.is_finished(),
-        "shutdown did not release the acceptor parked on an unopened gate"
+        "workers did not join within 5s of shutdown"
     );
     joiner.join().expect("joiner panicked");
 }
@@ -318,7 +318,7 @@ fn defer_listen_before_any_bind_is_a_launch_error() {
     }
 }
 
-// ── A1 reproduction: release on the first poll of on_start ──────────────
+// ── Release on the first poll of on_start ───────────────────────────────
 
 static EAGER_RESULT: OnceLock<String> = OnceLock::new();
 
@@ -351,6 +351,12 @@ impl AsyncEventHandler for ReleaseImmediately {
     }
 }
 
+/// A handler that releases on the first poll of `on_start` still serves.
+///
+/// `on_start` usually runs after `launch()` has registered the listener, so
+/// this test covers the release-before-registration path only when that race
+/// goes the other way. The deterministic check is the unit test
+/// `listen_gate::tests::a_gate_released_before_registration_listens_when_it_registers`.
 #[test]
 fn releasing_on_the_first_poll_still_serves() {
     let (shutdown, handles) = RinglineBuilder::new(test_config())
@@ -377,6 +383,83 @@ fn releasing_on_the_first_poll_still_serves() {
          (begin_listening said {:?})",
         EAGER_RESULT.get()
     );
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().expect("worker panicked").expect("worker error");
+    }
+}
+
+// ── One worker's call opens the listener for all of them ────────────────
+
+static ACCEPTED_ON: [AtomicBool; 2] = [AtomicBool::new(false), AtomicBool::new(false)];
+
+/// Only worker 1 releases the gate; worker 0 never calls `begin_listening`.
+struct ReleaseFromWorkerOne {
+    worker: usize,
+}
+
+impl AsyncEventHandler for ReleaseFromWorkerOne {
+    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
+        let worker = self.worker;
+        async move {
+            ACCEPTED_ON[worker].store(true, Ordering::Release);
+            let (mut tx, _rx) = conn.split();
+            let _ = tx.send_nowait(b"ok");
+            let _ = ringline::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        if self.worker != 1 {
+            return None;
+        }
+        Some(Box::pin(async {
+            ringline::begin_listening(ListenerId::from_index(0)).expect("begin_listening");
+        }))
+    }
+
+    fn create_for_worker(worker: usize) -> Self {
+        ReleaseFromWorkerOne { worker }
+    }
+}
+
+/// The first `begin_listening` call opens the listener for every worker, so
+/// connections reach a worker that never called it.
+#[test]
+fn one_workers_release_opens_the_listener_for_every_worker() {
+    let config = ConfigBuilder::new()
+        .workers(2)
+        .pin_to_core(false)
+        .sq_entries(64)
+        .recv_buffer(16, 1024)
+        .max_connections(16)
+        .send_pool(16, 16384)
+        .build()
+        .expect("valid config");
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind("127.0.0.1:0".parse().unwrap())
+        .defer_listen()
+        .launch::<ReleaseFromWorkerOne>()
+        .expect("launch");
+    let addr = shutdown
+        .bound_addr_of(ListenerId::from_index(0))
+        .expect("bound address");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while probe(addr).is_err() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // The acceptor hands connections to workers in turn, so a few more
+    // connections reach both.
+    for _ in 0..4 {
+        probe(addr).expect("every connection is served once the gate is open");
+    }
+    assert!(
+        ACCEPTED_ON[0].load(Ordering::Acquire),
+        "worker 0 never accepted, though it shares the opened listener"
+    );
+    assert!(ACCEPTED_ON[1].load(Ordering::Acquire));
 
     shutdown.shutdown();
     for h in handles {

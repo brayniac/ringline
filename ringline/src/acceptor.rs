@@ -103,7 +103,8 @@ pub fn run_acceptor(config: AcceptorConfig) {
 
     // Wait for this listener's gate. It is already open unless the caller
     // asked for a deferred listen, in which case the socket is bound and not
-    // listening, and `accept4` on it would fail with EINVAL forever.
+    // listening, and `accept4` on it would fail with EINVAL, and the acceptor
+    // would exit.
     //
     // A `false` return is shutdown, and the listen fd may already be closed,
     // so the thread returns without touching it.
@@ -286,7 +287,10 @@ mod tests {
         use std::sync::atomic::AtomicBool;
 
         let gates = crate::listen_gate::ListenGates::new(1, 128);
-        // Bound, not listening — the state a deferred listener launches in.
+        // `TcpListener::bind` listens, so an acceptor that skipped the gate
+        // would block in `accept4` rather than exit. The assertions below
+        // separate the two: a gated acceptor exits on `gates.shutdown()`, one
+        // blocked in `accept4` does not.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let (tx, _rx) = crossbeam_channel::bounded::<AcceptedConn>(1);
 
@@ -309,7 +313,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(30));
         assert!(
             !handle.is_finished(),
-            "the acceptor must wait rather than accept on a socket that is not listening"
+            "the acceptor exited before the gate opened or shut"
         );
 
         gates.shutdown();

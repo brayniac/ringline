@@ -113,8 +113,8 @@ pub trait AsyncEventHandler: Send + 'static {
     ///
     /// The task is spawned before the event loop's first iteration and then
     /// runs concurrently with everything else on the worker, including
-    /// accepting connections. It is not a readiness gate: a bound listener
-    /// is already serving while this future runs. To hold a port until the
+    /// accepting connections. It is not a readiness gate: a listener that was
+    /// not deferred is already serving while this future runs. To hold a port until the
     /// server can serve, bind it with
     /// [`RinglineBuilder::defer_listen`](crate::RinglineBuilder::defer_listen)
     /// and call [`begin_listening()`](crate::begin_listening) from here.

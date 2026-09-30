@@ -333,8 +333,14 @@ accepted connection closing first, 5 trials per row:
 | cleared after bind, **set again just before listen** | `EADDRINUSE` ×5 | ok ×5 |
 
 The third row is the fix: `listen_all` sets the flag immediately before
-`listen(2)`. The port stays reserved while the listener is held, and a
-competitor cannot bind in the gap, since the flag was clear until then.
+`listen(2)`. The port stays reserved while the listener is held. In the gap
+between setting the flag and `listen(2)`, a competing `SO_REUSEADDR` socket
+**can** bind: measured, it binds, ours listens, and its `listen` fails
+`EADDRINUSE`. So the gap cannot produce two listeners. This entry first said
+a competitor could not bind there, reasoned from "the flag was clear until
+then", which forgets that the flag is set again one line before the listen.
+An adversarial review found it; the same wrong sentence is in the `deae091`
+commit message, which cannot be corrected in place.
 `a_listener_listens_over_a_time_wait_connection` and
 `a_held_listener_reserves_its_port` pin the two halves, and each fails when its
 half of the fix is removed.
@@ -342,3 +348,41 @@ half of the fix is removed.
 The same lesson as the previous entry: "it costs nothing" was reasoned, not
 measured, and the table that justified the change did not include the case
 the flag exists for.
+
+## Second adversarial review: decisions
+
+Two independent reviews of `deae091` agreed on one blocking bug. A `launch()`
+that failed after a deferred listener's acceptor had started closed the
+listeners and joined the workers, but did not shut the gates. The acceptor
+stayed parked in `wait_open` for the life of the process, and a
+`begin_listening` during the rollback could `listen(2)` a closed fd number.
+All three failure paths now shut the gates first, as `ShutdownHandle::shutdown`
+does. `tests/deferred_listen_rollback.rs` counts `ringline-accept` threads in
+`/proc/self/task`; it failed before the fix (one thread alive after 5 s) and
+passes after it. It is its own test binary so other tests' acceptors are not
+counted.
+
+Two findings were owner decisions:
+
+- **Errors keep the raw errno; the syscall name is gone.** Naming the syscall
+  (`bind(2) on …`, `listen(2) on listener N`) wrapped the error with
+  `io::Error::new`, which sets `raw_os_error()` to `None`. A caller matching
+  on the errno could no longer do so. The name existed to tell the
+  `AddrInUse` flake's two candidate causes apart, and it did (see above). The
+  errno matters more to callers.
+- **`begin_listening` opens on the first call, and a barrier is the caller's
+  job.** `on_start` runs on every worker, so with per-worker warmup the first
+  worker to finish opens the listener for all of them, and the acceptor then
+  hands connections to workers still warming up. Counting calls until every
+  worker has asked was rejected: a call that does nothing until a hidden
+  barrier is met is surprising, and a handler that calls from one worker would
+  never open. The docs now say the first call opens the listener for every
+  worker, and give the pattern: count completions and call from the last
+  worker. `one_workers_release_opens_the_listener_for_every_worker` pins the
+  first-call behaviour with two workers, which no test covered before.
+
+Still open from the review: `begin_listening` works only on a worker thread,
+so warmup that finishes on another thread needs a flag the handler polls, and
+`defer_listen()` refuses a deferred Unix listener in merged mode, which has an
+acceptor thread and would likely work. The second belongs with merged-mode
+support.

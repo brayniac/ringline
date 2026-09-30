@@ -40,7 +40,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   says so and points to `defer_listen` for a readiness gate. No behaviour
   change (#534).
 
-
 - **Breaking:** `connect` and `connect_unix` return builders that resolve to an
   owned `Connection`. `connect_with_timeout`, `connect_tls`,
   `connect_tls_with_timeout`, and the `connect*` methods on `ConnCtx`,
