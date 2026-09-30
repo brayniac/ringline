@@ -1,0 +1,131 @@
+# Does the deferred-listen gate hold on io_uring? (#534, PR #537)
+#
+# WHY THIS EXISTS. Everything in #537 was developed on macOS, which is always
+# the mio backend. Two things here cannot be checked locally at all:
+#
+#   1. The io_uring path does not type-check on macOS, and this change touches
+#      `worker.rs` launch ordering, which both backends share.
+#   2. The peer's experience of a bound, non-listening port is
+#      platform-specific. Measured on Darwin: the SYN is dropped and the peer
+#      times out. Linux is expected to answer with RST, so the peer is refused.
+#      `tests/deferred_listen.rs` asserts `ConnectionRefused` specifically
+#      under `cfg(target_os = "linux")`, and that branch has never executed on
+#      the development machine. This job is the first time it runs.
+#
+# ON THE PIS, not hv01/hv02. Those two are the hypervisors every two-machine
+# measurement runs on, so a cargo build there lands CPU load on a measurement
+# host and silently perturbs whatever is in flight. Per CLAUDE.md: submit an
+# experiment, never ssh to a rig host.
+#
+# WHAT IT RUNS, driven from CLAUDE.md's gate list plus the one CI gate that
+# list omits (`doc-diagrams --check`, which already caught a drifted claim in
+# this change):
+#
+#   1. clippy --all-targets -D warnings              (io_uring-only lints)
+#   2. clippy --all-targets --features tls-unbuffered
+#   3. cargo build --examples
+#   4. cargo test --all
+#   5. RUSTDOCFLAGS=-D warnings cargo doc --all-features
+#   6. cargo run -p doc-diagrams -- --check
+#
+# PREDICTION: all six pass. A failure in 4 naming `deferred_listen` is the
+# interesting outcome: either Linux does not RST a bound, non-listening port
+# (which would mean the feature's readiness story is weaker than stated and
+# the docs need correcting again), or the acceptor gate behaves differently
+# when the acceptor is racing a real io_uring worker. Either wants
+# investigation rather than a patch.
+#
+# GATES: the backend must actually be io_uring — a `force-mio` build would
+# report a clean sweep for the wrong reason. And the uring test binary needs a
+# generous RLIMIT_NOFILE: at 1024 it aborts with io_uring_setup EMFILE, which
+# reads as a code failure and is not.
+name = "deferred-listen-verify {branch}"
+
+[matrix]
+context_name = "ringline: does the deferred-listen gate hold on io_uring? (#534)"
+branch = ["feat/deferred-listen"]
+
+[params]
+repo = "https://github.com/brayniac/ringline"
+
+[[jobs]]
+name = "verify"
+tags = ["pi4b"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+shape = "a72.c"
+image = "debian-13-ci"
+memory_gib = 4
+slots = 1
+ports = 0
+gpu = false
+payload_timeout = 7200
+artifacts = ["/home/anvil/verify.log"]
+upload = true
+payload = '''
+set -uo pipefail
+cd /home/anvil
+{
+  uname -srm; nproc; echo "arch=$(uname -m)"
+  case "$(uname -m)" in aarch64|arm64) ;; *) echo "NOTE: not aarch64, continuing anyway" ;; esac
+  cargo --version || { echo "FATAL: no cargo in the CI image"; exit 1; }
+
+  git clone -q {repo} src || { echo "FATAL: clone failed"; exit 1; }
+  cd src
+  git checkout -q {branch} || { echo "FATAL: no such ref: {branch}"; exit 1; }
+  git log --oneline -1
+
+  # The change must actually be present, or this verifies the wrong tree.
+  grep -q "pub fn defer_listen" ringline/src/worker.rs \
+    || { echo "FATAL: branch lacks defer_listen"; exit 1; }
+
+  # Raise the soft limit to the hard limit; `ulimit -n` needs no privileges for
+  # that. `sudo prlimit` returns 0 without applying a value above the hard
+  # limit, so a `||` fallback after it would not run, and the uring test binary
+  # aborts with io_uring_setup EMFILE at a 1024 soft limit.
+  hard=$(ulimit -Hn)
+  [ "$hard" = "unlimited" ] && hard=1048576
+  ulimit -n "$hard" 2>/dev/null || sudo prlimit --nofile="$hard" --pid $$ 2>/dev/null || true
+  echo "fd soft=$(ulimit -Sn) hard=$(ulimit -Hn)"
+  # Assert the limit took.
+  [ "$(ulimit -Sn)" -ge 65536 ] || { echo "FATAL: fd soft limit $(ulimit -Sn) too low for the uring test binary"; exit 1; }
+
+  # GATE: io_uring, or the whole job is meaningless.
+  cargo run --locked -q -p ringline-bench --bin bench-server -- --print-backend > bk.txt 2>/dev/null || true
+  got=$(cat bk.txt 2>/dev/null || echo unknown)
+  [ "$got" = "io_uring" ] || { echo "BACKEND MISMATCH: $got -- refusing to report a pass"; exit 1; }
+  echo "backend ok: $got on $(uname -m)"
+
+  rc_total=0
+  run() {
+    name=$1; shift
+    echo "=== $name ==="
+    # Not piped into anything: a piped cargo reports the pipe's status, which is
+    # how a failing step gets read as a pass.
+    "$@" > "/home/anvil/${name}.out" 2>&1
+    rc=$?
+    tail -12 "/home/anvil/${name}.out"
+    echo "${name}_rc=${rc}"
+    [ "$rc" != "0" ] && rc_total=1
+    return 0
+  }
+
+  run clippy            cargo clippy --locked --all-targets -- -D warnings
+  run clippy_tlsunbuf   cargo clippy --locked --all-targets --features tls-unbuffered -- -D warnings
+  run examples          cargo build --locked --examples
+  run tests             cargo test --locked --all
+  run diagrams          cargo run --locked -p doc-diagrams -- --check
+  RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features > /home/anvil/doc.out 2>&1
+  doc_rc=$?
+  tail -8 /home/anvil/doc.out
+  echo "doc_rc=${doc_rc}"
+  [ "$doc_rc" != "0" ] && rc_total=1
+
+  # The test totals, read from the finished output rather than a live log.
+  passed=$(grep -hE "^test result" /home/anvil/tests.out | awk '{p+=$4} END {print p+0}')
+  failed=$(grep -hE "^test result" /home/anvil/tests.out | awk '{f+=$6} END {print f+0}')
+  echo "RESULT branch={branch} arch=$(uname -m) backend=$got tests_passed=${passed} tests_failed=${failed} all_gates_ok=$([ "$rc_total" = "0" ] && echo yes || echo no)"
+} 2>&1 | tee /home/anvil/verify.log
+exit 0
+'''
