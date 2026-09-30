@@ -169,7 +169,9 @@ impl AsyncEventHandler for Bench {
                             // no userspace copy (recv buffers written by the kernel).
                             #[cfg(has_io_uring)]
                             "forward" => match fwd_sink.as_ref() {
-                                Some(sink) => conn.forward_to(sink, want).await.unwrap_or(0),
+                                // Forwarding is a read-side operation, and the
+                                // `Connection` was consumed by `split` above.
+                                Some(sink) => conn_rx.forward_to(sink, want).await.unwrap_or(0),
                                 None => 0,
                             },
                             "bytes" => {

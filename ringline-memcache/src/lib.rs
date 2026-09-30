@@ -617,13 +617,6 @@ impl Client {
     /// Create a new client wrapping an established connection.
     ///
     /// No callbacks, no metrics, no kernel timestamps — zero overhead.
-    /// # Errors
-    ///
-    /// Takes exclusive ownership of the connection's read side via
-    /// [`ConnCtx::split`], so this fails with `EBUSY` if another client (or
-    /// any other reader) already holds it, and `EPIPE` if `conn` is stale.
-    /// Two clients driving one connection used to be silently allowed, and it
-    /// interleaved their reads; now it is refused.
     /// Infallible: a [`Connection`] *is* the claimed halves, so there is nothing
     /// left to refuse. This took a `ConnCtx` and claimed the read side here via
     /// `split()`, which could fail `EBUSY`/`EPIPE` for reasons the caller had

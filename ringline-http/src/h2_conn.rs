@@ -409,7 +409,7 @@ impl H2AsyncConn {
         Self::from_conn(conn).await
     }
 
-    /// Wrap an already-connected [`Connection`] (must be TLS for H2).
+    /// Wrap an already-connected [`ringline::Connection`] (must be TLS for H2).
     ///
     /// Sends the H2 preface and waits for SETTINGS exchange. Claiming the halves
     /// is no longer a step that can fail here: a `Connection` already owns them

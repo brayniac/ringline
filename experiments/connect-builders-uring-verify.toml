@@ -1,0 +1,130 @@
+# Does the connect-builder change compile and pass on the io_uring path? (#528)
+#
+# WHY THIS EXISTS. Everything in #533 was developed on macOS, which is always the
+# mio backend and cannot type-check the io_uring path at all. The change touches
+# `arm_connect_timeout` in *both* drivers and `ConnectFuture`'s claim-on-success,
+# and CI already caught one io_uring-only break that no local gate could see: an
+# example used `conn.forward_to(..)` inside `#[cfg(has_io_uring)]` *after* the new
+# `Connection::split` had consumed `conn`. That compiled before only because
+# `ConnCtx` is `Copy`.
+#
+# The fix routes that forward through the read half instead, which is arguably
+# where it belonged — but the reasoning is unverified, because macOS still cannot
+# compile the line. This job is the check.
+#
+# ON THE PIS, not hv01/hv02. Those two are the hypervisors every two-machine
+# measurement runs on, so a cargo build there lands CPU load on a measurement
+# host and silently perturbs whatever is in flight — someone else's run as easily
+# as ours. The Pis are guest-capable and idle for this. Per CLAUDE.md: submit an
+# experiment, never ssh to a rig host.
+#
+# AARCH64 IS A BONUS, NOT THE POINT. The point is `has_io_uring`. Running on
+# aarch64 also exercises a second architecture for free, which is how #378's
+# behaviour on the Pis got characterised, but a pass here does **not** substitute
+# for CI's x86_64 jobs.
+#
+# WHAT IT RUNS, driven from CLAUDE.md's gate list rather than from memory — the
+# two CI failures on this PR were both gates that had simply not been run:
+#
+#   1. clippy --all-targets -D warnings              (io_uring; the lints behind
+#                                                     has_io_uring exist only here)
+#   2. clippy --all-targets --features tls-unbuffered (a CI job, and it failed)
+#   3. cargo build --examples                         (the break CI found)
+#   4. cargo test --all
+#   5. RUSTDOCFLAGS=-D warnings cargo doc --all-features
+#
+# PREDICTION: all five pass. A failure in 1 or 3 means the io_uring-only fix is
+# wrong and the forward belongs somewhere else; a failure in 4 means the lazy
+# submission or the claim-on-connect behaves differently on the ring than on
+# mio, which would be the more interesting outcome and would want its own
+# investigation rather than a patch.
+#
+# GATES: the backend must actually be io_uring — a `force-mio` build would report
+# a clean sweep for the wrong reason, which is the failure shape this whole
+# campaign keeps tripping over. And the uring test binary needs a generous
+# RLIMIT_NOFILE: at a 1024 soft limit it aborts with io_uring_setup EMFILE, which
+# reads as a code failure and is not.
+name = "uring-verify {branch}"
+
+[matrix]
+context_name = "ringline: does the connect-builder change hold on io_uring? (#528)"
+branch = ["feat/connect-returns-connection"]
+
+[params]
+repo = "https://github.com/brayniac/ringline"
+
+[[jobs]]
+name = "verify"
+tags = ["pi4b"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+shape = "a72.c"
+image = "debian-13-ci"
+memory_gib = 4
+slots = 1
+ports = 0
+gpu = false
+payload_timeout = 7200
+artifacts = ["/home/anvil/verify.log"]
+upload = true
+payload = '''
+set -uo pipefail
+cd /home/anvil
+{
+  uname -srm; nproc; echo "arch=$(uname -m)"
+  case "$(uname -m)" in aarch64|arm64) ;; *) echo "NOTE: not aarch64, continuing anyway" ;; esac
+  cargo --version || { echo "FATAL: no cargo in the CI image"; exit 1; }
+
+  git clone -q {repo} src || { echo "FATAL: clone failed"; exit 1; }
+  cd src
+  git checkout -q {branch} || { echo "FATAL: no such ref: {branch}"; exit 1; }
+  git log --oneline -1
+
+  # The change must actually be present, or this verifies the wrong tree.
+  grep -q "pub struct TcpConnect" ringline/src/runtime/io.rs \
+    || { echo "FATAL: branch lacks TcpConnect"; exit 1; }
+
+  # prlimit, not `ulimit -n`: the builtin cannot raise the soft limit past the
+  # hard one, and `sudo ulimit` is meaningless (a shell builtin; sudo cannot
+  # change the calling shell's limits).
+  sudo prlimit --nofile=1000000 --pid $$ 2>/dev/null || ulimit -n 65536 2>/dev/null || true
+  echo "fd soft=$(ulimit -Sn) hard=$(ulimit -Hn)"
+
+  # GATE: io_uring, or the whole job is meaningless.
+  cargo run --locked -q -p ringline-bench --bin bench-server -- --print-backend > bk.txt 2>/dev/null || true
+  got=$(cat bk.txt 2>/dev/null || echo unknown)
+  [ "$got" = "io_uring" ] || { echo "BACKEND MISMATCH: $got -- refusing to report a pass"; exit 1; }
+  echo "backend ok: $got on $(uname -m)"
+
+  rc_total=0
+  run() {
+    name=$1; shift
+    echo "=== $name ==="
+    # Not piped into anything: a piped cargo reports the pipe's status, which is
+    # how a failing step gets read as a pass.
+    "$@" > "/home/anvil/${name}.out" 2>&1
+    rc=$?
+    tail -12 "/home/anvil/${name}.out"
+    echo "${name}_rc=${rc}"
+    [ "$rc" != "0" ] && rc_total=1
+    return 0
+  }
+
+  run clippy            cargo clippy --locked --all-targets -- -D warnings
+  run clippy_tlsunbuf   cargo clippy --locked --all-targets --features tls-unbuffered -- -D warnings
+  run examples          cargo build --locked --examples
+  run tests             cargo test --locked --all
+  RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features > /home/anvil/doc.out 2>&1
+  doc_rc=$?
+  tail -8 /home/anvil/doc.out
+  echo "doc_rc=${doc_rc}"
+  [ "$doc_rc" != "0" ] && rc_total=1
+
+  # The test totals, read from the finished output rather than a live log.
+  passed=$(grep -hE "^test result" /home/anvil/tests.out | awk '{p+=$4} END {print p+0}')
+  failed=$(grep -hE "^test result" /home/anvil/tests.out | awk '{f+=$6} END {print f+0}')
+  echo "RESULT branch={branch} arch=$(uname -m) backend=$got tests_passed=${passed} tests_failed=${failed} all_gates_ok=$([ "$rc_total" = "0" ] && echo yes || echo no)"
+} 2>&1 | tee /home/anvil/verify.log
+exit 0
+'''
