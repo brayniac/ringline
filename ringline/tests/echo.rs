@@ -1079,24 +1079,15 @@ impl AsyncEventHandler for ForwarderHandler {
         let backend_addr = self.backend_addr;
         async move {
             // Connect to the backend echo server.
-            let backend = match client.connect(backend_addr) {
-                Ok(fut) => match fut.await {
-                    Ok(ctx) => ctx,
-                    Err(e) => {
-                        let _ = client.send_nowait(format!("-ERR connect: {e}\r\n").as_bytes());
-                        return;
-                    }
-                },
+            let backend = match ringline::connect(backend_addr).await {
+                Ok(ctx) => ctx,
                 Err(e) => {
                     let _ = client.send_nowait(format!("-ERR connect: {e}\r\n").as_bytes());
                     return;
                 }
             };
             // Reading an outbound connection goes through its read half.
-            let (mut backend_tx, mut backend_rx) = match backend.split() {
-                Ok(halves) => halves,
-                Err(_) => return,
-            };
+            let (mut backend_tx, mut backend_rx) = backend.split();
 
             // Forward loop: read from client, send to backend, read echo, send back.
             loop {
@@ -1212,12 +1203,9 @@ impl AsyncEventHandler for ConnectRefusedHandler {
             let port = CONNECT_REFUSED_PORT.load(Ordering::SeqCst);
             let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
 
-            let result = match client.connect(addr) {
-                Ok(fut) => match fut.await {
-                    Ok(_) => "CONNECTED".to_string(),
-                    Err(e) => format!("ERR:{}", e.kind()),
-                },
-                Err(e) => format!("SUBMIT_ERR:{e}"),
+            let result = match ringline::connect(addr).await {
+                Ok(_) => "CONNECTED".to_string(),
+                Err(e) => format!("ERR:{}", e.kind()),
             };
 
             let _ = client.send_nowait(result.as_bytes());
@@ -1304,43 +1292,25 @@ impl AsyncEventHandler for MultiOutboundHandler {
             .expect("backend addr not set");
         async move {
             // Open two backend connections from the same client task.
-            let backend1 = match client.connect(backend_addr) {
-                Ok(fut) => match fut.await {
-                    Ok(ctx) => ctx,
-                    Err(e) => {
-                        let _ = client.send_nowait(format!("ERR1:{e}").as_bytes());
-                        return;
-                    }
-                },
+            let backend1 = match ringline::connect(backend_addr).await {
+                Ok(ctx) => ctx,
                 Err(e) => {
                     let _ = client.send_nowait(format!("ERR1:{e}").as_bytes());
                     return;
                 }
             };
             // Reading an outbound connection goes through its read half.
-            let (mut backend1_tx, mut backend1_rx) = match backend1.split() {
-                Ok(halves) => halves,
-                Err(_) => return,
-            };
+            let (mut backend1_tx, mut backend1_rx) = backend1.split();
 
-            let backend2 = match client.connect(backend_addr) {
-                Ok(fut) => match fut.await {
-                    Ok(ctx) => ctx,
-                    Err(e) => {
-                        let _ = client.send_nowait(format!("ERR2:{e}").as_bytes());
-                        return;
-                    }
-                },
+            let backend2 = match ringline::connect(backend_addr).await {
+                Ok(ctx) => ctx,
                 Err(e) => {
                     let _ = client.send_nowait(format!("ERR2:{e}").as_bytes());
                     return;
                 }
             };
             // Reading an outbound connection goes through its read half.
-            let (mut backend2_tx, mut backend2_rx) = match backend2.split() {
-                Ok(halves) => halves,
-                Err(_) => return,
-            };
+            let (mut backend2_tx, mut backend2_rx) = backend2.split();
 
             // Send "AA" through backend1, "BB" through backend2.
             if backend1_tx.send_nowait(b"AA").is_err() {
@@ -1476,42 +1446,26 @@ impl AsyncEventHandler for SelectTwoHandler {
         let addr2 = *SELECT_BACKEND2_ADDR.get().expect("backend2 addr not set");
         async move {
             // Connect to both backends.
-            let backend1 = match client.connect(addr1) {
-                Ok(fut) => match fut.await {
-                    Ok(ctx) => ctx,
-                    Err(e) => {
-                        let _ = client.send_nowait(format!("ERR1:{e}").as_bytes());
-                        return;
-                    }
-                },
+            let backend1 = match ringline::connect(addr1).await {
+                Ok(ctx) => ctx,
                 Err(e) => {
                     let _ = client.send_nowait(format!("ERR1:{e}").as_bytes());
                     return;
                 }
             };
             // Reading an outbound connection goes through its read half.
-            let (mut backend1_tx, mut backend1_rx) = match backend1.split() {
-                Ok(halves) => halves,
-                Err(_) => return,
-            };
-            let backend2 = match client.connect(addr2) {
-                Ok(fut) => match fut.await {
-                    Ok(ctx) => ctx,
-                    Err(e) => {
-                        let _ = client.send_nowait(format!("ERR2:{e}").as_bytes());
-                        return;
-                    }
-                },
+            let (mut backend1_tx, mut backend1_rx) = backend1.split();
+            let backend2 = match ringline::connect(addr2).await {
+                Ok(ctx) => ctx,
                 Err(e) => {
                     let _ = client.send_nowait(format!("ERR2:{e}").as_bytes());
                     return;
                 }
             };
             // Reading an outbound connection goes through its read half.
-            let mut backend2_rx = match backend2.take_recv() {
-                Ok(rx) => rx,
-                Err(_) => return,
-            };
+            // A `Connection` already owns both halves; this test only writes
+            // through the other one.
+            let (_unused_tx, mut backend2_rx) = backend2.split();
 
             // Send data to backend1 only.
             if backend1_tx.send_nowait(b"HELLO").is_err() {
@@ -1645,42 +1599,26 @@ impl AsyncEventHandler for SelectSecondWinsHandler {
         let addr1 = *SELECT2_BACKEND1_ADDR.get().expect("backend1 addr not set");
         let addr2 = *SELECT2_BACKEND2_ADDR.get().expect("backend2 addr not set");
         async move {
-            let backend1 = match client.connect(addr1) {
-                Ok(fut) => match fut.await {
-                    Ok(ctx) => ctx,
-                    Err(e) => {
-                        let _ = client.send_nowait(format!("ERR:{e}").as_bytes());
-                        return;
-                    }
-                },
+            let backend1 = match ringline::connect(addr1).await {
+                Ok(ctx) => ctx,
                 Err(e) => {
                     let _ = client.send_nowait(format!("ERR:{e}").as_bytes());
                     return;
                 }
             };
             // Reading an outbound connection goes through its read half.
-            let mut backend1_rx = match backend1.take_recv() {
-                Ok(rx) => rx,
-                Err(_) => return,
-            };
-            let backend2 = match client.connect(addr2) {
-                Ok(fut) => match fut.await {
-                    Ok(ctx) => ctx,
-                    Err(e) => {
-                        let _ = client.send_nowait(format!("ERR:{e}").as_bytes());
-                        return;
-                    }
-                },
+            // A `Connection` already owns both halves; this test only writes
+            // through the other one.
+            let (_unused_tx, mut backend1_rx) = backend1.split();
+            let backend2 = match ringline::connect(addr2).await {
+                Ok(ctx) => ctx,
                 Err(e) => {
                     let _ = client.send_nowait(format!("ERR:{e}").as_bytes());
                     return;
                 }
             };
             // Reading an outbound connection goes through its read half.
-            let (mut backend2_tx, mut backend2_rx) = match backend2.split() {
-                Ok(halves) => halves,
-                Err(_) => return,
-            };
+            let (mut backend2_tx, mut backend2_rx) = backend2.split();
 
             // Send data to backend2 only.
             if backend2_tx.send_nowait(b"WORLD").is_err() {
@@ -1903,24 +1841,15 @@ impl AsyncEventHandler for Select3Handler {
     fn on_accept(&self, mut client: Connection) -> impl Future<Output = ()> + 'static {
         let backend_addr = *SELECT3_BACKEND_ADDR.get().expect("backend addr not set");
         async move {
-            let backend = match client.connect(backend_addr) {
-                Ok(fut) => match fut.await {
-                    Ok(ctx) => ctx,
-                    Err(e) => {
-                        let _ = client.send_nowait(format!("ERR:{e}").as_bytes());
-                        return;
-                    }
-                },
+            let backend = match ringline::connect(backend_addr).await {
+                Ok(ctx) => ctx,
                 Err(e) => {
                     let _ = client.send_nowait(format!("ERR:{e}").as_bytes());
                     return;
                 }
             };
             // Reading an outbound connection goes through its read half.
-            let (mut backend_tx, mut backend_rx) = match backend.split() {
-                Ok(halves) => halves,
-                Err(_) => return,
-            };
+            let (mut backend_tx, mut backend_rx) = backend.split();
 
             // Send data to backend so it echoes.
             if backend_tx.send_nowait(b"ECHO3").is_err() {
@@ -4182,24 +4111,15 @@ impl AsyncEventHandler for StandaloneConnectHandler {
             // Spawn a standalone task that connects to the backend.
             // ConnCtx is Copy — standalone tasks can use it for send().
             ringline::spawn(async move {
-                let backend = match ringline::connect(backend_addr) {
-                    Ok(fut) => match fut.await {
-                        Ok(ctx) => ctx,
-                        Err(e) => {
-                            let _ = client.send_nowait(format!("CONNECT_ERR:{e}").as_bytes());
-                            return;
-                        }
-                    },
+                let backend = match ringline::connect(backend_addr).await {
+                    Ok(ctx) => ctx,
                     Err(e) => {
-                        let _ = client.send_nowait(format!("SUBMIT_ERR:{e}").as_bytes());
+                        let _ = client.send_nowait(format!("CONNECT_ERR:{e}").as_bytes());
                         return;
                     }
                 };
                 // Reading an outbound connection goes through its read half.
-                let (mut backend_tx, mut backend_rx) = match backend.split() {
-                    Ok(halves) => halves,
-                    Err(_) => return,
-                };
+                let (mut backend_tx, mut backend_rx) = backend.split();
 
                 // Send data to backend, read echo.
                 if backend_tx.send_nowait(b"STANDALONE").is_err() {
@@ -4343,26 +4263,18 @@ impl AsyncEventHandler for GreetingClientHandler {
     fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
         let addr = *GREETING_ADDR.get().expect("greeting addr not set");
         Some(Box::pin(async move {
-            let conn = match ringline::connect(addr) {
-                Ok(fut) => match fut.await {
-                    Ok(ctx) => ctx,
-                    Err(e) => {
-                        GREETING_RESULT.set(format!("CONNECT_ERR:{e}")).ok();
-                        ringline::request_shutdown().ok();
-                        return;
-                    }
-                },
+            let conn = match ringline::connect(addr).await {
+                Ok(ctx) => ctx,
                 Err(e) => {
-                    GREETING_RESULT.set(format!("SUBMIT_ERR:{e}")).ok();
+                    GREETING_RESULT.set(format!("CONNECT_ERR:{e}")).ok();
                     ringline::request_shutdown().ok();
                     return;
                 }
             };
             // Reading an outbound connection goes through its read half.
-            let mut conn_rx = match conn.take_recv() {
-                Ok(rx) => rx,
-                Err(_) => return,
-            };
+            // A `Connection` already owns both halves; this test only writes
+            // through the other one.
+            let (_unused_tx, mut conn_rx) = conn.split();
 
             let mut greeting = Vec::new();
             while greeting.len() < 8 {
@@ -4436,26 +4348,16 @@ impl AsyncEventHandler for OnStartClientHandler {
     fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
         let backend_addr = *ON_START_BACKEND_ADDR.get().expect("backend addr not set");
         Some(Box::pin(async move {
-            let backend = match ringline::connect(backend_addr) {
-                Ok(fut) => match fut.await {
-                    Ok(ctx) => ctx,
-                    Err(e) => {
-                        ON_START_RESULT.set(format!("CONNECT_ERR:{e}")).ok();
-                        ringline::request_shutdown().ok();
-                        return;
-                    }
-                },
+            let backend = match ringline::connect(backend_addr).await {
+                Ok(ctx) => ctx,
                 Err(e) => {
-                    ON_START_RESULT.set(format!("SUBMIT_ERR:{e}")).ok();
+                    ON_START_RESULT.set(format!("CONNECT_ERR:{e}")).ok();
                     ringline::request_shutdown().ok();
                     return;
                 }
             };
             // Reading an outbound connection goes through its read half.
-            let (mut backend_tx, mut backend_rx) = match backend.split() {
-                Ok(halves) => halves,
-                Err(_) => return,
-            };
+            let (mut backend_tx, mut backend_rx) = backend.split();
 
             if backend_tx.send_nowait(b"ON_START").is_err() {
                 ON_START_RESULT.set("SEND_ERR".to_string()).ok();
@@ -4546,12 +4448,9 @@ impl AsyncEventHandler for StandaloneConnectRefusedHandler {
             let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
 
             ringline::spawn(async move {
-                let result = match ringline::connect(addr) {
-                    Ok(fut) => match fut.await {
-                        Ok(_) => "CONNECTED".to_string(),
-                        Err(e) => format!("ERR:{}", e.kind()),
-                    },
-                    Err(e) => format!("SUBMIT_ERR:{e}"),
+                let result = match ringline::connect(addr).await {
+                    Ok(_) => "CONNECTED".to_string(),
+                    Err(e) => format!("ERR:{}", e.kind()),
                 };
 
                 let _ = client.send_nowait(result.as_bytes());
@@ -5077,26 +4976,16 @@ impl AsyncEventHandler for OutboundEofClient {
     fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
         let server_addr = *OUTBOUND_EOF_ADDR.get().expect("addr not set");
         Some(Box::pin(async move {
-            let conn = match ringline::connect(server_addr) {
-                Ok(fut) => match fut.await {
-                    Ok(ctx) => ctx,
-                    Err(e) => {
-                        OUTBOUND_EOF_RESULT.set(format!("CONNECT_ERR:{e}")).ok();
-                        ringline::request_shutdown().ok();
-                        return;
-                    }
-                },
+            let conn = match ringline::connect(server_addr).await {
+                Ok(ctx) => ctx,
                 Err(e) => {
-                    OUTBOUND_EOF_RESULT.set(format!("SUBMIT_ERR:{e}")).ok();
+                    OUTBOUND_EOF_RESULT.set(format!("CONNECT_ERR:{e}")).ok();
                     ringline::request_shutdown().ok();
                     return;
                 }
             };
             // Reading an outbound connection goes through its read half.
-            let (mut conn_tx, mut conn_rx) = match conn.split() {
-                Ok(halves) => halves,
-                Err(_) => return,
-            };
+            let (mut conn_tx, mut conn_rx) = conn.split();
 
             // Send data and read echo, with a timeout.
             let _ = conn_tx.send_nowait(b"hello");
@@ -5264,21 +5153,21 @@ impl AsyncEventHandler for ConnectTimeoutClient {
             // Connect to a black-hole address with a 50ms timeout.
             // 192.0.2.1 is TEST-NET-1 (RFC 5737) — routable but unreachable.
             let addr: SocketAddr = "192.0.2.1:12345".parse().unwrap();
-            match ringline::connect_with_timeout(addr, 50) {
-                Ok(fut) => match fut.await {
-                    Ok(_) => {
-                        TIMEOUT_RESULT.set("UNEXPECTED_OK".into()).ok();
-                    }
-                    Err(e) => {
-                        if e.kind() == io::ErrorKind::TimedOut {
-                            TIMEOUT_RESULT.set("TIMED_OUT".into()).ok();
-                        } else {
-                            TIMEOUT_RESULT.set(format!("ERR:{e}")).ok();
-                        }
-                    }
-                },
+            // One error site now, so the SUBMIT_ERR arm is gone: submission and
+            // completion are no longer separate failures (#528).
+            match ringline::connect(addr)
+                .timeout(std::time::Duration::from_millis(50))
+                .await
+            {
+                Ok(_) => {
+                    TIMEOUT_RESULT.set("UNEXPECTED_OK".into()).ok();
+                }
                 Err(e) => {
-                    TIMEOUT_RESULT.set(format!("SUBMIT_ERR:{e}")).ok();
+                    if e.kind() == io::ErrorKind::TimedOut {
+                        TIMEOUT_RESULT.set("TIMED_OUT".into()).ok();
+                    } else {
+                        TIMEOUT_RESULT.set(format!("ERR:{e}")).ok();
+                    }
                 }
             }
             ringline::request_shutdown().ok();
@@ -7658,17 +7547,11 @@ impl AsyncEventHandler for ForwardToConnProxy {
             // proxy safe to express: nothing else can send to a socket while a
             // forward is writing to it.
             let (mut client_tx, mut client_rx) = client.split();
-            let backend = match client_tx.connect(backend_addr) {
-                Ok(fut) => match fut.await {
-                    Ok(ctx) => ctx,
-                    Err(_) => return,
-                },
+            let backend = match ringline::connect(backend_addr).await {
+                Ok(ctx) => ctx,
                 Err(_) => return,
             };
-            let (mut backend_tx, mut backend_rx) = match backend.split() {
-                Ok(halves) => halves,
-                Err(_) => return,
-            };
+            let (mut backend_tx, mut backend_rx) = backend.split();
 
             loop {
                 let mut hdr = [0u8; 4];
@@ -7839,18 +7722,14 @@ impl AsyncEventHandler for DroppedForwardProxy {
         let backend_addr = self.backend_addr;
         async move {
             let (mut tx, mut rx) = client.split();
-            let backend = match tx.connect(backend_addr) {
-                Ok(fut) => match fut.await {
-                    Ok(ctx) => ctx,
-                    Err(_) => return,
-                },
+            let backend = match ringline::connect(backend_addr).await {
+                Ok(ctx) => ctx,
                 Err(_) => return,
             };
 
-            let mut backend_tx = match backend.take_send() {
-                Ok(tx) => tx,
-                Err(_) => return,
-            };
+            // A `Connection` already owns both halves; this test only reads
+            // through the other one.
+            let (mut backend_tx, _unused_rx) = backend.split();
 
             // Arm a forward for far more than the client will ever send, then
             // drop it without awaiting it to completion.
@@ -8212,11 +8091,8 @@ impl AsyncEventHandler for BusyForwardProxy {
     fn on_accept(&self, mut client: Connection) -> impl Future<Output = ()> + 'static {
         let backend_addr = self.backend_addr;
         async move {
-            let backend = match client.connect(backend_addr) {
-                Ok(fut) => match fut.await {
-                    Ok(ctx) => ctx,
-                    Err(_) => return,
-                },
+            let backend = match ringline::connect(backend_addr).await {
+                Ok(ctx) => ctx,
                 Err(_) => return,
             };
 
@@ -8227,8 +8103,10 @@ impl AsyncEventHandler for BusyForwardProxy {
             // runtime `EBUSY` being asserted here. Go through the `Copy`
             // handle so the refusal is still exercised.
             let client_ctx = client.as_conn();
-            let first = client_ctx.forward_to_conn(&backend, 1 << 30);
-            let second = client_ctx.forward_to_conn(&backend, 16);
+            // Bound so the `ConnCtx` outlives both borrows.
+            let backend_ctx = backend.as_conn();
+            let first = client_ctx.forward_to_conn(&backend_ctx, 1 << 30);
+            let second = client_ctx.forward_to_conn(&backend_ctx, 16);
             let errno = match second.await {
                 Ok(_) => -1,
                 Err(e) => e.raw_os_error().unwrap_or(-1),

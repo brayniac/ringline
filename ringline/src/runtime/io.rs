@@ -553,7 +553,6 @@ enum ConnectTarget {
     },
 }
 
-
 // ── DNS Resolution ──────────────────────────────────────────────────
 
 /// Resolve a hostname to a [`SocketAddr`] using the dedicated resolver pool.
@@ -3509,6 +3508,16 @@ impl Connection {
         }
     }
 
+    /// A dangling pair for in-memory unit tests.
+    ///
+    /// Mirrors [`ConnCtx::for_test`]: the halves are unclaimed and the
+    /// connection does not exist, so this is only safe on the buffered paths
+    /// (encoders, write buffers, pending queues) that never reach the wire. It
+    /// carries exactly that contract and no more.
+    pub fn for_test(conn_index: u32, generation: u32) -> Self {
+        Self::from_claimed(ConnCtx::new(conn_index, generation))
+    }
+
     /// Split into the independently borrowable write and read halves.
     ///
     /// Needed whenever a send has to happen while a read borrow is live.
@@ -3760,7 +3769,6 @@ impl Connection {
     pub fn request_shutdown(&self) {
         self.tx.as_conn().request_shutdown();
     }
-
 }
 
 /// The **write side** of a connection, from [`ConnCtx::split`].
@@ -5579,7 +5587,9 @@ impl Future for ConnectFuture {
                     generation,
                 } => (*conn_index, *generation),
                 ConnectState::Done => {
-                    return Poll::Ready(Err(io::Error::other("connect future polled after completion")));
+                    return Poll::Ready(Err(io::Error::other(
+                        "connect future polled after completion",
+                    )));
                 }
             };
 

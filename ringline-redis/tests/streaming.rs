@@ -194,10 +194,9 @@ impl AsyncEventHandler for ClientHandler {
 
 async fn connect(addr: SocketAddr) -> Result<Client, String> {
     let conn = ringline::connect(addr)
-        .map_err(|e| format!("submit: {e}"))?
         .await
         .map_err(|e| format!("connect: {e}"))?;
-    Client::new(conn).map_err(|e| format!("split: {e}"))
+    Ok(Client::new(conn))
 }
 
 async fn run_client(addr: SocketAddr) -> Result<(), String> {

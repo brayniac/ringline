@@ -631,14 +631,8 @@ fn run_ringline_proxy(cfg: ProxyCfg) {
         ) -> impl std::future::Future<Output = ()> + 'static {
             async move {
                 let addr = *BACKEND.get().expect("backend set before launch");
-                let sink = match conn.connect(addr) {
-                    Ok(fut) => match fut.await {
-                        Ok(ctx) => ctx,
-                        Err(e) => {
-                            eprintln!("proxy: backend connect failed: {e}");
-                            return;
-                        }
-                    },
+                let sink = match ringline::connect(addr).await {
+                    Ok(c) => c,
                     Err(e) => {
                         eprintln!("proxy: backend connect failed: {e}");
                         return;
@@ -647,13 +641,9 @@ fn run_ringline_proxy(cfg: ProxyCfg) {
                 // The sink is presented as its write half: holding it is the
                 // permission to write, and the borrow keeps anything else from
                 // sending to that socket while the forward runs.
-                let mut sink_tx = match sink.take_send() {
-                    Ok(tx) => tx,
-                    Err(e) => {
-                        eprintln!("proxy: backend take_send failed: {e}");
-                        return;
-                    }
-                };
+                // A `Connection` already owns both halves, so the write half is
+                // taken by splitting rather than claimed from a shared handle.
+                let (mut sink_tx, _sink_rx) = sink.split();
                 if let Err(e) = conn.forward_to_conn(&mut sink_tx, UNTIL_EOF).await {
                     eprintln!("proxy: forward failed: {e}");
                 }

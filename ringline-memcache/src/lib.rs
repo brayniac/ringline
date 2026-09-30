@@ -3161,10 +3161,10 @@ mod zc_threshold_tests {
         }
     }
 
-    /// A `Client` backed by a dangling `ConnCtx`. Only safe for tests that
+    /// A `Client` backed by a dangling `Connection`. Only safe for tests that
     /// stay in the buffered path (no flush, no direct send, no recv).
     fn test_client(max_batch_size: usize, zc_threshold: u32) -> Client {
-        let conn = ConnCtx::for_test(0, 0);
+        let conn = ringline::Connection::for_test(0, 0);
         Client::builder(conn)
             .max_batch_size(max_batch_size)
             .zc_threshold(zc_threshold)
@@ -3287,7 +3287,7 @@ mod binary_tests {
     /// direct send, no recv), the only path safe to exercise without a live
     /// connection.
     fn binary_client(max_batch_size: usize, zc_threshold: u32) -> BinaryClient {
-        Client::builder(ConnCtx::for_test(0, 0))
+        Client::builder(ringline::Connection::for_test(0, 0))
             .max_batch_size(max_batch_size)
             .zc_threshold(zc_threshold)
             .build_binary_for_test()
@@ -3647,7 +3647,7 @@ mod binary_tests {
     #[test]
     fn build_yields_an_ascii_client() {
         // The flag must not leak into the plain `build()` path.
-        let c = Client::builder(ConnCtx::for_test(0, 0))
+        let c = Client::builder(ringline::Connection::for_test(0, 0))
             .max_batch_size(4)
             .build_for_test();
         assert!(!c.binary);

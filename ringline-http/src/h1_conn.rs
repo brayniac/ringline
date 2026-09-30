@@ -45,8 +45,8 @@ pub struct H1Conn {
 }
 
 impl H1Conn {
-    fn new(conn: ConnCtx, host: &str) -> Result<Self, HttpError> {
-        let (tx, rx) = conn.split()?;
+    fn new(conn: ringline::Connection, host: &str) -> Result<Self, HttpError> {
+        let (tx, rx) = conn.split();
         Ok(Self {
             tx,
             rx,

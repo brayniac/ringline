@@ -262,10 +262,6 @@ pub use runtime::io::BlockingJoinHandle;
 pub use runtime::io::ConnCtx;
 /// Future that completes when a connect finishes.
 pub use runtime::io::ConnectFuture;
-/// Builder for an outbound TCP connection, from [`connect`].
-pub use runtime::io::TcpConnect;
-/// Builder for an outbound Unix-domain connection, from [`connect_unix`].
-pub use runtime::io::UnixConnect;
 /// An owned connection: the pair of claimed halves, from `on_accept` or `connect`.
 pub use runtime::io::Connection;
 /// A monotonic clock deadline for absolute timers.
@@ -314,12 +310,16 @@ pub use runtime::io::SendHalf;
 pub use runtime::io::SinkFd;
 /// Future returned by [`sleep()`].
 pub use runtime::io::SleepFuture;
+/// Builder for an outbound TCP connection, from [`connect`].
+pub use runtime::io::TcpConnect;
 /// Future returned by [`timeout()`].
 pub use runtime::io::TimeoutFuture;
 /// Async context for a UDP socket.
 pub use runtime::io::UdpCtx;
 /// Future returned by [`UdpCtx::recv_from()`].
 pub use runtime::io::UdpRecvFuture;
+/// Builder for an outbound Unix-domain connection, from [`connect_unix`].
+pub use runtime::io::UnixConnect;
 /// Future that provides received data as zero-copy `Bytes`.
 pub use runtime::io::WithBytesFuture;
 /// Future that provides received data.

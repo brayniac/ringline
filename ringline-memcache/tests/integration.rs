@@ -37,10 +37,9 @@ fn test_config() -> Config {
 async fn connect_memcache() -> Result<Client, String> {
     let addr: SocketAddr = MEMCACHE_ADDR.parse().unwrap();
     let conn = ringline::connect(addr)
-        .map_err(|e| format!("submit: {e}"))?
         .await
         .map_err(|e| format!("connect: {e}"))?;
-    Client::new(conn).map_err(|e| format!("split: {e}"))
+    Ok(Client::new(conn))
 }
 
 macro_rules! run_memcache_test {

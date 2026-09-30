@@ -119,15 +119,9 @@ impl AsyncEventHandler for Bench {
             for _ in 0..conns {
                 let mode = mode.clone();
                 let _ = ringline::spawn(async move {
-                    let conn = connect(target)
-                        .expect("connect submit")
-                        .await
-                        .expect("connect");
+                    let conn = connect(target).await.expect("connect");
                     // Reading an outbound connection goes through its read half.
-                    let (mut conn_tx, mut conn_rx) = match conn.split() {
-                        Ok(halves) => halves,
-                        Err(_) => return,
-                    };
+                    let (mut conn_tx, mut conn_rx) = conn.split();
                     // MODE=forward forwards each response straight to a discard
                     // sink (/dev/null) with no userspace copy. Opened once per task.
                     #[cfg(has_io_uring)]

@@ -136,23 +136,16 @@ impl AsyncEventHandler for PingClientHandler {
     fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
         let server_addr = *PING_SERVER_ADDR.get().expect("server addr not set");
         Some(Box::pin(async move {
-            let conn = match ringline::connect(server_addr) {
-                Ok(fut) => match fut.await {
-                    Ok(ctx) => ctx,
-                    Err(e) => {
-                        PING_RESULT.set(format!("CONNECT_ERR:{e}")).ok();
-                        ringline::request_shutdown().ok();
-                        return;
-                    }
-                },
+            let conn = match ringline::connect(server_addr).await {
+                Ok(ctx) => ctx,
                 Err(e) => {
-                    PING_RESULT.set(format!("SUBMIT_ERR:{e}")).ok();
+                    PING_RESULT.set(format!("CONNECT_ERR:{e}")).ok();
                     ringline::request_shutdown().ok();
                     return;
                 }
             };
 
-            let mut client = ringline_ping::Client::new(conn).expect("split the connection");
+            let mut client = ringline_ping::Client::new(conn);
             match client.ping().await {
                 Ok(()) => {
                     PING_RESULT.set("OK".to_string()).ok();
@@ -340,23 +333,16 @@ impl AsyncEventHandler for BadPingClientHandler {
     fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
         let server_addr = *BAD_SERVER_ADDR.get().expect("bad server addr not set");
         Some(Box::pin(async move {
-            let conn = match ringline::connect(server_addr) {
-                Ok(fut) => match fut.await {
-                    Ok(ctx) => ctx,
-                    Err(e) => {
-                        BAD_RESULT.set(format!("CONNECT_ERR:{e}")).ok();
-                        ringline::request_shutdown().ok();
-                        return;
-                    }
-                },
+            let conn = match ringline::connect(server_addr).await {
+                Ok(ctx) => ctx,
                 Err(e) => {
-                    BAD_RESULT.set(format!("SUBMIT_ERR:{e}")).ok();
+                    BAD_RESULT.set(format!("CONNECT_ERR:{e}")).ok();
                     ringline::request_shutdown().ok();
                     return;
                 }
             };
 
-            let mut client = ringline_ping::Client::new(conn).expect("split the connection");
+            let mut client = ringline_ping::Client::new(conn);
             match client.ping().await {
                 Ok(()) => {
                     BAD_RESULT.set("UNEXPECTED_OK".to_string()).ok();

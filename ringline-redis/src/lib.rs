@@ -3945,10 +3945,10 @@ mod zc_threshold_tests {
         }
     }
 
-    /// A `Client` backed by a dangling `ConnCtx`. Only safe for tests that
+    /// A `Client` backed by a dangling `Connection`. Only safe for tests that
     /// stay in the buffered path (no flush, no direct send, no recv).
     fn test_client(max_batch_size: usize, zc_threshold: u32) -> Client {
-        let conn = ConnCtx::for_test(0, 0);
+        let conn = ringline::Connection::for_test(0, 0);
         let mut client = Client::builder(conn).max_batch_size(max_batch_size);
         client = client.zc_threshold(zc_threshold);
         client.build_for_test()
