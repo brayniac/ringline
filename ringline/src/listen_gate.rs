@@ -328,9 +328,33 @@ mod tests {
         fd
     }
 
+    /// Gates with every listener registered on a listenable socket, as
+    /// `launch()` leaves them. `open` does not publish an unregistered gate,
+    /// so tests of the open path start here. The fds are leaked; the test
+    /// process reaps them.
+    fn registered_gates(listeners: usize) -> Arc<ListenGates> {
+        let gates = ListenGates::new(listeners, 128);
+        for id in 0..listeners as u32 {
+            gates.register(id, vec![listenable_fd()]).expect("register");
+        }
+        gates
+    }
+
+    /// Run `wait_open` on another thread and fail rather than hang if it does
+    /// not return. A gate that never publishes blocks `wait_open` forever.
+    fn wait_open_within(gates: &Arc<ListenGates>, listener: u32) -> bool {
+        let waiter = Arc::clone(gates);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(waiter.wait_open(listener));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("wait_open did not return within 5s")
+    }
+
     #[test]
-    fn a_gate_with_no_sockets_opens_and_publishes() {
-        let gates = ListenGates::new(2, 128);
+    fn opening_one_gate_publishes_it_and_no_other() {
+        let gates = registered_gates(2);
         assert!(!gates.is_open(0));
         gates.open(0).expect("open");
         assert!(gates.is_open(0));
@@ -375,22 +399,24 @@ mod tests {
 
     #[test]
     fn wait_returns_immediately_for_an_already_open_gate() {
-        let gates = ListenGates::new(1, 128);
+        let gates = registered_gates(1);
         gates.open(0).expect("open");
-        assert!(gates.wait_open(0));
+        assert!(wait_open_within(&gates, 0));
     }
 
     #[test]
     fn wait_wakes_when_the_gate_opens() {
-        let gates = ListenGates::new(1, 128);
-        let waiter = Arc::clone(&gates);
-        let handle = std::thread::spawn(move || waiter.wait_open(0));
-        // Not a synchronisation point; it makes the wait usually start
-        // first. The test is correct either way: `wait_open` rechecks the
-        // predicate before parking.
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        gates.open(0).expect("open");
-        assert!(handle.join().expect("waiter panicked"));
+        let gates = registered_gates(1);
+        let opener = Arc::clone(&gates);
+        let handle = std::thread::spawn(move || {
+            // Not a synchronisation point; it makes the wait usually start
+            // first. The test is correct either way: `wait_open` rechecks
+            // the predicate before parking.
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            opener.open(0)
+        });
+        assert!(wait_open_within(&gates, 0));
+        handle.join().expect("opener panicked").expect("open");
     }
 
     #[test]
@@ -415,7 +441,7 @@ mod tests {
 
     #[test]
     fn open_all_opens_every_gate() {
-        let gates = ListenGates::new(3, 128);
+        let gates = registered_gates(3);
         gates.open_all().expect("open_all");
         for id in 0..3 {
             assert!(gates.is_open(id));
