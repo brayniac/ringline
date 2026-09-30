@@ -9,6 +9,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Breaking:** `connect` and `connect_unix` return builders that resolve to an
+  owned `Connection`, replacing five free functions and eleven receiver-ignoring
+  methods on `ConnCtx`, `Connection` and `SendHalf` — sixteen entry points for one
+  operation, of which ten never touched their receiver.
+
+  ```rust
+  let conn = connect(addr).await?;
+  let conn = connect(addr).tls("example.com").timeout(d).await?;
+  let conn = connect_unix(path).timeout(d).await?;   // was not expressible
+  ```
+
+  The old five were an incomplete cross product of transport × TLS × timeout, 5
+  of 8: `connect_unix_with_timeout` did not exist, so a Unix connect could not
+  take a timeout and nothing in the naming said so. The driver always supported
+  it — `connect_with_timeout` was only ever `connect()` plus
+  `arm_connect_timeout(index, ms)`, on both backends — so the options now compose
+  instead of multiplying. `connect` yields a TCP builder and `connect_unix` a Unix
+  one, which keeps `connect_unix(path).tls(..)` a **compile error** rather than a
+  runtime refusal: the driver terminates TLS on `SocketAddr` connections only.
+
+- **Breaking, behaviour:** a connect builder submits on its **first poll**, not
+  when it is created. Two held side by side no longer overlap:
+  `let a = connect(x); let b = connect(y);` then awaiting both in turn is now
+  serial where it used to have both SYNs already on the wire. Use `join` for
+  overlap — it polls each, so each submits before either waits. Nothing in this
+  repository relied on the old shape (every `Pool::connect_all` was already a
+  sequential loop; see #532). Laziness matches the contract
+  `send_backpressured` already documents, and makes a built-but-never-awaited
+  connect genuinely inert, where the eager version had already sent a SYN.
+
+- **Breaking:** `join`, `join3`, `select` and `select3` take `IntoFuture` rather
+  than `Future`, so a builder can be passed directly. Every `Future` is
+  `IntoFuture`, so existing callers are unaffected.
+
+- **Breaking:** client constructors are infallible.
+  `ringline_redis::Client::{new, builder(..).build()}`,
+  `ringline_memcache::Client::{new, build, build_binary}`,
+  `ringline_ping::Client::{new, build}` and `H2Conn::from_conn` take a
+  `Connection` and no longer return `Result`. Claiming the halves via `split()?`
+  was their only fallible step, and it could fail `EBUSY`/`EPIPE` for reasons the
+  caller had not caused — a setup-failure path every caller had to carry. A
+  `Connection` is not `Copy`, so two clients on one connection is now
+  unrepresentable rather than refused at run time.
+
+- **Breaking:** `Pool::client` returns `&mut Client` instead of an owned
+  `Client`, and each pool slot owns its client. Minting a throwaway client per
+  checkout cost a `split()` — two driver round trips and two claim writes — every
+  call; `ShardedClient` and `ClusterClient` moved to owning the client for that
+  reason in #439/#440, and the pools are now consistent with them at one split per
+  *connection*. The call shape and the number of awaits are unchanged.
+
 - Accept-time placement now hands a connection to an **idle** worker as soon as
   the accepting worker holds one, instead of waiting for a gap of two. The flat
   margin meant a worker first shed on its *third* connection, so when a pooled

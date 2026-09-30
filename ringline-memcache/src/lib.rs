@@ -3144,7 +3144,7 @@ mod tests {
 #[cfg(test)]
 mod zc_threshold_tests {
     use super::*;
-    use ringline::{ConnCtx, RegionId, SendGuard};
+    use ringline::{RegionId, SendGuard};
 
     const KEY: &[u8] = b"user:123456789";
 
@@ -3265,7 +3265,7 @@ mod zc_threshold_tests {
 #[cfg(test)]
 mod binary_tests {
     use super::*;
-    use ringline::{ConnCtx, RegionId, SendGuard};
+    use ringline::{RegionId, SendGuard};
 
     const KEY: &[u8] = b"user:123456789";
     const HDR: usize = memcache_proto::binary::HEADER_SIZE;

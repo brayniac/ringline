@@ -226,7 +226,7 @@ impl AsyncEventHandler for PingPoolClientHandler {
 
             // Ping via pool.
             match pool.client().await {
-                Ok(mut client) => match client.ping().await {
+                Ok(client) => match client.ping().await {
                     Ok(()) => {}
                     Err(e) => {
                         POOL_RESULT.set(format!("PING_ERR:{e}")).ok();

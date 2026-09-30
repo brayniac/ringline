@@ -682,8 +682,10 @@ pub fn request_shutdown() -> io::Result<()> {
 /// accepted ones arrive as a [`Connection`] in [`AsyncEventHandler::on_accept`](crate::AsyncEventHandler::on_accept).
 /// It exposes an async API for reading data (`with_data`,
 /// `with_bytes`), sending data (`send`,
-/// `send_nowait`), and initiating outbound connections
-/// ([`connect`](Self::connect)).
+/// `send_nowait`). Outbound connections come from the free functions
+/// [`connect`](crate::connect) and [`connect_unix`](crate::connect_unix), which
+/// resolve to an owned [`Connection`]; `ConnCtx` no longer carries a `connect`
+/// of its own, since it never used the receiver (#528).
 ///
 /// A `ConnCtx` is valid for the lifetime of the connection's async task.
 /// When the connection is closed, the task is dropped along with the `ConnCtx`.
@@ -3510,10 +3512,14 @@ impl Connection {
 
     /// A dangling pair for in-memory unit tests.
     ///
-    /// Mirrors [`ConnCtx::for_test`]: the halves are unclaimed and the
-    /// connection does not exist, so this is only safe on the buffered paths
-    /// (encoders, write buffers, pending queues) that never reach the wire. It
-    /// carries exactly that contract and no more.
+    /// Mirrors `ConnCtx::for_test`: the halves are unclaimed and the connection
+    /// does not exist, so this is only safe on the buffered paths (encoders,
+    /// write buffers, pending queues) that never reach the wire. It carries
+    /// exactly that contract and no more — and the same `testing` feature gate,
+    /// because a constructor that hands out a dangling connection has no
+    /// business in the default public surface.
+    #[cfg(feature = "testing")]
+    #[doc(hidden)]
     pub fn for_test(conn_index: u32, generation: u32) -> Self {
         Self::from_claimed(ConnCtx::new(conn_index, generation))
     }

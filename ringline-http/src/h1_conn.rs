@@ -6,7 +6,7 @@
 use std::net::SocketAddr;
 
 use bytes::{Bytes, BytesMut};
-use ringline::{ConnCtx, ParseResult, RecvHalf, SendHalf};
+use ringline::{ParseResult, RecvHalf, SendHalf};
 
 use crate::error::HttpError;
 use crate::response::Response;

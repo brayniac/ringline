@@ -8,7 +8,7 @@ use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 
 use bytes::{Bytes, BytesMut};
-use ringline::{ConnCtx, RecvHalf, SendHalf};
+use ringline::{RecvHalf, SendHalf};
 // `ParseResult` is only used by the mio/portable `with_data` recv path; the
 // io_uring path feeds h2 via `with_segments` (returns `SegConsumed`).
 #[cfg(not(has_io_uring))]

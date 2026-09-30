@@ -3928,7 +3928,7 @@ mod encode_tests {
 #[cfg(test)]
 mod zc_threshold_tests {
     use super::*;
-    use ringline::{ConnCtx, RegionId, SendGuard};
+    use ringline::{RegionId, SendGuard};
 
     const KEY: &[u8] = b"user:123456789";
 

@@ -411,7 +411,7 @@ fn memcache_pool() {
                         ));
                     }
 
-                    let mut client = pool.client().await.map_err(|e| format!("client: {e}"))?;
+                    let client = pool.client().await.map_err(|e| format!("client: {e}"))?;
                     client
                         .set("ringline-test:pool", "pool-value")
                         .await
