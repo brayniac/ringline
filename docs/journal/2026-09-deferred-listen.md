@@ -335,8 +335,10 @@ accepted connection closing first, 5 trials per row:
 The third row is the fix: `listen_all` sets the flag immediately before
 `listen(2)`. The port stays reserved while the listener is held. In the gap
 between setting the flag and `listen(2)`, a competing `SO_REUSEADDR` socket
-**can** bind: measured, it binds, ours listens, and its `listen` fails
-`EADDRINUSE`. So the gap cannot produce two listeners. This entry first said
+**can** bind. Measured in both orders: whichever socket calls `listen(2)`
+first listens, and the other's `listen` fails `EADDRINUSE`. If the competitor
+wins, `begin_listening` (or `launch()`) reports the error. The gap cannot
+produce two listeners. This entry first said
 a competitor could not bind there, reasoned from "the flag was clear until
 then", which forgets that the flag is set again one line before the listen.
 An adversarial review found it; the same wrong sentence is in the `deae091`
@@ -381,8 +383,18 @@ Two findings were owner decisions:
   worker. `one_workers_release_opens_the_listener_for_every_worker` pins the
   first-call behaviour with two workers, which no test covered before.
 
-Still open from the review: `begin_listening` works only on a worker thread,
-so warmup that finishes on another thread needs a flag the handler polls, and
-`defer_listen()` refuses a deferred Unix listener in merged mode, which has an
-acceptor thread and would likely work. The second belongs with merged-mode
-support.
+`begin_listening` works only on a worker thread, because it reaches the gates
+through a thread-local. `ListenHandle`, from `ShutdownHandle::listen_handle()`,
+opens a listener from any thread, for readiness decided outside a worker. It
+was first written as two methods on `ShutdownHandle`; the third review pointed
+out that `ShutdownHandle` is not `Clone` and shuts the runtime down on drop, so
+sharing it across threads meant `Arc` and a last-owner-drops shutdown. A
+`Clone` handle whose drop does nothing follows `worker_wake_handle()`. It
+exists only after `launch()` has registered every listener, so the
+release-before-registration path cannot arise through it.
+`the_listen_handle_releases_from_any_thread` releases from a spawned thread
+holding a clone.
+
+Still open: `defer_listen()` refuses a deferred Unix listener in merged mode,
+which has an acceptor thread and would likely work. That belongs with
+merged-mode support.

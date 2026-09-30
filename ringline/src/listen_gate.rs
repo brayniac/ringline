@@ -141,8 +141,8 @@ impl ListenGates {
         Ok(())
     }
 
-    /// Open every gate. Returns the first failure; gates opened before it
-    /// stay open.
+    /// Open every gate in index order, stopping at the first failure: gates
+    /// before it stay open, later ones are not attempted.
     pub(crate) fn open_all(&self) -> io::Result<()> {
         for listener in 0..self.open.len() as u32 {
             self.open(listener)?;
@@ -221,8 +221,8 @@ fn listen_all(inner: &mut GateInner, idx: usize) -> io::Result<()> {
         // check in `listen(2)` with the socket's current flag, and without it
         // a TIME_WAIT connection left by a previous instance on this port
         // fails the listen with EADDRINUSE. Between this call and `listen(2)`
-        // another SO_REUSEADDR socket can bind the port, but this socket
-        // listens first and the other's `listen(2)` then fails with
+        // another SO_REUSEADDR socket can bind the port. Whichever of the two
+        // calls `listen(2)` first listens; the other's `listen(2)` fails with
         // EADDRINUSE. No effect on Unix sockets, and merged-mode sockets
         // already have it set. A failure here is not checked: the `listen(2)`
         // below reports any consequence.
@@ -242,6 +242,54 @@ fn listen_all(inner: &mut GateInner, idx: usize) -> io::Result<()> {
     }
     inner.listened[idx] = true;
     Ok(())
+}
+
+/// Opens deferred listeners from any thread.
+///
+/// Obtained from
+/// [`ShutdownHandle::listen_handle`](crate::ShutdownHandle::listen_handle).
+/// For readiness decided outside a ringline worker: a management thread, a
+/// thread that waits on each worker's warmup, or another runtime. Clones share
+/// one runtime's listeners, and dropping one does not affect the runtime.
+///
+/// The handle exists only after `launch()` has bound every listener, so unlike
+/// the free [`begin_listening`] it never records a request for later.
+#[derive(Clone)]
+pub struct ListenHandle {
+    gates: Arc<ListenGates>,
+}
+
+impl ListenHandle {
+    pub(crate) fn new(gates: Arc<ListenGates>) -> Self {
+        Self { gates }
+    }
+
+    /// Begin listening on a deferred listener. The listener opens for every
+    /// worker.
+    ///
+    /// Calling it for a listener that is already listening returns `Ok(())`
+    /// and does nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `listener` names no listener, if
+    /// [`ShutdownHandle::shutdown`](crate::ShutdownHandle::shutdown) has been
+    /// called, or if `listen(2)` fails. A `listen(2)` failure leaves the
+    /// listener bound and not listening, so the call can be retried.
+    pub fn begin_listening(&self, listener: ListenerId) -> io::Result<()> {
+        self.gates.open(listener.index())
+    }
+
+    /// Applies [`begin_listening`](Self::begin_listening) to each listener in
+    /// index order and stops at the first failure: listeners before it stay
+    /// listening, later ones are not attempted.
+    ///
+    /// # Errors
+    ///
+    /// As [`begin_listening`](Self::begin_listening).
+    pub fn begin_listening_all(&self) -> io::Result<()> {
+        self.gates.open_all()
+    }
 }
 
 thread_local! {
@@ -266,8 +314,8 @@ fn with_gates<R>(f: impl FnOnce(&ListenGates) -> R) -> Option<R> {
 /// is bound but not listening, so a TCP readiness probe fails: on Linux the
 /// peer is refused, on macOS and the BSDs it times out.
 ///
-/// The listener is opened for every worker by the first call, from whichever
-/// worker makes it. To wait for warmup on every worker, count completions and
+/// The first call opens the listener for every worker, whichever worker makes
+/// it. To wait for warmup on every worker, count completions and
 /// call this from the last worker to finish.
 ///
 /// Calling it for a listener that is already listening returns `Ok(())` and
@@ -277,14 +325,16 @@ fn with_gates<R>(f: impl FnOnce(&ListenGates) -> R) -> Option<R> {
 ///
 /// # Errors
 ///
-/// Returns an error if called from a thread that is not a ringline worker, if
-/// `listener` names no listener, if the runtime is shutting down, or if
-/// `listen(2)` itself fails. A `listen(2)` failure leaves the gate closed, so
-/// the call can be retried.
+/// Returns an error if called from a thread that is not a ringline worker
+/// (use [`ListenHandle::begin_listening`] from other threads), if `listener` names no listener, if
+/// [`ShutdownHandle::shutdown`](crate::ShutdownHandle::shutdown) has been
+/// called or `launch()` has failed, or if `listen(2)` fails. A `listen(2)`
+/// failure leaves the listener bound and not listening, so the call can be
+/// retried.
 ///
 /// If called before `launch()` has bound the listener, which is possible from
-/// `on_start`, the call returns `Ok(())` and `launch()` performs the
-/// `listen(2)` and returns its error.
+/// `on_start`, the call records the request and returns `Ok(())`; `launch()`
+/// then calls `listen(2)` and, if it fails, returns that error.
 ///
 /// ```no_run
 /// # use std::future::Future;
@@ -298,7 +348,10 @@ fn with_gates<R>(f: impl FnOnce(&ListenGates) -> R) -> Option<R> {
 ///     fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
 ///         Some(Box::pin(async {
 ///             // warm caches, connect to backends, load config
-///             ringline::begin_listening(ListenerId::from_index(0)).expect("gate");
+///             if let Err(e) = ringline::begin_listening(ListenerId::from_index(0)) {
+///                 // also returned when the runtime is shutting down
+///                 eprintln!("begin_listening: {e}");
+///             }
 ///         }))
 ///     }
 ///     # fn create_for_worker(_id: usize) -> Self {
@@ -313,8 +366,9 @@ pub fn begin_listening(listener: ListenerId) -> io::Result<()> {
 
 /// Begin listening on every deferred listener.
 ///
-/// The [`begin_listening`] contract, applied to all of them. Returns the first
-/// failure; listeners opened before it stay open.
+/// Applies [`begin_listening`] to each listener in index order and stops at the
+/// first failure: listeners before it stay listening, later ones are not
+/// attempted.
 ///
 /// # Errors
 ///

@@ -155,7 +155,9 @@ impl ListenerId {
     /// a listener before any connection has arrived, for example to pass to
     /// [`begin_listening`](crate::begin_listening). Ids are per runtime: in a
     /// process running more than one, an id names the listener at that index
-    /// in the runtime of the worker that uses it.
+    /// in the runtime it is passed to: the calling worker's runtime for the
+    /// free functions, the handle's runtime for `ListenHandle` and
+    /// `ShutdownHandle` methods.
     pub fn from_index(index: u32) -> Self {
         ListenerId(index)
     }

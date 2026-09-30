@@ -1,9 +1,13 @@
 //! A `launch()` that fails after a deferred listener's acceptor has started
 //! must release that acceptor.
 //!
-//! This is its own test binary because it counts the process's
-//! `ringline-acceptor-*` threads, and acceptors started by any other test in
-//! the same process would be counted too.
+//! This is its own test binary because it counts the process's threads whose
+//! name starts with `ringline-accept`, and acceptors started by any other test
+//! in the same process would be counted too.
+//!
+//! It fails the second bind, so it covers the bind-failure rollback. The
+//! register and acceptor-spawn failure paths call the same
+//! `listen_gates.shutdown()` and have no test of their own.
 
 #![allow(clippy::manual_async_fn)]
 

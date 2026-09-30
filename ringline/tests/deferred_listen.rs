@@ -52,7 +52,8 @@ fn probe(addr: SocketAddr) -> std::io::Result<()> {
 /// refused immediately. Darwin drops the SYN, so the peer times out. Measured
 /// on Darwin 25.6 with no ringline involved: a socket bound without `listen`
 /// times out, an unbound port on the same host is refused, and the same socket
-/// connects once it listens. The Linux half of this claim is asserted here so CI checks it.
+/// connects once it listens. The Linux half of this claim is asserted here so
+/// CI checks it.
 fn assert_not_served(addr: SocketAddr, context: &str) {
     match TcpStream::connect_timeout(&addr, NOT_SERVED_TIMEOUT) {
         Ok(_) => panic!("{context}: connect succeeded on a listener that has not been released"),
@@ -424,8 +425,8 @@ impl AsyncEventHandler for ReleaseFromWorkerOne {
     }
 }
 
-/// The first `begin_listening` call opens the listener for every worker, so
-/// connections reach a worker that never called it.
+/// A release from a worker other than worker 0 serves connections on every
+/// worker, including one that never called `begin_listening`.
 #[test]
 fn one_workers_release_opens_the_listener_for_every_worker() {
     let config = ConfigBuilder::new()
@@ -459,7 +460,91 @@ fn one_workers_release_opens_the_listener_for_every_worker() {
         ACCEPTED_ON[0].load(Ordering::Acquire),
         "worker 0 never accepted, though it shares the opened listener"
     );
-    assert!(ACCEPTED_ON[1].load(Ordering::Acquire));
+    assert!(
+        ACCEPTED_ON[1].load(Ordering::Acquire),
+        "worker 1 never accepted"
+    );
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().expect("worker panicked").expect("worker error");
+    }
+}
+
+// ── Released from a thread that is not a worker ─────────────────────────
+
+/// A `ListenHandle` clone opens a deferred listener from another thread, where
+/// the free function returns an error, and dropping it leaves the runtime
+/// running.
+#[test]
+fn the_listen_handle_releases_from_any_thread() {
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
+        .bind("127.0.0.1:0".parse().unwrap())
+        .defer_listen()
+        .launch::<Greeter>()
+        .expect("launch");
+    let addr = shutdown
+        .bound_addr_of(ListenerId::from_index(0))
+        .expect("bound address");
+    let listen = shutdown.listen_handle();
+    assert_not_served(addr, "before the handle released it");
+
+    let remote = listen.clone();
+    std::thread::spawn(move || {
+        assert!(
+            ringline::begin_listening(ListenerId::from_index(0)).is_err(),
+            "the free function must refuse a thread that is not a worker"
+        );
+        remote
+            .begin_listening(ListenerId::from_index(0))
+            .expect("begin_listening");
+        // `remote` drops here.
+    })
+    .join()
+    .expect("releasing thread panicked");
+
+    probe(addr).expect("served once released, and after the clone dropped");
+    listen
+        .begin_listening(ListenerId::from_index(0))
+        .expect("a second call is a no-op");
+    assert!(
+        listen.begin_listening(ListenerId::from_index(7)).is_err(),
+        "an index past the last listener is an error"
+    );
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().expect("worker panicked").expect("worker error");
+    }
+    assert!(
+        listen.begin_listening(ListenerId::from_index(0)).is_err(),
+        "releasing after shutdown is an error"
+    );
+}
+
+/// `begin_listening_all` opens every deferred listener.
+#[test]
+fn the_listen_handle_releases_every_listener() {
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
+        .bind("127.0.0.1:0".parse().unwrap())
+        .defer_listen()
+        .bind("127.0.0.1:0".parse().unwrap())
+        .defer_listen()
+        .launch::<Greeter>()
+        .expect("launch");
+    let addrs: Vec<SocketAddr> = shutdown.bound_addrs().into_iter().flatten().collect();
+    assert_eq!(addrs.len(), 2);
+    for &addr in &addrs {
+        assert_not_served(addr, "before begin_listening_all");
+    }
+
+    shutdown
+        .listen_handle()
+        .begin_listening_all()
+        .expect("begin_listening_all");
+    for &addr in &addrs {
+        probe(addr).expect("served once every listener is released");
+    }
 
     shutdown.shutdown();
     for h in handles {

@@ -103,8 +103,8 @@ pub fn run_acceptor(config: AcceptorConfig) {
 
     // Wait for this listener's gate. It is already open unless the caller
     // asked for a deferred listen, in which case the socket is bound and not
-    // listening, and `accept4` on it would fail with EINVAL, and the acceptor
-    // would exit.
+    // listening, and `accept4` on it would fail with EINVAL, which ends the
+    // acceptor loop.
     //
     // A `false` return is shutdown, and the listen fd may already be closed,
     // so the thread returns without touching it.

@@ -249,6 +249,8 @@ pub use park::ParkState;
 pub use error::TimerExhausted;
 /// Errors returned by UDP send operations.
 pub use error::UdpSendError;
+/// Opens deferred listeners from any thread.
+pub use listen_gate::ListenHandle;
 /// Begin listening on a deferred listener, from any code on a ringline worker.
 pub use listen_gate::begin_listening;
 /// Begin listening on every deferred listener, from any code on a worker.

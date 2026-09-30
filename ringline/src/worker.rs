@@ -150,7 +150,10 @@ impl WorkerReadFd {
     }
 }
 
-/// Handle returned by `launch()` to trigger graceful shutdown of all workers.
+/// Handle returned by `launch()` for controlling the running runtime: shutdown,
+/// deferred listeners, accept steering and registered regions.
+///
+/// Dropping the handle shuts the runtime down.
 pub struct ShutdownHandle {
     shutdown_flag: Arc<AtomicBool>,
     worker_wake_handles: Vec<crate::wakeup::WakeHandle>,
@@ -208,6 +211,16 @@ impl ShutdownHandle {
     /// [`ListenerId`](crate::ListenerId).
     pub fn bound_addrs(&self) -> Vec<Option<SocketAddr>> {
         self.listeners.iter().map(|l| l.bound_addr).collect()
+    }
+
+    /// A handle for opening deferred listeners from any thread.
+    ///
+    /// The returned [`ListenHandle`](crate::ListenHandle) can be cloned and
+    /// moved to other threads, and dropping it does not shut the runtime
+    /// down. After this handle's [`shutdown`](Self::shutdown), its calls
+    /// return an error.
+    pub fn listen_handle(&self) -> crate::ListenHandle {
+        crate::ListenHandle::new(Arc::clone(&self.listen_gates))
     }
 
     /// Take a worker out of the accept rotation, or put it back.
@@ -727,7 +740,9 @@ impl RinglineBuilder {
     /// listener's [`ListenerId`](crate::ListenerId) once the server can
     /// serve. [`on_start`](crate::AsyncEventHandler::on_start) is the usual
     /// place, since work that needs the runtime (outbound connections,
-    /// timers, fs) runs there.
+    /// timers, fs) runs there. From a thread that is not a ringline worker,
+    /// call [`ListenHandle::begin_listening`](crate::ListenHandle::begin_listening)
+    /// on the handle from [`ShutdownHandle::listen_handle`] instead.
     ///
     /// The first `begin_listening` call opens the listener for every worker,
     /// and connections are then spread across all of them. `on_start` runs
@@ -1450,9 +1465,9 @@ impl RinglineBuilder {
                 let (fds, bound_addr) = match created {
                     Ok(created) => created,
                     Err(error) => {
-                        // Roll back the listeners already bound, or a failure on
-                        // the second bind would leave the first one listening
-                        // with no acceptor and no way to reach it. Shut the gates
+                        // Roll back the listeners already bound, or their ports
+                        // stay held and a listening socket keeps accepting into
+                        // workers that are being joined. Shut the gates
                         // first, as `ShutdownHandle::shutdown` does: an acceptor
                         // parked on a deferred gate is not woken by closing its fd.
                         listen_gates.shutdown();

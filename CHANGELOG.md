@@ -10,7 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Added
 
 - `RinglineBuilder::defer_listen` binds a listener without listening on it, and
-  `begin_listening` / `begin_listening_all` start it from a handler. The port is
+  `begin_listening` / `begin_listening_all` start it from code on a worker;
+  `ListenHandle` (from `ShutdownHandle::listen_handle`) does the same from any
+  thread; it is `Clone`, and dropping it does not shut the runtime down. The first call opens the listener for every worker. The port is
   reserved while the gate is closed, but the kernel does not complete
   handshakes, so a TCP readiness probe fails while the server is warming up
   instead of passing against a socket nothing will service. On Linux the peer is
