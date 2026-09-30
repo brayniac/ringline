@@ -90,8 +90,11 @@ enum Slot {
     /// Boxed so the enum stays pointer-sized and the client has a stable
     /// address.
     Connected(Box<Client>),
-    /// Checked out. The [`PooledClient`] holds the client and returns it here
-    /// when dropped.
+    /// Checked out, or reserved while a connect for this slot is in flight.
+    ///
+    /// A [`PooledClient`] holds the client and returns it here when dropped.
+    /// The reservation uses the same state so a second caller does not connect
+    /// a slot that is already being connected.
     Lent,
     Disconnected,
 }
@@ -106,6 +109,39 @@ struct Shared {
     next: Cell<usize>,
 }
 
+/// Holds a slot reserved as [`Lent`](Slot::Lent) across a connect.
+///
+/// Releases the slot back to [`Disconnected`](Slot::Disconnected) when dropped
+/// unless disarmed, so a `client()` or `connect_all()` future that is cancelled
+/// mid-connect — by [`timeout`](ringline::timeout), or by its task being
+/// dropped at teardown — does not leave the slot reserved forever. Restoring
+/// only on the error path would make cancellation permanently shrink the pool.
+struct Reservation<'a> {
+    shared: &'a Shared,
+    idx: usize,
+    armed: bool,
+}
+
+impl Reservation<'_> {
+    /// Keep the reservation: the caller is storing something in the slot.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // `try_borrow_mut` for the same reason as `PooledClient::drop`: a panic
+        // in `Drop` while unwinding would abort.
+        if let Ok(mut slots) = self.shared.slots.try_borrow_mut() {
+            slots[self.idx] = Slot::Disconnected;
+        }
+    }
+}
+
 /// A client checked out of a [`Pool`].
 ///
 /// Derefs to [`Client`]. On drop the client returns to its slot if the
@@ -113,11 +149,16 @@ struct Shared {
 /// reconnects on its next checkout.
 ///
 /// To evict a connection the pool should stop reusing — after a protocol error,
-/// where the socket is still open but the stream is out of step — call
+/// where the socket is still open but the response stream no longer matches
+/// the requests sent — call
 /// [`Client::close`] on it before dropping the guard.
 ///
 /// A guard that is never dropped leaves its slot checked out permanently, and
 /// the pool has one fewer connection to hand out.
+///
+/// If the guard is dropped outside the executor, for example when its task is
+/// dropped at connection teardown, the slot is marked disconnected and the
+/// connection is not closed.
 pub struct PooledClient {
     client: Option<Box<Client>>,
     idx: usize,
@@ -145,17 +186,25 @@ impl Drop for PooledClient {
         // Dropping a `Client` releases the connection's claim but does not
         // close the socket, so any path that does not return the client to a
         // slot must close it or the socket and driver slot leak.
+        //
+        // `is_alive()` gates each close below. It is false once the handle's
+        // generation no longer matches the driver's connection slot, and
+        // `ConnCtx::close` does not check the generation, so closing a stale
+        // handle would close whichever connection now holds that slot. It is
+        // also false outside the executor, where `close` does nothing.
+        //
+        // A `ValueStream` dropped mid-value calls `close()`, which marks the
+        // driver connection closing synchronously, so `is_alive` is false here.
+        let alive = client.is_alive();
 
         // The pool is gone and this is the last handle on the table, so there
         // is nobody to hand the client back to.
         if Rc::strong_count(&self.shared) == 1 {
-            client.close();
+            if alive {
+                client.close();
+            }
             return;
         }
-
-        // A `ValueStream` dropped mid-value calls `close()`, which marks the
-        // driver connection closing synchronously, so `is_alive` is false here.
-        let alive = client.is_alive();
 
         // `try_borrow_mut` rather than `borrow_mut`: no current path drops a
         // guard while the table is borrowed, so the failure arm is unreachable,
@@ -168,7 +217,11 @@ impl Drop for PooledClient {
                     Slot::Disconnected
                 };
             }
-            Err(_) => client.close(),
+            Err(_) => {
+                if alive {
+                    client.close();
+                }
+            }
         }
     }
 }
@@ -211,17 +264,34 @@ impl Pool {
         self.shared.slots.borrow().len()
     }
 
-    /// Eagerly connect all slots. Returns an error if any connection fails.
+    /// Connect every slot that is disconnected.
+    ///
+    /// Slots that are connected or checked out are left as they are, so this
+    /// can be called again, or while clients are checked out. Returns the
+    /// first connect error; slots connected before it stay connected.
     pub async fn connect_all(&self) -> Result<(), Error> {
         for i in 0..self.len() {
-            // Only fill slots that are actually empty. Overwriting a connected
-            // or checked-out slot would displace a live client, and dropping a
-            // `Client` does not close its connection, so the socket and driver
-            // slot would leak.
-            if !matches!(self.shared.slots.borrow()[i], Slot::Disconnected) {
-                continue;
+            // Reserve before awaiting, for the reason `client()` does: the
+            // check would otherwise be stale by the time of the write, and a
+            // concurrent checkout could connect the same slot. The loser's
+            // client would then be displaced and dropped, and dropping a
+            // `Client` does not close its connection, so the socket and the
+            // driver slot would leak.
+            {
+                let mut slots = self.shared.slots.borrow_mut();
+                if !matches!(slots[i], Slot::Disconnected) {
+                    continue;
+                }
+                slots[i] = Slot::Lent;
             }
+            let mut reservation = Reservation {
+                shared: &self.shared,
+                idx: i,
+                armed: true,
+            };
+            // On `Err` or cancellation the reservation releases the slot.
             let client = self.do_connect().await?;
+            reservation.disarm();
             self.shared.slots.borrow_mut()[i] = Slot::Connected(Box::new(client));
         }
         Ok(())
@@ -229,9 +299,15 @@ impl Pool {
 
     /// Get a [`Client`] bound to the next healthy connection.
     ///
-    /// Advances the round-robin cursor and returns a client for a connected
-    /// slot. Disconnected slots are lazily reconnected. If all slots fail,
-    /// returns [`Error::AllConnectionsFailed`].
+    /// Advances the round-robin cursor and returns a guard for a connected
+    /// slot. Disconnected slots are reconnected on demand; slots already
+    /// checked out are skipped. Returns [`Error::PoolExhausted`] if every slot
+    /// is checked out, and [`Error::AllConnectionsFailed`] if no slot could be
+    /// connected.
+    ///
+    /// The client is moved out of its slot and the slot is marked lent, so the
+    /// returned [`PooledClient`] does not borrow the pool and several may be
+    /// held at once.
     pub async fn client(&self) -> Result<PooledClient, Error> {
         let (idx, client) = self.checkout().await?;
         Ok(PooledClient {
@@ -249,47 +325,61 @@ impl Pool {
     /// may be held at once.
     async fn checkout(&self) -> Result<(usize, Box<Client>), Error> {
         let size = self.len();
+        if size == 0 {
+            return Err(Error::PoolExhausted);
+        }
+        // The cursor is read once, and the scan steps from that snapshot. A
+        // concurrent caller advances the cursor across this task's `await`, so
+        // re-reading it each iteration can move this scan past a slot it has
+        // not visited yet and revisit another, which can report
+        // `AllConnectionsFailed` while a usable slot exists. Stepping from a
+        // snapshot visits every index exactly once.
+        let start = self.shared.next.get();
+        self.shared.next.set((start + 1) % size);
         // Distinguishes "every slot is checked out" from "every connect failed".
         let mut attempted = false;
-        for _ in 0..size {
-            let idx = self.shared.next.get();
-            self.shared.next.set((idx + 1) % size);
+        for step in 0..size {
+            let idx = (start + step) % size;
 
-            // Scoped so the borrow ends before the `.await` below.
-            let taken = {
+            // One match decides all three cases, and `mem::replace` performs
+            // the reservation: the slot is `Lent` from here until either the
+            // guard returns it or the `Reservation` releases it. Reserving
+            // before the await is what stops a concurrent caller connecting
+            // the same slot and having its client displaced and dropped —
+            // dropping a `Client` does not close its connection.
+            enum Next {
+                Ready(Box<Client>),
+                Connect,
+                Skip,
+            }
+            let next = {
                 let mut slots = self.shared.slots.borrow_mut();
                 match std::mem::replace(&mut slots[idx], Slot::Lent) {
-                    Slot::Connected(client) => Some(client),
-                    // Put back what was there: a slot already lent out stays
-                    // lent, and a disconnected one is reconnected below.
-                    other => {
-                        slots[idx] = other;
-                        None
+                    Slot::Connected(client) => Next::Ready(client),
+                    // Already out: put it back and move on.
+                    Slot::Lent => {
+                        slots[idx] = Slot::Lent;
+                        Next::Skip
                     }
+                    // Left reserved by the replace above.
+                    Slot::Disconnected => Next::Connect,
                 }
             };
-            if let Some(client) = taken {
-                return Ok((idx, client));
+            match next {
+                Next::Ready(client) => return Ok((idx, client)),
+                Next::Skip => continue,
+                Next::Connect => {}
             }
-            // Reserve the slot before awaiting. Every method here takes
-            // `&self`, so a second task can reach this index while the connect
-            // is in flight; if the slot were left `Disconnected` both would
-            // connect it, and the loser's client would be displaced on drop.
-            // Dropping a `Client` does not close its connection — the halves'
-            // `Drop` only releases the claim — so that would leak the socket
-            // and the driver slot.
-            {
-                let mut slots = self.shared.slots.borrow_mut();
-                if matches!(slots[idx], Slot::Lent) {
-                    continue;
-                }
-                slots[idx] = Slot::Lent;
-            }
+            let mut reservation = Reservation {
+                shared: &self.shared,
+                idx,
+                armed: true,
+            };
+            // On failure or cancellation the reservation releases the slot.
             if let Ok(client) = self.do_connect().await {
+                reservation.disarm();
                 return Ok((idx, Box::new(client)));
             }
-            // The connect failed: give the reservation back.
-            self.shared.slots.borrow_mut()[idx] = Slot::Disconnected;
             attempted = true;
         }
         if attempted {
@@ -311,7 +401,6 @@ impl Pool {
     /// let mut client = pool.client().await?;
     /// let results = client.pipeline().get(b"a").get(b"b").execute().await?;
     /// ```
-    ///
     #[deprecated(note = "call `Client::pipeline` on a client from `Pool::client`")]
     pub async fn pipeline(&self) -> Result<PooledClient, Error> {
         self.client().await
@@ -344,7 +433,13 @@ impl Pool {
     /// is to close every connection.
     pub fn close_all(&self) {
         for slot in self.shared.slots.borrow_mut().iter_mut() {
-            if let Slot::Connected(client) = slot {
+            // `is_alive()` for the reason given in `PooledClient::drop`: a
+            // slot whose connection the runtime already closed holds a stale
+            // handle, and `ConnCtx::close` would close the slot's new
+            // occupant.
+            if let Slot::Connected(client) = slot
+                && client.is_alive()
+            {
                 client.close();
             }
             *slot = Slot::Disconnected;
@@ -374,7 +469,6 @@ impl Pool {
             .count()
     }
 
-    /// Total number of slots in the pool.
     /// Total number of slots in the pool, connected or not.
     pub fn pool_size(&self) -> usize {
         self.len()
@@ -392,7 +486,8 @@ impl Pool {
         let conn = connect.await?;
 
         // Return the authenticated client. `Connection` is not `Copy`, so no
-        // separate handle to the slot can be returned alongside it.
+        // second handle to the connection can be returned alongside the client
+        // built from it.
         let mut client = Client::new(conn);
         client
             .maybe_auth(self.password.as_deref(), self.username.as_deref())

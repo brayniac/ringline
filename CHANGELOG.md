@@ -49,7 +49,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   its client, so a connection is split once, when it is opened, rather than on
   every checkout. Several clients can be checked out at the same time, as
   before. `client`, `connect_all`, `mark_disconnected` and `close_all` now take
-  `&self`, and `lent_count` reports how many connections are checked out (#528).
+  `&self`, and `lent_count` reports how many connections are checked out. `client`
+  returns the new `Error::PoolExhausted` when every slot is checked out, which is
+  distinct from `AllConnectionsFailed`; `connect_all` connects only the slots that
+  are disconnected, so it can be called again or while clients are out (#528).
 
 - **Breaking:** `Pool::get_stream` is removed. Call `get_stream` on a client
   from `Pool::client` instead; the stream then borrows that client, so the guard

@@ -2607,13 +2607,23 @@ impl ConnCtx {
     /// path via `end_segments`) leaves the connection `Multi`/armed, so this
     /// returns `true` and the connection stays reusable.
     pub fn is_alive(&self) -> bool {
-        with_state(|driver, _| {
+        // `try_with_state`, not `with_state`: this is reachable from a `Drop`
+        // that runs outside a task poll. A connection-bound task is dropped by
+        // the teardown path (`remove_connection` on mio, `handle_close` on
+        // io_uring), which does not set `CURRENT_DRIVER`, so a panicking
+        // accessor there would unwind out of the event loop and kill the
+        // worker. `close()` and the half `Drop`s are null-safe for the same
+        // reason. Outside the executor the answer is unknowable, and `false`
+        // is the safe one: callers use this to decide whether to reuse a
+        // connection.
+        try_with_state(|driver, _| {
             driver
                 .connections
                 .get(self.conn_index)
                 .map(|cs| cs.generation == self.generation && !cs.close_requested())
                 .unwrap_or(false)
         })
+        .unwrap_or(false)
     }
 }
 
