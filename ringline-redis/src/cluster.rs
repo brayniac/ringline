@@ -283,8 +283,7 @@ impl ClusterClient {
     }
 
     async fn do_connect(&self, addr: SocketAddr) -> Result<Client, Error> {
-        // Options compose on one builder instead of branching over four
-        // entry points (#528).
+        // TLS and the timeout are set on the builder (#528).
         let mut connect = ringline::connect(addr);
         if let Some(sni) = &self.tls_server_name {
             connect = connect.tls(sni.as_str());
@@ -294,9 +293,8 @@ impl ClusterClient {
         }
         let conn = connect.await?;
 
-        // The authed client itself: a non-`Copy` `Connection` cannot be handed
-        // back alongside a client built from it, and every caller here built one
-        // immediately anyway (#528).
+        // Return the authenticated client. `Connection` is not `Copy`, so no
+        // separate handle can be returned alongside it (#528).
         let mut client = Client::new(conn);
         client
             .maybe_auth(self.password.as_deref(), self.username.as_deref())

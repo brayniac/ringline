@@ -1129,8 +1129,7 @@ async fn get_conn<'a>(shard: &'a mut Shard, opts: &ConnectOpts) -> Result<&'a mu
 }
 
 async fn do_connect(addr: SocketAddr, opts: &ConnectOpts) -> Result<Client, Error> {
-    // Options compose on one builder instead of branching over four
-    // entry points (#528).
+    // TLS and the timeout are set on the builder (#528).
     let mut connect = ringline::connect(addr);
     if let Some(ref sni) = opts.tls_server_name {
         connect = connect.tls(sni.as_str());
@@ -1140,8 +1139,7 @@ async fn do_connect(addr: SocketAddr, opts: &ConnectOpts) -> Result<Client, Erro
     }
     let conn = connect.await?;
 
-    // The authed client itself; see the pool's `do_connect` for why the handle
-    // cannot come back alongside it (#528).
+    // Return the authenticated client; see `Pool::do_connect` (#528).
     let mut client = Client::new(conn);
     client
         .maybe_auth(opts.password.as_deref(), opts.username.as_deref())

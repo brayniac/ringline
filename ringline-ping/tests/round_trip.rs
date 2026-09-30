@@ -213,7 +213,7 @@ impl AsyncEventHandler for PingPoolClientHandler {
         let server_addr = *POOL_SERVER_ADDR.get().expect("server addr not set");
         Some(Box::pin(async move {
             let config = PoolConfig::new(server_addr, 2).connect_timeout_ms(5000);
-            let mut pool = Pool::new(config);
+            let pool = Pool::new(config);
 
             if let Err(e) = pool.connect_all().await {
                 POOL_RESULT.set(format!("CONNECT_ERR:{e}")).ok();
@@ -226,7 +226,7 @@ impl AsyncEventHandler for PingPoolClientHandler {
 
             // Ping via pool.
             match pool.client().await {
-                Ok(client) => match client.ping().await {
+                Ok(mut client) => match client.ping().await {
                     Ok(()) => {}
                     Err(e) => {
                         POOL_RESULT.set(format!("PING_ERR:{e}")).ok();

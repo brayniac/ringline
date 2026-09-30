@@ -627,8 +627,7 @@ async fn get_conn<'a>(shard: &'a mut Shard, opts: &ConnectOpts) -> Result<&'a mu
 }
 
 async fn do_connect(addr: SocketAddr, opts: &ConnectOpts) -> Result<Client, Error> {
-    // Options compose on one builder instead of branching over four
-    // entry points (#528).
+    // TLS and the timeout are set on the builder (#528).
     let mut connect = ringline::connect(addr);
     if let Some(ref sni) = opts.tls_server_name {
         connect = connect.tls(sni.as_str());

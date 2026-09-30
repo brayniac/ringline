@@ -411,9 +411,8 @@ impl H2AsyncConn {
 
     /// Wrap an already-connected [`ringline::Connection`] (must be TLS for H2).
     ///
-    /// Sends the H2 preface and waits for SETTINGS exchange. Claiming the halves
-    /// is no longer a step that can fail here: a `Connection` already owns them
-    /// (#528).
+    /// Sends the H2 preface and waits for the SETTINGS exchange. The
+    /// `Connection` already owns both halves, so no claim step can fail (#528).
     pub async fn from_conn(conn: ringline::Connection) -> Result<Self, HttpError> {
         let h2 = H2Connection::new(Settings::client_default());
 

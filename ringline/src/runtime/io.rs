@@ -395,10 +395,10 @@ impl<T: 'static> Future for BlockingJoinHandle<T> {
 
 /// Begin an outbound TCP connection.
 ///
-/// Returns a builder; **nothing is submitted until it is awaited**, the same
-/// contract [`BackpressuredSendFuture`] carries. Awaiting resolves to an owned
-/// [`Connection`], with both halves already claimed — the same capability
-/// `on_accept` receives, so inbound and outbound connections are the same type.
+/// Returns a builder. Nothing is submitted until the builder is awaited;
+/// [`BackpressuredSendFuture`] has the same contract. Awaiting resolves to an
+/// owned [`Connection`] with both halves claimed, the same type that
+/// `on_accept` receives.
 ///
 /// ```ignore
 /// let conn = connect(addr).await?;
@@ -412,8 +412,8 @@ impl<T: 'static> Future for BlockingJoinHandle<T> {
 ///
 /// # Concurrency
 ///
-/// Because submission is deferred to the first poll, two builders held side by
-/// side do **not** overlap:
+/// Submission happens on the first poll, so two builders awaited one after the
+/// other run serially:
 ///
 /// ```ignore
 /// let a = connect(x);            // nothing submitted
@@ -421,12 +421,17 @@ impl<T: 'static> Future for BlockingJoinHandle<T> {
 /// let (ca, cb) = (a.await?, b.await?);   // serial: A then B
 /// ```
 ///
-/// Use [`join`](crate::join) for overlap, which submits both on their first
-/// poll and then waits for both:
+/// To run two connects concurrently, pass both builders to [`join`](crate::join).
+/// `join` polls each builder once, which submits both, and then waits for both:
 ///
 /// ```ignore
-/// let (ca, cb) = join(connect(x), connect(y)).await;
+/// let (a, b) = join(connect(x), connect(y)).await;
+/// let (ca, cb) = (a?, b?);
 /// ```
+///
+/// [`join`](crate::join) and [`join3`](crate::join3) take two and three
+/// futures. For more, spawn each connect with
+/// [`spawn_with_handle`](crate::spawn_with_handle) and await the handles.
 ///
 /// # Panics
 ///
@@ -441,10 +446,10 @@ pub fn connect(addr: SocketAddr) -> TcpConnect {
 
 /// Begin an outbound Unix-domain connection.
 ///
-/// The counterpart to [`connect`]; see it for the laziness and concurrency
-/// contract. There is deliberately no `.tls()` here: the driver terminates TLS
-/// on `SocketAddr` connections only, so TLS over a Unix socket is not
-/// *representable* rather than being refused at run time.
+/// See [`connect`] for the submission and concurrency contract; it is the same
+/// here. This builder has no `tls` method: the driver terminates TLS on
+/// `SocketAddr` connections only, so TLS over a Unix socket cannot be
+/// expressed.
 ///
 /// ```ignore
 /// let conn = connect_unix(path).await?;
@@ -463,10 +468,9 @@ pub fn connect_unix(path: impl AsRef<std::path::Path>) -> UnixConnect {
 
 /// Builder for an outbound TCP connection, from [`connect`].
 ///
-/// Inert until awaited. Options compose rather than multiplying entry points:
-/// transport is fixed by which function produced the builder, and TLS and
-/// timeout are independent of it — which is why a Unix connect can now take a
-/// timeout, something the old `connect_unix` could not express (#528).
+/// Nothing is submitted until the builder is awaited. The transport is fixed by
+/// the function that produced the builder; TLS and the timeout are set by
+/// methods on it (#528).
 #[must_use = "a connect builder does nothing until awaited"]
 pub struct TcpConnect {
     addr: SocketAddr,
@@ -476,6 +480,10 @@ pub struct TcpConnect {
 
 impl TcpConnect {
     /// Terminate TLS on this connection, with `server_name` as the SNI hostname.
+    ///
+    /// Requires a client configuration from
+    /// [`ConfigBuilder::tls_client`](crate::ConfigBuilder::tls_client); without
+    /// one the connect fails when awaited.
     pub fn tls(mut self, server_name: impl Into<String>) -> Self {
         self.server_name = Some(server_name.into());
         self
@@ -483,9 +491,12 @@ impl TcpConnect {
 
     /// Fail the connect if it has not completed within `timeout`.
     ///
-    /// A zero duration arms a timeout that fires immediately; the sub-millisecond
-    /// part of any duration is truncated, since both backends arm in whole
-    /// milliseconds.
+    /// On a TLS connection the window covers the TCP connect only, not the
+    /// handshake that follows.
+    ///
+    /// The duration is truncated to whole milliseconds, because both backends
+    /// arm in milliseconds. `Duration::ZERO` arms a timeout that fires
+    /// immediately rather than meaning "no timeout"; omit the call for that.
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
         self
@@ -494,7 +505,8 @@ impl TcpConnect {
 
 /// Builder for an outbound Unix-domain connection, from [`connect_unix`].
 ///
-/// Inert until awaited. Has no `.tls()`: see [`connect_unix`].
+/// Nothing is submitted until the builder is awaited. There is no `tls` method;
+/// see [`connect_unix`].
 #[must_use = "a connect builder does nothing until awaited"]
 pub struct UnixConnect {
     path: std::path::PathBuf,
@@ -504,7 +516,7 @@ pub struct UnixConnect {
 impl UnixConnect {
     /// Fail the connect if it has not completed within `timeout`.
     ///
-    /// See [`TcpConnect::timeout`] for how the duration is rounded.
+    /// See [`TcpConnect::timeout`] for how the duration is treated.
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
         self
@@ -646,19 +658,19 @@ pub fn request_shutdown() -> io::Result<()> {
 /// `send_chain_nowait`, `forward_recv_buf`, `shutdown_write`. Reading goes
 /// through [`RecvHalf`], writing through [`SendHalf`], and neither is `Copy`.
 ///
-/// That is what makes `ConnCtx` being `Copy` fine rather than a wart. Copying a
-/// *name* is harmless; copying a *capability* was the bug — it let two tasks
-/// write to one socket, which for a forward sink means interleaved SQEs on the
-/// wire, because a forward submits its own SQE instead of going through the
-/// connection's send queue (Domain Invariant 2).
+/// `ConnCtx` is `Copy` because it carries no I/O capability. A copyable handle
+/// that did carry one allowed two tasks to write to a single socket, which for
+/// a forward sink means interleaved SQEs on the wire, because a forward submits
+/// its own SQE rather than going through the connection's send queue (Domain
+/// Invariant 2).
 ///
-/// What a `ConnCtx` still does: identify a connection (`token`, `index`,
-/// `peer_addr`, `is_outbound`, `is_alive`, `tls_info`), manage its lifecycle
-/// (`close`, `cancel`, `request_shutdown`), open new connections
-/// (`connect`/`connect_tls`/…), name a forward sink, and — the important one —
-/// *mint the halves* with [`take_recv`](Self::take_recv),
-/// [`take_send`](Self::take_send) and [`split`](Self::split), each of which is
-/// exclusive.
+/// A `ConnCtx` identifies a connection (`token`, `index`, `peer_addr`,
+/// `is_outbound`, `is_alive`, `tls_info`), manages its lifecycle (`close`,
+/// `cancel`, `request_shutdown`), and names a forward sink. It can also mint the
+/// halves with [`take_recv`](Self::take_recv), [`take_send`](Self::take_send)
+/// and [`split`](Self::split); each is exclusive and fails if the half is
+/// already held. Connections delivered as a [`Connection`] already own their
+/// halves, so those methods are for the cases that start from a bare handle.
 ///
 /// # The read entry points are crate-private
 ///
@@ -678,14 +690,11 @@ pub fn request_shutdown() -> io::Result<()> {
 /// only through this handle, because `&mut RecvHalf` turns a second concurrent
 /// forward into a compile error.
 ///
-/// Outbound connections come back as a `ConnCtx` from [`connect`](crate::connect);
-/// accepted ones arrive as a [`Connection`] in [`AsyncEventHandler::on_accept`](crate::AsyncEventHandler::on_accept).
-/// It exposes an async API for reading data (`with_data`,
-/// `with_bytes`), sending data (`send`,
-/// `send_nowait`). Outbound connections come from the free functions
-/// [`connect`](crate::connect) and [`connect_unix`](crate::connect_unix), which
-/// resolve to an owned [`Connection`]; `ConnCtx` no longer carries a `connect`
-/// of its own, since it never used the receiver (#528).
+/// Both accepted and outbound connections are delivered as a [`Connection`]:
+/// accepted ones in
+/// [`AsyncEventHandler::on_accept`](crate::AsyncEventHandler::on_accept),
+/// outbound ones from [`connect`](crate::connect) and
+/// [`connect_unix`](crate::connect_unix) (#528).
 ///
 /// A `ConnCtx` is valid for the lifetime of the connection's async task.
 /// When the connection is closed, the task is dropped along with the `ConnCtx`.
@@ -3439,14 +3448,16 @@ impl RecvHalf {
     }
 }
 
-/// An accepted connection: the owned pair of halves, handed to
-/// [`AsyncEventHandler::on_accept`](crate::AsyncEventHandler::on_accept).
+/// An owned connection: the pair of claimed halves.
 ///
-/// Not `Copy`, not `Clone`, and `!Send`, so **one task owns one connection**.
-/// That is the whole point: the old `ConnCtx` was a `Copy` handle carrying the
-/// full read surface, so nothing stopped two readers from interleaving on one
-/// connection and desynchronising the protocol — the failure behind #423,
-/// #425 and #429.
+/// Delivered to
+/// [`AsyncEventHandler::on_accept`](crate::AsyncEventHandler::on_accept) for
+/// accepted connections, and resolved from [`connect`](crate::connect) and
+/// [`connect_unix`](crate::connect_unix) for outbound ones.
+///
+/// Not `Copy`, not `Clone`, and `!Send`, so one task owns one connection. A
+/// `Copy` handle carrying the read surface allowed two readers to interleave on
+/// one connection and desynchronise the protocol (#423, #425, #429).
 ///
 /// Most handlers can use this directly: the read and write methods are the
 /// same ones `ConnCtx` used to carry.
@@ -3460,7 +3471,7 @@ impl RecvHalf {
 /// }
 /// ```
 ///
-/// Sending *while a read is in flight* — an echo writing from inside its own
+/// Sending while a read is in flight — an echo writing from inside its own
 /// `with_data` closure — needs the two halves to be separately borrowable, so
 /// call [`split`](Self::split):
 ///
@@ -3489,14 +3500,13 @@ impl Connection {
         Self::from_claimed(conn)
     }
 
-    /// Build the pair from a slot whose halves the **caller** has already
-    /// marked claimed.
+    /// Build the pair from a slot whose halves the caller has already marked
+    /// claimed.
     ///
-    /// Both entry points need this, for different reasons: `spawn_accept_task`
-    /// runs outside a task poll and the event loop sets the claim while it owns
-    /// `&mut Driver`, while `ConnectFuture::poll` is already inside `with_state`
-    /// and sets it there. Neither can go through [`ConnCtx::split`], and
-    /// neither needs to.
+    /// Two callers use this. `spawn_accept_task` runs outside a task poll, and
+    /// the event loop sets the claim while it owns `&mut Driver`.
+    /// `ConnectFuture::poll` runs inside `with_state` and sets the claim there.
+    /// Neither goes through [`ConnCtx::split`].
     pub(crate) fn from_claimed(conn: ConnCtx) -> Self {
         Self {
             tx: SendHalf {
@@ -3513,11 +3523,9 @@ impl Connection {
     /// A dangling pair for in-memory unit tests.
     ///
     /// Mirrors `ConnCtx::for_test`: the halves are unclaimed and the connection
-    /// does not exist, so this is only safe on the buffered paths (encoders,
-    /// write buffers, pending queues) that never reach the wire. It carries
-    /// exactly that contract and no more — and the same `testing` feature gate,
-    /// because a constructor that hands out a dangling connection has no
-    /// business in the default public surface.
+    /// does not exist. The result is only safe on buffered paths (encoders,
+    /// write buffers, pending queues) that never reach the wire. Gated on the
+    /// `testing` feature for the same reason as `ConnCtx::for_test`.
     #[cfg(feature = "testing")]
     #[doc(hidden)]
     pub fn for_test(conn_index: u32, generation: u32) -> Self {
@@ -5501,13 +5509,13 @@ impl Drop for DirectEchoFuture {
 /// Future for an outbound connection, from awaiting [`TcpConnect`] or
 /// [`UnixConnect`].
 ///
-/// Submits on its **first poll**, not at construction, then waits for the CQE
-/// and resolves to an owned [`Connection`] with both halves claimed. Building
-/// one and never awaiting it does nothing at all — no socket, no slot, no SYN.
+/// Submits the connect on its first poll, waits for the completion, and
+/// resolves to an owned [`Connection`] with both halves claimed. A future that
+/// is never polled allocates no socket and no connection slot.
 ///
-/// That laziness is the one behavioural difference from the old eager
-/// `connect()`: two of these held side by side do not overlap unless they are
-/// [`join`](crate::join)ed. See [`connect`].
+/// Two of these futures awaited one after the other run serially. See
+/// [`connect`] for running them concurrently.
+#[must_use = "a connect future does nothing until polled"]
 pub struct ConnectFuture {
     state: ConnectState,
 }
@@ -5525,14 +5533,13 @@ enum ConnectState {
 }
 
 impl ConnectFuture {
-    /// Submit the connect described by `target`, arming a timeout if one was
-    /// asked for.
+    /// Submit the connect described by `target` and arm a timeout if one was
+    /// set.
     ///
-    /// Transport, TLS and timeout compose here rather than in the driver: the
-    /// base connect is chosen by transport, TLS by whether a server name was
-    /// given, and the timeout armed afterwards by index. `arm_connect_timeout`
-    /// is transport-agnostic on both backends, which is what lets
-    /// `connect_unix(..).timeout(..)` exist at all.
+    /// The driver call is chosen by transport and by whether a server name was
+    /// given. The timeout is armed afterwards by connection index;
+    /// `arm_connect_timeout` does not depend on the transport on either
+    /// backend.
     fn submit(
         target: &ConnectTarget,
         timeout: Option<Duration>,
@@ -5567,11 +5574,10 @@ impl Future for ConnectFuture {
     type Output = io::Result<Connection>;
 
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<Connection>> {
-        let this = unsafe { self.get_unchecked_mut() };
+        let this = self.get_mut();
         with_state(|driver, executor| {
-            // First poll: submit. A failure here is terminal and holds no slot,
-            // so the state goes straight to `Done` rather than leaving a
-            // half-built connect for `Drop` to reason about.
+            // First poll: submit. A submission failure holds no slot, so the
+            // state moves to `Done` and `Drop` has nothing to release.
             let (conn_index, generation) = match &this.state {
                 ConnectState::Unsubmitted { target, timeout } => {
                     match Self::submit(target, *timeout, driver, executor) {
@@ -5612,12 +5618,9 @@ impl Future for ConnectFuture {
                     this.state = ConnectState::Done;
                     match result {
                         Ok(()) => {
-                            // Claim both halves here, which is what `split()`
-                            // used to make the caller do — and what made
-                            // construction fallible for a reason the caller did
-                            // not cause. A freshly connected slot cannot have a
-                            // half out already, and `Connection` is not `Copy`,
-                            // so there is no second handle to race (#528).
+                            // Claim both halves. A freshly connected slot has
+                            // no half outstanding, and `Connection` is not
+                            // `Copy`, so no other handle can claim them (#528).
                             let idx = conn_index as usize;
                             driver.recv_half_taken[idx] = true;
                             driver.send_half_taken[idx] = true;
@@ -5640,9 +5643,9 @@ impl Future for ConnectFuture {
 
 impl Drop for ConnectFuture {
     fn drop(&mut self) {
-        // Unsubmitted and Done hold nothing: an un-awaited builder never
-        // reached the driver, and a resolved future already handed its slot to
-        // the `Connection` (or failed and holds none).
+        // `Unsubmitted` and `Done` hold no slot: an unpolled future never
+        // reached the driver, and a resolved future has either handed its slot
+        // to the `Connection` or failed without one.
         let (conn_index, generation) = match self.state {
             ConnectState::Waiting {
                 conn_index,

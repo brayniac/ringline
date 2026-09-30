@@ -123,7 +123,7 @@
 
 pub mod pool;
 pub mod sharded;
-pub use pool::{Pool, PoolConfig};
+pub use pool::{Pool, PoolConfig, PooledClient};
 pub use sharded::{ShardedClient, ShardedConfig};
 
 use std::cell::Cell;
@@ -184,6 +184,14 @@ pub enum Error {
     /// All connections in the pool are down and reconnection failed.
     #[error("all connections failed")]
     AllConnectionsFailed,
+    /// Every pooled connection is currently checked out.
+    ///
+    /// Distinct from [`AllConnectionsFailed`](Self::AllConnectionsFailed):
+    /// nothing failed and no connect was attempted. Drop a
+    /// [`PooledClient`] or size the pool for the number of
+    /// concurrent users.
+    #[error("every pooled connection is checked out")]
+    PoolExhausted,
 
     /// `recv()` called with no pending fire operations.
     #[error("no pending operations")]
@@ -482,9 +490,7 @@ impl ClientBuilder {
     /// request/response methods are simply absent from its surface instead of
     /// failing at runtime. Use [`build`](Self::build) for an ASCII [`Client`].
     ///
-    /// # Errors
-    ///
-    /// Same as [`Client::new`]: the read side must be free.
+    /// Cannot fail; see [`Client::new`].
     pub fn build_binary(self) -> BinaryClient {
         let mut client = self.build();
         client.binary = true;
@@ -521,11 +527,12 @@ impl ClientBuilder {
         self.finish(Some(halves))
     }
 
-    /// Assemble the client, taking the builder apart.
+    /// Assemble the client from the builder's fields.
     ///
-    /// `Connection::split` consumes the connection, which would partially move
-    /// a `self` the rest of this still reads. `halves` overrides, for the
-    /// in-memory unit tests whose handle is deliberately dangling.
+    /// The builder is destructured first because `Connection::split` consumes the
+    /// connection and the other fields are still needed. When `halves` is
+    /// `Some`, it is used instead of splitting the connection; the in-memory unit
+    /// tests pass a dangling handle this way.
     fn finish(self, halves: Option<(SendHalf, RecvHalf)>) -> Client {
         let Self {
             conn,
@@ -617,10 +624,7 @@ impl Client {
     /// Create a new client wrapping an established connection.
     ///
     /// No callbacks, no metrics, no kernel timestamps — zero overhead.
-    /// Infallible: a [`Connection`] *is* the claimed halves, so there is nothing
-    /// left to refuse. This took a `ConnCtx` and claimed the read side here via
-    /// `split()`, which could fail `EBUSY`/`EPIPE` for reasons the caller had
-    /// not caused (#528).
+    /// Cannot fail: a [`Connection`] already owns both halves (#528).
     pub fn new(conn: Connection) -> Self {
         let (tx, rx) = conn.split();
         Self {

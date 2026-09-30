@@ -26,8 +26,7 @@ impl AsyncEventHandler for ConnectHandler {
         let worker_id = self.worker_id;
         Some(Box::pin(async move {
             eprintln!("[worker {worker_id}] connecting to {target}");
-            // One error site: submission and completion are no longer separate
-            // failures (#528).
+            // Submission and completion report through one error path (#528).
             match connect(target).await {
                 Ok(conn) => {
                     eprintln!("[worker {worker_id}] connected to {target}");

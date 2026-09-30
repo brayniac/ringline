@@ -11,14 +11,16 @@
 //! # use ringline_ping::{Pool, PoolConfig};
 //! # async fn example() -> Result<(), ringline_ping::Error> {
 //! let config = PoolConfig::new("127.0.0.1:6379".parse().unwrap(), 4);
-//! let mut pool = Pool::new(config);
+//! let pool = Pool::new(config);
 //! pool.connect_all().await?;
 //! pool.client().await?.ping().await?;
 //! # Ok(())
 //! # }
 //! ```
 
+use std::cell::{Cell, RefCell};
 use std::net::SocketAddr;
+use std::rc::Rc;
 
 use ringline::ConnCtx;
 
@@ -33,6 +35,7 @@ pub struct PoolConfig {
     /// Connect timeout in milliseconds. 0 means no timeout.
     pub(crate) connect_timeout_ms: u64,
     /// TLS server name (SNI) for outbound connections. `None` means plain TCP.
+    /// Requires a client configuration from `ConfigBuilder::tls_client`.
     pub(crate) tls_server_name: Option<String>,
 }
 
@@ -62,16 +65,88 @@ impl PoolConfig {
 }
 
 enum Slot {
-    /// A pooled connection *is* a client.
-    ///
-    /// The slot held a bare `ConnCtx` and minted a throwaway `Client` per
-    /// checkout, which once the halves became claims meant a `split()` — two
-    /// driver round trips and two claim writes — every call. `ShardedClient`
-    /// moved to owning the client for that reason; `connect` resolving to a
-    /// non-`Copy` `Connection` (#528) finishes it here. One split per
-    /// *connection*, not per checkout.
+    /// Idle in the pool. Each slot owns its client, so a connection is split
+    /// once, when it is opened, rather than on every checkout (#528).
     Connected(Box<Client>),
+    /// Checked out. The [`PooledClient`] holds the client and returns it here
+    /// when dropped.
+    Lent,
     Disconnected,
+}
+
+/// Slot table shared between the pool and the clients checked out of it.
+///
+/// Held by the pool and by each checked-out client through an `Rc`, so a
+/// checked-out client does not borrow the pool. Single-threaded: the connection
+/// halves are `!Send`.
+struct Shared {
+    slots: RefCell<Vec<Slot>>,
+    next: Cell<usize>,
+}
+
+/// A client checked out of a [`Pool`].
+///
+/// Derefs to [`Client`]. On drop the client returns to its slot if the
+/// connection is still alive; if it is not, the slot is marked disconnected and
+/// reconnects on its next checkout.
+///
+/// To evict a connection the pool should stop reusing — after a protocol error,
+/// where the socket is still open but the stream is out of step — call
+/// [`Client::close`] on it before dropping the guard.
+///
+/// A guard that is never dropped leaves its slot checked out permanently, and
+/// the pool has one fewer connection to hand out.
+pub struct PooledClient {
+    client: Option<Box<Client>>,
+    idx: usize,
+    shared: Rc<Shared>,
+}
+
+impl std::ops::Deref for PooledClient {
+    type Target = Client;
+    fn deref(&self) -> &Client {
+        self.client.as_ref().expect("client is taken only in Drop")
+    }
+}
+
+impl std::ops::DerefMut for PooledClient {
+    fn deref_mut(&mut self) -> &mut Client {
+        self.client.as_mut().expect("client is taken only in Drop")
+    }
+}
+
+impl Drop for PooledClient {
+    fn drop(&mut self) {
+        let Some(mut client) = self.client.take() else {
+            return;
+        };
+        // Dropping a `Client` releases the connection's claim but does not
+        // close the socket, so any path that does not return the client to a
+        // slot must close it or the socket and driver slot leak.
+
+        // The pool is gone and this is the last handle on the table, so there
+        // is nobody to hand the client back to.
+        if Rc::strong_count(&self.shared) == 1 {
+            client.close();
+            return;
+        }
+
+        let alive = client.is_alive();
+
+        // `try_borrow_mut` rather than `borrow_mut`: no current path drops a
+        // guard while the table is borrowed, so the failure arm is unreachable,
+        // but a panic in `Drop` while unwinding would abort.
+        match self.shared.slots.try_borrow_mut() {
+            Ok(mut slots) => {
+                slots[self.idx] = if alive {
+                    Slot::Connected(client)
+                } else {
+                    Slot::Disconnected
+                };
+            }
+            Err(_) => client.close(),
+        }
+    }
 }
 
 /// A fixed-size connection pool with round-robin dispatch.
@@ -80,8 +155,7 @@ enum Slot {
 /// eager startup, or let [`client()`](Pool::client) lazily reconnect on demand.
 pub struct Pool {
     addr: SocketAddr,
-    slots: Vec<Slot>,
-    next: usize,
+    shared: Rc<Shared>,
     connect_timeout_ms: u64,
     tls_server_name: Option<String>,
 }
@@ -95,71 +169,114 @@ impl Pool {
         }
         Pool {
             addr: config.addr,
-            slots,
-            next: 0,
+            shared: Rc::new(Shared {
+                slots: RefCell::new(slots),
+                next: Cell::new(0),
+            }),
             connect_timeout_ms: config.connect_timeout_ms,
             tls_server_name: config.tls_server_name,
         }
     }
 
     /// Eagerly connect all slots. Returns an error if any connection fails.
-    pub async fn connect_all(&mut self) -> Result<(), Error> {
-        for i in 0..self.slots.len() {
+    pub async fn connect_all(&self) -> Result<(), Error> {
+        for i in 0..self.len() {
+            // Only fill slots that are actually empty. Overwriting a connected
+            // or checked-out slot would displace a live client, and dropping a
+            // `Client` does not close its connection, so the socket and driver
+            // slot would leak.
+            if !matches!(self.shared.slots.borrow()[i], Slot::Disconnected) {
+                continue;
+            }
             let client = self.do_connect().await?;
-            self.slots[i] = Slot::Connected(Box::new(client));
+            self.shared.slots.borrow_mut()[i] = Slot::Connected(Box::new(client));
         }
         Ok(())
     }
 
+    /// Number of slots, connected or not.
+    fn len(&self) -> usize {
+        self.shared.slots.borrow().len()
+    }
+
     /// Get a [`Client`] bound to the next healthy connection.
     ///
-    /// Advances the round-robin cursor and returns a client for a connected
-    /// slot. Disconnected slots are lazily reconnected. If all slots fail,
-    /// returns [`Error::AllConnectionsFailed`].
+    /// Advances the round-robin cursor and returns a guard for a connected
+    /// slot. Disconnected slots are reconnected on demand; slots already
+    /// checked out are skipped. Returns [`Error::PoolExhausted`] if every slot
+    /// is checked out, and [`Error::AllConnectionsFailed`] if no slot could be
+    /// connected.
     ///
-    /// # One live client per slot
-    ///
-    /// The pool owns each slot's client and lends it out, so two clients on one
-    /// slot is not representable — it used to be refused at run time with
-    /// `EBUSY`. Two clients reading one connection interleave their responses
-    /// and desynchronise the protocol, so this was never sound; now the borrow
-    /// checker says so instead of the driver (#528).
-    pub async fn client(&mut self) -> Result<&mut Client, Error> {
-        let size = self.slots.len();
+    /// The client is moved out of its slot and the slot is marked lent, so the
+    /// returned [`PooledClient`] does not borrow the pool and several may be
+    /// held at once.
+    pub async fn client(&self) -> Result<PooledClient, Error> {
+        let size = self.len();
+        // Distinguishes "every slot is checked out" from "every connect failed".
+        let mut attempted = false;
         for _ in 0..size {
-            let idx = self.next;
-            self.next = (self.next + 1) % size;
+            let idx = self.shared.next.get();
+            self.shared.next.set((idx + 1) % size);
 
-            match &self.slots[idx] {
-                Slot::Connected(_) => {
-                    // Re-index rather than returning the borrow from the match:
-                    // the `Disconnected` arm below needs `&mut self`.
-                    let Slot::Connected(client) = &mut self.slots[idx] else {
-                        unreachable!("just matched Connected")
-                    };
-                    return Ok(client);
-                }
-                Slot::Disconnected => {
-                    if let Ok(client) = self.do_connect().await {
-                        self.slots[idx] = Slot::Connected(Box::new(client));
-                        let Slot::Connected(client) = &mut self.slots[idx] else {
-                            unreachable!("just stored Connected")
-                        };
-                        return Ok(client);
+            // Scoped so the borrow ends before the `.await` below.
+            let taken = {
+                let mut slots = self.shared.slots.borrow_mut();
+                match std::mem::replace(&mut slots[idx], Slot::Lent) {
+                    Slot::Connected(client) => Some(client),
+                    other => {
+                        slots[idx] = other;
+                        None
                     }
                 }
+            };
+            if let Some(client) = taken {
+                return Ok(PooledClient {
+                    client: Some(client),
+                    idx,
+                    shared: Rc::clone(&self.shared),
+                });
             }
+            // Reserve the slot before awaiting. Every method here takes
+            // `&self`, so a second task can reach this index while the connect
+            // is in flight; if the slot were left `Disconnected` both would
+            // connect it, and the loser's client would be displaced on drop.
+            // Dropping a `Client` does not close its connection — the halves'
+            // `Drop` only releases the claim — so that would leak the socket
+            // and the driver slot.
+            {
+                let mut slots = self.shared.slots.borrow_mut();
+                if matches!(slots[idx], Slot::Lent) {
+                    continue;
+                }
+                slots[idx] = Slot::Lent;
+            }
+            if let Ok(client) = self.do_connect().await {
+                return Ok(PooledClient {
+                    client: Some(Box::new(client)),
+                    idx,
+                    shared: Rc::clone(&self.shared),
+                });
+            }
+            // The connect failed: give the reservation back.
+            self.shared.slots.borrow_mut()[idx] = Slot::Disconnected;
+            attempted = true;
         }
-        Err(Error::AllConnectionsFailed)
+        if attempted {
+            Err(Error::AllConnectionsFailed)
+        } else {
+            Err(Error::PoolExhausted)
+        }
     }
 
     /// Mark a connection as dead after a `ConnectionClosed` error.
     ///
     /// Matches by [`ConnCtx::token()`] and sets the slot to disconnected.
+    /// A connection that is currently checked out is not matched; call
+    /// [`Client::close`] on its guard instead.
     /// The next [`client()`](Pool::client) call will lazily reconnect.
-    pub fn mark_disconnected(&mut self, conn: ConnCtx) {
+    pub fn mark_disconnected(&self, conn: ConnCtx) {
         let token = conn.token();
-        for slot in &mut self.slots {
+        for slot in self.shared.slots.borrow_mut().iter_mut() {
             if let Slot::Connected(conn) = slot
                 && conn.token() == token
             {
@@ -170,9 +287,13 @@ impl Pool {
         }
     }
 
-    /// Close all connections and reset slots to disconnected.
-    pub fn close_all(&mut self) {
-        for slot in &mut self.slots {
+    /// Close all idle connections and reset their slots to disconnected.
+    ///
+    /// A connection currently checked out is not closed here: its
+    /// [`PooledClient`] owns it, and dropping that returns it to a slot this
+    /// call has already reset.
+    pub fn close_all(&self) {
+        for slot in self.shared.slots.borrow_mut().iter_mut() {
             if let Slot::Connected(conn) = slot {
                 conn.close();
             }
@@ -180,22 +301,34 @@ impl Pool {
         }
     }
 
-    /// Number of currently connected slots.
+    /// Number of slots holding an idle connection. Does not count connections
+    /// currently checked out; see [`lent_count`](Pool::lent_count).
     pub fn connected_count(&self) -> usize {
-        self.slots
+        self.shared
+            .slots
+            .borrow()
             .iter()
             .filter(|s| matches!(s, Slot::Connected(_)))
             .count()
     }
 
-    /// Total number of slots in the pool.
+    /// Number of connections currently checked out.
+    pub fn lent_count(&self) -> usize {
+        self.shared
+            .slots
+            .borrow()
+            .iter()
+            .filter(|s| matches!(s, Slot::Lent))
+            .count()
+    }
+
+    /// Total number of slots in the pool, connected or not.
     pub fn pool_size(&self) -> usize {
-        self.slots.len()
+        self.len()
     }
 
     async fn do_connect(&self) -> Result<Client, Error> {
-        // Options compose on one builder instead of branching over four
-        // entry points (#528).
+        // TLS and the timeout are set on the builder (#528).
         let mut connect = ringline::connect(self.addr);
         if let Some(sni) = &self.tls_server_name {
             connect = connect.tls(sni.as_str());

@@ -34,7 +34,7 @@ impl AsyncEventHandler for RedisHandler {
                 }
             };
 
-            // Infallible now: a `Connection` already owns both halves (#528).
+            // `Client::new` cannot fail: a `Connection` owns both halves (#528).
             let mut client = ringline_redis::Client::new(conn);
 
             // SET a key.

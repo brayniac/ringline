@@ -24,7 +24,7 @@
 //! | **Send** | 1 | 6-byte `PING\r\n` copied into the send pool. |
 
 pub mod pool;
-pub use pool::{Pool, PoolConfig};
+pub use pool::{Pool, PoolConfig, PooledClient};
 
 use std::cell::Cell;
 use std::io;
@@ -62,6 +62,14 @@ pub enum Error {
     /// All connections in the pool are down and reconnection failed.
     #[error("all connections failed")]
     AllConnectionsFailed,
+    /// Every pooled connection is currently checked out.
+    ///
+    /// Distinct from [`AllConnectionsFailed`](Self::AllConnectionsFailed):
+    /// nothing failed and no connect was attempted. Drop a
+    /// [`PooledClient`] or size the pool for the number of
+    /// concurrent users.
+    #[error("every pooled connection is checked out")]
+    PoolExhausted,
 }
 
 // ── Command types ───────────────────────────────────────────────────────
@@ -172,12 +180,10 @@ impl ClientBuilder {
 
     /// Build the client.
     ///
-    /// # Errors
-    ///
-    /// Same as [`Client::new`]: the read side must be free.
+    /// Cannot fail; see [`Client::new`].
     pub fn build(self) -> Client {
-        // Destructured because `Connection::split` consumes the connection,
-        // which would partially move a `self` the rest of this still reads.
+        // Destructure first: `Connection::split` consumes the connection and
+        // the other fields are still needed.
         let Self {
             conn,
             on_result,
@@ -227,10 +233,7 @@ impl Client {
     ///
     /// No callbacks, no metrics, no kernel timestamps — zero overhead.
     ///
-    /// Infallible: a [`Connection`] *is* the claimed halves, so there is nothing
-    /// left to refuse. This took a `ConnCtx` and claimed the read side here via
-    /// `split()`, which could fail `EBUSY`/`EPIPE` for reasons the caller had
-    /// not caused (#528).
+    /// Cannot fail: a [`Connection`] already owns both halves (#528).
     pub fn new(conn: Connection) -> Self {
         let (tx, rx) = conn.split();
         Self {

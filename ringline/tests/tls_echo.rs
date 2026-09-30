@@ -1,7 +1,7 @@
 //! End-to-end TLS echo tests.
 //!
 //! Tests the core TLS machinery: server-side TLS accept (handshake + data
-//! exchange), and outbound `connect_tls` from one ringline worker to another.
+//! exchange), and outbound `connect(addr).tls(..)` from one ringline worker to another.
 //! Uses self-signed certificates generated at test time via `rcgen`.
 
 use std::future::Future;

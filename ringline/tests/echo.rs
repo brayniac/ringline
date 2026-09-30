@@ -4089,7 +4089,7 @@ fn async_udp_echo() {
 // ── Standalone task using free connect() ─────────────────────────
 
 /// Handler where on_accept spawns a standalone task that uses the free
-/// ringline::connect() (not ConnCtx::connect) to reach a backend echo server.
+/// the free `ringline::connect()` to reach a backend echo server.
 struct StandaloneConnectHandler;
 
 static STANDALONE_CONNECT_BACKEND: std::sync::OnceLock<SocketAddr> = std::sync::OnceLock::new();
@@ -5153,8 +5153,7 @@ impl AsyncEventHandler for ConnectTimeoutClient {
             // Connect to a black-hole address with a 50ms timeout.
             // 192.0.2.1 is TEST-NET-1 (RFC 5737) — routable but unreachable.
             let addr: SocketAddr = "192.0.2.1:12345".parse().unwrap();
-            // One error site now, so the SUBMIT_ERR arm is gone: submission and
-            // completion are no longer separate failures (#528).
+            // Submission and completion report through one error path (#528).
             match ringline::connect(addr)
                 .timeout(std::time::Duration::from_millis(50))
                 .await

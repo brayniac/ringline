@@ -331,6 +331,11 @@ borrowing a *pooled* connection; an undrained drop poisons it (`close()`), and a
 desynced connection must never be returned to the pool as reusable. This is
 soundly handled without touching the shared `ValueStream` machinery:
 
+> **Superseded in #528.** `Pool::get_stream` was removed: a stream now borrows a
+> `PooledClient` from `Pool::client`, and the guard's drop performs the health
+> check that `reconcile_stream_slot` did. The reasoning below still describes why
+> the exclusivity is needed; only the mechanism changed.
+
 - **The borrow enforces exclusivity.** `Pool::get_stream(&mut self) ->
   ValueStream<'_>` borrows `&mut Pool` for the stream's whole lifetime, so no
   other pool operation can run while a stream is live — the streamed connection

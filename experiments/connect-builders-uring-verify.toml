@@ -85,11 +85,16 @@ cd /home/anvil
   grep -q "pub struct TcpConnect" ringline/src/runtime/io.rs \
     || { echo "FATAL: branch lacks TcpConnect"; exit 1; }
 
-  # prlimit, not `ulimit -n`: the builtin cannot raise the soft limit past the
-  # hard one, and `sudo ulimit` is meaningless (a shell builtin; sudo cannot
-  # change the calling shell's limits).
-  sudo prlimit --nofile=1000000 --pid $$ 2>/dev/null || ulimit -n 65536 2>/dev/null || true
+  # Raise the soft limit to the hard limit; `ulimit -n` needs no privileges for
+  # that. `sudo prlimit` returns 0 without applying a value above the hard
+  # limit, so a `||` fallback after it would not run, and the uring test binary
+  # aborts with io_uring_setup EMFILE at a 1024 soft limit.
+  hard=$(ulimit -Hn)
+  [ "$hard" = "unlimited" ] && hard=1048576
+  ulimit -n "$hard" 2>/dev/null || sudo prlimit --nofile="$hard" --pid $$ 2>/dev/null || true
   echo "fd soft=$(ulimit -Sn) hard=$(ulimit -Hn)"
+  # Assert the limit took.
+  [ "$(ulimit -Sn)" -ge 65536 ] || { echo "FATAL: fd soft limit $(ulimit -Sn) too low for the uring test binary"; exit 1; }
 
   # GATE: io_uring, or the whole job is meaningless.
   cargo run --locked -q -p ringline-bench --bin bench-server -- --print-backend > bk.txt 2>/dev/null || true

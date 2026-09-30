@@ -399,7 +399,7 @@ fn memcache_pool() {
                 let result = async {
                     let addr: SocketAddr = MEMCACHE_ADDR.parse().unwrap();
                     let config = PoolConfig::new(addr, 2).connect_timeout_ms(5000);
-                    let mut pool = Pool::new(config);
+                    let pool = Pool::new(config);
                     pool.connect_all()
                         .await
                         .map_err(|e| format!("connect_all: {e}"))?;
@@ -411,7 +411,7 @@ fn memcache_pool() {
                         ));
                     }
 
-                    let client = pool.client().await.map_err(|e| format!("client: {e}"))?;
+                    let mut client = pool.client().await.map_err(|e| format!("client: {e}"))?;
                     client
                         .set("ringline-test:pool", "pool-value")
                         .await

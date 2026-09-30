@@ -231,7 +231,7 @@ pub struct Config {
     /// the `bind*()` calls; an entry of `None` falls back to `tls` above.
     /// Empty in client-only mode.
     pub(crate) listener_tls: Vec<Option<TlsConfig>>,
-    /// Optional TLS client configuration for outbound `connect_tls()` calls.
+    /// Optional TLS client configuration for outbound `connect(addr).tls(..)` calls.
     pub(crate) tls_client: Option<TlsClientConfig>,
     /// Enable TCP_NODELAY on all connections (accepted and outbound).
     pub(crate) tcp_nodelay: bool,
