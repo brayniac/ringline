@@ -257,3 +257,48 @@ four of the six integration tests red and leaves the ungated control green.
 **What the peer sees is platform-specific**, which the entry above records with
 its measurement. The consequence for the feature is that only Linux fails a
 readiness probe quickly; Darwin makes the prober wait out its own timeout.
+
+## The reservation was not a reservation, on Linux
+
+The entry above, and the first implementation, claimed a gated listener
+reserves its port. **Linux CI falsified that**, through an assertion this PR
+happened to add: `std::net::TcpListener::bind()` on a gated port succeeds.
+Five test jobs failed, all Linux, both backends; macOS passed, which is why no
+local gate saw it.
+
+`create_listener` sets `SO_REUSEADDR`. Linux allows two `SO_REUSEADDR` sockets
+to bind one address while **neither** is listening, and that is exactly the
+state a gated listener sits in. Binding and listening used to be adjacent
+lines, so the window was microseconds; deferring `listen` stretched it to
+however long warmup takes.
+
+Probed on the rig rather than read out of kernel source, predictions written
+into the spec first. Linux 6.12.107 aarch64, plain sockets, no ringline:
+
+| arm | setup | predicted | measured |
+|---|---|---|---|
+| A | `SO_REUSEADDR`, not listening | squatter can bind | **yes** |
+| B | `SO_REUSEADDR` cleared after bind | squatter cannot | **cannot**, `EADDRINUSE` |
+| C | no `SO_REUSEADDR` | squatter cannot | **cannot**, `EADDRINUSE` |
+| D | squatter binds *and listens* first | unknown | our `listen` fails `EADDRINUSE` |
+
+D bounded the severity before any fix was written: there is no state in which
+two sockets listen on one address, so nothing is silently misrouted. The worst
+case is a stolen port that `begin_listening` reports, and `ListenGates::open`
+already returns the `listen(2)` error and leaves the gate closed and
+retryable.
+
+B is the fix, and it costs nothing: `SO_REUSEADDR` exists to tolerate a
+previous incarnation's `TIME_WAIT` **at bind time**, while the conflict check a
+later binder runs reads the flag on the socket already bound. Setting it for
+the bind and clearing it immediately after keeps the tolerance and restores
+exclusivity. It is a no-op for an ungated listener, because a listening socket
+conflicts with a later bind regardless of the flag — so the same code path
+serves both, which is what the design wanted anyway.
+
+The lesson is not about sockets. The claim "the port is reserved" was carried
+from the issue into the design entry, the rustdoc, the module docs and the
+changelog without anyone checking it, and it was wrong on the only platform
+that matters for this runtime. It survived four documents and a design review.
+What caught it was an assertion written because it was cheap, not because the
+claim was in doubt.

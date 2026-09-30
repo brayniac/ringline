@@ -1723,7 +1723,11 @@ fn bind_reuseport_socket(addr: SocketAddr) -> Result<RawFd, crate::error::Error>
     Ok(fd)
 }
 
-/// Create a TCP listener without SO_REUSEPORT (just SO_REUSEADDR).
+/// Create a bound TCP listener, without SO_REUSEPORT and without listening.
+///
+/// SO_REUSEADDR is set for the bind and cleared immediately after it, so
+/// the socket tolerates a previous incarnation's TIME_WAIT without leaving
+/// the port open to a second binder while it is not yet listening.
 fn create_listener(addr: SocketAddr) -> Result<RawFd, crate::error::Error> {
     let domain = if addr.is_ipv4() {
         libc::AF_INET
@@ -1759,6 +1763,37 @@ fn create_listener(addr: SocketAddr) -> Result<RawFd, crate::error::Error> {
             libc::close(fd);
         }
         return Err(crate::error::Error::Io(err));
+    }
+
+    // Clear SO_REUSEADDR now that the bind has succeeded, so the port is
+    // reserved against another process for as long as this socket holds it.
+    //
+    // Linux lets two SO_REUSEADDR sockets share an address while *neither* is
+    // listening, and its conflict check reads the flag on the socket that is
+    // already bound. A listener therefore reserved its port exclusively only
+    // once it listened — which used to be the next line, and with a deferred
+    // listen is however long the handler takes. Clearing the flag closes that
+    // window without giving up what SO_REUSEADDR is for, because its
+    // TIME_WAIT tolerance is only needed for the bind above.
+    //
+    // No effect on a listener that is not deferred: a listening socket
+    // conflicts with a later bind regardless of the flag.
+    //
+    // Measured on Linux 6.12 aarch64 with plain sockets: left set, a second
+    // bind succeeds; cleared after bind, it fails EADDRINUSE. Darwin refuses
+    // the second bind either way, which is why only Linux CI caught this. If
+    // a squatter does win the race it takes `listen(2)` to do so, and our own
+    // `listen` then fails EADDRINUSE — which `begin_listening` reports rather
+    // than silently sharing the port.
+    let clear: libc::c_int = 0;
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_REUSEADDR,
+            &clear as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
     }
 
     Ok(fd)
