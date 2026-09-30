@@ -7,7 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `RinglineBuilder::defer_listen` binds a listener without listening on it, and
+  `begin_listening` / `begin_listening_all` start it from a handler. The port is
+  reserved while the gate is closed, but the kernel does not complete
+  handshakes, so a TCP readiness probe fails while the server is warming up
+  instead of passing against a socket nothing will service. On Linux the peer is
+  refused with `ECONNREFUSED`; on macOS and the BSDs the SYN is dropped and the
+  peer times out. The gate is per listener, keyed by `ListenerId`, so a health
+  port can serve while a data port is held back (#534).
+
+  ```rust
+  RinglineBuilder::new(config)
+      .bind(health_addr)          // serving when launch returns
+      .bind(data_addr)
+      .defer_listen()             // held until begin_listening
+      .launch::<Handler>()?;
+  ```
+
+  Not yet supported with `AcceptMode::Merged`, which refuses the combination at
+  launch rather than ignoring the deferral.
+
+- `ListenerId::from_index` is public. Ids follow `bind()` call order, so a
+  listener can be named before any connection has arrived.
+
 ### Changed
+
+- `AsyncEventHandler::on_start`'s documentation said the returned future "runs
+  before the event loop begins accepting connections". It does not: it is
+  spawned as a standalone task and runs concurrently with accepting. The
+  documentation is corrected and points at `defer_listen` for an actual
+  readiness gate. No behaviour change (#534).
+
 
 - **Breaking:** `connect` and `connect_unix` return builders that resolve to an
   owned `Connection`. `connect_with_timeout`, `connect_tls`,

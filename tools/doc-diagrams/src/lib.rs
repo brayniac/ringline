@@ -201,14 +201,23 @@ pub fn verify_source_claims(root: &Path) -> io::Result<()> {
     require_order(
         &worker,
         "startup_rx.recv()",
-        "create_listener(*addr, self.config.backlog)",
-        "every worker reports readiness before any listener is created",
+        "create_listener(*addr)",
+        "every worker reports readiness before any listener is bound",
     )?;
     require_order(
         &worker,
-        "create_listener(*addr, self.config.backlog)",
+        "create_listener(*addr)",
         ".name(format!(\"ringline-acceptor-{idx}\"))",
-        "each listener is created before its acceptor thread starts",
+        "each listener is bound before its acceptor thread starts",
+    )?;
+    // `create_listener` binds but does not listen; the gate owns `listen(2)`,
+    // so a listener reaches its acceptor thread already registered with the
+    // gate the acceptor then waits on.
+    require_order(
+        &worker,
+        "listen_gates.register(idx as u32, fds.clone())",
+        ".name(format!(\"ringline-acceptor-{idx}\"))",
+        "a listener's sockets are registered with its gate before its acceptor starts",
     )?;
 
     let runtime = fs::read_to_string(root.join("ringline/src/runtime/mod.rs"))?;
@@ -564,7 +573,7 @@ fn render_runtime() -> String {
         &mut svg,
         50,
         84,
-        "Workers become ready before the listener exists.",
+        "Workers become ready before any listener is bound.",
         16,
         false,
     );

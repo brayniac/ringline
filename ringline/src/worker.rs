@@ -172,6 +172,11 @@ pub struct ShutdownHandle {
     /// so the field layout is identical across backends.
     #[cfg_attr(not(has_io_uring), allow(dead_code))]
     region_registrar: Arc<crate::region_registry::RegionRegistrar>,
+    /// The listen gates, so `shutdown()` can release an acceptor parked on a
+    /// gate that was never opened. Closing the listen fd wakes a thread
+    /// inside `accept4`; it does not reach one waiting to be allowed to call
+    /// `listen`.
+    listen_gates: Arc<crate::listen_gate::ListenGates>,
 }
 
 impl ShutdownHandle {
@@ -378,6 +383,11 @@ impl ShutdownHandle {
     /// Also closes the listen fd to unblock the acceptor's `accept()`.
     pub fn shutdown(&self) {
         self.shutdown_flag.store(true, Ordering::Release);
+        // Before the listen fds are closed: an acceptor parked on a gate that
+        // was never opened is not inside `accept4`, so closing its fd does
+        // not reach it. Releasing the gate first means it wakes, sees
+        // shutdown, and leaves without touching the fd.
+        self.listen_gates.shutdown();
         for listener in &self.listeners {
             if listener.closed.swap(true, Ordering::AcqRel) {
                 continue;
@@ -461,6 +471,11 @@ struct ListenerSpec {
     /// TLS for this listener only. `None` falls back to the process-wide
     /// `ConfigBuilder::tls()`, so single-listener setups are unchanged.
     tls: Option<crate::config::TlsConfig>,
+    /// Bind this listener but do not listen on it until a handler calls
+    /// [`begin_listening`](crate::begin_listening). `false` — listen during
+    /// `launch()` — is the default and what every listener did before gates
+    /// existed.
+    defer_listen: bool,
 }
 
 /// A listener the runtime owns, after binding. One per `bind*()` call, in
@@ -642,6 +657,10 @@ fn getsockname_v4_v6(fd: RawFd) -> Option<SocketAddr> {
 pub struct RinglineBuilder {
     config: Config,
     listeners: Vec<ListenerSpec>,
+    /// `defer_listen()` was called with no listener to apply it to. Reported
+    /// by `launch()` rather than panicking at the call, so it reads like
+    /// every other configuration error.
+    defer_listen_without_bind: bool,
 }
 
 impl RinglineBuilder {
@@ -650,6 +669,7 @@ impl RinglineBuilder {
         RinglineBuilder {
             config,
             listeners: Vec::new(),
+            defer_listen_without_bind: false,
         }
     }
 
@@ -659,6 +679,7 @@ impl RinglineBuilder {
         self.listeners.push(ListenerSpec {
             addr: BindAddr::Tcp(addr),
             tls: None,
+            defer_listen: false,
         });
         self
     }
@@ -671,6 +692,7 @@ impl RinglineBuilder {
         self.listeners.push(ListenerSpec {
             addr: BindAddr::Unix(path.as_ref().to_path_buf()),
             tls: None,
+            defer_listen: false,
         });
         self
     }
@@ -690,7 +712,51 @@ impl RinglineBuilder {
         self.listeners.push(ListenerSpec {
             addr: BindAddr::Tcp(addr),
             tls: Some(tls),
+            defer_listen: false,
         });
+        self
+    }
+
+    /// Bind the most recently added listener without listening on it.
+    ///
+    /// The port is reserved, so nothing else can take it, but the kernel does
+    /// not complete handshakes, so a TCP readiness probe fails while the
+    /// server is not ready. On Linux the peer is refused with
+    /// `ECONNREFUSED`; on macOS and the BSDs the SYN is dropped instead and
+    /// the peer times out. Call
+    /// [`begin_listening()`](crate::begin_listening) with this listener's
+    /// [`ListenerId`](crate::ListenerId) once the server can serve — from
+    /// [`on_start`](crate::AsyncEventHandler::on_start), which is where work
+    /// that needs the runtime (outbound connections, timers, fs) has to
+    /// happen.
+    ///
+    /// This is deferred `listen`, not deferred `accept`. Deferring `accept`
+    /// would let the kernel complete the handshake without the server, so a
+    /// load balancer's TCP check would pass against an instance that cannot
+    /// serve.
+    ///
+    /// Applies to the listener added by the preceding `bind*()` call, so it
+    /// is written immediately after one. Calling it before any `bind*()` is a
+    /// configuration error and `launch()` reports it.
+    ///
+    /// ```no_run
+    /// # use ringline::{Config, RinglineBuilder};
+    /// # fn example(config: Config) -> Result<(), ringline::Error> {
+    /// let builder = RinglineBuilder::new(config)
+    ///     .bind("0.0.0.0:8080".parse().unwrap())  // health, serving at once
+    ///     .bind("0.0.0.0:9090".parse().unwrap())  // data, gated
+    ///     .defer_listen();
+    /// # let _ = builder;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn defer_listen(mut self) -> Self {
+        match self.listeners.last_mut() {
+            Some(spec) => spec.defer_listen = true,
+            // Recorded rather than panicked: the builder reports every other
+            // misconfiguration through `launch()`.
+            None => self.defer_listen_without_bind = true,
+        }
         self
     }
 
@@ -978,6 +1044,17 @@ impl RinglineBuilder {
         // completed fallible setup. No socket is bound or listening yet.
         let pending_listeners = std::mem::take(&mut self.listeners);
         let has_acceptor = !pending_listeners.is_empty();
+        if self.defer_listen_without_bind {
+            return Err(crate::error::Error::RingSetup(
+                "defer_listen() was called before any bind() — it applies to the listener added                  by the preceding bind call, so it belongs immediately after one"
+                    .into(),
+            ));
+        }
+        // One gate per listener, whether or not it is deferred: an ungated
+        // listener is one whose gate `launch()` opens itself, which keeps a
+        // single path through `listen(2)`.
+        let listen_gates =
+            crate::listen_gate::ListenGates::new(pending_listeners.len(), self.config.backlog);
         // Hand the per-listener TLS configs to every worker: the driver's
         // `TlsTable` selects by `ListenerId` at accept time, so it needs the
         // whole list, indexed the same way.
@@ -1027,6 +1104,17 @@ impl RinglineBuilder {
         // listener keeps its acceptor thread even in merged mode.
         let merged_mode =
             self.config.accept_mode == crate::config::AcceptMode::Merged && cfg!(has_io_uring);
+        // Merged mode arms accept on the worker rings rather than in an
+        // acceptor thread, so the gate has to reach `arm_merged_accepts`
+        // per listener rather than as the one process-wide flag it reads
+        // today. Refused rather than silently ignored — a deferral that does
+        // not defer is the failure this feature exists to prevent.
+        if merged_mode && pending_listeners.iter().any(|spec| spec.defer_listen) {
+            return Err(crate::error::Error::RingSetup(
+                "defer_listen() is not supported with AcceptMode::Merged yet; use the default                  AcceptMode::Pool, or bind that listener without deferring"
+                    .into(),
+            ));
+        }
         let mut merged_sockets: Vec<(u32, Vec<RawFd>, Option<SocketAddr>)> = Vec::new();
         if merged_mode {
             for (idx, spec) in pending_listeners.iter().enumerate() {
@@ -1134,6 +1222,7 @@ impl RinglineBuilder {
             // and completions were only noticed at the poll timeout.)
             let eventfd = (worker_eventfds.remove(0), worker_wake_fds[worker_id]);
             let worker_shutdown_flag = shutdown_flag.clone();
+            let worker_listen_gates = listen_gates.clone();
             let worker_fn = worker_fn.clone();
             let startup_tx = startup_tx.clone();
 
@@ -1192,6 +1281,10 @@ impl RinglineBuilder {
                     }
 
                     metriken::set_thread_shard(worker_id);
+                    // Makes `begin_listening()` reachable from tasks on this
+                    // worker, the same way `request_shutdown()` reaches the
+                    // driver.
+                    crate::listen_gate::install(worker_listen_gates);
 
                     let accept_rx = if has_acceptor { Some(rx) } else { None };
                     // A panic before startup completed must reach `launch()`
@@ -1310,26 +1403,24 @@ impl RinglineBuilder {
                 // becomes reachable.
                 let merged_entry = merged_sockets.iter().find(|(i, _, _)| *i == idx as u32);
 
+                // Bind only. `listen(2)` happens when the gate opens, which
+                // for an ungated listener is a few lines below and for a
+                // deferred one is whenever the handler says so. Keeping one
+                // path through `listen` is what stops the two cases drifting.
+                //
+                // `getsockname` reports the port of a bound socket, so a
+                // zero-port bind still resolves here — merged mode has
+                // relied on that since it started binding before listening.
                 let created: Result<(Vec<RawFd>, Option<SocketAddr>), crate::error::Error> =
                     match (&spec.addr, merged_entry) {
                         (BindAddr::Tcp(_), Some((_, fds, resolved))) => {
-                            let mut err = None;
-                            for &fd in fds {
-                                if unsafe { libc::listen(fd, self.config.backlog) } < 0 {
-                                    err = Some(crate::error::Error::Io(io::Error::last_os_error()));
-                                    break;
-                                }
-                            }
-                            match err {
-                                Some(e) => Err(e),
-                                None => Ok((fds.clone(), *resolved)),
-                            }
+                            Ok((fds.clone(), *resolved))
                         }
-                        (BindAddr::Tcp(addr), None) => create_listener(*addr, self.config.backlog)
-                            .map(|fd| (vec![fd], getsockname_v4_v6(fd))),
+                        (BindAddr::Tcp(addr), None) => {
+                            create_listener(*addr).map(|fd| (vec![fd], getsockname_v4_v6(fd)))
+                        }
                         (BindAddr::Unix(path), _) => {
-                            create_unix_listener(path, self.config.backlog)
-                                .map(|fd| (vec![fd], None))
+                            create_unix_listener(path).map(|fd| (vec![fd], None))
                         }
                     };
                 let (fds, bound_addr) = match created {
@@ -1345,6 +1436,20 @@ impl RinglineBuilder {
                 };
 
                 let closed = Arc::new(AtomicBool::new(false));
+
+                // The gate owns the `listen(2)` call for these sockets from
+                // here on.
+                listen_gates.register(idx as u32, fds.clone());
+                if !spec.defer_listen
+                    && let Err(error) = listen_gates.open(idx as u32)
+                {
+                    close_listeners(&listeners);
+                    for &fd in &fds {
+                        unsafe { libc::close(fd) };
+                    }
+                    rollback_workers(&shutdown_flag, &worker_wake_fds, handles);
+                    return Err(crate::error::Error::Io(error));
+                }
 
                 // Merged mode has no acceptor thread: the workers arm their own
                 // multishot accept on these fds. Record the listener and move on.
@@ -1365,6 +1470,7 @@ impl RinglineBuilder {
                     worker_channels: worker_txs.clone(),
                     worker_wake_handles: worker_wake_fds.clone(),
                     shutdown_flag: shutdown_flag.clone(),
+                    listen_gates: listen_gates.clone(),
                     // A Unix listener has no TCP_NODELAY to set. This used to be
                     // a runtime `if is_unix` branch over one global flag; with a
                     // listener list each one simply answers for itself.
@@ -1432,6 +1538,7 @@ impl RinglineBuilder {
             accepting: worker_accepting,
             listeners,
             region_registrar,
+            listen_gates,
         };
 
         Ok((shutdown_handle, handles))
@@ -1617,7 +1724,7 @@ fn bind_reuseport_socket(addr: SocketAddr) -> Result<RawFd, crate::error::Error>
 }
 
 /// Create a TCP listener without SO_REUSEPORT (just SO_REUSEADDR).
-fn create_listener(addr: SocketAddr, backlog: i32) -> Result<RawFd, crate::error::Error> {
+fn create_listener(addr: SocketAddr) -> Result<RawFd, crate::error::Error> {
     let domain = if addr.is_ipv4() {
         libc::AF_INET
     } else {
@@ -1654,22 +1761,13 @@ fn create_listener(addr: SocketAddr, backlog: i32) -> Result<RawFd, crate::error
         return Err(crate::error::Error::Io(err));
     }
 
-    let ret = unsafe { libc::listen(fd, backlog) };
-    if ret < 0 {
-        let err = io::Error::last_os_error();
-        unsafe {
-            libc::close(fd);
-        }
-        return Err(crate::error::Error::Io(err));
-    }
-
     Ok(fd)
 }
 
 /// Create a Unix domain socket listener at the given path.
 ///
 /// Unlinks any existing socket file before binding.
-fn create_unix_listener(path: &Path, backlog: i32) -> Result<RawFd, crate::error::Error> {
+fn create_unix_listener(path: &Path) -> Result<RawFd, crate::error::Error> {
     // Remove existing socket file if present (ignore errors — path may not exist).
     let _ = std::fs::remove_file(path);
 
@@ -1683,15 +1781,6 @@ fn create_unix_listener(path: &Path, backlog: i32) -> Result<RawFd, crate::error
     let addr_len = crate::backend::unix_path_to_sockaddr(path, &mut storage);
 
     let ret = unsafe { libc::bind(fd, &storage as *const _ as *const libc::sockaddr, addr_len) };
-    if ret < 0 {
-        let err = io::Error::last_os_error();
-        unsafe {
-            libc::close(fd);
-        }
-        return Err(crate::error::Error::Io(err));
-    }
-
-    let ret = unsafe { libc::listen(fd, backlog) };
     if ret < 0 {
         let err = io::Error::last_os_error();
         unsafe {

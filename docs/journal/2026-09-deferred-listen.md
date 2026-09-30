@@ -45,13 +45,30 @@ handshakes and queue connections. `accept()` only dequeues them.
 
 | | port reserved | client sees | TCP readiness probe |
 |---|---|---|---|
-| bind, defer `listen` | yes | `ECONNREFUSED` | fails, correctly |
+| bind, defer `listen` | yes | refused (Linux) / times out (Darwin) | fails, correctly |
 | bind + `listen`, defer `accept` | yes | handshake completes, then silence | succeeds, wrongly |
 
 Deferring `accept` defeats a readiness probe: the kernel completes the handshake
 without the server, so a load balancer's TCP check passes and it routes to an
 instance that is not ready. When the backlog fills the kernel drops SYNs, so
 clients get timeouts rather than a clean refusal — worse to diagnose as well.
+
+**What the peer sees is platform-specific, and the first version of this entry
+said otherwise.** Measured on Darwin 25.6 with no ringline involved — a plain
+socket bound without `listen`, plus two controls:
+
+| | result |
+|---|---|
+| bound, not listening | times out (1.5 s limit reached) |
+| nothing bound on that port | `ECONNREFUSED` |
+| same socket after `listen(2)` | connects |
+
+So Darwin drops the SYN rather than answering with RST. Linux answers with RST,
+which is where the `ECONNREFUSED` claim came from. Both fail a readiness probe,
+which is what the feature needs; only Linux fails it *quickly*, and a probe
+with a generous timeout on Darwin spends that timeout. The integration test
+asserts the Linux behaviour specifically under `cfg(target_os = "linux")` so CI
+checks the claim rather than the code carrying it as a comment.
 
 Holding clients in the backlog is the right behaviour when *draining* an old
 instance during a handover. Refusing is the right behaviour when a new instance
@@ -212,3 +229,31 @@ the doc points at the gate for readiness. This is the part of #534 that is
 genuinely 0.7.0-blocking. The gate itself is additive and could ship later —
 but shipping a release whose documentation promises a readiness gate that does
 not exist is worse than shipping without the feature.
+
+## Implementation notes
+
+Landed for `AcceptMode::Pool` (the default, and the only mode on mio).
+`defer_listen()` with `AcceptMode::Merged` is refused at launch rather than
+silently not deferring; merged mode's arming is a single process-wide
+`merged_accept_armed` bool with two re-arm sites, and making it per-listener is
+a second change.
+
+**GO criterion 4 is met at the unit level, not the integration level, and that
+distinction was found by mutation.** The integration test asserts that shutting
+down a runtime with an unreleased gate completes and the workers join — and it
+stays green with `ShutdownHandle::shutdown`'s call to `ListenGates::shutdown`
+deleted. The acceptor thread is detached, so one parked on a gate never holds
+up `join()` on the worker handles, and the listen fd is closed by `shutdown`
+whether the thread woke or not. What the call actually prevents is a stranded
+thread, which no observable API state reflects. The mechanism therefore has its
+own unit test (`acceptor::tests::a_gated_acceptor_exits_on_shutdown`), and the
+wiring from `ShutdownHandle::shutdown` to it is covered by inspection only.
+Recorded because a green test that passes with the code removed is worse than
+no test.
+
+The other mutation behaved as intended: making `defer_listen()` a no-op turns
+four of the six integration tests red and leaves the ungated control green.
+
+**What the peer sees is platform-specific**, which the entry above records with
+its measurement. The consequence for the feature is that only Linux fails a
+readiness probe quickly; Darwin makes the prober wait out its own timeout.
