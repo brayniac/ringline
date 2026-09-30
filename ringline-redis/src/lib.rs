@@ -14,11 +14,11 @@
 //! The basic API sends one command and awaits its response:
 //!
 //! ```no_run
-//! use ringline::ConnCtx;
+//! use ringline::Connection;
 //! use ringline_redis::Client;
 //!
-//! async fn example(conn: ConnCtx) -> Result<(), ringline_redis::Error> {
-//!     let mut client = Client::new(conn)?;
+//! async fn example(conn: Connection) -> Result<(), ringline_redis::Error> {
+//!     let mut client = Client::new(conn);
 //!     client.set("hello", "world").await?;
 //!     let val = client.get("hello").await?;
 //!     assert_eq!(val.as_deref(), Some(&b"world"[..]));
@@ -51,11 +51,11 @@
 //! ```
 //!
 //! ```no_run
-//! use ringline::ConnCtx;
+//! use ringline::Connection;
 //! use ringline_redis::{Client, CompletedOp};
 //!
-//! async fn pipelined_example(conn: ConnCtx) -> Result<(), ringline_redis::Error> {
-//!     let mut client = Client::new(conn)?;
+//! async fn pipelined_example(conn: Connection) -> Result<(), ringline_redis::Error> {
+//!     let mut client = Client::new(conn);
 //!
 //!     // Fire multiple requests (synchronous, non-blocking)
 //!     client.fire_get(b"session:abc", 1)?;
@@ -3579,10 +3579,10 @@ fn append_set_guard_suffix_ex(buf: &mut Vec<u8>, ttl_secs: u64) {
 /// # Example
 ///
 /// ```no_run
-/// # use ringline::ConnCtx;
+/// # use ringline::Connection;
 /// # use ringline_redis::Client;
-/// # async fn example(conn: ConnCtx) -> Result<(), ringline_redis::Error> {
-/// let mut client = Client::new(conn)?;
+/// # async fn example(conn: Connection) -> Result<(), ringline_redis::Error> {
+/// let mut client = Client::new(conn);
 /// let results = client.pipeline()
 ///     .set(b"k1", b"v1")
 ///     .set(b"k2", b"v2")

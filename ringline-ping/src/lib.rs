@@ -6,11 +6,11 @@
 //! # Example
 //!
 //! ```no_run
-//! use ringline::ConnCtx;
+//! use ringline::Connection;
 //! use ringline_ping::Client;
 //!
-//! async fn example(conn: ConnCtx) -> Result<(), ringline_ping::Error> {
-//!     let mut client = Client::new(conn)?;
+//! async fn example(conn: Connection) -> Result<(), ringline_ping::Error> {
+//!     let mut client = Client::new(conn);
 //!     client.ping().await?;
 //!     Ok(())
 //! }

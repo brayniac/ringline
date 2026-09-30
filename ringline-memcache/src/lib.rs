@@ -13,11 +13,11 @@
 //! The basic API sends one command and awaits its response:
 //!
 //! ```no_run
-//! use ringline::ConnCtx;
+//! use ringline::Connection;
 //! use ringline_memcache::Client;
 //!
-//! async fn example(conn: ConnCtx) -> Result<(), ringline_memcache::Error> {
-//!     let mut client = Client::new(conn)?;
+//! async fn example(conn: Connection) -> Result<(), ringline_memcache::Error> {
+//!     let mut client = Client::new(conn);
 //!     client.set("hello", "world").await?;
 //!     let val = client.get("hello").await?;
 //!     assert_eq!(val.unwrap().data.as_ref(), b"world");
@@ -50,11 +50,11 @@
 //! ```
 //!
 //! ```no_run
-//! use ringline::ConnCtx;
+//! use ringline::Connection;
 //! use ringline_memcache::{Client, CompletedOp};
 //!
-//! async fn pipelined_example(conn: ConnCtx) -> Result<(), ringline_memcache::Error> {
-//!     let mut client = Client::new(conn)?;
+//! async fn pipelined_example(conn: Connection) -> Result<(), ringline_memcache::Error> {
+//!     let mut client = Client::new(conn);
 //!
 //!     // Fire multiple requests (synchronous, non-blocking)
 //!     client.fire_get(b"session:abc", 1)?;
@@ -2464,8 +2464,8 @@ impl CasStreamValue<'_> {
 ///
 /// ```no_run
 /// # use ringline_memcache::{Client, Error};
-/// # async fn demo(conn: ringline::ConnCtx) -> Result<(), Error> {
-/// let mut client = Client::builder(conn).max_batch_size(16).build_binary()?;
+/// # async fn demo(conn: ringline::Connection) -> Result<(), Error> {
+/// let mut client = Client::builder(conn).max_batch_size(16).build_binary();
 /// client.fire_get(b"key", 1)?;
 /// let op = client.recv().await?;
 /// # Ok(())
