@@ -249,9 +249,9 @@ pub use park::ParkState;
 pub use error::TimerExhausted;
 /// Errors returned by UDP send operations.
 pub use error::UdpSendError;
-/// Begin listening on a deferred listener, from any async task.
+/// Begin listening on a deferred listener, from any code on a ringline worker.
 pub use listen_gate::begin_listening;
-/// Begin listening on every deferred listener, from any async task.
+/// Begin listening on every deferred listener, from any code on a worker.
 pub use listen_gate::begin_listening_all;
 /// Trait for async event handlers (one task per connection).
 pub use runtime::handler::AsyncEventHandler;

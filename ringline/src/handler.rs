@@ -152,8 +152,8 @@ impl ListenerId {
     /// The id of the listener at `index` in `bind()` call order.
     ///
     /// Ids follow call order, so a caller that bound in a known order can name
-    /// a listener before any connection has arrived — which is what
-    /// [`begin_listening`](crate::begin_listening) needs.
+    /// a listener before any connection has arrived, for example to pass to
+    /// [`begin_listening`](crate::begin_listening).
     pub fn from_index(index: u32) -> Self {
         ListenerId(index)
     }

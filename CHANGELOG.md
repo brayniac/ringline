@@ -26,19 +26,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
       .launch::<Handler>()?;
   ```
 
-  Not yet supported with `AcceptMode::Merged`, which refuses the combination at
-  launch rather than ignoring the deferral.
+  Not supported with `AcceptMode::Merged` on the io_uring backend, where
+  `launch()` refuses the combination. On the mio backend `Merged` already runs
+  as `Pool`, so the deferral applies there.
 
 - `ListenerId::from_index` is public. Ids follow `bind()` call order, so a
   listener can be named before any connection has arrived.
 
 ### Changed
 
-- `AsyncEventHandler::on_start`'s documentation said the returned future "runs
-  before the event loop begins accepting connections". It does not: it is
-  spawned as a standalone task and runs concurrently with accepting. The
-  documentation is corrected and points at `defer_listen` for an actual
-  readiness gate. No behaviour change (#534).
+- `AsyncEventHandler::on_start`'s documentation no longer says the future runs
+  before accepting begins. It runs concurrently with accepting; the doc now
+  says so and points to `defer_listen` for a readiness gate. No behaviour
+  change (#534).
 
 
 - **Breaking:** `connect` and `connect_unix` return builders that resolve to an

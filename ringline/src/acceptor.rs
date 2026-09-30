@@ -30,9 +30,9 @@ pub struct AcceptorConfig {
     /// Shared flag set by ShutdownHandle to signal the acceptor to stop.
     #[allow(dead_code)] // stored for future use; acceptor currently uses channel disconnect
     pub shutdown_flag: Arc<AtomicBool>,
-    /// The runtime's listen gates. This acceptor waits for its own gate before
-    /// accepting; `listen(2)` is called by whoever opens the gate, so until
-    /// then `listen_fd` is bound and not listening.
+    /// The runtime's listen gates. This acceptor waits on its gate before
+    /// accepting. `ListenGates::open` calls `listen(2)`; until it runs,
+    /// `listen_fd` is bound and not listening.
     pub listen_gates: Arc<crate::listen_gate::ListenGates>,
     /// Whether to set TCP_NODELAY on accepted connections.
     pub tcp_nodelay: bool,
@@ -106,7 +106,7 @@ pub fn run_acceptor(config: AcceptorConfig) {
     // listening, and `accept4` on it would fail with EINVAL forever.
     //
     // A `false` return is shutdown, and the listen fd may already be closed,
-    // so there is nothing to do but leave.
+    // so the thread returns without touching it.
     if !config.listen_gates.wait_open(config.listener.index()) {
         return;
     }
@@ -304,8 +304,8 @@ mod tests {
         };
 
         let handle = std::thread::spawn(move || run_acceptor(config));
-        // Let it reach the park. The assertion holds either way: `wait_open`
-        // rechecks the predicate before it sleeps.
+        // Give the thread time to enter `wait_open`. The assertion holds
+        // either way: `wait_open` rechecks the predicate before it sleeps.
         std::thread::sleep(std::time::Duration::from_millis(30));
         assert!(
             !handle.is_finished(),

@@ -3,9 +3,8 @@
 //!
 //! The assertions are made from a client socket rather than by reading a flag:
 //! what matters is that a peer cannot connect while the server is not ready,
-//! which is what makes a TCP readiness probe fail honestly. A deferred
-//! *accept* would pass that probe, which is the failure this feature exists to
-//! prevent — see `docs/journal/2026-09-deferred-listen.md`.
+//! which is what a TCP readiness probe checks. A deferred accept would pass
+//! that probe.
 
 #![allow(clippy::manual_async_fn)]
 
@@ -46,13 +45,11 @@ fn probe(addr: SocketAddr) -> std::io::Result<()> {
 /// A connect attempt that must not be served, because the port is bound and
 /// not listening.
 ///
-/// *How* it fails is platform-specific, and the difference is the point of
-/// deferring `listen` rather than `accept`, so the assertion is specific per
-/// platform rather than loosened to "some error".
+/// The failure is platform-specific, so the assertion is per platform rather
+/// than "any error".
 ///
 /// Linux answers a SYN to a bound, non-listening port with RST, so the peer is
-/// refused immediately — a readiness probe fails fast and cleanly. Darwin
-/// drops the SYN instead, so the peer times out. Measured on Darwin 25.6 with
+/// refused immediately. Darwin drops the SYN, so the peer times out. Measured on Darwin 25.6 with
 /// no ringline involved: a socket bound without `listen` times out, an unbound
 /// port on the same host is refused, and the same socket connects once it
 /// listens. The Linux half of this claim is asserted here so CI checks it.
@@ -187,7 +184,7 @@ fn a_gated_listener_refuses_until_the_handler_releases_it() {
 
 // ── Control: without `defer_listen` nothing changes ─────────────────────
 
-/// The control the mechanism predicts *no* effect for. If this failed, the
+/// The control case: the mechanism predicts no effect. If this failed, the
 /// test above would be measuring a broken launch rather than a working gate.
 #[test]
 fn an_ungated_listener_serves_as_soon_as_launch_returns() {
@@ -262,7 +259,7 @@ fn a_gated_listener_resolves_its_zero_port() {
 /// Shutting down a runtime whose listener was never released completes and
 /// the workers join.
 ///
-/// This does **not** prove that `shutdown` releases the gate. The acceptor
+/// This does not prove that `shutdown` releases the gate. The acceptor
 /// thread is detached, so one parked on a gate does not hold up `join()` on
 /// the worker handles, and the listen fd is closed either way — verified by
 /// mutation: removing `ShutdownHandle::shutdown`'s call to
@@ -318,5 +315,71 @@ fn defer_listen_before_any_bind_is_a_launch_error() {
                 "the error must name the call that was misused, got: {msg}"
             );
         }
+    }
+}
+
+// ── A1 reproduction: release on the first poll of on_start ──────────────
+
+static EAGER_RESULT: OnceLock<String> = OnceLock::new();
+
+/// Releases the gate immediately, with no wait. This is the plausible shape
+/// for a server whose warmup is conditional and does nothing on this
+/// deployment.
+struct ReleaseImmediately;
+
+impl AsyncEventHandler for ReleaseImmediately {
+    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
+        async move {
+            let (mut tx, _rx) = conn.split();
+            let _ = tx.send_nowait(b"ok");
+            let _ = ringline::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        Some(Box::pin(async {
+            let outcome = match ringline::begin_listening(ListenerId::from_index(0)) {
+                Ok(()) => "OK".to_string(),
+                Err(e) => format!("ERR:{e}"),
+            };
+            EAGER_RESULT.set(outcome).ok();
+        }))
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        ReleaseImmediately
+    }
+}
+
+#[test]
+fn releasing_on_the_first_poll_still_serves() {
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
+        .bind("127.0.0.1:0".parse().unwrap())
+        .defer_listen()
+        .launch::<ReleaseImmediately>()
+        .expect("launch");
+    let addr = shutdown
+        .bound_addr_of(ListenerId::from_index(0))
+        .expect("bound address");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut served = Err(std::io::Error::other("never attempted"));
+    while Instant::now() < deadline {
+        served = probe(addr);
+        if served.is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        served.is_ok(),
+        "a gate released during on_start's first poll must still listen: {served:?} \
+         (begin_listening said {:?})",
+        EAGER_RESULT.get()
+    );
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().expect("worker panicked").expect("worker error");
     }
 }

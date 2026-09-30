@@ -472,9 +472,8 @@ struct ListenerSpec {
     /// `ConfigBuilder::tls()`, so single-listener setups are unchanged.
     tls: Option<crate::config::TlsConfig>,
     /// Bind this listener but do not listen on it until a handler calls
-    /// [`begin_listening`](crate::begin_listening). `false` — listen during
-    /// `launch()` — is the default and what every listener did before gates
-    /// existed.
+    /// [`begin_listening`](crate::begin_listening). `false`, the default,
+    /// listens during `launch()`.
     defer_listen: bool,
 }
 
@@ -719,25 +718,29 @@ impl RinglineBuilder {
 
     /// Bind the most recently added listener without listening on it.
     ///
-    /// The port is reserved, so nothing else can take it, but the kernel does
-    /// not complete handshakes, so a TCP readiness probe fails while the
-    /// server is not ready. On Linux the peer is refused with
-    /// `ECONNREFUSED`; on macOS and the BSDs the SYN is dropped instead and
-    /// the peer times out. Call
-    /// [`begin_listening()`](crate::begin_listening) with this listener's
-    /// [`ListenerId`](crate::ListenerId) once the server can serve — from
-    /// [`on_start`](crate::AsyncEventHandler::on_start), which is where work
-    /// that needs the runtime (outbound connections, timers, fs) has to
-    /// happen.
+    /// The port is reserved, and the kernel does not complete handshakes on
+    /// it, so a TCP readiness probe fails while the server is not ready. On
+    /// Linux the peer is refused with `ECONNREFUSED`; on macOS and the BSDs
+    /// the SYN is dropped and the peer times out.
     ///
-    /// This is deferred `listen`, not deferred `accept`. Deferring `accept`
-    /// would let the kernel complete the handshake without the server, so a
-    /// load balancer's TCP check would pass against an instance that cannot
-    /// serve.
+    /// Call [`begin_listening()`](crate::begin_listening) with this
+    /// listener's [`ListenerId`](crate::ListenerId) once the server can
+    /// serve. [`on_start`](crate::AsyncEventHandler::on_start) is the usual
+    /// place, since work that needs the runtime (outbound connections,
+    /// timers, fs) runs there.
     ///
-    /// Applies to the listener added by the preceding `bind*()` call, so it
-    /// is written immediately after one. Calling it before any `bind*()` is a
-    /// configuration error and `launch()` reports it.
+    /// The listener does not call `listen(2)` until it is released. A socket
+    /// that listens but does not accept still completes handshakes, so a TCP
+    /// check passes against it; a bound socket that does not listen does not.
+    ///
+    /// Applies to the listener added by the most recent
+    /// [`bind`](Self::bind), [`bind_unix`](Self::bind_unix) or
+    /// [`bind_tls`](Self::bind_tls) call, so it is written immediately after
+    /// one. UDP binds are not listeners and are unaffected. Calling it before
+    /// any of those three is a configuration error that `launch()` reports.
+    ///
+    /// Not supported with [`AcceptMode::Merged`](crate::config::AcceptMode)
+    /// on the io_uring backend, where `launch()` refuses the combination.
     ///
     /// ```no_run
     /// # use ringline::{Config, RinglineBuilder};
@@ -779,6 +782,37 @@ impl RinglineBuilder {
         self.config.udp_bind.push(local);
         self.config.udp_connect_peers.push(Some(peer));
         self
+    }
+
+    /// Check the listener configuration, before `launch_inner` builds
+    /// anything.
+    ///
+    /// These depend only on the builder, so they run beside
+    /// `Config::validate` rather than after the worker threads, channel pairs
+    /// and thread pools exist.
+    fn validate_listeners(&self) -> Result<(), crate::error::Error> {
+        if self.defer_listen_without_bind {
+            return Err(crate::error::Error::RingSetup(
+                "defer_listen() was called before any bind(): it applies to the listener \
+                 added by the preceding bind call, so it belongs immediately after one"
+                    .into(),
+            ));
+        }
+        // Merged mode arms accept on the worker rings rather than in an
+        // acceptor thread, so a gate would have to reach `arm_merged_accepts`
+        // per listener rather than as the single process-wide flag it reads
+        // today. Refused rather than ignored: a deferral that does not defer
+        // would pass a readiness probe against a server that cannot serve.
+        let merged =
+            self.config.accept_mode == crate::config::AcceptMode::Merged && cfg!(has_io_uring);
+        if merged && self.listeners.iter().any(|spec| spec.defer_listen) {
+            return Err(crate::error::Error::RingSetup(
+                "defer_listen() is not supported with AcceptMode::Merged; use the default \
+                 AcceptMode::Pool, or bind that listener without deferring"
+                    .into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Launch worker threads with the async `AsyncEventHandler`.
@@ -918,6 +952,7 @@ impl RinglineBuilder {
         // sockets used to skip validation entirely (e.g. GRO with a
         // too-small buffer silently truncates datagrams).
         self.config.validate()?;
+        self.validate_listeners()?;
 
         let num_threads = if self.config.worker.threads == 0 {
             crate::topology::physical_core_count()
@@ -1044,12 +1079,6 @@ impl RinglineBuilder {
         // completed fallible setup. No socket is bound or listening yet.
         let pending_listeners = std::mem::take(&mut self.listeners);
         let has_acceptor = !pending_listeners.is_empty();
-        if self.defer_listen_without_bind {
-            return Err(crate::error::Error::RingSetup(
-                "defer_listen() was called before any bind() — it applies to the listener added                  by the preceding bind call, so it belongs immediately after one"
-                    .into(),
-            ));
-        }
         // One gate per listener, whether or not it is deferred: an ungated
         // listener is one whose gate `launch()` opens itself, which keeps a
         // single path through `listen(2)`.
@@ -1104,17 +1133,6 @@ impl RinglineBuilder {
         // listener keeps its acceptor thread even in merged mode.
         let merged_mode =
             self.config.accept_mode == crate::config::AcceptMode::Merged && cfg!(has_io_uring);
-        // Merged mode arms accept on the worker rings rather than in an
-        // acceptor thread, so the gate has to reach `arm_merged_accepts`
-        // per listener rather than as the one process-wide flag it reads
-        // today. Refused rather than silently ignored — a deferral that does
-        // not defer is the failure this feature exists to prevent.
-        if merged_mode && pending_listeners.iter().any(|spec| spec.defer_listen) {
-            return Err(crate::error::Error::RingSetup(
-                "defer_listen() is not supported with AcceptMode::Merged yet; use the default                  AcceptMode::Pool, or bind that listener without deferring"
-                    .into(),
-            ));
-        }
         let mut merged_sockets: Vec<(u32, Vec<RawFd>, Option<SocketAddr>)> = Vec::new();
         if merged_mode {
             for (idx, spec) in pending_listeners.iter().enumerate() {
@@ -1405,8 +1423,9 @@ impl RinglineBuilder {
 
                 // Bind only. `listen(2)` happens when the gate opens, which
                 // for an ungated listener is a few lines below and for a
-                // deferred one is whenever the handler says so. Keeping one
-                // path through `listen` is what stops the two cases drifting.
+                // deferred one is whenever the handler releases it. Both go
+                // through `ListenGates::open`, so there is one `listen` call
+                // site.
                 //
                 // `getsockname` reports the port of a bound socket, so a
                 // zero-port bind still resolves here — merged mode has
@@ -1438,11 +1457,17 @@ impl RinglineBuilder {
                 let closed = Arc::new(AtomicBool::new(false));
 
                 // The gate owns the `listen(2)` call for these sockets from
-                // here on.
-                listen_gates.register(idx as u32, fds.clone());
-                if !spec.defer_listen
-                    && let Err(error) = listen_gates.open(idx as u32)
-                {
+                // here on. `register` itself can listen: a handler whose
+                // `on_start` released this gate before `launch()` got here
+                // recorded the request, and `register` honours it.
+                let registered = listen_gates.register(idx as u32, fds.clone());
+                if let Err(error) = registered.and_then(|()| {
+                    if spec.defer_listen {
+                        Ok(())
+                    } else {
+                        listen_gates.open(idx as u32)
+                    }
+                }) {
                     close_listeners(&listeners);
                     for &fd in &fds {
                         unsafe { libc::close(fd) };
@@ -1758,11 +1783,16 @@ fn create_listener(addr: SocketAddr) -> Result<RawFd, crate::error::Error> {
 
     let ret = unsafe { libc::bind(fd, &storage as *const _ as *const libc::sockaddr, addr_len) };
     if ret < 0 {
+        // Name the syscall, for the reason `ListenGates::open` does.
         let err = io::Error::last_os_error();
+        let kind = err.kind();
         unsafe {
             libc::close(fd);
         }
-        return Err(crate::error::Error::Io(err));
+        return Err(crate::error::Error::Io(io::Error::new(
+            kind,
+            format!("bind(2) on {addr}: {err}"),
+        )));
     }
 
     // Clear SO_REUSEADDR now that the bind has succeeded, so the port is
@@ -1770,21 +1800,23 @@ fn create_listener(addr: SocketAddr) -> Result<RawFd, crate::error::Error> {
     //
     // Linux lets two SO_REUSEADDR sockets share an address while *neither* is
     // listening, and its conflict check reads the flag on the socket that is
-    // already bound. A listener therefore reserved its port exclusively only
-    // once it listened — which used to be the next line, and with a deferred
-    // listen is however long the handler takes. Clearing the flag closes that
-    // window without giving up what SO_REUSEADDR is for, because its
-    // TIME_WAIT tolerance is only needed for the bind above.
+    // already bound. A listener therefore reserves its port exclusively only
+    // once it listens, which with a deferred listen is however long the
+    // handler takes. Clearing the flag closes that window without giving up
+    // what SO_REUSEADDR is for, because its TIME_WAIT tolerance is only
+    // needed for the bind above.
     //
     // No effect on a listener that is not deferred: a listening socket
     // conflicts with a later bind regardless of the flag.
     //
     // Measured on Linux 6.12 aarch64 with plain sockets: left set, a second
     // bind succeeds; cleared after bind, it fails EADDRINUSE. Darwin refuses
-    // the second bind either way, which is why only Linux CI caught this. If
-    // a squatter does win the race it takes `listen(2)` to do so, and our own
-    // `listen` then fails EADDRINUSE — which `begin_listening` reports rather
-    // than silently sharing the port.
+    // the second bind either way. If another process does bind in the
+    // window it must also call `listen(2)`, after which this socket's
+    // `listen` fails with EADDRINUSE and `begin_listening` reports it.
+    //
+    // Merged-mode sockets come from `bind_reuseport_socket`, not from here,
+    // so SO_REUSEPORT sharing is unaffected.
     let clear: libc::c_int = 0;
     unsafe {
         libc::setsockopt(
