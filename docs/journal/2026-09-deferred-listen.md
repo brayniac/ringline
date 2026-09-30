@@ -302,3 +302,43 @@ changelog without anyone checking it, and it was wrong on the only platform
 that matters for this runtime. It survived four documents and a design review.
 What caught it was an assertion written because it was cheap, not because the
 claim was in doubt.
+
+## "It costs nothing" was also wrong: `listen(2)` re-checks the port
+
+The fix above claimed `SO_REUSEADDR`'s TIME_WAIT tolerance is needed "at bind
+time" only. **It is not.** Linux runs the port conflict check again inside
+`listen(2)` (`inet_csk_listen_start` → `get_port`), using the socket's flag as
+it is *at that moment*. With the flag cleared, a TIME_WAIT connection on the
+port, such as one a previous instance of the server left behind, fails the
+listen with `EADDRINUSE`. That is a restart within the TIME_WAIT period
+failing `launch()`, and it hit every listener, gated or not, because every
+listener goes through `ListenGates`.
+
+This is what the `AddrInUse` flake was. The first run on Linux after the
+syscall-naming change reported it twice, both
+`listen(2) on listener 0: Address already in use`: `ringline-memcache`
+`streaming` (release) and `ringline-grpc` `round_trip` (force-mio). The shared
+`free_port()` range reuses ports that earlier test servers left in TIME_WAIT.
+Neither of the two causes in the handoff was right. It was not the probe race,
+and the longer window between bind and listen did not matter; the listen fails
+whenever it runs.
+
+Plain sockets, no ringline, Linux 6.12.111 aarch64, TIME_WAIT created by an
+accepted connection closing first, 5 trials per row:
+
+| setup at `listen(2)` | competitor bind while held | `listen` |
+|---|---|---|
+| `SO_REUSEADDR` still set | succeeds (arm A above) | ok ×5 |
+| cleared after bind | `EADDRINUSE` (arm B above) | `EADDRINUSE` ×5 |
+| cleared after bind, **set again just before listen** | `EADDRINUSE` ×5 | ok ×5 |
+
+The third row is the fix: `listen_all` sets the flag immediately before
+`listen(2)`. The port stays reserved while the listener is held, and a
+competitor cannot bind in the gap, since the flag was clear until then.
+`a_listener_listens_over_a_time_wait_connection` and
+`a_held_listener_reserves_its_port` pin the two halves, and each fails when its
+half of the fix is removed.
+
+The same lesson as the previous entry: "it costs nothing" was reasoned, not
+measured, and the table that justified the change did not include the case
+the flag exists for.

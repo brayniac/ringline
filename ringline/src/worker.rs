@@ -1750,10 +1750,10 @@ fn bind_reuseport_socket(addr: SocketAddr) -> Result<RawFd, crate::error::Error>
 
 /// Create a bound TCP listener, without SO_REUSEPORT and without listening.
 ///
-/// SO_REUSEADDR is set for the bind and cleared immediately after it, so
-/// the socket tolerates a previous incarnation's TIME_WAIT without leaving
-/// the port open to a second binder while it is not yet listening.
-fn create_listener(addr: SocketAddr) -> Result<RawFd, crate::error::Error> {
+/// SO_REUSEADDR is set for the bind and cleared immediately after it, so the
+/// port is not open to a second binder while the socket is not yet
+/// listening. `ListenGates` sets it again just before `listen(2)`.
+pub(crate) fn create_listener(addr: SocketAddr) -> Result<RawFd, crate::error::Error> {
     let domain = if addr.is_ipv4() {
         libc::AF_INET
     } else {
@@ -1802,9 +1802,10 @@ fn create_listener(addr: SocketAddr) -> Result<RawFd, crate::error::Error> {
     // listening, and its conflict check reads the flag on the socket that is
     // already bound. A listener therefore reserves its port exclusively only
     // once it listens, which with a deferred listen is however long the
-    // handler takes. Clearing the flag closes that window without giving up
-    // what SO_REUSEADDR is for, because its TIME_WAIT tolerance is only
-    // needed for the bind above.
+    // handler takes. Clearing the flag closes that window. `listen_all` sets
+    // it again immediately before `listen(2)`, which re-checks the port with
+    // the current flag and would otherwise fail EADDRINUSE on a TIME_WAIT
+    // connection left by a previous instance.
     //
     // No effect on a listener that is not deferred: a listening socket
     // conflicts with a later bind regardless of the flag.

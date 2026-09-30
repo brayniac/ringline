@@ -215,6 +215,23 @@ impl ListenGates {
 fn listen_all(inner: &mut GateInner, idx: usize) -> io::Result<()> {
     let backlog = inner.backlog;
     for &fd in &inner.fds[idx] {
+        // `create_listener` clears SO_REUSEADDR after bind so a held port is
+        // reserved. It must be set again here: Linux re-runs the port conflict
+        // check in `listen(2)` with the socket's current flag, and without it
+        // a TIME_WAIT connection left by a previous instance on this port
+        // fails the listen with EADDRINUSE. A competitor cannot bind in
+        // between, because the flag was clear until this line. No effect on
+        // Unix sockets, and merged-mode sockets already have it set.
+        let reuse: libc::c_int = 1;
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_REUSEADDR,
+                &reuse as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
         if unsafe { libc::listen(fd, backlog) } < 0 {
             // Name the syscall. `bind(2)` and `listen(2)` both report
             // EADDRINUSE, and a launch failure that does not say which one it
@@ -486,6 +503,74 @@ mod tests {
             "register must not open an unreleased gate"
         );
         unsafe { libc::close(fd) };
+    }
+
+    /// Leave a TIME_WAIT connection on a loopback port and return the port.
+    /// The side that closes first enters TIME_WAIT, so the accepted
+    /// connection closes before the client.
+    fn port_with_time_wait() -> u16 {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("local_addr").port();
+        let mut client = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        let (accepted, _) = listener.accept().expect("accept");
+        drop(accepted);
+        let _ = client.read(&mut [0u8; 1]);
+        drop(client);
+        drop(listener);
+        port
+    }
+
+    /// A restart on a port that still has TIME_WAIT connections from the
+    /// previous instance must listen. `create_listener` clears SO_REUSEADDR
+    /// after bind, and Linux re-checks the port in `listen(2)` with the
+    /// current flag, so the gate has to set it again first.
+    #[test]
+    fn a_listener_listens_over_a_time_wait_connection() {
+        let port = port_with_time_wait();
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let fd = crate::worker::create_listener(addr).expect("create_listener");
+        let gates = ListenGates::new(1, 128);
+        gates.register(0, vec![fd]).expect("register");
+        gates
+            .open(0)
+            .expect("listen must succeed over a TIME_WAIT connection");
+        assert!(gates.is_open(0));
+        unsafe { libc::close(fd) };
+    }
+
+    /// While a deferred listener is held, another socket must not be able to
+    /// bind its port, even with SO_REUSEADDR set.
+    #[test]
+    fn a_held_listener_reserves_its_port() {
+        let fd = crate::worker::create_listener("127.0.0.1:0".parse().unwrap())
+            .expect("create_listener");
+        let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        assert_eq!(
+            unsafe {
+                libc::getsockname(fd, &mut storage as *mut _ as *mut libc::sockaddr, &mut len)
+            },
+            0
+        );
+        let other = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+        assert!(other >= 0);
+        let reuse: libc::c_int = 1;
+        unsafe {
+            libc::setsockopt(
+                other,
+                libc::SOL_SOCKET,
+                libc::SO_REUSEADDR,
+                &reuse as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+        let ret = unsafe { libc::bind(other, &storage as *const _ as *const libc::sockaddr, len) };
+        unsafe {
+            libc::close(other);
+            libc::close(fd);
+        }
+        assert!(ret < 0, "a second bind succeeded on a held listener's port");
     }
 
     #[test]
