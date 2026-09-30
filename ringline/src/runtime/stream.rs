@@ -66,7 +66,7 @@ impl ConnStream {
     /// Borrow the inner [`ConnCtx`].
     ///
     /// Useful for operations without a trait equivalent, such as
-    /// [`ConnCtx::connect`] or [`ConnCtx::peer_addr`].
+    /// [`ConnCtx::peer_addr`] or [`ConnCtx::close`].
     pub fn conn_ctx(&self) -> ConnCtx {
         self.ctx
     }

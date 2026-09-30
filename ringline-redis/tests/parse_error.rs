@@ -132,23 +132,16 @@ impl AsyncEventHandler for BadRedisClientHandler {
     fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
         let server_addr = *BAD_REDIS_ADDR.get().expect("bad redis addr not set");
         Some(Box::pin(async move {
-            let conn = match ringline::connect(server_addr) {
-                Ok(fut) => match fut.await {
-                    Ok(ctx) => ctx,
-                    Err(e) => {
-                        BAD_REDIS_RESULT.set(format!("CONNECT_ERR:{e}")).ok();
-                        ringline::request_shutdown().ok();
-                        return;
-                    }
-                },
+            let conn = match ringline::connect(server_addr).await {
+                Ok(ctx) => ctx,
                 Err(e) => {
-                    BAD_REDIS_RESULT.set(format!("SUBMIT_ERR:{e}")).ok();
+                    BAD_REDIS_RESULT.set(format!("CONNECT_ERR:{e}")).ok();
                     ringline::request_shutdown().ok();
                     return;
                 }
             };
 
-            let mut client = Client::new(conn).expect("split the connection");
+            let mut client = Client::new(conn);
             // GET will send *2\r\n$3\r\nGET\r\n$4\r\ntest\r\n
             // and the server will respond with garbage RESP.
             match client.get(b"test").await {

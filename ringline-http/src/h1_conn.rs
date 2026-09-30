@@ -6,7 +6,7 @@
 use std::net::SocketAddr;
 
 use bytes::{Bytes, BytesMut};
-use ringline::{ConnCtx, ParseResult, RecvHalf, SendHalf};
+use ringline::{ParseResult, RecvHalf, SendHalf};
 
 use crate::error::HttpError;
 use crate::response::Response;
@@ -45,8 +45,8 @@ pub struct H1Conn {
 }
 
 impl H1Conn {
-    fn new(conn: ConnCtx, host: &str) -> Result<Self, HttpError> {
-        let (tx, rx) = conn.split()?;
+    fn new(conn: ringline::Connection, host: &str) -> Result<Self, HttpError> {
+        let (tx, rx) = conn.split();
         Ok(Self {
             tx,
             rx,
@@ -62,13 +62,13 @@ impl H1Conn {
 
     /// Connect to an HTTP/1.1 server over TLS.
     pub async fn connect_tls(addr: SocketAddr, host: &str) -> Result<Self, HttpError> {
-        let conn = ringline::connect_tls(addr, host)?.await?;
+        let conn = ringline::connect(addr).tls(host).await?;
         Self::new(conn, host)
     }
 
     /// Connect to an HTTP/1.1 server over plaintext TCP.
     pub async fn connect_plain(addr: SocketAddr, host: &str) -> Result<Self, HttpError> {
-        let conn = ringline::connect(addr)?.await?;
+        let conn = ringline::connect(addr).await?;
         Self::new(conn, host)
     }
 

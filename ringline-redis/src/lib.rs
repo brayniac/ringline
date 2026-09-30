@@ -14,11 +14,11 @@
 //! The basic API sends one command and awaits its response:
 //!
 //! ```no_run
-//! use ringline::ConnCtx;
+//! use ringline::Connection;
 //! use ringline_redis::Client;
 //!
-//! async fn example(conn: ConnCtx) -> Result<(), ringline_redis::Error> {
-//!     let mut client = Client::new(conn)?;
+//! async fn example(conn: Connection) -> Result<(), ringline_redis::Error> {
+//!     let mut client = Client::new(conn);
 //!     client.set("hello", "world").await?;
 //!     let val = client.get("hello").await?;
 //!     assert_eq!(val.as_deref(), Some(&b"world"[..]));
@@ -51,11 +51,11 @@
 //! ```
 //!
 //! ```no_run
-//! use ringline::ConnCtx;
+//! use ringline::Connection;
 //! use ringline_redis::{Client, CompletedOp};
 //!
-//! async fn pipelined_example(conn: ConnCtx) -> Result<(), ringline_redis::Error> {
-//!     let mut client = Client::new(conn)?;
+//! async fn pipelined_example(conn: Connection) -> Result<(), ringline_redis::Error> {
+//!     let mut client = Client::new(conn);
 //!
 //!     // Fire multiple requests (synchronous, non-blocking)
 //!     client.fire_get(b"session:abc", 1)?;
@@ -131,7 +131,7 @@ pub mod cluster;
 pub mod pool;
 pub mod sharded;
 pub use cluster::{ClusterClient, ClusterConfig};
-pub use pool::{Pool, PoolConfig};
+pub use pool::{Pool, PoolConfig, PooledClient};
 pub use sharded::{ShardedClient, ShardedConfig};
 
 use std::cell::Cell;
@@ -141,7 +141,7 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use resp_proto::{Request, Value};
-use ringline::{ConnCtx, GuardBox, ParseResult, RecvHalf, SendGuard, SendHalf};
+use ringline::{Connection, GuardBox, ParseResult, RecvHalf, SendGuard, SendHalf};
 
 /// Maximum guards per scatter-gather send (matches ringline core limit).
 const MAX_FLUSH_GUARDS: usize = 8;
@@ -188,6 +188,14 @@ pub enum Error {
     /// All connections in the pool are down and reconnection failed.
     #[error("all connections failed")]
     AllConnectionsFailed,
+    /// Every pooled connection is currently checked out.
+    ///
+    /// Distinct from [`AllConnectionsFailed`](Self::AllConnectionsFailed):
+    /// nothing failed and no connect was attempted. Drop a
+    /// [`PooledClient`] or size the pool for the number of
+    /// concurrent users.
+    #[error("every pooled connection is checked out")]
+    PoolExhausted,
 
     /// Too many MOVED/ASK redirects for a single command.
     #[error("too many redirects")]
@@ -438,7 +446,7 @@ type ResultCallback = Box<dyn Fn(&CommandResult)>;
 
 /// Builder for creating a [`Client`] with per-request callbacks and metrics.
 pub struct ClientBuilder {
-    conn: ConnCtx,
+    conn: Connection,
     on_result: Option<ResultCallback>,
     max_batch_size: usize,
     max_in_flight: usize,
@@ -450,7 +458,7 @@ pub struct ClientBuilder {
 }
 
 impl ClientBuilder {
-    pub(crate) fn new(conn: ConnCtx) -> Self {
+    pub(crate) fn new(conn: Connection) -> Self {
         Self {
             conn,
             on_result: None,
@@ -528,12 +536,10 @@ impl ClientBuilder {
 
     /// Build the client.
     ///
-    /// # Errors
-    ///
-    /// Same as [`Client::new`]: the read side must be free.
-    pub fn build(self) -> Result<Client, Error> {
-        let (tx, rx) = self.conn.split()?;
-        Ok(self.finish(tx, rx))
+    /// Cannot fail: the builder holds a [`Connection`], which owns both halves
+    /// (#528).
+    pub fn build(self) -> Client {
+        self.finish(None)
     }
 
     /// `build` without the driver, for the in-memory unit tests.
@@ -544,29 +550,47 @@ impl ClientBuilder {
     /// wire — the same contract `ConnCtx::for_test` already carries.
     #[cfg(test)]
     pub(crate) fn build_for_test(self) -> Client {
-        let (tx, rx) = self.conn.split_for_test();
-        self.finish(tx, rx)
+        let halves = self.conn.as_conn().split_for_test();
+        self.finish(Some(halves))
     }
 
-    fn finish(self, tx: SendHalf, rx: RecvHalf) -> Client {
+    /// Assemble the client from the builder's fields.
+    ///
+    /// The builder is destructured first because `Connection::split` consumes the
+    /// connection and the other fields are still needed. When `halves` is
+    /// `Some`, it is used instead of splitting the connection; the in-memory unit
+    /// tests pass a dangling handle this way.
+    fn finish(self, halves: Option<(SendHalf, RecvHalf)>) -> Client {
+        let Self {
+            conn,
+            on_result,
+            max_batch_size,
+            max_in_flight,
+            zc_threshold,
+            #[cfg(feature = "timestamps")]
+            use_kernel_ts,
+            #[cfg(feature = "metrics")]
+            with_metrics,
+        } = self;
+        let (tx, rx) = halves.unwrap_or_else(|| conn.split());
         Client {
             tx,
             rx,
-            on_result: self.on_result,
+            on_result,
             pending: VecDeque::with_capacity(16),
             last_rx_bytes: Cell::new(0),
             write_buf: Vec::new(),
             write_guards: Vec::new(),
             flushed_count: 0,
-            max_batch_size: self.max_batch_size,
-            max_in_flight: self.max_in_flight,
-            zc_threshold: self.zc_threshold,
+            max_batch_size,
+            max_in_flight,
+            zc_threshold,
             buffered_ops: 0,
             encode_buf: Vec::new(),
             #[cfg(feature = "timestamps")]
-            use_kernel_ts: self.use_kernel_ts,
+            use_kernel_ts,
             #[cfg(feature = "metrics")]
-            metrics: if self.with_metrics {
+            metrics: if with_metrics {
                 Some(ClientMetrics::new())
             } else {
                 None
@@ -704,16 +728,13 @@ impl Client {
     ///
     /// No callbacks, no metrics, no kernel timestamps — zero overhead.
     /// `max_batch_size` defaults to 1 (each `fire_*` sends immediately).
-    /// # Errors
     ///
-    /// Takes exclusive ownership of the connection's read side via
-    /// [`ConnCtx::split`], so this fails with `EBUSY` if another client (or
-    /// any other reader) already holds it, and `EPIPE` if `conn` is stale.
-    /// Two clients driving one connection used to be silently allowed, and it
-    /// interleaved their reads; now it is refused.
-    pub fn new(conn: ConnCtx) -> Result<Self, Error> {
-        let (tx, rx) = conn.split()?;
-        Ok(Self {
+    /// Cannot fail: a [`Connection`] already owns both halves (#528).
+    /// `Connection` is not `Copy`, so only one client can be built from a given
+    /// connection.
+    pub fn new(conn: Connection) -> Self {
+        let (tx, rx) = conn.split();
+        Self {
             tx,
             rx,
             on_result: None,
@@ -731,11 +752,11 @@ impl Client {
             use_kernel_ts: false,
             #[cfg(feature = "metrics")]
             metrics: None,
-        })
+        }
     }
 
     /// Create a builder for a client with per-request callbacks.
-    pub fn builder(conn: ConnCtx) -> ClientBuilder {
+    pub fn builder(conn: Connection) -> ClientBuilder {
         ClientBuilder::new(conn)
     }
 
@@ -3562,10 +3583,10 @@ fn append_set_guard_suffix_ex(buf: &mut Vec<u8>, ttl_secs: u64) {
 /// # Example
 ///
 /// ```no_run
-/// # use ringline::ConnCtx;
+/// # use ringline::Connection;
 /// # use ringline_redis::Client;
-/// # async fn example(conn: ConnCtx) -> Result<(), ringline_redis::Error> {
-/// let mut client = Client::new(conn)?;
+/// # async fn example(conn: Connection) -> Result<(), ringline_redis::Error> {
+/// let mut client = Client::new(conn);
 /// let results = client.pipeline()
 ///     .set(b"k1", b"v1")
 ///     .set(b"k2", b"v2")
@@ -3911,7 +3932,7 @@ mod encode_tests {
 #[cfg(test)]
 mod zc_threshold_tests {
     use super::*;
-    use ringline::{ConnCtx, RegionId, SendGuard};
+    use ringline::{RegionId, SendGuard};
 
     const KEY: &[u8] = b"user:123456789";
 
@@ -3928,10 +3949,10 @@ mod zc_threshold_tests {
         }
     }
 
-    /// A `Client` backed by a dangling `ConnCtx`. Only safe for tests that
+    /// A `Client` backed by a dangling `Connection`. Only safe for tests that
     /// stay in the buffered path (no flush, no direct send, no recv).
     fn test_client(max_batch_size: usize, zc_threshold: u32) -> Client {
-        let conn = ConnCtx::for_test(0, 0);
+        let conn = ringline::Connection::for_test(0, 0);
         let mut client = Client::builder(conn).max_batch_size(max_batch_size);
         client = client.zc_threshold(zc_threshold);
         client.build_for_test()

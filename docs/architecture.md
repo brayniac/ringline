@@ -218,7 +218,7 @@ See `docs/tls-premutation-bound-design.md`.
 TLS is implemented with rustls in the worker thread; it is not a separate
 thread or executor. Inbound TLS connections create a `TlsConn` after slot
 allocation but defer `on_accept` until `feed_tls_recv` reports
-`HandshakeJustCompleted`. Outbound `connect_tls` similarly resolves only after
+`HandshakeJustCompleted`. An outbound `connect(addr).tls(..)` similarly resolves only after
 the TCP connection and TLS handshake complete. Handshake messages and alerts
 use the normal per-connection send queue.
 

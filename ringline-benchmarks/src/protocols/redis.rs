@@ -279,17 +279,11 @@ impl ringline::AsyncEventHandler for RinglineRedisBench {
                 // Each client task connects so owner_task is set to the
                 // spawned task. Same pattern as tcp.rs.
                 ringline::spawn(async move {
-                    let conn = match ringline::connect(addr) {
-                        Ok(f) => match f.await {
-                            Ok(c) => c,
-                            Err(_) => return,
-                        },
-                        Err(_) => return,
-                    };
-                    let mut client = match ringline_redis::Client::new(conn) {
+                    let conn = match ringline::connect(addr).await {
                         Ok(c) => c,
                         Err(_) => return,
                     };
+                    let mut client = ringline_redis::Client::new(conn);
 
                     let key: &[u8] = b"k";
                     let mut local_ops: u64 = 0;

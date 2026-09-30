@@ -32,7 +32,6 @@
 use std::net::SocketAddr;
 
 use memcache_proto::ResponseBytes as McResponseBytes;
-use ringline::ConnCtx;
 
 use crate::{
     Client, Error, GetValue, Value, check_error_bytes, encode_add, encode_request,
@@ -128,8 +127,8 @@ impl ShardedClient {
         let opts = self.connect_opts();
         for shard in &mut self.shards {
             for slot in &mut shard.conns {
-                let conn = do_connect(shard.addr, &opts).await?;
-                *slot = ShardConn::Connected(Box::new(Client::new(conn)?));
+                let client = do_connect(shard.addr, &opts).await?;
+                *slot = ShardConn::Connected(Box::new(client));
             }
         }
         Ok(())
@@ -203,10 +202,7 @@ impl ShardedClient {
             let idx = (shard.next + attempt) % size;
             if matches!(shard.conns[idx], ShardConn::Disconnected) {
                 match do_connect(shard.addr, &opts).await {
-                    Ok(c) => match Client::new(c) {
-                        Ok(client) => shard.conns[idx] = ShardConn::Connected(Box::new(client)),
-                        Err(_) => continue,
-                    },
+                    Ok(client) => shard.conns[idx] = ShardConn::Connected(Box::new(client)),
                     Err(_) => continue,
                 }
             }
@@ -534,10 +530,7 @@ async fn flush_all_on_shard(shard: &mut Shard, opts: &ConnectOpts) -> Result<(),
         shard.next = (shard.next + 1) % size;
         if matches!(shard.conns[idx], ShardConn::Disconnected) {
             match do_connect(shard.addr, opts).await {
-                Ok(c) => match Client::new(c) {
-                    Ok(client) => shard.conns[idx] = ShardConn::Connected(Box::new(client)),
-                    Err(_) => continue,
-                },
+                Ok(client) => shard.conns[idx] = ShardConn::Connected(Box::new(client)),
                 Err(_) => continue,
             }
         }
@@ -570,10 +563,7 @@ async fn version_on_shard(shard: &mut Shard, opts: &ConnectOpts) -> Result<Box<s
         shard.next = (shard.next + 1) % size;
         if matches!(shard.conns[idx], ShardConn::Disconnected) {
             match do_connect(shard.addr, opts).await {
-                Ok(c) => match Client::new(c) {
-                    Ok(client) => shard.conns[idx] = ShardConn::Connected(Box::new(client)),
-                    Err(_) => continue,
-                },
+                Ok(client) => shard.conns[idx] = ShardConn::Connected(Box::new(client)),
                 Err(_) => continue,
             }
         }
@@ -621,9 +611,7 @@ async fn get_conn<'a>(shard: &'a mut Shard, opts: &ConnectOpts) -> Result<&'a mu
             chosen = Some(idx);
             break;
         }
-        if let Ok(conn) = do_connect(shard.addr, opts).await
-            && let Ok(client) = Client::new(conn)
-        {
+        if let Ok(client) = do_connect(shard.addr, opts).await {
             shard.conns[idx] = ShardConn::Connected(Box::new(client));
             chosen = Some(idx);
             break;
@@ -638,24 +626,17 @@ async fn get_conn<'a>(shard: &'a mut Shard, opts: &ConnectOpts) -> Result<&'a mu
     }
 }
 
-async fn do_connect(addr: SocketAddr, opts: &ConnectOpts) -> Result<ConnCtx, Error> {
-    let conn = if let Some(ref sni) = opts.tls_server_name {
-        let fut = if opts.connect_timeout_ms > 0 {
-            ringline::connect_tls_with_timeout(addr, sni, opts.connect_timeout_ms)?
-        } else {
-            ringline::connect_tls(addr, sni)?
-        };
-        fut.await?
-    } else {
-        let fut = if opts.connect_timeout_ms > 0 {
-            ringline::connect_with_timeout(addr, opts.connect_timeout_ms)?
-        } else {
-            ringline::connect(addr)?
-        };
-        fut.await?
-    };
-
-    Ok(conn)
+async fn do_connect(addr: SocketAddr, opts: &ConnectOpts) -> Result<Client, Error> {
+    // TLS and the timeout are set on the builder (#528).
+    let mut connect = ringline::connect(addr);
+    if let Some(ref sni) = opts.tls_server_name {
+        connect = connect.tls(sni.as_str());
+    }
+    if opts.connect_timeout_ms > 0 {
+        connect = connect.timeout(std::time::Duration::from_millis(opts.connect_timeout_ms));
+    }
+    let conn = connect.await?;
+    Ok(Client::new(conn))
 }
 
 #[cfg(test)]

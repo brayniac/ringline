@@ -32,7 +32,6 @@ use std::net::SocketAddr;
 
 use bytes::Bytes;
 use resp_proto::{RedirectKind, Request, SlotMap, Value, hash_slot, parse_redirect};
-use ringline::ConnCtx;
 
 use crate::{Client, Error, parse_bytes_array};
 
@@ -195,14 +194,7 @@ impl ClusterClient {
         if slots_value.is_none() {
             for &seed_addr in &self.seeds {
                 match self.do_connect(seed_addr).await {
-                    Ok(conn) => {
-                        let mut client = match Client::new(conn) {
-                            Ok(c) => c,
-                            Err(_) => {
-                                conn.close();
-                                continue;
-                            }
-                        };
+                    Ok(mut client) => {
                         if client.send_raw(&cluster_slots_cmd).is_err() {
                             client.close();
                             continue;
@@ -216,7 +208,7 @@ impl ClusterClient {
                                 break;
                             }
                             Err(_) => {
-                                conn.close();
+                                client.close();
                             }
                         }
                     }
@@ -255,15 +247,10 @@ impl ClusterClient {
                     Err(_) => continue,
                 };
                 match self.do_connect(parsed).await {
-                    Ok(conn) => match Client::new(conn) {
-                        Ok(client) => {
-                            self.nodes
-                                .insert(addr_str.clone(), NodeState::Connected(Box::new(client)));
-                        }
-                        Err(_) => {
-                            self.nodes.insert(addr_str.clone(), NodeState::Disconnected);
-                        }
-                    },
+                    Ok(client) => {
+                        self.nodes
+                            .insert(addr_str.clone(), NodeState::Connected(Box::new(client)));
+                    }
                     Err(_) => {
                         self.nodes.insert(addr_str.clone(), NodeState::Disconnected);
                     }
@@ -289,34 +276,30 @@ impl ClusterClient {
         let parsed: SocketAddr = addr
             .parse()
             .map_err(|e: std::net::AddrParseError| Error::Redis(e.to_string()))?;
-        let conn = self.do_connect(parsed).await?;
-        let client = Client::new(conn)?;
+        let client = self.do_connect(parsed).await?;
         self.nodes
             .insert(addr.to_string(), NodeState::Connected(Box::new(client)));
         Ok(())
     }
 
-    async fn do_connect(&self, addr: SocketAddr) -> Result<ConnCtx, Error> {
-        let conn = if let Some(sni) = &self.tls_server_name {
-            let fut = if self.connect_timeout_ms > 0 {
-                ringline::connect_tls_with_timeout(addr, sni, self.connect_timeout_ms)?
-            } else {
-                ringline::connect_tls(addr, sni)?
-            };
-            fut.await?
-        } else {
-            let fut = if self.connect_timeout_ms > 0 {
-                ringline::connect_with_timeout(addr, self.connect_timeout_ms)?
-            } else {
-                ringline::connect(addr)?
-            };
-            fut.await?
-        };
+    async fn do_connect(&self, addr: SocketAddr) -> Result<Client, Error> {
+        // TLS and the timeout are set on the builder (#528).
+        let mut connect = ringline::connect(addr);
+        if let Some(sni) = &self.tls_server_name {
+            connect = connect.tls(sni.as_str());
+        }
+        if self.connect_timeout_ms > 0 {
+            connect = connect.timeout(std::time::Duration::from_millis(self.connect_timeout_ms));
+        }
+        let conn = connect.await?;
 
-        Client::new(conn)?
+        // Return the authenticated client. `Connection` is not `Copy`, so no
+        // separate handle can be returned alongside it (#528).
+        let mut client = Client::new(conn);
+        client
             .maybe_auth(self.password.as_deref(), self.username.as_deref())
             .await?;
-        Ok(conn)
+        Ok(client)
     }
 
     /// Mark a node as disconnected (e.g. after ConnectionClosed).

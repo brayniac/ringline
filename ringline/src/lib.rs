@@ -262,7 +262,7 @@ pub use runtime::io::BlockingJoinHandle;
 pub use runtime::io::ConnCtx;
 /// Future that completes when a connect finishes.
 pub use runtime::io::ConnectFuture;
-/// An accepted connection: the owned pair of halves handed to `on_accept`.
+/// An owned connection: the pair of claimed halves, from `on_accept` or `connect`.
 pub use runtime::io::Connection;
 /// A monotonic clock deadline for absolute timers.
 pub use runtime::io::Deadline;
@@ -280,7 +280,7 @@ pub use runtime::io::ForwardToFuture;
 pub use runtime::io::JoinHandle;
 /// Result of a parse closure: consumed bytes or need more data.
 pub use runtime::io::ParseResult;
-/// The exclusive read side of a connection, from [`ConnCtx::take_recv()`].
+/// The exclusive read side of a connection, from [`Connection::split()`] or [`ConnCtx::take_recv()`].
 pub use runtime::io::RecvHalf;
 /// Future returned by [`ConnCtx::recv_owned_segment()`] (segmented recv, Mode C).
 #[cfg(has_io_uring)]
@@ -303,19 +303,23 @@ pub use runtime::io::SegConsumed;
 pub use runtime::io::SegmentReader;
 /// Future that completes when a send finishes.
 pub use runtime::io::SendFuture;
-/// The single-owner write side of a connection, from [`ConnCtx::split()`].
+/// The single-owner write side of a connection, from [`Connection::split()`] or [`ConnCtx::take_send()`].
 pub use runtime::io::SendHalf;
 /// Non-raw sink descriptor for [`ConnCtx::forward_to()`] (segmented recv, Mode A).
 #[cfg(has_io_uring)]
 pub use runtime::io::SinkFd;
 /// Future returned by [`sleep()`].
 pub use runtime::io::SleepFuture;
+/// Builder for an outbound TCP connection, from [`connect`].
+pub use runtime::io::TcpConnect;
 /// Future returned by [`timeout()`].
 pub use runtime::io::TimeoutFuture;
 /// Async context for a UDP socket.
 pub use runtime::io::UdpCtx;
 /// Future returned by [`UdpCtx::recv_from()`].
 pub use runtime::io::UdpRecvFuture;
+/// Builder for an outbound Unix-domain connection, from [`connect_unix`].
+pub use runtime::io::UnixConnect;
 /// Future that provides received data as zero-copy `Bytes`.
 pub use runtime::io::WithBytesFuture;
 /// Future that provides received data.
@@ -325,16 +329,10 @@ pub use runtime::io::WithDataResultFuture;
 /// Future returned by [`ConnCtx::with_segments()`] (segmented recv, Mode B).
 #[cfg(has_io_uring)]
 pub use runtime::io::WithSegmentsFuture;
-/// Initiate an outbound TCP connection from any async task.
+/// Begin an outbound TCP connection; awaiting resolves to a `Connection`.
 pub use runtime::io::connect;
-/// Initiate an outbound TLS connection from any async task.
-pub use runtime::io::connect_tls;
-/// Initiate an outbound TLS connection with a timeout from any async task.
-pub use runtime::io::connect_tls_with_timeout;
-/// Initiate an outbound Unix domain socket connection from any async task.
+/// Begin an outbound Unix-domain connection; awaiting resolves to a `Connection`.
 pub use runtime::io::connect_unix;
-/// Initiate an outbound TCP connection with a timeout from any async task.
-pub use runtime::io::connect_with_timeout;
 /// Submit a Direct I/O read and return a future for the result.
 pub use runtime::io::direct_io_read;
 /// Submit a Direct I/O write and return a future for the result.

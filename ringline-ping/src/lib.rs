@@ -6,11 +6,11 @@
 //! # Example
 //!
 //! ```no_run
-//! use ringline::ConnCtx;
+//! use ringline::Connection;
 //! use ringline_ping::Client;
 //!
-//! async fn example(conn: ConnCtx) -> Result<(), ringline_ping::Error> {
-//!     let mut client = Client::new(conn)?;
+//! async fn example(conn: Connection) -> Result<(), ringline_ping::Error> {
+//!     let mut client = Client::new(conn);
 //!     client.ping().await?;
 //!     Ok(())
 //! }
@@ -24,14 +24,14 @@
 //! | **Send** | 1 | 6-byte `PING\r\n` copied into the send pool. |
 
 pub mod pool;
-pub use pool::{Pool, PoolConfig};
+pub use pool::{Pool, PoolConfig, PooledClient};
 
 use std::cell::Cell;
 use std::io;
 use std::time::Instant;
 
 use ping_proto::{Request as PingRequest, Response as PingResponse};
-use ringline::{ConnCtx, ParseResult, RecvHalf, SendHalf};
+use ringline::{Connection, ParseResult, RecvHalf, SendHalf};
 
 // -- Error -------------------------------------------------------------------
 
@@ -62,6 +62,14 @@ pub enum Error {
     /// All connections in the pool are down and reconnection failed.
     #[error("all connections failed")]
     AllConnectionsFailed,
+    /// Every pooled connection is currently checked out.
+    ///
+    /// Distinct from [`AllConnectionsFailed`](Self::AllConnectionsFailed):
+    /// nothing failed and no connect was attempted. Drop a
+    /// [`PooledClient`] or size the pool for the number of
+    /// concurrent users.
+    #[error("every pooled connection is checked out")]
+    PoolExhausted,
 }
 
 // ── Command types ───────────────────────────────────────────────────────
@@ -130,7 +138,7 @@ type ResultCallback = Box<dyn Fn(&CommandResult)>;
 
 /// Builder for creating a [`Client`] with per-request callbacks and metrics.
 pub struct ClientBuilder {
-    conn: ConnCtx,
+    conn: Connection,
     on_result: Option<ResultCallback>,
     #[cfg(feature = "timestamps")]
     use_kernel_ts: bool,
@@ -139,7 +147,7 @@ pub struct ClientBuilder {
 }
 
 impl ClientBuilder {
-    pub(crate) fn new(conn: ConnCtx) -> Self {
+    pub(crate) fn new(conn: Connection) -> Self {
         Self {
             conn,
             on_result: None,
@@ -172,25 +180,33 @@ impl ClientBuilder {
 
     /// Build the client.
     ///
-    /// # Errors
-    ///
-    /// Same as [`Client::new`]: the read side must be free.
-    pub fn build(self) -> Result<Client, Error> {
-        let (tx, rx) = self.conn.split()?;
-        Ok(Client {
+    /// Cannot fail; see [`Client::new`].
+    pub fn build(self) -> Client {
+        // Destructure first: `Connection::split` consumes the connection and
+        // the other fields are still needed.
+        let Self {
+            conn,
+            on_result,
+            #[cfg(feature = "timestamps")]
+            use_kernel_ts,
+            #[cfg(feature = "metrics")]
+            with_metrics,
+        } = self;
+        let (tx, rx) = conn.split();
+        Client {
             tx,
             rx,
-            on_result: self.on_result,
+            on_result,
             last_rx_bytes: Cell::new(0),
             #[cfg(feature = "timestamps")]
-            use_kernel_ts: self.use_kernel_ts,
+            use_kernel_ts,
             #[cfg(feature = "metrics")]
-            metrics: if self.with_metrics {
+            metrics: if with_metrics {
                 Some(ClientMetrics::new())
             } else {
                 None
             },
-        })
+        }
     }
 }
 
@@ -217,16 +233,10 @@ impl Client {
     ///
     /// No callbacks, no metrics, no kernel timestamps — zero overhead.
     ///
-    /// # Errors
-    ///
-    /// Takes exclusive ownership of the connection's read side via
-    /// [`ConnCtx::split`], so this fails with `EBUSY` if another client (or
-    /// any other reader) already holds it, and `EPIPE` if `conn` is stale.
-    /// Two clients driving one connection used to be silently allowed, and it
-    /// interleaved their reads; now it is refused.
-    pub fn new(conn: ConnCtx) -> Result<Self, Error> {
-        let (tx, rx) = conn.split()?;
-        Ok(Self {
+    /// Cannot fail: a [`Connection`] already owns both halves (#528).
+    pub fn new(conn: Connection) -> Self {
+        let (tx, rx) = conn.split();
+        Self {
             tx,
             rx,
             on_result: None,
@@ -235,11 +245,11 @@ impl Client {
             use_kernel_ts: false,
             #[cfg(feature = "metrics")]
             metrics: None,
-        })
+        }
     }
 
     /// Create a builder for a client with per-request callbacks.
-    pub fn builder(conn: ConnCtx) -> ClientBuilder {
+    pub fn builder(conn: Connection) -> ClientBuilder {
         ClientBuilder::new(conn)
     }
 

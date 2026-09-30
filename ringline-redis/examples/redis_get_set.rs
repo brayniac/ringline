@@ -25,29 +25,17 @@ impl AsyncEventHandler for RedisHandler {
         let addr = *REDIS_ADDR.get().unwrap();
         Some(Box::pin(async move {
             // Connect to Redis.
-            let conn = match ringline::connect(addr) {
-                Ok(f) => match f.await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        eprintln!("connect error: {e}");
-                        ringline::request_shutdown().ok();
-                        return;
-                    }
-                },
+            let conn = match ringline::connect(addr).await {
+                Ok(c) => c,
                 Err(e) => {
-                    eprintln!("submit error: {e}");
+                    eprintln!("connect error: {e}");
                     ringline::request_shutdown().ok();
                     return;
                 }
             };
 
-            let mut client = match ringline_redis::Client::new(conn) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("split failed: {e}");
-                    return;
-                }
-            };
+            // `Client::new` cannot fail: a `Connection` owns both halves (#528).
+            let mut client = ringline_redis::Client::new(conn);
 
             // SET a key.
             match client.set(b"ringline:hello", b"world").await {

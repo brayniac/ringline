@@ -585,13 +585,9 @@ fn getsockname_v4_v6(fd: RawFd) -> Option<SocketAddr> {
 ///     fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
 ///         Some(Box::pin(async {
 ///             // Connect to Redis on startup
-///             match ringline::connect("127.0.0.1:6379".parse().unwrap()) {
-///                 Ok(future) => {
-///                     if let Ok(conn) = future.await {
-///                         println!("Connected to Redis");
-///                     }
-///                 }
-///                 Err(_) => eprintln!("Failed to initiate connection"),
+///             match ringline::connect("127.0.0.1:6379".parse().unwrap()).await {
+///                 Ok(_conn) => println!("Connected to Redis"),
+///                 Err(e) => eprintln!("Failed to connect: {e}"),
 ///             }
 ///         }))
 ///     }

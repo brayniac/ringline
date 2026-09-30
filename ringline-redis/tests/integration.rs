@@ -37,10 +37,9 @@ fn test_config() -> Config {
 async fn connect_redis() -> Result<Client, String> {
     let addr: SocketAddr = REDIS_ADDR.parse().unwrap();
     let conn = ringline::connect(addr)
-        .map_err(|e| format!("submit: {e}"))?
         .await
         .map_err(|e| format!("connect: {e}"))?;
-    Client::new(conn).map_err(|e| format!("split: {e}"))
+    Ok(Client::new(conn))
 }
 
 /// Run a client-only test: launch a 1-worker ringline with `on_start`, wait
@@ -414,7 +413,7 @@ fn redis_pool() {
                 let result = async {
                     let addr: SocketAddr = REDIS_ADDR.parse().unwrap();
                     let config = PoolConfig::new(addr, 2).connect_timeout_ms(5000);
-                    let mut pool = Pool::new(config);
+                    let pool = Pool::new(config);
                     pool.connect_all()
                         .await
                         .map_err(|e| format!("connect_all: {e}"))?;

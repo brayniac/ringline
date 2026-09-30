@@ -8,7 +8,7 @@ use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 
 use bytes::{Bytes, BytesMut};
-use ringline::{ConnCtx, RecvHalf, SendHalf};
+use ringline::{RecvHalf, SendHalf};
 // `ParseResult` is only used by the mio/portable `with_data` recv path; the
 // io_uring path feeds h2 via `with_segments` (returns `SegConsumed`).
 #[cfg(not(has_io_uring))]
@@ -392,7 +392,7 @@ impl H2AsyncConn {
     /// Performs TLS handshake, sends the H2 connection preface, and waits
     /// for the server SETTINGS exchange to complete.
     pub async fn connect(addr: SocketAddr, host: &str) -> Result<Self, HttpError> {
-        let conn = ringline::connect_tls(addr, host)?.await?;
+        let conn = ringline::connect(addr).tls(host).await?;
         Self::from_conn(conn).await
     }
 
@@ -402,17 +402,21 @@ impl H2AsyncConn {
         host: &str,
         timeout_ms: u64,
     ) -> Result<Self, HttpError> {
-        let conn = ringline::connect_tls_with_timeout(addr, host, timeout_ms)?.await?;
+        let conn = ringline::connect(addr)
+            .tls(host)
+            .timeout(std::time::Duration::from_millis(timeout_ms))
+            .await?;
         Self::from_conn(conn).await
     }
 
-    /// Wrap an already-connected `ConnCtx` (must be TLS for H2).
+    /// Wrap an already-connected [`ringline::Connection`] (must be TLS for H2).
     ///
-    /// Sends the H2 preface and waits for SETTINGS exchange.
-    pub async fn from_conn(conn: ConnCtx) -> Result<Self, HttpError> {
+    /// Sends the H2 preface and waits for the SETTINGS exchange. The
+    /// `Connection` already owns both halves, so no claim step can fail (#528).
+    pub async fn from_conn(conn: ringline::Connection) -> Result<Self, HttpError> {
         let h2 = H2Connection::new(Settings::client_default());
 
-        let (tx, rx) = conn.split()?;
+        let (tx, rx) = conn.split();
         let mut this = Self {
             tx,
             rx,

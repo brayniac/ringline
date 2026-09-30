@@ -194,10 +194,9 @@ impl AsyncEventHandler for ClientHandler {
 
 async fn connect(addr: SocketAddr) -> Result<Client, String> {
     let conn = ringline::connect(addr)
-        .map_err(|e| format!("submit: {e}"))?
         .await
         .map_err(|e| format!("connect: {e}"))?;
-    Client::new(conn).map_err(|e| format!("split: {e}"))
+    Ok(Client::new(conn))
 }
 
 async fn run_client(addr: SocketAddr) -> Result<(), String> {
@@ -668,14 +667,18 @@ async fn run_pool_stream(addr: SocketAddr) -> Result<(), String> {
     // `pool_size == 1` forces every checkout onto the SAME slot, so the poison
     // path below actually re-checks-out the poisoned connection (with 2+ slots
     // round-robin would dodge it, never exercising the eviction).
-    let mut pool = Pool::new(PoolConfig::new(addr, 1));
+    let pool = Pool::new(PoolConfig::new(addr, 1));
 
     let expected_large = large_value();
 
     // (a) happy path: pooled streaming collect() reassembles the large value
     //     across many recv buffers, just like the single-connection Client.
     {
-        let stream = pool
+        let mut client = pool
+            .client()
+            .await
+            .map_err(|e| format!("pool large client: {e}"))?;
+        let stream = client
             .get_stream(b"stream:large")
             .await
             .map_err(|e| format!("pool large get_stream: {e}"))?
@@ -712,26 +715,40 @@ async fn run_pool_stream(addr: SocketAddr) -> Result<(), String> {
     //     slot and lazily reconnect on the next checkout — never hand the
     //     desynced connection back out.
     {
-        let mut stream = pool
-            .get_stream(b"stream:poison")
+        let mut client = pool
+            .client()
             .await
-            .map_err(|e| format!("pool poison get_stream: {e}"))?
-            .ok_or("pool poison: None")?;
-        let first = stream
-            .next_segment()
-            .await
-            .map_err(|e| format!("pool poison next_segment: {e}"))?
-            .ok_or("pool poison: first chunk None")?;
-        if first.len() >= POISON_LEN {
-            return Err("pool poison value did not span multiple buffers".into());
+            .map_err(|e| format!("pool poison client: {e}"))?;
+        {
+            let mut stream = client
+                .get_stream(b"stream:poison")
+                .await
+                .map_err(|e| format!("pool poison get_stream: {e}"))?
+                .ok_or("pool poison: None")?;
+            let first = stream
+                .next_segment()
+                .await
+                .map_err(|e| format!("pool poison next_segment: {e}"))?
+                .ok_or("pool poison: first chunk None")?;
+            if first.len() >= POISON_LEN {
+                return Err("pool poison value did not span multiple buffers".into());
+            }
+            // `stream` dropped here undrained, which closes the connection.
         }
-        // `stream` dropped here undrained → pooled connection poisoned (close()).
+        // `client` dropped here. Its `Drop` sees the connection is no longer
+        // alive and marks the slot disconnected, so the next checkout
+        // reconnects.
     }
 
     // The NEXT pooled op must get a healthy, freshly reconnected connection with
     // CORRECT results — proving the abandoned inbound value bytes did not desync
     // a reused connection (the whole point of the eviction).
-    let after_poison = pool
+    let mut client = pool
+        .client()
+        .await
+        .map_err(|e| format!("pool client after poison: {e}"))?;
+    let reconnected = client.token();
+    let after_poison = client
         .get_stream(b"stream:small")
         .await
         .map_err(|e| format!("pool get_stream after poison: {e}"))?
@@ -742,14 +759,21 @@ async fn run_pool_stream(addr: SocketAddr) -> Result<(), String> {
     if after_poison.as_ref() != SMALL {
         return Err("pool desync after poison-evict-reconnect".into());
     }
+    // The pool has one slot. The guard has to go back before the next
+    // checkout, or that checkout is `PoolExhausted`.
+    drop(client);
 
     // A second op on the reconnected slot confirms steady-state reuse (a large
     // value, so any residual desync from the abandoned poison read would surface
     // as a mismatch).
-    let again = pool
+    let mut client = pool
         .client()
         .await
-        .map_err(|e| format!("pool client 2: {e}"))?
+        .map_err(|e| format!("pool client 2: {e}"))?;
+    if client.token() != reconnected {
+        return Err("the second checkout did not reuse the reconnected slot".into());
+    }
+    let again = client
         .get(b"stream:large")
         .await
         .map_err(|e| format!("pool get large after poison: {e}"))?

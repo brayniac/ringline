@@ -374,15 +374,7 @@ mod ringline_client {
     async fn run_ringline_client(state: Arc<ClientState>) {
         let msg_size = state.msg_size;
 
-        let connect_future = match connect(state.target) {
-            Ok(f) => f,
-            Err(e) => {
-                eprintln!("  ringline client connect setup failed: {e}");
-                return;
-            }
-        };
-
-        let conn = match connect_future.await {
+        let conn = match connect(state.target).await {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("  ringline client connect failed: {e}");
@@ -390,10 +382,7 @@ mod ringline_client {
             }
         };
         // Reading an outbound connection goes through its read half.
-        let (mut conn_tx, mut conn_rx) = match conn.split() {
-            Ok(halves) => halves,
-            Err(_) => return,
-        };
+        let (mut conn_tx, mut conn_rx) = conn.split();
 
         let mut local_ops: u64 = 0;
         let mut samples: Vec<u64> = Vec::with_capacity(1_000_000);
@@ -465,24 +454,15 @@ mod ringline_client {
     /// wake targets the owning task), and a separate spawned task is the
     /// *sender* (fire-and-forget `send_nowait`, never awaits recv).
     async fn run_ringline_open_client(state: Arc<ClientState>, ol: OpenLoop) {
-        let conn = match connect(state.target) {
-            Ok(f) => match f.await {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("  ringline client connect failed: {e}");
-                    return;
-                }
-            },
+        let conn = match ringline::connect(state.target).await {
+            Ok(c) => c,
             Err(e) => {
-                eprintln!("  ringline client connect setup failed: {e}");
+                eprintln!("  ringline client connect failed: {e}");
                 return;
             }
         };
         // Reading an outbound connection goes through its read half.
-        let (mut conn_tx, mut conn_rx) = match conn.split() {
-            Ok(halves) => halves,
-            Err(_) => return,
-        };
+        let (mut conn_tx, mut conn_rx) = conn.split();
 
         let msg_size = state.msg_size;
         let msg = vec![0xABu8; msg_size];

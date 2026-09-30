@@ -341,18 +341,12 @@ impl ringline::AsyncEventHandler for RinglineTcpBench {
                 // wake_recv() resolves through owner_task, so the correct task is woken
                 // when echo data arrives.
                 ringline::spawn(async move {
-                    let conn = match ringline::connect(addr) {
-                        Ok(f) => match f.await {
-                            Ok(c) => c,
-                            Err(_) => return,
-                        },
+                    let conn = match ringline::connect(addr).await {
+                        Ok(c) => c,
                         Err(_) => return,
                     };
                     // Reading an outbound connection goes through its read half.
-                    let (mut conn_tx, mut conn_rx) = match conn.split() {
-                        Ok(halves) => halves,
-                        Err(_) => return,
-                    };
+                    let (mut conn_tx, mut conn_rx) = conn.split();
 
                     let msg = vec![0xABu8; msg_size];
                     let mut local_ops: u64 = 0;

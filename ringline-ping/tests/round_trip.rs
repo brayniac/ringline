@@ -136,23 +136,16 @@ impl AsyncEventHandler for PingClientHandler {
     fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
         let server_addr = *PING_SERVER_ADDR.get().expect("server addr not set");
         Some(Box::pin(async move {
-            let conn = match ringline::connect(server_addr) {
-                Ok(fut) => match fut.await {
-                    Ok(ctx) => ctx,
-                    Err(e) => {
-                        PING_RESULT.set(format!("CONNECT_ERR:{e}")).ok();
-                        ringline::request_shutdown().ok();
-                        return;
-                    }
-                },
+            let conn = match ringline::connect(server_addr).await {
+                Ok(ctx) => ctx,
                 Err(e) => {
-                    PING_RESULT.set(format!("SUBMIT_ERR:{e}")).ok();
+                    PING_RESULT.set(format!("CONNECT_ERR:{e}")).ok();
                     ringline::request_shutdown().ok();
                     return;
                 }
             };
 
-            let mut client = ringline_ping::Client::new(conn).expect("split the connection");
+            let mut client = ringline_ping::Client::new(conn);
             match client.ping().await {
                 Ok(()) => {
                     PING_RESULT.set("OK".to_string()).ok();
@@ -220,7 +213,7 @@ impl AsyncEventHandler for PingPoolClientHandler {
         let server_addr = *POOL_SERVER_ADDR.get().expect("server addr not set");
         Some(Box::pin(async move {
             let config = PoolConfig::new(server_addr, 2).connect_timeout_ms(5000);
-            let mut pool = Pool::new(config);
+            let pool = Pool::new(config);
 
             if let Err(e) = pool.connect_all().await {
                 POOL_RESULT.set(format!("CONNECT_ERR:{e}")).ok();
@@ -340,23 +333,16 @@ impl AsyncEventHandler for BadPingClientHandler {
     fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
         let server_addr = *BAD_SERVER_ADDR.get().expect("bad server addr not set");
         Some(Box::pin(async move {
-            let conn = match ringline::connect(server_addr) {
-                Ok(fut) => match fut.await {
-                    Ok(ctx) => ctx,
-                    Err(e) => {
-                        BAD_RESULT.set(format!("CONNECT_ERR:{e}")).ok();
-                        ringline::request_shutdown().ok();
-                        return;
-                    }
-                },
+            let conn = match ringline::connect(server_addr).await {
+                Ok(ctx) => ctx,
                 Err(e) => {
-                    BAD_RESULT.set(format!("SUBMIT_ERR:{e}")).ok();
+                    BAD_RESULT.set(format!("CONNECT_ERR:{e}")).ok();
                     ringline::request_shutdown().ok();
                     return;
                 }
             };
 
-            let mut client = ringline_ping::Client::new(conn).expect("split the connection");
+            let mut client = ringline_ping::Client::new(conn);
             match client.ping().await {
                 Ok(()) => {
                     BAD_RESULT.set("UNEXPECTED_OK".to_string()).ok();
@@ -398,6 +384,163 @@ fn parse_error_returns_error_not_hang() {
 
     let result = BAD_RESULT.get().expect("on_start did not set result");
     assert_eq!(result, "ERROR", "expected parse error, got: {result}");
+
+    s_shutdown.shutdown();
+    for h in s_handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
+// ── Pool checkout semantics ─────────────────────────────────────────────
+
+static SEMANTICS_SERVER_ADDR: OnceLock<SocketAddr> = OnceLock::new();
+static SEMANTICS_RESULT: OnceLock<String> = OnceLock::new();
+
+struct PoolSemanticsHandler;
+
+impl PoolSemanticsHandler {
+    /// Exercises the checkout contract: several clients held at once, the
+    /// exhausted case, the slot returning on drop, and `connect_all` leaving
+    /// checked-out slots alone.
+    async fn run(server_addr: SocketAddr) -> Result<(), String> {
+        let config = PoolConfig::new(server_addr, 2).connect_timeout_ms(5000);
+        let pool = Pool::new(config);
+        pool.connect_all()
+            .await
+            .map_err(|e| format!("connect_all: {e}"))?;
+
+        // Two clients out at the same time. This is the capability the guard
+        // exists for: `PooledClient` owns its client and does not borrow the
+        // pool.
+        let mut a = pool
+            .client()
+            .await
+            .map_err(|e| format!("checkout a: {e}"))?;
+        let mut b = pool
+            .client()
+            .await
+            .map_err(|e| format!("checkout b: {e}"))?;
+        if pool.lent_count() != 2 || pool.connected_count() != 0 {
+            return Err(format!(
+                "with two out: lent={} connected={}",
+                pool.lent_count(),
+                pool.connected_count()
+            ));
+        }
+
+        // Both are live and independent.
+        a.ping().await.map_err(|e| format!("ping a: {e}"))?;
+        b.ping().await.map_err(|e| format!("ping b: {e}"))?;
+        if a.token() == b.token() {
+            return Err("both guards hold the same connection".to_string());
+        }
+
+        // Every slot is out, so this is exhaustion, not a connect failure.
+        match pool.client().await {
+            Err(ringline_ping::Error::PoolExhausted) => {}
+            Err(e) => return Err(format!("expected PoolExhausted, got {e}")),
+            Ok(_) => return Err("expected PoolExhausted, got a client".to_string()),
+        }
+
+        // `connect_all` must leave a checked-out slot alone rather than
+        // connecting over it.
+        pool.connect_all()
+            .await
+            .map_err(|e| format!("connect_all while lent: {e}"))?;
+        if pool.lent_count() != 2 || pool.connected_count() != 0 {
+            return Err(format!(
+                "connect_all disturbed lent slots: lent={} connected={}",
+                pool.lent_count(),
+                pool.connected_count()
+            ));
+        }
+        a.ping()
+            .await
+            .map_err(|e| format!("ping a after connect_all: {e}"))?;
+
+        // Dropping a guard returns its connection to the slot.
+        let a_token = a.token();
+        drop(a);
+        if pool.lent_count() != 1 || pool.connected_count() != 1 {
+            return Err(format!(
+                "after drop: lent={} connected={}",
+                pool.lent_count(),
+                pool.connected_count()
+            ));
+        }
+
+        // The returned connection is reused, not reconnected.
+        let mut c = pool
+            .client()
+            .await
+            .map_err(|e| format!("checkout c: {e}"))?;
+        if c.token() != a_token {
+            return Err("the returned slot was reconnected, not reused".to_string());
+        }
+        c.ping().await.map_err(|e| format!("ping c: {e}"))?;
+
+        drop(b);
+        drop(c);
+        if pool.connected_count() != 2 || pool.lent_count() != 0 {
+            return Err(format!(
+                "after both drops: lent={} connected={}",
+                pool.lent_count(),
+                pool.connected_count()
+            ));
+        }
+
+        pool.close_all();
+        Ok(())
+    }
+}
+
+impl AsyncEventHandler for PoolSemanticsHandler {
+    #[allow(clippy::manual_async_fn)]
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
+        async {}
+    }
+
+    fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        let server_addr = *SEMANTICS_SERVER_ADDR.get().expect("server addr not set");
+        Some(Box::pin(async move {
+            let result = match Self::run(server_addr).await {
+                Ok(()) => "OK".to_string(),
+                Err(e) => e,
+            };
+            SEMANTICS_RESULT.set(result).ok();
+            ringline::request_shutdown().ok();
+        }))
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        PoolSemanticsHandler
+    }
+}
+
+#[test]
+fn pool_checkout_semantics() {
+    let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
+
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let (s_shutdown, s_handles) = RinglineBuilder::new(test_config())
+        .bind(addr.parse().unwrap())
+        .launch::<PingServer>()
+        .expect("server launch failed");
+    wait_for_server(&addr);
+
+    SEMANTICS_SERVER_ADDR.set(addr.parse().unwrap()).ok();
+
+    let (_c_shutdown, c_handles) = RinglineBuilder::new(test_config())
+        .launch::<PoolSemanticsHandler>()
+        .expect("client launch failed");
+
+    for h in c_handles {
+        h.join().unwrap().unwrap();
+    }
+
+    let result = SEMANTICS_RESULT.get().expect("on_start did not set result");
+    assert_eq!(result, "OK", "expected OK, got: {result}");
 
     s_shutdown.shutdown();
     for h in s_handles {

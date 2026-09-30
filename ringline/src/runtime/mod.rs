@@ -471,7 +471,7 @@ pub(crate) struct Executor {
     /// Per-connection: CQE result storage for send/connect.
     pub(crate) io_results: Vec<Option<IoResult>>,
     /// Maps conn_index → owning task ID. For accepted connections, `owner_task[i] = Some(i)`
-    /// (self-owned). For outbound connections created via `ConnCtx::connect()`,
+    /// (self-owned). For outbound connections created via `connect()`,
     /// `owner_task[i] = Some(calling_task_id)` where `calling_task_id` is the task
     /// that initiated the connect. This indirection allows `wake_recv`/`wake_send`/
     /// `wake_connect` to wake the correct task even when the connection index differs

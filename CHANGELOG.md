@@ -9,6 +9,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Breaking:** `connect` and `connect_unix` return builders that resolve to an
+  owned `Connection`. `connect_with_timeout`, `connect_tls`,
+  `connect_tls_with_timeout`, and the `connect*` methods on `ConnCtx`,
+  `Connection` and `SendHalf` are removed. TLS and the timeout are set on the
+  builder, and `connect_unix` accepts a timeout for the first time. `UnixConnect`
+  has no `tls` method, so TLS over a Unix socket does not compile (#528).
+
+  ```rust
+  let conn = connect(addr).await?;
+  let conn = connect(addr).tls("example.com").timeout(d).await?;
+  let conn = connect_unix(path).timeout(d).await?;
+  ```
+
+  `timeout` takes a `Duration`. `Duration::ZERO` arms a timeout that fires
+  immediately, so callers that passed `0` to mean "no timeout" must omit the
+  call instead. On a TLS connection the window covers the TCP connect, not the
+  handshake.
+
+- **Breaking, behaviour:** a connect builder submits on its first poll rather
+  than when it is created. Two builders created and then awaited one after the
+  other connect serially; pass both to `join` to connect concurrently. This
+  matches `sleep` and `send_backpressured`, which also submit on first poll.
+
+- **Breaking:** `join`, `join3`, `select` and `select3` accept `IntoFuture`
+  rather than `Future`, so a builder can be passed directly. Every `Future` is
+  `IntoFuture`, so existing callers are unaffected.
+
+- **Breaking:** `ringline_redis::Client::{new, builder(..).build()}`,
+  `ringline_memcache::Client::{new, build, build_binary}`,
+  `ringline_ping::Client::{new, build}` and `H2Conn::from_conn` take a
+  `Connection` instead of a `ConnCtx` and no longer return `Result`. Claiming
+  the halves was their only fallible step.
+
+- **Breaking:** `Pool::client` returns a `PooledClient` guard instead of an
+  owned `Client`. The guard derefs to `Client`, and returns the client to its
+  slot when dropped — or marks the slot disconnected if the connection is no
+  longer alive, so a poisoned connection is not handed out again. Each slot owns
+  its client, so a connection is split once, when it is opened, rather than on
+  every checkout. Several clients can be checked out at the same time, as
+  before. `client`, `connect_all`, `mark_disconnected` and `close_all` now take
+  `&self`, and `lent_count` reports how many connections are checked out. `client`
+  returns the new `Error::PoolExhausted` when every slot is checked out, which is
+  distinct from `AllConnectionsFailed`; `connect_all` connects only the slots that
+  are disconnected, so it can be called again or while clients are out (#528).
+
+- **Breaking:** `Pool::get_stream` is removed. Call `get_stream` on a client
+  from `Pool::client` instead; the stream then borrows that client, so the guard
+  must be bound first. The guard's drop performs the slot health check.
+
+  ```rust
+  let mut client = pool.client().await?;
+  let stream = client.get_stream(b"key").await?;
+  ```
+
 - Accept-time placement now hands a connection to an **idle** worker as soon as
   the accepting worker holds one, instead of waiting for a gap of two. The flat
   margin meant a worker first shed on its *third* connection, so when a pooled

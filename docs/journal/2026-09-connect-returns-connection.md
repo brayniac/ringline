@@ -1,6 +1,6 @@
 # `connect()` resolves to a `Connection`, behind two builders
 
-- **Status:** open — intent landed before building, per this journal's own rule
+- **Status:** **shipped** — intent landed before building, per this journal's own rule
 - **Span:** 2026-09-29 → · issue #528 · this PR · targets 0.7.0 (breaking)
 
 Recording the design *before* implementing, because the change touches a public
@@ -203,5 +203,100 @@ the driver cannot back. Separate question, later.
 
 ## Outcome
 
-Not yet implemented. This entry will be closed out in the implementing PR with
-the GO criteria answered one by one.
+Shipped. The GO criteria, one by one:
+
+1. **The four client constructors are infallible.** ✅ `split()?` was the only
+   fallible step in each, as the table above predicted, so nothing else had to be
+   reconsidered. `ringline_redis::Client::{new, builder(..).build()}`,
+   `ringline_memcache::Client::{new, build, build_binary}`,
+   `ringline_ping::Client::{new, build}`, `H2Conn::from_conn`.
+2. **Entry points 15 → 2.** ✅ Except it was **16**: there was an eleventh
+   receiver-ignoring method, `SendHalf::connect`, that the plan missed. Ten of
+   the eleven never touched their receiver at all.
+3. **`connect_unix(path).timeout(d)` compiles.** ✅ The missing cell is closed,
+   and it cost nothing: `connect_with_timeout` was always `connect()` plus
+   `arm_connect_timeout(index, ms)`, so exposing that primitive
+   `pub(crate)` on both backends let the options compose. The cross product was
+   incomplete only in the *naming*; the mechanism was always there.
+4. **`connect_unix(path).tls(..)` does not compile.** ✅ Verified with a
+   throwaway compile gate: `no method named 'tls' found for struct 'UnixConnect'`.
+   No runtime refusal was introduced in exchange.
+5. **Green on both backends.** ✅ 491 tests pass across 30 binaries on mio,
+   `clippy --all-targets -D warnings` clean with and without `force-mio`,
+   `cargo fmt --check`, and `RUSTDOCFLAGS=-D warnings cargo doc`. The io_uring
+   path needs Linux, as always; CI is its first compile.
+
+### What the plan did not anticipate
+
+**All three pools were forced onto `Box<Client>`, and it is the design the
+siblings already chose.** They stored `Slot::Connected(ConnCtx)` and minted a
+throwaway `Client` per checkout. A non-`Copy` `Connection` makes that impossible
+— a client from a stored handle would need a second `Connection` for one slot,
+which is exactly what the claims prevent. `sharded.rs` already recorded the cost
+being paid: a `split()`, two driver round trips and two claim writes, *per
+command*, which is why `ShardedClient` and `ClusterClient` moved to owning the
+client in #439/#440. The pools were the last holdout. Consequences:
+
+- `Pool::client` returns `&mut Client`. The call shape and the number of awaits
+  are unchanged — `client()` was already `async`, for the lazy reconnect in
+  `checkout`, not for the split.
+- redis's `stream_client`/parking field is **gone**. It existed so a
+  `ValueStream` could borrow a client at a stable address; a boxed client in the
+  slot already is one. A simplification that fell out rather than being sought.
+- The pools' documented "two clients on one slot is refused with `EBUSY`" caveat
+  became a borrow error.
+
+**`do_connect` was exploiting `Copy`.** It built a throwaway client to AUTH with
+and returned the *same* handle — only possible because `ConnCtx` is `Copy`. It
+now returns the authed `Client`, which every caller was constructing anyway.
+
+**An unguarded `for_test` slipped in.** `Connection::for_test` was added without
+the `#[cfg(feature = "testing")] #[doc(hidden)]` gate that `ConnCtx::for_test`
+carries, which would have put a dangling-connection constructor in the default
+public surface. Caught by the rustdoc link check, of all things — the broken
+intra-doc link to the gated `ConnCtx::for_test` was the tell.
+
+### What the diffs show
+
+The argument made concrete. Every client crate had the cross product expanded by
+hand:
+
+```rust
+// before
+let fut = if tls {
+    if to > 0 { connect_tls_with_timeout(addr, sni, to)? } else { connect_tls(addr, sni)? }
+} else {
+    if to > 0 { connect_with_timeout(addr, to)? } else { connect(addr)? }
+};
+let conn = fut.await?;
+
+// after
+let mut connect = ringline::connect(addr);
+if let Some(sni) = &tls { connect = connect.tls(sni.as_str()); }
+if to > 0 { connect = connect.timeout(Duration::from_millis(to)); }
+let conn = connect.await?;
+```
+
+And roughly twenty nested double matches in tests collapsed to one match each,
+because submission and completion are no longer separate failures:
+
+```rust
+// before
+let backend = match ringline::connect(addr) {
+    Ok(fut) => match fut.await { Ok(c) => c, Err(e) => { /* connect */ } },
+    Err(e) => { /* submit */ }
+};
+// after
+let backend = match ringline::connect(addr).await {
+    Ok(c) => c,
+    Err(e) => { /* the only failure there is */ }
+};
+```
+
+### Follow-ups this opened
+
+- #532: every `connect_all` is sequential, so N connections cost N × RTT. Not
+  caused by this change, and the relaxed `join` bounds are a prerequisite for
+  fixing it.
+- `Connection::into_tls() -> Option<TlsConnection>` remains the narrow, honest
+  version of the rejected generic — deliberately still out of scope.

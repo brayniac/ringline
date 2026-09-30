@@ -26,26 +26,13 @@ impl AsyncEventHandler for ConnectHandler {
         let worker_id = self.worker_id;
         Some(Box::pin(async move {
             eprintln!("[worker {worker_id}] connecting to {target}");
-            let connect_future = match connect(target) {
-                Ok(f) => f,
-                Err(e) => {
-                    eprintln!("[worker {worker_id}] connect failed: {e}");
-                    ringline::request_shutdown().ok();
-                    return;
-                }
-            };
-            match connect_future.await {
+            // Submission and completion report through one error path (#528).
+            match connect(target).await {
                 Ok(conn) => {
                     eprintln!("[worker {worker_id}] connected to {target}");
                     // An outbound connection is driven through its halves,
                     // exactly like an accepted one.
-                    let (mut conn_tx, mut conn_rx) = match conn.split() {
-                        Ok(halves) => halves,
-                        Err(e) => {
-                            eprintln!("[worker {worker_id}] split error: {e}");
-                            return;
-                        }
-                    };
+                    let (mut conn_tx, mut conn_rx) = conn.split();
                     let msg: &[u8] = b"Hello from ringline!\n";
                     if let Err(e) = conn_tx.send_nowait(msg) {
                         eprintln!("[worker {worker_id}] send error: {e}");

@@ -1,7 +1,7 @@
 //! End-to-end TLS echo tests.
 //!
 //! Tests the core TLS machinery: server-side TLS accept (handshake + data
-//! exchange), and outbound `connect_tls` from one ringline worker to another.
+//! exchange), and outbound `connect(addr).tls(..)` from one ringline worker to another.
 //! Uses self-signed certificates generated at test time via `rcgen`.
 
 use std::future::Future;
@@ -515,26 +515,16 @@ impl AsyncEventHandler for TlsClientHandler {
     fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
         let server_addr = *TLS_SERVER_ADDR.get().expect("server addr not set");
         Some(Box::pin(async move {
-            let conn = match ringline::connect_tls(server_addr, "localhost") {
-                Ok(fut) => match fut.await {
-                    Ok(ctx) => ctx,
-                    Err(e) => {
-                        TLS_CONNECT_RESULT.set(format!("CONNECT_ERR:{e}")).ok();
-                        ringline::request_shutdown().ok();
-                        return;
-                    }
-                },
+            let conn = match ringline::connect(server_addr).tls("localhost").await {
+                Ok(ctx) => ctx,
                 Err(e) => {
-                    TLS_CONNECT_RESULT.set(format!("SUBMIT_ERR:{e}")).ok();
+                    TLS_CONNECT_RESULT.set(format!("CONNECT_ERR:{e}")).ok();
                     ringline::request_shutdown().ok();
                     return;
                 }
             };
             // Reading an outbound connection goes through its read half.
-            let (mut conn_tx, mut conn_rx) = match conn.split() {
-                Ok(halves) => halves,
-                Err(_) => return,
-            };
+            let (mut conn_tx, mut conn_rx) = conn.split();
 
             // Send data over TLS and read back.
             let msg = b"ringline-to-ringline TLS echo";
@@ -1222,19 +1212,13 @@ impl AsyncEventHandler for TlsForwardProxy {
     fn on_accept(&self, mut client: Connection) -> impl Future<Output = ()> + 'static {
         let backend_addr = self.backend_addr;
         async move {
-            let backend = match client.connect(backend_addr) {
-                Ok(fut) => match fut.await {
-                    Ok(ctx) => ctx,
-                    Err(_) => return,
-                },
+            let backend = match ringline::connect(backend_addr).await {
+                Ok(ctx) => ctx,
                 Err(_) => return,
             };
             // The backend is both read (for the return leg) and written (as
             // the forward sink), so take both halves.
-            let (mut backend_tx, mut backend_rx) = match backend.split() {
-                Ok(halves) => halves,
-                Err(_) => return,
-            };
+            let (mut backend_tx, mut backend_rx) = backend.split();
 
             loop {
                 let mut hdr = [0u8; 4];
@@ -1422,17 +1406,18 @@ impl AsyncEventHandler for TlsSinkRefusedProxy {
     fn on_accept(&self, mut client: Connection) -> impl Future<Output = ()> + 'static {
         let backend_addr = self.backend_addr;
         async move {
-            let backend = match client.connect(backend_addr) {
-                Ok(fut) => match fut.await {
-                    Ok(ctx) => ctx,
-                    Err(_) => return,
-                },
+            let backend = match ringline::connect(backend_addr).await {
+                Ok(ctx) => ctx,
                 Err(_) => return,
             };
 
             // `client` is the TLS connection. Forwarding backend -> client is
             // the case that must be refused.
-            let errno = match backend.forward_to_conn(&client.as_conn(), 16).await {
+            let errno = match backend
+                .as_conn()
+                .forward_to_conn(&client.as_conn(), 16)
+                .await
+            {
                 Ok(_) => -1,
                 Err(e) => e.raw_os_error().unwrap_or(-1),
             };
