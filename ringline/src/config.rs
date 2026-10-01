@@ -322,6 +322,11 @@ pub struct Config {
     /// Saves ~4 microseconds per round trip on single-shot client workloads.
     /// Must have the same length as `udp_bind` (enforced at validation).
     pub(crate) udp_connect_peers: Vec<Option<SocketAddr>>,
+    /// Sockets `launch` bound for zero-port UDP binds, parallel to
+    /// `udp_bind` once `launch` has run (empty before). The first worker to
+    /// set up a bind's socket takes the reserved socket as its own, and the
+    /// other workers bind its port.
+    pub(crate) udp_reserved: std::sync::Arc<[std::sync::Mutex<Option<std::os::fd::OwnedFd>>]>,
     /// Number of concurrent in-flight UDP sends per socket. Each slot owns a
     /// pre-allocated `sockaddr_storage` + `iovec` + `msghdr` triple used to
     /// submit a `sendmsg` SQE; the slot is returned to the freelist on CQE.
@@ -462,6 +467,7 @@ impl Default for Config {
             timer_slots: 256,
             udp_bind: Vec::new(),
             udp_connect_peers: Vec::new(),
+            udp_reserved: std::sync::Arc::from(Vec::new()),
             udp_send_slots: 64,
             udp_recv_queue_capacity: 1024,
             udp_gro: false,
@@ -478,6 +484,16 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Take the socket `launch` reserved for UDP bind `index`, if there is
+    /// one and no worker has taken it yet.
+    pub(crate) fn take_udp_reserved(&self, index: usize) -> Option<std::os::fd::OwnedFd> {
+        self.udp_reserved
+            .get(index)?
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+    }
+
     /// The zero-copy guard send threshold in bytes. See
     /// [`ConfigBuilder::send_zc_threshold`].
     pub fn send_zc_threshold(&self) -> u32 {
@@ -1066,7 +1082,8 @@ impl ConfigBuilder {
 
     // ── UDP settings ─────────────────────────────────────────────────
 
-    /// Add a UDP bind address. Can be called multiple times.
+    /// Add a UDP bind address. Can be called multiple times. A zero port
+    /// behaves as in [`RinglineBuilder::bind_udp`](crate::RinglineBuilder::bind_udp).
     pub fn udp_bind(mut self, addr: SocketAddr) -> Self {
         self.config.udp_bind.push(addr);
         self.config.udp_connect_peers.push(None);
@@ -1077,7 +1094,8 @@ impl ConfigBuilder {
     /// kernel filters incoming datagrams to `peer` and the runtime can use
     /// the lighter `RecvUdp`/`SendUdp` opcodes instead of the
     /// `RecvMsgUdp`/`SendMsgUdp` pair. Saves ~4 microseconds per round trip
-    /// on single-shot client workloads.
+    /// on single-shot client workloads. A zero local port behaves as in
+    /// [`RinglineBuilder::bind_udp_connected`](crate::RinglineBuilder::bind_udp_connected).
     pub fn udp_bind_connected(mut self, local: SocketAddr, peer: SocketAddr) -> Self {
         self.config.udp_bind.push(local);
         self.config.udp_connect_peers.push(Some(peer));
