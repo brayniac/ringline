@@ -12,3 +12,11 @@ slow-timeout = { period = "30s", terminate-after = 4 }
 fail-fast = false
 # Print a failure's output when it happens and again in the final summary.
 failure-output = "immediate-final"
+
+# memlock_rings lowers RLIMIT_MEMLOCK to the exact charge of one ring. The
+# kernel compares that limit with the total charged by every process of the
+# user, so a test running alongside it makes it fail. Reserving every test
+# thread keeps other tests from running while it does.
+[[profile.default.overrides]]
+filter = 'binary(memlock_rings)'
+threads-required = "num-test-threads"
