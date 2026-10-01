@@ -438,25 +438,11 @@ fn a_late_disk_io_wake_does_not_write_into_a_reused_fd() {
          (fd, bytes) = {stray:?}, freed fds {freed:?}"
     );
 
-    // The open's own result is not a wake fd. Its response reaches no worker
-    // and is dropped without closing the file, a separate leak, so it is
-    // excluded here.
-    let opened_by_launch = || -> Vec<RawFd> {
-        open_fds()
-            .difference(&baseline)
-            .copied()
-            .filter(|fd| {
-                std::fs::read_link(format!("/proc/self/fd/{fd}"))
-                    .map(|t| !t.starts_with(&dir))
-                    .unwrap_or(true)
-            })
-            .collect()
-    };
     let deadline = Instant::now() + Duration::from_secs(5);
-    let mut leaked = opened_by_launch();
+    let mut leaked: Vec<RawFd> = open_fds().difference(&baseline).copied().collect();
     while !leaked.is_empty() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
-        leaked = opened_by_launch();
+        leaked = open_fds().difference(&baseline).copied().collect();
     }
     assert!(
         leaked.is_empty(),

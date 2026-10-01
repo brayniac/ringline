@@ -15,7 +15,7 @@ use crossbeam_channel::{Receiver, Sender};
 
 /// A request from a worker to the disk I/O pool.
 pub(crate) struct DiskIoRequest {
-    /// The blocking syscall to execute. Returns `(i32, Option<Metadata>)`.
+    /// The blocking syscall to execute. Returns a [`DiskIoResult`].
     /// The i32 follows io_uring CQE convention: >= 0 for success/bytes,
     /// < 0 for -errno.
     pub(crate) work: Box<dyn FnOnce() -> DiskIoResult + Send>,
@@ -33,6 +33,9 @@ pub(crate) struct DiskIoResult {
     pub(crate) result: i32,
     /// Optional metadata (populated only for stat operations).
     pub(crate) metadata: Option<crate::fs::Metadata>,
+    /// The fd a successful open produced. Owned, so a result that reaches no
+    /// worker closes it.
+    pub(crate) opened: Option<std::os::fd::OwnedFd>,
 }
 
 /// A response from the disk I/O pool to a worker.
@@ -43,6 +46,8 @@ pub(crate) struct DiskIoResponse {
     pub(crate) result: i32,
     /// Optional metadata (populated only for stat operations).
     pub(crate) metadata: Option<crate::fs::Metadata>,
+    /// The fd a successful open produced; see [`DiskIoResult::opened`].
+    pub(crate) opened: Option<std::os::fd::OwnedFd>,
 }
 
 /// A pool of threads that perform blocking disk I/O.
@@ -91,6 +96,7 @@ fn disk_io_thread(rx: Receiver<DiskIoRequest>) {
             seq: req.seq,
             result: result.result,
             metadata: result.metadata,
+            opened: result.opened,
         });
         // Wake the requesting worker so it drains the response channel.
         req.wake_handle.wake();

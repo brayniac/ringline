@@ -208,6 +208,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A pool result that reached no worker leaked the fd it carried. An
+  `fs::open` on mio's disk-I/O pool that completed after its worker had
+  exited leaked the opened file, and a `spawn` result leaked the child's
+  pidfd. Both results now own their fd, so a dropped result closes it. A
+  spawned child whose result reaches no worker is still not reaped; it
+  remains a zombie until the ringline process exits (#546).
+
 - Connections accepted but still queued for a worker when the runtime shut
   down were never closed: the accept channel carried the socket as a raw fd,
   so the queued connections leaked when the worker exited without draining

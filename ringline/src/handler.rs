@@ -3125,6 +3125,7 @@ impl<'a> DriverCtx<'a> {
             crate::disk_io_pool::DiskIoResult {
                 result: r,
                 metadata: None,
+                opened: None,
             }
         });
         self.submit_disk_io(work)
@@ -3161,6 +3162,7 @@ impl<'a> DriverCtx<'a> {
             crate::disk_io_pool::DiskIoResult {
                 result: r,
                 metadata: None,
+                opened: None,
             }
         });
         self.submit_disk_io(work)
@@ -3181,6 +3183,7 @@ impl<'a> DriverCtx<'a> {
             crate::disk_io_pool::DiskIoResult {
                 result: r,
                 metadata: None,
+                opened: None,
             }
         });
         self.submit_disk_io(work)
@@ -3223,8 +3226,8 @@ impl<'a> DriverCtx<'a> {
     /// Open a file via the disk I/O pool.
     ///
     /// The open is dispatched to the pool. On completion, the pool sends back
-    /// the fd (as the i32 result). The event loop stores the fd in `fs_fds`
-    /// when it drains the response.
+    /// the opened fd in `DiskIoResult::opened`; the event loop moves it into
+    /// `fs_fds` when it drains the response.
     ///
     /// Returns `(file_index, generation, seq)`.
     pub(crate) fn fs_open(
@@ -3258,12 +3261,16 @@ impl<'a> DriverCtx<'a> {
                 crate::disk_io_pool::DiskIoResult {
                     result: -errno,
                     metadata: None,
+                    opened: None,
                 }
             } else {
-                // Return the fd as the result (positive value).
+                // Return the fd as the result (positive value), and as an
+                // owned fd so a result that reaches no worker closes it.
                 crate::disk_io_pool::DiskIoResult {
                     result: fd,
                     metadata: None,
+                    // SAFETY: `open` returned a fresh descriptor nothing else owns.
+                    opened: Some(unsafe { std::os::fd::FromRawFd::from_raw_fd(fd) }),
                 }
             }
         });
@@ -3309,6 +3316,7 @@ impl<'a> DriverCtx<'a> {
             crate::disk_io_pool::DiskIoResult {
                 result: r,
                 metadata: None,
+                opened: None,
             }
         });
         self.submit_disk_io(work)
@@ -3343,6 +3351,7 @@ impl<'a> DriverCtx<'a> {
             crate::disk_io_pool::DiskIoResult {
                 result: r,
                 metadata: None,
+                opened: None,
             }
         });
         self.submit_disk_io(work)
@@ -3363,6 +3372,7 @@ impl<'a> DriverCtx<'a> {
             crate::disk_io_pool::DiskIoResult {
                 result: r,
                 metadata: None,
+                opened: None,
             }
         });
         self.submit_disk_io(work)
@@ -3398,12 +3408,14 @@ impl<'a> DriverCtx<'a> {
                 crate::disk_io_pool::DiskIoResult {
                     result: -errno,
                     metadata: None,
+                    opened: None,
                 }
             } else {
                 let metadata = crate::fs::Metadata::from_stat(&stat_buf);
                 crate::disk_io_pool::DiskIoResult {
                     result: 0,
                     metadata: Some(metadata),
+                    opened: None,
                 }
             }
         });
@@ -3430,6 +3442,7 @@ impl<'a> DriverCtx<'a> {
             crate::disk_io_pool::DiskIoResult {
                 result: r,
                 metadata: None,
+                opened: None,
             }
         });
         self.submit_disk_io(work)
@@ -3450,6 +3463,7 @@ impl<'a> DriverCtx<'a> {
             crate::disk_io_pool::DiskIoResult {
                 result: r,
                 metadata: None,
+                opened: None,
             }
         });
         self.submit_disk_io(work)
@@ -3470,6 +3484,7 @@ impl<'a> DriverCtx<'a> {
             crate::disk_io_pool::DiskIoResult {
                 result: r,
                 metadata: None,
+                opened: None,
             }
         });
         self.submit_disk_io(work)
