@@ -360,14 +360,18 @@ mod tests {
 
         // What shutdown does to the shared fd, before the acceptor runs.
         unsafe { libc::shutdown(shared_fd, libc::SHUT_RD) };
-        drop(listener);
-        // A new socket takes the freed number.
-        let reuser = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        // A new socket takes the old number. `dup2` swaps it in atomically, so
+        // other tests opening fds in parallel cannot take the number first.
+        let fresh = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let shared_fd = std::os::fd::IntoRawFd::into_raw_fd(listener);
         assert_eq!(
-            reuser.as_raw_fd(),
-            shared_fd,
-            "the fd number was not reused"
+            unsafe { libc::dup2(fresh.as_raw_fd(), shared_fd) },
+            shared_fd
         );
+        drop(fresh);
+        // SAFETY: `dup2` made `shared_fd` a new descriptor this test owns.
+        let reuser =
+            unsafe { <std::net::TcpListener as std::os::fd::FromRawFd>::from_raw_fd(shared_fd) };
 
         let (tx, _rx) = crossbeam_channel::bounded::<AcceptedConn>(8);
         let config = AcceptorConfig {
