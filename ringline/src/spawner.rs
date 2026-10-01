@@ -8,7 +8,9 @@
 
 use std::ffi::CString;
 use std::io;
-use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+use std::os::fd::OwnedFd;
+#[cfg(target_os = "linux")]
+use std::os::fd::{FromRawFd, RawFd};
 use std::thread;
 
 use crossbeam_channel::{Receiver, Sender};
