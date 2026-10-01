@@ -171,7 +171,9 @@ pub(crate) struct Driver {
     pub(crate) writable: Vec<bool>,
     /// Per-connection connect timeout deadline (None if no timeout or not connecting).
     pub(crate) connect_deadlines: Vec<Option<std::time::Instant>>,
-    /// Raw fd of the wake pipe read end — registered with mio as WAKE_TOKEN.
+    /// The wake pipe's read end, registered with mio as `WAKE_TOKEN`. Not
+    /// owned: the worker's `WakeHandle` owns it, and `Config::wake_keep_alive`
+    /// holds that handle until the worker exits.
     pub(crate) wake_pipe_fd: RawFd,
     /// Whether to set TCP_NODELAY on accepted connections.
     pub(crate) tcp_nodelay: bool,

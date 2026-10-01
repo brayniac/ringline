@@ -7,7 +7,7 @@
 //! registered with `mio::Poll`; writing 1 byte wakes the worker.
 
 use std::io;
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 
 /// Internal fd carrier used on hot paths inside the runtime.
@@ -44,7 +44,7 @@ impl WakeFd {
     }
 }
 
-/// Owns the wake fd; closes it on drop.
+/// Owns the wake fd.
 ///
 /// On mio it also owns the pipe's read end, which the worker polls but does
 /// not close. A write to a pipe whose read end has closed raises SIGPIPE, which
@@ -52,19 +52,12 @@ impl WakeFd {
 /// here, a write after the worker has exited goes into the pipe buffer, or
 /// fails with `EAGAIN` once the buffer is full.
 struct WakeFdInner {
-    fd: RawFd,
+    fd: OwnedFd,
+    /// Never read here: held so the read end stays open until the last
+    /// `WakeHandle` drops. The worker polls it through its raw number.
     #[cfg(not(has_io_uring))]
-    read_fd: RawFd,
-}
-
-impl Drop for WakeFdInner {
-    fn drop(&mut self) {
-        unsafe {
-            libc::close(self.fd);
-            #[cfg(not(has_io_uring))]
-            libc::close(self.read_fd);
-        }
-    }
+    #[allow(dead_code)]
+    read_fd: OwnedFd,
 }
 
 /// Refcounted handle for waking a worker thread from any thread.
@@ -89,12 +82,14 @@ impl WakeHandle {
     /// Non-blocking and never reports an error. If the pipe or eventfd is full
     /// the write fails with `EAGAIN`, and a wake is already pending.
     pub fn wake(&self) {
-        wake_fd(self.inner.fd);
+        wake_fd(self.inner.fd.as_raw_fd());
     }
 
     /// Extract a non-owning [`WakeFd`] carrier for use on hot paths.
     pub(crate) fn as_wake_fd(&self) -> WakeFd {
-        WakeFd { fd: self.inner.fd }
+        WakeFd {
+            fd: self.inner.fd.as_raw_fd(),
+        }
     }
 }
 
@@ -131,7 +126,10 @@ pub(crate) fn create_wake_fd() -> io::Result<(RawFd, WakeHandle)> {
     Ok((
         efd,
         WakeHandle {
-            inner: Arc::new(WakeFdInner { fd: efd }),
+            // SAFETY: `eventfd` returned a fresh descriptor nothing else owns.
+            inner: Arc::new(WakeFdInner {
+                fd: unsafe { OwnedFd::from_raw_fd(efd) },
+            }),
         },
     ))
 }
@@ -179,9 +177,10 @@ pub(crate) fn create_wake_fd() -> io::Result<(RawFd, WakeHandle)> {
     Ok((
         read_fd,
         WakeHandle {
+            // SAFETY: `pipe` returned two fresh descriptors nothing else owns.
             inner: Arc::new(WakeFdInner {
-                fd: write_fd,
-                read_fd,
+                fd: unsafe { OwnedFd::from_raw_fd(write_fd) },
+                read_fd: unsafe { OwnedFd::from_raw_fd(read_fd) },
             }),
         },
     ))
