@@ -129,6 +129,8 @@ pub(crate) struct Driver {
     pub(crate) wake_handle: crate::wakeup::WakeFd,
     pub(crate) shutdown_flag: Arc<AtomicBool>,
     pub(crate) shutdown_local: bool,
+    /// Handles task panics caught on this worker, under the runtime's policy.
+    pub(crate) panic_reporter: crate::task_panic::PanicReporter,
     pub(crate) tls_table: Option<crate::tls::TlsTable>,
     pub(crate) connect_addrs: Vec<libc::sockaddr_storage>,
     /// Per-connection mio tokens -> connection index mapping.
@@ -373,6 +375,11 @@ impl Driver {
             // it used to be wrapped here, making every pool wake an EBADF
             // no-op observed only at the poll timeout (~10 ms).
             wake_handle: wake_fd,
+            panic_reporter: crate::task_panic::PanicReporter::new(
+                config.task_panic_policy,
+                shutdown_flag.clone(),
+                config.runtime_shutdown.clone(),
+            ),
             shutdown_flag,
             shutdown_local: false,
             tls_table,

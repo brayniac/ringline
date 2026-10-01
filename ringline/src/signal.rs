@@ -44,13 +44,20 @@ static PIPE: OnceLock<(i32, i32)> = OnceLock::new();
 /// (OnceLock is not async-signal-safe, but AtomicI32 load is).
 static PIPE_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
 
-/// A caught signal.
+/// A caught signal, or the reason [`Runtime::wait_on_signal`](crate::Runtime::wait_on_signal)
+/// returned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Signal {
     /// `SIGINT` — typically sent by Ctrl-C.
     Interrupt,
     /// `SIGTERM` — the default `kill` signal.
     Terminate,
+    /// Not an OS signal: a task panicked under
+    /// [`TaskPanicPolicy::Shutdown`](crate::TaskPanicPolicy::Shutdown) and shut
+    /// the runtime down. Returned only by
+    /// [`Runtime::wait_on_signal`](crate::Runtime::wait_on_signal).
+    TaskPanic,
 }
 
 impl fmt::Display for Signal {
@@ -58,6 +65,7 @@ impl fmt::Display for Signal {
         match self {
             Signal::Interrupt => f.write_str("SIGINT"),
             Signal::Terminate => f.write_str("SIGTERM"),
+            Signal::TaskPanic => f.write_str("task panic"),
         }
     }
 }
@@ -67,9 +75,10 @@ fn setup() {
     PIPE.get_or_init(|| {
         let mut fds = [0i32; 2];
 
-        // Create pipe with close-on-exec. Read end is blocking (so wait()
-        // blocks), write end will be set to non-blocking (so the signal
-        // handler never blocks).
+        // Create pipe with close-on-exec. Both ends are set non-blocking
+        // below: the signal handler must never block on a write, and several
+        // waiters may poll the read end, so the one that loses the race for a
+        // byte must get EAGAIN rather than block in read(2).
         #[cfg(target_os = "linux")]
         let ret = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
         #[cfg(not(target_os = "linux"))]
@@ -86,9 +95,10 @@ fn setup() {
         };
         assert!(ret == 0, "pipe failed: {}", std::io::Error::last_os_error());
 
-        // Make write end non-blocking.
-        let flags = unsafe { libc::fcntl(fds[1], libc::F_GETFL) };
-        unsafe { libc::fcntl(fds[1], libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        for fd in fds {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        }
 
         // Publish write fd for the signal handler.
         PIPE_WRITE_FD.store(fds[1], Ordering::Release);
@@ -126,23 +136,66 @@ extern "C" fn signal_handler(sig: libc::c_int) {
 ///
 /// This is a blocking call intended for use on the main thread.
 pub fn wait() -> Signal {
+    loop {
+        if let Some(signal) = wait_inner(None) {
+            return signal;
+        }
+    }
+}
+
+/// Block until `SIGINT` or `SIGTERM` is received or `ready_fd` becomes
+/// readable; the latter returns [`Signal::TaskPanic`].
+pub(crate) fn wait_or_ready(ready_fd: i32) -> Signal {
+    loop {
+        if let Some(signal) = wait_inner(Some(ready_fd)) {
+            return signal;
+        }
+    }
+}
+
+/// Poll the signal pipe, and `ready_fd` if given, until one is readable.
+/// Returns `None` when another waiter took the signal byte first.
+fn wait_inner(ready_fd: Option<i32>) -> Option<Signal> {
     setup();
 
     let (read_fd, _) = *PIPE.get().unwrap();
-    let mut buf = [0u8; 1];
-
-    loop {
+    let mut fds = [
+        libc::pollfd {
+            fd: read_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: ready_fd.unwrap_or(-1),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    let count = if ready_fd.is_some() { 2 } else { 1 };
+    // EINTR: interrupted by a signal we don't handle — poll again.
+    while unsafe { libc::poll(fds.as_mut_ptr(), count, -1) } <= 0 {}
+    if count == 2 && fds[1].revents != 0 {
+        return Some(Signal::TaskPanic);
+    }
+    // The pipe is process-global and never closed by ringline; an invalid or
+    // broken read end would make every later poll return at once.
+    assert!(
+        fds[0].revents & (libc::POLLNVAL | libc::POLLERR) == 0,
+        "ringline signal pipe is invalid (revents {:#x})",
+        fds[0].revents
+    );
+    if fds[0].revents & libc::POLLIN != 0 {
+        let mut buf = [0u8; 1];
+        // Non-blocking: another waiter may have taken the byte (EAGAIN).
         let n = unsafe { libc::read(read_fd, buf.as_mut_ptr() as *mut libc::c_void, 1) };
         if n == 1 {
-            return match buf[0] as i32 {
-                libc::SIGINT => Signal::Interrupt,
+            return Some(match buf[0] as i32 {
                 libc::SIGTERM => Signal::Terminate,
                 _ => Signal::Interrupt,
-            };
+            });
         }
-        // EINTR: interrupted by a signal we don't handle — retry.
-        // Any other error: shouldn't happen on a valid pipe fd.
     }
+    None
 }
 
 #[cfg(test)]

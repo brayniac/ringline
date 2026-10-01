@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `TaskPanicPolicy` and `ConfigBuilder::task_panic_policy` choose what a task
+  panic does. `Contain` (the default) catches it, drops the task and keeps the
+  worker running, as before. `Shutdown` also shuts the runtime down as
+  `Runtime::shutdown` does: the listeners close, every worker drains and
+  exits, `Runtime::wait_on_signal` returns `Signal::TaskPanic`, and each
+  worker that saw a panic returns the new `Error::TaskPanicked`. The policy
+  covers connection tasks, standalone tasks, the `on_start` and `on_udp_bind`
+  futures and the calls that build them, building the `on_accept` future,
+  `on_tick`, `on_notify` and `spawn_blocking` closures; not
+  `create_for_worker` (whose panic fails `launch()`) or a future's `Drop`
+  during the shutdown drain. A task panic while `launch()` is still setting up
+  its listeners fails `launch()` with `Error::TaskPanicked`. `JoinError` says
+  whether a task panicked or was cancelled and carries the panic payload, so
+  a caller can re-raise it; it converts into `io::Error` (#547).
+
 - `Runtime::bound_udp_addr` / `bound_udp_addrs` report the address each UDP
   bind is bound to, with a zero port resolved, as `bound_addr` /
   `bound_addrs` already do for TCP listeners. `bound_udp_addrs` returns
@@ -42,6 +57,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   listener can be named before any connection has arrived.
 
 ### Changed
+
+- **Breaking:** `JoinHandle` (from `spawn_with_handle`) and
+  `BlockingJoinHandle` (from `spawn_blocking`) resolve to
+  `Result<T, JoinError>` instead of `T`. Add `?` (in a function returning
+  `io::Result`) or `.expect(..)` to existing awaits. `Err` means the task
+  panicked or, for `JoinHandle`, was cancelled (#547).
+
+- **Breaking:** `signal::Signal` is `#[non_exhaustive]` and gains
+  `Signal::TaskPanic`, which `Runtime::wait_on_signal` returns when a task
+  panic shuts the runtime down under `TaskPanicPolicy::Shutdown` (#547).
 
 - An unconnected port-0 UDP bind on more than one worker now shares one
   port across the workers. A multi-worker UDP client on such a
@@ -221,6 +246,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   of the series that lands #318.
 
 ### Fixed
+
+- A `spawn_blocking` closure that panicked killed its pool thread and left
+  the awaiting task pending forever; a few panics could leave the pool with
+  no threads. The pool thread now catches the panic and the handle resolves to
+  a `JoinError`. A `spawn_with_handle` task that panicked also left its
+  `JoinHandle` pending forever, and so did `JoinHandle::abort` and cancelling
+  through `JoinHandle::id().cancel()`; all now resolve it to a `JoinError`.
+  `JoinHandle::abort` after the task had finished cancelled whatever task
+  had reused its slot; it now does nothing. On mio, a panic while building
+  the `on_accept` future ended the worker thread; it is now caught, as on
+  io_uring, and so are panics in the calls to `on_start` and `on_udp_bind`
+  (#547).
 
 - A port-0 unconnected UDP bind (`bind_udp("…:0")`) with more than one
   worker bound each worker's socket to a different ephemeral port, so the

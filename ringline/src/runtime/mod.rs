@@ -526,7 +526,7 @@ pub(crate) struct Executor {
     #[cfg_attr(not(has_io_uring), allow(dead_code))]
     pub(crate) next_pidfd_seq: u32,
     /// Pending blocking requests: request_id -> (task_id to wake, result slot).
-    pub(crate) pending_blocking: HashMap<u64, (u32, Option<Box<dyn std::any::Any + Send>>)>,
+    pub(crate) pending_blocking: HashMap<u64, (u32, Option<crate::blocking::BlockingResult>)>,
     /// Monotonic counter for blocking request IDs.
     pub(crate) next_blocking_id: u64,
     /// Per-batch dedup bitset for connection-task ready-queue entries.
@@ -854,7 +854,7 @@ impl Executor {
     pub(crate) fn deliver_blocking(
         &mut self,
         request_id: u64,
-        result: Box<dyn std::any::Any + Send>,
+        result: crate::blocking::BlockingResult,
     ) {
         if let Some((task_id, slot)) = self.pending_blocking.get_mut(&request_id) {
             *slot = Some(result);

@@ -1,7 +1,7 @@
 use std::any::Any;
 use std::io;
 use std::net::SocketAddr;
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -96,6 +96,41 @@ fn rollback_workers(
     first_error
 }
 
+/// Duplicate `fd` with close-on-exec, as an owned descriptor.
+fn dup_cloexec(fd: RawFd) -> io::Result<OwnedFd> {
+    let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if dup < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fcntl` returned a fresh descriptor nothing else owns.
+    Ok(unsafe { OwnedFd::from_raw_fd(dup) })
+}
+
+/// The error a failed `launch()` returns after rolling back the workers. A
+/// task panic on a worker, under `TaskPanicPolicy::Shutdown`, is what made
+/// the launch fail, so it wins over the error the launch saw.
+fn launch_error(
+    joined: Option<crate::error::Error>,
+    error: crate::error::Error,
+) -> crate::error::Error {
+    match joined {
+        Some(panicked @ crate::error::Error::TaskPanicked(_)) => panicked,
+        _ => error,
+    }
+}
+
+/// Close the merged-mode sockets of listeners at index `from` and later,
+/// which a failed `launch()` bound but never registered as listeners.
+fn close_merged_from(merged_sockets: &[(u32, Vec<RawFd>, Option<SocketAddr>)], from: usize) {
+    for (idx, fds, _) in merged_sockets {
+        if *idx as usize >= from {
+            for &fd in fds {
+                unsafe { libc::close(fd) };
+            }
+        }
+    }
+}
+
 /// Returned by `launch()` with the workers' join handles. Controls shutdown,
 /// listener addresses, deferred listeners, accept steering and registered
 /// regions.
@@ -105,7 +140,8 @@ fn rollback_workers(
 /// [`WakeHandle`](crate::WakeHandle) implement `Clone`, and dropping them does
 /// not shut the workers down.
 pub struct Runtime {
-    shutdown_flag: Arc<AtomicBool>,
+    /// Shared with the workers, so a task panic can shut the runtime down.
+    shutdown: Arc<RuntimeShutdown>,
     worker_wake_handles: Vec<crate::wakeup::WakeHandle>,
     /// One entry per listener, in `bind()` call order — the same order that
     /// gives each its [`ListenerId`](crate::ListenerId).
@@ -354,15 +390,17 @@ impl Runtime {
         }
     }
 
-    /// Block the calling thread until `SIGINT` or `SIGTERM` is received,
-    /// then trigger graceful shutdown.
+    /// Block the calling thread until `SIGINT` or `SIGTERM` is received, or a
+    /// task panic shuts the runtime down under
+    /// [`TaskPanicPolicy::Shutdown`](crate::TaskPanicPolicy::Shutdown), then
+    /// trigger graceful shutdown.
     ///
-    /// Equivalent to calling [`signal::wait()`](crate::signal::wait) followed
-    /// by [`shutdown()`](Self::shutdown).
-    ///
-    /// Returns which signal was caught.
+    /// Returns which signal was caught, or
+    /// [`Signal::TaskPanic`](crate::signal::Signal::TaskPanic). After a task
+    /// panic, the handle of each worker on which a task panicked returns
+    /// [`Error::TaskPanicked`](crate::Error::TaskPanicked).
     pub fn wait_on_signal(&self) -> crate::signal::Signal {
-        let sig = crate::signal::wait();
+        let sig = crate::signal::wait_or_ready(self.shutdown.panic_fd());
         self.shutdown();
         sig
     }
@@ -370,28 +408,113 @@ impl Runtime {
     /// Signal all workers to shut down gracefully.
     ///
     /// Workers will stop accepting new connections, close all active connections,
-    /// drain remaining completions, and exit their event loops returning `Ok(())`.
+    /// drain remaining completions, and exit their event loops returning
+    /// `Ok(())`, or [`Error::TaskPanicked`](crate::Error::TaskPanicked) under
+    /// [`TaskPanicPolicy::Shutdown`](crate::TaskPanicPolicy::Shutdown) for a
+    /// worker on which a task panicked.
     /// Also closes the listen fd to unblock the acceptor's `accept()`.
     pub fn shutdown(&self) {
-        self.shutdown_flag.store(true, Ordering::Release);
+        self.shutdown.shutdown();
+    }
+}
+
+/// Everything [`Runtime::shutdown`] acts on, shared with the workers so that a
+/// task panic under [`TaskPanicPolicy::Shutdown`](crate::TaskPanicPolicy::Shutdown)
+/// shuts the runtime down the same way.
+pub(crate) struct RuntimeShutdown {
+    flag: Arc<AtomicBool>,
+    listen_gates: Arc<crate::listen_gate::ListenGates>,
+    /// Each listener's fds and its close-once flag, added as `launch()`
+    /// creates the listeners.
+    listeners: std::sync::Mutex<Vec<(Vec<RawFd>, Arc<AtomicBool>)>>,
+    wake: crate::wakeup::WakeKeepAlive,
+    /// Readable once a task panic has shut the runtime down;
+    /// [`Runtime::wait_on_signal`] polls it alongside the signal pipe.
+    panic_read: OwnedFd,
+    panic_write: OwnedFd,
+    panicked: AtomicBool,
+}
+
+impl RuntimeShutdown {
+    fn new(
+        flag: Arc<AtomicBool>,
+        listen_gates: Arc<crate::listen_gate::ListenGates>,
+        wake: crate::wakeup::WakeKeepAlive,
+    ) -> io::Result<Self> {
+        let mut fds = [0 as RawFd; 2];
+        #[cfg(target_os = "linux")]
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            for fd in fds {
+                unsafe {
+                    libc::fcntl(
+                        fd,
+                        libc::F_SETFL,
+                        libc::fcntl(fd, libc::F_GETFL) | libc::O_NONBLOCK,
+                    );
+                    libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+                }
+            }
+        }
+        // SAFETY: `pipe` returned two fresh descriptors nothing else owns.
+        let (panic_read, panic_write) =
+            unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        Ok(RuntimeShutdown {
+            flag,
+            listen_gates,
+            listeners: std::sync::Mutex::new(Vec::new()),
+            wake,
+            panic_read,
+            panic_write,
+            panicked: AtomicBool::new(false),
+        })
+    }
+
+    fn add_listener(&self, fds: Vec<RawFd>, closed: Arc<AtomicBool>) {
+        self.listeners
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((fds, closed));
+        // A shutdown that ran before this listener was added did not close
+        // it; run it again now that it is registered. Idempotent.
+        if self.flag.load(Ordering::Acquire) {
+            self.shutdown();
+        }
+    }
+
+    /// Set the shutdown flag, release the listen gates, close the listeners
+    /// and wake every worker. Idempotent.
+    pub(crate) fn shutdown(&self) {
+        self.flag.store(true, Ordering::Release);
         // Before the listen fds are closed: an acceptor parked on a gate that
         // was never opened is not inside `accept4`, so closing its fd does
         // not reach it. Releasing the gate first means it wakes, sees
         // shutdown, and leaves without touching the fd.
         self.listen_gates.shutdown();
-        for listener in &self.listeners {
-            if listener.closed.swap(true, Ordering::AcqRel) {
+        for (fds, closed) in self
+            .listeners
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            if closed.swap(true, Ordering::AcqRel) {
                 continue;
             }
-            for &fd in &listener.fds {
+            for &fd in fds {
                 // shutdown(SHUT_RD) first: on Linux this wakes a thread
                 // blocked in accept4 (with EINVAL) and releases the bound
-                // port immediately. close(2) alone does neither — the
+                // port immediately. close(2) alone does neither: the
                 // in-progress syscall holds a file reference, so the
-                // acceptor stayed parked and the socket stayed listening
-                // until one more peer connected (EADDRINUSE on prompt
-                // relaunch). The close below then runs after the acceptor
-                // can no longer loop into a reused fd number.
+                // acceptor stays parked and the socket stays listening
+                // until one more peer connects. The close below then runs
+                // after the acceptor can no longer loop into a reused fd
+                // number.
                 //
                 // In merged mode there is no acceptor thread, but a worker
                 // may be parked in the ring with a multishot accept armed on
@@ -403,9 +526,24 @@ impl Runtime {
             }
         }
         // Wake all workers so they see the flag even if blocked on I/O.
-        for wh in &self.worker_wake_handles {
+        for wh in self.wake.iter() {
             wh.wake();
         }
+    }
+
+    /// Shut down after a task panic, and wake [`Runtime::wait_on_signal`].
+    pub(crate) fn shutdown_for_panic(&self) {
+        self.shutdown();
+        if !self.panicked.swap(true, Ordering::AcqRel) {
+            let byte = 1u8;
+            unsafe {
+                libc::write(self.panic_write.as_raw_fd(), (&byte as *const u8).cast(), 1);
+            }
+        }
+    }
+
+    fn panic_fd(&self) -> RawFd {
+        self.panic_read.as_raw_fd()
     }
 }
 
@@ -905,8 +1043,14 @@ impl RinglineBuilder {
                 // errors rather than burying them in an unjoined worker.
                 let _ = startup_tx.send(Ok(()));
                 drop(startup_tx);
-                event_loop.run()?;
-                Ok(())
+                let run_result = event_loop.run();
+                // Under `TaskPanicPolicy::Shutdown`, a panic on this worker
+                // shut the runtime down; report it as this worker's result,
+                // ahead of any error from the drain that followed.
+                match event_loop.take_task_panic() {
+                    Some(panic) => Err(crate::error::Error::TaskPanicked(panic)),
+                    None => run_result,
+                }
             },
         )
     }
@@ -1101,6 +1245,14 @@ impl RinglineBuilder {
         // single path through `listen(2)`.
         let listen_gates =
             crate::listen_gate::ListenGates::new(pending_listeners.len(), self.config.backlog);
+        let runtime_shutdown = Arc::new(
+            RuntimeShutdown::new(
+                shutdown_flag.clone(),
+                listen_gates.clone(),
+                wake_keep_alive.clone(),
+            )
+            .map_err(crate::error::Error::Io)?,
+        );
         // Hand the per-listener TLS configs to every worker: the driver's
         // `TlsTable` selects by `ListenerId` at accept time, so it needs the
         // whole list, indexed the same way.
@@ -1183,8 +1335,8 @@ impl RinglineBuilder {
                             unsafe { libc::close(fd) };
                         }
                     }
-                    rollback_workers(&shutdown_flag, &worker_wake_fds, handles);
-                    return Err(e);
+                    let joined = rollback_workers(&shutdown_flag, &worker_wake_fds, handles);
+                    return Err(launch_error(joined, e));
                 }
                 merged_sockets.push((idx as u32, fds, resolved));
             }
@@ -1219,16 +1371,28 @@ impl RinglineBuilder {
 
         for worker_id in 0..num_threads {
             let mut config = self.config.clone();
-            config.merged_accept_fds = merged_sockets
+            // Each worker arms its accepts on its own copy of its socket, closed
+            // when the worker exits, so shutdown closing the shared fds cannot
+            // leave a worker arming on a closed or reused fd number.
+            let merged_fds: io::Result<Vec<(u32, Arc<OwnedFd>)>> = merged_sockets
                 .iter()
-                .map(|(idx, fds, _)| (*idx, fds[worker_id]))
+                .map(|(idx, fds, _)| dup_cloexec(fds[worker_id]).map(|fd| (*idx, Arc::new(fd))))
                 .collect();
+            config.merged_accept_fds = match merged_fds {
+                Ok(fds) => fds,
+                Err(error) => {
+                    close_merged_from(&merged_sockets, 0);
+                    let joined = rollback_workers(&shutdown_flag, &worker_wake_fds, handles);
+                    return Err(launch_error(joined, crate::error::Error::Io(error)));
+                }
+            };
             config.merged_accept_live = merged_live.clone();
             // The worker's hold on every wake fd: `config` lives in the worker
             // thread until it exits. Its event loop reads its own wake fd by
             // number (the eventfd on io_uring, the pipe's read end on mio), and
             // in merged accept mode (io_uring) it wakes peers.
             config.wake_keep_alive = Some(wake_keep_alive.clone());
+            config.runtime_shutdown = Some(runtime_shutdown.clone());
             config.worker_index = worker_id;
             config.worker_loads = worker_loads.clone();
             config.worker_accepting = Some(worker_accepting.clone());
@@ -1384,8 +1548,9 @@ impl RinglineBuilder {
             let handle = match spawn_result {
                 Ok(handle) => handle,
                 Err(error) => {
-                    rollback_workers(&shutdown_flag, &worker_wake_fds, handles);
-                    return Err(crate::error::Error::Io(error));
+                    close_merged_from(&merged_sockets, 0);
+                    let joined = rollback_workers(&shutdown_flag, &worker_wake_fds, handles);
+                    return Err(launch_error(joined, crate::error::Error::Io(error)));
                 }
             };
 
@@ -1473,8 +1638,9 @@ impl RinglineBuilder {
                         // parked on a deferred gate is not woken by closing its fd.
                         listen_gates.shutdown();
                         close_listeners(&listeners);
-                        rollback_workers(&shutdown_flag, &worker_wake_fds, handles);
-                        return Err(error);
+                        close_merged_from(&merged_sockets, idx + 1);
+                        let joined = rollback_workers(&shutdown_flag, &worker_wake_fds, handles);
+                        return Err(launch_error(joined, error));
                     }
                 };
 
@@ -1497,12 +1663,14 @@ impl RinglineBuilder {
                     for &fd in &fds {
                         unsafe { libc::close(fd) };
                     }
-                    rollback_workers(&shutdown_flag, &worker_wake_fds, handles);
-                    return Err(crate::error::Error::Io(error));
+                    close_merged_from(&merged_sockets, idx + 1);
+                    let joined = rollback_workers(&shutdown_flag, &worker_wake_fds, handles);
+                    return Err(launch_error(joined, crate::error::Error::Io(error)));
                 }
 
                 // Merged mode has no acceptor thread: the workers arm their own
                 // multishot accept on these fds. Record the listener and move on.
+                runtime_shutdown.add_listener(fds.clone(), closed.clone());
                 if merged_entry.is_some() {
                     listeners.push(ListenerHandle {
                         fds,
@@ -1514,33 +1682,37 @@ impl RinglineBuilder {
                 }
 
                 let listen_fd = fds[0];
-                let acceptor_config = AcceptorConfig {
-                    listen_fd,
-                    listener: crate::ListenerId::from_index(idx as u32),
-                    worker_channels: worker_txs.clone(),
-                    worker_wake_handles: worker_wake_handles.clone(),
-                    shutdown_flag: shutdown_flag.clone(),
-                    listen_gates: listen_gates.clone(),
-                    // A Unix listener has no TCP_NODELAY to set. This used to be
-                    // a runtime `if is_unix` branch over one global flag; with a
-                    // listener list each one simply answers for itself.
-                    tcp_nodelay: !spec.addr.is_unix() && self.config.tcp_nodelay,
-                    #[cfg(feature = "timestamps")]
-                    timestamps: self.config.timestamps,
-                    conn_chunk_size: self.config.conn_chunk_size,
-                };
-
                 let acceptor_closed = closed.clone();
-                let spawn_result = thread::Builder::new()
-                    .name(format!("ringline-acceptor-{idx}"))
-                    .spawn(move || {
-                        run_acceptor(acceptor_config);
-                        if !acceptor_closed.swap(true, Ordering::AcqRel) {
-                            unsafe {
-                                libc::close(listen_fd);
+                // The acceptor accepts on its own copy of the socket and closes
+                // it when it exits. Shutdown and rollback wake it with
+                // `shutdown(SHUT_RD)` on the shared socket and close only
+                // `listen_fd`, so it never accepts on a closed fd number.
+                let spawn_result = dup_cloexec(listen_fd).and_then(|acceptor_fd| {
+                    let acceptor_config = AcceptorConfig {
+                        listen_fd: acceptor_fd,
+                        listener: crate::ListenerId::from_index(idx as u32),
+                        worker_channels: worker_txs.clone(),
+                        worker_wake_handles: worker_wake_handles.clone(),
+                        shutdown_flag: shutdown_flag.clone(),
+                        listen_gates: listen_gates.clone(),
+                        // A Unix listener has no TCP_NODELAY to set.
+                        tcp_nodelay: !spec.addr.is_unix() && self.config.tcp_nodelay,
+                        #[cfg(feature = "timestamps")]
+                        timestamps: self.config.timestamps,
+                        conn_chunk_size: self.config.conn_chunk_size,
+                    };
+                    thread::Builder::new()
+                        .name(format!("ringline-acceptor-{idx}"))
+                        .spawn(move || {
+                            run_acceptor(acceptor_config);
+                            if !acceptor_closed.swap(true, Ordering::AcqRel) {
+                                unsafe {
+                                    libc::shutdown(listen_fd, libc::SHUT_RD);
+                                    libc::close(listen_fd);
+                                }
                             }
-                        }
-                    });
+                        })
+                });
 
                 if let Err(error) = spawn_result {
                     if !closed.swap(true, Ordering::AcqRel) {
@@ -1550,8 +1722,9 @@ impl RinglineBuilder {
                     }
                     listen_gates.shutdown();
                     close_listeners(&listeners);
-                    rollback_workers(&shutdown_flag, &worker_wake_fds, handles);
-                    return Err(crate::error::Error::Io(error));
+                    close_merged_from(&merged_sockets, idx + 1);
+                    let joined = rollback_workers(&shutdown_flag, &worker_wake_fds, handles);
+                    return Err(launch_error(joined, crate::error::Error::Io(error)));
                 }
 
                 listeners.push(ListenerHandle {
@@ -1564,7 +1737,11 @@ impl RinglineBuilder {
             // Every merged socket is listening now, so the workers may arm.
             // Publishing the flag before the wake means a worker that checks on
             // its own schedule still sees it.
-            if let Some(ref live) = merged_live {
+            // A task panic during launch shut the runtime down: leave the
+            // workers unarmed.
+            if let Some(ref live) = merged_live
+                && !shutdown_flag.load(Ordering::Acquire)
+            {
                 live.store(true, Ordering::Release);
                 for wh in &worker_wake_fds {
                     wh.wake();
@@ -1584,7 +1761,7 @@ impl RinglineBuilder {
         ));
 
         let runtime = Runtime {
-            shutdown_flag,
+            shutdown: runtime_shutdown,
             worker_wake_handles,
             accepting: worker_accepting,
             listeners,

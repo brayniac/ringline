@@ -2866,7 +2866,10 @@ impl AsyncEventHandler for OwnerMoveHandler {
             let finisher = ringline::spawn_with_handle(moved).expect("spawn finisher");
 
             let _ = hog.await;
-            let n = finisher.await.expect("the moved send resolved");
+            let n = finisher
+                .await
+                .expect("the finisher task completed")
+                .expect("the moved send resolved");
             assert_eq!(n as usize, MOVED_MSG.len());
             tx.shutdown_write();
         }
@@ -2922,7 +2925,10 @@ impl AsyncEventHandler for FirstPollMoveHandler {
         async move {
             let unpolled = conn.send_backpressured(FIRST_POLL_MSG);
             let handle = ringline::spawn_with_handle(unpolled).expect("spawn");
-            let n = handle.await.expect("resolved in the task that polled it");
+            let n = handle
+                .await
+                .expect("the spawned task completed")
+                .expect("resolved in the task that polled it");
             assert_eq!(n as usize, FIRST_POLL_MSG.len());
             conn.shutdown_write();
         }
@@ -5118,7 +5124,7 @@ impl AsyncEventHandler for JoinHandleHandler {
             })
             .unwrap();
 
-            let value = handle.await;
+            let value = handle.await.expect("task completed");
             JOIN_RESULT.store(value, Ordering::SeqCst);
             let _ = conn.send_nowait(b"done");
         }
@@ -5170,7 +5176,7 @@ impl AsyncEventHandler for ImmediateJoinHandler {
             let handle = ringline::spawn_with_handle(async { 42u32 }).unwrap();
             // Yield once so the child gets polled.
             ringline::sleep(Duration::from_millis(1)).await;
-            let value = handle.await;
+            let value = handle.await.expect("task completed");
             IMMEDIATE_RESULT.store(value, Ordering::SeqCst);
             let _ = conn.send_nowait(b"ok");
         }
@@ -5327,7 +5333,8 @@ impl AsyncEventHandler for MultiJoinHandler {
             let h3 = ringline::spawn_with_handle(async { 30u32 }).unwrap();
 
             let (a, b) = ringline::join(h1, h2).await;
-            let c = h3.await;
+            let (a, b) = (a.expect("task completed"), b.expect("task completed"));
+            let c = h3.await.expect("task completed");
             MULTI_SUM.store(a + b + c, Ordering::SeqCst);
             let _ = conn.send_nowait(b"ok");
         }
@@ -6315,7 +6322,7 @@ impl AsyncEventHandler for CancellationHandler {
             token.cancel();
 
             // The spawned task should now complete.
-            let val = handle.await;
+            let val = handle.await.expect("task completed");
             CANCEL_RESULT.store(val, Ordering::SeqCst);
             let _ = conn.send_nowait(b"done");
         }

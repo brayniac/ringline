@@ -142,6 +142,11 @@ fn choose_placement(loads: &[u32], accepting: &[bool], me: usize, mine: u32) -> 
 }
 
 impl<A: AsyncEventHandler> AsyncEventLoop<A> {
+    /// The first task panic recorded under `TaskPanicPolicy::Shutdown`.
+    pub(crate) fn take_task_panic(&mut self) -> Option<crate::JoinError> {
+        self.driver.panic_reporter.take()
+    }
+
     /// Create a new async event loop for a worker thread.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -239,7 +244,20 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             let udp_ctx = UdpCtx {
                 udp_index: udp_idx as u32,
             };
-            if let Some(future) = self.handler.on_udp_bind(udp_ctx)
+            // A panic while building the future is a task panic too.
+            let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.handler.on_udp_bind(udp_ctx)
+            }));
+            let future = match built {
+                Ok(future) => future,
+                Err(payload) => {
+                    self.driver
+                        .panic_reporter
+                        .report("handler on_udp_bind", &*payload);
+                    None
+                }
+            };
+            if let Some(future) = future
                 && let Some(idx) = self.executor.standalone_slab.spawn(future)
             {
                 self.executor.ready_queue.push_back(idx | STANDALONE_BIT);
@@ -247,7 +265,19 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
 
         // Spawn on_start task (client-only entry point).
-        if let Some(future) = self.handler.on_start()
+        // A panic while building the future is a task panic too.
+        let built =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.handler.on_start()));
+        let future = match built {
+            Ok(future) => future,
+            Err(payload) => {
+                self.driver
+                    .panic_reporter
+                    .report("handler on_start", &*payload);
+                None
+            }
+        };
+        if let Some(future) = future
             && let Some(idx) = self.executor.standalone_slab.spawn(future)
         {
             self.executor.ready_queue.push_back(idx | STANDALONE_BIT);
@@ -500,14 +530,19 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // in user tick code from unwinding past the guard's scope with
             // futures observing a dangling CURRENT_DRIVER, and from killing
             // the worker.
-            {
+            let result = {
                 let mut ctx = unsafe { (*driver_ptr).make_ctx() };
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     handler.on_tick(&mut ctx);
-                }));
-                if result.is_err() {
-                    eprintln!("ringline: handler on_tick panicked; continuing");
-                }
+                }))
+            };
+            if let Err(payload) = result {
+                // SAFETY: `ctx` has ended, so this is the only reference.
+                unsafe {
+                    (*driver_ptr)
+                        .panic_reporter
+                        .report("handler on_tick", &*payload)
+                };
             }
             drop(guard);
 
@@ -742,16 +777,15 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                                 let _ = executor.wake_task(raw_id);
                             }
                         }
-                        Err(_panic) => {
-                            // Drop the future and free the slot. We swallow
-                            // the panic to keep the worker alive — without
-                            // this, a single buggy `on_udp_bind` /
-                            // `on_start` future panics the whole worker
-                            // thread and tears down every other connection
-                            // on it.
+                        Err(payload) => {
+                            // Drop the future, free the slot, and hand the
+                            // panic to `panic_reporter`, which decides under
+                            // the policy whether the worker keeps running. An
+                            // uncaught panic here would end the worker thread
+                            // and every connection on it.
                             drop(fut);
                             executor.standalone_slab.remove(task_idx);
-                            eprintln!("ringline: standalone task panicked; dropped");
+                            driver.panic_reporter.report("standalone task", &*payload);
                         }
                     }
                 }
@@ -791,15 +825,16 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                                 let _ = executor.wake_task(conn_index);
                             }
                         }
-                        Err(_panic) => {
+                        Err(payload) => {
                             // A panicking connection handler tears down the
                             // connection but must not take the worker
                             // thread with it.
                             drop(fut);
                             driver.close_connection(conn_index);
                             executor.remove_connection(conn_index);
-                            eprintln!(
-                                "ringline: connection task panicked; connection {conn_index} closed"
+                            driver.panic_reporter.report(
+                                &format!("connection task (connection {conn_index} closed)"),
+                                &*payload,
                             );
                         }
                     }
@@ -2553,7 +2588,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// Cheap to call every iteration: it is a relaxed load and an early return
     /// after the first arm.
     fn arm_merged_accepts(&mut self) {
-        if self.driver.merged_accept_armed || self.driver.merged_accept_fds.is_empty() {
+        if self.driver.merged_accept_armed
+            || self.driver.merged_accept_fds.is_empty()
+            || self
+                .driver
+                .shutdown_flag
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
             return;
         }
         let live = match self.driver.merged_accept_live {
@@ -2567,6 +2608,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // with no later trigger to retry, since the flag only rises once.
         let fds = self.driver.merged_accept_fds.clone();
         for (listener_index, fd) in fds {
+            let fd = std::os::fd::AsRawFd::as_raw_fd(&*fd);
             if let Err(error) = self.driver.ring.submit_accept_multi(listener_index, fd) {
                 // Submission queue full is backpressure, not failure
                 // (Domain Invariant 7) — leave `armed` false and retry next
@@ -2800,6 +2842,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // Drain blocking responses.
         if let Some(ref rx) = self.driver.blocking_rx {
             while let Ok(response) = rx.try_recv() {
+                if let Err(ref payload) = response.result {
+                    self.driver
+                        .panic_reporter
+                        .report("spawn_blocking closure", &**payload);
+                }
                 self.executor
                     .deliver_blocking(response.request_id, response.result);
             }
@@ -2818,14 +2865,19 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 executor: unsafe { NonNull::new_unchecked(executor_ptr) },
             };
             let guard = unsafe { set_driver_state_guarded(&mut driver_state) };
-            {
+            let result = {
                 let mut ctx = unsafe { (*driver_ptr).make_ctx() };
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     handler.on_notify(&mut ctx);
-                }));
-                if result.is_err() {
-                    eprintln!("ringline: handler on_notify panicked; continuing");
-                }
+                }))
+            };
+            if let Err(payload) = result {
+                // SAFETY: `ctx` has ended, so this is the only reference.
+                unsafe {
+                    (*driver_ptr)
+                        .panic_reporter
+                        .report("handler on_notify", &*payload)
+                };
             }
             drop(guard);
         }
@@ -5021,12 +5073,17 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.driver.send_half_taken[conn_index as usize] = true;
         let conn = crate::Connection::for_accept(conn_ctx);
         // SAFETY: `AssertUnwindSafe` is required because `self.handler` is
-        // not `UnwindSafe`. A panic here is treated like a fatal handler
-        // error — the connection is closed; the worker continues serving
-        // others.
+        // not `UnwindSafe`. A panic here closes the connection and goes to
+        // `panic_reporter`, which decides under the policy whether the worker
+        // keeps running.
         // An adopted connection gets `on_adopt`, not `on_accept`: it is not a
         // new connection, and the handler may have state to restore.
         let adopting = self.driver.adopt_pending.remove(&conn_index);
+        let site = if adopting.is_some() {
+            "handler on_adopt"
+        } else {
+            "handler on_accept"
+        };
         let future_result =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match adopting {
                 Some(state) => self.handler.on_adopt(conn, state),
@@ -5035,11 +5092,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }));
         let future = match future_result {
             Ok(f) => f,
-            Err(_) => {
+            Err(payload) => {
                 // Handler panicked during async-block construction.
-                // Close the connection and skip task setup. Don't propagate
-                // — the worker keeps serving its other connections.
+                // Close the connection and skip task setup.
                 self.driver.close_connection(conn_index);
+                self.driver.panic_reporter.report(site, &*payload);
                 return;
             }
         };

@@ -175,6 +175,7 @@ pub(crate) mod resolver;
 pub(crate) mod reuseport_bpf;
 pub(crate) mod runtime;
 pub(crate) mod spawner;
+pub(crate) mod task_panic;
 #[cfg_attr(not(has_io_uring), allow(dead_code))]
 pub(crate) mod tls;
 pub mod topology;
@@ -263,7 +264,7 @@ pub use runtime::io::AsyncSendBuilder;
 /// Future returned by [`SendHalf::send_backpressured()`]: a send that waits
 /// for send-pool capacity instead of failing when the pool is full.
 pub use runtime::io::BackpressuredSendFuture;
-/// Future returned by [`spawn_blocking()`]. Resolves to the closure's return value.
+/// Future returned by [`spawn_blocking()`]. Resolves to the closure's return value, or a [`JoinError`] if it panicked.
 pub use runtime::io::BlockingJoinHandle;
 /// Async connection context with send/recv futures.
 pub use runtime::io::ConnCtx;
@@ -402,6 +403,10 @@ pub use runtime::select::select;
 pub use runtime::select::select3;
 /// Opaque handle for a standalone spawned task.
 pub use runtime::task::TaskId;
+/// Why a task's handle did not produce a value: it panicked or was cancelled.
+pub use task_panic::JoinError;
+/// What the runtime does when a task panics.
+pub use task_panic::TaskPanicPolicy;
 
 // ── Re-exports: Cancellation ────────────────────────────────────────────
 

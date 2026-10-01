@@ -241,12 +241,14 @@ pub struct Config {
     pub(crate) tcp_nodelay: bool,
     /// Where connections are accepted. See [`AcceptMode`].
     pub(crate) accept_mode: AcceptMode,
+    /// What a worker does when a task panics.
+    pub(crate) task_panic_policy: crate::TaskPanicPolicy,
     /// Merged accept mode: this worker's own `SO_REUSEPORT` listener sockets,
     /// as `(listener index, fd)`. Bound but **not** listening when the worker
     /// starts — `launch()` calls `listen(2)` only once every worker has
     /// reported ready, so "listening" and "ready to serve" are the same
     /// instant. Empty in pool mode and in client-only mode.
-    pub(crate) merged_accept_fds: Vec<(u32, std::os::fd::RawFd)>,
+    pub(crate) merged_accept_fds: Vec<(u32, std::sync::Arc<std::os::fd::OwnedFd>)>,
     /// Set by `launch()` after it has called `listen(2)` on every merged
     /// socket. Until then a worker must not arm an accept: accept on a
     /// bound-but-unlistening socket fails with `EINVAL`.
@@ -256,6 +258,9 @@ pub struct Config {
     /// passes it to the per-worker disk-I/O pool, whose threads can outlive
     /// the worker.
     pub(crate) wake_keep_alive: Option<crate::wakeup::WakeKeepAlive>,
+    /// The runtime's shutdown, so a task panic under
+    /// `TaskPanicPolicy::Shutdown` can trigger it. Set by `launch()`.
+    pub(crate) runtime_shutdown: Option<std::sync::Arc<crate::worker::RuntimeShutdown>>,
     /// This worker's index, so it can find its own slot in `worker_loads` and
     /// avoid handing a connection back to itself.
     pub(crate) worker_index: usize,
@@ -450,9 +455,11 @@ impl Default for Config {
             tls_client: None,
             tcp_nodelay: true,
             accept_mode: AcceptMode::Pool,
+            task_panic_policy: crate::TaskPanicPolicy::Contain,
             merged_accept_fds: Vec::new(),
             merged_accept_live: None,
             wake_keep_alive: None,
+            runtime_shutdown: None,
             worker_index: 0,
             worker_loads: None,
             worker_accepting: None,
@@ -845,6 +852,24 @@ impl ConfigBuilder {
     /// accepted and ignored, since mio has no multishot accept.
     pub fn accept_mode(mut self, mode: AcceptMode) -> Self {
         self.config.accept_mode = mode;
+        self
+    }
+
+    /// Choose what happens when a task panics. Default
+    /// [`TaskPanicPolicy::Contain`](crate::TaskPanicPolicy::Contain): the panic
+    /// is caught, the task is dropped and the worker keeps running.
+    ///
+    /// This covers connection tasks, standalone tasks, the `on_start` and
+    /// `on_udp_bind` futures and the calls that build them, building the
+    /// `on_accept` future, `on_tick`, `on_notify`, and
+    /// [`spawn_blocking`](crate::spawn_blocking) closures. It does not cover
+    /// `create_for_worker` or a future's `Drop` during the shutdown drain. A
+    /// [`JoinHandle`](crate::JoinHandle) or
+    /// [`BlockingJoinHandle`](crate::BlockingJoinHandle) awaiting a task that
+    /// panicked resolves to a [`JoinError`](crate::JoinError) under either
+    /// policy.
+    pub fn task_panic_policy(mut self, policy: crate::TaskPanicPolicy) -> Self {
+        self.config.task_panic_policy = policy;
         self
     }
 

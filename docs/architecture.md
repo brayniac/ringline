@@ -272,9 +272,12 @@ event/task/send/close cycle before returning.
 
 Startup failures are returned from `launch`: workers acknowledge backend
 preparation before the listener exists, and a failed worker, listener bind, or
-acceptor spawn rolls back already-started workers. At runtime, a connection
-handler panic closes that connection while preserving its worker; standalone
-task and `on_tick` panics are also contained. Fatal accept errors stop the
+acceptor spawn rolls back already-started workers. At runtime, task panics
+follow `TaskPanicPolicy`. Under the default, `Contain`, a connection handler
+panic closes that connection while preserving its worker, and standalone task,
+`on_tick` and `on_notify` panics are also contained. Under `Shutdown`, a task
+panic shuts the runtime down as `Runtime::shutdown` does, and each worker
+that saw a panic returns `Error::TaskPanicked`. Fatal accept errors stop the
 acceptor, while `EINTR` and aborted connections retry and descriptor exhaustion
 backs off briefly.
 
