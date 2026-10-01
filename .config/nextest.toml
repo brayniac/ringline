@@ -1,0 +1,22 @@
+# cargo-nextest runs each test in its own process, so process-wide state (an
+# fd table, a global, an rlimit) cannot leak between tests. CI runs the `ci`
+# profile; doctests run separately under `cargo test --doc`.
+
+[profile.default]
+# The slowest test takes about 1.3 s on 4 CPUs. A test still running after
+# 30 s is reported as slow, and ended after four periods (2 min), so a hang
+# fails one test instead of holding the job until its timeout.
+slow-timeout = { period = "30s", terminate-after = 4 }
+
+[profile.ci]
+fail-fast = false
+# Print a failure's output when it happens and again in the final summary.
+failure-output = "immediate-final"
+
+# memlock_rings lowers RLIMIT_MEMLOCK to the exact charge of one ring. The
+# kernel compares that limit with the total charged by every process of the
+# user, so a test running alongside it makes it fail. Reserving every test
+# thread keeps other tests from running while it does.
+[[profile.default.overrides]]
+filter = 'binary(memlock_rings)'
+threads-required = "num-test-threads"
