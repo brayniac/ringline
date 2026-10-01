@@ -474,9 +474,13 @@ pub(crate) struct Driver {
     /// and re-armed once the hold drains below the cap.
     pub(crate) forward_hold_cap: usize,
     pub(crate) accept_rx: Option<crossbeam_channel::Receiver<crate::acceptor::AcceptedConn>>,
-    /// Merged accept mode: this worker's own listener sockets, `(listener
-    /// index, fd)`. Empty in pool mode.
-    pub(crate) merged_accept_fds: Vec<(u32, std::sync::Arc<std::os::fd::OwnedFd>)>,
+    /// Merged accept mode: every merged listener's sockets, `(listener index,
+    /// sockets)`. This worker accepts on socket `worker_index` of each, and
+    /// holds them open until it exits. Empty in pool mode.
+    pub(crate) merged_listeners: Vec<(
+        u32,
+        std::sync::Arc<crate::listener_sockets::ListenerSockets>,
+    )>,
     /// Goes true once `launch()` has called `listen(2)` on every merged socket.
     /// Arming an accept before that fails with `EINVAL`.
     pub(crate) merged_accept_live: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
@@ -1096,7 +1100,7 @@ impl Driver {
             forward_hold_throttled: vec![false; config.max_connections as usize],
             forward_hold_cap: config.forward_hold_cap,
             accept_rx,
-            merged_accept_fds: config.merged_accept_fds.clone(),
+            merged_listeners: config.merged_listeners.clone(),
             merged_accept_live: config.merged_accept_live.clone(),
             merged_accept_armed: false,
             worker_index: config.worker_index,

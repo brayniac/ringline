@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `TaskPanicPolicy` and `ConfigBuilder::task_panic_policy` choose what a task
   panic does. `Contain` (the default) catches it, drops the task and keeps the
   worker running, as before. `Shutdown` also shuts the runtime down as
-  `Runtime::shutdown` does: the listeners close, every worker drains and
+  `Runtime::shutdown` does: the listeners stop accepting, every worker drains and
   exits, `Runtime::wait_on_signal` returns `Signal::TaskPanic`, and each
   worker that saw a panic returns the new `Error::TaskPanicked`. The policy
   covers connection tasks, standalone tasks, the `on_start` and `on_udp_bind`
@@ -246,6 +246,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   of the series that lands #318.
 
 ### Fixed
+
+- Listener sockets were created without close-on-exec, so a process spawned
+  while the runtime ran inherited them and kept the port bound after the
+  runtime shut down. They are now close-on-exec.
+  `Runtime::set_worker_accepting` called after `shutdown()` attached its
+  steering program to a closed fd number, which another socket could have
+  reused; it now acts only on sockets that are still open (#561).
 
 - On Linux 6.14 and later, io_uring charges each ring and each provided buffer
   ring to `RLIMIT_MEMLOCK`, in addition to registered buffers. The kernel adds

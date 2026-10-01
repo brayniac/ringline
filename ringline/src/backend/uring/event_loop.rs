@@ -2589,7 +2589,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// after the first arm.
     fn arm_merged_accepts(&mut self) {
         if self.driver.merged_accept_armed
-            || self.driver.merged_accept_fds.is_empty()
+            || self.driver.merged_listeners.is_empty()
             || self
                 .driver
                 .shutdown_flag
@@ -2606,9 +2606,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
         // Arm all or none: a partial arm would leave one listener unserved
         // with no later trigger to retry, since the flag only rises once.
-        let fds = self.driver.merged_accept_fds.clone();
-        for (listener_index, fd) in fds {
-            let fd = std::os::fd::AsRawFd::as_raw_fd(&*fd);
+        for i in 0..self.driver.merged_listeners.len() {
+            let (listener_index, ref sockets) = self.driver.merged_listeners[i];
+            let fd = sockets.fd(self.driver.worker_index);
             if let Err(error) = self.driver.ring.submit_accept_multi(listener_index, fd) {
                 // Submission queue full is backpressure, not failure
                 // (Domain Invariant 7) — leave `armed` false and retry next
@@ -2716,9 +2716,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
         if result < 0 {
             let err = -result;
-            // ECANCELED/EBADF/EINVAL are the shapes shutdown takes: the
-            // listener was closed under us. Anything else is worth re-arming
-            // for, since losing the arm silently stops the worker accepting.
+            // ECANCELED and EINVAL are what shutdown produces:
+            // `ListenerSockets::shut_down` took the socket out of the
+            // listening state. EBADF is treated as terminal too. Anything else
+            // is worth re-arming for, since losing the arm silently stops the
+            // worker accepting.
             let terminal = err == libc::ECANCELED || err == libc::EBADF || err == libc::EINVAL;
             if terminal {
                 self.driver.merged_accept_armed = false;
