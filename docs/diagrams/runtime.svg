@@ -4,7 +4,7 @@
 <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#4D4D4D"/></marker></defs>
 <rect width="100%" height="100%" fill="white"/>
 <text x="50" y="55" font-family="sans-serif" font-size="28" fill="#222">Runtime startup and connection ownership</text>
-<text x="50" y="84" font-family="sans-serif" font-size="16" fill="#222">Workers become ready before the listener exists.</text>
+<text x="50" y="84" font-family="sans-serif" font-size="16" fill="#222">Workers become ready before any listener is bound.</text>
 <rect x="60" y="135" width="190" height="70" rx="12" fill="white" stroke="#4D4D4D" stroke-width="2.4" stroke-dasharray="8 5"/>
 <text x="155" y="176" text-anchor="middle" font-family="sans-serif" font-size="17" fill="#222">caller / application</text>
 <rect x="310" y="125" width="220" height="90" rx="12" fill="#CCEBC5" stroke="#4D4D4D" stroke-width="1.4"/>

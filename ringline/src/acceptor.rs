@@ -30,6 +30,10 @@ pub struct AcceptorConfig {
     /// Shared flag set by ShutdownHandle to signal the acceptor to stop.
     #[allow(dead_code)] // stored for future use; acceptor currently uses channel disconnect
     pub shutdown_flag: Arc<AtomicBool>,
+    /// The runtime's listen gates. This acceptor waits on its gate before
+    /// accepting. `ListenGates::open` calls `listen(2)`; until it runs,
+    /// `listen_fd` is bound and not listening.
+    pub listen_gates: Arc<crate::listen_gate::ListenGates>,
     /// Whether to set TCP_NODELAY on accepted connections.
     pub tcp_nodelay: bool,
     /// Connections to assign to each worker before moving to the next.
@@ -94,6 +98,17 @@ pub(crate) fn apply_accepted_sockopts(
 pub fn run_acceptor(config: AcceptorConfig) {
     let num_workers = config.worker_channels.len();
     if num_workers == 0 {
+        return;
+    }
+
+    // Wait for this listener's gate. It is already open unless the caller
+    // asked for a deferred listen, in which case the socket is bound and not
+    // listening, and `accept4` on it would fail with EINVAL, which ends the
+    // acceptor loop.
+    //
+    // A `false` return is shutdown, and the listen fd may already be closed,
+    // so the thread returns without touching it.
+    if !config.listen_gates.wait_open(config.listener.index()) {
         return;
     }
 
@@ -258,6 +273,61 @@ fn accept_nonblock(
 mod tests {
     use super::*;
     use std::os::fd::AsRawFd;
+
+    /// An acceptor parked on a gate that never opens must still exit when the
+    /// runtime shuts down.
+    ///
+    /// This is the mechanism `ShutdownHandle::shutdown` relies on. It cannot
+    /// be tested through the public API: the acceptor thread is detached, so a
+    /// parked one does not hold up `join()` on the worker handles, and the
+    /// listen fd is closed by `shutdown` whether the thread woke or not. The
+    /// leak is a stranded thread, which no observable API state reflects.
+    #[test]
+    fn a_gated_acceptor_exits_on_shutdown() {
+        use std::sync::atomic::AtomicBool;
+
+        let gates = crate::listen_gate::ListenGates::new(1, 128);
+        // `TcpListener::bind` listens, so an acceptor that skipped the gate
+        // would block in `accept4` rather than exit. The assertions below
+        // separate the two: a gated acceptor exits on `gates.shutdown()`, one
+        // blocked in `accept4` does not.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let (tx, _rx) = crossbeam_channel::bounded::<AcceptedConn>(1);
+
+        let config = AcceptorConfig {
+            listen_fd: listener.as_raw_fd(),
+            listener: crate::ListenerId::from_index(0),
+            worker_channels: vec![tx],
+            worker_wake_handles: Vec::new(),
+            shutdown_flag: Arc::new(AtomicBool::new(false)),
+            listen_gates: Arc::clone(&gates),
+            tcp_nodelay: false,
+            conn_chunk_size: 1,
+            #[cfg(feature = "timestamps")]
+            timestamps: false,
+        };
+
+        let handle = std::thread::spawn(move || run_acceptor(config));
+        // Give the thread time to enter `wait_open`. The assertion holds
+        // either way: `wait_open` rechecks the predicate before it sleeps.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert!(
+            !handle.is_finished(),
+            "the acceptor exited before the gate opened or shut"
+        );
+
+        gates.shutdown();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !handle.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            handle.is_finished(),
+            "shutdown did not release the acceptor parked on an unopened gate"
+        );
+        handle.join().expect("acceptor panicked");
+    }
 
     /// The option is actually applied, not merely requested.
     ///

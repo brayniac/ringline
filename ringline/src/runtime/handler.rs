@@ -107,10 +107,18 @@ pub trait AsyncEventHandler: Send + 'static {
 
     /// Async entry point called once during worker startup.
     ///
-    /// Return `Some(future)` to spawn a standalone task that runs before the
-    /// event loop begins accepting connections. This is useful for client-only
-    /// applications (no `.bind()`) that need to initiate outbound connections
-    /// via [`connect()`](crate::connect).
+    /// Return `Some(future)` to spawn a standalone task on this worker. This
+    /// is useful for client-only applications (no `.bind()`) that need to
+    /// initiate outbound connections via [`connect()`](crate::connect).
+    ///
+    /// The task is spawned before the event loop's first iteration and then
+    /// runs concurrently with everything else on the worker, including
+    /// accepting connections. It is not a readiness gate: a listener that was
+    /// not deferred starts serving as soon as `launch()` reaches it, whether or
+    /// not this future has finished. To hold a port until the server can
+    /// serve, bind it with
+    /// [`RinglineBuilder::defer_listen`](crate::RinglineBuilder::defer_listen)
+    /// and call [`begin_listening()`](crate::begin_listening) from here.
     ///
     /// The future can call [`request_shutdown()`](crate::request_shutdown) to
     /// stop the worker when done. Return `None` (the default) to skip.

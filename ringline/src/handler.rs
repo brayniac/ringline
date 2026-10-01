@@ -149,7 +149,16 @@ impl ListenerId {
         self.0
     }
 
-    pub(crate) fn from_index(index: u32) -> Self {
+    /// The id of the listener at `index` in `bind()` call order.
+    ///
+    /// Ids follow call order, so a caller that bound in a known order can name
+    /// a listener before any connection has arrived, for example to pass to
+    /// [`begin_listening`](crate::begin_listening). Ids are per runtime: in a
+    /// process running more than one, an id names the listener at that index
+    /// in the runtime it is passed to: the calling worker's runtime for the
+    /// free functions, the handle's runtime for `ListenHandle` and
+    /// `ShutdownHandle` methods.
+    pub fn from_index(index: u32) -> Self {
         ListenerId(index)
     }
 }

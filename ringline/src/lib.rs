@@ -162,6 +162,7 @@ pub mod direct_io;
 pub(crate) mod disk_io_pool;
 #[cfg_attr(not(has_io_uring), allow(dead_code))]
 pub mod fs;
+pub(crate) mod listen_gate;
 pub mod metrics;
 #[cfg_attr(not(has_io_uring), allow(dead_code))]
 pub mod nvme;
@@ -248,6 +249,12 @@ pub use park::ParkState;
 pub use error::TimerExhausted;
 /// Errors returned by UDP send operations.
 pub use error::UdpSendError;
+/// Opens deferred listeners from any thread.
+pub use listen_gate::ListenHandle;
+/// Begin listening on a deferred listener, from any code on a ringline worker.
+pub use listen_gate::begin_listening;
+/// Begin listening on every deferred listener, from any code on a worker.
+pub use listen_gate::begin_listening_all;
 /// Trait for async event handlers (one task per connection).
 pub use runtime::handler::AsyncEventHandler;
 #[cfg(has_io_uring)]

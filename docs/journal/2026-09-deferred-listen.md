@@ -45,13 +45,30 @@ handshakes and queue connections. `accept()` only dequeues them.
 
 | | port reserved | client sees | TCP readiness probe |
 |---|---|---|---|
-| bind, defer `listen` | yes | `ECONNREFUSED` | fails, correctly |
+| bind, defer `listen` | yes | refused (Linux) / times out (Darwin) | fails, correctly |
 | bind + `listen`, defer `accept` | yes | handshake completes, then silence | succeeds, wrongly |
 
 Deferring `accept` defeats a readiness probe: the kernel completes the handshake
 without the server, so a load balancer's TCP check passes and it routes to an
 instance that is not ready. When the backlog fills the kernel drops SYNs, so
 clients get timeouts rather than a clean refusal — worse to diagnose as well.
+
+**What the peer sees is platform-specific, and the first version of this entry
+said otherwise.** Measured on Darwin 25.6 with no ringline involved — a plain
+socket bound without `listen`, plus two controls:
+
+| | result |
+|---|---|
+| bound, not listening | times out (1.5 s limit reached) |
+| nothing bound on that port | `ECONNREFUSED` |
+| same socket after `listen(2)` | connects |
+
+So Darwin drops the SYN rather than answering with RST. Linux answers with RST,
+which is where the `ECONNREFUSED` claim came from. Both fail a readiness probe,
+which is what the feature needs; only Linux fails it *quickly*, and a probe
+with a generous timeout on Darwin spends that timeout. The integration test
+asserts the Linux behaviour specifically under `cfg(target_os = "linux")` so CI
+checks the claim rather than the code carrying it as a comment.
 
 Holding clients in the backlog is the right behaviour when *draining* an old
 instance during a handover. Refusing is the right behaviour when a new instance
@@ -212,3 +229,172 @@ the doc points at the gate for readiness. This is the part of #534 that is
 genuinely 0.7.0-blocking. The gate itself is additive and could ship later —
 but shipping a release whose documentation promises a readiness gate that does
 not exist is worse than shipping without the feature.
+
+## Implementation notes
+
+Landed for `AcceptMode::Pool` (the default, and the only mode on mio).
+`defer_listen()` with `AcceptMode::Merged` is refused at launch rather than
+silently not deferring; merged mode's arming is a single process-wide
+`merged_accept_armed` bool with two re-arm sites, and making it per-listener is
+a second change.
+
+**GO criterion 4 is met at the unit level, not the integration level, and that
+distinction was found by mutation.** The integration test asserts that shutting
+down a runtime with an unreleased gate completes and the workers join — and it
+stays green with `ShutdownHandle::shutdown`'s call to `ListenGates::shutdown`
+deleted. The acceptor thread is detached, so one parked on a gate never holds
+up `join()` on the worker handles, and the listen fd is closed by `shutdown`
+whether the thread woke or not. What the call actually prevents is a stranded
+thread, which no observable API state reflects. The mechanism therefore has its
+own unit test (`acceptor::tests::a_gated_acceptor_exits_on_shutdown`), and the
+wiring from `ShutdownHandle::shutdown` to it is covered by inspection only.
+Recorded because a green test that passes with the code removed is worse than
+no test.
+
+The other mutation behaved as intended: making `defer_listen()` a no-op turns
+four of the six integration tests red and leaves the ungated control green.
+
+**What the peer sees is platform-specific**, which the entry above records with
+its measurement. The consequence for the feature is that only Linux fails a
+readiness probe quickly; Darwin makes the prober wait out its own timeout.
+
+## The reservation was not a reservation, on Linux
+
+The entry above, and the first implementation, claimed a gated listener
+reserves its port. **Linux CI falsified that**, through an assertion this PR
+happened to add: `std::net::TcpListener::bind()` on a gated port succeeds.
+Five test jobs failed, all Linux, both backends; macOS passed, which is why no
+local gate saw it.
+
+`create_listener` sets `SO_REUSEADDR`. Linux allows two `SO_REUSEADDR` sockets
+to bind one address while **neither** is listening, and that is exactly the
+state a gated listener sits in. Binding and listening used to be adjacent
+lines, so the window was microseconds; deferring `listen` stretched it to
+however long warmup takes.
+
+Probed on the rig rather than read out of kernel source, predictions written
+into the spec first. Linux 6.12.107 aarch64, plain sockets, no ringline:
+
+| arm | setup | predicted | measured |
+|---|---|---|---|
+| A | `SO_REUSEADDR`, not listening | squatter can bind | **yes** |
+| B | `SO_REUSEADDR` cleared after bind | squatter cannot | **cannot**, `EADDRINUSE` |
+| C | no `SO_REUSEADDR` | squatter cannot | **cannot**, `EADDRINUSE` |
+| D | squatter binds *and listens* first | unknown | our `listen` fails `EADDRINUSE` |
+
+D bounded the severity before any fix was written: there is no state in which
+two sockets listen on one address, so nothing is silently misrouted. The worst
+case is a stolen port that `begin_listening` reports, and `ListenGates::open`
+already returns the `listen(2)` error and leaves the gate closed and
+retryable.
+
+B is the fix, and it costs nothing: `SO_REUSEADDR` exists to tolerate a
+previous incarnation's `TIME_WAIT` **at bind time**, while the conflict check a
+later binder runs reads the flag on the socket already bound. Setting it for
+the bind and clearing it immediately after keeps the tolerance and restores
+exclusivity. It is a no-op for an ungated listener, because a listening socket
+conflicts with a later bind regardless of the flag — so the same code path
+serves both, which is what the design wanted anyway.
+
+The lesson is not about sockets. The claim "the port is reserved" was carried
+from the issue into the design entry, the rustdoc, the module docs and the
+changelog without anyone checking it, and it was wrong on the only platform
+that matters for this runtime. It survived four documents and a design review.
+What caught it was an assertion written because it was cheap, not because the
+claim was in doubt.
+
+## "It costs nothing" was also wrong: `listen(2)` re-checks the port
+
+The fix above claimed `SO_REUSEADDR`'s TIME_WAIT tolerance is needed "at bind
+time" only. **It is not.** Linux runs the port conflict check again inside
+`listen(2)` (`inet_csk_listen_start` → `get_port`), using the socket's flag as
+it is *at that moment*. With the flag cleared, a TIME_WAIT connection on the
+port, such as one a previous instance of the server left behind, fails the
+listen with `EADDRINUSE`. That is a restart within the TIME_WAIT period
+failing `launch()`, and it hit every listener, gated or not, because every
+listener goes through `ListenGates`.
+
+This is what the `AddrInUse` flake was. The first run on Linux after the
+syscall-naming change reported it twice, both
+`listen(2) on listener 0: Address already in use`: `ringline-memcache`
+`streaming` (release) and `ringline-grpc` `round_trip` (force-mio). The shared
+`free_port()` range reuses ports that earlier test servers left in TIME_WAIT.
+Neither of the two causes in the handoff was right. It was not the probe race,
+and the longer window between bind and listen did not matter; the listen fails
+whenever it runs.
+
+Plain sockets, no ringline, Linux 6.12.111 aarch64, TIME_WAIT created by an
+accepted connection closing first, 5 trials per row:
+
+| setup at `listen(2)` | competitor bind while held | `listen` |
+|---|---|---|
+| `SO_REUSEADDR` still set | succeeds (arm A above) | ok ×5 |
+| cleared after bind | `EADDRINUSE` (arm B above) | `EADDRINUSE` ×5 |
+| cleared after bind, **set again just before listen** | `EADDRINUSE` ×5 | ok ×5 |
+
+The third row is the fix: `listen_all` sets the flag immediately before
+`listen(2)`. The port stays reserved while the listener is held. In the gap
+between setting the flag and `listen(2)`, a competing `SO_REUSEADDR` socket
+**can** bind. Measured in both orders: whichever socket calls `listen(2)`
+first listens, and the other's `listen` fails `EADDRINUSE`. If the competitor
+wins, `begin_listening` (or `launch()`) reports the error. The gap cannot
+produce two listeners. This entry first said
+a competitor could not bind there, reasoned from "the flag was clear until
+then", which forgets that the flag is set again one line before the listen.
+An adversarial review found it; the same wrong sentence is in the `deae091`
+commit message, which cannot be corrected in place.
+`a_listener_listens_over_a_time_wait_connection` and
+`a_held_listener_reserves_its_port` pin the two halves, and each fails when its
+half of the fix is removed.
+
+The same lesson as the previous entry: "it costs nothing" was reasoned, not
+measured, and the table that justified the change did not include the case
+the flag exists for.
+
+## Second adversarial review: decisions
+
+Two independent reviews of `deae091` agreed on one blocking bug. A `launch()`
+that failed after a deferred listener's acceptor had started closed the
+listeners and joined the workers, but did not shut the gates. The acceptor
+stayed parked in `wait_open` for the life of the process, and a
+`begin_listening` during the rollback could `listen(2)` a closed fd number.
+All three failure paths now shut the gates first, as `ShutdownHandle::shutdown`
+does. `tests/deferred_listen_rollback.rs` counts `ringline-accept` threads in
+`/proc/self/task`; it failed before the fix (one thread alive after 5 s) and
+passes after it. It is its own test binary so other tests' acceptors are not
+counted.
+
+Two findings were owner decisions:
+
+- **Errors keep the raw errno; the syscall name is gone.** Naming the syscall
+  (`bind(2) on …`, `listen(2) on listener N`) wrapped the error with
+  `io::Error::new`, which sets `raw_os_error()` to `None`. A caller matching
+  on the errno could no longer do so. The name existed to tell the
+  `AddrInUse` flake's two candidate causes apart, and it did (see above). The
+  errno matters more to callers.
+- **`begin_listening` opens on the first call, and a barrier is the caller's
+  job.** `on_start` runs on every worker, so with per-worker warmup the first
+  worker to finish opens the listener for all of them, and the acceptor then
+  hands connections to workers still warming up. Counting calls until every
+  worker has asked was rejected: a call that does nothing until a hidden
+  barrier is met is surprising, and a handler that calls from one worker would
+  never open. The docs now say the first call opens the listener for every
+  worker, and give the pattern: count completions and call from the last
+  worker. `one_workers_release_opens_the_listener_for_every_worker` pins the
+  first-call behaviour with two workers, which no test covered before.
+
+`begin_listening` works only on a worker thread, because it reaches the gates
+through a thread-local. `ListenHandle`, from `ShutdownHandle::listen_handle()`,
+opens a listener from any thread, for readiness decided outside a worker. It
+was first written as two methods on `ShutdownHandle`; the third review pointed
+out that `ShutdownHandle` is not `Clone` and shuts the runtime down on drop, so
+sharing it across threads meant `Arc` and a last-owner-drops shutdown. A
+`Clone` handle whose drop does nothing follows `worker_wake_handle()`. It
+exists only after `launch()` has registered every listener, so the
+release-before-registration path cannot arise through it.
+`the_listen_handle_releases_from_any_thread` releases from a spawned thread
+holding a clone.
+
+Still open: `defer_listen()` refuses a deferred Unix listener in merged mode,
+which has an acceptor thread and would likely work. That belongs with
+merged-mode support.

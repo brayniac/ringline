@@ -7,7 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `RinglineBuilder::defer_listen` binds a listener without listening on it, and
+  `begin_listening` / `begin_listening_all` start it from code on a worker;
+  `ListenHandle` (from `ShutdownHandle::listen_handle`) does the same from any
+  thread; it is `Clone`, and dropping it does not shut the runtime down. The first call opens the listener for every worker. The port is
+  reserved while the gate is closed, but the kernel does not complete
+  handshakes, so a TCP readiness probe fails while the server is warming up
+  instead of passing against a socket nothing will service. On Linux the peer is
+  refused with `ECONNREFUSED`; on macOS and the BSDs the SYN is dropped and the
+  peer times out. The gate is per listener, keyed by `ListenerId`, so a health
+  port can serve while a data port is held back (#534).
+
+  ```rust
+  RinglineBuilder::new(config)
+      .bind(health_addr)          // serving when launch returns
+      .bind(data_addr)
+      .defer_listen()             // held until begin_listening
+      .launch::<Handler>()?;
+  ```
+
+  Not supported with `AcceptMode::Merged` on the io_uring backend, where
+  `launch()` refuses the combination. On the mio backend `Merged` already runs
+  as `Pool`, so the deferral applies there.
+
+- `ListenerId::from_index` is public. Ids follow `bind()` call order, so a
+  listener can be named before any connection has arrived.
+
 ### Changed
+
+- `AsyncEventHandler::on_start`'s documentation no longer says the future runs
+  before accepting begins. It runs concurrently with accepting; the doc now
+  says so and points to `defer_listen` for a readiness gate. No behaviour
+  change (#534).
 
 - **Breaking:** `connect` and `connect_unix` return builders that resolve to an
   owned `Connection`. `connect_with_timeout`, `connect_tls`,

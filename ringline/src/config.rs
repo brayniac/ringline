@@ -24,6 +24,10 @@ pub enum AcceptMode {
     /// over N workers roughly 1/e of workers get none. That is why this is not
     /// the default. io_uring only — the mio backend always uses [`Pool`].
     ///
+    /// Not compatible with
+    /// [`RinglineBuilder::defer_listen`](crate::RinglineBuilder::defer_listen);
+    /// on the io_uring backend `launch()` refuses the combination.
+    ///
     /// [`Pool`]: AcceptMode::Pool
     Merged,
 }
