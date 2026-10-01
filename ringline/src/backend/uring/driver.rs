@@ -495,6 +495,9 @@ pub(crate) struct Driver {
         crossbeam_channel::Sender<crate::acceptor::AcceptedConn>,
         crate::wakeup::WakeFd,
     )>,
+    /// This worker's wake eventfd, read by the ring. Not owned: the worker's
+    /// `WakeHandle` owns it, and `Config::wake_keep_alive` holds that handle
+    /// until the worker exits.
     pub(crate) eventfd: RawFd,
     pub(crate) eventfd_buf: [u8; 8],
     /// Wake handle for cross-thread wakeup (wraps the eventfd).

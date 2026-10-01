@@ -24,7 +24,9 @@
 use std::ffi::CString;
 use std::future::Future;
 use std::io;
-use std::os::unix::io::RawFd;
+#[cfg(has_io_uring)]
+use std::os::fd::AsRawFd;
+use std::os::fd::OwnedFd;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -39,7 +41,10 @@ use crate::runtime::io::{try_with_state, with_state};
 /// pidfd is held open until the `Child` is dropped.
 pub struct Child {
     pid: u32,
-    pidfd: RawFd,
+    /// `None` on targets without `pidfd_open` (non-Linux). Held to keep the
+    /// pidfd open until the `Child` drops; only `wait` reads it, on io_uring.
+    #[cfg_attr(not(has_io_uring), allow(dead_code))]
+    pidfd: Option<OwnedFd>,
 }
 
 impl Child {
@@ -60,10 +65,16 @@ impl Child {
             let task_id = CURRENT_TASK_ID.with(|c| c.get());
             executor.pidfd_waiters.insert(seq, task_id);
 
+            // Present on Linux, the only target with io_uring.
+            let pidfd = self
+                .pidfd
+                .as_ref()
+                .map(AsRawFd::as_raw_fd)
+                .ok_or_else(|| io::Error::other("child has no pidfd"))?;
             let ud = UserData::encode(OpTag::PidfdPoll, 0, seq);
             driver
                 .ring
-                .submit_poll_add(self.pidfd, libc::POLLIN as u32, ud.raw())?;
+                .submit_poll_add(pidfd, libc::POLLIN as u32, ud.raw())?;
             Ok(WaitFuture { seq, pid: self.pid })
         })
     }
@@ -84,15 +95,6 @@ impl Child {
             Err(io::Error::last_os_error())
         } else {
             Ok(())
-        }
-    }
-}
-
-impl Drop for Child {
-    fn drop(&mut self) {
-        // Close the pidfd.
-        unsafe {
-            libc::close(self.pidfd);
         }
     }
 }
@@ -288,9 +290,7 @@ impl Future for SpawnFuture {
                 executor.pending_spawns.remove(&self.request_id);
                 return Poll::Ready(result.map(|r| Child {
                     pid: r.pid,
-                    // `Child` owns the pidfd from here and closes it on drop;
-                    // -1 where there is none.
-                    pidfd: r.pidfd.map_or(-1, std::os::fd::IntoRawFd::into_raw_fd),
+                    pidfd: r.pidfd,
                 }));
             }
             Poll::Pending
