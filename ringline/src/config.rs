@@ -269,7 +269,7 @@ pub struct Config {
     /// attractive handoff target — the two mechanisms would fight.
     pub(crate) worker_accepting: Option<std::sync::Arc<Vec<std::sync::atomic::AtomicBool>>>,
     /// Every worker's accept channel and wake handle, so a worker that accepts
-    /// while over its share can hand the raw fd to a less-loaded peer. Empty
+    /// while over its share can hand the connection to a less-loaded peer. Empty
     /// in pool mode, where the acceptor thread owns these.
     pub(crate) peer_accept: Vec<(
         crossbeam_channel::Sender<crate::acceptor::AcceptedConn>,

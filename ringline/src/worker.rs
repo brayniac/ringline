@@ -936,9 +936,9 @@ impl RinglineBuilder {
         for _ in 0..num_threads {
             // Bounded so a slow worker applies backpressure on the acceptor
             // rather than queuing fds indefinitely. On full, the acceptor
-            // tries the next worker; if every worker is full, the incoming
-            // fd is closed so the kernel can signal connection-refused to
-            // the peer instead of letting the listen queue overflow.
+            // tries the next worker; if every worker is full, the connection
+            // is dropped, which closes it, so the peer sees EOF instead of
+            // the listen queue overflowing.
             let (tx, rx) = crossbeam_channel::bounded::<crate::acceptor::AcceptedConn>(
                 self.config.accept_queue_capacity,
             );
@@ -1898,9 +1898,8 @@ mod startup_gate_tests {
                             .recv_timeout(Duration::from_millis(250))
                             .ok();
                         observed_tx.send(accepted.is_some()).unwrap();
-                        if let Some(accepted) = accepted {
-                            unsafe { libc::close(accepted.fd) };
-                        }
+                        // Dropping `accepted` closes the connection.
+                        drop(accepted);
                         let _ = startup_tx.send(Err(crate::error::Error::Io(io::Error::other(
                             "injected worker startup failure",
                         ))));

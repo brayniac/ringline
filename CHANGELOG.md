@@ -208,6 +208,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Connections accepted but still queued for a worker when the runtime shut
+  down were never closed: the accept channel carried the socket as a raw fd,
+  so the queued connections leaked when the worker exited without draining
+  it. On mio every connection queued at shutdown leaked; on io_uring only
+  those queued after the worker's last drain. Each queued connection now
+  owns its socket, and a worker closes the connections still queued for it
+  when it exits, including one that exits while the runtime keeps running
+  (#545).
+
 - `ConnCtx::close` (and `Connection::close` / `SendHalf::close`, which call
   it) on a stale handle, one whose slot had been reused by a new connection,
   closed that new connection. It now does nothing on a stale handle, as

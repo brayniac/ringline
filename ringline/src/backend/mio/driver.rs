@@ -876,6 +876,13 @@ impl Driver {
 
 impl Drop for Driver {
     fn drop(&mut self) {
+        // Close connections still queued for this worker. Dropping the
+        // receiver alone leaves them in the channel until every sender (the
+        // acceptor threads, or in merged mode the other workers) has exited.
+        if let Some(rx) = self.accept_rx.take() {
+            rx.try_iter().for_each(drop);
+        }
+
         // Hand back the copy-pool permits of any bounded sends still
         // queued. Worker shutdown drops the driver with whatever is in
         // `pending_sends`; a `PendingSend`'s `SlotReservation` cannot
