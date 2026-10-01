@@ -2,7 +2,7 @@
 //!
 //! Provides [`wait()`] to block the current thread until `SIGINT` or
 //! `SIGTERM` is received. Typically used with
-//! [`ShutdownHandle::wait_on_signal()`](crate::worker::ShutdownHandle::wait_on_signal)
+//! [`Runtime::wait_on_signal()`](crate::worker::Runtime::wait_on_signal)
 //! for one-line graceful shutdown.
 //!
 //! # Implementation
@@ -21,13 +21,13 @@
 //! #     fn create_for_worker(_: usize) -> Self { H }
 //! # }
 //!
-//! let (shutdown, handles) = RinglineBuilder::new(Config::default())
+//! let (runtime, handles) = RinglineBuilder::new(Config::default())
 //!     .bind("127.0.0.1:8080".parse().unwrap())
 //!     .launch::<H>()
 //!     .unwrap();
 //!
 //! // Block until Ctrl-C or kill, then shut down gracefully.
-//! shutdown.wait_on_signal();
+//! runtime.wait_on_signal();
 //! for h in handles {
 //!     h.join().unwrap().unwrap();
 //! }

@@ -1,4 +1,4 @@
-//! Regression: dropping a `ShutdownHandle` without calling `.shutdown()`
+//! Regression: dropping a `Runtime` without calling `.shutdown()`
 //! must trigger graceful worker shutdown so the RAII idiom
 //! `drop(shutdown); for h in handles { h.join() }` actually returns.
 //!
@@ -67,7 +67,7 @@ fn drop_handle_triggers_shutdown_and_join_returns() {
     }
     assert!(
         joiner.is_finished(),
-        "workers did not exit within 5s after ShutdownHandle drop \
+        "workers did not exit within 5s after Runtime drop \
          — Drop probably no longer signals shutdown",
     );
     joiner.join().expect("joiner thread panicked");

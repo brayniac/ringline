@@ -266,7 +266,7 @@ fn main() {
         .build()
         .expect("valid config");
 
-    let (_shutdown, _handles) = RinglineBuilder::new(config)
+    let (_runtime, _handles) = RinglineBuilder::new(config)
         .launch::<Bench>()
         .expect("launch");
     // Time-based measurement: let the workers' tasks run for `secs`, then read

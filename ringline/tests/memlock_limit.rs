@@ -2,7 +2,7 @@
 //! process register as fixed buffers. Distros default it to 8 MiB or 64 MiB,
 //! so a `registered_regions` config of a few hundred MiB used to fail with a
 //! bare `Cannot allocate memory`. Two paths must name the limit instead:
-//! `launch` before it spawns anything, and `ShutdownHandle::register_region`
+//! `launch` before it spawns anything, and `Runtime::register_region`
 //! at run time.
 //!
 //! One test, sequential: lowering the hard limit is irreversible for the

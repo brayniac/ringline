@@ -263,7 +263,7 @@ mod ringline_client {
     use std::time::{Duration, Instant};
 
     use ringline::{
-        AsyncEventHandler, ConfigBuilder, Connection, ParseResult, RinglineBuilder, ShutdownHandle,
+        AsyncEventHandler, ConfigBuilder, Connection, ParseResult, RinglineBuilder, Runtime,
         connect, sleep, spawn,
     };
 
@@ -574,7 +574,7 @@ mod ringline_client {
     }
 
     pub struct RinglineClientRuntime {
-        pub shutdown: ShutdownHandle,
+        pub shutdown: Runtime,
         pub handles: Vec<std::thread::JoinHandle<Result<(), ringline::Error>>>,
     }
 

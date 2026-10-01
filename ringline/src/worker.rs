@@ -18,7 +18,7 @@ use crate::runtime::handler::AsyncEventHandler;
 /// Result type for `launch` / `RinglineBuilder::launch` to avoid type-complexity warnings.
 type LaunchResult = Result<
     (
-        ShutdownHandle,
+        Runtime,
         Vec<thread::JoinHandle<Result<(), crate::error::Error>>>,
     ),
     crate::error::Error,
@@ -58,7 +58,7 @@ fn panic_payload(payload: &(dyn Any + Send)) -> String {
 /// Without this a failure on the second `bind()` would leave the first socket
 /// listening with an acceptor thread feeding channels nobody drains — the
 /// port stays taken and peers get accepted into a runtime that is being torn
-/// down. `shutdown(SHUT_RD)` first for the same reason `ShutdownHandle` does
+/// down. `shutdown(SHUT_RD)` first for the same reason `Runtime` does
 /// it: it wakes a thread parked in `accept4` and frees the port immediately.
 fn close_listeners(listeners: &[ListenerHandle]) {
     for listener in listeners {
@@ -150,11 +150,15 @@ impl WorkerReadFd {
     }
 }
 
-/// Handle returned by `launch()` for controlling the running runtime: shutdown,
-/// deferred listeners, accept steering and registered regions.
+/// Returned by `launch()` with the workers' join handles. Controls shutdown,
+/// listener addresses, deferred listeners, accept steering and registered
+/// regions.
 ///
-/// Dropping the handle shuts the runtime down.
-pub struct ShutdownHandle {
+/// Dropping it calls [`shutdown`](Self::shutdown); join the handles to wait
+/// for the workers to exit. [`ListenHandle`](crate::ListenHandle) and
+/// [`WakeHandle`](crate::WakeHandle) implement `Clone`, and dropping them does
+/// not shut the workers down.
+pub struct Runtime {
     shutdown_flag: Arc<AtomicBool>,
     worker_wake_handles: Vec<crate::wakeup::WakeHandle>,
     /// One entry per listener, in `bind()` call order — the same order that
@@ -182,7 +186,7 @@ pub struct ShutdownHandle {
     listen_gates: Arc<crate::listen_gate::ListenGates>,
 }
 
-impl ShutdownHandle {
+impl Runtime {
     /// The actual TCP address of the **first** TCP listener, if any. Returns
     /// `Some` for a TCP `bind()` (the port may have been zero-resolved) and
     /// `None` for client-only mode or when every listener is a Unix socket.
@@ -191,8 +195,8 @@ impl ShutdownHandle {
     /// [`bound_addrs`]: this returns the first TCP bind and cannot express
     /// the rest.
     ///
-    /// [`bound_addr_of`]: ShutdownHandle::bound_addr_of
-    /// [`bound_addrs`]: ShutdownHandle::bound_addrs
+    /// [`bound_addr_of`]: Runtime::bound_addr_of
+    /// [`bound_addrs`]: Runtime::bound_addrs
     pub fn bound_addr(&self) -> Option<SocketAddr> {
         self.listeners.iter().find_map(|l| l.bound_addr)
     }
@@ -216,8 +220,8 @@ impl ShutdownHandle {
     /// A handle for opening deferred listeners from any thread.
     ///
     /// The returned [`ListenHandle`](crate::ListenHandle) can be cloned and
-    /// moved to other threads, and dropping it does not shut the runtime
-    /// down. After this handle's [`shutdown`](Self::shutdown), its calls
+    /// moved to other threads, and dropping it does not shut the workers
+    /// down. After [`shutdown`](Self::shutdown), the `ListenHandle`'s calls
     /// return an error.
     pub fn listen_handle(&self) -> crate::ListenHandle {
         crate::ListenHandle::new(Arc::clone(&self.listen_gates))
@@ -304,7 +308,7 @@ impl ShutdownHandle {
     /// out of range.
     ///
     /// The returned handle can be cloned and moved to other threads, and
-    /// stays valid past [`ShutdownHandle`] drop — the underlying fd is
+    /// stays valid past [`Runtime`] drop — the underlying fd is
     /// reference-counted and closes only when the last clone is dropped.
     /// After workers join, calling [`wake`](crate::WakeHandle::wake) is a
     /// no-op write into an fd nobody is reading.
@@ -431,23 +435,9 @@ impl ShutdownHandle {
     }
 }
 
-// The wake-fd lifetime no longer needs an explicit `Drop`: each
-// `WakeHandle` reference-counts the underlying fd via `Arc<WakeFdInner>`
-// and closes it when the last clone is dropped. Users may keep clones
-// from `worker_wake_handle()` past `ShutdownHandle` drop without
-// leaking the fd — the runtime itself drops its clones when shutdown
-// completes.
-//
-// However, dropping the handle without ever calling `shutdown()` used
-// to leave workers running forever: the shutdown flag was never set,
-// the listen fd was never closed, and no wake-up was delivered, so the
-// RAII idiom `drop(shutdown); for h in handles { h.join() }` hung
-// indefinitely (reproducer: `cargo bench -p ringline --bench buffer`,
-// which iterates several sizes and depends on each previous server
-// shutting down between iterations). We restore the RAII contract by
-// having `Drop` call `shutdown()` — it's safe to call regardless of
-// whether the caller has already invoked it.
-impl Drop for ShutdownHandle {
+// `Drop` calls `shutdown()` so that `drop(runtime); for h in handles { h.join() }`
+// returns. `shutdown()` is idempotent, so an earlier explicit call is harmless.
+impl Drop for Runtime {
     fn drop(&mut self) {
         // `shutdown()` is idempotent:
         //   * `shutdown_flag.store(true)` is monotonic — a second store
@@ -584,12 +574,12 @@ fn getsockname_v4_v6(fd: RawFd) -> Option<SocketAddr> {
 ///
 /// fn main() -> Result<(), ringline::Error> {
 ///     let config = Config::default();
-///     let (shutdown, handles) = RinglineBuilder::new(config)
+///     let (runtime, handles) = RinglineBuilder::new(config)
 ///         .bind("0.0.0.0:7878".parse().unwrap())
 ///         .launch::<Echo>()?;
 ///
 ///     // Wait for shutdown signal
-///     shutdown.wait_on_signal();
+///     runtime.wait_on_signal();
 ///
 ///     // Join all worker threads
 ///     for h in handles {
@@ -626,11 +616,11 @@ fn getsockname_v4_v6(fd: RawFd) -> Option<SocketAddr> {
 ///
 /// fn main() -> Result<(), ringline::Error> {
 ///     let config = Config::default();
-///     let (shutdown, handles) = RinglineBuilder::new(config)
+///     let (runtime, handles) = RinglineBuilder::new(config)
 ///         // No .bind() call = client-only mode
 ///         .launch::<ClientHandler>()?;
 ///
-///     shutdown.wait_on_signal();
+///     runtime.wait_on_signal();
 ///     for h in handles { h.join().unwrap()?; }
 ///     Ok(())
 /// }
@@ -657,11 +647,11 @@ fn getsockname_v4_v6(fd: RawFd) -> Option<SocketAddr> {
 ///
 /// fn main() -> Result<(), ringline::Error> {
 ///     let config = Config::default();
-///     let (shutdown, handles) = RinglineBuilder::new(config)
+///     let (runtime, handles) = RinglineBuilder::new(config)
 ///         .bind_unix("/tmp/app.sock")
 ///         .launch::<Handler>()?;
 ///
-///     shutdown.wait_on_signal();
+///     runtime.wait_on_signal();
 ///     for h in handles { h.join().unwrap()?; }
 ///     Ok(())
 /// }
@@ -742,7 +732,7 @@ impl RinglineBuilder {
     /// place, since work that needs the runtime (outbound connections,
     /// timers, fs) runs there. From a thread that is not a ringline worker,
     /// call [`ListenHandle::begin_listening`](crate::ListenHandle::begin_listening)
-    /// on the handle from [`ShutdownHandle::listen_handle`] instead.
+    /// on the handle from [`Runtime::listen_handle`] instead.
     ///
     /// The first `begin_listening` call opens the listener for every worker,
     /// and connections are then spread across all of them. `on_start` runs
@@ -988,7 +978,7 @@ impl RinglineBuilder {
         crate::metrics::init_metadata();
 
         // Create per-worker channels and wake fds. `worker_wake_handles`
-        // (Arc-based) is what `ShutdownHandle` keeps and what
+        // (Arc-based) is what `Runtime` keeps and what
         // `worker_wake_handle()` hands out to users; `worker_wake_fds`
         // (Copy) is what the acceptor and internal request structs use on
         // hot paths.
@@ -1212,7 +1202,7 @@ impl RinglineBuilder {
                 ))
             };
 
-        // Shared by `ShutdownHandle::set_worker_accepting` and every worker's
+        // Shared by `Runtime::set_worker_accepting` and every worker's
         // accept-time placement: one mask, so steering and placement cannot
         // disagree about who is in the rotation.
         let worker_accepting: Arc<Vec<std::sync::atomic::AtomicBool>> = Arc::new(
@@ -1468,7 +1458,7 @@ impl RinglineBuilder {
                         // Roll back the listeners already bound, or their ports
                         // stay held and a listening socket keeps accepting into
                         // workers that are being joined. Shut the gates
-                        // first, as `ShutdownHandle::shutdown` does: an acceptor
+                        // first, as `Runtime::shutdown` does: an acceptor
                         // parked on a deferred gate is not woken by closing its fd.
                         listen_gates.shutdown();
                         close_listeners(&listeners);
@@ -1582,7 +1572,7 @@ impl RinglineBuilder {
             worker_wake_handles.clone(),
         ));
 
-        let shutdown_handle = ShutdownHandle {
+        let runtime = Runtime {
             shutdown_flag,
             worker_wake_handles,
             accepting: worker_accepting,
@@ -1591,7 +1581,7 @@ impl RinglineBuilder {
             listen_gates,
         };
 
-        Ok((shutdown_handle, handles))
+        Ok((runtime, handles))
     }
 }
 
@@ -1668,7 +1658,7 @@ fn ensure_nofile_limit(
 /// the kernel reports the shortfall as a bare `ENOMEM`. Like the nofile
 /// check, this raises the soft limit when the hard limit allows and otherwise
 /// fails with the fix spelled out. Regions registered later through
-/// `ShutdownHandle::register_region` are checked at that call instead.
+/// `Runtime::register_region` are checked at that call instead.
 #[cfg(has_io_uring)]
 fn ensure_memlock_limit(config: &Config) -> Result<(), crate::error::Error> {
     use crate::error::{MemlockLimit, MemlockPlan, describe_memlock_shortfall, memlock_plan};

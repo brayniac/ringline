@@ -67,7 +67,7 @@ fn main() {
 
     eprintln!("starting stream echo server on {bind_addr}");
 
-    let (_shutdown, handles) = RinglineBuilder::new(config)
+    let (_runtime, handles) = RinglineBuilder::new(config)
         .bind(bind_addr.parse().expect("invalid bind address"))
         .launch::<StreamEcho>()
         .expect("failed to launch workers");

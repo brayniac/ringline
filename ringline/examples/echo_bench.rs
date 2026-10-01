@@ -397,14 +397,14 @@ fn main() {
             );
 
             let config = make_config(workers, msg_size);
-            let (shutdown, handles) = RinglineBuilder::new(config)
+            let (runtime, handles) = RinglineBuilder::new(config)
                 .bind(addr.parse().expect("invalid bind address"))
                 .launch::<AsyncEcho>()
                 .expect("failed to launch server");
 
             let bench_result = run_bench(&addr, clients, msg_size, warmup, duration);
 
-            shutdown.shutdown();
+            runtime.shutdown();
             for h in handles {
                 h.join().ok();
             }

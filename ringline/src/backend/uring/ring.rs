@@ -190,7 +190,7 @@ impl Ring {
                 .submitter()
                 .register_buffers_update(slot as u32, std::slice::from_ref(&iov), None)
                 .map_err(|e| {
-                    // Surfaces to the caller of `ShutdownHandle::register_region`
+                    // Surfaces to the caller of `Runtime::register_region`
                     // as an `io::Error`; keep the kind, replace the bare
                     // "Cannot allocate memory" with the memlock guidance.
                     let text = describe_buffer_registration_failure(

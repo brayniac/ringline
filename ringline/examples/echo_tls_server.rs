@@ -88,7 +88,7 @@ fn main() {
     eprintln!("starting TLS echo server on {bind_addr}");
     eprintln!("test with: openssl s_client -connect {bind_addr}");
 
-    let (_shutdown, handles) = RinglineBuilder::new(config)
+    let (_runtime, handles) = RinglineBuilder::new(config)
         .bind(bind_addr.parse().expect("invalid bind address"))
         .launch::<TlsEcho>()
         .expect("failed to launch workers");

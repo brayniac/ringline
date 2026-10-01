@@ -531,7 +531,7 @@ pub(crate) struct Driver {
     pub(crate) blocking_pool: Option<std::sync::Arc<crate::blocking::BlockingPool>>,
     /// Region-registry control channel — drained each tick to apply
     /// dynamic fixed-buffer registrations from
-    /// [`ShutdownHandle::register_region`](crate::ShutdownHandle::register_region).
+    /// [`Runtime::register_region`](crate::Runtime::register_region).
     pub(crate) region_rx: crate::region_registry::RegionControlRx,
     /// Whether to set TCP_NODELAY on connections.
     pub(crate) tcp_nodelay: bool,
@@ -3301,10 +3301,9 @@ impl Driver {
             crate::metrics::RING.increment(crate::metrics::ring::SQE_SUBMIT_FAILURES);
         }
 
-        // The eventfd is owned by `ShutdownHandle::Drop` (it holds the
-        // matching `WakeHandle`), so don't close it here — the handle's
-        // wake clones live longer than the worker thread, and a
-        // double-close would race against fd-number reuse.
+        // The eventfd is owned by `WakeHandle` (`WakeFdInner` closes it when
+        // the last clone drops), so don't close it here: a double-close would
+        // race against fd-number reuse.
     }
 }
 

@@ -360,8 +360,8 @@ fn recv_forward_echo_preserves_order_across_buffers() {
 }
 
 #[test]
-fn shutdown_handle_reports_bound_addr() {
-    // Bind to :0 so the kernel picks a port, and verify ShutdownHandle
+fn runtime_reports_bound_addr() {
+    // Bind to :0 so the kernel picks a port, and verify Runtime
     // surfaces the resolved address (not the wildcard the user passed in).
     let (shutdown, handles) = RinglineBuilder::new(test_config())
         .bind("127.0.0.1:0".parse().unwrap())
@@ -765,7 +765,8 @@ fn async_request_shutdown_exits_cleanly() {
         result.expect("worker returned error");
     }
 
-    // ShutdownHandle is now redundant, but drop it cleanly.
+    // The workers have exited; dropping `shutdown` calls `shutdown()` again,
+    // which is a no-op.
     drop(shutdown);
 }
 

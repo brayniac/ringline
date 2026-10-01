@@ -30,7 +30,7 @@
 //!
 //! fn main() -> Result<(), ringline::Error> {
 //!     let config = Config::default();
-//!     let (_shutdown, handles) = RinglineBuilder::new(config)
+//!     let (_runtime, handles) = RinglineBuilder::new(config)
 //!         .bind("127.0.0.1:7878".parse().unwrap())
 //!         .launch::<Echo>()?;
 //!     for h in handles { h.join().unwrap()?; }
@@ -467,8 +467,8 @@ pub use nvme::NvmeDevice;
 pub use wakeup::WakeHandle;
 /// Builder for launching ringline workers.
 pub use worker::RinglineBuilder;
-/// Handle for triggering graceful shutdown.
-pub use worker::ShutdownHandle;
+/// Returned by `launch()`; controls the workers and shuts them down when dropped.
+pub use worker::Runtime;
 
 // ── Re-exports: TLS ─────────────────────────────────────────────────────
 
