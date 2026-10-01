@@ -339,6 +339,12 @@ mod tests {
     /// acceptor accepts on its own copy, which `shutdown(SHUT_RD)` has already
     /// ended, so it exits without touching whatever socket now holds the old
     /// number.
+    ///
+    /// Linux only: the test relies on `accept4` failing after
+    /// `shutdown(SHUT_RD)`, which is what lets the acceptor exit. Other
+    /// platforms keep the acceptor blocked on its own copy until a peer
+    /// connects (see `accept_nonblock`).
+    #[cfg(target_os = "linux")]
     #[test]
     fn an_acceptor_never_accepts_on_a_reused_fd_number() {
         use std::sync::atomic::AtomicBool;
