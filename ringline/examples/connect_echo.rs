@@ -87,7 +87,7 @@ fn main() {
     eprintln!("starting connect_echo example (client-only mode)");
 
     // Client-only mode: no bind address, no acceptor thread.
-    let (_shutdown, handles) = RinglineBuilder::new(config)
+    let (_runtime, handles) = RinglineBuilder::new(config)
         .launch::<ConnectHandler>()
         .expect("failed to launch workers");
 

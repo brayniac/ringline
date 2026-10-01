@@ -150,13 +150,14 @@ impl WorkerReadFd {
     }
 }
 
-/// The running runtime, returned by `launch()` with the workers' join handles.
-/// Controls shutdown, listener addresses, deferred listeners, accept steering
-/// and registered regions.
+/// Returned by `launch()` with the workers' join handles. Controls shutdown,
+/// listener addresses, deferred listeners, accept steering and registered
+/// regions.
 ///
-/// Dropping it shuts the runtime down. [`ListenHandle`](crate::ListenHandle)
-/// and [`WakeHandle`](crate::WakeHandle) are the clonable handles whose drop
-/// does nothing.
+/// Dropping it calls [`shutdown`](Self::shutdown); join the handles to wait
+/// for the workers to exit. [`ListenHandle`](crate::ListenHandle) and
+/// [`WakeHandle`](crate::WakeHandle) implement `Clone`, and dropping them does
+/// not shut the workers down.
 pub struct Runtime {
     shutdown_flag: Arc<AtomicBool>,
     worker_wake_handles: Vec<crate::wakeup::WakeHandle>,
@@ -219,8 +220,8 @@ impl Runtime {
     /// A handle for opening deferred listeners from any thread.
     ///
     /// The returned [`ListenHandle`](crate::ListenHandle) can be cloned and
-    /// moved to other threads, and dropping it does not shut the runtime
-    /// down. After this handle's [`shutdown`](Self::shutdown), its calls
+    /// moved to other threads, and dropping it does not shut the workers
+    /// down. After [`shutdown`](Self::shutdown), the `ListenHandle`'s calls
     /// return an error.
     pub fn listen_handle(&self) -> crate::ListenHandle {
         crate::ListenHandle::new(Arc::clone(&self.listen_gates))
@@ -434,22 +435,8 @@ impl Runtime {
     }
 }
 
-// The wake-fd lifetime no longer needs an explicit `Drop`: each
-// `WakeHandle` reference-counts the underlying fd via `Arc<WakeFdInner>`
-// and closes it when the last clone is dropped. Users may keep clones
-// from `worker_wake_handle()` past `Runtime` drop without
-// leaking the fd — the runtime itself drops its clones when shutdown
-// completes.
-//
-// However, dropping the handle without ever calling `shutdown()` used
-// to leave workers running forever: the shutdown flag was never set,
-// the listen fd was never closed, and no wake-up was delivered, so the
-// RAII idiom `drop(shutdown); for h in handles { h.join() }` hung
-// indefinitely (reproducer: `cargo bench -p ringline --bench buffer`,
-// which iterates several sizes and depends on each previous server
-// shutting down between iterations). We restore the RAII contract by
-// having `Drop` call `shutdown()` — it's safe to call regardless of
-// whether the caller has already invoked it.
+// `Drop` calls `shutdown()` so that `drop(runtime); for h in handles { h.join() }`
+// returns. `shutdown()` is idempotent, so an earlier explicit call is harmless.
 impl Drop for Runtime {
     fn drop(&mut self) {
         // `shutdown()` is idempotent:
@@ -587,12 +574,12 @@ fn getsockname_v4_v6(fd: RawFd) -> Option<SocketAddr> {
 ///
 /// fn main() -> Result<(), ringline::Error> {
 ///     let config = Config::default();
-///     let (shutdown, handles) = RinglineBuilder::new(config)
+///     let (runtime, handles) = RinglineBuilder::new(config)
 ///         .bind("0.0.0.0:7878".parse().unwrap())
 ///         .launch::<Echo>()?;
 ///
 ///     // Wait for shutdown signal
-///     shutdown.wait_on_signal();
+///     runtime.wait_on_signal();
 ///
 ///     // Join all worker threads
 ///     for h in handles {
@@ -629,11 +616,11 @@ fn getsockname_v4_v6(fd: RawFd) -> Option<SocketAddr> {
 ///
 /// fn main() -> Result<(), ringline::Error> {
 ///     let config = Config::default();
-///     let (shutdown, handles) = RinglineBuilder::new(config)
+///     let (runtime, handles) = RinglineBuilder::new(config)
 ///         // No .bind() call = client-only mode
 ///         .launch::<ClientHandler>()?;
 ///
-///     shutdown.wait_on_signal();
+///     runtime.wait_on_signal();
 ///     for h in handles { h.join().unwrap()?; }
 ///     Ok(())
 /// }
@@ -660,11 +647,11 @@ fn getsockname_v4_v6(fd: RawFd) -> Option<SocketAddr> {
 ///
 /// fn main() -> Result<(), ringline::Error> {
 ///     let config = Config::default();
-///     let (shutdown, handles) = RinglineBuilder::new(config)
+///     let (runtime, handles) = RinglineBuilder::new(config)
 ///         .bind_unix("/tmp/app.sock")
 ///         .launch::<Handler>()?;
 ///
-///     shutdown.wait_on_signal();
+///     runtime.wait_on_signal();
 ///     for h in handles { h.join().unwrap()?; }
 ///     Ok(())
 /// }

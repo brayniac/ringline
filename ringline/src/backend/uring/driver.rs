@@ -3301,10 +3301,9 @@ impl Driver {
             crate::metrics::RING.increment(crate::metrics::ring::SQE_SUBMIT_FAILURES);
         }
 
-        // The eventfd is owned by `Runtime::Drop` (it holds the
-        // matching `WakeHandle`), so don't close it here — the handle's
-        // wake clones live longer than the worker thread, and a
-        // double-close would race against fd-number reuse.
+        // The eventfd is owned by `WakeHandle` (`WakeFdInner` closes it when
+        // the last clone drops), so don't close it here: a double-close would
+        // race against fd-number reuse.
     }
 }
 

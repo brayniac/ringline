@@ -13,9 +13,10 @@ use std::sync::Arc;
 /// Internal fd carrier used on hot paths inside the runtime.
 ///
 /// Cheap to copy; does not own the fd. The fd is owned by the
-/// [`Arc<WakeFdInner>`] held inside [`WakeHandle`]. The runtime preserves the
-/// invariant that every `WakeFd` is dropped before the last `WakeHandle`
-/// clone — workers join before [`crate::Runtime`] drops.
+/// [`Arc<WakeFdInner>`] held inside [`WakeHandle`]. A `WakeFd` must not be
+/// used after the last `WakeHandle` clone drops. The runtime's own clones live
+/// in [`crate::Runtime`], so dropping it before the workers join leaves their
+/// `WakeFd` copies dangling.
 #[derive(Clone, Copy)]
 pub(crate) struct WakeFd {
     fd: RawFd,

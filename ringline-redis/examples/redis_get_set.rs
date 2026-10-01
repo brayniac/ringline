@@ -80,7 +80,7 @@ fn main() {
         .build()
         .expect("valid config");
 
-    let (_shutdown, handles) = RinglineBuilder::new(config)
+    let (_runtime, handles) = RinglineBuilder::new(config)
         .launch::<RedisHandler>()
         .expect("launch failed");
 

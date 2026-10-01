@@ -37,10 +37,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- **Breaking:** `ShutdownHandle` is renamed `Runtime`, with no alias. It is the
-  runtime's control surface (shutdown, listener addresses, deferred listeners,
-  accept steering, registered regions), and dropping it shuts the runtime
-  down. Replace the type name; its methods are unchanged.
+- **Breaking:** `ShutdownHandle` is renamed `Runtime`, with no alias. It
+  controls shutdown, listener addresses, deferred listeners, accept steering
+  and registered regions, and dropping it shuts the workers down. Replace the
+  type name; its methods are unchanged.
 
 - `AsyncEventHandler::on_start`'s documentation no longer says the future runs
   before accepting begins. It runs concurrently with accepting; the doc now

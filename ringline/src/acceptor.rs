@@ -27,7 +27,7 @@ pub struct AcceptorConfig {
     pub worker_channels: Vec<Sender<AcceptedConn>>,
     /// Per-worker wake handles to wake the event loop after sending a connection.
     pub worker_wake_handles: Vec<crate::wakeup::WakeFd>,
-    /// Shared flag set by Runtime to signal the acceptor to stop.
+    /// Shared flag set by `Runtime::shutdown` to signal the acceptor to stop.
     #[allow(dead_code)] // stored for future use; acceptor currently uses channel disconnect
     pub shutdown_flag: Arc<AtomicBool>,
     /// The runtime's listen gates. This acceptor waits on its gate before

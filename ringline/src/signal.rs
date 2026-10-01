@@ -21,13 +21,13 @@
 //! #     fn create_for_worker(_: usize) -> Self { H }
 //! # }
 //!
-//! let (shutdown, handles) = RinglineBuilder::new(Config::default())
+//! let (runtime, handles) = RinglineBuilder::new(Config::default())
 //!     .bind("127.0.0.1:8080".parse().unwrap())
 //!     .launch::<H>()
 //!     .unwrap();
 //!
 //! // Block until Ctrl-C or kill, then shut down gracefully.
-//! shutdown.wait_on_signal();
+//! runtime.wait_on_signal();
 //! for h in handles {
 //!     h.join().unwrap().unwrap();
 //! }

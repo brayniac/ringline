@@ -765,7 +765,8 @@ fn async_request_shutdown_exits_cleanly() {
         result.expect("worker returned error");
     }
 
-    // Runtime is now redundant, but drop it cleanly.
+    // The workers have exited; dropping `shutdown` calls `shutdown()` again,
+    // which is a no-op.
     drop(shutdown);
 }
 
