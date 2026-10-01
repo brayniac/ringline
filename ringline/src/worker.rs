@@ -96,25 +96,6 @@ fn rollback_workers(
     first_error
 }
 
-/// Carries the worker wake read descriptor into its worker thread.
-///
-/// Not owning: [`crate::wakeup::WakeHandle`] owns the descriptor (the eventfd
-/// on io_uring, the pipe's read end on mio) and closes it when the last clone
-/// drops.
-struct WorkerReadFd {
-    fd: RawFd,
-}
-
-impl WorkerReadFd {
-    fn new(fd: RawFd) -> Self {
-        Self { fd }
-    }
-
-    fn as_raw_fd(&self) -> RawFd {
-        self.fd
-    }
-}
-
 /// Returned by `launch()` with the workers' join handles. Controls shutdown,
 /// listener addresses, deferred listeners, accept steering and registered
 /// regions.
@@ -826,7 +807,7 @@ impl RinglineBuilder {
                     &config,
                     handler,
                     accept_rx,
-                    eventfd.0.as_raw_fd(),
+                    eventfd.0,
                     shutdown_flag,
                     resolve_rx,
                     resolve_tx,
@@ -846,7 +827,7 @@ impl RinglineBuilder {
                         &config,
                         handler,
                         accept_rx,
-                        eventfd.0.as_raw_fd(),
+                        eventfd.0,
                         eventfd.1,
                         shutdown_flag,
                         resolve_rx,
@@ -903,7 +884,7 @@ impl RinglineBuilder {
                 usize,
                 Config,
                 Option<crossbeam_channel::Receiver<crate::acceptor::AcceptedConn>>,
-                (WorkerReadFd, crate::wakeup::WakeFd),
+                (RawFd, crate::wakeup::WakeFd),
                 Arc<AtomicBool>,
                 Option<crossbeam_channel::Receiver<crate::resolver::ResolveResponse>>,
                 Option<crossbeam_channel::Sender<crate::resolver::ResolveResponse>>,
@@ -965,7 +946,9 @@ impl RinglineBuilder {
                 crate::wakeup::create_wake_fd().map_err(crate::error::Error::Io)?;
             worker_txs.push(tx);
             worker_rxs.push(rx);
-            worker_eventfds.push(WorkerReadFd::new(read_fd));
+            // Not owning: `wake_handle` owns the read side (the eventfd on
+            // io_uring, the pipe's read end on mio) and closes it.
+            worker_eventfds.push(read_fd);
             worker_wake_fds.push(wake_handle.as_wake_fd());
             worker_wake_handles.push(wake_handle);
         }
@@ -1193,6 +1176,10 @@ impl RinglineBuilder {
                 .map(|(idx, fds, _)| (*idx, fds[worker_id]))
                 .collect();
             config.merged_accept_live = merged_live.clone();
+            // The worker's hold on every wake fd: `config` lives in the worker
+            // thread until it exits. Its event loop reads its own wake fd by
+            // number (the eventfd on io_uring, the pipe's read end on mio), and
+            // in merged accept mode (io_uring) it wakes peers.
             config.wake_keep_alive = Some(wake_keep_alive.clone());
             config.worker_index = worker_id;
             config.worker_loads = worker_loads.clone();
@@ -1228,7 +1215,6 @@ impl RinglineBuilder {
             let eventfd = (worker_eventfds.remove(0), worker_wake_fds[worker_id]);
             let worker_shutdown_flag = shutdown_flag.clone();
             let worker_listen_gates = listen_gates.clone();
-            let worker_wake_keep_alive = wake_keep_alive.clone();
             let worker_fn = worker_fn.clone();
             let startup_tx = startup_tx.clone();
 
@@ -1268,11 +1254,6 @@ impl RinglineBuilder {
             let spawn_result = thread::Builder::new()
                 .name(format!("ringline-worker-{worker_id}"))
                 .spawn(move || {
-                    // Keeps every worker's wake fd open until this worker exits.
-                    // On io_uring its ring reads its own eventfd by number; in
-                    // merged accept mode it wakes peers when it hands off a
-                    // connection.
-                    let _wake_keep_alive = worker_wake_keep_alive;
                     if config.worker.pin_to_core {
                         let core = pin_cpu;
                         // Report the failure before bailing — otherwise

@@ -220,11 +220,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   never returns keeps them open. Startup takes one reference per thread;
   requests take none.
 
-- On mio, a wake after a worker had exited raised SIGPIPE, killing a host
-  that restores the default SIGPIPE disposition (Rust binaries ignore it).
-  `shutdown()`, then joining the workers, then dropping the `Runtime` did
-  this: the worker closed its wake pipe's read end on exit. The `WakeHandle`
-  now owns both ends of the pipe.
+- On mio, a wake that reached a worker after it had exited raised SIGPIPE.
+  That kills a process whose SIGPIPE disposition is the default; Rust programs
+  ignore SIGPIPE unless they reset it. Calling `shutdown()`, joining the
+  workers and then dropping the `Runtime` was enough, because the worker
+  closed its wake pipe's read end on exit. The `WakeHandle` now owns both ends
+  of the pipe.
 
 - Docs: `send_backpressured`'s documented error set omitted
   `io::ErrorKind::NotConnected`, which is what a waiter actually gets when the

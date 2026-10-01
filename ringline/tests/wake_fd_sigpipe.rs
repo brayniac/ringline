@@ -1,7 +1,7 @@
 //! A wake after a worker has exited must not raise SIGPIPE.
 //!
-//! Rust ignores SIGPIPE before `main`, but a host that restores the default
-//! disposition (many CLI tools and C hosts do) is killed by one. On mio a
+//! The Rust runtime sets SIGPIPE to ignored before `main`; a process that resets
+//! it to `SIG_DFL`, or a C program embedding ringline, is killed by one. On mio a
 //! worker's wake fd is a pipe, so a write after the read end has closed raises
 //! it. This binary restores the default disposition, so a regression kills the
 //! test process (signal 13) instead of passing.

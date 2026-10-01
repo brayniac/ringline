@@ -892,8 +892,8 @@ impl Drop for Driver {
             }
         }
 
-        // The wake pipe's read end is not closed here: `WakeHandle` owns both
-        // ends, so a wake after this worker exits never meets a closed reader.
+        // `WakeHandle` owns and closes both ends of the wake pipe. Closing the
+        // read end here would make a later wake raise SIGPIPE.
     }
 }
 
@@ -1022,12 +1022,10 @@ pub(crate) mod tests {
     /// Build a `Driver` with no acceptor, resolver, spawner, blocking or
     /// disk-I/O plumbing — every optional subsystem is `None`.
     ///
-    /// The returned `WakeHandle` owns the write end of the wake pipe and
-    /// **must be bound for the lifetime of the driver**
+    /// The returned `WakeHandle` owns both ends of the wake pipe and must be
+    /// bound for the lifetime of the driver
     /// (`let (mut driver, _wake) = test_driver(&config);`); dropping it closes
-    /// the fd the driver still holds. The read end is intentionally left
-    /// dangling: it is a per-test fd leak that the process exit reclaims,
-    /// which is simpler than handing tests a second guard to keep alive.
+    /// the read end the driver holds.
     fn test_driver(config: &Config) -> (Driver, crate::wakeup::WakeHandle) {
         let (read_fd, handle) = crate::wakeup::create_wake_fd().expect("wake fd");
         let driver = Driver::new(

@@ -241,10 +241,12 @@ fn a_running_worker_keeps_its_wake_fd_open() {
         .recv_buffer(16, 1024)
         .max_connections(16)
         .send_pool(16, 16384)
-        // No pools: their threads would also hold the fds open.
+        // No pools: their threads would also hold the fds open. The disk-I/O
+        // pool runs on mio only.
         .blocking_threads(0)
         .resolver_threads(0)
         .spawner_threads(0)
+        .disk_io_threads(0)
         .build()
         .expect("valid config");
     let baseline = open_fds();

@@ -3171,7 +3171,8 @@ impl Driver {
         }
     }
 
-    /// Shutdown: close all connections, drain remaining CQEs, close eventfd.
+    /// Shutdown: close all connections and drain remaining CQEs. The eventfd
+    /// is closed by `WakeHandle`, not here.
     pub(crate) fn run_shutdown(&mut self) {
         // 1. Close all active connections and drain their send queues.
         let max = self.connections.max_slots();
