@@ -152,21 +152,29 @@ pub(crate) type WakeKeepAlive = Arc<[WakeHandle]>;
 #[cfg(not(has_io_uring))]
 pub(crate) fn create_wake_fd() -> io::Result<(RawFd, WakeHandle)> {
     let mut fds = [0i32; 2];
-    if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
+    // Both ends non-blocking and close-on-exec. On Linux `pipe2` sets the
+    // flags atomically, so a child spawned on another thread cannot inherit
+    // the pipe; elsewhere they are set after `pipe`.
+    #[cfg(target_os = "linux")]
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) } < 0 {
         return Err(io::Error::last_os_error());
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        for fd in &fds {
+            unsafe {
+                let flags = libc::fcntl(*fd, libc::F_GETFL);
+                libc::fcntl(*fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                let fd_flags = libc::fcntl(*fd, libc::F_GETFD);
+                libc::fcntl(*fd, libc::F_SETFD, fd_flags | libc::FD_CLOEXEC);
+            }
+        }
     }
     let read_fd = fds[0];
     let write_fd = fds[1];
-
-    // Set both ends non-blocking and close-on-exec.
-    for fd in &fds {
-        unsafe {
-            let flags = libc::fcntl(*fd, libc::F_GETFL);
-            libc::fcntl(*fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-            let fd_flags = libc::fcntl(*fd, libc::F_GETFD);
-            libc::fcntl(*fd, libc::F_SETFD, fd_flags | libc::FD_CLOEXEC);
-        }
-    }
 
     Ok((
         read_fd,

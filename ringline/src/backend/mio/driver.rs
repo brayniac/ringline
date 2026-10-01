@@ -892,8 +892,8 @@ impl Drop for Driver {
             }
         }
 
-        // `WakeHandle` owns and closes both ends of the wake pipe. Closing the
-        // read end here would make a later wake raise SIGPIPE.
+        // `WakeHandle` owns and closes both ends of the wake pipe; closing the
+        // read end here as well would close it twice.
     }
 }
 

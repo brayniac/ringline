@@ -215,10 +215,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   themselves carried the fd number without owning it. A `spawn_blocking` task
   still running at shutdown therefore wrote its wake (8 bytes on io_uring, 1
   on mio) into an unrelated fd once it finished. Each of those threads now
-  holds the wake fds open while it runs, so they close when the last one
-  exits rather than when the `Runtime` drops; a `spawn_blocking` task that
-  never returns keeps them open. Startup takes one reference per thread;
-  requests take none.
+  holds the wake fds open while it runs, so they close when the last of those
+  threads exits, or the last `WakeHandle` from `worker_wake_handle()` drops,
+  rather than when the `Runtime` drops. Pool threads are detached, so the wake
+  fds can still be open just after `launch()` returns an error or the worker
+  handles have joined; they close once those threads see shutdown. A pool
+  operation that never returns, such as a `spawn_blocking` task, keeps them
+  open. References are taken when threads start, never per request.
 
 - On mio, a wake that reached a worker after it had exited raised SIGPIPE.
   That kills a process whose SIGPIPE disposition is the default; Rust programs

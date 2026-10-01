@@ -391,9 +391,9 @@ impl Drop for Runtime {
         //   * The listen-fd close is gated by an `AtomicBool::swap`, so
         //     a double-close is impossible whether `Drop` runs before
         //     or after an explicit `shutdown()`.
-        //   * `WakeHandle::wake` is documented as a no-op write into
-        //     an fd nobody is reading once workers have joined; the
-        //     write either delivers a real wake or returns harmlessly.
+        //   * `WakeHandle::wake` after the workers have joined writes
+        //     into a wake fd that is still open but unread; it never
+        //     errors.
         // Calling it unconditionally here makes the RAII idiom work
         // while leaving the explicit `.shutdown()` path unchanged.
         self.shutdown();
@@ -954,10 +954,9 @@ impl RinglineBuilder {
         }
         // The pool threads and the workers each hold a clone of this for as
         // long as they run; each acceptor holds its own `WakeHandle` clones.
-        // The `WakeFd`s those threads carry are not owning, so this is what
-        // keeps the fds open after `Runtime` drops and until the last such
-        // thread exits; otherwise a late wake would write into a reused fd
-        // number.
+        // The `WakeFd`s those threads carry do not own the fds. This keeps the
+        // fds open after `Runtime` drops, until the last such thread exits, so
+        // a late wake cannot write into a reused fd number.
         let wake_keep_alive: crate::wakeup::WakeKeepAlive =
             worker_wake_handles.iter().cloned().collect();
 

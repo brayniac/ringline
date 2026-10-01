@@ -293,3 +293,173 @@ fn a_running_worker_keeps_its_wake_fd_open() {
         "fds opened by launch() still open 5s after the worker exited: {leaked:?}"
     );
 }
+
+#[cfg(not(has_io_uring))]
+static DISK_OPEN_ISSUED: AtomicBool = AtomicBool::new(false);
+#[cfg(not(has_io_uring))]
+static FIFO_PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// Opens a FIFO for reading on the disk-I/O pool. The open blocks until a
+/// writer appears, so the pool thread outlives the worker.
+#[cfg(not(has_io_uring))]
+struct FifoOpen;
+
+#[cfg(not(has_io_uring))]
+impl AsyncEventHandler for FifoOpen {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
+        async {}
+    }
+
+    fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        Some(Box::pin(async {
+            let path = FIFO_PATH.get().expect("fifo path").clone();
+            let open =
+                ringline::fs::open(path, ringline::fs::OpenFlags::READ, 0).expect("fs::open");
+            DISK_OPEN_ISSUED.store(true, Ordering::Release);
+            let _ = open.await;
+        }))
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        FifoOpen
+    }
+}
+
+/// The mio disk-I/O pool's hold: an fs operation that completes after the
+/// worker has exited must not wake into a reused fd. The disk-I/O pool runs
+/// on mio only.
+#[cfg(not(has_io_uring))]
+#[test]
+fn a_late_disk_io_wake_does_not_write_into_a_reused_fd() {
+    let _lock = FD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = std::env::temp_dir().join(format!("ringline-wake-fifo-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let fifo = dir.join("fifo");
+    let c_path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0, "mkfifo");
+    FIFO_PATH.set(fifo.clone()).expect("fifo path set once");
+
+    let config = ConfigBuilder::new()
+        .workers(1)
+        .pin_to_core(false)
+        .sq_entries(64)
+        .recv_buffer(16, 1024)
+        .max_connections(16)
+        .send_pool(16, 16384)
+        // Only the disk-I/O pool, so its hold is the one under test.
+        .blocking_threads(0)
+        .resolver_threads(0)
+        .spawner_threads(0)
+        .disk_io_threads(1)
+        .build()
+        .expect("valid config");
+    let baseline = open_fds();
+    let (runtime, handles) = RinglineBuilder::new(config)
+        .launch::<FifoOpen>()
+        .expect("launch");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !DISK_OPEN_ISSUED.load(Ordering::Acquire) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        DISK_OPEN_ISSUED.load(Ordering::Acquire),
+        "fs::open never issued"
+    );
+    // The disk-I/O thread picks the request up and blocks in open(2).
+    std::thread::sleep(Duration::from_millis(50));
+
+    let before = open_fds();
+    drop(runtime);
+    for h in handles {
+        h.join().expect("worker panicked").expect("worker error");
+    }
+    assert!(
+        thread_alive("ringline-disk-i"),
+        "the disk-I/O thread exited before the open completed; the test proves nothing"
+    );
+    let freed: Vec<RawFd> = before.iter().copied().filter(|&fd| !is_open(fd)).collect();
+
+    let mut claimed: Vec<(RawFd, RawFd)> = Vec::new();
+    for &target in &freed {
+        let mut fds = [0 as RawFd; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) },
+            0
+        );
+        let read = unsafe { libc::fcntl(fds[0], libc::F_DUPFD_CLOEXEC, 512) };
+        let write = unsafe { libc::fcntl(fds[1], libc::F_DUPFD_CLOEXEC, 512) };
+        assert!(read >= 512 && write >= 512);
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+        assert_eq!(
+            unsafe { libc::dup3(write, target, libc::O_CLOEXEC) },
+            target
+        );
+        unsafe { libc::close(write) };
+        claimed.push((read, target));
+    }
+
+    // Opening the writer completes the pool thread's open(2); it then wakes
+    // the worker and, its request channel closed, exits.
+    let writer = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&fifo)
+        .expect("open fifo writer");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while thread_alive("ringline-disk-i") && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !thread_alive("ringline-disk-i"),
+        "disk-I/O thread never exited"
+    );
+    drop(writer);
+
+    let mut stray = Vec::new();
+    for &(read, write) in &claimed {
+        let mut buf = [0u8; 64];
+        let n = unsafe { libc::read(read, buf.as_mut_ptr().cast(), buf.len()) };
+        if n > 0 {
+            stray.push((write, n));
+        }
+        unsafe {
+            libc::close(read);
+            libc::close(write);
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        stray.is_empty(),
+        "a disk-I/O wake after Runtime drop wrote into an unrelated pipe: \
+         (fd, bytes) = {stray:?}, freed fds {freed:?}"
+    );
+
+    // The open's own result is not a wake fd. Its response reaches no worker
+    // and is dropped without closing the file, a separate leak, so it is
+    // excluded here.
+    let opened_by_launch = || -> Vec<RawFd> {
+        open_fds()
+            .difference(&baseline)
+            .copied()
+            .filter(|fd| {
+                std::fs::read_link(format!("/proc/self/fd/{fd}"))
+                    .map(|t| !t.starts_with(&dir))
+                    .unwrap_or(true)
+            })
+            .collect()
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut leaked = opened_by_launch();
+    while !leaked.is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+        leaked = opened_by_launch();
+    }
+    assert!(
+        leaked.is_empty(),
+        "fds opened by launch() still open 5s after shutdown: {leaked:?}"
+    );
+}
