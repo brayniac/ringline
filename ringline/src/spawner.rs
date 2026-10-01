@@ -8,7 +8,9 @@
 
 use std::ffi::CString;
 use std::io;
-use std::os::unix::io::RawFd;
+use std::os::fd::OwnedFd;
+#[cfg(target_os = "linux")]
+use std::os::fd::{FromRawFd, RawFd};
 use std::thread;
 
 use crossbeam_channel::{Receiver, Sender};
@@ -37,7 +39,9 @@ pub(crate) struct SpawnResponse {
 /// Successful spawn result containing the child pid and pidfd.
 pub(crate) struct SpawnResult {
     pub(crate) pid: u32,
-    pub(crate) pidfd: RawFd,
+    /// Owned, so a result that reaches no worker closes it. `None` on
+    /// non-Linux targets, which have no `pidfd_open`.
+    pub(crate) pidfd: Option<OwnedFd>,
 }
 
 /// A pool of threads that perform blocking process spawning.
@@ -136,12 +140,13 @@ fn do_spawn(program: &CString, args: &[CString]) -> io::Result<SpawnResult> {
             }
             return Err(err);
         }
-        fd
+        // SAFETY: `pidfd_open` returned a fresh descriptor nothing else owns.
+        Some(unsafe { OwnedFd::from_raw_fd(fd) })
     };
 
-    // Non-Linux: pidfd not available, use -1 as sentinel.
+    // Non-Linux: pidfd not available.
     #[cfg(not(target_os = "linux"))]
-    let pidfd: RawFd = -1;
+    let pidfd: Option<OwnedFd> = None;
 
     Ok(SpawnResult {
         pid: pid as u32,

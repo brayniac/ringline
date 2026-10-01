@@ -487,9 +487,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             while let Ok(response) = rx.try_recv() {
                 // Handle fs_open completions: install fd or release slot.
                 if let Some(file_index) = self.driver.pending_fs_opens.remove(&response.seq) {
-                    if response.result >= 0 {
-                        // Success — result is the fd.
-                        let fd = response.result;
+                    if let Some(opened) = response.opened {
+                        // Success: the fd moves into `fs_fds`, and `fs_close`
+                        // closes it. Worker exit does not.
+                        let fd = std::os::fd::IntoRawFd::into_raw_fd(opened);
                         self.driver.fs_fds[file_index as usize] = Some(fd as std::os::fd::RawFd);
                         if let Some(ref mut files) = self.driver.fs_files
                             && let Some(f) = files.get_mut(file_index)

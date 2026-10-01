@@ -266,8 +266,8 @@ pub(crate) struct Driver {
     /// Raw fds for filesystem files, indexed by file slot.
     pub(crate) fs_fds: Vec<Option<RawFd>>,
     /// Pending fs_open requests: maps seq → file_index. On completion, the
-    /// result (fd) is stored in `fs_fds[file_index]`. On failure, the file
-    /// slot is released.
+    /// opened fd (`DiskIoResponse::opened`) is stored in `fs_fds[file_index]`.
+    /// On failure, the file slot is released.
     pub(crate) pending_fs_opens: std::collections::HashMap<u32, u16>,
 }
 

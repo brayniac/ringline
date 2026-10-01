@@ -835,13 +835,9 @@ impl Executor {
             let task_id = *task_id;
             self.wake_task(task_id);
         } else {
-            // The SpawnFuture was dropped before the response arrived —
-            // close the pidfd instead of leaking it.
-            if let Ok(r) = result {
-                unsafe {
-                    libc::close(r.pidfd);
-                }
-            }
+            // The SpawnFuture was dropped before the response arrived; dropping
+            // the result closes the pidfd.
+            drop(result);
         }
     }
 

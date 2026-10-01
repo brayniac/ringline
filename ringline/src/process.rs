@@ -268,18 +268,11 @@ pub struct SpawnFuture {
 impl Drop for SpawnFuture {
     fn drop(&mut self) {
         // A SpawnFuture abandoned before completion (select/timeout loser)
-        // must not leak its map entry — and, worse, the spawner's response
-        // (containing an OPEN PIDFD) would be stored into the entry and
-        // never taken. Mark the entry as abandoned by removing it; the
-        // deliver path closes the pidfd when no entry is waiting.
+        // must not leak its map entry. Removing the entry drops a response
+        // that already arrived, which closes its pidfd; one that arrives later
+        // finds no entry and is dropped on delivery.
         let _ = try_with_state(|_driver, executor| {
-            // Response already arrived but was never consumed — close the
-            // pidfd so it doesn't leak.
-            if let Some((_, Some(Ok(r)))) = executor.pending_spawns.remove(&self.request_id) {
-                unsafe {
-                    libc::close(r.pidfd);
-                }
-            }
+            executor.pending_spawns.remove(&self.request_id);
         });
     }
 }
@@ -295,7 +288,9 @@ impl Future for SpawnFuture {
                 executor.pending_spawns.remove(&self.request_id);
                 return Poll::Ready(result.map(|r| Child {
                     pid: r.pid,
-                    pidfd: r.pidfd,
+                    // `Child` owns the pidfd from here and closes it on drop;
+                    // -1 where there is none.
+                    pidfd: r.pidfd.map_or(-1, std::os::fd::IntoRawFd::into_raw_fd),
                 }));
             }
             Poll::Pending
