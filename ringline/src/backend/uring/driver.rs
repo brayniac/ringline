@@ -1040,6 +1040,7 @@ impl Driver {
                 fd_index,
                 config.udp_send_slots,
                 config.udp_gro,
+                config.take_udp_reserved(udp_idx),
             )?;
             udp_sockets.push(state);
         }
@@ -2836,7 +2837,10 @@ impl Driver {
         }
     }
 
-    /// Create a UDP socket, bind with SO_REUSEPORT, register in fixed file table.
+    /// Create a UDP socket, bind with SO_REUSEPORT, register in fixed file
+    /// table. `reserved` is a socket `launch` already bound to `bind_addr`; it
+    /// is used instead of creating and binding one.
+    #[allow(clippy::too_many_arguments)]
     fn setup_udp_socket(
         ring: &Ring,
         bind_addr: SocketAddr,
@@ -2844,6 +2848,7 @@ impl Driver {
         fd_index: u32,
         send_slots: u16,
         udp_gro: bool,
+        reserved: Option<std::os::fd::OwnedFd>,
     ) -> Result<UdpSocketState, crate::error::Error> {
         let domain = if bind_addr.is_ipv4() {
             libc::AF_INET
@@ -2851,21 +2856,43 @@ impl Driver {
             libc::AF_INET6
         };
 
-        let fd = unsafe { libc::socket(domain, libc::SOCK_DGRAM | libc::SOCK_NONBLOCK, 0) };
+        let bound = reserved.is_some();
+        let fd = match reserved {
+            Some(fd) => {
+                use std::os::fd::IntoRawFd;
+                let fd = fd.into_raw_fd();
+                let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+                if flags < 0
+                    || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+                {
+                    let err = std::io::Error::last_os_error();
+                    unsafe { libc::close(fd) };
+                    return Err(crate::error::Error::Io(err));
+                }
+                fd
+            }
+            None => unsafe { libc::socket(domain, libc::SOCK_DGRAM | libc::SOCK_NONBLOCK, 0) },
+        };
         if fd < 0 {
             return Err(crate::error::Error::Io(std::io::Error::last_os_error()));
         }
 
-        // Set SO_REUSEPORT for multi-worker binding.
-        let optval: libc::c_int = 1;
-        unsafe {
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_REUSEPORT,
-                &optval as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
+        // SO_REUSEPORT lets every worker bind the same port. A zero port
+        // reaches a worker only when each worker should get its own port, and
+        // with the option set Linux's free-port search can return a port
+        // another SO_REUSEPORT socket already holds, so it is left off then.
+        // A reserved socket already has it.
+        if !bound && bind_addr.port() != 0 {
+            let optval: libc::c_int = 1;
+            unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_REUSEPORT,
+                    &optval as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            }
         }
 
         // Enable UDP GRO. Opt-in, so a failure is hard rather than silent —
@@ -2890,16 +2917,18 @@ impl Driver {
         }
 
         // Bind.
-        let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-        let addr_len = crate::backend::socket_addr_to_sockaddr(bind_addr, &mut storage);
-        let ret =
-            unsafe { libc::bind(fd, &storage as *const _ as *const libc::sockaddr, addr_len) };
-        if ret < 0 {
-            let err = std::io::Error::last_os_error();
-            unsafe {
-                libc::close(fd);
+        if !bound {
+            let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+            let addr_len = crate::backend::socket_addr_to_sockaddr(bind_addr, &mut storage);
+            let ret =
+                unsafe { libc::bind(fd, &storage as *const _ as *const libc::sockaddr, addr_len) };
+            if ret < 0 {
+                let err = std::io::Error::last_os_error();
+                unsafe {
+                    libc::close(fd);
+                }
+                return Err(crate::error::Error::Io(err));
             }
-            return Err(crate::error::Error::Io(err));
         }
 
         // If a peer was supplied, connect(2) the socket before registering

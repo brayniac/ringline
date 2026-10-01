@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `Runtime::bound_udp_addr` / `bound_udp_addrs` report the address each UDP
+  bind is bound to, with a zero port resolved, as `bound_addr` /
+  `bound_addrs` already do for TCP listeners. `bound_udp_addrs` returns
+  `Vec<Option<SocketAddr>>`: a connected zero-port bind gives each worker its
+  own port and reports `None`.
+
 - `RinglineBuilder::defer_listen` binds a listener without listening on it, and
   `begin_listening` / `begin_listening_all` start it from code on a worker;
   `ListenHandle` (from `Runtime::listen_handle`) does the same from any
@@ -36,6 +42,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   listener can be named before any connection has arrived.
 
 ### Changed
+
+- An unconnected port-0 UDP bind on more than one worker now shares one
+  port across the workers. A multi-worker UDP client on such a
+  bind receives each reply on whichever worker the kernel delivers it to, not
+  necessarily the worker that sent the request. A client with one peer per
+  bind can use `bind_udp_connected`, which gives each worker its own port
+  when the local port is zero. A client that talks to several peers from one
+  unconnected bind has no way to get a port per worker.
 
 - **Breaking:** `ShutdownHandle` is renamed `Runtime`, with no alias. It
   controls shutdown, listener addresses, deferred listeners, accept steering
@@ -207,6 +221,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   of the series that lands #318.
 
 ### Fixed
+
+- A port-0 unconnected UDP bind (`bind_udp("…:0")`) with more than one
+  worker bound each worker's socket to a different ephemeral port, so the
+  bind had no single address. `launch` now resolves the port once and every
+  worker binds it. The socket `launch` binds to choose the port becomes one
+  worker's socket, so no datagram can arrive on a socket nothing reads.
+  Connected binds (`bind_udp_connected`) with a zero port keep one port per
+  worker.
 
 - A pool result that reached no worker leaked the fd it carried. An
   `fs::open` on mio's disk-I/O pool that completed after its worker had

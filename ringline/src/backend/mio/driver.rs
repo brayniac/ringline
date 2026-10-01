@@ -334,8 +334,9 @@ impl Driver {
         // address).
         let mut udp_sockets = Vec::with_capacity(config.udp_bind.len());
         for (i, addr) in config.udp_bind.iter().enumerate() {
-            let std_socket = bind_udp_with_reuseport(*addr, config.udp_gro)
-                .map_err(|e| io::Error::new(e.kind(), format!("UDP bind {addr}: {e}")))?;
+            let std_socket =
+                bind_udp_with_reuseport(*addr, config.udp_gro, config.take_udp_reserved(i))
+                    .map_err(|e| io::Error::new(e.kind(), format!("UDP bind {addr}: {e}")))?;
             std_socket.set_nonblocking(true)?;
             let mut mio_socket = mio::net::UdpSocket::from_std(std_socket);
             poll.registry().register(
@@ -910,8 +911,20 @@ impl Drop for Driver {
 /// `std::net::UdpSocket::bind` binds before any setsockopt can run, so it
 /// can't be used here — multi-worker setups bind every worker to the same
 /// port and need `SO_REUSEPORT` set before bind.
-fn bind_udp_with_reuseport(addr: SocketAddr, udp_gro: bool) -> io::Result<std::net::UdpSocket> {
+///
+/// `reserved` is a socket `launch` already bound to `addr`; it is used
+/// instead of creating and binding one.
+fn bind_udp_with_reuseport(
+    addr: SocketAddr,
+    udp_gro: bool,
+    reserved: Option<std::os::fd::OwnedFd>,
+) -> io::Result<std::net::UdpSocket> {
     use std::os::fd::FromRawFd;
+
+    if let Some(fd) = reserved {
+        set_udp_gro(&fd, udp_gro)?;
+        return Ok(std::net::UdpSocket::from(fd));
+    }
 
     let domain = if addr.is_ipv4() {
         libc::AF_INET
@@ -938,33 +951,18 @@ fn bind_udp_with_reuseport(addr: SocketAddr, udp_gro: bool) -> io::Result<std::n
         }
     }
 
-    let optval: libc::c_int = 1;
-    let rc = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_REUSEPORT,
-            &optval as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        )
-    };
-    if rc < 0 {
-        let err = io::Error::last_os_error();
-        unsafe { libc::close(fd) };
-        return Err(err);
-    }
-
-    // Enable UDP GRO (opt-in → hard-fail, mirroring the io_uring backend).
-    // GRO is Linux-only; on other platforms `udp_gro` is a no-op.
-    #[cfg(target_os = "linux")]
-    if udp_gro {
-        let on: libc::c_int = 1;
+    // SO_REUSEPORT lets every worker bind the same port. A zero port reaches
+    // a worker only when each worker should get its own port, and with the
+    // option set the free-port search can return a port another
+    // SO_REUSEPORT socket already holds, so it is left off then.
+    if addr.port() != 0 {
+        let optval: libc::c_int = 1;
         let rc = unsafe {
             libc::setsockopt(
                 fd,
-                libc::SOL_UDP,
-                crate::backend::udp_gro::UDP_GRO,
-                &on as *const _ as *const libc::c_void,
+                libc::SOL_SOCKET,
+                libc::SO_REUSEPORT,
+                &optval as *const _ as *const libc::c_void,
                 std::mem::size_of::<libc::c_int>() as libc::socklen_t,
             )
         };
@@ -974,19 +972,50 @@ fn bind_udp_with_reuseport(addr: SocketAddr, udp_gro: bool) -> io::Result<std::n
             return Err(err);
         }
     }
-    #[cfg(not(target_os = "linux"))]
-    let _ = udp_gro;
+
+    // SAFETY: `fd` is a socket this function just created and owns.
+    let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+    set_udp_gro(&fd, udp_gro)?;
 
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
     let addr_len = crate::backend::socket_addr_to_sockaddr(addr, &mut storage);
-    let rc = unsafe { libc::bind(fd, &storage as *const _ as *const libc::sockaddr, addr_len) };
+    let rc = unsafe {
+        libc::bind(
+            std::os::fd::AsRawFd::as_raw_fd(&fd),
+            &storage as *const _ as *const libc::sockaddr,
+            addr_len,
+        )
+    };
     if rc < 0 {
-        let err = io::Error::last_os_error();
-        unsafe { libc::close(fd) };
-        return Err(err);
+        return Err(io::Error::last_os_error());
     }
 
-    Ok(unsafe { std::net::UdpSocket::from_raw_fd(fd) })
+    Ok(std::net::UdpSocket::from(fd))
+}
+
+/// Enable UDP GRO on `fd` when `udp_gro` is set (opt-in, so a failure is an
+/// error, as on the io_uring backend). GRO is Linux-only; elsewhere this does
+/// nothing.
+fn set_udp_gro(fd: &std::os::fd::OwnedFd, udp_gro: bool) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    if udp_gro {
+        let on: libc::c_int = 1;
+        let rc = unsafe {
+            libc::setsockopt(
+                std::os::fd::AsRawFd::as_raw_fd(fd),
+                libc::SOL_UDP,
+                crate::backend::udp_gro::UDP_GRO,
+                &on as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (fd, udp_gro);
+    Ok(())
 }
 
 #[cfg(test)]
