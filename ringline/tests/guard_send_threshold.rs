@@ -19,7 +19,8 @@ use ringline::ConfigBuilder;
 use std::future::Future;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use ringline::{
     AsyncEventHandler, Config, Connection, GuardBox, ParseResult, RegionId, RinglineBuilder,
@@ -64,6 +65,94 @@ impl SendGuard for VecGuard {
     }
 }
 
+// ── Server-side trace, for a client timeout (#513) ──────────────────
+
+/// Handler steps as (client port, time, event), shared by every test in this
+/// binary (#513).
+///
+/// Each handler records its steps under the client's ephemeral port. When the
+/// client's read times out or ends short, it prints the steps recorded under
+/// its own local port. The tests run in parallel and share this list; the port
+/// separates their connections only while no two connections in the process
+/// use the same port, which is likely but not guaranteed.
+static TRACE: Mutex<Vec<(u16, Instant, String)>> = Mutex::new(Vec::new());
+
+/// The client's ephemeral port, read once when the handler starts. `0` if the
+/// connection has no TCP peer address.
+fn client_port(conn: &Connection) -> u16 {
+    match conn.peer_addr() {
+        Some(ringline::PeerAddr::Tcp(a)) => a.port(),
+        _ => 0,
+    }
+}
+
+fn trace(port: u16, event: impl Into<String>) {
+    let event = event.into();
+    TRACE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((port, Instant::now(), event));
+}
+
+/// The server-side steps for the client on `port` since `t0`, one per line.
+///
+/// With `timed_out_at`, steps recorded after that offset are marked, so a
+/// handler that ran late is distinguishable from one that never ran.
+fn trace_for(port: u16, t0: Instant, timed_out_at: Option<Duration>) -> String {
+    let trace = TRACE.lock().unwrap_or_else(|e| e.into_inner());
+    let steps: Vec<String> = trace
+        .iter()
+        .filter(|(p, at, _)| *p == port && *at >= t0)
+        .map(|(_, at, ev)| {
+            let offset = at.duration_since(t0);
+            let late = match timed_out_at {
+                Some(limit) if offset > limit => " (after the timeout)",
+                _ => "",
+            };
+            format!("  +{:.1}ms {ev}{late}", offset.as_secs_f64() * 1000.0)
+        })
+        .collect();
+    if steps.is_empty() {
+        format!(
+            "  (none recorded by +{:.1}ms)",
+            t0.elapsed().as_secs_f64() * 1000.0
+        )
+    } else {
+        steps.join("\n")
+    }
+}
+
+/// Opens a second connection to `addr`, sends the trigger, and reports what it
+/// received and what the handler recorded for it.
+///
+/// After a timeout this separates a server that still serves connections from
+/// one whose worker is stuck.
+fn probe(addr: &str, want: usize) -> String {
+    let t0 = Instant::now();
+    let mut stream = match TcpStream::connect(addr) {
+        Ok(s) => s,
+        Err(e) => return format!("probe: connect failed: {e}"),
+    };
+    let port = stream.local_addr().map(|a| a.port()).unwrap_or(0);
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let _ = stream.write_all(b"go");
+    let mut buf = vec![0u8; want];
+    let mut total = 0;
+    while total < want {
+        match stream.read(&mut buf[total..]) {
+            Ok(0) => break,
+            Ok(n) => total += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    format!(
+        "probe (client port {port}): received {total}/{want} bytes in {:.1}ms\n{}",
+        t0.elapsed().as_secs_f64() * 1000.0,
+        trace_for(port, t0, None)
+    )
+}
+
 // ── Handler ─────────────────────────────────────────────────────────
 
 /// On the first recv (trigger), sends copy(PREFIX) + guard(value of VLEN
@@ -75,9 +164,12 @@ struct GuardPartsSender<const VLEN: usize>;
 impl<const VLEN: usize> AsyncEventHandler for GuardPartsSender<VLEN> {
     fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
+            let port = client_port(&conn);
+            trace(port, "accepted");
             let n = conn
                 .with_data(|data| ParseResult::Consumed(data.len()))
                 .await;
+            trace(port, format!("trigger with_data -> {n} bytes"));
             if n == 0 {
                 return;
             }
@@ -86,14 +178,17 @@ impl<const VLEN: usize> AsyncEventHandler for GuardPartsSender<VLEN> {
             let result = conn
                 .send_parts()
                 .build(|b| b.copy(PREFIX).guard(guard).copy(SUFFIX).submit());
+            trace(port, format!("send_parts -> {result:?}"));
             if let Err(e) = result {
-                let _ = conn.send_nowait(format!("ERR:{e}").as_bytes());
+                let r = conn.send_nowait(format!("ERR:{e}").as_bytes());
+                trace(port, format!("ERR send_nowait -> {r:?}"));
             }
 
             // Keep the connection open until the client finishes reading.
             loop {
                 let n = conn.with_data(|d| ParseResult::Consumed(d.len())).await;
                 if n == 0 {
+                    trace(port, "client closed");
                     break;
                 }
             }
@@ -115,9 +210,12 @@ struct ChainGuardPartsSender<const VLEN: usize>;
 impl<const VLEN: usize> AsyncEventHandler for ChainGuardPartsSender<VLEN> {
     fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
+            let port = client_port(&conn);
+            trace(port, "accepted");
             let n = conn
                 .with_data(|data| ParseResult::Consumed(data.len()))
                 .await;
+            trace(port, format!("trigger with_data -> {n} bytes"));
             if n == 0 {
                 return;
             }
@@ -137,13 +235,16 @@ impl<const VLEN: usize> AsyncEventHandler for ChainGuardPartsSender<VLEN> {
                     .add()
                     .finish()
             });
+            trace(port, format!("send_chain_nowait -> {result:?}"));
             if let Err(e) = result {
-                let _ = conn.send_nowait(format!("ERR:{e}").as_bytes());
+                let r = conn.send_nowait(format!("ERR:{e}").as_bytes());
+                trace(port, format!("ERR send_nowait -> {r:?}"));
             }
 
             loop {
                 let n = conn.with_data(|d| ParseResult::Consumed(d.len())).await;
                 if n == 0 {
+                    trace(port, "client closed");
                     break;
                 }
             }
@@ -206,7 +307,9 @@ fn run_case_with<H: AsyncEventHandler + 'static, const VLEN: usize>(config: Conf
     let addr = bound.to_string();
     wait_for_server(&addr);
 
+    let t0 = Instant::now();
     let mut stream = TcpStream::connect(&addr).unwrap();
+    let port = stream.local_addr().unwrap().port();
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
@@ -223,12 +326,26 @@ fn run_case_with<H: AsyncEventHandler + 'static, const VLEN: usize>(config: Conf
             Ok(n) => total += n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                panic!("read timed out after 5s with {total}/{want} bytes")
+                let timed_out_at = t0.elapsed();
+                // Steps that land in this second show a late handler.
+                std::thread::sleep(Duration::from_secs(1));
+                let probe = probe(&addr, want);
+                panic!(
+                    "read timed out at +{:.1}ms with {total}/{want} bytes; server side \
+                     (client port {port}):\n{}\n{probe}",
+                    timed_out_at.as_secs_f64() * 1000.0,
+                    trace_for(port, t0, Some(timed_out_at))
+                )
             }
             Err(e) => panic!("read error: {e}"),
         }
     }
-    assert_eq!(total, want, "received {total} bytes");
+    assert_eq!(
+        total,
+        want,
+        "received {total} bytes; server side (client port {port}):\n{}",
+        trace_for(port, t0, None)
+    );
     assert!(
         !buf.starts_with(b"ERR:"),
         "server-side send_parts failed: {}",
