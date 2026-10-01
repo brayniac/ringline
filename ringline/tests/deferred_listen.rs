@@ -257,7 +257,7 @@ fn a_gated_listener_resolves_its_zero_port() {
 ///
 /// This does not prove that `shutdown` releases the gate. The acceptor
 /// thread is detached, so one parked on a gate does not hold up `join()` on
-/// the worker handles, and the listen fd is closed either way — verified by
+/// the worker handles, and the listener is shut down either way — verified by
 /// mutation: removing `Runtime::shutdown`'s call to
 /// `ListenGates::shutdown` leaves this test green. What that call prevents is
 /// a stranded acceptor thread, which this test does not observe. The mechanism

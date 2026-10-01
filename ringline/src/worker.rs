@@ -11,6 +11,7 @@ use std::thread;
 use crate::acceptor::{AcceptorConfig, run_acceptor};
 use crate::backend::AsyncEventLoop;
 use crate::config::Config;
+use crate::listener_sockets::ListenerSockets;
 use crate::runtime::handler::AsyncEventHandler;
 
 /// Result type for `launch` / `RinglineBuilder::launch` to avoid type-complexity warnings.
@@ -51,30 +52,6 @@ fn panic_payload(payload: &(dyn Any + Send)) -> String {
     }
 }
 
-/// Close listeners already bound when a later bind or acceptor spawn fails.
-///
-/// Without this a failure on the second `bind()` would leave the first socket
-/// listening with an acceptor thread feeding channels nobody drains — the
-/// port stays taken and peers get accepted into a runtime that is being torn
-/// down. `shutdown(SHUT_RD)` first for the same reason `Runtime` does
-/// it: it wakes a thread parked in `accept4` and frees the port immediately.
-fn close_listeners(listeners: &[ListenerHandle]) {
-    for listener in listeners {
-        if listener
-            .closed
-            .swap(true, std::sync::atomic::Ordering::AcqRel)
-        {
-            continue;
-        }
-        for &fd in &listener.fds {
-            unsafe {
-                libc::shutdown(fd, libc::SHUT_RD);
-                libc::close(fd);
-            }
-        }
-    }
-}
-
 fn rollback_workers(
     shutdown_flag: &Arc<AtomicBool>,
     worker_wake_fds: &[crate::wakeup::WakeFd],
@@ -96,16 +73,6 @@ fn rollback_workers(
     first_error
 }
 
-/// Duplicate `fd` with close-on-exec, as an owned descriptor.
-fn dup_cloexec(fd: RawFd) -> io::Result<OwnedFd> {
-    let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
-    if dup < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: `fcntl` returned a fresh descriptor nothing else owns.
-    Ok(unsafe { OwnedFd::from_raw_fd(dup) })
-}
-
 /// The error a failed `launch()` returns after rolling back the workers. A
 /// task panic on a worker, under `TaskPanicPolicy::Shutdown`, is what made
 /// the launch fail, so it wins over the error the launch saw.
@@ -116,18 +83,6 @@ fn launch_error(
     match joined {
         Some(panicked @ crate::error::Error::TaskPanicked(_)) => panicked,
         _ => error,
-    }
-}
-
-/// Close the merged-mode sockets of listeners at index `from` and later,
-/// which a failed `launch()` bound but never registered as listeners.
-fn close_merged_from(merged_sockets: &[(u32, Vec<RawFd>, Option<SocketAddr>)], from: usize) {
-    for (idx, fds, _) in merged_sockets {
-        if *idx as usize >= from {
-            for &fd in fds {
-                unsafe { libc::close(fd) };
-            }
-        }
     }
 }
 
@@ -161,10 +116,8 @@ pub struct Runtime {
     /// so the field layout is identical across backends.
     #[cfg_attr(not(has_io_uring), allow(dead_code))]
     region_registrar: Arc<crate::region_registry::RegionRegistrar>,
-    /// The listen gates, so `shutdown()` can release an acceptor parked on a
-    /// gate that was never opened. Closing the listen fd wakes a thread
-    /// inside `accept4`; it does not wake one parked in
-    /// `ListenGates::wait_open`.
+    /// The listen gates, for [`listen_handle`](Self::listen_handle).
+    /// `shutdown()` reaches them through `RuntimeShutdown`.
     listen_gates: Arc<crate::listen_gate::ListenGates>,
     /// The address of each UDP bind, in `Config::udp_bind` order: `Some` with a
     /// zero port replaced by the port the kernel chose, `None` for a connected
@@ -295,7 +248,11 @@ impl Runtime {
             if !listener.steerable {
                 continue;
             }
-            let Some(&fd) = listener.fds.first() else {
+            // Gone once the workers have exited after a shutdown.
+            let Some(sockets) = listener.sockets.upgrade() else {
+                continue;
+            };
+            let Some(fd) = sockets.fds().next() else {
                 continue;
             };
             // The program governs the whole group, so one member is enough.
@@ -412,7 +369,13 @@ impl Runtime {
     /// `Ok(())`, or [`Error::TaskPanicked`](crate::Error::TaskPanicked) under
     /// [`TaskPanicPolicy::Shutdown`](crate::TaskPanicPolicy::Shutdown) for a
     /// worker on which a task panicked.
-    /// Also closes the listen fd to unblock the acceptor's `accept()`.
+    ///
+    /// On Linux the listeners stop accepting at once. A listener's sockets
+    /// close, and its port is free, once the threads accepting on it have
+    /// exited: its acceptor thread, which exits at once, or in merged accept
+    /// mode the workers. This `Runtime` does not hold them open. On macOS a
+    /// blocked acceptor thread exits only when a peer connects, and the
+    /// listener keeps its port until then (#560).
     pub fn shutdown(&self) {
         self.shutdown.shutdown();
     }
@@ -424,9 +387,9 @@ impl Runtime {
 pub(crate) struct RuntimeShutdown {
     flag: Arc<AtomicBool>,
     listen_gates: Arc<crate::listen_gate::ListenGates>,
-    /// Each listener's fds and its close-once flag, added as `launch()`
-    /// creates the listeners.
-    listeners: std::sync::Mutex<Vec<(Vec<RawFd>, Arc<AtomicBool>)>>,
+    /// Each listener's sockets, added as `launch()` creates the listeners and
+    /// released by `shutdown()`.
+    listeners: std::sync::Mutex<Vec<Arc<ListenerSockets>>>,
     wake: crate::wakeup::WakeKeepAlive,
     /// Readable once a task panic has shut the runtime down;
     /// [`Runtime::wait_on_signal`] polls it alongside the signal pipe.
@@ -476,54 +439,36 @@ impl RuntimeShutdown {
         })
     }
 
-    fn add_listener(&self, fds: Vec<RawFd>, closed: Arc<AtomicBool>) {
+    fn add_listener(&self, sockets: Arc<ListenerSockets>) {
         self.listeners
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push((fds, closed));
-        // A shutdown that ran before this listener was added did not close
-        // it; run it again now that it is registered. Idempotent.
+            .push(sockets);
+        // A shutdown that ran before this listener was added did not shut it
+        // down; run it again now that it is added. Idempotent.
         if self.flag.load(Ordering::Acquire) {
             self.shutdown();
         }
     }
 
-    /// Set the shutdown flag, release the listen gates, close the listeners
-    /// and wake every worker. Idempotent.
+    /// Set the shutdown flag, release the listen gates, shut the listener
+    /// sockets down and wake every worker. Idempotent.
+    ///
+    /// Releases this struct's hold on the sockets, as `ListenGates::shutdown`
+    /// releases the gates'. They close when the threads that accept on them,
+    /// the acceptor or in merged mode the workers, have exited.
     pub(crate) fn shutdown(&self) {
         self.flag.store(true, Ordering::Release);
-        // Before the listen fds are closed: an acceptor parked on a gate that
-        // was never opened is not inside `accept4`, so closing its fd does
-        // not reach it. Releasing the gate first means it wakes, sees
-        // shutdown, and leaves without touching the fd.
+        // Before the sockets are shut down: an acceptor parked on a gate that
+        // was never opened is not inside `accept4`, so `SHUT_RD` does not
+        // reach it, and after this call no gate starts a socket listening.
         self.listen_gates.shutdown();
-        for (fds, closed) in self
-            .listeners
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-        {
-            if closed.swap(true, Ordering::AcqRel) {
-                continue;
-            }
-            for &fd in fds {
-                // shutdown(SHUT_RD) first: on Linux this wakes a thread
-                // blocked in accept4 (with EINVAL) and releases the bound
-                // port immediately. close(2) alone does neither: the
-                // in-progress syscall holds a file reference, so the
-                // acceptor stays parked and the socket stays listening
-                // until one more peer connects. The close below then runs
-                // after the acceptor can no longer loop into a reused fd
-                // number.
-                //
-                // In merged mode there is no acceptor thread, but a worker
-                // may be parked in the ring with a multishot accept armed on
-                // this fd; the same shutdown-then-close wakes it.
-                unsafe {
-                    libc::shutdown(fd, libc::SHUT_RD);
-                    libc::close(fd);
-                }
-            }
+        let listeners =
+            std::mem::take(&mut *self.listeners.lock().unwrap_or_else(|e| e.into_inner()));
+        for sockets in listeners {
+            // Wakes an acceptor blocked in `accept4`, and in merged mode ends
+            // the multishot accept a worker has armed on each socket.
+            sockets.shut_down();
         }
         // Wake all workers so they see the flag even if blocked on I/O.
         for wh in self.wake.iter() {
@@ -554,9 +499,8 @@ impl Drop for Runtime {
         // `shutdown()` is idempotent:
         //   * `shutdown_flag.store(true)` is monotonic — a second store
         //     is a no-op.
-        //   * The listen-fd close is gated by an `AtomicBool::swap`, so
-        //     a double-close is impossible whether `Drop` runs before
-        //     or after an explicit `shutdown()`.
+        //   * `ListenerSockets::shut_down` only sets a socket option and
+        //     calls `shutdown(SHUT_RD)`, both of which can repeat.
         //   * `WakeHandle::wake` after the workers have joined writes
         //     into a wake fd that is still open but unread; it never
         //     errors.
@@ -595,18 +539,17 @@ struct ListenerSpec {
 /// A listener the runtime owns, after binding. One per `bind*()` call, in
 /// call order, so its position is its [`ListenerId`](crate::ListenerId).
 struct ListenerHandle {
-    /// One fd in pool mode. In merged mode, one `SO_REUSEPORT` socket per
-    /// worker, all bound to the same address — the worker at index `i` accepts
-    /// on `fds[i]`.
-    fds: Vec<RawFd>,
-    /// Set once by whoever closes these fds — `shutdown()` or the acceptor
-    /// thread on exit — so the close happens exactly once.
-    closed: Arc<AtomicBool>,
+    /// One socket in pool mode. In merged mode, one `SO_REUSEPORT` socket per
+    /// worker, all bound to the same address. Weak, so the sockets close once
+    /// the threads accepting on them exit after a shutdown, while the
+    /// `Runtime` is still alive.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    sockets: std::sync::Weak<ListenerSockets>,
     /// `Some` for a TCP listener (after zero-port resolution), `None` for Unix.
     bound_addr: Option<SocketAddr>,
-    /// Whether `fds` form a `SO_REUSEPORT` group that can be steered — true
-    /// only for a merged-mode TCP listener, where `fds[i]` belongs to worker
-    /// `i`. A pool-mode listener has a single socket and no group to steer.
+    /// Whether `sockets` form a `SO_REUSEPORT` group that can be steered —
+    /// true only for a merged-mode TCP listener, where socket `i` belongs to
+    /// worker `i`. A pool-mode listener has a single socket and no group to steer.
     ///
     /// Only read by `set_worker_accepting`, which is Linux-only because
     /// reuseport steering is.
@@ -1302,13 +1245,13 @@ impl RinglineBuilder {
         // listener keeps its acceptor thread even in merged mode.
         let merged_mode =
             self.config.accept_mode == crate::config::AcceptMode::Merged && cfg!(has_io_uring);
-        let mut merged_sockets: Vec<(u32, Vec<RawFd>, Option<SocketAddr>)> = Vec::new();
+        let mut merged_sockets: Vec<(u32, Arc<ListenerSockets>, Option<SocketAddr>)> = Vec::new();
         if merged_mode {
             for (idx, spec) in pending_listeners.iter().enumerate() {
                 let BindAddr::Tcp(addr) = &spec.addr else {
                     continue;
                 };
-                let mut fds: Vec<RawFd> = Vec::with_capacity(num_threads);
+                let mut fds: Vec<OwnedFd> = Vec::with_capacity(num_threads);
                 let mut resolved: Option<SocketAddr> = None;
                 let mut failure = None;
                 for _ in 0..num_threads {
@@ -1316,7 +1259,7 @@ impl RinglineBuilder {
                     match bind_reuseport_socket(target) {
                         Ok(fd) => {
                             if resolved.is_none() {
-                                resolved = getsockname_v4_v6(fd);
+                                resolved = getsockname_v4_v6(fd.as_raw_fd());
                             }
                             fds.push(fd);
                         }
@@ -1327,18 +1270,10 @@ impl RinglineBuilder {
                     }
                 }
                 if let Some(e) = failure {
-                    for fd in fds {
-                        unsafe { libc::close(fd) };
-                    }
-                    for (_, fds, _) in &merged_sockets {
-                        for &fd in fds {
-                            unsafe { libc::close(fd) };
-                        }
-                    }
                     let joined = rollback_workers(&shutdown_flag, &worker_wake_fds, handles);
                     return Err(launch_error(joined, e));
                 }
-                merged_sockets.push((idx as u32, fds, resolved));
+                merged_sockets.push((idx as u32, ListenerSockets::new(fds), resolved));
             }
         }
         let merged_live = if merged_sockets.is_empty() {
@@ -1371,21 +1306,12 @@ impl RinglineBuilder {
 
         for worker_id in 0..num_threads {
             let mut config = self.config.clone();
-            // Each worker arms its accepts on its own copy of its socket, closed
-            // when the worker exits, so shutdown closing the shared fds cannot
-            // leave a worker arming on a closed or reused fd number.
-            let merged_fds: io::Result<Vec<(u32, Arc<OwnedFd>)>> = merged_sockets
+            // The worker holds every merged listener's sockets until it exits,
+            // so they stay open while it can arm an accept on its own one.
+            config.merged_listeners = merged_sockets
                 .iter()
-                .map(|(idx, fds, _)| dup_cloexec(fds[worker_id]).map(|fd| (*idx, Arc::new(fd))))
+                .map(|(idx, sockets, _)| (*idx, Arc::clone(sockets)))
                 .collect();
-            config.merged_accept_fds = match merged_fds {
-                Ok(fds) => fds,
-                Err(error) => {
-                    close_merged_from(&merged_sockets, 0);
-                    let joined = rollback_workers(&shutdown_flag, &worker_wake_fds, handles);
-                    return Err(launch_error(joined, crate::error::Error::Io(error)));
-                }
-            };
             config.merged_accept_live = merged_live.clone();
             // The worker's hold on every wake fd: `config` lives in the worker
             // thread until it exits. Its event loop reads its own wake fd by
@@ -1548,7 +1474,6 @@ impl RinglineBuilder {
             let handle = match spawn_result {
                 Ok(handle) => handle,
                 Err(error) => {
-                    close_merged_from(&merged_sockets, 0);
                     let joined = rollback_workers(&shutdown_flag, &worker_wake_fds, handles);
                     return Err(launch_error(joined, crate::error::Error::Io(error)));
                 }
@@ -1616,41 +1541,39 @@ impl RinglineBuilder {
                 // `getsockname` reports the port of a bound socket, so a
                 // zero-port bind still resolves here; merged mode relies on
                 // the same.
-                let created: Result<(Vec<RawFd>, Option<SocketAddr>), crate::error::Error> =
-                    match (&spec.addr, merged_entry) {
-                        (BindAddr::Tcp(_), Some((_, fds, resolved))) => {
-                            Ok((fds.clone(), *resolved))
-                        }
-                        (BindAddr::Tcp(addr), None) => {
-                            create_listener(*addr).map(|fd| (vec![fd], getsockname_v4_v6(fd)))
-                        }
-                        (BindAddr::Unix(path), _) => {
-                            create_unix_listener(path).map(|fd| (vec![fd], None))
-                        }
-                    };
-                let (fds, bound_addr) = match created {
+                let created: Result<
+                    (Arc<ListenerSockets>, Option<SocketAddr>),
+                    crate::error::Error,
+                > = match (&spec.addr, merged_entry) {
+                    (BindAddr::Tcp(_), Some((_, sockets, resolved))) => {
+                        Ok((Arc::clone(sockets), *resolved))
+                    }
+                    (BindAddr::Tcp(addr), None) => create_listener(*addr).map(|fd| {
+                        let bound = getsockname_v4_v6(fd.as_raw_fd());
+                        (ListenerSockets::new(vec![fd]), bound)
+                    }),
+                    (BindAddr::Unix(path), _) => {
+                        create_unix_listener(path).map(|fd| (ListenerSockets::new(vec![fd]), None))
+                    }
+                };
+                let (sockets, bound_addr) = match created {
                     Ok(created) => created,
                     Err(error) => {
-                        // Roll back the listeners already bound, or their ports
-                        // stay held and a listening socket keeps accepting into
-                        // workers that are being joined. Shut the gates
-                        // first, as `Runtime::shutdown` does: an acceptor
-                        // parked on a deferred gate is not woken by closing its fd.
-                        listen_gates.shutdown();
-                        close_listeners(&listeners);
-                        close_merged_from(&merged_sockets, idx + 1);
+                        // Shut down the listeners already bound, or a
+                        // listening socket keeps accepting into workers that
+                        // are being joined. Their sockets close as the
+                        // acceptors exit and `launch()` returns.
+                        runtime_shutdown.shutdown();
                         let joined = rollback_workers(&shutdown_flag, &worker_wake_fds, handles);
                         return Err(launch_error(joined, error));
                     }
                 };
 
-                let closed = Arc::new(AtomicBool::new(false));
-
                 // The gate owns the `listen(2)` call for these sockets from
                 // here on. `register` itself can listen: a handler whose
                 // `on_start` released this gate before `launch()` got here
                 // recorded the request, and `register` honours it.
-                let registered = listen_gates.register(idx as u32, fds.clone());
+                let registered = listen_gates.register(idx as u32, Arc::clone(&sockets));
                 if let Err(error) = registered.and_then(|()| {
                     if spec.defer_listen {
                         Ok(())
@@ -1658,38 +1581,31 @@ impl RinglineBuilder {
                         listen_gates.open(idx as u32)
                     }
                 }) {
-                    listen_gates.shutdown();
-                    close_listeners(&listeners);
-                    for &fd in &fds {
-                        unsafe { libc::close(fd) };
-                    }
-                    close_merged_from(&merged_sockets, idx + 1);
+                    runtime_shutdown.shutdown();
+                    // Not yet added to `runtime_shutdown`, and `register` may
+                    // have started it listening.
+                    sockets.shut_down();
                     let joined = rollback_workers(&shutdown_flag, &worker_wake_fds, handles);
                     return Err(launch_error(joined, crate::error::Error::Io(error)));
                 }
 
                 // Merged mode has no acceptor thread: the workers arm their own
-                // multishot accept on these fds. Record the listener and move on.
-                runtime_shutdown.add_listener(fds.clone(), closed.clone());
+                // multishot accept on these sockets. Record the listener and
+                // move on.
+                runtime_shutdown.add_listener(Arc::clone(&sockets));
                 if merged_entry.is_some() {
                     listeners.push(ListenerHandle {
-                        fds,
-                        closed,
+                        sockets: Arc::downgrade(&sockets),
                         bound_addr,
                         steerable: true,
                     });
                     continue;
                 }
 
-                let listen_fd = fds[0];
-                let acceptor_closed = closed.clone();
-                // The acceptor accepts on its own copy of the socket and closes
-                // it when it exits. Shutdown and rollback wake it with
-                // `shutdown(SHUT_RD)` on the shared socket and close only
-                // `listen_fd`, so it never accepts on a closed fd number.
-                let spawn_result = dup_cloexec(listen_fd).and_then(|acceptor_fd| {
+                let acceptor_sockets = Arc::clone(&sockets);
+                let spawn_result = {
                     let acceptor_config = AcceptorConfig {
-                        listen_fd: acceptor_fd,
+                        sockets: Arc::clone(&sockets),
                         listener: crate::ListenerId::from_index(idx as u32),
                         worker_channels: worker_txs.clone(),
                         worker_wake_handles: worker_wake_handles.clone(),
@@ -1705,31 +1621,21 @@ impl RinglineBuilder {
                         .name(format!("ringline-acceptor-{idx}"))
                         .spawn(move || {
                             run_acceptor(acceptor_config);
-                            if !acceptor_closed.swap(true, Ordering::AcqRel) {
-                                unsafe {
-                                    libc::shutdown(listen_fd, libc::SHUT_RD);
-                                    libc::close(listen_fd);
-                                }
-                            }
+                            // An acceptor that stops on its own, because every
+                            // worker has exited, must not leave the socket
+                            // listening with nothing accepting.
+                            acceptor_sockets.shut_down();
                         })
-                });
+                };
 
                 if let Err(error) = spawn_result {
-                    if !closed.swap(true, Ordering::AcqRel) {
-                        unsafe {
-                            libc::close(listen_fd);
-                        }
-                    }
-                    listen_gates.shutdown();
-                    close_listeners(&listeners);
-                    close_merged_from(&merged_sockets, idx + 1);
+                    runtime_shutdown.shutdown();
                     let joined = rollback_workers(&shutdown_flag, &worker_wake_fds, handles);
                     return Err(launch_error(joined, crate::error::Error::Io(error)));
                 }
 
                 listeners.push(ListenerHandle {
-                    fds,
-                    closed,
+                    sockets: Arc::downgrade(&sockets),
                     bound_addr,
                     steerable: false,
                 });
@@ -1960,16 +1866,14 @@ fn pin_to_core(_core: usize) -> Result<(), crate::error::Error> {
 /// A bound-but-not-listening socket holds the port reservation but takes no
 /// connections, which is how `launch()` resolves a port-0 bind for merged mode
 /// without opening a listener before the workers are ready.
-fn bind_reuseport_socket(addr: SocketAddr) -> Result<RawFd, crate::error::Error> {
+fn bind_reuseport_socket(addr: SocketAddr) -> Result<OwnedFd, crate::error::Error> {
     let domain = if addr.is_ipv4() {
         libc::AF_INET
     } else {
         libc::AF_INET6
     };
-    let fd = unsafe { libc::socket(domain, libc::SOCK_STREAM, 0) };
-    if fd < 0 {
-        return Err(crate::error::Error::Io(io::Error::last_os_error()));
-    }
+    let owned = stream_socket(domain).map_err(crate::error::Error::Io)?;
+    let fd = owned.as_raw_fd();
     let optval: libc::c_int = 1;
     for opt in [libc::SO_REUSEADDR, libc::SO_REUSEPORT] {
         let ret = unsafe {
@@ -1982,9 +1886,7 @@ fn bind_reuseport_socket(addr: SocketAddr) -> Result<RawFd, crate::error::Error>
             )
         };
         if ret < 0 {
-            let err = io::Error::last_os_error();
-            unsafe { libc::close(fd) };
-            return Err(crate::error::Error::Io(err));
+            return Err(crate::error::Error::Io(io::Error::last_os_error()));
         }
     }
 
@@ -1992,9 +1894,32 @@ fn bind_reuseport_socket(addr: SocketAddr) -> Result<RawFd, crate::error::Error>
     let addr_len = crate::backend::socket_addr_to_sockaddr(addr, &mut storage);
     let ret = unsafe { libc::bind(fd, &storage as *const _ as *const libc::sockaddr, addr_len) };
     if ret < 0 {
-        let err = io::Error::last_os_error();
-        unsafe { libc::close(fd) };
-        return Err(crate::error::Error::Io(err));
+        return Err(crate::error::Error::Io(io::Error::last_os_error()));
+    }
+    Ok(owned)
+}
+
+/// A new close-on-exec stream socket in `domain`.
+///
+/// Close-on-exec, so a process spawned while the runtime runs does not inherit
+/// a listener and hold its port open after the runtime has shut it down.
+fn stream_socket(domain: libc::c_int) -> io::Result<OwnedFd> {
+    #[cfg(target_os = "linux")]
+    let sock_type = libc::SOCK_STREAM | libc::SOCK_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    let sock_type = libc::SOCK_STREAM;
+    let raw = unsafe { libc::socket(domain, sock_type, 0) };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `raw` is a socket this function just created and owns.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    #[cfg(not(target_os = "linux"))]
+    unsafe {
+        let flags = libc::fcntl(fd.as_raw_fd(), libc::F_GETFD);
+        if flags < 0 || libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, flags | libc::FD_CLOEXEC) < 0 {
+            return Err(io::Error::last_os_error());
+        }
     }
     Ok(fd)
 }
@@ -2105,17 +2030,15 @@ fn reserve_udp_port(addr: SocketAddr) -> io::Result<(std::os::fd::OwnedFd, Socke
 /// SO_REUSEADDR is set for the bind and cleared immediately after it, so the
 /// port is not open to a second binder while the socket is not yet
 /// listening. `ListenGates` sets it again just before `listen(2)`.
-pub(crate) fn create_listener(addr: SocketAddr) -> Result<RawFd, crate::error::Error> {
+pub(crate) fn create_listener(addr: SocketAddr) -> Result<OwnedFd, crate::error::Error> {
     let domain = if addr.is_ipv4() {
         libc::AF_INET
     } else {
         libc::AF_INET6
     };
 
-    let fd = unsafe { libc::socket(domain, libc::SOCK_STREAM, 0) };
-    if fd < 0 {
-        return Err(crate::error::Error::Io(io::Error::last_os_error()));
-    }
+    let owned = stream_socket(domain).map_err(crate::error::Error::Io)?;
+    let fd = owned.as_raw_fd();
 
     // Set SO_REUSEADDR only (no SO_REUSEPORT).
     let optval: libc::c_int = 1;
@@ -2135,11 +2058,7 @@ pub(crate) fn create_listener(addr: SocketAddr) -> Result<RawFd, crate::error::E
 
     let ret = unsafe { libc::bind(fd, &storage as *const _ as *const libc::sockaddr, addr_len) };
     if ret < 0 {
-        let err = io::Error::last_os_error();
-        unsafe {
-            libc::close(fd);
-        }
-        return Err(crate::error::Error::Io(err));
+        return Err(crate::error::Error::Io(io::Error::last_os_error()));
     }
 
     // Clear SO_REUSEADDR now that the bind has succeeded, so the port is
@@ -2178,32 +2097,31 @@ pub(crate) fn create_listener(addr: SocketAddr) -> Result<RawFd, crate::error::E
         );
     }
 
-    Ok(fd)
+    Ok(owned)
 }
 
 /// Create a Unix domain socket listener at the given path.
 ///
 /// Unlinks any existing socket file before binding.
-fn create_unix_listener(path: &Path) -> Result<RawFd, crate::error::Error> {
+fn create_unix_listener(path: &Path) -> Result<OwnedFd, crate::error::Error> {
     // Remove existing socket file if present (ignore errors — path may not exist).
     let _ = std::fs::remove_file(path);
 
-    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
-    if fd < 0 {
-        return Err(crate::error::Error::Io(io::Error::last_os_error()));
-    }
+    let fd = stream_socket(libc::AF_UNIX).map_err(crate::error::Error::Io)?;
 
     // Bind using the driver's sockaddr helper.
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
     let addr_len = crate::backend::unix_path_to_sockaddr(path, &mut storage);
 
-    let ret = unsafe { libc::bind(fd, &storage as *const _ as *const libc::sockaddr, addr_len) };
+    let ret = unsafe {
+        libc::bind(
+            fd.as_raw_fd(),
+            &storage as *const _ as *const libc::sockaddr,
+            addr_len,
+        )
+    };
     if ret < 0 {
-        let err = io::Error::last_os_error();
-        unsafe {
-            libc::close(fd);
-        }
-        return Err(crate::error::Error::Io(err));
+        return Err(crate::error::Error::Io(io::Error::last_os_error()));
     }
 
     Ok(fd)

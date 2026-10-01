@@ -22,11 +22,11 @@
 
 use std::cell::RefCell;
 use std::io;
-use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use crate::handler::ListenerId;
+use crate::listener_sockets::ListenerSockets;
 
 /// The listen gates for one runtime, one entry per `bind*()` call.
 pub(crate) struct ListenGates {
@@ -40,14 +40,9 @@ pub(crate) struct ListenGates {
 }
 
 struct GateInner {
-    /// The sockets to `listen(2)` when a gate opens: one per listener in pool
-    /// mode, one per worker per listener in merged mode. Empty for a listener
-    /// until `launch()` has bound it.
-    fds: Vec<Vec<RawFd>>,
-    /// Whether `launch()` has bound this listener and recorded its sockets.
-    /// Tracked separately from `fds` being non-empty, so an empty socket list
-    /// cannot be mistaken for a registered one.
-    registered: Vec<bool>,
+    /// The sockets to `listen(2)` when a gate opens. `None` for a listener
+    /// until `launch()` has bound it, and for every listener after shutdown.
+    sockets: Vec<Option<Arc<ListenerSockets>>>,
     /// Whether a handler asked for this listener before it was registered.
     /// `register` performs the listen for anything marked here.
     requested: Vec<bool>,
@@ -63,8 +58,7 @@ impl ListenGates {
         Arc::new(ListenGates {
             open: (0..listeners).map(|_| AtomicBool::new(false)).collect(),
             inner: Mutex::new(GateInner {
-                fds: vec![Vec::new(); listeners],
-                registered: vec![false; listeners],
+                sockets: vec![None; listeners],
                 requested: vec![false; listeners],
                 listened: vec![false; listeners],
                 backlog,
@@ -79,16 +73,19 @@ impl ListenGates {
     /// If a handler already called [`open`](Self::open) for this listener,
     /// that call recorded its intent and this one performs the `listen(2)`,
     /// so the error surfaces to `launch()`.
-    pub(crate) fn register(&self, listener: u32, fds: Vec<RawFd>) -> io::Result<()> {
+    pub(crate) fn register(&self, listener: u32, sockets: Arc<ListenerSockets>) -> io::Result<()> {
         let idx = listener as usize;
         {
             let mut inner = self.lock();
-            inner.fds[idx] = fds;
-            inner.registered[idx] = true;
-            if inner.shutdown || inner.listened[idx] || !inner.requested[idx] {
+            if inner.shutdown {
                 return Ok(());
             }
-            listen_all(&mut inner, idx)?;
+            inner.sockets[idx] = Some(Arc::clone(&sockets));
+            if inner.listened[idx] || !inner.requested[idx] {
+                return Ok(());
+            }
+            listen_all(&sockets, inner.backlog)?;
+            inner.listened[idx] = true;
         }
         self.publish(idx);
         Ok(())
@@ -123,7 +120,7 @@ impl ListenGates {
             if inner.listened[idx] {
                 return Ok(());
             }
-            if !inner.registered[idx] {
+            let Some(sockets) = inner.sockets[idx].clone() else {
                 // `launch()` has not bound this listener yet. A worker signals
                 // startup and then enters its event loop, which polls
                 // `on_start` on the first iteration, so a handler that
@@ -134,8 +131,9 @@ impl ListenGates {
                 // the acceptor to fail `accept4` with EINVAL and exit.
                 inner.requested[idx] = true;
                 return Ok(());
-            }
-            listen_all(&mut inner, idx)?;
+            };
+            listen_all(&sockets, inner.backlog)?;
+            inner.listened[idx] = true;
         }
         self.publish(idx);
         Ok(())
@@ -161,7 +159,7 @@ impl ListenGates {
     /// Block until this listener's gate opens, or the runtime shuts down.
     ///
     /// Returns `true` if the gate opened. A `false` return means shutdown, and
-    /// the caller must not touch the listen fd — it may already be closed.
+    /// the listener's sockets may never have listened.
     pub(crate) fn wait_open(&self, listener: u32) -> bool {
         let idx = listener as usize;
         // The common case is a gate that was opened during `launch()`, which
@@ -188,14 +186,23 @@ impl ListenGates {
 
     /// Release every waiter.
     ///
-    /// Called by `Runtime::shutdown` before it closes the listen fds.
-    /// Closing an fd wakes a thread inside `accept4`; it does not wake a
-    /// thread waiting in `wait_open`.
+    /// Called by `Runtime::shutdown` before it shuts the listener sockets
+    /// down. [`ListenerSockets::shut_down`] wakes a thread inside `accept4`;
+    /// it does not wake a thread waiting in `wait_open`. After this call no
+    /// gate calls `listen(2)`.
     pub(crate) fn shutdown(&self) {
-        {
+        let released = {
             let mut inner = self.lock();
             inner.shutdown = true;
-        }
+            // Release the gates' hold on the sockets, so a `ListenHandle`
+            // that outlives the runtime does not keep them open.
+            inner
+                .sockets
+                .iter_mut()
+                .map(Option::take)
+                .collect::<Vec<_>>()
+        };
+        drop(released);
         self.cv.notify_all();
     }
 
@@ -207,15 +214,14 @@ impl ListenGates {
     }
 }
 
-/// `listen(2)` every socket of one listener, then mark it listened.
+/// `listen(2)` every socket of one listener.
 ///
-/// Marks the listener listened only if every socket listened. On a failure the
-/// sockets before it stay listening and the gate stays closed; a retry calls
-/// `listen(2)` on all of them again, which Linux accepts on a socket that is
-/// already listening.
-fn listen_all(inner: &mut GateInner, idx: usize) -> io::Result<()> {
-    let backlog = inner.backlog;
-    for &fd in &inner.fds[idx] {
+/// The caller marks the listener listened only if this returns `Ok`. On a
+/// failure the sockets before it stay listening and the gate stays closed; a
+/// retry calls `listen(2)` on all of them again, which Linux accepts on a
+/// socket that is already listening.
+fn listen_all(sockets: &ListenerSockets, backlog: i32) -> io::Result<()> {
+    for fd in sockets.fds() {
         // `create_listener` clears SO_REUSEADDR after bind so a held port is
         // reserved. It must be set again here: Linux re-runs the port conflict
         // check in `listen(2)` with the socket's current flag, and without it
@@ -240,7 +246,6 @@ fn listen_all(inner: &mut GateInner, idx: usize) -> io::Result<()> {
             return Err(io::Error::last_os_error());
         }
     }
-    inner.listened[idx] = true;
     Ok(())
 }
 
@@ -382,35 +387,26 @@ pub fn begin_listening_all() -> io::Result<()> {
 mod tests {
     use super::*;
 
-    /// A socketpair fd stands in for a listener: `listen(2)` fails on it, so
+    /// A socketpair end stands in for a listener: `listen(2)` fails on it, so
     /// the bookkeeping tests can check that the gate does not publish when the
     /// syscall fails.
-    fn dead_fd() -> RawFd {
-        let mut fds = [0 as libc::c_int; 2];
-        assert_eq!(
-            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) },
-            0
-        );
-        unsafe { libc::close(fds[1]) };
-        fds[0]
+    fn unlistenable() -> Arc<ListenerSockets> {
+        let (a, _b) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        ListenerSockets::new(vec![a.into()])
     }
 
-    fn listenable_fd() -> RawFd {
+    fn listenable() -> Arc<ListenerSockets> {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        // Take the fd; the socket outlives the listener object.
-        let fd = unsafe { libc::dup(std::os::fd::AsRawFd::as_raw_fd(&listener)) };
-        assert!(fd >= 0);
-        fd
+        ListenerSockets::new(vec![listener.into()])
     }
 
     /// Gates with every listener registered on a listenable socket, as
     /// `launch()` leaves them. `open` does not publish an unregistered gate,
-    /// so tests of the open path start here. The fds are leaked; the test
-    /// process reaps them.
+    /// so tests of the open path start here. The gates own the sockets.
     fn registered_gates(listeners: usize) -> Arc<ListenGates> {
         let gates = ListenGates::new(listeners, 128);
         for id in 0..listeners as u32 {
-            gates.register(id, vec![listenable_fd()]).expect("register");
+            gates.register(id, listenable()).expect("register");
         }
         gates
     }
@@ -439,22 +435,19 @@ mod tests {
     #[test]
     fn opening_twice_is_a_no_op() {
         let gates = ListenGates::new(1, 128);
-        let fd = listenable_fd();
-        gates.register(0, vec![fd]).expect("register");
+        gates.register(0, listenable()).expect("register");
         gates.open(0).expect("first open");
         // The second call must not reach `listen(2)` again — on Linux a second
         // listen on a listening socket succeeds, so the assertion that matters
         // is that the gate stays open and no error is produced.
         gates.open(0).expect("second open");
         assert!(gates.is_open(0));
-        unsafe { libc::close(fd) };
     }
 
     #[test]
     fn a_failed_listen_leaves_the_gate_closed() {
         let gates = ListenGates::new(1, 128);
-        let fd = dead_fd();
-        gates.register(0, vec![fd]).expect("register");
+        gates.register(0, unlistenable()).expect("register");
         assert!(gates.open(0).is_err(), "listen on a socketpair must fail");
         assert!(
             !gates.is_open(0),
@@ -462,7 +455,6 @@ mod tests {
         );
         // Retryable: the bookkeeping did not record a listen that never happened.
         assert!(gates.open(0).is_err());
-        unsafe { libc::close(fd) };
     }
 
     #[test]
@@ -540,13 +532,11 @@ mod tests {
             "a gate with no sockets yet must not publish"
         );
 
-        let fd = listenable_fd();
-        gates.register(0, vec![fd]).expect("register");
+        gates.register(0, listenable()).expect("register");
         assert!(
             gates.is_open(0),
             "register must honour a release that arrived first"
         );
-        unsafe { libc::close(fd) };
     }
 
     /// The same path, for a listener nobody asked for: registering must not
@@ -554,13 +544,11 @@ mod tests {
     #[test]
     fn registering_does_not_open_a_gate_nobody_released() {
         let gates = ListenGates::new(1, 128);
-        let fd = listenable_fd();
-        gates.register(0, vec![fd]).expect("register");
+        gates.register(0, listenable()).expect("register");
         assert!(
             !gates.is_open(0),
             "register must not open an unreleased gate"
         );
-        unsafe { libc::close(fd) };
     }
 
     /// Leave a TIME_WAIT connection on a loopback port and return the port.
@@ -606,12 +594,13 @@ mod tests {
         let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         let fd = crate::worker::create_listener(addr).expect("create_listener");
         let gates = ListenGates::new(1, 128);
-        gates.register(0, vec![fd]).expect("register");
+        gates
+            .register(0, ListenerSockets::new(vec![fd]))
+            .expect("register");
         gates
             .open(0)
             .expect("listen must succeed over a TIME_WAIT connection");
         assert!(gates.is_open(0));
-        unsafe { libc::close(fd) };
     }
 
     /// While a deferred listener is held, another socket must not be able to
@@ -624,7 +613,11 @@ mod tests {
         let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
         assert_eq!(
             unsafe {
-                libc::getsockname(fd, &mut storage as *mut _ as *mut libc::sockaddr, &mut len)
+                libc::getsockname(
+                    std::os::fd::AsRawFd::as_raw_fd(&fd),
+                    &mut storage as *mut _ as *mut libc::sockaddr,
+                    &mut len,
+                )
             },
             0
         );
@@ -642,10 +635,8 @@ mod tests {
         }
         let ret = unsafe { libc::bind(other, &storage as *const _ as *const libc::sockaddr, len) };
         let err = io::Error::last_os_error();
-        unsafe {
-            libc::close(other);
-            libc::close(fd);
-        }
+        unsafe { libc::close(other) };
+        drop(fd);
         assert!(ret < 0, "a second bind succeeded on a held listener's port");
         assert_eq!(
             err.raw_os_error(),

@@ -6,8 +6,8 @@
 //! in the same process would be counted too.
 //!
 //! It fails the second bind, so it covers the bind-failure rollback. The
-//! register and acceptor-spawn failure paths call the same
-//! `listen_gates.shutdown()` and have no test of their own.
+//! register and acceptor-spawn failure paths shut the runtime down the same
+//! way and have no test of their own.
 //!
 //! Linux only: it reads `/proc/self/task`.
 
@@ -56,8 +56,8 @@ fn acceptor_threads() -> usize {
 }
 
 /// The first listener is deferred, so its acceptor parks on the gate. The
-/// second bind fails, and the rollback must shut the gates as well as close
-/// the listeners and join the workers.
+/// second bind fails, and the rollback must shut the gates as well as shut
+/// the listeners down and join the workers.
 #[test]
 fn a_failed_launch_releases_a_parked_acceptor() {
     let taken = TcpListener::bind("127.0.0.1:0").expect("bind");

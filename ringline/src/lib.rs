@@ -163,6 +163,7 @@ pub(crate) mod disk_io_pool;
 #[cfg_attr(not(has_io_uring), allow(dead_code))]
 pub mod fs;
 pub(crate) mod listen_gate;
+pub(crate) mod listener_sockets;
 #[cfg(any(has_io_uring, test))]
 pub(crate) mod memlock;
 pub mod metrics;

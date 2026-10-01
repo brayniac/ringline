@@ -262,13 +262,16 @@ cancels an armed multishot receive, and only then finalizes close. Stale CQEs
 are normal during teardown and must release only their own backing without
 touching a reused connection.
 
-`Runtime::shutdown` sets a shared atomic flag, calls
-`shutdown(SHUT_RD)` and `close` on the listener once, and wakes every worker.
-The explicit socket shutdown is required to release a Linux acceptor blocked in
-`accept4`; closing alone is insufficient. Dropping `Runtime` invokes the
-same idempotent path. io_uring workers observe shutdown after draining a CQE
-batch and run backend shutdown drainage; Mio workers finish the current
-event/task/send/close cycle before returning.
+`Runtime::shutdown` sets a shared atomic flag, releases the listen gates, sets
+`SO_REUSEADDR` and calls `shutdown(SHUT_RD)` on each listener socket, and wakes
+every worker. On Linux `SHUT_RD` wakes an acceptor blocked in `accept4` and
+takes the socket out of the listening state. Each listener's sockets are owned
+by a shared `ListenerSockets`. Every thread that passes their fd numbers to a
+syscall holds it, and the sockets close when the last holder drops it: after
+shutdown, when the acceptor thread or, in merged accept mode, the workers
+exit. Dropping `Runtime` invokes the same idempotent path. io_uring workers
+observe shutdown after draining a CQE batch and run backend shutdown drainage;
+Mio workers finish the current event/task/send/close cycle before returning.
 
 Startup failures are returned from `launch`: workers acknowledge backend
 preparation before the listener exists, and a failed worker, listener bind, or

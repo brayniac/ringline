@@ -584,7 +584,7 @@ impl AsyncEventHandler for ConnectionPanics {
 /// `wait_on_signal` installs ringline's `SIGINT`/`SIGTERM` handlers, so after
 /// this test Ctrl-C no longer stops this test binary.
 #[test]
-fn shutdown_closes_the_listener_and_wakes_wait_on_signal() {
+fn shutdown_stops_the_listener_and_wakes_wait_on_signal() {
     let (runtime, handles) = RinglineBuilder::new(config(2, TaskPanicPolicy::Shutdown))
         .bind("127.0.0.1:0".parse().unwrap())
         .launch::<ConnectionPanics>()

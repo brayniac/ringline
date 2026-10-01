@@ -243,12 +243,16 @@ pub struct Config {
     pub(crate) accept_mode: AcceptMode,
     /// What a worker does when a task panics.
     pub(crate) task_panic_policy: crate::TaskPanicPolicy,
-    /// Merged accept mode: this worker's own `SO_REUSEPORT` listener sockets,
-    /// as `(listener index, fd)`. Bound but **not** listening when the worker
-    /// starts — `launch()` calls `listen(2)` only once every worker has
-    /// reported ready, so "listening" and "ready to serve" are the same
-    /// instant. Empty in pool mode and in client-only mode.
-    pub(crate) merged_accept_fds: Vec<(u32, std::sync::Arc<std::os::fd::OwnedFd>)>,
+    /// Merged accept mode: every merged listener's `SO_REUSEPORT` sockets, as
+    /// `(listener index, sockets)`; the worker at index `i` accepts on socket
+    /// `i`. Bound but **not** listening when the worker starts — `launch()`
+    /// calls `listen(2)` only once every worker has reported ready, so
+    /// "listening" and "ready to serve" are the same instant. Empty in pool
+    /// mode and in client-only mode.
+    pub(crate) merged_listeners: Vec<(
+        u32,
+        std::sync::Arc<crate::listener_sockets::ListenerSockets>,
+    )>,
     /// Set by `launch()` after it has called `listen(2)` on every merged
     /// socket. Until then a worker must not arm an accept: accept on a
     /// bound-but-unlistening socket fails with `EINVAL`.
@@ -456,7 +460,7 @@ impl Default for Config {
             tcp_nodelay: true,
             accept_mode: AcceptMode::Pool,
             task_panic_policy: crate::TaskPanicPolicy::Contain,
-            merged_accept_fds: Vec::new(),
+            merged_listeners: Vec::new(),
             merged_accept_live: None,
             wake_keep_alive: None,
             runtime_shutdown: None,

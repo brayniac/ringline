@@ -215,7 +215,7 @@ pub fn verify_source_claims(root: &Path) -> io::Result<()> {
     // gate the acceptor then waits on.
     require_order(
         &worker,
-        "listen_gates.register(idx as u32, fds.clone())",
+        "listen_gates.register(idx as u32, Arc::clone(&sockets))",
         ".name(format!(\"ringline-acceptor-{idx}\"))",
         "a listener's sockets are registered with its gate before its acceptor starts",
     )?;

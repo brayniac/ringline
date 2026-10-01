@@ -17,11 +17,10 @@ pub struct AcceptedConn {
 
 /// Configuration for one acceptor thread.
 pub struct AcceptorConfig {
-    /// This acceptor's own copy of the listening socket, closed when the
-    /// acceptor exits. Shutdown and rollback reach it through the shared
-    /// socket with `shutdown(SHUT_RD)` and close only their own copy, so the
-    /// acceptor never accepts on a closed or reused fd number.
-    pub listen_fd: std::os::fd::OwnedFd,
+    /// The listener's socket. The acceptor's hold keeps it open while the
+    /// acceptor runs. Shutdown wakes it from `accept4` with
+    /// [`ListenerSockets::shut_down`](crate::listener_sockets::ListenerSockets::shut_down).
+    pub sockets: Arc<crate::listener_sockets::ListenerSockets>,
     /// Which listener this acceptor serves. Travels with every accepted fd so
     /// the handler can tell connections from different listeners apart.
     pub listener: crate::ListenerId,
@@ -35,8 +34,8 @@ pub struct AcceptorConfig {
     #[allow(dead_code)] // stored for future use; acceptor currently uses channel disconnect
     pub shutdown_flag: Arc<AtomicBool>,
     /// The runtime's listen gates. This acceptor waits on its gate before
-    /// accepting. `ListenGates::open` calls `listen(2)`; until it runs,
-    /// `listen_fd` is bound and not listening.
+    /// accepting. `ListenGates::open` calls `listen(2)`; until it runs, the
+    /// socket is bound and not listening.
     pub listen_gates: Arc<crate::listen_gate::ListenGates>,
     /// Whether to set TCP_NODELAY on accepted connections.
     pub tcp_nodelay: bool,
@@ -110,8 +109,7 @@ pub fn run_acceptor(config: AcceptorConfig) {
     // listening, and `accept4` on it would fail with EINVAL, which ends the
     // acceptor loop.
     //
-    // A `false` return is shutdown, and the listen fd may already be closed,
-    // so the thread returns without touching it.
+    // A `false` return is shutdown, and the socket may never have listened.
     if !config.listen_gates.wait_open(config.listener.index()) {
         return;
     }
@@ -126,11 +124,7 @@ pub fn run_acceptor(config: AcceptorConfig) {
         let mut addr_len: libc::socklen_t =
             std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
 
-        let fd = accept_nonblock(
-            std::os::fd::AsRawFd::as_raw_fd(&config.listen_fd),
-            &mut addr_storage,
-            &mut addr_len,
-        );
+        let fd = accept_nonblock(config.sockets.fd(0), &mut addr_storage, &mut addr_len);
 
         if fd < 0 {
             let err = std::io::Error::last_os_error();
@@ -147,7 +141,7 @@ pub fn run_acceptor(config: AcceptorConfig) {
                     continue;
                 }
                 _ => {
-                    // Fatal accept error or listen fd closed.
+                    // Fatal accept error, or the socket was shut down.
                     return;
                 }
             }
@@ -283,7 +277,7 @@ mod tests {
     /// This is the mechanism `Runtime::shutdown` relies on. It cannot
     /// be tested through the public API: the acceptor thread is detached, so a
     /// parked one does not hold up `join()` on the worker handles, and the
-    /// listen fd is closed by `shutdown` whether the thread woke or not. The
+    /// listener is shut down by `shutdown` whether the thread woke or not. The
     /// leak is a stranded thread, which no observable API state reflects.
     #[test]
     fn a_gated_acceptor_exits_on_shutdown() {
@@ -298,9 +292,7 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::bounded::<AcceptedConn>(1);
 
         let config = AcceptorConfig {
-            listen_fd: std::os::fd::AsFd::as_fd(&listener)
-                .try_clone_to_owned()
-                .expect("dup the listener"),
+            sockets: crate::listener_sockets::ListenerSockets::new(vec![listener.into()]),
             listener: crate::ListenerId::from_index(0),
             worker_channels: vec![tx],
             worker_wake_handles: Vec::new(),
@@ -334,52 +326,30 @@ mod tests {
         handle.join().expect("acceptor panicked");
     }
 
-    /// Shutdown or rollback closes the shared listener fd, possibly before the
-    /// acceptor reaches `accept4`, and the number can be reused at once. The
-    /// acceptor accepts on its own copy, which `shutdown(SHUT_RD)` has already
-    /// ended, so it exits without touching whatever socket now holds the old
-    /// number.
+    /// `Runtime::shutdown` wakes an acceptor blocked in `accept4` by shutting
+    /// its listener's sockets down, and leaves the fd open for the acceptor to
+    /// drop.
     ///
-    /// Linux only: the test relies on `accept4` failing after
-    /// `shutdown(SHUT_RD)`, which is what lets the acceptor exit. Other
-    /// platforms keep the acceptor blocked on its own copy until a peer
-    /// connects (see `accept_nonblock`).
+    /// Linux only: other platforms keep the acceptor blocked until a peer
+    /// connects (#560).
     #[cfg(target_os = "linux")]
     #[test]
-    fn an_acceptor_never_accepts_on_a_reused_fd_number() {
+    fn shutting_the_sockets_down_ends_a_blocked_acceptor() {
         use std::sync::atomic::AtomicBool;
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let shared_fd = listener.as_raw_fd();
-        let acceptor_fd = std::os::fd::AsFd::as_fd(&listener)
-            .try_clone_to_owned()
-            .expect("dup the listener");
+        let sockets = crate::listener_sockets::ListenerSockets::new(vec![listener.into()]);
         let gates = crate::listen_gate::ListenGates::new(1, 128);
-        gates.register(0, vec![shared_fd]).expect("register");
+        gates.register(0, Arc::clone(&sockets)).expect("register");
         gates.open(0).expect("open");
-
-        // What shutdown does to the shared fd, before the acceptor runs.
-        unsafe { libc::shutdown(shared_fd, libc::SHUT_RD) };
-        // A new socket takes the old number. `dup2` swaps it in atomically, so
-        // other tests opening fds in parallel cannot take the number first.
-        let fresh = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let shared_fd = std::os::fd::IntoRawFd::into_raw_fd(listener);
-        assert_eq!(
-            unsafe { libc::dup2(fresh.as_raw_fd(), shared_fd) },
-            shared_fd
-        );
-        drop(fresh);
-        // SAFETY: `dup2` made `shared_fd` a new descriptor this test owns.
-        let reuser =
-            unsafe { <std::net::TcpListener as std::os::fd::FromRawFd>::from_raw_fd(shared_fd) };
 
         let (tx, _rx) = crossbeam_channel::bounded::<AcceptedConn>(8);
         let config = AcceptorConfig {
-            listen_fd: acceptor_fd,
+            sockets: Arc::clone(&sockets),
             listener: crate::ListenerId::from_index(0),
             worker_channels: vec![tx],
             worker_wake_handles: Vec::new(),
-            shutdown_flag: Arc::new(AtomicBool::new(true)),
+            shutdown_flag: Arc::new(AtomicBool::new(false)),
             listen_gates: Arc::clone(&gates),
             tcp_nodelay: false,
             conn_chunk_size: 1,
@@ -387,31 +357,27 @@ mod tests {
             timestamps: false,
         };
         let handle = std::thread::spawn(move || run_acceptor(config));
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert!(!handle.is_finished(), "the acceptor exited before shutdown");
+
+        gates.shutdown();
+        sockets.shut_down();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !handle.is_finished() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert!(handle.is_finished(), "the acceptor did not exit");
+        assert!(handle.is_finished(), "shut_down did not wake the acceptor");
         handle.join().expect("acceptor panicked");
 
-        // The new socket's connection is still waiting for its own accept.
-        let _client =
-            std::net::TcpStream::connect(reuser.local_addr().expect("addr")).expect("connect");
-        reuser.set_nonblocking(true).expect("nonblocking");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        loop {
-            match reuser.accept() {
-                Ok(_) => break,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    assert!(
-                        std::time::Instant::now() < deadline,
-                        "the reusing socket's connection was taken"
-                    );
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                Err(e) => panic!("accept on the reusing socket: {e}"),
-            }
-        }
+        assert!(
+            unsafe { libc::fcntl(sockets.fd(0), libc::F_GETFD) } >= 0,
+            "shut_down closed the socket"
+        );
+        assert_eq!(
+            Arc::strong_count(&sockets),
+            1,
+            "the acceptor or the gates kept a hold after shutdown"
+        );
     }
 
     /// The option is actually applied, not merely requested.
