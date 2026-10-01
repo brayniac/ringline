@@ -1840,8 +1840,19 @@ fn memlock_required(config: &Config, workers: usize, charges_rings: bool, page: 
 }
 
 /// Pin the current thread to a specific CPU core.
+///
+/// A `core` that `cpu_set_t` cannot hold is an `InvalidInput` error.
+/// `libc::CPU_SET` panics on it, and the panic cannot unwind, so the process
+/// aborts.
 #[cfg(target_os = "linux")]
 fn pin_to_core(core: usize) -> Result<(), crate::error::Error> {
+    let capacity = 8 * std::mem::size_of::<libc::cpu_set_t>();
+    if core >= capacity {
+        return Err(crate::error::Error::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("CPU {core} is beyond the {capacity} CPUs an affinity mask can name"),
+        )));
+    }
     unsafe {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
         libc::CPU_ZERO(&mut set);

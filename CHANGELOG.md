@@ -247,6 +247,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- With `pin_to_core(true)`, a `core_offset` that put a worker on CPU 1024 or
+  higher aborted the process: `libc::CPU_SET` panicked and the panic could
+  not unwind. `launch()` now fails with an `InvalidInput` I/O error.
+
+- On io_uring, each worker's UDP socket was created without close-on-exec,
+  so a process spawned on another thread while the worker started could
+  inherit it. It is now close-on-exec.
+
 - Listener sockets were created without close-on-exec, so a process spawned
   while the runtime ran inherited them and kept the port bound after the
   runtime shut down. They are now close-on-exec.

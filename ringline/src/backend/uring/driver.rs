@@ -2885,7 +2885,13 @@ impl Driver {
                 }
                 fd
             }
-            None => unsafe { libc::socket(domain, libc::SOCK_DGRAM | libc::SOCK_NONBLOCK, 0) },
+            None => unsafe {
+                libc::socket(
+                    domain,
+                    libc::SOCK_DGRAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+                    0,
+                )
+            },
         };
         if fd < 0 {
             return Err(crate::error::Error::Io(std::io::Error::last_os_error()));
