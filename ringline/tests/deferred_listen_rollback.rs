@@ -8,7 +8,10 @@
 //! It fails the second bind, so it covers the bind-failure rollback. The
 //! register and acceptor-spawn failure paths call the same
 //! `listen_gates.shutdown()` and have no test of their own.
+//!
+//! Linux only: it reads `/proc/self/task`.
 
+#![cfg(target_os = "linux")]
 #![allow(clippy::manual_async_fn)]
 
 use std::future::Future;
@@ -44,7 +47,6 @@ impl AsyncEventHandler for Idle {
 /// The number of live acceptor threads in this process. The kernel truncates
 /// a thread name to 15 bytes, so `ringline-acceptor-0` reads back as
 /// `ringline-accept`.
-#[cfg(target_os = "linux")]
 fn acceptor_threads() -> usize {
     std::fs::read_dir("/proc/self/task")
         .expect("read /proc/self/task")
@@ -56,7 +58,6 @@ fn acceptor_threads() -> usize {
 /// The first listener is deferred, so its acceptor parks on the gate. The
 /// second bind fails, and the rollback must shut the gates as well as close
 /// the listeners and join the workers.
-#[cfg(target_os = "linux")]
 #[test]
 fn a_failed_launch_releases_a_parked_acceptor() {
     let taken = TcpListener::bind("127.0.0.1:0").expect("bind");
