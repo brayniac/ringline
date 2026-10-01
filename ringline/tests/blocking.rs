@@ -32,7 +32,10 @@ struct BlockingBasicHandler;
 impl AsyncEventHandler for BlockingBasicHandler {
     fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
         Some(Box::pin(async {
-            let val = ringline::spawn_blocking(|| 42u32).unwrap().await;
+            let val = ringline::spawn_blocking(|| 42u32)
+                .unwrap()
+                .await
+                .expect("closure returned");
             BLOCKING_RESULT.store(val, Ordering::SeqCst);
             ringline::request_shutdown().ok();
         }))
@@ -80,7 +83,7 @@ impl AsyncEventHandler for BlockingConcurrentHandler {
             ringline::sleep(std::time::Duration::from_millis(10)).await;
 
             // Now await the blocking result.
-            let val = handle.await;
+            let val = handle.await.expect("closure returned");
             BLOCKING_CONCURRENT.store(val, Ordering::SeqCst);
             ringline::request_shutdown().ok();
         }))
@@ -122,7 +125,8 @@ impl AsyncEventHandler for BlockingMultiHandler {
             let h3 = ringline::spawn_blocking(|| 30u32).unwrap();
 
             let (a, b) = ringline::join(h1, h2).await;
-            let c = h3.await;
+            let (a, b) = (a.expect("closure returned"), b.expect("closure returned"));
+            let c = h3.await.expect("closure returned");
             BLOCKING_MULTI.store(a + b + c, Ordering::SeqCst);
             ringline::request_shutdown().ok();
         }))
@@ -204,7 +208,8 @@ impl AsyncEventHandler for BlockingStringHandler {
         Some(Box::pin(async {
             let val = ringline::spawn_blocking(|| "hello blocking".to_string())
                 .unwrap()
-                .await;
+                .await
+                .expect("closure returned");
             if val == "hello blocking" {
                 BLOCKING_STRING.store(1, Ordering::SeqCst);
             }

@@ -176,7 +176,12 @@ pub fn spawn(future: impl Future<Output = ()> + 'static) -> io::Result<TaskId> {
 
 impl TaskId {
     /// Cancel a standalone task. Drops the future immediately, freeing
-    /// the slab slot. No-op if the task already completed.
+    /// the slab slot.
+    ///
+    /// A `TaskId` carries no generation: once the task has completed, its
+    /// slot can be reused, and cancelling the old id cancels whatever task
+    /// now holds the slot. Call this only while the task is known to be
+    /// running; [`JoinHandle::abort`] checks for you.
     ///
     /// Must be called from within the ringline executor (i.e., from a
     /// connection task or standalone task). Panics otherwise.
@@ -195,19 +200,58 @@ impl TaskId {
 
 /// Shared state between a spawned wrapper future and its [`JoinHandle`].
 struct JoinState<T> {
-    /// The task's return value, written by the wrapper when it completes.
-    result: Option<T>,
+    /// The task's outcome, written by the wrapper when it completes or panics.
+    result: Option<Result<T, crate::JoinError>>,
     /// Raw task ID of the task awaiting this handle (includes `STANDALONE_BIT`
     /// for standalone tasks). Set by `JoinHandle::poll` when it returns `Pending`.
     waiter: Option<u32>,
-    /// True if [`JoinHandle::abort`] was called.
-    aborted: bool,
+    /// True once the outcome is decided: completed, panicked or cancelled.
+    finished: bool,
+}
+
+impl<T> JoinState<T> {
+    /// Record the outcome, if none is recorded yet, and return the waiter to
+    /// wake.
+    fn finish(&mut self, result: Result<T, crate::JoinError>) -> Option<u32> {
+        if self.finished {
+            return None;
+        }
+        self.finished = true;
+        self.result = Some(result);
+        self.waiter.take()
+    }
+}
+
+/// Owned by a `spawn_with_handle` task. Dropping the task before it finished
+/// (abort, `TaskId::cancel`, worker shutdown) resolves the handle as cancelled
+/// and wakes its waiter.
+struct CancelOnDrop<T> {
+    state: Rc<RefCell<JoinState<T>>>,
+}
+
+impl<T> Drop for CancelOnDrop<T> {
+    fn drop(&mut self) {
+        let Ok(mut s) = self.state.try_borrow_mut() else {
+            return;
+        };
+        let waiter = s.finish(Err(crate::JoinError::cancelled()));
+        drop(s);
+        if let Some(waiter_id) = waiter {
+            // `None` outside the executor (worker teardown), where there is no
+            // task left to wake.
+            let _ = try_with_state(|_driver, executor| {
+                executor.wake_task(waiter_id);
+            });
+        }
+    }
 }
 
 /// Handle to a spawned task's return value.
 ///
-/// Obtained from [`spawn_with_handle()`]. Implements [`Future`] — awaiting it
-/// yields the task's return value `T` once the task completes.
+/// Obtained from [`spawn_with_handle()`]. Implements [`Future`]: awaiting it
+/// yields `Ok` with the task's return value once the task completes, or `Err`
+/// with a [`JoinError`](crate::JoinError) if the task panicked or was
+/// aborted.
 ///
 /// # Drop semantics
 ///
@@ -217,8 +261,9 @@ struct JoinState<T> {
 ///
 /// # Abort
 ///
-/// [`abort()`](Self::abort) cancels the spawned task. A `JoinHandle` that has
-/// been aborted will never resolve if polled.
+/// [`abort()`](Self::abort) cancels the spawned task. The handle then resolves
+/// to a [`JoinError`](crate::JoinError) for which
+/// [`is_cancelled`](crate::JoinError::is_cancelled) is true.
 pub struct JoinHandle<T> {
     state: Rc<RefCell<JoinState<T>>>,
     task_id: TaskId,
@@ -232,26 +277,25 @@ impl<T> JoinHandle<T> {
 
     /// Cancel the spawned task.
     ///
-    /// The future is dropped immediately and its slab slot is freed.
-    /// After this call, awaiting the handle will hang forever — use
-    /// [`select()`](crate::select) with a flag if you need to detect
-    /// cancellation.
+    /// The future is dropped immediately and its slab slot is freed. Awaiting
+    /// the handle then resolves to a cancelled [`JoinError`](crate::JoinError).
+    /// If the task has already finished, this does nothing and the handle
+    /// keeps its outcome.
     pub fn abort(&self) {
-        self.state.borrow_mut().aborted = true;
+        if self.state.borrow().finished {
+            return;
+        }
         self.task_id.cancel();
     }
 }
 
 impl<T: 'static> Future for JoinHandle<T> {
-    type Output = T;
+    type Output = Result<T, crate::JoinError>;
 
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<T> {
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut s = self.state.borrow_mut();
-        if s.aborted {
-            return Poll::Pending;
-        }
-        if let Some(value) = s.result.take() {
-            return Poll::Ready(value);
+        if let Some(result) = s.result.take() {
+            return Poll::Ready(result);
         }
         // Register this task as the waiter so the child can wake us.
         s.waiter = Some(CURRENT_TASK_ID.with(|c| c.get()));
@@ -259,11 +303,33 @@ impl<T: 'static> Future for JoinHandle<T> {
     }
 }
 
+pin_project_lite::pin_project! {
+    /// Polls `inner`, and resolves to `Err` with the payload if a poll panics.
+    struct CatchUnwind<F> {
+        #[pin]
+        inner: F,
+    }
+}
+
+impl<F: Future> Future for CatchUnwind<F> {
+    type Output = Result<F::Output, Box<dyn std::any::Any + Send>>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let inner = self.project().inner;
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| inner.poll(cx))) {
+            Ok(Poll::Ready(value)) => Poll::Ready(Ok(value)),
+            Ok(Poll::Pending) => Poll::Pending,
+            Err(payload) => Poll::Ready(Err(payload)),
+        }
+    }
+}
+
 /// Spawn a standalone async task and return a handle to await its result.
 ///
 /// Like [`spawn()`], the future runs on the current worker's single-threaded
-/// executor. The returned [`JoinHandle<T>`] implements [`Future<Output = T>`] —
-/// awaiting it yields the task's return value once it completes.
+/// executor. The returned [`JoinHandle<T>`] is a future: awaiting it yields
+/// `Ok` with the task's return value once it completes, or a
+/// [`JoinError`](crate::JoinError).
 ///
 /// # Detach semantics
 ///
@@ -277,25 +343,40 @@ impl<T: 'static> Future for JoinHandle<T> {
 ///
 /// # Panics in the spawned task
 ///
-/// A panic in the spawned future unwinds the worker thread (same as [`spawn()`]).
+/// A panic in the spawned future resolves the handle to a
+/// [`JoinError`](crate::JoinError) whose `is_panic` is true, and is handled
+/// under the runtime's [`TaskPanicPolicy`](crate::TaskPanicPolicy).
 pub fn spawn_with_handle<T: 'static>(
     future: impl Future<Output = T> + 'static,
 ) -> io::Result<JoinHandle<T>> {
     let state = Rc::new(RefCell::new(JoinState {
         result: None,
         waiter: None,
-        aborted: false,
+        finished: false,
     }));
     let state_for_wrapper = Rc::clone(&state);
+    // Created outside the async block so that dropping the task before its
+    // first poll still drops the guard.
+    let cancel_guard = CancelOnDrop {
+        state: Rc::clone(&state),
+    };
 
     let wrapper = async move {
-        let value = future.await;
-        let mut s = state_for_wrapper.borrow_mut();
-        s.result = Some(value);
-        let waiter = s.waiter.take();
-        // Drop the borrow before calling with_state — defensive against
-        // any re-entrant borrow in the wakeup path.
-        drop(s);
+        let _cancel_guard = cancel_guard;
+        let result = match (CatchUnwind { inner: future }).await {
+            Ok(value) => Ok(value),
+            Err(payload) => {
+                with_state(|driver, _executor| {
+                    driver
+                        .panic_reporter
+                        .report("spawn_with_handle task", &*payload);
+                });
+                Err(crate::JoinError::panicked(payload))
+            }
+        };
+        let waiter = state_for_wrapper.borrow_mut().finish(result);
+        // The borrow is released before calling with_state, which guards
+        // against a re-entrant borrow in the wakeup path.
         if let Some(waiter_id) = waiter {
             with_state(|_driver, executor| {
                 executor.wake_task(waiter_id);
@@ -321,8 +402,11 @@ pub fn spawn_with_handle<T: 'static>(
 /// Offload a blocking closure to the dedicated blocking thread pool.
 ///
 /// The closure runs on a low-priority background thread (`SCHED_IDLE`),
-/// keeping the io_uring event loop unblocked. Returns a future that
-/// resolves to the closure's return value.
+/// keeping the io_uring event loop unblocked. Returns a future that resolves
+/// to `Ok` with the closure's return value, or to `Err` with a
+/// [`JoinError`](crate::JoinError) if the closure panicked. A panic does not
+/// end the pool thread, and is handled under the runtime's
+/// [`TaskPanicPolicy`](crate::TaskPanicPolicy).
 ///
 /// # Errors
 ///
@@ -368,25 +452,28 @@ pub fn spawn_blocking<T: Send + 'static>(
     .unwrap_or_else(|| Err(io::Error::other("called outside executor")))
 }
 
-/// Future returned by [`spawn_blocking()`]. Resolves to the closure's return value.
+/// Future returned by [`spawn_blocking()`]. Resolves to the closure's return
+/// value, or to a [`JoinError`](crate::JoinError) if the closure panicked.
 pub struct BlockingJoinHandle<T> {
     request_id: u64,
     _phantom: std::marker::PhantomData<T>,
 }
 
 impl<T: 'static> Future for BlockingJoinHandle<T> {
-    type Output = T;
+    type Output = Result<T, crate::JoinError>;
 
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<T> {
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
         with_state(|_driver, executor| {
             if let Some((_, slot)) = executor.pending_blocking.get_mut(&self.request_id)
                 && let Some(boxed) = slot.take()
             {
                 executor.pending_blocking.remove(&self.request_id);
-                let value = *boxed
-                    .downcast::<T>()
-                    .expect("type mismatch in BlockingJoinHandle");
-                return Poll::Ready(value);
+                return Poll::Ready(match boxed {
+                    Ok(value) => Ok(*value
+                        .downcast::<T>()
+                        .expect("type mismatch in BlockingJoinHandle")),
+                    Err(payload) => Err(crate::JoinError::panicked(payload)),
+                });
             }
             Poll::Pending
         })

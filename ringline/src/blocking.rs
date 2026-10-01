@@ -21,8 +21,11 @@ pub(crate) struct BlockingRequest {
 /// A response from the blocking pool to a worker.
 pub(crate) struct BlockingResponse {
     pub(crate) request_id: u64,
-    pub(crate) result: Box<dyn Any + Send>,
+    pub(crate) result: BlockingResult,
 }
+
+/// A blocking closure's value, or its panic payload.
+pub(crate) type BlockingResult = Result<Box<dyn Any + Send>, Box<dyn Any + Send>>;
 
 /// A pool of threads that perform blocking work.
 ///
@@ -73,7 +76,10 @@ impl BlockingPool {
 /// Main loop for a blocking thread.
 fn blocking_thread(rx: Receiver<BlockingRequest>) {
     while let Ok(req) = rx.recv() {
-        let result = (req.work)();
+        // A panicking closure must not take the pool thread with it; the
+        // payload goes back to the requesting worker instead.
+        let work = req.work;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
         let _ = req.response_tx.send(BlockingResponse {
             request_id: req.request_id,
             result,

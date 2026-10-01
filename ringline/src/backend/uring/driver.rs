@@ -476,7 +476,7 @@ pub(crate) struct Driver {
     pub(crate) accept_rx: Option<crossbeam_channel::Receiver<crate::acceptor::AcceptedConn>>,
     /// Merged accept mode: this worker's own listener sockets, `(listener
     /// index, fd)`. Empty in pool mode.
-    pub(crate) merged_accept_fds: Vec<(u32, std::os::fd::RawFd)>,
+    pub(crate) merged_accept_fds: Vec<(u32, std::sync::Arc<std::os::fd::OwnedFd>)>,
     /// Goes true once `launch()` has called `listen(2)` on every merged socket.
     /// Arming an accept before that fails with `EINVAL`.
     pub(crate) merged_accept_live: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
@@ -503,6 +503,8 @@ pub(crate) struct Driver {
     pub(crate) flush_interval: Option<Duration>,
     pub(crate) shutdown_flag: Arc<AtomicBool>,
     pub(crate) shutdown_local: bool,
+    /// Handles task panics caught on this worker, under the runtime's policy.
+    pub(crate) panic_reporter: crate::task_panic::PanicReporter,
     pub(crate) tls_table: Option<crate::tls::TlsTable>,
     /// Pre-allocated sockaddr storage for outbound connect SQEs.
     pub(crate) connect_addrs: Vec<libc::sockaddr_storage>,
@@ -1105,6 +1107,11 @@ impl Driver {
             eventfd_buf: [0u8; 8],
             wake_handle: crate::wakeup::WakeFd::from_raw_fd(eventfd),
             flush_interval,
+            panic_reporter: crate::task_panic::PanicReporter::new(
+                config.task_panic_policy,
+                shutdown_flag.clone(),
+                config.runtime_shutdown.clone(),
+            ),
             shutdown_flag,
             shutdown_local: false,
             tls_table,

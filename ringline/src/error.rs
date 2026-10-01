@@ -129,6 +129,16 @@ pub enum Error {
     ///   are pinned against it. `ulimit -l <KiB>`, or `CAP_IPC_LOCK`.
     #[error("{0}")]
     ResourceLimit(String),
+
+    /// A task panicked under
+    /// [`TaskPanicPolicy::Shutdown`](crate::TaskPanicPolicy::Shutdown), which
+    /// shut the runtime down. Returned by each worker on which a task panicked
+    /// before it stopped, carrying that worker's first panic.
+    /// [`JoinError::into_panic`](crate::JoinError::into_panic) gives a `String`
+    /// payload, the panic message (or a placeholder if the panic payload was
+    /// not a string), to re-raise with `std::panic::resume_unwind`.
+    #[error("{0}")]
+    TaskPanicked(crate::JoinError),
 }
 
 /// What the host reported when ring setup or a provided buffer ring
