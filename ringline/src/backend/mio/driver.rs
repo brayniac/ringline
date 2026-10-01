@@ -892,12 +892,8 @@ impl Drop for Driver {
             }
         }
 
-        // Close the wake pipe's read end. The write end is held by
-        // `WakeHandle` clones that may live longer than the worker; it is
-        // closed when the last `WakeHandle` clone drops.
-        unsafe {
-            libc::close(self.wake_pipe_fd);
-        }
+        // The wake pipe's read end is not closed here: `WakeHandle` owns both
+        // ends, so a wake after this worker exits never meets a closed reader.
     }
 }
 

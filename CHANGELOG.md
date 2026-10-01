@@ -210,13 +210,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - A background thread that woke a worker after the `Runtime` had dropped
   wrote into whatever file then held the wake fd's number. Dropping the
-  `Runtime` closed every worker's wake fd, but blocking-pool, resolver,
-  spawner and disk-I/O threads, the acceptor and the workers themselves
-  carried the fd number without owning it. A `spawn_blocking` task still
-  running at shutdown therefore wrote its 8-byte wake into an unrelated fd
-  (a socket, a pipe, a file) once it finished. Each of those threads now holds
-  the wake fds open while it runs, and they close when the last one exits.
-  Startup takes one reference per thread; requests take none.
+  `Runtime` closed every worker's wake fd, but blocking-pool, resolver and
+  spawner threads, mio's disk-I/O threads, the acceptor and the workers
+  themselves carried the fd number without owning it. A `spawn_blocking` task
+  still running at shutdown therefore wrote its wake (8 bytes on io_uring, 1
+  on mio) into an unrelated fd once it finished. Each of those threads now
+  holds the wake fds open while it runs, so they close when the last one
+  exits rather than when the `Runtime` drops; a `spawn_blocking` task that
+  never returns keeps them open. Startup takes one reference per thread;
+  requests take none.
+
+- On mio, a wake after a worker had exited raised SIGPIPE, killing a host
+  that restores the default SIGPIPE disposition (Rust binaries ignore it).
+  `shutdown()`, then joining the workers, then dropping the `Runtime` did
+  this: the worker closed its wake pipe's read end on exit. The `WakeHandle`
+  now owns both ends of the pipe.
 
 - Docs: `send_backpressured`'s documented error set omitted
   `io::ErrorKind::NotConnected`, which is what a waiter actually gets when the

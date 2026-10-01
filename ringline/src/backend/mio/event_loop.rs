@@ -56,6 +56,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         {
             let pool = Arc::new(crate::disk_io_pool::DiskIoPool::start(
                 config.disk_io_threads,
+                // `None` only in unit tests, which hold their own `WakeHandle`.
                 config
                     .wake_keep_alive
                     .clone()

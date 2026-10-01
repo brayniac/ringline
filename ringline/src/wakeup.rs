@@ -14,8 +14,9 @@ use std::sync::Arc;
 ///
 /// Cheap to copy; does not own the fd. The fd is owned by the
 /// [`Arc<WakeFdInner>`] held inside [`WakeHandle`]. A `WakeFd` must not be
-/// used after the last `WakeHandle` clone drops, so every thread that carries
-/// one also holds a [`WakeKeepAlive`] for as long as it runs.
+/// used after the last `WakeHandle` clone drops, so every thread `launch()`
+/// starts that carries one also holds owning handles (a [`WakeKeepAlive`], or
+/// the acceptor's per-worker `WakeHandle`s) for as long as it runs.
 #[derive(Clone, Copy)]
 pub(crate) struct WakeFd {
     fd: RawFd,
@@ -44,14 +45,24 @@ impl WakeFd {
 }
 
 /// Owns the wake fd; closes it on drop.
+///
+/// On mio it also owns the pipe's read end, which the worker polls but does
+/// not close. A write to a pipe whose read end has closed raises SIGPIPE, which
+/// kills a process that has restored the default disposition; with both ends
+/// owned here, a write after the worker has exited fills the buffer or gets
+/// `EAGAIN` instead.
 struct WakeFdInner {
     fd: RawFd,
+    #[cfg(not(has_io_uring))]
+    read_fd: RawFd,
 }
 
 impl Drop for WakeFdInner {
     fn drop(&mut self) {
         unsafe {
             libc::close(self.fd);
+            #[cfg(not(has_io_uring))]
+            libc::close(self.read_fd);
         }
     }
 }
@@ -125,13 +136,12 @@ pub(crate) fn create_wake_fd() -> io::Result<(RawFd, WakeHandle)> {
     ))
 }
 
-/// Owning clones of every worker's wake handle, held by each thread that can
-/// wake a worker.
+/// Owning clones of every worker's wake handle, held by each pool and worker
+/// thread.
 ///
 /// A thread holding one keeps every worker's wake fd open, so the [`WakeFd`]s
 /// it carries stay valid for as long as it runs, including after the
-/// `Runtime` has dropped. Cloned once per thread at startup, never per
-/// request.
+/// `Runtime` has dropped. Cloned when a thread starts, never per request.
 pub(crate) type WakeKeepAlive = Arc<[WakeHandle]>;
 
 /// Create a per-worker wake fd pair (pipe).
@@ -160,7 +170,10 @@ pub(crate) fn create_wake_fd() -> io::Result<(RawFd, WakeHandle)> {
     Ok((
         read_fd,
         WakeHandle {
-            inner: Arc::new(WakeFdInner { fd: write_fd }),
+            inner: Arc::new(WakeFdInner {
+                fd: write_fd,
+                read_fd,
+            }),
         },
     ))
 }

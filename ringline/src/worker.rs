@@ -2,8 +2,6 @@ use std::any::Any;
 use std::io;
 use std::net::SocketAddr;
 use std::os::fd::RawFd;
-#[cfg(not(has_io_uring))]
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -100,53 +98,20 @@ fn rollback_workers(
 
 /// Carries the worker wake read descriptor into its worker thread.
 ///
-/// Mio has a distinct pipe read end, which this type owns until the driver is
-/// constructed. On io_uring, [`crate::wakeup::WakeHandle`] owns the shared
-/// eventfd and this type only carries its descriptor number.
+/// Not owning: [`crate::wakeup::WakeHandle`] owns the descriptor (the eventfd
+/// on io_uring, the pipe's read end on mio) and closes it when the last clone
+/// drops.
 struct WorkerReadFd {
-    #[cfg(has_io_uring)]
     fd: RawFd,
-    #[cfg(not(has_io_uring))]
-    fd: Option<OwnedFd>,
 }
 
 impl WorkerReadFd {
     fn new(fd: RawFd) -> Self {
-        #[cfg(has_io_uring)]
-        {
-            Self { fd }
-        }
-        #[cfg(not(has_io_uring))]
-        Self {
-            // SAFETY: create_wake_fd returns a fresh pipe read descriptor and
-            // transfers its ownership to this constructor on the mio backend.
-            fd: Some(unsafe { OwnedFd::from_raw_fd(fd) }),
-        }
+        Self { fd }
     }
 
     fn as_raw_fd(&self) -> RawFd {
-        #[cfg(has_io_uring)]
-        {
-            self.fd
-        }
-        #[cfg(not(has_io_uring))]
-        {
-            self.fd
-                .as_ref()
-                .expect("worker read fd must not be transferred twice")
-                .as_raw_fd()
-        }
-    }
-
-    fn transfer_to_driver(&mut self) {
-        #[cfg(not(has_io_uring))]
-        {
-            let owned = self
-                .fd
-                .take()
-                .expect("worker read fd must not be transferred twice");
-            let _ = owned.into_raw_fd();
-        }
+        self.fd
     }
 }
 
@@ -838,7 +803,7 @@ impl RinglineBuilder {
             |worker_id,
              config,
              accept_rx,
-             mut eventfd,
+             eventfd,
              shutdown_flag,
              resolve_rx,
              resolve_tx,
@@ -913,7 +878,6 @@ impl RinglineBuilder {
                 // preparation through `run()`: the io_uring eventfd-read SQE
                 // points into its inline driver storage, so moving the value
                 // after `prepare_run()` would invalidate that pointer.
-                eventfd.0.transfer_to_driver();
                 if let Err(e) = event_loop.prepare_run() {
                     let _ = startup_tx.send(Err(e));
                     return Err(startup_failure_placeholder());
@@ -980,8 +944,8 @@ impl RinglineBuilder {
         // Create per-worker channels and wake fds. `worker_wake_handles`
         // (Arc-based) is what `Runtime` keeps and what
         // `worker_wake_handle()` hands out to users; `worker_wake_fds`
-        // (Copy) is what the acceptor and internal request structs use on
-        // hot paths.
+        // (Copy) is what internal request structs and peer handoff use on hot
+        // paths; the acceptor takes owning `WakeHandle`s.
         let mut worker_txs = Vec::with_capacity(num_threads);
         let mut worker_rxs = Vec::with_capacity(num_threads);
         let mut worker_eventfds = Vec::with_capacity(num_threads);
@@ -1005,11 +969,12 @@ impl RinglineBuilder {
             worker_wake_fds.push(wake_handle.as_wake_fd());
             worker_wake_handles.push(wake_handle);
         }
-        // Every thread that can wake a worker holds a clone of this for as
-        // long as it runs: the pools, the acceptors and the workers. The
-        // `WakeFd`s those threads carry are not owning, so this is what keeps
-        // the fds open after `Runtime` drops and until the last such thread
-        // exits; otherwise a late wake would write into a reused fd number.
+        // The pool threads and the workers each hold a clone of this for as
+        // long as they run; each acceptor holds its own `WakeHandle` clones.
+        // The `WakeFd`s those threads carry are not owning, so this is what
+        // keeps the fds open after `Runtime` drops and until the last such
+        // thread exits; otherwise a late wake would write into a reused fd
+        // number.
         let wake_keep_alive: crate::wakeup::WakeKeepAlive =
             worker_wake_handles.iter().cloned().collect();
 
@@ -1303,9 +1268,10 @@ impl RinglineBuilder {
             let spawn_result = thread::Builder::new()
                 .name(format!("ringline-worker-{worker_id}"))
                 .spawn(move || {
-                    // Keeps every worker's wake fd open until this worker exits:
-                    // its own eventfd, which its ring reads, and its peers', which
-                    // it may wake during shutdown.
+                    // Keeps every worker's wake fd open until this worker exits.
+                    // On io_uring its ring reads its own eventfd by number; in
+                    // merged accept mode it wakes peers when it hands off a
+                    // connection.
                     let _wake_keep_alive = worker_wake_keep_alive;
                     if config.worker.pin_to_core {
                         let core = pin_cpu;

@@ -252,7 +252,8 @@ pub struct Config {
     /// bound-but-unlistening socket fails with `EINVAL`.
     pub(crate) merged_accept_live: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Every worker's wake handle, for the per-worker disk-I/O pool on the mio
-    /// backend, whose threads can outlive the worker. Set by `launch()`.
+    /// backend, whose threads can outlive the worker. Set by `launch()`;
+    /// unused on io_uring.
     pub(crate) wake_keep_alive: Option<crate::wakeup::WakeKeepAlive>,
     /// This worker's index, so it can find its own slot in `worker_loads` and
     /// avoid handing a connection back to itself.

@@ -8,8 +8,12 @@
 //! pipe receives the wake, then that every fd `launch()` opened is closed once
 //! the task has finished.
 //!
+//! A second test covers the worker's own hold: with no pool, a worker still
+//! running after the `Runtime` drops must keep every fd `launch()` opened.
+//!
 //! Its own test binary, because it reads `/proc/self/fd` and claims freed fd
-//! numbers, which other tests in the same process would disturb. Linux only.
+//! numbers, which other tests in the same process would disturb; the two tests
+//! here take a lock so they do not disturb each other. Linux only.
 
 #![cfg(target_os = "linux")]
 #![allow(clippy::manual_async_fn)]
@@ -18,6 +22,7 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::os::fd::RawFd;
 use std::pin::Pin;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -27,6 +32,9 @@ static BLOCKING_STARTED: AtomicBool = AtomicBool::new(false);
 static BLOCKING_FINISHED: AtomicBool = AtomicBool::new(false);
 
 const BLOCKING_TASK: Duration = Duration::from_millis(300);
+
+/// Serialises the tests, which both read and claim process-wide fd numbers.
+static FD_LOCK: Mutex<()> = Mutex::new(());
 
 /// Starts one blocking task on worker 0 that outlives the runtime.
 struct SlowBlocking;
@@ -68,6 +76,15 @@ fn open_fds() -> HashSet<RawFd> {
         .collect()
 }
 
+/// Whether a thread whose name starts with `prefix` is alive. The kernel
+/// truncates thread names to 15 bytes.
+fn thread_alive(prefix: &str) -> bool {
+    std::fs::read_dir("/proc/self/task")
+        .expect("read /proc/self/task")
+        .filter_map(|t| std::fs::read_to_string(t.ok()?.path().join("comm")).ok())
+        .any(|name| name.trim_end().starts_with(prefix))
+}
+
 /// Whether `fd` is open, checked without opening anything.
 fn is_open(fd: RawFd) -> bool {
     unsafe { libc::fcntl(fd, libc::F_GETFD) >= 0 }
@@ -75,6 +92,7 @@ fn is_open(fd: RawFd) -> bool {
 
 #[test]
 fn a_late_wake_does_not_write_into_a_reused_fd() {
+    let _lock = FD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let config = ConfigBuilder::new()
         .workers(1)
         .pin_to_core(false)
@@ -145,8 +163,16 @@ fn a_late_wake_does_not_write_into_a_reused_fd() {
         BLOCKING_FINISHED.load(Ordering::Acquire),
         "blocking task never finished"
     );
-    // The pool thread wakes the worker right after the task returns.
-    std::thread::sleep(Duration::from_millis(100));
+    // The pool thread wakes the worker after the task returns and exits after
+    // that, since its request channel has closed.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while thread_alive("ringline-blocki") && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !thread_alive("ringline-blocki"),
+        "blocking pool thread never exited"
+    );
 
     let mut stray = Vec::new();
     for &(read, write) in &claimed {
@@ -178,5 +204,90 @@ fn a_late_wake_does_not_write_into_a_reused_fd() {
     assert!(
         leaked.is_empty(),
         "fds opened by launch() still open 5s after shutdown: {leaked:?}"
+    );
+}
+
+static WORKER_PARKED: AtomicBool = AtomicBool::new(false);
+
+/// Blocks the worker thread in `on_start` so it outlives the `Runtime`.
+struct SlowWorker;
+
+impl AsyncEventHandler for SlowWorker {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
+        async {}
+    }
+
+    fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        Some(Box::pin(async {
+            WORKER_PARKED.store(true, Ordering::Release);
+            std::thread::sleep(BLOCKING_TASK);
+        }))
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        SlowWorker
+    }
+}
+
+/// With no pool threads, a worker still running after the `Runtime` drops is
+/// the only holder; every fd `launch()` opened stays open until it exits.
+#[test]
+fn a_running_worker_keeps_its_wake_fd_open() {
+    let _lock = FD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let config = ConfigBuilder::new()
+        .workers(1)
+        .pin_to_core(false)
+        .sq_entries(64)
+        .recv_buffer(16, 1024)
+        .max_connections(16)
+        .send_pool(16, 16384)
+        // No pools: their threads would also hold the fds open.
+        .blocking_threads(0)
+        .resolver_threads(0)
+        .spawner_threads(0)
+        .build()
+        .expect("valid config");
+    let baseline = open_fds();
+    let (runtime, handles) = RinglineBuilder::new(config)
+        .launch::<SlowWorker>()
+        .expect("launch");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !WORKER_PARKED.load(Ordering::Acquire) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        WORKER_PARKED.load(Ordering::Acquire),
+        "worker never ran on_start"
+    );
+
+    let launched: Vec<RawFd> = open_fds().difference(&baseline).copied().collect();
+    drop(runtime);
+    assert!(
+        !handles.iter().all(|h| h.is_finished()),
+        "the worker exited before the check; the test proves nothing"
+    );
+    let closed: Vec<RawFd> = launched
+        .iter()
+        .copied()
+        .filter(|&fd| !is_open(fd))
+        .collect();
+    assert!(
+        closed.is_empty(),
+        "Runtime drop closed fds {closed:?} while a worker that uses them is still running"
+    );
+
+    for h in handles {
+        h.join().expect("worker panicked").expect("worker error");
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut leaked: Vec<RawFd> = launched.iter().copied().filter(|&fd| is_open(fd)).collect();
+    while !leaked.is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+        leaked = launched.iter().copied().filter(|&fd| is_open(fd)).collect();
+    }
+    assert!(
+        leaked.is_empty(),
+        "fds opened by launch() still open 5s after the worker exited: {leaked:?}"
     );
 }
