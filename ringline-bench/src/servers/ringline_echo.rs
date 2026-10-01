@@ -3,7 +3,7 @@
 use std::net::SocketAddr;
 use std::thread::JoinHandle;
 
-use ringline::{AsyncEventHandler, ConfigBuilder, Connection, RinglineBuilder, ShutdownHandle};
+use ringline::{AsyncEventHandler, ConfigBuilder, Connection, RinglineBuilder, Runtime};
 // ParseResult is only needed in the non-io_uring fallback path.
 #[cfg(not(has_io_uring))]
 use ringline::ParseResult;
@@ -55,7 +55,7 @@ impl AsyncEventHandler for EchoHandler {
 }
 
 pub struct RinglineServer {
-    shutdown: ShutdownHandle,
+    shutdown: Runtime,
     handles: Vec<JoinHandle<Result<(), ringline::Error>>>,
 }
 

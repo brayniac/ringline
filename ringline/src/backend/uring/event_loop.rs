@@ -422,7 +422,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
 
             // Drain pending region-registry updates dispatched from
-            // `ShutdownHandle::register_region` / `unregister_region`. Each
+            // `Runtime::register_region` / `unregister_region`. Each
             // message is applied to this worker's ring + registry and then
             // acknowledged so the registrar can return to its caller.
             self.drain_region_control();

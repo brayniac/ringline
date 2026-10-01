@@ -467,8 +467,8 @@ pub use nvme::NvmeDevice;
 pub use wakeup::WakeHandle;
 /// Builder for launching ringline workers.
 pub use worker::RinglineBuilder;
-/// Handle for triggering graceful shutdown.
-pub use worker::ShutdownHandle;
+/// The running runtime returned by `launch()`; dropping it shuts down.
+pub use worker::Runtime;
 
 // ── Re-exports: TLS ─────────────────────────────────────────────────────
 

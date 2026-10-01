@@ -115,7 +115,7 @@ io_uring backend, each worker also owns:
 | `ConnectFuture` | Future that resolves when an outbound connection completes |
 | `RinglineBuilder` | Builder: `RinglineBuilder::new(config).bind(addr).launch::<H>()` |
 | `Config` | Runtime configuration (SQ size, buffer sizes, worker count, TLS, etc.) |
-| `ShutdownHandle` | Triggers graceful shutdown of all workers |
+| `Runtime` | Returned by `launch()`; controls shutdown, listeners and accept steering, and shuts down on drop |
 | `GuardBox` | Type-erased container for `SendGuard` (64-byte inline storage, no heap) |
 | `DriverCtx` | I/O context available in `on_tick()` and `on_notify()` callbacks |
 

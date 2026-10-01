@@ -135,11 +135,11 @@ impl ConnToken {
 ///
 /// Ids are assigned in `bind()` / `bind_unix()` call order, starting at 0, so
 /// a caller that knows the order it bound in knows the id. Pair it with
-/// [`ShutdownHandle::bound_addr_of`] to recover the address a given id landed
+/// [`Runtime::bound_addr_of`] to recover the address a given id landed
 /// on — useful when binding port 0.
 ///
 /// [`on_accept`]: crate::AsyncEventHandler::on_accept
-/// [`ShutdownHandle::bound_addr_of`]: crate::ShutdownHandle::bound_addr_of
+/// [`Runtime::bound_addr_of`]: crate::Runtime::bound_addr_of
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ListenerId(pub(crate) u32);
 
@@ -157,7 +157,7 @@ impl ListenerId {
     /// process running more than one, an id names the listener at that index
     /// in the runtime it is passed to: the calling worker's runtime for the
     /// free functions, the handle's runtime for `ListenHandle` and
-    /// `ShutdownHandle` methods.
+    /// `Runtime` methods.
     pub fn from_index(index: u32) -> Self {
         ListenerId(index)
     }

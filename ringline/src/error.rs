@@ -60,7 +60,7 @@ pub enum Error {
     /// unit) or grant the capability. Regions in the startup config are
     /// checked against the limit before any worker starts and reported as
     /// [`Error::ResourceLimit`]; regions added later through
-    /// [`ShutdownHandle::register_region`](crate::ShutdownHandle::register_region)
+    /// [`Runtime::register_region`](crate::Runtime::register_region)
     /// report the same guidance as an `io::Error`. `EFAULT` means the
     /// `MemoryRegion` pointer or length does not describe mapped memory.
     #[error("buffer registration: {0}")]
@@ -100,7 +100,7 @@ pub enum Error {
     /// The `RegionId` passed to `SendGuard` does not correspond to a
     /// registered `MemoryRegion`. Ensure:
     /// - The region was registered via [`ConfigBuilder::registered_regions`](crate::ConfigBuilder::registered_regions)
-    ///   or [`ShutdownHandle::register_region`](crate::ShutdownHandle::register_region)
+    ///   or [`Runtime::register_region`](crate::Runtime::register_region)
     /// - The region is still valid (not dropped)
     #[error("invalid memory region ID")]
     InvalidRegion,

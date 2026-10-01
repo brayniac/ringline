@@ -1,8 +1,8 @@
 //! Cross-thread control plane for dynamic fixed-buffer region registration.
 //!
 //! Each worker owns a [`RegionControlRx`] that the event loop drains once per
-//! tick. [`ShutdownHandle::register_region`](crate::ShutdownHandle::register_region)
-//! and [`ShutdownHandle::unregister_region`](crate::ShutdownHandle::unregister_region)
+//! tick. [`Runtime::register_region`](crate::Runtime::register_region)
+//! and [`Runtime::unregister_region`](crate::Runtime::unregister_region)
 //! send a [`RegionControlMsg`] to every worker, wake them via their
 //! [`WakeHandle`](crate::WakeHandle), and block until every worker acks.
 //!
@@ -33,7 +33,7 @@ pub(crate) enum RegionControlMsg {
 /// Per-worker receiver. The event loop owns this and drains it each tick.
 pub(crate) type RegionControlRx = Receiver<RegionControlMsg>;
 
-/// Shared registrar held by [`ShutdownHandle`]. Owns the slot allocator and
+/// Shared registrar held by [`Runtime`]. Owns the slot allocator and
 /// the per-worker senders.
 pub(crate) struct RegionRegistrar {
     inner: Mutex<RegistrarInner>,

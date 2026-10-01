@@ -1,5 +1,5 @@
 //! Integration tests for dynamic region registration via
-//! `ShutdownHandle::register_region` / `unregister_region`.
+//! `Runtime::register_region` / `unregister_region`.
 
 #![cfg(all(target_os = "linux", has_io_uring))]
 #![allow(clippy::manual_async_fn)]

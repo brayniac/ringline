@@ -514,7 +514,7 @@ pub enum BenchmarkServer {
         thread: Option<std::thread::JoinHandle<()>>,
     },
     Ringline {
-        shutdown: Option<ringline::ShutdownHandle>,
+        shutdown: Option<ringline::Runtime>,
         handles: Vec<std::thread::JoinHandle<Result<(), ringline::error::Error>>>,
     },
 }

@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - `RinglineBuilder::defer_listen` binds a listener without listening on it, and
   `begin_listening` / `begin_listening_all` start it from code on a worker;
-  `ListenHandle` (from `ShutdownHandle::listen_handle`) does the same from any
+  `ListenHandle` (from `Runtime::listen_handle`) does the same from any
   thread; it is `Clone`, and dropping it does not shut the runtime down. The first call opens the listener for every worker. The port is
   reserved while the gate is closed, but the kernel does not complete
   handshakes, so a TCP readiness probe fails while the server is warming up
@@ -36,6 +36,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   listener can be named before any connection has arrived.
 
 ### Changed
+
+- **Breaking:** `ShutdownHandle` is renamed `Runtime`, with no alias. It is the
+  runtime's control surface (shutdown, listener addresses, deferred listeners,
+  accept steering, registered regions), and dropping it shuts the runtime
+  down. Replace the type name; its methods are unchanged.
 
 - `AsyncEventHandler::on_start`'s documentation no longer says the future runs
   before accepting begins. It runs concurrently with accepting; the doc now
@@ -104,7 +109,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   reps, now 0 in 9 of 9. The margin of two still applies between two non-empty
   workers. Merged accept mode only (#457).
 
-- `ShutdownHandle::set_worker_accepting()` takes a worker out of the accept
+- `Runtime::set_worker_accepting()` takes a worker out of the accept
   rotation, or puts it back, for listeners in `AcceptMode::Merged`. It re-steers
   the `SO_REUSEPORT` group with an unprivileged classic-BPF program rather than
   closing the worker's socket, because closing one resets whatever is already
@@ -147,7 +152,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Connections carry the [`ListenerId`] of the listener that accepted them,
   exposed as `listener()` on `ConnCtx`, `Connection` and `SendHalf` (`None` for
   outbound), so one `on_accept` can dispatch across listeners. Ids follow
-  `bind()` call order. `ShutdownHandle` gains `bound_addr_of()`, `bound_addrs()`
+  `bind()` call order. `Runtime` gains `bound_addr_of()`, `bound_addrs()`
   and `listener_count()`; `bound_addr()` still returns the first TCP listener's
   address, so single-listener callers are unaffected at the call site.
 

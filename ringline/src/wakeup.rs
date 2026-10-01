@@ -15,7 +15,7 @@ use std::sync::Arc;
 /// Cheap to copy; does not own the fd. The fd is owned by the
 /// [`Arc<WakeFdInner>`] held inside [`WakeHandle`]. The runtime preserves the
 /// invariant that every `WakeFd` is dropped before the last `WakeHandle`
-/// clone — workers join before [`crate::ShutdownHandle`] drops.
+/// clone — workers join before [`crate::Runtime`] drops.
 #[derive(Clone, Copy)]
 pub(crate) struct WakeFd {
     fd: RawFd,
@@ -58,10 +58,10 @@ impl Drop for WakeFdInner {
 
 /// Refcounted handle for waking a worker thread from any thread.
 ///
-/// Returned by [`crate::ShutdownHandle::worker_wake_handle`]. Cloning is cheap
+/// Returned by [`crate::Runtime::worker_wake_handle`]. Cloning is cheap
 /// (an atomic refcount bump) and the underlying fd stays open until the last
 /// clone is dropped, so it is safe to keep clones around past
-/// [`crate::ShutdownHandle`] drop — the writes simply land in an fd nobody is
+/// [`crate::Runtime`] drop — the writes simply land in an fd nobody is
 /// reading anymore.
 ///
 /// Typical use is to deliver a response on a crossbeam channel and then call

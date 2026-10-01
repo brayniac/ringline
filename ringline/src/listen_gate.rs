@@ -188,7 +188,7 @@ impl ListenGates {
 
     /// Release every waiter.
     ///
-    /// Called by `ShutdownHandle::shutdown` before it closes the listen fds.
+    /// Called by `Runtime::shutdown` before it closes the listen fds.
     /// Closing an fd wakes a thread inside `accept4`; it does not wake a
     /// thread waiting in `wait_open`.
     pub(crate) fn shutdown(&self) {
@@ -247,7 +247,7 @@ fn listen_all(inner: &mut GateInner, idx: usize) -> io::Result<()> {
 /// Opens deferred listeners from any thread.
 ///
 /// Obtained from
-/// [`ShutdownHandle::listen_handle`](crate::ShutdownHandle::listen_handle).
+/// [`Runtime::listen_handle`](crate::Runtime::listen_handle).
 /// For readiness decided outside a ringline worker: a management thread, a
 /// thread that waits on each worker's warmup, or another runtime. Clones share
 /// one runtime's listeners, and dropping one does not affect the runtime.
@@ -273,7 +273,7 @@ impl ListenHandle {
     /// # Errors
     ///
     /// Returns an error if `listener` names no listener, if
-    /// [`ShutdownHandle::shutdown`](crate::ShutdownHandle::shutdown) has been
+    /// [`Runtime::shutdown`](crate::Runtime::shutdown) has been
     /// called, or if `listen(2)` fails. A `listen(2)` failure leaves the
     /// listener bound and not listening, so the call can be retried.
     pub fn begin_listening(&self, listener: ListenerId) -> io::Result<()> {
@@ -327,7 +327,7 @@ fn with_gates<R>(f: impl FnOnce(&ListenGates) -> R) -> Option<R> {
 ///
 /// Returns an error if called from a thread that is not a ringline worker
 /// (use [`ListenHandle::begin_listening`] from other threads), if `listener` names no listener, if
-/// [`ShutdownHandle::shutdown`](crate::ShutdownHandle::shutdown) has been
+/// [`Runtime::shutdown`](crate::Runtime::shutdown) has been
 /// called or `launch()` has failed, or if `listen(2)` fails. A `listen(2)`
 /// failure leaves the listener bound and not listening, so the call can be
 /// retried.

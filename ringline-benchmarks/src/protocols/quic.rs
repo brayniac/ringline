@@ -112,7 +112,7 @@ fn quinn_client_config(certs: &[CertificateDer<'static>]) -> quinn_proto::Client
 // ── Server (ringline + QuicEndpoint) ────────────────────────────────
 
 struct BenchmarkServer {
-    shutdown: Option<ringline::ShutdownHandle>,
+    shutdown: Option<ringline::Runtime>,
     handles: Vec<std::thread::JoinHandle<Result<(), ringline::error::Error>>>,
 }
 

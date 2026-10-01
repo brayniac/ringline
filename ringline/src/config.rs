@@ -89,13 +89,13 @@ pub struct Config {
     /// Regions listed here occupy slots `0..registered_regions.len()` at
     /// startup. The remaining slots up to [`ConfigBuilder::max_registered_regions`] are
     /// available for dynamic registration via
-    /// [`ShutdownHandle::register_region`](crate::ShutdownHandle::register_region).
+    /// [`Runtime::register_region`](crate::Runtime::register_region).
     pub(crate) registered_regions: Vec<MemoryRegion>,
     /// Maximum number of fixed-buffer slots to reserve in the io_uring
     /// registered-buffer table. Must be `>= registered_regions.len()`.
     ///
     /// Slots beyond the initial regions are empty until filled by
-    /// [`ShutdownHandle::register_region`](crate::ShutdownHandle::register_region).
+    /// [`Runtime::register_region`](crate::Runtime::register_region).
     /// Cannot be grown after launch — io_uring's registered-buffer table is
     /// fixed-size; expand by re-launching with a larger value.
     ///

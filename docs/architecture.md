@@ -30,7 +30,7 @@ Within the core crate, the main boundaries are:
 - Optional services: resolver, process spawner, blocking pool, filesystem,
   direct I/O, NVMe, and registered memory regions.
 
-The principal public abstractions are `RinglineBuilder`, `ShutdownHandle`,
+The principal public abstractions are `RinglineBuilder`, `Runtime`,
 `AsyncEventHandler`, and `ConnCtx`. `AsyncEventHandler::create_for_worker`
 constructs one handler instance per worker. Its `on_accept` method returns the
 long-lived future for an accepted connection; `on_start` is the client-only
@@ -262,10 +262,10 @@ cancels an armed multishot receive, and only then finalizes close. Stale CQEs
 are normal during teardown and must release only their own backing without
 touching a reused connection.
 
-`ShutdownHandle::shutdown` sets a shared atomic flag, calls
+`Runtime::shutdown` sets a shared atomic flag, calls
 `shutdown(SHUT_RD)` and `close` on the listener once, and wakes every worker.
 The explicit socket shutdown is required to release a Linux acceptor blocked in
-`accept4`; closing alone is insufficient. Dropping `ShutdownHandle` invokes the
+`accept4`; closing alone is insufficient. Dropping `Runtime` invokes the
 same idempotent path. io_uring workers observe shutdown after draining a CQE
 batch and run backend shutdown drainage; Mio workers finish the current
 event/task/send/close cycle before returning.

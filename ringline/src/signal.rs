@@ -2,7 +2,7 @@
 //!
 //! Provides [`wait()`] to block the current thread until `SIGINT` or
 //! `SIGTERM` is received. Typically used with
-//! [`ShutdownHandle::wait_on_signal()`](crate::worker::ShutdownHandle::wait_on_signal)
+//! [`Runtime::wait_on_signal()`](crate::worker::Runtime::wait_on_signal)
 //! for one-line graceful shutdown.
 //!
 //! # Implementation

@@ -903,7 +903,7 @@ fn run_ringline(cfg: EchoCfg) {
     #[cfg(target_os = "linux")]
     let shutdown = if park_imbalance_ms > 0 {
         let half = workers / 2;
-        // `ShutdownHandle` is not `Clone`, and the readmit has to happen on a
+        // `Runtime` is not `Clone`, and the readmit has to happen on a
         // timer while the main thread waits on a signal — so share it.
         let shutdown = std::sync::Arc::new(shutdown);
         for w in half..workers {
