@@ -14,9 +14,8 @@ use std::sync::Arc;
 ///
 /// Cheap to copy; does not own the fd. The fd is owned by the
 /// [`Arc<WakeFdInner>`] held inside [`WakeHandle`]. A `WakeFd` must not be
-/// used after the last `WakeHandle` clone drops. The runtime's own clones live
-/// in [`crate::Runtime`], so dropping it before the workers join leaves their
-/// `WakeFd` copies dangling.
+/// used after the last `WakeHandle` clone drops, so every thread that carries
+/// one also holds a [`WakeKeepAlive`] for as long as it runs.
 #[derive(Clone, Copy)]
 pub(crate) struct WakeFd {
     fd: RawFd,
@@ -125,6 +124,15 @@ pub(crate) fn create_wake_fd() -> io::Result<(RawFd, WakeHandle)> {
         },
     ))
 }
+
+/// Owning clones of every worker's wake handle, held by each thread that can
+/// wake a worker.
+///
+/// A thread holding one keeps every worker's wake fd open, so the [`WakeFd`]s
+/// it carries stay valid for as long as it runs, including after the
+/// `Runtime` has dropped. Cloned once per thread at startup, never per
+/// request.
+pub(crate) type WakeKeepAlive = Arc<[WakeHandle]>;
 
 /// Create a per-worker wake fd pair (pipe).
 ///

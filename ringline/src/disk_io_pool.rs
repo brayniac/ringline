@@ -57,15 +57,19 @@ pub(crate) struct DiskIoPool {
 
 impl DiskIoPool {
     /// Create the channel pair and spawn disk I/O threads.
-    pub(crate) fn start(num_threads: usize) -> Self {
+    pub(crate) fn start(num_threads: usize, wake_keep_alive: crate::wakeup::WakeKeepAlive) -> Self {
         let (request_tx, request_rx) = crossbeam_channel::unbounded::<DiskIoRequest>();
         let mut threads = Vec::with_capacity(num_threads);
 
         for i in 0..num_threads {
             let rx = request_rx.clone();
+            let keep_alive = std::sync::Arc::clone(&wake_keep_alive);
             let handle = thread::Builder::new()
                 .name(format!("ringline-disk-io-{i}"))
                 .spawn(move || {
+                    // Holds every worker's wake fd open while this thread
+                    // can still wake one.
+                    let _keep_alive = keep_alive;
                     disk_io_thread(rx);
                 })
                 .expect("failed to spawn disk I/O thread");

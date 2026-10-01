@@ -208,6 +208,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A background thread that woke a worker after the `Runtime` had dropped
+  wrote into whatever file then held the wake fd's number. Dropping the
+  `Runtime` closed every worker's wake fd, but blocking-pool, resolver,
+  spawner and disk-I/O threads, the acceptor and the workers themselves
+  carried the fd number without owning it. A `spawn_blocking` task still
+  running at shutdown therefore wrote its 8-byte wake into an unrelated fd
+  (a socket, a pipe, a file) once it finished. Each of those threads now holds
+  the wake fds open while it runs, and they close when the last one exits.
+  Startup takes one reference per thread; requests take none.
+
 - Docs: `send_backpressured`'s documented error set omitted
   `io::ErrorKind::NotConnected`, which is what a waiter actually gets when the
   connection's close is *committed* while it sits in the capacity-admission

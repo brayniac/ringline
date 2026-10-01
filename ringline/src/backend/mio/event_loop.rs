@@ -56,6 +56,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         {
             let pool = Arc::new(crate::disk_io_pool::DiskIoPool::start(
                 config.disk_io_threads,
+                config
+                    .wake_keep_alive
+                    .clone()
+                    .unwrap_or_else(|| Arc::from(Vec::new())),
             ));
             let (tx, rx) = crossbeam_channel::unbounded::<crate::disk_io_pool::DiskIoResponse>();
             (Some(rx), Some(tx), Some(pool))

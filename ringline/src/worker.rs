@@ -1005,6 +1005,13 @@ impl RinglineBuilder {
             worker_wake_fds.push(wake_handle.as_wake_fd());
             worker_wake_handles.push(wake_handle);
         }
+        // Every thread that can wake a worker holds a clone of this for as
+        // long as it runs: the pools, the acceptors and the workers. The
+        // `WakeFd`s those threads carry are not owning, so this is what keeps
+        // the fds open after `Runtime` drops and until the last such thread
+        // exits; otherwise a late wake would write into a reused fd number.
+        let wake_keep_alive: crate::wakeup::WakeKeepAlive =
+            worker_wake_handles.iter().cloned().collect();
 
         // Park channels (tier 3, #443): a sibling of the accept channels so
         // the mio backend, which has neither merged accept nor park, is not
@@ -1039,6 +1046,7 @@ impl RinglineBuilder {
         let (resolver_pool, resolve_rxs) = if self.config.resolver_threads > 0 {
             let pool = Arc::new(crate::resolver::ResolverPool::start(
                 self.config.resolver_threads,
+                wake_keep_alive.clone(),
             ));
             let mut rxs = Vec::with_capacity(num_threads);
             for _ in 0..num_threads {
@@ -1054,6 +1062,7 @@ impl RinglineBuilder {
         let (spawner_pool, spawn_rxs) = if self.config.spawner_threads > 0 {
             let pool = Arc::new(crate::spawner::SpawnerPool::start(
                 self.config.spawner_threads,
+                wake_keep_alive.clone(),
             ));
             let mut rxs = Vec::with_capacity(num_threads);
             for _ in 0..num_threads {
@@ -1075,6 +1084,7 @@ impl RinglineBuilder {
         let (blocking_pool, blocking_rxs) = if self.config.blocking_threads > 0 {
             let pool = Arc::new(crate::blocking::BlockingPool::start(
                 self.config.blocking_threads,
+                wake_keep_alive.clone(),
             ));
             let mut rxs = Vec::with_capacity(num_threads);
             for _ in 0..num_threads {
@@ -1218,6 +1228,7 @@ impl RinglineBuilder {
                 .map(|(idx, fds, _)| (*idx, fds[worker_id]))
                 .collect();
             config.merged_accept_live = merged_live.clone();
+            config.wake_keep_alive = Some(wake_keep_alive.clone());
             config.worker_index = worker_id;
             config.worker_loads = worker_loads.clone();
             config.worker_accepting = Some(worker_accepting.clone());
@@ -1252,6 +1263,7 @@ impl RinglineBuilder {
             let eventfd = (worker_eventfds.remove(0), worker_wake_fds[worker_id]);
             let worker_shutdown_flag = shutdown_flag.clone();
             let worker_listen_gates = listen_gates.clone();
+            let worker_wake_keep_alive = wake_keep_alive.clone();
             let worker_fn = worker_fn.clone();
             let startup_tx = startup_tx.clone();
 
@@ -1291,6 +1303,10 @@ impl RinglineBuilder {
             let spawn_result = thread::Builder::new()
                 .name(format!("ringline-worker-{worker_id}"))
                 .spawn(move || {
+                    // Keeps every worker's wake fd open until this worker exits:
+                    // its own eventfd, which its ring reads, and its peers', which
+                    // it may wake during shutdown.
+                    let _wake_keep_alive = worker_wake_keep_alive;
                     if config.worker.pin_to_core {
                         let core = pin_cpu;
                         // Report the failure before bailing — otherwise
@@ -1507,7 +1523,7 @@ impl RinglineBuilder {
                     listen_fd,
                     listener: crate::ListenerId::from_index(idx as u32),
                     worker_channels: worker_txs.clone(),
-                    worker_wake_handles: worker_wake_fds.clone(),
+                    worker_wake_handles: worker_wake_handles.clone(),
                     shutdown_flag: shutdown_flag.clone(),
                     listen_gates: listen_gates.clone(),
                     // A Unix listener has no TCP_NODELAY to set. This used to be
