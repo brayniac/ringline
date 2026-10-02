@@ -6276,11 +6276,17 @@ pub struct DiskIoFuture {
     pub(crate) seq: u32,
     /// Set once `poll` has returned `Ready`: the result has been taken.
     done: bool,
+    /// The worker whose executor holds `seq`.
+    owner: u32,
 }
 
 impl DiskIoFuture {
     pub(crate) fn new(seq: u32) -> Self {
-        DiskIoFuture { seq, done: false }
+        DiskIoFuture {
+            seq,
+            done: false,
+            owner: crate::runtime::waker::current_worker(),
+        }
     }
 }
 
@@ -6288,6 +6294,7 @@ impl Future for DiskIoFuture {
     type Output = io::Result<i32>;
 
     fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<i32>> {
+        assert!(!self.done, "DiskIoFuture polled after completion");
         let poll = with_state(|_driver, executor| {
             match executor.take_disk_io_result(self.seq) {
                 Some(result) if result < 0 => {
@@ -6311,7 +6318,9 @@ impl Future for DiskIoFuture {
 
 impl Drop for DiskIoFuture {
     fn drop(&mut self) {
-        if !self.done {
+        // Only the owning worker's executor holds the key. Dropped elsewhere
+        // (the future is `Send`), the key stays held there (#575).
+        if !self.done && crate::runtime::waker::current_worker() == self.owner {
             crate::fs::abandon_disk_io_key(self.seq);
         }
     }

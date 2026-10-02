@@ -359,6 +359,7 @@ impl Future for OpenFuture {
     type Output = io::Result<File>;
 
     fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<File>> {
+        assert!(!self.done, "OpenFuture polled after completion");
         let poll = with_state(
             |_driver, executor| match executor.take_disk_io_result(self.seq) {
                 Some(result) if result < 0 => {
@@ -477,7 +478,7 @@ pub(crate) fn release_orphans(
             // The open failed, and its slot is already free.
             Some(_) => {}
             None => {
-                executor.disk_io_live.remove(&seq);
+                crate::runtime::untrack_disk_io(seq);
                 executor.abandoned_fs_opens.insert(seq);
             }
         }
@@ -775,8 +776,8 @@ fn park_buffer(
         return;
     }
     // The graveyard now holds the key; `wake_disk_io` frees the buffer
-    // before it looks at `disk_io_live`.
-    executor.disk_io_live.remove(&seq);
+    // before it checks whether the key is held.
+    crate::runtime::untrack_disk_io(seq);
     executor.disk_io_graveyard.insert(seq, buf);
     #[cfg(has_io_uring)]
     {
@@ -837,26 +838,33 @@ pub fn stat(path: impl AsRef<std::path::Path>) -> io::Result<StatFuture> {
         let seq = ctx.fs_stat(path.as_ref())?;
         let task_id = CURRENT_TASK_ID.with(|c| c.get());
         executor.wait_disk_io(seq, task_id);
-        Ok(StatFuture { seq, done: false })
+        Ok(StatFuture {
+            seq,
+            done: false,
+            owner: crate::runtime::waker::current_worker(),
+        })
     })
 }
 
-/// Future that resolves to [`Metadata`] when the stat completes.
-///
-/// On io_uring the statx buffer is owned by the command slab entry, and on
-/// completion the handler converts it to [`Metadata`] and stores it in
-/// `Executor::fs_stat_results` before releasing the slab entry. On mio the
-/// disk-I/O pool returns the `Metadata`.
+/// Future that resolves to the file's [`Metadata`]. Dropping it before it
+/// resolves discards the result.
+// On io_uring the statx buffer is owned by the command slab entry, and on
+// completion the handler converts it to `Metadata` and stores it in
+// `Executor::fs_stat_results` before releasing the slab entry. On mio the
+// disk-I/O pool returns the `Metadata`.
 pub struct StatFuture {
     seq: u32,
     /// Set once `poll` has returned `Ready`: the result has been taken.
     done: bool,
+    /// The worker whose executor holds `seq`.
+    owner: u32,
 }
 
 impl Future for StatFuture {
     type Output = io::Result<Metadata>;
 
     fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<Metadata>> {
+        assert!(!self.done, "StatFuture polled after completion");
         let poll = with_state(|_driver, executor| {
             // First check if there's a normal error result (negative).
             match executor.take_disk_io_result(self.seq) {
@@ -891,14 +899,16 @@ impl Future for StatFuture {
 
 impl Drop for StatFuture {
     fn drop(&mut self) {
-        if !self.done {
+        // Only the owning worker's executor holds the key. Dropped elsewhere
+        // (the future is `Send`), the key stays held there (#575).
+        if !self.done && crate::runtime::waker::current_worker() == self.owner {
             abandon_disk_io_key(self.seq);
         }
     }
 }
 
 /// Forget a disk-I/O operation whose future was dropped before it resolved,
-/// so its result cannot be taken for a later operation's (#574). Inside a
+/// so its key and result are not held for the life of the worker (#574). Inside a
 /// task poll this calls [`Executor::abandon_disk_io`]; outside one (a
 /// connection's task dropped at teardown) it queues the key for
 /// [`release_orphans`].

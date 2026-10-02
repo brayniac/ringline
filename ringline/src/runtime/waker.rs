@@ -20,6 +20,11 @@ thread_local! {
     static CURRENT_WORKER: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
+/// The id of the worker whose executor runs on this thread, or 0.
+pub(crate) fn current_worker() -> u32 {
+    CURRENT_WORKER.with(|c| c.get())
+}
+
 /// Bit flag that distinguishes standalone tasks from connection tasks
 /// in the ready queue. Connection indices use bits 0..23 (max 16M),
 /// so bit 31 is always free for connection tasks.

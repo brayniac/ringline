@@ -496,10 +496,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.poll_ready_tasks();
             // Release what dropped fs futures left behind (abandoned
             // operations' results, abandoned opens' files, abandoned reads'
-            // and writes' buffers). Before the flush
-            // below submits this pass's SQEs, so an open whose future was
-            // dropped during the pass is marked abandoned before it can
-            // complete.
+            // and writes' buffers). Before the flush below submits this
+            // pass's SQEs, so an open whose future was dropped during the
+            // pass is marked abandoned before it can complete.
             crate::fs::release_orphans(&mut self.driver, &mut self.executor);
             diag_tasks_1st += tasks_before as u64;
             if tasks_before == 0 {
@@ -14025,6 +14024,30 @@ mod tests {
         // and pending_notifs is still 1 — will be released when the
         // notification CQE arrives).
         // The key assertion: no panic, no hang, retry was handled.
+    }
+
+    /// A key abandoned outside the executor (a future dropped with its
+    /// connection's task) is queued, and `release_orphans` stops holding it
+    /// and drops its result. Without the release the key and its result stay
+    /// held for the life of the worker.
+    #[test]
+    fn a_key_abandoned_outside_the_executor_is_released() {
+        let mut el = make_test_loop();
+        let key = 0x0123_0005;
+        el.executor.wait_disk_io(key, 0);
+        // Its result has arrived and nothing will take it.
+        el.executor.disk_io_results.insert(key, 0);
+
+        // CURRENT_DRIVER is unset here, as during connection teardown.
+        crate::fs::abandon_disk_io_key(key);
+        assert!(
+            crate::runtime::disk_io_key_held(key),
+            "the key is queued, not yet released"
+        );
+
+        crate::fs::release_orphans(&mut el.driver, &mut el.executor);
+        assert!(!crate::runtime::disk_io_key_held(key));
+        assert!(!el.executor.disk_io_results.contains_key(&key));
     }
 
     #[test]

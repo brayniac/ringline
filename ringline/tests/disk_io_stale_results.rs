@@ -2,7 +2,8 @@
 //! a later operation with the same key takes as its own completion (#574).
 //!
 //! On io_uring the key is a subsystem tag, a 14-bit sequence and the slab
-//! index, so it comes round again after 16,384 operations. A stale result under a read's key
+//! index. The sequence repeats every 16,384 operations; with one operation
+//! in flight each reuses the same slab slot, so the key repeats exactly. A stale result under a read's key
 //! made the read's dropped future free its buffer at once, while the kernel
 //! could still write into it.
 //!
@@ -440,8 +441,11 @@ async fn cycle_then_drop_a_read() -> Result<usize, String> {
     Ok(BUF_FREES.load(Ordering::SeqCst) - before)
 }
 
-/// A stat dropped with its connection's task leaves no result for the
-/// operation that reuses its key.
+/// A stat dropped with its connection's task leaves no result for a later
+/// operation to take. (That its key is then released, rather than held for
+/// the life of the worker, is checked by
+/// `a_key_abandoned_outside_the_executor_is_released` in the io_uring event
+/// loop's unit tests.)
 #[test]
 fn a_future_dropped_with_its_connection_leaves_no_result() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -500,4 +504,101 @@ fn a_future_dropped_with_its_connection_leaves_no_result() {
         frees, 0,
         "a result left by a future dropped at teardown freed the pending read's buffer"
     );
+}
+
+// ── A future that holds its result while its key comes round ───────────
+
+static HELD_OUTCOME: Mutex<Option<String>> = Mutex::new(None);
+
+struct HeldResult;
+
+impl AsyncEventHandler for HeldResult {
+    fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        Some(Box::pin(async {
+            let outcome = hold_a_result_while_the_key_comes_round().await;
+            *HELD_OUTCOME.lock().unwrap() = Some(outcome);
+            ringline::request_shutdown().ok();
+        }))
+    }
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
+        async {}
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        HeldResult
+    }
+}
+
+/// A stat is created and kept unpolled (a prefetch) while its result
+/// arrives and the sequence comes round. A read on an empty FIFO that would
+/// take the stat's key must stay pending, and the stat must still resolve.
+async fn hold_a_result_while_the_key_comes_round() -> String {
+    let dir = DIR.lock().unwrap().clone().unwrap();
+    let path = dir.join("file");
+    let fifo = ringline::fs::open(dir.join("fifo"), OpenFlags::READ_WRITE, 0)
+        .unwrap()
+        .await
+        .unwrap();
+    let held = ringline::fs::stat(&path).unwrap();
+    // The stat completes; its result waits for `held` to be polled.
+    ringline::sleep(Duration::from_millis(10)).await;
+    for _ in 1..KEY_PERIOD {
+        ringline::fs::stat(&path).unwrap().await.unwrap();
+    }
+    let read = ringline::fs::read_into(fifo, 0, BytesMut::with_capacity(4096)).unwrap();
+    let read = match ringline::timeout(Duration::from_millis(200), read).await {
+        Ok((result, _buf)) => {
+            format!("the read resolved with {result:?} while the kernel read was pending")
+        }
+        Err(_) => "read pending".to_string(),
+    };
+    let held = match ringline::timeout(Duration::from_millis(500), held).await {
+        Ok(result) => format!("stat resolved: {}", result.is_ok()),
+        Err(_) => "the held stat never resolved".to_string(),
+    };
+    format!("{read}; {held}")
+}
+
+/// A key a future still holds, with its result not yet taken, is not given
+/// to a later operation.
+#[test]
+fn a_held_key_is_not_reused() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = std::env::temp_dir().join(format!("ringline-held-key-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("file"), b"x").unwrap();
+    let fifo = dir.join("fifo");
+    let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    *DIR.lock().unwrap() = Some(dir.clone());
+
+    let config = ConfigBuilder::new()
+        .workers(1)
+        .pin_to_core(false)
+        .sq_entries(64)
+        .recv_buffer(16, 1024)
+        .max_connections(16)
+        .send_pool(16, 16384)
+        .blocking_threads(0)
+        .resolver_threads(0)
+        .spawner_threads(0)
+        .fs(FsConfig {
+            max_files: 4,
+            max_commands_in_flight: 64,
+        })
+        .build()
+        .expect("valid config");
+    let (_runtime, handles) = RinglineBuilder::new(config)
+        .launch::<HeldResult>()
+        .expect("launch");
+    for h in handles {
+        let _ = h.join();
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    let outcome = HELD_OUTCOME
+        .lock()
+        .unwrap()
+        .take()
+        .expect("on_start did not finish");
+    assert_eq!(outcome, "read pending; stat resolved: true");
 }

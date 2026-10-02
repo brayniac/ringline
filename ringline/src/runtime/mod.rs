@@ -410,6 +410,28 @@ impl TimerSlotPool {
     }
 }
 
+thread_local! {
+    // Disk-I/O keys a future holds on this worker: added when the future is
+    // created, removed when it takes its result or is dropped. The executor
+    // stores a result only for a held key, and the key allocators, which
+    // have the driver but not the executor, do not hand out a held key, so
+    // a result is never taken by an operation it does not belong to (#574).
+    static DISK_IO_LIVE: std::cell::RefCell<std::collections::HashSet<u32>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+/// Whether a future on this worker holds the disk-I/O key `key`.
+pub(crate) fn disk_io_key_held(key: u32) -> bool {
+    DISK_IO_LIVE.with(|live| live.borrow().contains(&key))
+}
+
+/// Stop holding the disk-I/O key `key` on this worker.
+pub(crate) fn untrack_disk_io(key: u32) {
+    DISK_IO_LIVE.with(|live| {
+        live.borrow_mut().remove(&key);
+    });
+}
+
 /// Per-worker async executor. Owns the task slab and coordinates
 /// CQE-driven wakeups with future polling.
 pub(crate) struct Executor {
@@ -515,12 +537,6 @@ pub(crate) struct Executor {
     pub(crate) disk_io_graveyard: HashMap<u32, bytes::BytesMut>,
     /// Filesystem stat results: maps disk-I/O key → Metadata (populated by handle_fs for Statx ops).
     pub(crate) fs_stat_results: HashMap<u32, crate::fs::Metadata>,
-    /// Disk-I/O keys a future is waiting on: added when the future is
-    /// created, removed when it takes its result or is dropped.
-    /// `wake_disk_io` stores a result only for a key in this set, so no
-    /// result is left for a later operation that reuses the key to take as
-    /// its own (#574).
-    pub(crate) disk_io_live: std::collections::HashSet<u32>,
     /// Disk I/O keys of opens whose `OpenFuture` was dropped before the open
     /// completed. The backend's completion handler closes the file and
     /// releases its slot instead of delivering the result.
@@ -637,7 +653,6 @@ impl Executor {
             disk_io_results: HashMap::new(),
             disk_io_graveyard: HashMap::new(),
             fs_stat_results: HashMap::new(),
-            disk_io_live: std::collections::HashSet::new(),
             abandoned_fs_opens: std::collections::HashSet::new(),
             pending_resolves: HashMap::new(),
             next_resolve_id: 0,
@@ -836,7 +851,7 @@ impl Executor {
     /// and mark `seq` as one a future is waiting on.
     pub(crate) fn wait_disk_io(&mut self, seq: u32, task_id: u32) {
         self.disk_io_waiters.insert(seq, task_id);
-        self.disk_io_live.insert(seq);
+        DISK_IO_LIVE.with(|live| live.borrow_mut().insert(seq));
     }
 
     /// Take the result of the operation `seq`, if it has completed. Taking
@@ -844,20 +859,20 @@ impl Executor {
     pub(crate) fn take_disk_io_result(&mut self, seq: u32) -> Option<i32> {
         let result = self.disk_io_results.remove(&seq);
         if result.is_some() {
-            self.disk_io_live.remove(&seq);
+            untrack_disk_io(seq);
         }
         result
     }
 
     /// Forget the operation `seq`, whose future was dropped before it took
     /// its result: remove its waiter, its result and stat metadata if they
-    /// have arrived, and its key from `disk_io_live`, so `wake_disk_io`
+    /// have arrived, and its key from the held set, so `wake_disk_io`
     /// discards a result that arrives later.
     pub(crate) fn abandon_disk_io(&mut self, seq: u32) {
         self.disk_io_waiters.remove(&seq);
         self.disk_io_results.remove(&seq);
         self.fs_stat_results.remove(&seq);
-        self.disk_io_live.remove(&seq);
+        untrack_disk_io(seq);
     }
 
     /// Wake a task that was waiting for a disk I/O completion.
@@ -865,7 +880,7 @@ impl Executor {
     /// If the key's buffer is in `disk_io_graveyard` (its future was dropped
     /// before the operation completed), frees the buffer and discards the
     /// result. Otherwise stores the result, and wakes the waiting task, only
-    /// if a future is waiting on the key (`disk_io_live`); the result of an
+    /// if a future holds the key ([`disk_io_key_held`]); the result of an
     /// operation whose future was dropped, or that was submitted without one,
     /// is discarded. Waiters and results are keyed by the disk-I/O key, not
     /// the connection.
@@ -874,7 +889,7 @@ impl Executor {
         if self.disk_io_graveyard.remove(&seq).is_some() {
             return;
         }
-        if !self.disk_io_live.contains(&seq) {
+        if !disk_io_key_held(seq) {
             // Nothing will take this result: its future was dropped, or the
             // operation was submitted without one.
             self.fs_stat_results.remove(&seq);

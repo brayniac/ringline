@@ -836,16 +836,23 @@ impl<'a> DriverCtx<'a> {
     /// Allocate a 32-bit disk-I/O completion key: the subsystem in the top 2
     /// bits, a 14-bit sequence below it, and the slab index in the low 16.
     /// fs, NVMe and direct I/O share the executor's completion and graveyard
-    /// maps but have independent slabs, each numbering its slots from 0. A
-    /// slab slot stays in use until its operation's completion arrives, so
-    /// the subsystem and slab index make the key unique among operations in
-    /// flight; the sequence separates successive uses of one slot. CQE
-    /// handlers extract the slab index from the low 16 bits and wake with the
-    /// full key.
+    /// maps but have independent slabs, each numbering its slots from 0.
+    /// CQE handlers extract the slab index from the low 16 bits and wake with
+    /// the full key.
+    ///
+    /// A key is held from submission until its future takes the result or is
+    /// dropped, which can be long after the slab slot is freed. A key a
+    /// future still holds is skipped, so no two held keys are equal.
     pub(crate) fn disk_io_key(&mut self, kind: DiskIoKind, slab_idx: u16) -> u32 {
-        let seq = *self.next_disk_io_seq;
-        *self.next_disk_io_seq = seq.wrapping_add(1);
-        ((kind as u32) << 30) | (((seq as u32) & 0x3FFF) << 16) | slab_idx as u32
+        for _ in 0..=0x3FFF {
+            let seq = *self.next_disk_io_seq;
+            *self.next_disk_io_seq = seq.wrapping_add(1);
+            let key = ((kind as u32) << 30) | (((seq as u32) & 0x3FFF) << 16) | slab_idx as u32;
+            if !crate::runtime::disk_io_key_held(key) {
+                return key;
+            }
+        }
+        panic!("every disk-I/O key for slab slot {slab_idx} is held by a future");
     }
 
     /// Queue a batch of built sends in order through the per-connection
@@ -3034,8 +3041,15 @@ impl<'a> DriverCtx<'a> {
             .as_ref()
             .ok_or_else(|| io::Error::other("disk I/O pool not configured"))?;
 
-        let seq = *self.next_disk_io_seq;
-        *self.next_disk_io_seq = seq.wrapping_add(1);
+        // Skip a key a future still holds; the u32 sequence can wrap on a
+        // long-running worker.
+        let seq = loop {
+            let seq = *self.next_disk_io_seq;
+            *self.next_disk_io_seq = seq.wrapping_add(1);
+            if !crate::runtime::disk_io_key_held(seq) {
+                break seq;
+            }
+        };
 
         pool.request_tx
             .send(crate::disk_io_pool::DiskIoRequest {
