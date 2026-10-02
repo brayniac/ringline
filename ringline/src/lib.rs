@@ -279,7 +279,8 @@ pub use runtime::io::ConnectFuture;
 pub use runtime::io::Connection;
 /// A monotonic clock deadline for absolute timers.
 pub use runtime::io::Deadline;
-/// Future that awaits a disk I/O completion (NVMe or Direct I/O).
+/// Future that awaits a disk-I/O completion (`fs::read`, `fs::write`,
+/// `fs::fsync`, `fs::rename`, `fs::remove`, `fs::mkdir`, NVMe, direct I/O).
 pub use runtime::io::DiskIoFuture;
 /// Error returned when a [`timeout()`] expires.
 pub use runtime::io::Elapsed;

@@ -319,7 +319,7 @@ pub fn open(
         let mut ctx = driver.make_ctx();
         let (file_index, generation, seq) = ctx.fs_open(path.as_ref(), flags, mode)?;
         let task_id = CURRENT_TASK_ID.with(|c| c.get());
-        executor.disk_io_waiters.insert(seq, task_id);
+        executor.wait_disk_io(seq, task_id);
         Ok(OpenFuture {
             seq,
             file_index,
@@ -359,23 +359,22 @@ impl Future for OpenFuture {
     type Output = io::Result<File>;
 
     fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<File>> {
-        let poll =
-            with_state(
-                |_driver, executor| match executor.disk_io_results.remove(&self.seq) {
-                    Some(result) if result < 0 => {
-                        Poll::Ready(Err(io::Error::from_raw_os_error(-result)))
-                    }
-                    Some(_) => Poll::Ready(Ok(File {
-                        index: self.file_index,
-                        generation: self.generation,
-                    })),
-                    None => {
-                        let task_id = CURRENT_TASK_ID.with(|c| c.get());
-                        executor.disk_io_waiters.insert(self.seq, task_id);
-                        Poll::Pending
-                    }
-                },
-            );
+        let poll = with_state(
+            |_driver, executor| match executor.take_disk_io_result(self.seq) {
+                Some(result) if result < 0 => {
+                    Poll::Ready(Err(io::Error::from_raw_os_error(-result)))
+                }
+                Some(_) => Poll::Ready(Ok(File {
+                    index: self.file_index,
+                    generation: self.generation,
+                })),
+                None => {
+                    let task_id = CURRENT_TASK_ID.with(|c| c.get());
+                    executor.wait_disk_io(self.seq, task_id);
+                    Poll::Pending
+                }
+            },
+        );
         if poll.is_ready() {
             self.done = true;
         }
@@ -430,10 +429,11 @@ impl Drop for OrphanedBuffers {
     }
 }
 
-/// Release what dropped fs futures queued: forget abandoned operations'
-/// results, close the files of abandoned opens and free their slots, and park
-/// or drop the buffers of abandoned reads and writes. Called by the event loop once per iteration, after its first
-/// task-poll pass.
+/// Release what dropped fs futures queued: drop abandoned operations'
+/// results, or stop tracking their keys so the results are discarded on
+/// arrival; close the files of abandoned opens and free their slots; and park
+/// or drop the buffers of abandoned reads and writes. Called by the event
+/// loop once per iteration, after its first task-poll pass.
 ///
 /// An open that has completed is closed now. One still in flight is marked in
 /// `abandoned_fs_opens`, and its completion handler closes it. A buffer whose
@@ -470,13 +470,14 @@ pub(crate) fn release_orphans(
     });
     for (seq, index, generation) in orphans {
         executor.disk_io_waiters.remove(&seq);
-        match executor.disk_io_results.remove(&seq) {
+        match executor.take_disk_io_result(seq) {
             Some(result) if result >= 0 => {
                 let _ = driver.make_ctx().fs_close(File { index, generation });
             }
             // The open failed, and its slot is already free.
             Some(_) => {}
             None => {
+                executor.disk_io_live.remove(&seq);
                 executor.abandoned_fs_opens.insert(seq);
             }
         }
@@ -503,7 +504,7 @@ pub unsafe fn read(file: File, offset: u64, buf: *mut u8, len: u32) -> io::Resul
         #[allow(unused_unsafe)]
         let seq = unsafe { ctx.fs_read(file, offset, buf, len)? };
         let task_id = CURRENT_TASK_ID.with(|c| c.get());
-        executor.disk_io_waiters.insert(seq, task_id);
+        executor.wait_disk_io(seq, task_id);
         Ok(DiskIoFuture::new(seq))
     })
 }
@@ -528,7 +529,7 @@ pub unsafe fn write(file: File, offset: u64, buf: *const u8, len: u32) -> io::Re
         #[allow(unused_unsafe)]
         let seq = unsafe { ctx.fs_write(file, offset, buf, len)? };
         let task_id = CURRENT_TASK_ID.with(|c| c.get());
-        executor.disk_io_waiters.insert(seq, task_id);
+        executor.wait_disk_io(seq, task_id);
         Ok(DiskIoFuture::new(seq))
     })
 }
@@ -581,7 +582,7 @@ pub fn read_into(file: File, offset: u64, mut buf: BytesMut) -> io::Result<ReadF
         // graveyard-on-drop (see ReadFuture::Drop).
         let seq = unsafe { ctx.fs_read(file, offset, ptr, len)? };
         let task_id = CURRENT_TASK_ID.with(|c| c.get());
-        executor.disk_io_waiters.insert(seq, task_id);
+        executor.wait_disk_io(seq, task_id);
         Ok(ReadFuture {
             seq,
             file_index,
@@ -623,7 +624,7 @@ pub fn write_from(file: File, offset: u64, buf: BytesMut) -> io::Result<WriteFut
         // graveyard-on-drop (see WriteFuture::Drop).
         let seq = unsafe { ctx.fs_write(file, offset, ptr, len_u32)? };
         let task_id = CURRENT_TASK_ID.with(|c| c.get());
-        executor.disk_io_waiters.insert(seq, task_id);
+        executor.wait_disk_io(seq, task_id);
         Ok(WriteFuture {
             seq,
             file_index,
@@ -649,7 +650,7 @@ impl Future for ReadFuture {
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
         let me = self.get_mut();
         with_state(|_driver, executor| {
-            match executor.disk_io_results.remove(&me.seq) {
+            match executor.take_disk_io_result(me.seq) {
                 Some(result) if result < 0 => {
                     let buf = me.buf.take().expect("ReadFuture polled after completion");
                     Poll::Ready((Err(io::Error::from_raw_os_error(-result)), buf))
@@ -666,7 +667,7 @@ impl Future for ReadFuture {
                 }
                 None => {
                     let task_id = CURRENT_TASK_ID.with(|c| c.get());
-                    executor.disk_io_waiters.insert(me.seq, task_id);
+                    executor.wait_disk_io(me.seq, task_id);
                     Poll::Pending
                 }
             }
@@ -697,7 +698,7 @@ impl Future for WriteFuture {
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
         let me = self.get_mut();
         with_state(
-            |_driver, executor| match executor.disk_io_results.remove(&me.seq) {
+            |_driver, executor| match executor.take_disk_io_result(me.seq) {
                 Some(result) if result < 0 => {
                     let buf = me.buf.take().expect("WriteFuture polled after completion");
                     Poll::Ready((Err(io::Error::from_raw_os_error(-result)), buf))
@@ -708,7 +709,7 @@ impl Future for WriteFuture {
                 }
                 None => {
                     let task_id = CURRENT_TASK_ID.with(|c| c.get());
-                    executor.disk_io_waiters.insert(me.seq, task_id);
+                    executor.wait_disk_io(me.seq, task_id);
                     Poll::Pending
                 }
             },
@@ -768,11 +769,14 @@ fn park_buffer(
     buf: BytesMut,
 ) {
     executor.disk_io_waiters.remove(&seq);
-    if executor.disk_io_results.remove(&seq).is_some() {
+    if executor.take_disk_io_result(seq).is_some() {
         // The operation has completed and released the buffer.
         drop(buf);
         return;
     }
+    // The graveyard now holds the key; `wake_disk_io` frees the buffer
+    // before it looks at `disk_io_live`.
+    executor.disk_io_live.remove(&seq);
     executor.disk_io_graveyard.insert(seq, buf);
     #[cfg(has_io_uring)]
     {
@@ -798,7 +802,7 @@ pub fn fsync(file: File) -> io::Result<DiskIoFuture> {
         let mut ctx = driver.make_ctx();
         let seq = ctx.fs_fsync(file)?;
         let task_id = CURRENT_TASK_ID.with(|c| c.get());
-        executor.disk_io_waiters.insert(seq, task_id);
+        executor.wait_disk_io(seq, task_id);
         Ok(DiskIoFuture::new(seq))
     })
 }
@@ -832,16 +836,17 @@ pub fn stat(path: impl AsRef<std::path::Path>) -> io::Result<StatFuture> {
         let mut ctx = driver.make_ctx();
         let seq = ctx.fs_stat(path.as_ref())?;
         let task_id = CURRENT_TASK_ID.with(|c| c.get());
-        executor.disk_io_waiters.insert(seq, task_id);
+        executor.wait_disk_io(seq, task_id);
         Ok(StatFuture { seq, done: false })
     })
 }
 
 /// Future that resolves to [`Metadata`] when the stat completes.
 ///
-/// The statx buffer is owned by the command slab entry. On CQE completion,
-/// the handler converts it to [`Metadata`] and stores it in
-/// `Executor::fs_stat_results` before releasing the slab entry.
+/// On io_uring the statx buffer is owned by the command slab entry, and on
+/// completion the handler converts it to [`Metadata`] and stores it in
+/// `Executor::fs_stat_results` before releasing the slab entry. On mio the
+/// disk-I/O pool returns the `Metadata`.
 pub struct StatFuture {
     seq: u32,
     /// Set once `poll` has returned `Ready`: the result has been taken.
@@ -854,7 +859,7 @@ impl Future for StatFuture {
     fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<Metadata>> {
         let poll = with_state(|_driver, executor| {
             // First check if there's a normal error result (negative).
-            match executor.disk_io_results.remove(&self.seq) {
+            match executor.take_disk_io_result(self.seq) {
                 Some(result) if result < 0 => {
                     // Also remove any stat result that might have been stored.
                     executor.fs_stat_results.remove(&self.seq);
@@ -872,7 +877,7 @@ impl Future for StatFuture {
                 }
                 None => {
                     let task_id = CURRENT_TASK_ID.with(|c| c.get());
-                    executor.disk_io_waiters.insert(self.seq, task_id);
+                    executor.wait_disk_io(self.seq, task_id);
                     Poll::Pending
                 }
             }
@@ -925,7 +930,7 @@ pub fn rename(
         let mut ctx = driver.make_ctx();
         let seq = ctx.fs_rename(from.as_ref(), to.as_ref())?;
         let task_id = CURRENT_TASK_ID.with(|c| c.get());
-        executor.disk_io_waiters.insert(seq, task_id);
+        executor.wait_disk_io(seq, task_id);
         Ok(DiskIoFuture::new(seq))
     })
 }
@@ -940,7 +945,7 @@ pub fn remove(path: impl AsRef<std::path::Path>) -> io::Result<DiskIoFuture> {
         let mut ctx = driver.make_ctx();
         let seq = ctx.fs_unlink(path.as_ref())?;
         let task_id = CURRENT_TASK_ID.with(|c| c.get());
-        executor.disk_io_waiters.insert(seq, task_id);
+        executor.wait_disk_io(seq, task_id);
         Ok(DiskIoFuture::new(seq))
     })
 }
@@ -955,7 +960,7 @@ pub fn mkdir(path: impl AsRef<std::path::Path>, mode: u32) -> io::Result<DiskIoF
         let mut ctx = driver.make_ctx();
         let seq = ctx.fs_mkdir(path.as_ref(), mode)?;
         let task_id = CURRENT_TASK_ID.with(|c| c.get());
-        executor.disk_io_waiters.insert(seq, task_id);
+        executor.wait_disk_io(seq, task_id);
         Ok(DiskIoFuture::new(seq))
     })
 }

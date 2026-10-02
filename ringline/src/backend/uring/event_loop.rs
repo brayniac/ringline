@@ -494,8 +494,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // Poll all ready tasks.
             let tasks_before = self.executor.ready_queue.len();
             self.poll_ready_tasks();
-            // Release what dropped fs futures left behind (abandoned opens'
-            // files, abandoned reads' and writes' buffers). Before the flush
+            // Release what dropped fs futures left behind (abandoned
+            // operations' results, abandoned opens' files, abandoned reads'
+            // and writes' buffers). Before the flush
             // below submits this pass's SQEs, so an open whose future was
             // dropped during the pass is marked abandoned before it can
             // complete.
@@ -14031,13 +14032,32 @@ mod tests {
         // fs/NVMe/direct-io share the executor's completion maps; the key
         // must differ across ops even for the same slab index (three
         // independent slabs all start their free lists at 0).
+        use crate::handler::DiskIoKind;
         let mut el = make_test_loop();
         let mut ctx = el.driver.make_ctx();
-        let k1 = ctx.disk_io_key(3);
-        let k2 = ctx.disk_io_key(3);
+        let k1 = ctx.disk_io_key(DiskIoKind::Fs, 3);
+        let k2 = ctx.disk_io_key(DiskIoKind::Fs, 3);
         assert_ne!(k1, k2, "same slab index must map to distinct keys");
         assert_eq!(k1 & 0xFFFF, 3, "low 16 bits must carry the slab index");
         assert_eq!(k2 & 0xFFFF, 3);
+
+        // Slot 3 of each subsystem's slab, whatever the sequence: an fs
+        // operation in flight never shares a key with a direct-I/O or NVMe
+        // one, even when the sequence has come round to the same value.
+        let fs = ctx.disk_io_key(DiskIoKind::Fs, 3);
+        for _ in 0..0x3FFF {
+            ctx.disk_io_key(DiskIoKind::Fs, 0);
+        }
+        let dio = ctx.disk_io_key(DiskIoKind::DirectIo, 3);
+        let nvme = ctx.disk_io_key(DiskIoKind::Nvme, 3);
+        assert_eq!(
+            fs & 0x3FFF_FFFF,
+            dio & 0x3FFF_FFFF,
+            "the sequence came round"
+        );
+        assert_ne!(fs, dio, "fs and direct-I/O keys must differ");
+        assert_ne!(fs, nvme, "fs and NVMe keys must differ");
+        assert_ne!(dio, nvme, "direct-I/O and NVMe keys must differ");
     }
 
     #[test]

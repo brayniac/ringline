@@ -248,14 +248,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Fixed
 
 - On io_uring, a `fs::read_into` or `fs::write_from` buffer could be freed
-  while the kernel could still write into it. A `DiskIoFuture` or
-  `StatFuture` (fsync, rename, remove, mkdir, stat, NVMe, direct I/O)
-  dropped before it resolved left its result behind, and the disk-I/O key
-  repeats after 65,536 operations, so a later read or write under the same
-  key took that result as its own completion: dropping its future freed the
-  buffer at once, and polling it returned before the kernel was done. A
-  dropped future now removes its result, or has it discarded when it
-  arrives, including when a connection's task is dropped at teardown (#574).
+  while the kernel could still be using it. A disk-I/O future (`fs::read`,
+  `fs::write`, fsync, rename, remove, mkdir, stat, NVMe, direct I/O) dropped
+  before it resolved, or an operation submitted through `DriverCtx` with no
+  future, left its result behind, and the disk-I/O key repeated after
+  65,536 operations, so a later read or write under the same key took that
+  result as its own completion. Results are now stored only for keys a
+  future is waiting on, and a dropped future gives up its key, including
+  when a connection's task is dropped at teardown. Keys also carry their
+  subsystem (fs, direct I/O, NVMe), so operations in flight on different
+  subsystems never share one (#574).
 
 - A connection closed while its task awaited `fs::read_into` or
   `fs::write_from` leaked the operation's buffer for the life of the

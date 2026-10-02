@@ -278,9 +278,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // 6. Collect wakeups and poll ready tasks.
             self.executor.collect_wakeups();
             self.poll_ready_tasks();
-            // Release what dropped fs futures left behind: close abandoned
-            // opens' files, and free or park abandoned reads' and writes'
-            // buffers. Futures dropped by `drain_pending_closes` below are
+            // Release what dropped fs futures left behind: abandoned
+            // operations' results, abandoned opens' files, and abandoned
+            // reads' and writes' buffers. Futures dropped by `drain_pending_closes` below are
             // released on the next iteration, after that iteration's drain.
             crate::fs::release_orphans(&mut self.driver, &mut self.executor);
 

@@ -6268,10 +6268,10 @@ impl<F: Future> Future for TimeoutFuture<F> {
 
 // ── Disk I/O async API ──────────────────────────────────────────────
 
-/// Future that awaits a disk I/O completion (NVMe or Direct I/O).
-///
-/// The io_uring SQE was submitted before this future was created.
-/// On completion, the CQE handler stores the result and wakes the task.
+/// Future that awaits a disk-I/O completion: `fs::read`, `fs::write`,
+/// `fs::fsync`, `fs::rename`, `fs::remove`, `fs::mkdir`, NVMe and direct
+/// I/O. The operation was submitted before this future was created;
+/// its completion stores the result and wakes the task.
 pub struct DiskIoFuture {
     pub(crate) seq: u32,
     /// Set once `poll` has returned `Ready`: the result has been taken.
@@ -6289,7 +6289,7 @@ impl Future for DiskIoFuture {
 
     fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<i32>> {
         let poll = with_state(|_driver, executor| {
-            match executor.disk_io_results.remove(&self.seq) {
+            match executor.take_disk_io_result(self.seq) {
                 Some(result) if result < 0 => {
                     Poll::Ready(Err(io::Error::from_raw_os_error(-result)))
                 }
@@ -6297,7 +6297,7 @@ impl Future for DiskIoFuture {
                 None => {
                     // Re-register waiter (polled before CQE arrived or after spurious wake).
                     let task_id = CURRENT_TASK_ID.with(|c| c.get());
-                    executor.disk_io_waiters.insert(self.seq, task_id);
+                    executor.wait_disk_io(self.seq, task_id);
                     Poll::Pending
                 }
             }
@@ -6373,7 +6373,7 @@ pub unsafe fn direct_io_read(
         #[allow(unused_unsafe)]
         let seq = unsafe { ctx.direct_io_read(file, offset, buf, len)? };
         let task_id = CURRENT_TASK_ID.with(|c| c.get());
-        executor.disk_io_waiters.insert(seq, task_id);
+        executor.wait_disk_io(seq, task_id);
         Ok(DiskIoFuture::new(seq))
     })
 }
@@ -6405,7 +6405,7 @@ pub unsafe fn nvme_read(
         // wrapper guarantees buf_addr/buf_len validity and lifetime.
         let seq = unsafe { ctx.nvme_read(device, lba, num_blocks, buf_addr, buf_len)? };
         let task_id = CURRENT_TASK_ID.with(|c| c.get());
-        executor.disk_io_waiters.insert(seq, task_id);
+        executor.wait_disk_io(seq, task_id);
         Ok(DiskIoFuture::new(seq))
     })
 }
@@ -6436,7 +6436,7 @@ pub unsafe fn direct_io_write(
         #[allow(unused_unsafe)]
         let seq = unsafe { ctx.direct_io_write(file, offset, buf, len)? };
         let task_id = CURRENT_TASK_ID.with(|c| c.get());
-        executor.disk_io_waiters.insert(seq, task_id);
+        executor.wait_disk_io(seq, task_id);
         Ok(DiskIoFuture::new(seq))
     })
 }
@@ -6455,7 +6455,7 @@ pub fn nvme_flush(device: crate::nvme::NvmeDevice) -> io::Result<DiskIoFuture> {
         let mut ctx = driver.make_ctx();
         let seq = ctx.nvme_flush(device)?;
         let task_id = CURRENT_TASK_ID.with(|c| c.get());
-        executor.disk_io_waiters.insert(seq, task_id);
+        executor.wait_disk_io(seq, task_id);
         Ok(DiskIoFuture::new(seq))
     })
 }
@@ -6486,7 +6486,7 @@ pub unsafe fn nvme_write(
         // SAFETY: forwarded contract — see nvme_read above.
         let seq = unsafe { ctx.nvme_write(device, lba, num_blocks, buf_addr, buf_len)? };
         let task_id = CURRENT_TASK_ID.with(|c| c.get());
-        executor.disk_io_waiters.insert(seq, task_id);
+        executor.wait_disk_io(seq, task_id);
         Ok(DiskIoFuture::new(seq))
     })
 }
