@@ -247,6 +247,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- On mio, `fs::close` (and `DriverCtx::close_direct_io_file`) closed the fd at
+  once, while a read, write or fsync queued on the disk-I/O pool still held its
+  number. If the number was reused first, the operation went to the wrong
+  file: a queued write landed in a file opened after the close. The fd now
+  closes once the operations queued on it have finished (#551).
+
+- On mio, a file that was never closed stayed open after its worker exited.
+  It now closes when the worker exits, or when the last operation queued on it
+  finishes, if that is later (#551).
+
+- An `OpenFuture` dropped before it resolved, including one owned by a
+  connection's task when the connection closed, left its file open and its
+  slot in the file table taken, on both backends, until the worker exited;
+  enough of them filled the table. The file is now closed and the slot freed
+  (#551).
+
+- On mio, files opened by `fs::open` and direct I/O files, and on io_uring,
+  NVMe devices and direct I/O files before they enter the fixed-file table,
+  are now opened close-on-exec (#551).
+
 - With `pin_to_core(true)`, a `core_offset` that put a worker on CPU 1024 or
   higher aborted the process: `libc::CPU_SET` panicked and the panic could
   not unwind. `launch()` now fails with an `InvalidInput` I/O error.

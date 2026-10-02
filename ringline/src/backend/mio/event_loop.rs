@@ -270,6 +270,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // 6. Collect wakeups and poll ready tasks.
             self.executor.collect_wakeups();
             self.poll_ready_tasks();
+            // Close the files of opens whose futures were dropped, before the
+            // next drain can deliver their completions.
+            crate::fs::release_orphaned_opens(&mut self.driver, &mut self.executor);
 
             // 6a. Flush pending sends queued during task polling, then
             // deliver the completions that flushing produced (completions
@@ -527,16 +530,20 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             while let Ok(response) = rx.try_recv() {
                 // Handle fs_open completions: install fd or release slot.
                 if let Some(file_index) = self.driver.pending_fs_opens.remove(&response.seq) {
-                    if let Some(opened) = response.opened {
-                        // Success: the fd moves into `fs_fds`, and `fs_close`
-                        // closes it. Worker exit does not.
-                        let fd = std::os::fd::IntoRawFd::into_raw_fd(opened);
-                        self.driver.fs_fds[file_index as usize] = Some(fd as std::os::fd::RawFd);
-                        if let Some(ref mut files) = self.driver.fs_files
-                            && let Some(f) = files.get_mut(file_index)
-                        {
-                            f.fd_index = fd as u32;
+                    if self.executor.abandoned_fs_opens.remove(&response.seq) {
+                        // Nothing holds a handle to this file: drop the fd, if
+                        // the open succeeded, and free the slot.
+                        drop(response.opened);
+                        if let Some(ref mut files) = self.driver.fs_files {
+                            files.release(file_index);
                         }
+                        continue;
+                    }
+                    if let Some(opened) = response.opened {
+                        // Success: the fd moves into `fs_fds`. It closes when
+                        // `fs_close` and every operation queued on it have
+                        // dropped their holds, or when the worker exits.
+                        self.driver.fs_fds[file_index as usize] = Some(std::sync::Arc::new(opened));
                         // Convert to success (0) for the OpenFuture.
                         self.executor.wake_disk_io(response.seq, 0);
                     } else {

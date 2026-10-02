@@ -1509,7 +1509,7 @@ impl<'a> DriverCtx<'a> {
         // Open the NVMe-generic character device.
         let c_path =
             std::ffi::CString::new(path).map_err(|_| io::Error::other("invalid device path"))?;
-        let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDWR) };
+        let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
         if fd < 0 {
             devices.release(index);
             return Err(io::Error::last_os_error());
@@ -1750,7 +1750,12 @@ impl<'a> DriverCtx<'a> {
         // Open with O_DIRECT | O_RDWR.
         let c_path =
             std::ffi::CString::new(path).map_err(|_| io::Error::other("invalid file path"))?;
-        let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDWR | libc::O_DIRECT) };
+        let fd = unsafe {
+            libc::open(
+                c_path.as_ptr(),
+                libc::O_RDWR | libc::O_DIRECT | libc::O_CLOEXEC,
+            )
+        };
         if fd < 0 {
             files.release(index);
             return Err(io::Error::last_os_error());
@@ -2475,12 +2480,12 @@ pub struct DriverCtx<'a> {
     pub(crate) next_disk_io_seq: &'a mut u32,
     /// Direct I/O file table.
     pub(crate) direct_io_files: &'a mut Option<crate::direct_io::DirectIoFileTable>,
-    /// Raw fds for direct I/O files, indexed by file slot.
-    pub(crate) direct_io_fds: &'a mut Vec<Option<std::os::fd::RawFd>>,
+    /// Direct I/O fds, indexed by file slot.
+    pub(crate) direct_io_fds: &'a mut Vec<Option<std::sync::Arc<std::os::fd::OwnedFd>>>,
     /// Filesystem file table.
     pub(crate) fs_files: &'a mut Option<crate::fs::FsFileTable>,
-    /// Raw fds for filesystem files, indexed by file slot.
-    pub(crate) fs_fds: &'a mut Vec<Option<std::os::fd::RawFd>>,
+    /// Filesystem fds, indexed by file slot.
+    pub(crate) fs_fds: &'a mut Vec<Option<std::sync::Arc<std::os::fd::OwnedFd>>>,
     /// Pending fs_open requests: maps seq → file_index.
     pub(crate) pending_fs_opens: &'a mut std::collections::HashMap<u32, u16>,
 }
@@ -3070,11 +3075,13 @@ impl<'a> DriverCtx<'a> {
         #[cfg(not(target_os = "linux"))]
         let flags = libc::O_RDWR;
 
-        let fd = unsafe { libc::open(c_path.as_ptr(), flags) };
+        let fd = unsafe { libc::open(c_path.as_ptr(), flags | libc::O_CLOEXEC) };
         if fd < 0 {
             files.release(index);
             return Err(io::Error::last_os_error());
         }
+        // SAFETY: `open` returned a fresh descriptor nothing else owns.
+        let owned: std::os::fd::OwnedFd = unsafe { std::os::fd::FromRawFd::from_raw_fd(fd) };
 
         // On macOS, use F_NOCACHE to bypass the page cache.
         #[cfg(target_os = "macos")]
@@ -3084,11 +3091,7 @@ impl<'a> DriverCtx<'a> {
             }
         }
 
-        // Store the fd.
-        if let Some(f) = files.get_mut(index) {
-            f.fd_index = fd as u32;
-        }
-        self.direct_io_fds[index as usize] = Some(fd);
+        self.direct_io_fds[index as usize] = Some(std::sync::Arc::new(owned));
 
         let generation = files.get(index).map(|f| f.generation).unwrap_or(0);
         Ok(crate::direct_io::DirectIoFile { index, generation })
@@ -3109,7 +3112,7 @@ impl<'a> DriverCtx<'a> {
         let work = Box::new(move || {
             let result = unsafe {
                 libc::pread(
-                    fd,
+                    std::os::fd::AsRawFd::as_raw_fd(&*fd),
                     buf_addr as *mut libc::c_void,
                     len as usize,
                     offset as libc::off_t,
@@ -3146,7 +3149,7 @@ impl<'a> DriverCtx<'a> {
         let work = Box::new(move || {
             let result = unsafe {
                 libc::pwrite(
-                    fd,
+                    std::os::fd::AsRawFd::as_raw_fd(&*fd),
                     buf_addr as *const libc::c_void,
                     len as usize,
                     offset as libc::off_t,
@@ -3172,7 +3175,7 @@ impl<'a> DriverCtx<'a> {
     pub fn direct_io_fsync(&mut self, file: crate::direct_io::DirectIoFile) -> io::Result<u32> {
         let fd = self.validate_direct_io_file(file)?;
         let work = Box::new(move || {
-            let result = unsafe { libc::fsync(fd) };
+            let result = unsafe { libc::fsync(std::os::fd::AsRawFd::as_raw_fd(&*fd)) };
             let r = if result < 0 {
                 -(io::Error::last_os_error()
                     .raw_os_error()
@@ -3189,12 +3192,12 @@ impl<'a> DriverCtx<'a> {
         self.submit_disk_io(work)
     }
 
-    /// Close a direct I/O file. Synchronous — closes the fd and releases the slot.
+    /// Close a direct I/O file and release its slot.
+    ///
+    /// The fd closes once the operations already queued on it have finished;
+    /// the handle is invalid at once.
     pub fn close_direct_io_file(&mut self, file: crate::direct_io::DirectIoFile) -> io::Result<()> {
-        let fd = self.validate_direct_io_file(file)?;
-        unsafe {
-            libc::close(fd);
-        }
+        self.validate_direct_io_file(file)?;
         self.direct_io_fds[file.index as usize] = None;
         if let Some(files) = self.direct_io_files.as_mut() {
             files.release(file.index);
@@ -3202,11 +3205,11 @@ impl<'a> DriverCtx<'a> {
         Ok(())
     }
 
-    /// Validate a direct I/O file handle and return the raw fd.
+    /// Validate a direct I/O file handle and return a hold on its fd.
     fn validate_direct_io_file(
         &self,
         file: crate::direct_io::DirectIoFile,
-    ) -> io::Result<std::os::fd::RawFd> {
+    ) -> io::Result<std::sync::Arc<std::os::fd::OwnedFd>> {
         let files = self
             .direct_io_files
             .as_ref()
@@ -3218,6 +3221,7 @@ impl<'a> DriverCtx<'a> {
             return Err(io::Error::other("stale direct I/O file handle"));
         }
         self.direct_io_fds[file.index as usize]
+            .clone()
             .ok_or_else(|| io::Error::other("direct I/O file fd not found"))
     }
 
@@ -3253,7 +3257,13 @@ impl<'a> DriverCtx<'a> {
 
         let open_flags = flags.0;
         let work = Box::new(move || {
-            let fd = unsafe { libc::open(c_path.as_ptr(), open_flags, mode as libc::c_int) };
+            let fd = unsafe {
+                libc::open(
+                    c_path.as_ptr(),
+                    open_flags | libc::O_CLOEXEC,
+                    mode as libc::c_int,
+                )
+            };
             if fd < 0 {
                 let errno = io::Error::last_os_error()
                     .raw_os_error()
@@ -3300,7 +3310,7 @@ impl<'a> DriverCtx<'a> {
         let work = Box::new(move || {
             let result = unsafe {
                 libc::pread(
-                    fd,
+                    std::os::fd::AsRawFd::as_raw_fd(&*fd),
                     buf_addr as *mut libc::c_void,
                     len as usize,
                     offset as libc::off_t,
@@ -3335,7 +3345,7 @@ impl<'a> DriverCtx<'a> {
         let work = Box::new(move || {
             let result = unsafe {
                 libc::pwrite(
-                    fd,
+                    std::os::fd::AsRawFd::as_raw_fd(&*fd),
                     buf_addr as *const libc::c_void,
                     len as usize,
                     offset as libc::off_t,
@@ -3361,7 +3371,7 @@ impl<'a> DriverCtx<'a> {
     pub(crate) fn fs_fsync(&mut self, file: crate::fs::File) -> io::Result<u32> {
         let fd = self.validate_fs_file(file)?;
         let work = Box::new(move || {
-            let result = unsafe { libc::fsync(fd) };
+            let result = unsafe { libc::fsync(std::os::fd::AsRawFd::as_raw_fd(&*fd)) };
             let r = if result < 0 {
                 -(io::Error::last_os_error()
                     .raw_os_error()
@@ -3378,12 +3388,12 @@ impl<'a> DriverCtx<'a> {
         self.submit_disk_io(work)
     }
 
-    /// Close a filesystem file. Synchronous — closes the fd and releases the slot.
+    /// Close a filesystem file and release its slot.
+    ///
+    /// The fd closes once the operations already queued on it have finished;
+    /// the handle is invalid at once.
     pub(crate) fn fs_close(&mut self, file: crate::fs::File) -> io::Result<()> {
-        let fd = self.validate_fs_file(file)?;
-        unsafe {
-            libc::close(fd);
-        }
+        self.validate_fs_file(file)?;
         self.fs_fds[file.index as usize] = None;
         if let Some(files) = self.fs_files.as_mut() {
             files.release(file.index);
@@ -3490,8 +3500,11 @@ impl<'a> DriverCtx<'a> {
         self.submit_disk_io(work)
     }
 
-    /// Validate a filesystem file handle and return the raw fd.
-    fn validate_fs_file(&self, file: crate::fs::File) -> io::Result<std::os::fd::RawFd> {
+    /// Validate a filesystem file handle and return a hold on its fd.
+    fn validate_fs_file(
+        &self,
+        file: crate::fs::File,
+    ) -> io::Result<std::sync::Arc<std::os::fd::OwnedFd>> {
         let files = self
             .fs_files
             .as_ref()
@@ -3503,6 +3516,7 @@ impl<'a> DriverCtx<'a> {
             return Err(io::Error::other("stale filesystem file handle"));
         }
         self.fs_fds[file.index as usize]
+            .clone()
             .ok_or_else(|| io::Error::other("filesystem file fd not found"))
     }
 }

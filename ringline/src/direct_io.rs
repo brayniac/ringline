@@ -49,7 +49,8 @@ impl DirectIoFile {
 
 /// Per-file state tracked by the driver.
 pub(crate) struct DirectIoFileState {
-    /// Index in the io_uring fixed file table.
+    /// Index in the io_uring fixed file table. Unused on mio, where the fd
+    /// lives in the driver's `direct_io_fds`.
     pub fd_index: u32,
     /// Whether this slot is in use.
     pub active: bool,

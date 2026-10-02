@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 use std::io;
 use std::net::SocketAddr;
-use std::os::fd::RawFd;
+use std::os::fd::{OwnedFd, RawFd};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -259,19 +259,24 @@ pub(crate) struct Driver {
     pub(crate) next_disk_io_seq: u32,
 
     // ── Direct I/O file management ──────────��───────────────────────
-    /// Direct I/O file table (allocates file slots, tracks raw fds).
+    /// Direct I/O file table (allocates file slots and generations).
     pub(crate) direct_io_files: Option<crate::direct_io::DirectIoFileTable>,
-    /// Raw fds for direct I/O files, indexed by file slot.
-    pub(crate) direct_io_fds: Vec<Option<RawFd>>,
+    /// Direct I/O fds, indexed by file slot. Each operation queued on the
+    /// disk-I/O pool holds a clone, so closing a file leaves its fd open until
+    /// those operations finish.
+    pub(crate) direct_io_fds: Vec<Option<Arc<OwnedFd>>>,
 
     // ── Filesystem file management ──────────────────────────────────
-    /// Filesystem file table (allocates file slots, tracks raw fds).
+    /// Filesystem file table (allocates file slots and generations).
     pub(crate) fs_files: Option<crate::fs::FsFileTable>,
-    /// Raw fds for filesystem files, indexed by file slot.
-    pub(crate) fs_fds: Vec<Option<RawFd>>,
+    /// Filesystem fds, indexed by file slot, shared with queued pool
+    /// operations as `direct_io_fds` is.
+    pub(crate) fs_fds: Vec<Option<Arc<OwnedFd>>>,
     /// Pending fs_open requests: maps seq → file_index. On completion, the
     /// opened fd (`DiskIoResponse::opened`) is stored in `fs_fds[file_index]`.
-    /// On failure, the file slot is released.
+    /// On failure, the file slot is released. If the seq is in
+    /// `Executor::abandoned_fs_opens`, the fd is dropped and the slot released
+    /// instead.
     pub(crate) pending_fs_opens: std::collections::HashMap<u32, u16>,
 }
 
