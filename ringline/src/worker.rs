@@ -845,9 +845,10 @@ impl RinglineBuilder {
 
     /// Bind a UDP socket on each worker (with `SO_REUSEPORT`) and immediately
     /// `connect(2)` it to `peer`. The kernel then filters incoming datagrams
-    /// to `peer` and the runtime uses the lighter `RecvUdp`/`SendUdp`
-    /// opcodes instead of `RecvMsgUdp`/`SendMsgUdp`. Saves ~4 microseconds
-    /// per round trip on single-shot client workloads.
+    /// to `peer`, on both backends. On io_uring the runtime also uses the
+    /// lighter `RecvUdp`/`SendUdp` opcodes instead of
+    /// `RecvMsgUdp`/`SendMsgUdp`, which saves ~4 microseconds per round trip
+    /// on single-shot client workloads.
     ///
     /// With a zero local port, each worker's socket gets its own port and
     /// receives the replies to what it sent. [`Runtime::bound_udp_addrs`]

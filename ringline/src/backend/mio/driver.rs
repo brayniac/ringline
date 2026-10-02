@@ -238,6 +238,9 @@ pub(crate) struct Driver {
     pub(crate) capacity_released: bool,
     /// Bound UDP sockets (one per `config.udp_bind` address).
     pub(crate) udp_sockets: Vec<mio::net::UdpSocket>,
+    /// The peer each UDP socket is `connect(2)`ed to, parallel to
+    /// `udp_sockets`. `None` for an unconnected bind.
+    pub(crate) udp_connected_peers: Vec<Option<SocketAddr>>,
     /// Whether UDP GRO was requested; when set, the readable handler uses
     /// `recvmsg` with a control buffer to read the `UDP_GRO` segment size.
     /// Only consulted on Linux (GRO is a Linux feature).
@@ -342,10 +345,20 @@ impl Driver {
         // setups (each worker creates its own socket bound to the same
         // address).
         let mut udp_sockets = Vec::with_capacity(config.udp_bind.len());
+        let mut udp_connected_peers = Vec::with_capacity(config.udp_bind.len());
         for (i, addr) in config.udp_bind.iter().enumerate() {
             let std_socket =
                 bind_udp_with_reuseport(*addr, config.udp_gro, config.take_udp_reserved(i))
                     .map_err(|e| io::Error::new(e.kind(), format!("UDP bind {addr}: {e}")))?;
+            // A connected bind: the kernel then delivers only datagrams from
+            // `peer`, as on io_uring.
+            let peer = config.udp_connect_peers.get(i).copied().flatten();
+            if let Some(peer) = peer {
+                std_socket.connect(peer).map_err(|e| {
+                    io::Error::new(e.kind(), format!("UDP connect {addr} -> {peer}: {e}"))
+                })?;
+            }
+            udp_connected_peers.push(peer);
             std_socket.set_nonblocking(true)?;
             let mut mio_socket = mio::net::UdpSocket::from_std(std_socket);
             poll.registry().register(
@@ -426,6 +439,7 @@ impl Driver {
             bounded_send_completions: VecDeque::new(),
             capacity_released: false,
             udp_sockets,
+            udp_connected_peers,
             udp_gro: config.udp_gro,
             udp_token_base,
             disk_io_rx,

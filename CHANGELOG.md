@@ -247,6 +247,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- On mio, `RinglineBuilder::bind_udp_connected` / `ConfigBuilder::udp_bind_connected`
+  bound the socket but never `connect(2)`ed it, so a datagram from any
+  source reached the handler. The socket is now connected to the peer, as
+  on io_uring, and the kernel delivers only the peer's datagrams. A send to
+  the connected peer uses `send`, since macOS refuses `sendto` with an
+  address on a connected socket (#549).
+
 - `SendHalf::forward_recv_buf` / `Connection::forward_recv_buf` on io_uring
   acted on the connection slot before checking the handle's generation. A
   stale handle (its connection closed and the slot reused), called with the

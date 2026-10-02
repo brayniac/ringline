@@ -2539,3 +2539,79 @@ fn udp_recv_batch_drains_a_full_batch_in_one_call() {
         drains.len()
     );
 }
+
+// ── Connected binds filter by peer (#549) ──────────────────────────────
+
+static FILTER_PEER: Mutex<Option<SocketAddr>> = Mutex::new(None);
+static FILTER_RECEIVED: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+
+/// Greets its connected peer, so the peer learns this socket's address, then
+/// records every datagram it receives.
+struct ConnectedRecorder;
+
+impl AsyncEventHandler for ConnectedRecorder {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
+        async move {}
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        ConnectedRecorder
+    }
+
+    fn on_udp_bind(&self, udp: UdpCtx) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        let peer = FILTER_PEER.lock().unwrap().expect("peer set");
+        Some(Box::pin(async move {
+            while udp.send_to(peer, b"hello").is_err() {
+                udp.send_ready().await;
+            }
+            loop {
+                let (data, _from) = udp.recv_from().await;
+                FILTER_RECEIVED.lock().unwrap().push(data);
+            }
+        }))
+    }
+}
+
+/// A connected bind receives datagrams from its peer only.
+#[test]
+fn udp_connected_bind_drops_datagrams_from_other_sources() {
+    let _guard = UDP_SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    FILTER_RECEIVED.lock().unwrap().clear();
+    let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let peer_addr = peer.local_addr().unwrap();
+    *FILTER_PEER.lock().unwrap() = Some(peer_addr);
+
+    let (runtime, handles) = RinglineBuilder::new(base_config())
+        .bind_udp_connected("127.0.0.1:0".parse().unwrap(), peer_addr)
+        .launch::<ConnectedRecorder>()
+        .expect("launch");
+
+    // The greeting carries the worker socket's address.
+    let mut buf = [0u8; 64];
+    let (n, server) = peer.recv_from(&mut buf).expect("greeting");
+    assert_eq!(&buf[..n], b"hello");
+
+    // An intruder first, so a missing filter delivers it before the peer's.
+    let intruder = UdpSocket::bind("127.0.0.1:0").unwrap();
+    intruder.send_to(b"intruder", server).unwrap();
+    peer.send_to(b"from peer", server).unwrap();
+
+    let mut received = Vec::new();
+    for _ in 0..500 {
+        received = FILTER_RECEIVED.lock().unwrap().clone();
+        if !received.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    runtime.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+    assert_eq!(
+        received,
+        vec![b"from peer".to_vec()],
+        "a connected bind received a datagram from a source other than its peer"
+    );
+}

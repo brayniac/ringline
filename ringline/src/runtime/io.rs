@@ -6652,7 +6652,14 @@ impl UdpCtx {
                     "invalid UDP socket index",
                 )));
             }
-            match driver.udp_sockets[idx].send_to(data, peer) {
+            // A connected socket sends to its peer with `send`: macOS refuses
+            // `sendto` with an address on a connected socket (EISCONN).
+            let sent = if driver.udp_connected_peers[idx] == Some(peer) {
+                driver.udp_sockets[idx].send(data)
+            } else {
+                driver.udp_sockets[idx].send_to(data, peer)
+            };
+            match sent {
                 Ok(_) => {
                     crate::metrics::UDP.increment(crate::metrics::udp::DATAGRAMS_SENT);
                     Ok(())
