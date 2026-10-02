@@ -6632,8 +6632,9 @@ impl UdpCtx {
 
     /// Send a datagram to the given peer (fire-and-forget, copying).
     ///
-    /// Copies `data` into the send pool and submits a `sendmsg` SQE.
-    /// Only one send can be in-flight per UDP socket at a time.
+    /// Copies `data` into the send pool and submits a send SQE; up to
+    /// [`udp_send_slots`](crate::ConfigBuilder::udp_send_slots) sends can be in
+    /// flight per socket.
     #[cfg(has_io_uring)]
     pub fn send_to(&self, peer: SocketAddr, data: &[u8]) -> Result<(), crate::error::UdpSendError> {
         with_state(|driver, _executor| driver.udp_send_to(self.udp_index, peer, data, None))
@@ -6655,7 +6656,15 @@ impl UdpCtx {
             // A connected socket sends to its peer with `send`: macOS refuses
             // `sendto` with an address on a connected socket (EISCONN).
             let sent = if driver.udp_connected_peers[idx] == Some(peer) {
-                driver.udp_sockets[idx].send(data)
+                match driver.udp_sockets[idx].send(data) {
+                    // A connected socket reports an earlier ICMP
+                    // port-unreachable once, on the next send, which then
+                    // sends nothing. The error is cleared, so send again.
+                    Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
+                        driver.udp_sockets[idx].send(data)
+                    }
+                    other => other,
+                }
             } else {
                 driver.udp_sockets[idx].send_to(data, peer)
             };

@@ -1123,7 +1123,14 @@ impl ConfigBuilder {
     /// kernel filters incoming datagrams to `peer`, on both backends. On
     /// io_uring the runtime also uses the lighter `RecvUdp`/`SendUdp`
     /// opcodes instead of the `RecvMsgUdp`/`SendMsgUdp` pair, which saves
-    /// ~4 microseconds per round trip on single-shot client workloads. A zero local port behaves as in
+    /// ~4 microseconds per round trip on single-shot client workloads.
+    ///
+    /// `launch` returns an error if `connect(2)` fails, for example when
+    /// `peer` is in a different address family from `local`. A `send_to` an
+    /// address other than `peer` is sent on Linux; on macOS it fails with
+    /// `EISCONN`.
+    ///
+    /// A zero local port behaves as in
     /// [`RinglineBuilder::bind_udp_connected`](crate::RinglineBuilder::bind_udp_connected).
     pub fn udp_bind_connected(mut self, local: SocketAddr, peer: SocketAddr) -> Self {
         self.config.udp_bind.push(local);

@@ -391,8 +391,8 @@ impl ringline::AsyncEventHandler for RinglineUdpClient {
             while !state.stop.load(Ordering::Relaxed) {
                 let t0 = Instant::now();
 
-                // Send_to with the connected peer hits the lighter
-                // `IORING_OP_SEND` path inside ringline; no per-send msghdr
+                // On io_uring, send_to with the connected peer hits the
+                // lighter `IORING_OP_SEND` path inside ringline; no per-send msghdr
                 // setup, no kernel copy_from_user of msghdr/iovec/sockaddr.
                 loop {
                     match udp.send_to(state.server_addr, &msg) {
@@ -476,8 +476,8 @@ fn run_bench_ringline(
     let mut builder = ringline::RinglineBuilder::new(config);
     for _ in 0..num_clients {
         // Each client binds an ephemeral local port and `connect()`s to the
-        // server. Connected sockets get the lighter RecvUdp/SendUdp opcode
-        // path inside the runtime.
+        // server. On io_uring, connected sockets get the lighter
+        // RecvUdp/SendUdp opcode path inside the runtime.
         builder = builder.bind_udp_connected(port_manager.next_addr(), server_addr);
     }
 

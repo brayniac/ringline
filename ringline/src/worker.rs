@@ -850,6 +850,11 @@ impl RinglineBuilder {
     /// `RecvMsgUdp`/`SendMsgUdp`, which saves ~4 microseconds per round trip
     /// on single-shot client workloads.
     ///
+    /// `launch` returns an error if `connect(2)` fails, for example when
+    /// `peer` is in a different address family from `local`. A `send_to` an
+    /// address other than `peer` is sent on Linux; on macOS it fails with
+    /// `EISCONN`.
+    ///
     /// With a zero local port, each worker's socket gets its own port and
     /// receives the replies to what it sent. [`Runtime::bound_udp_addrs`]
     /// reports `None` for this bind.
