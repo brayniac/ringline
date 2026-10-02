@@ -247,6 +247,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A `fs::read_into` or `fs::write_from` future dropped while its operation
+  was in flight, by a connection's task torn down when the connection
+  closed, leaked its buffer for the life of the process: the drop runs
+  outside the executor, and the buffer was forgotten rather than parked. It
+  is now queued, and the event loop parks it until the operation completes
+  and then frees it, as for a future dropped inside a task poll (#568).
+
 - On mio, `RinglineBuilder::bind_udp_connected` /
   `ConfigBuilder::udp_bind_connected` bound the socket but never
   `connect(2)`ed it, so a datagram from any source reached the handler. The

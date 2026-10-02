@@ -405,18 +405,52 @@ thread_local! {
     // key, file slot, generation)`. Nothing holds a handle to these files.
     static ORPHANED_OPENS: std::cell::RefCell<Vec<(u32, u16, u16)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    // Buffers of reads and writes whose future was dropped outside the
+    // executor, before the operation completed.
+    static ORPHANED_BUFFERS: std::cell::RefCell<OrphanedBuffers> =
+        const { std::cell::RefCell::new(OrphanedBuffers(Vec::new())) };
 }
 
-/// Close the files of opens whose `OpenFuture` was dropped, and free their
-/// slots. Called by the event loop once per iteration, after it has delivered
-/// that iteration's completions.
+/// Buffers of abandoned reads and writes, as `(disk I/O key, file slot,
+/// buffer)`, waiting for the event loop to park or drop them.
+struct OrphanedBuffers(Vec<(u32, u16, BytesMut)>);
+
+impl Drop for OrphanedBuffers {
+    fn drop(&mut self) {
+        // Dropped when the worker thread exits. The operations may still be
+        // running and writing into these buffers, so leak them, as the
+        // executor's graveyard does at exit.
+        for (_, _, buf) in self.0.drain(..) {
+            std::mem::forget(buf);
+        }
+    }
+}
+
+/// Release what futures dropped outside the executor left behind: close the
+/// files of abandoned opens and free their slots, and park or drop the
+/// buffers of abandoned reads and writes. Called by the event loop once per
+/// iteration, right after its task-poll pass.
 ///
 /// An open that has completed is closed now. One still in flight is marked in
-/// `abandoned_fs_opens`, and its completion handler closes it.
-pub(crate) fn release_orphaned_opens(
+/// `abandoned_fs_opens`, and its completion handler closes it. A buffer whose
+/// operation has completed is dropped now; one still in flight is parked in
+/// the graveyard until the completion arrives.
+pub(crate) fn release_orphans(
     driver: &mut crate::backend::Driver,
     executor: &mut crate::runtime::Executor,
 ) {
+    let buffers = ORPHANED_BUFFERS.with(|orphans| {
+        let mut orphans = orphans.borrow_mut();
+        if orphans.0.is_empty() {
+            Vec::new()
+        } else {
+            std::mem::take(&mut orphans.0)
+        }
+    });
+    for (seq, file_index, buf) in buffers {
+        park_buffer(driver, executor, seq, file_index, buf);
+    }
+
     let orphans = ORPHANED_OPENS.with(|orphans| {
         let mut orphans = orphans.borrow_mut();
         if orphans.is_empty() {
@@ -691,29 +725,47 @@ impl Drop for WriteFuture {
 /// (the syscall is already in-flight on a worker thread); the buffer just
 /// waits in the graveyard until the worker thread finishes.
 fn park_or_drop(seq: u32, file_index: u16, buf: BytesMut) {
-    let opt_non_null = CURRENT_DRIVER.with(|c| c.get());
-    if opt_non_null.is_none() {
-        // Outside the executor — leak the buffer rather than risk freeing
-        // memory the kernel may still write into. This shouldn't happen in
-        // practice (futures are owned by tasks pinned to a worker thread),
-        // but `forget` is the safe fallback if it ever does.
-        std::mem::forget(buf);
+    let Some(mut non_null) = CURRENT_DRIVER.with(|c| c.get()) else {
+        // Outside the executor: a connection's task is dropped outside any
+        // task poll. Queue the buffer for the event loop's next iteration.
+        // If the queue is gone (the thread is exiting), leak the buffer
+        // rather than free memory the operation may still write into.
+        let mut pending = Some(buf);
+        let _ = ORPHANED_BUFFERS.try_with(|orphans| {
+            if let Some(buf) = pending.take() {
+                orphans.borrow_mut().0.push((seq, file_index, buf));
+            }
+        });
+        if let Some(buf) = pending {
+            std::mem::forget(buf);
+        }
         return;
-    }
-    let mut non_null = opt_non_null.unwrap();
+    };
     let state = unsafe { non_null.as_mut() };
+    let driver = unsafe { &mut *state.driver.as_mut() };
     let executor = unsafe { &mut *state.executor.as_mut() };
+    park_buffer(driver, executor, seq, file_index, buf);
+}
+
+/// Drop `buf` if its operation has completed, otherwise park it in the
+/// graveyard until the completion arrives.
+#[cfg_attr(not(has_io_uring), allow(unused_variables))]
+fn park_buffer(
+    driver: &mut crate::backend::Driver,
+    executor: &mut crate::runtime::Executor,
+    seq: u32,
+    file_index: u16,
+    buf: BytesMut,
+) {
     executor.disk_io_waiters.remove(&seq);
     if executor.disk_io_results.remove(&seq).is_some() {
-        // CQE already arrived — kernel released the buffer. Drop normally.
+        // The operation has completed and released the buffer.
         drop(buf);
-        let _ = file_index;
         return;
     }
     executor.disk_io_graveyard.insert(seq, buf);
     #[cfg(has_io_uring)]
     {
-        let driver = unsafe { &mut *state.driver.as_mut() };
         let target = crate::completion::UserData::encode(
             crate::completion::OpTag::Fs,
             file_index as u32,
