@@ -1908,25 +1908,31 @@ impl ConnCtx {
         })
     }
 
-    /// Forward the current pending recv buffer as a zero-copy send.
-    ///
-    /// This is intended for use inside a `with_data` closure. If the connection
-    /// has a pending recv buffer (from the zero-copy recv path), it is taken and
-    /// used as the send source directly — no copy into the send pool. The recv
-    /// buffer is replenished when the send completes.
-    ///
-    /// Falls back to `send_nowait(data)` if there is no pending recv buffer
-    /// (e.g., data came from the accumulator or a TLS connection).
-    ///
-    /// Only works for plaintext connections; TLS connections always copy.
-    /// On the mio backend, this always uses the copy path.
+    /// Crate-internal body of [`SendHalf::forward_recv_buf`]; see that method
+    /// for behaviour and errors.
     pub(crate) fn forward_recv_buf(&self, data: &[u8]) -> io::Result<()> {
         with_state(|driver, _| {
             #[cfg_attr(not(has_io_uring), allow(unused_variables))]
             let conn_index = self.conn_index;
 
+            // Before either zero-copy branch: both act on the slot's pending
+            // recv buffer or accumulator, which belong to whichever
+            // connection holds the slot now. The same refusal as the copy
+            // path's `send` (#544).
+            if driver.connections.generation(conn_index) != self.generation {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "stale connection",
+                ));
+            }
+            // Once the Close is submitted, the copy path's `send` refuses
+            // without committing anything; the zero-copy branches would queue
+            // a send that is never driven.
             #[cfg(has_io_uring)]
-            {
+            let closing = driver.send_queues[conn_index as usize].close_submitted;
+
+            #[cfg(has_io_uring)]
+            if !closing {
                 // Check for pending recv buffer.
                 if let Some(pending) = driver.pending_recv_bufs[conn_index as usize].take() {
                     // Verify the data pointer matches the pending buffer (sanity check).
@@ -1991,7 +1997,7 @@ impl ConnCtx {
             // and "forwarded" and "consumed" cannot disagree about which bytes
             // went out. Anything else keeps the copy path.
             #[cfg(has_io_uring)]
-            {
+            if !closing {
                 let whole = {
                     let acc = driver.accumulators.data(conn_index);
                     !acc.is_empty()
@@ -2005,13 +2011,21 @@ impl ConnCtx {
                     // bytes — they are no longer in the accumulator.
                     driver.forward_zc_consumed[conn_index as usize] = frozen.len() as u32;
                     let token = self.token();
-                    let mut ctx = driver.make_ctx();
+                    // A refused send drops the guard; this handle puts the
+                    // bytes back, so nothing is committed on `Err`.
+                    let keep = frozen.clone();
                     // `guard()` honours `send_zc_threshold`, so a forward below
                     // it still folds into a copy exactly as before.
-                    return ctx
+                    let result = driver
+                        .make_ctx()
                         .send_parts(token)
                         .guard(crate::guard::GuardBox::new(AccumulatorGuard(frozen)))
                         .submit();
+                    if result.is_err() {
+                        driver.accumulators.put_back(conn_index, keep);
+                        driver.forward_zc_consumed[conn_index as usize] = 0;
+                    }
+                    return result;
                 }
             }
 
@@ -3953,7 +3967,28 @@ impl SendHalf {
         self.conn.close();
     }
 
-    /// See [`SendHalf::forward_recv_buf`].
+    /// Send `data`, the bytes a `with_data` closure was handed, without
+    /// copying them when possible.
+    ///
+    /// On io_uring, if `data` is exactly the connection's pending recv buffer,
+    /// that buffer is sent as is and replenished when the send completes. If
+    /// `data` is exactly the connection's whole recv accumulator, the
+    /// accumulator is detached and sent under a guard (copied into the send
+    /// pool below `send_zc_threshold`). Otherwise `data` is copied as by
+    /// [`send_nowait`](Self::send_nowait).
+    ///
+    /// On mio, `data` is always copied as by `send_nowait`. On a TLS
+    /// connection it is always encrypted into the send pool; when `data` is
+    /// the whole accumulator, the accumulator is detached first and gathered
+    /// into a temporary buffer.
+    ///
+    /// # Errors
+    ///
+    /// `NotConnected` if this handle is stale: its connection closed and the
+    /// slot now holds another. Otherwise the errors of
+    /// [`send_nowait`](Self::send_nowait), and, when `data` is the whole
+    /// accumulator, `Other` if the zero-copy send slab is full. Nothing is
+    /// sent or consumed on `Err`.
     pub fn forward_recv_buf(&mut self, data: &[u8]) -> io::Result<()> {
         self.conn.forward_recv_buf(data)
     }

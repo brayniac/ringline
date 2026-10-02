@@ -247,6 +247,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- `SendHalf::forward_recv_buf` / `Connection::forward_recv_buf` on io_uring
+  acted on the connection slot before checking the handle's generation. A
+  stale handle (its connection closed and the slot reused), called with the
+  new connection's bytes, sent the new connection's pending recv buffer to
+  it, or detached its accumulator and dropped those bytes when the send was
+  refused. It now returns `NotConnected` first, as the copy path's send
+  does. On a current handle, a whole-accumulator forward that the send
+  refused (the connection closing, or the zero-copy send slab full) also
+  dropped the accumulator's bytes; they are now put back, and once the
+  connection's Close is submitted both zero-copy paths are skipped so the
+  copy path's refusal applies. `SendHalf::forward_recv_buf` also gains the
+  documentation it was missing (#544).
+
 - A `Waker` the runtime hands to a future only worked when woken on the
   worker thread that polled it. Woken from another thread (a plain thread or
   another worker), it pushed the task id onto that thread's own ready queue:
