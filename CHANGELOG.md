@@ -247,6 +247,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- On mio, `RinglineBuilder::bind_udp_connected` /
+  `ConfigBuilder::udp_bind_connected` bound the socket but never
+  `connect(2)`ed it, so a datagram from any source reached the handler. The
+  socket is now connected, as on io_uring, and receives only the peer's
+  datagrams. As on io_uring, `launch` now fails if the connect fails (for
+  example, a peer in a different address family). On macOS, `send_to` an
+  address other than the peer now fails with `EISCONN` (#549).
+
 - `SendHalf::forward_recv_buf` / `Connection::forward_recv_buf` on io_uring
   acted on the connection slot before checking the handle's generation. A
   stale handle (its connection closed and the slot reused), called with the

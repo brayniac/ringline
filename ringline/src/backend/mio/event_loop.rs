@@ -1136,6 +1136,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     }
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                // A connected socket reports an ICMP port-unreachable once,
+                // on the next recv, ahead of any datagram queued behind it.
+                // Stopping here would leave that datagram unread until
+                // another one arrives.
+                Err(ref e) if e.kind() == io::ErrorKind::ConnectionRefused => continue,
                 Err(_) => break,
             }
         }
@@ -1169,6 +1174,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
             let n = unsafe { libc::recvmsg(fd, &mut msg, 0) };
             if n < 0 {
+                // A connected socket reports an ICMP port-unreachable once;
+                // read on to the datagrams behind it.
+                if io::Error::last_os_error().raw_os_error() == Some(libc::ECONNREFUSED) {
+                    continue;
+                }
                 // EWOULDBLOCK / EAGAIN ends the drain; other errors too.
                 break;
             }

@@ -2539,3 +2539,221 @@ fn udp_recv_batch_drains_a_full_batch_in_one_call() {
         drains.len()
     );
 }
+
+// ── Connected binds filter by peer (#549) ──────────────────────────────
+
+static FILTER_PEER: Mutex<Option<SocketAddr>> = Mutex::new(None);
+static FILTER_RECEIVED: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+
+/// Greets its connected peer, so the peer learns this socket's address, then
+/// records every datagram it receives.
+struct ConnectedRecorder;
+
+impl AsyncEventHandler for ConnectedRecorder {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
+        async move {}
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        ConnectedRecorder
+    }
+
+    fn on_udp_bind(&self, udp: UdpCtx) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        let peer = FILTER_PEER.lock().unwrap().expect("peer set");
+        Some(Box::pin(async move {
+            while udp.send_to(peer, b"hello").is_err() {
+                udp.send_ready().await;
+            }
+            loop {
+                let (data, _from) = udp.recv_from().await;
+                FILTER_RECEIVED.lock().unwrap().push(data);
+            }
+        }))
+    }
+}
+
+/// A connected bind receives datagrams from its peer only.
+#[test]
+fn udp_connected_bind_drops_datagrams_from_other_sources() {
+    let _guard = UDP_SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    FILTER_RECEIVED.lock().unwrap().clear();
+    let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let peer_addr = peer.local_addr().unwrap();
+    *FILTER_PEER.lock().unwrap() = Some(peer_addr);
+
+    let (runtime, handles) = RinglineBuilder::new(base_config())
+        .bind_udp_connected("127.0.0.1:0".parse().unwrap(), peer_addr)
+        .launch::<ConnectedRecorder>()
+        .expect("launch");
+
+    // The greeting carries the worker socket's address.
+    let mut buf = [0u8; 64];
+    let (n, server) = peer.recv_from(&mut buf).expect("greeting");
+    assert_eq!(&buf[..n], b"hello");
+
+    // An intruder first, so a missing filter delivers it before the peer's.
+    let intruder = UdpSocket::bind("127.0.0.1:0").unwrap();
+    intruder.send_to(b"intruder", server).unwrap();
+    peer.send_to(b"from peer", server).unwrap();
+
+    let mut received = Vec::new();
+    for _ in 0..500 {
+        received = FILTER_RECEIVED.lock().unwrap().clone();
+        if !received.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    runtime.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+    assert_eq!(
+        received,
+        vec![b"from peer".to_vec()],
+        "a connected bind received a datagram from a source other than its peer"
+    );
+}
+
+// ── A connected bind after its peer was unreachable (#549) ─────────────
+
+static UNREACH_PEER: Mutex<Option<SocketAddr>> = Mutex::new(None);
+static UNREACH_PROBES: AtomicUsize = AtomicUsize::new(0);
+static UNREACH_GO: AtomicBool = AtomicBool::new(false);
+static UNREACH_PROBE_RESULTS: Mutex<Option<Vec<String>>> = Mutex::new(None);
+static UNREACH_RECEIVED: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+
+/// Greets its peer, then on request sends `UNREACH_PROBES` probes to the
+/// peer, which has gone away, then records every datagram it receives.
+struct ProbesClosedPeer;
+
+impl AsyncEventHandler for ProbesClosedPeer {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
+        async move {}
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        ProbesClosedPeer
+    }
+
+    fn on_udp_bind(&self, udp: UdpCtx) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        let peer = UNREACH_PEER.lock().unwrap().expect("peer set");
+        Some(Box::pin(async move {
+            while udp.send_to(peer, b"hello").is_err() {
+                udp.send_ready().await;
+            }
+            while !UNREACH_GO.load(Ordering::SeqCst) {
+                ringline::sleep(Duration::from_millis(5)).await;
+            }
+            // The peer's port is closed: the kernel answers each probe with
+            // ICMP port unreachable, which a connected socket records.
+            let mut results = Vec::new();
+            for _ in 0..UNREACH_PROBES.load(Ordering::SeqCst) {
+                results.push(format!("{:?}", udp.send_to(peer, b"probe")));
+                ringline::sleep(Duration::from_millis(50)).await;
+            }
+            *UNREACH_PROBE_RESULTS.lock().unwrap() = Some(results);
+            loop {
+                let (data, _from) = udp.recv_from().await;
+                UNREACH_RECEIVED.lock().unwrap().push(data);
+            }
+        }))
+    }
+}
+
+/// Launch a connected bind, close its peer, have the worker send `probes`
+/// probes to it, then bring the peer back and send one datagram. Returns
+/// the probes' results and what the worker received.
+fn probe_closed_peer(probes: usize, gro: bool) -> (Vec<String>, Vec<Vec<u8>>) {
+    UNREACH_PROBES.store(probes, Ordering::SeqCst);
+    UNREACH_GO.store(false, Ordering::SeqCst);
+    UNREACH_RECEIVED.lock().unwrap().clear();
+    *UNREACH_PROBE_RESULTS.lock().unwrap() = None;
+    let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let peer_addr = peer.local_addr().unwrap();
+    *UNREACH_PEER.lock().unwrap() = Some(peer_addr);
+
+    let config = if gro {
+        base_config_builder()
+            .udp_gro(true)
+            // A coalesced GRO datagram can be ~64 KiB plus recvmsg metadata.
+            .udp_recv_buffer(8, 66_048)
+            .build()
+            .expect("valid config")
+    } else {
+        base_config()
+    };
+    let (runtime, handles) = RinglineBuilder::new(config)
+        .bind_udp_connected("127.0.0.1:0".parse().unwrap(), peer_addr)
+        .launch::<ProbesClosedPeer>()
+        .expect("launch");
+    let mut buf = [0u8; 64];
+    let (_, server) = peer.recv_from(&mut buf).expect("greeting");
+
+    drop(peer);
+    UNREACH_GO.store(true, Ordering::SeqCst);
+    for _ in 0..500 {
+        if UNREACH_PROBE_RESULTS.lock().unwrap().is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let results = UNREACH_PROBE_RESULTS
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("probes ran");
+    let peer = UdpSocket::bind(peer_addr).expect("rebind the peer's port");
+    peer.send_to(b"one", server).unwrap();
+
+    let mut received = Vec::new();
+    for _ in 0..200 {
+        received = UNREACH_RECEIVED.lock().unwrap().clone();
+        if !received.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    runtime.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+    (results, received)
+}
+
+/// After its peer's port was unreachable, a connected bind still receives
+/// the peer's next datagram, without waiting for another one to arrive.
+#[test]
+fn udp_connected_bind_receives_after_peer_was_unreachable() {
+    let _guard = UDP_SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (_, received) = probe_closed_peer(1, false);
+    assert_eq!(
+        received,
+        vec![b"one".to_vec()],
+        "the peer's datagram was not delivered"
+    );
+}
+
+/// The same with UDP GRO, which reads through `recvmsg`.
+#[cfg(target_os = "linux")]
+#[test]
+fn udp_connected_bind_with_gro_receives_after_peer_was_unreachable() {
+    let _guard = UDP_SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (_, received) = probe_closed_peer(1, true);
+    assert_eq!(
+        received,
+        vec![b"one".to_vec()],
+        "the peer's datagram was not delivered"
+    );
+}
+
+/// Sending to a peer whose port was unreachable succeeds, as it does on an
+/// unconnected socket.
+#[test]
+fn udp_connected_bind_sends_after_peer_was_unreachable() {
+    let _guard = UDP_SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (results, _) = probe_closed_peer(2, false);
+    assert_eq!(results, vec!["Ok(())", "Ok(())"]);
+}

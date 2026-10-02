@@ -326,8 +326,8 @@ pub struct Config {
     /// Optional peer to `connect(2)` each UDP socket to, parallel to
     /// `udp_bind`. `None` leaves the socket unconnected (the usual UDP
     /// server case); `Some(peer)` calls `connect()` so the kernel filters
-    /// incoming datagrams to that peer and the runtime can use the lighter
-    /// `RecvUdp`/`SendUdp` opcodes instead of `RecvMsgUdp`/`SendMsgUdp`.
+    /// incoming datagrams to that peer, and on io_uring the runtime uses the
+    /// lighter `RecvUdp`/`SendUdp` opcodes instead of `RecvMsgUdp`/`SendMsgUdp`.
     /// Saves ~4 microseconds per round trip on single-shot client workloads.
     /// Must have the same length as `udp_bind` (enforced at validation).
     pub(crate) udp_connect_peers: Vec<Option<SocketAddr>>,
@@ -368,10 +368,10 @@ pub struct Config {
     /// recvmsg header + sockaddr + control + payload share one provided
     /// buffer, so enabling GRO requires `udp_recv_buffer.buffer_size` to be
     /// large enough to hold a full coalesced datagram (validated at startup);
-    /// otherwise the kernel truncates and the datagram is dropped. Has no
-    /// effect on `connect(2)`-ed UDP sockets (they use the lighter `recv`
-    /// path, which carries no control message). Linux-only — a no-op on
-    /// other platforms. Default: false.
+    /// otherwise the kernel truncates and the datagram is dropped. On
+    /// io_uring it has no effect on `connect(2)`-ed UDP sockets (they use the
+    /// lighter `recv` path, which carries no control message). Linux-only —
+    /// a no-op on other platforms. Default: false.
     pub(crate) udp_gro: bool,
     /// Optional NVMe passthrough configuration. When set, enables NVMe device
     /// management and `IORING_OP_URING_CMD` submission for direct NVMe I/O.
@@ -1120,10 +1120,17 @@ impl ConfigBuilder {
     }
 
     /// Add a UDP bind address that is then `connect(2)`ed to `peer`. The
-    /// kernel filters incoming datagrams to `peer` and the runtime can use
-    /// the lighter `RecvUdp`/`SendUdp` opcodes instead of the
-    /// `RecvMsgUdp`/`SendMsgUdp` pair. Saves ~4 microseconds per round trip
-    /// on single-shot client workloads. A zero local port behaves as in
+    /// kernel filters incoming datagrams to `peer`, on both backends. On
+    /// io_uring the runtime also uses the lighter `RecvUdp`/`SendUdp`
+    /// opcodes instead of the `RecvMsgUdp`/`SendMsgUdp` pair, which saves
+    /// ~4 microseconds per round trip on single-shot client workloads.
+    ///
+    /// `launch` returns an error if `connect(2)` fails, for example when
+    /// `peer` is in a different address family from `local`. A `send_to` an
+    /// address other than `peer` is sent on Linux; on macOS it fails with
+    /// `EISCONN`.
+    ///
+    /// A zero local port behaves as in
     /// [`RinglineBuilder::bind_udp_connected`](crate::RinglineBuilder::bind_udp_connected).
     pub fn udp_bind_connected(mut self, local: SocketAddr, peer: SocketAddr) -> Self {
         self.config.udp_bind.push(local);
