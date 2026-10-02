@@ -505,7 +505,8 @@ pub(crate) struct Executor {
     /// Disk I/O buffer graveyard: holds buffers whose owning future was dropped
     /// before the CQE arrived. Entry is removed (and the buffer freed) when
     /// `wake_disk_io` fires, ensuring the kernel's pointer remains valid for
-    /// the entire op even after the future goes away.
+    /// the entire op even after the future goes away. Buffers still here when
+    /// the executor drops are leaked; see `impl Drop for Executor`.
     pub(crate) disk_io_graveyard: HashMap<u32, bytes::BytesMut>,
     /// Filesystem stat results: maps slab_idx → Metadata (populated by handle_fs for Statx ops).
     pub(crate) fs_stat_results: HashMap<u32, crate::fs::Metadata>,
@@ -556,6 +557,21 @@ pub(crate) struct Executor {
     /// is what makes "once" observable.
     #[cfg(test)]
     pub(crate) send_capacity_wakes: u32,
+}
+
+impl Drop for Executor {
+    fn drop(&mut self) {
+        // A buffer still in the graveyard belongs to an operation that has
+        // not completed: a read or write the kernel (io_uring) or a disk-I/O
+        // pool thread (mio) can still perform through its raw pointer, after
+        // this worker has exited. Neither backend waits for those at
+        // shutdown, so freeing the buffer here would let that operation write
+        // into freed memory. Leak it instead; the leak is bounded by the
+        // operations in flight when the worker exits.
+        for (_, buf) in self.disk_io_graveyard.drain() {
+            std::mem::forget(buf);
+        }
+    }
 }
 
 impl Executor {

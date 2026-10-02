@@ -247,6 +247,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Dropping a `ReadFuture` or `WriteFuture` (`fs::read_into`, `fs::write_from`)
+  before its operation completes parks the buffer until the operation is
+  done. When the worker exited first, the buffer was freed while the
+  operation could still write into it: on mio a disk-I/O pool thread, on
+  io_uring the kernel. Buffers still parked when the worker exits are now
+  leaked instead of freed.
+
 - On mio, `fs::close` (and `DriverCtx::close_direct_io_file`) closed the fd at
   once, while a read, write or fsync queued on the disk-I/O pool still held its
   number. If the number was reused first, the operation went to the wrong
