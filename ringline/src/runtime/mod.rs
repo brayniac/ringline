@@ -509,6 +509,10 @@ pub(crate) struct Executor {
     pub(crate) disk_io_graveyard: HashMap<u32, bytes::BytesMut>,
     /// Filesystem stat results: maps slab_idx → Metadata (populated by handle_fs for Statx ops).
     pub(crate) fs_stat_results: HashMap<u32, crate::fs::Metadata>,
+    /// Disk I/O keys of opens whose `OpenFuture` was dropped before the open
+    /// completed. The backend's completion handler closes the file and
+    /// releases its slot instead of delivering the result.
+    pub(crate) abandoned_fs_opens: std::collections::HashSet<u32>,
     /// Pending DNS resolve requests: request_id -> (task_id to wake, result slot).
     pub(crate) pending_resolves: HashMap<u64, (u32, Option<stdio::Result<std::net::SocketAddr>>)>,
     /// Monotonic counter for resolve request IDs.
@@ -605,6 +609,7 @@ impl Executor {
             disk_io_results: HashMap::new(),
             disk_io_graveyard: HashMap::new(),
             fs_stat_results: HashMap::new(),
+            abandoned_fs_opens: std::collections::HashSet::new(),
             pending_resolves: HashMap::new(),
             next_resolve_id: 0,
             pending_spawns: HashMap::new(),

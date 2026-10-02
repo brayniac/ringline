@@ -477,6 +477,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // Poll all ready tasks.
             let tasks_before = self.executor.ready_queue.len();
             self.poll_ready_tasks();
+            // Before the flush below submits this pass's SQEs: an open whose
+            // future was dropped during the pass is marked abandoned before
+            // it can complete.
+            crate::fs::release_orphaned_opens(&mut self.driver, &mut self.executor);
             diag_tasks_1st += tasks_before as u64;
             if tasks_before == 0 {
                 diag_dead_iters += 1;
@@ -4979,6 +4983,22 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // Keyed by the full disk-I/O key (StatFuture holds the same),
             // not the raw slab index.
             self.executor.fs_stat_results.insert(ud.payload(), metadata);
+        }
+
+        // An open whose `OpenFuture` was dropped: nothing holds a handle to
+        // the file, so close it, free the slot and deliver nothing.
+        if op == Some(crate::fs::FsOp::Open)
+            && self.executor.abandoned_fs_opens.remove(&ud.payload())
+        {
+            if result >= 0 {
+                let fd_index = self.driver.fs_fd_base + file_index as u32;
+                let _ = self.driver.ring.register_files_update(fd_index, &[-1i32]);
+            }
+            if let Some(ref mut files) = self.driver.fs_files {
+                files.release(file_index);
+            }
+            cmd_slab.release(slab_idx);
+            return;
         }
 
         // For Open ops, handle success/failure of the file slot.

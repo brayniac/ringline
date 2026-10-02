@@ -150,7 +150,8 @@ pub(crate) enum FsOp {
 
 /// Per-file state tracked by the driver.
 pub(crate) struct FsFileState {
-    /// Index in the io_uring fixed file table.
+    /// Index in the io_uring fixed file table. Unused on mio, where the fd
+    /// lives in the driver's `fs_fds`.
     pub fd_index: u32,
     /// Whether this slot is in use.
     pub active: bool,
@@ -323,6 +324,7 @@ pub fn open(
             seq,
             file_index,
             generation,
+            done: false,
         })
     })
 }
@@ -341,45 +343,100 @@ pub fn create(path: impl AsRef<std::path::Path>) -> io::Result<OpenFuture> {
 }
 
 /// Future that resolves to a [`File`] handle when the open completes.
+///
+/// Dropping it before it resolves closes the file and frees its slot, on the
+/// event loop's next iteration if the open has completed, otherwise when it
+/// completes.
 pub struct OpenFuture {
     seq: u32,
     file_index: u16,
     generation: u16,
+    /// Set once `poll` has returned `Ready`: the caller owns the outcome.
+    done: bool,
 }
 
 impl Future for OpenFuture {
     type Output = io::Result<File>;
 
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<File>> {
-        with_state(
-            |_driver, executor| match executor.disk_io_results.remove(&self.seq) {
-                Some(result) if result < 0 => {
-                    Poll::Ready(Err(io::Error::from_raw_os_error(-result)))
-                }
-                Some(_) => Poll::Ready(Ok(File {
-                    index: self.file_index,
-                    generation: self.generation,
-                })),
-                None => {
-                    let task_id = CURRENT_TASK_ID.with(|c| c.get());
-                    executor.disk_io_waiters.insert(self.seq, task_id);
-                    Poll::Pending
-                }
-            },
-        )
+    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<File>> {
+        let poll =
+            with_state(
+                |_driver, executor| match executor.disk_io_results.remove(&self.seq) {
+                    Some(result) if result < 0 => {
+                        Poll::Ready(Err(io::Error::from_raw_os_error(-result)))
+                    }
+                    Some(_) => Poll::Ready(Ok(File {
+                        index: self.file_index,
+                        generation: self.generation,
+                    })),
+                    None => {
+                        let task_id = CURRENT_TASK_ID.with(|c| c.get());
+                        executor.disk_io_waiters.insert(self.seq, task_id);
+                        Poll::Pending
+                    }
+                },
+            );
+        if poll.is_ready() {
+            self.done = true;
+        }
+        poll
     }
 }
 
 impl Drop for OpenFuture {
     fn drop(&mut self) {
-        let opt_non_null = CURRENT_DRIVER.with(|c| c.get());
-        if opt_non_null.is_none() {
+        if self.done {
             return;
         }
-        let mut non_null = opt_non_null.unwrap();
-        let state = unsafe { non_null.as_mut() };
-        let executor = unsafe { &mut *state.executor.as_mut() };
-        executor.disk_io_waiters.remove(&self.seq);
+        // Queued rather than handled here: a connection's task is dropped
+        // outside any task poll, where the driver is not reachable. The event
+        // loop releases the queue on its next iteration. A queue left at
+        // worker exit is dropped with the driver's file table.
+        let _ = ORPHANED_OPENS.try_with(|orphans| {
+            orphans
+                .borrow_mut()
+                .push((self.seq, self.file_index, self.generation));
+        });
+    }
+}
+
+thread_local! {
+    // Opens whose `OpenFuture` was dropped before it resolved, as `(disk I/O
+    // key, file slot, generation)`. Nothing holds a handle to these files.
+    static ORPHANED_OPENS: std::cell::RefCell<Vec<(u32, u16, u16)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Close the files of opens whose `OpenFuture` was dropped, and free their
+/// slots. Called by the event loop once per iteration, after it has delivered
+/// that iteration's completions.
+///
+/// An open that has completed is closed now. One still in flight is marked in
+/// `abandoned_fs_opens`, and its completion handler closes it.
+pub(crate) fn release_orphaned_opens(
+    driver: &mut crate::backend::Driver,
+    executor: &mut crate::runtime::Executor,
+) {
+    let orphans = ORPHANED_OPENS.with(|orphans| {
+        let mut orphans = orphans.borrow_mut();
+        if orphans.is_empty() {
+            Vec::new()
+        } else {
+            std::mem::take(&mut *orphans)
+        }
+    });
+    for (seq, index, generation) in orphans {
+        executor.disk_io_waiters.remove(&seq);
+        match executor.disk_io_results.remove(&seq) {
+            Some(result) if result >= 0 => {
+                let _ = driver.make_ctx().fs_close(File { index, generation });
+            }
+            // The open failed, and its slot is already free.
+            Some(_) => {}
+            None => {
+                executor.abandoned_fs_opens.insert(seq);
+            }
+        }
     }
 }
 
@@ -686,8 +743,10 @@ pub fn fsync(file: File) -> io::Result<DiskIoFuture> {
 
 /// Close a file handle.
 ///
-/// This is synchronous — it deregisters the fd from the fixed file table
-/// and releases the file slot. No SQE is needed.
+/// Synchronous: on success the handle is invalid and its slot is free when
+/// this returns. On io_uring it removes the file from the ring's fixed-file
+/// table. On mio the fd closes once the operations already queued on it have
+/// finished.
 ///
 /// # Panics
 ///
