@@ -59,9 +59,14 @@ impl WorkerWakes {
         static NEXT_ID: AtomicU32 = AtomicU32::new(1);
         // Stops at the maximum rather than wrapping, so an id is never handed
         // out twice.
-        let id = NEXT_ID
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-            .expect("worker ids exhausted");
+        let mut id = NEXT_ID.load(Ordering::Relaxed);
+        loop {
+            let next = id.checked_add(1).expect("worker ids exhausted");
+            match NEXT_ID.compare_exchange_weak(id, next, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(current) => id = current,
+            }
+        }
         let inbox = Arc::new(Inbox {
             ids: Mutex::new(Vec::new()),
             nonempty: AtomicBool::new(false),
