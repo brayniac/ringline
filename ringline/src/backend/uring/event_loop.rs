@@ -13388,7 +13388,7 @@ mod tests {
 
         // Create and immediately drop a DiskIoFuture.
         {
-            let _fut = crate::runtime::io::DiskIoFuture { seq };
+            let _fut = crate::runtime::io::DiskIoFuture::new(seq);
         }
 
         drop(guard);

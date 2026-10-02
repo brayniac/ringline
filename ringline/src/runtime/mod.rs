@@ -515,6 +515,11 @@ pub(crate) struct Executor {
     pub(crate) disk_io_graveyard: HashMap<u32, bytes::BytesMut>,
     /// Filesystem stat results: maps disk-I/O key → Metadata (populated by handle_fs for Statx ops).
     pub(crate) fs_stat_results: HashMap<u32, crate::fs::Metadata>,
+    /// Disk I/O keys of operations whose future (`DiskIoFuture`,
+    /// `StatFuture`) was dropped before the result arrived. `wake_disk_io`
+    /// discards the result for these keys, so it cannot be taken for the
+    /// completion of a later operation that reuses the key.
+    pub(crate) abandoned_disk_io: std::collections::HashSet<u32>,
     /// Disk I/O keys of opens whose `OpenFuture` was dropped before the open
     /// completed. The backend's completion handler closes the file and
     /// releases its slot instead of delivering the result.
@@ -631,6 +636,7 @@ impl Executor {
             disk_io_results: HashMap::new(),
             disk_io_graveyard: HashMap::new(),
             fs_stat_results: HashMap::new(),
+            abandoned_disk_io: std::collections::HashSet::new(),
             abandoned_fs_opens: std::collections::HashSet::new(),
             pending_resolves: HashMap::new(),
             next_resolve_id: 0,
@@ -825,12 +831,26 @@ impl Executor {
         }
     }
 
+    /// Forget a disk-I/O operation whose future was dropped before it
+    /// resolved: remove its waiter, and its result if one has arrived, or
+    /// mark the key so `wake_disk_io` discards the result when it arrives. A
+    /// result left in `disk_io_results` would be taken for the completion of
+    /// whichever later operation reuses the key; on io_uring the key repeats
+    /// after 65,536 operations (#574).
+    pub(crate) fn abandon_disk_io(&mut self, seq: u32) {
+        self.disk_io_waiters.remove(&seq);
+        self.fs_stat_results.remove(&seq);
+        if self.disk_io_results.remove(&seq).is_none() {
+            self.abandoned_disk_io.insert(seq);
+        }
+    }
+
     /// Wake a task that was waiting for a disk I/O completion.
     ///
     /// Stores the result and wakes the task if one is registered. Waiters
-    /// and results are keyed by the disk-I/O key, not the connection. A
-    /// result whose future was dropped without parking a buffer stays in
-    /// `disk_io_results` (#574).
+    /// and results are keyed by the disk-I/O key, not the connection. The
+    /// result of an operation whose future was dropped is discarded: see
+    /// [`abandon_disk_io`](Self::abandon_disk_io).
     ///
     /// If the owning future was dropped before completion, its buffer was
     /// parked in `disk_io_graveyard`. We free it here (the kernel is now
@@ -839,6 +859,10 @@ impl Executor {
     #[cfg_attr(not(has_io_uring), allow(dead_code))]
     pub(crate) fn wake_disk_io(&mut self, seq: u32, result: i32) {
         if self.disk_io_graveyard.remove(&seq).is_some() {
+            return;
+        }
+        if self.abandoned_disk_io.remove(&seq) {
+            self.fs_stat_results.remove(&seq);
             return;
         }
         self.disk_io_results.insert(seq, result);

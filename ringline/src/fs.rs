@@ -405,6 +405,10 @@ thread_local! {
     // key, file slot, generation)`. Nothing holds a handle to these files.
     static ORPHANED_OPENS: std::cell::RefCell<Vec<(u32, u16, u16)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    // Disk-I/O keys of operations whose future (`DiskIoFuture`,
+    // `StatFuture`) was dropped outside the executor, before it resolved.
+    static ORPHANED_KEYS: std::cell::RefCell<Vec<u32>> =
+        const { std::cell::RefCell::new(Vec::new()) };
     // Buffers of reads and writes whose future was dropped outside the
     // executor, before it resolved.
     static ORPHANED_BUFFERS: std::cell::RefCell<OrphanedBuffers> =
@@ -426,9 +430,9 @@ impl Drop for OrphanedBuffers {
     }
 }
 
-/// Release what dropped fs futures queued: close the files of abandoned opens
-/// and free their slots, and park or drop the buffers of abandoned reads and
-/// writes. Called by the event loop once per iteration, after its first
+/// Release what dropped fs futures queued: forget abandoned operations'
+/// results, close the files of abandoned opens and free their slots, and park
+/// or drop the buffers of abandoned reads and writes. Called by the event loop once per iteration, after its first
 /// task-poll pass.
 ///
 /// An open that has completed is closed now. One still in flight is marked in
@@ -439,6 +443,11 @@ pub(crate) fn release_orphans(
     driver: &mut crate::backend::Driver,
     executor: &mut crate::runtime::Executor,
 ) {
+    let keys = ORPHANED_KEYS.with(|orphans| std::mem::take(&mut *orphans.borrow_mut()));
+    for seq in keys {
+        executor.abandon_disk_io(seq);
+    }
+
     let buffers = ORPHANED_BUFFERS.with(|orphans| {
         let mut orphans = orphans.borrow_mut();
         if orphans.0.is_empty() {
@@ -495,7 +504,7 @@ pub unsafe fn read(file: File, offset: u64, buf: *mut u8, len: u32) -> io::Resul
         let seq = unsafe { ctx.fs_read(file, offset, buf, len)? };
         let task_id = CURRENT_TASK_ID.with(|c| c.get());
         executor.disk_io_waiters.insert(seq, task_id);
-        Ok(DiskIoFuture { seq })
+        Ok(DiskIoFuture::new(seq))
     })
 }
 
@@ -520,7 +529,7 @@ pub unsafe fn write(file: File, offset: u64, buf: *const u8, len: u32) -> io::Re
         let seq = unsafe { ctx.fs_write(file, offset, buf, len)? };
         let task_id = CURRENT_TASK_ID.with(|c| c.get());
         executor.disk_io_waiters.insert(seq, task_id);
-        Ok(DiskIoFuture { seq })
+        Ok(DiskIoFuture::new(seq))
     })
 }
 
@@ -790,7 +799,7 @@ pub fn fsync(file: File) -> io::Result<DiskIoFuture> {
         let seq = ctx.fs_fsync(file)?;
         let task_id = CURRENT_TASK_ID.with(|c| c.get());
         executor.disk_io_waiters.insert(seq, task_id);
-        Ok(DiskIoFuture { seq })
+        Ok(DiskIoFuture::new(seq))
     })
 }
 
@@ -824,7 +833,7 @@ pub fn stat(path: impl AsRef<std::path::Path>) -> io::Result<StatFuture> {
         let seq = ctx.fs_stat(path.as_ref())?;
         let task_id = CURRENT_TASK_ID.with(|c| c.get());
         executor.disk_io_waiters.insert(seq, task_id);
-        Ok(StatFuture { seq })
+        Ok(StatFuture { seq, done: false })
     })
 }
 
@@ -835,13 +844,15 @@ pub fn stat(path: impl AsRef<std::path::Path>) -> io::Result<StatFuture> {
 /// `Executor::fs_stat_results` before releasing the slab entry.
 pub struct StatFuture {
     seq: u32,
+    /// Set once `poll` has returned `Ready`: the result has been taken.
+    done: bool,
 }
 
 impl Future for StatFuture {
     type Output = io::Result<Metadata>;
 
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<Metadata>> {
-        with_state(|_driver, executor| {
+    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<Metadata>> {
+        let poll = with_state(|_driver, executor| {
             // First check if there's a normal error result (negative).
             match executor.disk_io_results.remove(&self.seq) {
                 Some(result) if result < 0 => {
@@ -865,21 +876,39 @@ impl Future for StatFuture {
                     Poll::Pending
                 }
             }
-        })
+        });
+        if poll.is_ready() {
+            self.done = true;
+        }
+        poll
     }
 }
 
 impl Drop for StatFuture {
     fn drop(&mut self) {
-        let opt_non_null = CURRENT_DRIVER.with(|c| c.get());
-        if opt_non_null.is_none() {
-            return;
+        if !self.done {
+            abandon_disk_io_key(self.seq);
         }
-        let mut non_null = opt_non_null.unwrap();
-        let state = unsafe { non_null.as_mut() };
-        let executor = unsafe { &mut *state.executor.as_mut() };
-        executor.disk_io_waiters.remove(&self.seq);
-        executor.fs_stat_results.remove(&self.seq);
+    }
+}
+
+/// Forget a disk-I/O operation whose future was dropped before it resolved,
+/// so its result cannot be taken for a later operation's (#574). Inside a
+/// task poll this calls [`Executor::abandon_disk_io`]; outside one (a
+/// connection's task dropped at teardown) it queues the key for
+/// [`release_orphans`].
+///
+/// [`Executor::abandon_disk_io`]: crate::runtime::Executor::abandon_disk_io
+pub(crate) fn abandon_disk_io_key(seq: u32) {
+    match CURRENT_DRIVER.with(|c| c.get()) {
+        Some(mut non_null) => {
+            let state = unsafe { non_null.as_mut() };
+            let executor = unsafe { &mut *state.executor.as_mut() };
+            executor.abandon_disk_io(seq);
+        }
+        None => {
+            let _ = ORPHANED_KEYS.try_with(|orphans| orphans.borrow_mut().push(seq));
+        }
     }
 }
 
@@ -897,7 +926,7 @@ pub fn rename(
         let seq = ctx.fs_rename(from.as_ref(), to.as_ref())?;
         let task_id = CURRENT_TASK_ID.with(|c| c.get());
         executor.disk_io_waiters.insert(seq, task_id);
-        Ok(DiskIoFuture { seq })
+        Ok(DiskIoFuture::new(seq))
     })
 }
 
@@ -912,7 +941,7 @@ pub fn remove(path: impl AsRef<std::path::Path>) -> io::Result<DiskIoFuture> {
         let seq = ctx.fs_unlink(path.as_ref())?;
         let task_id = CURRENT_TASK_ID.with(|c| c.get());
         executor.disk_io_waiters.insert(seq, task_id);
-        Ok(DiskIoFuture { seq })
+        Ok(DiskIoFuture::new(seq))
     })
 }
 
@@ -927,7 +956,7 @@ pub fn mkdir(path: impl AsRef<std::path::Path>, mode: u32) -> io::Result<DiskIoF
         let seq = ctx.fs_mkdir(path.as_ref(), mode)?;
         let task_id = CURRENT_TASK_ID.with(|c| c.get());
         executor.disk_io_waiters.insert(seq, task_id);
-        Ok(DiskIoFuture { seq })
+        Ok(DiskIoFuture::new(seq))
     })
 }
 
