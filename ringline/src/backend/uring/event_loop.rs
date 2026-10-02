@@ -385,12 +385,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // runnable without queueing SQEs (so `flush()` takes its empty-SQ
             // shortcut) starves the whole worker of completions.
             //
-            // Nor once shutdown is pending. The shutdown check below runs only
-            // after this wait returns, and the eventfd completion that carries
-            // the shutdown wake can already have been reaped by the drain that
-            // follows `flush()`, without a check after it; the eventfd read is
-            // not re-armed once shutdown is set. With no tick timeout, a
-            // blocking wait would then never return.
+            // Nor once shutdown is pending: the shutdown check below runs only
+            // after this wait. `request_shutdown()` sets `shutdown_local`
+            // without writing the eventfd. A `Runtime::shutdown` wake can
+            // already have been reaped by the drain after `flush()`, and the
+            // eventfd read is not re-armed once `shutdown_flag` is set. With no
+            // tick timeout, a blocking wait would never return in either case.
             let shutting_down =
                 self.driver.shutdown_local || self.driver.shutdown_flag.load(Ordering::Relaxed);
             if self.executor.ready_queue.is_empty() && !shutting_down {

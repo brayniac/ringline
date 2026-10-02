@@ -256,16 +256,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   notify shared between workers) could hang. A waker now carries its
   worker's id; woken off that worker's thread, it delivers the task to the
   worker's inbox and wakes the worker. A same-thread wake takes one extra
-  thread-local read; a cross-thread wake takes a lock and, when the inbox was
-  empty, writes the worker's wake fd. A wake for a worker that has exited is
-  dropped. ringline now requires a 64-bit target (#559).
+  thread-local read. A cross-thread wake takes two locks (the registry read
+  lock and the worker's inbox), and writes the worker's wake fd only if no
+  other wake has since the worker last drained its inbox. A wake for a worker
+  that has exited is dropped. ringline requires a 64-bit target; a const
+  assert now states this at compile time (32-bit Linux builds already failed
+  in `worker.rs` and io-uring) (#559).
 
-- On io_uring with `tick_timeout_us(0)`, a worker could miss its shutdown
-  and stay blocked forever: `request_shutdown()` from a task, or
-  `Runtime::shutdown` landing while the worker was busy, was consumed by a
-  completion drain the loop does not check shutdown after, and the next
-  wait had nothing to return for. The loop no longer blocks once shutdown is
-  pending.
+- On io_uring with `tick_timeout_us(0)`, a worker could block forever
+  instead of shutting down. `request_shutdown()` from a task always did this,
+  because the loop did not check shutdown before blocking. `Runtime::shutdown`
+  did it when it arrived while the worker was polling tasks: the drain after
+  `flush()` reaped the shutdown wake, and the eventfd read is not re-armed
+  once shutdown is set. The loop no longer blocks once shutdown is pending.
 
 - Dropping a `ReadFuture` or `WriteFuture` (`fs::read_into`, `fs::write_from`)
   before its operation completes parks the buffer until the operation is

@@ -120,6 +120,8 @@
 //!
 //! # Platform
 //!
+//! Requires a 64-bit target.
+//!
 //! The backend is selected at build time by `build.rs`: a Linux host whose
 //! kernel is 6.1+ gets the io_uring backend, everything else gets mio.
 //!

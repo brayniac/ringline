@@ -431,7 +431,8 @@ pub(crate) struct Executor {
     /// Set by `wake_task` when the currently-polling task wakes itself;
     /// consumed by the poll loop to re-queue the task after parking.
     pub(crate) woken_while_polling: bool,
-    /// Scratch for draining the thread-local waker queue.
+    /// Scratch for draining the thread-local waker queue and the cross-thread
+    /// inbox.
     waker_drain_scratch: VecDeque<u32>,
     /// Per-connection: task is awaiting recv data.
     pub(crate) recv_waiters: Vec<bool>,

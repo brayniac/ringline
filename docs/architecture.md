@@ -80,7 +80,8 @@ A task waker encodes a connection index, or a standalone task index with
 `STANDALONE_BIT`, in its low 32 bits, and its worker's id in the high 32. Woken
 on that worker's thread, it pushes the index onto the thread-local
 `READY_QUEUE`. Woken on any other thread, it pushes the index into the worker's
-inbox and writes the worker's wake descriptor. A wake for a worker that has
+inbox and, if no wake since the worker last drained it has done so, writes the
+worker's wake descriptor. A wake for a worker that has
 exited is dropped. `Executor::collect_wakeups` drains both through
 `wake_task`, transitions parked tasks to ready, and appends them to the
 worker's `ready_queue`.

@@ -30,11 +30,11 @@ pub(crate) const STANDALONE_BIT: u32 = 1 << 31;
 /// lives.
 pub(crate) struct Inbox {
     ids: Mutex<Vec<u32>>,
-    /// Set after an id is pushed, so the executor checks the lock only when
-    /// something is there.
+    /// Set after an id is pushed, so the executor takes the lock only after a
+    /// wake has set it.
     nonempty: AtomicBool,
-    /// The worker's wake fd, written after a push so a worker blocked in its
-    /// event loop wakes. Unset for an executor with no event loop (unit
+    /// The worker's wake fd, written by the push that sets `nonempty`, so a
+    /// worker blocked in its event loop wakes. Unset for an executor with no event loop (unit
     /// tests).
     wake: OnceLock<crate::wakeup::WakeHandle>,
 }
@@ -92,7 +92,11 @@ impl WorkerWakes {
 
     /// Move ids woken from other threads into `buf`.
     pub(crate) fn drain_into(&self, buf: &mut VecDeque<u32>) {
-        if self.inbox.nonempty.swap(false, Ordering::Acquire) {
+        // A plain load first, so a worker that never receives cross-thread
+        // wakes pays no read-modify-write per call.
+        if self.inbox.nonempty.load(Ordering::Relaxed)
+            && self.inbox.nonempty.swap(false, Ordering::Acquire)
+        {
             let mut ids = self.inbox.ids.lock().unwrap_or_else(|e| e.into_inner());
             buf.extend(ids.drain(..));
         }

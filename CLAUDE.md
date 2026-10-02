@@ -171,7 +171,7 @@ Generation-based stale detection: `ConnToken(index, generation)` prevents use-af
 
 ### Waker Implementation
 
-Zero-allocation wakers encode the `conn_index` (or `task_idx | STANDALONE_BIT`) in the low 32 bits of the pointer and the owning worker's process-unique id in the high 32. Waking on the owning worker's thread pushes the index onto thread-local `READY_QUEUE`; waking on any other thread pushes it into that worker's inbox (registry in `runtime/waker.rs`) and writes its wake fd. The event loop drains both into the executor's ready list.
+Zero-allocation wakers encode the `conn_index` (or `task_idx | STANDALONE_BIT`) in the low 32 bits of the pointer and the owning worker's process-unique id in the high 32. Waking on the owning worker's thread pushes the index onto thread-local `READY_QUEUE`; waking on any other thread pushes it into that worker's inbox (registry in `runtime/waker.rs`) and, if no wake since the worker last drained it has done so, writes its wake fd. The event loop drains both into the executor's ready list.
 
 ### Buffer Systems
 
