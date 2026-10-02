@@ -406,7 +406,7 @@ thread_local! {
     static ORPHANED_OPENS: std::cell::RefCell<Vec<(u32, u16, u16)>> =
         const { std::cell::RefCell::new(Vec::new()) };
     // Buffers of reads and writes whose future was dropped outside the
-    // executor, before the operation completed.
+    // executor, before it resolved.
     static ORPHANED_BUFFERS: std::cell::RefCell<OrphanedBuffers> =
         const { std::cell::RefCell::new(OrphanedBuffers(Vec::new())) };
 }
@@ -418,18 +418,18 @@ struct OrphanedBuffers(Vec<(u32, u16, BytesMut)>);
 impl Drop for OrphanedBuffers {
     fn drop(&mut self) {
         // Dropped when the worker thread exits. The operations may still be
-        // running and writing into these buffers, so leak them, as the
-        // executor's graveyard does at exit.
+        // using these buffers, so leak them, as the executor's graveyard does
+        // at exit.
         for (_, _, buf) in self.0.drain(..) {
             std::mem::forget(buf);
         }
     }
 }
 
-/// Release what futures dropped outside the executor left behind: close the
-/// files of abandoned opens and free their slots, and park or drop the
-/// buffers of abandoned reads and writes. Called by the event loop once per
-/// iteration, right after its task-poll pass.
+/// Release what dropped fs futures queued: close the files of abandoned opens
+/// and free their slots, and park or drop the buffers of abandoned reads and
+/// writes. Called by the event loop once per iteration, after its first
+/// task-poll pass.
 ///
 /// An open that has completed is closed now. One still in flight is marked in
 /// `abandoned_fs_opens`, and its completion handler closes it. A buffer whose
@@ -532,10 +532,11 @@ pub unsafe fn write(file: File, offset: u64, buf: *const u8, len: u32) -> io::Re
 /// On success, the returned future yields `(Ok(n), buf)` with `buf.len()` extended
 /// by `n` bytes. On failure, the buffer is returned unchanged alongside the error.
 ///
-/// If the future is dropped before the I/O completes, the buffer is parked
-/// in the runtime until the kernel reports completion (a best-effort
-/// `ASYNC_CANCEL` is also submitted). This avoids the use-after-free that
-/// motivates the `unsafe` on [`read()`].
+/// If the future is dropped before the I/O completes, the buffer is kept
+/// until the operation completes and then freed. On io_uring a best-effort
+/// `ASYNC_CANCEL` is also submitted. If the worker exits first, the buffer
+/// is leaked. This avoids the use-after-free that motivates the `unsafe` on
+/// [`read()`].
 ///
 /// Returns [`io::ErrorKind::InvalidInput`] if `buf` has no spare capacity
 /// or if spare capacity exceeds `u32::MAX`.
@@ -586,9 +587,10 @@ pub fn read_into(file: File, offset: u64, mut buf: BytesMut) -> io::Result<ReadF
 /// The kernel reads `buf.len()` bytes starting at `buf.as_ptr()`. The future
 /// yields `(io::Result<usize>, buf)` — the buffer is returned unchanged.
 ///
-/// If the future is dropped before the I/O completes, the buffer is parked
-/// until the kernel reports completion (a best-effort `ASYNC_CANCEL` is also
-/// submitted).
+/// If the future is dropped before the I/O completes, the buffer is kept
+/// until the operation completes and then freed. On io_uring a best-effort
+/// `ASYNC_CANCEL` is also submitted. If the worker exits first, the buffer
+/// is leaked.
 ///
 /// Returns [`io::ErrorKind::InvalidInput`] if `buf.len() > u32::MAX`.
 ///
@@ -712,22 +714,15 @@ impl Drop for WriteFuture {
     }
 }
 
-/// Drop-side handler shared by [`ReadFuture`] and [`WriteFuture`].
-///
-/// If the CQE has already arrived (result is sitting in `disk_io_results`),
-/// the kernel is done with the buffer — drop it immediately. Otherwise park
-/// the buffer in `disk_io_graveyard` keyed by `seq`; the fs CQE handler will
-/// drop it when the op completes (with `-ECANCELED` if the cancel below
-/// raced ahead, or with the natural result otherwise).
-///
-/// On the io_uring backend, also submit a best-effort `ASYNC_CANCEL` SQE
-/// to speed up the inevitable completion. The mio backend has no equivalent
-/// (the syscall is already in-flight on a worker thread); the buffer just
-/// waits in the graveyard until the worker thread finishes.
+/// Called from [`ReadFuture`] and [`WriteFuture`] drops. Inside a task poll
+/// it calls [`park_buffer`]. Outside one (a connection's task dropped at
+/// teardown) it queues the buffer on `ORPHANED_BUFFERS`, which
+/// [`release_orphans`] passes to `park_buffer`.
 fn park_or_drop(seq: u32, file_index: u16, buf: BytesMut) {
     let Some(mut non_null) = CURRENT_DRIVER.with(|c| c.get()) else {
         // Outside the executor: a connection's task is dropped outside any
-        // task poll. Queue the buffer for the event loop's next iteration.
+        // task poll. Queue the buffer; the event loop releases it after its
+        // next task-poll pass.
         // If the queue is gone (the thread is exiting), leak the buffer
         // rather than free memory the operation may still write into.
         let mut pending = Some(buf);
@@ -747,8 +742,14 @@ fn park_or_drop(seq: u32, file_index: u16, buf: BytesMut) {
     park_buffer(driver, executor, seq, file_index, buf);
 }
 
-/// Drop `buf` if its operation has completed, otherwise park it in the
-/// graveyard until the completion arrives.
+/// Drop `buf` if its operation has completed (its result is in
+/// `disk_io_results`), otherwise park it in `disk_io_graveyard` keyed by
+/// `seq`; `wake_disk_io` frees it when the operation completes.
+///
+/// On io_uring, also submit a best-effort `ASYNC_CANCEL` to speed up the
+/// completion, which then arrives with `-ECANCELED` or the natural result.
+/// On mio the disk-I/O pool thread runs the operation, which may not have
+/// started yet, and there is nothing to cancel.
 #[cfg_attr(not(has_io_uring), allow(unused_variables))]
 fn park_buffer(
     driver: &mut crate::backend::Driver,

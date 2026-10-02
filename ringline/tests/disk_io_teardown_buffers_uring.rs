@@ -1,12 +1,12 @@
-//! A read whose connection closes while it is in flight frees its buffer
-//! once the read completes, while the worker keeps running (#568).
+//! A read whose connection closes while it is in flight in the kernel frees
+//! its buffer once the read completes, while the worker keeps running
+//! (#568). io_uring counterpart of `disk_io_teardown_buffers.rs`.
 //!
 //! Its own test binary: it installs a global allocator that counts frees of
-//! one distinctive allocation size. mio only: the read is queued on the
-//! disk-I/O pool behind an open the test holds back. Linux only: it uses
-//! `mkfifo`.
+//! one distinctive allocation size. The read is from a FIFO opened read-write,
+//! so it waits in the kernel until the runtime cancels it. Linux only.
 
-#![cfg(all(target_os = "linux", not(has_io_uring)))]
+#![cfg(all(target_os = "linux", has_io_uring))]
 #![allow(clippy::manual_async_fn)]
 
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -22,7 +22,7 @@ use ringline::{AsyncEventHandler, ConfigBuilder, Connection, RinglineBuilder};
 
 /// The capacity of the abandoned read's buffer. Nothing else in the process
 /// allocates exactly this many bytes.
-const BUF_SIZE: usize = 777_779;
+const BUF_SIZE: usize = 777_781;
 
 static BUF_FREES: AtomicUsize = AtomicUsize::new(0);
 
@@ -43,7 +43,7 @@ unsafe impl GlobalAlloc for CountingAlloc {
 #[global_allocator]
 static ALLOC: CountingAlloc = CountingAlloc;
 
-static DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
+static FIFO: Mutex<Option<PathBuf>> = Mutex::new(None);
 static READ_QUEUED: AtomicBool = AtomicBool::new(false);
 static READ_RESOLVED: AtomicBool = AtomicBool::new(false);
 static TASK_DROPPED: AtomicBool = AtomicBool::new(false);
@@ -64,14 +64,13 @@ impl AsyncEventHandler for ReadsInConnection {
         let ctx = conn.send_half().as_conn();
         async move {
             let _guard = OnDrop;
-            let dir = DIR.lock().unwrap().clone().unwrap();
-            let file = ringline::fs::open(dir.join("data"), OpenFlags::READ, 0)
+            let fifo = FIFO.lock().unwrap().clone().unwrap();
+            // Read-write, so the open does not wait for a writer and the
+            // read waits for data that never comes.
+            let file = ringline::fs::open(&fifo, OpenFlags::READ_WRITE, 0)
                 .unwrap()
                 .await
                 .unwrap();
-            // Park the pool's only thread in an open that waits for a writer.
-            drop(ringline::fs::open(dir.join("fifo"), OpenFlags::READ, 0).unwrap());
-            // Queued behind it, then abandoned when this task is dropped.
             let read = ringline::fs::read_into(file, 0, BytesMut::with_capacity(BUF_SIZE)).unwrap();
             // Close this connection while the read waits: the task, and the
             // read's future with it, is dropped outside any task poll.
@@ -92,14 +91,16 @@ impl AsyncEventHandler for ReadsInConnection {
 
 #[test]
 fn a_read_dropped_with_its_connection_frees_its_buffer() {
-    let dir = std::env::temp_dir().join(format!("ringline-teardown-buf-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!(
+        "ringline-teardown-buf-uring-{}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("data"), vec![7u8; 4096]).unwrap();
     let fifo = dir.join("fifo");
     let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
     assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
-    *DIR.lock().unwrap() = Some(dir.clone());
+    *FIFO.lock().unwrap() = Some(fifo);
 
     let config = ConfigBuilder::new()
         .workers(1)
@@ -111,7 +112,6 @@ fn a_read_dropped_with_its_connection_frees_its_buffer() {
         .blocking_threads(0)
         .resolver_threads(0)
         .spawner_threads(0)
-        .disk_io_threads(1)
         .fs(FsConfig {
             max_files: 4,
             max_commands_in_flight: 64,
@@ -125,30 +125,16 @@ fn a_read_dropped_with_its_connection_frees_its_buffer() {
     let _client = std::net::TcpStream::connect(runtime.bound_addr().unwrap()).unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(5);
-    while !READ_QUEUED.load(Ordering::SeqCst) && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    // Wait for the connection to close and its task to go.
-    let deadline = Instant::now() + Duration::from_secs(5);
     while !TASK_DROPPED.load(Ordering::SeqCst) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
-    assert!(
-        TASK_DROPPED.load(Ordering::SeqCst),
-        "the connection's task was not dropped"
-    );
-    // Let the event loop release the queued buffer.
-    std::thread::sleep(Duration::from_millis(50));
-    let frees_while_queued = BUF_FREES.load(Ordering::SeqCst);
-
-    // Let the pool run the open, then the read.
-    let writer = std::fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+    // The release parks the buffer and cancels the read; the cancelled read's
+    // completion frees it.
     let deadline = Instant::now() + Duration::from_secs(5);
     while BUF_FREES.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
-    let frees_after_read = BUF_FREES.load(Ordering::SeqCst);
-    drop(writer);
+    let frees = BUF_FREES.load(Ordering::SeqCst);
 
     runtime.shutdown();
     for h in handles {
@@ -157,15 +143,19 @@ fn a_read_dropped_with_its_connection_frees_its_buffer() {
     let _ = std::fs::remove_dir_all(&dir);
 
     assert!(
+        READ_QUEUED.load(Ordering::SeqCst),
+        "the read was never queued"
+    );
+    assert!(
+        TASK_DROPPED.load(Ordering::SeqCst),
+        "the connection's task was not dropped"
+    );
+    assert!(
         !READ_RESOLVED.load(Ordering::SeqCst),
-        "the connection's task was not dropped before its read completed"
+        "the read resolved before its task was dropped"
     );
     assert_eq!(
-        frees_while_queued, 0,
-        "the buffer was freed while its read was still queued"
-    );
-    assert_eq!(
-        frees_after_read, 1,
+        frees, 1,
         "the buffer was not freed after its read completed"
     );
 }
