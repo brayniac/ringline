@@ -1925,6 +1925,17 @@ impl ConnCtx {
             #[cfg_attr(not(has_io_uring), allow(unused_variables))]
             let conn_index = self.conn_index;
 
+            // Before either zero-copy branch: both act on the slot's pending
+            // recv buffer or accumulator, which belong to whichever
+            // connection holds the slot now. The same refusal as the copy
+            // path's `send` (#544).
+            if driver.connections.generation(conn_index) != self.generation {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "stale connection",
+                ));
+            }
+
             #[cfg(has_io_uring)]
             {
                 // Check for pending recv buffer.
@@ -3953,7 +3964,21 @@ impl SendHalf {
         self.conn.close();
     }
 
-    /// See [`SendHalf::forward_recv_buf`].
+    /// Send `data`, the bytes a `with_data` closure was handed, without
+    /// copying them when possible.
+    ///
+    /// On io_uring, if `data` is exactly the connection's pending recv buffer,
+    /// that buffer is sent as is and replenished when the send completes. If
+    /// `data` is exactly the connection's whole recv accumulator, the
+    /// accumulator is detached and sent under a guard. Otherwise, and always
+    /// on mio and for TLS connections, `data` is copied as by
+    /// [`send_nowait`](Self::send_nowait).
+    ///
+    /// # Errors
+    ///
+    /// `NotConnected` if this handle is stale: its connection closed and the
+    /// slot now holds another. Otherwise the errors of
+    /// [`send_nowait`](Self::send_nowait).
     pub fn forward_recv_buf(&mut self, data: &[u8]) -> io::Result<()> {
         self.conn.forward_recv_buf(data)
     }

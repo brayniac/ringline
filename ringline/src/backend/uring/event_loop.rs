@@ -10603,6 +10603,101 @@ mod tests {
         );
     }
 
+    /// A stale handle's `forward_recv_buf` must not send the slot's new
+    /// occupant's pending recv buffer (#544).
+    #[test]
+    fn forward_recv_buf_refuses_a_stale_handle_on_the_pending_buffer() {
+        let mut el = make_test_loop_with_config(config_with_reserve(16));
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let stale = ConnCtx::new(conn_index, generation.wrapping_add(1));
+        let bytes = [7u8; 32];
+        el.driver.pending_recv_bufs[conn_index as usize] =
+            Some(crate::backend::uring::driver::PendingRecvBuf {
+                bid: 0,
+                len: bytes.len() as u32,
+                ptr: bytes.as_ptr(),
+            });
+
+        let err = with_driver_state(&mut el, || stale.forward_recv_buf(&bytes))
+            .expect_err("a stale handle must be refused");
+        assert_eq!(err.kind(), io::ErrorKind::NotConnected);
+        assert!(
+            el.driver.pending_recv_bufs[conn_index as usize].is_some(),
+            "a stale handle took the new occupant's pending recv buffer"
+        );
+        assert!(
+            !el.driver.send_queues[conn_index as usize].in_flight
+                && el.driver.send_queues[conn_index as usize].queue.is_empty(),
+            "a stale handle queued a send on the new occupant"
+        );
+        el.driver.pending_recv_bufs[conn_index as usize] = None;
+    }
+
+    /// A stale handle's `forward_recv_buf` must not detach the slot's new
+    /// occupant's accumulator, which would drop its buffered bytes (#544).
+    /// The current handle still forwards it.
+    #[test]
+    fn forward_recv_buf_refuses_a_stale_handle_on_the_accumulator() {
+        let mut el = make_test_loop_with_config(config_with_reserve(16));
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let stale = ConnCtx::new(conn_index, generation.wrapping_add(1));
+        assert!(el.driver.accumulators.append(conn_index, b"buffered bytes"));
+        let data = el.driver.accumulators.data(conn_index);
+        let (ptr, len) = (data.as_ptr(), data.len());
+        // SAFETY: the accumulator is not touched between here and the calls
+        // below, so the slice stays valid.
+        let view = unsafe { std::slice::from_raw_parts(ptr, len) };
+
+        let err = with_driver_state(&mut el, || stale.forward_recv_buf(view))
+            .expect_err("a stale handle must be refused");
+        assert_eq!(err.kind(), io::ErrorKind::NotConnected);
+        assert_eq!(
+            el.driver.accumulators.data(conn_index),
+            b"buffered bytes",
+            "a stale handle detached the new occupant's accumulator"
+        );
+        assert_eq!(el.driver.forward_zc_consumed[conn_index as usize], 0);
+
+        let current = ConnCtx::new(conn_index, generation);
+        with_driver_state(&mut el, || current.forward_recv_buf(view))
+            .expect("the current handle forwards its accumulator");
+        assert!(el.driver.accumulators.data(conn_index).is_empty());
+        assert_eq!(
+            el.driver.forward_zc_consumed[conn_index as usize],
+            len as u32
+        );
+    }
+
+    /// A handle made stale by real teardown and the slot's re-accept must not
+    /// detach the new occupant's accumulator (#544).
+    #[test]
+    fn forward_recv_buf_refuses_a_handle_made_stale_by_teardown() {
+        let mut el = make_test_loop_with_config(config_with_reserve(16));
+        let conn_index = accept_connection(&mut el);
+        let old = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+
+        el.driver.close_connection(conn_index);
+        let ud = UserData::encode(OpTag::Close, conn_index, 0);
+        el.test_dispatch_cqe(ud.raw(), 0, 0);
+        let new_index = accept_connection(&mut el);
+        assert_eq!(new_index, conn_index, "the test needs the slot reused");
+
+        assert!(el.driver.accumulators.append(conn_index, b"new occupant"));
+        let data = el.driver.accumulators.data(conn_index);
+        // SAFETY: the accumulator is not touched before the call below.
+        let view = unsafe { std::slice::from_raw_parts(data.as_ptr(), data.len()) };
+        let err = with_driver_state(&mut el, || old.forward_recv_buf(view))
+            .expect_err("a stale handle must be refused");
+        assert_eq!(err.kind(), io::ErrorKind::NotConnected);
+        assert_eq!(
+            el.driver.accumulators.data(conn_index),
+            b"new occupant",
+            "the stale handle dropped the new occupant's buffered bytes"
+        );
+    }
+
     /// A handle made stale by real teardown (close, the Close CQE, release)
     /// and the slot's re-accept must not close the new occupant or take its
     /// recv sink. Teardown clears the old occupant's sink before the slot is
