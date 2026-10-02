@@ -7,7 +7,7 @@
 //!
 //! - **Portable** (no io_uring dependency):
 //!   - `task` — `TaskSlab`, `TaskSlot` (slab of per-connection futures)
-//!   - `waker` — `conn_waker()`, thread-local `READY_QUEUE`
+//!   - `waker` — `conn_waker()`, thread-local `READY_QUEUE`, cross-thread wake inboxes
 //!   - `mod.rs` — `Executor`, `IoResult` (waiter flags, ready queue, result storage)
 //!   - `handler` — `AsyncEventHandler` trait (references `DriverCtx` by borrowed ref only)
 //!
@@ -413,6 +413,10 @@ impl TimerSlotPool {
 /// Per-worker async executor. Owns the task slab and coordinates
 /// CQE-driven wakeups with future polling.
 pub(crate) struct Executor {
+    /// This worker's id and inbox. Wakers carry the id; one woken on another
+    /// thread delivers its task id to the inbox, which `collect_wakeups`
+    /// drains.
+    pub(crate) wakes: waker::WorkerWakes,
     pub(crate) task_slab: TaskSlab,
     /// Standalone tasks not bound to any connection.
     pub(crate) standalone_slab: StandaloneTaskSlab,
@@ -586,6 +590,7 @@ impl Executor {
         let cap = max_connections as usize;
         let udp = udp_count as usize;
         Executor {
+            wakes: waker::WorkerWakes::register(),
             task_slab: TaskSlab::new(max_connections),
             standalone_slab: StandaloneTaskSlab::new(standalone_capacity),
             timer_pool: TimerSlotPool::new(timer_slots),
@@ -642,17 +647,13 @@ impl Executor {
         }
     }
 
-    /// Drain the thread-local waker queue, transitioning each woken task
-    /// Parked → Ready and queueing it for poll.
-    ///
-    /// The transition matters: a std `Waker` pushes only the raw id onto the
-    /// thread-local queue. Draining that id straight into `ready_queue`
-    /// (as this used to) left the slot Parked, so `take_ready()` returned
-    /// `None` and the wake was lost forever — stored wakers never worked
-    /// for parked tasks. Routing through `wake_task` performs the slab
-    /// transition and also handles wakes of the currently-polling task.
+    /// Drain the thread-local waker queue and this worker's cross-thread
+    /// inbox, moving each woken task from Parked to Ready through `wake_task`
+    /// and queueing it for poll. `wake_task` also records a wake of the task
+    /// being polled.
     pub(crate) fn collect_wakeups(&mut self) {
         drain_ready_queue(&mut self.waker_drain_scratch);
+        self.wakes.drain_into(&mut self.waker_drain_scratch);
         while let Some(id) = self.waker_drain_scratch.pop_front() {
             let _ = self.wake_task(id);
         }
@@ -912,7 +913,7 @@ mod tests {
         let fut = exec.task_slab.take_ready(3).unwrap();
         exec.task_slab.park(3, fut);
 
-        waker::conn_waker(3).wake_by_ref();
+        waker::conn_waker(exec.wakes.id(), 3).wake_by_ref();
         exec.collect_wakeups();
 
         assert_eq!(exec.ready_queue.len(), 1);

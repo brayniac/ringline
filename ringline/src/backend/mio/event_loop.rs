@@ -100,6 +100,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             config.udp_bind.len() as u32,
             config.udp_recv_queue_capacity,
         );
+        // A waker woken off this thread rings the worker's own wake fd.
+        if let Some(handle) = config
+            .wake_keep_alive
+            .as_ref()
+            .and_then(|handles| handles.get(config.worker_index))
+        {
+            executor.wakes.set_wake_handle(handle.clone());
+        }
 
         Ok(AsyncEventLoop {
             driver,
@@ -1479,7 +1487,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 }
                 let task_idx = task_idx as u32;
                 if let Some(mut fut) = executor.standalone_slab.take_ready(task_idx) {
-                    let waker = standalone_waker(task_idx);
+                    let waker = standalone_waker(executor.wakes.id(), task_idx);
                     let mut cx = Context::from_waker(&waker);
 
                     CURRENT_TASK_ID.with(|c| c.set(raw_id));
@@ -1519,7 +1527,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 }
                 let conn_index = conn_index as u32;
                 if let Some(mut fut) = executor.task_slab.take_ready(conn_index) {
-                    let waker = conn_waker(conn_index);
+                    let waker = conn_waker(executor.wakes.id(), conn_index);
                     let mut cx = Context::from_waker(&waker);
 
                     CURRENT_TASK_ID.with(|c| c.set(conn_index));

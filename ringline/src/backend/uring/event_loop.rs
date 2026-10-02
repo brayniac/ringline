@@ -200,6 +200,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             config.udp_bind.len() as u32,
             udp_queue_capacity,
         );
+        // A waker woken off this thread rings the worker's own wake fd.
+        if let Some(handle) = config
+            .wake_keep_alive
+            .as_ref()
+            .and_then(|handles| handles.get(config.worker_index))
+        {
+            executor.wakes.set_wake_handle(handle.clone());
+        }
         Ok(AsyncEventLoop {
             driver,
             handler,
@@ -376,7 +384,16 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // flowing while a task is runnable — otherwise a task that stays
             // runnable without queueing SQEs (so `flush()` takes its empty-SQ
             // shortcut) starves the whole worker of completions.
-            if self.executor.ready_queue.is_empty() {
+            //
+            // Nor once shutdown is pending. The shutdown check below runs only
+            // after this wait returns, and the eventfd completion that carries
+            // the shutdown wake can already have been reaped by the drain that
+            // follows `flush()`, without a check after it; the eventfd read is
+            // not re-armed once shutdown is set. With no tick timeout, a
+            // blocking wait would then never return.
+            let shutting_down =
+                self.driver.shutdown_local || self.driver.shutdown_flag.load(Ordering::Relaxed);
+            if self.executor.ready_queue.is_empty() && !shutting_down {
                 self.driver.ring.submit_and_wait(1)?;
             } else {
                 self.driver.ring.submit_and_get_events()?;
@@ -717,8 +734,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // pushes straight onto executor.ready_queue (and, for the task being
         // polled right now, records woken_while_polling so the poll loop
         // re-queues it after parking). A std::task::Waker does NOT — what a
-        // future gets from its Context pushes onto the thread-local queue in
-        // runtime/waker.rs, which only reaches executor.ready_queue via
+        // future gets from its Context pushes onto the thread-local queue (or,
+        // from another thread, the worker's inbox) in runtime/waker.rs, which
+        // only reaches executor.ready_queue via
         // collect_wakeups() once this pass has ended. So a future that wakes
         // itself through its Context (the usual "yield to the executor"
         // pattern) resumes on the NEXT event-loop iteration — after
@@ -758,7 +776,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 }
                 let task_idx = task_idx as u32;
                 if let Some(mut fut) = executor.standalone_slab.take_ready(task_idx) {
-                    let waker = standalone_waker(task_idx);
+                    let waker = standalone_waker(executor.wakes.id(), task_idx);
                     let mut cx = Context::from_waker(&waker);
 
                     CURRENT_TASK_ID.with(|c| c.set(raw_id));
@@ -805,7 +823,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 }
                 let conn_index = conn_index as u32;
                 if let Some(mut fut) = executor.task_slab.take_ready(conn_index) {
-                    let waker = conn_waker(conn_index);
+                    let waker = conn_waker(executor.wakes.id(), conn_index);
                     let mut cx = Context::from_waker(&waker);
 
                     CURRENT_TASK_ID.with(|c| c.set(conn_index));

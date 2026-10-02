@@ -77,7 +77,7 @@
 //!
 //! 1. `submit_and_wait(1)` — block until a CQE arrives
 //! 2. `drain_completions()` — decode CQEs via `OpTag` + `UserData`, dispatch to handlers
-//! 3. `collect_wakeups()` — drain thread-local `READY_QUEUE` into executor's ready list
+//! 3. `collect_wakeups()` — drain thread-local `READY_QUEUE` and the cross-thread wake inbox into executor's ready list
 //! 4. `poll_ready_tasks()` — poll all Ready futures (sets `CURRENT_DRIVER` thread-local)
 //! 5. `on_tick()` — call handler's sync tick callback
 //!
