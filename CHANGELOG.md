@@ -247,6 +247,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A connection closed while its task awaited `fs::read_into` or
+  `fs::write_from` leaked the operation's buffer for the life of the
+  process. The task is dropped outside any task poll, and the buffer was
+  forgotten there. The event loop now frees the buffer once the operation
+  completes, as it does for a future dropped inside a task poll (#568).
+
 - On mio, `RinglineBuilder::bind_udp_connected` /
   `ConfigBuilder::udp_bind_connected` bound the socket but never
   `connect(2)`ed it, so a datagram from any source reached the handler. The

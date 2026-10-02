@@ -503,17 +503,17 @@ pub(crate) struct Executor {
     /// empty because sends are synchronous and never suspend.
     #[cfg_attr(not(has_io_uring), allow(dead_code))]
     pub(crate) udp_send_ready_waiters: Vec<Option<u32>>,
-    /// Disk I/O: maps command slab_idx → task_id to wake on completion.
+    /// Disk I/O: maps disk-I/O key → task_id to wake on completion.
     pub(crate) disk_io_waiters: HashMap<u32, u32>,
-    /// Disk I/O: maps command slab_idx → i32 result from CQE.
+    /// Disk I/O: maps disk-I/O key → i32 result of the completed operation.
     pub(crate) disk_io_results: HashMap<u32, i32>,
     /// Disk I/O buffer graveyard: holds buffers whose owning future was dropped
-    /// before the CQE arrived. Entry is removed (and the buffer freed) when
+    /// before its operation completed. Entry is removed (and the buffer freed) when
     /// `wake_disk_io` fires, ensuring the kernel's pointer remains valid for
     /// the entire op even after the future goes away. Buffers still here when
     /// the executor drops are leaked; see `impl Drop for Executor`.
     pub(crate) disk_io_graveyard: HashMap<u32, bytes::BytesMut>,
-    /// Filesystem stat results: maps slab_idx → Metadata (populated by handle_fs for Statx ops).
+    /// Filesystem stat results: maps disk-I/O key → Metadata (populated by handle_fs for Statx ops).
     pub(crate) fs_stat_results: HashMap<u32, crate::fs::Metadata>,
     /// Disk I/O keys of opens whose `OpenFuture` was dropped before the open
     /// completed. The backend's completion handler closes the file and
@@ -827,10 +827,10 @@ impl Executor {
 
     /// Wake a task that was waiting for a disk I/O completion.
     ///
-    /// Stores the CQE result and wakes the task if one is registered.
-    /// Disk I/O waiters are keyed by slab_idx (not conn_index), so
-    /// `remove_connection()` does not need to clear them — the task
-    /// holds the `DiskIoFuture` and will consume the result.
+    /// Stores the result and wakes the task if one is registered. Waiters
+    /// and results are keyed by the disk-I/O key, not the connection. A
+    /// result whose future was dropped without parking a buffer stays in
+    /// `disk_io_results` (#574).
     ///
     /// If the owning future was dropped before completion, its buffer was
     /// parked in `disk_io_graveyard`. We free it here (the kernel is now
