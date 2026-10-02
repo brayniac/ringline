@@ -10670,6 +10670,74 @@ mod tests {
         );
     }
 
+    /// Once the connection's Close is submitted, `forward_recv_buf` on the
+    /// current handle is refused without committing anything: the pending
+    /// recv buffer and the accumulator stay where they are.
+    #[test]
+    fn forward_recv_buf_on_a_closing_connection_commits_nothing() {
+        let mut el = make_test_loop_with_config(config_with_reserve(16));
+        let conn_index = accept_connection(&mut el);
+        let current = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        el.driver.send_queues[conn_index as usize].close_submitted = true;
+
+        let bytes = [7u8; 32];
+        el.driver.pending_recv_bufs[conn_index as usize] =
+            Some(crate::backend::uring::driver::PendingRecvBuf {
+                bid: 0,
+                len: bytes.len() as u32,
+                ptr: bytes.as_ptr(),
+            });
+        assert!(with_driver_state(&mut el, || current.forward_recv_buf(&bytes)).is_err());
+        assert!(
+            el.driver.pending_recv_bufs[conn_index as usize].is_some(),
+            "a refused forward took the pending recv buffer"
+        );
+        el.driver.pending_recv_bufs[conn_index as usize] = None;
+
+        assert!(el.driver.accumulators.append(conn_index, b"buffered bytes"));
+        let data = el.driver.accumulators.data(conn_index);
+        // SAFETY: the accumulator is not touched before the call below.
+        let view = unsafe { std::slice::from_raw_parts(data.as_ptr(), data.len()) };
+        assert!(with_driver_state(&mut el, || current.forward_recv_buf(view)).is_err());
+        assert_eq!(
+            el.driver.accumulators.data(conn_index),
+            b"buffered bytes",
+            "a refused forward dropped the accumulator's bytes"
+        );
+        assert_eq!(el.driver.forward_zc_consumed[conn_index as usize], 0);
+        el.driver.send_queues[conn_index as usize].close_submitted = false;
+    }
+
+    /// When the zero-copy send slab is full, a whole-accumulator forward on
+    /// the current handle fails, and the accumulator keeps its bytes.
+    #[test]
+    fn forward_recv_buf_with_a_full_send_slab_keeps_the_accumulator() {
+        let mut el = make_test_loop_with_config(config_with_reserve(16));
+        let conn_index = accept_connection(&mut el);
+        let current = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        // Above `send_zc_threshold`, so each forward takes a slab entry.
+        let message = vec![9u8; 5000];
+        let mut refused = None;
+        for attempt in 0..64 {
+            assert!(el.driver.accumulators.append(conn_index, &message));
+            let data = el.driver.accumulators.data(conn_index);
+            // SAFETY: the accumulator is not touched before the call below.
+            let view = unsafe { std::slice::from_raw_parts(data.as_ptr(), data.len()) };
+            if let Err(e) = with_driver_state(&mut el, || current.forward_recv_buf(view)) {
+                refused = Some((attempt, e));
+                break;
+            }
+        }
+        let (attempt, err) = refused.expect("the send slab never filled");
+        assert!(attempt > 0, "the first forward was refused: {err}");
+        assert_eq!(
+            el.driver.accumulators.data(conn_index),
+            &message[..],
+            "the refused forward dropped the accumulator's bytes ({err})"
+        );
+        assert_eq!(el.driver.forward_zc_consumed[conn_index as usize], 0);
+    }
+
     /// A handle made stale by real teardown and the slot's re-accept must not
     /// detach the new occupant's accumulator (#544).
     #[test]
