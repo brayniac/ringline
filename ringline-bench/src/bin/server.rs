@@ -971,16 +971,33 @@ mod service_time_tests {
     use std::sync::atomic::Ordering;
     use std::time::Instant;
 
+    /// The shortest of `tries` timings of `f`. A thread can be preempted
+    /// mid-measurement, which only adds time, so the minimum is the timing to
+    /// hold to an upper bound.
+    fn fastest(tries: usize, mut f: impl FnMut()) -> std::time::Duration {
+        (0..tries)
+            .map(|_| {
+                let t = Instant::now();
+                f();
+                t.elapsed()
+            })
+            .min()
+            .expect("tries > 0")
+    }
+
     /// One test rather than several, deliberately: `SERVICE_NS` and
     /// `SERVICE_MSG_SIZE` are process-global, and the test harness runs tests in
     /// parallel threads, so separate tests touching them would race each other
     /// and flake. A single test is single-threaded by construction.
+    ///
+    /// Lower bounds are measured once: `burn_ns` spins until the clock says it
+    /// is done, so it cannot finish early. Upper bounds take the fastest of
+    /// several runs, because preemption can stretch any single one.
     #[test]
     fn simulated_work_is_charged_per_request_not_per_buffer() {
         // Zero is free, and must not consult the clock at all.
-        let t = Instant::now();
-        burn_ns(0);
-        assert!(t.elapsed().as_micros() < 50, "burn_ns(0) should be a no-op");
+        let took = fastest(20, || burn_ns(0));
+        assert!(took.as_micros() < 50, "burn_ns(0) took {took:?}");
 
         // A requested duration is actually burned. Generous lower bound only:
         // the spin can overshoot (scheduling, clock granularity) but must never
@@ -998,11 +1015,10 @@ mod service_time_tests {
         // how much data arrives.
         SERVICE_NS.store(0, Ordering::Relaxed);
         SERVICE_MSG_SIZE.store(64, Ordering::Relaxed);
-        let t = Instant::now();
-        burn_for(64 * 100);
+        let took = fastest(20, || burn_for(64 * 100));
         assert!(
-            t.elapsed().as_micros() < 50,
-            "burn_for with SERVICE_NS=0 should be a no-op"
+            took.as_micros() < 50,
+            "burn_for with SERVICE_NS=0 took {took:?}"
         );
 
         // The point of the whole knob: a buffer holding several pipelined
@@ -1010,17 +1026,17 @@ mod service_time_tests {
         // simulated work would get cheaper the more the runtime coalesced --
         // exactly backwards, and it would quietly cancel the effect being
         // measured.
+        //
+        // Checked against the requested cost rather than against a measured
+        // single request, whose own timing preemption can stretch.
         SERVICE_NS.store(200_000, Ordering::Relaxed); // 200us per request
-        let t = Instant::now();
-        burn_for(64); // one request
-        let one = t.elapsed();
         let t = Instant::now();
         burn_for(64 * 5); // five requests in one buffer
         let five = t.elapsed();
         assert!(
-            five.as_nanos() >= one.as_nanos() * 4,
-            "five requests ({five:?}) should cost ~5x one ({one:?}); \
-             charging per buffer would make them equal"
+            five.as_micros() >= 5 * 200,
+            "five requests in one buffer took {five:?}, less than 5 x 200us; \
+             charging per buffer would take 200us"
         );
 
         // A short buffer still costs one request rather than zero, so a partial
