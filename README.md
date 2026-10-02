@@ -138,6 +138,7 @@ handler instance. On the io_uring backend, each worker also owns:
   benchmarking.
 - macOS and other Mio-supported Unix targets always use the Mio backend.
   Linux builds can force it with `--features force-mio`.
+- Requires a 64-bit target.
 
 ## MSRV
 

@@ -139,7 +139,7 @@ Ringline is a thread-per-core async I/O runtime. No work-stealing, no cross-thre
 io_uring — `AsyncEventLoop::run()`:
 1. `submit_and_wait(1)` — block until a CQE arrives
 2. `drain_completions()` — decode CQEs via `OpTag` + `UserData`, dispatch (recv → accumulator append + wake task, send → dequeue next pending send, connect → store result + wake, timer → fire slot + wake)
-3. `collect_wakeups()` — drain thread-local `READY_QUEUE` into executor's ready list
+3. `collect_wakeups()` — drain thread-local `READY_QUEUE` and the worker's cross-thread wake inbox into executor's ready list
 4. `poll_ready_tasks()` — poll all Ready futures (sets `CURRENT_DRIVER` thread-local before each poll)
 5. `on_tick()` — call handler's sync tick callback
 
@@ -171,7 +171,7 @@ Generation-based stale detection: `ConnToken(index, generation)` prevents use-af
 
 ### Waker Implementation
 
-Zero-allocation wakers encode the `conn_index` (or `task_idx | STANDALONE_BIT`) as a pointer cast. Waking pushes the index onto thread-local `READY_QUEUE`. The event loop drains this into the executor's ready list.
+Zero-allocation wakers encode the `conn_index` (or `task_idx | STANDALONE_BIT`) in the low 32 bits of the pointer and the owning worker's process-unique id in the high 32. Waking on the owning worker's thread pushes the index onto thread-local `READY_QUEUE`; waking on any other thread pushes it into that worker's inbox (registry in `runtime/waker.rs`) and, if no wake since the worker last drained it has done so, writes its wake fd. The event loop drains both into the executor's ready list.
 
 ### Buffer Systems
 

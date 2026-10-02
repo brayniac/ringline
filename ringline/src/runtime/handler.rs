@@ -102,7 +102,10 @@ pub trait AsyncEventHandler: Send + 'static {
         None
     }
 
-    /// Eventfd notification (synchronous).
+    /// Called after the worker's wake fd fires on io_uring (a
+    /// [`WakeHandle::wake`](crate::WakeHandle::wake), a service-pool response,
+    /// or a runtime `Waker` woken on another thread); on mio, every loop
+    /// iteration. Synchronous.
     fn on_notify(&mut self, _ctx: &mut DriverCtx<'_>) {}
 
     /// Async entry point called once during worker startup.

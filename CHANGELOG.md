@@ -247,6 +247,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A `Waker` the runtime hands to a future only worked when woken on the
+  worker thread that polled it. Woken from another thread (a plain thread or
+  another worker), it pushed the task id onto that thread's own ready queue:
+  that wake did not schedule the parked task, and the waking thread could
+  poll an unrelated task of its own. `Waker` is `Send + Sync`, so a future
+  that stores its waker and has it woken elsewhere (a channel, mutex or
+  notify shared between workers) could hang. A waker now carries its
+  worker's id; woken off that worker's thread, it delivers the task to the
+  worker's inbox and wakes the worker. A same-thread wake takes one extra
+  thread-local read. A cross-thread wake takes two locks (the registry read
+  lock and the worker's inbox), and writes the worker's wake fd only if no
+  other wake has since the worker last drained its inbox. A wake for a worker
+  that has exited is dropped. ringline requires a 64-bit target; a const
+  assert now states this at compile time (32-bit Linux builds already failed
+  in `worker.rs` and io-uring) (#559).
+
+- On io_uring with `tick_timeout_us(0)`, a worker could block forever
+  instead of shutting down. `request_shutdown()` from a task always did this,
+  because the loop did not check shutdown before blocking. `Runtime::shutdown`
+  did it when it arrived while the worker was polling tasks: the drain after
+  `flush()` reaped the shutdown wake, and the eventfd read is not re-armed
+  once shutdown is set. The loop no longer blocks once shutdown is pending.
+
 - Dropping a `ReadFuture` or `WriteFuture` (`fs::read_into`, `fs::write_from`)
   before its operation completes parks the buffer until the operation is
   done. When the worker exited first, the buffer was freed while the
