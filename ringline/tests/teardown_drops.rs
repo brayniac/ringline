@@ -178,13 +178,16 @@ fn a_freed_timer_slot_is_available_to_the_next_connection() {
 
 // ── A spawn whose connection closes ─────────────────────────────────────
 
+#[cfg(target_os = "linux")]
 static SPAWNED: AtomicUsize = AtomicUsize::new(0);
 
+#[cfg(target_os = "linux")]
 /// Each connection's task starts a process and holds the `SpawnFuture`
 /// without polling it, so the spawn's result arrives with nothing to take
 /// it.
 struct SpawnsInConnection;
 
+#[cfg(target_os = "linux")]
 impl AsyncEventHandler for SpawnsInConnection {
     fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
