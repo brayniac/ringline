@@ -71,8 +71,8 @@ pub struct Config {
     pub(crate) sqpoll_idle_ms: u32,
     /// Pin SQPOLL kernel thread to this CPU core. Only meaningful when sqpoll=true.
     pub(crate) sqpoll_cpu: Option<u32>,
-    /// Upper bound on each worker's bounded io-wq pool; 0 leaves the kernel
-    /// default.
+    /// Upper bound on each worker's bounded io-wq pool; 0 (the default)
+    /// leaves the kernel's limit.
     pub(crate) iowq_max_workers: u32,
     /// Recv buffer configuration (provided buffer ring) for TCP multishot recv.
     pub(crate) recv_buffer: RecvBufferConfig,
@@ -429,7 +429,7 @@ impl Default for Config {
             sqpoll: false,
             sqpoll_idle_ms: 1000,
             sqpoll_cpu: None,
-            iowq_max_workers: 64,
+            iowq_max_workers: 0,
             recv_buffer: RecvBufferConfig::default(),
             udp_recv_buffer: RecvBufferConfig {
                 ring_size: 128,
@@ -935,17 +935,19 @@ impl ConfigBuilder {
         self
     }
 
-    /// Cap the threads in each worker's bounded io-wq pool. Default 64; 0
-    /// leaves the kernel's default, `min(sq_entries, 4 × online CPUs)`. The
-    /// cap only lowers that default: where the kernel's limit is already
-    /// lower, it is left as it is.
+    /// Cap the threads in each worker's bounded io-wq pool. Default 0, which
+    /// leaves the kernel's limit, `min(sq_entries, 4 × online CPUs)`. A cap
+    /// only lowers that limit: where the kernel's limit is already lower, it
+    /// is left as it is.
     ///
     /// The kernel runs work it cannot complete inline on io-wq threads. In
     /// the bounded pool that is the `shutdown` sent ahead of every
-    /// connection close (#581), and regular-file I/O that would block. A
-    /// lower cap means fewer threads per worker, and less parallelism for
-    /// that work: past the cap, work waits for a free thread. io_uring
-    /// backend only; the mio backend ignores it.
+    /// connection close (#581), and regular-file I/O that would block, such
+    /// as `fs::fsync`. Past the cap, work waits for a free thread. A cap at
+    /// or below a worker's concurrent blocking file I/O therefore delays its
+    /// connection closes: with 32 `fsync` loops on one worker, a cap of 16
+    /// raised the median wait for a closed connection's EOF from 0.2 ms to
+    /// 12 ms (#584). io_uring backend only; the mio backend ignores it.
     pub fn iowq_max_workers(mut self, n: u32) -> Self {
         self.config.iowq_max_workers = n;
         self

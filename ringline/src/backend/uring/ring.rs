@@ -1490,15 +1490,11 @@ mod tests {
         256.min(4 * online_cpus())
     }
 
-    /// The default config caps the bounded pool at 64, or leaves the kernel's
-    /// limit where that is lower.
+    /// The default config leaves the kernel's limit.
     #[test]
-    fn the_default_caps_the_bounded_iowq_pool_at_64() {
+    fn the_default_leaves_the_kernel_limit() {
         let ring = ring_with(None);
-        assert_eq!(
-            ring.iowq_max_workers().expect("query")[0],
-            64.min(kernel_default())
-        );
+        assert_eq!(ring.iowq_max_workers().expect("query")[0], kernel_default());
     }
 
     #[test]
