@@ -433,6 +433,11 @@ pub(crate) enum Orphan {
     Wait(u32),
     /// A `ConnectFuture`'s outbound connection.
     Connect { conn_index: u32, generation: u32 },
+    /// A `BlockingJoinHandle`'s `pending_blocking` entry, and with it a
+    /// delivered result.
+    Blocking(u64),
+    /// A `ResolveFuture`'s `pending_resolves` entry.
+    Resolve(u64),
 }
 
 thread_local! {
@@ -472,6 +477,12 @@ pub(crate) fn release_orphans(driver: &mut crate::backend::Driver, executor: &mu
                 generation,
             } => {
                 io::release_connect(driver, executor, conn_index, generation);
+            }
+            Orphan::Blocking(request_id) => {
+                executor.pending_blocking.remove(&request_id);
+            }
+            Orphan::Resolve(request_id) => {
+                executor.pending_resolves.remove(&request_id);
             }
         }
     }
@@ -988,7 +999,8 @@ impl Executor {
         }
     }
 
-    /// Deliver a blocking response and wake the waiting task.
+    /// Deliver a blocking response and wake the waiting task. With no entry
+    /// (the handle was dropped), the result is dropped here.
     pub(crate) fn deliver_blocking(
         &mut self,
         request_id: u64,
@@ -1001,7 +1013,8 @@ impl Executor {
         }
     }
 
-    /// Deliver a DNS resolve response and wake the waiting task.
+    /// Deliver a DNS resolve response and wake the waiting task. With no
+    /// entry (the future was dropped), the result is dropped here.
     pub(crate) fn deliver_resolve(
         &mut self,
         request_id: u64,

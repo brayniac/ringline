@@ -435,17 +435,23 @@ pub fn spawn_blocking<T: Send + 'static>(
 
         let work = Box::new(move || -> Box<dyn std::any::Any + Send> { Box::new(f()) });
 
-        pool.request_tx
+        if pool
+            .request_tx
             .send(crate::blocking::BlockingRequest {
                 work,
                 request_id,
                 response_tx: blocking_tx.clone(),
                 wake_handle: driver.wake_handle,
             })
-            .map_err(|_| io::Error::other("blocking pool shut down"))?;
+            .is_err()
+        {
+            executor.pending_blocking.remove(&request_id);
+            return Err(io::Error::other("blocking pool shut down"));
+        }
 
         Ok(BlockingJoinHandle {
             request_id,
+            owner: crate::runtime::waker::current_worker(),
             _phantom: std::marker::PhantomData,
         })
     })
@@ -454,9 +460,33 @@ pub fn spawn_blocking<T: Send + 'static>(
 
 /// Future returned by [`spawn_blocking()`]. Resolves to the closure's return
 /// value, or to a [`JoinError`](crate::JoinError) if the closure panicked.
+///
+/// Dropping the handle does not stop the closure. Its result is dropped when
+/// it arrives.
 pub struct BlockingJoinHandle<T> {
     request_id: u64,
+    /// The worker whose executor holds the `pending_blocking` entry.
+    owner: u32,
     _phantom: std::marker::PhantomData<T>,
+}
+
+impl<T> Drop for BlockingJoinHandle<T> {
+    fn drop(&mut self) {
+        // Only the owning worker's executor holds the entry. Dropped
+        // elsewhere (the handle is `Send`), it stays there.
+        if crate::runtime::waker::current_worker() != self.owner {
+            return;
+        }
+        // Removing the entry drops a result that already arrived; one that
+        // arrives later finds no entry and is dropped on delivery.
+        let released = try_with_state(|_driver, executor| {
+            executor.pending_blocking.remove(&self.request_id);
+        });
+        // Outside a task poll (a connection's task dropped at teardown).
+        if released.is_none() {
+            crate::runtime::defer_release(crate::runtime::Orphan::Blocking(self.request_id));
+        }
+    }
 }
 
 impl<T: 'static> Future for BlockingJoinHandle<T> {
@@ -683,7 +713,7 @@ pub fn resolve(host: &str, port: u16) -> io::Result<ResolveFuture> {
             .pending_resolves
             .insert(request_id, (task_id, None));
 
-        resolver
+        if resolver
             .request_tx
             .send(crate::resolver::ResolveRequest {
                 host,
@@ -692,9 +722,16 @@ pub fn resolve(host: &str, port: u16) -> io::Result<ResolveFuture> {
                 response_tx: resolve_tx.clone(),
                 wake_handle: driver.wake_handle,
             })
-            .map_err(|_| io::Error::other("resolver pool shut down"))?;
+            .is_err()
+        {
+            executor.pending_resolves.remove(&request_id);
+            return Err(io::Error::other("resolver pool shut down"));
+        }
 
-        Ok(ResolveFuture { request_id })
+        Ok(ResolveFuture {
+            request_id,
+            owner: crate::runtime::waker::current_worker(),
+        })
     })
     .unwrap_or_else(|| Err(io::Error::other("called outside executor")))
 }
@@ -702,6 +739,27 @@ pub fn resolve(host: &str, port: u16) -> io::Result<ResolveFuture> {
 /// Future returned by [`resolve()`]. Resolves to a [`SocketAddr`].
 pub struct ResolveFuture {
     request_id: u64,
+    /// The worker whose executor holds the `pending_resolves` entry.
+    owner: u32,
+}
+
+impl Drop for ResolveFuture {
+    fn drop(&mut self) {
+        // Only the owning worker's executor holds the entry. Dropped
+        // elsewhere (the future is `Send`), it stays there.
+        if crate::runtime::waker::current_worker() != self.owner {
+            return;
+        }
+        // A result that arrives after this finds no entry and is dropped on
+        // delivery.
+        let released = try_with_state(|_driver, executor| {
+            executor.pending_resolves.remove(&self.request_id);
+        });
+        // Outside a task poll (a connection's task dropped at teardown).
+        if released.is_none() {
+            crate::runtime::defer_release(crate::runtime::Orphan::Resolve(self.request_id));
+        }
+    }
 }
 
 impl Future for ResolveFuture {

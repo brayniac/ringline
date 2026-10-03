@@ -262,6 +262,79 @@ fn a_spawn_dropped_with_its_connection_closes_its_pidfd() {
     );
 }
 
+// ── A blocking handle whose connection closes ───────────────────────
+
+static BLOCKING_RESULTS_DROPPED: AtomicUsize = AtomicUsize::new(0);
+static BLOCKING_STARTED: AtomicUsize = AtomicUsize::new(0);
+
+/// A closure result that counts its own drop.
+struct CountedResult;
+
+impl Drop for CountedResult {
+    fn drop(&mut self) {
+        BLOCKING_RESULTS_DROPPED.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// Each connection's task starts a closure that finishes after 200 ms and
+/// holds its handle without polling it again.
+struct BlockingInConnection;
+
+impl AsyncEventHandler for BlockingInConnection {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
+        async move {
+            let _handle = ringline::spawn_blocking(|| {
+                std::thread::sleep(Duration::from_millis(200));
+                CountedResult
+            })
+            .expect("blocking pool configured");
+            BLOCKING_STARTED.fetch_add(1, Ordering::SeqCst);
+            std::future::pending::<()>().await;
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        BlockingInConnection
+    }
+}
+
+/// A blocking handle dropped with its connection's task drops the closure's
+/// result when it arrives (#582).
+#[test]
+fn a_blocking_handle_dropped_with_its_connection_drops_the_result() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    BLOCKING_RESULTS_DROPPED.store(0, Ordering::SeqCst);
+    BLOCKING_STARTED.store(0, Ordering::SeqCst);
+    let config = ConfigBuilder::new()
+        .workers(1)
+        .pin_to_core(false)
+        .sq_entries(64)
+        .recv_buffer(16, 1024)
+        .max_connections(16)
+        .send_pool(16, 16384)
+        .blocking_threads(1)
+        .resolver_threads(0)
+        .spawner_threads(0)
+        .build()
+        .expect("valid config");
+    let (runtime, handles) = RinglineBuilder::new(config)
+        .bind("127.0.0.1:0".parse().unwrap())
+        .launch::<BlockingInConnection>()
+        .expect("launch");
+    connect_and_close(runtime.bound_addr().unwrap());
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while BLOCKING_RESULTS_DROPPED.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let dropped = BLOCKING_RESULTS_DROPPED.load(Ordering::SeqCst);
+    runtime.shutdown();
+    for h in handles {
+        h.join().expect("worker panicked").expect("worker failed");
+    }
+    assert_eq!(BLOCKING_STARTED.load(Ordering::SeqCst), 1);
+    assert_eq!(dropped, 1, "the worker held the result of a dropped handle");
+}
+
 // ── A channel sender whose connection closes ────────────────────────────
 
 thread_local! {

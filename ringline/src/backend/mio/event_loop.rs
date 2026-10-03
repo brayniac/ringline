@@ -1715,6 +1715,73 @@ mod tests {
         assert_eq!(first.executor.timer_pool.generations, first_generations);
     }
 
+    /// A resolve future dropped before its result arrives removes its
+    /// `pending_resolves` entry: at once inside a task poll, and through the
+    /// orphan queue outside one. A request the pool cannot take leaves no
+    /// entry either (#582).
+    #[test]
+    fn a_dropped_resolve_future_leaves_no_entry() {
+        let config = test_config();
+        let (mut el, _wake) = test_loop(&config);
+        let (resolve_tx, _resolve_rx) = crossbeam_channel::unbounded();
+        el.driver.resolve_tx = Some(resolve_tx);
+
+        // A pool with no threads cannot take the request, and the failed
+        // request leaves no entry.
+        el.driver.resolver = Some(Arc::new(crate::resolver::ResolverPool::start(
+            0,
+            Arc::from(Vec::new()),
+        )));
+        {
+            let mut state = DriverState {
+                driver: NonNull::from(&mut el.driver),
+                executor: NonNull::from(&mut el.executor),
+            };
+            let _guard = unsafe { set_driver_state_guarded(&mut state) };
+            assert!(crate::runtime::io::resolve("localhost", 80).is_err());
+        }
+        assert!(el.executor.pending_resolves.is_empty());
+
+        // One thread. Its answers go to `_resolve_rx`, which nothing drains,
+        // so a request stays pending until its future goes.
+        el.driver.resolver = Some(Arc::new(crate::resolver::ResolverPool::start(
+            1,
+            Arc::from(Vec::new()),
+        )));
+        let start = |el: &mut AsyncEventLoop<NoopHandler>| {
+            let mut state = DriverState {
+                driver: NonNull::from(&mut el.driver),
+                executor: NonNull::from(&mut el.executor),
+            };
+            let _guard = unsafe { set_driver_state_guarded(&mut state) };
+            crate::runtime::io::resolve("localhost", 80).expect("resolve")
+        };
+
+        // Dropped inside a task poll.
+        let resolving = start(&mut el);
+        assert_eq!(el.executor.pending_resolves.len(), 1);
+        {
+            let mut state = DriverState {
+                driver: NonNull::from(&mut el.driver),
+                executor: NonNull::from(&mut el.executor),
+            };
+            let _guard = unsafe { set_driver_state_guarded(&mut state) };
+            drop(resolving);
+        }
+        assert!(el.executor.pending_resolves.is_empty());
+
+        // Dropped outside one, as at connection teardown.
+        let resolving = start(&mut el);
+        drop(resolving);
+        assert_eq!(
+            el.executor.pending_resolves.len(),
+            1,
+            "outside a poll the release waits for the event loop"
+        );
+        crate::fs::release_orphans(&mut el.driver, &mut el.executor);
+        assert!(el.executor.pending_resolves.is_empty());
+    }
+
     /// [`test_loop`] with an acceptor channel, for the tests that drive
     /// `drain_channels`' accept path.
     fn test_loop_with_accept(

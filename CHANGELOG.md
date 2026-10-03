@@ -261,6 +261,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A `spawn_blocking` handle or `resolve` future dropped before its result
+  arrived left its pending entry with the worker for the rest of its life,
+  and a closure's result delivered into that entry was never dropped. This
+  happened to a `select!`/`timeout` loser and to a future owned by a
+  connection's task at teardown. Each now removes its entry when dropped,
+  and a result that arrives later is dropped on delivery. A request the
+  blocking or resolver pool cannot take no longer leaves an entry either
+  (#582).
+
 - On io_uring with Linux 6.1–6.12, a closed connection sent no FIN while
   another connection had a request in flight. The kernel keeps a socket
   removed from the fixed-file table open until earlier requests that use a
