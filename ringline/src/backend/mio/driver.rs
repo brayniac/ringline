@@ -1895,7 +1895,7 @@ pub(crate) mod tests {
         // Nobody has to accept: mio's connect is nonblocking.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
         let addr = listener.local_addr().expect("listener address");
-        let reused = driver.make_ctx().connect(addr).expect("connect");
+        let reused = driver.make_ctx().start_connect(addr).expect("connect");
         assert_eq!(
             reused.index, conn_index,
             "the free list is LIFO, so this is the same slot"
