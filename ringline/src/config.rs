@@ -629,9 +629,10 @@ impl Config {
                 "forward_hold_cap must be >= 1".into(),
             ));
         }
-        if self.sq_entries == 0 || !self.sq_entries.is_power_of_two() {
+        // A close pushes a linked shutdown and Close as one pair (#581).
+        if self.sq_entries < 2 || !self.sq_entries.is_power_of_two() {
             return Err(crate::error::Error::RingSetup(
-                "sq_entries must be > 0 and a power of two".into(),
+                "sq_entries must be at least 2 and a power of two".into(),
             ));
         }
         if self.standalone_task_capacity >= (1 << 31) {
@@ -899,7 +900,8 @@ impl ConfigBuilder {
 
     // ── io_uring settings ────────────────────────────────────────────
 
-    /// Set the number of SQ entries. CQ will be 4x this. Must be a power of 2.
+    /// Set the number of SQ entries. CQ will be 4x this. Must be a power of 2
+    /// and at least 2.
     pub fn sq_entries(mut self, n: u32) -> Self {
         self.config.sq_entries = n;
         self
@@ -1450,6 +1452,14 @@ mod tests {
     #[test]
     fn validate_sq_entries_zero_rejected() {
         assert!(config_with(|c| c.sq_entries = 0).validate().is_err());
+    }
+
+    /// A close pushes a linked shutdown and Close as one pair (#581), which a
+    /// one-entry SQ cannot hold.
+    #[test]
+    fn validate_sq_entries_one_rejected() {
+        assert!(config_with(|c| c.sq_entries = 1).validate().is_err());
+        assert!(config_with(|c| c.sq_entries = 2).validate().is_ok());
     }
 
     #[test]

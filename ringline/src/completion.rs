@@ -98,6 +98,11 @@ pub enum OpTag {
     /// payload carries the connection generation, so a CQE that outlived
     /// its slot is rejected.
     ParkInstall = 32,
+    /// `shutdown(SHUT_RDWR)` hard-linked ahead of a connection's `Close`, so
+    /// the peer gets its FIN even while older in-flight requests keep the
+    /// socket from being released (#581). Its completion is ignored; the
+    /// `Close` CQE releases the slot.
+    CloseShutdown = 33,
 }
 
 impl OpTag {
@@ -136,6 +141,7 @@ impl OpTag {
             30 => Some(OpTag::ForwardWritePollOut),
             31 => Some(OpTag::AcceptMulti),
             32 => Some(OpTag::ParkInstall),
+            33 => Some(OpTag::CloseShutdown),
             _ => None,
         }
     }
@@ -182,6 +188,7 @@ impl OpTag {
             OpTag::ForwardWritePollOut => "forward_write_poll_out",
             OpTag::AcceptMulti => "accept_multi",
             OpTag::ParkInstall => "park_install",
+            OpTag::CloseShutdown => "close_shutdown",
         }
     }
 }
