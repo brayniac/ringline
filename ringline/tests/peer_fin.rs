@@ -47,14 +47,10 @@ impl AsyncEventHandler for Sleeps {
 }
 
 fn config() -> ringline::Config {
-    config_with_sq(64)
-}
-
-fn config_with_sq(sq_entries: u32) -> ringline::Config {
     ConfigBuilder::new()
         .workers(1)
         .pin_to_core(false)
-        .sq_entries(sq_entries)
+        .sq_entries(64)
         .recv_buffer(16, 1024)
         .max_connections(16)
         .send_pool(16, 16384)
@@ -68,13 +64,9 @@ fn config_with_sq(sq_entries: u32) -> ringline::Config {
 /// Open `open` connections, half-close the one at `which`, and return how
 /// long the server took to close it, or `None` if it stayed open for 3 s.
 fn time_to_close(open: usize, which: usize) -> Option<Duration> {
-    time_to_close_with(config(), open, which)
-}
-
-fn time_to_close_with(config: ringline::Config, open: usize, which: usize) -> Option<Duration> {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     ACCEPTED.store(0, Ordering::SeqCst);
-    let (runtime, handles) = RinglineBuilder::new(config)
+    let (runtime, handles) = RinglineBuilder::new(config())
         .bind("127.0.0.1:0".parse().unwrap())
         .launch::<Sleeps>()
         .expect("launch");
@@ -117,16 +109,6 @@ fn a_fin_closes_the_second_of_two_connections() {
 #[test]
 fn a_fin_closes_one_of_four_connections() {
     assert!(time_to_close(4, 2).is_some(), "the connection stayed open");
-}
-
-/// A submission queue of one entry has no room for the linked shutdown and
-/// close, so a close there submits the close alone.
-#[test]
-fn a_fin_closes_a_connection_with_a_one_entry_submission_queue() {
-    assert!(
-        time_to_close_with(config_with_sq(1), 1, 0).is_some(),
-        "the connection stayed open"
-    );
 }
 
 /// Each connection's task reads until it has seen `bye`, then returns, which

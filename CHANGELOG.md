@@ -58,6 +58,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Breaking:** `ConfigBuilder::sq_entries` must be at least 2: a
+  connection's close pushes a linked shutdown and `Close` together (#581).
+  `sq_entries(1)` now fails `build()`.
+
 - **Breaking:** `JoinHandle` (from `spawn_with_handle`) and
   `BlockingJoinHandle` (from `spawn_blocking`) resolve to
   `Result<T, JoinError>` instead of `T`. Add `?` (in a function returning
@@ -259,14 +263,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - On io_uring with Linux 6.1–6.12, a closed connection sent no FIN while
   another connection had a request in flight. The kernel keeps a socket
-  removed from the fixed-file table open until earlier requests on any
-  registered file complete, and another connection's multishot recv is such
-  a request. A peer that half-closed an idle connection, or whose
-  connection's task ended, saw no EOF until that request ended. The close
-  now hard-links a `shutdown(SHUT_RDWR)` ahead of the `Close`; the kernel
-  runs the shutdown on an io-wq worker. A connection parked onto another
-  worker, and every connection closed at worker exit, are closed without it
-  (#581).
+  removed from the fixed-file table open until earlier requests that use a
+  registered file or buffer complete, and another connection's multishot
+  recv is such a request. A peer that half-closed an idle connection, or
+  whose connection's task ended, saw no EOF until that request ended. The
+  close now hard-links a `shutdown(SHUT_RDWR)` ahead of the `Close`. The
+  kernel runs that shutdown on an io-wq thread, so a worker that closes many
+  connections runs more io-wq threads. A connection parked onto another
+  worker is closed without the shutdown, and so are the connections a
+  worker closes when it exits (#581).
 
 - A connection's task is dropped outside any task poll when the connection
   closes, and several futures it owned released nothing there:

@@ -2174,10 +2174,10 @@ impl Driver {
             .is_some_and(|c| c.socket_handed_off)
     }
 
-    /// Submit the deferred `Close` SQE once every pending send for
-    /// this connection has either completed or been finally given up
-    /// on. Called from `close_connection` (immediate-fast-path) and
-    /// from `note_send_finalized` after each per-send CQE.
+    /// Submit the deferred `Close` SQE once every pending send, forward
+    /// write, send chain and `Shutdown` for this connection has finished.
+    /// Re-driven from each of those completions and from the
+    /// end-of-iteration `pending_finalize_closes` drain.
     pub(crate) fn try_finalize_close(&mut self, conn_index: u32) {
         let state = &self.send_queues[conn_index as usize];
         let sends_drained = !state.in_flight && state.queue.is_empty();
@@ -2234,8 +2234,8 @@ impl Driver {
         // Close reordering since it targets the request, not the fd) releases
         // that reference. Requests on other connections can still delay the
         // socket's release after the Close, so `submit_close` also shuts the
-        // socket down first, which queues the FIN immediately, independent of
-        // when the socket is released (#581). The recv's
+        // socket down first, which queues a FIN behind any unsent data,
+        // whether or not the socket has been released (#581). The recv's
         // ECANCELED completion is a no-op (generation/slot checks in
         // `handle_recv_multi`). Skipped when the recv already self-terminated
         // (e.g. a peer FIN drove this close) — nothing to cancel.
@@ -3247,11 +3247,14 @@ impl Driver {
         let max = self.connections.max_slots();
         for i in 0..max {
             if self.connections.get(i).is_some() {
+                // Clear a deferred close so draining does not submit it with
+                // a shutdown; the one plain Close below replaces it.
+                self.send_queues[i as usize].close_pending = false;
                 self.drain_conn_send_queue(i);
-                // Best effort: kernel cleans up fds on thread/process exit.
-                // No shutdown: a send can still be in flight here, and a
-                // shutdown would cut it short. Dropping the ring at worker
-                // exit releases the sockets.
+                // No shutdown. The ring's teardown after `run_shutdown`
+                // cancels any request still in flight and releases the
+                // sockets; each peer then gets a FIN, or an RST if received
+                // data was unread.
                 let _ = self.ring.submit_close(i, false);
             }
         }

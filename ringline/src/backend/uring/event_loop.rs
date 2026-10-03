@@ -1327,9 +1327,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             OpTag::SendMsgZc => self.handle_send_msg_zc(ud, result, flags),
             OpTag::Close => self.handle_close(ud),
             OpTag::Shutdown => self.handle_shutdown(ud),
-            // The `Close` CQE releases the slot. A failure here (`ENOTCONN`
-            // on a socket already in `TCP_CLOSE`: a failed connect, or a
-            // reset) changes nothing.
+            // The `Close` CQE releases the slot. A shutdown failure changes
+            // nothing: `ENOTCONN` when the socket is already in `TCP_CLOSE`
+            // (reset, failed connect, or both FINs exchanged).
             OpTag::CloseShutdown => {}
             OpTag::EventFdRead => self.handle_eventfd_read(),
             OpTag::TlsSend => self.handle_tls_send(ud, result),
@@ -6797,7 +6797,7 @@ mod tests {
 
     /// Committing a parked connection's close does not shut its socket down:
     /// the socket now belongs to another worker, through the installed fd.
-    /// Every other close sends a shutdown ahead of the `Close` (#581), so
+    /// Other closes send a shutdown ahead of the `Close` (#581), so
     /// this test checks that the park path sets `socket_handed_off`.
     #[test]
     fn closing_a_parked_slot_leaves_the_handed_off_socket_open() {
@@ -6838,7 +6838,8 @@ mod tests {
         for c in pending {
             el.driver.try_finalize_close(c);
         }
-        // A close that shuts down posts two CQEs; wait for the `Close`.
+        // The close can post several CQEs (a recv cancel, a shutdown); wait
+        // for the `Close`.
         for _ in 0..10 {
             el.driver.ring.submit_and_wait(1).expect("submit the close");
             el.drain_completions();
