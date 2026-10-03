@@ -186,6 +186,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // 2. Compute poll timeout from nearest timer deadline. Don't
             // block at all while tasks are already runnable (self-wakes
             // collected after the last poll pass, tasks woken from on_tick).
+            // First release what futures dropped by `drain_pending_closes`
+            // queued, so an idle worker does not hold it until its next
+            // event, and a released timer no longer sets the timeout.
+            crate::fs::release_orphans(&mut self.driver, &mut self.executor);
             self.executor.collect_wakeups();
             let timeout = if self.executor.ready_queue.is_empty() {
                 self.compute_poll_timeout()
@@ -282,8 +286,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // timer slots, spawns, pidfd waits, connects, abandoned
             // operations' results, abandoned opens' files, and abandoned
             // reads' and writes' buffers. Futures dropped by
-            // `drain_pending_closes` below are released on the next
-            // iteration, after that iteration's drain.
+            // `drain_pending_closes` below are released before the next
+            // poll for I/O events.
             crate::fs::release_orphans(&mut self.driver, &mut self.executor);
 
             // 6a. Flush pending sends queued during task polling, then
@@ -1016,6 +1020,15 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             if result.is_ok() {
                 cs.mark_connected();
 
+                // No `ConnectFuture` is waiting: it was dropped while the
+                // connect was in flight, so no task will use the connection.
+                // Close it, plain or TLS, rather than leave it established
+                // with no owner.
+                if !self.executor.connect_waiters[idx] {
+                    self.driver.close_connection(conn_index);
+                    return;
+                }
+
                 // Re-arm interest exactly once, here, when the outbound
                 // connection becomes established.
                 //
@@ -1070,12 +1083,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 Err(e) => {
                     // Connect failed — clean up the connection.
                     self.executor.wake_connect(conn_index, Err(e));
-                    self.driver.close_connection(conn_index);
-                }
-                // No future is waiting: it was dropped while the connect was
-                // in flight, and no task will use the connection. Close it
-                // rather than leave it established with no owner.
-                Ok(()) if !self.executor.connect_waiters[idx] => {
                     self.driver.close_connection(conn_index);
                 }
                 Ok(()) => {
@@ -1464,8 +1471,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// Poll all tasks in the ready queue (both connection and standalone tasks).
     fn poll_ready_tasks(&mut self) {
         // First release what futures dropped outside the executor left
-        // behind (a closed connection's timer slot, say), so the tasks about
-        // to run can have it.
+        // behind (for example, a closed connection's timer slot), so tasks
+        // polled in this pass can reuse it.
         crate::fs::release_orphans(&mut self.driver, &mut self.executor);
         // Form raw pointers once and access driver/executor exclusively through
         // them for the duration of this method. This avoids Stacked Borrows
@@ -1673,6 +1680,39 @@ mod tests {
     /// the returned `WakeHandle` must stay bound for the loop's lifetime.
     fn test_loop(config: &Config) -> (AsyncEventLoop<NoopHandler>, crate::wakeup::WakeHandle) {
         test_loop_with_accept(config, None)
+    }
+
+    /// A sleep dropped on a worker other than the one that allocated its
+    /// timer slot releases nothing. The slot is in the first worker's pool;
+    /// releasing it into the second's would put a live slot on that pool's
+    /// free list.
+    #[test]
+    fn a_sleep_dropped_on_another_worker_releases_nothing() {
+        let config = test_config();
+        let (mut first, _first_wake) = test_loop(&config);
+        let sleep = {
+            let mut state = DriverState {
+                driver: NonNull::from(&mut first.driver),
+                executor: NonNull::from(&mut first.executor),
+            };
+            let _guard = unsafe { set_driver_state_guarded(&mut state) };
+            crate::runtime::io::try_sleep(Duration::from_secs(60)).expect("a free timer slot")
+        };
+        // Registering the second worker makes it this thread's worker.
+        let (mut second, _second_wake) = test_loop(&config);
+        let first_generations = first.executor.timer_pool.generations.clone();
+        let second_generations = second.executor.timer_pool.generations.clone();
+        {
+            let mut state = DriverState {
+                driver: NonNull::from(&mut second.driver),
+                executor: NonNull::from(&mut second.executor),
+            };
+            let _guard = unsafe { set_driver_state_guarded(&mut state) };
+            drop(sleep);
+        }
+        crate::fs::release_orphans(&mut second.driver, &mut second.executor);
+        assert_eq!(second.executor.timer_pool.generations, second_generations);
+        assert_eq!(first.executor.timer_pool.generations, first_generations);
     }
 
     /// [`test_loop`] with an acceptor channel, for the tests that drive

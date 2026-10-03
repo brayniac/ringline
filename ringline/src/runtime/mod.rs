@@ -436,15 +436,17 @@ pub(crate) enum Orphan {
 }
 
 thread_local! {
-    // Released by `release_orphans` before or after the event loop's next
-    // task-poll pass.
+    // Released by `release_orphans`, which the event loop calls at the start
+    // of every task-poll pass, after the first pass, and before it waits for
+    // I/O.
     static ORPHANS: std::cell::RefCell<Vec<Orphan>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Queue `orphan` for release before or after the event loop's next
-/// task-poll pass. Entries queued after the worker's last loop iteration are
-/// never released; the worker's pools go with it.
+/// Queue `orphan` for `release_orphans`, which the event loop calls at the
+/// start of every task-poll pass, after the first pass, and before the
+/// worker waits for I/O. Entries queued after the worker's last loop
+/// iteration are never released; the worker's pools go with it.
 pub(crate) fn defer_release(orphan: Orphan) {
     let _ = ORPHANS.try_with(|orphans| orphans.borrow_mut().push(orphan));
 }
@@ -977,8 +979,9 @@ impl Executor {
     /// Wake a task waiting for pidfd poll completion (child process exit).
     #[cfg_attr(not(has_io_uring), allow(dead_code))]
     pub(crate) fn wake_pidfd(&mut self, seq: u32, result: i32) {
-        // The waiter is registered from `Child::wait` until the future takes
-        // its result or is dropped; with none, nothing will take the result.
+        // The waiter is registered from `Child::wait` (and each pending poll)
+        // until its completion arrives or the future is released; with none,
+        // nothing will take the result.
         if let Some(task_id) = self.pidfd_waiters.remove(&seq) {
             self.pidfd_results.insert(seq, result);
             self.wake_task(task_id);

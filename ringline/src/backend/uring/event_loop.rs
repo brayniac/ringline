@@ -372,6 +372,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // on_tick): submit SQEs but return immediately so the ready
             // queue is polled now instead of after the next CQE or tick
             // timeout (indefinitely, with tick_timeout_us = 0).
+            //
+            // First release what futures dropped at a close since the last
+            // poll pass queued, so an idle worker does not hold it until its
+            // next completion; the wait below submits any timer cancels.
+            crate::fs::release_orphans(&mut self.driver, &mut self.executor);
             self.executor.collect_wakeups();
             // Commit buffer returns from the poll pass and revive
             // ENOBUFS-parked receivers before we block.
@@ -699,8 +704,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// Poll all tasks in the ready queue (both connection and standalone tasks).
     fn poll_ready_tasks(&mut self) {
         // First release what futures dropped outside the executor left
-        // behind (a closed connection's timer slot, say), so the tasks about
-        // to run can have it.
+        // behind (for example, a closed connection's timer slot), so tasks
+        // polled in this pass can reuse it.
         crate::fs::release_orphans(&mut self.driver, &mut self.executor);
         // Form raw pointers once and access driver/executor exclusively through
         // them for the duration of this method. This avoids Stacked Borrows

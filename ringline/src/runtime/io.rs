@@ -6001,7 +6001,7 @@ impl Drop for SleepFuture {
 }
 
 /// Release a sleep's timer slot. On io_uring, cancels the timer first if it
-/// has not fired; a timer CQE that arrives after the slot is reused is
+/// has not fired; a timer CQE that arrives after the release is
 /// rejected by its generation. On mio, releasing clears the deadline.
 #[cfg_attr(not(has_io_uring), allow(unused_variables))]
 pub(crate) fn release_timer_slot(
@@ -6228,8 +6228,9 @@ impl std::error::Error for Elapsed {}
 ///
 /// # Panics
 ///
-/// Panics if the timer pool is exhausted; [`try_timeout`] returns an error
-/// instead. Also panics if called outside the ringline async executor.
+/// Panics on first poll if the timer pool is exhausted, or if polled outside
+/// the ringline async executor. [`try_timeout`] returns an error for an
+/// exhausted pool instead.
 ///
 /// # Example
 ///

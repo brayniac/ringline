@@ -120,7 +120,8 @@ impl Drop for WaitFuture {
         }
         // Deregister so an abandoned wait (select/timeout loser) leaves no
         // waiter or result entry; a completion after this finds no waiter and
-        // is not stored.
+        // is not stored. Outside a task poll, the release is deferred and
+        // removes both entries.
         let released = try_with_state(|_driver, executor| {
             executor.pidfd_waiters.remove(&self.seq);
             executor.pidfd_results.remove(&self.seq);
