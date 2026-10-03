@@ -278,7 +278,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // 6. Collect wakeups and poll ready tasks.
             self.executor.collect_wakeups();
             self.poll_ready_tasks();
-            // Release what dropped fs futures left behind: abandoned
+            // Release what futures dropped outside the executor left behind:
+            // timer slots, spawns, pidfd waits, connects, abandoned
             // operations' results, abandoned opens' files, and abandoned
             // reads' and writes' buffers. Futures dropped by
             // `drain_pending_closes` below are released on the next
@@ -1071,6 +1072,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     self.executor.wake_connect(conn_index, Err(e));
                     self.driver.close_connection(conn_index);
                 }
+                // No future is waiting: it was dropped while the connect was
+                // in flight, and no task will use the connection. Close it
+                // rather than leave it established with no owner.
+                Ok(()) if !self.executor.connect_waiters[idx] => {
+                    self.driver.close_connection(conn_index);
+                }
                 Ok(()) => {
                     self.executor.wake_connect(conn_index, Ok(()));
                 }
@@ -1456,6 +1463,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
     /// Poll all tasks in the ready queue (both connection and standalone tasks).
     fn poll_ready_tasks(&mut self) {
+        // First release what futures dropped outside the executor left
+        // behind (a closed connection's timer slot, say), so the tasks about
+        // to run can have it.
+        crate::fs::release_orphans(&mut self.driver, &mut self.executor);
         // Form raw pointers once and access driver/executor exclusively through
         // them for the duration of this method. This avoids Stacked Borrows
         // violations: accessing self.driver or self.executor directly after

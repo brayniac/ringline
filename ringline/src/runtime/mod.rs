@@ -431,17 +431,20 @@ pub(crate) enum Orphan {
     Spawn(u64),
     /// A `WaitFuture`'s `pidfd_waiters` and `pidfd_results` entries.
     Wait(u32),
+    /// A `ConnectFuture`'s outbound connection.
+    Connect { conn_index: u32, generation: u32 },
 }
 
 thread_local! {
-    // Released by `release_orphans` on this worker's next loop iteration.
+    // Released by `release_orphans` before or after the event loop's next
+    // task-poll pass.
     static ORPHANS: std::cell::RefCell<Vec<Orphan>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Queue `orphan` for release on this worker's next loop iteration. At
-/// worker exit, when the queue is gone, there is nothing left to release
-/// into.
+/// Queue `orphan` for release before or after the event loop's next
+/// task-poll pass. Entries queued after the worker's last loop iteration are
+/// never released; the worker's pools go with it.
 pub(crate) fn defer_release(orphan: Orphan) {
     let _ = ORPHANS.try_with(|orphans| orphans.borrow_mut().push(orphan));
 }
@@ -461,6 +464,12 @@ pub(crate) fn release_orphans(driver: &mut crate::backend::Driver, executor: &mu
             Orphan::Wait(seq) => {
                 executor.pidfd_waiters.remove(&seq);
                 executor.pidfd_results.remove(&seq);
+            }
+            Orphan::Connect {
+                conn_index,
+                generation,
+            } => {
+                io::release_connect(driver, executor, conn_index, generation);
             }
         }
     }
@@ -968,8 +977,10 @@ impl Executor {
     /// Wake a task waiting for pidfd poll completion (child process exit).
     #[cfg_attr(not(has_io_uring), allow(dead_code))]
     pub(crate) fn wake_pidfd(&mut self, seq: u32, result: i32) {
-        self.pidfd_results.insert(seq, result);
+        // The waiter is registered from `Child::wait` until the future takes
+        // its result or is dropped; with none, nothing will take the result.
         if let Some(task_id) = self.pidfd_waiters.remove(&seq) {
+            self.pidfd_results.insert(seq, result);
             self.wake_task(task_id);
         }
     }
@@ -1004,6 +1015,20 @@ impl Executor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pidfd completion that arrives after its `WaitFuture` was dropped,
+    /// with no waiter left, is not stored: nothing would remove it.
+    #[test]
+    fn a_pidfd_completion_with_no_waiter_is_not_stored() {
+        let mut exec = Executor::new(8, 8, 8, 0, 0);
+        exec.wake_pidfd(5, 0);
+        assert!(!exec.pidfd_results.contains_key(&5));
+
+        // With a waiter, the result is stored for the future to take.
+        exec.pidfd_waiters.insert(6, 0);
+        exec.wake_pidfd(6, 0);
+        assert_eq!(exec.pidfd_results.get(&6), Some(&0));
+    }
 
     #[test]
     fn collect_wakeups_transitions_parked_to_ready() {

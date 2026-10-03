@@ -8,7 +8,9 @@
 //!
 //! Sending and receiving must happen within the ringline executor (connection
 //! tasks or standalone tasks). The wakeup mechanism uses
-//! [`Executor::wake_task`] via the thread-local driver state.
+//! [`Executor::wake_task`] via the thread-local driver state. A wake outside a
+//! task poll (a sender or receiver dropped with its connection's task) goes on
+//! the worker's ready queue.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;

@@ -256,10 +256,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - a `oneshot` or `mpsc` sender or receiver did not wake the task on the
     other end, which saw the channel close only when something else polled
     it;
-  - a `Child::wait` future left its waiter and result entries behind.
+  - a `Child::wait` future left its waiter and result entries behind;
+  - an outbound `connect` future left its connection established with no
+    task to use it, until the peer closed it.
 
-  They now queue their release, or the wake, for the worker's next loop
-  iteration (#575).
+  They now queue their release, or the wake, for the event loop's next
+  task-poll pass. On mio, an outbound connect that completes after its
+  future was dropped is now closed, as on io_uring; and a child that exits
+  after its `wait` future was dropped no longer leaves a result entry
+  behind (#575).
 
 - On io_uring, dropping a `fs::read_into` or `fs::write_from` future could
   free its buffer while the kernel was still using it, and another disk-I/O

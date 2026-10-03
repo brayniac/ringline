@@ -435,8 +435,10 @@ impl Drop for OrphanedBuffers {
     }
 }
 
-/// Release what dropped fs futures queued: drop abandoned operations'
-/// results, or stop tracking their keys so the results are discarded on
+/// Release what futures dropped outside the executor queued. First the
+/// timer slots, spawns, pidfd waits and connects queued by
+/// [`crate::runtime::defer_release`]; then what dropped fs futures queued:
+/// drop abandoned operations' results, or stop tracking their keys so the results are discarded on
 /// arrival; close the files of abandoned opens and free their slots; and park
 /// or drop the buffers of abandoned reads and writes. Called by the event
 /// loop once per iteration, after its first task-poll pass.

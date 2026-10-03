@@ -75,7 +75,11 @@ impl Child {
             driver
                 .ring
                 .submit_poll_add(pidfd, libc::POLLIN as u32, ud.raw())?;
-            Ok(WaitFuture { seq, pid: self.pid })
+            Ok(WaitFuture {
+                seq,
+                pid: self.pid,
+                owner: crate::runtime::waker::current_worker(),
+            })
         })
     }
 
@@ -103,17 +107,25 @@ impl Child {
 pub struct WaitFuture {
     seq: u32,
     pid: u32,
+    /// The worker whose executor holds `seq`.
+    owner: u32,
 }
 
 impl Drop for WaitFuture {
     fn drop(&mut self) {
-        // Deregister so an abandoned wait (select/timeout loser) doesn't
-        // leave a stale waiter/result entry behind forever.
+        // Only the owning worker's executor holds the entry. Dropped
+        // elsewhere (the future is `Send`), it stays there.
+        if crate::runtime::waker::current_worker() != self.owner {
+            return;
+        }
+        // Deregister so an abandoned wait (select/timeout loser) leaves no
+        // waiter or result entry; a completion after this finds no waiter and
+        // is not stored.
         let released = try_with_state(|_driver, executor| {
             executor.pidfd_waiters.remove(&self.seq);
             executor.pidfd_results.remove(&self.seq);
         });
-        // Outside a task poll: a connection's task dropped at teardown.
+        // Outside a task poll (a connection's task dropped at teardown).
         if released.is_none() {
             crate::runtime::defer_release(crate::runtime::Orphan::Wait(self.seq));
         }
@@ -260,7 +272,10 @@ impl Command {
                 })
                 .map_err(|_| io::Error::other("spawner pool shut down"))?;
 
-            Ok(SpawnFuture { request_id })
+            Ok(SpawnFuture {
+                request_id,
+                owner: crate::runtime::waker::current_worker(),
+            })
         })
         .unwrap_or_else(|| Err(io::Error::other("called outside executor")))
     }
@@ -269,10 +284,17 @@ impl Command {
 /// Future returned by [`Command::spawn()`]. Resolves to a [`Child`].
 pub struct SpawnFuture {
     request_id: u64,
+    /// The worker whose executor holds `request_id`.
+    owner: u32,
 }
 
 impl Drop for SpawnFuture {
     fn drop(&mut self) {
+        // Only the owning worker's executor holds the entry. Dropped
+        // elsewhere (the future is `Send`), it stays there.
+        if crate::runtime::waker::current_worker() != self.owner {
+            return;
+        }
         // A SpawnFuture abandoned before completion (select/timeout loser)
         // must not leak its map entry. Removing the entry drops a response
         // that already arrived, which closes its pidfd; one that arrives later
@@ -280,7 +302,7 @@ impl Drop for SpawnFuture {
         let released = try_with_state(|_driver, executor| {
             executor.pending_spawns.remove(&self.request_id);
         });
-        // Outside a task poll: a connection's task dropped at teardown.
+        // Outside a task poll (a connection's task dropped at teardown).
         if released.is_none() {
             crate::runtime::defer_release(crate::runtime::Orphan::Spawn(self.request_id));
         }

@@ -494,7 +494,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // Poll all ready tasks.
             let tasks_before = self.executor.ready_queue.len();
             self.poll_ready_tasks();
-            // Release what dropped fs futures left behind (abandoned
+            // Release what futures dropped outside the executor left behind
+            // (timer slots, spawns, pidfd waits, connects, abandoned
             // operations' results, abandoned opens' files, abandoned reads'
             // and writes' buffers). Before the flush below submits this
             // pass's SQEs, so an open whose future was dropped during the
@@ -697,6 +698,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
     /// Poll all tasks in the ready queue (both connection and standalone tasks).
     fn poll_ready_tasks(&mut self) {
+        // First release what futures dropped outside the executor left
+        // behind (a closed connection's timer slot, say), so the tasks about
+        // to run can have it.
+        crate::fs::release_orphans(&mut self.driver, &mut self.executor);
         // Form raw pointers once and access driver/executor exclusively through
         // them for the duration of this method. This avoids Stacked Borrows
         // violations: accessing self.driver or self.executor directly after
