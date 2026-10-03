@@ -633,19 +633,23 @@ impl Ring {
         let close = opcode::Close::new(Fixed(conn_index))
             .build()
             .user_data(user_data.raw());
-        if !shut_down {
+        // A one-entry SQ cannot hold the linked pair, so the close goes
+        // alone there.
+        if !shut_down || self.ring.params().sq_entries() < 2 {
             unsafe {
                 self.push_sqe(&close)?;
             }
             return Ok(());
         }
-        // Removing a socket from the fixed-file table does not release it
-        // while requests submitted before the removal are still in flight
-        // (on Linux 6.12, at least): another connection's multishot recv
-        // holds it open, and the peer sees no FIN until that recv ends.
-        // `shutdown` sends the FIN regardless. Hard-linked so the Close runs
-        // after it even when it fails (`ENOTCONN` on a socket that never
-        // connected), and pushed as one pair so a submit cannot split them.
+        // Before Linux 6.13, removing a socket from the fixed-file table
+        // does not release it until every request submitted before the
+        // removal that uses a registered file or buffer has completed, on
+        // any connection. Another connection's multishot recv is such a
+        // request, so the peer sees no FIN until that recv ends. `shutdown`
+        // queues the FIN immediately, independent of when the socket is
+        // released. Hard-linked, so the Close runs after the shutdown even
+        // when the shutdown fails. Pushed with `push_multiple`, so a submit
+        // cannot separate the pair.
         let shutdown = opcode::Shutdown::new(Fixed(conn_index), libc::SHUT_RDWR)
             .build()
             .flags(squeue::Flags::IO_HARDLINK)

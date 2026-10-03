@@ -206,7 +206,7 @@ These are the recurring failure modes in this codebase — the 2026-07 audit (~3
 5. **Short sends happen.** Stream sends use `MSG_WAITALL` (5.19+) so the kernel retries in-place; any new send variant must handle partial completion explicitly.
 6. **`ENOBUFS` on multishot recv means the provided ring is empty** — re-arm is event-driven (on replenish), not retried in a loop.
 7. **Errors like `EINTR`/`EBUSY` on submit are backpressure, not failures.** A queued send whose SQE cannot be pushed is parked at its queue head and retried next iteration (`drain_send_retries`), never dropped.
-8. **Closing a fixed file does not release its socket while older requests are in flight.** On Linux 6.12, the release waits for requests submitted before the removal, on any connection; another connection's multishot recv can hold a closed socket open, with no FIN sent, until that recv ends. `submit_close` therefore hard-links `shutdown(SHUT_RDWR)` ahead of the Close. The exception is a socket handed to another worker by a park (`socket_handed_off`), which must stay open (#581).
+8. **Closing a fixed file does not release its socket while older requests are in flight.** On kernels before 6.13, the release waits until every request that uses a registered file or buffer and was submitted before the removal has completed, on any connection; another connection's multishot recv can hold a closed socket open, with no FIN sent, until that recv ends. `try_finalize_close` therefore asks `submit_close` to hard-link `shutdown(SHUT_RDWR)` ahead of the Close, unless `Driver::close_shuts_down` is false (`socket_handed_off`: a socket parked onto another worker, which must stay open) (#581).
 
 ## Copy Semantics
 

@@ -7,9 +7,28 @@
 use std::future::Future;
 use std::io::Read;
 use std::net::{Shutdown, TcpStream};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use ringline::{AsyncEventHandler, ConfigBuilder, Connection, ParseResult, RinglineBuilder};
+
+/// The tests share `ACCEPTED`, so they run one at a time.
+static SERIAL: Mutex<()> = Mutex::new(());
+static ACCEPTED: AtomicUsize = AtomicUsize::new(0);
+
+/// Wait until the server has accepted `n` connections, so each has a recv
+/// armed before the test closes one.
+fn wait_accepted(n: usize) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while ACCEPTED.load(Ordering::SeqCst) < n {
+        assert!(
+            Instant::now() < deadline,
+            "the server never accepted {n} connections"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
 
 /// Each connection's task sleeps far longer than the test runs and never
 /// reads.
@@ -17,6 +36,7 @@ struct Sleeps;
 
 impl AsyncEventHandler for Sleeps {
     fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
+        ACCEPTED.fetch_add(1, Ordering::SeqCst);
         async move {
             ringline::sleep(Duration::from_secs(60)).await;
         }
@@ -27,10 +47,14 @@ impl AsyncEventHandler for Sleeps {
 }
 
 fn config() -> ringline::Config {
+    config_with_sq(64)
+}
+
+fn config_with_sq(sq_entries: u32) -> ringline::Config {
     ConfigBuilder::new()
         .workers(1)
         .pin_to_core(false)
-        .sq_entries(64)
+        .sq_entries(sq_entries)
         .recv_buffer(16, 1024)
         .max_connections(16)
         .send_pool(16, 16384)
@@ -44,7 +68,13 @@ fn config() -> ringline::Config {
 /// Open `open` connections, half-close the one at `which`, and return how
 /// long the server took to close it, or `None` if it stayed open for 3 s.
 fn time_to_close(open: usize, which: usize) -> Option<Duration> {
-    let (runtime, handles) = RinglineBuilder::new(config())
+    time_to_close_with(config(), open, which)
+}
+
+fn time_to_close_with(config: ringline::Config, open: usize, which: usize) -> Option<Duration> {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    ACCEPTED.store(0, Ordering::SeqCst);
+    let (runtime, handles) = RinglineBuilder::new(config)
         .bind("127.0.0.1:0".parse().unwrap())
         .launch::<Sleeps>()
         .expect("launch");
@@ -52,8 +82,7 @@ fn time_to_close(open: usize, which: usize) -> Option<Duration> {
     let mut conns: Vec<TcpStream> = (0..open)
         .map(|_| TcpStream::connect(addr).expect("connect"))
         .collect();
-    // Let the server accept them all and start their tasks.
-    std::thread::sleep(Duration::from_millis(50));
+    wait_accepted(open);
 
     let mut conn = conns.remove(which);
     conn.shutdown(Shutdown::Write).expect("shutdown");
@@ -90,12 +119,23 @@ fn a_fin_closes_one_of_four_connections() {
     assert!(time_to_close(4, 2).is_some(), "the connection stayed open");
 }
 
+/// A submission queue of one entry has no room for the linked shutdown and
+/// close, so a close there submits the close alone.
+#[test]
+fn a_fin_closes_a_connection_with_a_one_entry_submission_queue() {
+    assert!(
+        time_to_close_with(config_with_sq(1), 1, 0).is_some(),
+        "the connection stayed open"
+    );
+}
+
 /// Each connection's task reads until it has seen `bye`, then returns, which
 /// closes the connection.
 struct EndsOnBye;
 
 impl AsyncEventHandler for EndsOnBye {
     fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
+        ACCEPTED.fetch_add(1, Ordering::SeqCst);
         async move {
             let mut seen = Vec::new();
             while !seen.ends_with(b"bye") {
@@ -120,6 +160,8 @@ impl AsyncEventHandler for EndsOnBye {
 /// connection is open.
 #[test]
 fn a_connection_whose_task_ends_is_closed_while_another_is_open() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    ACCEPTED.store(0, Ordering::SeqCst);
     let (runtime, handles) = RinglineBuilder::new(config())
         .bind("127.0.0.1:0".parse().unwrap())
         .launch::<EndsOnBye>()
@@ -127,7 +169,7 @@ fn a_connection_whose_task_ends_is_closed_while_another_is_open() {
     let addr = runtime.bound_addr().unwrap();
     let _other = TcpStream::connect(addr).expect("connect");
     let mut conn = TcpStream::connect(addr).expect("connect");
-    std::thread::sleep(Duration::from_millis(50));
+    wait_accepted(2);
 
     std::io::Write::write_all(&mut conn, b"bye").unwrap();
     conn.set_read_timeout(Some(Duration::from_secs(3))).unwrap();

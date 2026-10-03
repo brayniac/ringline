@@ -101,7 +101,7 @@ pub enum OpTag {
     /// `shutdown(SHUT_RDWR)` hard-linked ahead of a connection's `Close`, so
     /// the peer gets its FIN even while older in-flight requests keep the
     /// socket from being released (#581). Its completion is ignored; the
-    /// `Close` CQE drives teardown.
+    /// `Close` CQE releases the slot.
     CloseShutdown = 33,
 }
 
