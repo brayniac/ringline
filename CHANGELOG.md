@@ -245,6 +245,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   On a TLS connection admission is sized by the *ciphertext* bound. Final PR
   of the series that lands #318.
 
+### Deprecated
+
+- `DriverCtx::connect`, `connect_unix`, `connect_with_timeout`,
+  `connect_tls` and `connect_tls_with_timeout`. No task owns a connection
+  opened this way, so the runtime closes it once it is established, and the
+  `on_connect` callback their docs described does not exist. Call
+  `ringline::connect` (or `connect_unix`) from a task instead;
+  `ringline::spawn` starts one from `on_tick` or `on_notify`. They will be
+  removed in the next breaking release (#579).
+
 ### Fixed
 
 - A connection's task is dropped outside any task poll when the connection

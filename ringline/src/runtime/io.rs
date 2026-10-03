@@ -5707,12 +5707,12 @@ impl ConnectFuture {
             ConnectTarget::Tcp {
                 addr,
                 server_name: Some(name),
-            } => ctx.connect_tls(*addr, name),
+            } => ctx.start_connect_tls(*addr, name),
             ConnectTarget::Tcp {
                 addr,
                 server_name: None,
-            } => ctx.connect(*addr),
-            ConnectTarget::Unix { path } => ctx.connect_unix(path.as_path()),
+            } => ctx.start_connect(*addr),
+            ConnectTarget::Unix { path } => ctx.start_connect_unix(path.as_path()),
         }
         .map_err(io::Error::other::<crate::error::Error>)?;
         if let Some(timeout) = timeout {
