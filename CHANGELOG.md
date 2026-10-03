@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `ConfigBuilder::iowq_max_workers` caps the threads in each worker's
+  bounded io-wq pool, default 64. That pool runs the `shutdown` sent ahead
+  of every io_uring connection close (#581) and regular-file I/O that would
+  block, and the kernel sizes it at `min(sq_entries, 4 × online CPUs)` per
+  worker. The cap only lowers that limit; 0 leaves the kernel default
+  (#584).
+
 - `TaskPanicPolicy` and `ConfigBuilder::task_panic_policy` choose what a task
   panic does. `Contain` (the default) catches it, drops the task and keeps the
   worker running, as before. `Shutdown` also shuts the runtime down as
