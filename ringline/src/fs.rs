@@ -319,12 +319,13 @@ pub fn open(
         let mut ctx = driver.make_ctx();
         let (file_index, generation, seq) = ctx.fs_open(path.as_ref(), flags, mode)?;
         let task_id = CURRENT_TASK_ID.with(|c| c.get());
-        executor.disk_io_waiters.insert(seq, task_id);
+        executor.wait_disk_io(seq, task_id);
         Ok(OpenFuture {
             seq,
             file_index,
             generation,
             done: false,
+            owner: crate::runtime::waker::current_worker(),
         })
     })
 }
@@ -353,29 +354,31 @@ pub struct OpenFuture {
     generation: u16,
     /// Set once `poll` has returned `Ready`: the caller owns the outcome.
     done: bool,
+    /// The worker whose executor holds `seq`.
+    owner: u32,
 }
 
 impl Future for OpenFuture {
     type Output = io::Result<File>;
 
     fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<File>> {
-        let poll =
-            with_state(
-                |_driver, executor| match executor.disk_io_results.remove(&self.seq) {
-                    Some(result) if result < 0 => {
-                        Poll::Ready(Err(io::Error::from_raw_os_error(-result)))
-                    }
-                    Some(_) => Poll::Ready(Ok(File {
-                        index: self.file_index,
-                        generation: self.generation,
-                    })),
-                    None => {
-                        let task_id = CURRENT_TASK_ID.with(|c| c.get());
-                        executor.disk_io_waiters.insert(self.seq, task_id);
-                        Poll::Pending
-                    }
-                },
-            );
+        assert!(!self.done, "OpenFuture polled after completion");
+        let poll = with_state(
+            |_driver, executor| match executor.take_disk_io_result(self.seq) {
+                Some(result) if result < 0 => {
+                    Poll::Ready(Err(io::Error::from_raw_os_error(-result)))
+                }
+                Some(_) => Poll::Ready(Ok(File {
+                    index: self.file_index,
+                    generation: self.generation,
+                })),
+                None => {
+                    let task_id = CURRENT_TASK_ID.with(|c| c.get());
+                    executor.wait_disk_io(self.seq, task_id);
+                    Poll::Pending
+                }
+            },
+        );
         if poll.is_ready() {
             self.done = true;
         }
@@ -385,7 +388,9 @@ impl Future for OpenFuture {
 
 impl Drop for OpenFuture {
     fn drop(&mut self) {
-        if self.done {
+        // Only the owning worker's executor holds `seq`. Dropped elsewhere
+        // (the future is `Send`), the file and its slot stay open there (#575).
+        if self.done || crate::runtime::waker::current_worker() != self.owner {
             return;
         }
         // Queued rather than handled here: a connection's task is dropped
@@ -404,6 +409,10 @@ thread_local! {
     // Opens whose `OpenFuture` was dropped before it resolved, as `(disk I/O
     // key, file slot, generation)`. Nothing holds a handle to these files.
     static ORPHANED_OPENS: std::cell::RefCell<Vec<(u32, u16, u16)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    // Disk-I/O keys of operations whose future (`DiskIoFuture`,
+    // `StatFuture`) was dropped outside the executor, before it resolved.
+    static ORPHANED_KEYS: std::cell::RefCell<Vec<u32>> =
         const { std::cell::RefCell::new(Vec::new()) };
     // Buffers of reads and writes whose future was dropped outside the
     // executor, before it resolved.
@@ -426,10 +435,11 @@ impl Drop for OrphanedBuffers {
     }
 }
 
-/// Release what dropped fs futures queued: close the files of abandoned opens
-/// and free their slots, and park or drop the buffers of abandoned reads and
-/// writes. Called by the event loop once per iteration, after its first
-/// task-poll pass.
+/// Release what dropped fs futures queued: drop abandoned operations'
+/// results, or stop tracking their keys so the results are discarded on
+/// arrival; close the files of abandoned opens and free their slots; and park
+/// or drop the buffers of abandoned reads and writes. Called by the event
+/// loop once per iteration, after its first task-poll pass.
 ///
 /// An open that has completed is closed now. One still in flight is marked in
 /// `abandoned_fs_opens`, and its completion handler closes it. A buffer whose
@@ -439,6 +449,11 @@ pub(crate) fn release_orphans(
     driver: &mut crate::backend::Driver,
     executor: &mut crate::runtime::Executor,
 ) {
+    let keys = ORPHANED_KEYS.with(|orphans| std::mem::take(&mut *orphans.borrow_mut()));
+    for seq in keys {
+        executor.abandon_disk_io(seq);
+    }
+
     let buffers = ORPHANED_BUFFERS.with(|orphans| {
         let mut orphans = orphans.borrow_mut();
         if orphans.0.is_empty() {
@@ -461,13 +476,14 @@ pub(crate) fn release_orphans(
     });
     for (seq, index, generation) in orphans {
         executor.disk_io_waiters.remove(&seq);
-        match executor.disk_io_results.remove(&seq) {
+        match executor.take_disk_io_result(seq) {
             Some(result) if result >= 0 => {
                 let _ = driver.make_ctx().fs_close(File { index, generation });
             }
             // The open failed, and its slot is already free.
             Some(_) => {}
             None => {
+                crate::runtime::untrack_disk_io(seq);
                 executor.abandoned_fs_opens.insert(seq);
             }
         }
@@ -494,8 +510,8 @@ pub unsafe fn read(file: File, offset: u64, buf: *mut u8, len: u32) -> io::Resul
         #[allow(unused_unsafe)]
         let seq = unsafe { ctx.fs_read(file, offset, buf, len)? };
         let task_id = CURRENT_TASK_ID.with(|c| c.get());
-        executor.disk_io_waiters.insert(seq, task_id);
-        Ok(DiskIoFuture { seq })
+        executor.wait_disk_io(seq, task_id);
+        Ok(DiskIoFuture::new(seq))
     })
 }
 
@@ -519,8 +535,8 @@ pub unsafe fn write(file: File, offset: u64, buf: *const u8, len: u32) -> io::Re
         #[allow(unused_unsafe)]
         let seq = unsafe { ctx.fs_write(file, offset, buf, len)? };
         let task_id = CURRENT_TASK_ID.with(|c| c.get());
-        executor.disk_io_waiters.insert(seq, task_id);
-        Ok(DiskIoFuture { seq })
+        executor.wait_disk_io(seq, task_id);
+        Ok(DiskIoFuture::new(seq))
     })
 }
 
@@ -572,12 +588,13 @@ pub fn read_into(file: File, offset: u64, mut buf: BytesMut) -> io::Result<ReadF
         // graveyard-on-drop (see ReadFuture::Drop).
         let seq = unsafe { ctx.fs_read(file, offset, ptr, len)? };
         let task_id = CURRENT_TASK_ID.with(|c| c.get());
-        executor.disk_io_waiters.insert(seq, task_id);
+        executor.wait_disk_io(seq, task_id);
         Ok(ReadFuture {
             seq,
             file_index,
             initial_len,
             buf: Some(buf),
+            owner: crate::runtime::waker::current_worker(),
         })
     })
 }
@@ -614,11 +631,12 @@ pub fn write_from(file: File, offset: u64, buf: BytesMut) -> io::Result<WriteFut
         // graveyard-on-drop (see WriteFuture::Drop).
         let seq = unsafe { ctx.fs_write(file, offset, ptr, len_u32)? };
         let task_id = CURRENT_TASK_ID.with(|c| c.get());
-        executor.disk_io_waiters.insert(seq, task_id);
+        executor.wait_disk_io(seq, task_id);
         Ok(WriteFuture {
             seq,
             file_index,
             buf: Some(buf),
+            owner: crate::runtime::waker::current_worker(),
         })
     })
 }
@@ -632,6 +650,8 @@ pub struct ReadFuture {
     file_index: u16,
     initial_len: usize,
     buf: Option<BytesMut>,
+    /// The worker whose executor holds `seq`.
+    owner: u32,
 }
 
 impl Future for ReadFuture {
@@ -639,8 +659,9 @@ impl Future for ReadFuture {
 
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
         let me = self.get_mut();
+        assert!(me.buf.is_some(), "ReadFuture polled after completion");
         with_state(|_driver, executor| {
-            match executor.disk_io_results.remove(&me.seq) {
+            match executor.take_disk_io_result(me.seq) {
                 Some(result) if result < 0 => {
                     let buf = me.buf.take().expect("ReadFuture polled after completion");
                     Poll::Ready((Err(io::Error::from_raw_os_error(-result)), buf))
@@ -657,7 +678,7 @@ impl Future for ReadFuture {
                 }
                 None => {
                     let task_id = CURRENT_TASK_ID.with(|c| c.get());
-                    executor.disk_io_waiters.insert(me.seq, task_id);
+                    executor.wait_disk_io(me.seq, task_id);
                     Poll::Pending
                 }
             }
@@ -668,7 +689,7 @@ impl Future for ReadFuture {
 impl Drop for ReadFuture {
     fn drop(&mut self) {
         let Some(buf) = self.buf.take() else { return };
-        park_or_drop(self.seq, self.file_index, buf);
+        drop_buffer(self.owner, self.seq, self.file_index, buf);
     }
 }
 
@@ -680,6 +701,8 @@ pub struct WriteFuture {
     seq: u32,
     file_index: u16,
     buf: Option<BytesMut>,
+    /// The worker whose executor holds `seq`.
+    owner: u32,
 }
 
 impl Future for WriteFuture {
@@ -687,8 +710,9 @@ impl Future for WriteFuture {
 
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
         let me = self.get_mut();
+        assert!(me.buf.is_some(), "WriteFuture polled after completion");
         with_state(
-            |_driver, executor| match executor.disk_io_results.remove(&me.seq) {
+            |_driver, executor| match executor.take_disk_io_result(me.seq) {
                 Some(result) if result < 0 => {
                     let buf = me.buf.take().expect("WriteFuture polled after completion");
                     Poll::Ready((Err(io::Error::from_raw_os_error(-result)), buf))
@@ -699,7 +723,7 @@ impl Future for WriteFuture {
                 }
                 None => {
                     let task_id = CURRENT_TASK_ID.with(|c| c.get());
-                    executor.disk_io_waiters.insert(me.seq, task_id);
+                    executor.wait_disk_io(me.seq, task_id);
                     Poll::Pending
                 }
             },
@@ -710,7 +734,19 @@ impl Future for WriteFuture {
 impl Drop for WriteFuture {
     fn drop(&mut self) {
         let Some(buf) = self.buf.take() else { return };
-        park_or_drop(self.seq, self.file_index, buf);
+        drop_buffer(self.owner, self.seq, self.file_index, buf);
+    }
+}
+
+/// Drop-side handler shared by [`ReadFuture`] and [`WriteFuture`]. Only the
+/// owning worker's executor tracks `seq`; dropped on another thread (the
+/// futures are `Send`), the operation may still be using `buf` and no
+/// executor here can park it, so it is leaked (#575).
+fn drop_buffer(owner: u32, seq: u32, file_index: u16, buf: BytesMut) {
+    if crate::runtime::waker::current_worker() == owner {
+        park_or_drop(seq, file_index, buf);
+    } else {
+        std::mem::forget(buf);
     }
 }
 
@@ -759,11 +795,14 @@ fn park_buffer(
     buf: BytesMut,
 ) {
     executor.disk_io_waiters.remove(&seq);
-    if executor.disk_io_results.remove(&seq).is_some() {
+    if executor.take_disk_io_result(seq).is_some() {
         // The operation has completed and released the buffer.
         drop(buf);
         return;
     }
+    // The graveyard now holds the key; `wake_disk_io` frees the buffer
+    // before it checks whether the key is held.
+    crate::runtime::untrack_disk_io(seq);
     executor.disk_io_graveyard.insert(seq, buf);
     #[cfg(has_io_uring)]
     {
@@ -789,8 +828,8 @@ pub fn fsync(file: File) -> io::Result<DiskIoFuture> {
         let mut ctx = driver.make_ctx();
         let seq = ctx.fs_fsync(file)?;
         let task_id = CURRENT_TASK_ID.with(|c| c.get());
-        executor.disk_io_waiters.insert(seq, task_id);
-        Ok(DiskIoFuture { seq })
+        executor.wait_disk_io(seq, task_id);
+        Ok(DiskIoFuture::new(seq))
     })
 }
 
@@ -823,27 +862,37 @@ pub fn stat(path: impl AsRef<std::path::Path>) -> io::Result<StatFuture> {
         let mut ctx = driver.make_ctx();
         let seq = ctx.fs_stat(path.as_ref())?;
         let task_id = CURRENT_TASK_ID.with(|c| c.get());
-        executor.disk_io_waiters.insert(seq, task_id);
-        Ok(StatFuture { seq })
+        executor.wait_disk_io(seq, task_id);
+        Ok(StatFuture {
+            seq,
+            done: false,
+            owner: crate::runtime::waker::current_worker(),
+        })
     })
 }
 
-/// Future that resolves to [`Metadata`] when the stat completes.
-///
-/// The statx buffer is owned by the command slab entry. On CQE completion,
-/// the handler converts it to [`Metadata`] and stores it in
-/// `Executor::fs_stat_results` before releasing the slab entry.
+/// Future that resolves to the file's [`Metadata`]. Dropping it before it
+/// resolves discards the result.
+// On io_uring the statx buffer is owned by the command slab entry, and on
+// completion the handler converts it to `Metadata` and stores it in
+// `Executor::fs_stat_results` before releasing the slab entry. On mio the
+// disk-I/O pool returns the `Metadata`.
 pub struct StatFuture {
     seq: u32,
+    /// Set once `poll` has returned `Ready`: the result has been taken.
+    done: bool,
+    /// The worker whose executor holds `seq`.
+    owner: u32,
 }
 
 impl Future for StatFuture {
     type Output = io::Result<Metadata>;
 
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<Metadata>> {
-        with_state(|_driver, executor| {
+    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<Metadata>> {
+        assert!(!self.done, "StatFuture polled after completion");
+        let poll = with_state(|_driver, executor| {
             // First check if there's a normal error result (negative).
-            match executor.disk_io_results.remove(&self.seq) {
+            match executor.take_disk_io_result(self.seq) {
                 Some(result) if result < 0 => {
                     // Also remove any stat result that might have been stored.
                     executor.fs_stat_results.remove(&self.seq);
@@ -861,25 +910,45 @@ impl Future for StatFuture {
                 }
                 None => {
                     let task_id = CURRENT_TASK_ID.with(|c| c.get());
-                    executor.disk_io_waiters.insert(self.seq, task_id);
+                    executor.wait_disk_io(self.seq, task_id);
                     Poll::Pending
                 }
             }
-        })
+        });
+        if poll.is_ready() {
+            self.done = true;
+        }
+        poll
     }
 }
 
 impl Drop for StatFuture {
     fn drop(&mut self) {
-        let opt_non_null = CURRENT_DRIVER.with(|c| c.get());
-        if opt_non_null.is_none() {
-            return;
+        // Only the owning worker's executor holds the key. Dropped elsewhere
+        // (the future is `Send`), the key stays held there (#575).
+        if !self.done && crate::runtime::waker::current_worker() == self.owner {
+            abandon_disk_io_key(self.seq);
         }
-        let mut non_null = opt_non_null.unwrap();
-        let state = unsafe { non_null.as_mut() };
-        let executor = unsafe { &mut *state.executor.as_mut() };
-        executor.disk_io_waiters.remove(&self.seq);
-        executor.fs_stat_results.remove(&self.seq);
+    }
+}
+
+/// Forget a disk-I/O operation whose future was dropped before it resolved,
+/// so its key and result are not held for the life of the worker (#574).
+/// Inside a task poll this calls [`Executor::abandon_disk_io`]; outside one
+/// (a connection's task dropped at teardown) it queues the key for
+/// [`release_orphans`].
+///
+/// [`Executor::abandon_disk_io`]: crate::runtime::Executor::abandon_disk_io
+pub(crate) fn abandon_disk_io_key(seq: u32) {
+    match CURRENT_DRIVER.with(|c| c.get()) {
+        Some(mut non_null) => {
+            let state = unsafe { non_null.as_mut() };
+            let executor = unsafe { &mut *state.executor.as_mut() };
+            executor.abandon_disk_io(seq);
+        }
+        None => {
+            let _ = ORPHANED_KEYS.try_with(|orphans| orphans.borrow_mut().push(seq));
+        }
     }
 }
 
@@ -896,8 +965,8 @@ pub fn rename(
         let mut ctx = driver.make_ctx();
         let seq = ctx.fs_rename(from.as_ref(), to.as_ref())?;
         let task_id = CURRENT_TASK_ID.with(|c| c.get());
-        executor.disk_io_waiters.insert(seq, task_id);
-        Ok(DiskIoFuture { seq })
+        executor.wait_disk_io(seq, task_id);
+        Ok(DiskIoFuture::new(seq))
     })
 }
 
@@ -911,8 +980,8 @@ pub fn remove(path: impl AsRef<std::path::Path>) -> io::Result<DiskIoFuture> {
         let mut ctx = driver.make_ctx();
         let seq = ctx.fs_unlink(path.as_ref())?;
         let task_id = CURRENT_TASK_ID.with(|c| c.get());
-        executor.disk_io_waiters.insert(seq, task_id);
-        Ok(DiskIoFuture { seq })
+        executor.wait_disk_io(seq, task_id);
+        Ok(DiskIoFuture::new(seq))
     })
 }
 
@@ -926,8 +995,8 @@ pub fn mkdir(path: impl AsRef<std::path::Path>, mode: u32) -> io::Result<DiskIoF
         let mut ctx = driver.make_ctx();
         let seq = ctx.fs_mkdir(path.as_ref(), mode)?;
         let task_id = CURRENT_TASK_ID.with(|c| c.get());
-        executor.disk_io_waiters.insert(seq, task_id);
-        Ok(DiskIoFuture { seq })
+        executor.wait_disk_io(seq, task_id);
+        Ok(DiskIoFuture::new(seq))
     })
 }
 

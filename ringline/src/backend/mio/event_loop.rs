@@ -278,10 +278,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // 6. Collect wakeups and poll ready tasks.
             self.executor.collect_wakeups();
             self.poll_ready_tasks();
-            // Release what dropped fs futures left behind: close abandoned
-            // opens' files, and free or park abandoned reads' and writes'
-            // buffers. Futures dropped by `drain_pending_closes` below are
-            // released on the next iteration, after that iteration's drain.
+            // Release what dropped fs futures left behind: abandoned
+            // operations' results, abandoned opens' files, and abandoned
+            // reads' and writes' buffers. Futures dropped by
+            // `drain_pending_closes` below are released on the next
+            // iteration, after that iteration's drain.
             crate::fs::release_orphans(&mut self.driver, &mut self.executor);
 
             // 6a. Flush pending sends queued during task polling, then
@@ -538,6 +539,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // Drain disk I/O responses.
         if let Some(ref rx) = self.driver.disk_io_rx {
             while let Ok(response) = rx.try_recv() {
+                // The operation is done: its key may be handed out again.
+                self.driver.disk_io_in_flight.remove(&response.seq);
                 // Handle fs_open completions: install fd or release slot.
                 if let Some(file_index) = self.driver.pending_fs_opens.remove(&response.seq) {
                     if self.executor.abandoned_fs_opens.remove(&response.seq) {
@@ -1687,6 +1690,50 @@ mod tests {
         )
         .expect("build mio event loop");
         (event_loop, handle)
+    }
+
+    /// A key whose operation is still in the disk-I/O pool is not handed
+    /// out again when the sequence comes round, even with no future holding
+    /// it (a dropped future gives its key up while its operation runs).
+    #[test]
+    fn a_key_whose_pool_operation_is_running_is_not_reissued() {
+        let config = ConfigBuilder::new()
+            .workers(1)
+            .pin_to_core(false)
+            .max_connections(16)
+            .send_pool(4, 64)
+            .disk_io_threads(1)
+            .build()
+            .expect("valid test config");
+        let (mut el, _wake) = test_loop(&config);
+        let dir =
+            std::env::temp_dir().join(format!("ringline-mio-inflight-key-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("fifo");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+
+        let (open_seq, stat_seq) = {
+            let mut ctx = el.driver.make_ctx();
+            // Blocks the pool's only thread until a writer opens the FIFO.
+            let (_, _, open_seq) = ctx
+                .fs_open(&fifo, crate::fs::OpenFlags::READ, 0)
+                .expect("submit open");
+            // Stand in for the u32 sequence coming round to it.
+            *ctx.next_disk_io_seq = open_seq;
+            let stat_seq = ctx.fs_stat(&dir).expect("submit stat");
+            (open_seq, stat_seq)
+        };
+        // Release the pool thread before the loop, and the pool, drop.
+        let writer = std::fs::OpenOptions::new().write(true).open(&fifo);
+        drop(writer);
+        drop(el);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_ne!(
+            stat_seq, open_seq,
+            "the key of an operation still in the pool was handed out again"
+        );
     }
 
     /// A parked standalone task, so that waking it is observable (a task

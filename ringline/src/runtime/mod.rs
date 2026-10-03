@@ -410,6 +410,28 @@ impl TimerSlotPool {
     }
 }
 
+thread_local! {
+    // Disk-I/O keys a future holds on this worker: added when the future is
+    // created, removed when it takes its result or is dropped. The executor
+    // stores a result only for a held key, and the key allocators, which
+    // have the driver but not the executor, do not hand out a held key, so
+    // a result is never taken by an operation it does not belong to (#574).
+    static DISK_IO_LIVE: std::cell::RefCell<std::collections::HashSet<u32>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+/// Whether a future on this worker holds the disk-I/O key `key`.
+pub(crate) fn disk_io_key_held(key: u32) -> bool {
+    DISK_IO_LIVE.with(|live| live.borrow().contains(&key))
+}
+
+/// Stop holding the disk-I/O key `key` on this worker.
+pub(crate) fn untrack_disk_io(key: u32) {
+    DISK_IO_LIVE.with(|live| {
+        live.borrow_mut().remove(&key);
+    });
+}
+
 /// Per-worker async executor. Owns the task slab and coordinates
 /// CQE-driven wakeups with future polling.
 pub(crate) struct Executor {
@@ -513,7 +535,8 @@ pub(crate) struct Executor {
     /// the entire op even after the future goes away. Buffers still here when
     /// the executor drops are leaked; see `impl Drop for Executor`.
     pub(crate) disk_io_graveyard: HashMap<u32, bytes::BytesMut>,
-    /// Filesystem stat results: maps disk-I/O key → Metadata (populated by handle_fs for Statx ops).
+    /// Filesystem stat results: maps disk-I/O key → Metadata (populated by
+    /// handle_fs for Statx ops).
     pub(crate) fs_stat_results: HashMap<u32, crate::fs::Metadata>,
     /// Disk I/O keys of opens whose `OpenFuture` was dropped before the open
     /// completed. The backend's completion handler closes the file and
@@ -825,20 +848,52 @@ impl Executor {
         }
     }
 
+    /// Register `task_id` to be woken when the operation `seq` completes,
+    /// and mark `seq` as one a future is waiting on.
+    pub(crate) fn wait_disk_io(&mut self, seq: u32, task_id: u32) {
+        self.disk_io_waiters.insert(seq, task_id);
+        DISK_IO_LIVE.with(|live| live.borrow_mut().insert(seq));
+    }
+
+    /// Take the result of the operation `seq`, if it has completed. Taking
+    /// it ends the future's interest in the key.
+    pub(crate) fn take_disk_io_result(&mut self, seq: u32) -> Option<i32> {
+        let result = self.disk_io_results.remove(&seq);
+        if result.is_some() {
+            untrack_disk_io(seq);
+        }
+        result
+    }
+
+    /// Forget the operation `seq`, whose future was dropped before it took
+    /// its result: remove its waiter, its result and stat metadata if they
+    /// have arrived, and its key from the held set, so `wake_disk_io`
+    /// discards a result that arrives later.
+    pub(crate) fn abandon_disk_io(&mut self, seq: u32) {
+        self.disk_io_waiters.remove(&seq);
+        self.disk_io_results.remove(&seq);
+        self.fs_stat_results.remove(&seq);
+        untrack_disk_io(seq);
+    }
+
     /// Wake a task that was waiting for a disk I/O completion.
     ///
-    /// Stores the result and wakes the task if one is registered. Waiters
-    /// and results are keyed by the disk-I/O key, not the connection. A
-    /// result whose future was dropped without parking a buffer stays in
-    /// `disk_io_results` (#574).
-    ///
-    /// If the owning future was dropped before completion, its buffer was
-    /// parked in `disk_io_graveyard`. We free it here (the kernel is now
-    /// done with the pointer) and discard the result, since no future
-    /// remains to read it.
+    /// If the key's buffer is in `disk_io_graveyard` (its future was dropped
+    /// before the operation completed), frees the buffer and discards the
+    /// result. Otherwise, if a future holds the key ([`disk_io_key_held`]),
+    /// stores the result and wakes the waiting task; if not (its future was
+    /// dropped, or it was submitted without one), discards the result.
+    /// Waiters and results are keyed by the disk-I/O key, not the
+    /// connection.
     #[cfg_attr(not(has_io_uring), allow(dead_code))]
     pub(crate) fn wake_disk_io(&mut self, seq: u32, result: i32) {
         if self.disk_io_graveyard.remove(&seq).is_some() {
+            return;
+        }
+        if !disk_io_key_held(seq) {
+            // Nothing will take this result: its future was dropped, or the
+            // operation was submitted without one.
+            self.fs_stat_results.remove(&seq);
             return;
         }
         self.disk_io_results.insert(seq, result);

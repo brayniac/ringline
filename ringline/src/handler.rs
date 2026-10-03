@@ -833,19 +833,29 @@ impl<'a> DriverCtx<'a> {
         *self.capacity_released = true;
     }
 
-    /// Allocate a unique 32-bit disk-I/O completion key: monotonic sequence
-    /// in the high 16 bits, slab index in the low 16. fs, NVMe, and
-    /// direct-io share the executor's completion/graveyard maps; a raw slab
-    /// index collided across their three independent slabs (results swapped
-    /// between subsystems, a dropped fs future's graveyard buffer freed by
-    /// an unrelated NVMe completion while the kernel was still writing to
-    /// it) and across LIFO reuse of one slab slot within a drain batch.
-    /// CQE handlers extract the slab index from the low 16 bits and wake
-    /// with the full key.
-    pub(crate) fn disk_io_key(&mut self, slab_idx: u16) -> u32 {
-        let seq = *self.next_disk_io_seq;
-        *self.next_disk_io_seq = seq.wrapping_add(1);
-        ((seq as u32) << 16) | slab_idx as u32
+    /// Allocate a 32-bit disk-I/O completion key: the subsystem in the top 2
+    /// bits, a 14-bit sequence below it, and the slab index in the low 16.
+    /// fs, NVMe and direct I/O share the executor's completion and graveyard
+    /// maps but have independent slabs, each numbering its slots from 0.
+    /// CQE handlers extract the slab index from the low 16 bits and wake with
+    /// the full key.
+    ///
+    /// A key is held from submission until its future takes the result or is
+    /// dropped, which can be long after the slab slot is freed. A key a
+    /// future still holds is skipped, so no two held keys are equal. Fails
+    /// when futures hold every key of this slot (16,384 of them).
+    pub(crate) fn disk_io_key(&mut self, kind: DiskIoKind, slab_idx: u16) -> io::Result<u32> {
+        for _ in 0..=0x3FFF {
+            let seq = *self.next_disk_io_seq;
+            *self.next_disk_io_seq = seq.wrapping_add(1);
+            let key = ((kind as u32) << 30) | (((seq as u32) & 0x3FFF) << 16) | slab_idx as u32;
+            if !crate::runtime::disk_io_key_held(key) {
+                return Ok(key);
+            }
+        }
+        Err(io::Error::other(
+            "every disk-I/O key for this slab slot is held by a future",
+        ))
     }
 
     /// Queue a batch of built sends in order through the per-connection
@@ -1543,7 +1553,9 @@ impl<'a> DriverCtx<'a> {
     /// Reads `num_blocks` logical blocks starting at `lba` into the buffer
     /// at `buf_addr` with length `buf_len`.
     ///
-    /// Returns the command slab index (sequence number) for correlation.
+    /// Returns the operation's disk-I/O key. Nothing reports the result: it is
+    /// discarded when it arrives. [`nvme_read`](crate::nvme_read) returns a future that
+    /// resolves to it.
     ///
     /// # Safety
     ///
@@ -1572,7 +1584,15 @@ impl<'a> DriverCtx<'a> {
             .ok_or_else(|| io::Error::other("NVMe command slab exhausted"))?;
 
         let cmd = crate::nvme::NvmeUringCmd::read(nsid, lba, num_blocks, buf_addr, buf_len);
-        let key = self.disk_io_key(slab_idx);
+        let key = match self.disk_io_key(DiskIoKind::Nvme, slab_idx) {
+            Ok(key) => key,
+            Err(e) => {
+                if let Some(slab) = self.nvme_cmd_slab.as_mut() {
+                    slab.release(slab_idx);
+                }
+                return Err(e);
+            }
+        };
         let ud = crate::completion::UserData::encode(
             crate::completion::OpTag::NvmeCmd,
             device.index as u32,
@@ -1602,7 +1622,9 @@ impl<'a> DriverCtx<'a> {
     /// Writes `num_blocks` logical blocks starting at `lba` from the buffer
     /// at `buf_addr` with length `buf_len`.
     ///
-    /// Returns the command slab index (sequence number) for correlation.
+    /// Returns the operation's disk-I/O key. Nothing reports the result: it is
+    /// discarded when it arrives. [`nvme_write`](crate::nvme_write) returns a future that
+    /// resolves to it.
     ///
     /// # Safety
     ///
@@ -1631,7 +1653,15 @@ impl<'a> DriverCtx<'a> {
             .ok_or_else(|| io::Error::other("NVMe command slab exhausted"))?;
 
         let cmd = crate::nvme::NvmeUringCmd::write(nsid, lba, num_blocks, buf_addr, buf_len);
-        let key = self.disk_io_key(slab_idx);
+        let key = match self.disk_io_key(DiskIoKind::Nvme, slab_idx) {
+            Ok(key) => key,
+            Err(e) => {
+                if let Some(slab) = self.nvme_cmd_slab.as_mut() {
+                    slab.release(slab_idx);
+                }
+                return Err(e);
+            }
+        };
         let ud = crate::completion::UserData::encode(
             crate::completion::OpTag::NvmeCmd,
             device.index as u32,
@@ -1658,7 +1688,9 @@ impl<'a> DriverCtx<'a> {
 
     /// Submit an NVMe flush command.
     ///
-    /// Returns the command slab index (sequence number) for correlation.
+    /// Returns the operation's disk-I/O key. Nothing reports the result: it is
+    /// discarded when it arrives. [`nvme_flush`](crate::nvme_flush) returns a future that
+    /// resolves to it.
     pub fn nvme_flush(&mut self, device: crate::nvme::NvmeDevice) -> io::Result<u32> {
         let (fd_index, nsid) = self.validate_nvme_device(device)?;
 
@@ -1671,7 +1703,15 @@ impl<'a> DriverCtx<'a> {
             .ok_or_else(|| io::Error::other("NVMe command slab exhausted"))?;
 
         let cmd = crate::nvme::NvmeUringCmd::flush(nsid);
-        let key = self.disk_io_key(slab_idx);
+        let key = match self.disk_io_key(DiskIoKind::Nvme, slab_idx) {
+            Ok(key) => key,
+            Err(e) => {
+                if let Some(slab) = self.nvme_cmd_slab.as_mut() {
+                    slab.release(slab_idx);
+                }
+                return Err(e);
+            }
+        };
         let ud = crate::completion::UserData::encode(
             crate::completion::OpTag::NvmeCmd,
             device.index as u32,
@@ -1789,11 +1829,14 @@ impl<'a> DriverCtx<'a> {
     /// The buffer must be aligned to the logical block size and remain valid
     /// until the direct I/O completion fires.
     ///
-    /// Returns the command slab index (sequence number) for correlation.
+    /// Returns the operation's disk-I/O key. Nothing reports the result: it is
+    /// discarded when it arrives. [`direct_io_read`](crate::direct_io_read) returns a future that
+    /// resolves to it.
     ///
     /// # Safety
     /// `buf` must point to valid, aligned memory of at least `len` bytes
-    /// that remains valid until the completion callback fires.
+    /// that remains valid until the operation completes. Nothing reports
+    /// completion, so keep the buffer for the life of the worker.
     pub unsafe fn direct_io_read(
         &mut self,
         file: crate::direct_io::DirectIoFile,
@@ -1811,7 +1854,15 @@ impl<'a> DriverCtx<'a> {
             .allocate(file.index, crate::direct_io::DirectIoOp::Read)
             .ok_or_else(|| io::Error::other("direct I/O command slab exhausted"))?;
 
-        let key = self.disk_io_key(slab_idx);
+        let key = match self.disk_io_key(DiskIoKind::DirectIo, slab_idx) {
+            Ok(key) => key,
+            Err(e) => {
+                if let Some(slab) = self.direct_io_cmd_slab.as_mut() {
+                    slab.release(slab_idx);
+                }
+                return Err(e);
+            }
+        };
         let ud = crate::completion::UserData::encode(
             crate::completion::OpTag::DirectIo,
             file.index as u32,
@@ -1842,11 +1893,14 @@ impl<'a> DriverCtx<'a> {
     /// The buffer must be aligned to the logical block size and remain valid
     /// until the direct I/O completion fires.
     ///
-    /// Returns the command slab index (sequence number) for correlation.
+    /// Returns the operation's disk-I/O key. Nothing reports the result: it is
+    /// discarded when it arrives. [`direct_io_write`](crate::direct_io_write) returns a future that
+    /// resolves to it.
     ///
     /// # Safety
     /// `buf` must point to valid, aligned memory of at least `len` bytes
-    /// that remains valid until the completion callback fires.
+    /// that remains valid until the operation completes. Nothing reports
+    /// completion, so keep the buffer for the life of the worker.
     pub unsafe fn direct_io_write(
         &mut self,
         file: crate::direct_io::DirectIoFile,
@@ -1864,7 +1918,15 @@ impl<'a> DriverCtx<'a> {
             .allocate(file.index, crate::direct_io::DirectIoOp::Write)
             .ok_or_else(|| io::Error::other("direct I/O command slab exhausted"))?;
 
-        let key = self.disk_io_key(slab_idx);
+        let key = match self.disk_io_key(DiskIoKind::DirectIo, slab_idx) {
+            Ok(key) => key,
+            Err(e) => {
+                if let Some(slab) = self.direct_io_cmd_slab.as_mut() {
+                    slab.release(slab_idx);
+                }
+                return Err(e);
+            }
+        };
         let ud = crate::completion::UserData::encode(
             crate::completion::OpTag::DirectIo,
             file.index as u32,
@@ -1894,7 +1956,9 @@ impl<'a> DriverCtx<'a> {
 
     /// Submit an fsync for a direct I/O file.
     ///
-    /// Returns the command slab index (sequence number) for correlation.
+    /// Returns the operation's disk-I/O key. Nothing reports the result: it is
+    /// discarded when it arrives. [`direct_io_fsync`](crate::direct_io_fsync) returns a future that
+    /// resolves to it.
     pub fn direct_io_fsync(&mut self, file: crate::direct_io::DirectIoFile) -> io::Result<u32> {
         let fd_index = self.validate_direct_io_file(file)?;
 
@@ -1906,7 +1970,15 @@ impl<'a> DriverCtx<'a> {
             .allocate(file.index, crate::direct_io::DirectIoOp::Fsync)
             .ok_or_else(|| io::Error::other("direct I/O command slab exhausted"))?;
 
-        let key = self.disk_io_key(slab_idx);
+        let key = match self.disk_io_key(DiskIoKind::DirectIo, slab_idx) {
+            Ok(key) => key,
+            Err(e) => {
+                if let Some(slab) = self.direct_io_cmd_slab.as_mut() {
+                    slab.release(slab_idx);
+                }
+                return Err(e);
+            }
+        };
         let ud = crate::completion::UserData::encode(
             crate::completion::OpTag::DirectIo,
             file.index as u32,
@@ -2023,7 +2095,18 @@ impl<'a> DriverCtx<'a> {
             .unwrap()
             .as_ptr();
 
-        let key = self.disk_io_key(slab_idx);
+        let key = match self.disk_io_key(DiskIoKind::Fs, slab_idx) {
+            Ok(key) => key,
+            Err(e) => {
+                if let Some(slab) = self.fs_cmd_slab.as_mut() {
+                    slab.release(slab_idx);
+                }
+                if let Some(files) = self.fs_files.as_mut() {
+                    files.release(file_index);
+                }
+                return Err(e);
+            }
+        };
         let ud = crate::completion::UserData::encode(
             crate::completion::OpTag::Fs,
             file_index as u32,
@@ -2069,7 +2152,15 @@ impl<'a> DriverCtx<'a> {
             .allocate(file.index, crate::fs::FsOp::Read)
             .ok_or_else(|| io::Error::other("filesystem command slab exhausted"))?;
 
-        let key = self.disk_io_key(slab_idx);
+        let key = match self.disk_io_key(DiskIoKind::Fs, slab_idx) {
+            Ok(key) => key,
+            Err(e) => {
+                if let Some(slab) = self.fs_cmd_slab.as_mut() {
+                    slab.release(slab_idx);
+                }
+                return Err(e);
+            }
+        };
         let ud = crate::completion::UserData::encode(
             crate::completion::OpTag::Fs,
             file.index as u32,
@@ -2116,7 +2207,15 @@ impl<'a> DriverCtx<'a> {
             .allocate(file.index, crate::fs::FsOp::Write)
             .ok_or_else(|| io::Error::other("filesystem command slab exhausted"))?;
 
-        let key = self.disk_io_key(slab_idx);
+        let key = match self.disk_io_key(DiskIoKind::Fs, slab_idx) {
+            Ok(key) => key,
+            Err(e) => {
+                if let Some(slab) = self.fs_cmd_slab.as_mut() {
+                    slab.release(slab_idx);
+                }
+                return Err(e);
+            }
+        };
         let ud = crate::completion::UserData::encode(
             crate::completion::OpTag::Fs,
             file.index as u32,
@@ -2156,7 +2255,15 @@ impl<'a> DriverCtx<'a> {
             .allocate(file.index, crate::fs::FsOp::Fsync)
             .ok_or_else(|| io::Error::other("filesystem command slab exhausted"))?;
 
-        let key = self.disk_io_key(slab_idx);
+        let key = match self.disk_io_key(DiskIoKind::Fs, slab_idx) {
+            Ok(key) => key,
+            Err(e) => {
+                if let Some(slab) = self.fs_cmd_slab.as_mut() {
+                    slab.release(slab_idx);
+                }
+                return Err(e);
+            }
+        };
         let ud = crate::completion::UserData::encode(
             crate::completion::OpTag::Fs,
             file.index as u32,
@@ -2231,7 +2338,15 @@ impl<'a> DriverCtx<'a> {
             .unwrap()
             .as_ptr();
 
-        let key = self.disk_io_key(slab_idx);
+        let key = match self.disk_io_key(DiskIoKind::Fs, slab_idx) {
+            Ok(key) => key,
+            Err(e) => {
+                if let Some(slab) = self.fs_cmd_slab.as_mut() {
+                    slab.release(slab_idx);
+                }
+                return Err(e);
+            }
+        };
         let ud = crate::completion::UserData::encode(crate::completion::OpTag::Fs, 0, key);
 
         match unsafe { self.ring.submit_statx(path_ptr, statx_ptr, ud.raw()) } {
@@ -2275,7 +2390,15 @@ impl<'a> DriverCtx<'a> {
             )
         };
 
-        let key = self.disk_io_key(slab_idx);
+        let key = match self.disk_io_key(DiskIoKind::Fs, slab_idx) {
+            Ok(key) => key,
+            Err(e) => {
+                if let Some(slab) = self.fs_cmd_slab.as_mut() {
+                    slab.release(slab_idx);
+                }
+                return Err(e);
+            }
+        };
         let ud = crate::completion::UserData::encode(crate::completion::OpTag::Fs, 0, key);
 
         match unsafe { self.ring.submit_renameat(old_ptr, new_ptr, ud.raw()) } {
@@ -2316,7 +2439,15 @@ impl<'a> DriverCtx<'a> {
             .unwrap()
             .as_ptr();
 
-        let key = self.disk_io_key(slab_idx);
+        let key = match self.disk_io_key(DiskIoKind::Fs, slab_idx) {
+            Ok(key) => key,
+            Err(e) => {
+                if let Some(slab) = self.fs_cmd_slab.as_mut() {
+                    slab.release(slab_idx);
+                }
+                return Err(e);
+            }
+        };
         let ud = crate::completion::UserData::encode(crate::completion::OpTag::Fs, 0, key);
 
         match unsafe { self.ring.submit_unlinkat(path_ptr, 0, ud.raw()) } {
@@ -2357,7 +2488,15 @@ impl<'a> DriverCtx<'a> {
             .unwrap()
             .as_ptr();
 
-        let key = self.disk_io_key(slab_idx);
+        let key = match self.disk_io_key(DiskIoKind::Fs, slab_idx) {
+            Ok(key) => key,
+            Err(e) => {
+                if let Some(slab) = self.fs_cmd_slab.as_mut() {
+                    slab.release(slab_idx);
+                }
+                return Err(e);
+            }
+        };
         let ud = crate::completion::UserData::encode(crate::completion::OpTag::Fs, 0, key);
 
         match unsafe { self.ring.submit_mkdirat(path_ptr, mode, ud.raw()) } {
@@ -2478,6 +2617,8 @@ pub struct DriverCtx<'a> {
     pub(crate) wake_handle: crate::wakeup::WakeFd,
     /// Monotonic sequence counter for disk I/O requests.
     pub(crate) next_disk_io_seq: &'a mut u32,
+    /// Keys of pool operations not yet drained; see `Driver::disk_io_in_flight`.
+    pub(crate) disk_io_in_flight: &'a mut std::collections::HashSet<u32>,
     /// Direct I/O file table.
     pub(crate) direct_io_files: &'a mut Option<crate::direct_io::DirectIoFileTable>,
     /// Direct I/O fds, indexed by file slot.
@@ -3034,8 +3175,15 @@ impl<'a> DriverCtx<'a> {
             .as_ref()
             .ok_or_else(|| io::Error::other("disk I/O pool not configured"))?;
 
-        let seq = *self.next_disk_io_seq;
-        *self.next_disk_io_seq = seq.wrapping_add(1);
+        // Skip a key a future still holds, or whose operation is still in the
+        // pool; the u32 sequence can wrap on a long-running worker.
+        let seq = loop {
+            let seq = *self.next_disk_io_seq;
+            *self.next_disk_io_seq = seq.wrapping_add(1);
+            if !crate::runtime::disk_io_key_held(seq) && !self.disk_io_in_flight.contains(&seq) {
+                break seq;
+            }
+        };
 
         pool.request_tx
             .send(crate::disk_io_pool::DiskIoRequest {
@@ -3045,6 +3193,7 @@ impl<'a> DriverCtx<'a> {
                 wake_handle: self.wake_handle,
             })
             .map_err(|_| io::Error::other("disk I/O pool shut down"))?;
+        self.disk_io_in_flight.insert(seq);
 
         Ok(seq)
     }
@@ -3099,7 +3248,9 @@ impl<'a> DriverCtx<'a> {
 
     /// Submit a direct I/O read via the disk I/O pool.
     ///
-    /// Returns the sequence number for correlation with `DiskIoFuture`.
+    /// Returns the operation's disk-I/O key. Nothing reports the result: it is
+    /// discarded when it arrives. [`direct_io_read`](crate::direct_io_read) returns a future that
+    /// resolves to it.
     pub fn direct_io_read(
         &mut self,
         file: crate::direct_io::DirectIoFile,
@@ -3136,7 +3287,9 @@ impl<'a> DriverCtx<'a> {
 
     /// Submit a direct I/O write via the disk I/O pool.
     ///
-    /// Returns the sequence number for correlation with `DiskIoFuture`.
+    /// Returns the operation's disk-I/O key. Nothing reports the result: it is
+    /// discarded when it arrives. [`direct_io_write`](crate::direct_io_write) returns a future that
+    /// resolves to it.
     pub fn direct_io_write(
         &mut self,
         file: crate::direct_io::DirectIoFile,
@@ -4514,4 +4667,13 @@ impl<'b, 'a> ChainPartsBuilder<'b, 'a> {
         self.chain.built.push(built);
         self.chain
     }
+}
+
+/// The subsystem a disk-I/O key belongs to: its top two bits.
+#[cfg(has_io_uring)]
+#[derive(Clone, Copy)]
+pub(crate) enum DiskIoKind {
+    Fs = 0,
+    DirectIo = 1,
+    Nvme = 2,
 }

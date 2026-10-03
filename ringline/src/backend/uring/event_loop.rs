@@ -494,11 +494,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // Poll all ready tasks.
             let tasks_before = self.executor.ready_queue.len();
             self.poll_ready_tasks();
-            // Release what dropped fs futures left behind (abandoned opens'
-            // files, abandoned reads' and writes' buffers). Before the flush
-            // below submits this pass's SQEs, so an open whose future was
-            // dropped during the pass is marked abandoned before it can
-            // complete.
+            // Release what dropped fs futures left behind (abandoned
+            // operations' results, abandoned opens' files, abandoned reads'
+            // and writes' buffers). Before the flush below submits this
+            // pass's SQEs, so an open whose future was dropped during the
+            // pass is marked abandoned before it can complete.
             crate::fs::release_orphans(&mut self.driver, &mut self.executor);
             diag_tasks_1st += tasks_before as u64;
             if tasks_before == 0 {
@@ -13388,7 +13388,7 @@ mod tests {
 
         // Create and immediately drop a DiskIoFuture.
         {
-            let _fut = crate::runtime::io::DiskIoFuture { seq };
+            let _fut = crate::runtime::io::DiskIoFuture::new(seq);
         }
 
         drop(guard);
@@ -14026,18 +14026,61 @@ mod tests {
         // The key assertion: no panic, no hang, retry was handled.
     }
 
+    /// A key abandoned outside the executor (a future dropped with its
+    /// connection's task) is queued, and `release_orphans` stops holding it
+    /// and drops its result. Without the release the key and its result stay
+    /// held for the life of the worker.
+    #[test]
+    fn a_key_abandoned_outside_the_executor_is_released() {
+        let mut el = make_test_loop();
+        let key = 0x0123_0005;
+        el.executor.wait_disk_io(key, 0);
+        // Its result has arrived and nothing will take it.
+        el.executor.disk_io_results.insert(key, 0);
+
+        // CURRENT_DRIVER is unset here, as during connection teardown.
+        crate::fs::abandon_disk_io_key(key);
+        assert!(
+            crate::runtime::disk_io_key_held(key),
+            "the key is queued, not yet released"
+        );
+
+        crate::fs::release_orphans(&mut el.driver, &mut el.executor);
+        assert!(!crate::runtime::disk_io_key_held(key));
+        assert!(!el.executor.disk_io_results.contains_key(&key));
+    }
+
     #[test]
     fn disk_io_keys_are_unique_per_op() {
         // fs/NVMe/direct-io share the executor's completion maps; the key
         // must differ across ops even for the same slab index (three
         // independent slabs all start their free lists at 0).
+        use crate::handler::DiskIoKind;
         let mut el = make_test_loop();
         let mut ctx = el.driver.make_ctx();
-        let k1 = ctx.disk_io_key(3);
-        let k2 = ctx.disk_io_key(3);
+        let k1 = ctx.disk_io_key(DiskIoKind::Fs, 3).unwrap();
+        let k2 = ctx.disk_io_key(DiskIoKind::Fs, 3).unwrap();
         assert_ne!(k1, k2, "same slab index must map to distinct keys");
         assert_eq!(k1 & 0xFFFF, 3, "low 16 bits must carry the slab index");
         assert_eq!(k2 & 0xFFFF, 3);
+
+        // Slot 3 of each subsystem's slab, whatever the sequence: an fs
+        // operation in flight never shares a key with a direct-I/O or NVMe
+        // one, even when the sequence has come round to the same value.
+        let fs = ctx.disk_io_key(DiskIoKind::Fs, 3).unwrap();
+        for _ in 0..0x3FFF {
+            ctx.disk_io_key(DiskIoKind::Fs, 0).unwrap();
+        }
+        let dio = ctx.disk_io_key(DiskIoKind::DirectIo, 3).unwrap();
+        let nvme = ctx.disk_io_key(DiskIoKind::Nvme, 3).unwrap();
+        assert_eq!(
+            fs & 0x3FFF_FFFF,
+            dio & 0x3FFF_FFFF,
+            "the sequence came round"
+        );
+        assert_ne!(fs, dio, "fs and direct-I/O keys must differ");
+        assert_ne!(fs, nvme, "fs and NVMe keys must differ");
+        assert_ne!(dio, nvme, "direct-I/O and NVMe keys must differ");
     }
 
     #[test]
