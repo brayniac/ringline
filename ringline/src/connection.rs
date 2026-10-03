@@ -147,6 +147,11 @@ pub struct ConnectionState {
     /// `RecvMsgMulti` path.)
     #[cfg(has_io_uring)]
     pub recv_multishot_armed: bool,
+    /// The socket was handed to another worker (a park install, #443), so
+    /// closing this slot must not shut it down. Every other close shuts the
+    /// socket down before closing the fixed descriptor (#581).
+    #[cfg(has_io_uring)]
+    pub socket_handed_off: bool,
 }
 
 impl Default for ConnectionState {
@@ -175,6 +180,8 @@ impl ConnectionState {
             direct_echo: false,
             #[cfg(has_io_uring)]
             recv_multishot_armed: false,
+            #[cfg(has_io_uring)]
+            socket_handed_off: false,
         }
     }
 
@@ -246,6 +253,7 @@ impl ConnectionState {
         {
             self.direct_echo = false;
             self.recv_multishot_armed = false;
+            self.socket_handed_off = false;
         }
         self.generation = self.generation.wrapping_add(1);
     }

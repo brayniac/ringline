@@ -1327,6 +1327,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             OpTag::SendMsgZc => self.handle_send_msg_zc(ud, result, flags),
             OpTag::Close => self.handle_close(ud),
             OpTag::Shutdown => self.handle_shutdown(ud),
+            // The `Close` linked behind it drives teardown; a failure here
+            // (`ENOTCONN` on a socket that never connected) changes nothing.
+            OpTag::CloseShutdown => {}
             OpTag::EventFdRead => self.handle_eventfd_read(),
             OpTag::TlsSend => self.handle_tls_send(ud, result),
             OpTag::Connect => self.handle_connect(ud, result),
@@ -2498,8 +2501,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
         // Ordinary teardown. It closes the fixed-file entry and drops the
         // handler future, but does *not* FIN: `fd` above is a second
-        // reference keeping the socket open. A connection with a pending
-        // shutdown could not have passed the gate, so no FIN is queued.
+        // reference keeping the socket open, and `socket_handed_off` keeps
+        // the close from shutting the socket down. A connection with a
+        // pending shutdown could not have passed the gate, so no FIN is
+        // queued.
+        if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+            cs.socket_handed_off = true;
+        }
         self.driver.close_connection(conn_index);
 
         metrics::CONNECTIONS.increment(metrics::conn::PARK_COMPLETED);
@@ -5524,7 +5532,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
         let retries = std::mem::take(&mut self.driver.pending_close_retries);
         for (conn_index, retry) in retries {
-            if self.driver.ring.submit_close(conn_index).is_err() {
+            let shut_down = self.driver.close_shuts_down(conn_index);
+            if self
+                .driver
+                .ring
+                .submit_close(conn_index, shut_down)
+                .is_err()
+            {
                 self.driver
                     .pending_close_retries
                     .push((conn_index, retry.saturating_add(1)));
@@ -6778,6 +6792,78 @@ mod tests {
             el.driver.park_in_flight[conn_index as usize].is_none(),
             "the in-flight slot clears on success too"
         );
+    }
+
+    /// Committing a parked connection's close does not shut its socket down:
+    /// the socket now belongs to another worker, through the installed fd.
+    /// Every other close sends a shutdown ahead of the `Close` (#581), so
+    /// this one must be told apart.
+    #[test]
+    fn closing_a_parked_slot_leaves_the_handed_off_socket_open() {
+        use std::io::{Read, Write};
+        use std::os::fd::{AsRawFd, IntoRawFd};
+
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+
+        // A real connection in the slot, and a second reference to its
+        // socket standing in for the fd that `FIXED_FD_INSTALL` returns.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let installed = unsafe { libc::dup(server.as_raw_fd()) };
+        assert!(installed >= 0);
+        el.driver
+            .ring
+            .register_files_update(conn_index, &[server.into_raw_fd()])
+            .expect("register the server end");
+
+        el.driver.park_offered[conn_index as usize] = true;
+        el.driver.park_in_flight[conn_index as usize] =
+            Some(crate::backend::uring::driver::ParkInFlight {
+                target: 3,
+                generation,
+            });
+        el.handle_park_install(park_install_ud(conn_index, generation), installed);
+        assert_eq!(
+            el.driver.park_ready.len(),
+            1,
+            "the connection was lifted off"
+        );
+
+        // Commit the close the park requested, and let the kernel run it.
+        let pending = std::mem::take(&mut el.driver.pending_finalize_closes);
+        for c in pending {
+            el.driver.try_finalize_close(c);
+        }
+        el.driver.ring.submit_and_wait(1).expect("submit the close");
+        el.drain_completions();
+        assert!(
+            el.driver.connections.get(conn_index).is_none(),
+            "the slot was released"
+        );
+
+        // The client sees no FIN, and the handed-off socket still carries
+        // data both ways.
+        client
+            .set_read_timeout(Some(std::time::Duration::from_millis(100)))
+            .unwrap();
+        let mut buf = [0u8; 8];
+        let read = client.read(&mut buf);
+        assert!(
+            matches!(&read, Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "the client saw {read:?}; the handed-off socket was shut down"
+        );
+        client.write_all(b"ping").unwrap();
+        let parked = &el.driver.park_ready[0];
+        let mut handed_off = std::net::TcpStream::from(parked.fd.try_clone().unwrap());
+        let mut got = [0u8; 4];
+        handed_off.read_exact(&mut got).unwrap();
+        assert_eq!(&got, b"ping");
+        handed_off.write_all(b"pong").unwrap();
+        client.read_exact(&mut got).unwrap();
+        assert_eq!(&got, b"pong");
     }
 
     // ── Opcode probe (tier 3, #443) ────────────────────────────────

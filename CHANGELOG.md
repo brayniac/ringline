@@ -257,6 +257,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- On io_uring, a closed connection sent no FIN while another connection had
+  a request in flight: removing a socket from the fixed-file table does not
+  release it until requests submitted earlier complete (on Linux 6.12), and
+  another connection's multishot recv is one such request. A peer that
+  half-closed an idle connection, or whose connection's task ended, saw no
+  EOF until that other request ended. The close now hard-links a
+  `shutdown(SHUT_RDWR)` ahead of the `Close`. A connection parked onto
+  another worker is closed without it (#581).
+
 - A connection's task is dropped outside any task poll when the connection
   closes, and several futures it owned released nothing there:
   - a `sleep` or `timeout` kept its timer slot, so enough connections closed

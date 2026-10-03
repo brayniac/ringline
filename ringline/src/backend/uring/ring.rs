@@ -628,15 +628,29 @@ impl Ring {
     }
 
     /// Submit a close for a direct file descriptor.
-    pub fn submit_close(&mut self, conn_index: u32) -> io::Result<()> {
+    pub fn submit_close(&mut self, conn_index: u32, shut_down: bool) -> io::Result<()> {
         let user_data = UserData::encode(OpTag::Close, conn_index, 0);
-        let entry = opcode::Close::new(Fixed(conn_index))
+        let close = opcode::Close::new(Fixed(conn_index))
             .build()
             .user_data(user_data.raw());
-        unsafe {
-            self.push_sqe(&entry)?;
+        if !shut_down {
+            unsafe {
+                self.push_sqe(&close)?;
+            }
+            return Ok(());
         }
-        Ok(())
+        // Removing a socket from the fixed-file table does not release it
+        // while requests submitted before the removal are still in flight
+        // (on Linux 6.12, at least): another connection's multishot recv
+        // holds it open, and the peer sees no FIN until that recv ends.
+        // `shutdown` sends the FIN regardless. Hard-linked so the Close runs
+        // after it even when it fails (`ENOTCONN` on a socket that never
+        // connected), and pushed as one pair so a submit cannot split them.
+        let shutdown = opcode::Shutdown::new(Fixed(conn_index), libc::SHUT_RDWR)
+            .build()
+            .flags(squeue::Flags::IO_HARDLINK)
+            .user_data(UserData::encode(OpTag::CloseShutdown, conn_index, 0).raw());
+        unsafe { self.push_sqe_pair(shutdown.into(), close.into()) }
     }
 
     /// Submit an async connect for a direct file descriptor.
@@ -1093,6 +1107,36 @@ impl Ring {
             if self.ring.submission().push(&entry).is_err() {
                 self.ring.submit()?;
                 if self.ring.submission().push(&entry).is_err() {
+                    crate::metrics::RING.increment(crate::metrics::ring::SQE_SUBMIT_FAILURES);
+                    return Err(io::Error::other("SQ still full after submit"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Push two SQEs adjacently, so a linked pair is never split across
+    /// submissions. Submits first if the SQ has room for fewer than two.
+    ///
+    /// # Safety
+    /// Both SQEs must reference valid memory for the lifetime of the operation.
+    unsafe fn push_sqe_pair(
+        &mut self,
+        first: squeue::Entry128,
+        second: squeue::Entry128,
+    ) -> io::Result<()> {
+        #[cfg(test)]
+        if self.forced_push_failures > 0 {
+            self.forced_push_failures -= 1;
+            crate::metrics::RING.increment(crate::metrics::ring::SQE_SUBMIT_FAILURES);
+            return Err(io::Error::other("forced SQ push failure"));
+        }
+
+        let pair = [first, second];
+        unsafe {
+            if self.ring.submission().push_multiple(&pair).is_err() {
+                self.ring.submit()?;
+                if self.ring.submission().push_multiple(&pair).is_err() {
                     crate::metrics::RING.increment(crate::metrics::ring::SQE_SUBMIT_FAILURES);
                     return Err(io::Error::other("SQ still full after submit"));
                 }

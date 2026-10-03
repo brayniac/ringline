@@ -2169,6 +2169,15 @@ impl Driver {
     /// this connection has either completed or been finally given up
     /// on. Called from `close_connection` (immediate-fast-path) and
     /// from `note_send_finalized` after each per-send CQE.
+    /// Whether closing this connection's slot shuts its socket down first:
+    /// every close except one whose socket was handed to another worker.
+    pub(crate) fn close_shuts_down(&self, conn_index: u32) -> bool {
+        !self
+            .connections
+            .get(conn_index)
+            .is_some_and(|c| c.socket_handed_off)
+    }
+
     pub(crate) fn try_finalize_close(&mut self, conn_index: u32) {
         let state = &self.send_queues[conn_index as usize];
         let sends_drained = !state.in_flight && state.queue.is_empty();
@@ -2223,7 +2232,9 @@ impl Driver {
         // the peer a FIN and a parked reader on the other end hangs forever.
         // Cancelling the recv (by its `RecvMulti` user_data, which is immune to
         // Close reordering since it targets the request, not the fd) releases
-        // that reference so the subsequent Close actually FINs. The recv's
+        // that reference. Requests on other connections can still delay the
+        // socket's release after the Close, so `submit_close` also shuts the
+        // socket down first, which sends the FIN regardless (#581). The recv's
         // ECANCELED completion is a no-op (generation/slot checks in
         // `handle_recv_multi`). Skipped when the recv already self-terminated
         // (e.g. a peer FIN drove this close) — nothing to cancel.
@@ -2252,7 +2263,8 @@ impl Driver {
                 cs.recv_multishot_armed = false;
             }
         }
-        if self.ring.submit_close(conn_index).is_err() {
+        let shut_down = self.close_shuts_down(conn_index);
+        if self.ring.submit_close(conn_index, shut_down).is_err() {
             crate::metrics::RING.increment(crate::metrics::ring::CLOSE_SUBMIT_FAILURES);
             // Queue this connection for retry on a later tick. (An earlier
             // version rebuilt the whole retry vec here — aging every other
@@ -3236,7 +3248,8 @@ impl Driver {
             if self.connections.get(i).is_some() {
                 self.drain_conn_send_queue(i);
                 // Best effort: kernel cleans up fds on thread/process exit.
-                let _ = self.ring.submit_close(i);
+                let shut_down = self.close_shuts_down(i);
+                let _ = self.ring.submit_close(i, shut_down);
             }
         }
 

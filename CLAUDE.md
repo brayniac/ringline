@@ -163,7 +163,7 @@ Async futures access the driver via `CURRENT_DRIVER` thread-local (raw pointer, 
 
 Inbound: acceptor → round-robin to worker → allocate `ConnectionTable` slot → submit multishot recv SQE → spawn `on_accept` task. Outbound: `connect(addr)` → allocate slot → submit connect SQE (optionally IO_LINK'd with timeout) → `ConnectFuture` resolves to new `ConnCtx`.
 
-Close, on both backends: only `close_connection` (and the `DriverCtx` close) moves the connection to `Lifecycle::Closing`; it also sets `ConnSendState::close_pending`, and teardown finalizes once queued sends drain (io_uring: `try_finalize_close` submits the Close SQE; mio: `drain_pending_closes` defers `finish_close`). A backend site that marks the connection closing directly leaks the slot — that was #368.
+Close, on both backends: only `close_connection` (and the `DriverCtx` close) moves the connection to `Lifecycle::Closing`; it also sets `ConnSendState::close_pending`, and teardown finalizes once queued sends drain (io_uring: `try_finalize_close` submits the Close SQE, with a `shutdown` hard-linked ahead of it; mio: `drain_pending_closes` defers `finish_close`). A backend site that marks the connection closing directly leaks the slot — that was #368.
 
 Connection state is four fields on `ConnectionState`: `recv_arm` (which recv op is armed: `Idle`/`Multi`/`MsgMulti` — mechanism, not lifecycle), `read` (the TCP read half as we observed it: `Open`, `Eof { truncated }`, `Error`, `Cancelled`), `lifecycle` (`Inactive`/`Connecting`/`Open`/`Closing`), and `write` (the TCP write half as we drive it: `Open`, `ShutdownPending`, `Shutdown`). Readers ask `recv_finished()` ("resolve to EOF instead of parking?") or `close_requested()` ("is a close already pending?") rather than matching variants; a peer FIN sets `read` first and then requests the close, so the two steps stay visible. Design: `docs/connection-state-model-design.md`.
 
@@ -206,6 +206,7 @@ These are the recurring failure modes in this codebase — the 2026-07 audit (~3
 5. **Short sends happen.** Stream sends use `MSG_WAITALL` (5.19+) so the kernel retries in-place; any new send variant must handle partial completion explicitly.
 6. **`ENOBUFS` on multishot recv means the provided ring is empty** — re-arm is event-driven (on replenish), not retried in a loop.
 7. **Errors like `EINTR`/`EBUSY` on submit are backpressure, not failures.** A queued send whose SQE cannot be pushed is parked at its queue head and retried next iteration (`drain_send_retries`), never dropped.
+8. **Closing a fixed file does not release its socket while older requests are in flight.** On Linux 6.12, the release waits for requests submitted before the removal, on any connection; another connection's multishot recv can hold a closed socket open, with no FIN sent, until that recv ends. `submit_close` therefore hard-links `shutdown(SHUT_RDWR)` ahead of the Close. The exception is a socket handed to another worker by a park (`socket_handed_off`), which must stay open (#581).
 
 ## Copy Semantics
 
