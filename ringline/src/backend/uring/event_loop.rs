@@ -500,11 +500,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             let tasks_before = self.executor.ready_queue.len();
             self.poll_ready_tasks();
             // Release what futures dropped outside the executor left behind
-            // (timer slots, spawns, pidfd waits, connects, abandoned
-            // operations' results, abandoned opens' files, abandoned reads'
-            // and writes' buffers). Before the flush below submits this
-            // pass's SQEs, so an open whose future was dropped during the
-            // pass is marked abandoned before it can complete.
+            // (timer slots, spawns, pidfd waits, connects, blocking and resolve
+            // entries, abandoned operations' results, abandoned opens' files,
+            // abandoned reads' and writes' buffers). Before the flush below
+            // submits this pass's SQEs, so an open whose future was dropped
+            // during the pass is marked abandoned before it can complete.
             crate::fs::release_orphans(&mut self.driver, &mut self.executor);
             diag_tasks_1st += tasks_before as u64;
             if tasks_before == 0 {

@@ -283,9 +283,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.executor.collect_wakeups();
             self.poll_ready_tasks();
             // Release what futures dropped outside the executor left behind:
-            // timer slots, spawns, pidfd waits, connects, abandoned
-            // operations' results, abandoned opens' files, and abandoned
-            // reads' and writes' buffers. Futures dropped by
+            // timer slots, spawns, pidfd waits, connects, blocking and resolve
+            // entries, abandoned operations' results, abandoned opens' files,
+            // and abandoned reads' and writes' buffers. Futures dropped by
             // `drain_pending_closes` below are released before the next
             // poll for I/O events.
             crate::fs::release_orphans(&mut self.driver, &mut self.executor);
@@ -1715,6 +1715,50 @@ mod tests {
         assert_eq!(first.executor.timer_pool.generations, first_generations);
     }
 
+    /// Run `f` with `el`'s driver and executor as this thread's driver state,
+    /// as a task poll does.
+    fn in_poll<R>(el: &mut AsyncEventLoop<NoopHandler>, f: impl FnOnce() -> R) -> R {
+        let mut state = DriverState {
+            driver: NonNull::from(&mut el.driver),
+            executor: NonNull::from(&mut el.executor),
+        };
+        let _guard = unsafe { set_driver_state_guarded(&mut state) };
+        f()
+    }
+
+    /// Give `el` a resolver pool of `threads` threads. Its answers go to a
+    /// channel nothing drains, so a request stays pending until its future
+    /// goes. The pool's threads hold `wake` open while they can still write
+    /// to it.
+    fn give_resolver(
+        el: &mut AsyncEventLoop<NoopHandler>,
+        threads: usize,
+        wake: &crate::wakeup::WakeHandle,
+    ) -> crossbeam_channel::Receiver<crate::resolver::ResolveResponse> {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        el.driver.resolve_tx = Some(tx);
+        el.driver.resolver = Some(Arc::new(crate::resolver::ResolverPool::start(
+            threads,
+            Arc::from(vec![wake.clone()]),
+        )));
+        rx
+    }
+
+    /// The same for the blocking pool.
+    fn give_blocking_pool(
+        el: &mut AsyncEventLoop<NoopHandler>,
+        threads: usize,
+        wake: &crate::wakeup::WakeHandle,
+    ) -> crossbeam_channel::Receiver<crate::blocking::BlockingResponse> {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        el.driver.blocking_tx = Some(tx);
+        el.driver.blocking_pool = Some(Arc::new(crate::blocking::BlockingPool::start(
+            threads,
+            Arc::from(vec![wake.clone()]),
+        )));
+        rx
+    }
+
     /// A resolve future dropped before its result arrives removes its
     /// `pending_resolves` entry: at once inside a task poll, and through the
     /// orphan queue outside one. A request the pool cannot take leaves no
@@ -1722,52 +1766,24 @@ mod tests {
     #[test]
     fn a_dropped_resolve_future_leaves_no_entry() {
         let config = test_config();
-        let (mut el, _wake) = test_loop(&config);
-        let (resolve_tx, _resolve_rx) = crossbeam_channel::unbounded();
-        el.driver.resolve_tx = Some(resolve_tx);
+        let (mut el, wake) = test_loop(&config);
 
-        // A pool with no threads cannot take the request, and the failed
-        // request leaves no entry.
-        el.driver.resolver = Some(Arc::new(crate::resolver::ResolverPool::start(
-            0,
-            Arc::from(Vec::new()),
-        )));
-        {
-            let mut state = DriverState {
-                driver: NonNull::from(&mut el.driver),
-                executor: NonNull::from(&mut el.executor),
-            };
-            let _guard = unsafe { set_driver_state_guarded(&mut state) };
-            assert!(crate::runtime::io::resolve("localhost", 80).is_err());
-        }
+        // A pool with no threads cannot take the request.
+        let _answers = give_resolver(&mut el, 0, &wake);
+        assert!(in_poll(&mut el, || crate::runtime::io::resolve("127.0.0.1", 80)).is_err());
         assert!(el.executor.pending_resolves.is_empty());
 
-        // One thread. Its answers go to `_resolve_rx`, which nothing drains,
-        // so a request stays pending until its future goes.
-        el.driver.resolver = Some(Arc::new(crate::resolver::ResolverPool::start(
-            1,
-            Arc::from(Vec::new()),
-        )));
+        let _answers = give_resolver(&mut el, 1, &wake);
         let start = |el: &mut AsyncEventLoop<NoopHandler>| {
-            let mut state = DriverState {
-                driver: NonNull::from(&mut el.driver),
-                executor: NonNull::from(&mut el.executor),
-            };
-            let _guard = unsafe { set_driver_state_guarded(&mut state) };
-            crate::runtime::io::resolve("localhost", 80).expect("resolve")
+            in_poll(el, || {
+                crate::runtime::io::resolve("127.0.0.1", 80).expect("resolve")
+            })
         };
 
         // Dropped inside a task poll.
         let resolving = start(&mut el);
         assert_eq!(el.executor.pending_resolves.len(), 1);
-        {
-            let mut state = DriverState {
-                driver: NonNull::from(&mut el.driver),
-                executor: NonNull::from(&mut el.executor),
-            };
-            let _guard = unsafe { set_driver_state_guarded(&mut state) };
-            drop(resolving);
-        }
+        in_poll(&mut el, || drop(resolving));
         assert!(el.executor.pending_resolves.is_empty());
 
         // Dropped outside one, as at connection teardown.
@@ -1780,6 +1796,57 @@ mod tests {
         );
         crate::fs::release_orphans(&mut el.driver, &mut el.executor);
         assert!(el.executor.pending_resolves.is_empty());
+    }
+
+    /// A `spawn_blocking` request the pool cannot take leaves no entry
+    /// (#582).
+    #[test]
+    fn a_failed_blocking_request_leaves_no_entry() {
+        let config = test_config();
+        let (mut el, wake) = test_loop(&config);
+        let _results = give_blocking_pool(&mut el, 0, &wake);
+        assert!(in_poll(&mut el, || crate::runtime::io::spawn_blocking(|| ())).is_err());
+        assert!(el.executor.pending_blocking.is_empty());
+    }
+
+    /// A resolve future or blocking handle dropped on a worker other than
+    /// the one that created it releases nothing. Request ids start at 0 on
+    /// every worker, so a release there would remove that worker's own,
+    /// unrelated request (#582).
+    #[test]
+    fn a_handle_dropped_on_another_worker_releases_nothing() {
+        let config = test_config();
+        let (mut first, first_wake) = test_loop(&config);
+        let _a = give_resolver(&mut first, 1, &first_wake);
+        let _b = give_blocking_pool(&mut first, 1, &first_wake);
+        let resolving = in_poll(&mut first, || {
+            crate::runtime::io::resolve("127.0.0.1", 80).expect("resolve")
+        });
+        let blocking = in_poll(&mut first, || {
+            crate::runtime::io::spawn_blocking(|| ()).expect("spawn_blocking")
+        });
+
+        // Registering the second worker makes it this thread's worker. Its
+        // own requests get the same ids as the first worker's.
+        let (mut second, second_wake) = test_loop(&config);
+        let _c = give_resolver(&mut second, 1, &second_wake);
+        let _d = give_blocking_pool(&mut second, 1, &second_wake);
+        let _own_resolving = in_poll(&mut second, || {
+            crate::runtime::io::resolve("127.0.0.1", 80).expect("resolve")
+        });
+        let _own_blocking = in_poll(&mut second, || {
+            crate::runtime::io::spawn_blocking(|| ()).expect("spawn_blocking")
+        });
+
+        in_poll(&mut second, || {
+            drop(resolving);
+            drop(blocking);
+        });
+        crate::fs::release_orphans(&mut second.driver, &mut second.executor);
+        assert_eq!(second.executor.pending_resolves.len(), 1);
+        assert_eq!(second.executor.pending_blocking.len(), 1);
+        assert_eq!(first.executor.pending_resolves.len(), 1);
+        assert_eq!(first.executor.pending_blocking.len(), 1);
     }
 
     /// [`test_loop`] with an acceptor channel, for the tests that drive

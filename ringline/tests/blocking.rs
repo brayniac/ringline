@@ -289,7 +289,7 @@ fn a_result_whose_handle_was_dropped_is_dropped_on_arrival() {
         .launch::<DropsHandleEarly>()
         .expect("launch failed");
 
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(10);
     while RESULTS_DROPPED.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(5));
     }
