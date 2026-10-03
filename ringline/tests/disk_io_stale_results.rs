@@ -3,9 +3,9 @@
 //!
 //! On io_uring the key is a subsystem tag, a 14-bit sequence and the slab
 //! index. The sequence repeats every 16,384 operations; with one operation
-//! in flight each reuses the same slab slot, so the key repeats exactly. A stale result under a read's key
-//! made the read's dropped future free its buffer at once, while the kernel
-//! could still write into it.
+//! in flight each reuses the same slab slot, so the key repeats exactly. A
+//! stale result under a read's key made the read's dropped future free its
+//! buffer at once, while the kernel could still write into it.
 //!
 //! Its own test binary: it installs a global allocator that counts frees of
 //! one distinctive allocation size. io_uring only: mio's sequence is 32-bit.
@@ -592,7 +592,7 @@ fn a_held_key_is_not_reused() {
         .launch::<HeldResult>()
         .expect("launch");
     for h in handles {
-        let _ = h.join();
+        h.join().expect("worker panicked").expect("worker failed");
     }
     let _ = std::fs::remove_dir_all(&dir);
     let outcome = HELD_OUTCOME

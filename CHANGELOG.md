@@ -247,18 +247,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
-- On io_uring, a `fs::read_into` or `fs::write_from` buffer could be freed
-  while the kernel could still be using it, and another disk-I/O future
-  could hang. The disk-I/O key, which the completion is matched by,
-  repeated every 65,536 operations, and results were stored under it with
-  nothing to say whose they were. A result left behind (by a future dropped
-  before it resolved, by an operation submitted through `DriverCtx` with no
-  future, or held by a future not yet polled) was taken as the completion
-  of a later operation under the same key. A key a future still holds is
-  now never handed out again, results are stored only for held keys, and a
-  dropped future gives up its key, including when a connection's task is
-  dropped at teardown. Keys also carry their subsystem (fs, direct I/O,
-  NVMe), and the sequence part now repeats every 16,384 operations (#574).
+- On io_uring, dropping a `fs::read_into` or `fs::write_from` future could
+  free its buffer while the kernel was still using it, and another disk-I/O
+  future could resolve with the wrong result or never resolve. A completion
+  is matched to its operation by a key that repeats, and a result nothing had
+  taken was taken by a later operation with the same key: one left by a
+  dropped future, by an NVMe or direct-I/O operation submitted through
+  `DriverCtx`, or by a future not yet polled. A key is now not reused while a
+  future holds it or, on mio, while its operation is still in the disk-I/O
+  pool, and a result is kept only while a future holds its key. A key
+  allocation that finds every key of its slab slot held fails with an error.
+  `DiskIoFuture`, `StatFuture`, `OpenFuture`, `ReadFuture` and `WriteFuture`
+  now panic if polled after returning `Ready` (#574).
 
 - A connection closed while its task awaited `fs::read_into` or
   `fs::write_from` leaked the operation's buffer for the life of the

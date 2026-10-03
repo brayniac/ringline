@@ -260,6 +260,11 @@ pub(crate) struct Driver {
     pub(crate) disk_io_pool: Option<Arc<DiskIoPool>>,
     /// Monotonic sequence counter for disk I/O requests.
     pub(crate) next_disk_io_seq: u32,
+    /// Keys of operations submitted to the disk-I/O pool whose response has
+    /// not been drained yet. Not reissued: with no slab slot to keep a key
+    /// busy, a dropped future's key would otherwise be handed out while its
+    /// operation still runs (#574).
+    pub(crate) disk_io_in_flight: std::collections::HashSet<u32>,
 
     // ── Direct I/O file management ──────────��───────────────────────
     /// Direct I/O file table (allocates file slots and generations).
@@ -446,6 +451,7 @@ impl Driver {
             disk_io_tx,
             disk_io_pool,
             next_disk_io_seq: 0,
+            disk_io_in_flight: std::collections::HashSet::new(),
             direct_io_files: config
                 .direct_io
                 .as_ref()
@@ -504,6 +510,7 @@ impl Driver {
             disk_io_tx: &self.disk_io_tx,
             wake_handle: self.wake_handle,
             next_disk_io_seq: &mut self.next_disk_io_seq,
+            disk_io_in_flight: &mut self.disk_io_in_flight,
             direct_io_files: &mut self.direct_io_files,
             direct_io_fds: &mut self.direct_io_fds,
             fs_files: &mut self.fs_files,

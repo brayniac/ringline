@@ -325,6 +325,7 @@ pub fn open(
             file_index,
             generation,
             done: false,
+            owner: crate::runtime::waker::current_worker(),
         })
     })
 }
@@ -353,6 +354,8 @@ pub struct OpenFuture {
     generation: u16,
     /// Set once `poll` has returned `Ready`: the caller owns the outcome.
     done: bool,
+    /// The worker whose executor holds `seq`.
+    owner: u32,
 }
 
 impl Future for OpenFuture {
@@ -385,7 +388,9 @@ impl Future for OpenFuture {
 
 impl Drop for OpenFuture {
     fn drop(&mut self) {
-        if self.done {
+        // Only the owning worker's executor holds `seq`. Dropped elsewhere
+        // (the future is `Send`), the file and its slot stay open there (#575).
+        if self.done || crate::runtime::waker::current_worker() != self.owner {
             return;
         }
         // Queued rather than handled here: a connection's task is dropped
@@ -589,6 +594,7 @@ pub fn read_into(file: File, offset: u64, mut buf: BytesMut) -> io::Result<ReadF
             file_index,
             initial_len,
             buf: Some(buf),
+            owner: crate::runtime::waker::current_worker(),
         })
     })
 }
@@ -630,6 +636,7 @@ pub fn write_from(file: File, offset: u64, buf: BytesMut) -> io::Result<WriteFut
             seq,
             file_index,
             buf: Some(buf),
+            owner: crate::runtime::waker::current_worker(),
         })
     })
 }
@@ -643,6 +650,8 @@ pub struct ReadFuture {
     file_index: u16,
     initial_len: usize,
     buf: Option<BytesMut>,
+    /// The worker whose executor holds `seq`.
+    owner: u32,
 }
 
 impl Future for ReadFuture {
@@ -650,6 +659,7 @@ impl Future for ReadFuture {
 
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
         let me = self.get_mut();
+        assert!(me.buf.is_some(), "ReadFuture polled after completion");
         with_state(|_driver, executor| {
             match executor.take_disk_io_result(me.seq) {
                 Some(result) if result < 0 => {
@@ -679,7 +689,7 @@ impl Future for ReadFuture {
 impl Drop for ReadFuture {
     fn drop(&mut self) {
         let Some(buf) = self.buf.take() else { return };
-        park_or_drop(self.seq, self.file_index, buf);
+        drop_buffer(self.owner, self.seq, self.file_index, buf);
     }
 }
 
@@ -691,6 +701,8 @@ pub struct WriteFuture {
     seq: u32,
     file_index: u16,
     buf: Option<BytesMut>,
+    /// The worker whose executor holds `seq`.
+    owner: u32,
 }
 
 impl Future for WriteFuture {
@@ -698,6 +710,7 @@ impl Future for WriteFuture {
 
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
         let me = self.get_mut();
+        assert!(me.buf.is_some(), "WriteFuture polled after completion");
         with_state(
             |_driver, executor| match executor.take_disk_io_result(me.seq) {
                 Some(result) if result < 0 => {
@@ -721,7 +734,19 @@ impl Future for WriteFuture {
 impl Drop for WriteFuture {
     fn drop(&mut self) {
         let Some(buf) = self.buf.take() else { return };
-        park_or_drop(self.seq, self.file_index, buf);
+        drop_buffer(self.owner, self.seq, self.file_index, buf);
+    }
+}
+
+/// Drop-side handler shared by [`ReadFuture`] and [`WriteFuture`]. Only the
+/// owning worker's executor tracks `seq`; dropped on another thread (the
+/// futures are `Send`), the operation may still be using `buf` and no
+/// executor here can park it, so it is leaked (#575).
+fn drop_buffer(owner: u32, seq: u32, file_index: u16, buf: BytesMut) {
+    if crate::runtime::waker::current_worker() == owner {
+        park_or_drop(seq, file_index, buf);
+    } else {
+        std::mem::forget(buf);
     }
 }
 
@@ -908,9 +933,9 @@ impl Drop for StatFuture {
 }
 
 /// Forget a disk-I/O operation whose future was dropped before it resolved,
-/// so its key and result are not held for the life of the worker (#574). Inside a
-/// task poll this calls [`Executor::abandon_disk_io`]; outside one (a
-/// connection's task dropped at teardown) it queues the key for
+/// so its key and result are not held for the life of the worker (#574).
+/// Inside a task poll this calls [`Executor::abandon_disk_io`]; outside one
+/// (a connection's task dropped at teardown) it queues the key for
 /// [`release_orphans`].
 ///
 /// [`Executor::abandon_disk_io`]: crate::runtime::Executor::abandon_disk_io

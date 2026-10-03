@@ -535,7 +535,8 @@ pub(crate) struct Executor {
     /// the entire op even after the future goes away. Buffers still here when
     /// the executor drops are leaked; see `impl Drop for Executor`.
     pub(crate) disk_io_graveyard: HashMap<u32, bytes::BytesMut>,
-    /// Filesystem stat results: maps disk-I/O key → Metadata (populated by handle_fs for Statx ops).
+    /// Filesystem stat results: maps disk-I/O key → Metadata (populated by
+    /// handle_fs for Statx ops).
     pub(crate) fs_stat_results: HashMap<u32, crate::fs::Metadata>,
     /// Disk I/O keys of opens whose `OpenFuture` was dropped before the open
     /// completed. The backend's completion handler closes the file and
@@ -879,11 +880,11 @@ impl Executor {
     ///
     /// If the key's buffer is in `disk_io_graveyard` (its future was dropped
     /// before the operation completed), frees the buffer and discards the
-    /// result. Otherwise stores the result, and wakes the waiting task, only
-    /// if a future holds the key ([`disk_io_key_held`]); the result of an
-    /// operation whose future was dropped, or that was submitted without one,
-    /// is discarded. Waiters and results are keyed by the disk-I/O key, not
-    /// the connection.
+    /// result. Otherwise, if a future holds the key ([`disk_io_key_held`]),
+    /// stores the result and wakes the waiting task; if not (its future was
+    /// dropped, or it was submitted without one), discards the result.
+    /// Waiters and results are keyed by the disk-I/O key, not the
+    /// connection.
     #[cfg_attr(not(has_io_uring), allow(dead_code))]
     pub(crate) fn wake_disk_io(&mut self, seq: u32, result: i32) {
         if self.disk_io_graveyard.remove(&seq).is_some() {

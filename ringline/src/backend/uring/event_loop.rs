@@ -14058,8 +14058,8 @@ mod tests {
         use crate::handler::DiskIoKind;
         let mut el = make_test_loop();
         let mut ctx = el.driver.make_ctx();
-        let k1 = ctx.disk_io_key(DiskIoKind::Fs, 3);
-        let k2 = ctx.disk_io_key(DiskIoKind::Fs, 3);
+        let k1 = ctx.disk_io_key(DiskIoKind::Fs, 3).unwrap();
+        let k2 = ctx.disk_io_key(DiskIoKind::Fs, 3).unwrap();
         assert_ne!(k1, k2, "same slab index must map to distinct keys");
         assert_eq!(k1 & 0xFFFF, 3, "low 16 bits must carry the slab index");
         assert_eq!(k2 & 0xFFFF, 3);
@@ -14067,12 +14067,12 @@ mod tests {
         // Slot 3 of each subsystem's slab, whatever the sequence: an fs
         // operation in flight never shares a key with a direct-I/O or NVMe
         // one, even when the sequence has come round to the same value.
-        let fs = ctx.disk_io_key(DiskIoKind::Fs, 3);
+        let fs = ctx.disk_io_key(DiskIoKind::Fs, 3).unwrap();
         for _ in 0..0x3FFF {
-            ctx.disk_io_key(DiskIoKind::Fs, 0);
+            ctx.disk_io_key(DiskIoKind::Fs, 0).unwrap();
         }
-        let dio = ctx.disk_io_key(DiskIoKind::DirectIo, 3);
-        let nvme = ctx.disk_io_key(DiskIoKind::Nvme, 3);
+        let dio = ctx.disk_io_key(DiskIoKind::DirectIo, 3).unwrap();
+        let nvme = ctx.disk_io_key(DiskIoKind::Nvme, 3).unwrap();
         assert_eq!(
             fs & 0x3FFF_FFFF,
             dio & 0x3FFF_FFFF,
