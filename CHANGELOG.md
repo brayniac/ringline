@@ -247,6 +247,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A connection's task is dropped outside any task poll when the connection
+  closes, and several futures it owned released nothing there:
+  - a `sleep` or `timeout` kept its timer slot, so enough connections closed
+    while waiting emptied the pool, after which `sleep` and `timeout` panic;
+  - a `process::Command::spawn` future whose result arrived later kept the
+    child's pidfd open;
+  - a `oneshot` or `mpsc` sender or receiver did not wake the task on the
+    other end, which saw the channel close only when something else polled
+    it;
+  - a `Child::wait` future left its waiter and result entries behind.
+
+  They now queue their release, or the wake, for the worker's next loop
+  iteration (#575).
+
 - On io_uring, dropping a `fs::read_into` or `fs::write_from` future could
   free its buffer while the kernel was still using it, and another disk-I/O
   future could resolve with the wrong result or never resolve. A completion

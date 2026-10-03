@@ -5938,39 +5938,43 @@ impl Future for SleepFuture {
 
 impl Drop for SleepFuture {
     fn drop(&mut self) {
-        if let Some(slot) = self.timer_slot {
-            // Timer was submitted but not yet fired — try to cancel it.
-            //
-            // If `CURRENT_DRIVER` is unset, the future is being dropped
-            // outside an active executor poll. This happens during normal
-            // worker teardown (the slab is dropped after the event loop
-            // exits, so `CURRENT_DRIVER` is no longer installed) and we
-            // can't do anything useful here — the io_uring instance is
-            // gone too. The timer slot is leaked from this worker's pool
-            // but the pool itself is being dropped, so no real leak.
-            let opt_non_null = CURRENT_DRIVER.with(|c| c.get());
-            if opt_non_null.is_none() {
-                return;
+        let Some(slot) = self.timer_slot else { return };
+        match CURRENT_DRIVER.with(|c| c.get()) {
+            Some(mut non_null) => {
+                let state = unsafe { non_null.as_mut() };
+                let driver = unsafe { &mut *state.driver.as_mut() };
+                let executor = unsafe { &mut *state.executor.as_mut() };
+                release_timer_slot(driver, executor, slot, self.generation);
             }
-            let mut non_null = opt_non_null.unwrap();
-            let state = unsafe { non_null.as_mut() };
-            #[cfg(has_io_uring)]
-            let driver = unsafe { &mut *state.driver.as_mut() };
-            let executor = unsafe { &mut *state.executor.as_mut() };
-
-            if !executor.timer_pool.is_fired(slot) {
-                #[cfg(has_io_uring)]
-                {
-                    let payload = TimerSlotPool::encode_payload(slot, self.generation);
-                    let target_ud = UserData::encode(OpTag::Timer, 0, payload);
-                    // Best effort cancel; timer fires harmlessly if already expired.
-                    let _ = driver.ring.submit_async_cancel(target_ud.raw(), 0);
-                }
-            }
-            // Slot released regardless — stale timer CQE detected via generation.
-            executor.timer_pool.release(slot);
+            // Outside a task poll: a connection's task dropped at teardown.
+            None => crate::runtime::defer_release(crate::runtime::Orphan::TimerSlot {
+                slot,
+                generation: self.generation,
+            }),
         }
     }
+}
+
+/// Release a sleep's timer slot, cancelling its timer first if it has not
+/// fired. A timer CQE that arrives after the slot is reused is told apart by
+/// its generation.
+#[cfg_attr(not(has_io_uring), allow(unused_variables))]
+pub(crate) fn release_timer_slot(
+    driver: &mut crate::backend::Driver,
+    executor: &mut crate::runtime::Executor,
+    slot: u32,
+    generation: u16,
+) {
+    if !executor.timer_pool.is_fired(slot) {
+        #[cfg(has_io_uring)]
+        {
+            let payload = TimerSlotPool::encode_payload(slot, generation);
+            let target_ud = UserData::encode(OpTag::Timer, 0, payload);
+            // Best effort cancel; timer fires harmlessly if already expired.
+            let _ = driver.ring.submit_async_cancel(target_ud.raw(), 0);
+        }
+    }
+    executor.timer_pool.release(slot);
 }
 
 /// Create a sleep future, returning an error if the timer pool is exhausted.

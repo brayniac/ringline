@@ -109,10 +109,14 @@ impl Drop for WaitFuture {
     fn drop(&mut self) {
         // Deregister so an abandoned wait (select/timeout loser) doesn't
         // leave a stale waiter/result entry behind forever.
-        let _ = try_with_state(|_driver, executor| {
+        let released = try_with_state(|_driver, executor| {
             executor.pidfd_waiters.remove(&self.seq);
             executor.pidfd_results.remove(&self.seq);
         });
+        // Outside a task poll: a connection's task dropped at teardown.
+        if released.is_none() {
+            crate::runtime::defer_release(crate::runtime::Orphan::Wait(self.seq));
+        }
     }
 }
 
@@ -273,9 +277,13 @@ impl Drop for SpawnFuture {
         // must not leak its map entry. Removing the entry drops a response
         // that already arrived, which closes its pidfd; one that arrives later
         // finds no entry and is dropped on delivery.
-        let _ = try_with_state(|_driver, executor| {
+        let released = try_with_state(|_driver, executor| {
             executor.pending_spawns.remove(&self.request_id);
         });
+        // Outside a task poll: a connection's task dropped at teardown.
+        if released.is_none() {
+            crate::runtime::defer_release(crate::runtime::Orphan::Spawn(self.request_id));
+        }
     }
 }
 

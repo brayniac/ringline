@@ -449,6 +449,10 @@ pub(crate) fn release_orphans(
     driver: &mut crate::backend::Driver,
     executor: &mut crate::runtime::Executor,
 ) {
+    // Timer slots, spawns and pidfd waits of futures dropped outside the
+    // executor (#575).
+    crate::runtime::release_orphans(driver, executor);
+
     let keys = ORPHANED_KEYS.with(|orphans| std::mem::take(&mut *orphans.borrow_mut()));
     for seq in keys {
         executor.abandon_disk_io(seq);

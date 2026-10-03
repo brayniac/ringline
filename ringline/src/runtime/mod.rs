@@ -420,6 +420,52 @@ thread_local! {
         std::cell::RefCell::new(std::collections::HashSet::new());
 }
 
+/// Something a future owned by a connection's task must release when the
+/// task is dropped at connection teardown, outside any task poll, where the
+/// driver is not reachable (#575).
+pub(crate) enum Orphan {
+    /// A `SleepFuture`'s timer slot.
+    TimerSlot { slot: u32, generation: u16 },
+    /// A `SpawnFuture`'s `pending_spawns` entry, and with it a delivered
+    /// child's pidfd.
+    Spawn(u64),
+    /// A `WaitFuture`'s `pidfd_waiters` and `pidfd_results` entries.
+    Wait(u32),
+}
+
+thread_local! {
+    // Released by `release_orphans` on this worker's next loop iteration.
+    static ORPHANS: std::cell::RefCell<Vec<Orphan>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Queue `orphan` for release on this worker's next loop iteration. At
+/// worker exit, when the queue is gone, there is nothing left to release
+/// into.
+pub(crate) fn defer_release(orphan: Orphan) {
+    let _ = ORPHANS.try_with(|orphans| orphans.borrow_mut().push(orphan));
+}
+
+/// Release what futures dropped outside the executor queued with
+/// [`defer_release`].
+pub(crate) fn release_orphans(driver: &mut crate::backend::Driver, executor: &mut Executor) {
+    let orphans = ORPHANS.with(|orphans| std::mem::take(&mut *orphans.borrow_mut()));
+    for orphan in orphans {
+        match orphan {
+            Orphan::TimerSlot { slot, generation } => {
+                io::release_timer_slot(driver, executor, slot, generation);
+            }
+            Orphan::Spawn(request_id) => {
+                executor.pending_spawns.remove(&request_id);
+            }
+            Orphan::Wait(seq) => {
+                executor.pidfd_waiters.remove(&seq);
+                executor.pidfd_results.remove(&seq);
+            }
+        }
+    }
+}
+
 /// Whether a future on this worker holds the disk-I/O key `key`.
 pub(crate) fn disk_io_key_held(key: u32) -> bool {
     DISK_IO_LIVE.with(|live| live.borrow().contains(&key))

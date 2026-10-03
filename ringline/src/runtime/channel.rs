@@ -21,14 +21,18 @@ use std::task::{Context, Poll};
 use super::CURRENT_TASK_ID;
 use super::io::try_with_state;
 
-/// Wake a task if a waiter is registered. Handles the case where we're
-/// called outside the executor (e.g. in a unit test or during drop after
-/// shutdown) by silently doing nothing.
+/// Wake a task if a waiter is registered. Outside a task poll (a sender or
+/// receiver dropped with its connection's task) the id goes on this
+/// worker's ready queue, which the executor drains on its next iteration;
+/// the channel is `!Send`, so this is the waiter's worker (#575).
 fn wake_waiter(waiter: Option<u32>) {
     if let Some(id) = waiter {
-        try_with_state(|_driver, executor| {
+        let woken = try_with_state(|_driver, executor| {
             executor.wake_task(id);
         });
+        if woken.is_none() {
+            let _ = super::waker::READY_QUEUE.try_with(|q| q.borrow_mut().push_back(id));
+        }
     }
 }
 
