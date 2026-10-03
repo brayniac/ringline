@@ -59,6 +59,7 @@ struct EchoCfg {
     conn_chunk_size: usize,
     pin_to_core: bool,
     prefault_buffers: bool,
+    iowq_max_workers: Option<u32>,
     accept_mode: AcceptModeArg,
     /// Offer every connection for park after each response.
     park: bool,
@@ -366,6 +367,13 @@ struct Args {
     #[arg(long, default_value_t = false)]
     prefault_buffers: bool,
 
+    /// (ringline echo) Cap each worker's bounded io-wq pool
+    /// (`ConfigBuilder::iowq_max_workers`; 0 leaves the kernel default).
+    /// Omitted, ringline's default applies. The knob under measurement in
+    /// #584.
+    #[arg(long)]
+    iowq_max_workers: Option<u32>,
+
     /// Restrict the whole process to these logical CPUs, e.g. `0-7,16-23` or
     /// `12,13,14,15` (the "taskset the task" model). When set, the process
     /// affinity mask is applied before launch and ringline's per-worker core
@@ -508,6 +516,7 @@ fn main() {
             recv_buffer_bytes: args.recv_buffer_bytes,
             recv_ring_size: args.recv_ring_size,
             prefault_buffers: args.prefault_buffers,
+            iowq_max_workers: args.iowq_max_workers,
             echo_mode: if args.recv_forward {
                 EchoMode::RecvForward
             } else {
@@ -711,6 +720,7 @@ fn run_ringline(cfg: EchoCfg) {
         conn_chunk_size,
         pin_to_core,
         prefault_buffers,
+        iowq_max_workers,
         accept_mode,
         park,
         park_imbalance_ms,
@@ -866,6 +876,10 @@ fn run_ringline(cfg: EchoCfg) {
         .conn_chunk_size(conn_chunk_size)
         .accept_mode(accept_mode.into())
         .tick_timeout_us(tick_timeout_us);
+    let staged = match iowq_max_workers {
+        Some(n) => staged.iowq_max_workers(n),
+        None => staged,
+    };
     // `direct` echoes the bytes as they arrived, straight from the CQE
     // handler. Under TLS those bytes are ciphertext, so the server would
     // reflect the client's own ciphertext instead of re-encrypting plaintext —

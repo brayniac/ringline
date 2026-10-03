@@ -1609,6 +1609,7 @@ dependencies = [
 name = "ringline-bench"
 version = "0.2.0"
 dependencies = [
+ "bytes",
  "clap",
  "libc",
  "metriken",

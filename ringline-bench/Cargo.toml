@@ -30,6 +30,10 @@ name = "connect-bench"
 path = "src/bin/connect-bench.rs"
 
 [[bin]]
+name = "close-latency"
+path = "src/bin/close-latency.rs"
+
+[[bin]]
 name = "proxy-load"
 path = "src/bin/proxy-load.rs"
 
@@ -61,6 +65,7 @@ serde_json = "1"
 metriken = "0.9"
 libc = { workspace = true }
 clap = { version = "4", features = ["derive"] }
+bytes = { workspace = true }
 # For the connect-rate arm: a self-signed cert generated at startup, so nothing
 # has to be staged onto a guest.
 rustls = { workspace = true, features = ["ring", "std"] }
