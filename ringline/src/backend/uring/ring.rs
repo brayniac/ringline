@@ -3,7 +3,7 @@ use std::os::fd::RawFd;
 
 use io_uring::cqueue;
 use io_uring::squeue;
-use io_uring::types::{DestinationSlot, Fd, Fixed};
+use io_uring::types::{self, DestinationSlot, Fd, Fixed};
 use io_uring::{IoUring, opcode};
 
 use crate::backend::ProvidedBufRing;
@@ -23,13 +23,36 @@ const FIXED_FILES_RELEASED_PER_FILE_SINCE: KernelVersion = KernelVersion {
     minor: 13,
 };
 
-/// Whether a connection's `Close` needs a `shutdown` linked ahead of it to
-/// send the FIN promptly: before Linux 6.13, or on a kernel whose version is
-/// unknown. From 6.13 the `Close` sends the FIN once the connection's own
-/// recv is cancelled, and skipping the shutdown keeps closes off the io-wq
-/// pool that blocking file I/O also uses (#586).
-pub(crate) fn close_needs_shutdown(kernel: Option<KernelVersion>) -> bool {
-    kernel.is_none_or(|k| k < FIXED_FILES_RELEASED_PER_FILE_SINCE)
+/// What is hard-linked ahead of a connection's `Close`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CloseLead {
+    /// The `Close` alone: a socket handed to another worker, which must stay
+    /// open, or a close at worker exit, where the ring's teardown releases
+    /// the socket.
+    Nothing,
+    /// `shutdown(SHUT_RDWR)`, before Linux 6.13. Requests on any connection
+    /// can hold the socket open after the `Close`; the shutdown queues the
+    /// FIN regardless, and ends this connection's own requests. It runs on
+    /// the bounded io-wq pool (#581, #586).
+    Shutdown,
+    /// Cancel every request on the connection's fixed file, from Linux 6.13.
+    /// Only this connection's requests hold the socket open, so the `Close`
+    /// sends the FIN once they have ended. The cancel runs inline (#586).
+    CancelAll,
+}
+
+/// The [`CloseLead`] for a connection close on `kernel`: [`Shutdown`] before
+/// Linux 6.13 or on a kernel whose version is unknown, [`CancelAll`] from
+/// 6.13.
+///
+/// [`Shutdown`]: CloseLead::Shutdown
+/// [`CancelAll`]: CloseLead::CancelAll
+pub(crate) fn close_lead_for(kernel: Option<KernelVersion>) -> CloseLead {
+    if kernel.is_none_or(|k| k < FIXED_FILES_RELEASED_PER_FILE_SINCE) {
+        CloseLead::Shutdown
+    } else {
+        CloseLead::CancelAll
+    }
 }
 
 /// Wrapper around IoUring providing high-level SQE submission helpers.
@@ -61,9 +84,9 @@ pub struct Ring {
     /// This opcode is the only way to get one back, so it decides whether
     /// park is available at all. See [`Ring::supports_park`].
     fixed_fd_install: bool,
-    /// Whether a connection's `Close` needs a `shutdown` linked ahead of it
-    /// to send the FIN promptly. See [`close_needs_shutdown`].
-    close_needs_shutdown: bool,
+    /// What goes ahead of a connection's `Close` on this kernel. See
+    /// [`close_lead_for`].
+    close_lead: CloseLead,
     /// Test-only: number of upcoming `push_sqe`/`push_sqe128` calls that
     /// fail as if the SQ were still full after a submit. See
     /// [`Ring::force_push_failures`].
@@ -146,7 +169,7 @@ impl Ring {
             chain_scratch: Vec::new(),
             defer_taskrun: !config.sqpoll,
             fixed_fd_install,
-            close_needs_shutdown: close_needs_shutdown(KernelVersion::current()),
+            close_lead: Self::close_lead_from(config),
             #[cfg(test)]
             forced_push_failures: 0,
         })
@@ -168,10 +191,19 @@ impl Ring {
         self.fixed_fd_install
     }
 
-    /// Whether a connection's `Close` needs a `shutdown` linked ahead of it on
-    /// the running kernel. See [`close_needs_shutdown`].
-    pub(crate) fn close_needs_shutdown(&self) -> bool {
-        self.close_needs_shutdown
+    /// What goes ahead of a connection's `Close` on the running kernel. See
+    /// [`close_lead_for`].
+    pub(crate) fn close_lead(&self) -> CloseLead {
+        self.close_lead
+    }
+
+    fn close_lead_from(config: &Config) -> CloseLead {
+        #[cfg(test)]
+        if let Some(lead) = config.close_lead_override {
+            return lead;
+        }
+        let _ = config;
+        close_lead_for(KernelVersion::current())
     }
 
     /// Re-probe an arbitrary opcode. Exists so tests can establish that the
@@ -692,32 +724,36 @@ impl Ring {
     }
 
     /// Submit a close for a direct file descriptor.
-    pub fn submit_close(&mut self, conn_index: u32, shut_down: bool) -> io::Result<()> {
+    pub fn submit_close(&mut self, conn_index: u32, lead: CloseLead) -> io::Result<()> {
         let user_data = UserData::encode(OpTag::Close, conn_index, 0);
         let close = opcode::Close::new(Fixed(conn_index))
             .build()
             .user_data(user_data.raw());
-        if !shut_down {
-            unsafe {
-                self.push_sqe(&close)?;
+        // A socket removed from the fixed-file table stays open until the
+        // requests holding it complete: before Linux 6.13, earlier requests
+        // on any registered file or buffer; from 6.13, this connection's own
+        // requests. See `CloseLead`. The lead is hard-linked, so the Close
+        // runs after it even when it fails, and `push_sqe_pair` pushes both
+        // together, so a submit cannot separate them; config validation
+        // guarantees an SQ of at least two entries.
+        let first = match lead {
+            CloseLead::Nothing => {
+                unsafe {
+                    self.push_sqe(&close)?;
+                }
+                return Ok(());
             }
-            return Ok(());
-        }
-        // Before Linux 6.13, a socket removed from the fixed-file table stays
-        // open until earlier requests that use a registered file or buffer
-        // complete. Those include other connections' requests, such as a
-        // multishot recv. The caller asks for the shutdown only on such a
-        // kernel (`close_needs_shutdown`). `shutdown` queues a FIN behind any
-        // unsent data,
-        // whether or not the socket has been released. Hard-linked, so the
-        // Close runs after the shutdown even when the shutdown fails.
-        // `push_sqe_pair` pushes both together, so a submit cannot separate
-        // them; config validation guarantees an SQ of at least two entries.
-        let shutdown = opcode::Shutdown::new(Fixed(conn_index), libc::SHUT_RDWR)
-            .build()
-            .flags(squeue::Flags::IO_HARDLINK)
-            .user_data(UserData::encode(OpTag::CloseShutdown, conn_index, 0).raw());
-        unsafe { self.push_sqe_pair(shutdown.into(), close.into()) }
+            CloseLead::Shutdown => opcode::Shutdown::new(Fixed(conn_index), libc::SHUT_RDWR)
+                .build()
+                .user_data(UserData::encode(OpTag::CloseShutdown, conn_index, 0).raw()),
+            CloseLead::CancelAll => {
+                opcode::AsyncCancel2::new(types::CancelBuilder::fd(Fixed(conn_index)).all())
+                    .build()
+                    .user_data(UserData::encode(OpTag::CloseCancel, conn_index, 0).raw())
+            }
+        };
+        let first = first.flags(squeue::Flags::IO_HARDLINK);
+        unsafe { self.push_sqe_pair(first.into(), close.into()) }
     }
 
     /// Submit an async connect for a direct file descriptor.
@@ -1541,26 +1577,23 @@ mod tests {
         assert_eq!(ring.iowq_max_workers().expect("query")[0], kernel_default());
     }
 
-    /// The shutdown goes ahead of a close before 6.13 and on an unknown
-    /// kernel, and not from 6.13 (#586).
+    /// A shutdown goes ahead of a close before 6.13 and on an unknown kernel,
+    /// a cancel of the connection's requests from 6.13 (#586).
     #[test]
-    fn a_close_needs_a_shutdown_before_6_13() {
+    fn a_close_leads_with_a_shutdown_before_6_13_and_a_cancel_after() {
         let k = |major, minor| Some(KernelVersion { major, minor });
-        assert!(close_needs_shutdown(k(6, 1)));
-        assert!(close_needs_shutdown(k(6, 12)));
-        assert!(!close_needs_shutdown(k(6, 13)));
-        assert!(!close_needs_shutdown(k(7, 1)));
-        assert!(close_needs_shutdown(None));
+        assert_eq!(close_lead_for(k(6, 1)), CloseLead::Shutdown);
+        assert_eq!(close_lead_for(k(6, 12)), CloseLead::Shutdown);
+        assert_eq!(close_lead_for(k(6, 13)), CloseLead::CancelAll);
+        assert_eq!(close_lead_for(k(7, 1)), CloseLead::CancelAll);
+        assert_eq!(close_lead_for(None), CloseLead::Shutdown);
     }
 
     /// The ring decides from the running kernel.
     #[test]
-    fn the_ring_decides_the_shutdown_from_the_running_kernel() {
+    fn the_ring_decides_the_close_lead_from_the_running_kernel() {
         let ring = ring_with(None);
-        assert_eq!(
-            ring.close_needs_shutdown(),
-            close_needs_shutdown(KernelVersion::current())
-        );
+        assert_eq!(ring.close_lead(), close_lead_for(KernelVersion::current()));
     }
 
     /// A cap of 0 registers nothing.

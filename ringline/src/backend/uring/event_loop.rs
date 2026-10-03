@@ -1331,6 +1331,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // nothing: `ENOTCONN` when the socket is already in `TCP_CLOSE`
             // (reset, failed connect, or both FINs exchanged).
             OpTag::CloseShutdown => {}
+            // Ignored likewise: the `Close` CQE releases the slot, and the
+            // cancelled requests' own CQEs pass the usual stale-completion
+            // checks.
+            OpTag::CloseCancel => {}
             OpTag::EventFdRead => self.handle_eventfd_read(),
             OpTag::TlsSend => self.handle_tls_send(ud, result),
             OpTag::Connect => self.handle_connect(ud, result),
@@ -5533,13 +5537,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
         let retries = std::mem::take(&mut self.driver.pending_close_retries);
         for (conn_index, retry) in retries {
-            let shut_down = self.driver.close_shuts_down(conn_index);
-            if self
-                .driver
-                .ring
-                .submit_close(conn_index, shut_down)
-                .is_err()
-            {
+            let lead = self.driver.close_lead(conn_index);
+            if self.driver.ring.submit_close(conn_index, lead).is_err() {
                 self.driver
                     .pending_close_retries
                     .push((conn_index, retry.saturating_add(1)));
@@ -6795,16 +6794,111 @@ mod tests {
         );
     }
 
+    /// Whether a forced close (`force_finalize_close`, as when a TLS
+    /// close_notify deadline passes) of a connection with a send stuck in the
+    /// kernel, with `lead` ahead of its `Close`, releases the socket. The
+    /// stuck send holds the socket until something ends it; the peer never
+    /// reads, and sees a hang-up only once the socket is released (#586).
+    fn forced_close_releases_a_stuck_send(lead: crate::backend::uring::ring::CloseLead) -> bool {
+        use std::os::fd::AsRawFd;
+        let mut config = test_config();
+        config.close_lead_override = Some(lead);
+        let mut el = make_test_loop_with_config(config);
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let token = crate::handler::ConnToken::new(conn_index, generation);
+        let (ours, peer) = attach_socketpair(&mut el, conn_index);
+        // A small send buffer, so a 16 KiB send cannot complete while the
+        // peer does not read. Then only the fixed slot holds our end.
+        let small: libc::c_int = 4096;
+        unsafe {
+            libc::setsockopt(
+                ours.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                &small as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+        drop(ours);
+
+        {
+            let mut ctx = el.driver.make_ctx();
+            ctx.send(token, &[7u8; 16384]).expect("send");
+        }
+        el.driver.ring.submit_and_get_events().expect("submit");
+        el.drain_completions();
+        assert!(
+            el.driver.send_queues[conn_index as usize].in_flight,
+            "the send must still be in the kernel"
+        );
+
+        // Request the close, then give up on the send.
+        el.driver.close_connection(conn_index);
+        el.driver.force_finalize_close(conn_index);
+        let pending = std::mem::take(&mut el.driver.pending_finalize_closes);
+        for c in pending {
+            el.driver.try_finalize_close(c);
+        }
+        for _ in 0..10 {
+            el.driver.ring.submit_and_wait(1).expect("submit the close");
+            el.drain_completions();
+            if el.driver.connections.get(conn_index).is_none() {
+                break;
+            }
+        }
+        assert!(
+            el.driver.connections.get(conn_index).is_none(),
+            "the slot was released"
+        );
+
+        let mut pfd = libc::pollfd {
+            fd: peer.as_raw_fd(),
+            events: libc::POLLRDHUP,
+            revents: 0,
+        };
+        let n = unsafe { libc::poll(&mut pfd, 1, 1000) };
+        n > 0 && pfd.revents & (libc::POLLRDHUP | libc::POLLHUP) != 0
+    }
+
+    #[test]
+    fn a_forced_close_led_by_a_cancel_releases_a_stuck_send() {
+        assert!(forced_close_releases_a_stuck_send(
+            crate::backend::uring::ring::CloseLead::CancelAll
+        ));
+    }
+
+    #[test]
+    fn a_forced_close_led_by_a_shutdown_releases_a_stuck_send() {
+        assert!(forced_close_releases_a_stuck_send(
+            crate::backend::uring::ring::CloseLead::Shutdown
+        ));
+    }
+
+    /// The control: with nothing ahead of the `Close`, the stuck send holds
+    /// the socket open.
+    #[test]
+    fn a_forced_close_led_by_nothing_leaves_a_stuck_send_holding_the_socket() {
+        assert!(!forced_close_releases_a_stuck_send(
+            crate::backend::uring::ring::CloseLead::Nothing
+        ));
+    }
+
     /// Committing a parked connection's close does not shut its socket down:
     /// the socket now belongs to another worker, through the installed fd.
-    /// Other closes send a shutdown ahead of the `Close` (#581), so
+    /// Before Linux 6.13, other closes send a shutdown ahead of the `Close`
+    /// (#581), so
     /// this test checks that the park path sets `socket_handed_off`.
     #[test]
     fn closing_a_parked_slot_leaves_the_handed_off_socket_open() {
         use std::io::{Read, Write};
         use std::os::fd::{AsRawFd, IntoRawFd};
 
-        let mut el = make_test_loop();
+        // A shutdown lead, whatever the running kernel, so the test guards
+        // the `socket_handed_off` check on every kernel.
+        let mut config = test_config();
+        config.close_lead_override = Some(crate::backend::uring::ring::CloseLead::Shutdown);
+        let mut el = make_test_loop_with_config(config);
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
 

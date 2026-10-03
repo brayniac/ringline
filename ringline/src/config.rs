@@ -74,6 +74,11 @@ pub struct Config {
     /// Upper bound on each worker's bounded io-wq pool; 0 (the default)
     /// leaves the kernel's limit.
     pub(crate) iowq_max_workers: u32,
+    /// Test-only: what goes ahead of a connection's `Close`, in place of the
+    /// running kernel's choice, so either kernel's close path can be tested
+    /// on one host.
+    #[cfg(all(test, has_io_uring))]
+    pub(crate) close_lead_override: Option<crate::backend::uring::ring::CloseLead>,
     /// Recv buffer configuration (provided buffer ring) for TCP multishot recv.
     pub(crate) recv_buffer: RecvBufferConfig,
     /// Recv buffer configuration for UDP multishot recvmsg.
@@ -430,6 +435,8 @@ impl Default for Config {
             sqpoll_idle_ms: 1000,
             sqpoll_cpu: None,
             iowq_max_workers: 0,
+            #[cfg(all(test, has_io_uring))]
+            close_lead_override: None,
             recv_buffer: RecvBufferConfig::default(),
             udp_recv_buffer: RecvBufferConfig {
                 ring_size: 128,
@@ -943,7 +950,7 @@ impl ConfigBuilder {
     /// The kernel runs work it cannot complete inline on io-wq threads. In
     /// the bounded pool that is regular-file I/O that would block, such as
     /// `fs::fsync`, and, before Linux 6.13, the `shutdown` sent ahead of
-    /// every connection close (#581). Past the cap, work waits for a free thread. A cap at
+    /// each connection close (#581). Past the cap, work waits for a free thread. A cap at
     /// or below a worker's concurrent blocking file I/O therefore delays its
     /// connection closes on those kernels: with 32 `fsync` loops on one worker, a cap of 16
     /// raised the median wait for a closed connection's EOF from 0.2 ms to
