@@ -271,8 +271,8 @@ impl SendCapacityQueue {
     /// or `Aborted`: removed, result discarded (a driver result that arrives
     /// afterwards finds no entry and is ignored). Unknown: ignored.
     ///
-    /// Called from PR 9's `Drop` via `try_with_state`. A drop outside the
-    /// executor skips this, as it does for every other future in the crate;
+    /// Called from `BackpressuredSendFuture`'s `Drop` via `try_with_state`. A
+    /// drop outside the executor skips this;
     /// [`remove_connection`](Self::remove_connection) is the backstop.
     pub(crate) fn cancel(&mut self, id: BoundedSendId) -> Option<u32> {
         if let Some(pos) = self.waiting.iter().position(|w| w.id == id) {

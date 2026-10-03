@@ -435,11 +435,14 @@ impl Drop for OrphanedBuffers {
     }
 }
 
-/// Release what dropped fs futures queued: drop abandoned operations'
-/// results, or stop tracking their keys so the results are discarded on
-/// arrival; close the files of abandoned opens and free their slots; and park
-/// or drop the buffers of abandoned reads and writes. Called by the event
-/// loop once per iteration, after its first task-poll pass.
+/// Release what futures dropped outside the executor queued. First the
+/// timer slots, spawns, pidfd waits and connects queued by
+/// [`crate::runtime::defer_release`]; then what dropped fs futures queued:
+/// drop abandoned operations' results, or stop tracking their keys so the
+/// results are discarded on arrival; close the files of abandoned opens and
+/// free their slots; and park or drop the buffers of abandoned reads and
+/// writes. Called by the event loop at the start of every task-poll pass,
+/// after the first pass, and before the worker waits for I/O.
 ///
 /// An open that has completed is closed now. One still in flight is marked in
 /// `abandoned_fs_opens`, and its completion handler closes it. A buffer whose
@@ -449,6 +452,10 @@ pub(crate) fn release_orphans(
     driver: &mut crate::backend::Driver,
     executor: &mut crate::runtime::Executor,
 ) {
+    // Timer slots, spawns, pidfd waits and connects of futures dropped
+    // outside the executor (#575).
+    crate::runtime::release_orphans(driver, executor);
+
     let keys = ORPHANED_KEYS.with(|orphans| std::mem::take(&mut *orphans.borrow_mut()));
     for seq in keys {
         executor.abandon_disk_io(seq);

@@ -247,6 +247,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A connection's task is dropped outside any task poll when the connection
+  closes, and several futures it owned released nothing there:
+  - a `sleep` or `timeout` kept its timer slot, so enough connections closed
+    while waiting emptied the pool, after which `sleep` and `timeout` panic;
+  - a `process::Command::spawn` future whose result arrived later kept the
+    child's pidfd open;
+  - a `oneshot` or `mpsc` sender, or an `mpsc` receiver or pending send,
+    did not wake the task waiting on the other end, which saw the channel
+    close only when something else polled it;
+  - a `Child::wait` future left its waiter and result entries behind;
+  - an outbound `connect` future left its connection established with no
+    task to use it, until the peer closed it.
+
+  They now queue their release, or the wake, and the event loop applies it
+  before its next task-poll pass or before it waits for I/O. On mio, an
+  outbound TCP or TLS connect that completes with no `ConnectFuture`
+  waiting is now closed, as on io_uring; this includes a connect started
+  with `DriverCtx::connect`. A child that exits after its `wait` future was
+  dropped no longer leaves a result entry behind (#575).
+
 - On io_uring, dropping a `fs::read_into` or `fs::write_from` future could
   free its buffer while the kernel was still using it, and another disk-I/O
   future could resolve with the wrong result or never resolve. A completion

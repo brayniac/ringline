@@ -5678,7 +5678,12 @@ enum ConnectState {
         timeout: Option<Duration>,
     },
     /// The connect is in the kernel; waiting for its completion.
-    Waiting { conn_index: u32, generation: u32 },
+    Waiting {
+        conn_index: u32,
+        generation: u32,
+        /// The worker whose connection table holds `conn_index`.
+        owner: u32,
+    },
     /// Resolved, or failed before submitting. Holds no slot.
     Done,
 }
@@ -5736,6 +5741,7 @@ impl Future for ConnectFuture {
                             this.state = ConnectState::Waiting {
                                 conn_index: pair.0,
                                 generation: pair.1,
+                                owner: crate::runtime::waker::current_worker(),
                             };
                             pair
                         }
@@ -5748,6 +5754,7 @@ impl Future for ConnectFuture {
                 ConnectState::Waiting {
                     conn_index,
                     generation,
+                    ..
                 } => (*conn_index, *generation),
                 ConnectState::Done => {
                     return Poll::Ready(Err(io::Error::other(
@@ -5797,29 +5804,58 @@ impl Drop for ConnectFuture {
         // `Unsubmitted` and `Done` hold no slot: an unpolled future never
         // reached the driver, and a resolved future has either handed its slot
         // to the `Connection` or failed without one.
-        let (conn_index, generation) = match self.state {
+        let (conn_index, generation, owner) = match self.state {
             ConnectState::Waiting {
                 conn_index,
                 generation,
-            } => (conn_index, generation),
+                owner,
+            } => (conn_index, generation, owner),
             _ => return,
         };
-        let opt_non_null = CURRENT_DRIVER.with(|c| c.get());
-        if opt_non_null.is_none() {
+        // Only the owning worker's table holds the slot. Dropped elsewhere
+        // (the future is `Send`), the connection stays there.
+        if crate::runtime::waker::current_worker() != owner {
             return;
         }
-        let mut non_null = opt_non_null.unwrap();
-        let state = unsafe { non_null.as_mut() };
-        let driver = unsafe { &mut *state.driver.as_mut() };
-        // Don't clear another connection's waiter flag if the slot has
-        // already been reused. (Quite rare for connect: drop usually
-        // happens before any close/reuse cycle on the same slot, but
-        // belt-and-suspenders.)
-        if driver.connections.generation(conn_index) != generation {
-            return;
+        match CURRENT_DRIVER.with(|c| c.get()) {
+            Some(mut non_null) => {
+                let state = unsafe { non_null.as_mut() };
+                let driver = unsafe { &mut *state.driver.as_mut() };
+                let executor = unsafe { &mut *state.executor.as_mut() };
+                release_connect(driver, executor, conn_index, generation);
+            }
+            // Outside a task poll (a connection's task dropped at teardown).
+            None => crate::runtime::defer_release(crate::runtime::Orphan::Connect {
+                conn_index,
+                generation,
+            }),
         }
-        let executor = unsafe { &mut *state.executor.as_mut() };
-        executor.connect_waiters[conn_index as usize] = false;
+    }
+}
+
+/// Give up an outbound connection whose `ConnectFuture` was dropped before it
+/// resolved. Still connecting: clear the waiter, and the completion handler
+/// closes the connection when the connect completes. Already connected (the
+/// future had not been polled since): close it now, since no task will.
+pub(crate) fn release_connect(
+    driver: &mut crate::backend::Driver,
+    executor: &mut crate::runtime::Executor,
+    conn_index: u32,
+    generation: u32,
+) {
+    // The slot may already hold another connection.
+    if driver.connections.generation(conn_index) != generation {
+        return;
+    }
+    let idx = conn_index as usize;
+    executor.connect_waiters[idx] = false;
+    executor.io_results[idx] = None;
+    let open = driver
+        .connections
+        .get(conn_index)
+        .is_some_and(|c| c.lifecycle == crate::connection::Lifecycle::Open);
+    if open {
+        driver.close_connection(conn_index);
     }
 }
 
@@ -5827,7 +5863,7 @@ impl Drop for ConnectFuture {
 
 /// Create a future that completes after the given duration.
 ///
-/// Uses an io_uring timeout SQE internally — no busy-waiting, no timer
+/// On io_uring, uses a timeout SQE internally — no busy-waiting, no timer
 /// thread. The timer fires on the same worker thread as the calling task.
 ///
 /// # Panics
@@ -5838,6 +5874,7 @@ pub fn sleep(duration: Duration) -> SleepFuture {
     SleepFuture {
         duration,
         timer_slot: None,
+        owner: 0,
         generation: 0,
         absolute: None,
     }
@@ -5853,6 +5890,8 @@ pub struct SleepFuture {
     generation: u16,
     /// If Some, this is an absolute timer (sleep_until).
     absolute: Option<Deadline>,
+    /// The worker whose timer pool holds `timer_slot`.
+    owner: u32,
 }
 
 impl Future for SleepFuture {
@@ -5931,6 +5970,7 @@ impl Future for SleepFuture {
 
             self.timer_slot = Some(slot);
             self.generation = generation;
+            self.owner = crate::runtime::waker::current_worker();
             Poll::Pending
         })
     }
@@ -5938,39 +5978,48 @@ impl Future for SleepFuture {
 
 impl Drop for SleepFuture {
     fn drop(&mut self) {
-        if let Some(slot) = self.timer_slot {
-            // Timer was submitted but not yet fired — try to cancel it.
-            //
-            // If `CURRENT_DRIVER` is unset, the future is being dropped
-            // outside an active executor poll. This happens during normal
-            // worker teardown (the slab is dropped after the event loop
-            // exits, so `CURRENT_DRIVER` is no longer installed) and we
-            // can't do anything useful here — the io_uring instance is
-            // gone too. The timer slot is leaked from this worker's pool
-            // but the pool itself is being dropped, so no real leak.
-            let opt_non_null = CURRENT_DRIVER.with(|c| c.get());
-            if opt_non_null.is_none() {
-                return;
+        let Some(slot) = self.timer_slot else { return };
+        // Only the owning worker's pool holds the slot. Dropped elsewhere
+        // (the future is `Send`), the slot stays allocated there.
+        if crate::runtime::waker::current_worker() != self.owner {
+            return;
+        }
+        match CURRENT_DRIVER.with(|c| c.get()) {
+            Some(mut non_null) => {
+                let state = unsafe { non_null.as_mut() };
+                let driver = unsafe { &mut *state.driver.as_mut() };
+                let executor = unsafe { &mut *state.executor.as_mut() };
+                release_timer_slot(driver, executor, slot, self.generation);
             }
-            let mut non_null = opt_non_null.unwrap();
-            let state = unsafe { non_null.as_mut() };
-            #[cfg(has_io_uring)]
-            let driver = unsafe { &mut *state.driver.as_mut() };
-            let executor = unsafe { &mut *state.executor.as_mut() };
-
-            if !executor.timer_pool.is_fired(slot) {
-                #[cfg(has_io_uring)]
-                {
-                    let payload = TimerSlotPool::encode_payload(slot, self.generation);
-                    let target_ud = UserData::encode(OpTag::Timer, 0, payload);
-                    // Best effort cancel; timer fires harmlessly if already expired.
-                    let _ = driver.ring.submit_async_cancel(target_ud.raw(), 0);
-                }
-            }
-            // Slot released regardless — stale timer CQE detected via generation.
-            executor.timer_pool.release(slot);
+            // Outside a task poll (a connection's task dropped at teardown).
+            None => crate::runtime::defer_release(crate::runtime::Orphan::TimerSlot {
+                slot,
+                generation: self.generation,
+            }),
         }
     }
+}
+
+/// Release a sleep's timer slot. On io_uring, cancels the timer first if it
+/// has not fired; a timer CQE that arrives after the release is
+/// rejected by its generation. On mio, releasing clears the deadline.
+#[cfg_attr(not(has_io_uring), allow(unused_variables))]
+pub(crate) fn release_timer_slot(
+    driver: &mut crate::backend::Driver,
+    executor: &mut crate::runtime::Executor,
+    slot: u32,
+    generation: u16,
+) {
+    if !executor.timer_pool.is_fired(slot) {
+        #[cfg(has_io_uring)]
+        {
+            let payload = TimerSlotPool::encode_payload(slot, generation);
+            let target_ud = UserData::encode(OpTag::Timer, 0, payload);
+            // Best effort cancel; timer fires harmlessly if already expired.
+            let _ = driver.ring.submit_async_cancel(target_ud.raw(), 0);
+        }
+    }
+    executor.timer_pool.release(slot);
 }
 
 /// Create a sleep future, returning an error if the timer pool is exhausted.
@@ -6000,10 +6049,12 @@ pub fn try_sleep(duration: Duration) -> Result<SleepFuture, TimerExhausted> {
 
             if let Err(_e) = driver.ring.submit_timeout(ts_ptr, ud) {
                 executor.timer_pool.release(slot);
-                // SQE submission failure — complete immediately (same as sleep()).
+                // SQE submission failure — complete immediately (`sleep()`
+                // panics instead).
                 return Ok(SleepFuture {
                     duration,
                     timer_slot: None,
+                    owner: 0,
                     generation: 0,
                     absolute: None,
                 });
@@ -6018,6 +6069,7 @@ pub fn try_sleep(duration: Duration) -> Result<SleepFuture, TimerExhausted> {
         Ok(SleepFuture {
             duration,
             timer_slot: Some(slot),
+            owner: crate::runtime::waker::current_worker(),
             generation,
             absolute: None,
         })
@@ -6095,6 +6147,7 @@ pub fn sleep_until(deadline: Deadline) -> SleepFuture {
     SleepFuture {
         duration: Duration::ZERO, // unused for absolute timers
         timer_slot: None,
+        owner: 0,
         generation: 0,
         absolute: Some(deadline),
     }
@@ -6132,6 +6185,7 @@ pub fn try_sleep_until(deadline: Deadline) -> Result<SleepFuture, TimerExhausted
                 return Ok(SleepFuture {
                     duration: Duration::ZERO,
                     timer_slot: None,
+                    owner: 0,
                     generation: 0,
                     absolute: Some(deadline),
                 });
@@ -6148,6 +6202,7 @@ pub fn try_sleep_until(deadline: Deadline) -> Result<SleepFuture, TimerExhausted
         Ok(SleepFuture {
             duration: Duration::ZERO,
             timer_slot: Some(slot),
+            owner: crate::runtime::waker::current_worker(),
             generation,
             absolute: Some(deadline),
         })
@@ -6170,6 +6225,12 @@ impl std::error::Error for Elapsed {}
 
 /// Wrap a future with a deadline. If the future does not complete within
 /// `duration`, returns `Err(Elapsed)`.
+///
+/// # Panics
+///
+/// Panics on first poll if the timer pool is exhausted, or if polled outside
+/// the ringline async executor. [`try_timeout`] returns an error for an
+/// exhausted pool instead.
 ///
 /// # Example
 ///
