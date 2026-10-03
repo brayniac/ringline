@@ -80,6 +80,30 @@ impl Ring {
             .build(config.sq_entries)
             .map_err(Error::ring_setup)?;
 
+        // Applies to the calling thread's io-wq, which is why the ring is
+        // set up on its worker's thread. A zero slot leaves that limit
+        // unchanged and reads back its current value, so the first call only
+        // reads. The cap is an upper bound: registering it where the
+        // kernel's own limit is lower would raise the limit instead.
+        if config.iowq_max_workers > 0 {
+            let refused = |e: io::Error| {
+                Error::RingSetup(format!(
+                    "io_uring refused an io-wq worker cap of {}: {e}",
+                    config.iowq_max_workers
+                ))
+            };
+            let mut current = [0, 0];
+            ring.submitter()
+                .register_iowq_max_workers(&mut current)
+                .map_err(refused)?;
+            if config.iowq_max_workers < current[0] {
+                let mut limits = [config.iowq_max_workers, 0];
+                ring.submitter()
+                    .register_iowq_max_workers(&mut limits)
+                    .map_err(refused)?;
+            }
+        }
+
         // Probed once here rather than per park: the answer cannot change for
         // the life of the ring, and a failed probe is not a setup failure —
         // it only means park is unavailable.
@@ -202,6 +226,17 @@ impl Ring {
                 })?;
         }
         Ok(())
+    }
+
+    /// The calling thread's io-wq limits, `[bounded, unbounded]`. Passing 0
+    /// for both changes nothing and returns the current values.
+    #[cfg(test)]
+    pub(crate) fn iowq_max_workers(&self) -> io::Result<[u32; 2]> {
+        let mut limits = [0, 0];
+        self.ring
+            .submitter()
+            .register_iowq_max_workers(&mut limits)?;
+        Ok(limits)
     }
 
     /// Register a sparse file table for direct descriptors.
@@ -1429,5 +1464,60 @@ impl Ring {
             self.push_sqe(&entry)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ConfigBuilder;
+
+    fn ring_with(cap: Option<u32>) -> Ring {
+        let mut builder = ConfigBuilder::new().workers(1).sq_entries(256);
+        if let Some(cap) = cap {
+            builder = builder.iowq_max_workers(cap);
+        }
+        Ring::setup(&builder.build().expect("valid config")).expect("ring")
+    }
+
+    fn online_cpus() -> u32 {
+        // SAFETY: sysconf has no preconditions.
+        unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) as u32 }
+    }
+
+    /// The kernel's own bounded limit on this host.
+    fn kernel_default() -> u32 {
+        256.min(4 * online_cpus())
+    }
+
+    /// The default config caps the bounded pool at 64, or leaves the kernel's
+    /// limit where that is lower.
+    #[test]
+    fn the_default_caps_the_bounded_iowq_pool_at_64() {
+        let ring = ring_with(None);
+        assert_eq!(
+            ring.iowq_max_workers().expect("query")[0],
+            64.min(kernel_default())
+        );
+    }
+
+    #[test]
+    fn a_configured_cap_reaches_the_kernel() {
+        let ring = ring_with(Some(2));
+        assert_eq!(ring.iowq_max_workers().expect("query")[0], 2);
+    }
+
+    /// A cap above the kernel's limit does not raise it.
+    #[test]
+    fn a_cap_above_the_kernel_limit_leaves_it() {
+        let ring = ring_with(Some(100_000));
+        assert_eq!(ring.iowq_max_workers().expect("query")[0], kernel_default());
+    }
+
+    /// A cap of 0 registers nothing.
+    #[test]
+    fn a_zero_cap_leaves_the_kernel_default() {
+        let ring = ring_with(Some(0));
+        assert_eq!(ring.iowq_max_workers().expect("query")[0], kernel_default());
     }
 }

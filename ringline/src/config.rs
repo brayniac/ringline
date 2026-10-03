@@ -71,6 +71,9 @@ pub struct Config {
     pub(crate) sqpoll_idle_ms: u32,
     /// Pin SQPOLL kernel thread to this CPU core. Only meaningful when sqpoll=true.
     pub(crate) sqpoll_cpu: Option<u32>,
+    /// Upper bound on each worker's bounded io-wq pool; 0 leaves the kernel
+    /// default.
+    pub(crate) iowq_max_workers: u32,
     /// Recv buffer configuration (provided buffer ring) for TCP multishot recv.
     pub(crate) recv_buffer: RecvBufferConfig,
     /// Recv buffer configuration for UDP multishot recvmsg.
@@ -426,6 +429,7 @@ impl Default for Config {
             sqpoll: false,
             sqpoll_idle_ms: 1000,
             sqpoll_cpu: None,
+            iowq_max_workers: 64,
             recv_buffer: RecvBufferConfig::default(),
             udp_recv_buffer: RecvBufferConfig {
                 ring_size: 128,
@@ -633,6 +637,12 @@ impl Config {
         if self.sq_entries < 2 || !self.sq_entries.is_power_of_two() {
             return Err(crate::error::Error::RingSetup(
                 "sq_entries must be at least 2 and a power of two".into(),
+            ));
+        }
+        // The kernel rejects a limit above INT_MAX.
+        if self.iowq_max_workers > i32::MAX as u32 {
+            return Err(crate::error::Error::RingSetup(
+                "iowq_max_workers must be at most i32::MAX".into(),
             ));
         }
         if self.standalone_task_capacity >= (1 << 31) {
@@ -922,6 +932,22 @@ impl ConfigBuilder {
     /// Pin SQPOLL kernel thread to a specific CPU core.
     pub fn sqpoll_cpu(mut self, cpu: u32) -> Self {
         self.config.sqpoll_cpu = Some(cpu);
+        self
+    }
+
+    /// Cap the threads in each worker's bounded io-wq pool. Default 64; 0
+    /// leaves the kernel's default, `min(sq_entries, 4 × online CPUs)`. The
+    /// cap only lowers that default: where the kernel's limit is already
+    /// lower, it is left as it is.
+    ///
+    /// The kernel runs work it cannot complete inline on io-wq threads. In
+    /// the bounded pool that is the `shutdown` sent ahead of every
+    /// connection close (#581), and regular-file I/O that would block. A
+    /// lower cap means fewer threads per worker, and less parallelism for
+    /// that work: past the cap, work waits for a free thread. io_uring
+    /// backend only; the mio backend ignores it.
+    pub fn iowq_max_workers(mut self, n: u32) -> Self {
+        self.config.iowq_max_workers = n;
         self
     }
 
