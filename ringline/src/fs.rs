@@ -436,8 +436,9 @@ impl Drop for OrphanedBuffers {
 }
 
 /// Release what futures dropped outside the executor queued. First the
-/// timer slots, spawns, pidfd waits and connects queued by
-/// [`crate::runtime::defer_release`]; then what dropped fs futures queued:
+/// timer slots, spawns, pidfd waits, connects, and blocking and resolve
+/// entries queued by [`crate::runtime::defer_release`]; then what dropped fs
+/// futures queued:
 /// drop abandoned operations' results, or stop tracking their keys so the
 /// results are discarded on arrival; close the files of abandoned opens and
 /// free their slots; and park or drop the buffers of abandoned reads and
@@ -452,8 +453,8 @@ pub(crate) fn release_orphans(
     driver: &mut crate::backend::Driver,
     executor: &mut crate::runtime::Executor,
 ) {
-    // Timer slots, spawns, pidfd waits and connects of futures dropped
-    // outside the executor (#575).
+    // Timer slots, spawns, pidfd waits, connects, and blocking and resolve
+    // entries of futures dropped outside the executor (#575, #582).
     crate::runtime::release_orphans(driver, executor);
 
     let keys = ORPHANED_KEYS.with(|orphans| std::mem::take(&mut *orphans.borrow_mut()));

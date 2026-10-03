@@ -3,7 +3,8 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use ringline::{AsyncEventHandler, Config, ConfigBuilder, Connection, RinglineBuilder};
 
@@ -237,4 +238,65 @@ fn spawn_blocking_non_copy_type() {
         h.join().unwrap().unwrap();
     }
     assert_eq!(BLOCKING_STRING.load(Ordering::SeqCst), 1);
+}
+
+// ── A dropped handle releases the result ────────────────────────────
+
+static RESULTS_DROPPED: AtomicUsize = AtomicUsize::new(0);
+
+/// A closure result that counts its own drop.
+struct CountedResult;
+
+impl Drop for CountedResult {
+    fn drop(&mut self) {
+        RESULTS_DROPPED.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// Starts a closure that finishes after 200 ms and drops its handle at
+/// 20 ms, when the `timeout` around it expires.
+struct DropsHandleEarly;
+
+impl AsyncEventHandler for DropsHandleEarly {
+    fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        Some(Box::pin(async {
+            let handle = ringline::spawn_blocking(|| {
+                std::thread::sleep(Duration::from_millis(200));
+                CountedResult
+            })
+            .unwrap();
+            let timed_out = ringline::timeout(Duration::from_millis(20), handle)
+                .await
+                .is_err();
+            assert!(timed_out, "the closure finished before the timeout");
+        }))
+    }
+
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
+        async {}
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        DropsHandleEarly
+    }
+}
+
+/// A result that arrives after its handle was dropped is dropped on arrival,
+/// not held by the worker until it exits (#582).
+#[test]
+fn a_result_whose_handle_was_dropped_is_dropped_on_arrival() {
+    RESULTS_DROPPED.store(0, Ordering::SeqCst);
+    let (runtime, handles) = RinglineBuilder::new(test_config())
+        .launch::<DropsHandleEarly>()
+        .expect("launch failed");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while RESULTS_DROPPED.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let dropped = RESULTS_DROPPED.load(Ordering::SeqCst);
+    runtime.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+    assert_eq!(dropped, 1, "the worker held the result of a dropped handle");
 }
