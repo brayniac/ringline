@@ -88,13 +88,11 @@ macro_rules! run_redis_test {
             }
         }
 
-        let (_shutdown, handles) = RinglineBuilder::new(test_config())
+        let (runtime, handles) = RinglineBuilder::new(test_config())
             .launch::<Handler>()
             .expect("launch failed");
 
-        for h in handles {
-            h.join().unwrap().unwrap();
-        }
+        common::join_workers(&runtime, handles);
 
         let result = $result_static.get().expect("on_start did not set result");
         if let Err(e) = result {

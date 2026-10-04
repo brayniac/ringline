@@ -23,7 +23,7 @@ impl AsyncEventHandler for NeverShutsDown {
 }
 
 #[test]
-#[should_panic(expected = "the workers did not exit within")]
+#[should_panic(expected = "exited, so shutdown was never requested")]
 fn workers_that_never_exit_fail_the_test() {
     let config = ConfigBuilder::new()
         .workers(1)

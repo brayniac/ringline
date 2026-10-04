@@ -46,10 +46,8 @@ fn config(max_files: u16, disk_io_threads: usize) -> Config {
 /// Launch one worker, wait for it to exit, and return what `on_start` set.
 fn run<H: AsyncEventHandler>(config: Config) -> Result<(), String> {
     *OUTCOME.lock().unwrap() = None;
-    let (_runtime, handles) = RinglineBuilder::new(config).launch::<H>().expect("launch");
-    for h in handles {
-        h.join().expect("worker panicked").expect("worker failed");
-    }
+    let (runtime, handles) = RinglineBuilder::new(config).launch::<H>().expect("launch");
+    common::join_workers(&runtime, handles);
     OUTCOME
         .lock()
         .unwrap()

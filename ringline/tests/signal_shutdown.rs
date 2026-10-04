@@ -15,8 +15,6 @@
 //! **Keep it alone here**: any test added to this file is a test that can be
 //! killed mid-flight by the signal below.
 
-mod common;
-
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
@@ -105,5 +103,7 @@ fn signal_wait_on_signal_shutdown() {
     let sig = shutdown.wait_on_signal();
     assert_eq!(sig, ringline::Signal::Terminate);
 
-    common::join_workers(&shutdown, handles);
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
 }

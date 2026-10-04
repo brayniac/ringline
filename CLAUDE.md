@@ -48,10 +48,12 @@ their servers. A test that needs a port with nothing listening uses `refusing_po
 connection. A bound socket that never listens refuses on Linux but not on macOS.
 
 A test whose handler requests its own shutdown joins the workers with
-`common::join_workers` (`tests/common/mod.rs` in each crate that has one), not
-a bare `h.join()`. The helper shuts the runtime down and fails the test if the
-workers have not exited within 30 s, so a stuck handler fails the test instead
-of hanging `cargo test` (#447).
+`common::join_workers`, not a bare `h.join()`. The helper is in
+`tests/common/mod.rs` in ringline, ringline-http, ringline-memcache,
+ringline-ping and ringline-redis; copy it into another crate that needs it. It
+shuts the runtime down and fails the test if the workers have not exited
+within 30 s of the call, so a stuck handler fails the test instead of hanging
+`cargo test` (#447).
 
 `cargo build` succeeding is NOT sufficient verification — clippy `-D warnings` and fmt failures are CI failures. CI runs every cargo invocation with `--locked`; `Cargo.lock` is committed, so any dependency or version change must update the lockfile in the same commit or CI goes red. A daily `cargo audit --deny warnings` cron catches new advisories — security version pins live as comments in the workspace `Cargo.toml`.
 

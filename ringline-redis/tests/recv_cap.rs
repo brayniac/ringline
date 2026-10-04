@@ -107,8 +107,8 @@ fn lrange_over_1024_elements_round_trips() {
         .pin_to_core(false)
         .build()
         .expect("valid config");
-    let (server_runtime, handles) = RinglineBuilder::new(cfg).launch::<H>().expect("launch");
-    common::join_workers(&server_runtime, handles);
+    let (client, handles) = RinglineBuilder::new(cfg).launch::<H>().expect("launch");
+    common::join_workers(&client, handles);
     match RESULT.get().expect("on_start did not set result") {
         Ok(len) => {
             let n = n_from_env();

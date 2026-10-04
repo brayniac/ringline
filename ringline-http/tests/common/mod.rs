@@ -1,21 +1,23 @@
 //! Helpers shared by this crate's integration tests.
 
+#![allow(dead_code)]
+
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-/// How long a test's workers have to exit on their own before the test
-/// shuts the runtime down and fails.
+/// How long [`join_workers`] waits for the workers to exit before it shuts
+/// the runtime down and fails the test.
 pub const WORKER_EXIT_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Join the workers of a runtime whose handler requests its own shutdown.
 ///
-/// If the workers have not all exited within [`WORKER_EXIT_DEADLINE`], this
-/// shuts the runtime down, waits briefly for them, and fails the test. A
-/// handler that never requests shutdown then fails the test with a message,
-/// where an unbounded join would hang it forever (#447).
+/// If the workers have not all exited within [`WORKER_EXIT_DEADLINE`] of the
+/// call, this shuts the runtime down, waits up to 5 s for them, and fails the
+/// test. A handler that never requests shutdown fails the test instead of
+/// hanging it.
 ///
-/// Panics if a worker panicked or returned an error.
-#[allow(dead_code)]
+/// Panics as soon as a worker panics or returns an error.
+#[track_caller]
 pub fn join_workers(
     runtime: &ringline::Runtime,
     handles: Vec<JoinHandle<Result<(), ringline::Error>>>,
@@ -24,30 +26,42 @@ pub fn join_workers(
 }
 
 /// [`join_workers`] with a deadline other than [`WORKER_EXIT_DEADLINE`].
-#[allow(dead_code)]
+#[track_caller]
 pub fn join_workers_within(
     runtime: &ringline::Runtime,
     handles: Vec<JoinHandle<Result<(), ringline::Error>>>,
     limit: Duration,
 ) {
     let deadline = Instant::now() + limit;
-    while !handles.iter().all(|h| h.is_finished()) {
+    let mut running = handles;
+    while !running.is_empty() {
+        // Check each worker as it exits, so an error surfaces at once rather
+        // than after the others.
+        let (finished, still): (Vec<_>, Vec<_>) =
+            running.into_iter().partition(|h| h.is_finished());
+        for h in finished {
+            h.join().expect("worker panicked").expect("worker failed");
+        }
+        running = still;
+        if running.is_empty() {
+            break;
+        }
         if Instant::now() >= deadline {
             runtime.shutdown();
-            // Give the workers a moment to exit after the shutdown, so they
-            // do not outlive the test holding its ports.
             let grace = Instant::now() + Duration::from_secs(5);
-            while !handles.iter().all(|h| h.is_finished()) && Instant::now() < grace {
+            while !running.iter().all(|h| h.is_finished()) && Instant::now() < grace {
                 std::thread::sleep(Duration::from_millis(10));
             }
+            let exited = running.iter().all(|h| h.is_finished());
             panic!(
-                "the workers did not exit within {limit:?}: the handler never requested \
-                 shutdown"
+                "the workers did not exit within {limit:?}; after Runtime::shutdown they {}",
+                if exited {
+                    "exited, so shutdown was never requested"
+                } else {
+                    "were still running 5 s later"
+                }
             );
         }
         std::thread::sleep(Duration::from_millis(5));
-    }
-    for h in handles {
-        h.join().expect("worker panicked").expect("worker failed");
     }
 }
