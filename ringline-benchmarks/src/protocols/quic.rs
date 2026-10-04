@@ -164,22 +164,22 @@ impl ringline::AsyncEventHandler for QuicEchoHandler {
                     quic.handle_datagram(recv_at, data, peer);
                 });
                 ringline::select(recv_fut, ringline::sleep(Duration::from_millis(10))).await;
-                let now = Instant::now();
-                quic.drive_timers(now);
+                quic.drive_timers(Instant::now());
 
                 while let Some(event) = quic.poll_event() {
                     if let ringline_quic::QuicEvent::StreamReadable { conn, stream } = event {
                         loop {
-                            let (n, fin) = match quic.stream_recv(now, conn, stream, &mut read_buf)
-                            {
-                                Ok(r) => r,
-                                Err(_) => break,
-                            };
+                            let (n, fin) =
+                                match quic.stream_recv(Instant::now(), conn, stream, &mut read_buf)
+                                {
+                                    Ok(r) => r,
+                                    Err(_) => break,
+                                };
                             if n > 0 {
                                 let _ = quic.stream_send(conn, stream, &read_buf[..n]);
                             }
                             if fin {
-                                let _ = quic.stream_finish(now, conn, stream);
+                                let _ = quic.stream_finish(Instant::now(), conn, stream);
                                 break;
                             }
                             if n == 0 {
@@ -321,8 +321,7 @@ impl ringline::AsyncEventHandler for RinglineQuicBench {
                     quic.handle_datagram(recv_at, data, peer);
                 });
                 ringline::select(recv_fut, ringline::sleep(Duration::from_millis(1))).await;
-                let now = Instant::now();
-                quic.drive_timers(now);
+                quic.drive_timers(Instant::now());
 
                 while let Some(event) = quic.poll_event() {
                     match event {
@@ -333,14 +332,18 @@ impl ringline::AsyncEventHandler for RinglineQuicBench {
                             if let Some(phase) = in_flight.get_mut(&stream) {
                                 let StreamPhase::AwaitingResponse { start, bytes_read } = phase;
                                 loop {
-                                    let (n, fin) =
-                                        match quic.stream_recv(now, conn, stream, &mut read_buf) {
-                                            Ok(r) => r,
-                                            Err(_) => {
-                                                in_flight.remove(&stream);
-                                                break;
-                                            }
-                                        };
+                                    let (n, fin) = match quic.stream_recv(
+                                        Instant::now(),
+                                        conn,
+                                        stream,
+                                        &mut read_buf,
+                                    ) {
+                                        Ok(r) => r,
+                                        Err(_) => {
+                                            in_flight.remove(&stream);
+                                            break;
+                                        }
+                                    };
                                     if n > 0 {
                                         *bytes_read += n;
                                     }
@@ -360,7 +363,8 @@ impl ringline::AsyncEventHandler for RinglineQuicBench {
                                 }
                             } else {
                                 // Drain unknown stream to keep flow control happy.
-                                let _ = quic.stream_recv(now, conn, stream, &mut read_buf);
+                                let _ =
+                                    quic.stream_recv(Instant::now(), conn, stream, &mut read_buf);
                             }
                         }
                         ringline_quic::QuicEvent::StreamWritable { .. }
@@ -404,29 +408,29 @@ impl ringline::AsyncEventHandler for RinglineQuicBench {
                         .and_then(|s| s.parse::<usize>().ok())
                         .unwrap_or(default_cap);
                     let mut opened_this_tick = 0usize;
-                    let mut batch = quic.batch(now);
+                    let mut batch = quic.batch(Instant::now());
                     while in_flight.len() < state.num_clients {
                         if opened_this_tick >= topup_cap {
                             break;
                         }
                         match batch.open_bi(conn_id) {
                             Ok(Some(stream)) => {
-                                let sent_at = Instant::now();
+                                let now = Instant::now();
                                 if let Err(_e) = batch.stream_send(conn_id, stream, &payload) {
                                     let _ = batch.reset_stream(
-                                        now,
+                                        Instant::now(),
                                         conn_id,
                                         stream,
                                         quinn_proto::VarInt::from_u32(0),
                                     );
                                     break;
                                 }
-                                let _ = batch.stream_finish(now, conn_id, stream);
+                                let _ = batch.stream_finish(Instant::now(), conn_id, stream);
                                 opened_this_tick += 1;
                                 in_flight.insert(
                                     stream,
                                     StreamPhase::AwaitingResponse {
-                                        start: sent_at,
+                                        start: now,
                                         bytes_read: 0,
                                     },
                                 );

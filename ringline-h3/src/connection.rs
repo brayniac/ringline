@@ -336,12 +336,7 @@ impl H3Connection {
     /// Initialize the HTTP/3 connection for a new QUIC connection.
     ///
     /// Opens our control unidirectional stream and sends the SETTINGS frame.
-    pub fn accept(
-        &mut self,
-        quic: &mut QuicEndpoint,
-        now: Instant,
-        conn: QuicConnId,
-    ) -> Result<(), H3Error> {
+    pub fn accept(&mut self, quic: &mut QuicEndpoint, conn: QuicConnId) -> Result<(), H3Error> {
         self.conn_id = Some(conn);
         self.role = Some(Role::Server);
 
@@ -358,7 +353,7 @@ impl H3Connection {
         let mut buf = Vec::new();
         frame::encode_varint(&mut buf, STREAM_TYPE_CONTROL);
         Frame::Settings(self.local_settings.clone()).encode(&mut buf);
-        self.queue_send(quic, now, conn, stream, vec![Bytes::from(buf)], false)?;
+        self.queue_send(quic, conn, stream, vec![Bytes::from(buf)], None)?;
 
         // Only mark SETTINGS as fully sent once nothing is queued behind it.
         // If queue_send had to defer due to flow control, `drain_pending_stream`
@@ -371,12 +366,7 @@ impl H3Connection {
     ///
     /// Opens our control unidirectional stream and sends the SETTINGS frame.
     /// This is the client-side counterpart of [`accept()`](Self::accept).
-    pub fn initiate(
-        &mut self,
-        quic: &mut QuicEndpoint,
-        now: Instant,
-        conn: QuicConnId,
-    ) -> Result<(), H3Error> {
+    pub fn initiate(&mut self, quic: &mut QuicEndpoint, conn: QuicConnId) -> Result<(), H3Error> {
         self.conn_id = Some(conn);
         self.role = Some(Role::Client);
 
@@ -390,7 +380,7 @@ impl H3Connection {
         let mut buf = Vec::new();
         frame::encode_varint(&mut buf, STREAM_TYPE_CONTROL);
         Frame::Settings(self.local_settings.clone()).encode(&mut buf);
-        self.queue_send(quic, now, conn, stream, vec![Bytes::from(buf)], false)?;
+        self.queue_send(quic, conn, stream, vec![Bytes::from(buf)], None)?;
 
         self.settings_sent = !self.has_pending_writes(stream);
         Ok(())
@@ -458,11 +448,10 @@ impl H3Connection {
 
         self.queue_send(
             quic,
-            now,
             conn,
             stream_id,
             vec![Bytes::from(buf)],
-            end_stream,
+            end_stream.then_some(now),
         )?;
 
         Ok(stream_id)
@@ -479,10 +468,10 @@ impl H3Connection {
     ) -> Result<(), H3Error> {
         match event {
             QuicEvent::NewConnection(conn) => {
-                self.accept(quic, now, *conn)?;
+                self.accept(quic, *conn)?;
             }
             QuicEvent::Connected(conn) => {
-                self.initiate(quic, now, *conn)?;
+                self.initiate(quic, *conn)?;
             }
             QuicEvent::StreamOpened { conn, stream, bidi } => {
                 if *bidi {
@@ -600,11 +589,10 @@ impl H3Connection {
 
         self.queue_send(
             quic,
-            now,
             conn,
             stream_id,
             vec![Bytes::from(buf)],
-            end_stream,
+            end_stream.then_some(now),
         )
     }
 
@@ -661,7 +649,7 @@ impl H3Connection {
         encode_frame_header(&mut header, frame::FRAME_DATA, data.len() as u64);
         let chunks = vec![Bytes::from(header), data];
 
-        self.queue_send(quic, now, conn, stream_id, chunks, end_stream)
+        self.queue_send(quic, conn, stream_id, chunks, end_stream.then_some(now))
     }
 
     /// Send trailing HEADERS (trailers) on a request stream and finish the
@@ -696,14 +684,13 @@ impl H3Connection {
         }
         .encode(&mut buf);
 
-        self.queue_send(quic, now, conn, stream_id, vec![Bytes::from(buf)], true)
+        self.queue_send(quic, conn, stream_id, vec![Bytes::from(buf)], Some(now))
     }
 
     /// Send a GOAWAY frame on the control stream (graceful shutdown).
     pub fn send_goaway(
         &mut self,
         quic: &mut QuicEndpoint,
-        now: Instant,
         last_stream_id: u64,
     ) -> Result<(), H3Error> {
         let conn = self
@@ -719,7 +706,7 @@ impl H3Connection {
         }
         .encode(&mut buf);
 
-        self.queue_send(quic, now, conn, control, vec![Bytes::from(buf)], false)?;
+        self.queue_send(quic, conn, control, vec![Bytes::from(buf)], None)?;
         self.state = H3State::Closing;
         Ok(())
     }
@@ -755,17 +742,16 @@ impl H3Connection {
     /// Push one or more [`Bytes`] chunks onto a stream. Chunks that don't
     /// fit in the current flow-control window are queued verbatim — they
     /// stay refcounted, no `extend_from_slice` — and flushed on the next
-    /// [`QuicEvent::StreamWritable`]. If `fin` is set, the stream is
-    /// finished either immediately (everything flushed) or later
+    /// [`QuicEvent::StreamWritable`]. If `fin` is `Some(now)`, the stream is
+    /// finished either immediately at `now` (everything flushed) or later
     /// ([`drain_pending_stream`]).
     fn queue_send(
         &mut self,
         quic: &mut QuicEndpoint,
-        now: Instant,
         conn: QuicConnId,
         stream_id: StreamId,
         mut chunks: Vec<Bytes>,
-        fin: bool,
+        fin: Option<Instant>,
     ) -> Result<(), H3Error> {
         let key = u64::from(stream_id);
 
@@ -793,7 +779,7 @@ impl H3Connection {
                     pending.queue.push_back(chunk);
                 }
             }
-            if fin {
+            if fin.is_some() {
                 pending.pending_fin = true;
             }
             return Ok(());
@@ -821,14 +807,14 @@ impl H3Connection {
             }
         }
 
-        if !any_remaining && fin {
+        if !any_remaining && let Some(now) = fin {
             quic.stream_finish(now, conn, stream_id)?;
             self.finalize_local_close(stream_id);
             self.pending_sends.remove(&key);
             return Ok(());
         }
 
-        if fin {
+        if fin.is_some() {
             self.pending_sends.entry(key).or_default().pending_fin = true;
         }
 

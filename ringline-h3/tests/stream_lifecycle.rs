@@ -471,7 +471,7 @@ fn send_request_after_goaway_errors() {
 
     // Server sends GOAWAY (stream id 4 — the next-expected client stream).
     server_h3
-        .send_goaway(&mut server_ep, common::now(), 4)
+        .send_goaway(&mut server_ep, 4)
         .expect("send_goaway");
 
     // Push the GOAWAY through and let the client process it.

@@ -131,7 +131,6 @@ fn drain_client_h3_events(
 fn topup_requests(
     h3: &mut ringline_h3::H3Connection,
     quic: &mut ringline_quic::QuicEndpoint,
-    now: Instant,
     in_flight: &mut HashMap<u64, PendingReq>,
     payload: &bytes::Bytes,
     num_clients: usize,
@@ -157,7 +156,7 @@ fn topup_requests(
         if topup_cap > 0 && opened_this_tick >= topup_cap {
             break;
         }
-        let sent_at = Instant::now();
+        let now = Instant::now();
         let stream = match h3.send_request(quic, now, &request_headers, false) {
             Ok(s) => s,
             Err(_) => break,
@@ -172,7 +171,7 @@ fn topup_requests(
         in_flight.insert(
             u64::from(stream),
             PendingReq {
-                start: sent_at,
+                start: now,
                 bytes_read: 0,
                 got_response_headers: false,
             },
@@ -186,7 +185,6 @@ fn topup_requests(
 fn echo_responses(
     h3: &mut ringline_h3::H3Connection,
     quic: &mut ringline_quic::QuicEndpoint,
-    now: Instant,
     bodies: &mut HashMap<u64, Vec<u8>>,
     resp_cap: usize,
 ) {
@@ -202,8 +200,14 @@ fn echo_responses(
             } => {
                 if end_stream {
                     let resp = vec![ringline_h3::HeaderField::new(b":status", b"200")];
-                    let _ = h3.send_response(quic, now, stream_id, &resp, false);
-                    let _ = h3.send_data_bytes(quic, now, stream_id, bytes::Bytes::new(), true);
+                    let _ = h3.send_response(quic, Instant::now(), stream_id, &resp, false);
+                    let _ = h3.send_data_bytes(
+                        quic,
+                        Instant::now(),
+                        stream_id,
+                        bytes::Bytes::new(),
+                        true,
+                    );
                     responded += 1;
                 } else {
                     bodies.insert(u64::from(stream_id), Vec::new());
@@ -220,11 +224,16 @@ fn echo_responses(
                 if end_stream {
                     let body = bodies.remove(&key).unwrap_or_default();
                     let resp = vec![ringline_h3::HeaderField::new(b":status", b"200")];
-                    let _ = h3.send_response(quic, now, stream_id, &resp, false);
+                    let _ = h3.send_response(quic, Instant::now(), stream_id, &resp, false);
                     // `Bytes::from(Vec<u8>)` is O(1) — takes ownership of
                     // the Vec's buffer without copying the body bytes.
-                    let _ =
-                        h3.send_data_bytes(quic, now, stream_id, bytes::Bytes::from(body), true);
+                    let _ = h3.send_data_bytes(
+                        quic,
+                        Instant::now(),
+                        stream_id,
+                        bytes::Bytes::from(body),
+                        true,
+                    );
                     responded += 1;
                 }
             }
@@ -413,17 +422,16 @@ impl ringline::AsyncEventHandler for H3EchoHandler {
                         batch.handle_datagram(recv_at, data, peer);
                     });
                     ringline::select(recv_fut, ringline::sleep(Duration::from_millis(1))).await;
-                    // The batch was opened before the wait; flush at the
-                    // time the wait returned.
-                    let now = Instant::now();
-                    batch.set_now(now);
-                    batch.drive_timers(now);
+                    batch.drive_timers(Instant::now());
 
                     while let Some(event) = batch.poll_event() {
-                        let _ = h3.handle_quic_event(&mut batch, now, &event);
+                        let _ = h3.handle_quic_event(&mut batch, Instant::now(), &event);
                     }
 
-                    echo_responses(&mut h3, &mut batch, now, &mut bodies, resp_cap);
+                    echo_responses(&mut h3, &mut batch, &mut bodies, resp_cap);
+                    // Flush at the time it happens, as before the endpoint
+                    // took `now`.
+                    batch.set_now(Instant::now());
                     // drop(batch) flushes deferred transmits as GSO.
                 }
 
@@ -571,17 +579,13 @@ impl ringline::AsyncEventHandler for RinglineH3Bench {
                         batch.handle_datagram(recv_at, data, peer);
                     });
                     ringline::select(recv_fut, ringline::sleep(Duration::from_millis(1))).await;
-                    // The batch was opened before the wait; flush at the
-                    // time the wait returned.
-                    let now = Instant::now();
-                    batch.set_now(now);
-                    batch.drive_timers(now);
+                    batch.drive_timers(Instant::now());
 
                     while let Some(event) = batch.poll_event() {
                         if let ringline_quic::QuicEvent::Connected(_) = event {
                             connected = true;
                         }
-                        let _ = h3.handle_quic_event(&mut batch, now, &event);
+                        let _ = h3.handle_quic_event(&mut batch, Instant::now(), &event);
                     }
 
                     if drain_client_h3_events(&mut h3, &mut in_flight, &mut local_ops, &state) {
@@ -590,7 +594,6 @@ impl ringline::AsyncEventHandler for RinglineH3Bench {
                         topup_requests(
                             &mut h3,
                             &mut batch,
-                            now,
                             &mut in_flight,
                             &payload,
                             state.num_clients,
@@ -598,6 +601,9 @@ impl ringline::AsyncEventHandler for RinglineH3Bench {
                             connected,
                         );
                     }
+                    // Flush at the time it happens, as before the endpoint
+                    // took `now`.
+                    batch.set_now(Instant::now());
                     // drop(batch) flushes deferred QUIC transmits as GSO.
                 }
                 if stop {

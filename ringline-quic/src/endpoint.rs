@@ -20,6 +20,11 @@ use crate::event::{QuicConnId, QuicEvent};
 /// sending outgoing packets (via [`poll_send`](Self::poll_send)) and
 /// feeding incoming datagrams.
 ///
+/// The endpoint never calls `Instant::now()`. Every method that can
+/// generate packets or fire timers takes `now: Instant`, and the caller
+/// should pass non-decreasing values. Reading the clock once per
+/// event-loop iteration is enough.
+///
 /// # Usage
 ///
 /// 1. Feed incoming UDP datagrams via [`handle_datagram`](Self::handle_datagram).
@@ -181,7 +186,8 @@ impl QuicEndpoint {
     /// `sendmsg` syscalls into one.
     ///
     /// Nested batches compose: only the outermost guard's drop
-    /// performs the flush, at the `now` that guard was created with.
+    /// performs the flush, at that guard's time: the `now` passed to
+    /// `batch`, or the last value given to [`BatchGuard::set_now`].
     pub fn batch(&mut self, now: Instant) -> BatchGuard<'_> {
         self.batch_depth = self.batch_depth.saturating_add(1);
         BatchGuard {
@@ -1075,8 +1081,9 @@ impl QuicEndpoint {
 /// internal `drain_transmits` calls that normally fire after each
 /// stream operation so quinn-proto can coalesce a whole batch into a
 /// single GSO buffer. On drop, flushes the connections so the
-/// accumulated work goes out as one burst, at the `now` passed to
-/// [`QuicEndpoint::batch`].
+/// accumulated work goes out as one burst. Only the outermost guard
+/// flushes, at its time: the `now` passed to [`QuicEndpoint::batch`], or
+/// the last value given to [`set_now`](Self::set_now).
 ///
 /// Construct via `let g = endpoint.batch(now);` and dereference through
 /// the guard to issue stream operations:
@@ -1095,14 +1102,15 @@ impl QuicEndpoint {
 /// ```
 pub struct BatchGuard<'a> {
     endpoint: &'a mut QuicEndpoint,
-    /// When the batch's flush happens.
+    /// The time passed to `flush` when this guard is the last to drop.
     now: Instant,
 }
 
 impl BatchGuard<'_> {
-    /// Set the time the batch's flush uses. A batch held across an `.await`
-    /// sets it once the wait returns, so the flush is not stamped with the
-    /// time from before the wait.
+    /// Sets the time the flush uses. Call it after an `.await` inside the
+    /// batch so the flush does not use the time from before the wait. On a
+    /// nested guard it has no effect, because only the outermost guard
+    /// flushes.
     pub fn set_now(&mut self, now: Instant) {
         self.now = now;
     }

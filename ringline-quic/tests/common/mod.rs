@@ -11,8 +11,9 @@
 use std::cell::Cell;
 use std::time::{Duration, Instant};
 
-/// How far [`tick`] advances the clock: the simulated time of one round of
-/// ferrying packets between the endpoints.
+/// How far [`tick`] advances the clock. The pump helpers call [`tick`] at
+/// the start of each round of ferrying packets; some ferry several times
+/// within one round.
 pub const ROUND: Duration = Duration::from_millis(1);
 
 thread_local! {

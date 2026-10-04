@@ -177,14 +177,9 @@ fn read_until_fin(
     let mut acc = Vec::with_capacity(expected_len);
     let mut buf = vec![0u8; 16 * 1024];
     let mut fin = false;
-    // Loop on *progress*, not on a fixed round count. The transport here is
-    // an in-memory function call, but `drain` reads `common::now()` and
-    // drives QUIC's timers from it, so wall-clock time leaks into an
-    // otherwise deterministic simulation: under parallel-suite load enough
-    // real time can pass between rounds to fire loss-detection or PTO
-    // timers, and the retransmission that follows costs rounds. A fixed
-    // budget of 64 then runs out before the FIN arrives and the test fails
-    // with "server should observe FIN" (ringline-rs/ringline#386).
+    // Loop on progress, not on a fixed round count: the FIN can need rounds
+    // after the last data byte, and a fixed budget of 64 once ran out before
+    // it arrived (ringline-rs/ringline#386).
     //
     // `stall_budget` is what bounds the loop now: rounds are cheap, and a
     // round that moves nothing and reads nothing means the endpoints have
@@ -1680,8 +1675,8 @@ fn quic_sustained_large_stream_round_trip() {
     let mut server_stream: Option<quinn_proto::StreamId> = None;
     let mut fin_seen = false;
     let mut buf = vec![0u8; 64 * 1024];
-    // Simulated time advances one round per `drain`, so this bounds a stall
-    // at 30 000 rounds.
+    // Simulated time advances one round per `drain`, so this bounds the
+    // whole transfer at 30 000 drains.
     let deadline = common::now() + Duration::from_secs(30);
     let mut finished = false;
 
