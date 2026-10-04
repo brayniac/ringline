@@ -84,6 +84,51 @@ fn thread_alive(prefix: &str) -> bool {
         .any(|name| name.trim_end().starts_with(prefix))
 }
 
+/// Waits until a thread whose name starts with `prefix` is inside open(2), or
+/// `limit` has passed. A FIFO open with no writer does not return, so once the
+/// thread is inside the call it stays there until the test opens the writer.
+/// On timeout, returns what the last poll read from each matching thread's
+/// `/proc/self/task/<tid>/syscall`.
+#[cfg(not(has_io_uring))]
+fn wait_in_open(prefix: &str, limit: Duration) -> Result<(), String> {
+    // musl's open() makes the open syscall on archs that have it, of which
+    // only x86_64 is built here; glibc's makes openat.
+    #[cfg(target_arch = "x86_64")]
+    let open_calls = [libc::SYS_openat, libc::SYS_open];
+    #[cfg(not(target_arch = "x86_64"))]
+    let open_calls = [libc::SYS_openat];
+    let deadline = Instant::now() + limit;
+    loop {
+        let reads: Vec<std::io::Result<String>> = std::fs::read_dir("/proc/self/task")
+            .expect("read /proc/self/task")
+            .filter_map(|t| t.ok())
+            .filter(|t| {
+                std::fs::read_to_string(t.path().join("comm"))
+                    .is_ok_and(|name| name.trim_end().starts_with(prefix))
+            })
+            .map(|t| std::fs::read_to_string(t.path().join("syscall")))
+            .collect();
+        // While the thread is blocked in a syscall the first field is its
+        // number; blocked outside one, `-1`; on a CPU, the file reads
+        // `running`.
+        let in_open = reads.iter().any(|read| {
+            read.as_ref().is_ok_and(|s| {
+                s.split_whitespace()
+                    .next()
+                    .and_then(|nr| nr.parse::<libc::c_long>().ok())
+                    .is_some_and(|nr| open_calls.contains(&nr))
+            })
+        });
+        if in_open {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("{reads:?}"));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 /// The disk-I/O pool runs on mio only.
 #[cfg(not(has_io_uring))]
 #[test]
@@ -120,8 +165,9 @@ fn a_late_disk_io_open_does_not_leak_its_fd() {
         std::thread::sleep(Duration::from_millis(5));
     }
     assert!(OPEN_ISSUED.load(Ordering::Acquire), "fs::open never issued");
-    // The disk-I/O thread picks the request up and blocks in open(2).
-    std::thread::sleep(Duration::from_millis(50));
+    if let Err(last) = wait_in_open("ringline-disk-i", Duration::from_secs(30)) {
+        panic!("the disk-I/O thread never blocked in open(2); last syscall reads: {last}");
+    }
 
     drop(runtime);
     for h in handles {

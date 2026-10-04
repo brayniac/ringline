@@ -4,15 +4,19 @@
 //! A blocking task still running at shutdown finishes on its pool thread and
 //! then wakes the worker that requested it. This test drops the `Runtime` and
 //! joins the workers while such a task runs, refills every fd number the
-//! shutdown freed with the write end of an unrelated pipe, and checks that no
-//! pipe receives the wake, then that every fd `launch()` opened is closed once
-//! the task has finished.
+//! shutdown freed with the write end of an unrelated pipe, releases the task,
+//! and checks that no pipe receives the wake, then that every fd `launch()`
+//! opened is closed once the task has finished.
 //!
 //! A second test covers the worker's own hold: with no pool, a worker still
 //! running after the `Runtime` drops must keep every fd `launch()` opened.
 //!
+//! A third test, on mio only, covers the disk-I/O pool's hold: an `fs::open`
+//! of a FIFO with no writer completes after the worker has exited, and its
+//! wake must not write into a reused fd.
+//!
 //! Its own test binary, because it reads `/proc/self/fd` and claims freed fd
-//! numbers, which other tests in the same process would disturb; the two tests
+//! numbers, which other tests in the same process would disturb; the tests
 //! here take a lock so they do not disturb each other. Linux only.
 
 #![cfg(target_os = "linux")]
@@ -29,14 +33,40 @@ use std::time::{Duration, Instant};
 use ringline::{AsyncEventHandler, ConfigBuilder, Connection, RinglineBuilder};
 
 static BLOCKING_STARTED: AtomicBool = AtomicBool::new(false);
+static BLOCKING_RELEASED: AtomicBool = AtomicBool::new(false);
 static BLOCKING_FINISHED: AtomicBool = AtomicBool::new(false);
 
-const BLOCKING_TASK: Duration = Duration::from_millis(300);
+/// How long a test waits for a thread that may be starved: the blocking pool
+/// runs at `SCHED_IDLE`, so on a loaded host it can wait seconds for a CPU.
+const STARVED: Duration = Duration::from_secs(30);
+
+/// How long a held task or worker waits for the test to release it before it
+/// returns anyway, so a failed test does not leave a thread blocked forever.
+const HOLD_LIMIT: Duration = Duration::from_secs(60);
+
+/// Sets its flag when dropped, so a test that fails before releasing a held
+/// thread still lets that thread return.
+struct ReleaseOnDrop(&'static AtomicBool);
+
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+/// Waits until `flag` is set or `limit` has passed.
+fn wait_for(flag: &AtomicBool, limit: Duration) {
+    let deadline = Instant::now() + limit;
+    while !flag.load(Ordering::Acquire) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
 
 /// Serialises the tests, which both read and claim process-wide fd numbers.
 static FD_LOCK: Mutex<()> = Mutex::new(());
 
-/// Starts one blocking task on worker 0 that outlives the runtime.
+/// Starts one blocking task on worker 0 that waits for `BLOCKING_RELEASED`,
+/// so it outlives the runtime.
 struct SlowBlocking;
 
 impl AsyncEventHandler for SlowBlocking {
@@ -48,7 +78,7 @@ impl AsyncEventHandler for SlowBlocking {
         Some(Box::pin(async {
             let task = ringline::spawn_blocking(|| {
                 BLOCKING_STARTED.store(true, Ordering::Release);
-                std::thread::sleep(BLOCKING_TASK);
+                wait_for(&BLOCKING_RELEASED, HOLD_LIMIT);
                 BLOCKING_FINISHED.store(true, Ordering::Release);
             })
             .expect("spawn_blocking");
@@ -85,6 +115,51 @@ fn thread_alive(prefix: &str) -> bool {
         .any(|name| name.trim_end().starts_with(prefix))
 }
 
+/// Waits until a thread whose name starts with `prefix` is inside open(2), or
+/// `limit` has passed. A FIFO open with no writer does not return, so once the
+/// thread is inside the call it stays there until the test opens the writer.
+/// On timeout, returns what the last poll read from each matching thread's
+/// `/proc/self/task/<tid>/syscall`.
+#[cfg(not(has_io_uring))]
+fn wait_in_open(prefix: &str, limit: Duration) -> Result<(), String> {
+    // musl's open() makes the open syscall on archs that have it, of which
+    // only x86_64 is built here; glibc's makes openat.
+    #[cfg(target_arch = "x86_64")]
+    let open_calls = [libc::SYS_openat, libc::SYS_open];
+    #[cfg(not(target_arch = "x86_64"))]
+    let open_calls = [libc::SYS_openat];
+    let deadline = Instant::now() + limit;
+    loop {
+        let reads: Vec<std::io::Result<String>> = std::fs::read_dir("/proc/self/task")
+            .expect("read /proc/self/task")
+            .filter_map(|t| t.ok())
+            .filter(|t| {
+                std::fs::read_to_string(t.path().join("comm"))
+                    .is_ok_and(|name| name.trim_end().starts_with(prefix))
+            })
+            .map(|t| std::fs::read_to_string(t.path().join("syscall")))
+            .collect();
+        // While the thread is blocked in a syscall the first field is its
+        // number; blocked outside one, `-1`; on a CPU, the file reads
+        // `running`.
+        let in_open = reads.iter().any(|read| {
+            read.as_ref().is_ok_and(|s| {
+                s.split_whitespace()
+                    .next()
+                    .and_then(|nr| nr.parse::<libc::c_long>().ok())
+                    .is_some_and(|nr| open_calls.contains(&nr))
+            })
+        });
+        if in_open {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("{reads:?}"));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 /// Whether `fd` is open, checked without opening anything.
 fn is_open(fd: RawFd) -> bool {
     unsafe { libc::fcntl(fd, libc::F_GETFD) >= 0 }
@@ -93,6 +168,7 @@ fn is_open(fd: RawFd) -> bool {
 #[test]
 fn a_late_wake_does_not_write_into_a_reused_fd() {
     let _lock = FD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _release = ReleaseOnDrop(&BLOCKING_RELEASED);
     let config = ConfigBuilder::new()
         .workers(1)
         .pin_to_core(false)
@@ -108,10 +184,7 @@ fn a_late_wake_does_not_write_into_a_reused_fd() {
         .launch::<SlowBlocking>()
         .expect("launch");
 
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !BLOCKING_STARTED.load(Ordering::Acquire) && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    wait_for(&BLOCKING_STARTED, STARVED);
     assert!(
         BLOCKING_STARTED.load(Ordering::Acquire),
         "blocking task never started"
@@ -155,17 +228,15 @@ fn a_late_wake_does_not_write_into_a_reused_fd() {
         claimed.push((read, target));
     }
 
-    let deadline = Instant::now() + BLOCKING_TASK * 3;
-    while !BLOCKING_FINISHED.load(Ordering::Acquire) && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    BLOCKING_RELEASED.store(true, Ordering::Release);
+    wait_for(&BLOCKING_FINISHED, STARVED);
     assert!(
         BLOCKING_FINISHED.load(Ordering::Acquire),
         "blocking task never finished"
     );
     // The pool thread wakes the worker after the task returns and exits after
     // that, since its request channel has closed.
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + STARVED;
     while thread_alive("ringline-blocki") && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -208,8 +279,10 @@ fn a_late_wake_does_not_write_into_a_reused_fd() {
 }
 
 static WORKER_PARKED: AtomicBool = AtomicBool::new(false);
+static WORKER_RELEASED: AtomicBool = AtomicBool::new(false);
 
-/// Blocks the worker thread in `on_start` so it outlives the `Runtime`.
+/// Blocks the worker thread in `on_start` until the test sets
+/// `WORKER_RELEASED`, so it outlives the `Runtime`.
 struct SlowWorker;
 
 impl AsyncEventHandler for SlowWorker {
@@ -220,7 +293,7 @@ impl AsyncEventHandler for SlowWorker {
     fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
         Some(Box::pin(async {
             WORKER_PARKED.store(true, Ordering::Release);
-            std::thread::sleep(BLOCKING_TASK);
+            wait_for(&WORKER_RELEASED, HOLD_LIMIT);
         }))
     }
 
@@ -234,6 +307,7 @@ impl AsyncEventHandler for SlowWorker {
 #[test]
 fn a_running_worker_keeps_its_wake_fd_open() {
     let _lock = FD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _release = ReleaseOnDrop(&WORKER_RELEASED);
     let config = ConfigBuilder::new()
         .workers(1)
         .pin_to_core(false)
@@ -278,6 +352,7 @@ fn a_running_worker_keeps_its_wake_fd_open() {
         closed.is_empty(),
         "Runtime drop closed fds {closed:?} while a worker that uses them is still running"
     );
+    WORKER_RELEASED.store(true, Ordering::Release);
 
     for h in handles {
         h.join().expect("worker panicked").expect("worker error");
@@ -367,8 +442,9 @@ fn a_late_disk_io_wake_does_not_write_into_a_reused_fd() {
         DISK_OPEN_ISSUED.load(Ordering::Acquire),
         "fs::open never issued"
     );
-    // The disk-I/O thread picks the request up and blocks in open(2).
-    std::thread::sleep(Duration::from_millis(50));
+    if let Err(last) = wait_in_open("ringline-disk-i", Duration::from_secs(30)) {
+        panic!("the disk-I/O thread never blocked in open(2); last syscall reads: {last}");
+    }
 
     let before = open_fds();
     drop(runtime);
