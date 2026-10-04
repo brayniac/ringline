@@ -3,8 +3,9 @@
 //! `CloseLead` is chosen from the running kernel, so a host runs one close
 //! path. These tests force each lead through `Config::close_lead_override`
 //! and check that a connection whose task ends sends its FIN. They use one
-//! connection: with two, a pre-6.13 kernel holds the closed socket open
-//! through the other connection's recv, whatever the lead (#581).
+//! connection: with two, a pre-6.13 kernel keeps the closed socket open
+//! through the other connection's recv, so a close led by a cancel sends no
+//! FIN there (#581).
 
 #![allow(clippy::manual_async_fn)]
 
@@ -84,6 +85,8 @@ fn a_close_led_by_a_shutdown_sends_its_fin() {
     assert!(fin_arrives(CloseLead::Shutdown, false));
 }
 
+/// Passes without the lead: the close's own `RecvMulti` cancel ends the
+/// plain recv. The timestamped and stuck-send tests guard the cancel.
 #[test]
 fn a_close_led_by_a_cancel_sends_its_fin() {
     assert!(fin_arrives(CloseLead::CancelAll, false));

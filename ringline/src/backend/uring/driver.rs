@@ -2294,15 +2294,12 @@ impl Driver {
     /// (never-submitted) sends are released here; the in-flight send / chain
     /// SQEs are left to the kernel. The Close does not cancel them; the
     /// `CloseLead` linked ahead of it ends them (a shutdown before Linux
-    /// 6.13, a cancel from 6.13). Their CQEs
-    /// fail the generation identity check in the completion handlers (post
-    /// Close-CQE), so they release their own slots without touching the
-    /// index's next occupant. A CQE that lands *before* the Close CQE still
-    /// matches the generation and takes the normal path: on this abandoned
-    /// connection that can burn a resubmit/POLLOUT SQE against the closing
-    /// fd (EBADF/ECANCELED follow-up) or wake the abandoned waiter — wasteful
-    /// but bounded, and confined to the force path. The next occupant is
-    /// protected by `reset_send_state` at reactivation.
+    /// 6.13, a cancel from 6.13). Their CQEs (`-ECANCELED`, `EPIPE`, or a
+    /// partial count) usually land before the Close CQE. They then find
+    /// `close_submitted` set, release their slot or slab entry, and fail the
+    /// waiter without pushing an SQE. A CQE that lands after the Close CQE
+    /// fails the generation check and releases only its own slot. The next
+    /// occupant is protected by `reset_send_state` at reactivation.
     pub(crate) fn force_finalize_close(&mut self, conn_index: u32) {
         let state = &mut self.send_queues[conn_index as usize];
         let bounded = Self::release_queued_sends(

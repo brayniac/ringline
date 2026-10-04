@@ -37,7 +37,8 @@ pub(crate) enum CloseLead {
     Shutdown,
     /// Cancel every request on the connection's fixed file, from Linux 6.13.
     /// Only this connection's requests hold the socket open, so the `Close`
-    /// sends the FIN once they have ended. The cancel runs inline (#586).
+    /// sends the FIN once they have ended, or an RST if received data is
+    /// unread. The cancel runs inline (#586).
     CancelAll,
 }
 
@@ -733,8 +734,8 @@ impl Ring {
         // requests holding it complete: before Linux 6.13, earlier requests
         // on any registered file or buffer; from 6.13, this connection's own
         // requests. See `CloseLead`. The lead is hard-linked, so the Close
-        // runs after it even when it fails, and `push_sqe_pair` pushes both
-        // together, so a submit cannot separate them; config validation
+        // runs after it even when it fails. `push_sqe_pair` pushes both
+        // together, so a submit cannot separate them. Config validation
         // guarantees an SQ of at least two entries.
         let first = match lead {
             CloseLead::Nothing => {

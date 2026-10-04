@@ -1199,10 +1199,19 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 .expect("checked in_use above")
                 .release(slot);
             if -result == libc::ECANCELED {
-                // Cancelled, connection still alive: re-park so a later
-                // flush re-arms the multishot (or retries the fallback) —
-                // otherwise no recv is armed and the connection hangs.
-                if !self.driver.recv_starved.contains(&conn_index) {
+                // Cancelled with the connection still open: re-park so a
+                // later flush re-arms the multishot (or retries the
+                // fallback); otherwise no recv is armed and the connection
+                // hangs. A close's `CancelAll` lead also cancels it (#586);
+                // that connection is closing and is not re-parked, or the
+                // park would outlive the close and arm a recv on the slot's
+                // next occupant.
+                let open = self
+                    .driver
+                    .connections
+                    .get(conn_index)
+                    .is_some_and(|c| matches!(c.lifecycle, Lifecycle::Open));
+                if open && !self.driver.recv_starved.contains(&conn_index) {
                     self.driver.recv_starved.push(conn_index);
                 }
                 return;
@@ -1331,9 +1340,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // nothing: `ENOTCONN` when the socket is already in `TCP_CLOSE`
             // (reset, failed connect, or both FINs exchanged).
             OpTag::CloseShutdown => {}
-            // Ignored likewise: the `Close` CQE releases the slot, and the
-            // cancelled requests' own CQEs pass the usual stale-completion
-            // checks.
+            // Ignored likewise: the `Close` CQE releases the slot. The
+            // cancelled requests' own CQEs arrive with `-ECANCELED`, usually
+            // before the Close CQE, and take each handler's
+            // `close_submitted` or closing-connection path.
             OpTag::CloseCancel => {}
             OpTag::EventFdRead => self.handle_eventfd_read(),
             OpTag::TlsSend => self.handle_tls_send(ud, result),
@@ -4406,6 +4416,17 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     fn handle_close(&mut self, ud: UserData) {
         let conn_index = ud.conn_index();
 
+        // A parked entry must not outlive the connection: the next occupant
+        // of the index would be re-armed by the next flush.
+        if let Some(pos) = self
+            .driver
+            .recv_starved
+            .iter()
+            .position(|&c| c == conn_index)
+        {
+            self.driver.recv_starved.swap_remove(pos);
+        }
+
         // Replenish any held zero-copy recv buffer.
         if let Some(pending) = self.driver.pending_recv_bufs[conn_index as usize].take() {
             self.driver.pending_replenish.push(pending.bid);
@@ -6798,7 +6819,8 @@ mod tests {
     /// close_notify deadline passes) of a connection with a send stuck in the
     /// kernel, with `lead` ahead of its `Close`, releases the socket. The
     /// stuck send holds the socket until something ends it; the peer never
-    /// reads, and sees a hang-up only once the socket is released (#586).
+    /// reads, and sees a hang-up once the socket is shut down or released
+    /// (#586).
     fn forced_close_releases_a_stuck_send(lead: crate::backend::uring::ring::CloseLead) -> bool {
         use std::os::fd::AsRawFd;
         let mut config = test_config();
@@ -6886,9 +6908,9 @@ mod tests {
 
     /// Committing a parked connection's close does not shut its socket down:
     /// the socket now belongs to another worker, through the installed fd.
-    /// Before Linux 6.13, other closes send a shutdown ahead of the `Close`
-    /// (#581), so
-    /// this test checks that the park path sets `socket_handed_off`.
+    /// Before Linux 6.13 other closes lead with a shutdown (#581). The test
+    /// forces that lead, so it checks on every kernel that the park path sets
+    /// `socket_handed_off`.
     #[test]
     fn closing_a_parked_slot_leaves_the_handed_off_socket_open() {
         use std::io::{Read, Write};
@@ -13126,6 +13148,42 @@ mod tests {
         assert!(
             el.driver.recv_starved.contains(&conn_index),
             "cancelled fallback must re-park, not strand the connection"
+        );
+    }
+
+    /// A fallback recv cancelled by a close (the `CancelAll` lead, #586) does
+    /// not re-park the closing connection. A re-park would outlive the close:
+    /// the next connection installed at the index would get a second
+    /// multishot recv from the next flush.
+    #[test]
+    fn fallback_completion_ecanceled_does_not_repark_a_closing_connection() {
+        let mut el = make_test_loop();
+        let conn_index = park_connection(&mut el);
+        assert!(el.driver.accumulators.append(conn_index, b"part"));
+        el.flush_replenish_and_rearm();
+        assert!(el.driver.recv_fallback_inflight[conn_index as usize]);
+
+        el.driver.close_connection(conn_index);
+        let ud = UserData::encode(OpTag::RecvFallback, conn_index, 0);
+        el.test_dispatch_cqe(ud.raw(), -libc::ECANCELED, 0);
+        assert!(!el.driver.fallback_recv_pool.as_ref().unwrap().in_use(0));
+        assert!(
+            !el.driver.recv_starved.contains(&conn_index),
+            "a closing connection must not be re-parked"
+        );
+
+        // The close completes and the index is reused; a flush must not arm
+        // a recv on the new occupant.
+        let close = UserData::encode(OpTag::Close, conn_index, 0);
+        el.test_dispatch_cqe(close.raw(), 0, 0);
+        let reused = accept_connection(&mut el);
+        assert_eq!(reused, conn_index, "the slot is reused");
+        let before = el.driver.ring.ring.submission().len();
+        el.flush_replenish_and_rearm();
+        assert_eq!(
+            el.driver.ring.ring.submission().len(),
+            before,
+            "the new connection got a recv it did not ask for"
         );
     }
 

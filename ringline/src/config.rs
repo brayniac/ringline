@@ -640,7 +640,8 @@ impl Config {
                 "forward_hold_cap must be >= 1".into(),
             ));
         }
-        // A close pushes a linked shutdown and Close as one pair (#581).
+        // A close pushes its lead (a shutdown or a cancel) and the Close as
+        // one linked pair (#581, #586).
         if self.sq_entries < 2 || !self.sq_entries.is_power_of_two() {
             return Err(crate::error::Error::RingSetup(
                 "sq_entries must be at least 2 and a power of two".into(),
@@ -950,11 +951,14 @@ impl ConfigBuilder {
     /// The kernel runs work it cannot complete inline on io-wq threads. In
     /// the bounded pool that is regular-file I/O that would block, such as
     /// `fs::fsync`, and, before Linux 6.13, the `shutdown` sent ahead of
-    /// each connection close (#581). Past the cap, work waits for a free thread. A cap at
-    /// or below a worker's concurrent blocking file I/O therefore delays its
-    /// connection closes on those kernels: with 32 `fsync` loops on one worker, a cap of 16
-    /// raised the median wait for a closed connection's EOF from 0.2 ms to
-    /// 12 ms (#584). io_uring backend only; the mio backend ignores it.
+    /// each connection close (#581). Past the cap, work waits for a free
+    /// thread. A cap at or below a worker's concurrent blocking file I/O
+    /// therefore delays its connection closes on those kernels: with 32
+    /// `fsync` loops on one worker, a cap of 16 raised the median wait for a
+    /// closed connection's EOF from 0.2 ms to 12 ms (#584). On any kernel, a
+    /// connection half-closed with `shutdown_write` waits for that shutdown
+    /// on this pool before its close. io_uring backend only; the mio backend
+    /// ignores it.
     pub fn iowq_max_workers(mut self, n: u32) -> Self {
         self.config.iowq_max_workers = n;
         self
@@ -1489,8 +1493,8 @@ mod tests {
         assert!(config_with(|c| c.sq_entries = 0).validate().is_err());
     }
 
-    /// A close pushes a linked shutdown and Close as one pair (#581), which a
-    /// one-entry SQ cannot hold.
+    /// A close pushes its lead (a shutdown or a cancel) and the Close as one
+    /// linked pair (#581, #586), which a one-entry SQ cannot hold.
     #[test]
     fn validate_sq_entries_one_rejected() {
         assert!(config_with(|c| c.sq_entries = 1).validate().is_err());
