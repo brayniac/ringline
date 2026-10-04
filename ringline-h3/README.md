@@ -29,15 +29,15 @@ use ringline_h3::{H3Connection, H3Event, HeaderField, Settings};
 
 let mut h3 = H3Connection::new(Settings::default());
 
-// After quic.poll_event():
-h3.handle_quic_event(&mut quic, &event)?;
+// After quic.poll_event(), with `now` read once for this iteration:
+h3.handle_quic_event(&mut quic, now, &event)?;
 
 while let Some(h3_event) = h3.poll_event() {
     match h3_event {
         H3Event::Request { stream_id, headers, end_stream } => {
             let response = vec![HeaderField::new(b":status", b"200")];
-            h3.send_response(&mut quic, stream_id, &response, false)?;
-            h3.send_data(&mut quic, stream_id, b"hello", true)?;
+            h3.send_response(&mut quic, now, stream_id, &response, false)?;
+            h3.send_data(&mut quic, now, stream_id, b"hello", true)?;
         }
         _ => {}
     }

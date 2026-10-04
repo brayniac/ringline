@@ -6,9 +6,11 @@
 //! glue (event ordering, drain logic, close paths) without needing a
 //! kernel socket or an async runtime.
 
+mod common;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bytes::Bytes;
 use quinn_proto::{ClientConfig, ServerConfig};
@@ -58,7 +60,7 @@ fn drain(
     ca: SocketAddr,
     sa: SocketAddr,
 ) -> bool {
-    let now = Instant::now();
+    let now = common::tick();
     let mut moved_any = false;
     for _ in 0..64 {
         let mut moved = false;
@@ -101,7 +103,7 @@ fn drain_until(
             return true;
         }
         // Advance time slightly so timers can fire.
-        std::thread::sleep(Duration::from_millis(2));
+        common::advance(Duration::from_millis(2));
     }
     false
 }
@@ -113,7 +115,7 @@ fn handshake(
     sa: SocketAddr,
 ) -> (QuicConnId, QuicConnId) {
     let client_conn = client
-        .connect(Instant::now(), sa, "localhost")
+        .connect(common::now(), sa, "localhost")
         .expect("connect");
 
     let mut server_conn = None;
@@ -176,7 +178,7 @@ fn read_until_fin(
     let mut buf = vec![0u8; 16 * 1024];
     let mut fin = false;
     // Loop on *progress*, not on a fixed round count. The transport here is
-    // an in-memory function call, but `drain` reads `Instant::now()` and
+    // an in-memory function call, but `drain` reads `common::now()` and
     // drives QUIC's timers from it, so wall-clock time leaks into an
     // otherwise deterministic simulation: under parallel-suite load enough
     // real time can pass between rounds to fire loss-detection or PTO
@@ -197,7 +199,7 @@ fn read_until_fin(
         // synthesised StreamReadable lands.
         while let Some(_ev) = rx_endpoint.poll_event() {}
         loop {
-            match rx_endpoint.stream_recv(rx_conn, stream, &mut buf) {
+            match rx_endpoint.stream_recv(common::now(), rx_conn, stream, &mut buf) {
                 Ok((0, true)) => {
                     fin = true;
                     break;
@@ -231,8 +233,8 @@ fn read_until_fin(
         // This is the flake #386 and #389 were both aiming at. Neither found it
         // because both treated "both endpoints went quiet" as needing more
         // patience rather than asking why the sender had stopped sending.
-        tx_endpoint.flush(Instant::now());
-        rx_endpoint.flush(Instant::now());
+        tx_endpoint.flush(common::now());
+        rx_endpoint.flush(common::now());
         let packets_moved = drain(tx_endpoint, rx_endpoint, tx_addr, rx_addr);
         // Progress is *either* application bytes arriving or datagrams still
         // crossing. The FIN routinely needs rounds after the last data byte,
@@ -277,7 +279,7 @@ fn handshake_then_echo_one_message() {
     let stream = client.open_bi(cc).unwrap().unwrap();
     let n = client.stream_send(cc, stream, b"ping").unwrap();
     assert_eq!(n, 4);
-    client.flush(Instant::now());
+    client.flush(common::now());
 
     drain(&mut client, &mut server, ca, sa);
 
@@ -299,8 +301,10 @@ fn handshake_then_echo_one_message() {
 
     // Echo back.
     server.stream_send(sc, server_stream, b"pong").unwrap();
-    server.stream_finish(sc, server_stream).unwrap();
-    server.flush(Instant::now());
+    server
+        .stream_finish(common::now(), sc, server_stream)
+        .unwrap();
+    server.flush(common::now());
     drain(&mut client, &mut server, ca, sa);
 
     let (resp, fin) = read_until_fin(&mut client, &mut server, ca, sa, cc, stream, 4);
@@ -318,8 +322,8 @@ fn unidirectional_stream_round_trip() {
         .expect("open_uni call ok")
         .expect("stream limit");
     client.stream_send(cc, stream, b"unidi").unwrap();
-    client.stream_finish(cc, stream).unwrap();
-    client.flush(Instant::now());
+    client.stream_finish(common::now(), cc, stream).unwrap();
+    client.flush(common::now());
     drain(&mut client, &mut server, ca, sa);
 
     let mut server_stream = None;
@@ -345,7 +349,7 @@ fn close_connection_drains_close_packet_without_explicit_flush() {
     let (_cc, sc) = handshake(&mut client, &mut server, ca, sa);
 
     let pre = server.send_queue_len();
-    server.close_connection(sc, 0x42, b"bye");
+    server.close_connection(common::now(), sc, 0x42, b"bye");
     let post = server.send_queue_len();
     assert!(
         post > pre,
@@ -359,8 +363,8 @@ fn close_connection_delivers_event_to_peer() {
     let (mut client, mut server, ca, sa, _) = make_pair();
     let (cc, sc) = handshake(&mut client, &mut server, ca, sa);
 
-    server.close_connection(sc, 0x42, b"bye");
-    server.flush(Instant::now());
+    server.close_connection(common::now(), sc, 0x42, b"bye");
+    server.flush(common::now());
 
     let mut client_close = None;
     drain_until(
@@ -410,8 +414,8 @@ fn stream_send_chunks_writes_all_bytes() {
     let total: usize = chunks.iter().map(|c| c.len()).sum();
     let n = client.stream_send_chunks(cc, stream, &mut chunks).unwrap();
     assert_eq!(n, total);
-    client.stream_finish(cc, stream).unwrap();
-    client.flush(Instant::now());
+    client.stream_finish(common::now(), cc, stream).unwrap();
+    client.flush(common::now());
 
     drain(&mut client, &mut server, ca, sa);
     let mut server_stream = None;
@@ -440,10 +444,10 @@ fn many_concurrent_bidi_streams_round_trip() {
             .expect("stream limit");
         let payload = vec![i; 64];
         client.stream_send(cc, stream, &payload).unwrap();
-        client.stream_finish(cc, stream).unwrap();
+        client.stream_finish(common::now(), cc, stream).unwrap();
         client_streams.push((stream, payload));
     }
-    client.flush(Instant::now());
+    client.flush(common::now());
     drain(&mut client, &mut server, ca, sa);
 
     // Server-side: collect all opened streams, read them, echo back.
@@ -465,9 +469,9 @@ fn many_concurrent_bidi_streams_round_trip() {
         assert!(fin);
         // Echo the same payload back on the same bidi stream.
         server.stream_send(sc, *s, &data).unwrap();
-        server.stream_finish(sc, *s).unwrap();
+        server.stream_finish(common::now(), sc, *s).unwrap();
     }
-    server.flush(Instant::now());
+    server.flush(common::now());
     drain(&mut client, &mut server, ca, sa);
 
     for (stream, expected) in &client_streams {
@@ -485,8 +489,8 @@ fn closed_connection_id_returns_invalid() {
     let (mut client, mut server, ca, sa, _) = make_pair();
     let (cc, sc) = handshake(&mut client, &mut server, ca, sa);
 
-    server.close_connection(sc, 0, b"goodbye");
-    server.flush(Instant::now());
+    server.close_connection(common::now(), sc, 0, b"goodbye");
+    server.flush(common::now());
 
     // Drive until the client connection is purged from its slab.
     let mut purged = false;
@@ -497,7 +501,7 @@ fn closed_connection_id_returns_invalid() {
             purged = true;
             break;
         }
-        std::thread::sleep(Duration::from_millis(2));
+        common::advance(Duration::from_millis(2));
     }
     assert!(purged, "client connection should drain after close");
 
@@ -516,7 +520,7 @@ fn client_endpoint_without_client_config_cannot_connect() {
     let server_only = server_config(certs, key);
     let mut endpoint = QuicEndpoint::new(server_only, "127.0.0.1:60001".parse().unwrap());
     let res = endpoint.connect(
-        Instant::now(),
+        common::now(),
         "127.0.0.1:60002".parse().unwrap(),
         "localhost",
     );
@@ -546,7 +550,7 @@ fn server_drops_incoming_when_no_server_config() {
     let (certs, _key) = self_signed();
     let mut client = QuicEndpoint::new(client_config(&certs), "127.0.0.1:60101".parse().unwrap());
     let _ = client.connect(
-        Instant::now(),
+        common::now(),
         "127.0.0.1:60100".parse().unwrap(),
         "localhost",
     );
@@ -554,7 +558,7 @@ fn server_drops_incoming_when_no_server_config() {
     // Ferry the initial Initial packet to the server. Server has no
     // server_config so accept() fails — should not crash, should not yield
     // a NewConnection event.
-    let now = Instant::now();
+    let now = common::tick();
     while let Some(pkt) = client.poll_send() {
         for dgram in pkt.datagrams() {
             server.handle_datagram(now, dgram, "127.0.0.1:60101".parse().unwrap());
@@ -608,12 +612,12 @@ fn idle_timeout_closes_connection() {
     assert_eq!(server.connection_count(), 1);
 
     // Don't ferry any packets for > idle timeout. Drive only timers.
-    std::thread::sleep(Duration::from_millis(350));
+    common::advance(Duration::from_millis(350));
     for _ in 0..16 {
-        let now = Instant::now();
+        let now = common::tick();
         client.drive_timers(now);
         server.drive_timers(now);
-        std::thread::sleep(Duration::from_millis(20));
+        common::advance(Duration::from_millis(20));
     }
 
     // At least one side should have produced a ConnectionClosed event and
@@ -649,15 +653,15 @@ fn large_payload_round_trip_via_endpoint_api() {
     for _ in 0..1024 {
         let n = client.stream_send(cc, stream, &payload[written..]).unwrap();
         written += n;
-        client.flush(Instant::now());
+        client.flush(common::now());
         drain(&mut client, &mut server, ca, sa);
         if written >= payload.len() {
             break;
         }
     }
     assert_eq!(written, payload.len(), "should have pushed full payload");
-    client.stream_finish(cc, stream).unwrap();
-    client.flush(Instant::now());
+    client.stream_finish(common::now(), cc, stream).unwrap();
+    client.flush(common::now());
     drain(&mut client, &mut server, ca, sa);
 
     let mut server_stream = None;
@@ -681,7 +685,7 @@ fn handshake_with_wrong_server_name_fails() {
     // Use a completely wrong server name. quinn will fail TLS server name
     // verification and the connection will close during handshake.
     let cc_id = client
-        .connect(Instant::now(), sa, "not-the-cert.example")
+        .connect(common::now(), sa, "not-the-cert.example")
         .expect("connect");
 
     let mut closed = false;
@@ -719,7 +723,7 @@ fn flush_emits_packets_buffered_during_write() {
     // Without flush, poll_send may be empty even though we have data to
     // send. After flush(), at least one packet should be ready.
     let pre = client.send_queue_len();
-    client.flush(Instant::now());
+    client.flush(common::now());
     let post = client.send_queue_len();
     assert!(
         post > pre,
@@ -737,7 +741,7 @@ fn flush_emits_packets_buffered_during_write() {
     }
     let s = server_stream.expect("server should observe stream opened");
     let mut buf = [0u8; 32];
-    let (n, _fin) = server.stream_recv(sc, s, &mut buf).unwrap();
+    let (n, _fin) = server.stream_recv(common::now(), sc, s, &mut buf).unwrap();
     assert_eq!(&buf[..n], b"flush-me");
 }
 
@@ -755,7 +759,7 @@ fn peer_stop_sending_surfaces_streamstopped_event() {
     // Client opens a bidi stream and pushes one chunk.
     let stream = client.open_bi(cc).unwrap().unwrap();
     client.stream_send(cc, stream, b"hello").unwrap();
-    client.flush(Instant::now());
+    client.flush(common::now());
     drain(&mut client, &mut server, ca, sa);
 
     // Server learns about the stream.
@@ -769,9 +773,9 @@ fn peer_stop_sending_surfaces_streamstopped_event() {
 
     // Server tells the client to stop sending.
     server
-        .stop_sending(sc, s, quinn_proto::VarInt::from_u32(0x99))
+        .stop_sending(common::now(), sc, s, quinn_proto::VarInt::from_u32(0x99))
         .unwrap();
-    server.flush(Instant::now());
+    server.flush(common::now());
     drain(&mut client, &mut server, ca, sa);
 
     // Client should now see StreamStopped on `stream`.
@@ -801,7 +805,7 @@ fn reset_stream_surfaces_read_error_to_peer() {
 
     let stream = client.open_bi(cc).unwrap().unwrap();
     client.stream_send(cc, stream, b"about-to-reset").unwrap();
-    client.flush(Instant::now());
+    client.flush(common::now());
     drain(&mut client, &mut server, ca, sa);
 
     // Server learns about the stream and reads the data.
@@ -813,18 +817,23 @@ fn reset_stream_surfaces_read_error_to_peer() {
     }
     let s = server_stream.expect("server StreamOpened");
     let mut buf = [0u8; 64];
-    let _ = server.stream_recv(sc, s, &mut buf).unwrap();
+    let _ = server.stream_recv(common::now(), sc, s, &mut buf).unwrap();
 
     // Client resets the send side.
     client
-        .reset_stream(cc, stream, quinn_proto::VarInt::from_u32(0x42))
+        .reset_stream(
+            common::now(),
+            cc,
+            stream,
+            quinn_proto::VarInt::from_u32(0x42),
+        )
         .unwrap();
-    client.flush(Instant::now());
+    client.flush(common::now());
     drain(&mut client, &mut server, ca, sa);
 
     // Server's next stream_recv on this stream must return an error
     // (specifically, a `ReadError::Reset`).
-    match server.stream_recv(sc, s, &mut buf) {
+    match server.stream_recv(common::now(), sc, s, &mut buf) {
         Ok(_) => panic!("expected an error after peer reset, got Ok"),
         Err(ringline_quic::Error::Read(quinn_proto::ReadError::Reset(code))) => {
             assert_eq!(code, quinn_proto::VarInt::from_u32(0x42));
@@ -861,7 +870,7 @@ fn send_queue_capacity_caps_queued_packets() {
     let stream = client.open_bi(cc).unwrap().unwrap();
     let payload = vec![0u8; 16 * 1024];
     let _ = client.stream_send(cc, stream, &payload);
-    client.flush(Instant::now());
+    client.flush(common::now());
 
     let qlen = client.send_queue_len();
     assert!(
@@ -917,14 +926,14 @@ fn streams_available_fires_when_peer_raises_limit() {
     let s2 = client.open_bi(cc).unwrap().expect("second stream");
     client.stream_send(cc, s1, b"a").unwrap();
     client.stream_send(cc, s2, b"b").unwrap();
-    client.stream_finish(cc, s1).unwrap();
-    client.stream_finish(cc, s2).unwrap();
+    client.stream_finish(common::now(), cc, s1).unwrap();
+    client.stream_finish(common::now(), cc, s2).unwrap();
     // Third must hit the limit.
     assert!(
         client.open_bi(cc).unwrap().is_none(),
         "expected to hit the stream limit at 2 concurrent bidi streams"
     );
-    client.flush(Instant::now());
+    client.flush(common::now());
     drain(&mut client, &mut server, ca, sa);
 
     // Server: read both streams to FIN, then finish their send side.
@@ -944,7 +953,7 @@ fn streams_available_fires_when_peer_raises_limit() {
         // Read until FIN; server.stream_recv returns (n, true) once the
         // FIN flag arrives.
         for _ in 0..8 {
-            match server.stream_recv(sc, *s, &mut buf) {
+            match server.stream_recv(common::now(), sc, *s, &mut buf) {
                 Ok((_, true)) => break,
                 Ok((_, false)) => {
                     drain(&mut client, &mut server, ca, sa);
@@ -952,9 +961,9 @@ fn streams_available_fires_when_peer_raises_limit() {
                 Err(_) => break,
             }
         }
-        let _ = server.stream_finish(sc, *s);
+        let _ = server.stream_finish(common::now(), sc, *s);
     }
-    server.flush(Instant::now());
+    server.flush(common::now());
 
     // Drive enough rounds for the FINs to ACK and the server to issue
     // MAX_STREAMS.
@@ -971,7 +980,7 @@ fn streams_available_fires_when_peer_raises_limit() {
         if got_avail {
             break;
         }
-        std::thread::sleep(Duration::from_millis(5));
+        common::advance(Duration::from_millis(5));
     }
     assert!(
         got_avail,
@@ -998,7 +1007,9 @@ fn datagram_round_trip() {
     assert!(max >= 256, "max_datagram_size suspiciously small: {max}");
 
     let payload = bytes::Bytes::from_static(b"unreliable hello");
-    client.send_datagram(cc, payload.clone(), false).unwrap();
+    client
+        .send_datagram(common::now(), cc, payload.clone(), false)
+        .unwrap();
     drain(&mut client, &mut server, ca, sa);
 
     let mut got = None;
@@ -1023,7 +1034,7 @@ fn datagram_send_too_large_errors() {
     // 4 KiB is well above any sane datagram MTU on loopback after path
     // overhead — quinn-proto rejects it.
     let too_big = bytes::Bytes::from(vec![0xFFu8; (max + 1) * 4]);
-    let res = client.send_datagram(cc, too_big, false);
+    let res = client.send_datagram(common::now(), cc, too_big, false);
     assert!(res.is_err(), "oversize datagram must fail to enqueue");
 }
 
@@ -1037,7 +1048,9 @@ fn datagram_drop_old_when_full_does_not_error() {
     // datagrams are dropped to make room.
     let payload = bytes::Bytes::from(vec![0xCDu8; 1100]);
     for _ in 0..256 {
-        client.send_datagram(cc, payload.clone(), true).unwrap();
+        client
+            .send_datagram(common::now(), cc, payload.clone(), true)
+            .unwrap();
     }
 
     // Now actually deliver. Server should receive *some* datagrams (we
@@ -1127,7 +1140,7 @@ fn drain_until_connected(
         if connected {
             break;
         }
-        std::thread::sleep(Duration::from_millis(2));
+        common::advance(Duration::from_millis(2));
     }
     (connected, rejected)
 }
@@ -1147,7 +1160,7 @@ fn read_full(
     let mut fin = false;
     for _ in 0..32 {
         loop {
-            match rx.stream_recv(rx_conn, stream, &mut buf) {
+            match rx.stream_recv(common::now(), rx_conn, stream, &mut buf) {
                 Ok((0, true)) => {
                     fin = true;
                     break;
@@ -1166,7 +1179,7 @@ fn read_full(
         if fin {
             break;
         }
-        rx.flush(Instant::now());
+        rx.flush(common::now());
         drain(tx, rx, tx_addr, rx_addr);
     }
     (acc, fin)
@@ -1205,8 +1218,8 @@ fn zero_rtt_round_trip() {
 
     let s1 = client.open_bi(cc1).unwrap().expect("open_bi");
     client.stream_send(cc1, s1, b"warmup-payload").unwrap();
-    client.stream_finish(cc1, s1).unwrap();
-    client.flush(Instant::now());
+    client.stream_finish(common::now(), cc1, s1).unwrap();
+    client.flush(common::now());
     drain(&mut client, &mut server, ca, sa);
 
     // Server reads the warmup stream + finishes its side.
@@ -1220,14 +1233,14 @@ fn zero_rtt_round_trip() {
     let (warmup_data, _fin) = read_full(&mut server, &mut client, sa, ca, sc1, s_srv);
     assert_eq!(&warmup_data, b"warmup-payload");
     server.stream_send(sc1, s_srv, b"ack").unwrap();
-    server.stream_finish(sc1, s_srv).unwrap();
-    server.flush(Instant::now());
+    server.stream_finish(common::now(), sc1, s_srv).unwrap();
+    server.flush(common::now());
     drain(&mut client, &mut server, ca, sa);
 
     // Client drains the response so quinn sees "1-RTT in use" and the
     // server can send NewSessionTicket as a post-handshake message.
     let mut buf = [0u8; 16];
-    let _ = client.stream_recv(cc1, s1, &mut buf);
+    let _ = client.stream_recv(common::now(), cc1, s1, &mut buf);
     drain(&mut client, &mut server, ca, sa);
 
     // Burn enough drain rounds for the NewSessionTicket frame to be
@@ -1235,12 +1248,12 @@ fn zero_rtt_round_trip() {
     // sends the ticket shortly after handshake completion.
     for _ in 0..16 {
         drain(&mut client, &mut server, ca, sa);
-        std::thread::sleep(Duration::from_millis(2));
+        common::advance(Duration::from_millis(2));
     }
 
     // Close conn 1 cleanly. The server's CONNECTION_CLOSE flushes;
     // client observes ConnectionClosed.
-    client.close_connection(cc1, 0, b"warmup-done");
+    client.close_connection(common::now(), cc1, 0, b"warmup-done");
     for _ in 0..8 {
         drain(&mut client, &mut server, ca, sa);
         while let Some(_ev) = client.poll_event() {}
@@ -1249,7 +1262,7 @@ fn zero_rtt_round_trip() {
 
     // ── Connection 2: 0-RTT ─────────────────────────────────────────
     let cc2 = client
-        .connect(Instant::now(), sa, "localhost")
+        .connect(common::now(), sa, "localhost")
         .expect("connect-0rtt");
     assert!(
         client.has_0rtt(cc2),
@@ -1259,8 +1272,8 @@ fn zero_rtt_round_trip() {
     // Send 0-RTT data immediately, before any packet has been ferried.
     let s2 = client.open_uni(cc2).unwrap().expect("open_uni");
     client.stream_send(cc2, s2, b"zero-rtt-hello").unwrap();
-    client.stream_finish(cc2, s2).unwrap();
-    client.flush(Instant::now());
+    client.stream_finish(common::now(), cc2, s2).unwrap();
+    client.flush(common::now());
 
     // Drive packets. The 0-RTT data should arrive at the server inside
     // (or alongside) the handshake exchange.
@@ -1366,8 +1379,8 @@ fn zero_rtt_rejected_event_fires_when_server_cannot_decrypt_ticket() {
         assert!(!client.has_0rtt(cc1));
         let s1 = client.open_bi(cc1).unwrap().unwrap();
         client.stream_send(cc1, s1, b"warmup").unwrap();
-        client.stream_finish(cc1, s1).unwrap();
-        client.flush(Instant::now());
+        client.stream_finish(common::now(), cc1, s1).unwrap();
+        client.flush(common::now());
         drain(&mut client, &mut server_a, ca, sa);
 
         let mut srv_stream = None;
@@ -1379,16 +1392,16 @@ fn zero_rtt_rejected_event_fires_when_server_cannot_decrypt_ticket() {
         let s_srv = srv_stream.unwrap();
         let _ = read_full(&mut server_a, &mut client, sa, ca, sc1, s_srv);
         server_a.stream_send(sc1, s_srv, b"ack").unwrap();
-        server_a.stream_finish(sc1, s_srv).unwrap();
-        server_a.flush(Instant::now());
+        server_a.stream_finish(common::now(), sc1, s_srv).unwrap();
+        server_a.flush(common::now());
         drain(&mut client, &mut server_a, ca, sa);
         let mut buf = [0u8; 8];
-        let _ = client.stream_recv(cc1, s1, &mut buf);
+        let _ = client.stream_recv(common::now(), cc1, s1, &mut buf);
         for _ in 0..16 {
             drain(&mut client, &mut server_a, ca, sa);
-            std::thread::sleep(Duration::from_millis(2));
+            common::advance(Duration::from_millis(2));
         }
-        client.close_connection(cc1, 0, b"done");
+        client.close_connection(common::now(), cc1, 0, b"done");
         for _ in 0..8 {
             drain(&mut client, &mut server_a, ca, sa);
         }
@@ -1401,7 +1414,7 @@ fn zero_rtt_rejected_event_fires_when_server_cannot_decrypt_ticket() {
     let mut client = QuicEndpoint::new(client_cfg, ca);
     let mut server_b = QuicEndpoint::new(mk_server(&certs, &key), sa);
     let cc2 = client
-        .connect(Instant::now(), sa, "localhost")
+        .connect(common::now(), sa, "localhost")
         .expect("connect");
     assert!(
         client.has_0rtt(cc2),
@@ -1412,8 +1425,8 @@ fn zero_rtt_rejected_event_fires_when_server_cannot_decrypt_ticket() {
     // discarded by quinn-proto on accepted_0rtt = false.
     let s = client.open_uni(cc2).unwrap().unwrap();
     client.stream_send(cc2, s, b"early-data-doomed").unwrap();
-    client.stream_finish(cc2, s).unwrap();
-    client.flush(Instant::now());
+    client.stream_finish(common::now(), cc2, s).unwrap();
+    client.flush(common::now());
 
     let (connected, rejected) = drain_until_connected(&mut client, &mut server_b, ca, sa, cc2);
     assert!(
@@ -1443,7 +1456,7 @@ fn zero_rtt_no_resumption_uses_normal_handshake() {
     let mut server = QuicEndpoint::new(server_cfg, sa);
 
     let cc = client
-        .connect(Instant::now(), sa, "localhost")
+        .connect(common::now(), sa, "localhost")
         .expect("connect");
     assert!(
         !client.has_0rtt(cc),
@@ -1475,7 +1488,7 @@ fn drain_with_apparent_client(
     apparent_client_addr: SocketAddr,
     server_addr: SocketAddr,
 ) {
-    let now = Instant::now();
+    let now = common::tick();
     for _ in 0..64 {
         let mut moved = false;
         while let Some(pkt) = client.poll_send() {
@@ -1538,7 +1551,7 @@ fn peer_address_changed_event_fires_on_migration() {
     // new source — this stream traffic provides that.
     let stream = client.open_bi(cc).unwrap().expect("open_bi");
     client.stream_send(cc, stream, b"hello-from-ca1").unwrap();
-    client.flush(Instant::now());
+    client.flush(common::now());
     drain(&mut client, &mut server, ca1, sa);
 
     // Drain server events to clear the noise so we can isolate the
@@ -1548,7 +1561,7 @@ fn peer_address_changed_event_fires_on_migration() {
     // Now NAT-rebind: future packets the client sends arrive at the
     // server claiming source = ca2.
     client.stream_send(cc, stream, b"now-from-ca2").unwrap();
-    client.flush(Instant::now());
+    client.flush(common::now());
 
     let mut got_event = None;
     for _ in 0..32 {
@@ -1567,7 +1580,7 @@ fn peer_address_changed_event_fires_on_migration() {
         if got_event.is_some() {
             break;
         }
-        std::thread::sleep(Duration::from_millis(2));
+        common::advance(Duration::from_millis(2));
     }
 
     let (prev, curr) =
@@ -1600,17 +1613,17 @@ fn migration_disabled_drops_packets_from_new_address() {
 
     let stream = client.open_bi(cc).unwrap().expect("open_bi");
     client.stream_send(cc, stream, b"hello").unwrap();
-    client.flush(Instant::now());
+    client.flush(common::now());
     drain(&mut client, &mut server, ca1, sa);
     while let Some(_ev) = server.poll_event() {}
 
     // Try to migrate. Packets are dropped server-side; the connection
     // stays on the original path.
     client.stream_send(cc, stream, b"would-migrate").unwrap();
-    client.flush(Instant::now());
+    client.flush(common::now());
     for _ in 0..16 {
         drain_with_apparent_client(&mut client, &mut server, ca2, sa);
-        std::thread::sleep(Duration::from_millis(2));
+        common::advance(Duration::from_millis(2));
     }
 
     // No PeerAddressChanged should have fired.
@@ -1659,13 +1672,17 @@ fn quic_sustained_large_stream_round_trip() {
     let stream = client.open_bi(cc).unwrap().expect("open_bi");
     let payload: Vec<u8> = (0..8 * 1024 * 1024).map(|i| (i & 0xFF) as u8).collect();
 
-    let started = Instant::now();
+    // The real clock: this measures how fast the test runs, and is never
+    // passed to the endpoints.
+    let started = std::time::Instant::now();
     let mut written = 0usize;
     let mut received: Vec<u8> = Vec::with_capacity(payload.len());
     let mut server_stream: Option<quinn_proto::StreamId> = None;
     let mut fin_seen = false;
     let mut buf = vec![0u8; 64 * 1024];
-    let deadline = Instant::now() + Duration::from_secs(30);
+    // Simulated time advances one round per `drain`, so this bounds a stall
+    // at 30 000 rounds.
+    let deadline = common::now() + Duration::from_secs(30);
     let mut finished = false;
 
     // Producer/consumer pump: push what flow control allows, ferry
@@ -1673,7 +1690,7 @@ fn quic_sustained_large_stream_round_trip() {
     // either bytes into the stream, bytes out of it, or both.
     while !(received.len() == payload.len() && fin_seen) {
         assert!(
-            Instant::now() < deadline,
+            common::now() < deadline,
             "stalled at written={written}/{}, received={}/{} (fin_seen={fin_seen})",
             payload.len(),
             received.len(),
@@ -1691,11 +1708,13 @@ fn quic_sustained_large_stream_round_trip() {
                 Err(e) => panic!("unexpected stream_send error: {e:?}"),
             }
             if written == payload.len() && !finished {
-                client.stream_finish(cc, stream).expect("stream_finish");
+                client
+                    .stream_finish(common::now(), cc, stream)
+                    .expect("stream_finish");
                 finished = true;
             }
         }
-        client.flush(Instant::now());
+        client.flush(common::now());
 
         drain(&mut client, &mut server, ca, sa);
 
@@ -1708,7 +1727,7 @@ fn quic_sustained_large_stream_round_trip() {
         }
         if let Some(s) = server_stream {
             loop {
-                match server.stream_recv(sc, s, &mut buf) {
+                match server.stream_recv(common::now(), sc, s, &mut buf) {
                     Ok((0, true)) => {
                         fin_seen = true;
                         break;
@@ -1726,7 +1745,7 @@ fn quic_sustained_large_stream_round_trip() {
             }
             // The server's read may have produced MAX_STREAM_DATA
             // frames; flush them out.
-            server.flush(Instant::now());
+            server.flush(common::now());
         }
     }
 
@@ -1777,7 +1796,7 @@ fn quic_drain_transmits_preserves_gso_segments() {
     let _ = client
         .stream_send(cc, stream, &payload)
         .expect("stream_send");
-    client.flush(Instant::now());
+    client.flush(common::now());
 
     let initial_mtu_ceiling = 1500usize; // generous; INITIAL_MTU is 1200
     let mut max_datagram = 0usize;
@@ -1815,8 +1834,8 @@ fn close_connection_called_twice_is_idempotent() {
     let (mut client, mut server, ca, sa, _) = make_pair();
     let (cc, _sc) = handshake(&mut client, &mut server, ca, sa);
 
-    client.close_connection(cc, 0, b"first");
-    client.close_connection(cc, 0, b"second");
+    client.close_connection(common::now(), cc, 0, b"first");
+    client.close_connection(common::now(), cc, 0, b"second");
 
     let mut close_events = 0;
     while let Some(ev) = client.poll_event() {
@@ -1838,7 +1857,7 @@ fn stream_finish_surfaces_peer_stop_sending_error_code() {
 
     let stream = client.open_bi(cc).unwrap().unwrap();
     client.stream_send(cc, stream, b"hi").unwrap();
-    client.flush(Instant::now());
+    client.flush(common::now());
     drain(&mut client, &mut server, ca, sa);
 
     // Wait for the server to learn about the stream so it can stop it.
@@ -1856,15 +1875,20 @@ fn stream_finish_surfaces_peer_stop_sending_error_code() {
     }
     let server_stream = server_stream.expect("server saw stream");
     server
-        .stop_sending(sc, server_stream, quinn_proto::VarInt::from_u32(0xc0de))
+        .stop_sending(
+            common::now(),
+            sc,
+            server_stream,
+            quinn_proto::VarInt::from_u32(0xc0de),
+        )
         .expect("stop_sending");
-    server.flush(Instant::now());
+    server.flush(common::now());
     drain(&mut client, &mut server, ca, sa);
 
     // Client's stream_finish should learn about the peer's stop with the
     // exact error code.
     let err = client
-        .stream_finish(cc, stream)
+        .stream_finish(common::now(), cc, stream)
         .expect_err("expected error");
     match err {
         Error::StreamStopped(code) => assert_eq!(code.into_inner(), 0xc0de),
@@ -1883,7 +1907,7 @@ fn datagram_blocked_returns_original_payload() {
     let payload = bytes::Bytes::from(vec![0u8; 1100]);
     let mut blocked = None;
     for _ in 0..4096 {
-        match client.send_datagram(cc, payload.clone(), false) {
+        match client.send_datagram(common::now(), cc, payload.clone(), false) {
             Ok(()) => continue,
             Err(Error::DatagramBlocked(b)) => {
                 blocked = Some(b);
@@ -1906,7 +1930,7 @@ fn stream_send_on_closing_connection_returns_connection_closing() {
     let (cc, _sc) = handshake(&mut client, &mut server, ca, sa);
     let stream = client.open_bi(cc).unwrap().unwrap();
 
-    client.close_connection(cc, 0, b"done");
+    client.close_connection(common::now(), cc, 0, b"done");
     // Now the connection is closed locally — `get_conn_mut` rejects
     // application operations with `InvalidConnection`.
     let err = client
@@ -1948,7 +1972,7 @@ fn poll_send_yields_nothing_until_flush() {
         "buffered bytes alone must not produce a packet: {buffered} bytes are \
          queued and nothing has flushed them"
     );
-    client.flush(Instant::now());
+    client.flush(common::now());
     assert!(
         client.poll_send().is_some(),
         "flush must generate the packet for the buffered bytes"

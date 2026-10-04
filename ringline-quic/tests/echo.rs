@@ -133,15 +133,17 @@ impl AsyncEventHandler for QuicEchoServer {
                 while let Some(event) = quic.poll_event() {
                     match event {
                         QuicEvent::StreamReadable { conn, stream } => loop {
-                            let (n, fin) = match quic.stream_recv(conn, stream, &mut read_buf) {
-                                Ok(r) => r,
-                                Err(_) => break,
-                            };
+                            let (n, fin) =
+                                match quic.stream_recv(Instant::now(), conn, stream, &mut read_buf)
+                                {
+                                    Ok(r) => r,
+                                    Err(_) => break,
+                                };
                             if n > 0 {
                                 let _ = quic.stream_send(conn, stream, &read_buf[..n]);
                             }
                             if fin {
-                                let _ = quic.stream_finish(conn, stream);
+                                let _ = quic.stream_finish(Instant::now(), conn, stream);
                                 break;
                             }
                             if n == 0 {

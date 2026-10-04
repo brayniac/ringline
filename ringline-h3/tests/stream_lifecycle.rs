@@ -5,9 +5,10 @@
 //! peer. Before these fixes the maps grew without bound on long-lived
 //! connections.
 
+mod common;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
 
 use quinn_proto::{ClientConfig, ServerConfig, TransportConfig, VarInt};
 use ringline_h3::error::H3Error;
@@ -54,7 +55,7 @@ fn shuffle(
     server_addr: SocketAddr,
 ) {
     for _ in 0..128 {
-        let now = Instant::now();
+        let now = common::tick();
         client.flush(now);
         server.flush(now);
         let mut moved = false;
@@ -85,7 +86,7 @@ fn handshake(
     server_addr: SocketAddr,
 ) -> (QuicConnId, QuicConnId) {
     let client_conn = client
-        .connect(Instant::now(), server_addr, "localhost")
+        .connect(common::now(), server_addr, "localhost")
         .expect("connect");
     let mut server_conn = None;
     for _ in 0..32 {
@@ -112,7 +113,8 @@ fn pump_h3(ep: &mut QuicEndpoint, h3: &mut H3Connection) {
         events.push(ev);
     }
     for ev in events {
-        h3.handle_quic_event(ep, &ev).expect("h3 event");
+        h3.handle_quic_event(ep, common::now(), &ev)
+            .expect("h3 event");
     }
 }
 
@@ -153,10 +155,18 @@ fn connected_pair() -> (
     let mut server_h3 = H3Connection::new(Settings::default());
 
     client_h3
-        .handle_quic_event(&mut client_ep, &QuicEvent::Connected(client_conn))
+        .handle_quic_event(
+            &mut client_ep,
+            common::now(),
+            &QuicEvent::Connected(client_conn),
+        )
         .expect("client initiate");
     server_h3
-        .handle_quic_event(&mut server_ep, &QuicEvent::NewConnection(server_conn))
+        .handle_quic_event(
+            &mut server_ep,
+            common::now(),
+            &QuicEvent::NewConnection(server_conn),
+        )
         .expect("server accept");
 
     // Exchange SETTINGS.
@@ -201,6 +211,7 @@ fn request_streams_cleaned_up_after_round_trip() {
     let req_stream = client_h3
         .send_request(
             &mut client_ep,
+            common::now(),
             &[
                 HeaderField::new(b":method", b"GET"),
                 HeaderField::new(b":path", b"/"),
@@ -226,6 +237,7 @@ fn request_streams_cleaned_up_after_round_trip() {
     server_h3
         .send_response(
             &mut server_ep,
+            common::now(),
             resp_stream,
             &[HeaderField::new(b":status", b"200")],
             true, // end_stream
@@ -277,6 +289,7 @@ fn stop_sending_drops_pending_state_and_emits_event() {
     let req_stream = client_h3
         .send_request(
             &mut client_ep,
+            common::now(),
             &[
                 HeaderField::new(b":method", b"GET"),
                 HeaderField::new(b":path", b"/"),
@@ -304,13 +317,14 @@ fn stop_sending_drops_pending_state_and_emits_event() {
     server_h3
         .send_response(
             &mut server_ep,
+            common::now(),
             resp_stream,
             &[HeaderField::new(b":status", b"200")],
             false,
         )
         .expect("send_response");
     server_h3
-        .send_data(&mut server_ep, resp_stream, &body, false)
+        .send_data(&mut server_ep, common::now(), resp_stream, &body, false)
         .expect("send_data");
 
     assert!(
@@ -326,7 +340,7 @@ fn stop_sending_drops_pending_state_and_emits_event() {
     // recv half tells the server-side send half to stop. The stream id is
     // the same on both sides (it's bidirectional).
     client_ep
-        .stop_sending(client_conn, req_stream, VarInt::from_u32(0))
+        .stop_sending(common::now(), client_conn, req_stream, VarInt::from_u32(0))
         .expect("stop_sending");
 
     // Pump until the server sees the STOP_SENDING event.
@@ -377,6 +391,7 @@ fn peer_reset_drops_stream_state_and_emits_event() {
     let req_stream = client_h3
         .send_request(
             &mut client_ep,
+            common::now(),
             &[
                 HeaderField::new(b":method", b"POST"),
                 HeaderField::new(b":path", b"/echo"),
@@ -388,7 +403,13 @@ fn peer_reset_drops_stream_state_and_emits_event() {
         .expect("send_request");
 
     client_h3
-        .send_data(&mut client_ep, req_stream, b"some body bytes", false)
+        .send_data(
+            &mut client_ep,
+            common::now(),
+            req_stream,
+            b"some body bytes",
+            false,
+        )
         .expect("send_data");
 
     shuffle(&mut client_ep, &mut server_ep, client_addr, server_addr);
@@ -397,7 +418,7 @@ fn peer_reset_drops_stream_state_and_emits_event() {
 
     // Client decides to give up — resets the request stream.
     client_ep
-        .reset_stream(client_conn, req_stream, VarInt::from_u32(42))
+        .reset_stream(common::now(), client_conn, req_stream, VarInt::from_u32(42))
         .expect("reset_stream");
 
     // Pump until the server sees the RESET_STREAM event.
@@ -450,7 +471,7 @@ fn send_request_after_goaway_errors() {
 
     // Server sends GOAWAY (stream id 4 — the next-expected client stream).
     server_h3
-        .send_goaway(&mut server_ep, 4)
+        .send_goaway(&mut server_ep, common::now(), 4)
         .expect("send_goaway");
 
     // Push the GOAWAY through and let the client process it.
@@ -467,6 +488,7 @@ fn send_request_after_goaway_errors() {
     let err = client_h3
         .send_request(
             &mut client_ep,
+            common::now(),
             &[
                 HeaderField::new(b":method", b"GET"),
                 HeaderField::new(b":path", b"/late"),
@@ -506,6 +528,7 @@ fn zero_rtt_rejected_clears_state_and_emits_event() {
     let _req_stream = client_h3
         .send_request(
             &mut client_ep,
+            common::now(),
             &[
                 HeaderField::new(b":method", b"GET"),
                 HeaderField::new(b":path", b"/"),
@@ -523,6 +546,7 @@ fn zero_rtt_rejected_clears_state_and_emits_event() {
     client_h3
         .handle_quic_event(
             &mut client_ep,
+            common::now(),
             &QuicEvent::ZeroRttRejected { conn: client_conn },
         )
         .expect("handle ZeroRttRejected");
@@ -560,6 +584,7 @@ fn pending_bytes_cap_returns_backpressure_exceeded() {
     let req_stream = client_h3
         .send_request(
             &mut client_ep,
+            common::now(),
             &[
                 HeaderField::new(b":method", b"POST"),
                 HeaderField::new(b":path", b"/upload"),
@@ -574,7 +599,7 @@ fn pending_bytes_cap_returns_backpressure_exceeded() {
     // accumulate in `pending_sends` and immediately blow past the cap.
     let body = vec![0u8; 32 * 1024];
     let err = client_h3
-        .send_data(&mut client_ep, req_stream, &body, false)
+        .send_data(&mut client_ep, common::now(), req_stream, &body, false)
         .expect_err("send_data should fail past cap");
     assert!(
         matches!(err, H3Error::BackpressureExceeded),
@@ -604,6 +629,7 @@ fn trailers_emit_trailers_event() {
     let req_stream = client_h3
         .send_request(
             &mut client_ep,
+            common::now(),
             &[
                 HeaderField::new(b":method", b"GET"),
                 HeaderField::new(b":path", b"/"),
@@ -628,17 +654,19 @@ fn trailers_emit_trailers_event() {
     server_h3
         .send_response(
             &mut server_ep,
+            common::now(),
             resp_stream,
             &[HeaderField::new(b":status", b"200")],
             false,
         )
         .expect("send_response");
     server_h3
-        .send_data(&mut server_ep, resp_stream, b"body", false)
+        .send_data(&mut server_ep, common::now(), resp_stream, b"body", false)
         .expect("send_data");
     server_h3
         .send_trailers(
             &mut server_ep,
+            common::now(),
             resp_stream,
             &[HeaderField::new(b"x-trailer", b"v")],
         )
@@ -700,7 +728,7 @@ fn send_request_rejects_oversize_headers_per_peer_settings() {
     ];
 
     let err = client_h3
-        .send_request(&mut client_ep, &headers, true)
+        .send_request(&mut client_ep, common::now(), &headers, true)
         .expect_err("expected ExcessiveSize from oversize headers");
     assert!(matches!(err, H3Error::ExcessiveSize));
 

@@ -181,10 +181,13 @@ impl QuicEndpoint {
     /// `sendmsg` syscalls into one.
     ///
     /// Nested batches compose: only the outermost guard's drop
-    /// performs the flush.
-    pub fn batch(&mut self) -> BatchGuard<'_> {
+    /// performs the flush, at the `now` that guard was created with.
+    pub fn batch(&mut self, now: Instant) -> BatchGuard<'_> {
         self.batch_depth = self.batch_depth.saturating_add(1);
-        BatchGuard { endpoint: self }
+        BatchGuard {
+            endpoint: self,
+            now,
+        }
     }
 
     /// Feed an incoming UDP datagram to the QUIC state machine.
@@ -381,6 +384,7 @@ impl QuicEndpoint {
     /// has finished sending on this stream.
     pub fn stream_recv(
         &mut self,
+        now: Instant,
         conn: QuicConnId,
         stream: StreamId,
         buf: &mut [u8],
@@ -421,7 +425,7 @@ impl QuicEndpoint {
         // receive other datagrams quickly.
         let should_transmit = chunks.finalize().should_transmit();
         if should_transmit {
-            self.drain_transmits(key, Instant::now());
+            self.drain_transmits(key, now);
         }
         if let Some(e) = read_err {
             return Err(Error::Read(e));
@@ -441,6 +445,7 @@ impl QuicEndpoint {
     /// frame payload extraction.
     pub fn stream_recv_into(
         &mut self,
+        now: Instant,
         conn: QuicConnId,
         stream: StreamId,
         buf: &mut BytesMut,
@@ -476,7 +481,7 @@ impl QuicEndpoint {
         }
         let should_transmit = chunks.finalize().should_transmit();
         if should_transmit {
-            self.drain_transmits(key, Instant::now());
+            self.drain_transmits(key, now);
         }
         if let Some(e) = read_err {
             return Err(Error::Read(e));
@@ -490,7 +495,12 @@ impl QuicEndpoint {
     /// with `code` before we finished, `Err(StreamClosed)` if the stream
     /// was already finished or reset locally. The frame is queued
     /// immediately — callers don't need to `flush()`.
-    pub fn stream_finish(&mut self, conn: QuicConnId, stream: StreamId) -> Result<(), Error> {
+    pub fn stream_finish(
+        &mut self,
+        now: Instant,
+        conn: QuicConnId,
+        stream: StreamId,
+    ) -> Result<(), Error> {
         let key = conn.0 as usize;
         let c = self.get_conn_mut(conn)?;
         match c.conn.send_stream(stream).finish() {
@@ -498,7 +508,7 @@ impl QuicEndpoint {
             Err(quinn_proto::FinishError::Stopped(code)) => return Err(Error::StreamStopped(code)),
             Err(quinn_proto::FinishError::ClosedStream) => return Err(Error::StreamClosed),
         }
-        self.drain_transmits(key, Instant::now());
+        self.drain_transmits(key, now);
         Ok(())
     }
 
@@ -510,6 +520,7 @@ impl QuicEndpoint {
     /// Returns `Err(StreamClosed)` if the recv side was already finished.
     pub fn stop_sending(
         &mut self,
+        now: Instant,
         conn: QuicConnId,
         stream: StreamId,
         error_code: quinn_proto::VarInt,
@@ -520,7 +531,7 @@ impl QuicEndpoint {
             Ok(()) => {}
             Err(quinn_proto::ClosedStream { .. }) => return Err(Error::StreamClosed),
         }
-        self.drain_transmits(key, Instant::now());
+        self.drain_transmits(key, now);
         Ok(())
     }
 
@@ -531,6 +542,7 @@ impl QuicEndpoint {
     /// or reset.
     pub fn reset_stream(
         &mut self,
+        now: Instant,
         conn: QuicConnId,
         stream: StreamId,
         error_code: quinn_proto::VarInt,
@@ -541,7 +553,7 @@ impl QuicEndpoint {
             Ok(()) => {}
             Err(quinn_proto::ClosedStream { .. }) => return Err(Error::StreamClosed),
         }
-        self.drain_transmits(key, Instant::now());
+        self.drain_transmits(key, now);
         Ok(())
     }
 
@@ -611,7 +623,7 @@ impl QuicEndpoint {
     /// before this call returns, so the peer is told about the closure as
     /// soon as the caller flushes its UDP socket. There is no need for the
     /// caller to also call [`flush`](Self::flush).
-    pub fn close_connection(&mut self, conn: QuicConnId, code: u32, reason: &[u8]) {
+    pub fn close_connection(&mut self, now: Instant, conn: QuicConnId, code: u32, reason: &[u8]) {
         let key = conn.0 as usize;
         if !self.connections.contains(key) {
             return;
@@ -623,7 +635,6 @@ impl QuicEndpoint {
         if self.connections[key].close_event_emitted {
             return;
         }
-        let now = Instant::now();
         self.connections[key].conn.close(
             now,
             quinn_proto::VarInt::from_u32(code),
@@ -668,6 +679,7 @@ impl QuicEndpoint {
     ///   extra clone / allocation.
     pub fn send_datagram(
         &mut self,
+        now: Instant,
         conn: QuicConnId,
         data: bytes::Bytes,
         drop_old_when_full: bool,
@@ -687,7 +699,6 @@ impl QuicEndpoint {
         // Make sure the resulting DATAGRAM frame actually leaves the
         // connection — see `close_connection` for the same lesson.
         let key = conn.0 as usize;
-        let now = Instant::now();
         self.drain_transmits(key, now);
         Ok(())
     }
@@ -825,7 +836,7 @@ impl QuicEndpoint {
     /// the whole buffer in one syscall, while others split per-datagram
     /// via [`OutgoingPacket::datagrams`].
     fn drain_transmits(&mut self, key: usize, now: Instant) {
-        // Inside a `batch()` scope, defer until the guard's drop calls
+        // Inside a `batch` scope, defer until the guard's drop calls
         // `flush()`. This is what lets quinn-proto coalesce a batch of
         // stream operations into a single GSO segment instead of
         // emitting one datagram per stream_send / stream_finish /
@@ -1064,18 +1075,19 @@ impl QuicEndpoint {
 /// internal `drain_transmits` calls that normally fire after each
 /// stream operation so quinn-proto can coalesce a whole batch into a
 /// single GSO buffer. On drop, flushes the connections so the
-/// accumulated work goes out as one burst.
+/// accumulated work goes out as one burst, at the `now` passed to
+/// [`QuicEndpoint::batch`].
 ///
-/// Construct via `let g = endpoint.batch();` and dereference through
+/// Construct via `let g = endpoint.batch(now);` and dereference through
 /// the guard to issue stream operations:
 ///
 /// ```rust,ignore
 /// {
-///     let mut g = endpoint.batch();
+///     let mut g = endpoint.batch(now);
 ///     for _ in 0..n {
 ///         let stream = g.open_bi(conn)?.unwrap();
 ///         g.stream_send(conn, stream, payload)?;
-///         g.stream_finish(conn, stream)?;
+///         g.stream_finish(now, conn, stream)?;
 ///     }
 ///     // Drop here triggers a single flush — quinn-proto can
 ///     // coalesce the n datagrams into one GSO segment.
@@ -1083,6 +1095,17 @@ impl QuicEndpoint {
 /// ```
 pub struct BatchGuard<'a> {
     endpoint: &'a mut QuicEndpoint,
+    /// When the batch's flush happens.
+    now: Instant,
+}
+
+impl BatchGuard<'_> {
+    /// Set the time the batch's flush uses. A batch held across an `.await`
+    /// sets it once the wait returns, so the flush is not stamped with the
+    /// time from before the wait.
+    pub fn set_now(&mut self, now: Instant) {
+        self.now = now;
+    }
 }
 
 impl<'a> std::ops::Deref for BatchGuard<'a> {
@@ -1103,13 +1126,12 @@ impl<'a> Drop for BatchGuard<'a> {
         // Decrement first so the flush below actually performs the
         // drain. saturating_sub keeps the field correct even if a
         // future bug double-drops (it can't today — `BatchGuard` is
-        // !Copy and constructed only by `batch()`).
+        // !Copy and constructed only by `batch`).
         self.endpoint.batch_depth = self.endpoint.batch_depth.saturating_sub(1);
         if self.endpoint.batch_depth == 0 {
-            // Use a single fresh `Instant::now` for the whole flush
-            // so quinn-proto's transmission accounting sees one
-            // consistent timestamp for the batch.
-            self.endpoint.flush(std::time::Instant::now());
+            // Guards drop innermost first, so this is the outermost
+            // guard, and the flush uses its `now`.
+            self.endpoint.flush(self.now);
         }
     }
 }
