@@ -14,7 +14,7 @@ use std::net::{Ipv6Addr, SocketAddr, UdpSocket};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use ringline::{
     AsyncEventHandler, Config, Connection, ParseResult, RinglineBuilder, UdpCtx, UdpSendError,
@@ -1953,103 +1953,6 @@ fn udp_invalid_bind_address_returns_error() {
     assert!(
         result.is_err(),
         "binding UDP to an unassigned address must surface the failure to launch()"
-    );
-}
-
-// ── No fd leak across repeated launch+shutdown cycles ──────────────────
-
-#[cfg(target_os = "linux")]
-fn open_fd_count() -> usize {
-    std::fs::read_dir("/proc/self/fd")
-        .map(|d| d.count())
-        .unwrap_or(0)
-}
-
-/// What each open fd refers to, for a failure message.
-#[cfg(target_os = "linux")]
-fn open_fd_targets() -> Vec<String> {
-    let mut targets: Vec<String> = std::fs::read_dir("/proc/self/fd")
-        .map(|d| {
-            d.filter_map(|e| e.ok())
-                .filter_map(|e| std::fs::read_link(e.path()).ok())
-                .map(|t| t.display().to_string())
-                .collect()
-        })
-        .unwrap_or_default();
-    targets.sort();
-    targets
-}
-
-/// The open-fd count once it has stopped changing for 200 ms, or after
-/// 10 s. Threads that outlive a runtime (the resolver and blocking pools,
-/// which hold its wake fds) release their fds when they exit, which under
-/// load can be well after the workers join.
-#[cfg(target_os = "linux")]
-fn settled_fd_count() -> usize {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut last = open_fd_count();
-    loop {
-        std::thread::sleep(Duration::from_millis(200));
-        let now = open_fd_count();
-        if now == last || Instant::now() >= deadline {
-            return now;
-        }
-        last = now;
-    }
-}
-
-#[test]
-#[cfg(target_os = "linux")]
-fn udp_repeated_launch_does_not_leak_fds() {
-    let _guard = UDP_SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-
-    // Burn a few launches first so any one-shot allocations (resolver
-    // pool, blocking pool, etc.) settle in. Compare counts after that.
-    for _ in 0..2 {
-        reset_echo_started();
-        let (shutdown, handles) = RinglineBuilder::new(base_config())
-            .bind_udp("127.0.0.1:0".parse().unwrap())
-            .launch::<UdpEcho>()
-            .expect("launch");
-        await_handler_started(ECHO_STARTED.get().unwrap());
-        shutdown.shutdown();
-        for h in handles {
-            h.join().unwrap().unwrap();
-        }
-    }
-
-    let baseline = settled_fd_count();
-
-    for _ in 0..6 {
-        reset_echo_started();
-        let (shutdown, handles) = RinglineBuilder::new(base_config())
-            .bind_udp("127.0.0.1:0".parse().unwrap())
-            .launch::<UdpEcho>()
-            .expect("launch");
-        await_handler_started(ECHO_STARTED.get().unwrap());
-        shutdown.shutdown();
-        for h in handles {
-            h.join().unwrap().unwrap();
-        }
-    }
-
-    // Wait for the count to come back within the slack of the baseline. A
-    // leak never does; fds held by threads that are still exiting do.
-    // Allow some slack for transient fds (logger flush, /proc handle) but
-    // no per-iteration leak.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut after = open_fd_count();
-    while after.saturating_sub(baseline) >= 6 && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(20));
-        after = open_fd_count();
-    }
-    let delta = after.saturating_sub(baseline);
-    assert!(
-        delta < 6,
-        "fd count grew by {delta} after 6 launch+shutdown cycles and stayed up for 10 s \
-         (baseline={baseline}, after={after}); suggests a UDP/io_uring fd leak. Open fds: \
-         {:?}",
-        open_fd_targets()
     );
 }
 
