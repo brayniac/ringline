@@ -23,17 +23,43 @@ const FIXED_FILES_RELEASED_PER_FILE_SINCE: KernelVersion = KernelVersion {
     minor: 13,
 };
 
-/// Whether a `Ring::setup` error is `io_uring_setup` failing with ENOMEM.
+/// The error for a refused provided-buffer-ring registration.
+fn provided_ring_failure(
+    err: &io::Error,
+    bgid: u16,
+    entries: impl std::fmt::Display,
+    probe: &crate::error::RingSetupProbe,
+) -> Error {
+    let name = errno_name(err)
+        .map(|n| format!(" ({n})"))
+        .unwrap_or_default();
+    Error::BufferRegistration(format!(
+        "provided buffer ring (bgid {bgid}, {entries} entries): {err}{name}. \
+         EINVAL here usually means a kernel older than 5.19 or a \
+         ring size that is not a power of two. {}",
+        crate::error::provided_ring_enomem_hint(probe)
+    ))
+}
+
+/// Whether a ring setup error is ENOMEM from `io_uring_setup` or from
+/// registering the provided buffer ring.
 ///
-/// On Linux 6.14+ each ring is charged to RLIMIT_MEMLOCK and a dropped ring's
+/// On Linux 6.14+ both are charged to RLIMIT_MEMLOCK, and a dropped ring's
 /// charge is released asynchronously, so tests that set up rings in quick
-/// succession can fail this way until earlier rings are freed (#589).
-/// `Error::RingSetup` carries only a message, built by
-/// `describe_ring_setup_failure`, so this reads the errno name from it.
+/// succession can fail this way until earlier rings are freed (#589). The
+/// errors carry only a message, built by `describe_ring_setup_failure` and
+/// `provided_ring_failure`, so this reads the errno name from it.
 #[cfg(test)]
-pub(crate) fn is_ring_setup_enomem(err: &Error) -> bool {
-    matches!(err, Error::RingSetup(msg)
-        if msg.starts_with("io_uring_setup(2): ") && msg.contains(" (ENOMEM)"))
+pub(crate) fn is_memlock_enomem(err: &Error) -> bool {
+    match err {
+        Error::RingSetup(msg) => {
+            msg.starts_with("io_uring_setup(2): ") && msg.contains(" (ENOMEM)")
+        }
+        Error::BufferRegistration(msg) => {
+            msg.starts_with("provided buffer ring ") && msg.contains(" (ENOMEM)")
+        }
+        _ => false,
+    }
 }
 
 /// What is hard-linked ahead of a connection's `Close`.
@@ -352,19 +378,12 @@ impl Ring {
                     0,
                 )
                 .map_err(|e| {
-                    let name = errno_name(&e)
-                        .map(|n| format!(" ({n})"))
-                        .unwrap_or_default();
-                    Error::BufferRegistration(format!(
-                        "provided buffer ring (bgid {}, {} entries): {e}{name}. \
-                         EINVAL here usually means a kernel older than 5.19 or a \
-                         ring size that is not a power of two. {}",
+                    provided_ring_failure(
+                        &e,
                         provided.bgid(),
                         provided.ring_entries(),
-                        crate::error::provided_ring_enomem_hint(
-                            &crate::error::RingSetupProbe::read()
-                        )
-                    ))
+                        &crate::error::RingSetupProbe::read(),
+                    )
                 })?;
         }
         Ok(())
@@ -1562,7 +1581,7 @@ mod tests {
         // Up to 5 s for earlier rings' memlock charge to be released (#589).
         for _ in 0..50 {
             match Ring::setup(&config) {
-                Err(e) if is_ring_setup_enomem(&e) => {
+                Err(e) if is_memlock_enomem(&e) => {
                     std::thread::sleep(std::time::Duration::from_millis(100))
                 }
                 result => return result.expect("ring"),
@@ -1576,19 +1595,23 @@ mod tests {
         unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) as u32 }
     }
 
-    /// The transient-ENOMEM check matches the message `Ring::setup` builds
-    /// for that errno, and nothing else.
+    /// The transient-ENOMEM check matches the messages ring setup and
+    /// provided-ring registration build for that errno, and nothing else.
     #[test]
-    fn is_ring_setup_enomem_reads_the_errno_from_the_message() {
+    fn is_memlock_enomem_reads_the_errno_from_the_message() {
         let probe = crate::error::RingSetupProbe::default();
         let enomem =
             Error::ring_setup_with_probe(io::Error::from_raw_os_error(libc::ENOMEM), &probe);
         let eperm = Error::ring_setup_with_probe(io::Error::from_raw_os_error(libc::EPERM), &probe);
-        assert!(is_ring_setup_enomem(&enomem), "{enomem}");
-        assert!(!is_ring_setup_enomem(&eperm), "{eperm}");
-        assert!(!is_ring_setup_enomem(&Error::Io(
+        assert!(is_memlock_enomem(&enomem), "{enomem}");
+        assert!(!is_memlock_enomem(&eperm), "{eperm}");
+        assert!(!is_memlock_enomem(&Error::Io(
             io::Error::from_raw_os_error(libc::ENOMEM)
         )));
+        let provided =
+            |errno| provided_ring_failure(&io::Error::from_raw_os_error(errno), 0, 16, &probe);
+        assert!(is_memlock_enomem(&provided(libc::ENOMEM)));
+        assert!(!is_memlock_enomem(&provided(libc::EINVAL)));
     }
 
     /// The kernel's own bounded limit on this host.

@@ -65,10 +65,20 @@ fn fin_arrives(lead: CloseLead, timestamps: bool) -> bool {
     #[cfg(not(feature = "timestamps"))]
     assert!(!timestamps, "timestamps need the `timestamps` feature");
     config.close_lead_override = Some(lead);
-    let (runtime, handles) = RinglineBuilder::new(config)
-        .bind("127.0.0.1:0".parse().unwrap())
-        .launch::<EndsOnBye>()
-        .expect("launch");
+    // Up to 5 s for earlier rings' memlock charge to be released (#589).
+    let mut attempts = 0;
+    let (runtime, handles) = loop {
+        match RinglineBuilder::new(config.clone())
+            .bind("127.0.0.1:0".parse().unwrap())
+            .launch::<EndsOnBye>()
+        {
+            Err(e) if attempts < 50 && super::ring::is_memlock_enomem(&e) => {
+                attempts += 1;
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            result => break result.expect("launch"),
+        }
+    };
     let mut conn = TcpStream::connect(runtime.bound_addr().unwrap()).expect("connect");
     conn.write_all(b"bye").unwrap();
     conn.set_read_timeout(Some(Duration::from_secs(3))).unwrap();

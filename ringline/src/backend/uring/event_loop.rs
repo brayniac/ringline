@@ -5865,13 +5865,15 @@ mod tests {
         // ENOMEM (e.g. runs 31887895010, 31710717130). The pressure clears as
         // sibling tests finish, so retry briefly before failing.
         //
-        // On Linux 6.14+ each ring is charged to RLIMIT_MEMLOCK, and a dropped
-        // ring's charge is released asynchronously. A test that sets up loops
-        // in quick succession (the proptests) can reach an 8 MiB limit before
-        // earlier rings are freed; `Ring::setup` then fails with
-        // `Error::RingSetup` naming ENOMEM. That clears as well, given time
-        // (#589).
-        let mut attempts = 0;
+        // On Linux 6.14+ each ring and provided buffer ring is charged to
+        // RLIMIT_MEMLOCK, and a dropped ring's charge is released
+        // asynchronously. A test that sets up loops in quick succession (the
+        // proptests) can reach an 8 MiB limit before earlier rings are freed;
+        // setup then fails with an `Error::RingSetup` or
+        // `Error::BufferRegistration` naming ENOMEM. It clears once the
+        // kernel's exit work frees those rings (#589).
+        let mut io_attempts = 0;
+        let mut memlock_attempts = 0;
         loop {
             let shutdown = Arc::new(AtomicBool::new(false));
             let eventfd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
@@ -5898,22 +5900,24 @@ mod tests {
                 // Transient: another test binary may hold the memory or fds
                 // this one needs for a moment. Retry, briefly.
                 Err(crate::error::Error::Io(ref io))
-                    if attempts < 10
+                    if io_attempts < 10
                         && matches!(
                             io.raw_os_error(),
                             Some(libc::ENOMEM | libc::EAGAIN | libc::EMFILE | libc::ENFILE)
                         ) =>
                 {
-                    attempts += 1;
+                    io_attempts += 1;
                     std::thread::sleep(std::time::Duration::from_millis(100));
                 }
-                // The memlock charge of rings dropped by earlier tests is
-                // still being released. Up to 5 s; past that the limit is too
-                // small for one ring, and the arm below reports it.
+                // Rings dropped by earlier tests are still releasing their
+                // memlock charge. Retry for up to 5 s. If it still fails, the
+                // user's total charge (this process and others) does not fit
+                // under the limit, and the arm below reports it.
                 Err(ref e)
-                    if attempts < 50 && crate::backend::uring::ring::is_ring_setup_enomem(e) =>
+                    if memlock_attempts < 50
+                        && crate::backend::uring::ring::is_memlock_enomem(e) =>
                 {
-                    attempts += 1;
+                    memlock_attempts += 1;
                     std::thread::sleep(std::time::Duration::from_millis(100));
                 }
                 // Structural: io_uring is refused or unsupported on this host
@@ -5947,7 +5951,10 @@ mod tests {
                     }
                 }
                 Err(e) => {
-                    panic!("failed to create test event loop after {attempts} retries: {e:?}")
+                    panic!(
+                        "failed to create test event loop after {} retries: {e:?}",
+                        io_attempts + memlock_attempts
+                    )
                 }
             }
         }
