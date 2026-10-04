@@ -2,6 +2,30 @@
 //!
 //! Provides buffered file read/write and metadata operations (stat, rename,
 //! unlink, mkdir) using native io_uring opcodes — no blocking syscalls.
+//!
+//! ## Blocking file I/O and connection closes (io_uring)
+//!
+//! An operation the kernel cannot complete without blocking, such as
+//! [`fsync`], runs on one of the worker's io-wq threads. Regular-file work
+//! uses the worker's bounded io-wq pool, which the kernel sizes at
+//! `min(sq_entries, 4 × online CPUs)` threads;
+//! [`ConfigBuilder::iowq_max_workers`](crate::ConfigBuilder::iowq_max_workers)
+//! can lower it.
+//!
+//! Before Linux 6.13, every connection close on the worker also runs a
+//! `shutdown` in that pool (#581). Once the worker's blocking file operations
+//! occupy every thread, its connection closes wait for one of them to finish,
+//! and peers see their EOF late. Measured on 6.12 with 32 concurrent `fsync`
+//! loops on one worker: with a 64-thread pool, the p99 wait for a closed
+//! connection's EOF rose from 0.44 ms to 11.8 ms; with the pool capped at 16,
+//! the median rose to 12 ms (#584, #586). From 6.13 a close does not use the
+//! pool.
+//!
+//! On those kernels, keep a worker's concurrent blocking file operations
+//! below its pool size, or run `fsync`-heavy work through
+//! [`spawn_blocking`](crate::spawn_blocking), whose threads are separate from
+//! io-wq. The mio backend runs file I/O on its own thread pool and is not
+//! affected.
 
 use std::ffi::CString;
 use std::future::Future;
@@ -827,6 +851,10 @@ fn park_buffer(
 }
 
 /// Fsync a file, flushing all data and metadata to disk.
+///
+/// On io_uring this runs on the worker's bounded io-wq pool. Before Linux
+/// 6.13, many concurrent `fsync`s on one worker delay its connection closes;
+/// see [the module docs](self#blocking-file-io-and-connection-closes-io_uring).
 ///
 /// # Panics
 ///
