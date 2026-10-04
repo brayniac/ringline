@@ -31,15 +31,15 @@
 //!
 //! let mut h3 = H3Connection::new(Settings::default());
 //!
-//! // After quic.poll_event():
-//! h3.handle_quic_event(&mut quic, &event)?;
+//! // After quic.poll_event(), with `now` read once for this iteration:
+//! h3.handle_quic_event(&mut quic, now, &event)?;
 //!
 //! while let Some(h3_event) = h3.poll_event() {
 //!     match h3_event {
 //!         H3Event::Request { stream_id, headers, end_stream } => {
 //!             let response = vec![HeaderField::new(b":status", b"200")];
-//!             h3.send_response(&mut quic, stream_id, &response, false)?;
-//!             h3.send_data(&mut quic, stream_id, b"hello", true)?;
+//!             h3.send_response(&mut quic, now, stream_id, &response, false)?;
+//!             h3.send_data(&mut quic, now, stream_id, b"hello", true)?;
 //!         }
 //!         _ => {}
 //!     }
@@ -54,7 +54,8 @@
 //! let mut h3 = H3Connection::new(Settings::default());
 //!
 //! // After QuicEvent::Connected, handle_quic_event() calls initiate() automatically.
-//! h3.handle_quic_event(&mut quic, &event)?;
+//! // `now` is the time read once for this event-loop iteration.
+//! h3.handle_quic_event(&mut quic, now, &event)?;
 //!
 //! // Send a GET request:
 //! let headers = vec![
@@ -62,7 +63,7 @@
 //!     HeaderField::new(b":path", b"/"),
 //!     HeaderField::new(b":scheme", b"https"),
 //! ];
-//! let stream_id = h3.send_request(&mut quic, &headers, true)?;
+//! let stream_id = h3.send_request(&mut quic, now, &headers, true)?;
 //!
 //! // Later, after receiving QUIC events:
 //! while let Some(h3_event) = h3.poll_event() {

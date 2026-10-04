@@ -8,9 +8,10 @@
 //! messages. `QuicEndpoint` synthesises a `StreamReadable` alongside
 //! `StreamOpened` so callers don't need to know this quirk.
 
+mod common;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
 
 use quinn_proto::{ClientConfig, ServerConfig};
 use ringline_quic::{QuicConfig, QuicConnId, QuicEndpoint, QuicEvent};
@@ -51,7 +52,7 @@ fn shuffle(
     client_addr: SocketAddr,
     server_addr: SocketAddr,
 ) {
-    let now = Instant::now();
+    let now = common::tick();
     for _ in 0..32 {
         let mut moved = false;
         while let Some(pkt) = client.poll_send() {
@@ -82,7 +83,7 @@ fn handshake(
     server_addr: SocketAddr,
 ) -> (QuicConnId, QuicConnId) {
     let client_conn = client
-        .connect(Instant::now(), server_addr, "localhost")
+        .connect(common::now(), server_addr, "localhost")
         .expect("connect");
 
     let mut server_conn = None;
@@ -129,7 +130,7 @@ fn stream_opened_with_data_in_opening_frame_fires_readable() {
     client
         .stream_send(client_conn, stream, b"hi")
         .expect("stream_send");
-    client.flush(Instant::now());
+    client.flush(common::now());
 
     shuffle(&mut client, &mut server, client_addr, server_addr);
 

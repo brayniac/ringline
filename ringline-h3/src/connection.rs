@@ -4,6 +4,7 @@
 //! and producing HTTP-level events. Supports both client and server roles.
 
 use std::collections::{HashMap, VecDeque};
+use std::time::Instant;
 
 use bytes::{Bytes, BytesMut};
 use ringline_quic::{QuicConnId, QuicEndpoint, QuicEvent, ReadError, StreamId, VarInt, WriteError};
@@ -352,7 +353,7 @@ impl H3Connection {
         let mut buf = Vec::new();
         frame::encode_varint(&mut buf, STREAM_TYPE_CONTROL);
         Frame::Settings(self.local_settings.clone()).encode(&mut buf);
-        self.queue_send(quic, conn, stream, vec![Bytes::from(buf)], false)?;
+        self.queue_send(quic, conn, stream, vec![Bytes::from(buf)], None)?;
 
         // Only mark SETTINGS as fully sent once nothing is queued behind it.
         // If queue_send had to defer due to flow control, `drain_pending_stream`
@@ -379,7 +380,7 @@ impl H3Connection {
         let mut buf = Vec::new();
         frame::encode_varint(&mut buf, STREAM_TYPE_CONTROL);
         Frame::Settings(self.local_settings.clone()).encode(&mut buf);
-        self.queue_send(quic, conn, stream, vec![Bytes::from(buf)], false)?;
+        self.queue_send(quic, conn, stream, vec![Bytes::from(buf)], None)?;
 
         self.settings_sent = !self.has_pending_writes(stream);
         Ok(())
@@ -393,6 +394,7 @@ impl H3Connection {
     pub fn send_request(
         &mut self,
         quic: &mut QuicEndpoint,
+        now: Instant,
         headers: &[HeaderField],
         end_stream: bool,
     ) -> Result<StreamId, H3Error> {
@@ -444,7 +446,13 @@ impl H3Connection {
         };
         self.request_streams.insert(u64::from(stream_id), rs);
 
-        self.queue_send(quic, conn, stream_id, vec![Bytes::from(buf)], end_stream)?;
+        self.queue_send(
+            quic,
+            conn,
+            stream_id,
+            vec![Bytes::from(buf)],
+            end_stream.then_some(now),
+        )?;
 
         Ok(stream_id)
     }
@@ -455,6 +463,7 @@ impl H3Connection {
     pub fn handle_quic_event(
         &mut self,
         quic: &mut QuicEndpoint,
+        now: Instant,
         event: &QuicEvent,
     ) -> Result<(), H3Error> {
         match event {
@@ -477,9 +486,9 @@ impl H3Connection {
                         // the connection close that follows will tear
                         // everything down anyway.
                         let code = VarInt::from_u32(H3Error::IdError.code());
-                        let _ = quic.reset_stream(*conn, *stream, code);
-                        let _ = quic.stop_sending(*conn, *stream, code);
-                        self.fatal_error(quic, H3Error::IdError);
+                        let _ = quic.reset_stream(now, *conn, *stream, code);
+                        let _ = quic.stop_sending(now, *conn, *stream, code);
+                        self.fatal_error(quic, now, H3Error::IdError);
                         return Ok(());
                     }
                     self.request_streams
@@ -487,18 +496,18 @@ impl H3Connection {
                     // Proactively try to read — data may have arrived in the
                     // same QUIC packet that opened the stream, in which case
                     // quinn-proto won't fire a separate StreamReadable event.
-                    self.read_request_stream(quic, *conn, *stream)?;
+                    self.read_request_stream(quic, now, *conn, *stream)?;
                 } else {
                     // Unidirectional stream — need to read the type byte.
                     // Try to identify immediately (data may already be available).
-                    self.identify_uni_stream(quic, *conn, *stream)?;
+                    self.identify_uni_stream(quic, now, *conn, *stream)?;
                 }
             }
             QuicEvent::StreamReadable { conn, stream } => {
-                self.handle_stream_readable(quic, *conn, *stream)?;
+                self.handle_stream_readable(quic, now, *conn, *stream)?;
             }
             QuicEvent::StreamWritable { conn, stream } => {
-                self.drain_pending_stream(quic, *conn, *stream)?;
+                self.drain_pending_stream(quic, now, *conn, *stream)?;
             }
             QuicEvent::ZeroRttRejected { .. } => {
                 // Quinn discarded everything we sent on 0-RTT keys. Our
@@ -554,6 +563,7 @@ impl H3Connection {
     pub fn send_response(
         &mut self,
         quic: &mut QuicEndpoint,
+        now: Instant,
         stream_id: StreamId,
         headers: &[HeaderField],
         end_stream: bool,
@@ -577,7 +587,13 @@ impl H3Connection {
         }
         .encode(&mut buf);
 
-        self.queue_send(quic, conn, stream_id, vec![Bytes::from(buf)], end_stream)
+        self.queue_send(
+            quic,
+            conn,
+            stream_id,
+            vec![Bytes::from(buf)],
+            end_stream.then_some(now),
+        )
     }
 
     /// Send response body data on a stream.
@@ -594,11 +610,18 @@ impl H3Connection {
     pub fn send_data(
         &mut self,
         quic: &mut QuicEndpoint,
+        now: Instant,
         stream_id: StreamId,
         data: &[u8],
         end_stream: bool,
     ) -> Result<(), H3Error> {
-        self.send_data_bytes(quic, stream_id, Bytes::copy_from_slice(data), end_stream)
+        self.send_data_bytes(
+            quic,
+            now,
+            stream_id,
+            Bytes::copy_from_slice(data),
+            end_stream,
+        )
     }
 
     /// Zero-copy counterpart of [`send_data`](Self::send_data). The payload
@@ -609,6 +632,7 @@ impl H3Connection {
     pub fn send_data_bytes(
         &mut self,
         quic: &mut QuicEndpoint,
+        now: Instant,
         stream_id: StreamId,
         data: Bytes,
         end_stream: bool,
@@ -625,7 +649,7 @@ impl H3Connection {
         encode_frame_header(&mut header, frame::FRAME_DATA, data.len() as u64);
         let chunks = vec![Bytes::from(header), data];
 
-        self.queue_send(quic, conn, stream_id, chunks, end_stream)
+        self.queue_send(quic, conn, stream_id, chunks, end_stream.then_some(now))
     }
 
     /// Send trailing HEADERS (trailers) on a request stream and finish the
@@ -637,6 +661,7 @@ impl H3Connection {
     pub fn send_trailers(
         &mut self,
         quic: &mut QuicEndpoint,
+        now: Instant,
         stream_id: StreamId,
         trailers: &[HeaderField],
     ) -> Result<(), H3Error> {
@@ -659,7 +684,7 @@ impl H3Connection {
         }
         .encode(&mut buf);
 
-        self.queue_send(quic, conn, stream_id, vec![Bytes::from(buf)], true)
+        self.queue_send(quic, conn, stream_id, vec![Bytes::from(buf)], Some(now))
     }
 
     /// Send a GOAWAY frame on the control stream (graceful shutdown).
@@ -681,7 +706,7 @@ impl H3Connection {
         }
         .encode(&mut buf);
 
-        self.queue_send(quic, conn, control, vec![Bytes::from(buf)], false)?;
+        self.queue_send(quic, conn, control, vec![Bytes::from(buf)], None)?;
         self.state = H3State::Closing;
         Ok(())
     }
@@ -717,8 +742,8 @@ impl H3Connection {
     /// Push one or more [`Bytes`] chunks onto a stream. Chunks that don't
     /// fit in the current flow-control window are queued verbatim — they
     /// stay refcounted, no `extend_from_slice` — and flushed on the next
-    /// [`QuicEvent::StreamWritable`]. If `fin` is set, the stream is
-    /// finished either immediately (everything flushed) or later
+    /// [`QuicEvent::StreamWritable`]. If `fin` is `Some(now)`, the stream is
+    /// finished either immediately at `now` (everything flushed) or later
     /// ([`drain_pending_stream`]).
     fn queue_send(
         &mut self,
@@ -726,7 +751,7 @@ impl H3Connection {
         conn: QuicConnId,
         stream_id: StreamId,
         mut chunks: Vec<Bytes>,
-        fin: bool,
+        fin: Option<Instant>,
     ) -> Result<(), H3Error> {
         let key = u64::from(stream_id);
 
@@ -754,7 +779,7 @@ impl H3Connection {
                     pending.queue.push_back(chunk);
                 }
             }
-            if fin {
+            if fin.is_some() {
                 pending.pending_fin = true;
             }
             return Ok(());
@@ -782,14 +807,14 @@ impl H3Connection {
             }
         }
 
-        if !any_remaining && fin {
-            quic.stream_finish(conn, stream_id)?;
+        if !any_remaining && let Some(now) = fin {
+            quic.stream_finish(now, conn, stream_id)?;
             self.finalize_local_close(stream_id);
             self.pending_sends.remove(&key);
             return Ok(());
         }
 
-        if fin {
+        if fin.is_some() {
             self.pending_sends.entry(key).or_default().pending_fin = true;
         }
 
@@ -810,6 +835,7 @@ impl H3Connection {
     fn drain_pending_stream(
         &mut self,
         quic: &mut QuicEndpoint,
+        now: Instant,
         conn: QuicConnId,
         stream_id: StreamId,
     ) -> Result<(), H3Error> {
@@ -856,7 +882,7 @@ impl H3Connection {
             .unwrap_or((false, false));
         if queue_drained {
             if do_fin {
-                quic.stream_finish(conn, stream_id)?;
+                quic.stream_finish(now, conn, stream_id)?;
                 self.finalize_local_close(stream_id);
                 self.pending_sends.remove(&key);
             } else {
@@ -879,12 +905,12 @@ impl H3Connection {
     /// protocol invariants are violated — without closing, the H3 state
     /// machine is corrupt yet the QUIC connection keeps running and the
     /// peer is never told what went wrong.
-    fn fatal_error(&mut self, quic: &mut QuicEndpoint, err: H3Error) {
+    fn fatal_error(&mut self, quic: &mut QuicEndpoint, now: Instant, err: H3Error) {
         let code = err.code();
         if let Some(conn) = self.conn_id
             && !matches!(self.state, H3State::Closed)
         {
-            quic.close_connection(conn, code, err.to_string().as_bytes());
+            quic.close_connection(now, conn, code, err.to_string().as_bytes());
         }
         self.state = H3State::Closed;
         self.events.push_back(H3Event::Error(err));
@@ -931,23 +957,24 @@ impl H3Connection {
     fn handle_stream_readable(
         &mut self,
         quic: &mut QuicEndpoint,
+        now: Instant,
         conn: QuicConnId,
         stream: StreamId,
     ) -> Result<(), H3Error> {
         // Check if this is a pending uni stream that needs type identification.
         if let Some(pos) = self.pending_uni_streams.iter().position(|s| *s == stream) {
             self.pending_uni_streams.swap_remove(pos);
-            return self.identify_uni_stream(quic, conn, stream);
+            return self.identify_uni_stream(quic, now, conn, stream);
         }
 
         // Check if it's the control stream.
         if self.control_stream_id == Some(stream) {
-            return self.read_control_stream(quic, conn, stream);
+            return self.read_control_stream(quic, now, conn, stream);
         }
 
         // Must be a request stream.
         if self.request_streams.contains_key(&u64::from(stream)) {
-            return self.read_request_stream(quic, conn, stream);
+            return self.read_request_stream(quic, now, conn, stream);
         }
 
         // Unknown stream — could be a uni stream type we don't track.
@@ -957,6 +984,7 @@ impl H3Connection {
     fn identify_uni_stream(
         &mut self,
         quic: &mut QuicEndpoint,
+        now: Instant,
         conn: QuicConnId,
         stream: StreamId,
     ) -> Result<(), H3Error> {
@@ -968,7 +996,7 @@ impl H3Connection {
         // Read more bytes into the remainder of an 8-byte scratch space.
         let mut scratch = [0u8; 8];
         let want = 8usize.saturating_sub(accumulated.len());
-        let (n, _fin) = quic.stream_recv(conn, stream, &mut scratch[..want])?;
+        let (n, _fin) = quic.stream_recv(now, conn, stream, &mut scratch[..want])?;
         if n == 0 && accumulated.is_empty() {
             // No data at all yet — re-add to pending.
             self.pending_uni_streams.push(stream);
@@ -990,7 +1018,7 @@ impl H3Connection {
             STREAM_TYPE_CONTROL => {
                 if self.control_stream_id.is_some() {
                     // Duplicate control stream is a connection error.
-                    self.fatal_error(quic, H3Error::FrameUnexpected);
+                    self.fatal_error(quic, now, H3Error::FrameUnexpected);
                     return Ok(());
                 }
                 self.control_stream_id = Some(stream);
@@ -1003,7 +1031,7 @@ impl H3Connection {
                     self.control_recv_buf
                         .extend_from_slice(&accumulated[consumed..]);
                 }
-                self.read_control_stream(quic, conn, stream)?;
+                self.read_control_stream(quic, now, conn, stream)?;
             }
             STREAM_TYPE_QPACK_ENCODER | STREAM_TYPE_QPACK_DECODER => {
                 // Phase 1: no dynamic table — ignore QPACK streams.
@@ -1019,12 +1047,13 @@ impl H3Connection {
     fn read_control_stream(
         &mut self,
         quic: &mut QuicEndpoint,
+        now: Instant,
         conn: QuicConnId,
         stream: StreamId,
     ) -> Result<(), H3Error> {
         // Read available data.
         loop {
-            let (n, fin) = match quic.stream_recv(conn, stream, &mut self.read_buf) {
+            let (n, fin) = match quic.stream_recv(now, conn, stream, &mut self.read_buf) {
                 Ok(r) => r,
                 Err(_) => break,
             };
@@ -1033,7 +1062,7 @@ impl H3Connection {
             }
             if fin {
                 // Control stream closed — this is a fatal HTTP/3 error.
-                self.fatal_error(quic, H3Error::ClosedCriticalStream);
+                self.fatal_error(quic, now, H3Error::ClosedCriticalStream);
                 return Ok(());
             }
             if n == 0 {
@@ -1042,10 +1071,14 @@ impl H3Connection {
         }
 
         // Process frames from the control stream buffer.
-        self.process_control_frames(quic)
+        self.process_control_frames(quic, now)
     }
 
-    fn process_control_frames(&mut self, quic: &mut QuicEndpoint) -> Result<(), H3Error> {
+    fn process_control_frames(
+        &mut self,
+        quic: &mut QuicEndpoint,
+        now: Instant,
+    ) -> Result<(), H3Error> {
         loop {
             let buf = &self.control_recv_buf;
             if buf.is_empty() {
@@ -1059,14 +1092,14 @@ impl H3Connection {
                     // (GREASE) frames that are normally ignored — is a
                     // connection error of type H3_MISSING_SETTINGS.
                     if self.remote_settings.is_none() && !matches!(frame, Frame::Settings(_)) {
-                        self.fatal_error(quic, H3Error::MissingSettings);
+                        self.fatal_error(quic, now, H3Error::MissingSettings);
                         return Ok(());
                     }
                     match frame {
                         Frame::Settings(settings) => {
                             if self.remote_settings.is_some() {
                                 // Duplicate SETTINGS is a connection error.
-                                self.fatal_error(quic, H3Error::FrameUnexpected);
+                                self.fatal_error(quic, now, H3Error::FrameUnexpected);
                                 return Ok(());
                             }
                             self.remote_settings = Some(settings);
@@ -1081,7 +1114,7 @@ impl H3Connection {
                         Frame::Data { .. } | Frame::Headers { .. } => {
                             // DATA and HEADERS on the control stream are
                             // connection errors.
-                            self.fatal_error(quic, H3Error::FrameUnexpected);
+                            self.fatal_error(quic, now, H3Error::FrameUnexpected);
                             return Ok(());
                         }
                         Frame::Unknown { .. } => {
@@ -1095,7 +1128,7 @@ impl H3Connection {
                 }
                 Ok(None) => break, // Incomplete frame, need more data.
                 Err(e) => {
-                    self.fatal_error(quic, e);
+                    self.fatal_error(quic, now, e);
                     return Ok(());
                 }
             }
@@ -1106,6 +1139,7 @@ impl H3Connection {
     fn read_request_stream(
         &mut self,
         quic: &mut QuicEndpoint,
+        now: Instant,
         conn: QuicConnId,
         stream: StreamId,
     ) -> Result<(), H3Error> {
@@ -1124,7 +1158,7 @@ impl H3Connection {
         // (kernel buffer → scratch slice → recv_buf), saving one
         // memcpy per call. At 32 KiB body sizes this is meaningful.
         while let Some(rs) = self.request_streams.get_mut(&u64::from(stream)) {
-            let res = quic.stream_recv_into(conn, stream, &mut rs.recv_buf, READ_CHUNK);
+            let res = quic.stream_recv_into(now, conn, stream, &mut rs.recv_buf, READ_CHUNK);
             match res {
                 Ok((n, fin)) => {
                     if fin {
@@ -1150,7 +1184,7 @@ impl H3Connection {
         }
 
         // Process frames from the stream's recv_buf.
-        self.process_request_frames(quic, stream, fin_received)
+        self.process_request_frames(quic, now, stream, fin_received)
     }
 
     /// Drop all per-stream state for `stream`. Used when the peer aborts the
@@ -1165,6 +1199,7 @@ impl H3Connection {
     fn process_request_frames(
         &mut self,
         quic: &mut QuicEndpoint,
+        now: Instant,
         stream: StreamId,
         fin_received: bool,
     ) -> Result<(), H3Error> {
@@ -1220,7 +1255,7 @@ impl H3Connection {
                             // After trailers we accept no further frames on
                             // this stream.
                             if already_trailed {
-                                self.fatal_error(quic, H3Error::FrameUnexpected);
+                                self.fatal_error(quic, now, H3Error::FrameUnexpected);
                                 aborted = true;
                                 break;
                             }
@@ -1231,7 +1266,7 @@ impl H3Connection {
                             let is_trailer = initial_seen;
                             // Trailers MUST be the last frame on the stream.
                             if is_trailer && !at_end {
-                                self.fatal_error(quic, H3Error::FrameUnexpected);
+                                self.fatal_error(quic, now, H3Error::FrameUnexpected);
                                 aborted = true;
                                 break;
                             }
@@ -1244,14 +1279,14 @@ impl H3Connection {
                             // before we let QPACK allocate.
                             let local_limit = self.local_settings.max_field_section_size;
                             if (encoded.len() as u64) > local_limit {
-                                self.fatal_error(quic, H3Error::ExcessiveSize);
+                                self.fatal_error(quic, now, H3Error::ExcessiveSize);
                                 aborted = true;
                                 break;
                             }
                             let headers = match qpack::decode(&encoded) {
                                 Ok(h) => h,
                                 Err(e) => {
-                                    self.fatal_error(quic, e);
+                                    self.fatal_error(quic, now, e);
                                     aborted = true;
                                     break;
                                 }
@@ -1259,7 +1294,7 @@ impl H3Connection {
                             // Post-decode authoritative check on the field
                             // section size per RFC 9114 §4.2.2.
                             if field_section_size(&headers) > local_limit {
-                                self.fatal_error(quic, H3Error::ExcessiveSize);
+                                self.fatal_error(quic, now, H3Error::ExcessiveSize);
                                 aborted = true;
                                 break;
                             }
@@ -1274,7 +1309,7 @@ impl H3Connection {
                                 HeaderKind::Request
                             };
                             if let Err(e) = validate_headers(kind, &headers) {
-                                self.fatal_error(quic, e);
+                                self.fatal_error(quic, now, e);
                                 aborted = true;
                                 break;
                             }
@@ -1325,7 +1360,7 @@ impl H3Connection {
                             // DATA before HEADERS, or DATA after trailers, is
                             // an HTTP/3 message error.
                             if !initial_seen || already_trailed {
-                                self.fatal_error(quic, H3Error::FrameUnexpected);
+                                self.fatal_error(quic, now, H3Error::FrameUnexpected);
                                 aborted = true;
                                 break;
                             }
@@ -1344,7 +1379,7 @@ impl H3Connection {
                             // SETTINGS / GOAWAY are control-stream frames;
                             // their appearance on a request stream is a
                             // connection error.
-                            self.fatal_error(quic, H3Error::FrameUnexpected);
+                            self.fatal_error(quic, now, H3Error::FrameUnexpected);
                             aborted = true;
                             break;
                         }
@@ -1359,7 +1394,7 @@ impl H3Connection {
                 }
                 Ok(None) => break, // Incomplete frame.
                 Err(e) => {
-                    self.fatal_error(quic, e);
+                    self.fatal_error(quic, now, e);
                     aborted = true;
                     break;
                 }

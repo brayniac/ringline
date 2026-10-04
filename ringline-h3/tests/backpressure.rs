@@ -8,9 +8,10 @@
 //! client ultimately receives every byte. Parameterised so both the
 //! `&[u8]` and the zero-copy `Bytes` send paths get the same treatment.
 
+mod common;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
 
 use bytes::Bytes;
 use quinn_proto::{ClientConfig, ServerConfig, TransportConfig};
@@ -66,7 +67,7 @@ fn shuffle(
     server_addr: SocketAddr,
 ) {
     for _ in 0..128 {
-        let now = Instant::now();
+        let now = common::tick();
         client.flush(now);
         server.flush(now);
         let mut moved = false;
@@ -97,7 +98,7 @@ fn handshake(
     server_addr: SocketAddr,
 ) -> (QuicConnId, QuicConnId) {
     let client_conn = client
-        .connect(Instant::now(), server_addr, "localhost")
+        .connect(common::now(), server_addr, "localhost")
         .expect("connect");
     let mut server_conn = None;
     for _ in 0..32 {
@@ -127,7 +128,8 @@ fn pump_h3(ep: &mut QuicEndpoint, h3: &mut H3Connection) {
         events.push(ev);
     }
     for ev in events {
-        h3.handle_quic_event(ep, &ev).expect("h3 event");
+        h3.handle_quic_event(ep, common::now(), &ev)
+            .expect("h3 event");
     }
 }
 
@@ -161,10 +163,18 @@ fn run_backpressure_test(api: SendApi, client_port: u16, server_port: u16) {
     // Hand each H3 its QUIC connection by synthesising the handshake events
     // that `handshake()` already drained.
     client_h3
-        .handle_quic_event(&mut client_ep, &QuicEvent::Connected(client_conn))
+        .handle_quic_event(
+            &mut client_ep,
+            common::now(),
+            &QuicEvent::Connected(client_conn),
+        )
         .expect("client initiate");
     server_h3
-        .handle_quic_event(&mut server_ep, &QuicEvent::NewConnection(server_conn))
+        .handle_quic_event(
+            &mut server_ep,
+            common::now(),
+            &QuicEvent::NewConnection(server_conn),
+        )
         .expect("server accept");
 
     // Exchange SETTINGS.
@@ -179,6 +189,7 @@ fn run_backpressure_test(api: SendApi, client_port: u16, server_port: u16) {
     let req_stream = client_h3
         .send_request(
             &mut client_ep,
+            common::now(),
             &[
                 HeaderField {
                     name: b":method".to_vec(),
@@ -216,6 +227,7 @@ fn run_backpressure_test(api: SendApi, client_port: u16, server_port: u16) {
     server_h3
         .send_response(
             &mut server_ep,
+            common::now(),
             resp_stream,
             &[HeaderField {
                 name: b":status".to_vec(),
@@ -229,12 +241,18 @@ fn run_backpressure_test(api: SendApi, client_port: u16, server_port: u16) {
     match api {
         SendApi::Slice => {
             server_h3
-                .send_data(&mut server_ep, resp_stream, &body, true)
+                .send_data(&mut server_ep, common::now(), resp_stream, &body, true)
                 .expect("send_data");
         }
         SendApi::Bytes => {
             server_h3
-                .send_data_bytes(&mut server_ep, resp_stream, Bytes::from(body.clone()), true)
+                .send_data_bytes(
+                    &mut server_ep,
+                    common::now(),
+                    resp_stream,
+                    Bytes::from(body.clone()),
+                    true,
+                )
                 .expect("send_data_bytes");
         }
     }

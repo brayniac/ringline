@@ -122,7 +122,7 @@ impl AsyncEventHandler for H3Server {
 
                 // Feed QUIC events to H3.
                 while let Some(event) = quic.poll_event() {
-                    let _ = h3.handle_quic_event(&mut quic, &event);
+                    let _ = h3.handle_quic_event(&mut quic, Instant::now(), &event);
                 }
 
                 // Process H3 events: echo back responses.
@@ -140,11 +140,18 @@ impl AsyncEventHandler for H3Server {
                                 let response_headers = vec![HeaderField::new(b":status", b"200")];
                                 let _ = h3.send_response(
                                     &mut quic,
+                                    Instant::now(),
                                     stream_id,
                                     &response_headers,
                                     false,
                                 );
-                                let _ = h3.send_data(&mut quic, stream_id, b"hello", true);
+                                let _ = h3.send_data(
+                                    &mut quic,
+                                    Instant::now(),
+                                    stream_id,
+                                    b"hello",
+                                    true,
+                                );
                             }
                         }
                         H3Event::Data {
@@ -153,9 +160,14 @@ impl AsyncEventHandler for H3Server {
                             end_stream: true,
                         } => {
                             let response_headers = vec![HeaderField::new(b":status", b"200")];
-                            let _ =
-                                h3.send_response(&mut quic, stream_id, &response_headers, false);
-                            let _ = h3.send_data(&mut quic, stream_id, &data, true);
+                            let _ = h3.send_response(
+                                &mut quic,
+                                Instant::now(),
+                                stream_id,
+                                &response_headers,
+                                false,
+                            );
+                            let _ = h3.send_data(&mut quic, Instant::now(), stream_id, &data, true);
                         }
                         H3Event::Response { .. }
                         | H3Event::Trailers { .. }

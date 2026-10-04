@@ -3,9 +3,10 @@
 //! Regression tests for the missing `StreamFinished` handler that caused
 //! h3 connections to stall when the peer finished sending on a stream.
 
+mod common;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
 
 use quinn_proto::{ClientConfig, ServerConfig, TransportConfig, VarInt};
 use ringline_h3::{H3Connection, H3Event, HeaderField, Settings};
@@ -54,7 +55,7 @@ fn shuffle(
     server_addr: SocketAddr,
 ) {
     for _ in 0..128 {
-        let now = Instant::now();
+        let now = common::tick();
         client.flush(now);
         server.flush(now);
         let mut moved = false;
@@ -85,7 +86,7 @@ fn handshake(
     server_addr: SocketAddr,
 ) -> (QuicConnId, QuicConnId) {
     let client_conn = client
-        .connect(Instant::now(), server_addr, "localhost")
+        .connect(common::now(), server_addr, "localhost")
         .expect("connect");
     let mut server_conn = None;
     for _ in 0..32 {
@@ -112,7 +113,8 @@ fn pump_h3(ep: &mut QuicEndpoint, h3: &mut H3Connection) {
         events.push(ev);
     }
     for ev in events {
-        h3.handle_quic_event(ep, &ev).expect("h3 event");
+        h3.handle_quic_event(ep, common::now(), &ev)
+            .expect("h3 event");
     }
 }
 
@@ -137,10 +139,18 @@ fn stream_finished_event_emitted() {
     let mut server_h3 = H3Connection::new(Settings::default());
 
     client_h3
-        .handle_quic_event(&mut client_ep, &QuicEvent::Connected(client_conn))
+        .handle_quic_event(
+            &mut client_ep,
+            common::now(),
+            &QuicEvent::Connected(client_conn),
+        )
         .expect("client initiate");
     server_h3
-        .handle_quic_event(&mut server_ep, &QuicEvent::NewConnection(server_conn))
+        .handle_quic_event(
+            &mut server_ep,
+            common::now(),
+            &QuicEvent::NewConnection(server_conn),
+        )
         .expect("server accept");
 
     // Exchange SETTINGS.
@@ -155,6 +165,7 @@ fn stream_finished_event_emitted() {
     let req_stream = client_h3
         .send_request(
             &mut client_ep,
+            common::now(),
             &[
                 HeaderField::new(b":method", b"POST"),
                 HeaderField::new(b":path", b"/echo"),
@@ -168,10 +179,10 @@ fn stream_finished_event_emitted() {
     // Send body data and then FIN.
     let body = b"request body";
     client_h3
-        .send_data(&mut client_ep, req_stream, body, false)
+        .send_data(&mut client_ep, common::now(), req_stream, body, false)
         .expect("send_data");
     client_h3
-        .send_data(&mut client_ep, req_stream, body, true) // FIN
+        .send_data(&mut client_ep, common::now(), req_stream, body, true) // FIN
         .expect("send_data");
 
     // Flush to server and process.
@@ -194,6 +205,7 @@ fn stream_finished_event_emitted() {
     server_h3
         .send_response(
             &mut server_ep,
+            common::now(),
             resp_stream,
             &[HeaderField::new(b":status", b"200")],
             false,
@@ -203,7 +215,13 @@ fn stream_finished_event_emitted() {
     // flow-control window, so the server has pending writes.
     let large_body: Vec<u8> = (0u8..255).cycle().take(8 * 1024).collect();
     server_h3
-        .send_data(&mut server_ep, resp_stream, &large_body, true) // FIN
+        .send_data(
+            &mut server_ep,
+            common::now(),
+            resp_stream,
+            &large_body,
+            true,
+        ) // FIN
         .expect("send_data");
 
     // Keep shuffling until the server's pending writes drain (flow control
@@ -255,10 +273,18 @@ fn connection_close_cleans_up_state() {
     let mut server_h3 = H3Connection::new(Settings::default());
 
     client_h3
-        .handle_quic_event(&mut client_ep, &QuicEvent::Connected(client_conn))
+        .handle_quic_event(
+            &mut client_ep,
+            common::now(),
+            &QuicEvent::Connected(client_conn),
+        )
         .expect("client initiate");
     server_h3
-        .handle_quic_event(&mut server_ep, &QuicEvent::NewConnection(server_conn))
+        .handle_quic_event(
+            &mut server_ep,
+            common::now(),
+            &QuicEvent::NewConnection(server_conn),
+        )
         .expect("server accept");
 
     // Exchange SETTINGS.
@@ -273,6 +299,7 @@ fn connection_close_cleans_up_state() {
     let req_stream = client_h3
         .send_request(
             &mut client_ep,
+            common::now(),
             &[
                 HeaderField::new(b":method", b"GET"),
                 HeaderField::new(b":path", b"/"),
@@ -305,13 +332,20 @@ fn connection_close_cleans_up_state() {
     server_h3
         .send_response(
             &mut server_ep,
+            common::now(),
             resp_stream,
             &[HeaderField::new(b":status", b"200")],
             false,
         )
         .expect("send_response");
     server_h3
-        .send_data(&mut server_ep, resp_stream, &large_body, false)
+        .send_data(
+            &mut server_ep,
+            common::now(),
+            resp_stream,
+            &large_body,
+            false,
+        )
         .expect("send_data");
 
     // Server has pending writes (response queued behind flow control).
@@ -321,7 +355,7 @@ fn connection_close_cleans_up_state() {
     );
 
     // Close the QUIC connection.
-    server_ep.close_connection(server_conn, 0, b"graceful closure".as_ref());
+    server_ep.close_connection(common::now(), server_conn, 0, b"graceful closure".as_ref());
 
     // Flush and process.
     shuffle(&mut client_ep, &mut server_ep, client_addr, server_addr);

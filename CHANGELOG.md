@@ -66,6 +66,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Breaking (`ringline-quic`):** the `QuicEndpoint` methods that read the
+  clock now take `now: Instant` as their first argument, as `flush`,
+  `handle_datagram` and `drive_timers` already did: `stream_recv`,
+  `stream_recv_into`, `stream_finish`, `stop_sending`, `reset_stream`,
+  `close_connection` and `send_datagram`. `batch(now)` also takes it, and the
+  outermost guard flushes at that time when dropped; `BatchGuard::set_now`
+  updates it for a batch held across an `.await`. The endpoint no longer
+  calls `Instant::now()`, so a caller can read the clock once per event-loop
+  iteration and a test can drive it on a simulated clock (#572).
+
+- **Breaking (`ringline-h3`):** the `H3Connection` methods that can finish
+  a stream, read from one or close the connection take `now: Instant` after
+  the endpoint: `send_request`, `handle_quic_event`, `send_response`,
+  `send_data`, `send_data_bytes` and `send_trailers` (#572).
+
 - **Breaking:** `ConfigBuilder::sq_entries` must be at least 2: a
   connection's close pushes a linked shutdown and `Close` together (#581).
   `sq_entries(1)` now fails `build()`.
