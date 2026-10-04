@@ -948,17 +948,19 @@ impl ConfigBuilder {
     /// only lowers that limit: where the kernel's limit is already lower, it
     /// is left as it is.
     ///
-    /// The kernel runs work it cannot complete inline on io-wq threads. In
-    /// the bounded pool that is regular-file I/O that would block, such as
-    /// `fs::fsync`, and, before Linux 6.13, the `shutdown` sent ahead of
-    /// each connection close (#581). Past the cap, work waits for a free
-    /// thread. A cap at or below a worker's concurrent blocking file I/O
-    /// therefore delays its connection closes on those kernels: with 32
-    /// `fsync` loops on one worker, a cap of 16 raised the median wait for a
-    /// closed connection's EOF from 0.2 ms to 12 ms (#584). On any kernel, a
-    /// connection half-closed with `shutdown_write` waits for that shutdown
-    /// on this pool before its close. io_uring backend only; the mio backend
-    /// ignores it.
+    /// The bounded pool runs the worker's file and path operations that the
+    /// kernel does not complete inline (`fs::fsync`, `fs::stat` and others),
+    /// and, before Linux 6.13, the `shutdown` sent ahead of each connection
+    /// close. Past the cap, work waits for a free thread, so a lower cap
+    /// delays those closes further. With 32 write-and-`fsync` loops on one
+    /// worker, measured on Linux 6.12 on a 16-vCPU host, where the kernel
+    /// limit is 64, a cap of 16 raised the median wait for a closed
+    /// connection's EOF from 0.21 ms to 11.6 ms. On every kernel,
+    /// [`shutdown_write`](crate::SendHalf::shutdown_write) sends a `shutdown`
+    /// that runs on this pool, and a close issued before it finishes waits
+    /// for it. See the
+    /// [`fs` module docs](crate::fs#blocking-file-io-and-connection-closes-io_uring).
+    /// io_uring backend only; the mio backend ignores it.
     pub fn iowq_max_workers(mut self, n: u32) -> Self {
         self.config.iowq_max_workers = n;
         self
