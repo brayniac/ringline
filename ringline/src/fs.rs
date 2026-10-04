@@ -1,31 +1,63 @@
 //! Async filesystem I/O via io_uring.
 //!
 //! Provides buffered file read/write and metadata operations (stat, rename,
-//! unlink, mkdir) using native io_uring opcodes — no blocking syscalls.
+//! remove, mkdir) using native io_uring opcodes. The worker thread never
+//! blocks in a syscall; operations that block run on kernel threads (see
+//! below).
 //!
 //! ## Blocking file I/O and connection closes (io_uring)
 //!
-//! An operation the kernel cannot complete without blocking, such as
-//! [`fsync`], runs on one of the worker's io-wq threads. Regular-file work
-//! uses the worker's bounded io-wq pool, which the kernel sizes at
-//! `min(sq_entries, 4 × online CPUs)` threads;
+//! The kernel runs some io_uring operations on io-wq, a pool of kernel
+//! threads belonging to the thread that submits them, here the ringline
+//! worker. Its bounded pool takes file and path operations:
+//!
+//! - always: [`fsync`], [`stat`], [`rename`], [`remove`], [`mkdir`], and
+//!   [`open`] with `CREATE` or `TRUNCATE` (including [`create`]);
+//! - when they would block: other opens, reads and writes. On a filesystem
+//!   without async buffered writes, such as ext4, every buffered write.
+//!
+//! The pool has `min(sq_entries, 4 × the host's online CPUs)` threads per
+//! worker; a container's CPU limit does not lower it. With the default
+//! [`sq_entries`](crate::ConfigBuilder::sq_entries) of 256 that is
+//! 4 × CPUs, up to 64 CPUs.
 //! [`ConfigBuilder::iowq_max_workers`](crate::ConfigBuilder::iowq_max_workers)
-//! can lower it.
+//! lowers it.
 //!
-//! Before Linux 6.13, every connection close on the worker also runs a
-//! `shutdown` in that pool (#581). Once the worker's blocking file operations
-//! occupy every thread, its connection closes wait for one of them to finish,
-//! and peers see their EOF late. Measured on 6.12 with 32 concurrent `fsync`
-//! loops on one worker: with a 64-thread pool, the p99 wait for a closed
-//! connection's EOF rose from 0.44 ms to 11.8 ms; with the pool capped at 16,
-//! the median rose to 12 ms (#584, #586). From 6.13 a close does not use the
-//! pool.
+//! Before Linux 6.13, or when ringline cannot read the kernel version, each
+//! connection close runs a `shutdown` on the same pool first (#581). Pool
+//! operations on the worker therefore delay its closes. The peer's FIN
+//! arrives late, and the connection's slot stays in use until the close
+//! completes. Measured on Linux 6.12 with 32 concurrent write-and-`fsync`
+//! loops on one worker, the wait for a closed connection's EOF was:
 //!
-//! On those kernels, keep a worker's concurrent blocking file operations
-//! below its pool size, or run `fsync`-heavy work through
-//! [`spawn_blocking`](crate::spawn_blocking), whose threads are separate from
-//! io-wq. The mio backend runs file I/O on its own thread pool and is not
-//! affected.
+//! | pool size          | p50     | p99     |
+//! |--------------------|---------|---------|
+//! | no file I/O        | 0.20 ms | 0.44 ms |
+//! | 64 (kernel limit)  | 0.21 ms | 11.8 ms |
+//! | 16                 | 11.6 ms | 37.6 ms |
+//! | 4                  | 28.2 ms | 82.3 ms |
+//!
+//! The server worker was confined to 4 CPUs, so part of the p99 at 64
+//! threads may be CPU contention (#584, #586).
+//!
+//! On these kernels:
+//!
+//! - Upgrade to Linux 6.13 or later if you can. From 6.13 a close does not
+//!   use the pool, except that a connection half-closed with `shutdown_write`
+//!   first waits for that shutdown, which uses the pool on any kernel.
+//! - Do not set `iowq_max_workers` at or below a worker's concurrent pool
+//!   operations.
+//! - Limit how many pool operations a worker runs at once. Staying below the
+//!   pool size reduces the delay but does not remove it.
+//! - Or do that file's I/O with `std::fs::File` inside
+//!   [`spawn_blocking`](crate::spawn_blocking), which runs on threads outside
+//!   io_uring. A ringline [`File`] cannot be used there. The blocking pool is
+//!   shared by all workers, has 4 threads by default
+//!   ([`ConfigBuilder::blocking_threads`](crate::ConfigBuilder::blocking_threads)),
+//!   and runs at `SCHED_IDLE`.
+//!
+//! On the mio backend, file I/O runs on a separate thread pool and a close
+//! does not wait for it.
 
 use std::ffi::CString;
 use std::future::Future;
@@ -356,6 +388,10 @@ pub fn open(
 
 /// Create a file (shorthand for open with CREATE | WRITE | TRUNCATE, mode 0o644).
 ///
+/// On io_uring this always runs on a kernel io-wq thread; before Linux 6.13
+/// that can delay the worker's connection closes. See
+/// [the module docs](self#blocking-file-io-and-connection-closes-io_uring).
+///
 /// # Panics
 ///
 /// Panics if called outside the ringline async executor.
@@ -551,6 +587,11 @@ pub unsafe fn read(file: File, offset: u64, buf: *mut u8, len: u32) -> io::Resul
 ///
 /// Returns a [`DiskIoFuture`] whose output is the number of bytes written.
 ///
+/// On io_uring a buffered write runs on a kernel io-wq thread when it would
+/// block, and always on a filesystem without async buffered writes, such as
+/// ext4; before Linux 6.13 that can delay the worker's connection closes.
+/// See [the module docs](self#blocking-file-io-and-connection-closes-io_uring).
+///
 /// # Safety
 ///
 /// `buf` must point to readable memory of at least `len` bytes that remains
@@ -635,6 +676,11 @@ pub fn read_into(file: File, offset: u64, mut buf: BytesMut) -> io::Result<ReadF
 ///
 /// The kernel reads `buf.len()` bytes starting at `buf.as_ptr()`. The future
 /// yields `(io::Result<usize>, buf)` — the buffer is returned unchanged.
+///
+/// On io_uring a buffered write runs on a kernel io-wq thread when it would
+/// block, and always on a filesystem without async buffered writes, such as
+/// ext4; before Linux 6.13 that can delay the worker's connection closes.
+/// See [the module docs](self#blocking-file-io-and-connection-closes-io_uring).
 ///
 /// If the future is dropped before the I/O completes, the buffer is kept
 /// until the operation completes and then freed. On io_uring a best-effort
@@ -852,9 +898,9 @@ fn park_buffer(
 
 /// Fsync a file, flushing all data and metadata to disk.
 ///
-/// On io_uring this runs on the worker's bounded io-wq pool. Before Linux
-/// 6.13, many concurrent `fsync`s on one worker delay its connection closes;
-/// see [the module docs](self#blocking-file-io-and-connection-closes-io_uring).
+/// On io_uring this always runs on a kernel io-wq thread. Before Linux 6.13,
+/// concurrent pool operations on a worker delay its connection closes; see
+/// [the module docs](self#blocking-file-io-and-connection-closes-io_uring).
 ///
 /// # Panics
 ///
@@ -887,6 +933,10 @@ pub fn close(file: File) -> io::Result<()> {
 }
 
 /// Get file metadata (stat) for a path.
+///
+/// On io_uring this always runs on a kernel io-wq thread; before Linux 6.13
+/// that can delay the worker's connection closes. See
+/// [the module docs](self#blocking-file-io-and-connection-closes-io_uring).
 ///
 /// Returns a [`StatFuture`] that resolves to [`Metadata`] on success.
 ///
@@ -990,6 +1040,10 @@ pub(crate) fn abandon_disk_io_key(seq: u32) {
 
 /// Rename a file.
 ///
+/// On io_uring this always runs on a kernel io-wq thread; before Linux 6.13
+/// that can delay the worker's connection closes. See
+/// [the module docs](self#blocking-file-io-and-connection-closes-io_uring).
+///
 /// # Panics
 ///
 /// Panics if called outside the ringline async executor.
@@ -1008,6 +1062,10 @@ pub fn rename(
 
 /// Remove a file (unlink).
 ///
+/// On io_uring this always runs on a kernel io-wq thread; before Linux 6.13
+/// that can delay the worker's connection closes. See
+/// [the module docs](self#blocking-file-io-and-connection-closes-io_uring).
+///
 /// # Panics
 ///
 /// Panics if called outside the ringline async executor.
@@ -1022,6 +1080,10 @@ pub fn remove(path: impl AsRef<std::path::Path>) -> io::Result<DiskIoFuture> {
 }
 
 /// Create a directory.
+///
+/// On io_uring this always runs on a kernel io-wq thread; before Linux 6.13
+/// that can delay the worker's connection closes. See
+/// [the module docs](self#blocking-file-io-and-connection-closes-io_uring).
 ///
 /// # Panics
 ///
