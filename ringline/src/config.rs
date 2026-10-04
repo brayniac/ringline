@@ -74,6 +74,11 @@ pub struct Config {
     /// Upper bound on each worker's bounded io-wq pool; 0 (the default)
     /// leaves the kernel's limit.
     pub(crate) iowq_max_workers: u32,
+    /// Test-only: what goes ahead of a connection's `Close`, in place of the
+    /// running kernel's choice, so either kernel's close path can be tested
+    /// on one host.
+    #[cfg(all(test, has_io_uring))]
+    pub(crate) close_lead_override: Option<crate::backend::uring::ring::CloseLead>,
     /// Recv buffer configuration (provided buffer ring) for TCP multishot recv.
     pub(crate) recv_buffer: RecvBufferConfig,
     /// Recv buffer configuration for UDP multishot recvmsg.
@@ -430,6 +435,8 @@ impl Default for Config {
             sqpoll_idle_ms: 1000,
             sqpoll_cpu: None,
             iowq_max_workers: 0,
+            #[cfg(all(test, has_io_uring))]
+            close_lead_override: None,
             recv_buffer: RecvBufferConfig::default(),
             udp_recv_buffer: RecvBufferConfig {
                 ring_size: 128,
@@ -633,7 +640,8 @@ impl Config {
                 "forward_hold_cap must be >= 1".into(),
             ));
         }
-        // A close pushes a linked shutdown and Close as one pair (#581).
+        // A close pushes its lead (a shutdown or a cancel) and the Close as
+        // one linked pair (#581, #586).
         if self.sq_entries < 2 || !self.sq_entries.is_power_of_two() {
             return Err(crate::error::Error::RingSetup(
                 "sq_entries must be at least 2 and a power of two".into(),
@@ -941,13 +949,16 @@ impl ConfigBuilder {
     /// is left as it is.
     ///
     /// The kernel runs work it cannot complete inline on io-wq threads. In
-    /// the bounded pool that is the `shutdown` sent ahead of every
-    /// connection close (#581), and regular-file I/O that would block, such
-    /// as `fs::fsync`. Past the cap, work waits for a free thread. A cap at
-    /// or below a worker's concurrent blocking file I/O therefore delays its
-    /// connection closes: with 32 `fsync` loops on one worker, a cap of 16
-    /// raised the median wait for a closed connection's EOF from 0.2 ms to
-    /// 12 ms (#584). io_uring backend only; the mio backend ignores it.
+    /// the bounded pool that is regular-file I/O that would block, such as
+    /// `fs::fsync`, and, before Linux 6.13, the `shutdown` sent ahead of
+    /// each connection close (#581). Past the cap, work waits for a free
+    /// thread. A cap at or below a worker's concurrent blocking file I/O
+    /// therefore delays its connection closes on those kernels: with 32
+    /// `fsync` loops on one worker, a cap of 16 raised the median wait for a
+    /// closed connection's EOF from 0.2 ms to 12 ms (#584). On any kernel, a
+    /// connection half-closed with `shutdown_write` waits for that shutdown
+    /// on this pool before its close. io_uring backend only; the mio backend
+    /// ignores it.
     pub fn iowq_max_workers(mut self, n: u32) -> Self {
         self.config.iowq_max_workers = n;
         self
@@ -1482,8 +1493,8 @@ mod tests {
         assert!(config_with(|c| c.sq_entries = 0).validate().is_err());
     }
 
-    /// A close pushes a linked shutdown and Close as one pair (#581), which a
-    /// one-entry SQ cannot hold.
+    /// A close pushes its lead (a shutdown or a cancel) and the Close as one
+    /// linked pair (#581, #586), which a one-entry SQ cannot hold.
     #[test]
     fn validate_sq_entries_one_rejected() {
         assert!(config_with(|c| c.sq_entries = 1).validate().is_err());

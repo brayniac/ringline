@@ -2165,13 +2165,19 @@ impl Driver {
         self.park_blocker(conn_index).is_none()
     }
 
-    /// Whether closing this connection's slot shuts its socket down first:
-    /// every close except one whose socket was handed to another worker.
-    pub(crate) fn close_shuts_down(&self, conn_index: u32) -> bool {
-        !self
+    /// What goes ahead of this connection's `Close`: the ring's choice for
+    /// the running kernel ([`CloseLead`](super::ring::CloseLead)), or nothing
+    /// for a socket handed to another worker, which must stay open.
+    pub(crate) fn close_lead(&self, conn_index: u32) -> super::ring::CloseLead {
+        let handed_off = self
             .connections
             .get(conn_index)
-            .is_some_and(|c| c.socket_handed_off)
+            .is_some_and(|c| c.socket_handed_off);
+        if handed_off {
+            super::ring::CloseLead::Nothing
+        } else {
+            self.ring.close_lead()
+        }
     }
 
     /// Submit the deferred `Close` SQE once every pending send, forward
@@ -2232,10 +2238,10 @@ impl Driver {
         // the peer a FIN and a parked reader on the other end hangs forever.
         // Cancelling the recv (by its `RecvMulti` user_data, which is immune to
         // Close reordering since it targets the request, not the fd) releases
-        // that reference. Requests on other connections can still delay the
-        // socket's release after the Close, so `submit_close` also shuts the
-        // socket down first, which queues a FIN behind any unsent data,
-        // whether or not the socket has been released (#581). The recv's
+        // that reference. The `CloseLead` linked ahead of the Close ends the
+        // connection's other requests; before Linux 6.13, a shutdown, which
+        // also queues the FIN while other connections' requests delay the
+        // socket's release (#581, #586). The recv's
         // ECANCELED completion is a no-op (generation/slot checks in
         // `handle_recv_multi`). Skipped when the recv already self-terminated
         // (e.g. a peer FIN drove this close) — nothing to cancel.
@@ -2264,8 +2270,8 @@ impl Driver {
                 cs.recv_multishot_armed = false;
             }
         }
-        let shut_down = self.close_shuts_down(conn_index);
-        if self.ring.submit_close(conn_index, shut_down).is_err() {
+        let lead = self.close_lead(conn_index);
+        if self.ring.submit_close(conn_index, lead).is_err() {
             crate::metrics::RING.increment(crate::metrics::ring::CLOSE_SUBMIT_FAILURES);
             // Queue this connection for retry on a later tick. (An earlier
             // version rebuilt the whole retry vec here — aging every other
@@ -2286,15 +2292,14 @@ impl Driver {
     /// deadline elapsed — the peer stopped reading, so the queued/in-flight
     /// sends are stuck). Deliberately abandons outstanding work: queued
     /// (never-submitted) sends are released here; the in-flight send / chain
-    /// SQEs are left to the kernel — the Close cancels them, and their CQEs
-    /// fail the generation identity check in the completion handlers (post
-    /// Close-CQE), so they release their own slots without touching the
-    /// index's next occupant. A CQE that lands *before* the Close CQE still
-    /// matches the generation and takes the normal path: on this abandoned
-    /// connection that can burn a resubmit/POLLOUT SQE against the closing
-    /// fd (EBADF/ECANCELED follow-up) or wake the abandoned waiter — wasteful
-    /// but bounded, and confined to the force path. The next occupant is
-    /// protected by `reset_send_state` at reactivation.
+    /// SQEs are left to the kernel. The Close does not cancel them; the
+    /// `CloseLead` linked ahead of it ends them (a shutdown before Linux
+    /// 6.13, a cancel from 6.13). Their CQEs (`-ECANCELED`, `EPIPE`, or a
+    /// partial count) usually land before the Close CQE. They then find
+    /// `close_submitted` set, release their slot or slab entry, and fail the
+    /// waiter without pushing an SQE. A CQE that lands after the Close CQE
+    /// fails the generation check and releases only its own slot. The next
+    /// occupant is protected by `reset_send_state` at reactivation.
     pub(crate) fn force_finalize_close(&mut self, conn_index: u32) {
         let state = &mut self.send_queues[conn_index as usize];
         let bounded = Self::release_queued_sends(
@@ -3255,7 +3260,7 @@ impl Driver {
                 // cancels any request still in flight and releases the
                 // sockets; each peer then gets a FIN, or an RST if received
                 // data was unread.
-                let _ = self.ring.submit_close(i, false);
+                let _ = self.ring.submit_close(i, super::ring::CloseLead::Nothing);
             }
         }
 

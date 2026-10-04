@@ -148,8 +148,9 @@ pub struct ConnectionState {
     #[cfg(has_io_uring)]
     pub recv_multishot_armed: bool,
     /// The socket was handed to another worker (a park install, #443), so
-    /// closing this slot must not shut it down. Every other close shuts the
-    /// socket down before closing the fixed descriptor (#581).
+    /// closing this slot must not shut the socket down. Other closes link a shutdown
+    /// (before Linux 6.13) or a cancel of the connection's requests (from
+    /// 6.13) ahead of closing the fixed descriptor (#581, #586).
     #[cfg(has_io_uring)]
     pub socket_handed_off: bool,
 }
