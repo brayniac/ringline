@@ -91,7 +91,7 @@ A cargo build on one of them is a CPU-heavy load landing on a measurement host,
 which silently perturbs whatever experiment is in flight — someone else's as
 easily as your own. Submit an experiment and let the scheduler place it.
 
-Two things worth knowing wherever the uring tests run:
+Three things worth knowing wherever the uring tests run:
 
 - **Run clippy on the io_uring path too, not just the tests.** Lints behind
   `has_io_uring` exist only there: a `///` doc comment above a `thread_local!`
@@ -101,6 +101,14 @@ Two things worth knowing wherever the uring tests run:
 - **The uring test binary needs a generous `RLIMIT_NOFILE`.** At a 1024 soft
   limit it aborts with `io_uring_setup(2): Too many open files (EMFILE)`, which
   reads as a code failure and is not; raise the soft limit in the payload.
+- **On Linux 6.14+ every ring is charged to `RLIMIT_MEMLOCK`**, and the
+  charge of a dropped ring is released asynchronously. The lib test helpers
+  `make_test_loop` and `ring.rs`'s `ring_with`, and the runtime launches in
+  `close_tests.rs`, retry an ENOMEM from ring setup or provided-ring
+  registration for up to 5 s (`is_memlock_enomem`, #589). Integration tests
+  under `ringline/tests/` do not. If the user's total charge, across all
+  their processes, still exceeds the limit after 5 s, `make_test_loop`
+  aborts the binary with the setup message.
 
 ## Workspace Structure
 
