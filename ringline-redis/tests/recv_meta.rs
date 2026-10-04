@@ -8,6 +8,8 @@
 //!
 //! In-process stub-server pattern, mirroring `parse_error.rs` / `streaming.rs`.
 
+mod common;
+
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -316,13 +318,11 @@ fn recv_meta_end_to_end() {
 
     SERVER_ADDR.set(addr.parse().unwrap()).ok();
 
-    let (_c_shutdown, c_handles) = RinglineBuilder::new(test_config())
+    let (c_shutdown, c_handles) = RinglineBuilder::new(test_config())
         .launch::<ClientHandler>()
         .expect("client launch failed");
 
-    for h in c_handles {
-        h.join().unwrap().unwrap();
-    }
+    common::join_workers(&c_shutdown, c_handles);
 
     let result = RESULT.get().expect("client did not set result");
     if let Err(e) = result {

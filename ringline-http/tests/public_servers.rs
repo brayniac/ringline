@@ -7,6 +7,8 @@
 //!
 //!   cargo test -p ringline-http --test public_servers -- --ignored --nocapture
 
+mod common;
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
@@ -111,13 +113,11 @@ fn h2_google() {
         }
     }
 
-    let (_shutdown, handles) = ringline::RinglineBuilder::new(test_config(&[b"h2"]))
+    let (shutdown, handles) = ringline::RinglineBuilder::new(test_config(&[b"h2"]))
         .launch::<H2GoogleHandler>()
         .expect("launch failed");
 
-    for h in handles {
-        h.join().unwrap().unwrap();
-    }
+    common::join_workers(&shutdown, handles);
 
     let r = H2_GOOGLE_RESULT.get().expect("test did not set result");
     assert_eq!(r, "OK", "h2_google: {r}");
@@ -182,13 +182,11 @@ fn h2_cloudflare() {
         }
     }
 
-    let (_shutdown, handles) = ringline::RinglineBuilder::new(test_config(&[b"h2"]))
+    let (shutdown, handles) = ringline::RinglineBuilder::new(test_config(&[b"h2"]))
         .launch::<H2CloudflareHandler>()
         .expect("launch failed");
 
-    for h in handles {
-        h.join().unwrap().unwrap();
-    }
+    common::join_workers(&shutdown, handles);
 
     let r = H2_CLOUDFLARE_RESULT.get().expect("test did not set result");
     assert_eq!(r, "OK", "h2_cloudflare: {r}");
@@ -269,13 +267,11 @@ fn h2_multiplexed() {
         }
     }
 
-    let (_shutdown, handles) = ringline::RinglineBuilder::new(test_config(&[b"h2"]))
+    let (shutdown, handles) = ringline::RinglineBuilder::new(test_config(&[b"h2"]))
         .launch::<H2MultiplexHandler>()
         .expect("launch failed");
 
-    for h in handles {
-        h.join().unwrap().unwrap();
-    }
+    common::join_workers(&shutdown, handles);
 
     let r = H2_MULTIPLEX_RESULT.get().expect("test did not set result");
     assert_eq!(r, "OK", "h2_multiplexed: {r}");
@@ -344,13 +340,11 @@ fn h1_google() {
         }
     }
 
-    let (_shutdown, handles) = ringline::RinglineBuilder::new(test_config(&[]))
+    let (shutdown, handles) = ringline::RinglineBuilder::new(test_config(&[]))
         .launch::<H1GoogleHandler>()
         .expect("launch failed");
 
-    for h in handles {
-        h.join().unwrap().unwrap();
-    }
+    common::join_workers(&shutdown, handles);
 
     let r = H1_GOOGLE_RESULT.get().expect("test did not set result");
     assert_eq!(r, "OK", "h1_google: {r}");
@@ -424,13 +418,11 @@ fn h2_streaming() {
         }
     }
 
-    let (_shutdown, handles) = ringline::RinglineBuilder::new(test_config(&[b"h2"]))
+    let (shutdown, handles) = ringline::RinglineBuilder::new(test_config(&[b"h2"]))
         .launch::<H2StreamingHandler>()
         .expect("launch failed");
 
-    for h in handles {
-        h.join().unwrap().unwrap();
-    }
+    common::join_workers(&shutdown, handles);
 
     let r = H2_STREAMING_RESULT.get().expect("test did not set result");
     assert_eq!(r, "OK", "h2_streaming: {r}");

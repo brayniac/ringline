@@ -2,6 +2,8 @@
 #![cfg(has_io_uring)]
 //! Integration tests for async process spawning.
 
+mod common;
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
@@ -54,13 +56,11 @@ impl AsyncEventHandler for SpawnTrueHandler {
 fn process_spawn_true() {
     SPAWN_OK.store(0, Ordering::SeqCst);
 
-    let (_shutdown, handles) = RinglineBuilder::new(test_config())
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
         .launch::<SpawnTrueHandler>()
         .expect("launch failed");
 
-    for h in handles {
-        h.join().unwrap().unwrap();
-    }
+    common::join_workers(&shutdown, handles);
     assert_eq!(SPAWN_OK.load(Ordering::SeqCst), 1);
 }
 
@@ -92,13 +92,11 @@ impl AsyncEventHandler for SpawnFalseHandler {
 fn process_spawn_false() {
     SPAWN_FAIL_CODE.store(-1, Ordering::SeqCst);
 
-    let (_shutdown, handles) = RinglineBuilder::new(test_config())
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
         .launch::<SpawnFalseHandler>()
         .expect("launch failed");
 
-    for h in handles {
-        h.join().unwrap().unwrap();
-    }
+    common::join_workers(&shutdown, handles);
     let code = SPAWN_FAIL_CODE.load(Ordering::SeqCst);
     assert_ne!(code, 0, "expected non-zero exit code from `false`");
 }
@@ -140,13 +138,11 @@ impl AsyncEventHandler for SpawnArgsHandler {
 fn process_spawn_with_args() {
     SPAWN_ARGS.store(0, Ordering::SeqCst);
 
-    let (_shutdown, handles) = RinglineBuilder::new(test_config())
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
         .launch::<SpawnArgsHandler>()
         .expect("launch failed");
 
-    for h in handles {
-        h.join().unwrap().unwrap();
-    }
+    common::join_workers(&shutdown, handles);
     assert_eq!(SPAWN_ARGS.load(Ordering::SeqCst), 1);
 }
 
@@ -187,13 +183,11 @@ impl AsyncEventHandler for KillHandler {
 fn process_kill() {
     KILL_OK.store(0, Ordering::SeqCst);
 
-    let (_shutdown, handles) = RinglineBuilder::new(test_config())
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
         .launch::<KillHandler>()
         .expect("launch failed");
 
-    for h in handles {
-        h.join().unwrap().unwrap();
-    }
+    common::join_workers(&shutdown, handles);
     assert_eq!(KILL_OK.load(Ordering::SeqCst), 1);
 }
 
@@ -230,13 +224,11 @@ fn process_spawner_disabled() {
         .spawner_threads(0)
         .build()
         .expect("valid config");
-    let (_shutdown, handles) = RinglineBuilder::new(config)
+    let (shutdown, handles) = RinglineBuilder::new(config)
         .launch::<SpawnerDisabledHandler>()
         .expect("launch failed");
 
-    for h in handles {
-        h.join().unwrap().unwrap();
-    }
+    common::join_workers(&shutdown, handles);
     assert_eq!(SPAWNER_DISABLED.load(Ordering::SeqCst), 1);
 }
 
@@ -276,12 +268,10 @@ impl AsyncEventHandler for ArgsBuilderHandler {
 fn process_args_builder() {
     ARGS_BUILDER.store(0, Ordering::SeqCst);
 
-    let (_shutdown, handles) = RinglineBuilder::new(test_config())
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
         .launch::<ArgsBuilderHandler>()
         .expect("launch failed");
 
-    for h in handles {
-        h.join().unwrap().unwrap();
-    }
+    common::join_workers(&shutdown, handles);
     assert_eq!(ARGS_BUILDER.load(Ordering::SeqCst), 1);
 }

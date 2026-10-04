@@ -8,6 +8,8 @@
 //!
 //!   cargo test -p ringline-redis --test recv_cap -- --ignored --nocapture
 
+mod common;
+
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -105,10 +107,8 @@ fn lrange_over_1024_elements_round_trips() {
         .pin_to_core(false)
         .build()
         .expect("valid config");
-    let (_s, handles) = RinglineBuilder::new(cfg).launch::<H>().expect("launch");
-    for h in handles {
-        h.join().unwrap().unwrap();
-    }
+    let (server_runtime, handles) = RinglineBuilder::new(cfg).launch::<H>().expect("launch");
+    common::join_workers(&server_runtime, handles);
     match RESULT.get().expect("on_start did not set result") {
         Ok(len) => {
             let n = n_from_env();

@@ -1,6 +1,8 @@
 #![allow(clippy::manual_async_fn)]
 //! Integration tests for spawn_blocking.
 
+mod common;
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
@@ -54,13 +56,11 @@ impl AsyncEventHandler for BlockingBasicHandler {
 fn spawn_blocking_returns_value() {
     BLOCKING_RESULT.store(0, Ordering::SeqCst);
 
-    let (_shutdown, handles) = RinglineBuilder::new(test_config())
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
         .launch::<BlockingBasicHandler>()
         .expect("launch failed");
 
-    for h in handles {
-        h.join().unwrap().unwrap();
-    }
+    common::join_workers(&shutdown, handles);
     assert_eq!(BLOCKING_RESULT.load(Ordering::SeqCst), 42);
 }
 
@@ -102,13 +102,11 @@ impl AsyncEventHandler for BlockingConcurrentHandler {
 fn spawn_blocking_doesnt_stall_worker() {
     BLOCKING_CONCURRENT.store(0, Ordering::SeqCst);
 
-    let (_shutdown, handles) = RinglineBuilder::new(test_config())
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
         .launch::<BlockingConcurrentHandler>()
         .expect("launch failed");
 
-    for h in handles {
-        h.join().unwrap().unwrap();
-    }
+    common::join_workers(&shutdown, handles);
     assert_eq!(BLOCKING_CONCURRENT.load(Ordering::SeqCst), 10);
 }
 
@@ -145,13 +143,11 @@ impl AsyncEventHandler for BlockingMultiHandler {
 fn spawn_blocking_multiple_concurrent() {
     BLOCKING_MULTI.store(0, Ordering::SeqCst);
 
-    let (_shutdown, handles) = RinglineBuilder::new(test_config())
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
         .launch::<BlockingMultiHandler>()
         .expect("launch failed");
 
-    for h in handles {
-        h.join().unwrap().unwrap();
-    }
+    common::join_workers(&shutdown, handles);
     assert_eq!(BLOCKING_MULTI.load(Ordering::SeqCst), 60);
 }
 
@@ -188,13 +184,11 @@ fn spawn_blocking_disabled() {
         .blocking_threads(0)
         .build()
         .expect("valid config");
-    let (_shutdown, handles) = RinglineBuilder::new(config)
+    let (shutdown, handles) = RinglineBuilder::new(config)
         .launch::<BlockingDisabledHandler>()
         .expect("launch failed");
 
-    for h in handles {
-        h.join().unwrap().unwrap();
-    }
+    common::join_workers(&shutdown, handles);
     assert_eq!(BLOCKING_DISABLED.load(Ordering::SeqCst), 1);
 }
 
@@ -230,13 +224,11 @@ impl AsyncEventHandler for BlockingStringHandler {
 fn spawn_blocking_non_copy_type() {
     BLOCKING_STRING.store(0, Ordering::SeqCst);
 
-    let (_shutdown, handles) = RinglineBuilder::new(test_config())
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
         .launch::<BlockingStringHandler>()
         .expect("launch failed");
 
-    for h in handles {
-        h.join().unwrap().unwrap();
-    }
+    common::join_workers(&shutdown, handles);
     assert_eq!(BLOCKING_STRING.load(Ordering::SeqCst), 1);
 }
 

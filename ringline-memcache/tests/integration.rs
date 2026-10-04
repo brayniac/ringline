@@ -5,6 +5,8 @@
 //!
 //!   cargo test -p ringline-memcache --test integration -- --ignored --nocapture
 
+mod common;
+
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -453,13 +455,11 @@ fn memcache_pool() {
         }
     }
 
-    let (_shutdown, handles) = RinglineBuilder::new(test_config())
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
         .launch::<Handler>()
         .expect("launch failed");
 
-    for h in handles {
-        h.join().unwrap().unwrap();
-    }
+    common::join_workers(&shutdown, handles);
 
     let result = POOL_RESULT.get().expect("on_start did not set result");
     if let Err(e) = result {

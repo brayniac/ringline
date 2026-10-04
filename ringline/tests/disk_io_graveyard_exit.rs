@@ -9,6 +9,8 @@
 #![cfg(all(target_os = "linux", not(has_io_uring)))]
 #![allow(clippy::manual_async_fn)]
 
+mod common;
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::future::Future;
 use std::path::PathBuf;
@@ -113,9 +115,7 @@ fn an_abandoned_reads_buffer_outlives_its_worker() {
     let (runtime, handles) = RinglineBuilder::new(config)
         .launch::<AbandonsRead>()
         .expect("launch");
-    for h in handles {
-        h.join().expect("worker panicked").expect("worker failed");
-    }
+    common::join_workers(&runtime, handles);
     drop(runtime);
     OUTCOME
         .lock()

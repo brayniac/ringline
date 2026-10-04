@@ -4,6 +4,8 @@
 //!
 //! Uses a fake "bad redis" server that responds with garbage to any command.
 
+mod common;
+
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -138,13 +140,11 @@ fn malformed_resp_returns_error_not_hang() {
 
     BAD_REDIS_ADDR.set(addr.parse().unwrap()).ok();
 
-    let (_c_shutdown, c_handles) = RinglineBuilder::new(test_config())
+    let (c_shutdown, c_handles) = RinglineBuilder::new(test_config())
         .launch::<BadRedisClientHandler>()
         .expect("client launch failed");
 
-    for h in c_handles {
-        h.join().unwrap().unwrap();
-    }
+    common::join_workers(&c_shutdown, c_handles);
 
     let result = BAD_REDIS_RESULT.get().expect("on_start did not set result");
     assert_eq!(result, "ERROR", "expected parse error, got: {result}");

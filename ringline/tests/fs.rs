@@ -1,6 +1,8 @@
 #![allow(clippy::manual_async_fn)]
 //! Integration tests for the async fs module.
 
+mod common;
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -88,13 +90,11 @@ impl AsyncEventHandler for FsReadWriteHandler {
 fn fs_create_write_read() {
     FS_READ_RESULT.store(0, Ordering::SeqCst);
 
-    let (_shutdown, handles) = RinglineBuilder::new(test_config())
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
         .launch::<FsReadWriteHandler>()
         .expect("launch failed");
 
-    for h in handles {
-        h.join().unwrap().unwrap();
-    }
+    common::join_workers(&shutdown, handles);
     assert_eq!(FS_READ_RESULT.load(Ordering::SeqCst), 1);
 }
 
@@ -134,13 +134,11 @@ impl AsyncEventHandler for FsStatHandler {
 fn fs_stat_file() {
     FS_STAT_RESULT.store(0, Ordering::SeqCst);
 
-    let (_shutdown, handles) = RinglineBuilder::new(test_config())
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
         .launch::<FsStatHandler>()
         .expect("launch failed");
 
-    for h in handles {
-        h.join().unwrap().unwrap();
-    }
+    common::join_workers(&shutdown, handles);
     assert_eq!(FS_STAT_RESULT.load(Ordering::SeqCst), 1);
 }
 
@@ -184,13 +182,11 @@ impl AsyncEventHandler for FsRenameHandler {
 fn fs_rename_file() {
     FS_RENAME_RESULT.store(0, Ordering::SeqCst);
 
-    let (_shutdown, handles) = RinglineBuilder::new(test_config())
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
         .launch::<FsRenameHandler>()
         .expect("launch failed");
 
-    for h in handles {
-        h.join().unwrap().unwrap();
-    }
+    common::join_workers(&shutdown, handles);
     assert_eq!(FS_RENAME_RESULT.load(Ordering::SeqCst), 1);
 }
 
@@ -227,13 +223,11 @@ impl AsyncEventHandler for FsRemoveHandler {
 fn fs_remove_file() {
     FS_REMOVE_RESULT.store(0, Ordering::SeqCst);
 
-    let (_shutdown, handles) = RinglineBuilder::new(test_config())
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
         .launch::<FsRemoveHandler>()
         .expect("launch failed");
 
-    for h in handles {
-        h.join().unwrap().unwrap();
-    }
+    common::join_workers(&shutdown, handles);
     assert_eq!(FS_REMOVE_RESULT.load(Ordering::SeqCst), 1);
 }
 
@@ -274,13 +268,11 @@ impl AsyncEventHandler for FsMkdirHandler {
 fn fs_mkdir_and_stat() {
     FS_MKDIR_RESULT.store(0, Ordering::SeqCst);
 
-    let (_shutdown, handles) = RinglineBuilder::new(test_config())
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
         .launch::<FsMkdirHandler>()
         .expect("launch failed");
 
-    for h in handles {
-        h.join().unwrap().unwrap();
-    }
+    common::join_workers(&shutdown, handles);
     assert_eq!(FS_MKDIR_RESULT.load(Ordering::SeqCst), 1);
 }
 
@@ -336,13 +328,11 @@ impl AsyncEventHandler for FsSafeRoundtripHandler {
 fn fs_safe_api_roundtrip() {
     FS_SAFE_RESULT.store(0, Ordering::SeqCst);
 
-    let (_shutdown, handles) = RinglineBuilder::new(test_config())
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
         .launch::<FsSafeRoundtripHandler>()
         .expect("launch failed");
 
-    for h in handles {
-        h.join().unwrap().unwrap();
-    }
+    common::join_workers(&shutdown, handles);
     assert_eq!(FS_SAFE_RESULT.load(Ordering::SeqCst), 1);
 }
 
@@ -401,12 +391,10 @@ impl AsyncEventHandler for FsDropInFlightHandler {
 fn fs_safe_api_drop_in_flight() {
     FS_DROP_RESULT.store(0, Ordering::SeqCst);
 
-    let (_shutdown, handles) = RinglineBuilder::new(test_config())
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
         .launch::<FsDropInFlightHandler>()
         .expect("launch failed");
 
-    for h in handles {
-        h.join().unwrap().unwrap();
-    }
+    common::join_workers(&shutdown, handles);
     assert_eq!(FS_DROP_RESULT.load(Ordering::SeqCst), 1);
 }

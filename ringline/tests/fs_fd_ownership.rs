@@ -7,6 +7,8 @@
 #![cfg(target_os = "linux")]
 #![allow(clippy::manual_async_fn)]
 
+mod common;
+
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -464,9 +466,7 @@ mod mio {
         let fifo_fds = fds_on(&fifo);
 
         PROBE.store(true, Ordering::SeqCst);
-        for h in handles {
-            h.join().expect("worker panicked").expect("worker failed");
-        }
+        common::join_workers(&runtime, handles);
         drop(runtime);
         let outcome = OUTCOME.lock().unwrap().take();
         let _ = std::fs::remove_dir_all(&dir);

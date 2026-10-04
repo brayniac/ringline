@@ -4,6 +4,8 @@
 //! exchange), and outbound `connect(addr).tls(..)` from one ringline worker to another.
 //! Uses self-signed certificates generated at test time via `rcgen`.
 
+mod common;
+
 use std::future::Future;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -545,13 +547,11 @@ fn tls_outbound_connect_and_echo() {
         .build()
         .expect("valid config");
 
-    let (_c_shutdown, c_handles) = RinglineBuilder::new(cli_config)
+    let (c_shutdown, c_handles) = RinglineBuilder::new(cli_config)
         .launch::<TlsClientHandler>()
         .expect("client launch failed");
 
-    for h in c_handles {
-        h.join().unwrap().unwrap();
-    }
+    common::join_workers(&c_shutdown, c_handles);
 
     let result = TLS_CONNECT_RESULT
         .get()

@@ -4,6 +4,8 @@
 //! `PONG\r\n` to `PING\r\n`), then connects a ringline ping client
 //! through `on_start` in client-only mode.
 
+mod common;
+
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -139,13 +141,11 @@ fn ping_round_trip() {
     PING_SERVER_ADDR.set(addr.parse().unwrap()).ok();
 
     // Launch client-only (no .bind()).
-    let (_c_shutdown, c_handles) = RinglineBuilder::new(test_config())
+    let (c_shutdown, c_handles) = RinglineBuilder::new(test_config())
         .launch::<PingClientHandler>()
         .expect("client launch failed");
 
-    for h in c_handles {
-        h.join().unwrap().unwrap();
-    }
+    common::join_workers(&c_shutdown, c_handles);
 
     let result = PING_RESULT.get().expect("on_start did not set result");
     assert_eq!(result, "OK", "expected OK, got: {result}");
@@ -229,13 +229,11 @@ fn ping_pool() {
     POOL_SERVER_ADDR.set(addr.parse().unwrap()).ok();
 
     // Launch client-only.
-    let (_c_shutdown, c_handles) = RinglineBuilder::new(test_config())
+    let (c_shutdown, c_handles) = RinglineBuilder::new(test_config())
         .launch::<PingPoolClientHandler>()
         .expect("client launch failed");
 
-    for h in c_handles {
-        h.join().unwrap().unwrap();
-    }
+    common::join_workers(&c_shutdown, c_handles);
 
     let result = POOL_RESULT.get().expect("on_start did not set result");
     assert_eq!(result, "OK", "expected OK, got: {result}");
@@ -332,13 +330,11 @@ fn parse_error_returns_error_not_hang() {
 
     BAD_SERVER_ADDR.set(addr.parse().unwrap()).ok();
 
-    let (_c_shutdown, c_handles) = RinglineBuilder::new(test_config())
+    let (c_shutdown, c_handles) = RinglineBuilder::new(test_config())
         .launch::<BadPingClientHandler>()
         .expect("client launch failed");
 
-    for h in c_handles {
-        h.join().unwrap().unwrap();
-    }
+    common::join_workers(&c_shutdown, c_handles);
 
     let result = BAD_RESULT.get().expect("on_start did not set result");
     assert_eq!(result, "ERROR", "expected parse error, got: {result}");
@@ -488,13 +484,11 @@ fn pool_checkout_semantics() {
 
     SEMANTICS_SERVER_ADDR.set(addr.parse().unwrap()).ok();
 
-    let (_c_shutdown, c_handles) = RinglineBuilder::new(test_config())
+    let (c_shutdown, c_handles) = RinglineBuilder::new(test_config())
         .launch::<PoolSemanticsHandler>()
         .expect("client launch failed");
 
-    for h in c_handles {
-        h.join().unwrap().unwrap();
-    }
+    common::join_workers(&c_shutdown, c_handles);
 
     let result = SEMANTICS_RESULT.get().expect("on_start did not set result");
     assert_eq!(result, "OK", "expected OK, got: {result}");
