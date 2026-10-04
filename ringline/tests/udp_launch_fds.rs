@@ -2,12 +2,14 @@
 //! each launch opened.
 //!
 //! Its own test binary, because it counts the process's open fds and waits
-//! for the process to have no runtime threads, which other tests in the same
-//! process would disturb. Linux only.
+//! for the threads launched since the test started to exit, which other tests
+//! in the same process would disturb. Linux only.
 
 #![cfg(target_os = "linux")]
 #![allow(clippy::manual_async_fn)]
 
+use std::collections::BTreeSet;
+use std::ffi::OsString;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -84,26 +86,29 @@ fn open_fd_targets() -> Vec<String> {
     targets
 }
 
-/// Waits up to 30 s until no thread named `ringline-*` is left in this
-/// process. Every pool thread holds each worker's wake fd until it exits.
-/// Blocking-pool threads run at `SCHED_IDLE`; on a busy host they can exit
-/// seconds after the workers join. A pool thread carries its creator's name,
-/// `ringline-worker-*`, until it first runs, so the prefix covers it too.
-fn wait_for_runtime_threads_to_exit() {
+/// The ids of this process's threads.
+fn thread_ids() -> BTreeSet<OsString> {
+    std::fs::read_dir("/proc/self/task")
+        .expect("read /proc/self/task")
+        .filter_map(|t| Some(t.ok()?.file_name()))
+        .collect()
+}
+
+/// Waits up to 30 s until the only threads left are those in `before`. Every
+/// pool thread holds each worker's wake fd until it exits. Blocking-pool
+/// threads run at `SCHED_IDLE`; on a busy host they can exit seconds after the
+/// workers join.
+fn wait_for_runtime_threads_to_exit(before: &BTreeSet<OsString>) {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let alive: Vec<String> = std::fs::read_dir("/proc/self/task")
-            .expect("read /proc/self/task")
-            .filter_map(|t| std::fs::read_to_string(t.ok()?.path().join("comm")).ok())
-            .map(|name| name.trim_end().to_string())
-            .filter(|name| name.starts_with("ringline-"))
-            .collect();
-        if alive.is_empty() {
+        let extra: Vec<OsString> = thread_ids().difference(before).cloned().collect();
+        if extra.is_empty() {
             return;
         }
         assert!(
             Instant::now() < deadline,
-            "ringline threads still running 30 s after the workers joined: {alive:?}"
+            "{} runtime threads still running 30 s after the workers joined",
+            extra.len()
         );
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -111,25 +116,28 @@ fn wait_for_runtime_threads_to_exit() {
 
 #[test]
 fn udp_repeated_launch_does_not_leak_fds() {
-    // Launch twice first so any per-process one-time allocations happen
-    // before the baseline.
+    let before = thread_ids();
+    // Launch twice first, in case a launch opens an fd once per process that
+    // stays open.
     for _ in 0..2 {
         launch_and_shut_down();
     }
-    wait_for_runtime_threads_to_exit();
+    wait_for_runtime_threads_to_exit(&before);
     let baseline = open_fd_count();
+    let baseline_targets = open_fd_targets();
 
     for _ in 0..6 {
         launch_and_shut_down();
     }
-    // Every ringline thread has exited, so every fd a launch opened is
-    // closed.
-    wait_for_runtime_threads_to_exit();
+    // Every thread a launch started has exited, so every fd a launch opened
+    // is closed.
+    wait_for_runtime_threads_to_exit(&before);
     let after = open_fd_count();
     assert_eq!(
         after,
         baseline,
-        "open fd count changed after 6 launch+shutdown cycles; open fds: {:?}",
+        "open fd count changed after 6 launch+shutdown cycles; open fds before: \
+         {baseline_targets:?}, after: {:?}",
         open_fd_targets()
     );
 }
