@@ -1,4 +1,4 @@
-//! Async filesystem I/O via io_uring.
+//! Async filesystem I/O.
 //!
 //! Provides buffered file read/write and metadata operations (stat, rename,
 //! remove, mkdir). File operations do not block the worker thread: on
@@ -7,29 +7,31 @@
 //!
 //! ## Blocking file I/O and connection closes (io_uring)
 //!
-//! The kernel runs io_uring operations it cannot finish without blocking on
-//! io-wq, a set of kernel threads owned by the thread that submits them: the
-//! ringline worker, or its SQPOLL thread when `sqpoll` is set. io-wq keeps two
-//! pools. File and path operations go to the bounded one, which has a fixed
-//! maximum size. These are the pool operations:
+//! When the kernel cannot finish an io_uring operation without blocking, it
+//! runs the operation on io-wq: kernel threads that belong to the thread that
+//! submitted it, which is the ringline worker, or its SQPOLL thread when
+//! [`sqpoll`](crate::ConfigBuilder::sqpoll) is set. io-wq keeps two pools.
+//! File and path operations go to the bounded one, whose size limit is given
+//! below. These are the pool operations:
 //!
 //! - always: [`fsync`], [`stat`], [`rename`], [`remove`], [`mkdir`], and
 //!   [`open`] with `CREATE` or `TRUNCATE` (including [`create`]);
-//! - on overlayfs (a container's root filesystem) and tmpfs: every read and
+//! - on overlayfs (the usual root filesystem of a Docker or Kubernetes
+//!   container; a mounted volume usually is not) and tmpfs: every read and
 //!   write;
-//! - on a filesystem without async buffered writes, such as ext4: every
-//!   buffered write;
+//! - on a filesystem that cannot run buffered writes asynchronously, such as
+//!   ext4 or f2fs (XFS and btrfs can): every write;
 //! - otherwise, when the kernel cannot finish them without blocking: other
 //!   opens, reads and writes.
 //!
 //! [`DriverCtx::direct_io_fsync`](crate::DriverCtx::direct_io_fsync) always
-//! uses the pool too, and direct I/O reads and writes use it when they would
-//! block.
+//! uses the pool too. Direct I/O reads and writes use it always on overlayfs
+//! and tmpfs, and elsewhere when they would block.
 //!
 //! The pool has `min(sq_entries, 4 × the host's online CPUs)` threads per
 //! worker; a container's CPU limit does not lower it. With the default
-//! [`sq_entries`](crate::ConfigBuilder::sq_entries) of 256 that is
-//! 4 × CPUs, up to 64 CPUs.
+//! [`sq_entries`](crate::ConfigBuilder::sq_entries) of 256 that is 4 × the
+//! CPU count on hosts with up to 64 CPUs, and 256 on larger hosts.
 //! [`ConfigBuilder::iowq_max_workers`](crate::ConfigBuilder::iowq_max_workers)
 //! lowers it.
 //!
@@ -51,13 +53,12 @@
 //! On these kernels:
 //!
 //! - Upgrade to Linux 6.13 or later if you can. From 6.13 a close does not
-//!   use the pool. One exception remains on every kernel:
-//!   [`shutdown_write`](crate::Connection::shutdown_write) uses the pool, and
-//!   a close issued while it is still running waits for it.
+//!   use the pool.
 //! - Keep the number of pool operations a worker has in flight below the
-//!   pool size, and do not set `iowq_max_workers` below that number. Writes
-//!   to the same file run one at a time and count once. This shortens the
-//!   delay; it does not remove it (the second row above).
+//!   pool size, and do not set `iowq_max_workers` below that count. Writes to
+//!   the same file run one at a time and count once; `fsync` calls do not,
+//!   even on the same file. This shortens the delay; it does not remove it
+//!   (the `64 (kernel limit)`, `32 loops` row above).
 //! - Move the heaviest file I/O, such as an `fsync` loop, to `std::fs::File`
 //!   inside [`spawn_blocking`](crate::spawn_blocking), which does not use
 //!   io_uring. A ringline [`File`] cannot be used there. That pool is shared
@@ -65,6 +66,13 @@
 //!   ([`ConfigBuilder::blocking_threads`](crate::ConfigBuilder::blocking_threads)),
 //!   and runs at `SCHED_IDLE`, so on a busy host its work waits until a CPU
 //!   is idle.
+//!
+//! On every kernel, `shutdown_write` (on
+//! [`Connection`](crate::Connection::shutdown_write),
+//! [`SendHalf`](crate::SendHalf::shutdown_write) or
+//! [`DriverCtx`](crate::DriverCtx::shutdown_write)) sends a `shutdown` that
+//! runs on the pool. A close issued before that `shutdown` finishes waits for
+//! it.
 //!
 //! On the mio backend, file I/O runs on a separate thread pool and a close
 //! does not wait for it.

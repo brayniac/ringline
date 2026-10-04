@@ -4056,7 +4056,19 @@ impl SendHalf {
         self.conn.forward_recv_buf(data)
     }
 
-    /// See [`SendHalf::shutdown_write`].
+    /// Shut down the write side of the connection (half-close).
+    ///
+    /// Sends a TCP FIN to the peer. The read side remains open.
+    ///
+    /// Any `send_backpressured` still waiting for pool capacity on this
+    /// connection fails with [`BrokenPipe`](io::ErrorKind::BrokenPipe) rather
+    /// than waiting for a turn it could no longer use. Already-submitted
+    /// sends are left alone: their bytes may already be on the way, and the
+    /// FIN is ordered behind them. Plain `send` is unaffected either way.
+    ///
+    /// On io_uring the shutdown runs on the worker's io-wq pool, and a close
+    /// issued before it finishes waits for it; see
+    /// [the `fs` module docs](crate::fs#blocking-file-io-and-connection-closes-io_uring).
     pub fn shutdown_write(&mut self) {
         self.conn.shutdown_write();
     }
