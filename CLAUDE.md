@@ -101,6 +101,11 @@ Two things worth knowing wherever the uring tests run:
 - **The uring test binary needs a generous `RLIMIT_NOFILE`.** At a 1024 soft
   limit it aborts with `io_uring_setup(2): Too many open files (EMFILE)`, which
   reads as a code failure and is not; raise the soft limit in the payload.
+- **On Linux 6.14+ every ring is charged to `RLIMIT_MEMLOCK`**, and a dropped
+  ring's charge is released asynchronously. The test harness retries an
+  `io_uring_setup` ENOMEM for up to 5 s (`is_ring_setup_enomem`, #589), so a
+  burst of short-lived test rings waits for earlier ones to be freed. A limit
+  too small for one ring still aborts the binary with the setup message.
 
 ## Workspace Structure
 

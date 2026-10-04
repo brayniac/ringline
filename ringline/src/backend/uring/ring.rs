@@ -23,6 +23,19 @@ const FIXED_FILES_RELEASED_PER_FILE_SINCE: KernelVersion = KernelVersion {
     minor: 13,
 };
 
+/// Whether a `Ring::setup` error is `io_uring_setup` failing with ENOMEM.
+///
+/// On Linux 6.14+ each ring is charged to RLIMIT_MEMLOCK and a dropped ring's
+/// charge is released asynchronously, so tests that set up rings in quick
+/// succession can fail this way until earlier rings are freed (#589).
+/// `Error::RingSetup` carries only a message, built by
+/// `describe_ring_setup_failure`, so this reads the errno name from it.
+#[cfg(test)]
+pub(crate) fn is_ring_setup_enomem(err: &Error) -> bool {
+    matches!(err, Error::RingSetup(msg)
+        if msg.starts_with("io_uring_setup(2): ") && msg.contains(" (ENOMEM)"))
+}
+
 /// What is hard-linked ahead of a connection's `Close`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CloseLead {
@@ -1545,12 +1558,37 @@ mod tests {
         if let Some(cap) = cap {
             builder = builder.iowq_max_workers(cap);
         }
-        Ring::setup(&builder.build().expect("valid config")).expect("ring")
+        let config = builder.build().expect("valid config");
+        // Up to 5 s for earlier rings' memlock charge to be released (#589).
+        for _ in 0..50 {
+            match Ring::setup(&config) {
+                Err(e) if is_ring_setup_enomem(&e) => {
+                    std::thread::sleep(std::time::Duration::from_millis(100))
+                }
+                result => return result.expect("ring"),
+            }
+        }
+        Ring::setup(&config).expect("ring")
     }
 
     fn online_cpus() -> u32 {
         // SAFETY: sysconf has no preconditions.
         unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) as u32 }
+    }
+
+    /// The transient-ENOMEM check matches the message `Ring::setup` builds
+    /// for that errno, and nothing else.
+    #[test]
+    fn is_ring_setup_enomem_reads_the_errno_from_the_message() {
+        let probe = crate::error::RingSetupProbe::default();
+        let enomem =
+            Error::ring_setup_with_probe(io::Error::from_raw_os_error(libc::ENOMEM), &probe);
+        let eperm = Error::ring_setup_with_probe(io::Error::from_raw_os_error(libc::EPERM), &probe);
+        assert!(is_ring_setup_enomem(&enomem), "{enomem}");
+        assert!(!is_ring_setup_enomem(&eperm), "{eperm}");
+        assert!(!is_ring_setup_enomem(&Error::Io(
+            io::Error::from_raw_os_error(libc::ENOMEM)
+        )));
     }
 
     /// The kernel's own bounded limit on this host.
