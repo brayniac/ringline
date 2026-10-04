@@ -125,7 +125,7 @@ task-waker scheme are shared. The I/O mechanisms are not:
 | TCP receive | Multishot receive with provided buffers | Readiness read into owned memory |
 | File descriptors | Fixed-file table for connections | Registered ordinary sockets |
 | Sends | Copy pool plus guarded `SendMsgZc` scatter/gather | Owned/copy pending-send buffers |
-| Send retry | CQE handling, retry lists, and POLLOUT operations | Writable readiness and dirty lists |
+| Send retry | CQE handling, retry lists, and drain sends after `EAGAIN` | Writable readiness and dirty lists |
 | Timers | Timeout SQEs and completion generations | Deadline min-heap |
 | File/direct I/O | Submitted through the ring | Dedicated disk-I/O pool |
 | NVMe and registered regions | Supported | Unsupported |
@@ -256,8 +256,11 @@ Backpressure is bounded and explicit at each layer:
   immediate admission failures. `send_backpressured` is the exception: copy-pool
   exhaustion parks it in the worker's admission FIFO instead of failing it.
 - Short sends retain their backing and resubmit the remainder. Socket `EAGAIN`
-  retains the send and waits for POLLOUT/writable readiness. Transient ring
-  submission pressure is handled by retry lists where the operation permits it.
+  retains the send; on io_uring a plain `send` of its first unsent bytes then
+  waits for room (see "Waiting for room after `EAGAIN`" in
+  [send-completion-design.md](send-completion-design.md)), and on mio the send
+  waits for writable readiness. Transient ring submission pressure is handled
+  by retry lists where the operation permits it.
 
 An application's connection future returning is a close request, not permission
 to discard queued bytes. The io_uring driver marks `close_pending`, drains

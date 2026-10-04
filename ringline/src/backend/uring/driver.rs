@@ -1754,6 +1754,44 @@ impl Driver {
         }
     }
 
+    /// After a forward write to a socket or connection sink returned
+    /// `-EAGAIN`, submit a plain `send` of the first bytes still owed, which
+    /// the kernel parks until the sink has room. A `POLLOUT` poll would not
+    /// wait once the sink's peer has half-closed (#603). The completion,
+    /// `OpTag::ForwardWriteDrain`, is handled as a short write of the forward
+    /// write.
+    pub(crate) fn drain_forward_write(&mut self, conn_index: u32) -> io::Result<()> {
+        let idx = conn_index as usize;
+        let Some(state) = self.forward_write[idx].as_mut() else {
+            return Ok(());
+        };
+        state.rebuild_iovecs(&self.provided_bufs);
+        let Some(first) = state.iovecs.first() else {
+            return Ok(());
+        };
+        let (ptr, len) = (
+            first.iov_base as *const u8,
+            first.iov_len.min(u32::MAX as usize) as u32,
+        );
+        let ud = crate::completion::UserData::encode(
+            crate::completion::OpTag::ForwardWriteDrain,
+            conn_index,
+            state.generation,
+        );
+        // SAFETY: the bytes belong to the installed state's backings, which
+        // stay put until this CQE arrives.
+        match state.target {
+            SinkTarget::Fd { fd, is_file: false } => unsafe {
+                self.ring.submit_drain_send_fd(fd, ptr, len, ud)
+            },
+            SinkTarget::Conn { index, .. } => unsafe {
+                self.ring.submit_drain_send_fixed(index, ptr, len, ud)
+            },
+            // A file write does not return `-EAGAIN`; resubmit it as is.
+            SinkTarget::Fd { is_file: true, .. } => self.resubmit_forward_writev(conn_index),
+        }
+    }
+
     /// Clear the recv-side exclusivity claims for a slot that is being reused.
     ///
     /// `RecvHalf::drop` and `SegmentReader::drop` release their own claims, but
@@ -1855,21 +1893,22 @@ impl Driver {
         // `forward_write[conn]` is still `Some`.
         if let Some(state) = self.forward_write[conn_index as usize].as_ref() {
             let write_gen = state.generation;
-            // The in-flight op is either the write itself or its POLLOUT re-arm;
-            // cancel both user_data variants (the non-matching one is a harmless
-            // ENOENT whose `Cancel` CQE is ignored).
+            // The in-flight op is either the write itself or the drain send
+            // that follows an `EAGAIN`; cancel both user_data variants (the
+            // non-matching one is a harmless ENOENT whose `Cancel` CQE is
+            // ignored).
             let write_ud = crate::completion::UserData::encode(
                 crate::completion::OpTag::ForwardWrite,
                 conn_index,
                 write_gen,
             );
-            let pollout_ud = crate::completion::UserData::encode(
-                crate::completion::OpTag::ForwardWritePollOut,
+            let drain_ud = crate::completion::UserData::encode(
+                crate::completion::OpTag::ForwardWriteDrain,
                 conn_index,
                 write_gen,
             );
             let _ = self.ring.submit_async_cancel(write_ud.raw(), conn_index);
-            let _ = self.ring.submit_async_cancel(pollout_ud.raw(), conn_index);
+            let _ = self.ring.submit_async_cancel(drain_ud.raw(), conn_index);
         } else {
             // No forward write in flight — safe to clear a stale completed result.
             self.forward_done[conn_index as usize] = None;

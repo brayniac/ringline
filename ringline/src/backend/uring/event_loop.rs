@@ -1369,13 +1369,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             OpTag::SendRecvBuf => self.handle_send_recv_buf(ud, result),
             OpTag::SendPollOut => self.handle_send_pollout(ud, result),
             OpTag::SendMsgCoalesced => self.handle_send_msg_coalesced(ud, result),
-            OpTag::SendMsgCoalescedPollOut => self.handle_send_msg_coalesced_pollout(ud, result),
+            // A drain send's result is a partial write of the same entry.
+            OpTag::SendMsgCoalescedDrain => self.handle_send_msg_coalesced(ud, result),
+            // No notification follows a plain `send`.
+            OpTag::SendMsgZcDrain => self.handle_send_msg_zc(ud, result, 0),
             OpTag::SendRecvBufsCoalesced => self.handle_send_recv_bufs_coalesced(ud, result),
-            OpTag::SendRecvBufsCoalescedPollOut => {
-                self.handle_send_recv_bufs_coalesced_pollout(ud, result)
-            }
+            OpTag::SendRecvBufsCoalescedDrain => self.handle_send_recv_bufs_coalesced(ud, result),
             OpTag::ForwardWrite => self.handle_forward_write(ud, result),
-            OpTag::ForwardWritePollOut => self.handle_forward_write_pollout(ud, result),
+            OpTag::ForwardWriteDrain => self.handle_forward_write(ud, result),
             #[cfg(feature = "timestamps")]
             OpTag::RecvMsgMultiTs => self.handle_recv_msg_multi_ts(ud, result, flags),
         }
@@ -3419,8 +3420,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             return;
         }
 
-        // EAGAIN/EWOULDBLOCK: socket buffer full — wait for POLLOUT, keep the
-        // slab entry (and its data) alive, then resubmit the same sendmsg.
+        // EAGAIN/EWOULDBLOCK: socket buffer full. Keep the slab entry (and its
+        // data) alive and send its first unsent iovec with a plain `send`,
+        // which the kernel parks until there is room; its completion comes
+        // back here as a partial write (#603).
         let errno = -result;
         if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
             if self.close_submitted(conn_index) {
@@ -3436,9 +3439,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 return;
             }
             if self
-                .driver
-                .ring
-                .submit_send_msg_coalesced_pollout(conn_index, slab_idx)
+                .submit_slab_drain(OpTag::SendMsgCoalescedDrain, conn_index, slab_idx)
                 .is_err()
             {
                 let generation = self.driver.connections.generation(conn_index);
@@ -3466,60 +3467,20 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.executor.wake_send(conn_index, io_result);
     }
 
-    /// Handle a POLLOUT CQE armed after a coalesced send returned `-EAGAIN`.
-    /// Resubmits the same sendmsg (data still intact in the slab entry).
-    fn handle_send_msg_coalesced_pollout(&mut self, ud: UserData, result: i32) {
-        let conn_index = ud.conn_index();
-        let slab_idx = ud.payload() as u16;
-
-        if !self.driver.send_slab.in_use(slab_idx) {
-            return;
-        }
-        // Identity: closed (index possibly reused) while waiting for POLLOUT.
-        if !self.slab_identity_ok(conn_index, slab_idx) {
-            // Take-and-discard, as in `handle_send_msg_coalesced`: the dead
-            // occupant's operation was already aborted by its teardown.
-            let _ = self.driver.send_slab.take_coalesced_bounded_send(slab_idx);
-            self.release_coalesced(slab_idx);
-            return;
-        }
-
-        if result < 0 {
-            let bounded = self.driver.send_slab.take_coalesced_bounded_send(slab_idx);
-            self.release_coalesced(slab_idx);
-            self.driver.drain_conn_send_queue(conn_index);
-            self.driver.note_send_finalized(conn_index);
-            if let Some((id, _logical_len)) = bounded {
-                self.settle_bounded(id, Err(io::Error::from_raw_os_error(-result)));
-            }
-            self.executor
-                .wake_send(conn_index, Err(io::Error::from_raw_os_error(-result)));
-            return;
-        }
-
-        if self.close_submitted(conn_index) {
-            let bounded = self.driver.send_slab.take_coalesced_bounded_send(slab_idx);
-            self.release_coalesced(slab_idx);
-            if let Some((id, _logical_len)) = bounded {
-                self.settle_bounded(id, Err(io::Error::from_raw_os_error(libc::ECANCELED)));
-            }
-            self.executor.wake_send(
-                conn_index,
-                Err(io::Error::from_raw_os_error(libc::ECANCELED)),
-            );
-            return;
-        }
-        let msg_ptr = self.driver.send_slab.msghdr_ptr(slab_idx);
-        if self
-            .driver
-            .ring
-            .submit_send_msg_coalesced(conn_index, msg_ptr, slab_idx)
-            .is_err()
-        {
-            let generation = self.driver.connections.generation(conn_index);
+    /// Submit a plain `send` of the first unsent iovec of slab entry
+    /// `slab_idx`, tagged `tag`, after its `sendmsg` returned `-EAGAIN`. The
+    /// kernel parks a `send` until the socket has room, where a `POLLOUT`
+    /// poll completes at once once the peer has half-closed (#603). The tag's
+    /// handler takes the result as a partial write of the entry.
+    fn submit_slab_drain(&mut self, tag: OpTag, conn_index: u32, slab_idx: u16) -> io::Result<()> {
+        let (ptr, len) = self.driver.send_slab.first_unsent(slab_idx);
+        let ud = UserData::encode(tag, conn_index, slab_idx as u32);
+        // SAFETY: the bytes belong to the slab entry, which is released only
+        // by a completion handler, so they outlive this CQE.
+        unsafe {
             self.driver
-                .pending_coalesced_retries
-                .push((conn_index, generation, slab_idx, 0));
+                .ring
+                .submit_drain_send_fixed(conn_index, ptr, len, ud)
         }
     }
 
@@ -3594,8 +3555,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             return;
         }
 
-        // EAGAIN/EWOULDBLOCK: wait for POLLOUT, keep the slab entry (and the held
-        // buffers) alive, then resubmit the same sendmsg.
+        // EAGAIN/EWOULDBLOCK: keep the slab entry (and the held buffers) alive
+        // and drain its first unsent iovec with a plain `send`, as in
+        // `handle_send_msg_coalesced`.
         let errno = -result;
         if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
             if self.close_submitted(conn_index) {
@@ -3607,9 +3569,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 return;
             }
             if self
-                .driver
-                .ring
-                .submit_send_recv_bufs_coalesced_pollout(conn_index, slab_idx)
+                .submit_slab_drain(OpTag::SendRecvBufsCoalescedDrain, conn_index, slab_idx)
                 .is_err()
             {
                 let generation = self.driver.connections.generation(conn_index);
@@ -3631,52 +3591,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             Err(io::Error::from_raw_os_error(-result))
         };
         self.executor.wake_send(conn_index, io_result);
-    }
-
-    /// Handle a POLLOUT CQE armed after a recv-forward send returned `-EAGAIN`.
-    /// Resubmits the same sendmsg (held buffers still intact in the slab entry).
-    fn handle_send_recv_bufs_coalesced_pollout(&mut self, ud: UserData, result: i32) {
-        let conn_index = ud.conn_index();
-        let slab_idx = ud.payload() as u16;
-
-        if !self.driver.send_slab.in_use(slab_idx) {
-            return;
-        }
-        // Identity: closed (index possibly reused) while waiting for POLLOUT.
-        if !self.slab_identity_ok(conn_index, slab_idx) {
-            self.release_recv_forward(slab_idx);
-            return;
-        }
-
-        if result < 0 {
-            self.release_recv_forward(slab_idx);
-            self.driver.submit_next_queued(conn_index);
-            self.driver.note_send_finalized(conn_index);
-            self.executor
-                .wake_send(conn_index, Err(io::Error::from_raw_os_error(-result)));
-            return;
-        }
-
-        if self.close_submitted(conn_index) {
-            self.release_recv_forward(slab_idx);
-            self.executor.wake_send(
-                conn_index,
-                Err(io::Error::from_raw_os_error(libc::ECANCELED)),
-            );
-            return;
-        }
-        let msg_ptr = self.driver.send_slab.msghdr_ptr(slab_idx);
-        if self
-            .driver
-            .ring
-            .submit_send_recv_bufs_coalesced(conn_index, msg_ptr, slab_idx)
-            .is_err()
-        {
-            let generation = self.driver.connections.generation(conn_index);
-            self.driver
-                .pending_recv_forward_retries
-                .push((conn_index, generation, slab_idx, 0));
-        }
     }
 
     /// Release the backing of the in-flight forward write, record an error for
@@ -3923,22 +3837,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
         let errno = -result;
         if !closing && (errno == libc::EAGAIN || errno == libc::EWOULDBLOCK) {
-            // Socket sink buffer full: arm POLLOUT, then resubmit when writable.
-            let target = self.driver.forward_write[conn_index as usize]
-                .as_ref()
-                .expect("checked live above")
-                .target;
-            let pud = UserData::encode(OpTag::ForwardWritePollOut, conn_index, submit_gen);
-            let armed = match target {
-                crate::backend::uring::driver::SinkTarget::Fd { fd, .. } => {
-                    self.driver.ring.submit_forward_write_pollout(fd, pud)
-                }
-                crate::backend::uring::driver::SinkTarget::Conn { index, .. } => self
-                    .driver
-                    .ring
-                    .submit_forward_write_pollout_conn(index, pud),
-            };
-            if armed.is_err() {
+            // Socket sink buffer full: send the first bytes still owed with a
+            // plain `send`, which the kernel parks until there is room; its
+            // completion comes back here as a short write (#603).
+            if self.driver.drain_forward_write(conn_index).is_err() {
                 self.fail_forward_write(conn_index, libc::EAGAIN);
             }
             metrics::POOL.increment(metrics::pool::SEND_EAGAIN);
@@ -3948,31 +3850,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // Real error (or a 0-byte write, which would otherwise loop forever).
         let e = if result == 0 { libc::EIO } else { errno };
         self.fail_forward_write(conn_index, e);
-    }
-
-    /// Handle a POLLOUT CQE armed after a forward write to a socket sink returned
-    /// `-EAGAIN` (`OpTag::ForwardWritePollOut`). Resubmits the remaining bytes.
-    fn handle_forward_write_pollout(&mut self, ud: UserData, result: i32) {
-        let conn_index = ud.conn_index();
-        let submit_gen = ud.payload();
-        let live = self.driver.forward_write[conn_index as usize]
-            .as_ref()
-            .is_some_and(|s| s.generation == submit_gen);
-        if !live {
-            return;
-        }
-        if result < 0 {
-            self.fail_forward_write(conn_index, -result);
-            return;
-        }
-        // A closing connection cancelled its forward write; even if this POLLOUT
-        // raced in writable, stop forwarding — reclaim the backing and finalize
-        // the close rather than resubmitting onto a doomed connection.
-        if self.driver.send_queues[conn_index as usize].close_pending {
-            self.fail_forward_write(conn_index, libc::ECANCELED);
-            return;
-        }
-        self.resubmit_forward_write(conn_index);
     }
 
     /// Handle completion of a send from a recv buffer (zero-copy forward).
@@ -4141,6 +4018,28 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // notification follows, and counting one would leak the entry.
         if cqueue::more(flags) {
             self.driver.send_slab.inc_pending_notifs(slab_idx);
+        }
+
+        // EAGAIN/EWOULDBLOCK: socket buffer full. Keep the entry (and its
+        // guards) alive and send the first unsent iovec with a plain `send`,
+        // which the kernel parks until there is room; its completion
+        // (`SendMsgZcDrain`, no notification) comes back here as a partial
+        // write and the rest is resubmitted zero-copy (#603).
+        if (result == -libc::EAGAIN || result == -libc::EWOULDBLOCK)
+            && !self.close_submitted(conn_index)
+        {
+            metrics::POOL.increment(metrics::pool::SEND_EAGAIN);
+            if self
+                .submit_slab_drain(OpTag::SendMsgZcDrain, conn_index, slab_idx)
+                .is_err()
+            {
+                // SQ full: resubmit the sendmsg next tick, as for a partial.
+                let generation = self.driver.connections.generation(conn_index);
+                self.driver
+                    .pending_zc_retries
+                    .push((conn_index, generation, slab_idx, 0));
+            }
+            return;
         }
 
         #[allow(clippy::collapsible_if)]
@@ -13429,6 +13328,78 @@ mod tests {
             conn.is_some() && !conn.unwrap().close_requested(),
             "EAGAIN must not close the connection"
         );
+    }
+
+    /// The opcode of the last SQE the loop pushed. `squeue::Entry` has no
+    /// getter for it; its `Debug` output carries `op_code`.
+    fn last_pushed_opcode(el: &AsyncEventLoop<NoopHandler>) -> u8 {
+        let entry = el
+            .driver
+            .ring
+            .last_pushed
+            .as_ref()
+            .expect("an SQE was pushed");
+        let debug = format!("{entry:?}");
+        let code = debug
+            .split("op_code: ")
+            .nth(1)
+            .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+            .expect("Entry's Debug output names op_code");
+        code.parse().expect("op_code is a number")
+    }
+
+    /// An `EAGAIN` from a slab-backed `sendmsg` must be followed by a plain
+    /// `send` of the first unsent iovec, tagged so its completion reaches the
+    /// same handler. A `POLLOUT` poll completes at once on `POLLRDHUP` once the
+    /// peer has half-closed, and the loop spun on it (#603).
+    fn assert_eagain_drains(el: &AsyncEventLoop<NoopHandler>, drain_tag: OpTag, conn_index: u32) {
+        assert_eq!(
+            last_pushed_opcode(el),
+            io_uring::opcode::Send::CODE,
+            "EAGAIN must be followed by a plain send, not a POLLOUT poll"
+        );
+        let ud = UserData(
+            el.driver
+                .ring
+                .last_pushed
+                .as_ref()
+                .expect("an SQE was pushed")
+                .get_user_data(),
+        );
+        assert_eq!(ud.tag(), Some(drain_tag));
+        assert_eq!(ud.conn_index(), conn_index);
+        assert_eq!(ud.payload(), 0, "the drain names the same slab entry");
+    }
+
+    #[test]
+    fn direct_echo_eagain_drains_with_a_plain_send() {
+        let mut el = make_test_loop();
+        let conn_index = stage_direct_echo(&mut el, &[0, 1], 4096);
+        el.flush_direct_echoes();
+        assert!(
+            el.driver.send_slab.in_use(0),
+            "the gather uses slab entry 0"
+        );
+
+        let ud = UserData::encode(OpTag::SendRecvBufsCoalesced, conn_index, 0);
+        el.test_dispatch_cqe(ud.raw(), -libc::EAGAIN, 0);
+        assert_eagain_drains(&el, OpTag::SendRecvBufsCoalescedDrain, conn_index);
+        assert!(el.driver.send_slab.in_use(0), "the entry stays alive");
+
+        // The drain sends the first buffer; its completion is a partial write
+        // of the entry, and the rest goes out as a sendmsg.
+        let drain = UserData::encode(OpTag::SendRecvBufsCoalescedDrain, conn_index, 0);
+        el.test_dispatch_cqe(drain.raw(), 4096, 0);
+        assert_eq!(
+            last_pushed_opcode(&el),
+            io_uring::opcode::SendMsg::CODE,
+            "the rest of the entry is resubmitted"
+        );
+        assert!(el.driver.send_slab.in_use(0));
+
+        let rest = UserData::encode(OpTag::SendRecvBufsCoalesced, conn_index, 0);
+        el.test_dispatch_cqe(rest.raw(), 4096, 0);
+        assert!(!el.driver.send_slab.in_use(0), "fully sent: entry released");
     }
 
     #[test]

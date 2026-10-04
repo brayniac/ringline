@@ -1,0 +1,248 @@
+#![allow(clippy::manual_async_fn)]
+//! Sends that back up behind a peer that has half-closed and is not reading
+//! must wait for room without spinning the event loop, and must deliver every
+//! byte once the peer reads.
+//!
+//! On io_uring a `sendmsg` to such a peer returns `-EAGAIN`, and a `POLLOUT`
+//! poll on it completes at once with `POLLRDHUP`, so a loop that retried the
+//! `sendmsg` behind a poll spun at the ring's round-trip rate (#603). Each test
+//! here drives one send path into that state, counts event-loop iterations
+//! (`on_tick`) while the peer does not read, and compares the count with the
+//! loop's idle rate. Plain copy sends are covered by
+//! `deferred_close_does_not_spin_on_half_closed_peer` in `echo.rs`, and the
+//! `run_direct_echo` path by `direct_echo_eagain_drains_with_a_plain_send` in
+//! the io_uring event loop's unit tests.
+//!
+//! The tests share the tick counter, so they take a lock.
+
+use std::future::Future;
+use std::io::{Read, Write};
+#[cfg(has_io_uring)]
+use std::net::TcpListener;
+use std::net::{Shutdown, TcpStream};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
+
+use ringline::{
+    AsyncEventHandler, Config, ConfigBuilder, Connection, DriverCtx, GuardBox, ParseResult,
+    RegionId, RinglineBuilder, SendGuard,
+};
+
+/// Event-loop iterations of the runtime under test.
+static TICKS: AtomicU32 = AtomicU32::new(0);
+
+/// Serialises the tests, which share `TICKS`.
+static LOCK: Mutex<()> = Mutex::new(());
+
+/// More than loopback's socket buffers hold for a peer that does not read, so
+/// the send backs up.
+const LEN: usize = 8 * 1024 * 1024;
+
+/// Byte `i` of every payload: a rolling pattern, so reordered or repeated
+/// chunks fail the comparison.
+fn pattern(i: usize) -> u8 {
+    (i.wrapping_mul(7).wrapping_add(13) % 251) as u8
+}
+
+fn payload() -> Vec<u8> {
+    (0..LEN).map(pattern).collect()
+}
+
+fn config() -> Config {
+    ConfigBuilder::new()
+        .workers(1)
+        .pin_to_core(false)
+        .sq_entries(64)
+        .recv_buffer(64, 4096)
+        .max_connections(64)
+        .send_pool(64, 16384)
+        .build()
+        .expect("valid config")
+}
+
+/// Ticks counted over 500 ms.
+fn ticks_over_500ms() -> u32 {
+    let before = TICKS.load(Ordering::Relaxed);
+    std::thread::sleep(Duration::from_millis(500));
+    TICKS.load(Ordering::Relaxed) - before
+}
+
+/// The loop's idle rate, then its rate once `setup` has left a send backed up
+/// behind a half-closed peer, and the bound the second must stay under.
+///
+/// A healthy loop has nothing to complete while the peer does not read, so it
+/// ticks at about its idle rate; the spin ran at more than 30 times idle. Four
+/// times idle leaves room for scheduling noise, and the floor keeps a
+/// near-zero baseline from making the bound too tight.
+fn assert_no_spin(baseline: u32, ticks: u32) {
+    let bound = baseline.max(200) * 4;
+    assert!(
+        ticks < bound,
+        "event loop spun while a send waited on a half-closed peer: {ticks} ticks in \
+         500 ms (idle baseline {baseline}, bound {bound})"
+    );
+}
+
+/// Reads exactly `LEN` bytes and checks them against `pattern`.
+fn read_payload(stream: &mut TcpStream, what: &str) {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut got = vec![0u8; LEN];
+    stream
+        .read_exact(&mut got)
+        .unwrap_or_else(|e| panic!("{what}: payload not delivered in full: {e}"));
+    if let Some(i) = (0..LEN).find(|&i| got[i] != pattern(i)) {
+        panic!("{what}: payload differs at byte {i}");
+    }
+}
+
+fn connect(addr: std::net::SocketAddr) -> TcpStream {
+    (0..200)
+        .find_map(|_| match TcpStream::connect(addr) {
+            Ok(s) => Some(s),
+            Err(_) => {
+                std::thread::sleep(Duration::from_millis(10));
+                None
+            }
+        })
+        .expect("server did not accept the connection")
+}
+
+// ── Guard (zero-copy) send ──────────────────────────────────────────────
+
+struct VecGuard(Vec<u8>);
+
+impl SendGuard for VecGuard {
+    fn as_ptr_len(&self) -> (*const u8, u32) {
+        (self.0.as_ptr(), self.0.len() as u32)
+    }
+    fn region(&self) -> RegionId {
+        RegionId::UNREGISTERED
+    }
+}
+
+/// Reads until the peer's FIN, then sends `LEN` bytes from a guard. On
+/// io_uring that is a `SendMsgZc`, which returned `-EAGAIN` once the socket
+/// filled and failed the send.
+struct GuardSendAfterFin;
+
+impl AsyncEventHandler for GuardSendAfterFin {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
+        async move {
+            while conn
+                .with_data(|data| ParseResult::Consumed(data.len()))
+                .await
+                > 0
+            {}
+            let guard = GuardBox::new(VecGuard(payload()));
+            conn.send_parts()
+                .build(|b| b.guard(guard).submit())
+                .expect("guard send accepted");
+        }
+    }
+    fn on_tick(&mut self, _ctx: &mut DriverCtx<'_>) {
+        TICKS.fetch_add(1, Ordering::Relaxed);
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        GuardSendAfterFin
+    }
+}
+
+#[test]
+fn guard_send_to_a_half_closed_peer_waits_and_delivers() {
+    let _lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (runtime, handles) = RinglineBuilder::new(config())
+        .bind("127.0.0.1:0".parse().unwrap())
+        .launch::<GuardSendAfterFin>()
+        .expect("launch");
+    let mut stream = connect(runtime.bound_addr().expect("bound address"));
+
+    std::thread::sleep(Duration::from_millis(100));
+    let baseline = ticks_over_500ms();
+
+    stream.write_all(b"go").unwrap();
+    stream.shutdown(Shutdown::Write).unwrap();
+    // Let the send fill the socket and stall.
+    std::thread::sleep(Duration::from_millis(200));
+    let ticks = ticks_over_500ms();
+
+    read_payload(&mut stream, "guard send");
+    drop(stream);
+    runtime.shutdown();
+    for h in handles {
+        h.join().expect("worker panicked").expect("worker error");
+    }
+    assert_no_spin(baseline, ticks);
+}
+
+// ── forward_to a socket sink ────────────────────────────────────────────
+
+/// Where the forwarder connects its socket sink.
+#[cfg(has_io_uring)]
+static SINK_ADDR: std::sync::OnceLock<std::net::SocketAddr> = std::sync::OnceLock::new();
+
+/// Forwards `LEN` received bytes to a non-blocking socket it connects to
+/// `SINK_ADDR`.
+#[cfg(has_io_uring)]
+struct ForwardToSocket;
+
+#[cfg(has_io_uring)]
+impl AsyncEventHandler for ForwardToSocket {
+    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
+        async move {
+            use std::os::fd::AsFd;
+            let sink_stream =
+                TcpStream::connect(*SINK_ADDR.get().expect("sink address")).expect("sink connect");
+            sink_stream.set_nonblocking(true).unwrap();
+            let sink = ringline::SinkFd::socket(sink_stream.as_fd());
+            let forwarded = conn.as_conn().forward_to(&sink, LEN).await;
+            assert_eq!(forwarded.ok(), Some(LEN), "forward_to ended early");
+        }
+    }
+    fn on_tick(&mut self, _ctx: &mut DriverCtx<'_>) {
+        TICKS.fetch_add(1, Ordering::Relaxed);
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        ForwardToSocket
+    }
+}
+
+#[cfg(has_io_uring)]
+#[test]
+fn forward_to_a_half_closed_socket_sink_waits_and_delivers() {
+    let _lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let sink_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    SINK_ADDR
+        .set(sink_listener.local_addr().unwrap())
+        .expect("sink address set once");
+    let (runtime, handles) = RinglineBuilder::new(config())
+        .bind("127.0.0.1:0".parse().unwrap())
+        .launch::<ForwardToSocket>()
+        .expect("launch");
+    let source = connect(runtime.bound_addr().expect("bound address"));
+    // The sink's peer half-closes at once and reads nothing until later.
+    let (mut sink_peer, _) = sink_listener.accept().unwrap();
+    sink_peer.shutdown(Shutdown::Write).unwrap();
+
+    std::thread::sleep(Duration::from_millis(100));
+    let baseline = ticks_over_500ms();
+
+    // The source's writes block once the sink backs up, so they run on their
+    // own thread.
+    let mut writer_stream = source.try_clone().unwrap();
+    let writer = std::thread::spawn(move || writer_stream.write_all(&payload()).unwrap());
+    // Let the forward fill the sink and stall.
+    std::thread::sleep(Duration::from_millis(500));
+    let ticks = ticks_over_500ms();
+
+    read_payload(&mut sink_peer, "forward_to socket");
+    writer.join().unwrap();
+    drop(source);
+    runtime.shutdown();
+    for h in handles {
+        h.join().expect("worker panicked").expect("worker error");
+    }
+    assert_no_spin(baseline, ticks);
+}

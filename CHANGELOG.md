@@ -66,6 +66,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- The per-operation completion counters (`op` label) for io_uring rename
+  `send_msg_coalesced_poll_out`, `send_recv_bufs_coalesced_poll_out` and
+  `forward_write_poll_out` to `send_msg_coalesced_drain`,
+  `send_recv_bufs_coalesced_drain` and `forward_write_drain`, and add
+  `send_msg_zc_drain`. Those operations are now plain sends, not `POLLOUT`
+  polls (#603).
+
 - **Breaking (`ringline-quic`):** the `QuicEndpoint` methods that read the
   clock now take `now: Instant` as their first argument, as `flush`,
   `handle_datagram` and `drive_timers` already did: `stream_recv`,
@@ -283,6 +290,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   removed in the next breaking release (#579).
 
 ### Fixed
+
+- On io_uring, a send that filled the socket of a peer that had half-closed
+  (sent its FIN) and was not reading made the worker's event loop spin until
+  the peer read or the connection closed: about 26,000 iterations a second
+  on Linux 6.12 and 7.1, slowing every connection on that worker. Once the
+  peer has half-closed, the kernel returns `EAGAIN` from `sendmsg` and
+  completes a `POLLOUT` poll at once with `POLLRDHUP`, so the loop's
+  `sendmsg`, poll, `sendmsg` retry never waited. Coalesced copy sends,
+  `run_direct_echo`, and `forward_to` / `forward_to_conn` socket sinks now
+  answer `EAGAIN` with a plain `send` of the first unsent bytes, which the
+  kernel parks until the socket has room, and then resubmit the rest. A
+  guard send (`SendMsgZc`) failed with `WouldBlock` in the same state; it
+  now waits and delivers as well (#603).
 
 - On Linux 6.13 and later, an io_uring connection close cancels the
   connection's requests ahead of its `Close` instead of sending a

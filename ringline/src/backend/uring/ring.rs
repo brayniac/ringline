@@ -132,6 +132,10 @@ pub struct Ring {
     /// [`Ring::force_push_failures`].
     #[cfg(test)]
     forced_push_failures: usize,
+    /// Test-only: the last entry `push_sqe` pushed, so a test can check which
+    /// operation a handler submitted.
+    #[cfg(test)]
+    pub(crate) last_pushed: Option<squeue::Entry>,
 }
 
 impl Ring {
@@ -212,6 +216,8 @@ impl Ring {
             close_lead: Self::close_lead_from(config),
             #[cfg(test)]
             forced_push_failures: 0,
+            #[cfg(test)]
+            last_pushed: None,
         })
     }
 
@@ -558,22 +564,48 @@ impl Ring {
         Ok(())
     }
 
-    /// Arm a POLLOUT poll after a coalesced send returned `-EAGAIN`; the slab
-    /// index is carried in the payload so the handler can resubmit the sendmsg.
-    pub fn submit_send_msg_coalesced_pollout(
+    /// Submit a plain `send` of `len` bytes at `ptr` on a registered file,
+    /// in place of a `POLLOUT` poll after a `sendmsg` returned `-EAGAIN`.
+    ///
+    /// io_uring reports `POLLRDHUP` on every poll, so once the peer has
+    /// half-closed a `POLLOUT` poll completes at once and the `sendmsg` it
+    /// retries fails with `-EAGAIN` again. A `send` is parked by the kernel
+    /// until the socket has room (#603). `user_data` names the operation whose
+    /// completion handler takes the result as a partial write.
+    ///
+    /// # Safety
+    /// The `len` bytes at `ptr` must stay valid until the CQE arrives.
+    pub unsafe fn submit_drain_send_fixed(
         &mut self,
-        conn_index: u32,
-        slab_idx: u16,
+        index: u32,
+        ptr: *const u8,
+        len: u32,
+        user_data: UserData,
     ) -> io::Result<()> {
-        let user_data =
-            UserData::encode(OpTag::SendMsgCoalescedPollOut, conn_index, slab_idx as u32);
-        let entry = opcode::PollAdd::new(Fixed(conn_index), libc::POLLOUT as u32)
+        let entry = opcode::Send::new(Fixed(index), ptr, len)
+            .flags(crate::completion::STREAM_SEND_FLAGS)
             .build()
             .user_data(user_data.raw());
-        unsafe {
-            self.push_sqe(&entry)?;
-        }
-        Ok(())
+        unsafe { self.push_sqe(&entry) }
+    }
+
+    /// As [`submit_drain_send_fixed`](Self::submit_drain_send_fixed), on a raw
+    /// descriptor.
+    ///
+    /// # Safety
+    /// The `len` bytes at `ptr` must stay valid until the CQE arrives.
+    pub unsafe fn submit_drain_send_fd(
+        &mut self,
+        fd: RawFd,
+        ptr: *const u8,
+        len: u32,
+        user_data: UserData,
+    ) -> io::Result<()> {
+        let entry = opcode::Send::new(Fd(fd), ptr, len)
+            .flags(crate::completion::STREAM_SEND_FLAGS)
+            .build()
+            .user_data(user_data.raw());
+        unsafe { self.push_sqe(&entry) }
     }
 
     /// Submit a zero-copy recv-forward send: one plain (non-ZC) `sendmsg` whose
@@ -594,40 +626,6 @@ impl Ring {
             self.push_sqe(&entry)?;
         }
         Ok(())
-    }
-
-    /// Arm a POLLOUT poll after a recv-forward send returned `-EAGAIN`; the slab
-    /// index is carried in the payload so the handler can resubmit the sendmsg.
-    pub fn submit_send_recv_bufs_coalesced_pollout(
-        &mut self,
-        conn_index: u32,
-        slab_idx: u16,
-    ) -> io::Result<()> {
-        let user_data = UserData::encode(
-            OpTag::SendRecvBufsCoalescedPollOut,
-            conn_index,
-            slab_idx as u32,
-        );
-        let entry = opcode::PollAdd::new(Fixed(conn_index), libc::POLLOUT as u32)
-            .build()
-            .user_data(user_data.raw());
-        unsafe {
-            self.push_sqe(&entry)?;
-        }
-        Ok(())
-    }
-
-    /// `POLLOUT` on a connection sink whose forward write returned `-EAGAIN`,
-    /// by registered file index rather than raw descriptor.
-    pub fn submit_forward_write_pollout_conn(
-        &mut self,
-        sink_index: u32,
-        user_data: UserData,
-    ) -> io::Result<()> {
-        let entry = opcode::PollAdd::new(Fixed(sink_index), libc::POLLOUT as u32)
-            .build()
-            .user_data(user_data.raw());
-        unsafe { self.push_sqe(&entry) }
     }
 
     /// Submit a **gathered** Mode A forward write to a socket sink: several
@@ -700,23 +698,6 @@ impl Ring {
             .build()
             .user_data(user_data.raw());
         unsafe { self.push_sqe(&entry) }
-    }
-
-    /// Arm a POLLOUT poll on a forward-write **socket** sink after a send
-    /// returned `-EAGAIN`; the handler resubmits the remaining bytes when the
-    /// sink becomes writable.
-    pub fn submit_forward_write_pollout(
-        &mut self,
-        fd: RawFd,
-        user_data: UserData,
-    ) -> io::Result<()> {
-        let entry = opcode::PollAdd::new(Fd(fd), libc::POLLOUT as u32)
-            .build()
-            .user_data(user_data.raw());
-        unsafe {
-            self.push_sqe(&entry)?;
-        }
-        Ok(())
     }
 
     /// Submit a TLS-internal send (handshake, alert). Uses OpTag::TlsSend
@@ -1219,6 +1200,10 @@ impl Ring {
         let entry128: squeue::Entry128 = entry.clone().into();
         unsafe {
             self.push_sqe128(entry128)?;
+        }
+        #[cfg(test)]
+        {
+            self.last_pushed = Some(entry.clone());
         }
         Ok(())
     }

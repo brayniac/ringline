@@ -75,7 +75,38 @@ the top of a profile on >=6.15 kernels with capable NICs. Not this phase.
 Prereq checklist for revisiting: kernel >= 6.15 on the rig, NIC with HDS
 (mlx5/bnxt/ice), a profile showing accumulator append >= ~5% of worker CPU.
 
-## 4. Admission and parking
+## 4. Waiting for room after `EAGAIN`
+
+io_uring adds `POLLRDHUP` to every poll's event mask. Once a TCP peer has
+half-closed (sent its FIN), a `PollAdd(POLLOUT)` on the socket completes at
+once with `POLLRDHUP` even while the send buffer is full. Measured on a socket
+with a full send buffer, before and after the peer's `shutdown(SHUT_WR)`, on
+Linux 6.12 (arm64 and x86_64) and 7.1 (x86_64):
+
+| op | no FIN | after FIN |
+|---|---|---|
+| `Send` + `MSG_WAITALL` | waits | waits |
+| `SendMsg` + `MSG_WAITALL` | waits | `-EAGAIN` |
+| `SendMsgZc` | waits | `-EAGAIN` |
+| `Writev` | waits | `-EAGAIN` |
+| `PollAdd(POLLOUT)` | waits | completes with `POLLRDHUP` |
+
+So a `sendmsg` that returns `-EAGAIN` is not retried behind a `POLLOUT` poll:
+that loop never waits, and spun the worker's event loop (#603). The handler
+instead submits a plain `send` of the entry's first unsent iovec, under a
+`*Drain` tag (`SendMsgCoalescedDrain`, `SendRecvBufsCoalescedDrain`,
+`SendMsgZcDrain`, `ForwardWriteDrain`). The kernel parks that `send` until
+the socket has room. Its result is a partial write of the same entry, so the
+drain tag's completion goes through the entry's own handler, which advances
+the iovecs and resubmits the rest as a `sendmsg`. The entry stays the one
+operation in flight on the connection, so byte order holds. A zero-copy
+entry's drain is a copying `send` and posts no notification.
+
+Plain `Send` paths (single-buffer copy sends, TLS) keep their `POLLOUT`
+fallback (`SendPollOut`): a `send` with `MSG_WAITALL` is parked by the kernel
+and does not return `-EAGAIN` in this state.
+
+## 5. Admission and parking
 
 Copied sends are admitted transactionally. On io_uring `DriverCtx::send`
 reserves every send-pool slot the buffer needs (`SendCopyPool::reserve_slots`

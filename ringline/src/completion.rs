@@ -62,17 +62,21 @@ pub enum OpTag {
     /// several queued per-connection sends. Payload = InFlightSendSlab index;
     /// the slab entry holds the backing pool slots, released on completion.
     SendMsgCoalesced = 24,
-    /// PollAdd for POLLOUT after a coalesced send returned `-EAGAIN`.
-    /// Payload = InFlightSendSlab index to resubmit when writable.
-    SendMsgCoalescedPollOut = 25,
+    /// Plain `send` of the first unsent iovec of a coalesced send whose
+    /// `sendmsg` returned `-EAGAIN`. The kernel parks a `send` until the socket
+    /// has room, which a `POLLOUT` poll does not do once the peer has
+    /// half-closed (#603). Its result is a partial write of the same entry.
+    /// Payload = InFlightSendSlab index.
+    SendMsgCoalescedDrain = 25,
     /// Zero-copy recv-forward: one `sendmsg` whose iovecs point directly into
     /// held provided recv buffers (no accumulator copy). Payload =
     /// InFlightSendSlab index; the slab entry holds the bids to replenish on
     /// completion.
     SendRecvBufsCoalesced = 26,
-    /// PollAdd for POLLOUT after a recv-forward send returned `-EAGAIN`.
-    /// Payload = InFlightSendSlab index to resubmit when writable.
-    SendRecvBufsCoalescedPollOut = 27,
+    /// Plain `send` of the first unsent iovec of a recv-forward send whose
+    /// `sendmsg` returned `-EAGAIN`; see `SendMsgCoalescedDrain`. Payload =
+    /// InFlightSendSlab index.
+    SendRecvBufsCoalescedDrain = 27,
     /// One-shot fallback recv into a fallback-pool slot, submitted when a
     /// connection parked on ENOBUFS holds a partial message in its
     /// accumulator (the provided ring is smaller than one response).
@@ -84,9 +88,11 @@ pub enum OpTag {
     /// connection (tracked in `Driver::forward_write`). Payload = the
     /// connection generation at submit time (validates stale completions).
     ForwardWrite = 29,
-    /// PollAdd for POLLOUT after a forward write to a socket sink returned
-    /// `-EAGAIN`. Payload = the connection generation at submit time.
-    ForwardWritePollOut = 30,
+    /// Plain `send` of the first unsent bytes of a forward write to a socket
+    /// or connection sink whose `sendmsg` returned `-EAGAIN`; see
+    /// `SendMsgCoalescedDrain`. Payload = the connection generation at submit
+    /// time.
+    ForwardWriteDrain = 30,
     /// Multishot accept on a listener the worker owns (merged accept mode).
     /// The `conn_index` field carries the **listener index**, not a
     /// connection: no slot exists yet when the SQE is submitted. Payload
@@ -107,6 +113,10 @@ pub enum OpTag {
     /// hard-linked ahead of its `Close` from Linux 6.13 (#586). Its
     /// completion is ignored; the `Close` CQE releases the slot.
     CloseCancel = 34,
+    /// Plain (copying) `send` of the first unsent iovec of a zero-copy send
+    /// whose `sendmsg` returned `-EAGAIN`; see `SendMsgCoalescedDrain`. It
+    /// posts no notification. Payload = InFlightSendSlab index.
+    SendMsgZcDrain = 35,
 }
 
 impl OpTag {
@@ -137,16 +147,17 @@ impl OpTag {
             22 => Some(OpTag::RecvUdp),
             23 => Some(OpTag::SendUdp),
             24 => Some(OpTag::SendMsgCoalesced),
-            25 => Some(OpTag::SendMsgCoalescedPollOut),
+            25 => Some(OpTag::SendMsgCoalescedDrain),
             26 => Some(OpTag::SendRecvBufsCoalesced),
-            27 => Some(OpTag::SendRecvBufsCoalescedPollOut),
+            27 => Some(OpTag::SendRecvBufsCoalescedDrain),
             28 => Some(OpTag::RecvFallback),
             29 => Some(OpTag::ForwardWrite),
-            30 => Some(OpTag::ForwardWritePollOut),
+            30 => Some(OpTag::ForwardWriteDrain),
             31 => Some(OpTag::AcceptMulti),
             32 => Some(OpTag::ParkInstall),
             33 => Some(OpTag::CloseShutdown),
             34 => Some(OpTag::CloseCancel),
+            35 => Some(OpTag::SendMsgZcDrain),
             _ => None,
         }
     }
@@ -185,16 +196,17 @@ impl OpTag {
             OpTag::RecvUdp => "recv_udp",
             OpTag::SendUdp => "send_udp",
             OpTag::SendMsgCoalesced => "send_msg_coalesced",
-            OpTag::SendMsgCoalescedPollOut => "send_msg_coalesced_poll_out",
+            OpTag::SendMsgCoalescedDrain => "send_msg_coalesced_drain",
             OpTag::SendRecvBufsCoalesced => "send_recv_bufs_coalesced",
-            OpTag::SendRecvBufsCoalescedPollOut => "send_recv_bufs_coalesced_poll_out",
+            OpTag::SendRecvBufsCoalescedDrain => "send_recv_bufs_coalesced_drain",
             OpTag::RecvFallback => "recv_fallback",
             OpTag::ForwardWrite => "forward_write",
-            OpTag::ForwardWritePollOut => "forward_write_poll_out",
+            OpTag::ForwardWriteDrain => "forward_write_drain",
             OpTag::AcceptMulti => "accept_multi",
             OpTag::ParkInstall => "park_install",
             OpTag::CloseShutdown => "close_shutdown",
             OpTag::CloseCancel => "close_cancel",
+            OpTag::SendMsgZcDrain => "send_msg_zc_drain",
         }
     }
 }

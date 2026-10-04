@@ -309,6 +309,20 @@ impl InFlightSendSlab {
         Some(&entry.msghdr as *const libc::msghdr)
     }
 
+    /// The first iovec of an entry that is not yet fully sent, as
+    /// `(ptr, len)`, with `len` capped at `u32::MAX` (a send of fewer bytes is
+    /// a partial write). The entry must have bytes left to send.
+    pub fn first_unsent(&self, idx: u16) -> (*const u8, u32) {
+        let entry = &self.entries[idx as usize];
+        debug_assert!(entry.in_use);
+        debug_assert!(entry.iov_start < entry.iov_count, "entry {idx} fully sent");
+        let iov = entry.iovecs[entry.iov_start as usize];
+        (
+            iov.iov_base as *const u8,
+            iov.iov_len.min(u32::MAX as usize) as u32,
+        )
+    }
+
     /// Get the msghdr pointer for a slab entry (for resubmission retries).
     pub fn msghdr_ptr(&self, idx: u16) -> *const libc::msghdr {
         &self.entries[idx as usize].msghdr as *const libc::msghdr
