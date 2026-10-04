@@ -9,6 +9,8 @@
 //! - Linux: kernel 5.6+, a real filesystem (not tmpfs)
 //! - macOS: any filesystem (F_NOCACHE works everywhere)
 
+mod common;
+
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -159,13 +161,11 @@ fn direct_io_write_fsync_read_roundtrip() {
     ROUNDTRIP_DONE.store(false, Ordering::Release);
     ROUNDTRIP_OK.store(false, Ordering::Release);
 
-    let (_shutdown, handles) = RinglineBuilder::new(direct_io_test_config())
+    let (shutdown, handles) = RinglineBuilder::new(direct_io_test_config())
         .launch::<RoundtripTickHandler>()
         .expect("launch failed");
 
-    for h in handles {
-        h.join().unwrap().unwrap();
-    }
+    common::join_workers(&shutdown, handles);
 
     // Clean up temp file.
     let path = temp_file_path(".krio_direct_io_roundtrip_test");
@@ -259,13 +259,11 @@ fn direct_io_multiple_files() {
     MULTI_FILE_DONE.store(false, Ordering::Release);
     MULTI_FILE_OK.store(false, Ordering::Release);
 
-    let (_shutdown, handles) = RinglineBuilder::new(direct_io_test_config())
+    let (shutdown, handles) = RinglineBuilder::new(direct_io_test_config())
         .launch::<MultiFileTickHandler>()
         .expect("launch failed");
 
-    for h in handles {
-        h.join().unwrap().unwrap();
-    }
+    common::join_workers(&shutdown, handles);
 
     // Clean up.
     for i in 0..3 {

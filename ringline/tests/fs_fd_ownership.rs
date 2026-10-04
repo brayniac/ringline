@@ -7,6 +7,8 @@
 #![cfg(target_os = "linux")]
 #![allow(clippy::manual_async_fn)]
 
+mod common;
+
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -44,10 +46,8 @@ fn config(max_files: u16, disk_io_threads: usize) -> Config {
 /// Launch one worker, wait for it to exit, and return what `on_start` set.
 fn run<H: AsyncEventHandler>(config: Config) -> Result<(), String> {
     *OUTCOME.lock().unwrap() = None;
-    let (_runtime, handles) = RinglineBuilder::new(config).launch::<H>().expect("launch");
-    for h in handles {
-        h.join().expect("worker panicked").expect("worker failed");
-    }
+    let (runtime, handles) = RinglineBuilder::new(config).launch::<H>().expect("launch");
+    common::join_workers(&runtime, handles);
     OUTCOME
         .lock()
         .unwrap()
@@ -464,9 +464,7 @@ mod mio {
         let fifo_fds = fds_on(&fifo);
 
         PROBE.store(true, Ordering::SeqCst);
-        for h in handles {
-            h.join().expect("worker panicked").expect("worker failed");
-        }
+        common::join_workers(&runtime, handles);
         drop(runtime);
         let outcome = OUTCOME.lock().unwrap().take();
         let _ = std::fs::remove_dir_all(&dir);

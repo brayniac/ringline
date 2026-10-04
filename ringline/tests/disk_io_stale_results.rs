@@ -13,6 +13,8 @@
 #![cfg(all(target_os = "linux", has_io_uring))]
 #![allow(clippy::manual_async_fn)]
 
+mod common;
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::future::Future;
 use std::path::PathBuf;
@@ -139,12 +141,10 @@ fn a_stale_result_does_not_free_a_pending_reads_buffer() {
         })
         .build()
         .expect("valid config");
-    let (_runtime, handles) = RinglineBuilder::new(config)
+    let (runtime, handles) = RinglineBuilder::new(config)
         .launch::<StaleKey>()
         .expect("launch");
-    for h in handles {
-        h.join().expect("worker panicked").expect("worker failed");
-    }
+    common::join_workers(&runtime, handles);
     let _ = std::fs::remove_dir_all(&dir);
     let frees = OUTCOME
         .lock()
@@ -230,12 +230,10 @@ fn a_resolved_futures_key_can_be_reused() {
         .spawner_threads(0)
         .build()
         .expect("valid config");
-    let (_runtime, handles) = RinglineBuilder::new(config)
+    let (runtime, handles) = RinglineBuilder::new(config)
         .launch::<ResolvedKeyReused>()
         .expect("launch");
-    for h in handles {
-        h.join().expect("worker panicked").expect("worker failed");
-    }
+    common::join_workers(&runtime, handles);
     let _ = std::fs::remove_dir_all(&dir);
     REUSE_OUTCOME
         .lock()
@@ -345,12 +343,10 @@ fn a_futureless_operations_result_is_not_taken_by_a_later_one() {
         })
         .build()
         .expect("valid config");
-    let (_runtime, handles) = RinglineBuilder::new(config)
+    let (runtime, handles) = RinglineBuilder::new(config)
         .launch::<RawThenFuture>()
         .expect("launch");
-    for h in handles {
-        h.join().expect("worker panicked").expect("worker failed");
-    }
+    common::join_workers(&runtime, handles);
     let _ = std::fs::remove_dir_all(&dir);
     let n = RAW_OUTCOME
         .lock()
@@ -490,9 +486,7 @@ fn a_future_dropped_with_its_connection_leaves_no_result() {
     // Let the event loop release the queued key.
     std::thread::sleep(Duration::from_millis(50));
     TD_GO.store(true, Ordering::SeqCst);
-    for h in handles {
-        h.join().expect("worker panicked").expect("worker failed");
-    }
+    common::join_workers(&runtime, handles);
     let _ = std::fs::remove_dir_all(&dir);
     let frees = TD_OUTCOME
         .lock()
@@ -588,12 +582,10 @@ fn a_held_key_is_not_reused() {
         })
         .build()
         .expect("valid config");
-    let (_runtime, handles) = RinglineBuilder::new(config)
+    let (runtime, handles) = RinglineBuilder::new(config)
         .launch::<HeldResult>()
         .expect("launch");
-    for h in handles {
-        h.join().expect("worker panicked").expect("worker failed");
-    }
+    common::join_workers(&runtime, handles);
     let _ = std::fs::remove_dir_all(&dir);
     let outcome = HELD_OUTCOME
         .lock()

@@ -4,6 +4,8 @@
 //! Each test launches a ringline server, connects via std TCP, sends data,
 //! and verifies the echoed response.
 
+mod common;
+
 use std::future::Future;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
@@ -712,10 +714,7 @@ fn async_request_shutdown_exits_cleanly() {
     }
 
     // Workers should exit on their own (request_shutdown triggers it).
-    for h in handles {
-        let result = h.join().expect("worker panicked");
-        result.expect("worker returned error");
-    }
+    common::join_workers(&shutdown, handles);
 
     // The workers have exited; dropping `shutdown` calls `shutdown()` again,
     // which is a no-op.
@@ -4207,12 +4206,10 @@ fn async_server_speaks_first_greeting() {
 
     GREETING_ADDR.set(addr.parse().unwrap()).ok();
 
-    let (_c_shutdown, c_handles) = RinglineBuilder::new(test_config())
+    let (c_shutdown, c_handles) = RinglineBuilder::new(test_config())
         .launch::<GreetingClientHandler>()
         .expect("client launch failed");
-    for h in c_handles {
-        h.join().unwrap().unwrap();
-    }
+    common::join_workers(&c_shutdown, c_handles);
 
     let result = GREETING_RESULT.get().expect("client did not set result");
     assert_eq!(result, "WELCOME!", "greeting lost or corrupted: {result}");
@@ -4300,14 +4297,12 @@ fn async_on_start_client_only() {
         .ok();
 
     // Launch client-only (no .bind()).
-    let (_shutdown, handles) = RinglineBuilder::new(test_config())
+    let (client, handles) = RinglineBuilder::new(test_config())
         .launch::<OnStartClientHandler>()
         .expect("launch failed");
 
     // Wait for the on_start task to complete and shut down the worker.
-    for h in handles {
-        h.join().unwrap().unwrap();
-    }
+    common::join_workers(&client, handles);
 
     let result = ON_START_RESULT.get().expect("on_start did not set result");
     assert_eq!(result, "ON_START", "expected ON_START echo, got: {result}");
@@ -4937,13 +4932,11 @@ fn async_outbound_connect_receives_eof() {
 
     OUTBOUND_EOF_ADDR.set(addr).ok();
 
-    let (_c_shutdown, c_handles) = RinglineBuilder::new(test_config())
+    let (c_shutdown, c_handles) = RinglineBuilder::new(test_config())
         .launch::<OutboundEofClient>()
         .expect("client launch failed");
 
-    for h in c_handles {
-        h.join().unwrap().unwrap();
-    }
+    common::join_workers(&c_shutdown, c_handles);
 
     server_thread.join().unwrap();
 
@@ -5059,13 +5052,11 @@ impl AsyncEventHandler for ConnectTimeoutClient {
 
 #[test]
 fn async_connect_timeout_fires() {
-    let (_c_shutdown, c_handles) = RinglineBuilder::new(test_config())
+    let (c_shutdown, c_handles) = RinglineBuilder::new(test_config())
         .launch::<ConnectTimeoutClient>()
         .expect("client launch failed");
 
-    for h in c_handles {
-        h.join().unwrap().unwrap();
-    }
+    common::join_workers(&c_shutdown, c_handles);
 
     let result = TIMEOUT_RESULT.get().expect("on_start did not set result");
     // Accept either TimedOut or a connection error (some networks reject

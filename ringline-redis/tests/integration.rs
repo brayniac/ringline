@@ -5,6 +5,8 @@
 //!
 //!   cargo test -p ringline-redis --test integration -- --ignored --nocapture
 
+mod common;
+
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -86,13 +88,11 @@ macro_rules! run_redis_test {
             }
         }
 
-        let (_shutdown, handles) = RinglineBuilder::new(test_config())
+        let (runtime, handles) = RinglineBuilder::new(test_config())
             .launch::<Handler>()
             .expect("launch failed");
 
-        for h in handles {
-            h.join().unwrap().unwrap();
-        }
+        common::join_workers(&runtime, handles);
 
         let result = $result_static.get().expect("on_start did not set result");
         if let Err(e) = result {
@@ -467,13 +467,11 @@ fn redis_pool() {
         }
     }
 
-    let (_shutdown, handles) = RinglineBuilder::new(test_config())
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
         .launch::<Handler>()
         .expect("launch failed");
 
-    for h in handles {
-        h.join().unwrap().unwrap();
-    }
+    common::join_workers(&shutdown, handles);
 
     let result = POOL_RESULT.get().expect("on_start did not set result");
     if let Err(e) = result {
