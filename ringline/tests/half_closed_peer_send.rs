@@ -246,3 +246,77 @@ fn forward_to_a_half_closed_socket_sink_waits_and_delivers() {
     }
     assert_no_spin(baseline, ticks);
 }
+
+// ── Shutdown while a send waits ─────────────────────────────────────────
+
+/// Reads until the peer's FIN, then sends 4 MiB as one copy send. On io_uring
+/// it spans many send-pool slots and goes out as coalesced `sendmsg`s.
+struct CopySendsAfterFin;
+
+impl AsyncEventHandler for CopySendsAfterFin {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
+        async move {
+            while conn
+                .with_data(|data| ParseResult::Consumed(data.len()))
+                .await
+                > 0
+            {}
+            let data = vec![0x5Au8; 4 * 1024 * 1024];
+            if let Ok(fut) = conn.send(&data) {
+                let _ = fut.await;
+            }
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        CopySendsAfterFin
+    }
+}
+
+/// Launches `H`, leaves a send waiting on a half-closed peer, then shuts the
+/// runtime down and returns how long the workers took to exit.
+fn shutdown_time_with_a_waiting_send<H: AsyncEventHandler>(config: Config) -> Duration {
+    let (runtime, handles) = RinglineBuilder::new(config)
+        .bind("127.0.0.1:0".parse().unwrap())
+        .launch::<H>()
+        .expect("launch");
+    let mut stream = connect(runtime.bound_addr().expect("bound address"));
+    stream.write_all(b"go").unwrap();
+    stream.shutdown(Shutdown::Write).unwrap();
+    // Let the send fill the socket and stall.
+    std::thread::sleep(Duration::from_millis(300));
+
+    let start = std::time::Instant::now();
+    runtime.shutdown();
+    for h in handles {
+        h.join().expect("worker panicked").expect("worker error");
+    }
+    let took = start.elapsed();
+    drop(stream);
+    took
+}
+
+/// A worker exits promptly when a copy send is waiting for a peer that will
+/// never read: shutdown cancels the send rather than waiting it out.
+///
+/// A zero-copy send in the same state is not covered: its guards stay in use
+/// until the kernel's notification, which does not come while the data sits
+/// in the socket, so shutdown waits out its bound for it (see
+/// `run_shutdown`).
+#[test]
+fn shutdown_does_not_wait_out_copy_sends_to_a_half_closed_peer() {
+    let _lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let config = ConfigBuilder::new()
+        .workers(1)
+        .pin_to_core(false)
+        .sq_entries(64)
+        .recv_buffer(64, 4096)
+        .max_connections(64)
+        .send_pool(512, 16384)
+        .build()
+        .expect("valid config");
+    let took = shutdown_time_with_a_waiting_send::<CopySendsAfterFin>(config);
+    assert!(
+        took < Duration::from_secs(2),
+        "worker took {took:?} to exit with copy sends waiting"
+    );
+}

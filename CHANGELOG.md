@@ -306,6 +306,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   half-closed socket it holds an io-wq kernel thread, as plain copy and TLS
   sends already did; #605 tracks waiting without one (#603).
 
+- On io_uring, a worker that shut down while a coalesced copy send or a
+  recv-forward send was waiting for room took 10 s to exit: the shutdown
+  closed connections without cancelling their requests, and released only
+  zero-copy send entries. It now cancels each connection's requests ahead of
+  its close and releases those entries, so the worker exits at once (0.3 s
+  against 10.2 s, measured). A zero-copy send queued to a peer that does not
+  read still holds shutdown for its 10 s bound, because its guards stay in
+  use until the kernel's notification (#607).
+
 - On Linux 6.13 and later, an io_uring connection close cancels the
   connection's requests ahead of its `Close` instead of sending a
   `shutdown`. From 6.13 the kernel releases a socket removed from the
