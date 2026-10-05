@@ -330,12 +330,11 @@ mod tests {
         handle.join().expect("acceptor panicked");
     }
 
-    /// `Runtime::shutdown` wakes an acceptor blocked in `accept4` by shutting
-    /// its listener's sockets down, and leaves the fd open for the acceptor to
-    /// drop.
+    /// A connection the acceptor cannot hand to any worker, because every
+    /// worker's accept queue is full, is closed and counted (#598).
     ///
-    /// Linux only: other platforms keep the acceptor blocked until a peer
-    /// connects (#560).
+    /// Linux only: the test joins the acceptor after shutting its sockets
+    /// down, and other platforms keep it blocked until a peer connects (#560).
     #[cfg(target_os = "linux")]
     #[test]
     fn a_connection_every_worker_is_too_busy_for_is_dropped_and_counted() {
@@ -405,6 +404,13 @@ mod tests {
         handle.join().expect("acceptor panicked");
     }
 
+    /// `Runtime::shutdown` wakes an acceptor blocked in `accept4` by shutting
+    /// its listener's sockets down, and leaves the fd open for the acceptor to
+    /// drop.
+    ///
+    /// Linux only: other platforms keep the acceptor blocked until a peer
+    /// connects (#560).
+    #[cfg(target_os = "linux")]
     #[test]
     fn shutting_the_sockets_down_ends_a_blocked_acceptor() {
         use std::sync::atomic::AtomicBool;
