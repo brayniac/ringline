@@ -1767,8 +1767,12 @@ impl Driver {
             return Ok(());
         };
         state.rebuild_iovecs(&self.provided_bufs);
+        // `EAGAIN` means bytes are still owed, and `rebuild_iovecs` skips
+        // empty backings, so there is a first iovec with bytes in it.
         let Some(first) = state.iovecs.first() else {
-            return Ok(());
+            return Err(io::Error::other(
+                "drain of a forward write with no bytes left",
+            ));
         };
         let (ptr, len) = (
             first.iov_base as *const u8,

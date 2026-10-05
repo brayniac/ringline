@@ -3422,9 +3422,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
         // EAGAIN/EWOULDBLOCK: socket buffer full. Keep the slab entry (and its
         // data) alive and send its first non-empty unsent iovec with a plain
-        // `send`,
-        // which waits until there is room; its completion comes
-        // back here as a partial write (#603).
+        // `send`, which waits until there is room; its completion comes back
+        // here as a partial write (#603).
         let errno = -result;
         if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
             if self.close_submitted(conn_index) {
@@ -4034,8 +4033,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
         // EAGAIN/EWOULDBLOCK: socket buffer full. Keep the entry (and its
         // guards) alive and send the first non-empty unsent iovec with a plain
-        // `send`,
-        // which waits until there is room; its completion
+        // `send`, which waits until there is room; its completion
         // (`SendMsgZcDrain`, no notification) comes back here as a partial
         // write and the rest is resubmitted zero-copy (#603).
         if (result == -libc::EAGAIN || result == -libc::EWOULDBLOCK)
@@ -11488,6 +11486,112 @@ mod tests {
             fut.as_mut().poll(&mut cx)
         });
         assert!(matches!(p2, std::task::Poll::Ready(Ok(5))));
+    }
+
+    /// A forward started by `start_conn_forward`.
+    type ConnForward = std::pin::Pin<Box<dyn Future<Output = io::Result<usize>>>>;
+
+    /// Starts a 5-byte `forward_to_conn` from a new source to a new sink
+    /// connection and returns `(source, source generation, sink, future)`.
+    fn start_conn_forward(el: &mut AsyncEventLoop<NoopHandler>) -> (u32, u32, u32, ConnForward) {
+        let src = accept_connection(el);
+        let sink = accept_connection(el);
+        let src_gen = el.driver.connections.generation(src);
+        let sink_gen = el.driver.connections.generation(sink);
+        el.driver.recv_domain[src as usize] = crate::recv::domain::RecvDomain::Segmented;
+        deliver_segment(el, src, 0, b"hello");
+        // Leaked so the returned future can borrow both for the test's length.
+        let source = Box::leak(Box::new(ConnCtx::new(src, src_gen)));
+        let sink_ctx = Box::leak(Box::new(ConnCtx::new(sink, sink_gen)));
+        let mut fut: ConnForward = Box::pin(with_driver_state(el, || {
+            source.forward_to_conn(sink_ctx, 5)
+        }));
+        let waker = noop_waker();
+        let p = with_driver_state(el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            fut.as_mut().poll(&mut cx)
+        });
+        assert!(
+            matches!(p, std::task::Poll::Pending),
+            "the write is in flight"
+        );
+        (src, src_gen, sink, fut)
+    }
+
+    /// An `EAGAIN` from a forward write to a connection sink is followed by a
+    /// plain `send` to the **sink**, whose completion finishes the forward
+    /// (#603).
+    #[test]
+    fn forward_to_conn_eagain_drains_to_the_sink() {
+        let mut el = make_test_loop();
+        let (src, src_gen, sink, mut fut) = start_conn_forward(&mut el);
+
+        let ud = UserData::encode(OpTag::ForwardWrite, src, src_gen);
+        el.test_dispatch_cqe(ud.raw(), -libc::EAGAIN, 0);
+        assert_eq!(last_pushed_opcode(&el), io_uring::opcode::Send::CODE);
+        assert_eq!(
+            el.driver.ring.last_drain_index,
+            Some(sink),
+            "the drain must write to the sink connection"
+        );
+        let drain = UserData::encode(OpTag::ForwardWriteDrain, src, src_gen);
+        assert_eq!(
+            el.driver
+                .ring
+                .last_pushed
+                .as_ref()
+                .map(|e| e.get_user_data()),
+            Some(drain.raw())
+        );
+
+        el.test_dispatch_cqe(drain.raw(), 5, 0);
+        let waker = noop_waker();
+        let p = with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            fut.as_mut().poll(&mut cx)
+        });
+        assert!(matches!(p, std::task::Poll::Ready(Ok(5))), "got {p:?}");
+    }
+
+    /// A drain is a new write, so it must not go to a sink slot recycled since
+    /// the forward started: the forward fails with `EPIPE` instead.
+    #[test]
+    fn forward_to_conn_eagain_on_a_recycled_sink_fails_with_epipe() {
+        let mut el = make_test_loop();
+        let (src, src_gen, sink, mut fut) = start_conn_forward(&mut el);
+        if let Some(st) = el.driver.forward_write[src as usize].as_mut() {
+            st.target = crate::backend::uring::driver::SinkTarget::Conn {
+                index: sink,
+                generation: el.driver.connections.generation(sink).wrapping_add(1),
+            };
+        }
+        let pushed_before = el
+            .driver
+            .ring
+            .last_pushed
+            .as_ref()
+            .map(|e| e.get_user_data());
+
+        let ud = UserData::encode(OpTag::ForwardWrite, src, src_gen);
+        el.test_dispatch_cqe(ud.raw(), -libc::EAGAIN, 0);
+        assert_eq!(
+            el.driver
+                .ring
+                .last_pushed
+                .as_ref()
+                .map(|e| e.get_user_data()),
+            pushed_before,
+            "nothing may be written to a recycled sink"
+        );
+        let waker = noop_waker();
+        let p = with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            fut.as_mut().poll(&mut cx)
+        });
+        match p {
+            std::task::Poll::Ready(Err(e)) => assert_eq!(e.raw_os_error(), Some(libc::EPIPE)),
+            other => panic!("expected EPIPE, got {other:?}"),
+        }
     }
 
     /// A stale sink handle must not write. Slots recycle, so a forward started

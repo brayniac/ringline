@@ -136,6 +136,10 @@ pub struct Ring {
     /// operation a handler submitted.
     #[cfg(test)]
     pub(crate) last_pushed: Option<squeue::Entry>,
+    /// Test-only: the registered file index of the last drain `send`, which
+    /// `last_pushed` does not show.
+    #[cfg(test)]
+    pub(crate) last_drain_index: Option<u32>,
 }
 
 impl Ring {
@@ -218,6 +222,8 @@ impl Ring {
             forced_push_failures: 0,
             #[cfg(test)]
             last_pushed: None,
+            #[cfg(test)]
+            last_drain_index: None,
         })
     }
 
@@ -569,8 +575,8 @@ impl Ring {
     ///
     /// io_uring reports `POLLRDHUP` on every poll, so once the peer has
     /// half-closed a `POLLOUT` poll completes at once and the vectored send
-    /// fails with `-EAGAIN` again. A `send` waits until the socket has room;
-    /// in that state it runs on an io-wq worker thread (#603). `user_data`
+    /// fails with `-EAGAIN` again (#603). A `send` waits until the socket has
+    /// room; in that state it runs on an io-wq worker thread (#605). `user_data`
     /// names the operation whose completion handler takes the result as a
     /// partial write.
     ///
@@ -587,6 +593,10 @@ impl Ring {
             .flags(crate::completion::STREAM_SEND_FLAGS)
             .build()
             .user_data(user_data.raw());
+        #[cfg(test)]
+        {
+            self.last_drain_index = Some(index);
+        }
         unsafe { self.push_sqe(&entry) }
     }
 

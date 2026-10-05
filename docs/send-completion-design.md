@@ -92,7 +92,7 @@ Linux 6.12 (arm64 and x86_64) and 7.1 (x86_64):
 | `PollAdd(POLLOUT)` | waits | completes with `POLLRDHUP` |
 
 So a vectored send (`sendmsg`, `SendMsgZc`, `writev`) that returns `-EAGAIN`
-is not retried behind a `POLLOUT` poll: that loop never waits, and spun the
+is not retried behind a `POLLOUT` poll: that loop never waits and spins the
 worker's event loop (#603). The handler instead submits a plain `send` of the
 entry's first non-empty unsent iovec, under a `*Drain` tag
 (`SendMsgCoalescedDrain`, `SendRecvBufsCoalescedDrain`, `SendMsgZcDrain`,
@@ -108,6 +108,8 @@ A `send` waits in this state by running on an io-wq worker thread from the
 **unbound** pool, which `ConfigBuilder::iowq_max_workers` does not cap: one
 thread for each connection whose send is waiting for room on a half-closed
 socket. Without a FIN the kernel waits with an internal poll and no thread.
+(Measured on Linux 6.12 arm64: 16 waiting sends held 16 `iou-wrk` threads
+after the peers' FINs, and none without them.)
 Waiting through an epoll fd instead would need an ordinary fd per connection;
 #605 tracks that.
 
