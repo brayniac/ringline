@@ -433,6 +433,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             let conn_index = match self.driver.connections.allocate() {
                 Some(idx) => idx,
                 None => {
+                    metrics::CONNECTIONS.increment(metrics::conn::ACCEPT_TABLE_FULL);
                     unsafe {
                         libc::close(raw_fd);
                     }
@@ -472,6 +473,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 )
                 .is_err()
             {
+                metrics::CONNECTIONS.increment(metrics::conn::ACCEPT_REGISTER_FAILED);
                 self.driver.connections.release(conn_index);
                 continue;
             }

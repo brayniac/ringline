@@ -217,6 +217,9 @@ pub fn run_acceptor(config: AcceptorConfig) {
         // Every live worker is backlogged. Dropping the connection closes it
         // rather than blocking the acceptor; keep accepting, since the backlog
         // is transient. (The all-workers-dead case returns above.)
+        if pending.is_some() {
+            crate::metrics::CONNECTIONS.increment(crate::metrics::conn::ACCEPT_BACKLOG_DROPPED);
+        }
         drop(pending);
     }
 }

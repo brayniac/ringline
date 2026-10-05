@@ -2568,6 +2568,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let conn_index = match self.driver.connections.allocate() {
             Some(idx) => idx,
             None => {
+                metrics::CONNECTIONS.increment(metrics::conn::ACCEPT_TABLE_FULL);
                 unsafe {
                     libc::close(raw_fd);
                 }
@@ -2586,6 +2587,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             .register_files_update(conn_index, &[raw_fd])
             .is_err()
         {
+            metrics::CONNECTIONS.increment(metrics::conn::ACCEPT_REGISTER_FAILED);
             self.driver.connections.release(conn_index);
             unsafe {
                 libc::close(raw_fd);
@@ -11516,6 +11518,39 @@ mod tests {
             "the write is in flight"
         );
         (src, src_gen, sink, fut)
+    }
+
+    /// A connection accepted while the table is full is closed before it
+    /// reaches a handler, and counted, so the drop can be told apart from a
+    /// handler that never ran (#598).
+    #[test]
+    fn an_accept_into_a_full_table_is_closed_and_counted() {
+        use std::os::fd::IntoRawFd;
+        let mut el = make_test_loop();
+        while el.driver.connections.allocate().is_some() {}
+        let (ours, _peer) = make_socketpair();
+        let raw = ours.into_raw_fd();
+        let before = metrics::CONNECTIONS
+            .value(metrics::conn::ACCEPT_TABLE_FULL)
+            .unwrap_or(0);
+
+        el.install_accepted(
+            raw,
+            crate::ListenerId::from_index(0),
+            crate::connection::PeerAddr::Tcp(std::net::SocketAddr::from(([127, 0, 0, 1], 9))),
+        );
+
+        let after = metrics::CONNECTIONS
+            .value(metrics::conn::ACCEPT_TABLE_FULL)
+            .unwrap_or(0);
+        assert!(
+            after > before,
+            "the drop was not counted ({before} -> {after})"
+        );
+        assert!(
+            unsafe { libc::fcntl(raw, libc::F_GETFD) } < 0,
+            "the accepted fd was not closed"
+        );
     }
 
     /// An `EAGAIN` from a forward write to a connection sink is followed by a

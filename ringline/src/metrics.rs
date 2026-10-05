@@ -12,7 +12,7 @@ use metriken::{Gauge, ShardedCounterGroup, metric};
     name = "ringline/connections",
     description = "Connection lifecycle counters"
 )]
-pub static CONNECTIONS: ShardedCounterGroup = ShardedCounterGroup::new(5);
+pub static CONNECTIONS: ShardedCounterGroup = ShardedCounterGroup::new(8);
 
 #[metric(name = "ringline/bytes", description = "Byte transfer counters")]
 pub static BYTES: ShardedCounterGroup = ShardedCounterGroup::new(3);
@@ -65,6 +65,16 @@ pub mod conn {
     pub const PARK_COMPLETED: usize = 3;
     /// Connections adopted from another worker.
     pub const ADOPTED: usize = 4;
+    /// Accepted connections closed before reaching the handler because the
+    /// worker's connection table was full (`ConfigBuilder::max_connections`).
+    pub const ACCEPT_TABLE_FULL: usize = 5;
+    /// Accepted connections closed before reaching the handler because the
+    /// worker could not register the socket (the io_uring fixed-file table,
+    /// or the mio poll).
+    pub const ACCEPT_REGISTER_FAILED: usize = 6;
+    /// Accepted connections the acceptor thread closed because every live
+    /// worker's accept queue was full (`ConfigBuilder::accept_queue_capacity`).
+    pub const ACCEPT_BACKLOG_DROPPED: usize = 7;
 }
 
 /// Completions processed, split by `OpTag`.
@@ -336,6 +346,21 @@ pub fn init_metadata() {
     CONNECTIONS.insert_metadata(conn::PARK_STARTED, "op".into(), "park_started".into());
     CONNECTIONS.insert_metadata(conn::PARK_COMPLETED, "op".into(), "park_completed".into());
     CONNECTIONS.insert_metadata(conn::ADOPTED, "op".into(), "adopted".into());
+    CONNECTIONS.insert_metadata(
+        conn::ACCEPT_TABLE_FULL,
+        "op".into(),
+        "accept_table_full".into(),
+    );
+    CONNECTIONS.insert_metadata(
+        conn::ACCEPT_REGISTER_FAILED,
+        "op".into(),
+        "accept_register_failed".into(),
+    );
+    CONNECTIONS.insert_metadata(
+        conn::ACCEPT_BACKLOG_DROPPED,
+        "op".into(),
+        "accept_backlog_dropped".into(),
+    );
 
     PARK_DRAIN_US.insert_metadata(park_drain_us::LT_100, "op".into(), "lt_100us".into());
     PARK_DRAIN_US.insert_metadata(park_drain_us::LT_250, "op".into(), "lt_250us".into());
@@ -506,7 +531,16 @@ mod tests {
     /// never counts (this caught `RING` sized 4 with 5 declared slots).
     #[test]
     fn declared_indices_are_in_bounds() {
-        for idx in [conn::ACCEPTED, conn::CLOSED] {
+        for idx in [
+            conn::ACCEPTED,
+            conn::CLOSED,
+            conn::PARK_STARTED,
+            conn::PARK_COMPLETED,
+            conn::ADOPTED,
+            conn::ACCEPT_TABLE_FULL,
+            conn::ACCEPT_REGISTER_FAILED,
+            conn::ACCEPT_BACKLOG_DROPPED,
+        ] {
             assert!(
                 CONNECTIONS.increment(idx),
                 "CONNECTIONS[{idx}] out of bounds"
