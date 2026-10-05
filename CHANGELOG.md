@@ -293,16 +293,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - On io_uring, a send that filled the socket of a peer that had half-closed
   (sent its FIN) and was not reading made the worker's event loop spin until
-  the peer read or the connection closed: about 26,000 iterations a second
-  on Linux 6.12 and 7.1, slowing every connection on that worker. Once the
+  the peer read or the connection closed, slowing every connection on that
+  worker: about 26,000 iterations a second on a Linux 6.12 host. Once the
   peer has half-closed, the kernel returns `EAGAIN` from `sendmsg` and
-  completes a `POLLOUT` poll at once with `POLLRDHUP`, so the loop's
-  `sendmsg`, poll, `sendmsg` retry never waited. Coalesced copy sends,
-  `run_direct_echo`, and `forward_to` / `forward_to_conn` socket sinks now
-  answer `EAGAIN` with a plain `send` of the first unsent bytes, which the
-  kernel parks until the socket has room, and then resubmit the rest. A
-  guard send (`SendMsgZc`) failed with `WouldBlock` in the same state; it
-  now waits and delivers as well (#603).
+  completes a `POLLOUT` poll at once with `POLLRDHUP` (6.12 and 7.1), so the
+  loop's `sendmsg`, poll, `sendmsg` retry never waited. Coalesced copy
+  sends, `run_direct_echo`, and `forward_to` / `forward_to_conn` socket and
+  connection sinks now answer `EAGAIN` with a plain `send` of the first
+  unsent bytes, which waits for room, and then resubmit the rest. A guard
+  send (`SendMsgZc`) outside `send_chain` failed with `WouldBlock` in the
+  same state; it now waits and delivers as well. While a send waits on a
+  half-closed socket it holds an io-wq kernel thread, as plain copy and TLS
+  sends already did; #605 tracks waiting without one (#603).
 
 - On Linux 6.13 and later, an io_uring connection close cancels the
   connection's requests ahead of its `Close` instead of sending a

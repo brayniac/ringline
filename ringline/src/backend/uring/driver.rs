@@ -646,8 +646,9 @@ pub(crate) struct Driver {
     /// the time the EAGAIN CQE arrived).
     pub(crate) pending_send_pollout_retries: Vec<(u32, u32, u16, u8, bool)>,
     /// Pending coalesced-send retries: (conn_index, generation, slab_idx, retries).
-    /// Drained each tick — used when resubmitting a coalesced `sendmsg` (partial
-    /// remainder or POLLOUT rearm) found the SQ full.
+    /// Drained each tick — used when resubmitting a coalesced `sendmsg` (a
+    /// partial remainder, or a drain `send` that could not be pushed) found the
+    /// SQ full.
     pub(crate) pending_coalesced_retries: Vec<(u32, u32, u16, u8)>,
     /// Pending recv-forward send resubmissions that failed (SQ full):
     /// (conn_index, generation, slab_idx, retries). Drained each tick.
@@ -1712,7 +1713,7 @@ impl Driver {
 
     /// Rebuild the in-flight write's iovecs and resubmit what is left of it.
     ///
-    /// Used after a short write and after a `POLLOUT` re-arm. The batch's
+    /// Used after a short or drained write. The batch's
     /// backings do not change; only which bytes of them are still owed.
     pub(crate) fn resubmit_forward_writev(&mut self, conn_index: u32) -> io::Result<()> {
         let idx = conn_index as usize;
@@ -1756,8 +1757,8 @@ impl Driver {
 
     /// After a forward write to a socket or connection sink returned
     /// `-EAGAIN`, submit a plain `send` of the first bytes still owed, which
-    /// the kernel parks until the sink has room. A `POLLOUT` poll would not
-    /// wait once the sink's peer has half-closed (#603). The completion,
+    /// waits until the sink has room. A `POLLOUT` poll would not wait once the
+    /// sink's peer has half-closed (#603). The completion,
     /// `OpTag::ForwardWriteDrain`, is handled as a short write of the forward
     /// write.
     pub(crate) fn drain_forward_write(&mut self, conn_index: u32) -> io::Result<()> {
@@ -3363,7 +3364,10 @@ impl Driver {
                             self.send_copy_pool.release(pool_slot);
                         }
                     }
-                    OpTag::SendMsgZc => {
+                    // A drain is a plain `send` on the same entry: its CQE
+                    // carries no notification flags, so it releases like a
+                    // main CQE that has no notification to wait for.
+                    OpTag::SendMsgZc | OpTag::SendMsgZcDrain => {
                         let slab_idx = ud.payload() as u16;
                         if !self.send_slab.in_use(slab_idx) {
                             continue;

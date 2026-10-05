@@ -62,10 +62,10 @@ pub enum OpTag {
     /// several queued per-connection sends. Payload = InFlightSendSlab index;
     /// the slab entry holds the backing pool slots, released on completion.
     SendMsgCoalesced = 24,
-    /// Plain `send` of the first unsent iovec of a coalesced send whose
-    /// `sendmsg` returned `-EAGAIN`. The kernel parks a `send` until the socket
-    /// has room, which a `POLLOUT` poll does not do once the peer has
-    /// half-closed (#603). Its result is a partial write of the same entry.
+    /// Plain `send` of the first non-empty unsent iovec of a coalesced send
+    /// whose `sendmsg` returned `-EAGAIN`. A `send` waits until the socket has
+    /// room, which a `POLLOUT` poll does not do once the peer has half-closed
+    /// (#603). Its result is a partial write of the same entry.
     /// Payload = InFlightSendSlab index.
     SendMsgCoalescedDrain = 25,
     /// Zero-copy recv-forward: one `sendmsg` whose iovecs point directly into
@@ -73,9 +73,9 @@ pub enum OpTag {
     /// InFlightSendSlab index; the slab entry holds the bids to replenish on
     /// completion.
     SendRecvBufsCoalesced = 26,
-    /// Plain `send` of the first unsent iovec of a recv-forward send whose
-    /// `sendmsg` returned `-EAGAIN`; see `SendMsgCoalescedDrain`. Payload =
-    /// InFlightSendSlab index.
+    /// Plain `send` of the first non-empty unsent iovec of a recv-forward send
+    /// whose `sendmsg` returned `-EAGAIN`; see `SendMsgCoalescedDrain`.
+    /// Payload = InFlightSendSlab index.
     SendRecvBufsCoalescedDrain = 27,
     /// One-shot fallback recv into a fallback-pool slot, submitted when a
     /// connection parked on ENOBUFS holds a partial message in its
@@ -113,9 +113,10 @@ pub enum OpTag {
     /// hard-linked ahead of its `Close` from Linux 6.13 (#586). Its
     /// completion is ignored; the `Close` CQE releases the slot.
     CloseCancel = 34,
-    /// Plain (copying) `send` of the first unsent iovec of a zero-copy send
-    /// whose `sendmsg` returned `-EAGAIN`; see `SendMsgCoalescedDrain`. It
-    /// posts no notification. Payload = InFlightSendSlab index.
+    /// Plain (copying) `send` of the first non-empty unsent iovec of a
+    /// zero-copy send whose `sendmsg` returned `-EAGAIN`; see
+    /// `SendMsgCoalescedDrain`. It posts no notification. Payload =
+    /// InFlightSendSlab index.
     SendMsgZcDrain = 35,
 }
 

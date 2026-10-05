@@ -8,7 +8,7 @@
 //! `sendmsg` behind a poll spun at the ring's round-trip rate (#603). Each test
 //! here drives one send path into that state, counts event-loop iterations
 //! (`on_tick`) while the peer does not read, and compares the count with the
-//! loop's idle rate. Plain copy sends are covered by
+//! loop's idle rate. Coalesced copy sends are covered by
 //! `deferred_close_does_not_spin_on_half_closed_peer` in `echo.rs`, and the
 //! `run_direct_echo` path by `direct_echo_eagain_drains_with_a_plain_send` in
 //! the io_uring event loop's unit tests.
@@ -68,8 +68,8 @@ fn ticks_over_500ms() -> u32 {
     TICKS.load(Ordering::Relaxed) - before
 }
 
-/// The loop's idle rate, then its rate once `setup` has left a send backed up
-/// behind a half-closed peer, and the bound the second must stay under.
+/// Checks the loop's rate once a send has backed up behind a half-closed peer
+/// against its idle rate.
 ///
 /// A healthy loop has nothing to complete while the peer does not read, so it
 /// ticks at about its idle rate; the spin ran at more than 30 times idle. Four

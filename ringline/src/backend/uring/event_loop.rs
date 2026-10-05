@@ -3421,8 +3421,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
 
         // EAGAIN/EWOULDBLOCK: socket buffer full. Keep the slab entry (and its
-        // data) alive and send its first unsent iovec with a plain `send`,
-        // which the kernel parks until there is room; its completion comes
+        // data) alive and send its first non-empty unsent iovec with a plain
+        // `send`,
+        // which waits until there is room; its completion comes
         // back here as a partial write (#603).
         let errno = -result;
         if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
@@ -3467,13 +3468,18 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.executor.wake_send(conn_index, io_result);
     }
 
-    /// Submit a plain `send` of the first unsent iovec of slab entry
-    /// `slab_idx`, tagged `tag`, after its `sendmsg` returned `-EAGAIN`. The
-    /// kernel parks a `send` until the socket has room, where a `POLLOUT`
-    /// poll completes at once once the peer has half-closed (#603). The tag's
+    /// Submit a plain `send` of the first non-empty unsent iovec of slab entry
+    /// `slab_idx`, tagged `tag`, after its `sendmsg` returned `-EAGAIN`. A
+    /// `send` waits until the socket has room, where a `POLLOUT` poll
+    /// completes at once once the peer has half-closed (#603). The tag's
     /// handler takes the result as a partial write of the entry.
     fn submit_slab_drain(&mut self, tag: OpTag, conn_index: u32, slab_idx: u16) -> io::Result<()> {
-        let (ptr, len) = self.driver.send_slab.first_unsent(slab_idx);
+        // An entry that got `-EAGAIN` has bytes left to send.
+        let (ptr, len) = self
+            .driver
+            .send_slab
+            .first_unsent(slab_idx)
+            .ok_or_else(|| io::Error::other("drain of an entry with no bytes left"))?;
         let ud = UserData::encode(tag, conn_index, slab_idx as u32);
         // SAFETY: the bytes belong to the slab entry, which is released only
         // by a completion handler, so they outlive this CQE.
@@ -3618,28 +3624,31 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     }
 
     /// Resubmit the remaining bytes of the in-flight forward write (after a short
-    /// write, or after a POLLOUT re-arm). The backing stays held; only the source
+    /// or drained write). The backing stays held; only the source
     /// pointer, length, and (for files) offset advance. On submit failure the
     /// forward is failed (releasing the backing).
     fn resubmit_forward_write(&mut self, conn_index: u32) {
-        // A connection sink's slot may have been recycled since the forward
-        // started; writing to a reused index would deliver this stream to
-        // whoever owns it now.
-        let stale = self.driver.forward_write[conn_index as usize]
-            .as_ref()
-            .is_some_and(|st| match st.target {
-                crate::backend::uring::driver::SinkTarget::Conn { index, generation } => {
-                    self.driver.connections.generation(index) != generation
-                }
-                crate::backend::uring::driver::SinkTarget::Fd { .. } => false,
-            });
-        if stale {
+        if self.forward_sink_is_stale(conn_index) {
             self.fail_forward_write(conn_index, libc::EPIPE);
             return;
         }
         if let Err(e) = self.driver.resubmit_forward_writev(conn_index) {
             self.fail_forward_write(conn_index, e.raw_os_error().unwrap_or(libc::EIO));
         }
+    }
+
+    /// Whether a forward write's connection sink has been recycled since the
+    /// forward started. Writing to a reused index would deliver this stream to
+    /// whoever owns it now, so every write after the first checks this.
+    fn forward_sink_is_stale(&self, conn_index: u32) -> bool {
+        self.driver.forward_write[conn_index as usize]
+            .as_ref()
+            .is_some_and(|st| match st.target {
+                crate::backend::uring::driver::SinkTarget::Conn { index, generation } => {
+                    self.driver.connections.generation(index) != generation
+                }
+                crate::backend::uring::driver::SinkTarget::Fd { .. } => false,
+            })
     }
 
     /// Re-arm a forwarding connection's multishot recv after the Mode A hold cap
@@ -3769,7 +3778,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// already released the backing) is ignored. On full completion the held bid
     /// is replenished exactly once and the `ForwardToFuture` is woken; a short
     /// write resubmits the remainder at the advanced offset; `-EAGAIN` (socket
-    /// sink) arms POLLOUT.
+    /// or connection sink) submits a drain `send` (`ForwardWriteDrain`), whose
+    /// completion comes back here as a short write.
     fn handle_forward_write(&mut self, ud: UserData, result: i32) {
         let conn_index = ud.conn_index();
         let submit_gen = ud.payload();
@@ -3783,7 +3793,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // If the connection is closing, `close_connection` cancelled this write;
         // stop forwarding regardless of the result. Reclaim the backing (the CQE
         // means the kernel is done reading it) and drive the deferred close — do
-        // not resubmit a short write, arm POLLOUT, or wake the doomed future.
+        // not resubmit a short write, submit a drain, or wake the doomed future.
         let closing = self.driver.send_queues[conn_index as usize].close_pending;
 
         if result > 0 {
@@ -3838,9 +3848,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let errno = -result;
         if !closing && (errno == libc::EAGAIN || errno == libc::EWOULDBLOCK) {
             // Socket sink buffer full: send the first bytes still owed with a
-            // plain `send`, which the kernel parks until there is room; its
+            // plain `send`, which waits until there is room; its
             // completion comes back here as a short write (#603).
-            if self.driver.drain_forward_write(conn_index).is_err() {
+            if self.forward_sink_is_stale(conn_index) {
+                self.fail_forward_write(conn_index, libc::EPIPE);
+            } else if self.driver.drain_forward_write(conn_index).is_err() {
                 self.fail_forward_write(conn_index, libc::EAGAIN);
             }
             metrics::POOL.increment(metrics::pool::SEND_EAGAIN);
@@ -4021,8 +4033,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
 
         // EAGAIN/EWOULDBLOCK: socket buffer full. Keep the entry (and its
-        // guards) alive and send the first unsent iovec with a plain `send`,
-        // which the kernel parks until there is room; its completion
+        // guards) alive and send the first non-empty unsent iovec with a plain
+        // `send`,
+        // which waits until there is room; its completion
         // (`SendMsgZcDrain`, no notification) comes back here as a partial
         // write and the rest is resubmitted zero-copy (#603).
         if (result == -libc::EAGAIN || result == -libc::EWOULDBLOCK)
@@ -13400,6 +13413,108 @@ mod tests {
         let rest = UserData::encode(OpTag::SendRecvBufsCoalesced, conn_index, 0);
         el.test_dispatch_cqe(rest.raw(), 4096, 0);
         assert!(!el.driver.send_slab.in_use(0), "fully sent: entry released");
+    }
+
+    #[test]
+    fn a_failed_drain_releases_the_entry() {
+        let mut el = make_test_loop();
+        let conn_index = stage_direct_echo(&mut el, &[0, 1], 4096);
+        el.flush_direct_echoes();
+        let ud = UserData::encode(OpTag::SendRecvBufsCoalesced, conn_index, 0);
+        el.test_dispatch_cqe(ud.raw(), -libc::EAGAIN, 0);
+        assert_eagain_drains(&el, OpTag::SendRecvBufsCoalescedDrain, conn_index);
+
+        // The peer reset the connection while the drain waited.
+        let pushed_before = el
+            .driver
+            .ring
+            .last_pushed
+            .as_ref()
+            .map(|e| e.get_user_data());
+        let drain = UserData::encode(OpTag::SendRecvBufsCoalescedDrain, conn_index, 0);
+        el.test_dispatch_cqe(drain.raw(), -libc::EPIPE, 0);
+        assert!(!el.driver.send_slab.in_use(0), "the entry is released");
+        assert_eq!(
+            el.driver
+                .ring
+                .last_pushed
+                .as_ref()
+                .map(|e| e.get_user_data()),
+            pushed_before,
+            "nothing is resubmitted after an error"
+        );
+    }
+
+    /// A zero-copy send that gets `-EAGAIN` drains its first non-empty iovec
+    /// with a plain `send` and keeps the entry until every notification has
+    /// landed. The entry leads with an empty iovec, as
+    /// `.copy(&[]).guard(g)` builds: a drain of that iovec would send 0
+    /// bytes and complete the send with the guarded bytes unsent.
+    #[test]
+    fn zc_eagain_drains_and_holds_for_its_notifications() {
+        const F_MORE: u32 = 2; // IORING_CQE_F_MORE
+        const F_NOTIF: u32 = 8; // IORING_CQE_F_NOTIF
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let data = Box::new([7u8; 100]);
+        let iovecs = [
+            libc::iovec {
+                iov_base: std::ptr::null_mut(),
+                iov_len: 0,
+            },
+            libc::iovec {
+                iov_base: data.as_ptr() as *mut _,
+                iov_len: 100,
+            },
+        ];
+        let guards = [const { None }; crate::buffer::send_slab::MAX_GUARDS];
+        let (slab_idx, _) = el
+            .driver
+            .send_slab
+            .allocate(
+                conn_index,
+                el.driver.connections.generation(conn_index),
+                &iovecs,
+                u16::MAX,
+                guards,
+                0,
+                100,
+            )
+            .unwrap();
+        assert_eq!(slab_idx, 0);
+        el.driver.send_queues[conn_index as usize].in_flight = true;
+
+        // EAGAIN, with a notification to follow.
+        let zc = UserData::encode(OpTag::SendMsgZc, conn_index, 0);
+        el.test_dispatch_cqe(zc.raw(), -libc::EAGAIN, F_MORE);
+        assert_eagain_drains(&el, OpTag::SendMsgZcDrain, conn_index);
+        assert_eq!(
+            el.driver.send_slab.first_unsent(0),
+            Some((data.as_ptr(), 100)),
+            "the drain must skip the empty iovec"
+        );
+
+        // The drain sends 40 bytes: the rest is resubmitted zero-copy.
+        let drain = UserData::encode(OpTag::SendMsgZcDrain, conn_index, 0);
+        el.test_dispatch_cqe(drain.raw(), 40, 0);
+        assert_eq!(last_pushed_opcode(&el), io_uring::opcode::SendMsgZc::CODE);
+        assert!(el.driver.send_queues[conn_index as usize].in_flight);
+
+        // The rest completes; the EAGAIN's notification is still owed.
+        el.test_dispatch_cqe(zc.raw(), 60, 0);
+        assert!(
+            !el.driver.send_queues[conn_index as usize].in_flight,
+            "the send is complete"
+        );
+        assert!(
+            el.driver.send_slab.in_use(0),
+            "the entry must wait for the owed notification"
+        );
+        el.test_dispatch_cqe(zc.raw(), 0, F_NOTIF);
+        assert!(
+            !el.driver.send_slab.in_use(0),
+            "released after the notification"
+        );
     }
 
     #[test]

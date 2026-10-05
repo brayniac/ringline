@@ -309,18 +309,24 @@ impl InFlightSendSlab {
         Some(&entry.msghdr as *const libc::msghdr)
     }
 
-    /// The first iovec of an entry that is not yet fully sent, as
+    /// The first non-empty iovec of an entry that is not yet fully sent, as
     /// `(ptr, len)`, with `len` capped at `u32::MAX` (a send of fewer bytes is
-    /// a partial write). The entry must have bytes left to send.
-    pub fn first_unsent(&self, idx: u16) -> (*const u8, u32) {
+    /// a partial write). `None` if no unsent iovec has any bytes.
+    ///
+    /// Zero-length iovecs are skipped: a `send` of 0 bytes completes with 0,
+    /// which a completion handler reads as the end of the send.
+    pub fn first_unsent(&self, idx: u16) -> Option<(*const u8, u32)> {
         let entry = &self.entries[idx as usize];
         debug_assert!(entry.in_use);
-        debug_assert!(entry.iov_start < entry.iov_count, "entry {idx} fully sent");
-        let iov = entry.iovecs[entry.iov_start as usize];
-        (
-            iov.iov_base as *const u8,
-            iov.iov_len.min(u32::MAX as usize) as u32,
-        )
+        entry.iovecs[entry.iov_start as usize..entry.iov_count as usize]
+            .iter()
+            .find(|iov| iov.iov_len > 0)
+            .map(|iov| {
+                (
+                    iov.iov_base as *const u8,
+                    iov.iov_len.min(u32::MAX as usize) as u32,
+                )
+            })
     }
 
     /// Get the msghdr pointer for a slab entry (for resubmission retries).
@@ -466,6 +472,37 @@ mod tests {
         fn drop(&mut self) {
             self.drop_counter.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    #[test]
+    fn first_unsent_skips_empty_iovecs() {
+        let mut slab = InFlightSendSlab::new(4);
+        let data = [7u8; 100];
+        let iovecs = [
+            libc::iovec {
+                iov_base: std::ptr::null_mut(),
+                iov_len: 0,
+            },
+            libc::iovec {
+                iov_base: data.as_ptr() as *mut _,
+                iov_len: 100,
+            },
+        ];
+        let guards: [Option<GuardBox>; MAX_GUARDS] = [const { None }; MAX_GUARDS];
+        let (idx, _) = slab
+            .allocate(1, 1, &iovecs, u16::MAX, guards, 0, 100)
+            .unwrap();
+        assert_eq!(slab.first_unsent(idx), Some((data.as_ptr(), 100)));
+
+        assert!(slab.try_advance(idx, 100).is_none(), "fully sent");
+        let guards: [Option<GuardBox>; MAX_GUARDS] = [const { None }; MAX_GUARDS];
+        let empty = [libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 0,
+        }];
+        slab.release(idx);
+        let (idx, _) = slab.allocate(1, 1, &empty, u16::MAX, guards, 0, 0).unwrap();
+        assert_eq!(slab.first_unsent(idx), None, "no bytes left to send");
     }
 
     #[test]

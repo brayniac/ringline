@@ -91,20 +91,29 @@ Linux 6.12 (arm64 and x86_64) and 7.1 (x86_64):
 | `Writev` | waits | `-EAGAIN` |
 | `PollAdd(POLLOUT)` | waits | completes with `POLLRDHUP` |
 
-So a `sendmsg` that returns `-EAGAIN` is not retried behind a `POLLOUT` poll:
-that loop never waits, and spun the worker's event loop (#603). The handler
-instead submits a plain `send` of the entry's first unsent iovec, under a
-`*Drain` tag (`SendMsgCoalescedDrain`, `SendRecvBufsCoalescedDrain`,
-`SendMsgZcDrain`, `ForwardWriteDrain`). The kernel parks that `send` until
-the socket has room. Its result is a partial write of the same entry, so the
+So a vectored send (`sendmsg`, `SendMsgZc`, `writev`) that returns `-EAGAIN`
+is not retried behind a `POLLOUT` poll: that loop never waits, and spun the
+worker's event loop (#603). The handler instead submits a plain `send` of the
+entry's first non-empty unsent iovec, under a `*Drain` tag
+(`SendMsgCoalescedDrain`, `SendRecvBufsCoalescedDrain`, `SendMsgZcDrain`,
+`ForwardWriteDrain`). Its result is a partial write of the same entry, so the
 drain tag's completion goes through the entry's own handler, which advances
-the iovecs and resubmits the rest as a `sendmsg`. The entry stays the one
-operation in flight on the connection, so byte order holds. A zero-copy
-entry's drain is a copying `send` and posts no notification.
+the iovecs and resubmits the rest with the entry's own operation. The entry
+stays the one operation in flight on the connection, so byte order holds. A
+zero-copy entry's drain is a copying `send` and posts no notification.
+Zero-copy sends inside a `send_chain` are linked SQEs and are not drained: an
+`-EAGAIN` there fails the chain.
+
+A `send` waits in this state by running on an io-wq worker thread from the
+**unbound** pool, which `ConfigBuilder::iowq_max_workers` does not cap: one
+thread for each connection whose send is waiting for room on a half-closed
+socket. Without a FIN the kernel waits with an internal poll and no thread.
+Waiting through an epoll fd instead would need an ordinary fd per connection;
+#605 tracks that.
 
 Plain `Send` paths (single-buffer copy sends, TLS) keep their `POLLOUT`
-fallback (`SendPollOut`): a `send` with `MSG_WAITALL` is parked by the kernel
-and does not return `-EAGAIN` in this state.
+fallback (`SendPollOut`): a `send` with `MSG_WAITALL` does not return
+`-EAGAIN` in this state, so the fallback is not reached.
 
 ## 5. Admission and parking
 
