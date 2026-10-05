@@ -110,8 +110,9 @@ pub enum OpTag {
     /// `Close` CQE releases the slot.
     CloseShutdown = 33,
     /// `ASYNC_CANCEL` of every request on a connection's fixed file,
-    /// hard-linked ahead of its `Close` from Linux 6.13 (#586). Its
-    /// completion is ignored; the `Close` CQE releases the slot.
+    /// hard-linked ahead of its `Close` from Linux 6.13 (#586), and at worker
+    /// exit on every kernel. Its completion is ignored; the `Close` CQE
+    /// releases the slot.
     CloseCancel = 34,
     /// Plain (copying) `send` of the first non-empty unsent iovec of a
     /// zero-copy send whose `sendmsg` returned `-EAGAIN`; see

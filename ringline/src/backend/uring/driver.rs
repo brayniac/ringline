@@ -3282,6 +3282,50 @@ impl Driver {
         }
     }
 
+    /// At shutdown, release a coalesced copy send's slab entry and its pool
+    /// slots, settling any bounded send it carries as aborted.
+    fn release_coalesced_at_shutdown(&mut self, slab_idx: u16) {
+        if !self.send_slab.in_use(slab_idx) {
+            return;
+        }
+        if let Some((id, _logical_len)) = self.send_slab.take_coalesced_bounded_send(slab_idx) {
+            self.bounded_send_completions.push_back((
+                id,
+                Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "worker shut down before the send completed",
+                )),
+            ));
+        }
+        let mut slots = [u16::MAX; crate::buffer::send_slab::MAX_IOVECS];
+        let mut n = 0;
+        for &slot in self.send_slab.coalesced_pool_slots(slab_idx) {
+            slots[n] = slot;
+            n += 1;
+        }
+        for &slot in &slots[..n] {
+            self.send_copy_pool.release(slot);
+        }
+        self.send_slab.release(slab_idx);
+    }
+
+    /// At shutdown, release a recv-forward send's slab entry. Its bids go to
+    /// `pending_replenish`, as in the normal handler; nothing replenishes
+    /// them, since the buffer ring is unregistered when the worker exits.
+    fn release_recv_forward_at_shutdown(&mut self, slab_idx: u16) {
+        if !self.send_slab.in_use(slab_idx) {
+            return;
+        }
+        let mut bids = [u16::MAX; crate::buffer::send_slab::MAX_IOVECS];
+        let mut n = 0;
+        for &bid in self.send_slab.recv_forward_bids(slab_idx) {
+            bids[n] = bid;
+            n += 1;
+        }
+        self.pending_replenish.extend_from_slice(&bids[..n]);
+        self.send_slab.release(slab_idx);
+    }
+
     /// Shutdown: close all connections and drain remaining CQEs. The eventfd
     /// is closed by `WakeHandle`, not here.
     pub(crate) fn run_shutdown(&mut self) {
@@ -3292,7 +3336,30 @@ impl Driver {
             rx.try_iter().for_each(drop);
         }
 
-        // 1. Close all active connections and drain their send queues.
+        // 1. Release entries parked on a retry list: their submit found the
+        //    SQ full, so no operation is in flight and no CQE will release
+        //    them. A zero-copy entry still waits for any notification its
+        //    earlier operations owe.
+        for (_, _, slab_idx, _) in std::mem::take(&mut self.pending_coalesced_retries) {
+            self.release_coalesced_at_shutdown(slab_idx);
+        }
+        for (_, _, slab_idx, _) in std::mem::take(&mut self.pending_recv_forward_retries) {
+            self.release_recv_forward_at_shutdown(slab_idx);
+        }
+        for (_, _, slab_idx, _) in std::mem::take(&mut self.pending_zc_retries) {
+            if !self.send_slab.in_use(slab_idx) {
+                continue;
+            }
+            self.send_slab.mark_awaiting_notifications(slab_idx);
+            if self.send_slab.should_release(slab_idx) {
+                let pool_slot = self.send_slab.release(slab_idx);
+                if pool_slot != u16::MAX {
+                    self.send_copy_pool.release(pool_slot);
+                }
+            }
+        }
+
+        // 2. Close all active connections and drain their send queues.
         let max = self.connections.max_slots();
         for i in 0..max {
             if self.connections.get(i).is_some() {
@@ -3303,24 +3370,25 @@ impl Driver {
                 // Cancel the connection's requests ahead of the Close. A
                 // send waiting for a peer that does not read would otherwise
                 // never complete, and the loop below would wait out its full
-                // bound for it. Cancelling by fixed file works on every
-                // supported kernel (6.0+). No shutdown: each peer gets a FIN
-                // once the socket is released, or an RST if received data
-                // was unread.
+                // bound for it. `IORING_ASYNC_CANCEL_FD_FIXED` is in Linux
+                // 6.0, below the 6.1 io_uring minimum. No shutdown: each peer
+                // gets a FIN once the socket is released, or an RST if
+                // received data was unread.
                 let _ = self.ring.submit_close(i, super::ring::CloseLead::CancelAll);
             }
         }
 
-        // 2. Submit + drain loop until all connections are closed and every
-        //    slab entry is released, for at most 100 × 100 ms. Arm a timeout
-        //    SQE each iteration so submit_and_wait(1) never blocks indefinitely
-        //    (the tick timeout from the main loop is not armed here).
+        // 3. Submit + drain loop until every connection's Close has completed
+        //    and every slab entry is released, for at most 100 × 100 ms. Arm a
+        //    timeout SQE each iteration so submit_and_wait(1) never blocks
+        //    indefinitely (the tick timeout from the main loop is not armed
+        //    here).
         //
         //    A zero-copy entry is released only once its notifications land,
-        //    and the kernel posts those when the data has left the socket. A
-        //    peer that does not read keeps the data queued after the close, so
-        //    such an entry holds the loop for its whole bound; the guards are
-        //    then dropped with the driver.
+        //    and the kernel posts those when the peer has acknowledged the data
+        //    and the kernel has freed it. A peer that does not read keeps the
+        //    data queued after the close, so such an entry holds the loop for
+        //    its whole bound; the guards are then dropped with the driver.
         let shutdown_ts = io_uring::types::Timespec::new().nsec(100_000_000); // 100ms
         for _ in 0..100 {
             if self.connections.active_count() == 0 && !self.send_slab.has_in_flight() {
@@ -3378,51 +3446,14 @@ impl Driver {
                             self.send_copy_pool.release(pool_slot);
                         }
                     }
-                    // A coalesced copy send, or its drain: release the pool
-                    // slots it holds. Nothing is resubmitted at shutdown, so
-                    // a partial completion releases too.
+                    // A coalesced copy send, or its drain. Nothing is
+                    // resubmitted at shutdown, so a partial completion
+                    // releases too.
                     OpTag::SendMsgCoalesced | OpTag::SendMsgCoalescedDrain => {
-                        let slab_idx = ud.payload() as u16;
-                        if !self.send_slab.in_use(slab_idx) {
-                            continue;
-                        }
-                        if let Some((id, _logical_len)) =
-                            self.send_slab.take_coalesced_bounded_send(slab_idx)
-                        {
-                            self.bounded_send_completions.push_back((
-                                id,
-                                Err(io::Error::new(
-                                    io::ErrorKind::ConnectionAborted,
-                                    "worker shut down before the send completed",
-                                )),
-                            ));
-                        }
-                        let mut slots = [u16::MAX; crate::buffer::send_slab::MAX_IOVECS];
-                        let mut n = 0;
-                        for &slot in self.send_slab.coalesced_pool_slots(slab_idx) {
-                            slots[n] = slot;
-                            n += 1;
-                        }
-                        for &slot in &slots[..n] {
-                            self.send_copy_pool.release(slot);
-                        }
-                        self.send_slab.release(slab_idx);
+                        self.release_coalesced_at_shutdown(ud.payload() as u16);
                     }
-                    // A recv-forward send, or its drain: the held provided
-                    // buffers go back to the ring.
                     OpTag::SendRecvBufsCoalesced | OpTag::SendRecvBufsCoalescedDrain => {
-                        let slab_idx = ud.payload() as u16;
-                        if !self.send_slab.in_use(slab_idx) {
-                            continue;
-                        }
-                        let mut bids = [u16::MAX; crate::buffer::send_slab::MAX_IOVECS];
-                        let mut n = 0;
-                        for &bid in self.send_slab.recv_forward_bids(slab_idx) {
-                            bids[n] = bid;
-                            n += 1;
-                        }
-                        self.pending_replenish.extend_from_slice(&bids[..n]);
-                        self.send_slab.release(slab_idx);
+                        self.release_recv_forward_at_shutdown(ud.payload() as u16);
                     }
                     // A drain is a plain `send` on the same entry: its CQE
                     // carries no notification flags, so it releases like a
@@ -3469,7 +3500,7 @@ impl Driver {
             }
         }
 
-        // 3. Unregister the provided buffer rings before Driver is dropped
+        // 4. Unregister the provided buffer rings before Driver is dropped
         // (which munmaps the ring memory). Without this, the kernel holds a
         // dangling pointer to the freed mmap region.
         if self

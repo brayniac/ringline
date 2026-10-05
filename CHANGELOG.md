@@ -310,10 +310,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   recv-forward send was waiting for room took 10 s to exit: the shutdown
   closed connections without cancelling their requests, and released only
   zero-copy send entries. It now cancels each connection's requests ahead of
-  its close and releases those entries, so the worker exits at once (0.3 s
-  against 10.2 s, measured). A zero-copy send queued to a peer that does not
-  read still holds shutdown for its 10 s bound, because its guards stay in
-  use until the kernel's notification (#607).
+  its close and releases those entries, so the worker exits within
+  milliseconds instead of after 10 s. A zero-copy send queued to a peer that
+  does not read still holds shutdown until the 10 s shutdown bound, because
+  its guards stay in use until the kernel's notification (#607).
 
 - On Linux 6.13 and later, an io_uring connection close cancels the
   connection's requests ahead of its `Close` instead of sending a

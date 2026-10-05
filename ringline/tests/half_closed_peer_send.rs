@@ -320,3 +320,64 @@ fn shutdown_does_not_wait_out_copy_sends_to_a_half_closed_peer() {
         "worker took {took:?} to exit with copy sends waiting"
     );
 }
+
+/// Echoes with `run_direct_echo`, whose sends gather held provided buffers into
+/// recv-forward `sendmsg`s.
+#[cfg(has_io_uring)]
+struct DirectEcho;
+
+#[cfg(has_io_uring)]
+impl AsyncEventHandler for DirectEcho {
+    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
+        async move {
+            conn.as_conn().run_direct_echo().await;
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        DirectEcho
+    }
+}
+
+/// As `shutdown_does_not_wait_out_copy_sends_to_a_half_closed_peer`, for a
+/// recv-forward send: the client sends until the echo backs up, half-closes,
+/// and never reads.
+#[cfg(has_io_uring)]
+#[test]
+fn shutdown_does_not_wait_out_a_direct_echo_to_a_half_closed_peer() {
+    let _lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (runtime, handles) = RinglineBuilder::new(config())
+        .bind("127.0.0.1:0".parse().unwrap())
+        .launch::<DirectEcho>()
+        .expect("launch");
+    let mut stream = connect(runtime.bound_addr().expect("bound address"));
+    stream.set_nonblocking(true).unwrap();
+    let chunk = vec![0x5Au8; 64 * 1024];
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let mut idle_since = std::time::Instant::now();
+    // Write until the echo has backed up all the way: no write has gone
+    // through for 200 ms.
+    while std::time::Instant::now() < deadline && idle_since.elapsed() < Duration::from_millis(200)
+    {
+        match stream.write(&chunk) {
+            Ok(_) => idle_since = std::time::Instant::now(),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(5))
+            }
+            Err(e) => panic!("write: {e}"),
+        }
+    }
+    stream.shutdown(Shutdown::Write).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+
+    let start = std::time::Instant::now();
+    runtime.shutdown();
+    for h in handles {
+        h.join().expect("worker panicked").expect("worker error");
+    }
+    let took = start.elapsed();
+    drop(stream);
+    assert!(
+        took < Duration::from_secs(2),
+        "worker took {took:?} to exit with a direct echo waiting"
+    );
+}

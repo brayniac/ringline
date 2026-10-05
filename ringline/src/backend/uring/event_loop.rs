@@ -13621,6 +13621,50 @@ mod tests {
         );
     }
 
+    /// An entry parked on a retry list has no operation in flight, so no CQE
+    /// will release it; shutdown must release it itself rather than wait out
+    /// its bound.
+    #[test]
+    fn shutdown_releases_entries_parked_on_retry_lists() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let iovecs = [libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 100,
+        }];
+        let mut parked = Vec::new();
+        for list in 0..3 {
+            let guards = [const { None }; crate::buffer::send_slab::MAX_GUARDS];
+            let (slab_idx, _) = el
+                .driver
+                .send_slab
+                .allocate(conn_index, generation, &iovecs, u16::MAX, guards, 0, 100)
+                .unwrap();
+            let entry = (conn_index, generation, slab_idx, 0);
+            match list {
+                0 => el.driver.pending_coalesced_retries.push(entry),
+                1 => el.driver.pending_recv_forward_retries.push(entry),
+                _ => el.driver.pending_zc_retries.push(entry),
+            }
+            parked.push(slab_idx);
+        }
+
+        let start = std::time::Instant::now();
+        el.driver.run_shutdown();
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "shutdown waited {:?} for parked entries",
+            start.elapsed()
+        );
+        for slab_idx in parked {
+            assert!(
+                !el.driver.send_slab.in_use(slab_idx),
+                "entry {slab_idx} not released"
+            );
+        }
+    }
+
     #[test]
     fn handle_tls_send_stale_slot_ignored() {
         let mut el = make_test_loop();

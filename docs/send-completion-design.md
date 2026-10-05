@@ -120,15 +120,19 @@ fallback (`SendPollOut`): a `send` with `MSG_WAITALL` does not return
 ### At worker shutdown
 
 `run_shutdown` closes every connection with the `CancelAll` lead, on every
-kernel, so a send waiting for room is cancelled and its entry released. It
-then waits, for at most 100 × 100 ms, until every send-slab entry is released.
-A zero-copy entry is released only once its notifications land, and the
-kernel posts them when the data has left the socket. A peer that does not read
-keeps that data queued after the close, so such an entry holds the worker for
-the whole bound, after which the guards are dropped with the driver. #607
-replaces that wait with an abortive close (`SO_LINGER {on, 0}`), which
-discards the queued data so the notifications land at once; it needs io_uring's
-setsockopt command and so the 6.8 minimum of #605.
+kernel, so a send waiting for room is cancelled, and a coalesced or
+recv-forward send's slab entry is released on its completion. Entries parked
+on a retry list, with no operation in flight, are released first. It then
+waits, for at most 100 × 100 ms, until every connection's `Close` has
+completed and every send-slab entry is released. A zero-copy entry is
+released only once its notifications land, and the kernel posts them when the
+peer has acknowledged the data and the kernel has freed it. A peer that does
+not read keeps that data queued after the close, so such an entry holds the
+worker for the whole bound, after which the guards are dropped with the
+driver. #607 proposes replacing that wait with an abortive close
+(`SO_LINGER {on, 0}`), which discards the queued data so the notifications land
+at once; it needs io_uring's setsockopt command (Linux 6.7), so it waits on the
+6.8 minimum proposed in #605.
 
 ## 5. Admission and parking
 

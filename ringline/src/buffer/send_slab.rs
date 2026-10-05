@@ -436,7 +436,7 @@ impl InFlightSendSlab {
         self.free_list.len()
     }
 
-    /// Whether any slab entries are still in use (awaiting ZC notifications).
+    /// Whether any slab entry is still in use.
     pub fn has_in_flight(&self) -> bool {
         self.free_list.len() < self.entries.len()
     }

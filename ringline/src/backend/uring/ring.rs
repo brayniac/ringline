@@ -66,18 +66,18 @@ pub(crate) fn is_memlock_enomem(err: &Error) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CloseLead {
     /// The `Close` alone: a socket handed to another worker, which must stay
-    /// open, or a close at worker exit, where the ring's teardown releases
-    /// the socket.
+    /// open.
     Nothing,
     /// `shutdown(SHUT_RDWR)`, before Linux 6.13. Requests on any connection
     /// can hold the socket open after the `Close`; the shutdown queues the
     /// FIN regardless, and ends this connection's own requests. It runs on
     /// the bounded io-wq pool (#581, #586).
     Shutdown,
-    /// Cancel every request on the connection's fixed file, from Linux 6.13.
-    /// Only this connection's requests hold the socket open, so the `Close`
-    /// sends the FIN once they have ended, or an RST if received data is
-    /// unread. The cancel runs inline (#586).
+    /// Cancel every request on the connection's fixed file. Used for every
+    /// close from Linux 6.13: from 6.13 only this connection's requests hold
+    /// the socket open, so the `Close` sends the FIN once they have ended, or
+    /// an RST if received data is unread. Also used at worker exit on every
+    /// kernel (`Driver::run_shutdown`). The cancel runs inline (#586).
     CancelAll,
 }
 
