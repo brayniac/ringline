@@ -153,6 +153,35 @@ fn probe(addr: &str, want: usize) -> String {
     )
 }
 
+/// What the server did for the client on `port`, whether it still serves a
+/// new connection, and the runtime's process-wide counters, for a failed
+/// read (#513, #598).
+///
+/// An empty server trace means the handler never ran for this connection,
+/// so the runtime closed it at accept (a full connection table, a failed
+/// registration, or a receive that could not be armed). The counters are
+/// shared by every test in the process, so they are context, not proof.
+fn failure_report(
+    addr: &str,
+    port: u16,
+    t0: Instant,
+    want: usize,
+    failed_at: Option<Duration>,
+) -> String {
+    use ringline::metrics::{CONNECTIONS, RING, conn, ring};
+    format!(
+        "server side (client port {port}):\n{}\n{}\nprocess counters: accepted {}, closed \
+         {}, SQE submit failures {}, recv arm failures {}, close submit failures {}",
+        trace_for(port, t0, failed_at),
+        probe(addr, want),
+        CONNECTIONS.value(conn::ACCEPTED).unwrap_or(0),
+        CONNECTIONS.value(conn::CLOSED).unwrap_or(0),
+        RING.value(ring::SQE_SUBMIT_FAILURES).unwrap_or(0),
+        RING.value(ring::RECV_ARM_FAILURES).unwrap_or(0),
+        RING.value(ring::CLOSE_SUBMIT_FAILURES).unwrap_or(0),
+    )
+}
+
 // ── Handler ─────────────────────────────────────────────────────────
 
 /// On the first recv (trigger), sends copy(PREFIX) + guard(value of VLEN
@@ -329,23 +358,32 @@ fn run_case_with<H: AsyncEventHandler + 'static, const VLEN: usize>(config: Conf
                 let timed_out_at = t0.elapsed();
                 // Steps that land in this second show a late handler.
                 std::thread::sleep(Duration::from_secs(1));
-                let probe = probe(&addr, want);
                 panic!(
-                    "read timed out at +{:.1}ms with {total}/{want} bytes; server side \
-                     (client port {port}):\n{}\n{probe}",
+                    "read timed out at +{:.1}ms with {total}/{want} bytes; {}",
                     timed_out_at.as_secs_f64() * 1000.0,
-                    trace_for(port, t0, Some(timed_out_at))
+                    failure_report(&addr, port, t0, want, Some(timed_out_at))
                 )
             }
-            Err(e) => panic!("read error: {e}"),
+            Err(e) => {
+                let failed_at = t0.elapsed();
+                std::thread::sleep(Duration::from_millis(200));
+                panic!(
+                    "read error at +{:.1}ms with {total}/{want} bytes: {e}; {}",
+                    failed_at.as_secs_f64() * 1000.0,
+                    failure_report(&addr, port, t0, want, Some(failed_at))
+                )
+            }
         }
     }
-    assert_eq!(
-        total,
-        want,
-        "received {total} bytes; server side (client port {port}):\n{}",
-        trace_for(port, t0, None)
-    );
+    if total != want {
+        let ended_at = t0.elapsed();
+        std::thread::sleep(Duration::from_millis(200));
+        panic!(
+            "the server closed the connection at +{:.1}ms after {total}/{want} bytes; {}",
+            ended_at.as_secs_f64() * 1000.0,
+            failure_report(&addr, port, t0, want, Some(ended_at))
+        );
+    }
     assert!(
         !buf.starts_with(b"ERR:"),
         "server-side send_parts failed: {}",
