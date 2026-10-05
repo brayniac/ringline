@@ -235,9 +235,19 @@ fn spawn_blocking_non_copy_type() {
 // ── A dropped handle releases the result ────────────────────────────
 
 static RESULTS_DROPPED: AtomicUsize = AtomicUsize::new(0);
-/// Set by the handler once the `timeout` around the blocking handle has
-/// dropped it.
+/// Set once the handler's future, and with it the blocking handle, has moved
+/// past the `timeout` or been dropped.
 static HANDLE_DROPPED: AtomicBool = AtomicBool::new(false);
+
+/// Sets `HANDLE_DROPPED` when dropped. Declared before the handle, so it drops
+/// after it on every path, including a future dropped at shutdown.
+struct MarkHandleDropped;
+
+impl Drop for MarkHandleDropped {
+    fn drop(&mut self) {
+        HANDLE_DROPPED.store(true, Ordering::Release);
+    }
+}
 
 /// A closure result that counts its own drop.
 struct CountedResult;
@@ -256,6 +266,7 @@ struct DropsHandleEarly;
 impl AsyncEventHandler for DropsHandleEarly {
     fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
         Some(Box::pin(async {
+            let mark = MarkHandleDropped;
             let handle = ringline::spawn_blocking(|| {
                 let deadline = Instant::now() + Duration::from_secs(60);
                 while !HANDLE_DROPPED.load(Ordering::Acquire) && Instant::now() < deadline {
@@ -268,7 +279,7 @@ impl AsyncEventHandler for DropsHandleEarly {
                 .await
                 .is_err();
             // The handle went with the `timeout` future.
-            HANDLE_DROPPED.store(true, Ordering::Release);
+            drop(mark);
             assert!(timed_out, "the closure finished before the timeout");
         }))
     }

@@ -55,30 +55,32 @@ fn wait_until(flag: &AtomicBool, limit: Duration) {
     }
 }
 
-/// The process's open sockets.
-fn socket_count() -> usize {
+/// The process's open sockets, by inode (`socket:[N]` link targets): fd
+/// numbers are reused, inodes are not.
+fn sockets() -> HashSet<String> {
     std::fs::read_dir("/proc/self/fd")
         .expect("read /proc/self/fd")
         .filter_map(|e| std::fs::read_link(e.ok()?.path()).ok())
-        .filter(|t| t.to_string_lossy().starts_with("socket:"))
-        .count()
+        .map(|t| t.to_string_lossy().into_owned())
+        .filter(|t| t.starts_with("socket:"))
+        .collect()
 }
 
-/// Waits up to 5 s until this process holds `n` more sockets than
-/// `sockets_before`. A connection made from this process adds its client
-/// socket, and its accepted socket while that sits in a worker's accept
-/// queue. (A worker that takes it keeps it as an fd on mio; on io_uring it
-/// moves it into the ring's fixed-file table and closes the fd.)
-fn wait_for_sockets(sockets_before: usize, n: usize) {
-    let want = sockets_before + n;
+/// Waits up to 5 s until the process holds `n` sockets that are not in
+/// `before`. A connection made from this process adds its client socket, and
+/// its accepted socket while that sits in a worker's accept queue. Counting
+/// new sockets rather than a total keeps an unrelated socket closing
+/// meanwhile, such as an earlier test's listener, from hiding them.
+fn wait_for_sockets(before: &HashSet<String>, n: usize) {
+    let new = || sockets().difference(before).count();
     let deadline = Instant::now() + Duration::from_secs(5);
-    while socket_count() < want && Instant::now() < deadline {
+    while new() < n && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(1));
     }
     assert!(
-        socket_count() >= want,
-        "the connections were not all accepted: {} sockets, want {want}",
-        socket_count()
+        new() >= n,
+        "the connections were not all accepted: {} new sockets, want {n}",
+        new()
     );
 }
 
@@ -201,13 +203,13 @@ fn queued_connections_are_closed_at_shutdown() {
 
     // The kernel completes the handshakes and the acceptor queues each
     // connection for the blocked worker.
-    let sockets_before = socket_count();
+    let sockets_before = sockets();
     let clients: Vec<TcpStream> = (0..CLIENTS)
         .map(|_| TcpStream::connect(addr).expect("connect"))
         .collect();
     // Each client socket, and each accepted socket in the blocked worker's
     // queue.
-    wait_for_sockets(sockets_before, 2 * CLIENTS);
+    wait_for_sockets(&sockets_before, 2 * CLIENTS);
     drop(clients);
 
     runtime.shutdown();
@@ -228,8 +230,8 @@ static NOTIFY_BLOCKED: AtomicBool = AtomicBool::new(false);
 static NOTIFY_RELEASED: AtomicBool = AtomicBool::new(false);
 
 /// Blocks the worker in `on_notify` once armed, until `NOTIFY_RELEASED`. On
-/// io_uring `on_notify` runs
-/// after the accept drain and before the eventfd read is re-armed, so
+/// io_uring `on_notify` runs after the accept drain and before the eventfd
+/// read is re-armed, so
 /// connections queued meanwhile are never drained.
 #[cfg(has_io_uring)]
 struct NotifyBlocker;
@@ -280,13 +282,13 @@ fn connections_queued_after_the_last_drain_are_closed() {
         "worker never ran on_notify"
     );
 
-    let sockets_before = socket_count();
+    let sockets_before = sockets();
     let clients: Vec<TcpStream> = (0..CLIENTS)
         .map(|_| TcpStream::connect(addr).expect("connect"))
         .collect();
     // Each client socket, and each accepted socket in the blocked worker's
     // queue.
-    wait_for_sockets(sockets_before, 2 * CLIENTS);
+    wait_for_sockets(&sockets_before, 2 * CLIENTS);
     runtime.shutdown();
     NOTIFY_RELEASED.store(true, Ordering::Release);
     for h in handles {
@@ -371,9 +373,9 @@ fn a_worker_that_exits_closes_its_queued_connections() {
         "worker 0 never started"
     );
 
-    // Round robin: half go to the blocked worker 0, half to worker 1. Worker
-    // 0 exits only once all of them are queued.
-    let sockets_before = socket_count();
+    // Round robin: half go to the blocked worker 0, half to worker 1, one at a
+    // time starting with worker 0, so once worker 1 has served its half every
+    // one of worker 0's is queued. Worker 0 exits only after that.
     let clients: Vec<TcpStream> = (0..CLIENTS)
         .map(|_| TcpStream::connect(addr).expect("connect"))
         .collect();
@@ -386,13 +388,6 @@ fn a_worker_that_exits_closes_its_queued_connections() {
         CLIENTS / 2,
         "worker 1 did not serve its half"
     );
-    // Each client socket, worker 0's queued half, and on mio worker 1's
-    // served half, which it keeps as fds.
-    #[cfg(has_io_uring)]
-    let accepted_fds = CLIENTS / 2;
-    #[cfg(not(has_io_uring))]
-    let accepted_fds = CLIENTS;
-    wait_for_sockets(sockets_before, CLIENTS + accepted_fds);
     EXITING_WORKER_RELEASED.store(true, Ordering::Release);
     handles
         .remove(0)
@@ -422,6 +417,8 @@ fn a_worker_that_exits_closes_its_queued_connections() {
     for h in handles {
         h.join().expect("worker panicked").expect("worker error");
     }
+    drop(runtime);
+    wait_for_acceptor_exit();
     assert_eq!(
         closed_count,
         CLIENTS / 2,

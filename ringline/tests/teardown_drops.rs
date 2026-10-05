@@ -287,8 +287,9 @@ impl Drop for CountedResult {
     }
 }
 
-/// Each connection's task starts a closure that finishes only after the task
-/// has been dropped, and holds its handle without polling it again. The
+/// The connection's task starts a closure that finishes only after a
+/// `BlockingInConnection` task has been dropped (the test opens one
+/// connection), and holds its handle without polling it again. The
 /// closure gives up waiting after 60 s, so a failed test does not leave the
 /// pool thread blocked.
 struct BlockingInConnection;
