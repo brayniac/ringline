@@ -75,7 +75,68 @@ the top of a profile on >=6.15 kernels with capable NICs. Not this phase.
 Prereq checklist for revisiting: kernel >= 6.15 on the rig, NIC with HDS
 (mlx5/bnxt/ice), a profile showing accumulator append >= ~5% of worker CPU.
 
-## 4. Admission and parking
+## 4. Waiting for room after `EAGAIN`
+
+io_uring adds `POLLRDHUP` to every poll's event mask. Once a TCP peer has
+half-closed (sent its FIN), a `PollAdd(POLLOUT)` on the socket completes at
+once with `POLLRDHUP` even while the send buffer is full. Measured on a socket
+with a full send buffer, before and after the peer's `shutdown(SHUT_WR)`, on
+Linux 6.12 (arm64 and x86_64) and 7.1 (x86_64):
+
+| op | no FIN | after FIN |
+|---|---|---|
+| `Send` + `MSG_WAITALL` | waits | waits |
+| `SendMsg` + `MSG_WAITALL` | waits | `-EAGAIN` |
+| `SendMsgZc` | waits | `-EAGAIN` |
+| `Writev` | waits | `-EAGAIN` |
+| `PollAdd(POLLOUT)` | waits | completes with `POLLRDHUP` |
+
+So a vectored send (`sendmsg`, `SendMsgZc`, `writev`) that returns `-EAGAIN`
+is not retried behind a `POLLOUT` poll: that loop never waits and spins the
+worker's event loop (#603). The handler instead submits a plain `send` of the
+entry's first non-empty unsent iovec, under a `*Drain` tag
+(`SendMsgCoalescedDrain`, `SendRecvBufsCoalescedDrain`, `SendMsgZcDrain`,
+`ForwardWriteDrain`). Its result is a partial write of the same entry, so the
+drain tag's completion goes through the entry's own handler, which advances
+the iovecs and resubmits the rest with the entry's own operation. The entry
+stays the one operation in flight on the connection, so byte order holds. A
+zero-copy entry's drain is a copying `send` and posts no notification.
+Zero-copy sends inside a `send_chain` are linked SQEs and are not drained: an
+`-EAGAIN` there fails the chain.
+
+A `send` waits in this state by running on an io-wq worker thread from the
+**unbound** pool, which `ConfigBuilder::iowq_max_workers` does not cap: one
+thread for each connection whose send is waiting for room on a half-closed
+socket. Without a FIN the kernel waits with an internal poll and no thread.
+(Measured on Linux 6.12 arm64: 16 waiting sends held 16 `iou-wrk` threads
+after the peers' FINs, and none without them.)
+Waiting through an epoll fd instead would need an ordinary fd per connection;
+#605 tracks that.
+
+Plain `Send` paths (single-buffer copy sends, TLS) keep their `POLLOUT`
+fallback (`SendPollOut`): a `send` with `MSG_WAITALL` does not return
+`-EAGAIN` in this state, so the fallback is not reached.
+
+### At worker shutdown
+
+`run_shutdown` closes every connection with the `CancelAll` lead, on every
+kernel, so a send waiting for room on a connection is cancelled, and a
+coalesced or recv-forward send's slab entry is released on its completion. A
+forward write's operation is on its sink's file, which that lead does not
+reach, so it is cancelled by its user_data. Entries parked on a retry list,
+with no operation in flight, are released first. It then waits, for at most
+100 × 100 ms, until every connection's `Close` has completed, every send-slab
+entry is released, and every forward write has completed. A zero-copy entry is
+released only once its notifications land, and the kernel posts them when the
+peer has acknowledged the data and the kernel has freed it. A peer that does
+not read keeps that data queued after the close, so such an entry holds the
+worker for the whole bound, after which the guards are dropped with the
+driver. #607 proposes replacing that wait with an abortive close
+(`SO_LINGER {on, 0}`), which discards the queued data so the notifications land
+at once; it needs io_uring's setsockopt command (Linux 6.7), so it waits on the
+6.8 minimum proposed in #605.
+
+## 5. Admission and parking
 
 Copied sends are admitted transactionally. On io_uring `DriverCtx::send`
 reserves every send-pool slot the buffer needs (`SendCopyPool::reserve_slots`

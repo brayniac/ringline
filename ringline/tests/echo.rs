@@ -7153,10 +7153,10 @@ fn response_after_peer_fin_is_delivered() {
 }
 
 /// Counts `on_tick` calls, i.e. event-loop iterations, while a response
-/// drains to a peer that half-closed and is slow to read. A loop that
-/// re-reports the peer's EOF every iteration spins at hundreds of
-/// thousands of iterations per second; a healthy loop blocks in poll and
-/// ticks at most every few milliseconds.
+/// drains to a peer that half-closed and is slow to read. A loop that wakes
+/// for the peer's EOF every iteration spins at tens to hundreds of thousands
+/// of iterations per second; a healthy loop blocks until the socket has room
+/// and ticks at its idle rate.
 static DRAIN_TICKS: AtomicU32 = AtomicU32::new(0);
 
 struct RespondAfterEofCountingTicks;
@@ -7201,10 +7201,10 @@ fn deferred_close_does_not_spin_on_half_closed_peer() {
         .unwrap();
 
     // Baseline: the loop's own cadence with this connection open and idle.
-    // It is backend- and host-dependent (mio blocks in poll with a 10 ms cap:
-    // tens of ticks; io_uring arms a tick timeout and ran ~5,300 ticks per
-    // 500 ms on the validation host), so the spin check below is relative to
-    // it rather than a fixed number.
+    // It is backend- and host-dependent (mio blocks in poll with a 10 ms cap,
+    // about 45 ticks per 500 ms; io_uring's tick timeout gave about 380 on a
+    // Linux 6.12 arm64 host), so the spin check below is relative to it
+    // rather than a fixed number.
     std::thread::sleep(Duration::from_millis(100));
     let base_before = DRAIN_TICKS.load(Ordering::Relaxed);
     std::thread::sleep(Duration::from_millis(500));
@@ -7230,15 +7230,15 @@ fn deferred_close_does_not_spin_on_half_closed_peer() {
     for handle in handles {
         handle.join().unwrap().unwrap();
     }
-    // A spinning loop re-reports the peer's EOF every iteration and did
-    // ~270k ticks in 500 ms when this bug was live — over 500x the idle
-    // cadence. A healthy loop with sends outstanding runs faster than idle
-    // but nowhere near that: io_uring's send-completion and flush-deadline
-    // traffic put it at ~11x idle on the validation host (473 idle vs 5,317
-    // retained per 500 ms), mio stays at its 10 ms poll cap. Fifty times
-    // idle separates the two by an order of magnitude either way; the floor
-    // keeps a near-zero baseline from making the bound too tight.
-    let bound = baseline.max(200) * 50;
+    // With the response stalled behind a peer that does not read, nothing
+    // completes until the peer reads, so a healthy loop ticks at its idle
+    // rate on both backends. Two spins have been seen here: mio re-reporting
+    // the peer's EOF (about 270k ticks per 500 ms), and io_uring retrying a
+    // `sendmsg` behind a `POLLOUT` poll that completes at once on `POLLRDHUP`
+    // (about 13,000 against an idle 390, #603). Four times idle leaves room
+    // for scheduling noise and catches both; the floor keeps a near-zero
+    // baseline from making the bound too tight.
+    let bound = baseline.max(200) * 4;
     assert!(
         ticks < bound,
         "event loop spun while a close was deferred: {ticks} ticks in 500 ms \

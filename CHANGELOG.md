@@ -66,6 +66,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- The per-operation completion counters (`op` label) for io_uring rename
+  `send_msg_coalesced_poll_out`, `send_recv_bufs_coalesced_poll_out` and
+  `forward_write_poll_out` to `send_msg_coalesced_drain`,
+  `send_recv_bufs_coalesced_drain` and `forward_write_drain`, and add
+  `send_msg_zc_drain`. Those operations are now plain sends, not `POLLOUT`
+  polls (#603).
+
 - **Breaking (`ringline-quic`):** the `QuicEndpoint` methods that read the
   clock now take `now: Instant` as their first argument, as `flush`,
   `handle_datagram` and `drive_timers` already did: `stream_recv`,
@@ -283,6 +290,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   removed in the next breaking release (#579).
 
 ### Fixed
+
+- On io_uring, a send that filled the socket of a peer that had half-closed
+  (sent its FIN) and was not reading made the worker's event loop spin until
+  the peer read or the connection closed, slowing every connection on that
+  worker: about 26,000 iterations a second on a Linux 6.12 host. Once the
+  peer has half-closed, the kernel returns `EAGAIN` from `sendmsg` and
+  completes a `POLLOUT` poll at once with `POLLRDHUP` (6.12 and 7.1), so the
+  loop's `sendmsg`, poll, `sendmsg` retry never waited. Coalesced copy
+  sends, `run_direct_echo`, and `forward_to` / `forward_to_conn` socket and
+  connection sinks now answer `EAGAIN` with a plain `send` of the first
+  unsent bytes, which waits for room, and then resubmit the rest. A guard
+  send (`SendMsgZc`) outside `send_chain` failed with `WouldBlock` in the
+  same state; it now waits and delivers as well. While a send waits on a
+  half-closed socket it holds an io-wq kernel thread, as plain copy and TLS
+  sends already did; #605 tracks waiting without one (#603).
+
+- On io_uring, a worker that shut down while a coalesced copy send or a
+  recv-forward send was waiting for room took 10 s to exit: the shutdown
+  closed connections without cancelling their requests, and released only
+  zero-copy send entries. It now cancels each connection's requests ahead of
+  its close and releases those entries, so the worker exits within
+  milliseconds instead of after 10 s. A zero-copy send queued to a peer that
+  does not read still holds shutdown until the 10 s shutdown bound, because
+  its guards stay in use until the kernel's notification (#607).
 
 - On Linux 6.13 and later, an io_uring connection close cancels the
   connection's requests ahead of its `Close` instead of sending a

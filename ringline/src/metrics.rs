@@ -263,7 +263,7 @@ pub mod cqe_tag {
     /// discriminant. `count_covers_every_tag` in the tests below fails if a new
     /// tag is added above this, which is the case that would otherwise drop
     /// completions silently.
-    pub const COUNT: usize = 35;
+    pub const COUNT: usize = 36;
 }
 
 /// Counter slot indices for pool exhaustion metrics.
@@ -271,11 +271,11 @@ pub mod pool {
     pub const SEND_EXHAUSTED: usize = 0;
     pub const TIMER_EXHAUSTED: usize = 1;
     pub const BUFFER_RING_EMPTY: usize = 2;
-    /// A TCP send returned `-EAGAIN` from the kernel — the send buffer
-    /// was full and ringline armed a `POLLOUT` retry. High counts mean
-    /// the peer is consuming bytes more slowly than the producer
-    /// generates them; tune `tcp_*_buffer_size` or apply
-    /// application-level backpressure.
+    /// A TCP send returned `-EAGAIN` from the kernel: the send buffer was
+    /// full and ringline waits for room before sending the rest. High counts
+    /// mean the peer is consuming bytes more slowly than the producer
+    /// generates them; tune `tcp_*_buffer_size` or apply application-level
+    /// backpressure.
     pub const SEND_EAGAIN: usize = 3;
     /// A connection's multishot recv completed with `ENOBUFS` and the
     /// connection was parked until provided-ring buffers are returned
