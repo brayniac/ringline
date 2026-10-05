@@ -65,17 +65,32 @@ impl SendGuard for VecGuard {
     }
 }
 
-// ── Server-side trace, for a client timeout (#513) ──────────────────
+// ── Server-side trace, for a failed client read (#513, #598) ────────
 
 /// Handler steps as (client port, time, event), shared by every test in this
 /// binary (#513).
 ///
 /// Each handler records its steps under the client's ephemeral port. When the
-/// client's read times out or ends short, it prints the steps recorded under
+/// client's read fails, times out or ends short, it prints the steps recorded under
 /// its own local port. The tests run in parallel and share this list; the port
 /// separates their connections only while no two connections in the process
 /// use the same port, which is likely but not guaranteed.
 static TRACE: Mutex<Vec<(u16, Instant, String)>> = Mutex::new(Vec::new());
+
+/// Records the end of a handler's future, including a drop at teardown that
+/// no step inside the handler would record.
+struct EndTrace(u16);
+
+impl Drop for EndTrace {
+    fn drop(&mut self) {
+        let event = if std::thread::panicking() {
+            "handler panicked"
+        } else {
+            "handler ended"
+        };
+        trace(self.0, event);
+    }
+}
 
 /// The client's ephemeral port, read once when the handler starts. `0` if the
 /// connection has no TCP peer address.
@@ -96,17 +111,17 @@ fn trace(port: u16, event: impl Into<String>) {
 
 /// The server-side steps for the client on `port` since `t0`, one per line.
 ///
-/// With `timed_out_at`, steps recorded after that offset are marked, so a
+/// With `failed_at`, steps recorded after that offset are marked, so a
 /// handler that ran late is distinguishable from one that never ran.
-fn trace_for(port: u16, t0: Instant, timed_out_at: Option<Duration>) -> String {
+fn trace_for(port: u16, t0: Instant, failed_at: Option<Duration>) -> String {
     let trace = TRACE.lock().unwrap_or_else(|e| e.into_inner());
     let steps: Vec<String> = trace
         .iter()
         .filter(|(p, at, _)| *p == port && *at >= t0)
         .map(|(_, at, ev)| {
             let offset = at.duration_since(t0);
-            let late = match timed_out_at {
-                Some(limit) if offset > limit => " (after the timeout)",
+            let late = match failed_at {
+                Some(limit) if offset > limit => " (after the failure)",
                 _ => "",
             };
             format!("  +{:.1}ms {ev}{late}", offset.as_secs_f64() * 1000.0)
@@ -138,18 +153,69 @@ fn probe(addr: &str, want: usize) -> String {
     let _ = stream.write_all(b"go");
     let mut buf = vec![0u8; want];
     let mut total = 0;
+    let mut end = "complete".to_string();
     while total < want {
         match stream.read(&mut buf[total..]) {
-            Ok(0) => break,
+            Ok(0) => {
+                end = "EOF".into();
+                break;
+            }
             Ok(n) => total += n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(_) => break,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                end = "timed out (2 s)".into();
+                break;
+            }
+            Err(e) => {
+                end = e.to_string();
+                break;
+            }
         }
     }
     format!(
-        "probe (client port {port}): received {total}/{want} bytes in {:.1}ms\n{}",
+        "probe (client port {port}): received {total}/{want} bytes, {end}, in {:.1}ms\n{}",
         t0.elapsed().as_secs_f64() * 1000.0,
         trace_for(port, t0, None)
+    )
+}
+
+/// What the server did for the client on `port`, whether it still serves a
+/// new connection, and the runtime's process-wide counters, for a failed
+/// read (#513, #598).
+///
+/// An empty server trace means the handler had not run for this connection
+/// when the report was taken. Either the connection was dropped at accept,
+/// which the "dropped at accept" counters below name, or the handler is late. A
+/// receive that could not be armed still runs the handler, which records
+/// `trigger with_data -> 0 bytes`. The counters are shared by every test in
+/// the process and are read before the probe connects; they are context, not
+/// proof. The ring counters count only on io_uring.
+fn failure_report(
+    addr: &str,
+    port: u16,
+    t0: Instant,
+    want: usize,
+    failed_at: Option<Duration>,
+) -> String {
+    use ringline::metrics::{CONNECTIONS, POOL, RING, conn, pool, ring};
+    let counters = format!(
+        "process counters: accepted {}, closed {}, dropped at accept (table full {}, \
+         register failed {}, acceptor backlog {}), recv parked {}; io_uring: SQE submit \
+         failures {}, recv arm failures {}, close submit failures {}",
+        CONNECTIONS.value(conn::ACCEPTED).unwrap_or(0),
+        CONNECTIONS.value(conn::CLOSED).unwrap_or(0),
+        CONNECTIONS.value(conn::ACCEPT_TABLE_FULL).unwrap_or(0),
+        CONNECTIONS.value(conn::ACCEPT_REGISTER_FAILED).unwrap_or(0),
+        CONNECTIONS.value(conn::ACCEPT_BACKLOG_DROPPED).unwrap_or(0),
+        POOL.value(pool::RECV_PARKED).unwrap_or(0),
+        RING.value(ring::SQE_SUBMIT_FAILURES).unwrap_or(0),
+        RING.value(ring::RECV_ARM_FAILURES).unwrap_or(0),
+        RING.value(ring::CLOSE_SUBMIT_FAILURES).unwrap_or(0),
+    );
+    let server = trace_for(port, t0, failed_at);
+    format!(
+        "server side (client port {port}):\n{server}\n{}\n{counters}",
+        probe(addr, want)
     )
 }
 
@@ -165,6 +231,7 @@ impl<const VLEN: usize> AsyncEventHandler for GuardPartsSender<VLEN> {
     fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             let port = client_port(&conn);
+            let _end = EndTrace(port);
             trace(port, "accepted");
             let n = conn
                 .with_data(|data| ParseResult::Consumed(data.len()))
@@ -188,7 +255,7 @@ impl<const VLEN: usize> AsyncEventHandler for GuardPartsSender<VLEN> {
             loop {
                 let n = conn.with_data(|d| ParseResult::Consumed(d.len())).await;
                 if n == 0 {
-                    trace(port, "client closed");
+                    trace(port, "with_data -> 0 (connection ended)");
                     break;
                 }
             }
@@ -211,6 +278,7 @@ impl<const VLEN: usize> AsyncEventHandler for ChainGuardPartsSender<VLEN> {
     fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             let port = client_port(&conn);
+            let _end = EndTrace(port);
             trace(port, "accepted");
             let n = conn
                 .with_data(|data| ParseResult::Consumed(data.len()))
@@ -244,7 +312,7 @@ impl<const VLEN: usize> AsyncEventHandler for ChainGuardPartsSender<VLEN> {
             loop {
                 let n = conn.with_data(|d| ParseResult::Consumed(d.len())).await;
                 if n == 0 {
-                    trace(port, "client closed");
+                    trace(port, "with_data -> 0 (connection ended)");
                     break;
                 }
             }
@@ -329,23 +397,32 @@ fn run_case_with<H: AsyncEventHandler + 'static, const VLEN: usize>(config: Conf
                 let timed_out_at = t0.elapsed();
                 // Steps that land in this second show a late handler.
                 std::thread::sleep(Duration::from_secs(1));
-                let probe = probe(&addr, want);
                 panic!(
-                    "read timed out at +{:.1}ms with {total}/{want} bytes; server side \
-                     (client port {port}):\n{}\n{probe}",
+                    "read timed out at +{:.1}ms with {total}/{want} bytes; {}",
                     timed_out_at.as_secs_f64() * 1000.0,
-                    trace_for(port, t0, Some(timed_out_at))
+                    failure_report(&addr, port, t0, want, Some(timed_out_at))
                 )
             }
-            Err(e) => panic!("read error: {e}"),
+            Err(e) => {
+                let failed_at = t0.elapsed();
+                std::thread::sleep(Duration::from_millis(200));
+                panic!(
+                    "read error at +{:.1}ms with {total}/{want} bytes: {e}; {}",
+                    failed_at.as_secs_f64() * 1000.0,
+                    failure_report(&addr, port, t0, want, Some(failed_at))
+                )
+            }
         }
     }
-    assert_eq!(
-        total,
-        want,
-        "received {total} bytes; server side (client port {port}):\n{}",
-        trace_for(port, t0, None)
-    );
+    if total != want {
+        let ended_at = t0.elapsed();
+        std::thread::sleep(Duration::from_millis(200));
+        panic!(
+            "the server closed the connection at +{:.1}ms after {total}/{want} bytes; {}",
+            ended_at.as_secs_f64() * 1000.0,
+            failure_report(&addr, port, t0, want, Some(ended_at))
+        );
+    }
     assert!(
         !buf.starts_with(b"ERR:"),
         "server-side send_parts failed: {}",
