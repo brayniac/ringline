@@ -162,6 +162,10 @@ fn probe(addr: &str, want: usize) -> String {
             }
             Ok(n) => total += n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                end = "timed out (2 s)".into();
+                break;
+            }
             Err(e) => {
                 end = e.to_string();
                 break;

@@ -172,8 +172,9 @@ pub fn run_acceptor(config: AcceptorConfig) {
         // adjacent workers if that worker's channel is full or it has exited.
         // `try_send` lets us distinguish a full queue (skip) from a
         // disconnected channel (mark dead). Dropping the connection when every
-        // live worker is full or dead closes it, so the peer sees EOF straight
-        // away instead of the channel growing without bound.
+        // live worker is full or dead closes it, so the peer sees the close
+        // straight away (a reset, if it had already sent data) instead of the
+        // channel growing without bound.
         let primary = (conn_count / chunk_size) % num_workers;
         // SAFETY: `accept4` returned a fresh descriptor that nothing else owns.
         let mut pending = Some(AcceptedConn {
@@ -336,6 +337,74 @@ mod tests {
     /// Linux only: other platforms keep the acceptor blocked until a peer
     /// connects (#560).
     #[cfg(target_os = "linux")]
+    #[test]
+    fn a_connection_every_worker_is_too_busy_for_is_dropped_and_counted() {
+        use std::io::{Read, Write};
+        use std::sync::atomic::AtomicBool;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("listener address");
+        let sockets = crate::listener_sockets::ListenerSockets::new(vec![listener.into()]);
+        let gates = crate::listen_gate::ListenGates::new(1, 128);
+        gates.register(0, Arc::clone(&sockets)).expect("register");
+        gates.open(0).expect("open");
+
+        // The only worker's queue is already full.
+        let (tx, _rx) = crossbeam_channel::bounded::<AcceptedConn>(1);
+        let filler = std::net::UdpSocket::bind("127.0.0.1:0").expect("filler socket");
+        tx.send(AcceptedConn {
+            fd: filler.into(),
+            listener: crate::ListenerId::from_index(0),
+            peer: crate::connection::PeerAddr::Tcp(addr),
+        })
+        .expect("fill the queue");
+        let config = AcceptorConfig {
+            sockets: Arc::clone(&sockets),
+            listener: crate::ListenerId::from_index(0),
+            worker_channels: vec![tx],
+            worker_wake_handles: Vec::new(),
+            shutdown_flag: Arc::new(AtomicBool::new(false)),
+            listen_gates: Arc::clone(&gates),
+            tcp_nodelay: false,
+            conn_chunk_size: 1,
+            #[cfg(feature = "timestamps")]
+            timestamps: false,
+        };
+        let before = crate::metrics::CONNECTIONS
+            .value(crate::metrics::conn::ACCEPT_BACKLOG_DROPPED)
+            .unwrap_or(0);
+        let handle = std::thread::spawn(move || run_acceptor(config));
+
+        let mut client = std::net::TcpStream::connect(addr).expect("connect");
+        let _ = client.write_all(b"go");
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("read timeout");
+        let mut b = [0u8; 1];
+        let read = client.read(&mut b);
+        // A close, not data: EOF, or a reset since the client sent bytes.
+        assert!(
+            !matches!(read, Ok(n) if n > 0),
+            "the dropped connection was served: {read:?}"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut after = before;
+        while after <= before && std::time::Instant::now() < deadline {
+            after = crate::metrics::CONNECTIONS
+                .value(crate::metrics::conn::ACCEPT_BACKLOG_DROPPED)
+                .unwrap_or(0);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            after > before,
+            "the drop was not counted ({before} -> {after})"
+        );
+
+        gates.shutdown();
+        sockets.shut_down();
+        handle.join().expect("acceptor panicked");
+    }
+
     #[test]
     fn shutting_the_sockets_down_ends_a_blocked_acceptor() {
         use std::sync::atomic::AtomicBool;

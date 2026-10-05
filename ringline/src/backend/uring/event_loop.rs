@@ -2565,10 +2565,15 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // branch's deferred spawn still finds it.
         adopt: Option<Option<crate::park::ParkState>>,
     ) {
+        // An adopted connection already ran a handler on the worker that
+        // parked it, so a close here is not a drop at accept.
+        let fresh_accept = adopt.is_none();
         let conn_index = match self.driver.connections.allocate() {
             Some(idx) => idx,
             None => {
-                metrics::CONNECTIONS.increment(metrics::conn::ACCEPT_TABLE_FULL);
+                if fresh_accept {
+                    metrics::CONNECTIONS.increment(metrics::conn::ACCEPT_TABLE_FULL);
+                }
                 unsafe {
                     libc::close(raw_fd);
                 }
@@ -2587,7 +2592,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             .register_files_update(conn_index, &[raw_fd])
             .is_err()
         {
-            metrics::CONNECTIONS.increment(metrics::conn::ACCEPT_REGISTER_FAILED);
+            if fresh_accept {
+                metrics::CONNECTIONS.increment(metrics::conn::ACCEPT_REGISTER_FAILED);
+            }
             self.driver.connections.release(conn_index);
             unsafe {
                 libc::close(raw_fd);
@@ -11528,7 +11535,7 @@ mod tests {
         use std::os::fd::IntoRawFd;
         let mut el = make_test_loop();
         while el.driver.connections.allocate().is_some() {}
-        let (ours, _peer) = make_socketpair();
+        let (ours, peer) = make_socketpair();
         let raw = ours.into_raw_fd();
         let before = metrics::CONNECTIONS
             .value(metrics::conn::ACCEPT_TABLE_FULL)
@@ -11547,8 +11554,13 @@ mod tests {
             after > before,
             "the drop was not counted ({before} -> {after})"
         );
-        assert!(
-            unsafe { libc::fcntl(raw, libc::F_GETFD) } < 0,
+        // The peer reads EOF once the accepted end is closed. (Checking `raw`
+        // itself could see another thread's fd reuse the number.)
+        let mut peer = std::os::unix::net::UnixStream::from(peer);
+        let mut b = [0u8; 1];
+        assert_eq!(
+            std::io::Read::read(&mut peer, &mut b).expect("read peer"),
+            0,
             "the accepted fd was not closed"
         );
     }

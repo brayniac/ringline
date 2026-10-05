@@ -9,13 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- Three connection counters (`ringline/connections`, `op` label) count
-  accepted connections that were closed before reaching a handler:
+- Three connection counters (`ringline/connections`, `op` label) count three
+  ways an accepted connection can be closed before it reaches a handler:
   `accept_table_full` (the worker's connection table was full),
   `accept_register_failed` (the worker could not register the socket), and
   `accept_backlog_dropped` (the acceptor thread found every worker's accept
-  queue full). Each of these closes was silent; a client that had already
-  sent data sees a reset (#598).
+  queue full). On Linux, a client that has already sent data sees these
+  closes as a connection reset (#598).
 
 - `ConfigBuilder::iowq_max_workers` caps the threads in each worker's
   bounded io-wq pool. The kernel sizes that pool at

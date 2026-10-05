@@ -2202,6 +2202,47 @@ mod tests {
         (server.into_raw_fd(), client, peer)
     }
 
+    /// A connection accepted while the table is full is closed before it
+    /// reaches a handler, and counted (#598).
+    #[test]
+    fn an_accept_into_a_full_table_is_closed_and_counted() {
+        use std::io::Read;
+        let config = test_config();
+        let (accept_tx, accept_rx) = crossbeam_channel::unbounded();
+        let (mut event_loop, _wake) = test_loop_with_accept(&config, Some(accept_rx));
+        while event_loop.driver.connections.allocate().is_some() {}
+        let (fd, mut client, peer) = accepted_socket();
+        let before = metrics::CONNECTIONS
+            .value(metrics::conn::ACCEPT_TABLE_FULL)
+            .unwrap_or(0);
+
+        accept_tx
+            .send(crate::acceptor::AcceptedConn {
+                fd: unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) },
+                listener: crate::ListenerId::from_index(0),
+                peer: crate::connection::PeerAddr::Tcp(peer),
+            })
+            .expect("send");
+        event_loop.drain_channels();
+
+        let after = metrics::CONNECTIONS
+            .value(metrics::conn::ACCEPT_TABLE_FULL)
+            .unwrap_or(0);
+        assert!(
+            after > before,
+            "the drop was not counted ({before} -> {after})"
+        );
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("read timeout");
+        let mut b = [0u8; 1];
+        assert_eq!(
+            client.read(&mut b).expect("read"),
+            0,
+            "the accepted fd was not closed"
+        );
+    }
+
     /// The accept-time slot-reuse clear in `drain_channels` disposes of
     /// whatever the previous occupant left queued: permit back, id failed.
     ///

@@ -65,12 +65,14 @@ pub mod conn {
     pub const PARK_COMPLETED: usize = 3;
     /// Connections adopted from another worker.
     pub const ADOPTED: usize = 4;
-    /// Accepted connections closed before reaching the handler because the
+    /// Accepted connections closed before reaching a handler because the
     /// worker's connection table was full (`ConfigBuilder::max_connections`).
+    /// A connection adopted from another worker is not counted here.
     pub const ACCEPT_TABLE_FULL: usize = 5;
-    /// Accepted connections closed before reaching the handler because the
+    /// Accepted connections closed before reaching a handler because the
     /// worker could not register the socket (the io_uring fixed-file table,
-    /// or the mio poll).
+    /// or the mio poll). A connection adopted from another worker is not
+    /// counted here.
     pub const ACCEPT_REGISTER_FAILED: usize = 6;
     /// Accepted connections the acceptor thread closed because every live
     /// worker's accept queue was full (`ConfigBuilder::accept_queue_capacity`).
