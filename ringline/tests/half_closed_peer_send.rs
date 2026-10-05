@@ -6,12 +6,14 @@
 //! On io_uring a `sendmsg` to such a peer returns `-EAGAIN`, and a `POLLOUT`
 //! poll on it completes at once with `POLLRDHUP`, so a loop that retried the
 //! `sendmsg` behind a poll spun at the ring's round-trip rate (#603). Each test
-//! here drives one send path into that state, counts event-loop iterations
-//! (`on_tick`) while the peer does not read, and compares the count with the
-//! loop's idle rate. Coalesced copy sends are covered by
-//! `deferred_close_does_not_spin_on_half_closed_peer` in `echo.rs`, and the
-//! `run_direct_echo` path by `direct_echo_eagain_drains_with_a_plain_send` in
-//! the io_uring event loop's unit tests.
+//! here drives one send path into that state. The `*_waits_and_delivers`
+//! tests count event-loop iterations (`on_tick`) while the peer does not read
+//! and compare the count with the loop's idle rate; the `shutdown_*` tests
+//! check that a worker exits promptly while such a send waits. The spin check
+//! for coalesced copy sends is `deferred_close_does_not_spin_on_half_closed_peer`
+//! in `echo.rs`, and the `run_direct_echo` drain is covered by
+//! `direct_echo_eagain_drains_with_a_plain_send` in the io_uring event loop's
+//! unit tests.
 //!
 //! The tests share the tick counter, so they take a lock.
 

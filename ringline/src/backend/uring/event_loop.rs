@@ -11594,6 +11594,24 @@ mod tests {
         }
     }
 
+    /// A forward write's operation is on the sink's file, which a source
+    /// connection's `CancelAll` does not reach. Shutdown must cancel it by
+    /// user_data and wait for its completion before the driver drops the
+    /// backing the kernel may still read.
+    #[test]
+    fn shutdown_waits_for_an_in_flight_forward_write() {
+        let mut el = make_test_loop();
+        let (src, _src_gen, _sink, fut) = start_conn_forward(&mut el);
+        assert!(el.driver.forward_write[src as usize].is_some());
+
+        el.driver.run_shutdown();
+        assert!(
+            el.driver.forward_write[src as usize].is_none(),
+            "shutdown returned with a forward write still in flight"
+        );
+        drop(fut);
+    }
+
     /// A stale sink handle must not write. Slots recycle, so a forward started
     /// against a closed-and-reused sink would deliver this stream to whoever
     /// owns that slot now — silently, and to the wrong peer.

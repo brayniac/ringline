@@ -3376,13 +3376,23 @@ impl Driver {
                 // received data was unread.
                 let _ = self.ring.submit_close(i, super::ring::CloseLead::CancelAll);
             }
+            // A forward write's operation is on its sink's file, which the
+            // cancel lead above does not reach: an fd sink has its own file.
+            // Cancel it by user_data, as `close_connection` does; the loop
+            // below waits for its completion before the backing is dropped.
+            if let Some(state) = self.forward_write[i as usize].as_ref() {
+                for tag in [OpTag::ForwardWrite, OpTag::ForwardWriteDrain] {
+                    let ud = UserData::encode(tag, i, state.generation);
+                    let _ = self.ring.submit_async_cancel(ud.raw(), i);
+                }
+            }
         }
 
-        // 3. Submit + drain loop until every connection's Close has completed
-        //    and every slab entry is released, for at most 100 × 100 ms. Arm a
-        //    timeout SQE each iteration so submit_and_wait(1) never blocks
-        //    indefinitely (the tick timeout from the main loop is not armed
-        //    here).
+        // 3. Submit + drain loop until every connection's Close has
+        //    completed, every slab entry is released, and every forward write
+        //    has completed, for at most 100 × 100 ms. Arm a timeout SQE each
+        //    iteration so submit_and_wait(1) never blocks indefinitely (the
+        //    tick timeout from the main loop is not armed here).
         //
         //    A zero-copy entry is released only once its notifications land,
         //    and the kernel posts those when the peer has acknowledged the data
@@ -3391,7 +3401,10 @@ impl Driver {
         //    its whole bound; the guards are then dropped with the driver.
         let shutdown_ts = io_uring::types::Timespec::new().nsec(100_000_000); // 100ms
         for _ in 0..100 {
-            if self.connections.active_count() == 0 && !self.send_slab.has_in_flight() {
+            if self.connections.active_count() == 0
+                && !self.send_slab.has_in_flight()
+                && self.forward_write.iter().all(Option::is_none)
+            {
                 break;
             }
             let ud = UserData::encode(OpTag::TickTimeout, 0, 0);
@@ -3454,6 +3467,17 @@ impl Driver {
                     }
                     OpTag::SendRecvBufsCoalesced | OpTag::SendRecvBufsCoalescedDrain => {
                         self.release_recv_forward_at_shutdown(ud.payload() as u16);
+                    }
+                    // A forward write, or its drain: the kernel is done with
+                    // the backing, so the state (and the backing) can go.
+                    OpTag::ForwardWrite | OpTag::ForwardWriteDrain => {
+                        let conn = ud.conn_index() as usize;
+                        if self.forward_write[conn]
+                            .as_ref()
+                            .is_some_and(|st| st.generation == ud.payload())
+                        {
+                            self.forward_write[conn] = None;
+                        }
                     }
                     // A drain is a plain `send` on the same entry: its CQE
                     // carries no notification flags, so it releases like a
