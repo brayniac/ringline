@@ -1,4 +1,4 @@
-use crate::runtime::send_capacity::BoundedSendId;
+use crate::runtime::send_completion::SendId;
 
 /// A promise of `remaining` free slots made by [`SendCopyPool::reserve_slots`].
 /// Filled with [`SendCopyPool::copy_in_reserved`]; the unfilled remainder must
@@ -68,8 +68,8 @@ pub struct SendCopyPool {
     // slot carries, and the logical (plaintext) length that operation reports
     // on success. Parallel to `slot_end_of_send` and set only on the slot that
     // is marked end-of-send, so at most one entry exists per logical send.
-    // `None` on every freshly allocated slot; see `set_bounded_send`.
-    slot_bounded_send: Vec<Option<(BoundedSendId, u32)>>,
+    // `None` on every freshly allocated slot; see `set_send_id`.
+    slot_send_id: Vec<Option<(SendId, u32)>>,
     // Free-list slots promised to outstanding `SlotReservation`s but not yet
     // popped. Every allocator subtracts this from `free_list.len()` before
     // taking a slot, so a reservation is honoured even if another allocation
@@ -93,7 +93,7 @@ impl SendCopyPool {
             slot_remaining: vec![0u32; n],
             in_use: vec![false; n],
             slot_end_of_send: vec![true; n],
-            slot_bounded_send: vec![None; n],
+            slot_send_id: vec![None; n],
             reserved: 0,
         }
     }
@@ -128,7 +128,7 @@ impl SendCopyPool {
         self.slot_remaining[idx as usize] = data.len() as u32;
         self.in_use[idx as usize] = true;
         self.slot_end_of_send[idx as usize] = true;
-        self.slot_bounded_send[idx as usize] = None;
+        self.slot_send_id[idx as usize] = None;
         (idx, ptr, data.len() as u32)
     }
 
@@ -168,7 +168,7 @@ impl SendCopyPool {
         self.slot_remaining[idx as usize] = total_len as u32;
         self.in_use[idx as usize] = true;
         self.slot_end_of_send[idx as usize] = true;
-        self.slot_bounded_send[idx as usize] = None;
+        self.slot_send_id[idx as usize] = None;
         Some((idx, out_ptr, total_len as u32))
     }
 
@@ -185,7 +185,7 @@ impl SendCopyPool {
         self.slot_remaining[idx as usize] = 0;
         self.in_use[idx as usize] = true;
         self.slot_end_of_send[idx as usize] = true;
-        self.slot_bounded_send[idx as usize] = None;
+        self.slot_send_id[idx as usize] = None;
         let ptr = self.backing.as_mut_ptr().wrapping_add(offset);
         Some((idx, ptr, self.slot_size))
     }
@@ -295,7 +295,7 @@ impl SendCopyPool {
     ///
     /// A slot must not still carry a bounded send when it is released: every
     /// disposal path has to take the id with
-    /// [`take_bounded_send`](Self::take_bounded_send) and settle the operation
+    /// [`take_send_id`](Self::take_send_id) and settle the operation
     /// first, or the caller's `send_backpressured` future never resolves. The
     /// `debug_assert` below is that audit's tripwire (it is what makes
     /// "delete a settle site and watch a test fail" work), and it sits
@@ -310,7 +310,7 @@ impl SendCopyPool {
     /// recycled slot that still names a dead operation.
     pub fn release(&mut self, idx: u16) {
         debug_assert!((idx as usize) < self.count as usize);
-        let carried = self.slot_bounded_send[idx as usize].take();
+        let carried = self.slot_send_id[idx as usize].take();
         debug_assert!(
             carried.is_none(),
             "slot {idx} released while still carrying bounded send {carried:?}; \
@@ -397,8 +397,8 @@ impl SendCopyPool {
     /// completion handlers and the teardown paths, and ultimately by PR 9's
     /// `send_backpressured` future, which is what the settled result
     /// resolves.
-    pub fn set_bounded_send(&mut self, slot: u16, id: BoundedSendId, logical_len: u32) {
-        self.slot_bounded_send[slot as usize] = Some((id, logical_len));
+    pub fn set_send_id(&mut self, slot: u16, id: SendId, logical_len: u32) {
+        self.slot_send_id[slot as usize] = Some((id, logical_len));
     }
 
     /// Take the bounded send attached to this slot, if any, leaving `None`.
@@ -414,8 +414,8 @@ impl SendCopyPool {
     /// `Driver::submit_next_queued_inner` when it lifts the id onto a
     /// coalesced slab entry; PR 9's `send_backpressured` future is the
     /// ultimate consumer of the result.
-    pub fn take_bounded_send(&mut self, slot: u16) -> Option<(BoundedSendId, u32)> {
-        self.slot_bounded_send[slot as usize].take()
+    pub fn take_send_id(&mut self, slot: u16) -> Option<(SendId, u32)> {
+        self.slot_send_id[slot as usize].take()
     }
 
     /// Bytes per slot.
@@ -438,12 +438,12 @@ impl SendCopyPool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::send_capacity::SendCapacityQueue;
+    use crate::runtime::send_completion::SendCompletions;
 
-    /// `BoundedSendId` has no public constructor — the admission queue is the
+    /// `SendId` has no public constructor — the admission queue is the
     /// only source of ids, which is exactly how the driver gets one too.
-    fn an_id() -> BoundedSendId {
-        SendCapacityQueue::new().enqueue(0, 1, 1, 0)
+    fn an_id() -> SendId {
+        SendCompletions::new().enqueue(0, 1, 1, 0)
     }
 
     #[test]
@@ -776,21 +776,21 @@ mod tests {
         let (idx, _ptr, _len) = pool.copy_in(b"payload").unwrap();
 
         // Freshly allocated slots carry nothing.
-        assert_eq!(pool.take_bounded_send(idx), None);
+        assert_eq!(pool.take_send_id(idx), None);
 
         // The logical length is the caller's, not the slot's byte count —
         // under TLS they differ, which is the whole reason it is carried.
-        pool.set_bounded_send(idx, id, 4096);
-        assert_eq!(pool.take_bounded_send(idx), Some((id, 4096)));
+        pool.set_send_id(idx, id, 4096);
+        assert_eq!(pool.take_send_id(idx), Some((id, 4096)));
         // Taking settles the operation, so a second take must find nothing.
-        assert_eq!(pool.take_bounded_send(idx), None);
+        assert_eq!(pool.take_send_id(idx), None);
 
         // The id is per-slot: attaching to one leaves its neighbour alone.
         let (other, _p, _l) = pool.copy_in(b"other").unwrap();
         assert_ne!(other, idx);
-        pool.set_bounded_send(idx, id, 7);
-        assert_eq!(pool.take_bounded_send(other), None);
-        assert_eq!(pool.take_bounded_send(idx), Some((id, 7)));
+        pool.set_send_id(idx, id, 7);
+        assert_eq!(pool.take_send_id(other), None);
+        assert_eq!(pool.take_send_id(idx), Some((id, 7)));
 
         pool.release(idx);
         pool.release(other);
@@ -801,31 +801,31 @@ mod tests {
         let mut pool = SendCopyPool::new(4, 32);
 
         let (a, _p, _l) = pool.copy_in(b"a").unwrap();
-        assert_eq!(pool.take_bounded_send(a), None);
+        assert_eq!(pool.take_send_id(a), None);
 
         let data = b"gather";
         let parts: &[(*const u8, usize)] = &[(data.as_ptr(), data.len())];
         let (b, _p, _l) = unsafe { pool.copy_in_gather(parts, data.len()) }.unwrap();
-        assert_eq!(pool.take_bounded_send(b), None);
+        assert_eq!(pool.take_send_id(b), None);
 
         let (c, _p, _cap) = pool.alloc_raw().unwrap();
-        assert_eq!(pool.take_bounded_send(c), None);
+        assert_eq!(pool.take_send_id(c), None);
 
         let mut r = pool.reserve_slots(1).unwrap();
         let (d, _p, _l) = pool.copy_in_reserved(&mut r, b"reserved");
-        assert_eq!(pool.take_bounded_send(d), None);
+        assert_eq!(pool.take_send_id(d), None);
         pool.release_reservation(r);
 
         // A slot recycled from the free list after carrying an id comes back
         // clean: the disposal path takes the id and the allocator resets the
         // entry regardless.
         let id = an_id();
-        pool.set_bounded_send(a, id, 11);
-        assert_eq!(pool.take_bounded_send(a), Some((id, 11)));
+        pool.set_send_id(a, id, 11);
+        assert_eq!(pool.take_send_id(a), Some((id, 11)));
         pool.release(a);
         let (again, _p, _l) = pool.copy_in(b"recycled").unwrap();
         assert_eq!(again, a, "LIFO free list should hand back the same slot");
-        assert_eq!(pool.take_bounded_send(again), None);
+        assert_eq!(pool.take_send_id(again), None);
 
         for slot in [again, b, c, d] {
             pool.release(slot);
@@ -858,7 +858,7 @@ mod tests {
         let mut pool = SendCopyPool::new(1, 32);
         let id = an_id();
         let (idx, _ptr, _len) = pool.copy_in(b"unsettled").unwrap();
-        pool.set_bounded_send(idx, id, 9);
+        pool.set_send_id(idx, id, 9);
         pool.release(idx);
     }
 
@@ -871,12 +871,12 @@ mod tests {
         let mut pool = SendCopyPool::new(1, 32);
         let id = an_id();
         let (idx, _ptr, _len) = pool.copy_in(b"unsettled").unwrap();
-        pool.set_bounded_send(idx, id, 9);
+        pool.set_send_id(idx, id, 9);
         pool.release(idx);
-        assert_eq!(pool.take_bounded_send(idx), None);
+        assert_eq!(pool.take_send_id(idx), None);
         let (again, _p, _l) = pool.copy_in(b"next").unwrap();
         assert_eq!(again, idx);
-        assert_eq!(pool.take_bounded_send(again), None);
+        assert_eq!(pool.take_send_id(again), None);
     }
 }
 

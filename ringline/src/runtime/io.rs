@@ -23,7 +23,7 @@ use crate::error::TimerExhausted;
 use crate::handler::ConnToken;
 #[cfg(has_io_uring)]
 use crate::runtime::TimerSlotPool;
-use crate::runtime::send_capacity::BoundedSendId;
+use crate::runtime::send_completion::SendId;
 use crate::runtime::task::TaskId;
 use crate::runtime::waker::STANDALONE_BIT;
 use crate::runtime::{CURRENT_TASK_ID, Executor, IoResult};
@@ -5316,9 +5316,9 @@ enum BackpressuredState {
     /// is what makes construction lazy.
     Fresh,
     /// Enqueued on the worker's send-capacity FIFO, waiting for its turn.
-    Waiting(BoundedSendId),
+    Waiting(SendId),
     /// `send_bounded` has run; waiting for the backend to settle the id.
-    Submitted(BoundedSendId),
+    Submitted(SendId),
     /// Resolved (or refused). Drop has nothing to undo.
     Done,
 }
@@ -5398,8 +5398,8 @@ impl BackpressuredSendFuture<'_> {
     /// result was parked: without the `cancel` the entry would sit in the
     /// queue forever, scanned by every later operation, and if it were the
     /// head it would stall every bounded send on the worker.
-    fn abandon(&mut self, executor: &mut Executor, id: BoundedSendId) -> Poll<io::Result<u32>> {
-        executor.cancel_bounded_send(id);
+    fn abandon(&mut self, executor: &mut Executor, id: SendId) -> Poll<io::Result<u32>> {
+        executor.cancel_send(id);
         self.finish(Err(io::Error::new(
             io::ErrorKind::ConnectionAborted,
             "connection closed",
@@ -5485,10 +5485,10 @@ impl Future for BackpressuredSendFuture<'_> {
                     // into a `join!`, handed to a spawned task). The queue
                     // wakes owners by task id, and a stale owner on the head
                     // stalls the whole FIFO, not just this send.
-                    executor.set_bounded_send_owner(id, task_id);
+                    executor.set_send_owner(id, task_id);
                     // Teardown moves waiting entries to `submitted` with a
                     // result, so consult the queue before asking for a turn.
-                    if let Some(result) = executor.take_bounded_send_result(id) {
+                    if let Some(result) = executor.take_send_result(id) {
                         return this.finish(result);
                     }
                     if driver.connections.generation(this.conn_index) != this.generation {
@@ -5498,8 +5498,8 @@ impl Future for BackpressuredSendFuture<'_> {
                 }
 
                 BackpressuredState::Submitted(id) => {
-                    executor.set_bounded_send_owner(id, task_id);
-                    match executor.take_bounded_send_result(id) {
+                    executor.set_send_owner(id, task_id);
+                    match executor.take_send_result(id) {
                         Some(result) => this.finish(result),
                         // A recycled slot means teardown ran but left no
                         // result for this id — take the entry off the queue
@@ -5523,7 +5523,7 @@ impl BackpressuredSendFuture<'_> {
         &mut self,
         driver: &mut Driver,
         executor: &mut Executor,
-        id: BoundedSendId,
+        id: SendId,
     ) -> Poll<io::Result<u32>> {
         let free = driver.send_copy_pool.free_count();
         if !executor.send_capacity_turn(id, free) {
@@ -5537,7 +5537,7 @@ impl BackpressuredSendFuture<'_> {
         match submit {
             Ok(()) => {
                 // Promotes this id to `submitted` and wakes the new head.
-                executor.mark_bounded_send_submitted(id);
+                executor.mark_send_submitted(id);
                 self.state = BackpressuredState::Submitted(id);
                 // A synchronous settle (an empty message, or a mio send
                 // that needed no socket write) lands on the *driver's*
@@ -5546,7 +5546,7 @@ impl BackpressuredSendFuture<'_> {
                 // drain that queue every iteration. Kept as a cheap
                 // belt-and-braces read rather than an assumption about which
                 // side settled.
-                match executor.take_bounded_send_result(id) {
+                match executor.take_send_result(id) {
                     Some(result) => self.finish(result),
                     None => Poll::Pending,
                 }
@@ -5554,7 +5554,7 @@ impl BackpressuredSendFuture<'_> {
             Err(e) => {
                 // Nothing was queued and no completion is coming, so the id
                 // has to leave the queue or it holds the head forever.
-                executor.cancel_bounded_send(id);
+                executor.cancel_send(id);
                 self.finish(Err(e))
             }
         }
@@ -5578,7 +5578,7 @@ impl Drop for BackpressuredSendFuture<'_> {
         // Waiting: removed, and the next waiter takes the head. Submitted:
         // marked abandoned, so the completion that is still coming removes
         // it rather than parking a result nobody will take.
-        executor.cancel_bounded_send(id);
+        executor.cancel_send(id);
     }
 }
 

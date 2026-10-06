@@ -195,7 +195,7 @@ impl UdpToken {
 /// This is the single definition of that number, and it exists because two
 /// call sites need it to agree exactly:
 ///
-/// - `send_backpressured`'s future passes it to `SendCapacityQueue::enqueue`,
+/// - `send_backpressured`'s future passes it to `SendCompletions::enqueue`,
 ///   which will not release the future until the pool's free count covers it;
 /// - `DriverCtx::send_bounded` then reserves (mio) or capacity-checks
 ///   (io_uring) against it.
@@ -335,15 +335,15 @@ pub struct DriverCtx<'a> {
     pub(crate) pending_send_retries: &'a mut Vec<(u32, u32, u8)>,
     /// Worker-wide bounded-send results that no CQE will carry, keyed by
     /// the id the submitting future holds. Same queue as
-    /// `backend::uring::driver::Driver::bounded_send_completions`, drained by
-    /// the event loop into `Executor::complete_bounded_send`.
+    /// `backend::uring::driver::Driver::settled_sends`, drained by
+    /// the event loop into `Executor::complete_send`.
     ///
     /// `send_bounded` needs it for the same reason mio's `DriverCtx` has
     /// one: a `DriverCtx` is a borrow of driver fields and has no executor
     /// access, so an operation it settles synchronously has nowhere else to
     /// go.
-    pub(crate) bounded_send_completions: &'a mut std::collections::VecDeque<(
-        crate::runtime::send_capacity::BoundedSendId,
+    pub(crate) settled_sends: &'a mut std::collections::VecDeque<(
+        crate::runtime::send_completion::SendId,
         io::Result<u32>,
     )>,
     /// Mirror of `Driver::capacity_released`: set when a copy-pool slot goes
@@ -617,7 +617,7 @@ impl<'a> DriverCtx<'a> {
     ///
     /// On `Ok` exactly one completion for `id` is coming: from a send CQE,
     /// from a teardown that destroys the queued entry
-    /// (`Driver::bounded_send_completions`), or — when the message produced no
+    /// (`Driver::settled_sends`), or — when the message produced no
     /// SQE at all — from this call, synchronously. On `Err` nothing was
     /// queued and no completion for `id` will ever be produced, so the
     /// caller owns the failure.
@@ -630,7 +630,7 @@ impl<'a> DriverCtx<'a> {
         &mut self,
         conn: ConnToken,
         data: &[u8],
-        id: crate::runtime::send_capacity::BoundedSendId,
+        id: crate::runtime::send_completion::SendId,
     ) -> io::Result<()> {
         let conn_state = self
             .connections
@@ -733,12 +733,12 @@ impl<'a> DriverCtx<'a> {
                         );
                         debug_assert_ne!(last.pool_slot, u16::MAX);
                         self.send_copy_pool
-                            .set_bounded_send(last.pool_slot, id, data.len() as u32);
+                            .set_send_id(last.pool_slot, id, data.len() as u32);
                     }
                     // Empty plaintext produces no records and therefore no
                     // CQE; nothing will ever settle the id but this call.
                     None => {
-                        self.bounded_send_completions_push(id, Ok(data.len() as u32));
+                        self.settled_sends_push(id, Ok(data.len() as u32));
                         return Ok(());
                     }
                 }
@@ -778,8 +778,7 @@ impl<'a> DriverCtx<'a> {
                 // Exactly one slot per logical send carries the id, and it
                 // is the one every success path already reads
                 // (`is_end_of_send`) before releasing.
-                self.send_copy_pool
-                    .set_bounded_send(slot, id, data.len() as u32);
+                self.send_copy_pool.set_send_id(slot, id, data.len() as u32);
                 attached = true;
             }
 
@@ -810,7 +809,7 @@ impl<'a> DriverCtx<'a> {
             // `[].chunks(n)` yields nothing, so a zero-length send queues no
             // SQE and no CQE is coming. `send` silently does nothing here; a
             // bounded send must still resolve, so settle it now.
-            self.bounded_send_completions_push(id, Ok(0));
+            self.settled_sends_push(id, Ok(0));
         }
         Ok(())
     }
@@ -820,16 +819,16 @@ impl<'a> DriverCtx<'a> {
     ///
     /// `DriverCtx` is a borrow of driver fields with no executor access —
     /// the same reason mio's driver owns a completion queue — so a
-    /// synchronous settle goes onto `Driver::bounded_send_completions` for the
-    /// event loop to hand to `Executor::complete_bounded_send`. The queue
+    /// synchronous settle goes onto `Driver::settled_sends` for the
+    /// event loop to hand to `Executor::complete_send`. The queue
     /// carries successes too despite its name: what unites its entries is
     /// that no CQE is coming for them.
-    fn bounded_send_completions_push(
+    fn settled_sends_push(
         &mut self,
-        id: crate::runtime::send_capacity::BoundedSendId,
+        id: crate::runtime::send_completion::SendId,
         result: io::Result<u32>,
     ) {
-        self.bounded_send_completions.push_back((id, result));
+        self.settled_sends.push_back((id, result));
         *self.capacity_released = true;
     }
 
@@ -2656,11 +2655,11 @@ pub struct DriverCtx<'a> {
     /// Per-connection send completion queue (byte counts for awaitable sends).
     pub(crate) send_completions: &'a mut Vec<std::collections::VecDeque<u32>>,
     /// Worker-wide bounded-send results, keyed by the id the submitting
-    /// future holds (see `Driver::bounded_send_completions`). `send_bounded`
+    /// future holds (see `Driver::settled_sends`). `send_bounded`
     /// pushes here only when it completes an operation without queueing it;
     /// the normal completion comes from `Driver::flush_sends`.
-    pub(crate) bounded_send_completions: &'a mut std::collections::VecDeque<(
-        crate::runtime::send_capacity::BoundedSendId,
+    pub(crate) settled_sends: &'a mut std::collections::VecDeque<(
+        crate::runtime::send_completion::SendId,
         io::Result<u32>,
     )>,
     /// Mirror of `Driver::capacity_released`: set when a copy-pool permit
@@ -2771,7 +2770,7 @@ impl<'a> DriverCtx<'a> {
     ///
     /// Nothing is written synchronously: admission *is* the reservation.
     /// On `Ok` the operation is queued and exactly one completion for `id`
-    /// will reach `Driver::bounded_send_completions` — `Ok(len)` when its
+    /// will reach `Driver::settled_sends` — `Ok(len)` when its
     /// last byte reaches the socket (`Driver::flush_sends`), `Err` if it is
     /// discarded first (`Driver::clear_pending_sends`). On `Err` nothing was
     /// reserved or queued and no completion for `id` will ever be produced,
@@ -2783,7 +2782,7 @@ impl<'a> DriverCtx<'a> {
         &mut self,
         conn: ConnToken,
         data: &[u8],
-        id: crate::runtime::send_capacity::BoundedSendId,
+        id: crate::runtime::send_completion::SendId,
     ) -> io::Result<()> {
         let conn_state = self
             .connections
@@ -2873,8 +2872,7 @@ impl<'a> DriverCtx<'a> {
                 // Nothing to queue and therefore nothing that could ever
                 // complete the id: settle it here.
                 self.release_permit(permit);
-                self.bounded_send_completions
-                    .push_back((id, Ok(data.len() as u32)));
+                self.settled_sends.push_back((id, Ok(data.len() as u32)));
                 return Ok(());
             }
             // `.min(needed)` cannot normally bind — the tripwire above fires
@@ -2899,7 +2897,7 @@ impl<'a> DriverCtx<'a> {
             // `flush_sends`'s empty-iovec bail-out as an error. Complete it
             // here instead.
             self.release_permit(permit);
-            self.bounded_send_completions.push_back((id, Ok(0)));
+            self.settled_sends.push_back((id, Ok(0)));
             return Ok(());
         }
 
@@ -2927,7 +2925,7 @@ impl<'a> DriverCtx<'a> {
         crate::backend::mio::driver::clear_pending_sends_into(
             &mut self.pending_sends[idx],
             self.send_copy_pool,
-            self.bounded_send_completions,
+            self.settled_sends,
             self.capacity_released,
             err,
         );

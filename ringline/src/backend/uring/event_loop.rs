@@ -14,7 +14,7 @@ use crate::connection::{Lifecycle, ReadHalf, RecvArm};
 use crate::metrics;
 use crate::runtime::handler::AsyncEventHandler;
 use crate::runtime::io::{ConnCtx, DriverState, UdpCtx, set_driver_state_guarded};
-use crate::runtime::send_capacity::BoundedSendId;
+use crate::runtime::send_completion::SendId;
 use crate::runtime::waker::{STANDALONE_BIT, conn_waker, standalone_waker};
 use crate::runtime::{CURRENT_TASK_ID, Executor, TimerSlotPool};
 
@@ -607,12 +607,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // `force_finalize_close` / `reset_send_state` above — including
             // the `try_finalize_close` pass immediately preceding. Draining
             // once, here, is therefore the single point that covers all of
-            // them, and nothing waits on it: `complete_bounded_send` wakes
+            // them, and nothing waits on it: `complete_send` wakes
             // the owner straight onto `Executor::ready_queue`, which the top
             // of the next iteration collects *before* deciding whether to
             // block, so a settled send is polled without a `submit_and_wait`
             // in between.
-            self.drain_bounded_send_completions();
+            self.drain_settled_sends();
 
             // One send-capacity wake per iteration, last — same placement,
             // and for the same reason, as the mio loop (#381). Copy-pool
@@ -3026,7 +3026,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // when the connection went away. Per #381 a driver result
             // overrides that abort, which is exactly what must not happen
             // here — the result describes a dead occupant's send.
-            let _ = self.driver.send_copy_pool.take_bounded_send(pool_slot);
+            let _ = self.driver.send_copy_pool.take_send_id(pool_slot);
             self.release_pool_slot(pool_slot);
             return;
         }
@@ -3039,15 +3039,15 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // send submitted alongside it. That aliasing predates this PR and
             // is not fixed here, but the id must not be dropped on the floor:
             // take it (or `release` trips) and report this CQE's own outcome.
-            let bounded = self.driver.send_copy_pool.take_bounded_send(pool_slot);
+            let bounded = self.driver.send_copy_pool.take_send_id(pool_slot);
             self.release_pool_slot(pool_slot);
             if let Some((id, logical_len)) = bounded {
                 let settled = if result > 0 {
                     Ok(logical_len)
                 } else {
-                    Err(Self::bounded_send_error(result))
+                    Err(Self::send_error(result))
                 };
-                self.settle_bounded(id, settled);
+                self.settle_send(id, settled);
             }
             let event = self.driver.chain_table.on_operation_cqe(conn_index, result);
             if matches!(event, ChainEvent::Complete { .. }) {
@@ -3063,10 +3063,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 .try_advance(pool_slot, result as u32)
             {
                 if self.close_submitted(conn_index) {
-                    let bounded = self.driver.send_copy_pool.take_bounded_send(pool_slot);
+                    let bounded = self.driver.send_copy_pool.take_send_id(pool_slot);
                     self.release_pool_slot(pool_slot);
                     if let Some((id, _logical_len)) = bounded {
-                        self.settle_bounded(id, Err(io::Error::from_raw_os_error(libc::ECANCELED)));
+                        self.settle_send(id, Err(io::Error::from_raw_os_error(libc::ECANCELED)));
                     }
                     self.executor.wake_send(
                         conn_index,
@@ -3098,7 +3098,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // slot is about to be recycled, and `release` debug-asserts
             // rather than let a live id go with it.
             let end_of_send = self.driver.send_copy_pool.is_end_of_send(pool_slot);
-            let bounded = self.driver.send_copy_pool.take_bounded_send(pool_slot);
+            let bounded = self.driver.send_copy_pool.take_send_id(pool_slot);
             metrics::BYTES.add(metrics::bytes::SENT, total as u64);
             self.release_pool_slot(pool_slot);
 
@@ -3120,7 +3120,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // ever carries an id, but the settle sits outside that branch so
             // that a stray one still cannot be lost.
             if let Some((id, logical_len)) = bounded {
-                self.settle_bounded(id, Ok(logical_len));
+                self.settle_send(id, Ok(logical_len));
             }
 
             // Wake the send waiter once, when this logical send's final chunk
@@ -3145,10 +3145,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let errno = -result;
         if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
             if self.close_submitted(conn_index) {
-                let bounded = self.driver.send_copy_pool.take_bounded_send(pool_slot);
+                let bounded = self.driver.send_copy_pool.take_send_id(pool_slot);
                 self.release_pool_slot(pool_slot);
                 if let Some((id, _logical_len)) = bounded {
-                    self.settle_bounded(id, Err(io::Error::from_raw_os_error(libc::ECANCELED)));
+                    self.settle_send(id, Err(io::Error::from_raw_os_error(libc::ECANCELED)));
                 }
                 self.executor.wake_send(
                     conn_index,
@@ -3172,7 +3172,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             return;
         }
 
-        let bounded = self.driver.send_copy_pool.take_bounded_send(pool_slot);
+        let bounded = self.driver.send_copy_pool.take_send_id(pool_slot);
         self.release_pool_slot(pool_slot);
         self.driver.drain_conn_send_queue(conn_index);
         self.driver.note_send_finalized(conn_index);
@@ -3183,7 +3183,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             Err(io::Error::from_raw_os_error(-result))
         };
         if let Some((id, _logical_len)) = bounded {
-            self.settle_bounded(id, Err(Self::bounded_send_error(result)));
+            self.settle_send(id, Err(Self::send_error(result)));
         }
         self.executor.wake_send(conn_index, io_result);
     }
@@ -3220,7 +3220,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // and it must not be settled, because teardown already aborted
             // the dead occupant's operation and a driver result would
             // override that abort (#381).
-            let _ = self.driver.send_copy_pool.take_bounded_send(pool_slot);
+            let _ = self.driver.send_copy_pool.take_send_id(pool_slot);
             self.release_pool_slot(pool_slot);
             return;
         }
@@ -3229,12 +3229,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // the same as a generic send failure: drop everything for
         // this connection.
         if result < 0 {
-            let bounded = self.driver.send_copy_pool.take_bounded_send(pool_slot);
+            let bounded = self.driver.send_copy_pool.take_send_id(pool_slot);
             self.release_pool_slot(pool_slot);
             self.driver.drain_conn_send_queue(conn_index);
             self.driver.note_send_finalized(conn_index);
             if let Some((id, _logical_len)) = bounded {
-                self.settle_bounded(id, Err(io::Error::from_raw_os_error(-result)));
+                self.settle_send(id, Err(io::Error::from_raw_os_error(-result)));
             }
             self.executor
                 .wake_send(conn_index, Err(io::Error::from_raw_os_error(-result)));
@@ -3242,10 +3242,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
 
         if self.close_submitted(conn_index) {
-            let bounded = self.driver.send_copy_pool.take_bounded_send(pool_slot);
+            let bounded = self.driver.send_copy_pool.take_send_id(pool_slot);
             self.release_pool_slot(pool_slot);
             if let Some((id, _logical_len)) = bounded {
-                self.settle_bounded(id, Err(io::Error::from_raw_os_error(libc::ECANCELED)));
+                self.settle_send(id, Err(io::Error::from_raw_os_error(libc::ECANCELED)));
             }
             self.executor.wake_send(
                 conn_index,
@@ -3300,10 +3300,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// Every site that resolves a bounded send goes through here so that no
     /// handler open-codes the rule: an id is settled exactly once, is routed
     /// by id rather than by connection, and carries the *logical* length on
-    /// success. `Executor::complete_bounded_send` wakes the owning task and
+    /// success. `Executor::complete_send` wakes the owning task and
     /// overrides a provisional teardown `Aborted` with this result (#381).
-    fn settle_bounded(&mut self, id: BoundedSendId, result: io::Result<u32>) {
-        self.executor.complete_bounded_send(id, result);
+    fn settle_send(&mut self, id: SendId, result: io::Result<u32>) {
+        self.executor.complete_send(id, result);
     }
 
     /// The failure a bounded send reports for a terminal send CQE.
@@ -3314,7 +3314,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// look like a short write of the caller's message), so it reports
     /// `WriteZero` — the same shape mio's flush reports for a zero-length
     /// write.
-    fn bounded_send_error(result: i32) -> io::Error {
+    fn send_error(result: i32) -> io::Error {
         if result == 0 {
             io::Error::new(io::ErrorKind::WriteZero, "send made no progress")
         } else {
@@ -3354,16 +3354,16 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// of mio's `drain_send_completions`; the per-connection `SendFuture`
     /// wakes have no equivalent queue here, since an io_uring completion
     /// handler calls `wake_send` directly.
-    fn drain_bounded_send_completions(&mut self) {
-        while let Some((id, result)) = self.driver.bounded_send_completions.pop_front() {
-            self.settle_bounded(id, result);
+    fn drain_settled_sends(&mut self) {
+        while let Some((id, result)) = self.driver.settled_sends.pop_front() {
+            self.settle_send(id, result);
         }
     }
 
     /// Release the backing pool slots of a coalesced send, then the slab entry.
     ///
     /// Callers that mean to settle the run's bounded send must take it with
-    /// `InFlightSendSlab::take_coalesced_bounded_send` *before* calling this:
+    /// `InFlightSendSlab::take_coalesced_send_id` *before* calling this:
     /// the slab release clears the entry's id silently (no tripwire, unlike
     /// the copy pool's).
     fn release_coalesced(&mut self, slab_idx: u16) {
@@ -3400,7 +3400,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // this CQE outlived, whose teardown already recorded the abort,
             // and a driver result would override that abort (#381) with a
             // dead occupant's outcome.
-            let _ = self.driver.send_slab.take_coalesced_bounded_send(slab_idx);
+            let _ = self.driver.send_slab.take_coalesced_send_id(slab_idx);
             self.release_coalesced(slab_idx);
             return;
         }
@@ -3409,10 +3409,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // Partial send: advance the iovec array and resubmit the remainder.
             if let Some(msg_ptr) = self.driver.send_slab.try_advance(slab_idx, result as u32) {
                 if self.close_submitted(conn_index) {
-                    let bounded = self.driver.send_slab.take_coalesced_bounded_send(slab_idx);
+                    let bounded = self.driver.send_slab.take_coalesced_send_id(slab_idx);
                     self.release_coalesced(slab_idx);
                     if let Some((id, _logical_len)) = bounded {
-                        self.settle_bounded(id, Err(io::Error::from_raw_os_error(libc::ECANCELED)));
+                        self.settle_send(id, Err(io::Error::from_raw_os_error(libc::ECANCELED)));
                     }
                     self.executor.wake_send(
                         conn_index,
@@ -3438,7 +3438,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // Read the end-of-send flag before releasing the slab entry —
             // and, for the same reason, take the bounded send it settles.
             let end_of_send = self.driver.send_slab.is_end_of_send(slab_idx);
-            let bounded = self.driver.send_slab.take_coalesced_bounded_send(slab_idx);
+            let bounded = self.driver.send_slab.take_coalesced_send_id(slab_idx);
             metrics::BYTES.add(metrics::bytes::SENT, total as u64);
             self.release_coalesced(slab_idx);
 
@@ -3452,7 +3452,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // The carried logical (plaintext) length, not `acked` — see
             // `handle_send`'s success path.
             if let Some((id, logical_len)) = bounded {
-                self.settle_bounded(id, Ok(logical_len));
+                self.settle_send(id, Ok(logical_len));
             }
             if end_of_send {
                 let acked =
@@ -3469,10 +3469,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let errno = -result;
         if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
             if self.close_submitted(conn_index) {
-                let bounded = self.driver.send_slab.take_coalesced_bounded_send(slab_idx);
+                let bounded = self.driver.send_slab.take_coalesced_send_id(slab_idx);
                 self.release_coalesced(slab_idx);
                 if let Some((id, _logical_len)) = bounded {
-                    self.settle_bounded(id, Err(io::Error::from_raw_os_error(libc::ECANCELED)));
+                    self.settle_send(id, Err(io::Error::from_raw_os_error(libc::ECANCELED)));
                 }
                 self.executor.wake_send(
                     conn_index,
@@ -3494,7 +3494,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
 
         // Real error — release everything and drain the connection's queue.
-        let bounded = self.driver.send_slab.take_coalesced_bounded_send(slab_idx);
+        let bounded = self.driver.send_slab.take_coalesced_send_id(slab_idx);
         self.release_coalesced(slab_idx);
         self.driver.drain_conn_send_queue(conn_index);
         self.driver.note_send_finalized(conn_index);
@@ -3504,7 +3504,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             Err(io::Error::from_raw_os_error(-result))
         };
         if let Some((id, _logical_len)) = bounded {
-            self.settle_bounded(id, Err(Self::bounded_send_error(result)));
+            self.settle_send(id, Err(Self::send_error(result)));
         }
         self.executor.wake_send(conn_index, io_result);
     }
@@ -4468,7 +4468,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             != u32::from(UserData::send_payload_gen(payload))
         {
             // Take-and-discard, as in `handle_send`'s identity guard.
-            let _ = self.driver.send_copy_pool.take_bounded_send(pool_slot);
+            let _ = self.driver.send_copy_pool.take_send_id(pool_slot);
             self.release_pool_slot(pool_slot);
             return;
         }
@@ -4483,10 +4483,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 // One of this handler's two silent returns. `send().await`
                 // is left hanging here (a pre-existing hole this PR does not
                 // fix), but a bounded send must not reproduce it.
-                let bounded = self.driver.send_copy_pool.take_bounded_send(pool_slot);
+                let bounded = self.driver.send_copy_pool.take_send_id(pool_slot);
                 self.release_pool_slot(pool_slot);
                 if let Some((id, _logical_len)) = bounded {
-                    self.settle_bounded(id, Err(io::Error::from_raw_os_error(libc::ECANCELED)));
+                    self.settle_send(id, Err(io::Error::from_raw_os_error(libc::ECANCELED)));
                 }
                 return;
             }
@@ -4520,10 +4520,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
                 if self.close_submitted(conn_index) {
                     // The handler's other silent return; same reasoning.
-                    let bounded = self.driver.send_copy_pool.take_bounded_send(pool_slot);
+                    let bounded = self.driver.send_copy_pool.take_send_id(pool_slot);
                     self.release_pool_slot(pool_slot);
                     if let Some((id, _logical_len)) = bounded {
-                        self.settle_bounded(id, Err(io::Error::from_raw_os_error(libc::ECANCELED)));
+                        self.settle_send(id, Err(io::Error::from_raw_os_error(libc::ECANCELED)));
                     }
                     return;
                 }
@@ -4543,7 +4543,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
         }
 
-        let bounded = self.driver.send_copy_pool.take_bounded_send(pool_slot);
+        let bounded = self.driver.send_copy_pool.take_send_id(pool_slot);
         self.release_pool_slot(pool_slot);
         // By construction no id reaches this handler: `send_bounded` attaches
         // it to the *final* ciphertext chunk, which `encrypt_to_sends` tags
@@ -4555,9 +4555,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             let settled = if result > 0 {
                 Ok(logical_len)
             } else {
-                Err(Self::bounded_send_error(result))
+                Err(Self::send_error(result))
             };
-            self.settle_bounded(id, settled);
+            self.settle_send(id, settled);
         }
 
         // Intermediate TLS chunks are serialized through the per-connection
@@ -5272,21 +5272,21 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 // The `!identity_ok` reason is a dead occupant's entry, whose
                 // operation teardown already aborted; a driver result would
                 // override that abort (#381).
-                let bounded = self.driver.send_slab.take_coalesced_bounded_send(slab_idx);
+                let bounded = self.driver.send_slab.take_coalesced_send_id(slab_idx);
                 self.release_coalesced(slab_idx);
                 if identity_ok && let Some((id, _logical_len)) = bounded {
-                    self.settle_bounded(id, Err(io::Error::from_raw_os_error(libc::ECANCELED)));
+                    self.settle_send(id, Err(io::Error::from_raw_os_error(libc::ECANCELED)));
                 }
                 continue;
             }
             if retries >= 2 {
                 // Give up: fail the waiter and close so the connection isn't
                 // left open with a hole in its byte stream.
-                let bounded = self.driver.send_slab.take_coalesced_bounded_send(slab_idx);
+                let bounded = self.driver.send_slab.take_coalesced_send_id(slab_idx);
                 self.release_coalesced(slab_idx);
                 self.driver.drain_conn_send_queue(conn_index);
                 if let Some((id, _logical_len)) = bounded {
-                    self.settle_bounded(
+                    self.settle_send(
                         id,
                         Err(io::Error::other(
                             "max retries during coalesced send resubmit",
@@ -5393,21 +5393,21 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 // reason is a dead occupant's slot: teardown already recorded
                 // that operation's abort, and a driver result would override
                 // it (#381) on behalf of a connection that is gone.
-                let bounded = self.driver.send_copy_pool.take_bounded_send(pool_slot);
+                let bounded = self.driver.send_copy_pool.take_send_id(pool_slot);
                 self.release_pool_slot(pool_slot);
                 if identity_ok && let Some((id, _logical_len)) = bounded {
-                    self.settle_bounded(id, Err(io::Error::from_raw_os_error(libc::ECANCELED)));
+                    self.settle_send(id, Err(io::Error::from_raw_os_error(libc::ECANCELED)));
                 }
                 continue;
             }
             if retries >= 2 {
                 // Give up: fail the waiter and close so the connection isn't
                 // left open with a hole in its byte stream.
-                let bounded = self.driver.send_copy_pool.take_bounded_send(pool_slot);
+                let bounded = self.driver.send_copy_pool.take_send_id(pool_slot);
                 self.release_pool_slot(pool_slot);
                 self.driver.drain_conn_send_queue(conn_index);
                 if let Some((id, _logical_len)) = bounded {
-                    self.settle_bounded(
+                    self.settle_send(
                         id,
                         Err(io::Error::other("max retries during send resubmit")),
                     );
@@ -5487,7 +5487,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 // the parked entry is still *queued*, so
                 // `drain_conn_send_queue` -> `release_queued_sends` takes its
                 // id off the pool slot and fails it (as `ConnectionAborted`)
-                // through `Driver::bounded_send_completions`, which the run
+                // through `Driver::settled_sends`, which the run
                 // loop drains.
                 self.driver.drain_conn_send_queue(conn_index);
                 let err = io::Error::other("max retries during send submit");
@@ -5553,7 +5553,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 // new occupant.
                 let mut bounded = None;
                 if self.driver.send_copy_pool.in_use(pool_slot) {
-                    bounded = self.driver.send_copy_pool.take_bounded_send(pool_slot);
+                    bounded = self.driver.send_copy_pool.take_send_id(pool_slot);
                     self.release_pool_slot(pool_slot);
                 }
                 if self.driver.connections.get(conn_index).is_none()
@@ -5568,7 +5568,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 }
                 self.driver.drain_conn_send_queue(conn_index);
                 if let Some((id, _logical_len)) = bounded {
-                    self.settle_bounded(
+                    self.settle_send(
                         id,
                         Err(io::Error::other("max retries during send pollout retry")),
                     );
@@ -5596,10 +5596,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     // the slot still belongs to the live occupant (the
                     // `close_submitted` reason); a dead occupant's id is
                     // taken and discarded.
-                    let bounded = self.driver.send_copy_pool.take_bounded_send(pool_slot);
+                    let bounded = self.driver.send_copy_pool.take_send_id(pool_slot);
                     self.release_pool_slot(pool_slot);
                     if identity_ok && let Some((id, _logical_len)) = bounded {
-                        self.settle_bounded(id, Err(io::Error::from_raw_os_error(libc::ECANCELED)));
+                        self.settle_send(id, Err(io::Error::from_raw_os_error(libc::ECANCELED)));
                     }
                 }
                 continue;
@@ -15749,7 +15749,7 @@ mod tests {
     ///
     /// Every bounded send in this section is owned by a standalone task, as
     /// mio's equivalents are: an entry owned by its own connection's task is
-    /// *dropped* by teardown rather than resolved (`SendCapacityQueue`'s
+    /// *dropped* by teardown rather than resolved (`SendCompletions`'s
     /// dead-owner rule), because that task's future is already gone. Parked
     /// rather than left Ready so that waking it is a real transition.
     fn parked_standalone(executor: &mut Executor) -> u32 {
@@ -15778,18 +15778,18 @@ mod tests {
 
     /// Take an id from the capacity FIFO and mark it submitted, for the
     /// handler tests that build the pool slot (or slab entry) by hand the
-    /// way the existing send tests do. `BoundedSendId` has no constructor
+    /// way the existing send tests do. `SendId` has no constructor
     /// but `enqueue`, which is how the real caller gets one too.
     fn submitted_id(
         el: &mut AsyncEventLoop<NoopHandler>,
         conn_index: u32,
         generation: u32,
-    ) -> BoundedSendId {
+    ) -> SendId {
         let task_id = parked_standalone(&mut el.executor);
         let id = el
             .executor
             .enqueue_send_capacity(conn_index, generation, 1, task_id);
-        el.executor.mark_bounded_send_submitted(id);
+        el.executor.mark_send_submitted(id);
         id
     }
 
@@ -15801,7 +15801,7 @@ mod tests {
         conn: crate::handler::ConnToken,
         data: &[u8],
         required_slots: usize,
-    ) -> BoundedSendId {
+    ) -> SendId {
         let task_id = parked_standalone(&mut el.executor);
         let id =
             el.executor
@@ -15810,7 +15810,7 @@ mod tests {
             let mut ctx = el.driver.make_ctx();
             ctx.send_bounded(conn, data, id).expect("admitted");
         }
-        el.executor.mark_bounded_send_submitted(id);
+        el.executor.mark_send_submitted(id);
         id
     }
 
@@ -16159,14 +16159,14 @@ mod tests {
             "a full SQ parks the built SQE rather than failing the send"
         );
         assert!(
-            el.executor.take_bounded_send_result(id).is_none(),
+            el.executor.take_send_result(id).is_none(),
             "nothing resolves while the entry is merely parked"
         );
 
         el.drain_send_retries();
-        assert!(el.executor.take_bounded_send_result(id).is_none());
+        assert!(el.executor.take_send_result(id).is_none());
         el.drain_send_retries();
-        assert!(el.executor.take_bounded_send_result(id).is_none());
+        assert!(el.executor.take_send_result(id).is_none());
 
         // Past the cap: the operation fails and the connection goes down.
         el.drain_send_retries();
@@ -16176,10 +16176,10 @@ mod tests {
         // takes it off the pool slot and fails it through the driver's
         // completion queue, which the run loop drains. Skipping this step is
         // what makes the settle look like it never happened.
-        el.drain_bounded_send_completions();
+        el.drain_settled_sends();
         let result = el
             .executor
-            .take_bounded_send_result(id)
+            .take_send_result(id)
             .expect("the retry cap must settle the bounded send, not drop it");
         assert!(
             result.is_err(),
@@ -16311,7 +16311,7 @@ mod tests {
             "the message took exactly one slot"
         );
         assert!(
-            el.executor.take_bounded_send_result(id).is_none(),
+            el.executor.take_send_result(id).is_none(),
             "nothing may resolve before the completion"
         );
 
@@ -16319,7 +16319,7 @@ mod tests {
 
         let result = el
             .executor
-            .take_bounded_send_result(id)
+            .take_send_result(id)
             .expect("the send CQE must settle the operation");
         assert_eq!(
             result.expect("the send succeeded"),
@@ -16369,7 +16369,7 @@ mod tests {
             "the first chunk's completion really did run"
         );
         assert!(
-            el.executor.take_bounded_send_result(id).is_none(),
+            el.executor.take_send_result(id).is_none(),
             "an intermediate chunk carries no id and must settle nothing"
         );
 
@@ -16377,7 +16377,7 @@ mod tests {
         complete_one_cqe(&mut el);
         let result = el
             .executor
-            .take_bounded_send_result(id)
+            .take_send_result(id)
             .expect("the end-of-send chunk settles the operation");
         assert_eq!(
             result.expect("the send succeeded"),
@@ -16396,7 +16396,7 @@ mod tests {
 
     /// A zero-length bounded send queues no SQE, so no CQE will ever settle
     /// it: `send_bounded` settles it itself, synchronously, through
-    /// `Driver::bounded_send_completions`. This is why that queue's payload
+    /// `Driver::settled_sends`. This is why that queue's payload
     /// is an `io::Result` and not an `io::Error` — its defining property is
     /// the *missing completion*, not failure.
     #[test]
@@ -16418,15 +16418,15 @@ mod tests {
             "and takes no slot"
         );
         assert_eq!(
-            el.driver.bounded_send_completions.len(),
+            el.driver.settled_sends.len(),
             1,
             "so the driver settles it itself"
         );
 
-        el.drain_bounded_send_completions();
+        el.drain_settled_sends();
         let result = el
             .executor
-            .take_bounded_send_result(id)
+            .take_send_result(id)
             .expect("the synchronous settle reached the executor");
         assert_eq!(result.expect("an empty send succeeds"), 0);
     }
@@ -16444,7 +16444,7 @@ mod tests {
         let data = [b'p'; 20];
         let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(&data).unwrap();
         el.driver.send_copy_pool.set_end_of_send(slot, true);
-        el.driver.send_copy_pool.set_bounded_send(slot, id, 20);
+        el.driver.send_copy_pool.set_send_id(slot, id, 20);
         let ud = UserData::encode(
             OpTag::Send,
             conn_index,
@@ -16459,7 +16459,7 @@ mod tests {
             "a partial write keeps its slot"
         );
         assert!(
-            el.executor.take_bounded_send_result(id).is_none(),
+            el.executor.take_send_result(id).is_none(),
             "a partial write must not settle the operation"
         );
 
@@ -16467,7 +16467,7 @@ mod tests {
         el.test_dispatch_cqe(ud.raw(), 12, 0);
         let result = el
             .executor
-            .take_bounded_send_result(id)
+            .take_send_result(id)
             .expect("the finishing CQE settles the operation");
         assert_eq!(
             result.expect("the send succeeded"),
@@ -16505,9 +16505,7 @@ mod tests {
         // bytes: under TLS the number the caller passed is a plaintext
         // length no completion handler can recompute, which is the whole
         // reason it travels with the id.
-        el.driver
-            .send_copy_pool
-            .set_bounded_send(c1.pool_slot, id, 99);
+        el.driver.send_copy_pool.set_send_id(c1.pool_slot, id, 99);
         let last_slot = c1.pool_slot;
         {
             let q = &mut el.driver.send_queues[conn_index as usize].queue;
@@ -16524,7 +16522,7 @@ mod tests {
             "the whole run was popped"
         );
         assert_eq!(
-            el.driver.send_copy_pool.take_bounded_send(last_slot),
+            el.driver.send_copy_pool.take_send_id(last_slot),
             None,
             "the id moved off the pool slot onto the slab entry"
         );
@@ -16533,7 +16531,7 @@ mod tests {
 
         let result = el
             .executor
-            .take_bounded_send_result(id)
+            .take_send_result(id)
             .expect("the coalesced CQE settles the operation");
         assert_eq!(
             result.expect("the send succeeded"),
@@ -16561,7 +16559,7 @@ mod tests {
         let id = submitted_id(&mut el, conn_index, generation);
         let (slot, _p, _l) = el.driver.send_copy_pool.copy_in(b"doomed").unwrap();
         el.driver.send_copy_pool.set_end_of_send(slot, true);
-        el.driver.send_copy_pool.set_bounded_send(slot, id, 6);
+        el.driver.send_copy_pool.set_send_id(slot, id, 6);
         let ud = UserData::encode(
             OpTag::Send,
             conn_index,
@@ -16572,7 +16570,7 @@ mod tests {
 
         let err = el
             .executor
-            .take_bounded_send_result(id)
+            .take_send_result(id)
             .expect("the error CQE settles the operation")
             .expect_err("the send failed");
         assert_eq!(
@@ -16599,7 +16597,7 @@ mod tests {
         let id = submitted_id(&mut el, conn_index, generation);
         let (slot, _p, _l) = el.driver.send_copy_pool.copy_in(b"nothing went").unwrap();
         el.driver.send_copy_pool.set_end_of_send(slot, true);
-        el.driver.send_copy_pool.set_bounded_send(slot, id, 12);
+        el.driver.send_copy_pool.set_send_id(slot, id, 12);
         let ud = UserData::encode(
             OpTag::Send,
             conn_index,
@@ -16610,7 +16608,7 @@ mod tests {
 
         let err = el
             .executor
-            .take_bounded_send_result(id)
+            .take_send_result(id)
             .expect("a zero-result CQE settles the operation")
             .expect_err("a bounded send never reports a truncated count");
         assert_eq!(err.kind(), io::ErrorKind::WriteZero);
@@ -16647,7 +16645,7 @@ mod tests {
         let (slot, _p, _l) = el.driver.send_copy_pool.copy_in(&ciphertext).unwrap();
         el.driver.send_copy_pool.set_end_of_send(slot, true);
         // 12 bytes of plaintext became 30 bytes on the wire.
-        el.driver.send_copy_pool.set_bounded_send(slot, id, 12);
+        el.driver.send_copy_pool.set_send_id(slot, id, 12);
         let ud = UserData::encode(
             OpTag::Send,
             conn_index,
@@ -16658,7 +16656,7 @@ mod tests {
 
         let result = el
             .executor
-            .take_bounded_send_result(id)
+            .take_send_result(id)
             .expect("the operation resolved");
         assert_eq!(
             result.expect("the send succeeded"),
@@ -16753,7 +16751,7 @@ mod tests {
         let data = [b'x'; 20];
         let (slot, _p, _l) = el.driver.send_copy_pool.copy_in(&data).unwrap();
         el.driver.send_copy_pool.set_end_of_send(slot, true);
-        el.driver.send_copy_pool.set_bounded_send(slot, id, 20);
+        el.driver.send_copy_pool.set_send_id(slot, id, 20);
         el.driver.send_queues[conn_index as usize].close_submitted = true;
 
         let ud = UserData::encode(
@@ -16765,7 +16763,7 @@ mod tests {
 
         let err = el
             .executor
-            .take_bounded_send_result(id)
+            .take_send_result(id)
             .expect("the close_submitted gate must settle the operation")
             .expect_err("the remainder was never sent");
         assert_eq!(err.raw_os_error(), Some(libc::ECANCELED));
@@ -16790,7 +16788,7 @@ mod tests {
         let ciphertext = [b'c'; 20];
         let (slot, _p, _l) = el.driver.send_copy_pool.copy_in(&ciphertext).unwrap();
         el.driver.send_copy_pool.set_end_of_send(slot, true);
-        el.driver.send_copy_pool.set_bounded_send(slot, id, 20);
+        el.driver.send_copy_pool.set_send_id(slot, id, 20);
         el.driver.send_queues[conn_index as usize].close_submitted = true;
 
         let ud = UserData::encode(
@@ -16802,7 +16800,7 @@ mod tests {
 
         let err = el
             .executor
-            .take_bounded_send_result(id)
+            .take_send_result(id)
             .expect("the silent return must still settle the operation")
             .expect_err("the remainder was never sent");
         assert_eq!(err.raw_os_error(), Some(libc::ECANCELED));
@@ -16824,7 +16822,7 @@ mod tests {
         let id = submitted_id(&mut el, conn_index, generation);
         let (slot, _p, _l) = el.driver.send_copy_pool.copy_in(b"stuck").unwrap();
         el.driver.send_copy_pool.set_end_of_send(slot, true);
-        el.driver.send_copy_pool.set_bounded_send(slot, id, 5);
+        el.driver.send_copy_pool.set_send_id(slot, id, 5);
         el.driver
             .pending_copy_retries
             .push((conn_index, generation, slot, 2, OpTag::Send));
@@ -16833,7 +16831,7 @@ mod tests {
 
         let err = el
             .executor
-            .take_bounded_send_result(id)
+            .take_send_result(id)
             .expect("the give-up arm must settle the operation")
             .expect_err("the resubmit never landed");
         assert_eq!(err.kind(), io::ErrorKind::Other);
@@ -16896,7 +16894,7 @@ mod tests {
 
         let err = el
             .executor
-            .take_bounded_send_result(id)
+            .take_send_result(id)
             .expect("the give-up arm must settle the operation")
             .expect_err("the resubmit never landed");
         assert_eq!(err.kind(), io::ErrorKind::Other);
@@ -16923,7 +16921,7 @@ mod tests {
         let id = submitted_id(&mut el, conn_index, generation);
         let (slot, _p, _l) = el.driver.send_copy_pool.copy_in(b"blocked").unwrap();
         el.driver.send_copy_pool.set_end_of_send(slot, true);
-        el.driver.send_copy_pool.set_bounded_send(slot, id, 7);
+        el.driver.send_copy_pool.set_send_id(slot, id, 7);
         el.driver
             .pending_send_pollout_retries
             .push((conn_index, generation, slot, 3, false));
@@ -16932,7 +16930,7 @@ mod tests {
 
         let err = el
             .executor
-            .take_bounded_send_result(id)
+            .take_send_result(id)
             .expect("the give-up arm must settle the operation")
             .expect_err("POLLOUT never armed");
         assert_eq!(err.kind(), io::ErrorKind::Other);
@@ -16950,7 +16948,7 @@ mod tests {
     /// `drain_send_retries`' give-up arm holds no id at all: the parked
     /// entry is still *queued*, so `drain_conn_send_queue` takes the id off
     /// its pool slot and aborts it through
-    /// `Driver::bounded_send_completions`, which the run loop drains. Both
+    /// `Driver::settled_sends`, which the run loop drains. Both
     /// halves have to work or the caller hangs.
     #[test]
     fn send_retry_cap_aborts_the_parked_bounded_send() {
@@ -16971,22 +16969,22 @@ mod tests {
         el.drain_send_retries();
         el.drain_send_retries();
         assert!(
-            el.executor.take_bounded_send_result(id).is_none(),
+            el.executor.take_send_result(id).is_none(),
             "a re-parked entry must not resolve"
         );
 
         // The cap.
         el.drain_send_retries();
         assert_eq!(
-            el.driver.bounded_send_completions.len(),
+            el.driver.settled_sends.len(),
             1,
             "the destroyed queue entry is recorded for the loop to deliver"
         );
-        el.drain_bounded_send_completions();
+        el.drain_settled_sends();
 
         let err = el
             .executor
-            .take_bounded_send_result(id)
+            .take_send_result(id)
             .expect("the aborted entry must be told")
             .expect_err("the message never reached the wire");
         assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
@@ -17018,14 +17016,14 @@ mod tests {
         el.driver.drain_conn_send_queue(conn_index);
 
         assert_eq!(
-            el.driver.bounded_send_completions.len(),
+            el.driver.settled_sends.len(),
             1,
             "the destroyed entry is recorded for the loop to deliver"
         );
-        el.drain_bounded_send_completions();
+        el.drain_settled_sends();
         let err = el
             .executor
-            .take_bounded_send_result(id)
+            .take_send_result(id)
             .expect("the destroyed entry must be told")
             .expect_err("the message never reached the wire");
         assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
@@ -17057,11 +17055,11 @@ mod tests {
 
         el.driver.force_finalize_close(conn_index);
 
-        assert_eq!(el.driver.bounded_send_completions.len(), 1);
-        el.drain_bounded_send_completions();
+        assert_eq!(el.driver.settled_sends.len(), 1);
+        el.drain_settled_sends();
         let err = el
             .executor
-            .take_bounded_send_result(id)
+            .take_send_result(id)
             .expect("the abandoned entry must be told")
             .expect_err("the message never reached the wire");
         assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
@@ -17087,7 +17085,7 @@ mod tests {
         let id = submitted_id(&mut el, conn_index, old_gen);
         let (slot, _p, _l) = el.driver.send_copy_pool.copy_in(b"orphaned").unwrap();
         el.driver.send_copy_pool.set_end_of_send(slot, true);
-        el.driver.send_copy_pool.set_bounded_send(slot, id, 8);
+        el.driver.send_copy_pool.set_send_id(slot, id, 8);
         let ud = UserData::encode(
             OpTag::Send,
             conn_index,
@@ -17117,16 +17115,16 @@ mod tests {
             "no bytes credited to the new occupant"
         );
         assert!(
-            el.executor.take_bounded_send_result(id).is_none(),
+            el.executor.take_send_result(id).is_none(),
             "a dead occupant's completion must not settle its operation"
         );
 
         // Not vacuous: the entry is still present and still settleable, so
         // the stale CQE left it alone rather than removing it.
-        el.executor.complete_bounded_send(id, Ok(42));
+        el.executor.complete_send(id, Ok(42));
         assert_eq!(
             el.executor
-                .take_bounded_send_result(id)
+                .take_send_result(id)
                 .expect("the entry survived the stale CQE")
                 .expect("settled by the control"),
             42,
@@ -17173,7 +17171,7 @@ mod tests {
 
         let result = el
             .executor
-            .take_bounded_send_result(id)
+            .take_send_result(id)
             .expect("the operation resolved");
         assert_eq!(
             result.expect("every byte reached the socket, so this is not an abort"),
@@ -17261,7 +17259,7 @@ mod tests {
         generation: u32,
         data: &[u8],
         logical_len: u32,
-    ) -> (BoundedSendId, u16) {
+    ) -> (SendId, u16) {
         let id = submitted_id(el, conn_index, generation);
         let (slot, _ptr, _len) = el
             .driver
@@ -17269,9 +17267,7 @@ mod tests {
             .copy_in(data)
             .expect("free pool slot");
         el.driver.send_copy_pool.set_end_of_send(slot, true);
-        el.driver
-            .send_copy_pool
-            .set_bounded_send(slot, id, logical_len);
+        el.driver.send_copy_pool.set_send_id(slot, id, logical_len);
         (id, slot)
     }
 
@@ -17307,7 +17303,7 @@ mod tests {
 
         let result = el
             .executor
-            .take_bounded_send_result(id)
+            .take_send_result(id)
             .expect("the CQE must have reached handle_send with its identity intact");
         assert_eq!(
             result.expect("the send succeeded"),
@@ -17347,7 +17343,7 @@ mod tests {
 
         let err = el
             .executor
-            .take_bounded_send_result(id)
+            .take_send_result(id)
             .expect("the error CQE settles the operation")
             .expect_err("a negative res is a failure, not a byte count");
         assert_eq!(
@@ -17366,7 +17362,7 @@ mod tests {
     /// Complements `zero_length_send_completion_settles_write_zero`. Zero is
     /// the one result a NOP produces on its own, so this also confirms the
     /// injection really did carry the value rather than the handler seeing a
-    /// default: the `WriteZero` it settles is `bounded_send_error`'s special
+    /// default: the `WriteZero` it settles is `send_error`'s special
     /// case and nothing else in the pipeline produces that kind.
     #[test]
     fn nop_inject_bounded_send_zero_result_settles_write_zero() {
@@ -17385,7 +17381,7 @@ mod tests {
 
         let err = el
             .executor
-            .take_bounded_send_result(id)
+            .take_send_result(id)
             .expect("a zero-result CQE settles the operation")
             .expect_err("a bounded send never reports a truncated count");
         assert_eq!(err.kind(), io::ErrorKind::WriteZero);
@@ -17431,7 +17427,7 @@ mod tests {
             "a partial write keeps its slot"
         );
         assert!(
-            el.executor.take_bounded_send_result(id).is_none(),
+            el.executor.take_send_result(id).is_none(),
             "a partial write must not settle the operation"
         );
 
@@ -17440,7 +17436,7 @@ mod tests {
 
         let result = el
             .executor
-            .take_bounded_send_result(id)
+            .take_send_result(id)
             .expect("the resubmission's CQE must route back to the same slot");
         assert_eq!(
             result.expect("the send succeeded"),
@@ -17505,7 +17501,7 @@ mod tests {
         el.inject_and_dispatch(stale_ud.raw(), 8);
 
         assert!(
-            el.executor.take_bounded_send_result(stale_id).is_none(),
+            el.executor.take_send_result(stale_id).is_none(),
             "a dead occupant's completion must not settle its operation"
         );
         assert!(
@@ -17527,7 +17523,7 @@ mod tests {
         el.inject_and_dispatch(fresh_ud.raw(), 12);
         let result = el
             .executor
-            .take_bounded_send_result(fresh_id)
+            .take_send_result(fresh_id)
             .expect("the live occupant's completion must settle");
         assert_eq!(
             result.expect("the send succeeded"),
@@ -17594,7 +17590,7 @@ mod tests {
 
         let result = el
             .executor
-            .take_bounded_send_result(id)
+            .take_send_result(id)
             .expect("the coalesced CQE settles the operation");
         assert_eq!(
             result.expect("the send succeeded"),
@@ -17664,7 +17660,7 @@ mod tests {
 
         let err = el
             .executor
-            .take_bounded_send_result(id)
+            .take_send_result(id)
             .expect("the error CQE settles the operation")
             .expect_err("the run failed");
         assert_eq!(
@@ -17714,7 +17710,7 @@ mod tests {
 
         let err = el
             .executor
-            .take_bounded_send_result(id)
+            .take_send_result(id)
             .expect("the silent return must still settle the operation")
             .expect_err("the remainder was never sent");
         assert_eq!(err.raw_os_error(), Some(libc::ECANCELED));
@@ -17758,7 +17754,7 @@ mod tests {
 
         let err = el
             .executor
-            .take_bounded_send_result(id)
+            .take_send_result(id)
             .expect("a failed POLLOUT must settle the operation")
             .expect_err("the send never resumed");
         assert_eq!(
@@ -17808,7 +17804,7 @@ mod tests {
 
         let result_a = el
             .executor
-            .take_bounded_send_result(id_a)
+            .take_send_result(id_a)
             .expect("the first completion settled its own operation");
         assert_eq!(
             result_a.expect("the send succeeded"),
@@ -17817,7 +17813,7 @@ mod tests {
         );
         let result_b = el
             .executor
-            .take_bounded_send_result(id_b)
+            .take_send_result(id_b)
             .expect("the second completion settled its own operation");
         assert_eq!(
             result_b.expect("the send succeeded"),
@@ -17868,7 +17864,7 @@ mod tests {
         );
         let result = el
             .executor
-            .take_bounded_send_result(id)
+            .take_send_result(id)
             .expect("the send settled before teardown could abort it");
         assert_eq!(
             result.expect("every byte reached the socket, so this is not an abort"),
@@ -17917,7 +17913,7 @@ mod tests {
         );
         let err = el
             .executor
-            .take_bounded_send_result(id)
+            .take_send_result(id)
             .expect("teardown resolved the operation")
             .expect_err("the send CQE arrived after its connection was gone");
         assert_eq!(

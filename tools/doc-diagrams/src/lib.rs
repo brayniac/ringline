@@ -55,7 +55,7 @@ const CLAIMS: &[Claim] = &[
         meaning: "the send that waits for pool capacity rather than failing",
     },
     Claim {
-        path: "ringline/src/runtime/send_capacity.rs",
+        path: "ringline/src/runtime/send_completion.rs",
         needle: "pub(crate) fn turn",
         meaning: "admission is head-of-FIFO plus enough free slots",
     },

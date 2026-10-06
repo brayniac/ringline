@@ -13,7 +13,7 @@ use crate::config::Config;
 use crate::connection::{ConnectionTable, Lifecycle, WriteHalf};
 use crate::disk_io_pool::DiskIoPool;
 use crate::handler::{ConnSendState, DriverCtx};
-use crate::runtime::send_capacity::BoundedSendId;
+use crate::runtime::send_completion::SendId;
 
 use mio::Interest;
 
@@ -28,7 +28,7 @@ pub(crate) const WAKE_TOKEN: mio::Token = mio::Token(0);
 /// socket — completing at queue time reported success for bytes that were
 /// never written and swallowed write errors entirely.
 ///
-/// `bounded` marks a `send_backpressured` entry: its [`BoundedSendId`]
+/// `bounded` marks a `send_backpressured` entry: its [`SendId`]
 /// routes the exact result of *this* operation back to the future that
 /// submitted it, and the [`SlotReservation`] is the copy-pool permit that
 /// admitted it. The permit is held unfilled for the entry's whole life and
@@ -38,7 +38,7 @@ pub(crate) struct PendingSend {
     pub(crate) data: Vec<u8>,
     pub(crate) offset: usize,
     pub(crate) notify_len: Option<u32>,
-    pub(crate) bounded: Option<(BoundedSendId, SlotReservation)>,
+    pub(crate) bounded: Option<(SendId, SlotReservation)>,
 }
 
 impl PendingSend {
@@ -57,7 +57,7 @@ impl PendingSend {
     /// Built by `DriverCtx::send_bounded`; the permit is released (and `id`
     /// completed) by [`Driver::flush_sends`] or
     /// [`Driver::clear_pending_sends`], never by dropping the entry.
-    pub(crate) fn bounded(data: Vec<u8>, id: BoundedSendId, permit: SlotReservation) -> Self {
+    pub(crate) fn bounded(data: Vec<u8>, id: SendId, permit: SlotReservation) -> Self {
         Self {
             data,
             offset: 0,
@@ -106,7 +106,7 @@ pub(crate) fn clone_io_error(e: &io::Error) -> io::Error {
 pub(crate) fn clear_pending_sends_into(
     queue: &mut VecDeque<PendingSend>,
     pool: &mut SendCopyPool,
-    completions: &mut VecDeque<(BoundedSendId, io::Result<u32>)>,
+    completions: &mut VecDeque<(SendId, io::Result<u32>)>,
     capacity_released: &mut bool,
     err: impl Fn() -> io::Error,
 ) {
@@ -223,15 +223,15 @@ pub(crate) struct Driver {
     pub(crate) send_completions: Vec<VecDeque<u32>>,
     /// Results of bounded (`send_backpressured`) sends, in completion order
     /// and keyed by the id the submitting future holds. Not per-connection:
-    /// a [`BoundedSendId`] is unique on the worker, and the consumer
-    /// (`Executor::complete_bounded_send`) looks entries up by id.
+    /// a [`SendId`] is unique on the worker, and the consumer
+    /// (`Executor::complete_send`) looks entries up by id.
     ///
     /// Produced here by [`Driver::flush_sends`] (`Ok(len)` when the entry's
     /// last byte reaches the socket) and [`Driver::clear_pending_sends`]
     /// (`Err` when the entry is discarded); drained by the event loop's
     /// `drain_send_completions`. The driver never touches the `Executor`
     /// itself.
-    pub(crate) bounded_send_completions: VecDeque<(BoundedSendId, io::Result<u32>)>,
+    pub(crate) settled_sends: VecDeque<(SendId, io::Result<u32>)>,
     /// Set whenever a copy-pool permit goes back to the pool, so the event
     /// loop can call `Executor::wake_send_capacity` once per iteration
     /// instead of once per released permit. The event loop clears it.
@@ -441,7 +441,7 @@ impl Driver {
             send_half_taken: vec![false; max_conn],
             forward_hold_cap: config.forward_hold_cap,
             send_completions: (0..max_conn).map(|_| VecDeque::new()).collect(),
-            bounded_send_completions: VecDeque::new(),
+            settled_sends: VecDeque::new(),
             capacity_released: false,
             udp_sockets,
             udp_connected_peers,
@@ -503,7 +503,7 @@ impl Driver {
             poll: &mut self.poll,
             writable: &mut self.writable,
             send_completions: &mut self.send_completions,
-            bounded_send_completions: &mut self.bounded_send_completions,
+            settled_sends: &mut self.settled_sends,
             capacity_released: &mut self.capacity_released,
             connect_deadlines: &mut self.connect_deadlines,
             disk_io_pool: &self.disk_io_pool,
@@ -661,7 +661,7 @@ impl Driver {
         clear_pending_sends_into(
             &mut self.pending_sends[idx],
             &mut self.send_copy_pool,
-            &mut self.bounded_send_completions,
+            &mut self.settled_sends,
             &mut self.capacity_released,
             err,
         );
@@ -812,7 +812,7 @@ impl Driver {
                 clear_pending_sends_into(
                     &mut self.pending_sends[idx],
                     &mut self.send_copy_pool,
-                    &mut self.bounded_send_completions,
+                    &mut self.settled_sends,
                     &mut self.capacity_released,
                     || {
                         io::Error::new(
@@ -870,7 +870,7 @@ impl Driver {
                         if let Some((id, permit)) = bounded {
                             self.send_copy_pool.release_reservation(permit);
                             self.capacity_released = true;
-                            self.bounded_send_completions.push_back((id, Ok(written)));
+                            self.settled_sends.push_back((id, Ok(written)));
                         }
                         self.pending_sends[idx].pop_front();
                     } else {
@@ -1211,15 +1211,15 @@ pub(crate) mod tests {
         assert_eq!(&buf, b"hello");
     }
 
-    /// Mint `n` distinct [`BoundedSendId`]s.
+    /// Mint `n` distinct [`SendId`]s.
     ///
     /// Ids are only constructible through the executor's FIFO, and the
     /// driver never looks inside one — it carries the id from `send_bounded`
     /// to the completion queue. A throwaway queue is therefore enough here;
     /// the two event-loop tests that need the executor to route the result
     /// mint theirs from a real `Executor`.
-    pub(crate) fn bounded_ids(n: usize) -> Vec<BoundedSendId> {
-        let mut queue = crate::runtime::send_capacity::SendCapacityQueue::new();
+    pub(crate) fn bounded_ids(n: usize) -> Vec<SendId> {
+        let mut queue = crate::runtime::send_completion::SendCompletions::new();
         (0..n).map(|i| queue.enqueue(0, 0, 1, i as u32)).collect()
     }
 
@@ -1238,8 +1238,8 @@ pub(crate) mod tests {
     }
 
     /// Drain and return the bounded completions the driver has queued.
-    fn take_completions(driver: &mut Driver) -> Vec<(BoundedSendId, io::Result<u32>)> {
-        driver.bounded_send_completions.drain(..).collect()
+    fn take_completions(driver: &mut Driver) -> Vec<(SendId, io::Result<u32>)> {
+        driver.settled_sends.drain(..).collect()
     }
 
     /// An already-handshaked `TlsConn` driven by whichever record-layer engine
@@ -1448,7 +1448,7 @@ pub(crate) mod tests {
             4,
             "a refusal reserves nothing"
         );
-        assert!(driver.bounded_send_completions.is_empty());
+        assert!(driver.settled_sends.is_empty());
     }
 
     /// Admission is the reservation: `send_bounded` takes its copy-pool
@@ -1489,7 +1489,7 @@ pub(crate) mod tests {
             "the entry carries its id and permit"
         );
         assert!(
-            driver.bounded_send_completions.is_empty(),
+            driver.settled_sends.is_empty(),
             "queueing completes nothing"
         );
         assert!(
@@ -1640,7 +1640,7 @@ pub(crate) mod tests {
             "the permit is not released mid-message"
         );
         assert!(
-            driver.bounded_send_completions.is_empty(),
+            driver.settled_sends.is_empty(),
             "no completion before the last byte"
         );
 
@@ -1737,7 +1737,7 @@ pub(crate) mod tests {
             "a refusal must not consume capacity"
         );
         assert!(
-            driver.bounded_send_completions.is_empty(),
+            driver.settled_sends.is_empty(),
             "a refused id never completes"
         );
 
@@ -1753,7 +1753,7 @@ pub(crate) mod tests {
         );
         assert_eq!(driver.pending_sends[idx].len(), 1);
         assert_eq!(driver.send_copy_pool.free_count(), 1);
-        assert!(driver.bounded_send_completions.is_empty());
+        assert!(driver.settled_sends.is_empty());
     }
 
     /// Discarding a send queue fails every bounded id in it, in queue order,
