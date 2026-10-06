@@ -126,7 +126,8 @@ pub fn run(args: &[String]) {
     }
 
     let mut b = IoUring::builder();
-    b.setup_cqsize((8 * nconns as u32 + 4096).next_power_of_two());
+    // IORING_MAX_CQ_ENTRIES is 65536; a larger request fails with EINVAL.
+    b.setup_cqsize((8 * nconns as u32 + 4096).next_power_of_two().min(65536));
     if sqpoll {
         b.setup_sqpoll(1000);
         if args.iter().any(|a| a == "--sqpoll-cpu") {

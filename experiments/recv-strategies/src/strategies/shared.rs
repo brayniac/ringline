@@ -99,6 +99,12 @@ impl Shared {
         if conn.head == conn.acc.len() {
             conn.acc.clear();
             conn.head = 0;
+        } else if conn.head >= conn.acc.len() / 2 {
+            // A stream always leaves a partial message: drop what was
+            // consumed, as ringline's accumulator does, or `acc` grows
+            // without bound.
+            conn.acc.drain(..conn.head);
+            conn.head = 0;
         }
     }
 
