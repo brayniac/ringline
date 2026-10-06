@@ -33,7 +33,7 @@ cd /home/anvil
   cargo build --release --locked
   rc=$?
   mkdir -p /home/anvil/out
-  cp target/release/recv-strategies runs.sh /home/anvil/out/
+  cp target/release/recv-strategies runs*.sh /home/anvil/out/
   cd /home/anvil && sha256sum out/*
   tar czf recv-bins.tgz out
   echo "build_status=$rc"
