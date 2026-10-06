@@ -294,14 +294,15 @@ pub(crate) struct Driver {
     /// buffer ID has NOT been pushed to `pending_replenish` and must be
     /// replenished when the slot is cleared.
     pub(crate) pending_recv_bufs: Vec<Option<PendingRecvBuf>>,
-    /// Per-connection original data length for in-flight SendRecvBuf operations.
-    /// Set when `forward_recv_buf` initiates a send; used by `handle_send_recv_buf`
-    /// to compute the correct offset on partial sends (since buf_size != data_len).
+    /// Per-connection original data length of the in-flight SendRecvBuf. Set
+    /// when a `SendRecvBuf` SQE is pushed (`note_send_recv_buf_pushed`);
+    /// `handle_send_recv_buf` uses it to compute the resubmit offset of a
+    /// partial send.
     pub(crate) send_recv_buf_original_lens: Vec<u32>,
     /// Per-connection remaining bytes for in-flight SendRecvBuf operations.
     /// Tracks how many bytes still need to be sent (decremented on each partial send).
     /// Stored here rather than in the CQE payload so that buffer sizes > u16::MAX are
-    /// supported (the old encoding packed remaining into the high 16 bits of the payload).
+    /// supported.
     pub(crate) send_recv_buf_remaining: Vec<u32>,
     /// Per-connection multi-buffer zero-copy recv hold. When `recv_forward` is
     /// set for a connection, incoming provided buffers are pushed here (bids NOT
@@ -2783,10 +2784,9 @@ impl Driver {
 
     /// Record the progress of a `SendRecvBuf` that has just been pushed: the
     /// buffer's full length, all of it still to send. A connection has at
-    /// most one `SendRecvBuf` in the kernel, so recording at push time, not
-    /// when the send is built, keeps a send queued behind it from
-    /// overwriting the counts its completion reads (#614). A remainder of a
-    /// partial send keeps the counts `handle_send_recv_buf` recorded.
+    /// most one `SendRecvBuf` in the kernel, so the counts belong to whichever
+    /// was pushed last (#614). A remainder (`SEND_RECV_BUF_REMAINDER`) keeps the
+    /// counts `handle_send_recv_buf` recorded.
     fn note_send_recv_buf_pushed(&mut self, conn_index: u32, built: &crate::handler::BuiltSend) {
         let ud = crate::completion::UserData(built.entry.get_user_data());
         if ud.tag() != Some(OpTag::SendRecvBuf)

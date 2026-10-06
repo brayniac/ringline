@@ -3907,7 +3907,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
     /// Handle completion of a send from a recv buffer (zero-copy forward).
     ///
-    /// Payload: the bid. The remaining byte count is in `send_recv_buf_remaining`.
+    /// Payload: the bid in the low 16 bits, plus `SEND_RECV_BUF_REMAINDER` when
+    /// this send is the rest of a partial send. The remaining byte count is in
+    /// `send_recv_buf_remaining`.
     /// On partial send, resubmits from offset. On completion, replenishes the bid.
     fn handle_send_recv_buf(&mut self, ud: UserData, result: i32) {
         // No liveness/identity guard and no close_submitted guard,
@@ -3919,8 +3921,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // close_submitted checks as its siblings.
         let conn_index = ud.conn_index();
         let payload = ud.payload();
-        // Payload carries only the bid. The remaining byte count is in the driver
-        // field (send_recv_buf_remaining) so that buffer sizes > u16::MAX work.
+        // The low 16 bits of the payload are the bid; the remaining byte count
+        // is in `send_recv_buf_remaining`, so buffers larger than `u16::MAX` work.
         let bid = payload as u16;
         let remaining_before = self.driver.send_recv_buf_remaining[conn_index as usize];
 
@@ -10859,6 +10861,7 @@ mod tests {
 
         forward(&mut el, 0, 100);
         assert!(el.driver.send_queues[ci].in_flight);
+        assert_eq!(el.driver.send_recv_buf_remaining[ci], 100);
         forward(&mut el, 1, 4096);
         assert_eq!(
             el.driver.send_queues[ci].queue.len(),

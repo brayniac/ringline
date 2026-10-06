@@ -303,8 +303,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   called while an earlier one's send was still in flight overwrote that
   send's progress. When the earlier send completed in full, it could be
   taken for a partial send and its buffer resent from past the end of its
-  data, putting stale bytes on the wire. The progress is now recorded when
-  each send is submitted, and one send at a time is in the kernel (#614).
+  data, putting stale bytes on the wire; when the earlier send was larger
+  and went out in part, the rest of it could be dropped. The progress is now
+  recorded when each send is submitted to the kernel (#614).
 
 - On io_uring, a receive buffer sent in part by `forward_recv_buf` (on
   `ConnCtx` or `SendHalf`) or `ConnCtx::run_direct_echo` lost the rest of its
