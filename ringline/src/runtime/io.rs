@@ -2354,13 +2354,7 @@ impl ConnCtx {
 
             // Nothing held (connection closed or spurious wake) — resolve to 0.
             if n == 0 {
-                executor.io_results[conn_index as usize] = Some(IoResult::Send(Ok(0)));
-                executor.owner_task[conn_index as usize] = Some(CURRENT_TASK_ID.with(|c| c.get()));
-                executor.send_waiters[conn_index as usize] = true;
-                return Ok(SendFuture {
-                    conn_index,
-                    generation: self.generation,
-                });
+                return Ok(SendFuture::ready(conn_index, self.generation, Ok(0)));
             }
 
             // Earlier sends queued, in flight or parked, or a chain active: the
@@ -2403,6 +2397,8 @@ impl ConnCtx {
                 .allocate_recv_forward(conn_index, generation, &iovecs[..n], &bids[..n], total)
                 .ok_or_else(|| io::Error::other("send slab exhausted"))?;
 
+            let id = executor.register_send(conn_index);
+            driver.send_slab.set_send_id(slab_idx, id, total);
             match driver
                 .ring
                 .submit_send_recv_bufs_coalesced(conn_index, msg_ptr, slab_idx)
@@ -2414,18 +2410,13 @@ impl ConnCtx {
                         driver.recv_hold[conn_index as usize].pop_front();
                     }
                     driver.send_queues[conn_index as usize].in_flight = true;
-                    executor.owner_task[conn_index as usize] =
-                        Some(CURRENT_TASK_ID.with(|c| c.get()));
-                    executor.send_waiters[conn_index as usize] = true;
-                    Ok(SendFuture {
-                        conn_index,
-                        generation: self.generation,
-                    })
+                    Ok(SendFuture::pending(conn_index, self.generation, id))
                 }
                 Err(e) => {
                     // Submission failed — release the slab entry; buffers stay in
                     // the hold (bids un-replenished, still valid) for a later retry.
                     driver.send_slab.release(slab_idx);
+                    executor.withdraw_send(id);
                     Err(e)
                 }
             }
@@ -2460,27 +2451,16 @@ impl ConnCtx {
             // we can take a DriverCtx), then consume them once the send is queued.
             let data = driver.accumulators.data(conn_index).to_vec();
             if data.is_empty() {
-                executor.io_results[conn_index as usize] = Some(IoResult::Send(Ok(0)));
-                executor.owner_task[conn_index as usize] = Some(CURRENT_TASK_ID.with(|c| c.get()));
-                executor.send_waiters[conn_index as usize] = true;
-                return Ok(SendFuture {
-                    conn_index,
-                    generation: self.generation,
-                });
+                return Ok(SendFuture::ready(conn_index, self.generation, Ok(0)));
             }
+            let id = executor.register_send(conn_index);
             let mut ctx = driver.make_ctx();
-            ctx.send(self.token(), &data)?;
-            // Deliver the completion only when the bytes actually reach the
-            // socket — completing at queue time reported success for data
-            // that was never written and swallowed write errors.
-            ctx.mark_last_send_awaited(conn_index);
+            if let Err(e) = ctx.send_awaited(self.token(), &data, id) {
+                executor.withdraw_send(id);
+                return Err(e);
+            }
             driver.accumulators.consume(conn_index, data.len());
-            executor.owner_task[conn_index as usize] = Some(CURRENT_TASK_ID.with(|c| c.get()));
-            executor.send_waiters[conn_index as usize] = true;
-            Ok(SendFuture {
-                conn_index,
-                generation: self.generation,
-            })
+            Ok(SendFuture::pending(conn_index, self.generation, id))
         })
     }
 
@@ -2499,8 +2479,11 @@ impl ConnCtx {
     // ── Send (awaitable) ─────────────────────────────────────────────
 
     /// Send data and await completion. Copies data into the send pool, submits
-    /// the SQE eagerly, then returns a future that resolves with the total bytes
-    /// sent (or error).
+    /// the SQE eagerly, then returns a future that resolves with `data.len()`
+    /// once this send's last byte has gone to the socket, or with the error
+    /// that ended it. Under TLS that is the plaintext length, not the
+    /// ciphertext's. Each future resolves with its own send's result, so
+    /// several may be awaited at once.
     ///
     /// Use this when you need backpressure or send completion notification.
     /// For fire-and-forget sending, use `send_nowait()`.
@@ -2522,20 +2505,13 @@ impl ConnCtx {
     /// connection is closed.
     pub(crate) fn send(&self, data: &[u8]) -> io::Result<SendFuture> {
         with_state(|driver, executor| {
+            let id = executor.register_send(self.conn_index);
             let mut ctx = driver.make_ctx();
-            ctx.send(self.token(), data)?;
-            // On mio, the send is buffered — mark it awaitable so the event
-            // loop delivers wake_send when the bytes actually reach the
-            // socket (not at queue time, which reported success for data
-            // that was never written and swallowed write errors).
-            #[cfg(not(has_io_uring))]
-            ctx.mark_last_send_awaited(self.conn_index);
-            executor.owner_task[self.conn_index as usize] = Some(CURRENT_TASK_ID.with(|c| c.get()));
-            executor.send_waiters[self.conn_index as usize] = true;
-            Ok(SendFuture {
-                conn_index: self.conn_index,
-                generation: self.generation,
-            })
+            if let Err(e) = ctx.send_awaited(self.token(), data, id) {
+                executor.withdraw_send(id);
+                return Err(e);
+            }
+            Ok(SendFuture::pending(self.conn_index, self.generation, id))
         })
     }
 
@@ -2601,7 +2577,8 @@ impl ConnCtx {
     /// The closure receives a [`SendChainBuilder`](crate::handler::SendChainBuilder) for
     /// constructing linked SQEs. Call `.copy()`, `.parts()...add()` to build the
     /// chain, then `.finish()` to submit it. Returns a [`SendFuture`] that
-    /// resolves with total bytes sent.
+    /// resolves with the bytes the chain sent, or `Ok(0)` when the closure
+    /// submitted nothing.
     ///
     /// For fire-and-forget chained sending, use `send_chain_nowait()`.
     #[cfg(has_io_uring)]
@@ -2610,16 +2587,21 @@ impl ConnCtx {
         F: FnOnce(crate::handler::SendChainBuilder<'_, '_>) -> io::Result<()>,
     {
         with_state(|driver, executor| {
+            let id = executor.register_send(self.conn_index);
             let mut ctx = driver.make_ctx();
             let token = ConnToken::new(self.conn_index, self.generation);
-            let builder = ctx.send_chain(token);
-            f(builder)?;
-            executor.owner_task[self.conn_index as usize] = Some(CURRENT_TASK_ID.with(|c| c.get()));
-            executor.send_waiters[self.conn_index as usize] = true;
-            Ok(SendFuture {
-                conn_index: self.conn_index,
-                generation: self.generation,
-            })
+            let builder = ctx.send_chain_awaited(token, id);
+            if let Err(e) = f(builder) {
+                executor.withdraw_send(id);
+                return Err(e);
+            }
+            // A closure that submitted nothing (an empty chain, or no
+            // `finish`) sent nothing.
+            if !driver.chain_table.carries(self.conn_index, id) {
+                executor.withdraw_send(id);
+                return Ok(SendFuture::ready(self.conn_index, self.generation, Ok(0)));
+            }
+            Ok(SendFuture::pending(self.conn_index, self.generation, id))
         })
     }
 
@@ -2898,8 +2880,7 @@ impl AsyncSendBuilder {
     ///
     /// Batch limits and the all-or-nothing rejection behavior are identical
     /// to [`submit_batch`](Self::submit_batch). A batch that is empty or
-    /// carries no bytes is rejected with `InvalidInput`: it would produce no
-    /// completion, so the returned future could never resolve.
+    /// carries no bytes is rejected with `InvalidInput`.
     pub fn submit_batch_await(
         self,
         parts: Vec<crate::handler::SendPart<'_>>,
@@ -2912,6 +2893,8 @@ impl AsyncSendBuilder {
                     "empty send batch",
                 ));
             }
+            let conn_index = self.token.index;
+            let id = executor.register_send(conn_index);
             let mut ctx = driver.make_ctx();
             let mut builder = ctx.send_parts(self.token);
             let mut consumed = 0usize;
@@ -2926,16 +2909,13 @@ impl AsyncSendBuilder {
                 }
                 consumed += 1;
             }
-            builder.submit()?;
-            let conn_index = self.token.index;
-            executor.owner_task[conn_index as usize] = Some(CURRENT_TASK_ID.with(|c| c.get()));
-            executor.send_waiters[conn_index as usize] = true;
+            if let Err(e) = builder.submit_awaited(id) {
+                executor.withdraw_send(id);
+                return Err(e);
+            }
             Ok((
                 consumed,
-                SendFuture {
-                    conn_index,
-                    generation: self.token.generation,
-                },
+                SendFuture::pending(conn_index, self.token.generation, id),
             ))
         })
     }
@@ -3028,8 +3008,7 @@ impl AsyncSendBuilder {
     /// that resolves when the batch has been written to the socket.
     ///
     /// A batch that is empty or carries no bytes is rejected with
-    /// `InvalidInput`: it would produce no completion, so the returned future
-    /// could never resolve.
+    /// `InvalidInput`.
     pub fn submit_batch_await(
         self,
         parts: Vec<crate::handler::SendPart<'_>>,
@@ -3055,21 +3034,16 @@ impl AsyncSendBuilder {
                     "empty send batch",
                 ));
             }
-            let mut ctx = driver.make_ctx();
-            ctx.send(self.token, &buf)?;
-            // The send is buffered — mark it awaitable so the event loop
-            // delivers wake_send when the bytes actually reach the socket,
-            // matching `ConnCtx::send`.
-            ctx.mark_last_send_awaited(self.token.index);
             let conn_index = self.token.index;
-            executor.owner_task[conn_index as usize] = Some(CURRENT_TASK_ID.with(|c| c.get()));
-            executor.send_waiters[conn_index as usize] = true;
+            let id = executor.register_send(conn_index);
+            let mut ctx = driver.make_ctx();
+            if let Err(e) = ctx.send_awaited(self.token, &buf, id) {
+                executor.withdraw_send(id);
+                return Err(e);
+            }
             Ok((
                 consumed,
-                SendFuture {
-                    conn_index,
-                    generation: self.token.generation,
-                },
+                SendFuture::pending(conn_index, self.token.generation, id),
             ))
         })
     }
@@ -5585,37 +5559,80 @@ impl Drop for BackpressuredSendFuture<'_> {
 
 // ── SendFuture ───────────────────────────────────────────────────────
 
-/// Future that awaits send completion. The SQE was already submitted eagerly
-/// by [`SendHalf::send`] — this future only waits for the CQE result.
-/// No data stored in the future. No allocation.
+/// Future that awaits one send's completion. The send was submitted when the
+/// future was created; the future resolves with that send's own result, the
+/// length its caller passed or the error that ended it, and with no other
+/// send's. No allocation.
+///
+/// Dropping it does not cancel the send: the bytes still go out, and the
+/// result is discarded.
 pub struct SendFuture {
     conn_index: u32,
     /// See `WithDataFuture` for the role of `generation`.
     generation: u32,
+    state: SendFutureState,
+}
+
+enum SendFutureState {
+    /// The send's entry in the executor's completion table.
+    Pending(SendId),
+    /// A result known when the future was created; taken by the first poll.
+    Ready(Option<io::Result<u32>>),
+}
+
+impl SendFuture {
+    /// A future for the send `id` names, which the caller has submitted.
+    fn pending(conn_index: u32, generation: u32, id: SendId) -> Self {
+        SendFuture {
+            conn_index,
+            generation,
+            state: SendFutureState::Pending(id),
+        }
+    }
+
+    /// A future that resolves with `result` on its first poll.
+    fn ready(conn_index: u32, generation: u32, result: io::Result<u32>) -> Self {
+        SendFuture {
+            conn_index,
+            generation,
+            state: SendFutureState::Ready(Some(result)),
+        }
+    }
 }
 
 impl Future for SendFuture {
     type Output = io::Result<u32>;
 
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<u32>> {
-        with_state(|driver, executor| {
-            // Slot-reuse safety: don't observe another connection's send
-            // completions. Treat as ConnectionAborted.
-            if driver.connections.generation(self.conn_index) != self.generation {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::ConnectionAborted,
-                    "connection closed",
-                )));
+        let this = self.get_mut();
+        let id = match &mut this.state {
+            SendFutureState::Ready(result) => {
+                return Poll::Ready(result.take().expect("SendFuture polled after completion"));
             }
-            match executor.io_results[self.conn_index as usize].take() {
-                Some(IoResult::Send(result)) => Poll::Ready(result),
-                _ => {
-                    // Not ready yet — re-register waiter.
-                    executor.owner_task[self.conn_index as usize] =
-                        Some(CURRENT_TASK_ID.with(|c| c.get()));
-                    executor.send_waiters[self.conn_index as usize] = true;
-                    Poll::Pending
+            SendFutureState::Pending(id) => *id,
+        };
+        with_state(|driver, executor| {
+            // A future polled from another task than the one that submitted
+            // (moved into a `join!`, handed to a spawned task) is woken where
+            // it now lives.
+            executor.set_send_owner(id, CURRENT_TASK_ID.with(|c| c.get()));
+            match executor.take_send_result(id) {
+                Some(result) => {
+                    this.state = SendFutureState::Ready(None);
+                    Poll::Ready(result)
                 }
+                // A recycled slot means teardown ran and left no result for
+                // this id: take the entry off the table and report the
+                // close.
+                None if driver.connections.generation(this.conn_index) != this.generation => {
+                    executor.cancel_send(id);
+                    this.state = SendFutureState::Ready(None);
+                    Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        "connection closed",
+                    )))
+                }
+                None => Poll::Pending,
             }
         })
     }
@@ -5623,25 +5640,19 @@ impl Future for SendFuture {
 
 impl Drop for SendFuture {
     fn drop(&mut self) {
-        let opt_non_null = CURRENT_DRIVER.with(|c| c.get());
-        if opt_non_null.is_none() {
+        let SendFutureState::Pending(id) = self.state else {
             return;
-        }
-        let mut non_null = opt_non_null.unwrap();
+        };
+        // Drop runs outside a poll, so the thread-local may be gone (worker
+        // teardown), and the table with it.
+        let Some(mut non_null) = CURRENT_DRIVER.with(|c| c.get()) else {
+            return;
+        };
         let state = unsafe { non_null.as_mut() };
-        // Verify the connection slot still belongs to us before touching
-        // its waiter flag. After a close/reuse cycle the same `conn_index`
-        // can be a *different* connection with its own send_waiter, which
-        // this Drop must not clear.
-        #[cfg(has_io_uring)]
-        let driver = unsafe { &mut *state.driver.as_mut() };
-        #[cfg(not(has_io_uring))]
-        let driver = unsafe { &mut *state.driver.as_mut() };
-        if driver.connections.generation(self.conn_index) != self.generation {
-            return;
-        }
         let executor = unsafe { &mut *state.executor.as_mut() };
-        executor.send_waiters[self.conn_index as usize] = false;
+        // In flight: marked abandoned, so the completion still coming frees
+        // the entry. Already resolved: freed now.
+        executor.cancel_send(id);
     }
 }
 

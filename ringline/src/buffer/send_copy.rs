@@ -61,10 +61,11 @@ pub struct SendCopyPool {
     in_use: Vec<bool>,     // double-free protection
     // Whether this slot holds the final chunk of its logical send. A send
     // larger than one slot is split across several slots; only the last one
-    // is marked, so the send waiter is woken once per logical send rather
-    // than once per chunk. Independent single-slot sends are always final.
+    // is marked, and only it carries the send's id, so the send settles once
+    // rather than once per chunk. A coalesced run stops at a marked slot.
+    // Independent single-slot sends are always final.
     slot_end_of_send: Vec<bool>,
-    // The bounded send (`ConnCtx::send_backpressured`) whose completion this
+    // The awaited send whose completion this
     // slot carries, and the logical (plaintext) length that operation reports
     // on success. Parallel to `slot_end_of_send` and set only on the slot that
     // is marked end-of-send, so at most one entry exists per logical send.
@@ -293,10 +294,10 @@ impl SendCopyPool {
 
     /// Release a slot back to the free list (called on Send CQE).
     ///
-    /// A slot must not still carry a bounded send when it is released: every
+    /// A slot must not still carry an awaited send when it is released: every
     /// disposal path has to take the id with
-    /// [`take_send_id`](Self::take_send_id) and settle the operation
-    /// first, or the caller's `send_backpressured` future never resolves. The
+    /// [`take_send_id`](Self::take_send_id) and settle the send first, or
+    /// the caller's future never resolves. The
     /// `debug_assert` below is that audit's tripwire (it is what makes
     /// "delete a settle site and watch a test fail" work), and it sits
     /// *before* the `!in_use` double-free early return on purpose: the
@@ -313,7 +314,7 @@ impl SendCopyPool {
         let carried = self.slot_send_id[idx as usize].take();
         debug_assert!(
             carried.is_none(),
-            "slot {idx} released while still carrying bounded send {carried:?}; \
+            "slot {idx} released while still carrying awaited send {carried:?}; \
              every disposal path must take the id and complete or fail it first",
         );
         if !self.in_use[idx as usize] {
@@ -382,26 +383,24 @@ impl SendCopyPool {
         self.slot_end_of_send[slot as usize]
     }
 
-    /// Attach a bounded send's identity to this slot, together with the
-    /// **logical (plaintext) length** the operation reports on success.
+    /// Attach an awaited send's identity to this slot, together with the
+    /// **logical (plaintext) length** the send reports on success.
     ///
     /// Set only on the slot that is marked
     /// [`end_of_send`](Self::set_end_of_send), so one logical send owns at
     /// most one entry. The length travels with the id because no completion
-    /// handler can recompute it: `handle_send` accumulates wire bytes and a
-    /// TLS send's final `OpTag::Send` chunk is one ciphertext record, neither
-    /// of which is the number the caller passed.
+    /// handler can recompute it: a TLS send's final `OpTag::Send` chunk is
+    /// one ciphertext record, and a split send's final chunk is part of it.
     ///
-    /// Written by `DriverCtx::send_bounded` and, when a coalescing run is
-    /// unwound, by `Driver::submit_next_queued_inner`; read back by the send
-    /// completion handlers and the teardown paths, and ultimately by PR 9's
-    /// `send_backpressured` future, which is what the settled result
-    /// resolves.
+    /// Written by `DriverCtx::send_awaited`, `SendBuilder::submit_awaited`
+    /// and `DriverCtx::send_bounded` and, when a coalescing run is unwound,
+    /// by `Driver::submit_next_queued_inner`; read back by the send
+    /// completion handlers and the teardown paths.
     pub fn set_send_id(&mut self, slot: u16, id: SendId, logical_len: u32) {
         self.slot_send_id[slot as usize] = Some((id, logical_len));
     }
 
-    /// Take the bounded send attached to this slot, if any, leaving `None`.
+    /// Take the awaited send attached to this slot, if any, leaving `None`.
     ///
     /// Taking — rather than peeking — is the point: an id can only be settled
     /// once, and the fact that it is gone is what lets
@@ -412,8 +411,7 @@ impl SendCopyPool {
     /// Called by the send/TLS-send completion handlers, their error and
     /// `close_submitted` branches, the teardown paths, and
     /// `Driver::submit_next_queued_inner` when it lifts the id onto a
-    /// coalesced slab entry; PR 9's `send_backpressured` future is the
-    /// ultimate consumer of the result.
+    /// coalesced slab entry.
     pub fn take_send_id(&mut self, slot: u16) -> Option<(SendId, u32)> {
         self.slot_send_id[slot as usize].take()
     }
@@ -853,7 +851,7 @@ mod tests {
     /// mechanical rather than asserted.
     #[test]
     #[cfg(debug_assertions)]
-    #[should_panic(expected = "still carrying bounded send")]
+    #[should_panic(expected = "still carrying awaited send")]
     fn release_with_a_live_bounded_send_trips_debug_assert() {
         let mut pool = SendCopyPool::new(1, 32);
         let id = an_id();

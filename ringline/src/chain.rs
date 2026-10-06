@@ -16,6 +16,8 @@ pub(crate) enum ChainEvent {
     Complete { bytes_sent: u32, error: Option<i32> },
 }
 
+use crate::runtime::send_completion::SendId;
+
 /// State for a single in-flight send chain on a connection.
 pub(crate) struct ChainState {
     /// Total SQEs in the chain.
@@ -24,14 +26,15 @@ pub(crate) struct ChainState {
     cqes_received: u16,
     /// Cumulative bytes from successful SQEs.
     pub(crate) bytes_sent: u32,
-    /// Total bytes submitted in the chain.
-    total_bytes: u32,
     /// Chain broke (partial write or error on a linked SQE).
     broken: bool,
     /// First error errno encountered (if any).
     pub(crate) first_error: Option<i32>,
     /// Outstanding SendMsgZc NOTIF CQEs.
     zc_notifs_pending: u16,
+    /// The awaited send this chain settles (`ConnCtx::send_chain`), with
+    /// `bytes_sent` on success; `None` for `send_chain_nowait`.
+    pub(crate) send_id: Option<SendId>,
 }
 
 impl ChainState {
@@ -70,7 +73,7 @@ impl SendChainTable {
     ///
     /// # Panics (debug)
     /// Panics if a chain is already active for this connection.
-    pub fn start(&mut self, conn_index: u32, total_sqes: u16, total_bytes: u32) {
+    pub fn start(&mut self, conn_index: u32, total_sqes: u16) {
         let slot = match self.chains.get_mut(conn_index as usize) {
             Some(s) => s,
             None => {
@@ -86,11 +89,27 @@ impl SendChainTable {
             total_sqes,
             cqes_received: 0,
             bytes_sent: 0,
-            total_bytes,
             broken: false,
             first_error: None,
             zc_notifs_pending: 0,
+            send_id: None,
         });
+    }
+
+    /// Attach the awaited send `id` to the connection's active chain. Does
+    /// nothing when no chain is active.
+    pub fn set_send_id(&mut self, conn_index: u32, id: SendId) {
+        if let Some(Some(chain)) = self.chains.get_mut(conn_index as usize) {
+            chain.send_id = Some(id);
+        }
+    }
+
+    /// Whether the connection's active chain carries `id`.
+    pub fn carries(&self, conn_index: u32, id: SendId) -> bool {
+        matches!(
+            self.chains.get(conn_index as usize),
+            Some(Some(ChainState { send_id: Some(carried), .. })) if *carried == id
+        )
     }
 
     /// Check if a chain is active for the connection.
@@ -155,14 +174,13 @@ impl SendChainTable {
             .and_then(|s| s.take())
     }
 
-    /// Force-cancel a chain (used on connection close).
-    /// Returns the total bytes in the chain (for logging/metrics).
-    pub fn cancel(&mut self, conn_index: u32) -> u32 {
+    /// Force-cancel a chain (used on connection close). Returns the
+    /// awaited send the chain carried, for the caller to fail.
+    pub fn cancel(&mut self, conn_index: u32) -> Option<SendId> {
         self.chains
             .get_mut(conn_index as usize)
             .and_then(|s| s.take())
-            .map(|chain| chain.total_bytes)
-            .unwrap_or(0)
+            .and_then(|chain| chain.send_id)
     }
 }
 
@@ -173,7 +191,7 @@ mod tests {
     #[test]
     fn single_sqe_chain() {
         let mut table = SendChainTable::new(16);
-        table.start(0, 1, 100);
+        table.start(0, 1);
         assert!(table.is_active(0));
 
         let event = table.on_operation_cqe(0, 100);
@@ -194,7 +212,7 @@ mod tests {
     #[test]
     fn multi_sqe_chain_success() {
         let mut table = SendChainTable::new(16);
-        table.start(0, 3, 300);
+        table.start(0, 3);
 
         let event = table.on_operation_cqe(0, 100);
         assert_eq!(event, ChainEvent::Pending);
@@ -215,7 +233,7 @@ mod tests {
     #[test]
     fn chain_with_error_and_cancel() {
         let mut table = SendChainTable::new(16);
-        table.start(0, 3, 300);
+        table.start(0, 3);
 
         // First SQE succeeds
         let event = table.on_operation_cqe(0, 100);
@@ -239,7 +257,7 @@ mod tests {
     #[test]
     fn chain_with_zc_notifs() {
         let mut table = SendChainTable::new(16);
-        table.start(0, 2, 200);
+        table.start(0, 2);
 
         // First SQE op CQE + ZC notif pending
         table.inc_zc_notif(0);
@@ -264,19 +282,17 @@ mod tests {
     #[test]
     fn cancel_active_chain() {
         let mut table = SendChainTable::new(16);
-        table.start(0, 5, 500);
+        table.start(0, 5);
         assert!(table.is_active(0));
 
-        let total = table.cancel(0);
-        assert_eq!(total, 500);
+        assert_eq!(table.cancel(0), None, "an unawaited chain carries no id");
         assert!(!table.is_active(0));
     }
 
     #[test]
     fn cancel_no_chain() {
         let mut table = SendChainTable::new(16);
-        let total = table.cancel(0);
-        assert_eq!(total, 0);
+        assert_eq!(table.cancel(0), None);
     }
 
     #[test]

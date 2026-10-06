@@ -38,8 +38,6 @@ use self::waker::drain_ready_queue;
 
 /// I/O result stored per-connection for async task wakeup.
 pub(crate) enum IoResult {
-    /// Send completed with total bytes or error.
-    Send(stdio::Result<u32>),
     /// Connect completed with success or error.
     Connect(stdio::Result<()>),
 }
@@ -553,11 +551,9 @@ pub(crate) struct Executor {
     /// generation-mismatch short-circuit. That is what lets a poll that lands
     /// after teardown still see the error.
     pub(crate) recv_errors: Vec<Option<(u32, stdio::Error)>>,
-    /// Per-connection: task is awaiting send completion.
-    pub(crate) send_waiters: Vec<bool>,
-    /// Worker-wide table of bounded sends: the FIFO that decides who may
-    /// reserve copy-pool slots next, and the state and result of every
-    /// operation, waiting or admitted. Driven through the
+    /// Worker-wide table of awaited sends: the FIFO that decides which
+    /// bounded send may reserve copy-pool slots next, and the state and
+    /// result of every awaited send. Driven through the
     /// wrappers in [`send_completion`]; `remove_connection` resolves the
     /// entries of a torn-down connection (provisionally — see that module's
     /// docs on why a driver result still overwrites the abort).
@@ -569,9 +565,9 @@ pub(crate) struct Executor {
     /// Maps conn_index → owning task ID. For accepted connections, `owner_task[i] = Some(i)`
     /// (self-owned). For outbound connections created via `connect()`,
     /// `owner_task[i] = Some(calling_task_id)` where `calling_task_id` is the task
-    /// that initiated the connect. This indirection allows `wake_recv`/`wake_send`/
-    /// `wake_connect` to wake the correct task even when the connection index differs
-    /// from the task index.
+    /// that initiated the connect. This indirection allows `wake_recv`/`wake_connect`
+    /// to wake the correct task even when the connection index differs from the
+    /// task index.
     pub(crate) owner_task: Vec<Option<u32>>,
     /// Per-connection recv sink for direct-to-buffer writes.
     pub(crate) recv_sinks: Vec<Option<RecvSink>>,
@@ -697,7 +693,6 @@ impl Executor {
                 v.resize_with(cap, || None);
                 v
             },
-            send_waiters: vec![false; cap],
             send_completions: send_completion::SendCompletions::new(),
             connect_waiters: vec![false; cap],
             io_results: {
@@ -761,7 +756,7 @@ impl Executor {
             self.recv_sinks[idx] = None;
         }
         self.task_slab.remove(conn_index);
-        // Bounded sends waiting on or in flight for this connection resolve
+        // Awaited sends waiting on or in flight for this connection resolve
         // to ConnectionAborted; wake their owners (standalone or cross-index
         // tasks that outlive the connection) and the FIFO's new head. That
         // abort is provisional: this method is also called from the mio
@@ -775,15 +770,14 @@ impl Executor {
             let _ = self.wake_task(task_id);
         }
         if idx < self.recv_waiters.len() {
-            // If a *standalone* task was awaiting recv/send/connect on this
+            // If a *standalone* task was awaiting recv/connect on this
             // connection, it isn't removed by `task_slab.remove`. Push it
             // back onto the ready queue so its future polls once more and
             // sees the new generation via the `ConnCtx`-stored gen check
             // — at which point it returns `ConnectionAborted` instead of
             // sitting parked forever. (Connection-bound tasks have already
             // been dropped by `task_slab.remove`.)
-            let any_waiter =
-                self.recv_waiters[idx] || self.send_waiters[idx] || self.connect_waiters[idx];
+            let any_waiter = self.recv_waiters[idx] || self.connect_waiters[idx];
             if any_waiter
                 && let Some(task_id) = self.owner_task[idx]
                 && (task_id & waker::STANDALONE_BIT != 0 || task_id != conn_index)
@@ -794,7 +788,6 @@ impl Executor {
                 let _ = self.wake_task(task_id);
             }
             self.recv_waiters[idx] = false;
-            self.send_waiters[idx] = false;
             self.connect_waiters[idx] = false;
             self.io_results[idx] = None;
             self.owner_task[idx] = None;
@@ -871,17 +864,6 @@ impl Executor {
                 slot.take().map(|(_, error)| error)
             }
             _ => None,
-        }
-    }
-
-    /// Wake a task that was waiting for send completion.
-    pub(crate) fn wake_send(&mut self, conn_index: u32, result: stdio::Result<u32>) {
-        let idx = conn_index as usize;
-        if idx < self.send_waiters.len() && self.send_waiters[idx] {
-            self.send_waiters[idx] = false;
-            self.io_results[idx] = Some(IoResult::Send(result));
-            let task_id = self.owner_task[idx].unwrap_or(conn_index);
-            self.wake_task(task_id);
         }
     }
 
@@ -1248,7 +1230,6 @@ mod tests {
         assert!(exec.ready_queue.is_empty());
         assert_eq!(exec.recv_waiters.len(), 16);
         assert_eq!(exec.recv_errors.len(), 16);
-        assert_eq!(exec.send_waiters.len(), 16);
         assert_eq!(exec.connect_waiters.len(), 16);
         assert_eq!(exec.io_results.len(), 16);
         assert_eq!(exec.owner_task.len(), 16);
@@ -1258,14 +1239,12 @@ mod tests {
     fn remove_connection_clears_state() {
         let mut exec = Executor::new(4, 4, 4, 0, 0);
         exec.recv_waiters[1] = true;
-        exec.send_waiters[1] = true;
         exec.connect_waiters[1] = true;
-        exec.io_results[1] = Some(IoResult::Send(Ok(42)));
+        exec.io_results[1] = Some(IoResult::Connect(Ok(())));
         exec.owner_task[1] = Some(0);
 
         exec.remove_connection(1);
         assert!(!exec.recv_waiters[1]);
-        assert!(!exec.send_waiters[1]);
         assert!(!exec.connect_waiters[1]);
         assert!(exec.io_results[1].is_none());
         assert!(exec.owner_task[1].is_none());
@@ -1432,8 +1411,10 @@ mod tests {
         assert!(!exec.recv_waiters[12]);
     }
 
+    /// A registered send is owned by the task that registered it, and its
+    /// completion wakes that task, whichever connection the send targets.
     #[test]
-    fn owner_task_routes_send_wakeup() {
+    fn a_registered_send_wakes_the_task_that_registered_it() {
         let mut exec = Executor::new(16, 4, 4, 0, 0);
 
         exec.task_slab
@@ -1441,15 +1422,13 @@ mod tests {
         let fut = exec.task_slab.take_ready(3).unwrap();
         exec.task_slab.park(3, fut);
 
-        exec.owner_task[10] = Some(3);
-        exec.send_waiters[10] = true;
-
-        exec.wake_send(10, Ok(42));
+        CURRENT_TASK_ID.with(|c| c.set(3));
+        let id = exec.register_send(10);
+        exec.complete_send(id, Ok(42));
 
         assert_eq!(exec.ready_queue.len(), 1);
         assert_eq!(exec.ready_queue[0], 3);
-        assert!(!exec.send_waiters[10]);
-        assert!(matches!(exec.io_results[10], Some(IoResult::Send(Ok(42)))));
+        assert_eq!(exec.take_send_result(id).unwrap().unwrap(), 42);
     }
 
     #[test]

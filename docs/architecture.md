@@ -170,7 +170,8 @@ the event loop immediately drains `read` until it returns `WouldBlock`
 panels, the subsequent poll is a poll of the owner task's Rust future, not
 another operating-system readiness poll. The handler parses a request and
 submits a response through the per-connection send queue. A send completion
-advances that queue and, for an awaited send, calls `wake_send`.
+advances that queue and, for an awaited send, settles that send's entry in the
+executor's completion table, which wakes the task that awaits it.
 When the handler future returns or panics, the runtime closes that connection,
 clears executor state, and eventually releases the slot with a new generation.
 

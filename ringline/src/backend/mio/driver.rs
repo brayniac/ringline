@@ -23,32 +23,40 @@ pub(crate) const WAKE_TOKEN: mio::Token = mio::Token(0);
 /// Per-connection pending send: the bytes plus how far into them the socket
 /// has got, so a partial `writev` can resume where it stopped.
 ///
-/// `notify_len` is `Some(len)` for awaitable sends: the completion
-/// (wake_send) is delivered only when the entry has fully reached the
-/// socket — completing at queue time reported success for bytes that were
-/// never written and swallowed write errors entirely.
+/// `send_id` names the awaited send this entry settles once its last byte
+/// reaches the socket, with the length that send reports: the length its
+/// caller passed, which under TLS is the plaintext length, not `data.len()`.
+/// A logical send that queues several entries carries its id on the last.
 ///
-/// `bounded` marks a `send_backpressured` entry: its [`SendId`]
-/// routes the exact result of *this* operation back to the future that
-/// submitted it, and the [`SlotReservation`] is the copy-pool permit that
-/// admitted it. The permit is held unfilled for the entry's whole life and
-/// released when the entry completes or is discarded — never dropped
-/// (`SlotReservation`'s `Drop` debug-asserts that).
+/// `permit` is a `send_backpressured` entry's copy-pool admission. It is held
+/// unfilled for the entry's whole life and released when the entry completes
+/// or is discarded — never dropped (`SlotReservation`'s `Drop`
+/// debug-asserts that).
 pub(crate) struct PendingSend {
     pub(crate) data: Vec<u8>,
     pub(crate) offset: usize,
-    pub(crate) notify_len: Option<u32>,
-    pub(crate) bounded: Option<(SendId, SlotReservation)>,
+    pub(crate) send_id: Option<(SendId, u32)>,
+    pub(crate) permit: Option<SlotReservation>,
 }
 
 impl PendingSend {
-    /// A fire-and-forget send: nothing is woken when it reaches the socket.
+    /// A fire-and-forget send: it settles nothing.
     pub(crate) fn plain(data: Vec<u8>) -> Self {
         Self {
             data,
             offset: 0,
-            notify_len: None,
-            bounded: None,
+            send_id: None,
+            permit: None,
+        }
+    }
+
+    /// An awaited send, settling `id` with `len` once flushed.
+    pub(crate) fn awaited(data: Vec<u8>, id: SendId, len: u32) -> Self {
+        Self {
+            data,
+            offset: 0,
+            send_id: Some((id, len)),
+            permit: None,
         }
     }
 
@@ -57,12 +65,12 @@ impl PendingSend {
     /// Built by `DriverCtx::send_bounded`; the permit is released (and `id`
     /// completed) by [`Driver::flush_sends`] or
     /// [`Driver::clear_pending_sends`], never by dropping the entry.
-    pub(crate) fn bounded(data: Vec<u8>, id: SendId, permit: SlotReservation) -> Self {
+    pub(crate) fn bounded(data: Vec<u8>, id: SendId, len: u32, permit: SlotReservation) -> Self {
         Self {
             data,
             offset: 0,
-            notify_len: None,
-            bounded: Some((id, permit)),
+            send_id: Some((id, len)),
+            permit: Some(permit),
         }
     }
 }
@@ -85,7 +93,7 @@ pub(crate) struct MioForwardState {
 }
 
 /// Clone an `io::Error` well enough to hand the same failure to several
-/// waiters. `io::Error` is not `Clone`, and a bounded-send fan-out has to
+/// waiters. `io::Error` is not `Clone`, and failing a queue of sends has to
 /// give every discarded id an equivalent error: the OS errno is preserved
 /// where there is one (so `raw_os_error()`/`kind()` match the original),
 /// otherwise the kind and message are.
@@ -97,7 +105,8 @@ pub(crate) fn clone_io_error(e: &io::Error) -> io::Error {
 }
 
 /// Discard every entry in one connection's send queue, releasing each
-/// bounded entry's copy-pool permit and failing its id with `err()`.
+/// bounded entry's copy-pool permit and failing each awaited send with
+/// `err()`.
 ///
 /// The field-wise form of [`Driver::clear_pending_sends`], so callers that
 /// hold a `DriverCtx` (or a live borrow of another `Driver` field) can use
@@ -111,9 +120,11 @@ pub(crate) fn clear_pending_sends_into(
     err: impl Fn() -> io::Error,
 ) {
     while let Some(entry) = queue.pop_front() {
-        if let Some((id, permit)) = entry.bounded {
+        if let Some(permit) = entry.permit {
             pool.release_reservation(permit);
             *capacity_released = true;
+        }
+        if let Some((id, _len)) = entry.send_id {
             completions.push_back((id, Err(err())));
         }
     }
@@ -161,9 +172,6 @@ pub(crate) struct Driver {
     /// set (and `i` present in `sends_dirty`).
     pub(crate) sends_dirty: Vec<u32>,
     pub(crate) sends_dirty_flag: Vec<bool>,
-    /// Same shape for `send_completions`.
-    pub(crate) completions_dirty: Vec<u32>,
-    pub(crate) completions_dirty_flag: Vec<bool>,
     /// Number of connections with an armed connect deadline — lets the
     /// per-loop timeout sweep skip the scan entirely in the common case.
     pub(crate) connect_pending: u32,
@@ -217,10 +225,6 @@ pub(crate) struct Driver {
     /// `Config::forward_hold_cap` with the io_uring hold cap: same intent —
     /// bound one slow forward — applied to the queue mio actually has.
     pub(crate) forward_hold_cap: usize,
-    /// Per-connection queue of awaitable-send byte counts.
-    /// `DriverCtx::send_await()` pushes len here; the event loop drains
-    /// these and calls `Executor::wake_send()` for each.
-    pub(crate) send_completions: Vec<VecDeque<u32>>,
     /// Results of bounded (`send_backpressured`) sends, in completion order
     /// and keyed by the id the submitting future holds. Not per-connection:
     /// a [`SendId`] is unique on the worker, and the consumer
@@ -425,8 +429,6 @@ impl Driver {
             pending_sends: (0..max_conn).map(|_| VecDeque::new()).collect(),
             sends_dirty: Vec::new(),
             sends_dirty_flag: vec![false; max_conn],
-            completions_dirty: Vec::new(),
-            completions_dirty_flag: vec![false; max_conn],
             connect_pending: 0,
             writable: vec![false; max_conn],
             connect_deadlines: vec![None; max_conn],
@@ -440,7 +442,6 @@ impl Driver {
             recv_half_taken: vec![false; max_conn],
             send_half_taken: vec![false; max_conn],
             forward_hold_cap: config.forward_hold_cap,
-            send_completions: (0..max_conn).map(|_| VecDeque::new()).collect(),
             settled_sends: VecDeque::new(),
             capacity_released: false,
             udp_sockets,
@@ -495,14 +496,11 @@ impl Driver {
             pending_sends: &mut self.pending_sends,
             sends_dirty: &mut self.sends_dirty,
             sends_dirty_flag: &mut self.sends_dirty_flag,
-            completions_dirty: &mut self.completions_dirty,
-            completions_dirty_flag: &mut self.completions_dirty_flag,
             connect_pending: &mut self.connect_pending,
             pending_closes: &mut self.pending_closes,
             tcp_streams: &mut self.tcp_streams,
             poll: &mut self.poll,
             writable: &mut self.writable,
-            send_completions: &mut self.send_completions,
             settled_sends: &mut self.settled_sends,
             capacity_released: &mut self.capacity_released,
             connect_deadlines: &mut self.connect_deadlines,
@@ -618,7 +616,6 @@ impl Driver {
         if self.connect_deadlines[idx].take().is_some() {
             self.connect_pending -= 1;
         }
-        self.send_completions[idx].clear();
         self.accumulators.reset(conn_index);
 
         self.send_queues[idx].queue.clear();
@@ -644,8 +641,8 @@ impl Driver {
         }
     }
 
-    /// Drop every queued send for `idx`, failing each bounded entry's id
-    /// with `err()` and returning its copy-pool permit.
+    /// Drop every queued send for `idx`, failing each awaited send with
+    /// `err()` and returning each bounded entry's copy-pool permit.
     ///
     /// The only sanctioned way to discard a `PendingSend`: a plain
     /// `pending_sends[idx].clear()` would drop a live [`SlotReservation`]
@@ -773,8 +770,8 @@ impl Driver {
     /// swallowed it, kept the queue, and retried the failing writev every
     /// loop iteration forever while awaited sends reported success).
     ///
-    /// Awaitable entries (`notify_len` set) push their completion when the
-    /// entry's last byte reaches the socket.
+    /// An entry carrying an awaited send settles it when the entry's last
+    /// byte reaches the socket.
     pub(crate) fn flush_sends(&mut self, conn_index: u32) -> io::Result<(bool, u32)> {
         use std::os::fd::AsRawFd;
 
@@ -854,23 +851,15 @@ impl Driver {
                     let avail = entry.data.len() - entry.offset;
                     if remaining >= avail {
                         remaining -= avail;
-                        // Take both completions out of the entry before it
-                        // is popped: the bounded permit must go back to the
-                        // pool here, never by dropping the entry.
-                        let notify = entry.notify_len.take();
-                        let bounded = entry.bounded.take();
-                        let written = entry.data.len() as u32;
-                        if let Some(len) = notify {
-                            self.send_completions[idx].push_back(len);
-                            if !self.completions_dirty_flag[idx] {
-                                self.completions_dirty_flag[idx] = true;
-                                self.completions_dirty.push(idx as u32);
-                            }
-                        }
-                        if let Some((id, permit)) = bounded {
+                        // Take the permit and the id out of the entry before
+                        // it is popped: the permit must go back to the pool
+                        // here, never by dropping the entry.
+                        if let Some(permit) = entry.permit.take() {
                             self.send_copy_pool.release_reservation(permit);
                             self.capacity_released = true;
-                            self.settled_sends.push_back((id, Ok(written)));
+                        }
+                        if let Some((id, len)) = entry.send_id.take() {
+                            self.settled_sends.push_back((id, Ok(len)));
                         }
                         self.pending_sends[idx].pop_front();
                     } else {
@@ -929,7 +918,7 @@ impl Drop for Driver {
         let pool = &mut self.send_copy_pool;
         for queue in self.pending_sends.iter_mut() {
             for entry in queue.drain(..) {
-                if let Some((_id, permit)) = entry.bounded {
+                if let Some(permit) = entry.permit {
                     pool.release_reservation(permit);
                 }
             }
@@ -1329,9 +1318,9 @@ pub(crate) mod tests {
             entry.data.len() <= bound.bytes(),
             "the bound must cover what rustls produced"
         );
-        assert_eq!(entry.bounded.as_ref().map(|(qid, _)| *qid), Some(id));
+        assert_eq!(entry.send_id.map(|(qid, _)| qid), Some(id));
         assert_eq!(
-            entry.bounded.as_ref().map(|(_, p)| p.remaining()),
+            entry.permit.as_ref().map(|p| p.remaining()),
             Some(2),
             "the permit left on the entry is the shrunk one"
         );
@@ -1479,15 +1468,12 @@ pub(crate) mod tests {
         let entry = &driver.pending_sends[idx][0];
         assert_eq!(entry.data.len(), 200);
         assert_eq!(entry.offset, 0);
-        assert!(
-            entry.notify_len.is_none(),
-            "a bounded entry routes by id, not through the send() completion queue"
-        );
         assert_eq!(
-            entry.bounded.as_ref().map(|(qid, _)| *qid),
+            entry.send_id.map(|(qid, _)| qid),
             Some(id),
-            "the entry carries its id and permit"
+            "the entry carries its id"
         );
+        assert!(entry.permit.is_some(), "the entry carries its permit");
         assert!(
             driver.settled_sends.is_empty(),
             "queueing completes nothing"
@@ -1627,10 +1613,7 @@ pub(crate) mod tests {
         assert_eq!(driver.pending_sends[idx].len(), 1, "the entry survives");
         assert_eq!(driver.pending_sends[idx][0].offset, written as usize);
         assert_eq!(
-            driver.pending_sends[idx][0]
-                .bounded
-                .as_ref()
-                .map(|(qid, _)| *qid),
+            driver.pending_sends[idx][0].send_id.map(|(qid, _)| qid),
             Some(id),
             "id and permit stay with the unfinished entry"
         );
@@ -1937,7 +1920,7 @@ pub(crate) mod tests {
             .send_copy_pool
             .reserve_slots(1)
             .expect("a free slot to promise");
-        driver.pending_sends[idx].push_back(PendingSend::bounded(Vec::new(), id, permit));
+        driver.pending_sends[idx].push_back(PendingSend::bounded(Vec::new(), id, 0, permit));
         assert_eq!(driver.send_copy_pool.free_count(), 3);
 
         let (all_flushed, written) = driver.flush_sends(conn_index).expect("flush");

@@ -74,6 +74,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- An awaited send resolves with the length its caller passed. Under TLS
+  that is the plaintext length: `send().await` used to report the ciphertext
+  of the send's last record on io_uring and of all its records on mio, and
+  `send_backpressured` the ciphertext on mio. A copy, zero-copy or
+  recv-forward send whose completion reports zero bytes now resolves with a
+  `WriteZero` error instead of `Ok(0)`, as `send_backpressured` already did.
+  A `SendFuture` polled again after it resolved panics; it used to return
+  `Pending` (#617).
+
 - The per-operation completion counters (`op` label) for io_uring rename
   `send_msg_coalesced_poll_out`, `send_recv_bufs_coalesced_poll_out` and
   `forward_write_poll_out` to `send_msg_coalesced_drain`,
@@ -298,6 +307,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   removed in the next breaking release (#579).
 
 ### Fixed
+
+- On io_uring, an awaited send could resolve with another send's result. A
+  connection had one send waiter, and any send completion on it woke the
+  waiter: a `send().await` behind a `send_nowait`, an unawaited chain, a
+  direct echo, a `forward_recv_buf` or a `send_backpressured` resolved with
+  that send's byte count, and the awaited send's own completion then found no
+  waiter. Two awaited sends in flight at once on one connection could hang;
+  on mio they resolved with each other's lengths.
+  Every awaited send (`send`, `submit_batch_await`, `send_chain`,
+  `forward_held`) now owns an entry in the worker's send completion table,
+  and only its own completion settles it, on both backends. Two awaited sends
+  in flight at once each resolve with their own result (#617).
+
+- `send_chain` with a closure that submits nothing, and an awaited `send` of
+  no bytes, resolve `Ok(0)`. With no other send in flight on the connection
+  they used to hang (#617).
 
 - On io_uring, a second `forward_recv_buf` (on `ConnCtx` or `SendHalf`)
   called while an earlier one's send was still in flight overwrote that

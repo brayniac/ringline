@@ -41,14 +41,18 @@ mechanism to every awaited send.
 | `Aborted(err)` | Teardown recorded this before the driver reported. A driver result overwrites it. |
 | `Abandoned` | The future was dropped while the operation was in flight. The driver's completion frees the slot. |
 
-Lookups are by index, so `complete`, `take_result`, `set_owner` and the
-cancel of an admitted operation are O(1); `mark_submitted` and the cancel
-of a waiting one search the FIFO. `remove_connection` scans every slot
-once per connection teardown.
+Lookups are by index, so `register`, `complete`, `take_result`,
+`set_owner` and the cancel of an admitted operation are O(1);
+`mark_submitted` and the cancel of a waiting one search the FIFO. Each
+entry is also listed under its target connection and, when a connection
+task owns it, under that task, so `remove_connection` visits only the
+entries it can affect.
 
-The state rules are the ones bounded sends already have, unchanged: a driver result wins over a teardown abort, the first
+The state rules: a driver result wins over a teardown abort, the first
 driver result wins over a second, and teardown drops the entries owned by
 the connection's own task (its future is gone and nothing can take them).
+A submission that fails withdraws its entry (`withdraw`), since no
+completion will free it.
 
 The bounded-send FIFO (`SendCompletions::waiting`) keeps only admission
 order: the ids of waiting operations. Their required slots, owner and
@@ -75,26 +79,31 @@ their completions settle nothing.
 ## The reported length
 
 A send settles with the length its caller passed: the plaintext length
-under TLS, the sum of the parts for a batch, the chain's total. This is
-the number bounded sends already report. Under TLS a plain `send()` used
-to report the ciphertext bytes of its records, which no caller can relate
-to what it sent.
+under TLS, and the sum of the parts for a batch. A chain settles with the
+bytes its operations' CQEs reported.
 
 ## Failure
 
 - The in-flight operation fails: its id settles with the errno
-  (`WriteZero` for a zero-byte completion).
+  (`WriteZero` for a zero-byte completion of a copy, zero-copy or
+  recv-forward send).
 - A failure, close or give-up drains the connection's queue: every id on
   a drained entry settles `ConnectionAborted`.
-- A completion that arrives after `close_submitted`: its id settles
-  `ECANCELED`.
+- A completion, or a dropped retry, that arrives after `close_submitted`:
+  its id settles `ECANCELED`.
+- A completion for a connection slot that has since been reused settles
+  nothing (teardown already recorded the abort); it frees an `Abandoned`
+  entry (`forget`).
 - Connection teardown: `Executor::remove_connection` records a provisional
-  `Aborted(ConnectionAborted)` for every entry on that connection.
+  `Aborted(ConnectionAborted)` for every entry on that connection, except
+  entries owned by the connection's own task, which are dropped (in
+  flight: `Abandoned`).
 - Worker shutdown: the table is dropped with the executor.
 
 Every disposal path that releases a carrier must take its id first. The
-copy pool's `release` debug-asserts that the slot no longer carries one;
-the slab entry and the chain state get the same check.
+copy pool's `release` debug-asserts that the slot no longer carries one.
+The slab entry's `release` clears the id without a check, and
+`ChainState` has none.
 
 ## The futures
 

@@ -62,18 +62,6 @@ pub(crate) struct ConnSendState {
     /// true, the runtime force-closes the connection.
     #[cfg_attr(not(has_io_uring), allow(dead_code))]
     pub close_notify_deadline: Option<std::time::Instant>,
-    /// Bytes acknowledged so far for the in-progress logical send.
-    ///
-    /// A logical send larger than one send-pool slot is split into
-    /// several `BuiltSend` chunks that complete as separate CQEs, but the
-    /// connection has exactly one send waiter. Waking that waiter on the
-    /// first chunk's completion reports a short byte count while the
-    /// remaining chunks are still queued or in flight, and consumes the
-    /// waiter so their completions are dropped. Instead, each chunk's
-    /// completion accumulates here; the waiter is woken exactly once, when
-    /// the send queue fully drains, reporting the whole logical byte count.
-    #[cfg_attr(not(has_io_uring), allow(dead_code))]
-    pub acked_bytes: u32,
     /// Whether a deferred-or-immediate `Shutdown` SQE for the current occupant
     /// is still in the kernel.
     ///
@@ -101,7 +89,6 @@ impl ConnSendState {
             close_submitted: false,
             close_send_count: 0,
             close_notify_deadline: None,
-            acked_bytes: 0,
             shutdown_inflight: false,
         }
     }
@@ -484,6 +471,27 @@ impl<'a> DriverCtx<'a> {
     /// which also names the one case that stays fatal). The user-facing
     /// contract lives on `ConnCtx::send`.
     pub fn send(&mut self, conn: ConnToken, data: &[u8]) -> io::Result<()> {
+        self.send_inner(conn, data, None)
+    }
+
+    /// [`send`](Self::send), with `id` attached to the send's final chunk:
+    /// its completion settles `id` with `data.len()`. On `Err` nothing was
+    /// queued and `id` is the caller's to cancel.
+    pub(crate) fn send_awaited(
+        &mut self,
+        conn: ConnToken,
+        data: &[u8],
+        id: crate::runtime::send_completion::SendId,
+    ) -> io::Result<()> {
+        self.send_inner(conn, data, Some(id))
+    }
+
+    fn send_inner(
+        &mut self,
+        conn: ConnToken,
+        data: &[u8],
+        id: Option<crate::runtime::send_completion::SendId>,
+    ) -> io::Result<()> {
         let conn_state = self
             .connections
             .get(conn.index)
@@ -509,6 +517,9 @@ impl<'a> DriverCtx<'a> {
             let tls_table = unsafe { &mut *self.tls_table };
             if tls_table.get_mut(conn.index).is_some() {
                 let sends = self.encrypt_tls_send(conn, data)?;
+                if let Some(id) = id {
+                    self.attach_send_id(sends.last(), id, data.len() as u32);
+                }
                 // Route every ciphertext chunk through the per-connection
                 // send queue: io_uring doesn't order independent SQEs, and
                 // a partial-send resubmit would interleave chunks on the
@@ -547,10 +558,8 @@ impl<'a> DriverCtx<'a> {
 
         // Chunk data that exceeds the send copy slot size. Each chunk gets its
         // own pool slot and SQE; the per-connection send queue ensures they are
-        // transmitted in order. Only the final chunk is marked end-of-send, so
-        // the waiter is woken once for the whole logical send rather than once
-        // per chunk (which would report a short count and, for pipelined sends,
-        // wake the wrong future).
+        // transmitted in order. Only the final chunk is marked end-of-send,
+        // and only that chunk carries the send's id, so the send settles once.
         //
         // `submit_or_queue` is infallible: it pushes to the ring only while
         // nothing is in flight (the first chunk) and parks that chunk at the
@@ -558,12 +567,21 @@ impl<'a> DriverCtx<'a> {
         // it. So once the reservation is granted the whole buffer is
         // committed, in order.
         let mut chunks = data.chunks(slot_size).peekable();
+        if chunks.peek().is_none()
+            && let Some(id) = id
+        {
+            // No bytes, no SQE, no completion: settle now.
+            self.settled_sends_push(id, Ok(0));
+        }
         while let Some(chunk) = chunks.next() {
             let (slot, ptr, len) = self
                 .send_copy_pool
                 .copy_in_reserved(&mut reservation, chunk);
-            self.send_copy_pool
-                .set_end_of_send(slot, chunks.peek().is_none());
+            let end_of_send = chunks.peek().is_none();
+            self.send_copy_pool.set_end_of_send(slot, end_of_send);
+            if end_of_send && let Some(id) = id {
+                self.send_copy_pool.set_send_id(slot, id, data.len() as u32);
+            }
 
             let user_data = crate::completion::UserData::encode(
                 crate::completion::OpTag::Send,
@@ -599,9 +617,8 @@ impl<'a> DriverCtx<'a> {
     /// `id` and the **logical (plaintext) length** are attached to the
     /// end-of-send slot, so the completion handler can resolve exactly this
     /// operation with exactly the number the caller passed. The length
-    /// travels because nothing downstream can recompute it: `handle_send`
-    /// accumulates wire bytes, and a TLS send's final `OpTag::Send` chunk is
-    /// one ciphertext record.
+    /// travels because nothing downstream can recompute it: a TLS send's
+    /// final `OpTag::Send` chunk is one ciphertext record.
     ///
     /// Admission is the caller's: `Executor`'s send-capacity FIFO only lets
     /// this id's turn come up when the pool can take the whole message
@@ -775,9 +792,9 @@ impl<'a> DriverCtx<'a> {
             let end_of_send = chunks.peek().is_none();
             self.send_copy_pool.set_end_of_send(slot, end_of_send);
             if end_of_send {
-                // Exactly one slot per logical send carries the id, and it
-                // is the one every success path already reads
-                // (`is_end_of_send`) before releasing.
+                // Exactly one slot per logical send carries the id, and the
+                // completion handlers take it from that slot before
+                // releasing it.
                 self.send_copy_pool.set_send_id(slot, id, data.len() as u32);
                 attached = true;
             }
@@ -857,6 +874,26 @@ impl<'a> DriverCtx<'a> {
         ))
     }
 
+    /// Attach `id` to the resource whose completion ends `built`: its slab
+    /// entry if it has one, otherwise its pool slot. `len` is what the send
+    /// reports on success. With no `built` (a send that produced no SQE),
+    /// `id` settles now with `len`.
+    pub(crate) fn attach_send_id(
+        &mut self,
+        built: Option<&BuiltSend>,
+        id: crate::runtime::send_completion::SendId,
+        len: u32,
+    ) {
+        match built {
+            Some(b) if b.slab_idx != u16::MAX => self.send_slab.set_send_id(b.slab_idx, id, len),
+            Some(b) if b.pool_slot != u16::MAX => {
+                self.send_copy_pool.set_send_id(b.pool_slot, id, len)
+            }
+            Some(_) => debug_assert!(false, "an awaited send without a carrier"),
+            None => self.settled_sends_push(id, Ok(len)),
+        }
+    }
+
     /// Queue a batch of built sends in order through the per-connection
     /// send queue. Infallible: `submit_or_queue` parks under SQ pressure
     /// rather than failing, so every entry is committed in order and nothing
@@ -874,7 +911,7 @@ impl<'a> DriverCtx<'a> {
     /// parked at the head of the (empty) queue with `in_flight = true` and
     /// the connection is registered on `pending_send_retries`; the event
     /// loop's `drain_send_retries` re-pushes it next iteration and, after
-    /// two failed attempts, fails the send waiter and closes the connection.
+    /// two failed attempts, fails the queued sends and closes the connection.
     /// Nothing is dropped or released here (Domain Invariant 7).
     pub(crate) fn submit_or_queue(&mut self, conn_index: u32, built: BuiltSend) {
         // An active IO_LINK chain counts as in flight: io_uring does not order
@@ -924,10 +961,22 @@ impl<'a> DriverCtx<'a> {
             ctx: self,
             conn,
             built: Vec::new(),
-            total_bytes: 0,
             error: None,
             finished: false,
+            send_id: None,
         }
+    }
+
+    /// [`send_chain`](Self::send_chain), with `id` settled by the chain's
+    /// completion once `finish` submits it.
+    pub(crate) fn send_chain_awaited(
+        &mut self,
+        conn: ConnToken,
+        id: crate::runtime::send_completion::SendId,
+    ) -> SendChainBuilder<'_, 'a> {
+        let mut builder = self.send_chain(conn);
+        builder.send_id = Some(id);
+        builder
     }
 
     /// Begin building a scatter-gather send with mixed copy + zero-copy guard parts.
@@ -944,6 +993,7 @@ impl<'a> DriverCtx<'a> {
             guard_count: 0,
             total_len: 0,
             error: None,
+            send_id: None,
         }
     }
 
@@ -2652,8 +2702,6 @@ pub struct DriverCtx<'a> {
     pub(crate) pending_closes: &'a mut Vec<u32>,
     /// Per-connection writable flag.
     pub(crate) writable: &'a mut Vec<bool>,
-    /// Per-connection send completion queue (byte counts for awaitable sends).
-    pub(crate) send_completions: &'a mut Vec<std::collections::VecDeque<u32>>,
     /// Worker-wide bounded-send results, keyed by the id the submitting
     /// future holds (see `Driver::settled_sends`). `send_bounded`
     /// pushes here only when it completes an operation without queueing it;
@@ -2670,8 +2718,6 @@ pub struct DriverCtx<'a> {
     pub(crate) connect_deadlines: &'a mut Vec<Option<std::time::Instant>>,
     pub(crate) sends_dirty: &'a mut Vec<u32>,
     pub(crate) sends_dirty_flag: &'a mut Vec<bool>,
-    pub(crate) completions_dirty: &'a mut Vec<u32>,
-    pub(crate) completions_dirty_flag: &'a mut Vec<bool>,
     pub(crate) connect_pending: &'a mut u32,
     /// Shared disk I/O pool for filesystem operations.
     pub(crate) disk_io_pool: &'a Option<std::sync::Arc<crate::disk_io_pool::DiskIoPool>>,
@@ -2723,6 +2769,28 @@ impl<'a> DriverCtx<'a> {
     /// For TLS connections, data is encrypted and written directly to the
     /// TcpStream (bypassing the pending send queue).
     pub fn send(&mut self, conn: ConnToken, data: &[u8]) -> io::Result<()> {
+        self.send_inner(conn, data, None)
+    }
+
+    /// [`send`](Self::send), with `id` carried on the queued entry: it
+    /// settles with `data.len()` once the entry's last byte reaches the
+    /// socket. On `Err` nothing was queued and `id` is the caller's to
+    /// cancel.
+    pub(crate) fn send_awaited(
+        &mut self,
+        conn: ConnToken,
+        data: &[u8],
+        id: crate::runtime::send_completion::SendId,
+    ) -> io::Result<()> {
+        self.send_inner(conn, data, Some(id))
+    }
+
+    fn send_inner(
+        &mut self,
+        conn: ConnToken,
+        data: &[u8],
+        id: Option<crate::runtime::send_completion::SendId>,
+    ) -> io::Result<()> {
         let conn_state = self
             .connections
             .get(conn.index)
@@ -2735,24 +2803,27 @@ impl<'a> DriverCtx<'a> {
         }
 
         // TLS path: encrypt and push ciphertext into the pending send queue.
-        if !self.tls_table.is_null() {
+        let tls = !self.tls_table.is_null() && unsafe { (*self.tls_table).has(conn.index) };
+        let bytes = if tls {
             let tls_table = unsafe { &mut *self.tls_table };
-            if tls_table.has(conn.index) {
-                let ciphertext = crate::tls::encrypt_for_send_mio(tls_table, conn.index, data)?;
-                if !ciphertext.is_empty() {
-                    let idx = conn.index as usize;
-                    self.pending_sends[idx]
-                        .push_back(crate::backend::mio::driver::PendingSend::plain(ciphertext));
-                    self.mark_send_dirty(idx);
-                }
+            crate::tls::encrypt_for_send_mio(tls_table, conn.index, data)?
+        } else {
+            data.to_vec()
+        };
+        let idx = conn.index as usize;
+        let entry = match id {
+            // Nothing to write, so nothing will complete it: settle now.
+            Some(id) if bytes.is_empty() => {
+                self.settled_sends.push_back((id, Ok(data.len() as u32)));
                 return Ok(());
             }
-        }
-
-        let idx = conn.index as usize;
-        self.pending_sends[idx].push_back(crate::backend::mio::driver::PendingSend::plain(
-            data.to_vec(),
-        ));
+            Some(id) => {
+                crate::backend::mio::driver::PendingSend::awaited(bytes, id, data.len() as u32)
+            }
+            None if tls && bytes.is_empty() => return Ok(()),
+            None => crate::backend::mio::driver::PendingSend::plain(bytes),
+        };
+        self.pending_sends[idx].push_back(entry);
         self.mark_send_dirty(idx);
         Ok(())
     }
@@ -2886,7 +2957,10 @@ impl<'a> DriverCtx<'a> {
                 *self.capacity_released = true;
             }
             self.pending_sends[idx].push_back(crate::backend::mio::driver::PendingSend::bounded(
-                ciphertext, id, permit,
+                ciphertext,
+                id,
+                data.len() as u32,
+                permit,
             ));
             self.mark_send_dirty(idx);
             return Ok(());
@@ -2904,6 +2978,7 @@ impl<'a> DriverCtx<'a> {
         self.pending_sends[idx].push_back(crate::backend::mio::driver::PendingSend::bounded(
             data.to_vec(),
             id,
+            data.len() as u32,
             permit,
         ));
         self.mark_send_dirty(idx);
@@ -2937,25 +3012,6 @@ impl<'a> DriverCtx<'a> {
         if !self.sends_dirty_flag[idx] {
             self.sends_dirty_flag[idx] = true;
             self.sends_dirty.push(idx as u32);
-        }
-    }
-
-    /// Mark the most recently queued pending send as awaitable: its
-    /// completion (`wake_send(Ok(len))`) is delivered when the entry has
-    /// fully reached the socket, not at queue time.
-    pub(crate) fn mark_last_send_awaited(&mut self, conn_index: u32) {
-        let idx = conn_index as usize;
-        if let Some(entry) = self.pending_sends[idx].back_mut() {
-            entry.notify_len = Some((entry.data.len() - entry.offset) as u32);
-        } else {
-            // The send was flushed... it can't have been (mio sends are
-            // queued, never written inline) — but if the queue is somehow
-            // empty, deliver a zero-byte completion so the future resolves.
-            self.send_completions[idx].push_back(0);
-            if !self.completions_dirty_flag[idx] {
-                self.completions_dirty_flag[idx] = true;
-                self.completions_dirty.push(idx as u32);
-            }
         }
     }
 
@@ -3858,6 +3914,8 @@ pub struct SendBuilder<'b, 'a> {
     guard_count: u8,
     total_len: u32,
     error: Option<io::Error>,
+    /// Settled by the send's completion; see `submit_awaited`.
+    send_id: Option<crate::runtime::send_completion::SendId>,
 }
 
 #[cfg(has_io_uring)]
@@ -3915,6 +3973,25 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
         self
     }
 
+    /// [`submit`](Self::submit), with `id` settled by the send's completion
+    /// with the total length of its parts. On `Err` nothing was queued and
+    /// `id` is the caller's to cancel.
+    pub(crate) fn submit_awaited(
+        mut self,
+        id: crate::runtime::send_completion::SendId,
+    ) -> io::Result<()> {
+        self.send_id = Some(id);
+        self.submit()
+    }
+
+    /// Attach the awaited id, if any, to `built`, then submit or queue it.
+    fn commit(&mut self, built: BuiltSend) {
+        if let Some(id) = self.send_id {
+            self.ctx.attach_send_id(Some(&built), id, self.total_len);
+        }
+        self.ctx.submit_or_queue(self.conn.index, built);
+    }
+
     /// Submit the scatter-gather send.
     pub fn submit(mut self) -> io::Result<()> {
         if let Some(e) = self.error.take() {
@@ -3922,6 +3999,9 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
         }
 
         if self.part_count == 0 {
+            if let Some(id) = self.send_id {
+                self.ctx.attach_send_id(None, id, 0);
+            }
             return Ok(());
         }
 
@@ -3997,6 +4077,9 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
             *g = None;
         }
         let sends = self.ctx.encrypt_tls_send(self.conn, &plaintext)?;
+        if let Some(id) = self.send_id {
+            self.ctx.attach_send_id(sends.last(), id, self.total_len);
+        }
         self.ctx.queue_built_sends(self.conn.index, sends);
         Ok(())
     }
@@ -4188,7 +4271,7 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
     /// Copy-only path: gather all copy parts, submit or queue.
     fn submit_copy_only(mut self) -> io::Result<()> {
         let built = self.build_copy_only()?;
-        self.ctx.submit_or_queue(self.conn.index, built);
+        self.commit(built);
         Ok(())
     }
 
@@ -4253,14 +4336,14 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
             total_len: self.total_len,
         };
         // Data is in the pool slot now — guards can die with `self` after return.
-        self.ctx.submit_or_queue(self.conn.index, built);
+        self.commit(built);
         Ok(true)
     }
 
     /// Mixed copy+guard path: submit or queue.
     fn submit_with_guards(mut self) -> io::Result<()> {
         let built = self.build_with_guards()?;
-        self.ctx.submit_or_queue(self.conn.index, built);
+        self.commit(built);
         Ok(())
     }
 }
@@ -4277,9 +4360,10 @@ pub struct SendChainBuilder<'b, 'a> {
     ctx: &'b mut DriverCtx<'a>,
     conn: ConnToken,
     built: Vec<BuiltSend>,
-    total_bytes: u32,
     error: Option<io::Error>,
     finished: bool,
+    /// Carried into the chain's `ChainState` by `finish`.
+    send_id: Option<crate::runtime::send_completion::SendId>,
 }
 
 #[cfg(has_io_uring)]
@@ -4315,7 +4399,6 @@ impl<'b, 'a> SendChainBuilder<'b, 'a> {
             .build()
             .user_data(user_data.raw());
 
-        self.total_bytes += data.len() as u32;
         self.built.push(BuiltSend {
             entry,
             pool_slot: slot,
@@ -4358,7 +4441,6 @@ impl<'b, 'a> SendChainBuilder<'b, 'a> {
             return Ok(());
         }
 
-        let total_bytes = self.total_bytes;
         let conn_index = self.conn.index;
 
         // Close already submitted — chain SQEs would race it. finished stays
@@ -4390,16 +4472,17 @@ impl<'b, 'a> SendChainBuilder<'b, 'a> {
             unsafe {
                 self.ctx.ring.push_sqe(&self.built[0].entry)?;
             }
-            self.ctx.chain_table.start(conn_index, 1, total_bytes);
+            self.ctx.chain_table.start(conn_index, 1);
         } else {
             let mut entries: Vec<io_uring::squeue::Entry> =
                 self.built.iter().map(|b| b.entry.clone()).collect();
             unsafe {
                 self.ctx.ring.push_sqe_chain(&mut entries)?;
             }
-            self.ctx
-                .chain_table
-                .start(conn_index, count as u16, total_bytes);
+            self.ctx.chain_table.start(conn_index, count as u16);
+        }
+        if let Some(id) = self.send_id {
+            self.ctx.chain_table.set_send_id(conn_index, id);
         }
 
         // Submission succeeded — resources now owned by kernel/CQE handlers.
@@ -4798,7 +4881,6 @@ impl<'b, 'a> ChainPartsBuilder<'b, 'a> {
             }
         };
 
-        self.chain.total_bytes += built.total_len;
         self.chain.built.push(built);
         self.chain
     }

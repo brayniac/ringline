@@ -1,22 +1,22 @@
-//! Per-worker admission queue and completion table for bounded
-//! (backpressured) sends.
+//! Per-worker completion table for awaited sends, and the admission FIFO
+//! for bounded sends.
 //!
-//! A bounded send (`ConnCtx::send_backpressured`, series PR 9) may only
-//! reserve copy-pool slots once it is the *oldest* waiter on the worker and
-//! the pool can admit its whole message. This module is the FIFO that
-//! decides whose turn it is, tracks each admitted operation until its
-//! completion arrives, and hands the exact result of that one operation
-//! back to the future that submitted it.
+//! Every awaited send (`ConnCtx::send`, `submit_batch_await`, `send_chain`,
+//! `forward_held`, `send_backpressured`) holds an entry here, named by the
+//! [`SendId`] its future keeps. The driver settles the entry when that send
+//! completes, and the future resolves with the result of that one send.
+//! A bounded send (`ConnCtx::send_backpressured`) is also admission-
+//! controlled: it may only reserve copy-pool slots once it is the *oldest*
+//! waiter on the worker and the pool can admit its whole message.
 //!
-//! The queue is plain worker-local state owned by the [`Executor`], next to
-//! the other per-connection waiter bookkeeping. Every operation, waiting or
-//! admitted, holds a slot in a table indexed by its id, and the waiting ones
-//! are also listed in arrival order. `set_owner`, `complete` and
-//! `take_result` are index lookups; `enqueue` reuses a freed slot or appends
-//! one; `mark_submitted` and the cancel of a waiting entry search the
-//! waiting list. Only the teardown paths (`remove_connection`, which scans
-//! the table, and `fail_waiting`) build a small `Vec` of task ids to wake.
-//! Design: `docs/send-completion-slots-design.md`.
+//! The table is plain worker-local state owned by the [`Executor`]. Every
+//! entry holds a slot indexed by its id, and is also listed under its target
+//! connection and, when a connection task owns it, under that task; waiting
+//! bounded sends are listed in arrival order. `register`, `set_owner`,
+//! `complete`, `take_result` and the cancel of an admitted entry are index
+//! lookups; `mark_submitted` and the cancel of a waiting entry search the
+//! waiting list; `remove_connection` visits the entries listed under its
+//! connection. Design: `docs/send-completion-slots-design.md`.
 //!
 //! Lifecycle of one entry:
 //!
@@ -35,7 +35,7 @@
 //! from [`Executor::remove_connection`], and on mio that has three callers,
 //! not one: `drain_pending_closes` (step 6b of the run loop, after the
 //! flush) *and* `poll_ready_tasks` (step 6, before it) for a connection task
-//! that returned `Poll::Ready` or panicked. So a bounded send owned by a
+//! that returned `Poll::Ready` or panicked. So an awaited send owned by a
 //! task that outlives the connection can be aborted by teardown at step 6
 //! and then written to the socket in full by step 6a's flush, in the same
 //! iteration. Teardown therefore records `Aborted`, not `Done`, and
@@ -47,14 +47,12 @@
 //! only between two *driver* results for one id.
 //!
 //! Every entry records the task id that owns it. The owner is refreshed on
-//! each poll (`set_owner`, the same discipline `SendFuture` follows with
-//! `owner_task`), and the `Executor` wrappers call `wake_task` immediately on
+//! each poll of its future (`set_owner`), and the `Executor` wrappers call `wake_task` immediately on
 //! whatever id the queue returns — no deferred wake list. Between a
 //! completion and the next poll no poll runs, so the owner resolved at
 //! completion time is the owner that will be polled.
 //!
-//! Design: `docs/send-capacity-fifo-design.md` (series PR 5 of
-//! `docs/backpressured-sends-series-design.md`).
+//! Admission design: `docs/send-capacity-fifo-design.md`.
 
 use std::collections::VecDeque;
 use std::io;
@@ -116,7 +114,8 @@ struct Slot {
     entry: Option<Entry>,
 }
 
-/// Admission queue and completion table for bounded sends on one worker.
+/// Completion table for awaited sends, and admission FIFO for bounded
+/// sends, on one worker.
 ///
 /// Owned by [`Executor::send_completions`]; the `Executor` methods further down
 /// in this file are the only intended entry points outside tests, because
@@ -130,6 +129,37 @@ pub(crate) struct SendCompletions {
     free: Vec<u32>,
     /// Waiting operations in arrival order. Only the head may be admitted.
     waiting: VecDeque<SendId>,
+    /// Slot indices of the live operations targeting each connection,
+    /// indexed by connection index.
+    by_conn: Vec<Vec<u32>>,
+    /// Slot indices of the live operations owned by each connection task,
+    /// indexed by task id. Standalone tasks are not indexed:
+    /// [`remove_connection`](Self::remove_connection) never looks them up.
+    by_task: Vec<Vec<u32>>,
+}
+
+/// Record `index` under `key`.
+fn index_add(lists: &mut Vec<Vec<u32>>, key: u32, index: u32) {
+    let key = key as usize;
+    if lists.len() <= key {
+        lists.resize_with(key + 1, Vec::new);
+    }
+    lists[key].push(index);
+}
+
+/// Forget `index` under `key`. A list holds the few operations of one
+/// connection or task, so the search is short.
+fn index_remove(lists: &mut [Vec<u32>], key: u32, index: u32) {
+    if let Some(list) = lists.get_mut(key as usize)
+        && let Some(pos) = list.iter().position(|&i| i == index)
+    {
+        list.swap_remove(pos);
+    }
+}
+
+/// Whether `task_id` is a connection task, the only kind `by_task` indexes.
+fn is_connection_task(task_id: u32) -> bool {
+    task_id & crate::runtime::waker::STANDALONE_BIT == 0
 }
 
 impl SendCompletions {
@@ -151,6 +181,10 @@ impl SendCompletions {
                 index
             }
         };
+        index_add(&mut self.by_conn, entry.conn_index, index);
+        if is_connection_task(entry.task_id) {
+            index_add(&mut self.by_task, entry.task_id, index);
+        }
         let slot = &mut self.slots[index as usize];
         slot.entry = Some(entry);
         SendId {
@@ -178,13 +212,22 @@ impl SendCompletions {
     /// Free the slot `id` names and return its operation. The slot's
     /// generation advances, so `id` and every copy of it go stale.
     fn remove(&mut self, id: SendId) -> Option<Entry> {
-        let slot = self
-            .slots
-            .get_mut(id.index as usize)
-            .filter(|slot| slot.generation == id.generation)?;
+        if self.slots.get(id.index as usize)?.generation != id.generation {
+            return None;
+        }
+        self.free_index(id.index)
+    }
+
+    /// Free slot `index`, whatever its generation, and return its operation.
+    fn free_index(&mut self, index: u32) -> Option<Entry> {
+        let slot = &mut self.slots[index as usize];
         let entry = slot.entry.take()?;
         slot.generation = slot.generation.wrapping_add(1);
-        self.free.push(id.index);
+        self.free.push(index);
+        index_remove(&mut self.by_conn, entry.conn_index, index);
+        if is_connection_task(entry.task_id) {
+            index_remove(&mut self.by_task, entry.task_id, index);
+        }
         Some(entry)
     }
 
@@ -198,7 +241,7 @@ impl SendCompletions {
 
     /// Append a waiter and return its id.
     ///
-    /// Called by PR 9's `send_backpressured` on its first poll, with the
+    /// Called by `BackpressuredSendFuture` on its first poll, with the
     /// connection it targets, the number of copy-pool slots its message
     /// needs, and the polling task's id.
     pub(crate) fn enqueue(
@@ -220,22 +263,75 @@ impl SendCompletions {
         id
     }
 
+    /// Register an awaited send that needs no admission, already `InFlight`,
+    /// and return its id.
+    ///
+    /// Called by the awaiting send APIs (`ConnCtx::send`,
+    /// `submit_batch_await`, `send_chain`, `forward_held`) before they
+    /// submit. A submission that fails must [`withdraw`](Self::withdraw) the id
+    /// it registered.
+    pub(crate) fn register(&mut self, conn_index: u32, task_id: u32) -> SendId {
+        self.insert(Entry {
+            conn_index,
+            task_id,
+            state: Completion::InFlight,
+        })
+    }
+
     /// Record the task that currently owns `id`, whether it is waiting or
     /// submitted. A no-op for an unknown id.
     ///
-    /// Called by PR 9's future on every poll after the first, so that a
+    /// Called by the send futures on every poll after the first, so that a
     /// future moved between tasks (or polled from a different task than the
     /// one that enqueued it) is woken where it now lives.
     pub(crate) fn set_owner(&mut self, id: SendId, task_id: u32) {
-        if let Some(e) = self.entry_mut(id) {
-            e.task_id = task_id;
+        let Some(e) = self.entry_mut(id) else {
+            return;
+        };
+        let old = std::mem::replace(&mut e.task_id, task_id);
+        if old != task_id {
+            if is_connection_task(old) {
+                index_remove(&mut self.by_task, old, id.index);
+            }
+            if is_connection_task(task_id) {
+                index_add(&mut self.by_task, task_id, id.index);
+            }
+        }
+    }
+
+    /// Remove `id`, which no submission took: its send was refused or
+    /// queued nothing, so no completion will ever arrive for it. Unlike
+    /// [`cancel`](Self::cancel), which leaves an in-flight entry for its
+    /// completion to free, this frees it now.
+    ///
+    /// Called by the awaited send APIs when their submission fails.
+    pub(crate) fn withdraw(&mut self, id: SendId) {
+        if matches!(self.entry(id).map(|e| &e.state), Some(Completion::InFlight)) {
+            self.remove(id);
+        }
+    }
+
+    /// A completion for `id` arrived that must not settle it, because its
+    /// connection has been torn down: teardown already recorded the abort,
+    /// and a driver result would override it. An `Abandoned` entry waits
+    /// for exactly this completion, so it is freed; any other state is left
+    /// for its future to take.
+    ///
+    /// Called by the completion handlers' stale-generation branches.
+    #[cfg_attr(not(has_io_uring), allow(dead_code))]
+    pub(crate) fn forget(&mut self, id: SendId) {
+        if matches!(
+            self.entry(id).map(|e| &e.state),
+            Some(Completion::Abandoned)
+        ) {
+            self.remove(id);
         }
     }
 
     /// Whether `id` may reserve slots now: it must be the head of the queue
     /// *and* `free_slots` must cover its `required_slots`.
     ///
-    /// Called by PR 9's future on each poll while waiting; a `false` parks
+    /// Called by `BackpressuredSendFuture` on each poll while waiting; a `false` parks
     /// the future until [`head_ready`](Self::head_ready) or a promotion
     /// wakes it.
     pub(crate) fn turn(&self, id: SendId, free_slots: usize) -> bool {
@@ -249,7 +345,7 @@ impl SendCompletions {
     /// Returns `None` if `id` was not the head, if there is no new head, or
     /// if `id` is not waiting.
     ///
-    /// Called by PR 9's future right after it reserved its slots and
+    /// Called by `BackpressuredSendFuture` right after it reserved its slots and
     /// submitted the send.
     pub(crate) fn mark_submitted(&mut self, id: SendId) -> Option<u32> {
         let pos = self.waiting.iter().position(|&w| w == id)?;
@@ -273,7 +369,7 @@ impl SendCompletions {
     /// [`remove_connection`](Self::remove_connection) already resolved and
     /// the future already collected.
     ///
-    /// Called by the backends' send-completion handlers (PRs 6 and 7).
+    /// Called by the backends' send-completion handlers.
     pub(crate) fn complete(&mut self, id: SendId, result: io::Result<u32>) -> Option<u32> {
         let e = self.entry_mut(id)?;
         match e.state {
@@ -298,7 +394,7 @@ impl SendCompletions {
     /// was torn down before the driver ever reported has no other way to
     /// finish, and would park forever.
     ///
-    /// Called by PR 9's future on each poll after it submitted; `None`
+    /// Called by the send futures on each poll after submission; `None`
     /// parks it until [`complete`](Self::complete) wakes it.
     pub(crate) fn take_result(&mut self, id: SendId) -> Option<io::Result<u32>> {
         if !matches!(
@@ -322,7 +418,7 @@ impl SendCompletions {
     /// or `Aborted`: removed, result discarded (a driver result that arrives
     /// afterwards finds no entry and is ignored). Unknown: ignored.
     ///
-    /// Called from `BackpressuredSendFuture`'s `Drop` via `try_with_state`. A
+    /// Called from `SendFuture`'s and `BackpressuredSendFuture`'s `Drop`. A
     /// drop outside the executor skips this;
     /// [`remove_connection`](Self::remove_connection) is the backstop.
     pub(crate) fn cancel(&mut self, id: SendId) -> Option<u32> {
@@ -349,7 +445,7 @@ impl SendCompletions {
 
     /// The head's task id if `free_slots` covers its `required_slots`.
     ///
-    /// The driver's slot-release hook (PRs 6 and 7) calls this through
+    /// The driver's slot-release hook calls this through
     /// [`Executor::wake_send_capacity`] after every pool release, so the
     /// head is woken only when it can now fit rather than on every release.
     pub(crate) fn head_ready(&self, free_slots: usize) -> Option<u32> {
@@ -389,8 +485,8 @@ impl SendCompletions {
     /// waiting → removed, `InFlight` → `Abandoned` (the completion still
     /// arrives and removes it), `Done` → removed.
     ///
-    /// Scans every slot and allocates the returned `Vec`; this is the
-    /// teardown path.
+    /// Visits only the entries indexed under `conn_index`, and allocates the
+    /// returned `Vec` and a list of those entries; this is the teardown path.
     pub(crate) fn remove_connection(&mut self, conn_index: u32) -> Vec<u32> {
         let mut wakes = Vec::new();
         // `conn_index` names two things that both die here: the connection
@@ -410,8 +506,19 @@ impl SendCompletions {
         };
         let old_head = self.waiting.front().copied();
 
-        for (index, slot) in self.slots.iter_mut().enumerate() {
-            let Some(e) = slot.entry.as_mut() else {
+        // Every entry `dead_owner` matches is indexed under `conn_index`,
+        // as its target or as its connection-task owner.
+        let mut candidates: Vec<u32> = Vec::new();
+        for lists in [&self.by_conn, &self.by_task] {
+            if let Some(list) = lists.get(conn_index as usize) {
+                candidates.extend_from_slice(list);
+            }
+        }
+        candidates.sort_unstable();
+        candidates.dedup();
+
+        for index in candidates {
+            let Some(e) = self.slots[index as usize].entry.as_mut() else {
                 continue;
             };
             if !dead_owner(e) {
@@ -435,9 +542,7 @@ impl SendCompletions {
                 Completion::Abandoned => false,
             };
             if !keep {
-                slot.entry = None;
-                slot.generation = slot.generation.wrapping_add(1);
-                self.free.push(index as u32);
+                self.free_index(index);
             }
         }
         // Every waiting entry this touched is now aborted or freed.
@@ -466,7 +571,7 @@ impl SendCompletions {
     /// Returns the owners' task ids for waking, plus the new head's task id
     /// if the head was among the failed.
     ///
-    /// PR 9's `shutdown_write` calls this with `BrokenPipe` so that bounded
+    /// `ConnCtx::shutdown_write` calls this with `BrokenPipe` so that bounded
     /// sends queued behind a write shutdown fail instead of waiting forever.
     ///
     /// Records `Done`, not the provisional `Aborted`
@@ -512,6 +617,12 @@ impl SendCompletions {
         self.waiting.len()
     }
 
+    /// Operations holding a slot, waiting or admitted.
+    #[cfg(test)]
+    pub(crate) fn live(&self) -> usize {
+        self.slots.iter().filter(|s| s.entry.is_some()).count()
+    }
+
     #[cfg(test)]
     fn submitted_len(&self) -> usize {
         let live = self.slots.iter().filter(|s| s.entry.is_some()).count();
@@ -528,8 +639,7 @@ fn connection_aborted() -> io::Error {
 /// uses; the `wake_task` bool is ignored (a task that is not parked does not
 /// need waking).
 impl Executor {
-    /// [`SendCompletions::enqueue`]. PR 9, first poll of
-    /// `send_backpressured`.
+    /// [`SendCompletions::enqueue`]. `BackpressuredSendFuture`, first poll.
     pub(crate) fn enqueue_send_capacity(
         &mut self,
         conn_index: u32,
@@ -541,18 +651,39 @@ impl Executor {
             .enqueue(conn_index, generation, required_slots, task_id)
     }
 
-    /// [`SendCompletions::set_owner`]. PR 9, every later poll.
+    /// [`SendCompletions::register`], owned by the polling task. The
+    /// awaiting send APIs, before they submit.
+    pub(crate) fn register_send(&mut self, conn_index: u32) -> SendId {
+        let task_id = super::CURRENT_TASK_ID.with(|c| c.get());
+        self.send_completions.register(conn_index, task_id)
+    }
+
+    /// [`SendCompletions::withdraw`]. The awaited send APIs, when their
+    /// submission fails.
+    pub(crate) fn withdraw_send(&mut self, id: SendId) {
+        self.send_completions.withdraw(id);
+    }
+
+    /// [`SendCompletions::forget`]. The completion handlers' stale-generation
+    /// branches.
+    #[cfg_attr(not(has_io_uring), allow(dead_code))]
+    pub(crate) fn forget_send(&mut self, id: SendId) {
+        self.send_completions.forget(id);
+    }
+
+    /// [`SendCompletions::set_owner`]. The send futures, every later poll.
     pub(crate) fn set_send_owner(&mut self, id: SendId, task_id: u32) {
         self.send_completions.set_owner(id, task_id);
     }
 
-    /// [`SendCompletions::turn`]. PR 9, each poll while waiting.
+    /// [`SendCompletions::turn`]. `BackpressuredSendFuture`, each poll while
+    /// waiting.
     pub(crate) fn send_capacity_turn(&self, id: SendId, free_slots: usize) -> bool {
         self.send_completions.turn(id, free_slots)
     }
 
     /// [`SendCompletions::mark_submitted`] plus a wake of the new head.
-    /// PR 9, after the reserve-copy-submit step.
+    /// `BackpressuredSendFuture`, after the reserve-copy-submit step.
     pub(crate) fn mark_send_submitted(&mut self, id: SendId) {
         if let Some(next) = self.send_completions.mark_submitted(id) {
             let _ = self.wake_task(next);
@@ -560,20 +691,21 @@ impl Executor {
     }
 
     /// [`SendCompletions::complete`] plus a wake of the owner. Backends'
-    /// send-completion handlers, PRs 6 and 7.
+    /// send-completion handlers.
     pub(crate) fn complete_send(&mut self, id: SendId, result: io::Result<u32>) {
         if let Some(owner) = self.send_completions.complete(id, result) {
             let _ = self.wake_task(owner);
         }
     }
 
-    /// [`SendCompletions::take_result`]. PR 9, each poll after submission.
+    /// [`SendCompletions::take_result`]. The send futures, each poll after
+    /// submission.
     pub(crate) fn take_send_result(&mut self, id: SendId) -> Option<io::Result<u32>> {
         self.send_completions.take_result(id)
     }
 
-    /// [`SendCompletions::cancel`] plus a wake of the new head. PR 9,
-    /// from the future's `Drop` via `try_with_state`.
+    /// [`SendCompletions::cancel`] plus a wake of the new head. The send
+    /// futures' `Drop`.
     pub(crate) fn cancel_send(&mut self, id: SendId) {
         if let Some(next) = self.send_completions.cancel(id) {
             let _ = self.wake_task(next);
@@ -581,7 +713,7 @@ impl Executor {
     }
 
     /// [`SendCompletions::head_ready`] plus a wake of the head. The
-    /// driver's copy-pool slot-release hook, PRs 6 and 7, with the number of
+    /// driver's copy-pool slot-release hook, with the number of
     /// slots now free.
     ///
     /// Counted under `cfg(test)` in [`Executor::send_capacity_wakes`]: the
@@ -598,7 +730,7 @@ impl Executor {
     }
 
     /// [`SendCompletions::fail_waiting`] plus a wake of every returned
-    /// task. PR 9's `shutdown_write`, with `BrokenPipe`.
+    /// task. `ConnCtx::shutdown_write`, with `BrokenPipe`.
     pub(crate) fn fail_waiting_bounded_sends(
         &mut self,
         conn_index: u32,
@@ -874,7 +1006,7 @@ mod tests {
         let other_gen = q.enqueue(1, 6, 1, task(3));
         let other_conn = q.enqueue(2, 5, 1, task(4));
 
-        // PR 9 will pass BrokenPipe; an arbitrary kind here proves the kind
+        // `shutdown_write` passes BrokenPipe; an arbitrary kind here proves the kind
         // is plumbed through rather than hardcoded.
         let wakes = q.fail_waiting(1, 5, io::ErrorKind::TimedOut, "write side shut down");
 
@@ -890,6 +1022,65 @@ mod tests {
         assert!(q.turn(other_gen, 1), "other generation is now the head");
         assert_eq!(q.cancel(other_gen), Some(task(4)));
         assert!(q.turn(other_conn, 1));
+    }
+
+    /// `withdraw` frees an entry no submission took, and leaves alone one
+    /// that has moved on.
+    #[test]
+    fn withdraw_frees_only_an_unsubmitted_entry() {
+        let mut q = SendCompletions::new();
+        for _ in 0..100 {
+            let id = q.register(1, task(1));
+            q.withdraw(id);
+        }
+        assert_eq!(q.live(), 0, "every withdrawn entry is freed");
+
+        let done = q.register(1, task(1));
+        q.complete(done, Ok(3));
+        q.withdraw(done);
+        assert_eq!(q.take_result(done).unwrap().unwrap(), 3, "a result is kept");
+    }
+
+    /// `forget` frees an abandoned entry, whose completion is the one it was
+    /// waiting for, and leaves a teardown abort for its future to take.
+    #[test]
+    fn forget_frees_only_an_abandoned_entry() {
+        const A: u32 = 3;
+        let mut q = SendCompletions::new();
+        let abandoned = q.register(A, task(1));
+        q.cancel(abandoned);
+        q.forget(abandoned);
+        assert_eq!(q.live(), 0, "the abandoned entry is freed");
+
+        let aborted = q.register(A, task(2));
+        q.forget(aborted);
+        assert_eq!(q.live(), 1, "an in-flight entry is kept");
+        q.remove_connection(A);
+        q.forget(aborted);
+        assert_eq!(q.live(), 1, "an aborted entry is kept");
+        assert_eq!(
+            kind_of(q.take_result(aborted)),
+            io::ErrorKind::ConnectionAborted
+        );
+    }
+
+    /// `remove_connection` finds an entry through its current owner: after
+    /// `set_owner` moves it to connection task `C`, tearing `C` down drops
+    /// it, and tearing down its first owner does not.
+    #[test]
+    fn remove_connection_follows_an_entry_s_current_owner() {
+        const B: u32 = 2;
+        const C: u32 = 3;
+        const D: u32 = 7;
+        let mut q = SendCompletions::new();
+        let id = q.register(D, B);
+        q.set_owner(id, C);
+
+        assert!(q.remove_connection(B).is_empty(), "B no longer owns it");
+        assert_eq!(q.live(), 1);
+        q.remove_connection(C);
+        assert_eq!(q.complete(id, Ok(1)), None, "C's teardown abandoned it");
+        assert_eq!(q.live(), 0, "and its completion freed it");
     }
 
     /// A slot freed by one operation is reused by the next, and an id the
