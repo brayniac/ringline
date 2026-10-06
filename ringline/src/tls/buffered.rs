@@ -501,7 +501,7 @@ pub(super) fn encrypt_to_sends_buffered(
     let mut built = Vec::with_capacity(filled.len());
     for (i, &(slot, len)) in filled.iter().enumerate() {
         let (ptr, _) = send_copy_pool.current_ptr_remaining(slot);
-        // Final chunk completes the logical send (wakes the waiter, drives
+        // Final chunk completes the logical send (settles its id, drives
         // the queue via handle_send); intermediates are TLS-internal.
         let tag = if i + 1 == filled.len() {
             crate::completion::OpTag::Send

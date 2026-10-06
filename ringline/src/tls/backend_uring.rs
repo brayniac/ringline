@@ -10,7 +10,7 @@
 //! `docs/send-completion-design.md` is preserved verbatim: no CQE-skip, slots
 //! live until their CQE, and a logical send that spans several slots tags the
 //! intermediate ones [`OpTag::TlsSend`] and only the final one [`OpTag::Send`],
-//! so exactly one waiter wake happens per logical send. Every send built here
+//! so an awaited send's id, on that final chunk, settles once. Every send built here
 //! is routed through the per-connection send queue by the caller: io_uring does
 //! not order independent SQEs, and interleaved TLS records are `bad_record_mac`
 //! at the peer.
@@ -281,7 +281,7 @@ pub fn encrypt_to_sends(
         let mut built = Vec::with_capacity(filled.len());
         for (i, &(slot, len)) in filled.iter().enumerate() {
             let (ptr, _) = send_copy_pool.current_ptr_remaining(slot);
-            // Final chunk completes the logical send (wakes the waiter, drives
+            // Final chunk completes the logical send (settles its id, drives
             // the queue via handle_send); intermediates are TLS-internal.
             let tag = if i + 1 == filled.len() {
                 OpTag::Send

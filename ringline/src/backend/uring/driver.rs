@@ -2339,8 +2339,8 @@ impl Driver {
     /// `CloseLead` linked ahead of it ends them (a shutdown before Linux
     /// 6.13, a cancel from 6.13). Their CQEs (`-ECANCELED`, `EPIPE`, or a
     /// partial count) usually land before the Close CQE. They then find
-    /// `close_submitted` set, release their slot or slab entry, and fail the
-    /// waiter without pushing an SQE. A CQE that lands after the Close CQE
+    /// `close_submitted` set, release their slot or slab entry, and fail
+    /// their send without pushing an SQE. A CQE that lands after the Close CQE
     /// fails the generation check and releases only its own slot. The next
     /// occupant is protected by `reset_send_state` at reactivation.
     pub(crate) fn force_finalize_close(&mut self, conn_index: u32) {
@@ -2413,7 +2413,7 @@ impl Driver {
     /// `pending_send_retries` for `drain_send_retries` to re-push next
     /// iteration. Nothing is dropped or released on that path (Domain
     /// Invariant 7); persistent starvation past the retry cap fails the
-    /// waiter and closes the connection there.
+    /// queued sends and closes the connection there.
     pub(crate) fn submit_next_queued(&mut self, conn_index: u32) -> bool {
         self.submit_next_queued_inner(conn_index, 0)
     }
@@ -2832,8 +2832,7 @@ impl Driver {
         );
         state.in_flight = false;
         state.parked = false;
-        // Abandon any partially-accumulated logical send so the next one
-        // starts from zero.
+        // Fail the awaited sends the drained entries carried.
         self.fail_send_ids(settles);
         // The queue is now empty and nothing is in flight — fire a deferred
         // close if one was pending so the connection can't leak.

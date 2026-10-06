@@ -249,6 +249,10 @@ fn a_send_after_an_unawaited_chain_reports_its_own_length() {
     );
 }
 
+/// The ordering opposite to #617: the awaited send goes first, and the
+/// unawaited send behind it must not settle it. This passed before #617 was
+/// fixed too; it guards the fix against settling the last send queued
+/// rather than the awaited one.
 #[test]
 fn a_send_followed_by_an_unawaited_one_reports_its_own_length() {
     let n = run(SEND_THEN_NOWAIT, SECOND + FIRST).expect("the awaited send failed");

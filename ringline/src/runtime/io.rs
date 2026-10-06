@@ -2416,7 +2416,7 @@ impl ConnCtx {
                     // Submission failed — release the slab entry; buffers stay in
                     // the hold (bids un-replenished, still valid) for a later retry.
                     driver.send_slab.release(slab_idx);
-                    executor.cancel_send(id);
+                    executor.withdraw_send(id);
                     Err(e)
                 }
             }
@@ -2456,7 +2456,7 @@ impl ConnCtx {
             let id = executor.register_send(conn_index);
             let mut ctx = driver.make_ctx();
             if let Err(e) = ctx.send_awaited(self.token(), &data, id) {
-                executor.cancel_send(id);
+                executor.withdraw_send(id);
                 return Err(e);
             }
             driver.accumulators.consume(conn_index, data.len());
@@ -2508,7 +2508,7 @@ impl ConnCtx {
             let id = executor.register_send(self.conn_index);
             let mut ctx = driver.make_ctx();
             if let Err(e) = ctx.send_awaited(self.token(), data, id) {
-                executor.cancel_send(id);
+                executor.withdraw_send(id);
                 return Err(e);
             }
             Ok(SendFuture::pending(self.conn_index, self.generation, id))
@@ -2592,13 +2592,13 @@ impl ConnCtx {
             let token = ConnToken::new(self.conn_index, self.generation);
             let builder = ctx.send_chain_awaited(token, id);
             if let Err(e) = f(builder) {
-                executor.cancel_send(id);
+                executor.withdraw_send(id);
                 return Err(e);
             }
             // A closure that submitted nothing (an empty chain, or no
             // `finish`) sent nothing.
             if !driver.chain_table.carries(self.conn_index, id) {
-                executor.cancel_send(id);
+                executor.withdraw_send(id);
                 return Ok(SendFuture::ready(self.conn_index, self.generation, Ok(0)));
             }
             Ok(SendFuture::pending(self.conn_index, self.generation, id))
@@ -2880,8 +2880,7 @@ impl AsyncSendBuilder {
     ///
     /// Batch limits and the all-or-nothing rejection behavior are identical
     /// to [`submit_batch`](Self::submit_batch). A batch that is empty or
-    /// carries no bytes is rejected with `InvalidInput`: it would produce no
-    /// completion, so the returned future could never resolve.
+    /// carries no bytes is rejected with `InvalidInput`.
     pub fn submit_batch_await(
         self,
         parts: Vec<crate::handler::SendPart<'_>>,
@@ -2911,7 +2910,7 @@ impl AsyncSendBuilder {
                 consumed += 1;
             }
             if let Err(e) = builder.submit_awaited(id) {
-                executor.cancel_send(id);
+                executor.withdraw_send(id);
                 return Err(e);
             }
             Ok((
@@ -3009,8 +3008,7 @@ impl AsyncSendBuilder {
     /// that resolves when the batch has been written to the socket.
     ///
     /// A batch that is empty or carries no bytes is rejected with
-    /// `InvalidInput`: it would produce no completion, so the returned future
-    /// could never resolve.
+    /// `InvalidInput`.
     pub fn submit_batch_await(
         self,
         parts: Vec<crate::handler::SendPart<'_>>,
@@ -3040,7 +3038,7 @@ impl AsyncSendBuilder {
             let id = executor.register_send(conn_index);
             let mut ctx = driver.make_ctx();
             if let Err(e) = ctx.send_awaited(self.token, &buf, id) {
-                executor.cancel_send(id);
+                executor.withdraw_send(id);
                 return Err(e);
             }
             Ok((

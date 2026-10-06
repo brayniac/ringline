@@ -558,10 +558,8 @@ impl<'a> DriverCtx<'a> {
 
         // Chunk data that exceeds the send copy slot size. Each chunk gets its
         // own pool slot and SQE; the per-connection send queue ensures they are
-        // transmitted in order. Only the final chunk is marked end-of-send, so
-        // the waiter is woken once for the whole logical send rather than once
-        // per chunk (which would report a short count and, for pipelined sends,
-        // wake the wrong future).
+        // transmitted in order. Only the final chunk is marked end-of-send,
+        // and only that chunk carries the send's id, so the send settles once.
         //
         // `submit_or_queue` is infallible: it pushes to the ring only while
         // nothing is in flight (the first chunk) and parks that chunk at the
@@ -794,9 +792,9 @@ impl<'a> DriverCtx<'a> {
             let end_of_send = chunks.peek().is_none();
             self.send_copy_pool.set_end_of_send(slot, end_of_send);
             if end_of_send {
-                // Exactly one slot per logical send carries the id, and it
-                // is the one every success path already reads
-                // (`is_end_of_send`) before releasing.
+                // Exactly one slot per logical send carries the id, and the
+                // completion handlers take it from that slot before
+                // releasing it.
                 self.send_copy_pool.set_send_id(slot, id, data.len() as u32);
                 attached = true;
             }

@@ -756,7 +756,7 @@ impl Executor {
             self.recv_sinks[idx] = None;
         }
         self.task_slab.remove(conn_index);
-        // Bounded sends waiting on or in flight for this connection resolve
+        // Awaited sends waiting on or in flight for this connection resolve
         // to ConnectionAborted; wake their owners (standalone or cross-index
         // tasks that outlive the connection) and the FIFO's new head. That
         // abort is provisional: this method is also called from the mio

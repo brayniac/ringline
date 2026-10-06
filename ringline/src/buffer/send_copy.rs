@@ -65,7 +65,7 @@ pub struct SendCopyPool {
     // rather than once per chunk. A coalesced run stops at a marked slot.
     // Independent single-slot sends are always final.
     slot_end_of_send: Vec<bool>,
-    // The bounded send (`ConnCtx::send_backpressured`) whose completion this
+    // The awaited send whose completion this
     // slot carries, and the logical (plaintext) length that operation reports
     // on success. Parallel to `slot_end_of_send` and set only on the slot that
     // is marked end-of-send, so at most one entry exists per logical send.

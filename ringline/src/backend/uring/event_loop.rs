@@ -3026,7 +3026,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // when the connection went away. Per #381 a driver result
             // overrides that abort, which is exactly what must not happen
             // here — the result describes a dead occupant's send.
-            let _ = self.driver.send_copy_pool.take_send_id(pool_slot);
+            if let Some((id, _len)) = self.driver.send_copy_pool.take_send_id(pool_slot) {
+                self.executor.forget_send(id);
+            }
             self.release_pool_slot(pool_slot);
             return;
         }
@@ -3188,7 +3190,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // and it must not be settled, because teardown already aborted
             // the dead occupant's operation and a driver result would
             // override that abort (#381).
-            let _ = self.driver.send_copy_pool.take_send_id(pool_slot);
+            if let Some((id, _len)) = self.driver.send_copy_pool.take_send_id(pool_slot) {
+                self.executor.forget_send(id);
+            }
             self.release_pool_slot(pool_slot);
             return;
         }
@@ -3252,7 +3256,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// send CQEs must not push new SQEs (partial resubmits, POLLOUT arms)
     /// after this point — they would race the in-flight Close. The queue is
     /// already drained by then, so the caller just releases its resources
-    /// and fails the waiter.
+    /// and fails the send it carries.
     fn close_submitted(&self, conn_index: u32) -> bool {
         self.driver.send_queues[conn_index as usize].close_submitted
     }
@@ -3360,7 +3364,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // this CQE outlived, whose teardown already recorded the abort,
             // and a driver result would override that abort (#381) with a
             // dead occupant's outcome.
-            let _ = self.driver.send_slab.take_send_id(slab_idx);
+            if let Some((id, _len)) = self.driver.send_slab.take_send_id(slab_idx) {
+                self.executor.forget_send(id);
+            }
             self.release_coalesced(slab_idx);
             return;
         }
@@ -3482,6 +3488,22 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
     }
 
+    /// A slab retry dropped because its connection is closing or gone: the
+    /// send the entry carries fails `ECANCELED` while the connection is still
+    /// the one that submitted it (`identity_ok`), as in
+    /// `drain_coalesced_retries`. A dead occupant's send is not settled:
+    /// teardown recorded its abort, and a driver result would override it
+    /// (#381). Call before releasing the entry.
+    fn settle_abandoned_retry(&mut self, slab_idx: u16, identity_ok: bool) {
+        if let Some((id, _len)) = self.driver.send_slab.take_send_id(slab_idx) {
+            if identity_ok {
+                self.settle_send(id, Err(io::Error::from_raw_os_error(libc::ECANCELED)));
+            } else {
+                self.executor.forget_send(id);
+            }
+        }
+    }
+
     /// Replenish the held provided-buffer bids backing a recv-forward entry and
     /// release the slab slot. The bids become available in the `ProvidedBufRing`
     /// again (resuming recv if it was ENOBUFS-stalled).
@@ -3511,8 +3533,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             return;
         }
         // Identity: the CQE outlived its connection slot — replenish the held
-        // bids and release the entry; touch no per-connection state.
+        // bids and release the entry; touch no per-connection state, and
+        // settle nothing (teardown recorded the abort).
         if !self.slab_identity_ok(conn_index, slab_idx) {
+            if let Some((id, _len)) = self.driver.send_slab.take_send_id(slab_idx) {
+                self.executor.forget_send(id);
+            }
             self.release_recv_forward(slab_idx);
             return;
         }
@@ -3945,6 +3971,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 // partial is never resubmitted. Mark awaiting only here
                 // (not on notif CQEs, which for a resubmitted partial can
                 // precede the remainder's main CQE), matching run_shutdown.
+                // Its send settles nothing: teardown recorded the abort.
+                if let Some((id, _len)) = self.driver.send_slab.take_send_id(slab_idx) {
+                    self.executor.forget_send(id);
+                }
                 if cqueue::more(flags) {
                     self.driver.send_slab.inc_pending_notifs(slab_idx);
                 }
@@ -4045,7 +4075,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             if let Some(msg_ptr) = self.driver.send_slab.try_advance(slab_idx, result as u32) {
                 // Never resubmit a partial past a submitted Close: mirror the
                 // completion path's notification accounting minus the queue
-                // and wake bookkeeping (the notification for the sent prefix
+                // bookkeeping (the notification for the sent prefix
                 // is still in flight).
                 if self.close_submitted(conn_index) {
                     self.settle_slab_err(slab_idx, io::Error::from_raw_os_error(libc::ECANCELED));
@@ -4081,10 +4111,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // Send complete (all bytes sent) or error (result <= 0). The awaited
         // send settles now; the entry, and the guards it holds, stay until
         // the notification lands.
-        if result >= 0 {
+        if result > 0 {
             self.settle_slab_ok(slab_idx);
         } else {
-            self.settle_slab_err(slab_idx, io::Error::from_raw_os_error(-result));
+            self.settle_slab_err(slab_idx, Self::send_error(result));
         }
         self.driver.send_slab.mark_awaiting_notifications(slab_idx);
 
@@ -4399,7 +4429,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             != u32::from(UserData::send_payload_gen(payload))
         {
             // Take-and-discard, as in `handle_send`'s identity guard.
-            let _ = self.driver.send_copy_pool.take_send_id(pool_slot);
+            if let Some((id, _len)) = self.driver.send_copy_pool.take_send_id(pool_slot) {
+                self.executor.forget_send(id);
+            }
             self.release_pool_slot(pool_slot);
             return;
         }
@@ -4449,7 +4481,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             let errno = -result;
             if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
                 if self.close_submitted(conn_index) {
-                    // The handler's other silent return; same reasoning.
+                    // The send the slot carries, if any, fails with
+                    // `ECANCELED`: the close is already submitted.
                     let settles = self.driver.send_copy_pool.take_send_id(pool_slot);
                     self.release_pool_slot(pool_slot);
                     if let Some((id, _logical_len)) = settles {
@@ -5129,16 +5162,16 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // Connection closed or reused (or its Close already submitted —
             // no new SQEs may be pushed for it) — release the slab and
             // nothing else: the slot may already belong to a new connection.
-            if self.driver.connections.get(conn_index).is_none()
-                || self.driver.connections.generation(conn_index) != generation
-                || self.close_submitted(conn_index)
-            {
+            let identity_ok = self.driver.connections.get(conn_index).is_some()
+                && self.driver.connections.generation(conn_index) == generation;
+            if !identity_ok || self.close_submitted(conn_index) {
+                self.settle_abandoned_retry(slab_idx, identity_ok);
                 self.release_zc_slab(slab_idx);
                 continue;
             }
             if retries >= 2 {
                 // Give up: bytes of this send are already missing from the
-                // stream, so fail the waiter and close rather than leaving
+                // stream, so fail the send and close rather than leaving
                 // in_flight stuck and the connection wedged open.
                 self.settle_slab_err(
                     slab_idx,
@@ -5214,7 +5247,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 continue;
             }
             if retries >= 2 {
-                // Give up: fail the waiter and close so the connection isn't
+                // Give up: fail the send and close so the connection isn't
                 // left open with a hole in its byte stream.
                 let settles = self.driver.send_slab.take_send_id(slab_idx);
                 self.release_coalesced(slab_idx);
@@ -5264,10 +5297,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 continue; // slab released meanwhile
             }
             // Connection closed or reused — replenish bids and release only.
-            if self.driver.connections.get(conn_index).is_none()
-                || self.driver.connections.generation(conn_index) != generation
-                || self.close_submitted(conn_index)
-            {
+            let identity_ok = self.driver.connections.get(conn_index).is_some()
+                && self.driver.connections.generation(conn_index) == generation;
+            if !identity_ok || self.close_submitted(conn_index) {
+                self.settle_abandoned_retry(slab_idx, identity_ok);
                 self.release_recv_forward(slab_idx);
                 continue;
             }
@@ -5335,7 +5368,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 continue;
             }
             if retries >= 2 {
-                // Give up: fail the waiter and close so the connection isn't
+                // Give up: fail the send and close so the connection isn't
                 // left open with a hole in its byte stream.
                 let settles = self.driver.send_copy_pool.take_send_id(pool_slot);
                 self.release_pool_slot(pool_slot);
@@ -5352,8 +5385,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             let (ptr, remaining) = self.driver.send_copy_pool.current_ptr_remaining(pool_slot);
             // Resubmit with the entry's original OpTag. Choosing by
             // tls_table membership here re-tagged the *final* chunk of a TLS
-            // send (deliberately OpTag::Send so its CQE wakes the waiter) as
-            // TlsSend, whose handler never wakes — a permanent send() hang.
+            // send (OpTag::Send, so `handle_send` settles its id) as TlsSend,
+            // which leaves the send unsettled.
             let result = if matches!(op, OpTag::TlsSend) {
                 self.driver
                     .ring
@@ -5412,7 +5445,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
             if attempts >= 2 {
                 // Give up: release the parked entry and everything behind it,
-                // fail the waiter and close so the connection isn't left open
+                // fail the send and close so the connection isn't left open
                 // with a hole in its byte stream.
                 //
                 // No send is settled here because none is in hand:
@@ -7301,7 +7334,7 @@ mod tests {
 
     /// Guards the streaming rewrite: a multi-slot send that is admitted still
     /// queues one entry per chunk, in order, with only the last chunk marked
-    /// end-of-send (so the waiter is woken once with the full count).
+    /// end-of-send (so the send settles once, with its full length).
     #[test]
     fn multi_chunk_send_still_queues_all_chunks_in_order() {
         let mut el = make_test_loop_with_config(
@@ -8146,7 +8179,7 @@ mod tests {
     }
 
     /// After the Close SQE is submitted (close_submitted), a late partial
-    /// send CQE must release its slot and fail the waiter instead of
+    /// send CQE must release its slot and fail its send instead of
     /// resubmitting the remainder — the resubmit would race the in-flight
     /// Close (post-force-close scenario).
     #[test]
@@ -16685,6 +16718,158 @@ mod tests {
 
         el.test_dispatch_cqe(ud.raw(), 0, CQE_F_NOTIF);
         assert!(!el.driver.send_slab.in_use(slab_idx));
+    }
+
+    /// An awaited send that is refused, or submits nothing, leaves no entry
+    /// in the completion table: no completion would ever free it.
+    #[test]
+    fn a_refused_awaited_send_leaves_no_entry() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let conn = ConnCtx::new(conn_index, generation);
+        // Another send is in flight, so every chain is refused.
+        el.driver.send_queues[conn_index as usize].in_flight = true;
+        let huge = vec![0u8; 1 << 24];
+        for _ in 0..10 {
+            with_driver_state(&mut el, || {
+                let refused = conn.send_chain(|chain| chain.copy(b"x").finish());
+                assert_eq!(
+                    refused.err().map(|e| e.kind()),
+                    Some(io::ErrorKind::WouldBlock)
+                );
+                let empty = conn.send_chain(|_chain| Ok(()));
+                assert!(empty.is_ok());
+                let too_big = conn.send(&huge);
+                assert_eq!(
+                    too_big.err().map(|e| e.kind()),
+                    Some(io::ErrorKind::InvalidInput)
+                );
+            });
+        }
+        assert_eq!(el.executor.send_completions.live(), 0);
+    }
+
+    /// A send owned by its connection's own task is abandoned when the
+    /// connection is torn down, and the completion that arrives after the
+    /// slot is reused frees its entry without settling it.
+    #[test]
+    fn a_stale_completion_frees_an_abandoned_send() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let old_gen = el.driver.connections.generation(conn_index);
+        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(b"orphaned").unwrap();
+        crate::runtime::CURRENT_TASK_ID.with(|c| c.set(conn_index));
+        let id = await_slot(&mut el, conn_index, slot, 8);
+        let ud = UserData::encode(
+            OpTag::Send,
+            conn_index,
+            UserData::send_payload(slot, old_gen),
+        );
+
+        // Teardown drops the connection's task, abandoning its send, and the
+        // slot is reused.
+        el.executor.remove_connection(conn_index);
+        el.driver.connections.release(conn_index);
+        let reused = el.driver.connections.allocate().unwrap();
+        assert_eq!(reused, conn_index, "test premise: index reused");
+        assert_eq!(el.executor.send_completions.live(), 1);
+
+        el.test_dispatch_cqe(ud.raw(), 8, 0);
+
+        assert_eq!(
+            el.executor.send_completions.live(),
+            0,
+            "the abandoned entry outlived its completion"
+        );
+        assert!(send_result(&mut el, id).is_none());
+    }
+
+    /// A zero-copy or recv-forward retry dropped because its connection's
+    /// Close is submitted fails the send it carries with `ECANCELED`.
+    #[test]
+    fn a_retry_dropped_at_close_fails_its_send() {
+        for recv_forward in [false, true] {
+            let mut el = make_test_loop();
+            let conn_index = accept_connection(&mut el);
+            let generation = el.driver.connections.generation(conn_index);
+            let iovecs = [libc::iovec {
+                iov_base: std::ptr::null_mut(),
+                iov_len: 100,
+            }];
+            let (slab_idx, _msg) = if recv_forward {
+                el.driver.send_slab.allocate_recv_forward(
+                    conn_index,
+                    generation,
+                    &iovecs,
+                    &[3],
+                    100,
+                )
+            } else {
+                let guards = [const { None }; crate::buffer::send_slab::MAX_GUARDS];
+                el.driver.send_slab.allocate(
+                    conn_index,
+                    generation,
+                    &iovecs,
+                    u16::MAX,
+                    guards,
+                    0,
+                    100,
+                )
+            }
+            .expect("slab room");
+            let id = await_slab(&mut el, conn_index, slab_idx, 100);
+            el.driver.send_queues[conn_index as usize].close_submitted = true;
+            if recv_forward {
+                el.driver
+                    .pending_recv_forward_retries
+                    .push((conn_index, generation, slab_idx, 0));
+                el.drain_recv_forward_retries();
+            } else {
+                el.driver
+                    .pending_zc_retries
+                    .push((conn_index, generation, slab_idx, 0));
+                el.drain_zc_retries();
+            }
+            assert_eq!(
+                send_result(&mut el, id)
+                    .expect("the dropped retry settled its send")
+                    .expect_err("it never went out")
+                    .raw_os_error(),
+                Some(libc::ECANCELED),
+                "recv_forward = {recv_forward}"
+            );
+        }
+    }
+
+    /// A zero-copy send whose completion reports zero bytes fails
+    /// `WriteZero`, as a copied send does.
+    #[test]
+    fn a_zero_byte_zero_copy_completion_settles_write_zero() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        el.driver.send_queues[conn_index as usize].in_flight = true;
+        let iovecs = [libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 100,
+        }];
+        let guards = [const { None }; crate::buffer::send_slab::MAX_GUARDS];
+        let (slab_idx, _msg) = el
+            .driver
+            .send_slab
+            .allocate(conn_index, generation, &iovecs, u16::MAX, guards, 0, 100)
+            .expect("slab room");
+        let id = await_slab(&mut el, conn_index, slab_idx, 100);
+        let ud = UserData::encode(OpTag::SendMsgZc, conn_index, slab_idx as u32);
+        el.test_dispatch_cqe(ud.raw(), 0, 0);
+        assert_eq!(
+            send_result(&mut el, id)
+                .expect("settled")
+                .expect_err("no bytes went out")
+                .kind(),
+            io::ErrorKind::WriteZero
+        );
     }
 
     /// A terminal send error settles `Err` with the errno and returns the

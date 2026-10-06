@@ -77,9 +77,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - An awaited send resolves with the length its caller passed. Under TLS
   that is the plaintext length: `send().await` used to report the ciphertext
   of the send's last record on io_uring and of all its records on mio, and
-  `send_backpressured` the ciphertext on mio. A send whose completion
-  reports zero bytes now resolves with a `WriteZero` error instead of
-  `Ok(0)`, as `send_backpressured` already did (#617).
+  `send_backpressured` the ciphertext on mio. A copy, zero-copy or
+  recv-forward send whose completion reports zero bytes now resolves with a
+  `WriteZero` error instead of `Ok(0)`, as `send_backpressured` already did.
+  A `SendFuture` polled again after it resolved panics; it used to return
+  `Pending` (#617).
 
 - The per-operation completion counters (`op` label) for io_uring rename
   `send_msg_coalesced_poll_out`, `send_recv_bufs_coalesced_poll_out` and
@@ -311,7 +313,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   waiter: a `send().await` behind a `send_nowait`, an unawaited chain, a
   direct echo, a `forward_recv_buf` or a `send_backpressured` resolved with
   that send's byte count, and the awaited send's own completion then found no
-  waiter. Two awaited sends in flight at once on one connection could hang.
+  waiter. Two awaited sends in flight at once on one connection could hang;
+  on mio they resolved with each other's lengths.
   Every awaited send (`send`, `submit_batch_await`, `send_chain`,
   `forward_held`) now owns an entry in the worker's send completion table,
   and only its own completion settles it, on both backends. Two awaited sends
