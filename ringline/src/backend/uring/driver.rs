@@ -294,14 +294,15 @@ pub(crate) struct Driver {
     /// buffer ID has NOT been pushed to `pending_replenish` and must be
     /// replenished when the slot is cleared.
     pub(crate) pending_recv_bufs: Vec<Option<PendingRecvBuf>>,
-    /// Per-connection original data length for in-flight SendRecvBuf operations.
-    /// Set when `forward_recv_buf` initiates a send; used by `handle_send_recv_buf`
-    /// to compute the correct offset on partial sends (since buf_size != data_len).
+    /// Per-connection original data length of the in-flight SendRecvBuf. Set
+    /// when a `SendRecvBuf` SQE is pushed (`note_send_recv_buf_pushed`);
+    /// `handle_send_recv_buf` uses it to compute the resubmit offset of a
+    /// partial send.
     pub(crate) send_recv_buf_original_lens: Vec<u32>,
     /// Per-connection remaining bytes for in-flight SendRecvBuf operations.
     /// Tracks how many bytes still need to be sent (decremented on each partial send).
     /// Stored here rather than in the CQE payload so that buffer sizes > u16::MAX are
-    /// supported (the old encoding packed remaining into the high 16 bits of the payload).
+    /// supported.
     pub(crate) send_recv_buf_remaining: Vec<u32>,
     /// Per-connection multi-buffer zero-copy recv hold. When `recv_forward` is
     /// set for a connection, incoming provided buffers are pushed here (bids NOT
@@ -2560,8 +2561,11 @@ impl Driver {
             };
             return match pushed {
                 Ok(()) => {
-                    state.queue.pop_front();
+                    let built = state.queue.pop_front();
                     state.parked = false;
+                    if let Some(built) = built {
+                        self.note_send_recv_buf_pushed(conn_index, &built);
+                    }
                     true
                 }
                 Err(_) => {
@@ -2728,8 +2732,6 @@ impl Driver {
         .flags(crate::completion::STREAM_SEND_FLAGS)
         .build()
         .user_data(ud.raw());
-        self.send_recv_buf_original_lens[ci] = pending.len;
-        self.send_recv_buf_remaining[ci] = pending.len;
         // Infallible: under SQ pressure the echo is parked at the queue head
         // and retried, holding its provided buffer exactly as a queued echo
         // does; the bid is replenished by its completion.
@@ -2764,7 +2766,10 @@ impl Driver {
             return;
         }
         match unsafe { self.ring.push_sqe(&built.entry) } {
-            Ok(()) => state.in_flight = true,
+            Ok(()) => {
+                state.in_flight = true;
+                self.note_send_recv_buf_pushed(conn_index, &built);
+            }
             Err(_) => {
                 // SQ still full after submit: park at the head and retry next
                 // iteration (see `drain_send_retries`). Nothing is dropped.
@@ -2775,6 +2780,23 @@ impl Driver {
                 self.pending_send_retries.push((conn_index, generation, 0));
             }
         }
+    }
+
+    /// Record the progress of a `SendRecvBuf` that has just been pushed: the
+    /// buffer's full length, all of it still to send. A connection has at
+    /// most one `SendRecvBuf` in the kernel, so the counts belong to whichever
+    /// was pushed last (#614). A remainder (`SEND_RECV_BUF_REMAINDER`) keeps the
+    /// counts `handle_send_recv_buf` recorded.
+    fn note_send_recv_buf_pushed(&mut self, conn_index: u32, built: &crate::handler::BuiltSend) {
+        let ud = crate::completion::UserData(built.entry.get_user_data());
+        if ud.tag() != Some(OpTag::SendRecvBuf)
+            || ud.payload() & crate::completion::SEND_RECV_BUF_REMAINDER != 0
+        {
+            return;
+        }
+        let ci = conn_index as usize;
+        self.send_recv_buf_original_lens[ci] = built.total_len;
+        self.send_recv_buf_remaining[ci] = built.total_len;
     }
 
     /// Park `built` at the head of the connection's send queue, for
