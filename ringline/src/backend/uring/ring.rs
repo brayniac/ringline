@@ -101,8 +101,8 @@ pub(crate) fn close_lead_for(kernel: Option<KernelVersion>) -> CloseLead {
 ///
 /// The ring uses 128-byte SQEs and 32-byte CQEs (`IoUring<Entry128, Entry32>`)
 /// to support NVMe passthrough via `IORING_OP_URING_CMD` / `UringCmd80`.
-/// Standard network opcodes produce 64-byte `Entry` values which are
-/// automatically converted to `Entry128` (zero-padded) via `Into`.
+/// [`Sqe::encode`] produces the 128-byte entries; 64-byte opcodes are
+/// zero-padded.
 ///
 /// Memory overhead of Big SQE/CQE: +32 KB per worker with default config
 /// (256 SQ × 64B extra + 1024 CQ × 16B extra), negligible relative to the
@@ -134,8 +134,9 @@ pub struct Ring {
     /// [`Ring::force_push_failures`].
     #[cfg(test)]
     forced_push_failures: usize,
-    /// Test-only: the last entry `push_sqe` pushed, so a test can check which
-    /// operation a handler submitted.
+    /// Test-only: the last 64-byte entry pushed by `push_sqe` or
+    /// `push_entry`, without link flags, so a test can check which operation
+    /// a handler submitted. `UringCmd80` pushes are not recorded.
     #[cfg(test)]
     pub(crate) last_pushed: Option<squeue::Entry>,
     /// Test-only: the registered file index of the last drain `send`, which
@@ -963,12 +964,7 @@ impl Ring {
     /// Recover a real fd for a connection whose recv is already cancelled.
     pub fn submit_park_install(&mut self, conn_index: u32, generation: u32) -> io::Result<()> {
         let ud = UserData::encode(OpTag::ParkInstall, conn_index, generation);
-        let entry = Sqe::new(
-            Op::FixedFdInstall {
-                fd: sqe::Fd::Fixed(conn_index),
-            },
-            ud.raw(),
-        );
+        let entry = Sqe::new(Op::FixedFdInstall { index: conn_index }, ud.raw());
         unsafe {
             self.push_sqe(&entry)?;
         }
@@ -1280,11 +1276,6 @@ impl Ring {
         Ok(())
     }
 
-    /// Push a standard SQE to the submission queue.
-    ///
-    /// The 64-byte `Entry` is automatically converted to `Entry128` (zero-padded)
-    /// for the Big SQE ring.
-    ///
     /// Submit a NOP with injected result for error injection testing.
     ///
     /// The kernel will post a CQE with the given `user_data` and `result`,
@@ -1331,11 +1322,9 @@ impl Ring {
 
     /// Push an operation to the submission queue.
     ///
-    /// Takes the operation by reference so a caller that must keep it on
-    /// failure (a queued send parked for retry) can do so without a clone.
-    ///
     /// # Safety
-    /// The operation must reference valid memory for its lifetime.
+    /// The operation's pointers must stay valid until its completion
+    /// arrives, and for `SendMsgZc` until its notification.
     pub(crate) unsafe fn push_sqe(&mut self, sqe: &Sqe) -> io::Result<()> {
         unsafe {
             self.push_sqe128(sqe.encode())?;
@@ -1446,6 +1435,7 @@ impl Ring {
         // Link every entry to the next, except the last.
         let last = entries.len() - 1;
         for entry in entries[..last].iter_mut() {
+            debug_assert_eq!(entry.link, Link::None, "a chain sets its own links");
             entry.link = Link::Soft;
         }
 

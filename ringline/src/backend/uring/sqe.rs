@@ -4,7 +4,7 @@
 //! The driver describes every operation as an [`Sqe`] and the ring encodes
 //! it into an io_uring submission queue entry when it is pushed. Nothing
 //! outside this module and `ring.rs` builds an `io_uring::squeue::Entry`.
-//! See `docs/ring-emulator-design.md`.
+//! Step 1 of the ring emulator (#621).
 
 use io_uring::opcode;
 use io_uring::squeue::{Entry, Entry128, Flags};
@@ -31,7 +31,8 @@ pub(crate) enum Link {
 }
 
 /// One operation and its arguments. Pointers must stay valid until the
-/// operation's completion arrives (Domain Invariant 1).
+/// operation's completion arrives, and for `SendMsgZc` until its
+/// notification (Domain Invariant 1).
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Op {
     /// Multishot recv selecting from provided-buffer group `buf_group`.
@@ -117,9 +118,9 @@ pub(crate) enum Op {
         ts: *const types::Timespec,
         abs: bool,
     },
-    /// Install a real fd for a registered file (`FIXED_FD_INSTALL`).
+    /// Install a real fd for registered file `index` (`FIXED_FD_INSTALL`).
     FixedFdInstall {
-        fd: Fd,
+        index: u32,
     },
     PollAdd {
         fd: Fd,
@@ -226,7 +227,8 @@ impl Sqe {
         }
     }
 
-    /// The 64-byte entry, for every op but `UringCmd80`. Without link flags.
+    /// The 64-byte entry, without link flags. Panics on `UringCmd80`, which
+    /// needs [`Sqe::encode`].
     pub(crate) fn encode64(&self) -> Entry {
         macro_rules! on {
             ($fd:expr, |$t:ident| $build:expr) => {
@@ -320,10 +322,7 @@ impl Sqe {
                     opcode::Timeout::new(ts).build()
                 }
             }
-            Op::FixedFdInstall { fd } => match fd {
-                Fd::Fixed(i) => opcode::FixedFdInstall::new(Fixed(i), 0).build(),
-                Fd::Raw(_) => unreachable!("FIXED_FD_INSTALL takes a registered file"),
-            },
+            Op::FixedFdInstall { index } => opcode::FixedFdInstall::new(Fixed(index), 0).build(),
             Op::PollAdd { fd, mask } => on!(fd, |t| opcode::PollAdd::new(t, mask).build()),
             Op::OpenAt {
                 path,
@@ -374,10 +373,11 @@ mod tests {
         unsafe { std::slice::from_raw_parts(e as *const Entry128 as *const u8, n).to_vec() }
     }
 
-    /// Each operation encodes to the entry the ring's builders produced
-    /// before `Sqe` existed: same opcode, fields, flags and user_data.
+    /// Each operation encodes to the same bytes as the equivalent
+    /// `io_uring::opcode` builder chain: opcode, fields, flags and
+    /// user_data. Call sites' arguments are not covered here.
     #[test]
-    fn every_op_encodes_like_the_builder_chain_it_replaced() {
+    fn every_op_encodes_like_its_opcode_builder() {
         let ud = 0x0123_4567_89ab_cdef;
         let p = 0x1000 as *mut u8;
         let msg = 0x2000 as *const libc::msghdr;
@@ -576,7 +576,7 @@ mod tests {
                 e(opcode::Timeout::new(ts).flags(TimeoutFlags::ABS).build()),
             ),
             (
-                Sqe::new(Op::FixedFdInstall { fd: Fd::Fixed(9) }, ud),
+                Sqe::new(Op::FixedFdInstall { index: 9 }, ud),
                 e(opcode::FixedFdInstall::new(fx, 0).build()),
             ),
             (
