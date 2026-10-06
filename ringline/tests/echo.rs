@@ -7550,11 +7550,26 @@ struct DroppedForwardProxy {
 }
 
 static DROPPED_FORWARD_BACKEND: std::sync::OnceLock<SocketAddr> = std::sync::OnceLock::new();
+/// The client ports of connections whose handler has armed its forward and
+/// dropped it. Per connection, because `wait_for_server`'s probe connection
+/// runs the handler too.
+static FORWARD_DROPPED_FOR: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
+
+fn forward_dropped_for(port: u16) -> bool {
+    FORWARD_DROPPED_FOR
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&port)
+}
 
 impl AsyncEventHandler for DroppedForwardProxy {
     fn on_accept(&self, client: Connection) -> impl Future<Output = ()> + 'static {
         let backend_addr = self.backend_addr;
         async move {
+            let client_port = match client.peer_addr() {
+                Some(ringline::PeerAddr::Tcp(a)) => a.port(),
+                _ => 0,
+            };
             let (mut tx, mut rx) = client.split();
             let backend = match ringline::connect(backend_addr).await {
                 Ok(ctx) => ctx,
@@ -7570,6 +7585,10 @@ impl AsyncEventHandler for DroppedForwardProxy {
             {
                 let _fut = rx.forward_to_conn(&mut backend_tx, 1 << 30);
             }
+            FORWARD_DROPPED_FOR
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(client_port);
 
             // Everything the client sends must now come to *this* task, not to
             // the sink. Echo it back so the test can see where it went.
@@ -7619,16 +7638,24 @@ fn dropping_a_forward_to_conn_future_cancels_the_relay() {
         .to_string();
     wait_for_server(&proxy_addr);
 
-    // Connect first and pause, so the handler has armed and dropped its
-    // forward before any byte arrives. Bytes already buffered when a forward
-    // is armed are part of that forward and are queued on the sink
-    // immediately; the cancel can only stop what has not been read yet, which
-    // is the case worth asserting.
+    // Connect, then wait until the handler has armed and dropped its forward
+    // before sending any byte. Bytes already buffered when a forward is armed
+    // are part of that forward and are queued on the sink immediately; the
+    // cancel can stop only bytes not yet read, so the client sends after the
+    // forward is dropped.
     let mut stream = TcpStream::connect(&proxy_addr).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
-    std::thread::sleep(Duration::from_millis(200));
+    let port = stream.local_addr().unwrap().port();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !forward_dropped_for(port) && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        forward_dropped_for(port),
+        "the proxy never armed and dropped this connection's forward"
+    );
 
     // The handler echoes, so a reply proves the bytes reached the handler. If
     // the dropped forward were still installed they would have gone to the

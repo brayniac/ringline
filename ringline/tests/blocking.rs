@@ -5,7 +5,7 @@ mod common;
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use ringline::{AsyncEventHandler, Config, ConfigBuilder, Connection, RinglineBuilder};
@@ -235,6 +235,22 @@ fn spawn_blocking_non_copy_type() {
 // ── A dropped handle releases the result ────────────────────────────
 
 static RESULTS_DROPPED: AtomicUsize = AtomicUsize::new(0);
+/// Set by `MarkHandleDropped`: after the `timeout` statement, or when the
+/// `on_start` future is dropped.
+static HANDLE_DROPPED: AtomicBool = AtomicBool::new(false);
+/// Whether the `timeout` around the blocking handle expired. Checked by the
+/// test, since a panic inside the task would be contained.
+static HANDLE_TIMED_OUT: AtomicBool = AtomicBool::new(false);
+
+/// Sets `HANDLE_DROPPED` when dropped. Declared before the handle, so it drops
+/// after it on every path, including a future dropped at shutdown.
+struct MarkHandleDropped;
+
+impl Drop for MarkHandleDropped {
+    fn drop(&mut self) {
+        HANDLE_DROPPED.store(true, Ordering::Release);
+    }
+}
 
 /// A closure result that counts its own drop.
 struct CountedResult;
@@ -245,22 +261,30 @@ impl Drop for CountedResult {
     }
 }
 
-/// Starts a closure that finishes after 200 ms and drops its handle at
-/// 20 ms, when the `timeout` around it expires.
+/// Starts a closure that finishes only after its handle has been dropped, by
+/// the `timeout` around it expiring at 20 ms. The closure gives up waiting
+/// after 60 s, so a failed test does not leave the pool thread blocked.
 struct DropsHandleEarly;
 
 impl AsyncEventHandler for DropsHandleEarly {
     fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
         Some(Box::pin(async {
+            let mark = MarkHandleDropped;
             let handle = ringline::spawn_blocking(|| {
-                std::thread::sleep(Duration::from_millis(200));
+                let deadline = Instant::now() + Duration::from_secs(60);
+                while !HANDLE_DROPPED.load(Ordering::Acquire) && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
                 CountedResult
             })
             .unwrap();
             let timed_out = ringline::timeout(Duration::from_millis(20), handle)
                 .await
                 .is_err();
-            assert!(timed_out, "the closure finished before the timeout");
+            // The `timeout` future, which owned the handle, was dropped at the
+            // end of the previous statement.
+            drop(mark);
+            HANDLE_TIMED_OUT.store(timed_out, Ordering::Release);
         }))
     }
 
@@ -277,11 +301,15 @@ impl AsyncEventHandler for DropsHandleEarly {
 #[test]
 fn a_result_whose_handle_was_dropped_is_dropped_on_arrival() {
     RESULTS_DROPPED.store(0, Ordering::SeqCst);
+    HANDLE_DROPPED.store(false, Ordering::Release);
+    HANDLE_TIMED_OUT.store(false, Ordering::Release);
     let (runtime, handles) = RinglineBuilder::new(test_config())
         .launch::<DropsHandleEarly>()
         .expect("launch failed");
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // The blocking pool runs at `SCHED_IDLE`, so on a loaded host its result
+    // can take seconds to arrive.
+    let deadline = Instant::now() + Duration::from_secs(30);
     while RESULTS_DROPPED.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -290,5 +318,9 @@ fn a_result_whose_handle_was_dropped_is_dropped_on_arrival() {
     for h in handles {
         h.join().unwrap().unwrap();
     }
+    assert!(
+        HANDLE_TIMED_OUT.load(Ordering::Acquire),
+        "the closure finished before the timeout"
+    );
     assert_eq!(dropped, 1, "the worker held the result of a dropped handle");
 }

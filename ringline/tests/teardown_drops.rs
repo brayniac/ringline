@@ -266,6 +266,17 @@ fn a_spawn_dropped_with_its_connection_closes_its_pidfd() {
 
 static BLOCKING_RESULTS_DROPPED: AtomicUsize = AtomicUsize::new(0);
 static BLOCKING_STARTED: AtomicUsize = AtomicUsize::new(0);
+/// Set when a `BlockingInConnection` task is dropped.
+static BLOCKING_TASK_DROPPED: AtomicBool = AtomicBool::new(false);
+
+/// Sets `BLOCKING_TASK_DROPPED` when the task holding it is dropped.
+struct MarkTaskDropped;
+
+impl Drop for MarkTaskDropped {
+    fn drop(&mut self) {
+        BLOCKING_TASK_DROPPED.store(true, Ordering::Release);
+    }
+}
 
 /// A closure result that counts its own drop.
 struct CountedResult;
@@ -276,15 +287,20 @@ impl Drop for CountedResult {
     }
 }
 
-/// Each connection's task starts a closure that finishes after 200 ms and
-/// holds its handle without polling it again.
+/// Each connection's task starts a closure and holds its handle without
+/// polling it again. The closure returns once a `BlockingInConnection` task
+/// has been dropped, or after 60 s. The test opens one connection.
 struct BlockingInConnection;
 
 impl AsyncEventHandler for BlockingInConnection {
     fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
+            let _mark = MarkTaskDropped;
             let _handle = ringline::spawn_blocking(|| {
-                std::thread::sleep(Duration::from_millis(200));
+                let deadline = Instant::now() + Duration::from_secs(60);
+                while !BLOCKING_TASK_DROPPED.load(Ordering::Acquire) && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
                 CountedResult
             })
             .expect("blocking pool configured");
@@ -304,6 +320,7 @@ fn a_blocking_handle_dropped_with_its_connection_drops_the_result() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     BLOCKING_RESULTS_DROPPED.store(0, Ordering::SeqCst);
     BLOCKING_STARTED.store(0, Ordering::SeqCst);
+    BLOCKING_TASK_DROPPED.store(false, Ordering::Release);
     let config = ConfigBuilder::new()
         .workers(1)
         .pin_to_core(false)
@@ -322,7 +339,9 @@ fn a_blocking_handle_dropped_with_its_connection_drops_the_result() {
         .expect("launch");
     connect_and_close(runtime.bound_addr().unwrap());
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // The blocking pool runs at `SCHED_IDLE`, so on a loaded host its result
+    // can take seconds to arrive.
+    let deadline = Instant::now() + Duration::from_secs(30);
     while BLOCKING_RESULTS_DROPPED.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(5));
     }
