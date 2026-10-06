@@ -1,8 +1,9 @@
 # Receiving into the accumulator
 
-Status: proposal. Nothing here is implemented. The kernel behaviour it
-relies on was probed on Linux 6.12 (results below); the performance case
-is not yet measured, and the design does not land until it is.
+Status: proposal, with per-connection rings chosen over the hybrid by
+the owner. Nothing here is implemented. The kernel behaviour it relies on
+was probed on Linux 6.12 (results below); the performance case is not yet
+measured, and the design does not land until it is.
 
 ## Goal
 
@@ -23,9 +24,10 @@ Two shapes were considered:
 - **Per-connection rings (this design).** Every TCP connection receives
   into its own accumulator.
 - **Hybrid.** Small or idle connections stay on the shared ring and busy
-  ones switch to their own. It keeps everything the shared ring needs,
-  adds a switch between the two modes, and is not proposed unless the
-  measurements below rule out per-connection rings.
+  ones switch to their own. It keeps everything the shared ring needs and
+  adds a switch between the two modes on a live connection. Not chosen;
+  it returns only if the measurements below rule out per-connection
+  rings.
 
 ## Kernel facts
 
@@ -58,14 +60,20 @@ Each connection's accumulator has a **receive region**: its free space,
 else. The driver tracks how far the kernel has written by summing `res`
 (the ring entry carries the same position).
 
-The region is armed in one of two ways, chosen once at startup by a
-probe (registering with `IOU_PBUF_RING_INC` fails with `EINVAL` on a
-kernel without it):
+The region is armed in one of two ways:
 
-| Kernel | Arm | Ends when |
+| Arm | Used when | Ends when |
 |---|---|---|
-| 6.12+ | A one-entry INC ring per connection whose entry is the region, and one multishot `RECV` on it | The region is full (`-ENOBUFS`), EOF, an error, or a cancel |
-| older | One-shot `RECV` into the region | Every completion |
+| A one-entry INC ring whose entry is the region, and one multishot `RECV` on it | The kernel supports `IOU_PBUF_RING_INC` (6.12+; probed at startup, since registering with the flag fails with `EINVAL` without it) and the worker has a free buffer group id | The region is full (`-ENOBUFS`), EOF, an error, or a cancel |
+| One-shot `RECV` into the region | Otherwise | Every completion |
+
+A connection's arm kind is chosen when it is first armed and does not
+change while the connection lives, so there is no switch between modes.
+
+A buffer group id is a `u16`, so one worker holds at most 65,536 rings,
+less the shared UDP ring's id. Connections past that on the same worker
+use the one-shot arm. A deployment that wants every connection on a ring
+runs more workers (more than one per core if needed).
 
 Both give the driver the same state machine:
 
@@ -194,14 +202,17 @@ one at install.
 | Cost | Per connection | At 16,000 connections per worker |
 |---|---|---|
 | Ring page (6.12+) | 4 KiB | 62.5 MiB; charged to `RLIMIT_MEMLOCK` on 6.14+ unless the process has `CAP_IPC_LOCK` |
-| bgid | 1 of 65,536 per ring | Caps connections per worker at 65,536 minus the shared rings; `max_connections` must be validated against it |
+| bgid | 1 of 65,536 per worker | Connections past 65,536 on one worker use the one-shot arm |
 | Region memory | starts at 4 KiB, grows under load | 62.5 MiB at the default 4 KiB, against today's fixed 4 MiB shared ring plus 4 KiB accumulators |
 | Syscalls | register and unregister once per connection | — |
 | State | ring pointer, bgid, written offset, pin count, armed flag | offset by the state removed above |
 
 The memory model changes from a fixed pool per worker to memory that
-scales with connections. That is the reason the hybrid exists, and the
-measurement decides between them.
+scales with connections. At 1,000,000 connections that is about 4 GB of
+regions, as accumulators cost today, plus about 4 GB of ring pages, which
+on 6.14+ need a matching `RLIMIT_MEMLOCK` or `CAP_IPC_LOCK`. Regions
+become resident only when data arrives, as accumulators do today. The
+owner judged this acceptable.
 
 ## Measurement before landing
 
@@ -215,12 +226,14 @@ Workloads: echo at 256 B, 4 KiB, 64 KiB and 1 MiB messages, and the
 `forward_to` proxy from #415, at 64, 1,000 and 16,000 connections. Record
 throughput, p99, instructions per byte, RSS and locked memory.
 
+The one-shot arm is also run at 100,000 connections on one worker, the
+case where connections past the bgid limit use it.
+
 The design proceeds if arm 2 is no slower than arm 1 at small messages
 and faster at large ones, and arm 3 is within a margin to be agreed of
 arm 2. If arm 3 is much slower, kernels below 6.12 keep the shared ring
-(the hybrid, by kernel version). If memory at 16,000 connections is
-unacceptable, idle connections release their region (the hybrid, by
-activity).
+(the hybrid, by kernel version), and the bgid limit becomes a reason to
+run more workers rather than an overflow path.
 
 ## Landing
 
@@ -238,15 +251,22 @@ activity).
 6. **Emulator**: the region-receive op in the emulated engine (a `read`
    into the region), with conformance tests on both engines.
 
+## Owner decisions
+
+- Per-connection rings, not the hybrid.
+- Memory that scales with connections is acceptable (about 8 GB at
+  1,000,000 connections, including ring pages).
+- Around 100,000 connections per worker is an acceptable target; past
+  65,536 on one worker the one-shot arm applies, and more workers per
+  core is the way to keep every connection on a ring.
+
 ## Questions for the owner
 
-1. **Memory budget.** Is per-connection region memory acceptable at your
-   largest deployments, or do idle connections need to release theirs?
-2. **`RLIMIT_MEMLOCK`.** One page per connection on 6.14+ raises the
-   memlock requirement roughly by `max_connections × 4 KiB` per worker.
-   Is that acceptable, or should rings use `IOU_PBUF_RING_MMAP`
-   (kernel-allocated) if that is charged differently?
-3. **Kernel floor.** With the one-shot path, region receive works on
-   every supported kernel. If the measurement shows the one-shot path is
-   too slow, should kernels below 6.12 keep the shared ring, or should
-   the floor rise?
+1. **`RLIMIT_MEMLOCK`.** One page per connection on 6.14+ raises the
+   memlock requirement by about `connections × 4 KiB` per worker. Should
+   the startup check require it (failing launch, as today), or should a
+   worker that cannot lock more pages use the one-shot arm for further
+   connections?
+2. **Kernel floor.** If the measurement shows the one-shot arm is too
+   slow, should kernels below 6.12 keep the shared ring, or should the
+   floor rise?
