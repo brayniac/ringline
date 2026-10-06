@@ -383,3 +383,35 @@ fn shutdown_does_not_wait_out_a_direct_echo_to_a_half_closed_peer() {
         "worker took {took:?} to exit with a direct echo waiting"
     );
 }
+
+/// Every byte a direct-echo server receives is echoed, including the bytes
+/// that arrive in the same completion batch as the client's FIN (#604).
+#[cfg(has_io_uring)]
+#[test]
+fn direct_echo_echoes_every_byte_before_closing_on_fin() {
+    let _lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (runtime, handles) = RinglineBuilder::new(config())
+        .bind("127.0.0.1:0".parse().unwrap())
+        .launch::<DirectEcho>()
+        .expect("launch");
+    let mut stream = connect(runtime.bound_addr().expect("bound address"));
+
+    // Send everything and half-close on another thread; the echo comes back
+    // while it is still writing.
+    let mut writer_stream = stream.try_clone().unwrap();
+    let writer = std::thread::spawn(move || {
+        writer_stream.write_all(&payload()).unwrap();
+        writer_stream.shutdown(Shutdown::Write).unwrap();
+    });
+    read_payload(&mut stream, "direct echo");
+    writer.join().unwrap();
+    // After the whole echo, the server closes.
+    let mut b = [0u8; 1];
+    assert_eq!(stream.read(&mut b).expect("read after the echo"), 0);
+
+    drop(stream);
+    runtime.shutdown();
+    for h in handles {
+        h.join().expect("worker panicked").expect("worker error");
+    }
+}

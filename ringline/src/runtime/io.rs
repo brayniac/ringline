@@ -5690,19 +5690,24 @@ impl Future for DirectEchoFuture {
                 }
             }
 
-            // Check if the connection is already closed.
+            // Done once the read side has finished and every byte received
+            // before it has been submitted for echo; until the hold drains,
+            // ending the task would close the connection and drop them
+            // (#604).
             let is_closed = driver
                 .connections
                 .get(self.conn_index)
                 .map(|c| c.recv_finished())
-                .unwrap_or(true);
+                .unwrap_or(true)
+                && driver.recv_hold[self.conn_index as usize].is_empty();
 
             if is_closed {
                 return Poll::Ready(());
             }
 
-            // Park until close — handle_recv_multi calls wake_recv when
-            // result == 0 (EOF) or on error, which will wake this future.
+            // Park until close. handle_recv_multi calls wake_recv on EOF or
+            // error, and flush_direct_echoes calls it when the hold of a
+            // connection whose read side has finished drains.
             executor.owner_task[self.conn_index as usize] = Some(CURRENT_TASK_ID.with(|c| c.get()));
             executor.recv_waiters[self.conn_index as usize] = true;
             Poll::Pending
