@@ -1,9 +1,8 @@
 //! The engine executes the operations the driver submits and reports their
-//! completions. [`UringEngine`](uring::UringEngine) is the kernel's
-//! io_uring. Building with the environment variable
-//! `RINGLINE_STUB_ENGINE=1` selects [`StubEngine`](stub::StubEngine)
-//! instead, which compiles the driver without the `io_uring` crate and
-//! fails at setup.
+//! completions. `UringEngine` runs them on the kernel's io_uring. Building
+//! with the environment variable `RINGLINE_STUB_ENGINE=1` selects
+//! `StubEngine` instead, which compiles the driver without using the
+//! `io_uring` crate and fails at setup.
 
 use std::io;
 use std::os::fd::RawFd;
@@ -37,8 +36,8 @@ pub(crate) trait Engine: Sized {
     /// Create the engine for one worker, on that worker's thread.
     fn setup(config: &Config) -> Result<Self, Error>;
 
-    /// Queue `sqe`. Fails when the queue is still full after submitting
-    /// what it holds.
+    /// Queue `sqe`. Fails when the queue is full and submitting to make room
+    /// either fails or leaves it full.
     ///
     /// # Safety
     /// The operation's pointers must stay valid until its completion
@@ -89,7 +88,7 @@ pub(crate) trait Engine: Sized {
     fn unregister_buf_ring(&self, bgid: u16) -> io::Result<()>;
 
     /// Register the fixed-buffer table, sized to `registry`, with its
-    /// occupied slots.
+    /// occupied slots. An empty registry registers nothing.
     fn register_buffers(&self, registry: &FixedBufferRegistry) -> Result<(), Error>;
 
     /// Set fixed-buffer slot `slot` to `iov`; a null `iov_base` clears it.
@@ -113,8 +112,9 @@ pub(crate) trait Engine: Sized {
     #[cfg(test)]
     fn inject(&mut self, user_data: u64, result: i32, linked: bool) -> io::Result<()>;
 
-    /// Test-only: make the next `count` pushes fail as if the queue were
-    /// still full after a submit.
+    /// Test-only: make the next `count` calls to `push`, `push_pair` or
+    /// `inject` fail as if the queue were still full after a submit;
+    /// `push_chain` is not affected.
     #[cfg(test)]
     fn force_push_failures(&mut self, count: usize);
 

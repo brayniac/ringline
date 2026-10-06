@@ -1,5 +1,5 @@
 //! An engine that executes nothing: it lets the io_uring driver compile
-//! without the `io_uring` crate (`RINGLINE_STUB_ENGINE=1`). Setup fails, so
+//! without using the `io_uring` crate (`RINGLINE_STUB_ENGINE=1`). Setup fails, so
 //! no other method is reached; each panics if it is.
 
 use std::io;

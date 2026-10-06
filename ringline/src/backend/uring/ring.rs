@@ -206,14 +206,15 @@ impl Ring {
         self.engine.inject(user_data, result, true)
     }
 
-    /// Re-probe an arbitrary opcode; see [`UringEngine::probe_supported`].
+    /// Re-probe an arbitrary opcode; see
+    /// `engine::uring::UringEngine::probe_supported`.
     #[cfg(all(test, uring_engine))]
     pub(crate) fn probe_supported(&self, code: u8) -> bool {
         self.engine.probe_supported(code)
     }
 
     /// The calling thread's io-wq limits; see
-    /// [`UringEngine::iowq_max_workers`].
+    /// `engine::uring::UringEngine::iowq_max_workers`.
     #[cfg(all(test, uring_engine))]
     pub(crate) fn iowq_max_workers(&self) -> io::Result<[u32; 2]> {
         self.engine.iowq_max_workers()
@@ -992,8 +993,8 @@ impl Ring {
     /// Push a chain of linked SQEs atomically.
     ///
     /// Sets `IOSQE_IO_LINK` on all entries except the last, so the kernel
-    /// executes them sequentially. All entries are pushed via `push_multiple`
-    /// to guarantee contiguous placement in the SQ.
+    /// executes them sequentially. The engine queues them contiguously
+    /// (`Engine::push_chain`).
     ///
     /// # Safety
     /// All SQEs must reference valid memory for the lifetime of their operations.

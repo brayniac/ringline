@@ -72,7 +72,7 @@ fn page_align(bytes: u64, page: u64) -> u64 {
 }
 
 /// The bytes the kernel charges for one ring set up the way
-/// `backend::uring::ring::Ring::setup` does it: 128-byte SQEs, 32-byte CQEs,
+/// `backend::uring::engine::uring::UringEngine::setup` does it: 128-byte SQEs, 32-byte CQEs,
 /// a CQ four times the SQ, and an SQ index array.
 ///
 /// The kernel rounds both entry counts up to a power of two, then charges two

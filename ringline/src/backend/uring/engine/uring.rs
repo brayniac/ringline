@@ -63,7 +63,7 @@ pub(crate) struct UringEngine {
     /// What goes ahead of a connection's `Close` on this kernel. See
     /// [`close_lead_for`].
     close_lead: CloseLead,
-    /// Test-only: number of upcoming `push_sqe`/`push_sqe128` calls that
+    /// Test-only: number of upcoming `push_sqe128`/`push_sqe_pair` calls that
     /// fail as if the SQ were still full after a submit. See
     /// [`Engine::force_push_failures`].
     #[cfg(test)]
@@ -426,7 +426,7 @@ impl Engine for UringEngine {
     /// a single completion: no accepts, no recvs, no send completions, and so
     /// no send-pool slots recycled, for as long as that task stays runnable.
     ///
-    /// Costs the same one syscall as the `submit_and_wait(0)` it replaces.
+    /// One `io_uring_enter`.
     /// Without DEFER_TASKRUN (SQPOLL rings, which cannot enable it) the kernel
     /// posts completions eagerly, so this delegates.
     fn submit_and_get_events(&self) -> io::Result<()> {
@@ -452,8 +452,8 @@ impl Engine for UringEngine {
 
     /// Submit pending SQEs without waiting. Used for mid-iteration flush.
     ///
-    /// After submitting the SQEs this method issues a second `io_uring_enter`
-    /// with `IORING_ENTER_GETEVENTS` and `min_complete=0`.  With
+    /// Submits pending SQEs with `IORING_ENTER_GETEVENTS` and
+    /// `min_complete=0` in one `io_uring_enter`. With
     /// `IORING_SETUP_DEFER_TASKRUN` the kernel only runs task_work (and posts
     /// deferred CQEs to the completion ring) when `IORING_ENTER_GETEVENTS` is
     /// set.  A plain `submit()` call does NOT set that flag, so send-completion
@@ -461,21 +461,12 @@ impl Engine for UringEngine {
     /// until the next `submit_and_wait(1)`, causing a "dead" event-loop
     /// iteration that wakes up only to process those CQEs.
     ///
-    /// By issuing a non-blocking `enter(GETEVENTS, min=0)` right after submit
+    /// Setting the flag on the submitting enter
     /// we flush task_work inline — the send CQEs land in the CQ ring before
     /// `flush()` returns, so the `drain_completions()` call that follows in
     /// the event loop can consume them immediately.
     fn flush(&self) -> io::Result<()> {
-        // Combine submit + DEFER_TASKRUN flush into a single kernel entry.
-        //
-        // The old two-call path was:
-        //   submit()                           → enter(sq_len, 0, 0=no-GETEVENTS, None)
-        //   enter::<()>(0, 0, GETEVENTS, None) → enter(0,      0, GETEVENTS,       None)
-        //
-        // Merged into one:
-        //   enter(sq_len, 0, GETEVENTS, None)
-        //
-        // This submits any pending SQEs AND triggers DEFER_TASKRUN task_work
+        // `enter(sq_len, 0, GETEVENTS, None)`: this submits any pending SQEs AND triggers DEFER_TASKRUN task_work
         // delivery in a single syscall, saving one round-trip to the kernel
         // per flush() invocation (≈ once or twice per event-loop iteration).
         //
@@ -518,10 +509,8 @@ impl Engine for UringEngine {
     /// Each forced failure returns an error of the same kind (`Other`) as
     /// the real "SQ still full after submit" path, increments the same
     /// `SQE_SUBMIT_FAILURES` metric, and consumes one unit of `count`
-    /// before the real submission queue is touched. `push_sqe` routes
-    /// through `push_sqe128`, so every `submit_*` helper is covered.
-    /// `push_sqe_chain`'s multi-entry path (`push_multiple`) is not
-    /// affected.
+    /// before the real submission queue is touched. `push`, `push_pair`
+    /// and `inject` are covered; `push_chain` is not affected.
     #[cfg(test)]
     fn force_push_failures(&mut self, count: usize) {
         self.forced_push_failures = count;

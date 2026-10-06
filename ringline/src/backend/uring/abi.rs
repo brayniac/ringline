@@ -2,7 +2,7 @@
 //! timespec a TIMEOUT points at, the flags on a completion, and the layout
 //! of a multishot `recvmsg` buffer.
 //!
-//! Outside `ring.rs` and `sqe.rs`, only tests use the `io_uring` crate;
+//! Outside `engine/uring.rs`, only tests use the `io_uring` crate;
 //! the tests here check these definitions against it.
 
 /// `struct __kernel_timespec`, which a TIMEOUT operation points at.

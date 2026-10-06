@@ -1,10 +1,9 @@
 //! A ringline-owned submission: what to do, on which file, and how to tag
 //! the completion.
 //!
-//! The driver describes every operation as an [`Sqe`] and the ring encodes
-//! it into an io_uring submission queue entry when it is pushed. Nothing
-//! outside this module and `ring.rs` builds an `io_uring::squeue::Entry`.
-//! Step 1 of the ring emulator (#621).
+//! The driver describes every operation as an [`Sqe`], and the engine
+//! encodes it when it is pushed. Only `engine/uring.rs` builds an
+//! `io_uring::squeue::Entry`.
 
 use std::os::fd::RawFd;
 
