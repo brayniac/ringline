@@ -21,7 +21,7 @@ use crate::config::Config;
 use crate::connection::{ConnectionTable, Lifecycle, RecvArm, WriteHalf};
 use crate::handler::{BuiltSend, ConnSendState, DriverCtx};
 use crate::metrics;
-use crate::runtime::send_capacity::BoundedSendId;
+use crate::runtime::send_completion::SendId;
 
 /// Slots in the lazily-constructed fallback recv pool. At most one
 /// fallback is in flight per connection, so this bounds how many
@@ -666,12 +666,11 @@ pub(crate) struct Driver {
     /// Bounded (`ConnCtx::send_backpressured`) operations that no CQE will
     /// ever settle, in settle order and keyed by the id the submitting
     /// future holds. Drained by the event loop into
-    /// `Executor::complete_bounded_send` (the event-loop half of series
+    /// `Executor::complete_send` (the event-loop half of series
     /// PR 7b) — the driver never touches the `Executor` itself.
     ///
-    /// Named for the common case, but the payload is an `io::Result` like
-    /// mio's `bounded_send_completions`, because what unites these entries
-    /// is the missing completion rather than the failure: a zero-length
+    /// The payload is an `io::Result`, as in mio's `settled_sends`, because
+    /// what unites these entries is the missing completion, not a failure: a zero-length
     /// message (and a TLS one whose plaintext produced no record) queues no
     /// SQE at all and still has to resolve — with `Ok`, and with the same
     /// value mio reports for it.
@@ -687,7 +686,7 @@ pub(crate) struct Driver {
     /// `run_shutdown` pushes here too, into a queue nobody will drain. That
     /// is correct: the executor is going away with the driver, exactly as
     /// mio's `Driver::drop` produces no completions.
-    pub(crate) bounded_send_completions: VecDeque<(BoundedSendId, io::Result<u32>)>,
+    pub(crate) settled_sends: VecDeque<(SendId, io::Result<u32>)>,
     /// Set whenever a copy-pool slot goes back to the pool, so the event
     /// loop can call `Executor::wake_send_capacity` once per iteration
     /// instead of once per released slot. The event loop clears it.
@@ -1188,7 +1187,7 @@ impl Driver {
             pending_recv_forward_retries: Vec::new(),
             pending_close_retries: Vec::new(),
             pending_send_retries: Vec::new(),
-            bounded_send_completions: VecDeque::new(),
+            settled_sends: VecDeque::new(),
             capacity_released: false,
             pending_finalize_closes: Vec::new(),
             zc_retry_scratch: Vec::new(),
@@ -1308,7 +1307,7 @@ impl Driver {
             fs_fd_base: self.fs_fd_base,
             pending_finalize_closes: &mut self.pending_finalize_closes,
             pending_send_retries: &mut self.pending_send_retries,
-            bounded_send_completions: &mut self.bounded_send_completions,
+            settled_sends: &mut self.settled_sends,
             capacity_released: &mut self.capacity_released,
             close_notify_timeout: self.close_notify_timeout,
             next_disk_io_seq: &mut self.next_disk_io_seq,
@@ -1356,7 +1355,7 @@ impl Driver {
         // A previous occupant's bounded send can still be sitting in the
         // queue here (its close abandoned the drain); the new occupant must
         // not inherit it, and its caller is still waiting.
-        self.fail_bounded_sends(bounded);
+        self.fail_send_ids(bounded);
     }
 
     /// Reset segmented-recv delivery state for a (re)activated connection slot.
@@ -2358,7 +2357,7 @@ impl Driver {
         if let Some(cs) = self.connections.get_mut(conn_index) {
             cs.write = WriteHalf::Open;
         }
-        self.fail_bounded_sends(bounded);
+        self.fail_send_ids(bounded);
         self.chain_table.cancel(conn_index);
         self.try_finalize_close(conn_index);
     }
@@ -2490,7 +2489,7 @@ impl Driver {
             // would then trip on the slot the handler is about to free.
             // Both failure paths below put it back on that slot, because
             // they leave the run queued and still owning its slots.
-            let bounded_send = self.send_copy_pool.take_bounded_send(pool_slots[n - 1]);
+            let send_id = self.send_copy_pool.take_send_id(pool_slots[n - 1]);
             // Only commit to coalescing if the slab has room; otherwise fall
             // through to single-submit (nothing popped yet).
             if let Some((slab_idx, msg_ptr)) = self.send_slab.allocate_coalesced(
@@ -2500,7 +2499,7 @@ impl Driver {
                 &pool_slots[..n],
                 total,
                 end_of_send,
-                bounded_send,
+                send_id,
             ) {
                 match self
                     .ring
@@ -2527,12 +2526,9 @@ impl Driver {
                         // if teardown gets there first the slot is what
                         // teardown reads.
                         self.send_slab.release(slab_idx);
-                        if let Some((id, logical_len)) = bounded_send {
-                            self.send_copy_pool.set_bounded_send(
-                                pool_slots[n - 1],
-                                id,
-                                logical_len,
-                            );
+                        if let Some((id, logical_len)) = send_id {
+                            self.send_copy_pool
+                                .set_send_id(pool_slots[n - 1], id, logical_len);
                         }
                         self.send_queues[ci].parked = true;
                         let generation = self.connections.generation(conn_index);
@@ -2545,9 +2541,9 @@ impl Driver {
             // slab full → fall through to single-submit. Nothing was popped
             // and the run still owns its slots, so the lifted id goes back
             // where the single-submit path (and teardown) will find it.
-            if let Some((id, logical_len)) = bounded_send {
+            if let Some((id, logical_len)) = send_id {
                 self.send_copy_pool
-                    .set_bounded_send(pool_slots[n - 1], id, logical_len);
+                    .set_send_id(pool_slots[n - 1], id, logical_len);
             }
         }
 
@@ -2842,7 +2838,7 @@ impl Driver {
         // Abandon any partially-accumulated logical send so the next one
         // starts from zero.
         state.acked_bytes = 0;
-        self.fail_bounded_sends(bounded);
+        self.fail_send_ids(bounded);
         // The queue is now empty and nothing is in flight — fire a deferred
         // close if one was pending so the connection can't leak.
         self.try_finalize_close(conn_index);
@@ -2863,7 +2859,7 @@ impl Driver {
     /// its caller's future hangs — and `SendCopyPool::release` debug-asserts
     /// rather than let the id be dropped silently. The ids are *returned*
     /// instead of pushed, so the three callers can put them on
-    /// `Driver::bounded_send_completions` themselves: every caller already
+    /// `Driver::settled_sends` themselves: every caller already
     /// holds `&mut self` while this takes four disjoint field borrows, and
     /// threading a failures queue and an error constructor through a fifth
     /// `&mut` parameter is the change with the most call-site risk and the
@@ -2873,13 +2869,13 @@ impl Driver {
     /// The returned `Vec` does not allocate unless a bounded send was
     /// actually queued, so the common teardown (and `reset_send_state`, run
     /// on every slot reactivation) pays nothing.
-    #[must_use = "queued bounded sends must be failed onto Driver::bounded_send_completions"]
+    #[must_use = "queued bounded sends must be failed onto Driver::settled_sends"]
     pub(crate) fn release_queued_sends(
         queue: &mut VecDeque<BuiltSend>,
         send_slab: &mut InFlightSendSlab,
         send_copy_pool: &mut SendCopyPool,
         pending_replenish: &mut Vec<u16>,
-    ) -> Vec<BoundedSendId> {
+    ) -> Vec<SendId> {
         let mut bounded = Vec::new();
         for built in queue.drain(..) {
             if built.pool_slot == u16::MAX && built.slab_idx == u16::MAX {
@@ -2896,7 +2892,7 @@ impl Driver {
             // slab entry is never queued (it is built at submit time and the
             // run it covers is popped on success).
             if built.pool_slot != u16::MAX
-                && let Some((id, _logical_len)) = send_copy_pool.take_bounded_send(built.pool_slot)
+                && let Some((id, _logical_len)) = send_copy_pool.take_send_id(built.pool_slot)
             {
                 bounded.push(id);
             }
@@ -2916,9 +2912,9 @@ impl Driver {
     /// The tail of each `release_queued_sends` call site. `ConnectionAborted`
     /// is the failure every teardown reports: the send was admitted, never
     /// reached the wire, and its connection is going away.
-    fn fail_bounded_sends(&mut self, bounded: Vec<BoundedSendId>) {
+    fn fail_send_ids(&mut self, bounded: Vec<SendId>) {
         for id in bounded {
-            self.bounded_send_completions.push_back((
+            self.settled_sends.push_back((
                 id,
                 Err(io::Error::new(
                     io::ErrorKind::ConnectionAborted,
@@ -3324,8 +3320,8 @@ impl Driver {
         if !self.send_slab.in_use(slab_idx) {
             return;
         }
-        if let Some((id, _logical_len)) = self.send_slab.take_coalesced_bounded_send(slab_idx) {
-            self.bounded_send_completions.push_back((
+        if let Some((id, _logical_len)) = self.send_slab.take_coalesced_send_id(slab_idx) {
+            self.settled_sends.push_back((
                 id,
                 Err(io::Error::new(
                     io::ErrorKind::ConnectionAborted,
@@ -3482,9 +3478,9 @@ impl Driver {
                             // with the driver, so there is no future left to
                             // resolve.
                             if let Some((id, _logical_len)) =
-                                self.send_copy_pool.take_bounded_send(pool_slot)
+                                self.send_copy_pool.take_send_id(pool_slot)
                             {
-                                self.bounded_send_completions.push_back((
+                                self.settled_sends.push_back((
                                     id,
                                     Err(io::Error::new(
                                         io::ErrorKind::ConnectionAborted,

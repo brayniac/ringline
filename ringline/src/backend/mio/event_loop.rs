@@ -1342,8 +1342,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// Drain the driver's send completions and re-poll the tasks they woke.
     ///
     /// Two queues, in this order: the worker-wide bounded-send queue
-    /// (`Driver::bounded_send_completions`, routed by id through
-    /// `Executor::complete_bounded_send`), then the per-connection
+    /// (`Driver::settled_sends`, routed by id through
+    /// `Executor::complete_send`), then the per-connection
     /// `send_completions` queues, calling wake_send for each so that each
     /// SendFuture resolves. The per-connection pass visits only connections
     /// marked dirty at completion-push time; a connection with results left
@@ -1358,15 +1358,16 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             let mut delivered = false;
             // Bounded (`send_backpressured`) completions first. They are
             // keyed by id rather than by connection, so they bypass the
-            // dirty-list entirely; the executor's FIFO routes each result
-            // to the exact operation that produced it. Draining them here
+            // dirty-list entirely; the executor's completion table
+            // (`SendCompletions`) routes each result to the exact operation
+            // that produced it. Draining them here
             // (rather than after the per-connection pass) keeps them ahead
             // of `drain_pending_closes`, so a bounded send whose last byte
             // reached the socket is recorded `Ok` before
             // `Executor::remove_connection` would resolve it as
             // `ConnectionAborted`.
-            while let Some((id, result)) = self.driver.bounded_send_completions.pop_front() {
-                self.executor.complete_bounded_send(id, result);
+            while let Some((id, result)) = self.driver.settled_sends.pop_front() {
+                self.executor.complete_send(id, result);
                 delivered = true;
             }
             let dirty = std::mem::take(&mut self.driver.completions_dirty);
@@ -1963,7 +1964,7 @@ mod tests {
 
         // The submitting future is on a standalone task: one owned by the
         // connection's own task is dropped by teardown before it could ever
-        // read a result (`SendCapacityQueue::remove_connection`).
+        // read a result (`SendCompletions::remove_connection`).
         let task_id = parked_standalone(&mut event_loop.executor);
         let payload = vec![b'z'; 200];
         let id = event_loop
@@ -1974,7 +1975,7 @@ mod tests {
             .make_ctx()
             .send_bounded(conn, &payload, id)
             .expect("admitted");
-        event_loop.executor.mark_bounded_send_submitted(id);
+        event_loop.executor.mark_send_submitted(id);
 
         // Close requested while the send is still queued.
         event_loop.driver.close_connection(conn_index);
@@ -1986,7 +1987,7 @@ mod tests {
 
         let result = event_loop
             .executor
-            .take_bounded_send_result(id)
+            .take_send_result(id)
             .expect("the operation resolved");
         assert_eq!(
             result.expect("the bytes reached the socket, so this is not ConnectionAborted"),
@@ -2040,7 +2041,7 @@ mod tests {
             .make_ctx()
             .send_bounded(conn, &payload, id)
             .expect("admitted");
-        event_loop.executor.mark_bounded_send_submitted(id);
+        event_loop.executor.mark_send_submitted(id);
 
         // Step 6: the connection's own task runs and returns Ready.
         // `NoopHandler::on_accept` is `async move {}`, so the first poll
@@ -2064,7 +2065,7 @@ mod tests {
 
         let result = event_loop
             .executor
-            .take_bounded_send_result(id)
+            .take_send_result(id)
             .expect("the operation resolved");
         assert_eq!(
             result.expect("every byte reached the socket, so this is not an abort"),
@@ -2122,7 +2123,7 @@ mod tests {
                 .make_ctx()
                 .send_bounded(conn, b"sixty-odd bytes is one slot", id)
                 .expect("admitted");
-            event_loop.executor.mark_bounded_send_submitted(id);
+            event_loop.executor.mark_send_submitted(id);
         }
         assert_eq!(event_loop.driver.send_copy_pool.free_count(), 2);
         assert!(
@@ -2265,7 +2266,7 @@ mod tests {
             .make_ctx()
             .send_bounded(conn, b"stranded", id)
             .expect("admitted");
-        event_loop.executor.mark_bounded_send_submitted(id);
+        event_loop.executor.mark_send_submitted(id);
         assert_eq!(event_loop.driver.send_copy_pool.free_count(), 3);
 
         // Free the slot with its send queue still populated — the state the
@@ -2301,7 +2302,7 @@ mod tests {
         event_loop.drain_send_completions();
         let err = event_loop
             .executor
-            .take_bounded_send_result(id)
+            .take_send_result(id)
             .expect("the stranded id must be told")
             .expect_err("the send never went");
         assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
@@ -2385,7 +2386,7 @@ mod tests {
                 .make_ctx()
                 .send_bounded(conn, payload, id)
                 .expect("admission does not touch the socket");
-            event_loop.executor.mark_bounded_send_submitted(id);
+            event_loop.executor.mark_send_submitted(id);
             ids.push(id);
         }
 
@@ -2411,7 +2412,7 @@ mod tests {
         for id in ids {
             let err = event_loop
                 .executor
-                .take_bounded_send_result(id)
+                .take_send_result(id)
                 .unwrap_or_else(|| panic!("{id:?} was never told"))
                 .expect_err("the write failed");
             assert!(

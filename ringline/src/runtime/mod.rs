@@ -24,7 +24,7 @@ pub(crate) mod handler;
 pub(crate) mod io;
 pub(crate) mod join;
 pub(crate) mod select;
-pub(crate) mod send_capacity;
+pub(crate) mod send_completion;
 pub(crate) mod stream;
 pub(crate) mod task;
 pub(crate) mod waker;
@@ -555,12 +555,13 @@ pub(crate) struct Executor {
     pub(crate) recv_errors: Vec<Option<(u32, stdio::Error)>>,
     /// Per-connection: task is awaiting send completion.
     pub(crate) send_waiters: Vec<bool>,
-    /// Worker-wide FIFO for bounded sends: who may reserve copy-pool slots
-    /// next, and the result of each admitted operation. Driven through the
-    /// wrappers in [`send_capacity`]; `remove_connection` resolves the
+    /// Worker-wide table of bounded sends: the FIFO that decides who may
+    /// reserve copy-pool slots next, and the state and result of every
+    /// operation, waiting or admitted. Driven through the
+    /// wrappers in [`send_completion`]; `remove_connection` resolves the
     /// entries of a torn-down connection (provisionally — see that module's
     /// docs on why a driver result still overwrites the abort).
-    pub(crate) send_capacity: send_capacity::SendCapacityQueue,
+    pub(crate) send_completions: send_completion::SendCompletions,
     /// Per-connection: task is awaiting connect result.
     pub(crate) connect_waiters: Vec<bool>,
     /// Per-connection: CQE result storage for send/connect.
@@ -697,7 +698,7 @@ impl Executor {
                 v
             },
             send_waiters: vec![false; cap],
-            send_capacity: send_capacity::SendCapacityQueue::new(),
+            send_completions: send_completion::SendCompletions::new(),
             connect_waiters: vec![false; cap],
             io_results: {
                 let mut v = Vec::with_capacity(cap);
@@ -766,11 +767,11 @@ impl Executor {
         // abort is provisional: this method is also called from the mio
         // loop's `poll_ready_tasks` (step 6), *before* the step-6a flush
         // that can still deliver the message, so a driver result arriving
-        // afterwards overwrites it (`send_capacity`'s module docs). Runs
+        // afterwards overwrites it (`send_completion`'s module docs). Runs
         // after `task_slab.remove` on purpose: the connection's own task is
         // already gone, and the queue drops its entries rather than parking
         // results nobody can take.
-        for task_id in self.send_capacity.remove_connection(conn_index) {
+        for task_id in self.send_completions.remove_connection(conn_index) {
             let _ = self.wake_task(task_id);
         }
         if idx < self.recv_waiters.len() {
@@ -1319,7 +1320,7 @@ mod tests {
         let mut exec = Executor::new(8, 8, 8, 0, 0);
         let task_id = parked_standalone(&mut exec);
         let id = exec.enqueue_send_capacity(3, 1, 1, task_id);
-        exec.mark_bounded_send_submitted(id);
+        exec.mark_send_submitted(id);
         assert!(exec.ready_queue.is_empty());
 
         exec.remove_connection(3);
@@ -1333,7 +1334,7 @@ mod tests {
             "owner must be Ready after teardown"
         );
         let err = exec
-            .take_bounded_send_result(id)
+            .take_send_result(id)
             .expect("result recorded")
             .expect_err("teardown fails the send");
         assert_eq!(err.kind(), stdio::ErrorKind::ConnectionAborted);
@@ -1347,10 +1348,10 @@ mod tests {
         let a = parked_standalone(&mut exec);
         let b = parked_standalone(&mut exec);
         let id = exec.enqueue_send_capacity(2, 1, 1, a);
-        exec.mark_bounded_send_submitted(id);
-        exec.set_bounded_send_owner(id, b);
+        exec.mark_send_submitted(id);
+        exec.set_send_owner(id, b);
 
-        exec.complete_bounded_send(id, Ok(7));
+        exec.complete_send(id, Ok(7));
 
         assert_eq!(exec.ready_queue.len(), 1);
         assert_eq!(exec.ready_queue[0], b);
@@ -1366,7 +1367,7 @@ mod tests {
                 .is_none(),
             "original owner stays parked"
         );
-        assert_eq!(exec.take_bounded_send_result(id).unwrap().unwrap(), 7);
+        assert_eq!(exec.take_send_result(id).unwrap().unwrap(), 7);
     }
 
     #[test]
@@ -1389,7 +1390,7 @@ mod tests {
         exec.wake_send_capacity(4);
         assert_eq!(exec.ready_queue.pop_front(), Some(a));
 
-        exec.cancel_bounded_send(head);
+        exec.cancel_send(head);
         assert_eq!(exec.ready_queue.pop_front(), Some(b), "next head woken");
         assert!(exec.send_capacity_turn(next, 1));
 
@@ -1402,7 +1403,7 @@ mod tests {
         assert!(exec.ready_queue.is_empty());
         for id in [next, last] {
             let err = exec
-                .take_bounded_send_result(id)
+                .take_send_result(id)
                 .expect("failed waiter has a result")
                 .expect_err("failed");
             assert_eq!(err.kind(), stdio::ErrorKind::BrokenPipe);

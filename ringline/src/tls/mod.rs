@@ -644,7 +644,7 @@ impl TlsTable {
     ///
     /// **This is the single source of that number.** PR 9's bounded-send
     /// future must compute the `required_slots` it hands
-    /// `SendCapacityQueue::enqueue` with this same function, and its
+    /// `SendCompletions::enqueue` with this same function, and its
     /// oversize-rejection test must use it too. If the FIFO admits on a
     /// different number than the backend checks, the queue will admit a
     /// message the backend then refuses — which is the failure this bound
