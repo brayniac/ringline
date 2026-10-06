@@ -3907,7 +3907,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
     /// Handle completion of a send from a recv buffer (zero-copy forward).
     ///
-    /// Payload encoding: `bid` in low 16 bits, `remaining_len` in high 16 bits.
+    /// Payload: the bid. The remaining byte count is in `send_recv_buf_remaining`.
     /// On partial send, resubmits from offset. On completion, replenishes the bid.
     fn handle_send_recv_buf(&mut self, ud: UserData, result: i32) {
         // No liveness/identity guard and no close_submitted guard,
@@ -15498,16 +15498,62 @@ mod tests {
             el.driver.ring.force_push_failures(1);
             el.drain_send_retries();
         }
-        assert!(
-            el.driver.pending_replenish.contains(&bid),
-            "the buffer was not returned"
+        assert_eq!(
+            el.driver
+                .pending_replenish
+                .iter()
+                .filter(|&&b| b == bid)
+                .count(),
+            1,
+            "the buffer was not returned exactly once"
         );
+        let ci = conn_index as usize;
+        assert!(el.driver.send_queues[ci].queue.is_empty());
+        assert!(!el.driver.send_queues[ci].in_flight);
         assert!(
             el.driver
                 .connections
                 .get(conn_index)
                 .is_some_and(|c| c.close_requested()),
             "the connection was left open with a hole in its stream"
+        );
+    }
+
+    /// The parked remainder is the next bytes of the stream, so it goes out
+    /// ahead of a send queued behind the in-flight `SendRecvBuf`.
+    #[test]
+    fn a_parked_send_recv_buf_remainder_goes_ahead_of_a_queued_send() {
+        let mut el = make_test_loop_with_config(
+            test_config_builder()
+                .send_pool(8, 64)
+                .build()
+                .expect("valid config"),
+        );
+        let conn_index = accept_connection(&mut el);
+        let ci = conn_index as usize;
+        let bid: u16 = 3;
+        el.driver.send_recv_buf_original_lens[ci] = 100;
+        el.driver.send_recv_buf_remaining[ci] = 100;
+        el.driver.send_queues[ci].in_flight = true;
+        let queued = built_copy_send(&mut el, conn_index, b"bbb");
+        el.driver.submit_or_queue_send(conn_index, queued);
+
+        el.driver.ring.force_push_failures(1);
+        let ud = UserData::encode(OpTag::SendRecvBuf, conn_index, bid as u32);
+        el.test_dispatch_cqe(ud.raw(), 60, 0);
+        el.drain_send_retries();
+        let pushed = UserData(
+            el.driver
+                .ring
+                .last_pushed
+                .as_ref()
+                .expect("an SQE was pushed")
+                .get_user_data(),
+        );
+        assert_eq!(
+            pushed.tag(),
+            Some(OpTag::SendRecvBuf),
+            "the queued send overtook the remainder"
         );
     }
 

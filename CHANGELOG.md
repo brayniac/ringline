@@ -299,14 +299,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
-- On io_uring, a partially sent receive buffer (`forward_recv_buf`, or
-  `run_direct_echo` with one buffer held) whose remainder could not be
-  resubmitted because the submission queue was full lost that remainder:
-  the buffer went back to the ring and the connection moved on to its next
-  send, leaving a gap in the stream. The remainder is now parked at the head
-  of the send queue and retried, as any send is under submission-queue
-  pressure; if it still cannot be submitted, the connection is closed rather
-  than left with a gap (#613).
+- On io_uring, a receive buffer sent in part by `forward_recv_buf` (on
+  `ConnCtx` or `SendHalf`) or `ConnCtx::run_direct_echo` lost the rest of its
+  bytes when the submission queue was full. The buffer went back to
+  the ring and the next send went out, leaving a gap in the stream. The rest
+  is now parked at the head of the send queue and retried. If it still
+  cannot be submitted, the connection is closed (#613).
 
 - On io_uring, `ConnCtx::run_direct_echo` dropped the bytes it had received
   just before the peer's FIN: the FIN closed the connection, returning the
