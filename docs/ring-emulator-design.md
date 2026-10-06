@@ -393,9 +393,13 @@ Each step is a separate PR. Steps 1–6 keep both backends working.
 
 ## Notes
 
-- Emulated recv copies as many times as the mio backend does today:
-  socket → provided buffer → accumulator on the emulator, socket → 8 KiB
-  scratch buffer → accumulator on mio.
+- Copy counts follow CLAUDE.md's table, which counts copies ringline
+  makes in userspace, not the kernel's copy out of the socket. Emulated
+  recv makes one (provided buffer → accumulator), as io_uring does and as
+  mio does today (8 KiB scratch buffer → accumulator). Receiving straight
+  into the accumulator would remove that copy on both engines; that is a
+  change to the recv design, not to the emulator, and has its own
+  design.
 - kTLS is designed (`docs/ktls-design.md`) but not implemented. Its
   design sends plaintext with `IORING_OP_SEND` without `MSG_WAITALL`, so
   the emulator's Send follows the flag: with `MSG_WAITALL` it writes
