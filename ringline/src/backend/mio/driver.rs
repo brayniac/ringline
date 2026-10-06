@@ -225,6 +225,10 @@ pub(crate) struct Driver {
     /// `Config::forward_hold_cap` with the io_uring hold cap: same intent —
     /// bound one slow forward — applied to the queue mio actually has.
     pub(crate) forward_hold_cap: usize,
+    /// The most bytes one `forward_held` call forwards:
+    /// `FORWARD_HELD_MAX_BUFFERS` receive buffers' worth, the most one
+    /// io_uring call forwards.
+    pub(crate) forward_held_max_bytes: usize,
     /// Results of bounded (`send_backpressured`) sends, in completion order
     /// and keyed by the id the submitting future holds. Not per-connection:
     /// a [`SendId`] is unique on the worker, and the consumer
@@ -442,6 +446,8 @@ impl Driver {
             recv_half_taken: vec![false; max_conn],
             send_half_taken: vec![false; max_conn],
             forward_hold_cap: config.forward_hold_cap,
+            forward_held_max_bytes: crate::buffer::FORWARD_HELD_MAX_BUFFERS
+                * config.recv_buffer.buffer_size as usize,
             settled_sends: VecDeque::new(),
             capacity_released: false,
             udp_sockets,
