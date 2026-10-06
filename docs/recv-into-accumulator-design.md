@@ -256,9 +256,12 @@ run more workers rather than an overflow path.
 - Per-connection rings, not the hybrid.
 - Memory that scales with connections is acceptable (about 8 GB at
   1,000,000 connections, including ring pages).
-- Around 100,000 connections per worker is an acceptable target; past
-  65,536 on one worker the one-shot arm applies, and more workers per
-  core is the way to keep every connection on a ring.
+- The realistic high end is about 10,000 connections on a 4-core cache
+  server: 2,500 per worker, about 80 MB of regions and ring pages in
+  total, 10 MB of it locked per worker on 6.14+. The 65,536-ring limit
+  per worker is far above that; the one-shot overflow past it is a
+  safety rule, and more workers per core keep every connection on a ring
+  if a deployment ever needs it.
 
 ## Questions for the owner
 
