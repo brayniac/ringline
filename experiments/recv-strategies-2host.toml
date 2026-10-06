@@ -1,0 +1,182 @@
+# Receive strategies across a real NIC on the backports kernel, for
+# docs/recv-into-accumulator-design.md (#622). Complements the loopback runs
+# (experiments/recv-strategies.toml) with what loopback cannot show: NIC
+# interrupts and GRO-shaped arrivals, and a 6.14+ kernel, where provided
+# buffer rings are charged to RLIMIT_MEMLOCK.
+#
+# Server: hv02 (z1.baremetal). It first reports the kernel facts the design
+# relies on (`inc-probe`) and how many one-entry rings fit under the image's
+# default memlock limit (`ring-limit`), then runs one single-threaded
+# server per run, pinned to CPU 0, with memlock raised.
+# Client: hv01 (z2.baremetal).
+# Both machines read the same run list from experiments/recv-strategies/
+# runs.sh and run N listens on port 7000+N, so they stay in step without a
+# barrier per run.
+name = "ringline recv strategies 2-host bpo (#622)"
+
+[params]
+branch    = "exp/recv-strategies"
+repo      = "https://github.com/brayniac/ringline"
+image     = "spool/images/debian-13-ci-bpo-20261001.1@golden"
+server_ip = "172.31.0.1"
+client_ip = "172.31.0.2"
+reps      = "5"
+warmup    = "2"
+duration  = "8"
+
+# ── server: hv02 ───────────────────────────────────────────────────────────
+
+[[jobs]]
+name = "server"
+tags = ["z1.baremetal"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "start"
+shape = "z1.c"
+image = "{image}"
+gpu = false
+data_address = "{server_ip}/24"
+boot_timeout = 600
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "exec"
+payload = '''
+set -uo pipefail
+cd /home/anvil
+{
+  echo "KERNEL $(uname -r)"; nproc; lscpu | grep -E "Model name" | head -1
+  git clone -q {repo} src && git -C src checkout -q {branch} && git -C src log --oneline -1
+  (cd src/experiments/recv-strategies && cargo build --release --locked) || { echo "FATAL: build"; exit 1; }
+  B=/home/anvil/src/experiments/recv-strategies/target/release/recv-strategies
+  echo "memlock_default=$(ulimit -l)"
+  $B inc-probe
+  $B ring-limit
+  for len in 64 256 4096; do taskset -c 0 $B bytes-bench --iters 20000000 --len $len; done
+  sudo sysctl -qw net.core.somaxconn=65535 net.ipv4.tcp_max_syn_backlog=65535
+  ip -4 -brief addr show
+} 2>&1 | tee /home/anvil/setup.log
+exit 0
+'''
+
+[[jobs.steps]]
+type = "barrier"
+name = "server-ready"
+timeout = 1800
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "exec"
+upload = true
+artifacts = ["/home/anvil/setup.log", "/home/anvil/server.log"]
+payload = '''
+set -uo pipefail
+cd /home/anvil
+B=/home/anvil/src/experiments/recv-strategies/target/release/recv-strategies
+hard=$(ulimit -Hn); [ "$hard" = unlimited ] && hard=1048576; ulimit -n "$hard"
+sudo prlimit --pid $BASHPID --memlock=unlimited:unlimited
+{
+  echo "memlock_runs=$(ulimit -l)"
+  /home/anvil/src/experiments/recv-strategies/runs.sh {reps} | \
+  while IFS='|' read -r i rep label sargs wl conns cargs sextra; do
+    port=$((7000 + i))
+    taskset -c 0 $B server --addr {server_ip}:$port --conns $conns $sargs $sextra \
+      --warmup {warmup} --duration {duration} > srv.out 2> srv.err < /dev/null
+    r=$(grep '^RESULT' srv.out)
+    if [ -z "$r" ]; then
+      echo "SFAIL i=$i rep=$rep wl=$wl conns=$conns cfg=$label"; tail -3 srv.err | sed 's/^/  srv| /'
+    else
+      echo "SROW i=$i rep=$rep wl=$wl cfg=$label $r"
+    fi
+  done
+  echo "DONE"
+} 2>&1 | tee /home/anvil/server.log
+exit 0
+'''
+
+[[jobs.steps]]
+type = "barrier"
+name = "bench-done"
+timeout = 14400
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "stop"
+upload = true
+
+# ── client: hv01 ───────────────────────────────────────────────────────────
+
+[[jobs]]
+name = "client"
+tags = ["z2.baremetal"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "start"
+shape = "z2.c"
+image = "{image}"
+gpu = false
+data_address = "{client_ip}/24"
+boot_timeout = 600
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "exec"
+payload = '''
+set -uo pipefail
+cd /home/anvil
+{
+  echo "KERNEL $(uname -r)"; nproc
+  git clone -q {repo} src && git -C src checkout -q {branch} && git -C src log --oneline -1
+  (cd src/experiments/recv-strategies && cargo build --release --locked) || { echo "FATAL: build"; exit 1; }
+  sudo sysctl -qw net.ipv4.ip_local_port_range="10000 65535" net.ipv4.tcp_tw_reuse=1
+  ping -c 2 -W 2 {server_ip} || echo "WARN: server not reachable yet"
+} 2>&1 | tee /home/anvil/client-setup.log
+exit 0
+'''
+
+[[jobs.steps]]
+type = "barrier"
+name = "server-ready"
+timeout = 1800
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "exec"
+upload = true
+artifacts = ["/home/anvil/client.log"]
+payload = '''
+set -uo pipefail
+cd /home/anvil
+B=/home/anvil/src/experiments/recv-strategies/target/release/recv-strategies
+hard=$(ulimit -Hn); [ "$hard" = unlimited ] && hard=1048576; ulimit -n "$hard"
+threads=$(( $(nproc) - 1 ))
+{
+  /home/anvil/src/experiments/recv-strategies/runs.sh {reps} | \
+  while IFS='|' read -r i rep label sargs wl conns cargs sextra; do
+    port=$((7000 + i))
+    $B client --addr {server_ip}:$port --conns $conns --threads $threads $cargs \
+      --warmup {warmup} --seconds $(( {warmup} + {duration} + 2 )) --start-delay-ms 1000 \
+      > cli.out 2> cli.err < /dev/null
+    r=$(grep '^CLIENT' cli.out)
+    if [ -z "$r" ]; then
+      echo "CFAIL i=$i rep=$rep wl=$wl conns=$conns cfg=$label"; tail -3 cli.err | sed 's/^/  cli| /'
+    else
+      echo "CROW i=$i rep=$rep wl=$wl cfg=$label $r"
+    fi
+  done
+  echo "DONE"
+} 2>&1 | tee /home/anvil/client.log
+exit 0
+'''
+
+[[jobs.steps]]
+type = "barrier"
+name = "bench-done"
+timeout = 14400
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "stop"
+upload = true

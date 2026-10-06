@@ -22,9 +22,11 @@
 //! after `--warmup`.
 //!
 //! `bytes-bench` times a `Bytes::from_owner` view against today's
-//! `BytesMut::split_to().freeze()`.
+//! `BytesMut::split_to().freeze()`. `inc-probe` and `ring-limit` report the
+//! kernel facts the design relies on (`src/probe.rs`).
 
 mod common;
+mod probe;
 mod server;
 mod strategies;
 
@@ -55,8 +57,10 @@ fn main() {
         Some("server") => server::run(&args),
         Some("client") => client(&args),
         Some("bytes-bench") => bytes_bench(&args),
+        Some("inc-probe") => probe::inc_probe(),
+        Some("ring-limit") => probe::ring_limit(),
         _ => {
-            eprintln!("usage: recv-strategies server|client|bytes-bench ...");
+            eprintln!("usage: recv-strategies server|client|bytes-bench|inc-probe|ring-limit ...");
             std::process::exit(2);
         }
     }
@@ -149,8 +153,20 @@ fn client(args: &[String]) {
     }
 
     let mut streams: Vec<TcpStream> = Vec::with_capacity(nconns);
+    // The server may not be listening yet (two-machine runs start the next
+    // server when the previous run ends): retry the first connect.
+    let deadline = Instant::now() + Duration::from_secs(30);
     for _ in 0..nconns {
-        let s = TcpStream::connect(&addr).expect("connect");
+        let s = loop {
+            match TcpStream::connect(&addr) {
+                Ok(s) => break s,
+                Err(e) if streams.is_empty() && Instant::now() < deadline => {
+                    let _ = e;
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(e) => panic!("connect {addr}: {e}"),
+            }
+        };
         s.set_nodelay(true).ok();
         streams.push(s);
     }

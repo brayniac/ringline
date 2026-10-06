@@ -105,11 +105,24 @@ pub fn run(args: &[String]) {
     let mut strategy = crate::strategies::build(&strategy_name, args, nconns, sqpoll);
 
     let listener = TcpListener::bind(&addr).expect("bind");
+    // Give up if the client never connects, so a failed run cannot stall a
+    // two-machine sequence.
+    listener.set_nonblocking(true).expect("nonblocking listener");
+    let accept_deadline = Instant::now() + Duration::from_secs(60);
     let mut streams = Vec::with_capacity(nconns);
     while streams.len() < nconns {
-        let (s, _) = listener.accept().expect("accept");
-        s.set_nodelay(true).ok();
-        streams.push(s);
+        match listener.accept() {
+            Ok((s, _)) => {
+                s.set_nonblocking(false).ok();
+                s.set_nodelay(true).ok();
+                streams.push(s);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(Instant::now() < accept_deadline, "accept timeout: {} of {nconns}", streams.len());
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(e) => panic!("accept: {e}"),
+        }
     }
 
     let mut b = IoUring::builder();
