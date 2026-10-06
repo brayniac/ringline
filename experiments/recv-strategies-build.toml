@@ -1,0 +1,49 @@
+# Build the receive-strategy benchmark once for the two-host run
+# (experiments/recv-strategies-2host.toml), whose VMs have no route to
+# GitHub. The tarball carries the binary and the shared run list.
+name = "ringline recv strategies build (#622)"
+
+[params]
+branch = "exp/recv-strategies"
+repo   = "https://github.com/brayniac/ringline"
+
+[[jobs]]
+name = "build"
+tags = ["validation"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+shape = "z4.c"
+image = "spool/images/debian-13-ci-20260912.1@golden"
+slots = 1
+memory_gib = 4
+ports = 0
+gpu = false
+payload_timeout = 3600
+artifacts = ["/home/anvil/recv-bins.tgz", "/home/anvil/build.log"]
+upload = true
+payload = '''
+set -uo pipefail
+cd /home/anvil
+{
+  uname -srm
+  git clone -q {repo} src && git -C src checkout -q {branch}
+  git -C src log --oneline -1
+  cd src/experiments/recv-strategies
+  cargo build --release --locked
+  rc=$?
+  mkdir -p /home/anvil/out
+  cp target/release/recv-strategies runs.sh /home/anvil/out/
+  cd /home/anvil && sha256sum out/*
+  tar czf recv-bins.tgz out
+  echo "build_status=$rc"
+} 2>&1 | tee /home/anvil/build.log
+exit 0
+'''
+
+[[jobs.steps]]
+type = "shell"
+command = '''
+grep -q "build_status=0" build.log || { echo "build failed"; exit 1; }
+echo ok
+'''

@@ -12,11 +12,12 @@
 # Both machines read the same run list from experiments/recv-strategies/
 # runs.sh and run N listens on port 7000+N, so they stay in step without a
 # barrier per run.
+# These VMs cannot reach GitHub: the binary and runs.sh come from the
+# tarball experiments/recv-strategies-build.toml uploads (bins_artifact).
 name = "ringline recv strategies 2-host bpo (#622)"
 
 [params]
-branch    = "exp/recv-strategies"
-repo      = "https://github.com/brayniac/ringline"
+bins_artifact = "REPLACE_WITH_BUILD_ARTIFACT"
 image     = "spool/images/debian-13-ci-bpo-20261001.1@golden"
 server_ip = "172.31.0.1"
 client_ip = "172.31.0.2"
@@ -42,17 +43,17 @@ boot_timeout = 600
 [[jobs.steps]]
 type = "anvil-vm"
 mode = "exec"
+inputs = [{ artifact = "{bins_artifact}", name = "recv-bins.tgz", dest = "/home/anvil" }]
 payload = '''
-set -uo pipefail
-cd /home/anvil
+set -euo pipefail
+cd /home/anvil && tar xzf recv-bins.tgz && chmod +x out/*
 {
   echo "KERNEL $(uname -r)"; nproc; lscpu | grep -E "Model name" | head -1
-  git clone -q {repo} src && git -C src checkout -q {branch} && git -C src log --oneline -1
-  (cd src/experiments/recv-strategies && cargo build --release --locked) || { echo "FATAL: build"; exit 1; }
-  B=/home/anvil/src/experiments/recv-strategies/target/release/recv-strategies
+  sha256sum out/*
+  B=/home/anvil/out/recv-strategies
   echo "memlock_default=$(ulimit -l)"
-  $B inc-probe
-  $B ring-limit
+  $B inc-probe || echo "PROBE_FAIL inc-probe"
+  $B ring-limit || echo "PROBE_FAIL ring-limit"
   for len in 64 256 4096; do taskset -c 0 $B bytes-bench --iters 20000000 --len $len; done
   sudo sysctl -qw net.core.somaxconn=65535 net.ipv4.tcp_max_syn_backlog=65535
   ip -4 -brief addr show
@@ -73,12 +74,12 @@ artifacts = ["/home/anvil/setup.log", "/home/anvil/server.log"]
 payload = '''
 set -uo pipefail
 cd /home/anvil
-B=/home/anvil/src/experiments/recv-strategies/target/release/recv-strategies
+B=/home/anvil/out/recv-strategies
 hard=$(ulimit -Hn); [ "$hard" = unlimited ] && hard=1048576; ulimit -n "$hard"
 sudo prlimit --pid $BASHPID --memlock=unlimited:unlimited
 {
   echo "memlock_runs=$(ulimit -l)"
-  /home/anvil/src/experiments/recv-strategies/runs.sh {reps} | \
+  /home/anvil/out/runs.sh {reps} | \
   while IFS='|' read -r i rep label sargs wl conns cargs sextra; do
     port=$((7000 + i))
     taskset -c 0 $B server --addr {server_ip}:$port --conns $conns $sargs $sextra \
@@ -123,13 +124,13 @@ boot_timeout = 600
 [[jobs.steps]]
 type = "anvil-vm"
 mode = "exec"
+inputs = [{ artifact = "{bins_artifact}", name = "recv-bins.tgz", dest = "/home/anvil" }]
 payload = '''
-set -uo pipefail
-cd /home/anvil
+set -euo pipefail
+cd /home/anvil && tar xzf recv-bins.tgz && chmod +x out/*
 {
   echo "KERNEL $(uname -r)"; nproc
-  git clone -q {repo} src && git -C src checkout -q {branch} && git -C src log --oneline -1
-  (cd src/experiments/recv-strategies && cargo build --release --locked) || { echo "FATAL: build"; exit 1; }
+  sha256sum out/*
   sudo sysctl -qw net.ipv4.ip_local_port_range="10000 65535" net.ipv4.tcp_tw_reuse=1
   ping -c 2 -W 2 {server_ip} || echo "WARN: server not reachable yet"
 } 2>&1 | tee /home/anvil/client-setup.log
@@ -149,11 +150,11 @@ artifacts = ["/home/anvil/client.log"]
 payload = '''
 set -uo pipefail
 cd /home/anvil
-B=/home/anvil/src/experiments/recv-strategies/target/release/recv-strategies
+B=/home/anvil/out/recv-strategies
 hard=$(ulimit -Hn); [ "$hard" = unlimited ] && hard=1048576; ulimit -n "$hard"
 threads=$(( $(nproc) - 1 ))
 {
-  /home/anvil/src/experiments/recv-strategies/runs.sh {reps} | \
+  /home/anvil/out/runs.sh {reps} | \
   while IFS='|' read -r i rep label sargs wl conns cargs sextra; do
     port=$((7000 + i))
     $B client --addr {server_ip}:$port --conns $conns --threads $threads $cargs \
