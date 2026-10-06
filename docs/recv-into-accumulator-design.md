@@ -423,6 +423,14 @@ reallocation, lent bytes at the cap.
   safety rule, and more workers per core keep every connection on a ring
   if a deployment ever needs it.
 
+- Locked memory: requiring `CAP_IPC_LOCK` or a raised `RLIMIT_MEMLOCK`
+  on 6.14+ for per-connection rings is acceptable.
+- Decided ahead of the measurement, so the shared ring for TCP is always
+  deleted: kernels below 6.12 and SQPOLL rings use the one-shot arm
+  whatever its numbers, and buffered TLS moves to regions.
+- Shared-ring INC and one-shot-only are full candidates in the
+  measurement, alongside per-connection rings.
+
 ## Questions for the owner
 
 1. **Kernel floor.** If the one-shot configuration misses its gate, should kernels below
