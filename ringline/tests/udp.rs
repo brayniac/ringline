@@ -136,8 +136,10 @@ fn udp_basic_round_trip() {
 
 /// A port-0 UDP bind reports a nonzero port, and each worker binds its own
 /// `SO_REUSEPORT` socket to that port. One worker's socket is the one `launch`
-/// reserved the port with, so on Linux the IPv4 UDP table lists exactly one
-/// socket per worker on the port.
+/// reserved the port with. On Linux the test checks that the IPv4 UDP table
+/// lists exactly one socket per worker on the port. That catches a kept
+/// reservation or a worker that resolves port 0 itself, but not a reservation
+/// closed and replaced by a fresh bind.
 #[test]
 fn udp_port_zero_resolves_once_for_every_worker() {
     let _guard = UDP_SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -162,20 +164,43 @@ fn udp_port_zero_resolves_once_for_every_worker() {
 
     #[cfg(target_os = "linux")]
     {
-        // /proc/net/udp lists local addresses as hex `ip:port`.
-        let table = std::fs::read_to_string("/proc/net/udp").unwrap();
-        let port_hex = format!(":{:04X} ", addr.port());
-        let sockets = table
-            .lines()
-            .skip(1)
-            .filter(|line| {
-                line.split_whitespace()
-                    .nth(1)
-                    .is_some_and(|local| format!("{local} ").ends_with(&port_hex))
-            })
-            .count();
+        // /proc/net/udp lists each socket's local address as hex `ip:port`
+        // and its inode. The kernel produces the file in chunks and resumes
+        // each by position. If sockets in this network namespace open or
+        // close during a read, the read can skip an entry or list it twice
+        // (#597). Under nextest, other tests' processes open and close
+        // sockets. Under `cargo test`, `run_udp_client`'s echo server does, up
+        // to 5 s after its test returns.
+        //
+        // Counting distinct inodes removes duplicates. A socket is missed only
+        // if every one of the ten reads skips it.
+        //
+        // The kernel prints the address as the raw network-order `u32` with
+        // `%08X`, so the octets are read as a native-endian `u32`.
+        let std::net::IpAddr::V4(ip) = addr.ip() else {
+            panic!("the test binds an IPv4 address");
+        };
+        let local = format!(
+            "{:08X}:{:04X}",
+            u32::from_ne_bytes(ip.octets()),
+            addr.port()
+        );
+        let mut inodes = HashSet::new();
+        for _ in 0..10 {
+            let table = std::fs::read_to_string("/proc/net/udp").unwrap();
+            for line in table.lines().skip(1) {
+                let fields: Vec<&str> = line.split_whitespace().collect();
+                if fields.get(1).is_some_and(|l| *l == local)
+                    && let Some(inode) = fields.get(9)
+                {
+                    inodes.insert(inode.to_string());
+                }
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
         assert_eq!(
-            sockets, WORKERS,
+            inodes.len(),
+            WORKERS,
             "the reported port must be bound by exactly one socket per worker"
         );
     }
