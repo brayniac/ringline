@@ -2717,14 +2717,12 @@ impl Driver {
             .pop_front()
             .expect("hold is non-empty: n >= 1 was checked above");
         let ud = UserData::encode(OpTag::SendRecvBuf, conn_index, pending.bid as u32);
-        let entry = io_uring::opcode::Send::new(
-            io_uring::types::Fixed(conn_index),
+        let entry = crate::backend::uring::sqe::Sqe::stream_send(
+            conn_index,
             pending.ptr,
             pending.len,
-        )
-        .flags(crate::completion::STREAM_SEND_FLAGS)
-        .build()
-        .user_data(ud.raw());
+            ud.raw(),
+        );
         // Infallible: under SQ pressure the echo is parked at the queue head
         // and retried, holding its provided buffer exactly as a queued echo
         // does; the bid is replenished by its completion.
@@ -2781,7 +2779,7 @@ impl Driver {
     /// was pushed last (#614). A remainder (`SEND_RECV_BUF_REMAINDER`) keeps the
     /// counts `handle_send_recv_buf` recorded.
     fn note_send_recv_buf_pushed(&mut self, conn_index: u32, built: &crate::handler::BuiltSend) {
-        let ud = crate::completion::UserData(built.entry.get_user_data());
+        let ud = crate::completion::UserData(built.entry.user_data);
         if ud.tag() != Some(OpTag::SendRecvBuf)
             || ud.payload() & crate::completion::SEND_RECV_BUF_REMAINDER != 0
         {
@@ -2874,7 +2872,7 @@ impl Driver {
         let mut ids = Vec::new();
         for built in queue.drain(..) {
             if built.pool_slot == u16::MAX && built.slab_idx == u16::MAX {
-                let ud = crate::completion::UserData(built.entry.get_user_data());
+                let ud = crate::completion::UserData(built.entry.user_data);
                 if ud.tag() == Some(crate::completion::OpTag::SendRecvBuf) {
                     pending_replenish.push(ud.payload() as u16);
                 }

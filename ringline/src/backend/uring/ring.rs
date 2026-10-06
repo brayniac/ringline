@@ -3,7 +3,7 @@ use std::os::fd::RawFd;
 
 use io_uring::cqueue;
 use io_uring::squeue;
-use io_uring::types::{self, DestinationSlot, Fd, Fixed};
+use io_uring::types::DestinationSlot;
 use io_uring::{IoUring, opcode};
 
 use crate::backend::ProvidedBufRing;
@@ -13,6 +13,8 @@ use crate::config::Config;
 use crate::error::{Error, MemlockLimit, describe_buffer_registration_failure, errno_name};
 use crate::memlock::KernelVersion;
 use crate::nvme::{NVME_URING_CMD_IO, NvmeUringCmd};
+
+use super::sqe::{self, Link, Op, Sqe};
 
 /// The first kernel that releases a socket removed from the fixed-file table
 /// once that socket's own requests have completed. Earlier kernels release
@@ -423,9 +425,14 @@ impl Ring {
         msghdr: *const libc::msghdr,
     ) -> io::Result<()> {
         let user_data = UserData::encode(OpTag::RecvMsgMultiTs, conn_index, generation);
-        let entry = opcode::RecvMsgMulti::new(Fixed(conn_index), msghdr, self.bgid)
-            .build()
-            .user_data(user_data.raw());
+        let entry = Sqe::new(
+            Op::RecvMsgMulti {
+                fd: sqe::Fd::Fixed(conn_index),
+                msg: msghdr,
+                buf_group: self.bgid,
+            },
+            user_data.raw(),
+        );
         unsafe {
             self.push_sqe(&entry)?;
         }
@@ -445,9 +452,14 @@ impl Ring {
         pool_slot: u16,
     ) -> io::Result<()> {
         let user_data = UserData::encode(OpTag::RecvFallback, conn_index, pool_slot as u32);
-        let entry = opcode::Recv::new(Fixed(conn_index), ptr, len)
-            .build()
-            .user_data(user_data.raw());
+        let entry = Sqe::new(
+            Op::Recv {
+                fd: sqe::Fd::Fixed(conn_index),
+                buf: ptr,
+                len,
+            },
+            user_data.raw(),
+        );
         unsafe {
             self.push_sqe(&entry)?;
         }
@@ -468,9 +480,13 @@ impl Ring {
     /// cancel matches by `user_data`.
     pub fn submit_multishot_recv(&mut self, conn_index: u32, generation: u32) -> io::Result<()> {
         let user_data = UserData::encode(OpTag::RecvMulti, conn_index, generation);
-        let entry = opcode::RecvMulti::new(Fixed(conn_index), self.bgid)
-            .build()
-            .user_data(user_data.raw());
+        let entry = Sqe::new(
+            Op::RecvMulti {
+                fd: sqe::Fd::Fixed(conn_index),
+                buf_group: self.bgid,
+            },
+            user_data.raw(),
+        );
         unsafe {
             self.push_sqe(&entry)?;
         }
@@ -498,10 +514,13 @@ impl Ring {
         // path. Multishot accept defaults to zero, so without this the merged
         // path is the one place in the runtime that hands out an fd which
         // survives `exec` and blocks on a direct read (#460).
-        let entry = opcode::AcceptMulti::new(Fd(listen_fd))
-            .flags(libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC)
-            .build()
-            .user_data(user_data.raw());
+        let entry = Sqe::new(
+            Op::AcceptMulti {
+                fd: sqe::Fd::Raw(listen_fd),
+                flags: libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            },
+            user_data.raw(),
+        );
         unsafe {
             self.push_sqe(&entry)?;
         }
@@ -523,10 +542,15 @@ impl Ring {
             conn_index,
             UserData::send_payload(pool_slot, generation),
         );
-        let entry = opcode::Send::new(Fixed(conn_index), ptr, len)
-            .flags(crate::completion::STREAM_SEND_FLAGS)
-            .build()
-            .user_data(user_data.raw());
+        let entry = Sqe::new(
+            Op::Send {
+                fd: sqe::Fd::Fixed(conn_index),
+                buf: ptr,
+                len,
+                flags: crate::completion::STREAM_SEND_FLAGS,
+            },
+            user_data.raw(),
+        );
         unsafe {
             self.push_sqe(&entry)?;
         }
@@ -542,9 +566,13 @@ impl Ring {
         slab_idx: u16,
     ) -> io::Result<()> {
         let user_data = UserData::encode(OpTag::SendMsgZc, conn_index, slab_idx as u32);
-        let entry = opcode::SendMsgZc::new(Fixed(conn_index), msg)
-            .build()
-            .user_data(user_data.raw());
+        let entry = Sqe::new(
+            Op::SendMsgZc {
+                fd: sqe::Fd::Fixed(conn_index),
+                msg,
+            },
+            user_data.raw(),
+        );
         unsafe {
             self.push_sqe(&entry)?;
         }
@@ -560,10 +588,14 @@ impl Ring {
         slab_idx: u16,
     ) -> io::Result<()> {
         let user_data = UserData::encode(OpTag::SendMsgCoalesced, conn_index, slab_idx as u32);
-        let entry = opcode::SendMsg::new(Fixed(conn_index), msg)
-            .flags(crate::completion::STREAM_SEND_FLAGS as u32)
-            .build()
-            .user_data(user_data.raw());
+        let entry = Sqe::new(
+            Op::SendMsg {
+                fd: sqe::Fd::Fixed(conn_index),
+                msg,
+                flags: crate::completion::STREAM_SEND_FLAGS as u32,
+            },
+            user_data.raw(),
+        );
         unsafe {
             self.push_sqe(&entry)?;
         }
@@ -589,10 +621,15 @@ impl Ring {
         len: u32,
         user_data: UserData,
     ) -> io::Result<()> {
-        let entry = opcode::Send::new(Fixed(index), ptr, len)
-            .flags(crate::completion::STREAM_SEND_FLAGS)
-            .build()
-            .user_data(user_data.raw());
+        let entry = Sqe::new(
+            Op::Send {
+                fd: sqe::Fd::Fixed(index),
+                buf: ptr,
+                len,
+                flags: crate::completion::STREAM_SEND_FLAGS,
+            },
+            user_data.raw(),
+        );
         #[cfg(test)]
         {
             self.last_drain_index = Some(index);
@@ -612,10 +649,15 @@ impl Ring {
         len: u32,
         user_data: UserData,
     ) -> io::Result<()> {
-        let entry = opcode::Send::new(Fd(fd), ptr, len)
-            .flags(crate::completion::STREAM_SEND_FLAGS)
-            .build()
-            .user_data(user_data.raw());
+        let entry = Sqe::new(
+            Op::Send {
+                fd: sqe::Fd::Raw(fd),
+                buf: ptr,
+                len,
+                flags: crate::completion::STREAM_SEND_FLAGS,
+            },
+            user_data.raw(),
+        );
         unsafe { self.push_sqe(&entry) }
     }
 
@@ -629,10 +671,14 @@ impl Ring {
         slab_idx: u16,
     ) -> io::Result<()> {
         let user_data = UserData::encode(OpTag::SendRecvBufsCoalesced, conn_index, slab_idx as u32);
-        let entry = opcode::SendMsg::new(Fixed(conn_index), msg)
-            .flags(crate::completion::STREAM_SEND_FLAGS as u32)
-            .build()
-            .user_data(user_data.raw());
+        let entry = Sqe::new(
+            Op::SendMsg {
+                fd: sqe::Fd::Fixed(conn_index),
+                msg,
+                flags: crate::completion::STREAM_SEND_FLAGS as u32,
+            },
+            user_data.raw(),
+        );
         unsafe {
             self.push_sqe(&entry)?;
         }
@@ -659,12 +705,14 @@ impl Ring {
         msghdr: *const libc::msghdr,
         user_data: UserData,
     ) -> io::Result<()> {
-        let entry = opcode::SendMsg::new(Fd(fd), msghdr)
-            // `SendMsg` takes u32 flags where `Send` takes i32; the cast is what
-            // every other SendMsg call site here does.
-            .flags(crate::completion::STREAM_SEND_FLAGS as u32)
-            .build()
-            .user_data(user_data.raw());
+        let entry = Sqe::new(
+            Op::SendMsg {
+                fd: sqe::Fd::Raw(fd),
+                msg: msghdr,
+                flags: crate::completion::STREAM_SEND_FLAGS as u32,
+            },
+            user_data.raw(),
+        );
         unsafe { self.push_sqe(&entry) }
     }
 
@@ -681,10 +729,14 @@ impl Ring {
         msghdr: *const libc::msghdr,
         user_data: UserData,
     ) -> io::Result<()> {
-        let entry = opcode::SendMsg::new(Fixed(sink_index), msghdr)
-            .flags(crate::completion::STREAM_SEND_FLAGS as u32)
-            .build()
-            .user_data(user_data.raw());
+        let entry = Sqe::new(
+            Op::SendMsg {
+                fd: sqe::Fd::Fixed(sink_index),
+                msg: msghdr,
+                flags: crate::completion::STREAM_SEND_FLAGS as u32,
+            },
+            user_data.raw(),
+        );
         unsafe { self.push_sqe(&entry) }
     }
 
@@ -704,10 +756,15 @@ impl Ring {
         offset: u64,
         user_data: UserData,
     ) -> io::Result<()> {
-        let entry = opcode::Writev::new(Fd(fd), iovecs, count)
-            .offset(offset)
-            .build()
-            .user_data(user_data.raw());
+        let entry = Sqe::new(
+            Op::Writev {
+                fd: sqe::Fd::Raw(fd),
+                iovecs,
+                count,
+                offset,
+            },
+            user_data.raw(),
+        );
         unsafe { self.push_sqe(&entry) }
     }
 
@@ -726,10 +783,15 @@ impl Ring {
             conn_index,
             UserData::send_payload(pool_slot, generation),
         );
-        let entry = opcode::Send::new(Fixed(conn_index), ptr, len)
-            .flags(crate::completion::STREAM_SEND_FLAGS)
-            .build()
-            .user_data(user_data.raw());
+        let entry = Sqe::new(
+            Op::Send {
+                fd: sqe::Fd::Fixed(conn_index),
+                buf: ptr,
+                len,
+                flags: crate::completion::STREAM_SEND_FLAGS,
+            },
+            user_data.raw(),
+        );
         unsafe {
             self.push_sqe(&entry)?;
         }
@@ -739,9 +801,15 @@ impl Ring {
     /// Submit an eventfd read (8 bytes).
     pub fn submit_eventfd_read(&mut self, eventfd: RawFd, buf: *mut u8) -> io::Result<()> {
         let user_data = UserData::encode(OpTag::EventFdRead, 0, 0);
-        let entry = opcode::Read::new(Fd(eventfd), buf, 8)
-            .build()
-            .user_data(user_data.raw());
+        let entry = Sqe::new(
+            Op::Read {
+                fd: sqe::Fd::Raw(eventfd),
+                buf,
+                len: 8,
+                offset: 0,
+            },
+            user_data.raw(),
+        );
         unsafe {
             self.push_sqe(&entry)?;
         }
@@ -751,9 +819,12 @@ impl Ring {
     /// Submit a close for a direct file descriptor.
     pub fn submit_close(&mut self, conn_index: u32, lead: CloseLead) -> io::Result<()> {
         let user_data = UserData::encode(OpTag::Close, conn_index, 0);
-        let close = opcode::Close::new(Fixed(conn_index))
-            .build()
-            .user_data(user_data.raw());
+        let close = Sqe::new(
+            Op::Close {
+                fd: sqe::Fd::Fixed(conn_index),
+            },
+            user_data.raw(),
+        );
         // A socket removed from the fixed-file table stays open until the
         // requests holding it complete: before Linux 6.13, earlier requests
         // on any registered file or buffer; from 6.13, this connection's own
@@ -768,17 +839,22 @@ impl Ring {
                 }
                 return Ok(());
             }
-            CloseLead::Shutdown => opcode::Shutdown::new(Fixed(conn_index), libc::SHUT_RDWR)
-                .build()
-                .user_data(UserData::encode(OpTag::CloseShutdown, conn_index, 0).raw()),
-            CloseLead::CancelAll => {
-                opcode::AsyncCancel2::new(types::CancelBuilder::fd(Fixed(conn_index)).all())
-                    .build()
-                    .user_data(UserData::encode(OpTag::CloseCancel, conn_index, 0).raw())
-            }
+            CloseLead::Shutdown => Sqe::new(
+                Op::Shutdown {
+                    fd: sqe::Fd::Fixed(conn_index),
+                    how: libc::SHUT_RDWR,
+                },
+                UserData::encode(OpTag::CloseShutdown, conn_index, 0).raw(),
+            ),
+            CloseLead::CancelAll => Sqe::new(
+                Op::CancelFdAll {
+                    fd: sqe::Fd::Fixed(conn_index),
+                },
+                UserData::encode(OpTag::CloseCancel, conn_index, 0).raw(),
+            ),
         };
-        let first = first.flags(squeue::Flags::IO_HARDLINK);
-        unsafe { self.push_sqe_pair(first.into(), close.into()) }
+        let first = first.link(Link::Hard);
+        unsafe { self.push_sqe_pair(first.encode(), close.encode()) }
     }
 
     /// Submit an async connect for a direct file descriptor.
@@ -789,9 +865,14 @@ impl Ring {
         addrlen: libc::socklen_t,
     ) -> io::Result<()> {
         let user_data = UserData::encode(OpTag::Connect, conn_index, 0);
-        let entry = opcode::Connect::new(Fixed(conn_index), addr, addrlen)
-            .build()
-            .user_data(user_data.raw());
+        let entry = Sqe::new(
+            Op::Connect {
+                fd: sqe::Fd::Fixed(conn_index),
+                addr,
+                addrlen,
+            },
+            user_data.raw(),
+        );
         unsafe {
             self.push_sqe(&entry)?;
         }
@@ -804,9 +885,13 @@ impl Ring {
         timespec: *const io_uring::types::Timespec,
         user_data: UserData,
     ) -> io::Result<()> {
-        let entry = opcode::Timeout::new(timespec)
-            .build()
-            .user_data(user_data.raw());
+        let entry = Sqe::new(
+            Op::Timeout {
+                ts: timespec,
+                abs: false,
+            },
+            user_data.raw(),
+        );
         unsafe {
             self.push_sqe(&entry)?;
         }
@@ -821,10 +906,13 @@ impl Ring {
         timespec: *const io_uring::types::Timespec,
         user_data: UserData,
     ) -> io::Result<()> {
-        let entry = opcode::Timeout::new(timespec)
-            .flags(io_uring::types::TimeoutFlags::ABS)
-            .build()
-            .user_data(user_data.raw());
+        let entry = Sqe::new(
+            Op::Timeout {
+                ts: timespec,
+                abs: true,
+            },
+            user_data.raw(),
+        );
         unsafe {
             self.push_sqe(&entry)?;
         }
@@ -860,9 +948,12 @@ impl Ring {
         cancel_recv_user_data: u64,
     ) -> io::Result<()> {
         let cancel_ud = UserData::encode(OpTag::Cancel, conn_index, 0);
-        let cancel = opcode::AsyncCancel::new(cancel_recv_user_data)
-            .build()
-            .user_data(cancel_ud.raw());
+        let cancel = Sqe::new(
+            Op::Cancel {
+                target: cancel_recv_user_data,
+            },
+            cancel_ud.raw(),
+        );
         unsafe {
             self.push_sqe(&cancel)?;
         }
@@ -872,9 +963,12 @@ impl Ring {
     /// Recover a real fd for a connection whose recv is already cancelled.
     pub fn submit_park_install(&mut self, conn_index: u32, generation: u32) -> io::Result<()> {
         let ud = UserData::encode(OpTag::ParkInstall, conn_index, generation);
-        let entry = opcode::FixedFdInstall::new(Fixed(conn_index), 0)
-            .build()
-            .user_data(ud.raw());
+        let entry = Sqe::new(
+            Op::FixedFdInstall {
+                fd: sqe::Fd::Fixed(conn_index),
+            },
+            ud.raw(),
+        );
         unsafe {
             self.push_sqe(&entry)?;
         }
@@ -887,9 +981,12 @@ impl Ring {
         conn_index: u32,
     ) -> io::Result<()> {
         let ud = UserData::encode(OpTag::Cancel, conn_index, 0);
-        let entry = opcode::AsyncCancel::new(target_user_data)
-            .build()
-            .user_data(ud.raw());
+        let entry = Sqe::new(
+            Op::Cancel {
+                target: target_user_data,
+            },
+            ud.raw(),
+        );
         unsafe {
             self.push_sqe(&entry)?;
         }
@@ -902,9 +999,13 @@ impl Ring {
         // CQE that outlived its connection slot (domain invariant 3). It used
         // to be a bare 0, and the completion was `{}`.
         let user_data = UserData::encode(OpTag::Shutdown, conn_index, generation);
-        let entry = opcode::Shutdown::new(Fixed(conn_index), libc::SHUT_WR)
-            .build()
-            .user_data(user_data.raw());
+        let entry = Sqe::new(
+            Op::Shutdown {
+                fd: sqe::Fd::Fixed(conn_index),
+                how: libc::SHUT_WR,
+            },
+            user_data.raw(),
+        );
         unsafe {
             self.push_sqe(&entry)?;
         }
@@ -925,9 +1026,14 @@ impl Ring {
         bgid: u16,
         user_data: UserData,
     ) -> io::Result<()> {
-        let entry = opcode::RecvMsgMulti::new(Fixed(fd_index), msghdr, bgid)
-            .build()
-            .user_data(user_data.raw());
+        let entry = Sqe::new(
+            Op::RecvMsgMulti {
+                fd: sqe::Fd::Fixed(fd_index),
+                msg: msghdr,
+                buf_group: bgid,
+            },
+            user_data.raw(),
+        );
         unsafe {
             self.push_sqe(&entry)?;
         }
@@ -941,9 +1047,14 @@ impl Ring {
         msghdr: *const libc::msghdr,
         user_data: UserData,
     ) -> io::Result<()> {
-        let entry = opcode::SendMsg::new(Fixed(fd_index), msghdr)
-            .build()
-            .user_data(user_data.raw());
+        let entry = Sqe::new(
+            Op::SendMsg {
+                fd: sqe::Fd::Fixed(fd_index),
+                msg: msghdr,
+                flags: 0,
+            },
+            user_data.raw(),
+        );
         unsafe {
             self.push_sqe(&entry)?;
         }
@@ -960,9 +1071,13 @@ impl Ring {
         bgid: u16,
         user_data: UserData,
     ) -> io::Result<()> {
-        let entry = opcode::RecvMulti::new(Fixed(fd_index), bgid)
-            .build()
-            .user_data(user_data.raw());
+        let entry = Sqe::new(
+            Op::RecvMulti {
+                fd: sqe::Fd::Fixed(fd_index),
+                buf_group: bgid,
+            },
+            user_data.raw(),
+        );
         unsafe {
             self.push_sqe(&entry)?;
         }
@@ -979,9 +1094,15 @@ impl Ring {
         len: u32,
         user_data: UserData,
     ) -> io::Result<()> {
-        let entry = opcode::Send::new(Fixed(fd_index), ptr, len)
-            .build()
-            .user_data(user_data.raw());
+        let entry = Sqe::new(
+            Op::Send {
+                fd: sqe::Fd::Fixed(fd_index),
+                buf: ptr,
+                len,
+                flags: 0,
+            },
+            user_data.raw(),
+        );
         unsafe {
             self.push_sqe(&entry)?;
         }
@@ -990,7 +1111,13 @@ impl Ring {
 
     /// Submit a PollAdd for a raw file descriptor (e.g., pidfd for process exit).
     pub fn submit_poll_add(&mut self, fd: RawFd, mask: u32, ud: u64) -> io::Result<()> {
-        let entry = opcode::PollAdd::new(Fd(fd), mask).build().user_data(ud);
+        let entry = Sqe::new(
+            Op::PollAdd {
+                fd: sqe::Fd::Raw(fd),
+                mask,
+            },
+            ud,
+        );
         unsafe {
             self.push_sqe(&entry)?;
         }
@@ -1015,9 +1142,13 @@ impl Ring {
         // reject a CQE that outlived its connection slot.
         let payload = UserData::send_pollout_payload(pool_slot, is_tls, generation);
         let user_data = UserData::encode(OpTag::SendPollOut, conn_index, payload);
-        let entry = opcode::PollAdd::new(Fixed(conn_index), libc::POLLOUT as u32)
-            .build()
-            .user_data(user_data.raw());
+        let entry = Sqe::new(
+            Op::PollAdd {
+                fd: sqe::Fd::Fixed(conn_index),
+                mask: libc::POLLOUT as u32,
+            },
+            user_data.raw(),
+        );
         unsafe {
             self.push_sqe(&entry)?;
         }
@@ -1089,7 +1220,7 @@ impl Ring {
         ts: *const io_uring::types::Timespec,
         user_data: u64,
     ) -> io::Result<()> {
-        let entry = opcode::Timeout::new(ts).build().user_data(user_data);
+        let entry = Sqe::new(Op::Timeout { ts, abs: false }, user_data);
         unsafe {
             self.push_sqe(&entry)?;
         }
@@ -1175,7 +1306,7 @@ impl Ring {
             // nop_flags (union with rw_flags) is at byte offset 28
             std::ptr::write_unaligned(ptr.add(28) as *mut u32, 1); // IORING_NOP_INJECT_RESULT
         }
-        unsafe { self.push_sqe(&entry) }
+        unsafe { self.push_entry(&entry) }
     }
 
     /// Like `submit_nop_inject` but with IOSQE_IO_LINK set, so the
@@ -1195,38 +1326,43 @@ impl Ring {
             std::ptr::write_unaligned(ptr.add(24) as *mut u32, result as u32);
             std::ptr::write_unaligned(ptr.add(28) as *mut u32, 1); // IORING_NOP_INJECT_RESULT
         }
-        unsafe { self.push_sqe(&entry) }
+        unsafe { self.push_entry(&entry) }
     }
 
-    /// Push a 64-byte SQE to the submission queue.
+    /// Push an operation to the submission queue.
     ///
-    /// Takes the entry by reference so a caller that must keep the entry on
-    /// failure (a queued send parked for retry) can do so without a
-    /// speculative clone; the 64-byte copy into the ring's 128-byte entry
-    /// happens here either way.
+    /// Takes the operation by reference so a caller that must keep it on
+    /// failure (a queued send parked for retry) can do so without a clone.
     ///
     /// # Safety
-    /// The SQE must reference valid memory for the lifetime of the operation.
-    pub(crate) unsafe fn push_sqe(&mut self, entry: &squeue::Entry) -> io::Result<()> {
-        let entry128: squeue::Entry128 = entry.clone().into();
+    /// The operation must reference valid memory for its lifetime.
+    pub(crate) unsafe fn push_sqe(&mut self, sqe: &Sqe) -> io::Result<()> {
         unsafe {
-            self.push_sqe128(entry128)?;
+            self.push_sqe128(sqe.encode())?;
         }
         #[cfg(test)]
-        {
-            self.last_pushed = Some(entry.clone());
+        if !matches!(sqe.op, Op::UringCmd80 { .. }) {
+            self.last_pushed = Some(sqe.encode64());
         }
         Ok(())
     }
 
-    /// Push a 128-byte SQE to the submission queue.
-    ///
-    /// Used directly for NVMe passthrough (`UringCmd80`) which produces
-    /// `Entry128` natively.
+    /// Push a raw 64-byte entry: the test-only NOP injections, which set
+    /// fields `Sqe` does not describe.
+    #[cfg(test)]
+    unsafe fn push_entry(&mut self, entry: &squeue::Entry) -> io::Result<()> {
+        unsafe {
+            self.push_sqe128(entry.clone().into())?;
+        }
+        self.last_pushed = Some(entry.clone());
+        Ok(())
+    }
+
+    /// Push a 128-byte entry to the submission queue.
     ///
     /// # Safety
-    /// The SQE must reference valid memory for the lifetime of the operation.
-    pub(crate) unsafe fn push_sqe128(&mut self, entry: squeue::Entry128) -> io::Result<()> {
+    /// The entry must reference valid memory for the lifetime of the operation.
+    unsafe fn push_sqe128(&mut self, entry: squeue::Entry128) -> io::Result<()> {
         #[cfg(test)]
         if self.forced_push_failures > 0 {
             self.forced_push_failures -= 1;
@@ -1299,10 +1435,7 @@ impl Ring {
     ///
     /// # Safety
     /// All SQEs must reference valid memory for the lifetime of their operations.
-    pub(crate) unsafe fn push_sqe_chain(
-        &mut self,
-        entries: &mut [squeue::Entry],
-    ) -> io::Result<()> {
+    pub(crate) unsafe fn push_sqe_chain(&mut self, entries: &mut [Sqe]) -> io::Result<()> {
         if entries.is_empty() {
             return Ok(());
         }
@@ -1310,17 +1443,17 @@ impl Ring {
             return unsafe { self.push_sqe(&entries[0]) };
         }
 
-        // Set IO_LINK on all entries except the last.
+        // Link every entry to the next, except the last.
         let last = entries.len() - 1;
         for entry in entries[..last].iter_mut() {
-            *entry = entry.clone().flags(io_uring::squeue::Flags::IO_LINK);
+            entry.link = Link::Soft;
         }
 
         // Convert to Entry128 for the Big SQ ring, reusing the scratch to
         // avoid a per-chain heap allocation.
         let mut entries128 = std::mem::take(&mut self.chain_scratch);
         entries128.clear();
-        entries128.extend(entries.iter().map(|e| e.clone().into()));
+        entries128.extend(entries.iter().map(Sqe::encode));
 
         // Ensure enough room in the SQ for the entire chain.
         {
@@ -1366,12 +1499,16 @@ impl Ring {
         user_data: UserData,
     ) -> io::Result<()> {
         let cmd_bytes = cmd.to_bytes();
-        let entry = opcode::UringCmd80::new(Fixed(fd_index), NVME_URING_CMD_IO)
-            .cmd(cmd_bytes)
-            .build()
-            .user_data(user_data.raw());
+        let entry = Sqe::new(
+            Op::UringCmd80 {
+                fd: sqe::Fd::Fixed(fd_index),
+                cmd_op: NVME_URING_CMD_IO,
+                cmd: cmd_bytes,
+            },
+            user_data.raw(),
+        );
         unsafe {
-            self.push_sqe128(entry)?;
+            self.push_sqe(&entry)?;
         }
         Ok(())
     }
@@ -1393,10 +1530,15 @@ impl Ring {
         offset: u64,
         user_data: UserData,
     ) -> io::Result<()> {
-        let entry = opcode::Read::new(Fixed(fd_index), buf, len)
-            .offset(offset)
-            .build()
-            .user_data(user_data.raw());
+        let entry = Sqe::new(
+            Op::Read {
+                fd: sqe::Fd::Fixed(fd_index),
+                buf,
+                len,
+                offset,
+            },
+            user_data.raw(),
+        );
         unsafe {
             self.push_sqe(&entry)?;
         }
@@ -1420,10 +1562,15 @@ impl Ring {
         offset: u64,
         user_data: UserData,
     ) -> io::Result<()> {
-        let entry = opcode::Write::new(Fixed(fd_index), buf, len)
-            .offset(offset)
-            .build()
-            .user_data(user_data.raw());
+        let entry = Sqe::new(
+            Op::Write {
+                fd: sqe::Fd::Fixed(fd_index),
+                buf,
+                len,
+                offset,
+            },
+            user_data.raw(),
+        );
         unsafe {
             self.push_sqe(&entry)?;
         }
@@ -1434,9 +1581,12 @@ impl Ring {
     ///
     /// The `fd_index` must be a fixed file table index pointing to an opened file.
     pub fn submit_direct_fsync(&mut self, fd_index: u32, user_data: UserData) -> io::Result<()> {
-        let entry = opcode::Fsync::new(Fixed(fd_index))
-            .build()
-            .user_data(user_data.raw());
+        let entry = Sqe::new(
+            Op::Fsync {
+                fd: sqe::Fd::Fixed(fd_index),
+            },
+            user_data.raw(),
+        );
         unsafe {
             self.push_sqe(&entry)?;
         }
@@ -1459,14 +1609,19 @@ impl Ring {
         mode: u32,
         ud: u64,
     ) -> io::Result<()> {
-        let dest = DestinationSlot::try_from_slot_target(fd_index)
+        // `Sqe::encode` builds the destination slot again and relies on
+        // this check.
+        DestinationSlot::try_from_slot_target(fd_index)
             .map_err(|_| io::Error::other("invalid fd_index for openat"))?;
-        let entry = opcode::OpenAt::new(Fd(libc::AT_FDCWD), pathname)
-            .flags(flags)
-            .mode(mode)
-            .file_index(Some(dest))
-            .build()
-            .user_data(ud);
+        let entry = Sqe::new(
+            Op::OpenAt {
+                path: pathname,
+                flags,
+                mode,
+                file_index: fd_index,
+            },
+            ud,
+        );
         unsafe {
             self.push_sqe(&entry)?;
         }
@@ -1485,15 +1640,13 @@ impl Ring {
         ud: u64,
     ) -> io::Result<()> {
         // STATX_BASIC_STATS = 0x7ff
-        let entry = opcode::Statx::new(
-            Fd(libc::AT_FDCWD),
-            pathname,
-            statxbuf as *mut io_uring::types::statx,
-        )
-        .flags(libc::AT_STATX_SYNC_AS_STAT)
-        .mask(0x7ff)
-        .build()
-        .user_data(ud);
+        let entry = Sqe::new(
+            Op::Statx {
+                path: pathname,
+                buf: statxbuf,
+            },
+            ud,
+        );
         unsafe {
             self.push_sqe(&entry)?;
         }
@@ -1511,9 +1664,13 @@ impl Ring {
         newpath: *const libc::c_char,
         ud: u64,
     ) -> io::Result<()> {
-        let entry = opcode::RenameAt::new(Fd(libc::AT_FDCWD), oldpath, Fd(libc::AT_FDCWD), newpath)
-            .build()
-            .user_data(ud);
+        let entry = Sqe::new(
+            Op::RenameAt {
+                old: oldpath,
+                new: newpath,
+            },
+            ud,
+        );
         unsafe {
             self.push_sqe(&entry)?;
         }
@@ -1531,10 +1688,13 @@ impl Ring {
         flags: i32,
         ud: u64,
     ) -> io::Result<()> {
-        let entry = opcode::UnlinkAt::new(Fd(libc::AT_FDCWD), pathname)
-            .flags(flags)
-            .build()
-            .user_data(ud);
+        let entry = Sqe::new(
+            Op::UnlinkAt {
+                path: pathname,
+                flags,
+            },
+            ud,
+        );
         unsafe {
             self.push_sqe(&entry)?;
         }
@@ -1552,10 +1712,13 @@ impl Ring {
         mode: u32,
         ud: u64,
     ) -> io::Result<()> {
-        let entry = opcode::MkDirAt::new(Fd(libc::AT_FDCWD), pathname)
-            .mode(mode)
-            .build()
-            .user_data(ud);
+        let entry = Sqe::new(
+            Op::MkDirAt {
+                path: pathname,
+                mode,
+            },
+            ud,
+        );
         unsafe {
             self.push_sqe(&entry)?;
         }
