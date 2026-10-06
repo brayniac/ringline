@@ -3951,9 +3951,18 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 .user_data(new_ud.raw());
 
                 if unsafe { self.driver.ring.push_sqe(&entry) }.is_err() {
-                    // SQ full — replenish and give up.
-                    self.driver.pending_replenish.push(bid);
-                    self.driver.submit_next_queued(conn_index);
+                    // SQ full: park the remainder at the queue head and keep
+                    // the buffer; `drain_send_retries` pushes it, or gives up
+                    // and closes the connection (#613).
+                    self.driver.park_at_queue_head(
+                        conn_index,
+                        crate::handler::BuiltSend {
+                            entry,
+                            pool_slot: u16::MAX,
+                            slab_idx: u16::MAX,
+                            total_len: new_remaining,
+                        },
+                    );
                 }
                 return;
             }
@@ -15417,6 +15426,88 @@ mod tests {
         assert!(
             el.driver.pending_replenish.contains(&bid),
             "buffer not replenished after retry completed"
+        );
+    }
+
+    /// Set up a 100-byte `SendRecvBuf` in flight on a new connection and
+    /// complete it partially (60 bytes) while the SQ refuses the resubmit of
+    /// the remaining 40. Returns the connection and the bid.
+    fn partial_send_recv_buf_with_a_full_sq(el: &mut AsyncEventLoop<NoopHandler>) -> (u32, u16) {
+        let conn_index = accept_connection(el);
+        let bid: u16 = 3;
+        el.driver.send_recv_buf_original_lens[conn_index as usize] = 100;
+        el.driver.send_recv_buf_remaining[conn_index as usize] = 100;
+        el.driver.send_queues[conn_index as usize].in_flight = true;
+        el.driver.ring.force_push_failures(1);
+        let ud = UserData::encode(OpTag::SendRecvBuf, conn_index, bid as u32);
+        el.test_dispatch_cqe(ud.raw(), 60, 0);
+        (conn_index, bid)
+    }
+
+    /// A partial `SendRecvBuf` whose remainder cannot be pushed (SQ full)
+    /// parks the remainder at the head of the queue and keeps the buffer, as
+    /// any send does under SQ pressure; dropping it left a hole in the stream
+    /// (#613). The retry submits the remainder.
+    #[test]
+    fn a_send_recv_buf_remainder_is_parked_when_the_sq_is_full() {
+        let mut el = make_test_loop();
+        let (conn_index, bid) = partial_send_recv_buf_with_a_full_sq(&mut el);
+        let ci = conn_index as usize;
+        assert!(
+            !el.driver.pending_replenish.contains(&bid),
+            "the remainder's buffer went back to the ring unsent"
+        );
+        assert!(
+            el.driver.send_queues[ci].parked,
+            "the remainder was not parked"
+        );
+        assert!(el.driver.send_queues[ci].in_flight);
+        assert_eq!(el.driver.send_recv_buf_remaining[ci], 40);
+
+        el.drain_send_retries();
+        assert!(
+            !el.driver.send_queues[ci].parked,
+            "the retry did not submit"
+        );
+        let ud = UserData(
+            el.driver
+                .ring
+                .last_pushed
+                .as_ref()
+                .expect("an SQE was pushed")
+                .get_user_data(),
+        );
+        assert_eq!(ud.tag(), Some(OpTag::SendRecvBuf));
+        assert_eq!(ud.payload() as u16, bid);
+
+        el.test_dispatch_cqe(ud.raw(), 40, 0);
+        assert!(
+            el.driver.pending_replenish.contains(&bid),
+            "the buffer was not returned after the remainder was sent"
+        );
+    }
+
+    /// A remainder the SQ keeps refusing is given up on as any parked send
+    /// is: its buffer goes back to the ring and the connection closes, so the
+    /// stream does not continue with a hole.
+    #[test]
+    fn a_send_recv_buf_remainder_the_sq_keeps_refusing_closes_the_connection() {
+        let mut el = make_test_loop();
+        let (conn_index, bid) = partial_send_recv_buf_with_a_full_sq(&mut el);
+        for _ in 0..3 {
+            el.driver.ring.force_push_failures(1);
+            el.drain_send_retries();
+        }
+        assert!(
+            el.driver.pending_replenish.contains(&bid),
+            "the buffer was not returned"
+        );
+        assert!(
+            el.driver
+                .connections
+                .get(conn_index)
+                .is_some_and(|c| c.close_requested()),
+            "the connection was left open with a hole in its stream"
         );
     }
 

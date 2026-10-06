@@ -2777,6 +2777,20 @@ impl Driver {
         }
     }
 
+    /// Park `built` at the head of the connection's send queue, ahead of
+    /// anything already queued, for `drain_send_retries` to push. For the
+    /// remainder of a partial send whose resubmit found the SQ full: the
+    /// remainder is the next bytes of the stream, so it goes first, and the
+    /// queue keeps owning the send order (`in_flight`) until it is pushed.
+    pub(crate) fn park_at_queue_head(&mut self, conn_index: u32, built: crate::handler::BuiltSend) {
+        let state = &mut self.send_queues[conn_index as usize];
+        state.queue.push_front(built);
+        state.in_flight = true;
+        state.parked = true;
+        let generation = self.connections.generation(conn_index);
+        self.pending_send_retries.push((conn_index, generation, 0));
+    }
+
     /// Queue a batch of built sends in order through the per-connection
     /// send queue. Infallible: `submit_or_queue_send` parks under SQ
     /// pressure rather than failing, so every entry is committed in order
