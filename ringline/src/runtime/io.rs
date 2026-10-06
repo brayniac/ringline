@@ -2106,10 +2106,13 @@ impl ConnCtx {
     /// submit the echo SQE directly from the CQE handler — bypassing the
     /// `collect_wakeups` → `poll_ready_tasks` roundtrip entirely.
     ///
-    /// The returned future parks until the connection is closed, then resolves.
-    /// Any data buffered before the flag was set is drained on the first poll.
+    /// The returned future resolves once the peer has closed its write side
+    /// (or the read failed) and every byte received before that has been
+    /// submitted for echo. The connection then closes, after the last send
+    /// completes. Any data buffered before the flag was set is drained on the
+    /// first poll.
     ///
-    /// On the mio backend this degrades gracefully to the normal `with_data` /
+    /// Available only on io_uring; on mio, use a `with_data` /
     /// `forward_recv_buf` loop.
     #[cfg(has_io_uring)]
     pub fn run_direct_echo(&self) -> DirectEchoFuture {
@@ -5652,7 +5655,9 @@ impl Drop for SendFuture {
 /// subsequent recv CQEs are echoed directly from `handle_recv_multi` without
 /// waking this task — eliminating the `collect_wakeups` → `poll_ready_tasks`
 /// roundtrip on the hot path. Any data buffered before the flag was set is
-/// drained on the first poll. The future parks until the connection is closed.
+/// drained on the first poll. The future resolves once the peer has closed
+/// its write side (or the read failed) and every byte received before that
+/// has been submitted for echo.
 ///
 /// Created by [`ConnCtx::run_direct_echo`].
 #[cfg(has_io_uring)]
@@ -5694,18 +5699,18 @@ impl Future for DirectEchoFuture {
             // before it has been submitted for echo; until the hold drains,
             // ending the task would close the connection and drop them
             // (#604).
-            let is_closed = driver
+            let done = driver
                 .connections
                 .get(self.conn_index)
                 .map(|c| c.recv_finished())
                 .unwrap_or(true)
                 && driver.recv_hold[self.conn_index as usize].is_empty();
 
-            if is_closed {
+            if done {
                 return Poll::Ready(());
             }
 
-            // Park until close. handle_recv_multi calls wake_recv on EOF or
+            // Park until done. handle_recv_multi calls wake_recv on EOF or
             // error, and flush_direct_echoes calls it when the hold of a
             // connection whose read side has finished drains.
             executor.owner_task[self.conn_index as usize] = Some(CURRENT_TASK_ID.with(|c| c.get()));
