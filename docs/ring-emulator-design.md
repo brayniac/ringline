@@ -5,12 +5,16 @@ Status: proposal. Nothing here is implemented.
 ## Goal
 
 Ringline has two drivers. The io_uring driver (`backend/uring/`) submits
-SQEs and handles CQEs. The mio driver (`backend/mio/`) is a second,
-readiness-based implementation of the same runtime: its own send queue,
-recv path, close ordering, timers and teardown. Every behaviour exists
-twice, and the two copies drift. Recent examples: #617 needed fixing on
-both; a TLS `send().await` reported different lengths on each; mio's
-`forward_held` moved a different amount per call (#620).
+SQEs and handles CQEs. The mio driver is a second, readiness-based
+implementation of the same runtime: `backend/mio/`, the mio `DriverCtx`
+(about 1,200 lines of `handler.rs`) and `tls/backend_mio.rs`. It has its
+own send queue, recv path, close ordering, timers and teardown. Every
+behaviour exists twice, and the two copies drift. Recent examples:
+
+- #617 (fixed in #619) needed fixing on both drivers.
+- A TLS `send().await` reported the last record's ciphertext length on
+  io_uring and every record's on mio (fixed in #619).
+- mio's `forward_held` moved a different amount per call (#620).
 
 This design keeps one driver, the io_uring one, and puts an engine under
 it:
@@ -21,23 +25,25 @@ it:
   nonblocking syscalls, mio readiness and the existing disk-I/O thread
   pool, and posts the completions the kernel would have posted.
 
-The driver cannot tell the two apart. On a platform without io_uring
-(macOS, a Linux with `io_uring_disabled`, a seccomp profile that denies
-`io_uring_setup`), ringline runs the io_uring driver on the emulator.
+The driver sees the same completions from either engine. It asks the
+engine two capability questions (which close lead to use, and whether
+fds can be parked), as it asks the ring today. On macOS, and on a Linux
+build with `force-mio`, ringline runs the io_uring driver on the
+emulator.
 
-What this buys:
+What this gives:
 
 - One implementation of every send, recv, close and teardown rule.
 - The io_uring driver builds and runs its tests on macOS. Today it cannot
-  even be type-checked there.
+  be type-checked there.
 - The io_uring-only API (`send_chain`, segmented recv, `forward_to`,
   direct echo) becomes available everywhere.
 - The gaps the mio backend has today close: `ConnCtx::cancel`,
-  `connect_unix`, `ChildProcess::wait`, NVMe and merged accept are all
+  `connect_unix`, `ChildProcess::wait`, NVMe and merged accept are
   unsupported or ignored on mio, and all exist in the io_uring driver.
 - A test engine: the emulator can inject short sends, `ENOBUFS`,
-  `EAGAIN`, reordered completions and late notifications on demand,
-  which the kernel produces only under load.
+  `EAGAIN`, reordered completions and late notifications on demand.
+  These are hard to provoke against a real kernel.
 
 ## Parity
 
@@ -50,14 +56,15 @@ op-by-op table names the equivalent.
 
 Where the equivalent cannot carry everything the kernel op does, the
 difference is listed in that row. These are differences in what the
-platform can observe, not missing operations; for example, a macOS
+platform can observe, not missing operations. For example, a macOS
 "NVMe" device backed by a file reports errors as errno rather than NVMe
 status codes.
 
 Non-goals:
 
 - Matching io_uring's performance on the emulator. The emulated path has
-  to be correct and not pathological, as the mio backend does today.
+  to be correct and not pathological, the bar CLAUDE.md sets for the mio
+  backend today.
 - Emulating ops the driver does not use (splice, `LINK_TIMEOUT`, futex,
   `READ_FIXED`, ...).
 
@@ -70,25 +77,33 @@ Every operation already reads from or writes into memory ringline owns:
 | Send-pool slots | `SendCopyPool` | copy sends, TLS records |
 | Slab entries (iovecs, guards) | `InFlightSendSlab` | coalesced, zero-copy and recv-forward sends |
 | Provided recv buffers | `ProvidedBufRing` | multishot recv, UDP recv, recv forward |
-| Fallback recv slots | fallback pool | one-shot recv |
+| Fallback recv slots | `fallback_recv_pool` (a `SendCopyPool`) | one-shot recv |
 | Disk buffers | caller, held by the disk-I/O future | fs, direct I/O |
 
-The engines share these pools. An operation borrows its buffer from the
-pool before it is submitted and returns it when its completion is handled,
-on either engine. The only difference is who fills or drains the memory:
+The engines share these pools, and each buffer's lifetime is the same on
+both engines:
+
+- A send borrows its slot or slab entry before it is submitted, and the
+  completion handler releases it. A zero-copy entry is released after its
+  notification.
+- A provided recv buffer is chosen when the recv completes, and goes back
+  to the ring when the task has consumed it.
+
+The only difference is who fills or drains the memory:
 
 - **`UringEngine`**: the kernel. A send hands the slot's address to
   `IORING_OP_SEND`; a recv lets the kernel pick a provided buffer.
 - **`EmulatedEngine`**: the engine itself. A send `write`s or `writev`s
-  from the borrowed memory and posts a CQE when it is done; a recv pops a
-  buffer id from the emulated provided ring, `read`s into that buffer and
-  posts a CQE that names the id.
+  from the borrowed memory and posts a CQE when it is done; a recv takes
+  a buffer id from the provided ring, `read`s into that buffer and posts
+  a CQE that names the id.
 
-The provided buffer ring is ringline memory on both engines. On io_uring
-`ProvidedBufRing` writes entries into an mmapped ring and publishes the
-tail; the kernel consumes from the head. The emulator keeps the same
-entries in a userspace queue and consumes them the same way, so
-`replenish`, `free()` and the `ENOBUFS` accounting are unchanged.
+The provided buffer ring is ringline memory on both engines.
+`ProvidedBufRing` writes entries into a ring and publishes the tail. On
+io_uring the ring is mmapped and the kernel consumes from the head. The
+emulator reads entries from the same ring between its own head and the
+published tail, so `replenish`, `free()` and the `ENOBUFS` accounting are
+unchanged.
 
 ## The submission type
 
@@ -115,21 +130,30 @@ pub(crate) enum Fd { Fixed(u32), Raw(RawFd) }
 ```
 
 `UringEngine` encodes an `Sqe` into an `squeue::Entry` (or `Entry128`
-for NVMe) at push time. `EmulatedEngine` executes it.
+for NVMe) at push time. `EmulatedEngine` executes it. `Sqe.link`
+replaces both conventions in use today: `push_sqe_chain` sets `IO_LINK`
+itself on every entry but the last, and `submit_close` sets
+`IO_HARDLINK` on the lead before `push_sqe_pair`.
 
 The refactor is bounded by where the driver touches io_uring types today:
 
 | Site | Count |
 |---|---|
-| `Ring::submit_*` builders in `ring.rs` | 41 |
-| `Send` / `SendMsgZc` builders outside `ring.rs` (`handler.rs`, `tls/mod.rs`, `driver.rs`, `runtime/io.rs`, `event_loop.rs`) | 15 |
+| `Ring::submit_*` builders in `ring.rs` | 41, two of them test-only |
+| `Send` / `SendMsgZc` builders outside `ring.rs` | 15: `handler.rs` ×11, `tls/mod.rs`, `driver.rs`, `runtime/io.rs`, `event_loop.rs` |
 | Push choke points (`push_sqe`, `push_sqe128`, `push_sqe_pair`, `push_sqe_chain`) | 4 |
 | Stored entries (`BuiltSend.entry`) | 1 field |
 | Reads of a stored entry's user_data | 3 sites |
-| Other io_uring types in the driver: `Timespec`, `RecvMsgOut::parse`, `cqueue::{more, notif, buffer_select}` | small; replaced by ringline types and flag constants |
+| CQ readers (`ring.completion()`) | 2: `drain_completions` and `run_shutdown` |
+| `io_uring::types::Timespec` | 5 files |
+| `RecvMsgOut::parse` | 2 sites |
+| `cqueue::{more, notif, buffer_select}` | about 20 sites |
+| `DestinationSlot` (OPENAT direct install) | 1 site |
+| Test-only: `last_pushed` / `last_pushed_opcode`, and `io_uring::` uses in tests | 1 field, 16 uses |
 
-The ~100 calls to `Ring::submit_*` across the driver keep their
-signatures; only the bodies of the 41 builders change.
+About 100 calls to `Ring::submit_*` keep their signatures. The three
+timespec-taking builders and `submit_statx` (which takes a
+`*mut libc::statx`) change to ringline types.
 
 Completions need no new type. The event loop already copies each CQE into
 `cqe_batch: Vec<(u64, i32, u32)>` and dispatches the tuple
@@ -137,88 +161,159 @@ Completions need no new type. The event loop already copies each CQE into
 
 ## The engine interface
 
+The loop uses the ring in three different ways today, and each maps onto
+one engine call:
+
+| Today (`event_loop.rs`) | Engine call | Meaning |
+|---|---|---|
+| `submit_and_wait(1)` when nothing is runnable | `wait(None)` | Start queued work; block until a completion is ready. |
+| `submit_and_get_events()` when a task is runnable | `wait(Some(ZERO))` | Start queued work and collect what is ready, without blocking. The emulator polls readiness with a zero timeout here; otherwise it reproduces the worker starvation the comment above that call describes. |
+| `flush()` after the poll pass, and mid-batch | `submit()` | Start queued work, run what is already ready, and make those completions visible to the next `reap`. |
+
+The loop arms its own wake-up deadline as a TickTimeout SQE, and
+`run_shutdown` arms its own, so `wait` needs no timeout of its own.
+
 ```rust
 pub(crate) trait Engine {
-    /// Queue one submission. Err when the queue is full (the driver's
-    /// existing retry lists handle that, as for a full SQ).
-    fn push(&mut self, sqe: Sqe) -> io::Result<()>;
-    /// Queue a linked chain atomically.
+    fn push(&mut self, sqe: Sqe) -> io::Result<()>; // Err: queue full
     fn push_chain(&mut self, sqes: &[Sqe]) -> io::Result<()>;
-    /// Start queued work without waiting.
     fn submit(&mut self) -> io::Result<()>;
-    /// Start queued work and wait until at least one completion is ready
-    /// or `timeout` passes.
-    fn submit_and_wait(&mut self, timeout: Option<Duration>) -> io::Result<()>;
-    /// Move ready completions into `out`.
+    fn wait(&mut self, timeout: Option<Duration>) -> io::Result<()>;
     fn reap(&mut self, out: &mut Vec<(u64, i32, u32)>);
+
+    // Registration.
+    fn register_files_sparse(&mut self, n: u32) -> io::Result<()>;
+    fn register_files_update(&mut self, slot: u32, fds: &[RawFd]) -> io::Result<()>;
+    fn register_buf_ring(&mut self, ring: &ProvidedBufRing, bgid: u16) -> io::Result<()>;
+    fn unregister_buf_ring(&mut self, bgid: u16) -> io::Result<()>;
+    fn register_buffers(&mut self, regions: &[libc::iovec]) -> io::Result<()>;
+    fn register_buffers_update_one(&mut self, idx: u32, region: libc::iovec) -> io::Result<()>;
+
+    // Capabilities.
+    fn close_lead(&self) -> CloseLead;
+    fn supports_park(&self) -> bool;
+
+    // Test hooks.
+    #[cfg(test)]
+    fn inject(&mut self, user_data: u64, result: i32, flags: u32);
+    #[cfg(test)]
+    fn force_push_failures(&mut self, n: u32);
 }
 ```
 
-`Ring` becomes `UringEngine`. The emulator implements the same calls.
+`Ring` becomes `UringEngine`, and both CQ readers go through `reap`.
 
-The interface is chosen at compile time (`has_io_uring` selects
-`UringEngine`). A runtime choice is not part of this design: it would
-fight the `CURRENT_DRIVER` raw-pointer design as backend selection does
-today. A later change could pick the engine at launch on Linux, so a
-kernel that refuses `io_uring_setup` falls back instead of failing with
-`Error::RingSetup`; that needs only the engine, not the driver, to be
-generic.
+The engine is chosen at compile time: `has_io_uring` selects
+`UringEngine`, and anything else `EmulatedEngine`. A choice at launch is
+open question 2.
 
 ## Completion timing
 
 The driver depends on when completions appear, not just on what they say.
-The emulator follows the rules the driver relies on with `DEFER_TASKRUN`:
+The emulator follows these rules, which the driver relies on with
+`DEFER_TASKRUN` and does not break under SQPOLL:
 
 1. **A completion is never posted inside `push`.** Work starts in
-   `submit` or `submit_and_wait`, and completions become visible only
-   through `reap`. Handlers never run re-entrantly inside a submission.
-2. **Independent submissions are not ordered.** The driver must not
+   `submit` or `wait`, and completions become visible only through
+   `reap`. Handlers never run re-entrantly inside a submission.
+2. **Every readiness-driven op tries its syscall once when it is
+   submitted or re-armed, and waits for a readiness edge only after
+   `EAGAIN`.** mio's readiness is edge-triggered. A multishot recv that
+   stopped on `ENOBUFS` leaves data in the socket, and no new edge
+   arrives for it; the re-arm after a replenish must read at once. The
+   same holds for a `POLLOUT` armed after the socket became writable, and
+   for an `EventFdRead` re-armed after the wake fd was written. The
+   kernel behaves this way: it tries an op at issue and arms a poll only
+   on `EAGAIN`.
+3. **Independent submissions are not ordered.** The driver must not
    depend on completion order between unrelated SQEs (Domain Invariant
    2), and the emulator does not promise one. Its default order is
-   submission order; a test mode shuffles independent completions to
-   catch code that relies on it.
-3. **A linked chain runs in order**, and a failed or short link fails the
-   rest with `-ECANCELED`.
+   submission order; a test mode shuffles completions to catch code that
+   relies on it. The shuffle keeps three orders the kernel guarantees:
+   one multishot's CQEs, a zero-copy send's operation CQE before its
+   notification, and a linked chain.
+4. **Links.** Under `IO_LINK`, an error, or a short result on an op with
+   `MSG_WAITALL`, cancels the rest of the chain with `-ECANCELED`. Under
+   `IO_HARDLINK` the next op runs whatever the previous result. The close
+   lead is hard-linked so that the Close runs even when the lead fails.
+5. **Disk-pool results are collected on every `wait` and `submit`.** The
+   pool runs on other threads and reports on a channel; the engine drains
+   that channel each time, whether or not the wake fd fired, as the mio
+   loop does on macOS today to avoid lost kqueue wake-ups. Results that
+   change the fixed-file table (OPENAT direct install) are applied on the
+   worker thread when they are reaped.
+
+## The fixed-file table
+
+The driver installs an fd into a fixed slot with `register_files_update`
+and then closes its own copy at once, because the kernel holds its own
+reference to the file. The emulator does the same: on register it takes
+a `F_DUPFD_CLOEXEC` copy of the fd and owns it. An update to `-1` (how
+fs, direct-I/O and NVMe handles are closed) drops the emulator's copy
+once no pending operation names that slot.
+
+Each op resolves its fixed slot to the emulator's fd when it is pushed,
+and keeps that fd until it completes. This is what keeps the driver's
+close ordering correct:
+
+- The `shutdown_inflight` gate holds a Close until the Shutdown on that
+  slot completes; the Shutdown already holds its fd.
+- The driver cancels a connection's multishot recv before its Close; the
+  cancel finds the recv by user_data and completes it with
+  `-ECANCELED`.
+- A Close cancels the slot's pending ops (posting `-ECANCELED`) before it
+  calls `close(2)`. The kernel's Close does not cancel; the emulator must,
+  because once it closes the fd, the number can be reused by the next
+  accept.
+
+The engine reports the 6.13 close behaviour (`close_lead()` returns the
+cancel lead), because its Close does not wait on other connections'
+requests. Today `close_lead_for` reads `KernelVersion::current()`
+directly, which exists only on io_uring; it moves behind the engine.
+
+The emulator holds one real fd per connection, as the mio backend does.
+`ensure_nofile_limit` and the `RLIMIT_MEMLOCK` checks follow the engine,
+not the driver: the emulator needs the mio fd budget and charges nothing
+to `RLIMIT_MEMLOCK`.
+
+Fixed buffer registration is a no-op on the emulator: no SQE the driver
+builds references `buf_index`.
 
 ## Op-by-op
 
 Difficulty: **A** maps directly onto a syscall, **B** needs state in the
 emulator, **C** reproduces a kernel rule the driver depends on. **P**
 marks a row that needs a platform equivalent off Linux; the equivalent is
-named in the row.
+named in the row. Rows marked *(verify)* rely on kernel behaviour the
+conformance tests confirm against the real ring first.
 
 | OpTag(s) | Opcode | Emulation | |
 |---|---|---|---|
-| RecvMulti | RECV multishot, buffer select | On readable: pop a buffer id, `read` into it, post `(res, F_BUFFER\|bid<<16\|F_MORE)`; repeat until `EAGAIN`. No buffer: post `-ENOBUFS` without `F_MORE` (the arm ends; the driver re-arms on replenish, Domain Invariant 6). EOF: post `0` without `F_MORE`. | C |
+| RecvMulti | RECV multishot, buffer select | Try at arm, then on each readable edge: take a buffer id, `read` into it, post `(res, F_BUFFER\|bid<<16\|F_MORE)`, and repeat until `EAGAIN` or a per-pass cap *(verify the kernel's cap)*, so one fast sender cannot empty the shared ring. A read that returns `0`, `EAGAIN` or an error puts the id back at the ring head, and its CQE carries no `F_BUFFER`. No buffer: post `-ENOBUFS` without `F_MORE` (the arm ends; the driver re-arms on replenish, Domain Invariant 6). EOF: post `0` without `F_MORE`. Other errors: `-errno` without `F_MORE`. | C |
 | RecvMsgMultiTs, RecvMsgUdp | RECVMSG multishot | As RecvMulti, and write the `io_uring_recvmsg_out` header, name and control data into the buffer in the kernel's layout so `RecvMsgOut::parse` (or its replacement) reads it. On Linux the control data is what `recvmsg` returns (`SCM_TIMESTAMPING`, `UDP_GRO`). Off Linux: timestamps come from `SO_TIMESTAMP` and are written as a software `SCM_TIMESTAMPING` entry (there are no hardware timestamps); there is no GRO, so each completion carries one datagram and no segment-size control message, which the driver already reads as a single datagram. | C, P |
 | RecvUdp | RECV multishot | As RecvMulti on a UDP socket. | B |
-| RecvFallback | RECV one-shot into a pool slot | `read` when readable, one CQE. | A |
-| Send, TlsSend, SendRecvBuf, *Drain | SEND, `MSG_WAITALL` | `write` until all bytes are sent, waiting for writable in between; one CQE with the total, or the error. `MSG_WAITALL` means the kernel never reports a short count while the socket is open, so neither does the emulator. | B |
-| SendMsgCoalesced, SendRecvBufsCoalesced, ForwardWrite | SENDMSG / WRITEV | `writev` the iovecs with the same waiting rule. The emulator need not reproduce `-EAGAIN` after a peer's half-close (#603); the driver's drain path stays correct either way. | B |
-| SendMsgZc | SENDMSG_ZC | `writev` (a copy, as mio does today), then post the operation CQE with `F_MORE` and a separate `F_NOTIF` CQE in the same reap. The driver's notification accounting (#487) runs unchanged. | C |
-| SendPollOut | POLL_ADD POLLOUT | Post when writable. | A |
+| RecvFallback | RECV one-shot into a pool slot | Try at submit, then on readable; one CQE. | A |
+| Send, TlsSend, SendRecvBuf, *Drain | SEND, `MSG_WAITALL` | `write` until all bytes are sent, waiting for writable in between. Post the total, or, on an error, the bytes written before it if any *(verify)*, otherwise `-errno`. | B |
+| SendMsgCoalesced, SendRecvBufsCoalesced | SENDMSG, `MSG_WAITALL` | `writev` the iovecs with the same rule. The emulator need not reproduce `-EAGAIN` after a peer's half-close (#603); the driver's drain path is correct either way. | B |
+| ForwardWrite | SENDMSG to a socket; WRITEV to a regular file | Socket sink: as SendMsgCoalesced. File sink: readiness does not apply to regular files, so the `pwritev` runs on the disk-I/O pool. | B |
+| SendMsgZc | SENDMSG_ZC (no `MSG_WAITALL`) | One `writev` attempt per readable-to-writable cycle, posting a short count when that is all the socket took, as the kernel can *(verify)*. Then post the operation CQE with `F_MORE` and a separate `F_NOTIF` CQE in the same reap. A notification follows exactly when `F_MORE` is set, including on error and zero-length results (#487). The data is copied, as on mio today. | C |
+| SendPollOut | POLL_ADD POLLOUT | Check writability at submit; otherwise post on the writable edge. | A |
 | Connect | CONNECT | Nonblocking `connect`, then `SO_ERROR` on writable, as the mio backend does today. | A |
-| Shutdown, CloseShutdown | SHUTDOWN | `shutdown(2)`. | A |
-| Close | CLOSE (fixed) | Remove the fd from the emulated fixed-file table and close it. Requests still pending on that fd are cancelled first, as Linux 6.13+ does for the connection's own requests (Domain Invariant 8). The emulator reports itself as the 6.13 behaviour, so `close_lead_for` picks the cancel lead. | C |
-| CloseCancel, Cancel | ASYNC_CANCEL (by user_data; by fixed fd, all) | Exact 64-bit user_data match, or every pending request on the fixed fd. The cancelled request posts `-ECANCELED`; the cancel posts `0` or `-ENOENT`. | B |
-| Timeout, TickTimeout, Timer | TIMEOUT (relative, `ABS`) | A min-heap of deadlines, as `TimerSlotPool` has for mio today. Fires post `-ETIME`; a cancel posts `-ECANCELED`. `submit_and_wait` waits until the earliest deadline. | B |
-| EventFdRead | READ on the eventfd | The worker's wake fd (a pipe on macOS): post when readable. | A |
-| AcceptMulti | ACCEPT multishot | On readable, `accept` until `EAGAIN`, one CQE per fd with `F_MORE`. | B |
-| ParkInstall | FIXED_FD_INSTALL | `dup` the fixed slot's fd and post it. | A |
+| Shutdown, CloseShutdown | SHUTDOWN | `shutdown(2)` on the op's fd. | A |
+| Close | CLOSE (fixed) | See the fixed-file table: cancel the slot's pending ops, then drop the emulator's fd. | C |
+| CloseCancel, Cancel | ASYNC_CANCEL (by user_data; by fixed fd, all) | Exact 64-bit user_data match, or every pending request on the fixed slot. The cancelled request posts `-ECANCELED`; the cancel posts `0` or `-ENOENT`. | B |
+| Timeout, TickTimeout, Timer | TIMEOUT (relative, `ABS`) | A min-heap of deadlines, computed from the timespec at push (the caller's timespec need not outlive the push, as with the kernel). Fires post `-ETIME`; a cancel posts `-ECANCELED`. `wait` blocks no later than the earliest deadline. | B |
+| EventFdRead | READ on the eventfd | The worker's wake fd (a pipe on macOS). Try at arm, then on readable. | A |
+| AcceptMulti | ACCEPT multishot | Try at arm, then on readable: `accept` (with `SOCK_NONBLOCK\|SOCK_CLOEXEC`, or `fcntl` after `accept` where `accept4` is missing) until `EAGAIN`, one CQE per fd with `F_MORE`. | B, P |
+| ParkInstall | FIXED_FD_INSTALL | `fcntl(F_DUPFD_CLOEXEC)` on the slot's fd; post the new fd. The kernel installs it close-on-exec, which #460 relies on. | A |
 | PidfdPoll | POLL_ADD on a pidfd | On Linux, poll the pidfd for readable. Off Linux there are no pidfds: the engine registers `EVFILT_PROC` / `NOTE_EXIT` for the pid on its kqueue and posts the completion when the child exits. `ChildProcess::wait` then works as on Linux. | A, P |
 | SendMsgUdp, SendUdp | SENDMSG (with `UDP_SEGMENT`), SEND | `sendmsg`, with `UDP_SEGMENT` on Linux. Off Linux there is no GSO: the engine sends one datagram per segment and posts one completion with the total. | B, P |
-| Fs, DirectIo | OPENAT (direct install), READ, WRITE, FSYNC, STATX, RENAMEAT, UNLINKAT, MKDIRAT | The existing disk-I/O thread pool (`disk_io_pool.rs`) runs the call and posts the CQE through the engine. OPENAT installs into the emulated fixed-file table. Off Linux: STATX is filled from `fstatat` (fields `stat` lacks are left zero and unmarked in the mask), and direct I/O uses `F_NOCACHE` where Linux uses `O_DIRECT`. | B, P |
+| Fs, DirectIo | OPENAT (direct install), READ, WRITE, FSYNC, STATX, RENAMEAT, UNLINKAT, MKDIRAT | The disk-I/O thread pool (`disk_io_pool.rs`) runs the call. OPENAT installs into the emulated fixed-file table when reaped. Off Linux: STATX is filled from `fstatat` (fields `stat` lacks are left zero and unmarked in the mask), and direct I/O uses `F_NOCACHE` where Linux uses `O_DIRECT`. | B, P |
 | NvmeCmd | URING_CMD (SQE128) | The API is `open_nvme_device` plus three commands: read, write, flush. On Linux the disk-I/O pool runs the same command with the synchronous `NVME_IOCTL_IO64_CMD` ioctl on the same `/dev/ngXnY` device and posts its NVMe status word as the result, so `handle_nvme_cmd` is unchanged. Off Linux there is no NVMe passthrough for user processes: the "device" is a raw disk (`/dev/rdiskN`, root only) or a file, read becomes `pread` and write `pwrite` at LBA × block size, and flush becomes `fcntl(F_FULLFSYNC)`. Errors there are errno, not NVMe status codes, and `nsid` is ignored. | B, P |
 
-The fixed-file table is emulated as a slot → fd array. The driver's
-`register_files_update` calls go to the engine; on io_uring they register
-with the kernel, on the emulator they write the array. Fixed buffer
-registration is a no-op on the emulator: no SQE the driver builds
-references `buf_index`.
-
-The emulator implements the ring setup flags' effects only where the
-driver can observe them. `COOP_TASKRUN`, `SINGLE_ISSUER` and the io-wq
-worker cap have no counterpart.
+The ring setup flags have no counterpart in the emulator: `COOP_TASKRUN`,
+`SINGLE_ISSUER`, `DEFER_TASKRUN`, SQPOLL and the io-wq worker cap. The
+completion-timing rules above are what the driver observes of them.
 
 ## Tests
 
@@ -228,42 +323,51 @@ Three layers:
    the `Engine` interface against real sockets and files and checks the
    CQEs: result, flags and buffer ids. On Linux the same tests run
    against `UringEngine` and `EmulatedEngine`, so the emulator is checked
-   against the kernel rather than against a description of it. On macOS
-   they run against `EmulatedEngine` with the platform equivalents, and
-   assert the differences each **P** row lists, so a difference cannot
-   grow unnoticed.
-2. **The driver's unit tests.** The ~700 io_uring lib tests run on both
-   engines. Tests that inject results through the real ring
-   (`IORING_NOP_INJECT_RESULT`) need an engine-level injection hook; the
-   emulator implements it directly.
+   against the kernel rather than against a description of it. The rows
+   marked *(verify)* are settled here, before the emulator implements
+   them. On macOS the tests run against `EmulatedEngine` with the
+   platform equivalents, and assert the differences each **P** row lists,
+   so a difference cannot grow unnoticed.
+2. **The driver's unit tests.** The io_uring lib tests (756 `#[test]`
+   items in `ringline/src`, 23 of them mio-only) run on both engines.
+   Tests that inject results through the real ring
+   (`IORING_NOP_INJECT_RESULT`) use the engine's `inject` hook instead.
 3. **The integration tests** (`tests/*.rs`) run on both engines, on
    Linux in CI and on macOS.
 
 ## Landing
 
-Each step is a separate PR and leaves both backends working.
+Each step is a separate PR. Steps 1–6 keep both backends working.
 
 1. **`Sqe`.** Introduce the ringline-owned submission type and encode it
    in `Ring`. `BuiltSend` stores an `Sqe`. Linux only, no behaviour
    change.
 2. **`Engine`.** Turn `Ring` into `UringEngine` behind the `Engine`
-   interface. Replace the remaining io_uring types in the driver
-   (`Timespec`, `RecvMsgOut`, the `cqueue` helpers) with ringline types.
-   After this the driver compiles without the `io_uring` crate.
+   interface, route both CQ readers through `reap`, and move
+   `close_lead_for` and the park probe behind it. Replace the remaining
+   io_uring types in the driver and its tests (the table above) with
+   ringline types. Split the `has_io_uring` cfg in two: one for the
+   driver (the io_uring driver, on every platform) and one for the engine
+   (`UringEngine` or `EmulatedEngine`). The startup checks
+   (`ensure_nofile_limit`, `RLIMIT_MEMLOCK`) follow the engine cfg. There
+   are about 184 `cfg(has_io_uring)` sites in 20 files to sort between
+   the two. After this the driver compiles without the `io_uring` crate.
 3. **First emulated slice.** `EmulatedEngine` on Linux behind a
-   `ring-emulator` feature, with RecvMulti, Send, Close, the close leads,
-   Cancel, Timeout/TickTimeout/Timer and EventFdRead. Acceptance: the
-   plain TCP tests in `tests/echo.rs` pass on the emulator, and the
-   conformance tests for those ops pass on both engines.
-4. **The rest of the table**, op group by op group: connect and accept;
-   coalesced, zero-copy and forward sends; chains; UDP; fs and direct
-   I/O; park.
+   `ring-emulator` feature, with RecvMulti, Send, SendRecvBuf, Connect,
+   Close, the close leads, Cancel, Timeout/TickTimeout/Timer and
+   EventFdRead. Acceptance: the conformance tests for those ops pass on
+   both engines, and the `tests/echo.rs` tests that use only those ops
+   pass on the emulator (the PR names the filter).
+4. **The rest of the table**, op group by op group: accept; coalesced,
+   zero-copy and forward sends; chains; UDP; fs and direct I/O; park;
+   process; NVMe on Linux.
 5. **macOS.** Build the io_uring driver on the emulator on macOS and run
    the full suite in CI.
 6. **Parity on macOS.** The **P** rows: timestamps, UDP without
-   GRO/GSO, process exit through kqueue, file-backed NVMe, `fstatat` and
-   `F_NOCACHE`. Every public API is available on every platform, and the
-   `#[cfg(has_io_uring)]` gates on public items are removed.
+   GRO/GSO, accept without `accept4`, process exit through kqueue,
+   file-backed NVMe, `fstatat` and `F_NOCACHE`. Every public API is
+   available on every platform, and the `#[cfg(has_io_uring)]` gates on
+   public items are removed.
 7. **Retire the mio backend** once the emulator passes everything the
    mio backend passes. `force-mio` becomes the switch that selects the
    emulator on Linux.
@@ -273,24 +377,39 @@ Each step is a separate PR and leaves both backends working.
 1. **Retire the mio backend at step 7, or keep it?** Keeping it keeps
    two drivers, which is the cost this design removes. Retiring it means
    the emulator carries macOS alone.
-2. **Engine choice at launch.** Should step 7 also let a Linux build fall
-   back to the emulator when `io_uring_setup` is refused (RHEL 10 ships
+2. **Engine choice at launch.** Should Linux fall back to the emulator
+   when `io_uring_setup` is refused (RHEL 10 ships
    `io_uring_disabled = 2`), instead of requiring a `force-mio` build?
-3. **Emulated recv copies twice** (socket → provided buffer →
-   accumulator), where mio copies once into its accumulator today. The
-   emulator could read straight into the accumulator for RecvMulti, but
-   then the provided-buffer accounting the driver relies on would not be
-   exercised. This design takes the second copy; measure before changing
-   it.
+   That needs an enum over the two engines, so every push branches on the
+   engine; the driver itself stays non-generic. The fd and
+   `RLIMIT_MEMLOCK` checks run before ring setup, so a fallback would
+   start under the io_uring limits and must recheck them.
+3. **Breaking changes on macOS.** Retiring mio changes the public API
+   there: `forward_to_conn` returns a different future type per backend
+   today (`ForwardToConnFuture` is exported only without io_uring), and
+   `ringline::backend()` returns `Backend::Mio`. Under the release
+   process these are breaking changes to batch into a coordinated
+   release.
+
+## Notes
+
+- Emulated recv copies as many times as the mio backend does today:
+  socket → provided buffer → accumulator on the emulator, socket → 8 KiB
+  scratch buffer → accumulator on mio.
+- kTLS is designed (`docs/ktls-design.md`) but not implemented. It
+  builds on the `tls-unbuffered` engine and adds no ring op in that
+  design, so the emulator does not need to know about it.
 
 ## Found while surveying
 
 - **The connect-timeout cancel never matches.** `arm_connect_timeout`
-  arms the timeout with `payload = generation` (`handler.rs`), but the
-  three cancels of it encode payload 0, and `ASYNC_CANCEL` matches the
-  whole user_data. The timeout therefore always runs to `-ETIME`, which
-  `handle_timeout` ignores once the connect has completed. Harmless
+  (`handler.rs`) arms the timeout with `payload = generation`, but the
+  three cancels of it (one in `handler.rs`, two in `event_loop.rs`)
+  encode payload 0, and `ASYNC_CANCEL` matches the whole user_data. The
+  timeout therefore always runs to `-ETIME`. `handle_timeout` ignores it,
+  because it checks the generation and `connect_timeout_armed`. Harmless
   today; the emulator's exact-match cancel must not hide it.
-- **A stale comment** in `ring.rs` (around `submit_park_cancel`)
+- **A stale comment** in `ring.rs` above `submit_park_recv_cancel`
   describes an `IO_LINK` from the park recv-cancel to the install, which
-  the code no longer has.
+  the code no longer has. The same block carries `submit_async_cancel`'s
+  orphaned summary line.
