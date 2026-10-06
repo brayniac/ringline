@@ -5,7 +5,7 @@
 name = "ringline recv shared_inc pool sweep 2-host bpo (#622)"
 
 [params]
-bins_artifact = "REPLACE_WITH_BUILD_ARTIFACT"
+bins_artifact = "01a1137d-d578-736c-ad81-0089b4c8a042"
 image     = "spool/images/debian-13-ci-bpo-20261001.1@golden"
 server_ip = "172.31.0.1"
 client_ip = "172.31.0.2"
