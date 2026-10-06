@@ -18,16 +18,17 @@ shared by every connection on the worker. The driver then lends that
 buffer to the task when the accumulator is empty (`pending_recv_bufs`,
 no copy) and otherwise copies it into the connection's `RecvAccumulator`.
 The copy is paid by messages that span completions, by `with_bytes`
-callers and by streams. Separately, about 700 lines of the driver, plus
+callers and by streams. Separately, about 860 lines of the driver, plus
 the bid lifecycle of the lending paths, exist only because the buffers
 are shared and one connection can empty the ring for all of them (see
 "What this removes").
 
 This design has the kernel write each connection's bytes into memory that
-connection owns, so the copy is gone for every API, and the shared-ring
-state goes once no TCP connection uses the shared ring. The emulator
-proposal (`docs/ring-emulator-design.md`, not yet merged) would do the
-same with `read(2)` into that memory.
+connection owns, so the copy is gone for every plain-TCP API except
+recv sinks, and the shared-ring state goes once no TCP connection uses
+the shared ring. The emulator proposal (`docs/ring-emulator-design.md`
+on branch `docs/ring-emulator-design`, PR #621) would do the same with
+`read(2)` into that memory.
 
 Two shapes were considered:
 
@@ -73,27 +74,42 @@ it (`with_bytes`), sends may read from it after its connection closes
 connection. A count on the slot cannot cover all of these, so the memory
 is a reference-counted allocation:
 
-- A connection's receive memory is a `RecvRegion`: one allocation behind
-  an `Arc`, with `head` (first unread byte), `tail` (end of written
-  bytes) and `posted` (the range currently posted to the kernel, if any).
-- Everything that may read or write the allocation holds a reference:
-  the connection, the posted entry (until its arm's terminal CQE),
-  every `Bytes` handed to a task, and every lend to a send.
-- `with_bytes` hands out `Bytes::from_owner` views of the region
-  (`bytes` 1.12.0, already a dependency). A view shares the allocation;
-  slicing it is O(1). There is no "merge" step: unread bytes and newly
-  received bytes are already adjacent in the same allocation, so the copy
-  `accumulator.rs` warns about (69 GB copied to receive 4.8 GB when the
-  merge fell back to copying) does not arise.
-- When the connection needs room it cannot get in place (the region is
-  full and the head cannot be reclaimed because views or lends still
-  reference it), it **allocates a new region** and copies only its unread
-  bytes into it. The old allocation lives until its last reference drops.
+- A connection's receive memory is a `RecvRegion`: a raw allocation
+  (`NonNull<u8>` and a length, never a `Vec` or a `Box<[u8]>`, so no Rust
+  reference spans bytes the kernel writes) behind an `Arc`.
+- The cursors live in the driver's per-connection state, not in the
+  `Arc`: `head` (first unread byte), `tail` (end of reaped bytes) and
+  `posted` (the range posted to the kernel, if any). Views drop on other
+  threads, so nothing they touch is mutable.
+- These hold a reference: the connection; the posted entry, until its
+  arm's terminal CQE; an in-flight one-shot `RECV`, until its CQE; every
+  `Bytes` handed to a task; every lend to a send, until its last CQE
+  (and zero-copy notification).
+- `with_bytes` hands out `Bytes::from_owner` views (`bytes` 1.12.0,
+  already a dependency). Each owner is `{Arc<RecvRegion>, offset, len}`
+  and exposes only its own range through `as_ref()`. Slicing a view is
+  O(1); creating one allocates (`from_owner` boxes its owner), which is a
+  cost today's held-remainder path does not pay (see costs).
+- Unread and newly received bytes are adjacent in one allocation, so
+  `with_bytes` has no merge step. Today a merge copies the remainder when
+  new bytes arrive while a task holds slices of it
+  (`accumulator.rs`, `unfreeze`).
+- The region is reclaimed in place (head and tail back to the front)
+  only when the only references are the internal ones (connection,
+  posted entry, in-flight one-shot), checked with an acquire load of the
+  count. Otherwise, when the connection needs room, it **allocates a new
+  region** and copies its unread bytes into it; the old allocation lives
+  until its last reference drops.
 - Slot reuse never inherits memory: a reactivated slot starts with a new
-  region (or a recycled one whose reference count is one).
+  region, or a recycled one whose count is one. The sites that reset an
+  accumulator today become "take a new region": on io_uring the install
+  and connect paths (`event_loop.rs` `install_accepted`, the two connect
+  paths); on mio `driver.rs` and `event_loop.rs` at slot reactivation.
 
-This replaces today's `BytesMut` accumulator for TCP on io_uring. The
-emulator and the mio backend can use the same type.
+This replaces today's `BytesMut` accumulator for TCP. The mio backend
+adopts the same type in the same release, so `with_bytes` returns the
+same kind of `Bytes` on both backends (an owner-backed `Bytes` never
+converts back with `try_into_mut`, which no caller relies on today).
 
 ## Arming
 
@@ -114,33 +130,58 @@ connection on a ring.
 
 ## Moving the region
 
-The kernel writes only into a posted entry. Under `DEFER_TASKRUN` the
-kernel selects the buffer and copies into it inside the worker's own
-`io_uring_enter`, so between two enters no kernel write is in progress.
+The kernel writes only into a posted entry, and it writes ahead of the
+completions the driver has reaped: in an `io_uring_enter` that runs task
+work (`GETEVENTS`), it copies received bytes and advances the INC entry
+before the driver reads the CQE (probed). The driver's ringline enters
+that do so are the blocking wait, `submit_and_get_events` and `flush()`,
+including the mid-drain `flush()` that `flush_interval_us` enables by
+default. A plain `submit()` without `GETEVENTS` does not run deferred task
+work for an armed recv (probed); it can execute a recv SQE submitted in
+that call inline, which only the driver's own arm SQEs are.
+
 The rules:
 
-1. **Re-post on `F_BUF_MORE` clear.** When a CQE clears `F_BUF_MORE`, the
-   posted range is used up and the arm is still live. The driver
-   compacts or grows the region if needed and posts the new free range
-   before the next enter. The arm continues; there is no `-ENOBUFS`
-   round trip.
-2. **Moves between enters.** Any other move of a ring-armed region
-   (compaction on the task's side, a new region for the reasons above)
-   rewrites the posted entry in place, between enters, on the worker
-   thread. The probe shows the arm continues at the new address.
-3. **One-shot arms move between completions.** A one-shot `RECV` is not
-   re-armed until the end of the loop iteration, so task polls in that
-   iteration see an unarmed region and may move it freely. A move needed
-   while a one-shot is in flight waits for its CQE.
-4. **Nothing else writes into a posted range.** Today's `append` callers
+1. **The kernel's write position is the posted entry's address.** INC
+   rewrites the entry as it consumes, so `entry.addr - base` is the true
+   end of written bytes; `tail` (from reaped CQEs) lags it. A move copies
+   `[head, entry.addr)`, and later CQEs for bytes already moved only
+   advance `tail`.
+2. **Moves happen only while the CQ is settled**: drained, with no
+   `GETEVENTS` enter since. That holds while tasks are polled
+   (`poll_ready_tasks` runs after the drain and before the post-poll
+   `flush()`). A move requested outside that window (a `flush()` mid-drain
+   has run, or the CQ is not empty) is deferred to the next settled
+   point, and the task is re-polled then.
+3. **Re-post on `F_BUF_MORE` clear.** When a CQE clears `F_BUF_MORE`, the
+   posted range is used up and the arm is still live. The driver posts
+   the next free range before the next enter, and the arm continues. If
+   bytes were already queued when the entry filled, the arm ends with
+   `-ENOBUFS` in that same enter (probed) and the driver re-arms; bulk
+   streams pay that re-arm on every fill. A two-entry ring, the second
+   entry posted at the first one's end address, lets the kernel continue
+   into contiguous memory without ending the arm; step 0 measures
+   whether it is worth the second entry.
+4. **A ring-armed region moves by rewriting its posted entry**, under
+   rule 2, on the worker thread. The probe shows the arm continues at the
+   new address. This relies on `DEFER_TASKRUN` keeping the kernel's work
+   inside the worker's enters, which is why the ring arm is not used under
+   SQPOLL.
+5. **One-shot arms move between completions.** A one-shot `RECV` is
+   re-armed only at the end of the loop iteration, so tasks polled in that
+   iteration see an unarmed region. A move needed while a one-shot is in
+   flight waits for its CQE.
+6. **Nothing else writes into a posted range.** Today's `append` callers
    that write received bytes go away with the bids and
-   `pending_recv_bufs`; the park install seeds carried bytes before the
-   first arm, which stays correct.
+   `pending_recv_bufs`. The park install seeds carried bytes before the
+   first arm. `settle_forward_end`, which returns held forward bytes to the
+   accumulator today, becomes "move `head` back over the returned range"
+   when the region has not moved since, and a copy to the front of a new
+   region otherwise.
 
-Rule 2 relies on `DEFER_TASKRUN` keeping the kernel's buffer selection
-inside the worker's enter. That is why the ring arm is not used under
-SQPOLL, and why the conformance tests pin rule 2 so a kernel that behaves
-differently fails a test, not a connection.
+The conformance tests pin rules 1, 3 and 4, including the reaped-versus-
+written gap, so a kernel that behaves differently fails a test, not a
+connection.
 
 ## Close and slot reuse
 
@@ -148,7 +189,7 @@ This answers the objection that retired the idea before (#274: "accumulator
 spare capacity is unsound across close/slot-reuse"). Three rules:
 
 1. **The posted entry holds a reference until its arm's terminal CQE.**
-   The connection's ring is unregistered at close, but unregistering does
+   The connection's ring is unregistered in `close_connection`, but unregistering does
    not end a live arm. The arm ends with the close lead (`ShutdownRdWr`
    before 6.13, `CancelAll` from 6.13: `ring.rs` `close_lead_for`) or the
    recv cancel. Today that cancel is best-effort, dropped when the SQ is
@@ -160,18 +201,23 @@ spare capacity is unsound across close/slot-reuse"). Three rules:
 3. **Slot reuse takes new memory.** The reactivated slot never inherits
    the old region, so a one-shot recv or a lend still holding the old
    allocation cannot overlap the new occupant's writes. This is what
-   makes the pre-6.12 path safe without gating the Close on the recv
-   (which would deadlock: the recv is ended by the lead linked ahead of
-   that Close).
+   makes the one-shot arm safe (on kernels before 6.12, under SQPOLL,
+   and past bgid exhaustion) without gating the Close on the recv, which
+   would deadlock: the recv is ended by the lead linked ahead of that
+   Close. The one-shot needs its own cancel at close, since today's close
+   cancels only the multishot by its user_data.
 
 The generation check on the RecvMulti payload stays; it guards
 bookkeeping, not memory.
 
 **Park** moves an idle connection to another worker (#443) and is
-unrelated to buffer pressure. It already cancels the recv and waits for
-`-ECANCELED`, which is the terminal CQE rule 1 needs. It retires the
-ring after the install succeeds, not at `begin_park`, since an abandoned
-park re-arms (`abandon_park_drain`).
+unrelated to buffer pressure. For a ring-armed connection it already
+cancels the recv and waits for `-ECANCELED`, which is the terminal CQE
+rule 1 needs; it retires the ring after the install succeeds, not at
+`begin_park`, since an abandoned park re-arms (`abandon_park_drain`).
+A one-shot-armed connection always has a recv in flight, which
+`park_blocker` refuses today; park cancels the one-shot and waits for
+its CQE the same way.
 
 **Worker shutdown** drops the ring before the accumulators (`Driver` field
 order, `driver.rs`), as it does for the shared ring today; this design
@@ -186,21 +232,33 @@ relies on that order.
   full at the maximum while the parser still needs more is closed, as
   today. The default is 1 GiB, so per-connection backpressure does not
   engage by default.
+- **Lent bytes are capped per connection.** Bytes held by lends (views in
+  forward, echo or segment state, not yet released by their last CQE)
+  count against a per-connection cap, the role `forward_hold_cap` has
+  today. Above it the driver does not re-post; a release re-posts. Without
+  the cap, a slow `forward_to` sink would make each fill allocate a new
+  region while the lent ones stay alive.
 - Re-posting after the task consumes, or after a lend is released, is the
   event that frees space (Domain Invariant 6's rule, re-arm on an event,
   per connection).
+- Regions shrink back to `recv_accumulator_capacity` after staying under
+  a quarter full for a period, as `CiphertextBuf` already does.
 
 ## Paths that lend received memory
 
 Recv-forward (`forward_held`), direct echo, `forward_recv_buf`, segmented
 recv and `forward_to` Mode A hand received bytes onward without copying.
 Today they hold provided buffers by bid. Here a lend holds a `Bytes` view
-of the region (a reference, see "Memory ownership"), so:
+of the region (a reference, see "Memory ownership"). The view moves into
+the state that already holds lent bytes (`HeldRecvBuf::Owned(Bytes)`,
+the slab entry, the forward state) and drops at the send's last CQE or
+zero-copy notification. So:
 
 - a lend can outlive its connection, and a send reading it stays valid
   (Domain Invariant 1);
-- a lend never blocks the region from growing: growth allocates new
-  memory and the old allocation lives until the lend is released;
+- a lend does not stop the region from growing (growth allocates new
+  memory and the old allocation lives until the lend is released), but
+  lent bytes are capped (see backpressure);
 - release is dropping the view, not replenishing a bid.
 
 Mode B segments (`segments()`) exist to skip the accumulator copy. With
@@ -218,63 +276,82 @@ for memory ringline does not own.
 - **The `timestamps` feature.** Its multishot `RECVMSG` interleaves a
   header and control data with the payload in each buffer. It can move to
   a one-shot `RECVMSG` with the payload iovec at the region and control
-  data in a small per-connection buffer; it moves only if that measures
-  within 5% of the shared ring, otherwise it stays.
-- **TLS, buffered engine.** rustls copies ciphertext into its own buffer
-  (`read_tls`), so a per-connection ciphertext region saves no copy and
-  costs memory. These connections stay on the shared ring.
-- **TLS, unbuffered engine.** `CiphertextBuf` is a natural region:
-  receiving into it removes today's provided-buffer → `CiphertextBuf`
-  copy. Its no-deadlock bound assumes appends of at most 64 KiB
-  (`tls/ciphertext.rs`), so a posted range is capped at 64 KiB. It costs
-  its existing 32 KiB per connection.
+  data in a small per-connection buffer; it moves only if that passes its
+  gate (see measurement), otherwise it stays.
+- **TLS, buffered engine** (the default). rustls copies ciphertext into
+  its own buffer (`read_tls`), so receiving ciphertext into a region saves
+  no copy. It is moved to a region anyway: it is the default engine, and
+  while it stays on the shared ring, the starvation and replenish
+  machinery stays too. The cost is the region's memory per TLS
+  connection.
+- **TLS, unbuffered engine.** `CiphertextBuf` becomes a `RecvRegion`
+  (today it is a `Vec<u8>` that reallocates in `grow_to`, frees in
+  `discard` and copies in `compact`, each of which would break the move
+  rules). Receiving into it removes today's provided-buffer →
+  `CiphertextBuf` copy. Its no-deadlock bound assumes appends of at most
+  64 KiB (`tls/ciphertext.rs`), so a posted range is capped at 64 KiB.
 
-While any TCP connection uses the shared ring (buffered TLS, timestamps,
-or kernels where the measurement keeps the shared ring), the shared-ring
-mechanisms stay for those connections.
+A TLS connection also holds a plaintext region that is never posted to
+the kernel (decrypted bytes are written into it, as `tls/mod.rs` appends
+today).
+
+While any TCP connection uses the shared ring (timestamps, or kernels
+where the measurement keeps the shared ring), the shared-ring mechanisms
+stay for those connections.
 
 ## What this removes
 
-When no TCP connection uses the shared ring. Line counts are the
-inventory's estimates of non-test code, by reading, not a tool count.
+Each row lists when it can go. Line counts are the inventory's
+estimates of non-test code, by reading, not a tool count.
 
 | Mechanism | Today | After |
 |---|---|---|
-| Fallback one-shot recv (`recv_fallback_inflight`, `fallback_recv_pool`, `fallback_slot_owner`, `OpTag::RecvFallback`), #274 | ~290 LOC, ~410 test LOC | Removed: the connection's own region is the target |
-| Worker-wide starvation (`recv_starved`, the cross-connection arbitration in `flush_replenish_and_rearm`, `pending_replenish` for TCP), #245 | ~160 LOC | Per connection |
+| Fallback one-shot recv (`recv_fallback_inflight`, `fallback_recv_pool`, `fallback_slot_owner`, `OpTag::RecvFallback`), #274 | ~290 LOC, ~410 test LOC | Removed when plain TCP moves (TLS, segmented and forward connections are already ineligible for it) |
+| Worker-wide starvation (`recv_starved`, the cross-connection arbitration in `flush_replenish_and_rearm`, `pending_replenish` for TCP), #245 | ~160 LOC | Removed when no TCP connection uses the shared ring |
 | Segmented-recv aggregate reserve (`recv_segment_reserve`, `delivery_decision`) | ~60 LOC + config | Removed |
 | `pending_recv_bufs` (lending one held bid) | ~200 LOC | Removed: the bytes are in the region |
-| `forward_hold_cap` throttle | ~150 LOC | Ordinary per-connection flow control |
-| Bid lifecycle in recv-forward, direct echo, segments, `forward_to` (bid arrays, `SendRecvBuf` bid payloads, exactly-once replenish) | spread over ~2,600 LOC | Replaced by `Bytes` views |
+| `forward_hold_cap` throttle (cancel and re-arm of the multishot) | ~150 LOC | Replaced by the lent-bytes cap (not re-posting) |
+| Bid lifecycle in recv-forward, direct echo, segments, `forward_to` (bid arrays, `SendRecvBuf` bid payloads, exactly-once replenish), in `driver.rs`, `event_loop.rs` and `runtime/io.rs` | not counted | Replaced by `Bytes` views |
 | Shared-ring fairness | design constraint | Removed |
 
-Public configuration affected: `recv_segment_reserve` and
-`forward_hold_cap` lose their purpose, and `recv_buffer` /
-`recv_buffer_bgid` no longer size TCP receive. These are breaking changes
-to batch into a coordinated release.
+Public configuration affected:
+
+- `recv_segment_reserve` loses its purpose; `forward_hold_cap` becomes
+  the lent-bytes cap.
+- `recv_accumulator_capacity` (default 4 KiB) becomes the initial region
+  size, so it caps what one completion delivers until the region grows;
+  today one completion delivers up to the shared ring's 16 KiB buffer.
+  Its default is revisited in step 0.
+- `recv_buffer` / `recv_buffer_bgid` size only the rings that remain
+  shared (timestamps), and per-connection bgids are allocated around the
+  TCP and UDP ids the user chose.
+
+These are breaking changes to batch into a coordinated release.
 
 ## What this costs
 
 | Cost | Per connection | At 16,000 connections per worker |
 |---|---|---|
-| Ring page (6.12+) | 4 KiB | 62.5 MiB of ring pages; locked on 6.14+ (not on 6.12, probed) unless the process has `CAP_IPC_LOCK` |
+| Ring page (6.12+) | 4 KiB | 62.5 MiB of ring pages; locked on 6.14+ (not on 6.12, probed) unless the process has `CAP_IPC_LOCK`. The launch preflight counts `max_connections` × 4 KiB per worker; an `ENOMEM` at registration gives that connection the one-shot arm |
 | bgid | 1 of 65,536 per worker, held until the arm's terminal CQE | Past the limit: one-shot arm |
 | Region memory | 4 KiB at the default, grows under load | 62.5 MiB, the same as today: `AccumulatorTable` already allocates `max_connections` × 4 KiB. What changes is residency: today's lending fast path can leave an accumulator untouched; a posted region is written by the kernel |
 | Syscalls | register and unregister once per connection | measured above |
 | State per connection | ring pointer, bgid, `head`/`tail`/`posted`, arm kind | against the fields removed above |
-| Kernel lookup | one buffer group lookup per selection, among up to 16,000 groups | not measured; the 16,000-connection arm covers it |
+| Kernel lookup | one buffer group lookup per selection, among up to 16,000 groups | not measured; the 16,000-connection cell covers it |
+| View allocation | one small heap allocation per `with_bytes` view (`from_owner`) | measured by instructions per byte |
+| Buffered TLS | a ciphertext region per connection, with no copy saved | the price of retiring the shared ring |
 
 ## Measurement before landing
 
-Steps 0 and 1 need a prototype of arms 2 and 3 behind a feature flag.
+Step 1 measures the step-0 prototype.
 
-A SystemsLab experiment on the two-machine rig, three arms:
+A SystemsLab experiment on the two-machine rig, three configurations:
 
-1. the shared ring (today);
-2. per-connection INC rings;
-3. one-shot `RECV` into the region, run on the same kernel.
+1. **shared**: the shared ring (today);
+2. **ring**: per-connection INC rings;
+3. **one-shot**: one-shot `RECV` into the region, on the same kernel.
 
-Workloads, each at 64, 1,000 and 16,000 connections, and arm 3 also at
+Workloads, each at 64, 1,000 and 16,000 connections, and one-shot also at
 100,000 connections on one worker:
 
 - echo with `with_data` and with `with_bytes`, at 256 B, 4 KiB, 64 KiB
@@ -287,32 +364,52 @@ Workloads, each at 64, 1,000 and 16,000 connections, and arm 3 also at
 - a slow consumer, for resident memory.
 
 Record throughput, p99, instructions per byte, RSS and locked memory.
-Five runs per cell, arms interleaved; a difference counts when it exceeds
-the larger run-to-run spread of the two arms.
+Five runs per cell, configurations interleaved. The noise of a cell is
+max − min of its five runs; a difference between two configurations
+counts when it exceeds the larger of their two noises.
 
-The design proceeds if, on every workload, arm 2 is within 2% of arm 1 or
-better, and at 64 KiB and above it is better by more than the noise. Arm
-3 must be within 10% of arm 2 at 1,000 connections. If arm 3 misses that,
-kernels below 6.12 keep the shared ring (the hybrid, by kernel version),
-and the bgid limit becomes a reason to run more workers.
+The gate is on median throughput and median p99:
+
+- **ring vs shared**: on every workload, throughput no more than 2% lower
+  and p99 no more than 2% higher; at 64 KiB and above, throughput higher
+  by more than the noise.
+- **one-shot vs ring**: throughput within 10% at 1,000 connections.
+- **timestamps**: the one-shot `RECVMSG` within 5% of the shared ring on
+  throughput, for timestamps to move.
+- A cell whose noise exceeds the threshold it is judged against is rerun
+  with ten runs before it can pass or fail.
+
+If one-shot misses its gate, kernels below 6.12 keep the shared ring (the
+hybrid, by kernel version), and the bgid limit becomes a reason to run
+more workers.
 
 ## Landing
 
-0. **Prototype.** Arms 2 and 3 for plain TCP behind a feature flag, with
-   `RecvRegion`. Enough to run the experiment; not merged as the default.
-1. **Probe and measure.** The kernel facts as conformance tests, and the
-   experiment above.
-2. **Region receive for plain TCP** by default: `RecvRegion`, both arms,
-   the moving rules, close and quarantine. The shared ring stays for every
-   connection not yet moved.
-3. **Lending paths** move from bids to `Bytes` views.
-4. **Unbuffered TLS** ciphertext regions.
-5. **Timestamps**, if it measures within 5%.
-6. **Delete the shared-ring mechanisms** once no TCP connection uses the
-   shared ring on any supported kernel, together with the configuration
+0. **Prototype.** `RecvRegion`, the ring and one-shot arms, and the move
+   rules for plain TCP behind a feature flag, including the two-entry ring
+   variant. Enough to run the experiment; not the default.
+1. **Probe and measure.** The kernel facts, including the reaped-versus-
+   written gap, as conformance tests; then the experiment.
+2. **Region receive for TCP, lending paths included**, behind the feature
+   flag: plain TCP, recv-forward, direct echo, `forward_recv_buf`,
+   segments and `forward_to`, with the lent-bytes cap. Lending modes are
+   switched on for live connections, so a connection receiving into a
+   region must already support them; they cannot land separately.
+3. **TLS** on regions, both engines.
+4. **Default on**, once steps 2 and 3 pass the full test suite on both
+   arm kinds. The fallback recv is deleted here.
+5. **Timestamps**, if it passes its gate.
+6. **Delete the shared-ring mechanisms for TCP** once no TCP connection
+   uses the shared ring on any supported kernel, with the configuration
    changes, in a coordinated release.
-7. **Emulator**: the region-receive op in the emulated engine (a `read`
+7. **mio** adopts `RecvRegion`, in the same release as step 4, so
+   `with_bytes` returns the same `Bytes` kind on both backends.
+8. **Emulator**: the region-receive op in the emulated engine (a `read`
    into the region), with conformance tests on both engines.
+
+**Metrics** replace the shared-ring ones: connections on each arm kind,
+bgid exhaustion, `-ENOBUFS` arm ends, bytes copied by region
+reallocation, lent bytes at the cap.
 
 ## Owner decisions
 
@@ -328,8 +425,12 @@ and the bgid limit becomes a reason to run more workers.
 
 ## Questions for the owner
 
-1. **Kernel floor.** If arm 3 misses its threshold, should kernels below
+1. **Kernel floor.** If the one-shot configuration misses its gate, should kernels below
    6.12 keep the shared ring, or should the floor rise?
 2. **SQPOLL.** The ring arm is not used under SQPOLL, so SQPOLL
    deployments run the one-shot arm. Is that acceptable, or should SQPOLL
    be dropped as a configuration?
+3. **Buffered TLS on regions.** This design moves buffered TLS to regions
+   to retire the shared ring, at a region's memory per TLS connection and
+   with no copy saved. The alternative keeps buffered TLS, and with it the
+   starvation and replenish machinery, on the shared ring.
