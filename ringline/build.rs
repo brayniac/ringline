@@ -2,8 +2,17 @@ fn main() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let force_mio = std::env::var("CARGO_FEATURE_FORCE_MIO").is_ok();
 
+    // `has_io_uring` selects the io_uring driver; `uring_engine` runs it on
+    // the kernel's io_uring. `RINGLINE_STUB_ENGINE=1` builds the driver on
+    // a stub engine instead, to check that only the engine needs the
+    // `io_uring` crate.
+    println!("cargo:rerun-if-env-changed=RINGLINE_STUB_ENGINE");
+    let stub_engine = std::env::var("RINGLINE_STUB_ENGINE").is_ok_and(|v| v == "1");
     if target_os == "linux" && !force_mio && kernel_version_sufficient() {
         println!("cargo:rustc-cfg=has_io_uring");
+        if !stub_engine {
+            println!("cargo:rustc-cfg=uring_engine");
+        }
     }
 }
 

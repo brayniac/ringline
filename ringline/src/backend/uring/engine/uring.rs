@@ -1,0 +1,1095 @@
+//! The kernel engine: an io_uring instance that executes each [`Sqe`]
+//! the driver pushes and reports its completions.
+
+use std::io;
+use std::os::fd::RawFd;
+
+use io_uring::squeue::{Entry, Entry128, Flags};
+use io_uring::types::{self, CancelBuilder, DestinationSlot, Fixed, TimeoutFlags};
+use io_uring::{IoUring, cqueue, opcode, squeue};
+
+use super::Engine;
+use crate::backend::ProvidedBufRing;
+use crate::backend::uring::ring::{CloseLead, close_lead_for};
+use crate::backend::uring::sqe::{Fd, Link, Op, Sqe};
+use crate::buffer::fixed::FixedBufferRegistry;
+use crate::config::Config;
+use crate::error::{Error, MemlockLimit, describe_buffer_registration_failure, errno_name};
+use crate::memlock::KernelVersion;
+
+/// The error for a refused provided-buffer-ring registration.
+pub(crate) fn provided_ring_failure(
+    err: &io::Error,
+    bgid: u16,
+    entries: impl std::fmt::Display,
+    probe: &crate::error::RingSetupProbe,
+) -> Error {
+    let name = errno_name(err)
+        .map(|n| format!(" ({n})"))
+        .unwrap_or_default();
+    Error::BufferRegistration(format!(
+        "provided buffer ring (bgid {bgid}, {entries} entries): {err}{name}. \
+         EINVAL here usually means a kernel older than 5.19 or a \
+         ring size that is not a power of two. {}",
+        crate::error::provided_ring_enomem_hint(probe)
+    ))
+}
+
+/// An io_uring instance with 128-byte SQEs and 32-byte CQEs
+/// (`IoUring<Entry128, Entry32>`), which NVMe passthrough
+/// (`IORING_OP_URING_CMD`) needs. [`Sqe::encode`] produces the 128-byte
+/// entries; 64-byte opcodes are zero-padded.
+///
+/// Memory overhead of Big SQE/CQE: +32 KB per worker with default config
+/// (256 SQ × 64B extra + 1024 CQ × 16B extra), negligible relative to the
+/// ~20 MB of buffer pools allocated per worker.
+pub(crate) struct UringEngine {
+    ring: IoUring<squeue::Entry128, cqueue::Entry32>,
+    /// Reusable Entry128 conversion scratch for chain pushes — avoids a
+    /// heap allocation per chained send.
+    chain_scratch: Vec<squeue::Entry128>,
+    /// Whether the ring was set up with `IORING_SETUP_DEFER_TASKRUN`. When
+    /// set, the kernel runs task_work — and so posts the CQEs it generates —
+    /// only on an `io_uring_enter` carrying `IORING_ENTER_GETEVENTS`.
+    defer_taskrun: bool,
+    /// Whether the kernel supports `IORING_OP_FIXED_FD_INSTALL` (6.8+).
+    ///
+    /// Park (tier 3, #443) has to hand a real fd to another worker, but an
+    /// established connection's fd lives only in this ring's fixed-file
+    /// table — `install_accepted` closes the raw fd once it is registered.
+    /// This opcode is the only way to get one back, so it decides whether
+    /// park is available at all. See [`Engine::supports_park`].
+    fixed_fd_install: bool,
+    /// What goes ahead of a connection's `Close` on this kernel. See
+    /// [`close_lead_for`].
+    close_lead: CloseLead,
+    /// Test-only: number of upcoming `push_sqe`/`push_sqe128` calls that
+    /// fail as if the SQ were still full after a submit. See
+    /// [`Engine::force_push_failures`].
+    #[cfg(test)]
+    forced_push_failures: usize,
+}
+
+impl UringEngine {
+    fn close_lead_from(config: &Config) -> CloseLead {
+        #[cfg(test)]
+        if let Some(lead) = config.close_lead_override {
+            return lead;
+        }
+        let _ = config;
+        close_lead_for(KernelVersion::current())
+    }
+
+    /// Re-probe an arbitrary opcode. Exists so tests can establish that the
+    /// probe mechanism answers at all — a probe that silently reported
+    /// everything unsupported would disable park permanently and look
+    /// exactly like an old kernel.
+    #[cfg(test)]
+    pub(crate) fn probe_supported(&self, code: u8) -> bool {
+        let mut probe = io_uring::Probe::new();
+        match self.ring.submitter().register_probe(&mut probe) {
+            Ok(()) => probe.is_supported(code),
+            Err(_) => false,
+        }
+    }
+
+    /// The calling thread's io-wq limits, `[bounded, unbounded]`. Passing 0
+    /// for both changes nothing and returns the current values.
+    #[cfg(test)]
+    pub(crate) fn iowq_max_workers(&self) -> io::Result<[u32; 2]> {
+        let mut limits = [0, 0];
+        self.ring
+            .submitter()
+            .register_iowq_max_workers(&mut limits)?;
+        Ok(limits)
+    }
+
+    /// Push a raw 64-byte entry: the test-only NOP injections, which set
+    /// fields `Sqe` does not describe.
+    #[cfg(test)]
+    unsafe fn push_entry(&mut self, entry: &squeue::Entry) -> io::Result<()> {
+        unsafe {
+            self.push_sqe128(entry.clone().into())?;
+        }
+        Ok(())
+    }
+
+    /// Push a 128-byte entry to the submission queue.
+    ///
+    /// # Safety
+    /// The entry must reference valid memory for the lifetime of the operation.
+    unsafe fn push_sqe128(&mut self, entry: squeue::Entry128) -> io::Result<()> {
+        #[cfg(test)]
+        if self.forced_push_failures > 0 {
+            self.forced_push_failures -= 1;
+            crate::metrics::RING.increment(crate::metrics::ring::SQE_SUBMIT_FAILURES);
+            return Err(io::Error::other("forced SQ push failure"));
+        }
+
+        // Try to push; if SQ is full, submit first to make room.
+        unsafe {
+            if self.ring.submission().push(&entry).is_err() {
+                self.ring.submit()?;
+                if self.ring.submission().push(&entry).is_err() {
+                    crate::metrics::RING.increment(crate::metrics::ring::SQE_SUBMIT_FAILURES);
+                    return Err(io::Error::other("SQ still full after submit"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Push two SQEs adjacently, so a linked pair is never split across
+    /// submissions. Submits first if the SQ has room for fewer than two.
+    ///
+    /// # Safety
+    /// Both SQEs must reference valid memory for the lifetime of the operation.
+    unsafe fn push_sqe_pair(
+        &mut self,
+        first: squeue::Entry128,
+        second: squeue::Entry128,
+    ) -> io::Result<()> {
+        #[cfg(test)]
+        if self.forced_push_failures > 0 {
+            self.forced_push_failures -= 1;
+            crate::metrics::RING.increment(crate::metrics::ring::SQE_SUBMIT_FAILURES);
+            return Err(io::Error::other("forced SQ push failure"));
+        }
+
+        let pair = [first, second];
+        unsafe {
+            if self.ring.submission().push_multiple(&pair).is_err() {
+                self.ring.submit()?;
+                if self.ring.submission().push_multiple(&pair).is_err() {
+                    crate::metrics::RING.increment(crate::metrics::ring::SQE_SUBMIT_FAILURES);
+                    return Err(io::Error::other("SQ still full after submit"));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Engine for UringEngine {
+    /// Create and configure the io_uring instance.
+    ///
+    /// Returns [`Error::RingSetup`] rather than `Error::Io` so a refused
+    /// `io_uring_setup(2)` names the subsystem and, for `EPERM`, the
+    /// `kernel.io_uring_disabled` sysctl or seccomp profile behind it.
+    fn setup(config: &Config) -> Result<Self, Error> {
+        let cq_entries = config
+            .sq_entries
+            .checked_mul(4)
+            .unwrap_or(config.sq_entries);
+
+        let mut builder = IoUring::<squeue::Entry128, cqueue::Entry32>::builder();
+        builder.setup_cqsize(cq_entries);
+        builder.setup_coop_taskrun();
+        builder.setup_single_issuer();
+
+        if config.sqpoll {
+            builder.setup_sqpoll(config.sqpoll_idle_ms);
+            if let Some(cpu) = config.sqpoll_cpu {
+                builder.setup_sqpoll_cpu(cpu);
+            }
+            // DEFER_TASKRUN is incompatible with SQPOLL (kernel returns EINVAL).
+        } else {
+            builder.setup_defer_taskrun();
+        }
+
+        let ring = builder
+            .build(config.sq_entries)
+            .map_err(Error::ring_setup)?;
+
+        // Applies to the calling thread's io-wq, which is why the ring is
+        // set up on its worker's thread. A zero slot leaves that limit
+        // unchanged and reads back its current value, so the first call only
+        // reads. The cap is an upper bound: registering it where the
+        // kernel's own limit is lower would raise the limit instead.
+        if config.iowq_max_workers > 0 {
+            let refused = |e: io::Error| {
+                Error::RingSetup(format!(
+                    "io_uring refused an io-wq worker cap of {}: {e}",
+                    config.iowq_max_workers
+                ))
+            };
+            let mut current = [0, 0];
+            ring.submitter()
+                .register_iowq_max_workers(&mut current)
+                .map_err(refused)?;
+            if config.iowq_max_workers < current[0] {
+                let mut limits = [config.iowq_max_workers, 0];
+                ring.submitter()
+                    .register_iowq_max_workers(&mut limits)
+                    .map_err(refused)?;
+            }
+        }
+
+        // Probed once here rather than per park: the answer cannot change for
+        // the life of the ring, and a failed probe is not a setup failure —
+        // it only means park is unavailable.
+        let fixed_fd_install = {
+            let mut probe = io_uring::Probe::new();
+            match ring.submitter().register_probe(&mut probe) {
+                Ok(()) => probe.is_supported(opcode::FixedFdInstall::CODE),
+                // `IORING_REGISTER_PROBE` is 5.6 and the crate floor is 6.1,
+                // so this should not happen — but a refused probe means
+                // "assume not supported", never "fail to start".
+                Err(_) => false,
+            }
+        };
+
+        Ok(UringEngine {
+            ring,
+            chain_scratch: Vec::new(),
+            defer_taskrun: !config.sqpoll,
+            fixed_fd_install,
+            close_lead: Self::close_lead_from(config),
+            #[cfg(test)]
+            forced_push_failures: 0,
+        })
+    }
+
+    /// Whether this kernel can return a registered fd to the process table,
+    /// and so whether park (tier 3, #443) is available.
+    ///
+    /// Requires Linux 6.8 for `IORING_OP_FIXED_FD_INSTALL`. The crate floor
+    /// stays at 6.1: below 6.8 park is simply unavailable, and nothing else
+    /// changes. That is a smaller loss than it sounds, because park exists
+    /// only to repair the placement imbalance
+    /// [`AcceptMode::Merged`](crate::AcceptMode::Merged) introduces — the
+    /// default [`Pool`](crate::AcceptMode::Pool) mode places by round-robin
+    /// and has nothing to rebalance. A pre-6.8 deployment that wants even
+    /// placement stays on the default and loses nothing.
+    fn supports_park(&self) -> bool {
+        self.fixed_fd_install
+    }
+
+    /// What goes ahead of a connection's `Close` on the running kernel. See
+    /// [`close_lead_for`].
+    fn close_lead(&self) -> CloseLead {
+        self.close_lead
+    }
+
+    /// Register a sparse fixed-buffer table sized to the registry, then
+    /// fill in any occupied slots via `register_buffers_update`.
+    ///
+    /// The sparse path lets us add and remove regions dynamically after
+    /// launch without re-registering the entire table.
+    ///
+    /// Failures come back as [`Error::BufferRegistration`] naming the cause;
+    /// `ENOMEM` is the `RLIMIT_MEMLOCK` limit in practice.
+    fn register_buffers(&self, registry: &FixedBufferRegistry) -> Result<(), Error> {
+        let iovecs = registry.iovecs();
+        if iovecs.is_empty() {
+            return Ok(());
+        }
+        let total: u64 = iovecs.iter().map(|iov| iov.iov_len as u64).sum();
+        let attribute =
+            |e: io::Error| Error::buffer_registration(e, total, MemlockLimit::read().ok().as_ref());
+        let submitter = self.ring.submitter();
+        submitter
+            .register_buffers_sparse(iovecs.len() as u32)
+            .map_err(attribute)?;
+
+        // Apply each occupied slot. Empty slots stay zeroed in the kernel.
+        for (slot, iov) in iovecs.iter().enumerate() {
+            if iov.iov_base.is_null() {
+                continue;
+            }
+            // Safety: the iovec points at user memory documented to outlive
+            // the runtime; tags are unused.
+            unsafe {
+                submitter
+                    .register_buffers_update(slot as u32, std::slice::from_ref(iov), None)
+                    .map_err(attribute)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Update a single fixed-buffer slot with a new iovec.
+    ///
+    /// `iov.iov_base.is_null()` clears the slot.
+    ///
+    /// # Safety
+    ///
+    /// The memory described by `iov` must remain valid until either the slot
+    /// is cleared or the runtime shuts down. No SQE referencing the slot may
+    /// be in flight when this is called.
+    unsafe fn register_buffers_update_one(&self, slot: u16, iov: libc::iovec) -> io::Result<()> {
+        unsafe {
+            self.ring
+                .submitter()
+                .register_buffers_update(slot as u32, std::slice::from_ref(&iov), None)
+                .map_err(|e| {
+                    // Surfaces to the caller of `Runtime::register_region`
+                    // as an `io::Error`; keep the kind, replace the bare
+                    // "Cannot allocate memory" with the memlock guidance.
+                    let text = describe_buffer_registration_failure(
+                        &e,
+                        iov.iov_len as u64,
+                        MemlockLimit::read().ok().as_ref(),
+                    );
+                    io::Error::new(e.kind(), text)
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Register a sparse file table for direct descriptors.
+    ///
+    /// The kernel sizes this table against `RLIMIT_NOFILE`, so `EMFILE`
+    /// means the limit, not fd exhaustion, and is reported as such.
+    fn register_files_sparse(&self, count: u32) -> Result<(), Error> {
+        self.ring
+            .submitter()
+            .register_files_sparse(count)
+            .map_err(|e| match e.raw_os_error() {
+                Some(libc::EMFILE | libc::ENFILE) => Error::ResourceLimit(format!(
+                    "RLIMIT_NOFILE too low for the fixed file table: io_uring refused \
+                     {count} entries ({e}). Raise it with `ulimit -n` to at least \
+                     {count} plus overhead, or lower ConfigBuilder::max_connections"
+                )),
+                _ => Error::Io(e),
+            })?;
+        Ok(())
+    }
+
+    /// Update registered file table at given offset.
+    fn register_files_update(&self, offset: u32, fds: &[RawFd]) -> io::Result<()> {
+        self.ring.submitter().register_files_update(offset, fds)?;
+        Ok(())
+    }
+
+    /// Register the provided buffer ring with the kernel.
+    fn register_buf_ring(&self, provided: &ProvidedBufRing) -> Result<(), Error> {
+        // Safety: ring_addr points to valid mmap'd memory that outlives the registration.
+        unsafe {
+            self.ring
+                .submitter()
+                .register_buf_ring_with_flags(
+                    provided.ring_addr(),
+                    provided.ring_entries() as u16,
+                    provided.bgid(),
+                    0,
+                )
+                .map_err(|e| {
+                    provided_ring_failure(
+                        &e,
+                        provided.bgid(),
+                        provided.ring_entries(),
+                        &crate::error::RingSetupProbe::read(),
+                    )
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Unregister the provided buffer ring from the kernel.
+    /// Must be called before the ring memory is munmap'd.
+    fn unregister_buf_ring(&self, bgid: u16) -> io::Result<()> {
+        self.ring.submitter().unregister_buf_ring(bgid)?;
+        Ok(())
+    }
+
+    /// Submit all pending SQEs and wait for at least `min_complete` CQEs.
+    ///
+    /// A bare `?` here would kill the worker thread (and every connection on
+    /// it) on the first transient `io_uring_enter` failure:
+    /// - `EINTR`: any signal delivered to the worker interrupts the wait
+    ///   regardless of `SA_RESTART` — restart it.
+    /// - `EBUSY`: the CQ is backed up (overflow list non-empty); return `Ok`
+    ///   so the caller drains completions, which frees CQ space.
+    fn submit_and_wait(&self, min_complete: u32) -> io::Result<()> {
+        loop {
+            match self.ring.submitter().submit_and_wait(min_complete as usize) {
+                Ok(_) => return Ok(()),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) if e.raw_os_error() == Some(libc::EBUSY) => return Ok(()),
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Submit pending SQEs and reap deferred completions **without blocking**.
+    ///
+    /// Use this instead of `submit_and_wait(0)` whenever the event loop
+    /// declines to block because a task is runnable.
+    ///
+    /// `submit_and_wait(0)` does not set `IORING_ENTER_GETEVENTS` (the
+    /// io-uring crate sets it only for `want > 0`), and under
+    /// `IORING_SETUP_DEFER_TASKRUN` the kernel runs task_work only when that
+    /// flag is present. A worker with a permanently runnable task therefore
+    /// never blocks, never sets GETEVENTS, and — if the runnable task also
+    /// queues no SQEs, so `flush()` takes its empty-SQ shortcut — never reaps
+    /// a single completion: no accepts, no recvs, no send completions, and so
+    /// no send-pool slots recycled, for as long as that task stays runnable.
+    ///
+    /// Costs the same one syscall as the `submit_and_wait(0)` it replaces.
+    /// Without DEFER_TASKRUN (SQPOLL rings, which cannot enable it) the kernel
+    /// posts completions eagerly, so this delegates.
+    fn submit_and_get_events(&self) -> io::Result<()> {
+        if !self.defer_taskrun {
+            return self.submit_and_wait(0);
+        }
+        loop {
+            // Safety: as in `flush()` — a shared view of the SQ head/tail
+            // atomics, read-only.
+            let n = unsafe { self.ring.submission_shared().len() } as u32;
+            match unsafe {
+                self.ring
+                    .submitter()
+                    .enter::<()>(n, 0, 1 /* IORING_ENTER_GETEVENTS */, None)
+            } {
+                Ok(_) => return Ok(()),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) if e.raw_os_error() == Some(libc::EBUSY) => return Ok(()),
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Submit pending SQEs without waiting. Used for mid-iteration flush.
+    ///
+    /// After submitting the SQEs this method issues a second `io_uring_enter`
+    /// with `IORING_ENTER_GETEVENTS` and `min_complete=0`.  With
+    /// `IORING_SETUP_DEFER_TASKRUN` the kernel only runs task_work (and posts
+    /// deferred CQEs to the completion ring) when `IORING_ENTER_GETEVENTS` is
+    /// set.  A plain `submit()` call does NOT set that flag, so send-completion
+    /// CQEs for the SQEs we just submitted sit in kernel-internal task_work
+    /// until the next `submit_and_wait(1)`, causing a "dead" event-loop
+    /// iteration that wakes up only to process those CQEs.
+    ///
+    /// By issuing a non-blocking `enter(GETEVENTS, min=0)` right after submit
+    /// we flush task_work inline — the send CQEs land in the CQ ring before
+    /// `flush()` returns, so the `drain_completions()` call that follows in
+    /// the event loop can consume them immediately.
+    fn flush(&self) -> io::Result<()> {
+        // Combine submit + DEFER_TASKRUN flush into a single kernel entry.
+        //
+        // The old two-call path was:
+        //   submit()                           → enter(sq_len, 0, 0=no-GETEVENTS, None)
+        //   enter::<()>(0, 0, GETEVENTS, None) → enter(0,      0, GETEVENTS,       None)
+        //
+        // Merged into one:
+        //   enter(sq_len, 0, GETEVENTS, None)
+        //
+        // This submits any pending SQEs AND triggers DEFER_TASKRUN task_work
+        // delivery in a single syscall, saving one round-trip to the kernel
+        // per flush() invocation (≈ once or twice per event-loop iteration).
+        //
+        // Safety: `submission_shared()` gives a shared view of the SQ head/tail
+        // atomics.  We only read `.len()` (sq_tail − sq_head) and never push
+        // new entries here, so there is no aliasing or mutation hazard.
+        let n = unsafe { self.ring.submission_shared().len() } as u32;
+        if n == 0 {
+            // Nothing to submit. Pending DEFER_TASKRUN task_work and CQEs are
+            // reaped by the event loop's next ring entry, which always carries
+            // GETEVENTS — `submit_and_wait(1)` when it blocks, and
+            // `submit_and_get_events()` when it declines to because a task is
+            // runnable. Skipping the syscall here therefore defers completion
+            // reaping by at most one loop iteration. (That second case is why
+            // `submit_and_get_events` exists: a plain `submit_and_wait(0)` sets
+            // no GETEVENTS, and combined with this shortcut it would strand
+            // task_work indefinitely.)
+            return Ok(());
+        }
+        unsafe {
+            self.ring
+                .submitter()
+                .enter::<()>(n, 0, 1 /* IORING_ENTER_GETEVENTS */, None)?;
+        }
+        Ok(())
+    }
+
+    /// Append every completion the ring holds to `out` as
+    /// `(user_data, result, flags)`, consuming them.
+    fn reap(&mut self, out: &mut Vec<(u64, i32, u32)>) {
+        out.extend(
+            self.ring
+                .completion()
+                .map(|cqe| (cqe.user_data(), cqe.result(), cqe.flags())),
+        );
+    }
+
+    /// Test-only: make the next `count` `push_sqe`/`push_sqe128` calls fail.
+    ///
+    /// Each forced failure returns an error of the same kind (`Other`) as
+    /// the real "SQ still full after submit" path, increments the same
+    /// `SQE_SUBMIT_FAILURES` metric, and consumes one unit of `count`
+    /// before the real submission queue is touched. `push_sqe` routes
+    /// through `push_sqe128`, so every `submit_*` helper is covered.
+    /// `push_sqe_chain`'s multi-entry path (`push_multiple`) is not
+    /// affected.
+    #[cfg(test)]
+    fn force_push_failures(&mut self, count: usize) {
+        self.forced_push_failures = count;
+    }
+
+    /// The number of entries queued in the SQ and not yet submitted.
+    #[cfg(test)]
+    fn sq_len(&mut self) -> usize {
+        self.ring.submission().len()
+    }
+
+    unsafe fn push(&mut self, sqe: &Sqe) -> io::Result<()> {
+        unsafe { self.push_sqe128(sqe.encode()) }
+    }
+
+    unsafe fn push_pair(&mut self, first: &Sqe, second: &Sqe) -> io::Result<()> {
+        unsafe { self.push_sqe_pair(first.encode(), second.encode()) }
+    }
+
+    unsafe fn push_chain(&mut self, sqes: &[Sqe]) -> io::Result<()> {
+        // Convert to Entry128 for the Big SQ ring, reusing the scratch to
+        // avoid a per-chain heap allocation.
+        let mut entries128 = std::mem::take(&mut self.chain_scratch);
+        entries128.clear();
+        entries128.extend(sqes.iter().map(Sqe::encode));
+
+        // Ensure enough room in the SQ for the entire chain.
+        {
+            let sq = self.ring.submission();
+            if sq.capacity() - sq.len() < entries128.len() {
+                drop(sq);
+                self.ring.submit()?;
+                let sq = self.ring.submission();
+                if sq.capacity() - sq.len() < entries128.len() {
+                    entries128.clear();
+                    self.chain_scratch = entries128;
+                    return Err(io::Error::other("SQ too small for chain"));
+                }
+            }
+        }
+
+        // Atomic push of the entire chain.
+        let pushed = unsafe {
+            self.ring
+                .submission()
+                .push_multiple(&entries128)
+                .map_err(|_| io::Error::other("SQ full after flush for chain"))
+        };
+        // Return the scratch for reuse regardless of outcome.
+        entries128.clear();
+        self.chain_scratch = entries128;
+        pushed?;
+        Ok(())
+    }
+
+    /// Post a completion with `user_data` and `result` through the real
+    /// ring, by submitting a NOP with `IORING_NOP_INJECT_RESULT` (Linux
+    /// 6.6+). With `linked`, the next entry pushed is linked to it.
+    #[cfg(test)]
+    fn inject(&mut self, user_data: u64, result: i32, linked: bool) -> io::Result<()> {
+        let mut entry = opcode::Nop::new().build().user_data(user_data);
+        if linked {
+            entry = entry.flags(squeue::Flags::IO_LINK);
+        }
+        // The high-level Entry doesn't expose nop_flags or len fields.
+        // Use raw pointer arithmetic to patch the SQE in-place.
+        // SQE layout (64 bytes): opcode(1) flags(1) ioprio(2) fd(4) off(8) addr(8)
+        //                         len(4@24) rw_flags/nop_flags(4@28) user_data(8) ...
+        let ptr = &mut entry as *mut squeue::Entry as *mut u8;
+        unsafe {
+            // len is at byte offset 24 in the SQE
+            std::ptr::write_unaligned(ptr.add(24) as *mut u32, result as u32);
+            // nop_flags (union with rw_flags) is at byte offset 28
+            std::ptr::write_unaligned(ptr.add(28) as *mut u32, 1); // IORING_NOP_INJECT_RESULT
+        }
+        unsafe { self.push_entry(&entry) }
+    }
+}
+
+impl Sqe {
+    /// The 128-byte entry the ring's submission queue holds.
+    pub(crate) fn encode(&self) -> Entry128 {
+        let e: Entry128 = match self.op {
+            Op::UringCmd80 { fd, cmd_op, cmd } => {
+                let e = match fd {
+                    Fd::Fixed(i) => opcode::UringCmd80::new(Fixed(i), cmd_op).cmd(cmd).build(),
+                    Fd::Raw(f) => opcode::UringCmd80::new(types::Fd(f), cmd_op)
+                        .cmd(cmd)
+                        .build(),
+                };
+                e.user_data(self.user_data)
+            }
+            _ => self.encode64().into(),
+        };
+        match self.link {
+            Link::None => e,
+            Link::Soft => e.flags(Flags::IO_LINK),
+            Link::Hard => e.flags(Flags::IO_HARDLINK),
+        }
+    }
+
+    /// The 64-byte entry, without link flags. Panics on `UringCmd80`, which
+    /// needs [`Sqe::encode`].
+    pub(crate) fn encode64(&self) -> Entry {
+        macro_rules! on {
+            ($fd:expr, |$t:ident| $build:expr) => {
+                match $fd {
+                    Fd::Fixed(i) => {
+                        let $t = Fixed(i);
+                        $build
+                    }
+                    Fd::Raw(f) => {
+                        let $t = types::Fd(f);
+                        $build
+                    }
+                }
+            };
+        }
+        let e = match self.op {
+            Op::RecvMulti { fd, buf_group } => {
+                on!(fd, |t| opcode::RecvMulti::new(t, buf_group).build())
+            }
+            Op::RecvMsgMulti { fd, msg, buf_group } => {
+                on!(fd, |t| opcode::RecvMsgMulti::new(t, msg, buf_group).build())
+            }
+            Op::Recv { fd, buf, len } => on!(fd, |t| opcode::Recv::new(t, buf, len).build()),
+            Op::AcceptMulti { fd, flags } => {
+                on!(fd, |t| opcode::AcceptMulti::new(t).flags(flags).build())
+            }
+            Op::Send {
+                fd,
+                buf,
+                len,
+                flags,
+            } => {
+                on!(fd, |t| opcode::Send::new(t, buf, len).flags(flags).build())
+            }
+            Op::SendMsg { fd, msg, flags } => {
+                on!(fd, |t| opcode::SendMsg::new(t, msg).flags(flags).build())
+            }
+            Op::SendMsgZc { fd, msg } => on!(fd, |t| opcode::SendMsgZc::new(t, msg).build()),
+            Op::Writev {
+                fd,
+                iovecs,
+                count,
+                offset,
+            } => {
+                on!(fd, |t| opcode::Writev::new(t, iovecs, count)
+                    .offset(offset)
+                    .build())
+            }
+            Op::Read {
+                fd,
+                buf,
+                len,
+                offset,
+            } => {
+                on!(fd, |t| opcode::Read::new(t, buf, len)
+                    .offset(offset)
+                    .build())
+            }
+            Op::Write {
+                fd,
+                buf,
+                len,
+                offset,
+            } => {
+                on!(fd, |t| opcode::Write::new(t, buf, len)
+                    .offset(offset)
+                    .build())
+            }
+            Op::Fsync { fd } => on!(fd, |t| opcode::Fsync::new(t).build()),
+            Op::Close { fd } => match fd {
+                Fd::Fixed(i) => opcode::Close::new(Fixed(i)).build(),
+                Fd::Raw(f) => opcode::Close::new(types::Fd(f)).build(),
+            },
+            Op::Shutdown { fd, how } => on!(fd, |t| opcode::Shutdown::new(t, how).build()),
+            Op::CancelFdAll { fd } => match fd {
+                Fd::Fixed(i) => {
+                    opcode::AsyncCancel2::new(CancelBuilder::fd(Fixed(i)).all()).build()
+                }
+                Fd::Raw(f) => {
+                    opcode::AsyncCancel2::new(CancelBuilder::fd(types::Fd(f)).all()).build()
+                }
+            },
+            Op::Cancel { target } => opcode::AsyncCancel::new(target).build(),
+            Op::Connect { fd, addr, addrlen } => {
+                on!(fd, |t| opcode::Connect::new(t, addr, addrlen).build())
+            }
+            Op::Timeout { ts, abs } => {
+                // `abi::Timespec` is `struct __kernel_timespec`, as is the
+                // crate's type; a test pins the layouts together.
+                let ts = ts.cast::<types::Timespec>();
+                if abs {
+                    opcode::Timeout::new(ts).flags(TimeoutFlags::ABS).build()
+                } else {
+                    opcode::Timeout::new(ts).build()
+                }
+            }
+            Op::FixedFdInstall { index } => opcode::FixedFdInstall::new(Fixed(index), 0).build(),
+            Op::PollAdd { fd, mask } => on!(fd, |t| opcode::PollAdd::new(t, mask).build()),
+            Op::OpenAt {
+                path,
+                flags,
+                mode,
+                file_index,
+            } => {
+                let dest = DestinationSlot::try_from_slot_target(file_index)
+                    .expect("file_index validated by the caller");
+                opcode::OpenAt::new(types::Fd(libc::AT_FDCWD), path)
+                    .flags(flags)
+                    .mode(mode)
+                    .file_index(Some(dest))
+                    .build()
+            }
+            Op::Statx { path, buf } => {
+                opcode::Statx::new(types::Fd(libc::AT_FDCWD), path, buf as *mut types::statx)
+                    .flags(libc::AT_STATX_SYNC_AS_STAT)
+                    .mask(0x7ff) // STATX_BASIC_STATS
+                    .build()
+            }
+            Op::RenameAt { old, new } => opcode::RenameAt::new(
+                types::Fd(libc::AT_FDCWD),
+                old,
+                types::Fd(libc::AT_FDCWD),
+                new,
+            )
+            .build(),
+            Op::UnlinkAt { path, flags } => opcode::UnlinkAt::new(types::Fd(libc::AT_FDCWD), path)
+                .flags(flags)
+                .build(),
+            Op::MkDirAt { path, mode } => opcode::MkDirAt::new(types::Fd(libc::AT_FDCWD), path)
+                .mode(mode)
+                .build(),
+            Op::UringCmd80 { .. } => unreachable!("URING_CMD needs a 128-byte entry; use encode"),
+        };
+        e.user_data(self.user_data)
+    }
+}
+
+#[cfg(test)]
+mod encode_tests {
+    use super::*;
+    use crate::backend::uring::sqe::{Fd, Link, Op, Sqe};
+    use io_uring::squeue::Flags;
+
+    fn bytes(e: &Entry128) -> Vec<u8> {
+        let n = std::mem::size_of::<Entry128>();
+        unsafe { std::slice::from_raw_parts(e as *const Entry128 as *const u8, n).to_vec() }
+    }
+
+    /// Each operation encodes to the same bytes as the equivalent
+    /// `io_uring::opcode` builder chain: opcode, fields, flags and
+    /// user_data. Call sites' arguments are not covered here.
+    #[test]
+    fn every_op_encodes_like_its_opcode_builder() {
+        let ud = 0x0123_4567_89ab_cdef;
+        let p = 0x1000 as *mut u8;
+        let msg = 0x2000 as *const libc::msghdr;
+        let path = 0x3000 as *const libc::c_char;
+        let path2 = 0x3100 as *const libc::c_char;
+        let ts = 0x4000 as *const crate::backend::uring::abi::Timespec;
+        let iov = 0x5000 as *const libc::iovec;
+        let addr = 0x6000 as *const libc::sockaddr;
+        let stx = 0x7000 as *mut libc::statx;
+        let cmd = [7u8; 80];
+        let fx = Fixed(9);
+        let raw = types::Fd(11);
+        let e = |x: Entry| -> Entry128 { x.user_data(ud).into() };
+        let cases: Vec<(Sqe, Entry128)> = vec![
+            (
+                Sqe::new(
+                    Op::RecvMulti {
+                        fd: Fd::Fixed(9),
+                        buf_group: 3,
+                    },
+                    ud,
+                ),
+                e(opcode::RecvMulti::new(fx, 3).build()),
+            ),
+            (
+                Sqe::new(
+                    Op::RecvMsgMulti {
+                        fd: Fd::Fixed(9),
+                        msg,
+                        buf_group: 3,
+                    },
+                    ud,
+                ),
+                e(opcode::RecvMsgMulti::new(fx, msg, 3).build()),
+            ),
+            (
+                Sqe::new(
+                    Op::Recv {
+                        fd: Fd::Fixed(9),
+                        buf: p,
+                        len: 77,
+                    },
+                    ud,
+                ),
+                e(opcode::Recv::new(fx, p, 77).build()),
+            ),
+            (
+                Sqe::new(
+                    Op::AcceptMulti {
+                        fd: Fd::Raw(11),
+                        flags: libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+                    },
+                    ud,
+                ),
+                e(opcode::AcceptMulti::new(raw)
+                    .flags(libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC)
+                    .build()),
+            ),
+            (
+                Sqe::stream_send(9, p, 77, ud),
+                e(opcode::Send::new(fx, p, 77)
+                    .flags(crate::completion::STREAM_SEND_FLAGS)
+                    .build()),
+            ),
+            (
+                Sqe::new(
+                    Op::Send {
+                        fd: Fd::Raw(11),
+                        buf: p,
+                        len: 77,
+                        flags: 0,
+                    },
+                    ud,
+                ),
+                e(opcode::Send::new(raw, p, 77).build()),
+            ),
+            (
+                Sqe::new(
+                    Op::SendMsg {
+                        fd: Fd::Raw(11),
+                        msg,
+                        flags: crate::completion::STREAM_SEND_FLAGS as u32,
+                    },
+                    ud,
+                ),
+                e(opcode::SendMsg::new(raw, msg)
+                    .flags(crate::completion::STREAM_SEND_FLAGS as u32)
+                    .build()),
+            ),
+            (
+                Sqe::new(
+                    Op::SendMsg {
+                        fd: Fd::Fixed(9),
+                        msg,
+                        flags: 0,
+                    },
+                    ud,
+                ),
+                e(opcode::SendMsg::new(fx, msg).build()),
+            ),
+            (
+                Sqe::send_msg_zc(9, msg, ud),
+                e(opcode::SendMsgZc::new(fx, msg).build()),
+            ),
+            (
+                Sqe::new(
+                    Op::Writev {
+                        fd: Fd::Raw(11),
+                        iovecs: iov,
+                        count: 4,
+                        offset: 99,
+                    },
+                    ud,
+                ),
+                e(opcode::Writev::new(raw, iov, 4).offset(99).build()),
+            ),
+            (
+                Sqe::new(
+                    Op::Read {
+                        fd: Fd::Raw(11),
+                        buf: p,
+                        len: 8,
+                        offset: 0,
+                    },
+                    ud,
+                ),
+                e(opcode::Read::new(raw, p, 8).build()),
+            ),
+            (
+                Sqe::new(
+                    Op::Read {
+                        fd: Fd::Fixed(9),
+                        buf: p,
+                        len: 4096,
+                        offset: 8192,
+                    },
+                    ud,
+                ),
+                e(opcode::Read::new(fx, p, 4096).offset(8192).build()),
+            ),
+            (
+                Sqe::new(
+                    Op::Write {
+                        fd: Fd::Fixed(9),
+                        buf: p,
+                        len: 4096,
+                        offset: 8192,
+                    },
+                    ud,
+                ),
+                e(opcode::Write::new(fx, p, 4096).offset(8192).build()),
+            ),
+            (
+                Sqe::new(Op::Fsync { fd: Fd::Fixed(9) }, ud),
+                e(opcode::Fsync::new(fx).build()),
+            ),
+            (
+                Sqe::new(Op::Close { fd: Fd::Fixed(9) }, ud),
+                e(opcode::Close::new(fx).build()),
+            ),
+            (
+                Sqe::new(
+                    Op::Shutdown {
+                        fd: Fd::Fixed(9),
+                        how: libc::SHUT_RDWR,
+                    },
+                    ud,
+                ),
+                e(opcode::Shutdown::new(fx, libc::SHUT_RDWR).build()),
+            ),
+            (
+                Sqe::new(Op::CancelFdAll { fd: Fd::Fixed(9) }, ud),
+                e(opcode::AsyncCancel2::new(CancelBuilder::fd(fx).all()).build()),
+            ),
+            (
+                Sqe::new(Op::Cancel { target: 42 }, ud),
+                e(opcode::AsyncCancel::new(42).build()),
+            ),
+            (
+                Sqe::new(
+                    Op::Connect {
+                        fd: Fd::Fixed(9),
+                        addr,
+                        addrlen: 16,
+                    },
+                    ud,
+                ),
+                e(opcode::Connect::new(fx, addr, 16).build()),
+            ),
+            (
+                Sqe::new(Op::Timeout { ts, abs: false }, ud),
+                e(opcode::Timeout::new(ts.cast()).build()),
+            ),
+            (
+                Sqe::new(Op::Timeout { ts, abs: true }, ud),
+                e(opcode::Timeout::new(ts.cast())
+                    .flags(TimeoutFlags::ABS)
+                    .build()),
+            ),
+            (
+                Sqe::new(Op::FixedFdInstall { index: 9 }, ud),
+                e(opcode::FixedFdInstall::new(fx, 0).build()),
+            ),
+            (
+                Sqe::new(
+                    Op::PollAdd {
+                        fd: Fd::Fixed(9),
+                        mask: libc::POLLOUT as u32,
+                    },
+                    ud,
+                ),
+                e(opcode::PollAdd::new(fx, libc::POLLOUT as u32).build()),
+            ),
+            (
+                Sqe::new(
+                    Op::OpenAt {
+                        path,
+                        flags: libc::O_RDONLY,
+                        mode: 0o644,
+                        file_index: 5,
+                    },
+                    ud,
+                ),
+                e(opcode::OpenAt::new(types::Fd(libc::AT_FDCWD), path)
+                    .flags(libc::O_RDONLY)
+                    .mode(0o644)
+                    .file_index(Some(DestinationSlot::try_from_slot_target(5).unwrap()))
+                    .build()),
+            ),
+            (
+                Sqe::new(Op::Statx { path, buf: stx }, ud),
+                e(
+                    opcode::Statx::new(types::Fd(libc::AT_FDCWD), path, stx as *mut types::statx)
+                        .flags(libc::AT_STATX_SYNC_AS_STAT)
+                        .mask(0x7ff)
+                        .build(),
+                ),
+            ),
+            (
+                Sqe::new(
+                    Op::RenameAt {
+                        old: path,
+                        new: path2,
+                    },
+                    ud,
+                ),
+                e(opcode::RenameAt::new(
+                    types::Fd(libc::AT_FDCWD),
+                    path,
+                    types::Fd(libc::AT_FDCWD),
+                    path2,
+                )
+                .build()),
+            ),
+            (
+                Sqe::new(
+                    Op::UnlinkAt {
+                        path,
+                        flags: libc::AT_REMOVEDIR,
+                    },
+                    ud,
+                ),
+                e(opcode::UnlinkAt::new(types::Fd(libc::AT_FDCWD), path)
+                    .flags(libc::AT_REMOVEDIR)
+                    .build()),
+            ),
+            (
+                Sqe::new(Op::MkDirAt { path, mode: 0o755 }, ud),
+                e(opcode::MkDirAt::new(types::Fd(libc::AT_FDCWD), path)
+                    .mode(0o755)
+                    .build()),
+            ),
+            (
+                Sqe::new(
+                    Op::UringCmd80 {
+                        fd: Fd::Fixed(9),
+                        cmd_op: 0x42,
+                        cmd,
+                    },
+                    ud,
+                ),
+                opcode::UringCmd80::new(fx, 0x42)
+                    .cmd(cmd)
+                    .build()
+                    .user_data(ud),
+            ),
+        ];
+        for (i, (sqe, want)) in cases.iter().enumerate() {
+            assert_eq!(bytes(&sqe.encode()), bytes(want), "case {i}: {:?}", sqe.op);
+        }
+    }
+
+    /// `MAX_FILE_INDEX` is the largest slot the crate's `DestinationSlot`
+    /// accepts, which `encode` relies on after `submit_openat` checks it.
+    #[test]
+    fn max_file_index_is_the_largest_destination_slot() {
+        use crate::backend::uring::sqe::MAX_FILE_INDEX;
+        assert!(DestinationSlot::try_from_slot_target(MAX_FILE_INDEX).is_ok());
+        assert!(DestinationSlot::try_from_slot_target(MAX_FILE_INDEX + 1).is_err());
+    }
+
+    #[test]
+    fn links_set_the_link_flags() {
+        let base = Sqe::new(Op::Cancel { target: 1 }, 2);
+        let plain: Entry128 = opcode::AsyncCancel::new(1).build().user_data(2).into();
+        let cases = [
+            (Link::None, plain.clone()),
+            (Link::Soft, plain.clone().flags(Flags::IO_LINK)),
+            (Link::Hard, plain.flags(Flags::IO_HARDLINK)),
+        ];
+        for (link, want) in cases {
+            assert_eq!(bytes(&base.link(link).encode()), bytes(&want), "{link:?}");
+        }
+    }
+}
