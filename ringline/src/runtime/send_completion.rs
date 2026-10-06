@@ -1,4 +1,5 @@
-//! Per-worker admission queue for bounded (backpressured) sends.
+//! Per-worker admission queue and completion table for bounded
+//! (backpressured) sends.
 //!
 //! A bounded send (`ConnCtx::send_backpressured`, series PR 9) may only
 //! reserve copy-pool slots once it is the *oldest* waiter on the worker and
@@ -409,7 +410,6 @@ impl SendCompletions {
         };
         let old_head = self.waiting.front().copied();
 
-        let mut freed = Vec::new();
         for (index, slot) in self.slots.iter_mut().enumerate() {
             let Some(e) = slot.entry.as_mut() else {
                 continue;
@@ -435,14 +435,10 @@ impl SendCompletions {
                 Completion::Abandoned => false,
             };
             if !keep {
-                freed.push(SendId {
-                    index: index as u32,
-                    generation: slot.generation,
-                });
+                slot.entry = None;
+                slot.generation = slot.generation.wrapping_add(1);
+                self.free.push(index as u32);
             }
-        }
-        for id in freed {
-            self.remove(id);
         }
         // Every waiting entry this touched is now aborted or freed.
         let slots = &self.slots;

@@ -19,8 +19,8 @@ bounded send. Two awaited sends in flight at once on one connection share
 the waiter, so only one of them is woken.
 
 Bounded sends (`send_backpressured`) do not have this problem. Each one
-has a `BoundedSendId` that rides the resource its completion releases, and
-the completion settles exactly that operation. This design extends that
+has a `SendId` stored on the resource its completion releases, and the
+completion settles exactly that operation. This design extends that
 mechanism to every awaited send.
 
 ## The table
@@ -41,22 +41,22 @@ mechanism to every awaited send.
 | `Aborted(err)` | Teardown recorded this before the driver reported. A driver result overwrites it. |
 | `Abandoned` | The future was dropped while the operation was in flight. The driver's completion frees the slot. |
 
-Lookups are by index, so `complete`, `take_result`, `set_owner` and
-`cancel` are O(1). `remove_connection` scans the live slots once per
-connection teardown.
+Lookups are by index, so `complete`, `take_result`, `set_owner` and the
+cancel of an admitted operation are O(1); `mark_submitted` and the cancel
+of a waiting one search the FIFO. `remove_connection` scans every slot
+once per connection teardown.
 
-The state rules are the ones `send_capacity` already has for bounded
-sends, unchanged: a driver result wins over a teardown abort, the first
+The state rules are the ones bounded sends already have, unchanged: a driver result wins over a teardown abort, the first
 driver result wins over a second, and teardown drops the entries owned by
 the connection's own task (its future is gone and nothing can take them).
 
-The bounded-send FIFO (`SendCapacityQueue`) keeps only admission: the
-ordered list of waiting ids and the copy-pool slots each needs. The task
-to wake and the state live in the table.
+The bounded-send FIFO (`SendCompletions::waiting`) keeps only admission
+order: the ids of waiting operations. Their required slots, owner and
+state live in the table.
 
 ## What carries the id
 
-The id rides the resource whose completion ends the logical send,
+The id is stored on the resource whose completion ends the logical send,
 together with the length the send reports on success.
 
 | Send | Carrier |
@@ -114,12 +114,13 @@ Two awaited sends on one connection each resolve with their own result.
   `DriverCtx::mark_last_send_awaited`.
 - The `bounded_` prefix: `BoundedSendId` becomes `SendId`, and
   `take_bounded_send` / `set_bounded_send` / `bounded_send_completions`
-  become `take_send_id` / `set_send_id` / `send_completions`.
+  become `take_send_id` / `set_send_id` / `settled_sends`.
 
 ## Landing
 
-1. The table. `SendCompletions` replaces `SendCapacityQueue::submitted`,
-   and `BoundedSendId` becomes `SendId`. No behaviour change.
+1. The table. `SendCompletions` replaces `SendCapacityQueue`; waiting and
+   admitted operations both hold a slot, and `BoundedSendId` becomes
+   `SendId`. No behaviour change.
 2. Awaited sends. Every awaited API takes a `SendId`, every carrier
    carries one, and the per-connection send waiter is removed, on both
    backends. Fixes #617.

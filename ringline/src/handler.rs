@@ -821,7 +821,7 @@ impl<'a> DriverCtx<'a> {
     /// the same reason mio's driver owns a completion queue — so a
     /// synchronous settle goes onto `Driver::settled_sends` for the
     /// event loop to hand to `Executor::complete_send`. The queue
-    /// carries successes too despite its name: what unites its entries is
+    /// carries successes as well as failures: what unites its entries is
     /// that no CQE is coming for them.
     fn settled_sends_push(
         &mut self,

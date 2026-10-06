@@ -5426,8 +5426,8 @@ impl Future for BackpressuredSendFuture<'_> {
                     //
                     // This check belongs *only* here. Once an id exists it
                     // identifies the operation on its own — an id's slot
-                    // generation changes when the slot is freed, so it never
-                    // names another operation — and the queue is the
+                    // generation changes when the slot is freed, so it stops
+                    // matching once its operation is freed — and the queue is the
                     // authority on its outcome. Checking the generation in
                     // the other states would throw away the result teardown
                     // parked for this id, which on mio can be a real

@@ -669,9 +669,8 @@ pub(crate) struct Driver {
     /// `Executor::complete_send` (the event-loop half of series
     /// PR 7b) — the driver never touches the `Executor` itself.
     ///
-    /// Named for the common case, but the payload is an `io::Result` like
-    /// mio's `settled_sends`, because what unites these entries
-    /// is the missing completion rather than the failure: a zero-length
+    /// The payload is an `io::Result`, as in mio's `settled_sends`, because
+    /// what unites these entries is the missing completion, not a failure: a zero-length
     /// message (and a TLS one whose plaintext produced no record) queues no
     /// SQE at all and still has to resolve — with `Ok`, and with the same
     /// value mio reports for it.

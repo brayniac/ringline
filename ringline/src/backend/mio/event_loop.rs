@@ -1358,8 +1358,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             let mut delivered = false;
             // Bounded (`send_backpressured`) completions first. They are
             // keyed by id rather than by connection, so they bypass the
-            // dirty-list entirely; the executor's FIFO routes each result
-            // to the exact operation that produced it. Draining them here
+            // dirty-list entirely; the executor's completion table
+            // (`SendCompletions`) routes each result to the exact operation
+            // that produced it. Draining them here
             // (rather than after the per-connection pass) keeps them ahead
             // of `drain_pending_closes`, so a bounded send whose last byte
             // reached the socket is recorded `Ok` before

@@ -555,8 +555,9 @@ pub(crate) struct Executor {
     pub(crate) recv_errors: Vec<Option<(u32, stdio::Error)>>,
     /// Per-connection: task is awaiting send completion.
     pub(crate) send_waiters: Vec<bool>,
-    /// Worker-wide FIFO for bounded sends: who may reserve copy-pool slots
-    /// next, and the result of each admitted operation. Driven through the
+    /// Worker-wide table of bounded sends: the FIFO that decides who may
+    /// reserve copy-pool slots next, and the state and result of every
+    /// operation, waiting or admitted. Driven through the
     /// wrappers in [`send_completion`]; `remove_connection` resolves the
     /// entries of a torn-down connection (provisionally — see that module's
     /// docs on why a driver result still overwrites the abort).
