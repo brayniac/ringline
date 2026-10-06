@@ -1879,10 +1879,11 @@ fn udp_recv_ring_exhaustion_under_burst() {
 
 // ── Send to unreachable peer ───────────────────────────────────────────
 
-/// Handler that, on first recv, attempts to send to a peer that's
-/// guaranteed to have no listener (loopback :1). That send may fail
-/// async via ICMP, but the worker must keep running so subsequent
-/// real traffic still flows.
+/// Handler that, on first recv, sends to a peer that has no listener
+/// (loopback :1), then replies to the original peer. Linux drops ICMP
+/// errors for an unconnected UDP socket without `IP_RECVERR`, so the sends
+/// to the dead peer cannot fail through ICMP; the worker must keep running
+/// so later traffic still flows.
 struct UnreachableProbe {
     started: Arc<AtomicUsize>,
     follow_up_ok: Arc<AtomicUsize>,
@@ -1913,9 +1914,11 @@ impl AsyncEventHandler for UnreachableProbe {
             for _ in 0..5 {
                 let _ = udp.send_to(dead, b"to-the-void");
             }
-            // Wait for the kernel's async ICMP storm to settle.
+            // Give any ICMP replies time to arrive before the follow-up.
             let _ = ringline::sleep(Duration::from_millis(100)).await;
-            // Now reply to the original peer; this must succeed.
+            // Now reply to the original peer; this must succeed. No await
+            // between the send and the increment: the test reads the
+            // counter after shutdown, which drops a parked task.
             if udp.send_to(peer, b"alive").is_ok() {
                 follow_up_ok.fetch_add(1, Ordering::SeqCst);
             }
@@ -1950,16 +1953,19 @@ fn udp_send_to_unreachable_peer_does_not_kill_worker() {
     let (n, _src) = client.recv_from(&mut buf).unwrap();
     assert_eq!(&buf[..n], b"alive", "live peer must still receive its echo");
 
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+    // Read after the join: on mio the client can receive "alive" before the
+    // handler's increment runs (#394). The join orders that increment before
+    // this read because the handler does not await between `send_to` and
+    // `fetch_add`.
     let follow_up_ok = UNREACH_FOLLOWUP.get().unwrap().load(Ordering::SeqCst);
     assert_eq!(
         follow_up_ok, 1,
         "follow-up send to live peer must succeed after spamming a dead peer"
     );
-
-    shutdown.shutdown();
-    for h in handles {
-        h.join().unwrap().unwrap();
-    }
 }
 
 // ── Invalid bind address propagates an error ───────────────────────────
