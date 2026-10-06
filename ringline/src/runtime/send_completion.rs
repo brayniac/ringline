@@ -1049,12 +1049,15 @@ mod tests {
         let mut q = SendCompletions::new();
         let abandoned = q.register(A, task(1));
         q.cancel(abandoned);
-        let aborted = q.register(A, task(2));
-        q.remove_connection(A);
-
         q.forget(abandoned);
+        assert_eq!(q.live(), 0, "the abandoned entry is freed");
+
+        let aborted = q.register(A, task(2));
         q.forget(aborted);
-        assert_eq!(q.live(), 1, "only the aborted entry is left");
+        assert_eq!(q.live(), 1, "an in-flight entry is kept");
+        q.remove_connection(A);
+        q.forget(aborted);
+        assert_eq!(q.live(), 1, "an aborted entry is kept");
         assert_eq!(
             kind_of(q.take_result(aborted)),
             io::ErrorKind::ConnectionAborted
