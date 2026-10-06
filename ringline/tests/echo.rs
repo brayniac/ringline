@@ -7641,8 +7641,8 @@ fn dropping_a_forward_to_conn_future_cancels_the_relay() {
     // Connect, then wait until the handler has armed and dropped its forward
     // before sending any byte. Bytes already buffered when a forward is armed
     // are part of that forward and are queued on the sink immediately; the
-    // cancel can only stop what has not been read yet, which is the case worth
-    // asserting.
+    // cancel can stop only bytes not yet read, so the client sends after the
+    // forward is dropped.
     let mut stream = TcpStream::connect(&proxy_addr).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))

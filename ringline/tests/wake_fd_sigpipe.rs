@@ -65,8 +65,8 @@ impl AsyncEventHandler for Idle {
     }
 }
 
-/// Starts one blocking task that waits for `BLOCKING_RELEASED`, so it
-/// finishes after the worker has exited.
+/// Starts one blocking task that returns when the test sets
+/// `BLOCKING_RELEASED`, which it does after the worker has exited.
 struct SlowBlocking;
 
 impl AsyncEventHandler for SlowBlocking {
@@ -140,7 +140,7 @@ fn late_wakes_do_not_raise_sigpipe() {
     }
     assert!(
         !BLOCKING_FINISHED.load(Ordering::Acquire),
-        "the blocking task finished before the worker exited; the test proves nothing"
+        "the blocking task finished before the worker exited, so no wake reached an exited worker"
     );
     BLOCKING_RELEASED.store(true, Ordering::Release);
     wait_for(&BLOCKING_FINISHED, "blocking task never finished");

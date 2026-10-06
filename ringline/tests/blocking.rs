@@ -235,9 +235,12 @@ fn spawn_blocking_non_copy_type() {
 // ── A dropped handle releases the result ────────────────────────────
 
 static RESULTS_DROPPED: AtomicUsize = AtomicUsize::new(0);
-/// Set once the handler's future, and with it the blocking handle, has moved
-/// past the `timeout` or been dropped.
+/// Set by `MarkHandleDropped`: after the `timeout` statement, or when the
+/// `on_start` future is dropped.
 static HANDLE_DROPPED: AtomicBool = AtomicBool::new(false);
+/// Whether the `timeout` around the blocking handle expired. Checked by the
+/// test, since a panic inside the task would be contained.
+static HANDLE_TIMED_OUT: AtomicBool = AtomicBool::new(false);
 
 /// Sets `HANDLE_DROPPED` when dropped. Declared before the handle, so it drops
 /// after it on every path, including a future dropped at shutdown.
@@ -278,9 +281,10 @@ impl AsyncEventHandler for DropsHandleEarly {
             let timed_out = ringline::timeout(Duration::from_millis(20), handle)
                 .await
                 .is_err();
-            // The handle went with the `timeout` future.
+            // The `timeout` future, which owned the handle, was dropped at the
+            // end of the previous statement.
             drop(mark);
-            assert!(timed_out, "the closure finished before the timeout");
+            HANDLE_TIMED_OUT.store(timed_out, Ordering::Release);
         }))
     }
 
@@ -298,6 +302,7 @@ impl AsyncEventHandler for DropsHandleEarly {
 fn a_result_whose_handle_was_dropped_is_dropped_on_arrival() {
     RESULTS_DROPPED.store(0, Ordering::SeqCst);
     HANDLE_DROPPED.store(false, Ordering::Release);
+    HANDLE_TIMED_OUT.store(false, Ordering::Release);
     let (runtime, handles) = RinglineBuilder::new(test_config())
         .launch::<DropsHandleEarly>()
         .expect("launch failed");
@@ -313,5 +318,9 @@ fn a_result_whose_handle_was_dropped_is_dropped_on_arrival() {
     for h in handles {
         h.join().unwrap().unwrap();
     }
+    assert!(
+        HANDLE_TIMED_OUT.load(Ordering::Acquire),
+        "the closure finished before the timeout"
+    );
     assert_eq!(dropped, 1, "the worker held the result of a dropped handle");
 }

@@ -33,12 +33,12 @@ use ringline::{AsyncEventHandler, ConfigBuilder, Connection, ListenerId, Ringlin
 static WORKER_PARKED: AtomicBool = AtomicBool::new(false);
 static WORKER_RELEASED: AtomicBool = AtomicBool::new(false);
 
-/// How long a held worker waits for the test to release it before it carries
-/// on anyway, so a failed test does not leave a worker blocked forever.
+/// How long a held worker waits for the test to release it before it
+/// returns, so a failed test does not leave a worker blocked forever.
 const HOLD_LIMIT: Duration = Duration::from_secs(60);
 
 /// Sets its flag when dropped, so a test that fails before releasing a held
-/// worker still lets it go.
+/// worker still releases the worker.
 struct ReleaseOnDrop(&'static AtomicBool);
 
 impl Drop for ReleaseOnDrop {
@@ -55,8 +55,9 @@ fn wait_until(flag: &AtomicBool, limit: Duration) {
     }
 }
 
-/// The process's open sockets, by inode (`socket:[N]` link targets): fd
-/// numbers are reused, inodes are not.
+/// The process's open sockets, by inode (`socket:[N]` link targets). fd
+/// numbers are reused at once; socket inode numbers come from a counter and
+/// are not reused within a test.
 fn sockets() -> HashSet<String> {
     std::fs::read_dir("/proc/self/fd")
         .expect("read /proc/self/fd")
@@ -69,18 +70,19 @@ fn sockets() -> HashSet<String> {
 /// Waits up to 5 s until the process holds `n` sockets that are not in
 /// `before`. A connection made from this process adds its client socket, and
 /// its accepted socket while that sits in a worker's accept queue. Counting
-/// new sockets rather than a total keeps an unrelated socket closing
-/// meanwhile, such as an earlier test's listener, from hiding them.
+/// sockets absent from `before`, not a total, means a socket that closes
+/// during the wait does not offset a new one.
 fn wait_for_sockets(before: &HashSet<String>, n: usize) {
     let new = || sockets().difference(before).count();
     let deadline = Instant::now() + Duration::from_secs(5);
-    while new() < n && Instant::now() < deadline {
+    let mut got = new();
+    while got < n && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(1));
+        got = new();
     }
     assert!(
-        new() >= n,
-        "the connections were not all accepted: {} new sockets, want {n}",
-        new()
+        got >= n,
+        "the connections were not all accepted: {got} new sockets, want {n}"
     );
 }
 
@@ -231,8 +233,7 @@ static NOTIFY_RELEASED: AtomicBool = AtomicBool::new(false);
 
 /// Blocks the worker in `on_notify` once armed, until `NOTIFY_RELEASED`. On
 /// io_uring `on_notify` runs after the accept drain and before the eventfd
-/// read is re-armed, so
-/// connections queued meanwhile are never drained.
+/// read is re-armed, so connections queued meanwhile are never drained.
 #[cfg(has_io_uring)]
 struct NotifyBlocker;
 
@@ -328,7 +329,8 @@ impl AsyncEventHandler for ExitingWorker {
         if self.id == 1 {
             SERVED_BY_WORKER_1.fetch_add(1, Ordering::AcqRel);
         }
-        // Hold a served connection open, so only an unserved one reads EOF.
+        // Hold a served connection open on worker 1, so only worker 0's
+        // connections read EOF while the runtime is running.
         async {
             std::future::pending::<()>().await;
         }
@@ -353,6 +355,12 @@ impl AsyncEventHandler for ExitingWorker {
 /// Connections queued for a worker that exits while the runtime keeps running
 /// are closed when that worker exits, not when the runtime shuts down. The
 /// acceptor still holds a sender, so the channel is not freed until then.
+///
+/// On mio, worker 0 exits with its connections still queued, so this covers
+/// the drain at worker exit. On io_uring, worker 0 serves its queued
+/// connections before it checks for shutdown, so they close as served
+/// connections when it exits; the io_uring drain is covered by
+/// `connections_queued_after_the_last_drain_are_closed`.
 #[test]
 fn a_worker_that_exits_closes_its_queued_connections() {
     let _lock = FD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -373,9 +381,11 @@ fn a_worker_that_exits_closes_its_queued_connections() {
         "worker 0 never started"
     );
 
-    // Round robin: half go to the blocked worker 0, half to worker 1, one at a
-    // time starting with worker 0, so once worker 1 has served its half every
-    // one of worker 0's is queued. Worker 0 exits only after that.
+    // With the default `conn_chunk_size` of 1 and an accept queue far larger
+    // than `CLIENTS`, the acceptor sends the connections one at a time,
+    // alternating, starting with worker 0. When worker 1 has served its half,
+    // every connection for worker 0 has been sent to it. Worker 0 is released
+    // only then.
     let clients: Vec<TcpStream> = (0..CLIENTS)
         .map(|_| TcpStream::connect(addr).expect("connect"))
         .collect();
