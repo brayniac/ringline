@@ -4,7 +4,7 @@ use std::sync::atomic::Ordering;
 use std::task::Context;
 use std::time::Instant;
 
-use io_uring::cqueue;
+use crate::backend::uring::abi::cqueue;
 
 use crate::backend::Driver;
 use crate::backend::sockaddr_to_socket_addr;
@@ -912,14 +912,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
         self.driver.cqe_batch.clear();
 
-        {
-            let cq = self.driver.ring.ring.completion();
-            for cqe in cq {
-                self.driver
-                    .cqe_batch
-                    .push((cqe.user_data(), cqe.result(), cqe.flags()));
-            }
-        }
+        self.driver.ring.reap(&mut self.driver.cqe_batch);
 
         if let Some(interval) = self.driver.flush_interval {
             let mut last_flush = Instant::now();
@@ -2004,13 +1997,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.driver.pending_replenish.push(bid);
 
         // Parse the io_uring_recvmsg_out header to extract control data + payload.
-        let msg_out = match io_uring::types::RecvMsgOut::parse(buf, &self.driver.recvmsg_msghdr) {
-            Ok(out) => out,
-            Err(()) => {
-                // Parse failed — treat as regular data (shouldn't happen).
-                return;
-            }
-        };
+        let msg_out =
+            match crate::backend::uring::abi::RecvMsgOut::parse(buf, &self.driver.recvmsg_msghdr) {
+                Ok(out) => out,
+                Err(()) => {
+                    // Parse failed — treat as regular data (shouldn't happen).
+                    return;
+                }
+            };
 
         let payload = msg_out.payload_data();
         if payload.is_empty() {
@@ -4674,8 +4668,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // returned to the ring immediately. Otherwise the bid travels with the
         // queue entry and is replenished when the consumer reads it — that's
         // what makes the recv path zero-copy.
-        let parse_result =
-            io_uring::types::RecvMsgOut::parse(buf, &self.driver.udp_sockets[idx].recv_msghdr);
+        let parse_result = crate::backend::uring::abi::RecvMsgOut::parse(
+            buf,
+            &self.driver.udp_sockets[idx].recv_msghdr,
+        );
 
         let mut handed_to_queue = false;
         if let Ok(msg_out) = parse_result
@@ -13444,10 +13440,10 @@ mod tests {
         el.test_dispatch_cqe(close.raw(), 0, 0);
         let reused = accept_connection(&mut el);
         assert_eq!(reused, conn_index, "the slot is reused");
-        let before = el.driver.ring.ring.submission().len();
+        let before = el.driver.ring.sq_len();
         el.flush_replenish_and_rearm();
         assert_eq!(
-            el.driver.ring.ring.submission().len(),
+            el.driver.ring.sq_len(),
             before,
             "the new connection got a recv it did not ask for"
         );
@@ -15237,12 +15233,12 @@ mod tests {
 
         // Set up the timespec in the pool.
         el.executor.timer_pool.timespecs[slot as usize] =
-            io_uring::types::Timespec::new().sec(10).nsec(0);
+            crate::backend::uring::abi::Timespec::new().sec(10).nsec(0);
 
         let payload = TimerSlotPool::encode_payload(slot, generation);
         let timer_ud = UserData::encode(OpTag::Timer, 0, payload);
-        let ts_ptr =
-            &el.executor.timer_pool.timespecs[slot as usize] as *const io_uring::types::Timespec;
+        let ts_ptr = &el.executor.timer_pool.timespecs[slot as usize]
+            as *const crate::backend::uring::abi::Timespec;
 
         // Submit the real timeout SQE.
         el.driver
@@ -15291,12 +15287,12 @@ mod tests {
 
         // 1 nanosecond timeout — will fire almost immediately.
         el.executor.timer_pool.timespecs[slot as usize] =
-            io_uring::types::Timespec::new().sec(0).nsec(1);
+            crate::backend::uring::abi::Timespec::new().sec(0).nsec(1);
 
         let payload = TimerSlotPool::encode_payload(slot, generation);
         let timer_ud = UserData::encode(OpTag::Timer, 0, payload);
-        let ts_ptr =
-            &el.executor.timer_pool.timespecs[slot as usize] as *const io_uring::types::Timespec;
+        let ts_ptr = &el.executor.timer_pool.timespecs[slot as usize]
+            as *const crate::backend::uring::abi::Timespec;
 
         el.driver
             .ring

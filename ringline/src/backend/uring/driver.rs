@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
-use io_uring::cqueue;
+use crate::backend::uring::abi::cqueue;
 
 use crate::accumulator::AccumulatorTable;
 use crate::backend::ProvidedBufRing;
@@ -517,7 +517,7 @@ pub(crate) struct Driver {
     /// Pre-allocated sockaddr storage for outbound connect SQEs.
     pub(crate) connect_addrs: Vec<libc::sockaddr_storage>,
     /// Pre-allocated timespec storage for connect timeouts.
-    pub(crate) connect_timespecs: Vec<io_uring::types::Timespec>,
+    pub(crate) connect_timespecs: Vec<crate::backend::uring::abi::Timespec>,
     /// Pre-allocated batch buffer for draining CQEs.
     /// Tuple: (user_data, result, flags).
     pub(crate) cqe_batch: Vec<(u64, i32, u32)>,
@@ -630,7 +630,7 @@ pub(crate) struct Driver {
     pub(crate) udp_batch_recv_at: std::time::Instant,
     /// Tick timeout duration. When set, a timeout SQE ensures the event loop
     /// wakes periodically even when no I/O completions are pending.
-    pub(crate) tick_timeout_ts: Option<io_uring::types::Timespec>,
+    pub(crate) tick_timeout_ts: Option<crate::backend::uring::abi::Timespec>,
     /// Whether a tick timeout SQE is currently in-flight.
     pub(crate) tick_timeout_armed: bool,
     /// Monotonic tick counter for backoff-based retry scheduling.
@@ -1030,7 +1030,7 @@ impl Driver {
         let mut connect_timespecs = Vec::with_capacity(config.max_connections as usize);
         connect_timespecs.resize(
             config.max_connections as usize,
-            io_uring::types::Timespec::new(),
+            crate::backend::uring::abi::Timespec::new(),
         );
 
         let mut send_queues = Vec::with_capacity(config.max_connections as usize);
@@ -1170,7 +1170,7 @@ impl Driver {
             udp_batch_recv_at: std::time::Instant::now(),
             tick_timeout_ts: if config.tick_timeout_us > 0 {
                 Some(
-                    io_uring::types::Timespec::new()
+                    crate::backend::uring::abi::Timespec::new()
                         .sec(config.tick_timeout_us / 1_000_000)
                         .nsec((config.tick_timeout_us % 1_000_000) as u32 * 1000),
                 )
@@ -3428,7 +3428,7 @@ impl Driver {
         //    and the kernel has freed it. A peer that does not read keeps the
         //    data queued after the close, so such an entry holds the loop for
         //    its whole bound; the guards are then dropped with the driver.
-        let shutdown_ts = io_uring::types::Timespec::new().nsec(100_000_000); // 100ms
+        let shutdown_ts = crate::backend::uring::abi::Timespec::new().nsec(100_000_000); // 100ms
         for _ in 0..100 {
             if self.connections.active_count() == 0
                 && !self.send_slab.has_in_flight()
@@ -3444,13 +3444,7 @@ impl Driver {
             }
 
             self.cqe_batch.clear();
-            {
-                let cq = self.ring.ring.completion();
-                for cqe in cq {
-                    self.cqe_batch
-                        .push((cqe.user_data(), cqe.result(), cqe.flags()));
-                }
-            }
+            self.ring.reap(&mut self.cqe_batch);
 
             for i in 0..self.cqe_batch.len() {
                 let (user_data_raw, _, flags) = self.cqe_batch[i];

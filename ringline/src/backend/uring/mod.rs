@@ -1,3 +1,4 @@
+pub(crate) mod abi;
 #[cfg(test)]
 mod close_tests;
 pub(crate) mod driver;

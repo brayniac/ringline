@@ -277,7 +277,7 @@ pub struct DriverCtx<'a> {
     pub(crate) timestamps: bool,
     /// Pre-allocated timespec storage for connect timeouts (io_uring only).
     #[cfg(has_io_uring)]
-    pub(crate) connect_timespecs: &'a mut Vec<io_uring::types::Timespec>,
+    pub(crate) connect_timespecs: &'a mut Vec<crate::backend::uring::abi::Timespec>,
     /// Per-connection send chain tracking.
     pub(crate) chain_table: &'a mut crate::chain::SendChainTable,
     /// Maximum SQEs per chain (0 = disabled).
@@ -2644,7 +2644,7 @@ impl<'a> DriverCtx<'a> {
     #[cfg(has_io_uring)]
     pub(crate) fn arm_connect_timeout(&mut self, conn_index: u32, timeout_ms: u64) {
         let ts = &mut self.connect_timespecs[conn_index as usize];
-        *ts = io_uring::types::Timespec::new()
+        *ts = crate::backend::uring::abi::Timespec::new()
             .sec(timeout_ms / 1000)
             .nsec((timeout_ms % 1000) as u32 * 1_000_000);
 
