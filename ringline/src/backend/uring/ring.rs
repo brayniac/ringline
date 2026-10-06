@@ -1013,8 +1013,8 @@ impl Ring {
     /// `msghdr` is used as a *template* by the kernel to decide how to lay out
     /// each datagram inside the ring buffer it picks (name / control / payload
     /// regions). It must remain valid for as long as the multishot is armed.
-    /// Use [`crate::backend::uring::abi::RecvMsgOut::parse`] on the returned buffer to
-    /// extract the datagram.
+    /// Use [`crate::backend::uring::abi::RecvMsgOut::parse`] on the provided
+    /// buffer each completion selects to extract the datagram.
     pub fn submit_recvmsg_multishot(
         &mut self,
         fd_index: u32,
@@ -1233,8 +1233,7 @@ impl Ring {
         );
     }
 
-    /// Test-only: the number of entries queued in the SQ and not yet
-    /// submitted.
+    /// The number of entries queued in the SQ and not yet submitted.
     #[cfg(test)]
     pub(crate) fn sq_len(&mut self) -> usize {
         self.ring.submission().len()

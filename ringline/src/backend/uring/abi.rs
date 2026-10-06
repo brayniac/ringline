@@ -2,8 +2,8 @@
 //! timespec a TIMEOUT points at, the flags on a completion, and the layout
 //! of a multishot `recvmsg` buffer.
 //!
-//! The driver uses these instead of the `io_uring` crate's types, so only
-//! `ring.rs` and `sqe.rs` depend on that crate (#621).
+//! Outside `ring.rs` and `sqe.rs`, only tests use the `io_uring` crate;
+//! the tests here check these definitions against it.
 
 /// `struct __kernel_timespec`, which a TIMEOUT operation points at.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -90,7 +90,8 @@ impl<'buf> RecvMsgOut<'buf> {
     /// Fails when `buffer` is shorter than the header and the two fields.
     pub(crate) fn parse(buffer: &'buf [u8], msghdr: &libc::msghdr) -> Result<Self, ()> {
         let name_field_len = msghdr.msg_namelen as usize;
-        // `msg_controllen` is `usize` on glibc and `socklen_t` elsewhere.
+        // `msg_controllen` is `size_t` on glibc and Android, and `socklen_t`
+        // on musl and the BSDs (macOS included).
         #[allow(clippy::unnecessary_cast)]
         let control_field_len = msghdr.msg_controllen as usize;
         if Self::DATA_START
@@ -103,8 +104,9 @@ impl<'buf> RecvMsgOut<'buf> {
         // Safety: the length check above covers the header.
         let header = unsafe { buffer.as_ptr().cast::<RecvMsgHeader>().read_unaligned() };
 
-        // The header gives the full lengths; the data may have been
-        // truncated to the fields' sizes.
+        // The header gives the full lengths; the name and control data may
+        // have been truncated to their fields, and the payload to the rest of
+        // the buffer.
         let name_start = Self::DATA_START;
         let name_end = name_start + (header.namelen as usize).min(name_field_len);
         let control_start = name_start + name_field_len;
@@ -238,6 +240,11 @@ mod tests {
             buffer(&[1; 16], 28, &[2; 32], 64, b"p", 1, libc::MSG_CTRUNC as u32),
             // Payload longer than the buffer holds.
             buffer(b"", 0, b"", 0, b"abc", 4096, libc::MSG_TRUNC as u32),
+            // A name exactly filling its field is not truncated.
+            buffer(&[1; NAME_FIELD], NAME_FIELD as u32, b"", 0, b"p", 1, 0),
+            // Control data longer than its field, without MSG_CTRUNC:
+            // truncation is read from the flag.
+            buffer(b"", 0, &[2; CONTROL_FIELD], 64, b"p", 1, 0),
             // Empty payload.
             buffer(b"n", 1, b"", 0, b"", 0, 0),
             // Too short for the fields.
