@@ -5425,8 +5425,9 @@ impl Future for BackpressuredSendFuture<'_> {
                     // does: a recycled index is a different connection.
                     //
                     // This check belongs *only* here. Once an id exists it
-                    // identifies the operation on its own — ids are monotonic
-                    // per worker and never reused — and the queue is the
+                    // identifies the operation on its own — an id's slot
+                    // generation changes when the slot is freed, so it never
+                    // names another operation — and the queue is the
                     // authority on its outcome. Checking the generation in
                     // the other states would throw away the result teardown
                     // parked for this id, which on mio can be a real
@@ -5486,7 +5487,7 @@ impl Future for BackpressuredSendFuture<'_> {
                     // wakes owners by task id, and a stale owner on the head
                     // stalls the whole FIFO, not just this send.
                     executor.set_send_owner(id, task_id);
-                    // Teardown moves waiting entries to `submitted` with a
+                    // Teardown takes waiting entries out of the FIFO with a
                     // result, so consult the queue before asking for a turn.
                     if let Some(result) = executor.take_send_result(id) {
                         return this.finish(result);
