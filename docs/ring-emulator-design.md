@@ -32,9 +32,27 @@ What this buys:
   even be type-checked there.
 - The io_uring-only API (`send_chain`, segmented recv, `forward_to`,
   direct echo) becomes available everywhere.
+- The gaps the mio backend has today close: `ConnCtx::cancel`,
+  `connect_unix`, `ChildProcess::wait`, NVMe and merged accept are all
+  unsupported or ignored on mio, and all exist in the io_uring driver.
 - A test engine: the emulator can inject short sends, `ENOBUFS`,
   `EAGAIN`, reordered completions and late notifications on demand,
   which the kernel produces only under load.
+
+## Parity
+
+Every op the driver submits is emulated, and every public API works on
+every platform the emulator runs on. There is no "unsupported" outcome.
+Where a platform lacks the facility an op uses, the emulator uses that
+platform's equivalent and posts a completion of the same shape: the same
+result convention, flags and buffer contents the driver parses. The
+op-by-op table names the equivalent.
+
+Where the equivalent cannot carry everything the kernel op does, the
+difference is listed in that row. These are differences in what the
+platform can observe, not missing operations; for example, a macOS
+"NVMe" device backed by a file reports errors as errno rather than NVMe
+status codes.
 
 Non-goals:
 
@@ -165,13 +183,14 @@ The emulator follows the rules the driver relies on with `DEFER_TASKRUN`:
 ## Op-by-op
 
 Difficulty: **A** maps directly onto a syscall, **B** needs state in the
-emulator, **C** reproduces a kernel rule the driver depends on, **U**
-unsupported on the emulator.
+emulator, **C** reproduces a kernel rule the driver depends on. **P**
+marks a row that needs a platform equivalent off Linux; the equivalent is
+named in the row.
 
 | OpTag(s) | Opcode | Emulation | |
 |---|---|---|---|
 | RecvMulti | RECV multishot, buffer select | On readable: pop a buffer id, `read` into it, post `(res, F_BUFFER\|bid<<16\|F_MORE)`; repeat until `EAGAIN`. No buffer: post `-ENOBUFS` without `F_MORE` (the arm ends; the driver re-arms on replenish, Domain Invariant 6). EOF: post `0` without `F_MORE`. | C |
-| RecvMsgMultiTs, RecvMsgUdp | RECVMSG multishot | As RecvMulti, and write the `io_uring_recvmsg_out` header, name and control data into the buffer in the kernel's layout so `RecvMsgOut::parse` (or its replacement) reads it. Timestamps and GRO control messages are Linux-only. | C |
+| RecvMsgMultiTs, RecvMsgUdp | RECVMSG multishot | As RecvMulti, and write the `io_uring_recvmsg_out` header, name and control data into the buffer in the kernel's layout so `RecvMsgOut::parse` (or its replacement) reads it. On Linux the control data is what `recvmsg` returns (`SCM_TIMESTAMPING`, `UDP_GRO`). Off Linux: timestamps come from `SO_TIMESTAMP` and are written as a software `SCM_TIMESTAMPING` entry (there are no hardware timestamps); there is no GRO, so each completion carries one datagram and no segment-size control message, which the driver already reads as a single datagram. | C, P |
 | RecvUdp | RECV multishot | As RecvMulti on a UDP socket. | B |
 | RecvFallback | RECV one-shot into a pool slot | `read` when readable, one CQE. | A |
 | Send, TlsSend, SendRecvBuf, *Drain | SEND, `MSG_WAITALL` | `write` until all bytes are sent, waiting for writable in between; one CQE with the total, or the error. `MSG_WAITALL` means the kernel never reports a short count while the socket is open, so neither does the emulator. | B |
@@ -186,10 +205,10 @@ unsupported on the emulator.
 | EventFdRead | READ on the eventfd | The worker's wake fd (a pipe on macOS): post when readable. | A |
 | AcceptMulti | ACCEPT multishot | On readable, `accept` until `EAGAIN`, one CQE per fd with `F_MORE`. | B |
 | ParkInstall | FIXED_FD_INSTALL | `dup` the fixed slot's fd and post it. | A |
-| PidfdPoll | POLL_ADD on a pidfd | Linux only. Elsewhere `ChildProcess::wait` stays unsupported, as on mio today. | A / U |
-| SendMsgUdp, SendUdp | SENDMSG (with `UDP_SEGMENT`), SEND | `sendmsg`; GSO is Linux-only, so elsewhere the engine splits into one datagram per segment. | B |
-| Fs, DirectIo | OPENAT (direct install), READ, WRITE, FSYNC, STATX, RENAMEAT, UNLINKAT, MKDIRAT | The existing disk-I/O thread pool (`disk_io_pool.rs`) runs the call and posts the CQE through the engine. OPENAT installs into the emulated fixed-file table. STATX is filled from `statx` on Linux and `fstatat` elsewhere. | B |
-| NvmeCmd | URING_CMD (SQE128) | Not emulated: post `-EOPNOTSUPP`. NVMe already requires io_uring. | U |
+| PidfdPoll | POLL_ADD on a pidfd | On Linux, poll the pidfd for readable. Off Linux there are no pidfds: the engine registers `EVFILT_PROC` / `NOTE_EXIT` for the pid on its kqueue and posts the completion when the child exits. `ChildProcess::wait` then works as on Linux. | A, P |
+| SendMsgUdp, SendUdp | SENDMSG (with `UDP_SEGMENT`), SEND | `sendmsg`, with `UDP_SEGMENT` on Linux. Off Linux there is no GSO: the engine sends one datagram per segment and posts one completion with the total. | B, P |
+| Fs, DirectIo | OPENAT (direct install), READ, WRITE, FSYNC, STATX, RENAMEAT, UNLINKAT, MKDIRAT | The existing disk-I/O thread pool (`disk_io_pool.rs`) runs the call and posts the CQE through the engine. OPENAT installs into the emulated fixed-file table. Off Linux: STATX is filled from `fstatat` (fields `stat` lacks are left zero and unmarked in the mask), and direct I/O uses `F_NOCACHE` where Linux uses `O_DIRECT`. | B, P |
+| NvmeCmd | URING_CMD (SQE128) | The API is `open_nvme_device` plus three commands: read, write, flush. On Linux the disk-I/O pool runs the same command with the synchronous `NVME_IOCTL_IO64_CMD` ioctl on the same `/dev/ngXnY` device and posts its NVMe status word as the result, so `handle_nvme_cmd` is unchanged. Off Linux there is no NVMe passthrough for user processes: the "device" is a raw disk (`/dev/rdiskN`, root only) or a file, read becomes `pread` and write `pwrite` at LBA × block size, and flush becomes `fcntl(F_FULLFSYNC)`. Errors there are errno, not NVMe status codes, and `nsid` is ignored. | B, P |
 
 The fixed-file table is emulated as a slot → fd array. The driver's
 `register_files_update` calls go to the engine; on io_uring they register
@@ -209,7 +228,10 @@ Three layers:
    the `Engine` interface against real sockets and files and checks the
    CQEs: result, flags and buffer ids. On Linux the same tests run
    against `UringEngine` and `EmulatedEngine`, so the emulator is checked
-   against the kernel rather than against a description of it.
+   against the kernel rather than against a description of it. On macOS
+   they run against `EmulatedEngine` with the platform equivalents, and
+   assert the differences each **P** row lists, so a difference cannot
+   grow unnoticed.
 2. **The driver's unit tests.** The ~700 io_uring lib tests run on both
    engines. Tests that inject results through the real ring
    (`IORING_NOP_INJECT_RESULT`) need an engine-level injection hook; the
@@ -238,16 +260,20 @@ Each step is a separate PR and leaves both backends working.
    I/O; park.
 5. **macOS.** Build the io_uring driver on the emulator on macOS and run
    the full suite in CI.
-6. **Retire the mio backend** once the emulator passes everything the
+6. **Parity on macOS.** The **P** rows: timestamps, UDP without
+   GRO/GSO, process exit through kqueue, file-backed NVMe, `fstatat` and
+   `F_NOCACHE`. Every public API is available on every platform, and the
+   `#[cfg(has_io_uring)]` gates on public items are removed.
+7. **Retire the mio backend** once the emulator passes everything the
    mio backend passes. `force-mio` becomes the switch that selects the
    emulator on Linux.
 
 ## Questions for the owner
 
-1. **Retire the mio backend at step 6, or keep it?** Keeping it keeps
+1. **Retire the mio backend at step 7, or keep it?** Keeping it keeps
    two drivers, which is the cost this design removes. Retiring it means
    the emulator carries macOS alone.
-2. **Engine choice at launch.** Should step 6 also let a Linux build fall
+2. **Engine choice at launch.** Should step 7 also let a Linux build fall
    back to the emulator when `io_uring_setup` is refused (RHEL 10 ships
    `io_uring_disabled = 2`), instead of requiring a `force-mio` build?
 3. **Emulated recv copies twice** (socket → provided buffer →
