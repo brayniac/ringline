@@ -1,0 +1,17 @@
+# Standalone benchmark for docs/recv-into-accumulator-design.md: compares TCP
+# receive strategies directly on io_uring. Not a workspace member.
+[package]
+name = "recv-strategies"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+io-uring = "=0.7.12"
+libc = "=0.2.186"
+mio = { version = "=1.2.1", features = ["net", "os-poll"] }
+
+[profile.release]
+debug = 1
