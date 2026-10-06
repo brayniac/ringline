@@ -396,9 +396,12 @@ Each step is a separate PR. Steps 1–6 keep both backends working.
 - Emulated recv copies as many times as the mio backend does today:
   socket → provided buffer → accumulator on the emulator, socket → 8 KiB
   scratch buffer → accumulator on mio.
-- kTLS is designed (`docs/ktls-design.md`) but not implemented. It
-  builds on the `tls-unbuffered` engine and adds no ring op in that
-  design, so the emulator does not need to know about it.
+- kTLS is designed (`docs/ktls-design.md`) but not implemented. Its
+  design sends plaintext with `IORING_OP_SEND` without `MSG_WAITALL`, so
+  the emulator's Send follows the flag: with `MSG_WAITALL` it writes
+  until done, and without it posts what one `write` took. The kernel TLS
+  socket itself is a platform facility the emulator cannot provide off
+  Linux; parity there needs the userspace TLS path, as today.
 
 ## Found while surveying
 
