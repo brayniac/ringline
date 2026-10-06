@@ -482,8 +482,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.driver.tcp_streams[idx] = Some(mio_stream);
             self.driver.accumulators.reset(conn_index);
             // Defensive: a freshly allocated slot should have an empty send
-            // queue, but if anything survived, its bounded entries must be
-            // failed and their permits returned rather than dropped.
+            // queue, but if anything survived, its awaited sends must be
+            // failed and its permits returned rather than dropped.
             self.driver.clear_pending_sends(idx, || {
                 io::Error::new(
                     io::ErrorKind::ConnectionAborted,
@@ -1107,13 +1107,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// error was swallowed — the queue was retried every loop iteration
     /// forever while send().await had already reported success.
     fn fail_connection_on_send_error(&mut self, conn_index: u32, e: io::Error) {
-        // Every queued bounded send fails with the same error the write
-        // produced (cloned per id — `io::Error` is not `Clone`), and gives
-        // its copy-pool permit back.
+        // Every queued awaited send fails with the same error the write
+        // produced (cloned per id — `io::Error` is not `Clone`), and every
+        // bounded one gives its copy-pool permit back.
         self.driver.clear_pending_sends(conn_index as usize, || {
             crate::backend::mio::driver::clone_io_error(&e)
         });
-        self.executor.wake_send(conn_index, Err(e));
         self.executor.wake_recv(conn_index);
         self.driver.close_connection(conn_index);
     }
@@ -1339,16 +1338,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
     }
 
-    /// Drain the driver's send completions and re-poll the tasks they woke.
+    /// Drain the driver's settled sends and re-poll the tasks they woke.
     ///
-    /// Two queues, in this order: the worker-wide bounded-send queue
-    /// (`Driver::settled_sends`, routed by id through
-    /// `Executor::complete_send`), then the per-connection
-    /// `send_completions` queues, calling wake_send for each so that each
-    /// SendFuture resolves. The per-connection pass visits only connections
-    /// marked dirty at completion-push time; a connection with results left
-    /// over (single waiter slot, or no waiter yet) is re-marked for the next
-    /// pass.
+    /// `Driver::settled_sends` is keyed by id rather than by connection;
+    /// `Executor::complete_send` routes each result to the operation that
+    /// produced it. Draining here keeps the results ahead of
+    /// `drain_pending_closes`, so a send whose last byte reached the socket
+    /// is recorded `Ok` before `Executor::remove_connection` would resolve
+    /// it as `ConnectionAborted`.
     ///
     /// Returned copy-pool permits are *not* signalled here: the driver sets
     /// `capacity_released` wherever a permit goes back, and the run loop
@@ -1356,42 +1353,15 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     fn drain_send_completions(&mut self) {
         loop {
             let mut delivered = false;
-            // Bounded (`send_backpressured`) completions first. They are
-            // keyed by id rather than by connection, so they bypass the
-            // dirty-list entirely; the executor's completion table
-            // (`SendCompletions`) routes each result to the exact operation
-            // that produced it. Draining them here
-            // (rather than after the per-connection pass) keeps them ahead
-            // of `drain_pending_closes`, so a bounded send whose last byte
-            // reached the socket is recorded `Ok` before
-            // `Executor::remove_connection` would resolve it as
-            // `ConnectionAborted`.
             while let Some((id, result)) = self.driver.settled_sends.pop_front() {
                 self.executor.complete_send(id, result);
                 delivered = true;
-            }
-            let dirty = std::mem::take(&mut self.driver.completions_dirty);
-            for conn_index in dirty {
-                let idx = conn_index as usize;
-                self.driver.completions_dirty_flag[idx] = false;
-                if let Some(bytes) = self.driver.send_completions[idx].pop_front()
-                    && self.executor.send_waiters[idx]
-                {
-                    self.executor.wake_send(conn_index, Ok(bytes));
-                    delivered = true;
-                }
-                if !self.driver.send_completions[idx].is_empty()
-                    && !self.driver.completions_dirty_flag[idx]
-                {
-                    self.driver.completions_dirty_flag[idx] = true;
-                    self.driver.completions_dirty.push(conn_index);
-                }
             }
             if !delivered {
                 break;
             }
             // Re-poll tasks woken by the completions so they can consume
-            // the results and potentially re-register waiters.
+            // the results and potentially submit more sends.
             self.executor.collect_wakeups();
             self.poll_ready_tasks();
         }

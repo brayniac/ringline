@@ -295,6 +295,9 @@ struct TlsBigSendHandler;
 
 const BIG_SEND_SIZE: usize = 150 * 1024;
 
+/// What `TlsBigSendHandler`'s awaited send resolved with.
+static BIG_SEND_RESULT: std::sync::Mutex<Option<usize>> = std::sync::Mutex::new(None);
+
 fn big_send_payload() -> Vec<u8> {
     (0..BIG_SEND_SIZE)
         .map(|i| (i as u32).wrapping_mul(2246822519) as u8)
@@ -312,10 +315,12 @@ impl AsyncEventHandler for TlsBigSendHandler {
                 return;
             }
             let payload = big_send_payload();
-            conn.send(&payload)
+            let sent = conn
+                .send(&payload)
                 .expect("large TLS send submit failed")
                 .await
                 .expect("large TLS send failed");
+            *BIG_SEND_RESULT.lock().unwrap() = Some(sent as usize);
         }
     }
 
@@ -370,6 +375,13 @@ fn tls_single_send_larger_than_rustls_buffer() {
     for h in handles {
         h.join().unwrap().unwrap();
     }
+    // The awaited send reports the plaintext it was handed, not the
+    // ciphertext of its records.
+    assert_eq!(
+        BIG_SEND_RESULT.lock().unwrap().take(),
+        Some(BIG_SEND_SIZE),
+        "the TLS send resolved with a length other than the caller's"
+    );
 }
 
 #[test]

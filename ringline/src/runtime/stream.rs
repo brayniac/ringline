@@ -18,8 +18,9 @@
 //!
 //! ringline does not use [`std::task::Waker`]. The `Context` argument to each
 //! `poll_*` method is ignored. Wakeups are driven by the internal waiter-flag
-//! system (`recv_waiters` / `send_waiters`), which is set inside `poll_read` /
-//! `poll_write` before returning `Poll::Pending`.
+//! system (`recv_waiters`), which is set inside `poll_read` before returning
+//! `Poll::Pending`. `poll_write` copies into the send pool with `send_nowait`
+//! and does not wait for the send to complete.
 
 use bytes::{Buf, Bytes};
 use futures_io::{AsyncBufRead, AsyncRead, AsyncWrite};

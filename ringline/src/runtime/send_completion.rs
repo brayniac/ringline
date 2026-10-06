@@ -220,6 +220,21 @@ impl SendCompletions {
         id
     }
 
+    /// Register an awaited send that needs no admission, already `InFlight`,
+    /// and return its id.
+    ///
+    /// Called by the awaiting send APIs (`ConnCtx::send`,
+    /// `submit_batch_await`, `send_chain`, `forward_held`) before they
+    /// submit. A submission that fails must [`cancel`](Self::cancel) the id
+    /// it registered.
+    pub(crate) fn register(&mut self, conn_index: u32, task_id: u32) -> SendId {
+        self.insert(Entry {
+            conn_index,
+            task_id,
+            state: Completion::InFlight,
+        })
+    }
+
     /// Record the task that currently owns `id`, whether it is waiting or
     /// submitted. A no-op for an unknown id.
     ///
@@ -539,6 +554,13 @@ impl Executor {
     ) -> SendId {
         self.send_completions
             .enqueue(conn_index, generation, required_slots, task_id)
+    }
+
+    /// [`SendCompletions::register`], owned by the polling task. The
+    /// awaiting send APIs, before they submit.
+    pub(crate) fn register_send(&mut self, conn_index: u32) -> SendId {
+        let task_id = super::CURRENT_TASK_ID.with(|c| c.get());
+        self.send_completions.register(conn_index, task_id)
     }
 
     /// [`SendCompletions::set_owner`]. PR 9, every later poll.

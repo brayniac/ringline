@@ -660,14 +660,13 @@ pub(crate) struct Driver {
     /// full after submit): (conn_index, generation, attempts). Drained each
     /// tick by `drain_send_retries`; the entry stays at the queue head with
     /// `in_flight = true` meanwhile, so stream order and the close deferral
-    /// are preserved. Two failed attempts fail the send waiter and close the
+    /// are preserved. Two failed attempts fail the queued sends and close the
     /// connection, mirroring `pending_copy_retries`.
     pub(crate) pending_send_retries: Vec<(u32, u32, u8)>,
-    /// Bounded (`ConnCtx::send_backpressured`) operations that no CQE will
-    /// ever settle, in settle order and keyed by the id the submitting
-    /// future holds. Drained by the event loop into
-    /// `Executor::complete_send` (the event-loop half of series
-    /// PR 7b) — the driver never touches the `Executor` itself.
+    /// Awaited sends that no CQE will ever settle, in settle order and keyed
+    /// by the id the submitting future holds. Drained by the event loop into
+    /// `Executor::complete_send`; the driver never touches the `Executor`
+    /// itself.
     ///
     /// The payload is an `io::Result`, as in mio's `settled_sends`, because
     /// what unites these entries is the missing completion, not a failure: a zero-length
@@ -676,7 +675,8 @@ pub(crate) struct Driver {
     /// value mio reports for it.
     ///
     /// Two producers, and both exist because there is no CQE behind them.
-    /// `DriverCtx::send_bounded` settles here when it finishes an operation
+    /// `DriverCtx::send_awaited`, `SendBuilder::submit_awaited` and
+    /// `DriverCtx::send_bounded` settle here when they finish a send
     /// synchronously, for the same reason mio has a completion queue at all:
     /// a `DriverCtx` is a borrow of driver fields with no executor access.
     /// Teardown (`release_queued_sends`, via `drain_conn_send_queue`,
@@ -1329,7 +1329,7 @@ impl Driver {
         // Queued-but-unsubmitted sends from the previous occupant hold
         // pool/slab resources; no SQE was submitted for them, so no CQE
         // will release them — do it here.
-        let bounded = Self::release_queued_sends(
+        let settles = Self::release_queued_sends(
             &mut state.queue,
             &mut self.send_slab,
             &mut self.send_copy_pool,
@@ -1343,7 +1343,6 @@ impl Driver {
         // reactivated with a Shutdown still outstanding. If the gate ever leaks,
         // the next occupant must not inherit the block.
         state.shutdown_inflight = false;
-        state.acked_bytes = 0;
         state.close_notify_deadline = None;
         if let Some(pos) = self
             .close_notify_armed
@@ -1352,10 +1351,10 @@ impl Driver {
         {
             self.close_notify_armed.swap_remove(pos);
         }
-        // A previous occupant's bounded send can still be sitting in the
+        // A previous occupant's awaited send can still be sitting in the
         // queue here (its close abandoned the drain); the new occupant must
         // not inherit it, and its caller is still waiting.
-        self.fail_send_ids(bounded);
+        self.fail_send_ids(settles);
     }
 
     /// Reset segmented-recv delivery state for a (re)activated connection slot.
@@ -2346,7 +2345,7 @@ impl Driver {
     /// occupant is protected by `reset_send_state` at reactivation.
     pub(crate) fn force_finalize_close(&mut self, conn_index: u32) {
         let state = &mut self.send_queues[conn_index as usize];
-        let bounded = Self::release_queued_sends(
+        let settles = Self::release_queued_sends(
             &mut state.queue,
             &mut self.send_slab,
             &mut self.send_copy_pool,
@@ -2357,8 +2356,10 @@ impl Driver {
         if let Some(cs) = self.connections.get_mut(conn_index) {
             cs.write = WriteHalf::Open;
         }
-        self.fail_send_ids(bounded);
-        self.chain_table.cancel(conn_index);
+        self.fail_send_ids(settles);
+        if let Some(id) = self.chain_table.cancel(conn_index) {
+            self.fail_send_ids(vec![id]);
+        }
         self.try_finalize_close(conn_index);
     }
 
@@ -2437,8 +2438,8 @@ impl Driver {
             |b: &crate::handler::BuiltSend| b.pool_slot != u16::MAX && b.slab_idx == u16::MAX;
         // Coalesce at most one logical send's tail per op: stop the run after
         // the first chunk marked end-of-send. Otherwise a single coalesced
-        // completion could span two independent pipelined sends, and only one
-        // of their two waiters would ever be woken.
+        // completion could span two independent pipelined sends, while the
+        // slab entry carries only one send's id.
         let n = {
             let mut n = 0;
             while n < MAX_IOVECS {
@@ -2476,11 +2477,8 @@ impl Driver {
                 };
                 total += len;
             }
-            // The coalesced op carries the final chunk of a logical send only
-            // if its last gathered chunk does; the completion handler wakes the
-            // waiter on that.
-            let end_of_send = self.send_copy_pool.is_end_of_send(pool_slots[n - 1]);
-            // ...and, for the same reason, the bounded send it settles. The
+            // The run's last slot carries the send it settles, if any (only
+            // an end-of-send slot does). The
             // coalesced completion releases every pool slot in the run, so
             // the id cannot stay on the slot that carried it here; it moves
             // onto the slab entry, which outlives them. Taken, not peeked:
@@ -2498,7 +2496,6 @@ impl Driver {
                 &iovecs[..n],
                 &pool_slots[..n],
                 total,
-                end_of_send,
                 send_id,
             ) {
                 match self
@@ -2521,7 +2518,7 @@ impl Driver {
                         // Release just the slab entry and park: the run stays
                         // queued in order, `in_flight` stays true, and
                         // `drain_send_retries` re-pushes next iteration.
-                        // The lifted bounded-send id goes back on its slot
+                        // The lifted send id goes back on its slot
                         // for the same reason — the retry re-lifts it, and
                         // if teardown gets there first the slot is what
                         // teardown reads.
@@ -2827,7 +2824,7 @@ impl Driver {
     /// Drain and release all queued sends for a connection.
     pub(crate) fn drain_conn_send_queue(&mut self, conn_index: u32) {
         let state = &mut self.send_queues[conn_index as usize];
-        let bounded = Self::release_queued_sends(
+        let settles = Self::release_queued_sends(
             &mut state.queue,
             &mut self.send_slab,
             &mut self.send_copy_pool,
@@ -2837,14 +2834,13 @@ impl Driver {
         state.parked = false;
         // Abandon any partially-accumulated logical send so the next one
         // starts from zero.
-        state.acked_bytes = 0;
-        self.fail_send_ids(bounded);
+        self.fail_send_ids(settles);
         // The queue is now empty and nothing is in flight — fire a deferred
         // close if one was pending so the connection can't leak.
         self.try_finalize_close(conn_index);
     }
 
-    /// Release all entries from a send queue, returning the bounded sends
+    /// Release all entries from a send queue, returning the awaited sends
     /// they were carrying.
     ///
     /// A queued `SendRecvBuf` entry (recv-buffer forward / direct echo) owns
@@ -2854,10 +2850,10 @@ impl Driver {
     /// completion handler would have done.
     ///
     /// A queued entry was never submitted, so nothing will ever complete it:
-    /// if its pool slot carries a bounded send
-    /// (`ConnCtx::send_backpressured`), that operation has to be failed or
-    /// its caller's future hangs — and `SendCopyPool::release` debug-asserts
-    /// rather than let the id be dropped silently. The ids are *returned*
+    /// if its pool slot or slab entry carries an awaited send, that send has
+    /// to be failed or its caller's future hangs — and
+    /// `SendCopyPool::release` debug-asserts rather than let the id be
+    /// dropped silently. The ids are *returned*
     /// instead of pushed, so the three callers can put them on
     /// `Driver::settled_sends` themselves: every caller already
     /// holds `&mut self` while this takes four disjoint field borrows, and
@@ -2866,17 +2862,17 @@ impl Driver {
     /// least visibility. `#[must_use]` is what keeps a caller from quietly
     /// dropping them.
     ///
-    /// The returned `Vec` does not allocate unless a bounded send was
+    /// The returned `Vec` does not allocate unless an awaited send was
     /// actually queued, so the common teardown (and `reset_send_state`, run
     /// on every slot reactivation) pays nothing.
-    #[must_use = "queued bounded sends must be failed onto Driver::settled_sends"]
+    #[must_use = "queued awaited sends must be failed onto Driver::settled_sends"]
     pub(crate) fn release_queued_sends(
         queue: &mut VecDeque<BuiltSend>,
         send_slab: &mut InFlightSendSlab,
         send_copy_pool: &mut SendCopyPool,
         pending_replenish: &mut Vec<u16>,
     ) -> Vec<SendId> {
-        let mut bounded = Vec::new();
+        let mut ids = Vec::new();
         for built in queue.drain(..) {
             if built.pool_slot == u16::MAX && built.slab_idx == u16::MAX {
                 let ud = crate::completion::UserData(built.entry.get_user_data());
@@ -2885,16 +2881,20 @@ impl Driver {
                 }
                 continue;
             }
-            // Take before releasing: `release` asserts the slot is clean.
-            // Only a pool-slot entry can carry an id — a slab-backed queued
-            // entry is a ZC or recv-forward send, which a bounded send
-            // cannot be (`send_backpressured` is copy-only), and a coalesced
-            // slab entry is never queued (it is built at submit time and the
-            // run it covers is popped on success).
+            // Take before releasing: `release` asserts the slot is clean,
+            // and the slab clears its id silently. A queued slab entry is an
+            // awaited zero-copy batch; a pool slot is any other awaited send.
+            // (A coalesced slab entry is never queued: it is built at submit
+            // time and the run it covers is popped on success.)
+            if built.slab_idx != u16::MAX
+                && let Some((id, _len)) = send_slab.take_send_id(built.slab_idx)
+            {
+                ids.push(id);
+            }
             if built.pool_slot != u16::MAX
                 && let Some((id, _logical_len)) = send_copy_pool.take_send_id(built.pool_slot)
             {
-                bounded.push(id);
+                ids.push(id);
             }
             Self::release_built_resources(
                 send_slab,
@@ -2903,17 +2903,17 @@ impl Driver {
                 built.slab_idx,
             );
         }
-        bounded
+        ids
     }
 
-    /// Record every id in `bounded` as an aborted bounded send, and note
-    /// that the slots they were holding went back to the pool.
+    /// Record every send in `ids` as aborted, and note that the slots they
+    /// were holding went back to the pool.
     ///
     /// The tail of each `release_queued_sends` call site. `ConnectionAborted`
-    /// is the failure every teardown reports: the send was admitted, never
+    /// is the failure every teardown reports: the send was accepted, never
     /// reached the wire, and its connection is going away.
-    fn fail_send_ids(&mut self, bounded: Vec<SendId>) {
-        for id in bounded {
+    fn fail_send_ids(&mut self, ids: Vec<SendId>) {
+        for id in ids {
             self.settled_sends.push_back((
                 id,
                 Err(io::Error::new(
@@ -3315,12 +3315,12 @@ impl Driver {
     }
 
     /// At shutdown, release a coalesced copy send's slab entry and its pool
-    /// slots, settling any bounded send it carries as aborted.
+    /// slots, settling any awaited send it carries as aborted.
     fn release_coalesced_at_shutdown(&mut self, slab_idx: u16) {
         if !self.send_slab.in_use(slab_idx) {
             return;
         }
-        if let Some((id, _logical_len)) = self.send_slab.take_coalesced_send_id(slab_idx) {
+        if let Some((id, _logical_len)) = self.send_slab.take_send_id(slab_idx) {
             self.settled_sends.push_back((
                 id,
                 Err(io::Error::new(
@@ -3469,7 +3469,7 @@ impl Driver {
                         // carry the truncated generation / is_tls flag).
                         let pool_slot = ud.payload() as u16;
                         if self.send_copy_pool.in_use(pool_slot) {
-                            // These are the three tags a bounded send's
+                            // These are the three tags an awaited send's
                             // end-of-send slot can wear, so take the id
                             // before releasing — `release` debug-asserts on
                             // a slot that still names a live operation. The
