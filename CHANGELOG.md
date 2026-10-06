@@ -299,6 +299,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- On io_uring, `ConnCtx::run_direct_echo` dropped the bytes it had received
+  just before the peer's FIN: the FIN closed the connection, returning the
+  buffers still waiting to be echoed to the ring unsent, and the direct-echo
+  future then resolved. The connection now stays open until those bytes
+  have been submitted, then closes once the last send completes (#604).
+
 - On io_uring, a send that filled the socket of a peer that had half-closed
   (sent its FIN) and was not reading made the worker's event loop spin until
   the peer read or the connection closed, slowing every connection on that

@@ -959,7 +959,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// because more arrived during the flush — and drops off once it drains
     /// (including when `close_connection` drains it). That means no completion
     /// handler has to remember to re-arm the connection: the next drain's pass
-    /// finds it still queued.
+    /// finds it still queued. When the hold of a connection whose read side
+    /// has finished drains, it wakes the direct-echo future and requests the
+    /// close.
     fn flush_direct_echoes(&mut self) {
         if self.driver.direct_echo_pending.is_empty() {
             return;
@@ -982,6 +984,21 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             {
                 self.driver.direct_echo_queued[conn_index as usize] = false;
                 self.driver.direct_echo_pending.swap_remove(i);
+                // The read side has finished and the hold is empty, because
+                // every held byte was submitted or a close drained them. Wake
+                // the direct-echo future, which the FIN branch did not wake
+                // while bytes were held, and request the close, which waits
+                // for the last send (#604). An already-closing connection
+                // ignores the second request.
+                if self
+                    .driver
+                    .connections
+                    .get(conn_index)
+                    .is_some_and(|c| c.direct_echo && c.recv_finished())
+                {
+                    self.executor.wake_recv(conn_index);
+                    self.driver.close_connection(conn_index);
+                }
             } else {
                 i += 1;
             }
@@ -1437,6 +1454,21 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 if let Some(cs) = self.driver.connections.get_mut(conn_index) {
                     cs.note_eof(close_notify_seen == Some(false));
                 }
+                // A direct-echo connection may still hold bytes received
+                // before the FIN that the flush pass has not echoed yet.
+                // Closing now would drop them (#604): leave the connection
+                // open, and let `flush_direct_echoes` wake its future once
+                // the hold has drained. The flush pass then requests the
+                // close, which waits for the last send (`try_finalize_close`).
+                let echo_pending = self
+                    .driver
+                    .connections
+                    .get(conn_index)
+                    .is_some_and(|c| c.direct_echo)
+                    && !self.driver.recv_hold[conn_index as usize].is_empty();
+                if echo_pending {
+                    return;
+                }
                 // Wake recv waiter before closing so the owning task can
                 // detect EOF (with_data will see `recv_finished()` and return 0).
                 self.executor.wake_recv(conn_index);
@@ -1786,9 +1818,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                         ptr: buf_ptr,
                     },
                 );
-                // Do NOT call wake_recv here. DirectEchoFuture only needs to
-                // be woken on connection close (handled by the result <= 0 path
-                // above), not on every incoming buffer.
+                // Do NOT call wake_recv here. DirectEchoFuture is woken only
+                // when the read side finishes: by the result <= 0 path above,
+                // or by `flush_direct_echoes` once a FIN's held bytes have
+                // drained.
             } else {
                 // Plaintext path: route through recv sink if active, else zero-copy/accumulator.
                 if let Some(sink) = &mut self.executor.recv_sinks[conn_index as usize] {
@@ -12692,6 +12725,94 @@ mod tests {
                 .hold_direct_echo(conn_index, crate::backend::PendingRecvBuf { bid, len, ptr });
         }
         conn_index
+    }
+
+    /// A FIN that arrives while direct-echo bytes are held leaves the
+    /// connection open without waking the future; the flush that drains the
+    /// hold wakes it and requests the close (#604).
+    #[test]
+    fn a_fin_with_bytes_held_waits_for_the_flush_to_close() {
+        use std::future::Future;
+        let mut el = make_test_loop();
+        let conn_index = stage_direct_echo(&mut el, &[0, 1], 256);
+        let ci = conn_index as usize;
+        let generation = el.driver.connections.generation(conn_index);
+        let ctx = ConnCtx::new(conn_index, generation);
+        let mut fut = std::pin::pin!(with_driver_state(&mut el, || ctx.run_direct_echo()));
+        let waker = noop_waker();
+        let first = with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            fut.as_mut().poll(&mut cx)
+        });
+        assert!(first.is_pending());
+        assert!(el.executor.recv_waiters[ci], "the future parked");
+
+        let fin = UserData::encode(OpTag::RecvMulti, conn_index, generation);
+        el.test_dispatch_cqe(fin.raw(), 0, 0);
+        let cs = el.driver.connections.get(conn_index).expect("connection");
+        assert!(cs.recv_finished(), "the FIN was recorded");
+        assert!(!cs.close_requested(), "the FIN closed the connection");
+        assert_eq!(
+            el.driver.recv_hold[ci].len(),
+            2,
+            "the held bytes were dropped"
+        );
+        assert!(el.executor.recv_waiters[ci], "the FIN woke the future");
+
+        el.flush_direct_echoes();
+        assert!(el.driver.recv_hold[ci].is_empty());
+        assert!(
+            !el.executor.recv_waiters[ci],
+            "the flush did not wake the future"
+        );
+        assert!(
+            el.driver
+                .connections
+                .get(conn_index)
+                .is_some_and(|c| c.close_requested()),
+            "the flush did not request the close"
+        );
+        let second = with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            fut.as_mut().poll(&mut cx)
+        });
+        assert!(second.is_ready());
+    }
+
+    /// A direct-echo future stays pending while bytes received before the
+    /// peer's FIN are still held, and resolves once they have been taken
+    /// for echo; resolving earlier would end its task and close the
+    /// connection with them unsent (#604).
+    #[test]
+    fn direct_echo_future_waits_for_the_hold_after_eof() {
+        use std::future::Future;
+        let mut el = make_test_loop();
+        let conn_index = stage_direct_echo(&mut el, &[0], 256);
+        if let Some(cs) = el.driver.connections.get_mut(conn_index) {
+            cs.note_eof(false);
+        }
+        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        let mut fut = std::pin::pin!(with_driver_state(&mut el, || ctx.run_direct_echo()));
+        let waker = noop_waker();
+        let first = with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            fut.as_mut().poll(&mut cx)
+        });
+        assert!(
+            first.is_pending(),
+            "the future resolved with a byte still held"
+        );
+
+        el.flush_direct_echoes();
+        assert!(el.driver.recv_hold[conn_index as usize].is_empty());
+        let second = with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            fut.as_mut().poll(&mut cx)
+        });
+        assert!(
+            second.is_ready(),
+            "the future stayed pending after the hold drained"
+        );
     }
 
     #[test]
