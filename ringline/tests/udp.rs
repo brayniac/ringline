@@ -1950,16 +1950,17 @@ fn udp_send_to_unreachable_peer_does_not_kill_worker() {
     let (n, _src) = client.recv_from(&mut buf).unwrap();
     assert_eq!(&buf[..n], b"alive", "live peer must still receive its echo");
 
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+    // Read after the join: the handler counts the follow-up after `send_to`
+    // returns, and on mio the datagram can reach the client first (#394).
     let follow_up_ok = UNREACH_FOLLOWUP.get().unwrap().load(Ordering::SeqCst);
     assert_eq!(
         follow_up_ok, 1,
         "follow-up send to live peer must succeed after spamming a dead peer"
     );
-
-    shutdown.shutdown();
-    for h in handles {
-        h.join().unwrap().unwrap();
-    }
 }
 
 // ── Invalid bind address propagates an error ───────────────────────────
