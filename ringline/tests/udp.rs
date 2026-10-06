@@ -164,20 +164,30 @@ fn udp_port_zero_resolves_once_for_every_worker() {
     {
         // /proc/net/udp lists each socket's local address as hex `ip:port`
         // and its inode. The kernel produces the file in chunks and resumes
-        // each by position, so while other sockets open and close (other
-        // tests in this process, under `cargo test`) one read can skip an
-        // entry or list it twice (#597). Counting distinct inodes across
-        // several reads removes both errors; a port bound by too few or too
-        // many sockets still shows.
-        let port_hex = format!(":{:04X}", addr.port());
+        // each by position, so while other sockets in this network namespace
+        // open and close (such as `run_udp_client`'s echo server, which closes
+        // up to 5 s after its test returns) one read can skip an entry or list
+        // it twice (#597). Counting distinct inodes removes duplicates, and a
+        // socket skipped by one read is counted if any of the ten reads lists
+        // it. Too few or too many sockets on the port still fails the
+        // assertion.
+        //
+        // The kernel prints the address as the raw network-order `u32` with
+        // `%08X`, hence the native-order conversion.
+        let std::net::IpAddr::V4(ip) = addr.ip() else {
+            panic!("the test binds an IPv4 address");
+        };
+        let local = format!(
+            "{:08X}:{:04X}",
+            u32::from_ne_bytes(ip.octets()),
+            addr.port()
+        );
         let mut inodes = std::collections::HashSet::new();
         for _ in 0..10 {
             let table = std::fs::read_to_string("/proc/net/udp").unwrap();
             for line in table.lines().skip(1) {
                 let fields: Vec<&str> = line.split_whitespace().collect();
-                if fields
-                    .get(1)
-                    .is_some_and(|local| local.ends_with(&port_hex))
+                if fields.get(1).is_some_and(|l| *l == local)
                     && let Some(inode) = fields.get(9)
                 {
                     inodes.insert(inode.to_string());
