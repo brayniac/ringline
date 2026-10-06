@@ -2300,8 +2300,8 @@ impl ConnCtx {
     ///
     /// Once enabled, incoming provided recv buffers are *held in place* (not
     /// copied into the accumulator) and can be echoed back zero-copy via
-    /// [`forward_held`](Self::forward_held), which gathers all held buffers into
-    /// one scatter-gather `sendmsg`. Intended for byte-pipe workloads (echo,
+    /// [`forward_held`](Self::forward_held), which gathers up to 32 held
+    /// buffers into one scatter-gather `sendmsg`. Intended for byte-pipe workloads (echo,
     /// proxy) where the handler does not parse the stream. While enabled,
     /// `with_data` / `with_bytes` will not
     /// observe data (it never reaches the accumulator).
@@ -2322,10 +2322,13 @@ impl ConnCtx {
         });
     }
 
-    /// Forward all currently-held recv buffers back to the peer in one zero-copy
-    /// scatter-gather `sendmsg` (up to `MAX_IOVECS` buffers), returning a
-    /// [`SendFuture`] that resolves with the bytes sent. Requires
-    /// [`enable_recv_forward`](Self::enable_recv_forward).
+    /// Forward the held recv buffers back to the peer in one zero-copy
+    /// scatter-gather `sendmsg`, returning a [`SendFuture`] that resolves with
+    /// the bytes sent. A call forwards at most 32 buffers. While the
+    /// connection is open, buffers beyond that stay held for the next call,
+    /// and `recv_ready` is ready at once. When the peer closes, held buffers
+    /// that were not forwarded are discarded.
+    /// Requires [`enable_recv_forward`](Self::enable_recv_forward).
     ///
     /// Gate calls on `recv_ready`, which becomes ready when
     /// the hold is non-empty (or the connection closed). When the hold is empty
@@ -2350,7 +2353,7 @@ impl ConnCtx {
 
             let n = driver.recv_hold[conn_index as usize]
                 .len()
-                .min(crate::buffer::send_slab::MAX_IOVECS);
+                .min(crate::buffer::FORWARD_HELD_MAX_BUFFERS);
 
             // Nothing held (connection closed or spurious wake) — resolve to 0.
             if n == 0 {
@@ -2427,16 +2430,23 @@ impl ConnCtx {
     ///
     /// mio fallback: no-op. There is no provided-buffer ring to hold, so recv
     /// data flows through the accumulator as usual and
-    /// [`forward_held`](Self::forward_held) drains + copy-sends it (no
-    /// zero-copy). Keeps the API portable across backends.
+    /// [`forward_held`](Self::forward_held) copy-sends it, at most 32
+    /// receive buffers' worth per call (no zero-copy). Keeps the API portable across backends.
     #[cfg(not(has_io_uring))]
     pub fn enable_recv_forward(&self) {}
 
     /// Forward currently-buffered recv data back to the peer.
     ///
-    /// mio fallback: drains the accumulator and copy-sends it, returning a
-    /// [`SendFuture`] that resolves with the bytes sent (`0` when empty). Gate
-    /// calls on `recv_ready` as on the io_uring backend.
+    /// mio fallback: copy-sends the start of the accumulator and consumes it,
+    /// returning a [`SendFuture`] that resolves with the bytes sent (`0` when
+    /// empty). A call forwards at most 32 receive buffers' worth of bytes
+    /// (`ConfigBuilder::recv_buffer`'s `buffer_size` each), the most one
+    /// io_uring call forwards. The rest stays buffered for the next call,
+    /// and `recv_ready` is ready at once. After the peer closes, the rest
+    /// survives only while each call follows the previous one's completion
+    /// directly: the connection's teardown discards it once nothing is
+    /// queued to send. Gate calls on `recv_ready` as on the io_uring
+    /// backend.
     #[cfg(not(has_io_uring))]
     pub fn forward_held(&self) -> io::Result<SendFuture> {
         with_state(|driver, executor| {
@@ -2449,7 +2459,8 @@ impl ConnCtx {
             }
             // Copy out the accumulated bytes (releases the accumulator borrow so
             // we can take a DriverCtx), then consume them once the send is queued.
-            let data = driver.accumulators.data(conn_index).to_vec();
+            let held = driver.accumulators.data(conn_index);
+            let data = held[..held.len().min(driver.forward_held_max_bytes)].to_vec();
             if data.is_empty() {
                 return Ok(SendFuture::ready(conn_index, self.generation, Ok(0)));
             }

@@ -2,6 +2,10 @@ use crate::guard::GuardBox;
 use crate::runtime::send_completion::SendId;
 
 pub(crate) const MAX_IOVECS: usize = 32;
+
+// `forward_held` gathers up to `FORWARD_HELD_MAX_BUFFERS` held buffers into
+// an iovec array of `MAX_IOVECS` entries.
+const _: () = assert!(crate::buffer::FORWARD_HELD_MAX_BUFFERS <= MAX_IOVECS);
 /// Raised from 4 after rig measurement showed the guard-flush batching cap
 /// costing ~17% on guarded-SET pipelines vs the copy path (each flush pays a
 /// syscall + slab entry; deeper batches amortize it). 8 guards need 2*8+1 =

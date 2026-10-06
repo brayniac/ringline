@@ -185,13 +185,22 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
             // 2. Compute poll timeout from nearest timer deadline. Don't
             // block at all while tasks are already runnable (self-wakes
-            // collected after the last poll pass, tasks woken from on_tick).
+            // collected after the last poll pass, tasks woken from on_tick)
+            // or while a writable connection has sends queued: a send
+            // queued by a task re-polled after the last flush would
+            // otherwise wait out the timeout. A connection whose socket is
+            // full stays queued too, but waits for its writable event.
             // First release what futures dropped by `drain_pending_closes`
             // queued, so an idle worker does not hold it until its next
             // event, and a released timer no longer sets the timeout.
             crate::fs::release_orphans(&mut self.driver, &mut self.executor);
             self.executor.collect_wakeups();
-            let timeout = if self.executor.ready_queue.is_empty() {
+            let flushable = self
+                .driver
+                .sends_dirty
+                .iter()
+                .any(|&i| self.driver.writable[i as usize]);
+            let timeout = if self.executor.ready_queue.is_empty() && !flushable {
                 self.compute_poll_timeout()
             } else {
                 Duration::ZERO

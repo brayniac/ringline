@@ -74,6 +74,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- On mio, `forward_held` forwards at most 32 receive buffers' worth of
+  bytes per call (`ConfigBuilder::recv_buffer`'s `buffer_size` each), the
+  most one io_uring call forwards. It used to forward the whole
+  accumulator. The rest stays buffered, and `recv_ready` is ready at once,
+  so a large backlog takes several calls. After the peer's FIN, the rest is
+  forwarded only if each call follows the previous one's completion
+  directly, as on io_uring, where unforwarded held buffers are discarded
+  when the peer closes.
+
+- On mio, the event loop no longer waits out its idle poll timeout (10 ms
+  by default) while a writable connection has sends queued. A task that
+  queued a send after the loop's flush, such as one awaiting each send in
+  turn, waited for that timeout before its send went out.
+
 - An awaited send resolves with the length its caller passed. Under TLS
   that is the plaintext length: `send().await` used to report the ciphertext
   of the send's last record on io_uring and of all its records on mio, and
