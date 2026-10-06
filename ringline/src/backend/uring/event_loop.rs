@@ -3935,7 +3935,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 let original_len = self.driver.send_recv_buf_original_lens[conn_index as usize];
                 let offset = original_len - new_remaining;
                 let new_ptr = unsafe { buf_ptr.add(offset as usize) };
-                let new_payload = bid as u32;
+                let new_payload = bid as u32 | crate::completion::SEND_RECV_BUF_REMAINDER;
                 let new_ud = UserData::encode(
                     crate::completion::OpTag::SendRecvBuf,
                     conn_index,
@@ -10840,6 +10840,60 @@ mod tests {
         el.driver.pending_recv_bufs[conn_index as usize] = None;
     }
 
+    /// A second `forward_recv_buf` queued behind one still in flight must
+    /// not change how the first one's completion is read: the first, sent in
+    /// full, returns its buffer and the second goes out next (#614).
+    #[test]
+    fn a_queued_forward_recv_buf_does_not_disturb_the_one_in_flight() {
+        let mut el = make_test_loop_with_config(config_with_reserve(16));
+        let conn_index = accept_connection(&mut el);
+        let ci = conn_index as usize;
+        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        let forward = |el: &mut AsyncEventLoop<NoopHandler>, bid: u16, len: u32| {
+            let (ptr, _) = el.driver.provided_bufs.get_buffer(bid);
+            el.driver.pending_recv_bufs[ci] =
+                Some(crate::backend::uring::driver::PendingRecvBuf { bid, len, ptr });
+            let data = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+            with_driver_state(el, || ctx.forward_recv_buf(data)).expect("forward");
+        };
+
+        forward(&mut el, 0, 100);
+        assert!(el.driver.send_queues[ci].in_flight);
+        forward(&mut el, 1, 4096);
+        assert_eq!(
+            el.driver.send_queues[ci].queue.len(),
+            1,
+            "the second queued"
+        );
+
+        // The first completes in full.
+        let first = UserData::encode(OpTag::SendRecvBuf, conn_index, 0);
+        el.test_dispatch_cqe(first.raw(), 100, 0);
+        assert!(
+            el.driver.pending_replenish.contains(&0),
+            "the first buffer was taken for a partial send"
+        );
+        let pushed = UserData(
+            el.driver
+                .ring
+                .last_pushed
+                .as_ref()
+                .expect("an SQE was pushed")
+                .get_user_data(),
+        );
+        assert_eq!(
+            pushed.payload() as u16,
+            1,
+            "the second send did not go next"
+        );
+        assert_eq!(el.driver.send_recv_buf_remaining[ci], 4096);
+
+        // The second completes in full too.
+        el.test_dispatch_cqe(pushed.raw(), 4096, 0);
+        assert!(el.driver.pending_replenish.contains(&1));
+        assert!(!el.driver.send_queues[ci].in_flight);
+    }
+
     /// A stale handle's `forward_recv_buf` must not detach the slot's new
     /// occupant's accumulator, which would drop its buffered bytes (#544).
     /// The current handle still forwards it.
@@ -15469,6 +15523,10 @@ mod tests {
             !el.driver.send_queues[ci].parked,
             "the retry did not submit"
         );
+        // Pushing the remainder keeps its progress: 40 of the 100 bytes left,
+        // so a further partial resubmits from the right offset (#614).
+        assert_eq!(el.driver.send_recv_buf_original_lens[ci], 100);
+        assert_eq!(el.driver.send_recv_buf_remaining[ci], 40);
         let ud = UserData(
             el.driver
                 .ring

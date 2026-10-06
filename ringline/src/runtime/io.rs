@@ -2009,9 +2009,6 @@ impl ConnCtx {
                         // buffer sizes > u16::MAX (e.g. 65536 B) are supported without
                         // truncation in the CQE user_data payload.
                         let payload = pending.bid as u32;
-                        // Store original and remaining lengths for partial-send tracking.
-                        driver.send_recv_buf_original_lens[conn_index as usize] = pending.len;
-                        driver.send_recv_buf_remaining[conn_index as usize] = pending.len;
                         let user_data = crate::completion::UserData::encode(
                             crate::completion::OpTag::SendRecvBuf,
                             conn_index,

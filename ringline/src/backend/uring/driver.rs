@@ -2560,8 +2560,11 @@ impl Driver {
             };
             return match pushed {
                 Ok(()) => {
-                    state.queue.pop_front();
+                    let built = state.queue.pop_front();
                     state.parked = false;
+                    if let Some(built) = built {
+                        self.note_send_recv_buf_pushed(conn_index, &built);
+                    }
                     true
                 }
                 Err(_) => {
@@ -2728,8 +2731,6 @@ impl Driver {
         .flags(crate::completion::STREAM_SEND_FLAGS)
         .build()
         .user_data(ud.raw());
-        self.send_recv_buf_original_lens[ci] = pending.len;
-        self.send_recv_buf_remaining[ci] = pending.len;
         // Infallible: under SQ pressure the echo is parked at the queue head
         // and retried, holding its provided buffer exactly as a queued echo
         // does; the bid is replenished by its completion.
@@ -2764,7 +2765,10 @@ impl Driver {
             return;
         }
         match unsafe { self.ring.push_sqe(&built.entry) } {
-            Ok(()) => state.in_flight = true,
+            Ok(()) => {
+                state.in_flight = true;
+                self.note_send_recv_buf_pushed(conn_index, &built);
+            }
             Err(_) => {
                 // SQ still full after submit: park at the head and retry next
                 // iteration (see `drain_send_retries`). Nothing is dropped.
@@ -2775,6 +2779,24 @@ impl Driver {
                 self.pending_send_retries.push((conn_index, generation, 0));
             }
         }
+    }
+
+    /// Record the progress of a `SendRecvBuf` that has just been pushed: the
+    /// buffer's full length, all of it still to send. A connection has at
+    /// most one `SendRecvBuf` in the kernel, so recording at push time, not
+    /// when the send is built, keeps a send queued behind it from
+    /// overwriting the counts its completion reads (#614). A remainder of a
+    /// partial send keeps the counts `handle_send_recv_buf` recorded.
+    fn note_send_recv_buf_pushed(&mut self, conn_index: u32, built: &crate::handler::BuiltSend) {
+        let ud = crate::completion::UserData(built.entry.get_user_data());
+        if ud.tag() != Some(OpTag::SendRecvBuf)
+            || ud.payload() & crate::completion::SEND_RECV_BUF_REMAINDER != 0
+        {
+            return;
+        }
+        let ci = conn_index as usize;
+        self.send_recv_buf_original_lens[ci] = built.total_len;
+        self.send_recv_buf_remaining[ci] = built.total_len;
     }
 
     /// Park `built` at the head of the connection's send queue, for

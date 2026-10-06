@@ -121,6 +121,11 @@ pub enum OpTag {
     SendMsgZcDrain = 35,
 }
 
+/// Set in an `OpTag::SendRecvBuf` payload, above the 16-bit bid, when the send
+/// continues a partial send of the same buffer. Its progress is already
+/// recorded and must not be reset when it is pushed (#614).
+pub(crate) const SEND_RECV_BUF_REMAINDER: u32 = 1 << 16;
+
 impl OpTag {
     pub fn from_u8(v: u8) -> Option<Self> {
         match v {
