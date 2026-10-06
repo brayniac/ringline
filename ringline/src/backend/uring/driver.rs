@@ -2777,6 +2777,20 @@ impl Driver {
         }
     }
 
+    /// Park `built` at the head of the connection's send queue, for
+    /// `drain_send_retries` to push. The caller is the completion handler of
+    /// the connection's only in-flight send, so nothing else is parked.
+    /// `built` continues that send, so it goes ahead of anything queued
+    /// behind it. `in_flight` stays set until the queue drains.
+    pub(crate) fn park_at_queue_head(&mut self, conn_index: u32, built: crate::handler::BuiltSend) {
+        let state = &mut self.send_queues[conn_index as usize];
+        state.queue.push_front(built);
+        state.in_flight = true;
+        state.parked = true;
+        let generation = self.connections.generation(conn_index);
+        self.pending_send_retries.push((conn_index, generation, 0));
+    }
+
     /// Queue a batch of built sends in order through the per-connection
     /// send queue. Infallible: `submit_or_queue_send` parks under SQ
     /// pressure rather than failing, so every entry is committed in order
