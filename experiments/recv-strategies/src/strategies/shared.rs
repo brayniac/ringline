@@ -56,6 +56,11 @@ pub struct Shared {
     hold: Duration,
     /// `--no-thp`: back the buffers with 4 KiB pages.
     no_thp: bool,
+    /// `--recv-len`: the most bytes one completion takes; 0 for no cap.
+    recv_len: u32,
+    /// `--bounded-acc`: copy into the accumulator only what completes a
+    /// pending message, and parse the rest of a completion in place.
+    bounded_acc: bool,
     /// Most buffers that may be pinned by holds at once.
     lend_cap: usize,
     holds: Vec<u32>,
@@ -85,6 +90,8 @@ impl Shared {
         hold_us: u64,
         lend_cap: f64,
         no_thp: bool,
+        recv_len: u32,
+        bounded_acc: bool,
     ) -> Self {
         let fallback_chunk = (4 * buf_size).max(1 << 20);
         Shared {
@@ -107,6 +114,8 @@ impl Shared {
             rearms: 0,
             hold_every,
             no_thp,
+            recv_len,
+            bounded_acc,
             hold: Duration::from_micros(hold_us),
             lend_cap: (lend_cap * bufs as f64) as usize,
             holds: vec![0; bufs],
@@ -157,7 +166,12 @@ impl Shared {
     }
 
     fn arm(&mut self, cx: &mut Ctx, c: usize) {
-        let sqe = opcode::RecvMulti::new(types::Fd(cx.fds[c]), 0).build().user_data(ud(TAG_RECV, 0, c));
+        // `recv_len` caps how many bytes one completion takes (0: the whole
+        // buffer), which bounds how far a connection's accumulator grows.
+        let sqe = opcode::RecvMulti::new(types::Fd(cx.fds[c]), 0)
+            .len(self.recv_len)
+            .build()
+            .user_data(ud(TAG_RECV, 0, c));
         cx.push(sqe);
         self.rearms += 1;
     }
@@ -165,6 +179,37 @@ impl Shared {
     /// Hand `data` (bytes just received for `c`) to the application: in
     /// place when nothing is buffered, through the accumulator otherwise.
     fn receive(&mut self, cx: &mut Ctx, c: usize, data: &[u8]) {
+        let mut data = data;
+        if self.bounded_acc {
+            // Complete a pending partial message from the front of `data`,
+            // then parse the rest in place: the accumulator never holds more
+            // than one message, whatever the completion's size.
+            loop {
+                let conn = &mut self.conns[c];
+                if conn.head == conn.acc.len() || data.is_empty() {
+                    break;
+                }
+                let have = conn.acc.len() - conn.head;
+                let need = next_need(&conn.acc[conn.head..]);
+                let take = (need - have).min(data.len());
+                conn.acc.extend_from_slice(&data[..take]);
+                self.copied += take as u64;
+                data = &data[take..];
+                if have + take < need {
+                    return;
+                }
+                if need == 4 {
+                    // Only the header was completed; read its length next.
+                    continue;
+                }
+                let p = cx.deliver(c, &conn.acc[conn.head..]);
+                conn.head += p.consumed;
+                if conn.head == conn.acc.len() {
+                    conn.acc.clear();
+                    conn.head = 0;
+                }
+            }
+        }
         let conn = &mut self.conns[c];
         if conn.head == conn.acc.len() {
             let p = cx.deliver(c, data);
@@ -197,6 +242,15 @@ impl Shared {
     fn buffer(&self, bid: usize) -> *mut u8 {
         unsafe { self.backing.add(bid * self.buf_size) }
     }
+}
+
+/// The full size of the message starting at `buf` (header included), or 4
+/// while its header is incomplete.
+fn next_need(buf: &[u8]) -> usize {
+    if buf.len() < 4 {
+        return 4;
+    }
+    4 + u32::from_le_bytes(buf[..4].try_into().unwrap()) as usize
 }
 
 /// Resident KiB of the `len` bytes at `base`, by `mincore`.

@@ -25,6 +25,8 @@ pub fn build(name: &str, args: &[String], nconns: usize, sqpoll: bool) -> Box<dy
             hold_us,
             lend_cap,
             flag(args, "--no-thp"),
+            arg(args, "--recv-len", Some(0)),
+            flag(args, "--bounded-acc"),
         )),
         "shared_inc" => Box::new(shared::Shared::new(
             true,
@@ -35,6 +37,8 @@ pub fn build(name: &str, args: &[String], nconns: usize, sqpoll: bool) -> Box<dy
             hold_us,
             lend_cap,
             flag(args, "--no-thp"),
+            arg(args, "--recv-len", Some(0)),
+            flag(args, "--bounded-acc"),
         )),
         "ring" | "ring_norewrite" => {
             assert!(!sqpoll, "the ring strategies rely on DEFER_TASKRUN");
