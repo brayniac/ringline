@@ -1,8 +1,8 @@
 # Incremental provided-buffer consumption (`IOU_PBUF_RING_INC`)
 
-- **Status:** open — design chosen, not built. **2026-10-06: GO on the
-  owner's decision, after the measurements in "2026-10: INC against the
-  alternatives". Design: `docs/recv-incremental-ring-design.md` (#622).**
+- **Status:** open — design chosen, not built. **2026-10-07: GO on the
+  owner's decision, after the measurements in "2026-10: measurements".
+  Design: `docs/recv-incremental-ring-design.md` (#622).**
   Phase A (2026-09-17) had narrowed the case: see "What Phase A did to
   criterion 1".
 - **Span:** 2026-09-17 → (open) · follows #415 (282773b), #416 Phase A ·
@@ -281,105 +281,150 @@ re-opening the class of bug that #236–#244 and #415 spent their time closing.
   earlier number. Measure RSS *and* peak-touched pages under a bursty mixed
   workload before treating a deep ring as free.
 
-## 2026-10: INC against the alternatives
+## 2026-10: measurements
 
-The recv redesign (#622) first proposed per-connection receive memory: each
-TCP connection's bytes land in memory it owns, through a one-entry INC ring
-per connection or a one-shot `RECV`. Before deciding, the owner asked for
-measurements of every candidate. This section records them; the GO/NO-GO
-reading follows.
+The recv redesign (#622) first proposed per-connection receive memory (each
+connection's bytes land in memory it owns). Before deciding, the owner asked
+for measurements of every candidate. This section records them and how they
+were read.
 
-### What was measured, and how
+### Method
 
 `experiments/recv-strategies/` (branch `exp/recv-strategies`) is a standalone
-io_uring program, not ringline: one single-threaded server pinned to one CPU,
-`DEFER_TASKRUN`, a length-prefixed framing that every byte passes through, and
-a client that counts acked messages and records latency. Each strategy is a
-small module written directly against io_uring:
+io_uring program, not ringline: a single-threaded server pinned to one CPU,
+`DEFER_TASKRUN`, length-prefixed messages, and a client that counts acked
+messages and records latency. Each receive strategy is a small module
+written directly against io_uring:
 
 | Strategy | Receive model |
 |---|---|
-| `shared` | ringline today: one ring of 256 × 16 KiB, parsed in place when nothing is buffered, copied otherwise, fallback one-shot recv on `ENOBUFS` |
-| `shared_4096` | the same with 4096 × 16 KiB (64 MiB) |
-| `shared_inc` | the same ring registered with `IOU_PBUF_RING_INC`; pool size and buffer size swept |
-| `ring` | a one-entry INC ring per connection over the connection's own region; the posted entry rewritten in place to move the region |
+| `shared` (or `plain_*`) | ringline today: one plain provided-buffer ring per worker, parse in place when nothing is buffered, copy otherwise, fallback one-shot recv on `ENOBUFS` |
+| `inc_*` | the same ring registered with `IOU_PBUF_RING_INC` |
+| `ring` | a one-entry INC ring per connection over the connection's region; moves rewrite the posted entry in place |
 | `ring_norewrite` | the same, never touching a posted entry |
 | `oneshot` | one-shot `RECV` into the connection's region |
-| `*_sqpoll` | `shared` / `oneshot` on an SQPOLL ring |
 
-Workloads: request/ack with one message outstanding per connection (`reqack`)
-at 256 B to 1 MiB, eight outstanding (`pipe8`), a 90/10 mix of 256 B and
-64 KiB (`mixed`), and a continuous 16 KiB stream. Five reps per cell,
-strategies interleaved within each rep; medians below. `shared_aa` (the
-`shared` configuration run twice) gives the noise: 2–5% on loopback, 1–4%
-across hosts.
+`--adapt` (added 2026-10-07) grows a per-connection region when its posted
+range is used up while data flows, and shrinks it after it stays empty.
+`--verify` stamps every message with its connection's sequence number and a
+derived payload, and the server checks every byte. `--hold-every` /
+`--hold-us` / `--lend-cap` make every second connection keep each received
+range lent for a time, as a forward to a slow sink does, with a cap on how
+much of the ring held lends may pin.
 
-| Experiment | Where | Notes |
-|---|---|---|
-| `01a11274-6cf4-7199-2d59-f2af8fb4be91` (v2) | loopback, one anvil VM, Linux 6.12, 16 vCPU EPYC 4564P | 515 runs; 130 failed on two benchmark bugs (below) |
-| `01a112fc-f7ea-71d2-a7b6-a00afe495637` (v2b) | as v2 | the failed cells, rerun after the fixes; 185 runs, none failed |
-| `01a112fe-2fc8-7174-a304-6698db259b1f` (v3) | two hosts: server hv02, client hv01, backports kernel 7.1.13 | 180 runs, none failed |
-| `01a1134e-f20c-7101-4a78-3f35415063d6` | loopback, as v2 | `shared_inc` pool sweep; 225 runs |
-| `01a1137e-52c4-710c-15bf-4a1a830ceea4` | two hosts, as v3 | `shared_inc` pool sweep; 180 runs |
+Two setups, both on Linux 7.1.13 (the backports image):
 
-Two bugs in the benchmark invalidated cells of v2 and were fixed before v2b:
-every 10k-connection server asked for a CQ larger than `IORING_MAX_CQ_ENTRIES`
-(65536) and failed setup with `EINVAL`, and the `shared` strategies'
-accumulator never dropped consumed bytes while a partial message remained, so
-streaming servers were OOM-killed. An earlier v1
-(`01a1121f-8047-71bb-a968-3472d4e34661`) was discarded after review: its
-`shared` arm had no lend-in-place or fallback recv, and it had no INC arm.
+- **hv01**: one VM (`z2.c`, 56 vCPU), server and client in it over
+  loopback, which delivers bytes in bursts at memory speed.
+- **Two hosts**: server VM on hv02 (`z1.c`), client VM on hv01, over each
+  guest's 4 × 10 GbE 802.3ad bond (layer3+4). A calibration run
+  (`01a114e0-077e-7100-6a96-ee2f7660185b`) found NIC interrupts and NET_RX
+  softirq spread over all 24 server vCPUs (5% on the server's CPU) and eight
+  servers reaching 26.6 Gb/s, so one server's core is bounded by its own
+  work: these numbers are one worker's steady-state cost at about 1.5 GB/s.
+
+Five reps per cell, configurations interleaved within each rep; medians
+below. An A/A pair (the same configuration twice) agreed within 1–2% on
+hv01.
+
+**Superseded.** The first loopback runs (v1 `01a1121f`, v2 `01a11274`, v2b
+`01a112fc-f7ea`, the pool sweep `01a1134e-f20c`, the plain-ring and lend-cap
+sweeps `01a114ba-bb57` and `01a114ba-bbf0`) ran on the validation host,
+delta, which also runs frigate and the infra VMs. Their A/A spreads reached
+19.5% and the same configuration moved 25% between experiments; two of
+their findings did not reproduce on hv01 (today's ring starving at 10,000
+connections, and today's ring winning streaming). They are not used below.
+Two bugs in the benchmark also invalidated v2 cells (a CQ larger than
+`IORING_MAX_CQ_ENTRIES`, and an accumulator that never compacted under
+streaming), and its framing checked lengths only until `--verify` was added.
 
 ### Results
 
-Loopback (v2, v2b), msg/s:
+Core comparison, hv01 (`01a11520-5424-7143-8c86-731a6e6738bb`), msg/s:
 
-| Workload (conns) | shared | shared_inc 4 MiB | ring | ring_norewrite | oneshot |
+| Workload (conns) | Today 256 × 16 KiB | INC 64 × 64 KiB | INC 64 × 1 MiB | `ring` | `oneshot` |
 |---|---|---|---|---|---|
-| reqack 256 B (1000) | 174k | 200k | 190k | 185k | 99k |
-| reqack 256 B (10k) | 47k (15.7M `ENOBUFS`) | 80k (0 `ENOBUFS`) | 75k | 68k | 57k |
-| reqack 64 KiB (64) | 81k | 108k | 107k | 106k | 108k |
-| reqack 64 KiB (1000) | 40k | 54k | 53k | 48k | 42k |
-| reqack 64 KiB (10k) | 19k | 17k (19M `ENOBUFS`) | 40k | 42k | 37k |
-| mixed (1000) | 123k | 133k | 156k | 101k | 103k |
-| pipe8 256 B (1000) | 634k | 661k | 631k | 610k | 510k |
-| pipe8 mixed (1000) | 253k, p99 44 ms | 251k, p99 46 ms | 207k, p99 105 ms | 204k | 190k |
-| stream 16 KiB (64) | 187k | 346k | 217k | 213k | 236k |
+| 256 B (64 / 1000 / 10k) | 90k / 83k / 47k | 92k / 85k / 46k | 90k / 84k / 47k | 92k / 83k / — | 95k / 51k / 43k |
+| 64 KiB (64) | 37.3k | 48.8k | 43.0k | 47.9k | 51.3k |
+| 64 KiB (1000) | 32.0k | 44.5k | 38.1k | 38.0k | 28.8k |
+| 64 KiB (10k) | 29.8k | 39.5k | 34.8k | — | 30.7k |
+| 1 MiB (64) | 3.2k | 3.3k | 5.7k | 5.4k | 5.4k |
+| mixed (1000) | 61.0k | 65.2k | 74.0k | 76.9k | 47.2k |
+| pipelined mixed (1000) | 199k, p99 76 ms | 209k | 258k, p99 33 ms | 166k | 118k |
+| stream, mixed sizes (1000) | 110k | 133k | 128k | 85k | 88k |
 
-Two hosts (v3), msg/s unless noted:
+`ring` at 10k connections did not start: on 7.1 each one-entry ring is
+charged a page of `RLIMIT_MEMLOCK`, and 2041 fit under the default 8 MiB.
 
-| Workload (conns) | shared | shared_inc 4 MiB | ring | ring_norewrite | oneshot |
+Geometry, two hosts (`01a11520-54ad-71fa-9dce-bc7e913ed435`), msg/s:
+
+| Workload (conns) | Today | INC 4 MiB / 64 KiB | INC 16 MiB / 1 MiB | INC 64 MiB / 1 MiB | `ring` |
 |---|---|---|---|---|---|
-| reqack 256 B (1000) | 119k | 119k | 118k | 118k | 120k |
-| reqack 256 B (10k) | 108k | 107k | 106k | 105k | 87k |
-| reqack 64 KiB (1000) | 20k | 22k | 24k | 24k | 20k |
-| reqack 1 MiB (64), CPU per message | 656 µs | 644 µs | 477 µs | 483 µs | 488 µs |
-| mixed (1000), p99 | 23.1 ms (A/A: 14.7 ms) | 13.6 ms | 12.6 ms | 13.1 ms | 13.1 ms |
-| stream 16 KiB (64) | 104k | 103k | 81k | 82k | 81k |
+| mixed (1000) | 79.2k | 80.2k | 85.0k | 85.7k | 84.6k |
+| 64 KiB (1000) | 19.9k | 21.6k | 23.5k | 23.6k | 24.0k |
+| 1 MiB (64) | 1.6k | 1.6k | 1.7k | 1.7k | 2.1k |
+| 256 B (10k) | 106.7k | 107.0k | 107.1k | 107.0k | 105.8k |
+| stream 16 KiB (64) | 109.6k | 108.6k | 110.5k | 114.2k | 83.1k |
+| stream 16 KiB (1000) | 93.9k | 103.6k | 96.9k | 102.0k | 73.2k |
 
-SQPOLL lost to the same strategy without it in every cell it ran (v2).
+Geometry, hv01 (`01a11520-55d2-7179-7c79-b2a7536f50c1`): a 16 MiB pool of
+1 MiB buffers did 6.3k at 1 MiB × 64 and 368k streaming at 64 connections
+(64 MiB: 5.7k and 300k), and 214k streaming at 1000 (64 MiB: 234k).
 
-The `shared_inc` pool sweep, 10k connections × 64 KiB, msg/s:
+Streaming alignment, hv01 (`01a11520-5543-7171-7461-ba465491f200`). INC
+beat today's ring in every streaming cell, at 12000 B, 16384 B, 20000 B and
+mixed sizes, 64 and 1000 connections: by 8–45%, at 10–30% less CPU per KiB.
+Today's ring parsed 99% of bytes in place only when the message size equalled
+its 16 KiB buffer and the ring kept running dry (16384 B × 1000), and 0–4%
+otherwise.
 
-| Pool | loopback | two hosts |
-|---|---|---|
-| 4 MiB, 64 KiB buffers | 22.4k (24.0M `ENOBUFS`) | 21.8k (0 `ENOBUFS`) |
-| 64 MiB, 64 KiB buffers | 30.9k (2.0M) | 21.7k |
-| 256 MiB, 64 KiB buffers | 31.9k (0.4M) | 21.6k |
-| 64 MiB, 1 MiB buffers | 35.6k (2.4M) | 21.6k |
-| 256 MiB, 1 MiB buffers | 40.8k (0.5M) | 21.6k |
-| `ring` | 45.3k | 21.9k |
+Plain rings for kernels without INC, hv01 and two hosts
+(`01a11520-56b7-71f4-ce93-6f895c7992ed`, `01a11520-5644-7109-7752-ad578a83da4d`),
+msg/s:
 
-At 1000 connections × 64 KiB across hosts, 1 MiB buffers matched `ring`
-(23.7k against 24.1k, the same p99), while 64 KiB buffers stayed at 21.6k at
-every pool size. 10k × 4 KiB on loopback needed 64 MiB to reach zero
-`ENOBUFS` and then matched `ring`. 10k × 256 B was the same at every pool
-size.
+| Workload (conns) | 256 × 16 KiB | 1024 × 16 KiB | 4096 × 16 KiB | 1024 × 64 KiB | INC 64 × 1 MiB |
+|---|---|---|---|---|---|
+| hv01 mixed (1000) | 58.4k | 60.5k | 56.1k | 73.5k | 73.6k |
+| hv01 64 KiB (1000) | 32.3k | 28.9k | 28.4k | 38.9k | 38.3k |
+| hv01 64 KiB (10k) | 29.6k | 27.0k | 27.2k | 35.1k | 34.8k |
+| hv01 1 MiB (64) | 3.3k | 2.7k | 2.2k | 2.9k | 5.7k |
+| hv01 stream 16 KiB (1000) | 216.6k | 187.4k | 180.6k | 215.4k | 234.0k |
+| two hosts mixed (1000) | 79.0k | 79.2k | 78.6k | 86.5k | 85.2k |
+| two hosts 64 KiB (1000) | 20.0k | 19.8k | 20.0k | 23.6k | 23.5k |
+| two hosts stream 16 KiB (1000) | 92.0k | 87.9k | 86.5k | 94.5k | 105.3k |
 
-Across hosts every 10k × 64 KiB configuration saturated the server core at
-about 46 µs per message. The work the strategies share (the kernel's TCP and
-copy work on that core) bounds it there; loopback, where data arrives in
-bursts at memory speed, is where the pool size and the extra copy show.
+Small messages were the same in every column.
+
+Lend cap, INC 64 × 1 MiB, every second connection holding each range for
+50 ms, 64 KiB × 1000 (hv01 `01a11520-57a3-7131-2c26-f10fce555c09`, two
+hosts `01a11520-5730-7182-d5f0-6a93de5e30e7`): no cap 20.1k (19.9k); caps
+0–0.75 between 36.6k and 38.0k (22.5–22.8k); no holds 38.2k (23.2k). On
+4 KiB and mixed traffic, and with 5 ms holds, every setting was within the
+noise.
+
+Per-connection rings with adaptive regions, hv01
+(`01a11649-5df3-7153-91b9-ff606706d842`), `ring_norewrite --adapt` (1 MiB
+cap) against INC 64 × 1 MiB: streaming at 1000 connections +21% (16 KiB) and
++26% (mixed sizes); streaming at 64 connections −6%; pipelined mixed −8%;
+mixed −13%; 64 KiB × 1000 −19%; 64 KiB × 10k −39%; 1 MiB × 64 −11%. Its
+regions grew to the cap and stayed: RSS about 1 GiB at 1000 connections on
+every workload, 6.2 GB at 10k × 64 KiB. A 256 KiB cap stalled at 1 MiB
+messages, which cannot fit.
+
+### Correctness
+
+Every byte verified (`--verify`), Linux 6.12 and 7.1, 1000–10,000
+connections, mixed, pipelined and streaming traffic:
+
+- INC on the shared ring (`01a114c0-d1a4`, `01a1150d-01a6`): clean in 186
+  runs, including a 64-entry CQ with a 32-entry SQ (overflow and inline
+  submits), SQPOLL, SQPOLL with the small queues, and held lends.
+- Per-connection rings (`01a11648-ef98`, `01a11648-f03c`, and the bisect
+  `01a1166a-fbc5`, `01a1166a-fc47`): `ring`, which rewrites a posted entry in
+  place to move its region, delivered wrong bytes with the small queues on
+  both kernels, adaptive or not (up to 26 bad messages in five runs).
+  `ring_norewrite` was clean in every run, including runs where the kernel
+  had written past the reaped bytes.
 
 ### Kernel facts on 7.1
 
@@ -388,38 +433,34 @@ entry advanced in place, re-posting after `F_BUF_MORE` clears continues the
 arm, a posted entry rewritten between enters is honoured, a stale arm writes
 into a re-registered bgid, and unregister then data gives `-ENOBUFS`.
 `ring-limit`: under the default 8 MiB `RLIMIT_MEMLOCK`, 2041 one-entry rings
-registered before `ENOMEM`, so 7.1 charges a page per ring.
+registered before `ENOMEM`.
 
 ### Reading against GO / NO-GO
 
 1. **Tuning burden on a mixed workload.** Not measured as an oracle gap. On
-   the mixed workload INC beat today's geometry by 8% throughput and 16% p99
-   on loopback, and matched it across hosts (its p99 advantage there is
-   within the A/A spread). By its own terms criterion 1 is not met. The
-   decision rests on a different finding: the shared ring starves at high
-   fan-in (15.7M `ENOBUFS` at 10k × 256 B), and INC at the same 4 MiB does
-   not starve at all.
-2. **Closing the gap untuned.** At 64 MiB in 1 MiB buffers, INC matched or
-   beat every other strategy across hosts, and lost only on loopback at
-   10k × 64 KiB (35.6k against 45.3k).
-3. **No homogeneous regression.** None: INC was within the A/A spread of
-   `shared` or ahead of it in every cell.
+   mixed traffic INC 64 × 1 MiB beat today's ring by 21% on hv01 and 8%
+   across hosts, and the best plain geometry (1024 × 64 KiB) matched it, so
+   much of that is buffer size rather than INC.
+2. **Closing the gap untuned.** INC 64 × 1 MiB beat today's ring or matched
+   it in every measured cell on both setups; the best fixed alternatives won
+   only cells shaped like them (64 KiB buffers at 64 KiB messages).
+3. **No homogeneous regression.** None on hv01 or across hosts.
 4. **The bid lifecycle.** Not tested; it is the design's subject.
 
-**"Is the win just bigger buffers in disguise?"** No. At the same 64 MiB,
-INC in 1 MiB buffers did 35.6k at 10k × 64 KiB where a plain ring of 16 KiB
-buffers did 24k (`shared_4096`, v2b); at 64 KiB × 64 connections a 4 MiB INC
-ring did 108k where the 64 MiB plain ring did 59k (v2).
+**"Is the win just bigger buffers in disguise?"** Partly. A plain ring of
+1024 × 64 KiB matches INC 64 × 1 MiB on 64 KiB, mixed and small traffic.
+INC's own gains are at 1 MiB messages (5.7k against 2.9k on hv01) and on
+streaming (234k against 215k on hv01, 105k against 95k across hosts). That
+plain ring is the design's choice for kernels without INC.
 
-**The per-connection strategies** were set aside on the owner's decision
-(2026-10-06). They won at large messages with high connection counts on
-loopback, and nowhere across hosts by more than the noise against a 1 MiB-buffer
-INC pool, while costing per-connection kernel objects (a bgid quarantine, a
-page of `RLIMIT_MEMLOCK` per connection on 6.14+), a dependence on rewriting
-a posted entry (or on never doing so), and 22% of streaming throughput across
-hosts.
+**Decision (owner, 2026-10-06 and 2026-10-07).** One shared ring per worker:
+INC 64 × 1 MiB on 6.12+, plain 1024 × 64 KiB below. Per-connection receive
+memory was rebuilt with adaptive regions and still not chosen: the variant
+that can move a live region corrupts data, and the one that cannot loses
+request/response traffic and keeps its grown memory. A hybrid that gives
+streaming and forwarding connections their own receive memory is a
+follow-up.
 
-**RSS.** The question above about touched pages staying resident stands: a
-64 MiB pool becomes 64 MiB resident per worker after a burst that touches it.
-The benchmark's RSS figures for streaming are not evidence either way; its
-accumulator policy, not the ring, dominated them.
+**RSS.** The open question above about touched pages staying resident
+stands, now with an answer for the ring: a 64 MiB pool is fully resident on
+any worker that has received 64 MiB.
