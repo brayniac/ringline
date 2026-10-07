@@ -423,6 +423,45 @@ connections was 737–891 MB, from accumulators grown by completions of up to
 two-host run (`01a11649-5e78-717b-a0c8-434715ed6dd3`) had not finished when
 this was written.
 
+### Latency at fixed rate
+
+The closed-loop client measured latency from the last byte written, and it
+compared configurations at different loads: a faster server drew more
+traffic and queued it. At 1 MiB × 64 on hv01 that read as p99 rising from
+5.0 ms (today's ring, 3.2k msg/s) to 13.6 ms (INC, 5.7k msg/s). The
+latency runs therefore use an open-loop client (`--rate`): each connection
+sends on a fixed schedule whatever has been acked, and latency runs from
+each message's scheduled time, so all configurations see the same traffic
+and a server that falls behind is charged for the queueing. Rates are about
+25, 50, 75 and 90% of today's ring's closed-loop capacity on each setup.
+hv01 `01a11778-a253-7123-caea-635929d95ac9`, two hosts
+`01a11778-a2d3-710c-2e87-72564e729f3c`; 400 runs each, none failed.
+
+p50 / p99 / p999 in ms:
+
+| Cell (rate) | Today 256 × 16 KiB | INC 64 × 1 MiB | plain 1024 × 64 KiB | plain 64 × 1 MiB |
+|---|---|---|---|---|
+| hv01 1 MiB × 64 (2400/s) | 2.4 / 3.7 / 3.9 | 2.1 / 3.3 / 3.8 | 2.5 / 3.9 / 4.5 | 2.0 / 3.0 / 3.3 |
+| hv01 1 MiB × 64 (2900/s) | 268 / 1074 / 1208 (2.7k/s served) | 2.1 / 3.5 / 3.9 | 2.6 / 105 / 419 | 2.0 / 2.9 / 3.3 |
+| hv01 256 KiB × 64 (11000/s) | 1.0 / 1.9 / 2.5 | 0.9 / 1.7 / 2.0 | 1.0 / 5.8 / 7.6 | 0.9 / 1.7 / 2.4 |
+| hv01 64 KiB × 1000 (28500/s) | 0.9 / 1.6 / 2.4 | 0.7 / 1.6 / 1.9 | 0.7 / 1.6 / 1.8 | 0.7 / 1.6 / 1.8 |
+| hv01 mixed × 1000 (54000/s) | 0.6 / 1.0 / 2.0 | 0.5 / 0.8 / 1.6 | 0.5 / 0.8 / 1.5 | 0.5 / 0.7 / 1.4 |
+| hv01 4 KiB × 1000 (70000/s) | 0.6 / 1.0 / 1.8 | 0.6 / 1.3 / 2.4 | 0.6 / 1.2 / 1.8 | 0.6 / 1.2 / 1.6 |
+| two hosts 1 MiB × 64 (1125/s) | 16.8 / 21.0 / 46.1 | 16.3 / 19.9 / 21.0 | 16.8 / 21.0 / 23.1 | 16.8 / 19.9 / 22.0 |
+| two hosts 256 KiB × 64 (4850/s) | 3.0 / 5.2 / 11.0 | 2.6 / 4.5 / 10.5 | 2.6 / 5.0 / 10.5 | 2.4 / 4.5 / 10.0 |
+| two hosts 64 KiB × 1000 (18000/s) | 2.2 / 4.2 / 5.8 | 2.0 / 3.1 / 4.7 | 1.9 / 3.1 / 4.2 | 2.0 / 3.1 / 5.2 |
+| two hosts mixed × 1000 (72000/s) | 1.0 / 2.1 / 3.7 | 0.9 / 1.9 / 2.6 | 0.9 / 1.8 / 2.8 | 0.9 / 1.9 / 2.9 |
+| two hosts 4 KiB × 1000 (67000/s) | 0.9 / 2.0 / 2.8 | 0.9 / 1.9 / 3.3 | 0.9 / 2.0 / 3.0 | 0.9 / 2.0 / 3.0 |
+
+At the lower rates every configuration was within about 0.3 ms of the
+others at p99. Near capacity INC kept its latency where today's ring fell
+behind (hv01, 1 MiB at 2900/s). INC's p999 was higher than today's ring's
+at 4 KiB near capacity on both setups (2.4 against 1.8 ms; 3.3 against
+2.8 ms). Plain 1024 × 64 KiB had a large-message tail on hv01 near capacity
+(p99 105 ms at 1 MiB, 5.8 ms at 256 KiB). Plain 64 × 1 MiB, a 64-deep
+plain ring, matched the others at these connection counts; it was not
+tested with more connections or bursts, where its depth is the risk.
+
 ### Correctness
 
 Every byte verified (`--verify`), Linux 6.12 and 7.1, 1000–10,000
@@ -465,8 +504,9 @@ registered before `ENOMEM`.
    streaming at 64 connections (10–16%, three of four sizes) on hv01, INC 16 × 1 MiB at 1 MiB
    × 64 (11%) and streaming at 64 connections (23%) on hv01, and `ring` at
    1 MiB across hosts (24%).
-3. **No homogeneous regression.** None on throughput. On latency, p99 at
-   1 MiB × 64 on hv01 rose from 5.0 ms to 13.6 ms. On hv01, streaming at 64
+3. **No homogeneous regression.** None on throughput. At equal offered load
+   (see "Latency at fixed rate"), latency matched today's ring or was lower,
+   except p999 at 4 KiB messages near capacity. On hv01, streaming at 64
    connections used up the 64 MiB ring in every run (about 30–42k
    `ENOBUFS` per run).
 4. **The bid lifecycle.** Not tested; it is the design's subject.

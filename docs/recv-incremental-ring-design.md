@@ -46,9 +46,9 @@ finished with it and nothing holds any of its bytes.
   once the worker has received 64 MiB. Completions of up to 1 MiB also grow
   accumulators: in the benchmark, process RSS streaming at 1000 connections
   was 737–891 MB with the INC ring against 92–264 MB with the 4 MiB ring.
-- At 1 MiB messages over 64 connections on hv01, p99 latency was 13.6 ms
-  with the INC ring against 5.0 ms with the 4 MiB ring, at 70% more
-  throughput.
+- At equal offered load, latency matched the 4 MiB ring's or was lower,
+  except p999 at 4 KiB messages near capacity (1000 connections): 2.4 ms
+  against 1.8 ms on hv01, 3.3 ms against 2.8 ms across hosts.
 - The ring emulator (#621), if it lands, must reproduce incremental shared
   buffers.
 
@@ -276,8 +276,10 @@ lends refused by the per-worker cap, and the ring kind in use.
    kernel before 6.12: INC 64 × 1 MiB and plain 1024 × 64 KiB against the
    256 × 16 KiB ring, with the bench suite (echo at 256 B to 1 MiB, mixed
    sizes, the #415 forward proxy, streaming, 64 to 10,000 connections).
-   Record throughput, p99 and RSS, five reps or more per cell with an A/A
-   pair on each setup; a difference counts when it exceeds the A/A spread.
+   Record throughput, RSS, and p50/p99/p999 at fixed offered load (an
+   open-loop client measuring from each message's scheduled time), five
+   reps or more per cell with an A/A pair on each setup; a difference
+   counts when it exceeds the A/A spread.
    Gate: no cell slower, or worse at p99, than the 256 × 16 KiB ring beyond
    that spread, and no sustained `buffer_ring_empty`. A cell that fails is
    resolved before step 5, by geometry for that kernel or by keeping the
