@@ -54,6 +54,8 @@ pub struct Shared {
     rearms: u64,
     hold_every: usize,
     hold: Duration,
+    /// `--no-thp`: back the buffers with 4 KiB pages.
+    no_thp: bool,
     /// Most buffers that may be pinned by holds at once.
     lend_cap: usize,
     holds: Vec<u32>,
@@ -82,6 +84,7 @@ impl Shared {
         hold_every: usize,
         hold_us: u64,
         lend_cap: f64,
+        no_thp: bool,
     ) -> Self {
         let fallback_chunk = (4 * buf_size).max(1 << 20);
         Shared {
@@ -103,6 +106,7 @@ impl Shared {
             fallbacks: 0,
             rearms: 0,
             hold_every,
+            no_thp,
             hold: Duration::from_micros(hold_us),
             lend_cap: (lend_cap * bufs as f64) as usize,
             holds: vec![0; bufs],
@@ -195,6 +199,20 @@ impl Shared {
     }
 }
 
+/// Resident KiB of the `len` bytes at `base`, by `mincore`.
+fn resident_kb(base: *mut u8, len: usize) -> usize {
+    if base.is_null() || len == 0 {
+        return 0;
+    }
+    let pages = len.div_ceil(PAGE);
+    let mut vec = vec![0u8; pages];
+    let rc = unsafe { libc::mincore(base.cast(), len, vec.as_mut_ptr()) };
+    if rc != 0 {
+        return 0;
+    }
+    vec.iter().filter(|&&b| b & 1 != 0).count() * PAGE / 1024
+}
+
 impl Strategy for Shared {
     fn name(&self) -> String {
         format!("{}-{}x{}", if self.inc { "shared_inc" } else { "shared" }, self.bufs, self.buf_size)
@@ -203,6 +221,11 @@ impl Strategy for Shared {
     fn start(&mut self, cx: &mut Ctx) {
         let ring_mem = mmap_anon((self.bufs * 16).max(PAGE));
         self.backing = mmap_anon(self.bufs * self.buf_size);
+        if self.no_thp {
+            // 4 KiB pages: a completion makes resident only the pages it
+            // writes, rather than the 2 MiB huge page around them.
+            unsafe { libc::madvise(self.backing.cast(), self.bufs * self.buf_size, libc::MADV_NOHUGEPAGE) };
+        }
         let flags = if self.inc { PBUF_RING_INC } else { 0 };
         unsafe {
             cx.uring
@@ -328,7 +351,7 @@ impl Strategy for Shared {
 
     fn report(&self) -> String {
         format!(
-            "lent_bytes={} copied_bytes={} enobufs={} fallbacks={} rearms={} held_lends={} capped_copies={} pinned_peak={}",
+            "lent_bytes={} copied_bytes={} enobufs={} fallbacks={} rearms={} held_lends={} capped_copies={} pinned_peak={} ring_resident_kb={}",
             self.lent,
             self.copied,
             self.enobufs,
@@ -336,7 +359,8 @@ impl Strategy for Shared {
             self.rearms,
             self.held_lends,
             self.capped_copies,
-            self.pinned_peak
+            self.pinned_peak,
+            resident_kb(self.backing, self.bufs * self.buf_size)
         )
     }
 }

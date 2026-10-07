@@ -251,7 +251,7 @@ pub fn run(args: &[String]) {
     println!(
         "RESULT strategy={} sqpoll={} conns={} msgs_per_sec={:.0} mbyte_per_sec={:.1} \
          cpu_ns_per_msg={:.0} cpu_ns_per_kib={:.0} main_util={:.3} proc_util={:.3} \
-         idle_rss_kb={} rss_kb={} sq_full={} sends_failed={} dead={} touch={} verify={} bad={} corrupt={} {}",
+         idle_rss_kb={} rss_kb={} hwm_kb={} sq_full={} sends_failed={} dead={} touch={} verify={} bad={} corrupt={} {}",
         strategy.name(),
         sqpoll,
         nconns,
@@ -263,6 +263,7 @@ pub fn run(args: &[String]) {
         proc_cpu / secs,
         idle_rss,
         status_kb("VmRSS:"),
+        status_kb("VmHWM:"),
         cx.sq_full,
         cx.sends_failed,
         dead,
