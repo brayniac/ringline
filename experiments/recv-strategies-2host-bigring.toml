@@ -4,7 +4,7 @@
 name = "ringline recv large plain ring and RSS 2-host bpo (#622)"
 
 [params]
-bins_artifact = "REPLACE_WITH_BUILD_ARTIFACT"
+bins_artifact = "01a11783-b075-73ab-c583-86780d5eab83"
 image     = "spool/images/debian-13-ci-bpo-20261001.1@golden"
 server_ip = "172.31.0.1"
 client_ip = "172.31.0.2"
