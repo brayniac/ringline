@@ -1,0 +1,111 @@
+# Which INC geometry should be the default? The pool sweep found 1 MiB
+# buffers best at 64 KiB messages but a 4 MiB pool fastest on streaming
+# across hosts; this runs 4-64 MiB in 64 KiB, 256 KiB and 1 MiB buffers on
+# streaming, 1 MiB messages and the earlier cells, against today's ring and
+# per-connection rings. Loopback on one VM, as v2.
+name = "ringline recv INC geometry (#622)"
+
+[params]
+branch   = "exp/recv-strategies"
+repo     = "https://github.com/brayniac/ringline"
+reps     = "5"
+warmup   = "2"
+duration = "8"
+threads  = "12"
+
+[[jobs]]
+name = "recv-strategies"
+tags = ["validation"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+shape = "z4.c"
+image = "spool/images/debian-13-ci-20260912.1@golden"
+slots = 1
+memory_gib = 8
+ports = 0
+gpu = false
+payload_timeout = 14400
+artifacts = ["/home/anvil/run.log"]
+upload = true
+payload = '''
+set -uo pipefail
+cd /home/anvil
+{
+  uname -srm; n=$(nproc); echo "nproc=$n"; lscpu | grep -E "Model name|MHz" | head -3
+  [ "$n" -ge 8 ] || { echo "FATAL: need >=8 CPUs"; exit 1; }
+  git clone -q {repo} src && git -C src checkout -q {branch} && git -C src log --oneline -1
+  (cd src/experiments/recv-strategies && cargo build --release --locked) || { echo "FATAL: build"; exit 1; }
+  B=/home/anvil/src/experiments/recv-strategies/target/release/recv-strategies
+  sudo sysctl -qw net.ipv4.ip_local_port_range="10000 65535" net.ipv4.tcp_tw_reuse=1 \
+    net.core.somaxconn=65535 net.ipv4.tcp_max_syn_backlog=65535
+  hard=$(ulimit -Hn); [ "$hard" = unlimited ] && hard=1048576; ulimit -n "$hard"
+  echo "memlock=$(ulimit -l)"
+  for len in 64 256 4096; do taskset -c 0 $B bytes-bench --iters 20000000 --len $len; done
+
+  # label | server args
+  defer=(
+    "inc_4M_64k|--strategy shared_inc --shared-bufs 64 --shared-buf-size 65536"
+    "inc_16M_1m|--strategy shared_inc --shared-bufs 16 --shared-buf-size 1048576"
+    "inc_16M_256k|--strategy shared_inc --shared-bufs 64 --shared-buf-size 262144"
+    "inc_64M_1m|--strategy shared_inc --shared-bufs 64 --shared-buf-size 1048576"
+    "plain_4M|--strategy shared --shared-bufs 256 --shared-buf-size 16384"
+    "ring|--strategy ring"
+  )
+  sqp=()
+  # workload | conns | client args | server extra | sqpoll too?
+  cells=(
+    "stream-16k|64|--msg-size 16384 --stream|--no-ack|0"
+    "stream-16k|1000|--msg-size 16384 --stream|--no-ack|0"
+    "reqack-1m|64|--msg-size 1048576||0"
+    "reqack-64k|1000|--msg-size 65536||0"
+    "mixed|1000|--mix 256:9,65536:1||0"
+    "reqack-256|10000|--msg-size 256||0"
+  )
+  port=7000
+  run_one() { # label, server args, workload, conns, client args, server extra, rep
+    local label="$1" sargs="$2" wl="$3" conns="$4" cargs="$5" sextra="$6" rep="$7"
+    port=$((port+1)); [ $port -gt 9900 ] && port=7001
+    taskset -c 0 $B server --addr 127.0.0.1:$port --conns $conns $sargs $sextra \
+      --warmup {warmup} --duration {duration} > srv.out 2> srv.err &
+    local spid=$!
+    sleep 0.3
+    taskset -c 2-$((n-1)) $B client --addr 127.0.0.1:$port --conns $conns --threads {threads} \
+      $cargs --warmup {warmup} --seconds $(( {warmup} + {duration} + 2 )) --start-delay-ms 1000 \
+      > cli.out 2> cli.err
+    wait $spid; local src=$?
+    local r; r=$(grep '^RESULT' srv.out)
+    if [ -z "$r" ]; then
+      echo "FAIL rep=$rep wl=$wl conns=$conns cfg=$label server_exit=$src"
+      sed 's/^/  srv| /' srv.err | tail -5; sed 's/^/  cli| /' cli.err | tail -5
+    else
+      echo "ROW rep=$rep wl=$wl cfg=$label $r $(cat cli.out)"
+    fi
+  }
+  for rep in $(seq 1 {reps}); do
+    for cell in "${cells[@]}"; do
+      IFS='|' read -r wl conns cargs sextra withsq <<< "$cell"
+      k=${#defer[@]}
+      for i in $(seq 0 $((k-1))); do
+        IFS='|' read -r label sargs <<< "${defer[$(( (i + rep) % k ))]}"
+        run_one "$label" "$sargs" "$wl" "$conns" "$cargs" "$sextra" "$rep"
+      done
+      if [ "$withsq" = 1 ]; then
+        for i in 0 1; do
+          IFS='|' read -r label sargs <<< "${sqp[$(( (i + rep) % 2 ))]}"
+          run_one "$label" "$sargs" "$wl" "$conns" "$cargs" "$sextra" "$rep"
+        done
+      fi
+    done
+  done
+  echo "DONE"
+} 2>&1 | tee /home/anvil/run.log
+exit 0
+'''
+
+[[jobs.steps]]
+type = "shell"
+command = '''
+grep -q '^DONE' run.log || { echo "run did not finish"; exit 1; }
+echo "rows=$(grep -c '^ROW' run.log) fails=$(grep -c '^FAIL' run.log)"
+'''
