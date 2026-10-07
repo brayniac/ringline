@@ -325,7 +325,8 @@ Two setups, both on Linux 7.1.13 (the backports image):
 
 Five reps per cell, configurations interleaved within each rep; medians
 below. An A/A pair (the same configuration twice) agreed within 1–2% on
-hv01.
+hv01; the two-host experiments had no A/A pair, and their per-cell spreads
+were 0–11%.
 
 **Superseded.** The first loopback runs (v1 `01a1121f`, v2 `01a11274`, v2b
 `01a112fc-f7ea`, the pool sweep `01a1134e-f20c`, the plain-ring and lend-cap
@@ -373,7 +374,8 @@ Geometry, hv01 (`01a11520-55d2-7179-7c79-b2a7536f50c1`): a 16 MiB pool of
 
 Streaming alignment, hv01 (`01a11520-5543-7171-7461-ba465491f200`). INC
 beat today's ring in every streaming cell, at 12000 B, 16384 B, 20000 B and
-mixed sizes, 64 and 1000 connections: by 8–45%, at 10–30% less CPU per KiB.
+mixed sizes, 64 and 1000 connections: INC 64 × 1 MiB by 8–50% at 7–33% less
+CPU per KiB, and INC 64 × 64 KiB by 10–43% at 9–30% less.
 Today's ring parsed 99% of bytes in place only when the message size equalled
 its 16 KiB buffer and the ring kept running dry (16384 B × 1000), and 0–4%
 otherwise.
@@ -393,14 +395,20 @@ msg/s:
 | two hosts 64 KiB (1000) | 20.0k | 19.8k | 20.0k | 23.6k | 23.5k |
 | two hosts stream 16 KiB (1000) | 92.0k | 87.9k | 86.5k | 94.5k | 105.3k |
 
-Small messages were the same in every column.
+Small messages were the same in every column. Today's ring beat
+1024 × 64 KiB at 1 MiB × 64 on hv01 (3.3k against 2.9k); across hosts the
+two were level, and INC's 1 MiB gain disappeared there (1.6k in every
+column).
 
 Lend cap, INC 64 × 1 MiB, every second connection holding each range for
 50 ms, 64 KiB × 1000 (hv01 `01a11520-57a3-7131-2c26-f10fce555c09`, two
 hosts `01a11520-5730-7182-d5f0-6a93de5e30e7`): no cap 20.1k (19.9k); caps
-0–0.75 between 36.6k and 38.0k (22.5–22.8k); no holds 38.2k (23.2k). On
-4 KiB and mixed traffic, and with 5 ms holds, every setting was within the
-noise.
+0–0.75 between 36.6k and 38.0k (22.5–22.8k); no holds 38.2k (23.2k). Across
+hosts, caps 0–0.75 were within 3% of each other on 4 KiB, 64 KiB and mixed
+traffic; on hv01 mixed traffic they spread 68.3–76.8k, which its per-cell
+spreads (±4–16%) cannot resolve. With 5 ms holds the pinned buffers peaked
+at 19, so caps of 0.5 and above never engaged. Only 1000 connections were
+measured.
 
 Per-connection rings with adaptive regions, hv01
 (`01a11649-5df3-7153-91b9-ff606706d842`), `ring_norewrite --adapt` (1 MiB
@@ -408,23 +416,33 @@ cap) against INC 64 × 1 MiB: streaming at 1000 connections +21% (16 KiB) and
 +26% (mixed sizes); streaming at 64 connections −6%; pipelined mixed −8%;
 mixed −13%; 64 KiB × 1000 −19%; 64 KiB × 10k −39%; 1 MiB × 64 −11%. Its
 regions grew to the cap and stayed: RSS about 1 GiB at 1000 connections on
-every workload, 6.2 GB at 10k × 64 KiB. A 256 KiB cap stalled at 1 MiB
-messages, which cannot fit.
+every workload, 6.1 GiB at 10k × 64 KiB. INC's own RSS streaming at 1000
+connections was 737–891 MB, from accumulators grown by completions of up to
+1 MiB. `ring --adapt` with a 256 KiB cap (the rewriting variant) stalled at
+1 MiB messages, which cannot fit. These were measured on hv01 only; the
+two-host run (`01a11649-5e78-717b-a0c8-434715ed6dd3`) had not finished when
+this was written.
 
 ### Correctness
 
 Every byte verified (`--verify`), Linux 6.12 and 7.1, 1000–10,000
 connections, mixed, pipelined and streaming traffic:
 
-- INC on the shared ring (`01a114c0-d1a4`, `01a1150d-01a6`): clean in 186
-  runs, including a 64-entry CQ with a 32-entry SQ (overflow and inline
-  submits), SQPOLL, SQPOLL with the small queues, and held lends.
+- INC on the shared ring (`01a114c0-d1a4`, `01a1150d-01a6`): clean in 144
+  runs (174 with the bisect's small-queue runs), including a 64-entry CQ
+  with a 32-entry SQ (inline submits recorded; CQ overflow not measured),
+  SQPOLL, SQPOLL with the small queues, and held lends. A deliberate
+  one-byte offset error in the INC strategy, tried locally, was caught at
+  once.
 - Per-connection rings (`01a11648-ef98`, `01a11648-f03c`, and the bisect
   `01a1166a-fbc5`, `01a1166a-fc47`): `ring`, which rewrites a posted entry in
   place to move its region, delivered wrong bytes with the small queues on
-  both kernels, adaptive or not (up to 26 bad messages in five runs).
-  `ring_norewrite` was clean in every run, including runs where the kernel
-  had written past the reaped bytes.
+  both kernels, adaptive or not (up to 26 bad messages in five runs), with
+  a 64-entry CQ and a 32-entry SQ; with default queues it was clean.
+  `ring_norewrite` delivered no wrong byte in any run, including one where
+  the kernel had written past the reaped bytes. Three of its small-queue
+  streaming runs (two on 6.12, one on 7.1) lost one connection each, which
+  is unexplained.
 
 ### Kernel facts on 7.1
 
@@ -442,9 +460,15 @@ registered before `ENOMEM`.
    across hosts, and the best plain geometry (1024 × 64 KiB) matched it, so
    much of that is buffer size rather than INC.
 2. **Closing the gap untuned.** INC 64 × 1 MiB beat today's ring or matched
-   it in every measured cell on both setups; the best fixed alternatives won
-   only cells shaped like them (64 KiB buffers at 64 KiB messages).
-3. **No homogeneous regression.** None on hv01 or across hosts.
+   it on throughput in every measured cell on both setups. Other geometries
+   beat it in some cells: INC 64 × 64 KiB at 64 KiB messages (13–17%) and on
+   streaming at 64 connections (10–16%, three of four sizes) on hv01, INC 16 × 1 MiB at 1 MiB
+   × 64 (11%) and streaming at 64 connections (23%) on hv01, and `ring` at
+   1 MiB across hosts (24%).
+3. **No homogeneous regression.** None on throughput. On latency, p99 at
+   1 MiB × 64 on hv01 rose from 5.0 ms to 13.6 ms. On hv01, streaming at 64
+   connections used up the 64 MiB ring in every run (about 30–42k
+   `ENOBUFS` per run).
 4. **The bid lifecycle.** Not tested; it is the design's subject.
 
 **"Is the win just bigger buffers in disguise?"** Partly. A plain ring of
@@ -454,7 +478,8 @@ streaming (234k against 215k on hv01, 105k against 95k across hosts). That
 plain ring is the design's choice for kernels without INC.
 
 **Decision (owner, 2026-10-06 and 2026-10-07).** One shared ring per worker:
-INC 64 × 1 MiB on 6.12+, plain 1024 × 64 KiB below. Per-connection receive
+INC 64 × 1 MiB on 6.12+, plain 1024 × 64 KiB below. Measurements are taken
+on hv01 and hv02, not on the validation host. Per-connection receive
 memory was rebuilt with adaptive regions and still not chosen: the variant
 that can move a live region corrupts data, and the one that cannot loses
 request/response traffic and keeps its grown memory. A hybrid that gives
