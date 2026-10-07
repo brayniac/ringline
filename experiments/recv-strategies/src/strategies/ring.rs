@@ -9,6 +9,12 @@
 //! copies through the kernel's write position, which INC records in the
 //! posted entry.
 //!
+//! With `--adapt`, a connection whose posted space was used up while data
+//! was flowing (`F_BUF_MORE` cleared, or `-ENOBUFS`) doubles its region at
+//! the next settle, up to `--region-max`, so a busy connection posts enough
+//! for the kernel to keep the arm live; one that stays empty for
+//! `SHRINK_AFTER` settles halves it, down to the starting size.
+//!
 //! `ring` moves a posted entry in place: it rewrites the entry's address
 //! between enters (relies on DEFER_TASKRUN). `ring_norewrite` never touches
 //! a posted entry: the region moves only after the kernel has used the
@@ -18,8 +24,15 @@ use crate::common::{BufRing, PAGE, PBUF_RING_INC, Region, mmap_anon};
 use crate::server::{Ctx, Strategy, TAG_RECV, ud};
 use io_uring::{cqueue, opcode, types};
 
+/// Settles a connection's region must stay empty before it halves.
+const SHRINK_AFTER: u32 = 64;
+
 struct Conn {
     region: Region,
+    /// `--adapt`: the posted space was used up since the last settle.
+    filled: bool,
+    /// `--adapt`: consecutive settles with nothing unread.
+    quiet: u32,
     ring: BufRing,
     /// The ring's entry is live: the kernel may write into it.
     posted: bool,
@@ -31,6 +44,9 @@ struct Conn {
 
 pub struct Ring {
     rewrite: bool,
+    adapt: bool,
+    initial: usize,
+    shrinks: u64,
     region_max: usize,
     conns: Vec<Conn>,
     /// The kernel had written past the reaped bytes when a move ran.
@@ -42,12 +58,14 @@ pub struct Ring {
 }
 
 impl Ring {
-    pub fn new(rewrite: bool, nconns: usize, region: usize, region_max: usize) -> Self {
+    pub fn new(rewrite: bool, adapt: bool, nconns: usize, region: usize, region_max: usize) -> Self {
         assert!(nconns < 65535, "one buffer group id per connection");
         let pages = mmap_anon(nconns * PAGE);
         let conns = (0..nconns)
             .map(|i| Conn {
                 region: Region::new(region),
+                filled: false,
+                quiet: 0,
                 ring: BufRing::new(unsafe { pages.add(i * PAGE) }, 1),
                 posted: false,
                 need: 4,
@@ -55,7 +73,19 @@ impl Ring {
                 dead: false,
             })
             .collect();
-        Ring { rewrite, region_max, conns, ahead_of_reaped: 0, moves: 0, grows: 0, rearms: 0, enobufs: 0 }
+        Ring {
+            rewrite,
+            adapt,
+            initial: region,
+            shrinks: 0,
+            region_max,
+            conns,
+            ahead_of_reaped: 0,
+            moves: 0,
+            grows: 0,
+            rearms: 0,
+            enobufs: 0,
+        }
     }
 
     fn bgid(c: usize) -> u16 {
@@ -75,7 +105,12 @@ impl Strategy for Ring {
     fn name(&self) -> String {
         format!(
             "{}-{}",
-            if self.rewrite { "ring" } else { "ring_norewrite" },
+            match (self.rewrite, self.adapt) {
+                (true, false) => "ring",
+                (false, false) => "ring_norewrite",
+                (true, true) => "ring_adapt",
+                (false, true) => "ring_norewrite_adapt",
+            },
             self.conns.first().map(|c| c.region.cap).unwrap_or(0)
         )
     }
@@ -101,6 +136,7 @@ impl Strategy for Ring {
             conn.region.tail += res as usize;
             if !cqueue::buffer_more(flags) {
                 conn.posted = false;
+                conn.filled = true;
             }
             let p = cx.deliver(c, conn.region.unread());
             conn.region.head += p.consumed;
@@ -113,6 +149,7 @@ impl Strategy for Ring {
         if res == -libc::ENOBUFS {
             self.enobufs += 1;
             conn.posted = false;
+            conn.filled = true;
             conn.rearm = true;
             return;
         }
@@ -121,6 +158,8 @@ impl Strategy for Ring {
 
     fn settle(&mut self, cx: &mut Ctx, c: usize) {
         let rewrite = self.rewrite;
+        let adapt = self.adapt;
+        let initial = self.initial;
         let region_max = self.region_max;
         let conn = &mut self.conns[c];
         if conn.dead {
@@ -139,12 +178,28 @@ impl Strategy for Ring {
             self.ahead_of_reaped += 1;
         }
         let mut moved = false;
+        let filled = std::mem::take(&mut conn.filled);
+        if adapt {
+            conn.quiet = if written == r.head { conn.quiet + 1 } else { 0 };
+        }
         if rewrite || !conn.posted {
             let head = r.head;
+            let mut want = r.cap;
             if conn.need > r.cap {
-                let new_cap = conn.need.next_power_of_two().min(region_max).max(r.cap);
-                r.relocate(new_cap, written);
+                want = conn.need.next_power_of_two();
+            }
+            if adapt && filled {
+                want = want.max(r.cap * 2);
+            }
+            let want = want.min(region_max).max(r.cap);
+            if want > r.cap {
+                r.relocate(want, written);
                 self.grows += 1;
+                moved = true;
+            } else if adapt && conn.quiet >= SHRINK_AFTER && r.cap > initial && written == head {
+                r.relocate(r.cap / 2, written);
+                conn.quiet = 0;
+                self.shrinks += 1;
                 moved = true;
             } else if head > 0 && (written == head || written == r.cap) {
                 // Empty: start over at the front. Full, with consumed bytes
@@ -183,8 +238,15 @@ impl Strategy for Ring {
     fn report(&self) -> String {
         let copied: u64 = self.conns.iter().map(|c| c.region.copied).sum();
         format!(
-            "moves={} grows={} copied_bytes={} ahead_of_reaped={} enobufs={} rearms={}",
-            self.moves, self.grows, copied, self.ahead_of_reaped, self.enobufs, self.rearms
+            "moves={} grows={} shrinks={} copied_bytes={} ahead_of_reaped={} enobufs={} rearms={} region_kib_total={}",
+            self.moves,
+            self.grows,
+            self.shrinks,
+            copied,
+            self.ahead_of_reaped,
+            self.enobufs,
+            self.rearms,
+            self.conns.iter().map(|c| c.region.cap).sum::<usize>() / 1024
         )
     }
 }

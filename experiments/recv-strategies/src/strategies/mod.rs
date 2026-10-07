@@ -6,7 +6,7 @@ mod oneshot;
 mod ring;
 mod shared;
 
-use crate::arg;
+use crate::{arg, flag};
 use crate::server::Strategy;
 
 pub fn build(name: &str, args: &[String], nconns: usize, sqpoll: bool) -> Box<dyn Strategy> {
@@ -36,7 +36,7 @@ pub fn build(name: &str, args: &[String], nconns: usize, sqpoll: bool) -> Box<dy
         )),
         "ring" | "ring_norewrite" => {
             assert!(!sqpoll, "the ring strategies rely on DEFER_TASKRUN");
-            Box::new(ring::Ring::new(name == "ring", nconns, region, region_max))
+            Box::new(ring::Ring::new(name == "ring", flag(args, "--adapt"), nconns, region, region_max))
         }
         "oneshot" => Box::new(oneshot::Oneshot::new(nconns, region, region_max)),
         s => panic!("unknown strategy {s}"),
