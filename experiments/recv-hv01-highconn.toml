@@ -10,7 +10,7 @@
 name = "ringline recv high connection counts hv01 (#622)"
 
 [params]
-bins_artifact = "REPLACE_WITH_BUILD_ARTIFACT"
+bins_artifact = "01a1185e-4f66-738c-37b8-e8b4001bc300"
 image    = "spool/images/debian-13-ci-bpo-20261001.1@golden"
 reps     = "3"
 warmup   = "2"
