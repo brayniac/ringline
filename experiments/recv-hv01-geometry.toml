@@ -10,7 +10,7 @@
 name = "ringline recv INC geometry hv01 (#622)"
 
 [params]
-bins_artifact = "REPLACE_WITH_BUILD_ARTIFACT"
+bins_artifact = "01a11520-0ab2-73db-250c-321f73211289"
 image    = "spool/images/debian-13-ci-bpo-20261001.1@golden"
 reps     = "5"
 warmup   = "2"
