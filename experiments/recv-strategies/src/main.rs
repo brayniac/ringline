@@ -124,6 +124,9 @@ struct ClientCfg {
     msgs: Vec<Vec<u8>>,
     weights: Vec<u32>,
     measure_from: Instant,
+    /// When the open-loop schedules start, shared by every client thread so
+    /// `--burst` arrivals line up across threads.
+    epoch: Instant,
 }
 
 fn client(args: &[String]) {
@@ -140,6 +143,10 @@ fn client(args: &[String]) {
     // connection on its own fixed schedule, and measure latency from the
     // scheduled send time. 0 keeps the closed loop.
     let rate: f64 = arg(args, "--rate", Some(0.0));
+    // With --rate: every connection sends at the same instants instead of
+    // staggered across the interval, so arrivals come in bursts of one
+    // message per connection.
+    let burst = flag(args, "--burst");
     let mix: String = if flag(args, "--mix") {
         arg(args, "--mix", None)
     } else {
@@ -187,6 +194,7 @@ fn client(args: &[String]) {
         msgs,
         weights,
         measure_from: Instant::now() + Duration::from_secs(warmup),
+        epoch: Instant::now() + Duration::from_millis(100),
     });
     let done = Arc::new(AtomicBool::new(false));
     let per = nconns.div_ceil(threads);
@@ -204,7 +212,7 @@ fn client(args: &[String]) {
             None
         };
         handles.push(std::thread::spawn(move || match per_conn_interval {
-            Some(interval) => client_rate_thread(t as u64, mine, cfg, done, interval),
+            Some(interval) => client_rate_thread(t as u64, mine, cfg, done, interval, burst),
             None => client_thread(t as u64, mine, cfg, done),
         }));
     }
@@ -318,11 +326,12 @@ fn client_rate_thread(
     cfg: Arc<ClientCfg>,
     done: Arc<AtomicBool>,
     interval: Duration,
+    burst: bool,
 ) -> (u64, Hist) {
     use mio::{Events, Interest, Poll, Token};
     let mut poll = Poll::new().unwrap();
     let n = streams.len().max(1);
-    let start = Instant::now();
+    let start = cfg.epoch;
     let mut conns: Vec<RateConn> = streams
         .into_iter()
         .enumerate()
@@ -330,8 +339,9 @@ fn client_rate_thread(
             s.set_nonblocking(true).unwrap();
             let mut sock = mio::net::TcpStream::from_std(s);
             poll.registry().register(&mut sock, Token(i), Interest::READABLE | Interest::WRITABLE).unwrap();
-            // Stagger the connections across one interval.
-            let offset = interval.mul_f64((i as f64 + (seed as f64 % 1.0)) / n as f64);
+            // Stagger the connections across one interval, or with
+            // `burst` start them all together.
+            let offset = if burst { Duration::ZERO } else { interval.mul_f64(i as f64 / n as f64) };
             RateConn { sock, next_due: start + offset, pending: VecDeque::new(), off: 0, sent: VecDeque::new() }
         })
         .collect();
