@@ -117,6 +117,9 @@ impl Hist {
 struct ClientCfg {
     depth: usize,
     stream: bool,
+    /// Stamp each message with the connection's sequence number and a
+    /// payload derived from it, for the server's `--verify`.
+    verify: bool,
     /// Pre-built messages (header + payload) and their cumulative weights.
     msgs: Vec<Vec<u8>>,
     weights: Vec<u32>,
@@ -131,6 +134,7 @@ fn client(args: &[String]) {
     let warmup: u64 = arg(args, "--warmup", Some(2));
     let delay_ms: u64 = arg(args, "--start-delay-ms", Some(1000));
     let stream = flag(args, "--stream");
+    let verify = flag(args, "--verify");
     let depth: usize = arg(args, "--depth", Some(1));
     let mix: String = if flag(args, "--mix") {
         arg(args, "--mix", None)
@@ -175,6 +179,7 @@ fn client(args: &[String]) {
     let cfg = Arc::new(ClientCfg {
         depth,
         stream,
+        verify,
         msgs,
         weights,
         measure_from: Instant::now() + Duration::from_secs(warmup),
@@ -216,6 +221,10 @@ struct ConnState {
     cur: Option<(usize, usize)>,
     /// Send times of messages written and not yet acked.
     sent: VecDeque<Instant>,
+    /// `--verify`: the message being written, stamped, and the next
+    /// sequence number.
+    stamped: Vec<u8>,
+    seq: u32,
 }
 
 /// Write messages while fewer than `depth` are outstanding (always, when
@@ -225,10 +234,24 @@ fn fill(cfg: &ClientCfg, c: &mut ConnState, pick: &mut dyn FnMut() -> usize) {
         if !cfg.stream && c.cur.is_none() && c.sent.len() >= cfg.depth {
             return;
         }
-        let (i, off) = *c.cur.get_or_insert_with(|| (pick(), 0));
-        match c.sock.write(&cfg.msgs[i][off..]) {
+        let (i, off) = match c.cur {
+            Some(cur) => cur,
+            None => {
+                let i = pick();
+                if cfg.verify {
+                    c.stamped.clear();
+                    c.stamped.extend_from_slice(&cfg.msgs[i]);
+                    stamp(&mut c.stamped, c.seq);
+                    c.seq = c.seq.wrapping_add(1);
+                }
+                c.cur = Some((i, 0));
+                (i, 0)
+            }
+        };
+        let msg: &[u8] = if cfg.verify { &c.stamped } else { &cfg.msgs[i] };
+        match c.sock.write(&msg[off..]) {
             Ok(n) => {
-                if off + n == cfg.msgs[i].len() {
+                if off + n == msg.len() {
                     c.cur = None;
                     if !cfg.stream {
                         c.sent.push_back(Instant::now());
@@ -244,6 +267,18 @@ fn fill(cfg: &ClientCfg, c: &mut ConnState, pick: &mut dyn FnMut() -> usize) {
     }
 }
 
+/// Write `seq` and the payload derived from it into message `m` (header
+/// already set). The server's `--verify` checks the same pattern.
+fn stamp(m: &mut [u8], seq: u32) {
+    let payload = &mut m[4..];
+    if payload.len() >= 4 {
+        payload[..4].copy_from_slice(&seq.to_le_bytes());
+        for (i, b) in payload[4..].iter_mut().enumerate() {
+            *b = common::pattern(seq, i);
+        }
+    }
+}
+
 fn client_thread(seed: u64, streams: Vec<TcpStream>, cfg: Arc<ClientCfg>, done: Arc<AtomicBool>) -> (u64, Hist) {
     use mio::{Events, Interest, Poll, Token};
     let mut poll = Poll::new().unwrap();
@@ -254,7 +289,7 @@ fn client_thread(seed: u64, streams: Vec<TcpStream>, cfg: Arc<ClientCfg>, done: 
             s.set_nonblocking(true).unwrap();
             let mut sock = mio::net::TcpStream::from_std(s);
             poll.registry().register(&mut sock, Token(i), Interest::READABLE | Interest::WRITABLE).unwrap();
-            ConnState { sock, cur: None, sent: VecDeque::new() }
+            ConnState { sock, cur: None, sent: VecDeque::new(), stamped: Vec::new(), seq: 0 }
         })
         .collect();
     let mut rng = (seed + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;

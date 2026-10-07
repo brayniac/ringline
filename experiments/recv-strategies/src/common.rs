@@ -140,6 +140,37 @@ pub struct Parsed {
     pub need: usize,
 }
 
+/// The payload byte at index `i` (after the sequence number) of message
+/// `seq`, in `--verify` runs.
+pub fn pattern(seq: u32, i: usize) -> u8 {
+    (seq as u8).wrapping_mul(31).wrapping_add(i as u8).wrapping_add((i >> 8) as u8)
+}
+
+/// Lengths above this are corruption, not a message (the largest the
+/// client sends is 1 MiB).
+pub const MAX_MSG: usize = 64 << 20;
+
+/// Check every message in `data` (whole messages only) against the
+/// `--verify` pattern, advancing `expect`. Returns the bad messages.
+pub fn verify(data: &[u8], expect: &mut u32) -> u64 {
+    let mut bad = 0;
+    let mut off = 0;
+    while data.len() - off >= 4 {
+        let len = u32::from_le_bytes(data[off..off + 4].try_into().unwrap()) as usize;
+        let payload = &data[off + 4..off + 4 + len];
+        if len >= 4 {
+            let seq = u32::from_le_bytes(payload[..4].try_into().unwrap());
+            let ok = seq == *expect && payload[4..].iter().enumerate().all(|(i, &b)| b == pattern(seq, i));
+            if !ok {
+                bad += 1;
+            }
+            *expect = seq.wrapping_add(1);
+        }
+        off += 4 + len;
+    }
+    bad
+}
+
 /// Parse length-prefixed messages (`u32` little-endian payload length,
 /// then the payload) from `data`. Reads the last payload byte of each
 /// message, so delivered memory is touched as an application would.

@@ -1,7 +1,7 @@
 //! The server: accepts `--conns` connections, then runs one io_uring event
 //! loop that a `Strategy` plugs its receive model into.
 
-use crate::common::{Parsed, parse};
+use crate::common::{MAX_MSG, Parsed, parse, verify};
 use crate::{arg, flag};
 use io_uring::{IoUring, opcode, squeue, types};
 use std::net::TcpListener;
@@ -33,6 +33,13 @@ pub struct Ctx {
     pub sends_failed: u64,
     /// Pushes that found the SQ full and submitted inline.
     pub sq_full: u64,
+    /// `--verify`: check every byte; the next sequence number per
+    /// connection, and the messages that failed.
+    pub verify: bool,
+    pub expect: Vec<u32>,
+    pub bad: u64,
+    /// Connections whose next message claims a length above `MAX_MSG`.
+    pub corrupt: Vec<bool>,
 }
 
 impl Ctx {
@@ -47,6 +54,12 @@ impl Ctx {
     /// `c`'s unread bytes) and ack them.
     pub fn deliver(&mut self, c: usize, data: &[u8]) -> Parsed {
         let p = parse(data, &mut self.touch);
+        if self.verify {
+            self.bad += verify(&data[..p.consumed], &mut self.expect[c]);
+        }
+        if p.need > MAX_MSG + 4 && !self.corrupt[c] {
+            self.corrupt[c] = true;
+        }
         self.msgs += p.msgs as u64;
         self.bytes += p.consumed as u64;
         if self.ack {
@@ -131,7 +144,9 @@ pub fn run(args: &[String]) {
 
     let mut b = IoUring::builder();
     // IORING_MAX_CQ_ENTRIES is 65536; a larger request fails with EINVAL.
-    b.setup_cqsize((8 * nconns as u32 + 4096).next_power_of_two().min(65536));
+    let cq_default = (8 * nconns as u32 + 4096).next_power_of_two().min(65536);
+    // `--cq-entries` shrinks the CQ to force overflow in verify runs.
+    b.setup_cqsize(arg(args, "--cq-entries", Some(cq_default)));
     if sqpoll {
         b.setup_sqpoll(1000);
         if args.iter().any(|a| a == "--sqpoll-cpu") {
@@ -151,6 +166,10 @@ pub fn run(args: &[String]) {
         touch: 0,
         sends_failed: 0,
         sq_full: 0,
+        verify: flag(args, "--verify"),
+        expect: vec![0; nconns],
+        bad: 0,
+        corrupt: vec![false; nconns],
     };
     strategy.start(&mut cx);
     cx.uring.submit().expect("submit arms");
@@ -232,7 +251,7 @@ pub fn run(args: &[String]) {
     println!(
         "RESULT strategy={} sqpoll={} conns={} msgs_per_sec={:.0} mbyte_per_sec={:.1} \
          cpu_ns_per_msg={:.0} cpu_ns_per_kib={:.0} main_util={:.3} proc_util={:.3} \
-         idle_rss_kb={} rss_kb={} sq_full={} sends_failed={} dead={} touch={} {}",
+         idle_rss_kb={} rss_kb={} sq_full={} sends_failed={} dead={} touch={} verify={} bad={} corrupt={} {}",
         strategy.name(),
         sqpoll,
         nconns,
@@ -248,6 +267,9 @@ pub fn run(args: &[String]) {
         cx.sends_failed,
         dead,
         cx.touch % 10,
+        cx.verify,
+        cx.bad,
+        cx.corrupt.iter().filter(|&&x| x).count(),
         strategy.report(),
     );
     drop(streams);
