@@ -74,6 +74,10 @@ pub trait Strategy {
     fn on_recv(&mut self, cx: &mut Ctx, c: usize, tag: u64, extra: u32, res: i32, flags: u32);
     fn settle(&mut self, cx: &mut Ctx, c: usize);
     fn dead(&self, c: usize) -> bool;
+    /// Called once per loop iteration; returns when it next needs a call.
+    fn tick(&mut self, _cx: &mut Ctx) -> Option<Instant> {
+        None
+    }
     /// Strategy counters for the RESULT line.
     fn report(&self) -> String;
 }
@@ -160,9 +164,17 @@ pub fn run(args: &[String]) {
     let mut touched = Vec::with_capacity(nconns);
     let mut batch: Vec<(u64, i32, u32)> = Vec::with_capacity(16384);
     let tick = types::Timespec::new().nsec(100_000_000);
+    let mut next_tick: Option<Instant> = None;
 
     loop {
-        let _ = cx.uring.submitter().submit_with_args(1, &types::SubmitArgs::new().timespec(&tick));
+        let wait = match next_tick {
+            Some(at) => {
+                let d = at.saturating_duration_since(Instant::now()).min(Duration::from_millis(100));
+                types::Timespec::new().sec(d.as_secs()).nsec(d.subsec_nanos())
+            }
+            None => tick,
+        };
+        let _ = cx.uring.submitter().submit_with_args(1, &types::SubmitArgs::new().timespec(&wait));
         batch.clear();
         batch.extend(cx.uring.completion().map(|c| (c.user_data(), c.result(), c.flags())));
         for &(u, res, flags) in &batch {
@@ -189,6 +201,7 @@ pub fn run(args: &[String]) {
             seen[c] = false;
         }
         touched.clear();
+        next_tick = strategy.tick(&mut cx);
 
         let now = Instant::now();
         if snap.is_none() && now >= measure_from {

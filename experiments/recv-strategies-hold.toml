@@ -1,0 +1,114 @@
+# What per-worker cap on pinned buffers should lends get? On the INC
+# default ring (64 x 1 MiB), every second connection keeps each received
+# range lent for 5 ms or 50 ms, as a forward to a slow sink does; a held
+# range pins its whole buffer. The cap (fraction of the ring that may be
+# pinned before arrivals are copied instead) is swept from 0 (always copy)
+# to 1.0 (never copy). Loopback on one VM, as v2.
+name = "ringline recv lend cap (#622)"
+
+[params]
+branch   = "exp/recv-strategies"
+repo     = "https://github.com/brayniac/ringline"
+reps     = "5"
+warmup   = "2"
+duration = "8"
+threads  = "12"
+
+[[jobs]]
+name = "recv-strategies"
+tags = ["validation"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+shape = "z4.c"
+image = "spool/images/debian-13-ci-20260912.1@golden"
+slots = 1
+memory_gib = 8
+ports = 0
+gpu = false
+payload_timeout = 14400
+artifacts = ["/home/anvil/run.log"]
+upload = true
+payload = '''
+set -uo pipefail
+cd /home/anvil
+{
+  uname -srm; n=$(nproc); echo "nproc=$n"; lscpu | grep -E "Model name|MHz" | head -3
+  [ "$n" -ge 8 ] || { echo "FATAL: need >=8 CPUs"; exit 1; }
+  git clone -q {repo} src && git -C src checkout -q {branch} && git -C src log --oneline -1
+  (cd src/experiments/recv-strategies && cargo build --release --locked) || { echo "FATAL: build"; exit 1; }
+  B=/home/anvil/src/experiments/recv-strategies/target/release/recv-strategies
+  sudo sysctl -qw net.ipv4.ip_local_port_range="10000 65535" net.ipv4.tcp_tw_reuse=1 \
+    net.core.somaxconn=65535 net.ipv4.tcp_max_syn_backlog=65535
+  hard=$(ulimit -Hn); [ "$hard" = unlimited ] && hard=1048576; ulimit -n "$hard"
+  echo "memlock=$(ulimit -l)"
+  for len in 64 256 4096; do taskset -c 0 $B bytes-bench --iters 20000000 --len $len; done
+
+  # label | server args
+  defer=(
+    "nohold|--strategy shared_inc --shared-bufs 64 --shared-buf-size 1048576"
+    "h5ms_cap0|--strategy shared_inc --shared-bufs 64 --shared-buf-size 1048576 --hold-every 2 --hold-us 5000 --lend-cap 0"
+    "h5ms_cap0.25|--strategy shared_inc --shared-bufs 64 --shared-buf-size 1048576 --hold-every 2 --hold-us 5000 --lend-cap 0.25"
+    "h5ms_cap0.5|--strategy shared_inc --shared-bufs 64 --shared-buf-size 1048576 --hold-every 2 --hold-us 5000 --lend-cap 0.5"
+    "h5ms_cap0.75|--strategy shared_inc --shared-bufs 64 --shared-buf-size 1048576 --hold-every 2 --hold-us 5000 --lend-cap 0.75"
+    "h5ms_cap1.0|--strategy shared_inc --shared-bufs 64 --shared-buf-size 1048576 --hold-every 2 --hold-us 5000 --lend-cap 1.0"
+    "h50ms_cap0|--strategy shared_inc --shared-bufs 64 --shared-buf-size 1048576 --hold-every 2 --hold-us 50000 --lend-cap 0"
+    "h50ms_cap0.25|--strategy shared_inc --shared-bufs 64 --shared-buf-size 1048576 --hold-every 2 --hold-us 50000 --lend-cap 0.25"
+    "h50ms_cap0.5|--strategy shared_inc --shared-bufs 64 --shared-buf-size 1048576 --hold-every 2 --hold-us 50000 --lend-cap 0.5"
+    "h50ms_cap0.75|--strategy shared_inc --shared-bufs 64 --shared-buf-size 1048576 --hold-every 2 --hold-us 50000 --lend-cap 0.75"
+    "h50ms_cap1.0|--strategy shared_inc --shared-bufs 64 --shared-buf-size 1048576 --hold-every 2 --hold-us 50000 --lend-cap 1.0"
+  )
+  sqp=()
+  # workload | conns | client args | server extra | sqpoll too?
+  cells=(
+    "reqack-4k|1000|--msg-size 4096||0"
+    "reqack-64k|1000|--msg-size 65536||0"
+    "mixed|1000|--mix 256:9,65536:1||0"
+  )
+  port=7000
+  run_one() { # label, server args, workload, conns, client args, server extra, rep
+    local label="$1" sargs="$2" wl="$3" conns="$4" cargs="$5" sextra="$6" rep="$7"
+    port=$((port+1)); [ $port -gt 9900 ] && port=7001
+    taskset -c 0 $B server --addr 127.0.0.1:$port --conns $conns $sargs $sextra \
+      --warmup {warmup} --duration {duration} > srv.out 2> srv.err &
+    local spid=$!
+    sleep 0.3
+    taskset -c 2-$((n-1)) $B client --addr 127.0.0.1:$port --conns $conns --threads {threads} \
+      $cargs --warmup {warmup} --seconds $(( {warmup} + {duration} + 2 )) --start-delay-ms 1000 \
+      > cli.out 2> cli.err
+    wait $spid; local src=$?
+    local r; r=$(grep '^RESULT' srv.out)
+    if [ -z "$r" ]; then
+      echo "FAIL rep=$rep wl=$wl conns=$conns cfg=$label server_exit=$src"
+      sed 's/^/  srv| /' srv.err | tail -5; sed 's/^/  cli| /' cli.err | tail -5
+    else
+      echo "ROW rep=$rep wl=$wl cfg=$label $r $(cat cli.out)"
+    fi
+  }
+  for rep in $(seq 1 {reps}); do
+    for cell in "${cells[@]}"; do
+      IFS='|' read -r wl conns cargs sextra withsq <<< "$cell"
+      k=${#defer[@]}
+      for i in $(seq 0 $((k-1))); do
+        IFS='|' read -r label sargs <<< "${defer[$(( (i + rep) % k ))]}"
+        run_one "$label" "$sargs" "$wl" "$conns" "$cargs" "$sextra" "$rep"
+      done
+      if [ "$withsq" = 1 ]; then
+        for i in 0 1; do
+          IFS='|' read -r label sargs <<< "${sqp[$(( (i + rep) % 2 ))]}"
+          run_one "$label" "$sargs" "$wl" "$conns" "$cargs" "$sextra" "$rep"
+        done
+      fi
+    done
+  done
+  echo "DONE"
+} 2>&1 | tee /home/anvil/run.log
+exit 0
+'''
+
+[[jobs.steps]]
+type = "shell"
+command = '''
+grep -q '^DONE' run.log || { echo "run did not finish"; exit 1; }
+echo "rows=$(grep -c '^ROW' run.log) fails=$(grep -c '^FAIL' run.log)"
+'''

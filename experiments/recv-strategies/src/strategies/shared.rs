@@ -12,8 +12,16 @@
 //! consumed incrementally, possibly by several connections, and returns to
 //! the ring only when a completion clears `F_BUF_MORE`. Same memory as
 //! `shared` by default, in fewer, larger buffers.
+//!
+//! Held lends (`--hold-every K --hold-us T`): every K-th connection keeps
+//! each received range lent for T µs, as a forward to a slow sink does. A
+//! held range pins its whole buffer. `--lend-cap F` lends only while fewer
+//! than F x bufs buffers are pinned and copies otherwise. A buffer returns
+//! to the ring when the kernel is done with it and no hold remains.
 
 use crate::common::{BufRing, PAGE, PBUF_RING_INC, mmap_anon};
+use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 use crate::server::{Ctx, Strategy, TAG_RECV, TAG_RECV_AUX, ud};
 use io_uring::{cqueue, opcode, types};
 
@@ -44,10 +52,37 @@ pub struct Shared {
     enobufs: u64,
     fallbacks: u64,
     rearms: u64,
+    hold_every: usize,
+    hold: Duration,
+    /// Most buffers that may be pinned by holds at once.
+    lend_cap: usize,
+    holds: Vec<u32>,
+    /// The kernel is done with the buffer; it returns when its holds end.
+    exhausted: Vec<bool>,
+    pinned: usize,
+    /// Buffers the kernel is done with that wait for their holds.
+    waiting: usize,
+    /// Connections parked on `-ENOBUFS` while every buffer waits on holds;
+    /// re-armed when one returns, as ringline's `recv_starved`.
+    starved: Vec<usize>,
+    returned: bool,
+    releases: VecDeque<(Instant, usize)>,
+    scratch: Vec<u8>,
+    held_lends: u64,
+    capped_copies: u64,
+    pinned_peak: usize,
 }
 
 impl Shared {
-    pub fn new(inc: bool, bufs: usize, buf_size: usize, nconns: usize) -> Self {
+    pub fn new(
+        inc: bool,
+        bufs: usize,
+        buf_size: usize,
+        nconns: usize,
+        hold_every: usize,
+        hold_us: u64,
+        lend_cap: f64,
+    ) -> Self {
         let fallback_chunk = (4 * buf_size).max(1 << 20);
         Shared {
             inc,
@@ -67,7 +102,54 @@ impl Shared {
             enobufs: 0,
             fallbacks: 0,
             rearms: 0,
+            hold_every,
+            hold: Duration::from_micros(hold_us),
+            lend_cap: (lend_cap * bufs as f64) as usize,
+            holds: vec![0; bufs],
+            exhausted: vec![false; bufs],
+            pinned: 0,
+            waiting: 0,
+            starved: Vec::new(),
+            returned: false,
+            releases: VecDeque::new(),
+            scratch: Vec::new(),
+            held_lends: 0,
+            capped_copies: 0,
+            pinned_peak: 0,
         }
+    }
+
+    fn give_back(&mut self, bid: usize) {
+        if self.exhausted[bid] {
+            self.waiting -= 1;
+        }
+        self.returned = true;
+        self.exhausted[bid] = false;
+        self.buf_off[bid] = 0;
+        let addr = self.buffer(bid) as u64;
+        self.ring.as_mut().unwrap().push(addr, self.buf_size as u32, bid as u16);
+    }
+
+    /// Connection `c` keeps `data` (in buffer `bid`) lent for `hold`, or
+    /// copies it when the lend cap is reached.
+    fn hold_or_copy(&mut self, c: usize, bid: usize, data: &[u8]) {
+        if self.hold_every == 0 || c % self.hold_every != 0 {
+            return;
+        }
+        if self.holds[bid] == 0 && self.pinned >= self.lend_cap {
+            self.scratch.clear();
+            self.scratch.extend_from_slice(data);
+            self.copied += data.len() as u64;
+            self.capped_copies += 1;
+            return;
+        }
+        if self.holds[bid] == 0 {
+            self.pinned += 1;
+            self.pinned_peak = self.pinned_peak.max(self.pinned);
+        }
+        self.holds[bid] += 1;
+        self.held_lends += 1;
+        self.releases.push_back((Instant::now() + self.hold, bid));
     }
 
     fn arm(&mut self, cx: &mut Ctx, c: usize) {
@@ -160,7 +242,9 @@ impl Strategy for Shared {
             let off = if self.inc { self.buf_off[bid] } else { 0 };
             let data = unsafe { std::slice::from_raw_parts(self.buffer(bid).add(off), res as usize) };
             self.receive(cx, c, data);
-            // The buffer goes back once the kernel is done with it.
+            self.hold_or_copy(c, bid, data);
+            // The buffer goes back once the kernel is done with it and no
+            // hold remains.
             let done = if self.inc {
                 self.buf_off[bid] += res as usize;
                 !cqueue::buffer_more(flags)
@@ -168,9 +252,12 @@ impl Strategy for Shared {
                 true
             };
             if done {
-                self.buf_off[bid] = 0;
-                let addr = self.buffer(bid) as u64;
-                self.ring.as_mut().unwrap().push(addr, self.buf_size as u32, bid as u16);
+                if self.holds[bid] == 0 {
+                    self.give_back(bid);
+                } else {
+                    self.exhausted[bid] = true;
+                    self.waiting += 1;
+                }
             }
             if !cqueue::more(flags) {
                 self.conns[c].rearm = true;
@@ -192,7 +279,11 @@ impl Strategy for Shared {
                     return;
                 }
             }
-            self.conns[c].rearm = true;
+            if self.waiting == self.bufs {
+                self.starved.push(c);
+            } else {
+                self.conns[c].rearm = true;
+            }
             return;
         }
         self.conns[c].dead = true;
@@ -209,10 +300,43 @@ impl Strategy for Shared {
         self.conns[c].dead
     }
 
+    fn tick(&mut self, cx: &mut Ctx) -> Option<Instant> {
+        let now = Instant::now();
+        while let Some(&(at, bid)) = self.releases.front() {
+            if at > now {
+                break;
+            }
+            self.releases.pop_front();
+            self.holds[bid] -= 1;
+            if self.holds[bid] == 0 {
+                self.pinned -= 1;
+                if self.exhausted[bid] {
+                    self.give_back(bid);
+                }
+            }
+        }
+        if self.returned {
+            self.returned = false;
+            for c in std::mem::take(&mut self.starved) {
+                if !self.conns[c].dead && self.conns[c].fallback.is_none() {
+                    self.arm(cx, c);
+                }
+            }
+        }
+        self.releases.front().map(|&(at, _)| at)
+    }
+
     fn report(&self) -> String {
         format!(
-            "lent_bytes={} copied_bytes={} enobufs={} fallbacks={} rearms={}",
-            self.lent, self.copied, self.enobufs, self.fallbacks, self.rearms
+            "lent_bytes={} copied_bytes={} enobufs={} fallbacks={} rearms={} held_lends={} capped_copies={} pinned_peak={}",
+            self.lent,
+            self.copied,
+            self.enobufs,
+            self.fallbacks,
+            self.rearms,
+            self.held_lends,
+            self.capped_copies,
+            self.pinned_peak
         )
     }
 }
