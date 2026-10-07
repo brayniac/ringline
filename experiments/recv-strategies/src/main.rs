@@ -219,7 +219,10 @@ struct ConnState {
     sock: mio::net::TcpStream,
     /// The message being written (index into `msgs`) and bytes written.
     cur: Option<(usize, usize)>,
-    /// Send times of messages written and not yet acked.
+    /// When the message being written started: latency runs from its first
+    /// byte, so a receiver slow enough to block the write is counted.
+    started: Instant,
+    /// Start times of messages written and not yet acked.
     sent: VecDeque<Instant>,
     /// `--verify`: the message being written, stamped, and the next
     /// sequence number.
@@ -245,6 +248,7 @@ fn fill(cfg: &ClientCfg, c: &mut ConnState, pick: &mut dyn FnMut() -> usize) {
                     c.seq = c.seq.wrapping_add(1);
                 }
                 c.cur = Some((i, 0));
+                c.started = Instant::now();
                 (i, 0)
             }
         };
@@ -254,7 +258,7 @@ fn fill(cfg: &ClientCfg, c: &mut ConnState, pick: &mut dyn FnMut() -> usize) {
                 if off + n == msg.len() {
                     c.cur = None;
                     if !cfg.stream {
-                        c.sent.push_back(Instant::now());
+                        c.sent.push_back(c.started);
                     }
                 } else {
                     c.cur = Some((i, off + n));
@@ -289,7 +293,7 @@ fn client_thread(seed: u64, streams: Vec<TcpStream>, cfg: Arc<ClientCfg>, done: 
             s.set_nonblocking(true).unwrap();
             let mut sock = mio::net::TcpStream::from_std(s);
             poll.registry().register(&mut sock, Token(i), Interest::READABLE | Interest::WRITABLE).unwrap();
-            ConnState { sock, cur: None, sent: VecDeque::new(), stamped: Vec::new(), seq: 0 }
+            ConnState { sock, cur: None, started: Instant::now(), sent: VecDeque::new(), stamped: Vec::new(), seq: 0 }
         })
         .collect();
     let mut rng = (seed + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
