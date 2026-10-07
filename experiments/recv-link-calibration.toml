@@ -1,0 +1,180 @@
+# Calibrate the two-host rig the receive-strategy runs used (#622): what
+# the guest's bond is (mode, hash policy, members and their speeds), what
+# aggregate throughput the VMs reach with eight servers on eight cores, and
+# where NIC interrupts and NET_RX softirq land while one server runs pinned
+# to CPU 0, as every recv-strategies two-host run did. Read-only on the
+# hosts; everything runs in the guests.
+name = "ringline recv link calibration (#622)"
+
+[params]
+bins_artifact = "01a1137d-d578-736c-ad81-0089b4c8a042"
+image         = "spool/images/debian-13-ci-bpo-20261001.1@golden"
+server_ip     = "172.31.0.1"
+client_ip     = "172.31.0.2"
+
+# ── server: hv02 ───────────────────────────────────────────────────────────
+
+[[jobs]]
+name = "server"
+tags = ["z1.baremetal"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "start"
+shape = "z1.c"
+image = "{image}"
+gpu = false
+data_address = "{server_ip}/24"
+boot_timeout = 600
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "exec"
+inputs = [{ artifact = "{bins_artifact}", name = "recv-bins.tgz", dest = "/home/anvil" }]
+payload = '''
+set -uo pipefail
+cd /home/anvil && tar xzf recv-bins.tgz && chmod +x out/*
+{
+  echo "== kernel"; uname -r; nproc
+  echo "== anvil-instance"; cat /etc/anvil-instance.json 2>&1
+  echo "== bond"; cat /proc/net/bonding/bond0 2>&1
+  echo "== links"; ip -d -brief link show
+  for d in /sys/class/net/*; do
+    n=$(basename $d)
+    echo "-- $n driver=$(basename "$(readlink -f $d/device/driver 2>/dev/null)" 2>/dev/null) speed=$(cat $d/speed 2>/dev/null) queues_rx=$(ls -d $d/queues/rx-* 2>/dev/null | wc -l) master=$(basename "$(readlink -f $d/master 2>/dev/null)" 2>/dev/null)"
+    ethtool -i $n 2>/dev/null | head -3
+    ethtool -l $n 2>/dev/null | tail -5
+  done
+  echo "== irqbalance"; systemctl is-active irqbalance 2>&1
+  echo "== nic irqs"; grep -iE 'virtio|mlx|ice|i40e|iavf|ixgbe|bnxt|eth|en[ops]' /proc/interrupts | head -40
+  sudo sysctl -qw net.core.somaxconn=65535 net.ipv4.tcp_max_syn_backlog=65535
+} 2>&1 | tee /home/anvil/info.log
+exit 0
+'''
+
+[[jobs.steps]]
+type = "barrier"
+name = "server-ready"
+timeout = 1800
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "exec"
+upload = true
+artifacts = ["/home/anvil/info.log", "/home/anvil/server.log"]
+payload = '''
+set -uo pipefail
+cd /home/anvil
+B=/home/anvil/out/recv-strategies
+hard=$(ulimit -Hn); [ "$hard" = unlimited ] && hard=1048576; ulimit -n "$hard"
+snap() { cat /proc/softirqs | grep -E 'CPU|NET_RX'; grep -E 'CPU|virtio|mlx|iavf|ice|i40e|bond|en[ops]' /proc/interrupts; }
+{
+  # 1. Eight servers on CPUs 0-7, streaming 16 KiB, ports 7100-7107.
+  echo "== eight servers"
+  for k in 0 1 2 3 4 5 6 7; do
+    taskset -c $k $B server --addr {server_ip}:$((7100 + k)) --conns 64 --strategy shared --no-ack --warmup 2 --duration 8 > s8_$k.out 2>&1 &
+  done
+  wait
+  grep -h RESULT s8_*.out | grep -oE 'mbyte_per_sec=[0-9.]+|main_util=[0-9.]+' | paste - -
+  awk -F'mbyte_per_sec=' '/RESULT/{split($2,a," "); s+=a[1]} END{printf "total_mbyte_per_sec=%.0f gbit=%.1f\n", s, s*8/1000}' s8_*.out
+  # 2. One server on CPU 0, as the sweeps ran it, with softirq and IRQ
+  #    counts around the run.
+  echo "== one server, cpu 0"
+  snap > before.txt
+  taskset -c 0 $B server --addr {server_ip}:7200 --conns 1000 --strategy shared --no-ack --warmup 2 --duration 8 > s1.out 2>&1
+  snap > after.txt
+  grep RESULT s1.out
+  echo "-- before"; cat before.txt
+  echo "-- after"; cat after.txt
+  echo "-- mpstat-like: /proc/stat cpu lines after"; grep '^cpu' /proc/stat
+  echo "DONE"
+} 2>&1 | tee /home/anvil/server.log
+exit 0
+'''
+
+[[jobs.steps]]
+type = "barrier"
+name = "bench-done"
+timeout = 3600
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "stop"
+upload = true
+
+# ── client: hv01 ───────────────────────────────────────────────────────────
+
+[[jobs]]
+name = "client"
+tags = ["z2.baremetal"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "start"
+shape = "z2.c"
+image = "{image}"
+gpu = false
+data_address = "{client_ip}/24"
+boot_timeout = 600
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "exec"
+inputs = [{ artifact = "{bins_artifact}", name = "recv-bins.tgz", dest = "/home/anvil" }]
+payload = '''
+set -uo pipefail
+cd /home/anvil && tar xzf recv-bins.tgz && chmod +x out/*
+{
+  echo "== kernel"; uname -r; nproc
+  echo "== anvil-instance"; cat /etc/anvil-instance.json 2>&1
+  echo "== bond"; cat /proc/net/bonding/bond0 2>&1
+  echo "== links"; ip -d -brief link show
+  for d in /sys/class/net/*; do
+    n=$(basename $d)
+    echo "-- $n driver=$(basename "$(readlink -f $d/device/driver 2>/dev/null)" 2>/dev/null) speed=$(cat $d/speed 2>/dev/null) master=$(basename "$(readlink -f $d/master 2>/dev/null)" 2>/dev/null)"
+  done
+  sudo sysctl -qw net.ipv4.ip_local_port_range="10000 65535" net.ipv4.tcp_tw_reuse=1
+} 2>&1 | tee /home/anvil/client-info.log
+exit 0
+'''
+
+[[jobs.steps]]
+type = "barrier"
+name = "server-ready"
+timeout = 1800
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "exec"
+upload = true
+artifacts = ["/home/anvil/client-info.log", "/home/anvil/client.log"]
+payload = '''
+set -uo pipefail
+cd /home/anvil
+B=/home/anvil/out/recv-strategies
+hard=$(ulimit -Hn); [ "$hard" = unlimited ] && hard=1048576; ulimit -n "$hard"
+{
+  echo "== eight clients"
+  for k in 0 1 2 3 4 5 6 7; do
+    $B client --addr {server_ip}:$((7100 + k)) --conns 64 --threads 2 --msg-size 16384 --stream \
+      --warmup 2 --seconds 12 --start-delay-ms 1000 > c8_$k.out 2>&1 &
+  done
+  wait
+  echo "== one client"
+  $B client --addr {server_ip}:7200 --conns 1000 --threads $(( $(nproc) - 1 )) --msg-size 16384 --stream \
+    --warmup 2 --seconds 12 --start-delay-ms 1000 > c1.out 2>&1
+  cat c1.out
+  echo "DONE"
+} 2>&1 | tee /home/anvil/client.log
+exit 0
+'''
+
+[[jobs.steps]]
+type = "barrier"
+name = "bench-done"
+timeout = 3600
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "stop"
+upload = true
