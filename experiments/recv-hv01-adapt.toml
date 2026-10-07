@@ -10,7 +10,7 @@
 name = "ringline recv adaptive rings hv01 (#622)"
 
 [params]
-bins_artifact = "REPLACE_WITH_BUILD_ARTIFACT"
+bins_artifact = "01a11649-4c03-73c3-e8c0-466093f591fd"
 image    = "spool/images/debian-13-ci-bpo-20261001.1@golden"
 reps     = "5"
 warmup   = "2"
