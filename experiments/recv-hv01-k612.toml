@@ -9,7 +9,7 @@
 name = "ringline recv on 6.12 hv01 (#622)"
 
 [params]
-bins_artifact = "REPLACE_WITH_BUILD_ARTIFACT"
+bins_artifact = "01a11885-b133-73a6-cc4d-01432f2aff33"
 image    = "spool/images/debian-13-ci-20260912.1@golden"
 reps     = "3"
 warmup   = "2"

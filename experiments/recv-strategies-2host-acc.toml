@@ -4,7 +4,7 @@
 name = "ringline recv bounded accumulator 2-host (#622)"
 
 [params]
-bins_artifact = "REPLACE_WITH_BUILD_ARTIFACT"
+bins_artifact = "01a11885-b133-73a6-cc4d-01432f2aff33"
 image     = "spool/images/debian-13-ci-bpo-20261001.1@golden"
 server_ip = "172.31.0.1"
 client_ip = "172.31.0.2"
