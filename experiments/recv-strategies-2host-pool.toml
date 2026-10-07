@@ -31,6 +31,7 @@ boot_timeout = 600
 [[jobs.steps]]
 type = "anvil-vm"
 mode = "exec"
+payload_timeout = 21600
 inputs = [{ artifact = "{bins_artifact}", name = "recv-bins.tgz", dest = "/home/anvil" }]
 payload = '''
 set -euo pipefail
@@ -57,6 +58,7 @@ timeout = 1800
 [[jobs.steps]]
 type = "anvil-vm"
 mode = "exec"
+payload_timeout = 21600
 upload = true
 artifacts = ["/home/anvil/setup.log", "/home/anvil/server.log"]
 payload = '''
@@ -112,6 +114,7 @@ boot_timeout = 600
 [[jobs.steps]]
 type = "anvil-vm"
 mode = "exec"
+payload_timeout = 21600
 inputs = [{ artifact = "{bins_artifact}", name = "recv-bins.tgz", dest = "/home/anvil" }]
 payload = '''
 set -euo pipefail
@@ -133,6 +136,7 @@ timeout = 1800
 [[jobs.steps]]
 type = "anvil-vm"
 mode = "exec"
+payload_timeout = 21600
 upload = true
 artifacts = ["/home/anvil/client.log"]
 payload = '''

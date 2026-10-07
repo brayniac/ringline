@@ -1,11 +1,11 @@
-# The lend-cap sweep (experiments/recv-strategies-hold.toml) across
-# a real NIC on the backports kernel: hv02 server, hv01 client, run list
-# experiments/recv-strategies/runs-hold.sh. Otherwise as
-# experiments/recv-strategies-2host.toml.
-name = "ringline recv lend cap 2-host bpo (#622)"
+# Latency at fixed offered load (open-loop client, --rate) across a real NIC
+# on the backports kernel: hv02 server, hv01 client, run list
+# experiments/recv-strategies/runs-rate.sh. Rates are about 25/50/75/90% of
+# the 256 x 16 KiB ring's two-host capacity.
+name = "ringline recv fixed-rate latency 2-host bpo (#622)"
 
 [params]
-bins_artifact = "01a11520-0ab2-73db-250c-321f73211289"
+bins_artifact = "REPLACE_WITH_BUILD_ARTIFACT"
 image     = "spool/images/debian-13-ci-bpo-20261001.1@golden"
 server_ip = "172.31.0.1"
 client_ip = "172.31.0.2"
@@ -69,7 +69,7 @@ hard=$(ulimit -Hn); [ "$hard" = unlimited ] && hard=1048576; ulimit -n "$hard"
 sudo prlimit --pid $BASHPID --memlock=unlimited:unlimited
 {
   echo "memlock_runs=$(ulimit -l)"
-  /home/anvil/out/runs-hold.sh {reps} | \
+  /home/anvil/out/runs-rate.sh {reps} | \
   while IFS='|' read -r i rep label sargs wl conns cargs sextra; do
     port=$((7000 + i))
     taskset -c 0 $B server --addr {server_ip}:$port --conns $conns $sargs $sextra \
@@ -146,7 +146,7 @@ B=/home/anvil/out/recv-strategies
 hard=$(ulimit -Hn); [ "$hard" = unlimited ] && hard=1048576; ulimit -n "$hard"
 threads=$(( $(nproc) - 1 ))
 {
-  /home/anvil/out/runs-hold.sh {reps} | \
+  /home/anvil/out/runs-rate.sh {reps} | \
   while IFS='|' read -r i rep label sargs wl conns cargs sextra; do
     port=$((7000 + i))
     $B client --addr {server_ip}:$port --conns $conns --threads $threads $cargs \

@@ -136,6 +136,10 @@ fn client(args: &[String]) {
     let stream = flag(args, "--stream");
     let verify = flag(args, "--verify");
     let depth: usize = arg(args, "--depth", Some(1));
+    // Open loop: send at this many messages per second in total, each
+    // connection on its own fixed schedule, and measure latency from the
+    // scheduled send time. 0 keeps the closed loop.
+    let rate: f64 = arg(args, "--rate", Some(0.0));
     let mix: String = if flag(args, "--mix") {
         arg(args, "--mix", None)
     } else {
@@ -194,7 +198,15 @@ fn client(args: &[String]) {
             break;
         }
         let (cfg, done) = (cfg.clone(), done.clone());
-        handles.push(std::thread::spawn(move || client_thread(t as u64, mine, cfg, done)));
+        let per_conn_interval = if rate > 0.0 {
+            Some(Duration::from_secs_f64(nconns as f64 / rate))
+        } else {
+            None
+        };
+        handles.push(std::thread::spawn(move || match per_conn_interval {
+            Some(interval) => client_rate_thread(t as u64, mine, cfg, done, interval),
+            None => client_thread(t as u64, mine, cfg, done),
+        }));
     }
     std::thread::sleep(Duration::from_secs(seconds));
     done.store(true, Ordering::Relaxed);
@@ -281,6 +293,126 @@ fn stamp(m: &mut [u8], seq: u32) {
             *b = common::pattern(seq, i);
         }
     }
+}
+
+/// One connection in the open-loop client.
+struct RateConn {
+    sock: mio::net::TcpStream,
+    /// When the next message is due.
+    next_due: Instant,
+    /// Messages due and not yet fully written: (scheduled time, message).
+    pending: VecDeque<(Instant, usize)>,
+    /// Bytes of the front pending message already written.
+    off: usize,
+    /// Scheduled times of messages written and not yet acked.
+    sent: VecDeque<Instant>,
+}
+
+/// Open-loop client: each connection sends one message every `interval`,
+/// on schedule whether or not earlier ones are acked; latency runs from the
+/// scheduled time, so a server that falls behind is charged for the
+/// queueing it causes.
+fn client_rate_thread(
+    seed: u64,
+    streams: Vec<TcpStream>,
+    cfg: Arc<ClientCfg>,
+    done: Arc<AtomicBool>,
+    interval: Duration,
+) -> (u64, Hist) {
+    use mio::{Events, Interest, Poll, Token};
+    let mut poll = Poll::new().unwrap();
+    let n = streams.len().max(1);
+    let start = Instant::now();
+    let mut conns: Vec<RateConn> = streams
+        .into_iter()
+        .enumerate()
+        .map(|(i, s)| {
+            s.set_nonblocking(true).unwrap();
+            let mut sock = mio::net::TcpStream::from_std(s);
+            poll.registry().register(&mut sock, Token(i), Interest::READABLE | Interest::WRITABLE).unwrap();
+            // Stagger the connections across one interval.
+            let offset = interval.mul_f64((i as f64 + (seed as f64 % 1.0)) / n as f64);
+            RateConn { sock, next_due: start + offset, pending: VecDeque::new(), off: 0, sent: VecDeque::new() }
+        })
+        .collect();
+    let mut rng = (seed + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let weights = cfg.weights.clone();
+    let total_w = *weights.last().unwrap();
+    let mut pick = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        let r = (rng % total_w as u64) as u32;
+        weights.iter().position(|&w| r < w).unwrap()
+    };
+    let mut hist = Hist::new();
+    let mut acked = 0u64;
+    let mut buf = [0u8; 4096];
+    let mut events = Events::with_capacity(1024);
+
+    fn write_pending(cfg: &ClientCfg, c: &mut RateConn) {
+        while let Some(&(due, i)) = c.pending.front() {
+            let msg = &cfg.msgs[i];
+            match c.sock.write(&msg[c.off..]) {
+                Ok(w) => {
+                    c.off += w;
+                    if c.off == msg.len() {
+                        c.off = 0;
+                        c.pending.pop_front();
+                        c.sent.push_back(due);
+                    }
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(_) => return,
+            }
+        }
+    }
+
+    while !done.load(Ordering::Relaxed) {
+        let now = Instant::now();
+        let mut earliest = now + Duration::from_millis(50);
+        for c in conns.iter_mut() {
+            let mut added = false;
+            while c.next_due <= now {
+                c.pending.push_back((c.next_due, pick()));
+                c.next_due += interval;
+                added = true;
+            }
+            if added {
+                write_pending(&cfg, c);
+            }
+            earliest = earliest.min(c.next_due);
+        }
+        let timeout = earliest.saturating_duration_since(Instant::now());
+        poll.poll(&mut events, Some(timeout)).unwrap();
+        for ev in events.iter() {
+            let c = &mut conns[ev.token().0];
+            if ev.is_readable() {
+                loop {
+                    match c.sock.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(got) => {
+                            let at = Instant::now();
+                            for _ in 0..got {
+                                if let Some(t) = c.sent.pop_front() {
+                                    if t >= cfg.measure_from {
+                                        hist.record(at.duration_since(t).as_nanos() as u64);
+                                        acked += 1;
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                        Err(_) => break,
+                    }
+                }
+            }
+            if ev.is_writable() {
+                write_pending(&cfg, c);
+            }
+        }
+    }
+    (acked, hist)
 }
 
 fn client_thread(seed: u64, streams: Vec<TcpStream>, cfg: Arc<ClientCfg>, done: Arc<AtomicBool>) -> (u64, Hist) {
