@@ -334,9 +334,9 @@ each one costs per request.
 | Need | `UringEngine` | `EmulatedEngine` |
 |---|---|---|
 | Register a group as incremental or plain (`RingKind`) | `IORING_REGISTER_PBUF_RING` with or without `IOU_PBUF_RING_INC`. An `EINVAL` on the incremental form means the kernel lacks it; the engine reports that and the driver registers plain rings. The Ubuntu 6.8 reserved-word retry (#626) stays inside the engine. | Both kinds, in userspace. |
-| `incremental_buffers()` | Whether the kernel accepts `IOU_PBUF_RING_INC`, from #622 step 0's probe or the first registration's `EINVAL`. | `true`. The driver selects the ring kind from this and `recv_incremental`, as #622's ring-kind selection describes, so `recv_incremental(false)` gives the plain row on the emulator too. |
+| `incremental_buffers()` | Whether incremental rings are usable: the flag is accepted and, if #622 step 0 keeps one, the behaviour probe passes. | `true`. The driver selects the ring kind from this and `recv_incremental`, as #622's ring-kind selection describes, so `recv_incremental(false)` gives the plain row on the emulator too. |
 | `F_BUFFER`, `F_MORE`, `F_BUF_MORE` | The kernel's flags. | Posted by the RecvMulti emulation (op-by-op table). |
-| `IORING_CQE_F_SOCK_NONEMPTY` (promotion) | The kernel's flag. | Set from the next read of the same pass, or from `FIONREAD` when the pass stops at its cap. |
+| `IORING_CQE_F_SOCK_NONEMPTY` (promotion) | The kernel's flag. | Set from the next read of the same pass, or from `FIONREAD` when the pass stops at its cap or the group has no space left. |
 | The group a receive was armed on | Its tag: `RecvMulti` or `RecvMultiLarge`. | The same tags; the emulator does not interpret them. |
 | Move a connection between groups | `ASYNC_CANCEL` by user_data, then a new arm. | Drop the emulated arm and post `-ECANCELED`, then a new arm, which reads at once (rule 2). |
 
@@ -349,7 +349,7 @@ Copies ringline makes in userspace, not the kernel's copy out of the
 socket, as `docs/syscalls-and-copies.md` and CLAUDE.md count them. Both of
 those tables count provided buffer → accumulator as one mandatory copy; the
 `pending_recv_bufs` path in `handle_recv_multi` makes a completion holding
-one whole message 0 today, and those tables need the same correction.
+one whole message 0 today, and both tables should say so.
 "Today" is the code at the base of this design; "#622" is the shared-ring
 design on either engine.
 
@@ -380,10 +380,10 @@ emulator removes that copy for guard parts.
 |---|---|---|---|
 | Learn the request arrived | share of one `io_uring_enter` | share of one `epoll_wait` (`kevent` on macOS) | share of one `epoll_wait` |
 | Read the request | 0 | 1 `read` per completion, plus 1 `read` returning `EAGAIN` per readable edge | N `read`s plus 1 `EAGAIN` per edge, into a scratch buffer |
-| `SOCK_NONEMPTY` | 0 | 0, except one `ioctl(FIONREAD)` when a pass stops at its cap | — |
-| Send one response | 0 dedicated | 1 `write` or `writev` (plaintext); 1 per record (TLS) | share of one `writev` per connection per flush |
+| `SOCK_NONEMPTY` | 0 | 0, except one `ioctl(FIONREAD)` when a pass stops at its cap or the group runs out of space | — |
+| Send one response | 0 dedicated | 1 `write` or `writev` (plaintext); 1 per ciphertext slot (TLS) | share of one `writev` per connection per flush |
 | Send N pipelined responses on one connection | N SQEs, 0 dedicated syscalls | N `write`s, one per loop iteration or flush | 1 `writev` |
-| Move a connection between groups | 0 dedicated (cancel and arm are SQEs) | 1 `read` (the new arm's, rule 2), returning `EAGAIN` when nothing is queued | — |
+| Move a connection between groups | 0 dedicated (cancel and arm are SQEs) | 0 dedicated when data is queued (the arm's read is counted above); 1 `read` returning `EAGAIN` when nothing is queued | — |
 | Re-arm after `ENOBUFS` | 0 dedicated | 0 dedicated: the re-arm's read is the pass's first, counted above (rule 2) | — |
 
 Pipelined plaintext copy sends and TLS sends are where the emulator pays
@@ -397,10 +397,11 @@ completion. Merging consecutive copy sends on a connection into one
 `SendMsgCoalesced`, with each send's completion accounted from the total,
 removes the regression on the emulator and cuts SQEs on io_uring. That is a
 driver change, tracked in #628, and it lands before the mio backend is
-retired (step 7). #628 leaves TLS out: each record is a single-slot send,
-so on the emulator a TLS response costs one `write` per record, and
-pipelined TLS responses one per record in turn, against one `writev` per
-flush on mio. Owner question 4 covers it.
+retired (step 7). #628 leaves TLS out. Every TLS ciphertext slot is marked
+end-of-send (`alloc_raw` sets it and the TLS path never clears it), so each
+slot is its own SQE. On the emulator a TLS response costs one `write` per
+send-pool slot of ciphertext, about one per record, against one `writev`
+per flush on mio. Owner question 4 covers it.
 
 ### Measuring the counts
 
@@ -499,15 +500,17 @@ Each step is a separate PR. Steps 1–6 keep both backends working.
    process these are breaking changes to batch into a coordinated
    release.
 4. **TLS sends on the emulator.** #628 coalesces plaintext copy sends
-   only. On the emulator a TLS response costs one `write` per record,
-   where mio writes a connection's queued ciphertext with one `writev`.
+   only. On the emulator a TLS response costs one `write` per ciphertext
+   slot (about one per record), where mio writes a connection's queued
+   ciphertext with one `writev`.
    Either #628's scope grows to cover TLS records, or that cost is
    accepted before step 7.
 
 ## Notes
 
-- Copy counts follow CLAUDE.md's table, which counts copies ringline
-  makes in userspace, not the kernel's copy out of the socket. "Receive
+- Copy counts use CLAUDE.md's basis: copies ringline makes in userspace,
+  not the kernel's copy out of the socket. Where the receive rows differ
+  from its table, "Copies per request" says why. "Receive
   under the shared-ring design" above gives the counts per engine.
 - kTLS is designed (`docs/ktls-design.md`) but not implemented. Its
   design sends plaintext with `IORING_OP_SEND` without `MSG_WAITALL`, so
