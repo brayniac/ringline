@@ -380,9 +380,9 @@ buffers to refill from until the views are dropped. A client that hands
 values to an application cache can do this.
 
 Decision (owner, 2026-10-08): a receive threshold, `recv_zc_threshold`,
-mirrors `send_zc_threshold`. The runtime hands the parser one `Bytes` and
-never sees individual values, so the threshold is applied where values
-are known:
+mirrors `send_zc_threshold`. The mechanism is the author's design: the
+runtime hands the parser one `Bytes` and never sees individual values, so
+the threshold is applied where values are known:
 
 - `ConfigBuilder::recv_zc_threshold(bytes)` sets the runtime default.
 - A ringline helper takes a `Bytes` returned from a `with_bytes` parse and
