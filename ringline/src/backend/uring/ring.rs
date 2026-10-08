@@ -468,17 +468,18 @@ impl Ring {
         );
         // Safety (every registration in this function): `addr` is
         // `provided`'s mmap'd ring, mapped at the call. The `io-uring`
-        // crate's contract asks for it to stay mapped until the group is
-        // unregistered or the ring is dropped. `Driver::run_shutdown` meets
-        // that; `Driver`'s error and panic exits, and a failed unregister,
-        // unmap the ring first. That frees no memory the kernel reads:
-        // registration pins the ring's pages (`io_pin_pages`, called from
-        // `io_uring/kbuf.c` or `io_uring/memmap.c`), the kernel reads entries
-        // through its own mapping of them, and it unpins them only when the
-        // group is unregistered or the io_uring instance is freed. The
-        // buffers the entries point at (`buf_backing`) are a separate,
-        // unpinned allocation that the kernel writes through its user
-        // address; this does not cover them.
+        // crate's contract, which `pbuf_ring_register` repeats, asks for it
+        // to stay mapped until the group is unregistered or the io_uring
+        // instance is dropped. `Driver::run_shutdown` meets that. `Driver`'s
+        // error and panic exits, and a failed unregister, unmap the ring
+        // while it is still registered. That frees no memory the kernel
+        // reads. Registration pins the ring's pages (`io_pin_pages`, called
+        // from `io_uring/kbuf.c` or `io_uring/memmap.c`), and the kernel reads
+        // entries through its own mapping of those pages. The kernel unpins
+        // them only when the group is unregistered or the io_uring instance
+        // is freed. The buffers the entries point at (`buf_backing`) are a
+        // separate, unpinned allocation that the kernel writes through the
+        // user addresses in the entries; this argument does not cover them.
         let first = if self.pbuf_resv_set {
             unsafe { self.register_pbuf_resv_set(addr, entries, bgid) }
         } else {
