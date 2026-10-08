@@ -61,7 +61,7 @@ const IORING_UNREGISTER_PBUF_RING: libc::c_uint = 23;
 /// `opcode` must be `IORING_REGISTER_PBUF_RING` or
 /// `IORING_UNREGISTER_PBUF_RING`. For registration, `ring_addr` must point to
 /// a buffer ring of `ring_entries` entries that stays mapped until the group
-/// is unregistered or the ring is dropped.
+/// is unregistered or the io_uring instance is dropped.
 unsafe fn pbuf_ring_register(
     fd: RawFd,
     opcode: libc::c_uint,
@@ -471,15 +471,16 @@ impl Ring {
         // crate's contract, which `pbuf_ring_register` repeats, asks for it
         // to stay mapped until the group is unregistered or the io_uring
         // instance is dropped. `Driver::run_shutdown` meets that. `Driver`'s
-        // error and panic exits, and a failed unregister, unmap the ring
-        // while it is still registered. That frees no memory the kernel
-        // reads. Registration pins the ring's pages (`io_pin_pages`, called
-        // from `io_uring/kbuf.c` or `io_uring/memmap.c`), and the kernel reads
-        // entries through its own mapping of those pages. The kernel unpins
-        // them only when the group is unregistered or the io_uring instance
-        // is freed. The buffers the entries point at (`buf_backing`) are a
-        // separate, unpinned allocation that the kernel writes through the
-        // user addresses in the entries; this argument does not cover them.
+        // error and panic exits, and the path after a failed unregister,
+        // unmap the ring while its group is still registered. That frees no
+        // memory the kernel reads. Registration pins the ring's pages
+        // (`io_pin_pages`, called from `io_uring/kbuf.c` or
+        // `io_uring/memmap.c`), and the kernel reads entries through its own
+        // mapping of those pages. The kernel unpins them only when the group
+        // is unregistered or the io_uring instance is freed. The buffers the
+        // entries point at (`buf_backing`) are a separate, unpinned
+        // allocation that the kernel writes through the user addresses in the
+        // entries; this argument does not cover them.
         let first = if self.pbuf_resv_set {
             unsafe { self.register_pbuf_resv_set(addr, entries, bgid) }
         } else {
@@ -524,7 +525,9 @@ impl Ring {
     }
 
     /// Unregister the provided buffer ring from the kernel.
-    /// Must be called before the ring memory is munmap'd.
+    /// Call it before the ring memory is unmapped, as the `io-uring` crate's
+    /// contract requires; the Safety comment in [`Ring::register_buf_ring`]
+    /// says why the exits that skip it free no memory the kernel reads.
     ///
     /// After a registration needed `resv[0]` set, unregistration tries that
     /// form first and falls back to the standard one on `EINVAL`, since only
