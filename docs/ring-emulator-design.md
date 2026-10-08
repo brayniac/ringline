@@ -334,7 +334,7 @@ each one costs per request.
 | Need | `UringEngine` | `EmulatedEngine` |
 |---|---|---|
 | Register a group as incremental or plain (`RingKind`) | `IORING_REGISTER_PBUF_RING` with or without `IOU_PBUF_RING_INC`. An `EINVAL` on the incremental form means the kernel lacks it; the engine reports that and the driver registers plain rings. The Ubuntu 6.8 reserved-word retry (#626) stays inside the engine. | Both kinds, in userspace. |
-| `incremental_buffers()` | Whether incremental rings are usable: the flag is accepted and, if #622 step 0 keeps one, the behaviour probe passes. | `true`. The driver selects the ring kind from this and `recv_incremental`, as #622's ring-kind selection describes, so `recv_incremental(false)` gives the plain row on the emulator too. |
+| `incremental_buffers()` | Whether incremental rings are usable: the flag is accepted and, if #622 step 0 keeps a behaviour probe, that probe passes. | `true`. The driver selects the ring kind from this and `recv_incremental`, as #622's ring-kind selection describes, so `recv_incremental(false)` gives the plain row on the emulator too. |
 | `F_BUFFER`, `F_MORE`, `F_BUF_MORE` | The kernel's flags. | Posted by the RecvMulti emulation (op-by-op table). |
 | `IORING_CQE_F_SOCK_NONEMPTY` (promotion) | The kernel's flag. | Set from the next read of the same pass, or from `FIONREAD` when the pass stops at its cap or the group has no space left. |
 | The group a receive was armed on | Its tag: `RecvMulti` or `RecvMultiLarge`. | The same tags; the emulator does not interpret them. |
@@ -379,7 +379,7 @@ emulator removes that copy for guard parts.
 | Step | io_uring | Emulator | mio today |
 |---|---|---|---|
 | Learn the request arrived | share of one `io_uring_enter` | share of one `epoll_wait` (`kevent` on macOS) | share of one `epoll_wait` |
-| Read the request | 0 | 1 `read` per completion, plus 1 `read` returning `EAGAIN` per readable edge | N `read`s plus 1 `EAGAIN` per edge, into a scratch buffer |
+| Read the request | 0 | 1 `read` per completion, plus 1 `read` returning `EAGAIN` per pass (a readable edge, an arm or a re-arm) that does not stop at its cap or for lack of space | N `read`s plus 1 `EAGAIN` per edge, into a scratch buffer |
 | `SOCK_NONEMPTY` | 0 | 0, except one `ioctl(FIONREAD)` when a pass stops at its cap or the group runs out of space | — |
 | Send one response | 0 dedicated | 1 `write` or `writev` (plaintext); 1 per ciphertext slot (TLS) | share of one `writev` per connection per flush |
 | Send N pipelined responses on one connection | N SQEs, 0 dedicated syscalls | N `write`s, one per loop iteration or flush | 1 `writev` |
@@ -387,7 +387,8 @@ emulator removes that copy for guard parts.
 | Re-arm after `ENOBUFS` | 0 dedicated | 0 dedicated: the re-arm's read is the pass's first, counted above (rule 2) | — |
 
 Pipelined plaintext copy sends and TLS sends are where the emulator pays
-more syscalls than mio today; the `FIONREAD` at the cap is a smaller one.
+more syscalls than mio today; the `FIONREAD` when a pass stops at its cap or for lack of space is a
+smaller one.
 The driver keeps one send in flight per connection and never merges two
 user sends into one SQE: every `send()` marks its last slot end-of-send,
 and `submit_next_queued_inner` stops a coalescing run there
@@ -398,7 +399,7 @@ completion. Merging consecutive copy sends on a connection into one
 removes the regression on the emulator and cuts SQEs on io_uring. That is a
 driver change, tracked in #628, and it lands before the mio backend is
 retired (step 7). #628 leaves TLS out. Every TLS ciphertext slot is marked
-end-of-send (`alloc_raw` sets it and the TLS path never clears it), so each
+end-of-send (`alloc_raw` and `copy_in` set it and the TLS paths never clear it), so each
 slot is its own SQE. On the emulator a TLS response costs one `write` per
 send-pool slot of ciphertext, about one per record, against one `writev`
 per flush on mio. Owner question 4 covers it.
