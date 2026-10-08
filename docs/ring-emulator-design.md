@@ -294,7 +294,7 @@ conformance tests confirm against the real ring first.
 
 | OpTag(s) | Opcode | Emulation | |
 |---|---|---|---|
-| RecvMulti, RecvMultiLarge | RECV multishot, buffer select | Try at arm, then on each readable edge: take buffer space from the arm's group, `read` into it, and repeat until `EAGAIN` or a per-pass cap *(verify the kernel's cap)*, so one fast sender cannot empty a shared group. On a plain group a read takes the head buffer whole and posts `(res, F_BUFFER\|bid<<16\|F_MORE)`. On an incremental group it reads into the head buffer at its current offset, posts `F_BUF_MORE` while the buffer has space left, and moves to the next buffer when it is used up. Each CQE is held until the next read of the same pass returns: if that read returned data, the held CQE gets `IORING_CQE_F_SOCK_NONEMPTY`; if it returned `EAGAIN`, it does not. When the pass stops at the cap, or because the group has no space left, one `ioctl(FIONREAD)` decides the flag. The flag also counts bytes that arrived after the held CQE's read, which the kernel's does not. A pass posts its held CQE before another connection's pass takes space from the same incremental group. A read that returns `0`, `EAGAIN` or an error puts the space back, and its CQE carries no `F_BUFFER`. No buffer: post `-ENOBUFS` without `F_MORE` (the arm ends; the driver re-arms on replenish, Domain Invariant 6). EOF: post `0` without `F_MORE`. Other errors: `-errno` without `F_MORE`. | C |
+| RecvMulti, RecvMultiLarge | RECV multishot, buffer select | Try at arm, then on each readable edge: take buffer space from the arm's group, `read` into it, and repeat until `EAGAIN` or a per-pass cap *(verify the kernel's cap)*, so one fast sender cannot empty a shared group. On a plain group a read takes the head buffer whole and posts `(res, F_BUFFER\|bid<<16\|F_MORE)`. On an incremental group it reads into the head buffer at its current offset, posts `F_BUF_MORE` while the buffer has space left, and moves to the next buffer when it is used up. Each CQE is held until the next read of the same pass returns: if that read returned data, the held CQE gets `IORING_CQE_F_SOCK_NONEMPTY`; if it returned `EAGAIN`, it does not. When the pass stops at the cap, or because the group has no space left, one `ioctl(FIONREAD)` decides the flag. The flag also counts bytes that arrived after the held CQE's read, which the kernel's does not. A pass posts its held CQE before another connection's pass takes space from the same incremental group. A read that returns `0`, `EAGAIN` or an error puts the space back. A `0` or error CQE carries no `F_BUFFER`, and an `EAGAIN` read posts no CQE. A pass that stops at its cap is resumed on the next loop iteration, since no new readiness edge arrives for data already queued. No buffer: post `-ENOBUFS` without `F_MORE` (the arm ends; the driver re-arms on replenish, Domain Invariant 6). EOF: post `0` without `F_MORE`. Other errors: `-errno` without `F_MORE`. | C |
 | RecvMsgMultiTs, RecvMsgUdp | RECVMSG multishot | As RecvMulti, and write the `io_uring_recvmsg_out` header, name and control data into the buffer in the kernel's layout so `RecvMsgOut::parse` (or its replacement) reads it. On Linux the control data is what `recvmsg` returns (`SCM_TIMESTAMPING`, `UDP_GRO`). Off Linux: timestamps come from `SO_TIMESTAMP` and are written as a software `SCM_TIMESTAMPING` entry (there are no hardware timestamps); there is no GRO, so each completion carries one datagram and no segment-size control message, which the driver already reads as a single datagram. | C, P |
 | RecvUdp | RECV multishot | As RecvMulti on a UDP socket. | B |
 | RecvFallback | RECV one-shot into a pool slot | Try at submit, then on readable; one CQE. | A |
@@ -379,16 +379,16 @@ emulator removes that copy for guard parts.
 | Step | io_uring | Emulator | mio today |
 |---|---|---|---|
 | Learn the request arrived | share of one `io_uring_enter` | share of one `epoll_wait` (`kevent` on macOS) | share of one `epoll_wait` |
-| Read the request | 0 | 1 `read` per completion, plus the `read` returning `EAGAIN` that ends a pass (a readable edge, an arm or a re-arm); a pass that stops at its cap, for lack of space, at EOF or on an error has none | N `read`s plus 1 `EAGAIN` per edge, into a scratch buffer |
+| Read the request | 0 | 1 `read` per completion that carries data, EOF or a read error, plus the `read` returning `EAGAIN` that ends a pass (a readable edge, an arm, a re-arm, or a pass resumed after a cap); a pass that stops at its cap, for lack of space, at EOF or on an error has none | N `read`s plus 1 `EAGAIN` per edge, into a scratch buffer |
 | `SOCK_NONEMPTY` | 0 | 0, except one `ioctl(FIONREAD)` when a pass stops at its cap or the group runs out of space | — |
 | Send one response | 0 dedicated | 1 `write` or `writev` (plaintext); 1 per ciphertext slot (TLS) | share of one `writev` per connection per flush |
 | Send N pipelined responses on one connection | N SQEs, 0 dedicated syscalls | N `write`s, one per loop iteration or flush | 1 `writev` |
 | Move a connection between groups | 0 dedicated (cancel and arm are SQEs) | 0 dedicated: the arm is a pass, counted above; when nothing is queued that pass is one `read` returning `EAGAIN` | — |
 | Re-arm after `ENOBUFS` | 0 dedicated | 0 dedicated: the re-arm's read is the pass's first, counted above (rule 2) | — |
 
-Pipelined plaintext copy sends and TLS sends are where the emulator pays
-more syscalls than mio today; the `FIONREAD` when a pass stops at its cap
-or for lack of space is a smaller one.
+Until #628 lands, pipelined plaintext copy sends and TLS sends are where
+the emulator pays more syscalls than mio today; the `FIONREAD` when a pass
+stops at its cap or for lack of space is a smaller one.
 
 The driver keeps one send in flight per connection and never merges two
 user sends into one SQE: every `send()` marks its last slot end-of-send,
@@ -399,11 +399,11 @@ Merging consecutive copy sends on a connection into one
 `SendMsgCoalesced`, with each send's completion accounted from the total,
 removes the regression on the emulator and cuts SQEs on io_uring. That is
 a driver change, tracked in #628, and it lands before the mio backend is
-retired (step 7). #628 leaves TLS out. Every TLS ciphertext slot is marked
-end-of-send (`alloc_raw` and `copy_in` set it and the TLS paths never
-clear it), so each slot is its own SQE. On the emulator a TLS response
-costs one `write` per send-pool slot of ciphertext, about one per record,
-against one `writev` per flush on mio. Owner question 4 covers it.
+retired (step 7). #628 also covers TLS sends: every TLS ciphertext slot is
+marked end-of-send today (`alloc_raw` and `copy_in` set it and the TLS
+paths never clear it), so each slot is its own SQE, and on the emulator a
+TLS response would cost one `write` per send-pool slot of ciphertext
+against one `writev` per flush on mio.
 
 ### Measuring the counts
 
@@ -478,10 +478,9 @@ Each step is a separate PR. Steps 1–6 keep both backends working.
    available on every platform, and the `#[cfg(has_io_uring)]` gates on
    public items are removed.
 7. **Retire the mio backend** once the emulator passes everything the
-   mio backend passes and #628 has landed, so pipelined plaintext copy
-   sends cost the emulator no more syscalls than mio. TLS sends are owner
-   question 4. `force-mio` becomes the switch that selects the emulator on
-   Linux.
+   mio backend passes and #628 has landed, so pipelined plaintext and TLS
+   sends cost the emulator no more syscalls than mio. `force-mio` becomes
+   the switch that selects the emulator on Linux.
 
 ## Questions for the owner
 
@@ -501,12 +500,6 @@ Each step is a separate PR. Steps 1–6 keep both backends working.
    `ringline::backend()` returns `Backend::Mio`. Under the release
    process these are breaking changes to batch into a coordinated
    release.
-4. **TLS sends on the emulator.** #628 coalesces plaintext copy sends
-   only. On the emulator a TLS response costs one `write` per ciphertext
-   slot (about one per record), where mio writes a connection's queued
-   ciphertext with one `writev`.
-   Either #628's scope grows to cover TLS records, or that cost is
-   accepted before step 7.
 
 ## Notes
 
