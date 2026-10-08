@@ -726,7 +726,7 @@ Measured:
   moved in both directions. Tiered p999 fell (2.75, 2.62, 3.15 ms per rep
   with one group; 2.36, 2.03, 2.49 ms with two;
   `01a11d44-3a9e-71f7-9019-7cc0a98b5d66`). Heavy-tailed tiered p99 rose
-  (3.54, 3.80, 3.80 against 3.93, 4.19, 4.06 ms) and its p999 rose from
+  (3.54, 3.80, 3.80 against 4.06, 4.19, 3.93 ms) and its p999 rose from
   5.2 to 6.6 ms in all three reps (`01a11d45-3f7d-71bc-53b6-95a2526e0900`).
 - A cap on promoted connections was worse wherever more than 64 needed
   promoting.
@@ -806,29 +806,56 @@ medians:
 
 | Kernel | Decision to re-arm | Decision to first delivery on the new group |
 |---|---|---|
-| 6.12 | 1.3–2.5 ms (streamers holding) to 4–25 ms (mixed, tiered) | 7–25 ms (mixed, streamers holding), about 50 ms (tiered) |
-| 6.1 | 15–586 ms | 50 ms to 7.4 s (7.4 s in one rep of streamers holding) |
+| 6.12 | 1.3–2.5 ms (streamers holding), 4–12 ms (other cells) | 8–21 ms (mixed, streamers holding), 49–53 ms (tiered, heavy-tailed) |
+| 6.1 | 17–586 ms | 50 ms to 7.4 s (7.4 s in one rep of streamers holding) |
+
+Timings cover the whole run including warmup. In the holding cell all 16
+moves happen at startup, so each rep is one observation, and the 7.4 s
+rests on one rep. A move reversed before its re-arm is not sampled. For
+request/response connections, first delivery on the new group also waits
+for the next request, which in these cells came every 50 ms.
 
 Measured:
 
-- On 6.1 the quiet period lowered request p99 and p999 in all four cells
-  (1.4–8.4× at p99, 1.2–5.7× at p999) and cut demotions in the three cells
-  that had them; streamer throughput changed by −21% to +4%.
-- On 6.12 it lowered p999 in the mixed cell and raised p50 and p99 in the
-  mixed and tiered cells.
-- A move took milliseconds on 6.12 and up to seconds on 6.1 before the
-  connection received on its new group.
+- On 6.1 the quiet period cut demotions in the mixed (40 to 5) and tiered
+  (99 to 11) cells. Mixed p99 and p999 fell 8.4× and 5.7×, and tiered p999
+  fell 2.6×, with the reps of the two configurations not overlapping. In
+  the streamers-holding cell the rule cannot act, because the streamers are
+  the holders and had 0 demotions either way. That cell still moved by
+  1.4× at p99 and −21% in streamer throughput, which is the spread between
+  runs. In the heavy-tailed cell the demotions (415 and 381) and the tails
+  overlapped across reps.
+- On 6.12 the rule changed demotions only in the mixed cell (median 6 to
+  0). There, p50 and p99 rose in every rep (4.5–6.8 to 9.4–10.5 ms;
+  7.1–11.0 to 15.2–16.8 ms), and the p999 reps overlapped. The tiered cell
+  had no demotions to remove, yet its p50 rose 5.2 to 12.6 ms, which is the
+  spread between runs.
+- Decision to re-arm took 1.3–12 ms on 6.12 and 17–586 ms on 6.1.
+- In the later run, two groups without the quiet period raised 6.1 mixed
+  p99 from 336 to 369 ms against one group, and cut holding p50 and p99
+  only 4.2–4.6×. Two-group mixed p99 was 134 ms in the earlier run and
+  369 ms in this one, so run-to-run variation is large on 6.1 too.
+- The client reported 13.3–14.0k acks/s on every run of both kernels at
+  20k requests/s offered. The client divides acks by `--seconds` minus
+  warmup (12 − 2 = 10 s), but the server stops after its 8 s measured
+  window, so about 7 s of acks land in a 10 s window, about 0.7 of the
+  offered rate. It is a reporting artifact: the offered rate is honoured
+  and the latency percentiles are per request. Requests in flight when the
+  server exits are never acked and so are not sampled. This is inferred
+  from the code (`main.rs`), not separately measured.
 - The single-group 6.12 results moved between this run and the previous
   one (streamers holding p999 23.1 ms here against 54.5 ms; mixed p50
   4.98 ms against 8.1 ms). Run-to-run variation on 6.12 is at least as
   large as the configuration effects.
 
-Inferred, not measured: that 6.1's long moves come from the saturated
-server loop (request p50 about 170 ms with one group) and from waiting for
-a free large-group buffer.
+Inferred, not measured: that 6.1's long moves come from waiting for a free
+large-group buffer (large-group `ENOBUFS` 410–83k per run on 6.1, 0 on
+6.12; all 256 large buffers pinned in the holding cell). The loop was
+equally busy on both kernels (`main_util` 0.95–0.998).
 
-**Decision (owner, 2026-10-08, later).** With a plain ring, demotion
-requires a 1 s quiet period (`recv_large_demote_quiet`). With an INC ring
-the large group stays off by default and its demotion rule is decided with
-it in the landing measurements.
+**Decision (owner, 2026-10-08, later).** Demotion requires a 1 s quiet
+period (`recv_large_demote_quiet`) on both ring kinds. With a plain ring
+two groups on is the proposed default, pending A/A pairs on both kernels
+in the landing measurements. With an INC ring the large group stays off
+by default, and its demotion rule is decided with it there.
 

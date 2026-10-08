@@ -48,8 +48,15 @@ sharing the worker, two groups cut request p50 and p99 by 2.8× to 25×. In
 cells without streamers p50 was the same with one or two groups; the tails
 moved in both directions: tiered p999 fell (2.75, 2.62, 3.15 ms per rep
 with one group; 2.36, 2.03, 2.49 ms with two), heavy-tailed tiered p99
-rose (3.54, 3.80, 3.80 against 3.93, 4.19, 4.06 ms) and its p999 rose from
+rose (3.54, 3.80, 3.80 against 4.06, 4.19, 3.93 ms) and its p999 rose from
 5.2 to 6.6 ms.
+
+Variation between runs is large on 6.1 too. In the later run
+(`01a11d87-5bd5`) two groups without the quiet period raised mixed p99
+from 336 to 369 ms, and cut holding p50 and p99 only 4.2–4.6×. Two-group
+mixed p99 was 134 ms in one run and 369 ms in the other. Two groups on by
+default with a plain ring is therefore the proposed default, confirmed or
+not by landing step 6's A/A pairs on both kernels.
 
 The copy into the accumulator, the lend-in-place paths and the `ENOBUFS`
 fallback stay. The accumulator copy is bounded: see "Bounded accumulator".
@@ -83,9 +90,10 @@ and nothing holds any of its bytes.
   connections.
 - A promoted connection's small messages each take a whole large-group
   buffer on a plain ring. On 6.1 the 256-buffer large group returned
-  `ENOBUFS` 7.8k times per run (10.9k with heavy-tailed sizes) only when
-  promoted holders and the 16 promoted streamers shared it; the holders
-  alone returned none.
+  `ENOBUFS` 7.8k times per run (10.9k with heavy-tailed sizes,
+  `01a11d45-3f7d`; 18k–83k, median 69k, in the later run `01a11d87-5bd5`)
+  only when promoted holders and the 16 promoted streamers shared it; the
+  holders alone returned none. Its size is unsettled.
 - On 6.1 (Amazon Linux 2023, loopback) the 4096 × 64 KiB ring had a tail no
   other geometry had at 10,000 connections: p99 906 ms and p999 2.7 s at
   256 B against 130 and 134 ms for the 1024-buffer geometries, and p999
@@ -335,30 +343,37 @@ Generation checks are unchanged.
 ### Demotion
 
 A promoted connection returns to the small group after 64 consecutive
-completions below `promote_bytes`, and only once `recv_large_demote_quiet`
-(default 1 s) has passed since its last completion that counted toward
-promotion. A connection holding a lend is not demoted while it holds.
+completions that do not count toward promotion (see "Promotion"), at the
+first such completion once `recv_large_demote_quiet` has passed since the
+last one that did. An idle promoted connection receives no completions and
+is never demoted. A connection holding a lend is not demoted while it
+holds. The quiet period applies to both ring kinds, default 1 s; with an
+INC ring, landing step 6 decides it together with the large group.
 
-A move is not cheap. From the decision to the connection's first delivery
-on its new group, the benchmark measured 7–50 ms on 6.12 and 50 ms to
-7.4 s on 6.1, where the server loop was saturated; from the decision to
-the re-arm, 1.3–25 ms on 6.12 and 15–586 ms on 6.1. Moves must therefore
-be rare. Without the quiet period connections moved back and forth: on
-6.1, 1 MiB request/ack connections were promoted and demoted about 600
-times per eight-second run.
+Moves should be rare. Decision to re-arm took 1.3–12 ms on 6.12 and
+17–586 ms on 6.1. For streamers, which always have data queued, first
+delivery on the new group came 8–21 ms after the decision on 6.12. For
+request/response connections, first delivery also waits for the next
+request, which in these cells came every 50 ms. Without the quiet period
+connections moved back and forth: on 6.1, 1 MiB request/ack connections
+were promoted and demoted about 600 times per run (eight seconds of
+measurement plus two of warmup).
 
-With a plain ring, where the large group is on by default, the quiet
-period is the measured rule. On 6.1, with 16 streamers sharing the worker,
-it cut demotions in three of four cells (40 to 5, 99 to 11, 415 to 381; the
-fourth had none), and request p99 and p999 fell in all four, by 1.4–8.4×
-at p99 and 1.2–5.7× at p999, while streamer throughput changed by −21% to
-+4%.
+With a plain ring, where the large group is proposed on by default, the
+quiet period is the measured rule. On 6.1 the quiet period cut demotions in
+the mixed (40 to 5) and tiered (99 to 11) cells. Mixed p99 and p999 fell
+8.4× and 5.7×, and tiered p999 fell 2.6×, with the reps of the two
+configurations not overlapping. In the streamers-holding cell the rule
+cannot act, because the streamers are the holders and had 0 demotions
+either way. That cell still moved by 1.4× at p99 and −21% in streamer
+throughput, which is the spread between runs. In the heavy-tailed cell the
+demotions (415 and 381) and the tails overlapped across reps.
 
-With an INC ring the large group is off by default, and the demotion rule
-is decided with it in landing step 6. On 6.12 the quiet period cut both
-ways: p999 fell in the mixed cell (54.5 to 17.8 ms) while p50 and p99 rose
-there (4.5 to 9.4 ms, 7.3 to 16.3 ms) and in the tiered cell with
-streamers (5.2 to 12.6 ms, 8.4 to 22.0 ms).
+With an INC ring the large group is off by default. On 6.12 the rule
+changed demotions only in the mixed cell (median 6 to 0). There, p50 and
+p99 rose in every rep (4.5–6.8 to 9.4–10.5 ms; 7.1–11.0 to 15.2–16.8 ms),
+and the p999 reps overlapped. The tiered cell had no demotions to remove,
+yet its p50 rose 5.2 to 12.6 ms, which is the spread between runs.
 
 ## Lends
 
@@ -453,11 +468,10 @@ receive queue, and TCP closes the window until the worker re-arms.
 - `ConfigBuilder::recv_large_group(bool)` turns the large group on or off
   (default per ring kind, as in the first table, from step 7);
   `recv_large_buffer(ring_size, buffer_size)` sets its geometry; and
-  `recv_large_buffer_bgid(u16)` its buffer group id, default 2; and
+  `recv_large_buffer_bgid(u16)` its buffer group id, default 2;
   `recv_large_demote_quiet(Duration)` the demotion quiet period, default
-  1 s. `build()`
-  rejects a large-group bgid equal to the TCP bgid (default 0), or the UDP
-  bgid (default 1) when UDP is in use.
+  1 s. `build()` rejects a large-group bgid equal to the TCP bgid
+  (default 0), or the UDP bgid (default 1) when UDP is in use.
 
 ## Unchanged
 
@@ -487,11 +501,19 @@ the ring kind in use.
 - Kernels 6.2–6.11; 6.8 is pending #627.
 - Large-group sizes other than 256 buffers of 1 MiB before 6.12.
 - More than one worker.
-- The runtime hold-promotion rule (only a static per-connection rule ran).
+- The runtime hold-promotion rule, and the holder exemption from demotion
+  (only a static per-connection rule ran).
 - The half-the-group lend cap.
 - The 1 MiB fallback chunk with the free-space re-arm.
 - The demotion rule and the time a migration takes in ringline (measured
-  only in the benchmark), and the demotion rule on 6.12.
+  only in the benchmark).
+- Quiet periods other than 1 s, and the quiet period outside the four
+  cells with streamers (1 MiB request/ack, 64 KiB, stream-mix, cells
+  without streamers).
+- The demotion rule for an INC ring: the 6.12 runs measured the 1 s quiet
+  period; which rule INC uses is open.
+- The size of the plain large group: 256 × 1 MiB runs out when holders are
+  promoted alongside streamers.
 - Multishot `RECVMSG` on an INC ring.
 
 ## Landing
@@ -536,7 +558,9 @@ the ring kind in use.
    that spread, and no sustained `buffer_ring_empty`. A cell that fails is
    resolved before step 7, by geometry for that kernel, by leaving the
    large group off there, or by keeping the 256 × 16 KiB ring there. This
-   step decides the large group's default on 6.12+.
+   step decides the large group's default and its demotion rule with an
+   INC ring, and confirms the proposed plain-ring default (two groups on)
+   with A/A pairs on both kernels.
 7. New defaults (the geometry per ring kind, `recv_incremental` on, the
    large group's default per ring kind, the `recv_accumulator_max` floor,
    the removal of `recv_segment_reserve`) in a coordinated release.
