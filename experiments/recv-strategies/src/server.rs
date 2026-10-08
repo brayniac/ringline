@@ -29,6 +29,10 @@ pub struct Ctx {
     pub ack: bool,
     pub msgs: u64,
     pub bytes: u64,
+    /// `--split N`: bytes delivered on connections below N, counted
+    /// apart (the streamers in a mixed run, which connect first).
+    pub split: usize,
+    pub split_bytes: u64,
     pub touch: u64,
     pub sends_failed: u64,
     /// Pushes that found the SQ full and submitted inline.
@@ -62,6 +66,9 @@ impl Ctx {
         }
         self.msgs += p.msgs as u64;
         self.bytes += p.consumed as u64;
+        if c < self.split {
+            self.split_bytes += p.consumed as u64;
+        }
         if self.ack {
             let mut left = p.msgs as usize;
             while left > 0 {
@@ -124,7 +131,9 @@ pub fn run(args: &[String]) {
     let listener = TcpListener::bind(&addr).expect("bind");
     // Give up if the client never connects, so a failed run cannot stall a
     // two-machine sequence.
-    listener.set_nonblocking(true).expect("nonblocking listener");
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking listener");
     // The client connects one at a time; 50k connections take over a minute.
     let accept_deadline = Instant::now() + Duration::from_secs(300);
     let mut streams = Vec::with_capacity(nconns);
@@ -136,7 +145,11 @@ pub fn run(args: &[String]) {
                 streams.push(s);
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                assert!(Instant::now() < accept_deadline, "accept timeout: {} of {nconns}", streams.len());
+                assert!(
+                    Instant::now() < accept_deadline,
+                    "accept timeout: {} of {nconns}",
+                    streams.len()
+                );
                 std::thread::sleep(Duration::from_millis(1));
             }
             Err(e) => panic!("accept: {e}"),
@@ -164,6 +177,8 @@ pub fn run(args: &[String]) {
         ack: !flag(args, "--no-ack"),
         msgs: 0,
         bytes: 0,
+        split: arg(args, "--split", Some(0)),
+        split_bytes: 0,
         touch: 0,
         sends_failed: 0,
         sq_full: 0,
@@ -179,7 +194,7 @@ pub fn run(args: &[String]) {
     let start = Instant::now();
     let measure_from = start + Duration::from_secs(warmup);
     let measure_to = measure_from + Duration::from_secs(duration);
-    let mut snap: Option<(u64, u64, Duration, Duration, Instant)> = None;
+    let mut snap: Option<(u64, u64, u64, Duration, Duration, Instant)> = None;
     let mut seen = vec![false; nconns];
     let mut touched = Vec::with_capacity(nconns);
     let mut batch: Vec<(u64, i32, u32)> = Vec::with_capacity(16384);
@@ -189,14 +204,25 @@ pub fn run(args: &[String]) {
     loop {
         let wait = match next_tick {
             Some(at) => {
-                let d = at.saturating_duration_since(Instant::now()).min(Duration::from_millis(100));
-                types::Timespec::new().sec(d.as_secs()).nsec(d.subsec_nanos())
+                let d = at
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(100));
+                types::Timespec::new()
+                    .sec(d.as_secs())
+                    .nsec(d.subsec_nanos())
             }
             None => tick,
         };
-        let _ = cx.uring.submitter().submit_with_args(1, &types::SubmitArgs::new().timespec(&wait));
+        let _ = cx
+            .uring
+            .submitter()
+            .submit_with_args(1, &types::SubmitArgs::new().timespec(&wait));
         batch.clear();
-        batch.extend(cx.uring.completion().map(|c| (c.user_data(), c.result(), c.flags())));
+        batch.extend(
+            cx.uring
+                .completion()
+                .map(|c| (c.user_data(), c.result(), c.flags())),
+        );
         for &(u, res, flags) in &batch {
             let c = (u & 0xffff_ffff) as usize;
             let tag = u >> 56;
@@ -228,6 +254,7 @@ pub fn run(args: &[String]) {
             snap = Some((
                 cx.msgs,
                 cx.bytes,
+                cx.split_bytes,
                 cpu(libc::RUSAGE_SELF),
                 cpu(libc::RUSAGE_THREAD),
                 now,
@@ -242,7 +269,7 @@ pub fn run(args: &[String]) {
         }
     }
 
-    let (m0, b0, p0, t0, at) = snap.expect("the run ended before its warmup");
+    let (m0, b0, sb0, p0, t0, at) = snap.expect("the run ended before its warmup");
     let secs = at.elapsed().as_secs_f64();
     let msgs = cx.msgs - m0;
     let bytes = cx.bytes - b0;
@@ -252,7 +279,7 @@ pub fn run(args: &[String]) {
     println!(
         "RESULT strategy={} sqpoll={} conns={} msgs_per_sec={:.0} mbyte_per_sec={:.1} \
          cpu_ns_per_msg={:.0} cpu_ns_per_kib={:.0} main_util={:.3} proc_util={:.3} \
-         idle_rss_kb={} rss_kb={} hwm_kb={} sq_full={} sends_failed={} dead={} touch={} verify={} bad={} corrupt={} {}",
+         split_mbyte_per_sec={:.1} idle_rss_kb={} rss_kb={} hwm_kb={} sq_full={} sends_failed={} dead={} touch={} verify={} bad={} corrupt={} {}",
         strategy.name(),
         sqpoll,
         nconns,
@@ -262,6 +289,7 @@ pub fn run(args: &[String]) {
         proc_cpu * 1e9 / (bytes.max(1) as f64 / 1024.0),
         main_cpu / secs,
         proc_cpu / secs,
+        (cx.split_bytes - sb0) as f64 / secs / 1e6,
         idle_rss,
         status_kb("VmRSS:"),
         status_kb("VmHWM:"),

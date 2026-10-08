@@ -26,17 +26,32 @@ pub struct Oneshot {
 impl Oneshot {
     pub fn new(nconns: usize, region: usize, region_max: usize) -> Self {
         let conns = (0..nconns)
-            .map(|_| Conn { region: Region::new(region), need: 4, in_flight: false, dead: false })
+            .map(|_| Conn {
+                region: Region::new(region),
+                need: 4,
+                in_flight: false,
+                dead: false,
+            })
             .collect();
-        Oneshot { region_max, conns, moves: 0, grows: 0, arms: 0 }
+        Oneshot {
+            region_max,
+            conns,
+            moves: 0,
+            grows: 0,
+            arms: 0,
+        }
     }
 
     fn arm(&mut self, cx: &mut Ctx, c: usize) {
         let conn = &mut self.conns[c];
         let r = &conn.region;
-        let sqe = opcode::Recv::new(types::Fd(cx.fds[c]), r.spare_ptr(r.tail), (r.cap - r.tail) as u32)
-            .build()
-            .user_data(ud(TAG_RECV, 0, c));
+        let sqe = opcode::Recv::new(
+            types::Fd(cx.fds[c]),
+            r.spare_ptr(r.tail),
+            (r.cap - r.tail) as u32,
+        )
+        .build()
+        .user_data(ud(TAG_RECV, 0, c));
         conn.in_flight = true;
         cx.push(sqe);
         self.arms += 1;
@@ -45,7 +60,10 @@ impl Oneshot {
 
 impl Strategy for Oneshot {
     fn name(&self) -> String {
-        format!("oneshot-{}", self.conns.first().map(|c| c.region.cap).unwrap_or(0))
+        format!(
+            "oneshot-{}",
+            self.conns.first().map(|c| c.region.cap).unwrap_or(0)
+        )
     }
 
     fn start(&mut self, cx: &mut Ctx) {
@@ -94,6 +112,9 @@ impl Strategy for Oneshot {
 
     fn report(&self) -> String {
         let copied: u64 = self.conns.iter().map(|c| c.region.copied).sum();
-        format!("moves={} grows={} copied_bytes={} arms={}", self.moves, self.grows, copied, self.arms)
+        format!(
+            "moves={} grows={} copied_bytes={} arms={}",
+            self.moves, self.grows, copied, self.arms
+        )
     }
 }

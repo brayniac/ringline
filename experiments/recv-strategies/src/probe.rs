@@ -30,10 +30,16 @@ fn pair() -> (TcpStream, TcpStream) {
 /// Enter with GETEVENTS (so deferred work runs) and collect CQEs.
 fn reap(u: &mut IoUring, wait: usize) -> Vec<(u64, i32, u32)> {
     let ts = types::Timespec::new().nsec(200_000_000);
-    let _ = u.submitter().submit_with_args(wait, &types::SubmitArgs::new().timespec(&ts));
+    let _ = u
+        .submitter()
+        .submit_with_args(wait, &types::SubmitArgs::new().timespec(&ts));
     std::thread::sleep(Duration::from_millis(20));
-    let _ = u.submitter().submit_with_args(0, &types::SubmitArgs::new().timespec(&ts));
-    u.completion().map(|c| (c.user_data(), c.result(), c.flags())).collect()
+    let _ = u
+        .submitter()
+        .submit_with_args(0, &types::SubmitArgs::new().timespec(&ts));
+    u.completion()
+        .map(|c| (c.user_data(), c.result(), c.flags()))
+        .collect()
 }
 
 fn fact(name: &str, ok: bool, detail: String) {
@@ -53,7 +59,8 @@ fn register(u: &IoUring, bgid: u16) -> BufRing {
 pub fn inc_probe() {
     let region = mmap_anon(64 * 1024);
     let base = region as u64;
-    let bytes = |off: usize, n: usize| unsafe { std::slice::from_raw_parts(region.add(off), n).to_vec() };
+    let bytes =
+        |off: usize, n: usize| unsafe { std::slice::from_raw_parts(region.add(off), n).to_vec() };
 
     // Contiguous append and in-place entry advance.
     {
@@ -61,7 +68,15 @@ pub fn inc_probe() {
         let mut ring = register(&u, 1);
         ring.push(base, 4096, 0);
         let (mut c, s) = pair();
-        unsafe { u.submission().push(&opcode::RecvMulti::new(types::Fd(s.as_raw_fd()), 1).build().user_data(1)).unwrap() };
+        unsafe {
+            u.submission()
+                .push(
+                    &opcode::RecvMulti::new(types::Fd(s.as_raw_fd()), 1)
+                        .build()
+                        .user_data(1),
+                )
+                .unwrap()
+        };
         let mut flags = Vec::new();
         for m in [&b"hello"[..], b"world!"] {
             c.write_all(m).unwrap();
@@ -75,7 +90,11 @@ pub fn inc_probe() {
             bytes(0, 11) == b"helloworld!",
             format!("cqes={flags:?} entry_offset={entry_addr}"),
         );
-        fact("entry_advanced_in_place", entry_addr == 11, format!("entry_offset={entry_addr}"));
+        fact(
+            "entry_advanced_in_place",
+            entry_addr == 11,
+            format!("entry_offset={entry_addr}"),
+        );
     }
 
     // Fill, then re-post after F_BUF_MORE clears: the live arm continues.
@@ -84,15 +103,30 @@ pub fn inc_probe() {
         let mut ring = register(&u, 2);
         ring.push(base + 8192, 16, 0);
         let (mut c, s) = pair();
-        unsafe { u.submission().push(&opcode::RecvMulti::new(types::Fd(s.as_raw_fd()), 2).build().user_data(2)).unwrap() };
+        unsafe {
+            u.submission()
+                .push(
+                    &opcode::RecvMulti::new(types::Fd(s.as_raw_fd()), 2)
+                        .build()
+                        .user_data(2),
+                )
+                .unwrap()
+        };
         c.write_all(&[b'a'; 16]).unwrap();
         let first = reap(&mut u, 1);
-        let filled = first.iter().any(|&(_, r, f)| r == 16 && !cqueue::buffer_more(f) && cqueue::more(f));
+        let filled = first
+            .iter()
+            .any(|&(_, r, f)| r == 16 && !cqueue::buffer_more(f) && cqueue::more(f));
         ring.push(base + 12288, 64, 0);
         c.write_all(b"second").unwrap();
         let second = reap(&mut u, 1);
-        let continued = second.iter().any(|&(_, r, f)| r == 6 && cqueue::more(f)) && bytes(12288, 6) == b"second";
-        fact("repost_after_buf_more_clear", filled && continued, format!("first={first:?} second={second:?}"));
+        let continued = second.iter().any(|&(_, r, f)| r == 6 && cqueue::more(f))
+            && bytes(12288, 6) == b"second";
+        fact(
+            "repost_after_buf_more_clear",
+            filled && continued,
+            format!("first={first:?} second={second:?}"),
+        );
     }
 
     // Rewrite a posted, partly used entry in place between enters.
@@ -101,7 +135,15 @@ pub fn inc_probe() {
         let mut ring = register(&u, 3);
         ring.push(base + 16384, 4096, 0);
         let (mut c, s) = pair();
-        unsafe { u.submission().push(&opcode::RecvMulti::new(types::Fd(s.as_raw_fd()), 3).build().user_data(3)).unwrap() };
+        unsafe {
+            u.submission()
+                .push(
+                    &opcode::RecvMulti::new(types::Fd(s.as_raw_fd()), 3)
+                        .build()
+                        .user_data(3),
+                )
+                .unwrap()
+        };
         c.write_all(b"abc").unwrap();
         let _ = reap(&mut u, 1);
         unsafe {
@@ -122,7 +164,15 @@ pub fn inc_probe() {
         let mut ring = register(&u, 4);
         ring.push(base + 32768, 4096, 0);
         let (mut c, s) = pair();
-        unsafe { u.submission().push(&opcode::RecvMulti::new(types::Fd(s.as_raw_fd()), 4).build().user_data(4)).unwrap() };
+        unsafe {
+            u.submission()
+                .push(
+                    &opcode::RecvMulti::new(types::Fd(s.as_raw_fd()), 4)
+                        .build()
+                        .user_data(4),
+                )
+                .unwrap()
+        };
         u.submit().unwrap();
         let unreg = u.submitter().unregister_buf_ring(4);
         let mut fresh = register(&u, 4);
@@ -143,12 +193,23 @@ pub fn inc_probe() {
         let mut ring = register(&u, 5);
         ring.push(base + 49152, 4096, 0);
         let (mut c, s) = pair();
-        unsafe { u.submission().push(&opcode::RecvMulti::new(types::Fd(s.as_raw_fd()), 5).build().user_data(5)).unwrap() };
+        unsafe {
+            u.submission()
+                .push(
+                    &opcode::RecvMulti::new(types::Fd(s.as_raw_fd()), 5)
+                        .build()
+                        .user_data(5),
+                )
+                .unwrap()
+        };
         u.submit().unwrap();
         let _ = u.submitter().unregister_buf_ring(5);
         c.write_all(b"late").unwrap();
         let r = reap(&mut u, 1);
-        let ok = r.iter().any(|&(_, res, f)| res == -libc::ENOBUFS && !cqueue::more(f)) && bytes(49152, 4) == [0u8; 4];
+        let ok = r
+            .iter()
+            .any(|&(_, res, f)| res == -libc::ENOBUFS && !cqueue::more(f))
+            && bytes(49152, 4) == [0u8; 4];
         fact("unregister_then_data_enobufs", ok, format!("cqes={r:?}"));
     }
 }
@@ -165,8 +226,12 @@ pub fn ring_limit() {
     let mut err = None;
     for i in 0..65_000u32 {
         let r = unsafe {
-            u.submitter()
-                .register_buf_ring_with_flags(mem.add(i as usize * PAGE) as u64, 1, i as u16, PBUF_RING_INC)
+            u.submitter().register_buf_ring_with_flags(
+                mem.add(i as usize * PAGE) as u64,
+                1,
+                i as u16,
+                PBUF_RING_INC,
+            )
         };
         match r {
             Ok(()) => n += 1,

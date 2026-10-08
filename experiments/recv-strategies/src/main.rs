@@ -76,18 +76,28 @@ struct Hist {
 
 impl Hist {
     fn new() -> Self {
-        Hist { counts: vec![0; 64 * 16] }
+        Hist {
+            counts: vec![0; 64 * 16],
+        }
     }
     fn index(ns: u64) -> usize {
         let ns = ns.max(1);
         let p = 63 - ns.leading_zeros() as usize;
-        let sub = if p >= 4 { ((ns >> (p - 4)) & 15) as usize } else { 0 };
+        let sub = if p >= 4 {
+            ((ns >> (p - 4)) & 15) as usize
+        } else {
+            0
+        };
         p * 16 + sub
     }
     fn value(i: usize) -> u64 {
         let p = i / 16;
         let sub = (i % 16) as u64;
-        if p >= 4 { (16 + sub) << (p - 4) } else { 1 << p }
+        if p >= 4 {
+            (16 + sub) << (p - 4)
+        } else {
+            1 << p
+        }
     }
     fn record(&mut self, ns: u64) {
         self.counts[Self::index(ns)] += 1;
@@ -338,11 +348,23 @@ fn client_rate_thread(
         .map(|(i, s)| {
             s.set_nonblocking(true).unwrap();
             let mut sock = mio::net::TcpStream::from_std(s);
-            poll.registry().register(&mut sock, Token(i), Interest::READABLE | Interest::WRITABLE).unwrap();
+            poll.registry()
+                .register(&mut sock, Token(i), Interest::READABLE | Interest::WRITABLE)
+                .unwrap();
             // Stagger the connections across one interval, or with
             // `burst` start them all together.
-            let offset = if burst { Duration::ZERO } else { interval.mul_f64(i as f64 / n as f64) };
-            RateConn { sock, next_due: start + offset, pending: VecDeque::new(), off: 0, sent: VecDeque::new() }
+            let offset = if burst {
+                Duration::ZERO
+            } else {
+                interval.mul_f64(i as f64 / n as f64)
+            };
+            RateConn {
+                sock,
+                next_due: start + offset,
+                pending: VecDeque::new(),
+                off: 0,
+                sent: VecDeque::new(),
+            }
         })
         .collect();
     let mut rng = (seed + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
@@ -425,7 +447,12 @@ fn client_rate_thread(
     (acked, hist)
 }
 
-fn client_thread(seed: u64, streams: Vec<TcpStream>, cfg: Arc<ClientCfg>, done: Arc<AtomicBool>) -> (u64, Hist) {
+fn client_thread(
+    seed: u64,
+    streams: Vec<TcpStream>,
+    cfg: Arc<ClientCfg>,
+    done: Arc<AtomicBool>,
+) -> (u64, Hist) {
     use mio::{Events, Interest, Poll, Token};
     let mut poll = Poll::new().unwrap();
     let mut conns: Vec<ConnState> = streams
@@ -434,8 +461,17 @@ fn client_thread(seed: u64, streams: Vec<TcpStream>, cfg: Arc<ClientCfg>, done: 
         .map(|(i, s)| {
             s.set_nonblocking(true).unwrap();
             let mut sock = mio::net::TcpStream::from_std(s);
-            poll.registry().register(&mut sock, Token(i), Interest::READABLE | Interest::WRITABLE).unwrap();
-            ConnState { sock, cur: None, started: Instant::now(), sent: VecDeque::new(), stamped: Vec::new(), seq: 0 }
+            poll.registry()
+                .register(&mut sock, Token(i), Interest::READABLE | Interest::WRITABLE)
+                .unwrap();
+            ConnState {
+                sock,
+                cur: None,
+                started: Instant::now(),
+                sent: VecDeque::new(),
+                stamped: Vec::new(),
+                seq: 0,
+            }
         })
         .collect();
     let mut rng = (seed + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
@@ -457,7 +493,8 @@ fn client_thread(seed: u64, streams: Vec<TcpStream>, cfg: Arc<ClientCfg>, done: 
         fill(&cfg, c, &mut pick);
     }
     while !done.load(Ordering::Relaxed) {
-        poll.poll(&mut events, Some(Duration::from_millis(50))).unwrap();
+        poll.poll(&mut events, Some(Duration::from_millis(50)))
+            .unwrap();
         for ev in events.iter() {
             let c = &mut conns[ev.token().0];
             if ev.is_readable() {
@@ -524,14 +561,22 @@ fn bytes_bench(args: &[String]) {
     let t = Instant::now();
     for i in 0..iters {
         let off = (i * len) % ((1 << 20) - len);
-        let v = Bytes::from_owner(View { region: region.clone(), off, len });
+        let v = Bytes::from_owner(View {
+            region: region.clone(),
+            off,
+            len,
+        });
         sink += v.len();
         drop(v);
     }
     let owner = t.elapsed();
 
     // A view sliced from one cached owner `Bytes` (no allocation per view).
-    let cached = Bytes::from_owner(View { region: region.clone(), off: 0, len: 1 << 20 });
+    let cached = Bytes::from_owner(View {
+        region: region.clone(),
+        off: 0,
+        len: 1 << 20,
+    });
     let t = Instant::now();
     for i in 0..iters {
         let off = (i * len) % ((1 << 20) - len);

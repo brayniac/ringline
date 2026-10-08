@@ -58,7 +58,13 @@ pub struct Ring {
 }
 
 impl Ring {
-    pub fn new(rewrite: bool, adapt: bool, nconns: usize, region: usize, region_max: usize) -> Self {
+    pub fn new(
+        rewrite: bool,
+        adapt: bool,
+        nconns: usize,
+        region: usize,
+        region_max: usize,
+    ) -> Self {
         assert!(nconns < 65535, "one buffer group id per connection");
         let pages = mmap_anon(nconns * PAGE);
         let conns = (0..nconns)
@@ -121,10 +127,16 @@ impl Strategy for Ring {
             unsafe {
                 cx.uring
                     .submitter()
-                    .register_buf_ring_with_flags(conn.ring.base as u64, 1, Self::bgid(c), PBUF_RING_INC)
+                    .register_buf_ring_with_flags(
+                        conn.ring.base as u64,
+                        1,
+                        Self::bgid(c),
+                        PBUF_RING_INC,
+                    )
                     .expect("register connection ring");
             }
-            conn.ring.push(conn.region.base as u64, conn.region.cap as u32, 0);
+            conn.ring
+                .push(conn.region.base as u64, conn.region.cap as u32, 0);
             conn.posted = true;
             self.arm(cx, c);
         }
@@ -222,7 +234,8 @@ impl Strategy for Ring {
                 }
             }
         } else if written < r.cap {
-            conn.ring.push(r.base as u64 + written as u64, (r.cap - written) as u32, 0);
+            conn.ring
+                .push(r.base as u64 + written as u64, (r.cap - written) as u32, 0);
             conn.posted = true;
         }
         if conn.rearm {

@@ -46,7 +46,11 @@ pub struct BufRing {
 impl BufRing {
     pub fn new(base: *mut u8, entries: u16) -> Self {
         assert!(entries.is_power_of_two());
-        BufRing { base, mask: entries - 1, tail: 0 }
+        BufRing {
+            base,
+            mask: entries - 1,
+            tail: 0,
+        }
     }
 
     pub fn entry(&self, i: u16) -> *mut BufEntry {
@@ -85,7 +89,13 @@ pub struct Region {
 
 impl Region {
     pub fn new(cap: usize) -> Self {
-        Region { base: mmap_anon(cap), cap, head: 0, tail: 0, copied: 0 }
+        Region {
+            base: mmap_anon(cap),
+            cap,
+            head: 0,
+            tail: 0,
+            copied: 0,
+        }
     }
 
     pub fn unread(&self) -> &[u8] {
@@ -143,7 +153,10 @@ pub struct Parsed {
 /// The payload byte at index `i` (after the sequence number) of message
 /// `seq`, in `--verify` runs.
 pub fn pattern(seq: u32, i: usize) -> u8 {
-    (seq as u8).wrapping_mul(31).wrapping_add(i as u8).wrapping_add((i >> 8) as u8)
+    (seq as u8)
+        .wrapping_mul(31)
+        .wrapping_add(i as u8)
+        .wrapping_add((i >> 8) as u8)
 }
 
 /// Lengths above this are corruption, not a message (the largest the
@@ -160,7 +173,11 @@ pub fn verify(data: &[u8], expect: &mut u32) -> u64 {
         let payload = &data[off + 4..off + 4 + len];
         if len >= 4 {
             let seq = u32::from_le_bytes(payload[..4].try_into().unwrap());
-            let ok = seq == *expect && payload[4..].iter().enumerate().all(|(i, &b)| b == pattern(seq, i));
+            let ok = seq == *expect
+                && payload[4..]
+                    .iter()
+                    .enumerate()
+                    .all(|(i, &b)| b == pattern(seq, i));
             if !ok {
                 bad += 1;
             }
@@ -180,12 +197,20 @@ pub fn parse(data: &[u8], touch: &mut u64) -> Parsed {
     loop {
         let rest = &data[off..];
         if rest.len() < 4 {
-            return Parsed { consumed: off, msgs, need: 4 };
+            return Parsed {
+                consumed: off,
+                msgs,
+                need: 4,
+            };
         }
         let len = u32::from_le_bytes(rest[..4].try_into().unwrap()) as usize;
         let total = 4 + len;
         if rest.len() < total {
-            return Parsed { consumed: off, msgs, need: total };
+            return Parsed {
+                consumed: off,
+                msgs,
+                need: total,
+            };
         }
         if len > 0 {
             *touch = touch.wrapping_add(rest[total - 1] as u64);

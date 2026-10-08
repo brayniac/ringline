@@ -13,11 +13,21 @@
 //! the ring only when a completion clears `F_BUF_MORE`. Same memory as
 //! `shared` by default, in fewer, larger buffers.
 //!
-//! Held lends (`--hold-every K --hold-us T`): every K-th connection keeps
-//! each received range lent for T µs, as a forward to a slow sink does. A
-//! held range pins its whole buffer. `--lend-cap F` lends only while fewer
-//! than F x bufs buffers are pinned and copies otherwise. A buffer returns
-//! to the ring when the kernel is done with it and no hold remains.
+//! Held lends (`--hold-every K --hold-us T`, or `--hold-first N` for
+//! connections 0..N): a holding connection keeps each received range lent
+//! for T µs, as a forward to a slow sink does. A held range pins its whole
+//! buffer. `--lend-cap F` lends only while fewer than F x bufs buffers of
+//! the group are pinned and copies otherwise. A buffer returns to the ring
+//! when the kernel is done with it and no hold remains.
+//!
+//! `two_ring` and `two_ring_inc` add a second group (`--large-bufs`,
+//! `--large-buf-size`) for streaming connections. A connection moves to it
+//! after `--promote-after` consecutive completions of at least
+//! `--promote-bytes`, or on its first held lend with `--promote-on-hold`,
+//! and back after `--demote-after` consecutive smaller completions (a
+//! holding connection is not demoted). A move takes effect at the next
+//! arm: a live multishot recv is cancelled, and its last completion re-arms
+//! the connection on its new group.
 
 use crate::common::{BufRing, PAGE, PBUF_RING_INC, mmap_anon};
 use crate::server::{Ctx, Strategy, TAG_RECV, TAG_RECV_AUX, ud};
@@ -26,6 +36,8 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 const FALLBACK_SLOTS: usize = 32;
+/// The cancel SQE's tag; the server loop ignores its completion.
+const TAG_CANCEL: u64 = 4;
 
 struct Conn {
     acc: Vec<u8>,
@@ -33,6 +45,14 @@ struct Conn {
     rearm: bool,
     fallback: Option<usize>,
     dead: bool,
+    /// The group the live recv is armed on, and the one the next arm uses.
+    group: usize,
+    target: usize,
+    /// A cancel is in flight for the live recv.
+    cancelling: bool,
+    /// Consecutive completions at or above, and below, `promote_bytes`.
+    full_run: u32,
+    small_run: u32,
     /// When the connection last delivered bytes.
     last_data: Option<Instant>,
     /// The longest gap between two deliveries.
@@ -42,114 +62,52 @@ struct Conn {
     enobufs: u32,
 }
 
-pub struct Shared {
-    inc: bool,
+/// One provided-buffer ring and its buffers.
+struct Group {
     bufs: usize,
     buf_size: usize,
     ring: Option<BufRing>,
     backing: *mut u8,
-    /// `shared-inc`: where the kernel's next write into each buffer lands.
+    /// Incremental rings: where the kernel's next write into each buffer lands.
     buf_off: Vec<usize>,
-    conns: Vec<Conn>,
-    fallback_chunk: usize,
-    fallback_mem: *mut u8,
-    fallback_free: Vec<usize>,
-    lent: u64,
-    copied: u64,
-    enobufs: u64,
-    fallbacks: u64,
-    rearms: u64,
-    hold_every: usize,
-    hold: Duration,
-    /// `--no-thp`: back the buffers with 4 KiB pages.
-    no_thp: bool,
-    /// `--recv-len`: the most bytes one completion takes; 0 for no cap.
-    recv_len: u32,
-    /// `--bounded-acc`: copy into the accumulator only what completes a
-    /// pending message, and parse the rest of a completion in place.
-    bounded_acc: bool,
-    /// Most buffers that may be pinned by holds at once.
-    lend_cap: usize,
     holds: Vec<u32>,
     /// The kernel is done with the buffer; it returns when its holds end.
     exhausted: Vec<bool>,
+    /// Most buffers that may be pinned by holds at once.
+    lend_cap: usize,
     pinned: usize,
+    pinned_peak: usize,
     /// Buffers the kernel is done with that wait for their holds.
     waiting: usize,
     /// Connections parked on `-ENOBUFS` while every buffer waits on holds;
     /// re-armed when one returns, as ringline's `recv_starved`.
     starved: Vec<usize>,
     returned: bool,
-    releases: VecDeque<(Instant, usize)>,
-    scratch: Vec<u8>,
-    held_lends: u64,
-    capped_copies: u64,
-    pinned_peak: usize,
-    /// Time from a connection's first `-ENOBUFS` to its next delivery.
-    starve_waits: Vec<Duration>,
+    enobufs: u64,
 }
 
-impl Shared {
-    pub fn new(
-        inc: bool,
-        bufs: usize,
-        buf_size: usize,
-        nconns: usize,
-        hold_every: usize,
-        hold_us: u64,
-        lend_cap: f64,
-        no_thp: bool,
-        recv_len: u32,
-        bounded_acc: bool,
-    ) -> Self {
-        let fallback_chunk = (4 * buf_size).max(1 << 20);
-        Shared {
-            inc,
+impl Group {
+    fn new(bufs: usize, buf_size: usize, lend_cap: f64) -> Self {
+        Group {
             bufs,
             buf_size,
             ring: None,
             backing: std::ptr::null_mut(),
             buf_off: vec![0; bufs],
-            conns: (0..nconns)
-                .map(|_| Conn {
-                    acc: Vec::with_capacity(PAGE),
-                    head: 0,
-                    rearm: false,
-                    fallback: None,
-                    dead: false,
-                    last_data: None,
-                    max_gap: Duration::ZERO,
-                    starved_at: None,
-                    enobufs: 0,
-                })
-                .collect(),
-            fallback_chunk,
-            fallback_mem: mmap_anon(FALLBACK_SLOTS * fallback_chunk),
-            fallback_free: (0..FALLBACK_SLOTS).rev().collect(),
-            lent: 0,
-            copied: 0,
-            enobufs: 0,
-            fallbacks: 0,
-            rearms: 0,
-            hold_every,
-            no_thp,
-            recv_len,
-            bounded_acc,
-            hold: Duration::from_micros(hold_us),
-            lend_cap: (lend_cap * bufs as f64) as usize,
             holds: vec![0; bufs],
             exhausted: vec![false; bufs],
+            lend_cap: (lend_cap * bufs as f64) as usize,
             pinned: 0,
+            pinned_peak: 0,
             waiting: 0,
             starved: Vec::new(),
             returned: false,
-            releases: VecDeque::new(),
-            scratch: Vec::new(),
-            held_lends: 0,
-            capped_copies: 0,
-            pinned_peak: 0,
-            starve_waits: Vec::new(),
+            enobufs: 0,
         }
+    }
+
+    fn buffer(&self, bid: usize) -> *mut u8 {
+        unsafe { self.backing.add(bid * self.buf_size) }
     }
 
     fn give_back(&mut self, bid: usize) {
@@ -166,35 +124,227 @@ impl Shared {
             .push(addr, self.buf_size as u32, bid as u16);
     }
 
-    /// Connection `c` keeps `data` (in buffer `bid`) lent for `hold`, or
-    /// copies it when the lend cap is reached.
-    fn hold_or_copy(&mut self, c: usize, bid: usize, data: &[u8]) {
-        if self.hold_every == 0 || c % self.hold_every != 0 {
+    /// Map the buffers, register the ring as buffer group `bgid` and post
+    /// every buffer.
+    fn start(&mut self, cx: &mut Ctx, bgid: u16, inc: bool, no_thp: bool) {
+        let ring_mem = mmap_anon((self.bufs * 16).max(PAGE));
+        self.backing = mmap_anon(self.bufs * self.buf_size);
+        if no_thp {
+            // 4 KiB pages: a completion makes resident only the pages it
+            // writes, rather than the 2 MiB huge page around them.
+            unsafe {
+                libc::madvise(
+                    self.backing.cast(),
+                    self.bufs * self.buf_size,
+                    libc::MADV_NOHUGEPAGE,
+                )
+            };
+        }
+        let flags = if inc { PBUF_RING_INC } else { 0 };
+        unsafe {
+            cx.uring
+                .submitter()
+                .register_buf_ring_with_flags(ring_mem as u64, self.bufs as u16, bgid, flags)
+                .expect("register shared ring");
+        }
+        let mut ring = BufRing::new(ring_mem, self.bufs as u16);
+        for i in 0..self.bufs {
+            ring.push(self.buffer(i) as u64, self.buf_size as u32, i as u16);
+        }
+        self.ring = Some(ring);
+    }
+
+    fn resident_kb(&self) -> usize {
+        resident_kb(self.backing, self.bufs * self.buf_size)
+    }
+}
+
+/// When connections move to the large group.
+pub struct Promote {
+    pub bytes: usize,
+    pub after: u32,
+    pub demote_after: u32,
+    pub on_hold: bool,
+}
+
+pub struct Shared {
+    inc: bool,
+    /// Group 0 takes every connection; group 1, when present, the
+    /// streaming ones.
+    groups: Vec<Group>,
+    promote: Option<Promote>,
+    conns: Vec<Conn>,
+    fallback_chunk: usize,
+    fallback_mem: *mut u8,
+    fallback_free: Vec<usize>,
+    lent: u64,
+    copied: u64,
+    fallbacks: u64,
+    rearms: u64,
+    promotions: u64,
+    demotions: u64,
+    hold_every: usize,
+    hold_first: usize,
+    hold: Duration,
+    /// `--no-thp`: back the buffers with 4 KiB pages.
+    no_thp: bool,
+    /// `--recv-len`: the most bytes one completion takes; 0 for no cap.
+    recv_len: u32,
+    /// `--bounded-acc`: copy into the accumulator only what completes a
+    /// pending message, and parse the rest of a completion in place.
+    bounded_acc: bool,
+    releases: VecDeque<(Instant, usize, usize)>,
+    scratch: Vec<u8>,
+    held_lends: u64,
+    capped_copies: u64,
+    /// Time from a connection's first `-ENOBUFS` to its next delivery.
+    starve_waits: Vec<Duration>,
+}
+
+impl Shared {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        inc: bool,
+        bufs: usize,
+        buf_size: usize,
+        nconns: usize,
+        hold_every: usize,
+        hold_first: usize,
+        hold_us: u64,
+        lend_cap: f64,
+        no_thp: bool,
+        recv_len: u32,
+        bounded_acc: bool,
+        large: Option<(usize, usize, Promote)>,
+    ) -> Self {
+        let max_buf = large.as_ref().map_or(buf_size, |l| l.1.max(buf_size));
+        let fallback_chunk = (4 * max_buf).max(1 << 20);
+        let mut groups = vec![Group::new(bufs, buf_size, lend_cap)];
+        let promote = large.map(|(lbufs, lsize, p)| {
+            groups.push(Group::new(lbufs, lsize, lend_cap));
+            p
+        });
+        Shared {
+            inc,
+            groups,
+            promote,
+            conns: (0..nconns)
+                .map(|_| Conn {
+                    acc: Vec::with_capacity(PAGE),
+                    head: 0,
+                    rearm: false,
+                    fallback: None,
+                    dead: false,
+                    group: 0,
+                    target: 0,
+                    cancelling: false,
+                    full_run: 0,
+                    small_run: 0,
+                    last_data: None,
+                    max_gap: Duration::ZERO,
+                    starved_at: None,
+                    enobufs: 0,
+                })
+                .collect(),
+            fallback_chunk,
+            fallback_mem: mmap_anon(FALLBACK_SLOTS * fallback_chunk),
+            fallback_free: (0..FALLBACK_SLOTS).rev().collect(),
+            lent: 0,
+            copied: 0,
+            fallbacks: 0,
+            rearms: 0,
+            promotions: 0,
+            demotions: 0,
+            hold_every,
+            hold_first,
+            no_thp,
+            recv_len,
+            bounded_acc,
+            hold: Duration::from_micros(hold_us),
+            releases: VecDeque::new(),
+            scratch: Vec::new(),
+            held_lends: 0,
+            capped_copies: 0,
+            starve_waits: Vec::new(),
+        }
+    }
+
+    fn holder(&self, c: usize) -> bool {
+        (self.hold_every != 0 && c % self.hold_every == 0) || c < self.hold_first
+    }
+
+    /// Connection `c` keeps `data` (in buffer `bid` of group `g`) lent for
+    /// `hold`, or copies it when the group's lend cap is reached.
+    fn hold_or_copy(&mut self, c: usize, g: usize, bid: usize, data: &[u8]) {
+        if !self.holder(c) {
             return;
         }
-        if self.holds[bid] == 0 && self.pinned >= self.lend_cap {
+        if self.promote.as_ref().is_some_and(|p| p.on_hold) {
+            self.retarget(c, 1);
+        }
+        let grp = &mut self.groups[g];
+        if grp.holds[bid] == 0 && grp.pinned >= grp.lend_cap {
             self.scratch.clear();
             self.scratch.extend_from_slice(data);
             self.copied += data.len() as u64;
             self.capped_copies += 1;
             return;
         }
-        if self.holds[bid] == 0 {
-            self.pinned += 1;
-            self.pinned_peak = self.pinned_peak.max(self.pinned);
+        if grp.holds[bid] == 0 {
+            grp.pinned += 1;
+            grp.pinned_peak = grp.pinned_peak.max(grp.pinned);
         }
-        self.holds[bid] += 1;
+        grp.holds[bid] += 1;
         self.held_lends += 1;
-        self.releases.push_back((Instant::now() + self.hold, bid));
+        self.releases
+            .push_back((Instant::now() + self.hold, g, bid));
+    }
+
+    /// Count a completion of `res` bytes toward moving `c` between groups.
+    fn classify(&mut self, c: usize, res: usize) {
+        let Some(p) = &self.promote else { return };
+        let (bytes, after, demote_after) = (p.bytes, p.after, p.demote_after);
+        let holder = self.holder(c) && p.on_hold;
+        let conn = &mut self.conns[c];
+        if res >= bytes {
+            conn.full_run += 1;
+            conn.small_run = 0;
+            if conn.full_run >= after {
+                self.retarget(c, 1);
+            }
+        } else {
+            conn.small_run += 1;
+            conn.full_run = 0;
+            if conn.small_run >= demote_after && !holder {
+                self.retarget(c, 0);
+            }
+        }
+    }
+
+    fn retarget(&mut self, c: usize, g: usize) {
+        let conn = &mut self.conns[c];
+        if conn.target == g {
+            return;
+        }
+        conn.target = g;
+        conn.full_run = 0;
+        conn.small_run = 0;
+        if g == 1 {
+            self.promotions += 1;
+        } else {
+            self.demotions += 1;
+        }
     }
 
     fn arm(&mut self, cx: &mut Ctx, c: usize) {
+        let g = self.conns[c].target;
+        self.conns[c].group = g;
         // `recv_len` caps how many bytes one completion takes (0: the whole
         // buffer), which bounds how far a connection's accumulator grows.
-        let sqe = opcode::RecvMulti::new(types::Fd(cx.fds[c]), 0)
+        let sqe = opcode::RecvMulti::new(types::Fd(cx.fds[c]), g as u16)
             .len(self.recv_len)
             .build()
-            .user_data(ud(TAG_RECV, 0, c));
+            .user_data(ud(TAG_RECV, g as u32, c));
         cx.push(sqe);
         self.rearms += 1;
     }
@@ -261,14 +411,8 @@ impl Shared {
             conn.head = 0;
         }
     }
-
-    fn buffer(&self, bid: usize) -> *mut u8 {
-        unsafe { self.backing.add(bid * self.buf_size) }
-    }
 }
 
-/// The full size of the message starting at `buf` (header included), or 4
-/// while its header is incomplete.
 /// p50, p99 and max of `v` in milliseconds, as `p50/p99/max`.
 fn ms_quantiles(mut v: Vec<Duration>) -> String {
     if v.is_empty() {
@@ -296,6 +440,8 @@ impl Shared {
     }
 }
 
+/// The full size of the message starting at `buf` (header included), or 4
+/// while its header is incomplete.
 fn next_need(buf: &[u8]) -> usize {
     if buf.len() < 4 {
         return 4;
@@ -319,40 +465,23 @@ fn resident_kb(base: *mut u8, len: usize) -> usize {
 
 impl Strategy for Shared {
     fn name(&self) -> String {
-        format!(
-            "{}-{}x{}",
-            if self.inc { "shared_inc" } else { "shared" },
-            self.bufs,
-            self.buf_size
-        )
+        let g = &self.groups[0];
+        let base = match (self.promote.is_some(), self.inc) {
+            (false, false) => "shared",
+            (false, true) => "shared_inc",
+            (true, false) => "two_ring",
+            (true, true) => "two_ring_inc",
+        };
+        match self.groups.get(1) {
+            Some(l) => format!("{base}-{}x{}+{}x{}", g.bufs, g.buf_size, l.bufs, l.buf_size),
+            None => format!("{base}-{}x{}", g.bufs, g.buf_size),
+        }
     }
 
     fn start(&mut self, cx: &mut Ctx) {
-        let ring_mem = mmap_anon((self.bufs * 16).max(PAGE));
-        self.backing = mmap_anon(self.bufs * self.buf_size);
-        if self.no_thp {
-            // 4 KiB pages: a completion makes resident only the pages it
-            // writes, rather than the 2 MiB huge page around them.
-            unsafe {
-                libc::madvise(
-                    self.backing.cast(),
-                    self.bufs * self.buf_size,
-                    libc::MADV_NOHUGEPAGE,
-                )
-            };
+        for (i, g) in self.groups.iter_mut().enumerate() {
+            g.start(cx, i as u16, self.inc, self.no_thp);
         }
-        let flags = if self.inc { PBUF_RING_INC } else { 0 };
-        unsafe {
-            cx.uring
-                .submitter()
-                .register_buf_ring_with_flags(ring_mem as u64, self.bufs as u16, 0, flags)
-                .expect("register shared ring");
-        }
-        let mut ring = BufRing::new(ring_mem, self.bufs as u16);
-        for i in 0..self.bufs {
-            ring.push(self.buffer(i) as u64, self.buf_size as u32, i as u16);
-        }
-        self.ring = Some(ring);
         for c in 0..self.conns.len() {
             self.arm(cx, c);
         }
@@ -393,36 +522,63 @@ impl Strategy for Shared {
             self.fallback_free.push(slot);
             return;
         }
+        // The group this recv was armed on; a completion that arrives after
+        // its connection moved still names the buffer of the old group.
+        let g = extra as usize;
+        let more = cqueue::more(flags);
+        if !more {
+            self.conns[c].cancelling = false;
+        }
         if res > 0 {
             let bid = cqueue::buffer_select(flags).expect("recv without a buffer") as usize;
-            let off = if self.inc { self.buf_off[bid] } else { 0 };
-            let data =
-                unsafe { std::slice::from_raw_parts(self.buffer(bid).add(off), res as usize) };
+            let off = if self.inc {
+                self.groups[g].buf_off[bid]
+            } else {
+                0
+            };
+            let data = unsafe {
+                std::slice::from_raw_parts(self.groups[g].buffer(bid).add(off), res as usize)
+            };
             self.receive(cx, c, data);
-            self.hold_or_copy(c, bid, data);
+            self.hold_or_copy(c, g, bid, data);
+            self.classify(c, res as usize);
             // The buffer goes back once the kernel is done with it and no
             // hold remains.
+            let grp = &mut self.groups[g];
             let done = if self.inc {
-                self.buf_off[bid] += res as usize;
+                grp.buf_off[bid] += res as usize;
                 !cqueue::buffer_more(flags)
             } else {
                 true
             };
             if done {
-                if self.holds[bid] == 0 {
-                    self.give_back(bid);
+                if grp.holds[bid] == 0 {
+                    grp.give_back(bid);
                 } else {
-                    self.exhausted[bid] = true;
-                    self.waiting += 1;
+                    grp.exhausted[bid] = true;
+                    grp.waiting += 1;
                 }
             }
-            if !cqueue::more(flags) {
-                self.conns[c].rearm = true;
+            let conn = &mut self.conns[c];
+            if !more {
+                conn.rearm = true;
+            } else if conn.target != conn.group && !conn.cancelling {
+                // Move: end the live recv; its last completion re-arms the
+                // connection on its new group.
+                conn.cancelling = true;
+                let sqe = opcode::AsyncCancel::new(ud(TAG_RECV, g as u32, c))
+                    .build()
+                    .user_data(ud(TAG_CANCEL, 0, c));
+                cx.push(sqe);
             }
             return;
         }
+        if res == -libc::ECANCELED {
+            self.conns[c].rearm = true;
+            return;
+        }
         if res == -libc::ENOBUFS {
-            self.enobufs += 1;
+            self.groups[g].enobufs += 1;
             let conn = &self.conns[c];
             if conn.head < conn.acc.len() && conn.fallback.is_none() {
                 if let Some(slot) = self.fallback_free.pop() {
@@ -437,8 +593,9 @@ impl Strategy for Shared {
                     return;
                 }
             }
-            if self.waiting == self.bufs {
-                self.starved.push(c);
+            let grp = &mut self.groups[g];
+            if grp.waiting == grp.bufs && self.conns[c].target == g {
+                grp.starved.push(c);
             } else {
                 self.conns[c].rearm = true;
             }
@@ -460,43 +617,60 @@ impl Strategy for Shared {
 
     fn tick(&mut self, cx: &mut Ctx) -> Option<Instant> {
         let now = Instant::now();
-        while let Some(&(at, bid)) = self.releases.front() {
+        while let Some(&(at, g, bid)) = self.releases.front() {
             if at > now {
                 break;
             }
             self.releases.pop_front();
-            self.holds[bid] -= 1;
-            if self.holds[bid] == 0 {
-                self.pinned -= 1;
-                if self.exhausted[bid] {
-                    self.give_back(bid);
+            let grp = &mut self.groups[g];
+            grp.holds[bid] -= 1;
+            if grp.holds[bid] == 0 {
+                grp.pinned -= 1;
+                if grp.exhausted[bid] {
+                    grp.give_back(bid);
                 }
             }
         }
-        if self.returned {
-            self.returned = false;
-            for c in std::mem::take(&mut self.starved) {
-                if !self.conns[c].dead && self.conns[c].fallback.is_none() {
-                    self.arm(cx, c);
+        for g in 0..self.groups.len() {
+            if self.groups[g].returned {
+                self.groups[g].returned = false;
+                for c in std::mem::take(&mut self.groups[g].starved) {
+                    if !self.conns[c].dead && self.conns[c].fallback.is_none() {
+                        self.arm(cx, c);
+                    }
                 }
             }
         }
-        self.releases.front().map(|&(at, _)| at)
+        self.releases.front().map(|&(at, _, _)| at)
     }
 
     fn report(&self) -> String {
-        format!(
+        let g0 = &self.groups[0];
+        let mut s = format!(
             "lent_bytes={} copied_bytes={} enobufs={} fallbacks={} rearms={} held_lends={} capped_copies={} pinned_peak={} ring_resident_kb={} {}",
             self.lent,
             self.copied,
-            self.enobufs,
+            self.groups.iter().map(|g| g.enobufs).sum::<u64>(),
             self.fallbacks,
             self.rearms,
             self.held_lends,
             self.capped_copies,
-            self.pinned_peak,
-            resident_kb(self.backing, self.bufs * self.buf_size),
+            g0.pinned_peak,
+            self.groups.iter().map(|g| g.resident_kb()).sum::<usize>(),
             self.stall_report(),
-        )
+        );
+        if let Some(l) = self.groups.get(1) {
+            s += &format!(
+                " small_enobufs={} large_enobufs={} large_pinned_peak={} large_resident_kb={} promotions={} demotions={} large_conns={}",
+                g0.enobufs,
+                l.enobufs,
+                l.pinned_peak,
+                l.resident_kb(),
+                self.promotions,
+                self.demotions,
+                self.conns.iter().filter(|c| c.group == 1).count(),
+            );
+        }
+        s
     }
 }
