@@ -388,13 +388,17 @@ memory. A view dropped on its worker queues its release as an `Orphan`
 poll pass and before the worker waits for I/O, ahead of
 `flush_replenish_and_rearm`. A drop inside a `with_state` closure, such as
 the parser's, or in `on_tick`, therefore never takes the driver and is
-released before the worker blocks. The release names its allocation, and
-`release_orphans` ignores a release for another ring's allocation. A
-release queued after the worker's last iteration is never applied; the
-allocation is freed when the last view drops. One dropped on another
-thread releases through the worker's cross-thread inbox, which carries
-task indices today and gains a message kind for it. A release sent after
-the worker exits finds no inbox and is dropped.
+released before the worker blocks. The orphan queue is per thread, and a
+thread can run more than one worker in turn, so a release names its
+allocation by a process-unique id (or a `Weak`), not by address, since a
+later worker's allocation can reuse a freed one's address;
+`release_orphans` ignores a release whose allocation is not among this
+worker's group allocations. A release queued after the worker's last
+iteration is never applied; the allocation is freed when the last view
+drops. One dropped on another thread releases through the worker's
+cross-thread inbox, which carries task indices today and gains a message
+kind for it. A release sent after the worker exits finds no inbox and is
+dropped.
 
 A view the caller keeps pins its whole buffer: a 1 MiB buffer on an INC
 ring, shared with other connections' data, for a value of any size. With
@@ -689,7 +693,7 @@ buffers held by `with_bytes` views, values copied by the
    forced-async receive), EOF on a partly used buffer, and multishot
    `RECVMSG` on an INC ring; run on CI and as SystemsLab experiments on
    6.1, 6.8, 6.12 and 7.1. Settle the 6.12.y minimum or keep a probe.
-1.  Bounded accumulator: the target length from `NeedAtLeast` and the
+1. Bounded accumulator: the target length from `NeedAtLeast` and the
    sites that clear it (reset, close, `ConnStream` reads, the segmented
    entry's `take_frozen`, `settle_forward_end`), the hold of a
    completion's rest while a target is set and the accumulator is
@@ -747,6 +751,6 @@ buffers held by `with_bytes` views, values copied by the
    the removal of `recv_segment_reserve`) in a coordinated release.
 
 Steps 1 to 3 change neither the ring's registration nor its geometry, and
-can land before INC is switched on. Step 1 holds a `pending_recv_bufs`
-buffer in more states than today, still at most one per connection, with
-no lend cap until step 4.
+can land before INC is switched on. Step 1 holds a buffer in
+`pending_recv_bufs`, out of the ring, in more states than today, still at
+most one per connection, with no lend cap until step 4.
