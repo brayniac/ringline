@@ -322,18 +322,18 @@ today.
 This needs three driver changes, since today a buffer is held in place only
 while the accumulator is empty and the held buffer is the older data:
 
-- The driver records the target from `NeedAtLeast(n)` and clears it as
+-  The driver records the target from `NeedAtLeast(n)` and clears it as
   above, and moves held bytes into the accumulator before the future parks
-  or resolves. Today both futures only call `accumulators.reserve(n)`,
-  whose `reserve_target` is a capacity hint cleared when the accumulator
-  drains.
-- `handle_recv_multi` holds the rest of a completion while the accumulator
-  is non-empty (today, when the accumulator has bytes or a buffer is
-  already held, it copies the held buffer and then the completion into
-  the accumulator, `event_loop.rs`). Every path that appends to the
-  accumulator or installs a recv sink flushes a held buffer first, so a
-  held buffer is always newer than the accumulator's bytes; today the
-  recv-sink overflow append and `set_recv_sink` do not.
+  or resolves at EOF. Today both futures only call
+  `accumulators.reserve(n)`, whose `reserve_target` is a capacity hint
+  cleared when the accumulator drains.
+-  `handle_recv_multi` holds the rest of a completion while a target is
+  set and the accumulator is non-empty (today, when the accumulator has
+  bytes or a buffer is already held, it copies the held buffer and then
+  the completion into the accumulator, `event_loop.rs`). Every path that
+  appends to the accumulator or installs a recv sink flushes a held buffer
+  first, so a held buffer is always newer than the accumulator's bytes;
+  today the recv-sink overflow append and `set_recv_sink` do not.
 - `WithDataFuture` parses the accumulator before the held buffer, instead
   of prepending the held buffer to the accumulator (`runtime/io.rs`,
   `accumulators.prepend`). The held rest is parsed by the next `with_data`
@@ -345,9 +345,11 @@ while the accumulator is empty and the held buffer is the older data:
 `park_blocker` reports `DataPending` while `pending_recv_bufs[conn]` is
 `Some` (today it checks the accumulator, `segment_hold`, `recv_hold` and
 `segment_pinned`, `driver.rs`), and `take_pending_for_park` drains that
-slot as well. Once a rest stays held after `Consumed(k)` (the views step),
-a connection offered for park after a partial parse would otherwise be
-parked and its rest replenished uncopied (`event_loop.rs` park teardown).
+slot as well, after the accumulator, since the held rest is the newer
+data. From step 1 a rest can stay held after a parse of the accumulator
+returns `Consumed(k)` (and, from the views step, after the fast path's);
+a connection offered for park then would otherwise be parked and its rest
+replenished uncopied (`event_loop.rs` park teardown).
 
 A hold at an offset needs the data-address changes in "Changes in the
 driver" (`PendingRecvBuf`'s pointer and `handle_send_recv_buf`'s short-send
@@ -381,10 +383,14 @@ allocation that every view also holds. Only the entry array is mmap'd;
 the buffers are a `Vec` today (`provided.rs`). The worker's drop releases
 its reference after the ring is dropped (`ring` is `Driver`'s first field,
 and fields drop in declaration order), and the last view to drop frees
-the memory. A view dropped on its worker pushes the release onto a
-thread-local queue that the event loop drains after each poll, as it
-drains `READY_QUEUE`, so a drop inside a `with_state` closure, such as the
-parser's, never takes the driver. One dropped on another thread releases
+the memory. A view dropped on its worker queues its release as an
+`Orphan` (`defer_release`), which `release_orphans` applies at the start
+of each poll pass and before the worker waits for I/O, ahead of
+`flush_replenish_and_rearm`. A drop inside a `with_state` closure, such as
+the parser's, or in `on_tick`, therefore never takes the driver and is
+released before the worker blocks. A release queued after the worker's
+last iteration is dropped with the worker's pools. One dropped on another
+thread releases
 through the worker's cross-thread inbox, which carries task indices today
 and gains a message kind for it.
 A release sent after the worker exits finds no inbox and is dropped.
@@ -438,15 +444,16 @@ A connection's next arm targets the large group when either holds:
 
 - four consecutive completions were each at least `promote_bytes` (default
   64 KiB) and each carried `IORING_CQE_F_SOCK_NONEMPTY`;
-- a lend from this connection is still held when its task next parks.
+-  a lend from this connection is still held when its task next parks.
   Every in-place delivery is a lend held past the completion handler, so
   the test is at the park, not after the handler. Two lends count under
   the lend cap but not here or for the demotion exemption (author's
   proposal): a `with_bytes` view, which the caller owns, not the
   connection's task, so a client that keeps values would otherwise stay
-  promoted; and a rest held after `Consumed(k)`, which would otherwise
-  promote every request/response connection that awaits anything between
-  two pipelined requests.
+  promoted; and a rest the bounded accumulator holds (the part of a
+  completion beyond the target, or the rest after a fast-path
+  `Consumed(k)`), which would otherwise promote every request/response
+  connection that awaits anything between two pipelined requests.
 
 The rule uses a byte threshold rather than "filled its buffer": under INC a
 completion clears `F_BUF_MORE` whenever it reaches the end of a shared
@@ -531,14 +538,14 @@ quiet period (0, 0, 1) and none with it; its p50 per rep was 5.2, 12.6 and
 
 ## Lends
 
-A lend (`pending_recv_bufs`, including a rest held after `Consumed(k)`,
-`forward_recv_buf`, recv-forward, direct echo, segments, `forward_to` Mode
-A, and `with_bytes` views) holds a range of a buffer until its task polls,
-its send completes, or, for a view, the caller drops it. Under INC the
-buffer is shared, so a 200-byte lend keeps a whole 1 MiB buffer out of the
-ring. A connection whose lend, other than a view or a rest held after
-`Consumed(k)`, is held when its task parks is promoted, so its later lends
-pin large-group buffers.
+A lend (`pending_recv_bufs`, including a rest the bounded accumulator
+holds, `forward_recv_buf`, recv-forward, direct echo, segments,
+`forward_to` Mode A, and `with_bytes` views) holds a range of a buffer
+until its task polls, its send completes, or, for a view, the caller drops
+it. Under INC the buffer is shared, so a 200-byte lend keeps a whole 1 MiB
+buffer out of the ring. A connection whose lend, other than a view or a
+rest the bounded accumulator holds, is held when its task parks is
+promoted, so its later lends pin large-group buffers.
 
 - Per group, a lend is taken only while fewer than half that group's
   buffers are held. Plaintext lends in `pending_recv_bufs` are otherwise
@@ -681,22 +688,23 @@ buffers held by `with_bytes` views, values copied by the
    forced-async receive), EOF on a partly used buffer, and multishot
    `RECVMSG` on an INC ring; run on CI and as SystemsLab experiments on
    6.1, 6.8, 6.12 and 7.1. Settle the 6.12.y minimum or keep a probe.
-1. Bounded accumulator: the target length from `NeedAtLeast` and the sites
-   that clear it (reset, close, `ConnStream` reads, the segmented entry's
-   `take_frozen`, `settle_forward_end`), the hold of a completion's rest
-   while the accumulator is non-empty, the flush of a held buffer before
-   any append, `WithDataFuture` parsing the accumulator before the held
-   buffer, the move of held bytes into the accumulator, with a re-parse,
-   before the future parks or resolves, and `park_blocker` and
-   `take_pending_for_park` covering `pending_recv_bufs`. It needs the
-   data-address changes to `PendingRecvBuf` and `handle_send_recv_buf`
-   from step 3; land those here. `with_bytes` views over held buffers (see
-   "`with_bytes`"), with `recv_zc_threshold`, its helper, the client
-   crates' use of it and the view metric, are a step of their own after
-   step 4, since a view is a hold (Buffer state rule 4) counted under the
-   per-group lend cap. That step also keeps the rest held at offset + k
-   after `Consumed(k)` (for `with_data` too), and gives `WithBytesFuture`
-   the fast path and the accumulator-first parse order.
+1.  Bounded accumulator: the target length from `NeedAtLeast` and the
+   sites that clear it (reset, close, `ConnStream` reads, the segmented
+   entry's `take_frozen`, `settle_forward_end`), the hold of a
+   completion's rest while the accumulator is non-empty, the flush of a
+   held buffer before any append, `WithDataFuture` parsing the accumulator
+   before the held buffer, the move of held bytes into the accumulator,
+   with a re-parse, before the future parks or resolves at EOF, and
+   `park_blocker` and `take_pending_for_park` covering
+   `pending_recv_bufs`. It needs the data-address changes to
+   `PendingRecvBuf` and `handle_send_recv_buf` from step 3; land those
+   here. `with_bytes` views over held buffers (see "`with_bytes`"), with
+   `recv_zc_threshold`, its helper, the client crates' use of it and the
+   view metric, are a step of their own after step 4, since a view is a
+   hold (Buffer state rule 4) counted under the per-group lend cap. That
+   step also keeps the rest held at offset + k after `Consumed(k)` (for
+   `with_data` too), and gives `WithBytesFuture` the fast path and the
+   accumulator-first parse order.
 2. Buffer state (`written`, `exhausted`, `holds`) with the ring registered
    plain. Every completion exhausts its buffer at offset 0, so behaviour is
    unchanged; the per-path single-release checks become holds. The existing
@@ -737,5 +745,7 @@ buffers held by `with_bytes` views, values copied by the
    large group's default per ring kind, the `recv_accumulator_max` floor,
    the removal of `recv_segment_reserve`) in a coordinated release.
 
-Steps 1 to 3 change no ring behaviour and can land before INC is switched
-on.
+Steps 1 to 3 change neither the ring's registration nor its geometry, and
+can land before INC is switched on. Step 1 keeps a buffer out of the ring
+in more states than today, still at most one per connection, with no lend
+cap until step 4.
