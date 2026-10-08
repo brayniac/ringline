@@ -283,31 +283,62 @@ it needs no special case.
 
 ## Bounded accumulator
 
-When a connection's parser last returned `ParseResult::NeedAtLeast(n)`, a
-completion copies `n` bytes into the accumulator and holds the rest of the
-completion in place, at its offset. The task parses the accumulator first
-and then the held rest, as if nothing were buffered. `NeedAtLeast(n)` is a
-lower bound: if the parser still returns `NeedMore` or `NeedAtLeast` after
-the `n` bytes, the held rest is copied as today. With `NeedMore` (no
-announced length) the completion is copied whole, as today. The
-accumulator then holds at most one message plus the bytes of one
-completion, whatever the buffer size.
+When a connection's parser last returned `ParseResult::NeedAtLeast(n)`, the
+driver records a target accumulator length: the accumulator's length at
+that parse plus `n`. Any other parse result clears the target. A completion
+copies `min(target − accumulator length, completion length)` bytes into the
+accumulator and holds the rest of the completion in place, at its offset.
+One buffer is held per connection: a completion that arrives while a rest
+is held is copied whole, after the held rest. `NeedAtLeast(n)` is a lower
+bound; on `NeedMore` after the target is reached, the held rest is appended
+and the closure runs again on the merged bytes before the task parks. With
+`NeedMore` and no target, the completion is copied whole, as today. The
+accumulator then holds at most one message plus the bytes received between
+two parses, whatever the buffer size.
 
-This needs two driver changes, since today a buffer is held in place only
+This needs three driver changes, since today a buffer is held in place only
 while the accumulator is empty and the held buffer is the older data:
 
+- The driver records the target from `NeedAtLeast(n)` and clears it on any
+  other result. Today both futures only call `accumulators.reserve(n)`,
+  whose `reserve_target` is a capacity hint cleared when the accumulator
+  drains.
 - `handle_recv_multi` holds the rest of a completion while the accumulator
   is non-empty (today it copies both into the accumulator when the
-  accumulator has bytes, `event_loop.rs`).
+  accumulator has bytes, `event_loop.rs`). Every path that appends to the
+  accumulator or installs a recv sink flushes a held buffer first, so a
+  held buffer is always newer than the accumulator's bytes; today the
+  recv-sink overflow append and `set_recv_sink` do not.
 - `WithDataFuture` parses the accumulator before the held buffer, instead
   of prepending the held buffer to the accumulator (`runtime/io.rs`,
-  `accumulators.prepend`).
+  `accumulators.prepend`). The held rest is parsed by the next `with_data`
+  call through the fast path, once the accumulator is empty.
+
+A hold at an offset needs the data-address changes in "Changes in the
+driver" (`PendingRecvBuf`'s pointer and `handle_send_recv_buf`'s short-send
+resubmit, which today computes from the buffer's base), so they land with
+it.
+
+`with_bytes` copies a held buffer into the accumulator when it polls, so the
+bounded accumulator saves no copy and no accumulator memory for
+`with_bytes` callers. ringline-redis, the only `NeedAtLeast` producer in the
+workspace, parses with `with_bytes`. How `with_bytes` callers get the bound
+is open; the options are:
+
+- `with_bytes` hands out `Bytes` views over held provided buffers, which
+  keep the buffer held until dropped. Zero-copy, and each kept view is a
+  hold under the lend cap.
+- ringline-redis moves to `with_data` and copies the values it keeps.
+- The bound applies to `with_data` callers only.
 
 In the benchmark's streaming cells it cut process RSS from 2.3 GiB to 262
 MiB (INC 64 × 1 MiB, hv01); with a 1 GiB plain ring RSS only halved, from
 2.0 to 1.07 GiB. Bytes copied fell sevenfold, at 10–58% more throughput. The
 benchmark parses in the completion handler; ringline parses in the
-connection's task, so the gain for ringline is inferred, not measured.
+connection's task, so the gain for ringline is inferred, not measured. The
+benchmark knows each message's exact length from its header. Ringline's
+bound engages only after a parse has returned `NeedAtLeast`, and
+`NeedAtLeast` is a lower bound.
 
 ## The large group
 
@@ -502,8 +533,9 @@ receive queue, and TCP closes the window until the worker re-arms.
 ## Unchanged
 
 - The UDP ring (`udp_recv_buffer`, its own bgid) stays plain.
-- `with_bytes` reads the accumulator. `with_data` reads the accumulator and
-  then a held buffer, as "Bounded accumulator" describes.
+- `with_bytes` copies a held buffer into the accumulator when it polls,
+  unless "Bounded accumulator"'s open question changes it. `with_data`
+  reads the accumulator and then a held buffer.
 - TLS (both engines) copies out of the ring and takes no hold.
 - The `timestamps` feature shares the small TCP group. If multishot
   `RECVMSG` works on an INC ring, it stays there, with `RecvMsgOut::parse`
@@ -551,10 +583,13 @@ the ring kind in use.
    forced-async receive), EOF on a partly used buffer, and multishot
    `RECVMSG` on an INC ring; run on CI and as SystemsLab experiments on
    6.1, 6.8, 6.12 and 7.1. Settle the 6.12.y minimum or keep a probe.
-1. Bounded accumulator: copy only the `n` bytes a `NeedAtLeast(n)`
-   message announced, hold the rest of the completion while the
-   accumulator is non-empty, and have `WithDataFuture` parse the
-   accumulator before the held buffer. Independent of the ring changes.
+1. Bounded accumulator: the target length from `NeedAtLeast`, the hold of
+   a completion's rest while the accumulator is non-empty, the flush of a
+   held buffer before any append, and `WithDataFuture` parsing the
+   accumulator before the held buffer. It needs the data-address changes
+   to `PendingRecvBuf` and `handle_send_recv_buf` from step 3; land those
+   here. How `with_bytes` callers get the bound is decided before this
+   step.
 2. Buffer state (`written`, `exhausted`, `holds`) with the ring registered
    plain. Every completion exhausts its buffer at offset 0, so behaviour is
    unchanged; the per-path single-release checks become holds. The existing
