@@ -264,12 +264,15 @@ pub fn pbuf_variants() {
     const REGISTER_PBUF_RING: libc::c_uint = 22;
     const REGISTER_BUFFERS: libc::c_uint = 0;
     fn reg(fd: i32, addr: u64, entries: u32, bgid: u16, flags: u16) -> String {
+        reg_resv(fd, addr, entries, bgid, flags, 0)
+    }
+    fn reg_resv(fd: i32, addr: u64, entries: u32, bgid: u16, flags: u16, resv0: u64) -> String {
         let r = BufReg {
             ring_addr: addr,
             ring_entries: entries,
             bgid,
             flags,
-            resv: [0; 3],
+            resv: [resv0, 0, 0],
         };
         let rc = unsafe {
             libc::syscall(
@@ -316,6 +319,14 @@ pub fn pbuf_variants() {
         println!(
             "PBUF setup={setup} mem=mmap entries=8 bgid=7 {}",
             reg(u.as_raw_fd(), mem as u64, 8, 7, 0)
+        );
+        // Ubuntu's 6.8.0-139 and later are reported to invert the check on
+        // `resv`: zeroed is rejected, nonzero accepted.
+        let u = mk();
+        let mem = mmap_anon(PAGE);
+        println!(
+            "PBUF setup={setup} mem=mmap entries=8 resv0=1 {}",
+            reg_resv(u.as_raw_fd(), mem as u64, 8, 0, 0, 1)
         );
         // Fixed buffers, as a control for registration in general.
         let u = mk();
