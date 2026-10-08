@@ -168,7 +168,7 @@ one engine call:
 |---|---|---|
 | `submit_and_wait(1)` when nothing is runnable | `wait(None)` | Start queued work; block until a completion is ready. |
 | `submit_and_get_events()` when a task is runnable | `wait(Some(ZERO))` | Start queued work and collect what is ready, without blocking. The emulator polls readiness with a zero timeout here; otherwise it reproduces the worker starvation the comment above that call describes. |
-| `flush()` after the poll pass, and mid-batch | `submit()` | Start queued work (each op tries its syscall once, rule 2), and make those completions visible to the next `reap`. `submit` does not poll readiness and does not resume passes on the cap list. The kernel's `flush()` runs deferred task_work, including a capped receive's requeue, when the SQ is non-empty; the driver depends on neither. |
+| `flush()` after the poll pass, and mid-batch | `submit()` | Start queued work: each readiness-driven op makes its first attempt (rule 2; a multishot recv runs one capped pass), and disk-pool ops are handed to the pool. Those completions become visible to the next `reap`. `submit` does not poll readiness and does not resume passes on the cap list. The kernel's `flush()` runs deferred task_work when the SQ is non-empty, including a capped receive's requeue and the recv completions of sockets that became readable. The driver needs neither for correctness: the next `wait` delivers both. |
 
 The loop arms its own wake-up deadline as a TickTimeout SQE, and
 `run_shutdown` arms its own, so `wait` needs no timeout of its own.
