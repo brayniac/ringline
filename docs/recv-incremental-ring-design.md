@@ -322,12 +322,12 @@ today.
 This needs three driver changes, since today a buffer is held in place only
 while the accumulator is empty and the held buffer is the older data:
 
--  The driver records the target from `NeedAtLeast(n)` and clears it as
+- The driver records the target from `NeedAtLeast(n)` and clears it as
   above, and moves held bytes into the accumulator before the future parks
   or resolves at EOF. Today both futures only call
   `accumulators.reserve(n)`, whose `reserve_target` is a capacity hint
   cleared when the accumulator drains.
--  `handle_recv_multi` holds the rest of a completion while a target is
+- `handle_recv_multi` holds the rest of a completion while a target is
   set and the accumulator is non-empty (today, when the accumulator has
   bytes or a buffer is already held, it copies the held buffer and then
   the completion into the accumulator, `event_loop.rs`). Every path that
@@ -379,21 +379,22 @@ whether the accumulator was empty when its parse began. Bytes moved into
 the accumulator by the re-run rule above are copied.
 
 Buffer memory moves out of `ProvidedBufRing` into a reference-counted
-allocation that every view also holds. Only the entry array is mmap'd;
-the buffers are a `Vec` today (`provided.rs`). The worker's drop releases
-its reference after the ring is dropped (`ring` is `Driver`'s first field,
-and fields drop in declaration order), and the last view to drop frees
-the memory. A view dropped on its worker queues its release as an
-`Orphan` (`defer_release`), which `release_orphans` applies at the start
-of each poll pass and before the worker waits for I/O, ahead of
+allocation that every view also holds. Only the entry array is mmap'd; the
+buffers are a `Vec` today (`provided.rs`). The worker's drop releases its
+reference after the ring is dropped (`ring` is `Driver`'s first field, and
+fields drop in declaration order), and the last view to drop frees the
+memory. A view dropped on its worker queues its release as an `Orphan`
+(`defer_release`), which `release_orphans` applies at the start of each
+poll pass and before the worker waits for I/O, ahead of
 `flush_replenish_and_rearm`. A drop inside a `with_state` closure, such as
 the parser's, or in `on_tick`, therefore never takes the driver and is
-released before the worker blocks. A release queued after the worker's
-last iteration is dropped with the worker's pools. One dropped on another
-thread releases
-through the worker's cross-thread inbox, which carries task indices today
-and gains a message kind for it.
-A release sent after the worker exits finds no inbox and is dropped.
+released before the worker blocks. The release names its allocation, and
+`release_orphans` ignores a release for another ring's allocation. A
+release queued after the worker's last iteration is never applied; the
+allocation is freed when the last view drops. One dropped on another
+thread releases through the worker's cross-thread inbox, which carries
+task indices today and gains a message kind for it. A release sent after
+the worker exits finds no inbox and is dropped.
 
 A view the caller keeps pins its whole buffer: a 1 MiB buffer on an INC
 ring, shared with other connections' data, for a value of any size. With
@@ -444,7 +445,7 @@ A connection's next arm targets the large group when either holds:
 
 - four consecutive completions were each at least `promote_bytes` (default
   64 KiB) and each carried `IORING_CQE_F_SOCK_NONEMPTY`;
--  a lend from this connection is still held when its task next parks.
+- a lend from this connection is still held when its task next parks.
   Every in-place delivery is a lend held past the completion handler, so
   the test is at the park, not after the handler. Two lends count under
   the lend cap but not here or for the demotion exemption (author's
@@ -691,20 +692,20 @@ buffers held by `with_bytes` views, values copied by the
 1.  Bounded accumulator: the target length from `NeedAtLeast` and the
    sites that clear it (reset, close, `ConnStream` reads, the segmented
    entry's `take_frozen`, `settle_forward_end`), the hold of a
-   completion's rest while the accumulator is non-empty, the flush of a
-   held buffer before any append, `WithDataFuture` parsing the accumulator
-   before the held buffer, the move of held bytes into the accumulator,
-   with a re-parse, before the future parks or resolves at EOF, and
-   `park_blocker` and `take_pending_for_park` covering
-   `pending_recv_bufs`. It needs the data-address changes to
-   `PendingRecvBuf` and `handle_send_recv_buf` from step 3; land those
-   here. `with_bytes` views over held buffers (see "`with_bytes`"), with
-   `recv_zc_threshold`, its helper, the client crates' use of it and the
-   view metric, are a step of their own after step 4, since a view is a
-   hold (Buffer state rule 4) counted under the per-group lend cap. That
-   step also keeps the rest held at offset + k after `Consumed(k)` (for
-   `with_data` too), and gives `WithBytesFuture` the fast path and the
-   accumulator-first parse order.
+   completion's rest while a target is set and the accumulator is
+   non-empty, the flush of a held buffer before any append,
+   `WithDataFuture` parsing the accumulator before the held buffer, the
+   move of held bytes into the accumulator, with a re-parse, before the
+   future parks or resolves at EOF, and `park_blocker` and
+   `take_pending_for_park` covering `pending_recv_bufs`. It needs the
+   data-address changes to `PendingRecvBuf` and `handle_send_recv_buf`
+   from step 3; land those here. `with_bytes` views over held buffers (see
+   "`with_bytes`"), with `recv_zc_threshold`, its helper, the client
+   crates' use of it and the view metric, are a step of their own after
+   step 4, since a view is a hold (Buffer state rule 4) counted under the
+   per-group lend cap. That step also keeps the rest held at offset + k
+   after `Consumed(k)` (for `with_data` too), and gives `WithBytesFuture`
+   the fast path and the accumulator-first parse order.
 2. Buffer state (`written`, `exhausted`, `holds`) with the ring registered
    plain. Every completion exhausts its buffer at offset 0, so behaviour is
    unchanged; the per-path single-release checks become holds. The existing
@@ -746,6 +747,6 @@ buffers held by `with_bytes` views, values copied by the
    the removal of `recv_segment_reserve`) in a coordinated release.
 
 Steps 1 to 3 change neither the ring's registration nor its geometry, and
-can land before INC is switched on. Step 1 keeps a buffer out of the ring
-in more states than today, still at most one per connection, with no lend
-cap until step 4.
+can land before INC is switched on. Step 1 holds a `pending_recv_bufs`
+buffer in more states than today, still at most one per connection, with
+no lend cap until step 4.
