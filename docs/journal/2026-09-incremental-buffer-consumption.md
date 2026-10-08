@@ -765,6 +765,70 @@ the same two-group code and an INC 64 × 1 MiB large group off by default
 until the design's landing measurements (rate-limited streamers, A/A
 pairs) separate the effect. The bounded accumulator on both. Promotion on
 completions of at least 64 KiB carrying `SOCK_NONEMPTY`, and on held
-lends, with no cap. Demotion hysteresis and migration timing are measured
-next. This replaces the plain 1024 × 64 KiB recommendation and the
-per-connection hybrid follow-up above.
+lends, with no cap. Demotion hysteresis and migration timing were
+measured next (below). This replaces the plain 1024 × 64 KiB
+recommendation and the per-connection hybrid follow-up above.
+
+### Demotion quiet period and migration time
+
+Benchmark at `aa46b64`: `--demote-quiet-ms` demotes a connection only once
+that long has passed since its last completion that counted toward
+promotion, and each move records the time from the decision to the re-arm
+on the new group and to the first delivery there. Two hosts, three reps,
+medians, 36 runs per kernel and none failed: 6.12 Debian 13
+`01a11d87-5b5d-710a-210d-caee1b974dd2`, 6.1 Debian 12
+`01a11d87-5bd5-7100-e089-358dd296381e`. Every cell is 1000
+request/response connections at 20k requests/s plus 16 streamers.
+
+6.1, request p50 / p99 / p999 in ms, and streamer MB/s:
+
+| Cell | 4096 × 64 KiB | two groups | two groups, 1 s quiet |
+|---|---|---|---|
+| mixed | 168 / 336 / 352, 814 | 57 / 369 / 403, 1139 | 25 / 44 / 71, 1054 |
+| streamers holding | 176 / 352 / 369, 815 | 38 / 84 / 92, 1280 | 31 / 61 / 76, 1017 |
+| tiered | 168 / 336 / 336, 797 | 13 / 34 / 67, 856 | 12 / 20 / 26, 888 |
+| heavy-tailed, tiered | 352 / 1040 / 1476, 598 | 19 / 117 / 193, 805 | 13 / 34 / 57, 708 |
+
+Median demotions per run without and with the quiet period: mixed 40 and
+5, tiered 99 and 11, heavy-tailed 415 and 381, streamers holding 0 and 0.
+
+6.12, request p50 / p99 / p999 in ms:
+
+| Cell | INC 64 × 1 MiB | two groups | two groups, 1 s quiet |
+|---|---|---|---|
+| mixed | 4.98 / 8.39 / 54.5 | 4.46 / 7.34 / 54.5 | 9.44 / 16.25 / 17.83 |
+| streamers holding | 8.91 / 15.2 / 23.1 | 6.03 / 9.44 / 54.5 | 7.34 / 11.5 / 26.2 |
+| tiered | 7.86 / 12.6 / 16.8 | 5.24 / 8.39 / 16.8 | 12.6 / 22.0 / 24.1 |
+| heavy-tailed, tiered | 7.08 / 12.6 / 56.6 | 7.60 / 14.2 / 56.6 | 8.91 / 16.25 / 54.5 |
+
+Migration time, two groups without the quiet period, range of per-rep
+medians:
+
+| Kernel | Decision to re-arm | Decision to first delivery on the new group |
+|---|---|---|
+| 6.12 | 1.3–2.5 ms (streamers holding) to 4–25 ms (mixed, tiered) | 7–25 ms (mixed, streamers holding), about 50 ms (tiered) |
+| 6.1 | 15–586 ms | 50 ms to 7.4 s (7.4 s in one rep of streamers holding) |
+
+Measured:
+
+- On 6.1 the quiet period lowered request p99 and p999 in all four cells
+  (1.4–8.4× at p99, 1.2–5.7× at p999) and cut demotions in the three cells
+  that had them; streamer throughput changed by −21% to +4%.
+- On 6.12 it lowered p999 in the mixed cell and raised p50 and p99 in the
+  mixed and tiered cells.
+- A move took milliseconds on 6.12 and up to seconds on 6.1 before the
+  connection received on its new group.
+- The single-group 6.12 results moved between this run and the previous
+  one (streamers holding p999 23.1 ms here against 54.5 ms; mixed p50
+  4.98 ms against 8.1 ms). Run-to-run variation on 6.12 is at least as
+  large as the configuration effects.
+
+Inferred, not measured: that 6.1's long moves come from the saturated
+server loop (request p50 about 170 ms with one group) and from waiting for
+a free large-group buffer.
+
+**Decision (owner, 2026-10-08, later).** With a plain ring, demotion
+requires a 1 s quiet period (`recv_large_demote_quiet`). With an INC ring
+the large group stays off by default and its demotion rule is decided with
+it in the landing measurements.
+

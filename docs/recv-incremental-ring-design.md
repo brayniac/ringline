@@ -334,14 +334,31 @@ Generation checks are unchanged.
 
 ### Demotion
 
-A promoted connection returns to the small group after a run of
-completions below `promote_bytes`. A connection holding a lend is not
-demoted while it holds. In the benchmark the run was 64 completions, and
-connections moved back and forth: on 6.1, 1 MiB request/ack connections
-were promoted and demoted about 600 times per eight-second run, and on 6.12
-streaming produced 58–91 demotions. Demotion after a quiet period, and the
-time each migration takes, are being measured; landing step 5 settles the
-rule.
+A promoted connection returns to the small group after 64 consecutive
+completions below `promote_bytes`, and only once `recv_large_demote_quiet`
+(default 1 s) has passed since its last completion that counted toward
+promotion. A connection holding a lend is not demoted while it holds.
+
+A move is not cheap. From the decision to the connection's first delivery
+on its new group, the benchmark measured 7–50 ms on 6.12 and 50 ms to
+7.4 s on 6.1, where the server loop was saturated; from the decision to
+the re-arm, 1.3–25 ms on 6.12 and 15–586 ms on 6.1. Moves must therefore
+be rare. Without the quiet period connections moved back and forth: on
+6.1, 1 MiB request/ack connections were promoted and demoted about 600
+times per eight-second run.
+
+With a plain ring, where the large group is on by default, the quiet
+period is the measured rule. On 6.1, with 16 streamers sharing the worker,
+it cut demotions in three of four cells (40 to 5, 99 to 11, 415 to 381; the
+fourth had none), and request p99 and p999 fell in all four, by 1.4–8.4×
+at p99 and 1.2–5.7× at p999, while streamer throughput changed by −21% to
++4%.
+
+With an INC ring the large group is off by default, and the demotion rule
+is decided with it in landing step 6. On 6.12 the quiet period cut both
+ways: p999 fell in the mixed cell (54.5 to 17.8 ms) while p50 and p99 rose
+there (4.5 to 9.4 ms, 7.3 to 16.3 ms) and in the tiered cell with
+streamers (5.2 to 12.6 ms, 8.4 to 22.0 ms).
 
 ## Lends
 
@@ -436,7 +453,9 @@ receive queue, and TCP closes the window until the worker re-arms.
 - `ConfigBuilder::recv_large_group(bool)` turns the large group on or off
   (default per ring kind, as in the first table, from step 7);
   `recv_large_buffer(ring_size, buffer_size)` sets its geometry; and
-  `recv_large_buffer_bgid(u16)` its buffer group id, default 2. `build()`
+  `recv_large_buffer_bgid(u16)` its buffer group id, default 2; and
+  `recv_large_demote_quiet(Duration)` the demotion quiet period, default
+  1 s. `build()`
   rejects a large-group bgid equal to the TCP bgid (default 0), or the UDP
   bgid (default 1) when UDP is in use.
 
@@ -456,8 +475,9 @@ receive queue, and TCP closes the window until the worker re-arms.
 Kept: `buffer_ring_empty`, `recv_parked`, `recv_fallback`,
 `forward_throttled`. New, per group where it applies: buffers out of the
 ring, buffers held by lends, lends refused by the lend cap, `ENOBUFS`,
-promotions, demotions, connections in the large group, and the ring kind in
-use.
+promotions, demotions, connections in the large group, the time from a
+move's decision to the connection's first delivery on its new group, and
+the ring kind in use.
 
 ## Not measured
 
@@ -470,7 +490,8 @@ use.
 - The runtime hold-promotion rule (only a static per-connection rule ran).
 - The half-the-group lend cap.
 - The 1 MiB fallback chunk with the free-space re-arm.
-- The demotion rule and the time a migration takes.
+- The demotion rule and the time a migration takes in ringline (measured
+  only in the benchmark), and the demotion rule on 6.12.
 - Multishot `RECVMSG` on an INC ring.
 
 ## Landing
@@ -500,8 +521,8 @@ use.
    and validation, the arm taking the group per call,
    `OpTag::RecvMultiLarge` and the `SendRecvBuf` group bit, `group` in
    `PendingRecvBuf` and the send slab, the cancel sites, promotion,
-   migration and demotion, and the two-group memlock preflight.
-   Demotion's rule is settled here, with migration timed.
+   migration and demotion with `recv_large_demote_quiet`, and the two-group
+   memlock preflight. Migration is timed in ringline's metrics.
 6. Measure ringline on hv01 and across hv01/hv02, on Linux 6.1, 6.8, 6.12
    and 7.1: the geometry per ring kind with and without the large group
    against the 256 × 16 KiB ring, with the bench suite (echo at 256 B to
