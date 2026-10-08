@@ -12,6 +12,10 @@
 # them the holding connections.
 reps=${1:-3}
 kind=${2:-plain}
+# A trailing "m" (inc2m, plain2m) runs the same configs on the mixed-size
+# cells instead.
+cellset=default
+case "$kind" in *2m) cellset=sizes; kind=${kind%m} ;; esac
 if [ "$kind" = inc ]; then
   configs=(
     "inc_64x1m|--strategy shared_inc --shared-bufs 64 --shared-buf-size 1048576 --bounded-acc"
@@ -53,6 +57,16 @@ cells=(
   "tiered-r20000|1000|--msg-size 4096 --rate 20000|--hold-every 4 --hold-us 5000|0|"
   "tiered-mixed-r20000|1000|--msg-size 4096 --rate 20000|--hold-every 4 --hold-us 5000|16|$stream"
 )
+# Get/set-like request sizes, heavy-tailed: about half 64 B, 0.5% 1 MiB,
+# mean about 12.5 KB.
+sizes="--mix 64:500,256:200,1024:120,4096:80,16384:50,65536:30,262144:15,1048576:5"
+if [ "$cellset" = sizes ]; then
+  cells=(
+    "sizes-r20000|1000|$sizes --rate 20000||0|"
+    "sizes-tiered-r20000|1000|$sizes --rate 20000|--hold-every 4 --hold-us 5000|0|"
+    "sizes-tiered-mixed-r20000|1000|$sizes --rate 20000|--hold-every 4 --hold-us 5000|16|$stream"
+  )
+fi
 i=0
 for rep in $(seq 1 "$reps"); do
   for cell in "${cells[@]}"; do
