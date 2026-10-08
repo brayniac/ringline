@@ -544,7 +544,8 @@ connections. This section records those runs (2026-10-07 and 2026-10-08).
 - **Bounded accumulator** (`--bounded-acc`): a completion copies into the
   accumulator only what completes the pending message and parses the rest in
   place. Every configuration below uses it. In the streaming cells it cut
-  RSS from 2.4 GB to 262 MB and bytes copied sevenfold, at 10–58% more
+  RSS from 2.3 GiB to 262 MiB (INC 64 × 1 MiB, hv01; with a 1 GiB plain
+  ring only from 2.0 to 1.07 GiB) and bytes copied sevenfold, at 10–58% more
   throughput (hv01 `01a11885-c77f-7166-f3e7-a7c1f337c950`, two hosts
   `01a11885-c7f9-7178-4ae7-ccecdb8b4337`).
 - **`--no-thp`** (`MADV_NOHUGEPAGE`) on plain rings: with transparent huge
@@ -643,10 +644,9 @@ multishot receive and re-arms on the other group.
 + 256 × 1 MiB) beat the 4096 × 64 KiB group on streaming (1216 against
 1030 MB/s) and cut request latency 4–5× with streamers present. 64 KiB
 request/response messages fill a 64 KiB buffer exactly, so those
-connections were promoted and stayed: a median of 833 promotions and 0–2
-demotions per run, with a median of 831 connections in the large group at
-the end, starved the
-large group (147k `ENOBUFS`) and lost 5% throughput. On 6.12 two INC groups
+connections were promoted and stayed (median 833 promotions, 0–2 demotions
+and 831 connections in the large group at the end, per run). They starved
+the large group (147k `ENOBUFS`) and lost 5% throughput. On 6.12 two INC groups
 tied one on streaming, 1 MiB and 64 KiB request/ack and the control. In the
 mixed cells, p50 / p99 / p999 in ms:
 
@@ -719,12 +719,15 @@ Measured:
   across hosts.
 - The `SOCK_NONEMPTY` rule promoted no 64 KiB request/response connection
   on 6.1 or 6.12.
-- Before 6.12, in every cell with 16 streamers sharing the worker, two
-  groups cut request p50 and p99 by 2.8× to 25×: 2.8× (mixed), 7–9×
-  (streamers holding), 3.7–25× (tiered with streamers), 15–21×
-  (heavy-tailed, tiered with streamers). In cells without streamers they
-  tied one group, except p999 in the heavy-tailed tiered cell, which rose
-  from 5.2 to 6.6 ms in all three reps.
+- On 6.1, in every cell with 16 streamers sharing the worker, two groups
+  cut request p50 and p99 by 2.8× to 25×: 2.8× (mixed), 7–9× (streamers
+  holding), 3.7–25× (tiered with streamers), 15–21× (heavy-tailed, tiered
+  with streamers). In cells without streamers p50 was the same; the tails
+  moved in both directions. Tiered p999 fell (2.75, 2.62, 3.15 ms per rep
+  with one group; 2.36, 2.03, 2.49 ms with two;
+  `01a11d44-3a9e-71f7-9019-7cc0a98b5d66`). Heavy-tailed tiered p99 rose
+  (3.54, 3.80, 3.80 against 3.93, 4.19, 4.06 ms) and its p999 rose from
+  5.2 to 6.6 ms in all three reps (`01a11d45-3f7d-71bc-53b6-95a2526e0900`).
 - A cap on promoted connections was worse wherever more than 64 needed
   promoting.
 - Two groups were not run on 7.1, nor on any kernel between 6.2 and 6.11.

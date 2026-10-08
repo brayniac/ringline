@@ -26,7 +26,7 @@ kind"), not the kernel version:
 | Ring kind | Selected on | Small group (every connection starts here) | Large group (promoted connections) | Large group default | Ring memory per worker |
 |---|---|---|---|---|---|
 | `IOU_PBUF_RING_INC` | Linux 6.12 and later | 64 buffers of 1 MiB | 64 buffers of 1 MiB | off | 64 MiB, 128 MiB with the large group |
-| plain | Linux 6.1–6.11, or `recv_incremental(false)` | 4096 buffers of 64 KiB | 256 buffers of 1 MiB | on | 512 MiB |
+| plain | Linux 6.1–6.11, or `recv_incremental(false)` (from step 7) | 4096 buffers of 64 KiB | 256 buffers of 1 MiB | on | 512 MiB |
 
 With `IOU_PBUF_RING_INC` one buffer is consumed incrementally by successive
 completions, from any connection, and returns to the ring only when it is
@@ -43,10 +43,13 @@ difference between one and two groups was smaller than the rep-to-rep
 range of one of the two configurations (three reps). The sign changed
 between the run with the first promotion rule and the run with the
 `SOCK_NONEMPTY` rule (journal). Landing step 6's measurements decide
-whether it is turned on. Before 6.12, in every cell with 16 streamers
+whether it is turned on. On 6.1, in every cell with 16 streamers
 sharing the worker, two groups cut request p50 and p99 by 2.8× to 25×. In
-cells without streamers they tied one group, except p999 in the
-heavy-tailed tiered cell, which rose from 5.2 to 6.6 ms.
+cells without streamers p50 was the same with one or two groups; the tails
+moved in both directions: tiered p999 fell (2.75, 2.62, 3.15 ms per rep
+with one group; 2.36, 2.03, 2.49 ms with two), heavy-tailed tiered p99
+rose (3.54, 3.80, 3.80 against 3.93, 4.19, 4.06 ms) and its p999 rose from
+5.2 to 6.6 ms.
 
 The copy into the accumulator, the lend-in-place paths and the `ENOBUFS`
 fallback stay. The accumulator copy is bounded: see "Bounded accumulator".
@@ -63,8 +66,8 @@ and nothing holds any of its bytes.
 - Above a group's lend cap, arrivals are copied instead of lent.
 - `with_bytes` keeps its merge copy when bytes arrive while a task holds
   slices of the remainder.
-- Ring memory per worker rises from today's 4 MiB to 64 or 128 MiB (6.12+,
-  without and with the large group) or 512 MiB (before 6.12). Each group's
+- Ring memory per worker rises from today's 4 MiB to 64 MiB with an INC
+  ring (128 MiB with the large group), 512 MiB with a plain ring. Each group's
   touched pages stay resident. Every measurement used one worker. Peak
   process RSS in the benchmark, MiB, median of three reps per cell (range
   across the cells in the row):
@@ -79,10 +82,10 @@ and nothing holds any of its bytes.
   accumulator holds up to one message, 1 MiB here, per connection, at 1000
   connections.
 - A promoted connection's small messages each take a whole large-group
-  buffer on a plain ring. On 6.1, holders promoted alongside 16 streamers
-  left the 256-buffer large group returning `ENOBUFS` 7.8k times per run
-  (10.9k with heavy-tailed sizes). The same holders without streamers
-  returned none.
+  buffer on a plain ring. On 6.1 the 256-buffer large group returned
+  `ENOBUFS` 7.8k times per run (10.9k with heavy-tailed sizes) only when
+  promoted holders and the 16 promoted streamers shared it; the holders
+  alone returned none.
 - On 6.1 (Amazon Linux 2023, loopback) the 4096 × 64 KiB ring had a tail no
   other geometry had at 10,000 connections: p99 906 ms and p999 2.7 s at
   256 B against 130 and 134 ms for the 1024-buffer geometries, and p999
@@ -107,13 +110,16 @@ error from either attempt fails the worker's startup with
 registration fails after the small group's succeeded, startup fails the
 same way and names the large group.
 
-`ConfigBuilder::recv_incremental(bool)` gates the attempt. With an INC
-ring the defaults are 64 × 1 MiB, large group off. With a plain ring they
-are 4096 × 64 KiB plus 256 × 1 MiB, large group on. From step 7,
-`recv_incremental(false)` selects the plain row on any kernel, which lets
-CI cover the plain path on a kernel that supports INC; before step 7 it
-selects today's 256 × 16 KiB ring with no large group, and it is the
-default.
+`ConfigBuilder::recv_incremental(bool)` gates the attempt. From step 7 the
+defaults are: with an INC ring, 64 × 1 MiB, large group off; with a plain
+ring, 4096 × 64 KiB plus 256 × 1 MiB, large group on. From step 7,
+`recv_incremental(false)` alone selects the plain row on any kernel, which
+lets CI cover the plain path on a kernel that supports INC. Before step 7
+`recv_incremental(false)` is the default and selects today's 256 × 16 KiB
+ring with no large group. `recv_large_group(true)` is honoured with
+`recv_incremental(false)`, so before step 7 CI reaches the two-group plain
+path with an explicit `recv_buffer(4096, 64 KiB)` plus
+`recv_large_group(true)`.
 
 The incremental-buffer code had fixes in 6.12 stable releases. Which 6.12.y
 release first has all the fixes this design relies on is not known. Step 0
@@ -138,7 +144,7 @@ rerun with #627.
 | The completion that uses up a buffer | Clears `F_BUF_MORE`. The kernel does not write into that buffer again until it is posted again. |
 | Data offset | Not in the CQE. Completions for one buffer are reaped in the order the kernel filled it, across every connection sharing it. |
 | The ring entry | Rewritten by the kernel as it consumes (`addr` advances, `len` shrinks). |
-| More data queued | A multishot receive completion carries `IORING_CQE_F_SOCK_NONEMPTY` when the socket still has data after it. On Debian 12's 6.1.0-53 every full completion of a streaming connection carried it; no request/response completion that filled its 64 KiB buffer did. |
+| More data queued | A multishot receive completion carries `IORING_CQE_F_SOCK_NONEMPTY` when the socket still has data after it. On Debian 12's 6.1.0-53 every full completion of a streaming connection carried it; no completion of a 64 KiB request/response message did (102,678–104,001 per run), and 99.9% of 1 MiB requests' full completions did. |
 | No buffer left | `-ENOBUFS` without `F_MORE`, ending the arm. |
 | `RLIMIT_MEMLOCK` (6.14+) | Charged for each ring's entry array, not the buffers: 16 bytes per entry, at least a page per ring. |
 
@@ -202,14 +208,15 @@ buffers; each now also names the group:
   (`ring.rs` `submit_multishot_recv`), so there is no spare bit for the
   group. A receive armed on the large group uses a second tag,
   `OpTag::RecvMultiLarge`, handled like `RecvMulti` with the large group's
-  buffers. Generation checks are unchanged. The connection records which
-  tag its live receive uses.
+  buffers. Generation checks are unchanged. The connection records which tag
+  its live receive uses.
 - Every site that builds a `RecvMulti` user_data to cancel the live receive
   uses the live receive's tag: `DriverCtx::cancel` (`handler.rs`, which
   matches on `RecvArm` and gains a variant for the large group), the
   close-time cancel (`driver.rs`), and in `event_loop.rs` the Mode A
-  hold-cap throttle and `begin_park`'s linked cancel. A cancel with the
-  wrong tag matches nothing.
+  hold-cap throttle (`handle_recv_multi`) and `begin_park`'s cancel
+  (`Ring::submit_park_recv_cancel`). A cancel with the wrong tag matches
+  nothing.
 - `Ring` holds one bgid (`ring.rs`), which `submit_multishot_recv` uses for
   every arm. The arm takes the target group per call.
 - `OpTag::SendRecvBuf`'s payload carries the bid in its low 16 bits and
@@ -220,35 +227,40 @@ buffers; each now also names the group:
 - The completion handlers (`event_loop.rs` `handle_recv_multi`,
   `handle_recv_msg_multi_ts`) read from the base.
 - `HeldRecvBuf::Pinned { bid, len }` (`driver.rs`), `SegBacking::Pinned` and
-  `SegSettle::Pinned` (`runtime/io.rs`) gain `group` and `off`. Their readers
-  re-derive the base: `driver.rs` forward-write iovecs, the Mode A split,
-  `advance_forward` and `settle_forward_end`; `io.rs` segment readers and the
-  `with_segments` remainder.
+  `SegSettle::Pinned` (`runtime/io.rs`) gain `group` and `off`. Their
+  readers re-derive the base: `driver.rs` forward-write iovecs, the Mode A
+  split, `advance_forward` and `settle_forward_end`; `io.rs` segment readers
+  and the `with_segments` remainder.
 - `PendingRecvBuf`'s pointer, today the buffer's base, becomes the data's
   address. `PendingRecvBuf` (backing `pending_recv_bufs` and `recv_hold`)
   gains `group`; a migrating connection can hold entries from both groups.
 - The send slab's recv-forward entries record a group per bid (`bids`
   becomes `(group, bid)` pairs), read by `recv_forward_bids` at the
   `SendRecvBufsCoalesced` completion.
-- `copy_out_bid` (park) takes the group and offset, or the data pointer,
-  and copies from the data's address; today it reads from the base.
+- `copy_out_bid` (park) takes the group and offset, or the data pointer, and
+  copies from the data's address; today it reads from the base.
 - `handle_send_recv_buf` resubmits a partial send from
   `base + (original_len - remaining)`. Its user_data carries the bid, the
-  remainder bit and the group bit. A per-connection `send_recv_buf_ptr`,
-  next to `send_recv_buf_original_lens`, holds the original data address.
-- Every `pending_replenish.push` of a TCP bid becomes a hold release. These
-  include the `segment_pinned` single-release check, the recv-forward slab's
-  one-bid-per-iovec replenish, `release_queued_sends`, the Mode A
-  forward-write completion and `fail_forward_write`, `start_forward_write`'s
-  error paths, the close and park drains, and the `pending_recv_bufs`
-  flushes (`io.rs` `with_data`, `with_bytes`, segmented entry,
-  `with_segments`, direct-echo arm; `stream.rs`; the starved and accumulator
-  flushes in `event_loop.rs`).
+  remainder bit and the group bit. A per-connection `send_recv_buf_ptr`, next to
+  `send_recv_buf_original_lens`, holds the original data address.
+- `provided_bufs` becomes one `ProvidedBufRing` per group, and
+  `pending_replenish` becomes per group (or `(group, bid)`);
+  `flush_replenish_and_rearm` replenishes each.
+- Every `pending_replenish.push` of a TCP bid goes through rule 3's return
+  check. A lend path releases its hold first; a copy path (TLS, the
+  stale-CQE early returns, timestamps, the accumulator copy) releases
+  nothing. The lend paths include the `segment_pinned` single-release check,
+  the recv-forward slab's one-bid-per-iovec replenish,
+  `release_queued_sends`, the Mode A forward-write completion and
+  `fail_forward_write`, `start_forward_write`'s error paths, the close and
+  park drains, and the `pending_recv_bufs` flushes (`io.rs` `with_data`,
+  `with_bytes`, segmented entry, `with_segments`, direct-echo arm;
+  `stream.rs`; the starved and accumulator flushes in `event_loop.rs`).
 - `on_handout` and `free()` count buffers out of each group's ring as
   defined above.
 - `MAX_FORWARD_IOV` (16), `FORWARD_HELD_MAX_BUFFERS` (32) and the send
-  slab's `MAX_IOVECS` (32) bound ranges per call; one gathered write can hold
-  that many shared 1 MiB buffers.
+  slab's `MAX_IOVECS` (32) bound ranges per call; one gathered write can
+  hold that many shared 1 MiB buffers.
 - `replenish_batch`'s `debug_assert` is count-based and cannot see one bid
   returned twice; the runtime check above and rule 3's single return site
   replace it.
@@ -265,10 +277,11 @@ nothing were buffered. With `NeedMore` (no announced length) the completion
 is copied whole, as today. The accumulator then holds at most one message
 plus the bytes of one completion, whatever the buffer size.
 
-In the benchmark's streaming cells it cut process RSS from 2.4 GB to 262 MiB
-and bytes copied sevenfold, at 10–58% more throughput. The benchmark parses
-in the completion handler; ringline parses in the connection's task, so the
-gain for ringline is inferred, not measured.
+In the benchmark's streaming cells it cut process RSS from 2.3 GiB to 262
+MiB (INC 64 × 1 MiB, hv01); with a 1 GiB plain ring RSS only halved, from
+2.0 to 1.07 GiB. Bytes copied fell sevenfold, at 10–58% more throughput. The
+benchmark parses in the completion handler; ringline parses in the
+connection's task, so the gain for ringline is inferred, not measured.
 
 ## The large group
 
@@ -287,7 +300,7 @@ completion clears `F_BUF_MORE` whenever it reaches the end of a shared
 buffer, at any size, so "filled" does not identify a stream there.
 
 The `SOCK_NONEMPTY` condition separates a stream from request/response
-messages that reach the threshold. In the two-host 6.1 run, 64 KiB
+messages no larger than the threshold. In the two-host 6.1 run, 64 KiB
 request/response at 1000 connections produced 102,678–104,001 completions
 of 64 KiB per run, none flagged, and promoted no connection. On 6.12 that
 cell also promoted no connection, but the benchmark did not count
@@ -393,9 +406,9 @@ receive queue, and TCP closes the window until the worker re-arms.
 
 ## Sizing
 
-- Per worker: 64 MiB on 6.12+ (128 MiB with the large group), 512 MiB
-  before 6.12. Only touched pages are resident: the plain groups use
-  `MADV_NOHUGEPAGE`, and with transparent huge pages a completion would
+- Per worker: 64 MiB with an INC ring (128 MiB with the large group), 512
+  MiB with a plain ring. Only touched pages are resident: the plain groups
+  use `MADV_NOHUGEPAGE`, and with transparent huge pages a completion would
   otherwise make its whole 2 MiB region resident.
 - A group covers the bytes that arrive while a worker is not reaping:
   ingress rate into that worker × the longest stall to absorb before TCP
@@ -409,7 +422,8 @@ receive queue, and TCP closes the window until the worker re-arms.
   memory at startup.
 - `RLIMIT_MEMLOCK` (6.14+) is charged only for entry arrays. The launch
   preflight (`worker.rs` `memlock_required`, through `memlock.rs`) counts
-  both groups' entries: 4096 + 256 for plain rings, 64 + 64 for INC.
+  both groups' entries: 4096 + 256 for plain rings; 64, or 64 + 64 with the
+  large group, for INC.
 - `recv_accumulator_max` must be at least the larger of 1 MiB and every
   configured buffer size (`recv_buffer`, `recv_large_buffer`), since the
   geometry is chosen at runtime; `build()` rejects a smaller value. Today's
@@ -486,8 +500,8 @@ use.
    and validation, the arm taking the group per call,
    `OpTag::RecvMultiLarge` and the `SendRecvBuf` group bit, `group` in
    `PendingRecvBuf` and the send slab, the cancel sites, promotion,
-   migration and demotion, and the two-group memlock preflight. Demotion's rule is settled here, with migration
-   timed.
+   migration and demotion, and the two-group memlock preflight.
+   Demotion's rule is settled here, with migration timed.
 6. Measure ringline on hv01 and across hv01/hv02, on Linux 6.1, 6.8, 6.12
    and 7.1: the geometry per ring kind with and without the large group
    against the 256 × 16 KiB ring, with the bench suite (echo at 256 B to
