@@ -1,10 +1,11 @@
 # Incremental provided-buffer consumption (`IOU_PBUF_RING_INC`)
 
-- **Status:** open — design chosen, not built. **2026-10-08: owner's
-  decision, after "2026-10: measurements" and "2026-10: kernels, two rings,
-  tiered caches": two shared buffer groups per worker, on by default before
-  6.12 and off by default on 6.12+ until measured further. Design:
-  `docs/recv-incremental-ring-design.md` (#622).**
+- **Status:** open — design chosen, not built. **2026-10-08, after
+  "2026-10: measurements" and "2026-10: kernels, two rings, tiered caches":
+  the owner decided that two shared buffer groups go into the
+  implementation for kernels before 6.12. The author proposes the large
+  group off by default on 6.12+ until measured further, and a 1 s demotion
+  quiet period. Design: `docs/recv-incremental-ring-design.md` (#622).**
   Phase A (2026-09-17) had narrowed the case: see "What Phase A did to
   criterion 1".
 - **Span:** 2026-09-17 → (open) · follows #415 (282773b), #416 Phase A ·
@@ -757,13 +758,20 @@ Caveats:
 - Demotion moves connections back and forth (about 600 times per run for
   1 MiB request/ack on 6.1, 58–91 on 6.12 streaming).
 
-### Decision (owner, 2026-10-08)
+### Decision and proposals (2026-10-08)
 
-Before 6.12: plain 4096 × 64 KiB plus plain 256 × 1 MiB, both with
-`MADV_NOHUGEPAGE`, two groups on by default. On 6.12+: INC 64 × 1 MiB, with
-the same two-group code and an INC 64 × 1 MiB large group off by default
-until the design's landing measurements (rate-limited streamers, A/A
-pairs) separate the effect. The bounded accumulator on both. Promotion on
+Owner's decision: two groups go into the implementation for kernels before
+6.12 (plain rings). The owner said they might make sense on 6.12+ too, if
+they reduce latency or improve resilience with mixed traffic or slow
+handlers.
+
+The author's proposals, measured above but not decided by the owner:
+before 6.12, plain 4096 × 64 KiB plus plain 256 × 1 MiB, both with
+`MADV_NOHUGEPAGE`, two groups on by default (amended below: proposed,
+pending A/A pairs). On 6.12+: INC 64 × 1 MiB, with the same two-group code
+and an INC 64 × 1 MiB large group off by default until the design's
+landing measurements (rate-limited streamers, A/A pairs) separate the
+effect. The bounded accumulator on both. Promotion on
 completions of at least 64 KiB carrying `SOCK_NONEMPTY`, and on held
 lends, with no cap. Demotion hysteresis and migration timing were
 measured next (below). This replaces the plain 1024 × 64 KiB
@@ -817,45 +825,64 @@ for the next request, which in these cells came every 50 ms.
 
 Measured:
 
-- On 6.1 the quiet period cut demotions in the mixed (40 to 5) and tiered
-  (99 to 11) cells. Mixed p99 and p999 fell 8.4× and 5.7×, and tiered p999
-  fell 2.6×, with the reps of the two configurations not overlapping. In
+- On 6.1 the quiet period lowered the median demotions in the mixed (40 to
+  5) and tiered (99 to 11) cells, but the per-rep counts overlapped (mixed
+  62, 40, 0 against 2, 38, 5; tiered 115, 99, 13 against 23, 4, 11). Mixed
+  p99 and p999 fell 8.4× and 5.6× and tiered p999 2.6× at the median, and
+  the reps did not overlap. The tails do not track demotions per rep: the
+  mixed rep without the quiet period that had 0 demotions, where the rule
+  had nothing to remove, still had p99 168 ms against 36–122 ms with it.
+  How much of the difference the rule causes is not established. In
   the streamers-holding cell the rule cannot act, because the streamers are
   the holders and had 0 demotions either way. That cell still moved by
   1.4× at p99 and −21% in streamer throughput, which is the spread between
   runs. In the heavy-tailed cell the demotions (415 and 381) and the tails
   overlapped across reps.
-- On 6.12 the rule changed demotions only in the mixed cell (median 6 to
-  0). There, p50 and p99 rose in every rep (4.5–6.8 to 9.4–10.5 ms;
-  7.1–11.0 to 15.2–16.8 ms), and the p999 reps overlapped. The tiered cell
+- On 6.12 the rule changed median demotions only in the mixed cell (6 to
+  0) and the heavy-tailed cell (4 to 1, reps overlapping). In the mixed
+  cell p50 and p99 rose in every rep (4.5–6.8 to 9.4–10.5 ms; 7.1–11.0 to
+  15.2–16.8 ms), and the p999 reps overlapped. The mixed rep without the
+  quiet period that had 0 demotions still had p50 6.8 ms, below every rep
+  with it (9.4–10.5 ms). How much of the difference the rule causes is not
+  established. The tiered cell
   had no demotions to remove, yet its p50 rose 5.2 to 12.6 ms, which is the
   spread between runs.
-- Decision to re-arm took 1.3–12 ms on 6.12 and 17–586 ms on 6.1.
-- In the later run, two groups without the quiet period raised 6.1 mixed
-  p99 from 336 to 369 ms against one group, and cut holding p50 and p99
-  only 4.2–4.6×. Two-group mixed p99 was 134 ms in the earlier run and
-  369 ms in this one, so run-to-run variation is large on 6.1 too.
-- The client reported 13.3–14.0k acks/s on every run of both kernels at
-  20k requests/s offered. The client divides acks by `--seconds` minus
-  warmup (12 − 2 = 10 s), but the server stops after its 8 s measured
-  window, so about 7 s of acks land in a 10 s window, about 0.7 of the
-  offered rate. It is a reporting artifact: the offered rate is honoured
-  and the latency percentiles are per request. Requests in flight when the
-  server exits are never acked and so are not sampled. This is inferred
-  from the code (`main.rs`), not separately measured.
+- Per-rep medians without the quiet period: decision to re-arm 1.3–12 ms
+  on 6.12 and 17–586 ms on 6.1; streamer first delivery 8–21 ms on 6.12
+  and 130 ms–7.4 s on 6.1. With the 1 s quiet period: re-arm 0.4–25 ms on
+  6.12 and 15–336 ms on 6.1.
+- In this run, two groups without the quiet period gave 6.1 mixed p99 reps
+  of 168, 369 and 419 ms against 336, 336 and 352 ms with one group, and
+  cut holding p50 and p99 4.2–4.7×. With the 1 s quiet period, two-group
+  mixed p99 was 36–122 ms. In the earlier run (`01a11d44-3a9e`) two-group
+  mixed p99 was 134 ms.
+- The client reported 12.8–14.0k acks/s at 20k requests/s offered. The
+  client counts acks for requests scheduled after its warmup, which begins
+  1 s after the server starts (`--start-delay-ms 1000`) and lasts 2 s, so
+  it counts from about server t=3 s. The server exits at t=10 s (2 s
+  warmup + 8 s). About 7 s of requests are therefore divided by
+  `--seconds` − warmup = 10 s. The lowest rates are one-group 6.1 runs,
+  whose 0.17–0.35 s latencies leave more requests unacked at exit.
+  Inferred from `main.rs`, `server.rs` and the spec, not separately
+  measured.
 - The single-group 6.12 results moved between this run and the previous
   one (streamers holding p999 23.1 ms here against 54.5 ms; mixed p50
   4.98 ms against 8.1 ms). Run-to-run variation on 6.12 is at least as
   large as the configuration effects.
 
-Inferred, not measured: that 6.1's long moves come from waiting for a free
-large-group buffer (large-group `ENOBUFS` 410–83k per run on 6.1, 0 on
-6.12; all 256 large buffers pinned in the holding cell). The loop was
-equally busy on both kernels (`main_util` 0.95–0.998).
+Inferred, not measured: that the holding cell's 0.4–7.4 s first
+deliveries on 6.1 come from waiting for a free large-group buffer (all 256
+pinned; large-group `ENOBUFS` 1.0k–1.6k per run). The 17–586 ms re-arm
+times on 6.1 are unexplained. In the benchmark the re-arm does not wait on
+a large-group buffer, and the cell with the most large-group `ENOBUFS`
+(heavy-tailed, 18k–83k) had the shortest re-arms (17–20 ms). On 6.12 the
+large group returned `ENOBUFS` in two of the quiet-period runs (22 and 11).
+The server loop was equally busy on both kernels (`main_util`
+0.95–0.998).
 
-**Decision (owner, 2026-10-08, later).** Demotion requires a 1 s quiet
-period (`recv_large_demote_quiet`) on both ring kinds. With a plain ring
-two groups on is the proposed default, pending A/A pairs on both kernels
-in the landing measurements. With an INC ring the large group stays off
-by default, and its demotion rule is decided with it there.
+**Proposals (author, 2026-10-08, later; not owner decisions).** Demotion
+requires a 1 s quiet period (`recv_large_demote_quiet`) on both ring
+kinds. With a plain ring two groups on is the proposed default, pending
+A/A pairs in the landing measurements. With an INC ring the large group
+stays off by default, and its demotion rule is decided with it there.
 

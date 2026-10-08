@@ -43,7 +43,8 @@ difference between one and two groups was smaller than the rep-to-rep
 range of one of the two configurations (three reps). The sign changed
 between the run with the first promotion rule and the run with the
 `SOCK_NONEMPTY` rule (journal). Landing step 6's measurements decide
-whether it is turned on. On 6.1, in every cell with 16 streamers
+whether it is turned on. In the first two-group run (`01a11d44-3a9e`), on
+6.1, in every cell with 16 streamers
 sharing the worker, two groups cut request p50 and p99 by 2.8× to 25×. In
 cells without streamers p50 was the same with one or two groups; the tails
 moved in both directions: tiered p999 fell (2.75, 2.62, 3.15 ms per rep
@@ -52,11 +53,11 @@ rose (3.54, 3.80, 3.80 against 4.06, 4.19, 3.93 ms) and its p999 rose from
 5.2 to 6.6 ms.
 
 Variation between runs is large on 6.1 too. In the later run
-(`01a11d87-5bd5`) two groups without the quiet period raised mixed p99
-from 336 to 369 ms, and cut holding p50 and p99 only 4.2–4.6×. Two-group
-mixed p99 was 134 ms in one run and 369 ms in the other. Two groups on by
-default with a plain ring is therefore the proposed default, confirmed or
-not by landing step 6's A/A pairs on both kernels.
+(`01a11d87-5bd5`) two groups without the quiet period gave mixed p99 reps
+of 168, 369 and 419 ms against 336, 336 and 352 ms with one group, and cut
+holding p50 and p99 4.2–4.7×. With the 1 s quiet period, two-group mixed
+p99 was 36–122 ms. Two groups on by default with a plain ring is therefore
+the proposed default, confirmed or rejected by landing step 6.
 
 The copy into the accumulator, the lend-in-place paths and the `ENOBUFS`
 fallback stay. The accumulator copy is bounded: see "Bounded accumulator".
@@ -90,10 +91,11 @@ and nothing holds any of its bytes.
   connections.
 - A promoted connection's small messages each take a whole large-group
   buffer on a plain ring. On 6.1 the 256-buffer large group returned
-  `ENOBUFS` 7.8k times per run (10.9k with heavy-tailed sizes,
-  `01a11d45-3f7d`; 18k–83k, median 69k, in the later run `01a11d87-5bd5`)
-  only when promoted holders and the 16 promoted streamers shared it; the
-  holders alone returned none. Its size is unsettled.
+  `ENOBUFS` 7.8k times per run with promoted holders and streamers
+  together (10.9k with heavy-tailed sizes, `01a11d45-3f7d`; 18k–83k,
+  median 69k, in the heavy-tailed cell of `01a11d87-5bd5`), 410–955 with
+  the 16 streamers alone, and none with the holders alone. Its size is
+  unsettled.
 - On 6.1 (Amazon Linux 2023, loopback) the 4096 × 64 KiB ring had a tail no
   other geometry had at 10,000 connections: p99 906 ms and p999 2.7 s at
   256 B against 130 and 134 ms for the 1024-buffer geometries, and p999
@@ -345,34 +347,45 @@ Generation checks are unchanged.
 A promoted connection returns to the small group after 64 consecutive
 completions that do not count toward promotion (see "Promotion"), at the
 first such completion once `recv_large_demote_quiet` has passed since the
-last one that did. An idle promoted connection receives no completions and
-is never demoted. A connection holding a lend is not demoted while it
+last one that did. A connection that never had one is demoted without
+waiting. An idle promoted connection receives no completions and is never
+demoted. A connection holding a lend is not demoted while it
 holds. The quiet period applies to both ring kinds, default 1 s; with an
 INC ring, landing step 6 decides it together with the large group.
 
-Moves should be rare. Decision to re-arm took 1.3–12 ms on 6.12 and
-17–586 ms on 6.1. For streamers, which always have data queued, first
-delivery on the new group came 8–21 ms after the decision on 6.12. For
-request/response connections, first delivery also waits for the next
+Moves should be rare. Per-rep medians without the quiet period: decision
+to re-arm 1.3–12 ms on 6.12 and 17–586 ms on 6.1. Streamer first delivery
+8–21 ms on 6.12 and 130 ms–7.4 s on 6.1. With the 1 s quiet period:
+re-arm 0.4–25 ms on 6.12 and 15–336 ms on 6.1. For request/response
+connections, first delivery also waits for the next
 request, which in these cells came every 50 ms. Without the quiet period
 connections moved back and forth: on 6.1, 1 MiB request/ack connections
 were promoted and demoted about 600 times per run (eight seconds of
 measurement plus two of warmup).
 
 With a plain ring, where the large group is proposed on by default, the
-quiet period is the measured rule. On 6.1 the quiet period cut demotions in
-the mixed (40 to 5) and tiered (99 to 11) cells. Mixed p99 and p999 fell
-8.4× and 5.7×, and tiered p999 fell 2.6×, with the reps of the two
-configurations not overlapping. In the streamers-holding cell the rule
+quiet period is the proposed rule. On 6.1 the quiet period lowered the
+median demotions in the mixed (40 to 5) and tiered (99 to 11) cells, but
+the per-rep counts overlapped (mixed 62, 40, 0 against 2, 38, 5; tiered
+115, 99, 13 against 23, 4, 11). Mixed p99 and p999 fell 8.4× and 5.6× and
+tiered p999 2.6× at the median, and the reps did not overlap. The tails do
+not track demotions per rep: the mixed rep without the quiet period that
+had 0 demotions, where the rule had nothing to remove, still had p99
+168 ms against 36–122 ms with it. How much of the difference the rule
+causes is not established. In the streamers-holding cell the rule
 cannot act, because the streamers are the holders and had 0 demotions
 either way. That cell still moved by 1.4× at p99 and −21% in streamer
 throughput, which is the spread between runs. In the heavy-tailed cell the
 demotions (415 and 381) and the tails overlapped across reps.
 
 With an INC ring the large group is off by default. On 6.12 the rule
-changed demotions only in the mixed cell (median 6 to 0). There, p50 and
+changed median demotions only in the mixed cell (6 to 0) and the
+heavy-tailed cell (4 to 1, reps overlapping). In the mixed cell p50 and
 p99 rose in every rep (4.5–6.8 to 9.4–10.5 ms; 7.1–11.0 to 15.2–16.8 ms),
-and the p999 reps overlapped. The tiered cell had no demotions to remove,
+and the p999 reps overlapped. The tails do not track demotions per rep:
+the mixed rep without the quiet period that had 0 demotions still had p50
+6.8 ms, below every rep with it (9.4–10.5 ms). How much of the difference
+the rule causes is not established. The tiered cell had no demotions to remove,
 yet its p50 rose 5.2 to 12.6 ms, which is the spread between runs.
 
 ## Lends
@@ -499,7 +512,6 @@ the ring kind in use.
   benchmark, including the bounded accumulator's gain.
 - Two groups on 7.1.
 - Kernels 6.2–6.11; 6.8 is pending #627.
-- Large-group sizes other than 256 buffers of 1 MiB before 6.12.
 - More than one worker.
 - The runtime hold-promotion rule, and the holder exemption from demotion
   (only a static per-connection rule ran).
@@ -512,8 +524,9 @@ the ring kind in use.
   without streamers).
 - The demotion rule for an INC ring: the 6.12 runs measured the 1 s quiet
   period; which rule INC uses is open.
-- The size of the plain large group: 256 × 1 MiB runs out when holders are
-  promoted alongside streamers.
+- The size of the plain large group: 256 × 1 MiB, the only size run, runs
+  out when holders are promoted alongside streamers and, less often, with
+  streamers alone.
 - Multishot `RECVMSG` on an INC ring.
 
 ## Landing
@@ -559,8 +572,8 @@ the ring kind in use.
    resolved before step 7, by geometry for that kernel, by leaving the
    large group off there, or by keeping the 256 × 16 KiB ring there. This
    step decides the large group's default and its demotion rule with an
-   INC ring, and confirms the proposed plain-ring default (two groups on)
-   with A/A pairs on both kernels.
+   INC ring, and confirms or rejects the proposed plain-ring default (two
+   groups on) on 6.1 and 6.8.
 7. New defaults (the geometry per ring kind, `recv_incremental` on, the
    large group's default per ring kind, the `recv_accumulator_max` floor,
    the removal of `recv_segment_reserve`) in a coordinated release.
