@@ -62,7 +62,8 @@ p99 was 36–122 ms. Two groups on by default with a plain ring is the
 author's proposal; landing step 6 confirms or rejects it.
 
 The copy into the accumulator, the lend-in-place paths and the `ENOBUFS`
-fallback stay. The accumulator copy is bounded: see "Bounded accumulator".
+fallback stay. The accumulator copy is bounded for `with_data` callers: see the open
+question in "Bounded accumulator".
 Under INC a buffer holds the bytes of several completions at increasing
 offsets, and returns to the ring only when the kernel has finished with it
 and nothing holds any of its bytes.
@@ -70,7 +71,8 @@ and nothing holds any of its bytes.
 ## Costs
 
 - The receive copy into the accumulator stays, bounded to what completes a
-  pending message when the parser announced its length.
+  pending message when the parser announced its length, for `with_data`
+  callers (see the open question in "Bounded accumulator").
 - The `ENOBUFS` park, the fallback recv and the starvation arbitration stay,
   and the buffer state below is added, once per group.
 - Above a group's lend cap, arrivals are copied instead of lent.
@@ -285,27 +287,45 @@ it needs no special case.
 
 When a connection's parser last returned `ParseResult::NeedAtLeast(n)`, the
 driver records a target accumulator length: the accumulator's length at
-that parse plus `n`. Any other parse result clears the target. A completion
-copies `min(target − accumulator length, completion length)` bytes into the
+that parse plus `n`. A completion copies
+`min(target.saturating_sub(len), completion length)` bytes into the
 accumulator and holds the rest of the completion in place, at its offset.
-One buffer is held per connection: a completion that arrives while a rest
-is held is copied whole, after the held rest. `NeedAtLeast(n)` is a lower
-bound; on `NeedMore` after the target is reached, the held rest is appended
-and the closure runs again on the merged bytes before the task parks. With
-`NeedMore` and no target, the completion is copied whole, as today. The
-accumulator then holds at most one message plus the bytes received between
-two parses, whatever the buffer size.
+The held rest is a `pending_recv_bufs` lend; above its group's lend cap
+(from step 4) it is copied instead. One buffer is held per connection: a
+completion that arrives while a rest is held is copied whole, after the
+held rest.
+
+`NeedAtLeast(n)` is a lower bound, so a parse can need bytes that are
+still held. When a parse of the accumulator returns anything other than
+`Consumed(k)` with `k > 0` while a buffer is held, the driver moves held
+bytes into the accumulator (with `NeedAtLeast(n)`, up to the new target,
+keeping the rest held at its new offset; otherwise all of them) and runs
+the closure again before the task parks. The task parks only when nothing
+is held. `NeedAtLeast(0)` and `Consumed(0)` count as "anything other than
+`Consumed(k)` with `k > 0`".
+
+The target is cleared by any parse result other than `NeedAtLeast`, and
+with the accumulator: on reset, on close, and whenever bytes leave it
+other than through a parse (`ConnStream` reads, the segmented entry's
+`take_frozen`, `settle_forward_end` refilling it).
+
+With no target, a completion is handled as today: held in place if the
+accumulator is empty and nothing is held, otherwise copied. While a target
+is set, the accumulator holds at most the target plus the bytes received
+between the completion that reaches it and the next parse; without one it
+holds every byte the task has not consumed, as today.
 
 This needs three driver changes, since today a buffer is held in place only
 while the accumulator is empty and the held buffer is the older data:
 
-- The driver records the target from `NeedAtLeast(n)` and clears it on any
-  other result. Today both futures only call `accumulators.reserve(n)`,
+- The driver records the target from `NeedAtLeast(n)` and clears it as
+  above, and moves held bytes into the accumulator before a task parks. Today both futures only call `accumulators.reserve(n)`,
   whose `reserve_target` is a capacity hint cleared when the accumulator
   drains.
 - `handle_recv_multi` holds the rest of a completion while the accumulator
-  is non-empty (today it copies both into the accumulator when the
-  accumulator has bytes, `event_loop.rs`). Every path that appends to the
+  is non-empty (today, when the accumulator has bytes or a buffer is
+  already held, it copies the held buffer and then the completion into
+  the accumulator, `event_loop.rs`). Every path that appends to the
   accumulator or installs a recv sink flushes a held buffer first, so a
   held buffer is always newer than the accumulator's bytes; today the
   recv-sink overflow append and `set_recv_sink` do not.
@@ -327,7 +347,8 @@ is open; the options are:
 
 - `with_bytes` hands out `Bytes` views over held provided buffers, which
   keep the buffer held until dropped. Zero-copy, and each kept view is a
-  hold under the lend cap.
+  hold under the lend cap. A view can be dropped on any thread, so its
+  release goes through the worker's cross-thread inbox.
 - ringline-redis moves to `with_data` and copies the values it keeps.
 - The bound applies to `with_data` callers only.
 
@@ -534,8 +555,7 @@ receive queue, and TCP closes the window until the worker re-arms.
 
 - The UDP ring (`udp_recv_buffer`, its own bgid) stays plain.
 - `with_bytes` copies a held buffer into the accumulator when it polls,
-  unless "Bounded accumulator"'s open question changes it. `with_data`
-  reads the accumulator and then a held buffer.
+  unless "Bounded accumulator"'s open question changes it.
 - TLS (both engines) copies out of the ring and takes no hold.
 - The `timestamps` feature shares the small TCP group. If multishot
   `RECVMSG` works on an INC ring, it stays there, with `RecvMsgOut::parse`
@@ -595,10 +615,9 @@ the ring kind in use.
    unchanged; the per-path single-release checks become holds. The existing
    lifecycle tests (double replenish, leaks, close drain, the Mode A hold
    cap) pass unchanged. Steps 2 and 3 can be one change if that is simpler.
-3. Offsets: the `off` fields, data at `base + written`,
-   `send_recv_buf_ptr`, `copy_out_bid` and `settle_forward_end`. Still a
-   plain ring, where every offset is 0, so these paths are exercised only
-   from step 4.
+3. Offsets: the `off` fields, data at `base + written`, `copy_out_bid`
+   and `settle_forward_end`. Still a plain ring, where these offsets are 0,
+   so these paths are exercised only from step 4.
 4. INC and the plain geometry, behind `recv_incremental` (default `false`):
    ring-kind selection, `MADV_NOHUGEPAGE` and the 4096 × 64 KiB plain
    geometry, the per-group lend cap and its copy paths,
