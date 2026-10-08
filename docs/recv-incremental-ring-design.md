@@ -62,8 +62,7 @@ p99 was 36–122 ms. Two groups on by default with a plain ring is the
 author's proposal; landing step 6 confirms or rejects it.
 
 The copy into the accumulator, the lend-in-place paths and the `ENOBUFS`
-fallback stay. The accumulator copy is bounded for `with_data` callers: see the open
-question in "Bounded accumulator".
+fallback stay. The accumulator copy is bounded: see "Bounded accumulator".
 Under INC a buffer holds the bytes of several completions at increasing
 offsets, and returns to the ring only when the kernel has finished with it
 and nothing holds any of its bytes.
@@ -71,8 +70,8 @@ and nothing holds any of its bytes.
 ## Costs
 
 - The receive copy into the accumulator stays, bounded to what completes a
-  pending message when the parser announced its length, for `with_data`
-  callers (see the open question in "Bounded accumulator").
+  pending message when the parser announced its length. `with_bytes` gets
+  the bound through views over held buffers ("`with_bytes`").
 - The `ENOBUFS` park, the fallback recv and the starvation arbitration stay,
   and the buffer state below is added, once per group.
 - Above a group's lend cap, arrivals are copied instead of lent.
@@ -90,9 +89,9 @@ and nothing holds any of its bytes.
   | streaming (1000 connections) | 264 | 328–329 | 361 | 709 |
   | heavy-tailed request sizes | 774–778 | 823–842 | 970–990 | 1061–1275 |
 
-  In the heavy-tailed cells the accumulators dominate: a bounded
-  accumulator holds up to one message, 1 MiB here, per connection, at 1000
-  connections.
+  In the heavy-tailed cells the accumulators dominate: the benchmark's
+  bounded accumulator holds up to one message, 1 MiB here, per connection,
+  at 1000 connections.
 - A promoted connection's small messages each take a whole large-group
   buffer on a plain ring. On 6.1 the 256-buffer large group returned
   `ENOBUFS` 7.8k times per run with promoted holders and streamers
@@ -286,23 +285,27 @@ it needs no special case.
 ## Bounded accumulator
 
 When a connection's parser last returned `ParseResult::NeedAtLeast(n)`, the
-driver records a target accumulator length: the accumulator's length at
-that parse plus `n`. A completion copies
+driver records a target accumulator length: the length of the bytes that
+parse was shown plus `n`. A completion copies
 `min(target.saturating_sub(len), completion length)` bytes into the
 accumulator and holds the rest of the completion in place, at its offset.
 The held rest is a `pending_recv_bufs` lend; above its group's lend cap
 (from step 4) it is copied instead. One buffer is held per connection: a
-completion that arrives while a rest is held is copied whole, after the
-held rest.
+completion that arrives while a rest is held moves the held rest into the
+accumulator and is then copied whole after it.
 
 `NeedAtLeast(n)` is a lower bound, so a parse can need bytes that are
-still held. When a parse of the accumulator returns anything other than
-`Consumed(k)` with `k > 0` while a buffer is held, the driver moves held
-bytes into the accumulator (with `NeedAtLeast(n)`, up to the new target,
-keeping the rest held at its new offset; otherwise all of them) and runs
-the closure again before the task parks. The task parks only when nothing
-is held. `NeedAtLeast(0)` and `Consumed(0)` count as "anything other than
-`Consumed(k)` with `k > 0`".
+still held. When a parse returns anything other than `Consumed(k)` with
+`k > 0` while a buffer is held, the driver moves held bytes into the
+accumulator and runs the closure again before the future parks or
+resolves at EOF. With `NeedAtLeast(n)` it moves up to the new target,
+keeping the rest held at its new offset, or all of them if that would
+move none (`NeedAtLeast(0)`); otherwise it moves all of them. On the
+second consecutive re-run it moves all of them, so a parser returning
+small lower bounds costs at most two extra parses. The future parks or
+resolves only when nothing is held. A parse of a held buffer through the
+fast path (accumulator empty) that does not complete flushes the held
+buffer into the accumulator and parses again, as today.
 
 The target is cleared by any parse result other than `NeedAtLeast`, and
 with the accumulator: on reset, on close, and whenever bytes leave it
@@ -311,15 +314,17 @@ other than through a parse (`ConnStream` reads, the segmented entry's
 
 With no target, a completion is handled as today: held in place if the
 accumulator is empty and nothing is held, otherwise copied. While a target
-is set, the accumulator holds at most the target plus the bytes received
-between the completion that reaches it and the next parse; without one it
-holds every byte the task has not consumed, as today.
+is set, the accumulator holds at most the target plus every byte received,
+from the rest of the completion that reaches it onward, before the next
+parse; without one it holds every byte the task has not consumed, as
+today.
 
 This needs three driver changes, since today a buffer is held in place only
 while the accumulator is empty and the held buffer is the older data:
 
 - The driver records the target from `NeedAtLeast(n)` and clears it as
-  above, and moves held bytes into the accumulator before a task parks. Today both futures only call `accumulators.reserve(n)`,
+  above, and moves held bytes into the accumulator before the future parks
+  or resolves. Today both futures only call `accumulators.reserve(n)`,
   whose `reserve_target` is a capacity hint cleared when the accumulator
   drains.
 - `handle_recv_multi` holds the rest of a completion while the accumulator
@@ -339,18 +344,34 @@ driver" (`PendingRecvBuf`'s pointer and `handle_send_recv_buf`'s short-send
 resubmit, which today computes from the buffer's base), so they land with
 it.
 
-`with_bytes` copies a held buffer into the accumulator when it polls, so the
-bounded accumulator saves no copy and no accumulator memory for
-`with_bytes` callers. ringline-redis, the only `NeedAtLeast` producer in the
-workspace, parses with `with_bytes`. How `with_bytes` callers get the bound
-is open; the options are:
+### `with_bytes`
 
-- `with_bytes` hands out `Bytes` views over held provided buffers, which
-  keep the buffer held until dropped. Zero-copy, and each kept view is a
-  hold under the lend cap. A view can be dropped on any thread, so its
-  release goes through the worker's cross-thread inbox.
-- ringline-redis moves to `with_data` and copies the values it keeps.
-- The bound applies to `with_data` callers only.
+Today `with_bytes` copies a held buffer into the accumulator when it polls,
+so the bound would save no copy and no accumulator memory for
+`with_bytes` callers. ringline-redis, the only `NeedAtLeast` producer in
+the workspace, parses with `with_bytes`.
+
+Decision (owner, 2026-10-08): `with_bytes` hands out `Bytes` views over
+held provided buffers. A value that lies inside one held buffer is a view:
+zero copies, and the view keeps its buffer held until it is dropped, as a
+hold under the lend cap. A value split across completions or buffers is
+copied into the accumulator, bounded as above, and viewed from there.
+
+A view can be dropped on any thread. Its release goes through the worker's
+cross-thread inbox, which carries task indices today and gains a message
+kind for it. Ring memory stays mapped until the last view into it is
+dropped, including after the worker exits.
+
+A view the caller keeps pins its whole buffer: a 1 MiB buffer on an INC
+ring, shared with other connections' data, for a value of any size. With
+64 buffers per group, about 32 kept views on distinct buffers reach the
+lend cap; from then on arrivals are copied, and the group has fewer
+buffers to refill from until the views are dropped. A client that hands
+values to an application cache can do this. Proposed (author): values
+below a threshold are copied into an owned `Bytes`, which copies the value
+only, not the completion; values at or above it are views. The threshold
+is measured as `send_zc_threshold` was, and a metric counts buffers
+pinned by views.
 
 In the benchmark's streaming cells it cut process RSS from 2.3 GiB to 262
 MiB (INC 64 × 1 MiB, hv01); with a 1 GiB plain ring RSS only halved, from
@@ -554,8 +575,6 @@ receive queue, and TCP closes the window until the worker re-arms.
 ## Unchanged
 
 - The UDP ring (`udp_recv_buffer`, its own bgid) stays plain.
-- `with_bytes` copies a held buffer into the accumulator when it polls,
-  unless "Bounded accumulator"'s open question changes it.
 - TLS (both engines) copies out of the ring and takes no hold.
 - The `timestamps` feature shares the small TCP group. If multishot
   `RECVMSG` works on an INC ring, it stays there, with `RecvMsgOut::parse`
@@ -603,13 +622,17 @@ the ring kind in use.
    forced-async receive), EOF on a partly used buffer, and multishot
    `RECVMSG` on an INC ring; run on CI and as SystemsLab experiments on
    6.1, 6.8, 6.12 and 7.1. Settle the 6.12.y minimum or keep a probe.
-1. Bounded accumulator: the target length from `NeedAtLeast`, the hold of
-   a completion's rest while the accumulator is non-empty, the flush of a
-   held buffer before any append, and `WithDataFuture` parsing the
-   accumulator before the held buffer. It needs the data-address changes
-   to `PendingRecvBuf` and `handle_send_recv_buf` from step 3; land those
-   here. How `with_bytes` callers get the bound is decided before this
-   step.
+1. Bounded accumulator: the target length from `NeedAtLeast` and the
+   sites that clear it (reset, close, `ConnStream` reads, `take_frozen`,
+   `settle_forward_end`), the hold of a completion's rest while the
+   accumulator is non-empty, the flush of a held buffer before any append,
+   `WithDataFuture` parsing the accumulator before the held buffer, and
+   the move of held bytes into the accumulator, with a re-parse, before
+   the future parks or resolves. It needs the data-address changes to
+   `PendingRecvBuf` and `handle_send_recv_buf` from step 3; land those
+   here. `with_bytes` views over held buffers (see "`with_bytes`"), with
+   the view threshold and the pinned-buffer metric, are a step of their
+   own after this one.
 2. Buffer state (`written`, `exhausted`, `holds`) with the ring registered
    plain. Every completion exhausts its buffer at offset 0, so behaviour is
    unchanged; the per-path single-release checks become holds. The existing
