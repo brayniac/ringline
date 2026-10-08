@@ -2,7 +2,8 @@
 # The two-machine run list for experiments/recv-strategies-2host-tworing.toml:
 # one ring against two (a second, large-buffer group for connections
 # promoted as streaming or holding). `$2` picks the kernel's configs:
-# `inc` (6.12+) or `plain` (before 6.12). Both machines read it, so they
+# `inc` (6.12+), `plain` (before 6.12), or `plain2` (before 6.12, promotion
+# on a socket that still has data queued). Both machines read it, so they
 # execute the same runs in the same order; run N listens on port BASE+N.
 # One line per run:
 #   index|rep|label|server args|workload|conns|client args|server extra|streamers|streamer client args
@@ -15,6 +16,15 @@ if [ "$kind" = inc ]; then
   configs=(
     "inc_64x1m|--strategy shared_inc --shared-bufs 64 --shared-buf-size 1048576 --bounded-acc"
     "tr_inc_64x1m+64x1m|--strategy two_ring_inc --shared-bufs 64 --shared-buf-size 1048576 --large-bufs 64 --large-buf-size 1048576 --promote-on-hold --bounded-acc"
+  )
+elif [ "$kind" = plain2 ]; then
+  # Promotion on IORING_CQE_F_SOCK_NONEMPTY: a full completion with data
+  # still queued, which a 64 KiB request/response exchange does not leave.
+  tr="--strategy two_ring --shared-bufs 4096 --shared-buf-size 65536 --large-bufs 256 --large-buf-size 1048576 --promote-on-hold --promote-nonempty --no-thp --bounded-acc"
+  configs=(
+    "p4096_64k|--strategy shared --shared-bufs 4096 --shared-buf-size 65536 --no-thp --bounded-acc"
+    "tr_ne|$tr"
+    "tr_ne_cap64|$tr --max-promoted 64"
   )
 else
   configs=(

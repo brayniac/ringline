@@ -1,0 +1,64 @@
+# Build ringline's lib, echo and memlock_rings test binaries for the
+# fix branch of #626 and for upstream main, so they can run on the Ubuntu
+# 24.04 guest (experiments/ubuntu-pbuf-tests-run.toml). ringline does not
+# build for musl (`libc::statx`), so these link glibc; the log prints the
+# newest glibc symbol version each needs (Ubuntu 24.04 has 2.39).
+name = "ringline #626 test build"
+
+[params]
+fix_repo   = "https://github.com/brayniac/ringline"
+fix_branch = "fix/ubuntu-pbuf-resv"
+main_repo  = "https://github.com/ringline-rs/ringline"
+
+[[jobs]]
+name = "build"
+tags = ["validation"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+shape = "z4.c"
+image = "spool/images/debian-13-ci-20260912.1@golden"
+slots = 1
+memory_gib = 8
+ports = 0
+gpu = false
+payload_timeout = 5400
+artifacts = ["/home/anvil/tests.tgz", "/home/anvil/build.log"]
+upload = true
+payload = '''
+set -uo pipefail
+cd /home/anvil
+{
+  export CARGO_PROFILE_RELEASE_DEBUG=0 CARGO_PROFILE_RELEASE_STRIP=true
+  mkdir -p out
+  for which in fix main; do
+    if [ $which = fix ]; then repo={fix_repo}; ref={fix_branch}; else repo={main_repo}; ref=main; fi
+    git clone -q $repo $which && git -C $which checkout -q $ref
+    echo "$which: $(git -C $which log --oneline -1)"
+    ( cd $which && cargo test -p ringline --release --locked --no-run \
+        --lib --test echo --test memlock_rings \
+        --message-format=json > ../$which.json )
+    rc=$?
+    echo "build_${which}_status=$rc"
+    # The JSON stream hides the compiler's messages; print them on failure.
+    [ $rc -eq 0 ] || ( cd $which && cargo test -p ringline --release --locked --no-run \
+        --lib --test echo --test memlock_rings 2>&1 | grep -E '^(error|warning)' -A6 | head -60 )
+    grep -o '"executable":"[^"]*"' $which.json | cut -d'"' -f4 | while read -r exe; do
+      name=$(basename "$exe" | sed 's/-[0-9a-f]*$//')
+      cp "$exe" out/$which-$name
+    done
+  done
+  ls -la out; sha256sum out/*
+  # Ubuntu 24.04 has glibc 2.39; this image has 2.41.
+  for f in out/*; do echo "GLIBC_MAX $f $(objdump -T $f | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)"; done
+  tar czf tests.tgz out
+} 2>&1 | tee /home/anvil/build.log
+exit 0
+'''
+
+[[jobs.steps]]
+type = "shell"
+command = '''
+grep -q "build_fix_status=0" build.log && grep -q "build_main_status=0" build.log || { echo "build failed"; exit 1; }
+echo ok
+'''

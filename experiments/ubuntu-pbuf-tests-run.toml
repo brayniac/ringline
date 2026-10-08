@@ -1,0 +1,59 @@
+# Run the #626 test binaries (experiments/ubuntu-pbuf-tests-build.toml) on
+# the Ubuntu 24.04 image, kernel 6.8.0-142: upstream main first (its
+# workers are expected to fail registering the provided buffer ring), then
+# the fix branch.
+name = "ringline #626 tests on Ubuntu 24.04"
+
+[params]
+tests_artifact = "SET_AT_SUBMIT"
+image          = "spool/images/ubuntu-24.04-base-20261008.1@golden"
+
+[[jobs]]
+name = "run"
+tags = ["z2.baremetal"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "start"
+shape = "z2.c"
+image = "{image}"
+gpu = false
+boot_timeout = 600
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "exec"
+payload_timeout = 3600
+upload = true
+artifacts = ["/home/anvil/run.log"]
+inputs = [{ artifact = "{tests_artifact}", name = "tests.tgz", dest = "/home/anvil" }]
+payload = '''
+set -uo pipefail
+cd /home/anvil && tar xzf tests.tgz && chmod +x out/*
+hard=$(ulimit -Hn); [ "$hard" = unlimited ] && hard=1048576; ulimit -n "$hard"
+sudo prlimit --pid $BASHPID --memlock=unlimited:unlimited
+{
+  uname -r; ls out
+  for which in main fix; do
+    for t in out/$which-*; do
+      name=$(basename $t)
+      case $name in
+        *memlock_rings*) args="--test-threads=1" ;;
+        *) args="--test-threads=8" ;;
+      esac
+      echo "== $name"
+      timeout 1200 $t $args > $name.out 2>&1
+      rc=$?
+      echo "RESULT $name exit=$rc $(grep -E '^test result:' $name.out | tail -1)"
+      grep -E 'EINVAL|Invalid argument|panicked' $name.out | sort | uniq -c | sort -rn | head -5
+      grep -E '^test .* FAILED$' $name.out | head -40
+    done
+  done
+} 2>&1 | tee /home/anvil/run.log
+exit 0
+'''
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "stop"
+upload = true

@@ -57,6 +57,8 @@ struct Conn {
     last_data: Option<Instant>,
     /// The longest gap between two deliveries.
     max_gap: Duration,
+    /// The gap before the latest delivery.
+    last_gap: Option<Duration>,
     /// When the first `-ENOBUFS` since the last delivery arrived.
     starved_at: Option<Instant>,
     enobufs: u32,
@@ -165,6 +167,18 @@ pub struct Promote {
     pub after: u32,
     pub demote_after: u32,
     pub on_hold: bool,
+    /// `--promote-gap-us`: a full completion counts toward promotion only
+    /// if it arrives within this long of the connection's previous one; 0
+    /// for no limit. Separates a stream from request/response messages
+    /// that happen to fill a buffer.
+    pub gap: Duration,
+    /// `--max-promoted`: the most connections in the large group at once;
+    /// 0 for no limit.
+    pub max: usize,
+    /// `--promote-nonempty`: a full completion counts toward promotion only
+    /// if the kernel reports more data queued on the socket
+    /// (`IORING_CQE_F_SOCK_NONEMPTY`).
+    pub nonempty: bool,
 }
 
 pub struct Shared {
@@ -183,6 +197,12 @@ pub struct Shared {
     rearms: u64,
     promotions: u64,
     demotions: u64,
+    /// Connections whose target is the large group.
+    promoted: usize,
+    /// Completions that filled their buffer, and those of them flagged
+    /// `IORING_CQE_F_SOCK_NONEMPTY`.
+    full_completions: u64,
+    full_nonempty: u64,
     hold_every: usize,
     hold_first: usize,
     hold: Duration,
@@ -242,6 +262,7 @@ impl Shared {
                     small_run: 0,
                     last_data: None,
                     max_gap: Duration::ZERO,
+                    last_gap: None,
                     starved_at: None,
                     enobufs: 0,
                 })
@@ -255,6 +276,9 @@ impl Shared {
             rearms: 0,
             promotions: 0,
             demotions: 0,
+            promoted: 0,
+            full_completions: 0,
+            full_nonempty: 0,
             hold_every,
             hold_first,
             no_thp,
@@ -301,12 +325,14 @@ impl Shared {
     }
 
     /// Count a completion of `res` bytes toward moving `c` between groups.
-    fn classify(&mut self, c: usize, res: usize) {
+    fn classify(&mut self, c: usize, res: usize, nonempty: bool) {
         let Some(p) = &self.promote else { return };
-        let (bytes, after, demote_after) = (p.bytes, p.after, p.demote_after);
+        let (bytes, after, demote_after, gap) = (p.bytes, p.after, p.demote_after, p.gap);
+        let need_nonempty = p.nonempty;
         let holder = self.holder(c) && p.on_hold;
         let conn = &mut self.conns[c];
-        if res >= bytes {
+        let close = gap.is_zero() || conn.last_gap.is_some_and(|g| g <= gap);
+        if res >= bytes && close && (nonempty || !need_nonempty) {
             conn.full_run += 1;
             conn.small_run = 0;
             if conn.full_run >= after {
@@ -322,10 +348,19 @@ impl Shared {
     }
 
     fn retarget(&mut self, c: usize, g: usize) {
-        let conn = &mut self.conns[c];
-        if conn.target == g {
+        if self.conns[c].target == g {
             return;
         }
+        if g == 1 {
+            let max = self.promote.as_ref().map_or(0, |p| p.max);
+            if max != 0 && self.promoted >= max {
+                return;
+            }
+            self.promoted += 1;
+        } else {
+            self.promoted -= 1;
+        }
+        let conn = &mut self.conns[c];
         conn.target = g;
         conn.full_run = 0;
         conn.small_run = 0;
@@ -491,8 +526,9 @@ impl Strategy for Shared {
         let now = Instant::now();
         if res > 0 {
             let conn = &mut self.conns[c];
-            if let Some(at) = conn.last_data {
-                conn.max_gap = conn.max_gap.max(now - at);
+            conn.last_gap = conn.last_data.map(|at| now - at);
+            if let Some(gap) = conn.last_gap {
+                conn.max_gap = conn.max_gap.max(gap);
             }
             conn.last_data = Some(now);
             if let Some(at) = conn.starved_at.take() {
@@ -541,7 +577,13 @@ impl Strategy for Shared {
             };
             self.receive(cx, c, data);
             self.hold_or_copy(c, g, bid, data);
-            self.classify(c, res as usize);
+            if res as usize >= self.groups[g].buf_size {
+                self.full_completions += 1;
+                if cqueue::sock_nonempty(flags) {
+                    self.full_nonempty += 1;
+                }
+            }
+            self.classify(c, res as usize, cqueue::sock_nonempty(flags));
             // The buffer goes back once the kernel is done with it and no
             // hold remains.
             let grp = &mut self.groups[g];
@@ -661,7 +703,7 @@ impl Strategy for Shared {
         );
         if let Some(l) = self.groups.get(1) {
             s += &format!(
-                " small_enobufs={} large_enobufs={} large_pinned_peak={} large_resident_kb={} promotions={} demotions={} large_conns={}",
+                " small_enobufs={} large_enobufs={} large_pinned_peak={} large_resident_kb={} promotions={} demotions={} large_conns={} full={} full_nonempty={}",
                 g0.enobufs,
                 l.enobufs,
                 l.pinned_peak,
@@ -669,6 +711,8 @@ impl Strategy for Shared {
                 self.promotions,
                 self.demotions,
                 self.conns.iter().filter(|c| c.group == 1).count(),
+                self.full_completions,
+                self.full_nonempty,
             );
         }
         s

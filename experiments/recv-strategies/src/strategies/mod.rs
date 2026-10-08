@@ -27,6 +27,13 @@ pub fn build(name: &str, args: &[String], nconns: usize, sqpoll: bool) -> Box<dy
                         after: arg(args, "--promote-after", Some(4)),
                         demote_after: arg(args, "--demote-after", Some(64)),
                         on_hold: flag(args, "--promote-on-hold"),
+                        gap: std::time::Duration::from_micros(arg(
+                            args,
+                            "--promote-gap-us",
+                            Some(0),
+                        )),
+                        max: arg(args, "--max-promoted", Some(0)),
+                        nonempty: flag(args, "--promote-nonempty"),
                     },
                 )
             });
