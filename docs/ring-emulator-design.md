@@ -203,7 +203,8 @@ pub(crate) trait Engine {
 ```
 
 `RingKind` is `Plain` or `Incremental` (`IOU_PBUF_RING_INC`); see "Receive
-under the shared-ring design". `Ring` becomes `UringEngine`, and both CQ readers go through `reap`.
+under the shared-ring design". `Ring` becomes `UringEngine`, and both CQ
+readers go through `reap`.
 
 The engine is chosen at compile time: `has_io_uring` selects
 `UringEngine`, and anything else `EmulatedEngine`. A choice at launch is
@@ -231,9 +232,11 @@ The emulator follows these rules, which the driver relies on with
    depend on completion order between unrelated SQEs (Domain Invariant
    2), and the emulator does not promise one. Its default order is
    submission order; a test mode shuffles completions to catch code that
-   relies on it. The shuffle keeps three orders the kernel guarantees:
+   relies on it. The shuffle keeps four orders the kernel guarantees:
    one multishot's CQEs, a zero-copy send's operation CQE before its
-   notification, and a linked chain.
+   notification, a linked chain, and the CQEs that consume one
+   incremental buffer, across connections (the driver derives each
+   completion's offset from that order).
 4. **Links.** Under `IO_LINK`, an error, or a short result on an op with
    `MSG_WAITALL`, cancels the rest of the chain with `-ECANCELED`. Under
    `IO_HARDLINK` the next op runs whatever the previous result. The close
@@ -291,7 +294,7 @@ conformance tests confirm against the real ring first.
 
 | OpTag(s) | Opcode | Emulation | |
 |---|---|---|---|
-| RecvMulti, RecvMultiLarge | RECV multishot, buffer select | Try at arm, then on each readable edge: take buffer space from the arm's group, `read` into it, and repeat until `EAGAIN` or a per-pass cap *(verify the kernel's cap)*, so one fast sender cannot empty a shared group. On a plain group a read takes the head buffer whole and posts `(res, F_BUFFER\|bid<<16\|F_MORE)`. On an incremental group it reads into the head buffer at its current offset, posts `F_BUF_MORE` while the buffer has space left, and moves to the next buffer when it is used up. Each CQE is held until the next read of the same pass returns: if that read returned data, the held CQE gets `IORING_CQE_F_SOCK_NONEMPTY`; if it returned `EAGAIN`, it does not. When the pass stops at the cap, one `ioctl(FIONREAD)` decides the flag. A read that returns `0`, `EAGAIN` or an error puts the space back, and its CQE carries no `F_BUFFER`. No buffer: post `-ENOBUFS` without `F_MORE` (the arm ends; the driver re-arms on replenish, Domain Invariant 6). EOF: post `0` without `F_MORE`. Other errors: `-errno` without `F_MORE`. | C |
+| RecvMulti, RecvMultiLarge | RECV multishot, buffer select | Try at arm, then on each readable edge: take buffer space from the arm's group, `read` into it, and repeat until `EAGAIN` or a per-pass cap *(verify the kernel's cap)*, so one fast sender cannot empty a shared group. On a plain group a read takes the head buffer whole and posts `(res, F_BUFFER\|bid<<16\|F_MORE)`. On an incremental group it reads into the head buffer at its current offset, posts `F_BUF_MORE` while the buffer has space left, and moves to the next buffer when it is used up. Each CQE is held until the next read of the same pass returns: if that read returned data, the held CQE gets `IORING_CQE_F_SOCK_NONEMPTY`; if it returned `EAGAIN`, it does not. When the pass stops at the cap, or because the group has no space left, one `ioctl(FIONREAD)` decides the flag. The flag also counts bytes that arrived after the held CQE's read, which the kernel's does not. A pass posts its held CQE before another connection's pass takes space from the same incremental group. A read that returns `0`, `EAGAIN` or an error puts the space back, and its CQE carries no `F_BUFFER`. No buffer: post `-ENOBUFS` without `F_MORE` (the arm ends; the driver re-arms on replenish, Domain Invariant 6). EOF: post `0` without `F_MORE`. Other errors: `-errno` without `F_MORE`. | C |
 | RecvMsgMultiTs, RecvMsgUdp | RECVMSG multishot | As RecvMulti, and write the `io_uring_recvmsg_out` header, name and control data into the buffer in the kernel's layout so `RecvMsgOut::parse` (or its replacement) reads it. On Linux the control data is what `recvmsg` returns (`SCM_TIMESTAMPING`, `UDP_GRO`). Off Linux: timestamps come from `SO_TIMESTAMP` and are written as a software `SCM_TIMESTAMPING` entry (there are no hardware timestamps); there is no GRO, so each completion carries one datagram and no segment-size control message, which the driver already reads as a single datagram. | C, P |
 | RecvUdp | RECV multishot | As RecvMulti on a UDP socket. | B |
 | RecvFallback | RECV one-shot into a pool slot | Try at submit, then on readable; one CQE. | A |
@@ -331,29 +334,34 @@ each one costs per request.
 | Need | `UringEngine` | `EmulatedEngine` |
 |---|---|---|
 | Register a group as incremental or plain (`RingKind`) | `IORING_REGISTER_PBUF_RING` with or without `IOU_PBUF_RING_INC`. An `EINVAL` on the incremental form means the kernel lacks it; the engine reports that and the driver registers plain rings. The Ubuntu 6.8 reserved-word retry (#626) stays inside the engine. | Both kinds, in userspace. |
-| `incremental_buffers()` | Whether the incremental registration succeeded. | `true`. The emulator implements incremental consumption exactly, so on the emulator the driver selects the incremental row of #622's defaults: 64 × 1 MiB, large group off. |
+| `incremental_buffers()` | Whether the kernel accepts `IOU_PBUF_RING_INC`, from #622 step 0's probe or the first registration's `EINVAL`. | `true`. The driver selects the ring kind from this and `recv_incremental`, as #622's ring-kind selection describes, so `recv_incremental(false)` gives the plain row on the emulator too. |
 | `F_BUFFER`, `F_MORE`, `F_BUF_MORE` | The kernel's flags. | Posted by the RecvMulti emulation (op-by-op table). |
 | `IORING_CQE_F_SOCK_NONEMPTY` (promotion) | The kernel's flag. | Set from the next read of the same pass, or from `FIONREAD` when the pass stops at its cap. |
 | The group a receive was armed on | Its tag: `RecvMulti` or `RecvMultiLarge`. | The same tags; the emulator does not interpret them. |
-| Move a connection between groups | `ASYNC_CANCEL` by user_data, then a new arm. | Drop the emulated arm and post `-ECANCELED`, then a new arm. No syscall. |
+| Move a connection between groups | `ASYNC_CANCEL` by user_data, then a new arm. | Drop the emulated arm and post `-ECANCELED`, then a new arm, which reads at once (rule 2). |
 
 The driver's buffer-state rules, the lend cap, the bounded accumulator and
 promotion are driver code and run unchanged on both engines.
 
 ### Copies per request
 
-Counted as `docs/syscalls-and-copies.md` counts them: copies ringline makes
-in userspace, not the kernel's copy out of the socket. "Today" is the code
-at the base of this design; "#622" is the shared-ring design on either
-engine.
+Copies ringline makes in userspace, not the kernel's copy out of the
+socket, as `docs/syscalls-and-copies.md` and CLAUDE.md count them. Both of
+those tables count provided buffer → accumulator as one mandatory copy; the
+`pending_recv_bufs` path in `handle_recv_multi` makes a completion holding
+one whole message 0 today, and those tables need the same correction.
+"Today" is the code at the base of this design; "#622" is the shared-ring
+design on either engine.
 
 Receive:
 
 | Case | io_uring today | mio today | #622, io_uring or emulator |
 |---|---|---|---|
-| A whole message in one completion, accumulator empty, `with_data` | 0: the buffer is held in `pending_recv_bufs` and parsed in place, one buffer per connection at a time | 1: 8 KiB scratch → accumulator | 0 |
-| A second completion while one is held, or bytes already buffered | 1: both buffers copied into the accumulator | 1 | 0 for the whole messages in it; the bytes that complete a pending message are copied (bounded accumulator, when the parser announced the length) |
-| A message split across completions | 1 for every byte | 1 | 1 for the bytes after the first completion's share, bounded by the message length |
+| A completion holding exactly one whole message, accumulator empty, `with_data` | 0: the buffer is held in `pending_recv_bufs` and parsed in place, one buffer per connection at a time | 1: 8 KiB scratch → accumulator | 0 |
+| Several whole messages in one completion, `with_data` | 0 for the first; 1 for the rest (`WithDataFuture` appends the remainder after a partial consume) | 1 | as io_uring today |
+| A second completion while one is held | 1: both buffers copied into the accumulator | 1 | 1, as today |
+| Bytes already buffered | 1 for the whole completion | 1 | with `NeedAtLeast(n)`: the bytes that complete the message are copied and the rest of the completion is handled as the rows above; with `NeedMore`: 1 for the whole completion |
+| A message split across completions | 1 for every byte | 1 | 1 for every byte of the message: the first share is copied when the parser asks for more, the later shares by the bounded copy. Bytes past the message end are not copied by the bound. |
 | `with_bytes` | 1: a held buffer is always copied into the accumulator first; `Bytes` views of the accumulator are then free | 1 | 1, unchanged by #622 |
 | TLS | 1 (decrypt into the accumulator) | 1 | 1 |
 | Above a group's lend cap | — | — | 1 |
@@ -373,12 +381,13 @@ emulator removes that copy for guard parts.
 | Learn the request arrived | share of one `io_uring_enter` | share of one `epoll_wait` (`kevent` on macOS) | share of one `epoll_wait` |
 | Read the request | 0 | 1 `read` per completion, plus 1 `read` returning `EAGAIN` per readable edge | N `read`s plus 1 `EAGAIN` per edge, into a scratch buffer |
 | `SOCK_NONEMPTY` | 0 | 0, except one `ioctl(FIONREAD)` when a pass stops at its cap | — |
-| Send one response | 0 dedicated | 1 `write` | share of one `writev` per connection per flush |
+| Send one response | 0 dedicated | 1 `write` or `writev` (plaintext); 1 per record (TLS) | share of one `writev` per connection per flush |
 | Send N pipelined responses on one connection | N SQEs, 0 dedicated syscalls | N `write`s, one per loop iteration or flush | 1 `writev` |
-| Move a connection between groups | 0 dedicated (cancel and arm are SQEs) | 0 | — |
-| Re-arm after `ENOBUFS` | 0 dedicated | 1 `read` (rule 2: an arm reads at once) | — |
+| Move a connection between groups | 0 dedicated (cancel and arm are SQEs) | 1 `read` (the new arm's, rule 2), returning `EAGAIN` when nothing is queued | — |
+| Re-arm after `ENOBUFS` | 0 dedicated | 0 dedicated: the re-arm's read is the pass's first, counted above (rule 2) | — |
 
-The pipelined-send row is the emulator's one regression against mio today.
+Pipelined plaintext copy sends and TLS sends are where the emulator pays
+more syscalls than mio today; the `FIONREAD` at the cap is a smaller one.
 The driver keeps one send in flight per connection and never merges two
 user sends into one SQE: every `send()` marks its last slot end-of-send,
 and `submit_next_queued_inner` stops a coalescing run there
@@ -388,7 +397,10 @@ completion. Merging consecutive copy sends on a connection into one
 `SendMsgCoalesced`, with each send's completion accounted from the total,
 removes the regression on the emulator and cuts SQEs on io_uring. That is a
 driver change, tracked in #628, and it lands before the mio backend is
-retired (step 7).
+retired (step 7). #628 leaves TLS out: each record is a single-slot send,
+so on the emulator a TLS response costs one `write` per record, and
+pipelined TLS responses one per record in turn, against one `writev` per
+flush on mio. Owner question 4 covers it.
 
 ### Measuring the counts
 
@@ -401,8 +413,9 @@ only difference:
 - Workloads: request/response at 64 B, 4 KiB, 64 KiB and 1 MiB, pipeline
   depth 1 to 32, and a streaming cell.
 - Syscalls per request from rezolus' syscall counters, divided by requests.
-  Copies per request from ringline's receive counters (#622's metrics:
-  bytes lent and bytes copied) and the send pool's copy counter.
+  Copies per request from receive counters (bytes lent, bytes copied)
+  and a send-pool copy counter, which this measurement adds; neither
+  exists today.
 
 The results replace the measured section of `docs/syscalls-and-copies.md`,
 which today compares two different programs.
@@ -462,9 +475,10 @@ Each step is a separate PR. Steps 1–6 keep both backends working.
    available on every platform, and the `#[cfg(has_io_uring)]` gates on
    public items are removed.
 7. **Retire the mio backend** once the emulator passes everything the
-   mio backend passes and #628 has landed, so pipelined responses cost
-   the emulator no more syscalls than mio. `force-mio` becomes the switch that selects the
-   emulator on Linux.
+   mio backend passes and #628 has landed, so pipelined plaintext copy
+   sends cost the emulator no more syscalls than mio. TLS sends are owner
+   question 4. `force-mio` becomes the switch that selects the emulator on
+   Linux.
 
 ## Questions for the owner
 
@@ -484,12 +498,17 @@ Each step is a separate PR. Steps 1–6 keep both backends working.
    `ringline::backend()` returns `Backend::Mio`. Under the release
    process these are breaking changes to batch into a coordinated
    release.
+4. **TLS sends on the emulator.** #628 coalesces plaintext copy sends
+   only. On the emulator a TLS response costs one `write` per record,
+   where mio writes a connection's queued ciphertext with one `writev`.
+   Either #628's scope grows to cover TLS records, or that cost is
+   accepted before step 7.
 
 ## Notes
 
 - Copy counts follow CLAUDE.md's table, which counts copies ringline
   makes in userspace, not the kernel's copy out of the socket. "Receive
-  under the shared-ring design" below gives the counts per engine.
+  under the shared-ring design" above gives the counts per engine.
 - kTLS is designed (`docs/ktls-design.md`) but not implemented. Its
   design sends plaintext with `IORING_OP_SEND` without `MSG_WAITALL`, so
   the emulator's Send follows the flag: with `MSG_WAITALL` it writes
