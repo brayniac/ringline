@@ -725,8 +725,11 @@ Measured:
 - On 6.1, in every cell with 16 streamers sharing the worker, two groups
   cut request p50 and p99 by 2.8× to 25×: 2.8× (mixed), 7–9× (streamers
   holding), 3.7–25× (tiered with streamers), 15–21× (heavy-tailed, tiered
-  with streamers). In cells without streamers p50 was the same; the tails
-  moved in both directions. Tiered p999 fell (2.75, 2.62, 3.15 ms per rep
+  with streamers). In the tiered and heavy-tailed cells without streamers,
+  p50 was the same with one or two groups. In the 1 MiB × 64 request/ack
+  cell (`01a11d44-3a9e`), two groups lowered p50 from 46–48 to 36–38 ms
+  and raised p99 from 92–96 to 117–126 ms; the reps did not overlap.
+  Tiered p999 fell (2.75, 2.62, 3.15 ms per rep
   with one group; 2.36, 2.03, 2.49 ms with two;
   `01a11d44-3a9e-71f7-9019-7cc0a98b5d66`). Heavy-tailed tiered p99 rose
   (3.54, 3.80, 3.80 against 4.06, 4.19, 3.93 ms) and its p999 rose from
@@ -778,9 +781,10 @@ completions of at least 64 KiB carrying `SOCK_NONEMPTY`, and on held
 lends, with no cap. Demotion hysteresis and migration timing were
 measured next (below).
 
-The owner's decision replaces one ring per worker before 6.12. If
-accepted, the proposed 4096 × 64 KiB small group would replace the
-1024 × 64 KiB ring. Whether the large group supersedes the per-connection
+The owner's decision puts a second group into the implementation before
+6.12; whether two groups replace one ring as the default there is decided
+in landing step 6. If accepted, the proposed 4096 × 64 KiB small group
+would replace the 1024 × 64 KiB ring. Whether the large group supersedes the per-connection
 hybrid follow-up has not been decided.
 
 ### Demotion quiet period and migration time
@@ -846,7 +850,8 @@ Measured:
   cell p50 and p99 rose in every rep (4.5–6.8 to 9.4–10.5 ms; 7.1–11.0 to
   15.2–16.8 ms), and the p999 reps overlapped. How much of the difference
   the rule causes is not established. The tiered cell had at most one
-  demotion per rep (0, 0, 1), and its p50 rose from 5.2 to 12.6 ms.
+  demotion per rep without the quiet period (0, 0, 1) and none with it;
+  its p50 per rep was 5.2, 12.6 and 4.7 ms against 8.4, 14.2 and 12.6 ms.
 - Per-rep medians without the quiet period: decision to re-arm 1.3–12 ms
   on 6.12 and 17–586 ms on 6.1; streamer first delivery 8–21 ms on 6.12
   and 130 ms–7.4 s on 6.1. With the 1 s quiet period: re-arm 0.4–25 ms on
@@ -874,8 +879,10 @@ Not explained: the holding cell's 0.4–7.4 s first deliveries on 6.1.
 Waiting for a free large-group buffer does not fit: the same cell with the
 quiet period, where the rule cannot act, also pinned all 256 and had more
 large-group `ENOBUFS` (1.6k–2.6k), and its first deliveries took
-96–150 ms. The difference between those two is the run-to-run spread for
-this cell.
+96–150 ms. In every rep the configuration without the quiet period was
+the slower (417 vs 150, 486 vs 96, 7425 vs 143 ms). The order of
+configurations rotated between reps (in rep 2 the quiet-period
+configuration ran first).
 
 Not explained: the 17–586 ms re-arm times on 6.1. In the benchmark the
 re-arm does not wait on a large-group buffer, and the cell with the most

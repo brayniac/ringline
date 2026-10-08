@@ -45,18 +45,21 @@ run with the first promotion rule and the run with the `SOCK_NONEMPTY` rule
 (journal). Landing step 6's measurements decide whether it is turned on. On
 6.1, in every cell with 16 streamers sharing the worker in the first
 two-group runs (`01a11d44-3a9e`, `01a11d45-3f7d`), two groups cut request
-p50 and p99 by 2.8× to 25×. In cells without streamers p50 was the same
-with one or two groups. Tiered p999 per rep was 2.75, 2.62 and 3.15 ms with
-one group and 2.36, 2.03 and 2.49 ms with two (`01a11d44-3a9e`).
-Heavy-tailed tiered p99 was 3.54, 3.80 and 3.80 ms against 4.06, 4.19 and
-3.93 ms, and its p999 5.2 against 6.6 ms (`01a11d45-3f7d`).
+p50 and p99 by 2.8× to 25×. In the tiered and heavy-tailed cells without
+streamers, p50 was the same with one or two groups. In the 1 MiB × 64
+request/ack cell (`01a11d44-3a9e`), two groups lowered p50 from 46–48 to
+36–38 ms and raised p99 from 92–96 to 117–126 ms; the reps did not overlap.
+Tiered p999 per rep was 2.75, 2.62 and 3.15 ms with one group and 2.36,
+2.03 and 2.49 ms with two (`01a11d44-3a9e`). Heavy-tailed tiered p99 was
+3.54, 3.80 and 3.80 ms against 4.06, 4.19 and 3.93 ms, and its p999 5.2
+against 6.6 ms (`01a11d45-3f7d`).
 
 Variation between runs is large on 6.1 too. In the later run
 (`01a11d87-5bd5`) two groups without the quiet period gave mixed p99 reps
 of 168, 369 and 419 ms against 336, 336 and 352 ms with one group, and cut
 holding p50 and p99 4.2–4.7×. With the 1 s quiet period, two-group mixed
-p99 was 36–122 ms. Because of this variation, two groups on by default
-with a plain ring is a proposal; landing step 6 confirms or rejects it.
+p99 was 36–122 ms. Two groups on by default with a plain ring is the
+author's proposal; landing step 6 confirms or rejects it.
 
 The copy into the accumulator, the lend-in-place paths and the `ENOBUFS`
 fallback stay. The accumulator copy is bounded: see "Bounded accumulator".
@@ -381,8 +384,9 @@ rule changed median demotions only in the mixed cell (6 to 0) and the
 heavy-tailed cell (4 to 1, reps overlapping). In the mixed cell p50 and p99
 rose in every rep (4.5–6.8 to 9.4–10.5 ms; 7.1–11.0 to 15.2–16.8 ms), and
 the p999 reps overlapped. How much of the difference the rule causes is not
-established. The tiered cell had at most one demotion per rep (0, 0, 1),
-and its p50 rose from 5.2 to 12.6 ms.
+established. The tiered cell had at most one demotion per rep without the
+quiet period (0, 0, 1) and none with it; its p50 per rep was 5.2, 12.6 and
+4.7 ms against 8.4, 14.2 and 12.6 ms.
 
 ## Lends
 
