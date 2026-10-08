@@ -284,11 +284,24 @@ it needs no special case.
 ## Bounded accumulator
 
 When a connection's parser last returned `ParseResult::NeedAtLeast(n)`, a
-completion copies into the accumulator only the bytes that complete that
-message, parses it, and delivers the rest of the completion in place as if
-nothing were buffered. With `NeedMore` (no announced length) the completion
-is copied whole, as today. The accumulator then holds at most one message
-plus the bytes of one completion, whatever the buffer size.
+completion copies `n` bytes into the accumulator and holds the rest of the
+completion in place, at its offset. The task parses the accumulator first
+and then the held rest, as if nothing were buffered. `NeedAtLeast(n)` is a
+lower bound: if the parser still returns `NeedMore` or `NeedAtLeast` after
+the `n` bytes, the held rest is copied as today. With `NeedMore` (no
+announced length) the completion is copied whole, as today. The
+accumulator then holds at most one message plus the bytes of one
+completion, whatever the buffer size.
+
+This needs two driver changes, since today a buffer is held in place only
+while the accumulator is empty and the held buffer is the older data:
+
+- `handle_recv_multi` holds the rest of a completion while the accumulator
+  is non-empty (today it copies both into the accumulator when the
+  accumulator has bytes, `event_loop.rs`).
+- `WithDataFuture` parses the accumulator before the held buffer, instead
+  of prepending the held buffer to the accumulator (`runtime/io.rs`,
+  `accumulators.prepend`).
 
 In the benchmark's streaming cells it cut process RSS from 2.3 GiB to 262
 MiB (INC 64 × 1 MiB, hv01); with a 1 GiB plain ring RSS only halved, from
@@ -489,7 +502,8 @@ receive queue, and TCP closes the window until the worker re-arms.
 ## Unchanged
 
 - The UDP ring (`udp_recv_buffer`, its own bgid) stays plain.
-- `with_data` and `with_bytes` read the accumulator.
+- `with_bytes` reads the accumulator. `with_data` reads the accumulator and
+  then a held buffer, as "Bounded accumulator" describes.
 - TLS (both engines) copies out of the ring and takes no hold.
 - The `timestamps` feature shares the small TCP group. If multishot
   `RECVMSG` works on an INC ring, it stays there, with `RecvMsgOut::parse`
@@ -537,8 +551,10 @@ the ring kind in use.
    forced-async receive), EOF on a partly used buffer, and multishot
    `RECVMSG` on an INC ring; run on CI and as SystemsLab experiments on
    6.1, 6.8, 6.12 and 7.1. Settle the 6.12.y minimum or keep a probe.
-1. Bounded accumulator: copy only what completes a `NeedAtLeast` message.
-   Independent of the ring changes.
+1. Bounded accumulator: copy only the `n` bytes a `NeedAtLeast(n)`
+   message announced, hold the rest of the completion while the
+   accumulator is non-empty, and have `WithDataFuture` parse the
+   accumulator before the held buffer. Independent of the ring changes.
 2. Buffer state (`written`, `exhausted`, `holds`) with the ring registered
    plain. Every completion exhausts its buffer at offset 0, so behaviour is
    unchanged; the per-path single-release checks become holds. The existing
