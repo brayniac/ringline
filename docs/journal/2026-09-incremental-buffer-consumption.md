@@ -5,7 +5,8 @@
   the owner decided that two shared buffer groups go into the
   implementation for kernels before 6.12. The author proposes the large
   group off by default on 6.12+ until measured further, and a 1 s demotion
-  quiet period. Design: `docs/recv-incremental-ring-design.md` (#622).**
+  quiet period. The author also proposes 4096 × 64 KiB plus 256 × 1 MiB
+  before 6.12, on by default pending landing step 6. Design: `docs/recv-incremental-ring-design.md` (#622).**
   Phase A (2026-09-17) had narrowed the case: see "What Phase A did to
   criterion 1".
 - **Span:** 2026-09-17 → (open) · follows #415 (282773b), #416 Phase A ·
@@ -518,7 +519,8 @@ registered before `ENOMEM`.
 1024 × 64 KiB matches INC 64 × 1 MiB on 64 KiB, mixed and small traffic.
 INC's own gains are at 1 MiB messages (5.7k against 2.9k on hv01) and on
 streaming (234k against 215k on hv01, 105k against 95k across hosts). That
-plain ring is the design's choice for kernels without INC.
+plain ring was the design's choice at the time; see "Decision and
+proposals (2026-10-08)".
 
 **Decision (owner, 2026-10-06 and 2026-10-07).** One shared ring per worker:
 INC 64 × 1 MiB on 6.12+, plain 1024 × 64 KiB below. Measurements are taken
@@ -767,15 +769,19 @@ handlers.
 
 The author's proposals, measured above but not decided by the owner:
 before 6.12, plain 4096 × 64 KiB plus plain 256 × 1 MiB, both with
-`MADV_NOHUGEPAGE`, two groups on by default (amended below: proposed,
-pending A/A pairs). On 6.12+: INC 64 × 1 MiB, with the same two-group code
+`MADV_NOHUGEPAGE`, two groups on by default (pending A/A pairs in landing
+step 6). On 6.12+: INC 64 × 1 MiB, with the same two-group code
 and an INC 64 × 1 MiB large group off by default until the design's
 landing measurements (rate-limited streamers, A/A pairs) separate the
 effect. The bounded accumulator on both. Promotion on
 completions of at least 64 KiB carrying `SOCK_NONEMPTY`, and on held
 lends, with no cap. Demotion hysteresis and migration timing were
-measured next (below). This replaces the plain 1024 × 64 KiB
-recommendation and the per-connection hybrid follow-up above.
+measured next (below).
+
+The owner's decision replaces one ring per worker before 6.12. If
+accepted, the proposed 4096 × 64 KiB small group would replace the
+1024 × 64 KiB ring. Whether the large group supersedes the per-connection
+hybrid follow-up has not been decided.
 
 ### Demotion quiet period and migration time
 
@@ -829,28 +835,23 @@ Measured:
   5) and tiered (99 to 11) cells, but the per-rep counts overlapped (mixed
   62, 40, 0 against 2, 38, 5; tiered 115, 99, 13 against 23, 4, 11). Mixed
   p99 and p999 fell 8.4× and 5.6× and tiered p999 2.6× at the median, and
-  the reps did not overlap. The tails do not track demotions per rep: the
-  mixed rep without the quiet period that had 0 demotions, where the rule
-  had nothing to remove, still had p99 168 ms against 36–122 ms with it.
-  How much of the difference the rule causes is not established. In
-  the streamers-holding cell the rule cannot act, because the streamers are
-  the holders and had 0 demotions either way. That cell still moved by
-  1.4× at p99 and −21% in streamer throughput, which is the spread between
-  runs. In the heavy-tailed cell the demotions (415 and 381) and the tails
-  overlapped across reps.
+  the reps did not overlap. How much of the difference the rule causes is
+  not established. In the streamers-holding cell the rule cannot act,
+  because the streamers are the holders and had 0 demotions either way;
+  that cell moved by 1.4× at p99 and −21% in streamer throughput. In the
+  heavy-tailed cell the demotions (415 and 381) and the tails overlapped
+  across reps.
 - On 6.12 the rule changed median demotions only in the mixed cell (6 to
   0) and the heavy-tailed cell (4 to 1, reps overlapping). In the mixed
   cell p50 and p99 rose in every rep (4.5–6.8 to 9.4–10.5 ms; 7.1–11.0 to
-  15.2–16.8 ms), and the p999 reps overlapped. The mixed rep without the
-  quiet period that had 0 demotions still had p50 6.8 ms, below every rep
-  with it (9.4–10.5 ms). How much of the difference the rule causes is not
-  established. The tiered cell
-  had no demotions to remove, yet its p50 rose 5.2 to 12.6 ms, which is the
-  spread between runs.
+  15.2–16.8 ms), and the p999 reps overlapped. How much of the difference
+  the rule causes is not established. The tiered cell had at most one
+  demotion per rep (0, 0, 1), and its p50 rose from 5.2 to 12.6 ms.
 - Per-rep medians without the quiet period: decision to re-arm 1.3–12 ms
   on 6.12 and 17–586 ms on 6.1; streamer first delivery 8–21 ms on 6.12
   and 130 ms–7.4 s on 6.1. With the 1 s quiet period: re-arm 0.4–25 ms on
-  6.12 and 15–336 ms on 6.1.
+  6.12 and 15–336 ms on 6.1; streamer first delivery 7–26 ms on 6.12 and
+  96–150 ms on 6.1.
 - In this run, two groups without the quiet period gave 6.1 mixed p99 reps
   of 168, 369 and 419 ms against 336, 336 and 352 ms with one group, and
   cut holding p50 and p99 4.2–4.7×. With the 1 s quiet period, two-group
@@ -867,18 +868,23 @@ Measured:
   measured.
 - The single-group 6.12 results moved between this run and the previous
   one (streamers holding p999 23.1 ms here against 54.5 ms; mixed p50
-  4.98 ms against 8.1 ms). Run-to-run variation on 6.12 is at least as
-  large as the configuration effects.
+  4.98 ms against 8.1 ms).
 
-Inferred, not measured: that the holding cell's 0.4–7.4 s first
-deliveries on 6.1 come from waiting for a free large-group buffer (all 256
-pinned; large-group `ENOBUFS` 1.0k–1.6k per run). The 17–586 ms re-arm
-times on 6.1 are unexplained. In the benchmark the re-arm does not wait on
-a large-group buffer, and the cell with the most large-group `ENOBUFS`
-(heavy-tailed, 18k–83k) had the shortest re-arms (17–20 ms). On 6.12 the
-large group returned `ENOBUFS` in two of the quiet-period runs (22 and 11).
-The server loop was equally busy on both kernels (`main_util`
-0.95–0.998).
+Not explained: the holding cell's 0.4–7.4 s first deliveries on 6.1.
+Waiting for a free large-group buffer does not fit: the same cell with the
+quiet period, where the rule cannot act, also pinned all 256 and had more
+large-group `ENOBUFS` (1.6k–2.6k), and its first deliveries took
+96–150 ms. The difference between those two is the run-to-run spread for
+this cell.
+
+Not explained: the 17–586 ms re-arm times on 6.1. In the benchmark the
+re-arm does not wait on a large-group buffer, and the cell with the most
+large-group `ENOBUFS` (heavy-tailed, 18k–83k) had the shortest re-arms
+(17–20 ms). The benchmark's `settle` does not re-arm while a one-shot
+fallback recv is outstanding (`fallback.is_none()`), and that recv
+completes only when data arrives. On 6.12 the large group returned
+`ENOBUFS` in two of the quiet-period runs (22 and 11). The server loop was
+equally busy on both kernels (`main_util` 0.95–0.998).
 
 **Proposals (author, 2026-10-08, later; not owner decisions).** Demotion
 requires a 1 s quiet period (`recv_large_demote_quiet`) on both ring
