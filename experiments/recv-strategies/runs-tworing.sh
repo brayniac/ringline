@@ -2,8 +2,8 @@
 # The two-machine run list for experiments/recv-strategies-2host-tworing.toml:
 # one ring against two (a second, large-buffer group for connections
 # promoted as streaming or holding). `$2` picks the kernel's configs:
-# `inc` (6.12+), `plain` (before 6.12), or `plain2` (before 6.12, promotion
-# on a socket that still has data queued). Both machines read it, so they
+# `inc` (6.12+), `plain` (before 6.12), or `inc2` / `plain2` (promotion on a
+# socket that still has data queued, plus tiered-cache cells). Both machines read it, so they
 # execute the same runs in the same order; run N listens on port BASE+N.
 # One line per run:
 #   index|rep|label|server args|workload|conns|client args|server extra|streamers|streamer client args
@@ -16,6 +16,13 @@ if [ "$kind" = inc ]; then
   configs=(
     "inc_64x1m|--strategy shared_inc --shared-bufs 64 --shared-buf-size 1048576 --bounded-acc"
     "tr_inc_64x1m+64x1m|--strategy two_ring_inc --shared-bufs 64 --shared-buf-size 1048576 --large-bufs 64 --large-buf-size 1048576 --promote-on-hold --bounded-acc"
+  )
+elif [ "$kind" = inc2 ]; then
+  tri="--strategy two_ring_inc --shared-bufs 64 --shared-buf-size 1048576 --large-bufs 64 --large-buf-size 1048576 --promote-nonempty --bounded-acc"
+  configs=(
+    "inc_64x1m|--strategy shared_inc --shared-bufs 64 --shared-buf-size 1048576 --bounded-acc"
+    "tr_inc_ne_hold|$tri --promote-on-hold"
+    "tr_inc_ne|$tri"
   )
 elif [ "$kind" = plain2 ]; then
   # Promotion on IORING_CQE_F_SOCK_NONEMPTY: a full completion with data
@@ -41,6 +48,10 @@ cells=(
   "reqack-256|10000|--msg-size 256||0|"
   "mixed-r20000|1000|--msg-size 256 --rate 20000||16|$stream"
   "mixed-hold-r20000|1000|--msg-size 256 --rate 20000|--hold-first 16 --hold-us 10000|16|$stream"
+  # A RAM+disk tiered cache: a quarter of the connections hold each
+  # received range for 5 ms, as a request that misses to disk does.
+  "tiered-r20000|1000|--msg-size 4096 --rate 20000|--hold-every 4 --hold-us 5000|0|"
+  "tiered-mixed-r20000|1000|--msg-size 4096 --rate 20000|--hold-every 4 --hold-us 5000|16|$stream"
 )
 i=0
 for rep in $(seq 1 "$reps"); do
