@@ -125,7 +125,8 @@ pub fn run(args: &[String]) {
     // Give up if the client never connects, so a failed run cannot stall a
     // two-machine sequence.
     listener.set_nonblocking(true).expect("nonblocking listener");
-    let accept_deadline = Instant::now() + Duration::from_secs(60);
+    // The client connects one at a time; 50k connections take over a minute.
+    let accept_deadline = Instant::now() + Duration::from_secs(300);
     let mut streams = Vec::with_capacity(nconns);
     while streams.len() < nconns {
         match listener.accept() {
