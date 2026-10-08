@@ -642,8 +642,10 @@ multishot receive and re-arms on the other group.
 `01a11cfc-30d3-71a6-9833-8ac3e633db4f`). On 6.1 two groups (4096 × 64 KiB
 + 256 × 1 MiB) beat the 4096 × 64 KiB group on streaming (1216 against
 1030 MB/s) and cut request latency 4–5× with streamers present. 64 KiB
-request/response messages fill a 64 KiB buffer exactly, so 833 of those
-connections were promoted and stayed (0–2 demotions per run), starved the
+request/response messages fill a 64 KiB buffer exactly, so those
+connections were promoted and stayed: a median of 833 promotions and 0–2
+demotions per run, with a median of 831 connections in the large group at
+the end, starved the
 large group (147k `ENOBUFS`) and lost 5% throughput. On 6.12 two INC groups
 tied one on streaming, 1 MiB and 64 KiB request/ack and the control. In the
 mixed cells, p50 / p99 / p999 in ms:
@@ -717,12 +719,12 @@ Measured:
   across hosts.
 - The `SOCK_NONEMPTY` rule promoted no 64 KiB request/response connection
   on 6.1 or 6.12.
-- On 6.1, with streamers or slow handlers sharing a worker with
-  request/response traffic, two groups lowered request p50 and p99 in every
-  cell: 2.8× (mixed), 7–9× (streamers holding), 3.7–25× (tiered with
-  streamers), 15–21× (heavy-tailed, tiered with streamers). Without them,
-  two groups tied one, apart from the heavy-tailed tiered cell's p999 (5.2
-  against 6.6 ms in all three reps).
+- Before 6.12, in every cell with 16 streamers sharing the worker, two
+  groups cut request p50 and p99 by 2.8× to 25×: 2.8× (mixed), 7–9×
+  (streamers holding), 3.7–25× (tiered with streamers), 15–21×
+  (heavy-tailed, tiered with streamers). In cells without streamers they
+  tied one group, except p999 in the heavy-tailed tiered cell, which rose
+  from 5.2 to 6.6 ms in all three reps.
 - A cap on promoted connections was worse wherever more than 64 needed
   promoting.
 - Two groups were not run on 7.1, nor on any kernel between 6.2 and 6.11.
@@ -733,11 +735,14 @@ Inferred, not measured:
 - That the 6.1 gains come partly from fewer completions per byte, freeing
   the server's one CPU (97–100% utilised), not only from separating the
   buffers.
-- Anything about two groups on 6.12. The request-latency differences
-  between one and two groups there, in either direction, were within the
-  three-rep spread and changed sign between the first-rule run and the
-  `SOCK_NONEMPTY` run (mixed cell p50 5.8 → 10.0 ms in one, 8.1 → 4.5 ms in
-  the other; p999 54.5 → 19.9 ms in one, 37.8 → 54.5 ms in the other).
+- Anything about two groups on 6.12. Each difference between one and two
+  groups there was smaller than the rep-to-rep range of one of the two
+  configurations (three reps). The sign changed between the run with the
+  first promotion rule and the run with the `SOCK_NONEMPTY` rule (mixed
+  cell p50 5.8 → 10.0 ms in one, 8.1 → 4.5 ms in the other; p999
+  54.5 → 19.9 ms in one, 37.8 → 54.5 ms in the other). In the
+  `SOCK_NONEMPTY` run's mixed cell the per-rep p99s did not overlap (one
+  group 9.96, 13.6 and 28.3 ms; two groups 7.1, 7.6 and 9.4 ms).
 
 Caveats:
 
