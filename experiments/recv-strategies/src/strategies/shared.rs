@@ -20,10 +20,10 @@
 //! to the ring when the kernel is done with it and no hold remains.
 
 use crate::common::{BufRing, PAGE, PBUF_RING_INC, mmap_anon};
-use std::collections::VecDeque;
-use std::time::{Duration, Instant};
 use crate::server::{Ctx, Strategy, TAG_RECV, TAG_RECV_AUX, ud};
 use io_uring::{cqueue, opcode, types};
+use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
 const FALLBACK_SLOTS: usize = 32;
 
@@ -33,6 +33,13 @@ struct Conn {
     rearm: bool,
     fallback: Option<usize>,
     dead: bool,
+    /// When the connection last delivered bytes.
+    last_data: Option<Instant>,
+    /// The longest gap between two deliveries.
+    max_gap: Duration,
+    /// When the first `-ENOBUFS` since the last delivery arrived.
+    starved_at: Option<Instant>,
+    enobufs: u32,
 }
 
 pub struct Shared {
@@ -78,6 +85,8 @@ pub struct Shared {
     held_lends: u64,
     capped_copies: u64,
     pinned_peak: usize,
+    /// Time from a connection's first `-ENOBUFS` to its next delivery.
+    starve_waits: Vec<Duration>,
 }
 
 impl Shared {
@@ -102,7 +111,17 @@ impl Shared {
             backing: std::ptr::null_mut(),
             buf_off: vec![0; bufs],
             conns: (0..nconns)
-                .map(|_| Conn { acc: Vec::with_capacity(PAGE), head: 0, rearm: false, fallback: None, dead: false })
+                .map(|_| Conn {
+                    acc: Vec::with_capacity(PAGE),
+                    head: 0,
+                    rearm: false,
+                    fallback: None,
+                    dead: false,
+                    last_data: None,
+                    max_gap: Duration::ZERO,
+                    starved_at: None,
+                    enobufs: 0,
+                })
                 .collect(),
             fallback_chunk,
             fallback_mem: mmap_anon(FALLBACK_SLOTS * fallback_chunk),
@@ -129,6 +148,7 @@ impl Shared {
             held_lends: 0,
             capped_copies: 0,
             pinned_peak: 0,
+            starve_waits: Vec::new(),
         }
     }
 
@@ -140,7 +160,10 @@ impl Shared {
         self.exhausted[bid] = false;
         self.buf_off[bid] = 0;
         let addr = self.buffer(bid) as u64;
-        self.ring.as_mut().unwrap().push(addr, self.buf_size as u32, bid as u16);
+        self.ring
+            .as_mut()
+            .unwrap()
+            .push(addr, self.buf_size as u32, bid as u16);
     }
 
     /// Connection `c` keeps `data` (in buffer `bid`) lent for `hold`, or
@@ -246,6 +269,33 @@ impl Shared {
 
 /// The full size of the message starting at `buf` (header included), or 4
 /// while its header is incomplete.
+/// p50, p99 and max of `v` in milliseconds, as `p50/p99/max`.
+fn ms_quantiles(mut v: Vec<Duration>) -> String {
+    if v.is_empty() {
+        return "-".into();
+    }
+    v.sort_unstable();
+    let q = |p: f64| v[((v.len() - 1) as f64 * p).round() as usize].as_secs_f64() * 1e3;
+    format!("{:.1}/{:.1}/{:.1}", q(0.5), q(0.99), q(1.0))
+}
+
+impl Shared {
+    /// Per-connection stalls: the longest gap between deliveries, split by
+    /// whether the connection ever saw `-ENOBUFS`, and how long a starved
+    /// connection waited for its next delivery. Covers warmup too.
+    fn stall_report(&self) -> String {
+        let live = self.conns.iter().filter(|c| c.last_data.is_some());
+        let (hit, clean): (Vec<_>, Vec<_>) = live.partition(|c| c.enobufs > 0);
+        format!(
+            "enob_conns={} gap_enob_ms={} gap_clean_ms={} starve_wait_ms={}",
+            hit.len(),
+            ms_quantiles(hit.iter().map(|c| c.max_gap).collect()),
+            ms_quantiles(clean.iter().map(|c| c.max_gap).collect()),
+            ms_quantiles(self.starve_waits.clone()),
+        )
+    }
+}
+
 fn next_need(buf: &[u8]) -> usize {
     if buf.len() < 4 {
         return 4;
@@ -269,7 +319,12 @@ fn resident_kb(base: *mut u8, len: usize) -> usize {
 
 impl Strategy for Shared {
     fn name(&self) -> String {
-        format!("{}-{}x{}", if self.inc { "shared_inc" } else { "shared" }, self.bufs, self.buf_size)
+        format!(
+            "{}-{}x{}",
+            if self.inc { "shared_inc" } else { "shared" },
+            self.bufs,
+            self.buf_size
+        )
     }
 
     fn start(&mut self, cx: &mut Ctx) {
@@ -278,7 +333,13 @@ impl Strategy for Shared {
         if self.no_thp {
             // 4 KiB pages: a completion makes resident only the pages it
             // writes, rather than the 2 MiB huge page around them.
-            unsafe { libc::madvise(self.backing.cast(), self.bufs * self.buf_size, libc::MADV_NOHUGEPAGE) };
+            unsafe {
+                libc::madvise(
+                    self.backing.cast(),
+                    self.bufs * self.buf_size,
+                    libc::MADV_NOHUGEPAGE,
+                )
+            };
         }
         let flags = if self.inc { PBUF_RING_INC } else { 0 };
         unsafe {
@@ -298,13 +359,31 @@ impl Strategy for Shared {
     }
 
     fn on_recv(&mut self, cx: &mut Ctx, c: usize, tag: u64, extra: u32, res: i32, flags: u32) {
+        let now = Instant::now();
+        if res > 0 {
+            let conn = &mut self.conns[c];
+            if let Some(at) = conn.last_data {
+                conn.max_gap = conn.max_gap.max(now - at);
+            }
+            conn.last_data = Some(now);
+            if let Some(at) = conn.starved_at.take() {
+                self.starve_waits.push(now - at);
+            }
+        } else if res == -libc::ENOBUFS {
+            let conn = &mut self.conns[c];
+            conn.enobufs += 1;
+            conn.starved_at.get_or_insert(now);
+        }
         if tag == TAG_RECV_AUX {
             // A fallback recv into pool slot `extra`.
             let slot = extra as usize;
             self.conns[c].fallback = None;
             if res > 0 {
                 let data = unsafe {
-                    std::slice::from_raw_parts(self.fallback_mem.add(slot * self.fallback_chunk), res as usize)
+                    std::slice::from_raw_parts(
+                        self.fallback_mem.add(slot * self.fallback_chunk),
+                        res as usize,
+                    )
                 };
                 self.receive(cx, c, data);
                 self.conns[c].rearm = true;
@@ -317,7 +396,8 @@ impl Strategy for Shared {
         if res > 0 {
             let bid = cqueue::buffer_select(flags).expect("recv without a buffer") as usize;
             let off = if self.inc { self.buf_off[bid] } else { 0 };
-            let data = unsafe { std::slice::from_raw_parts(self.buffer(bid).add(off), res as usize) };
+            let data =
+                unsafe { std::slice::from_raw_parts(self.buffer(bid).add(off), res as usize) };
             self.receive(cx, c, data);
             self.hold_or_copy(c, bid, data);
             // The buffer goes back once the kernel is done with it and no
@@ -347,9 +427,10 @@ impl Strategy for Shared {
             if conn.head < conn.acc.len() && conn.fallback.is_none() {
                 if let Some(slot) = self.fallback_free.pop() {
                     let ptr = unsafe { self.fallback_mem.add(slot * self.fallback_chunk) };
-                    let sqe = opcode::Recv::new(types::Fd(cx.fds[c]), ptr, self.fallback_chunk as u32)
-                        .build()
-                        .user_data(ud(TAG_RECV_AUX, slot as u32, c));
+                    let sqe =
+                        opcode::Recv::new(types::Fd(cx.fds[c]), ptr, self.fallback_chunk as u32)
+                            .build()
+                            .user_data(ud(TAG_RECV_AUX, slot as u32, c));
                     cx.push(sqe);
                     self.conns[c].fallback = Some(slot);
                     self.fallbacks += 1;
@@ -405,7 +486,7 @@ impl Strategy for Shared {
 
     fn report(&self) -> String {
         format!(
-            "lent_bytes={} copied_bytes={} enobufs={} fallbacks={} rearms={} held_lends={} capped_copies={} pinned_peak={} ring_resident_kb={}",
+            "lent_bytes={} copied_bytes={} enobufs={} fallbacks={} rearms={} held_lends={} capped_copies={} pinned_peak={} ring_resident_kb={} {}",
             self.lent,
             self.copied,
             self.enobufs,
@@ -414,7 +495,8 @@ impl Strategy for Shared {
             self.held_lends,
             self.capped_copies,
             self.pinned_peak,
-            resident_kb(self.backing, self.bufs * self.buf_size)
+            resident_kb(self.backing, self.bufs * self.buf_size),
+            self.stall_report(),
         )
     }
 }
