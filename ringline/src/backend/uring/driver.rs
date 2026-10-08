@@ -927,7 +927,7 @@ impl Driver {
         region_rx: crate::region_registry::RegionControlRx,
     ) -> Result<Self, crate::error::Error> {
         config.validate()?;
-        let ring = Ring::setup(config)?;
+        let mut ring = Ring::setup(config)?;
 
         let fixed_buffers =
             FixedBufferRegistry::new(&config.registered_regions, config.max_registered_regions);

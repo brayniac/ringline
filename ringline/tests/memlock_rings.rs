@@ -119,9 +119,54 @@ fn register_pbuf(
         )
     };
     assert_ne!(addr, libc::MAP_FAILED, "mmap");
-    unsafe {
+    let standard = unsafe {
         ring.submitter()
             .register_buf_ring_with_flags(addr as u64, entries, bgid, 0)
+    };
+    match standard {
+        // Ubuntu's 6.8 kernels accept the registration only with `resv[0]`
+        // set (#626), as `Ring::register_buf_ring` handles.
+        Err(e) if e.raw_os_error() == Some(libc::EINVAL) && kernel_is_6_8() => {
+            register_pbuf_resv_set(ring, addr as u64, entries, bgid).map_err(|_| e)
+        }
+        other => other,
+    }
+}
+
+fn kernel_is_6_8() -> bool {
+    let mut uts: libc::utsname = unsafe { std::mem::zeroed() };
+    if unsafe { libc::uname(&mut uts) } != 0 {
+        return false;
+    }
+    let release = unsafe { std::ffi::CStr::from_ptr(uts.release.as_ptr()) };
+    release.to_string_lossy().starts_with("6.8.")
+}
+
+/// `IORING_REGISTER_PBUF_RING` with `resv[0] = 1`.
+fn register_pbuf_resv_set(
+    ring: &IoUring<squeue::Entry128, cqueue::Entry32>,
+    addr: u64,
+    entries: u16,
+    bgid: u16,
+) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // `struct io_uring_buf_reg`: ring_addr, ring_entries, bgid, flags, resv[3].
+    #[repr(C)]
+    struct BufReg(u64, u32, u16, u16, [u64; 3]);
+    let reg = BufReg(addr, u32::from(entries), bgid, 0, [1, 0, 0]);
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_io_uring_register,
+            ring.as_raw_fd(),
+            22 as libc::c_uint, // IORING_REGISTER_PBUF_RING
+            &reg as *const BufReg,
+            1,
+        )
+    };
+    if rc < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
     }
 }
 
