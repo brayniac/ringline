@@ -1,8 +1,10 @@
 # Incremental provided-buffer consumption (`IOU_PBUF_RING_INC`)
 
-- **Status:** open — design chosen, not built. **2026-10-07: GO on the
-  owner's decision, after the measurements in "2026-10: measurements".
-  Design: `docs/recv-incremental-ring-design.md` (#622).**
+- **Status:** open — design chosen, not built. **2026-10-08: owner's
+  decision, after "2026-10: measurements" and "2026-10: kernels, two rings,
+  tiered caches": two shared buffer groups per worker, on by default before
+  6.12 and off by default on 6.12+ until measured further. Design:
+  `docs/recv-incremental-ring-design.md` (#622).**
   Phase A (2026-09-17) had narrowed the case: see "What Phase A did to
   criterion 1".
 - **Span:** 2026-09-17 → (open) · follows #415 (282773b), #416 Phase A ·
@@ -556,9 +558,11 @@ connections. This section records those runs (2026-10-07 and 2026-10-08).
   a first `ENOBUFS` to the next delivery), a second-client mode for mixed
   cells (16 streamers connected first, their bytes counted apart), and
   fixed-rate request clients.
-- Two-host setup throughout: server VM on hv02, client VM on hv01, 4 ×
-  10 GbE bond. Three reps per cell, configurations interleaved; medians.
-  Statically linked binaries, so each guest image runs the same build.
+- Setups: the 6.12 stand-in and the Amazon Linux 2023 runs are loopback on
+  hv01 (the 6.12 stand-in also has a two-host run); every other run is
+  two-host, server VM on hv02 and client VM on hv01 over a 4 × 10 GbE bond.
+  Three reps per cell, configurations interleaved; medians. Statically
+  linked binaries, so each guest image runs the same build.
 
 ### Linux 6.12 as a stand-in for older kernels
 
@@ -638,10 +642,16 @@ multishot receive and re-arms on the other group.
 `01a11cfc-30d3-71a6-9833-8ac3e633db4f`). On 6.1 two groups (4096 × 64 KiB
 + 256 × 1 MiB) beat the 4096 × 64 KiB group on streaming (1216 against
 1030 MB/s) and cut request latency 4–5× with streamers present. 64 KiB
-request/response messages fill a 64 KiB buffer exactly, so those
-connections were promoted and demoted 833 times per run, starved the large
-group (147k `ENOBUFS`) and lost 5% throughput. On 6.12 two INC groups tied
-one on streaming, 1 MiB and 64 KiB request/ack and the control.
+request/response messages fill a 64 KiB buffer exactly, so 833 of those
+connections were promoted and stayed (0–2 demotions per run), starved the
+large group (147k `ENOBUFS`) and lost 5% throughput. On 6.12 two INC groups
+tied one on streaming, 1 MiB and 64 KiB request/ack and the control. In the
+mixed cells, p50 / p99 / p999 in ms:
+
+| 6.12 cell, first rule | INC 64 × 1 MiB | two INC groups |
+|---|---|---|
+| 1000 at 20k/s + 16 streamers | 5.8 / 8.9 / 54.5 | 10.0 / 16.8 / 19.9 |
+| same, streamers holding 10 ms | 6.0 / 9.4 / 54.5 | 4.5 / 7.6 / 54.5 |
 
 **`SOCK_NONEMPTY` rule**: a full completion counts only when it carries
 `IORING_CQE_F_SOCK_NONEMPTY` (6.12 `01a11d44-3a29-71f7-c1a9-244e24bdebd2`,
@@ -661,7 +671,7 @@ with a quarter of them holding each received range for 5 ms, alone and with
 | tiered | 1.4 / 1.8 / 2.8 | 1.4 / 1.8 / 2.4 | 1.4 / 1.8 / 2.6 |
 | tiered + 16 streamers | 319 / 436 / 453 | 13 / 117 / 151 | 403 / 570 / 570 |
 | 1 MiB × 64 request/ack, MB/s | 1320 | 1376 (613 promotions, 567 demotions) | 1276 |
-| peak RSS | 282 MB | about 580 MB | about 550 MB |
+| peak RSS, mixed cells | 282 MiB | 580–583 MiB | 543 MiB |
 
 6.12 (Debian 13):
 
@@ -672,7 +682,11 @@ with a quarter of them holding each received range for 5 ms, alone and with
 | same, streamers holding 10 ms | 7.9 / 12.1 / 54.5 | 5.0 / 8.1 / 54.5 | 6.8 / 11.5 / 54.5 |
 | tiered | 1.05 / 1.5 / 2.2 | 1.02 / 1.5 / 1.9 | 1.02 / 1.5 / 2.0 |
 | tiered + 16 streamers | 19.9 / 33.6 / 35.7 (237 `ENOBUFS`) | 8.9 / 14.7 / 16.3 (0) | 9.4 / 15.2 / 17.8 (0) |
-| peak RSS | 71 MB | 135 MB | 117–135 MB |
+| peak RSS, mixed cells | 71 MiB | 135 MiB | 117–135 MiB |
+
+In the 6.12 stream-mix cell a median of 88 of 1000 streaming connections
+ended in the large group, and the small group still returned 122k
+`ENOBUFS`.
 
 **Heavy-tailed request sizes**: 64 B to 1 MiB, about half 64 B and 0.5%
 1 MiB, mean about 12.5 KB, at 20k requests/s (6.12
@@ -687,7 +701,10 @@ with a quarter of them holding each received range for 5 ms, alone and with
 
 On 6.1 large requests promoted request/response connections: 649
 promotions and 358 demotions per run in the sizes cell, about 290 of 1000
-connections in the large group at the end.
+connections in the large group at the end. In the 6.1 64 KiB × 1000
+request/response cell, two groups saw 102,678–104,001 completions of
+64 KiB per run, none carrying `SOCK_NONEMPTY`, and promoted no connection;
+in stream-mix every full completion carried it.
 
 ### What was measured and what was inferred
 
@@ -698,20 +715,29 @@ Measured:
 - Among plain geometries on 6.1, 4096 × 64 KiB had the highest throughput
   at 10,000 connections and the lowest latency in the fixed-rate cell
   across hosts.
-- The `SOCK_NONEMPTY` rule promoted no 64 KiB request/response connection.
-- With streamers or slow handlers sharing a worker with request/response
-  traffic, two groups lowered request p50 and p99 on both kernels: 3–25×
-  on 6.1, by 15% to 2.2× on 6.12. Without them, two groups tied one.
+- The `SOCK_NONEMPTY` rule promoted no 64 KiB request/response connection
+  on 6.1 or 6.12.
+- On 6.1, with streamers or slow handlers sharing a worker with
+  request/response traffic, two groups lowered request p50 and p99 in every
+  cell: 2.8× (mixed), 7–9× (streamers holding), 3.7–25× (tiered with
+  streamers), 15–21× (heavy-tailed, tiered with streamers). Without them,
+  two groups tied one, apart from the heavy-tailed tiered cell's p999 (5.2
+  against 6.6 ms in all three reps).
 - A cap on promoted connections was worse wherever more than 64 needed
   promoting.
+- Two groups were not run on 7.1, nor on any kernel between 6.2 and 6.11.
+  Only one large-group size (256 × 1 MiB before 6.12) was run.
 
 Inferred, not measured:
 
 - That the 6.1 gains come partly from fewer completions per byte, freeing
   the server's one CPU (97–100% utilised), not only from separating the
   buffers.
-- That migration causes the higher 6.12 p999 in two streamer cells
-  (37.8 against 54.5 and 56.6 ms). Not timed yet.
+- Anything about two groups on 6.12. The request-latency differences
+  between one and two groups there, in either direction, were within the
+  three-rep spread and changed sign between the first-rule run and the
+  `SOCK_NONEMPTY` run (mixed cell p50 5.8 → 10.0 ms in one, 8.1 → 4.5 ms in
+  the other; p999 54.5 → 19.9 ms in one, 37.8 → 54.5 ms in the other).
 
 Caveats:
 
@@ -725,10 +751,12 @@ Caveats:
 
 ### Decision (owner, 2026-10-08)
 
-Two groups on every kernel: INC 64 × 1 MiB plus INC 64 × 1 MiB on 6.12+,
-plain 4096 × 64 KiB plus plain 256 × 1 MiB before 6.12, both plain groups
-with `MADV_NOHUGEPAGE`, and the bounded accumulator. Promotion on
-`SOCK_NONEMPTY` full completions and on held lends, with no cap. Demotion
-hysteresis and migration timing are measured next. This replaces the
-plain 1024 × 64 KiB recommendation and the per-connection hybrid follow-up
-above.
+Before 6.12: plain 4096 × 64 KiB plus plain 256 × 1 MiB, both with
+`MADV_NOHUGEPAGE`, two groups on by default. On 6.12+: INC 64 × 1 MiB, with
+the same two-group code and an INC 64 × 1 MiB large group off by default
+until the design's landing measurements (rate-limited streamers, A/A
+pairs) separate the effect. The bounded accumulator on both. Promotion on
+completions of at least 64 KiB carrying `SOCK_NONEMPTY`, and on held
+lends, with no cap. Demotion hysteresis and migration timing are measured
+next. This replaces the plain 1024 × 64 KiB recommendation and the
+per-connection hybrid follow-up above.
