@@ -3556,8 +3556,9 @@ impl Driver {
         }
 
         // 4. Unregister the provided buffer rings before Driver is dropped
-        // (which munmaps the ring memory). Without this, the kernel holds a
-        // dangling pointer to the freed mmap region.
+        // (which munmaps the ring memory). Unregistering releases the
+        // kernel's pin on the ring pages; the error and panic exits skip it,
+        // which is safe for the reason given at `Ring::register_buf_ring`.
         if self
             .ring
             .unregister_buf_ring(self.provided_bufs.bgid())

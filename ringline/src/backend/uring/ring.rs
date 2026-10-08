@@ -467,13 +467,18 @@ impl Ring {
             provided.bgid(),
         );
         // Safety (every registration in this function): `addr` is
-        // `provided`'s mmap'd ring, mapped at the call. `Driver::run_shutdown`
-        // unregisters each registered group before the rings are unmapped.
-        // `Driver`'s error and panic exits, and a failed unregister, unmap
-        // the rings without unregistering. That frees no memory the kernel
-        // reads: registration pins the ring's pages (`io_pin_pages` in
-        // `io_uring/kbuf.c` or `memmap.c`), and they are unpinned only when
-        // the group is torn down.
+        // `provided`'s mmap'd ring, mapped at the call. The `io-uring`
+        // crate's contract asks for it to stay mapped until the group is
+        // unregistered or the ring is dropped. `Driver::run_shutdown` meets
+        // that; `Driver`'s error and panic exits, and a failed unregister,
+        // unmap the ring first. That frees no memory the kernel reads:
+        // registration pins the ring's pages (`io_pin_pages`, called from
+        // `io_uring/kbuf.c` or `io_uring/memmap.c`), the kernel reads entries
+        // through its own mapping of them, and it unpins them only when the
+        // group is unregistered or the io_uring instance is freed. The
+        // buffers the entries point at (`buf_backing`) are a separate,
+        // unpinned allocation that the kernel writes through its user
+        // address; this does not cover them.
         let first = if self.pbuf_resv_set {
             unsafe { self.register_pbuf_resv_set(addr, entries, bgid) }
         } else {
