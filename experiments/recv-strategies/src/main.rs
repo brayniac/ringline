@@ -59,6 +59,7 @@ fn main() {
         Some("bytes-bench") => bytes_bench(&args),
         Some("inc-probe") => probe::inc_probe(),
         Some("ring-limit") => probe::ring_limit(),
+        Some("pbuf-variants") => probe::pbuf_variants(),
         _ => {
             eprintln!("usage: recv-strategies server|client|bytes-bench|inc-probe|ring-limit ...");
             std::process::exit(2);

@@ -1,0 +1,52 @@
+# Why IORING_REGISTER_PBUF_RING returns EINVAL on Ubuntu 24.04's 6.8
+# kernel (every run of recv-strategies-2host-xkernel failed there): try
+# the registration several ways, as the user and as root. One VM, short.
+name = "ringline pbuf registration probe on Ubuntu 24.04 (#622)"
+
+[params]
+bins_artifact = "SET_AT_SUBMIT"
+image         = "spool/images/ubuntu-24.04-base-20261008.1@golden"
+
+[[jobs]]
+name = "probe"
+tags = ["z2.baremetal"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "start"
+shape = "z2.c"
+image = "{image}"
+gpu = false
+boot_timeout = 600
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "exec"
+payload_timeout = 900
+upload = true
+artifacts = ["/home/anvil/probe.log"]
+inputs = [{ artifact = "{bins_artifact}", name = "recv-bins.tgz", dest = "/home/anvil" }]
+payload = '''
+set -uo pipefail
+cd /home/anvil && tar xzf recv-bins.tgz && chmod +x out/*
+B=/home/anvil/out/recv-strategies-static
+{
+  uname -a
+  cat /etc/os-release | head -3
+  echo "io_uring_disabled=$(cat /proc/sys/kernel/io_uring_disabled 2>/dev/null || echo absent)"
+  echo "io_uring_group=$(cat /proc/sys/kernel/io_uring_group 2>/dev/null || echo absent)"
+  echo "memlock=$(ulimit -l)"
+  grep -i -E 'io_uring|seccomp|apparmor' /proc/self/status
+  echo "== user"; $B pbuf-variants
+  echo "== root"; sudo $B pbuf-variants
+  echo "== root, memlock unlimited"; sudo prlimit --memlock=unlimited:unlimited $B pbuf-variants
+  sudo dmesg | grep -i -E 'io_uring|kbuf|pbuf' | tail -20
+  command -v strace && strace -f -e trace=io_uring_register,io_uring_setup $B pbuf-variants 2>&1 | head -40
+} 2>&1 | tee /home/anvil/probe.log
+exit 0
+'''
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "stop"
+upload = true

@@ -249,3 +249,107 @@ pub fn ring_limit() {
         err
     );
 }
+
+/// `pbuf-variants`: try `IORING_REGISTER_PBUF_RING` several ways, by raw
+/// syscall, and print the errno of each, to find what a kernel rejects.
+pub fn pbuf_variants() {
+    #[repr(C)]
+    struct BufReg {
+        ring_addr: u64,
+        ring_entries: u32,
+        bgid: u16,
+        flags: u16,
+        resv: [u64; 3],
+    }
+    const REGISTER_PBUF_RING: libc::c_uint = 22;
+    const REGISTER_BUFFERS: libc::c_uint = 0;
+    fn reg(fd: i32, addr: u64, entries: u32, bgid: u16, flags: u16) -> String {
+        let r = BufReg {
+            ring_addr: addr,
+            ring_entries: entries,
+            bgid,
+            flags,
+            resv: [0; 3],
+        };
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_io_uring_register,
+                fd,
+                REGISTER_PBUF_RING,
+                &r as *const BufReg,
+                1,
+            )
+        };
+        if rc < 0 {
+            format!("err={}", std::io::Error::last_os_error())
+        } else {
+            "ok".into()
+        }
+    }
+    let rings: [(&str, fn() -> IoUring); 2] = [
+        ("default", || IoUring::new(64).expect("setup")),
+        ("defer", uring),
+    ];
+    for (setup, mk) in rings {
+        for entries in [1u32, 8, 256, 4096] {
+            let u = mk();
+            let mem = mmap_anon((entries as usize * 16).max(PAGE));
+            println!(
+                "PBUF setup={setup} mem=mmap entries={entries} flags=0 {}",
+                reg(u.as_raw_fd(), mem as u64, entries, 0, 0)
+            );
+        }
+        let u = mk();
+        let mut v: *mut libc::c_void = std::ptr::null_mut();
+        unsafe { libc::posix_memalign(&mut v, PAGE, PAGE) };
+        println!(
+            "PBUF setup={setup} mem=heap entries=8 flags=0 {}",
+            reg(u.as_raw_fd(), v as u64, 8, 0, 0)
+        );
+        let u = mk();
+        println!(
+            "PBUF setup={setup} mem=kernel entries=8 flags=MMAP {}",
+            reg(u.as_raw_fd(), 0, 8, 0, 1)
+        );
+        let u = mk();
+        let mem = mmap_anon(PAGE);
+        println!(
+            "PBUF setup={setup} mem=mmap entries=8 bgid=7 {}",
+            reg(u.as_raw_fd(), mem as u64, 8, 7, 0)
+        );
+        // Fixed buffers, as a control for registration in general.
+        let u = mk();
+        let buf = mmap_anon(PAGE);
+        let iov = libc::iovec {
+            iov_base: buf.cast(),
+            iov_len: PAGE,
+        };
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_io_uring_register,
+                u.as_raw_fd(),
+                REGISTER_BUFFERS,
+                &iov,
+                1,
+            )
+        };
+        println!(
+            "PBUF setup={setup} register_buffers {}",
+            if rc < 0 {
+                format!("err={}", std::io::Error::last_os_error())
+            } else {
+                "ok".into()
+            }
+        );
+    }
+    // Legacy provided buffers, as a control.
+    let mut u = uring();
+    let mem = mmap_anon(8 * PAGE);
+    let sqe = opcode::ProvideBuffers::new(mem, PAGE as i32, 8, 3, 0)
+        .build()
+        .user_data(9);
+    unsafe { u.submission().push(&sqe).unwrap() };
+    u.submit_and_wait(1).unwrap();
+    let res = u.completion().next().map(|c| c.result());
+    println!("PBUF provide_buffers res={res:?}");
+}
