@@ -387,7 +387,7 @@ each SQE is one `write`, and each queued send waits for the previous one's
 completion. Merging consecutive copy sends on a connection into one
 `SendMsgCoalesced`, with each send's completion accounted from the total,
 removes the regression on the emulator and cuts SQEs on io_uring. That is a
-driver change with its own issue, and it lands before the mio backend is
+driver change, tracked in #628, and it lands before the mio backend is
 retired (step 7).
 
 ### Measuring the counts
@@ -462,7 +462,8 @@ Each step is a separate PR. Steps 1–6 keep both backends working.
    available on every platform, and the `#[cfg(has_io_uring)]` gates on
    public items are removed.
 7. **Retire the mio backend** once the emulator passes everything the
-   mio backend passes. `force-mio` becomes the switch that selects the
+   mio backend passes and #628 has landed, so pipelined responses cost
+   the emulator no more syscalls than mio. `force-mio` becomes the switch that selects the
    emulator on Linux.
 
 ## Questions for the owner
