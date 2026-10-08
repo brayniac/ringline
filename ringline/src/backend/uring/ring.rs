@@ -467,8 +467,8 @@ impl Ring {
             provided.bgid(),
         );
         // Safety (every registration in this function): `addr` is
-        // `provided`'s mmap'd ring; the driver keeps it mapped until
-        // `unregister_buf_ring`.
+        // `provided`'s mmap'd ring. The caller keeps it mapped while the group
+        // is registered; `Driver` unregisters both groups in `run_shutdown`.
         let first = if self.pbuf_resv_set {
             unsafe { self.register_pbuf_resv_set(addr, entries, bgid) }
         } else {
@@ -1741,9 +1741,10 @@ mod tests {
     /// standard form is used throughout.
     #[test]
     fn provided_rings_register_and_unregister() {
-        let mut ring = ring_with(None);
+        // Declared before the ring, so they are unmapped after it drops.
         let tcp = ProvidedBufRing::new(5, 8, 4096).expect("tcp ring");
         let udp = ProvidedBufRing::new(6, 8, 4096).expect("udp ring");
+        let mut ring = ring_with(None);
         ring.register_buf_ring(&tcp).expect("register tcp ring");
         ring.register_buf_ring(&udp).expect("register udp ring");
         if KernelVersion::current() != Some(PBUF_RESV_INVERTED_ON) {
@@ -1765,7 +1766,9 @@ mod tests {
     /// registration with `resv[0]` set is refused. A correct kernel refuses a
     /// nonzero word in any slot, so this cannot tell which slot `resv0` is
     /// written to; the size assertion on `BufReg` and its field order cover
-    /// that.
+    /// that. Unregistration is checked in the same form as registration,
+    /// which is stricter than `unregister_buf_ring`'s fallback; Ubuntu
+    /// 6.8.0-142 accepts `resv[0]` set for both.
     #[test]
     fn raw_pbuf_registration_round_trips() {
         // Declared before the ring, so it is unmapped after the ring drops.
