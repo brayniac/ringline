@@ -4,7 +4,7 @@
 name = "ringline recv plain-ring depth on 6.12 2-host (#622)"
 
 [params]
-bins_artifact = "01a11962-d3d2-7340-a27f-dea283693597"
+bins_artifact = "01a11ab1-6e60-73eb-e5af-fbc80f2ffee7"
 image     = "spool/images/debian-13-base-20260912.1@golden"
 server_ip = "172.31.0.1"
 client_ip = "172.31.0.2"
