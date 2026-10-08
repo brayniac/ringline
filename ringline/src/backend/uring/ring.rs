@@ -470,7 +470,8 @@ impl Ring {
         // `provided`'s mmap'd ring, mapped at the call. The caller must keep
         // it mapped while the group is registered. `Driver` does so on the
         // path through `run_shutdown`, which unregisters both groups; its
-        // error and panic exits unmap the rings with the groups registered.
+        // error and panic exits unmap the rings without unregistering the
+        // groups.
         let first = if self.pbuf_resv_set {
             unsafe { self.register_pbuf_resv_set(addr, entries, bgid) }
         } else {
