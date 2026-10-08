@@ -34,6 +34,11 @@ pub fn build(name: &str, args: &[String], nconns: usize, sqpoll: bool) -> Box<dy
                         )),
                         max: arg(args, "--max-promoted", Some(0)),
                         nonempty: flag(args, "--promote-nonempty"),
+                        demote_quiet: std::time::Duration::from_millis(arg(
+                            args,
+                            "--demote-quiet-ms",
+                            Some(0),
+                        )),
                     },
                 )
             });

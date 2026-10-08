@@ -59,6 +59,13 @@ struct Conn {
     max_gap: Duration,
     /// The gap before the latest delivery.
     last_gap: Option<Duration>,
+    /// When the connection last delivered a completion that counted toward
+    /// promotion.
+    last_stream: Option<Instant>,
+    /// When the connection's target group last changed, until it is armed
+    /// on that group (`armed_at`) and delivers there (`moving`).
+    moving: Option<Instant>,
+    moved_armed: bool,
     /// When the first `-ENOBUFS` since the last delivery arrived.
     starved_at: Option<Instant>,
     enobufs: u32,
@@ -175,6 +182,9 @@ pub struct Promote {
     /// `--max-promoted`: the most connections in the large group at once;
     /// 0 for no limit.
     pub max: usize,
+    /// `--demote-quiet-ms`: demote only once this long has passed since the
+    /// connection's last streaming completion; 0 for no quiet period.
+    pub demote_quiet: Duration,
     /// `--promote-nonempty`: a full completion counts toward promotion only
     /// if the kernel reports more data queued on the socket
     /// (`IORING_CQE_F_SOCK_NONEMPTY`).
@@ -203,6 +213,11 @@ pub struct Shared {
     /// `IORING_CQE_F_SOCK_NONEMPTY`.
     full_completions: u64,
     full_nonempty: u64,
+    /// Arms that moved a connection to another group, and per move the time
+    /// from the decision to the re-arm and to the first delivery after it.
+    migrations: u64,
+    migrate_arm: Vec<Duration>,
+    migrate_data: Vec<Duration>,
     hold_every: usize,
     hold_first: usize,
     hold: Duration,
@@ -263,6 +278,9 @@ impl Shared {
                     last_data: None,
                     max_gap: Duration::ZERO,
                     last_gap: None,
+                    last_stream: None,
+                    moving: None,
+                    moved_armed: false,
                     starved_at: None,
                     enobufs: 0,
                 })
@@ -279,6 +297,9 @@ impl Shared {
             promoted: 0,
             full_completions: 0,
             full_nonempty: 0,
+            migrations: 0,
+            migrate_arm: Vec::new(),
+            migrate_data: Vec::new(),
             hold_every,
             hold_first,
             no_thp,
@@ -328,11 +349,14 @@ impl Shared {
     fn classify(&mut self, c: usize, res: usize, nonempty: bool) {
         let Some(p) = &self.promote else { return };
         let (bytes, after, demote_after, gap) = (p.bytes, p.after, p.demote_after, p.gap);
+        let quiet = p.demote_quiet;
+        let now = Instant::now();
         let need_nonempty = p.nonempty;
         let holder = self.holder(c) && p.on_hold;
         let conn = &mut self.conns[c];
         let close = gap.is_zero() || conn.last_gap.is_some_and(|g| g <= gap);
         if res >= bytes && close && (nonempty || !need_nonempty) {
+            conn.last_stream = Some(now);
             conn.full_run += 1;
             conn.small_run = 0;
             if conn.full_run >= after {
@@ -341,7 +365,8 @@ impl Shared {
         } else {
             conn.small_run += 1;
             conn.full_run = 0;
-            if conn.small_run >= demote_after && !holder {
+            let quiet_enough = conn.last_stream.is_none_or(|at| now - at >= quiet);
+            if conn.small_run >= demote_after && quiet_enough && !holder {
                 self.retarget(c, 0);
             }
         }
@@ -364,6 +389,13 @@ impl Shared {
         conn.target = g;
         conn.full_run = 0;
         conn.small_run = 0;
+        // A move back before the first one was armed cancels the timing.
+        conn.moving = if g != conn.group {
+            Some(Instant::now())
+        } else {
+            None
+        };
+        conn.moved_armed = false;
         if g == 1 {
             self.promotions += 1;
         } else {
@@ -373,6 +405,13 @@ impl Shared {
 
     fn arm(&mut self, cx: &mut Ctx, c: usize) {
         let g = self.conns[c].target;
+        if self.conns[c].group != g {
+            self.migrations += 1;
+            if let Some(at) = self.conns[c].moving {
+                self.migrate_arm.push(at.elapsed());
+                self.conns[c].moved_armed = true;
+            }
+        }
         self.conns[c].group = g;
         // `recv_len` caps how many bytes one completion takes (0: the whole
         // buffer), which bounds how far a connection's accumulator grows.
@@ -446,6 +485,16 @@ impl Shared {
             conn.head = 0;
         }
     }
+}
+
+/// p50, p99 and max of `v` in microseconds, as `p50/p99/max`.
+fn us_quantiles(mut v: Vec<Duration>) -> String {
+    if v.is_empty() {
+        return "-".into();
+    }
+    v.sort_unstable();
+    let q = |p: f64| v[((v.len() - 1) as f64 * p).round() as usize].as_secs_f64() * 1e6;
+    format!("{:.0}/{:.0}/{:.0}", q(0.5), q(0.99), q(1.0))
 }
 
 /// p50, p99 and max of `v` in milliseconds, as `p50/p99/max`.
@@ -561,6 +610,12 @@ impl Strategy for Shared {
         // The group this recv was armed on; a completion that arrives after
         // its connection moved still names the buffer of the old group.
         let g = extra as usize;
+        if res > 0 && self.conns[c].moved_armed && g == self.conns[c].target {
+            if let Some(at) = self.conns[c].moving.take() {
+                self.migrate_data.push(at.elapsed());
+            }
+            self.conns[c].moved_armed = false;
+        }
         let more = cqueue::more(flags);
         if !more {
             self.conns[c].cancelling = false;
@@ -703,7 +758,7 @@ impl Strategy for Shared {
         );
         if let Some(l) = self.groups.get(1) {
             s += &format!(
-                " small_enobufs={} large_enobufs={} large_pinned_peak={} large_resident_kb={} promotions={} demotions={} large_conns={} full={} full_nonempty={}",
+                " small_enobufs={} large_enobufs={} large_pinned_peak={} large_resident_kb={} promotions={} demotions={} large_conns={} full={} full_nonempty={} migrations={} migrate_arm_us={} migrate_data_us={}",
                 g0.enobufs,
                 l.enobufs,
                 l.pinned_peak,
@@ -713,6 +768,9 @@ impl Strategy for Shared {
                 self.conns.iter().filter(|c| c.group == 1).count(),
                 self.full_completions,
                 self.full_nonempty,
+                self.migrations,
+                us_quantiles(self.migrate_arm.clone()),
+                us_quantiles(self.migrate_data.clone()),
             );
         }
         s

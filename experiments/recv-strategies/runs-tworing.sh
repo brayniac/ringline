@@ -16,6 +16,12 @@ kind=${2:-plain}
 # cells instead.
 cellset=default
 case "$kind" in *2m) cellset=sizes; kind=${kind%m} ;; esac
+# inc3 / plain3: the streamer cells only, with and without a 1 s quiet
+# period before demotion, to time migrations.
+case "$kind" in
+  inc3) cellset=streamers; kind=inc2; quiet=1 ;;
+  plain3) cellset=streamers; kind=plain2; quiet=1 ;;
+esac
 if [ "$kind" = inc ]; then
   configs=(
     "inc_64x1m|--strategy shared_inc --shared-bufs 64 --shared-buf-size 1048576 --bounded-acc"
@@ -60,6 +66,18 @@ cells=(
 # Get/set-like request sizes, heavy-tailed: about half 64 B, 0.5% 1 MiB,
 # mean about 12.5 KB.
 sizes="--mix 64:500,256:200,1024:120,4096:80,16384:50,65536:30,262144:15,1048576:5"
+if [ "${quiet:-0}" = 1 ]; then
+  # Replace the third config with the second plus a demotion quiet period.
+  configs[2]="${configs[1]%%|*}_q1000|${configs[1]#*|} --demote-quiet-ms 1000"
+fi
+if [ "$cellset" = streamers ]; then
+  cells=(
+    "mixed-r20000|1000|--msg-size 256 --rate 20000||16|$stream"
+    "mixed-hold-r20000|1000|--msg-size 256 --rate 20000|--hold-first 16 --hold-us 10000|16|$stream"
+    "tiered-mixed-r20000|1000|--msg-size 4096 --rate 20000|--hold-every 4 --hold-us 5000|16|$stream"
+    "sizes-tiered-mixed-r20000|1000|$sizes --rate 20000|--hold-every 4 --hold-us 5000|16|$stream"
+  )
+fi
 if [ "$cellset" = sizes ]; then
   cells=(
     "sizes-r20000|1000|$sizes --rate 20000||0|"
