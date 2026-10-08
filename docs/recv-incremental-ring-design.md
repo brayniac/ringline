@@ -302,8 +302,8 @@ resolves at EOF. With `NeedAtLeast(n)` it moves up to the new target,
 keeping the rest held at its new offset, or all of them if that would
 move none (`NeedAtLeast(0)`); otherwise it moves all of them. On the
 second consecutive re-run it moves all of them, so a parser returning
-small lower bounds costs at most two extra parses. The future parks or
-resolves only when nothing is held. A parse of a held buffer through the
+small lower bounds costs at most two extra parses. The future parks, or
+resolves at EOF, only when nothing is held. A parse of a held buffer through the
 fast path (accumulator empty) that does not complete flushes the held
 buffer into the accumulator and parses again, as today.
 
@@ -337,7 +337,9 @@ while the accumulator is empty and the held buffer is the older data:
 - `WithDataFuture` parses the accumulator before the held buffer, instead
   of prepending the held buffer to the accumulator (`runtime/io.rs`,
   `accumulators.prepend`). The held rest is parsed by the next `with_data`
-  call through the fast path, once the accumulator is empty.
+  call through the fast path, once the accumulator is empty. After the
+  fast path returns `Consumed(k)`, the rest stays held at offset + k
+  instead of being copied into the accumulator, as it is today.
 
 A hold at an offset needs the data-address changes in "Changes in the
 driver" (`PendingRecvBuf`'s pointer and `handle_send_recv_buf`'s short-send
@@ -352,26 +354,47 @@ so the bound would save no copy and no accumulator memory for
 the workspace, parses with `with_bytes`.
 
 Decision (owner, 2026-10-08): `with_bytes` hands out `Bytes` views over
-held provided buffers. A value that lies inside one held buffer is a view:
-zero copies, and the view keeps its buffer held until it is dropped, as a
-hold under the lend cap. A value split across completions or buffers is
-copied into the accumulator, bounded as above, and viewed from there.
+held provided buffers. When the accumulator is empty and a buffer is held,
+`WithBytesFuture` hands the parser a view over the held rest. After
+`Consumed(k)` the rest stays held at offset + k, as a hold, and is not
+copied. Values the parser slices from that view are views; each keeps its
+buffer held until it is dropped (Buffer state rule 4), under the lend cap.
+A parse over the accumulator yields slices of the accumulator, as today.
+Whether a value is a view therefore depends on whether the accumulator was
+empty when its parse began. Bytes moved into the accumulator by the re-run
+rule above are copied.
 
-A view can be dropped on any thread. Its release goes through the worker's
-cross-thread inbox, which carries task indices today and gains a message
-kind for it. Ring memory stays mapped until the last view into it is
-dropped, including after the worker exits.
+Buffer memory moves out of `ProvidedBufRing` into a reference-counted
+allocation that every view also holds. Only the entry array is mmap'd;
+the buffers are a `Vec` today (`provided.rs`). The worker's drop releases
+its reference, and the last view to drop frees the memory. A view can be
+dropped on any thread; its release goes through the worker's cross-thread
+inbox, which carries task indices today and gains a message kind for it.
+A release sent after the worker exits finds no inbox and is dropped.
 
 A view the caller keeps pins its whole buffer: a 1 MiB buffer on an INC
 ring, shared with other connections' data, for a value of any size. With
 64 buffers per group, about 32 kept views on distinct buffers reach the
 lend cap; from then on arrivals are copied, and the group has fewer
 buffers to refill from until the views are dropped. A client that hands
-values to an application cache can do this. Proposed (author): values
-below a threshold are copied into an owned `Bytes`, which copies the value
-only, not the completion; values at or above it are views. The threshold
-is measured as `send_zc_threshold` was, and a metric counts buffers
-pinned by views.
+values to an application cache can do this.
+
+Decision (owner, 2026-10-08): a receive threshold, `recv_zc_threshold`,
+mirrors `send_zc_threshold`. The runtime hands the parser one `Bytes` and
+never sees individual values, so the threshold is applied where values
+are known:
+
+- `ConfigBuilder::recv_zc_threshold(bytes)` sets the runtime default.
+- A ringline helper takes a `Bytes` returned from a `with_bytes` parse and
+  returns it unchanged if it is not a view or is at least the threshold,
+  and an owned copy otherwise. It tells a view from an accumulator slice,
+  so values parsed from the accumulator stay zero-copy, as they are today.
+- The client crates (ringline-redis, ringline-memcache) apply the helper
+  to the values they return, with a client-level `recv_zc_threshold`
+  override, as the send-side `zc_threshold` already works.
+
+The default is measured as `send_zc_threshold` was. A metric counts
+buffers held by views.
 
 In the benchmark's streaming cells it cut process RSS from 2.3 GiB to 262
 MiB (INC 64 × 1 MiB, hv01); with a 1 GiB plain ring RSS only halved, from
@@ -588,8 +611,9 @@ Kept: `buffer_ring_empty`, `recv_parked`, `recv_fallback`,
 `forward_throttled`. New, per group where it applies: buffers out of the
 ring, buffers held by lends, lends refused by the lend cap, `ENOBUFS`,
 promotions, demotions, connections in the large group, the time from a
-move's decision to the connection's first delivery on its new group, and
-the ring kind in use.
+move's decision to the connection's first delivery on its new group,
+buffers held by `with_bytes` views, values copied by the
+`recv_zc_threshold` helper, and the ring kind in use.
 
 ## Not measured
 
@@ -623,16 +647,18 @@ the ring kind in use.
    `RECVMSG` on an INC ring; run on CI and as SystemsLab experiments on
    6.1, 6.8, 6.12 and 7.1. Settle the 6.12.y minimum or keep a probe.
 1. Bounded accumulator: the target length from `NeedAtLeast` and the
-   sites that clear it (reset, close, `ConnStream` reads, `take_frozen`,
-   `settle_forward_end`), the hold of a completion's rest while the
+   sites that clear it (reset, close, `ConnStream` reads, the segmented
+   entry's `take_frozen`, `settle_forward_end`), the hold of a completion's rest while the
    accumulator is non-empty, the flush of a held buffer before any append,
    `WithDataFuture` parsing the accumulator before the held buffer, and
    the move of held bytes into the accumulator, with a re-parse, before
    the future parks or resolves. It needs the data-address changes to
    `PendingRecvBuf` and `handle_send_recv_buf` from step 3; land those
    here. `with_bytes` views over held buffers (see "`with_bytes`"), with
-   the view threshold and the pinned-buffer metric, are a step of their
-   own after this one.
+   `recv_zc_threshold`, its helper, the client crates' use of it and the
+   view metric, are a step of their own after step 2, since a view is a
+   hold (Buffer state rule 4). That step also gives `WithBytesFuture` the
+   fast path and the accumulator-first parse order.
 2. Buffer state (`written`, `exhausted`, `holds`) with the ring registered
    plain. Every completion exhausts its buffer at offset 0, so behaviour is
    unchanged; the per-path single-release checks become holds. The existing
