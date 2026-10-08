@@ -184,7 +184,7 @@ pub(crate) trait Engine {
     // Registration.
     fn register_files_sparse(&mut self, n: u32) -> io::Result<()>;
     fn register_files_update(&mut self, slot: u32, fds: &[RawFd]) -> io::Result<()>;
-    fn register_buf_ring(&mut self, ring: &ProvidedBufRing, bgid: u16) -> io::Result<()>;
+    fn register_buf_ring(&mut self, ring: &ProvidedBufRing, bgid: u16, kind: RingKind) -> io::Result<()>;
     fn unregister_buf_ring(&mut self, bgid: u16) -> io::Result<()>;
     fn register_buffers(&mut self, regions: &[libc::iovec]) -> io::Result<()>;
     fn register_buffers_update_one(&mut self, idx: u32, region: libc::iovec) -> io::Result<()>;
@@ -192,6 +192,7 @@ pub(crate) trait Engine {
     // Capabilities.
     fn close_lead(&self) -> CloseLead;
     fn supports_park(&self) -> bool;
+    fn incremental_buffers(&self) -> bool;
 
     // Test hooks.
     #[cfg(test)]
@@ -201,7 +202,8 @@ pub(crate) trait Engine {
 }
 ```
 
-`Ring` becomes `UringEngine`, and both CQ readers go through `reap`.
+`RingKind` is `Plain` or `Incremental` (`IOU_PBUF_RING_INC`); see "Receive
+under the shared-ring design". `Ring` becomes `UringEngine`, and both CQ readers go through `reap`.
 
 The engine is chosen at compile time: `has_io_uring` selects
 `UringEngine`, and anything else `EmulatedEngine`. A choice at launch is
@@ -289,14 +291,14 @@ conformance tests confirm against the real ring first.
 
 | OpTag(s) | Opcode | Emulation | |
 |---|---|---|---|
-| RecvMulti | RECV multishot, buffer select | Try at arm, then on each readable edge: take a buffer id, `read` into it, post `(res, F_BUFFER\|bid<<16\|F_MORE)`, and repeat until `EAGAIN` or a per-pass cap *(verify the kernel's cap)*, so one fast sender cannot empty the shared ring. A read that returns `0`, `EAGAIN` or an error puts the id back at the ring head, and its CQE carries no `F_BUFFER`. No buffer: post `-ENOBUFS` without `F_MORE` (the arm ends; the driver re-arms on replenish, Domain Invariant 6). EOF: post `0` without `F_MORE`. Other errors: `-errno` without `F_MORE`. | C |
+| RecvMulti, RecvMultiLarge | RECV multishot, buffer select | Try at arm, then on each readable edge: take buffer space from the arm's group, `read` into it, and repeat until `EAGAIN` or a per-pass cap *(verify the kernel's cap)*, so one fast sender cannot empty a shared group. On a plain group a read takes the head buffer whole and posts `(res, F_BUFFER\|bid<<16\|F_MORE)`. On an incremental group it reads into the head buffer at its current offset, posts `F_BUF_MORE` while the buffer has space left, and moves to the next buffer when it is used up. Each CQE is held until the next read of the same pass returns: if that read returned data, the held CQE gets `IORING_CQE_F_SOCK_NONEMPTY`; if it returned `EAGAIN`, it does not. When the pass stops at the cap, one `ioctl(FIONREAD)` decides the flag. A read that returns `0`, `EAGAIN` or an error puts the space back, and its CQE carries no `F_BUFFER`. No buffer: post `-ENOBUFS` without `F_MORE` (the arm ends; the driver re-arms on replenish, Domain Invariant 6). EOF: post `0` without `F_MORE`. Other errors: `-errno` without `F_MORE`. | C |
 | RecvMsgMultiTs, RecvMsgUdp | RECVMSG multishot | As RecvMulti, and write the `io_uring_recvmsg_out` header, name and control data into the buffer in the kernel's layout so `RecvMsgOut::parse` (or its replacement) reads it. On Linux the control data is what `recvmsg` returns (`SCM_TIMESTAMPING`, `UDP_GRO`). Off Linux: timestamps come from `SO_TIMESTAMP` and are written as a software `SCM_TIMESTAMPING` entry (there are no hardware timestamps); there is no GRO, so each completion carries one datagram and no segment-size control message, which the driver already reads as a single datagram. | C, P |
 | RecvUdp | RECV multishot | As RecvMulti on a UDP socket. | B |
 | RecvFallback | RECV one-shot into a pool slot | Try at submit, then on readable; one CQE. | A |
 | Send, TlsSend, SendRecvBuf, *Drain | SEND, `MSG_WAITALL` | `write` until all bytes are sent, waiting for writable in between. Post the total, or, on an error, the bytes written before it if any *(verify)*, otherwise `-errno`. | B |
 | SendMsgCoalesced, SendRecvBufsCoalesced | SENDMSG, `MSG_WAITALL` | `writev` the iovecs with the same rule. The emulator need not reproduce `-EAGAIN` after a peer's half-close (#603); the driver's drain path is correct either way. | B |
 | ForwardWrite | SENDMSG to a socket; WRITEV to a regular file | Socket sink: as SendMsgCoalesced. File sink: readiness does not apply to regular files, so the `pwritev` runs on the disk-I/O pool. | B |
-| SendMsgZc | SENDMSG_ZC (no `MSG_WAITALL`) | One `writev` attempt per readable-to-writable cycle, posting a short count when that is all the socket took, as the kernel can *(verify)*. Then post the operation CQE with `F_MORE` and a separate `F_NOTIF` CQE in the same reap. A notification follows exactly when `F_MORE` is set, including on error and zero-length results (#487). The data is copied, as on mio today. | C |
+| SendMsgZc | SENDMSG_ZC (no `MSG_WAITALL`) | One `writev` attempt per readable-to-writable cycle, posting a short count when that is all the socket took, as the kernel can *(verify)*. Then post the operation CQE with `F_MORE` and a separate `F_NOTIF` CQE in the same reap. A notification follows exactly when `F_MORE` is set, including on error and zero-length results (#487). The `writev` reads the guard's memory in place; the kernel copies it into the socket buffer, so the send is not zero-copy, but ringline makes no copy of its own. | C |
 | SendPollOut | POLL_ADD POLLOUT | Check writability at submit; otherwise post on the writable edge. | A |
 | Connect | CONNECT | Nonblocking `connect`, then `SO_ERROR` on writable, as the mio backend does today. | A |
 | Shutdown, CloseShutdown | SHUTDOWN | `shutdown(2)` on the op's fd. | A |
@@ -314,6 +316,96 @@ conformance tests confirm against the real ring first.
 The ring setup flags have no counterpart in the emulator: `COOP_TASKRUN`,
 `SINGLE_ISSUER`, `DEFER_TASKRUN`, SQPOLL and the io-wq worker cap. The
 completion-timing rules above are what the driver observes of them.
+
+## Receive under the shared-ring design
+
+`docs/recv-incremental-ring-design.md` (#622) sets how the driver receives
+TCP data: one or two shared buffer groups per worker, incremental
+consumption (`IOU_PBUF_RING_INC`) where the kernel has it, a bounded
+accumulator, and promotion of streaming or holding connections to a group
+of 1 MiB buffers. This section maps that onto both engines and counts what
+each one costs per request.
+
+### What the driver asks of the engine
+
+| Need | `UringEngine` | `EmulatedEngine` |
+|---|---|---|
+| Register a group as incremental or plain (`RingKind`) | `IORING_REGISTER_PBUF_RING` with or without `IOU_PBUF_RING_INC`. An `EINVAL` on the incremental form means the kernel lacks it; the engine reports that and the driver registers plain rings. The Ubuntu 6.8 reserved-word retry (#626) stays inside the engine. | Both kinds, in userspace. |
+| `incremental_buffers()` | Whether the incremental registration succeeded. | `true`. The emulator implements incremental consumption exactly, so on the emulator the driver selects the incremental row of #622's defaults: 64 × 1 MiB, large group off. |
+| `F_BUFFER`, `F_MORE`, `F_BUF_MORE` | The kernel's flags. | Posted by the RecvMulti emulation (op-by-op table). |
+| `IORING_CQE_F_SOCK_NONEMPTY` (promotion) | The kernel's flag. | Set from the next read of the same pass, or from `FIONREAD` when the pass stops at its cap. |
+| The group a receive was armed on | Its tag: `RecvMulti` or `RecvMultiLarge`. | The same tags; the emulator does not interpret them. |
+| Move a connection between groups | `ASYNC_CANCEL` by user_data, then a new arm. | Drop the emulated arm and post `-ECANCELED`, then a new arm. No syscall. |
+
+The driver's buffer-state rules, the lend cap, the bounded accumulator and
+promotion are driver code and run unchanged on both engines.
+
+### Copies per request
+
+Counted as `docs/syscalls-and-copies.md` counts them: copies ringline makes
+in userspace, not the kernel's copy out of the socket. "Today" is the code
+at the base of this design; "#622" is the shared-ring design on either
+engine.
+
+Receive:
+
+| Case | io_uring today | mio today | #622, io_uring or emulator |
+|---|---|---|---|
+| A whole message in one completion, accumulator empty, `with_data` | 0: the buffer is held in `pending_recv_bufs` and parsed in place, one buffer per connection at a time | 1: 8 KiB scratch → accumulator | 0 |
+| A second completion while one is held, or bytes already buffered | 1: both buffers copied into the accumulator | 1 | 0 for the whole messages in it; the bytes that complete a pending message are copied (bounded accumulator, when the parser announced the length) |
+| A message split across completions | 1 for every byte | 1 | 1 for the bytes after the first completion's share, bounded by the message length |
+| `with_bytes` | 1: a held buffer is always copied into the accumulator first; `Bytes` views of the accumulator are then free | 1 | 1, unchanged by #622 |
+| TLS | 1 (decrypt into the accumulator) | 1 | 1 |
+| Above a group's lend cap | — | — | 1 |
+
+Send counts do not change with #622. On the emulator a send writes from the
+memory the driver lent it (the send-pool slot, or a guard's memory), so the
+counts are io_uring's: 1 copy for `send()` and copy parts, 0 for guard parts
+above `send_zc_threshold`. The kernel's copy into the socket buffer, which
+replaces io_uring's zero-copy DMA there, is not counted. Today's mio backend
+copies every send into a queued `Vec` (`send_inner`, `handler.rs`), so the
+emulator removes that copy for guard parts.
+
+### Syscalls per request
+
+| Step | io_uring | Emulator | mio today |
+|---|---|---|---|
+| Learn the request arrived | share of one `io_uring_enter` | share of one `epoll_wait` (`kevent` on macOS) | share of one `epoll_wait` |
+| Read the request | 0 | 1 `read` per completion, plus 1 `read` returning `EAGAIN` per readable edge | N `read`s plus 1 `EAGAIN` per edge, into a scratch buffer |
+| `SOCK_NONEMPTY` | 0 | 0, except one `ioctl(FIONREAD)` when a pass stops at its cap | — |
+| Send one response | 0 dedicated | 1 `write` | share of one `writev` per connection per flush |
+| Send N pipelined responses on one connection | N SQEs, 0 dedicated syscalls | N `write`s, one per loop iteration or flush | 1 `writev` |
+| Move a connection between groups | 0 dedicated (cancel and arm are SQEs) | 0 | — |
+| Re-arm after `ENOBUFS` | 0 dedicated | 1 `read` (rule 2: an arm reads at once) | — |
+
+The pipelined-send row is the emulator's one regression against mio today.
+The driver keeps one send in flight per connection and never merges two
+user sends into one SQE: every `send()` marks its last slot end-of-send,
+and `submit_next_queued_inner` stops a coalescing run there
+(`driver.rs`). On io_uring that costs SQEs, not syscalls. On the emulator
+each SQE is one `write`, and each queued send waits for the previous one's
+completion. Merging consecutive copy sends on a connection into one
+`SendMsgCoalesced`, with each send's completion accounted from the total,
+removes the regression on the emulator and cuts SQEs on io_uring. That is a
+driver change with its own issue, and it lands before the mio backend is
+retired (step 7).
+
+### Measuring the counts
+
+One client, one machine pair, through SystemsLab, so the engines are the
+only difference:
+
+- Engines: `UringEngine` with incremental rings (6.12+), `UringEngine`
+  with plain rings and two groups (6.1), `EmulatedEngine` on Linux, and the
+  mio backend while it exists.
+- Workloads: request/response at 64 B, 4 KiB, 64 KiB and 1 MiB, pipeline
+  depth 1 to 32, and a streaming cell.
+- Syscalls per request from rezolus' syscall counters, divided by requests.
+  Copies per request from ringline's receive counters (#622's metrics:
+  bytes lent and bytes copied) and the send pool's copy counter.
+
+The results replace the measured section of `docs/syscalls-and-copies.md`,
+which today compares two different programs.
 
 ## Tests
 
@@ -353,8 +445,9 @@ Each step is a separate PR. Steps 1–6 keep both backends working.
    are about 184 `cfg(has_io_uring)` sites in 20 files to sort between
    the two. After this the driver compiles without the `io_uring` crate.
 3. **First emulated slice.** `EmulatedEngine` on Linux behind a
-   `ring-emulator` feature, with RecvMulti, Send, SendRecvBuf, Connect,
-   Close, the close leads, Cancel, Timeout/TickTimeout/Timer and
+   `ring-emulator` feature, with RecvMulti on both ring kinds (incremental
+   offsets, `F_BUF_MORE` and `SOCK_NONEMPTY` included), Send, SendRecvBuf,
+   Connect, Close, the close leads, Cancel, Timeout/TickTimeout/Timer and
    EventFdRead. Acceptance: the conformance tests for those ops pass on
    both engines, and the `tests/echo.rs` tests that use only those ops
    pass on the emulator (the PR names the filter).
@@ -394,12 +487,8 @@ Each step is a separate PR. Steps 1–6 keep both backends working.
 ## Notes
 
 - Copy counts follow CLAUDE.md's table, which counts copies ringline
-  makes in userspace, not the kernel's copy out of the socket. Emulated
-  recv makes one (provided buffer → accumulator), as io_uring does and as
-  mio does today (8 KiB scratch buffer → accumulator). Receiving straight
-  into the accumulator would remove that copy on both engines; that is a
-  change to the recv design, not to the emulator, and has its own
-  design.
+  makes in userspace, not the kernel's copy out of the socket. "Receive
+  under the shared-ring design" below gives the counts per engine.
 - kTLS is designed (`docs/ktls-design.md`) but not implemented. Its
   design sends plaintext with `IORING_OP_SEND` without `MSG_WAITALL`, so
   the emulator's Send follows the flag: with `MSG_WAITALL` it writes
