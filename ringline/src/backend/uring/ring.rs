@@ -24,10 +24,9 @@ const FIXED_FILES_RELEASED_PER_FILE_SINCE: KernelVersion = KernelVersion {
 };
 
 /// Ubuntu's 6.8 kernels (from 6.8.0-139) invert the check on the reserved
-/// words of `IORING_REGISTER_PBUF_RING`, and reportedly of
-/// `IORING_UNREGISTER_PBUF_RING`: a call with them zeroed, as upstream
-/// kernels require, fails with `EINVAL`, and a call with `resv[0]` set
-/// succeeds (#626).
+/// words of `IORING_REGISTER_PBUF_RING`: a registration with them zeroed, as
+/// upstream kernels require, fails with `EINVAL`, and one with `resv[0]` set
+/// succeeds. The same is reported for `IORING_UNREGISTER_PBUF_RING` (#626).
 const PBUF_RESV_INVERTED_ON: KernelVersion = KernelVersion { major: 6, minor: 8 };
 
 /// Whether a provided-buffer-ring registration refused with `err` on
@@ -59,9 +58,10 @@ const IORING_UNREGISTER_PBUF_RING: libc::c_uint = 23;
 ///
 /// # Safety
 ///
-/// For `IORING_REGISTER_PBUF_RING`, `ring_addr` must point to
-/// `ring_entries` page-aligned buffer-ring entries that stay valid until the
-/// group is unregistered or the ring is dropped.
+/// `opcode` must be `IORING_REGISTER_PBUF_RING` or
+/// `IORING_UNREGISTER_PBUF_RING`. For registration, `ring_addr` must point to
+/// a buffer ring of `ring_entries` entries that stays mapped until the group
+/// is unregistered or the ring is dropped.
 unsafe fn pbuf_ring_register(
     fd: RawFd,
     opcode: libc::c_uint,
@@ -200,7 +200,8 @@ pub struct Ring {
     /// [`close_lead_for`].
     close_lead: CloseLead,
     /// The kernel accepted a provided buffer ring only with `resv[0]` set,
-    /// so later registrations and every unregistration use that form.
+    /// so later registrations use that form and unregistration tries it
+    /// first.
     /// See [`retry_with_resv_set`].
     pbuf_resv_set: bool,
     /// Test-only: number of upcoming `push_sqe`/`push_sqe128` calls that
@@ -465,8 +466,9 @@ impl Ring {
             provided.ring_entries(),
             provided.bgid(),
         );
-        // Safety (both registrations): ring_addr points to valid mmap'd
-        // memory that outlives the registration.
+        // Safety (every registration in this function): `addr` is
+        // `provided`'s mmap'd ring; the driver keeps it mapped until
+        // `unregister_buf_ring`.
         let first = if self.pbuf_resv_set {
             unsafe { self.register_pbuf_resv_set(addr, entries, bgid) }
         } else {
@@ -1757,32 +1759,45 @@ mod tests {
     }
 
     /// The raw `io_uring_register` call behind the `resv[0]` retry (#626)
-    /// registers, unregisters and re-registers a ring when given zeroed
-    /// reserved words, which any kernel other than Ubuntu's 6.8 requires, so
-    /// the struct layout and opcodes are checked on every kernel CI runs.
+    /// registers, unregisters and re-registers a ring, in whichever form the
+    /// running kernel accepts: zeroed reserved words, or on a 6.8 kernel that
+    /// refuses those, `resv[0]` set. Where zeroed words are accepted, a
+    /// registration with `resv[0]` set is refused. A correct kernel refuses a
+    /// nonzero word in any slot, so this cannot tell which slot `resv0` is
+    /// written to; the size assertion on `BufReg` and its field order cover
+    /// that.
     #[test]
     fn raw_pbuf_registration_round_trips() {
-        if KernelVersion::current() == Some(PBUF_RESV_INVERTED_ON) {
-            return;
-        }
-        let ring = ring_with(None);
+        // Declared before the ring, so it is unmapped after the ring drops.
         let provided = ProvidedBufRing::new(7, 8, 4096).expect("provided ring");
+        let ring = ring_with(None);
         let fd = ring.ring.as_raw_fd();
         let (addr, entries) = (provided.ring_addr(), provided.ring_entries());
-        // Safety: `provided` outlives every registration below.
+        // Safety: `provided` outlives the ring and so every registration.
         unsafe {
-            pbuf_ring_register(fd, IORING_REGISTER_PBUF_RING, addr, entries, 7, 0)
-                .expect("register");
-            pbuf_ring_register(fd, IORING_UNREGISTER_PBUF_RING, 0, 0, 7, 0).expect("unregister");
-            pbuf_ring_register(fd, IORING_REGISTER_PBUF_RING, addr, entries, 7, 0)
+            let resv0 = match pbuf_ring_register(fd, IORING_REGISTER_PBUF_RING, addr, entries, 7, 0)
+            {
+                Ok(()) => 0,
+                Err(e) if retry_with_resv_set(&e, KernelVersion::current()) => {
+                    pbuf_ring_register(fd, IORING_REGISTER_PBUF_RING, addr, entries, 7, 1)
+                        .expect("register with resv[0] set");
+                    1
+                }
+                Err(e) => panic!("register: {e}"),
+            };
+            pbuf_ring_register(fd, IORING_UNREGISTER_PBUF_RING, 0, 0, 7, resv0)
+                .expect("unregister");
+            pbuf_ring_register(fd, IORING_REGISTER_PBUF_RING, addr, entries, 7, resv0)
                 .expect("register again");
-            // The reserved word is checked: set, it is refused.
-            assert_eq!(
-                pbuf_ring_register(fd, IORING_REGISTER_PBUF_RING, addr, entries, 8, 1)
-                    .map_err(|e| e.raw_os_error()),
-                Err(Some(libc::EINVAL))
-            );
-            pbuf_ring_register(fd, IORING_UNREGISTER_PBUF_RING, 0, 0, 7, 0).expect("unregister");
+            if resv0 == 0 {
+                assert_eq!(
+                    pbuf_ring_register(fd, IORING_REGISTER_PBUF_RING, addr, entries, 8, 1)
+                        .map_err(|e| e.raw_os_error()),
+                    Err(Some(libc::EINVAL))
+                );
+            }
+            pbuf_ring_register(fd, IORING_UNREGISTER_PBUF_RING, 0, 0, 7, resv0)
+                .expect("unregister");
         }
     }
 

@@ -324,9 +324,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - io_uring: workers start on Ubuntu's 6.8 kernels (6.8.0-139 and later),
   which reject `IORING_REGISTER_PBUF_RING` with `EINVAL` unless a reserved
-  word is set. Registration is tried in the standard form first; only an
-  `EINVAL` on a 6.8 kernel is retried with `resv[0] = 1`, and the worker's
-  later registrations use that form; unregistration tries it first and falls
+  word is set. Registration is tried in the standard form first. Only an
+  `EINVAL` on a 6.8 kernel is retried with `resv[0] = 1`. The worker's later
+  registrations use that form, and unregistration tries it first and falls
   back to the standard form (#626).
 
 - On io_uring, an awaited send could resolve with another send's result. A
