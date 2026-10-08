@@ -32,8 +32,15 @@ cd /home/anvil
   cd src/experiments/recv-strategies
   cargo build --release --locked
   rc=$?
+  # A static build for guests whose glibc is older than the build image's
+  # (Amazon Linux 2023, kernel 6.1).
+  rustup target add x86_64-unknown-linux-musl >/dev/null 2>&1
+  cargo build --release --locked --target x86_64-unknown-linux-musl
+  rc_musl=$?
   mkdir -p /home/anvil/out
   cp target/release/recv-strategies runs*.sh /home/anvil/out/
+  [ $rc_musl -eq 0 ] && cp target/x86_64-unknown-linux-musl/release/recv-strategies /home/anvil/out/recv-strategies-static
+  echo "build_musl_status=$rc_musl"
   cd /home/anvil && sha256sum out/*
   tar czf recv-bins.tgz out
   echo "build_status=$rc"
