@@ -467,8 +467,10 @@ impl Ring {
             provided.bgid(),
         );
         // Safety (every registration in this function): `addr` is
-        // `provided`'s mmap'd ring. The caller keeps it mapped while the group
-        // is registered; `Driver` unregisters both groups in `run_shutdown`.
+        // `provided`'s mmap'd ring, mapped at the call. The caller must keep
+        // it mapped while the group is registered. `Driver` does so on the
+        // path through `run_shutdown`, which unregisters both groups; its
+        // error and panic exits unmap the rings with the groups registered.
         let first = if self.pbuf_resv_set {
             unsafe { self.register_pbuf_resv_set(addr, entries, bgid) }
         } else {
