@@ -529,3 +529,206 @@ follow-up.
 **RSS.** The open question above about touched pages staying resident
 stands, now with an answer for the ring: a 64 MiB pool is fully resident on
 any worker that has received 64 MiB.
+
+## 2026-10: kernels, two rings, tiered caches
+
+The decision above left two things open: what to recommend on kernels
+without INC, measured on such kernels rather than on 6.12 as a stand-in,
+and whether a second, large-buffer group helps streaming and forwarding
+connections. This section records those runs (2026-10-07 and 2026-10-08).
+
+### Method changes
+
+- **Bounded accumulator** (`--bounded-acc`): a completion copies into the
+  accumulator only what completes the pending message and parses the rest in
+  place. Every configuration below uses it. In the streaming cells it cut
+  RSS from 2.4 GB to 262 MB and bytes copied sevenfold, at 10–58% more
+  throughput (hv01 `01a11885-c77f-7166-f3e7-a7c1f337c950`, two hosts
+  `01a11885-c7f9-7178-4ae7-ccecdb8b4337`).
+- **`--no-thp`** (`MADV_NOHUGEPAGE`) on plain rings: with transparent huge
+  pages a 64 KiB or 1 MiB completion made its whole 2 MiB region resident
+  (hv01 `01a11783-c258-719e-f54d-392e414d1312`, two hosts
+  `01a11783-c2c8-7118-b7f6-30d77b83989c`).
+- A kernel cap on bytes per multishot completion (`--recv-len`) was tried
+  and dropped: 6.12 rejects a nonzero length on multishot `RECV` with
+  `EINVAL`; 7.1 accepts it, and it lowered throughput.
+- Stall statistics per connection (longest gap between deliveries, time from
+  a first `ENOBUFS` to the next delivery), a second-client mode for mixed
+  cells (16 streamers connected first, their bytes counted apart), and
+  fixed-rate request clients.
+- Two-host setup throughout: server VM on hv02, client VM on hv01, 4 ×
+  10 GbE bond. Three reps per cell, configurations interleaved; medians.
+  Statically linked binaries, so each guest image runs the same build.
+
+### Linux 6.12 as a stand-in for older kernels
+
+hv01 `01a119eb-faf8-713c-de38-4c872eeca62c`, two hosts
+`01a11ab1-7eb9-719e-5777-3e5165b760fa`, Debian 13, 6.12.63. On 6.12 plain
+rings return `ENOBUFS` in the millions at 10,000 connections, where 7.1
+returns none; depth reduces it. On hv01, msg/s and `ENOBUFS`:
+
+| Cell | 256 × 16 KiB | 1024 × 64 KiB | 4096 × 64 KiB | 1024 × 1 MiB | INC 64 × 1 MiB |
+|---|---|---|---|---|---|
+| 256 B × 10k | 32.4k (11.1M) | 40.7k (3.2M) | 42.7k (0.55M) | 40.4k (3.2M) | 47.6k (0) |
+| 64 KiB × 10k | 13.5k (18.2M) | 28.4k (2.2M) | 30.5k (0.38M) | 28.7k (2.2M) | 29.4k (2.3M) |
+| 1 MiB × 64 | 3.6k | 3.0k | 3.0k | 5.2k | 5.4k |
+| stream-mix × 1000 | 115k | 142k | 141k | 183k (1.2 GB RSS) | 181k |
+| 64 KiB × 1000 at 28.5k/s, p50 | 26.2 ms | 0.62 ms | 0.62 ms | 0.62 ms | 0.62 ms |
+
+### Linux 6.1
+
+**Loopback, hv01, Amazon Linux 2023, 6.1.159**
+(`01a11be9-5f7e-71db-173b-1a9df0f897ba`). Registering a ring with
+`IOU_PBUF_RING_INC` returned `EINVAL`, in the probe and in every INC cell.
+msg/s, `ENOBUFS`, p50 / p999:
+
+| Cell | 256 × 16 KiB | 1024 × 64 KiB | 4096 × 64 KiB | 1024 × 1 MiB |
+|---|---|---|---|---|
+| 256 B × 10k | 57k (19.6M), 168 / 176 ms | 84k (6.6M), 117 / 134 ms | 105k (25k), 21 ms / 2.7 s | 84k (6.6M), 117 / 134 ms |
+| 64 KiB × 10k | 16k (20.7M), 604 / 638 ms | 44k (3.4M), 226 / 252 ms | 47k (28k), 67 ms / 5.1 s | 43k (3.4M), 226 / 252 ms |
+| 64 KiB × 1000 at 28.5k/s, p50 / p999 | 0.79 / 1.97 ms | 0.75 / 1.77 ms | 0.75 / 1.77 ms | 0.72 / 1.77 ms |
+| 1 MiB × 64 | 3.3k | 3.1k | 3.1k | 5.4k (1.1 GB resident) |
+| stream-mix × 1000, MB/s | 3226 | 4117 | 3820 | 4677 |
+
+The 2–6 s p999 at 4096 × 64 KiB held in all three reps and is unexplained.
+It did not reproduce across two hosts on Debian 12's 6.1 (below), and
+6.12 showed no such tail. The AL2023 guest ran about 1.4 times faster than
+the Debian 13 guest in the same cells, so only ratios within a run compare.
+
+**Two hosts, Debian 12, 6.1.0-53** (`01a11cbb-70d8-7181-ea9d-4d9adb77267d`).
+`IOU_PBUF_RING_INC` returned `EINVAL`. 144 of 144 runs, no corrupt messages:
+
+| Cell | 256 × 16 KiB | 1024 × 64 KiB | 2048 × 64 KiB | 4096 × 64 KiB | 1024 × 1 MiB |
+|---|---|---|---|---|---|
+| 256 B × 10k, msg/s (`ENOBUFS`) | 38k (12.9M) | 54k (4.3M) | 57k (2.0M) | 62k (0.83M) | 54k (4.3M) |
+| ↳ p50 / p999 | 260 / 268 ms | 185 / 210 ms | 176 / 201 ms | 143 / 226 ms | 185 / 210 ms |
+| 64 KiB × 10k, msg/s | 8.0k | 18.9k | 19.2k | 20.0k | 18.6k |
+| ↳ p50 / p999 | 1141 / 1342 ms | 537 / 872 ms | 520 / 1275 ms | 436 / 1074 ms | 537 / 805 ms |
+| 64 KiB × 1000 at 18k/s, p50 / p999 | 604 / 1946 ms | 67 / 168 ms | 92 / 243 ms | 63 / 134 ms | 71 / 143 ms |
+| stream-mix × 1000, MB/s | 1068 | 1142 | 1056 | 1074 | 1440 (1.2 GB) |
+
+Every connection hit `ENOBUFS` at least once in every plain configuration,
+warmup included. The median wait from a first `ENOBUFS` to the next
+delivery at 256 B × 10k fell with depth: 255 ms for 256 × 16 KiB, 170 ms
+for 1024 × 64 KiB, 68 ms for 4096 × 64 KiB.
+
+**Ubuntu 24.04, 6.8.0-142** (`01a11cbb-7154-7103-1bbb-e8e7af7f2928`): every
+run failed to register its ring, plain or INC, with `EINVAL`. A probe showed
+the kernel requires `resv[0]` set (#626, fixed for ringline in #627). The
+6.8 numbers wait for a rerun with that fix.
+
+### Linux 7.1 at 10,000 and 50,000 connections
+
+Two hosts, Debian 13 backports kernel (`01a11962-e405-71fd-0f61-c5ac0d91fa86`).
+No configuration returned `ENOBUFS`. INC 64 × 1 MiB and the plain rings tied
+almost everywhere; at 50,000 connections INC's p99 at a fixed 72k/s mixed
+load was 906 ms against 604–638 ms for the plain rings, and it was 3% lower
+on 64 KiB closed loop. The 256 × 16 KiB ring was 15% lower at 10,000 and
+33% lower at 50,000 on 64 KiB closed loop, could not hold 16k/s of 64 KiB
+at 50,000 connections (p50 1.3 s), and used 2–3 GB RSS against 0.3–1 GB.
+
+### Two rings
+
+A second buffer group of 1 MiB buffers. Connections are promoted to it and
+demoted back (`two_ring`, `two_ring_inc`); a move cancels the live
+multishot receive and re-arms on the other group.
+
+**First rule, four consecutive full completions** (6.1 Debian 12
+`01a11cfc-3148-718b-a774-c670177d1490`, 6.12 Debian 13
+`01a11cfc-30d3-71a6-9833-8ac3e633db4f`). On 6.1 two groups (4096 × 64 KiB
++ 256 × 1 MiB) beat the 4096 × 64 KiB group on streaming (1216 against
+1030 MB/s) and cut request latency 4–5× with streamers present. 64 KiB
+request/response messages fill a 64 KiB buffer exactly, so those
+connections were promoted and demoted 833 times per run, starved the large
+group (147k `ENOBUFS`) and lost 5% throughput. On 6.12 two INC groups tied
+one on streaming, 1 MiB and 64 KiB request/ack and the control.
+
+**`SOCK_NONEMPTY` rule**: a full completion counts only when it carries
+`IORING_CQE_F_SOCK_NONEMPTY` (6.12 `01a11d44-3a29-71f7-c1a9-244e24bdebd2`,
+6.1 `01a11d44-3a9e-71f7-9019-7cc0a98b5d66`). The 256 B × 10k and 64 KiB ×
+1000 control cells promoted no connection on either kernel. The tiered cells
+are a RAM+disk cache: 1000 request/response connections at 20k requests/s
+with a quarter of them holding each received range for 5 ms, alone and with
+16 streamers. Request p50 / p99 / p999 in ms:
+
+6.1 (Debian 12):
+
+| Cell | 4096 × 64 KiB | two groups | two groups, at most 64 promoted |
+|---|---|---|---|
+| stream-mix × 1000, MB/s | 1006 | 1328 | 1137 |
+| 1000 at 20k/s + 16 streamers | 185 / 369 / 369, streamers 813 MB/s | 65 / 134 / 151, 1001 MB/s | 50 / 352 / 419, 1130 MB/s |
+| same, streamers holding 10 ms | 302 / 419 / 419, 791 MB/s | 33 / 61 / 67, 1224 MB/s | 29 / 71 / 84, 996 MB/s |
+| tiered | 1.4 / 1.8 / 2.8 | 1.4 / 1.8 / 2.4 | 1.4 / 1.8 / 2.6 |
+| tiered + 16 streamers | 319 / 436 / 453 | 13 / 117 / 151 | 403 / 570 / 570 |
+| 1 MiB × 64 request/ack, MB/s | 1320 | 1376 (613 promotions, 567 demotions) | 1276 |
+| peak RSS | 282 MB | about 580 MB | about 550 MB |
+
+6.12 (Debian 13):
+
+| Cell | INC 64 × 1 MiB | two INC groups | two INC groups, promote on hold too |
+|---|---|---|---|
+| stream-mix × 1000, MB/s | 1715 | 1811 | 1734 |
+| 1000 at 20k/s + 16 streamers | 8.1 / 13.6 / 37.8 | 4.5 / 7.6 / 54.5 | 4.2 / 7.3 / 54.5 |
+| same, streamers holding 10 ms | 7.9 / 12.1 / 54.5 | 5.0 / 8.1 / 54.5 | 6.8 / 11.5 / 54.5 |
+| tiered | 1.05 / 1.5 / 2.2 | 1.02 / 1.5 / 1.9 | 1.02 / 1.5 / 2.0 |
+| tiered + 16 streamers | 19.9 / 33.6 / 35.7 (237 `ENOBUFS`) | 8.9 / 14.7 / 16.3 (0) | 9.4 / 15.2 / 17.8 (0) |
+| peak RSS | 71 MB | 135 MB | 117–135 MB |
+
+**Heavy-tailed request sizes**: 64 B to 1 MiB, about half 64 B and 0.5%
+1 MiB, mean about 12.5 KB, at 20k requests/s (6.12
+`01a11d45-3f0a-71ba-dcfa-52bcf6190593`, 6.1
+`01a11d45-3f7d-71bc-53b6-95a2526e0900`). p50 / p99 / p999 in ms:
+
+| Cell | 6.12 INC | 6.12 two groups | 6.1 4096 × 64 KiB | 6.1 two groups |
+|---|---|---|---|---|
+| sizes | 1.11 / 2.49 / 3.41 | 1.05 / 2.49 / 3.54 | 1.44 / 3.93 / 5.50 | 1.44 / 3.80 / 5.77 |
+| sizes, tiered | 1.11 / 2.49 / 3.28 | 1.05 / 2.49 / 3.67 | 1.44 / 3.80 / 5.24 | 1.44 / 4.06 / 6.55 |
+| sizes, tiered + 16 streamers | 7.6 / 13.6 / 37.8 | 6.6 / 11.5 / 56.6 | 168 / 520 / 537 | 11 / 25 / 59 |
+
+On 6.1 large requests promoted request/response connections: 649
+promotions and 358 demotions per run in the sizes cell, about 290 of 1000
+connections in the large group at the end.
+
+### What was measured and what was inferred
+
+Measured:
+
+- 6.1 rejects `IOU_PBUF_RING_INC` with `EINVAL` (Debian 12, AL2023).
+- Plain rings on 6.1 and 6.12 run out at 10,000 connections; 7.1 does not.
+- Among plain geometries on 6.1, 4096 × 64 KiB had the highest throughput
+  at 10,000 connections and the lowest latency in the fixed-rate cell
+  across hosts.
+- The `SOCK_NONEMPTY` rule promoted no 64 KiB request/response connection.
+- With streamers or slow handlers sharing a worker with request/response
+  traffic, two groups lowered request p50 and p99 on both kernels: 3–25×
+  on 6.1, by 15% to 2.2× on 6.12. Without them, two groups tied one.
+- A cap on promoted connections was worse wherever more than 64 needed
+  promoting.
+
+Inferred, not measured:
+
+- That the 6.1 gains come partly from fewer completions per byte, freeing
+  the server's one CPU (97–100% utilised), not only from separating the
+  buffers.
+- That migration causes the higher 6.12 p999 in two streamer cells
+  (37.8 against 54.5 and 56.6 ms). Not timed yet.
+
+Caveats:
+
+- Streamers were not rate-limited. A configuration that let them move more
+  bytes also used more of the server's CPU, which raises request latency in
+  the same cell.
+- p999 of 54.5 ms recurs across configurations in the mixed cells,
+  suggesting a histogram bucket edge or one systemic stall.
+- Demotion moves connections back and forth (about 600 times per run for
+  1 MiB request/ack on 6.1, 58–91 on 6.12 streaming).
+
+### Decision (owner, 2026-10-08)
+
+Two groups on every kernel: INC 64 × 1 MiB plus INC 64 × 1 MiB on 6.12+,
+plain 4096 × 64 KiB plus plain 256 × 1 MiB before 6.12, both plain groups
+with `MADV_NOHUGEPAGE`, and the bounded accumulator. Promotion on
+`SOCK_NONEMPTY` full completions and on held lends, with no cap. Demotion
+hysteresis and migration timing are measured next. This replaces the
+plain 1024 × 64 KiB recommendation and the per-connection hybrid follow-up
+above.
