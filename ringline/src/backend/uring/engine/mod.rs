@@ -16,6 +16,8 @@ use crate::error::Error;
 
 #[cfg(all(test, uring_engine))]
 mod conformance;
+#[allow(dead_code)] // first caller lands with #622's ring-kind selection
+pub(crate) mod preflight;
 #[cfg(not(uring_engine))]
 pub(crate) mod stub;
 #[cfg(uring_engine)]

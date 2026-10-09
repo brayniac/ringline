@@ -214,10 +214,11 @@ impl ProvidedBufRing {
         }
     }
 
-    /// Test-only: treat the ring as incremental, so driver tests can deliver
-    /// data at nonzero offsets.
-    #[cfg(test)]
-    pub(crate) fn set_incremental_for_test(&mut self) {
+    /// Treat the ring as incremental (`IOU_PBUF_RING_INC`): a completion
+    /// exhausts its buffer only when it clears `IORING_CQE_F_BUF_MORE`. Call
+    /// before the first completion, when the ring is registered as
+    /// incremental.
+    pub(crate) fn set_incremental(&mut self) {
         self.incremental = true;
     }
 
@@ -230,9 +231,8 @@ impl ProvidedBufRing {
         self.ring_entries().saturating_sub(self.outstanding)
     }
 
-    /// Test-only: the `(addr, len, bid)` of ring entry `index`, as the
-    /// kernel left it. An incremental ring's entry advances in place.
-    #[cfg(test)]
+    /// The `(addr, len, bid)` of ring entry `index`, as the kernel left it.
+    /// An incremental ring's entry advances in place.
     pub(crate) fn entry(&self, index: u16) -> (u64, u32, u16) {
         let off = (index & self.mask) as usize * Self::ENTRY_SIZE;
         // Safety: `off` is inside the mapped ring; the kernel writes the
