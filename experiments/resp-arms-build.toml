@@ -37,7 +37,7 @@ cd /home/anvil
   echo "cachecannon: $(git -C cc log --oneline -1)"
   ( cd src && cargo build --release --locked -p ringline-bench --features tokio-uring-arm --bin resp-server ) || exit 1
   cp src/target/release/resp-server out/
-  ( cd cc && cargo build --release --locked -j 2 ) || exit 1
+  ( cd cc && CARGO_PROFILE_RELEASE_LTO=thin CARGO_PROFILE_RELEASE_DEBUG=0 CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 cargo build --release --locked -j 2 ) || exit 1
   cp cc/target/release/cachecannon out/
   ( cd out && sha256sum * )
   tar czf bins.tgz out
