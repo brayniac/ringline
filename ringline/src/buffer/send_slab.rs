@@ -54,7 +54,8 @@ struct InFlightSendEntry {
     /// length it reports on success and where its bytes end in the entry.
     ///
     /// Set by `allocate_coalesced` for every pool slot of the run that carried
-    /// an id (only a logical send's final slot does) (`submit_next_queued_inner` lifts them, since the
+    /// an id, which only a logical send's final slot does
+    /// (`submit_next_queued_inner` lifts them, since the
     /// coalesced completion releases the slots), and by
     /// [`set_send_id`](InFlightSendSlab::set_send_id) for a zero-copy
     /// (`submit_batch_await`) or recv-forward (`forward_held`) entry, which
@@ -740,6 +741,32 @@ mod tests {
         slab.dec_pending_notifs(idx);
         assert!(slab.should_release(idx));
         slab.release(idx);
+    }
+
+    /// One entry reused more often than a run holds sends: each release
+    /// forgets the run, so the next allocation starts empty and no push
+    /// overflows it.
+    #[test]
+    fn a_reused_entry_starts_with_an_empty_run() {
+        let mut slab = InFlightSendSlab::new(1);
+        let mut completions = crate::runtime::send_completion::SendCompletions::new();
+        let data = [0u8; 4];
+        let iov = [libc::iovec {
+            iov_base: data.as_ptr() as *mut libc::c_void,
+            iov_len: 4,
+        }];
+        for round in 0..(MAX_IOVECS as u32 + 4) {
+            let id = completions.register(0, round);
+            let (idx, _) = slab
+                .allocate_coalesced(0, 0, &iov, &[0], 4, [(id, 4, 4)], false)
+                .expect("slab room");
+            if round % 2 == 0 {
+                let mut taken = slab.take_sends(idx);
+                assert_eq!(taken.next(), Some((id, 4)));
+                assert_eq!(taken.next(), None);
+            }
+            slab.release(idx);
+        }
     }
 
     #[test]

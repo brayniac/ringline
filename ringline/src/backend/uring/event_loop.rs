@@ -3348,7 +3348,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.driver.send_slab.release(slab_idx);
     }
 
-    /// Handle completion of a coalesced copy `sendmsg` (plaintext or TLS ciphertext) (OpTag::SendMsgCoalesced).
+    /// Handle completion of a coalesced copy `sendmsg` of plaintext or TLS
+    /// ciphertext (OpTag::SendMsgCoalesced).
     /// Mirrors `handle_send` but the backing is a slab entry holding several
     /// pool slots; partial sends advance the iovec array via `try_advance`.
     fn handle_send_msg_coalesced(&mut self, ud: UserData, result: i32) {
@@ -17513,6 +17514,59 @@ mod tests {
             conn.is_none() || conn.unwrap().close_requested(),
             "connection not closed after a TLS ciphertext send error"
         );
+    }
+
+    /// Queue two `Send`-tagged chunks behind an in-flight send and coalesce
+    /// them; returns the coalesced operation's user_data.
+    fn two_send_tagged_chunks(el: &mut AsyncEventLoop<NoopHandler>, conn_index: u32) -> UserData {
+        let generation = el.driver.connections.generation(conn_index);
+        el.driver.send_queues[conn_index as usize].in_flight = true;
+        for data in [&b"record-1"[..], b"record-2"] {
+            let (slot, ptr, len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+            let ud = UserData::encode(
+                OpTag::Send,
+                conn_index,
+                UserData::send_payload(slot, generation),
+            );
+            let entry =
+                crate::backend::uring::sqe::Sqe::stream_send(conn_index, ptr, len, ud.raw());
+            el.driver.send_queues[conn_index as usize]
+                .queue
+                .push_back(crate::handler::BuiltSend {
+                    entry,
+                    pool_slot: slot,
+                    slab_idx: u16::MAX,
+                    total_len: len,
+                });
+        }
+        assert!(el.driver.submit_next_queued(conn_index));
+        let ud = UserData(el.driver.ring.last_pushed.as_ref().unwrap().user_data);
+        assert_eq!(ud.tag(), Some(OpTag::SendMsgCoalesced));
+        ud
+    }
+
+    /// Two single-record TLS sends: every chunk is tagged `Send`, so only the
+    /// connection's TLS state marks the run, and an error still closes.
+    #[test]
+    fn tls_connection_run_of_final_chunks_closes_on_error() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        install_handshaked_tls(&mut el, conn_index);
+        let ud = two_send_tagged_chunks(&mut el, conn_index);
+        el.test_dispatch_cqe(ud.raw(), -104, 0);
+        let conn = el.driver.connections.get(conn_index);
+        assert!(conn.is_none() || conn.unwrap().close_requested());
+    }
+
+    /// The same run on a plaintext connection drains without closing.
+    #[test]
+    fn plaintext_run_error_does_not_close() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let ud = two_send_tagged_chunks(&mut el, conn_index);
+        el.test_dispatch_cqe(ud.raw(), -104, 0);
+        let conn = el.driver.connections.get(conn_index).expect("still open");
+        assert!(!conn.close_requested());
     }
 
     /// With the close already submitted, a partial write settles the sends it
