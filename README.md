@@ -99,7 +99,7 @@ handler instance. On the io_uring backend, each worker also owns:
 | SendMsgZc | Zero-copy scatter-gather send — kernel DMAs directly from app buffers |
 | Fixed file table | Direct descriptors — no per-syscall fd table lookup |
 | IO_LINK chains | Atomic multi-step operations (connect + timeout) |
-| COOP_TASKRUN | Reduced context switches |
+| COOP_TASKRUN (not with SQPOLL) | Reduced context switches |
 | SINGLE_ISSUER | Lock-free kernel-side optimizations |
 
 ## Key Types

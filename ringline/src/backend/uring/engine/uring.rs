@@ -300,11 +300,31 @@ impl UringEngine {
         // Try to push; if SQ is full, submit first to make room.
         unsafe {
             if self.ring.submission().push(&entry).is_err() {
-                self.ring.submit()?;
+                self.make_sq_room(1)?;
                 if self.ring.submission().push(&entry).is_err() {
                     crate::metrics::RING.increment(crate::metrics::ring::SQE_SUBMIT_FAILURES);
                     return Err(io::Error::other("SQ still full after submit"));
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// Submit the queued SQEs to free room for `needed` more. Under SQPOLL,
+    /// only the SQ thread frees entries and `submit` does not enter the
+    /// kernel while that thread is awake, so this also waits
+    /// (`IORING_ENTER_SQ_WAIT`, which returns once at least one entry is
+    /// free) until `needed` are free or the SQ has drained.
+    fn make_sq_room(&mut self, needed: usize) -> io::Result<()> {
+        self.ring.submit()?;
+        if self.ring.params().is_setup_sqpoll() {
+            loop {
+                let sq = self.ring.submission();
+                if sq.capacity() - sq.len() >= needed || sq.is_empty() {
+                    break;
+                }
+                drop(sq);
+                self.ring.submitter().squeue_wait()?;
             }
         }
         Ok(())
@@ -330,7 +350,7 @@ impl UringEngine {
         let pair = [first, second];
         unsafe {
             if self.ring.submission().push_multiple(&pair).is_err() {
-                self.ring.submit()?;
+                self.make_sq_room(2)?;
                 if self.ring.submission().push_multiple(&pair).is_err() {
                     crate::metrics::RING.increment(crate::metrics::ring::SQE_SUBMIT_FAILURES);
                     return Err(io::Error::other("SQ still full after submit"));
@@ -362,8 +382,9 @@ impl Engine for UringEngine {
             if let Some(cpu) = config.sqpoll_cpu {
                 builder.setup_sqpoll_cpu(cpu);
             }
-            // The kernel refuses COOP_TASKRUN and DEFER_TASKRUN with SQPOLL
-            // (EINVAL): the SQ thread, not the submitter, runs task_work.
+            // The kernel refuses COOP_TASKRUN, TASKRUN_FLAG and
+            // DEFER_TASKRUN with SQPOLL (EINVAL). The SQ thread issues the
+            // requests, so their task_work runs on it, not on this worker.
         } else {
             builder.setup_coop_taskrun();
             builder.setup_defer_taskrun();
@@ -373,8 +394,9 @@ impl Engine for UringEngine {
             .build(config.sq_entries)
             .map_err(Error::ring_setup)?;
 
-        // Applies to the calling thread's io-wq, which is why the ring is
-        // set up on its worker's thread. A zero slot leaves that limit
+        // Applies to the io-wq of the thread that issues requests: the
+        // calling thread, which is why the ring is set up on its worker's
+        // thread, or the SQ thread under SQPOLL. A zero slot leaves that limit
         // unchanged and reads back its current value, so the first call only
         // reads. The cap is an upper bound: registering it where the
         // kernel's own limit is lower would raise the limit instead.
@@ -721,6 +743,14 @@ impl Engine for UringEngine {
         // atomics.  We only read `.len()` (sq_tail − sq_head) and never push
         // new entries here, so there is no aliasing or mutation hazard.
         let n = unsafe { self.ring.submission_shared().len() } as u32;
+        if self.ring.params().is_setup_sqpoll() {
+            // The SQ thread submits. `submit` enters the kernel only to wake
+            // that thread when it has gone idle, or to flush an overflowed
+            // CQ; a raw enter here would cost a syscall on every flush and
+            // would not wake it.
+            self.ring.submit()?;
+            return Ok(());
+        }
         if n == 0 {
             // Nothing to submit. Pending DEFER_TASKRUN task_work and CQEs are
             // reaped by the event loop's next ring entry, which always carries
@@ -789,7 +819,7 @@ impl Engine for UringEngine {
             let sq = self.ring.submission();
             if sq.capacity() - sq.len() < entries128.len() {
                 drop(sq);
-                self.ring.submit()?;
+                self.make_sq_room(entries128.len())?;
                 let sq = self.ring.submission();
                 if sq.capacity() - sq.len() < entries128.len() {
                     entries128.clear();
