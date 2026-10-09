@@ -305,10 +305,15 @@ fn check_offset_order(mut e: ActiveEngine, conns: usize, burst: bool, push_async
     assert_eq!(order.received, sent);
     if burst {
         // More completions than the 64-entry CQ holds were pending at the
-        // first reap. The kernel ends a multishot arm whose completion
-        // overflows the CQ (no `F_MORE`); the order of the bytes holds.
+        // first reap, and the order of the bytes holds. Whether an arm ends
+        // depends on the kernel: on 6.12 a multishot arm whose completion
+        // overflows the CQ ends (no `F_MORE`); on 7.1 none ended. Ended
+        // arms are re-armed above either way.
         assert!(order.completions > 64, "{} completions", order.completions);
-        assert!(order.arms_ended > 0, "no arm ended on overflow");
+        eprintln!(
+            "{} completions, {} arms ended",
+            order.completions, order.arms_ended
+        );
     } else {
         assert_eq!(order.arms_ended, 0, "an arm ended without overflow");
     }

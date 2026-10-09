@@ -1,0 +1,197 @@
+# Run the #622 step 0 conformance tests (experiments/recv-conformance-build.toml)
+# on four kernels, one VM each, in turn on one host (the only
+# z2.baremetal host is hv01, and the jobs of one experiment are scheduled
+# together): Debian 12 (6.1), Ubuntu 24.04 (6.8),
+# Debian 13 (6.12) and Debian 13 backports (7.1). Kernels without
+# IOU_PBUF_RING_INC skip the INC tests; the log shows which ran.
+name = "ringline #622 conformance tests across kernels"
+
+[params]
+tests_artifact = "SET_AT_SUBMIT"
+repo           = "https://github.com/brayniac/ringline"
+branch         = "test/recv-conformance"
+
+[[jobs]]
+name = "kernels"
+tags = ["z2.baremetal"]
+
+# --- k6-1
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "start"
+shape = "z2.c"
+image = "spool/images/debian-12-base-20261008.1@golden"
+gpu = false
+boot_timeout = 600
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "exec"
+payload_timeout = 1800
+upload = true
+artifacts = ["/home/anvil/run-k6-1.log"]
+inputs = [{ artifact = "{tests_artifact}", name = "tests.tgz", dest = "/home/anvil" }]
+payload = '''
+set -uo pipefail
+cd /home/anvil
+# Debian 12 has glibc 2.36 and the artifact's binaries need 2.39
+# (std's weak pidfd_spawnp/pidfd_getpid carry a non-weak version need),
+# so this job builds the tests from source on the guest.
+{
+  sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential git curl pkg-config >/dev/null
+  curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal >/dev/null 2>&1
+  . $HOME/.cargo/env
+  git clone -q {repo} src && git -C src checkout -q {branch}
+  echo "src: $(git -C src log --oneline -1) $(rustc --version)"
+  ( cd src && CARGO_PROFILE_RELEASE_DEBUG=0 cargo test -p ringline --release --locked --no-run \
+      --lib --test echo --message-format=json > ../build.json )
+  echo "build_status=$?"
+  mkdir -p out
+  grep -o '"executable":"[^"]*"' build.json | cut -d'"' -f4 | while read -r exe; do
+    cp "$exe" out/$(basename "$exe" | sed 's/-[0-9a-f]*$//')
+  done
+} 2>&1 | tee /home/anvil/build.log | tail -5
+hard=$(ulimit -Hn); [ "$hard" = unlimited ] && hard=1048576; ulimit -n "$hard"
+sudo prlimit --pid $BASHPID --memlock=unlimited:unlimited
+{
+  uname -r; ldd --version | head -1; ls out
+  L=$(ls out/ringline* | grep -v echo | head -1); E=out/echo
+  for run in "$L conformance" "$L abi::" "$E async_echo_under_sqpoll"; do
+    set -- $run; name=$(basename $1)-$2
+    echo "== $name"
+    timeout 900 $1 $2 --test-threads=1 --nocapture > $name.out 2>&1
+    rc=$?
+    echo "RESULT $name exit=$rc $(grep -E '^test result:' $name.out | tail -1)"
+    cat $name.out
+  done
+} 2>&1 | tee /home/anvil/run-k6-1.log
+exit 0
+'''
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "stop"
+upload = true
+
+# --- k6-8
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "start"
+shape = "z2.c"
+image = "spool/images/ubuntu-24.04-base-20261008.1@golden"
+gpu = false
+boot_timeout = 600
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "exec"
+payload_timeout = 1800
+upload = true
+artifacts = ["/home/anvil/run-k6-8.log"]
+inputs = [{ artifact = "{tests_artifact}", name = "tests.tgz", dest = "/home/anvil" }]
+payload = '''
+set -uo pipefail
+cd /home/anvil && tar xzf tests.tgz && chmod +x out/*
+hard=$(ulimit -Hn); [ "$hard" = unlimited ] && hard=1048576; ulimit -n "$hard"
+sudo prlimit --pid $BASHPID --memlock=unlimited:unlimited
+{
+  uname -r; ldd --version | head -1; ls out
+  L=$(ls out/ringline* | grep -v echo | head -1); E=out/echo
+  for run in "$L conformance" "$L abi::" "$E async_echo_under_sqpoll"; do
+    set -- $run; name=$(basename $1)-$2
+    echo "== $name"
+    timeout 900 $1 $2 --test-threads=1 --nocapture > $name.out 2>&1
+    rc=$?
+    echo "RESULT $name exit=$rc $(grep -E '^test result:' $name.out | tail -1)"
+    cat $name.out
+  done
+} 2>&1 | tee /home/anvil/run-k6-8.log
+exit 0
+'''
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "stop"
+upload = true
+
+# --- k6-12
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "start"
+shape = "z2.c"
+image = "spool/images/debian-13-base-20260912.1@golden"
+gpu = false
+boot_timeout = 600
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "exec"
+payload_timeout = 1800
+upload = true
+artifacts = ["/home/anvil/run-k6-12.log"]
+inputs = [{ artifact = "{tests_artifact}", name = "tests.tgz", dest = "/home/anvil" }]
+payload = '''
+set -uo pipefail
+cd /home/anvil && tar xzf tests.tgz && chmod +x out/*
+hard=$(ulimit -Hn); [ "$hard" = unlimited ] && hard=1048576; ulimit -n "$hard"
+sudo prlimit --pid $BASHPID --memlock=unlimited:unlimited
+{
+  uname -r; ldd --version | head -1; ls out
+  L=$(ls out/ringline* | grep -v echo | head -1); E=out/echo
+  for run in "$L conformance" "$L abi::" "$E async_echo_under_sqpoll"; do
+    set -- $run; name=$(basename $1)-$2
+    echo "== $name"
+    timeout 900 $1 $2 --test-threads=1 --nocapture > $name.out 2>&1
+    rc=$?
+    echo "RESULT $name exit=$rc $(grep -E '^test result:' $name.out | tail -1)"
+    cat $name.out
+  done
+} 2>&1 | tee /home/anvil/run-k6-12.log
+exit 0
+'''
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "stop"
+upload = true
+
+# --- k7-1
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "start"
+shape = "z2.c"
+image = "spool/images/debian-13-ci-bpo-20261001.1@golden"
+gpu = false
+boot_timeout = 600
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "exec"
+payload_timeout = 1800
+upload = true
+artifacts = ["/home/anvil/run-k7-1.log"]
+inputs = [{ artifact = "{tests_artifact}", name = "tests.tgz", dest = "/home/anvil" }]
+payload = '''
+set -uo pipefail
+cd /home/anvil && tar xzf tests.tgz && chmod +x out/*
+hard=$(ulimit -Hn); [ "$hard" = unlimited ] && hard=1048576; ulimit -n "$hard"
+sudo prlimit --pid $BASHPID --memlock=unlimited:unlimited
+{
+  uname -r; ldd --version | head -1; ls out
+  L=$(ls out/ringline* | grep -v echo | head -1); E=out/echo
+  for run in "$L conformance" "$L abi::" "$E async_echo_under_sqpoll"; do
+    set -- $run; name=$(basename $1)-$2
+    echo "== $name"
+    timeout 900 $1 $2 --test-threads=1 --nocapture > $name.out 2>&1
+    rc=$?
+    echo "RESULT $name exit=$rc $(grep -E '^test result:' $name.out | tail -1)"
+    cat $name.out
+  done
+} 2>&1 | tee /home/anvil/run-k7-1.log
+exit 0
+'''
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "stop"
+upload = true
