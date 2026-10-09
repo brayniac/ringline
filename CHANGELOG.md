@@ -355,6 +355,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- On io_uring, a connection reading through `segments()` or
+  `with_segments` that stopped reading made the worker copy everything the
+  peer sent: segmented deliveries the reserve (or, with `recv_incremental`,
+  the lend cap) sends to the copy fallback were copied without limit. The
+  copies now stop at one receive ring's worth of bytes per worker; past
+  that the ring buffer is held, the ring drains and the peer is stopped by
+  TCP backpressure. A test client that wrote without being read sent 64
+  MiB before and stalls now.
+
 - io_uring: `ConfigBuilder::sqpoll(true)` works. Ring setup set
   `IORING_SETUP_COOP_TASKRUN` together with `IORING_SETUP_SQPOLL`, which the
   kernel refuses with `EINVAL`, so every worker failed to launch with

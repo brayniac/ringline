@@ -1083,7 +1083,10 @@ impl ConfigBuilder {
     /// well-behaved connections under fan-in. Above the reserve, delivery stays
     /// zero-copy. `0` force-copies only when the ring is fully drained. Tune
     /// relative to the `recv_buffer` ring size; must be `<= 65535`. Ignored
-    /// with `recv_incremental(true)`, where the lend cap decides.
+    /// with `recv_incremental(true)`, where the lend cap decides. Force-copied
+    /// bytes stop at one receive ring's worth per worker; past that the
+    /// buffer is held, so a reader that does not read is stopped by TCP
+    /// backpressure.
     ///
     /// Default: 64 (a quarter of the default 256-buffer recv ring).
     pub fn recv_segment_reserve(mut self, reserve: u32) -> Self {

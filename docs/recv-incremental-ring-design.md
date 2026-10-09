@@ -612,7 +612,9 @@ promoted, so its later lends pin large-group buffers.
 - Above the cap, each path copies instead:
   - `pending_recv_bufs`: into the accumulator;
   - segments and Mode A: into `HeldRecvBuf::Owned`, as the `ForceCopy`
-    decision does;
+    decision does, until owned segment copies hold one ring's worth of bytes
+    per worker (`Driver::own_segment_copy`); past that the ring buffer is
+    held, so a reader that does not read meets `ENOBUFS` backpressure;
   - recv-forward and direct echo, which deliver only from `recv_hold`: into an
     owned heap copy (`Driver::owned_recv`), not a `SendCopyPool` slot, since
     an incremental completion can exceed a 16 KiB slot. The entry's bid is
