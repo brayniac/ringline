@@ -3,14 +3,15 @@
 //! The 6.12.y incremental-buffer fixes ran through at least 6.12.81, so no
 //! kernel version marks a kernel that behaves as the receive driver relies
 //! on. Before a worker registers its TCP ring as incremental, it checks
-//! that behaviour on the running kernel with a one-entry ring and a
-//! loopback TCP pair (`docs/recv-incremental-ring-design.md`, "Selecting
+//! that behaviour on the running kernel with a one-entry ring and an
+//! `AF_UNIX` stream socketpair, which needs no network configuration (`docs/recv-incremental-ring-design.md`, "Selecting
 //! the ring kind"). It runs on the worker's ring before anything else is
 //! armed, since it reaps every completion the ring holds.
 
 use std::io::Write;
-use std::net::{Shutdown, TcpListener, TcpStream};
+use std::net::Shutdown;
 use std::os::fd::AsRawFd;
+use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
 use super::{Engine, RingKind};
@@ -25,6 +26,8 @@ const BGID: u16 = u16::MAX;
 const SIZE: u32 = 64;
 /// The preflight receive's user_data.
 const USER_DATA: u64 = u64::MAX - 1;
+/// The user_data of the cancel that tears a live preflight receive down.
+const CANCEL_USER_DATA: u64 = u64::MAX - 2;
 /// How long the preflight waits for one completion.
 const WAIT: Duration = Duration::from_secs(1);
 
@@ -41,9 +44,9 @@ pub(crate) enum IncPreflight {
 
 /// Check the incremental-ring behaviour the receive driver relies on.
 ///
-/// `Err` is a failure to run the check (the registration failing other
-/// than with `EINVAL`, or a socket error), which fails the worker's startup
-/// as any registration failure does.
+/// `Err` is a registration failing other than with `EINVAL`, which fails
+/// the worker's startup as any registration failure does. A socketpair or
+/// I/O failure is reported as a failed step, which selects plain rings.
 pub(crate) fn inc_preflight<E: Engine>(engine: &mut E) -> Result<IncPreflight, Error> {
     if !engine
         .incremental_buffers()
@@ -51,38 +54,61 @@ pub(crate) fn inc_preflight<E: Engine>(engine: &mut E) -> Result<IncPreflight, E
     {
         return Ok(IncPreflight::Unsupported);
     }
+    let Ok((mut client, server)) = UnixStream::pair() else {
+        return Ok(IncPreflight::Failed("socketpair"));
+    };
     let mut ring = ProvidedBufRing::new(BGID, 1, SIZE).map_err(Error::Io)?;
     ring.set_incremental();
     engine.register_buf_ring(&ring, RingKind::Incremental)?;
-    let result = match run(engine, &mut ring) {
+    let mut armed = false;
+    let mut reaped = Reaped::default();
+    let result = match run(
+        engine,
+        &mut ring,
+        &mut client,
+        &server,
+        &mut reaped,
+        &mut armed,
+    ) {
+        Ok(found) => Ok(found),
         Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
             Ok(IncPreflight::Failed("no completion within 1 s"))
         }
-        other => other.map_err(Error::Io),
+        Err(_) => Ok(IncPreflight::Failed("I/O error")),
     };
+    // A completion that ends the arm may already be reaped and unconsumed.
+    armed &= reaped.0.iter().all(|&(_, flags)| cqueue::more(flags));
+    if armed {
+        disarm(engine);
+    }
     // A failed unregister leaves the group registered on pages the kernel
     // has pinned, which is safe for the reason `register_buf_ring` gives.
     let _ = engine.unregister_buf_ring(BGID);
     result
 }
 
-fn run<E: Engine>(e: &mut E, ring: &mut ProvidedBufRing) -> std::io::Result<IncPreflight> {
+fn run<E: Engine>(
+    e: &mut E,
+    ring: &mut ProvidedBufRing,
+    client: &mut UnixStream,
+    server: &UnixStream,
+    reaped: &mut Reaped,
+    armed: &mut bool,
+) -> std::io::Result<IncPreflight> {
     use IncPreflight::Failed;
-    let listener = TcpListener::bind("127.0.0.1:0")?;
-    let mut client = TcpStream::connect(listener.local_addr()?)?;
-    let (server, _) = listener.accept()?;
-    client.set_nodelay(true)?;
     let base = ring.data_ptr(0, 0) as u64;
 
-    // Two writes append at increasing offsets, the entry advancing in place.
-    arm(e, &server)?;
+    // Write, reap, write, reap: the completions append at increasing
+    // offsets, and the entry advances in place.
+    arm(e, server)?;
+    *armed = true;
     client.write_all(b"abc")?;
-    if !delivered(wait(e)?, 3, true, true) {
+    if !delivered(wait(e, reaped, armed)?, 3, true, true) {
         return Ok(Failed("first completion"));
     }
     ring.complete(0, 3, true);
     client.write_all(b"defg")?;
-    if !delivered(wait(e)?, 4, true, true) {
+    if !delivered(wait(e, reaped, armed)?, 4, true, true) {
         return Ok(Failed("second completion"));
     }
     ring.complete(0, 4, true);
@@ -95,37 +121,64 @@ fn run<E: Engine>(e: &mut E, ring: &mut ProvidedBufRing) -> std::io::Result<IncP
         return Ok(Failed("ring entry advance"));
     }
 
-    // The completion that uses the buffer up clears F_BUF_MORE, and the next
-    // data ends the arm with ENOBUFS.
-    client.write_all(&[b'x'; SIZE as usize - 7])?;
-    if !delivered(wait(e)?, SIZE as i32 - 7, false, true) {
+    // More than the space left: the completion delivers exactly the space
+    // left with F_BUF_MORE clear, and the excess ends the arm with ENOBUFS.
+    const EXCESS: u32 = 5;
+    client.write_all(&[b'x'; (SIZE - 7 + EXCESS) as usize])?;
+    if !delivered(wait(e, reaped, armed)?, (SIZE - 7) as i32, false, true) {
         return Ok(Failed("exhausting completion"));
     }
     ring.complete(0, SIZE - 7, false);
-    client.write_all(b"y")?;
-    let (res, flags) = wait(e)?;
+    let (res, flags) = wait(e, reaped, armed)?;
     if res != -libc::ENOBUFS || cqueue::more(flags) {
         return Ok(Failed("ENOBUFS after exhaustion"));
     }
 
-    // Posted again and partly filled, the buffer stays posted at its used
-    // length when the peer half-closes.
+    // Posted again and re-armed, the excess lands at offset 0, and a
+    // half-close leaves the buffer posted at its used length.
     ring.release_batch(&[0, 0, 0]);
-    arm(e, &server)?;
-    if !delivered(wait(e)?, 1, true, true) {
+    arm(e, server)?;
+    *armed = true;
+    if !delivered(wait(e, reaped, armed)?, EXCESS as i32, true, true) {
         return Ok(Failed("completion after reposting"));
     }
-    ring.complete(0, 1, true);
+    ring.complete(0, EXCESS, true);
     client.shutdown(Shutdown::Write)?;
-    let (res, flags) = wait(e)?;
+    let (res, flags) = wait(e, reaped, armed)?;
     if res != 0 || cqueue::buffer_select(flags).is_some() || cqueue::more(flags) {
         return Ok(Failed("EOF completion"));
     }
-    if ring.entry(0) != (base + 1, SIZE - 1, 0) {
+    if ring.entry(0) != (base + EXCESS as u64, SIZE - EXCESS, 0) {
         return Ok(Failed("ring entry at EOF"));
     }
     ring.release_batch(&[0]);
     Ok(IncPreflight::Passed)
+}
+
+/// Cancel a live preflight receive and reap its last completion, so none
+/// reaches the event loop. Bounded by `WAIT`; past it the receive is left
+/// to the ring's teardown.
+fn disarm<E: Engine>(e: &mut E) {
+    let cancel = Sqe::new(Op::Cancel { target: USER_DATA }, CANCEL_USER_DATA);
+    // Safety: a cancel references no caller memory.
+    if unsafe { e.push(&cancel) }.is_err() {
+        return;
+    }
+    let deadline = Instant::now() + WAIT;
+    let mut out = Vec::new();
+    let (mut ended, mut cancelled) = (false, false);
+    while !(ended && cancelled) && Instant::now() < deadline {
+        if e.submit_and_get_events().is_err() {
+            return;
+        }
+        e.reap(&mut out);
+        for &(ud, _, flags) in &out {
+            ended |= ud == USER_DATA && !cqueue::more(flags);
+            cancelled |= ud == CANCEL_USER_DATA;
+        }
+        out.clear();
+        std::thread::yield_now();
+    }
 }
 
 /// Whether `(res, flags)` delivered `len` bytes into buffer 0 with the given
@@ -137,7 +190,7 @@ fn delivered((res, flags): (i32, u32), len: i32, buf_more: bool, more: bool) -> 
         && cqueue::more(flags) == more
 }
 
-fn arm<E: Engine>(e: &mut E, server: &TcpStream) -> std::io::Result<()> {
+fn arm<E: Engine>(e: &mut E, server: &UnixStream) -> std::io::Result<()> {
     let sqe = Sqe::new(
         Op::RecvMulti {
             fd: Fd::Raw(server.as_raw_fd()),
@@ -149,25 +202,43 @@ fn arm<E: Engine>(e: &mut E, server: &TcpStream) -> std::io::Result<()> {
     unsafe { e.push(&sqe) }
 }
 
-/// The next completion of the preflight receive, or `TimedOut` after
-/// `WAIT`.
-fn wait<E: Engine>(e: &mut E) -> std::io::Result<(i32, u32)> {
+/// Completions reaped but not yet consumed: one reap can return several
+/// of the preflight receive's completions.
+#[derive(Default)]
+struct Reaped(std::collections::VecDeque<(i32, u32)>);
+
+/// The next completion of the preflight receive, in order, or `TimedOut`
+/// after `WAIT`. Clears `armed` when the completion ends the arm.
+fn wait<E: Engine>(
+    e: &mut E,
+    reaped: &mut Reaped,
+    armed: &mut bool,
+) -> std::io::Result<(i32, u32)> {
     let deadline = Instant::now() + WAIT;
     let mut out = Vec::new();
     loop {
-        e.submit_and_get_events()?;
-        e.reap(&mut out);
-        if let Some(&(_, res, flags)) = out.iter().find(|c| c.0 == USER_DATA) {
+        if let Some((res, flags)) = reaped.0.pop_front() {
+            if !cqueue::more(flags) {
+                *armed = false;
+            }
             return Ok((res, flags));
         }
-        out.clear();
-        if Instant::now() >= deadline {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "no preflight completion within 1 s",
-            ));
+        e.submit_and_get_events()?;
+        e.reap(&mut out);
+        reaped.0.extend(
+            out.drain(..)
+                .filter(|c| c.0 == USER_DATA)
+                .map(|(_, res, flags)| (res, flags)),
+        );
+        if reaped.0.is_empty() {
+            if Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "no preflight completion within 1 s",
+                ));
+            }
+            std::thread::yield_now();
         }
-        std::thread::yield_now();
     }
 }
 
