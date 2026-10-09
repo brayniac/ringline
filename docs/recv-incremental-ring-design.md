@@ -115,9 +115,11 @@ and nothing holds any of its bytes.
 
 ## Selecting the ring kind
 
-At startup the worker registers the small group with `IOU_PBUF_RING_INC`.
-`EINVAL` selects plain rings for both groups; Linux 6.1 (Debian 12 and
-Amazon Linux 2023) returns it, and 6.12 and 7.1 accept the flag. Any other
+At startup the worker runs the preflight below and, if it passes,
+registers the small group with `IOU_PBUF_RING_INC`. A failed preflight, or
+`EINVAL` from the registration, selects plain rings for both groups; Linux
+6.1 (Debian 12 and Amazon Linux 2023) returns `EINVAL`, and 6.12 and 7.1
+accept the flag. Any other
 error from either attempt fails the worker's startup with
 `Error::BufferRegistration`, as a registration failure does today
 (`ENOMEM` from `RLIMIT_MEMLOCK` on 6.14+ included). If the large group's
@@ -135,10 +137,41 @@ ring with no large group. `recv_large_group(true)` is honoured with
 path with an explicit `recv_buffer(4096, 64 KiB)` plus
 `recv_large_group(true)`.
 
-The incremental-buffer code had fixes in 6.12 stable releases. Which 6.12.y
-release first has all the fixes this design relies on is not known. Step 0
-either names a minimum 6.12.y release and checks the running kernel against
-it, or keeps a runtime probe of the behaviour table on a one-entry ring.
+The incremental-buffer code had fixes in 6.12 stable releases, through at
+least 6.12.81, so no patch level marks a kernel with all of them, and a
+distribution kernel's patch level does not show its backports. The fixes
+after 6.12.63, the release the conformance tests passed on, concern
+non-pollable files, bundles, zero-length transfers and multishot `RECVMSG`
+with little space left in a buffer. Instead of a version check, each
+worker checks the behaviour the driver relies on, on the running kernel,
+before it registers the small group with `IOU_PBUF_RING_INC`. It runs on
+the worker's own ring, set up with the production flags, before anything
+else is armed, and uses an `AF_UNIX` stream socketpair, which needs no
+network configuration:
+
+1. Register a one-entry INC ring with a small buffer at the reserved bgid
+   65535, the one the `incremental_buffers` probe uses.
+2. Arm a multishot `RECV` on one end. Write, reap, write, reap: the two
+   completions must land at offsets 0 and the first's length, both with
+   `F_BUF_MORE`, and the ring entry must advance in place.
+3. Write more than the space left. The completion must deliver exactly the
+   space left with `F_BUF_MORE` clear, and the excess must end the arm with
+   `-ENOBUFS` without `F_MORE`.
+4. Post the buffer again and re-arm. The excess must complete at offset 0
+   with `F_BUF_MORE`; then a half-close must end the arm with `res` 0, no
+   `F_BUFFER` and no `F_MORE`, leaving the entry at the used length.
+5. Tear down before the event loop starts: cancel the arm if it is still
+   live and reap its last completion, unregister the group, and close the
+   sockets, so no preflight completion reaches the event loop.
+
+Each step waits at most 1 s for its completion; a step that times out does
+not match. A registration refused with `EINVAL` (no INC), a step that does
+not match, or a failure to create the socketpair selects plain rings, and
+the worker records which step failed in a metric. Any other registration
+error fails startup as above. The preflight's ring entry is one page,
+which the memlock preflight counts on 6.14+. The preflight does not cover
+ordering under CQ overflow or SQPOLL; the conformance tests checked those
+on 6.12.63 and 7.1. Its time per worker is measured in step 4.
 
 Ubuntu's 6.8 kernels from 6.8.0-139 reject every provided-ring registration
 whose reserved words are zero, the form other kernels require, and accept
@@ -200,17 +233,22 @@ The rules:
 3. A buffer returns to its group's ring when it is `exhausted` and `holds` is
    zero, and only then. It is posted whole (`addr = base`,
    `len = buffer_size`), and `written` resets to zero.
-4. A path that keeps bytes past the completion handler takes a hold and
-   drops it when it is done. The copy paths (the accumulator copy, TLS, recv
-   sinks, `ForceCopy`, timestamps) take none.
+4. Every completion takes one hold, and every path releases it once by
+   pushing the bid to `pending_replenish`: a copy path (the accumulator
+   copy, TLS, recv sinks, `ForceCopy`, timestamps, the stale-CQE early
+   returns) in the completion handler, a lend path when it is done with
+   the bytes. `flush_replenish_and_rearm` releases the pushed bids
+   (`ProvidedBufRing::release_batch`).
 5. On a plain ring every completion exhausts its buffer, at offset 0. One
    code path serves both ring kinds.
 
-Rules 3 and 4 replace the per-path "exactly one replenish per bid" checks
-(`docs/segmented-recv-design.md`) with one count per buffer and one return
-site. A runtime check guards rule 1: when a completion clears `F_BUF_MORE`,
-`written` must equal `buffer_size`, and while it is set, be less; a mismatch
-is a bug and fails loudly.
+The per-path single pushes (`docs/segmented-recv-design.md`) remain; each
+releases one hold, and the buffer returns at one site, `release_batch`. A
+release without a hold panics, naming the bid. A duplicate release that
+arrives after the buffer was posted and completed again takes that
+completion's hold and is not detected. A runtime check guards rule 1: when a
+completion clears `F_BUF_MORE`, `written` must equal `buffer_size`, and
+while it is set, be less; a mismatch is a bug and fails loudly.
 
 A buffer counts as out of the ring when it is exhausted and not yet
 returned; a partly filled buffer is still in the ring. A group's `free()` is
@@ -245,45 +283,42 @@ buffers; each now also names the group:
 - `RecvMsgMultiTs` (the `timestamps` feature) has no large-group tag.
   Timestamped connections are not promoted.
 - The completion handlers (`event_loop.rs` `handle_recv_multi`,
-  `handle_recv_msg_multi_ts`) read from the base.
-- `HeldRecvBuf::Pinned { bid, len }` (`driver.rs`), `SegBacking::Pinned` and
-  `SegSettle::Pinned` (`runtime/io.rs`) gain `group` and `off`. Their
-  readers re-derive the base: `driver.rs` forward-write iovecs, the Mode A
-  split, `advance_forward` and `settle_forward_end`; `io.rs` segment readers
-  and the `with_segments` remainder.
-- `PendingRecvBuf`'s pointer, today the buffer's base, becomes the data's
-  address. `PendingRecvBuf` (backing `pending_recv_bufs` and `recv_hold`)
-  gains `group`; a migrating connection can hold entries from both groups.
+  `handle_recv_msg_multi_ts`) read the data at the offset `complete`
+  returns (steps 2 and 3).
+- `HeldRecvBuf::Pinned` (`driver.rs`), `SegBacking::Pinned` and
+  `SegSettle::Pinned` (`runtime/io.rs`) carry `off`, and their readers use
+  `data_ptr(bid, off)`: `driver.rs` forward-write iovecs, the Mode A split,
+  `advance_forward` and `settle_forward_end`; `io.rs` segment readers and
+  the `with_segments` remainder (step 3). They gain `group` in step 5.
+- `PendingRecvBuf`'s pointer is the data's address (step 3).
+  `PendingRecvBuf` (backing `pending_recv_bufs` and `recv_hold`) gains
+  `group` in step 5; a migrating connection can hold entries from both
+  groups.
 - The send slab's recv-forward entries record a group per bid (`bids`
   becomes `(group, bid)` pairs), read by `recv_forward_bids` at the
   `SendRecvBufsCoalesced` completion.
-- `copy_out_bid` (park) takes the group and offset, or the data pointer, and
-  copies from the data's address; today it reads from the base.
+- `copy_out_bid` (park) takes the data pointer (step 3).
 - `handle_send_recv_buf` resubmits a partial send from
-  `base + (original_len - remaining)`. Its user_data carries the bid, the
-  remainder bit and the group bit. A per-connection `send_recv_buf_ptr`,
-  next to `send_recv_buf_original_lens`, holds the original data address.
+  `data_ptr(bid, off + original_len - remaining)`, where the per-connection
+  `send_recv_buf_offs`, next to `send_recv_buf_original_lens`, holds the
+  original data's offset (step 3). Its user_data gains the group bit in
+  step 5.
 - `provided_bufs` becomes one `ProvidedBufRing` per group, and
   `pending_replenish` becomes per group (or `(group, bid)`);
   `flush_replenish_and_rearm` replenishes each.
-- Every `pending_replenish.push` of a TCP bid goes through rule 3's return
-  check. A lend path releases its hold first; a copy path (TLS, the
-  stale-CQE early returns, timestamps, the accumulator copy) releases
-  nothing. The lend paths include the `segment_pinned` single-release check,
+- Every `pending_replenish.push` of a TCP bid releases one hold through
+  rule 3's return check (step 2). The lend paths include the `segment_pinned` single-release check,
   the recv-forward slab's one-bid-per-iovec replenish,
   `release_queued_sends`, the Mode A forward-write completion and
   `fail_forward_write`, `start_forward_write`'s error paths, the close and
   park drains, and the `pending_recv_bufs` flushes (`io.rs` `with_data`,
   `with_bytes`, segmented entry, `with_segments`, direct-echo arm;
   `stream.rs`; the starved and accumulator flushes in `event_loop.rs`).
-- `on_handout` and `free()` count buffers out of each group's ring as
-  defined above.
+- `complete` and `release_batch` count buffers out of the ring as defined
+  above, and `free()` reads the count (step 2); in step 5, per group.
 - `MAX_FORWARD_IOV` (16), `FORWARD_HELD_MAX_BUFFERS` (32) and the send
   slab's `MAX_IOVECS` (32) bound ranges per call; one gathered write can
   hold that many shared 1 MiB buffers.
-- `replenish_batch`'s `debug_assert` is count-based and cannot see one bid
-  returned twice; the runtime check above and rule 3's single return site
-  replace it.
 
 The UDP ring shares the `ProvidedBufRing` type and stays plain; under rule 5
 it needs no special case.
@@ -646,13 +681,21 @@ receive queue, and TCP closes the window until the worker re-arms.
   `recv_large_demote_quiet(Duration)` the demotion quiet period, default
   1 s. `build()` rejects a large-group bgid equal to the TCP bgid
   (default 0), or the UDP bgid (default 1) when UDP is in use.
+- With INC on and the `timestamps` feature built in, timestamped
+  connections get their own plain ring. Their multishot `RECVMSG` works on
+  an INC ring (conformance tests), but before the 6.12.y change that lets a
+  ring require a minimum length left in a buffer it can fail when the space
+  left is smaller than the message header; that failure is not reproduced
+  here. The ring's geometry is the plain small group's, its bgid
+  (`recv_timestamp_buffer_bgid`, default 3) is validated against the TCP,
+  UDP and large-group bgids, and its entries count in the memlock
+  preflight.
 
 ## Unchanged
 
 - The UDP ring (`udp_recv_buffer`, its own bgid) stays plain.
-- TLS (both engines) copies out of the ring and takes no hold.
-- The `timestamps` feature shares the small TCP group, with
-  `RecvMsgOut::parse` reading at the completion's offset.
+- TLS (both engines) copies out of the ring and releases its completion's
+  hold in the handler.
 - mio. If the ring emulator (#621) lands, it implements this state machine.
 
 ## Metrics
@@ -694,8 +737,8 @@ buffers held by `with_bytes` views, values copied by the
 0. Probe and conformance tests: each row of the behaviour table, the
    byte-verified offset order (a CQ overflow, SQPOLL), EOF on a partly
    used buffer, and multishot `RECVMSG` on an INC ring; run on CI and as
-   SystemsLab experiments on 6.1, 6.8, 6.12 and 7.1. Settle the 6.12.y
-   minimum or keep a probe.
+   SystemsLab experiments on 6.1, 6.8, 6.12 and 7.1. Ring selection uses
+   a behaviour preflight instead of a 6.12.y minimum.
 1. Bounded accumulator: the target length from `NeedAtLeast` and the
    sites that clear it (reset, close, `ConnStream` reads, the segmented
    entry's `take_frozen`, `settle_forward_end`), the hold of a
@@ -715,14 +758,16 @@ buffers held by `with_bytes` views, values copied by the
    the fast path and the accumulator-first parse order.
 2. Buffer state (`written`, `exhausted`, `holds`) with the ring registered
    plain. Every completion exhausts its buffer at offset 0, so behaviour is
-   unchanged; the per-path single-release checks become holds. The existing
+   unchanged; each per-path push releases one hold. The existing
    lifecycle tests (double replenish, leaks, close drain, the Mode A hold
    cap) pass unchanged. Steps 2 and 3 can be one change if that is simpler.
 3. Offsets: the `off` fields, data at `base + written`, `copy_out_bid`
    and `settle_forward_end`. Still a plain ring, where these offsets are 0,
    so these paths are exercised only from step 4.
 4. INC and the plain geometry, behind `recv_incremental` (default `false`):
-   ring-kind selection, `MADV_NOHUGEPAGE` and the 4096 × 64 KiB plain
+   ring-kind selection with the behaviour preflight and its timing, a
+   plain ring for timestamped connections, `MADV_NOHUGEPAGE` and the
+   4096 × 64 KiB plain
    geometry, the per-group lend cap and its copy paths,
    `recv_segment_reserve` ignored under INC, the fallback arbitration, the
    memlock preflight, and the per-group metrics.

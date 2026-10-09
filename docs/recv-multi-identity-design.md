@@ -129,7 +129,9 @@ if self.driver.connections.get(conn_index).is_none()
     || self.driver.connections.generation(conn_index) != ud.payload()
 {
     if result > 0 && let Some(bid) = cqueue::buffer_select(flags) {
-        self.driver.provided_bufs.on_handout();
+        self.driver
+            .provided_bufs
+            .complete(bid, result as u32, cqueue::buf_more(flags));
         self.driver.pending_replenish.push(bid);
     }
     return;

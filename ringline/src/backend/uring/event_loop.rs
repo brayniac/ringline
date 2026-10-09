@@ -1036,7 +1036,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let replenished = if !self.driver.pending_replenish.is_empty() {
             self.driver
                 .provided_bufs
-                .replenish_batch(&self.driver.pending_replenish);
+                .release_batch(&self.driver.pending_replenish);
             self.driver.pending_replenish.clear();
             true
         } else {
@@ -1415,7 +1415,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             if result > 0
                 && let Some(bid) = cqueue::buffer_select(flags)
             {
-                self.driver.provided_bufs.on_handout();
+                self.driver
+                    .provided_bufs
+                    .complete(bid, result as u32, cqueue::buf_more(flags));
                 self.driver.pending_replenish.push(bid);
             }
             return;
@@ -1555,10 +1557,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
         };
 
-        self.driver.provided_bufs.on_handout();
         let bytes_received = result as u32;
+        let buf_off =
+            self.driver
+                .provided_bufs
+                .complete(bid, bytes_received, cqueue::buf_more(flags));
         metrics::BYTES.add(metrics::bytes::RECEIVED, bytes_received as u64);
-        let (buf_ptr, _) = self.driver.provided_bufs.get_buffer(bid);
+        let buf_ptr = self.driver.provided_bufs.data_ptr(bid, buf_off);
         let data = unsafe { std::slice::from_raw_parts(buf_ptr, bytes_received as usize) };
 
         // NOTE: bid is NOT unconditionally pushed to pending_replenish here.
@@ -1691,7 +1696,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // Segmented delivery (Mode B/C). Consult the aggregate low-water
             // reserve on the shared per-worker recv ring (see
             // `docs/segmented-recv-design.md`, "Backpressure and ring safety").
-            // `on_handout()` above already counted this bid, so `free()` reflects
+            // `complete()` above already counted this bid, so `free()` reflects
             // this delivery.
             let reserve = self.driver.recv_segment_reserve;
             let free = self.driver.provided_bufs.free();
@@ -1706,6 +1711,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     self.driver.segment_hold[conn_index as usize].push_back(
                         crate::backend::HeldRecvBuf::Pinned {
                             bid,
+                            off: buf_off,
                             len: bytes_received,
                         },
                     );
@@ -1713,7 +1719,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 crate::recv::occupancy::Delivery::ForceCopy => {
                     // At/below the reserve: copy the bytes into an owned `Bytes`
                     // and replenish the bid IMMEDIATELY so the ring recovers and
-                    // holders cannot deplete it. `on_handout()` counted the bid at
+                    // holders cannot deplete it. `complete()` counted the bid at
                     // buffer_select; this replenish balances it (net-zero pin), so
                     // the outstanding/free accounting stays consistent. INC
                     // ordering: copy before replenish, no await between.
@@ -1931,7 +1937,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             if result > 0
                 && let Some(bid) = cqueue::buffer_select(flags)
             {
-                self.driver.provided_bufs.on_handout();
+                self.driver
+                    .provided_bufs
+                    .complete(bid, result as u32, cqueue::buf_more(flags));
                 self.driver.pending_replenish.push(bid);
             }
             return;
@@ -1989,9 +1997,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // delivered, so any park offer is stale (#443 tier 3).
         self.withdraw_park_offer(conn_index);
 
-        self.driver.provided_bufs.on_handout();
         let buf_len = result as u32;
-        let (buf_ptr, _) = self.driver.provided_bufs.get_buffer(bid);
+        let buf_off = self
+            .driver
+            .provided_bufs
+            .complete(bid, buf_len, cqueue::buf_more(flags));
+        let buf_ptr = self.driver.provided_bufs.data_ptr(bid, buf_off);
         let buf = unsafe { std::slice::from_raw_parts(buf_ptr, buf_len as usize) };
 
         self.driver.pending_replenish.push(bid);
@@ -3894,10 +3905,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 // Partial send — resubmit the remainder.
                 let new_remaining = remaining_before - bytes_sent;
                 self.driver.send_recv_buf_remaining[conn_index as usize] = new_remaining;
-                let (buf_ptr, _buf_size) = self.driver.provided_bufs.get_buffer(bid);
                 let original_len = self.driver.send_recv_buf_original_lens[conn_index as usize];
-                let offset = original_len - new_remaining;
-                let new_ptr = unsafe { buf_ptr.add(offset as usize) };
+                let offset = self.driver.send_recv_buf_offs[conn_index as usize] + original_len
+                    - new_remaining;
+                let new_ptr = self.driver.provided_bufs.data_ptr(bid, offset);
                 let new_payload = bid as u32 | crate::completion::SEND_RECV_BUF_REMAINDER;
                 let new_ud = UserData::encode(
                     crate::completion::OpTag::SendRecvBuf,
@@ -6043,14 +6054,22 @@ mod tests {
                 "pinned",
                 Box::new(|el: &mut AsyncEventLoop<NoopHandler>, c: u32| {
                     el.driver.segment_pinned[c as usize] =
-                        Some(crate::backend::uring::driver::HeldRecvBuf::Pinned { bid: 0, len: 5 });
+                        Some(crate::backend::uring::driver::HeldRecvBuf::Pinned {
+                            bid: 0,
+                            off: 0,
+                            len: 5,
+                        });
                 }) as Box<dyn Fn(&mut AsyncEventLoop<NoopHandler>, u32)>,
             ),
             (
                 "held",
                 Box::new(|el: &mut AsyncEventLoop<NoopHandler>, c: u32| {
                     el.driver.segment_hold[c as usize].push_back(
-                        crate::backend::uring::driver::HeldRecvBuf::Pinned { bid: 1, len: 5 },
+                        crate::backend::uring::driver::HeldRecvBuf::Pinned {
+                            bid: 1,
+                            off: 0,
+                            len: 5,
+                        },
                     );
                 }),
             ),
@@ -8692,6 +8711,140 @@ mod tests {
         );
     }
 
+    /// On an incremental ring a completion's data starts at the bytes the
+    /// buffer already holds, not at its base: two completions into one
+    /// buffer reach the connection as consecutive bytes, and the buffer is
+    /// released once per completion.
+    #[test]
+    fn handle_recv_multi_reads_each_completion_at_its_offset() {
+        let mut el = make_test_loop();
+        el.driver.provided_bufs.set_incremental_for_test();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let bid: u16 = 2;
+        let (buf_ptr, _) = el.driver.provided_bufs.get_buffer(bid);
+        unsafe { std::ptr::copy_nonoverlapping(b"abcdefg".as_ptr(), buf_ptr as *mut u8, 7) };
+        // F_BUFFER | F_MORE | F_BUF_MORE, bid.
+        let flags = 1u32 | 2 | 0x10 | ((bid as u32) << 16);
+        let ud = UserData::encode(OpTag::RecvMulti, conn_index, generation);
+        el.test_dispatch_cqe(ud.raw(), 3, flags);
+        el.test_dispatch_cqe(ud.raw(), 4, flags);
+
+        let mut got = el.driver.accumulators.data(conn_index).to_vec();
+        if let Some(p) = el.driver.pending_recv_bufs[conn_index as usize] {
+            got.extend_from_slice(unsafe { std::slice::from_raw_parts(p.ptr, p.len as usize) });
+        }
+        assert_eq!(got, b"abcdefg");
+        assert_eq!(
+            el.driver.provided_bufs.free(),
+            el.driver.provided_bufs.ring_entries(),
+            "a partly used buffer stays in the ring"
+        );
+        // Both completions' bytes are in the accumulator, and each released
+        // its hold once.
+        assert!(el.driver.pending_recv_bufs[conn_index as usize].is_none());
+        assert_eq!(el.driver.pending_replenish, [bid, bid]);
+        let r: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
+        el.driver.provided_bufs.release_batch(&r);
+    }
+
+    /// A partial direct-echo send resumes from the original data's offset in
+    /// its buffer plus the bytes sent, not from the buffer's base. The
+    /// remainder is parked by a forced push failure so its SQE can be read.
+    #[test]
+    fn handle_send_recv_buf_resumes_at_the_data_offset() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let ci = conn_index as usize;
+        let bid: u16 = 0;
+        el.driver.send_recv_buf_offs[ci] = 7;
+        el.driver.send_recv_buf_original_lens[ci] = 100;
+        el.driver.send_recv_buf_remaining[ci] = 100;
+        el.driver.send_queues[ci].in_flight = true;
+        el.driver.ring.force_push_failures(1);
+        let ud = UserData::encode(OpTag::SendRecvBuf, conn_index, bid as u32);
+        el.test_dispatch_cqe(ud.raw(), 60, 0);
+        let crate::backend::uring::sqe::Op::Send { buf, len, .. } =
+            el.driver.send_queues[ci].queue[0].entry.op
+        else {
+            panic!("the parked remainder is a plain send");
+        };
+        assert_eq!(buf, el.driver.provided_bufs.data_ptr(bid, 67));
+        assert_eq!(len, 40);
+    }
+
+    /// Pushing a direct-echo send records its data's offset in the buffer,
+    /// which a partial send resumes from.
+    #[test]
+    fn a_pushed_direct_echo_send_records_its_offset() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let bid: u16 = 1;
+        let ud = UserData::encode(OpTag::SendRecvBuf, conn_index, bid as u32);
+        let entry = crate::backend::uring::sqe::Sqe::stream_send(
+            conn_index,
+            el.driver.provided_bufs.data_ptr(bid, 5),
+            10,
+            ud.raw(),
+        );
+        el.driver.submit_or_queue_send(
+            conn_index,
+            crate::handler::BuiltSend {
+                entry,
+                pool_slot: u16::MAX,
+                slab_idx: u16::MAX,
+                total_len: 10,
+            },
+        );
+        assert_eq!(el.driver.send_recv_buf_offs[conn_index as usize], 5);
+        assert_eq!(
+            el.driver.send_recv_buf_original_lens[conn_index as usize],
+            10
+        );
+    }
+
+    /// `settle_forward_end` reads a held buffer at its offset.
+    #[test]
+    fn settle_forward_end_reads_a_held_buffer_at_its_offset() {
+        let mut el = make_test_loop();
+        el.driver.provided_bufs.set_incremental_for_test();
+        let conn_index = accept_connection(&mut el);
+        let bid: u16 = 1;
+        let (buf_ptr, _) = el.driver.provided_bufs.get_buffer(bid);
+        unsafe { std::ptr::copy_nonoverlapping(b"skip-kept".as_ptr(), buf_ptr as *mut u8, 9) };
+        el.driver.provided_bufs.complete(bid, 5, true);
+        let off = el.driver.provided_bufs.complete(bid, 4, true);
+        assert_eq!(off, 5);
+        el.driver.segment_hold[conn_index as usize]
+            .push_back(crate::backend::HeldRecvBuf::Pinned { bid, off, len: 4 });
+        assert!(el.driver.settle_forward_end(conn_index));
+        assert_eq!(el.driver.accumulators.data(conn_index), b"kept");
+    }
+
+    /// The timestamps handler's stale-CQE branch counts and releases the
+    /// buffer exactly once, as `handle_recv_multi`'s does.
+    #[cfg(feature = "timestamps")]
+    #[test]
+    fn handle_recv_msg_multi_ts_stale_generation_releases_buffer_once() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let stale_generation = el.driver.connections.generation(conn_index);
+        recycle_connection(&mut el, conn_index);
+        el.driver.pending_replenish.clear();
+        let free_before = el.driver.provided_bufs.free();
+
+        let bid: u16 = 3;
+        let flags = 1u32 | 2u32 | ((bid as u32) << 16);
+        let stale_ud = UserData::encode(OpTag::RecvMsgMultiTs, conn_index, stale_generation);
+        el.test_dispatch_cqe(stale_ud.raw(), 40, flags);
+
+        assert_eq!(el.driver.pending_replenish, [bid]);
+        assert_eq!(el.driver.provided_bufs.free(), free_before - 1);
+        let r: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
+        el.driver.provided_bufs.release_batch(&r);
+        assert_eq!(el.driver.provided_bufs.free(), free_before);
+    }
+
     #[test]
     fn handle_recv_multi_stale_generation_replenishes_buffer_once() {
         let mut el = make_test_loop();
@@ -8739,7 +8892,7 @@ mod tests {
 
         // The accounting closes: replenishing restores the free count.
         let r: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
-        el.driver.provided_bufs.replenish_batch(&r);
+        el.driver.provided_bufs.release_batch(&r);
         assert_eq!(
             el.driver.provided_bufs.free(),
             free_before,
@@ -9003,8 +9156,8 @@ mod tests {
             "recv handout must decrement free by one"
         );
 
-        // The consume path returns the bid via replenish_batch; free is restored.
-        el.driver.provided_bufs.replenish_batch(&[bid]);
+        // The consume path releases the bid via release_batch; free is restored.
+        el.driver.provided_bufs.release_batch(&[bid]);
         assert_eq!(
             el.driver.provided_bufs.free(),
             entries,
@@ -9058,8 +9211,13 @@ mod tests {
         let hold = &el.driver.segment_hold[conn_index as usize];
         assert_eq!(hold.len(), 1, "buffer should be held in segment_hold");
         match &hold[0] {
-            crate::backend::HeldRecvBuf::Pinned { bid: hbid, len } => {
+            crate::backend::HeldRecvBuf::Pinned {
+                bid: hbid,
+                off,
+                len,
+            } => {
                 assert_eq!(*hbid, bid);
+                assert_eq!(*off, 0, "a plain ring delivers at offset 0");
                 assert_eq!(*len, bytes_received as u32);
             }
             crate::backend::HeldRecvBuf::Owned(_) => {
@@ -9102,7 +9260,7 @@ mod tests {
             "handle_close queues the held bid for replenish"
         );
         let to_replenish: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
-        el.driver.provided_bufs.replenish_batch(&to_replenish);
+        el.driver.provided_bufs.release_batch(&to_replenish);
         assert_eq!(
             el.driver.provided_bufs.free(),
             entries,
@@ -9213,7 +9371,7 @@ mod tests {
             "drop queues the bid for replenish"
         );
         let to_replenish: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
-        el.driver.provided_bufs.replenish_batch(&to_replenish);
+        el.driver.provided_bufs.release_batch(&to_replenish);
         assert_eq!(
             el.driver.provided_bufs.free(),
             entries,
@@ -9342,7 +9500,7 @@ mod tests {
         );
 
         let to_replenish: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
-        el.driver.provided_bufs.replenish_batch(&to_replenish);
+        el.driver.provided_bufs.release_batch(&to_replenish);
         assert_eq!(
             el.driver.provided_bufs.free(),
             entries,
@@ -9409,7 +9567,7 @@ mod tests {
             "stale segment drop after teardown does not double-replenish"
         );
         let to_replenish: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
-        el.driver.provided_bufs.replenish_batch(&to_replenish);
+        el.driver.provided_bufs.release_batch(&to_replenish);
         assert_eq!(
             el.driver.provided_bufs.free(),
             entries,
@@ -9644,7 +9802,7 @@ mod tests {
         // (b) Commit the replenish, then overwrite the underlying buffer: the owned
         // Bytes must be unaffected — proving it is a real copy, not an alias.
         let to_replenish: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
-        el.driver.provided_bufs.replenish_batch(&to_replenish);
+        el.driver.provided_bufs.release_batch(&to_replenish);
         assert_eq!(
             el.driver.provided_bufs.free(),
             entries,
@@ -9721,7 +9879,7 @@ mod tests {
             "bid replenished at delivery, before the owned Bytes is dropped"
         );
         let to_replenish: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
-        el.driver.provided_bufs.replenish_batch(&to_replenish);
+        el.driver.provided_bufs.release_batch(&to_replenish);
         assert_eq!(
             el.driver.provided_bufs.free(),
             entries,
@@ -9863,7 +10021,7 @@ mod tests {
 
         // No held buffers were leaked: the ring's free count is fully restored.
         let to_replenish: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
-        el.driver.provided_bufs.replenish_batch(&to_replenish);
+        el.driver.provided_bufs.release_batch(&to_replenish);
         assert_eq!(
             el.driver.provided_bufs.free(),
             entries,
@@ -9981,7 +10139,7 @@ mod tests {
         assert!(el.driver.pending_replenish.contains(&0));
         assert!(el.driver.pending_replenish.contains(&1));
         let to_replenish: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
-        el.driver.provided_bufs.replenish_batch(&to_replenish);
+        el.driver.provided_bufs.release_batch(&to_replenish);
         assert_eq!(
             el.driver.provided_bufs.free(),
             entries,
@@ -10032,7 +10190,7 @@ mod tests {
         assert!(el.driver.pending_replenish.contains(&0));
         assert!(el.driver.pending_replenish.contains(&1));
         let to_replenish: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
-        el.driver.provided_bufs.replenish_batch(&to_replenish);
+        el.driver.provided_bufs.release_batch(&to_replenish);
         assert_eq!(
             el.driver.provided_bufs.free(),
             entries,
@@ -10197,7 +10355,7 @@ mod tests {
         // Committing the queued replenish restores the full ring while the owned
         // segment is STILL held — proving the hold pins nothing.
         let to_replenish: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
-        el.driver.provided_bufs.replenish_batch(&to_replenish);
+        el.driver.provided_bufs.release_batch(&to_replenish);
         assert_eq!(
             el.driver.provided_bufs.free(),
             entries,
@@ -10226,8 +10384,13 @@ mod tests {
         let hold = &el.driver.segment_hold[conn_index as usize];
         assert_eq!(hold.len(), 1);
         match &hold[0] {
-            crate::backend::HeldRecvBuf::Pinned { bid: hbid, len } => {
+            crate::backend::HeldRecvBuf::Pinned {
+                bid: hbid,
+                off,
+                len,
+            } => {
                 assert_eq!(*hbid, bid);
+                assert_eq!(*off, 0, "a plain ring delivers at offset 0");
                 assert_eq!(*len, 5);
             }
             crate::backend::HeldRecvBuf::Owned(_) => {
@@ -11235,7 +11398,7 @@ mod tests {
         deliver_segment(&mut el, conn_index, bid, b"hello");
         // Commit the force-copy's delivery-time replenish so the ring is full.
         let r: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
-        el.driver.provided_bufs.replenish_batch(&r);
+        el.driver.provided_bufs.release_batch(&r);
         assert_eq!(el.driver.provided_bufs.free(), entries);
 
         // Read the owned segment out via the lending-iterator reader.
@@ -11319,7 +11482,7 @@ mod tests {
             "consuming an owned hold entry must not replenish its bid again"
         );
         let r: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
-        el.driver.provided_bufs.replenish_batch(&r);
+        el.driver.provided_bufs.release_batch(&r);
         assert_eq!(el.driver.provided_bufs.free(), entries, "balanced");
     }
 
@@ -11343,7 +11506,7 @@ mod tests {
         // ring is full before consuming.
         let r: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
         assert_eq!(r.len(), 2, "both force-copied bids queued at delivery");
-        el.driver.provided_bufs.replenish_batch(&r);
+        el.driver.provided_bufs.release_batch(&r);
         assert_eq!(el.driver.provided_bufs.free(), entries);
 
         let seen: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
@@ -11394,7 +11557,7 @@ mod tests {
         deliver_segment(&mut el, conn_index, 0, b"hello");
         deliver_segment(&mut el, conn_index, 1, b"world");
         let r: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
-        el.driver.provided_bufs.replenish_batch(&r);
+        el.driver.provided_bufs.release_batch(&r);
         assert_eq!(el.driver.provided_bufs.free(), entries);
 
         let conn = ConnCtx::new(conn_index, generation);
@@ -11474,7 +11637,7 @@ mod tests {
             "teardown must NOT re-queue an owned entry's bid (no bid to return)"
         );
         let r: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
-        el.driver.provided_bufs.replenish_batch(&r);
+        el.driver.provided_bufs.release_batch(&r);
         assert_eq!(
             el.driver.provided_bufs.free(),
             entries,
@@ -11750,7 +11913,7 @@ mod tests {
         // The held buffer's bid has to come back, or a refused forward leaks a
         // provided buffer per attempt.
         let r: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
-        el.driver.provided_bufs.replenish_batch(&r);
+        el.driver.provided_bufs.release_batch(&r);
         assert_eq!(
             el.driver.provided_bufs.free(),
             entries,
@@ -11834,7 +11997,7 @@ mod tests {
             "delivery domain reset after the forward"
         );
         let r: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
-        el.driver.provided_bufs.replenish_batch(&r);
+        el.driver.provided_bufs.release_batch(&r);
         assert_eq!(el.driver.provided_bufs.free(), entries, "free restored");
     }
 
@@ -11930,7 +12093,7 @@ mod tests {
             "forwarded all 10 bytes"
         );
         let r: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
-        el.driver.provided_bufs.replenish_batch(&r);
+        el.driver.provided_bufs.release_batch(&r);
         assert_eq!(
             el.driver.provided_bufs.free(),
             entries,
@@ -11962,7 +12125,7 @@ mod tests {
         // Commit the delivery-time replenish so `free()` reflects the ring is not
         // depleted by the (owned) held buffer.
         let r: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
-        el.driver.provided_bufs.replenish_batch(&r);
+        el.driver.provided_bufs.release_batch(&r);
         assert_eq!(
             el.driver.provided_bufs.free(),
             entries,
@@ -12071,7 +12234,7 @@ mod tests {
             "a stale forward-write CQE does not double-replenish"
         );
         let r: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
-        el.driver.provided_bufs.replenish_batch(&r);
+        el.driver.provided_bufs.release_batch(&r);
         assert_eq!(
             el.driver.provided_bufs.free(),
             entries,
@@ -12387,7 +12550,7 @@ mod tests {
 
         // And its bid goes back, or the ring bleeds an entry per forward.
         let r: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
-        el.driver.provided_bufs.replenish_batch(&r);
+        el.driver.provided_bufs.release_batch(&r);
         assert_eq!(el.driver.provided_bufs.free(), free_before);
     }
 
@@ -12580,7 +12743,7 @@ mod tests {
         el.test_dispatch_cqe(recv_ud.raw(), -libc::ECANCELED, 0);
 
         let r: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
-        el.driver.provided_bufs.replenish_batch(&r);
+        el.driver.provided_bufs.release_batch(&r);
         assert_eq!(
             el.driver.provided_bufs.free(),
             entries,
@@ -13220,7 +13383,7 @@ mod tests {
         // Buffers came back — but re-arming a connection with a partial
         // message would only move one ring's worth before parking again
         // (the churn cycle). The fallback must win the arbitration.
-        el.driver.provided_bufs.on_handout(); // a replenished bid was handed out first
+        el.driver.provided_bufs.complete(0, 1, false); // a bid was handed out first
         el.driver.pending_replenish.push(0);
         el.flush_replenish_and_rearm();
 
@@ -13236,7 +13399,7 @@ mod tests {
         let mut el = make_test_loop();
         let conn_index = park_connection(&mut el);
 
-        el.driver.provided_bufs.on_handout(); // a replenished bid was handed out first
+        el.driver.provided_bufs.complete(0, 1, false); // a bid was handed out first
         el.driver.pending_replenish.push(0);
         el.flush_replenish_and_rearm();
 
@@ -13271,7 +13434,7 @@ mod tests {
         el.test_dispatch_cqe(ud.raw(), -libc::ENOBUFS, 0);
         assert!(el.driver.recv_starved.contains(&conn_index));
 
-        el.driver.provided_bufs.on_handout(); // a replenished bid was handed out first
+        el.driver.provided_bufs.complete(0, 1, false); // a bid was handed out first
         el.driver.pending_replenish.push(0);
         el.flush_replenish_and_rearm();
 
@@ -13290,7 +13453,7 @@ mod tests {
         // Simulate a zero-copy held buffer with unconsumed partial data.
         let (buf_ptr, _) = el.driver.provided_bufs.get_buffer(3);
         unsafe { std::ptr::copy_nonoverlapping(b"held".as_ptr(), buf_ptr as *mut u8, 4) };
-        el.driver.provided_bufs.on_handout(); // bid 3 was handed out before being held
+        el.driver.provided_bufs.complete(3, 4, false); // bid 3 was handed out before being held
         el.driver.pending_recv_bufs[conn_index as usize] = Some(crate::backend::PendingRecvBuf {
             bid: 3,
             len: 4,

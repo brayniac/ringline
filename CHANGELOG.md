@@ -74,6 +74,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- On io_uring, each TCP provided receive buffer keeps a count of the
+  completions whose data is still in use, and returns to the ring only when
+  the kernel is done with it and the count is zero (#622). A buffer
+  released more times than it completed panics the worker, naming the
+  buffer, in release builds as well as debug; before, a release build
+  clamped the ring's free count, posted the buffer twice, and continued.
+
 - On mio, `forward_held` forwards at most 32 receive buffers' worth of
   bytes per call (`ConfigBuilder::recv_buffer`'s `buffer_size` each), the
   most one io_uring call forwards. It used to forward the whole

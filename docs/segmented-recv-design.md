@@ -308,8 +308,11 @@ close-drain + single-release discriminant), or copied and replenished at deliver
 - **Replenish to origin class** (`PendingRecvBuf.class`), never live `recv_class`.
 - **Exactly one replenish per bid** — enforced by the single-release discriminant
   across the guard drop, `into_owned`/`collect`, Mode-A write CQE, and
-  `close_connection`. No double-replenish, no leak.
-- **`outstanding`/free count updated at every hand-out and every replenish.**
+  `close_connection`. No double-replenish, no leak. Each replenish releases
+  the completion's hold (`ProvidedBufRing::release_batch`), which panics on a
+  release without a hold.
+- **`outstanding`/free count updated at every completion that exhausts a
+  buffer and every return.**
 - Generation guards connection *slots*, not bid lifetime — never rely on it to
   police a held buffer.
 

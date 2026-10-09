@@ -4372,16 +4372,16 @@ impl<'a> Future for SegmentNext<'a> {
             // A held buffer is available: hand it to a `RecvSegment`.
             if let Some(held) = driver.segment_hold[idx].pop_front() {
                 match held {
-                    crate::backend::HeldRecvBuf::Pinned { bid, len } => {
+                    crate::backend::HeldRecvBuf::Pinned { bid, off, len } => {
                         // Zero-copy: check the bid out into the (guaranteed-empty)
                         // pin slot; the segment's Drop / into_owned releases it
                         // exactly once.
                         driver.segment_pinned[idx] =
-                            Some(crate::backend::HeldRecvBuf::Pinned { bid, len });
+                            Some(crate::backend::HeldRecvBuf::Pinned { bid, off, len });
                         return Poll::Ready(Ok(Some(RecvSegment {
                             conn_index: conn,
                             generation: self.generation,
-                            backing: SegBacking::Pinned { bid, len },
+                            backing: SegBacking::Pinned { bid, off, len },
                             _borrow: PhantomData,
                             _not_send: PhantomData,
                         })));
@@ -4466,7 +4466,7 @@ pub struct RecvSegment<'a> {
 enum SegBacking {
     /// A provided buffer pinned in the ring. The bid is released exactly once via
     /// the driver pin slot (`segment_pinned[conn]`) on drop or `into_owned`.
-    Pinned { bid: u16, len: u32 },
+    Pinned { bid: u16, off: u32, len: u32 },
     /// An owned copy of the received bytes. The bid was replenished at delivery,
     /// so this segment pins nothing: drop is a no-op and `into_owned` just hands
     /// back the bytes.
@@ -4520,13 +4520,13 @@ impl RecvSegment<'_> {
                 // clone is an O(1) refcount bump; `self`'s `Drop` no-ops for Owned.
                 b.clone()
             }
-            SegBacking::Pinned { bid, len } => {
-                let (bid, len) = (*bid, *len);
+            SegBacking::Pinned { bid, off, len } => {
+                let (bid, off, len) = (*bid, *off, *len);
                 // Copy before replenish (INC template), no await between.
                 let owned = with_state(|driver, _executor| {
-                    let (ptr, _) = driver.provided_bufs.get_buffer(bid);
+                    let ptr = driver.provided_bufs.data_ptr(bid, off);
                     // SAFETY: the bid is pinned (not yet replenished) and `len`
-                    // bytes were received into its backing buffer.
+                    // bytes were received into it at `off`.
                     let slice = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
                     Bytes::copy_from_slice(slice)
                 });
@@ -4565,10 +4565,10 @@ impl Deref for RecvSegment<'_> {
         match &self.backing {
             // Owned bytes (force-copied at delivery) — borrow them directly.
             SegBacking::Owned(b) => &b[..],
-            SegBacking::Pinned { bid, len } => {
+            SegBacking::Pinned { bid, off, len } => {
                 // The buffer is pinned in the ring (bid not replenished) for this
                 // segment's lifetime, so the pointer is valid and `len <= buf cap`.
-                let ptr = with_state(|driver, _executor| driver.provided_bufs.get_buffer(*bid).0);
+                let ptr = with_state(|driver, _executor| driver.provided_bufs.data_ptr(*bid, *off));
                 // SAFETY: `ptr` points into the provided-buffer backing for `bid`,
                 // which stays pinned until this segment drops; `len` bytes were
                 // received into it. The returned slice borrows `self`, so it
@@ -4652,10 +4652,10 @@ impl Future for RecvOwnedSegment {
             // holding. (INC ordering: copy-before-replenish, no await between.)
             if let Some(held) = driver.segment_hold[idx].pop_front() {
                 match held {
-                    crate::backend::HeldRecvBuf::Pinned { bid, len } => {
-                        let (ptr, _) = driver.provided_bufs.get_buffer(bid);
+                    crate::backend::HeldRecvBuf::Pinned { bid, off, len } => {
+                        let ptr = driver.provided_bufs.data_ptr(bid, off);
                         // SAFETY: `bid` is held (not yet replenished), and `len`
-                        // bytes were received into its backing buffer. The slice is
+                        // bytes were received into it at `off`. The slice is
                         // consumed by the copy below before `driver` is mutated.
                         let slice = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
                         let owned = Bytes::copy_from_slice(slice);
@@ -5010,7 +5010,7 @@ impl<'a> SegChain<'a> {
 /// hold is cleared and need no replenish.
 #[cfg(has_io_uring)]
 enum SegSettle {
-    Pinned { bid: u16, len: usize },
+    Pinned { bid: u16, off: u32, len: usize },
     Owned(Bytes),
 }
 
@@ -5101,14 +5101,15 @@ impl<F: FnMut(&SegChain<'_>) -> SegConsumed + Unpin> Future for WithSegmentsFutu
             }
             for held in &driver.segment_hold[idx] {
                 match held {
-                    crate::backend::HeldRecvBuf::Pinned { bid, len } => {
-                        // `get_buffer` returns a raw pointer (no borrow tie), so the
+                    crate::backend::HeldRecvBuf::Pinned { bid, off, len } => {
+                        // `data_ptr` returns a raw pointer (no borrow tie), so the
                         // held slice does not alias the `provided_bufs` field borrow.
-                        let (ptr, _) = driver.provided_bufs.get_buffer(*bid);
+                        let ptr = driver.provided_bufs.data_ptr(*bid, *off);
                         let s = unsafe { std::slice::from_raw_parts(ptr, *len as usize) };
                         slices.push(s);
                         held_meta.push(SegSettle::Pinned {
                             bid: *bid,
+                            off: *off,
                             len: *len as usize,
                         });
                     }
@@ -5156,7 +5157,7 @@ impl<F: FnMut(&SegChain<'_>) -> SegConsumed + Unpin> Future for WithSegmentsFutu
             let mut overflowed = false;
             for meta in held_meta {
                 match meta {
-                    SegSettle::Pinned { bid, len } => {
+                    SegSettle::Pinned { bid, off, len } => {
                         if rem_n >= len {
                             // Wholly consumed by the callback — just replenish.
                             rem_n -= len;
@@ -5167,7 +5168,7 @@ impl<F: FnMut(&SegChain<'_>) -> SegConsumed + Unpin> Future for WithSegmentsFutu
                             // accumulator, in order, then replenish. Push the bid
                             // even on breach so it is never leaked.
                             if !overflowed {
-                                let (ptr, _) = driver.provided_bufs.get_buffer(bid);
+                                let ptr = driver.provided_bufs.data_ptr(bid, off);
                                 let remainder = unsafe {
                                     std::slice::from_raw_parts(ptr.add(rem_n), len - rem_n)
                                 };
