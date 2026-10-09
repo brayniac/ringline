@@ -142,6 +142,17 @@ impl ProvidedBufRing {
         self.ring_entries().saturating_sub(self.outstanding)
     }
 
+    /// Test-only: the `(addr, len, bid)` of ring entry `index`, as the
+    /// kernel left it. An incremental ring's entry advances in place.
+    #[cfg(test)]
+    pub(crate) fn entry(&self, index: u16) -> (u64, u32, u16) {
+        let off = (index & self.mask) as usize * Self::ENTRY_SIZE;
+        // Safety: `off` is inside the mapped ring; the kernel writes the
+        // entry, so it is read volatile.
+        let e = unsafe { ptr::read_volatile(self.ring_ptr.add(off) as *const BufRingEntry) };
+        (e.addr, e.len, e.bid)
+    }
+
     /// Get a pointer and length for a buffer by its ID.
     pub fn get_buffer(&self, bid: u16) -> (*const u8, u32) {
         let offset = bid as usize * self.buf_size as usize;

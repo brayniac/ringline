@@ -230,6 +230,15 @@ impl UringEngine {
         result
     }
 
+    /// Test-only: queue `sqe` with `IOSQE_ASYNC`, which punts it to io-wq.
+    ///
+    /// # Safety
+    /// As [`Engine::push`].
+    #[cfg(test)]
+    pub(crate) unsafe fn push_async(&mut self, sqe: &Sqe) -> io::Result<()> {
+        unsafe { self.push_sqe128(sqe.encode().flags(Flags::ASYNC)) }
+    }
+
     /// Test-only: the ring's file descriptor, for raw registration calls.
     #[cfg(test)]
     pub(crate) fn raw_fd(&self) -> RawFd {
