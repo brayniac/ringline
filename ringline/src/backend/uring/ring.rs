@@ -292,14 +292,32 @@ impl Ring {
     /// Any cancel targeting this request must encode the same payload — a
     /// cancel matches by `user_data`.
     pub fn submit_multishot_recv(&mut self, conn_index: u32, generation: u32) -> io::Result<()> {
+        self.submit_recv(conn_index, generation, false)
+    }
+
+    /// Submit a one-shot recv that selects one provided buffer, under the
+    /// same `RecvMulti` user_data as a multishot recv: its completion carries
+    /// no `IORING_CQE_F_MORE`, so `handle_recv_multi` treats it as a multishot
+    /// that ended after one completion and re-arms it.
+    pub fn submit_single_recv(&mut self, conn_index: u32, generation: u32) -> io::Result<()> {
+        self.submit_recv(conn_index, generation, true)
+    }
+
+    fn submit_recv(&mut self, conn_index: u32, generation: u32, single: bool) -> io::Result<()> {
         let user_data = UserData::encode(OpTag::RecvMulti, conn_index, generation);
-        let entry = Sqe::new(
-            Op::RecvMulti {
-                fd: sqe::Fd::Fixed(conn_index),
+        let fd = sqe::Fd::Fixed(conn_index);
+        let op = if single {
+            Op::RecvSelect {
+                fd,
                 buf_group: self.bgid,
-            },
-            user_data.raw(),
-        );
+            }
+        } else {
+            Op::RecvMulti {
+                fd,
+                buf_group: self.bgid,
+            }
+        };
+        let entry = Sqe::new(op, user_data.raw());
         unsafe {
             self.push_sqe(&entry)?;
         }

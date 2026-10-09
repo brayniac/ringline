@@ -33,8 +33,9 @@ pub enum RecvArm {
     /// Nothing armed: slot inactive, connect in flight, recv cancelled, or
     /// the multishot self-terminated and has not been re-armed.
     Idle,
-    /// Multishot recv with the provided buffer ring (io_uring) / readable
-    /// interest (mio).
+    /// Recv with the provided buffer ring (io_uring) / readable interest
+    /// (mio). On io_uring each arm is multishot, or one-shot for a
+    /// connection whose completions stay held (`Driver::recv_single`).
     Multi,
     /// Multishot recvmsg with cmsg timestamps (io_uring, `timestamps`).
     #[cfg(feature = "timestamps")]

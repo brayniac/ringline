@@ -73,7 +73,7 @@ Everything a request needs rides inside those batched enters as SQEs and CQEs:
 
 | Operation | Syscalls per event | Mechanism |
 |---|---:|---|
-| Receive a message | **0** | Multishot recv (`opcode::RecvMulti` + provided buffers) is armed once per connection; the kernel keeps posting CQEs with filled buffers indefinitely. Re-arm happens only after `ENOBUFS` parking or cancellation, and is itself an SQE. |
+| Receive a message | **0** | Multishot recv (`opcode::RecvMulti` + provided buffers) is armed once per connection; the kernel keeps posting CQEs with filled buffers indefinitely. Re-arm happens only after `ENOBUFS` parking or cancellation, and is itself an SQE. A direct-echo or recv-forward connection instead arms a one-shot recv for each buffer (`Driver::recv_single`, #638): 1 SQE per received buffer. |
 | Send a response | **0 dedicated** | `send()`/`send_nowait()` push an `opcode::Send` SQE (`MSG_WAITALL`, so the kernel retries short sends in place); coalesced sends are one `opcode::SendMsg` SQE gathering several queued sends; zero-copy sends are `opcode::SendMsgZc`. All are submitted by the iteration's shared enter. |
 | Zero-copy notification | **0** | The "DMA done, guard can drop" signal is a second CQE on the same SQE, not a syscall. |
 | Timer arm/fire | **0** | Timeout SQE / timeout CQE. |

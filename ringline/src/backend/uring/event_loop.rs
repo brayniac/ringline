@@ -1114,12 +1114,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             if replenished || self.driver.provided_bufs.free() > 0 {
                 self.driver.recv_starved.swap_remove(i);
                 let generation = self.driver.connections.generation(conn_index);
-                if self
-                    .driver
-                    .ring
-                    .submit_multishot_recv(conn_index, generation)
-                    .is_err()
-                {
+                if self.driver.submit_tcp_recv(conn_index, generation).is_err() {
                     metrics::RING.increment(metrics::ring::RECV_ARM_FAILURES);
                     self.executor.wake_recv(conn_index);
                     self.driver.close_connection(conn_index);
@@ -1921,12 +1916,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             && matches!(conn.recv_arm, RecvArm::Multi)
         {
             let generation = self.driver.connections.generation(conn_index);
-            if self
-                .driver
-                .ring
-                .submit_multishot_recv(conn_index, generation)
-                .is_err()
-            {
+            if self.driver.submit_tcp_recv(conn_index, generation).is_err() {
                 metrics::RING.increment(metrics::ring::RECV_ARM_FAILURES);
                 self.executor.wake_recv(conn_index);
                 self.driver.close_connection(conn_index);
@@ -3756,12 +3746,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             return;
         }
         let generation = self.driver.connections.generation(conn_index);
-        if self
-            .driver
-            .ring
-            .submit_multishot_recv(conn_index, generation)
-            .is_err()
-        {
+        if self.driver.submit_tcp_recv(conn_index, generation).is_err() {
             metrics::RING.increment(metrics::ring::RECV_ARM_FAILURES);
             self.executor.wake_recv(conn_index);
             self.driver.close_connection(conn_index);
@@ -3917,12 +3902,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
         self.driver.forward_hold_throttled[ci] = false;
         let generation = self.driver.connections.generation(conn_index);
-        if self
-            .driver
-            .ring
-            .submit_multishot_recv(conn_index, generation)
-            .is_err()
-        {
+        if self.driver.submit_tcp_recv(conn_index, generation).is_err() {
             metrics::RING.increment(metrics::ring::RECV_ARM_FAILURES);
             self.executor.wake_recv(conn_index);
             self.driver.close_connection(conn_index);
@@ -5207,12 +5187,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
             return;
         }
-        if self
-            .driver
-            .ring
-            .submit_multishot_recv(conn_index, generation)
-            .is_err()
-        {
+        if self.driver.submit_tcp_recv(conn_index, generation).is_err() {
             metrics::RING.increment(metrics::ring::RECV_ARM_FAILURES);
             self.executor.wake_recv(conn_index);
             self.driver.close_connection(conn_index);
@@ -10838,6 +10813,110 @@ mod tests {
                 .get(conn)
                 .unwrap()
                 .recv_multishot_armed
+        );
+    }
+
+    /// Deliver a one-shot recv completion: `IORING_CQE_F_BUFFER` without
+    /// `IORING_CQE_F_MORE`.
+    fn deliver_single(el: &mut AsyncEventLoop<NoopHandler>, conn: u32, bid: u16, msg: &[u8]) {
+        let (ptr, _) = el.driver.provided_bufs.get_buffer(bid);
+        unsafe { std::ptr::copy_nonoverlapping(msg.as_ptr(), ptr as *mut u8, msg.len()) };
+        let ud = UserData::encode(
+            OpTag::RecvMulti,
+            conn,
+            el.driver.connections.generation(conn),
+        );
+        el.test_dispatch_cqe(ud.raw(), msg.len() as i32, 1 | ((bid as u32) << 16));
+    }
+
+    /// A direct-echo or recv-forward connection re-arms a one-shot recv; any
+    /// other connection re-arms a multishot one. Both carry the `RecvMulti`
+    /// user_data.
+    #[test]
+    fn holding_connections_re_arm_a_one_shot_recv() {
+        use crate::backend::uring::sqe::Op;
+        for mode in ["plain", "direct echo", "recv forward"] {
+            let mut el = make_test_loop();
+            let conn = accept_connection(&mut el);
+            match mode {
+                "direct echo" => el.driver.connections.get_mut(conn).unwrap().direct_echo = true,
+                "recv forward" => el.driver.recv_forward[conn as usize] = true,
+                _ => {}
+            }
+            deliver_single(&mut el, conn, 2, b"x");
+            let pushed = el.driver.ring.last_pushed.as_ref().expect("re-armed");
+            let ud = UserData(pushed.user_data);
+            assert_eq!(ud.tag(), Some(OpTag::RecvMulti), "{mode}");
+            assert_eq!(
+                ud.payload(),
+                el.driver.connections.generation(conn),
+                "{mode}"
+            );
+            let single = matches!(pushed.op, Op::RecvSelect { .. });
+            assert_eq!(single, mode != "plain", "{mode}: {:?}", pushed.op);
+            assert!(
+                el.driver
+                    .connections
+                    .get(conn)
+                    .unwrap()
+                    .recv_multishot_armed
+            );
+        }
+    }
+
+    /// A one-shot direct-echo connection stops re-arming at the hold cap, so
+    /// it holds no more buffers than the cap.
+    #[test]
+    fn a_one_shot_recv_stops_at_the_hold_cap() {
+        use crate::backend::uring::sqe::Op;
+        let mut el = make_test_loop_with_config(config_with_forward_cap(64));
+        let conn = accept_connection(&mut el);
+        el.driver.connections.get_mut(conn).unwrap().direct_echo = true;
+        let cap = el.quarter_ring_cap();
+        assert!(cap >= 2, "the arms before the cap are checked");
+        for bid in 0..cap as u16 - 1 {
+            deliver_single(&mut el, conn, bid, b"x");
+            assert!(matches!(last_pushed_op(&el), Op::RecvSelect { .. }));
+        }
+        el.driver.ring.last_pushed = None;
+        deliver_single(&mut el, conn, cap as u16 - 1, b"x");
+        assert!(el.driver.forward_hold_throttled[conn as usize]);
+        assert!(el.driver.ring.last_pushed.is_none(), "no re-arm at the cap");
+        assert!(
+            !el.driver
+                .connections
+                .get(conn)
+                .unwrap()
+                .recv_multishot_armed
+        );
+        assert_eq!(el.driver.recv_hold[conn as usize].len(), cap);
+    }
+
+    /// Entering a holding mode cancels an armed recv, so the multishot armed
+    /// before stops taking buffers; with nothing armed it submits nothing.
+    #[test]
+    fn entering_a_holding_mode_cancels_the_armed_recv() {
+        use crate::backend::uring::sqe::Op;
+        let mut el = make_test_loop();
+        let conn = accept_connection(&mut el);
+        el.driver.ring.last_pushed = None;
+        el.driver.cancel_recv_for_single(conn);
+        assert!(el.driver.ring.last_pushed.is_none());
+        el.driver
+            .connections
+            .get_mut(conn)
+            .unwrap()
+            .recv_multishot_armed = true;
+        el.driver.cancel_recv_for_single(conn);
+        let target = UserData::encode(
+            OpTag::RecvMulti,
+            conn,
+            el.driver.connections.generation(conn),
+        );
+        assert!(
+            matches!(last_pushed_op(&el), Op::Cancel { target: t } if t == target.raw()),
+            "{:?}",
+            last_pushed_op(&el)
         );
     }
 

@@ -924,6 +924,12 @@ impl Sqe {
             Op::RecvMulti { fd, buf_group } => {
                 on!(fd, |t| opcode::RecvMulti::new(t, buf_group).build())
             }
+            Op::RecvSelect { fd, buf_group } => on!(fd, |t| {
+                opcode::Recv::new(t, std::ptr::null_mut(), 0)
+                    .buf_group(buf_group)
+                    .build()
+                    .flags(Flags::BUFFER_SELECT)
+            }),
             Op::RecvMsgMulti { fd, msg, buf_group } => {
                 on!(fd, |t| opcode::RecvMsgMulti::new(t, msg, buf_group).build())
             }
@@ -1081,6 +1087,19 @@ mod encode_tests {
                     ud,
                 ),
                 e(opcode::RecvMulti::new(fx, 3).build()),
+            ),
+            (
+                Sqe::new(
+                    Op::RecvSelect {
+                        fd: Fd::Fixed(9),
+                        buf_group: 3,
+                    },
+                    ud,
+                ),
+                e(opcode::Recv::new(fx, std::ptr::null_mut(), 0)
+                    .buf_group(3)
+                    .build()
+                    .flags(Flags::BUFFER_SELECT)),
             ),
             (
                 Sqe::new(

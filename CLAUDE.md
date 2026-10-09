@@ -181,7 +181,7 @@ Async futures access the driver via `CURRENT_DRIVER` thread-local (raw pointer, 
 
 ### Connection Lifecycle
 
-Inbound: acceptor → round-robin to worker → allocate `ConnectionTable` slot → submit multishot recv SQE → spawn `on_accept` task. Outbound: `connect(addr)` → allocate slot → submit connect SQE (optionally IO_LINK'd with timeout) → `ConnectFuture` resolves to new `ConnCtx`.
+Inbound: acceptor → round-robin to worker → allocate `ConnectionTable` slot → submit multishot recv SQE (one-shot, re-armed per completion, for direct-echo and recv-forward connections; `Driver::recv_single`) → spawn `on_accept` task. Outbound: `connect(addr)` → allocate slot → submit connect SQE (optionally IO_LINK'd with timeout) → `ConnectFuture` resolves to new `ConnCtx`.
 
 Close, on both backends: only `close_connection` (and the `DriverCtx` close) moves the connection to `Lifecycle::Closing`; it also sets `ConnSendState::close_pending`, and teardown finalizes once queued sends drain (io_uring: `try_finalize_close` submits the Close SQE, with a `shutdown` hard-linked ahead of it; mio: `drain_pending_closes` defers `finish_close`). A backend site that marks the connection closing directly leaks the slot — that was #368.
 

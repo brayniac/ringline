@@ -122,6 +122,50 @@ impl Driver {
 }
 
 impl Driver {
+    /// Whether `conn_index` arms a one-shot recv rather than a multishot one:
+    /// a direct-echo or recv-forward connection, whose completions stay held
+    /// after the completion handler returns. A multishot recv takes every
+    /// buffer the socket's queued data fills before the throttle's cancel
+    /// lands; a one-shot recv takes one per arm, and the throttle skips the
+    /// re-arm at the hold cap (#638).
+    pub(crate) fn recv_single(&self, conn_index: u32) -> bool {
+        self.recv_forward[conn_index as usize]
+            || self
+                .connections
+                .get(conn_index)
+                .is_some_and(|c| c.direct_echo)
+    }
+
+    /// Arm a TCP recv on `conn_index`: one-shot when `recv_single`,
+    /// multishot otherwise. Both carry the `RecvMulti` user_data.
+    pub(crate) fn submit_tcp_recv(&mut self, conn_index: u32, generation: u32) -> io::Result<()> {
+        if self.recv_single(conn_index) {
+            self.ring.submit_single_recv(conn_index, generation)
+        } else {
+            self.ring.submit_multishot_recv(conn_index, generation)
+        }
+    }
+
+    /// Cancel `conn_index`'s armed recv after it enters a mode that arms a
+    /// one-shot recv (`recv_single`), so the multishot armed before stops
+    /// taking buffers. Its `-ECANCELED` completion re-arms the recv
+    /// (`rearm_multishot_if_idle`), which `submit_tcp_recv` makes one-shot.
+    pub(crate) fn cancel_recv_for_single(&mut self, conn_index: u32) {
+        let armed = self
+            .connections
+            .get(conn_index)
+            .is_some_and(|c| c.recv_multishot_armed && matches!(c.recv_arm, RecvArm::Multi));
+        if !armed {
+            return;
+        }
+        let ud = crate::completion::UserData::encode(
+            crate::completion::OpTag::RecvMulti,
+            conn_index,
+            self.connections.generation(conn_index),
+        );
+        let _ = self.ring.submit_async_cancel(ud.raw(), conn_index);
+    }
+
     /// Record that `n` received buffers of `conn_index` were released by the
     /// send that held them (`send_held_recv`).
     pub(crate) fn release_send_held(&mut self, conn_index: u32, n: u32) {
@@ -1646,10 +1690,7 @@ impl Driver {
             });
             let generation = self.connections.generation(conn_index);
             if open
-                && self
-                    .ring
-                    .submit_multishot_recv(conn_index, generation)
-                    .is_ok()
+                && self.submit_tcp_recv(conn_index, generation).is_ok()
                 && let Some(cs) = self.connections.get_mut(conn_index)
             {
                 cs.recv_multishot_armed = true;
