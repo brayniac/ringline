@@ -807,7 +807,11 @@ buffers held by `with_bytes` views, values copied by the
    and 7.1.
 7. New defaults (the geometry per ring kind, `recv_incremental` on, the
    large group's default per ring kind, the `recv_accumulator_max` floor,
-   the removal of `recv_segment_reserve`) in a coordinated release.
+   the removal of `recv_segment_reserve`) in a coordinated release. Before
+   `recv_incremental` is on by default, the rule-1 assertion in
+   `ProvidedBufRing::complete` becomes a counted recovery, so a kernel
+   whose TCP receive differs from what the preflight checks does not panic
+   a worker.
 
 Steps 1 to 3 change neither the ring's registration nor its geometry, and
 can land before INC is switched on. Step 1 holds a buffer in

@@ -1034,8 +1034,8 @@ impl ConfigBuilder {
     ///   (`with_segments`, `forward_to`) is copied.
     /// - With `prefault_buffers(true)` a plain ring makes 256 MiB per worker
     ///   resident, against 4 MiB for the 256 × 16 KiB default.
-    /// - The fallback receive's chunks grow from 1 MiB to 4 MiB of virtual
-    ///   memory each.
+    /// - With the incremental geometry, the fallback receive's chunks grow
+    ///   from 1 MiB to 4 MiB of virtual memory each.
     /// - Lends into incremental buffers are not capped yet, so about 64
     ///   connections holding unread data can keep every buffer out of use
     ///   and stall receives on the worker.
