@@ -1029,8 +1029,10 @@ impl ConfigBuilder {
     /// worker uses a plain ring.
     ///
     /// With this on, data is lent (held in place for a task, a segment or a
-    /// forward) only while lends hold at most half the TCP ring's buffers;
-    /// above that, each path copies, and `recv_segment_reserve` is ignored.
+    /// `forward_to` source) only while at most half the TCP ring's buffers
+    /// have a hold (a lend, or a completion whose release is queued for the
+    /// next flush); above that, each path copies, and `recv_segment_reserve`
+    /// is ignored.
     /// Recv-forward (`recv_forward`) and direct-echo lends are not capped yet.
     /// The fallback receive reads 1 MiB chunks, and a parked connection
     /// re-arms its multishot instead when the ring's free buffers hold more.
@@ -1081,7 +1083,8 @@ impl ConfigBuilder {
     /// connections holding segments cannot deplete the ring and `ENOBUFS`-starve
     /// well-behaved connections under fan-in. Above the reserve, delivery stays
     /// zero-copy. `0` force-copies only when the ring is fully drained. Tune
-    /// relative to the `recv_buffer` ring size; must be `<= 65535`.
+    /// relative to the `recv_buffer` ring size; must be `<= 65535`. Ignored
+    /// with `recv_incremental(true)`, where the lend cap decides.
     ///
     /// Default: 64 (a quarter of the default 256-buffer recv ring).
     pub fn recv_segment_reserve(mut self, reserve: u32) -> Self {

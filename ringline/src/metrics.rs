@@ -286,8 +286,10 @@ pub mod recv_ring {
     pub const INCREMENTAL: usize = 0;
     /// A plain ring.
     pub const PLAIN: usize = 1;
-    /// Completions copied instead of lent because the buffers lends hold
-    /// reached the lend cap, half the ring (`recv_incremental` only).
+    /// Completions copied instead of lent because more than half the ring's
+    /// buffers had a hold, this completion's and queued releases included
+    /// (`recv_incremental` only). A per-completion event, unlike the
+    /// per-worker kind counts.
     pub const LEND_REFUSED: usize = 2;
     pub const COUNT: usize = 3;
 }
@@ -667,6 +669,14 @@ mod tests {
     #[test]
     fn recv_ring_slots_are_labelled() {
         init_metadata();
+        let op = |idx| {
+            RECV_RING
+                .load_metadata(idx)
+                .and_then(|m| m.get("op").cloned())
+        };
+        assert_eq!(op(recv_ring::INCREMENTAL).as_deref(), Some("incremental"));
+        assert_eq!(op(recv_ring::PLAIN).as_deref(), Some("plain"));
+        assert_eq!(op(recv_ring::LEND_REFUSED).as_deref(), Some("lend_refused"));
         for idx in 0..recv_ring::COUNT {
             assert!(
                 RECV_RING

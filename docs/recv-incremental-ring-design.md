@@ -599,8 +599,11 @@ buffer out of the ring. A connection whose lend, other than a view or a
 rest the bounded accumulator holds, is held when its task parks is
 promoted, so its later lends pin large-group buffers.
 
-- Per group, a lend is taken only while fewer than half that group's
-  buffers are held. Plaintext lends in `pending_recv_bufs` are otherwise
+- With `recv_incremental` on, on either ring kind, a lend is taken only
+  while at most half that group's buffers have a hold, this completion's
+  included. Step 4b-1 counts every hold, so completions copied in the same
+  pass, whose releases are queued for the end-of-pass flush, count too; a
+  lend refused that way costs a copy. Plaintext lends in `pending_recv_bufs` are otherwise
   uncapped, and connections whose tasks do not poll could hold every
   buffer, leaving a parked connection with nothing to re-arm into. The
   two-ring runs set no lend cap (`--lend-cap` 1.0), so the half-the-group
@@ -613,7 +616,8 @@ promoted, so its later lends pin large-group buffers.
     new owned variant of the `recv_hold` entry (a `SendCopyPool` slot).
 - Per connection, `forward_hold_cap` still counts held ranges; one forwarder
   can pin up to that many shared buffers, which the per-group cap bounds.
-- With INC on, `recv_segment_reserve` is ignored and the per-group cap
+- With `recv_incremental` on, `recv_segment_reserve` is ignored and the
+  per-group cap
   governs; its default (64 free buffers) would otherwise force a copy on
   every segmented and Mode A delivery from a 64-buffer ring. It is removed
   in step 7, which removes a public `ConfigBuilder` method.
@@ -640,12 +644,13 @@ Measured, per run:
 - On 7.1 no ring tested, plain or INC, returned any at 10,000 or 50,000
   connections.
 
-The fallback chunk today is `max(4 × buffer_size, 1 MiB)`, and its
-arbitration prefers the fallback over a re-arm on the premise that the
-chunk exceeds the ring's capacity (`event_loop.rs`
+Without `recv_incremental` the fallback chunk is `max(4 × buffer_size,
+1 MiB)`, and its arbitration prefers the fallback over a re-arm on the
+premise that the chunk exceeds the ring's capacity (`event_loop.rs`
 `flush_replenish_and_rearm`). That premise does not hold for a 64 MiB ring.
-Step 3 sets the chunk to 1 MiB and re-arms when the group's
-`free() × buffer_size` exceeds it. The benchmark used the 4 MiB chunk, so
+With it (step 4b-1) the chunk is 1 MiB, and a parked connection re-arms
+when the group's `free() × buffer_size`, less one chunk for each
+connection already re-armed that way in the pass, exceeds it. The benchmark used the 4 MiB chunk, so
 step 6 measures this.
 
 When a group is empty the multishot ends, the bytes stay in the socket's
@@ -782,7 +787,8 @@ buffers held by `with_bytes` views, values copied by the
    `recv_segment_reserve` ignored, the 1 MiB fallback chunk with the
    free-space re-arm, and the lends-refused count; all only with
    `recv_incremental`. 4b-2: the owned `recv_hold` entry for recv-forward
-   and direct echo, and the per-group gauges.
+   and direct echo, the per-group gauges, and the per-group `ENOBUFS`
+   count.
 5. The large group, behind `recv_large_group` (default `false`): its bgid
    and validation, the arm taking the group per call,
    `OpTag::RecvMultiLarge` and the `SendRecvBuf` group bit, `group` in

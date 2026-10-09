@@ -19,8 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   requires `recv_accumulator_max` of at least 1 MiB. Default off.
   `ringline/recv_ring` counts the kind each worker selected, and
   `ringline/recv_preflight_failed` the step a failed check stopped at.
-  Data is lent (held in place) only while lends hold at most half the
-  ring's buffers, and copied above that (`ringline/recv_ring`
+  Data is lent (held in place) only while at most half the ring's buffers
+  have a hold (a lend, or a completion whose release is queued for the
+  next flush), and copied above that (`ringline/recv_ring`
   `lend_refused`); `recv_segment_reserve` is ignored, and the fallback
   receive reads 1 MiB chunks, re-arming the multishot instead when the
   ring's free buffers hold more. Recv-forward and direct-echo lends are

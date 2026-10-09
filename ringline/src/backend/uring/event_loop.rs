@@ -1053,17 +1053,20 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         //   alongside the outstanding one-shot could append out of order
         //   (io_uring does not order independent SQEs). The fallback's
         //   completion re-parks it and a later pass hands off.
-        // - Partial message on the plaintext accumulator path: prefer a
-        //   fallback recv EVEN IF buffers were replenished. Re-arming the
-        //   multishot moves at most one ring's worth before parking again —
-        //   with responses larger than the ring that park/re-arm churn is
-        //   the pathology (per-pass throughput = ring capacity × pass
-        //   rate), while a fallback moves one `fallback_chunk` (> ring
-        //   capacity) per pass and never closes the TCP window. The
+        // - Partial message on the plaintext accumulator path, without
+        //   `recv_incremental`: prefer a fallback recv EVEN IF buffers were
+        //   replenished. Re-arming the multishot moves at most one ring's
+        //   worth before parking again — with responses larger than the ring
+        //   that park/re-arm churn is the pathology (per-pass throughput =
+        //   ring capacity × pass rate), while a fallback moves one
+        //   `fallback_chunk` per pass and never closes the TCP window. The
         //   multishot resumes once the message completes and the
-        //   accumulator drains.
+        //   accumulator drains. With `recv_incremental`, see
+        //   `ring_beats_chunk` below.
         // - Everything else: re-arm the multishot when buffers came back,
         //   otherwise keep waiting (nothing is half-delivered).
+        let mut free_bytes = u64::from(self.driver.provided_bufs.free())
+            * u64::from(self.driver.provided_bufs.buffer_size());
         let mut i = 0;
         while i < self.driver.recv_starved.len() {
             let conn_index = self.driver.recv_starved[i];
@@ -1088,11 +1091,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
             // With `recv_incremental`, a ring whose free buffers hold more
             // than one fallback chunk feeds the multishot faster than the
-            // fallback would, so the connection re-arms instead.
+            // fallback would, so the connection re-arms instead. Each such
+            // re-arm takes one chunk from this pass's free bytes, so a pass
+            // does not re-arm more connections than the ring can feed.
             let ring_beats_chunk = self.driver.lend_cap.is_some()
-                && u64::from(self.driver.provided_bufs.free())
-                    * u64::from(self.driver.provided_bufs.buffer_size())
-                    > u64::from(self.driver.fallback_chunk);
+                && free_bytes > u64::from(self.driver.fallback_chunk);
+            if ring_beats_chunk {
+                free_bytes -= u64::from(self.driver.fallback_chunk);
+            }
             if !ring_beats_chunk
                 && self.fallback_eligible(conn_index)
                 && self.driver.try_submit_fallback_recv(conn_index)
@@ -10392,10 +10398,8 @@ mod tests {
         );
     }
 
-    /// (b) Above the reserve, delivery is still Pinned (zero-copy) as before — the
-    /// bid is NOT replenished until consumed.
     /// Over the lend cap, a plaintext completion is copied into the
-    /// accumulator instead of being lent, and its hold is released.
+    /// accumulator instead of being lent, and its bid is queued for release.
     #[test]
     fn over_the_lend_cap_a_completion_is_copied_not_lent() {
         let mut el = make_test_loop();
@@ -10443,6 +10447,72 @@ mod tests {
         assert!(matches!(&hold[1], crate::backend::HeldRecvBuf::Owned(b) if &b[..] == b"two"));
     }
 
+    /// Without a lend cap, a partial message still takes the fallback even
+    /// when the ring's free bytes exceed the chunk.
+    #[test]
+    fn without_a_lend_cap_a_partial_message_takes_the_fallback() {
+        let mut el = make_test_loop();
+        let conn_index = park_connection(&mut el);
+        assert!(el.driver.accumulators.append(conn_index, b"part"));
+        el.driver.fallback_chunk = el.driver.provided_bufs.buffer_size();
+        el.flush_replenish_and_rearm();
+        assert!(el.driver.recv_fallback_inflight[conn_index as usize]);
+    }
+
+    /// With a lend cap, free bytes equal to the chunk do not beat it, so the
+    /// fallback is taken.
+    #[test]
+    fn with_a_lend_cap_free_bytes_equal_to_the_chunk_take_the_fallback() {
+        let mut el = make_test_loop();
+        let conn_index = park_connection(&mut el);
+        assert!(el.driver.accumulators.append(conn_index, b"part"));
+        el.driver.lend_cap = Some(8);
+        el.driver.fallback_chunk =
+            el.driver.provided_bufs.free() * el.driver.provided_bufs.buffer_size();
+        el.flush_replenish_and_rearm();
+        assert!(el.driver.recv_fallback_inflight[conn_index as usize]);
+    }
+
+    /// Each re-arm on free space takes one chunk from the pass's free bytes:
+    /// with room for one chunk, one parked connection re-arms and the next
+    /// takes the fallback.
+    #[test]
+    fn with_a_lend_cap_a_pass_rearms_only_as_many_as_the_ring_can_feed() {
+        let mut el = make_test_loop();
+        let a = park_connection(&mut el);
+        let b = park_connection(&mut el);
+        assert!(el.driver.accumulators.append(a, b"part"));
+        assert!(el.driver.accumulators.append(b, b"part"));
+        el.driver.lend_cap = Some(8);
+        // Room for one chunk, not two.
+        el.driver.fallback_chunk =
+            el.driver.provided_bufs.free() * el.driver.provided_bufs.buffer_size() * 2 / 3;
+        el.flush_replenish_and_rearm();
+        let fallbacks = [a, b]
+            .iter()
+            .filter(|&&c| el.driver.recv_fallback_inflight[c as usize])
+            .count();
+        assert_eq!(fallbacks, 1);
+    }
+
+    /// `recv_incremental` sets the lend cap to half the TCP ring; without it
+    /// lends are uncapped.
+    #[test]
+    fn the_lend_cap_is_half_the_ring_with_recv_incremental() {
+        let el = make_test_loop();
+        assert_eq!(el.driver.lend_cap, None);
+        let inc = make_test_loop_with_config(
+            test_config_builder()
+                .recv_incremental(true)
+                .build()
+                .expect("valid config"),
+        );
+        assert_eq!(
+            inc.driver.lend_cap,
+            Some(inc.driver.provided_bufs.ring_entries() / 2)
+        );
+    }
+
     /// With a lend cap (`recv_incremental`), a parked connection with a
     /// partial message re-arms its multishot when the ring's free buffers
     /// hold more than one fallback chunk, instead of taking the fallback.
@@ -10458,6 +10528,8 @@ mod tests {
         assert!(!el.driver.recv_starved.contains(&conn_index));
     }
 
+    /// (b) Above the reserve, delivery is still Pinned (zero-copy) as before — the
+    /// bid is NOT replenished until consumed.
     #[test]
     fn segmented_zero_copy_when_ring_above_reserve_stays_pinned() {
         // reserve 4, ring 16: the first delivery leaves free = 15 > 4 → Pinned.
