@@ -102,6 +102,133 @@ pub(crate) struct PendingRecvBuf {
     pub(crate) ptr: *const u8,
 }
 
+impl Driver {
+    /// Whether a completion's data may be lent (held in place) rather than
+    /// copied: always without a lend cap, and with one while the buffers
+    /// with a hold number at most half the ring. Those include this
+    /// completion's buffer and completions whose release is queued for the
+    /// next flush, copied ones too, so within one pass copies alone can
+    /// refuse a lend; a refusal costs a copy. A refusal is counted.
+    pub(crate) fn may_lend(&self) -> bool {
+        match self.lend_cap {
+            None => true,
+            Some(cap) if self.provided_bufs.held() <= cap => true,
+            Some(_) => {
+                metrics::RECV_RING.increment(metrics::recv_ring::LEND_REFUSED);
+                false
+            }
+        }
+    }
+}
+
+impl Driver {
+    /// Whether `bid` names an owned copy (`owned_recv`) rather than a
+    /// provided-ring buffer.
+    pub(crate) fn is_owned_recv(&self, bid: u16) -> bool {
+        u32::from(bid) >= self.provided_bufs.ring_entries()
+    }
+
+    /// Copy `data` into an owned buffer for a `recv_hold` entry, and return
+    /// the entry's bid and the copy's address. At most `ring_entries()`
+    /// copies exist, each at most one completion, so owned copies hold at
+    /// most one more ring's worth of bytes. `None` when all are in use; the
+    /// caller then lends the provided buffer, so a peer that sends without
+    /// reading drains the ring and meets `ENOBUFS` backpressure.
+    pub(crate) fn own_recv_copy(&mut self, data: &[u8]) -> Option<(u16, *const u8)> {
+        let first = self.provided_bufs.ring_entries() as usize;
+        let index = match self.owned_recv_free.pop() {
+            Some(i) => i as usize,
+            None if self.owned_recv.len() < first
+                && first + self.owned_recv.len() < u16::MAX as usize =>
+            {
+                self.owned_recv.push(None);
+                self.owned_recv.len() - 1
+            }
+            None => return None,
+        };
+        let copy: Box<[u8]> = data.into();
+        let ptr = copy.as_ptr();
+        self.owned_recv[index] = Some(copy);
+        Some(((first + index) as u16, ptr))
+    }
+
+    /// Release every queued bid: owned copies are freed, and provided-ring
+    /// buffers released through `ProvidedBufRing::release_batch`.
+    ///
+    /// # Panics
+    /// If an owned copy is released twice, or a ring buffer has no hold.
+    pub(crate) fn release_pending(&mut self) {
+        let mut bids = std::mem::take(&mut self.pending_replenish);
+        let ring = self.provided_bufs.ring_entries();
+        if bids.iter().any(|&b| u32::from(b) >= ring) {
+            bids.retain(|&b| {
+                if u32::from(b) < ring {
+                    return true;
+                }
+                let index = b as usize - ring as usize;
+                self.owned_recv[index]
+                    .take()
+                    .unwrap_or_else(|| panic!("owned receive copy {b} released twice"));
+                self.owned_recv_free.push(index as u16);
+                false
+            });
+        }
+        self.provided_bufs.release_batch(&bids);
+        bids.clear();
+        self.pending_replenish = bids;
+    }
+
+    /// Length of the memory a `recv_hold` entry's bid names: an owned copy's
+    /// length, or a provided buffer's size.
+    fn recv_data_len(&self, bid: u16) -> usize {
+        if self.is_owned_recv(bid) {
+            let index = bid as usize - self.provided_bufs.ring_entries() as usize;
+            self.owned_recv[index].as_ref().map_or(0, |c| c.len())
+        } else {
+            self.provided_bufs.buffer_size() as usize
+        }
+    }
+
+    /// Address of byte `off` of the data a `recv_hold` entry's bid names: a
+    /// provided-ring buffer or an owned copy.
+    pub(crate) fn recv_data_ptr(&self, bid: u16, off: u32) -> *const u8 {
+        if self.is_owned_recv(bid) {
+            let index = bid as usize - self.provided_bufs.ring_entries() as usize;
+            let copy = self.owned_recv[index]
+                .as_ref()
+                .expect("a live recv_hold entry's owned copy");
+            debug_assert!(off as usize <= copy.len());
+            // Safety: `off` is within the copy.
+            unsafe { copy.as_ptr().add(off as usize) }
+        } else {
+            self.provided_bufs.data_ptr(bid, off)
+        }
+    }
+}
+
+/// Whether the worker registers its TCP receive ring as incremental: only
+/// with `recv_incremental` on, the `timestamps` option off, and the kernel
+/// passing the incremental-ring preflight. A failed preflight is counted by
+/// step and selects a plain ring.
+fn select_incremental(config: &Config, ring: &mut Ring) -> Result<bool, crate::error::Error> {
+    if !config.recv_incremental {
+        return Ok(false);
+    }
+    #[cfg(feature = "timestamps")]
+    if config.timestamps {
+        return Ok(false);
+    }
+    use crate::backend::uring::engine::preflight::{IncPreflight, inc_preflight};
+    Ok(match inc_preflight(&mut ring.engine)? {
+        IncPreflight::Passed => true,
+        IncPreflight::Unsupported => false,
+        IncPreflight::Failed(step) => {
+            metrics::RECV_PREFLIGHT_FAILED.increment(step);
+            false
+        }
+    })
+}
+
 /// A held received buffer for segmented delivery (Mode B/C), in one of two
 /// backings depending on ring pressure at delivery time.
 ///
@@ -319,7 +446,9 @@ pub(crate) struct Driver {
     /// replenished) instead of copied into the accumulator, then forwarded back
     /// in one coalesced `sendmsg` via `forward_held`. Backpressure is natural:
     /// unreplenished bids deplete the provided-buffer ring (ENOBUFS) until a
-    /// forward completes and replenishes them.
+    /// forward completes and replenishes them. Above the lend cap an entry is
+    /// an owned copy instead (`own_recv_copy`), at most `ring_entries()` of
+    /// them per worker; past that, entries hold ring buffers again.
     /// `recv_hold` is also the staging area for direct-echo connections, which
     /// gather it the same way from the CQE handler (see `flush_direct_echo`).
     pub(crate) recv_hold: Vec<std::collections::VecDeque<PendingRecvBuf>>,
@@ -468,21 +597,21 @@ pub(crate) struct Driver {
     pub(crate) forward_epoch: Vec<u32>,
     /// Per-connection flag: `true` while a Mode A `forward_to` is driving this
     /// connection (set by `ConnCtx::forward_to`, cleared by `settle_forward_end`
-    /// / `reset_segment_state` / `close_connection`). Gates the `forward_hold_cap`
-    /// throttle so it applies only to forwarding connections, not to pure Mode B
-    /// segment readers that share the `Segmented` domain and `segment_hold`.
+    /// / `reset_segment_state` / `close_connection`).
     pub(crate) forward_recv_active: Vec<bool>,
-    /// Per-connection flag: `true` while a forwarding connection's multishot recv
-    /// has been throttled (cancelled) because its `segment_hold` reached
-    /// `forward_hold_cap`. Set at the throttle point in the recv handler; cleared
-    /// when the recv is re-armed after the hold drains below the cap
-    /// (`maybe_rearm_throttled_forward`) or on `settle_forward_end` / close.
+    /// Per-connection flag: `true` while a connection's multishot recv has been
+    /// throttled (cancelled) because its held receive entries reached the
+    /// hold cap (`throttle_if_held`). Cleared when the recv is re-armed after
+    /// the hold drains below the cap (`maybe_rearm_throttled_forward`) or on
+    /// `settle_forward_end` / close.
     /// Gates re-arm so the starved-connection path does not fight the throttle.
     pub(crate) forward_hold_throttled: Vec<bool>,
-    /// Per-connection held-buffer cap for Mode A `forward_to`
-    /// (`Config::forward_hold_cap`). When a forwarding connection's `segment_hold`
-    /// length reaches this, its multishot recv is cancelled (TCP window closes)
-    /// and re-armed once the hold drains below the cap.
+    /// Connections throttled by `throttle_if_held`, which the event loop
+    /// re-arms once their hold drains (`rearm_throttled_recvs`). May hold a
+    /// connection whose flag was cleared since; the next pass drops it.
+    pub(crate) throttled_recvs: Vec<u32>,
+    /// Per-connection cap on held receive entries (`Config::forward_hold_cap`);
+    /// `throttle_if_held` applies it, lowered to a quarter of the ring.
     pub(crate) forward_hold_cap: usize,
     pub(crate) accept_rx: Option<crossbeam_channel::Receiver<crate::acceptor::AcceptedConn>>,
     /// Merged accept mode: every merged listener's sockets, `(listener index,
@@ -627,10 +756,24 @@ pub(crate) struct Driver {
     /// validated in `handle_recv_fallback` before any connection state is
     /// touched (slots recycle; stale CQEs are normal).
     pub(crate) fallback_slot_owner: Vec<(u32, u32)>,
-    /// Size of each fallback recv chunk (bytes). A few multiples of the
-    /// provided-ring buffer size: one event-loop pass moves one chunk per
-    /// starved connection, so this bounds per-pass fallback throughput.
+    /// Size of each fallback recv chunk (bytes): `max(4 × buffer size,
+    /// 1 MiB)`, or 1 MiB with `recv_incremental`. One event-loop pass moves
+    /// one chunk per starved connection, so this bounds per-pass fallback
+    /// throughput.
     pub(crate) fallback_chunk: u32,
+    /// With `recv_incremental` on, the most TCP receive buffers that may
+    /// have a hold when a lend is taken: half the ring. A lend is taken only
+    /// while `held()` is at or below it; above it, each lend path copies
+    /// instead. `None` leaves lends uncapped, as without `recv_incremental`.
+    pub(crate) lend_cap: Option<u32>,
+    /// Owned copies standing in `recv_hold` entries (recv-forward, direct
+    /// echo) for completions the lend cap refused. An entry's bid is
+    /// `ring_entries() + index`, above every provided-ring bid, so the
+    /// existing release paths push it to `pending_replenish` unchanged and
+    /// `release_pending` frees it here instead of releasing a ring buffer.
+    /// `None` is a free index (`owned_recv_free`).
+    pub(crate) owned_recv: Vec<Option<Box<[u8]>>>,
+    pub(crate) owned_recv_free: Vec<u16>,
     /// Lifetime count of fallback recv submissions on this worker
     /// (reported in the shutdown diag line).
     pub(crate) recv_fallback_count: u64,
@@ -942,11 +1085,19 @@ impl Driver {
         let fixed_buffers =
             FixedBufferRegistry::new(&config.registered_regions, config.max_registered_regions);
 
-        let mut provided_bufs = ProvidedBufRing::new(
-            config.recv_buffer.bgid,
-            config.recv_buffer.ring_size,
-            config.recv_buffer.buffer_size,
-        )?;
+        // Before anything else is armed: the preflight reaps every
+        // completion the ring holds.
+        let incremental = select_incremental(config, &mut ring)?;
+        let (recv_ring_size, recv_buffer_size) = config.tcp_recv_geometry(incremental);
+        let mut provided_bufs =
+            ProvidedBufRing::new(config.recv_buffer.bgid, recv_ring_size, recv_buffer_size)?;
+        if incremental {
+            provided_bufs.set_incremental();
+        } else if config.recv_incremental {
+            // A completion would otherwise make a whole transparent huge
+            // page resident in a ring this large.
+            provided_bufs.advise_no_huge_pages();
+        }
         // On the worker thread, which `worker.rs` has already pinned — so the
         // pages fault in on this worker's NUMA node rather than the launching
         // thread's.
@@ -981,7 +1132,17 @@ impl Driver {
         ring.register_files_sparse(
             config.max_connections + udp_count + nvme_max + direct_io_max + fs_max,
         )?;
-        ring.register_buf_ring(&provided_bufs, RingKind::Plain)?;
+        let kind = if incremental {
+            RingKind::Incremental
+        } else {
+            RingKind::Plain
+        };
+        ring.register_buf_ring(&provided_bufs, kind)?;
+        metrics::RECV_RING.increment(if incremental {
+            metrics::recv_ring::INCREMENTAL
+        } else {
+            metrics::recv_ring::PLAIN
+        });
         if let Some(ref udp_bufs) = udp_provided_bufs {
             ring.register_buf_ring(udp_bufs, RingKind::Plain)?;
         }
@@ -1075,7 +1236,7 @@ impl Driver {
             send_copy_pool,
             send_slab,
             accumulators,
-            pending_replenish: Vec::with_capacity(config.recv_buffer.ring_size as usize),
+            pending_replenish: Vec::with_capacity(recv_ring_size as usize),
             pending_recv_bufs: vec![None; config.max_connections as usize],
             send_recv_buf_original_lens: vec![0; config.max_connections as usize],
             send_recv_buf_offs: vec![0; config.max_connections as usize],
@@ -1113,6 +1274,7 @@ impl Driver {
             forward_epoch: vec![0; config.max_connections as usize],
             forward_recv_active: vec![false; config.max_connections as usize],
             forward_hold_throttled: vec![false; config.max_connections as usize],
+            throttled_recvs: Vec::new(),
             forward_hold_cap: config.forward_hold_cap,
             accept_rx,
             merged_listeners: config.merged_listeners.clone(),
@@ -1167,16 +1329,21 @@ impl Driver {
             fallback_slot_owner: Vec::new(),
             // One event-loop pass moves at most one chunk per starved
             // connection, so the chunk — not the provided ring — is the
-            // per-pass byte ceiling while degraded. It must be LARGER than
-            // the ring's capacity to beat the park/re-arm churn cycle it
-            // replaces (which moves one ring's worth per pass); a small
-            // chunk would be slower than the pathology. Floor of 1 MiB,
-            // scaled up for jumbo provided buffers.
-            fallback_chunk: config
-                .recv_buffer
-                .buffer_size
-                .saturating_mul(4)
-                .max(1 << 20),
+            // per-pass byte ceiling while degraded. Four buffers, at least
+            // 1 MiB. Without `recv_incremental`, the arbitration in
+            // `flush_replenish_and_rearm` prefers the fallback on the premise
+            // that the chunk exceeds the ring's capacity, which no geometry
+            // here meets (the default 256 × 16 KiB ring holds 4 MiB). With
+            // `recv_incremental` the chunk is 1 MiB and the arbitration
+            // re-arms when the ring's free bytes exceed it.
+            fallback_chunk: if config.recv_incremental {
+                1 << 20
+            } else {
+                recv_buffer_size.saturating_mul(4).max(1 << 20)
+            },
+            lend_cap: config.recv_incremental.then_some(recv_ring_size as u32 / 2),
+            owned_recv: Vec::new(),
+            owned_recv_free: Vec::new(),
             recv_fallback_count: 0,
             udp_batch_recv_at: std::time::Instant::now(),
             tick_timeout_ts: if config.tick_timeout_us > 0 {
@@ -1856,8 +2023,9 @@ impl Driver {
         } else {
             return;
         }
-        // Replenish any held (not-yet-forwarded) zero-copy recv buffers so their
-        // bids aren't leaked, and clear the opt-in flag for slot reuse. An
+        // Release every held (not-yet-forwarded) entry, ring buffer or owned
+        // copy, so its bid is not leaked, and clear the opt-in flag for slot
+        // reuse. An
         // in-flight forward's bids live in its slab entry (already drained from
         // recv_hold) and are replenished by its own completion handler.
         // Direct-echo connections stage in the same hold, so this drains
@@ -2077,8 +2245,8 @@ impl Driver {
         out
     }
 
-    /// Copy `len` bytes out of provided buffer `bid`, then return the bid to
-    /// the ring. `None` for an empty buffer, which carries no bytes and would
+    /// Copy `len` bytes from `ptr`, the data of the buffer `bid` names (a
+    /// ring buffer or an owned copy), then release the bid. `None` for an empty buffer, which carries no bytes and would
     /// only add an empty chunk to the stream.
     ///
     /// Copy first, replenish second, nothing in between — a bid handed back
@@ -2745,7 +2913,8 @@ impl Driver {
             ud.raw(),
         );
         // Infallible: under SQ pressure the echo is parked at the queue head
-        // and retried, holding its provided buffer exactly as a queued echo
+        // and retried, holding the buffer its bid names (a ring buffer or an
+        // owned copy) exactly as a queued echo
         // does; the bid is replenished by its completion.
         self.submit_or_queue_send(
             conn_index,
@@ -2812,11 +2981,12 @@ impl Driver {
         let crate::backend::uring::sqe::Op::Send { buf, .. } = built.entry.op else {
             unreachable!("a SendRecvBuf is a plain send");
         };
-        let (base, size) = self.provided_bufs.get_buffer(ud.payload() as u16);
+        let bid = ud.payload() as u16;
+        let base = self.recv_data_ptr(bid, 0);
         let off = (buf as usize).wrapping_sub(base as usize);
         debug_assert!(
-            buf >= base && off < size as usize,
-            "send outside its buffer"
+            buf >= base && off < self.recv_data_len(bid),
+            "send outside its data"
         );
         self.send_recv_buf_offs[ci] = off as u32;
     }
@@ -2872,8 +3042,8 @@ impl Driver {
     /// they were carrying.
     ///
     /// A queued `SendRecvBuf` entry (recv-buffer forward / direct echo) owns
-    /// neither a pool slot nor a slab entry; it owns the provided recv buffer
-    /// whose bid is the SQE's payload. No CQE will ever replenish it, so the
+    /// neither a pool slot nor a slab entry; it owns the buffer whose bid is
+    /// the SQE's payload (a ring buffer or an owned copy). No CQE will ever replenish it, so the
     /// bid is recovered from the entry's user_data here, exactly as the
     /// completion handler would have done.
     ///

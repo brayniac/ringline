@@ -154,20 +154,24 @@ pub struct Config {
     ///
     /// **Default: 64** (a quarter of the default 256-buffer recv ring).
     pub(crate) recv_segment_reserve: u32,
-    /// Per-connection held-buffer cap for a Mode A `forward_to` connection (see
+    /// Per-connection cap on held receive entries (see
     /// `docs/segmented-recv-design.md`, "Mode A — Forward to an fd").
     ///
-    /// A `forward_to` connection holds arriving provided buffers in-place until
-    /// each is written to the sink. A slow or high-latency sink (or a very large
-    /// object) would otherwise let one forwarding connection accumulate an
-    /// unbounded backlog of held buffers, pinning much of the shared per-worker
-    /// recv ring (and growing heap when the low-water reserve force-copies) and
-    /// starving every other connection on the worker. When a forwarding
-    /// connection's held-buffer count reaches this cap, the runtime cancels its
-    /// multishot recv so its TCP receive window closes and the peer stops sending
-    /// (natural backpressure to the source); the recv is re-armed once the hold
-    /// drains below the cap as writes complete. This bounds one slow forward to at
-    /// most `forward_hold_cap` held buffers.
+    /// A connection can hold arriving data in place or as copies until its
+    /// consumer drains it: a `forward_to` source until each buffer is written to
+    /// the sink, a segment reader (`segments`, `with_segments`) until it reads,
+    /// a recv-forward or direct-echo connection until its send goes out. A slow
+    /// consumer would otherwise accumulate an unbounded backlog, pinning the
+    /// shared per-worker recv ring (starving every other connection on the
+    /// worker) or growing heap copies without limit. When a connection's held
+    /// entries reach this cap (lowered to a quarter of the recv ring's buffers
+    /// for recv-forward and direct echo, and for a segment hold without
+    /// `recv_incremental`), the runtime cancels its multishot recv so its TCP
+    /// receive window closes and only its peer stops sending; the recv is re-armed
+    /// once the hold drains below the cap. A recv-forward or direct-echo send
+    /// waiting on a peer that does not read still holds the ring buffers it
+    /// carries, uncounted: without `recv_incremental` one such connection can
+    /// empty the ring, and with it several can (#638).
     ///
     /// Larger values allow more recv in flight (higher single-forward throughput)
     /// at the cost of more pinned ring buffers / held heap under a slow sink;
@@ -178,6 +182,9 @@ pub struct Config {
     /// Fault recv and send buffer pages in at worker startup instead of on
     /// first use. See `ConfigBuilder::prefault_buffers`.
     pub(crate) prefault_buffers: bool,
+    /// Try an incremental TCP receive ring. See
+    /// `ConfigBuilder::recv_incremental`.
+    pub(crate) recv_incremental: bool,
     /// Bound on the per-worker accept channel. If a worker can't drain its
     /// queue fast enough, the acceptor will skip past it (and possibly
     /// close the incoming fd if every worker is full) rather than
@@ -442,6 +449,7 @@ impl Default for Config {
                 ring_size: 128,
                 buffer_size: 2048,
                 bgid: 1,
+                explicit: false,
             },
             registered_regions: Vec::new(),
             max_registered_regions: 64,
@@ -457,6 +465,7 @@ impl Default for Config {
             // the intent but is also a behaviour change for anything that
             // over-provisions today and never touches what it asked for.
             prefault_buffers: false,
+            recv_incremental: false,
             accept_queue_capacity: 1024,
             conn_chunk_size: 1,
             send_copy_count: 1024,
@@ -582,12 +591,15 @@ impl Config {
         // A cap below one recv buffer would overflow on the first full
         // buffer, and some pending-buffer flush paths assume a single
         // buffer's append into an empty accumulator cannot fail.
-        if self.recv_accumulator_max < self.recv_buffer.buffer_size as usize {
-            return Err(crate::error::Error::RingSetup(
-                "recv_accumulator_max must be >= recv_buffer_size \
+        let largest_buffer = self
+            .tcp_recv_geometry(true)
+            .1
+            .max(self.tcp_recv_geometry(false).1);
+        if self.recv_accumulator_max < largest_buffer as usize {
+            return Err(crate::error::Error::RingSetup(format!(
+                "recv_accumulator_max must be >= the TCP receive buffer size, {largest_buffer} \
                  (use usize::MAX to disable the cap)"
-                    .into(),
-            ));
+            )));
         }
         if self.max_connections == 0 || self.max_connections >= (1 << 24) {
             return Err(crate::error::Error::RingSetup(
@@ -749,6 +761,9 @@ pub(crate) struct RecvBufferConfig {
     pub buffer_size: u32,
     /// Buffer group ID for the provided buffer ring.
     pub bgid: u16,
+    /// Whether `ConfigBuilder::recv_buffer` set the geometry. With
+    /// `recv_incremental` on, a geometry not set follows the ring kind.
+    pub explicit: bool,
 }
 
 impl Default for RecvBufferConfig {
@@ -757,6 +772,28 @@ impl Default for RecvBufferConfig {
             ring_size: 256,
             buffer_size: 16384,
             bgid: 0,
+            explicit: false,
+        }
+    }
+}
+
+/// The TCP receive ring's geometry, `(ring_size, buffer_size)`, for an
+/// incremental ring, with `recv_incremental` on and no `recv_buffer` call.
+pub(crate) const RECV_INCREMENTAL_GEOMETRY: (u16, u32) = (64, 1 << 20);
+/// The TCP receive ring's geometry for a plain ring, with
+/// `recv_incremental` on and no `recv_buffer` call.
+pub(crate) const RECV_PLAIN_GEOMETRY: (u16, u32) = (4096, 64 << 10);
+
+impl Config {
+    /// The TCP receive ring's `(ring_size, buffer_size)` for a ring
+    /// registered as incremental or not.
+    pub(crate) fn tcp_recv_geometry(&self, incremental: bool) -> (u16, u32) {
+        if !self.recv_incremental || self.recv_buffer.explicit {
+            (self.recv_buffer.ring_size, self.recv_buffer.buffer_size)
+        } else if incremental {
+            RECV_INCREMENTAL_GEOMETRY
+        } else {
+            RECV_PLAIN_GEOMETRY
         }
     }
 }
@@ -979,6 +1016,37 @@ impl ConfigBuilder {
     pub fn recv_buffer(mut self, ring_size: u16, buffer_size: u32) -> Self {
         self.config.recv_buffer.ring_size = ring_size;
         self.config.recv_buffer.buffer_size = buffer_size;
+        self.config.recv_buffer.explicit = true;
+        self
+    }
+
+    /// Try an incremental TCP receive ring (`IOU_PBUF_RING_INC`), where
+    /// successive receives share a buffer at increasing offsets.
+    ///
+    /// Each worker first checks, on a one-entry ring, that the running kernel
+    /// behaves as the receive path relies on; if the kernel lacks incremental
+    /// rings or the check fails, it uses a plain ring. Without a
+    /// [`recv_buffer`](Self::recv_buffer) call the geometry follows the ring
+    /// kind: 64 × 1 MiB incremental, or 4096 × 64 KiB plain, and `build()`
+    /// then requires `recv_accumulator_max` to be at least 1 MiB on either
+    /// backend. With the `timestamps` feature and `timestamps(true)`, every
+    /// worker uses a plain ring.
+    ///
+    /// With this on, data is lent (held in place for a task, a segment or a
+    /// `forward_to` source) only while at most half the TCP ring's buffers
+    /// have a hold (a lend, or a completion whose release is queued for the
+    /// next flush); above that, each path copies, and `recv_segment_reserve`
+    /// is ignored. Recv-forward and direct echo copy into an owned buffer.
+    /// The fallback receive reads 1 MiB chunks, and a parked connection
+    /// re-arms its multishot instead when the ring's free buffers hold more.
+    /// With `prefault_buffers(true)` a plain ring makes 256 MiB per worker
+    /// resident, against 4 MiB for the 256 × 16 KiB default.
+    ///
+    /// The ring kind is an io_uring choice; the mio backend uses its own
+    /// receive buffers. **Default: false**, which keeps the plain ring
+    /// `recv_buffer` sets (256 × 16 KiB by default).
+    pub fn recv_incremental(mut self, enabled: bool) -> Self {
+        self.config.recv_incremental = enabled;
         self
     }
 
@@ -1018,7 +1086,8 @@ impl ConfigBuilder {
     /// connections holding segments cannot deplete the ring and `ENOBUFS`-starve
     /// well-behaved connections under fan-in. Above the reserve, delivery stays
     /// zero-copy. `0` force-copies only when the ring is fully drained. Tune
-    /// relative to the `recv_buffer` ring size; must be `<= 65535`.
+    /// relative to the `recv_buffer` ring size; must be `<= 65535`. Ignored
+    /// with `recv_incremental(true)`, where the lend cap decides.
     ///
     /// Default: 64 (a quarter of the default 256-buffer recv ring).
     pub fn recv_segment_reserve(mut self, reserve: u32) -> Self {
@@ -1026,19 +1095,6 @@ impl ConfigBuilder {
         self
     }
 
-    /// Set the per-connection held-buffer cap for Mode A `forward_to`
-    /// connections.
-    ///
-    /// When a forwarding connection has this many provided buffers held awaiting
-    /// writes to the sink, the runtime cancels its multishot recv (closing its
-    /// TCP receive window so the source stops sending) and re-arms it once the
-    /// hold drains below the cap as writes complete — bounding one slow forward
-    /// to `forward_hold_cap` held buffers so it cannot deplete the shared
-    /// per-worker recv ring and starve other connections. Larger values allow
-    /// more recv in flight (higher single-forward throughput) at the cost of more
-    /// pinned ring buffers / held heap under a slow sink. Must be `>= 1`.
-    ///
-    /// Default: 64 (2× `MAX_IOVECS`).
     /// Fault buffer pages in at worker startup rather than on first use.
     ///
     /// The provided recv ring and the send copy pool are allocated zeroed,
@@ -1067,6 +1123,27 @@ impl ConfigBuilder {
         self
     }
 
+    /// Set the per-connection cap on held receive entries.
+    ///
+    /// A connection holds received data until its consumer drains it: a
+    /// `forward_to` source until each buffer is written to the sink, a
+    /// segment reader (`segments`, `with_segments`, `recv_owned_segment`)
+    /// until it reads, a recv-forward or direct-echo connection until its
+    /// send goes out. When a connection holds this many entries the runtime
+    /// cancels its multishot recv, closing its TCP receive window so only its
+    /// peer stops sending, and re-arms it on an event-loop pass once the hold
+    /// drains below the cap. A recv-forward or direct-echo hold, and without
+    /// `recv_incremental` a segment hold, is held to at most a quarter of the
+    /// recv ring's buffers, since each such entry can pin one.
+    /// A recv-forward or direct-echo send waiting on a peer that does not read
+    /// holds the buffers it carries uncounted: without `recv_incremental` one
+    /// such connection can empty the ring, and with it several can (#638).
+    /// Larger values allow more recv in flight at the cost of more held
+    /// buffers or copies under a slow consumer: with `recv_incremental` a
+    /// segment hold can reach this many copies of up to one buffer each
+    /// (64 MiB at the default 64 × 1 MiB). Must be `>= 1`.
+    ///
+    /// Default: 64 (2× `MAX_IOVECS`).
     pub fn forward_hold_cap(mut self, cap: usize) -> Self {
         self.config.forward_hold_cap = cap;
         self
@@ -1385,6 +1462,27 @@ mod tests {
         // Principle 7: growth that cannot terminate is bounded by default.
         let c = Config::default();
         assert_eq!(c.recv_accumulator_max, 1024 * 1024 * 1024);
+    }
+
+    /// With `recv_incremental` on and no `recv_buffer` call, the buffer may
+    /// be the incremental geometry's 1 MiB, so a smaller cap is rejected; an
+    /// explicit geometry keeps its own floor.
+    #[test]
+    fn validate_recv_accumulator_max_covers_the_incremental_geometry() {
+        let inc = |max: usize| {
+            config_with(|c| {
+                c.recv_incremental = true;
+                c.recv_accumulator_max = max;
+            })
+        };
+        assert!(inc((1 << 20) - 1).validate().is_err());
+        assert!(inc(1 << 20).validate().is_ok());
+        let explicit = config_with(|c| {
+            c.recv_incremental = true;
+            c.recv_buffer.explicit = true;
+            c.recv_accumulator_max = c.recv_buffer.buffer_size as usize;
+        });
+        assert!(explicit.validate().is_ok());
     }
 
     #[test]

@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- io_uring: `ConfigBuilder::recv_incremental(true)` registers each worker's
+  TCP receive ring as incremental (`IOU_PBUF_RING_INC`), where successive
+  receives share a buffer at increasing offsets (#622). Each worker first
+  checks, on a one-entry ring and a socketpair, that the kernel behaves as
+  the receive path relies on, and otherwise uses a plain ring. Without a
+  `recv_buffer` call the geometry follows the ring kind: 64 × 1 MiB
+  incremental, 4096 × 64 KiB plain with `MADV_NOHUGEPAGE`, and `build()`
+  requires `recv_accumulator_max` of at least 1 MiB. Default off.
+  `ringline/recv_ring` counts the kind each worker selected, and
+  `ringline/recv_preflight_failed` the step a failed check stopped at.
+  Data is lent (held in place) only while at most half the ring's buffers
+  have a hold (a lend, or a completion whose release is queued for the
+  next flush), and copied above that (`ringline/recv_ring`
+  `lend_refused`); `recv_segment_reserve` is ignored, and the fallback
+  receive reads 1 MiB chunks, re-arming the multishot instead when the
+  ring's free buffers hold more. Recv-forward and direct echo copy into
+  an owned heap buffer above the cap. With `prefault_buffers(true)` the plain
+  geometry makes 256 MiB per worker resident.
+
 - Three connection counters (`ringline/connections`, `op` label) count three
   ways an accepted connection can be closed before it reaches a handler:
   `accept_table_full` (the worker's connection table was full),
@@ -348,6 +367,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   removed in the next breaking release (#579).
 
 ### Fixed
+
+- On io_uring, one segment reader or `forward_to` source whose consumer
+  stops draining what it holds, or with `recv_incremental` one recv-forward
+  or direct-echo connection, no longer grows memory without limit or stalls
+  its worker. A segment
+  reader (`segments()`, `with_segments`, `recv_owned_segment`) that stopped
+  reading made the worker copy everything its peer sent (a test client
+  wrote 64 MiB unread); with `recv_incremental`, a direct-echo peer that
+  stopped reading stalled every other connection on the worker. The
+  `forward_hold_cap` receive throttle, which applied only to `forward_to`
+  sources, now applies to every connection that holds received data
+  (segment readers, recv-forward, direct echo), at `forward_hold_cap` held
+  entries, lowered to a quarter of the receive ring's buffers for
+  recv-forward and direct echo and for segment holds without
+  `recv_incremental`:
+  its multishot receive is cancelled so only its peer is stopped, and it is
+  re-armed once the hold drains. A recv-forward or direct-echo send waiting
+  on a peer that does not read still holds the ring buffers it carries,
+  uncounted: without `recv_incremental` one such connection can empty the
+  ring, and with it several can (#638).
 
 - io_uring: `ConfigBuilder::sqpoll(true)` works. Ring setup set
   `IORING_SETUP_COOP_TASKRUN` together with `IORING_SETUP_SQPOLL`, which the

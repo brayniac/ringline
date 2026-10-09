@@ -1833,8 +1833,14 @@ fn memlock_required(config: &Config, workers: usize, charges_rings: bool, page: 
         })
         .sum();
     let rings = if charges_rings {
-        let mut bytes = ring_bytes(config.sq_entries, page)
-            + provided_ring_bytes(config.recv_buffer.ring_size, page);
+        // The ring kind is chosen per worker at startup, so count the TCP
+        // ring with the more entries of the two geometries.
+        let tcp_entries = config
+            .tcp_recv_geometry(true)
+            .0
+            .max(config.tcp_recv_geometry(false).0);
+        let mut bytes =
+            ring_bytes(config.sq_entries, page) + provided_ring_bytes(tcp_entries, page);
         if !config.udp_bind.is_empty() {
             bytes += provided_ring_bytes(config.udp_recv_buffer.ring_size, page);
         }
@@ -2377,6 +2383,22 @@ mod memlock_required_tests {
         assert_eq!(memlock_required(&config, 1, true, PAGE), 6 * PAGE);
         assert_eq!(memlock_required(&config, 4, true, PAGE), 24 * PAGE);
         assert_eq!(memlock_required(&config, 4, false, PAGE), 0);
+    }
+
+    /// With `recv_incremental` and no `recv_buffer` call, the ring kind is
+    /// chosen per worker, so the larger geometry's entries are counted: the
+    /// plain ring's 4096 entries * 16 bytes = 16 pages.
+    #[test]
+    fn recv_incremental_counts_the_larger_geometry() {
+        let config = ConfigBuilder::new()
+            .sq_entries(64)
+            .recv_incremental(true)
+            .build()
+            .unwrap();
+        assert_eq!(memlock_required(&config, 1, true, PAGE), (5 + 16) * PAGE);
+        // An explicit geometry is used as given.
+        let explicit = builder().recv_incremental(true).build().unwrap();
+        assert_eq!(memlock_required(&explicit, 1, true, PAGE), 6 * PAGE);
     }
 
     #[test]
