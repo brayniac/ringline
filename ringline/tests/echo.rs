@@ -488,6 +488,80 @@ fn async_echo_small_message() {
     }
 }
 
+/// The runtime launches and echoes with `sqpoll(true)`. The kernel refuses
+/// COOP_TASKRUN and DEFER_TASKRUN with SQPOLL, so setup sets neither under
+/// SQPOLL (#630).
+#[test]
+#[cfg(has_io_uring)]
+fn async_echo_under_sqpoll() {
+    let config = test_config_builder().sqpoll(true).build().expect("config");
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind("127.0.0.1:0".parse().unwrap())
+        .launch::<AsyncEcho>()
+        .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
+
+    wait_for_server(&addr);
+
+    for len in [22usize, 8192, 256 * 1024] {
+        let msg: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        let response = echo_round_trip(&addr, &msg);
+        assert_eq!(response, msg, "{len} bytes");
+    }
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
+/// Under SQPOLL, a burst of more SQEs than the SQ holds waits for the SQ
+/// thread to free entries instead of failing the push and closing the
+/// connection (#630): 128 connections echo through a 4-entry SQ.
+#[test]
+#[cfg(has_io_uring)]
+fn sqpoll_burst_larger_than_the_sq() {
+    let config = test_config_builder()
+        .sqpoll(true)
+        .sq_entries(4)
+        .max_connections(256)
+        .send_pool(512, 16384)
+        .build()
+        .expect("config");
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind("127.0.0.1:0".parse().unwrap())
+        .launch::<AsyncEcho>()
+        .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
+
+    wait_for_server(&addr);
+
+    let mut streams: Vec<TcpStream> = (0..128)
+        .map(|_| {
+            let s = TcpStream::connect(&addr).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            s
+        })
+        .collect();
+    for round in 0..20 {
+        for s in streams.iter_mut() {
+            s.write_all(b"0123456789abcdef").unwrap();
+        }
+        for (i, s) in streams.iter_mut().enumerate() {
+            let mut buf = [0u8; 16];
+            s.read_exact(&mut buf)
+                .unwrap_or_else(|e| panic!("round {round}, connection {i}: {e}"));
+            assert_eq!(&buf, b"0123456789abcdef");
+        }
+    }
+
+    drop(streams);
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
 #[test]
 fn async_echo_large_message() {
     let (shutdown, handles) = RinglineBuilder::new(test_config())
