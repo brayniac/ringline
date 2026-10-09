@@ -52,7 +52,7 @@ The worker loop is `AsyncEventLoop::run()` in
 `coop_taskrun`, `single_issuer`, and (unless SQPOLL is enabled)
 `defer_taskrun`, with registered file descriptors — connections are referenced
 as `Fixed(conn_index)` slots, so no per-operation fd table lookups
-(`ring.rs`).
+(`engine/uring.rs`).
 
 One loop iteration makes **one to three `io_uring_enter` calls, total,
 regardless of how many connections or requests it services**:

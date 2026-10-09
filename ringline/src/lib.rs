@@ -137,6 +137,11 @@
 //! available. Direct I/O and filesystem operations are supported via a
 //! dedicated thread pool.
 
+// A stub-engine build (`RINGLINE_STUB_ENGINE=1`) only checks that the
+// driver compiles without the `io_uring` crate; nothing reads the
+// operations it builds.
+#![cfg_attr(all(has_io_uring, not(uring_engine)), allow(dead_code))]
+
 // ── Internal modules ────────────────────────────────────────────────────
 pub(crate) mod acceptor;
 pub(crate) mod accumulator;

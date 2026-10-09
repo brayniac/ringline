@@ -2,12 +2,25 @@ fn main() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let force_mio = std::env::var("CARGO_FEATURE_FORCE_MIO").is_ok();
 
+    // `has_io_uring` selects the io_uring driver; `uring_engine` runs it on
+    // the kernel's io_uring. `RINGLINE_STUB_ENGINE=1` builds the driver on
+    // a stub engine instead, to check that only the engine needs the
+    // `io_uring` crate.
+    println!("cargo:rerun-if-env-changed=RINGLINE_STUB_ENGINE");
+    // Printing any rerun-if line drops cargo's default of rerunning on every
+    // package change; keep rerunning on source edits, so a target dir reused
+    // across a kernel upgrade picks up the new kernel at the next edit.
+    println!("cargo:rerun-if-changed=src");
+    let stub_engine = std::env::var("RINGLINE_STUB_ENGINE").is_ok_and(|v| v == "1");
     if target_os == "linux" && !force_mio && kernel_version_sufficient() {
         println!("cargo:rustc-cfg=has_io_uring");
+        if !stub_engine {
+            println!("cargo:rustc-cfg=uring_engine");
+        }
     }
 }
 
-/// Check that the running kernel is 6.1+. `Ring::setup` unconditionally sets
+/// Check that the running kernel is 6.1+. `UringEngine::setup` sets
 /// `IORING_SETUP_DEFER_TASKRUN` (non-SQPOLL) and the send path uses
 /// `IORING_OP_SENDMSG_ZC`; both landed in 6.1. Multishot recv, provided
 /// buffers, and `SINGLE_ISSUER` are 6.0.

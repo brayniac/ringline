@@ -60,8 +60,8 @@ const CLAIMS: &[Claim] = &[
         meaning: "admission is head-of-FIFO plus enough free slots",
     },
     Claim {
-        path: "ringline/src/backend/uring/ring.rs",
-        needle: "submit_and_wait(&self, min_complete: u32)",
+        path: "ringline/src/backend/uring/engine/uring.rs",
+        needle: "fn submit_and_wait(&self, min_complete: u32)",
         meaning: "io_uring submit/completion boundary",
     },
     Claim {

@@ -93,7 +93,7 @@ fn hard_limit() -> u64 {
     r.rlim_max
 }
 
-/// A ring set up as `Ring::setup` sets it up, for the sizes that matter here.
+/// A ring set up as `UringEngine::setup` sets it up, for the sizes that matter here.
 fn ring(sq_entries: u32) -> io::Result<IoUring<squeue::Entry128, cqueue::Entry32>> {
     IoUring::<squeue::Entry128, cqueue::Entry32>::builder()
         .setup_cqsize(sq_entries * 4)

@@ -123,6 +123,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   connection's close pushes a linked shutdown and `Close` together (#581).
   `sq_entries(1)` now fails `build()`.
 
+- **Breaking:** `ConfigBuilder::build` rejects a TCP or UDP receive buffer
+  group id of 65535 (`recv_buffer_bgid`, `udp_recv_buffer_bgid`), on both
+  backends. The io_uring backend uses that group id to check whether the
+  kernel supports incremental buffer rings (`IOU_PBUF_RING_INC`). A
+  `recv_buffer_bgid(65535)` or `udp_recv_buffer_bgid(65535)` config now
+  fails `build()` (#625).
+
 - **Breaking:** `JoinHandle` (from `spawn_with_handle`) and
   `BlockingJoinHandle` (from `spawn_blocking`) resolve to
   `Result<T, JoinError>` instead of `T`. Add `?` (in a function returning

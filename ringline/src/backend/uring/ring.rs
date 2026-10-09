@@ -1,19 +1,15 @@
 use std::io;
-use std::os::fd::{AsRawFd, RawFd};
-
-use io_uring::cqueue;
-use io_uring::squeue;
-use io_uring::types::DestinationSlot;
-use io_uring::{IoUring, opcode};
+use std::os::fd::RawFd;
 
 use crate::backend::ProvidedBufRing;
 use crate::buffer::fixed::FixedBufferRegistry;
 use crate::completion::{OpTag, UserData};
 use crate::config::Config;
-use crate::error::{Error, MemlockLimit, describe_buffer_registration_failure, errno_name};
+use crate::error::Error;
 use crate::memlock::KernelVersion;
 use crate::nvme::{NVME_URING_CMD_IO, NvmeUringCmd};
 
+use super::engine::{ActiveEngine, Engine, RingKind};
 use super::sqe::{self, Link, Op, Sqe};
 
 /// The first kernel that releases a socket removed from the fixed-file table
@@ -24,96 +20,6 @@ const FIXED_FILES_RELEASED_PER_FILE_SINCE: KernelVersion = KernelVersion {
     major: 6,
     minor: 13,
 };
-
-/// Ubuntu's 6.8 kernels (from 6.8.0-139) invert the check on the reserved
-/// words of `IORING_REGISTER_PBUF_RING`: a registration with them zeroed, as
-/// upstream kernels require, fails with `EINVAL`, and one with `resv[0]` set
-/// succeeds. The same is reported for `IORING_UNREGISTER_PBUF_RING` (#626).
-const PBUF_RESV_INVERTED_ON: KernelVersion = KernelVersion { major: 6, minor: 8 };
-
-/// Whether a provided-buffer-ring registration refused with `err` on
-/// `kernel` is retried with `resv[0]` set: only an `EINVAL` on 6.8. On any
-/// other kernel the `EINVAL` is returned unchanged.
-fn retry_with_resv_set(err: &io::Error, kernel: Option<KernelVersion>) -> bool {
-    err.raw_os_error() == Some(libc::EINVAL) && kernel == Some(PBUF_RESV_INVERTED_ON)
-}
-
-/// `struct io_uring_buf_reg`, which the `io-uring` crate fills with `resv`
-/// zeroed and does not let the caller set.
-#[repr(C)]
-struct BufReg {
-    ring_addr: u64,
-    ring_entries: u32,
-    bgid: u16,
-    flags: u16,
-    resv: [u64; 3],
-}
-
-const _: () = assert!(std::mem::size_of::<BufReg>() == 40);
-
-const IORING_REGISTER_PBUF_RING: libc::c_uint = 22;
-const IORING_UNREGISTER_PBUF_RING: libc::c_uint = 23;
-
-/// `io_uring_register(2)` for a provided buffer ring, with `resv[0]` set to
-/// `resv0`. Ringline passes 1 (see [`retry_with_resv_set`]); tests pass 0 to
-/// check the call against a kernel that requires zeroed reserved words.
-///
-/// # Safety
-///
-/// `opcode` must be `IORING_REGISTER_PBUF_RING` or
-/// `IORING_UNREGISTER_PBUF_RING`. For registration, `ring_addr` must point to
-/// a buffer ring of `ring_entries` entries that stays mapped until the group
-/// is unregistered or the io_uring instance is dropped.
-unsafe fn pbuf_ring_register(
-    fd: RawFd,
-    opcode: libc::c_uint,
-    ring_addr: u64,
-    ring_entries: u32,
-    bgid: u16,
-    resv0: u64,
-) -> io::Result<()> {
-    let reg = BufReg {
-        ring_addr,
-        ring_entries,
-        bgid,
-        flags: 0,
-        resv: [resv0, 0, 0],
-    };
-    // Safety: `reg` is a valid `io_uring_buf_reg` for the duration of the
-    // call; the caller upholds the contract on `ring_addr`.
-    let rc = unsafe {
-        libc::syscall(
-            libc::SYS_io_uring_register,
-            fd,
-            opcode,
-            &reg as *const BufReg,
-            1,
-        )
-    };
-    if rc < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
-/// The error for a refused provided-buffer-ring registration.
-fn provided_ring_failure(
-    err: &io::Error,
-    bgid: u16,
-    entries: impl std::fmt::Display,
-    probe: &crate::error::RingSetupProbe,
-) -> Error {
-    let name = errno_name(err)
-        .map(|n| format!(" ({n})"))
-        .unwrap_or_default();
-    Error::BufferRegistration(format!(
-        "provided buffer ring (bgid {bgid}, {entries} entries): {err}{name}. \
-         EINVAL here usually means a kernel older than 5.19 or a \
-         ring size that is not a power of two. {}",
-        crate::error::provided_ring_enomem_hint(probe)
-    ))
-}
 
 /// Whether a ring setup error is ENOMEM from `io_uring_setup` or from
 /// registering the provided buffer ring.
@@ -169,53 +75,16 @@ pub(crate) fn close_lead_for(kernel: Option<KernelVersion>) -> CloseLead {
     }
 }
 
-/// Wrapper around IoUring providing high-level SQE submission helpers.
-///
-/// The ring uses 128-byte SQEs and 32-byte CQEs (`IoUring<Entry128, Entry32>`)
-/// to support NVMe passthrough via `IORING_OP_URING_CMD` / `UringCmd80`.
-/// [`Sqe::encode`] produces the 128-byte entries; 64-byte opcodes are
-/// zero-padded.
-///
-/// Memory overhead of Big SQE/CQE: +32 KB per worker with default config
-/// (256 SQ × 64B extra + 1024 CQ × 16B extra), negligible relative to the
-/// ~20 MB of buffer pools allocated per worker.
+/// The driver's submission interface: builds an [`Sqe`] for each operation
+/// and pushes it to the engine.
 pub struct Ring {
-    pub(crate) ring: IoUring<squeue::Entry128, cqueue::Entry32>,
+    pub(crate) engine: ActiveEngine,
     /// Recv buffer group ID for multishot recv.
     bgid: u16,
-    /// Reusable Entry128 conversion scratch for chain pushes — avoids a
-    /// heap allocation per chained send.
-    chain_scratch: Vec<squeue::Entry128>,
-    /// Whether the ring was set up with `IORING_SETUP_DEFER_TASKRUN`. When
-    /// set, the kernel runs task_work — and so posts the CQEs it generates —
-    /// only on an `io_uring_enter` carrying `IORING_ENTER_GETEVENTS`.
-    defer_taskrun: bool,
-    /// Whether the kernel supports `IORING_OP_FIXED_FD_INSTALL` (6.8+).
-    ///
-    /// Park (tier 3, #443) has to hand a real fd to another worker, but an
-    /// established connection's fd lives only in this ring's fixed-file
-    /// table — `install_accepted` closes the raw fd once it is registered.
-    /// This opcode is the only way to get one back, so it decides whether
-    /// park is available at all. See [`Ring::supports_park`].
-    fixed_fd_install: bool,
-    /// What goes ahead of a connection's `Close` on this kernel. See
-    /// [`close_lead_for`].
-    close_lead: CloseLead,
-    /// The kernel accepted a provided buffer ring only with `resv[0]` set,
-    /// so later registrations use that form and unregistration tries it
-    /// first.
-    /// See [`retry_with_resv_set`].
-    pbuf_resv_set: bool,
-    /// Test-only: number of upcoming `push_sqe`/`push_sqe128` calls that
-    /// fail as if the SQ were still full after a submit. See
-    /// [`Ring::force_push_failures`].
+    /// Test-only: the last operation pushed through `push_sqe`, so a test
+    /// can check which operation a handler submitted.
     #[cfg(test)]
-    forced_push_failures: usize,
-    /// Test-only: the last 64-byte entry pushed by `push_sqe` or
-    /// `push_entry`, without link flags, so a test can check which operation
-    /// a handler submitted. `UringCmd80` pushes are not recorded.
-    #[cfg(test)]
-    pub(crate) last_pushed: Option<squeue::Entry>,
+    pub(crate) last_pushed: Option<Sqe>,
     /// Test-only: the registered file index of the last drain `send`, which
     /// `last_pushed` does not show.
     #[cfg(test)]
@@ -223,84 +92,11 @@ pub struct Ring {
 }
 
 impl Ring {
-    /// Create and configure the io_uring instance.
-    ///
-    /// Returns [`Error::RingSetup`] rather than `Error::Io` so a refused
-    /// `io_uring_setup(2)` names the subsystem and, for `EPERM`, the
-    /// `kernel.io_uring_disabled` sysctl or seccomp profile behind it.
+    /// Set up the engine for `config`.
     pub fn setup(config: &Config) -> Result<Self, Error> {
-        let cq_entries = config
-            .sq_entries
-            .checked_mul(4)
-            .unwrap_or(config.sq_entries);
-
-        let mut builder = IoUring::<squeue::Entry128, cqueue::Entry32>::builder();
-        builder.setup_cqsize(cq_entries);
-        builder.setup_coop_taskrun();
-        builder.setup_single_issuer();
-
-        if config.sqpoll {
-            builder.setup_sqpoll(config.sqpoll_idle_ms);
-            if let Some(cpu) = config.sqpoll_cpu {
-                builder.setup_sqpoll_cpu(cpu);
-            }
-            // DEFER_TASKRUN is incompatible with SQPOLL (kernel returns EINVAL).
-        } else {
-            builder.setup_defer_taskrun();
-        }
-
-        let ring = builder
-            .build(config.sq_entries)
-            .map_err(Error::ring_setup)?;
-
-        // Applies to the calling thread's io-wq, which is why the ring is
-        // set up on its worker's thread. A zero slot leaves that limit
-        // unchanged and reads back its current value, so the first call only
-        // reads. The cap is an upper bound: registering it where the
-        // kernel's own limit is lower would raise the limit instead.
-        if config.iowq_max_workers > 0 {
-            let refused = |e: io::Error| {
-                Error::RingSetup(format!(
-                    "io_uring refused an io-wq worker cap of {}: {e}",
-                    config.iowq_max_workers
-                ))
-            };
-            let mut current = [0, 0];
-            ring.submitter()
-                .register_iowq_max_workers(&mut current)
-                .map_err(refused)?;
-            if config.iowq_max_workers < current[0] {
-                let mut limits = [config.iowq_max_workers, 0];
-                ring.submitter()
-                    .register_iowq_max_workers(&mut limits)
-                    .map_err(refused)?;
-            }
-        }
-
-        // Probed once here rather than per park: the answer cannot change for
-        // the life of the ring, and a failed probe is not a setup failure —
-        // it only means park is unavailable.
-        let fixed_fd_install = {
-            let mut probe = io_uring::Probe::new();
-            match ring.submitter().register_probe(&mut probe) {
-                Ok(()) => probe.is_supported(opcode::FixedFdInstall::CODE),
-                // `IORING_REGISTER_PROBE` is 5.6 and the crate floor is 6.1,
-                // so this should not happen — but a refused probe means
-                // "assume not supported", never "fail to start".
-                Err(_) => false,
-            }
-        };
-
         Ok(Ring {
-            ring,
+            engine: ActiveEngine::setup(config)?,
             bgid: config.recv_buffer.bgid,
-            chain_scratch: Vec::new(),
-            defer_taskrun: !config.sqpoll,
-            fixed_fd_install,
-            close_lead: Self::close_lead_from(config),
-            pbuf_resv_set: false,
-            #[cfg(test)]
-            forced_push_failures: 0,
             #[cfg(test)]
             last_pushed: None,
             #[cfg(test)]
@@ -309,254 +105,124 @@ impl Ring {
     }
 
     /// Whether this kernel can return a registered fd to the process table,
-    /// and so whether park (tier 3, #443) is available.
-    ///
-    /// Requires Linux 6.8 for `IORING_OP_FIXED_FD_INSTALL`. The crate floor
-    /// stays at 6.1: below 6.8 park is simply unavailable, and nothing else
-    /// changes. That is a smaller loss than it sounds, because park exists
-    /// only to repair the placement imbalance
-    /// [`AcceptMode::Merged`](crate::AcceptMode::Merged) introduces — the
-    /// default [`Pool`](crate::AcceptMode::Pool) mode places by round-robin
-    /// and has nothing to rebalance. A pre-6.8 deployment that wants even
-    /// placement stays on the default and loses nothing.
+    /// and so whether park (tier 3, #443) is available. See
+    /// [`Engine::supports_park`].
     #[allow(dead_code)] // first caller lands with the handover (#443 step 5c)
     pub(crate) fn supports_park(&self) -> bool {
-        self.fixed_fd_install
+        self.engine.supports_park()
     }
 
     /// What goes ahead of a connection's `Close` on the running kernel. See
     /// [`close_lead_for`].
     pub(crate) fn close_lead(&self) -> CloseLead {
-        self.close_lead
+        self.engine.close_lead()
     }
 
-    fn close_lead_from(config: &Config) -> CloseLead {
-        #[cfg(test)]
-        if let Some(lead) = config.close_lead_override {
-            return lead;
-        }
-        let _ = config;
-        close_lead_for(KernelVersion::current())
-    }
-
-    /// Re-probe an arbitrary opcode. Exists so tests can establish that the
-    /// probe mechanism answers at all — a probe that silently reported
-    /// everything unsupported would disable park permanently and look
-    /// exactly like an old kernel.
-    #[cfg(test)]
-    pub(crate) fn probe_supported(&self, code: u8) -> bool {
-        let mut probe = io_uring::Probe::new();
-        match self.ring.submitter().register_probe(&mut probe) {
-            Ok(()) => probe.is_supported(code),
-            Err(_) => false,
-        }
-    }
-
-    /// Register a sparse fixed-buffer table sized to the registry, then
-    /// fill in any occupied slots via `register_buffers_update`.
-    ///
-    /// The sparse path lets us add and remove regions dynamically after
-    /// launch without re-registering the entire table.
-    ///
-    /// Failures come back as [`Error::BufferRegistration`] naming the cause;
-    /// `ENOMEM` is the `RLIMIT_MEMLOCK` limit in practice.
+    /// See [`Engine::register_buffers`].
     pub fn register_buffers(&self, registry: &FixedBufferRegistry) -> Result<(), Error> {
-        let iovecs = registry.iovecs();
-        if iovecs.is_empty() {
-            return Ok(());
-        }
-        let total: u64 = iovecs.iter().map(|iov| iov.iov_len as u64).sum();
-        let attribute =
-            |e: io::Error| Error::buffer_registration(e, total, MemlockLimit::read().ok().as_ref());
-        let submitter = self.ring.submitter();
-        submitter
-            .register_buffers_sparse(iovecs.len() as u32)
-            .map_err(attribute)?;
-
-        // Apply each occupied slot. Empty slots stay zeroed in the kernel.
-        for (slot, iov) in iovecs.iter().enumerate() {
-            if iov.iov_base.is_null() {
-                continue;
-            }
-            // Safety: the iovec points at user memory documented to outlive
-            // the runtime; tags are unused.
-            unsafe {
-                submitter
-                    .register_buffers_update(slot as u32, std::slice::from_ref(iov), None)
-                    .map_err(attribute)?;
-            }
-        }
-        Ok(())
+        self.engine.register_buffers(registry)
     }
 
-    /// Update a single fixed-buffer slot with a new iovec.
-    ///
-    /// `iov.iov_base.is_null()` clears the slot.
+    /// See [`Engine::register_buffers_update_one`].
     ///
     /// # Safety
     ///
-    /// The memory described by `iov` must remain valid until either the slot
-    /// is cleared or the runtime shuts down. No SQE referencing the slot may
-    /// be in flight when this is called.
+    /// As [`Engine::register_buffers_update_one`].
     pub unsafe fn register_buffers_update_one(
         &self,
         slot: u16,
         iov: libc::iovec,
     ) -> io::Result<()> {
-        unsafe {
-            self.ring
-                .submitter()
-                .register_buffers_update(slot as u32, std::slice::from_ref(&iov), None)
-                .map_err(|e| {
-                    // Surfaces to the caller of `Runtime::register_region`
-                    // as an `io::Error`; keep the kind, replace the bare
-                    // "Cannot allocate memory" with the memlock guidance.
-                    let text = describe_buffer_registration_failure(
-                        &e,
-                        iov.iov_len as u64,
-                        MemlockLimit::read().ok().as_ref(),
-                    );
-                    io::Error::new(e.kind(), text)
-                })?;
-        }
-        Ok(())
+        unsafe { self.engine.register_buffers_update_one(slot, iov) }
     }
 
-    /// The calling thread's io-wq limits, `[bounded, unbounded]`. Passing 0
-    /// for both changes nothing and returns the current values.
-    #[cfg(test)]
-    pub(crate) fn iowq_max_workers(&self) -> io::Result<[u32; 2]> {
-        let mut limits = [0, 0];
-        self.ring
-            .submitter()
-            .register_iowq_max_workers(&mut limits)?;
-        Ok(limits)
-    }
-
-    /// Register a sparse file table for direct descriptors.
-    ///
-    /// The kernel sizes this table against `RLIMIT_NOFILE`, so `EMFILE`
-    /// means the limit, not fd exhaustion, and is reported as such.
+    /// See [`Engine::register_files_sparse`].
     pub fn register_files_sparse(&self, count: u32) -> Result<(), Error> {
-        self.ring
-            .submitter()
-            .register_files_sparse(count)
-            .map_err(|e| match e.raw_os_error() {
-                Some(libc::EMFILE | libc::ENFILE) => Error::ResourceLimit(format!(
-                    "RLIMIT_NOFILE too low for the fixed file table: io_uring refused \
-                     {count} entries ({e}). Raise it with `ulimit -n` to at least \
-                     {count} plus overhead, or lower ConfigBuilder::max_connections"
-                )),
-                _ => Error::Io(e),
-            })?;
-        Ok(())
+        self.engine.register_files_sparse(count)
     }
 
-    /// Update registered file table at given offset.
+    /// See [`Engine::register_files_update`].
     pub fn register_files_update(&self, offset: u32, fds: &[RawFd]) -> io::Result<()> {
-        self.ring.submitter().register_files_update(offset, fds)?;
-        Ok(())
+        self.engine.register_files_update(offset, fds)
     }
 
-    /// Register the provided buffer ring with the kernel.
-    ///
-    /// On a 6.8 kernel that refuses the zeroed reserved words with `EINVAL`,
-    /// retries once with `resv[0]` set; after that succeeds, later
-    /// registrations use only that form (#626).
-    pub fn register_buf_ring(&mut self, provided: &ProvidedBufRing) -> Result<(), Error> {
-        let (addr, entries, bgid) = (
-            provided.ring_addr(),
-            provided.ring_entries(),
-            provided.bgid(),
-        );
-        // Safety (every registration in this function): `addr` is
-        // `provided`'s mmap'd ring, mapped at the call. The `io-uring`
-        // crate's contract, which `pbuf_ring_register` repeats, asks for it
-        // to stay mapped until the group is unregistered or the io_uring
-        // instance is dropped. `Driver::run_shutdown` meets that. `Driver`'s
-        // error and panic exits, and the path after a failed unregister,
-        // unmap the ring while its group is still registered. That frees no
-        // memory the kernel reads. Registration pins the ring's pages
-        // (`io_pin_pages`, called from `io_uring/kbuf.c` or
-        // `io_uring/memmap.c`), and the kernel reads entries through its own
-        // mapping of those pages. The kernel unpins them only when the group
-        // is unregistered or the io_uring instance is freed. The buffers the
-        // entries point at (`buf_backing`) are a separate, unpinned
-        // allocation that the kernel writes through the user addresses in the
-        // entries; this argument does not cover them.
-        let first = if self.pbuf_resv_set {
-            unsafe { self.register_pbuf_resv_set(addr, entries, bgid) }
-        } else {
-            unsafe {
-                self.ring
-                    .submitter()
-                    .register_buf_ring_with_flags(addr, entries as u16, bgid, 0)
-            }
-        };
-        let result = match first {
-            Err(e) if !self.pbuf_resv_set && retry_with_resv_set(&e, KernelVersion::current()) => {
-                match unsafe { self.register_pbuf_resv_set(addr, entries, bgid) } {
-                    Ok(()) => {
-                        self.pbuf_resv_set = true;
-                        Ok(())
-                    }
-                    // Report the refusal of the standard form.
-                    Err(_) => Err(e),
-                }
-            }
-            other => other,
-        };
-        result.map_err(|e| {
-            provided_ring_failure(&e, bgid, entries, &crate::error::RingSetupProbe::read())
-        })
+    /// See [`Engine::register_buf_ring`].
+    pub fn register_buf_ring(
+        &mut self,
+        provided: &ProvidedBufRing,
+        kind: RingKind,
+    ) -> Result<(), Error> {
+        self.engine.register_buf_ring(provided, kind)
     }
 
-    /// # Safety
-    ///
-    /// As [`pbuf_ring_register`].
-    unsafe fn register_pbuf_resv_set(&self, addr: u64, entries: u32, bgid: u16) -> io::Result<()> {
-        unsafe {
-            pbuf_ring_register(
-                self.ring.as_raw_fd(),
-                IORING_REGISTER_PBUF_RING,
-                addr,
-                entries,
-                bgid,
-                1,
-            )
-        }
-    }
-
-    /// Unregister the provided buffer ring from the kernel.
-    /// Call it before the ring memory is unmapped, as the `io-uring` crate's
-    /// contract requires; the Safety comment in [`Ring::register_buf_ring`]
-    /// says why the exits that skip it free no memory the kernel reads.
-    ///
-    /// After a registration needed `resv[0]` set, unregistration tries that
-    /// form first and falls back to the standard one on `EINVAL`, since only
-    /// the registration check is confirmed inverted (#626).
+    /// See [`Engine::unregister_buf_ring`].
     pub fn unregister_buf_ring(&self, bgid: u16) -> io::Result<()> {
-        if self.pbuf_resv_set {
-            // Safety: unregistration reads no memory through `ring_addr`.
-            let resv = unsafe {
-                pbuf_ring_register(
-                    self.ring.as_raw_fd(),
-                    IORING_UNREGISTER_PBUF_RING,
-                    0,
-                    0,
-                    bgid,
-                    1,
-                )
-            };
-            match resv {
-                Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {}
-                other => return other,
-            }
-        }
-        self.ring.submitter().unregister_buf_ring(bgid)?;
-        Ok(())
+        self.engine.unregister_buf_ring(bgid)
     }
 
+    /// See [`Engine::submit_and_wait`].
+    pub fn submit_and_wait(&self, min_complete: u32) -> io::Result<()> {
+        self.engine.submit_and_wait(min_complete)
+    }
+
+    /// See [`Engine::submit_and_get_events`].
+    pub fn submit_and_get_events(&self) -> io::Result<()> {
+        self.engine.submit_and_get_events()
+    }
+
+    /// See [`Engine::flush`].
+    pub fn flush(&self) -> io::Result<()> {
+        self.engine.flush()
+    }
+
+    /// See [`Engine::reap`].
+    pub(crate) fn reap(&mut self, out: &mut Vec<(u64, i32, u32)>) {
+        self.engine.reap(out);
+    }
+
+    /// See [`Engine::sq_len`].
+    #[cfg(test)]
+    pub(crate) fn sq_len(&mut self) -> usize {
+        self.engine.sq_len()
+    }
+
+    /// See [`Engine::force_push_failures`].
+    #[cfg(test)]
+    pub(crate) fn force_push_failures(&mut self, count: usize) {
+        self.engine.force_push_failures(count);
+    }
+
+    /// Post a completion with `user_data` and `result`, as if an operation
+    /// had completed. See [`Engine::inject`].
+    #[cfg(test)]
+    pub(crate) fn submit_nop_inject(&mut self, user_data: u64, result: i32) -> io::Result<()> {
+        self.engine.inject(user_data, result, false)
+    }
+
+    /// As [`submit_nop_inject`](Self::submit_nop_inject), linked to the next
+    /// entry pushed.
+    #[cfg(test)]
+    pub(crate) fn submit_nop_inject_linked(
+        &mut self,
+        user_data: u64,
+        result: i32,
+    ) -> io::Result<()> {
+        self.engine.inject(user_data, result, true)
+    }
+
+    /// Re-probe an arbitrary opcode; see
+    /// `engine::uring::UringEngine::probe_supported`.
+    #[cfg(all(test, uring_engine))]
+    pub(crate) fn probe_supported(&self, code: u8) -> bool {
+        self.engine.probe_supported(code)
+    }
+
+    /// The calling thread's io-wq limits; see
+    /// `engine::uring::UringEngine::iowq_max_workers`.
+    #[cfg(all(test, uring_engine))]
+    pub(crate) fn iowq_max_workers(&self) -> io::Result<[u32; 2]> {
+        self.engine.iowq_max_workers()
+    }
     /// Submit a multishot recvmsg with provided buffer ring for a connection.
     /// Used when SO_TIMESTAMPING is enabled to receive cmsg ancillary data
     /// (kernel timestamps) alongside TCP payload.
@@ -1001,7 +667,7 @@ impl Ring {
             ),
         };
         let first = first.link(Link::Hard);
-        unsafe { self.push_sqe_pair(first.encode(), close.encode()) }
+        unsafe { self.engine.push_pair(&first, &close) }
     }
 
     /// Submit an async connect for a direct file descriptor.
@@ -1297,63 +963,6 @@ impl Ring {
         Ok(())
     }
 
-    /// Submit all pending SQEs and wait for at least `min_complete` CQEs.
-    ///
-    /// A bare `?` here would kill the worker thread (and every connection on
-    /// it) on the first transient `io_uring_enter` failure:
-    /// - `EINTR`: any signal delivered to the worker interrupts the wait
-    ///   regardless of `SA_RESTART` — restart it.
-    /// - `EBUSY`: the CQ is backed up (overflow list non-empty); return `Ok`
-    ///   so the caller drains completions, which frees CQ space.
-    pub fn submit_and_wait(&self, min_complete: u32) -> io::Result<()> {
-        loop {
-            match self.ring.submitter().submit_and_wait(min_complete as usize) {
-                Ok(_) => return Ok(()),
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) if e.raw_os_error() == Some(libc::EBUSY) => return Ok(()),
-                Err(e) => return Err(e),
-            }
-        }
-    }
-
-    /// Submit pending SQEs and reap deferred completions **without blocking**.
-    ///
-    /// Use this instead of `submit_and_wait(0)` whenever the event loop
-    /// declines to block because a task is runnable.
-    ///
-    /// `submit_and_wait(0)` does not set `IORING_ENTER_GETEVENTS` (the
-    /// io-uring crate sets it only for `want > 0`), and under
-    /// `IORING_SETUP_DEFER_TASKRUN` the kernel runs task_work only when that
-    /// flag is present. A worker with a permanently runnable task therefore
-    /// never blocks, never sets GETEVENTS, and — if the runnable task also
-    /// queues no SQEs, so `flush()` takes its empty-SQ shortcut — never reaps
-    /// a single completion: no accepts, no recvs, no send completions, and so
-    /// no send-pool slots recycled, for as long as that task stays runnable.
-    ///
-    /// Costs the same one syscall as the `submit_and_wait(0)` it replaces.
-    /// Without DEFER_TASKRUN (SQPOLL rings, which cannot enable it) the kernel
-    /// posts completions eagerly, so this delegates.
-    pub fn submit_and_get_events(&self) -> io::Result<()> {
-        if !self.defer_taskrun {
-            return self.submit_and_wait(0);
-        }
-        loop {
-            // Safety: as in `flush()` — a shared view of the SQ head/tail
-            // atomics, read-only.
-            let n = unsafe { self.ring.submission_shared().len() } as u32;
-            match unsafe {
-                self.ring
-                    .submitter()
-                    .enter::<()>(n, 0, 1 /* IORING_ENTER_GETEVENTS */, None)
-            } {
-                Ok(_) => return Ok(()),
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) if e.raw_os_error() == Some(libc::EBUSY) => return Ok(()),
-                Err(e) => return Err(e),
-            }
-        }
-    }
-
     /// Submit a timeout SQE that fires after the given duration.
     /// Produces a CQE with the given user_data when it fires (-ETIME)
     /// or is cancelled (-ECANCELED).
@@ -1369,119 +978,6 @@ impl Ring {
         Ok(())
     }
 
-    /// Append every completion the ring holds to `out` as
-    /// `(user_data, result, flags)`, consuming them.
-    pub(crate) fn reap(&mut self, out: &mut Vec<(u64, i32, u32)>) {
-        out.extend(
-            self.ring
-                .completion()
-                .map(|cqe| (cqe.user_data(), cqe.result(), cqe.flags())),
-        );
-    }
-
-    /// The number of entries queued in the SQ and not yet submitted.
-    #[cfg(test)]
-    pub(crate) fn sq_len(&mut self) -> usize {
-        self.ring.submission().len()
-    }
-
-    /// Submit pending SQEs without waiting. Used for mid-iteration flush.
-    ///
-    /// After submitting the SQEs this method issues a second `io_uring_enter`
-    /// with `IORING_ENTER_GETEVENTS` and `min_complete=0`.  With
-    /// `IORING_SETUP_DEFER_TASKRUN` the kernel only runs task_work (and posts
-    /// deferred CQEs to the completion ring) when `IORING_ENTER_GETEVENTS` is
-    /// set.  A plain `submit()` call does NOT set that flag, so send-completion
-    /// CQEs for the SQEs we just submitted sit in kernel-internal task_work
-    /// until the next `submit_and_wait(1)`, causing a "dead" event-loop
-    /// iteration that wakes up only to process those CQEs.
-    ///
-    /// By issuing a non-blocking `enter(GETEVENTS, min=0)` right after submit
-    /// we flush task_work inline — the send CQEs land in the CQ ring before
-    /// `flush()` returns, so the `drain_completions()` call that follows in
-    /// the event loop can consume them immediately.
-    pub fn flush(&self) -> io::Result<()> {
-        // Combine submit + DEFER_TASKRUN flush into a single kernel entry.
-        //
-        // The old two-call path was:
-        //   submit()                           → enter(sq_len, 0, 0=no-GETEVENTS, None)
-        //   enter::<()>(0, 0, GETEVENTS, None) → enter(0,      0, GETEVENTS,       None)
-        //
-        // Merged into one:
-        //   enter(sq_len, 0, GETEVENTS, None)
-        //
-        // This submits any pending SQEs AND triggers DEFER_TASKRUN task_work
-        // delivery in a single syscall, saving one round-trip to the kernel
-        // per flush() invocation (≈ once or twice per event-loop iteration).
-        //
-        // Safety: `submission_shared()` gives a shared view of the SQ head/tail
-        // atomics.  We only read `.len()` (sq_tail − sq_head) and never push
-        // new entries here, so there is no aliasing or mutation hazard.
-        let n = unsafe { self.ring.submission_shared().len() } as u32;
-        if n == 0 {
-            // Nothing to submit. Pending DEFER_TASKRUN task_work and CQEs are
-            // reaped by the event loop's next ring entry, which always carries
-            // GETEVENTS — `submit_and_wait(1)` when it blocks, and
-            // `submit_and_get_events()` when it declines to because a task is
-            // runnable. Skipping the syscall here therefore defers completion
-            // reaping by at most one loop iteration. (That second case is why
-            // `submit_and_get_events` exists: a plain `submit_and_wait(0)` sets
-            // no GETEVENTS, and combined with this shortcut it would strand
-            // task_work indefinitely.)
-            return Ok(());
-        }
-        unsafe {
-            self.ring
-                .submitter()
-                .enter::<()>(n, 0, 1 /* IORING_ENTER_GETEVENTS */, None)?;
-        }
-        Ok(())
-    }
-
-    /// Submit a NOP with injected result for error injection testing.
-    ///
-    /// The kernel will post a CQE with the given `user_data` and `result`,
-    /// allowing tests to simulate any CQE (send error, recv EOF, etc.)
-    /// through the real submit_and_wait → dispatch_cqe pipeline.
-    ///
-    /// Requires kernel 6.6+ (IORING_NOP_INJECT_RESULT support).
-    #[cfg(test)]
-    pub(crate) fn submit_nop_inject(&mut self, user_data: u64, result: i32) -> io::Result<()> {
-        let mut entry = opcode::Nop::new().build().user_data(user_data);
-        // The high-level Entry doesn't expose nop_flags or len fields.
-        // Use raw pointer arithmetic to patch the SQE in-place.
-        // SQE layout (64 bytes): opcode(1) flags(1) ioprio(2) fd(4) off(8) addr(8)
-        //                         len(4@24) rw_flags/nop_flags(4@28) user_data(8) ...
-        let ptr = &mut entry as *mut squeue::Entry as *mut u8;
-        unsafe {
-            // len is at byte offset 24 in the SQE
-            std::ptr::write_unaligned(ptr.add(24) as *mut u32, result as u32);
-            // nop_flags (union with rw_flags) is at byte offset 28
-            std::ptr::write_unaligned(ptr.add(28) as *mut u32, 1); // IORING_NOP_INJECT_RESULT
-        }
-        unsafe { self.push_entry(&entry) }
-    }
-
-    /// Like `submit_nop_inject` but with IOSQE_IO_LINK set, so the
-    /// next SQE in the submission queue is linked to this one.
-    #[cfg(test)]
-    pub(crate) fn submit_nop_inject_linked(
-        &mut self,
-        user_data: u64,
-        result: i32,
-    ) -> io::Result<()> {
-        let mut entry = opcode::Nop::new()
-            .build()
-            .user_data(user_data)
-            .flags(squeue::Flags::IO_LINK);
-        let ptr = &mut entry as *mut squeue::Entry as *mut u8;
-        unsafe {
-            std::ptr::write_unaligned(ptr.add(24) as *mut u32, result as u32);
-            std::ptr::write_unaligned(ptr.add(28) as *mut u32, 1); // IORING_NOP_INJECT_RESULT
-        }
-        unsafe { self.push_entry(&entry) }
-    }
-
     /// Push an operation to the submission queue.
     ///
     /// # Safety
@@ -1489,100 +985,20 @@ impl Ring {
     /// arrives, and for `SendMsgZc` until its notification.
     pub(crate) unsafe fn push_sqe(&mut self, sqe: &Sqe) -> io::Result<()> {
         unsafe {
-            self.push_sqe128(sqe.encode())?;
+            self.engine.push(sqe)?;
         }
         #[cfg(test)]
-        if !matches!(sqe.op, Op::UringCmd80 { .. }) {
-            self.last_pushed = Some(sqe.encode64());
+        {
+            self.last_pushed = Some(*sqe);
         }
         Ok(())
-    }
-
-    /// Push a raw 64-byte entry: the test-only NOP injections, which set
-    /// fields `Sqe` does not describe.
-    #[cfg(test)]
-    unsafe fn push_entry(&mut self, entry: &squeue::Entry) -> io::Result<()> {
-        unsafe {
-            self.push_sqe128(entry.clone().into())?;
-        }
-        self.last_pushed = Some(entry.clone());
-        Ok(())
-    }
-
-    /// Push a 128-byte entry to the submission queue.
-    ///
-    /// # Safety
-    /// The entry must reference valid memory for the lifetime of the operation.
-    unsafe fn push_sqe128(&mut self, entry: squeue::Entry128) -> io::Result<()> {
-        #[cfg(test)]
-        if self.forced_push_failures > 0 {
-            self.forced_push_failures -= 1;
-            crate::metrics::RING.increment(crate::metrics::ring::SQE_SUBMIT_FAILURES);
-            return Err(io::Error::other("forced SQ push failure"));
-        }
-
-        // Try to push; if SQ is full, submit first to make room.
-        unsafe {
-            if self.ring.submission().push(&entry).is_err() {
-                self.ring.submit()?;
-                if self.ring.submission().push(&entry).is_err() {
-                    crate::metrics::RING.increment(crate::metrics::ring::SQE_SUBMIT_FAILURES);
-                    return Err(io::Error::other("SQ still full after submit"));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Push two SQEs adjacently, so a linked pair is never split across
-    /// submissions. Submits first if the SQ has room for fewer than two.
-    ///
-    /// # Safety
-    /// Both SQEs must reference valid memory for the lifetime of the operation.
-    unsafe fn push_sqe_pair(
-        &mut self,
-        first: squeue::Entry128,
-        second: squeue::Entry128,
-    ) -> io::Result<()> {
-        #[cfg(test)]
-        if self.forced_push_failures > 0 {
-            self.forced_push_failures -= 1;
-            crate::metrics::RING.increment(crate::metrics::ring::SQE_SUBMIT_FAILURES);
-            return Err(io::Error::other("forced SQ push failure"));
-        }
-
-        let pair = [first, second];
-        unsafe {
-            if self.ring.submission().push_multiple(&pair).is_err() {
-                self.ring.submit()?;
-                if self.ring.submission().push_multiple(&pair).is_err() {
-                    crate::metrics::RING.increment(crate::metrics::ring::SQE_SUBMIT_FAILURES);
-                    return Err(io::Error::other("SQ still full after submit"));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Test-only: make the next `count` `push_sqe`/`push_sqe128` calls fail.
-    ///
-    /// Each forced failure returns an error of the same kind (`Other`) as
-    /// the real "SQ still full after submit" path, increments the same
-    /// `SQE_SUBMIT_FAILURES` metric, and consumes one unit of `count`
-    /// before the real submission queue is touched. `push_sqe` routes
-    /// through `push_sqe128`, so every `submit_*` helper is covered.
-    /// `push_sqe_chain`'s multi-entry path (`push_multiple`) is not
-    /// affected.
-    #[cfg(test)]
-    pub(crate) fn force_push_failures(&mut self, count: usize) {
-        self.forced_push_failures = count;
     }
 
     /// Push a chain of linked SQEs atomically.
     ///
     /// Sets `IOSQE_IO_LINK` on all entries except the last, so the kernel
-    /// executes them sequentially. All entries are pushed via `push_multiple`
-    /// to guarantee contiguous placement in the SQ.
+    /// executes them sequentially. The engine queues them contiguously
+    /// (`Engine::push_chain`).
     ///
     /// # Safety
     /// All SQEs must reference valid memory for the lifetime of their operations.
@@ -1601,39 +1017,7 @@ impl Ring {
             entry.link = Link::Soft;
         }
 
-        // Convert to Entry128 for the Big SQ ring, reusing the scratch to
-        // avoid a per-chain heap allocation.
-        let mut entries128 = std::mem::take(&mut self.chain_scratch);
-        entries128.clear();
-        entries128.extend(entries.iter().map(Sqe::encode));
-
-        // Ensure enough room in the SQ for the entire chain.
-        {
-            let sq = self.ring.submission();
-            if sq.capacity() - sq.len() < entries128.len() {
-                drop(sq);
-                self.ring.submit()?;
-                let sq = self.ring.submission();
-                if sq.capacity() - sq.len() < entries128.len() {
-                    entries128.clear();
-                    self.chain_scratch = entries128;
-                    return Err(io::Error::other("SQ too small for chain"));
-                }
-            }
-        }
-
-        // Atomic push of the entire chain.
-        let pushed = unsafe {
-            self.ring
-                .submission()
-                .push_multiple(&entries128)
-                .map_err(|_| io::Error::other("SQ full after flush for chain"))
-        };
-        // Return the scratch for reuse regardless of outcome.
-        entries128.clear();
-        self.chain_scratch = entries128;
-        pushed?;
-        Ok(())
+        unsafe { self.engine.push_chain(entries) }
     }
 
     /// Submit an NVMe passthrough command via `IORING_OP_URING_CMD`.
@@ -1763,8 +1147,9 @@ impl Ring {
     ) -> io::Result<()> {
         // `Sqe::encode` builds the destination slot again and relies on
         // this check.
-        DestinationSlot::try_from_slot_target(fd_index)
-            .map_err(|_| io::Error::other("invalid fd_index for openat"))?;
+        if fd_index > sqe::MAX_FILE_INDEX {
+            return Err(io::Error::other("invalid fd_index for openat"));
+        }
         let entry = Sqe::new(
             Op::OpenAt {
                 path: pathname,
@@ -1878,10 +1263,15 @@ impl Ring {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, uring_engine))]
 mod tests {
     use super::*;
+    use crate::backend::uring::engine::uring::{
+        IORING_REGISTER_PBUF_RING, IORING_UNREGISTER_PBUF_RING, PBUF_RESV_INVERTED_ON,
+        pbuf_ring_register, provided_ring_failure, retry_with_resv_set,
+    };
     use crate::config::ConfigBuilder;
+    use crate::memlock::KernelVersion;
 
     fn ring_with(cap: Option<u32>) -> Ring {
         let mut builder = ConfigBuilder::new().workers(1).sq_entries(256);
@@ -1928,18 +1318,52 @@ mod tests {
         let tcp = ProvidedBufRing::new(5, 8, 4096).expect("tcp ring");
         let udp = ProvidedBufRing::new(6, 8, 4096).expect("udp ring");
         let mut ring = ring_with(None);
-        ring.register_buf_ring(&tcp).expect("register tcp ring");
-        ring.register_buf_ring(&udp).expect("register udp ring");
+        ring.register_buf_ring(&tcp, RingKind::Plain)
+            .expect("register tcp ring");
+        ring.register_buf_ring(&udp, RingKind::Plain)
+            .expect("register udp ring");
         if KernelVersion::current() != Some(PBUF_RESV_INVERTED_ON) {
-            assert!(!ring.pbuf_resv_set);
+            assert!(!ring.engine.pbuf_resv_set());
         }
         ring.unregister_buf_ring(5).expect("unregister tcp ring");
         ring.unregister_buf_ring(6).expect("unregister udp ring");
         // Unregistered, so the group can be registered again.
-        ring.register_buf_ring(&tcp)
+        ring.register_buf_ring(&tcp, RingKind::Plain)
             .expect("register tcp ring again");
         ring.unregister_buf_ring(5)
             .expect("unregister tcp ring again");
+    }
+
+    /// `incremental_buffers` matches what registration does: an
+    /// incremental ring registers and unregisters when it reports true and
+    /// is refused with `EINVAL` when it reports false. Kernels from 6.12
+    /// support it.
+    #[test]
+    fn incremental_buffers_matches_registration() {
+        // Declared before the ring, so it is unmapped after it drops.
+        let provided = ProvidedBufRing::new(9, 8, 4096).expect("provided ring");
+        let mut ring = ring_with(None);
+        let supported = ring.engine.incremental_buffers().expect("probe");
+        // The answer is cached and stable.
+        assert_eq!(ring.engine.incremental_buffers().expect("probe"), supported);
+        if KernelVersion::current()
+            >= Some(KernelVersion {
+                major: 6,
+                minor: 12,
+            })
+        {
+            assert!(supported, "6.12+ supports IOU_PBUF_RING_INC");
+        }
+        match ring.register_buf_ring(&provided, RingKind::Incremental) {
+            Ok(()) => {
+                assert!(supported);
+                ring.unregister_buf_ring(9).expect("unregister");
+            }
+            Err(e) => {
+                assert!(!supported, "registration refused: {e}");
+                assert!(e.to_string().contains("EINVAL"), "{e}");
+            }
+        }
     }
 
     /// The raw `io_uring_register` call behind the `resv[0]` retry (#626)
@@ -1957,32 +1381,32 @@ mod tests {
         // Declared before the ring, so it is unmapped after the ring drops.
         let provided = ProvidedBufRing::new(7, 8, 4096).expect("provided ring");
         let ring = ring_with(None);
-        let fd = ring.ring.as_raw_fd();
+        let fd = ring.engine.raw_fd();
         let (addr, entries) = (provided.ring_addr(), provided.ring_entries());
         // Safety: `provided` outlives the ring and so every registration.
         unsafe {
-            let resv0 = match pbuf_ring_register(fd, IORING_REGISTER_PBUF_RING, addr, entries, 7, 0)
-            {
-                Ok(()) => 0,
-                Err(e) if retry_with_resv_set(&e, KernelVersion::current()) => {
-                    pbuf_ring_register(fd, IORING_REGISTER_PBUF_RING, addr, entries, 7, 1)
-                        .expect("register with resv[0] set");
-                    1
-                }
-                Err(e) => panic!("register: {e}"),
-            };
-            pbuf_ring_register(fd, IORING_UNREGISTER_PBUF_RING, 0, 0, 7, resv0)
+            let resv0 =
+                match pbuf_ring_register(fd, IORING_REGISTER_PBUF_RING, addr, entries, 7, 0, 0) {
+                    Ok(()) => 0,
+                    Err(e) if retry_with_resv_set(&e, KernelVersion::current()) => {
+                        pbuf_ring_register(fd, IORING_REGISTER_PBUF_RING, addr, entries, 7, 0, 1)
+                            .expect("register with resv[0] set");
+                        1
+                    }
+                    Err(e) => panic!("register: {e}"),
+                };
+            pbuf_ring_register(fd, IORING_UNREGISTER_PBUF_RING, 0, 0, 7, 0, resv0)
                 .expect("unregister");
-            pbuf_ring_register(fd, IORING_REGISTER_PBUF_RING, addr, entries, 7, resv0)
+            pbuf_ring_register(fd, IORING_REGISTER_PBUF_RING, addr, entries, 7, 0, resv0)
                 .expect("register again");
             if resv0 == 0 {
                 assert_eq!(
-                    pbuf_ring_register(fd, IORING_REGISTER_PBUF_RING, addr, entries, 8, 1)
+                    pbuf_ring_register(fd, IORING_REGISTER_PBUF_RING, addr, entries, 8, 0, 1)
                         .map_err(|e| e.raw_os_error()),
                     Err(Some(libc::EINVAL))
                 );
             }
-            pbuf_ring_register(fd, IORING_UNREGISTER_PBUF_RING, 0, 0, 7, resv0)
+            pbuf_ring_register(fd, IORING_UNREGISTER_PBUF_RING, 0, 0, 7, 0, resv0)
                 .expect("unregister");
         }
     }

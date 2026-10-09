@@ -1,0 +1,148 @@
+//! The engine executes the operations the driver submits and reports their
+//! completions. `UringEngine` runs them on the kernel's io_uring. Building
+//! with the environment variable `RINGLINE_STUB_ENGINE=1` selects
+//! `StubEngine` instead, which compiles the driver without using the
+//! `io_uring` crate and fails at setup.
+
+use std::io;
+use std::os::fd::RawFd;
+
+use super::ring::CloseLead;
+use super::sqe::Sqe;
+use crate::backend::ProvidedBufRing;
+use crate::buffer::fixed::FixedBufferRegistry;
+use crate::config::Config;
+use crate::error::Error;
+
+#[cfg(not(uring_engine))]
+pub(crate) mod stub;
+#[cfg(uring_engine)]
+pub(crate) mod uring;
+
+/// The engine this build uses.
+#[cfg(not(uring_engine))]
+pub(crate) type ActiveEngine = stub::StubEngine;
+/// The engine this build uses.
+#[cfg(uring_engine)]
+pub(crate) type ActiveEngine = uring::UringEngine;
+
+/// How the kernel consumes a provided-buffer ring's buffers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RingKind {
+    /// Each completion takes a whole buffer.
+    Plain,
+    /// `IOU_PBUF_RING_INC`: completions consume a buffer at increasing
+    /// offsets, and a buffer goes back to the application once it is used
+    /// up.
+    #[allow(dead_code)] // first use lands with #622's ring-kind selection
+    Incremental,
+}
+
+/// What the driver needs from an engine.
+///
+/// A completion is `(user_data, result, flags)`, with the meaning
+/// io_uring gives each: `result` is the operation's return value or a
+/// negated errno, and `flags` are `IORING_CQE_F_*` bits (read them with
+/// [`abi::cqueue`](super::abi::cqueue)).
+pub(crate) trait Engine: Sized {
+    /// Create the engine for one worker, on that worker's thread.
+    fn setup(config: &Config) -> Result<Self, Error>;
+
+    /// Queue `sqe`. Fails when the queue is full and submitting to make room
+    /// either fails or leaves it full.
+    ///
+    /// # Safety
+    /// The operation's pointers must stay valid until its completion
+    /// arrives, and for `SendMsgZc` until its notification.
+    unsafe fn push(&mut self, sqe: &Sqe) -> io::Result<()>;
+
+    /// Queue two operations next to each other, so a link from `first` to
+    /// `second` is never split across submissions.
+    ///
+    /// # Safety
+    /// As [`push`](Self::push), for both.
+    unsafe fn push_pair(&mut self, first: &Sqe, second: &Sqe) -> io::Result<()>;
+
+    /// Queue `sqes` contiguously, with the links they carry.
+    ///
+    /// # Safety
+    /// As [`push`](Self::push), for each.
+    unsafe fn push_chain(&mut self, sqes: &[Sqe]) -> io::Result<()>;
+
+    /// Start queued operations and block until at least `min_complete`
+    /// completions are ready. `EINTR` restarts; `EBUSY` (completions backed
+    /// up) returns `Ok` so the caller reaps.
+    fn submit_and_wait(&self, min_complete: u32) -> io::Result<()>;
+
+    /// Start queued operations and make ready completions reapable, without
+    /// blocking.
+    fn submit_and_get_events(&self) -> io::Result<()>;
+
+    /// Start queued operations, if any, and make the completions they
+    /// produce at once reapable.
+    fn flush(&self) -> io::Result<()>;
+
+    /// Append every ready completion to `out`, consuming them.
+    fn reap(&mut self, out: &mut Vec<(u64, i32, u32)>);
+
+    /// Create a fixed-file table of `count` empty slots.
+    fn register_files_sparse(&self, count: u32) -> Result<(), Error>;
+
+    /// Install `fds` into the fixed-file table from slot `offset`; `-1`
+    /// empties a slot. The engine keeps its own reference to each file.
+    fn register_files_update(&self, offset: u32, fds: &[RawFd]) -> io::Result<()>;
+
+    /// Register a provided-buffer ring under its group id, as a ring of
+    /// `kind`.
+    fn register_buf_ring(
+        &mut self,
+        provided: &ProvidedBufRing,
+        kind: RingKind,
+    ) -> Result<(), Error>;
+
+    /// Unregister the provided-buffer ring with group id `bgid`. Must be
+    /// called before the ring's memory is unmapped.
+    fn unregister_buf_ring(&self, bgid: u16) -> io::Result<()>;
+
+    /// Register the fixed-buffer table, sized to `registry`, with its
+    /// occupied slots. An empty registry registers nothing.
+    fn register_buffers(&self, registry: &FixedBufferRegistry) -> Result<(), Error>;
+
+    /// Set fixed-buffer slot `slot` to `iov`; a null `iov_base` clears it.
+    ///
+    /// # Safety
+    /// The memory `iov` describes must stay valid until the slot is cleared
+    /// or the runtime shuts down, and no operation using the slot may be in
+    /// flight.
+    unsafe fn register_buffers_update_one(&self, slot: u16, iov: libc::iovec) -> io::Result<()>;
+
+    /// What goes ahead of a connection's `Close`.
+    fn close_lead(&self) -> CloseLead;
+
+    /// Whether a registered file can be returned to the process's file
+    /// table (`FIXED_FD_INSTALL`), and so whether park (#443) is available.
+    fn supports_park(&self) -> bool;
+
+    /// Whether this engine registers [`RingKind::Incremental`] rings
+    /// (`IOU_PBUF_RING_INC`, Linux 6.12+). `Ok(false)` means the kernel
+    /// lacks them; an error is a failure to find out (for example `ENOMEM`
+    /// from `RLIMIT_MEMLOCK`), and the next call tries again.
+    #[allow(dead_code)] // first caller lands with #622's ring-kind selection
+    fn incremental_buffers(&self) -> io::Result<bool>;
+
+    /// Test-only: post a completion with `user_data` and `result` as if an
+    /// operation had completed. With `linked`, the next operation pushed is
+    /// linked to it.
+    #[cfg(test)]
+    fn inject(&mut self, user_data: u64, result: i32, linked: bool) -> io::Result<()>;
+
+    /// Test-only: make the next `count` calls to `push`, `push_pair` or
+    /// `inject` fail as if the queue were still full after a submit;
+    /// `push_chain` is not affected.
+    #[cfg(test)]
+    fn force_push_failures(&mut self, count: usize);
+
+    /// Test-only: the number of operations queued and not yet submitted.
+    #[cfg(test)]
+    fn sq_len(&mut self) -> usize;
+}

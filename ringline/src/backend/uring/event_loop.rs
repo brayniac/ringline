@@ -6989,6 +6989,7 @@ mod tests {
     /// broken: it reports "unsupported" for everything, silently disabling
     /// park on kernels that support it perfectly well.
     #[test]
+    #[cfg(uring_engine)]
     fn the_opcode_probe_answers_for_an_opcode_every_kernel_has() {
         let el = make_test_loop();
         assert!(
@@ -7030,6 +7031,7 @@ mod tests {
     /// caching the wrong opcode, which no runtime behaviour would reveal
     /// until park silently never ran.
     #[test]
+    #[cfg(uring_engine)]
     fn park_support_matches_a_fresh_probe_of_the_opcode() {
         let el = make_test_loop();
         assert_eq!(
@@ -10845,7 +10847,7 @@ mod tests {
                 .last_pushed
                 .as_ref()
                 .expect("an SQE was pushed")
-                .get_user_data(),
+                .user_data,
         );
         assert_eq!(
             pushed.payload() as u16,
@@ -11637,7 +11639,10 @@ mod tests {
 
         let ud = UserData::encode(OpTag::ForwardWrite, src, src_gen);
         el.test_dispatch_cqe(ud.raw(), -libc::EAGAIN, 0);
-        assert_eq!(last_pushed_opcode(&el), io_uring::opcode::Send::CODE);
+        assert!(matches!(
+            last_pushed_op(&el),
+            crate::backend::uring::sqe::Op::Send { .. }
+        ));
         assert_eq!(
             el.driver.ring.last_drain_index,
             Some(sink),
@@ -11645,11 +11650,7 @@ mod tests {
         );
         let drain = UserData::encode(OpTag::ForwardWriteDrain, src, src_gen);
         assert_eq!(
-            el.driver
-                .ring
-                .last_pushed
-                .as_ref()
-                .map(|e| e.get_user_data()),
+            el.driver.ring.last_pushed.as_ref().map(|e| e.user_data),
             Some(drain.raw())
         );
 
@@ -11674,21 +11675,12 @@ mod tests {
                 generation: el.driver.connections.generation(sink).wrapping_add(1),
             };
         }
-        let pushed_before = el
-            .driver
-            .ring
-            .last_pushed
-            .as_ref()
-            .map(|e| e.get_user_data());
+        let pushed_before = el.driver.ring.last_pushed.as_ref().map(|e| e.user_data);
 
         let ud = UserData::encode(OpTag::ForwardWrite, src, src_gen);
         el.test_dispatch_cqe(ud.raw(), -libc::EAGAIN, 0);
         assert_eq!(
-            el.driver
-                .ring
-                .last_pushed
-                .as_ref()
-                .map(|e| e.get_user_data()),
+            el.driver.ring.last_pushed.as_ref().map(|e| e.user_data),
             pushed_before,
             "nothing may be written to a recycled sink"
         );
@@ -13670,22 +13662,14 @@ mod tests {
         );
     }
 
-    /// The opcode of the last SQE the loop pushed. `squeue::Entry` has no
-    /// getter for it; its `Debug` output carries `op_code`.
-    fn last_pushed_opcode(el: &AsyncEventLoop<NoopHandler>) -> u8 {
-        let entry = el
-            .driver
+    /// The last operation the loop pushed.
+    fn last_pushed_op(el: &AsyncEventLoop<NoopHandler>) -> crate::backend::uring::sqe::Op {
+        el.driver
             .ring
             .last_pushed
             .as_ref()
-            .expect("an SQE was pushed");
-        let debug = format!("{entry:?}");
-        let code = debug
-            .split("op_code: ")
-            .nth(1)
-            .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
-            .expect("Entry's Debug output names op_code");
-        code.parse().expect("op_code is a number")
+            .expect("an SQE was pushed")
+            .op
     }
 
     /// An `EAGAIN` from a slab-backed `sendmsg` must be followed by a plain
@@ -13693,9 +13677,11 @@ mod tests {
     /// same handler. A `POLLOUT` poll completes at once on `POLLRDHUP` once the
     /// peer has half-closed, and the loop spun on it (#603).
     fn assert_eagain_drains(el: &AsyncEventLoop<NoopHandler>, drain_tag: OpTag, conn_index: u32) {
-        assert_eq!(
-            last_pushed_opcode(el),
-            io_uring::opcode::Send::CODE,
+        assert!(
+            matches!(
+                last_pushed_op(el),
+                crate::backend::uring::sqe::Op::Send { .. }
+            ),
             "EAGAIN must be followed by a plain send, not a POLLOUT poll"
         );
         let ud = UserData(
@@ -13704,7 +13690,7 @@ mod tests {
                 .last_pushed
                 .as_ref()
                 .expect("an SQE was pushed")
-                .get_user_data(),
+                .user_data,
         );
         assert_eq!(ud.tag(), Some(drain_tag));
         assert_eq!(ud.conn_index(), conn_index);
@@ -13730,9 +13716,11 @@ mod tests {
         // of the entry, and the rest goes out as a sendmsg.
         let drain = UserData::encode(OpTag::SendRecvBufsCoalescedDrain, conn_index, 0);
         el.test_dispatch_cqe(drain.raw(), 4096, 0);
-        assert_eq!(
-            last_pushed_opcode(&el),
-            io_uring::opcode::SendMsg::CODE,
+        assert!(
+            matches!(
+                last_pushed_op(&el),
+                crate::backend::uring::sqe::Op::SendMsg { .. }
+            ),
             "the rest of the entry is resubmitted"
         );
         assert!(el.driver.send_slab.in_use(0));
@@ -13752,21 +13740,12 @@ mod tests {
         assert_eagain_drains(&el, OpTag::SendRecvBufsCoalescedDrain, conn_index);
 
         // The peer reset the connection while the drain waited.
-        let pushed_before = el
-            .driver
-            .ring
-            .last_pushed
-            .as_ref()
-            .map(|e| e.get_user_data());
+        let pushed_before = el.driver.ring.last_pushed.as_ref().map(|e| e.user_data);
         let drain = UserData::encode(OpTag::SendRecvBufsCoalescedDrain, conn_index, 0);
         el.test_dispatch_cqe(drain.raw(), -libc::EPIPE, 0);
         assert!(!el.driver.send_slab.in_use(0), "the entry is released");
         assert_eq!(
-            el.driver
-                .ring
-                .last_pushed
-                .as_ref()
-                .map(|e| e.get_user_data()),
+            el.driver.ring.last_pushed.as_ref().map(|e| e.user_data),
             pushed_before,
             "nothing is resubmitted after an error"
         );
@@ -13824,7 +13803,10 @@ mod tests {
         // The drain sends 40 bytes: the rest is resubmitted zero-copy.
         let drain = UserData::encode(OpTag::SendMsgZcDrain, conn_index, 0);
         el.test_dispatch_cqe(drain.raw(), 40, 0);
-        assert_eq!(last_pushed_opcode(&el), io_uring::opcode::SendMsgZc::CODE);
+        assert!(matches!(
+            last_pushed_op(&el),
+            crate::backend::uring::sqe::Op::SendMsgZc { .. }
+        ));
         assert!(el.driver.send_queues[conn_index as usize].in_flight);
 
         // The rest completes; the EAGAIN's notification is still owed.
@@ -15496,7 +15478,7 @@ mod tests {
                 .last_pushed
                 .as_ref()
                 .expect("an SQE was pushed")
-                .get_user_data(),
+                .user_data,
         );
         assert_eq!(ud.tag(), Some(OpTag::SendRecvBuf));
         assert_eq!(ud.payload() as u16, bid);
@@ -15569,7 +15551,7 @@ mod tests {
                 .last_pushed
                 .as_ref()
                 .expect("an SQE was pushed")
-                .get_user_data(),
+                .user_data,
         );
         assert_eq!(
             pushed.tag(),
