@@ -8711,6 +8711,79 @@ mod tests {
         );
     }
 
+    /// On an incremental ring a completion's data starts at the bytes the
+    /// buffer already holds, not at its base: two completions into one
+    /// buffer reach the connection as consecutive bytes, and the buffer is
+    /// released once per completion.
+    #[test]
+    fn handle_recv_multi_reads_each_completion_at_its_offset() {
+        let mut el = make_test_loop();
+        el.driver.provided_bufs.set_incremental_for_test();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let bid: u16 = 2;
+        let (buf_ptr, _) = el.driver.provided_bufs.get_buffer(bid);
+        unsafe { std::ptr::copy_nonoverlapping(b"abcdefg".as_ptr(), buf_ptr as *mut u8, 7) };
+        // F_BUFFER | F_MORE | F_BUF_MORE, bid.
+        let flags = 1u32 | 2 | 0x10 | ((bid as u32) << 16);
+        let ud = UserData::encode(OpTag::RecvMulti, conn_index, generation);
+        el.test_dispatch_cqe(ud.raw(), 3, flags);
+        el.test_dispatch_cqe(ud.raw(), 4, flags);
+
+        let mut got = el.driver.accumulators.data(conn_index).to_vec();
+        if let Some(p) = el.driver.pending_recv_bufs[conn_index as usize] {
+            got.extend_from_slice(unsafe { std::slice::from_raw_parts(p.ptr, p.len as usize) });
+        }
+        assert_eq!(got, b"abcdefg");
+        assert_eq!(
+            el.driver.provided_bufs.free(),
+            el.driver.provided_bufs.ring_entries(),
+            "a partly used buffer stays in the ring"
+        );
+    }
+
+    /// `settle_forward_end` reads a held buffer at its offset.
+    #[test]
+    fn settle_forward_end_reads_a_held_buffer_at_its_offset() {
+        let mut el = make_test_loop();
+        el.driver.provided_bufs.set_incremental_for_test();
+        let conn_index = accept_connection(&mut el);
+        let bid: u16 = 1;
+        let (buf_ptr, _) = el.driver.provided_bufs.get_buffer(bid);
+        unsafe { std::ptr::copy_nonoverlapping(b"skip-kept".as_ptr(), buf_ptr as *mut u8, 9) };
+        el.driver.provided_bufs.complete(bid, 5, true);
+        let off = el.driver.provided_bufs.complete(bid, 4, true);
+        assert_eq!(off, 5);
+        el.driver.segment_hold[conn_index as usize]
+            .push_back(crate::backend::HeldRecvBuf::Pinned { bid, off, len: 4 });
+        assert!(el.driver.settle_forward_end(conn_index));
+        assert_eq!(el.driver.accumulators.data(conn_index), b"kept");
+    }
+
+    /// The timestamps handler's stale-CQE branch counts and releases the
+    /// buffer exactly once, as `handle_recv_multi`'s does.
+    #[cfg(feature = "timestamps")]
+    #[test]
+    fn handle_recv_msg_multi_ts_stale_generation_releases_buffer_once() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let stale_generation = el.driver.connections.generation(conn_index);
+        recycle_connection(&mut el, conn_index);
+        el.driver.pending_replenish.clear();
+        let free_before = el.driver.provided_bufs.free();
+
+        let bid: u16 = 3;
+        let flags = 1u32 | 2u32 | ((bid as u32) << 16);
+        let stale_ud = UserData::encode(OpTag::RecvMsgMultiTs, conn_index, stale_generation);
+        el.test_dispatch_cqe(stale_ud.raw(), 40, flags);
+
+        assert_eq!(el.driver.pending_replenish, [bid]);
+        assert_eq!(el.driver.provided_bufs.free(), free_before - 1);
+        let r: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
+        el.driver.provided_bufs.release_batch(&r);
+        assert_eq!(el.driver.provided_bufs.free(), free_before);
+    }
+
     #[test]
     fn handle_recv_multi_stale_generation_replenishes_buffer_once() {
         let mut el = make_test_loop();
@@ -9022,7 +9095,7 @@ mod tests {
             "recv handout must decrement free by one"
         );
 
-        // The consume path returns the bid via replenish_batch; free is restored.
+        // The consume path releases the bid via release_batch; free is restored.
         el.driver.provided_bufs.release_batch(&[bid]);
         assert_eq!(
             el.driver.provided_bufs.free(),

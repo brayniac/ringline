@@ -157,8 +157,9 @@ impl ProvidedBufRing {
     /// completion's `IORING_CQE_F_BUF_MORE`; on a plain ring every completion
     /// exhausts its buffer.
     ///
-    /// Call once per completion that carries `IORING_CQE_F_BUFFER`, before the
-    /// connection is checked, and release the hold through `release_batch`.
+    /// Call once per completion that carries `IORING_CQE_F_BUFFER`, the
+    /// stale-CQE early returns included, before its data is read, and release
+    /// the hold through `release_batch`.
     ///
     /// # Panics
     /// If the buffer is already exhausted, or if `written` disagrees with
@@ -192,7 +193,9 @@ impl ProvidedBufRing {
     ///
     /// # Panics
     /// If a bid has no hold to drop: it was released more times than it
-    /// completed.
+    /// completed. A duplicate release that arrives after the buffer was
+    /// posted and completed again takes that completion's hold and is not
+    /// detected.
     pub(crate) fn release_batch(&mut self, bids: &[u16]) {
         let mut posted = false;
         for &bid in bids {
@@ -209,6 +212,13 @@ impl ProvidedBufRing {
         if posted {
             self.commit_tail();
         }
+    }
+
+    /// Test-only: treat the ring as incremental, so driver tests can deliver
+    /// data at nonzero offsets.
+    #[cfg(test)]
+    pub(crate) fn set_incremental_for_test(&mut self) {
+        self.incremental = true;
     }
 
     /// Buffers currently available in the ring for the kernel to select.

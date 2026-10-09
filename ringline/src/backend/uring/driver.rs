@@ -94,7 +94,7 @@ pub(crate) struct UdpSocketState {
 /// A kernel recv buffer held in-place for zero-copy access.
 ///
 /// The pointer is into `ProvidedBufRing::buf_backing`, which is allocated once
-/// and never resized, so it remains valid until the bid is replenished.
+/// and never resized, so it remains valid until its hold is released.
 #[derive(Clone, Copy)]
 pub(crate) struct PendingRecvBuf {
     pub(crate) bid: u16,
@@ -110,9 +110,8 @@ pub(crate) struct PendingRecvBuf {
 ///   segment reader consumes it or the connection closes (`close_connection`
 ///   drains the hold). The data's address is derivable via
 ///   `provided_bufs.data_ptr(bid, off)`, so only the id, offset and length
-///   are stored. This
-///   is the zero-copy delivery, used while the ring is above the low-water
-///   reserve.
+///   are stored. This is the zero-copy delivery, used while the ring is
+///   above the low-water reserve.
 /// - [`Owned`](Self::Owned): an owned copy of the received bytes. When the ring
 ///   is at/below `recv_segment_reserve` the bytes are copied at delivery and the
 ///   bid is returned to the ring immediately (Mode C), so this entry pins
@@ -225,7 +224,7 @@ pub(crate) struct ForwardWriteState {
 
 impl ForwardWriteState {
     /// Address of the first byte of one backing's data.
-    fn base_ptr(backing: &HeldRecvBuf, provided_bufs: &ProvidedBufRing) -> *const u8 {
+    fn data_ptr(backing: &HeldRecvBuf, provided_bufs: &ProvidedBufRing) -> *const u8 {
         match backing {
             HeldRecvBuf::Pinned { bid, off, .. } => provided_bufs.data_ptr(*bid, *off),
             HeldRecvBuf::Owned(bytes) => bytes.as_ptr(),
@@ -248,7 +247,7 @@ impl ForwardWriteState {
                 skip -= len;
                 continue;
             }
-            let base = Self::base_ptr(backing, provided_bufs);
+            let base = Self::data_ptr(backing, provided_bufs);
             // SAFETY: `skip < len` and `len` bytes from `base` are initialised
             // and owned by this state until its CQE arrives.
             let ptr = unsafe { base.add(skip as usize) };
@@ -293,6 +292,9 @@ pub(crate) struct Driver {
     pub(crate) send_copy_pool: SendCopyPool,
     pub(crate) send_slab: InFlightSendSlab,
     pub(crate) accumulators: AccumulatorTable,
+    /// TCP bids whose completion hold is released at the next
+    /// `flush_replenish_and_rearm` (`ProvidedBufRing::release_batch`): one
+    /// entry per hold.
     pub(crate) pending_replenish: Vec<u16>,
     /// Per-connection pending recv buffer for zero-copy recv. When `Some`, the
     /// buffer ID has NOT been pushed to `pending_replenish` and must be
@@ -2801,10 +2803,16 @@ impl Driver {
         let ci = conn_index as usize;
         self.send_recv_buf_original_lens[ci] = built.total_len;
         self.send_recv_buf_remaining[ci] = built.total_len;
-        if let crate::backend::uring::sqe::Op::Send { buf, .. } = built.entry.op {
-            let base = self.provided_bufs.get_buffer(ud.payload() as u16).0;
-            self.send_recv_buf_offs[ci] = (buf as usize - base as usize) as u32;
-        }
+        let crate::backend::uring::sqe::Op::Send { buf, .. } = built.entry.op else {
+            unreachable!("a SendRecvBuf is a plain send");
+        };
+        let (base, size) = self.provided_bufs.get_buffer(ud.payload() as u16);
+        let off = (buf as usize).wrapping_sub(base as usize);
+        debug_assert!(
+            buf >= base && off < size as usize,
+            "send outside its buffer"
+        );
+        self.send_recv_buf_offs[ci] = off as u32;
     }
 
     /// Park `built` at the head of the connection's send queue, for
