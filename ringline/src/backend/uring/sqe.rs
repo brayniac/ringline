@@ -115,7 +115,7 @@ pub(crate) enum Op {
     },
     /// A timeout, relative or (`abs`) absolute `CLOCK_MONOTONIC`.
     Timeout {
-        ts: *const types::Timespec,
+        ts: *const super::abi::Timespec,
         abs: bool,
     },
     /// Install a real fd for registered file `index` (`FIXED_FD_INSTALL`).
@@ -316,6 +316,9 @@ impl Sqe {
                 on!(fd, |t| opcode::Connect::new(t, addr, addrlen).build())
             }
             Op::Timeout { ts, abs } => {
+                // `abi::Timespec` is `struct __kernel_timespec`, as is the
+                // crate's type; a test pins the layouts together.
+                let ts = ts.cast::<types::Timespec>();
                 if abs {
                     opcode::Timeout::new(ts).flags(TimeoutFlags::ABS).build()
                 } else {
@@ -383,7 +386,7 @@ mod tests {
         let msg = 0x2000 as *const libc::msghdr;
         let path = 0x3000 as *const libc::c_char;
         let path2 = 0x3100 as *const libc::c_char;
-        let ts = 0x4000 as *const types::Timespec;
+        let ts = 0x4000 as *const crate::backend::uring::abi::Timespec;
         let iov = 0x5000 as *const libc::iovec;
         let addr = 0x6000 as *const libc::sockaddr;
         let stx = 0x7000 as *mut libc::statx;
@@ -569,11 +572,13 @@ mod tests {
             ),
             (
                 Sqe::new(Op::Timeout { ts, abs: false }, ud),
-                e(opcode::Timeout::new(ts).build()),
+                e(opcode::Timeout::new(ts.cast()).build()),
             ),
             (
                 Sqe::new(Op::Timeout { ts, abs: true }, ud),
-                e(opcode::Timeout::new(ts).flags(TimeoutFlags::ABS).build()),
+                e(opcode::Timeout::new(ts.cast())
+                    .flags(TimeoutFlags::ABS)
+                    .build()),
             ),
             (
                 Sqe::new(Op::FixedFdInstall { index: 9 }, ud),

@@ -1029,7 +1029,7 @@ impl Ring {
     /// Submit a timeout SQE. The timespec must remain valid until the CQE arrives.
     pub fn submit_timeout(
         &mut self,
-        timespec: *const io_uring::types::Timespec,
+        timespec: *const crate::backend::uring::abi::Timespec,
         user_data: UserData,
     ) -> io::Result<()> {
         let entry = Sqe::new(
@@ -1050,7 +1050,7 @@ impl Ring {
     /// until the CQE arrives.
     pub fn submit_timeout_abs(
         &mut self,
-        timespec: *const io_uring::types::Timespec,
+        timespec: *const crate::backend::uring::abi::Timespec,
         user_data: UserData,
     ) -> io::Result<()> {
         let entry = Sqe::new(
@@ -1159,8 +1159,8 @@ impl Ring {
     /// `msghdr` is used as a *template* by the kernel to decide how to lay out
     /// each datagram inside the ring buffer it picks (name / control / payload
     /// regions). It must remain valid for as long as the multishot is armed.
-    /// Use [`io_uring::types::RecvMsgOut::parse`] on the returned buffer to
-    /// extract the datagram.
+    /// Use [`crate::backend::uring::abi::RecvMsgOut::parse`] on the provided
+    /// buffer each completion selects to extract the datagram.
     pub fn submit_recvmsg_multishot(
         &mut self,
         fd_index: u32,
@@ -1359,7 +1359,7 @@ impl Ring {
     /// or is cancelled (-ECANCELED).
     pub fn submit_tick_timeout(
         &mut self,
-        ts: *const io_uring::types::Timespec,
+        ts: *const crate::backend::uring::abi::Timespec,
         user_data: u64,
     ) -> io::Result<()> {
         let entry = Sqe::new(Op::Timeout { ts, abs: false }, user_data);
@@ -1367,6 +1367,22 @@ impl Ring {
             self.push_sqe(&entry)?;
         }
         Ok(())
+    }
+
+    /// Append every completion the ring holds to `out` as
+    /// `(user_data, result, flags)`, consuming them.
+    pub(crate) fn reap(&mut self, out: &mut Vec<(u64, i32, u32)>) {
+        out.extend(
+            self.ring
+                .completion()
+                .map(|cqe| (cqe.user_data(), cqe.result(), cqe.flags())),
+        );
+    }
+
+    /// The number of entries queued in the SQ and not yet submitted.
+    #[cfg(test)]
+    pub(crate) fn sq_len(&mut self) -> usize {
+        self.ring.submission().len()
     }
 
     /// Submit pending SQEs without waiting. Used for mid-iteration flush.

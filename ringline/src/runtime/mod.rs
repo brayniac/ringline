@@ -197,7 +197,7 @@ thread_local! {
 pub(crate) struct TimerSlotPool {
     /// Timespec values — must remain at stable addresses for io_uring.
     #[cfg(has_io_uring)]
-    pub(crate) timespecs: Vec<io_uring::types::Timespec>,
+    pub(crate) timespecs: Vec<crate::backend::uring::abi::Timespec>,
     /// Deadline instants for the mio backend timer expiry.
     #[cfg(not(has_io_uring))]
     pub(crate) deadlines: Vec<Option<std::time::Instant>>,
@@ -227,7 +227,7 @@ impl TimerSlotPool {
         }
         TimerSlotPool {
             #[cfg(has_io_uring)]
-            timespecs: vec![io_uring::types::Timespec::new(); cap],
+            timespecs: vec![crate::backend::uring::abi::Timespec::new(); cap],
             #[cfg(not(has_io_uring))]
             deadlines: vec![None; cap],
             #[cfg(not(has_io_uring))]
@@ -307,9 +307,9 @@ impl TimerSlotPool {
         &mut self,
         slot: u32,
         duration: std::time::Duration,
-    ) -> *const io_uring::types::Timespec {
+    ) -> *const crate::backend::uring::abi::Timespec {
         let idx = slot as usize;
-        self.timespecs[idx] = io_uring::types::Timespec::new()
+        self.timespecs[idx] = crate::backend::uring::abi::Timespec::new()
             .sec(duration.as_secs())
             .nsec(duration.subsec_nanos());
         &self.timespecs[idx] as *const _
@@ -323,9 +323,11 @@ impl TimerSlotPool {
         slot: u32,
         secs: u64,
         nsecs: u32,
-    ) -> *const io_uring::types::Timespec {
+    ) -> *const crate::backend::uring::abi::Timespec {
         let idx = slot as usize;
-        self.timespecs[idx] = io_uring::types::Timespec::new().sec(secs).nsec(nsecs);
+        self.timespecs[idx] = crate::backend::uring::abi::Timespec::new()
+            .sec(secs)
+            .nsec(nsecs);
         &self.timespecs[idx] as *const _
     }
 
