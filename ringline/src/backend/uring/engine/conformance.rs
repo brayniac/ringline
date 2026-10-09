@@ -8,9 +8,9 @@
 //! `incremental_buffers_matches_registration` in `ring.rs` checks the
 //! refusal instead.
 //!
-//! Each test creates its provided ring before the engine, so the engine,
-//! and with it every armed receive, is dropped before the ring's memory is
-//! unmapped, including when an assertion fails.
+//! Each test creates its provided ring before the engine, so the engine's
+//! ring fd is closed before the provided ring's memory is freed, including
+//! when an assertion fails.
 
 use std::io::Write;
 use std::net::{Shutdown, TcpListener, TcpStream};
@@ -293,8 +293,8 @@ fn check_offset_order(run: OrderRun) {
     // A burst writes 1000–1199 bytes per connection, less in all than the
     // ring holds. With 256-byte buffers each receive posts several
     // completions in one task_work run, so the 64-entry CQ overflows even
-    // where the kernel runs at most 20 deferred task_work items per enter
-    // (6.13 and later).
+    // where the kernel runs at most 20 deferred task_work items per pass,
+    // and at most two passes per enter (6.13 and later).
     let (rounds, base, span) = if run.burst {
         (1, 1000, 200)
     } else {

@@ -204,5 +204,7 @@ command = '''
 ls run-*.log
 [ "$(ls run-*.log | wc -l)" -eq 4 ] || { echo "missing logs"; exit 1; }
 if grep -H 'RESULT .* exit=[^0]' run-*.log; then exit 1; fi
+# Three test binaries per kernel; fewer means a payload was cut short.
+[ "$(cat run-*.log | grep -c '^RESULT')" -eq 12 ] || { echo "missing results"; exit 1; }
 echo ok
 '''
