@@ -674,10 +674,10 @@ pub(crate) struct Driver {
     /// one chunk per starved connection, so this bounds per-pass fallback
     /// throughput.
     pub(crate) fallback_chunk: u32,
-    /// With `recv_incremental` on, the most TCP receive buffers that lends
-    /// may hold: half the ring. A lend is taken only while `held()` is at or
-    /// below it; above it, each lend path copies instead. `None` leaves
-    /// lends uncapped, as without `recv_incremental`.
+    /// With `recv_incremental` on, the most TCP receive buffers that may
+    /// have a hold when a lend is taken: half the ring. A lend is taken only
+    /// while `held()` is at or below it; above it, each lend path copies
+    /// instead. `None` leaves lends uncapped, as without `recv_incremental`.
     pub(crate) lend_cap: Option<u32>,
     /// Lifetime count of fallback recv submissions on this worker
     /// (reported in the shutdown diag line).
