@@ -633,8 +633,24 @@ fn probe_multishot_total_limit() {
                 e.register_buf_ring(&ring, kind).expect("register");
                 let (mut client, server) = pair();
                 let payload: Vec<u8> = (0..200u32).map(|i| i as u8).collect();
-                client.write_all(&payload).expect("write");
+                // Split writes: 70 bytes before the arm, 130 after it, so a
+                // bundle receive retries mid-arm. `split` runs the second
+                // write on another thread once the arm is in.
+                let split = std::env::var_os("PROBE_SPLIT").is_some();
+                if split {
+                    client.write_all(&payload[..70]).expect("write");
+                } else {
+                    client.write_all(&payload).expect("write");
+                }
                 std::thread::sleep(Duration::from_millis(20));
+                let mut rest = client.try_clone().expect("clone");
+                let tail = payload[70..].to_vec();
+                let late = split.then(|| {
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_millis(50));
+                        rest.write_all(&tail).expect("write");
+                    })
+                });
                 let sqe = Sqe::new(
                     Op::RecvMultiLimit {
                         fd: Fd::Raw(server.as_raw_fd()),
@@ -650,12 +666,22 @@ fn probe_multishot_total_limit() {
                 let cqes = reap(&mut e, 40);
                 let mut sum = 0i64;
                 let mut seen = Vec::new();
+                if let Some(t) = late {
+                    let _ = t.join();
+                }
                 for c in &cqes {
-                    let (res, _bid, _bm, more, _ne) = data(*c);
+                    let (res, bid, buf_more, more, _ne) = data(*c);
                     if res > 0 {
                         sum += res as i64;
                     }
-                    seen.push(format!("{res}{}", if more { "+" } else { "." }));
+                    // res, then: bid, `m` if IORING_CQE_F_BUF_MORE, and
+                    // `+` if IORING_CQE_F_MORE else `.`
+                    seen.push(format!(
+                        "{res}@{}{}{}",
+                        bid.map_or(-1, i32::from),
+                        if buf_more { "m" } else { "" },
+                        if more { "+" } else { "." }
+                    ));
                 }
                 eprintln!(
                     "PROBE {kind:?} bundle={bundle} per_trigger={per_trigger} total={total}: \
