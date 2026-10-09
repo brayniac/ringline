@@ -396,6 +396,7 @@ pub mod udp {
 pub fn init_metadata() {
     RECV_RING.insert_metadata(recv_ring::INCREMENTAL, "op".into(), "incremental".into());
     RECV_RING.insert_metadata(recv_ring::PLAIN, "op".into(), "plain".into());
+    RECV_RING.insert_metadata(recv_ring::LEND_REFUSED, "op".into(), "lend_refused".into());
     for (step, name) in [
         (recv_preflight::SOCKETPAIR, "socketpair"),
         (recv_preflight::IO_ERROR, "io_error"),
@@ -646,7 +647,11 @@ mod tests {
         ] {
             assert!(UDP.increment(idx), "UDP[{idx}] out of bounds");
         }
-        for idx in [recv_ring::INCREMENTAL, recv_ring::PLAIN] {
+        for idx in [
+            recv_ring::INCREMENTAL,
+            recv_ring::PLAIN,
+            recv_ring::LEND_REFUSED,
+        ] {
             assert!(RECV_RING.increment(idx), "RECV_RING[{idx}] out of bounds");
         }
         for idx in 0..recv_preflight::COUNT {
