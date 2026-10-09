@@ -70,7 +70,8 @@ and nothing holds any of its bytes.
 ## Costs
 
 - The receive copy into the accumulator stays, bounded to what completes a
-  pending message when the parser announced its length.
+  pending message when the parser announced its length. `with_bytes` gets
+  the bound through views over held buffers ("`with_bytes`").
 - The `ENOBUFS` park, the fallback recv and the starvation arbitration stay,
   and the buffer state below is added, once per group.
 - Above a group's lend cap, arrivals are copied instead of lent.
@@ -88,9 +89,9 @@ and nothing holds any of its bytes.
   | streaming (1000 connections) | 264 | 328–329 | 361 | 709 |
   | heavy-tailed request sizes | 774–778 | 823–842 | 970–990 | 1061–1275 |
 
-  In the heavy-tailed cells the accumulators dominate: a bounded
-  accumulator holds up to one message, 1 MiB here, per connection, at 1000
-  connections.
+  In the heavy-tailed cells the accumulators dominate: the benchmark's
+  bounded accumulator holds up to one message, 1 MiB here, per connection,
+  at 1000 connections.
 - A promoted connection's small messages each take a whole large-group
   buffer on a plain ring. On 6.1 the 256-buffer large group returned
   `ENOBUFS` 7.8k times per run with promoted holders and streamers
@@ -254,8 +255,8 @@ buffers; each now also names the group:
   copies from the data's address; today it reads from the base.
 - `handle_send_recv_buf` resubmits a partial send from
   `base + (original_len - remaining)`. Its user_data carries the bid, the
-  remainder bit and the group bit. A per-connection `send_recv_buf_ptr`, next to
-  `send_recv_buf_original_lens`, holds the original data address.
+  remainder bit and the group bit. A per-connection `send_recv_buf_ptr`,
+  next to `send_recv_buf_original_lens`, holds the original data address.
 - `provided_bufs` becomes one `ProvidedBufRing` per group, and
   `pending_replenish` becomes per group (or `(group, bid)`);
   `flush_replenish_and_rearm` replenishes each.
@@ -283,18 +284,162 @@ it needs no special case.
 
 ## Bounded accumulator
 
-When a connection's parser last returned `ParseResult::NeedAtLeast(n)`, a
-completion copies into the accumulator only the bytes that complete that
-message, parses it, and delivers the rest of the completion in place as if
-nothing were buffered. With `NeedMore` (no announced length) the completion
-is copied whole, as today. The accumulator then holds at most one message
-plus the bytes of one completion, whatever the buffer size.
+When a connection's parser last returned `ParseResult::NeedAtLeast(n)`, the
+driver records a target accumulator length: the length of the bytes that
+parse was shown plus `n`. A completion copies
+`min(target.saturating_sub(len), completion length)` bytes into the
+accumulator and holds the rest of the completion in place, at its offset.
+The held rest is a `pending_recv_bufs` lend; above its group's lend cap
+(from step 4) it is copied instead. One buffer is held per connection: a
+completion that arrives while a rest is held moves the held rest into the
+accumulator and is then copied whole after it.
+
+`NeedAtLeast(n)` is a lower bound, so a parse can need bytes that are
+still held. When a parse returns anything other than `Consumed(k)` with
+`k > 0` while a buffer is held, the driver moves held bytes into the
+accumulator and runs the closure again before the future parks or resolves
+at EOF. With `NeedAtLeast(n)` it moves up to the new target, keeping the
+rest held at its new offset, or all of them if that would move none
+(`NeedAtLeast(0)`); otherwise it moves all of them. On the second
+consecutive re-run it moves all of them, so a parser returning small lower
+bounds costs at most two extra parses. The future parks, or resolves at
+EOF, only when nothing is held. A parse of a held buffer through the fast
+path (accumulator empty) that does not complete flushes the held buffer
+into the accumulator and parses again, as today.
+
+The target is cleared by any parse result other than `NeedAtLeast`, and
+with the accumulator: on reset, on close, and whenever bytes leave it
+other than through a parse (`ConnStream` reads, the segmented entry's
+`take_frozen`, `settle_forward_end` refilling it).
+
+With no target, a completion is handled as today: held in place if the
+accumulator is empty and nothing is held, otherwise copied. While a target
+is set, the accumulator holds at most the target plus every byte received,
+from the rest of the completion that reaches it onward, before the next
+parse; without one it holds every byte the task has not consumed, as
+today.
+
+This needs three driver changes, since today a buffer is held in place only
+while the accumulator is empty and the held buffer is the older data:
+
+- The driver records the target from `NeedAtLeast(n)` and clears it as
+  above, and moves held bytes into the accumulator before the future parks
+  or resolves at EOF. Today both futures only call
+  `accumulators.reserve(n)`, whose `reserve_target` is a capacity hint
+  cleared when the accumulator drains.
+- `handle_recv_multi` holds the rest of a completion while a target is
+  set and the accumulator is non-empty (today, when the accumulator has
+  bytes or a buffer is already held, it copies the held buffer and then
+  the completion into the accumulator, `event_loop.rs`). Every path that
+  appends to the accumulator or installs a recv sink flushes a held buffer
+  first, so a held buffer is always newer than the accumulator's bytes;
+  today the recv-sink overflow append and `set_recv_sink` do not.
+- `WithDataFuture` parses the accumulator before the held buffer, instead
+  of prepending the held buffer to the accumulator (`runtime/io.rs`,
+  `accumulators.prepend`). The held rest is parsed by the next `with_data`
+  call through the fast path, once the accumulator is empty. After the
+  fast path returns `Consumed(k)`, the rest is copied into the
+  accumulator, as today, until the views step (landing, after step 4)
+  keeps it held.
+
+`park_blocker` reports `DataPending` while `pending_recv_bufs[conn]` is
+`Some` (today it checks the accumulator, `segment_hold`, `recv_hold` and
+`segment_pinned`, `driver.rs`), and `take_pending_for_park` drains that
+slot as well, after the accumulator, since the held rest is the newer
+data. From step 1 a rest can stay held after a parse of the accumulator
+returns `Consumed(k)` (and, from the views step, after the fast path's);
+a connection offered for park then would otherwise be parked and its rest
+replenished uncopied (`event_loop.rs` park teardown).
+
+A hold at an offset needs the data-address changes in "Changes in the
+driver" (`PendingRecvBuf`'s pointer and `handle_send_recv_buf`'s short-send
+resubmit, which today computes from the buffer's base), so they land with
+it.
+
+### `with_bytes`
+
+Today `with_bytes` copies a held buffer into the accumulator when it polls,
+so the bound would save no copy and no accumulator memory for
+`with_bytes` callers. ringline-redis, the only `NeedAtLeast` producer in
+the workspace, parses with `with_bytes`.
+
+Decision (owner, 2026-10-08): `with_bytes` hands out `Bytes` views over
+held provided buffers. When the accumulator is empty and a buffer is held,
+`WithBytesFuture` hands the parser a view over the held rest. After
+`Consumed(k)` the rest stays held at offset + k, as a hold, and is not
+copied, for `with_data` as for `with_bytes`; `Consumed(k)` with k equal to
+the length releases the hold. Each parse over a held buffer takes one
+hold, owned by the `Bytes` passed to the parser (`Bytes::from_owner`); the
+hold is released when the last `Bytes` sliced or cloned from it drops.
+Values the parser slices from it are views. The held rest's
+`pending_recv_bufs` lend is a separate hold. Views count under the
+per-group lend cap. A parse over the accumulator yields slices of the
+accumulator, as today. Whether a value is a view therefore depends on
+whether the accumulator was empty when its parse began. Bytes moved into
+the accumulator by the re-run rule above are copied.
+
+Buffer memory moves out of `ProvidedBufRing` into a reference-counted
+allocation that every view also holds. Only the entry array is mmap'd; the
+buffers are a `Vec` today (`provided.rs`). The worker's drop releases its
+reference after the ring is dropped (`ring` is `Driver`'s first field, and
+fields drop in declaration order), and the last view to drop frees the
+memory. A view dropped on its worker queues its release as an `Orphan`
+(`defer_release`), which `release_orphans` applies at the start of each
+poll pass and before the worker waits for I/O, ahead of
+`flush_replenish_and_rearm`. A drop inside a `with_state` closure, such as
+the parser's, or in `on_tick`, therefore never takes the driver and is
+released before the worker blocks. The orphan queue is per thread, and a
+thread can run more than one worker in turn, so a release names its
+allocation by a process-unique id (or a `Weak`), not by address, since a
+later worker's allocation can reuse a freed one's address;
+`release_orphans` ignores a release whose allocation is not among this
+worker's group allocations. A release queued after the worker's last
+iteration is never applied; the allocation is freed when the last view
+drops. One dropped on another thread releases through the worker's
+cross-thread inbox, which carries task indices today and gains a message
+kind for it. A release sent after the worker exits finds no inbox and is
+dropped.
+
+A view the caller keeps pins its whole buffer: a 1 MiB buffer on an INC
+ring, shared with other connections' data, for a value of any size. With
+64 buffers per group, about 32 kept views on distinct buffers reach the
+lend cap; from then on arrivals are copied, and the group has fewer
+buffers to refill from until the views are dropped. A client that hands
+values to an application cache can do this.
+
+Decision (owner, 2026-10-08): a receive threshold, `recv_zc_threshold`,
+mirrors `send_zc_threshold`. The mechanism is the author's design: the
+runtime hands the parser one `Bytes` and never sees individual values, so
+the threshold is applied where values are known:
+
+- `ConfigBuilder::recv_zc_threshold(bytes)` sets the runtime default.
+- A ringline helper takes a `Bytes` returned from a `with_bytes` parse and
+  returns it unchanged if it is not a view or is at least the threshold,
+  and an owned copy otherwise. It tells a view from an accumulator slice by
+  checking whether the data pointer lies in one of the calling worker's
+  group allocations, so values parsed from the accumulator stay zero-copy,
+  as they are today. Called off a worker, it treats every `Bytes` as a
+  view. A view parsed on one worker and passed to the helper on another is
+  not recognised and is returned uncopied.
+- The client crates (ringline-redis, ringline-memcache) apply the helper
+  to every `Bytes` in a response, with a client-level `recv_zc_threshold`
+  override. ringline-redis walks the `Value` tree in `read_value_from`,
+  which gains the threshold as a parameter so `Pipeline` applies it too. A
+  client without an override uses the runtime's configured
+  `recv_zc_threshold`; the send side's default (`DEFAULT_ZC_THRESHOLD`) is
+  a crate constant and does not read the runtime's value.
+
+The default is measured as `send_zc_threshold` was; until then it is 4096,
+the send side's default. A metric counts buffers held by views.
 
 In the benchmark's streaming cells it cut process RSS from 2.3 GiB to 262
 MiB (INC 64 × 1 MiB, hv01); with a 1 GiB plain ring RSS only halved, from
 2.0 to 1.07 GiB. Bytes copied fell sevenfold, at 10–58% more throughput. The
 benchmark parses in the completion handler; ringline parses in the
-connection's task, so the gain for ringline is inferred, not measured.
+connection's task, so the gain for ringline is inferred, not measured. The
+benchmark knows each message's exact length from its header. Ringline's
+bound engages only after a parse has returned `NeedAtLeast`, and
+`NeedAtLeast` is a lower bound.
 
 ## The large group
 
@@ -306,7 +451,14 @@ A connection's next arm targets the large group when either holds:
   64 KiB) and each carried `IORING_CQE_F_SOCK_NONEMPTY`;
 - a lend from this connection is still held when its task next parks.
   Every in-place delivery is a lend held past the completion handler, so
-  the test is at the park, not after the handler.
+  the test is at the park, not after the handler. Two lends count under
+  the lend cap but not here or for the demotion exemption (author's
+  proposal): a `with_bytes` view, which the caller owns, not the
+  connection's task, so a client that keeps values would otherwise stay
+  promoted; and a rest the bounded accumulator holds (the part of a
+  completion beyond the target, or the rest after a fast-path
+  `Consumed(k)`), which would otherwise promote every request/response
+  connection that awaits anything between two pipelined requests.
 
 The rule uses a byte threshold rather than "filled its buffer": under INC a
 completion clears `F_BUF_MORE` whenever it reaches the end of a shared
@@ -353,9 +505,10 @@ first such completion once `recv_large_demote_quiet` has passed since the
 last one that did. A connection that has never had a completion counting
 toward promotion (one promoted on a held lend) is demoted without waiting
 for the quiet period. An idle promoted connection receives no completions
-and is never demoted. A connection holding a lend is not demoted while it
-holds. The quiet period applies to both ring kinds, default 1 s; with an
-INC ring, landing step 6 decides it together with the large group.
+and is never demoted. A connection holding a lend that counts toward
+promotion is not demoted while it holds. The quiet period applies to both
+ring kinds, default 1 s; with an INC ring, landing step 6 decides it
+together with the large group.
 
 Moves should be rare. Per-rep medians without the quiet period: decision to
 re-arm 1.3–12 ms on 6.12 and 17–586 ms on 6.1. Streamer first delivery 8–21
@@ -390,12 +543,14 @@ quiet period (0, 0, 1) and none with it; its p50 per rep was 5.2, 12.6 and
 
 ## Lends
 
-A lend (`pending_recv_bufs`, `forward_recv_buf`, recv-forward, direct echo,
-segments, `forward_to` Mode A) holds a range of a buffer until its task polls
-or its send completes. Under INC the buffer is shared, so a 200-byte lend
-keeps a whole 1 MiB buffer out of the ring. A connection whose lend is held
-when its task parks is promoted, so its later lends pin large-group
-buffers.
+A lend (`pending_recv_bufs`, including a rest the bounded accumulator
+holds, `forward_recv_buf`, recv-forward, direct echo, segments,
+`forward_to` Mode A, and `with_bytes` views) holds a range of a buffer
+until its task polls, its send completes, or, for a view, the caller drops
+it. Under INC the buffer is shared, so a 200-byte lend keeps a whole 1 MiB
+buffer out of the ring. A connection whose lend, other than a view or a
+rest the bounded accumulator holds, is held when its task parks is
+promoted, so its later lends pin large-group buffers.
 
 - Per group, a lend is taken only while fewer than half that group's
   buffers are held. Plaintext lends in `pending_recv_bufs` are otherwise
@@ -489,7 +644,6 @@ receive queue, and TCP closes the window until the worker re-arms.
 ## Unchanged
 
 - The UDP ring (`udp_recv_buffer`, its own bgid) stays plain.
-- `with_data` and `with_bytes` read the accumulator.
 - TLS (both engines) copies out of the ring and takes no hold.
 - The `timestamps` feature shares the small TCP group. If multishot
   `RECVMSG` works on an INC ring, it stays there, with `RecvMsgOut::parse`
@@ -501,10 +655,12 @@ receive queue, and TCP closes the window until the worker re-arms.
 
 Kept: `buffer_ring_empty`, `recv_parked`, `recv_fallback`,
 `forward_throttled`. New, per group where it applies: buffers out of the
-ring, buffers held by lends, lends refused by the lend cap, `ENOBUFS`,
+ring, buffers held by lends, views included, each counted once (the count
+the lend cap compares), lends refused by the lend cap, `ENOBUFS`,
 promotions, demotions, connections in the large group, the time from a
-move's decision to the connection's first delivery on its new group, and
-the ring kind in use.
+move's decision to the connection's first delivery on its new group,
+buffers held by `with_bytes` views, values copied by the
+`recv_zc_threshold` helper, and the ring kind in use.
 
 ## Not measured
 
@@ -537,17 +693,31 @@ the ring kind in use.
    forced-async receive), EOF on a partly used buffer, and multishot
    `RECVMSG` on an INC ring; run on CI and as SystemsLab experiments on
    6.1, 6.8, 6.12 and 7.1. Settle the 6.12.y minimum or keep a probe.
-1. Bounded accumulator: copy only what completes a `NeedAtLeast` message.
-   Independent of the ring changes.
+1. Bounded accumulator: the target length from `NeedAtLeast` and the
+   sites that clear it (reset, close, `ConnStream` reads, the segmented
+   entry's `take_frozen`, `settle_forward_end`), the hold of a
+   completion's rest while a target is set and the accumulator is
+   non-empty, the flush of a held buffer before any append,
+   `WithDataFuture` parsing the accumulator before the held buffer, the
+   move of held bytes into the accumulator, with a re-parse, before the
+   future parks or resolves at EOF, and `park_blocker` and
+   `take_pending_for_park` covering `pending_recv_bufs`. It needs the
+   data-address changes to `PendingRecvBuf` and `handle_send_recv_buf`
+   from step 3; land those here. `with_bytes` views over held buffers (see
+   "`with_bytes`"), with `recv_zc_threshold`, its helper, the client
+   crates' use of it and the view metric, are a step of their own after
+   step 4, since a view is a hold (Buffer state rule 4) counted under the
+   per-group lend cap. That step also keeps the rest held at offset + k
+   after `Consumed(k)` (for `with_data` too), and gives `WithBytesFuture`
+   the fast path and the accumulator-first parse order.
 2. Buffer state (`written`, `exhausted`, `holds`) with the ring registered
    plain. Every completion exhausts its buffer at offset 0, so behaviour is
    unchanged; the per-path single-release checks become holds. The existing
    lifecycle tests (double replenish, leaks, close drain, the Mode A hold
    cap) pass unchanged. Steps 2 and 3 can be one change if that is simpler.
-3. Offsets: the `off` fields, data at `base + written`,
-   `send_recv_buf_ptr`, `copy_out_bid` and `settle_forward_end`. Still a
-   plain ring, where every offset is 0, so these paths are exercised only
-   from step 4.
+3. Offsets: the `off` fields, data at `base + written`, `copy_out_bid`
+   and `settle_forward_end`. Still a plain ring, where these offsets are 0,
+   so these paths are exercised only from step 4.
 4. INC and the plain geometry, behind `recv_incremental` (default `false`):
    ring-kind selection, `MADV_NOHUGEPAGE` and the 4096 × 64 KiB plain
    geometry, the per-group lend cap and its copy paths,
@@ -580,5 +750,7 @@ the ring kind in use.
    large group's default per ring kind, the `recv_accumulator_max` floor,
    the removal of `recv_segment_reserve`) in a coordinated release.
 
-Steps 1 to 3 change no ring behaviour and can land before INC is switched
-on.
+Steps 1 to 3 change neither the ring's registration nor its geometry, and
+can land before INC is switched on. Step 1 holds a buffer in
+`pending_recv_bufs`, out of the ring, in more states than today, still at
+most one per connection, with no lend cap until step 4.
