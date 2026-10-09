@@ -597,21 +597,21 @@ pub(crate) struct Driver {
     pub(crate) forward_epoch: Vec<u32>,
     /// Per-connection flag: `true` while a Mode A `forward_to` is driving this
     /// connection (set by `ConnCtx::forward_to`, cleared by `settle_forward_end`
-    /// / `reset_segment_state` / `close_connection`). Gates the `forward_hold_cap`
-    /// throttle so it applies only to forwarding connections, not to pure Mode B
-    /// segment readers that share the `Segmented` domain and `segment_hold`.
+    /// / `reset_segment_state` / `close_connection`).
     pub(crate) forward_recv_active: Vec<bool>,
-    /// Per-connection flag: `true` while a forwarding connection's multishot recv
-    /// has been throttled (cancelled) because its `segment_hold` reached
-    /// `forward_hold_cap`. Set at the throttle point in the recv handler; cleared
-    /// when the recv is re-armed after the hold drains below the cap
-    /// (`maybe_rearm_throttled_forward`) or on `settle_forward_end` / close.
+    /// Per-connection flag: `true` while a connection's multishot recv has been
+    /// throttled (cancelled) because its held receive entries reached the
+    /// hold cap (`throttle_if_held`). Cleared when the recv is re-armed after
+    /// the hold drains below the cap (`maybe_rearm_throttled_forward`) or on
+    /// `settle_forward_end` / close.
     /// Gates re-arm so the starved-connection path does not fight the throttle.
     pub(crate) forward_hold_throttled: Vec<bool>,
-    /// Per-connection held-buffer cap for Mode A `forward_to`
-    /// (`Config::forward_hold_cap`). When a forwarding connection's `segment_hold`
-    /// length reaches this, its multishot recv is cancelled (TCP window closes)
-    /// and re-armed once the hold drains below the cap.
+    /// Connections throttled by `throttle_if_held`, which the event loop
+    /// re-arms once their hold drains (`rearm_throttled_recvs`). May hold a
+    /// connection whose flag was cleared since; the next pass drops it.
+    pub(crate) throttled_recvs: Vec<u32>,
+    /// Per-connection cap on held receive entries (`Config::forward_hold_cap`);
+    /// `throttle_if_held` applies it, lowered to a quarter of the ring.
     pub(crate) forward_hold_cap: usize,
     pub(crate) accept_rx: Option<crossbeam_channel::Receiver<crate::acceptor::AcceptedConn>>,
     /// Merged accept mode: every merged listener's sockets, `(listener index,
@@ -1274,6 +1274,7 @@ impl Driver {
             forward_epoch: vec![0; config.max_connections as usize],
             forward_recv_active: vec![false; config.max_connections as usize],
             forward_hold_throttled: vec![false; config.max_connections as usize],
+            throttled_recvs: Vec::new(),
             forward_hold_cap: config.forward_hold_cap,
             accept_rx,
             merged_listeners: config.merged_listeners.clone(),

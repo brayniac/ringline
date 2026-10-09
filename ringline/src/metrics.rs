@@ -356,12 +356,14 @@ pub mod pool {
     /// degradation path that keeps draining the socket when a single
     /// response exceeds the provided ring.
     pub const RECV_FALLBACK: usize = 5;
-    /// A Mode A `forward_to` connection reached its `forward_hold_cap` held-buffer
-    /// backlog and had its multishot recv cancelled (TCP window closed) to
-    /// backpressure the source — re-armed once writes drain the hold below the
-    /// cap. Sustained counts mean the sink is slower than the source for large
+    /// A connection holding received data (a `forward_to` source, a segment
+    /// reader, a recv-forward or direct-echo connection) reached its hold cap
+    /// (`forward_hold_cap`, lowered as `ConfigBuilder::forward_hold_cap` says)
+    /// and had its multishot recv cancelled (TCP window closed) to backpressure
+    /// its peer — re-armed once the hold drains below the cap. Sustained counts
+    /// mean a consumer is slower than its peer for large
     /// objects; unlike `RECV_PARKED` (ENOBUFS starvation) this is *deliberate*
-    /// per-connection backpressure that prevents one slow forward from depleting
+    /// per-connection backpressure that prevents one slow consumer from depleting
     /// the shared recv ring.
     pub const FORWARD_THROTTLED: usize = 6;
     /// A segmented reader was about to park while the `RecvAccumulator` still
