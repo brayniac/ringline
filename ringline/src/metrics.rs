@@ -390,6 +390,20 @@ pub mod udp {
 ///
 /// Call once at startup before metrics are scraped.
 pub fn init_metadata() {
+    RECV_RING.insert_metadata(recv_ring::INCREMENTAL, "op".into(), "incremental".into());
+    RECV_RING.insert_metadata(recv_ring::PLAIN, "op".into(), "plain".into());
+    for (step, name) in [
+        (recv_preflight::SOCKETPAIR, "socketpair"),
+        (recv_preflight::IO_ERROR, "io_error"),
+        (recv_preflight::TIMEOUT, "timeout"),
+        (recv_preflight::APPEND, "append"),
+        (recv_preflight::OFFSETS, "offsets"),
+        (recv_preflight::EXHAUSTION, "exhaustion"),
+        (recv_preflight::REPOST, "repost"),
+        (recv_preflight::EOF, "eof"),
+    ] {
+        RECV_PREFLIGHT_FAILED.insert_metadata(step, "op".into(), name.into());
+    }
     CONNECTIONS.insert_metadata(conn::ACCEPTED, "op".into(), "accepted".into());
     CONNECTIONS.insert_metadata(conn::CLOSED, "op".into(), "closed".into());
     CONNECTIONS.insert_metadata(conn::PARK_STARTED, "op".into(), "park_started".into());
@@ -627,6 +641,38 @@ mod tests {
             udp::DATAGRAMS_DROPPED,
         ] {
             assert!(UDP.increment(idx), "UDP[{idx}] out of bounds");
+        }
+        for idx in [recv_ring::INCREMENTAL, recv_ring::PLAIN] {
+            assert!(RECV_RING.increment(idx), "RECV_RING[{idx}] out of bounds");
+        }
+        for idx in 0..recv_preflight::COUNT {
+            assert!(
+                RECV_PREFLIGHT_FAILED.increment(idx),
+                "RECV_PREFLIGHT_FAILED[{idx}] out of bounds"
+            );
+        }
+    }
+
+    /// Every slot of the receive-ring groups is labelled, so an exporter
+    /// can name what it counts.
+    #[test]
+    fn recv_ring_slots_are_labelled() {
+        init_metadata();
+        for idx in 0..recv_ring::COUNT {
+            assert!(
+                RECV_RING
+                    .load_metadata(idx)
+                    .is_some_and(|m| m.contains_key("op")),
+                "RECV_RING[{idx}] has no op label"
+            );
+        }
+        for idx in 0..recv_preflight::COUNT {
+            assert!(
+                RECV_PREFLIGHT_FAILED
+                    .load_metadata(idx)
+                    .is_some_and(|m| m.contains_key("op")),
+                "RECV_PREFLIGHT_FAILED[{idx}] has no op label"
+            );
         }
     }
 }
