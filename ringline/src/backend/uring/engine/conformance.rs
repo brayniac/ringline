@@ -611,3 +611,61 @@ fn probe_one_shot_bundle_recv() {
         }
     }
 }
+
+/// Probe, not a contract: a multishot recv with a total byte limit
+/// (`sqe->optlen`, Linux 7.x `IORING_RECV_MSHOT_LIM`) on plain and
+/// incremental rings of 32 x 16 B, with and without bundles, 200 B queued.
+/// Prints every completion; asserts nothing.
+#[test]
+#[ignore = "probe"]
+fn probe_multishot_total_limit() {
+    eprintln!("PROBE kernel {:?}", KernelVersion::current());
+    for kind in [RingKind::Plain, RingKind::Incremental] {
+        for bundle in [false, true] {
+            for (per_trigger, total) in
+                [(0u32, 0u32), (0, 40), (0, 64), (0, 100), (16, 64), (0, 17)]
+            {
+                let ring = ProvidedBufRing::new(9, 32, 16).expect("ring");
+                let mut e = engine();
+                if kind == RingKind::Incremental && !incremental(&e) {
+                    continue;
+                }
+                e.register_buf_ring(&ring, kind).expect("register");
+                let (mut client, server) = pair();
+                let payload: Vec<u8> = (0..200u32).map(|i| i as u8).collect();
+                client.write_all(&payload).expect("write");
+                std::thread::sleep(Duration::from_millis(20));
+                let sqe = Sqe::new(
+                    Op::RecvMultiLimit {
+                        fd: Fd::Raw(server.as_raw_fd()),
+                        buf_group: 9,
+                        per_trigger,
+                        total,
+                        bundle,
+                    },
+                    1,
+                );
+                // Safety: a buffer-select recv references no caller memory.
+                unsafe { e.push(&sqe) }.expect("push");
+                let cqes = reap(&mut e, 40);
+                let mut sum = 0i64;
+                let mut seen = Vec::new();
+                for c in &cqes {
+                    let (res, _bid, _bm, more, _ne) = data(*c);
+                    if res > 0 {
+                        sum += res as i64;
+                    }
+                    seen.push(format!("{res}{}", if more { "+" } else { "." }));
+                }
+                eprintln!(
+                    "PROBE {kind:?} bundle={bundle} per_trigger={per_trigger} total={total}: \
+                     completions={} bytes={sum} [{}]",
+                    cqes.len(),
+                    seen.join(" ")
+                );
+                // Cancel whatever is still armed before tearing down.
+                let _ = e.unregister_buf_ring(9);
+            }
+        }
+    }
+}

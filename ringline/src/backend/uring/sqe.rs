@@ -50,6 +50,15 @@ pub(crate) enum Op {
     /// One-shot bundle recv (`IORING_RECVSEND_BUNDLE`): selects one or
     /// more buffers from `buf_group`, receiving at most `len` bytes (0: no
     /// limit). Linux 6.10+.
+    /// PROBE: multishot recv with a per-trigger cap (`sqe->len`), a total
+    /// cap for the arm (`sqe->optlen`, 0 = none) and optional bundles.
+    RecvMultiLimit {
+        fd: Fd,
+        buf_group: u16,
+        per_trigger: u32,
+        total: u32,
+        bundle: bool,
+    },
     RecvBundle {
         fd: Fd,
         buf_group: u16,

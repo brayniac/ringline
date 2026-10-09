@@ -924,6 +924,27 @@ impl Sqe {
             Op::RecvMulti { fd, buf_group } => {
                 on!(fd, |t| opcode::RecvMulti::new(t, buf_group).build())
             }
+            Op::RecvMultiLimit {
+                fd,
+                buf_group,
+                per_trigger,
+                total,
+                bundle,
+            } => on!(fd, |t| {
+                let mut e = if bundle {
+                    opcode::RecvMultiBundle::new(t, buf_group).build()
+                } else {
+                    opcode::RecvMulti::new(t, buf_group).build()
+                };
+                // PROBE: `len` is the u32 at byte 24 and `optlen` the u32 at
+                // byte 44 of the `#[repr(C)]` 64-byte SQE.
+                unsafe {
+                    let base = (&mut e as *mut Entry).cast::<u8>();
+                    base.add(24).cast::<u32>().write_unaligned(per_trigger);
+                    base.add(44).cast::<u32>().write_unaligned(total);
+                }
+                e
+            }),
             Op::RecvBundle { fd, buf_group, len } => on!(fd, |t| {
                 let mut e = opcode::RecvBundle::new(t, buf_group).build();
                 // PROBE: io-uring 0.7.12's `RecvBundle` has no `len`; it is
