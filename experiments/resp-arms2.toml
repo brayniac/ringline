@@ -1,0 +1,194 @@
+# Protocol-server comparison, second campaign: one cell set per copy-count
+# row of docs/io-api-redesign.md ("Against tokio and mio") plus open-loop
+# latency at fixed rates. resp-server on hv02 (z1, 24 vCPU, 8 workers),
+# cachecannon on hv01 (z2, 56 vCPU). One arm per experiment, all 12 cells
+# per experiment; submit arms interleaved with at least four of each and
+# discard the first round. rezolus records the server unit.
+#   arm = ringline | ringline-ondemand | tokio-pc | tokio-uring
+name = "ringline resp-arms2 {arm} rep{rep}"
+
+[params]
+bins_artifact = "REPLACE-WITH-ARTIFACT-ID"
+arm           = "ringline"
+rep           = "1"
+image         = "spool/images/debian-13-base-20260912.1@golden"
+server_ip     = "172.31.0.1"
+client_ip     = "172.31.0.2"
+port          = "6379"
+workers       = "8"
+client_threads = "16"
+warmup        = "10s"
+duration      = "20s"
+
+[[jobs]]
+name = "server"
+tags = ["z1.baremetal"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "start"
+shape = "z1.c"
+image = "{image}"
+gpu = false
+data_address = "{server_ip}/24"
+boot_timeout = 600
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "exec"
+inputs = [{ artifact = "{bins_artifact}", name = "bins.tgz", dest = "/home/anvil" }]
+payload = '''
+set -uo pipefail
+cd /home/anvil && tar xzf bins.tgz && chmod +x out/*
+cat /etc/anvil-instance.json
+sudo sysctl -w net.core.somaxconn=65535 net.ipv4.tcp_max_syn_backlog=65535 net.core.rmem_max=134217728 net.core.wmem_max=134217728
+case "{arm}" in
+  ringline)          args="--runtime ringline" ;;
+  ringline-best)     args="--runtime ringline --zc-get 4096 --stream-sets 16384" ;;
+  ringline-ondemand) args="--runtime ringline --recv-on-demand" ;;
+  tokio-pc)          args="--runtime tokio-pc" ;;
+  tokio-best)        args="--runtime tokio-pc --zc-get 4096 --stream-sets 16384" ;;
+  tokio-uring)       args="--runtime tokio-uring" ;;
+  *) echo "BAD ARM {arm}"; exit 1 ;;
+esac
+echo "exec /home/anvil/out/resp-server $args --addr {server_ip}:{port} --workers {workers}" > /home/anvil/run-server.sh
+chmod +x /home/anvil/run-server.sh
+cat /home/anvil/run-server.sh
+'''
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "exec"
+detach = true
+unit = "resp-server"
+metrics = true
+payload = "ulimit -n 1048576; exec bash /home/anvil/run-server.sh"
+
+[[jobs.steps]]
+type = "barrier"
+name = "server-ready"
+timeout = 1800
+
+[[jobs.steps]]
+type = "barrier"
+name = "bench-done"
+timeout = 7200
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "stop"
+upload = true
+
+[[jobs]]
+name = "client"
+tags = ["z2.baremetal"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "start"
+shape = "z2.c"
+image = "{image}"
+gpu = false
+data_address = "{client_ip}/24"
+boot_timeout = 600
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "exec"
+inputs = [{ artifact = "{bins_artifact}", name = "bins.tgz", dest = "/home/anvil" }]
+payload = '''
+set -uo pipefail
+cd /home/anvil && tar xzf bins.tgz && chmod +x out/*
+sudo sysctl -w net.core.rmem_max=134217728 net.core.wmem_max=134217728 net.ipv4.ip_local_port_range="1024 65535"
+ping -c 2 -W 2 {server_ip} || echo "WARN: server not reachable yet"
+'''
+
+[[jobs.steps]]
+type = "barrier"
+name = "server-ready"
+timeout = 1800
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "exec"
+metrics = true
+upload = true
+artifacts = ["/home/anvil/results.tgz"]
+payload_timeout = 7000
+payload = '''
+set -uo pipefail
+cd /home/anvil
+mkdir -p results
+ulimit -n 1048576
+for i in $(seq 1 120); do
+  (exec 3<>/dev/tcp/{server_ip}/{port}) 2>/dev/null && { exec 3>&-; echo "server reachable after ${i}s"; break; }
+  sleep 1
+done
+# cell: name vlen depth conns get set rate keys
+cat > cells.txt <<CELLS
+ol-v64-r1000k 64 16 512 80 20 1000000 100000
+ol-v64-r2500k 64 16 512 80 20 2500000 100000
+ol-v64-r4000k 64 16 512 80 20 4000000 100000
+ol-v4096-r250k 4096 16 512 80 20 250000 20000
+ol-v4096-r500k 4096 16 512 80 20 500000 20000
+ol-v4096-r800k 4096 16 512 80 20 800000 20000
+set-v65536-d1 65536 1 64 10 90 0 2000
+set-v65536-d16 65536 16 64 10 90 0 2000
+get-v65536-d1 65536 1 64 100 0 0 2000
+get-v65536-d16 65536 16 64 100 0 0 2000
+get-v4096-d16 4096 16 64 100 0 0 20000
+CELLS
+while read cell vlen depth conns get set rate keys; do
+      rl=""; [ "$rate" != 0 ] && rl="rate_limit = $rate"
+      cat > results/$cell.toml <<CFG
+[general]
+duration = "{duration}"
+warmup = "{warmup}"
+threads = {client_threads}
+
+[target]
+endpoints = ["{server_ip}:{port}"]
+protocol = "resp"
+
+[connection]
+connections = $conns
+pipeline_depth = $depth
+connect_timeout = "10s"
+request_timeout = "5s"
+
+[workload]
+backfill_on_miss = true
+$rl
+
+[workload.keyspace]
+length = 16
+count = $keys
+distribution = "uniform"
+
+[workload.commands]
+get = $get
+set = $set
+
+[workload.values]
+length = $vlen
+
+[admin]
+format = "json"
+CFG
+      ./out/cachecannon results/$cell.toml > results/$cell.json 2> results/$cell.log
+      echo "== arm={arm} rep={rep} cell=$cell"
+      grep '"type":"result"' results/$cell.json || { echo "NO RESULT"; tail -5 results/$cell.log; }
+      sleep 3
+done < cells.txt
+tar czf /home/anvil/results.tgz -C /home/anvil results
+exit 0
+'''
+
+[[jobs.steps]]
+type = "barrier"
+name = "bench-done"
+timeout = 7200
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "stop"
