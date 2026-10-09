@@ -99,8 +99,14 @@ fn bytes(ring: &ProvidedBufRing, bid: u16, off: usize, len: usize) -> Vec<u8> {
     unsafe { std::slice::from_raw_parts(ptr.add(off), len).to_vec() }
 }
 
+/// Whether the kernel has incremental rings. A test that returns early on
+/// `false` prints so, since the harness reports it as passed.
 fn incremental(engine: &ActiveEngine) -> bool {
-    engine.incremental_buffers().expect("probe")
+    let inc = engine.incremental_buffers().expect("probe");
+    if !inc {
+        eprintln!("skipped: the kernel has no incremental buffer rings");
+    }
+    inc
 }
 
 /// A completion that delivered data, as the receive design reads it.
