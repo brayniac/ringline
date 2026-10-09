@@ -19,7 +19,7 @@ type = "anvil-vm"
 shape = "z4.c"
 image = "spool/images/debian-13-ci-20260912.1@golden"
 slots = 1
-memory_gib = 16
+memory_gib = 8
 ports = 0
 gpu = false
 payload_timeout = 3600
@@ -37,7 +37,7 @@ cd /home/anvil
   echo "cachecannon: $(git -C cc log --oneline -1)"
   ( cd src && cargo build --release --locked -p ringline-bench --features tokio-uring-arm --bin resp-server ) || exit 1
   cp src/target/release/resp-server out/
-  ( cd cc && cargo build --release --locked -j 4 ) || exit 1
+  ( cd cc && cargo build --release --locked -j 2 ) || exit 1
   cp cc/target/release/cachecannon out/
   ( cd out && sha256sum * )
   tar czf bins.tgz out
