@@ -774,9 +774,10 @@ impl Default for RecvBufferConfig {
 }
 
 /// The TCP receive ring's geometry, `(ring_size, buffer_size)`, for an
-/// incremental or a plain ring, with `recv_incremental` on and no
-/// `recv_buffer` call.
+/// incremental ring, with `recv_incremental` on and no `recv_buffer` call.
 pub(crate) const RECV_INCREMENTAL_GEOMETRY: (u16, u32) = (64, 1 << 20);
+/// The TCP receive ring's geometry for a plain ring, with
+/// `recv_incremental` on and no `recv_buffer` call.
 pub(crate) const RECV_PLAIN_GEOMETRY: (u16, u32) = (4096, 64 << 10);
 
 impl Config {
@@ -1022,12 +1023,26 @@ impl ConfigBuilder {
     /// behaves as the receive path relies on; if the kernel lacks incremental
     /// rings or the check fails, it uses a plain ring. Without a
     /// [`recv_buffer`](Self::recv_buffer) call the geometry follows the ring
-    /// kind: 64 × 1 MiB incremental, or 4096 × 64 KiB plain. A worker built
-    /// with the `timestamps` feature and `timestamps(true)` uses a plain ring.
+    /// kind: 64 × 1 MiB incremental, or 4096 × 64 KiB plain, and `build()`
+    /// then requires `recv_accumulator_max` to be at least 1 MiB on either
+    /// backend. With the `timestamps` feature and `timestamps(true)`, every
+    /// worker uses a plain ring.
     ///
-    /// io_uring backend only; the mio backend ignores it. **Default: false**,
-    /// which keeps the plain ring `recv_buffer` sets (256 × 16 KiB by
-    /// default).
+    /// The default geometry has these effects:
+    /// - The incremental ring's 64 buffers never leave more free than the
+    ///   default `recv_segment_reserve` (64), so every segmented delivery
+    ///   (`with_segments`, `forward_to`) is copied.
+    /// - With `prefault_buffers(true)` a plain ring makes 256 MiB per worker
+    ///   resident, against 4 MiB for the 256 × 16 KiB default.
+    /// - The fallback receive's chunks grow from 1 MiB to 4 MiB of virtual
+    ///   memory each.
+    /// - Lends into incremental buffers are not capped yet, so about 64
+    ///   connections holding unread data can keep every buffer out of use
+    ///   and stall receives on the worker.
+    ///
+    /// The ring kind is an io_uring choice; the mio backend uses its own
+    /// receive buffers. **Default: false**, which keeps the plain ring
+    /// `recv_buffer` sets (256 × 16 KiB by default).
     pub fn recv_incremental(mut self, enabled: bool) -> Self {
         self.config.recv_incremental = enabled;
         self

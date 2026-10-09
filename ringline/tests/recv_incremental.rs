@@ -69,15 +69,23 @@ fn echo_round_trip(addr: &str, msg: &[u8]) -> Vec<u8> {
 /// 1 MiB, with the geometry that follows the ring kind (64 × 1 MiB on a
 /// kernel with incremental rings) and with a small explicit one (16 × 1 KiB,
 /// which runs out of buffers within each message). Each worker records the
-/// ring kind it selected.
+/// ring kind it selected; from Linux 6.12, an incremental ring with no failed
+/// preflight step.
 #[test]
 fn async_echo_with_recv_incremental() {
-    use ringline::metrics::{RECV_RING, recv_ring};
-    let selections = || {
-        RECV_RING.value(recv_ring::INCREMENTAL).unwrap_or(0)
-            + RECV_RING.value(recv_ring::PLAIN).unwrap_or(0)
+    use ringline::metrics::{RECV_PREFLIGHT_FAILED, RECV_RING, recv_preflight, recv_ring};
+    let count = |slot| RECV_RING.value(slot).unwrap_or(0);
+    let failed = || {
+        (0..recv_preflight::COUNT)
+            .map(|s| RECV_PREFLIGHT_FAILED.value(s).unwrap_or(0))
+            .sum::<u64>()
     };
-    let before = selections();
+    let (inc_before, plain_before, failed_before) = (
+        count(recv_ring::INCREMENTAL),
+        count(recv_ring::PLAIN),
+        failed(),
+    );
+    let has_incremental = kernel_at_least(6, 12);
     let geometries: [Option<(u16, u32)>; 2] = [None, Some((16, 1024))];
     for (i, geometry) in geometries.into_iter().enumerate() {
         let mut builder = ConfigBuilder::new()
@@ -85,7 +93,7 @@ fn async_echo_with_recv_incremental() {
             .pin_to_core(false)
             .sq_entries(64)
             .max_connections(64)
-            .send_pool(64, 16384)
+            .send_pool(128, 16384)
             .recv_incremental(true);
         if let Some((ring_size, buffer_size)) = geometry {
             builder = builder.recv_buffer(ring_size, buffer_size);
@@ -108,10 +116,28 @@ fn async_echo_with_recv_incremental() {
         for h in handles {
             h.join().unwrap().unwrap();
         }
-        assert_eq!(
-            selections(),
-            before + i as u64 + 1,
-            "one selection per worker"
+        let launches = i as u64 + 1;
+        let (inc, plain) = (
+            count(recv_ring::INCREMENTAL) - inc_before,
+            count(recv_ring::PLAIN) - plain_before,
         );
+        assert_eq!(inc + plain, launches, "one selection per worker");
+        if has_incremental {
+            assert_eq!(inc, launches, "an incremental ring on Linux 6.12+");
+            assert_eq!(failed(), failed_before, "no failed preflight step");
+        }
     }
+}
+
+/// Whether the running kernel is at least `major.minor`.
+fn kernel_at_least(major: u32, minor: u32) -> bool {
+    let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
+    let mut parts = release.split(|c: char| !c.is_ascii_digit());
+    let mut next = || {
+        parts
+            .next()
+            .and_then(|p| p.parse::<u32>().ok())
+            .unwrap_or(0)
+    };
+    (next(), next()) >= (major, minor)
 }

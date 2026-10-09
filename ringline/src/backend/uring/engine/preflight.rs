@@ -4,9 +4,10 @@
 //! kernel version marks a kernel that behaves as the receive driver relies
 //! on. Before a worker registers its TCP ring as incremental, it checks
 //! that behaviour on the running kernel with a one-entry ring and an
-//! `AF_UNIX` stream socketpair, which needs no network configuration (`docs/recv-incremental-ring-design.md`, "Selecting
-//! the ring kind"). It runs on the worker's ring before anything else is
-//! armed, since it reaps every completion the ring holds.
+//! `AF_UNIX` stream socketpair, which needs no network configuration
+//! (`docs/recv-incremental-ring-design.md`, "Selecting the ring kind"). It
+//! runs on the worker's ring before anything else is armed, since it reaps
+//! every completion the ring holds.
 
 use std::io::Write;
 use std::net::Shutdown;
@@ -46,14 +47,17 @@ pub(crate) enum IncPreflight {
 
 /// Check the incremental-ring behaviour the receive driver relies on.
 ///
-/// `Err` is a registration failing other than with `EINVAL`, which fails
-/// the worker's startup as any registration failure does. A socketpair or
-/// I/O failure is reported as a failed step, which selects plain rings.
+/// `Err` is the `incremental_buffers` probe failing other than with
+/// `EINVAL`, the preflight ring's registration failing, or a receive the
+/// preflight could not cancel within 1 s; each fails the worker's startup.
+/// A socketpair or I/O failure is reported as a failed step, which selects
+/// plain rings.
 pub(crate) fn inc_preflight<E: Engine>(engine: &mut E) -> Result<IncPreflight, Error> {
-    if !engine
-        .incremental_buffers()
-        .map_err(|e| Error::buffer_registration(e, 0, None))?
-    {
+    if !engine.incremental_buffers().map_err(|e| {
+        Error::BufferRegistration(format!(
+            "incremental provided buffer ring probe (bgid {BGID}): {e}"
+        ))
+    })? {
         return Ok(IncPreflight::Unsupported);
     }
     let Ok((mut client, server)) = UnixStream::pair() else {
@@ -80,13 +84,40 @@ pub(crate) fn inc_preflight<E: Engine>(engine: &mut E) -> Result<IncPreflight, E
     };
     // A completion that ends the arm may already be reaped and unconsumed.
     armed &= reaped.0.iter().all(|&(_, flags)| cqueue::more(flags));
-    if armed {
-        disarm(engine);
+    let disarmed = !armed || disarm(engine);
+    let unregistered = engine.unregister_buf_ring(BGID).is_ok();
+    if !disarmed || !unregistered {
+        // The kernel may still reach the ring's entry, which points into the
+        // ring's buffer; leak both rather than free memory it can write.
+        std::mem::forget(ring);
     }
-    // A failed unregister leaves the group registered on pages the kernel
-    // has pinned, which is safe for the reason `register_buf_ring` gives.
-    let _ = engine.unregister_buf_ring(BGID);
+    if !disarmed {
+        // Its last completion would otherwise reach the event loop.
+        return Err(Error::RingSetup(
+            "the incremental-ring preflight could not cancel its receive within 1 s".into(),
+        ));
+    }
     result
+}
+
+// Test-only: make the preflight report `step` as failed when it reaches
+// that step, with its receive still armed.
+#[cfg(test)]
+thread_local! {
+    static FAIL_AT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether a test asked the preflight to fail at `at`.
+fn injected(at: usize) -> bool {
+    #[cfg(test)]
+    {
+        FAIL_AT.with(|f| f.get()) == Some(at)
+    }
+    #[cfg(not(test))]
+    {
+        let _ = at;
+        false
+    }
 }
 
 fn run<E: Engine>(
@@ -104,6 +135,9 @@ fn run<E: Engine>(
     // offsets, and the entry advances in place.
     arm(e, server)?;
     *armed = true;
+    if injected(step::APPEND) {
+        return Ok(Failed(step::APPEND));
+    }
     client.write_all(b"abc")?;
     if !delivered(wait(e, reaped, armed)?, 3, true, true) {
         return Ok(Failed(step::APPEND));
@@ -126,6 +160,9 @@ fn run<E: Engine>(
     // More than the space left: the completion delivers exactly the space
     // left with F_BUF_MORE clear, and the excess ends the arm with ENOBUFS.
     const EXCESS: u32 = 5;
+    if injected(step::EXHAUSTION) {
+        return Ok(Failed(step::EXHAUSTION));
+    }
     client.write_all(&[b'x'; (SIZE - 7 + EXCESS) as usize])?;
     if !delivered(wait(e, reaped, armed)?, (SIZE - 7) as i32, false, true) {
         return Ok(Failed(step::EXHAUSTION));
@@ -141,10 +178,16 @@ fn run<E: Engine>(
     ring.release_batch(&[0, 0, 0]);
     arm(e, server)?;
     *armed = true;
+    if injected(step::REPOST) {
+        return Ok(Failed(step::REPOST));
+    }
     if !delivered(wait(e, reaped, armed)?, EXCESS as i32, true, true) {
         return Ok(Failed(step::REPOST));
     }
     ring.complete(0, EXCESS, true);
+    if injected(step::EOF) {
+        return Ok(Failed(step::EOF));
+    }
     client.shutdown(Shutdown::Write)?;
     let (res, flags) = wait(e, reaped, armed)?;
     if res != 0 || cqueue::buffer_select(flags).is_some() || cqueue::more(flags) {
@@ -157,21 +200,21 @@ fn run<E: Engine>(
     Ok(IncPreflight::Passed)
 }
 
-/// Cancel a live preflight receive and reap its last completion, so none
-/// reaches the event loop. Bounded by `WAIT`; past it the receive is left
-/// to the ring's teardown.
-fn disarm<E: Engine>(e: &mut E) {
+/// Cancel a live preflight receive and reap its last completion and the
+/// cancel's, so neither reaches the event loop. Returns whether both were
+/// reaped within `WAIT`.
+fn disarm<E: Engine>(e: &mut E) -> bool {
     let cancel = Sqe::new(Op::Cancel { target: USER_DATA }, CANCEL_USER_DATA);
     // Safety: a cancel references no caller memory.
     if unsafe { e.push(&cancel) }.is_err() {
-        return;
+        return false;
     }
     let deadline = Instant::now() + WAIT;
     let mut out = Vec::new();
     let (mut ended, mut cancelled) = (false, false);
     while !(ended && cancelled) && Instant::now() < deadline {
         if e.submit_and_get_events().is_err() {
-            return;
+            return false;
         }
         e.reap(&mut out);
         for &(ud, _, flags) in &out {
@@ -181,6 +224,7 @@ fn disarm<E: Engine>(e: &mut E) {
         out.clear();
         std::thread::yield_now();
     }
+    ended && cancelled
 }
 
 /// Whether `(res, flags)` delivered `len` bytes into buffer 0 with the given
@@ -261,6 +305,30 @@ mod tests {
             }
         }
         ActiveEngine::setup(&config).expect("engine")
+    }
+
+    /// A preflight that fails with its receive armed cancels it: nothing is
+    /// left to reap, and the preflight group can be registered again.
+    #[test]
+    fn a_failed_step_leaves_nothing_behind() {
+        for at in [step::APPEND, step::EXHAUSTION, step::REPOST, step::EOF] {
+            let mut e = engine();
+            if !e.incremental_buffers().expect("probe") {
+                return;
+            }
+            FAIL_AT.with(|f| f.set(Some(at)));
+            let found = inc_preflight(&mut e);
+            FAIL_AT.with(|f| f.set(None));
+            assert_eq!(found.expect("preflight"), IncPreflight::Failed(at));
+            e.submit_and_get_events().expect("enter");
+            let mut left = Vec::new();
+            e.reap(&mut left);
+            assert!(left.is_empty(), "step {at}: {left:?}");
+            let again = ProvidedBufRing::new(BGID, 1, SIZE).expect("ring");
+            e.register_buf_ring(&again, RingKind::Incremental)
+                .unwrap_or_else(|err| panic!("step {at}: group still registered: {err}"));
+            e.unregister_buf_ring(BGID).expect("unregister");
+        }
     }
 
     /// The preflight passes on a kernel with incremental rings, reports

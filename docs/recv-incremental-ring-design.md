@@ -169,10 +169,14 @@ Each step waits at most 1 s for its completion; a step that times out does
 not match. A registration refused with `EINVAL` (no INC), a step that does
 not match, or a failure to create the socketpair selects plain rings, and
 the worker records which step failed in a metric. Any other registration
-error fails startup as above. The preflight's ring entry is one page,
-which the memlock preflight counts on 6.14+. The preflight does not cover
+error fails startup as above, and so does a receive the preflight cannot
+cancel within 1 s, since its last completion would reach the event loop;
+the preflight ring is then leaked rather than freed. The preflight's
+one-page ring is unregistered before the TCP ring is registered, so the
+memlock preflight does not count it. The preflight does not cover
 ordering under CQ overflow or SQPOLL; the conformance tests checked those
-on 6.12.63 and 7.1. Its time per worker is measured in step 4.
+on 6.12.63 and 7.1. It takes about 0.1 ms per worker (85–115 µs over 11
+runs on Linux 6.12, arm64), and 2.3 ms on a cold first run.
 
 Ubuntu's 6.8 kernels from 6.8.0-139 reject every provided-ring registration
 whose reserved words are zero, the form other kernels require, and accept
@@ -249,7 +253,8 @@ release without a hold panics, naming the bid. A duplicate release that
 arrives after the buffer was posted and completed again takes that
 completion's hold and is not detected. A runtime check guards rule 1: when a
 completion clears `F_BUF_MORE`, `written` must equal `buffer_size`, and
-while it is set, be less; a mismatch is a bug and fails loudly.
+while it is set, be less; a mismatch is a bug, and the assertion panics
+the worker, in release builds too.
 
 A buffer counts as out of the ring when it is exhausted and not yet
 returned; a partly filled buffer is still in the ring. A group's `free()` is
@@ -684,9 +689,10 @@ receive queue, and TCP closes the window until the worker re-arms.
   (default 0), or the UDP bgid (default 1) when UDP is in use.
 - With INC on and the `timestamps` feature built in, timestamped
   connections get their own plain ring from step 5. Until then a worker
-  with `timestamps(true)` uses a plain ring for every connection. Their multishot `RECVMSG` works on
-  an INC ring (conformance tests), but before the 6.12.y change that lets a
-  ring require a minimum length left in a buffer it can fail when the space
+  with `timestamps(true)` uses a plain ring for every connection.
+  Timestamped connections' multishot `RECVMSG` works on an INC ring
+  (conformance tests), but before the 6.12.y change that lets a ring
+  require a minimum length left in a buffer it can fail when the space
   left is smaller than the message header; that failure is not reproduced
   here. The ring's geometry is the plain small group's, its bgid
   (`recv_timestamp_buffer_bgid`, default 3) is validated against the TCP,
@@ -768,7 +774,7 @@ buffers held by `with_bytes` views, values copied by the
    so these paths are exercised only from step 4.
 4. INC and the plain geometry, behind `recv_incremental` (default
    `false`), in two changes. 4a: ring-kind selection with the behaviour
-   preflight (62–111 µs per worker on Linux 6.12, arm64), a plain ring
+   preflight (about 0.1 ms per worker on Linux 6.12, arm64), a plain ring
    for a worker with `timestamps(true)`, `MADV_NOHUGEPAGE`, the geometry
    per ring kind, the memlock preflight and the ring-kind metrics. 4b: the
    per-group lend cap and its copy paths, `recv_segment_reserve` ignored
@@ -778,8 +784,10 @@ buffers held by `with_bytes` views, values copied by the
    and validation, the arm taking the group per call,
    `OpTag::RecvMultiLarge` and the `SendRecvBuf` group bit, `group` in
    `PendingRecvBuf` and the send slab, the cancel sites, promotion,
-   migration and demotion with `recv_large_demote_quiet`, and the two-group
-   memlock preflight. Migration is timed in ringline's metrics.
+   migration and demotion with `recv_large_demote_quiet`, the two-group
+   memlock preflight, and the timestamps ring with
+   `recv_timestamp_buffer_bgid`. Migration is timed in ringline's
+   metrics.
 6. Measure ringline on hv01 and across hv01/hv02, on Linux 6.1, 6.8, 6.12
    and 7.1: the geometry per ring kind with and without the large group
    against the 256 × 16 KiB ring, with the bench suite (echo at 256 B to

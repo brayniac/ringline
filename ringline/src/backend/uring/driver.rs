@@ -1208,11 +1208,11 @@ impl Driver {
             fallback_slot_owner: Vec::new(),
             // One event-loop pass moves at most one chunk per starved
             // connection, so the chunk — not the provided ring — is the
-            // per-pass byte ceiling while degraded. It must be LARGER than
-            // the ring's capacity to beat the park/re-arm churn cycle it
-            // replaces (which moves one ring's worth per pass); a small
-            // chunk would be slower than the pathology. Floor of 1 MiB,
-            // scaled up for jumbo provided buffers.
+            // per-pass byte ceiling while degraded. Four buffers, at least
+            // 1 MiB. The arbitration in `flush_replenish_and_rearm` prefers
+            // the fallback on the premise that the chunk exceeds the ring's
+            // capacity, which no geometry here meets (the default 256 × 16 KiB
+            // ring holds 4 MiB); #622 step 4b revisits it.
             fallback_chunk: recv_buffer_size.saturating_mul(4).max(1 << 20),
             recv_fallback_count: 0,
             udp_batch_recv_at: std::time::Instant::now(),
