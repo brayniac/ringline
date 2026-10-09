@@ -488,6 +488,33 @@ fn async_echo_small_message() {
     }
 }
 
+/// The runtime starts and echoes with `sqpoll(true)`: the kernel thread
+/// consumes the SQ, so the ring is set up without COOP_TASKRUN or
+/// DEFER_TASKRUN (#630).
+#[test]
+#[cfg(has_io_uring)]
+fn async_echo_under_sqpoll() {
+    let config = test_config_builder().sqpoll(true).build().expect("config");
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind("127.0.0.1:0".parse().unwrap())
+        .launch::<AsyncEcho>()
+        .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
+
+    wait_for_server(&addr);
+
+    for len in [22usize, 8192, 256 * 1024] {
+        let msg: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        let response = echo_round_trip(&addr, &msg);
+        assert_eq!(response, msg, "{len} bytes");
+    }
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
 #[test]
 fn async_echo_large_message() {
     let (shutdown, handles) = RinglineBuilder::new(test_config())

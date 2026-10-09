@@ -329,6 +329,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- io_uring: `ConfigBuilder::sqpoll(true)` works. Ring setup set
+  `IORING_SETUP_COOP_TASKRUN` together with `IORING_SETUP_SQPOLL`, which the
+  kernel refuses with `EINVAL`, so every worker failed to launch with
+  `Error::RingSetup`. Under SQPOLL the ring is now set up without
+  `COOP_TASKRUN` and `DEFER_TASKRUN` (#630).
+
 - io_uring: workers start on Ubuntu's 6.8 kernels (6.8.0-139 and later),
   which reject `IORING_REGISTER_PBUF_RING` with `EINVAL` unless a reserved
   word is set. Registration is tried in the standard form first. Only an

@@ -355,7 +355,6 @@ impl Engine for UringEngine {
 
         let mut builder = IoUring::<squeue::Entry128, cqueue::Entry32>::builder();
         builder.setup_cqsize(cq_entries);
-        builder.setup_coop_taskrun();
         builder.setup_single_issuer();
 
         if config.sqpoll {
@@ -363,8 +362,10 @@ impl Engine for UringEngine {
             if let Some(cpu) = config.sqpoll_cpu {
                 builder.setup_sqpoll_cpu(cpu);
             }
-            // DEFER_TASKRUN is incompatible with SQPOLL (kernel returns EINVAL).
+            // The kernel refuses COOP_TASKRUN and DEFER_TASKRUN with SQPOLL
+            // (EINVAL): the SQ thread, not the submitter, runs task_work.
         } else {
+            builder.setup_coop_taskrun();
             builder.setup_defer_taskrun();
         }
 
