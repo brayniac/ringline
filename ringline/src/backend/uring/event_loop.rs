@@ -1086,7 +1086,15 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 self.driver.recv_starved.swap_remove(i);
                 continue;
             }
-            if self.fallback_eligible(conn_index)
+            // With `recv_incremental`, a ring whose free buffers hold more
+            // than one fallback chunk feeds the multishot faster than the
+            // fallback would, so the connection re-arms instead.
+            let ring_beats_chunk = self.driver.lend_cap.is_some()
+                && u64::from(self.driver.provided_bufs.free())
+                    * u64::from(self.driver.provided_bufs.buffer_size())
+                    > u64::from(self.driver.fallback_chunk);
+            if !ring_beats_chunk
+                && self.fallback_eligible(conn_index)
                 && self.driver.try_submit_fallback_recv(conn_index)
             {
                 self.driver.recv_starved.swap_remove(i);
@@ -1698,9 +1706,22 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // `docs/segmented-recv-design.md`, "Backpressure and ring safety").
             // `complete()` above already counted this bid, so `free()` reflects
             // this delivery.
-            let reserve = self.driver.recv_segment_reserve;
-            let free = self.driver.provided_bufs.free();
-            match crate::recv::occupancy::delivery_decision(free, reserve) {
+            // With a lend cap (`recv_incremental`), the cap decides and
+            // `recv_segment_reserve` is ignored: 64 buffers of an incremental
+            // ring would never clear the default reserve of 64.
+            let decision = if self.driver.lend_cap.is_some() {
+                if self.driver.may_lend() {
+                    crate::recv::occupancy::Delivery::ZeroCopyOk
+                } else {
+                    crate::recv::occupancy::Delivery::ForceCopy
+                }
+            } else {
+                crate::recv::occupancy::delivery_decision(
+                    self.driver.provided_bufs.free(),
+                    self.driver.recv_segment_reserve,
+                )
+            };
+            match decision {
                 crate::recv::occupancy::Delivery::ZeroCopyOk => {
                     // Above the reserve: hold the provided buffer in-place (bid
                     // NOT replenished, no accumulator copy) for a future segment
@@ -1856,9 +1877,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     // a full-remainder copy per chunk while a large response
                     // streams in (O(N·K)).
                     let acc_empty = self.driver.accumulators.is_empty(conn_index);
+                    let lend = acc_empty
+                        && self.driver.pending_recv_bufs[conn_index as usize].is_none()
+                        && self.driver.may_lend();
                     let slot = &mut self.driver.pending_recv_bufs[conn_index as usize];
 
-                    if acc_empty && slot.is_none() {
+                    if lend {
                         *slot = Some(crate::backend::PendingRecvBuf {
                             bid,
                             len: bytes_received,
@@ -10370,6 +10394,70 @@ mod tests {
 
     /// (b) Above the reserve, delivery is still Pinned (zero-copy) as before — the
     /// bid is NOT replenished until consumed.
+    /// Over the lend cap, a plaintext completion is copied into the
+    /// accumulator instead of being lent, and its hold is released.
+    #[test]
+    fn over_the_lend_cap_a_completion_is_copied_not_lent() {
+        let mut el = make_test_loop();
+        let a = accept_connection(&mut el);
+        let b = accept_connection(&mut el);
+        el.driver.lend_cap = Some(1);
+        for (conn, bid, msg) in [(a, 0u16, &b"first"[..]), (b, 1, b"second")] {
+            let (ptr, _) = el.driver.provided_bufs.get_buffer(bid);
+            unsafe { std::ptr::copy_nonoverlapping(msg.as_ptr(), ptr as *mut u8, msg.len()) };
+            let ud = UserData::encode(
+                OpTag::RecvMulti,
+                conn,
+                el.driver.connections.generation(conn),
+            );
+            el.test_dispatch_cqe(ud.raw(), msg.len() as i32, 1 | 2 | ((bid as u32) << 16));
+        }
+        assert!(
+            el.driver.pending_recv_bufs[a as usize].is_some(),
+            "the first is lent"
+        );
+        assert!(
+            el.driver.pending_recv_bufs[b as usize].is_none(),
+            "the second is copied"
+        );
+        assert_eq!(el.driver.accumulators.data(b), b"second");
+        assert_eq!(el.driver.pending_replenish, [1]);
+    }
+
+    /// With a lend cap, the cap decides a segmented delivery and
+    /// `recv_segment_reserve` is ignored: over the cap the bytes are copied
+    /// even though the ring is far above the reserve.
+    #[test]
+    fn with_a_lend_cap_segmented_delivery_follows_the_cap() {
+        let mut el = make_test_loop_with_config(config_with_reserve(0));
+        let conn_index = accept_connection(&mut el);
+        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
+        el.driver.lend_cap = Some(1);
+        deliver_segment(&mut el, conn_index, 0, b"one");
+        deliver_segment(&mut el, conn_index, 1, b"two");
+        let hold = &el.driver.segment_hold[conn_index as usize];
+        assert!(matches!(
+            hold[0],
+            crate::backend::HeldRecvBuf::Pinned { .. }
+        ));
+        assert!(matches!(&hold[1], crate::backend::HeldRecvBuf::Owned(b) if &b[..] == b"two"));
+    }
+
+    /// With a lend cap (`recv_incremental`), a parked connection with a
+    /// partial message re-arms its multishot when the ring's free buffers
+    /// hold more than one fallback chunk, instead of taking the fallback.
+    #[test]
+    fn with_a_lend_cap_a_ring_larger_than_the_chunk_rearms() {
+        let mut el = make_test_loop();
+        let conn_index = park_connection(&mut el);
+        assert!(el.driver.accumulators.append(conn_index, b"part"));
+        el.driver.lend_cap = Some(8);
+        el.driver.fallback_chunk = el.driver.provided_bufs.buffer_size();
+        el.flush_replenish_and_rearm();
+        assert!(!el.driver.recv_fallback_inflight[conn_index as usize]);
+        assert!(!el.driver.recv_starved.contains(&conn_index));
+    }
+
     #[test]
     fn segmented_zero_copy_when_ring_above_reserve_stays_pinned() {
         // reserve 4, ring 16: the first delivery leaves free = 15 > 4 → Pinned.

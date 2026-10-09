@@ -102,6 +102,23 @@ pub(crate) struct PendingRecvBuf {
     pub(crate) ptr: *const u8,
 }
 
+impl Driver {
+    /// Whether a completion's data may be lent (held in place) rather than
+    /// copied: always without a lend cap, and with one while the buffers
+    /// holds keep out of use, this completion's included, are at most half
+    /// the ring. A refusal is counted.
+    pub(crate) fn may_lend(&self) -> bool {
+        match self.lend_cap {
+            None => true,
+            Some(cap) if self.provided_bufs.held() <= cap => true,
+            Some(_) => {
+                metrics::RECV_RING.increment(metrics::recv_ring::LEND_REFUSED);
+                false
+            }
+        }
+    }
+}
+
 /// Whether the worker registers its TCP receive ring as incremental: only
 /// with `recv_incremental` on, the `timestamps` option off, and the kernel
 /// passing the incremental-ring preflight. A failed preflight is counted by
@@ -654,6 +671,11 @@ pub(crate) struct Driver {
     /// provided-ring buffer size: one event-loop pass moves one chunk per
     /// starved connection, so this bounds per-pass fallback throughput.
     pub(crate) fallback_chunk: u32,
+    /// With `recv_incremental` on, the most TCP receive buffers that lends
+    /// may hold: half the ring. A lend is taken only while `held()` is at or
+    /// below it; above it, each lend path copies instead. `None` leaves
+    /// lends uncapped, as without `recv_incremental`.
+    pub(crate) lend_cap: Option<u32>,
     /// Lifetime count of fallback recv submissions on this worker
     /// (reported in the shutdown diag line).
     pub(crate) recv_fallback_count: u64,
@@ -1213,7 +1235,15 @@ impl Driver {
             // the fallback on the premise that the chunk exceeds the ring's
             // capacity, which no geometry here meets (the default 256 × 16 KiB
             // ring holds 4 MiB); #622 step 4b revisits it.
-            fallback_chunk: recv_buffer_size.saturating_mul(4).max(1 << 20),
+            // With `recv_incremental` the chunk is 1 MiB and the arbitration
+            // re-arms when the ring's free bytes exceed it
+            // (`flush_replenish_and_rearm`).
+            fallback_chunk: if config.recv_incremental {
+                1 << 20
+            } else {
+                recv_buffer_size.saturating_mul(4).max(1 << 20)
+            },
+            lend_cap: config.recv_incremental.then_some(recv_ring_size as u32 / 2),
             recv_fallback_count: 0,
             udp_batch_recv_at: std::time::Instant::now(),
             tick_timeout_ts: if config.tick_timeout_us > 0 {

@@ -34,6 +34,8 @@ pub struct ProvidedBufRing {
     incremental: bool,
     /// Per-buffer state, indexed by bid; see `complete` and `release_batch`.
     state: Vec<BufState>,
+    /// Buffers with at least one hold: the count the lend cap compares.
+    held: u32,
 }
 
 /// What the driver knows about one buffer since it was last posted.
@@ -98,6 +100,7 @@ impl ProvidedBufRing {
             outstanding: 0,
             incremental: false,
             state: vec![BufState::default(); ring_size as usize],
+            held: 0,
         };
 
         // Pre-fill the ring with all buffers
@@ -188,6 +191,9 @@ impl ProvidedBufRing {
         let offset = s.written;
         s.written += res;
         s.holds += 1;
+        if s.holds == 1 {
+            self.held += 1;
+        }
         s.exhausted = !self.incremental || !buf_more;
         if self.incremental {
             assert_eq!(
@@ -219,6 +225,9 @@ impl ProvidedBufRing {
             let s = &mut self.state[bid as usize];
             assert!(s.holds > 0, "release of buffer {bid}, which has no hold");
             s.holds -= 1;
+            if s.holds == 0 {
+                self.held -= 1;
+            }
             if s.exhausted && s.holds == 0 {
                 *s = BufState::default();
                 self.outstanding -= 1;
@@ -237,6 +246,17 @@ impl ProvidedBufRing {
     /// incremental.
     pub(crate) fn set_incremental(&mut self) {
         self.incremental = true;
+    }
+
+    /// Buffers with at least one hold: completions whose data a lend still
+    /// holds, plus those whose release is queued for the next flush.
+    pub(crate) fn held(&self) -> u32 {
+        self.held
+    }
+
+    /// Size of each buffer in bytes.
+    pub(crate) fn buffer_size(&self) -> u32 {
+        self.buf_size
     }
 
     /// Buffers currently available in the ring for the kernel to select.
@@ -435,6 +455,21 @@ mod tests {
         assert_eq!(ring.free(), 3);
         ring.release_batch(&[0]);
         assert_eq!(ring.free(), 4);
+    }
+
+    /// `held()` counts buffers with any hold once, however many holds.
+    #[test]
+    fn held_counts_each_buffer_once() {
+        let mut ring = ProvidedBufRing::new(0, 4, 100).expect("ring");
+        ring.incremental = true;
+        ring.complete(0, 10, true);
+        ring.complete(0, 10, true);
+        ring.complete(1, 10, true);
+        assert_eq!(ring.held(), 2);
+        ring.release_batch(&[0]);
+        assert_eq!(ring.held(), 2, "buffer 0 still has a hold");
+        ring.release_batch(&[0, 1]);
+        assert_eq!(ring.held(), 0);
     }
 
     #[test]

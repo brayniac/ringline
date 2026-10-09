@@ -25,7 +25,7 @@ pub static POOL: ShardedCounterGroup = ShardedCounterGroup::new(8);
 
 #[metric(
     name = "ringline/recv_ring",
-    description = "TCP receive ring kind selected by each worker at startup"
+    description = "TCP receive ring: the kind each worker selected, and lends refused"
 )]
 pub static RECV_RING: ShardedCounterGroup = ShardedCounterGroup::new(recv_ring::COUNT);
 
@@ -278,14 +278,18 @@ pub mod ring {
     pub const SHUTDOWN_STALE: usize = 5;
 }
 
-/// Slot indices for `RECV_RING`: one count per worker, by the TCP receive
-/// ring it registered (`ConfigBuilder::recv_incremental`).
+/// Slot indices for `RECV_RING`: one count per worker by the TCP receive
+/// ring it registered (`ConfigBuilder::recv_incremental`), and the lends the
+/// lend cap refused.
 pub mod recv_ring {
     /// An incremental ring (`IOU_PBUF_RING_INC`).
     pub const INCREMENTAL: usize = 0;
     /// A plain ring.
     pub const PLAIN: usize = 1;
-    pub const COUNT: usize = 2;
+    /// Completions copied instead of lent because the buffers lends hold
+    /// reached the lend cap, half the ring (`recv_incremental` only).
+    pub const LEND_REFUSED: usize = 2;
+    pub const COUNT: usize = 3;
 }
 
 /// Slot indices for `RECV_PREFLIGHT_FAILED`: the step of the

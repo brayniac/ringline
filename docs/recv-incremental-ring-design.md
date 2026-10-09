@@ -776,10 +776,13 @@ buffers held by `with_bytes` views, values copied by the
    `false`), in two changes. 4a: ring-kind selection with the behaviour
    preflight (about 0.1 ms per worker on Linux 6.12, arm64), a plain ring
    for a worker with `timestamps(true)`, `MADV_NOHUGEPAGE`, the geometry
-   per ring kind, the memlock preflight and the ring-kind metrics. 4b: the
-   per-group lend cap and its copy paths, `recv_segment_reserve` ignored
-   under INC, the fallback arbitration, and the per-group lend and
-   `ENOBUFS` metrics.
+   per ring kind, the memlock preflight and the ring-kind metrics. 4b-1:
+   the lend cap with the copy paths that exist (`pending_recv_bufs` into
+   the accumulator, segments and Mode A into `HeldRecvBuf::Owned`),
+   `recv_segment_reserve` ignored, the 1 MiB fallback chunk with the
+   free-space re-arm, and the lends-refused count; all only with
+   `recv_incremental`. 4b-2: the owned `recv_hold` entry for recv-forward
+   and direct echo, and the per-group gauges.
 5. The large group, behind `recv_large_group` (default `false`): its bgid
    and validation, the arm taking the group per call,
    `OpTag::RecvMultiLarge` and the `SendRecvBuf` group bit, `group` in

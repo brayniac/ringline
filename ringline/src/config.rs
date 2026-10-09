@@ -1028,17 +1028,14 @@ impl ConfigBuilder {
     /// backend. With the `timestamps` feature and `timestamps(true)`, every
     /// worker uses a plain ring.
     ///
-    /// The default geometry has these effects:
-    /// - The incremental ring's 64 buffers never leave more free than the
-    ///   default `recv_segment_reserve` (64), so every segmented delivery
-    ///   (`with_segments`, `forward_to`) is copied.
-    /// - With `prefault_buffers(true)` a plain ring makes 256 MiB per worker
-    ///   resident, against 4 MiB for the 256 × 16 KiB default.
-    /// - With the incremental geometry, the fallback receive's chunks grow
-    ///   from 1 MiB to 4 MiB of virtual memory each.
-    /// - Lends into incremental buffers are not capped yet, so about 64
-    ///   connections holding unread data can keep every buffer out of use
-    ///   and stall receives on the worker.
+    /// With this on, data is lent (held in place for a task, a segment or a
+    /// forward) only while lends hold at most half the TCP ring's buffers;
+    /// above that, each path copies, and `recv_segment_reserve` is ignored.
+    /// Recv-forward (`recv_forward`) and direct-echo lends are not capped yet.
+    /// The fallback receive reads 1 MiB chunks, and a parked connection
+    /// re-arms its multishot instead when the ring's free buffers hold more.
+    /// With `prefault_buffers(true)` a plain ring makes 256 MiB per worker
+    /// resident, against 4 MiB for the 256 × 16 KiB default.
     ///
     /// The ring kind is an io_uring choice; the mio backend uses its own
     /// receive buffers. **Default: false**, which keeps the plain ring
