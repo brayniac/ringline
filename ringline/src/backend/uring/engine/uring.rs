@@ -924,6 +924,16 @@ impl Sqe {
             Op::RecvMulti { fd, buf_group } => {
                 on!(fd, |t| opcode::RecvMulti::new(t, buf_group).build())
             }
+            Op::RecvBundle { fd, buf_group, len } => on!(fd, |t| {
+                let mut e = opcode::RecvBundle::new(t, buf_group).build();
+                // PROBE: io-uring 0.7.12's `RecvBundle` has no `len`; it is
+                // the u32 at byte 24 of the `#[repr(C)]` 64-byte SQE.
+                unsafe {
+                    let p = (&mut e as *mut Entry).cast::<u8>().add(24).cast::<u32>();
+                    p.write_unaligned(len);
+                }
+                e
+            }),
             Op::RecvSelect { fd, buf_group } => on!(fd, |t| {
                 opcode::Recv::new(t, std::ptr::null_mut(), 0)
                     .buf_group(buf_group)

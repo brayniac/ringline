@@ -47,6 +47,14 @@ pub(crate) enum Op {
         fd: Fd,
         buf_group: u16,
     },
+    /// One-shot bundle recv (`IORING_RECVSEND_BUNDLE`): selects one or
+    /// more buffers from `buf_group`, receiving at most `len` bytes (0: no
+    /// limit). Linux 6.10+.
+    RecvBundle {
+        fd: Fd,
+        buf_group: u16,
+        len: u32,
+    },
     /// Multishot recvmsg selecting from `buf_group`, laid out by `msg`.
     RecvMsgMulti {
         fd: Fd,

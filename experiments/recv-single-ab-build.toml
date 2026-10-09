@@ -1,0 +1,61 @@
+# Build the bench binaries for the one-shot recv A/B (#638): bench-server
+# from before (multishot for every connection) and after (one-shot for
+# direct-echo connections), io_uring only; one bench-client from before, so
+# only the server under test varies. The bench server's echo is
+# `run_direct_echo`, the path that changes. No target-cpu=native.
+name = "ringline recv-single A/B build (before={before_ref} after={after_ref})"
+
+[params]
+before_ref  = "fix/638-inflight-hold"
+before_repo = "https://github.com/brayniac/ringline"
+after_ref   = "feat/recv-single-arm"
+after_repo  = "https://github.com/brayniac/ringline"
+
+[[jobs]]
+name = "build"
+tags = ["validation"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+shape = "z4.c"
+image = "spool/images/debian-13-ci-20260912.1@golden"
+slots = 1
+memory_gib = 4
+ports = 0
+gpu = false
+payload_timeout = 3600
+artifacts = ["/home/anvil/bench-bins.tgz", "/home/anvil/build.log"]
+upload = true
+payload = '''
+set -uo pipefail
+cd /home/anvil
+{
+  cat /etc/anvil-instance.json
+  mkdir -p out
+  git clone -q {before_repo} before-src && git -C before-src checkout -q {before_ref}
+  git clone -q {after_repo} after-src && git -C after-src checkout -q {after_ref}
+  for src in before-src after-src; do
+    label=${src%-src}
+    ( cd $src
+      echo "== $label: $(git log --oneline -1)"
+      cargo build --release --locked -p ringline-bench --bin bench-server --bin bench-client
+      cp target/release/bench-server ../out/bench-server-$label-uring
+      cp target/release/bench-client ../out/bench-client-$label-uring
+    ) || exit 1
+  done
+  ( cd out && sha256sum * )
+  for label in before after; do
+    got=$(./out/bench-server-$label-uring --print-backend)
+    [ "$got" = io_uring ] || { echo "BACKEND MISMATCH: $label built as $got"; exit 1; }
+    echo "backend ok: $label -> $got"
+  done
+  # Two arms that are secretly the same binary report a dead heat.
+  if cmp -s out/bench-server-before-uring out/bench-server-after-uring; then
+    echo "IDENTICAL SERVERS: before and after are the same binary"; exit 1
+  fi
+  tar czf bench-bins.tgz out
+} 2>&1 | tee /home/anvil/build.log
+rc=${PIPESTATUS[0]}
+echo "build_status=$rc" | tee -a /home/anvil/build.log
+exit 0
+'''

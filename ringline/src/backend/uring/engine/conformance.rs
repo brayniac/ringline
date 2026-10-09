@@ -552,3 +552,62 @@ fn inc_recvmsg_multishot_writes_each_message_at_its_offset() {
     }
     e.unregister_buf_ring(8).expect("unregister");
 }
+
+/// Probe, not a contract: what one one-shot bundle recv takes from a plain
+/// or incremental ring of 16-byte buffers with 200 bytes queued, for several
+/// `len` limits, and what a second arm takes after it. Prints; asserts
+/// nothing.
+#[test]
+#[ignore = "probe"]
+fn probe_one_shot_bundle_recv() {
+    for kind in [RingKind::Plain, RingKind::Incremental] {
+        for len in [16u32, 17, 31, 63, 64, 65, 80, 96, 128, 160, 199, 4096] {
+            let ring = ProvidedBufRing::new(8, 32, 16).expect("ring");
+            let mut e = engine();
+            if kind == RingKind::Incremental && !incremental(&e) {
+                continue;
+            }
+            e.register_buf_ring(&ring, kind).expect("register");
+            let (mut client, server) = pair();
+            let payload: Vec<u8> = (0..200u32).map(|i| i as u8).collect();
+            client.write_all(&payload).expect("write");
+            std::thread::sleep(Duration::from_millis(20));
+            for arm in 0..2 {
+                let sqe = Sqe::new(
+                    Op::RecvBundle {
+                        fd: Fd::Raw(server.as_raw_fd()),
+                        buf_group: 8,
+                        len,
+                    },
+                    arm,
+                );
+                // Safety: a buffer-select recv references no caller memory.
+                unsafe { e.push(&sqe) }.expect("push");
+                let cqes = reap(&mut e, 2);
+                for c in &cqes {
+                    let (res, bid, buf_more, more, nonempty) = data(*c);
+                    // First byte of each buffer from `bid` on, to see which
+                    // buffers the bundle filled.
+                    let firsts: Vec<u8> = match bid {
+                        Some(b) if res > 0 => (0..(res as u32).div_ceil(16))
+                            .map(|k| {
+                                let (ptr, _) = ring.get_buffer(b + k as u16);
+                                unsafe { *ptr }
+                            })
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    eprintln!(
+                        "PROBE {kind:?} len={len} arm={arm}: res={res} bid={bid:?} \
+                         buf_more={buf_more} more={more} sock_nonempty={nonempty} \
+                         first_bytes={firsts:?}"
+                    );
+                }
+                if cqes.is_empty() {
+                    eprintln!("PROBE {kind:?} len={len} arm={arm}: no completion");
+                }
+            }
+            e.unregister_buf_ring(8).expect("unregister");
+        }
+    }
+}
