@@ -10538,6 +10538,28 @@ mod tests {
         assert!(el.driver.owned_recv.iter().all(Option::is_none));
     }
 
+    /// Owned copies gathered into one coalesced send are freed when it
+    /// completes; the coalesced path is recv-forward's normal release.
+    #[test]
+    fn a_coalesced_owned_copy_is_freed_by_its_send() {
+        let mut el = make_test_loop();
+        let conn = accept_connection(&mut el);
+        el.driver.connections.get_mut(conn).unwrap().direct_echo = true;
+        el.driver.lend_cap = Some(0);
+        deliver(&mut el, conn, 2, b"first");
+        deliver(&mut el, conn, 3, b"second");
+        assert_eq!(el.driver.owned_recv.iter().flatten().count(), 2);
+        el.flush_direct_echoes();
+        let bids = el.driver.send_slab.recv_forward_bids(0).to_vec();
+        assert_eq!(bids.len(), 2);
+        assert!(bids.iter().all(|&b| el.driver.is_owned_recv(b)));
+        let ud = UserData::encode(OpTag::SendRecvBufsCoalesced, conn, 0);
+        el.test_dispatch_cqe(ud.raw(), 11, 0);
+        assert!(!el.driver.send_slab.in_use(0));
+        el.driver.release_pending();
+        assert!(el.driver.owned_recv.iter().all(Option::is_none));
+    }
+
     /// A recv-forward owned copy is freed when its connection closes.
     #[test]
     fn a_recv_forward_owned_copy_is_freed_on_close() {
