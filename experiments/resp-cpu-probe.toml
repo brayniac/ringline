@@ -1,0 +1,178 @@
+# Where does the server's CPU go at pipeline depth 1? One cell
+# (64 B values, depth 1, 64 connections) per arm, arms in sequence on the
+# same VM pair. During each arm's measured window the server records
+# /proc/stat and /proc/softirqs deltas and per-thread CPU of the server
+# process (which includes any io-wq `iou-wrk` threads).
+name = "ringline resp cpu probe"
+
+[params]
+bins_artifact = "REPLACE-WITH-ARTIFACT-ID"
+image         = "spool/images/debian-13-base-20260912.1@golden"
+server_ip     = "172.31.0.1"
+client_ip     = "172.31.0.2"
+port          = "6379"
+arms          = "ringline ringline-ondemand tokio-pc"
+
+[[jobs]]
+name = "server"
+tags = ["z1.baremetal"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "start"
+shape = "z1.c"
+image = "{image}"
+gpu = false
+data_address = "{server_ip}/24"
+boot_timeout = 600
+
+[[jobs.steps]]
+type = "barrier"
+name = "vms-up"
+timeout = 1800
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "exec"
+upload = true
+artifacts = ["/home/anvil/probe.tgz"]
+payload_timeout = 3000
+inputs = [{ artifact = "{bins_artifact}", name = "bins.tgz", dest = "/home/anvil" }]
+payload = '''
+set -uo pipefail
+cd /home/anvil && tar xzf bins.tgz && chmod +x out/*
+sudo sysctl -w net.core.somaxconn=65535 net.core.rmem_max=134217728 net.core.wmem_max=134217728 >/dev/null
+ulimit -n 1048576
+mkdir -p probe
+nproc; uname -r
+conns() { ss -Htn state established "( sport = :{port} )" | wc -l; }
+threads() { for t in /proc/$1/task/*; do echo "$(basename $t) $(cat $t/comm) $(awk '{print $14, $15, $39}' $t/stat)"; done; }
+for arm in {arms}; do
+  case $arm in
+    ringline)          args="--runtime ringline" ;;
+    ringline-ondemand) args="--runtime ringline --recv-on-demand" ;;
+    tokio-pc)          args="--runtime tokio-pc" ;;
+  esac
+  ./out/resp-server $args --addr {server_ip}:{port} --workers 8 > probe/$arm.server.log 2>&1 &
+  pid=$!
+  # wait for the client's 64 connections, then for its 10 s warmup
+  for i in $(seq 1 600); do [ "$(conns)" -ge 64 ] && break; sleep 0.5; done
+  sleep 12
+  cat /proc/stat > probe/$arm.stat0; cat /proc/softirqs > probe/$arm.softirqs0; threads $pid > probe/$arm.threads0
+  sleep 15
+  cat /proc/stat > probe/$arm.stat1; cat /proc/softirqs > probe/$arm.softirqs1; threads $pid > probe/$arm.threads1
+  echo "== $arm conns=$(conns)"
+  for i in $(seq 1 600); do [ "$(conns)" -eq 0 ] && break; sleep 0.5; done
+  kill $pid; wait $pid 2>/dev/null
+  sleep 2
+done
+# summarise: per arm, /proc/stat deltas in cores, softirq deltas, per-thread CPU
+python3 - <<'PY'
+import os
+hz=os.sysconf("SC_CLK_TCK"); W=15.0
+for arm in "{arms}".split():
+    def stat(f):
+        for l in open(f"probe/{arm}.{f}"):
+            if l.startswith("cpu "): return list(map(int,l.split()[1:9]))
+    a,b=stat("stat0"),stat("stat1")
+    names=["user","nice","system","idle","iowait","irq","softirq","steal"]
+    d={n:(y-x)/hz/W for n,x,y in zip(names,a,b)}
+    print(f"== {arm}: cores " + " ".join(f"{n}={d[n]:.2f}" for n in names if n!="idle"))
+    def sirq(f):
+        out={}
+        for l in open(f"probe/{arm}.{f}").readlines()[1:]:
+            p=l.split(); out[p[0].rstrip(":")]=sum(map(int,p[1:]))
+        return out
+    s0,s1=sirq("softirqs0"),sirq("softirqs1")
+    print("   softirqs/s " + " ".join(f"{k}={(s1[k]-s0[k])/W:.0f}" for k in s1 if s1[k]-s0[k]>0))
+    def th(f):
+        out={}
+        for l in open(f"probe/{arm}.{f}"):
+            p=l.split(); out[p[0]]=(p[1],int(p[2]),int(p[3]),p[4])
+        return out
+    t0,t1=th("threads0"),th("threads1")
+    rows=[]
+    for tid,(comm,u,s,cpu) in t1.items():
+        u0,s0_=t0.get(tid,(comm,0,0,cpu))[1:3]
+        rows.append(((u-u0)/hz/W,(s-s0_)/hz/W,comm,tid,cpu))
+    rows.sort(key=lambda r:-(r[0]+r[1]))
+    tot_u=sum(r[0] for r in rows); tot_s=sum(r[1] for r in rows)
+    print(f"   process threads={len(rows)} user={tot_u:.2f} system={tot_s:.2f} cores")
+    for r in rows[:12]:
+        print(f"     {r[2]:<16} tid={r[3]} cpu={r[4]} user={r[0]:.2f} sys={r[1]:.2f}")
+PY
+tar czf /home/anvil/probe.tgz probe
+exit 0
+'''
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "stop"
+upload = true
+
+[[jobs]]
+name = "client"
+tags = ["z2.baremetal"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "start"
+shape = "z2.c"
+image = "{image}"
+gpu = false
+data_address = "{client_ip}/24"
+boot_timeout = 600
+
+[[jobs.steps]]
+type = "barrier"
+name = "vms-up"
+timeout = 1800
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "exec"
+payload_timeout = 3000
+inputs = [{ artifact = "{bins_artifact}", name = "bins.tgz", dest = "/home/anvil" }]
+payload = '''
+set -uo pipefail
+cd /home/anvil && tar xzf bins.tgz && chmod +x out/*
+ulimit -n 1048576
+cat > cell.toml <<CFG
+[general]
+duration = "30s"
+warmup = "10s"
+threads = 16
+[target]
+endpoints = ["{server_ip}:{port}"]
+protocol = "resp"
+[connection]
+connections = 64
+pipeline_depth = 1
+connect_timeout = "10s"
+request_timeout = "5s"
+[workload]
+backfill_on_miss = true
+[workload.keyspace]
+length = 16
+count = 100000
+distribution = "uniform"
+[workload.commands]
+get = 80
+set = 20
+[workload.values]
+length = 64
+[admin]
+format = "json"
+CFG
+for arm in {arms}; do
+  for i in $(seq 1 300); do (exec 3<>/dev/tcp/{server_ip}/{port}) 2>/dev/null && { exec 3>&-; break; }; sleep 1; done
+  ./out/cachecannon cell.toml > $arm.json 2> $arm.log
+  echo "== $arm"; grep '"type":"result"' $arm.json | cut -c1-260
+  sleep 8
+done
+exit 0
+'''
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "stop"
