@@ -144,24 +144,34 @@ after 6.12.63, the release the conformance tests passed on, concern
 non-pollable files, bundles, zero-length transfers and multishot `RECVMSG`
 with little space left in a buffer. Instead of a version check, each
 worker checks the behaviour the driver relies on, on the running kernel,
-before it registers the small group with `IOU_PBUF_RING_INC`:
+before it registers the small group with `IOU_PBUF_RING_INC`. It runs on
+the worker's own ring, set up with the production flags, before anything
+else is armed, and uses an `AF_UNIX` stream socketpair, which needs no
+network configuration:
 
 1. Register a one-entry INC ring with a small buffer at the reserved bgid
    65535, the one the `incremental_buffers` probe uses.
-2. On a loopback TCP pair, arm a multishot `RECV` on it. Two writes must
-   complete at offsets 0 and the first's length, both with `F_BUF_MORE`,
-   and the ring entry must advance in place.
-3. A write that fills the rest must complete with `F_BUF_MORE` clear, and
-   the next write must end the arm with `-ENOBUFS`.
-4. After the buffer is posted again and partly filled, a half-close must
-   end the arm with `res` 0 and no `F_BUFFER`, leaving the entry at the
-   used length.
+2. Arm a multishot `RECV` on one end. Write, reap, write, reap: the two
+   completions must land at offsets 0 and the first's length, both with
+   `F_BUF_MORE`, and the ring entry must advance in place.
+3. Write more than the space left. The completion must deliver exactly the
+   space left with `F_BUF_MORE` clear, and the excess must end the arm with
+   `-ENOBUFS` without `F_MORE`.
+4. Post the buffer again and re-arm. The excess must complete at offset 0
+   with `F_BUF_MORE`; then a half-close must end the arm with `res` 0, no
+   `F_BUFFER` and no `F_MORE`, leaving the entry at the used length.
+5. Tear down before the event loop starts: cancel the arm if it is still
+   live and reap its last completion, unregister the group, and close the
+   sockets, so no preflight completion reaches the event loop.
 
-A registration refused with `EINVAL` (no INC), or any step that does not
-match, selects plain rings, and the worker records which step failed in a
-metric. Any other error fails startup as above. The preflight does not
-cover ordering under CQ overflow or SQPOLL; the conformance tests checked
-those on 6.12.63 and 7.1. Its time per worker is measured in step 4.
+Each step waits at most 1 s for its completion; a step that times out does
+not match. A registration refused with `EINVAL` (no INC), a step that does
+not match, or a failure to create the socketpair selects plain rings, and
+the worker records which step failed in a metric. Any other registration
+error fails startup as above. The preflight's ring entry is one page,
+which the memlock preflight counts on 6.14+. The preflight does not cover
+ordering under CQ overflow or SQPOLL; the conformance tests checked those
+on 6.12.63 and 7.1. Its time per worker is measured in step 4.
 
 Ubuntu's 6.8 kernels from 6.8.0-139 reject every provided-ring registration
 whose reserved words are zero, the form other kernels require, and accept
@@ -671,16 +681,21 @@ receive queue, and TCP closes the window until the worker re-arms.
   `recv_large_demote_quiet(Duration)` the demotion quiet period, default
   1 s. `build()` rejects a large-group bgid equal to the TCP bgid
   (default 0), or the UDP bgid (default 1) when UDP is in use.
+- With INC on and the `timestamps` feature built in, timestamped
+  connections get their own plain ring. Their multishot `RECVMSG` works on
+  an INC ring (conformance tests), but before the 6.12.y change that lets a
+  ring require a minimum length left in a buffer it can fail when the space
+  left is smaller than the message header; that failure is not reproduced
+  here. The ring's geometry is the plain small group's, its bgid
+  (`recv_timestamp_buffer_bgid`, default 3) is validated against the TCP,
+  UDP and large-group bgids, and its entries count in the memlock
+  preflight.
 
 ## Unchanged
 
 - The UDP ring (`udp_recv_buffer`, its own bgid) stays plain.
-- TLS (both engines) copies out of the ring and takes no hold.
-- The `timestamps` feature's multishot `RECVMSG` works on an INC ring
-  (conformance tests), but before the 6.12.y change that lets a ring
-  require a minimum length left in a buffer, it can fail when the space
-  left is smaller than the message header. Not reproduced here. With INC
-  on, timestamped connections get their own plain ring.
+- TLS (both engines) copies out of the ring and releases its completion's
+  hold in the handler.
 - mio. If the ring emulator (#621) lands, it implements this state machine.
 
 ## Metrics

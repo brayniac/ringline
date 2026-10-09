@@ -8740,6 +8740,67 @@ mod tests {
             el.driver.provided_bufs.ring_entries(),
             "a partly used buffer stays in the ring"
         );
+        // Both completions' bytes are in the accumulator, and each released
+        // its hold once.
+        assert!(el.driver.pending_recv_bufs[conn_index as usize].is_none());
+        assert_eq!(el.driver.pending_replenish, [bid, bid]);
+        let r: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
+        el.driver.provided_bufs.release_batch(&r);
+    }
+
+    /// A partial direct-echo send resumes from the original data's offset in
+    /// its buffer plus the bytes sent, not from the buffer's base. The
+    /// remainder is parked by a forced push failure so its SQE can be read.
+    #[test]
+    fn handle_send_recv_buf_resumes_at_the_data_offset() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let ci = conn_index as usize;
+        let bid: u16 = 0;
+        el.driver.send_recv_buf_offs[ci] = 7;
+        el.driver.send_recv_buf_original_lens[ci] = 100;
+        el.driver.send_recv_buf_remaining[ci] = 100;
+        el.driver.send_queues[ci].in_flight = true;
+        el.driver.ring.force_push_failures(1);
+        let ud = UserData::encode(OpTag::SendRecvBuf, conn_index, bid as u32);
+        el.test_dispatch_cqe(ud.raw(), 60, 0);
+        let crate::backend::uring::sqe::Op::Send { buf, len, .. } =
+            el.driver.send_queues[ci].queue[0].entry.op
+        else {
+            panic!("the parked remainder is a plain send");
+        };
+        assert_eq!(buf, el.driver.provided_bufs.data_ptr(bid, 67));
+        assert_eq!(len, 40);
+    }
+
+    /// Pushing a direct-echo send records its data's offset in the buffer,
+    /// which a partial send resumes from.
+    #[test]
+    fn a_pushed_direct_echo_send_records_its_offset() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let bid: u16 = 1;
+        let ud = UserData::encode(OpTag::SendRecvBuf, conn_index, bid as u32);
+        let entry = crate::backend::uring::sqe::Sqe::stream_send(
+            conn_index,
+            el.driver.provided_bufs.data_ptr(bid, 5),
+            10,
+            ud.raw(),
+        );
+        el.driver.submit_or_queue_send(
+            conn_index,
+            crate::handler::BuiltSend {
+                entry,
+                pool_slot: u16::MAX,
+                slab_idx: u16::MAX,
+                total_len: 10,
+            },
+        );
+        assert_eq!(el.driver.send_recv_buf_offs[conn_index as usize], 5);
+        assert_eq!(
+            el.driver.send_recv_buf_original_lens[conn_index as usize],
+            10
+        );
     }
 
     /// `settle_forward_end` reads a held buffer at its offset.
