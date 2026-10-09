@@ -121,6 +121,91 @@ impl Driver {
     }
 }
 
+impl Driver {
+    /// Whether `bid` names an owned copy (`owned_recv`) rather than a
+    /// provided-ring buffer.
+    pub(crate) fn is_owned_recv(&self, bid: u16) -> bool {
+        u32::from(bid) >= self.provided_bufs.ring_entries()
+    }
+
+    /// Copy `data` into an owned buffer for a `recv_hold` entry, and return
+    /// the entry's bid and the copy's address. At most `ring_entries()`
+    /// copies exist, each at most one completion, so owned copies hold at
+    /// most one more ring's worth of bytes. `None` when all are in use; the
+    /// caller then lends the provided buffer, so a peer that sends without
+    /// reading drains the ring and meets `ENOBUFS` backpressure.
+    pub(crate) fn own_recv_copy(&mut self, data: &[u8]) -> Option<(u16, *const u8)> {
+        let first = self.provided_bufs.ring_entries() as usize;
+        let index = match self.owned_recv_free.pop() {
+            Some(i) => i as usize,
+            None if self.owned_recv.len() < first
+                && first + self.owned_recv.len() < u16::MAX as usize =>
+            {
+                self.owned_recv.push(None);
+                self.owned_recv.len() - 1
+            }
+            None => return None,
+        };
+        let copy: Box<[u8]> = data.into();
+        let ptr = copy.as_ptr();
+        self.owned_recv[index] = Some(copy);
+        Some(((first + index) as u16, ptr))
+    }
+
+    /// Release every queued bid: owned copies are freed, and provided-ring
+    /// buffers released through `ProvidedBufRing::release_batch`.
+    ///
+    /// # Panics
+    /// If an owned copy is released twice, or a ring buffer has no hold.
+    pub(crate) fn release_pending(&mut self) {
+        let mut bids = std::mem::take(&mut self.pending_replenish);
+        let ring = self.provided_bufs.ring_entries();
+        if bids.iter().any(|&b| u32::from(b) >= ring) {
+            bids.retain(|&b| {
+                if u32::from(b) < ring {
+                    return true;
+                }
+                let index = b as usize - ring as usize;
+                self.owned_recv[index]
+                    .take()
+                    .unwrap_or_else(|| panic!("owned receive copy {b} released twice"));
+                self.owned_recv_free.push(index as u16);
+                false
+            });
+        }
+        self.provided_bufs.release_batch(&bids);
+        bids.clear();
+        self.pending_replenish = bids;
+    }
+
+    /// Length of the memory a `recv_hold` entry's bid names: an owned copy's
+    /// length, or a provided buffer's size.
+    fn recv_data_len(&self, bid: u16) -> usize {
+        if self.is_owned_recv(bid) {
+            let index = bid as usize - self.provided_bufs.ring_entries() as usize;
+            self.owned_recv[index].as_ref().map_or(0, |c| c.len())
+        } else {
+            self.provided_bufs.buffer_size() as usize
+        }
+    }
+
+    /// Address of byte `off` of the data a `recv_hold` entry's bid names: a
+    /// provided-ring buffer or an owned copy.
+    pub(crate) fn recv_data_ptr(&self, bid: u16, off: u32) -> *const u8 {
+        if self.is_owned_recv(bid) {
+            let index = bid as usize - self.provided_bufs.ring_entries() as usize;
+            let copy = self.owned_recv[index]
+                .as_ref()
+                .expect("a live recv_hold entry's owned copy");
+            debug_assert!(off as usize <= copy.len());
+            // Safety: `off` is within the copy.
+            unsafe { copy.as_ptr().add(off as usize) }
+        } else {
+            self.provided_bufs.data_ptr(bid, off)
+        }
+    }
+}
+
 /// Whether the worker registers its TCP receive ring as incremental: only
 /// with `recv_incremental` on, the `timestamps` option off, and the kernel
 /// passing the incremental-ring preflight. A failed preflight is counted by
@@ -361,7 +446,9 @@ pub(crate) struct Driver {
     /// replenished) instead of copied into the accumulator, then forwarded back
     /// in one coalesced `sendmsg` via `forward_held`. Backpressure is natural:
     /// unreplenished bids deplete the provided-buffer ring (ENOBUFS) until a
-    /// forward completes and replenishes them.
+    /// forward completes and replenishes them. Above the lend cap an entry is
+    /// an owned copy instead (`own_recv_copy`), at most `ring_entries()` of
+    /// them per worker; past that, entries hold ring buffers again.
     /// `recv_hold` is also the staging area for direct-echo connections, which
     /// gather it the same way from the CQE handler (see `flush_direct_echo`).
     pub(crate) recv_hold: Vec<std::collections::VecDeque<PendingRecvBuf>>,
@@ -679,6 +766,14 @@ pub(crate) struct Driver {
     /// while `held()` is at or below it; above it, each lend path copies
     /// instead. `None` leaves lends uncapped, as without `recv_incremental`.
     pub(crate) lend_cap: Option<u32>,
+    /// Owned copies standing in `recv_hold` entries (recv-forward, direct
+    /// echo) for completions the lend cap refused. An entry's bid is
+    /// `ring_entries() + index`, above every provided-ring bid, so the
+    /// existing release paths push it to `pending_replenish` unchanged and
+    /// `release_pending` frees it here instead of releasing a ring buffer.
+    /// `None` is a free index (`owned_recv_free`).
+    pub(crate) owned_recv: Vec<Option<Box<[u8]>>>,
+    pub(crate) owned_recv_free: Vec<u16>,
     /// Lifetime count of fallback recv submissions on this worker
     /// (reported in the shutdown diag line).
     pub(crate) recv_fallback_count: u64,
@@ -1246,6 +1341,8 @@ impl Driver {
                 recv_buffer_size.saturating_mul(4).max(1 << 20)
             },
             lend_cap: config.recv_incremental.then_some(recv_ring_size as u32 / 2),
+            owned_recv: Vec::new(),
+            owned_recv_free: Vec::new(),
             recv_fallback_count: 0,
             udp_batch_recv_at: std::time::Instant::now(),
             tick_timeout_ts: if config.tick_timeout_us > 0 {
@@ -1925,8 +2022,9 @@ impl Driver {
         } else {
             return;
         }
-        // Replenish any held (not-yet-forwarded) zero-copy recv buffers so their
-        // bids aren't leaked, and clear the opt-in flag for slot reuse. An
+        // Release every held (not-yet-forwarded) entry, ring buffer or owned
+        // copy, so its bid is not leaked, and clear the opt-in flag for slot
+        // reuse. An
         // in-flight forward's bids live in its slab entry (already drained from
         // recv_hold) and are replenished by its own completion handler.
         // Direct-echo connections stage in the same hold, so this drains
@@ -2146,8 +2244,8 @@ impl Driver {
         out
     }
 
-    /// Copy `len` bytes out of provided buffer `bid`, then return the bid to
-    /// the ring. `None` for an empty buffer, which carries no bytes and would
+    /// Copy `len` bytes from `ptr`, the data of the buffer `bid` names (a
+    /// ring buffer or an owned copy), then release the bid. `None` for an empty buffer, which carries no bytes and would
     /// only add an empty chunk to the stream.
     ///
     /// Copy first, replenish second, nothing in between — a bid handed back
@@ -2808,7 +2906,8 @@ impl Driver {
             ud.raw(),
         );
         // Infallible: under SQ pressure the echo is parked at the queue head
-        // and retried, holding its provided buffer exactly as a queued echo
+        // and retried, holding the buffer its bid names (a ring buffer or an
+        // owned copy) exactly as a queued echo
         // does; the bid is replenished by its completion.
         self.submit_or_queue_send(
             conn_index,
@@ -2875,11 +2974,12 @@ impl Driver {
         let crate::backend::uring::sqe::Op::Send { buf, .. } = built.entry.op else {
             unreachable!("a SendRecvBuf is a plain send");
         };
-        let (base, size) = self.provided_bufs.get_buffer(ud.payload() as u16);
+        let bid = ud.payload() as u16;
+        let base = self.recv_data_ptr(bid, 0);
         let off = (buf as usize).wrapping_sub(base as usize);
         debug_assert!(
-            buf >= base && off < size as usize,
-            "send outside its buffer"
+            buf >= base && off < self.recv_data_len(bid),
+            "send outside its data"
         );
         self.send_recv_buf_offs[ci] = off as u32;
     }
@@ -2935,8 +3035,8 @@ impl Driver {
     /// they were carrying.
     ///
     /// A queued `SendRecvBuf` entry (recv-buffer forward / direct echo) owns
-    /// neither a pool slot nor a slab entry; it owns the provided recv buffer
-    /// whose bid is the SQE's payload. No CQE will ever replenish it, so the
+    /// neither a pool slot nor a slab entry; it owns the buffer whose bid is
+    /// the SQE's payload (a ring buffer or an owned copy). No CQE will ever replenish it, so the
     /// bid is recovered from the entry's user_data here, exactly as the
     /// completion handler would have done.
     ///

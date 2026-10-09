@@ -243,7 +243,8 @@ The rules:
    copy, TLS, recv sinks, `ForceCopy`, timestamps, the stale-CQE early
    returns) in the completion handler, a lend path when it is done with
    the bytes. `flush_replenish_and_rearm` releases the pushed bids
-   (`ProvidedBufRing::release_batch`).
+   (`Driver::release_pending`, which frees owned copies and passes ring
+   bids to `ProvidedBufRing::release_batch`).
 5. On a plain ring every completion exhausts its buffer, at offset 0. One
    code path serves both ring kinds.
 
@@ -612,8 +613,17 @@ promoted, so its later lends pin large-group buffers.
   - `pending_recv_bufs`: into the accumulator;
   - segments and Mode A: into `HeldRecvBuf::Owned`, as the `ForceCopy`
     decision does;
-  - recv-forward and direct echo, which deliver only from `recv_hold`: into a
-    new owned variant of the `recv_hold` entry (a `SendCopyPool` slot).
+  - recv-forward and direct echo, which deliver only from `recv_hold`: into an
+    owned heap copy (`Driver::owned_recv`), not a `SendCopyPool` slot, since
+    an incremental completion can exceed a 16 KiB slot. The entry's bid is
+    `ring_entries()` plus the copy's index, above every ring bid, so every
+    existing release path pushes it unchanged and the flush frees the copy
+    instead of releasing a ring buffer; at worker exit, `Driver`'s drop frees
+    any left. At most `ring_entries()` copies exist per worker; past that the
+    ring buffer is lent, so a peer that sends without reading drains the ring
+    and meets `ENOBUFS` backpressure. Step 5 must move the owned bids above
+    every group's `ring_entries()`, or mark them with their own group, since a
+    large-group bid can exceed the small group's ring size.
 - Per connection, `forward_hold_cap` still counts held ranges; one forwarder
   can pin up to that many shared buffers, which the per-group cap bounds.
 - With `recv_incremental` on, `recv_segment_reserve` is ignored and the
@@ -659,7 +669,9 @@ receive queue, and TCP closes the window until the worker re-arms.
 ## Sizing
 
 - Per worker: 64 MiB with an INC ring (128 MiB with the large group), 512
-  MiB with a plain ring. Only touched pages are resident: the plain groups
+  MiB with a plain ring. With `recv_incremental`, owned copies for
+  recv-forward and direct echo add at most one more ring's worth (one copy
+  per ring entry, each at most one buffer). Only touched pages are resident: the plain groups
   use `MADV_NOHUGEPAGE`, and with transparent huge pages a completion would
   otherwise make its whole 2 MiB region resident.
 - A group covers the bytes that arrive while a worker is not reaping:
@@ -787,15 +799,15 @@ buffers held by `with_bytes` views, values copied by the
    `recv_segment_reserve` ignored, the 1 MiB fallback chunk with the
    free-space re-arm, and the lends-refused count; all only with
    `recv_incremental`. 4b-2: the owned `recv_hold` entry for recv-forward
-   and direct echo, the per-group gauges, and the per-group `ENOBUFS`
-   count.
+   and direct echo.
 5. The large group, behind `recv_large_group` (default `false`): its bgid
    and validation, the arm taking the group per call,
    `OpTag::RecvMultiLarge` and the `SendRecvBuf` group bit, `group` in
    `PendingRecvBuf` and the send slab, the cancel sites, promotion,
    migration and demotion with `recv_large_demote_quiet`, the two-group
-   memlock preflight, and the timestamps ring with
-   `recv_timestamp_buffer_bgid`. Migration is timed in ringline's
+   memlock preflight, the timestamps ring with
+   `recv_timestamp_buffer_bgid`, and the per-group gauges and `ENOBUFS`
+   count. Migration is timed in ringline's
    metrics.
 6. Measure ringline on hv01 and across hv01/hv02, on Linux 6.1, 6.8, 6.12
    and 7.1: the geometry per ring kind with and without the large group

@@ -1032,8 +1032,7 @@ impl ConfigBuilder {
     /// `forward_to` source) only while at most half the TCP ring's buffers
     /// have a hold (a lend, or a completion whose release is queued for the
     /// next flush); above that, each path copies, and `recv_segment_reserve`
-    /// is ignored.
-    /// Recv-forward (`recv_forward`) and direct-echo lends are not capped yet.
+    /// is ignored. Recv-forward and direct echo copy into an owned buffer.
     /// The fallback receive reads 1 MiB chunks, and a parked connection
     /// re-arms its multishot instead when the ring's free buffers hold more.
     /// With `prefault_buffers(true)` a plain ring makes 256 MiB per worker

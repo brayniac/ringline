@@ -24,8 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   next flush), and copied above that (`ringline/recv_ring`
   `lend_refused`); `recv_segment_reserve` is ignored, and the fallback
   receive reads 1 MiB chunks, re-arming the multishot instead when the
-  ring's free buffers hold more. Recv-forward and direct-echo lends are
-  not capped yet (#622 step 4b-2). With `prefault_buffers(true)` the plain
+  ring's free buffers hold more. Recv-forward and direct echo copy into
+  an owned heap buffer above the cap. With `prefault_buffers(true)` the plain
   geometry makes 256 MiB per worker resident.
 
 - Three connection counters (`ringline/connections`, `op` label) count three
