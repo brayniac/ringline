@@ -49,7 +49,7 @@ io_uring loop *cheaper* per request while the epoll loop stays flat:
 
 The worker loop is `AsyncEventLoop::run()` in
 `ringline/src/backend/uring/event_loop.rs`. The ring is created with
-`coop_taskrun`, `single_issuer`, and (unless SQPOLL is enabled)
+`single_issuer` and, unless SQPOLL is enabled, `coop_taskrun` and
 `defer_taskrun`, with registered file descriptors — connections are referenced
 as `Fixed(conn_index)` slots, so no per-operation fd table lookups
 (`engine/uring.rs`).
