@@ -724,6 +724,13 @@ impl Config {
                 ));
             }
         }
+        // The io_uring engine probes incremental buffer rings under bgid
+        // u16::MAX, so no configured group may use it.
+        if self.recv_buffer.bgid == u16::MAX || self.udp_recv_buffer.bgid == u16::MAX {
+            return Err(crate::error::Error::RingSetup(
+                "recv_buffer.bgid and udp_recv_buffer.bgid must not be 65535 (reserved)".into(),
+            ));
+        }
         if self.close_notify_timeout_ms == 0 || self.close_notify_timeout_ms > 60000 {
             return Err(crate::error::Error::RingSetup(
                 "close_notify_timeout_ms must be > 0 and <= 60000".into(),
@@ -976,6 +983,7 @@ impl ConfigBuilder {
     }
 
     /// Set the recv buffer group ID (bgid) for the TCP provided buffer ring.
+    /// 65535 is reserved.
     pub fn recv_buffer_bgid(mut self, bgid: u16) -> Self {
         self.config.recv_buffer.bgid = bgid;
         self
@@ -1197,7 +1205,7 @@ impl ConfigBuilder {
     }
 
     /// Set the UDP recv buffer group ID (bgid). Must differ from the TCP
-    /// `recv_buffer` bgid when UDP is in use.
+    /// `recv_buffer` bgid when UDP is in use. 65535 is reserved.
     pub fn udp_recv_buffer_bgid(mut self, bgid: u16) -> Self {
         self.config.udp_recv_buffer.bgid = bgid;
         self
@@ -1326,6 +1334,28 @@ impl ConfigBuilder {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn bgid_65535_is_reserved() {
+        assert!(
+            ConfigBuilder::new()
+                .recv_buffer_bgid(u16::MAX)
+                .build()
+                .is_err()
+        );
+        assert!(
+            ConfigBuilder::new()
+                .udp_recv_buffer_bgid(u16::MAX)
+                .build()
+                .is_err()
+        );
+        assert!(
+            ConfigBuilder::new()
+                .recv_buffer_bgid(u16::MAX - 1)
+                .build()
+                .is_ok()
+        );
+    }
     use super::*;
 
     /// Helper: create a Config with a single field override.

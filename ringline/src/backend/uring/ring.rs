@@ -1343,9 +1343,9 @@ mod tests {
         // Declared before the ring, so it is unmapped after it drops.
         let provided = ProvidedBufRing::new(9, 8, 4096).expect("provided ring");
         let mut ring = ring_with(None);
-        let supported = ring.engine.incremental_buffers();
+        let supported = ring.engine.incremental_buffers().expect("probe");
         // The answer is cached and stable.
-        assert_eq!(ring.engine.incremental_buffers(), supported);
+        assert_eq!(ring.engine.incremental_buffers().expect("probe"), supported);
         if KernelVersion::current()
             >= Some(KernelVersion {
                 major: 6,

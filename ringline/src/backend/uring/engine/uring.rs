@@ -51,8 +51,8 @@ const _: () = assert!(std::mem::size_of::<BufReg>() == 40);
 pub(crate) const IORING_REGISTER_PBUF_RING: libc::c_uint = 22;
 pub(crate) const IORING_UNREGISTER_PBUF_RING: libc::c_uint = 23;
 
-/// `io_uring_register(2)` for a provided buffer ring, with `flags` and
-/// `resv[0]` set to `resv0`. Ringline passes 1 (see [`retry_with_resv_set`]); tests pass 0 to
+/// `io_uring_register(2)` for a provided buffer ring, with the given `flags`
+/// and `resv[0]` set to `resv0`. Ringline passes 1 (see [`retry_with_resv_set`]); tests pass 0 to
 /// check the call against a kernel that requires zeroed reserved words.
 ///
 /// # Safety
@@ -146,7 +146,7 @@ pub(crate) struct UringEngine {
     /// first. See [`retry_with_resv_set`].
     pbuf_resv_set: bool,
     /// Whether the kernel registers an `IOU_PBUF_RING_INC` ring, probed on
-    /// the first call to [`Engine::incremental_buffers`].
+    /// the first successful call to [`Engine::incremental_buffers`].
     incremental: Cell<Option<bool>>,
     /// Test-only: number of upcoming `push_sqe128`/`push_sqe_pair` calls that
     /// fail as if the SQ were still full after a submit. See
@@ -180,10 +180,13 @@ impl UringEngine {
     }
 
     /// Whether the kernel registers an `IOU_PBUF_RING_INC` ring: register a
-    /// one-entry incremental ring under a spare group id and unregister it.
-    fn probe_incremental(&self) -> bool {
+    /// one-entry incremental ring under group id `u16::MAX` (which
+    /// `Config::validate` reserves) and unregister it. `EINVAL` means the
+    /// kernel lacks it; any other error is returned.
+    fn probe_incremental(&self) -> io::Result<bool> {
         const PROBE_BGID: u16 = u16::MAX;
-        let page = 4096;
+        // Safety: sysconf has no preconditions.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
         // Safety: an anonymous private mapping with no preconditions.
         let mem = unsafe {
             libc::mmap(
@@ -196,25 +199,32 @@ impl UringEngine {
             )
         };
         if mem == libc::MAP_FAILED {
-            return false;
+            return Err(io::Error::last_os_error());
         }
-        // Safety: `mem` is a mapped page, unmapped below only after the
-        // group is unregistered.
-        let ok = unsafe {
+        // Safety: `mem` stays mapped across the registration. If the
+        // unregister below fails, the munmap leaves the group registered on
+        // pages the kernel has pinned, which is safe for the reason given at
+        // `register_buf_ring`; the group and its pinned page then stay until
+        // the io_uring instance is freed.
+        let registered = unsafe {
             self.ring.submitter().register_buf_ring_with_flags(
                 mem as u64,
                 1,
                 PROBE_BGID,
                 IOU_PBUF_RING_INC,
             )
-        }
-        .is_ok();
-        if ok {
-            let _ = self.ring.submitter().unregister_buf_ring(PROBE_BGID);
-        }
+        };
+        let result = match registered {
+            Ok(()) => {
+                let _ = self.ring.submitter().unregister_buf_ring(PROBE_BGID);
+                Ok(true)
+            }
+            Err(e) if e.raw_os_error() == Some(libc::EINVAL) => Ok(false),
+            Err(e) => Err(e),
+        };
         // Safety: `mem` was mapped above with length `page`.
         unsafe { libc::munmap(mem, page) };
-        ok
+        result
     }
 
     /// Test-only: the ring's file descriptor, for raw registration calls.
@@ -425,13 +435,13 @@ impl Engine for UringEngine {
         self.fixed_fd_install
     }
 
-    fn incremental_buffers(&self) -> bool {
+    fn incremental_buffers(&self) -> io::Result<bool> {
         if let Some(known) = self.incremental.get() {
-            return known;
+            return Ok(known);
         }
-        let known = self.probe_incremental();
+        let known = self.probe_incremental()?;
         self.incremental.set(Some(known));
-        known
+        Ok(known)
     }
 
     /// What goes ahead of a connection's `Close` on the running kernel. See

@@ -87,7 +87,7 @@ impl Engine for StubEngine {
         unreachable!("the stub engine fails at setup")
     }
 
-    fn incremental_buffers(&self) -> bool {
+    fn incremental_buffers(&self) -> io::Result<bool> {
         unreachable!("the stub engine fails at setup")
     }
 

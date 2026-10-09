@@ -32,7 +32,8 @@ pub(crate) enum RingKind {
     /// Each completion takes a whole buffer.
     Plain,
     /// `IOU_PBUF_RING_INC`: completions consume a buffer at increasing
-    /// offsets, and the buffer returns when it is used up.
+    /// offsets, and a buffer goes back to the application once it is used
+    /// up.
     #[allow(dead_code)] // first use lands with #622's ring-kind selection
     Incremental,
 }
@@ -123,11 +124,12 @@ pub(crate) trait Engine: Sized {
     fn supports_park(&self) -> bool;
 
     /// Whether this engine registers [`RingKind::Incremental`] rings
-    /// (`IOU_PBUF_RING_INC`, Linux 6.12+). The receive design
-    /// (`docs/recv-incremental-ring-design.md`) selects the ring kind from
-    /// this and the configuration.
+    /// (`IOU_PBUF_RING_INC`, Linux 6.12+). `Ok(false)` means the kernel
+    /// lacks them; an error is a failure to find out (for example `ENOMEM`
+    /// from `RLIMIT_MEMLOCK`), and the next call tries again. Not called
+    /// yet; #622's ring-kind selection will use it.
     #[allow(dead_code)] // first caller lands with #622's ring-kind selection
-    fn incremental_buffers(&self) -> bool;
+    fn incremental_buffers(&self) -> io::Result<bool>;
 
     /// Test-only: post a completion with `user_data` and `result` as if an
     /// operation had completed. With `linked`, the next operation pushed is
