@@ -142,9 +142,8 @@ it, or keeps a runtime probe of the behaviour table on a one-entry ring.
 
 Ubuntu's 6.8 kernels from 6.8.0-139 reject every provided-ring registration
 whose reserved words are zero, the form other kernels require, and accept
-one with `resv[0]` set (#626). PR #627 makes `Ring::register_buf_ring`
-retry that way only after `EINVAL` on a 6.8 kernel; until it lands,
-ringline's io_uring backend does not start on these kernels. On them, ring
+one with `resv[0]` set (#626). `UringEngine::register_buf_ring` retries
+that way only after `EINVAL` on a 6.8 kernel (#627). On these kernels, ring
 selection sees `EINVAL` from the INC attempt in both forms and from the
 plain attempt's standard form before the plain retry succeeds. That
 sequence is untested. Measurements of this design on 6.8 are pending a
@@ -160,19 +159,26 @@ rerun with #627.
 | The ring entry | Rewritten by the kernel as it consumes (`addr` advances, `len` shrinks). |
 | More data queued | A multishot receive completion carries `IORING_CQE_F_SOCK_NONEMPTY` when the socket still has data after it. On Debian 12's 6.1.0-53 every full completion of a streaming connection carried it; no completion of a 64 KiB request/response message did (102,678–104,001 per run), and 99.9% of 1 MiB requests' full completions did. |
 | No buffer left | `-ENOBUFS` without `F_MORE`, ending the arm. |
+| CQ overflow | A multishot completion that finds the CQ full goes to the overflow list and ends its arm (no `F_MORE`), whether or not data is still queued; the driver re-arms it. The byte order holds across the overflow and the re-arm. From 6.13, on a `DEFER_TASKRUN` ring, the kernel runs at most 20 deferred task_work items per pass (`IO_LOCAL_TW_DEFAULT_MAX`), and an `io_uring_enter` makes at most two passes, so a burst of single-completion receives no longer fills the CQ; receives that each post several completions still do. |
+| EOF on a partly used INC buffer | A completion with `res` 0, no `F_BUFFER` and no `F_MORE`. The buffer stays posted, and another connection's next data lands at the following offset. |
+| Multishot `RECVMSG` on an INC ring | Each message, header included, lands at the buffer's next offset, as `RECV` data does. |
 | `RLIMIT_MEMLOCK` (6.14+) | Charged for each ring's entry array, not the buffers: 16 bytes per entry, at least a page per ring. |
 
 The offset order was checked byte for byte on Linux 6.12 and 7.1 with a
 64-entry CQ and 32-entry SQ, under SQPOLL, with held lends and at 10,000
-connections (journal). It assumes INC-ring receives are not punted to
-io-wq: the driver sets no `IOSQE_ASYNC` on them.
+connections (journal). The kernel does not run a multishot receive on
+io-wq: `io_wq_submit_work` arms poll for it (6.12 and 7.1 source), so
+`IOSQE_ASYNC` does not change where its data is received.
 
-Step 0's conformance tests cover each row, a forced-async receive, the
-behaviour at EOF on a partly used buffer, and multishot `RECVMSG` (the
-`timestamps` feature) on an INC ring, which have not been probed. CI's
-Linux runners (`ubuntu-latest`, 6.17) cover one kernel; the tests also run
-as SystemsLab experiments on 6.1 (Debian 12), 6.8 (Ubuntu 24.04), 6.12
-(Debian 13) and 7.1 (Debian 13 backports).
+The conformance tests in `ringline/src/backend/uring/engine/conformance.rs`
+cover each row except `RLIMIT_MEMLOCK`, which `ringline/tests/memlock_rings.rs`
+covers. They passed on 6.1.0-53 (Debian 12), 6.8.0-142 (Ubuntu 24.04),
+6.12.63 (Debian 13) and 7.1.13 (Debian 13 backports)
+(`experiments/recv-conformance-run.toml`). 6.1 and 6.8 have no INC rings,
+so only the plain-ring rows ran there. On 6.12 and 7.1 the overflow test's
+96 connections posted 508 completions into a 64-entry CQ and 225 arms
+ended. CI's Linux test jobs (`ubuntu-latest`, 6.17) run them on pull
+requests to `main`.
 
 ## Buffer state
 
@@ -645,10 +651,8 @@ receive queue, and TCP closes the window until the worker re-arms.
 
 - The UDP ring (`udp_recv_buffer`, its own bgid) stays plain.
 - TLS (both engines) copies out of the ring and takes no hold.
-- The `timestamps` feature shares the small TCP group. If multishot
-  `RECVMSG` works on an INC ring, it stays there, with `RecvMsgOut::parse`
-  reading at the completion's offset; otherwise timestamped connections get
-  their own plain ring.
+- The `timestamps` feature shares the small TCP group, with
+  `RecvMsgOut::parse` reading at the completion's offset.
 - mio. If the ring emulator (#621) lands, it implements this state machine.
 
 ## Metrics
@@ -684,15 +688,14 @@ buffers held by `with_bytes` views, values copied by the
 - The size of the plain large group: 256 × 1 MiB, the only size run, runs
   out when holders are promoted alongside streamers and, less often, with
   streamers alone.
-- Multishot `RECVMSG` on an INC ring.
 
 ## Landing
 
 0. Probe and conformance tests: each row of the behaviour table, the
-   byte-verified offset order (a 64-entry CQ and 32-entry SQ, SQPOLL, a
-   forced-async receive), EOF on a partly used buffer, and multishot
-   `RECVMSG` on an INC ring; run on CI and as SystemsLab experiments on
-   6.1, 6.8, 6.12 and 7.1. Settle the 6.12.y minimum or keep a probe.
+   byte-verified offset order (a CQ overflow, SQPOLL), EOF on a partly
+   used buffer, and multishot `RECVMSG` on an INC ring; run on CI and as
+   SystemsLab experiments on 6.1, 6.8, 6.12 and 7.1. Settle the 6.12.y
+   minimum or keep a probe.
 1. Bounded accumulator: the target length from `NeedAtLeast` and the
    sites that clear it (reset, close, `ConnStream` reads, the segmented
    entry's `take_frozen`, `settle_forward_end`), the hold of a

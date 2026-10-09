@@ -36,7 +36,9 @@ impl Timespec {
 pub(crate) mod cqueue {
     const F_BUFFER: u32 = 1 << 0;
     const F_MORE: u32 = 1 << 1;
+    const F_SOCK_NONEMPTY: u32 = 1 << 2;
     const F_NOTIF: u32 = 1 << 3;
+    const F_BUF_MORE: u32 = 1 << 4;
     const BUFFER_SHIFT: u32 = 16;
 
     /// The provided buffer the completion consumed, if any.
@@ -57,6 +59,21 @@ pub(crate) mod cqueue {
     /// The completion is a zero-copy send's notification.
     pub(crate) fn notif(flags: u32) -> bool {
         flags & F_NOTIF != 0
+    }
+
+    /// The socket still had data queued after this receive completed
+    /// (`IORING_CQE_F_SOCK_NONEMPTY`).
+    #[cfg_attr(not(test), allow(dead_code))] // first driver use lands with #622's promotion
+    pub(crate) fn sock_nonempty(flags: u32) -> bool {
+        flags & F_SOCK_NONEMPTY != 0
+    }
+
+    /// The provided buffer the completion used has room left, and the
+    /// kernel keeps consuming it (`IORING_CQE_F_BUF_MORE`, incremental
+    /// rings only).
+    #[cfg_attr(not(test), allow(dead_code))] // first driver use lands with #622 step 4
+    pub(crate) fn buf_more(flags: u32) -> bool {
+        flags & F_BUF_MORE != 0
     }
 }
 
@@ -186,6 +203,8 @@ mod tests {
             9,
             10,
             11,
+            0x10,
+            0x14,
             0x0007_0001,
             0xffff_0003,
             0x1234_000b,
@@ -199,6 +218,16 @@ mod tests {
             );
             assert_eq!(cqueue::more(f), io_uring::cqueue::more(f), "{f:#x}");
             assert_eq!(cqueue::notif(f), io_uring::cqueue::notif(f), "{f:#x}");
+            assert_eq!(
+                cqueue::sock_nonempty(f),
+                io_uring::cqueue::sock_nonempty(f),
+                "{f:#x}"
+            );
+            assert_eq!(
+                cqueue::buf_more(f),
+                io_uring::cqueue::buffer_more(f),
+                "{f:#x}"
+            );
         }
     }
 

@@ -230,6 +230,13 @@ impl UringEngine {
         result
     }
 
+    /// Test-only: whether the kernel holds completions on its overflow
+    /// list (`IORING_SQ_CQ_OVERFLOW`).
+    #[cfg(test)]
+    pub(crate) fn cq_overflowed(&mut self) -> bool {
+        self.ring.submission().cq_overflow()
+    }
+
     /// Test-only: the ring's file descriptor, for raw registration calls.
     #[cfg(test)]
     pub(crate) fn raw_fd(&self) -> RawFd {

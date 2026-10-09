@@ -1,0 +1,56 @@
+# Build ringline's lib and echo test binaries from the #622 step 0 branch
+# (provided-ring conformance tests, stacked on the #630 SQPOLL fix), for
+# experiments/recv-conformance-run.toml. ringline does not build for musl
+# (`libc::statx`), so these link glibc; the log prints the newest glibc
+# symbol version each needs (Debian 12 has 2.36, Ubuntu 24.04 2.39).
+name = "ringline #622 conformance test build"
+
+[params]
+repo   = "https://github.com/brayniac/ringline"
+branch = "test/recv-conformance"
+
+[[jobs]]
+name = "build"
+tags = ["validation"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+shape = "z4.c"
+image = "spool/images/debian-13-ci-20260912.1@golden"
+slots = 1
+memory_gib = 8
+ports = 0
+gpu = false
+payload_timeout = 5400
+artifacts = ["/home/anvil/tests.tgz", "/home/anvil/build.log"]
+upload = true
+payload = '''
+set -uo pipefail
+cd /home/anvil
+{
+  export CARGO_PROFILE_RELEASE_DEBUG=0 CARGO_PROFILE_RELEASE_STRIP=true
+  mkdir -p out
+  git clone -q {repo} src && git -C src checkout -q {branch}
+  echo "src: $(git -C src log --oneline -1)"
+  ( cd src && cargo test -p ringline --release --locked --no-run \
+      --lib --test echo --message-format=json > ../build.json )
+  rc=$?
+  echo "build_status=$rc"
+  [ $rc -eq 0 ] || ( cd src && cargo test -p ringline --release --locked --no-run \
+      --lib --test echo 2>&1 | grep -E '^(error|warning)' -A6 | head -60 )
+  grep -o '"executable":"[^"]*"' build.json | cut -d'"' -f4 | while read -r exe; do
+    cp "$exe" out/$(basename "$exe" | sed 's/-[0-9a-f]*$//')
+  done
+  ls -la out; sha256sum out/*
+  for f in out/*; do echo "GLIBC_MAX $f $(objdump -T $f | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)"; done
+  tar czf tests.tgz out
+} 2>&1 | tee /home/anvil/build.log
+exit 0
+'''
+
+[[jobs.steps]]
+type = "shell"
+command = '''
+grep -q "build_status=0" build.log || { echo "build failed"; exit 1; }
+echo ok
+'''

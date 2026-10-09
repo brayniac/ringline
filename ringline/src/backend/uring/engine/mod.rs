@@ -14,6 +14,8 @@ use crate::buffer::fixed::FixedBufferRegistry;
 use crate::config::Config;
 use crate::error::Error;
 
+#[cfg(all(test, uring_engine))]
+mod conformance;
 #[cfg(not(uring_engine))]
 pub(crate) mod stub;
 #[cfg(uring_engine)]
