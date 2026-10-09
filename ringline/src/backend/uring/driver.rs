@@ -102,6 +102,25 @@ pub(crate) struct PendingRecvBuf {
     pub(crate) ptr: *const u8,
 }
 
+impl Driver {
+    /// Whether a completion's data may be lent (held in place) rather than
+    /// copied: always without a lend cap, and with one while the buffers
+    /// with a hold number at most half the ring. Those include this
+    /// completion's buffer and completions whose release is queued for the
+    /// next flush, copied ones too, so within one pass copies alone can
+    /// refuse a lend; a refusal costs a copy. A refusal is counted.
+    pub(crate) fn may_lend(&self) -> bool {
+        match self.lend_cap {
+            None => true,
+            Some(cap) if self.provided_bufs.held() <= cap => true,
+            Some(_) => {
+                metrics::RECV_RING.increment(metrics::recv_ring::LEND_REFUSED);
+                false
+            }
+        }
+    }
+}
+
 /// Whether the worker registers its TCP receive ring as incremental: only
 /// with `recv_incremental` on, the `timestamps` option off, and the kernel
 /// passing the incremental-ring preflight. A failed preflight is counted by
@@ -650,10 +669,16 @@ pub(crate) struct Driver {
     /// validated in `handle_recv_fallback` before any connection state is
     /// touched (slots recycle; stale CQEs are normal).
     pub(crate) fallback_slot_owner: Vec<(u32, u32)>,
-    /// Size of each fallback recv chunk (bytes). A few multiples of the
-    /// provided-ring buffer size: one event-loop pass moves one chunk per
-    /// starved connection, so this bounds per-pass fallback throughput.
+    /// Size of each fallback recv chunk (bytes): `max(4 × buffer size,
+    /// 1 MiB)`, or 1 MiB with `recv_incremental`. One event-loop pass moves
+    /// one chunk per starved connection, so this bounds per-pass fallback
+    /// throughput.
     pub(crate) fallback_chunk: u32,
+    /// With `recv_incremental` on, the most TCP receive buffers that may
+    /// have a hold when a lend is taken: half the ring. A lend is taken only
+    /// while `held()` is at or below it; above it, each lend path copies
+    /// instead. `None` leaves lends uncapped, as without `recv_incremental`.
+    pub(crate) lend_cap: Option<u32>,
     /// Lifetime count of fallback recv submissions on this worker
     /// (reported in the shutdown diag line).
     pub(crate) recv_fallback_count: u64,
@@ -1209,11 +1234,18 @@ impl Driver {
             // One event-loop pass moves at most one chunk per starved
             // connection, so the chunk — not the provided ring — is the
             // per-pass byte ceiling while degraded. Four buffers, at least
-            // 1 MiB. The arbitration in `flush_replenish_and_rearm` prefers
-            // the fallback on the premise that the chunk exceeds the ring's
-            // capacity, which no geometry here meets (the default 256 × 16 KiB
-            // ring holds 4 MiB); #622 step 4b revisits it.
-            fallback_chunk: recv_buffer_size.saturating_mul(4).max(1 << 20),
+            // 1 MiB. Without `recv_incremental`, the arbitration in
+            // `flush_replenish_and_rearm` prefers the fallback on the premise
+            // that the chunk exceeds the ring's capacity, which no geometry
+            // here meets (the default 256 × 16 KiB ring holds 4 MiB). With
+            // `recv_incremental` the chunk is 1 MiB and the arbitration
+            // re-arms when the ring's free bytes exceed it.
+            fallback_chunk: if config.recv_incremental {
+                1 << 20
+            } else {
+                recv_buffer_size.saturating_mul(4).max(1 << 20)
+            },
+            lend_cap: config.recv_incremental.then_some(recv_ring_size as u32 / 2),
             recv_fallback_count: 0,
             udp_batch_recv_at: std::time::Instant::now(),
             tick_timeout_ts: if config.tick_timeout_us > 0 {

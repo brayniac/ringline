@@ -19,12 +19,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   requires `recv_accumulator_max` of at least 1 MiB. Default off.
   `ringline/recv_ring` counts the kind each worker selected, and
   `ringline/recv_preflight_failed` the step a failed check stopped at.
-  With the default incremental geometry every segmented delivery is copied
-  (64 buffers never exceed the default `recv_segment_reserve`); with
-  `prefault_buffers(true)` the plain geometry makes 256 MiB per worker
-  resident. Lends into incremental buffers are not capped yet (#622 step
-  4b): about 64 connections holding unread data can keep every buffer of
-  the default ring out of use and stall receives on the worker.
+  Data is lent (held in place) only while at most half the ring's buffers
+  have a hold (a lend, or a completion whose release is queued for the
+  next flush), and copied above that (`ringline/recv_ring`
+  `lend_refused`); `recv_segment_reserve` is ignored, and the fallback
+  receive reads 1 MiB chunks, re-arming the multishot instead when the
+  ring's free buffers hold more. Recv-forward and direct-echo lends are
+  not capped yet (#622 step 4b-2). With `prefault_buffers(true)` the plain
+  geometry makes 256 MiB per worker resident.
 
 - Three connection counters (`ringline/connections`, `op` label) count three
   ways an accepted connection can be closed before it reaches a handler:

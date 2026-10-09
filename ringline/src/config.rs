@@ -1028,17 +1028,16 @@ impl ConfigBuilder {
     /// backend. With the `timestamps` feature and `timestamps(true)`, every
     /// worker uses a plain ring.
     ///
-    /// The default geometry has these effects:
-    /// - The incremental ring's 64 buffers never leave more free than the
-    ///   default `recv_segment_reserve` (64), so every segmented delivery
-    ///   (`with_segments`, `forward_to`) is copied.
-    /// - With `prefault_buffers(true)` a plain ring makes 256 MiB per worker
-    ///   resident, against 4 MiB for the 256 × 16 KiB default.
-    /// - With the incremental geometry, the fallback receive's chunks grow
-    ///   from 1 MiB to 4 MiB of virtual memory each.
-    /// - Lends into incremental buffers are not capped yet, so about 64
-    ///   connections holding unread data can keep every buffer out of use
-    ///   and stall receives on the worker.
+    /// With this on, data is lent (held in place for a task, a segment or a
+    /// `forward_to` source) only while at most half the TCP ring's buffers
+    /// have a hold (a lend, or a completion whose release is queued for the
+    /// next flush); above that, each path copies, and `recv_segment_reserve`
+    /// is ignored.
+    /// Recv-forward (`recv_forward`) and direct-echo lends are not capped yet.
+    /// The fallback receive reads 1 MiB chunks, and a parked connection
+    /// re-arms its multishot instead when the ring's free buffers hold more.
+    /// With `prefault_buffers(true)` a plain ring makes 256 MiB per worker
+    /// resident, against 4 MiB for the 256 × 16 KiB default.
     ///
     /// The ring kind is an io_uring choice; the mio backend uses its own
     /// receive buffers. **Default: false**, which keeps the plain ring
@@ -1084,7 +1083,8 @@ impl ConfigBuilder {
     /// connections holding segments cannot deplete the ring and `ENOBUFS`-starve
     /// well-behaved connections under fan-in. Above the reserve, delivery stays
     /// zero-copy. `0` force-copies only when the ring is fully drained. Tune
-    /// relative to the `recv_buffer` ring size; must be `<= 65535`.
+    /// relative to the `recv_buffer` ring size; must be `<= 65535`. Ignored
+    /// with `recv_incremental(true)`, where the lend cap decides.
     ///
     /// Default: 64 (a quarter of the default 256-buffer recv ring).
     pub fn recv_segment_reserve(mut self, reserve: u32) -> Self {

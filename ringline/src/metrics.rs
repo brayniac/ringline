@@ -25,7 +25,7 @@ pub static POOL: ShardedCounterGroup = ShardedCounterGroup::new(8);
 
 #[metric(
     name = "ringline/recv_ring",
-    description = "TCP receive ring kind selected by each worker at startup"
+    description = "TCP receive ring: the kind each worker selected, and lends refused"
 )]
 pub static RECV_RING: ShardedCounterGroup = ShardedCounterGroup::new(recv_ring::COUNT);
 
@@ -278,14 +278,20 @@ pub mod ring {
     pub const SHUTDOWN_STALE: usize = 5;
 }
 
-/// Slot indices for `RECV_RING`: one count per worker, by the TCP receive
-/// ring it registered (`ConfigBuilder::recv_incremental`).
+/// Slot indices for `RECV_RING`: one count per worker by the TCP receive
+/// ring it registered (`ConfigBuilder::recv_incremental`), and the lends the
+/// lend cap refused.
 pub mod recv_ring {
     /// An incremental ring (`IOU_PBUF_RING_INC`).
     pub const INCREMENTAL: usize = 0;
     /// A plain ring.
     pub const PLAIN: usize = 1;
-    pub const COUNT: usize = 2;
+    /// Completions copied instead of lent because more than half the ring's
+    /// buffers had a hold, this completion's and queued releases included
+    /// (`recv_incremental` only). A per-completion event, unlike the
+    /// per-worker kind counts.
+    pub const LEND_REFUSED: usize = 2;
+    pub const COUNT: usize = 3;
 }
 
 /// Slot indices for `RECV_PREFLIGHT_FAILED`: the step of the
@@ -392,6 +398,7 @@ pub mod udp {
 pub fn init_metadata() {
     RECV_RING.insert_metadata(recv_ring::INCREMENTAL, "op".into(), "incremental".into());
     RECV_RING.insert_metadata(recv_ring::PLAIN, "op".into(), "plain".into());
+    RECV_RING.insert_metadata(recv_ring::LEND_REFUSED, "op".into(), "lend_refused".into());
     for (step, name) in [
         (recv_preflight::SOCKETPAIR, "socketpair"),
         (recv_preflight::IO_ERROR, "io_error"),
@@ -642,7 +649,11 @@ mod tests {
         ] {
             assert!(UDP.increment(idx), "UDP[{idx}] out of bounds");
         }
-        for idx in [recv_ring::INCREMENTAL, recv_ring::PLAIN] {
+        for idx in [
+            recv_ring::INCREMENTAL,
+            recv_ring::PLAIN,
+            recv_ring::LEND_REFUSED,
+        ] {
             assert!(RECV_RING.increment(idx), "RECV_RING[{idx}] out of bounds");
         }
         for idx in 0..recv_preflight::COUNT {
@@ -658,6 +669,14 @@ mod tests {
     #[test]
     fn recv_ring_slots_are_labelled() {
         init_metadata();
+        let op = |idx| {
+            RECV_RING
+                .load_metadata(idx)
+                .and_then(|m| m.get("op").cloned())
+        };
+        assert_eq!(op(recv_ring::INCREMENTAL).as_deref(), Some("incremental"));
+        assert_eq!(op(recv_ring::PLAIN).as_deref(), Some("plain"));
+        assert_eq!(op(recv_ring::LEND_REFUSED).as_deref(), Some("lend_refused"));
         for idx in 0..recv_ring::COUNT {
             assert!(
                 RECV_RING
