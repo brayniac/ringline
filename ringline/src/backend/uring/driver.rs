@@ -152,6 +152,26 @@ impl Driver {
         Some(((first + index) as u16, ptr))
     }
 
+    /// Copy `data` into an owned segment (`HeldRecvBuf::Owned`), unless owned
+    /// segment copies already hold one ring's worth of bytes
+    /// (`ring_entries() × buffer_size`). `None` then; the caller holds the
+    /// ring buffer instead, so a segment reader that does not read drains
+    /// the ring and meets `ENOBUFS` backpressure rather than growing copies
+    /// without bound.
+    pub(crate) fn own_segment_copy(&self, data: &[u8]) -> Option<bytes::Bytes> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let cap =
+            self.provided_bufs.ring_entries() as usize * self.provided_bufs.buffer_size() as usize;
+        if self.owned_segment_bytes.load(Relaxed) + data.len() > cap {
+            return None;
+        }
+        self.owned_segment_bytes.fetch_add(data.len(), Relaxed);
+        Some(bytes::Bytes::from_owner(SegmentCopy {
+            data: data.into(),
+            counter: self.owned_segment_bytes.clone(),
+        }))
+    }
+
     /// Release every queued bid: owned copies are freed, and provided-ring
     /// buffers released through `ProvidedBufRing::release_batch`.
     ///
@@ -203,6 +223,26 @@ impl Driver {
         } else {
             self.provided_bufs.data_ptr(bid, off)
         }
+    }
+}
+
+/// An owned segment copy's memory, which subtracts its length from its
+/// worker's `owned_segment_bytes` when freed.
+struct SegmentCopy {
+    data: Box<[u8]>,
+    counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl AsRef<[u8]> for SegmentCopy {
+    fn as_ref(&self) -> &[u8] {
+        &self.data
+    }
+}
+
+impl Drop for SegmentCopy {
+    fn drop(&mut self) {
+        self.counter
+            .fetch_sub(self.data.len(), std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -774,6 +814,10 @@ pub(crate) struct Driver {
     /// `None` is a free index (`owned_recv_free`).
     pub(crate) owned_recv: Vec<Option<Box<[u8]>>>,
     pub(crate) owned_recv_free: Vec<u16>,
+    /// Bytes held by owned segment copies (`HeldRecvBuf::Owned` made by the
+    /// segmented copy fallback), shared with each copy, which subtracts its
+    /// length when its memory is freed, wherever that happens.
+    pub(crate) owned_segment_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Lifetime count of fallback recv submissions on this worker
     /// (reported in the shutdown diag line).
     pub(crate) recv_fallback_count: u64,
@@ -1343,6 +1387,7 @@ impl Driver {
             lend_cap: config.recv_incremental.then_some(recv_ring_size as u32 / 2),
             owned_recv: Vec::new(),
             owned_recv_free: Vec::new(),
+            owned_segment_bytes: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             recv_fallback_count: 0,
             udp_batch_recv_at: std::time::Instant::now(),
             tick_timeout_ts: if config.tick_timeout_us > 0 {

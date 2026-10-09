@@ -1758,16 +1758,28 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     );
                 }
                 crate::recv::occupancy::Delivery::ForceCopy => {
-                    // At/below the reserve: copy the bytes into an owned `Bytes`
-                    // and replenish the bid IMMEDIATELY so the ring recovers and
-                    // holders cannot deplete it. `complete()` counted the bid at
-                    // buffer_select; this replenish balances it (net-zero pin), so
-                    // the outstanding/free accounting stays consistent. INC
-                    // ordering: copy before replenish, no await between.
-                    let owned = bytes::Bytes::copy_from_slice(data);
-                    self.driver.segment_hold[conn_index as usize]
-                        .push_back(crate::backend::HeldRecvBuf::Owned(owned));
-                    self.driver.pending_replenish.push(bid);
+                    // At/below the reserve, or over the lend cap: copy the bytes
+                    // into an owned `Bytes` and replenish the bid IMMEDIATELY so
+                    // the ring recovers and holders cannot deplete it.
+                    // `complete()` counted the bid at buffer_select; this
+                    // replenish balances it (net-zero pin), so the outstanding/
+                    // free accounting stays consistent. INC ordering: copy
+                    // before replenish, no await between. Once owned segment
+                    // copies hold one ring's worth of bytes the buffer is held
+                    // instead, so a reader that does not read meets `ENOBUFS`
+                    // backpressure.
+                    let entry = match self.driver.own_segment_copy(data) {
+                        Some(owned) => {
+                            self.driver.pending_replenish.push(bid);
+                            crate::backend::HeldRecvBuf::Owned(owned)
+                        }
+                        None => crate::backend::HeldRecvBuf::Pinned {
+                            bid,
+                            off: buf_off,
+                            len: bytes_received,
+                        },
+                    };
+                    self.driver.segment_hold[conn_index as usize].push_back(entry);
                 }
             }
             // Mode A hold cap (see `docs/segmented-recv-design.md`, "Mode A"). A
@@ -10446,6 +10458,43 @@ mod tests {
         );
         assert_eq!(el.driver.accumulators.data(b), b"second");
         assert_eq!(el.driver.pending_replenish, [1]);
+    }
+
+    /// Owned segment copies stop at one ring's worth of bytes: past it, the
+    /// copy fallback holds the ring buffer. A copy's bytes leave the count
+    /// when it is dropped.
+    #[test]
+    fn owned_segment_copies_stop_at_one_ring_of_bytes() {
+        let mut el = make_test_loop_with_config(config_with_reserve(16));
+        let conn_index = accept_connection(&mut el);
+        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
+        let ring_bytes = el.driver.provided_bufs.ring_entries() as usize
+            * el.driver.provided_bufs.buffer_size() as usize;
+        let copy = el
+            .driver
+            .own_segment_copy(b"held")
+            .expect("under the bound");
+        assert_eq!(
+            el.driver
+                .owned_segment_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            4
+        );
+        drop(copy);
+        assert_eq!(
+            el.driver
+                .owned_segment_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        el.driver
+            .owned_segment_bytes
+            .store(ring_bytes - 2, std::sync::atomic::Ordering::Relaxed);
+        deliver_segment(&mut el, conn_index, 0, b"over");
+        assert!(matches!(
+            el.driver.segment_hold[conn_index as usize][0],
+            crate::backend::HeldRecvBuf::Pinned { .. }
+        ));
     }
 
     /// With a lend cap, the cap decides a segmented delivery and
