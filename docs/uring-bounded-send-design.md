@@ -30,7 +30,9 @@ path already reads before releasing. `submit_next_queued_inner` coalesces a
 run that stops at the first end-of-send slot, so a coalesced op covers at
 most one logical send's tail and **one id per slab entry suffices**;
 `allocate_coalesced` already propagates `end_of_send` from the last slot and
-lifts the id at the same line. Departure 5.
+lifts the id at the same line. Departure 5. (Superseded by #628: a run now
+spans sends, the end-of-send flag is gone, and the slab entry carries each
+send's id with where its bytes end; see `InFlightSendSlab::take_sent_sends`.)
 
 **Why the logical length travels with the id.** Owner decision, 2026-09-12:
 a bounded TLS send reports the **plaintext** length the caller passed. The
@@ -92,6 +94,8 @@ through it.
 **Success** (`handle_send`, `handle_send_msg_coalesced`): where the handler
 already reads `is_end_of_send` before releasing, it also takes the id and
 settles `Ok(logical_len)` — the carried length, not `acked_bytes`.
+(Superseded by #628: the flag is gone; the slab entry settles each send in
+its run, and a partial write settles the sends it covers.)
 
 **Failure with a completion** (every send-family error branch, the
 `close_submitted` gates, and `handle_tls_send`'s two silent

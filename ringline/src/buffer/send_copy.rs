@@ -59,17 +59,11 @@ pub struct SendCopyPool {
     slot_offset: Vec<u32>, // current byte offset within slot (advances on partial send)
     slot_remaining: Vec<u32>, // bytes remaining to send
     in_use: Vec<bool>,     // double-free protection
-    // Whether this slot holds the final chunk of its logical send. A send
-    // larger than one slot is split across several slots; only the last one
-    // is marked, and only it carries the send's id, so the send settles once
-    // rather than once per chunk. A coalesced run stops at a marked slot.
-    // Independent single-slot sends are always final.
-    slot_end_of_send: Vec<bool>,
-    // The awaited send whose completion this
-    // slot carries, and the logical (plaintext) length that operation reports
-    // on success. Parallel to `slot_end_of_send` and set only on the slot that
-    // is marked end-of-send, so at most one entry exists per logical send.
-    // `None` on every freshly allocated slot; see `set_send_id`.
+    // The awaited send whose completion this slot carries, and the logical
+    // (plaintext) length that operation reports on success. A send larger
+    // than one slot is split across several slots; only the last one carries
+    // the id, so the send settles once rather than once per chunk. `None` on
+    // every freshly allocated slot; see `set_send_id`.
     slot_send_id: Vec<Option<(SendId, u32)>>,
     // Free-list slots promised to outstanding `SlotReservation`s but not yet
     // popped. Every allocator subtracts this from `free_list.len()` before
@@ -93,7 +87,6 @@ impl SendCopyPool {
             slot_offset: vec![0u32; n],
             slot_remaining: vec![0u32; n],
             in_use: vec![false; n],
-            slot_end_of_send: vec![true; n],
             slot_send_id: vec![None; n],
             reserved: 0,
         }
@@ -128,7 +121,6 @@ impl SendCopyPool {
         self.slot_offset[idx as usize] = 0;
         self.slot_remaining[idx as usize] = data.len() as u32;
         self.in_use[idx as usize] = true;
-        self.slot_end_of_send[idx as usize] = true;
         self.slot_send_id[idx as usize] = None;
         (idx, ptr, data.len() as u32)
     }
@@ -168,7 +160,6 @@ impl SendCopyPool {
         self.slot_offset[idx as usize] = 0;
         self.slot_remaining[idx as usize] = total_len as u32;
         self.in_use[idx as usize] = true;
-        self.slot_end_of_send[idx as usize] = true;
         self.slot_send_id[idx as usize] = None;
         Some((idx, out_ptr, total_len as u32))
     }
@@ -185,7 +176,6 @@ impl SendCopyPool {
         self.slot_offset[idx as usize] = 0;
         self.slot_remaining[idx as usize] = 0;
         self.in_use[idx as usize] = true;
-        self.slot_end_of_send[idx as usize] = true;
         self.slot_send_id[idx as usize] = None;
         let ptr = self.backing.as_mut_ptr().wrapping_add(offset);
         Some((idx, ptr, self.slot_size))
@@ -371,26 +361,14 @@ impl SendCopyPool {
         self.slot_offset[i] + self.slot_remaining[i]
     }
 
-    /// Mark whether this slot holds the final chunk of its logical send.
-    /// Defaults to `true` on allocation; `DriverCtx::send` clears it on every
-    /// chunk but the last when a send is split across slots.
-    pub fn set_end_of_send(&mut self, slot: u16, end_of_send: bool) {
-        self.slot_end_of_send[slot as usize] = end_of_send;
-    }
-
-    /// Whether this slot holds the final chunk of its logical send.
-    pub fn is_end_of_send(&self, slot: u16) -> bool {
-        self.slot_end_of_send[slot as usize]
-    }
-
     /// Attach an awaited send's identity to this slot, together with the
     /// **logical (plaintext) length** the send reports on success.
     ///
-    /// Set only on the slot that is marked
-    /// [`end_of_send`](Self::set_end_of_send), so one logical send owns at
-    /// most one entry. The length travels with the id because no completion
-    /// handler can recompute it: a TLS send's final `OpTag::Send` chunk is
-    /// one ciphertext record, and a split send's final chunk is part of it.
+    /// Set only on the final slot of its logical send, so one logical send
+    /// owns at most one entry. The length travels with the id because no
+    /// completion handler can recompute it: a TLS send's final `OpTag::Send`
+    /// chunk is one ciphertext record, and a split send's final chunk is part
+    /// of it.
     ///
     /// Written by `DriverCtx::send_awaited`, `SendBuilder::submit_awaited`
     /// and `DriverCtx::send_bounded` and, when a coalescing run is unwound,

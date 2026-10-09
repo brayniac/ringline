@@ -50,17 +50,23 @@ struct InFlightSendEntry {
     /// per-connection state — a send CQE can outlive its connection slot.
     generation: u32,
     total_len: u32,
-    /// The awaited send this entry settles, and the length it reports on
-    /// success.
+    /// The awaited sends this entry settles, in byte order, each with the
+    /// length it reports on success and where its bytes end in the entry.
     ///
-    /// Set by `allocate_coalesced` when the run's end-of-send pool slot
-    /// carried an id (`submit_next_queued_inner` lifts it, since the
+    /// Set by `allocate_coalesced` for every pool slot of the run that carried
+    /// an id, which only a logical send's final slot does
+    /// (`submit_next_queued_inner` lifts them, since the
     /// coalesced completion releases the slots), and by
     /// [`set_send_id`](InFlightSendSlab::set_send_id) for a zero-copy
-    /// (`submit_batch_await`) or recv-forward (`forward_held`) entry. The
-    /// run stops at the first end-of-send slot, so an entry covers at most
-    /// one logical send's tail and a single `Option` suffices.
-    send_id: Option<(SendId, u32)>,
+    /// (`submit_batch_await`) or recv-forward (`forward_held`) entry, which
+    /// carries at most one.
+    sends: SendRun,
+    /// Bytes of the entry the kernel has sent so far (`try_advance`).
+    sent: u32,
+    /// The run includes TLS ciphertext, whose loss breaks the record
+    /// stream: a send error closes the connection (as `handle_tls_send`
+    /// does), where a plaintext run's error only drains the queue.
+    close_on_error: bool,
     pending_notifs: u8,
     awaiting_notifications: bool,
     in_use: bool,
@@ -89,7 +95,9 @@ impl InFlightSendSlab {
                 conn_index: 0,
                 generation: 0,
                 total_len: 0,
-                send_id: None,
+                sends: SendRun::EMPTY,
+                sent: 0,
+                close_on_error: false,
                 pending_notifs: 0,
                 awaiting_notifications: false,
                 in_use: false,
@@ -135,7 +143,9 @@ impl InFlightSendSlab {
         entry.total_len = total_len;
         // A recycled entry must never name a dead operation; an awaited send
         // attaches its id afterwards (`set_send_id`).
-        entry.send_id = None;
+        entry.sends.clear();
+        entry.sent = 0;
+        entry.close_on_error = false;
         entry.pending_notifs = 0;
         entry.awaiting_notifications = false;
         entry.in_use = true;
@@ -160,7 +170,8 @@ impl InFlightSendSlab {
         iovecs_slice: &[libc::iovec],
         pool_slots: &[u16],
         total_len: u32,
-        send_id: Option<(SendId, u32)>,
+        sends: impl IntoIterator<Item = (SendId, u32, u32)>,
+        close_on_error: bool,
     ) -> Option<(u16, *const libc::msghdr)> {
         debug_assert!(iovecs_slice.len() <= MAX_IOVECS);
         debug_assert_eq!(iovecs_slice.len(), pool_slots.len());
@@ -181,7 +192,12 @@ impl InFlightSendSlab {
         entry.conn_index = conn_index;
         entry.generation = generation;
         entry.total_len = total_len;
-        entry.send_id = send_id;
+        entry.sends.clear();
+        for (id, len, end) in sends {
+            entry.sends.push(id, len, end);
+        }
+        entry.sent = 0;
+        entry.close_on_error = close_on_error;
         entry.pending_notifs = 0;
         entry.awaiting_notifications = false;
         entry.in_use = true;
@@ -234,7 +250,9 @@ impl InFlightSendSlab {
         entry.total_len = total_len;
         // As in `allocate`: a recycled entry must not carry a previous
         // occupant's id.
-        entry.send_id = None;
+        entry.sends.clear();
+        entry.sent = 0;
+        entry.close_on_error = false;
         entry.pending_notifs = 0;
         entry.awaiting_notifications = false;
         entry.in_use = true;
@@ -261,6 +279,7 @@ impl InFlightSendSlab {
         let entry = &mut self.entries[idx as usize];
         debug_assert!(entry.in_use);
 
+        entry.sent = entry.sent.saturating_add(bytes_sent);
         let mut skip = bytes_sent as usize;
         let count = entry.iov_count as usize;
         let mut new_start = entry.iov_start as usize;
@@ -360,18 +379,24 @@ impl InFlightSendSlab {
         entry.pool_slot_count = 0;
         entry.bid_count = 0;
         // Cleared unconditionally so a recycled entry cannot name a dead
-        // operation. A handler that means to settle the send must call
-        // `take_send_id` *before* releasing; there is no
+        // operation. A handler that means to settle its sends must call
+        // `take_sends` *before* releasing; there is no
         // tripwire here (unlike `SendCopyPool::release`) because
         // `Driver::run_shutdown` releases slab entries with the executor
         // already going away, where a lost settle is correct.
-        entry.send_id = None;
+        entry.sends.clear();
         entry.in_use = false;
         entry.awaiting_notifications = false;
         entry.pending_notifs = 0;
 
         self.free_list.push(idx);
         pool_slot
+    }
+
+    /// Whether a send error on this coalesced entry closes its connection:
+    /// the run includes TLS ciphertext.
+    pub fn close_on_error(&self, idx: u16) -> bool {
+        self.entries[idx as usize].close_on_error
     }
 
     /// Get the total original send length for an entry.
@@ -384,19 +409,35 @@ impl InFlightSendSlab {
     pub fn set_send_id(&mut self, idx: u16, id: SendId, len: u32) {
         let entry = &mut self.entries[idx as usize];
         debug_assert!(
-            entry.send_id.is_none(),
+            entry.sends.is_empty(),
             "slab entry {idx} already carries a send"
         );
-        entry.send_id = Some((id, len));
+        entry.sends.push(id, len, entry.total_len);
     }
 
-    /// Take the awaited send this entry settles, if any, leaving `None`.
+    /// Take every awaited send this entry still carries, in byte order,
+    /// each with its success length.
     ///
     /// Take-not-peek for the same reason as `SendCopyPool::take_send_id`: an
     /// id may be settled exactly once, and taking is what lets a handler
     /// release the entry afterwards without settling it twice.
-    pub fn take_send_id(&mut self, idx: u16) -> Option<(SendId, u32)> {
-        self.entries[idx as usize].send_id.take()
+    pub(crate) fn take_sends(&mut self, idx: u16) -> TakenSends {
+        let sends = &mut self.entries[idx as usize].sends;
+        let taken = TakenSends(*sends);
+        sends.head = sends.count;
+        taken
+    }
+
+    /// Take the awaited sends whose bytes the kernel has all sent
+    /// (`try_advance`), in byte order, so they settle before the rest of the
+    /// entry.
+    pub(crate) fn take_sent_sends(&mut self, idx: u16) -> TakenSends {
+        let entry = &mut self.entries[idx as usize];
+        let mut taken = SendRun::EMPTY;
+        while let Some((id, len, end)) = entry.sends.pop_front_if_ended(entry.sent) {
+            taken.push(id, len, end);
+        }
+        TakenSends(taken)
     }
 
     /// Get the connection index for an entry.
@@ -702,6 +743,32 @@ mod tests {
         slab.release(idx);
     }
 
+    /// One entry reused more often than a run holds sends: each release
+    /// forgets the run, so the next allocation starts empty and no push
+    /// overflows it.
+    #[test]
+    fn a_reused_entry_starts_with_an_empty_run() {
+        let mut slab = InFlightSendSlab::new(1);
+        let mut completions = crate::runtime::send_completion::SendCompletions::new();
+        let data = [0u8; 4];
+        let iov = [libc::iovec {
+            iov_base: data.as_ptr() as *mut libc::c_void,
+            iov_len: 4,
+        }];
+        for round in 0..(MAX_IOVECS as u32 + 4) {
+            let id = completions.register(0, round);
+            let (idx, _) = slab
+                .allocate_coalesced(0, 0, &iov, &[0], 4, [(id, 4, 4)], false)
+                .expect("slab room");
+            if round % 2 == 0 {
+                let mut taken = slab.take_sends(idx);
+                assert_eq!(taken.next(), Some((id, 4)));
+                assert_eq!(taken.next(), None);
+            }
+            slab.release(idx);
+        }
+    }
+
     #[test]
     fn exhaust_slab() {
         let mut slab = InFlightSendSlab::new(1);
@@ -719,5 +786,70 @@ mod tests {
             slab.allocate(0, 0, &iovecs, u16::MAX, guards2, 0, 10)
                 .is_none()
         );
+    }
+}
+
+/// The awaited sends a slab entry settles, in byte order: each with its
+/// success length and the offset in the entry where its bytes end.
+#[derive(Clone, Copy)]
+struct SendRun {
+    sends: [Option<(SendId, u32, u32)>; MAX_IOVECS],
+    head: u8,
+    count: u8,
+}
+
+impl SendRun {
+    const EMPTY: SendRun = SendRun {
+        sends: [None; MAX_IOVECS],
+        head: 0,
+        count: 0,
+    };
+
+    fn push(&mut self, id: SendId, len: u32, end: u32) {
+        assert!(
+            (self.count as usize) < MAX_IOVECS,
+            "too many sends in one entry"
+        );
+        self.sends[self.count as usize] = Some((id, len, end));
+        self.count += 1;
+    }
+
+    /// Forget every send. Slots outside `[head, count)` are never read, so
+    /// only the bounds are reset.
+    fn clear(&mut self) {
+        self.head = 0;
+        self.count = 0;
+    }
+
+    fn is_empty(&self) -> bool {
+        self.head == self.count
+    }
+
+    fn pop_front(&mut self) -> Option<(SendId, u32, u32)> {
+        if self.is_empty() {
+            return None;
+        }
+        let send = self.sends[self.head as usize].take();
+        self.head += 1;
+        send
+    }
+
+    fn pop_front_if_ended(&mut self, sent: u32) -> Option<(SendId, u32, u32)> {
+        match self.sends.get(self.head as usize) {
+            Some(Some((_, _, end))) if !self.is_empty() && *end <= sent => self.pop_front(),
+            _ => None,
+        }
+    }
+}
+
+/// Awaited sends taken off a slab entry (`take_sends`, `take_sent_sends`):
+/// each id with its success length, in byte order.
+pub(crate) struct TakenSends(SendRun);
+
+impl Iterator for TakenSends {
+    type Item = (SendId, u32);
+
+    fn next(&mut self) -> Option<(SendId, u32)> {
+        self.0.pop_front().map(|(id, len, _)| (id, len))
     }
 }

@@ -558,8 +558,8 @@ impl<'a> DriverCtx<'a> {
 
         // Chunk data that exceeds the send copy slot size. Each chunk gets its
         // own pool slot and SQE; the per-connection send queue ensures they are
-        // transmitted in order. Only the final chunk is marked end-of-send,
-        // and only that chunk carries the send's id, so the send settles once.
+        // transmitted in order. Only the final chunk carries the send's id, so
+        // the send settles once.
         //
         // `submit_or_queue` is infallible: it pushes to the ring only while
         // nothing is in flight (the first chunk) and parks that chunk at the
@@ -578,7 +578,6 @@ impl<'a> DriverCtx<'a> {
                 .send_copy_pool
                 .copy_in_reserved(&mut reservation, chunk);
             let end_of_send = chunks.peek().is_none();
-            self.send_copy_pool.set_end_of_send(slot, end_of_send);
             if end_of_send && let Some(id) = id {
                 self.send_copy_pool.set_send_id(slot, id, data.len() as u32);
             }
@@ -613,7 +612,7 @@ impl<'a> DriverCtx<'a> {
     /// same `close_submitted` refusal, the same two `reserve_slots` error
     /// mappings, the same TLS branch, the same chunk loop — plus one thing:
     /// `id` and the **logical (plaintext) length** are attached to the
-    /// end-of-send slot, so the completion handler can resolve exactly this
+    /// final slot, so the completion handler can resolve exactly this
     /// operation with exactly the number the caller passed. The length
     /// travels because nothing downstream can recompute it: a TLS send's
     /// final `OpTag::Send` chunk is one ciphertext record.
@@ -788,7 +787,6 @@ impl<'a> DriverCtx<'a> {
                 .send_copy_pool
                 .copy_in_reserved(&mut reservation, chunk);
             let end_of_send = chunks.peek().is_none();
-            self.send_copy_pool.set_end_of_send(slot, end_of_send);
             if end_of_send {
                 // Exactly one slot per logical send carries the id, and the
                 // completion handlers take it from that slot before

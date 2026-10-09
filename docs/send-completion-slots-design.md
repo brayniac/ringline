@@ -65,7 +65,7 @@ together with the length the send reports on success.
 
 | Send | Carrier |
 |---|---|
-| `send`, `send_backpressured`, copy-only batch (io_uring) | End-of-send pool slot (`SendCopyPool`), lifted onto the coalesced slab entry when the run is coalesced |
+| `send`, `send_backpressured`, copy-only batch (io_uring) | Final pool slot (`SendCopyPool`), lifted onto the coalesced slab entry when the run is coalesced |
 | TLS send (io_uring) | The final ciphertext chunk's pool slot (`OpTag::Send`) |
 | Zero-copy batch (io_uring) | The `SendMsgZc` slab entry |
 | `forward_held` (io_uring) | The recv-forward slab entry |

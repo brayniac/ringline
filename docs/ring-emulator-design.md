@@ -381,29 +381,20 @@ emulator removes that copy for guard parts.
 | Learn the request arrived | share of one `io_uring_enter` | share of one `epoll_wait` (`kevent` on macOS) | share of one `epoll_wait` |
 | Read the request | 0 | 1 `read` per completion that carries data, EOF or a read error, plus the `read` returning `EAGAIN` that ends a pass (a readable edge, an arm, a re-arm, or a pass resumed from the cap list); a pass that stops at its cap, for lack of space, at EOF or on an error has none | N `read`s plus 1 `EAGAIN` per edge, into a scratch buffer |
 | `SOCK_NONEMPTY` | 0 | 0, except one `ioctl(FIONREAD)` when a pass stops at its cap or the group runs out of space | — |
-| Send one response | 0 dedicated | 1 `write` or `writev` (plaintext); 1 per ciphertext slot (TLS) | share of one `writev` per connection per flush |
-| Send N pipelined responses on one connection | N SQEs, 0 dedicated syscalls | N `write`s, one per loop iteration or flush | 1 `writev` |
+| Send one response | 0 dedicated | 1 `write`, or 2 when the response spans more than one send-pool slot | share of one `writev` per connection per flush |
+| Send N pipelined responses on one connection | 1 + ⌈(N−1)/32⌉ SQEs: the first response, then one `SendMsgCoalesced` per 32 queued behind it (2 measured at depth 2–32), 0 dedicated syscalls | as many `write`/`writev`s as SQEs (derived, not measured) | 1 `writev` |
 | Move a connection between groups | 0 dedicated (cancel and arm are SQEs) | 0 dedicated: the arm is a pass, counted above; when nothing is queued that pass is one `read` returning `EAGAIN` | — |
 | Re-arm after `ENOBUFS` | 0 dedicated | 0 dedicated: the re-arm's read is the pass's first, counted above (rule 2) | — |
 
-Until #628 lands, pipelined plaintext copy sends and TLS sends are where
-the emulator pays more syscalls than mio today; the `FIONREAD` when a pass
-stops at its cap or for lack of space is a smaller one.
-
-The driver keeps one send in flight per connection and never merges two
-user sends into one SQE: every `send()` marks its last slot end-of-send,
-and `submit_next_queued_inner` stops a coalescing run there (`driver.rs`).
-On io_uring that costs SQEs, not syscalls. On the emulator each SQE is one
-`write`, and each queued send waits for the previous one's completion.
-Merging consecutive copy sends on a connection into one
-`SendMsgCoalesced`, with each send's completion accounted from the total,
-removes the regression on the emulator and cuts SQEs on io_uring. That is
-a driver change, tracked in #628, and it lands before the mio backend is
-retired (step 7). #628 also covers TLS sends: every TLS ciphertext slot is
-marked end-of-send today (`alloc_raw` and `copy_in` set it and the TLS
-paths never clear it), so each slot is its own SQE, and until #628 lands a
-TLS response costs the emulator one `write` per send-pool slot of
-ciphertext against one `writev` per flush on mio.
+The driver keeps one send in flight per connection. Queued copy sends,
+plaintext or TLS ciphertext, coalesce into one `SendMsgCoalesced` of up to
+32 iovecs when the in-flight send completes (#628), each awaited send
+settling with its own length, so N pipelined responses cost the first
+response's operation and one more per 32 queued behind it, and a TLS
+response's ciphertext slots after the first go out together. The emulator
+still pays at least one more `write` than mio's single `writev` per flush
+for a pipelined batch; the `FIONREAD` when a
+pass stops at its cap or for lack of space is the other extra syscall.
 
 ### Measuring the counts
 
