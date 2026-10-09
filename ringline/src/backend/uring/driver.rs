@@ -129,13 +129,18 @@ impl Driver {
     }
 
     /// Copy `data` into an owned buffer for a `recv_hold` entry, and return
-    /// the entry's bid and the copy's address. `None` when every bid above
-    /// the ring is in use; the caller then lends the provided buffer.
+    /// the entry's bid and the copy's address. At most `ring_entries()`
+    /// copies exist, each at most one completion, so owned copies hold at
+    /// most one more ring's worth of bytes. `None` when all are in use; the
+    /// caller then lends the provided buffer, so a peer that sends without
+    /// reading drains the ring and meets `ENOBUFS` backpressure.
     pub(crate) fn own_recv_copy(&mut self, data: &[u8]) -> Option<(u16, *const u8)> {
         let first = self.provided_bufs.ring_entries() as usize;
         let index = match self.owned_recv_free.pop() {
             Some(i) => i as usize,
-            None if first + self.owned_recv.len() < u16::MAX as usize => {
+            None if self.owned_recv.len() < first
+                && first + self.owned_recv.len() < u16::MAX as usize =>
+            {
                 self.owned_recv.push(None);
                 self.owned_recv.len() - 1
             }
@@ -171,6 +176,17 @@ impl Driver {
         self.provided_bufs.release_batch(&bids);
         bids.clear();
         self.pending_replenish = bids;
+    }
+
+    /// Length of the memory a `recv_hold` entry's bid names: an owned copy's
+    /// length, or a provided buffer's size.
+    fn recv_data_len(&self, bid: u16) -> usize {
+        if self.is_owned_recv(bid) {
+            let index = bid as usize - self.provided_bufs.ring_entries() as usize;
+            self.owned_recv[index].as_ref().map_or(0, |c| c.len())
+        } else {
+            self.provided_bufs.buffer_size() as usize
+        }
     }
 
     /// Address of byte `off` of the data a `recv_hold` entry's bid names: a
@@ -430,7 +446,9 @@ pub(crate) struct Driver {
     /// replenished) instead of copied into the accumulator, then forwarded back
     /// in one coalesced `sendmsg` via `forward_held`. Backpressure is natural:
     /// unreplenished bids deplete the provided-buffer ring (ENOBUFS) until a
-    /// forward completes and replenishes them.
+    /// forward completes and replenishes them. Above the lend cap an entry is
+    /// an owned copy instead (`own_recv_copy`), at most `ring_entries()` of
+    /// them per worker; past that, entries hold ring buffers again.
     /// `recv_hold` is also the staging area for direct-echo connections, which
     /// gather it the same way from the CQE handler (see `flush_direct_echo`).
     pub(crate) recv_hold: Vec<std::collections::VecDeque<PendingRecvBuf>>,
@@ -2004,8 +2022,9 @@ impl Driver {
         } else {
             return;
         }
-        // Replenish any held (not-yet-forwarded) zero-copy recv buffers so their
-        // bids aren't leaked, and clear the opt-in flag for slot reuse. An
+        // Release every held (not-yet-forwarded) entry, ring buffer or owned
+        // copy, so its bid is not leaked, and clear the opt-in flag for slot
+        // reuse. An
         // in-flight forward's bids live in its slab entry (already drained from
         // recv_hold) and are replenished by its own completion handler.
         // Direct-echo connections stage in the same hold, so this drains
@@ -2225,8 +2244,8 @@ impl Driver {
         out
     }
 
-    /// Copy `len` bytes out of provided buffer `bid`, then return the bid to
-    /// the ring. `None` for an empty buffer, which carries no bytes and would
+    /// Copy `len` bytes from `ptr`, the data of the buffer `bid` names (a
+    /// ring buffer or an owned copy), then release the bid. `None` for an empty buffer, which carries no bytes and would
     /// only add an empty chunk to the stream.
     ///
     /// Copy first, replenish second, nothing in between — a bid handed back
@@ -2887,7 +2906,8 @@ impl Driver {
             ud.raw(),
         );
         // Infallible: under SQ pressure the echo is parked at the queue head
-        // and retried, holding its provided buffer exactly as a queued echo
+        // and retried, holding the buffer its bid names (a ring buffer or an
+        // owned copy) exactly as a queued echo
         // does; the bid is replenished by its completion.
         self.submit_or_queue_send(
             conn_index,
@@ -2954,9 +2974,13 @@ impl Driver {
         let crate::backend::uring::sqe::Op::Send { buf, .. } = built.entry.op else {
             unreachable!("a SendRecvBuf is a plain send");
         };
-        let base = self.recv_data_ptr(ud.payload() as u16, 0);
+        let bid = ud.payload() as u16;
+        let base = self.recv_data_ptr(bid, 0);
         let off = (buf as usize).wrapping_sub(base as usize);
-        debug_assert!(buf >= base, "send before its data");
+        debug_assert!(
+            buf >= base && off < self.recv_data_len(bid),
+            "send outside its data"
+        );
         self.send_recv_buf_offs[ci] = off as u32;
     }
 
@@ -3011,8 +3035,8 @@ impl Driver {
     /// they were carrying.
     ///
     /// A queued `SendRecvBuf` entry (recv-buffer forward / direct echo) owns
-    /// neither a pool slot nor a slab entry; it owns the provided recv buffer
-    /// whose bid is the SQE's payload. No CQE will ever replenish it, so the
+    /// neither a pool slot nor a slab entry; it owns the buffer whose bid is
+    /// the SQE's payload (a ring buffer or an owned copy). No CQE will ever replenish it, so the
     /// bid is recovered from the entry's user_data here, exactly as the
     /// completion handler would have done.
     ///

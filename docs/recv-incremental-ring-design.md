@@ -243,7 +243,8 @@ The rules:
    copy, TLS, recv sinks, `ForceCopy`, timestamps, the stale-CQE early
    returns) in the completion handler, a lend path when it is done with
    the bytes. `flush_replenish_and_rearm` releases the pushed bids
-   (`ProvidedBufRing::release_batch`).
+   (`Driver::release_pending`, which frees owned copies and passes ring
+   bids to `ProvidedBufRing::release_batch`).
 5. On a plain ring every completion exhausts its buffer, at offset 0. One
    code path serves both ring kinds.
 
@@ -617,7 +618,12 @@ promoted, so its later lends pin large-group buffers.
     an incremental completion can exceed a 16 KiB slot. The entry's bid is
     `ring_entries()` plus the copy's index, above every ring bid, so every
     existing release path pushes it unchanged and the flush frees the copy
-    instead of releasing a ring buffer.
+    instead of releasing a ring buffer; at worker exit, `Driver`'s drop frees
+    any left. At most `ring_entries()` copies exist per worker; past that the
+    ring buffer is lent, so a peer that sends without reading drains the ring
+    and meets `ENOBUFS` backpressure. Step 5 must move the owned bids above
+    every group's `ring_entries()`, or mark them with their own group, since a
+    large-group bid can exceed the small group's ring size.
 - Per connection, `forward_hold_cap` still counts held ranges; one forwarder
   can pin up to that many shared buffers, which the per-group cap bounds.
 - With `recv_incremental` on, `recv_segment_reserve` is ignored and the
@@ -663,7 +669,9 @@ receive queue, and TCP closes the window until the worker re-arms.
 ## Sizing
 
 - Per worker: 64 MiB with an INC ring (128 MiB with the large group), 512
-  MiB with a plain ring. Only touched pages are resident: the plain groups
+  MiB with a plain ring. With `recv_incremental`, owned copies for
+  recv-forward and direct echo add at most one more ring's worth (one copy
+  per ring entry, each at most one buffer). Only touched pages are resident: the plain groups
   use `MADV_NOHUGEPAGE`, and with transparent huge pages a completion would
   otherwise make its whole 2 MiB region resident.
 - A group covers the bytes that arrive while a worker is not reaping:

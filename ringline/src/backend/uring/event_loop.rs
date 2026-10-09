@@ -1827,7 +1827,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // `forward_held`. No accumulator copy. Backpressure is natural —
             // unreplenished bids deplete the ring (ENOBUFS) until a forward
             // completes. The hold is drained on close (see close_connection).
-            // Over the lend cap the bytes are copied into an owned entry.
+            // Over the lend cap the bytes are copied into an owned entry, up
+            // to `ring_entries()` owned copies per worker; past that the ring
+            // buffer is held and the same backpressure applies.
             let (hold_bid, hold_ptr) = self.lend_or_own(bid, buf_ptr, data);
             self.driver.recv_hold[conn_index as usize].push_back(crate::backend::PendingRecvBuf {
                 bid: hold_bid,
@@ -10502,6 +10504,51 @@ mod tests {
         let (bid, _) = el.driver.own_recv_copy(b"copy").expect("owned bid");
         el.driver.pending_replenish.extend([bid, bid]);
         el.driver.release_pending();
+    }
+
+    /// At most `ring_entries()` owned copies exist; past that the caller
+    /// lends the ring buffer.
+    #[test]
+    fn owned_receive_copies_stop_at_one_ring() {
+        let mut el = make_test_loop();
+        let ring = el.driver.provided_bufs.ring_entries();
+        for _ in 0..ring {
+            assert!(el.driver.own_recv_copy(b"x").is_some());
+        }
+        assert!(el.driver.own_recv_copy(b"x").is_none());
+    }
+
+    /// A direct-echo owned copy is freed when its send completes.
+    #[test]
+    fn a_direct_echo_owned_copy_is_freed_by_its_send() {
+        let mut el = make_test_loop();
+        let conn = accept_connection(&mut el);
+        el.driver.connections.get_mut(conn).unwrap().direct_echo = true;
+        el.driver.lend_cap = Some(0);
+        deliver(&mut el, conn, 2, b"echo-me");
+        let entry = el.driver.recv_hold[conn as usize].pop_front().unwrap();
+        let ci = conn as usize;
+        el.driver.send_recv_buf_original_lens[ci] = 7;
+        el.driver.send_recv_buf_remaining[ci] = 7;
+        el.driver.send_queues[ci].in_flight = true;
+        let ud = UserData::encode(OpTag::SendRecvBuf, conn, entry.bid as u32);
+        el.test_dispatch_cqe(ud.raw(), 7, 0);
+        assert!(el.driver.pending_replenish.contains(&entry.bid));
+        el.driver.release_pending();
+        assert!(el.driver.owned_recv.iter().all(Option::is_none));
+    }
+
+    /// A recv-forward owned copy is freed when its connection closes.
+    #[test]
+    fn a_recv_forward_owned_copy_is_freed_on_close() {
+        let mut el = make_test_loop();
+        let conn = accept_connection(&mut el);
+        el.driver.recv_forward[conn as usize] = true;
+        el.driver.lend_cap = Some(0);
+        deliver(&mut el, conn, 3, b"forward");
+        el.driver.close_connection(conn);
+        el.driver.release_pending();
+        assert!(el.driver.owned_recv.iter().all(Option::is_none));
     }
 
     /// Over the lend cap, a recv-forward completion is held as an owned

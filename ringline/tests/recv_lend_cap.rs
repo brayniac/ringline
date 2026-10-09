@@ -137,3 +137,56 @@ fn recv_forward_echoes_over_the_lend_cap() {
 fn direct_echo_echoes_over_the_lend_cap() {
     echo_over_the_lend_cap::<DirectEcho>(320 << 10);
 }
+
+/// A client that writes without reading the echo is stopped by TCP
+/// backpressure: above the lend cap, owned copies stop at one ring's worth,
+/// then the ring drains and its receive stops. Without that bound the server
+/// would buffer everything the client sends.
+fn writes_stall_without_reads<H: AsyncEventHandler>() {
+    const LIMIT: u64 = 64 << 20;
+    let config = ConfigBuilder::new()
+        .workers(1)
+        .pin_to_core(false)
+        .max_connections(64)
+        .recv_incremental(true)
+        .recv_buffer(16, 64 << 10)
+        .build()
+        .expect("config");
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind("127.0.0.1:0".parse().unwrap())
+        .launch::<H>()
+        .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
+    wait_for_server(&addr);
+    let mut client = TcpStream::connect(&addr).unwrap();
+    client
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let chunk = vec![7u8; 1 << 20];
+    let mut sent = 0u64;
+    while sent < LIMIT {
+        match client.write(&chunk) {
+            Ok(n) => sent += n as u64,
+            Err(_) => break,
+        }
+    }
+    drop(client);
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+    assert!(
+        sent < LIMIT,
+        "the server accepted {sent} bytes without a read"
+    );
+}
+
+#[test]
+fn recv_forward_writes_stall_without_reads() {
+    writes_stall_without_reads::<RecvForwardEcho>();
+}
+
+#[test]
+fn direct_echo_writes_stall_without_reads() {
+    writes_stall_without_reads::<DirectEcho>();
+}
