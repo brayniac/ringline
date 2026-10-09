@@ -126,8 +126,7 @@ pub(crate) trait Engine: Sized {
     /// Whether this engine registers [`RingKind::Incremental`] rings
     /// (`IOU_PBUF_RING_INC`, Linux 6.12+). `Ok(false)` means the kernel
     /// lacks them; an error is a failure to find out (for example `ENOMEM`
-    /// from `RLIMIT_MEMLOCK`), and the next call tries again. Not called
-    /// yet; #622's ring-kind selection will use it.
+    /// from `RLIMIT_MEMLOCK`), and the next call tries again.
     #[allow(dead_code)] // first caller lands with #622's ring-kind selection
     fn incremental_buffers(&self) -> io::Result<bool>;
 

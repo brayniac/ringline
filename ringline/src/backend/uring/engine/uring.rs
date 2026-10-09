@@ -182,7 +182,10 @@ impl UringEngine {
     /// Whether the kernel registers an `IOU_PBUF_RING_INC` ring: register a
     /// one-entry incremental ring under group id `u16::MAX` (which
     /// `Config::validate` reserves) and unregister it. `EINVAL` means the
-    /// kernel lacks it; any other error is returned.
+    /// kernel lacks it; any other error is returned. It registers through
+    /// the `io-uring` crate without the `resv[0]` retry: the kernels that
+    /// need that retry are 6.8, which predates `IOU_PBUF_RING_INC`, so
+    /// `EINVAL` there is still the right answer.
     fn probe_incremental(&self) -> io::Result<bool> {
         const PROBE_BGID: u16 = u16::MAX;
         // Safety: sysconf has no preconditions.
