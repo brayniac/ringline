@@ -578,7 +578,6 @@ impl<'a> DriverCtx<'a> {
                 .send_copy_pool
                 .copy_in_reserved(&mut reservation, chunk);
             let end_of_send = chunks.peek().is_none();
-            self.send_copy_pool.set_end_of_send(slot, end_of_send);
             if end_of_send && let Some(id) = id {
                 self.send_copy_pool.set_send_id(slot, id, data.len() as u32);
             }
@@ -788,7 +787,6 @@ impl<'a> DriverCtx<'a> {
                 .send_copy_pool
                 .copy_in_reserved(&mut reservation, chunk);
             let end_of_send = chunks.peek().is_none();
-            self.send_copy_pool.set_end_of_send(slot, end_of_send);
             if end_of_send {
                 // Exactly one slot per logical send carries the id, and the
                 // completion handlers take it from that slot before

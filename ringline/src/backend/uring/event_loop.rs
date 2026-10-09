@@ -3369,7 +3369,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // this CQE outlived, whose teardown already recorded the abort,
             // and a driver result would override that abort (#381) with a
             // dead occupant's outcome.
-            if let Some((id, _len)) = self.driver.send_slab.take_send_id(slab_idx) {
+            for (id, _len) in self.driver.send_slab.take_sends(slab_idx) {
                 self.executor.forget_send(id);
             }
             self.release_coalesced(slab_idx);
@@ -3379,10 +3379,16 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         if result > 0 {
             // Partial send: advance the iovec array and resubmit the remainder.
             if let Some(msg_ptr) = self.driver.send_slab.try_advance(slab_idx, result as u32) {
+                // A run can span several sends (#628). Those whose bytes are
+                // all on the wire settle now with their own length; only the
+                // rest wait for, or fail with, the remainder.
+                for (id, len) in self.driver.send_slab.take_sent_sends(slab_idx) {
+                    self.settle_send(id, Ok(len));
+                }
                 if self.close_submitted(conn_index) {
-                    let settles = self.driver.send_slab.take_send_id(slab_idx);
+                    let settles = self.driver.send_slab.take_sends(slab_idx);
                     self.release_coalesced(slab_idx);
-                    if let Some((id, _logical_len)) = settles {
+                    for (id, _logical_len) in settles {
                         self.settle_send(id, Err(io::Error::from_raw_os_error(libc::ECANCELED)));
                     }
                     return;
@@ -3403,7 +3409,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // Fully sent.
             let total = self.driver.send_slab.total_len(slab_idx);
             // Take the send this entry settles before releasing it.
-            let settles = self.driver.send_slab.take_send_id(slab_idx);
+            let settles = self.driver.send_slab.take_sends(slab_idx);
             metrics::BYTES.add(metrics::bytes::SENT, total as u64);
             self.release_coalesced(slab_idx);
 
@@ -3411,7 +3417,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.driver.note_send_finalized(conn_index);
             // The carried logical (plaintext) length, not `acked` — see
             // `handle_send`'s success path.
-            if let Some((id, logical_len)) = settles {
+            for (id, logical_len) in settles {
                 self.settle_send(id, Ok(logical_len));
             }
             return;
@@ -3424,9 +3430,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let errno = -result;
         if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
             if self.close_submitted(conn_index) {
-                let settles = self.driver.send_slab.take_send_id(slab_idx);
+                let settles = self.driver.send_slab.take_sends(slab_idx);
                 self.release_coalesced(slab_idx);
-                if let Some((id, _logical_len)) = settles {
+                for (id, _logical_len) in settles {
                     self.settle_send(id, Err(io::Error::from_raw_os_error(libc::ECANCELED)));
                 }
                 return;
@@ -3445,11 +3451,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
 
         // Real error — release everything and drain the connection's queue.
-        let settles = self.driver.send_slab.take_send_id(slab_idx);
+        let settles = self.driver.send_slab.take_sends(slab_idx);
         self.release_coalesced(slab_idx);
         self.driver.drain_conn_send_queue(conn_index);
         self.driver.note_send_finalized(conn_index);
-        if let Some((id, _logical_len)) = settles {
+        for (id, _logical_len) in settles {
             self.settle_send(id, Err(Self::send_error(result)));
         }
     }
@@ -3480,7 +3486,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// the length it carries. Call before releasing the entry, which clears
     /// the id.
     fn settle_slab_ok(&mut self, slab_idx: u16) {
-        if let Some((id, len)) = self.driver.send_slab.take_send_id(slab_idx) {
+        for (id, len) in self.driver.send_slab.take_sends(slab_idx) {
             self.settle_send(id, Ok(len));
         }
     }
@@ -3488,8 +3494,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// Settle the awaited send slab entry `slab_idx` carries, if any, with
     /// `err`. Call before releasing the entry, which clears the id.
     fn settle_slab_err(&mut self, slab_idx: u16, err: io::Error) {
-        if let Some((id, _len)) = self.driver.send_slab.take_send_id(slab_idx) {
-            self.settle_send(id, Err(err));
+        for (id, _len) in self.driver.send_slab.take_sends(slab_idx) {
+            let copy = match err.raw_os_error() {
+                Some(errno) => io::Error::from_raw_os_error(errno),
+                None => io::Error::new(err.kind(), err.to_string()),
+            };
+            self.settle_send(id, Err(copy));
         }
     }
 
@@ -3500,7 +3510,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// teardown recorded its abort, and a driver result would override it
     /// (#381). Call before releasing the entry.
     fn settle_abandoned_retry(&mut self, slab_idx: u16, identity_ok: bool) {
-        if let Some((id, _len)) = self.driver.send_slab.take_send_id(slab_idx) {
+        for (id, _len) in self.driver.send_slab.take_sends(slab_idx) {
             if identity_ok {
                 self.settle_send(id, Err(io::Error::from_raw_os_error(libc::ECANCELED)));
             } else {
@@ -3541,7 +3551,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // bids and release the entry; touch no per-connection state, and
         // settle nothing (teardown recorded the abort).
         if !self.slab_identity_ok(conn_index, slab_idx) {
-            if let Some((id, _len)) = self.driver.send_slab.take_send_id(slab_idx) {
+            for (id, _len) in self.driver.send_slab.take_sends(slab_idx) {
                 self.executor.forget_send(id);
             }
             self.release_recv_forward(slab_idx);
@@ -3975,7 +3985,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 // (not on notif CQEs, which for a resubmitted partial can
                 // precede the remainder's main CQE), matching run_shutdown.
                 // Its send settles nothing: teardown recorded the abort.
-                if let Some((id, _len)) = self.driver.send_slab.take_send_id(slab_idx) {
+                for (id, _len) in self.driver.send_slab.take_sends(slab_idx) {
                     self.executor.forget_send(id);
                 }
                 if cqueue::more(flags) {
@@ -5244,20 +5254,22 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 // The `!identity_ok` reason is a dead occupant's entry, whose
                 // operation teardown already aborted; a driver result would
                 // override that abort (#381).
-                let settles = self.driver.send_slab.take_send_id(slab_idx);
+                let settles = self.driver.send_slab.take_sends(slab_idx);
                 self.release_coalesced(slab_idx);
-                if identity_ok && let Some((id, _logical_len)) = settles {
-                    self.settle_send(id, Err(io::Error::from_raw_os_error(libc::ECANCELED)));
+                for (id, _logical_len) in settles {
+                    if identity_ok {
+                        self.settle_send(id, Err(io::Error::from_raw_os_error(libc::ECANCELED)));
+                    }
                 }
                 continue;
             }
             if retries >= 2 {
                 // Give up: fail the send and close so the connection isn't
                 // left open with a hole in its byte stream.
-                let settles = self.driver.send_slab.take_send_id(slab_idx);
+                let settles = self.driver.send_slab.take_sends(slab_idx);
                 self.release_coalesced(slab_idx);
                 self.driver.drain_conn_send_queue(conn_index);
-                if let Some((id, _logical_len)) = settles {
+                for (id, _logical_len) in settles {
                     self.settle_send(
                         id,
                         Err(io::Error::other(
@@ -7231,8 +7243,6 @@ mod tests {
         let (slot0, _p0, _l0) = el.driver.send_copy_pool.copy_in(&chunk0).unwrap();
         let (slot1, ptr1, len1) = el.driver.send_copy_pool.copy_in(&chunk1).unwrap();
         // One logical send split across two slots: only the last is end-of-send.
-        el.driver.send_copy_pool.set_end_of_send(slot0, false);
-        el.driver.send_copy_pool.set_end_of_send(slot1, true);
         let id = await_slot(&mut el, conn_index, slot1, total);
 
         // Queue chunk 1 as a real BuiltSend behind the in-flight chunk 0.
@@ -7380,16 +7390,6 @@ mod tests {
 
         let state = &el.driver.send_queues[conn_index as usize];
         assert_eq!(state.queue.len(), 4, "one queued entry per chunk");
-        let end_flags: Vec<bool> = state
-            .queue
-            .iter()
-            .map(|b| el.driver.send_copy_pool.is_end_of_send(b.pool_slot))
-            .collect();
-        assert_eq!(
-            end_flags,
-            vec![false, false, false, true],
-            "only the final chunk is end-of-send"
-        );
         let lens: Vec<u32> = state.queue.iter().map(|b| b.total_len).collect();
         assert_eq!(lens, vec![64, 64, 64, 8], "chunks queued in order");
         assert_eq!(
@@ -7565,20 +7565,15 @@ mod tests {
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
 
-        // A send is in flight; behind it: one independent send (its own
-        // logical send, so end-of-send) and then the two chunks of a second
-        // logical send. The independent head keeps the coalescing run at
-        // one entry, so this exercises the single-entry push path.
+        // No free slab entry, so the queued copy sends cannot coalesce
+        // (#628 lets a run span sends) and the single-entry push path runs.
+        el.driver.send_slab = crate::buffer::send_slab::InFlightSendSlab::new(0);
+        // A send is in flight; behind it: one independent send and then the
+        // two chunks of a second logical send.
         el.driver.send_queues[conn_index as usize].in_flight = true;
         let head = built_copy_send(&mut el, conn_index, b"X");
         let chunk0 = built_copy_send(&mut el, conn_index, b"AA");
         let chunk1 = built_copy_send(&mut el, conn_index, b"BBB");
-        el.driver
-            .send_copy_pool
-            .set_end_of_send(chunk0.pool_slot, false);
-        el.driver
-            .send_copy_pool
-            .set_end_of_send(chunk1.pool_slot, true);
         let expected_slots = [head.pool_slot, chunk0.pool_slot, chunk1.pool_slot];
         {
             let q = &mut el.driver.send_queues[conn_index as usize].queue;
@@ -7652,13 +7647,6 @@ mod tests {
         let c0 = built_copy_send(&mut el, conn_index, b"aa");
         let c1 = built_copy_send(&mut el, conn_index, b"bb");
         let c2 = built_copy_send(&mut el, conn_index, b"cc");
-        el.driver
-            .send_copy_pool
-            .set_end_of_send(c0.pool_slot, false);
-        el.driver
-            .send_copy_pool
-            .set_end_of_send(c1.pool_slot, false);
-        el.driver.send_copy_pool.set_end_of_send(c2.pool_slot, true);
         let expected_slots = [c0.pool_slot, c1.pool_slot, c2.pool_slot];
         {
             let q = &mut el.driver.send_queues[conn_index as usize].queue;
@@ -7877,6 +7865,9 @@ mod tests {
                 .expect("valid config"),
         );
         let conn_index = accept_connection(&mut el);
+        // No free slab entry, so the queued copy sends cannot coalesce
+        // (#628 lets a run span sends) and the single-entry push path runs.
+        el.driver.send_slab = crate::buffer::send_slab::InFlightSendSlab::new(0);
         let generation = el.driver.connections.generation(conn_index);
 
         let a = built_copy_send(&mut el, conn_index, b"aaa");
@@ -7955,6 +7946,9 @@ mod tests {
                 .expect("valid config"),
         );
         let conn_index = accept_connection(&mut el);
+        // No free slab entry, so the queued copy sends cannot coalesce
+        // (#628 lets a run span sends) and the single-entry push path runs.
+        el.driver.send_slab = crate::buffer::send_slab::InFlightSendSlab::new(0);
         let generation = el.driver.connections.generation(conn_index);
 
         let first = built_copy_send(&mut el, conn_index, b"one");
@@ -16549,7 +16543,6 @@ mod tests {
         let id = submitted_id(&mut el, conn_index, generation);
         let data = [b'p'; 20];
         let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(&data).unwrap();
-        el.driver.send_copy_pool.set_end_of_send(slot, true);
         el.driver.send_copy_pool.set_send_id(slot, id, 20);
         let ud = UserData::encode(
             OpTag::Send,
@@ -16603,10 +16596,6 @@ mod tests {
         el.driver.send_queues[conn_index as usize].in_flight = true;
         let c0 = built_copy_send(&mut el, conn_index, b"aa");
         let c1 = built_copy_send(&mut el, conn_index, b"bbb");
-        el.driver
-            .send_copy_pool
-            .set_end_of_send(c0.pool_slot, false);
-        el.driver.send_copy_pool.set_end_of_send(c1.pool_slot, true);
         // Deliberately neither chunk's length and not the run's 5 wire
         // bytes: under TLS the number the caller passed is a plaintext
         // length no completion handler can recompute, which is the whole
@@ -17017,7 +17006,6 @@ mod tests {
 
         let id = submitted_id(&mut el, conn_index, generation);
         let (slot, _p, _l) = el.driver.send_copy_pool.copy_in(b"doomed").unwrap();
-        el.driver.send_copy_pool.set_end_of_send(slot, true);
         el.driver.send_copy_pool.set_send_id(slot, id, 6);
         let ud = UserData::encode(
             OpTag::Send,
@@ -17053,7 +17041,6 @@ mod tests {
 
         let id = submitted_id(&mut el, conn_index, generation);
         let (slot, _p, _l) = el.driver.send_copy_pool.copy_in(b"nothing went").unwrap();
-        el.driver.send_copy_pool.set_end_of_send(slot, true);
         el.driver.send_copy_pool.set_send_id(slot, id, 12);
         let ud = UserData::encode(
             OpTag::Send,
@@ -17090,7 +17077,6 @@ mod tests {
         let id = submitted_id(&mut el, conn_index, generation);
         let ciphertext = [b'c'; 30];
         let (slot, _p, _l) = el.driver.send_copy_pool.copy_in(&ciphertext).unwrap();
-        el.driver.send_copy_pool.set_end_of_send(slot, true);
         // 12 bytes of plaintext became 30 bytes on the wire.
         el.driver.send_copy_pool.set_send_id(slot, id, 12);
         let ud = UserData::encode(
@@ -17189,7 +17175,6 @@ mod tests {
         let id = submitted_id(&mut el, conn_index, generation);
         let data = [b'x'; 20];
         let (slot, _p, _l) = el.driver.send_copy_pool.copy_in(&data).unwrap();
-        el.driver.send_copy_pool.set_end_of_send(slot, true);
         el.driver.send_copy_pool.set_send_id(slot, id, 20);
         el.driver.send_queues[conn_index as usize].close_submitted = true;
 
@@ -17226,7 +17211,6 @@ mod tests {
         let id = submitted_id(&mut el, conn_index, generation);
         let ciphertext = [b'c'; 20];
         let (slot, _p, _l) = el.driver.send_copy_pool.copy_in(&ciphertext).unwrap();
-        el.driver.send_copy_pool.set_end_of_send(slot, true);
         el.driver.send_copy_pool.set_send_id(slot, id, 20);
         el.driver.send_queues[conn_index as usize].close_submitted = true;
 
@@ -17260,7 +17244,6 @@ mod tests {
 
         let id = submitted_id(&mut el, conn_index, generation);
         let (slot, _p, _l) = el.driver.send_copy_pool.copy_in(b"stuck").unwrap();
-        el.driver.send_copy_pool.set_end_of_send(slot, true);
         el.driver.send_copy_pool.set_send_id(slot, id, 5);
         el.driver
             .pending_copy_retries
@@ -17289,6 +17272,71 @@ mod tests {
         );
     }
 
+    /// Queue two awaited copy sends, `aa` and `bbb`, behind an in-flight
+    /// send, then let the in-flight one finish, so both go out as one
+    /// coalesced `sendmsg` (#628). Returns their ids and the slab entry.
+    fn two_pipelined_sends(
+        el: &mut AsyncEventLoop<NoopHandler>,
+        conn_index: u32,
+        generation: u32,
+    ) -> (SendId, SendId, u16) {
+        let first = submitted_id(el, conn_index, generation);
+        let second = submitted_id(el, conn_index, generation);
+        el.driver.send_queues[conn_index as usize].in_flight = true;
+        for (id, data) in [(first, &b"aa"[..]), (second, b"bbb")] {
+            let built = built_copy_send(el, conn_index, data);
+            el.driver
+                .send_copy_pool
+                .set_send_id(built.pool_slot, id, data.len() as u32);
+            el.driver.send_queues[conn_index as usize]
+                .queue
+                .push_back(built);
+        }
+        assert!(el.driver.submit_next_queued(conn_index));
+        assert!(
+            el.driver.send_queues[conn_index as usize].queue.is_empty(),
+            "both sends left in one operation"
+        );
+        let pushed = UserData(el.driver.ring.last_pushed.as_ref().unwrap().user_data);
+        assert_eq!(pushed.tag(), Some(OpTag::SendMsgCoalesced));
+        (first, second, pushed.payload() as u16)
+    }
+
+    /// Two pipelined sends coalesced into one `sendmsg` each settle with their
+    /// own length, not the run's total.
+    #[test]
+    fn pipelined_sends_coalesce_and_each_settles_with_its_own_length() {
+        let mut el = bounded_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let (first, second, slab_idx) = two_pipelined_sends(&mut el, conn_index, generation);
+        let ud = UserData::encode(OpTag::SendMsgCoalesced, conn_index, slab_idx as u32);
+        el.test_dispatch_cqe(ud.raw(), 5, 0);
+        assert_eq!(el.executor.take_send_result(first).unwrap().unwrap(), 2);
+        assert_eq!(el.executor.take_send_result(second).unwrap().unwrap(), 3);
+        assert!(!el.driver.send_slab.in_use(slab_idx));
+    }
+
+    /// A partial write that covers the first send settles it at once; an
+    /// error on the rest fails only the second.
+    #[test]
+    fn a_partial_write_settles_the_sends_it_covers() {
+        let mut el = bounded_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let (first, second, slab_idx) = two_pipelined_sends(&mut el, conn_index, generation);
+        let ud = UserData::encode(OpTag::SendMsgCoalesced, conn_index, slab_idx as u32);
+        el.test_dispatch_cqe(ud.raw(), 2, 0);
+        assert_eq!(el.executor.take_send_result(first).unwrap().unwrap(), 2);
+        assert!(
+            el.executor.take_send_result(second).is_none(),
+            "still in flight"
+        );
+        el.test_dispatch_cqe(ud.raw(), -libc::EPIPE, 0);
+        let err = el.executor.take_send_result(second).unwrap().unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EPIPE));
+    }
+
     /// `drain_coalesced_retries`' give-up arm, on the id the slab entry
     /// carries.
     #[test]
@@ -17300,8 +17348,6 @@ mod tests {
         let id = submitted_id(&mut el, conn_index, generation);
         let (s0, p0, l0) = el.driver.send_copy_pool.copy_in(b"aa").unwrap();
         let (s1, p1, l1) = el.driver.send_copy_pool.copy_in(b"bbb").unwrap();
-        el.driver.send_copy_pool.set_end_of_send(s0, false);
-        el.driver.send_copy_pool.set_end_of_send(s1, true);
         let iovecs = [
             libc::iovec {
                 iov_base: p0 as *mut libc::c_void,
@@ -17321,7 +17367,7 @@ mod tests {
                 &iovecs,
                 &[s0, s1],
                 l0 + l1,
-                Some((id, 99)),
+                Some((id, 99, l0 + l1)),
             )
             .expect("slab room");
         el.driver
@@ -17358,7 +17404,6 @@ mod tests {
 
         let id = submitted_id(&mut el, conn_index, generation);
         let (slot, _p, _l) = el.driver.send_copy_pool.copy_in(b"blocked").unwrap();
-        el.driver.send_copy_pool.set_end_of_send(slot, true);
         el.driver.send_copy_pool.set_send_id(slot, id, 7);
         el.driver
             .pending_send_pollout_retries
@@ -17522,7 +17567,6 @@ mod tests {
 
         let id = submitted_id(&mut el, conn_index, old_gen);
         let (slot, _p, _l) = el.driver.send_copy_pool.copy_in(b"orphaned").unwrap();
-        el.driver.send_copy_pool.set_end_of_send(slot, true);
         el.driver.send_copy_pool.set_send_id(slot, id, 8);
         let ud = UserData::encode(
             OpTag::Send,
@@ -17700,7 +17744,6 @@ mod tests {
             .send_copy_pool
             .copy_in(data)
             .expect("free pool slot");
-        el.driver.send_copy_pool.set_end_of_send(slot, true);
         el.driver.send_copy_pool.set_send_id(slot, id, logical_len);
         (id, slot)
     }
@@ -17987,8 +18030,6 @@ mod tests {
         let id = submitted_id(&mut el, conn_index, generation);
         let (s0, p0, l0) = el.driver.send_copy_pool.copy_in(b"aa").unwrap();
         let (s1, p1, l1) = el.driver.send_copy_pool.copy_in(b"bbb").unwrap();
-        el.driver.send_copy_pool.set_end_of_send(s0, false);
-        el.driver.send_copy_pool.set_end_of_send(s1, true);
         let iovecs = [
             libc::iovec {
                 iov_base: p0 as *mut libc::c_void,
@@ -18010,7 +18051,7 @@ mod tests {
                 l0 + l1,
                 // Neither chunk's length and not the run's 5 wire bytes: the
                 // carried number is the only one a handler cannot recompute.
-                Some((id, 99)),
+                Some((id, 99, l0 + l1)),
             )
             .expect("slab room");
 
@@ -18058,8 +18099,6 @@ mod tests {
         let id = submitted_id(&mut el, conn_index, generation);
         let (s0, p0, l0) = el.driver.send_copy_pool.copy_in(b"aa").unwrap();
         let (s1, p1, l1) = el.driver.send_copy_pool.copy_in(b"bbb").unwrap();
-        el.driver.send_copy_pool.set_end_of_send(s0, false);
-        el.driver.send_copy_pool.set_end_of_send(s1, true);
         let iovecs = [
             libc::iovec {
                 iov_base: p0 as *mut libc::c_void,
@@ -18079,7 +18118,7 @@ mod tests {
                 &iovecs,
                 &[s0, s1],
                 l0 + l1,
-                Some((id, 99)),
+                Some((id, 99, l0 + l1)),
             )
             .expect("slab room");
 

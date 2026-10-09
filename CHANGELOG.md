@@ -74,6 +74,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- On io_uring, consecutive queued copy sends on one connection, plaintext
+  or TLS ciphertext, go out as one `sendmsg` even when they belong to
+  different `send` calls (#628); before, each call took its own operation.
+  Each awaited send still resolves with its own length, and one whose bytes
+  are all sent resolves before the rest of the operation completes. With
+  16-byte responses each sent by `send_nowait`, a client pipelining 32
+  requests per write cost 32 send operations per round on main and 2 with
+  this change; at depth 1 both cost 1.
+
 - On io_uring, each TCP provided receive buffer keeps a count of the
   completions whose data is still in use, and returns to the ring only when
   the kernel is done with it and the count is zero (#622). A buffer

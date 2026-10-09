@@ -2443,34 +2443,23 @@ impl Driver {
 
         let ci = conn_index as usize;
 
-        // Coalesce a run of consecutive plaintext copy sends (pool_slot set, no
-        // ZC slab) at the front of the queue into a single `sendmsg`, so more
-        // than one queued message is pipelined per CQE round-trip. Order is
-        // preserved (one SQE; iovec order = FIFO queue order). ZC-guard sends
+        // Coalesce a run of consecutive copy sends (pool_slot set, no ZC
+        // slab), plaintext or TLS ciphertext, at the front of the queue into a
+        // single `sendmsg`, so more than one queued send is pipelined per CQE
+        // round-trip (#628). Order is preserved (one SQE; iovec order = FIFO
+        // queue order), which keeps TLS records in sequence. ZC-guard sends
         // and recv-buffer forwards are not coalescable and fall through to the
-        // single-submit path below.
+        // single-submit path below. A run can span several logical sends: the
+        // slab entry records each one's id and where its bytes end, and the
+        // completion settles each with its own result.
         let coalescable =
             |b: &crate::handler::BuiltSend| b.pool_slot != u16::MAX && b.slab_idx == u16::MAX;
-        // Coalesce at most one logical send's tail per op: stop the run after
-        // the first chunk marked end-of-send. Otherwise a single coalesced
-        // completion could span two independent pipelined sends, while the
-        // slab entry carries only one send's id.
-        let n = {
-            let mut n = 0;
-            while n < MAX_IOVECS {
-                match self.send_queues[ci].queue.get(n) {
-                    Some(b) if coalescable(b) => {
-                        let pool_slot = b.pool_slot;
-                        n += 1;
-                        if self.send_copy_pool.is_end_of_send(pool_slot) {
-                            break;
-                        }
-                    }
-                    _ => break,
-                }
-            }
-            n
-        };
+        let n = self.send_queues[ci]
+            .queue
+            .iter()
+            .take(MAX_IOVECS)
+            .take_while(|b| coalescable(b))
+            .count();
         if n >= 2 {
             let mut pool_slots = [u16::MAX; MAX_IOVECS];
             {
@@ -2484,6 +2473,11 @@ impl Driver {
                 iov_len: 0,
             }; MAX_IOVECS];
             let mut total: u32 = 0;
+            // The awaited sends the run settles, lifted off the end-of-send
+            // slots that carry them (see below), each with where its bytes
+            // end in the run, and the slot each came from.
+            let mut sends = [None; MAX_IOVECS];
+            let mut send_count = 0;
             for i in 0..n {
                 let (ptr, len) = self.send_copy_pool.current_ptr_remaining(pool_slots[i]);
                 iovecs[i] = libc::iovec {
@@ -2491,18 +2485,27 @@ impl Driver {
                     iov_len: len as usize,
                 };
                 total += len;
+                if let Some((id, logical_len)) = self.send_copy_pool.take_send_id(pool_slots[i]) {
+                    sends[send_count] = Some((pool_slots[i], id, logical_len, total));
+                    send_count += 1;
+                }
             }
-            // The run's last slot carries the send it settles, if any (only
-            // an end-of-send slot does). The
-            // coalesced completion releases every pool slot in the run, so
-            // the id cannot stay on the slot that carried it here; it moves
-            // onto the slab entry, which outlives them. Taken, not peeked:
-            // leaving a copy behind would let both the slab entry and the
-            // slot claim the same operation, and `SendCopyPool::release`
+            // Put every lifted id back on its slot, for the paths that leave
+            // the run queued and still owning its slots.
+            let restore = |pool: &mut crate::buffer::send_copy::SendCopyPool| {
+                for &(slot, id, logical_len, _) in sends[..send_count].iter().flatten() {
+                    pool.set_send_id(slot, id, logical_len);
+                }
+            };
+            // The coalesced completion releases every pool slot in the run, so
+            // an id cannot stay on the end-of-send slot that carried it; it
+            // moves onto the slab entry, which outlives them. Taken, not
+            // peeked: leaving a copy behind would let both the slab entry and
+            // the slot claim the same operation, and `SendCopyPool::release`
             // would then trip on the slot the handler is about to free.
-            // Both failure paths below put it back on that slot, because
+            // Both failure paths below put the ids back (`restore`), because
             // they leave the run queued and still owning its slots.
-            let send_id = self.send_copy_pool.take_send_id(pool_slots[n - 1]);
+            //
             // Only commit to coalescing if the slab has room; otherwise fall
             // through to single-submit (nothing popped yet).
             if let Some((slab_idx, msg_ptr)) = self.send_slab.allocate_coalesced(
@@ -2511,7 +2514,10 @@ impl Driver {
                 &iovecs[..n],
                 &pool_slots[..n],
                 total,
-                send_id,
+                sends[..send_count]
+                    .iter()
+                    .flatten()
+                    .map(|&(_, id, logical_len, end)| (id, logical_len, end)),
             ) {
                 match self
                     .ring
@@ -2538,10 +2544,7 @@ impl Driver {
                         // if teardown gets there first the slot is what
                         // teardown reads.
                         self.send_slab.release(slab_idx);
-                        if let Some((id, logical_len)) = send_id {
-                            self.send_copy_pool
-                                .set_send_id(pool_slots[n - 1], id, logical_len);
-                        }
+                        restore(&mut self.send_copy_pool);
                         self.send_queues[ci].parked = true;
                         let generation = self.connections.generation(conn_index);
                         self.pending_send_retries
@@ -2551,12 +2554,9 @@ impl Driver {
                 }
             }
             // slab full → fall through to single-submit. Nothing was popped
-            // and the run still owns its slots, so the lifted id goes back
-            // where the single-submit path (and teardown) will find it.
-            if let Some((id, logical_len)) = send_id {
-                self.send_copy_pool
-                    .set_send_id(pool_slots[n - 1], id, logical_len);
-            }
+            // and the run still owns its slots, so the lifted ids go back
+            // where the single-submit path (and teardown) will find them.
+            restore(&mut self.send_copy_pool);
         }
 
         let state = &mut self.send_queues[ci];
@@ -2908,10 +2908,8 @@ impl Driver {
             // awaited zero-copy batch; a pool slot is any other awaited send.
             // (A coalesced slab entry is never queued: it is built at submit
             // time and the run it covers is popped on success.)
-            if built.slab_idx != u16::MAX
-                && let Some((id, _len)) = send_slab.take_send_id(built.slab_idx)
-            {
-                ids.push(id);
+            if built.slab_idx != u16::MAX {
+                ids.extend(send_slab.take_sends(built.slab_idx).map(|(id, _)| id));
             }
             if built.pool_slot != u16::MAX
                 && let Some((id, _logical_len)) = send_copy_pool.take_send_id(built.pool_slot)
@@ -3342,7 +3340,7 @@ impl Driver {
         if !self.send_slab.in_use(slab_idx) {
             return;
         }
-        if let Some((id, _logical_len)) = self.send_slab.take_send_id(slab_idx) {
+        for (id, _logical_len) in self.send_slab.take_sends(slab_idx) {
             self.settled_sends.push_back((
                 id,
                 Err(io::Error::new(
