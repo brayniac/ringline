@@ -3111,7 +3111,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.driver.submit_next_queued(conn_index);
             self.driver.note_send_finalized(conn_index);
 
-            // Only a send's end-of-send slot carries its id, so the send
+            // Only a send's final slot carries its id, so the send
             // settles once, when its final chunk completes, with the
             // *logical* (plaintext) length its caller passed. The wire bytes
             // differ under TLS.
@@ -3332,7 +3332,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// Release the backing pool slots of a coalesced send, then the slab entry.
     ///
     /// Callers that mean to settle the run's awaited send must take it with
-    /// `InFlightSendSlab::take_send_id` *before* calling this:
+    /// `InFlightSendSlab::take_sends` *before* calling this:
     /// the slab release clears the entry's id silently (no tripwire, unlike
     /// the copy pool's).
     fn release_coalesced(&mut self, slab_idx: u16) {
@@ -3348,7 +3348,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.driver.send_slab.release(slab_idx);
     }
 
-    /// Handle completion of a coalesced plaintext `sendmsg` (OpTag::SendMsgCoalesced).
+    /// Handle completion of a coalesced copy `sendmsg` (plaintext or TLS ciphertext) (OpTag::SendMsgCoalesced).
     /// Mirrors `handle_send` but the backing is a slab entry holding several
     /// pool slots; partial sends advance the iovec array via `try_advance`.
     fn handle_send_msg_coalesced(&mut self, ud: UserData, result: i32) {
@@ -3363,8 +3363,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // only (plain sendmsg, no notification coming; no resubmit either
         // way, the connection is gone).
         if !self.slab_identity_ok(conn_index, slab_idx) {
-            // The entry may still name the awaited send lifted off the run's
-            // end-of-send pool slot. Take it so nothing can claim it twice,
+            // The entry may still name awaited sends lifted off the run's pool
+            // slots. Take them so nothing can claim them twice,
             // and settle nothing: the operation belonged to the connection
             // this CQE outlived, whose teardown already recorded the abort,
             // and a driver result would override that abort (#381) with a
@@ -3408,7 +3408,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
             // Fully sent.
             let total = self.driver.send_slab.total_len(slab_idx);
-            // Take the send this entry settles before releasing it.
+            // Take the sends this entry still carries before releasing it.
             let settles = self.driver.send_slab.take_sends(slab_idx);
             metrics::BYTES.add(metrics::bytes::SENT, total as u64);
             self.release_coalesced(slab_idx);
@@ -3451,10 +3451,17 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
 
         // Real error — release everything and drain the connection's queue.
+        // A run with TLS ciphertext also closes the connection: its record
+        // stream has a hole (as `handle_tls_send` does for a chunk).
         let settles = self.driver.send_slab.take_sends(slab_idx);
+        let close = self.driver.send_slab.close_on_error(slab_idx);
         self.release_coalesced(slab_idx);
         self.driver.drain_conn_send_queue(conn_index);
         self.driver.note_send_finalized(conn_index);
+        if close {
+            self.executor.wake_recv(conn_index);
+            self.driver.close_connection(conn_index);
+        }
         for (id, _logical_len) in settles {
             self.settle_send(id, Err(Self::send_error(result)));
         }
@@ -5254,13 +5261,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 // The `!identity_ok` reason is a dead occupant's entry, whose
                 // operation teardown already aborted; a driver result would
                 // override that abort (#381).
-                let settles = self.driver.send_slab.take_sends(slab_idx);
+                self.settle_abandoned_retry(slab_idx, identity_ok);
                 self.release_coalesced(slab_idx);
-                for (id, _logical_len) in settles {
-                    if identity_ok {
-                        self.settle_send(id, Err(io::Error::from_raw_os_error(libc::ECANCELED)));
-                    }
-                }
                 continue;
             }
             if retries >= 2 {
@@ -5920,7 +5922,7 @@ mod tests {
     }
 
     /// Register an awaited send on `conn_index` and attach it to pool slot
-    /// `slot` with `len`, as `ConnCtx::send` does with its end-of-send slot.
+    /// `slot` with `len`, as `ConnCtx::send` does with its final slot.
     fn await_slot(
         el: &mut AsyncEventLoop<NoopHandler>,
         conn_index: u32,
@@ -7242,7 +7244,7 @@ mod tests {
         let total = (chunk0.len() + chunk1.len()) as u32;
         let (slot0, _p0, _l0) = el.driver.send_copy_pool.copy_in(&chunk0).unwrap();
         let (slot1, ptr1, len1) = el.driver.send_copy_pool.copy_in(&chunk1).unwrap();
-        // One logical send split across two slots: only the last is end-of-send.
+        // One logical send split across two slots: only the last carries the id.
         let id = await_slot(&mut el, conn_index, slot1, total);
 
         // Queue chunk 1 as a real BuiltSend behind the in-flight chunk 0.
@@ -7356,8 +7358,7 @@ mod tests {
     }
 
     /// Guards the streaming rewrite: a multi-slot send that is admitted still
-    /// queues one entry per chunk, in order, with only the last chunk marked
-    /// end-of-send (so the send settles once, with its full length).
+    /// queues one entry per chunk, in order.
     #[test]
     fn multi_chunk_send_still_queues_all_chunks_in_order() {
         let mut el = make_test_loop_with_config(
@@ -8003,9 +8004,8 @@ mod tests {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
 
-        // Each is its own logical send, so both slots are end-of-send (the
-        // copy_in default). Different lengths, so neither can pass for the
-        // other.
+        // Each is its own logical send. Different lengths, so neither can
+        // pass for the other.
         let a = b"HELLO";
         let b = b"WORLD!!";
         let (slot_a, _pa, _la) = el.driver.send_copy_pool.copy_in(a).unwrap();
@@ -15834,7 +15834,7 @@ mod tests {
     // Series PR 7b (`docs/uring-bounded-send-design.md`). A bounded send
     // (`ConnCtx::send_backpressured`, series PR 9) must resolve with the
     // exact result of *its own* operation. On io_uring its id rides the
-    // end-of-send pool slot — lifted onto the slab entry when the run is
+    // final pool slot — lifted onto the slab entry when the run is
     // coalesced — and every completion, give-up and teardown site takes the
     // id and settles it.
     //
@@ -16436,7 +16436,7 @@ mod tests {
     }
 
     /// A message wider than one pool slot completes as several CQEs, but the
-    /// id rides only the end-of-send chunk: the intermediate completion
+    /// id rides only the final chunk: the intermediate completion
     /// settles nothing, and the final one reports the *logical* length — not
     /// the 36 bytes its own chunk carried.
     #[test]
@@ -16473,12 +16473,12 @@ mod tests {
             "an intermediate chunk carries no id and must settle nothing"
         );
 
-        // The end-of-send chunk completes.
+        // The final chunk completes.
         complete_one_cqe(&mut el);
         let result = el
             .executor
             .take_send_result(id)
-            .expect("the end-of-send chunk settles the operation");
+            .expect("the final chunk settles the operation");
         assert_eq!(
             result.expect("the send succeeded"),
             100,
@@ -16580,7 +16580,7 @@ mod tests {
     }
 
     /// A coalesced run settles the id that `submit_next_queued_inner` lifted
-    /// off the run's end-of-send pool slot and onto the slab entry — with
+    /// off the run's final pool slot and onto the slab entry — with
     /// the carried logical length, not the run's wire total.
     #[test]
     fn coalesced_run_settles_the_id_lifted_onto_the_slab_entry() {
@@ -16592,7 +16592,7 @@ mod tests {
         let id = submitted_id(&mut el, conn_index, generation);
 
         // Two chunks of one logical send behind an in-flight send: a
-        // coalescable run that stops at the end-of-send chunk.
+        // coalescable run.
         el.driver.send_queues[conn_index as usize].in_flight = true;
         let c0 = built_copy_send(&mut el, conn_index, b"aa");
         let c1 = built_copy_send(&mut el, conn_index, b"bbb");
@@ -17337,6 +17337,261 @@ mod tests {
         assert_eq!(err.raw_os_error(), Some(libc::EPIPE));
     }
 
+    /// Three awaited sends coalesced: a real error before any byte fails all
+    /// three.
+    #[test]
+    fn error_fails_every_send_in_the_run() {
+        let mut el = bounded_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let ids: Vec<SendId> = (0..3)
+            .map(|_| submitted_id(&mut el, conn_index, generation))
+            .collect();
+        el.driver.send_queues[conn_index as usize].in_flight = true;
+        for (id, data) in ids.iter().zip([&b"aa"[..], b"bbb", b"cccc"]) {
+            let built = built_copy_send(&mut el, conn_index, data);
+            el.driver
+                .send_copy_pool
+                .set_send_id(built.pool_slot, *id, data.len() as u32);
+            el.driver.send_queues[conn_index as usize]
+                .queue
+                .push_back(built);
+        }
+        assert!(el.driver.submit_next_queued(conn_index));
+        let pushed = UserData(el.driver.ring.last_pushed.as_ref().unwrap().user_data);
+        assert_eq!(pushed.tag(), Some(OpTag::SendMsgCoalesced));
+        el.test_dispatch_cqe(pushed.raw(), -libc::EPIPE, 0);
+        for id in ids {
+            let err = el
+                .executor
+                .take_send_result(id)
+                .expect("settled")
+                .unwrap_err();
+            assert_eq!(err.raw_os_error(), Some(libc::EPIPE));
+        }
+    }
+
+    /// Successive partial writes, each covering one more send, then the
+    /// rest: each send settles once with its own length.
+    #[test]
+    fn successive_partials_settle_in_order() {
+        let mut el = bounded_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let ids: Vec<SendId> = (0..3)
+            .map(|_| submitted_id(&mut el, conn_index, generation))
+            .collect();
+        el.driver.send_queues[conn_index as usize].in_flight = true;
+        for (id, data) in ids.iter().zip([&b"aa"[..], b"bbb", b"cccc"]) {
+            let built = built_copy_send(&mut el, conn_index, data);
+            el.driver
+                .send_copy_pool
+                .set_send_id(built.pool_slot, *id, data.len() as u32);
+            el.driver.send_queues[conn_index as usize]
+                .queue
+                .push_back(built);
+        }
+        assert!(el.driver.submit_next_queued(conn_index));
+        let ud = UserData(el.driver.ring.last_pushed.as_ref().unwrap().user_data);
+        // 1 byte: nothing covered.
+        el.test_dispatch_cqe(ud.raw(), 1, 0);
+        assert!(el.executor.take_send_result(ids[0]).is_none());
+        // 3 more (total 4): first covered, second not (ends at 5).
+        el.test_dispatch_cqe(ud.raw(), 3, 0);
+        assert_eq!(el.executor.take_send_result(ids[0]).unwrap().unwrap(), 2);
+        assert!(el.executor.take_send_result(ids[1]).is_none());
+        // 1 more (total 5): second covered exactly.
+        el.test_dispatch_cqe(ud.raw(), 1, 0);
+        assert_eq!(el.executor.take_send_result(ids[1]).unwrap().unwrap(), 3);
+        assert!(el.executor.take_send_result(ids[2]).is_none());
+        el.test_dispatch_cqe(ud.raw(), 4, 0);
+        assert_eq!(el.executor.take_send_result(ids[2]).unwrap().unwrap(), 4);
+        assert!(!el.driver.send_slab.in_use(ud.payload() as u16));
+    }
+
+    /// A coalesced push failure puts every lifted id back; the retry then
+    /// settles each send with its own length.
+    #[test]
+    fn push_failure_restores_every_id() {
+        let mut el = bounded_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let ids: Vec<SendId> = (0..2)
+            .map(|_| submitted_id(&mut el, conn_index, generation))
+            .collect();
+        el.driver.send_queues[conn_index as usize].in_flight = true;
+        for (id, data) in ids.iter().zip([&b"aa"[..], b"bbb"]) {
+            let built = built_copy_send(&mut el, conn_index, data);
+            el.driver
+                .send_copy_pool
+                .set_send_id(built.pool_slot, *id, data.len() as u32);
+            el.driver.send_queues[conn_index as usize]
+                .queue
+                .push_back(built);
+        }
+        el.driver.ring.force_push_failures(1);
+        assert!(!el.driver.submit_next_queued(conn_index));
+        el.drain_send_retries();
+        assert!(el.driver.send_queues[conn_index as usize].queue.is_empty());
+        let ud = UserData(el.driver.ring.last_pushed.as_ref().unwrap().user_data);
+        assert_eq!(ud.tag(), Some(OpTag::SendMsgCoalesced));
+        el.test_dispatch_cqe(ud.raw(), 5, 0);
+        assert_eq!(el.executor.take_send_result(ids[0]).unwrap().unwrap(), 2);
+        assert_eq!(el.executor.take_send_result(ids[1]).unwrap().unwrap(), 3);
+    }
+
+    /// A slab-full fall-through puts every lifted id back on its slot, so the
+    /// single-submit path settles each send.
+    #[test]
+    fn slab_full_restores_every_id() {
+        let mut el = bounded_test_loop();
+        el.driver.send_slab = crate::buffer::send_slab::InFlightSendSlab::new(0);
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let ids: Vec<SendId> = (0..2)
+            .map(|_| submitted_id(&mut el, conn_index, generation))
+            .collect();
+        el.driver.send_queues[conn_index as usize].in_flight = true;
+        let mut slots = Vec::new();
+        for (id, data) in ids.iter().zip([&b"aa"[..], b"bbb"]) {
+            let built = built_copy_send(&mut el, conn_index, data);
+            slots.push(built.pool_slot);
+            el.driver
+                .send_copy_pool
+                .set_send_id(built.pool_slot, *id, data.len() as u32);
+            el.driver.send_queues[conn_index as usize]
+                .queue
+                .push_back(built);
+        }
+        assert!(el.driver.submit_next_queued(conn_index));
+        // The head left alone; the second still owns its id on its slot.
+        assert_eq!(
+            el.driver.send_copy_pool.take_send_id(slots[1]),
+            Some((ids[1], 3))
+        );
+        el.driver.send_copy_pool.set_send_id(slots[1], ids[1], 3);
+        let ud = UserData(el.driver.ring.last_pushed.as_ref().unwrap().user_data);
+        el.test_dispatch_cqe(ud.raw(), 2, 0);
+        assert_eq!(el.executor.take_send_result(ids[0]).unwrap().unwrap(), 2);
+    }
+
+    /// A TLS-internal ciphertext chunk that fails closes the connection
+    /// (`handle_tls_send`); coalesced with a following chunk, it still does.
+    #[test]
+    fn coalesced_tls_chunk_error_closes_connection() {
+        let mut el = bounded_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        el.driver.send_queues[conn_index as usize].in_flight = true;
+        for (tag, data) in [
+            (OpTag::TlsSend, &b"record-1"[..]),
+            (OpTag::Send, b"record-2"),
+        ] {
+            let (slot, ptr, len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+            let ud = UserData::encode(tag, conn_index, UserData::send_payload(slot, generation));
+            let entry =
+                crate::backend::uring::sqe::Sqe::stream_send(conn_index, ptr, len, ud.raw());
+            el.driver.send_queues[conn_index as usize]
+                .queue
+                .push_back(crate::handler::BuiltSend {
+                    entry,
+                    pool_slot: slot,
+                    slab_idx: u16::MAX,
+                    total_len: len,
+                });
+        }
+        assert!(el.driver.submit_next_queued(conn_index));
+        let ud = UserData(el.driver.ring.last_pushed.as_ref().unwrap().user_data);
+        assert_eq!(
+            ud.tag(),
+            Some(OpTag::SendMsgCoalesced),
+            "TLS chunks coalesced"
+        );
+        el.test_dispatch_cqe(ud.raw(), -104, 0);
+        let conn = el.driver.connections.get(conn_index);
+        assert!(
+            conn.is_none() || conn.unwrap().close_requested(),
+            "connection not closed after a TLS ciphertext send error"
+        );
+    }
+
+    /// With the close already submitted, a partial write settles the sends it
+    /// covers and cancels every other send in the run.
+    #[test]
+    fn a_partial_write_after_the_close_cancels_the_rest() {
+        let mut el = bounded_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let ids: Vec<SendId> = (0..3)
+            .map(|_| submitted_id(&mut el, conn_index, generation))
+            .collect();
+        el.driver.send_queues[conn_index as usize].in_flight = true;
+        for (id, data) in ids.iter().zip([&b"aa"[..], b"bbb", b"cccc"]) {
+            let built = built_copy_send(&mut el, conn_index, data);
+            el.driver
+                .send_copy_pool
+                .set_send_id(built.pool_slot, *id, data.len() as u32);
+            el.driver.send_queues[conn_index as usize]
+                .queue
+                .push_back(built);
+        }
+        assert!(el.driver.submit_next_queued(conn_index));
+        let ud = UserData(el.driver.ring.last_pushed.as_ref().unwrap().user_data);
+        el.driver.send_queues[conn_index as usize].close_submitted = true;
+        el.test_dispatch_cqe(ud.raw(), 2, 0);
+        assert_eq!(el.executor.take_send_result(ids[0]).unwrap().unwrap(), 2);
+        for &id in &ids[1..] {
+            let err = el
+                .executor
+                .take_send_result(id)
+                .expect("settled")
+                .unwrap_err();
+            assert_eq!(err.raw_os_error(), Some(libc::ECANCELED));
+        }
+    }
+
+    /// With the close already submitted, `EAGAIN` cancels every send in the
+    /// run.
+    #[test]
+    fn eagain_after_the_close_cancels_every_send() {
+        let mut el = bounded_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let (first, second, slab_idx) = two_pipelined_sends(&mut el, conn_index, generation);
+        el.driver.send_queues[conn_index as usize].close_submitted = true;
+        let ud = UserData::encode(OpTag::SendMsgCoalesced, conn_index, slab_idx as u32);
+        el.test_dispatch_cqe(ud.raw(), -libc::EAGAIN, 0);
+        for id in [first, second] {
+            let err = el
+                .executor
+                .take_send_result(id)
+                .expect("settled")
+                .unwrap_err();
+            assert_eq!(err.raw_os_error(), Some(libc::ECANCELED));
+        }
+    }
+
+    /// The coalesced retry's give-up fails every send in the run.
+    #[test]
+    fn the_coalesced_retry_give_up_fails_every_send() {
+        let mut el = bounded_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let (first, second, slab_idx) = two_pipelined_sends(&mut el, conn_index, generation);
+        el.driver
+            .pending_coalesced_retries
+            .push((conn_index, generation, slab_idx, 2));
+        el.drain_coalesced_retries();
+        for id in [first, second] {
+            let err = el
+                .executor
+                .take_send_result(id)
+                .expect("settled")
+                .unwrap_err();
+            assert!(err.to_string().contains("max retries"), "{err}");
+        }
+    }
+
     /// `drain_coalesced_retries`' give-up arm, on the id the slab entry
     /// carries.
     #[test]
@@ -17368,6 +17623,7 @@ mod tests {
                 &[s0, s1],
                 l0 + l1,
                 Some((id, 99, l0 + l1)),
+                false,
             )
             .expect("slab room");
         el.driver
@@ -17727,7 +17983,7 @@ mod tests {
         cs.established = true;
     }
 
-    /// Copy `data` into a fresh pool slot, mark it end-of-send and attach a
+    /// Copy `data` into a fresh pool slot and attach a
     /// freshly admitted bounded send reporting `logical_len` — the by-hand
     /// equivalent of the last chunk `DriverCtx::send_bounded` builds, as the
     /// handler tests above assemble it. Returns the id and the slot.
@@ -18052,6 +18308,7 @@ mod tests {
                 // Neither chunk's length and not the run's 5 wire bytes: the
                 // carried number is the only one a handler cannot recompute.
                 Some((id, 99, l0 + l1)),
+                false,
             )
             .expect("slab room");
 
@@ -18119,6 +18376,7 @@ mod tests {
                 &[s0, s1],
                 l0 + l1,
                 Some((id, 99, l0 + l1)),
+                false,
             )
             .expect("slab room");
 

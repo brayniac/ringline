@@ -53,8 +53,8 @@ struct InFlightSendEntry {
     /// The awaited sends this entry settles, in byte order, each with the
     /// length it reports on success and where its bytes end in the entry.
     ///
-    /// Set by `allocate_coalesced` for every end-of-send pool slot of the run
-    /// that carried an id (`submit_next_queued_inner` lifts them, since the
+    /// Set by `allocate_coalesced` for every pool slot of the run that carried
+    /// an id (only a logical send's final slot does) (`submit_next_queued_inner` lifts them, since the
     /// coalesced completion releases the slots), and by
     /// [`set_send_id`](InFlightSendSlab::set_send_id) for a zero-copy
     /// (`submit_batch_await`) or recv-forward (`forward_held`) entry, which
@@ -62,6 +62,10 @@ struct InFlightSendEntry {
     sends: SendRun,
     /// Bytes of the entry the kernel has sent so far (`try_advance`).
     sent: u32,
+    /// The run includes TLS ciphertext, whose loss breaks the record
+    /// stream: a send error closes the connection (as `handle_tls_send`
+    /// does), where a plaintext run's error only drains the queue.
+    close_on_error: bool,
     pending_notifs: u8,
     awaiting_notifications: bool,
     in_use: bool,
@@ -92,6 +96,7 @@ impl InFlightSendSlab {
                 total_len: 0,
                 sends: SendRun::EMPTY,
                 sent: 0,
+                close_on_error: false,
                 pending_notifs: 0,
                 awaiting_notifications: false,
                 in_use: false,
@@ -137,8 +142,9 @@ impl InFlightSendSlab {
         entry.total_len = total_len;
         // A recycled entry must never name a dead operation; an awaited send
         // attaches its id afterwards (`set_send_id`).
-        entry.sends = SendRun::EMPTY;
+        entry.sends.clear();
         entry.sent = 0;
+        entry.close_on_error = false;
         entry.pending_notifs = 0;
         entry.awaiting_notifications = false;
         entry.in_use = true;
@@ -164,6 +170,7 @@ impl InFlightSendSlab {
         pool_slots: &[u16],
         total_len: u32,
         sends: impl IntoIterator<Item = (SendId, u32, u32)>,
+        close_on_error: bool,
     ) -> Option<(u16, *const libc::msghdr)> {
         debug_assert!(iovecs_slice.len() <= MAX_IOVECS);
         debug_assert_eq!(iovecs_slice.len(), pool_slots.len());
@@ -184,11 +191,12 @@ impl InFlightSendSlab {
         entry.conn_index = conn_index;
         entry.generation = generation;
         entry.total_len = total_len;
-        entry.sends = SendRun::EMPTY;
+        entry.sends.clear();
         for (id, len, end) in sends {
             entry.sends.push(id, len, end);
         }
         entry.sent = 0;
+        entry.close_on_error = close_on_error;
         entry.pending_notifs = 0;
         entry.awaiting_notifications = false;
         entry.in_use = true;
@@ -241,8 +249,9 @@ impl InFlightSendSlab {
         entry.total_len = total_len;
         // As in `allocate`: a recycled entry must not carry a previous
         // occupant's id.
-        entry.sends = SendRun::EMPTY;
+        entry.sends.clear();
         entry.sent = 0;
+        entry.close_on_error = false;
         entry.pending_notifs = 0;
         entry.awaiting_notifications = false;
         entry.in_use = true;
@@ -369,18 +378,24 @@ impl InFlightSendSlab {
         entry.pool_slot_count = 0;
         entry.bid_count = 0;
         // Cleared unconditionally so a recycled entry cannot name a dead
-        // operation. A handler that means to settle the send must call
-        // `take_send_id` *before* releasing; there is no
+        // operation. A handler that means to settle its sends must call
+        // `take_sends` *before* releasing; there is no
         // tripwire here (unlike `SendCopyPool::release`) because
         // `Driver::run_shutdown` releases slab entries with the executor
         // already going away, where a lost settle is correct.
-        entry.sends = SendRun::EMPTY;
+        entry.sends.clear();
         entry.in_use = false;
         entry.awaiting_notifications = false;
         entry.pending_notifs = 0;
 
         self.free_list.push(idx);
         pool_slot
+    }
+
+    /// Whether a send error on this coalesced entry closes its connection:
+    /// the run includes TLS ciphertext.
+    pub fn close_on_error(&self, idx: u16) -> bool {
+        self.entries[idx as usize].close_on_error
     }
 
     /// Get the total original send length for an entry.
@@ -772,6 +787,13 @@ impl SendRun {
         self.count += 1;
     }
 
+    /// Forget every send. Slots outside `[head, count)` are never read, so
+    /// only the bounds are reset.
+    fn clear(&mut self) {
+        self.head = 0;
+        self.count = 0;
+    }
+
     fn is_empty(&self) -> bool {
         self.head == self.count
     }
@@ -795,7 +817,6 @@ impl SendRun {
 
 /// Awaited sends taken off a slab entry (`take_sends`, `take_sent_sends`):
 /// each id with its success length, in byte order.
-#[derive(Clone, Copy)]
 pub(crate) struct TakenSends(SendRun);
 
 impl Iterator for TakenSends {

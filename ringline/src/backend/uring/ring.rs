@@ -392,7 +392,8 @@ impl Ring {
         Ok(())
     }
 
-    /// Submit a coalesced plaintext send: one plain (non-ZC) `sendmsg` whose
+    /// Submit a coalesced copy send (plaintext or TLS ciphertext): one plain
+    /// (non-ZC) `sendmsg` whose
     /// iovecs gather several queued sends. The slab index is in the payload.
     pub fn submit_send_msg_coalesced(
         &mut self,

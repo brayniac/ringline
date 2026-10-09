@@ -94,6 +94,8 @@ through it.
 **Success** (`handle_send`, `handle_send_msg_coalesced`): where the handler
 already reads `is_end_of_send` before releasing, it also takes the id and
 settles `Ok(logical_len)` — the carried length, not `acked_bytes`.
+(Superseded by #628: the flag is gone; the slab entry settles each send in
+its run, and a partial write settles the sends it covers.)
 
 **Failure with a completion** (every send-family error branch, the
 `close_submitted` gates, and `handle_tls_send`'s two silent

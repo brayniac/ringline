@@ -558,8 +558,8 @@ impl<'a> DriverCtx<'a> {
 
         // Chunk data that exceeds the send copy slot size. Each chunk gets its
         // own pool slot and SQE; the per-connection send queue ensures they are
-        // transmitted in order. Only the final chunk is marked end-of-send,
-        // and only that chunk carries the send's id, so the send settles once.
+        // transmitted in order. Only the final chunk carries the send's id, so
+        // the send settles once.
         //
         // `submit_or_queue` is infallible: it pushes to the ring only while
         // nothing is in flight (the first chunk) and parks that chunk at the
@@ -612,7 +612,7 @@ impl<'a> DriverCtx<'a> {
     /// same `close_submitted` refusal, the same two `reserve_slots` error
     /// mappings, the same TLS branch, the same chunk loop — plus one thing:
     /// `id` and the **logical (plaintext) length** are attached to the
-    /// end-of-send slot, so the completion handler can resolve exactly this
+    /// final slot, so the completion handler can resolve exactly this
     /// operation with exactly the number the caller passed. The length
     /// travels because nothing downstream can recompute it: a TLS send's
     /// final `OpTag::Send` chunk is one ciphertext record.

@@ -58,7 +58,8 @@ pub enum OpTag {
     /// Single-shot send on a connected UDP socket (no msghdr, uses the
     /// socket's connected peer). Lighter than `SendMsgUdp`.
     SendUdp = 23,
-    /// Coalesced plaintext send: one non-ZC `sendmsg` whose iovecs gather
+    /// Coalesced copy send (plaintext or TLS ciphertext): one non-ZC
+    /// `sendmsg` whose iovecs gather
     /// several queued per-connection sends. Payload = InFlightSendSlab index;
     /// the slab entry holds the backing pool slots, released on completion.
     SendMsgCoalesced = 24,

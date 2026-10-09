@@ -2473,9 +2473,9 @@ impl Driver {
                 iov_len: 0,
             }; MAX_IOVECS];
             let mut total: u32 = 0;
-            // The awaited sends the run settles, lifted off the end-of-send
-            // slots that carry them (see below), each with where its bytes
-            // end in the run, and the slot each came from.
+            // The awaited sends the run settles, lifted off the final slots
+            // that carry them (see below), each with where its bytes end in
+            // the run, and the slot each came from.
             let mut sends = [None; MAX_IOVECS];
             let mut send_count = 0;
             for i in 0..n {
@@ -2490,6 +2490,11 @@ impl Driver {
                     send_count += 1;
                 }
             }
+            // A run with TLS ciphertext closes the connection on a send error.
+            let tls_run = self.tls_table.as_ref().is_some_and(|t| t.has(conn_index))
+                || self.send_queues[ci].queue.iter().take(n).any(|b| {
+                    crate::completion::UserData(b.entry.user_data).tag() == Some(OpTag::TlsSend)
+                });
             // Put every lifted id back on its slot, for the paths that leave
             // the run queued and still owning its slots.
             let restore = |pool: &mut crate::buffer::send_copy::SendCopyPool| {
@@ -2498,7 +2503,7 @@ impl Driver {
                 }
             };
             // The coalesced completion releases every pool slot in the run, so
-            // an id cannot stay on the end-of-send slot that carried it; it
+            // an id cannot stay on the final slot that carried it; it
             // moves onto the slab entry, which outlives them. Taken, not
             // peeked: leaving a copy behind would let both the slab entry and
             // the slot claim the same operation, and `SendCopyPool::release`
@@ -2518,6 +2523,7 @@ impl Driver {
                     .iter()
                     .flatten()
                     .map(|&(_, id, logical_len, end)| (id, logical_len, end)),
+                tls_run,
             ) {
                 match self
                     .ring
@@ -3484,7 +3490,7 @@ impl Driver {
                         let pool_slot = ud.payload() as u16;
                         if self.send_copy_pool.in_use(pool_slot) {
                             // These are the three tags an awaited send's
-                            // end-of-send slot can wear, so take the id
+                            // final slot can wear, so take the id
                             // before releasing — `release` debug-asserts on
                             // a slot that still names a live operation. The
                             // record goes on a queue nobody will drain,
