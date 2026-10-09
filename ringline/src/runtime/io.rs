@@ -1627,9 +1627,8 @@ impl ConnCtx {
     }
 
     /// Put this connection into the Mode A forwarding state: switch delivery to
-    /// the segmented domain, mark it a forwarder (so the recv handler applies
-    /// the `forward_hold_cap` throttle rather than treating it as a plain Mode
-    /// B segment reader), and move anything already buffered into the hold.
+    /// the segmented domain, mark it a forwarder, and move anything already
+    /// buffered into the hold.
     ///
     /// That last step is what makes a proxy expressible. The length a forward
     /// needs comes from a header, and reading a header means `with_data`,
@@ -2223,9 +2222,11 @@ impl ConnCtx {
     ///
     /// # Backpressure
     ///
-    /// The source stops reading once the sink has `forward_hold_cap` queued
-    /// sends outstanding, which closes the source's TCP window rather than
-    /// growing the queue without bound, and resumes when the sink drains.
+    /// The source stops reading once it holds the hold cap of entries
+    /// awaiting the sink (`forward_hold_cap`; on io_uring without
+    /// `recv_incremental`, at most a quarter of the receive ring), which closes
+    /// the source's TCP window rather than growing the queue without bound,
+    /// and resumes when the sink drains.
     ///
     /// # TLS
     ///

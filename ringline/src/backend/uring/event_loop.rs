@@ -3742,8 +3742,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
     }
 
-    /// Throttle a connection whose held receive entries (`held_entries`) reach
-    /// `hold_throttle`: a reader, forwarder or echo
+    /// Throttle a connection that holds as much received data as it may
+    /// (`at_hold_cap`): a reader, forwarder or echo
     /// peer that is not keeping up would otherwise hold ring buffers until
     /// the ring is empty, stalling every connection on the worker, or grow
     /// heap copies without bound. Cancel its multishot recv so its TCP
@@ -3752,9 +3752,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// (`rearm_throttled_recvs`).
     fn throttle_if_held(&mut self, conn_index: u32) {
         let ci = conn_index as usize;
-        if self.driver.forward_hold_throttled[ci]
-            || self.held_entries(conn_index) < self.hold_throttle()
-        {
+        if self.driver.forward_hold_throttled[ci] || !self.at_hold_cap(conn_index) {
             return;
         }
         self.driver.forward_hold_throttled[ci] = true;
@@ -3788,31 +3786,36 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
     }
 
-    /// The held entries at which a connection's receive is throttled:
-    /// `forward_hold_cap`, but at most a quarter of the TCP ring's buffers,
-    /// since each held entry can pin one, so a single connection cannot empty
-    /// the ring.
-    fn hold_throttle(&self) -> usize {
+    /// `forward_hold_cap`, but at most a quarter of the TCP ring's buffers.
+    fn quarter_ring_cap(&self) -> usize {
         let quarter = (self.driver.provided_bufs.ring_entries() as usize / 4).max(1);
         self.driver.forward_hold_cap.min(quarter)
     }
 
-    /// Receive entries a connection holds: its segment and recv-forward holds,
-    /// and on a direct-echo connection the queued sends, each of which holds
-    /// the buffer it echoes until it is sent.
-    fn held_entries(&self, conn_index: u32) -> usize {
+    /// Whether a connection holds as much received data as it may before its
+    /// receive is throttled.
+    ///
+    /// The segment hold may reach `forward_hold_cap`. Without a lend cap each
+    /// segment entry can pin a ring buffer, so there it is held to a quarter
+    /// of the ring, and one connection cannot empty it; with one
+    /// (`recv_incremental`) the lend cap bounds the buffers lends pin on the
+    /// worker, and the rest are heap copies.
+    ///
+    /// The recv-forward or direct-echo hold is always held to a quarter of the
+    /// ring: its copies come from `Driver::own_recv_copy`, at most one ring's
+    /// worth per worker, and past that its entries pin ring buffers. A
+    /// direct-echo connection gathers its hold only when no send is in
+    /// flight, so its backlog stays in `recv_hold`; the buffers of the one
+    /// send in flight are not counted (#638).
+    fn at_hold_cap(&self, conn_index: u32) -> bool {
         let ci = conn_index as usize;
-        let echo_queued = if self
-            .driver
-            .connections
-            .get(conn_index)
-            .is_some_and(|c| c.direct_echo)
-        {
-            self.driver.send_queues[ci].queue.len()
+        let segment_cap = if self.driver.lend_cap.is_some() {
+            self.driver.forward_hold_cap
         } else {
-            0
+            self.quarter_ring_cap()
         };
-        self.driver.segment_hold[ci].len() + self.driver.recv_hold[ci].len() + echo_queued
+        self.driver.segment_hold[ci].len() >= segment_cap
+            || self.driver.recv_hold[ci].len() >= self.quarter_ring_cap()
     }
 
     /// Re-arm every throttled connection whose hold has drained below the
@@ -3827,12 +3830,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         for &conn_index in &throttled {
             self.maybe_rearm_throttled_forward(conn_index);
         }
+        // The re-arms dispatch no completion, so nothing was throttled while
+        // they ran and the list holds each connection once.
+        debug_assert!(self.driver.throttled_recvs.is_empty());
         let mut throttled = throttled;
         throttled.retain(|&c| self.driver.forward_hold_throttled[c as usize]);
-        // A throttle taken during the re-arms above is already in the list.
-        throttled.append(&mut self.driver.throttled_recvs);
-        throttled.sort_unstable();
-        throttled.dedup();
         self.driver.throttled_recvs = throttled;
     }
 
@@ -3851,7 +3853,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             return;
         }
         // Only re-arm once the hold has drained below the cap.
-        if self.held_entries(conn_index) >= self.hold_throttle() {
+        if self.at_hold_cap(conn_index) {
             return;
         }
         // Connection must still be open in multishot recv mode.
@@ -10510,7 +10512,7 @@ mod tests {
         let conn_index = accept_connection(&mut el);
         let ci = conn_index as usize;
         el.driver.recv_domain[ci] = crate::recv::domain::RecvDomain::Segmented;
-        let cap = el.hold_throttle();
+        let cap = el.quarter_ring_cap();
         for bid in 0..cap as u16 {
             deliver_segment(&mut el, conn_index, bid, b"x");
         }

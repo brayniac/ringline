@@ -164,12 +164,14 @@ pub struct Config {
     /// consumer would otherwise accumulate an unbounded backlog, pinning the
     /// shared per-worker recv ring (starving every other connection on the
     /// worker) or growing heap copies without limit. When a connection's held
-    /// entries reach this cap, or a quarter of the recv ring's buffers if that
-    /// is lower, the runtime cancels its multishot recv so its TCP receive
-    /// window closes and only its peer stops sending; the recv is re-armed
-    /// once the hold drains below the cap. Without `recv_incremental`, a
-    /// recv-forward or direct-echo send waiting on a peer that does not read
-    /// still holds the ring buffers it carries.
+    /// entries reach this cap (lowered to a quarter of the recv ring's buffers
+    /// for recv-forward and direct echo, and for a segment hold without
+    /// `recv_incremental`), the runtime cancels its multishot recv so its TCP
+    /// receive window closes and only its peer stops sending; the recv is re-armed
+    /// once the hold drains below the cap. A recv-forward or direct-echo send
+    /// waiting on a peer that does not read still holds the ring buffers it
+    /// carries, uncounted, so several such connections together can empty the
+    /// ring (#638).
     ///
     /// Larger values allow more recv in flight (higher single-forward throughput)
     /// at the cost of more pinned ring buffers / held heap under a slow sink;
@@ -1093,19 +1095,6 @@ impl ConfigBuilder {
         self
     }
 
-    /// Set the per-connection held-buffer cap for Mode A `forward_to`
-    /// connections.
-    ///
-    /// When a forwarding connection has this many provided buffers held awaiting
-    /// writes to the sink, the runtime cancels its multishot recv (closing its
-    /// TCP receive window so the source stops sending) and re-arms it once the
-    /// hold drains below the cap as writes complete — bounding one slow forward
-    /// to `forward_hold_cap` held buffers so it cannot deplete the shared
-    /// per-worker recv ring and starve other connections. Larger values allow
-    /// more recv in flight (higher single-forward throughput) at the cost of more
-    /// pinned ring buffers / held heap under a slow sink. Must be `>= 1`.
-    ///
-    /// Default: 64 (2× `MAX_IOVECS`).
     /// Fault buffer pages in at worker startup rather than on first use.
     ///
     /// The provided recv ring and the send copy pool are allocated zeroed,
@@ -1134,6 +1123,25 @@ impl ConfigBuilder {
         self
     }
 
+    /// Set the per-connection cap on held receive entries.
+    ///
+    /// A connection holds received data until its consumer drains it: a
+    /// `forward_to` source until each buffer is written to the sink, a
+    /// segment reader (`segments`, `with_segments`, `recv_owned_segment`)
+    /// until it reads, a recv-forward or direct-echo connection until its
+    /// send goes out. When a connection holds this many entries the runtime
+    /// cancels its multishot recv, closing its TCP receive window so only its
+    /// peer stops sending, and re-arms it on an event-loop pass once the hold
+    /// drains below the cap. A recv-forward or direct-echo hold, and without
+    /// `recv_incremental` a segment hold, is held to at most a quarter of the
+    /// recv ring's buffers, since each such entry can pin one.
+    /// A recv-forward or direct-echo send waiting on a peer that does not read
+    /// holds the buffers it carries uncounted, so several such connections
+    /// together can still empty the ring (#638). Larger values allow more recv
+    /// in flight at the cost of more held buffers or copies under a slow
+    /// consumer. Must be `>= 1`.
+    ///
+    /// Default: 64 (2× `MAX_IOVECS`).
     pub fn forward_hold_cap(mut self, cap: usize) -> Self {
         self.config.forward_hold_cap = cap;
         self
