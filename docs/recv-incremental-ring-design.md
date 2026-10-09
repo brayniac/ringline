@@ -159,22 +159,26 @@ rerun with #627.
 | The ring entry | Rewritten by the kernel as it consumes (`addr` advances, `len` shrinks). |
 | More data queued | A multishot receive completion carries `IORING_CQE_F_SOCK_NONEMPTY` when the socket still has data after it. On Debian 12's 6.1.0-53 every full completion of a streaming connection carried it; no completion of a 64 KiB request/response message did (102,678–104,001 per run), and 99.9% of 1 MiB requests' full completions did. |
 | No buffer left | `-ENOBUFS` without `F_MORE`, ending the arm. |
-| CQ overflow | The byte order holds across the overflow. Whether an arm ends depends on the kernel: in a burst of 96 single-completion connections into a 64-entry CQ, 32 arms ended (no `F_MORE`) on 6.12 and none on 7.1. An arm that ends is re-armed. |
+| CQ overflow | A multishot completion that finds the CQ full goes to the overflow list and ends its arm (no `F_MORE`) with data still queued; the driver re-arms it. The byte order holds across the overflow and the re-arm. From 6.13 the kernel runs at most 20 deferred task_work items per `io_uring_enter`, so a burst of single-completion receives no longer fills the CQ; receives that each post several completions still do. |
 | EOF on a partly used INC buffer | A completion with `res` 0, no `F_BUFFER` and no `F_MORE`. The buffer stays posted, and another connection's next data lands at the following offset. |
 | Multishot `RECVMSG` on an INC ring | Each message, header included, lands at the buffer's next offset, as `RECV` data does. |
 | `RLIMIT_MEMLOCK` (6.14+) | Charged for each ring's entry array, not the buffers: 16 bytes per entry, at least a page per ring. |
 
 The offset order was checked byte for byte on Linux 6.12 and 7.1 with a
 64-entry CQ and 32-entry SQ, under SQPOLL, with held lends and at 10,000
-connections (journal). It also holds for receives submitted with
-`IOSQE_ASYNC`, which the driver does not set.
+connections (journal). The kernel does not run a multishot receive on
+io-wq: `io_wq_submit_work` arms poll for it (6.12 and 7.1 source), so
+`IOSQE_ASYNC` does not change where its data is received.
 
 The conformance tests in `ringline/src/backend/uring/engine/conformance.rs`
-cover each row through the engine. They passed on 6.1.0-53 (Debian 12),
-6.8.0-142 (Ubuntu 24.04), 6.12.63 (Debian 13) and 7.1.13 (Debian 13
-backports) (`experiments/recv-conformance-run.toml`); 6.1 and 6.8 have no INC rings,
-so only the plain-ring rows ran there. CI's Linux runners
-(`ubuntu-latest`, 6.17) run them on every change.
+cover each row except `RLIMIT_MEMLOCK`, which `ringline/tests/memlock_rings.rs`
+covers. They passed on 6.1.0-53 (Debian 12), 6.8.0-142 (Ubuntu 24.04),
+6.12.63 (Debian 13) and 7.1.13 (Debian 13 backports)
+(`experiments/recv-conformance-run.toml`). 6.1 and 6.8 have no INC rings,
+so only the plain-ring rows ran there. On 6.12 and 7.1 the overflow test's
+96 connections posted 508 completions into a 64-entry CQ and 225 arms
+ended. CI's Linux test jobs (`ubuntu-latest`, 6.17) run them on pull
+requests to `main`.
 
 ## Buffer state
 
@@ -688,10 +692,10 @@ buffers held by `with_bytes` views, values copied by the
 ## Landing
 
 0. Probe and conformance tests: each row of the behaviour table, the
-   byte-verified offset order (a 64-entry CQ and 32-entry SQ, SQPOLL, a
-   forced-async receive), EOF on a partly used buffer, and multishot
-   `RECVMSG` on an INC ring; run on CI and as SystemsLab experiments on
-   6.1, 6.8, 6.12 and 7.1. Settle the 6.12.y minimum or keep a probe.
+   byte-verified offset order (a CQ overflow, SQPOLL), EOF on a partly
+   used buffer, and multishot `RECVMSG` on an INC ring; run on CI and as
+   SystemsLab experiments on 6.1, 6.8, 6.12 and 7.1. Settle the 6.12.y
+   minimum or keep a probe.
 1. Bounded accumulator: the target length from `NeedAtLeast` and the
    sites that clear it (reset, close, `ConnStream` reads, the segmented
    entry's `take_frozen`, `settle_forward_end`), the hold of a
