@@ -383,10 +383,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   recv-forward and direct echo and for segment holds without
   `recv_incremental`:
   its multishot receive is cancelled so only its peer is stopped, and it is
-  re-armed once the hold drains. A recv-forward or direct-echo send waiting
-  on a peer that does not read still holds the ring buffers it carries,
-  uncounted: without `recv_incremental` one such connection can empty the
-  ring, and with it several can (#638).
+  re-armed once the hold drains. The buffers a connection's sends hold count
+  toward its cap: those of a direct-echo or `forward_held` send, of a
+  `forward_recv_buf` send of a lent receive buffer, and the ring buffers a
+  `forward_to` write pins (#638). The cap is checked as completions
+  arrive, so a multishot receive can take buffers past it before its
+  cancel lands. In runs outside the test suite without
+  `recv_incremental`, one unread direct-echo or `forward_held` connection
+  still emptied a 16-buffer ring, and two unread direct-echo connections
+  emptied a 256-buffer ring of 16 KiB buffers; with it, three unread
+  direct-echo or `forward_held` connections emptied a 16-buffer ring. A connection
+  that forwards accumulator-backed data with `forward_recv_buf` is not
+  throttled: in a test the server accepted 64 MiB from a peer that did
+  not read (#638).
 
 - io_uring: `ConfigBuilder::sqpoll(true)` works. Ring setup set
   `IORING_SETUP_COOP_TASKRUN` together with `IORING_SETUP_SQPOLL`, which the
