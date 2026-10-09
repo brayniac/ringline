@@ -336,8 +336,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `COOP_TASKRUN` and `DEFER_TASKRUN`. A push to a full SQ under SQPOLL now
   waits for the SQ thread to free entries (`IORING_ENTER_SQ_WAIT`); it
   failed before, closing the connection. A flush under SQPOLL enters the
-  kernel only when SQEs are queued and the SQ thread is idle, or the CQ has
-  overflowed (#630).
+  kernel only when SQEs are queued and either the SQ thread is idle or the
+  CQ has overflowed (#630).
 
 - io_uring: workers start on Ubuntu's 6.8 kernels (6.8.0-139 and later),
   which reject `IORING_REGISTER_PBUF_RING` with `EINVAL` unless a reserved

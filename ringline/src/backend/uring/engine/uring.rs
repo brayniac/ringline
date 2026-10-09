@@ -1400,6 +1400,7 @@ mod sq_room_tests {
     fn a_pair_waits_for_the_sq_thread_to_free_two_entries() {
         let mut e = sqpoll_engine(4);
         let cap = e.ring.submission().capacity();
+        let mut exercised = 0;
         for round in 0..20 {
             // `sqpoll_idle_ms(1)`: the SQ thread sleeps after 1 ms idle.
             std::thread::sleep(Duration::from_millis(20));
@@ -1407,14 +1408,20 @@ mod sq_room_tests {
             for _ in 0..cap - 1 {
                 unsafe { e.ring.submission().push(&nop()) }.expect("room");
             }
+            if e.ring.submission().len() == cap - 1 {
+                exercised += 1;
+            }
             unsafe { e.push_sqe_pair(nop(), nop()) }
                 .unwrap_or_else(|err| panic!("round {round}: {err}"));
-            e.ring.submit().expect("submit");
             let mut reaped = 0;
             while reaped < cap + 1 {
                 e.ring.submit_and_wait(1).expect("wait");
                 reaped += e.ring.completion().count();
             }
         }
+        assert!(
+            exercised > 0,
+            "the SQ thread consumed every round's NOPs before the pair push"
+        );
     }
 }
