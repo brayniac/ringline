@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- io_uring: `ConfigBuilder::recv_incremental(true)` registers each worker's
+  TCP receive ring as incremental (`IOU_PBUF_RING_INC`), where successive
+  receives share a buffer at increasing offsets (#622). Each worker first
+  checks, on a one-entry ring and a socketpair, that the kernel behaves as
+  the receive path relies on, and otherwise uses a plain ring. Without a
+  `recv_buffer` call the geometry follows the ring kind: 64 × 1 MiB
+  incremental, 4096 × 64 KiB plain with `MADV_NOHUGEPAGE`, and `build()`
+  requires `recv_accumulator_max` of at least 1 MiB. Default off.
+  `ringline/recv_ring` counts the kind each worker selected, and
+  `ringline/recv_preflight_failed` the step a failed check stopped at.
+  With the default incremental geometry every segmented delivery is copied
+  (64 buffers never exceed the default `recv_segment_reserve`); with
+  `prefault_buffers(true)` the plain geometry makes 256 MiB per worker
+  resident. Lends into incremental buffers are not capped yet (#622 step
+  4b): about 64 connections holding unread data can keep every buffer of
+  the default ring out of use and stall receives on the worker.
+
 - Three connection counters (`ringline/connections`, `op` label) count three
   ways an accepted connection can be closed before it reaches a handler:
   `accept_table_full` (the worker's connection table was full),

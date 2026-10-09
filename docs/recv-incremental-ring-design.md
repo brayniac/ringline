@@ -154,9 +154,10 @@ network configuration:
 2. Arm a multishot `RECV` on one end. Write, reap, write, reap: the two
    completions must land at offsets 0 and the first's length, both with
    `F_BUF_MORE`, and the ring entry must advance in place.
-3. Write more than the space left. The completion must deliver exactly the
-   space left with `F_BUF_MORE` clear, and the excess must end the arm with
-   `-ENOBUFS` without `F_MORE`.
+3. Write more than the space left, by fewer bytes than the buffer holds.
+   The completion must deliver exactly the space left with `F_BUF_MORE`
+   clear, and the excess must end the arm with `-ENOBUFS` without
+   `F_MORE`.
 4. Post the buffer again and re-arm. The excess must complete at offset 0
    with `F_BUF_MORE`; then a half-close must end the arm with `res` 0, no
    `F_BUFFER` and no `F_MORE`, leaving the entry at the used length.
@@ -168,10 +169,14 @@ Each step waits at most 1 s for its completion; a step that times out does
 not match. A registration refused with `EINVAL` (no INC), a step that does
 not match, or a failure to create the socketpair selects plain rings, and
 the worker records which step failed in a metric. Any other registration
-error fails startup as above. The preflight's ring entry is one page,
-which the memlock preflight counts on 6.14+. The preflight does not cover
+error fails startup as above, and so does a receive the preflight cannot
+cancel within 1 s, since its last completion would reach the event loop;
+the preflight ring is then leaked rather than freed. The preflight's
+one-page ring is unregistered before the TCP ring is registered, so the
+memlock preflight does not count it. The preflight does not cover
 ordering under CQ overflow or SQPOLL; the conformance tests checked those
-on 6.12.63 and 7.1. Its time per worker is measured in step 4.
+on 6.12.63 and 7.1. It takes about 0.1 ms per worker (85–115 µs over 11
+runs on Linux 6.12, arm64), and 2.3 ms on a cold first run.
 
 Ubuntu's 6.8 kernels from 6.8.0-139 reject every provided-ring registration
 whose reserved words are zero, the form other kernels require, and accept
@@ -248,7 +253,8 @@ release without a hold panics, naming the bid. A duplicate release that
 arrives after the buffer was posted and completed again takes that
 completion's hold and is not detected. A runtime check guards rule 1: when a
 completion clears `F_BUF_MORE`, `written` must equal `buffer_size`, and
-while it is set, be less; a mismatch is a bug and fails loudly.
+while it is set, be less; a mismatch is a bug, and the assertion panics
+the worker, in release builds too.
 
 A buffer counts as out of the ring when it is exhausted and not yet
 returned; a partly filled buffer is still in the ring. A group's `free()` is
@@ -682,9 +688,11 @@ receive queue, and TCP closes the window until the worker re-arms.
   1 s. `build()` rejects a large-group bgid equal to the TCP bgid
   (default 0), or the UDP bgid (default 1) when UDP is in use.
 - With INC on and the `timestamps` feature built in, timestamped
-  connections get their own plain ring. Their multishot `RECVMSG` works on
-  an INC ring (conformance tests), but before the 6.12.y change that lets a
-  ring require a minimum length left in a buffer it can fail when the space
+  connections get their own plain ring from step 5. Until then a worker
+  with `timestamps(true)` uses a plain ring for every connection.
+  Timestamped connections' multishot `RECVMSG` works on an INC ring
+  (conformance tests), but before the 6.12.y change that lets a ring
+  require a minimum length left in a buffer it can fail when the space
   left is smaller than the message header; that failure is not reproduced
   here. The ring's geometry is the plain small group's, its bgid
   (`recv_timestamp_buffer_bgid`, default 3) is validated against the TCP,
@@ -764,19 +772,22 @@ buffers held by `with_bytes` views, values copied by the
 3. Offsets: the `off` fields, data at `base + written`, `copy_out_bid`
    and `settle_forward_end`. Still a plain ring, where these offsets are 0,
    so these paths are exercised only from step 4.
-4. INC and the plain geometry, behind `recv_incremental` (default `false`):
-   ring-kind selection with the behaviour preflight and its timing, a
-   plain ring for timestamped connections, `MADV_NOHUGEPAGE` and the
-   4096 × 64 KiB plain
-   geometry, the per-group lend cap and its copy paths,
-   `recv_segment_reserve` ignored under INC, the fallback arbitration, the
-   memlock preflight, and the per-group metrics.
+4. INC and the plain geometry, behind `recv_incremental` (default
+   `false`), in two changes. 4a: ring-kind selection with the behaviour
+   preflight (about 0.1 ms per worker on Linux 6.12, arm64), a plain ring
+   for a worker with `timestamps(true)`, `MADV_NOHUGEPAGE`, the geometry
+   per ring kind, the memlock preflight and the ring-kind metrics. 4b: the
+   per-group lend cap and its copy paths, `recv_segment_reserve` ignored
+   under INC, the fallback arbitration, and the per-group lend and
+   `ENOBUFS` metrics.
 5. The large group, behind `recv_large_group` (default `false`): its bgid
    and validation, the arm taking the group per call,
    `OpTag::RecvMultiLarge` and the `SendRecvBuf` group bit, `group` in
    `PendingRecvBuf` and the send slab, the cancel sites, promotion,
-   migration and demotion with `recv_large_demote_quiet`, and the two-group
-   memlock preflight. Migration is timed in ringline's metrics.
+   migration and demotion with `recv_large_demote_quiet`, the two-group
+   memlock preflight, and the timestamps ring with
+   `recv_timestamp_buffer_bgid`. Migration is timed in ringline's
+   metrics.
 6. Measure ringline on hv01 and across hv01/hv02, on Linux 6.1, 6.8, 6.12
    and 7.1: the geometry per ring kind with and without the large group
    against the 256 × 16 KiB ring, with the bench suite (echo at 256 B to
@@ -796,7 +807,11 @@ buffers held by `with_bytes` views, values copied by the
    and 7.1.
 7. New defaults (the geometry per ring kind, `recv_incremental` on, the
    large group's default per ring kind, the `recv_accumulator_max` floor,
-   the removal of `recv_segment_reserve`) in a coordinated release.
+   the removal of `recv_segment_reserve`) in a coordinated release. Before
+   `recv_incremental` is on by default, the rule-1 assertion in
+   `ProvidedBufRing::complete` becomes a counted recovery, so a kernel
+   whose TCP receive differs from what the preflight checks does not panic
+   a worker.
 
 Steps 1 to 3 change neither the ring's registration nor its geometry, and
 can land before INC is switched on. Step 1 holds a buffer in

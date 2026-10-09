@@ -23,6 +23,19 @@ pub static RING: ShardedCounterGroup = ShardedCounterGroup::new(6);
 #[metric(name = "ringline/pool", description = "Pool exhaustion counters")]
 pub static POOL: ShardedCounterGroup = ShardedCounterGroup::new(8);
 
+#[metric(
+    name = "ringline/recv_ring",
+    description = "TCP receive ring kind selected by each worker at startup"
+)]
+pub static RECV_RING: ShardedCounterGroup = ShardedCounterGroup::new(recv_ring::COUNT);
+
+#[metric(
+    name = "ringline/recv_preflight_failed",
+    description = "Incremental-ring preflights that failed, by step"
+)]
+pub static RECV_PREFLIGHT_FAILED: ShardedCounterGroup =
+    ShardedCounterGroup::new(recv_preflight::COUNT);
+
 #[metric(name = "ringline/udp", description = "UDP counters")]
 pub static UDP: ShardedCounterGroup = ShardedCounterGroup::new(4);
 
@@ -265,6 +278,40 @@ pub mod ring {
     pub const SHUTDOWN_STALE: usize = 5;
 }
 
+/// Slot indices for `RECV_RING`: one count per worker, by the TCP receive
+/// ring it registered (`ConfigBuilder::recv_incremental`).
+pub mod recv_ring {
+    /// An incremental ring (`IOU_PBUF_RING_INC`).
+    pub const INCREMENTAL: usize = 0;
+    /// A plain ring.
+    pub const PLAIN: usize = 1;
+    pub const COUNT: usize = 2;
+}
+
+/// Slot indices for `RECV_PREFLIGHT_FAILED`: the step of the
+/// incremental-ring preflight that did not behave as the receive path
+/// relies on (`backend/uring/engine/preflight.rs`). A failed preflight
+/// selects a plain ring.
+pub mod recv_preflight {
+    /// The socketpair could not be created.
+    pub const SOCKETPAIR: usize = 0;
+    /// A write, read or ring operation failed.
+    pub const IO_ERROR: usize = 1;
+    /// A step's completion did not arrive within 1 s.
+    pub const TIMEOUT: usize = 2;
+    /// The first or second appended completion.
+    pub const APPEND: usize = 3;
+    /// The appended data or the ring entry's advance.
+    pub const OFFSETS: usize = 4;
+    /// The completion that uses the buffer up, or the `ENOBUFS` after it.
+    pub const EXHAUSTION: usize = 5;
+    /// The completion after the buffer was posted again.
+    pub const REPOST: usize = 6;
+    /// The half-close completion or the ring entry it leaves.
+    pub const EOF: usize = 7;
+    pub const COUNT: usize = 8;
+}
+
 /// Slot indices for per-`OpTag` completion counters: the slot *is* the
 /// discriminant.
 pub mod cqe_tag {
@@ -343,6 +390,20 @@ pub mod udp {
 ///
 /// Call once at startup before metrics are scraped.
 pub fn init_metadata() {
+    RECV_RING.insert_metadata(recv_ring::INCREMENTAL, "op".into(), "incremental".into());
+    RECV_RING.insert_metadata(recv_ring::PLAIN, "op".into(), "plain".into());
+    for (step, name) in [
+        (recv_preflight::SOCKETPAIR, "socketpair"),
+        (recv_preflight::IO_ERROR, "io_error"),
+        (recv_preflight::TIMEOUT, "timeout"),
+        (recv_preflight::APPEND, "append"),
+        (recv_preflight::OFFSETS, "offsets"),
+        (recv_preflight::EXHAUSTION, "exhaustion"),
+        (recv_preflight::REPOST, "repost"),
+        (recv_preflight::EOF, "eof"),
+    ] {
+        RECV_PREFLIGHT_FAILED.insert_metadata(step, "op".into(), name.into());
+    }
     CONNECTIONS.insert_metadata(conn::ACCEPTED, "op".into(), "accepted".into());
     CONNECTIONS.insert_metadata(conn::CLOSED, "op".into(), "closed".into());
     CONNECTIONS.insert_metadata(conn::PARK_STARTED, "op".into(), "park_started".into());
@@ -580,6 +641,38 @@ mod tests {
             udp::DATAGRAMS_DROPPED,
         ] {
             assert!(UDP.increment(idx), "UDP[{idx}] out of bounds");
+        }
+        for idx in [recv_ring::INCREMENTAL, recv_ring::PLAIN] {
+            assert!(RECV_RING.increment(idx), "RECV_RING[{idx}] out of bounds");
+        }
+        for idx in 0..recv_preflight::COUNT {
+            assert!(
+                RECV_PREFLIGHT_FAILED.increment(idx),
+                "RECV_PREFLIGHT_FAILED[{idx}] out of bounds"
+            );
+        }
+    }
+
+    /// Every slot of the receive-ring groups is labelled, so an exporter
+    /// can name what it counts.
+    #[test]
+    fn recv_ring_slots_are_labelled() {
+        init_metadata();
+        for idx in 0..recv_ring::COUNT {
+            assert!(
+                RECV_RING
+                    .load_metadata(idx)
+                    .is_some_and(|m| m.contains_key("op")),
+                "RECV_RING[{idx}] has no op label"
+            );
+        }
+        for idx in 0..recv_preflight::COUNT {
+            assert!(
+                RECV_PREFLIGHT_FAILED
+                    .load_metadata(idx)
+                    .is_some_and(|m| m.contains_key("op")),
+                "RECV_PREFLIGHT_FAILED[{idx}] has no op label"
+            );
         }
     }
 }

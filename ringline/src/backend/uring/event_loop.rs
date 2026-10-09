@@ -8718,7 +8718,7 @@ mod tests {
     #[test]
     fn handle_recv_multi_reads_each_completion_at_its_offset() {
         let mut el = make_test_loop();
-        el.driver.provided_bufs.set_incremental_for_test();
+        el.driver.provided_bufs.set_incremental();
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
         let bid: u16 = 2;
@@ -8807,7 +8807,7 @@ mod tests {
     #[test]
     fn settle_forward_end_reads_a_held_buffer_at_its_offset() {
         let mut el = make_test_loop();
-        el.driver.provided_bufs.set_incremental_for_test();
+        el.driver.provided_bufs.set_incremental();
         let conn_index = accept_connection(&mut el);
         let bid: u16 = 1;
         let (buf_ptr, _) = el.driver.provided_bufs.get_buffer(bid);
