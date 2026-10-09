@@ -896,10 +896,7 @@ fn build_pool_send(
         conn_index,
         crate::completion::UserData::send_payload(pool_slot, generation),
     );
-    let entry = io_uring::opcode::Send::new(io_uring::types::Fixed(conn_index), ptr, len)
-        .flags(crate::completion::STREAM_SEND_FLAGS)
-        .build()
-        .user_data(user_data.raw());
+    let entry = crate::backend::uring::sqe::Sqe::stream_send(conn_index, ptr, len, user_data.raw());
     crate::handler::BuiltSend {
         entry,
         pool_slot,

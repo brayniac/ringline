@@ -2014,14 +2014,12 @@ impl ConnCtx {
                             conn_index,
                             payload,
                         );
-                        let entry = io_uring::opcode::Send::new(
-                            io_uring::types::Fixed(conn_index),
+                        let entry = crate::backend::uring::sqe::Sqe::stream_send(
+                            conn_index,
                             pending_ptr,
                             pending.len,
-                        )
-                        .flags(crate::completion::STREAM_SEND_FLAGS)
-                        .build()
-                        .user_data(user_data.raw());
+                            user_data.raw(),
+                        );
 
                         let built = crate::handler::BuiltSend {
                             entry,

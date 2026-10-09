@@ -3910,14 +3910,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     conn_index,
                     new_payload,
                 );
-                let entry = io_uring::opcode::Send::new(
-                    io_uring::types::Fixed(conn_index),
+                let entry = crate::backend::uring::sqe::Sqe::stream_send(
+                    conn_index,
                     new_ptr,
                     new_remaining,
-                )
-                .flags(crate::completion::STREAM_SEND_FLAGS)
-                .build()
-                .user_data(new_ud.raw());
+                    new_ud.raw(),
+                );
 
                 if unsafe { self.driver.ring.push_sqe(&entry) }.is_err() {
                     // SQ full: park the remainder at the queue head and keep
@@ -7222,10 +7220,8 @@ mod tests {
 
         // Queue chunk 1 as a real BuiltSend behind the in-flight chunk 0.
         let ud1 = UserData::encode(OpTag::Send, conn_index, slot1 as u32);
-        let entry1 = io_uring::opcode::Send::new(io_uring::types::Fixed(conn_index), ptr1, len1)
-            .flags(crate::completion::STREAM_SEND_FLAGS)
-            .build()
-            .user_data(ud1.raw());
+        let entry1 =
+            crate::backend::uring::sqe::Sqe::stream_send(conn_index, ptr1, len1, ud1.raw());
         el.driver.send_queues[conn_index as usize]
             .queue
             .push_back(crate::handler::BuiltSend {
@@ -7407,10 +7403,7 @@ mod tests {
             conn_index,
             UserData::send_payload(slot, generation),
         );
-        let entry = io_uring::opcode::Send::new(io_uring::types::Fixed(conn_index), ptr, len)
-            .flags(crate::completion::STREAM_SEND_FLAGS)
-            .build()
-            .user_data(ud.raw());
+        let entry = crate::backend::uring::sqe::Sqe::stream_send(conn_index, ptr, len, ud.raw());
         crate::handler::BuiltSend {
             entry,
             pool_slot: slot,
@@ -7914,10 +7907,7 @@ mod tests {
         let bid: u16 = 7;
         let ud = UserData::encode(OpTag::SendRecvBuf, conn_index, bid as u32);
         let entry =
-            io_uring::opcode::Send::new(io_uring::types::Fixed(conn_index), std::ptr::null(), 0)
-                .flags(crate::completion::STREAM_SEND_FLAGS)
-                .build()
-                .user_data(ud.raw());
+            crate::backend::uring::sqe::Sqe::stream_send(conn_index, std::ptr::null(), 0, ud.raw());
         el.driver.send_queues[conn_index as usize]
             .queue
             .push_back(crate::handler::BuiltSend {
@@ -8014,10 +8004,8 @@ mod tests {
 
         // Send A is in flight; send B is queued behind it.
         let ud_b = UserData::encode(OpTag::Send, conn_index, slot_b as u32);
-        let entry_b = io_uring::opcode::Send::new(io_uring::types::Fixed(conn_index), ptr_b, len_b)
-            .flags(crate::completion::STREAM_SEND_FLAGS)
-            .build()
-            .user_data(ud_b.raw());
+        let entry_b =
+            crate::backend::uring::sqe::Sqe::stream_send(conn_index, ptr_b, len_b, ud_b.raw());
         el.driver.send_queues[conn_index as usize]
             .queue
             .push_back(crate::handler::BuiltSend {
@@ -13033,7 +13021,15 @@ mod tests {
                 let (slot, ptr, len) = el.driver.send_copy_pool.copy_in(b"first").unwrap();
                 let state = &mut el.driver.send_queues[c as usize];
                 state.queue.push_back(crate::handler::BuiltSend {
-                    entry: io_uring::opcode::Send::new(io_uring::types::Fixed(c), ptr, len).build(),
+                    entry: crate::backend::uring::sqe::Sqe::new(
+                        crate::backend::uring::sqe::Op::Send {
+                            fd: crate::backend::uring::sqe::Fd::Fixed(c),
+                            buf: ptr,
+                            len,
+                            flags: 0,
+                        },
+                        0,
+                    ),
                     pool_slot: slot,
                     slab_idx: u16::MAX,
                     total_len: len,
@@ -16644,9 +16640,7 @@ mod tests {
             .expect("slab room");
         let id = await_slab(&mut el, conn_index, slab_idx, 100);
         let ud = UserData::encode(OpTag::SendMsgZc, conn_index, slab_idx as u32);
-        let entry = io_uring::opcode::SendMsgZc::new(io_uring::types::Fixed(conn_index), msg_ptr)
-            .build()
-            .user_data(ud.raw());
+        let entry = crate::backend::uring::sqe::Sqe::send_msg_zc(conn_index, msg_ptr, ud.raw());
         let state = &mut el.driver.send_queues[conn_index as usize];
         state.queue.push_back(crate::handler::BuiltSend {
             entry,

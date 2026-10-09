@@ -588,10 +588,8 @@ impl<'a> DriverCtx<'a> {
                 conn.index,
                 crate::completion::UserData::send_payload(slot, conn.generation),
             );
-            let entry = io_uring::opcode::Send::new(io_uring::types::Fixed(conn.index), ptr, len)
-                .flags(crate::completion::STREAM_SEND_FLAGS)
-                .build()
-                .user_data(user_data.raw());
+            let entry =
+                crate::backend::uring::sqe::Sqe::stream_send(conn.index, ptr, len, user_data.raw());
 
             let built = BuiltSend {
                 entry,
@@ -744,7 +742,7 @@ impl<'a> DriverCtx<'a> {
                 match sends.last() {
                     Some(last) => {
                         debug_assert_eq!(
-                            crate::completion::UserData(last.entry.get_user_data()).tag(),
+                            crate::completion::UserData(last.entry.user_data).tag(),
                             Some(crate::completion::OpTag::Send),
                             "encrypt_to_sends must tag its final chunk OpTag::Send",
                         );
@@ -804,10 +802,8 @@ impl<'a> DriverCtx<'a> {
                 conn.index,
                 crate::completion::UserData::send_payload(slot, conn.generation),
             );
-            let entry = io_uring::opcode::Send::new(io_uring::types::Fixed(conn.index), ptr, len)
-                .flags(crate::completion::STREAM_SEND_FLAGS)
-                .build()
-                .user_data(user_data.raw());
+            let entry =
+                crate::backend::uring::sqe::Sqe::stream_send(conn.index, ptr, len, user_data.raw());
 
             let built = BuiltSend {
                 entry,
@@ -3870,7 +3866,7 @@ impl<'a> DriverCtx<'a> {
 pub(crate) struct BuiltSend {
     /// The io_uring SQE to submit.
     #[cfg(has_io_uring)]
-    pub entry: io_uring::squeue::Entry,
+    pub entry: crate::backend::uring::sqe::Sqe,
     /// SendCopyPool slot index. u16::MAX if none.
     pub pool_slot: u16,
     /// InFlightSendSlab index. u16::MAX if none (only for SendMsgZc).
@@ -4099,10 +4095,12 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
             self.conn.index,
             crate::completion::UserData::send_payload(slot, self.conn.generation),
         );
-        let entry = io_uring::opcode::Send::new(io_uring::types::Fixed(self.conn.index), ptr, len)
-            .flags(crate::completion::STREAM_SEND_FLAGS)
-            .build()
-            .user_data(user_data.raw());
+        let entry = crate::backend::uring::sqe::Sqe::stream_send(
+            self.conn.index,
+            ptr,
+            len,
+            user_data.raw(),
+        );
 
         Ok(BuiltSend {
             entry,
@@ -4195,10 +4193,11 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
                 self.conn.index,
                 slab_idx as u32,
             );
-            let entry =
-                io_uring::opcode::SendMsgZc::new(io_uring::types::Fixed(self.conn.index), msg_ptr)
-                    .build()
-                    .user_data(user_data.raw());
+            let entry = crate::backend::uring::sqe::Sqe::send_msg_zc(
+                self.conn.index,
+                msg_ptr,
+                user_data.raw(),
+            );
 
             Ok(BuiltSend {
                 entry,
@@ -4254,10 +4253,11 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
                 self.conn.index,
                 slab_idx as u32,
             );
-            let entry =
-                io_uring::opcode::SendMsgZc::new(io_uring::types::Fixed(self.conn.index), msg_ptr)
-                    .build()
-                    .user_data(user_data.raw());
+            let entry = crate::backend::uring::sqe::Sqe::send_msg_zc(
+                self.conn.index,
+                msg_ptr,
+                user_data.raw(),
+            );
 
             Ok(BuiltSend {
                 entry,
@@ -4324,10 +4324,12 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
             self.conn.index,
             crate::completion::UserData::send_payload(slot, self.conn.generation),
         );
-        let entry = io_uring::opcode::Send::new(io_uring::types::Fixed(self.conn.index), ptr, len)
-            .flags(crate::completion::STREAM_SEND_FLAGS)
-            .build()
-            .user_data(user_data.raw());
+        let entry = crate::backend::uring::sqe::Sqe::stream_send(
+            self.conn.index,
+            ptr,
+            len,
+            user_data.raw(),
+        );
 
         let built = BuiltSend {
             entry,
@@ -4394,10 +4396,12 @@ impl<'b, 'a> SendChainBuilder<'b, 'a> {
             self.conn.index,
             crate::completion::UserData::send_payload(slot, self.conn.generation),
         );
-        let entry = io_uring::opcode::Send::new(io_uring::types::Fixed(self.conn.index), ptr, len)
-            .flags(crate::completion::STREAM_SEND_FLAGS)
-            .build()
-            .user_data(user_data.raw());
+        let entry = crate::backend::uring::sqe::Sqe::stream_send(
+            self.conn.index,
+            ptr,
+            len,
+            user_data.raw(),
+        );
 
         self.built.push(BuiltSend {
             entry,
@@ -4474,8 +4478,8 @@ impl<'b, 'a> SendChainBuilder<'b, 'a> {
             }
             self.ctx.chain_table.start(conn_index, 1);
         } else {
-            let mut entries: Vec<io_uring::squeue::Entry> =
-                self.built.iter().map(|b| b.entry.clone()).collect();
+            let mut entries: Vec<crate::backend::uring::sqe::Sqe> =
+                self.built.iter().map(|b| b.entry).collect();
             unsafe {
                 self.ctx.ring.push_sqe_chain(&mut entries)?;
             }
@@ -4651,11 +4655,12 @@ impl<'b, 'a> ChainPartsBuilder<'b, 'a> {
                         conn_index,
                         crate::completion::UserData::send_payload(slot, self.chain.conn.generation),
                     );
-                    let entry =
-                        io_uring::opcode::Send::new(io_uring::types::Fixed(conn_index), ptr, len)
-                            .flags(crate::completion::STREAM_SEND_FLAGS)
-                            .build()
-                            .user_data(user_data.raw());
+                    let entry = crate::backend::uring::sqe::Sqe::stream_send(
+                        conn_index,
+                        ptr,
+                        len,
+                        user_data.raw(),
+                    );
                     BuiltSend {
                         entry,
                         pool_slot: slot,
@@ -4684,11 +4689,12 @@ impl<'b, 'a> ChainPartsBuilder<'b, 'a> {
                         conn_index,
                         crate::completion::UserData::send_payload(slot, self.chain.conn.generation),
                     );
-                    let entry =
-                        io_uring::opcode::Send::new(io_uring::types::Fixed(conn_index), ptr, len)
-                            .flags(crate::completion::STREAM_SEND_FLAGS)
-                            .build()
-                            .user_data(user_data.raw());
+                    let entry = crate::backend::uring::sqe::Sqe::stream_send(
+                        conn_index,
+                        ptr,
+                        len,
+                        user_data.raw(),
+                    );
 
                     BuiltSend {
                         entry,
@@ -4786,12 +4792,11 @@ impl<'b, 'a> ChainPartsBuilder<'b, 'a> {
                                     conn_index,
                                     slab_idx as u32,
                                 );
-                                let entry = io_uring::opcode::SendMsgZc::new(
-                                    io_uring::types::Fixed(conn_index),
+                                let entry = crate::backend::uring::sqe::Sqe::send_msg_zc(
+                                    conn_index,
                                     msg_ptr,
-                                )
-                                .build()
-                                .user_data(user_data.raw());
+                                    user_data.raw(),
+                                );
 
                                 BuiltSend {
                                     entry,
@@ -4859,12 +4864,11 @@ impl<'b, 'a> ChainPartsBuilder<'b, 'a> {
                             conn_index,
                             slab_idx as u32,
                         );
-                        let entry = io_uring::opcode::SendMsgZc::new(
-                            io_uring::types::Fixed(conn_index),
+                        let entry = crate::backend::uring::sqe::Sqe::send_msg_zc(
+                            conn_index,
                             msg_ptr,
-                        )
-                        .build()
-                        .user_data(user_data.raw());
+                            user_data.raw(),
+                        );
 
                         BuiltSend {
                             entry,
