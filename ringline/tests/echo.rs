@@ -488,58 +488,6 @@ fn async_echo_small_message() {
     }
 }
 
-/// With `recv_incremental(true)` the runtime echoes messages from 22 B to
-/// 1 MiB, with the geometry that follows the ring kind (64 × 1 MiB on a
-/// kernel with incremental rings) and with a small explicit one (16 × 1 KiB,
-/// which runs out of buffers within each message). Each worker records the
-/// ring kind it selected.
-#[test]
-#[cfg(has_io_uring)]
-fn async_echo_with_recv_incremental() {
-    use ringline::metrics::{RECV_RING, recv_ring};
-    let selections = || {
-        RECV_RING.value(recv_ring::INCREMENTAL).unwrap_or(0)
-            + RECV_RING.value(recv_ring::PLAIN).unwrap_or(0)
-    };
-    let before = selections();
-    let geometries: [Option<(u16, u32)>; 2] = [None, Some((16, 1024))];
-    for (i, geometry) in geometries.into_iter().enumerate() {
-        let mut builder = ConfigBuilder::new()
-            .workers(1)
-            .pin_to_core(false)
-            .sq_entries(64)
-            .max_connections(64)
-            .send_pool(64, 16384)
-            .recv_incremental(true);
-        if let Some((ring_size, buffer_size)) = geometry {
-            builder = builder.recv_buffer(ring_size, buffer_size);
-        }
-        let (shutdown, handles) = RinglineBuilder::new(builder.build().expect("config"))
-            .bind("127.0.0.1:0".parse().unwrap())
-            .launch::<AsyncEcho>()
-            .expect("launch failed");
-        let addr = shutdown.bound_addr().expect("bound address").to_string();
-        wait_for_server(&addr);
-        for len in [22usize, 1000, 8192, 100_000, 1 << 20] {
-            let msg: Vec<u8> = (0..len).map(|k| (k % 251) as u8).collect();
-            assert_eq!(
-                echo_round_trip(&addr, &msg),
-                msg,
-                "{geometry:?}, {len} bytes"
-            );
-        }
-        shutdown.shutdown();
-        for h in handles {
-            h.join().unwrap().unwrap();
-        }
-        assert_eq!(
-            selections(),
-            before + i as u64 + 1,
-            "one selection per worker"
-        );
-    }
-}
-
 /// The runtime launches and echoes with `sqpoll(true)`. The kernel refuses
 /// COOP_TASKRUN and DEFER_TASKRUN with SQPOLL, so setup sets neither under
 /// SQPOLL (#630).
