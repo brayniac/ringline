@@ -314,7 +314,10 @@ impl UringEngine {
     /// only the SQ thread frees entries and `submit` does not enter the
     /// kernel while that thread is awake, so this also waits
     /// (`IORING_ENTER_SQ_WAIT`, which returns once at least one entry is
-    /// free) until `needed` are free or the SQ has drained.
+    /// free) until `needed` are free or the SQ has drained. When fewer than
+    /// `needed` but at least one entry is free, `IORING_ENTER_SQ_WAIT`
+    /// returns at once, so this repeats the enter until the SQ thread frees
+    /// the rest.
     fn make_sq_room(&mut self, needed: usize) -> io::Result<()> {
         self.ring.submit()?;
         if self.ring.params().is_setup_sqpoll() {
@@ -324,7 +327,11 @@ impl UringEngine {
                     break;
                 }
                 drop(sq);
-                self.ring.submitter().squeue_wait()?;
+                match self.ring.submitter().squeue_wait() {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(e),
+                }
             }
         }
         Ok(())
@@ -743,7 +750,7 @@ impl Engine for UringEngine {
         // atomics.  We only read `.len()` (sq_tail − sq_head) and never push
         // new entries here, so there is no aliasing or mutation hazard.
         let n = unsafe { self.ring.submission_shared().len() } as u32;
-        if self.ring.params().is_setup_sqpoll() {
+        if n > 0 && self.ring.params().is_setup_sqpoll() {
             // The SQ thread submits. `submit` enters the kernel only to wake
             // that thread when it has gone idle, or to flush an overflowed
             // CQ; a raw enter here would cost a syscall on every flush and
@@ -1356,6 +1363,58 @@ mod encode_tests {
         ];
         for (link, want) in cases {
             assert_eq!(bytes(&base.link(link).encode()), bytes(&want), "{link:?}");
+        }
+    }
+}
+
+#[cfg(all(test, uring_engine))]
+mod sq_room_tests {
+    use super::*;
+    use crate::backend::uring::ring::is_memlock_enomem;
+    use crate::config::ConfigBuilder;
+    use std::time::Duration;
+
+    fn sqpoll_engine(sq_entries: u32) -> UringEngine {
+        let config = ConfigBuilder::new()
+            .workers(1)
+            .sq_entries(sq_entries)
+            .sqpoll(true)
+            .sqpoll_idle_ms(1)
+            .build()
+            .expect("valid config");
+        // Up to 5 s for earlier rings' memlock charge to be released (#589).
+        for _ in 0..50 {
+            match UringEngine::setup(&config) {
+                Err(e) if is_memlock_enomem(&e) => std::thread::sleep(Duration::from_millis(100)),
+                result => return result.expect("ring"),
+            }
+        }
+        UringEngine::setup(&config).expect("ring")
+    }
+
+    /// Under SQPOLL, a pair pushed when the SQ has one free entry waits for
+    /// the SQ thread to free a second instead of failing (#630). The SQ
+    /// thread is left to go idle first, so the queued entries stay in the SQ
+    /// until the push wakes it.
+    #[test]
+    fn a_pair_waits_for_the_sq_thread_to_free_two_entries() {
+        let mut e = sqpoll_engine(4);
+        let cap = e.ring.submission().capacity();
+        for round in 0..20 {
+            // `sqpoll_idle_ms(1)`: the SQ thread sleeps after 1 ms idle.
+            std::thread::sleep(Duration::from_millis(20));
+            let nop = || -> squeue::Entry128 { opcode::Nop::new().build().into() };
+            for _ in 0..cap - 1 {
+                unsafe { e.ring.submission().push(&nop()) }.expect("room");
+            }
+            unsafe { e.push_sqe_pair(nop(), nop()) }
+                .unwrap_or_else(|err| panic!("round {round}: {err}"));
+            e.ring.submit().expect("submit");
+            let mut reaped = 0;
+            while reaped < cap + 1 {
+                e.ring.submit_and_wait(1).expect("wait");
+                reaped += e.ring.completion().count();
+            }
         }
     }
 }
