@@ -198,6 +198,17 @@ fn two_unread_echoes_or_forwards_are_throttled_alone() {
     }
 }
 
+/// A direct-echo or `forward_held` connection receives one buffer per arm,
+/// so on a plain ring it holds no more than its cap: three unread ones, a
+/// quarter of a 16-buffer ring each, leave the fourth quarter to the echo
+/// connection (#638).
+#[test]
+fn unread_echoes_and_forwards_are_throttled_alone_on_a_plain_ring() {
+    for mode in *b"DF" {
+        idle_peers_are_throttled_alone(mode, false, 0, 3);
+    }
+}
+
 /// A `forward_to_conn` write's pinned buffers count toward the segment cap.
 #[test]
 fn unread_forward_to_peers_are_throttled_alone() {

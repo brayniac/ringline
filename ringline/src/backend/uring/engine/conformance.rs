@@ -223,6 +223,41 @@ fn plain_ring_without_buffers_ends_the_arm_with_enobufs() {
     e.unregister_buf_ring(3).expect("unregister");
 }
 
+/// A one-shot recv with buffer select (`Op::RecvSelect`) takes one buffer
+/// and ends: one completion with `IORING_CQE_F_BUFFER` and without
+/// `IORING_CQE_F_MORE`, and none after it while data stays queued. Direct
+/// echo and recv-forward arm it so a connection takes one buffer per arm
+/// (`Driver::recv_single`).
+#[test]
+fn a_one_shot_recv_takes_one_buffer() {
+    for kind in [RingKind::Plain, RingKind::Incremental] {
+        let ring = ProvidedBufRing::new(6, 4, 16).expect("ring");
+        let mut e = engine();
+        if kind == RingKind::Incremental && !incremental(&e) {
+            continue;
+        }
+        e.register_buf_ring(&ring, kind).expect("register");
+        let (mut client, server) = pair();
+        client.write_all(&[b'e'; 40]).expect("write");
+        std::thread::sleep(Duration::from_millis(20));
+        let sqe = Sqe::new(
+            Op::RecvSelect {
+                fd: Fd::Raw(server.as_raw_fd()),
+                buf_group: 6,
+            },
+            7,
+        );
+        // Safety: a buffer-select recv references no caller memory.
+        unsafe { e.push(&sqe) }.expect("push");
+        let cqes = reap(&mut e, 2);
+        assert_eq!(cqes.len(), 1, "{kind:?}: {cqes:?}");
+        assert_eq!(data(cqes[0]).0, 16, "{kind:?}");
+        assert!(cqueue::buffer_select(cqes[0].2).is_some(), "{kind:?}");
+        assert!(!cqueue::more(cqes[0].2), "{kind:?}");
+        e.unregister_buf_ring(6).expect("unregister");
+    }
+}
+
 /// Row "More data queued": a completion carries `SOCK_NONEMPTY` when the
 /// socket still has data after it, on both ring kinds.
 #[test]

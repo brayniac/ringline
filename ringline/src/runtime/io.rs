@@ -2319,6 +2319,9 @@ impl ConnCtx {
                 return;
             }
             driver.recv_forward[self.conn_index as usize] = true;
+            // Recv-forward holds its buffers past the completion, so it
+            // receives one buffer per arm (`Driver::recv_single`).
+            driver.cancel_recv_for_single(self.conn_index);
         });
     }
 
@@ -5705,6 +5708,9 @@ impl Future for DirectEchoFuture {
                 if let Some(cs) = driver.connections.get_mut(self.conn_index) {
                     cs.direct_echo = true;
                 }
+                // Direct echo holds its buffers past the completion, so it
+                // receives one buffer per arm (`Driver::recv_single`).
+                driver.cancel_recv_for_single(self.conn_index);
                 self.armed = true;
 
                 // Drain any buffer that arrived before the flag was set.
