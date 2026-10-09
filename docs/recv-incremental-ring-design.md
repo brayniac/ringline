@@ -135,10 +135,15 @@ ring with no large group. `recv_large_group(true)` is honoured with
 path with an explicit `recv_buffer(4096, 64 KiB)` plus
 `recv_large_group(true)`.
 
-The incremental-buffer code had fixes in 6.12 stable releases. Which 6.12.y
-release first has all the fixes this design relies on is not known. Step 0
-either names a minimum 6.12.y release and checks the running kernel against
-it, or keeps a runtime probe of the behaviour table on a one-entry ring.
+The incremental-buffer code had fixes in 6.12 stable releases. INC is used
+on 6.12 only from 6.12.63, the release the conformance tests passed on, and
+on every 6.13 or later kernel. Which earlier 6.12.y release first has all
+the fixes this design relies on is not known; the minimum can be lowered
+once an earlier release passes the conformance tests. Ring selection reads
+the running kernel's `major.minor.patch` from `uname`. A 6.12 kernel below
+6.12.63 gets a plain ring, including a distribution kernel whose release
+string carries a lower patch level than its backports, such as RHEL 10's
+6.12.0.
 
 Ubuntu's 6.8 kernels from 6.8.0-139 reject every provided-ring registration
 whose reserved words are zero, the form other kernels require, and accept
@@ -694,8 +699,8 @@ buffers held by `with_bytes` views, values copied by the
 0. Probe and conformance tests: each row of the behaviour table, the
    byte-verified offset order (a CQ overflow, SQPOLL), EOF on a partly
    used buffer, and multishot `RECVMSG` on an INC ring; run on CI and as
-   SystemsLab experiments on 6.1, 6.8, 6.12 and 7.1. Settle the 6.12.y
-   minimum or keep a probe.
+   SystemsLab experiments on 6.1, 6.8, 6.12 and 7.1. The 6.12.y minimum
+   is 6.12.63.
 1. Bounded accumulator: the target length from `NeedAtLeast` and the
    sites that clear it (reset, close, `ConnStream` reads, the segmented
    entry's `take_frozen`, `settle_forward_end`), the hold of a

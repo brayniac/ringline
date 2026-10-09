@@ -108,8 +108,9 @@ pub(crate) struct PendingRecvBuf {
 /// - [`Pinned`](Self::Pinned): a provided-buffer bid pinned in the ring — the
 ///   bid is NOT replenished, so the buffer stays in the provided ring until a
 ///   segment reader consumes it or the connection closes (`close_connection`
-///   drains the hold). The backing pointer is derivable via
-///   `provided_bufs.get_buffer(bid)`, so only the id and length are stored. This
+///   drains the hold). The data's address is derivable via
+///   `provided_bufs.data_ptr(bid, off)`, so only the id, offset and length
+///   are stored. This
 ///   is the zero-copy delivery, used while the ring is above the low-water
 ///   reserve.
 /// - [`Owned`](Self::Owned): an owned copy of the received bytes. When the ring
@@ -121,8 +122,10 @@ pub(crate) enum HeldRecvBuf {
     /// A provided-buffer bid pinned in the ring (zero-copy hold).
     Pinned {
         bid: u16,
-        /// Bytes received into this buffer. The segment reader slices the buffer
-        /// to this length; close-drain only needs the bid.
+        /// Offset of the received bytes in the buffer: 0 on a plain ring.
+        off: u32,
+        /// Bytes received into this buffer at `off`. The segment reader slices
+        /// the buffer to this length; close-drain only needs the bid.
         len: u32,
     },
     /// An owned copy of the received bytes; its bid was already replenished at
@@ -221,10 +224,10 @@ pub(crate) struct ForwardWriteState {
 }
 
 impl ForwardWriteState {
-    /// Base pointer of one backing.
+    /// Address of the first byte of one backing's data.
     fn base_ptr(backing: &HeldRecvBuf, provided_bufs: &ProvidedBufRing) -> *const u8 {
         match backing {
-            HeldRecvBuf::Pinned { bid, .. } => provided_bufs.get_buffer(*bid).0,
+            HeldRecvBuf::Pinned { bid, off, .. } => provided_bufs.data_ptr(*bid, *off),
             HeldRecvBuf::Owned(bytes) => bytes.as_ptr(),
         }
     }
@@ -300,6 +303,10 @@ pub(crate) struct Driver {
     /// `handle_send_recv_buf` uses it to compute the resubmit offset of a
     /// partial send.
     pub(crate) send_recv_buf_original_lens: Vec<u32>,
+    /// Per-connection offset, in its provided buffer, of the in-flight
+    /// SendRecvBuf's first byte. Set with `send_recv_buf_original_lens`; 0 on
+    /// a plain ring.
+    pub(crate) send_recv_buf_offs: Vec<u32>,
     /// Per-connection remaining bytes for in-flight SendRecvBuf operations.
     /// Tracks how many bytes still need to be sent (decremented on each partial send).
     /// Stored here rather than in the CQE payload so that buffer sizes > u16::MAX are
@@ -1069,6 +1076,7 @@ impl Driver {
             pending_replenish: Vec::with_capacity(config.recv_buffer.ring_size as usize),
             pending_recv_bufs: vec![None; config.max_connections as usize],
             send_recv_buf_original_lens: vec![0; config.max_connections as usize],
+            send_recv_buf_offs: vec![0; config.max_connections as usize],
             send_recv_buf_remaining: vec![0; config.max_connections as usize],
             recv_hold: (0..config.max_connections)
                 .map(|_| std::collections::VecDeque::new())
@@ -1392,8 +1400,8 @@ impl Driver {
         let mut ok = true;
         while let Some(held) = self.segment_hold[conn_index as usize].pop_front() {
             match held {
-                HeldRecvBuf::Pinned { bid, len } => {
-                    let (ptr, _) = self.provided_bufs.get_buffer(bid);
+                HeldRecvBuf::Pinned { bid, off, len } => {
+                    let ptr = self.provided_bufs.data_ptr(bid, off);
                     let data = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
                     if ok && !self.accumulators.append(conn_index, data) {
                         ok = false;
@@ -1523,14 +1531,14 @@ impl Driver {
             // stashed in the accumulator. That can only happen to the last
             // buffer of a batch, since it ends the forward.
             match held {
-                HeldRecvBuf::Pinned { bid, len } => {
+                HeldRecvBuf::Pinned { bid, off, len } => {
                     if (len as u64) <= remaining {
                         remaining -= len as u64;
-                        backings.push(HeldRecvBuf::Pinned { bid, len });
+                        backings.push(HeldRecvBuf::Pinned { bid, off, len });
                         lens.push(len);
                     } else {
                         let chunk = remaining as u32;
-                        let (ptr, _) = self.provided_bufs.get_buffer(bid);
+                        let ptr = self.provided_bufs.data_ptr(bid, off);
                         // SAFETY: `bid` is pinned (unreplenished) and `len`
                         // bytes were received into it, so `[chunk..len]` is
                         // initialised and is copied out before anything can
@@ -1555,7 +1563,11 @@ impl Driver {
                             )));
                         }
                         remaining = 0;
-                        backings.push(HeldRecvBuf::Pinned { bid, len: chunk });
+                        backings.push(HeldRecvBuf::Pinned {
+                            bid,
+                            off,
+                            len: chunk,
+                        });
                         lens.push(chunk);
                     }
                 }
@@ -2038,8 +2050,9 @@ impl Driver {
         let held: Vec<HeldRecvBuf> = self.segment_hold[idx].drain(..).collect();
         for entry in pinned.into_iter().chain(held) {
             match entry {
-                HeldRecvBuf::Pinned { bid, len } => {
-                    if let Some(b) = self.copy_out_bid(bid, len) {
+                HeldRecvBuf::Pinned { bid, off, len } => {
+                    let ptr = self.provided_bufs.data_ptr(bid, off);
+                    if let Some(b) = self.copy_out_bid(bid, ptr, len) {
                         out.push(b);
                     }
                 }
@@ -2054,7 +2067,7 @@ impl Driver {
 
         let forward: Vec<PendingRecvBuf> = self.recv_hold[idx].drain(..).collect();
         for pending in forward {
-            if let Some(b) = self.copy_out_bid(pending.bid, pending.len) {
+            if let Some(b) = self.copy_out_bid(pending.bid, pending.ptr, pending.len) {
                 out.push(b);
             }
         }
@@ -2069,14 +2082,13 @@ impl Driver {
     /// Copy first, replenish second, nothing in between — a bid handed back
     /// before its bytes are copied can be overwritten by another connection's
     /// recv.
-    fn copy_out_bid(&mut self, bid: u16, len: u32) -> Option<bytes::Bytes> {
+    fn copy_out_bid(&mut self, bid: u16, ptr: *const u8, len: u32) -> Option<bytes::Bytes> {
         let owned = if len == 0 {
             None
         } else {
-            let (ptr, _) = self.provided_bufs.get_buffer(bid);
             // SAFETY: `bid` is held (not yet replenished) and `len` bytes were
-            // received into its backing buffer. The slice is consumed by the
-            // copy before `self` is mutated below.
+            // received into it at `ptr`. The slice is consumed by the copy
+            // before `self` is mutated below.
             let slice = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
             Some(bytes::Bytes::copy_from_slice(slice))
         };
@@ -2789,6 +2801,10 @@ impl Driver {
         let ci = conn_index as usize;
         self.send_recv_buf_original_lens[ci] = built.total_len;
         self.send_recv_buf_remaining[ci] = built.total_len;
+        if let crate::backend::uring::sqe::Op::Send { buf, .. } = built.entry.op {
+            let base = self.provided_bufs.get_buffer(ud.payload() as u16).0;
+            self.send_recv_buf_offs[ci] = (buf as usize - base as usize) as u32;
+        }
     }
 
     /// Park `built` at the head of the connection's send queue, for

@@ -1,5 +1,5 @@
-# Build ringline's lib and echo test binaries from the #622 step 0 branch
-# (provided-ring conformance tests, stacked on the #630 SQPOLL fix), for
+# Build ringline's lib and echo test binaries from a branch with the #622
+# step 0 provided-ring conformance tests, for
 # experiments/recv-conformance-run.toml. ringline does not build for musl
 # (`libc::statx`), so these link glibc; the log prints the newest glibc
 # symbol version each needs (Debian 12 has 2.36, Ubuntu 24.04 2.39).
