@@ -102,6 +102,29 @@ pub(crate) struct PendingRecvBuf {
     pub(crate) ptr: *const u8,
 }
 
+/// Whether the worker registers its TCP receive ring as incremental: only
+/// with `recv_incremental` on, the `timestamps` option off, and the kernel
+/// passing the incremental-ring preflight. A failed preflight is counted by
+/// step and selects a plain ring.
+fn select_incremental(config: &Config, ring: &mut Ring) -> Result<bool, crate::error::Error> {
+    if !config.recv_incremental {
+        return Ok(false);
+    }
+    #[cfg(feature = "timestamps")]
+    if config.timestamps {
+        return Ok(false);
+    }
+    use crate::backend::uring::engine::preflight::{IncPreflight, inc_preflight};
+    Ok(match inc_preflight(&mut ring.engine)? {
+        IncPreflight::Passed => true,
+        IncPreflight::Unsupported => false,
+        IncPreflight::Failed(step) => {
+            metrics::RECV_PREFLIGHT_FAILED.increment(step);
+            false
+        }
+    })
+}
+
 /// A held received buffer for segmented delivery (Mode B/C), in one of two
 /// backings depending on ring pressure at delivery time.
 ///
@@ -942,11 +965,19 @@ impl Driver {
         let fixed_buffers =
             FixedBufferRegistry::new(&config.registered_regions, config.max_registered_regions);
 
-        let mut provided_bufs = ProvidedBufRing::new(
-            config.recv_buffer.bgid,
-            config.recv_buffer.ring_size,
-            config.recv_buffer.buffer_size,
-        )?;
+        // Before anything else is armed: the preflight reaps every
+        // completion the ring holds.
+        let incremental = select_incremental(config, &mut ring)?;
+        let (recv_ring_size, recv_buffer_size) = config.tcp_recv_geometry(incremental);
+        let mut provided_bufs =
+            ProvidedBufRing::new(config.recv_buffer.bgid, recv_ring_size, recv_buffer_size)?;
+        if incremental {
+            provided_bufs.set_incremental();
+        } else if config.recv_incremental {
+            // A completion would otherwise make a whole transparent huge
+            // page resident in a ring this large.
+            provided_bufs.advise_no_huge_pages();
+        }
         // On the worker thread, which `worker.rs` has already pinned — so the
         // pages fault in on this worker's NUMA node rather than the launching
         // thread's.
@@ -981,7 +1012,17 @@ impl Driver {
         ring.register_files_sparse(
             config.max_connections + udp_count + nvme_max + direct_io_max + fs_max,
         )?;
-        ring.register_buf_ring(&provided_bufs, RingKind::Plain)?;
+        let kind = if incremental {
+            RingKind::Incremental
+        } else {
+            RingKind::Plain
+        };
+        ring.register_buf_ring(&provided_bufs, kind)?;
+        metrics::RECV_RING.increment(if incremental {
+            metrics::recv_ring::INCREMENTAL
+        } else {
+            metrics::recv_ring::PLAIN
+        });
         if let Some(ref udp_bufs) = udp_provided_bufs {
             ring.register_buf_ring(udp_bufs, RingKind::Plain)?;
         }
@@ -1075,7 +1116,7 @@ impl Driver {
             send_copy_pool,
             send_slab,
             accumulators,
-            pending_replenish: Vec::with_capacity(config.recv_buffer.ring_size as usize),
+            pending_replenish: Vec::with_capacity(recv_ring_size as usize),
             pending_recv_bufs: vec![None; config.max_connections as usize],
             send_recv_buf_original_lens: vec![0; config.max_connections as usize],
             send_recv_buf_offs: vec![0; config.max_connections as usize],
@@ -1172,11 +1213,7 @@ impl Driver {
             // replaces (which moves one ring's worth per pass); a small
             // chunk would be slower than the pathology. Floor of 1 MiB,
             // scaled up for jumbo provided buffers.
-            fallback_chunk: config
-                .recv_buffer
-                .buffer_size
-                .saturating_mul(4)
-                .max(1 << 20),
+            fallback_chunk: recv_buffer_size.saturating_mul(4).max(1 << 20),
             recv_fallback_count: 0,
             udp_batch_recv_at: std::time::Instant::now(),
             tick_timeout_ts: if config.tick_timeout_us > 0 {

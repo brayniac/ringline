@@ -154,9 +154,10 @@ network configuration:
 2. Arm a multishot `RECV` on one end. Write, reap, write, reap: the two
    completions must land at offsets 0 and the first's length, both with
    `F_BUF_MORE`, and the ring entry must advance in place.
-3. Write more than the space left. The completion must deliver exactly the
-   space left with `F_BUF_MORE` clear, and the excess must end the arm with
-   `-ENOBUFS` without `F_MORE`.
+3. Write more than the space left, by fewer bytes than the buffer holds.
+   The completion must deliver exactly the space left with `F_BUF_MORE`
+   clear, and the excess must end the arm with `-ENOBUFS` without
+   `F_MORE`.
 4. Post the buffer again and re-arm. The excess must complete at offset 0
    with `F_BUF_MORE`; then a half-close must end the arm with `res` 0, no
    `F_BUFFER` and no `F_MORE`, leaving the entry at the used length.
@@ -682,7 +683,8 @@ receive queue, and TCP closes the window until the worker re-arms.
   1 s. `build()` rejects a large-group bgid equal to the TCP bgid
   (default 0), or the UDP bgid (default 1) when UDP is in use.
 - With INC on and the `timestamps` feature built in, timestamped
-  connections get their own plain ring. Their multishot `RECVMSG` works on
+  connections get their own plain ring from step 5. Until then a worker
+  with `timestamps(true)` uses a plain ring for every connection. Their multishot `RECVMSG` works on
   an INC ring (conformance tests), but before the 6.12.y change that lets a
   ring require a minimum length left in a buffer it can fail when the space
   left is smaller than the message header; that failure is not reproduced
@@ -764,13 +766,14 @@ buffers held by `with_bytes` views, values copied by the
 3. Offsets: the `off` fields, data at `base + written`, `copy_out_bid`
    and `settle_forward_end`. Still a plain ring, where these offsets are 0,
    so these paths are exercised only from step 4.
-4. INC and the plain geometry, behind `recv_incremental` (default `false`):
-   ring-kind selection with the behaviour preflight and its timing, a
-   plain ring for timestamped connections, `MADV_NOHUGEPAGE` and the
-   4096 × 64 KiB plain
-   geometry, the per-group lend cap and its copy paths,
-   `recv_segment_reserve` ignored under INC, the fallback arbitration, the
-   memlock preflight, and the per-group metrics.
+4. INC and the plain geometry, behind `recv_incremental` (default
+   `false`), in two changes. 4a: ring-kind selection with the behaviour
+   preflight (62–111 µs per worker on Linux 6.12, arm64), a plain ring
+   for a worker with `timestamps(true)`, `MADV_NOHUGEPAGE`, the geometry
+   per ring kind, the memlock preflight and the ring-kind metrics. 4b: the
+   per-group lend cap and its copy paths, `recv_segment_reserve` ignored
+   under INC, the fallback arbitration, and the per-group lend and
+   `ENOBUFS` metrics.
 5. The large group, behind `recv_large_group` (default `false`): its bgid
    and validation, the arm taking the group per call,
    `OpTag::RecvMultiLarge` and the `SendRecvBuf` group bit, `group` in

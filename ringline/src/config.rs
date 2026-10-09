@@ -178,6 +178,9 @@ pub struct Config {
     /// Fault recv and send buffer pages in at worker startup instead of on
     /// first use. See `ConfigBuilder::prefault_buffers`.
     pub(crate) prefault_buffers: bool,
+    /// Try an incremental TCP receive ring. See
+    /// `ConfigBuilder::recv_incremental`.
+    pub(crate) recv_incremental: bool,
     /// Bound on the per-worker accept channel. If a worker can't drain its
     /// queue fast enough, the acceptor will skip past it (and possibly
     /// close the incoming fd if every worker is full) rather than
@@ -442,6 +445,7 @@ impl Default for Config {
                 ring_size: 128,
                 buffer_size: 2048,
                 bgid: 1,
+                explicit: false,
             },
             registered_regions: Vec::new(),
             max_registered_regions: 64,
@@ -457,6 +461,7 @@ impl Default for Config {
             // the intent but is also a behaviour change for anything that
             // over-provisions today and never touches what it asked for.
             prefault_buffers: false,
+            recv_incremental: false,
             accept_queue_capacity: 1024,
             conn_chunk_size: 1,
             send_copy_count: 1024,
@@ -582,12 +587,15 @@ impl Config {
         // A cap below one recv buffer would overflow on the first full
         // buffer, and some pending-buffer flush paths assume a single
         // buffer's append into an empty accumulator cannot fail.
-        if self.recv_accumulator_max < self.recv_buffer.buffer_size as usize {
-            return Err(crate::error::Error::RingSetup(
-                "recv_accumulator_max must be >= recv_buffer_size \
+        let largest_buffer = self
+            .tcp_recv_geometry(true)
+            .1
+            .max(self.tcp_recv_geometry(false).1);
+        if self.recv_accumulator_max < largest_buffer as usize {
+            return Err(crate::error::Error::RingSetup(format!(
+                "recv_accumulator_max must be >= the TCP receive buffer size, {largest_buffer} \
                  (use usize::MAX to disable the cap)"
-                    .into(),
-            ));
+            )));
         }
         if self.max_connections == 0 || self.max_connections >= (1 << 24) {
             return Err(crate::error::Error::RingSetup(
@@ -749,6 +757,9 @@ pub(crate) struct RecvBufferConfig {
     pub buffer_size: u32,
     /// Buffer group ID for the provided buffer ring.
     pub bgid: u16,
+    /// Whether `ConfigBuilder::recv_buffer` set the geometry. With
+    /// `recv_incremental` on, a geometry not set follows the ring kind.
+    pub explicit: bool,
 }
 
 impl Default for RecvBufferConfig {
@@ -757,6 +768,27 @@ impl Default for RecvBufferConfig {
             ring_size: 256,
             buffer_size: 16384,
             bgid: 0,
+            explicit: false,
+        }
+    }
+}
+
+/// The TCP receive ring's geometry, `(ring_size, buffer_size)`, for an
+/// incremental or a plain ring, with `recv_incremental` on and no
+/// `recv_buffer` call.
+pub(crate) const RECV_INCREMENTAL_GEOMETRY: (u16, u32) = (64, 1 << 20);
+pub(crate) const RECV_PLAIN_GEOMETRY: (u16, u32) = (4096, 64 << 10);
+
+impl Config {
+    /// The TCP receive ring's `(ring_size, buffer_size)` for a ring
+    /// registered as incremental or not.
+    pub(crate) fn tcp_recv_geometry(&self, incremental: bool) -> (u16, u32) {
+        if !self.recv_incremental || self.recv_buffer.explicit {
+            (self.recv_buffer.ring_size, self.recv_buffer.buffer_size)
+        } else if incremental {
+            RECV_INCREMENTAL_GEOMETRY
+        } else {
+            RECV_PLAIN_GEOMETRY
         }
     }
 }
@@ -979,6 +1011,25 @@ impl ConfigBuilder {
     pub fn recv_buffer(mut self, ring_size: u16, buffer_size: u32) -> Self {
         self.config.recv_buffer.ring_size = ring_size;
         self.config.recv_buffer.buffer_size = buffer_size;
+        self.config.recv_buffer.explicit = true;
+        self
+    }
+
+    /// Try an incremental TCP receive ring (`IOU_PBUF_RING_INC`), where
+    /// successive receives share a buffer at increasing offsets.
+    ///
+    /// Each worker first checks, on a one-entry ring, that the running kernel
+    /// behaves as the receive path relies on; if the kernel lacks incremental
+    /// rings or the check fails, it uses a plain ring. Without a
+    /// [`recv_buffer`](Self::recv_buffer) call the geometry follows the ring
+    /// kind: 64 × 1 MiB incremental, or 4096 × 64 KiB plain. A worker built
+    /// with the `timestamps` feature and `timestamps(true)` uses a plain ring.
+    ///
+    /// io_uring backend only; the mio backend ignores it. **Default: false**,
+    /// which keeps the plain ring `recv_buffer` sets (256 × 16 KiB by
+    /// default).
+    pub fn recv_incremental(mut self, enabled: bool) -> Self {
+        self.config.recv_incremental = enabled;
         self
     }
 
@@ -1385,6 +1436,27 @@ mod tests {
         // Principle 7: growth that cannot terminate is bounded by default.
         let c = Config::default();
         assert_eq!(c.recv_accumulator_max, 1024 * 1024 * 1024);
+    }
+
+    /// With `recv_incremental` on and no `recv_buffer` call, the buffer may
+    /// be the incremental geometry's 1 MiB, so a smaller cap is rejected; an
+    /// explicit geometry keeps its own floor.
+    #[test]
+    fn validate_recv_accumulator_max_covers_the_incremental_geometry() {
+        let inc = |max: usize| {
+            config_with(|c| {
+                c.recv_incremental = true;
+                c.recv_accumulator_max = max;
+            })
+        };
+        assert!(inc((1 << 20) - 1).validate().is_err());
+        assert!(inc(1 << 20).validate().is_ok());
+        let explicit = config_with(|c| {
+            c.recv_incremental = true;
+            c.recv_buffer.explicit = true;
+            c.recv_accumulator_max = c.recv_buffer.buffer_size as usize;
+        });
+        assert!(explicit.validate().is_ok());
     }
 
     #[test]

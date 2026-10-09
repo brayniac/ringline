@@ -16,7 +16,6 @@ use crate::error::Error;
 
 #[cfg(all(test, uring_engine))]
 mod conformance;
-#[allow(dead_code)] // first caller lands with #622's ring-kind selection
 pub(crate) mod preflight;
 #[cfg(not(uring_engine))]
 pub(crate) mod stub;
@@ -131,7 +130,6 @@ pub(crate) trait Engine: Sized {
     /// (`IOU_PBUF_RING_INC`, Linux 6.12+). `Ok(false)` means the kernel
     /// lacks them; an error is a failure to find out (for example `ENOMEM`
     /// from `RLIMIT_MEMLOCK`), and the next call tries again.
-    #[allow(dead_code)] // first caller lands with #622's ring-kind selection
     fn incremental_buffers(&self) -> io::Result<bool>;
 
     /// Test-only: post a completion with `user_data` and `result` as if an

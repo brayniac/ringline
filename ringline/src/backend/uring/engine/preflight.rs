@@ -19,6 +19,7 @@ use crate::backend::ProvidedBufRing;
 use crate::backend::uring::abi::cqueue;
 use crate::backend::uring::sqe::{Fd, Op, Sqe};
 use crate::error::Error;
+use crate::metrics::recv_preflight as step;
 
 /// The group the preflight registers, which `Config` reserves.
 const BGID: u16 = u16::MAX;
@@ -38,8 +39,9 @@ pub(crate) enum IncPreflight {
     Passed,
     /// The kernel refuses incremental rings.
     Unsupported,
-    /// The step that did not behave as relied on.
-    Failed(&'static str),
+    /// The step that did not behave as relied on: a
+    /// `metrics::recv_preflight` slot.
+    Failed(usize),
 }
 
 /// Check the incremental-ring behaviour the receive driver relies on.
@@ -55,7 +57,7 @@ pub(crate) fn inc_preflight<E: Engine>(engine: &mut E) -> Result<IncPreflight, E
         return Ok(IncPreflight::Unsupported);
     }
     let Ok((mut client, server)) = UnixStream::pair() else {
-        return Ok(IncPreflight::Failed("socketpair"));
+        return Ok(IncPreflight::Failed(step::SOCKETPAIR));
     };
     let mut ring = ProvidedBufRing::new(BGID, 1, SIZE).map_err(Error::Io)?;
     ring.set_incremental();
@@ -72,9 +74,9 @@ pub(crate) fn inc_preflight<E: Engine>(engine: &mut E) -> Result<IncPreflight, E
     ) {
         Ok(found) => Ok(found),
         Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-            Ok(IncPreflight::Failed("no completion within 1 s"))
+            Ok(IncPreflight::Failed(step::TIMEOUT))
         }
-        Err(_) => Ok(IncPreflight::Failed("I/O error")),
+        Err(_) => Ok(IncPreflight::Failed(step::IO_ERROR)),
     };
     // A completion that ends the arm may already be reaped and unconsumed.
     armed &= reaped.0.iter().all(|&(_, flags)| cqueue::more(flags));
@@ -104,21 +106,21 @@ fn run<E: Engine>(
     *armed = true;
     client.write_all(b"abc")?;
     if !delivered(wait(e, reaped, armed)?, 3, true, true) {
-        return Ok(Failed("first completion"));
+        return Ok(Failed(step::APPEND));
     }
     ring.complete(0, 3, true);
     client.write_all(b"defg")?;
     if !delivered(wait(e, reaped, armed)?, 4, true, true) {
-        return Ok(Failed("second completion"));
+        return Ok(Failed(step::APPEND));
     }
     ring.complete(0, 4, true);
     // Safety: 7 bytes were received into buffer 0, which is not posted again
     // until it is released below.
     if unsafe { std::slice::from_raw_parts(ring.data_ptr(0, 0), 7) } != b"abcdefg" {
-        return Ok(Failed("data at the completions' offsets"));
+        return Ok(Failed(step::OFFSETS));
     }
     if ring.entry(0) != (base + 7, SIZE - 7, 0) {
-        return Ok(Failed("ring entry advance"));
+        return Ok(Failed(step::OFFSETS));
     }
 
     // More than the space left: the completion delivers exactly the space
@@ -126,12 +128,12 @@ fn run<E: Engine>(
     const EXCESS: u32 = 5;
     client.write_all(&[b'x'; (SIZE - 7 + EXCESS) as usize])?;
     if !delivered(wait(e, reaped, armed)?, (SIZE - 7) as i32, false, true) {
-        return Ok(Failed("exhausting completion"));
+        return Ok(Failed(step::EXHAUSTION));
     }
     ring.complete(0, SIZE - 7, false);
     let (res, flags) = wait(e, reaped, armed)?;
     if res != -libc::ENOBUFS || cqueue::more(flags) {
-        return Ok(Failed("ENOBUFS after exhaustion"));
+        return Ok(Failed(step::EXHAUSTION));
     }
 
     // Posted again and re-armed, the excess lands at offset 0, and a
@@ -140,16 +142,16 @@ fn run<E: Engine>(
     arm(e, server)?;
     *armed = true;
     if !delivered(wait(e, reaped, armed)?, EXCESS as i32, true, true) {
-        return Ok(Failed("completion after reposting"));
+        return Ok(Failed(step::REPOST));
     }
     ring.complete(0, EXCESS, true);
     client.shutdown(Shutdown::Write)?;
     let (res, flags) = wait(e, reaped, armed)?;
     if res != 0 || cqueue::buffer_select(flags).is_some() || cqueue::more(flags) {
-        return Ok(Failed("EOF completion"));
+        return Ok(Failed(step::EOF));
     }
     if ring.entry(0) != (base + EXCESS as u64, SIZE - EXCESS, 0) {
-        return Ok(Failed("ring entry at EOF"));
+        return Ok(Failed(step::EOF));
     }
     ring.release_batch(&[0]);
     Ok(IncPreflight::Passed)

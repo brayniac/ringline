@@ -110,6 +110,23 @@ impl ProvidedBufRing {
         Ok(ring)
     }
 
+    /// Ask the kernel not to back the buffers with transparent huge pages
+    /// (`MADV_NOHUGEPAGE`), so a completion makes resident only the pages it
+    /// writes. Advisory: an error leaves the default in place.
+    pub(crate) fn advise_no_huge_pages(&mut self) {
+        // Safety: sysconf has no preconditions.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let start = self.buf_backing.as_ptr() as usize;
+        let end = start + self.buf_backing.len();
+        let aligned = start.next_multiple_of(page);
+        let len = end.saturating_sub(aligned) / page * page;
+        if len > 0 {
+            // Safety: `[aligned, aligned + len)` lies inside `buf_backing`,
+            // which this ring owns; the advice changes no contents.
+            unsafe { libc::madvise(aligned as *mut libc::c_void, len, libc::MADV_NOHUGEPAGE) };
+        }
+    }
+
     /// Fault every provided buffer in before the ring is armed.
     ///
     /// The recv path's first touch of a buffer is the *kernel* copying an skb
