@@ -1034,10 +1034,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
         // Commit returned bids up front so re-armed multishots find them.
         let replenished = if !self.driver.pending_replenish.is_empty() {
-            self.driver
-                .provided_bufs
-                .release_batch(&self.driver.pending_replenish);
-            self.driver.pending_replenish.clear();
+            self.driver.release_pending();
             true
         } else {
             false
@@ -1403,6 +1400,23 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             OpTag::ForwardWriteDrain => self.handle_forward_write(ud, result),
             #[cfg(feature = "timestamps")]
             OpTag::RecvMsgMultiTs => self.handle_recv_msg_multi_ts(ud, result, flags),
+        }
+    }
+
+    /// The bid and address a `recv_hold` entry holds for a completion of
+    /// `bid` at `ptr`: the provided buffer itself when the lend cap allows a
+    /// lend, otherwise an owned copy of `data`, with the completion's hold
+    /// queued for release. If no owned bid is free, the buffer is lent.
+    fn lend_or_own(&mut self, bid: u16, ptr: *const u8, data: &[u8]) -> (u16, *const u8) {
+        if self.driver.may_lend() {
+            return (bid, ptr);
+        }
+        match self.driver.own_recv_copy(data) {
+            Some(owned) => {
+                self.driver.pending_replenish.push(bid);
+                owned
+            }
+            None => (bid, ptr),
         }
     }
 
@@ -1813,10 +1827,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // `forward_held`. No accumulator copy. Backpressure is natural —
             // unreplenished bids deplete the ring (ENOBUFS) until a forward
             // completes. The hold is drained on close (see close_connection).
+            // Over the lend cap the bytes are copied into an owned entry.
+            let (hold_bid, hold_ptr) = self.lend_or_own(bid, buf_ptr, data);
             self.driver.recv_hold[conn_index as usize].push_back(crate::backend::PendingRecvBuf {
-                bid,
+                bid: hold_bid,
                 len: bytes_received,
-                ptr: buf_ptr,
+                ptr: hold_ptr,
             });
             self.executor.wake_recv(conn_index);
         } else {
@@ -1835,13 +1851,15 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 // The flush pass at the end of this drain gathers everything
                 // that arrived in the batch into one operation, so a message
                 // spanning several recv completions echoes as one message
-                // instead of one segment per completion (#397).
+                // instead of one segment per completion (#397). Over the
+                // lend cap the bytes are copied into an owned entry.
+                let (hold_bid, hold_ptr) = self.lend_or_own(bid, buf_ptr, data);
                 self.driver.hold_direct_echo(
                     conn_index,
                     crate::backend::PendingRecvBuf {
-                        bid,
+                        bid: hold_bid,
                         len: bytes_received,
-                        ptr: buf_ptr,
+                        ptr: hold_ptr,
                     },
                 );
                 // Do NOT call wake_recv here. DirectEchoFuture is woken only
@@ -3938,7 +3956,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 let original_len = self.driver.send_recv_buf_original_lens[conn_index as usize];
                 let offset = self.driver.send_recv_buf_offs[conn_index as usize] + original_len
                     - new_remaining;
-                let new_ptr = self.driver.provided_bufs.data_ptr(bid, offset);
+                let new_ptr = self.driver.recv_data_ptr(bid, offset);
                 let new_payload = bid as u32 | crate::completion::SEND_RECV_BUF_REMAINDER;
                 let new_ud = UserData::encode(
                     crate::completion::OpTag::SendRecvBuf,
@@ -10445,6 +10463,95 @@ mod tests {
             crate::backend::HeldRecvBuf::Pinned { .. }
         ));
         assert!(matches!(&hold[1], crate::backend::HeldRecvBuf::Owned(b) if &b[..] == b"two"));
+    }
+
+    /// Deliver `msg` into buffer `bid` for `conn` as a multishot completion.
+    fn deliver(el: &mut AsyncEventLoop<NoopHandler>, conn: u32, bid: u16, msg: &[u8]) {
+        let (ptr, _) = el.driver.provided_bufs.get_buffer(bid);
+        unsafe { std::ptr::copy_nonoverlapping(msg.as_ptr(), ptr as *mut u8, msg.len()) };
+        let ud = UserData::encode(
+            OpTag::RecvMulti,
+            conn,
+            el.driver.connections.generation(conn),
+        );
+        el.test_dispatch_cqe(ud.raw(), msg.len() as i32, 1 | 2 | ((bid as u32) << 16));
+    }
+
+    /// An owned copy's bid lies above the ring, its bytes are the copy's,
+    /// and releasing it frees the copy for reuse.
+    #[test]
+    fn an_owned_receive_copy_is_freed_by_its_release() {
+        let mut el = make_test_loop();
+        let ring = el.driver.provided_bufs.ring_entries();
+        let (bid, ptr) = el.driver.own_recv_copy(b"copy").expect("owned bid");
+        assert_eq!(u32::from(bid), ring);
+        assert!(el.driver.is_owned_recv(bid));
+        assert_eq!(unsafe { std::slice::from_raw_parts(ptr, 4) }, b"copy");
+        assert_eq!(el.driver.recv_data_ptr(bid, 1), unsafe { ptr.add(1) });
+        el.driver.pending_replenish.push(bid);
+        el.driver.release_pending();
+        assert!(el.driver.owned_recv[0].is_none());
+        let (again, _) = el.driver.own_recv_copy(b"next").expect("owned bid");
+        assert_eq!(again, bid, "a freed index is reused");
+    }
+
+    #[test]
+    #[should_panic(expected = "released twice")]
+    fn an_owned_receive_copy_released_twice_panics() {
+        let mut el = make_test_loop();
+        let (bid, _) = el.driver.own_recv_copy(b"copy").expect("owned bid");
+        el.driver.pending_replenish.extend([bid, bid]);
+        el.driver.release_pending();
+    }
+
+    /// Over the lend cap, a recv-forward completion is held as an owned
+    /// copy, and its ring buffer is queued for release at once.
+    #[test]
+    fn over_the_lend_cap_recv_forward_holds_an_owned_copy() {
+        let mut el = make_test_loop();
+        let conn = accept_connection(&mut el);
+        el.driver.recv_forward[conn as usize] = true;
+        el.driver.lend_cap = Some(0);
+        deliver(&mut el, conn, 3, b"forward");
+        let entry = el.driver.recv_hold[conn as usize][0];
+        assert!(el.driver.is_owned_recv(entry.bid));
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(entry.ptr, entry.len as usize) },
+            b"forward"
+        );
+        assert_eq!(el.driver.pending_replenish, [3]);
+        el.driver.release_pending();
+        assert_eq!(el.driver.provided_bufs.held(), 0);
+    }
+
+    /// Over the lend cap, a direct-echo completion is held as an owned copy;
+    /// a partial send of it resumes inside the copy.
+    #[test]
+    fn over_the_lend_cap_direct_echo_holds_an_owned_copy() {
+        let mut el = make_test_loop();
+        let conn = accept_connection(&mut el);
+        el.driver.connections.get_mut(conn).unwrap().direct_echo = true;
+        el.driver.lend_cap = Some(0);
+        deliver(&mut el, conn, 2, b"echo-me");
+        let entry = el.driver.recv_hold[conn as usize][0];
+        assert!(el.driver.is_owned_recv(entry.bid));
+        assert_eq!(el.driver.pending_replenish, [2]);
+
+        let ci = conn as usize;
+        el.driver.send_recv_buf_offs[ci] = 0;
+        el.driver.send_recv_buf_original_lens[ci] = 7;
+        el.driver.send_recv_buf_remaining[ci] = 7;
+        el.driver.send_queues[ci].in_flight = true;
+        el.driver.ring.force_push_failures(1);
+        let ud = UserData::encode(OpTag::SendRecvBuf, conn, entry.bid as u32);
+        el.test_dispatch_cqe(ud.raw(), 3, 0);
+        let crate::backend::uring::sqe::Op::Send { buf, len, .. } =
+            el.driver.send_queues[ci].queue[0].entry.op
+        else {
+            panic!("the parked remainder is a plain send");
+        };
+        assert_eq!(buf, unsafe { entry.ptr.add(3) });
+        assert_eq!(len, 4);
     }
 
     /// Without a lend cap, a partial message still takes the fallback even

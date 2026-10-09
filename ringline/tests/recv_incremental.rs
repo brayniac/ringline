@@ -35,6 +35,45 @@ impl AsyncEventHandler for AsyncEcho {
     }
 }
 
+/// Echo through the recv-forward path: held receive buffers are sent back
+/// with one gathered write.
+struct RecvForwardEcho;
+
+impl AsyncEventHandler for RecvForwardEcho {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
+        async move {
+            conn.enable_recv_forward();
+            loop {
+                conn.recv_ready().await;
+                let n = match conn.forward_held() {
+                    Ok(f) => f.await.unwrap_or(0),
+                    Err(_) => break,
+                };
+                if n == 0 {
+                    break;
+                }
+            }
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        RecvForwardEcho
+    }
+}
+
+/// Echo through the direct-echo path, sent from the completion handler.
+struct DirectEcho;
+
+impl AsyncEventHandler for DirectEcho {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
+        async move {
+            let _ = conn.run_direct_echo().await;
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        DirectEcho
+    }
+}
+
 fn wait_for_server(addr: &str) {
     for _ in 0..200 {
         if TcpStream::connect(addr).is_ok() {
@@ -140,4 +179,48 @@ fn kernel_at_least(major: u32, minor: u32) -> bool {
             .unwrap_or(0)
     };
     (next(), next()) >= (major, minor)
+}
+
+/// Echo `total` bytes through a 16 × 1 KiB incremental ring, whose lend cap
+/// is 8 buffers, with handler `H`, and check the bytes and that the cap
+/// refused lends (so owned copies carried part of the stream).
+fn echo_over_the_lend_cap<H: AsyncEventHandler>(total: usize) {
+    use ringline::metrics::{RECV_RING, recv_ring};
+    let refused = || RECV_RING.value(recv_ring::LEND_REFUSED).unwrap_or(0);
+    let before = refused();
+    let config = ConfigBuilder::new()
+        .workers(1)
+        .pin_to_core(false)
+        .sq_entries(256)
+        .max_connections(64)
+        .send_pool(128, 16384)
+        .recv_incremental(true)
+        .recv_buffer(16, 1024)
+        .build()
+        .expect("config");
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind("127.0.0.1:0".parse().unwrap())
+        .launch::<H>()
+        .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
+    wait_for_server(&addr);
+    let msg: Vec<u8> = (0..total).map(|k| (k % 251) as u8).collect();
+    assert_eq!(echo_round_trip(&addr, &msg), msg);
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+    if kernel_at_least(6, 12) {
+        assert!(refused() > before, "the lend cap refused no lend");
+    }
+}
+
+#[test]
+fn recv_forward_echoes_over_the_lend_cap() {
+    echo_over_the_lend_cap::<RecvForwardEcho>(320 << 10);
+}
+
+#[test]
+fn direct_echo_echoes_over_the_lend_cap() {
+    echo_over_the_lend_cap::<DirectEcho>(320 << 10);
 }

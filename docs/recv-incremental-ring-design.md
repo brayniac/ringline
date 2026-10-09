@@ -612,8 +612,12 @@ promoted, so its later lends pin large-group buffers.
   - `pending_recv_bufs`: into the accumulator;
   - segments and Mode A: into `HeldRecvBuf::Owned`, as the `ForceCopy`
     decision does;
-  - recv-forward and direct echo, which deliver only from `recv_hold`: into a
-    new owned variant of the `recv_hold` entry (a `SendCopyPool` slot).
+  - recv-forward and direct echo, which deliver only from `recv_hold`: into an
+    owned heap copy (`Driver::owned_recv`), not a `SendCopyPool` slot, since
+    an incremental completion can exceed a 16 KiB slot. The entry's bid is
+    `ring_entries()` plus the copy's index, above every ring bid, so every
+    existing release path pushes it unchanged and the flush frees the copy
+    instead of releasing a ring buffer.
 - Per connection, `forward_hold_cap` still counts held ranges; one forwarder
   can pin up to that many shared buffers, which the per-group cap bounds.
 - With `recv_incremental` on, `recv_segment_reserve` is ignored and the
@@ -787,15 +791,15 @@ buffers held by `with_bytes` views, values copied by the
    `recv_segment_reserve` ignored, the 1 MiB fallback chunk with the
    free-space re-arm, and the lends-refused count; all only with
    `recv_incremental`. 4b-2: the owned `recv_hold` entry for recv-forward
-   and direct echo, the per-group gauges, and the per-group `ENOBUFS`
-   count.
+   and direct echo.
 5. The large group, behind `recv_large_group` (default `false`): its bgid
    and validation, the arm taking the group per call,
    `OpTag::RecvMultiLarge` and the `SendRecvBuf` group bit, `group` in
    `PendingRecvBuf` and the send slab, the cancel sites, promotion,
    migration and demotion with `recv_large_demote_quiet`, the two-group
-   memlock preflight, and the timestamps ring with
-   `recv_timestamp_buffer_bgid`. Migration is timed in ringline's
+   memlock preflight, the timestamps ring with
+   `recv_timestamp_buffer_bgid`, and the per-group gauges and `ENOBUFS`
+   count. Migration is timed in ringline's
    metrics.
 6. Measure ringline on hv01 and across hv01/hv02, on Linux 6.1, 6.8, 6.12
    and 7.1: the geometry per ring kind with and without the large group
