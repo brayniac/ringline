@@ -179,6 +179,9 @@ pub struct Config {
     ///
     /// **Default: 64** (2× `MAX_IOVECS`, the per-`sendmsg` iovec bound).
     pub(crate) forward_hold_cap: usize,
+    /// Experimental (measurement 8 of `docs/io-api-redesign.md`): every TCP
+    /// connection arms one-shot receives instead of multishot. io_uring only.
+    pub(crate) recv_on_demand: bool,
     /// Fault recv and send buffer pages in at worker startup instead of on
     /// first use. See `ConfigBuilder::prefault_buffers`.
     pub(crate) prefault_buffers: bool,
@@ -460,6 +463,7 @@ impl Default for Config {
             recv_accumulator_max: 1024 * 1024 * 1024,
             recv_segment_reserve: 64,
             forward_hold_cap: 64,
+            recv_on_demand: false,
             // Off by default while the trade is being measured: prefaulting
             // converts a latent memory cost into an immediate one, which is
             // the intent but is also a behaviour change for anything that
@@ -1144,6 +1148,15 @@ impl ConfigBuilder {
     /// (64 MiB at the default 64 × 1 MiB). Must be `>= 1`.
     ///
     /// Default: 64 (2× `MAX_IOVECS`).
+    /// Experimental: arm one-shot receives on every TCP connection instead
+    /// of multishot ones (measurement 8 of `docs/io-api-redesign.md`).
+    /// io_uring only; ignored on mio.
+    #[doc(hidden)]
+    pub fn recv_on_demand(mut self, on: bool) -> Self {
+        self.config.recv_on_demand = on;
+        self
+    }
+
     pub fn forward_hold_cap(mut self, cap: usize) -> Self {
         self.config.forward_hold_cap = cap;
         self

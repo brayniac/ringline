@@ -1,0 +1,48 @@
+# Build resp-server (ringline, tokio-pc, tokio-uring arms; one RESP parser
+# and store) and cachecannon, and upload them as one artifact for the
+# protocol-server comparison (measurements 8 and 9 of
+# docs/io-api-redesign.md). No target-cpu=native.
+name = "ringline resp-arms build (ringline={ref}, cachecannon={cc_ref})"
+
+[params]
+repo    = "https://github.com/brayniac/ringline"
+ref     = "exp/protocol-bench"
+cc_repo = "https://github.com/brayniac/cachecannon"
+cc_ref  = "main"
+
+[[jobs]]
+name = "build"
+tags = ["validation"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+shape = "z4.c"
+image = "spool/images/debian-13-ci-20260912.1@golden"
+slots = 1
+memory_gib = 4
+ports = 0
+gpu = false
+payload_timeout = 3600
+artifacts = ["/home/anvil/bins.tgz", "/home/anvil/build.log"]
+upload = true
+payload = '''
+set -uo pipefail
+cd /home/anvil
+{
+  cat /etc/anvil-instance.json
+  mkdir -p out
+  git clone -q {repo} src && git -C src checkout -q {ref}
+  git clone -q {cc_repo} cc && git -C cc checkout -q {cc_ref}
+  echo "ringline: $(git -C src log --oneline -1)"
+  echo "cachecannon: $(git -C cc log --oneline -1)"
+  ( cd src && cargo build --release --locked -p ringline-bench --features tokio-uring-arm --bin resp-server ) || exit 1
+  cp src/target/release/resp-server out/
+  ( cd cc && cargo build --release --locked ) || exit 1
+  cp cc/target/release/cachecannon out/
+  ( cd out && sha256sum * )
+  tar czf bins.tgz out
+} 2>&1 | tee /home/anvil/build.log
+rc=${PIPESTATUS[0]}
+echo "build_status=$rc" | tee -a /home/anvil/build.log
+exit 0
+'''

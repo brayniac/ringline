@@ -129,7 +129,8 @@ impl Driver {
     /// lands; a one-shot recv takes one per arm, and the throttle skips the
     /// re-arm at the hold cap (#638).
     pub(crate) fn recv_single(&self, conn_index: u32) -> bool {
-        self.recv_forward[conn_index as usize]
+        self.recv_on_demand
+            || self.recv_forward[conn_index as usize]
             || self
                 .connections
                 .get(conn_index)
@@ -683,6 +684,8 @@ pub(crate) struct Driver {
     /// Per-connection cap on held receive entries (`Config::forward_hold_cap`);
     /// `throttle_if_held` applies it, lowered to a quarter of the ring.
     pub(crate) forward_hold_cap: usize,
+    /// `Config::recv_on_demand`: every TCP connection arms one-shot receives.
+    pub(crate) recv_on_demand: bool,
     pub(crate) accept_rx: Option<crossbeam_channel::Receiver<crate::acceptor::AcceptedConn>>,
     /// Merged accept mode: every merged listener's sockets, `(listener index,
     /// sockets)`. This worker accepts on socket `worker_index` of each, and
@@ -1347,6 +1350,7 @@ impl Driver {
             forward_hold_throttled: vec![false; config.max_connections as usize],
             throttled_recvs: Vec::new(),
             forward_hold_cap: config.forward_hold_cap,
+            recv_on_demand: config.recv_on_demand,
             accept_rx,
             merged_listeners: config.merged_listeners.clone(),
             merged_accept_live: config.merged_accept_live.clone(),
