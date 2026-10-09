@@ -12,6 +12,7 @@ use crate::backend::uring::abi::cqueue;
 use crate::accumulator::AccumulatorTable;
 use crate::backend::ProvidedBufRing;
 use crate::backend::Ring;
+use crate::backend::uring::engine::RingKind;
 use crate::buffer::fixed::FixedBufferRegistry;
 use crate::buffer::send_copy::SendCopyPool;
 use crate::buffer::send_slab::InFlightSendSlab;
@@ -927,7 +928,7 @@ impl Driver {
         region_rx: crate::region_registry::RegionControlRx,
     ) -> Result<Self, crate::error::Error> {
         config.validate()?;
-        let ring = Ring::setup(config)?;
+        let mut ring = Ring::setup(config)?;
 
         let fixed_buffers =
             FixedBufferRegistry::new(&config.registered_regions, config.max_registered_regions);
@@ -971,9 +972,9 @@ impl Driver {
         ring.register_files_sparse(
             config.max_connections + udp_count + nvme_max + direct_io_max + fs_max,
         )?;
-        ring.register_buf_ring(&provided_bufs)?;
+        ring.register_buf_ring(&provided_bufs, RingKind::Plain)?;
         if let Some(ref udp_bufs) = udp_provided_bufs {
-            ring.register_buf_ring(udp_bufs)?;
+            ring.register_buf_ring(udp_bufs, RingKind::Plain)?;
         }
 
         let connections = ConnectionTable::new(config.max_connections);
@@ -3548,8 +3549,9 @@ impl Driver {
         }
 
         // 4. Unregister the provided buffer rings before Driver is dropped
-        // (which munmaps the ring memory). Without this, the kernel holds a
-        // dangling pointer to the freed mmap region.
+        // (which munmaps the ring memory). Unregistering releases the
+        // kernel's pin on the ring pages; the error and panic exits skip it,
+        // which is safe for the reason given at `UringEngine::register_buf_ring`.
         if self
             .ring
             .unregister_buf_ring(self.provided_bufs.bgid())

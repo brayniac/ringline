@@ -5,7 +5,7 @@
 use std::io;
 use std::os::fd::RawFd;
 
-use super::Engine;
+use super::{Engine, RingKind};
 use crate::backend::ProvidedBufRing;
 use crate::backend::uring::ring::CloseLead;
 use crate::backend::uring::sqe::Sqe;
@@ -59,7 +59,11 @@ impl Engine for StubEngine {
         unreachable!("the stub engine fails at setup")
     }
 
-    fn register_buf_ring(&self, _provided: &ProvidedBufRing) -> Result<(), Error> {
+    fn register_buf_ring(
+        &mut self,
+        _provided: &ProvidedBufRing,
+        _kind: RingKind,
+    ) -> Result<(), Error> {
         unreachable!("the stub engine fails at setup")
     }
 
@@ -80,6 +84,10 @@ impl Engine for StubEngine {
     }
 
     fn supports_park(&self) -> bool {
+        unreachable!("the stub engine fails at setup")
+    }
+
+    fn incremental_buffers(&self) -> bool {
         unreachable!("the stub engine fails at setup")
     }
 

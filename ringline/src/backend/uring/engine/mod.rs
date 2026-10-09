@@ -26,6 +26,17 @@ pub(crate) type ActiveEngine = stub::StubEngine;
 #[cfg(uring_engine)]
 pub(crate) type ActiveEngine = uring::UringEngine;
 
+/// How the kernel consumes a provided-buffer ring's buffers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RingKind {
+    /// Each completion takes a whole buffer.
+    Plain,
+    /// `IOU_PBUF_RING_INC`: completions consume a buffer at increasing
+    /// offsets, and the buffer returns when it is used up.
+    #[allow(dead_code)] // first use lands with #622's ring-kind selection
+    Incremental,
+}
+
 /// What the driver needs from an engine.
 ///
 /// A completion is `(user_data, result, flags)`, with the meaning
@@ -80,8 +91,13 @@ pub(crate) trait Engine: Sized {
     /// empties a slot. The engine keeps its own reference to each file.
     fn register_files_update(&self, offset: u32, fds: &[RawFd]) -> io::Result<()>;
 
-    /// Register a provided-buffer ring under its group id.
-    fn register_buf_ring(&self, provided: &ProvidedBufRing) -> Result<(), Error>;
+    /// Register a provided-buffer ring under its group id, as a ring of
+    /// `kind`.
+    fn register_buf_ring(
+        &mut self,
+        provided: &ProvidedBufRing,
+        kind: RingKind,
+    ) -> Result<(), Error>;
 
     /// Unregister the provided-buffer ring with group id `bgid`. Must be
     /// called before the ring's memory is unmapped.
@@ -105,6 +121,13 @@ pub(crate) trait Engine: Sized {
     /// Whether a registered file can be returned to the process's file
     /// table (`FIXED_FD_INSTALL`), and so whether park (#443) is available.
     fn supports_park(&self) -> bool;
+
+    /// Whether this engine registers [`RingKind::Incremental`] rings
+    /// (`IOU_PBUF_RING_INC`, Linux 6.12+). The receive design
+    /// (`docs/recv-incremental-ring-design.md`) selects the ring kind from
+    /// this and the configuration.
+    #[allow(dead_code)] // first caller lands with #622's ring-kind selection
+    fn incremental_buffers(&self) -> bool;
 
     /// Test-only: post a completion with `user_data` and `result` as if an
     /// operation had completed. With `linked`, the next operation pushed is

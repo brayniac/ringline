@@ -65,6 +65,8 @@ Within the io_uring backend, `has_io_uring` selects the driver and `uring_engine
 
 The kernel check is a **build-host, compile-time** gate and is necessary but not sufficient. At **run time** the kernel must also permit io_uring: `kernel.io_uring_disabled` (6.6+) must be 0, or 1 with the process in `kernel.io_uring_group` (or holding `CAP_SYS_ADMIN`), and no seccomp profile may deny `io_uring_setup`. Otherwise every launch fails with `Error::RingSetup`, whose message names the cause. RHEL 10 / Rocky 10 ship `io_uring_disabled = 2` (refused for everyone, root included), so on that family only a `force-mio` build runs — verified on Rocky 10.2, kernel 6.12.0-211.el10 (#355).
 
+Ubuntu's 6.8 kernels from 6.8.0-139 on (24.04, and 22.04 HWE) invert the reserved-word check in `IORING_REGISTER_PBUF_RING`, and reportedly in `IORING_UNREGISTER_PBUF_RING`: the standard call, with `resv` zeroed, fails with `EINVAL`. `Ring::register_buf_ring` retries once with `resv[0] = 1`, only after an `EINVAL` on a 6.8 kernel, and uses that form for the worker's later registrations; unregistration tries it first and falls back to the standard form (#626). Code that registers a provided buffer ring through the `io-uring` crate directly fails on those kernels.
+
 - **io_uring** (`ringline/src/backend/uring/`) — the production path. Linux 6.1+ (DEFER_TASKRUN and SendMsgZc are 6.1; multishot recv with provided buffers is 6.0).
 - **mio** (`ringline/src/backend/mio/`) — cross-platform fallback (macOS, containers without io_uring). Zero-copy sends degrade to copies (guards are consumed by copying), NVMe is unsupported, and fs/direct I/O run on a dedicated disk-I/O thread pool (`disk_io_pool.rs`) instead of the ring.
 
