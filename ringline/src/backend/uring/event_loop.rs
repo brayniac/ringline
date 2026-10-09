@@ -3756,7 +3756,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             return;
         }
         self.driver.forward_hold_throttled[ci] = true;
-        self.driver.throttled_recvs.push(conn_index);
+        // A close or a forward's end clears the flag without leaving the
+        // list, so the connection may still be in it.
+        if !self.driver.throttled_recvs.contains(&conn_index) {
+            self.driver.throttled_recvs.push(conn_index);
+        }
         // Only cancel a still-armed multishot. If this CQE terminated the
         // multishot (`!has_more` cleared `recv_multishot_armed` at the top of
         // the handler), there is nothing to cancel — the re-arm gate in the

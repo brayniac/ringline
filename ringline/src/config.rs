@@ -170,8 +170,8 @@ pub struct Config {
     /// receive window closes and only its peer stops sending; the recv is re-armed
     /// once the hold drains below the cap. A recv-forward or direct-echo send
     /// waiting on a peer that does not read still holds the ring buffers it
-    /// carries, uncounted, so several such connections together can empty the
-    /// ring (#638).
+    /// carries, uncounted: without `recv_incremental` one such connection can
+    /// empty the ring, and with it several can (#638).
     ///
     /// Larger values allow more recv in flight (higher single-forward throughput)
     /// at the cost of more pinned ring buffers / held heap under a slow sink;
@@ -1136,10 +1136,12 @@ impl ConfigBuilder {
     /// `recv_incremental` a segment hold, is held to at most a quarter of the
     /// recv ring's buffers, since each such entry can pin one.
     /// A recv-forward or direct-echo send waiting on a peer that does not read
-    /// holds the buffers it carries uncounted, so several such connections
-    /// together can still empty the ring (#638). Larger values allow more recv
-    /// in flight at the cost of more held buffers or copies under a slow
-    /// consumer. Must be `>= 1`.
+    /// holds the buffers it carries uncounted: without `recv_incremental` one
+    /// such connection can empty the ring, and with it several can (#638).
+    /// Larger values allow more recv in flight at the cost of more held
+    /// buffers or copies under a slow consumer: with `recv_incremental` a
+    /// segment hold can reach this many copies of up to one buffer each
+    /// (64 MiB at the default 64 × 1 MiB). Must be `>= 1`.
     ///
     /// Default: 64 (2× `MAX_IOVECS`).
     pub fn forward_hold_cap(mut self, cap: usize) -> Self {

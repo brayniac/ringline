@@ -363,7 +363,7 @@ pub mod pool {
     /// its peer — re-armed once the hold drains below the cap. Sustained counts
     /// mean a consumer is slower than its peer for large
     /// objects; unlike `RECV_PARKED` (ENOBUFS starvation) this is *deliberate*
-    /// per-connection backpressure that prevents one slow forward from depleting
+    /// per-connection backpressure that prevents one slow consumer from depleting
     /// the shared recv ring.
     pub const FORWARD_THROTTLED: usize = 6;
     /// A segmented reader was about to park while the `RecvAccumulator` still

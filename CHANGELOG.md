@@ -355,8 +355,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
-- On io_uring, one connection whose consumer stops draining what it holds
-  no longer grows memory without limit or stalls its worker. A segment
+- On io_uring, one segment reader or `forward_to` source whose consumer
+  stops draining what it holds, or with `recv_incremental` one recv-forward
+  or direct-echo connection, no longer grows memory without limit or stalls
+  its worker. A segment
   reader (`segments()`, `with_segments`, `recv_owned_segment`) that stopped
   reading made the worker copy everything its peer sent (a test client
   wrote 64 MiB unread); with `recv_incremental`, a direct-echo peer that
