@@ -74,11 +74,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- `ConfigBuilder::build` rejects a TCP or UDP receive buffer group id of
-  65535 (`recv_buffer_bgid`, `udp_recv_buffer_bgid`), on both backends. The
-  io_uring backend uses that group id to check whether the kernel supports
-  incremental buffer rings (`IOU_PBUF_RING_INC`).
-
 - On mio, `forward_held` forwards at most 32 receive buffers' worth of
   bytes per call (`ConfigBuilder::recv_buffer`'s `buffer_size` each), the
   most one io_uring call forwards. It used to forward the whole
@@ -127,6 +122,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **Breaking:** `ConfigBuilder::sq_entries` must be at least 2: a
   connection's close pushes a linked shutdown and `Close` together (#581).
   `sq_entries(1)` now fails `build()`.
+
+- **Breaking:** `ConfigBuilder::build` rejects a TCP or UDP receive buffer
+  group id of 65535 (`recv_buffer_bgid`, `udp_recv_buffer_bgid`), on both
+  backends. The io_uring backend uses that group id to check whether the
+  kernel supports incremental buffer rings (`IOU_PBUF_RING_INC`). A
+  `recv_buffer_bgid(65535)` or `udp_recv_buffer_bgid(65535)` config now
+  fails `build()` (#625).
 
 - **Breaking:** `JoinHandle` (from `spawn_with_handle`) and
   `BlockingJoinHandle` (from `spawn_blocking`) resolve to

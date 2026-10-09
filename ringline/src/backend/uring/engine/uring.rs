@@ -184,8 +184,8 @@ impl UringEngine {
     /// `Config::validate` reserves) and unregister it. `EINVAL` means the
     /// kernel lacks it; any other error is returned. It registers through
     /// the `io-uring` crate without the `resv[0]` retry: the kernels that
-    /// need that retry are 6.8, which predates `IOU_PBUF_RING_INC`, so
-    /// `EINVAL` there is still the right answer.
+    /// need that retry are Ubuntu 6.8 kernels, and 6.8 predates
+    /// `IOU_PBUF_RING_INC`, so `EINVAL` there is still the right answer.
     fn probe_incremental(&self) -> io::Result<bool> {
         const PROBE_BGID: u16 = u16::MAX;
         // Safety: sysconf has no preconditions.
