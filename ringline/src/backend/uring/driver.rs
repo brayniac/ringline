@@ -927,7 +927,7 @@ impl Driver {
         region_rx: crate::region_registry::RegionControlRx,
     ) -> Result<Self, crate::error::Error> {
         config.validate()?;
-        let ring = Ring::setup(config)?;
+        let mut ring = Ring::setup(config)?;
 
         let fixed_buffers =
             FixedBufferRegistry::new(&config.registered_regions, config.max_registered_regions);
@@ -3548,8 +3548,9 @@ impl Driver {
         }
 
         // 4. Unregister the provided buffer rings before Driver is dropped
-        // (which munmaps the ring memory). Without this, the kernel holds a
-        // dangling pointer to the freed mmap region.
+        // (which munmaps the ring memory). Unregistering releases the
+        // kernel's pin on the ring pages; the error and panic exits skip it,
+        // which is safe for the reason given at `Ring::register_buf_ring`.
         if self
             .ring
             .unregister_buf_ring(self.provided_bufs.bgid())
