@@ -152,26 +152,6 @@ impl Driver {
         Some(((first + index) as u16, ptr))
     }
 
-    /// Copy `data` into an owned segment (`HeldRecvBuf::Owned`), unless owned
-    /// segment copies already hold one ring's worth of bytes
-    /// (`ring_entries() × buffer_size`). `None` then; the caller holds the
-    /// ring buffer instead, so a segment reader that does not read drains
-    /// the ring and meets `ENOBUFS` backpressure rather than growing copies
-    /// without bound.
-    pub(crate) fn own_segment_copy(&self, data: &[u8]) -> Option<bytes::Bytes> {
-        use std::sync::atomic::Ordering::Relaxed;
-        let cap =
-            self.provided_bufs.ring_entries() as usize * self.provided_bufs.buffer_size() as usize;
-        if self.owned_segment_bytes.load(Relaxed) + data.len() > cap {
-            return None;
-        }
-        self.owned_segment_bytes.fetch_add(data.len(), Relaxed);
-        Some(bytes::Bytes::from_owner(SegmentCopy {
-            data: data.into(),
-            counter: self.owned_segment_bytes.clone(),
-        }))
-    }
-
     /// Release every queued bid: owned copies are freed, and provided-ring
     /// buffers released through `ProvidedBufRing::release_batch`.
     ///
@@ -223,26 +203,6 @@ impl Driver {
         } else {
             self.provided_bufs.data_ptr(bid, off)
         }
-    }
-}
-
-/// An owned segment copy's memory, which subtracts its length from its
-/// worker's `owned_segment_bytes` when freed.
-struct SegmentCopy {
-    data: Box<[u8]>,
-    counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-}
-
-impl AsRef<[u8]> for SegmentCopy {
-    fn as_ref(&self) -> &[u8] {
-        &self.data
-    }
-}
-
-impl Drop for SegmentCopy {
-    fn drop(&mut self) {
-        self.counter
-            .fetch_sub(self.data.len(), std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -637,21 +597,21 @@ pub(crate) struct Driver {
     pub(crate) forward_epoch: Vec<u32>,
     /// Per-connection flag: `true` while a Mode A `forward_to` is driving this
     /// connection (set by `ConnCtx::forward_to`, cleared by `settle_forward_end`
-    /// / `reset_segment_state` / `close_connection`). Gates the `forward_hold_cap`
-    /// throttle so it applies only to forwarding connections, not to pure Mode B
-    /// segment readers that share the `Segmented` domain and `segment_hold`.
+    /// / `reset_segment_state` / `close_connection`).
     pub(crate) forward_recv_active: Vec<bool>,
-    /// Per-connection flag: `true` while a forwarding connection's multishot recv
-    /// has been throttled (cancelled) because its `segment_hold` reached
-    /// `forward_hold_cap`. Set at the throttle point in the recv handler; cleared
-    /// when the recv is re-armed after the hold drains below the cap
-    /// (`maybe_rearm_throttled_forward`) or on `settle_forward_end` / close.
+    /// Per-connection flag: `true` while a connection's multishot recv has been
+    /// throttled (cancelled) because its held receive entries reached the
+    /// hold cap (`throttle_if_held`). Cleared when the recv is re-armed after
+    /// the hold drains below the cap (`maybe_rearm_throttled_forward`) or on
+    /// `settle_forward_end` / close.
     /// Gates re-arm so the starved-connection path does not fight the throttle.
     pub(crate) forward_hold_throttled: Vec<bool>,
-    /// Per-connection held-buffer cap for Mode A `forward_to`
-    /// (`Config::forward_hold_cap`). When a forwarding connection's `segment_hold`
-    /// length reaches this, its multishot recv is cancelled (TCP window closes)
-    /// and re-armed once the hold drains below the cap.
+    /// Connections throttled by `throttle_if_held`, which the event loop
+    /// re-arms once their hold drains (`rearm_throttled_recvs`). May hold a
+    /// connection whose flag was cleared since; the next pass drops it.
+    pub(crate) throttled_recvs: Vec<u32>,
+    /// Per-connection cap on held receive entries (`Config::forward_hold_cap`);
+    /// `throttle_if_held` applies it, lowered to a quarter of the ring.
     pub(crate) forward_hold_cap: usize,
     pub(crate) accept_rx: Option<crossbeam_channel::Receiver<crate::acceptor::AcceptedConn>>,
     /// Merged accept mode: every merged listener's sockets, `(listener index,
@@ -814,10 +774,6 @@ pub(crate) struct Driver {
     /// `None` is a free index (`owned_recv_free`).
     pub(crate) owned_recv: Vec<Option<Box<[u8]>>>,
     pub(crate) owned_recv_free: Vec<u16>,
-    /// Bytes held by owned segment copies (`HeldRecvBuf::Owned` made by the
-    /// segmented copy fallback), shared with each copy, which subtracts its
-    /// length when its memory is freed, wherever that happens.
-    pub(crate) owned_segment_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Lifetime count of fallback recv submissions on this worker
     /// (reported in the shutdown diag line).
     pub(crate) recv_fallback_count: u64,
@@ -1318,6 +1274,7 @@ impl Driver {
             forward_epoch: vec![0; config.max_connections as usize],
             forward_recv_active: vec![false; config.max_connections as usize],
             forward_hold_throttled: vec![false; config.max_connections as usize],
+            throttled_recvs: Vec::new(),
             forward_hold_cap: config.forward_hold_cap,
             accept_rx,
             merged_listeners: config.merged_listeners.clone(),
@@ -1387,7 +1344,6 @@ impl Driver {
             lend_cap: config.recv_incremental.then_some(recv_ring_size as u32 / 2),
             owned_recv: Vec::new(),
             owned_recv_free: Vec::new(),
-            owned_segment_bytes: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             recv_fallback_count: 0,
             udp_batch_recv_at: std::time::Instant::now(),
             tick_timeout_ts: if config.tick_timeout_us > 0 {

@@ -1011,6 +1011,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// released by tasks during the poll pass would otherwise sit uncommitted
     /// (and starved connections parked) until the next unrelated CQE.
     fn flush_replenish_and_rearm(&mut self) {
+        self.rearm_throttled_recvs();
         // Starved connections holding a zero-copy single-buffer hold
         // (`pending_recv_bufs`) with data the parser hasn't consumed: flush
         // the hold into the accumulator so its bid can rejoin the ring.
@@ -1758,74 +1759,19 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     );
                 }
                 crate::recv::occupancy::Delivery::ForceCopy => {
-                    // At/below the reserve, or over the lend cap: copy the bytes
-                    // into an owned `Bytes` and replenish the bid IMMEDIATELY so
-                    // the ring recovers and holders cannot deplete it.
-                    // `complete()` counted the bid at buffer_select; this
-                    // replenish balances it (net-zero pin), so the outstanding/
-                    // free accounting stays consistent. INC ordering: copy
-                    // before replenish, no await between. Once owned segment
-                    // copies hold one ring's worth of bytes the buffer is held
-                    // instead, so a reader that does not read meets `ENOBUFS`
-                    // backpressure.
-                    let entry = match self.driver.own_segment_copy(data) {
-                        Some(owned) => {
-                            self.driver.pending_replenish.push(bid);
-                            crate::backend::HeldRecvBuf::Owned(owned)
-                        }
-                        None => crate::backend::HeldRecvBuf::Pinned {
-                            bid,
-                            off: buf_off,
-                            len: bytes_received,
-                        },
-                    };
-                    self.driver.segment_hold[conn_index as usize].push_back(entry);
+                    // At/below the reserve: copy the bytes into an owned `Bytes`
+                    // and replenish the bid IMMEDIATELY so the ring recovers and
+                    // holders cannot deplete it. `complete()` counted the bid at
+                    // buffer_select; this replenish balances it (net-zero pin), so
+                    // the outstanding/free accounting stays consistent. INC
+                    // ordering: copy before replenish, no await between.
+                    let owned = bytes::Bytes::copy_from_slice(data);
+                    self.driver.segment_hold[conn_index as usize]
+                        .push_back(crate::backend::HeldRecvBuf::Owned(owned));
+                    self.driver.pending_replenish.push(bid);
                 }
             }
-            // Mode A hold cap (see `docs/segmented-recv-design.md`, "Mode A"). A
-            // `forward_to` connection whose held-buffer backlog reaches
-            // `forward_hold_cap` (a slow/high-latency sink, or a very large
-            // object) would otherwise pin much of the shared per-worker ring (and
-            // grow heap when the reserve force-copies), starving other
-            // connections. Throttle it: cancel its multishot recv so its TCP
-            // receive window closes and the source stops sending. The recv is
-            // re-armed once writes drain the hold below the cap
-            // (`maybe_rearm_throttled_forward`). Applies only to forwarders
-            // (`forward_recv_active`), not pure Mode B segment readers.
-            let ci = conn_index as usize;
-            if self.driver.forward_recv_active[ci]
-                && !self.driver.forward_hold_throttled[ci]
-                && self.driver.segment_hold[ci].len() >= self.driver.forward_hold_cap
-            {
-                self.driver.forward_hold_throttled[ci] = true;
-                // Only cancel a still-armed multishot. If this CQE terminated the
-                // multishot (`!has_more` cleared `recv_multishot_armed` at the top
-                // of the handler), there is nothing to cancel — the re-arm gate
-                // below (`!has_more`) already skips re-arming a throttled conn.
-                let armed = self
-                    .driver
-                    .connections
-                    .get(conn_index)
-                    .is_some_and(|c| c.recv_multishot_armed);
-                if armed {
-                    // Cancel by the RecvMulti user_data (targets the request, not
-                    // the fd — immune to reordering). `recv_multishot_armed` stays
-                    // set until the ECANCELED CQE clears it (top of the handler),
-                    // which gates re-arm so two multishots with the same user_data
-                    // never overlap. The payload must reproduce the arm-time
-                    // generation or the cancel matches nothing.
-                    let recv_ud = UserData::encode(
-                        OpTag::RecvMulti,
-                        conn_index,
-                        self.driver.connections.generation(conn_index),
-                    );
-                    let _ = self
-                        .driver
-                        .ring
-                        .submit_async_cancel(recv_ud.raw(), conn_index);
-                    metrics::POOL.increment(metrics::pool::FORWARD_THROTTLED);
-                }
-            }
+            self.throttle_if_held(conn_index);
             // A forwarder can submit its write straight from here; only a
             // Mode B/C segment reader needs its task woken to look at the hold.
             if self.driver.forward_progress[conn_index as usize].is_some() {
@@ -1848,6 +1794,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 len: bytes_received,
                 ptr: hold_ptr,
             });
+            self.throttle_if_held(conn_index);
             self.executor.wake_recv(conn_index);
         } else {
             // Direct echo fast path: submit the echo SQE directly from the CQE
@@ -1876,6 +1823,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                         ptr: hold_ptr,
                     },
                 );
+                self.throttle_if_held(conn_index);
                 // Do NOT call wake_recv here. DirectEchoFuture is woken only
                 // when the read side finishes: by the result <= 0 path above,
                 // or by `flush_direct_echoes` once a FIN's held bytes have
@@ -3794,6 +3742,100 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
     }
 
+    /// Throttle a connection whose held receive entries (`held_entries`) reach
+    /// `hold_throttle`: a reader, forwarder or echo
+    /// peer that is not keeping up would otherwise hold ring buffers until
+    /// the ring is empty, stalling every connection on the worker, or grow
+    /// heap copies without bound. Cancel its multishot recv so its TCP
+    /// receive window closes and only its peer stops sending. The event loop
+    /// re-arms it once the hold drains below the cap
+    /// (`rearm_throttled_recvs`).
+    fn throttle_if_held(&mut self, conn_index: u32) {
+        let ci = conn_index as usize;
+        if self.driver.forward_hold_throttled[ci]
+            || self.held_entries(conn_index) < self.hold_throttle()
+        {
+            return;
+        }
+        self.driver.forward_hold_throttled[ci] = true;
+        self.driver.throttled_recvs.push(conn_index);
+        // Only cancel a still-armed multishot. If this CQE terminated the
+        // multishot (`!has_more` cleared `recv_multishot_armed` at the top of
+        // the handler), there is nothing to cancel — the re-arm gate in the
+        // handler (`!has_more`) already skips re-arming a throttled conn.
+        let armed = self
+            .driver
+            .connections
+            .get(conn_index)
+            .is_some_and(|c| c.recv_multishot_armed);
+        if armed {
+            // Cancel by the RecvMulti user_data (targets the request, not the
+            // fd — immune to reordering). `recv_multishot_armed` stays set
+            // until the ECANCELED CQE clears it (top of the handler), which
+            // gates re-arm so two multishots with the same user_data never
+            // overlap. The payload must reproduce the arm-time generation or
+            // the cancel matches nothing.
+            let recv_ud = UserData::encode(
+                OpTag::RecvMulti,
+                conn_index,
+                self.driver.connections.generation(conn_index),
+            );
+            let _ = self
+                .driver
+                .ring
+                .submit_async_cancel(recv_ud.raw(), conn_index);
+            metrics::POOL.increment(metrics::pool::FORWARD_THROTTLED);
+        }
+    }
+
+    /// The held entries at which a connection's receive is throttled:
+    /// `forward_hold_cap`, but at most a quarter of the TCP ring's buffers,
+    /// since each held entry can pin one, so a single connection cannot empty
+    /// the ring.
+    fn hold_throttle(&self) -> usize {
+        let quarter = (self.driver.provided_bufs.ring_entries() as usize / 4).max(1);
+        self.driver.forward_hold_cap.min(quarter)
+    }
+
+    /// Receive entries a connection holds: its segment and recv-forward holds,
+    /// and on a direct-echo connection the queued sends, each of which holds
+    /// the buffer it echoes until it is sent.
+    fn held_entries(&self, conn_index: u32) -> usize {
+        let ci = conn_index as usize;
+        let echo_queued = if self
+            .driver
+            .connections
+            .get(conn_index)
+            .is_some_and(|c| c.direct_echo)
+        {
+            self.driver.send_queues[ci].queue.len()
+        } else {
+            0
+        };
+        self.driver.segment_hold[ci].len() + self.driver.recv_hold[ci].len() + echo_queued
+    }
+
+    /// Re-arm every throttled connection whose hold has drained below the
+    /// cap. A segment reader or a recv-forward task drains its hold from task
+    /// code, which has no completion to re-arm from, so the event loop checks
+    /// the throttled connections on each pass.
+    fn rearm_throttled_recvs(&mut self) {
+        if self.driver.throttled_recvs.is_empty() {
+            return;
+        }
+        let throttled = std::mem::take(&mut self.driver.throttled_recvs);
+        for &conn_index in &throttled {
+            self.maybe_rearm_throttled_forward(conn_index);
+        }
+        let mut throttled = throttled;
+        throttled.retain(|&c| self.driver.forward_hold_throttled[c as usize]);
+        // A throttle taken during the re-arms above is already in the list.
+        throttled.append(&mut self.driver.throttled_recvs);
+        throttled.sort_unstable();
+        throttled.dedup();
+        self.driver.throttled_recvs = throttled;
+    }
+
     fn maybe_rearm_throttled_forward(&mut self, conn_index: u32) {
         let ci = conn_index as usize;
         if !self.driver.forward_hold_throttled[ci] {
@@ -3809,7 +3851,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             return;
         }
         // Only re-arm once the hold has drained below the cap.
-        if self.driver.segment_hold[ci].len() >= self.driver.forward_hold_cap {
+        if self.held_entries(conn_index) >= self.hold_throttle() {
             return;
         }
         // Connection must still be open in multishot recv mode.
@@ -10460,41 +10502,50 @@ mod tests {
         assert_eq!(el.driver.pending_replenish, [1]);
     }
 
-    /// Owned segment copies stop at one ring's worth of bytes: past it, the
-    /// copy fallback holds the ring buffer. A copy's bytes leave the count
-    /// when it is dropped.
+    /// A segment reader whose hold reaches the hold cap has its receive
+    /// cancelled and is re-armed by the event loop once its hold drains.
     #[test]
-    fn owned_segment_copies_stop_at_one_ring_of_bytes() {
-        let mut el = make_test_loop_with_config(config_with_reserve(16));
+    fn a_full_segment_hold_throttles_until_it_drains() {
+        let mut el = make_test_loop_with_config(config_with_reserve(0));
         let conn_index = accept_connection(&mut el);
-        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
-        let ring_bytes = el.driver.provided_bufs.ring_entries() as usize
-            * el.driver.provided_bufs.buffer_size() as usize;
-        let copy = el
-            .driver
-            .own_segment_copy(b"held")
-            .expect("under the bound");
-        assert_eq!(
-            el.driver
-                .owned_segment_bytes
-                .load(std::sync::atomic::Ordering::Relaxed),
-            4
+        let ci = conn_index as usize;
+        el.driver.recv_domain[ci] = crate::recv::domain::RecvDomain::Segmented;
+        let cap = el.hold_throttle();
+        for bid in 0..cap as u16 {
+            deliver_segment(&mut el, conn_index, bid, b"x");
+        }
+        assert!(el.driver.forward_hold_throttled[ci], "throttled at the cap");
+        assert_eq!(el.driver.throttled_recvs, [conn_index]);
+
+        // Still held: the event loop leaves it throttled.
+        el.flush_replenish_and_rearm();
+        assert!(el.driver.forward_hold_throttled[ci]);
+
+        // The cancel lands and the reader drains its hold.
+        let ud = UserData::encode(
+            OpTag::RecvMulti,
+            conn_index,
+            el.driver.connections.generation(conn_index),
         );
-        drop(copy);
-        assert_eq!(
-            el.driver
-                .owned_segment_bytes
-                .load(std::sync::atomic::Ordering::Relaxed),
-            0
+        el.test_dispatch_cqe(ud.raw(), -libc::ECANCELED, 0);
+        for held in el.driver.segment_hold[ci].drain(..) {
+            if let crate::backend::HeldRecvBuf::Pinned { bid, .. } = held {
+                el.driver.pending_replenish.push(bid);
+            }
+        }
+        el.flush_replenish_and_rearm();
+        assert!(
+            !el.driver.forward_hold_throttled[ci],
+            "re-armed once drained"
         );
-        el.driver
-            .owned_segment_bytes
-            .store(ring_bytes - 2, std::sync::atomic::Ordering::Relaxed);
-        deliver_segment(&mut el, conn_index, 0, b"over");
-        assert!(matches!(
-            el.driver.segment_hold[conn_index as usize][0],
-            crate::backend::HeldRecvBuf::Pinned { .. }
-        ));
+        assert!(el.driver.throttled_recvs.is_empty());
+        assert!(
+            el.driver
+                .connections
+                .get(conn_index)
+                .unwrap()
+                .recv_multishot_armed
+        );
     }
 
     /// With a lend cap, the cap decides a segmented delivery and

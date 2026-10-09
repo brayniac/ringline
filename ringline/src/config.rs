@@ -154,20 +154,22 @@ pub struct Config {
     ///
     /// **Default: 64** (a quarter of the default 256-buffer recv ring).
     pub(crate) recv_segment_reserve: u32,
-    /// Per-connection held-buffer cap for a Mode A `forward_to` connection (see
+    /// Per-connection cap on held receive entries (see
     /// `docs/segmented-recv-design.md`, "Mode A — Forward to an fd").
     ///
-    /// A `forward_to` connection holds arriving provided buffers in-place until
-    /// each is written to the sink. A slow or high-latency sink (or a very large
-    /// object) would otherwise let one forwarding connection accumulate an
-    /// unbounded backlog of held buffers, pinning much of the shared per-worker
-    /// recv ring (and growing heap when the low-water reserve force-copies) and
-    /// starving every other connection on the worker. When a forwarding
-    /// connection's held-buffer count reaches this cap, the runtime cancels its
-    /// multishot recv so its TCP receive window closes and the peer stops sending
-    /// (natural backpressure to the source); the recv is re-armed once the hold
-    /// drains below the cap as writes complete. This bounds one slow forward to at
-    /// most `forward_hold_cap` held buffers.
+    /// A connection can hold arriving data in place or as copies until its
+    /// consumer drains it: a `forward_to` source until each buffer is written to
+    /// the sink, a segment reader (`segments`, `with_segments`) until it reads,
+    /// a recv-forward or direct-echo connection until its send goes out. A slow
+    /// consumer would otherwise accumulate an unbounded backlog, pinning the
+    /// shared per-worker recv ring (starving every other connection on the
+    /// worker) or growing heap copies without limit. When a connection's held
+    /// entries reach this cap, or a quarter of the recv ring's buffers if that
+    /// is lower, the runtime cancels its multishot recv so its TCP receive
+    /// window closes and only its peer stops sending; the recv is re-armed
+    /// once the hold drains below the cap. Without `recv_incremental`, a
+    /// recv-forward or direct-echo send waiting on a peer that does not read
+    /// still holds the ring buffers it carries.
     ///
     /// Larger values allow more recv in flight (higher single-forward throughput)
     /// at the cost of more pinned ring buffers / held heap under a slow sink;
@@ -1083,10 +1085,7 @@ impl ConfigBuilder {
     /// well-behaved connections under fan-in. Above the reserve, delivery stays
     /// zero-copy. `0` force-copies only when the ring is fully drained. Tune
     /// relative to the `recv_buffer` ring size; must be `<= 65535`. Ignored
-    /// with `recv_incremental(true)`, where the lend cap decides. Force-copied
-    /// bytes stop at one receive ring's worth per worker; past that the
-    /// buffer is held, so a reader that does not read is stopped by TCP
-    /// backpressure.
+    /// with `recv_incremental(true)`, where the lend cap decides.
     ///
     /// Default: 64 (a quarter of the default 256-buffer recv ring).
     pub fn recv_segment_reserve(mut self, reserve: u32) -> Self {

@@ -355,14 +355,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
-- On io_uring, a connection reading through `segments()` or
-  `with_segments` that stopped reading made the worker copy everything the
-  peer sent: segmented deliveries the reserve (or, with `recv_incremental`,
-  the lend cap) sends to the copy fallback were copied without limit. The
-  copies now stop at one receive ring's worth of bytes per worker; past
-  that the ring buffer is held, the ring drains and the peer is stopped by
-  TCP backpressure. A test client that wrote without being read sent 64
-  MiB before and stalls now.
+- On io_uring, a connection whose consumer stops draining what it holds
+  no longer grows memory without limit or stalls its worker. A segment
+  reader (`segments()`, `with_segments`, `recv_owned_segment`) that stopped
+  reading made the worker copy everything its peer sent (a test client
+  wrote 64 MiB unread); with `recv_incremental`, a direct-echo peer that
+  stopped reading stalled every other connection on the worker. The
+  `forward_hold_cap` receive throttle, which applied only to `forward_to`
+  sources, now applies to every connection that holds received data
+  (segment readers, recv-forward, direct echo), at `forward_hold_cap` held
+  entries or a quarter of the receive ring's buffers, whichever is lower:
+  its multishot receive is cancelled so only its peer is stopped, and it is
+  re-armed once the hold drains. Without `recv_incremental`, a recv-forward
+  or direct-echo send waiting on a peer that does not read still holds the
+  ring buffers it carries.
 
 - io_uring: `ConfigBuilder::sqpoll(true)` works. Ring setup set
   `IORING_SETUP_COOP_TASKRUN` together with `IORING_SETUP_SQPOLL`, which the
