@@ -1902,6 +1902,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                         }
                     }
                 }
+                // A lent buffer (`pending_recv_bufs`) that the handler forwards
+                // with `forward_recv_buf` becomes a `SendRecvBuf` counted in
+                // `send_held_recv`. The check runs before the task forwards the
+                // buffer lent by this completion, so it lags by one send.
+                // Forwards of accumulator-backed data are not counted (#638).
+                if self.driver.send_held_recv[conn_index as usize] != 0 {
+                    self.throttle_if_held(conn_index);
+                }
                 self.executor.wake_recv(conn_index);
             }
         }
@@ -3550,6 +3558,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         for &b in &bids[..n] {
             self.driver.pending_replenish.push(b);
         }
+        let owner = self.driver.send_slab.conn_index(slab_idx);
+        self.driver.release_send_held(owner, n as u32);
         self.driver.send_slab.release(slab_idx);
     }
 
@@ -3825,10 +3835,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     ///
     /// The recv-forward or direct-echo hold is always held to a quarter of the
     /// ring: its copies come from `Driver::own_recv_copy`, at most one ring's
-    /// worth per worker, and past that its entries pin ring buffers. A
-    /// direct-echo connection gathers its hold only when no send is in
-    /// flight, so its backlog stays in `recv_hold`; the buffers of the one
-    /// send in flight are not counted (#638).
+    /// worth per worker, and past that its entries pin ring buffers.
+    ///
+    /// The entries held by the connection's direct-echo and `forward_held`
+    /// sends, and by its `forward_recv_buf` sends of lent receive buffers
+    /// (`SendRecvBuf`), are counted in `send_held_recv` and added to the
+    /// `recv_hold` count, and the ring buffers a `forward_to` write pins are
+    /// added to the `segment_hold` count. Both stay held until the send
+    /// completes or fails (#638).
     fn at_hold_cap(&self, conn_index: u32) -> bool {
         let ci = conn_index as usize;
         let segment_cap = if self.driver.lend_cap.is_some() {
@@ -3836,8 +3850,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         } else {
             self.quarter_ring_cap()
         };
-        self.driver.segment_hold[ci].len() >= segment_cap
-            || self.driver.recv_hold[ci].len() >= self.quarter_ring_cap()
+        let writing = self.driver.forward_write[ci]
+            .as_ref()
+            .map_or(0, |w| w.pinned());
+        let sending = self.driver.send_held_recv[ci] as usize;
+        self.driver.segment_hold[ci].len() + writing >= segment_cap
+            || self.driver.recv_hold[ci].len() + sending >= self.quarter_ring_cap()
     }
 
     /// Re-arm every throttled connection whose hold has drained below the
@@ -4070,6 +4088,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // Full send complete.
             metrics::BYTES.add(metrics::bytes::SENT, remaining_before as u64);
             self.driver.pending_replenish.push(bid);
+            self.driver.release_send_held(conn_index, 1);
             self.driver.submit_next_queued(conn_index);
             return;
         }
@@ -4077,6 +4096,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // Error or zero-length send. A `SendRecvBuf` (`forward_recv_buf`,
         // direct echo) is never awaited, so there is nothing to settle.
         self.driver.pending_replenish.push(bid);
+        self.driver.release_send_held(conn_index, 1);
         self.driver.submit_next_queued(conn_index);
     }
 
@@ -8026,6 +8046,8 @@ mod tests {
         let conn_index = accept_connection(&mut el);
         let bid: u16 = 7;
         let ud = UserData::encode(OpTag::SendRecvBuf, conn_index, bid as u32);
+        // A real send raised the count when it took the buffer.
+        el.driver.send_held_recv[conn_index as usize] = 1;
         let entry =
             crate::backend::uring::sqe::Sqe::stream_send(conn_index, std::ptr::null(), 0, ud.raw());
         el.driver.send_queues[conn_index as usize]
@@ -10633,6 +10655,8 @@ mod tests {
         el.driver.send_recv_buf_remaining[ci] = 7;
         el.driver.send_queues[ci].in_flight = true;
         let ud = UserData::encode(OpTag::SendRecvBuf, conn, entry.bid as u32);
+        // A real send raised the count when it took the buffer.
+        el.driver.send_held_recv[conn as usize] = 1;
         el.test_dispatch_cqe(ud.raw(), 7, 0);
         assert!(el.driver.pending_replenish.contains(&entry.bid));
         el.driver.release_pending();
@@ -10659,6 +10683,175 @@ mod tests {
         assert!(!el.driver.send_slab.in_use(0));
         el.driver.release_pending();
         assert!(el.driver.owned_recv.iter().all(Option::is_none));
+    }
+
+    /// A direct-echo gather counts its buffers in `send_held_recv` until its
+    /// send completes, and the count reaches the hold cap (#638).
+    #[test]
+    fn a_direct_echo_gather_is_counted_until_its_send_completes() {
+        let mut el = make_test_loop();
+        let conn = accept_connection(&mut el);
+        el.driver.connections.get_mut(conn).unwrap().direct_echo = true;
+        deliver(&mut el, conn, 2, b"first");
+        deliver(&mut el, conn, 3, b"second");
+        el.flush_direct_echoes();
+        assert!(el.driver.recv_hold[conn as usize].is_empty());
+        assert_eq!(el.driver.send_held_recv[conn as usize], 2);
+        let ud = UserData::encode(OpTag::SendRecvBufsCoalesced, conn, 0);
+        el.test_dispatch_cqe(ud.raw(), 11, 0);
+        assert_eq!(el.driver.send_held_recv[conn as usize], 0);
+    }
+
+    /// A failed coalesced send releases its count.
+    #[test]
+    fn a_failed_direct_echo_gather_releases_its_count() {
+        let mut el = make_test_loop();
+        let conn = accept_connection(&mut el);
+        el.driver.connections.get_mut(conn).unwrap().direct_echo = true;
+        deliver(&mut el, conn, 2, b"first");
+        deliver(&mut el, conn, 3, b"second");
+        el.flush_direct_echoes();
+        let ud = UserData::encode(OpTag::SendRecvBufsCoalesced, conn, 0);
+        el.test_dispatch_cqe(ud.raw(), -libc::ECONNRESET, 0);
+        assert_eq!(el.driver.send_held_recv[conn as usize], 0);
+    }
+
+    /// A lone held buffer goes out as a `SendRecvBuf`, counted until it
+    /// completes or fails.
+    #[test]
+    fn a_single_direct_echo_send_is_counted_until_it_completes() {
+        for result in [7, -libc::ECONNRESET] {
+            let mut el = make_test_loop();
+            let conn = accept_connection(&mut el);
+            el.driver.connections.get_mut(conn).unwrap().direct_echo = true;
+            deliver(&mut el, conn, 2, b"echo-me");
+            el.flush_direct_echoes();
+            assert_eq!(el.driver.send_held_recv[conn as usize], 1);
+            let ud = UserData(el.driver.ring.last_pushed.as_ref().unwrap().user_data);
+            assert_eq!(ud.tag(), Some(OpTag::SendRecvBuf));
+            el.test_dispatch_cqe(ud.raw(), result, 0);
+            assert_eq!(
+                el.driver.send_held_recv[conn as usize], 0,
+                "result {result}"
+            );
+        }
+    }
+
+    /// A queued `forward_recv_buf` send is counted, and releasing the queue
+    /// releases its count.
+    #[test]
+    fn a_queued_forward_recv_buf_send_is_released_with_the_queue() {
+        let mut el = make_test_loop();
+        let conn = accept_connection(&mut el);
+        let (ptr, _) = el.driver.provided_bufs.get_buffer(4);
+        el.driver.pending_recv_bufs[conn as usize] = Some(crate::backend::PendingRecvBuf {
+            bid: 4,
+            len: 5,
+            ptr,
+        });
+        el.driver.send_queues[conn as usize].in_flight = true;
+        let ctx = ConnCtx::new(conn, el.driver.connections.generation(conn));
+        let data = unsafe { std::slice::from_raw_parts(ptr, 5) };
+        with_driver_state(&mut el, || ctx.forward_recv_buf(data)).expect("forwarded");
+        assert_eq!(el.driver.send_queues[conn as usize].queue.len(), 1);
+        assert_eq!(el.driver.send_held_recv[conn as usize], 1);
+        el.driver.drain_conn_send_queue(conn);
+        assert_eq!(el.driver.send_held_recv[conn as usize], 0);
+        assert!(el.driver.pending_replenish.contains(&4));
+    }
+
+    /// The ring buffers a `forward_to` write pins count toward the segment
+    /// cap; its owned backings do not.
+    #[test]
+    fn a_forward_writes_pinned_buffers_count_toward_the_segment_cap() {
+        let mut el = make_test_loop();
+        let conn = accept_connection(&mut el);
+        let ci = conn as usize;
+        let cap = el.quarter_ring_cap();
+        for _ in 0..cap - 1 {
+            el.driver.segment_hold[ci]
+                .push_back(crate::backend::HeldRecvBuf::Owned(bytes::Bytes::new()));
+        }
+        let write = |backing| crate::backend::uring::driver::ForwardWriteState {
+            backings: vec![backing],
+            lens: vec![1],
+            iovecs: Vec::new(),
+            msghdr: unsafe { std::mem::zeroed() },
+            total: 1,
+            written: 0,
+            base_offset: 0,
+            target: crate::backend::uring::driver::SinkTarget::Fd {
+                fd: -1,
+                is_file: false,
+            },
+            generation: 0,
+        };
+        el.driver.forward_write[ci] = Some(write(crate::backend::HeldRecvBuf::Owned(
+            bytes::Bytes::from_static(b"x"),
+        )));
+        assert!(!el.at_hold_cap(conn));
+        el.driver.forward_write[ci] = Some(write(crate::backend::HeldRecvBuf::Pinned {
+            bid: 0,
+            off: 0,
+            len: 1,
+        }));
+        assert!(el.at_hold_cap(conn));
+        el.driver.forward_write[ci] = None;
+        el.driver.segment_hold[ci].clear();
+    }
+
+    /// A plain connection whose sends hold its cap is throttled on its next
+    /// completion, and re-armed once the sends release their buffers.
+    #[test]
+    fn a_plain_recv_is_throttled_while_its_sends_hold_the_cap() {
+        let mut el = make_test_loop();
+        let conn = accept_connection(&mut el);
+        let ci = conn as usize;
+        el.driver
+            .connections
+            .get_mut(conn)
+            .unwrap()
+            .recv_multishot_armed = true;
+        el.driver.send_held_recv[ci] = el.quarter_ring_cap() as u32;
+        deliver(&mut el, conn, 2, b"x");
+        assert!(el.driver.forward_hold_throttled[ci]);
+        assert_eq!(el.driver.throttled_recvs, [conn]);
+
+        // The cancel lands; the sends still hold the cap.
+        let ud = UserData::encode(
+            OpTag::RecvMulti,
+            conn,
+            el.driver.connections.generation(conn),
+        );
+        el.test_dispatch_cqe(ud.raw(), -libc::ECANCELED, 0);
+        el.flush_replenish_and_rearm();
+        assert!(el.driver.forward_hold_throttled[ci], "held at the cap");
+
+        // The sends complete.
+        el.driver.send_held_recv[ci] = 0;
+        el.flush_replenish_and_rearm();
+        assert!(!el.driver.forward_hold_throttled[ci], "re-armed");
+        assert!(el.driver.throttled_recvs.is_empty());
+        assert!(
+            el.driver
+                .connections
+                .get(conn)
+                .unwrap()
+                .recv_multishot_armed
+        );
+    }
+
+    /// Buffers held by sends count toward the hold cap.
+    #[test]
+    fn send_held_buffers_count_toward_the_hold_cap() {
+        let mut el = make_test_loop();
+        let conn = accept_connection(&mut el);
+        let cap = el.quarter_ring_cap() as u32;
+        el.driver.send_held_recv[conn as usize] = cap - 1;
+        assert!(!el.at_hold_cap(conn));
+        el.driver.send_held_recv[conn as usize] = cap;
+        assert!(el.at_hold_cap(conn));
+        el.driver.send_held_recv[conn as usize] = 0;
     }
 
     /// A recv-forward owned copy is freed when its connection closes.
@@ -15927,6 +16120,8 @@ mod tests {
         el.driver.send_queues[conn_index as usize].in_flight = true;
         let payload = bid as u32;
         let ud = UserData::encode(OpTag::SendRecvBuf, conn_index, payload);
+        // A real send raised the count when it took the buffer.
+        el.driver.send_held_recv[conn_index as usize] = 1;
 
         // Full send: all 100 bytes sent.
         el.test_dispatch_cqe(ud.raw(), 100, 0);
@@ -15959,6 +16154,8 @@ mod tests {
         el.driver.send_recv_buf_remaining[conn_index as usize] = data_len;
         let payload = bid as u32;
         let ud = UserData::encode(OpTag::SendRecvBuf, conn_index, payload);
+        // A real send raised the count when it took the buffer.
+        el.driver.send_held_recv[conn_index as usize] = 1;
 
         // Simulate ECONNRESET.
         el.test_dispatch_cqe(ud.raw(), -104, 0);
@@ -16000,6 +16197,8 @@ mod tests {
         el.driver.send_recv_buf_remaining[conn_index as usize] = data_len;
         let payload = bid as u32;
         let ud = UserData::encode(OpTag::SendRecvBuf, conn_index, payload);
+        // A real send raised the count when it took the buffer.
+        el.driver.send_held_recv[conn_index as usize] = 1;
 
         // Partial send: only 60 of 100 bytes sent.
         el.test_dispatch_cqe(ud.raw(), 60, 0);
@@ -16039,6 +16238,8 @@ mod tests {
         el.driver.send_queues[conn_index as usize].in_flight = true;
         el.driver.ring.force_push_failures(1);
         let ud = UserData::encode(OpTag::SendRecvBuf, conn_index, bid as u32);
+        // A real send raised the count when it took the buffer.
+        el.driver.send_held_recv[conn_index as usize] = 1;
         el.test_dispatch_cqe(ud.raw(), 60, 0);
         (conn_index, bid)
     }
@@ -16143,6 +16344,8 @@ mod tests {
 
         el.driver.ring.force_push_failures(1);
         let ud = UserData::encode(OpTag::SendRecvBuf, conn_index, bid as u32);
+        // A real send raised the count when it took the buffer.
+        el.driver.send_held_recv[conn_index as usize] = 1;
         el.test_dispatch_cqe(ud.raw(), 60, 0);
         el.drain_send_retries();
         let pushed = UserData(
@@ -16180,6 +16383,8 @@ mod tests {
         el.driver.send_recv_buf_remaining[conn_index as usize] = data_len;
         let payload = bid as u32;
         let ud = UserData::encode(OpTag::SendRecvBuf, conn_index, payload);
+        // A real send raised the count when it took the buffer.
+        el.driver.send_held_recv[conn_index as usize] = 1;
 
         // First partial: 30 of 100 bytes sent. Remaining = 70. Offset should be 30.
         el.test_dispatch_cqe(ud.raw(), 30, 0);
@@ -16223,6 +16428,8 @@ mod tests {
         el.driver.send_recv_buf_remaining[conn_index as usize] = data_len;
         let payload = bid as u32;
         let ud = UserData::encode(OpTag::SendRecvBuf, conn_index, payload);
+        // A real send raised the count when it took the buffer.
+        el.driver.send_held_recv[conn_index as usize] = 1;
 
         // Partial send: 25 of 50 bytes.
         el.test_dispatch_cqe(ud.raw(), 25, 0);
@@ -16262,6 +16469,8 @@ mod tests {
         el.driver.send_recv_buf_remaining[conn_index as usize] = data_len;
         let payload = bid as u32;
         let ud = UserData::encode(OpTag::SendRecvBuf, conn_index, payload);
+        // A real send raised the count when it took the buffer.
+        el.driver.send_held_recv[conn_index as usize] = 1;
 
         // Result == 0 (zero-length send).
         el.test_dispatch_cqe(ud.raw(), 0, 0);
@@ -17102,6 +17311,8 @@ mod tests {
             .send_slab
             .allocate_recv_forward(conn_index, generation, &iovecs, &[3], 100)
             .expect("slab room");
+        // A real forward raised the count when it took the buffer.
+        el.driver.send_held_recv[conn_index as usize] = 1;
         let id = awaited.then(|| await_slab(&mut el, conn_index, slab_idx, 100));
         let ud = UserData::encode(OpTag::SendRecvBufsCoalesced, conn_index, slab_idx as u32);
         el.test_dispatch_cqe(ud.raw(), 100, 0);
@@ -17148,6 +17359,8 @@ mod tests {
             .send_slab
             .allocate_recv_forward(conn_index, generation, &iovecs, &[3], 100)
             .expect("slab room");
+        // A real forward raised the count when it took the buffer.
+        el.driver.send_held_recv[conn_index as usize] = 1;
         let id = await_slab(&mut el, conn_index, slab_idx, 100);
         let ud = UserData::encode(OpTag::SendRecvBufsCoalesced, conn_index, slab_idx as u32);
         el.test_dispatch_cqe(ud.raw(), -libc::ECONNRESET, 0);
@@ -17385,6 +17598,10 @@ mod tests {
                 )
             }
             .expect("slab room");
+            if recv_forward {
+                // A real forward raised the count when it took the buffer.
+                el.driver.send_held_recv[conn_index as usize] = 1;
+            }
             let id = await_slab(&mut el, conn_index, slab_idx, 100);
             el.driver.send_queues[conn_index as usize].close_submitted = true;
             if recv_forward {

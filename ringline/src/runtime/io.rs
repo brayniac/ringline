@@ -2032,6 +2032,7 @@ impl ConnCtx {
                         // the connection's queue and keeps its bid exactly as
                         // a queued entry does; `handle_send_recv_buf`
                         // replenishes it on completion.
+                        driver.send_held_recv[conn_index as usize] += 1;
                         driver.submit_or_queue_send(conn_index, built);
                         return Ok(());
                     }
@@ -2411,6 +2412,7 @@ impl ConnCtx {
                     for _ in 0..n {
                         driver.recv_hold[conn_index as usize].pop_front();
                     }
+                    driver.send_held_recv[conn_index as usize] += n as u32;
                     driver.send_queues[conn_index as usize].in_flight = true;
                     Ok(SendFuture::pending(conn_index, self.generation, id))
                 }

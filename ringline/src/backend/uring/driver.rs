@@ -122,6 +122,14 @@ impl Driver {
 }
 
 impl Driver {
+    /// Record that `n` received buffers of `conn_index` were released by the
+    /// send that held them (`send_held_recv`).
+    pub(crate) fn release_send_held(&mut self, conn_index: u32, n: u32) {
+        let held = &mut self.send_held_recv[conn_index as usize];
+        debug_assert!(*held >= n, "released more send-held buffers than were held");
+        *held = held.saturating_sub(n);
+    }
+
     /// Whether `bid` names an owned copy (`owned_recv`) rather than a
     /// provided-ring buffer.
     pub(crate) fn is_owned_recv(&self, bid: u16) -> bool {
@@ -350,6 +358,14 @@ pub(crate) struct ForwardWriteState {
 }
 
 impl ForwardWriteState {
+    /// How many ring buffers this write pins (`HeldRecvBuf::Pinned`).
+    pub(crate) fn pinned(&self) -> usize {
+        self.backings
+            .iter()
+            .filter(|b| matches!(b, HeldRecvBuf::Pinned { .. }))
+            .count()
+    }
+
     /// Address of the first byte of one backing's data.
     fn data_ptr(backing: &HeldRecvBuf, provided_bufs: &ProvidedBufRing) -> *const u8 {
         match backing {
@@ -452,6 +468,16 @@ pub(crate) struct Driver {
     /// `recv_hold` is also the staging area for direct-echo connections, which
     /// gather it the same way from the CQE handler (see `flush_direct_echo`).
     pub(crate) recv_hold: Vec<std::collections::VecDeque<PendingRecvBuf>>,
+    /// Per connection, the received buffers (ring buffers or owned copies)
+    /// held by its queued or in-flight sends: a direct-echo gather or single
+    /// send, a `forward_held` send, or a `forward_recv_buf` send of a lent
+    /// receive buffer (`SendRecvBuf`).
+    /// Raised when an entry leaves `recv_hold` or `pending_recv_bufs` for a
+    /// send, lowered when the send releases its bids (`release_send_held`,
+    /// or `release_queued_sends` for a queued `SendRecvBuf`). The receive
+    /// throttle counts it (`at_hold_cap`): against a peer that does not read,
+    /// the send never completes and keeps these buffers held (#638).
+    pub(crate) send_held_recv: Vec<u32>,
     /// Per-connection opt-in flag for the zero-copy recv-forward path.
     pub(crate) recv_forward: Vec<bool>,
     /// Bytes already detached from the accumulator by a zero-copy
@@ -1244,6 +1270,7 @@ impl Driver {
             recv_hold: (0..config.max_connections)
                 .map(|_| std::collections::VecDeque::new())
                 .collect(),
+            send_held_recv: vec![0; config.max_connections as usize],
             recv_forward: vec![false; config.max_connections as usize],
             forward_zc_consumed: vec![0; config.max_connections as usize],
             direct_echo_pending: Vec::new(),
@@ -1512,6 +1539,7 @@ impl Driver {
             &mut self.send_slab,
             &mut self.send_copy_pool,
             &mut self.pending_replenish,
+            &mut self.send_held_recv[conn_index as usize],
         );
         state.in_flight = false;
         state.parked = false;
@@ -2533,6 +2561,7 @@ impl Driver {
             &mut self.send_slab,
             &mut self.send_copy_pool,
             &mut self.pending_replenish,
+            &mut self.send_held_recv[conn_index as usize],
         );
         state.in_flight = false;
         state.parked = false;
@@ -2885,6 +2914,7 @@ impl Driver {
                 for _ in 0..n {
                     self.recv_hold[ci].pop_front();
                 }
+                self.send_held_recv[ci] += n as u32;
                 self.send_queues[ci].in_flight = true;
                 if self
                     .ring
@@ -2905,6 +2935,7 @@ impl Driver {
         let pending = self.recv_hold[ci]
             .pop_front()
             .expect("hold is non-empty: n >= 1 was checked above");
+        self.send_held_recv[ci] += 1;
         let ud = UserData::encode(OpTag::SendRecvBuf, conn_index, pending.bid as u32);
         let entry = crate::backend::uring::sqe::Sqe::stream_send(
             conn_index,
@@ -3028,6 +3059,7 @@ impl Driver {
             &mut self.send_slab,
             &mut self.send_copy_pool,
             &mut self.pending_replenish,
+            &mut self.send_held_recv[conn_index as usize],
         );
         state.in_flight = false;
         state.parked = false;
@@ -3069,6 +3101,7 @@ impl Driver {
         send_slab: &mut InFlightSendSlab,
         send_copy_pool: &mut SendCopyPool,
         pending_replenish: &mut Vec<u16>,
+        send_held_recv: &mut u32,
     ) -> Vec<SendId> {
         let mut ids = Vec::new();
         for built in queue.drain(..) {
@@ -3076,6 +3109,8 @@ impl Driver {
                 let ud = crate::completion::UserData(built.entry.user_data);
                 if ud.tag() == Some(crate::completion::OpTag::SendRecvBuf) {
                     pending_replenish.push(ud.payload() as u16);
+                    debug_assert!(*send_held_recv > 0, "a queued SendRecvBuf was not counted");
+                    *send_held_recv = send_held_recv.saturating_sub(1);
                 }
                 continue;
             }
@@ -3551,6 +3586,8 @@ impl Driver {
             n += 1;
         }
         self.pending_replenish.extend_from_slice(&bids[..n]);
+        let owner = self.send_slab.conn_index(slab_idx);
+        self.release_send_held(owner, n as u32);
         self.send_slab.release(slab_idx);
     }
 
