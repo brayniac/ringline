@@ -54,7 +54,7 @@ cd /home/anvil
 hard=$(ulimit -Hn); [ "$hard" = unlimited ] && hard=1048576; ulimit -n "$hard"
 sudo prlimit --pid $BASHPID --memlock=unlimited:unlimited
 {
-  uname -r; ldd --version | head -1; ls out
+  uname -r; ldd --version | head -1; sha256sum out/*
   L=$(ls out/ringline* | grep -v echo | head -1); E=out/echo
   for run in "$L conformance" "$L abi::" "$E async_echo_under_sqpoll"; do
     set -- $run; name=$(basename $1)-$2
@@ -95,7 +95,7 @@ cd /home/anvil && tar xzf tests.tgz && chmod +x out/*
 hard=$(ulimit -Hn); [ "$hard" = unlimited ] && hard=1048576; ulimit -n "$hard"
 sudo prlimit --pid $BASHPID --memlock=unlimited:unlimited
 {
-  uname -r; ldd --version | head -1; ls out
+  uname -r; ldd --version | head -1; sha256sum out/*
   L=$(ls out/ringline* | grep -v echo | head -1); E=out/echo
   for run in "$L conformance" "$L abi::" "$E async_echo_under_sqpoll"; do
     set -- $run; name=$(basename $1)-$2
@@ -136,7 +136,7 @@ cd /home/anvil && tar xzf tests.tgz && chmod +x out/*
 hard=$(ulimit -Hn); [ "$hard" = unlimited ] && hard=1048576; ulimit -n "$hard"
 sudo prlimit --pid $BASHPID --memlock=unlimited:unlimited
 {
-  uname -r; ldd --version | head -1; ls out
+  uname -r; ldd --version | head -1; sha256sum out/*
   L=$(ls out/ringline* | grep -v echo | head -1); E=out/echo
   for run in "$L conformance" "$L abi::" "$E async_echo_under_sqpoll"; do
     set -- $run; name=$(basename $1)-$2
@@ -177,7 +177,7 @@ cd /home/anvil && tar xzf tests.tgz && chmod +x out/*
 hard=$(ulimit -Hn); [ "$hard" = unlimited ] && hard=1048576; ulimit -n "$hard"
 sudo prlimit --pid $BASHPID --memlock=unlimited:unlimited
 {
-  uname -r; ldd --version | head -1; ls out
+  uname -r; ldd --version | head -1; sha256sum out/*
   L=$(ls out/ringline* | grep -v echo | head -1); E=out/echo
   for run in "$L conformance" "$L abi::" "$E async_echo_under_sqpoll"; do
     set -- $run; name=$(basename $1)-$2
@@ -195,3 +195,14 @@ exit 0
 type = "anvil-vm"
 mode = "stop"
 upload = true
+
+# Each payload exits 0 so the next VM still runs; fail the experiment here
+# if any test binary failed or a kernel's log is missing.
+[[jobs.steps]]
+type = "shell"
+command = '''
+ls run-*.log
+[ "$(ls run-*.log | wc -l)" -eq 4 ] || { echo "missing logs"; exit 1; }
+if grep -H 'RESULT .* exit=[^0]' run-*.log; then exit 1; fi
+echo ok
+'''

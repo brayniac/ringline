@@ -1,12 +1,16 @@
 //! Conformance tests for the kernel behaviour the receive design relies on
 //! (`docs/recv-incremental-ring-design.md`, "Kernel behaviour relied on").
 //!
-//! They drive the engine through [`Engine`] with plain sockets, so another
-//! engine can run them unchanged; the forced-async test is the exception
-//! and uses the io_uring engine's `push_async`. Tests of incremental rings
-//! return early on a kernel without them (`incremental_buffers` is
-//! `false`), where `incremental_buffers_matches_registration` in `ring.rs`
-//! checks the refusal instead.
+//! They drive the engine through [`Engine`] with plain sockets; the CQ
+//! overflow test also reads `UringEngine::cq_overflowed`. Tests of
+//! incremental rings return early on a kernel without them
+//! (`incremental_buffers` is `false`, which is a failure from 6.12), where
+//! `incremental_buffers_matches_registration` in `ring.rs` checks the
+//! refusal instead.
+//!
+//! Each test creates its provided ring before the engine, so the engine,
+//! and with it every armed receive, is dropped before the ring's memory is
+//! unmapped, including when an assertion fails.
 
 use std::io::Write;
 use std::net::{Shutdown, TcpListener, TcpStream};
@@ -19,6 +23,7 @@ use crate::backend::uring::abi::{RecvMsgOut, cqueue};
 use crate::backend::uring::ring::is_memlock_enomem;
 use crate::backend::uring::sqe::{Fd, Op, Sqe};
 use crate::config::ConfigBuilder;
+use crate::memlock::KernelVersion;
 
 type Cqe = (u64, i32, u32);
 
@@ -100,10 +105,20 @@ fn bytes(ring: &ProvidedBufRing, bid: u16, off: usize, len: usize) -> Vec<u8> {
 }
 
 /// Whether the kernel has incremental rings. A test that returns early on
-/// `false` prints so, since the harness reports it as passed.
+/// `false` prints so, since the harness reports it as passed. From 6.12 the
+/// kernel has them, so `false` there fails the test.
 fn incremental(engine: &ActiveEngine) -> bool {
     let inc = engine.incremental_buffers().expect("probe");
     if !inc {
+        let kernel = KernelVersion::current();
+        assert!(
+            kernel
+                < Some(KernelVersion {
+                    major: 6,
+                    minor: 12
+                }),
+            "incremental rings refused on {kernel:?}"
+        );
         eprintln!("skipped: the kernel has no incremental buffer rings");
     }
     inc
@@ -127,11 +142,11 @@ fn data(cqe: Cqe) -> (i32, Option<u16>, bool, bool, bool) {
 /// place.
 #[test]
 fn inc_completions_append_into_one_buffer() {
+    let ring = ProvidedBufRing::new(1, 1, 4096).expect("ring");
     let mut e = engine();
     if !incremental(&e) {
         return;
     }
-    let ring = ProvidedBufRing::new(1, 1, 4096).expect("ring");
     e.register_buf_ring(&ring, RingKind::Incremental)
         .expect("register");
     let (mut client, server) = pair();
@@ -157,11 +172,11 @@ fn inc_completions_append_into_one_buffer() {
 /// re-posted buffer is filled from its start.
 #[test]
 fn inc_buffer_used_up_is_not_written_again_until_posted() {
+    let mut ring = ProvidedBufRing::new(2, 1, 16).expect("ring");
     let mut e = engine();
     if !incremental(&e) {
         return;
     }
-    let mut ring = ProvidedBufRing::new(2, 1, 16).expect("ring");
     e.register_buf_ring(&ring, RingKind::Incremental)
         .expect("register");
     let (mut client, server) = pair();
@@ -192,8 +207,8 @@ fn inc_buffer_used_up_is_not_written_again_until_posted() {
 /// holds.
 #[test]
 fn plain_ring_without_buffers_ends_the_arm_with_enobufs() {
-    let mut e = engine();
     let ring = ProvidedBufRing::new(3, 1, 16).expect("ring");
+    let mut e = engine();
     e.register_buf_ring(&ring, RingKind::Plain)
         .expect("register");
     let (mut client, server) = pair();
@@ -213,11 +228,11 @@ fn plain_ring_without_buffers_ends_the_arm_with_enobufs() {
 #[test]
 fn sock_nonempty_marks_completions_with_data_left() {
     for kind in [RingKind::Plain, RingKind::Incremental] {
+        let ring = ProvidedBufRing::new(4, 4, 16).expect("ring");
         let mut e = engine();
         if kind == RingKind::Incremental && !incremental(&e) {
             continue;
         }
-        let ring = ProvidedBufRing::new(4, 4, 16).expect("ring");
         e.register_buf_ring(&ring, kind).expect("register");
         let (mut client, server) = pair();
         client.write_all(&[b'c'; 40]).expect("write");
@@ -234,60 +249,72 @@ fn sock_nonempty_marks_completions_with_data_left() {
     }
 }
 
+/// How `check_offset_order` drives the connections.
+struct OrderRun {
+    sq_entries: u32,
+    sqpoll: bool,
+    conns: usize,
+    /// Write once per connection before reaping anything, instead of 24
+    /// rounds reaped as they go.
+    burst: bool,
+    bufs: u16,
+    buf_size: u32,
+}
+
 /// Byte-verified order across connections sharing incremental buffers:
 /// the data offset is not in the CQE, so the reader derives it from the
-/// order completions are reaped in. `n` connections write stamped chunks;
-/// each completion's bytes must be the next bytes its connection sent.
-fn check_offset_order(mut e: ActiveEngine, conns: usize, burst: bool, push_async: bool) {
+/// order completions are reaped in. Connections write stamped chunks; each
+/// completion's bytes must be the next bytes its connection sent.
+fn check_offset_order(run: OrderRun) {
     const GROUP: u16 = 6;
-    const BUFS: u16 = 4;
-    const SIZE: u32 = 16 * 1024;
-    let mut ring = ProvidedBufRing::new(GROUP, BUFS, SIZE).expect("ring");
+    let mut ring = ProvidedBufRing::new(GROUP, run.bufs, run.buf_size).expect("ring");
+    let mut e = engine_with(run.sq_entries, run.sqpoll);
+    if !incremental(&e) {
+        return;
+    }
     e.register_buf_ring(&ring, RingKind::Incremental)
         .expect("register");
+    let conns = run.conns;
     let pairs: Vec<(TcpStream, TcpStream)> = (0..conns).map(|_| pair()).collect();
     let arm_conn = |e: &mut ActiveEngine, conn: usize| {
-        let sqe = Sqe::new(
-            Op::RecvMulti {
-                fd: Fd::Raw(pairs[conn].1.as_raw_fd()),
-                buf_group: GROUP,
-            },
-            conn as u64,
-        );
-        // Safety: a multishot recv references no caller memory.
-        unsafe {
-            if push_async {
-                e.push_async(&sqe)
-            } else {
-                e.push(&sqe)
-            }
-        }
-        .expect("push");
+        arm(e, &pairs[conn].1, GROUP, conn as u64);
     };
     for conn in 0..conns {
         arm_conn(&mut e, conn);
     }
     let mut order = OrderCheck {
         received: vec![0; conns],
-        offset: vec![0; BUFS as usize],
+        offset: vec![0; run.bufs as usize],
         verified: 0,
         completions: 0,
         arms_ended: 0,
     };
     let mut sent = vec![0usize; conns];
-    // A burst writes once per connection before anything is reaped: one
-    // completion each (writes on one connection would coalesce into one
-    // receive), more completions than a 64-entry CQ holds, and less data
-    // than the ring holds (4 × 16 KiB), so no buffer runs out.
-    let (rounds, span) = if burst { (1, 200) } else { (24, 3000) };
+    // A burst writes 1000–1199 bytes per connection, less in all than the
+    // ring holds. With 256-byte buffers each receive posts several
+    // completions in one task_work run, so the 64-entry CQ overflows even
+    // where the kernel runs at most 20 deferred task_work items per enter
+    // (6.13 and later).
+    let (rounds, base, span) = if run.burst {
+        (1, 1000, 200)
+    } else {
+        (24, 100, 3000)
+    };
+    let mut overflowed = false;
     for round in 0..rounds {
         for (conn, (client, _)) in pairs.iter().enumerate() {
-            let len = 100 + (conn * 977 + round * 313) % span;
+            let len = base + (conn * 977 + round * 313) % span;
             let chunk: Vec<u8> = (0..len).map(|k| stamp(conn, sent[conn] + k)).collect();
             (&*client).write_all(&chunk).expect("write");
             sent[conn] += len;
         }
-        if !burst {
+        if run.burst {
+            // Let every connection's data reach its socket, then run the
+            // queued task_work once without reaping.
+            std::thread::sleep(Duration::from_millis(50));
+            e.submit_and_get_events().expect("enter");
+            overflowed = e.cq_overflowed();
+        } else {
             let cqes = reap_for(&mut e, Duration::from_millis(5));
             for conn in order.check(&mut ring, cqes) {
                 arm_conn(&mut e, conn);
@@ -303,13 +330,12 @@ fn check_offset_order(mut e: ActiveEngine, conns: usize, burst: bool, push_async
         }
     }
     assert_eq!(order.received, sent);
-    if burst {
-        // More completions than the 64-entry CQ holds were pending at the
-        // first reap, and the order of the bytes holds. Whether an arm ends
-        // depends on the kernel: on 6.12 a multishot arm whose completion
-        // overflows the CQ ends (no `F_MORE`); on 7.1 none ended. Ended
-        // arms are re-armed above either way.
-        assert!(order.completions > 64, "{} completions", order.completions);
+    if run.burst {
+        // A completion that finds the CQ full ends its arm (no `F_MORE`)
+        // with data still queued, so the bytes after it arrive only through
+        // the re-arm above.
+        assert!(overflowed, "the CQ did not overflow");
+        assert!(order.arms_ended > 0, "no arm ended on overflow");
         eprintln!(
             "{} completions, {} arms ended",
             order.completions, order.arms_ended
@@ -376,44 +402,42 @@ impl OrderCheck {
 /// arrive.
 #[test]
 fn inc_offset_order_holds_across_connections() {
-    let e = engine();
-    if !incremental(&e) {
-        return;
-    }
-    check_offset_order(e, 8, false, false);
+    check_offset_order(OrderRun {
+        sq_entries: 256,
+        sqpoll: false,
+        conns: 8,
+        burst: false,
+        bufs: 4,
+        buf_size: 16 * 1024,
+    });
 }
 
-/// The same with a 16-entry SQ and 64-entry CQ, and 96 connections each
-/// writing once before any completion is reaped, so the CQ overflows.
+/// Row "CQ overflow": a 16-entry SQ and 64-entry CQ, 96 connections each
+/// writing once into 256-byte buffers before any completion is reaped. The
+/// CQ overflows, arms end, and the order holds across the re-arms.
 #[test]
-fn inc_offset_order_holds_with_a_small_cq() {
-    let e = engine_with(16, false);
-    if !incremental(&e) {
-        return;
-    }
-    check_offset_order(e, 96, true, false);
+fn inc_offset_order_holds_across_a_cq_overflow() {
+    check_offset_order(OrderRun {
+        sq_entries: 16,
+        sqpoll: false,
+        conns: 96,
+        burst: true,
+        bufs: 512,
+        buf_size: 256,
+    });
 }
 
-/// The same under SQPOLL.
+/// The same as `inc_offset_order_holds_across_connections`, under SQPOLL.
 #[test]
 fn inc_offset_order_holds_under_sqpoll() {
-    let e = engine_with(256, true);
-    if !incremental(&e) {
-        return;
-    }
-    check_offset_order(e, 8, false, false);
-}
-
-/// The same with every receive forced onto io-wq (`IOSQE_ASYNC`), which
-/// the driver does not set; the design assumes receives on an INC ring are
-/// not punted.
-#[test]
-fn inc_offset_order_holds_for_forced_async_receives() {
-    let e = engine();
-    if !incremental(&e) {
-        return;
-    }
-    check_offset_order(e, 8, false, true);
+    check_offset_order(OrderRun {
+        sq_entries: 256,
+        sqpoll: true,
+        conns: 8,
+        burst: false,
+        bufs: 4,
+        buf_size: 16 * 1024,
+    });
 }
 
 /// EOF on a partly used incremental buffer: the FIN ends the arm with 0
@@ -421,11 +445,11 @@ fn inc_offset_order_holds_for_forced_async_receives() {
 /// next connection's data lands after them.
 #[test]
 fn inc_eof_leaves_a_partly_used_buffer_posted() {
+    let ring = ProvidedBufRing::new(7, 1, 4096).expect("ring");
     let mut e = engine();
     if !incremental(&e) {
         return;
     }
-    let ring = ProvidedBufRing::new(7, 1, 4096).expect("ring");
     e.register_buf_ring(&ring, RingKind::Incremental)
         .expect("register");
     let (mut client, server) = pair();
@@ -456,11 +480,11 @@ fn inc_eof_leaves_a_partly_used_buffer_posted() {
 /// at the completion's offset in the buffer.
 #[test]
 fn inc_recvmsg_multishot_writes_each_message_at_its_offset() {
+    let ring = ProvidedBufRing::new(8, 1, 4096).expect("ring");
     let mut e = engine();
     if !incremental(&e) {
         return;
     }
-    let ring = ProvidedBufRing::new(8, 1, 4096).expect("ring");
     e.register_buf_ring(&ring, RingKind::Incremental)
         .expect("register");
     let (mut client, server) = pair();
@@ -474,8 +498,8 @@ fn inc_recvmsg_multishot_writes_each_message_at_its_offset() {
         },
         9,
     );
-    // Safety: `msghdr` outlives the arm, which this test cancels by
-    // unregistering and dropping the engine before returning.
+    // Safety: the kernel copies `msghdr` when it prepares the request; a
+    // multishot RECVMSG does not read it again.
     unsafe { e.push(&sqe) }.expect("push");
     let mut offset = 0usize;
     for m in [&b"hello"[..], b"world!"] {

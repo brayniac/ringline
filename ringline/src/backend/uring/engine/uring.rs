@@ -230,13 +230,11 @@ impl UringEngine {
         result
     }
 
-    /// Test-only: queue `sqe` with `IOSQE_ASYNC`, which punts it to io-wq.
-    ///
-    /// # Safety
-    /// As [`Engine::push`].
+    /// Test-only: whether the kernel holds completions on its overflow
+    /// list (`IORING_SQ_CQ_OVERFLOW`).
     #[cfg(test)]
-    pub(crate) unsafe fn push_async(&mut self, sqe: &Sqe) -> io::Result<()> {
-        unsafe { self.push_sqe128(sqe.encode().flags(Flags::ASYNC)) }
+    pub(crate) fn cq_overflowed(&mut self) -> bool {
+        self.ring.submission().cq_overflow()
     }
 
     /// Test-only: the ring's file descriptor, for raw registration calls.
