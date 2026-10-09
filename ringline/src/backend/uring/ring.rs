@@ -1,5 +1,5 @@
 use std::io;
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, RawFd};
 
 use io_uring::cqueue;
 use io_uring::squeue;
@@ -22,6 +22,78 @@ const FIXED_FILES_RELEASED_PER_FILE_SINCE: KernelVersion = KernelVersion {
     major: 6,
     minor: 13,
 };
+
+/// Ubuntu's 6.8 kernels (from 6.8.0-139) invert the check on the reserved
+/// words of `IORING_REGISTER_PBUF_RING`: a registration with them zeroed, as
+/// upstream kernels require, fails with `EINVAL`, and one with `resv[0]` set
+/// succeeds. The same is reported for `IORING_UNREGISTER_PBUF_RING` (#626).
+const PBUF_RESV_INVERTED_ON: KernelVersion = KernelVersion { major: 6, minor: 8 };
+
+/// Whether a provided-buffer-ring registration refused with `err` on
+/// `kernel` is retried with `resv[0]` set: only an `EINVAL` on 6.8. On any
+/// other kernel the `EINVAL` is returned unchanged.
+fn retry_with_resv_set(err: &io::Error, kernel: Option<KernelVersion>) -> bool {
+    err.raw_os_error() == Some(libc::EINVAL) && kernel == Some(PBUF_RESV_INVERTED_ON)
+}
+
+/// `struct io_uring_buf_reg`, which the `io-uring` crate fills with `resv`
+/// zeroed and does not let the caller set.
+#[repr(C)]
+struct BufReg {
+    ring_addr: u64,
+    ring_entries: u32,
+    bgid: u16,
+    flags: u16,
+    resv: [u64; 3],
+}
+
+const _: () = assert!(std::mem::size_of::<BufReg>() == 40);
+
+const IORING_REGISTER_PBUF_RING: libc::c_uint = 22;
+const IORING_UNREGISTER_PBUF_RING: libc::c_uint = 23;
+
+/// `io_uring_register(2)` for a provided buffer ring, with `resv[0]` set to
+/// `resv0`. Ringline passes 1 (see [`retry_with_resv_set`]); tests pass 0 to
+/// check the call against a kernel that requires zeroed reserved words.
+///
+/// # Safety
+///
+/// `opcode` must be `IORING_REGISTER_PBUF_RING` or
+/// `IORING_UNREGISTER_PBUF_RING`. For registration, `ring_addr` must point to
+/// a buffer ring of `ring_entries` entries that stays mapped until the group
+/// is unregistered or the io_uring instance is dropped.
+unsafe fn pbuf_ring_register(
+    fd: RawFd,
+    opcode: libc::c_uint,
+    ring_addr: u64,
+    ring_entries: u32,
+    bgid: u16,
+    resv0: u64,
+) -> io::Result<()> {
+    let reg = BufReg {
+        ring_addr,
+        ring_entries,
+        bgid,
+        flags: 0,
+        resv: [resv0, 0, 0],
+    };
+    // Safety: `reg` is a valid `io_uring_buf_reg` for the duration of the
+    // call; the caller upholds the contract on `ring_addr`.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_io_uring_register,
+            fd,
+            opcode,
+            &reg as *const BufReg,
+            1,
+        )
+    };
+    if rc < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
 
 /// The error for a refused provided-buffer-ring registration.
 fn provided_ring_failure(
@@ -127,6 +199,11 @@ pub struct Ring {
     /// What goes ahead of a connection's `Close` on this kernel. See
     /// [`close_lead_for`].
     close_lead: CloseLead,
+    /// The kernel accepted a provided buffer ring only with `resv[0]` set,
+    /// so later registrations use that form and unregistration tries it
+    /// first.
+    /// See [`retry_with_resv_set`].
+    pbuf_resv_set: bool,
     /// Test-only: number of upcoming `push_sqe`/`push_sqe128` calls that
     /// fail as if the SQ were still full after a submit. See
     /// [`Ring::force_push_failures`].
@@ -218,6 +295,7 @@ impl Ring {
             defer_taskrun: !config.sqpoll,
             fixed_fd_install,
             close_lead: Self::close_lead_from(config),
+            pbuf_resv_set: false,
             #[cfg(test)]
             forced_push_failures: 0,
             #[cfg(test)]
@@ -378,32 +456,100 @@ impl Ring {
     }
 
     /// Register the provided buffer ring with the kernel.
-    pub fn register_buf_ring(&self, provided: &ProvidedBufRing) -> Result<(), Error> {
-        // Safety: ring_addr points to valid mmap'd memory that outlives the registration.
+    ///
+    /// On a 6.8 kernel that refuses the zeroed reserved words with `EINVAL`,
+    /// retries once with `resv[0]` set; after that succeeds, later
+    /// registrations use only that form (#626).
+    pub fn register_buf_ring(&mut self, provided: &ProvidedBufRing) -> Result<(), Error> {
+        let (addr, entries, bgid) = (
+            provided.ring_addr(),
+            provided.ring_entries(),
+            provided.bgid(),
+        );
+        // Safety (every registration in this function): `addr` is
+        // `provided`'s mmap'd ring, mapped at the call. The `io-uring`
+        // crate's contract, which `pbuf_ring_register` repeats, asks for it
+        // to stay mapped until the group is unregistered or the io_uring
+        // instance is dropped. `Driver::run_shutdown` meets that. `Driver`'s
+        // error and panic exits, and the path after a failed unregister,
+        // unmap the ring while its group is still registered. That frees no
+        // memory the kernel reads. Registration pins the ring's pages
+        // (`io_pin_pages`, called from `io_uring/kbuf.c` or
+        // `io_uring/memmap.c`), and the kernel reads entries through its own
+        // mapping of those pages. The kernel unpins them only when the group
+        // is unregistered or the io_uring instance is freed. The buffers the
+        // entries point at (`buf_backing`) are a separate, unpinned
+        // allocation that the kernel writes through the user addresses in the
+        // entries; this argument does not cover them.
+        let first = if self.pbuf_resv_set {
+            unsafe { self.register_pbuf_resv_set(addr, entries, bgid) }
+        } else {
+            unsafe {
+                self.ring
+                    .submitter()
+                    .register_buf_ring_with_flags(addr, entries as u16, bgid, 0)
+            }
+        };
+        let result = match first {
+            Err(e) if !self.pbuf_resv_set && retry_with_resv_set(&e, KernelVersion::current()) => {
+                match unsafe { self.register_pbuf_resv_set(addr, entries, bgid) } {
+                    Ok(()) => {
+                        self.pbuf_resv_set = true;
+                        Ok(())
+                    }
+                    // Report the refusal of the standard form.
+                    Err(_) => Err(e),
+                }
+            }
+            other => other,
+        };
+        result.map_err(|e| {
+            provided_ring_failure(&e, bgid, entries, &crate::error::RingSetupProbe::read())
+        })
+    }
+
+    /// # Safety
+    ///
+    /// As [`pbuf_ring_register`].
+    unsafe fn register_pbuf_resv_set(&self, addr: u64, entries: u32, bgid: u16) -> io::Result<()> {
         unsafe {
-            self.ring
-                .submitter()
-                .register_buf_ring_with_flags(
-                    provided.ring_addr(),
-                    provided.ring_entries() as u16,
-                    provided.bgid(),
-                    0,
-                )
-                .map_err(|e| {
-                    provided_ring_failure(
-                        &e,
-                        provided.bgid(),
-                        provided.ring_entries(),
-                        &crate::error::RingSetupProbe::read(),
-                    )
-                })?;
+            pbuf_ring_register(
+                self.ring.as_raw_fd(),
+                IORING_REGISTER_PBUF_RING,
+                addr,
+                entries,
+                bgid,
+                1,
+            )
         }
-        Ok(())
     }
 
     /// Unregister the provided buffer ring from the kernel.
-    /// Must be called before the ring memory is munmap'd.
+    /// Call it before the ring memory is unmapped, as the `io-uring` crate's
+    /// contract requires; the Safety comment in [`Ring::register_buf_ring`]
+    /// says why the exits that skip it free no memory the kernel reads.
+    ///
+    /// After a registration needed `resv[0]` set, unregistration tries that
+    /// form first and falls back to the standard one on `EINVAL`, since only
+    /// the registration check is confirmed inverted (#626).
     pub fn unregister_buf_ring(&self, bgid: u16) -> io::Result<()> {
+        if self.pbuf_resv_set {
+            // Safety: unregistration reads no memory through `ring_addr`.
+            let resv = unsafe {
+                pbuf_ring_register(
+                    self.ring.as_raw_fd(),
+                    IORING_UNREGISTER_PBUF_RING,
+                    0,
+                    0,
+                    bgid,
+                    1,
+                )
+            };
+            match resv {
+                Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {}
+                other => return other,
+            }
+        }
         self.ring.submitter().unregister_buf_ring(bgid)?;
         Ok(())
     }
@@ -1589,6 +1735,87 @@ mod tests {
     fn online_cpus() -> u32 {
         // SAFETY: sysconf has no preconditions.
         unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) as u32 }
+    }
+
+    /// The `resv[0]` retry (#626) runs only for `EINVAL` on 6.8.
+    #[test]
+    fn resv_retry_only_for_einval_on_6_8() {
+        let k = |major, minor| Some(KernelVersion { major, minor });
+        let einval = io::Error::from_raw_os_error(libc::EINVAL);
+        let enomem = io::Error::from_raw_os_error(libc::ENOMEM);
+        assert!(retry_with_resv_set(&einval, k(6, 8)));
+        assert!(!retry_with_resv_set(&enomem, k(6, 8)));
+        for kernel in [k(6, 1), k(6, 7), k(6, 9), k(6, 12), k(7, 1), None] {
+            assert!(!retry_with_resv_set(&einval, kernel), "{kernel:?}");
+        }
+    }
+
+    /// Two provided buffer rings register and unregister on the running
+    /// kernel, as a worker with UDP does. On a kernel other than 6.8 the
+    /// standard form is used throughout.
+    #[test]
+    fn provided_rings_register_and_unregister() {
+        // Declared before the ring, so they are unmapped after it drops.
+        let tcp = ProvidedBufRing::new(5, 8, 4096).expect("tcp ring");
+        let udp = ProvidedBufRing::new(6, 8, 4096).expect("udp ring");
+        let mut ring = ring_with(None);
+        ring.register_buf_ring(&tcp).expect("register tcp ring");
+        ring.register_buf_ring(&udp).expect("register udp ring");
+        if KernelVersion::current() != Some(PBUF_RESV_INVERTED_ON) {
+            assert!(!ring.pbuf_resv_set);
+        }
+        ring.unregister_buf_ring(5).expect("unregister tcp ring");
+        ring.unregister_buf_ring(6).expect("unregister udp ring");
+        // Unregistered, so the group can be registered again.
+        ring.register_buf_ring(&tcp)
+            .expect("register tcp ring again");
+        ring.unregister_buf_ring(5)
+            .expect("unregister tcp ring again");
+    }
+
+    /// The raw `io_uring_register` call behind the `resv[0]` retry (#626)
+    /// registers, unregisters and re-registers a ring, in whichever form the
+    /// running kernel accepts: zeroed reserved words, or on a 6.8 kernel that
+    /// refuses those, `resv[0]` set. Where zeroed words are accepted, a
+    /// registration with `resv[0]` set is refused. A correct kernel refuses a
+    /// nonzero word in any slot, so this cannot tell which slot `resv0` is
+    /// written to; the size assertion on `BufReg` and its field order cover
+    /// that. Unregistration is checked in the same form as registration,
+    /// which is stricter than `unregister_buf_ring`'s fallback; Ubuntu
+    /// 6.8.0-142 accepts `resv[0]` set for both.
+    #[test]
+    fn raw_pbuf_registration_round_trips() {
+        // Declared before the ring, so it is unmapped after the ring drops.
+        let provided = ProvidedBufRing::new(7, 8, 4096).expect("provided ring");
+        let ring = ring_with(None);
+        let fd = ring.ring.as_raw_fd();
+        let (addr, entries) = (provided.ring_addr(), provided.ring_entries());
+        // Safety: `provided` outlives the ring and so every registration.
+        unsafe {
+            let resv0 = match pbuf_ring_register(fd, IORING_REGISTER_PBUF_RING, addr, entries, 7, 0)
+            {
+                Ok(()) => 0,
+                Err(e) if retry_with_resv_set(&e, KernelVersion::current()) => {
+                    pbuf_ring_register(fd, IORING_REGISTER_PBUF_RING, addr, entries, 7, 1)
+                        .expect("register with resv[0] set");
+                    1
+                }
+                Err(e) => panic!("register: {e}"),
+            };
+            pbuf_ring_register(fd, IORING_UNREGISTER_PBUF_RING, 0, 0, 7, resv0)
+                .expect("unregister");
+            pbuf_ring_register(fd, IORING_REGISTER_PBUF_RING, addr, entries, 7, resv0)
+                .expect("register again");
+            if resv0 == 0 {
+                assert_eq!(
+                    pbuf_ring_register(fd, IORING_REGISTER_PBUF_RING, addr, entries, 8, 1)
+                        .map_err(|e| e.raw_os_error()),
+                    Err(Some(libc::EINVAL))
+                );
+            }
+            pbuf_ring_register(fd, IORING_UNREGISTER_PBUF_RING, 0, 0, 7, resv0)
+                .expect("unregister");
+        }
     }
 
     /// The transient-ENOMEM check matches the messages ring setup and
