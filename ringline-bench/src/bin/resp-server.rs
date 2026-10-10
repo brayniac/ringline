@@ -280,6 +280,22 @@ mod ringline_arm {
             .launch::<Handler>()
             .expect("launch");
         eprintln!("resp-server: ready (ringline x{})", args.workers);
+        // Which receive tier the workers selected, and how often arms end at
+        // their byte limit, so an A/B of the limit can show it was in effect.
+        std::thread::spawn(|| {
+            use ringline::metrics::{RECV_RING, recv_ring};
+            loop {
+                let v = |i| RECV_RING.value(i).unwrap_or(0);
+                eprintln!(
+                    "resp-server: recv_ring incremental={} plain={} limited={} limit_reached={}",
+                    v(recv_ring::INCREMENTAL),
+                    v(recv_ring::PLAIN),
+                    v(recv_ring::LIMITED),
+                    v(recv_ring::LIMIT_REACHED)
+                );
+                std::thread::sleep(std::time::Duration::from_secs(10));
+            }
+        });
         for h in handles {
             let _ = h.join();
         }
