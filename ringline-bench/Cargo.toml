@@ -29,6 +29,12 @@ path = "src/bin/client.rs"
 name = "connect-bench"
 path = "src/bin/connect-bench.rs"
 
+# RESP GET/SET server in three runtime arms (measurement 9 of
+# docs/io-api-redesign.md). Its own binary so the echo harness is untouched.
+[[bin]]
+name = "resp-server"
+path = "src/bin/resp-server.rs"
+
 [[bin]]
 name = "close-latency"
 path = "src/bin/close-latency.rs"
