@@ -695,3 +695,66 @@ fn probe_multishot_total_limit() {
         }
     }
 }
+
+/// Probe, not a contract: does a multishot total limit bound the number of
+/// ring buffers an arm takes when segments are small? 64 x 64 B ring, the
+/// arm goes in first, then 40 writes of 4 B each, 3 ms apart, with a 128 B
+/// limit.
+#[test]
+#[ignore = "probe"]
+fn probe_multishot_limit_small_writes() {
+    eprintln!("PROBE kernel {:?}", KernelVersion::current());
+    for kind in [RingKind::Plain, RingKind::Incremental] {
+        for bundle in [false, true] {
+            let ring = ProvidedBufRing::new(9, 64, 64).expect("ring");
+            let mut e = engine();
+            if kind == RingKind::Incremental && !incremental(&e) {
+                continue;
+            }
+            e.register_buf_ring(&ring, kind).expect("register");
+            let (mut client, server) = pair();
+            let sqe = Sqe::new(
+                Op::RecvMultiLimit {
+                    fd: Fd::Raw(server.as_raw_fd()),
+                    buf_group: 9,
+                    per_trigger: 0,
+                    total: 128,
+                    bundle,
+                },
+                1,
+            );
+            // Safety: a buffer-select recv references no caller memory.
+            unsafe { e.push(&sqe) }.expect("push");
+            e.submit_and_get_events().expect("enter");
+            let writer = std::thread::spawn(move || {
+                for i in 0..40u8 {
+                    std::thread::sleep(Duration::from_millis(3));
+                    let _ = client.write_all(&[i; 4]);
+                }
+                client
+            });
+            let cqes = reap_for(&mut e, Duration::from_millis(400));
+            let _client = writer.join();
+            let mut sum = 0i64;
+            let mut bids = std::collections::BTreeSet::new();
+            let mut ended = false;
+            for c in &cqes {
+                let (res, bid, _bm, more, _ne) = data(*c);
+                if res > 0 {
+                    sum += res as i64;
+                }
+                if let Some(b) = bid {
+                    bids.insert(b);
+                }
+                ended |= !more;
+            }
+            eprintln!(
+                "PROBE small {kind:?} bundle={bundle} limit=128: completions={} bytes={sum} \
+                 distinct_bids={} ended={ended}",
+                cqes.len(),
+                bids.len()
+            );
+            let _ = e.unregister_buf_ring(9);
+        }
+    }
+}
