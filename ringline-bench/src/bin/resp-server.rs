@@ -47,6 +47,10 @@ struct Args {
     /// ringline only: incremental provided-buffer ring.
     #[arg(long)]
     recv_incremental: bool,
+    /// ringline only: provided receive buffers per worker (16 KiB each);
+    /// 0 keeps the default.
+    #[arg(long, default_value_t = 0)]
+    recv_buffers: u16,
     /// Send GET values of at least this many bytes without copying them
     /// (ringline: `send_parts` guard; tokio: `write_vectored`). 0 = copy all.
     #[arg(long, default_value_t = 0)]
@@ -79,6 +83,7 @@ fn main() {
         args.stream_sets,
         args.addr
     );
+    diag::spawn(matches!(args.runtime, Runtime::Ringline));
     match args.runtime {
         Runtime::Ringline => ringline_arm::run(&args),
         Runtime::TokioPc => tokio_pc::run(args.addr, args.workers, args.opts()),
@@ -123,6 +128,83 @@ fn reuseport_listener(addr: SocketAddr) -> std::io::Result<std::net::TcpListener
     Ok(l)
 }
 
+/// Fairness and backpressure diagnostics, logged every 10 s.
+mod diag {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::sync::{Arc, Mutex};
+
+    pub static CONNS: Mutex<Vec<Arc<AtomicU64>>> = Mutex::new(Vec::new());
+    pub static BACKPRESSURED: AtomicU64 = AtomicU64::new(0);
+    pub static BP_MAX_US: AtomicU64 = AtomicU64::new(0);
+
+    pub fn register() -> Arc<AtomicU64> {
+        let c = Arc::new(AtomicU64::new(0));
+        CONNS.lock().unwrap().push(c.clone());
+        c
+    }
+
+    pub fn note_wait(us: u64) {
+        BACKPRESSURED.fetch_add(1, Relaxed);
+        BP_MAX_US.fetch_max(us, Relaxed);
+    }
+
+    pub fn spawn(ringline: bool) {
+        std::thread::spawn(move || {
+            // Keyed by counter address. A connection whose task has ended
+            // dropped its handle, so only the registry holds the counter;
+            // it is counted for the interval it closed in and then removed.
+            let mut prev: std::collections::HashMap<usize, u64> = Default::default();
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(10));
+                let mut next = std::collections::HashMap::new();
+                let mut d: Vec<u64> = Vec::new();
+                CONNS.lock().unwrap().retain(|c| {
+                    let key = Arc::as_ptr(c) as usize;
+                    let v = c.load(Relaxed);
+                    d.push(v - prev.get(&key).copied().unwrap_or(0));
+                    let open = Arc::strong_count(c) > 1;
+                    if open {
+                        next.insert(key, v);
+                    }
+                    open
+                });
+                prev = next;
+                d.sort_unstable();
+                let q = |f: f64| {
+                    d.get(((d.len() as f64 - 1.0) * f) as usize)
+                        .copied()
+                        .unwrap_or(0)
+                };
+                let zero = d.iter().filter(|&&v| v == 0).count();
+                let mut line = format!(
+                    "diag: conns={} ops/conn/10s min={} p1={} p10={} p50={} max={} zero={} backpressured={} bp_max_us={}",
+                    d.len(),
+                    q(0.0),
+                    q(0.01),
+                    q(0.10),
+                    q(0.50),
+                    q(1.0),
+                    zero,
+                    BACKPRESSURED.swap(0, Relaxed),
+                    BP_MAX_US.swap(0, Relaxed)
+                );
+                if ringline {
+                    use ringline::metrics::{POOL, pool};
+                    let v = |i| POOL.value(i).unwrap_or(0);
+                    line += &format!(
+                        " ring_empty={} recv_parked={} recv_fallback={} send_exhausted={}",
+                        v(pool::BUFFER_RING_EMPTY),
+                        v(pool::RECV_PARKED),
+                        v(pool::RECV_FALLBACK),
+                        v(pool::SEND_EXHAUSTED)
+                    );
+                }
+                eprintln!("{line}");
+            }
+        });
+    }
+}
+
 mod ringline_arm {
     use super::*;
     use ringline::{
@@ -148,8 +230,12 @@ mod ringline_arm {
     /// batch is refused.
     async fn flush(tx: &mut ringline::SendHalf, out: &mut resp::Out) -> bool {
         if out.vals.is_empty() {
-            let ok =
-                tx.send_nowait(&out.buf).is_ok() || tx.send_backpressured(&out.buf).await.is_ok();
+            let ok = tx.send_nowait(&out.buf).is_ok() || {
+                let t = std::time::Instant::now();
+                let r = tx.send_backpressured(&out.buf).await.is_ok();
+                crate::diag::note_wait(t.elapsed().as_micros() as u64);
+                r
+            };
             out.clear();
             return ok;
         }
@@ -195,6 +281,7 @@ mod ringline_arm {
                 let ctx = conn.as_conn();
                 let (mut tx, mut rx) = conn.split();
                 let mut out = resp::Out::default();
+                let served = crate::diag::register();
                 loop {
                     let mut bad = false;
                     let mut body: Option<(Vec<u8>, usize)> = None;
@@ -252,8 +339,11 @@ mod ringline_arm {
                         val.truncate(len);
                         resp::store_set(key, bytes::Bytes::from(val), &mut out);
                     }
-                    if !out.is_empty() && !flush(&mut tx, &mut out).await {
-                        break;
+                    if !out.is_empty() {
+                        served.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if !flush(&mut tx, &mut out).await {
+                            break;
+                        }
                     }
                 }
             }
@@ -265,16 +355,18 @@ mod ringline_arm {
 
     pub fn run(args: &Args) {
         OPTS.set(args.opts()).ok();
-        let config = ConfigBuilder::new()
+        let mut builder = ConfigBuilder::new()
             .workers(args.workers)
             .pin_to_core(true)
             .sq_entries(4096)
             .max_connections(8192)
             .send_pool(16384, 16384)
             .recv_incremental(args.recv_incremental)
-            .recv_on_demand(args.recv_on_demand)
-            .build()
-            .expect("valid config");
+            .recv_on_demand(args.recv_on_demand);
+        if args.recv_buffers != 0 {
+            builder = builder.recv_buffer(args.recv_buffers, 16384);
+        }
+        let config = builder.build().expect("valid config");
         let (_shutdown, handles) = RinglineBuilder::new(config)
             .bind(args.addr)
             .launch::<Handler>()
@@ -381,6 +473,7 @@ mod tokio_pc {
     async fn serve(mut stream: tokio::net::TcpStream, opts: resp::Opts) {
         let mut inbuf = BytesMut::with_capacity(64 << 10);
         let mut out = resp::Out::default();
+        let served = crate::diag::register();
         loop {
             match stream.read_buf(&mut inbuf).await {
                 Ok(0) | Err(_) => return,
@@ -412,8 +505,11 @@ mod tokio_pc {
                     Err(()) => return,
                 }
             }
-            if !out.is_empty() && !flush(&mut stream, &mut out).await {
-                return;
+            if !out.is_empty() {
+                served.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if !flush(&mut stream, &mut out).await {
+                    return;
+                }
             }
             if inbuf.capacity() - inbuf.len() < 16 << 10 {
                 inbuf.reserve(64 << 10);

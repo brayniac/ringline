@@ -1,10 +1,11 @@
-# Protocol-server comparison (measurements 8 and 9 of
-# docs/io-api-redesign.md). resp-server on hv02 (z1, 24 vCPU, 8 workers),
-# cachecannon on hv01 (z2, 56 vCPU). One arm per experiment, all 12 cells
-# per experiment; submit arms interleaved with at least four of each and
-# discard the first round. rezolus records the server unit.
-#   arm = ringline | ringline-ondemand | tokio-pc | tokio-uring
-name = "ringline resp-arms {arm} rep{rep} server={server_image}"
+# Tail-latency rerun of the 2048-connection cells of resp-arms.toml, with
+# the client's send pool and slab sized from its connections per worker
+# and RLIMIT_MEMLOCK raised on both guests, so no client connection goes
+# idle on a refused or failed zero-copy send. resp-server logs per-connection
+# fairness and pool counters every 10 s (diag lines in its unit log).
+# resp-server on z1 (24 vCPU, 8 workers), cachecannon on z2 (56 vCPU).
+#   arm = ringline | ringline-ondemand | tokio-pc
+name = "ringline resp-tail {arm} rep{rep}"
 
 [params]
 bins_artifact = "REPLACE-WITH-ARTIFACT-ID"
@@ -19,7 +20,7 @@ port          = "6379"
 workers       = "8"
 client_threads = "16"
 warmup        = "10s"
-duration      = "20s"
+duration      = "60s"
 
 [[jobs]]
 name = "server"
@@ -122,6 +123,8 @@ set -uo pipefail
 cd /home/anvil
 mkdir -p results
 ulimit -n 1048576
+ulimit -l unlimited 2>/dev/null || sudo prlimit --memlock=unlimited:unlimited --pid $$
+echo "client-limits memlock=$(ulimit -l) nofile=$(ulimit -n)"
 for i in $(seq 1 120); do
   (exec 3<>/dev/tcp/{server_ip}/{port}) 2>/dev/null && { exec 3>&-; echo "server reachable after ${i}s"; break; }
   sleep 1
@@ -129,7 +132,7 @@ done
 for vlen in 64 4096 65536; do
   case $vlen in 64) keys=100000;; 4096) keys=20000;; 65536) keys=2000;; esac
   for depth in 1 16; do
-    for conns in 64 2048; do
+    for conns in 2048; do
       cell="v${vlen}-d${depth}-c${conns}"
       cat > results/$cell.toml <<CFG
 [general]
