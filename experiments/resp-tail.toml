@@ -12,6 +12,9 @@
 #       | ringline-rb512 / ringline-rb1024 (512 or 1024 receive buffers)
 #       | ringline-rb-run (2048 receive buffers; a multi-slot send goes out as
 #         one coalesced sendmsg; exp build only)
+#       | ringline-early (256 receive buffers; bids the task pass released are
+#         committed before the next flush; exp build only)
+#       | ringline-early-run (early commit plus the coalesced send)
 #   depths: the pipeline depths to run (default "1 16")
 name = "ringline resp-tail {arm} rep{rep}"
 
@@ -64,6 +67,8 @@ case "{arm}" in
   ringline-rb512)    args="--runtime ringline --recv-buffers 512" ;;
   ringline-rb1024)   args="--runtime ringline --recv-buffers 1024" ;;
   ringline-rb-run)   args="--runtime ringline --recv-buffers 2048"; echo "export RINGLINE_EXP_SEND_RUN=1" > /home/anvil/env.sh ;;
+  ringline-early)    args="--runtime ringline"; echo "export RINGLINE_EXP_EARLY_REPLENISH=1" > /home/anvil/env.sh ;;
+  ringline-early-run) args="--runtime ringline"; printf 'export RINGLINE_EXP_EARLY_REPLENISH=1\nexport RINGLINE_EXP_SEND_RUN=1\n' > /home/anvil/env.sh ;;
   tokio-pc)          args="--runtime tokio-pc" ;;
   tokio-uring)       args="--runtime tokio-uring" ;;
   *) echo "BAD ARM {arm}"; exit 1 ;;

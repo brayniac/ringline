@@ -513,6 +513,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
             // exp/lendcap-ab: submit sends the pass queued whole.
             self.drain_send_retries();
+            self.exp_early_replenish();
 
             // Flush any SQEs enqueued by poll_ready_tasks (e.g., client sends).
             // flush() does two things:
@@ -542,6 +543,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 diag_tasks_fp += self.executor.ready_queue.len() as u64;
                 self.poll_ready_tasks();
                 self.drain_send_retries();
+                self.exp_early_replenish();
                 let _ = self.driver.ring.flush();
             }
 
@@ -1014,6 +1016,18 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// Also called from the run loop right before the blocking wait: bids
     /// released by tasks during the poll pass would otherwise sit uncommitted
     /// (and starved connections parked) until the next unrelated CQE.
+    /// exp/lendcap-ab: with RINGLINE_EXP_EARLY_REPLENISH set, commit the
+    /// bids the poll pass released before the flush that issues the next
+    /// receives.
+    fn exp_early_replenish(&mut self) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *ON.get_or_init(|| std::env::var_os("RINGLINE_EXP_EARLY_REPLENISH").is_some())
+            && !self.driver.pending_replenish.is_empty()
+        {
+            self.driver.release_pending();
+        }
+    }
+
     fn flush_replenish_and_rearm(&mut self) {
         self.rearm_throttled_recvs();
         // Starved connections holding a zero-copy single-buffer hold
