@@ -267,7 +267,7 @@ Backpressure is bounded and explicit at each layer:
 An application's connection future returning is a close request, not permission
 to discard queued bytes. The io_uring driver marks `close_pending`, drains
 queued and in-flight sends in order, waits for any forwarded-buffer write,
-cancels an armed multishot receive, and only then finalizes close. Stale CQEs
+cancels an armed receive, and only then finalizes close. Stale CQEs
 are normal during teardown and must release only their own backing without
 touching a reused connection.
 

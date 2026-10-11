@@ -111,6 +111,17 @@ fn idle_peer_is_throttled_alone(mode: u8, incremental: bool, reserve: u32) {
 /// `idle_peer_is_throttled_alone` with `peers` idle connections in mode
 /// `mode`, each flooded in turn.
 fn idle_peers_are_throttled_alone(mode: u8, incremental: bool, reserve: u32, peers: usize) {
+    idle_peers_are_throttled_alone_with(mode, incremental, reserve, peers, false);
+}
+
+/// `idle_peers_are_throttled_alone` with `recv_multishot` set as given.
+fn idle_peers_are_throttled_alone_with(
+    mode: u8,
+    incremental: bool,
+    reserve: u32,
+    peers: usize,
+    multishot: bool,
+) {
     const LIMIT: u64 = 64 << 20;
     let config = ConfigBuilder::new()
         .workers(1)
@@ -120,6 +131,7 @@ fn idle_peers_are_throttled_alone(mode: u8, incremental: bool, reserve: u32, pee
         .recv_buffer(16, 64 << 10)
         .recv_segment_reserve(reserve)
         .recv_incremental(incremental)
+        .recv_multishot(multishot)
         .build()
         .expect("config");
     let (shutdown, handles) = RinglineBuilder::new(config)
@@ -206,6 +218,16 @@ fn two_unread_echoes_or_forwards_are_throttled_alone() {
 fn unread_echoes_and_forwards_are_throttled_alone_on_a_plain_ring() {
     for mode in *b"DF" {
         idle_peers_are_throttled_alone(mode, false, 0, 3);
+    }
+}
+
+/// With `recv_multishot`, an unread direct-echo or recv-forward connection
+/// is still throttled alone: it arms one-shot recvs once it enters that
+/// mode (#638).
+#[test]
+fn unread_echoes_and_forwards_are_throttled_alone_with_multishot() {
+    for mode in *b"DF" {
+        idle_peers_are_throttled_alone_with(mode, false, 0, 3, true);
     }
 }
 

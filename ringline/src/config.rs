@@ -169,10 +169,8 @@ pub struct Config {
     /// `recv_incremental`), the runtime stops its recv (a one-shot recv is not
     /// re-armed, a multishot one is cancelled) so its TCP receive window closes
     /// and only its peer stops sending; the recv is re-armed once the hold
-    /// drains below the cap. A recv-forward or direct-echo send
-    /// waiting on a peer that does not read still holds the ring buffers it
-    /// carries, uncounted: without `recv_incremental` one such connection can
-    /// empty the ring, and with it several can (#638).
+    /// drains below the cap. The buffers a recv-forward or direct-echo
+    /// connection's pending sends carry count toward its cap (#638).
     ///
     /// Larger values allow more recv in flight (higher single-forward throughput)
     /// at the cost of more pinned ring buffers / held heap under a slow sink;
@@ -757,7 +755,7 @@ impl Config {
     }
 }
 
-/// Configuration for the provided buffer ring (multishot recv).
+/// Configuration for the provided buffer ring (TCP recv).
 #[derive(Clone)]
 pub(crate) struct RecvBufferConfig {
     /// Number of buffers in the ring (must be power of 2).
@@ -1033,11 +1031,14 @@ impl ConfigBuilder {
     /// long as the socket has data, so with many connections and large
     /// messages some connections can hold the ring's buffers while others
     /// get none, and those wait until buffers return. A multishot receive
-    /// saves one SQE per received buffer.
+    /// saves one SQE per received buffer, and the wait for the next arm's
+    /// submission: one connection streaming large messages receives about a
+    /// fifth less per second with one-shot receives.
     ///
     /// Direct-echo and recv-forward connections always arm one-shot
-    /// receives. io_uring only; the mio backend reads on readiness.
-    /// **Default: false**.
+    /// receives. With the `timestamps` feature and `timestamps(true)`, TCP
+    /// receives are multishot `recvmsg` either way. io_uring only; the mio
+    /// backend reads on readiness. **Default: false**.
     pub fn recv_multishot(mut self, enabled: bool) -> Self {
         self.config.recv_multishot = enabled;
         self
@@ -1159,9 +1160,8 @@ impl ConfigBuilder {
     /// below the cap. A recv-forward or direct-echo hold, and without
     /// `recv_incremental` a segment hold, is held to at most a quarter of the
     /// recv ring's buffers, since each such entry can pin one.
-    /// A recv-forward or direct-echo send waiting on a peer that does not read
-    /// holds the buffers it carries uncounted: without `recv_incremental` one
-    /// such connection can empty the ring, and with it several can (#638).
+    /// The buffers a recv-forward or direct-echo connection's pending sends
+    /// carry count toward its cap (#638).
     /// Larger values allow more recv in flight at the cost of more held
     /// buffers or copies under a slow consumer: with `recv_incremental` a
     /// segment hold can reach this many copies of up to one buffer each

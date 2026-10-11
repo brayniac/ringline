@@ -342,9 +342,12 @@ pub mod pool {
     /// generates them; tune `tcp_*_buffer_size` or apply application-level
     /// backpressure.
     pub const SEND_EAGAIN: usize = 3;
-    /// A connection's multishot recv completed with `ENOBUFS` and the
-    /// connection was parked until provided-ring buffers are returned
-    /// (see `recv_starved` in the uring driver). While parked the socket
+    /// A connection's recv completed with `ENOBUFS` and the connection was
+    /// parked until provided-ring buffers are returned (see `recv_starved` in
+    /// the uring driver). A one-shot recv (the default) is armed once per
+    /// received buffer, so under ring pressure this counts per buffer a
+    /// connection tried to receive, where a multishot recv counts once per
+    /// arm. While parked the socket
     /// is not being drained, so the kernel receive buffer fills and the
     /// advertised TCP window closes — sustained counts with large
     /// payloads mean single responses exceed the provided ring
@@ -359,8 +362,9 @@ pub mod pool {
     /// A connection holding received data (a `forward_to` source, a segment
     /// reader, a recv-forward or direct-echo connection) reached its hold cap
     /// (`forward_hold_cap`, lowered as `ConfigBuilder::forward_hold_cap` says)
-    /// and had its multishot recv cancelled (TCP window closed) to backpressure
-    /// its peer — re-armed once the hold drains below the cap. Sustained counts
+    /// and had its recv stopped (a one-shot recv not re-armed, a multishot one
+    /// cancelled), so its TCP window closes and its peer is backpressured;
+    /// the recv is re-armed once the hold drains below the cap. Sustained counts
     /// mean a consumer is slower than its peer for large
     /// objects; unlike `RECV_PARKED` (ENOBUFS starvation) this is *deliberate*
     /// per-connection backpressure that prevents one slow consumer from depleting

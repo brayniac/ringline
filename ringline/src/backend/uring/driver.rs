@@ -153,6 +153,10 @@ impl Driver {
     /// taking buffers. Its `-ECANCELED` completion re-arms the recv
     /// (`rearm_multishot_if_idle`), which `submit_tcp_recv` makes one-shot.
     pub(crate) fn cancel_recv_for_single(&mut self, conn_index: u32) {
+        // Without `recv_multishot` the armed recv is already one-shot.
+        if !self.recv_multishot {
+            return;
+        }
         let armed = self
             .connections
             .get(conn_index)
@@ -682,6 +686,10 @@ pub(crate) struct Driver {
     /// re-arms once their hold drains (`rearm_throttled_recvs`). May hold a
     /// connection whose flag was cleared since; the next pass drops it.
     pub(crate) throttled_recvs: Vec<u32>,
+    /// `(conn_index, generation)` of connections whose end-of-completion
+    /// recv re-arm could not be pushed (the submit that makes SQ room
+    /// failed); `drain_recv_rearm_retries` re-arms them on the next pass.
+    pub(crate) recv_rearm_retries: Vec<(u32, u32)>,
     /// Per-connection cap on held receive entries (`Config::forward_hold_cap`);
     /// `throttle_if_held` applies it, lowered to a quarter of the ring.
     pub(crate) forward_hold_cap: usize,
@@ -1350,6 +1358,7 @@ impl Driver {
             forward_recv_active: vec![false; config.max_connections as usize],
             forward_hold_throttled: vec![false; config.max_connections as usize],
             throttled_recvs: Vec::new(),
+            recv_rearm_retries: Vec::new(),
             forward_hold_cap: config.forward_hold_cap,
             recv_multishot: config.recv_multishot,
             accept_rx,

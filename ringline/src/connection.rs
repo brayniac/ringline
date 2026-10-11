@@ -31,11 +31,12 @@ impl fmt::Display for PeerAddr {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecvArm {
     /// Nothing armed: slot inactive, connect in flight, recv cancelled, or
-    /// the multishot self-terminated and has not been re-armed.
+    /// the recv ended and has not been re-armed.
     Idle,
     /// Recv with the provided buffer ring (io_uring) / readable interest
-    /// (mio). On io_uring each arm is multishot, or one-shot for a
-    /// connection whose completions stay held (`Driver::recv_single`).
+    /// (mio). On io_uring each arm is one-shot by default and multishot with
+    /// `recv_multishot(true)`; a direct-echo or recv-forward connection
+    /// always arms one-shot (`Driver::recv_single`).
     Multi,
     /// Multishot recvmsg with cmsg timestamps (io_uring, `timestamps`).
     #[cfg(feature = "timestamps")]
