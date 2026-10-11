@@ -25,7 +25,7 @@ follow):
 | Step | epoll loop (mio backend) | io_uring loop |
 |---|---|---|
 | Learn the request arrived | share of one `epoll_wait` | share of one `io_uring_enter` — the CQE is already in the completion ring when it returns |
-| Read the request bytes | 1 `read()` — **plus 1 more** `read()` returning `EAGAIN` to finish the edge-triggered drain | **0** — the multishot-recv CQE *delivers a filled buffer*; no read call exists |
+| Read the request bytes | 1 `read()` — **plus 1 more** `read()` returning `EAGAIN` to finish the edge-triggered drain | **0** — the recv CQE *delivers a filled buffer*; no read call exists |
 | Send the response | 1 `writev()` | **0 dedicated** — a send SQE rides the iteration's shared enter |
 | Confirm the send completed | (return value of `writev`) | **0** — send CQE, drained in the same iteration |
 | Arm/fire a timeout | folded into the `epoll_wait` timeout | **0** — timeout SQE/CQE |
@@ -73,7 +73,7 @@ Everything a request needs rides inside those batched enters as SQEs and CQEs:
 
 | Operation | Syscalls per event | Mechanism |
 |---|---:|---|
-| Receive a message | **0** | Multishot recv (`opcode::RecvMulti` + provided buffers) is armed once per connection; the kernel keeps posting CQEs with filled buffers indefinitely. Re-arm happens only after `ENOBUFS` parking or cancellation, and is itself an SQE. |
+| Receive a message | **0** | By default a TCP connection arms a one-shot buffer-select recv (`Op::RecvSelect` + provided buffers) and re-arms it when it completes: 1 SQE per received buffer, submitted by the iteration's shared enter. With `ConfigBuilder::recv_multishot(true)` a multishot recv (`opcode::RecvMulti`) is armed once and the kernel keeps posting CQEs with filled buffers; re-arm happens after `ENOBUFS` parking, cancellation, or a completion that ends the arm (CQ overflow). Direct-echo and recv-forward connections arm one-shot recvs in either mode (`Driver::recv_single`, #638). With the `timestamps` feature configured, every TCP receive is a multishot `recvmsg`, including those connections'. |
 | Send a response | **0 dedicated** | `send()`/`send_nowait()` push an `opcode::Send` SQE (`MSG_WAITALL`, so the kernel retries short sends in place); coalesced sends are one `opcode::SendMsg` SQE gathering several queued sends; zero-copy sends are `opcode::SendMsgZc`. All are submitted by the iteration's shared enter. |
 | Zero-copy notification | **0** | The "DMA done, guard can drop" signal is a second CQE on the same SQE, not a syscall. |
 | Timer arm/fire | **0** | Timeout SQE / timeout CQE. |

@@ -22,6 +22,7 @@ struct ProxyCfg {
     conn_chunk_size: usize,
     pin_to_core: bool,
     prefault_buffers: bool,
+    recv_multishot: bool,
     api: ProxyApi,
     metrics_out: Option<std::path::PathBuf>,
 }
@@ -59,6 +60,7 @@ struct EchoCfg {
     conn_chunk_size: usize,
     pin_to_core: bool,
     prefault_buffers: bool,
+    recv_multishot: bool,
     iowq_max_workers: Option<u32>,
     accept_mode: AcceptModeArg,
     /// Offer every connection for park after each response.
@@ -367,6 +369,12 @@ struct Args {
     #[arg(long, default_value_t = false)]
     prefault_buffers: bool,
 
+    /// (ringline) Arm multishot TCP receives instead of the default one-shot
+    /// receives (`ConfigBuilder::recv_multishot`). The checked-in
+    /// `BENCHMARKS.md` baseline predates the one-shot default.
+    #[arg(long, default_value_t = false)]
+    recv_multishot: bool,
+
     /// (ringline echo) Cap each worker's bounded io-wq pool
     /// (`ConfigBuilder::iowq_max_workers`; 0 leaves the kernel default).
     /// Omitted, ringline's default applies. The knob under measurement in
@@ -505,6 +513,7 @@ fn main() {
             conn_chunk_size: args.conn_chunk_size,
             pin_to_core,
             prefault_buffers: args.prefault_buffers,
+            recv_multishot: args.recv_multishot,
             api: args.proxy_api,
             metrics_out: args.metrics_out.clone(),
         }),
@@ -516,6 +525,7 @@ fn main() {
             recv_buffer_bytes: args.recv_buffer_bytes,
             recv_ring_size: args.recv_ring_size,
             prefault_buffers: args.prefault_buffers,
+            recv_multishot: args.recv_multishot,
             iowq_max_workers: args.iowq_max_workers,
             echo_mode: if args.recv_forward {
                 EchoMode::RecvForward
@@ -585,6 +595,7 @@ fn run_ringline_proxy(cfg: ProxyCfg) {
         conn_chunk_size,
         pin_to_core,
         prefault_buffers,
+        recv_multishot,
         api,
         metrics_out,
     } = cfg;
@@ -674,6 +685,7 @@ fn run_ringline_proxy(cfg: ProxyCfg) {
         .sq_entries(256)
         .recv_buffer(recv_ring_size, recv_buf)
         .prefault_buffers(prefault_buffers)
+        .recv_multishot(recv_multishot)
         .max_connections(16384)
         .send_pool(512, msg_size.next_power_of_two().max(4096) as u32)
         .conn_chunk_size(conn_chunk_size)
@@ -720,6 +732,7 @@ fn run_ringline(cfg: EchoCfg) {
         conn_chunk_size,
         pin_to_core,
         prefault_buffers,
+        recv_multishot,
         iowq_max_workers,
         accept_mode,
         park,
@@ -871,6 +884,7 @@ fn run_ringline(cfg: EchoCfg) {
         // the same derived size and could only ever have reported "no effect".
         .recv_buffer(recv_ring_size, recv_buf)
         .prefault_buffers(prefault_buffers)
+        .recv_multishot(recv_multishot)
         .max_connections(16384)
         .send_pool(512, msg_size.next_power_of_two().max(4096) as u32)
         .conn_chunk_size(conn_chunk_size)

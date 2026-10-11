@@ -8,8 +8,8 @@ ringline is a thread-per-core I/O framework. It provides an async/await API
 
 ## What ringline is
 
-- An io_uring backend that exploits advanced kernel features: multishot
-  recv, ring-provided buffers, SendMsgZc (zero-copy send), fixed file table
+- An io_uring backend that exploits advanced kernel features: ring-provided
+  buffers with one-shot or multishot recv, SendMsgZc (zero-copy send), fixed file table
 - A Mio backend for macOS and other Unix targets, for Linux kernels older
   than 6.1 (automatic build-time fallback), and for Linux builds using
   `force-mio`

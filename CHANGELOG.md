@@ -93,6 +93,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Breaking, behaviour:** on io_uring, TCP connections arm a one-shot
+  buffer-select recv and re-arm it when it completes, instead of one
+  multishot recv per connection. `ConfigBuilder::recv_multishot(true)`
+  restores multishot. With `timestamps` configured, TCP receives stay
+  multishot `recvmsg`. Direct-echo and recv-forward connections arm one-shot
+  recvs in either mode (#638). A multishot recv keeps taking provided
+  buffers while its socket has data, so with many connections and large
+  messages some connections held the ring while others were served nothing.
+  Measured on two machines with a RESP server (8 workers, 2048 connections,
+  80/20 GET/SET, three 60 s runs per mode, 5 s client request timeout). At
+  depth 16 and 64 KiB values, multishot timed out 176,848–178,272 requests
+  per run (4.2% of the requests the client sent), and the GET p99 of the
+  requests that completed was 0.69–0.73 s; one-shot timed out none, served
+  every connection in every 10 s window, and had a GET p99 of 1.36–1.40 s
+  and a p99.9 of 1.93–1.98 s. Both served 68–69k operations per second. The
+  cost is one SQE per received buffer. At depth 16, one-shot served 2–3%
+  fewer operations than multishot with 64 B and 4 KiB values (4.76–4.79M
+  against 4.89–4.91M ops/s; 945–951k against 969–983k) and used 1–4% more
+  server CPU per operation. At depth 1 with 64 KiB values it served 3–5%
+  fewer (64.95–65.19k against 67.41–68.08k ops/s) and used 4–6% more CPU per
+  operation, with a GET p99 of 36 ms against 55–56 ms. One connection
+  streaming 1 MiB writes over loopback received 7.7–7.9 GB/s one-shot
+  against 9.5–9.6 GB/s multishot. `recv_parked` and `buffer_ring_empty`
+  count once per recv arm that completes with `ENOBUFS` in both modes;
+  one-shot arms once per received buffer, so on the rig the one-shot rate
+  was 0.94–2.4 times the multishot rate, depending on value size and depth.
+  At depth 16 with 64 KiB values the multishot rate rose with the
+  connections accumulating on the server, from about the one-shot rate to 12
+  times it by the end of the run. In both modes, `forward_throttled` counts
+  every time a connection reaches its hold cap, a re-arm whose SQE cannot be
+  pushed at the end of a completion is retried instead of closing the
+  connection, and the incremental-ring preflight tests one-shot as well as
+  multishot receives, falling back to plain rings if either fails.
+
 - On io_uring, consecutive queued copy sends on one connection, plaintext
   or TLS ciphertext, go out as one `sendmsg` even when they belong to
   different `send` calls (#628); before, each call took its own operation.

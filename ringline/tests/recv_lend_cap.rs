@@ -61,22 +61,31 @@ fn wait_for_server(addr: &str) {
     panic!("server did not start on {addr}");
 }
 
-fn echo_round_trip(addr: &str, msg: &[u8]) -> Vec<u8> {
-    let mut stream = TcpStream::connect(addr).unwrap();
+/// Send `msg` from one thread and read the echo from another that starts
+/// only after `delay`, so the server's echo sends back up behind a client
+/// that is not reading and the connection's held receives reach its hold
+/// cap.
+fn echo_with_delayed_reads(addr: &str, msg: &[u8], delay: Duration) -> Vec<u8> {
+    let stream = TcpStream::connect(addr).unwrap();
     stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
+        .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
-    stream.write_all(msg).unwrap();
+    let mut writer = stream.try_clone().unwrap();
+    let out = msg.to_vec();
+    let w = std::thread::spawn(move || writer.write_all(&out).unwrap());
+    std::thread::sleep(delay);
+    let mut reader = stream;
     let mut buf = vec![0u8; msg.len()];
     let mut total = 0;
     while total < msg.len() {
-        match stream.read(&mut buf[total..]) {
+        match reader.read(&mut buf[total..]) {
             Ok(0) => break,
             Ok(n) => total += n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => panic!("read error: {e}"),
         }
     }
+    w.join().unwrap();
     buf.truncate(total);
     buf
 }
@@ -94,9 +103,12 @@ fn kernel_at_least(major: u32, minor: u32) -> bool {
     (next(), next()) >= (major, minor)
 }
 
-/// Echo `total` bytes through a 16 × 1 KiB incremental ring, whose lend cap
-/// is 8 buffers, with handler `H`, and check the bytes and that the cap
-/// refused lends (so owned copies carried part of the stream).
+/// Echo `total` bytes on each of `CLIENTS` connections through a 16 × 1 KiB
+/// incremental ring, whose lend cap is 8 buffers, with handler `H`, and
+/// check the bytes and that the cap refused lends (so owned copies carried
+/// part of the stream). One connection's held receives stop at its hold cap
+/// (a quarter of the ring, 4 buffers); the lend cap counts holds across the
+/// ring, so the stalled connections together pass it.
 fn echo_over_the_lend_cap<H: AsyncEventHandler>(total: usize) {
     use ringline::metrics::{RECV_RING, recv_ring};
     let refused = || RECV_RING.value(recv_ring::LEND_REFUSED).unwrap_or(0);
@@ -117,8 +129,19 @@ fn echo_over_the_lend_cap<H: AsyncEventHandler>(total: usize) {
         .expect("launch failed");
     let addr = shutdown.bound_addr().expect("bound address").to_string();
     wait_for_server(&addr);
+    const CLIENTS: usize = 4;
     let msg: Vec<u8> = (0..total).map(|k| (k % 251) as u8).collect();
-    assert_eq!(echo_round_trip(&addr, &msg), msg);
+    let clients: Vec<_> = (0..CLIENTS)
+        .map(|_| {
+            let (addr, msg) = (addr.clone(), msg.clone());
+            std::thread::spawn(move || {
+                echo_with_delayed_reads(&addr, &msg, Duration::from_millis(300)) == msg
+            })
+        })
+        .collect();
+    for c in clients {
+        assert!(c.join().unwrap(), "echo differs from what was sent");
+    }
     shutdown.shutdown();
     for h in handles {
         h.join().unwrap().unwrap();
@@ -130,12 +153,12 @@ fn echo_over_the_lend_cap<H: AsyncEventHandler>(total: usize) {
 
 #[test]
 fn recv_forward_echoes_over_the_lend_cap() {
-    echo_over_the_lend_cap::<RecvForwardEcho>(320 << 10);
+    echo_over_the_lend_cap::<RecvForwardEcho>(8 << 20);
 }
 
 #[test]
 fn direct_echo_echoes_over_the_lend_cap() {
-    echo_over_the_lend_cap::<DirectEcho>(320 << 10);
+    echo_over_the_lend_cap::<DirectEcho>(8 << 20);
 }
 
 /// A client that writes without reading the echo is stopped by TCP

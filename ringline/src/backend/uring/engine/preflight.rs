@@ -60,6 +60,18 @@ pub(crate) fn inc_preflight<E: Engine>(engine: &mut E) -> Result<IncPreflight, E
     })? {
         return Ok(IncPreflight::Unsupported);
     }
+    // TCP receives are one-shot by default and multishot with
+    // `recv_multishot(true)`, and direct-echo and recv-forward connections
+    // are always one-shot, so check both.
+    match inc_pass(engine, false)? {
+        IncPreflight::Passed => inc_pass(engine, true),
+        other => Ok(other),
+    }
+}
+
+/// One preflight pass with multishot receives, or with one-shot receives
+/// re-armed after each completion when `single`.
+fn inc_pass<E: Engine>(engine: &mut E, single: bool) -> Result<IncPreflight, Error> {
     let Ok((mut client, server)) = UnixStream::pair() else {
         return Ok(IncPreflight::Failed(step::SOCKETPAIR));
     };
@@ -75,6 +87,7 @@ pub(crate) fn inc_preflight<E: Engine>(engine: &mut E) -> Result<IncPreflight, E
         &server,
         &mut reaped,
         &mut armed,
+        single,
     ) {
         Ok(found) => Ok(found),
         Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
@@ -101,21 +114,21 @@ pub(crate) fn inc_preflight<E: Engine>(engine: &mut E) -> Result<IncPreflight, E
 }
 
 // Test-only: make the preflight report `step` as failed when it reaches
-// that step, with its receive still armed.
+// that step in the pass whose `single` matches, with its receive still armed.
 #[cfg(test)]
 thread_local! {
-    static FAIL_AT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static FAIL_AT: std::cell::Cell<Option<(usize, bool)>> = const { std::cell::Cell::new(None) };
 }
 
-/// Whether a test asked the preflight to fail at `at`.
-fn injected(at: usize) -> bool {
+/// Whether a test asked the preflight to fail at `at` in the `single` pass.
+fn injected(at: usize, single: bool) -> bool {
     #[cfg(test)]
     {
-        FAIL_AT.with(|f| f.get()) == Some(at)
+        FAIL_AT.with(|f| f.get()) == Some((at, single))
     }
     #[cfg(not(test))]
     {
-        let _ = at;
+        let _ = (at, single);
         false
     }
 }
@@ -127,24 +140,35 @@ fn run<E: Engine>(
     server: &UnixStream,
     reaped: &mut Reaped,
     armed: &mut bool,
+    single: bool,
 ) -> std::io::Result<IncPreflight> {
     use IncPreflight::Failed;
     let base = ring.data_ptr(0, 0) as u64;
+    // A one-shot receive ends with each completion and is armed again.
+    let more = !single;
+    let rearm = |e: &mut E, armed: &mut bool| -> std::io::Result<()> {
+        if single {
+            arm(e, server, true)?;
+            *armed = true;
+        }
+        Ok(())
+    };
 
     // Write, reap, write, reap: the completions append at increasing
     // offsets, and the entry advances in place.
-    arm(e, server)?;
+    arm(e, server, single)?;
     *armed = true;
-    if injected(step::APPEND) {
+    if injected(step::APPEND, single) {
         return Ok(Failed(step::APPEND));
     }
     client.write_all(b"abc")?;
-    if !delivered(wait(e, reaped, armed)?, 3, true, true) {
+    if !delivered(wait(e, reaped, armed)?, 3, true, more) {
         return Ok(Failed(step::APPEND));
     }
     ring.complete(0, 3, true);
+    rearm(e, armed)?;
     client.write_all(b"defg")?;
-    if !delivered(wait(e, reaped, armed)?, 4, true, true) {
+    if !delivered(wait(e, reaped, armed)?, 4, true, more) {
         return Ok(Failed(step::APPEND));
     }
     ring.complete(0, 4, true);
@@ -160,14 +184,16 @@ fn run<E: Engine>(
     // More than the space left: the completion delivers exactly the space
     // left with F_BUF_MORE clear, and the excess ends the arm with ENOBUFS.
     const EXCESS: u32 = 5;
-    if injected(step::EXHAUSTION) {
+    if injected(step::EXHAUSTION, single) {
         return Ok(Failed(step::EXHAUSTION));
     }
+    rearm(e, armed)?;
     client.write_all(&[b'x'; (SIZE - 7 + EXCESS) as usize])?;
-    if !delivered(wait(e, reaped, armed)?, (SIZE - 7) as i32, false, true) {
+    if !delivered(wait(e, reaped, armed)?, (SIZE - 7) as i32, false, more) {
         return Ok(Failed(step::EXHAUSTION));
     }
     ring.complete(0, SIZE - 7, false);
+    rearm(e, armed)?;
     let (res, flags) = wait(e, reaped, armed)?;
     if res != -libc::ENOBUFS || cqueue::more(flags) {
         return Ok(Failed(step::EXHAUSTION));
@@ -176,16 +202,17 @@ fn run<E: Engine>(
     // Posted again and re-armed, the excess lands at offset 0, and a
     // half-close leaves the buffer posted at its used length.
     ring.release_batch(&[0, 0, 0]);
-    arm(e, server)?;
+    arm(e, server, single)?;
     *armed = true;
-    if injected(step::REPOST) {
+    if injected(step::REPOST, single) {
         return Ok(Failed(step::REPOST));
     }
-    if !delivered(wait(e, reaped, armed)?, EXCESS as i32, true, true) {
+    if !delivered(wait(e, reaped, armed)?, EXCESS as i32, true, more) {
         return Ok(Failed(step::REPOST));
     }
     ring.complete(0, EXCESS, true);
-    if injected(step::EOF) {
+    rearm(e, armed)?;
+    if injected(step::EOF, single) {
         return Ok(Failed(step::EOF));
     }
     client.shutdown(Shutdown::Write)?;
@@ -236,15 +263,22 @@ fn delivered((res, flags): (i32, u32), len: i32, buf_more: bool, more: bool) -> 
         && cqueue::more(flags) == more
 }
 
-fn arm<E: Engine>(e: &mut E, server: &UnixStream) -> std::io::Result<()> {
-    let sqe = Sqe::new(
-        Op::RecvMulti {
-            fd: Fd::Raw(server.as_raw_fd()),
+/// Arm the preflight receive: one-shot when `single`, multishot otherwise.
+fn arm<E: Engine>(e: &mut E, server: &UnixStream, single: bool) -> std::io::Result<()> {
+    let fd = Fd::Raw(server.as_raw_fd());
+    let op = if single {
+        Op::RecvSelect {
+            fd,
             buf_group: BGID,
-        },
-        USER_DATA,
-    );
-    // Safety: a multishot recv references no caller memory.
+        }
+    } else {
+        Op::RecvMulti {
+            fd,
+            buf_group: BGID,
+        }
+    };
+    let sqe = Sqe::new(op, USER_DATA);
+    // Safety: a buffer-select recv references no caller memory.
     unsafe { e.push(&sqe) }
 }
 
@@ -311,19 +345,22 @@ mod tests {
     /// left to reap, and the preflight group can be registered again.
     #[test]
     fn a_failed_step_leaves_nothing_behind() {
-        for at in [step::APPEND, step::EXHAUSTION, step::REPOST, step::EOF] {
+        for (at, single) in [step::APPEND, step::EXHAUSTION, step::REPOST, step::EOF]
+            .into_iter()
+            .flat_map(|at| [(at, false), (at, true)])
+        {
             let mut e = engine();
             if !e.incremental_buffers().expect("probe") {
                 return;
             }
-            FAIL_AT.with(|f| f.set(Some(at)));
+            FAIL_AT.with(|f| f.set(Some((at, single))));
             let found = inc_preflight(&mut e);
             FAIL_AT.with(|f| f.set(None));
             assert_eq!(found.expect("preflight"), IncPreflight::Failed(at));
             e.submit_and_get_events().expect("enter");
             let mut left = Vec::new();
             e.reap(&mut left);
-            assert!(left.is_empty(), "step {at}: {left:?}");
+            assert!(left.is_empty(), "step {at} single={single}: {left:?}");
             let again = ProvidedBufRing::new(BGID, 1, SIZE).expect("ring");
             e.register_buf_ring(&again, RingKind::Incremental)
                 .unwrap_or_else(|err| panic!("step {at}: group still registered: {err}"));

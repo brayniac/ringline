@@ -165,6 +165,12 @@ network configuration:
    live and reap its last completion, unregister the group, and close the
    sockets, so no preflight completion reaches the event loop.
 
+Steps 1 to 5 run twice: once with a multishot `RECV`, and once with a
+one-shot buffer-select `RECV` armed again after each completion, where each
+completion has `F_MORE` clear. TCP receives are one-shot by default and
+multishot with `recv_multishot(true)`, and direct-echo and recv-forward
+connections are one-shot in either mode, so a worker can use either.
+
 Each step waits at most 1 s for its completion; a step that times out does
 not match. A registration refused with `EINVAL` (no INC), a step that does
 not match, or a failure to create the socketpair selects plain rings, and
