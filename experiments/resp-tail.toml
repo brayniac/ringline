@@ -5,6 +5,10 @@
 # fairness and pool counters every 10 s (diag lines in its unit log).
 # resp-server on z1 (24 vCPU, 8 workers), cachecannon on z2 (56 vCPU).
 #   arm = ringline (one-shot receives) | ringline-multishot | tokio-pc
+#       | ringline-rb (2048 provided receive buffers per worker, not 256)
+#       | ringline-slot64 (64 KiB send-pool slots, not 16 KiB)
+#       | ringline-rb-slot64 (both)
+#   depths: the pipeline depths to run (default "1 16")
 name = "ringline resp-tail {arm} rep{rep}"
 
 [params]
@@ -21,6 +25,7 @@ workers       = "8"
 client_threads = "16"
 warmup        = "10s"
 duration      = "60s"
+depths        = "1 16"
 
 [[jobs]]
 name = "server"
@@ -48,6 +53,9 @@ sudo sysctl -w net.core.somaxconn=65535 net.ipv4.tcp_max_syn_backlog=65535 net.c
 case "{arm}" in
   ringline)          args="--runtime ringline" ;;
   ringline-multishot) args="--runtime ringline --recv-multishot" ;;
+  ringline-rb)       args="--runtime ringline --recv-buffers 2048" ;;
+  ringline-slot64)   args="--runtime ringline --send-slot 65536" ;;
+  ringline-rb-slot64) args="--runtime ringline --recv-buffers 2048 --send-slot 65536" ;;
   tokio-pc)          args="--runtime tokio-pc" ;;
   tokio-uring)       args="--runtime tokio-uring" ;;
   *) echo "BAD ARM {arm}"; exit 1 ;;
@@ -131,7 +139,7 @@ for i in $(seq 1 120); do
 done
 for vlen in 64 4096 65536; do
   case $vlen in 64) keys=100000;; 4096) keys=20000;; 65536) keys=2000;; esac
-  for depth in 1 16; do
+  for depth in {depths}; do
     for conns in 2048; do
       cell="v${vlen}-d${depth}-c${conns}"
       cat > results/$cell.toml <<CFG

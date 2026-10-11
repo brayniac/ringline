@@ -51,6 +51,10 @@ struct Args {
     /// 0 keeps the default.
     #[arg(long, default_value_t = 0)]
     recv_buffers: u16,
+    /// ringline only: send-pool slot size in bytes. The slot count keeps the
+    /// pool at 256 MiB per worker.
+    #[arg(long, default_value_t = 16384)]
+    send_slot: u32,
     /// Send GET values of at least this many bytes without copying them
     /// (ringline: `send_parts` guard; tokio: `write_vectored`). 0 = copy all.
     #[arg(long, default_value_t = 0)]
@@ -74,11 +78,13 @@ impl Args {
 fn main() {
     let args = Args::parse();
     eprintln!(
-        "resp-server: runtime={:?} workers={} multishot={} incremental={} zc_get={} stream_sets={} addr={}",
+        "resp-server: runtime={:?} workers={} multishot={} incremental={} recv_buffers={} send_slot={} zc_get={} stream_sets={} addr={}",
         args.runtime,
         args.workers,
         args.recv_multishot,
         args.recv_incremental,
+        args.recv_buffers,
+        args.send_slot,
         args.zc_get,
         args.stream_sets,
         args.addr
@@ -360,7 +366,10 @@ mod ringline_arm {
             .pin_to_core(true)
             .sq_entries(4096)
             .max_connections(8192)
-            .send_pool(16384, 16384)
+            .send_pool(
+                ((256u64 << 20) / args.send_slot as u64) as u16,
+                args.send_slot,
+            )
             .recv_incremental(args.recv_incremental)
             .recv_multishot(args.recv_multishot);
         if args.recv_buffers != 0 {
