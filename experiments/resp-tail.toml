@@ -8,6 +8,7 @@
 #       | ringline-rb (2048 provided receive buffers per worker, not 256)
 #       | ringline-slot64 (64 KiB send-pool slots, not 16 KiB)
 #       | ringline-rb-slot64 (both)
+#       | ringline-lendcap (lends capped at half the plain ring; exp build only)
 #   depths: the pipeline depths to run (default "1 16")
 name = "ringline resp-tail {arm} rep{rep}"
 
@@ -56,11 +57,13 @@ case "{arm}" in
   ringline-rb)       args="--runtime ringline --recv-buffers 2048" ;;
   ringline-slot64)   args="--runtime ringline --send-slot 65536" ;;
   ringline-rb-slot64) args="--runtime ringline --recv-buffers 2048 --send-slot 65536" ;;
+  ringline-lendcap)  args="--runtime ringline"; echo "export RINGLINE_EXP_LEND_CAP=1" > /home/anvil/env.sh ;;
   tokio-pc)          args="--runtime tokio-pc" ;;
   tokio-uring)       args="--runtime tokio-uring" ;;
   *) echo "BAD ARM {arm}"; exit 1 ;;
 esac
-echo "exec /home/anvil/out/resp-server $args --addr {server_ip}:{port} --workers {workers}" > /home/anvil/run-server.sh
+touch /home/anvil/env.sh
+echo ". /home/anvil/env.sh; exec /home/anvil/out/resp-server $args --addr {server_ip}:{port} --workers {workers}" > /home/anvil/run-server.sh
 chmod +x /home/anvil/run-server.sh
 cat /home/anvil/run-server.sh
 '''

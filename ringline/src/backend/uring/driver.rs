@@ -1426,7 +1426,11 @@ impl Driver {
             } else {
                 recv_buffer_size.saturating_mul(4).max(1 << 20)
             },
-            lend_cap: config.recv_incremental.then_some(recv_ring_size as u32 / 2),
+            // exp/lendcap-ab: RINGLINE_EXP_LEND_CAP=1 caps lends on a plain
+            // ring too.
+            lend_cap: (config.recv_incremental
+                || std::env::var_os("RINGLINE_EXP_LEND_CAP").is_some())
+            .then_some(recv_ring_size as u32 / 2),
             owned_recv: Vec::new(),
             owned_recv_free: Vec::new(),
             recv_fallback_count: 0,
