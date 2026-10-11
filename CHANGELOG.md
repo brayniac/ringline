@@ -98,7 +98,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `ShardedCounterGroup` and `Gauge`; their methods and the values they report
   are unchanged. `metriken-core` declares `links = "metriken-core"`, so a
   build holds one `metriken-core`: a dependent still on `metriken` 0.9 must
-  move to 0.11 together with this release.
+  move to 0.11 together with this release. (#649)
 
 - **Breaking, behaviour:** on io_uring, TCP connections arm a one-shot
   buffer-select recv and re-arm it when it completes, instead of one
