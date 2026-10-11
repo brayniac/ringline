@@ -2,7 +2,11 @@
 # per arm, arms in sequence on the same VM pair. During each arm's measured
 # window the server records a system-wide perf profile (no call graphs) and
 # /proc/stat deltas, and keeps resp-server's diag lines.
-#   arms: ringline (one-shot receives) | ringline-multishot | tokio-pc
+#   arms: ringline (one-shot receives) | ringline-multishot | ringline-zc
+#   (GET values of 4 KiB and up sent zero-copy) | tokio-pc
+# After the system-wide window, an 8 s DWARF call-graph profile of the server
+# process. Reports are generated after the last arm, so report time cannot
+# delay the next arm's server.
 name = "ringline resp profile v{vlen} d{depth} c{conns}"
 
 [params]
@@ -13,7 +17,7 @@ image          = "spool/images/debian-13-base-20260912.1@golden"
 server_ip      = "172.31.0.1"
 client_ip      = "172.31.0.2"
 port           = "6379"
-arms           = "ringline ringline-multishot tokio-pc"
+arms           = "ringline ringline-zc tokio-pc"
 vlen           = "4096"
 depth          = "16"
 conns          = "2048"
@@ -52,7 +56,9 @@ payload = '''
 set -uo pipefail
 cd /home/anvil && tar xzf bins.tgz && tar xzf perf.tgz && chmod +x out/resp-server out/cachecannon
 sudo sysctl -w net.core.somaxconn=65535 net.ipv4.tcp_max_syn_backlog=65535 net.core.rmem_max=134217728 net.core.wmem_max=134217728 kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0 >/dev/null
-ulimit -n 1048576
+# The guest's hard nofile limit is below 1048576, so `ulimit -n` alone
+# leaves the soft limit at 1024; tokio does not raise it itself.
+ulimit -n 1048576 2>/dev/null || sudo prlimit --nofile=1048576:1048576 --pid $$
 ulimit -l unlimited 2>/dev/null || sudo prlimit --memlock=unlimited:unlimited --pid $$
 echo "server-limits memlock=$(ulimit -l) nofile=$(ulimit -n)"
 # perf is not in the base image; the bins artifact may carry a bundle
@@ -69,6 +75,7 @@ for arm in {arms}; do
   case $arm in
     ringline)           args="--runtime ringline" ;;
     ringline-multishot) args="--runtime ringline --recv-multishot" ;;
+    ringline-zc)        args="--runtime ringline --zc-get 4096" ;;
     tokio-pc)           args="--runtime tokio-pc" ;;
   esac
   ./out/resp-server $args --addr {server_ip}:{port} --workers 8 > prof/$arm.server.log 2>&1 &
@@ -83,7 +90,15 @@ for arm in {arms}; do
     sleep 20
   fi
   cat /proc/stat > prof/$arm.stat1
+  if command -v perf >/dev/null; then
+    sudo perf record -p $pid -F 199 --call-graph dwarf,8192 -o prof/$arm.cg.data -- sleep 8 2>prof/$arm.cg.err
+  fi
   echo "== $arm conns=$(conns)"
+  for i in $(seq 1 600); do [ "$(conns)" -eq 0 ] && break; sleep 0.5; done
+  kill $pid; wait $pid 2>/dev/null
+  sleep 2
+done
+for arm in {arms}; do
   if [ -f prof/$arm.perf.data ]; then
     sudo perf report -i prof/$arm.perf.data --stdio --no-children --sort comm,dso --percent-limit 0.5 2>/dev/null | grep -v '^#' | grep -v '^$' | head -40 > prof/$arm.dso.txt
     sudo perf report -i prof/$arm.perf.data --stdio --no-children --sort sym --percent-limit 0.3 2>/dev/null | grep -v '^#' | grep -v '^$' | head -120 > prof/$arm.sym.txt
@@ -91,9 +106,11 @@ for arm in {arms}; do
     echo "-- $arm top dso"; head -15 prof/$arm.dso.txt
     echo "-- $arm top symbols"; head -40 prof/$arm.sym.txt
   fi
-  for i in $(seq 1 600); do [ "$(conns)" -eq 0 ] && break; sleep 0.5; done
-  kill $pid; wait $pid 2>/dev/null
-  sleep 2
+  if [ -f prof/$arm.cg.data ]; then
+    # callers of each hot symbol, as raw text; libc addresses are resolved offline
+    sudo perf report -i prof/$arm.cg.data --stdio --no-children --sort sym -G --percent-limit 1.5 2>/dev/null | grep -v '^$' | head -1500 > prof/$arm.cg.txt
+    sudo rm -f prof/$arm.cg.data
+  fi
 done
 python3 - <<'PY'
 import os
@@ -144,7 +161,7 @@ payload = '''
 set -uo pipefail
 cd /home/anvil && tar xzf bins.tgz && chmod +x out/*
 sudo sysctl -w net.core.rmem_max=134217728 net.core.wmem_max=134217728 net.ipv4.ip_local_port_range="1024 65535" >/dev/null
-ulimit -n 1048576
+ulimit -n 1048576 2>/dev/null || sudo prlimit --nofile=1048576:1048576 --pid $$
 ulimit -l unlimited 2>/dev/null || sudo prlimit --memlock=unlimited:unlimited --pid $$
 echo "client-limits memlock=$(ulimit -l) nofile=$(ulimit -n)"
 cat > cell.toml <<CFG
