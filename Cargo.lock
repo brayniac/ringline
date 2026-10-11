@@ -1027,40 +1027,49 @@ checksum = "88904434abc2901f197fe8cc55f0445e7ded921dba5911dad2e2b39b48e663c4"
 
 [[package]]
 name = "metriken"
-version = "0.9.2"
+version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d34d88b3f3ec8c532945831eeea8170f9410a37f444feb1322b8e124f3a4a3b9"
+checksum = "6b775d1c8fa624fbf8e3a553a09cd2b48311e076301a48f2c968b6a52d7a52e1"
 dependencies = [
+ "getrandom 0.3.4",
  "histogram 1.4.1",
  "metriken-core",
  "metriken-derive",
+ "metriken-types",
  "once_cell",
  "parking_lot",
 ]
 
 [[package]]
 name = "metriken-core"
-version = "0.2.1"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bab27bd3058a12219267acc9a86c68c9a55ab456825582758f5c0376a1267e31"
+checksum = "475f9a727147e3b088eadebda0572fb49f81aae39993d9dd1e6bac4556a18da0"
 dependencies = [
  "histogram 1.4.1",
  "linkme",
+ "metriken-types",
  "parking_lot",
  "phf",
 ]
 
 [[package]]
 name = "metriken-derive"
-version = "0.5.1"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3643374c9873e69a27e50404db6006ad09f0c1ee944e8ce928d586df077b71db"
+checksum = "ba9466276652f7134a720d6d7e004bb5277dfa85a349e63030bb80b9aacf3db5"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
  "quote",
  "syn",
 ]
+
+[[package]]
+name = "metriken-types"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9bd7377cbafbe5e1852bff7714e7056598f419cfc42130c35955bb2c13a26c76"
 
 [[package]]
 name = "miniz_oxide"
