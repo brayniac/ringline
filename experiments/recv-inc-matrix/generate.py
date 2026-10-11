@@ -16,7 +16,8 @@ order rotated by rep. The arms are:
 A difference between base and inc counts only when it exceeds the spread
 between base and base2.
 
-Each arm runs the server in the foreground under `timeout -s TERM`, so it
+Each arm's server is sent SIGTERM once the client's connections have all
+opened and closed (or at a deadline, if they never do), so it
 dumps its counters (`--metrics-out`) and peak RSS when it stops. Barriers
 pair each server arm with its client arm.
 
@@ -88,12 +89,28 @@ payload = '''
 set -uo pipefail
 mkdir -p /home/anvil/results
 sudo prlimit --nofile=1048576:1048576 --memlock=unlimited:unlimited --pid $$
-# `timeout` exits 124 on the deadline it is meant to hit.
-timeout -s TERM {server_secs} /home/anvil/out/bench-server \\
+/home/anvil/out/bench-server \\
   --runtime ringline --addr {{server_ip}}:{{port}} --workers {{workers}} \\
   {server_args} \\
   --metrics-out /home/anvil/results/{aid}.metrics.json \\
-  > /home/anvil/results/{aid}.server.log 2>&1 || true
+  > /home/anvil/results/{aid}.server.log 2>&1 &
+pid=$!
+# Stop the server once all {conns} client connections have opened and then
+# closed, or after {server_secs} s if that never happens.
+conns() {{ ss -Htn state established "( sport = :{{port}} )" | wc -l; }}
+end=$((SECONDS + {server_secs}))
+seen=0
+while kill -0 $pid 2>/dev/null && [ $SECONDS -lt $end ]; do
+  n=$(conns)
+  if [ $seen -eq 0 ]; then
+    [ "$n" -ge {conns} ] && seen=1
+  elif [ "$n" -eq 0 ]; then
+    break
+  fi
+  sleep 0.5
+done
+echo "stop seen=$seen after=$SECONDS s" | tee -a /home/anvil/results/{aid}.server.log
+kill -TERM $pid 2>/dev/null; wait $pid
 grep -E "ready|VmHWM|panicked" /home/anvil/results/{aid}.server.log | head -5
 '''
 
@@ -283,7 +300,9 @@ def render(kernel, rep, phase, bins, workers, warmup, duration, rates):
         for arm in order:
             aid = f"{cid}-{arm}"
             sa, cc = arm_cmds(c, arm, phase, rates.get(cid), warmup, duration)
-            server.append(SERVER_ARM.format(aid=aid, server_secs=server_secs, server_args=sa))
+            server.append(SERVER_ARM.format(
+                aid=aid, conns=c["conns"], server_secs=server_secs, server_args=sa,
+            ))
             client.append(CLIENT_ARM.format(aid=aid, client_cmd=cc))
             n += 1
     head = HEAD.format(
@@ -324,7 +343,7 @@ def main():
                 out_dir.mkdir(parents=True, exist_ok=True)
                 path.write_text(text)
             print(f"{path} {n} arms")
-    per = args.warmup + args.duration + 25
+    per = args.warmup + args.duration + 8
     print(f"{total} arms, about {total * per // 3600} h {total * per % 3600 // 60} min plus boots")
 
 
