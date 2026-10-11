@@ -102,11 +102,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   buffers while its socket has data, so with many connections and large
   messages some connections held the ring while others were served nothing.
   Measured on two machines with a RESP server (8 workers, 2048 connections,
-  80/20 GET/SET, depth 16, 64 KiB values; three 60 s runs per mode) using an
-  equivalent switch on an earlier main: 500 to 670 connections were served
-  nothing in each 10 s window with multishot and none with one-shot, and GET
-  p99 went from 3.3–3.7 s to 1.1–1.4 s. The cost is one SQE per received
-  buffer: one connection streaming 1 MiB writes over loopback received
+  80/20 GET/SET, three 60 s runs per mode, 5 s client request timeout). At
+  depth 16 and 64 KiB values, multishot timed out 176,848–178,272 requests
+  per run (4.2% of those sent), and the GET p99 of the requests that
+  completed was 0.69–0.73 s; one-shot timed out none, served every
+  connection in every 10 s window, and had a GET p99 of 1.36–1.40 s and a
+  p99.9 of 1.93–1.98 s. Both served 68–69k operations per second. The cost is
+  one SQE per received buffer. At depth 16, one-shot served 2–3% fewer
+  operations than multishot with 64 B and 4 KiB values (4.76–4.79M against
+  4.89–4.91M ops/s; 945–951k against 969–983k) and used 1–4% more server
+  CPU per operation. One connection streaming 1 MiB writes over loopback received
   7.7–7.9 GB/s one-shot against 9.5–9.6 GB/s multishot. `recv_parked` and
   `buffer_ring_empty` now count per received buffer under ring pressure,
   since each completion re-arms. `forward_throttled` counts every time a
