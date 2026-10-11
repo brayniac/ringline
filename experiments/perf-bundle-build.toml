@@ -1,0 +1,63 @@
+# Bundle Debian's perf binary and the shared libraries it needs that the
+# base guest image lacks, for experiments whose guests have no package
+# network access. Built on the CI image, which can install linux-perf.
+name = "perf bundle build"
+
+[[jobs]]
+name = "build"
+tags = ["validation"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+shape = "z4.c"
+image = "spool/images/debian-13-ci-20260912.1@golden"
+slots = 1
+memory_gib = 4
+ports = 0
+gpu = false
+payload_timeout = 1200
+artifacts = ["/home/anvil/perf.tgz"]
+upload = true
+payload = '''
+set -uo pipefail
+cd /home/anvil
+uname -r
+cat /etc/apt/sources.list.d/* /etc/apt/sources.list 2>/dev/null | grep -v '^#' | head
+sudo DEBIAN_FRONTEND=noninteractive apt-get update 2>&1 | tail -3
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y linux-perf 2>&1 | tail -5
+bin=$(ls /usr/bin/perf_* 2>/dev/null | head -1)
+[ -n "$bin" ] || bin=$(command -v perf >/dev/null && readlink -f "$(command -v perf)")
+file "$bin" 2>/dev/null || true
+if [ -z "$bin" ]; then
+  # No apt: fetch linux-perf and its library dependencies from the archive.
+  curl -fsSL https://deb.debian.org/debian/dists/trixie/main/binary-amd64/Packages.xz | xz -d > Packages || { echo "no archive access"; exit 1; }
+  pkgs="linux-perf"
+  fetched=""
+  mkdir -p debs root
+  while [ -n "$pkgs" ]; do
+    next=""
+    for p in $pkgs; do
+      case " $fetched " in *" $p "*) continue;; esac
+      fetched="$fetched $p"
+      rec=$(awk -v p="$p" 'BEGIN{RS=""} $0 ~ "(^|\n)Package: "p"\n" {print; exit}' Packages)
+      [ -n "$rec" ] || continue
+      file=$(echo "$rec" | awk '/^Filename:/{print $2}')
+      curl -fsSL "https://deb.debian.org/debian/$file" -o debs/$(basename $file) && dpkg-deb -x debs/$(basename $file) root
+      deps=$(echo "$rec" | awk -F': ' '/^(Depends|Pre-Depends):/{print $2}' | tr ',' '\n' | sed 's/|.*//; s/(.*)//; s/:any//' | awk '{print $1}' | grep -E '^lib' )
+      next="$next $deps"
+    done
+    pkgs="$next"
+  done
+  bin=$(ls root/usr/bin/perf_* 2>/dev/null | head -1)
+  libdirs=$(find root -name '*.so*' -printf '%h\n' | sort -u | tr '\n' ':')
+fi
+[ -n "$bin" ] || { echo "no perf binary"; exit 1; }
+echo "perf binary: $bin"
+mkdir -p out/perf/lib
+cp "$bin" out/perf/perf
+LD_LIBRARY_PATH="${libdirs:-}" ldd "$bin" | awk '/=> \//{print $3}' | while read -r lib; do cp -L "$lib" out/perf/lib/; done
+ls out/perf/lib | head -60
+LD_LIBRARY_PATH=out/perf/lib out/perf/perf --version
+tar czf perf.tgz out
+exit 0
+'''
