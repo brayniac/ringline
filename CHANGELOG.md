@@ -93,6 +93,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- io_uring: TCP connections arm a one-shot buffer-select recv and re-arm it
+  when it completes, instead of one multishot recv per connection.
+  `ConfigBuilder::recv_multishot(true)` restores multishot. A multishot recv
+  keeps taking provided buffers while its socket has data, so with many
+  connections and large messages some connections held the ring while others
+  were served nothing. Measured on two machines (resp-server, 8 workers,
+  2048 connections, 80/20 GET/SET, depth 16, 64 KiB values; three 60 s runs
+  each): 500 to 670 connections were served nothing in each 10 s window with
+  multishot and none with one-shot, GET p99 went from 3.3–3.7 s to 1.1–1.4 s
+  and p99.9 from 36–40 s to 1.6–2.0 s, throughput was within 3%, and CPU per
+  request rose 1–14%. With 64-byte values throughput and CPU per request were
+  within the run-to-run spread. Direct-echo and recv-forward connections arm
+  one-shot recvs in either mode (#638).
+
 - On io_uring, consecutive queued copy sends on one connection, plaintext
   or TLS ciphertext, go out as one `sendmsg` even when they belong to
   different `send` calls (#628); before, each call took its own operation.

@@ -5911,6 +5911,11 @@ mod tests {
             // (Pinned) as the existing assertions expect. Force-copy behavior is
             // covered by dedicated tests that raise the reserve explicitly.
             .recv_segment_reserve(0)
+            // Multishot: most of these tests drive multishot completions
+            // (`F_MORE`, `ENOBUFS` parking). The one-shot default is covered
+            // by tests that build their own config and by the integration
+            // tests.
+            .recv_multishot(true)
             .max_connections(16)
             .send_pool(16, 16384)
             .send_slab_slots(8)
@@ -11143,9 +11148,30 @@ mod tests {
         el.test_dispatch_cqe(ud.raw(), msg.len() as i32, 1 | ((bid as u32) << 16));
     }
 
-    /// A direct-echo or recv-forward connection re-arms a one-shot recv; any
-    /// other connection re-arms a multishot one. Both carry the `RecvMulti`
-    /// user_data.
+    /// By default every TCP connection re-arms a one-shot recv.
+    #[test]
+    fn connections_re_arm_a_one_shot_recv_by_default() {
+        use crate::backend::uring::sqe::Op;
+        let mut el = make_test_loop_with_config(
+            test_config_builder()
+                .recv_multishot(false)
+                .build()
+                .expect("valid config"),
+        );
+        let conn = accept_connection(&mut el);
+        deliver_single(&mut el, conn, 2, b"x");
+        let pushed = el.driver.ring.last_pushed.as_ref().expect("re-armed");
+        assert_eq!(UserData(pushed.user_data).tag(), Some(OpTag::RecvMulti));
+        assert!(
+            matches!(pushed.op, Op::RecvSelect { .. }),
+            "{:?}",
+            pushed.op
+        );
+    }
+
+    /// With `recv_multishot` set, a direct-echo or recv-forward connection
+    /// still re-arms a one-shot recv, and any other connection re-arms a
+    /// multishot one. Both carry the `RecvMulti` user_data.
     #[test]
     fn holding_connections_re_arm_a_one_shot_recv() {
         use crate::backend::uring::sqe::Op;
