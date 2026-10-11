@@ -11,12 +11,14 @@ server writes from its own buffer, and the only copy is the kernel's.
 
 The profile that showed this ran a RESP server benchmark
 (`ringline-bench/src/bin/resp-server.rs` on the `exp/oneshot-ab` branch of
-the brayniac/ringline fork, commit 9b72617, not merged) on the two-host rig:
-8 workers, 2048 connections, pipeline depth 16, 80/20 GET/SET. The ringline
+the brayniac/ringline fork, commit 9b72617, not merged). Server and load
+generator ran in VMs on two hypervisors, connected through Intel X710 NICs,
+with Debian 13 guests (Linux 6.12): 8 server workers, 2048 connections,
+pipeline depth 16, 80/20 GET/SET. The ringline
 arm used a 1024-buffer receive ring, so it had no receive-ring starvation.
 It was compared with the same server on tokio, one current-thread runtime
-per core. Experiments `01a12a6d-1a82` (4 KiB values) and `01a12a6d-1af9`
-(64 KiB values):
+per core. SystemsLab experiments `01a12a6d-1a82-71a5-329e-d642483b6a9a`
+(4 KiB values) and `01a12a6d-1af9-7140-3d1a-8074bb4a0b7b` (64 KiB values):
 
 | Values | Runtime | ops/s | system CPU per op | user `memmove` per op | kernel `rep_movs_alternative` per op |
 |---|---|---|---|---|---|
@@ -34,7 +36,9 @@ operation are about four times request bytes, so most of the extra
 the profile has no call graph that separates the two copies.
 
 An arm of the same server that sent GET values of 4 KiB and up zero-copy
-(`send_parts` with guards; experiments `01a12922-edca` and `01a12922-ef13`)
+(`send_parts` with guards; experiments
+`01a12922-edca-71fc-d27a-3071b58fdf46` and
+`01a12922-ef13-713f-9990-ac7d71c006cf`)
 matched tokio's throughput at 4 KiB (1082k against 1080k ops/s) and beat it
 at 64 KiB (84k against 73k). It used 9.95 cores of softirq at 4 KiB and
 18.43 at 64 KiB. In the profile above, at 4 KiB, the copy arm used 7.44
@@ -67,10 +71,10 @@ impl SendHalf {
 
     /// Wait for send-pool capacity for `len` bytes, through the same
     /// admission queue as `send_backpressured`, then run `f` and queue its
-    /// bytes. Resolves like `send_backpressured`.
+    /// bytes. Resolves to the closure's result and the bytes sent.
     pub fn send_with_backpressured<F, R>(&mut self, len: usize, f: F) -> SendWithFuture<F>
     where
-        F: FnOnce(&mut SendWriter<'_>) -> R;
+        F: FnOnce(&mut SendWriter<'_>) -> R; // Output = io::Result<(R, u32)>
 }
 
 pub struct SendWriter<'a> { /* slot chain, state; borrows the call */ }
@@ -80,6 +84,12 @@ impl SendWriter<'_> {
     /// `io::Write` or `BufMut`.
     pub fn reserve(&mut self, additional: usize) -> io::Result<()>;
 
+    /// Reserve `n` more whole slots, for `contiguous` calls.
+    pub fn reserve_slots(&mut self, n: usize) -> io::Result<()>;
+
+    /// The pool's slot size: the largest `max` `contiguous` accepts.
+    pub fn slot_size(&self) -> usize;
+
     /// Hand `f` a contiguous region of `max` bytes in the current slot,
     /// starting a new slot if the current one has less room. `f` returns
     /// how many bytes it wrote. `max` must not exceed the slot size.
@@ -87,11 +97,13 @@ impl SendWriter<'_> {
     where
         F: FnOnce(&mut [u8]) -> usize;
 
-    /// Bytes written so far.
+    /// Bytes the writer has accepted, including bytes discarded after a
+    /// failure.
     pub fn len(&self) -> usize;
 
-    /// Discard everything written; the call then sends nothing and returns
-    /// `Ok` with the closure's result.
+    /// Release everything written and clear a failure. Writing can start
+    /// again; if nothing more is written, the call sends nothing and
+    /// returns `Ok` with the closure's result.
     pub fn discard(&mut self);
 }
 
@@ -129,7 +141,9 @@ w.contiguous(n, |buf| value.encode(buf))?;
 `memcache-proto` encoders also write into `&mut [u8]` and have no
 `encoded_len()`. `ringline-memcache` already computes an upper bound for
 its scratch buffer; it passes that bound as `max` and uses the returned
-count.
+count. The bound includes a SET's value, so a SET larger than a slot takes
+the header, value and trailer path below; `append_set_guard_prefix` already
+encodes the text header on its own.
 
 `contiguous` cannot carry an encoding larger than one slot, and
 `resp-proto`'s `encode` has no streaming form. A response with a value
@@ -162,7 +176,15 @@ none of them:
   (`take_send`), for example one running a forward.
 
 Inside the closure the application cannot `.await`, so none of these can
-happen. The cost is the coalescing client below.
+happen. The costs:
+
+- The coalescing client below keeps its own buffer.
+- An encoder that must `.await` partway through a response (a value read
+  from disk, for example) splits it across several `send_with` calls.
+  Order holds, but if a later call fails, the earlier part is already
+  queued, as with several `send` calls today.
+- A response produced by another task arrives at the connection's task as
+  bytes that already exist, so it goes through `send`.
 
 ## Semantics
 
@@ -181,7 +203,8 @@ against the pool from the moment they are taken.
   change only through `advance_mut`, and the default `put_slice` panics
   when it is smaller than the slice.
 - When the closure returns, a failed writer releases every slot and the
-  call returns `Err`, whatever the closure returned. Nothing was queued or
+  call returns `Err`, whatever the closure returned, unless the closure
+  called `discard` after the failure. Nothing was queued or
   transmitted, which is the guarantee `send` gives
   (`docs/copied-send-reservation-design.md`). The application can run its
   encoder again. A failed writer is never committed, so a frame cut short
@@ -198,34 +221,49 @@ against the pool from the moment they are taken.
   slot unused, so a writer that mixes `contiguous` with a byte-count
   reservation can need more slots than it reserved; those come from the
   free pool and can fail. An application that wants a guarantee for
-  `contiguous` writes reserves one slot per call that can start a new slot.
-  Unused reserved slots go back through `release_reservation` when the call
-  ends.
+  `contiguous` writes calls `reserve_slots` with one slot per `contiguous`
+  call that can start a new slot. Unused reserved slots go back through
+  `release_reservation` when the call ends.
+- `SendWriter`'s `Drop` releases its slot chain and any outstanding
+  reservation. That covers a panic inside the closure: the default
+  `TaskPanicPolicy::Contain` catches it and keeps the worker running, and
+  the unwind runs inside the task's poll, where `CURRENT_DRIVER` is set.
+  Without this each panic would shrink the worker's pool for good. The
+  implementation tests it: panic inside `send_with` under `Contain`, then
+  check `free_count`.
 - `SendCopyPool` gains `alloc_raw_reserved(&mut SlotReservation)`, the
   `alloc_raw` counterpart of `copy_in_reserved`: it pops a promised slot
   for incremental filling.
 
-### Backpressured form
+### Id lifecycle per form
 
-`send_with_backpressured(len, f)` joins the send-capacity FIFO
-(`docs/send-capacity-fifo-design.md`) with the slots `len` needs:
-`ceil(len / slot_size)` on a plaintext connection, `bounded_send_slots`'
-ciphertext bound on TLS. On a plaintext connection, admission takes that
-reservation and `f` runs with it. On TLS the writer holds no reservation
-(see "TLS"). The future's id is attached to the last slot at commit, as
-`send_bounded` attaches it, so the future resolves on that slot's
-completion with the number of bytes written. A closure that writes nothing
-settles the id at once with `Ok(0)`, as `send_inner` does for an empty
-send. A failed writer cancels the id. Writing past `len` takes further
-slots as `send_with` does.
+- `send_with` attaches no id.
+- `send_with_awaited` registers its id (`register_send`), runs `f`, and on
+  success attaches the id to the last slot (`set_send_id`). On failure it
+  withdraws the id (`withdraw_send`), as `ConnCtx::send` does.
+- `send_with_backpressured(len, f)` on a plaintext connection joins the
+  send-capacity FIFO (`docs/send-capacity-fifo-design.md`) with
+  `ceil(len / slot_size)` slots. On its turn it reserves them, leaves
+  `with_state`, runs `f` with the reservation, commits with the id on the
+  last slot, and marks the id submitted. On failure it cancels the id
+  while the id is still waiting, which wakes the next head.
+  `BackpressuredSendFuture` does all of its work inside one `with_state`;
+  this future has to leave it to run `f`.
+- Writing past `len`, or `contiguous` leaving slot tails unused, can need
+  more slots than `ceil(len / slot_size)` even when `len()` is at most
+  `len`. Those come from the free pool and can fail.
+- A closure that writes nothing settles its id at once with `Ok(0)`, as
+  `send_inner` does for an empty send.
+- On TLS and on mio the backpressured form differs; see those sections.
 
 ### Order
 
 The bytes are queued on the connection when the closure returns, as one
-unit in the per-connection send queue. Wire order between `send_with`
-calls, and between `send_with` and `send` on the same connection, is call
-order. This is the guarantee `send` gives today: one call's bytes reach the
-wire contiguously.
+unit in the per-connection send queue, so one call's bytes reach the wire
+contiguously, as `send`'s do. Wire order is the order in which calls queue
+their bytes. For `send_with` and `send_with_awaited` that is call order.
+For `send_with_backpressured` it is admission time, so a send issued while
+it waits goes first, as with `send_backpressured`.
 
 ### Stale connections
 
@@ -283,10 +321,23 @@ The writer holds no pool reservation on TLS. `encrypt_to_sends` allocates
 ciphertext slots with `alloc_raw`, which cannot take reserved slots, and
 `encrypt_tls_send` checks `free_count()`, which subtracts reservations. A
 reservation held by the writer would therefore count against its own
-encryption. On TLS, `reserve` succeeds without reserving, and
-`send_with_backpressured` releases its admission reservation before the
-closure runs, as `send_bounded` does. The API is the same on TLS and
-plaintext connections; TLS gains nothing from it.
+encryption. On TLS:
+
+- `reserve` and `reserve_slots` succeed without reserving, and guarantee
+  nothing. Pool exhaustion and `InvalidInput` are reported after the
+  closure returns, when the plaintext is encrypted.
+- `send_with_backpressured` runs `f` into the plaintext buffer on its first
+  poll, before it joins the FIFO. It then joins with the ciphertext bound
+  of the bytes written (`bounded_send_slots`), and on its turn hands the
+  buffer to `send_bounded`, which checks capacity and encrypts with nothing
+  allocating in between. `len` is ignored on TLS. Running `f` after
+  admission instead would let the closure take slots between the check and
+  the encryption.
+- A buffer returned to the free list keeps at most 64 KiB of capacity, so
+  one large response does not hold memory for the life of the worker.
+
+The API is the same on TLS and plaintext connections; TLS gains nothing
+from it.
 
 ## mio
 
@@ -294,8 +345,9 @@ The mio backend queues a `Vec<u8>` per send (`data.to_vec()` in
 `DriverCtx::send_inner`). A writer on mio writes into that `Vec` directly,
 which removes the `to_vec` copy, and the call queues it as
 `PendingSend::plain` or `PendingSend::awaited`. As with `send` on mio, the
-pool limits only the backpressured form, whose admission budget is the
-pool reservation (`docs/mio-bounded-send-design.md`).
+pool limits only the backpressured form. Its admission reservation becomes
+the permit of a `PendingSend::bounded` entry, as in `send_bounded`
+(`docs/mio-bounded-send-design.md`).
 
 ## Protocol clients
 
@@ -361,8 +413,9 @@ Predictions, recorded before the runs:
 2. Name: `send_with` / `SendWriter`.
 3. Whether a `BufMut` write that finds the pool empty is recorded until the
    call ends, as above, or panics. `Vec<u8>`'s `BufMut` cannot fail, so
-   encoders written for `BufMut` do not check for errors, and a panic would
-   take down the worker.
+   encoders written for `BufMut` do not check for errors. A panic would
+   close the connection under the default `TaskPanicPolicy::Contain`, and
+   shut the runtime down under `TaskPanicPolicy::Shutdown`.
 
 ## Not in scope
 
