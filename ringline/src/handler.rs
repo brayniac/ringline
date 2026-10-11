@@ -573,6 +573,14 @@ impl<'a> DriverCtx<'a> {
             // No bytes, no SQE, no completion: settle now.
             self.settled_sends_push(id, Ok(0));
         }
+        // exp/lendcap-ab: with RINGLINE_EXP_SEND_RUN set, a multi-chunk send
+        // on an idle queue is queued whole and parked, and the event loop's
+        // post-poll retry drain submits it as one coalesced sendmsg.
+        static SEND_RUN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let run = needed >= 2
+            && *SEND_RUN.get_or_init(|| std::env::var_os("RINGLINE_EXP_SEND_RUN").is_some())
+            && !self.send_queues[conn.index as usize].in_flight
+            && !self.chain_table.is_active(conn.index);
         while let Some(chunk) = chunks.next() {
             let (slot, ptr, len) = self
                 .send_copy_pool
@@ -597,7 +605,18 @@ impl<'a> DriverCtx<'a> {
                 total_len: chunk.len() as u32,
             };
 
-            self.submit_or_queue(conn.index, built);
+            if run {
+                self.send_queues[conn.index as usize].queue.push_back(built);
+            } else {
+                self.submit_or_queue(conn.index, built);
+            }
+        }
+        if run {
+            let state = &mut self.send_queues[conn.index as usize];
+            state.in_flight = true;
+            state.parked = true;
+            self.pending_send_retries
+                .push((conn.index, conn.generation, 0));
         }
 
         // Every promised slot was filled; this returns a zero remainder.

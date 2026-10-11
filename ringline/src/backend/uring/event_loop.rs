@@ -511,6 +511,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             if tasks_before == 0 {
                 diag_dead_iters += 1;
             }
+            // exp/lendcap-ab: submit sends the pass queued whole.
+            self.drain_send_retries();
 
             // Flush any SQEs enqueued by poll_ready_tasks (e.g., client sends).
             // flush() does two things:
@@ -539,6 +541,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             if !self.executor.ready_queue.is_empty() {
                 diag_tasks_fp += self.executor.ready_queue.len() as u64;
                 self.poll_ready_tasks();
+                self.drain_send_retries();
                 let _ = self.driver.ring.flush();
             }
 
