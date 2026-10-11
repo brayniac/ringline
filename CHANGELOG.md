@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- `metriken` 0.9 → 0.11.3 (`metriken-core` 0.2 → 0.3.3). The statics in
+  `ringline::metrics` are `metriken` types, so they are now 0.11's
+  `ShardedCounterGroup` and `Gauge`; their methods and the values they report
+  are unchanged. `metriken-core` declares `links = "metriken-core"`, so a
+  build holds one `metriken-core`: a dependent still on `metriken` 0.9 must
+  move to 0.11 together with this release. Until it does, Cargo resolves it
+  to the previous ringline release rather than failing. Backport of #649.
+
 ### Fixed
 
 - io_uring: `ConnCtx::forward_recv_buf` took the slot's pending recv buffer
