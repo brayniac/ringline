@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.10] - 2026-10-11
+
 ### Changed
 
 - `metriken` 0.9 → 0.11.3 (`metriken-core` 0.2 → 0.3.3). The statics in
