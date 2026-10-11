@@ -93,13 +93,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- `metriken` 0.9 → 0.11.3 (`metriken-core` 0.2 → 0.3.3). The statics in
-  `ringline::metrics` are `metriken` types, so they are now 0.11's
-  `ShardedCounterGroup` and `Gauge`; their methods and the values they report
-  are unchanged. `metriken-core` declares `links = "metriken-core"`, so a
-  build holds one `metriken-core`: a dependent still on `metriken` 0.9 must
-  move to 0.11 together with this release. (#649)
-
 - **Breaking, behaviour:** on io_uring, TCP connections arm a one-shot
   buffer-select recv and re-arm it when it completes, instead of one
   multishot recv per connection. `ConfigBuilder::recv_multishot(true)`
@@ -616,18 +609,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   example, a peer in a different address family). On macOS, `send_to` an
   address other than the peer now fails with `EISCONN` (#549).
 
-- `SendHalf::forward_recv_buf` / `Connection::forward_recv_buf` on io_uring
-  acted on the connection slot before checking the handle's generation. A
-  stale handle (its connection closed and the slot reused), called with the
-  new connection's bytes, sent the new connection's pending recv buffer to
-  it, or detached its accumulator and dropped those bytes when the send was
-  refused. It now returns `NotConnected` first, as the copy path's send
-  does. On a current handle, a whole-accumulator forward that the send
-  refused (the connection closing, or the zero-copy send slab full) also
-  dropped the accumulator's bytes; they are now put back, and once the
-  connection's Close is submitted both zero-copy paths are skipped so the
-  copy path's refusal applies. `SendHalf::forward_recv_buf` also gains the
-  documentation it was missing (#544).
+- `SendHalf::forward_recv_buf` / `Connection::forward_recv_buf` on io_uring:
+  a stale handle (its connection closed and the slot reused), called with
+  the new connection's bytes, detached the new connection's accumulator and
+  dropped those bytes when the send was refused. It now returns
+  `NotConnected` first, as the copy path's send does. On a current handle, a
+  whole-accumulator forward that the send refused (the connection closing,
+  or the zero-copy send slab full) also dropped the accumulator's bytes;
+  they are now put back, and once the connection's Close is submitted both
+  zero-copy paths are skipped so the copy path's refusal applies.
+  `SendHalf::forward_recv_buf` also gains the documentation it was missing.
+  The pending-recv-buffer part of this fix shipped in 0.6.10 (#544).
 
 - A `Waker` the runtime hands to a future only worked when woken on the
   worker thread that polled it. Woken from another thread (a plain thread or
@@ -745,15 +737,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   owns its socket, and a worker closes the connections still queued for it
   when it exits, including one that exits while the runtime keeps running
   (#545).
-
-- `ConnCtx::close` (and `Connection::close` / `SendHalf::close`, which call
-  it) on a stale handle, one whose slot had been reused by a new connection,
-  closed that new connection. It now does nothing on a stale handle, as
-  `enable_recv_forward` and `offer_for_park` already did. The same check now
-  guards `set_recv_sink` (a stale handle installed its buffer as the new
-  connection's recv sink, so that connection's bytes were written into it),
-  `take_recv_sink` (a stale handle removed the new connection's sink) and
-  `recv_timestamp` (#535).
 
 - A background thread that woke a worker after the `Runtime` had dropped
   wrote into whatever file then held the wake fd's number. Dropping the
@@ -885,6 +868,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the awaiting `send`; persistent starvation fails the waiter and closes the
   connection, like a write error. Series PR 4 of #318 (design:
   `docs/copied-send-reservation-design.md`).
+
+## [0.6.10] - 2026-10-11
+
+### Changed
+
+- `metriken` 0.9 → 0.11.3 (`metriken-core` 0.2 → 0.3.3). The statics in
+  `ringline::metrics` are `metriken` types, so they are now 0.11's
+  `ShardedCounterGroup` and `Gauge`; their methods and the values they report
+  are unchanged. `metriken-core` declares `links = "metriken-core"`, so a
+  build holds one `metriken-core`: a dependent still on `metriken` 0.9 must
+  move to 0.11 together with this release. Until it does, Cargo resolves it
+  to the previous ringline release rather than failing. Backport of #649.
+
+### Fixed
+
+- io_uring: `ConnCtx::forward_recv_buf` took the slot's pending recv buffer
+  before checking the handle's generation, so a stale handle (its
+  connection closed and the slot reused), called with the new connection's
+  bytes, sent the new connection's pending recv buffer to it. It now
+  returns `NotConnected` first, as the copy path's send does. Once the
+  connection's Close is submitted, the zero-copy branch is skipped, so the
+  copy path's refusal applies and the pending buffer stays in place.
+  Backport of #570 (#544).
+
+- io_uring and mio: `ConnCtx::close` on a stale handle, one whose slot had
+  been reused by a new connection, closed that new connection. It now does
+  nothing on a stale handle. The same check now guards `set_recv_sink` (a
+  stale handle installed its buffer as the new connection's recv sink, so
+  that connection's bytes were written into it) and `take_recv_sink` (a
+  stale handle removed the new connection's sink). On io_uring it also
+  guards `recv_timestamp`, which returned the new connection's timestamp.
+  Backport of #540 (#535).
 
 ## [0.6.9] - 2026-09-29
 
