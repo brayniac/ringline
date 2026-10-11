@@ -26,7 +26,7 @@ workers       = "8"
 client_threads = "16"
 warmup        = "10s"
 duration      = "60s"
-depths        = "1 16"
+depths        = "16"
 
 [[jobs]]
 name = "server"
@@ -76,7 +76,7 @@ unit = "resp-server"
 metrics = true
 # Linux 6.14+ charges io_uring rings to RLIMIT_MEMLOCK; the guest's 8 MiB
 # hard limit refuses 8 ringline workers there.
-payload = "ulimit -n 1048576; ulimit -l unlimited 2>/dev/null || sudo prlimit --memlock=unlimited:unlimited --pid $$; echo resp-server-limits memlock=$(ulimit -l) nofile=$(ulimit -n) >&2; exec bash /home/anvil/run-server.sh"
+payload = "ulimit -n 1048576 2>/dev/null || sudo prlimit --nofile=1048576:1048576 --pid $$; ulimit -l unlimited 2>/dev/null || sudo prlimit --memlock=unlimited:unlimited --pid $$; echo resp-server-limits memlock=$(ulimit -l) nofile=$(ulimit -n) >&2; exec bash /home/anvil/run-server.sh"
 
 [[jobs.steps]]
 type = "barrier"
@@ -133,7 +133,7 @@ payload = '''
 set -uo pipefail
 cd /home/anvil
 mkdir -p results
-ulimit -n 1048576
+ulimit -n 1048576 2>/dev/null || sudo prlimit --nofile=1048576:1048576 --pid $$
 ulimit -l unlimited 2>/dev/null || sudo prlimit --memlock=unlimited:unlimited --pid $$
 echo "client-limits memlock=$(ulimit -l) nofile=$(ulimit -n)"
 for i in $(seq 1 120); do
