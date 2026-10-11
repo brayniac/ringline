@@ -23,6 +23,7 @@ struct ProxyCfg {
     pin_to_core: bool,
     prefault_buffers: bool,
     recv_multishot: bool,
+    recv_incremental: bool,
     api: ProxyApi,
     metrics_out: Option<std::path::PathBuf>,
 }
@@ -61,6 +62,7 @@ struct EchoCfg {
     pin_to_core: bool,
     prefault_buffers: bool,
     recv_multishot: bool,
+    recv_incremental: bool,
     iowq_max_workers: Option<u32>,
     accept_mode: AcceptModeArg,
     /// Offer every connection for park after each response.
@@ -375,6 +377,13 @@ struct Args {
     #[arg(long, default_value_t = false)]
     recv_multishot: bool,
 
+    /// (ringline) Register an incremental TCP receive ring where the kernel
+    /// supports one (`ConfigBuilder::recv_incremental`). Without
+    /// `--recv-buffer-bytes`, the ring takes the geometry for its kind
+    /// instead of the one derived from `--msg-size`.
+    #[arg(long, default_value_t = false)]
+    recv_incremental: bool,
+
     /// (ringline echo) Cap each worker's bounded io-wq pool
     /// (`ConfigBuilder::iowq_max_workers`; 0 leaves the kernel default).
     /// Omitted, ringline's default applies. The knob under measurement in
@@ -440,6 +449,12 @@ fn apply_cpu_affinity(_cpus: &[usize]) {
 /// given. Called after the shutdown signal so the numbers cover the whole run.
 fn dump_runtime_metrics(path: Option<&std::path::Path>) {
     ringline_bench::runtime_metrics::print_summary();
+    // Peak resident set, for comparing ring geometries' memory.
+    if let Ok(status) = std::fs::read_to_string("/proc/self/status")
+        && let Some(line) = status.lines().find(|l| l.starts_with("VmHWM:"))
+    {
+        eprintln!("bench-server: {line}");
+    }
     if let Some(path) = path {
         match ringline_bench::runtime_metrics::dump_to(path) {
             Ok(()) => eprintln!("bench-server: wrote runtime metrics to {}", path.display()),
@@ -514,6 +529,7 @@ fn main() {
             pin_to_core,
             prefault_buffers: args.prefault_buffers,
             recv_multishot: args.recv_multishot,
+            recv_incremental: args.recv_incremental,
             api: args.proxy_api,
             metrics_out: args.metrics_out.clone(),
         }),
@@ -526,6 +542,7 @@ fn main() {
             recv_ring_size: args.recv_ring_size,
             prefault_buffers: args.prefault_buffers,
             recv_multishot: args.recv_multishot,
+            recv_incremental: args.recv_incremental,
             iowq_max_workers: args.iowq_max_workers,
             echo_mode: if args.recv_forward {
                 EchoMode::RecvForward
@@ -596,6 +613,7 @@ fn run_ringline_proxy(cfg: ProxyCfg) {
         pin_to_core,
         prefault_buffers,
         recv_multishot,
+        recv_incremental,
         api,
         metrics_out,
     } = cfg;
@@ -683,14 +701,21 @@ fn run_ringline_proxy(cfg: ProxyCfg) {
         .workers(workers)
         .pin_to_core(pin_to_core)
         .sq_entries(256)
-        .recv_buffer(recv_ring_size, recv_buf)
         .prefault_buffers(prefault_buffers)
         .recv_multishot(recv_multishot)
+        .recv_incremental(recv_incremental)
         .max_connections(16384)
         .send_pool(512, msg_size.next_power_of_two().max(4096) as u32)
-        .conn_chunk_size(conn_chunk_size)
-        .build()
-        .expect("valid config");
+        .conn_chunk_size(conn_chunk_size);
+    let config = recv_geometry(
+        config,
+        recv_incremental,
+        recv_buffer_bytes,
+        recv_ring_size,
+        recv_buf,
+    )
+    .build()
+    .expect("valid config");
 
     let builder = RinglineBuilder::new(config).bind(addr);
     let (shutdown, handles) = match api {
@@ -709,13 +734,57 @@ fn run_ringline_proxy(cfg: ProxyCfg) {
         ProxyApi::SinkFd => "forward_to",
     };
     eprintln!(
-        "bench-server: ready (backend={RINGLINE_BACKEND}, proxy -> {backend}, api={api_name}, recv_buffer={recv_ring_size}x{recv_buf} = {} MiB)",
-        (recv_ring_size as u64 * recv_buf as u64) / (1024 * 1024)
+        "bench-server: ready (backend={RINGLINE_BACKEND}, proxy -> {backend}, api={api_name}, recv_buffer={})",
+        geometry_label(
+            recv_incremental,
+            recv_buffer_bytes,
+            recv_ring_size,
+            recv_buf
+        )
     );
     shutdown.wait_on_signal();
     dump_runtime_metrics(metrics_out.as_deref());
     for h in handles {
         h.join().ok();
+    }
+}
+
+/// Set the TCP receive ring's geometry, unless `--recv-incremental` was given
+/// without `--recv-buffer-bytes`: then the ring keeps the geometry for the
+/// kind the worker selects at startup.
+fn recv_geometry(
+    builder: ringline::ConfigBuilder,
+    recv_incremental: bool,
+    recv_buffer_bytes: u32,
+    recv_ring_size: u16,
+    recv_buf: u32,
+) -> ringline::ConfigBuilder {
+    if recv_incremental && recv_buffer_bytes == 0 {
+        builder
+    } else {
+        builder.recv_buffer(recv_ring_size, recv_buf)
+    }
+}
+
+/// The receive geometry for the ready line, as `recv_geometry` applies it.
+fn geometry_label(
+    recv_incremental: bool,
+    recv_buffer_bytes: u32,
+    recv_ring_size: u16,
+    recv_buf: u32,
+) -> String {
+    if recv_incremental && recv_buffer_bytes == 0 {
+        "incremental, geometry per ring kind".to_string()
+    } else {
+        format!(
+            "{recv_ring_size}x{recv_buf} = {} MiB/worker{}",
+            (recv_ring_size as u64 * recv_buf as u64) / (1024 * 1024),
+            if recv_incremental {
+                ", incremental"
+            } else {
+                ""
+            }
+        )
     }
 }
 
@@ -733,6 +802,7 @@ fn run_ringline(cfg: EchoCfg) {
         pin_to_core,
         prefault_buffers,
         recv_multishot,
+        recv_incremental,
         iowq_max_workers,
         accept_mode,
         park,
@@ -882,14 +952,21 @@ fn run_ringline(cfg: EchoCfg) {
         // used to be proxy-only and silently ignored here, so a
         // buffer-geometry sweep over the echo path would have run every arm at
         // the same derived size and could only ever have reported "no effect".
-        .recv_buffer(recv_ring_size, recv_buf)
         .prefault_buffers(prefault_buffers)
         .recv_multishot(recv_multishot)
+        .recv_incremental(recv_incremental)
         .max_connections(16384)
         .send_pool(512, msg_size.next_power_of_two().max(4096) as u32)
         .conn_chunk_size(conn_chunk_size)
         .accept_mode(accept_mode.into())
         .tick_timeout_us(tick_timeout_us);
+    let staged = recv_geometry(
+        staged,
+        recv_incremental,
+        recv_buffer_bytes,
+        recv_ring_size,
+        recv_buf,
+    );
     let staged = match iowq_max_workers {
         Some(n) => staged.iowq_max_workers(n),
         None => staged,
@@ -977,8 +1054,13 @@ fn run_ringline(cfg: EchoCfg) {
         "forward (no io_uring)"
     };
     eprintln!(
-        "bench-server: ready (backend={RINGLINE_BACKEND}, echo_mode={mode}, effective={effective}, service_time={service_time_us}us/req, recv_buffer={recv_ring_size}x{recv_buf} = {} MiB/worker)",
-        (recv_ring_size as u64 * recv_buf as u64) / (1024 * 1024)
+        "bench-server: ready (backend={RINGLINE_BACKEND}, echo_mode={mode}, effective={effective}, service_time={service_time_us}us/req, recv_buffer={})",
+        geometry_label(
+            recv_incremental,
+            recv_buffer_bytes,
+            recv_ring_size,
+            recv_buf
+        )
     );
 
     // Block until SIGINT/SIGTERM, then trigger graceful shutdown so each
