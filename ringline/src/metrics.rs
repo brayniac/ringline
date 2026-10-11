@@ -344,10 +344,10 @@ pub mod pool {
     pub const SEND_EAGAIN: usize = 3;
     /// A connection's recv completed with `ENOBUFS` and the connection was
     /// parked until provided-ring buffers are returned (see `recv_starved` in
-    /// the uring driver). A one-shot recv (the default) is armed once per
-    /// received buffer, so under ring pressure this counts per buffer a
-    /// connection tried to receive, where a multishot recv counts once per
-    /// arm. While parked the socket
+    /// the uring driver). It counts once per recv arm that completed with
+    /// `ENOBUFS`. A one-shot recv (the default) is armed once per received
+    /// buffer and a multishot recv once per run of buffers, so the count is
+    /// not comparable between the two modes. While parked the socket
     /// is not being drained, so the kernel receive buffer fills and the
     /// advertised TCP window closes — sustained counts with large
     /// payloads mean single responses exceed the provided ring

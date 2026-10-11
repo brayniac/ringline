@@ -1035,9 +1035,10 @@ impl ConfigBuilder {
     /// submission: one connection streaming large messages receives about a
     /// fifth less per second with one-shot receives.
     ///
-    /// Direct-echo and recv-forward connections always arm one-shot
-    /// receives. With the `timestamps` feature and `timestamps(true)`, TCP
-    /// receives are multishot `recvmsg` either way. io_uring only; the mio
+    /// Direct-echo and recv-forward connections arm one-shot receives with
+    /// either setting. With the `timestamps` feature and `timestamps(true)`,
+    /// every TCP receive, including those connections', is multishot
+    /// `recvmsg`. io_uring only; the mio
     /// backend reads on readiness. **Default: false**.
     pub fn recv_multishot(mut self, enabled: bool) -> Self {
         self.config.recv_multishot = enabled;

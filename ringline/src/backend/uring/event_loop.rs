@@ -11220,6 +11220,38 @@ mod tests {
         );
     }
 
+    /// A retry is dropped, not pushed, when the slot was reused by another
+    /// connection or the connection was armed again before the drain.
+    #[test]
+    fn a_stale_rearm_retry_is_dropped() {
+        for case in ["slot reused", "armed since"] {
+            let mut el = make_test_loop();
+            let conn = accept_connection(&mut el);
+            el.driver.ring.force_push_failures(1);
+            deliver_single(&mut el, conn, 2, b"x");
+            assert_eq!(el.driver.recv_rearm_retries.len(), 1, "{case}");
+            match case {
+                "slot reused" => {
+                    let generation = el.driver.connections.generation(conn);
+                    el.driver.connections.release(conn);
+                    assert_eq!(accept_connection(&mut el), conn, "{case}");
+                    assert_ne!(el.driver.connections.generation(conn), generation);
+                }
+                _ => {
+                    el.driver
+                        .connections
+                        .get_mut(conn)
+                        .unwrap()
+                        .recv_multishot_armed = true;
+                }
+            }
+            el.driver.ring.last_pushed = None;
+            el.drain_recv_rearm_retries();
+            assert!(el.driver.recv_rearm_retries.is_empty(), "{case}");
+            assert!(el.driver.ring.last_pushed.is_none(), "{case}: re-armed");
+        }
+    }
+
     /// By default every TCP connection re-arms a one-shot recv.
     #[test]
     fn connections_re_arm_a_one_shot_recv_by_default() {
