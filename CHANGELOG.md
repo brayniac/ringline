@@ -120,12 +120,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   one-shot arms once per received buffer, so on the rig the one-shot rate
   was 0.94–2.4 times the multishot rate, depending on value size and depth.
   At depth 16 with 64 KiB values the multishot rate rose with the
-  connections accumulating on the server, to about 3 times the one-shot
-  rate. In both modes, `forward_throttled` counts every time a connection
-  reaches its hold cap, a re-arm whose SQE cannot be pushed at the end of a
-  completion is retried instead of closing the connection, and the
-  incremental-ring preflight tests one-shot as well as multishot receives,
-  falling back to plain rings if either fails.
+  connections accumulating on the server, from about the one-shot rate to 12
+  times it by the end of the run. In both modes, `forward_throttled` counts
+  every time a connection reaches its hold cap, a re-arm whose SQE cannot be
+  pushed at the end of a completion is retried instead of closing the
+  connection, and the incremental-ring preflight tests one-shot as well as
+  multishot receives, falling back to plain rings if either fails.
 
 - On io_uring, consecutive queued copy sends on one connection, plaintext
   or TLS ciphertext, go out as one `sendmsg` even when they belong to
