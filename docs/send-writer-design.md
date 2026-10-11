@@ -250,9 +250,10 @@ against the pool from the moment they are taken.
 - `send_with` attaches no id.
 - `send_with_awaited` runs `f` with no id. In the commit's `with_state` it
   registers its id (`register_send`) and attaches it to the last slot
-  (`set_send_id`). If the stale-connection check refuses the commit, it
-  withdraws the id (`withdraw_send`), as `ConnCtx::send` does. A panic in
-  `f` therefore leaves no id behind.
+  (`set_send_id`). If the commit returns `Err` (a failed writer, the
+  stale-connection check, or on TLS the encryption's admission), it
+  withdraws the id (`withdraw_send`), as `ConnCtx::send` does for any `Err`
+  from `send_awaited`. A panic in `f` leaves no id behind.
 - `send_with_backpressured(len, f)` on a plaintext connection joins the
   send-capacity FIFO (`docs/send-capacity-fifo-design.md`) with
   `ceil(len / slot_size)` slots. On its turn it reserves them, leaves
@@ -292,9 +293,9 @@ The call checks the connection's generation, and on io_uring
 ### Slot chain
 
 The writer records its slots without a heap allocation per send
-(this keeps decision 3 of `docs/backpressured-sends-series-design.md`: no
-per-send heap allocation on the copy path). `SendCopyPool` gains a `next: Vec<u16>` with one
-entry per slot. The writer keeps the first slot, the slot being filled, its
+(this keeps departure 3 of `docs/backpressured-sends-series-design.md`:
+no per-send heap allocation on the copy path). `SendCopyPool` gains a
+`next: Vec<u16>` with one entry per slot. The writer keeps the first slot, the slot being filled, its
 base pointer, capacity and fill level, and the slot count. Sealing a slot
 sets its filled length (`set_filled`) and links it to the next one. The
 internal TLS `PoolWriter` (`tls/buffered.rs`) keeps the same state in a
@@ -328,10 +329,10 @@ entries as it does to any queued send.
 
 A writer on a TLS connection writes plaintext into a buffer owned by the
 call, taken from a per-worker free list so steady-state use does not
-allocate. When the closure returns, the buffer goes to `encrypt_tls_send` (io_uring)
-or `encrypt_for_send_mio` (mio),
-so admission against the ciphertext bound and the two-copy count are what
-`send` has today.
+allocate. When the closure returns, the buffer goes to
+`encrypt_tls_send` (io_uring) or `encrypt_for_send_mio` (mio), so
+admission and copy count are what `send` has today on each backend:
+admission against the ciphertext bound on io_uring, and none on mio.
 
 The writer holds no pool reservation on TLS. `encrypt_to_sends` allocates
 ciphertext slots with `alloc_raw`, which cannot take reserved slots, and
@@ -350,7 +351,9 @@ encryption. On TLS:
   admission instead would let the closure take slots between the check and
   the encryption.
 - A buffer returned to the free list keeps at most 64 KiB of capacity, so
-  one large response does not hold memory for the life of the worker.
+  one large response does not hold memory for the life of the worker. The
+  buffer's `Drop` returns it to the list only when a driver is installed,
+  and otherwise frees it, since teardown drops tasks with no driver.
 
 The API is the same on TLS and plaintext connections; TLS gains nothing
 from it.
@@ -359,14 +362,18 @@ from it.
 
 The mio backend queues a `Vec<u8>` per send (`data.to_vec()` in
 `DriverCtx::send_inner`). On a plaintext connection, a writer on mio
-writes into that `Vec` directly,
-which removes the `to_vec` copy, and the call queues it as
+writes into that `Vec` directly, which removes the `to_vec` copy, and the
+call queues it as
 `PendingSend::plain` or `PendingSend::awaited`. As with `send` on mio, the
 pool limits only the backpressured form. Its admission reservation becomes
 the permit of a `PendingSend::bounded` entry, as in `send_bounded`
 (`docs/mio-bounded-send-design.md`). When `f` writes fewer bytes than
 `len`, the permit is narrowed with `shrink_reservation` before the entry
-is queued, as the TLS branch of mio's `send_bounded` does.
+is queued, and the capacity release is flagged (`capacity_released`) so
+the FIFO head is woken, as the TLS branch of mio's `send_bounded` does.
+When `f` writes more, the shortfall is reserved with `reserve_slots`
+before the entry is queued; that can fail, and the call then returns
+`Err` with nothing queued.
 
 ## Protocol clients
 
