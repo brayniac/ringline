@@ -295,8 +295,9 @@ The call checks the connection's generation, and on io_uring
 The writer records its slots without a heap allocation per send
 (this keeps departure 3 of `docs/backpressured-sends-series-design.md`:
 no per-send heap allocation on the copy path). `SendCopyPool` gains a
-`next: Vec<u16>` with one entry per slot. The writer keeps the first slot, the slot being filled, its
-base pointer, capacity and fill level, and the slot count. Sealing a slot
+`next: Vec<u16>` with one entry per slot. The writer keeps the first
+slot, the slot being filled, its base pointer, capacity and fill level, and
+the slot count. Sealing a slot
 sets its filled length (`set_filled`) and links it to the next one. The
 internal TLS `PoolWriter` (`tls/buffered.rs`) keeps the same state in a
 `Vec`. It can move to the chain afterwards; that is not required here.
@@ -352,8 +353,11 @@ encryption. On TLS:
   the encryption.
 - A buffer returned to the free list keeps at most 64 KiB of capacity, so
   one large response does not hold memory for the life of the worker. The
-  buffer's `Drop` returns it to the list only when a driver is installed,
-  and otherwise frees it, since teardown drops tasks with no driver.
+  commit, which already holds the driver, puts the buffer back on the list
+  itself. The buffer's `Drop` covers abnormal drops: it returns the buffer
+  through `try_with_state` when a driver is installed, and otherwise frees
+  it, since a task dropped by unguarded teardown (connection close, worker
+  exit) runs `Drop` with no driver installed.
 
 The API is the same on TLS and plaintext connections; TLS gains nothing
 from it.
@@ -371,9 +375,15 @@ the permit of a `PendingSend::bounded` entry, as in `send_bounded`
 `len`, the permit is narrowed with `shrink_reservation` before the entry
 is queued, and the capacity release is flagged (`capacity_released`) so
 the FIFO head is woken, as the TLS branch of mio's `send_bounded` does.
-When `f` writes more, the shortfall is reserved with `reserve_slots`
-before the entry is queued; that can fail, and the call then returns
-`Err` with nothing queued.
+When `f` writes more, the permit is grown in place with a new
+`SendCopyPool::grow_reservation(&mut SlotReservation, more) -> Result<(),
+ReserveError>` (mio-only, like `shrink_reservation`), which reserves the
+shortfall and adds it to the permit. It returns `TooLarge` when the
+permit's slots plus the shortfall exceed the pool, which maps to
+`InvalidInput`. On either error the call releases the permit
+(`release_permit`), cancels the id while it is still waiting, which wakes
+the next head, and the future resolves to `Err` with nothing queued (the
+closure's `R` is dropped).
 
 ## Protocol clients
 
