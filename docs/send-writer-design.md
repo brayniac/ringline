@@ -176,7 +176,12 @@ none of them:
   (`take_send`), for example one running a forward.
 
 Inside the closure the application cannot `.await`, so none of these can
-happen. The costs:
+happen to `send_with` or `send_with_awaited`. `send_with_backpressured`
+returns a future that carries only the connection token, as
+`send_backpressured`'s does, so it shares that method's exposure to a
+change of write-side owner while it waits. Its slots are taken only after
+admission, inside one poll, so the teardown and FIFO problems do not apply
+to it. The costs:
 
 - The coalescing client below keeps its own buffer.
 - An encoder that must `.await` partway through a response (a value read
@@ -185,6 +190,9 @@ happen. The costs:
   queued, as with several `send` calls today.
 - A response produced by another task arrives at the connection's task as
   bytes that already exist, so it goes through `send`.
+- The writer has no seek. An encoder that writes a body and then fills in
+  a length prefix ahead of it (HTTP/2 or gRPC frame headers) needs the
+  length first, as `contiguous` with `encoded_len()` does.
 
 ## Semantics
 
@@ -200,8 +208,10 @@ against the pool from the moment they are taken.
   there are discarded.
 - `remaining_mut()` returns `isize::MAX as usize - len()`, as `Vec<u8>`'s
   does. The `BufMut` contract does not allow it to track pool space: it may
-  change only through `advance_mut`, and the default `put_slice` panics
-  when it is smaller than the slice.
+  change only through `advance_mut` or a method documented to move the
+  position, and the default `put_slice` panics when it is smaller than the
+  slice. `discard` resets `len()` to 0 and is documented as moving the
+  position, as `Vec::clear` does.
 - When the closure returns, a failed writer releases every slot and the
   call returns `Err`, whatever the closure returned, unless the closure
   called `discard` after the failure. Nothing was queued or
@@ -238,15 +248,20 @@ against the pool from the moment they are taken.
 ### Id lifecycle per form
 
 - `send_with` attaches no id.
-- `send_with_awaited` registers its id (`register_send`), runs `f`, and on
-  success attaches the id to the last slot (`set_send_id`). On failure it
-  withdraws the id (`withdraw_send`), as `ConnCtx::send` does.
+- `send_with_awaited` runs `f` with no id. In the commit's `with_state` it
+  registers its id (`register_send`) and attaches it to the last slot
+  (`set_send_id`). If the stale-connection check refuses the commit, it
+  withdraws the id (`withdraw_send`), as `ConnCtx::send` does. A panic in
+  `f` therefore leaves no id behind.
 - `send_with_backpressured(len, f)` on a plaintext connection joins the
   send-capacity FIFO (`docs/send-capacity-fifo-design.md`) with
   `ceil(len / slot_size)` slots. On its turn it reserves them, leaves
   `with_state`, runs `f` with the reservation, commits with the id on the
   last slot, and marks the id submitted. On failure it cancels the id
-  while the id is still waiting, which wakes the next head.
+  while the id is still waiting, which wakes the next head. While `f` runs
+  the future stays in its waiting state, so a panic in `f` drops it there
+  and its `Drop` cancels the id and wakes the next head, as
+  `BackpressuredSendFuture`'s does.
   `BackpressuredSendFuture` does all of its work inside one `with_state`;
   this future has to leave it to run `f`.
 - Writing past `len`, or `contiguous` leaving slot tails unused, can need
@@ -277,8 +292,8 @@ The call checks the connection's generation, and on io_uring
 ### Slot chain
 
 The writer records its slots without a heap allocation per send
-(`docs/backpressured-sends-series-design.md` requires that no per-send heap
-allocation be added). `SendCopyPool` gains a `next: Vec<u16>` with one
+(this keeps decision 3 of `docs/backpressured-sends-series-design.md`: no
+per-send heap allocation on the copy path). `SendCopyPool` gains a `next: Vec<u16>` with one
 entry per slot. The writer keeps the first slot, the slot being filled, its
 base pointer, capacity and fill level, and the slot count. Sealing a slot
 sets its filled length (`set_filled`) and links it to the next one. The
@@ -313,7 +328,8 @@ entries as it does to any queued send.
 
 A writer on a TLS connection writes plaintext into a buffer owned by the
 call, taken from a per-worker free list so steady-state use does not
-allocate. When the closure returns, the buffer goes to `encrypt_tls_send`,
+allocate. When the closure returns, the buffer goes to `encrypt_tls_send` (io_uring)
+or `encrypt_for_send_mio` (mio),
 so admission against the ciphertext bound and the two-copy count are what
 `send` has today.
 
@@ -342,12 +358,15 @@ from it.
 ## mio
 
 The mio backend queues a `Vec<u8>` per send (`data.to_vec()` in
-`DriverCtx::send_inner`). A writer on mio writes into that `Vec` directly,
+`DriverCtx::send_inner`). On a plaintext connection, a writer on mio
+writes into that `Vec` directly,
 which removes the `to_vec` copy, and the call queues it as
 `PendingSend::plain` or `PendingSend::awaited`. As with `send` on mio, the
 pool limits only the backpressured form. Its admission reservation becomes
 the permit of a `PendingSend::bounded` entry, as in `send_bounded`
-(`docs/mio-bounded-send-design.md`).
+(`docs/mio-bounded-send-design.md`). When `f` writes fewer bytes than
+`len`, the permit is narrowed with `shrink_reservation` before the entry
+is queued, as the TLS branch of mio's `send_bounded` does.
 
 ## Protocol clients
 
@@ -414,8 +433,10 @@ Predictions, recorded before the runs:
 3. Whether a `BufMut` write that finds the pool empty is recorded until the
    call ends, as above, or panics. `Vec<u8>`'s `BufMut` cannot fail, so
    encoders written for `BufMut` do not check for errors. A panic would
-   close the connection under the default `TaskPanicPolicy::Contain`, and
-   shut the runtime down under `TaskPanicPolicy::Shutdown`.
+   close the connection when it happens in a connection task under the
+   default `TaskPanicPolicy::Contain`; in a standalone task it drops the
+   task and the connection stays open. Under `TaskPanicPolicy::Shutdown` it
+   shuts the runtime down.
 
 ## Not in scope
 
