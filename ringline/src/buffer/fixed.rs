@@ -102,7 +102,7 @@ impl FixedBufferRegistry {
     }
 
     /// Returns true if the slot is currently occupied.
-    #[allow(dead_code)] // used in tests; keep on the public surface
+    #[allow(dead_code)] // unused on the mio backend
     pub fn is_occupied(&self, slot: u16) -> bool {
         self.iovecs
             .get(slot as usize)

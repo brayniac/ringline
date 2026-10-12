@@ -665,41 +665,62 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             };
             match msg {
                 RegionControlMsg::Register { slot, region, ack } => {
-                    let result = self
-                        .driver
-                        .fixed_buffers
-                        .set_slot(slot, &region)
-                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))
-                        .and_then(|()| {
+                    let result = match self.driver.fixed_buffers.set_slot(slot, &region) {
+                        Err(e) => Err(io::Error::new(io::ErrorKind::InvalidInput, e.to_string())),
+                        Ok(()) => {
                             let iov = libc::iovec {
                                 iov_base: region.ptr() as *mut _,
                                 iov_len: region.len(),
                             };
                             // Safety: caller of `register_region` guarantees the
                             // region outlives the registration.
-                            unsafe { self.driver.ring.register_buffers_update_one(slot, iov) }
-                        });
+                            let r =
+                                unsafe { self.driver.ring.register_buffers_update_one(slot, iov) };
+                            if r.is_err() {
+                                // IORING_REGISTER_BUFFERS_UPDATE does not
+                                // change the kernel slot when it fails, so the
+                                // kernel slot is still empty. Clear the table
+                                // entry that set_slot just wrote.
+                                let _ = self.driver.fixed_buffers.clear_slot(slot);
+                            }
+                            r
+                        }
+                    };
                     let _ = ack.send(result);
                 }
                 RegionControlMsg::Unregister { slot, ack } => {
-                    let result = self
-                        .driver
-                        .fixed_buffers
-                        .clear_slot(slot)
-                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))
-                        .and_then(|()| {
-                            let iov = libc::iovec {
-                                iov_base: std::ptr::null_mut(),
-                                iov_len: 0,
-                            };
-                            // Safety: clearing a slot does not reference any user
-                            // memory; iov is null/zero.
-                            unsafe { self.driver.ring.register_buffers_update_one(slot, iov) }
-                        });
+                    let _ = ack.send(self.clear_region_slot(slot));
+                }
+                RegionControlMsg::Release { slot, ack } => {
+                    let result = if self.driver.fixed_buffers.is_occupied(slot) {
+                        self.clear_region_slot(slot)
+                    } else {
+                        Ok(())
+                    };
                     let _ = ack.send(result);
                 }
             }
         }
+    }
+
+    /// Clear the table entry, then the kernel slot. Returns `InvalidInput` if
+    /// the table slot is already empty. If the kernel call fails, the table
+    /// slot stays empty and the kernel slot keeps the region; the registrar
+    /// then does not reuse the slot.
+    fn clear_region_slot(&mut self, slot: u16) -> io::Result<()> {
+        self.driver
+            .fixed_buffers
+            .clear_slot(slot)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))
+            .and_then(|()| {
+                let iov = libc::iovec {
+                    iov_base: std::ptr::null_mut(),
+                    iov_len: 0,
+                };
+                // Safety: clearing a slot does not reference any user
+                // memory; iov is null/zero.
+                unsafe { self.driver.ring.register_buffers_update_one(slot, iov) }
+            })
     }
 
     /// Poll all tasks in the ready queue (both connection and standalone tasks).

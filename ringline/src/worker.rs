@@ -296,7 +296,11 @@ impl Runtime {
     ///   table has no free slots (size set by
     ///   [`ConfigBuilder::max_registered_regions`](crate::ConfigBuilder::max_registered_regions)).
     /// - The first kernel error reported by any worker if the underlying
-    ///   `register_buffers_update` call fails.
+    ///   `register_buffers_update` call fails. The slot is then released on
+    ///   every worker, and reused by a later registration if every release
+    ///   succeeds.
+    /// - `io::ErrorKind::Other` if a worker has exited. The slot is not
+    ///   reused, so each such failure leaves one fewer free slot.
     /// - On the mio backend (no io_uring): always returns
     ///   `io::ErrorKind::Unsupported`.
     ///

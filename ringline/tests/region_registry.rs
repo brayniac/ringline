@@ -124,3 +124,47 @@ fn initial_regions_reserve_low_slots() {
         h.join().unwrap().unwrap();
     }
 }
+
+/// A region the kernel refuses to pin fails to register, and the slot it was
+/// given is registered again afterwards.
+#[test]
+fn failed_register_leaves_the_slot_reusable() {
+    let (shutdown, handles) = RinglineBuilder::new(small_config())
+        .launch::<Idle>()
+        .unwrap();
+
+    let len = 4096;
+    let mut backing = vec![0u8; len];
+    let good = unsafe { MemoryRegion::new(backing.as_mut_ptr(), len) };
+    // Register and unregister once, so the free list's top slot is known.
+    let id0 = shutdown.register_region(good.clone()).unwrap();
+    shutdown.unregister_region(id0).unwrap();
+
+    // io_uring_register returns EFAULT for PROT_NONE pages, which cannot be
+    // pinned for writing.
+    let unpinnable = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_NONE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    assert_ne!(unpinnable, libc::MAP_FAILED);
+    let bad = unsafe { MemoryRegion::new(unpinnable.cast(), len) };
+    let err = shutdown.register_region(bad).unwrap_err();
+    assert!(err.to_string().contains("EFAULT"), "{err}");
+
+    let id = shutdown
+        .register_region(good)
+        .expect("register after a failed register");
+    assert_eq!(id, id0, "the failed register's slot is reused");
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+    unsafe { libc::munmap(unpinnable, len) };
+}
