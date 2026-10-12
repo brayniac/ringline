@@ -38,6 +38,7 @@ Usage:
 
 import argparse
 import json
+import math
 import pathlib
 
 KIB = 1024
@@ -216,6 +217,84 @@ name = "{aid}-done"
 timeout = 3600
 """
 
+# Phase q: the server exits by itself once the search's last step has closed
+# its connections, or at {server_secs} s.
+SEARCH_SERVER_ARM = """
+[[jobs.steps]]
+type = "barrier"
+name = "{aid}-start"
+timeout = 3600
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "exec"
+payload_timeout = 7200
+payload = '''
+set -uo pipefail
+mkdir -p /home/anvil/results
+sudo prlimit --nofile=1048576:1048576 --memlock=unlimited:unlimited --pid $$
+/home/anvil/out/bench-server \\
+  --runtime ringline --addr {{server_ip}}:{{port}} --workers {{workers}} \\
+  {server_args} \\
+  --exit-when-idle 5 --exit-after {server_secs} \\
+  --metrics-out /home/anvil/results/{aid}.metrics.json \\
+  > /home/anvil/results/{aid}.server.log 2>&1
+echo "server exited $?" | tee -a /home/anvil/results/{aid}.server.log
+grep -E "ready|VmHWM|panicked|exiting" /home/anvil/results/{aid}.server.log | head -6
+exit 0
+'''
+
+[[jobs.steps]]
+type = "barrier"
+name = "{aid}-done"
+timeout = 7200
+"""
+
+# Phase q: one bench-client SLO search per arm. The client prints one JSON
+# line per step and a final result line; collect.py reads them.
+SEARCH_ARM = """
+[[jobs.steps]]
+type = "barrier"
+name = "{aid}-start"
+timeout = 3600
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "exec"
+payload_timeout = 7200
+payload = '''
+set -uo pipefail
+cd /home/anvil && mkdir -p results
+sudo prlimit --nofile=1048576:1048576 --memlock=unlimited:unlimited --pid $$
+# Each step opens new connections; reuse TIME_WAIT ports so 10,000
+# connections per step do not run out of local ports.
+sudo sysctl -qw net.ipv4.tcp_tw_reuse=1
+for i in $(seq 1 120); do
+  (exec 3<>/dev/tcp/{{server_ip}}/{{port}}) 2>/dev/null && {{ exec 3>&-; break; }}
+  sleep 1
+done
+{client_cmd} --search --search-start {start} --search-factor {factor} \\
+  --search-max-rate {max_rate} --slo-p99-us {slo_us} \\
+  > results/{aid}.search.jsonl 2> results/{aid}.search.log
+echo "== {aid} bench-client exited $?"
+grep -E "bench-client: (step|search)" results/{aid}.search.log
+exit 0
+'''
+
+[[jobs.steps]]
+type = "barrier"
+name = "{aid}-done"
+timeout = 7200
+"""
+
+# Phase q search, as fractions of base's closed-loop median from phase t:
+# start at 0.5, climb by 1.25, never offer more than 8.
+SEARCH_START = 0.5
+SEARCH_FACTOR = 1.25
+SEARCH_MAX = 8.0
+# The client's defaults: bisect until within 5%, at most 8 bisection steps.
+SEARCH_MAX_BISECT = 8
+
 # Offered rates for phase s, as fractions of base's closed-loop median:
 # geometric steps of 12% from 50% to 385%. Arms stop two steps past the
 # SLO, so the upper steps run only where the SLO still holds.
@@ -362,9 +441,51 @@ upload = true
 """
 
 
+def render_search(kernel, rep, bins, workers, warmup, duration, ladder):
+    """Phase q: a bench-client SLO search per arm against one server.
+    `ladder` maps kernel -> cell id -> base's closed-loop median from
+    phase t (collect.py ladder)."""
+    names = list(ARMS)
+    k = (rep - 1) % len(names)
+    order = names[k:] + names[:k]
+    server, client = [], []
+    n = 0
+    climb = math.ceil(math.log(SEARCH_MAX / SEARCH_START) / math.log(SEARCH_FACTOR)) + 1
+    max_steps = climb + SEARCH_MAX_BISECT
+    for c in cells():
+        cid = cell_id(c)
+        # proxy-load has no open loop; open loop ignores depth, so the d16
+        # cell would repeat the 4 KiB c1000 one.
+        if c["kind"] == "proxy" or c["depth"] > 1 or cid not in ladder[kernel]:
+            continue
+        base = ladder[kernel][cid]
+        per_step = warmup + duration + (30 if c["conns"] >= 10000 else 10)
+        server_secs = max_steps * per_step + 60
+        for arm in order:
+            aid = f"{cid}-{arm}"
+            sa, cc = arm_cmds(c, arm, "t", None, warmup, duration)
+            server.append(SEARCH_SERVER_ARM.format(
+                aid=aid, server_secs=server_secs, server_args=sa,
+            ))
+            client.append(SEARCH_ARM.format(
+                aid=aid, client_cmd=cc,
+                start=max(1, int(SEARCH_START * base)), factor=SEARCH_FACTOR,
+                max_rate=max(1, int(SEARCH_MAX * base)),
+                slo_us=SLO_P99_NS[c["msg"]] // 1000,
+            ))
+            n += 1
+    head = HEAD.format(
+        phase="q", kernel=kernel, rep=rep, n=n, bins=bins,
+        image=KERNELS[kernel], workers=workers,
+    )
+    return head + "".join(server) + SERVER_TAIL + "".join(client) + CLIENT_TAIL, n
+
+
 def render(kernel, rep, phase, bins, workers, warmup, duration, rates):
     if phase == "s":
         return render_ladder(kernel, rep, bins, workers, warmup, duration, rates)
+    if phase == "q":
+        return render_search(kernel, rep, bins, workers, warmup, duration, rates)
     names = list(ARMS)
     k = (rep - 1) % len(names)
     order = names[k:] + names[:k]
@@ -432,8 +553,8 @@ def render_ladder(kernel, rep, bins, workers, warmup, duration, ladder):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bins-artifact", required=True)
-    ap.add_argument("--phase", default="t", choices=["t", "l", "s"])
-    ap.add_argument("--rates", default=None, help="phase l: JSON of cell id -> rate; phase s: kernel -> cell id -> base median")
+    ap.add_argument("--phase", default="t", choices=["t", "l", "s", "q"])
+    ap.add_argument("--rates", default=None, help="phase l: JSON of cell id -> rate; phase s and q: kernel -> cell id -> base median")
     ap.add_argument("--kernels", default=",".join(KERNELS))
     ap.add_argument("--reps", type=int, default=5)
     ap.add_argument("--workers", type=int, default=2)
@@ -443,7 +564,7 @@ def main():
     ap.add_argument("--dry", action="store_true")
     args = ap.parse_args()
     rates = json.load(open(args.rates)) if args.rates else {}
-    if args.phase in ("l", "s") and not rates:
+    if args.phase in ("l", "s", "q") and not rates:
         ap.error(f"phase {args.phase} needs --rates")
 
     out_dir = pathlib.Path(args.out or pathlib.Path(__file__).parent / f"phase-{args.phase}")
@@ -464,6 +585,9 @@ def main():
     if args.phase == "s":
         per *= len(LADDER)
         print("phase s: the estimate assumes every step runs; an arm stops after two saturated steps")
+    if args.phase == "q":
+        per = (args.warmup + args.duration + 10) * 14
+        print("phase q: the estimate assumes 14 steps per arm")
     print(f"{total} arms, about {total * per // 3600} h {total * per % 3600 // 60} min plus boots")
 
 

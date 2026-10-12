@@ -6,10 +6,14 @@
     ./collect.py rates rows.jsonl > rates.json   # phase l offered rates: 70% of base's median
     ./collect.py ladder rows.jsonl > ladder.json # phase s: base's median per kernel and cell
     ./collect.py knees rows.jsonl          # phase s: SLO-limited throughput per arm
+    ./collect.py searches rows.jsonl       # phase q: the client's search result per arm
 
 A row is one arm of one boot. A client result with zero samples or no
 JSON is kept with `ok: false`, so a failed arm is visible as one rather
-than missing.
+than missing. Phase s adds a row per ladder step (`step` sNN). Phase q adds
+a row per search step (`step` qNN) and one `search` row per arm with the
+client's result; an arm whose client printed no result line has
+`stopped: "no result"`.
 
 The gate per cell compares inc's median with the 2 x reps runs of base and
 base2 together: throughput below their minimum, or p99 above their maximum,
@@ -76,21 +80,55 @@ def rows(ids_path, out_path):
                             row["offered"] = c["offered_rate"]
                 except (ValueError, KeyError):
                     pass
-                sdir = d / "server" / "results"
-                log = sdir / f"{aid}.server.log"
-                if log.exists():
-                    text = log.read_text(errors="replace")
-                    m = re.search(r"VmHWM:\s+(\d+) kB", text)
-                    row["rss_mib"] = int(m.group(1)) / 1024 if m else None
-                    row["panic"] = "panicked" in text
-                mj = sdir / f"{aid}.metrics.json"
-                if mj.exists():
-                    for e in json.loads(mj.read_text()):
-                        if e.get("op") in COUNTERS:
-                            row[e["op"]] = e["value"]
+                row.update(server_fields(d, aid))
+                out.write(json.dumps(row) + "\n")
+            for sj in sorted((d / "client" / "results").glob("*.search.jsonl")):
+                aid = sj.name.removesuffix(".search.jsonl")
+                cell, arm = aid.rsplit("-", 1)
+                key = {"kernel": kernel, "rep": int(rep), "exp": exp, "cell": cell, "arm": arm}
+                result = None
+                for line in sj.read_text().splitlines():
+                    try:
+                        e = json.loads(line)
+                    except ValueError:
+                        continue
+                    if e.get("type") == "step":
+                        out.write(json.dumps(key | {
+                            "step": f"q{e['index']:02}", "phase": e["phase"],
+                            "offered": e["offered_rate"], "tput": e["ops_per_sec"],
+                            "p50": e["p50_ns"], "p99": e["p99_ns"], "p999": e["p999_ns"],
+                            "pass": e["pass"], "fail_reason": e["fail_reason"],
+                            "ok": e["sample_count"] > 0,
+                        }) + "\n")
+                    elif e.get("type") in ("result", "step_timeout"):
+                        result = e
+                row = key | {"search": True, "ok": False, "knee": None, "stopped": "no result"}
+                if result and result["type"] == "result":
+                    row.update(ok=True, knee=result["knee"], stopped=result["stopped"], steps=result["steps"])
+                elif result:
+                    row["stopped"] = f"step_timeout at step {result['index']}"
+                row.update(server_fields(d, aid))
                 out.write(json.dumps(row) + "\n")
         out.flush()
         print(kernel, rep, exp, file=sys.stderr)
+
+
+def server_fields(d, aid):
+    """Peak RSS, panic, and ring counters from one arm's server results."""
+    row = {}
+    sdir = d / "server" / "results"
+    log = sdir / f"{aid}.server.log"
+    if log.exists():
+        text = log.read_text(errors="replace")
+        m = re.search(r"VmHWM:\s+(\d+) kB", text)
+        row["rss_mib"] = int(m.group(1)) / 1024 if m else None
+        row["panic"] = "panicked" in text
+    mj = sdir / f"{aid}.metrics.json"
+    if mj.exists():
+        for e in json.loads(mj.read_text()):
+            if e.get("op") in COUNTERS:
+                row[e["op"]] = e["value"]
+    return row
 
 
 def load(path):
@@ -174,7 +212,7 @@ def knees(path):
     """Per kernel, cell and arm: the highest achieved rate over the ladder
     steps that achieved at least 90% of the offered rate with p99 within
     the cell's SLO. Medians over reps; inc is compared with base and base2."""
-    rs = [r for r in load(path) if r.get("step") and r["ok"]]
+    rs = [r for r in load(path) if r.get("step", "").startswith("s") and r["ok"]]
     per = {}
     for r in rs:
         msg = int(re.search(r"-(\d+)b-", r["cell"]).group(1))
@@ -203,8 +241,30 @@ def knees(path):
     print("knee: k ops/s achieved at the highest step meeting p99 SLO and >= 90% of offered; 0 = no step met it")
 
 
+def searches(path):
+    """Phase q: per kernel, cell and arm, the median over reps of the
+    client's knee, the highest offered rate whose step passed the SLO. An
+    arm with no passing step counts as 0. inc is compared with base and
+    base2; any arm that did not converge is named in the note."""
+    rs = [r for r in load(path) if r.get("search")]
+    g = group(rs)
+    print(f"{'kernel':5} {'cell':24} {'base':>10} {'A/A min-max':>21} {'inc':>10} {'d%':>7} note")
+    for (kernel, cell) in sorted(g):
+        arms = g[(kernel, cell)]
+        knee = {a: [r["knee"] or 0 for r in v] for a, v in arms.items()}
+        b = knee.get("base", []) + knee.get("base2", [])
+        if not b or not knee.get("inc"):
+            continue
+        bm, im = med(knee["base"]), med(knee["inc"])
+        d = f"{100 * (im / bm - 1):7.1f}" if bm else "      -"
+        odd = sorted({f"{r['arm']} r{r['rep']}: {r['stopped']}" for v in arms.values() for r in v
+                      if r["stopped"] != "converged"})
+        print(f"{kernel:5} {cell:24} {bm / 1e3:10.1f} {min(b) / 1e3:10.1f}-{max(b) / 1e3:<10.1f} {im / 1e3:10.1f} {d} {'; '.join(odd)}")
+    print("knee: k req/s offered at the highest search step meeting the p99 SLO and >= 90% of offered; 0 = none")
+
+
 if __name__ == "__main__":
     cmd = sys.argv[1]
     {"rows": lambda: rows(sys.argv[2], sys.argv[3]), "table": lambda: table(sys.argv[2]),
      "rates": lambda: rates(sys.argv[2]), "ladder": lambda: ladder(sys.argv[2]),
-     "knees": lambda: knees(sys.argv[2])}[cmd]()
+     "knees": lambda: knees(sys.argv[2]), "searches": lambda: searches(sys.argv[2])}[cmd]()

@@ -398,6 +398,87 @@ struct Args {
     /// Pass `--workers N` to match the number of physical cores in the list.
     #[arg(long)]
     cpu_list: Option<String>,
+
+    /// Exit once connections to the listen port have been seen and none has
+    /// been established for this many seconds. The process sends itself
+    /// SIGTERM, so a ringline server shuts down as it does on a signal and
+    /// writes its metrics. 0 is off.
+    #[arg(long, default_value_t = 0)]
+    exit_when_idle: u64,
+
+    /// Exit this many seconds after start, whether or not connections are
+    /// open, by the same SIGTERM. 0 is off.
+    #[arg(long, default_value_t = 0)]
+    exit_after: u64,
+}
+
+/// Established TCP connections whose local port is `port`, from
+/// /proc/net/tcp and /proc/net/tcp6. A file that cannot be read counts as
+/// none.
+fn established_on_port(port: u16) -> usize {
+    const ESTABLISHED: &str = "01";
+    let mut n = 0;
+    for path in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let Ok(table) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        for line in table.lines().skip(1) {
+            let mut fields = line.split_whitespace();
+            let (Some(local), Some(_remote), Some(state)) =
+                (fields.nth(1), fields.next(), fields.next())
+            else {
+                continue;
+            };
+            let local_port = local
+                .rsplit_once(':')
+                .and_then(|(_, p)| u16::from_str_radix(p, 16).ok());
+            if state == ESTABLISHED && local_port == Some(port) {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// Starts the thread behind `--exit-when-idle` and `--exit-after`.
+fn spawn_exit_watch(port: u16, idle_secs: u64, after_secs: u64) {
+    if idle_secs == 0 && after_secs == 0 {
+        return;
+    }
+    std::thread::spawn(move || {
+        let start = std::time::Instant::now();
+        let mut seen = false;
+        let mut idle_since: Option<std::time::Instant> = None;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let reason = if after_secs > 0 && start.elapsed().as_secs() >= after_secs {
+                Some(format!("--exit-after {after_secs} s reached"))
+            } else if idle_secs > 0 {
+                let n = established_on_port(port);
+                if n > 0 {
+                    seen = true;
+                    idle_since = None;
+                    None
+                } else if seen {
+                    let since = *idle_since.get_or_insert_with(std::time::Instant::now);
+                    (since.elapsed().as_secs() >= idle_secs)
+                        .then(|| format!("no connections for {idle_secs} s"))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                eprintln!(
+                    "bench-server: exiting, {reason} ({:.1} s after start)",
+                    start.elapsed().as_secs_f64()
+                );
+                unsafe { libc::kill(libc::getpid(), libc::SIGTERM) };
+                return;
+            }
+        }
+    });
 }
 
 /// Parse a cpu-list spec (`0-7,16-23` / `12,13,14,15`) into logical CPU ids.
@@ -516,6 +597,8 @@ fn main() {
         "bench-server: {} runtime, {} workers, listening on {}",
         runtime_name, workers, args.addr,
     );
+
+    spawn_exit_watch(args.addr.port(), args.exit_when_idle, args.exit_after);
 
     match runtime {
         Runtime::Ringline if args.proxy_backend.is_some() => run_ringline_proxy(ProxyCfg {
