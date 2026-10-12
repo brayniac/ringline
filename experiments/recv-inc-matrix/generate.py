@@ -441,7 +441,7 @@ upload = true
 """
 
 
-def render_search(kernel, rep, bins, workers, warmup, duration, ladder):
+def render_search(kernel, rep, bins, workers, warmup, duration, ladder, only=None):
     """Phase q: a bench-client SLO search per arm against one server.
     `ladder` maps kernel -> cell id -> base's closed-loop median from
     phase t (collect.py ladder)."""
@@ -457,6 +457,8 @@ def render_search(kernel, rep, bins, workers, warmup, duration, ladder):
         # proxy-load has no open loop; open loop ignores depth, so the d16
         # cell would repeat the 4 KiB c1000 one.
         if c["kind"] == "proxy" or c["depth"] > 1 or cid not in ladder[kernel]:
+            continue
+        if only and cid not in only:
             continue
         base = ladder[kernel][cid]
         per_step = warmup + duration + (30 if c["conns"] >= 10000 else 10)
@@ -481,11 +483,11 @@ def render_search(kernel, rep, bins, workers, warmup, duration, ladder):
     return head + "".join(server) + SERVER_TAIL + "".join(client) + CLIENT_TAIL, n
 
 
-def render(kernel, rep, phase, bins, workers, warmup, duration, rates):
+def render(kernel, rep, phase, bins, workers, warmup, duration, rates, only=None):
     if phase == "s":
         return render_ladder(kernel, rep, bins, workers, warmup, duration, rates)
     if phase == "q":
-        return render_search(kernel, rep, bins, workers, warmup, duration, rates)
+        return render_search(kernel, rep, bins, workers, warmup, duration, rates, only)
     names = list(ARMS)
     k = (rep - 1) % len(names)
     order = names[k:] + names[:k]
@@ -561,6 +563,7 @@ def main():
     ap.add_argument("--warmup", type=int, default=3)
     ap.add_argument("--duration", type=int, default=12)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--cells", default=None, help="phase q: comma-separated cell ids to keep")
     ap.add_argument("--dry", action="store_true")
     args = ap.parse_args()
     rates = json.load(open(args.rates)) if args.rates else {}
@@ -574,6 +577,7 @@ def main():
             text, n = render(
                 kernel, rep, args.phase, args.bins_artifact, args.workers,
                 args.warmup, args.duration, rates,
+                set(args.cells.split(",")) if args.cells else None,
             )
             total += n
             path = out_dir / f"{kernel}-rep{rep}.toml"
