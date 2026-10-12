@@ -322,6 +322,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- io_uring: a `Runtime::register_region` that the kernel refused on any worker
+  left the slot unusable. Each worker recorded the region in its slot table
+  before the kernel call and kept the entry when the call failed. Workers
+  whose call succeeded kept the registration. The slot went back to the free
+  list, so the next `register_region` got the same slot and failed on every
+  worker with `InvalidInput`, and retrying a failed registration did not
+  succeed. A worker whose kernel call fails now clears its table entry, and a
+  failed `register_region` then releases the slot on every worker, a second
+  round trip. The slot goes back to the free list only if every worker
+  acknowledges the release. If a worker has exited, or its release fails, the
+  slot is not returned and later registrations use other slots, so a runtime
+  with an exited worker loses one slot per failed `register_region`.
+  `register_region` and `unregister_region` now still reach the remaining
+  workers when one worker has exited, and `unregister_region` then clears the
+  slot on every running worker before returning the error.
+
 - On io_uring, an awaited send could resolve with another send's result. A
   connection had one send waiter, and any send completion on it woke the
   waiter: a `send().await` behind a `send_nowait`, an unawaited chain, a
