@@ -294,6 +294,9 @@ SEARCH_FACTOR = 1.25
 SEARCH_MAX = 8.0
 # The client's defaults: bisect until within 5%, at most 8 bisection steps.
 SEARCH_MAX_BISECT = 8
+# With --reuse: the search keeps one set of connections and changes the rate
+# in place, waiting this long after each change before measuring.
+SEARCH_DRAIN_MS = 1000
 
 # Offered rates for phase s, as fractions of base's closed-loop median:
 # geometric steps of 12% from 50% to 385%. Arms stop two steps past the
@@ -441,7 +444,7 @@ upload = true
 """
 
 
-def render_search(kernel, rep, bins, workers, warmup, duration, ladder, only=None):
+def render_search(kernel, rep, bins, workers, warmup, duration, ladder, only=None, reuse=False):
     """Phase q: a bench-client SLO search per arm against one server.
     `ladder` maps kernel -> cell id -> base's closed-loop median from
     phase t (collect.py ladder)."""
@@ -466,6 +469,8 @@ def render_search(kernel, rep, bins, workers, warmup, duration, ladder, only=Non
         for arm in order:
             aid = f"{cid}-{arm}"
             sa, cc = arm_cmds(c, arm, "t", None, warmup, duration)
+            if reuse:
+                cc += f" --search-reuse --drain-window-ms {SEARCH_DRAIN_MS}"
             server.append(SEARCH_SERVER_ARM.format(
                 aid=aid, server_secs=server_secs, server_args=sa,
             ))
@@ -483,11 +488,11 @@ def render_search(kernel, rep, bins, workers, warmup, duration, ladder, only=Non
     return head + "".join(server) + SERVER_TAIL + "".join(client) + CLIENT_TAIL, n
 
 
-def render(kernel, rep, phase, bins, workers, warmup, duration, rates, only=None):
+def render(kernel, rep, phase, bins, workers, warmup, duration, rates, only=None, reuse=False):
     if phase == "s":
         return render_ladder(kernel, rep, bins, workers, warmup, duration, rates)
     if phase == "q":
-        return render_search(kernel, rep, bins, workers, warmup, duration, rates, only)
+        return render_search(kernel, rep, bins, workers, warmup, duration, rates, only, reuse)
     names = list(ARMS)
     k = (rep - 1) % len(names)
     order = names[k:] + names[:k]
@@ -564,6 +569,7 @@ def main():
     ap.add_argument("--duration", type=int, default=12)
     ap.add_argument("--out", default=None)
     ap.add_argument("--cells", default=None, help="phase q: comma-separated cell ids to keep")
+    ap.add_argument("--reuse", action="store_true", help="phase q: one set of connections per search (--search-reuse)")
     ap.add_argument("--dry", action="store_true")
     args = ap.parse_args()
     rates = json.load(open(args.rates)) if args.rates else {}
@@ -578,6 +584,7 @@ def main():
                 kernel, rep, args.phase, args.bins_artifact, args.workers,
                 args.warmup, args.duration, rates,
                 set(args.cells.split(",")) if args.cells else None,
+                args.reuse,
             )
             total += n
             path = out_dir / f"{kernel}-rep{rep}.toml"

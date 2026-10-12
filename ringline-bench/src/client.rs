@@ -3,7 +3,31 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::stats::{BenchResult, LatencyHistogram, process_cpu_time_ns};
+use crate::stats::{BenchResult, LatencyHistogram, LatencyStats, process_cpu_time_ns};
+
+/// Shared state of an open-loop run whose offered rate changes while its
+/// connections stay open ([`LiveOpenLoop`]). Each connection reads `rate`
+/// again when `generation` changes, and records every response's
+/// coordinated-omission-corrected time into `hist`.
+pub struct LiveCtl {
+    rate: AtomicU64,
+    generation: AtomicU64,
+    hist: histogram::AtomicHistogram,
+    /// Connections currently open.
+    conns: AtomicU64,
+}
+
+impl LiveCtl {
+    fn new(rate: u64) -> Self {
+        Self {
+            rate: AtomicU64::new(rate),
+            generation: AtomicU64::new(0),
+            // 2^-7 relative bucket width (under 1% error), values to 2^64 ns.
+            hist: histogram::AtomicHistogram::new(7, 64).expect("valid histogram config"),
+            conns: AtomicU64::new(0),
+        }
+    }
+}
 
 /// Open-loop load configuration.
 ///
@@ -267,7 +291,7 @@ mod ringline_client {
         connect, sleep, spawn,
     };
 
-    use super::OpenLoop;
+    use super::{LiveCtl, OpenLoop};
 
     /// A fraction in [0, 1) that differs per call: successive multiples of
     /// the golden-ratio conjugate, which stay evenly spread for any count.
@@ -307,6 +331,9 @@ mod ringline_client {
         /// CO-corrected response time (recv - scheduled).
         pub svc: Arc<Mutex<Vec<Vec<u64>>>>,
         pub lag: Arc<Mutex<Vec<Vec<u64>>>>,
+        /// `Some` => open loop whose rate changes in place ([`super::LiveOpenLoop`]);
+        /// responses go to its histogram and the sample vecs stay empty.
+        pub live: Option<Arc<super::LiveCtl>>,
     }
 
     struct ClientHandler {
@@ -473,13 +500,19 @@ mod ringline_client {
         };
         // Reading an outbound connection goes through its read half.
         let (mut conn_tx, mut conn_rx) = conn.split();
+        let live: Option<&LiveCtl> = state.live.as_deref();
+        if let Some(l) = live {
+            l.conns.fetch_add(1, Ordering::Relaxed);
+        }
 
         let msg_size = state.msg_size;
         let msg = vec![0xABu8; msg_size];
+        let num_clients = state.num_clients.max(1) as f64;
         // Below 1/s per connection is allowed: 1 MiB echo at 1000 connections
         // saturates at a few hundred requests/s in total.
-        let per_conn_rate = ol.rate as f64 / state.num_clients.max(1) as f64;
-        let interval = 1.0 / per_conn_rate;
+        let mut generation = live.map_or(0, |l| l.generation.load(Ordering::Acquire));
+        let rate = live.map_or(ol.rate, |l| l.rate.load(Ordering::Relaxed));
+        let mut interval = num_clients / rate.max(1) as f64;
 
         // Single interleaved task: send a bounded burst of due requests, then do
         // one recv (the await is the yield point that lets other connections on
@@ -491,7 +524,10 @@ mod ringline_client {
         // Spread the connections' schedules across one interval. Without this
         // every connection's first request is due when it connects, and at
         // rates below a few per second per connection they all send together.
-        let start = Instant::now() + Duration::from_secs_f64(interval * schedule_phase());
+        let phase = schedule_phase();
+        let mut start = Instant::now() + Duration::from_secs_f64(interval * phase);
+        // Requests sent since `start`; the next is due at
+        // `start + interval * sent`.
         let mut sent: u64 = 0;
         let mut fifo: VecDeque<(Instant, Instant)> = VecDeque::new();
         let mut samples: Vec<u64> = Vec::with_capacity(1_000_000);
@@ -509,6 +545,19 @@ mod ringline_client {
             // flush its recorded samples.
             if state.stop.load(Ordering::Relaxed) {
                 break;
+            }
+
+            // A rate change starts a new schedule from now, at the same phase
+            // within the new interval. Requests already in flight keep their
+            // scheduled times; a backlog behind the old schedule is dropped.
+            if let Some(l) = live {
+                let g = l.generation.load(Ordering::Acquire);
+                if g != generation {
+                    generation = g;
+                    interval = num_clients / l.rate.load(Ordering::Relaxed).max(1) as f64;
+                    start = Instant::now() + Duration::from_secs_f64(interval * phase);
+                    sent = 0;
+                }
             }
 
             // Send all currently-due requests, bounded by in-flight and a burst
@@ -574,9 +623,14 @@ mod ringline_client {
             partial -= completed * msg_size;
             let measuring = state.measure.load(Ordering::Relaxed);
             for _ in 0..completed {
-                if let Some((sched, sent_at)) = fifo.pop_front()
-                    && measuring
-                {
+                let Some((sched, sent_at)) = fifo.pop_front() else {
+                    continue;
+                };
+                if let Some(l) = live {
+                    let ns = sched.elapsed().as_nanos() as u64;
+                    l.hist.increment(ns).ok();
+                }
+                if measuring {
                     let now = Instant::now();
                     samples.push(now.saturating_duration_since(sched).as_nanos() as u64);
                     svc.push(now.saturating_duration_since(sent_at).as_nanos() as u64);
@@ -587,6 +641,9 @@ mod ringline_client {
                     }
                 }
             }
+        }
+        if let Some(l) = live {
+            l.conns.fetch_sub(1, Ordering::Relaxed);
         }
         state.ops.fetch_add(local_ops & 0xFF, Ordering::Relaxed);
         state.histograms.lock().unwrap().push(samples);
@@ -886,6 +943,7 @@ fn run_bench_ringline(
         open,
         svc: svc.clone(),
         lag: lag.clone(),
+        live: None,
     });
 
     let client_rt = match ringline_client::RinglineClientRuntime::start(state, workers.max(1)) {
@@ -949,5 +1007,158 @@ fn run_bench_ringline(
         total_ops,
         latency: merged.finalize(),
         cpu_ns: cpu_after.saturating_sub(cpu_before),
+    }
+}
+
+// ── Open loop with in-place rate changes ───────────────────────────
+
+/// A point-in-time copy of a [`LiveOpenLoop`]'s response histogram.
+pub struct LiveSnapshot {
+    hist: histogram::Histogram,
+    at: Instant,
+}
+
+/// An open-loop ringline client whose connections stay open while
+/// [`set_rate`](Self::set_rate) changes the offered rate, for an SLO search
+/// that measures every step on the same connections. A step is measured by
+/// a [`snapshot`](Self::snapshot) at its start and end and
+/// [`LiveOpenLoop::step`] on the two.
+pub struct LiveOpenLoop {
+    ctl: Arc<LiveCtl>,
+    stop: Arc<AtomicBool>,
+    rt: ringline_client::RinglineClientRuntime,
+}
+
+impl LiveOpenLoop {
+    pub fn start(
+        addr: &str,
+        num_clients: usize,
+        msg_size: usize,
+        workers: usize,
+        max_inflight: usize,
+        conn_chunk_size: usize,
+        rate: u64,
+    ) -> Result<Self, String> {
+        wait_for_server(addr);
+        let ctl = Arc::new(LiveCtl::new(rate));
+        let stop = Arc::new(AtomicBool::new(false));
+        let state = Arc::new(ringline_client::ClientState {
+            target: addr
+                .parse()
+                .map_err(|e| format!("invalid addr {addr}: {e}"))?,
+            msg_size,
+            num_clients,
+            depth: 1,
+            num_workers: workers.max(1),
+            conn_chunk_size,
+            stop: stop.clone(),
+            measure: Arc::new(AtomicBool::new(false)),
+            ops: Arc::new(AtomicU64::new(0)),
+            histograms: Arc::new(Mutex::new(Vec::new())),
+            open: Some(OpenLoop { rate, max_inflight }),
+            svc: Arc::new(Mutex::new(Vec::new())),
+            lag: Arc::new(Mutex::new(Vec::new())),
+            live: Some(ctl.clone()),
+        });
+        let rt = ringline_client::RinglineClientRuntime::start(state, workers.max(1))
+            .map_err(|e| format!("ringline client failed to start: {e}"))?;
+        Ok(Self { ctl, stop, rt })
+    }
+
+    /// Offer `rate` requests/s in total from now on.
+    pub fn set_rate(&self, rate: u64) {
+        self.ctl.rate.store(rate, Ordering::Relaxed);
+        self.ctl.generation.fetch_add(1, Ordering::Release);
+    }
+
+    /// Connections open now.
+    pub fn connections(&self) -> u64 {
+        self.ctl.conns.load(Ordering::Relaxed)
+    }
+
+    pub fn snapshot(&self) -> LiveSnapshot {
+        LiveSnapshot {
+            hist: self.ctl.hist.load(),
+            at: Instant::now(),
+        }
+    }
+
+    /// Achieved responses/s and latency between two snapshots.
+    pub fn step(before: &LiveSnapshot, after: &LiveSnapshot) -> (f64, LatencyStats) {
+        let delta = after
+            .hist
+            .wrapping_sub(&before.hist)
+            .expect("snapshots of one histogram share a config");
+        let count: u64 = delta.iter().map(|b| b.count()).sum();
+        let secs = after.at.saturating_duration_since(before.at).as_secs_f64();
+        let pct = |q: f64| -> u64 {
+            delta
+                .quantile(q)
+                .ok()
+                .flatten()
+                .and_then(|r| r.entries().values().next().map(|b| b.end()))
+                .unwrap_or(0)
+        };
+        // The histogram has no exact sum; the mean is over bucket midpoints.
+        let mean_ns = if count == 0 {
+            0
+        } else {
+            (delta
+                .iter()
+                .map(|b| (b.start() as u128 + b.end() as u128) / 2 * b.count() as u128)
+                .sum::<u128>()
+                / count as u128) as u64
+        };
+        let stats = LatencyStats {
+            mean_ns,
+            p50_ns: pct(0.5),
+            p90_ns: pct(0.9),
+            p99_ns: pct(0.99),
+            p999_ns: pct(0.999),
+            p9999_ns: pct(0.9999),
+            max_ns: pct(1.0),
+            count,
+        };
+        (if secs > 0.0 { count as f64 / secs } else { 0.0 }, stats)
+    }
+
+    pub fn stop(self) {
+        self.stop.store(true, Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(200));
+        self.rt.stop();
+    }
+}
+
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+
+    #[test]
+    fn step_reports_only_the_window_between_snapshots() {
+        let ctl = LiveCtl::new(1000);
+        // Recorded before the window: must not appear in the step.
+        for _ in 0..1000 {
+            ctl.hist.increment(1_000_000_000).unwrap();
+        }
+        let before = LiveSnapshot {
+            hist: ctl.hist.load(),
+            at: Instant::now(),
+        };
+        for us in 1..=1000u64 {
+            ctl.hist.increment(us * 1000).unwrap();
+        }
+        let after = LiveSnapshot {
+            hist: ctl.hist.load(),
+            at: before.at + Duration::from_secs(2),
+        };
+        let (rate, lat) = LiveOpenLoop::step(&before, &after);
+        assert_eq!(lat.count, 1000);
+        assert_eq!(rate, 500.0);
+        // Bucket ends are within 2^-7 of the value.
+        let near = |got: u64, want: u64| (got as f64 - want as f64).abs() / want as f64 <= 0.01;
+        assert!(near(lat.p50_ns, 500_000), "p50 {}", lat.p50_ns);
+        assert!(near(lat.p99_ns, 990_000), "p99 {}", lat.p99_ns);
+        assert!(near(lat.max_ns, 1_000_000), "max {}", lat.max_ns);
+        assert!(near(lat.mean_ns, 500_500), "mean {}", lat.mean_ns);
     }
 }

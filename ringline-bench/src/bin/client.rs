@@ -16,9 +16,9 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use serde::Serialize;
 
-use ringline_bench::client::{OpenLoop, run_bench};
+use ringline_bench::client::{LiveOpenLoop, OpenLoop, run_bench};
 use ringline_bench::search::{RateSearch, SearchOutcome, SearchPhase, Slo};
-use ringline_bench::stats::BenchResult;
+use ringline_bench::stats::LatencyStats;
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum Runtime {
@@ -101,10 +101,24 @@ struct Args {
     /// they are within `--search-tolerance` of each other or
     /// `--search-max-bisect` bisection steps have run. Each step is a
     /// separate open-loop run with new connections: `--warmup` seconds, then
-    /// `--duration` seconds measured. Prints one JSON line per step and a
-    /// final `"type":"result"` line with the highest passing rate.
+    /// `--duration` seconds measured; with `--search-reuse`, the steps share
+    /// one set of connections. Prints one JSON line per step and a final
+    /// `"type":"result"` line with the highest passing rate.
     #[arg(long, conflicts_with_all = ["open", "rate"])]
     search: bool,
+
+    /// Keep one set of connections open for the whole search and change the
+    /// offered rate in place, as cachecannon does. `--warmup` runs once, at
+    /// the start rate. Each step then waits `--drain-window-ms` for requests
+    /// sent at the previous rate, and measures `--duration` seconds. ringline
+    /// runtime only.
+    #[arg(long, requires = "search")]
+    search_reuse: bool,
+
+    /// With `--search-reuse`: milliseconds after a rate change before a
+    /// step's measurement starts.
+    #[arg(long, default_value_t = 500)]
+    drain_window_ms: u64,
 
     /// First offered rate of the search, requests/s.
     #[arg(long, default_value_t = 1000)]
@@ -176,6 +190,9 @@ struct StepReport {
     sample_count: u64,
     pass: bool,
     fail_reason: Option<String>,
+    /// With `--search-reuse`: connections open at the end of the step.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    connections: Option<u64>,
 }
 
 /// The search's final line.
@@ -188,6 +205,8 @@ struct SearchReport {
     msg_size: usize,
     warmup_secs: u64,
     duration_secs: u64,
+    reuse_connections: bool,
+    drain_window_ms: Option<u64>,
     slo_p50_ns: Option<u64>,
     slo_p99_ns: Option<u64>,
     slo_p999_ns: Option<u64>,
@@ -340,6 +359,8 @@ fn run_search(args: &Args, runtime_name: &str, threads: usize) {
         Some("--search-tolerance must be in [0, 1)")
     } else if args.search_start == 0 || args.search_max_rate < args.search_start {
         Some("--search-start must be at least 1 and at most --search-max-rate")
+    } else if args.search_reuse && args.runtime != Runtime::Ringline {
+        Some("--search-reuse needs --runtime ringline")
     } else {
         None
     };
@@ -348,7 +369,12 @@ fn run_search(args: &Args, runtime_name: &str, threads: usize) {
         std::process::exit(2);
     }
 
-    let step_secs = args.warmup + args.duration;
+    let drain = Duration::from_millis(args.drain_window_ms);
+    let step_secs = if args.search_reuse {
+        (drain + Duration::from_secs(args.duration)).as_secs() + 1
+    } else {
+        args.warmup + args.duration
+    };
     let step_limit = Duration::from_secs(step_secs + args.step_grace);
     let watchdog = StepWatchdog::start(step_limit);
 
@@ -360,6 +386,33 @@ fn run_search(args: &Args, runtime_name: &str, threads: usize) {
         args.search_max_bisect,
     );
     let began = Instant::now();
+    let live = if args.search_reuse {
+        eprintln!(
+            "bench-client: search opens {} connections at {} rps, {} s warmup",
+            args.clients,
+            search.current_rate(),
+            args.warmup
+        );
+        watchdog.arm(0, search.current_rate());
+        let live = LiveOpenLoop::start(
+            &args.addr,
+            args.clients,
+            args.msg_size,
+            threads,
+            args.max_inflight,
+            args.conn_chunk_size,
+            search.current_rate(),
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        });
+        std::thread::sleep(Duration::from_secs(args.warmup));
+        watchdog.disarm();
+        Some(live)
+    } else {
+        None
+    };
     let mut index = 0;
     let (knee, stopped) = loop {
         let rate = search.current_rate();
@@ -378,24 +431,52 @@ fn run_search(args: &Args, runtime_name: &str, threads: usize) {
             args.addr,
         );
         watchdog.arm(index, rate);
-        let result = run_bench(
-            &args.addr,
-            args.clients,
-            args.msg_size,
-            args.depth,
-            Duration::from_secs(args.warmup),
-            Duration::from_secs(args.duration),
-            args.runtime == Runtime::Ringline,
-            threads,
-            Some(OpenLoop {
-                rate,
-                max_inflight: args.max_inflight,
-            }),
-            args.conn_chunk_size,
-        );
+        let (ops_per_sec, total_ops, latency, connections) = match &live {
+            Some(live) => {
+                live.set_rate(rate);
+                std::thread::sleep(drain);
+                let before = live.snapshot();
+                std::thread::sleep(Duration::from_secs(args.duration));
+                let after = live.snapshot();
+                let (ops_per_sec, latency) = LiveOpenLoop::step(&before, &after);
+                (
+                    ops_per_sec,
+                    latency.count,
+                    latency,
+                    Some(live.connections()),
+                )
+            }
+            None => {
+                let result = run_bench(
+                    &args.addr,
+                    args.clients,
+                    args.msg_size,
+                    args.depth,
+                    Duration::from_secs(args.warmup),
+                    Duration::from_secs(args.duration),
+                    args.runtime == Runtime::Ringline,
+                    threads,
+                    Some(OpenLoop {
+                        rate,
+                        max_inflight: args.max_inflight,
+                    }),
+                    args.conn_chunk_size,
+                );
+                (result.ops_per_sec, result.total_ops, result.latency, None)
+            }
+        };
         watchdog.disarm();
-        let fail_reason = slo.check(rate, result.ops_per_sec, &result.latency);
-        print_step(index, phase, rate, &result, fail_reason.clone());
+        let fail_reason = slo.check(rate, ops_per_sec, &latency);
+        print_step(
+            index,
+            phase,
+            rate,
+            ops_per_sec,
+            total_ops,
+            &latency,
+            connections,
+            fail_reason.clone(),
+        );
         index += 1;
         match search.advance(fail_reason.is_none()) {
             SearchOutcome::Probe(_) => {}
@@ -409,6 +490,12 @@ fn run_search(args: &Args, runtime_name: &str, threads: usize) {
         }
     };
 
+    if let Some(live) = live {
+        watchdog.arm(index, 0);
+        live.stop();
+        watchdog.disarm();
+    }
+
     let report = SearchReport {
         r#type: "result",
         addr: args.addr.clone(),
@@ -417,6 +504,8 @@ fn run_search(args: &Args, runtime_name: &str, threads: usize) {
         msg_size: args.msg_size,
         warmup_secs: args.warmup,
         duration_secs: args.duration,
+        reuse_connections: args.search_reuse,
+        drain_window_ms: args.search_reuse.then_some(args.drain_window_ms),
         slo_p50_ns: slo.p50_ns,
         slo_p99_ns: slo.p99_ns,
         slo_p999_ns: slo.p999_ns,
@@ -432,21 +521,24 @@ fn run_search(args: &Args, runtime_name: &str, threads: usize) {
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn print_step(
     index: usize,
     phase: SearchPhase,
     rate: u64,
-    result: &BenchResult,
+    ops_per_sec: f64,
+    total_ops: u64,
+    lat: &LatencyStats,
+    connections: Option<u64>,
     fail_reason: Option<String>,
 ) {
-    let lat = &result.latency;
     let step = StepReport {
         r#type: "step",
         index,
         phase: phase.as_str(),
         offered_rate: rate,
-        ops_per_sec: result.ops_per_sec,
-        total_ops: result.total_ops,
+        ops_per_sec,
+        total_ops,
         mean_ns: lat.mean_ns,
         p50_ns: lat.p50_ns,
         p90_ns: lat.p90_ns,
@@ -457,13 +549,14 @@ fn print_step(
         sample_count: lat.count,
         pass: fail_reason.is_none(),
         fail_reason,
+        connections,
     };
     // stdout is line-buffered, so each step is written out before the next
     // starts, and a step timeout does not lose the earlier ones.
     println!("{}", serde_json::to_string(&step).unwrap());
     eprintln!(
         "bench-client: step {index} @ {rate} rps: {:.0} ops/s, p99={:.1}us {}",
-        result.ops_per_sec,
+        ops_per_sec,
         lat.p99_ns as f64 / 1000.0,
         step.fail_reason.as_deref().unwrap_or("pass"),
     );

@@ -1611,6 +1611,7 @@ version = "0.2.0"
 dependencies = [
  "bytes",
  "clap",
+ "histogram 1.4.1",
  "libc",
  "metriken",
  "rcgen",
