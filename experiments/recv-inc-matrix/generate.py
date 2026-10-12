@@ -188,7 +188,14 @@ for st in {steps}; do
     (exec 3<>/dev/tcp/{{server_ip}}/{{port}}) 2>/dev/null && {{ exec 3>&-; break; }}
     sleep 1
   done
-  {client_cmd} --open --rate $rate > results/{aid}.$s.json 2> results/{aid}.$s.log || true
+  # A step that runs past {step_cap} s is killed and counts as a failed
+  # step; the guest's memory and kernel log are printed for diagnosis.
+  timeout -k 10 {step_cap} {client_cmd} --open --rate $rate > results/{aid}.$s.json 2> results/{aid}.$s.log
+  rc=$?
+  if [ $rc -eq 124 ] || [ $rc -eq 137 ]; then
+    echo "== {aid} $s client timed out after {step_cap} s (rc=$rc)"
+    free -m; sudo dmesg | tail -20
+  fi
   ach=$(tr -d ' \\n' < results/{aid}.$s.json | grep -o '"ops_per_sec":[0-9.]*' | cut -d: -f2)
   p99=$(tr -d ' \\n' < results/{aid}.$s.json | grep -o '"p99_ns":[0-9]*' | cut -d: -f2)
   echo "== {aid} $s offered=$rate achieved=$ach p99_ns=$p99"
@@ -412,6 +419,7 @@ def render_ladder(kernel, rep, bins, workers, warmup, duration, ladder):
             ))
             client.append(LADDER_ARM.format(
                 aid=aid, steps=steps, client_cmd=cc, slo_ns=SLO_P99_NS[c["msg"]],
+                step_cap=per_step + 60,
             ))
             n += 1
     head = HEAD.format(
