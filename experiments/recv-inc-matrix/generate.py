@@ -25,9 +25,15 @@ Phase `t` is closed loop, for throughput. Phase `l` is open loop at a fixed
 offered rate per cell (`--rates`, a JSON file of cell id -> requests/s,
 written by collect.py from phase t's base arms).
 
+Phase `s` is open loop over a ladder of offered rates (LADDER, fractions of
+base's phase t median on that kernel; `--rates` from `collect.py ladder`),
+one client run per rate against one server per arm. collect.py `knees`
+reports the highest rate per arm whose p99 meets the cell's SLO.
+
 Usage:
     ./generate.py --bins-artifact <id> --phase t [--dry]
     ./generate.py --bins-artifact <id> --phase l --rates rates.json
+    ./generate.py --bins-artifact <id> --phase s --rates ladder.json --kernels k612,k71 --reps 3 --warmup 2 --duration 6
 """
 
 import argparse
@@ -85,6 +91,7 @@ timeout = 3600
 [[jobs.steps]]
 type = "anvil-vm"
 mode = "exec"
+payload_timeout = 3600
 payload = '''
 set -uo pipefail
 mkdir -p /home/anvil/results
@@ -96,16 +103,20 @@ sudo prlimit --nofile=1048576:1048576 --memlock=unlimited:unlimited --pid $$
   > /home/anvil/results/{aid}.server.log 2>&1 &
 pid=$!
 # Stop the server once all {conns} client connections have opened and then
-# closed, or after {server_secs} s if that never happens.
+# stayed closed for {quiet} s, or after {server_secs} s if that never happens.
 conns() {{ ss -Htn state established "( sport = :{{port}} )" | wc -l; }}
 end=$((SECONDS + {server_secs}))
 seen=0
+zero_at=-1
 while kill -0 $pid 2>/dev/null && [ $SECONDS -lt $end ]; do
   n=$(conns)
   if [ $seen -eq 0 ]; then
     [ "$n" -ge {conns} ] && seen=1
   elif [ "$n" -eq 0 ]; then
-    break
+    [ $zero_at -lt 0 ] && zero_at=$SECONDS
+    [ $((SECONDS - zero_at)) -ge {quiet} ] && break
+  else
+    zero_at=-1
   fi
   sleep 0.5
 done
@@ -129,6 +140,7 @@ timeout = 3600
 [[jobs.steps]]
 type = "anvil-vm"
 mode = "exec"
+payload_timeout = 3600
 payload = '''
 set -uo pipefail
 cd /home/anvil && mkdir -p results
@@ -146,6 +158,56 @@ type = "barrier"
 name = "{aid}-done"
 timeout = 3600
 """
+
+
+LADDER_ARM = """
+[[jobs.steps]]
+type = "barrier"
+name = "{aid}-start"
+timeout = 3600
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "exec"
+payload_timeout = 3600
+payload = '''
+set -uo pipefail
+cd /home/anvil && mkdir -p results
+sudo prlimit --nofile=1048576:1048576 --memlock=unlimited:unlimited --pid $$
+# Each step closes every connection; reuse TIME_WAIT ports so 10,000
+# connections per step do not run out of local ports.
+sudo sysctl -qw net.ipv4.tcp_tw_reuse=1
+# One client run per offered rate, lowest first. The arm stops after two
+# consecutive steps that achieve under 90% of the offered rate.
+fails=0
+for st in {steps}; do
+  s=$(echo $st | cut -d: -f1)
+  rate=$(echo $st | cut -d: -f2)
+  for i in $(seq 1 120); do
+    (exec 3<>/dev/tcp/{{server_ip}}/{{port}}) 2>/dev/null && {{ exec 3>&-; break; }}
+    sleep 1
+  done
+  {client_cmd} --open --rate $rate > results/{aid}.$s.json 2> results/{aid}.$s.log || true
+  ach=$(tr -d ' \\n' < results/{aid}.$s.json | grep -o '"ops_per_sec":[0-9.]*' | cut -d: -f2)
+  echo "== {aid} $s offered=$rate achieved=$ach"
+  if awk -v a="$ach" -v r="$rate" 'BEGIN{{exit !(a + 0 >= 0.9 * r)}}'; then
+    fails=0
+  else
+    fails=$((fails + 1))
+    [ $fails -ge 2 ] && break
+  fi
+done
+'''
+
+[[jobs.steps]]
+type = "barrier"
+name = "{aid}-done"
+timeout = 3600
+"""
+
+# Offered rates for phase s, as fractions of base's closed-loop median:
+# geometric steps of 12% from 50% to 195%.
+LADDER = [round(0.5 * 1.12 ** i, 3) for i in range(13)]
 
 
 def arm_cmds(c, arm, phase, rate, warmup, duration):
@@ -285,6 +347,8 @@ upload = true
 
 
 def render(kernel, rep, phase, bins, workers, warmup, duration, rates):
+    if phase == "s":
+        return render_ladder(kernel, rep, bins, workers, warmup, duration, rates)
     names = list(ARMS)
     k = (rep - 1) % len(names)
     order = names[k:] + names[:k]
@@ -301,7 +365,7 @@ def render(kernel, rep, phase, bins, workers, warmup, duration, rates):
             aid = f"{cid}-{arm}"
             sa, cc = arm_cmds(c, arm, phase, rates.get(cid), warmup, duration)
             server.append(SERVER_ARM.format(
-                aid=aid, conns=c["conns"], server_secs=server_secs, server_args=sa,
+                aid=aid, conns=c["conns"], quiet=0, server_secs=server_secs, server_args=sa,
             ))
             client.append(CLIENT_ARM.format(aid=aid, client_cmd=cc))
             n += 1
@@ -312,11 +376,45 @@ def render(kernel, rep, phase, bins, workers, warmup, duration, rates):
     return head + "".join(server) + SERVER_TAIL + "".join(client) + CLIENT_TAIL, n
 
 
+def render_ladder(kernel, rep, bins, workers, warmup, duration, ladder):
+    """Phase s: an offered-rate ladder per arm against one server.
+    `ladder` maps kernel -> cell id -> base's closed-loop median from
+    phase t (collect.py ladder)."""
+    names = list(ARMS)
+    k = (rep - 1) % len(names)
+    order = names[k:] + names[:k]
+    server, client = [], []
+    n = 0
+    for c in cells():
+        cid = cell_id(c)
+        # proxy-load has no open loop; open loop ignores depth, so the d16
+        # cell would repeat the 4 KiB c1000 one.
+        if c["kind"] == "proxy" or c["depth"] > 1 or cid not in ladder[kernel]:
+            continue
+        base = ladder[kernel][cid]
+        steps = " ".join(f"s{i:02}:{max(1, int(f * base))}" for i, f in enumerate(LADDER))
+        per_step = warmup + duration + (30 if c["conns"] >= 10000 else 10)
+        server_secs = len(LADDER) * per_step + 60
+        for arm in order:
+            aid = f"{cid}-{arm}"
+            sa, cc = arm_cmds(c, arm, "t", None, warmup, duration)
+            server.append(SERVER_ARM.format(
+                aid=aid, conns=c["conns"], quiet=5, server_secs=server_secs, server_args=sa,
+            ))
+            client.append(LADDER_ARM.format(aid=aid, steps=steps, client_cmd=cc))
+            n += 1
+    head = HEAD.format(
+        phase="s", kernel=kernel, rep=rep, n=n, bins=bins,
+        image=KERNELS[kernel], workers=workers,
+    )
+    return head + "".join(server) + SERVER_TAIL + "".join(client) + CLIENT_TAIL, n
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bins-artifact", required=True)
-    ap.add_argument("--phase", default="t", choices=["t", "l"])
-    ap.add_argument("--rates", default=None, help="phase l: JSON of cell id -> rate")
+    ap.add_argument("--phase", default="t", choices=["t", "l", "s"])
+    ap.add_argument("--rates", default=None, help="phase l: JSON of cell id -> rate; phase s: kernel -> cell id -> base median")
     ap.add_argument("--kernels", default=",".join(KERNELS))
     ap.add_argument("--reps", type=int, default=5)
     ap.add_argument("--workers", type=int, default=2)
@@ -326,8 +424,8 @@ def main():
     ap.add_argument("--dry", action="store_true")
     args = ap.parse_args()
     rates = json.load(open(args.rates)) if args.rates else {}
-    if args.phase == "l" and not rates:
-        ap.error("phase l needs --rates")
+    if args.phase in ("l", "s") and not rates:
+        ap.error(f"phase {args.phase} needs --rates")
 
     out_dir = pathlib.Path(args.out or pathlib.Path(__file__).parent / f"phase-{args.phase}")
     total = 0
@@ -344,6 +442,9 @@ def main():
                 path.write_text(text)
             print(f"{path} {n} arms")
     per = args.warmup + args.duration + 8
+    if args.phase == "s":
+        per *= len(LADDER)
+        print("phase s: the estimate assumes every step runs; an arm stops after two saturated steps")
     print(f"{total} arms, about {total * per // 3600} h {total * per % 3600 // 60} min plus boots")
 
 

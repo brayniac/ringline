@@ -4,6 +4,8 @@
     ./collect.py rows ids.txt rows.jsonl   # ids.txt: "<kernel> <rep> <experiment id>" lines
     ./collect.py table rows.jsonl          # per kernel and cell: base vs inc against the A/A pair
     ./collect.py rates rows.jsonl > rates.json   # phase l offered rates: 70% of base's median
+    ./collect.py ladder rows.jsonl > ladder.json # phase s: base's median per kernel and cell
+    ./collect.py knees rows.jsonl          # phase s: SLO-limited throughput per arm
 
 A row is one arm of one boot. A client result with zero samples or no
 JSON is kept with `ok: false`, so a failed arm is visible as one rather
@@ -57,9 +59,12 @@ def rows(ids_path, out_path):
             d = pathlib.Path(d)
             fetch(exp, d)
             for cj in sorted((d / "client" / "results").glob("*.json")):
-                aid = cj.stem
+                # phase s names each ladder step <aid>.sNN.json
+                aid, _, step = cj.stem.partition(".")
                 cell, arm = aid.rsplit("-", 1)
                 row = {"kernel": kernel, "rep": int(rep), "exp": exp, "cell": cell, "arm": arm, "ok": False}
+                if step:
+                    row["step"] = step
                 try:
                     c = json.loads(cj.read_text())
                     if "bytes_per_sec" in c:
@@ -67,6 +72,8 @@ def rows(ids_path, out_path):
                     else:
                         row.update(tput=c["ops_per_sec"], p50=c["p50_ns"], p99=c["p99_ns"],
                                    p999=c["p999_ns"], ok=c["sample_count"] > 0)
+                        if c.get("offered_rate"):
+                            row["offered"] = c["offered_rate"]
                 except (ValueError, KeyError):
                     pass
                 sdir = d / "server" / "results"
@@ -151,7 +158,54 @@ def rates(path):
     json.dump(out, sys.stdout, indent=1, sort_keys=True)
 
 
+def ladder(path):
+    """Phase s input: base's closed-loop median per kernel and cell."""
+    out = {}
+    for (kernel, cell), arms in group([r for r in load(path) if r["ok"]]).items():
+        if "base" in arms:
+            out.setdefault(kernel, {})[cell] = int(med(x["tput"] for x in arms["base"]))
+    json.dump(out, sys.stdout, indent=1, sort_keys=True)
+
+
+# p99 SLO per message size for phase s, fixed before the runs.
+SLO_P99_NS = {256: 1_000_000, 4096: 1_000_000, 65536: 10_000_000, 1048576: 100_000_000}
+
+
+def knees(path):
+    """Per kernel, cell and arm: the highest achieved rate over the ladder
+    steps that achieved at least 90% of the offered rate with p99 within
+    the cell's SLO. Medians over reps; inc is compared with base and base2."""
+    rs = [r for r in load(path) if r.get("step") and r["ok"]]
+    per = {}
+    for r in rs:
+        msg = int(re.search(r"-(\d+)b-", r["cell"]).group(1))
+        good = r["tput"] >= 0.9 * r["offered"] and r["p99"] <= SLO_P99_NS[msg]
+        k = (r["kernel"], r["cell"], r["arm"], r["rep"])
+        top = max((s["offered"] for s in rs if (s["kernel"], s["cell"], s["arm"], s["rep"]) == k), default=0)
+        best = per.setdefault(k, {"knee": 0, "top": top})
+        if good:
+            best["knee"] = max(best["knee"], r["tput"])
+    print(f"{'kernel':5} {'cell':24} {'base':>10} {'A/A min-max':>21} {'inc':>10} {'d%':>7} note")
+    for kc in sorted({(k[0], k[1]) for k in per}):
+        arms = {}
+        capped = []
+        for (kernel, cell, arm, rep), v in per.items():
+            if (kernel, cell) == kc:
+                arms.setdefault(arm, []).append(v["knee"])
+                if v["knee"] and v["knee"] >= 0.9 * v["top"]:
+                    capped.append(arm)
+        b = arms.get("base", []) + arms.get("base2", [])
+        if not b or not arms.get("inc"):
+            continue
+        bm, im = med(arms["base"]), med(arms["inc"])
+        d = f"{100 * (im / bm - 1):7.1f}" if bm else "      -"
+        note = ("ladder top reached: " + ",".join(sorted(set(capped)))) if capped else ""
+        print(f"{kc[0]:5} {kc[1]:24} {bm / 1e3:10.1f} {min(b) / 1e3:10.1f}-{max(b) / 1e3:<10.1f} {im / 1e3:10.1f} {d} {note}")
+    print("knee: k ops/s achieved at the highest step meeting p99 SLO and >= 90% of offered; 0 = no step met it")
+
+
 if __name__ == "__main__":
     cmd = sys.argv[1]
     {"rows": lambda: rows(sys.argv[2], sys.argv[3]), "table": lambda: table(sys.argv[2]),
-     "rates": lambda: rates(sys.argv[2])}[cmd]()
+     "rates": lambda: rates(sys.argv[2]), "ladder": lambda: ladder(sys.argv[2]),
+     "knees": lambda: knees(sys.argv[2])}[cmd]()
