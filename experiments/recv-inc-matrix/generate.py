@@ -97,7 +97,7 @@ payload = '''
 set -uo pipefail
 mkdir -p /home/anvil/results
 sudo prlimit --nofile=1048576:1048576 --memlock=unlimited:unlimited --pid $$
-/home/anvil/out/bench-server \\
+{pre}/home/anvil/out/bench-server \\
   --runtime ringline --addr {{server_ip}}:{{port}} --workers {{workers}} \\
   {server_args} \\
   --metrics-out /home/anvil/results/{aid}.metrics.json \\
@@ -178,7 +178,7 @@ sudo prlimit --nofile=1048576:1048576 --memlock=unlimited:unlimited --pid $$
 # Each step closes every connection; reuse TIME_WAIT ports so 10,000
 # connections per step do not run out of local ports.
 sudo sysctl -qw net.ipv4.tcp_tw_reuse=1
-# One client run per offered rate, lowest first. The arm stops after two
+{pre}# One client run per offered rate, lowest first. The arm stops after two
 # consecutive steps that miss the p99 SLO ({slo_ns} ns) or achieve under
 # 90% of the offered rate.
 fails=0
@@ -216,6 +216,28 @@ type = "barrier"
 name = "{aid}-done"
 timeout = 3600
 """
+
+# Phase s: host state at the start of each arm, on both guests, written to
+# results/<arm>.diag with a one-line summary in the job log. Sockets left by
+# the previous cell show in sockstat and the TIME_WAIT count.
+DIAG = """diag() {{
+  v=$(vmstat 1 5 | tail -1)
+  {{ echo "-- $1 $(date -u +%T)"; cat /proc/net/sockstat
+     echo "time_wait $(ss -Htan state time-wait | wc -l)"
+     echo "vmstat $v"; cat /proc/softirqs; }} >> {results}/{aid}.diag
+  echo "== {aid} diag $1 $(grep ^TCP: /proc/net/sockstat) tw=$(ss -Htan state time-wait | wc -l) vmstat: $v"
+}}
+"""
+
+
+def diag(aid, results, pause):
+    """Shell for the start of a phase s arm: record host state, and with
+    `pause` > 0 record it, wait `pause` s and record it again."""
+    text = DIAG.format(aid=aid, results=results)
+    if pause:
+        return text + f"diag before-pause\nsleep {pause}\ndiag start\n"
+    return text + "diag start\n"
+
 
 # Phase q: the server exits by itself once the search's last step has closed
 # its connections, or at {server_secs} s.
@@ -445,7 +467,8 @@ upload = true
 """
 
 
-def render_search(kernel, rep, bins, workers, warmup, duration, ladder, only=None, reuse=True):
+def render_search(kernel, rep, bins, workers, warmup, duration, ladder, only=None, reuse=True,
+                  label=""):
     """Phase q: a bench-client SLO search per arm against one server.
     `ladder` maps kernel -> cell id -> base's closed-loop median from
     phase t (collect.py ladder)."""
@@ -483,17 +506,18 @@ def render_search(kernel, rep, bins, workers, warmup, duration, ladder, only=Non
             ))
             n += 1
     head = HEAD.format(
-        phase="q", kernel=kernel, rep=rep, n=n, bins=bins,
+        phase="q" + label, kernel=kernel, rep=rep, n=n, bins=bins,
         image=KERNELS[kernel], workers=workers,
     )
     return head + "".join(server) + SERVER_TAIL + "".join(client) + CLIENT_TAIL, n
 
 
-def render(kernel, rep, phase, bins, workers, warmup, duration, rates, only=None, reuse=True):
+def render(kernel, rep, phase, bins, workers, warmup, duration, rates, only=None, reuse=True,
+           first=None, label=""):
     if phase == "s":
-        return render_ladder(kernel, rep, bins, workers, warmup, duration, rates)
+        return render_ladder(kernel, rep, bins, workers, warmup, duration, rates, first, label)
     if phase == "q":
-        return render_search(kernel, rep, bins, workers, warmup, duration, rates, only, reuse)
+        return render_search(kernel, rep, bins, workers, warmup, duration, rates, only, reuse, label)
     names = list(ARMS)
     k = (rep - 1) % len(names)
     order = names[k:] + names[:k]
@@ -511,6 +535,7 @@ def render(kernel, rep, phase, bins, workers, warmup, duration, rates, only=None
             sa, cc = arm_cmds(c, arm, phase, rates.get(cid), warmup, duration)
             server.append(SERVER_ARM.format(
                 aid=aid, conns=c["conns"], quiet=0, server_secs=server_secs, server_args=sa,
+                pre="",
             ))
             client.append(CLIENT_ARM.format(aid=aid, client_cmd=cc))
             n += 1
@@ -521,16 +546,28 @@ def render(kernel, rep, phase, bins, workers, warmup, duration, rates, only=None
     return head + "".join(server) + SERVER_TAIL + "".join(client) + CLIENT_TAIL, n
 
 
-def render_ladder(kernel, rep, bins, workers, warmup, duration, ladder):
+# Phase s: seconds to wait before the slow cell when another cell ran
+# before it in the boot.
+SLOW_PAUSE = 30
+
+
+def render_ladder(kernel, rep, bins, workers, warmup, duration, ladder, first=None, label=""):
     """Phase s: an offered-rate ladder per arm against one server.
     `ladder` maps kernel -> cell id -> base's closed-loop median from
-    phase t (collect.py ladder)."""
+    phase t (collect.py ladder). `first` moves that cell to the front of
+    the boot."""
     names = list(ARMS)
     k = (rep - 1) % len(names)
     order = names[k:] + names[:k]
     server, client = [], []
     n = 0
-    for c in cells():
+    all_cells = cells()
+    if first:
+        lead = [c for c in all_cells if cell_id(c) == first]
+        if not lead:
+            raise SystemExit(f"--first: no cell {first}")
+        all_cells = lead + [c for c in all_cells if cell_id(c) != first]
+    for c in all_cells:
         cid = cell_id(c)
         # proxy-load has no open loop; open loop ignores depth, so the d16
         # cell would repeat the 4 KiB c1000 one.
@@ -540,19 +577,21 @@ def render_ladder(kernel, rep, bins, workers, warmup, duration, ladder):
         steps = " ".join(f"s{i:02}:{max(1, int(f * base))}" for i, f in enumerate(LADDER))
         per_step = warmup + duration + (30 if c["conns"] >= 10000 else 10)
         server_secs = len(LADDER) * per_step + 60
-        for arm in order:
+        for i, arm in enumerate(order):
             aid = f"{cid}-{arm}"
             sa, cc = arm_cmds(c, arm, "t", None, warmup, duration)
+            pause = SLOW_PAUSE if c["kind"] == "slow" and i == 0 and n > 0 else 0
             server.append(SERVER_ARM.format(
-                aid=aid, conns=c["conns"], quiet=5, server_secs=server_secs, server_args=sa,
+                aid=aid, conns=c["conns"], quiet=5, server_secs=server_secs,
+                server_args=sa, pre=diag(aid, "/home/anvil/results", pause),
             ))
             client.append(LADDER_ARM.format(
                 aid=aid, steps=steps, client_cmd=cc, slo_ns=SLO_P99_NS[c["msg"]],
-                step_cap=per_step + 60,
+                step_cap=per_step + 60, pre=diag(aid, "results", pause),
             ))
             n += 1
     head = HEAD.format(
-        phase="s", kernel=kernel, rep=rep, n=n, bins=bins,
+        phase="s" + label, kernel=kernel, rep=rep, n=n, bins=bins,
         image=KERNELS[kernel], workers=workers,
     )
     return head + "".join(server) + SERVER_TAIL + "".join(client) + CLIENT_TAIL, n
@@ -571,6 +610,8 @@ def main():
     ap.add_argument("--out", default=None)
     ap.add_argument("--cells", default=None, help="phase q: comma-separated cell ids to keep")
     ap.add_argument("--fresh", action="store_true", help="phase q: new connections for every search step, instead of one set per search")
+    ap.add_argument("--first", default=None, help="phase s: run this cell id first in each boot")
+    ap.add_argument("--label", default="", help="appended to the phase in experiment names and file names")
     ap.add_argument("--dry", action="store_true")
     args = ap.parse_args()
     rates = json.load(open(args.rates)) if args.rates else {}
@@ -585,10 +626,10 @@ def main():
                 kernel, rep, args.phase, args.bins_artifact, args.workers,
                 args.warmup, args.duration, rates,
                 set(args.cells.split(",")) if args.cells else None,
-                not args.fresh,
+                not args.fresh, args.first, args.label,
             )
             total += n
-            path = out_dir / f"{kernel}-rep{rep}.toml"
+            path = out_dir / f"{kernel}{args.label}-rep{rep}.toml"
             if not args.dry:
                 out_dir.mkdir(parents=True, exist_ok=True)
                 path.write_text(text)
