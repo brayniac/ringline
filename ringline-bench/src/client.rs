@@ -269,6 +269,14 @@ mod ringline_client {
 
     use super::OpenLoop;
 
+    /// A fraction in [0, 1) that differs per call: successive multiples of
+    /// the golden-ratio conjugate, which stay evenly spread for any count.
+    fn schedule_phase() -> f64 {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let k = NEXT.fetch_add(1, Ordering::Relaxed);
+        (k as f64 * 0.618_033_988_749_894_9).fract()
+    }
+
     /// Shared state passed into ringline worker tasks.
     pub struct ClientState {
         pub target: std::net::SocketAddr,
@@ -466,7 +474,9 @@ mod ringline_client {
 
         let msg_size = state.msg_size;
         let msg = vec![0xABu8; msg_size];
-        let per_conn_rate = (ol.rate as f64 / state.num_clients.max(1) as f64).max(1.0);
+        // Below 1/s per connection is allowed: 1 MiB echo at 1000 connections
+        // saturates at a few hundred requests/s in total.
+        let per_conn_rate = ol.rate as f64 / state.num_clients.max(1) as f64;
         let interval = 1.0 / per_conn_rate;
 
         // Single interleaved task: send a bounded burst of due requests, then do
@@ -476,7 +486,10 @@ mod ringline_client {
         // holds scheduled send-instants for in-flight requests (FIFO = echo
         // response order).
         const SEND_BURST: usize = 256;
-        let start = Instant::now();
+        // Spread the connections' schedules across one interval. Without this
+        // every connection's first request is due when it connects, and at
+        // rates below a few per second per connection they all send together.
+        let start = Instant::now() + Duration::from_secs_f64(interval * schedule_phase());
         let mut sent: u64 = 0;
         let mut fifo: VecDeque<(Instant, Instant)> = VecDeque::new();
         let mut samples: Vec<u64> = Vec::with_capacity(1_000_000);
@@ -523,11 +536,14 @@ mod ringline_client {
                     // processing, so the pool never drains (overload collapse).
                     sleep(Duration::from_micros(50)).await;
                 } else {
-                    // Caught up: sleep until the next request is due.
+                    // Caught up: sleep until the next request is due, at most
+                    // 5 ms at a time. A task still asleep after `stop` is
+                    // dropped at shutdown with its samples unrecorded, which
+                    // at low per-connection rates loses most of the run.
                     let target = start + Duration::from_secs_f64(interval * sent as f64);
                     let now = Instant::now();
                     if now < target {
-                        sleep(target - now).await;
+                        sleep((target - now).min(Duration::from_millis(5))).await;
                     } else {
                         sleep(Duration::from_micros(10)).await; // spin guard
                     }
