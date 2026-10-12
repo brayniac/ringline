@@ -167,8 +167,7 @@ def ladder(path):
     json.dump(out, sys.stdout, indent=1, sort_keys=True)
 
 
-# p99 SLO per message size for phase s, fixed before the runs.
-SLO_P99_NS = {256: 1_000_000, 4096: 1_000_000, 65536: 10_000_000, 1048576: 100_000_000}
+from generate import SLO_P99_NS  # noqa: E402  phase s SLOs, one definition
 
 
 def knees(path):

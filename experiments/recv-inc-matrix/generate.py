@@ -178,7 +178,8 @@ sudo prlimit --nofile=1048576:1048576 --memlock=unlimited:unlimited --pid $$
 # connections per step do not run out of local ports.
 sudo sysctl -qw net.ipv4.tcp_tw_reuse=1
 # One client run per offered rate, lowest first. The arm stops after two
-# consecutive steps that achieve under 90% of the offered rate.
+# consecutive steps that miss the p99 SLO ({slo_ns} ns) or achieve under
+# 90% of the offered rate.
 fails=0
 for st in {steps}; do
   s=$(echo $st | cut -d: -f1)
@@ -189,8 +190,9 @@ for st in {steps}; do
   done
   {client_cmd} --open --rate $rate > results/{aid}.$s.json 2> results/{aid}.$s.log || true
   ach=$(tr -d ' \\n' < results/{aid}.$s.json | grep -o '"ops_per_sec":[0-9.]*' | cut -d: -f2)
-  echo "== {aid} $s offered=$rate achieved=$ach"
-  if awk -v a="$ach" -v r="$rate" 'BEGIN{{exit !(a + 0 >= 0.9 * r)}}'; then
+  p99=$(tr -d ' \\n' < results/{aid}.$s.json | grep -o '"p99_ns":[0-9]*' | cut -d: -f2)
+  echo "== {aid} $s offered=$rate achieved=$ach p99_ns=$p99"
+  if awk -v a="$ach" -v r="$rate" -v p="$p99" 'BEGIN{{exit !(a + 0 >= 0.9 * r && p != "" && p + 0 <= {slo_ns})}}'; then
     fails=0
   else
     fails=$((fails + 1))
@@ -206,8 +208,13 @@ timeout = 3600
 """
 
 # Offered rates for phase s, as fractions of base's closed-loop median:
-# geometric steps of 12% from 50% to 195%.
-LADDER = [round(0.5 * 1.12 ** i, 3) for i in range(13)]
+# geometric steps of 12% from 50% to 385%. Arms stop two steps past the
+# SLO, so the upper steps run only where the SLO still holds.
+LADDER = [round(0.5 * 1.12 ** i, 3) for i in range(19)]
+
+# p99 SLO per message size for phase s, fixed before the runs. collect.py
+# imports it.
+SLO_P99_NS = {256: 1_000_000, 4096: 1_000_000, 65536: 10_000_000, 1048576: 100_000_000}
 
 
 def arm_cmds(c, arm, phase, rate, warmup, duration):
@@ -401,7 +408,9 @@ def render_ladder(kernel, rep, bins, workers, warmup, duration, ladder):
             server.append(SERVER_ARM.format(
                 aid=aid, conns=c["conns"], quiet=5, server_secs=server_secs, server_args=sa,
             ))
-            client.append(LADDER_ARM.format(aid=aid, steps=steps, client_cmd=cc))
+            client.append(LADDER_ARM.format(
+                aid=aid, steps=steps, client_cmd=cc, slo_ns=SLO_P99_NS[c["msg"]],
+            ))
             n += 1
     head = HEAD.format(
         phase="s", kernel=kernel, rep=rep, n=n, bins=bins,
