@@ -199,6 +199,8 @@ for st in {steps}; do
     [ $fails -ge 2 ] && break
   fi
 done
+# A failed test on the last step would otherwise be the payload's status.
+exit 0
 '''
 
 [[jobs.steps]]
