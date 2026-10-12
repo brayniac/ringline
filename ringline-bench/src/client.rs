@@ -348,16 +348,18 @@ mod ringline_client {
                         let s = state.clone();
                         match s.open {
                             Some(ol) => {
-                                spawn(async move {
+                                if let Err(e) = spawn(async move {
                                     run_ringline_open_client(s, ol).await;
-                                })
-                                .ok();
+                                }) {
+                                    eprintln!("  ringline client spawn failed: {e}");
+                                }
                             }
                             None => {
-                                spawn(async move {
+                                if let Err(e) = spawn(async move {
                                     run_ringline_client(s).await;
-                                })
-                                .ok();
+                                }) {
+                                    eprintln!("  ringline client spawn failed: {e}");
+                                }
                             }
                         }
                     }
@@ -537,13 +539,16 @@ mod ringline_client {
                     sleep(Duration::from_micros(50)).await;
                 } else {
                     // Caught up: sleep until the next request is due, at most
-                    // 5 ms at a time. A task still asleep after `stop` is
-                    // dropped at shutdown with its samples unrecorded, which
-                    // at low per-connection rates loses most of the run.
+                    // 100 ms at a time, inside the 200 ms the runner waits
+                    // after `stop`. A task still asleep at shutdown is dropped
+                    // with its samples unrecorded, which at low
+                    // per-connection rates loses most of the run. A shorter
+                    // cap costs a timer wake per connection per cap: 2M/s at
+                    // 10,000 connections and 5 ms.
                     let target = start + Duration::from_secs_f64(interval * sent as f64);
                     let now = Instant::now();
                     if now < target {
-                        sleep((target - now).min(Duration::from_millis(5))).await;
+                        sleep((target - now).min(Duration::from_millis(100))).await;
                     } else {
                         sleep(Duration::from_micros(10)).await; // spin guard
                     }
@@ -639,6 +644,12 @@ mod ringline_client {
                 .recv_buffer(4096, msg_size.next_power_of_two().max(4096) as u32)
                 .max_connections(max_conns)
                 .send_pool(slots as u16, msg_size.next_power_of_two().max(256) as u32)
+                // Each connection is a spawned task, and an open-loop one holds
+                // a timer slot while it sleeps between requests. Both pools
+                // default to 256 per worker, and a spawn past that failed:
+                // a worker ran at most 256 connections.
+                .standalone_task_capacity((clients as u32).clamp(256, 65535))
+                .timer_slots((clients as u32).clamp(256, 65535))
                 .build()
                 .expect("valid config");
 
