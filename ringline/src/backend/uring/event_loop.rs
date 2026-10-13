@@ -389,16 +389,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // flowing while a task is runnable — otherwise a task that stays
             // runnable without queueing SQEs (so `flush()` takes its empty-SQ
             // shortcut) starves the whole worker of completions.
-            //
-            // Nor once shutdown is pending: the shutdown check below runs only
-            // after this wait. `request_shutdown()` sets `shutdown_local`
-            // without writing the eventfd. A `Runtime::shutdown` wake can
-            // already have been reaped by the drain after `flush()`, and the
-            // eventfd read is not re-armed once `shutdown_flag` is set. With no
-            // tick timeout, a blocking wait would never return in either case.
-            let shutting_down =
-                self.driver.shutdown_local || self.driver.shutdown_flag.load(Ordering::Relaxed);
-            if self.executor.ready_queue.is_empty() && !shutting_down {
+            if self.may_block() {
                 self.driver.ring.submit_and_wait(1)?;
             } else {
                 self.driver.ring.submit_and_get_events()?;
@@ -1020,8 +1011,25 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
     }
 
+    /// Whether the run loop may block in `submit_and_wait(1)`. It may not
+    /// while a task is runnable, once shutdown is pending, or while
+    /// `rearm_deferred` is set.
+    ///
+    /// Shutdown: the shutdown check in the run loop runs only after the wait.
+    /// `request_shutdown()` sets `shutdown_local` without writing the eventfd.
+    /// A `Runtime::shutdown` wake can already have been reaped by the drain
+    /// after `flush()`, and the eventfd read is not re-armed once
+    /// `shutdown_flag` is set. With no tick timeout, a blocking wait would
+    /// never return in either case.
+    fn may_block(&self) -> bool {
+        let shutting_down =
+            self.driver.shutdown_local || self.driver.shutdown_flag.load(Ordering::Relaxed);
+        self.executor.ready_queue.is_empty() && !shutting_down && !self.driver.rearm_deferred
+    }
+
     /// Commit pending provided-buffer returns to the kernel ring and re-arm
-    /// any connections whose multishot recv was parked on ENOBUFS.
+    /// connections parked in `recv_starved`, oldest first, at most one per
+    /// free buffer.
     ///
     /// Safe because every bid pushed to `pending_replenish` had its contents
     /// copied out (into the accumulator / recv sink / TLS state) before being
@@ -1042,7 +1050,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // expects it.
         if !self.driver.recv_starved.is_empty() {
             for i in 0..self.driver.recv_starved.len() {
-                let conn_index = self.driver.recv_starved[i];
+                let Some(conn_index) = self.driver.recv_starved.get(i) else {
+                    break;
+                };
                 if let Some(pending) = self.driver.pending_recv_bufs[conn_index as usize].take() {
                     let data =
                         unsafe { std::slice::from_raw_parts(pending.ptr, pending.len as usize) };
@@ -1056,13 +1066,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
 
         // Commit returned bids up front so re-armed multishots find them.
-        let replenished = if !self.driver.pending_replenish.is_empty() {
+        if !self.driver.pending_replenish.is_empty() {
             self.driver.release_pending();
-            true
-        } else {
-            false
-        };
+        }
 
+        self.driver.rearm_deferred = false;
         if self.driver.recv_starved.is_empty() {
             return;
         }
@@ -1083,15 +1091,27 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         //   multishot resumes once the message completes and the
         //   accumulator drains. With `recv_incremental`, see
         //   `ring_beats_chunk` below.
-        // - Everything else: re-arm the multishot when buffers came back,
-        //   otherwise keep waiting (nothing is half-delivered).
+        // - Everything else: re-arm the recv while this pass has re-arms
+        //   left, otherwise move it to the back (nothing is half-delivered).
+        //
+        // Connections are visited oldest first. One that stays parked goes to
+        // the back of the queue, so it keeps its place relative to the others.
         let mut free_bytes = u64::from(self.driver.provided_bufs.free())
             * u64::from(self.driver.provided_bufs.buffer_size());
-        let mut i = 0;
-        while i < self.driver.recv_starved.len() {
-            let conn_index = self.driver.recv_starved[i];
+        // A re-armed recv on a connection with data waiting takes a buffer
+        // as soon as it runs; one with no data waiting takes none. Re-arming
+        // more connections than there are free buffers parks again those of
+        // the excess that have data waiting. With 10,000 connections and 256
+        // buffers, re-arming every parked connection gave one worker about
+        // 55M ENOBUFS completions (`buffer_ring_empty`) in a 15 s run.
+        let mut rearms_left = self.driver.provided_bufs.free() as usize;
+        let had_free = rearms_left > 0;
+        for _ in 0..self.driver.recv_starved.len() {
+            let Some(conn_index) = self.driver.recv_starved.pop_front() else {
+                break;
+            };
             if self.driver.recv_fallback_inflight[conn_index as usize] {
-                i += 1;
+                self.driver.recv_starved.push(conn_index);
                 continue;
             }
             // A forwarding connection throttled by the Mode A hold cap owns its own
@@ -1099,7 +1119,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // below the cap). Leave it parked here so the two paths do not both
             // arm a multishot.
             if self.driver.forward_hold_throttled[conn_index as usize] {
-                i += 1;
+                self.driver.recv_starved.push(conn_index);
                 continue;
             }
             let alive = self.driver.connections.get(conn_index).is_some_and(|c| {
@@ -1108,7 +1128,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // `abandon_park_drain` and `handle_park_install` re-arm a
             // connection whose park ends on this worker.
             if !alive || self.driver.park_pending(conn_index) {
-                self.driver.recv_starved.swap_remove(i);
                 continue;
             }
             // With `recv_incremental`, a ring whose free buffers hold more
@@ -1125,18 +1144,16 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 && self.fallback_eligible(conn_index)
                 && self.driver.try_submit_fallback_recv(conn_index)
             {
-                self.driver.recv_starved.swap_remove(i);
                 continue;
             }
-            // Re-arm whenever the ring can actually feed a multishot, not only
-            // on a pass that just returned bids. A connection parked while the
-            // ring was dry, whose bids came back in a pass that did not visit
-            // it — a fallback completion re-parks it *after* the flush — would
-            // otherwise sit parked against a full ring with nothing left to
-            // trigger another replenish: no further recv, so no further bid
-            // return, so no further pass with `replenished`. Forever.
-            if replenished || self.driver.provided_bufs.free() > 0 {
-                self.driver.recv_starved.swap_remove(i);
+            // Re-arm while this pass's budget lasts, whether or not this pass
+            // returned bids. A connection parked while the ring was dry, whose
+            // bids came back in a pass that did not visit it (a fallback
+            // completion re-parks it after the flush), would otherwise stay
+            // parked against a full ring: no recv completes, so no bid returns
+            // and no later pass re-arms it.
+            if rearms_left > 0 {
+                rearms_left -= 1;
                 let generation = self.driver.connections.generation(conn_index);
                 if self.driver.submit_tcp_recv(conn_index, generation).is_err() {
                     metrics::RING.increment(metrics::ring::RECV_ARM_FAILURES);
@@ -1147,7 +1164,17 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 }
                 continue;
             }
-            i += 1;
+            // With no free buffer at the start of the pass, a returned bid
+            // (from a completion, or from a task dropping a hold) is committed
+            // by the next flush, which runs the next pass. Otherwise
+            // the pass re-armed one connection per free buffer. A re-armed
+            // connection with no data waiting takes no buffer and produces no
+            // completion, so `rearm_deferred` keeps the loop from blocking
+            // while connections are left over.
+            if had_free {
+                self.driver.rearm_deferred = true;
+            }
+            self.driver.recv_starved.push(conn_index);
         }
     }
 
@@ -1252,7 +1279,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     .connections
                     .get(conn_index)
                     .is_some_and(|c| matches!(c.lifecycle, Lifecycle::Open));
-                if open && !self.driver.recv_starved.contains(&conn_index) {
+                if open {
                     self.driver.recv_starved.push(conn_index);
                 }
                 return;
@@ -1336,9 +1363,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // (parse still incomplete, ring still dry). If the parse completed,
         // the connection waits parked until bids return — exactly the
         // pre-fallback steady state.
-        if !self.driver.recv_starved.contains(&conn_index) {
-            self.driver.recv_starved.push(conn_index);
-        }
+        self.driver.recv_starved.push(conn_index);
     }
 
     fn dispatch_cqe(&mut self, user_data_raw: u64, result: i32, flags: u32) {
@@ -1526,8 +1551,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 // completed with ENOBUFS again while data was pending and
                 // the ring was empty — submit_and_wait(1) never blocked and
                 // the worker spun at 100% CPU until a task freed a bid.
-                if !has_more && !self.driver.recv_starved.contains(&conn_index) {
-                    self.driver.recv_starved.push(conn_index);
+                if !has_more && self.driver.recv_starved.push(conn_index) {
                     self.driver.recv_park_count += 1;
                     metrics::POOL.increment(metrics::pool::RECV_PARKED);
                 }
@@ -3976,14 +4000,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // If the cancelled multishot happened to ENOBUFS-terminate (rather than
         // ECANCELED) it may have parked in `recv_starved`; take it back so the
         // starved-rearm path and this throttle re-arm cannot both fire.
-        if let Some(pos) = self
-            .driver
-            .recv_starved
-            .iter()
-            .position(|&c| c == conn_index)
-        {
-            self.driver.recv_starved.swap_remove(pos);
-        }
+        self.driver.recv_starved.remove(conn_index);
         self.driver.forward_hold_throttled[ci] = false;
         let generation = self.driver.connections.generation(conn_index);
         if self.driver.submit_tcp_recv(conn_index, generation).is_err() {
@@ -4573,14 +4590,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
         // A parked entry must not outlive the connection: the next occupant
         // of the index would be re-armed by the next flush.
-        if let Some(pos) = self
-            .driver
-            .recv_starved
-            .iter()
-            .position(|&c| c == conn_index)
-        {
-            self.driver.recv_starved.swap_remove(pos);
-        }
+        self.driver.recv_starved.remove(conn_index);
 
         // Replenish any held zero-copy recv buffer.
         if let Some(pending) = self.driver.pending_recv_bufs[conn_index as usize].take() {
@@ -6577,10 +6587,10 @@ mod tests {
             el.driver.connections.generation(conn_index),
         );
         el.test_dispatch_cqe(ud.raw(), -libc::ENOBUFS, 0);
-        assert!(el.driver.recv_starved.contains(&conn_index));
+        assert!(el.driver.recv_starved.contains(conn_index));
         el.flush_replenish_and_rearm();
         assert!(!recv_armed(&el, conn_index), "re-armed during the drain");
-        assert!(!el.driver.recv_starved.contains(&conn_index));
+        assert!(!el.driver.recv_starved.contains(conn_index));
     }
 
     /// A park install still in flight for a slot's previous occupant does
@@ -11620,7 +11630,7 @@ mod tests {
         el.driver.fallback_chunk = el.driver.provided_bufs.buffer_size();
         el.flush_replenish_and_rearm();
         assert!(!el.driver.recv_fallback_inflight[conn_index as usize]);
-        assert!(!el.driver.recv_starved.contains(&conn_index));
+        assert!(!el.driver.recv_starved.contains(conn_index));
     }
 
     /// (b) Above the reserve, delivery is still Pinned (zero-copy) as before — the
@@ -14145,7 +14155,7 @@ mod tests {
             el.driver.connections.generation(conn_index),
         );
         el.test_dispatch_cqe(ud.raw(), -libc::ENOBUFS, 0);
-        assert!(el.driver.recv_starved.contains(&conn_index));
+        assert!(el.driver.recv_starved.contains(conn_index));
         conn_index
     }
 
@@ -14483,7 +14493,7 @@ mod tests {
             "fallback not submitted"
         );
         assert!(
-            !el.driver.recv_starved.contains(&conn_index),
+            !el.driver.recv_starved.contains(conn_index),
             "connection still parked after fallback submit"
         );
         assert_eq!(el.driver.recv_fallback_count, 1);
@@ -14584,7 +14594,7 @@ mod tests {
                 .recv_multishot_armed,
             "a parked connection must re-arm while the ring can feed it"
         );
-        assert!(!el.driver.recv_starved.contains(&conn_index));
+        assert!(!el.driver.recv_starved.contains(conn_index));
     }
 
     /// A segmented connection must never take the fallback recv.
@@ -14627,6 +14637,84 @@ mod tests {
                 .recv_multishot_armed,
             "it takes an ordinary multishot instead — segments need provided buffers"
         );
+    }
+
+    /// Hand out ring buffers until `free` are left, without returning any.
+    fn leave_free_buffers(el: &mut AsyncEventLoop<NoopHandler>, free: u32) {
+        let mut bid = 0;
+        while el.driver.provided_bufs.free() > free {
+            el.driver.provided_bufs.complete(bid, 1, false);
+            bid += 1;
+        }
+    }
+
+    fn parked_in_order(el: &AsyncEventLoop<NoopHandler>) -> Vec<u32> {
+        (0..el.driver.recv_starved.len())
+            .filter_map(|i| el.driver.recv_starved.get(i))
+            .collect()
+    }
+
+    #[test]
+    fn a_pass_rearms_one_connection_per_free_buffer_oldest_first() {
+        let mut el = make_test_loop();
+        let conns: Vec<u32> = (0..5).map(|_| park_connection(&mut el)).collect();
+        leave_free_buffers(&mut el, 2);
+
+        el.flush_replenish_and_rearm();
+        assert_eq!(parked_in_order(&el), conns[2..]);
+        assert!(el.driver.rearm_deferred, "parked connections were left");
+        assert!(
+            !el.may_block(),
+            "the loop must run another pass instead of blocking"
+        );
+
+        // The re-armed recvs have not completed, so the buffers are still
+        // free and the next pass takes the next two.
+        el.flush_replenish_and_rearm();
+        assert_eq!(parked_in_order(&el), conns[4..]);
+        assert!(el.driver.rearm_deferred);
+
+        el.flush_replenish_and_rearm();
+        assert!(el.driver.recv_starved.is_empty());
+        assert!(!el.driver.rearm_deferred);
+        assert!(el.may_block());
+        for c in conns {
+            assert!(el.driver.connections.get(c).unwrap().recv_multishot_armed);
+        }
+    }
+
+    #[test]
+    fn a_pass_with_no_free_buffer_rearms_nothing_and_does_not_defer() {
+        let mut el = make_test_loop();
+        let conns: Vec<u32> = (0..3).map(|_| park_connection(&mut el)).collect();
+        leave_free_buffers(&mut el, 0);
+
+        el.flush_replenish_and_rearm();
+        assert_eq!(parked_in_order(&el), conns);
+        assert!(
+            !el.driver.rearm_deferred,
+            "a dry ring must let the loop block until a bid returns"
+        );
+        assert!(el.may_block());
+    }
+
+    #[test]
+    fn a_connection_parked_again_goes_behind_those_still_waiting() {
+        let mut el = make_test_loop();
+        let conns: Vec<u32> = (0..3).map(|_| park_connection(&mut el)).collect();
+        leave_free_buffers(&mut el, 1);
+
+        el.flush_replenish_and_rearm();
+        assert_eq!(parked_in_order(&el), conns[1..]);
+
+        // The re-armed recv finds the ring empty and parks again.
+        let ud = UserData::encode(
+            OpTag::RecvMulti,
+            conns[0],
+            el.driver.connections.generation(conns[0]),
+        );
+        el.test_dispatch_cqe(ud.raw(), -libc::ENOBUFS, 0);
+        assert_eq!(parked_in_order(&el), [conns[1], conns[2], conns[0]]);
     }
 
     #[test]
@@ -14674,7 +14762,7 @@ mod tests {
         assert!(el.driver.recv_fallback_inflight[conn_index as usize]);
         // Fallback submission takes the connection out of the park queue;
         // its completion re-parks it.
-        assert!(!el.driver.recv_starved.contains(&conn_index));
+        assert!(!el.driver.recv_starved.contains(conn_index));
 
         // A stale multishot ENOBUFS CQE re-parks the connection while the
         // fallback is still in flight. When buffers come back, the
@@ -14687,15 +14775,19 @@ mod tests {
             el.driver.connections.generation(conn_index),
         );
         el.test_dispatch_cqe(ud.raw(), -libc::ENOBUFS, 0);
-        assert!(el.driver.recv_starved.contains(&conn_index));
+        assert!(el.driver.recv_starved.contains(conn_index));
 
         el.driver.provided_bufs.complete(0, 1, false); // a bid was handed out first
         el.driver.pending_replenish.push(0);
         el.flush_replenish_and_rearm();
 
         assert!(
-            el.driver.recv_starved.contains(&conn_index),
+            el.driver.recv_starved.contains(conn_index),
             "fallback-inflight connection must stay parked until its CQE"
+        );
+        assert!(
+            !el.driver.rearm_deferred,
+            "a fallback in flight must not keep the loop awake"
         );
         assert!(el.driver.recv_fallback_inflight[conn_index as usize]);
     }
@@ -14758,7 +14850,7 @@ mod tests {
             "pool slot not released"
         );
         assert!(
-            el.driver.recv_starved.contains(&conn_index),
+            el.driver.recv_starved.contains(conn_index),
             "connection not re-parked after fallback completion"
         );
         assert!(el.driver.connections.get(conn_index).is_some());
@@ -14818,7 +14910,7 @@ mod tests {
         assert!(!el.driver.fallback_recv_pool.as_ref().unwrap().in_use(0));
         assert!(!el.driver.recv_fallback_inflight[conn_index as usize]);
         assert!(
-            el.driver.recv_starved.contains(&conn_index),
+            el.driver.recv_starved.contains(conn_index),
             "cancelled fallback must re-park, not strand the connection"
         );
     }
@@ -14840,7 +14932,7 @@ mod tests {
         el.test_dispatch_cqe(ud.raw(), -libc::ECANCELED, 0);
         assert!(!el.driver.fallback_recv_pool.as_ref().unwrap().in_use(0));
         assert!(
-            !el.driver.recv_starved.contains(&conn_index),
+            !el.driver.recv_starved.contains(conn_index),
             "a closing connection must not be re-parked"
         );
 
