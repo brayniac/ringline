@@ -77,6 +77,43 @@ pub struct BenchResult {
     pub total_ops: u64,
     pub latency: LatencyStats,
     pub cpu_ns: u64,
+    /// Responses recorded per connection in the measured window. ringline
+    /// client only.
+    pub per_conn: Option<ConnCounts>,
+}
+
+/// How responses in the measured window were spread over the connections
+/// that reported. A response that never arrives has no latency sample, so a
+/// connection that got none is visible here and not in [`LatencyStats`].
+#[derive(Clone, Serialize)]
+pub struct ConnCounts {
+    /// Connections that reported samples (connected and ran to the end).
+    pub conns: u64,
+    /// Connections with no response in the measured window.
+    pub zero: u64,
+    pub min: u64,
+    pub p10: u64,
+    pub median: u64,
+    pub max: u64,
+}
+
+impl ConnCounts {
+    /// `None` when no connection reported.
+    pub fn from_counts(mut counts: Vec<u64>) -> Option<Self> {
+        if counts.is_empty() {
+            return None;
+        }
+        counts.sort_unstable();
+        let at = |q: f64| counts[((counts.len() - 1) as f64 * q) as usize];
+        Some(Self {
+            conns: counts.len() as u64,
+            zero: counts.iter().filter(|&&c| c == 0).count() as u64,
+            min: counts[0],
+            p10: at(0.1),
+            median: at(0.5),
+            max: counts[counts.len() - 1],
+        })
+    }
 }
 
 /// Read process CPU time (user + system) from /proc/self/stat.

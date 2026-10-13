@@ -85,27 +85,51 @@ pub fn dump_to(path: &Path) -> io::Result<()> {
     std::fs::write(path, json)
 }
 
+/// The counters that usually explain a result, by `op` label.
+const INTERESTING: [&str; 9] = [
+    "buffer_ring_empty",
+    "recv_parked",
+    "recv_fallback",
+    "forward_throttled",
+    "recv_arm_failures",
+    "send_eagain",
+    "send_zc_enomem",
+    "send_exhausted",
+    "fallback_received",
+];
+
+/// Print the [`INTERESTING`] counters, cumulative since start, as one JSON
+/// line to stderr: `{"type":"counters","unix_ms":..,"<op>":..}`. A counter
+/// that two groups both label with the same `op` is summed.
+pub fn print_counters_line() {
+    let mut line: BTreeMap<&str, i128> = INTERESTING.iter().map(|op| (*op, 0)).collect();
+    for e in collect() {
+        if let Some(v) = e.op.as_deref().and_then(|op| line.get_mut(op)) {
+            *v += e.value;
+        }
+    }
+    let unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    let mut obj = serde_json::Map::new();
+    obj.insert("type".into(), "counters".into());
+    obj.insert("unix_ms".into(), (unix_ms as u64).into());
+    for (op, v) in line {
+        obj.insert(op.into(), (v as i64).into());
+    }
+    eprintln!("{}", serde_json::Value::Object(obj));
+}
+
 /// Print the counters that usually explain a result, one line each, to stderr.
 ///
 /// The JSON file is for the harness; this is for a human reading a job log and
 /// wondering why an arm was slow.
 pub fn print_summary() {
     let entries = collect();
-    let interesting = [
-        "buffer_ring_empty",
-        "recv_parked",
-        "recv_fallback",
-        "forward_throttled",
-        "recv_arm_failures",
-        "send_eagain",
-        "send_zc_enomem",
-        "send_exhausted",
-        "fallback_received",
-    ];
     let mut shown = false;
     for e in &entries {
         let Some(op) = e.op.as_deref() else { continue };
-        if interesting.contains(&op) && e.value != 0 {
+        if INTERESTING.contains(&op) && e.value != 0 {
             eprintln!("bench-server: {}/{} = {}", e.name, op, e.value);
             shown = true;
         }

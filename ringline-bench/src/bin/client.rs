@@ -18,7 +18,7 @@ use serde::Serialize;
 
 use ringline_bench::client::{LiveOpenLoop, OpenLoop, run_bench, send_pool_full};
 use ringline_bench::search::{RateSearch, SearchOutcome, SearchPhase, Slo};
-use ringline_bench::stats::LatencyStats;
+use ringline_bench::stats::{ConnCounts, LatencyStats};
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum Runtime {
@@ -262,6 +262,10 @@ struct ClientReport {
     /// Sends refused because the client's send pool was full, over the whole
     /// run including warmup. ringline client only.
     send_pool_full: u64,
+    /// Responses per connection in the measured window. ringline client
+    /// only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    per_conn: Option<ConnCounts>,
 }
 
 fn main() {
@@ -345,6 +349,7 @@ fn main() {
         max_ns: result.latency.max_ns,
         sample_count: result.latency.count,
         send_pool_full: send_pool_full(),
+        per_conn: result.per_conn,
     };
 
     // JSON to stdout for machine consumption.

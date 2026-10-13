@@ -3,7 +3,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::stats::{BenchResult, LatencyHistogram, LatencyStats, process_cpu_time_ns};
+use crate::stats::{BenchResult, ConnCounts, LatencyHistogram, LatencyStats, process_cpu_time_ns};
 
 /// `send_nowait` calls refused because the ringline client's send pool was
 /// full, since the process started. A nonzero count means the client's own
@@ -542,6 +542,13 @@ mod ringline_client {
         if let Some(l) = live {
             l.conns.fetch_add(1, Ordering::Relaxed);
         }
+        let mut rec = ConnRecord {
+            state: state.clone(),
+            samples: Vec::with_capacity(1_000_000),
+            svc: Vec::with_capacity(1_000_000),
+            lag: Vec::with_capacity(1_000_000),
+            local_ops: 0,
+        };
 
         let msg_size = state.msg_size;
         let msg = vec![0xABu8; msg_size];
@@ -576,10 +583,6 @@ mod ringline_client {
         // `start + interval * sent`.
         let mut sent: u64 = 0;
         let mut fifo: VecDeque<(Instant, Instant)> = VecDeque::new();
-        let mut samples: Vec<u64> = Vec::with_capacity(1_000_000);
-        let mut svc: Vec<u64> = Vec::with_capacity(1_000_000);
-        let mut lag: Vec<u64> = Vec::with_capacity(1_000_000);
-        let mut local_ops: u64 = 0;
         // Bytes received toward the next not-yet-complete response, carried
         // across recv wakes (responses are a fixed msg_size byte stream).
         let mut partial: usize = 0;
@@ -694,23 +697,58 @@ mod ringline_client {
                 }
                 if measuring {
                     let now = Instant::now();
-                    samples.push(now.saturating_duration_since(sched).as_nanos() as u64);
-                    svc.push(now.saturating_duration_since(sent_at).as_nanos() as u64);
-                    lag.push(sent_at.saturating_duration_since(sched).as_nanos() as u64);
-                    local_ops += 1;
-                    if local_ops & 0xFF == 0 {
+                    rec.samples
+                        .push(now.saturating_duration_since(sched).as_nanos() as u64);
+                    rec.svc
+                        .push(now.saturating_duration_since(sent_at).as_nanos() as u64);
+                    rec.lag
+                        .push(sent_at.saturating_duration_since(sched).as_nanos() as u64);
+                    rec.local_ops += 1;
+                    if rec.local_ops & 0xFF == 0 {
                         state.ops.fetch_add(256, Ordering::Relaxed);
                     }
                 }
             }
         }
-        if let Some(l) = live {
-            l.conns.fetch_sub(1, Ordering::Relaxed);
+        // `rec` reports on drop.
+    }
+
+    /// One open-loop connection's measurements. They are reported when this
+    /// is dropped, so a connection whose task is dropped at shutdown while it
+    /// waits for a response still counts the responses it did get.
+    struct ConnRecord {
+        state: Arc<ClientState>,
+        samples: Vec<u64>,
+        svc: Vec<u64>,
+        lag: Vec<u64>,
+        local_ops: u64,
+    }
+
+    impl Drop for ConnRecord {
+        fn drop(&mut self) {
+            let state = &self.state;
+            if let Some(l) = state.live.as_deref() {
+                l.conns.fetch_sub(1, Ordering::Relaxed);
+            }
+            state
+                .ops
+                .fetch_add(self.local_ops & 0xFF, Ordering::Relaxed);
+            state
+                .histograms
+                .lock()
+                .unwrap()
+                .push(std::mem::take(&mut self.samples));
+            state
+                .svc
+                .lock()
+                .unwrap()
+                .push(std::mem::take(&mut self.svc));
+            state
+                .lag
+                .lock()
+                .unwrap()
+                .push(std::mem::take(&mut self.lag));
         }
-        state.ops.fetch_add(local_ops & 0xFF, Ordering::Relaxed);
-        state.histograms.lock().unwrap().push(samples);
-        state.svc.lock().unwrap().push(svc);
-        state.lag.lock().unwrap().push(lag);
     }
 
     pub struct RinglineClientRuntime {
@@ -742,8 +780,9 @@ mod ringline_client {
                 // Each connection is a spawned task, and an open-loop one holds
                 // a timer slot while it sleeps between requests. Both pools
                 // default to 256 per worker, and a spawn past that failed:
-                // a worker ran at most 256 connections.
-                .standalone_task_capacity((clients as u32).clamp(256, 65535))
+                // a worker ran at most 256 connections. The `on_start` task
+                // that spawns them holds one more task slot.
+                .standalone_task_capacity((clients as u32 + 1).clamp(256, 65535))
                 .timer_slots((clients as u32).clamp(256, 65535))
                 .build()
                 .expect("valid config");
@@ -925,6 +964,7 @@ fn run_bench_tokio(
         total_ops,
         latency: merged.finalize(),
         cpu_ns: cpu_after.saturating_sub(cpu_before),
+        per_conn: None,
     }
 }
 
@@ -993,6 +1033,7 @@ fn run_bench_ringline(
                 total_ops: 0,
                 latency: LatencyHistogram::new().finalize(),
                 cpu_ns: 0,
+                per_conn: None,
             };
         }
     };
@@ -1013,8 +1054,10 @@ fn run_bench_ringline(
     client_rt.stop();
 
     let mut merged = LatencyHistogram::new();
+    let per_conn;
     {
         let collected = histograms.lock().unwrap();
+        per_conn = ConnCounts::from_counts(collected.iter().map(|s| s.len() as u64).collect());
         for samples in collected.iter() {
             for &sample in samples {
                 merged.record(sample);
@@ -1045,6 +1088,7 @@ fn run_bench_ringline(
         total_ops,
         latency: merged.finalize(),
         cpu_ns: cpu_after.saturating_sub(cpu_before),
+        per_conn,
     }
 }
 

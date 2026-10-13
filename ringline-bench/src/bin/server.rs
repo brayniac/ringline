@@ -410,6 +410,12 @@ struct Args {
     /// open, by the same SIGTERM. 0 is off.
     #[arg(long, default_value_t = 0)]
     exit_after: u64,
+
+    /// Print the runtime's receive and send counters, cumulative since
+    /// start, as a `"type":"counters"` JSON line on stderr every this many
+    /// milliseconds, with a Unix timestamp. 0 is off. ringline runtime only.
+    #[arg(long, default_value_t = 0)]
+    counters_interval_ms: u64,
 }
 
 /// Established TCP connections whose local port is `port`, from
@@ -599,6 +605,15 @@ fn main() {
     );
 
     spawn_exit_watch(args.addr.port(), args.exit_when_idle, args.exit_after);
+    if args.counters_interval_ms > 0 {
+        let every = std::time::Duration::from_millis(args.counters_interval_ms);
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(every);
+                ringline_bench::runtime_metrics::print_counters_line();
+            }
+        });
+    }
 
     match runtime {
         Runtime::Ringline if args.proxy_backend.is_some() => run_ringline_proxy(ProxyCfg {
@@ -825,11 +840,10 @@ fn run_ringline_proxy(cfg: ProxyCfg) {
             recv_buf
         )
     );
-    shutdown.wait_on_signal();
+    let signal = shutdown.wait_on_signal();
+    eprintln!("bench-server: shutting down on {signal:?}");
     dump_runtime_metrics(metrics_out.as_deref());
-    for h in handles {
-        h.join().ok();
-    }
+    report_worker_exits(handles);
 }
 
 /// Set the TCP receive ring's geometry, unless `--recv-incremental` was given
@@ -1150,11 +1164,21 @@ fn run_ringline(cfg: EchoCfg) {
     // worker's event loop runs its shutdown path — including the
     // `[ringline diag]`/`[ringline stall]` counter dump. (A SIGKILL at
     // teardown skips that, hiding the server-side loop diagnostics.)
-    shutdown.wait_on_signal();
+    let signal = shutdown.wait_on_signal();
+    eprintln!("bench-server: shutting down on {signal:?}");
     dump_runtime_metrics(metrics_out.as_deref());
 
-    for h in handles {
-        h.join().ok();
+    report_worker_exits(handles);
+}
+
+/// Join the workers and print any that returned an error or panicked.
+fn report_worker_exits(handles: Vec<std::thread::JoinHandle<Result<(), ringline::Error>>>) {
+    for (i, h) in handles.into_iter().enumerate() {
+        match h.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => eprintln!("bench-server: worker {i} returned an error: {e}"),
+            Err(_) => eprintln!("bench-server: worker {i} panicked"),
+        }
     }
 }
 
