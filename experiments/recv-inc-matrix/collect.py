@@ -99,6 +99,8 @@ def rows(ids_path, out_path):
                             "p50": e["p50_ns"], "p99": e["p99_ns"], "p999": e["p999_ns"],
                             "pass": e["pass"], "fail_reason": e["fail_reason"],
                             "ok": e["sample_count"] > 0,
+                            "drain_ms": e.get("drain_ms"),
+                            "send_pool_full": e.get("send_pool_full"),
                         }) + "\n")
                     elif e.get("type") in ("result", "step_timeout"):
                         result = e

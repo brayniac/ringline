@@ -549,7 +549,7 @@ def render(kernel, rep, phase, bins, workers, warmup, duration, rates, only=None
             client.append(CLIENT_ARM.format(aid=aid, client_cmd=cc))
             n += 1
     head = HEAD.format(
-        phase=phase, kernel=kernel, rep=rep, n=n, bins=bins,
+        phase=phase + label, kernel=kernel, rep=rep, n=n, bins=bins,
         image=KERNELS[kernel], workers=workers,
     )
     return head + "".join(server) + SERVER_TAIL + "".join(client) + CLIENT_TAIL, n
