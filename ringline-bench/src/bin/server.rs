@@ -966,18 +966,55 @@ fn run_ringline(cfg: EchoCfg) {
         // The send happens inside the recv closure, so the two halves have to
         // be separately borrowable.
         let (mut tx, mut rx) = conn.split();
+        // Bytes at the front of the accumulator already charged to
+        // `burn_for` by an attempt whose forward failed.
+        let burned = std::cell::Cell::new(0usize);
+        let failed = std::cell::Cell::new(false);
+        let forward = |tx: &mut ringline::SendHalf, data: &[u8]| {
+            // Before the response: a real server parses, works, replies.
+            burn_for(data.len().saturating_sub(burned.get()));
+            if let Err(e) = tx.forward_recv_buf(data) {
+                if !failed.get() {
+                    eprintln!("echo: forward_recv_buf failed: {e}");
+                }
+                burned.set(data.len());
+                failed.set(true);
+                return ParseResult::NeedMore;
+            }
+            burned.set(0);
+            failed.set(false);
+            ParseResult::Consumed(data.len())
+        };
         loop {
-            let n = rx
-                .with_data(|data| {
-                    // Before the response: a real server parses, works, replies.
-                    burn_for(data.len());
-                    if let Err(e) = tx.forward_recv_buf(data) {
-                        eprintln!("echo: forward_recv_buf failed: {e}");
-                        return ParseResult::NeedMore;
-                    }
-                    ParseResult::Consumed(data.len())
+            // A failed forward leaves the bytes in the accumulator, and
+            // `with_data` would wait for more to arrive before trying again;
+            // a client waiting for this response sends none. Stop waiting,
+            // and retry on the bytes already here until a forward succeeds.
+            let n = {
+                let mut recv = std::pin::pin!(rx.with_data(|d| forward(&mut tx, d)));
+                std::future::poll_fn(|cx| match recv.as_mut().poll(cx) {
+                    std::task::Poll::Pending if failed.get() => std::task::Poll::Ready(None),
+                    p => p.map(Some),
                 })
-                .await;
+                .await
+            };
+            let n = match n {
+                Some(n) => n,
+                None => loop {
+                    // One timer per retrying connection: `timer_slots` is
+                    // `max_connections` (`run_ringline`).
+                    ringline::sleep(std::time::Duration::from_micros(50)).await;
+                    if !rx.is_alive() {
+                        return;
+                    }
+                    match rx.try_with_data(|d| forward(&mut tx, d)) {
+                        Some(ParseResult::Consumed(n)) => break n,
+                        Some(_) => {}
+                        // Nothing buffered: the connection's slot is stale.
+                        None => return,
+                    }
+                },
+            };
             if n == 0 {
                 break;
             }
@@ -1073,6 +1110,9 @@ fn run_ringline(cfg: EchoCfg) {
         .recv_multishot(recv_multishot)
         .recv_incremental(recv_incremental)
         .max_connections(16384)
+        // A forward echo connection whose forward fails sleeps on a timer
+        // between retries (`forward_echo_loop`); every connection can.
+        .timer_slots(16384)
         .send_pool(512, msg_size.next_power_of_two().max(4096) as u32)
         .conn_chunk_size(conn_chunk_size)
         .accept_mode(accept_mode.into())
