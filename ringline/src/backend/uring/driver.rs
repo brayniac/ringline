@@ -807,12 +807,18 @@ pub(crate) struct Driver {
     pub(crate) tls_out_scratch: Vec<crate::handler::BuiltSend>,
     /// Monotonic disk-I/O sequence (see DriverCtx::disk_io_key).
     pub(crate) next_disk_io_seq: u16,
-    /// Connections whose multishot recv hit ENOBUFS and is parked until
-    /// provided-ring buffers return. Re-arming immediately (the old
-    /// behavior) completed instantly with ENOBUFS again while data was
-    /// pending and the ring was empty — a 100% CPU spin until some task
-    /// released a bid.
-    pub(crate) recv_starved: Vec<u32>,
+    /// Connections with no recv armed that `flush_replenish_and_rearm`
+    /// re-arms, oldest first: those whose recv completed with ENOBUFS, and
+    /// those whose fallback recv completed or was cancelled. Re-arming on
+    /// ENOBUFS immediately completes with ENOBUFS again while data is pending
+    /// and the ring is empty, a 100% CPU spin until some task releases a bid.
+    pub(crate) recv_starved: super::parked::ParkedConns,
+    /// Set when a pass of `flush_replenish_and_rearm` that started with a
+    /// free buffer used all its re-arms (one per buffer free at the start)
+    /// while a connection it would have re-armed was still parked. The event
+    /// loop does not block while it is set, so the next pass runs even if
+    /// none of the re-armed recvs completes.
+    pub(crate) rearm_deferred: bool,
     /// Lifetime count of ENOBUFS parks on this worker (pushes onto
     /// `recv_starved`). Reported in the shutdown diag line; sustained
     /// growth means responses exceed the provided ring and receive
@@ -1407,7 +1413,8 @@ impl Driver {
             close_notify_timeout: std::time::Duration::from_millis(config.close_notify_timeout_ms),
             tls_out_scratch: Vec::new(),
             next_disk_io_seq: 0,
-            recv_starved: Vec::new(),
+            recv_starved: super::parked::ParkedConns::new(),
+            rearm_deferred: false,
             recv_park_count: 0,
             recv_fallback_inflight: vec![false; config.max_connections as usize],
             fallback_recv_pool: None,
