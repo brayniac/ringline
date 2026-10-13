@@ -496,20 +496,40 @@ impl Engine for UringEngine {
     /// The sparse path lets us add and remove regions dynamically after
     /// launch without re-registering the entire table.
     ///
-    /// Failures come back as [`Error::BufferRegistration`] naming the cause;
-    /// `ENOMEM` is the `RLIMIT_MEMLOCK` limit in practice.
+    /// Failures come back as [`Error::BufferRegistration`]; for a buffer
+    /// that failed to pin, its text names the causes of an `ENOMEM` or
+    /// `EFAULT`.
     fn register_buffers(&self, registry: &FixedBufferRegistry) -> Result<(), Error> {
         let iovecs = registry.iovecs();
         if iovecs.is_empty() {
             return Ok(());
         }
+        // The memlock charge is cumulative, so an `ENOMEM` is described
+        // against the total; an `EFAULT` is about the one buffer.
         let total: u64 = iovecs.iter().map(|iov| iov.iov_len as u64).sum();
-        let attribute =
-            |e: io::Error| Error::buffer_registration(e, total, MemlockLimit::read().ok().as_ref());
+        let attribute = |e: io::Error, len: usize| {
+            let bytes = if e.raw_os_error() == Some(libc::EFAULT) {
+                len as u64
+            } else {
+                total
+            };
+            Error::buffer_registration(e, bytes, MemlockLimit::read().ok().as_ref())
+        };
         let submitter = self.ring.submitter();
+        // The sparse table pins no pages and is not charged to
+        // RLIMIT_MEMLOCK, so the pin hints do not apply to its errors.
         submitter
             .register_buffers_sparse(iovecs.len() as u32)
-            .map_err(attribute)?;
+            .map_err(|e| {
+                let mut msg = format!(
+                    "io_uring_register(2) of a sparse table of {} slots: {e}",
+                    iovecs.len()
+                );
+                if let Some(name) = errno_name(&e) {
+                    msg.push_str(&format!(" ({name})"));
+                }
+                Error::BufferRegistration(msg)
+            })?;
 
         // Apply each occupied slot. Empty slots stay zeroed in the kernel.
         for (slot, iov) in iovecs.iter().enumerate() {
@@ -521,7 +541,7 @@ impl Engine for UringEngine {
             unsafe {
                 submitter
                     .register_buffers_update(slot as u32, std::slice::from_ref(iov), None)
-                    .map_err(attribute)?;
+                    .map_err(|e| attribute(e, iov.iov_len))?;
             }
         }
         Ok(())
@@ -543,8 +563,8 @@ impl Engine for UringEngine {
                 .register_buffers_update(slot as u32, std::slice::from_ref(&iov), None)
                 .map_err(|e| {
                     // Surfaces to the caller of `Runtime::register_region`
-                    // as an `io::Error`; keep the kind, replace the bare
-                    // "Cannot allocate memory" with the memlock guidance.
+                    // as an `io::Error`; keep the kind and add the causes
+                    // of an `ENOMEM` or `EFAULT` to the OS message.
                     let text = describe_buffer_registration_failure(
                         &e,
                         iov.iov_len as u64,

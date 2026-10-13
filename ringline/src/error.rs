@@ -10,7 +10,7 @@ use thiserror::Error;
 /// |-------|-------|----------|
 /// | `Io` | System call failure | Check `io::ErrorKind`; transient network errors may be retryable |
 /// | `RingSetup` | io_uring refused or unsupported | Read the message: it names the sysctl/seccomp/kernel cause (`ENOMEM` on Linux 6.14+ is usually `RLIMIT_MEMLOCK`); or build with the `force-mio` feature |
-/// | `BufferRegistration` | io_uring refused to register memory | `ENOMEM` is `RLIMIT_MEMLOCK`: raise with `ulimit -l` / `LimitMEMLOCK=`, or grant `CAP_IPC_LOCK`; `EFAULT` is a bad region pointer |
+/// | `BufferRegistration` | io_uring refused to register memory | `ENOMEM`: `RLIMIT_MEMLOCK` (raise with `ulimit -l` / `LimitMEMLOCK=`, or grant `CAP_IPC_LOCK`) or a failed page migration; `EFAULT`: a buffer over 1 GiB or of length 0, an unpinnable mapping, or a failed page migration. The message says which apply |
 /// | `ConnectionLimitReached` | All connection slots in use | Increase via `ConfigBuilder::max_connections(...)` or close idle connections |
 /// | `InvalidConnection` | Stale token, connection closed | Re-establish connection; do not reuse the `ConnCtx` |
 /// | `SendPoolExhausted` | All send buffer slots in use | Await pending sends to complete before sending more |
@@ -52,8 +52,9 @@ pub enum Error {
     /// ([`ConfigBuilder::registered_regions`](crate::ConfigBuilder::registered_regions))
     /// or a provided buffer ring.
     ///
-    /// The message names the errno and the cause. `ENOMEM` on fixed buffers
-    /// is the `RLIMIT_MEMLOCK` limit in practice: io_uring pins registered
+    /// The message names the errno and the causes. `ENOMEM` on fixed buffers
+    /// is usually the `RLIMIT_MEMLOCK` limit, or a page the kernel could not
+    /// migrate before pinning it long-term. io_uring pins registered
     /// buffers and charges them to the caller's memlock limit unless the
     /// process holds `CAP_IPC_LOCK`, and distros default the limit to 8 MiB
     /// or 64 MiB. Raise it with `ulimit -l` (or `LimitMEMLOCK=` in a systemd
@@ -61,8 +62,9 @@ pub enum Error {
     /// checked against the limit before any worker starts and reported as
     /// [`Error::ResourceLimit`]; regions added later through
     /// [`Runtime::register_region`](crate::Runtime::register_region)
-    /// report the same guidance as an `io::Error`. `EFAULT` means the
-    /// `MemoryRegion` pointer or length does not describe mapped memory.
+    /// report the same guidance as an `io::Error`. `EFAULT` means a buffer is
+    /// larger than 1 GiB or empty, its range is not mapped memory that can be
+    /// pinned for writing, or a page migration failed.
     #[error("buffer registration: {0}")]
     BufferRegistration(String),
 
@@ -416,9 +418,31 @@ pub(crate) fn describe_memlock_shortfall(
     )
 }
 
+/// The page-migration cause of a failed buffer registration, shared by the
+/// `EFAULT` and `ENOMEM` hints. The kernel pins registered buffers long-term
+/// (`FOLL_LONGTERM`): it pins the range, then unpins and migrates every page
+/// that cannot stay pinned where it is, and pins again. When a migration
+/// fails, the pin returns `ENOMEM`, or a short count that io_uring reports
+/// as `EFAULT`.
+#[cfg(any(has_io_uring, test))]
+const LONGTERM_PIN_MIGRATION_HINT: &str = "The kernel fails a registration \
+    with this error when it cannot migrate a page it must move before pinning \
+    it long-term: pages in ZONE_MOVABLE, or in MIGRATE_CMA or MIGRATE_ISOLATE \
+    pageblocks. A kernel booted with kexec handover (KHO) active (`kho=on`, \
+    or built with KEXEC_HANDOVER_ENABLE_DEFAULT) has MIGRATE_CMA pageblocks \
+    even when /proc/meminfo shows CmaTotal 0; the CMA column of \
+    /proc/pagetypeinfo (readable by root) shows them. \
+    The failure can be transient: `pgmigrate_fail` in /proc/vmstat rises \
+    when it happens, and registering the same memory again can succeed.";
+
 /// Turn a failed `io_uring_register` of `bytes` of user memory into a message
-/// that names the cause. `ENOMEM` here is the memlock limit in practice; the
-/// kernel returns it rather than `EPERM` when the accounting fails.
+/// that names the cause. `ENOMEM` comes from the `RLIMIT_MEMLOCK` charge (the
+/// kernel returns it rather than `EPERM`), from a long-term pin that could
+/// not migrate a page, or from a kernel allocation refused by the cgroup
+/// memory limit; an unlimited soft limit rules out the first. `EFAULT` comes
+/// from a buffer larger than 1 GiB or of length 0, from a range that is
+/// unmapped or cannot be pinned for writing, or from that same failed
+/// migration.
 #[cfg(any(has_io_uring, test))]
 pub(crate) fn describe_buffer_registration_failure(
     err: &io::Error,
@@ -431,23 +455,43 @@ pub(crate) fn describe_buffer_registration_failure(
     }
     msg.push_str(". ");
     match err.raw_os_error() {
-        Some(libc::ENOMEM) => match limit {
-            Some(limit) => msg.push_str(&describe_memlock_shortfall(
-                bytes,
-                limit,
-                "the buffers being registered",
-            )),
-            None => msg.push_str(
-                "The kernel refused to pin this much memory, which is the \
-                 RLIMIT_MEMLOCK limit in practice. Raise it with `ulimit -l` \
-                 (or `LimitMEMLOCK=` in the systemd unit), or grant the process \
-                 CAP_IPC_LOCK.",
-            ),
-        },
-        Some(libc::EFAULT) => msg.push_str(
-            "The region is not mapped in this process: the pointer or length \
-             passed to MemoryRegion::new is wrong, or the memory was freed.",
-        ),
+        Some(libc::ENOMEM) => {
+            match limit {
+                Some(limit) if limit.soft == libc::RLIM_INFINITY => {
+                    msg.push_str("RLIMIT_MEMLOCK is unlimited, so it is not the cause. ")
+                }
+                Some(limit) => {
+                    msg.push_str(&describe_memlock_shortfall(
+                        bytes,
+                        limit,
+                        "the buffers being registered",
+                    ));
+                    msg.push(' ');
+                }
+                None => msg.push_str(
+                    "The kernel refused to pin this much memory. The usual \
+                     cause is the RLIMIT_MEMLOCK limit: raise it with \
+                     `ulimit -l` (or `LimitMEMLOCK=` in the systemd unit), or \
+                     grant the process CAP_IPC_LOCK. ",
+                ),
+            }
+            msg.push_str(LONGTERM_PIN_MIGRATION_HINT);
+        }
+        Some(libc::EFAULT) => {
+            msg.push_str(
+                "io_uring refuses a single buffer larger than 1 GiB, or of \
+                 length 0, before pinning anything; split a larger region into \
+                 buffers of at most 1 GiB. Otherwise the kernel did not pin \
+                 every page. The region might be unmapped (the pointer or \
+                 length passed to MemoryRegion::new is wrong, or the memory \
+                 was freed), read-only, a device (VM_IO or VM_PFNMAP) mapping, \
+                 or a shared mapping of a file on a filesystem that writes \
+                 back dirty pages, none of which can be pinned for writing \
+                 (tmpfs, hugetlbfs and memfd_create mappings can be); \
+                 /proc/<pid>/maps shows the mapping. ",
+            );
+            msg.push_str(LONGTERM_PIN_MIGRATION_HINT);
+        }
         _ => {}
     }
     msg
@@ -780,15 +824,52 @@ mod tests {
         let text = describe_buffer_registration_failure(&err, 4 * MIB, None);
         assert!(text.contains("RLIMIT_MEMLOCK"), "{text}");
         assert!(text.contains("ulimit -l"), "{text}");
+        assert!(text.contains("pgmigrate_fail"), "{text}");
     }
 
     #[test]
-    fn efault_on_buffer_registration_blames_the_pointer() {
+    fn efault_on_buffer_registration_names_the_pointer_and_pin_migration() {
         let err = io::Error::from_raw_os_error(libc::EFAULT);
         let text = describe_buffer_registration_failure(&err, 4096, None);
         assert!(text.contains("EFAULT"), "{text}");
-        assert!(text.contains("not mapped"), "{text}");
+        assert!(text.contains("larger than 1 GiB"), "{text}");
+        let unmapped = text.find("might be unmapped").expect(&text);
+        let migration = text.find("pgmigrate_fail").expect(&text);
+        assert!(unmapped < migration, "{text}");
         assert!(!text.contains("RLIMIT_MEMLOCK"), "{text}");
+    }
+
+    #[test]
+    fn enomem_under_an_unlimited_soft_limit_does_not_blame_memlock() {
+        let err = io::Error::from_raw_os_error(libc::ENOMEM);
+        let unlimited = limit(libc::RLIM_INFINITY, libc::RLIM_INFINITY);
+        let text = describe_buffer_registration_failure(&err, 4 * MIB, Some(&unlimited));
+        assert!(
+            text.contains("RLIMIT_MEMLOCK is unlimited, so it is not the cause"),
+            "{text}"
+        );
+        assert!(!text.contains("ulimit -l"), "{text}");
+        assert!(text.contains("pgmigrate_fail"), "{text}");
+    }
+
+    #[test]
+    fn enomem_under_a_finite_soft_and_unlimited_hard_limit_names_memlock() {
+        let err = io::Error::from_raw_os_error(libc::ENOMEM);
+        let soft_only = limit(64 * 1024, libc::RLIM_INFINITY);
+        let text = describe_buffer_registration_failure(&err, 4 * MIB, Some(&soft_only));
+        assert!(text.contains("RLIMIT_MEMLOCK too low"), "{text}");
+        assert!(!text.contains("is not the cause"), "{text}");
+    }
+
+    #[test]
+    fn enomem_under_a_finite_limit_names_memlock_then_migration() {
+        let err = io::Error::from_raw_os_error(libc::ENOMEM);
+        let text = describe_buffer_registration_failure(&err, 4 * MIB, Some(&limit(MIB, MIB)));
+        let memlock = text.find("RLIMIT_MEMLOCK too low").expect(&text);
+        let migration = text.find("pgmigrate_fail").expect(&text);
+        assert!(memlock < migration, "{text}");
+        assert!(text.contains("in others. The kernel"), "{text}");
+        assert!(text.contains("CmaTotal 0"), "{text}");
     }
 
     #[test]

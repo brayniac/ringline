@@ -402,6 +402,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- io_uring: the error text of a failed buffer registration names a failed
+  page migration as a cause, and the `EFAULT` text names io_uring's 1 GiB
+  per-buffer limit. A long-term pin migrates pages in `ZONE_MOVABLE` or in
+  `MIGRATE_CMA` or `MIGRATE_ISOLATE` pageblocks before pinning them; in the
+  mainline v7.0 source a failed migration returns `ENOMEM`, or a short pin
+  that io_uring reports as `EFAULT`. A kernel booted with kexec handover
+  (KHO) active has `MIGRATE_CMA` pageblocks even when `CmaTotal` is 0. On an
+  AWS i4i running Ubuntu's 7.0 kernel, with KHO active by default and about
+  8.5 GiB of such pageblocks, 6 registrations of mapped anonymous memory
+  failed with `EFAULT` or `ENOMEM` in process restarts where
+  `pgmigrate_fail` rose, and each succeeded when retried 1 s later. The one
+  restart with no `pgmigrate_fail` increase had no failure. This is a
+  correlation; no trace showed which migration failed or why. The `EFAULT`
+  hint said only that the region was not mapped, and the `ENOMEM` hint
+  blamed `RLIMIT_MEMLOCK` even when the limit was unlimited. Under an
+  unlimited soft limit the `ENOMEM` hint now says the limit is not the
+  cause.
+
 - io_uring: a `Runtime::register_region` that the kernel refused on any worker
   left the slot unusable. Each worker recorded the region in its slot table
   before the kernel call and kept the entry when the call failed. Workers
