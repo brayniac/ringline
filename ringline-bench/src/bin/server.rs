@@ -544,10 +544,24 @@ fn apply_cpu_affinity(_cpus: &[usize]) {
     eprintln!("bench-server: --cpu-list ignored (CPU affinity unsupported on this platform)");
 }
 
+/// Forward echo: runs of consecutive failed `forward_recv_buf` calls on one
+/// connection, and retries within them (`forward_echo_loop`).
+static FORWARD_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FORWARD_RETRIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Print ringline's runtime counters, and write them to `path` if one was
 /// given. Called after the shutdown signal so the numbers cover the whole run.
 fn dump_runtime_metrics(path: Option<&std::path::Path>) {
     ringline_bench::runtime_metrics::print_summary();
+    use std::sync::atomic::Ordering::Relaxed;
+    eprintln!(
+        "bench-server: forward_failures = {}",
+        FORWARD_FAILURES.load(Relaxed)
+    );
+    eprintln!(
+        "bench-server: forward_retries = {}",
+        FORWARD_RETRIES.load(Relaxed)
+    );
     // Peak resident set, for comparing ring geometries' memory.
     if let Ok(status) = std::fs::read_to_string("/proc/self/status")
         && let Some(line) = status.lines().find(|l| l.starts_with("VmHWM:"))
@@ -973,15 +987,18 @@ fn run_ringline(cfg: EchoCfg) {
         let failed = std::cell::Cell::new(None::<std::io::ErrorKind>);
         let forward = |tx: &mut ringline::SendHalf, data: &[u8]| {
             // Before the response: a real server parses, works, replies.
-            // `burn_for` charges at least one request, so a retry with no
-            // new bytes charges nothing.
+            // `burn_for(0)` still charges one request; skip it when no bytes
+            // arrived since the last attempt.
             let fresh = data.len().saturating_sub(burned.get());
             if fresh > 0 {
                 burn_for(fresh);
             }
             if let Err(e) = tx.forward_recv_buf(data) {
                 if failed.get().is_none() {
+                    FORWARD_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     eprintln!("echo: forward_recv_buf failed: {e}");
+                } else if failed.get() != Some(e.kind()) {
+                    eprintln!("echo: forward_recv_buf failed on retry: {e}");
                 }
                 burned.set(data.len());
                 failed.set(Some(e.kind()));
@@ -1018,7 +1035,9 @@ fn run_ringline(cfg: EchoCfg) {
                             return;
                         }
                         // `timer_slots` is `max_connections` (`run_ringline`),
-                        // so a slot is free unless that changes.
+                        // so a slot is free unless that changes. A timeout SQE
+                        // that cannot be pushed still panics when the sleep is
+                        // polled; the executor then closes the connection.
                         let Ok(sleep) = ringline::try_sleep(wait) else {
                             eprintln!("echo: no timer slot to wait for a forward retry; closing");
                             return;
@@ -1028,6 +1047,7 @@ fn run_ringline(cfg: EchoCfg) {
                         if !rx.is_alive() {
                             return;
                         }
+                        FORWARD_RETRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         match rx.try_with_data(|d| forward(&mut tx, d)) {
                             Some(ParseResult::Consumed(n)) => break n,
                             Some(_) => {}

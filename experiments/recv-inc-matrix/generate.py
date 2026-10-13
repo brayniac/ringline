@@ -505,8 +505,8 @@ def render_search(kernel, rep, bins, workers, warmup, duration, ladder, only=Non
         # 60 s inside it.
         if server_secs + 60 > SEARCH_PAYLOAD_TIMEOUT_S:
             raise SystemExit(
-                f"{cid}: the server may run {server_secs} s, within 60 s of the "
-                f"{SEARCH_PAYLOAD_TIMEOUT_S} s payload timeout; lower --cooldown, --warmup or --duration")
+                f"{cid}: the server may run {server_secs} s; --exit-after must be at least 60 s "
+                f"below the {SEARCH_PAYLOAD_TIMEOUT_S} s payload timeout; lower --cooldown, --warmup or --duration")
         for arm in order:
             aid = f"{cid}-{arm}"
             sa, cc = arm_cmds(c, arm, "t", None, warmup, duration)
