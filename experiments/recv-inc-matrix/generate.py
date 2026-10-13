@@ -320,6 +320,10 @@ SEARCH_MAX_BISECT = 8
 # (--search-reuse), waiting this long after each change before measuring.
 # --fresh opens new connections for every step instead.
 SEARCH_DRAIN_MS = 1000
+# With --search-reuse, each rate change first waits, at most this long, for
+# the requests in flight at the previous rate to be answered; a step whose
+# drain times out fails. The server's lifetime allows for it on every step.
+SEARCH_DRAIN_TIMEOUT_S = 60
 
 # Offered rates for phase s, as fractions of base's closed-loop median:
 # geometric steps of 12% from 50% to 385%. Arms stop two steps past the
@@ -489,12 +493,17 @@ def render_search(kernel, rep, bins, workers, warmup, duration, ladder, only=Non
             continue
         base = ladder[kernel][cid]
         per_step = warmup + duration + (30 if c["conns"] >= 10000 else 10)
+        if reuse:
+            per_step += SEARCH_DRAIN_TIMEOUT_S
         server_secs = max_steps * per_step + 60
         for arm in order:
             aid = f"{cid}-{arm}"
             sa, cc = arm_cmds(c, arm, "t", None, warmup, duration)
             if reuse:
-                cc += f" --search-reuse --drain-window-ms {SEARCH_DRAIN_MS}"
+                cc += (
+                    f" --search-reuse --drain-window-ms {SEARCH_DRAIN_MS}"
+                    f" --drain-timeout-secs {SEARCH_DRAIN_TIMEOUT_S}"
+                )
             server.append(SEARCH_SERVER_ARM.format(
                 aid=aid, server_secs=server_secs, server_args=sa,
             ))
