@@ -162,9 +162,11 @@ struct Args {
 
     /// Seconds the whole search may take, counted from before the warmup. A
     /// step that would end past it is not started; the result reports the
-    /// highest passing rate so far. The check does not allow for a
-    /// cool-down after the step, so a search can end up to one
-    /// `--search-cooldown-secs` past the limit. 0 is no limit.
+    /// highest passing rate so far. The check does not include the step's
+    /// drain or a cool-down after it, so a search can end past the limit by
+    /// up to `--drain-timeout-secs`, one cool-down
+    /// (`--search-cooldown-secs` + `--drain-window-ms` +
+    /// `--drain-timeout-secs`) and the close. 0 is no limit.
     #[arg(long, default_value_t = 0)]
     search_time_limit: u64,
 
@@ -191,8 +193,9 @@ struct Args {
     /// `--search-reuse` `--drain-window-ms` + `--duration` + 1 s plus
     /// `--drain-timeout-secs`. A cool-down may run this long past
     /// `--search-cooldown-secs` + `--drain-window-ms` +
-    /// `--drain-timeout-secs`, and the warmup this long past `--warmup` +
-    /// 60 s for connecting. The line's `period` says which ran over.
+    /// `--drain-timeout-secs`, the warmup this long past `--warmup` + 60 s
+    /// for starting the client, and the final close the step allowance. The
+    /// line's `period` says which ran over.
     #[arg(long, default_value_t = 60)]
     step_grace: u64,
 }
@@ -457,7 +460,9 @@ fn run_search(args: &Args, runtime_name: &str, threads: usize) {
             + args.step_grace
             + reuse_drain,
     );
-    // Opening the connections is not part of `--warmup`; allow it 60 s.
+    // Starting the client (`wait_for_server`, up to 5 s) runs before the
+    // `--warmup` sleep; allow 60 s for it. Connections open during the
+    // warmup and nothing waits for all of them.
     let warmup_limit = Duration::from_secs(args.warmup + 60 + args.step_grace);
     let watchdog = StepWatchdog::start();
 
@@ -731,7 +736,8 @@ fn print_step(
 /// What the search is doing while a [`StepWatchdog`] is armed.
 #[derive(Clone, Copy)]
 enum Period {
-    /// Opening the connections and the warmup, with `--search-reuse`.
+    /// Starting the client and the `--warmup` sleep, with `--search-reuse`;
+    /// connections open during it.
     Warmup,
     Step,
     /// The cool-down after the failed step `index`.
