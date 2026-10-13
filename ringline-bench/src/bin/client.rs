@@ -134,7 +134,7 @@ struct Args {
     /// search, offer `--search-start` requests/s for this many seconds
     /// (after the drain and `--drain-window-ms`), print a
     /// `"type":"cooldown"` line measured over them, then run the next step.
-    /// `--search-time-limit` does not count this time. 0 runs the next step
+    /// The time counts toward `--search-time-limit`. 0 runs the next step
     /// straight away.
     #[arg(long, default_value_t = 0, requires = "search_reuse")]
     search_cooldown_secs: u64,
@@ -160,10 +160,11 @@ struct Args {
     #[arg(long, default_value_t = 8)]
     search_max_bisect: u32,
 
-    /// Seconds the whole search may take. A step that would end past it is
-    /// not started; the result reports the highest passing rate so far.
-    /// Cool-downs (`--search-cooldown-secs`) are not counted. 0 is no
-    /// limit.
+    /// Seconds the whole search may take, counted from before the warmup. A
+    /// step that would end past it is not started; the result reports the
+    /// highest passing rate so far. The check does not allow for a
+    /// cool-down after the step, so a search can end up to one
+    /// `--search-cooldown-secs` past the limit. 0 is no limit.
     #[arg(long, default_value_t = 0)]
     search_time_limit: u64,
 
@@ -188,9 +189,10 @@ struct Args {
     /// process prints a `"type":"step_timeout"` line and exits with status
     /// 3. A step's expected length is `--warmup` + `--duration`, or with
     /// `--search-reuse` `--drain-window-ms` + `--duration` + 1 s plus
-    /// `--drain-timeout-secs`. The warmup, each cool-down and the final
-    /// close get the same allowance; the line's `period` says which ran
-    /// over.
+    /// `--drain-timeout-secs`. A cool-down may run this long past
+    /// `--search-cooldown-secs` + `--drain-window-ms` +
+    /// `--drain-timeout-secs`, and the warmup this long past `--warmup` +
+    /// 60 s for connecting. The line's `period` says which ran over.
     #[arg(long, default_value_t = 60)]
     step_grace: u64,
 }
@@ -455,6 +457,8 @@ fn run_search(args: &Args, runtime_name: &str, threads: usize) {
             + args.step_grace
             + reuse_drain,
     );
+    // Opening the connections is not part of `--warmup`; allow it 60 s.
+    let warmup_limit = Duration::from_secs(args.warmup + 60 + args.step_grace);
     let watchdog = StepWatchdog::start();
 
     let mut search = RateSearch::new(
@@ -472,7 +476,7 @@ fn run_search(args: &Args, runtime_name: &str, threads: usize) {
             search.current_rate(),
             args.warmup
         );
-        watchdog.arm(Period::Warmup, 0, search.current_rate(), step_limit);
+        watchdog.arm(Period::Warmup, 0, search.current_rate(), warmup_limit);
         let live = LiveOpenLoop::start(
             &args.addr,
             args.clients,

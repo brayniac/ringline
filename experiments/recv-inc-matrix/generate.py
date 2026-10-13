@@ -269,7 +269,7 @@ exit 0
 [[jobs.steps]]
 type = "barrier"
 name = "{aid}-done"
-timeout = 7200
+timeout = {payload_timeout}
 """
 
 # Phase q: one bench-client SLO search per arm. The client prints one JSON
@@ -306,7 +306,7 @@ exit 0
 [[jobs.steps]]
 type = "barrier"
 name = "{aid}-done"
-timeout = 7200
+timeout = {payload_timeout}
 """
 
 # Phase q search, as fractions of base's closed-loop median from phase t:
@@ -501,7 +501,8 @@ def render_search(kernel, rep, bins, workers, warmup, duration, ladder, only=Non
         if cooldown:
             per_step += cooldown + SEARCH_DRAIN_TIMEOUT_S + 2
         server_secs = max_steps * per_step + 60
-        if server_secs > SEARCH_PAYLOAD_TIMEOUT_S:
+        # The payload starts the server before its --exit-after clock does.
+        if server_secs + 60 > SEARCH_PAYLOAD_TIMEOUT_S:
             raise SystemExit(
                 f"{cid}: the server may run {server_secs} s, past the {SEARCH_PAYLOAD_TIMEOUT_S} s "
                 "payload timeout; lower --cooldown, --warmup or --duration")

@@ -119,10 +119,10 @@ def rows(ids_path, out_path):
                 if result and result["type"] == "result":
                     row.update(ok=True, knee=result["knee"], stopped=result["stopped"], steps=result["steps"])
                 elif result:
-                    # Clients before the cool-down change print no period.
+                    # A client built before 75643f0 prints no `period`.
                     period = result.get("period", "step")
-                    where = (f"cooldown after step {result['index']}" if period == "cooldown"
-                             else f"{period} {result['index']}")
+                    where = {"cooldown": f"cooldown after step {result['index']}",
+                             "step": f"step {result['index']}"}.get(period, period)
                     row["stopped"] = f"step_timeout in {where}"
                 row.update(server_fields(d, aid))
                 out.write(json.dumps(row) + "\n")

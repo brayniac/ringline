@@ -878,6 +878,42 @@ mod ringline_client {
             }
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn dropping_a_live_connection_marks_its_slot_closed() {
+            let ctl = Arc::new(LiveCtl::new(1000, 2));
+            let state = Arc::new(ClientState {
+                target: "127.0.0.1:1".parse().unwrap(),
+                msg_size: 1,
+                num_clients: 2,
+                depth: 1,
+                num_workers: 1,
+                conn_chunk_size: 1,
+                stop: Arc::new(AtomicBool::new(false)),
+                measure: Arc::new(AtomicBool::new(false)),
+                ops: Arc::new(AtomicU64::new(0)),
+                histograms: Arc::new(Mutex::new(Vec::new())),
+                open: None,
+                svc: Arc::new(Mutex::new(Vec::new())),
+                lag: Arc::new(Mutex::new(Vec::new())),
+                live: Some(ctl.clone()),
+            });
+            ctl.conns.fetch_add(2, Ordering::Relaxed);
+            let kept = ctl.take_slot().unwrap();
+            let closed = ctl.take_slot().unwrap();
+            let mut rec = ConnRecord::new(state);
+            rec.slot = Some(closed);
+            drop(rec);
+            let counts = ctl.conn_counts();
+            assert_ne!(counts[closed] & super::super::SLOT_CLOSED, 0);
+            assert_eq!(counts[kept] & super::super::SLOT_CLOSED, 0);
+            assert_eq!(ctl.conns.load(Ordering::Relaxed), 1);
+        }
+    }
 }
 
 // ── Shared ─────────────────────────────────────────────────────────
@@ -1324,19 +1360,30 @@ impl LiveOpenLoop {
             .iter()
             .filter(|&&n| n & SLOT_CLOSED != 0)
             .count() as u64;
-        let per_conn = ConnCounts::from_counts(
-            after
-                .per_conn
-                .iter()
-                .enumerate()
-                .filter(|&(_, &n)| n & SLOT_CLOSED == 0)
-                .map(|(i, &n)| n.saturating_sub(before.per_conn.get(i).copied().unwrap_or(0)))
-                .collect(),
-        )
-        .map(|c| ConnCounts {
-            closed: Some(closed),
-            ..c
-        });
+        let open: Vec<u64> = after
+            .per_conn
+            .iter()
+            .enumerate()
+            .filter(|&(_, &n)| n & SLOT_CLOSED == 0)
+            .map(|(i, &n)| n.saturating_sub(before.per_conn.get(i).copied().unwrap_or(0)))
+            .collect();
+        let per_conn = match ConnCounts::from_counts(open) {
+            Some(c) => Some(ConnCounts {
+                closed: Some(closed),
+                ..c
+            }),
+            // Every connection that connected has closed.
+            None if closed > 0 => Some(ConnCounts {
+                conns: 0,
+                zero: 0,
+                min: 0,
+                p10: 0,
+                median: 0,
+                max: 0,
+                closed: Some(closed),
+            }),
+            None => None,
+        };
         (
             if secs > 0.0 { count as f64 / secs } else { 0.0 },
             stats,
@@ -1389,6 +1436,18 @@ mod live_tests {
         let per_conn = per_conn.unwrap();
         assert_eq!(per_conn.conns, 3);
         assert_eq!(per_conn.closed, Some(1));
+        // Once every connection has closed, the closed count is still reported.
+        for i in 0..3 {
+            ctl.close_slot(i);
+        }
+        let last = LiveSnapshot {
+            hist: ctl.hist.load(),
+            per_conn: ctl.conn_counts(),
+            at: after.at + Duration::from_secs(1),
+        };
+        let (_, _, gone) = LiveOpenLoop::step(&after, &last);
+        let gone = gone.unwrap();
+        assert_eq!((gone.conns, gone.closed), (0, Some(4)));
         assert_eq!(per_conn.zero, 2);
         assert_eq!(per_conn.max, 1000);
         assert_eq!(lat.count, 1000);
