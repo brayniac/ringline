@@ -81,8 +81,8 @@ struct Args {
 
     /// Max outstanding requests per connection in open-loop mode. When reached
     /// the sender stalls and falls behind schedule (coordinated-omission-free).
-    /// Kept modest so the per-connection send queue (each entry holds a
-    /// send-copy-pool slot) can't exhaust the pool under overload.
+    /// Each queued send holds a send-pool slot (8192 per client worker); past
+    /// that, sends are refused and counted in `send_pool_full`.
     #[arg(long, default_value_t = 64)]
     max_inflight: usize,
 

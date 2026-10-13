@@ -6,10 +6,18 @@ use std::time::{Duration, Instant};
 use crate::stats::{BenchResult, ConnCounts, LatencyHistogram, LatencyStats, process_cpu_time_ns};
 
 /// `send_nowait` calls refused because the ringline client's send pool was
-/// full, since the process started. A nonzero count means the client's own
-/// pool delayed requests: in open loop they fall behind schedule, and the
-/// delay is in the measured latency.
+/// full, since the process started. In open loop a refused request is sent
+/// later, behind schedule, and the delay is in the measured latency; in
+/// closed loop a refused send ends that connection.
 static SEND_POOL_FULL: AtomicU64 = AtomicU64::new(0);
+
+/// Counts `e` in [`SEND_POOL_FULL`] if the pool refused the send. A closed
+/// connection or an oversized send is not a full pool.
+fn count_refused_send(e: &std::io::Error) {
+    if e.kind() == std::io::ErrorKind::Other {
+        SEND_POOL_FULL.fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 pub fn send_pool_full() -> u64 {
     SEND_POOL_FULL.load(Ordering::Relaxed)
@@ -48,6 +56,16 @@ impl LiveCtl {
             hist: histogram::AtomicHistogram::new(7, 64).expect("valid histogram config"),
             conns: AtomicU64::new(0),
         }
+    }
+
+    /// Undoes [`mark_drained`](Self::mark_drained) for a connection that
+    /// closed. Has no effect once the controller has moved past `generation`.
+    fn unmark_drained(&self, generation: u64) {
+        let _ = self
+            .drained
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+                (v >> 32 == generation & DRAINED_COUNT && v & DRAINED_COUNT > 0).then(|| v - 1)
+            });
     }
 
     /// Counts one connection as drained for `generation`. A connection that
@@ -458,8 +476,7 @@ mod ringline_client {
         // Reading an outbound connection goes through its read half.
         let (mut conn_tx, mut conn_rx) = conn.split();
 
-        let mut local_ops: u64 = 0;
-        let mut samples: Vec<u64> = Vec::with_capacity(1_000_000);
+        let mut rec = ConnRecord::new(state.clone());
 
         // Pipeline depth: `depth` requests go out in one send, then their
         // responses are matched in order. At depth 1 this is byte-identical to
@@ -472,8 +489,8 @@ mod ringline_client {
         while !state.stop.load(Ordering::Relaxed) {
             let t0 = Instant::now();
 
-            if conn_tx.send_nowait(&batch).is_err() {
-                super::SEND_POOL_FULL.fetch_add(1, Ordering::Relaxed);
+            if let Err(e) = conn_tx.send_nowait(&batch) {
+                super::count_refused_send(&e);
                 break;
             }
 
@@ -492,37 +509,22 @@ mod ringline_client {
                     })
                     .await;
                 if consumed == 0 {
-                    state
-                        .histograms
-                        .lock()
-                        .unwrap()
-                        .push(std::mem::take(&mut samples));
-                    state.ops.fetch_add(local_ops, Ordering::Relaxed);
-                    return;
+                    return; // EOF; `rec` reports on drop
                 }
                 got += consumed;
+                // Only responses completed after warmup are recorded, so
+                // `total_ops` and the latency samples cover the same window.
+                let measuring = state.measure.load(Ordering::Relaxed);
                 while recorded < depth && (recorded + 1) * msg_size <= got {
-                    samples.push(t0.elapsed().as_nanos() as u64);
+                    if measuring {
+                        rec.record(t0.elapsed().as_nanos() as u64);
+                    }
                     recorded += 1;
                 }
             }
-
-            // Every response was recorded above as it completed; `depth`
-            // operations finished in this pass, not one.
             debug_assert_eq!(recorded, depth);
-            local_ops += depth as u64;
-            if local_ops >= 256 {
-                state.ops.fetch_add(local_ops & !0xFF, Ordering::Relaxed);
-                local_ops &= 0xFF;
-            }
         }
-
-        state.ops.fetch_add(local_ops, Ordering::Relaxed);
-        state
-            .histograms
-            .lock()
-            .unwrap()
-            .push(std::mem::take(&mut samples));
+        // `rec` reports on drop.
     }
 
     /// Open-loop ringline client. The connecting task is the *reader* (recv
@@ -542,13 +544,9 @@ mod ringline_client {
         if let Some(l) = live {
             l.conns.fetch_add(1, Ordering::Relaxed);
         }
-        let mut rec = ConnRecord {
-            state: state.clone(),
-            samples: Vec::with_capacity(1_000_000),
-            svc: Vec::with_capacity(1_000_000),
-            lag: Vec::with_capacity(1_000_000),
-            local_ops: 0,
-        };
+        let mut rec = ConnRecord::new(state.clone());
+        rec.svc.reserve(1_000_000);
+        rec.lag.reserve(1_000_000);
 
         let msg_size = state.msg_size;
         let msg = vec![0xABu8; msg_size];
@@ -562,8 +560,6 @@ mod ringline_client {
         // Between a rate change and `go`: send nothing, receive what is in
         // flight.
         let mut waiting = false;
-        // Whether this connection has been counted drained for `generation`.
-        let mut reported = false;
         let rate = live.map_or(ol.rate, |l| l.rate.load(Ordering::Relaxed));
         let mut interval = num_clients / rate.max(1) as f64;
 
@@ -606,12 +602,11 @@ mod ringline_client {
                 if g != generation {
                     generation = g;
                     waiting = true;
-                    reported = false;
                 }
                 if waiting && fifo.is_empty() {
-                    if !reported {
+                    if rec.drained_for != Some(generation) {
                         l.mark_drained(generation);
-                        reported = true;
+                        rec.drained_for = Some(generation);
                     }
                     if l.go.load(Ordering::Acquire) < generation {
                         sleep(Duration::from_millis(1)).await;
@@ -633,8 +628,11 @@ mod ringline_client {
                 if Instant::now() < target {
                     break; // next request not due yet
                 }
-                if conn_tx.send_nowait(&msg).is_err() {
-                    super::SEND_POOL_FULL.fetch_add(1, Ordering::Relaxed);
+                if let Err(e) = conn_tx.send_nowait(&msg) {
+                    if e.kind() == std::io::ErrorKind::NotConnected {
+                        break 'outer; // the connection is closing
+                    }
+                    super::count_refused_send(&e);
                     pool_full = true;
                     break; // send pool full; drain responses first
                 }
@@ -697,24 +695,19 @@ mod ringline_client {
                 }
                 if measuring {
                     let now = Instant::now();
-                    rec.samples
-                        .push(now.saturating_duration_since(sched).as_nanos() as u64);
                     rec.svc
                         .push(now.saturating_duration_since(sent_at).as_nanos() as u64);
                     rec.lag
                         .push(sent_at.saturating_duration_since(sched).as_nanos() as u64);
-                    rec.local_ops += 1;
-                    if rec.local_ops & 0xFF == 0 {
-                        state.ops.fetch_add(256, Ordering::Relaxed);
-                    }
+                    rec.record(now.saturating_duration_since(sched).as_nanos() as u64);
                 }
             }
         }
         // `rec` reports on drop.
     }
 
-    /// One open-loop connection's measurements. They are reported when this
-    /// is dropped, so a connection whose task is dropped at shutdown while it
+    /// One connection's measurements. They are reported when this is
+    /// dropped, so a connection whose task is dropped at shutdown while it
     /// waits for a response still counts the responses it did get.
     struct ConnRecord {
         state: Arc<ClientState>,
@@ -722,6 +715,32 @@ mod ringline_client {
         svc: Vec<u64>,
         lag: Vec<u64>,
         local_ops: u64,
+        /// The live generation this connection has been counted drained
+        /// for, if any.
+        drained_for: Option<u64>,
+    }
+
+    impl ConnRecord {
+        fn new(state: Arc<ClientState>) -> Self {
+            Self {
+                state,
+                samples: Vec::with_capacity(1_000_000),
+                svc: Vec::new(),
+                lag: Vec::new(),
+                local_ops: 0,
+                drained_for: None,
+            }
+        }
+
+        /// Record one response's latency and count it in `state.ops`, in
+        /// steps of 256 to keep the shared counter cold.
+        fn record(&mut self, ns: u64) {
+            self.samples.push(ns);
+            self.local_ops += 1;
+            if self.local_ops & 0xFF == 0 {
+                self.state.ops.fetch_add(256, Ordering::Relaxed);
+            }
+        }
     }
 
     impl Drop for ConnRecord {
@@ -729,6 +748,13 @@ mod ringline_client {
             let state = &self.state;
             if let Some(l) = state.live.as_deref() {
                 l.conns.fetch_sub(1, Ordering::Relaxed);
+                // A connection that closes mid-drain leaves the open count;
+                // it must leave the drained count too, or the barrier
+                // releases while another connection still has requests in
+                // flight.
+                if let Some(g) = self.drained_for {
+                    l.unmark_drained(g);
+                }
             }
             state
                 .ops

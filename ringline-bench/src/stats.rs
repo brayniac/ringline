@@ -87,7 +87,7 @@ pub struct BenchResult {
 /// connection that got none is visible here and not in [`LatencyStats`].
 #[derive(Clone, Serialize)]
 pub struct ConnCounts {
-    /// Connections that reported samples (connected and ran to the end).
+    /// Connections that connected.
     pub conns: u64,
     /// Connections with no response in the measured window.
     pub zero: u64,

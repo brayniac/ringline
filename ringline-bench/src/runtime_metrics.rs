@@ -99,25 +99,28 @@ const INTERESTING: [&str; 9] = [
 ];
 
 /// Print the [`INTERESTING`] counters, cumulative since start, as one JSON
-/// line to stderr: `{"type":"counters","unix_ms":..,"<op>":..}`. A counter
-/// that two groups both label with the same `op` is summed.
+/// line to stderr: `{"type":"counters","unix_ms":..,"<name>/<op>":..}`,
+/// keyed by group name and `op` label because several groups reuse a label
+/// (`recv_fallback` is a pool counter, a completion tag and a park-abandon
+/// reason).
 pub fn print_counters_line() {
-    let mut line: BTreeMap<&str, i128> = INTERESTING.iter().map(|op| (*op, 0)).collect();
-    for e in collect() {
-        if let Some(v) = e.op.as_deref().and_then(|op| line.get_mut(op)) {
-            *v += e.value;
-        }
-    }
+    use std::io::Write;
     let unix_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis());
+        .map_or(0, |d| d.as_millis() as u64);
     let mut obj = serde_json::Map::new();
     obj.insert("type".into(), "counters".into());
-    obj.insert("unix_ms".into(), (unix_ms as u64).into());
-    for (op, v) in line {
-        obj.insert(op.into(), (v as i64).into());
+    obj.insert("unix_ms".into(), unix_ms.into());
+    for e in collect() {
+        if let Some(op) = e.op.as_deref()
+            && INTERESTING.contains(&op)
+        {
+            obj.insert(format!("{}/{op}", e.name), (e.value as i64).into());
+        }
     }
-    eprintln!("{}", serde_json::Value::Object(obj));
+    // One write, so process exit cannot leave half a line.
+    let line = format!("{}\n", serde_json::Value::Object(obj));
+    let _ = std::io::stderr().write_all(line.as_bytes());
 }
 
 /// Print the counters that usually explain a result, one line each, to stderr.
