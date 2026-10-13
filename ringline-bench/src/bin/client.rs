@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use serde::Serialize;
 
-use ringline_bench::client::{LiveOpenLoop, OpenLoop, run_bench};
+use ringline_bench::client::{LiveOpenLoop, OpenLoop, run_bench, send_pool_full};
 use ringline_bench::search::{RateSearch, SearchOutcome, SearchPhase, Slo};
 use ringline_bench::stats::LatencyStats;
 
@@ -201,6 +201,9 @@ struct StepReport {
     /// With `--search-reuse`: connections open at the end of the step.
     #[serde(skip_serializing_if = "Option::is_none")]
     connections: Option<u64>,
+    /// Sends refused because the client's send pool was full during this
+    /// step. ringline client only.
+    send_pool_full: u64,
     /// With `--search-reuse`: milliseconds the rate change waited for
     /// in-flight requests to be answered; `null` if the drain timed out.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -256,6 +259,9 @@ struct ClientReport {
     p9999_ns: u64,
     max_ns: u64,
     sample_count: u64,
+    /// Sends refused because the client's send pool was full, over the whole
+    /// run including warmup. ringline client only.
+    send_pool_full: u64,
 }
 
 fn main() {
@@ -338,6 +344,7 @@ fn main() {
         p9999_ns: result.latency.p9999_ns,
         max_ns: result.latency.max_ns,
         sample_count: result.latency.count,
+        send_pool_full: send_pool_full(),
     };
 
     // JSON to stdout for machine consumption.
@@ -453,6 +460,7 @@ fn run_search(args: &Args, runtime_name: &str, threads: usize) {
             args.addr,
         );
         watchdog.arm(index, rate);
+        let pool_full_before = send_pool_full();
         let (ops_per_sec, total_ops, latency, connections, drain_ms) = match &live {
             Some(live) => {
                 let drained = live.set_rate(rate, drain_timeout);
@@ -511,6 +519,7 @@ fn run_search(args: &Args, runtime_name: &str, threads: usize) {
             total_ops,
             &latency,
             connections,
+            send_pool_full() - pool_full_before,
             drain_ms,
             fail_reason.clone(),
         );
@@ -568,6 +577,7 @@ fn print_step(
     total_ops: u64,
     lat: &LatencyStats,
     connections: Option<u64>,
+    send_pool_full: u64,
     drain_ms: Option<Option<u64>>,
     fail_reason: Option<String>,
 ) {
@@ -589,6 +599,7 @@ fn print_step(
         pass: fail_reason.is_none(),
         fail_reason,
         connections,
+        send_pool_full,
         drain_ms,
     };
     // stdout is line-buffered, so each step is written out before the next

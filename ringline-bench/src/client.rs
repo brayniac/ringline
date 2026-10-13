@@ -5,6 +5,16 @@ use std::time::{Duration, Instant};
 
 use crate::stats::{BenchResult, LatencyHistogram, LatencyStats, process_cpu_time_ns};
 
+/// `send_nowait` calls refused because the ringline client's send pool was
+/// full, since the process started. A nonzero count means the client's own
+/// pool delayed requests: in open loop they fall behind schedule, and the
+/// delay is in the measured latency.
+static SEND_POOL_FULL: AtomicU64 = AtomicU64::new(0);
+
+pub fn send_pool_full() -> u64 {
+    SEND_POOL_FULL.load(Ordering::Relaxed)
+}
+
 /// Shared state of an open-loop run whose offered rate changes while its
 /// connections stay open ([`LiveOpenLoop`]). Each connection reads `rate`
 /// again when `generation` changes, and records every response's
@@ -430,6 +440,11 @@ mod ringline_client {
 
     static GLOBAL_STATE: Mutex<Option<Arc<ClientState>>> = Mutex::new(None);
 
+    /// Send pool slots per client worker. A connection holds a slot for each
+    /// send the kernel has not completed; when the pool is full a send is
+    /// refused and counted in [`super::send_pool_full`].
+    const SEND_POOL_SLOTS: u16 = 8192;
+
     async fn run_ringline_client(state: Arc<ClientState>) {
         let msg_size = state.msg_size;
 
@@ -458,6 +473,7 @@ mod ringline_client {
             let t0 = Instant::now();
 
             if conn_tx.send_nowait(&batch).is_err() {
+                super::SEND_POOL_FULL.fetch_add(1, Ordering::Relaxed);
                 break;
             }
 
@@ -615,6 +631,7 @@ mod ringline_client {
                     break; // next request not due yet
                 }
                 if conn_tx.send_nowait(&msg).is_err() {
+                    super::SEND_POOL_FULL.fetch_add(1, Ordering::Relaxed);
                     pool_full = true;
                     break; // send pool full; drain responses first
                 }
@@ -706,38 +723,11 @@ mod ringline_client {
             let msg_size = state.msg_size;
             // Read before `state` is moved into GLOBAL_STATE below.
             let clients = state.num_clients;
-            let inflight = state.open.as_ref().map_or(1, |o| o.max_inflight.max(1));
 
             *GLOBAL_STATE.lock().unwrap() = Some(state);
 
-            // Both of these used to be fixed (`max_connections(4096)` and
-            // `send_pool(32768, ..)`), which silently made the *client* the
-            // thing under test at high connection counts: 32768 slots across
-            // 4096 connections is 8 per connection, and the client collapsed
-            // from ~187k to ~33k ops/s there. An arm that measures the load
-            // generator is worse than no arm, so both now scale with the load
-            // actually requested.
+            // Room for every requested connection, and at least 4096.
             let max_conns = (clients as u32).next_power_of_two().max(4096);
-
-            // One slot per in-flight message per connection, doubled for
-            // headroom, floored at the old value so small runs are unchanged.
-            let want_slots = clients
-                .saturating_mul(inflight)
-                .saturating_mul(2)
-                .max(32768);
-            // `send_copy_count` is a u16, so the pool cannot exceed 65535 slots
-            // however much we ask for. Say so rather than silently clamping:
-            // a clamped pool is exactly the condition that produced the
-            // collapse above, and it must not look like a server result.
-            let slots = want_slots.min(u16::MAX as usize);
-            if slots < want_slots {
-                eprintln!(
-                    "bench-client: WARNING send-copy pool clamped to {slots} slots \
-                     (wanted {want_slots} for {clients} conns x {inflight} in-flight). \
-                     Only {:.1} slots/conn — the client may bound this measurement.",
-                    slots as f64 / clients as f64
-                );
-            }
 
             let config = ConfigBuilder::new()
                 .workers(workers)
@@ -745,7 +735,10 @@ mod ringline_client {
                 .sq_entries(4096)
                 .recv_buffer(4096, msg_size.next_power_of_two().max(4096) as u32)
                 .max_connections(max_conns)
-                .send_pool(slots as u16, msg_size.next_power_of_two().max(256) as u32)
+                .send_pool(
+                    SEND_POOL_SLOTS,
+                    msg_size.next_power_of_two().max(256) as u32,
+                )
                 // Each connection is a spawned task, and an open-loop one holds
                 // a timer slot while it sleeps between requests. Both pools
                 // default to 256 per worker, and a spawn past that failed:
