@@ -143,9 +143,9 @@ def server_fields(d, aid):
         m = re.search(r"VmHWM:\s+(\d+) kB", text)
         row["rss_mib"] = int(m.group(1)) / 1024 if m else None
         row["panic"] = "panicked" in text
-        # A server built before 23072fa prints no counts; each failed
-        # forward logs this line.
-        row["forward_fail_lines"] = text.count("forward_recv_buf failed")
+        # A server built before 23072fa prints no counts and logs this line
+        # for every failed forward; a later one logs it once per stall.
+        row["forward_fail_lines"] = text.count("forward_recv_buf failed: ")
         for k in ("forward_failures", "forward_retries"):
             m = re.search(rf"bench-server: {k} = (\d+)", text)
             row[k] = int(m.group(1)) if m else None
