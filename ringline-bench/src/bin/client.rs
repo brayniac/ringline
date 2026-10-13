@@ -128,6 +128,13 @@ struct Args {
     #[arg(long, default_value_t = 60)]
     drain_timeout_secs: u64,
 
+    /// With `--search-reuse`: after a step fails, offer `--search-start`
+    /// requests/s for this many seconds before the next step, and print a
+    /// `"type":"cooldown"` line measured over that time. 0 runs the next
+    /// step straight away.
+    #[arg(long, default_value_t = 0, requires = "search_reuse")]
+    search_cooldown_secs: u64,
+
     /// First offered rate of the search, requests/s.
     #[arg(long, default_value_t = 1000)]
     search_start: u64,
@@ -208,6 +215,32 @@ struct StepReport {
     /// in-flight requests to be answered; `null` if the drain timed out.
     #[serde(skip_serializing_if = "Option::is_none")]
     drain_ms: Option<Option<u64>>,
+    /// With `--search-reuse`: responses per connection in the measured
+    /// window.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    per_conn: Option<ConnCounts>,
+}
+
+/// The low-rate period after a failed step (`--search-cooldown-secs`),
+/// printed as a JSON line.
+#[derive(Serialize)]
+struct CooldownReport {
+    r#type: &'static str,
+    /// The failed step this follows.
+    after_index: usize,
+    offered_rate: u64,
+    secs: u64,
+    ops_per_sec: f64,
+    p50_ns: u64,
+    p99_ns: u64,
+    p999_ns: u64,
+    sample_count: u64,
+    connections: u64,
+    send_pool_full: u64,
+    /// Milliseconds the rate change waited for in-flight requests to be
+    /// answered; `null` if the drain timed out.
+    drain_ms: Option<u64>,
+    per_conn: Option<ConnCounts>,
 }
 
 /// The search's final line.
@@ -402,7 +435,7 @@ fn run_search(args: &Args, runtime_name: &str, threads: usize) {
     };
     let drain_timeout = Duration::from_secs(args.drain_timeout_secs);
     let step_limit = Duration::from_secs(
-        step_secs
+        step_secs.max(args.search_cooldown_secs + args.drain_window_ms.div_ceil(1000))
             + args.step_grace
             + if args.search_reuse {
                 args.drain_timeout_secs
@@ -466,20 +499,21 @@ fn run_search(args: &Args, runtime_name: &str, threads: usize) {
         );
         watchdog.arm(index, rate);
         let pool_full_before = send_pool_full();
-        let (ops_per_sec, total_ops, latency, connections, drain_ms) = match &live {
+        let (ops_per_sec, total_ops, latency, connections, drain_ms, per_conn) = match &live {
             Some(live) => {
                 let drained = live.set_rate(rate, drain_timeout);
                 std::thread::sleep(drain);
                 let before = live.snapshot();
                 std::thread::sleep(Duration::from_secs(args.duration));
                 let after = live.snapshot();
-                let (ops_per_sec, latency) = LiveOpenLoop::step(&before, &after);
+                let (ops_per_sec, latency, per_conn) = LiveOpenLoop::step(&before, &after);
                 (
                     ops_per_sec,
                     latency.count,
                     latency,
                     Some(live.connections()),
                     Some(drained.map(|d| d.as_millis() as u64)),
+                    per_conn,
                 )
             }
             None => {
@@ -504,6 +538,7 @@ fn run_search(args: &Args, runtime_name: &str, threads: usize) {
                     result.latency,
                     None,
                     None,
+                    None,
                 )
             }
         };
@@ -526,11 +561,21 @@ fn run_search(args: &Args, runtime_name: &str, threads: usize) {
             connections,
             send_pool_full() - pool_full_before,
             drain_ms,
+            per_conn,
             fail_reason.clone(),
         );
         index += 1;
         match search.advance(fail_reason.is_none()) {
-            SearchOutcome::Probe(_) => {}
+            SearchOutcome::Probe(_) => {
+                if let Some(live) = &live
+                    && fail_reason.is_some()
+                    && args.search_cooldown_secs > 0
+                {
+                    watchdog.arm(index - 1, args.search_start);
+                    cooldown(live, index - 1, args, drain_timeout, drain);
+                    watchdog.disarm();
+                }
+            }
             SearchOutcome::Done { knee } => {
                 let stopped = match search.phase() {
                     SearchPhase::Climb => "max_rate",
@@ -573,6 +618,45 @@ fn run_search(args: &Args, runtime_name: &str, threads: usize) {
     );
 }
 
+/// Offers `--search-start` requests/s for `--search-cooldown-secs` after
+/// the failed step `after_index`, and prints what it achieved.
+fn cooldown(
+    live: &LiveOpenLoop,
+    after_index: usize,
+    args: &Args,
+    drain_timeout: Duration,
+    drain: Duration,
+) {
+    let rate = args.search_start;
+    let pool_full_before = send_pool_full();
+    let drained = live.set_rate(rate, drain_timeout);
+    std::thread::sleep(drain);
+    let before = live.snapshot();
+    std::thread::sleep(Duration::from_secs(args.search_cooldown_secs));
+    let after = live.snapshot();
+    let (ops_per_sec, lat, per_conn) = LiveOpenLoop::step(&before, &after);
+    let report = CooldownReport {
+        r#type: "cooldown",
+        after_index,
+        offered_rate: rate,
+        secs: args.search_cooldown_secs,
+        ops_per_sec,
+        p50_ns: lat.p50_ns,
+        p99_ns: lat.p99_ns,
+        p999_ns: lat.p999_ns,
+        sample_count: lat.count,
+        connections: live.connections(),
+        send_pool_full: send_pool_full() - pool_full_before,
+        drain_ms: drained.map(|d| d.as_millis() as u64),
+        per_conn,
+    };
+    println!("{}", serde_json::to_string(&report).unwrap());
+    eprintln!(
+        "bench-client: cooldown after step {after_index} @ {rate} rps: {ops_per_sec:.0} ops/s, p99={:.1}us",
+        lat.p99_ns as f64 / 1000.0,
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn print_step(
     index: usize,
@@ -584,6 +668,7 @@ fn print_step(
     connections: Option<u64>,
     send_pool_full: u64,
     drain_ms: Option<Option<u64>>,
+    per_conn: Option<ConnCounts>,
     fail_reason: Option<String>,
 ) {
     let step = StepReport {
@@ -606,6 +691,7 @@ fn print_step(
         connections,
         send_pool_full,
         drain_ms,
+        per_conn,
     };
     // stdout is line-buffered, so each step is written out before the next
     // starts, and a step timeout does not lose the earlier ones.

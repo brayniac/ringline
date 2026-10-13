@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::stats::{BenchResult, ConnCounts, LatencyHistogram, LatencyStats, process_cpu_time_ns};
@@ -41,12 +41,22 @@ pub struct LiveCtl {
     hist: histogram::AtomicHistogram,
     /// Connections currently open.
     conns: AtomicU64,
+    /// Responses received per connection, indexed by the slot each
+    /// connection takes from `next_slot` when it connects.
+    per_conn: Box<[ConnCounter]>,
+    next_slot: AtomicUsize,
 }
+
+/// One connection's response count, on its own cache line so connections
+/// on different workers do not share one.
+#[repr(align(64))]
+#[derive(Default)]
+struct ConnCounter(AtomicU64);
 
 const DRAINED_COUNT: u64 = 0xffff_ffff;
 
 impl LiveCtl {
-    fn new(rate: u64) -> Self {
+    fn new(rate: u64, num_clients: usize) -> Self {
         Self {
             rate: AtomicU64::new(rate),
             generation: AtomicU64::new(0),
@@ -55,7 +65,28 @@ impl LiveCtl {
             // 2^-7 relative bucket width (under 1% error), values to 2^64 ns.
             hist: histogram::AtomicHistogram::new(7, 64).expect("valid histogram config"),
             conns: AtomicU64::new(0),
+            per_conn: (0..num_clients).map(|_| ConnCounter::default()).collect(),
+            next_slot: AtomicUsize::new(0),
         }
+    }
+
+    /// The counter slot for a connection that has just connected, or
+    /// `None` if more connections connected than `num_clients`.
+    fn take_slot(&self) -> Option<usize> {
+        let slot = self.next_slot.fetch_add(1, Ordering::Relaxed);
+        (slot < self.per_conn.len()).then_some(slot)
+    }
+
+    /// Response counts of the connections that have connected so far.
+    fn conn_counts(&self) -> Vec<u64> {
+        let n = self
+            .next_slot
+            .load(Ordering::Relaxed)
+            .min(self.per_conn.len());
+        self.per_conn[..n]
+            .iter()
+            .map(|c| c.0.load(Ordering::Relaxed))
+            .collect()
     }
 
     /// Undoes [`mark_drained`](Self::mark_drained) for a connection that
@@ -541,9 +572,10 @@ mod ringline_client {
         // Reading an outbound connection goes through its read half.
         let (mut conn_tx, mut conn_rx) = conn.split();
         let live: Option<&LiveCtl> = state.live.as_deref();
-        if let Some(l) = live {
+        let slot = live.and_then(|l| {
             l.conns.fetch_add(1, Ordering::Relaxed);
-        }
+            l.take_slot()
+        });
         let mut rec = ConnRecord::new(state.clone());
         rec.svc.reserve(1_000_000);
         rec.lag.reserve(1_000_000);
@@ -692,6 +724,9 @@ mod ringline_client {
                 if let Some(l) = live {
                     let ns = sched.elapsed().as_nanos() as u64;
                     l.hist.increment(ns).ok();
+                    if let Some(i) = slot {
+                        l.per_conn[i].0.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
                 if measuring {
                     let now = Instant::now();
@@ -1130,6 +1165,7 @@ fn run_bench_ringline(
 /// A point-in-time copy of a [`LiveOpenLoop`]'s response histogram.
 pub struct LiveSnapshot {
     hist: histogram::Histogram,
+    per_conn: Vec<u64>,
     at: Instant,
 }
 
@@ -1155,7 +1191,7 @@ impl LiveOpenLoop {
         rate: u64,
     ) -> Result<Self, String> {
         wait_for_server(addr);
-        let ctl = Arc::new(LiveCtl::new(rate));
+        let ctl = Arc::new(LiveCtl::new(rate, num_clients));
         let stop = Arc::new(AtomicBool::new(false));
         let state = Arc::new(ringline_client::ClientState {
             target: addr
@@ -1218,12 +1254,18 @@ impl LiveOpenLoop {
     pub fn snapshot(&self) -> LiveSnapshot {
         LiveSnapshot {
             hist: self.ctl.hist.load(),
+            per_conn: self.ctl.conn_counts(),
             at: Instant::now(),
         }
     }
 
-    /// Achieved responses/s and latency between two snapshots.
-    pub fn step(before: &LiveSnapshot, after: &LiveSnapshot) -> (f64, LatencyStats) {
+    /// Achieved responses/s, latency, and responses per connection between
+    /// two snapshots. The per-connection counts cover the connections that
+    /// had connected by `after`.
+    pub fn step(
+        before: &LiveSnapshot,
+        after: &LiveSnapshot,
+    ) -> (f64, LatencyStats, Option<ConnCounts>) {
         let delta = after
             .hist
             .wrapping_sub(&before.hist)
@@ -1258,7 +1300,19 @@ impl LiveOpenLoop {
             max_ns: pct(1.0),
             count,
         };
-        (if secs > 0.0 { count as f64 / secs } else { 0.0 }, stats)
+        let per_conn = ConnCounts::from_counts(
+            after
+                .per_conn
+                .iter()
+                .enumerate()
+                .map(|(i, &n)| n.saturating_sub(before.per_conn.get(i).copied().unwrap_or(0)))
+                .collect(),
+        );
+        (
+            if secs > 0.0 { count as f64 / secs } else { 0.0 },
+            stats,
+            per_conn,
+        )
     }
 
     pub fn stop(self) {
@@ -1274,23 +1328,35 @@ mod live_tests {
 
     #[test]
     fn step_reports_only_the_window_between_snapshots() {
-        let ctl = LiveCtl::new(1000);
+        let ctl = LiveCtl::new(1000, 4);
+        let a = ctl.take_slot().unwrap();
+        let b = ctl.take_slot().unwrap();
         // Recorded before the window: must not appear in the step.
         for _ in 0..1000 {
             ctl.hist.increment(1_000_000_000).unwrap();
         }
+        ctl.per_conn[a].0.fetch_add(1000, Ordering::Relaxed);
         let before = LiveSnapshot {
             hist: ctl.hist.load(),
+            per_conn: ctl.conn_counts(),
             at: Instant::now(),
         };
         for us in 1..=1000u64 {
             ctl.hist.increment(us * 1000).unwrap();
         }
+        ctl.per_conn[b].0.fetch_add(1000, Ordering::Relaxed);
+        // Connects inside the window and gets nothing.
+        ctl.take_slot().unwrap();
         let after = LiveSnapshot {
             hist: ctl.hist.load(),
+            per_conn: ctl.conn_counts(),
             at: before.at + Duration::from_secs(2),
         };
-        let (rate, lat) = LiveOpenLoop::step(&before, &after);
+        let (rate, lat, per_conn) = LiveOpenLoop::step(&before, &after);
+        let per_conn = per_conn.unwrap();
+        assert_eq!(per_conn.conns, 3);
+        assert_eq!(per_conn.zero, 2);
+        assert_eq!(per_conn.max, 1000);
         assert_eq!(lat.count, 1000);
         assert_eq!(rate, 500.0);
         // Bucket ends are within 2^-7 of the value.

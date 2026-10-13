@@ -101,6 +101,15 @@ def rows(ids_path, out_path):
                             "ok": e["sample_count"] > 0,
                             "drain_ms": e.get("drain_ms"),
                             "send_pool_full": e.get("send_pool_full"),
+                            "per_conn": e.get("per_conn"),
+                        }) + "\n")
+                    elif e.get("type") == "cooldown":
+                        out.write(json.dumps(key | {
+                            "step": f"q{e['after_index']:02}c", "phase": "cooldown",
+                            "offered": e["offered_rate"], "tput": e["ops_per_sec"],
+                            "p50": e["p50_ns"], "p99": e["p99_ns"], "p999": e["p999_ns"],
+                            "ok": e["sample_count"] > 0, "drain_ms": e["drain_ms"],
+                            "send_pool_full": e["send_pool_full"], "per_conn": e["per_conn"],
                         }) + "\n")
                     elif e.get("type") in ("result", "step_timeout"):
                         result = e

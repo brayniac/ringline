@@ -299,7 +299,7 @@ done
   --search-max-rate {max_rate} --slo-p99-us {slo_us} \\
   > results/{aid}.search.jsonl 2> results/{aid}.search.log
 echo "== {aid} bench-client exited $?"
-grep -E "bench-client: (step|search)" results/{aid}.search.log
+grep -E "bench-client: (step|search|cooldown)" results/{aid}.search.log
 exit 0
 '''
 
@@ -472,10 +472,11 @@ upload = true
 
 
 def render_search(kernel, rep, bins, workers, warmup, duration, ladder, only=None, reuse=True,
-                  label=""):
+                  label="", cooldown=0):
     """Phase q: a bench-client SLO search per arm against one server.
     `ladder` maps kernel -> cell id -> base's closed-loop median from
-    phase t (collect.py ladder)."""
+    phase t (collect.py ladder). With `cooldown` seconds, each failed step
+    is followed by that long at the start rate (--search-cooldown-secs)."""
     names = list(ARMS)
     k = (rep - 1) % len(names)
     order = names[k:] + names[:k]
@@ -495,6 +496,8 @@ def render_search(kernel, rep, bins, workers, warmup, duration, ladder, only=Non
         per_step = warmup + duration + (30 if c["conns"] >= 10000 else 10)
         if reuse:
             per_step += SEARCH_DRAIN_TIMEOUT_S
+        if cooldown:
+            per_step += cooldown + SEARCH_DRAIN_TIMEOUT_S + 2
         server_secs = max_steps * per_step + 60
         for arm in order:
             aid = f"{cid}-{arm}"
@@ -504,6 +507,8 @@ def render_search(kernel, rep, bins, workers, warmup, duration, ladder, only=Non
                     f" --search-reuse --drain-window-ms {SEARCH_DRAIN_MS}"
                     f" --drain-timeout-secs {SEARCH_DRAIN_TIMEOUT_S}"
                 )
+                if cooldown:
+                    cc += f" --search-cooldown-secs {cooldown}"
             server.append(SEARCH_SERVER_ARM.format(
                 aid=aid, server_secs=server_secs, server_args=sa,
             ))
@@ -522,11 +527,12 @@ def render_search(kernel, rep, bins, workers, warmup, duration, ladder, only=Non
 
 
 def render(kernel, rep, phase, bins, workers, warmup, duration, rates, only=None, reuse=True,
-           first=None, label=""):
+           first=None, label="", cooldown=0):
     if phase == "s":
         return render_ladder(kernel, rep, bins, workers, warmup, duration, rates, first, label)
     if phase == "q":
-        return render_search(kernel, rep, bins, workers, warmup, duration, rates, only, reuse, label)
+        return render_search(kernel, rep, bins, workers, warmup, duration, rates, only, reuse, label,
+                             cooldown)
     names = list(ARMS)
     k = (rep - 1) % len(names)
     order = names[k:] + names[:k]
@@ -621,11 +627,14 @@ def main():
     ap.add_argument("--fresh", action="store_true", help="phase q: new connections for every search step, instead of one set per search")
     ap.add_argument("--first", default=None, help="phase s: run this cell id first in each boot")
     ap.add_argument("--label", default="", help="appended to the phase in experiment names and file names")
+    ap.add_argument("--cooldown", type=int, default=0, help="phase q with reuse: seconds at the start rate after each failed step")
     ap.add_argument("--dry", action="store_true")
     args = ap.parse_args()
     rates = json.load(open(args.rates)) if args.rates else {}
     if args.phase in ("l", "s", "q") and not rates:
         ap.error(f"phase {args.phase} needs --rates")
+    if args.cooldown and (args.phase != "q" or args.fresh):
+        ap.error("--cooldown needs phase q with reused connections")
 
     out_dir = pathlib.Path(args.out or pathlib.Path(__file__).parent / f"phase-{args.phase}")
     total = 0
@@ -635,7 +644,7 @@ def main():
                 kernel, rep, args.phase, args.bins_artifact, args.workers,
                 args.warmup, args.duration, rates,
                 set(args.cells.split(",")) if args.cells else None,
-                not args.fresh, args.first, args.label,
+                not args.fresh, args.first, args.label, args.cooldown,
             )
             total += n
             path = out_dir / f"{kernel}{args.label}-rep{rep}.toml"
