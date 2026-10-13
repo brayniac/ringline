@@ -276,12 +276,13 @@ struct Args {
     #[arg(long, default_value_t = 1000)]
     tick_timeout_us: u64,
 
-    /// (ringline echo only) Zero-copy send slab entries per worker. A
-    /// forward of bytes held in the recv accumulator (they arrived across
-    /// several recv completions), at or above `send_zc_threshold`, is sent
-    /// zero-copy and holds an entry until the kernel's notification; with
-    /// every entry held, `forward_recv_buf` fails with "send slab
-    /// exhausted". Entries are allocated at startup, about 1.3 KB each.
+    /// (ringline echo only) Zero-copy send slab entries per worker. An entry
+    /// is held from a zero-copy send until the kernel's notification: a
+    /// forward that covers the whole recv accumulator at or above
+    /// `send_zc_threshold`, a smaller one when the copy pool cannot take
+    /// it, and every forward in `--echo-mode recv-forward`. With every entry
+    /// held, the forward fails with "send slab exhausted". Entries are
+    /// allocated at startup, about 1.9 KB each.
     #[arg(long, default_value_t = 512)]
     send_slab_slots: u16,
 
@@ -610,6 +611,12 @@ fn main() {
         Runtime::TokioUring => "tokio-uring",
     };
 
+    if args.send_slab_slots != 512 && (runtime != Runtime::Ringline || args.proxy_backend.is_some())
+    {
+        eprintln!("bench-server: --send-slab-slots applies to the ringline echo server only");
+        std::process::exit(2);
+    }
+
     eprintln!(
         "bench-server: {} runtime, {} workers, listening on {}",
         runtime_name, workers, args.addr,
@@ -624,12 +631,6 @@ fn main() {
                 ringline_bench::runtime_metrics::print_counters_line();
             }
         });
-    }
-
-    if args.send_slab_slots != 512 && (runtime != Runtime::Ringline || args.proxy_backend.is_some())
-    {
-        eprintln!("bench-server: --send-slab-slots applies to the ringline echo server only");
-        std::process::exit(2);
     }
 
     match runtime {

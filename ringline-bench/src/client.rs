@@ -950,8 +950,9 @@ fn run_bench_tokio(
     let cpu_before = process_cpu_time_ns();
     let start = Instant::now();
     std::thread::sleep(duration);
-    // Responses that complete while the tasks wind down are outside the
-    // window `elapsed` measures, so recording stops with it.
+    // Recording stops with the window `elapsed` measures. Only the open
+    // loop reads `measure`: `run_tokio_client` records warmup and
+    // wind-down responses too.
     measure.store(false, Ordering::Relaxed);
     let elapsed = start.elapsed();
     let cpu_after = process_cpu_time_ns();
