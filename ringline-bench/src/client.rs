@@ -367,8 +367,8 @@ mod ringline_client {
         /// Mirrors `Config::conn_chunk_size` on the server side.
         pub conn_chunk_size: usize,
         pub stop: Arc<AtomicBool>,
-        /// Set true once warmup ends; open-loop latency/ops are only recorded
-        /// while this is true.
+        /// Set once warmup ends and cleared when the measured window ends;
+        /// responses are recorded only while it is set, in both modes.
         pub measure: Arc<AtomicBool>,
         pub ops: Arc<AtomicU64>,
         pub histograms: Arc<Mutex<Vec<Vec<u64>>>>,
@@ -733,7 +733,7 @@ mod ringline_client {
         }
 
         /// Record one response's latency and count it in `state.ops`, in
-        /// steps of 256 to keep the shared counter cold.
+        /// steps of 256 to limit contention on the shared counter.
         fn record(&mut self, ns: u64) {
             self.samples.push(ns);
             self.local_ops += 1;
@@ -747,14 +747,14 @@ mod ringline_client {
         fn drop(&mut self) {
             let state = &self.state;
             if let Some(l) = state.live.as_deref() {
-                l.conns.fetch_sub(1, Ordering::Relaxed);
-                // A connection that closes mid-drain leaves the open count;
-                // it must leave the drained count too, or the barrier
-                // releases while another connection still has requests in
-                // flight.
+                // A connection that closes mid-drain leaves the drained count
+                // before the open count, so the controller never counts it
+                // drained but not open and releases while another
+                // connection still has requests in flight.
                 if let Some(g) = self.drained_for {
                     l.unmark_drained(g);
                 }
+                l.conns.fetch_sub(1, Ordering::Release);
             }
             state
                 .ops
@@ -950,6 +950,9 @@ fn run_bench_tokio(
     let cpu_before = process_cpu_time_ns();
     let start = Instant::now();
     std::thread::sleep(duration);
+    // Responses that complete while the tasks wind down are outside the
+    // window `elapsed` measures, so recording stops with it.
+    measure.store(false, Ordering::Relaxed);
     let elapsed = start.elapsed();
     let cpu_after = process_cpu_time_ns();
     stop.store(true, Ordering::Relaxed);
@@ -1071,6 +1074,9 @@ fn run_bench_ringline(
     let cpu_before = process_cpu_time_ns();
     let start = Instant::now();
     std::thread::sleep(duration);
+    // Responses that complete while the tasks wind down are outside the
+    // window `elapsed` measures, so recording stops with it.
+    measure.store(false, Ordering::Relaxed);
     let elapsed = start.elapsed();
     let cpu_after = process_cpu_time_ns();
     stop.store(true, Ordering::Relaxed);
@@ -1187,8 +1193,11 @@ impl LiveOpenLoop {
         ctl.generation.store(next, Ordering::Release);
         let began = Instant::now();
         let drained = loop {
+            // `conns` first: a closing connection unmarks itself before it
+            // leaves `conns`.
+            let open = ctl.conns.load(Ordering::Acquire);
             let n = ctl.drained.load(Ordering::Acquire) & DRAINED_COUNT;
-            if n >= ctl.conns.load(Ordering::Relaxed) {
+            if n >= open {
                 break Some(began.elapsed());
             }
             if began.elapsed() >= timeout {

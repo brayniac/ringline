@@ -277,10 +277,11 @@ struct Args {
     tick_timeout_us: u64,
 
     /// (ringline echo only) Zero-copy send slab entries per worker. A
-    /// forwarded message the recv buffer could not carry is sent from the
-    /// accumulator under a guard and holds an entry until the kernel's
-    /// notification; with every entry held, `forward_recv_buf` fails with
-    /// "send slab exhausted".
+    /// forward of bytes held in the recv accumulator (they arrived across
+    /// several recv completions), at or above `send_zc_threshold`, is sent
+    /// zero-copy and holds an entry until the kernel's notification; with
+    /// every entry held, `forward_recv_buf` fails with "send slab
+    /// exhausted". Entries are allocated at startup, about 1.3 KB each.
     #[arg(long, default_value_t = 512)]
     send_slab_slots: u16,
 
@@ -623,6 +624,12 @@ fn main() {
                 ringline_bench::runtime_metrics::print_counters_line();
             }
         });
+    }
+
+    if args.send_slab_slots != 512 && (runtime != Runtime::Ringline || args.proxy_backend.is_some())
+    {
+        eprintln!("bench-server: --send-slab-slots applies to the ringline echo server only");
+        std::process::exit(2);
     }
 
     match runtime {
