@@ -250,7 +250,7 @@ timeout = 3600
 [[jobs.steps]]
 type = "anvil-vm"
 mode = "exec"
-payload_timeout = 7200
+payload_timeout = {payload_timeout}
 payload = '''
 set -uo pipefail
 mkdir -p /home/anvil/results
@@ -283,7 +283,7 @@ timeout = 3600
 [[jobs.steps]]
 type = "anvil-vm"
 mode = "exec"
-payload_timeout = 7200
+payload_timeout = {payload_timeout}
 payload = '''
 set -uo pipefail
 cd /home/anvil && mkdir -p results
@@ -324,6 +324,8 @@ SEARCH_DRAIN_MS = 1000
 # the requests in flight at the previous rate to be answered; a step whose
 # drain times out fails. The server's lifetime allows for it on every step.
 SEARCH_DRAIN_TIMEOUT_S = 60
+# payload_timeout of the phase q server and client steps.
+SEARCH_PAYLOAD_TIMEOUT_S = 7200
 
 # Offered rates for phase s, as fractions of base's closed-loop median:
 # geometric steps of 12% from 50% to 385%. Arms stop two steps past the
@@ -499,6 +501,10 @@ def render_search(kernel, rep, bins, workers, warmup, duration, ladder, only=Non
         if cooldown:
             per_step += cooldown + SEARCH_DRAIN_TIMEOUT_S + 2
         server_secs = max_steps * per_step + 60
+        if server_secs > SEARCH_PAYLOAD_TIMEOUT_S:
+            raise SystemExit(
+                f"{cid}: the server may run {server_secs} s, past the {SEARCH_PAYLOAD_TIMEOUT_S} s "
+                "payload timeout; lower --cooldown, --warmup or --duration")
         for arm in order:
             aid = f"{cid}-{arm}"
             sa, cc = arm_cmds(c, arm, "t", None, warmup, duration)
@@ -511,9 +517,10 @@ def render_search(kernel, rep, bins, workers, warmup, duration, ladder, only=Non
                     cc += f" --search-cooldown-secs {cooldown}"
             server.append(SEARCH_SERVER_ARM.format(
                 aid=aid, server_secs=server_secs, server_args=sa,
+                payload_timeout=SEARCH_PAYLOAD_TIMEOUT_S,
             ))
             client.append(SEARCH_ARM.format(
-                aid=aid, client_cmd=cc,
+                aid=aid, client_cmd=cc, payload_timeout=SEARCH_PAYLOAD_TIMEOUT_S,
                 start=max(1, int(SEARCH_START * base)), factor=SEARCH_FACTOR,
                 max_rate=max(1, int(SEARCH_MAX * base)),
                 slo_us=SLO_P99_NS[c["msg"]] // 1000,
@@ -658,7 +665,11 @@ def main():
         print("phase s: the estimate assumes every step runs; an arm stops after two saturated steps")
     if args.phase == "q":
         per = (args.warmup + args.duration + 10) * 14
-        print("phase q: the estimate assumes 14 steps per arm")
+        if args.cooldown:
+            per += (args.cooldown + 2) * 5
+            print("phase q: the estimate assumes 14 steps and 5 cool-downs per arm")
+        else:
+            print("phase q: the estimate assumes 14 steps per arm")
     print(f"{total} arms, about {total * per // 3600} h {total * per % 3600 // 60} min plus boots")
 
 

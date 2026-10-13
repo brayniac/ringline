@@ -13,7 +13,9 @@ JSON is kept with `ok: false`, so a failed arm is visible as one rather
 than missing. Phase s adds a row per ladder step (`step` sNN). Phase q adds
 a row per search step (`step` qNN) and one `search` row per arm with the
 client's result; an arm whose client printed no result line has
-`stopped: "no result"`.
+`stopped: "no result"`. With generate.py --cooldown, a `qNNc` row
+(`phase` "cooldown", no `pass`) follows each failed step NN that did not
+end the search.
 
 The gate per cell compares inc's median with the 2 x reps runs of base and
 base2 together: throughput below their minimum, or p99 above their maximum,
@@ -117,7 +119,11 @@ def rows(ids_path, out_path):
                 if result and result["type"] == "result":
                     row.update(ok=True, knee=result["knee"], stopped=result["stopped"], steps=result["steps"])
                 elif result:
-                    row["stopped"] = f"step_timeout at step {result['index']}"
+                    # Clients before the cool-down change print no period.
+                    period = result.get("period", "step")
+                    where = (f"cooldown after step {result['index']}" if period == "cooldown"
+                             else f"{period} {result['index']}")
+                    row["stopped"] = f"step_timeout in {where}"
                 row.update(server_fields(d, aid))
                 out.write(json.dumps(row) + "\n")
         out.flush()

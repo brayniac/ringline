@@ -87,7 +87,9 @@ pub struct BenchResult {
 /// connection that got none is visible here and not in [`LatencyStats`].
 #[derive(Clone, Serialize)]
 pub struct ConnCounts {
-    /// Connections that connected.
+    /// Connections counted: in a fixed-rate run, every connection that
+    /// connected; in a search that reuses its connections, those open at the
+    /// end of the window.
     pub conns: u64,
     /// Connections with no response in the measured window.
     pub zero: u64,
@@ -95,6 +97,11 @@ pub struct ConnCounts {
     pub p10: u64,
     pub median: u64,
     pub max: u64,
+    /// Connections that connected and had closed by the end of the window;
+    /// they are not in the other fields. Reported by a search that reuses
+    /// its connections.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub closed: Option<u64>,
 }
 
 impl ConnCounts {
@@ -112,6 +119,7 @@ impl ConnCounts {
             p10: at(0.1),
             median: at(0.5),
             max: counts[counts.len() - 1],
+            closed: None,
         })
     }
 }

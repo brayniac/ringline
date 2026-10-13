@@ -102,7 +102,9 @@ struct Args {
     /// `--search-max-bisect` bisection steps have run. Each step is a
     /// separate open-loop run with new connections: `--warmup` seconds, then
     /// `--duration` seconds measured; with `--search-reuse`, the steps share
-    /// one set of connections. Prints one JSON line per step and a final
+    /// one set of connections. Prints one JSON line per step, a
+    /// `"type":"cooldown"` line after each failed step that does not end the
+    /// search when `--search-cooldown-secs` is set, and a final
     /// `"type":"result"` line with the highest passing rate.
     #[arg(long, conflicts_with_all = ["open", "rate"])]
     search: bool,
@@ -128,10 +130,12 @@ struct Args {
     #[arg(long, default_value_t = 60)]
     drain_timeout_secs: u64,
 
-    /// With `--search-reuse`: after a step fails, offer `--search-start`
-    /// requests/s for this many seconds before the next step, and print a
-    /// `"type":"cooldown"` line measured over that time. 0 runs the next
-    /// step straight away.
+    /// With `--search-reuse`: after a failed step that does not end the
+    /// search, offer `--search-start` requests/s for this many seconds
+    /// (after the drain and `--drain-window-ms`), print a
+    /// `"type":"cooldown"` line measured over them, then run the next step.
+    /// `--search-time-limit` does not count this time. 0 runs the next step
+    /// straight away.
     #[arg(long, default_value_t = 0, requires = "search_reuse")]
     search_cooldown_secs: u64,
 
@@ -158,7 +162,8 @@ struct Args {
 
     /// Seconds the whole search may take. A step that would end past it is
     /// not started; the result reports the highest passing rate so far.
-    /// 0 is no limit.
+    /// Cool-downs (`--search-cooldown-secs`) are not counted. 0 is no
+    /// limit.
     #[arg(long, default_value_t = 0)]
     search_time_limit: u64,
 
@@ -179,9 +184,13 @@ struct Args {
     #[arg(long, default_value_t = 0.9)]
     min_throughput_ratio: f64,
 
-    /// Seconds past `--warmup` + `--duration` a search step may run before
-    /// the process prints a `"type":"step_timeout"` line and exits with
-    /// status 3.
+    /// Seconds a search step may run past its expected length before the
+    /// process prints a `"type":"step_timeout"` line and exits with status
+    /// 3. A step's expected length is `--warmup` + `--duration`, or with
+    /// `--search-reuse` `--drain-window-ms` + `--duration` + 1 s plus
+    /// `--drain-timeout-secs`. The warmup, each cool-down and the final
+    /// close get the same allowance; the line's `period` says which ran
+    /// over.
     #[arg(long, default_value_t = 60)]
     step_grace: u64,
 }
@@ -434,16 +443,19 @@ fn run_search(args: &Args, runtime_name: &str, threads: usize) {
         args.warmup + args.duration
     };
     let drain_timeout = Duration::from_secs(args.drain_timeout_secs);
-    let step_limit = Duration::from_secs(
-        step_secs.max(args.search_cooldown_secs + args.drain_window_ms.div_ceil(1000))
+    let reuse_drain = if args.search_reuse {
+        args.drain_timeout_secs
+    } else {
+        0
+    };
+    let step_limit = Duration::from_secs(step_secs + args.step_grace + reuse_drain);
+    let cooldown_limit = Duration::from_secs(
+        args.search_cooldown_secs
+            + args.drain_window_ms.div_ceil(1000)
             + args.step_grace
-            + if args.search_reuse {
-                args.drain_timeout_secs
-            } else {
-                0
-            },
+            + reuse_drain,
     );
-    let watchdog = StepWatchdog::start(step_limit);
+    let watchdog = StepWatchdog::start();
 
     let mut search = RateSearch::new(
         args.search_start,
@@ -460,7 +472,7 @@ fn run_search(args: &Args, runtime_name: &str, threads: usize) {
             search.current_rate(),
             args.warmup
         );
-        watchdog.arm(0, search.current_rate());
+        watchdog.arm(Period::Warmup, 0, search.current_rate(), step_limit);
         let live = LiveOpenLoop::start(
             &args.addr,
             args.clients,
@@ -497,7 +509,7 @@ fn run_search(args: &Args, runtime_name: &str, threads: usize) {
             args.msg_size,
             args.addr,
         );
-        watchdog.arm(index, rate);
+        watchdog.arm(Period::Step, index, rate, step_limit);
         let pool_full_before = send_pool_full();
         let (ops_per_sec, total_ops, latency, connections, drain_ms, per_conn) = match &live {
             Some(live) => {
@@ -571,7 +583,12 @@ fn run_search(args: &Args, runtime_name: &str, threads: usize) {
                     && fail_reason.is_some()
                     && args.search_cooldown_secs > 0
                 {
-                    watchdog.arm(index - 1, args.search_start);
+                    watchdog.arm(
+                        Period::Cooldown,
+                        index - 1,
+                        args.search_start,
+                        cooldown_limit,
+                    );
                     cooldown(live, index - 1, args, drain_timeout, drain);
                     watchdog.disarm();
                 }
@@ -587,7 +604,7 @@ fn run_search(args: &Args, runtime_name: &str, threads: usize) {
     };
 
     if let Some(live) = live {
-        watchdog.arm(index, 0);
+        watchdog.arm(Period::Stop, index, 0, step_limit);
         live.stop();
         watchdog.disarm();
     }
@@ -652,8 +669,11 @@ fn cooldown(
     };
     println!("{}", serde_json::to_string(&report).unwrap());
     eprintln!(
-        "bench-client: cooldown after step {after_index} @ {rate} rps: {ops_per_sec:.0} ops/s, p99={:.1}us",
+        "bench-client: cooldown after step {after_index} @ {rate} rps: {ops_per_sec:.0} ops/s, p99={:.1}us, drain {}",
         lat.p99_ns as f64 / 1000.0,
+        report
+            .drain_ms
+            .map_or("timed out".to_string(), |ms| format!("{ms} ms")),
     );
 }
 
@@ -704,30 +724,67 @@ fn print_step(
     );
 }
 
-/// Ends the process if one search step runs past its limit. A client that
+/// What the search is doing while a [`StepWatchdog`] is armed.
+#[derive(Clone, Copy)]
+enum Period {
+    /// Opening the connections and the warmup, with `--search-reuse`.
+    Warmup,
+    Step,
+    /// The cool-down after the failed step `index`.
+    Cooldown,
+    /// Closing the connections after the last step.
+    Stop,
+}
+
+impl Period {
+    fn as_str(self) -> &'static str {
+        match self {
+            Period::Warmup => "warmup",
+            Period::Step => "step",
+            Period::Cooldown => "cooldown",
+            Period::Stop => "stop",
+        }
+    }
+}
+
+struct Armed {
+    started: Instant,
+    limit: Duration,
+    period: Period,
+    index: usize,
+    rate: u64,
+}
+
+/// Ends the process if one search period runs past its limit. A client that
 /// hangs (a connect that never completes, a worker that does not join) would
 /// otherwise hold the load host until the experiment's own timeout.
 struct StepWatchdog {
-    armed: Arc<Mutex<Option<(Instant, usize, u64)>>>,
+    armed: Arc<Mutex<Option<Armed>>>,
 }
 
 impl StepWatchdog {
-    fn start(limit: Duration) -> Self {
-        let armed: Arc<Mutex<Option<(Instant, usize, u64)>>> = Arc::new(Mutex::new(None));
+    fn start() -> Self {
+        let armed: Arc<Mutex<Option<Armed>>> = Arc::new(Mutex::new(None));
         let watched = armed.clone();
         std::thread::spawn(move || {
             loop {
                 std::thread::sleep(Duration::from_secs(1));
-                if let Some((started, index, rate)) = *watched.lock().unwrap()
-                    && started.elapsed() > limit
+                if let Some(a) = &*watched.lock().unwrap()
+                    && a.started.elapsed() > a.limit
                 {
                     println!(
-                        "{{\"type\":\"step_timeout\",\"index\":{index},\"offered_rate\":{rate},\"limit_secs\":{}}}",
-                        limit.as_secs()
+                        "{{\"type\":\"step_timeout\",\"period\":\"{}\",\"index\":{},\"offered_rate\":{},\"limit_secs\":{}}}",
+                        a.period.as_str(),
+                        a.index,
+                        a.rate,
+                        a.limit.as_secs()
                     );
                     eprintln!(
-                        "bench-client: search step {index} @ {rate} rps ran past {} s; exiting",
-                        limit.as_secs()
+                        "bench-client: search {} {} @ {} rps ran past {} s; exiting",
+                        a.period.as_str(),
+                        a.index,
+                        a.rate,
+                        a.limit.as_secs()
                     );
                     std::process::exit(3);
                 }
@@ -736,8 +793,14 @@ impl StepWatchdog {
         Self { armed }
     }
 
-    fn arm(&self, index: usize, rate: u64) {
-        *self.armed.lock().unwrap() = Some((Instant::now(), index, rate));
+    fn arm(&self, period: Period, index: usize, rate: u64, limit: Duration) {
+        *self.armed.lock().unwrap() = Some(Armed {
+            started: Instant::now(),
+            limit,
+            period,
+            index,
+            rate,
+        });
     }
 
     fn disarm(&self) {

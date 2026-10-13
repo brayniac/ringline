@@ -42,7 +42,8 @@ pub struct LiveCtl {
     /// Connections currently open.
     conns: AtomicU64,
     /// Responses received per connection, indexed by the slot each
-    /// connection takes from `next_slot` when it connects.
+    /// connection takes from `next_slot` when it connects, with the top bit
+    /// (`SLOT_CLOSED`) set once the connection has closed.
     per_conn: Box<[ConnCounter]>,
     next_slot: AtomicUsize,
 }
@@ -54,6 +55,7 @@ pub struct LiveCtl {
 struct ConnCounter(AtomicU64);
 
 const DRAINED_COUNT: u64 = 0xffff_ffff;
+const SLOT_CLOSED: u64 = 1 << 63;
 
 impl LiveCtl {
     fn new(rate: u64, num_clients: usize) -> Self {
@@ -77,7 +79,15 @@ impl LiveCtl {
         (slot < self.per_conn.len()).then_some(slot)
     }
 
-    /// Response counts of the connections that have connected so far.
+    /// Marks a slot's connection closed.
+    fn close_slot(&self, slot: usize) {
+        self.per_conn[slot]
+            .0
+            .fetch_or(SLOT_CLOSED, Ordering::Relaxed);
+    }
+
+    /// Counters of the connections that have connected so far, with
+    /// `SLOT_CLOSED` set on those that have closed.
     fn conn_counts(&self) -> Vec<u64> {
         let n = self
             .next_slot
@@ -577,6 +587,7 @@ mod ringline_client {
             l.take_slot()
         });
         let mut rec = ConnRecord::new(state.clone());
+        rec.slot = slot;
         rec.svc.reserve(1_000_000);
         rec.lag.reserve(1_000_000);
 
@@ -753,6 +764,8 @@ mod ringline_client {
         /// The live generation this connection has been counted drained
         /// for, if any.
         drained_for: Option<u64>,
+        /// This connection's slot in the live controller's counters.
+        slot: Option<usize>,
     }
 
     impl ConnRecord {
@@ -764,6 +777,7 @@ mod ringline_client {
                 lag: Vec::new(),
                 local_ops: 0,
                 drained_for: None,
+                slot: None,
             }
         }
 
@@ -788,6 +802,9 @@ mod ringline_client {
                 // connection still has requests in flight.
                 if let Some(g) = self.drained_for {
                     l.unmark_drained(g);
+                }
+                if let Some(slot) = self.slot {
+                    l.close_slot(slot);
                 }
                 l.conns.fetch_sub(1, Ordering::Release);
             }
@@ -1162,7 +1179,8 @@ fn run_bench_ringline(
 
 // ── Open loop with in-place rate changes ───────────────────────────
 
-/// A point-in-time copy of a [`LiveOpenLoop`]'s response histogram.
+/// A point-in-time copy of a [`LiveOpenLoop`]'s response histogram and
+/// per-connection response counts.
 pub struct LiveSnapshot {
     hist: histogram::Histogram,
     per_conn: Vec<u64>,
@@ -1260,8 +1278,9 @@ impl LiveOpenLoop {
     }
 
     /// Achieved responses/s, latency, and responses per connection between
-    /// two snapshots. The per-connection counts cover the connections that
-    /// had connected by `after`.
+    /// two snapshots. The per-connection counts cover the connections open
+    /// at `after`; `ConnCounts::closed` counts the ones that had connected
+    /// and closed by then.
     pub fn step(
         before: &LiveSnapshot,
         after: &LiveSnapshot,
@@ -1300,14 +1319,24 @@ impl LiveOpenLoop {
             max_ns: pct(1.0),
             count,
         };
+        let closed = after
+            .per_conn
+            .iter()
+            .filter(|&&n| n & SLOT_CLOSED != 0)
+            .count() as u64;
         let per_conn = ConnCounts::from_counts(
             after
                 .per_conn
                 .iter()
                 .enumerate()
+                .filter(|&(_, &n)| n & SLOT_CLOSED == 0)
                 .map(|(i, &n)| n.saturating_sub(before.per_conn.get(i).copied().unwrap_or(0)))
                 .collect(),
-        );
+        )
+        .map(|c| ConnCounts {
+            closed: Some(closed),
+            ..c
+        });
         (
             if secs > 0.0 { count as f64 / secs } else { 0.0 },
             stats,
@@ -1328,7 +1357,7 @@ mod live_tests {
 
     #[test]
     fn step_reports_only_the_window_between_snapshots() {
-        let ctl = LiveCtl::new(1000, 4);
+        let ctl = LiveCtl::new(1000, 5);
         let a = ctl.take_slot().unwrap();
         let b = ctl.take_slot().unwrap();
         // Recorded before the window: must not appear in the step.
@@ -1347,6 +1376,10 @@ mod live_tests {
         ctl.per_conn[b].0.fetch_add(1000, Ordering::Relaxed);
         // Connects inside the window and gets nothing.
         ctl.take_slot().unwrap();
+        // Gets responses in the window, then closes: not counted as open.
+        let d = ctl.take_slot().unwrap();
+        ctl.per_conn[d].0.fetch_add(5, Ordering::Relaxed);
+        ctl.close_slot(d);
         let after = LiveSnapshot {
             hist: ctl.hist.load(),
             per_conn: ctl.conn_counts(),
@@ -1355,6 +1388,7 @@ mod live_tests {
         let (rate, lat, per_conn) = LiveOpenLoop::step(&before, &after);
         let per_conn = per_conn.unwrap();
         assert_eq!(per_conn.conns, 3);
+        assert_eq!(per_conn.closed, Some(1));
         assert_eq!(per_conn.zero, 2);
         assert_eq!(per_conn.max, 1000);
         assert_eq!(lat.count, 1000);
