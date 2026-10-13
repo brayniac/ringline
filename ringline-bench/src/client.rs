@@ -11,21 +11,43 @@ use crate::stats::{BenchResult, LatencyHistogram, LatencyStats, process_cpu_time
 /// coordinated-omission-corrected time into `hist`.
 pub struct LiveCtl {
     rate: AtomicU64,
+    /// Incremented on every rate change. A connection that sees a new value
+    /// stops sending until its in-flight requests have been answered.
     generation: AtomicU64,
+    /// The generation whose schedule connections may start sending on.
+    go: AtomicU64,
+    /// Connections whose in-flight requests have all been answered since
+    /// the last rate change: the generation in the high 32 bits, the count
+    /// in the low 32.
+    drained: AtomicU64,
     hist: histogram::AtomicHistogram,
     /// Connections currently open.
     conns: AtomicU64,
 }
+
+const DRAINED_COUNT: u64 = 0xffff_ffff;
 
 impl LiveCtl {
     fn new(rate: u64) -> Self {
         Self {
             rate: AtomicU64::new(rate),
             generation: AtomicU64::new(0),
+            go: AtomicU64::new(0),
+            drained: AtomicU64::new(0),
             // 2^-7 relative bucket width (under 1% error), values to 2^64 ns.
             hist: histogram::AtomicHistogram::new(7, 64).expect("valid histogram config"),
             conns: AtomicU64::new(0),
         }
+    }
+
+    /// Counts one connection as drained for `generation`. A connection that
+    /// reports for a generation the controller has moved past is not counted.
+    fn mark_drained(&self, generation: u64) {
+        let _ = self
+            .drained
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+                (v >> 32 == generation & DRAINED_COUNT).then_some(v + 1)
+            });
     }
 }
 
@@ -510,7 +532,15 @@ mod ringline_client {
         let num_clients = state.num_clients.max(1) as f64;
         // Below 1/s per connection is allowed: 1 MiB echo at 1000 connections
         // saturates at a few hundred requests/s in total.
-        let mut generation = live.map_or(0, |l| l.generation.load(Ordering::Acquire));
+        // With a live controller the first pass of the loop sees a changed
+        // generation, reports this connection drained and waits for `go`, so
+        // a connection opened during a drain does not hold it up.
+        let mut generation = u64::MAX;
+        // Between a rate change and `go`: send nothing, receive what is in
+        // flight.
+        let mut waiting = false;
+        // Whether this connection has been counted drained for `generation`.
+        let mut reported = false;
         let rate = live.map_or(ol.rate, |l| l.rate.load(Ordering::Relaxed));
         let mut interval = num_clients / rate.max(1) as f64;
 
@@ -547,13 +577,28 @@ mod ringline_client {
                 break;
             }
 
-            // A rate change starts a new schedule from now, at the same phase
-            // within the new interval. Requests already in flight keep their
-            // scheduled times; a backlog behind the old schedule is dropped.
+            // A rate change stops sending until this connection's in-flight
+            // requests are answered, so they do not queue ahead of the next
+            // step's. Once every connection has drained (`go`), a new schedule
+            // starts from now, at the same phase within the new interval; the
+            // backlog behind the old schedule is dropped.
             if let Some(l) = live {
                 let g = l.generation.load(Ordering::Acquire);
                 if g != generation {
                     generation = g;
+                    waiting = true;
+                    reported = false;
+                }
+                if waiting && fifo.is_empty() {
+                    if !reported {
+                        l.mark_drained(generation);
+                        reported = true;
+                    }
+                    if l.go.load(Ordering::Acquire) < generation {
+                        sleep(Duration::from_millis(1)).await;
+                        continue;
+                    }
+                    waiting = false;
                     interval = num_clients / l.rate.load(Ordering::Relaxed).max(1) as f64;
                     start = Instant::now() + Duration::from_secs_f64(interval * phase);
                     sent = 0;
@@ -564,7 +609,7 @@ mod ringline_client {
             // cap so we return to recv frequently.
             let mut burst = 0;
             let mut pool_full = false;
-            while fifo.len() < ol.max_inflight && burst < SEND_BURST {
+            while !waiting && fifo.len() < ol.max_inflight && burst < SEND_BURST {
                 let target = start + Duration::from_secs_f64(interval * sent as f64);
                 if Instant::now() < target {
                     break; // next request not due yet
@@ -1065,10 +1110,31 @@ impl LiveOpenLoop {
         Ok(Self { ctl, stop, rt })
     }
 
-    /// Offer `rate` requests/s in total from now on.
-    pub fn set_rate(&self, rate: u64) {
-        self.ctl.rate.store(rate, Ordering::Relaxed);
-        self.ctl.generation.fetch_add(1, Ordering::Release);
+    /// Offer `rate` requests/s in total. Every connection stops sending
+    /// until the requests it has in flight are answered; once all open
+    /// connections have drained, or `timeout` has passed, each starts a new
+    /// schedule at `rate`. Returns how long the drain took, or `None` if it
+    /// timed out.
+    pub fn set_rate(&self, rate: u64, timeout: Duration) -> Option<Duration> {
+        let ctl = &self.ctl;
+        let next = ctl.generation.load(Ordering::Relaxed) + 1;
+        ctl.drained
+            .store((next & DRAINED_COUNT) << 32, Ordering::Release);
+        ctl.rate.store(rate, Ordering::Relaxed);
+        ctl.generation.store(next, Ordering::Release);
+        let began = Instant::now();
+        let drained = loop {
+            let n = ctl.drained.load(Ordering::Acquire) & DRAINED_COUNT;
+            if n >= ctl.conns.load(Ordering::Relaxed) {
+                break Some(began.elapsed());
+            }
+            if began.elapsed() >= timeout {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        ctl.go.store(next, Ordering::Release);
+        drained
     }
 
     /// Connections open now.

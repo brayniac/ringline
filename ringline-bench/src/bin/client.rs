@@ -109,16 +109,24 @@ struct Args {
 
     /// Keep one set of connections open for the whole search and change the
     /// offered rate in place, as cachecannon does. `--warmup` runs once, at
-    /// the start rate. Each step then waits `--drain-window-ms` for requests
-    /// sent at the previous rate, and measures `--duration` seconds. ringline
+    /// the start rate. At each rate change every connection stops sending
+    /// until its in-flight requests are answered (at most
+    /// `--drain-timeout-secs`), then starts the new rate; the step waits
+    /// `--drain-window-ms` more and measures `--duration` seconds. ringline
     /// runtime only.
     #[arg(long, requires = "search")]
     search_reuse: bool,
 
-    /// With `--search-reuse`: milliseconds after a rate change before a
-    /// step's measurement starts.
+    /// With `--search-reuse`: milliseconds between the new rate starting
+    /// and the step's measurement.
     #[arg(long, default_value_t = 500)]
     drain_window_ms: u64,
+
+    /// With `--search-reuse`: seconds to wait at a rate change for the
+    /// requests in flight at the previous rate to be answered. A step whose
+    /// drain runs past this fails.
+    #[arg(long, default_value_t = 60)]
+    drain_timeout_secs: u64,
 
     /// First offered rate of the search, requests/s.
     #[arg(long, default_value_t = 1000)]
@@ -193,6 +201,10 @@ struct StepReport {
     /// With `--search-reuse`: connections open at the end of the step.
     #[serde(skip_serializing_if = "Option::is_none")]
     connections: Option<u64>,
+    /// With `--search-reuse`: milliseconds the rate change waited for
+    /// in-flight requests to be answered; `null` if the drain timed out.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    drain_ms: Option<Option<u64>>,
 }
 
 /// The search's final line.
@@ -207,6 +219,7 @@ struct SearchReport {
     duration_secs: u64,
     reuse_connections: bool,
     drain_window_ms: Option<u64>,
+    drain_timeout_secs: Option<u64>,
     slo_p50_ns: Option<u64>,
     slo_p99_ns: Option<u64>,
     slo_p999_ns: Option<u64>,
@@ -375,7 +388,16 @@ fn run_search(args: &Args, runtime_name: &str, threads: usize) {
     } else {
         args.warmup + args.duration
     };
-    let step_limit = Duration::from_secs(step_secs + args.step_grace);
+    let drain_timeout = Duration::from_secs(args.drain_timeout_secs);
+    let step_limit = Duration::from_secs(
+        step_secs
+            + args.step_grace
+            + if args.search_reuse {
+                args.drain_timeout_secs
+            } else {
+                0
+            },
+    );
     let watchdog = StepWatchdog::start(step_limit);
 
     let mut search = RateSearch::new(
@@ -431,9 +453,9 @@ fn run_search(args: &Args, runtime_name: &str, threads: usize) {
             args.addr,
         );
         watchdog.arm(index, rate);
-        let (ops_per_sec, total_ops, latency, connections) = match &live {
+        let (ops_per_sec, total_ops, latency, connections, drain_ms) = match &live {
             Some(live) => {
-                live.set_rate(rate);
+                let drained = live.set_rate(rate, drain_timeout);
                 std::thread::sleep(drain);
                 let before = live.snapshot();
                 std::thread::sleep(Duration::from_secs(args.duration));
@@ -444,6 +466,7 @@ fn run_search(args: &Args, runtime_name: &str, threads: usize) {
                     latency.count,
                     latency,
                     Some(live.connections()),
+                    Some(drained.map(|d| d.as_millis() as u64)),
                 )
             }
             None => {
@@ -462,11 +485,24 @@ fn run_search(args: &Args, runtime_name: &str, threads: usize) {
                     }),
                     args.conn_chunk_size,
                 );
-                (result.ops_per_sec, result.total_ops, result.latency, None)
+                (
+                    result.ops_per_sec,
+                    result.total_ops,
+                    result.latency,
+                    None,
+                    None,
+                )
             }
         };
         watchdog.disarm();
-        let fail_reason = slo.check(rate, ops_per_sec, &latency);
+        let fail_reason = if drain_ms == Some(None) {
+            Some(format!(
+                "in-flight requests not answered within {}s of the rate change",
+                args.drain_timeout_secs
+            ))
+        } else {
+            slo.check(rate, ops_per_sec, &latency)
+        };
         print_step(
             index,
             phase,
@@ -475,6 +511,7 @@ fn run_search(args: &Args, runtime_name: &str, threads: usize) {
             total_ops,
             &latency,
             connections,
+            drain_ms,
             fail_reason.clone(),
         );
         index += 1;
@@ -506,6 +543,7 @@ fn run_search(args: &Args, runtime_name: &str, threads: usize) {
         duration_secs: args.duration,
         reuse_connections: args.search_reuse,
         drain_window_ms: args.search_reuse.then_some(args.drain_window_ms),
+        drain_timeout_secs: args.search_reuse.then_some(args.drain_timeout_secs),
         slo_p50_ns: slo.p50_ns,
         slo_p99_ns: slo.p99_ns,
         slo_p999_ns: slo.p999_ns,
@@ -530,6 +568,7 @@ fn print_step(
     total_ops: u64,
     lat: &LatencyStats,
     connections: Option<u64>,
+    drain_ms: Option<Option<u64>>,
     fail_reason: Option<String>,
 ) {
     let step = StepReport {
@@ -550,6 +589,7 @@ fn print_step(
         pass: fail_reason.is_none(),
         fail_reason,
         connections,
+        drain_ms,
     };
     // stdout is line-buffered, so each step is written out before the next
     // starts, and a step timeout does not lose the earlier ones.
