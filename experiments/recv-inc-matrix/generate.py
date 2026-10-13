@@ -551,6 +551,8 @@ def render(kernel, rep, phase, bins, workers, warmup, duration, rates, only=None
         cid = cell_id(c)
         if phase == "l" and (c["kind"] == "proxy" or cid not in rates):
             continue
+        if only and cid not in only:
+            continue
         # 10,000 connections take longer to open than 64.
         slack = 40 if c["conns"] >= 10000 else 20
         server_secs = warmup + duration + slack
@@ -632,7 +634,7 @@ def main():
     ap.add_argument("--warmup", type=int, default=3)
     ap.add_argument("--duration", type=int, default=12)
     ap.add_argument("--out", default=None)
-    ap.add_argument("--cells", default=None, help="phase q: comma-separated cell ids to keep")
+    ap.add_argument("--cells", default=None, help="phases t, l and q: comma-separated cell ids to keep")
     ap.add_argument("--fresh", action="store_true", help="phase q: new connections for every search step, instead of one set per search")
     ap.add_argument("--first", default=None, help="phase s: run this cell id first in each boot")
     ap.add_argument("--label", default="", help="appended to the phase in experiment names and file names")
