@@ -162,8 +162,10 @@ struct Args {
 
     /// Seconds the whole search may take, counted from before the warmup. A
     /// step that would end past it is not started; the result reports the
-    /// highest passing rate so far. The check does not include everything
-    /// a step can take, so a search can end past the limit: with
+    /// highest passing rate so far. The check adds only the step's expected
+    /// length (`--warmup` + `--duration`, or with `--search-reuse`
+    /// `--drain-window-ms` + `--duration` + 1 s), so a search can end past
+    /// the limit: with
     /// `--search-reuse`, by up to `--drain-timeout-secs`, one cool-down
     /// (`--search-cooldown-secs` + `--drain-window-ms` +
     /// `--drain-timeout-secs`) and the close; without it, by the last
@@ -195,8 +197,8 @@ struct Args {
     /// `--drain-timeout-secs`. A cool-down may run this long past
     /// `--search-cooldown-secs` + `--drain-window-ms` +
     /// `--drain-timeout-secs`, and the warmup this long past `--warmup` +
-    /// 60 s for starting the client. The final close is given the same
-    /// limit as a step. The line's `period` says which ran over.
+    /// 60 s for starting the client. With `--search-reuse`, the final close
+    /// is given the same limit as a step. The line's `period` says which ran over.
     #[arg(long, default_value_t = 60)]
     step_grace: u64,
 }

@@ -549,10 +549,9 @@ fn apply_cpu_affinity(_cpus: &[usize]) {
 static FORWARD_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FORWARD_RETRIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Print ringline's runtime counters, and write them to `path` if one was
-/// given. Called after the shutdown signal so the numbers cover the whole run.
-fn dump_runtime_metrics(path: Option<&std::path::Path>) {
-    ringline_bench::runtime_metrics::print_summary();
+/// Print [`FORWARD_FAILURES`] and [`FORWARD_RETRIES`]. Called after the
+/// workers have exited, and only for arms that run `forward_echo_loop`.
+fn print_forward_counts() {
     use std::sync::atomic::Ordering::Relaxed;
     eprintln!(
         "bench-server: forward_failures = {}",
@@ -562,6 +561,12 @@ fn dump_runtime_metrics(path: Option<&std::path::Path>) {
         "bench-server: forward_retries = {}",
         FORWARD_RETRIES.load(Relaxed)
     );
+}
+
+/// Print ringline's runtime counters, and write them to `path` if one was
+/// given. Called after the shutdown signal so the numbers cover the whole run.
+fn dump_runtime_metrics(path: Option<&std::path::Path>) {
+    ringline_bench::runtime_metrics::print_summary();
     // Peak resident set, for comparing ring geometries' memory.
     if let Ok(status) = std::fs::read_to_string("/proc/self/status")
         && let Some(line) = status.lines().find(|l| l.starts_with("VmHWM:"))
@@ -1035,9 +1040,10 @@ fn run_ringline(cfg: EchoCfg) {
                             return;
                         }
                         // `timer_slots` is `max_connections` (`run_ringline`),
-                        // so a slot is free unless that changes. A timeout SQE
-                        // that cannot be pushed still panics when the sleep is
-                        // polled; the executor then closes the connection.
+                        // so a slot is free unless that changes. If try_sleep
+                        // cannot push the timeout SQE, the first poll pushes it
+                        // again and panics if that push also fails; the
+                        // executor then closes the connection.
                         let Ok(sleep) = ringline::try_sleep(wait) else {
                             eprintln!("echo: no timer slot to wait for a forward retry; closing");
                             return;
@@ -1273,6 +1279,12 @@ fn run_ringline(cfg: EchoCfg) {
     dump_runtime_metrics(metrics_out.as_deref());
 
     report_worker_exits(handles);
+    // `direct` runs `forward_echo_loop` where there is no io_uring.
+    if matches!(echo_mode, EchoMode::Forward)
+        || (matches!(echo_mode, EchoMode::Direct) && !cfg!(has_io_uring))
+    {
+        print_forward_counts();
+    }
 }
 
 /// Join the workers and print any that returned an error or panicked.
