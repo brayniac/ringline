@@ -80,6 +80,8 @@ def rows(ids_path, out_path):
                                    p999=c["p999_ns"], ok=c["sample_count"] > 0)
                         if c.get("offered_rate"):
                             row["offered"] = c["offered_rate"]
+                        if c.get("per_conn"):
+                            row["per_conn"] = c["per_conn"]
                 except (ValueError, KeyError):
                     pass
                 row.update(server_fields(d, aid))
@@ -131,8 +133,8 @@ def rows(ids_path, out_path):
 
 
 def server_fields(d, aid):
-    """Peak RSS, panic, forward failure and retry counts, and ring counters
-    from one arm's server results."""
+    """Peak RSS, panic, forward failure and retry counts, forward failure
+    log lines, and ring counters from one arm's server results."""
     row = {}
     sdir = d / "server" / "results"
     log = sdir / f"{aid}.server.log"
@@ -141,6 +143,9 @@ def server_fields(d, aid):
         m = re.search(r"VmHWM:\s+(\d+) kB", text)
         row["rss_mib"] = int(m.group(1)) / 1024 if m else None
         row["panic"] = "panicked" in text
+        # A server built before 23072fa prints no counts; each failed
+        # forward logs this line.
+        row["forward_fail_lines"] = text.count("forward_recv_buf failed")
         for k in ("forward_failures", "forward_retries"):
             m = re.search(rf"bench-server: {k} = (\d+)", text)
             row[k] = int(m.group(1)) if m else None
