@@ -74,6 +74,8 @@ struct EchoCfg {
     tls: bool,
     /// Event-loop tick interval, microseconds.
     tick_timeout_us: u64,
+    /// Zero-copy send slab entries per worker.
+    send_slab_slots: u16,
     /// Simulated per-request application work, microseconds.
     service_time_us: u64,
 }
@@ -273,6 +275,14 @@ struct Args {
     /// not: if throughput tracks this knob, the work is tick-driven.
     #[arg(long, default_value_t = 1000)]
     tick_timeout_us: u64,
+
+    /// (ringline echo only) Zero-copy send slab entries per worker. A
+    /// forwarded message the recv buffer could not carry is sent from the
+    /// accumulator under a guard and holds an entry until the kernel's
+    /// notification; with every entry held, `forward_recv_buf` fails with
+    /// "send slab exhausted".
+    #[arg(long, default_value_t = 512)]
+    send_slab_slots: u16,
 
     /// Simulated per-request application work in MICROSECONDS, burned as a busy
     /// spin before each response.
@@ -654,6 +664,7 @@ fn main() {
             park_imbalance_ms: args.park_imbalance_ms,
             tls: args.tls,
             tick_timeout_us: args.tick_timeout_us,
+            send_slab_slots: args.send_slab_slots,
             service_time_us: args.service_time_us,
         }),
         Runtime::Tokio => {
@@ -906,6 +917,7 @@ fn run_ringline(cfg: EchoCfg) {
         park_imbalance_ms,
         tls,
         tick_timeout_us,
+        send_slab_slots,
         service_time_us,
     } = cfg;
     use ringline::ParseResult;
@@ -1056,7 +1068,8 @@ fn run_ringline(cfg: EchoCfg) {
         .send_pool(512, msg_size.next_power_of_two().max(4096) as u32)
         .conn_chunk_size(conn_chunk_size)
         .accept_mode(accept_mode.into())
-        .tick_timeout_us(tick_timeout_us);
+        .tick_timeout_us(tick_timeout_us)
+        .send_slab_slots(send_slab_slots);
     let staged = recv_geometry(
         staged,
         recv_incremental,
