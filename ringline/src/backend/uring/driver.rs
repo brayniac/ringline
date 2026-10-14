@@ -819,17 +819,17 @@ pub(crate) struct Driver {
     /// set, so the next pass runs even if none of the re-armed recvs
     /// completes.
     pub(crate) rearm_deferred: bool,
-    /// Re-arms `flush_replenish_and_rearm` has issued since the run loop
-    /// last waited. Each pass subtracts it from its budget, so the three
-    /// passes of one loop iteration (after each of its two drains, and
-    /// before the wait) share one budget. The run loop resets it after the
-    /// wait.
+    /// Re-arms `flush_replenish_and_rearm` has issued since the run loop's
+    /// last `submit_and_wait` or `submit_and_get_events`, which reset it.
+    /// Each pass subtracts it from its budget, so the passes between two of
+    /// those calls (after each of the two drains, then before the next wait)
+    /// share one budget of one re-arm per free buffer.
     ///
     /// A re-arm whose recv completed in the drain after the mid-iteration
-    /// `flush()` is counted both here and in the lower `free()`, so the later
-    /// passes of an iteration re-arm fewer connections than there are free
-    /// buffers. Resetting at each reap instead, which counts each re-arm
-    /// once, measured worse tail latency (#657).
+    /// `flush()`, and whose buffer is still held (a `forward_recv_buf` or
+    /// zero-copy hold), is counted both here and in the lower `free()`.
+    /// Resetting at each reap instead, which counts each re-arm once,
+    /// measured worse tail latency (#657).
     pub(crate) rearms_since_wait: u32,
     /// Lifetime count of ENOBUFS parks on this worker (pushes onto
     /// `recv_starved`). Reported in the shutdown diag line; sustained

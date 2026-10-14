@@ -11604,6 +11604,22 @@ mod tests {
         assert_eq!(fallbacks, 1);
     }
 
+    /// With a lend cap, buffers already promised to re-arms issued since the
+    /// wait do not count toward the ring beating a fallback chunk.
+    #[test]
+    fn with_a_lend_cap_rearms_since_the_wait_do_not_count_as_free_bytes() {
+        let mut el = make_test_loop();
+        let conn_index = park_connection(&mut el);
+        assert!(el.driver.accumulators.append(conn_index, b"part"));
+        el.driver.lend_cap = Some(8);
+        el.driver.fallback_chunk = el.driver.provided_bufs.buffer_size();
+        // Two free buffers would beat one chunk; one is already promised.
+        leave_free_buffers(&mut el, 2);
+        el.driver.rearms_since_wait = 1;
+        el.flush_replenish_and_rearm();
+        assert!(el.driver.recv_fallback_inflight[conn_index as usize]);
+    }
+
     /// `recv_incremental` sets the lend cap to half the TCP ring; without it
     /// lends are uncapped.
     #[test]
