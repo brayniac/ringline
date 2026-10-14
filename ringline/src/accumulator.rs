@@ -26,6 +26,9 @@ pub struct RecvAccumulator {
     /// multi-chunk message allocates once at full size instead of running
     /// the doubling-regrowth cascade. Cleared when the contents drain.
     reserve_target: usize,
+    /// Capacity `buf` is allocated with, and returns to on
+    /// [`release`](Self::release).
+    initial_capacity: usize,
 }
 
 impl RecvAccumulator {
@@ -47,6 +50,7 @@ impl RecvAccumulator {
             frozen: None,
             max_size,
             reserve_target: 0,
+            initial_capacity: capacity,
         }
     }
 
@@ -201,10 +205,21 @@ impl RecvAccumulator {
         self.reserve_target = self.reserve_target.max(target);
     }
 
-    /// Reset the accumulator (discard all data).
+    /// Reset the accumulator (discard all data). Keeps the allocation.
     pub fn reset(&mut self) {
         self.frozen = None;
         self.buf.clear();
+        self.reserve_target = 0;
+    }
+
+    /// Discard all data and the allocation, and allocate the initial
+    /// capacity again. A connection's accumulator grows to the largest
+    /// message it buffered; without this, the slot keeps that allocation
+    /// after the connection closes. Slices a parser kept (`with_bytes`)
+    /// keep their own reference to the old allocation.
+    pub fn release(&mut self) {
+        self.frozen = None;
+        self.buf = BytesMut::with_capacity(self.initial_capacity);
         self.reserve_target = 0;
     }
 
@@ -279,6 +294,12 @@ impl AccumulatorTable {
     /// Reset the accumulator at the given index.
     pub fn reset(&mut self, index: u32) {
         self.accumulators[index as usize].reset();
+    }
+
+    /// Discard the accumulator's data and allocation at the given index.
+    /// See [`RecvAccumulator::release`].
+    pub fn release(&mut self, index: u32) {
+        self.accumulators[index as usize].release();
     }
 
     /// Return the current backing-buffer capacity for the accumulator at
@@ -448,6 +469,27 @@ mod tests {
             "reserve target must clamp at max_size, cap {}",
             acc.capacity()
         );
+    }
+
+    #[test]
+    fn release_returns_to_the_initial_capacity() {
+        let mut acc = RecvAccumulator::new(4096);
+        acc.append(&vec![0u8; 1024 * 1024]);
+        acc.reset();
+        assert!(acc.capacity() >= 1024 * 1024, "reset keeps the allocation");
+        acc.release();
+        assert!(acc.is_empty());
+        assert_eq!(acc.capacity(), 4096);
+    }
+
+    #[test]
+    fn release_leaves_a_kept_slice_intact() {
+        let mut table = AccumulatorTable::new(1, 64);
+        table.append(0, b"value");
+        let kept = table.take_frozen(0);
+        table.release(0);
+        assert_eq!(&kept[..], b"value");
+        assert!(table.is_empty(0));
     }
 
     #[test]

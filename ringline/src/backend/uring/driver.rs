@@ -3861,6 +3861,7 @@ impl Driver {
                             tls_table.remove(conn_index);
                         }
                         self.clear_conn_claims(conn_index);
+                        self.accumulators.release(conn_index);
                         self.connections.release(conn_index);
                     }
                     _ => {}

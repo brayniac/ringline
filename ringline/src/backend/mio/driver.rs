@@ -622,7 +622,7 @@ impl Driver {
         if self.connect_deadlines[idx].take().is_some() {
             self.connect_pending -= 1;
         }
-        self.accumulators.reset(conn_index);
+        self.accumulators.release(conn_index);
 
         self.send_queues[idx].queue.clear();
         self.send_queues[idx].in_flight = false;
@@ -1804,6 +1804,28 @@ pub(crate) mod tests {
                 "wrong kind for {id:?}"
             );
         }
+    }
+
+    /// `finish_close` gives the accumulator's allocation back, so a slot
+    /// does not keep the largest message its last connection buffered.
+    #[test]
+    fn finish_close_releases_the_accumulator_allocation() {
+        let config = test_config();
+        let (mut driver, _wake) = test_driver(&config);
+        let (conn_index, _client) = attach_conn(&mut driver);
+        driver
+            .accumulators
+            .append(conn_index, &vec![0u8; 1024 * 1024]);
+        assert!(driver.accumulators.capacity(conn_index) >= 1024 * 1024);
+
+        driver.close_connection(conn_index);
+        driver.finish_close(conn_index);
+
+        // mio allocates accumulators at the receive buffer size.
+        assert_eq!(
+            driver.accumulators.capacity(conn_index),
+            config.recv_buffer.buffer_size as usize
+        );
     }
 
     /// `finish_close` disposes of whatever is still queued when the socket
