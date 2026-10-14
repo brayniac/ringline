@@ -161,6 +161,9 @@ def server_fields(d, aid):
         for k in ("forward_failures", "forward_retries"):
             m = re.search(rf"bench-server: {k} = (\d+)", text)
             row[k] = int(m.group(1)) if m else None
+        # Phase e: the server's user + system CPU time, from /proc/<pid>/stat.
+        m = re.search(r"CPU_TICKS (\d+) (\d+) HZ (\d+)", text)
+        row["cpu_s"] = (int(m.group(1)) + int(m.group(2))) / int(m.group(3)) if m else None
     mj = sdir / f"{aid}.metrics.json"
     if mj.exists():
         for e in json.loads(mj.read_text()):

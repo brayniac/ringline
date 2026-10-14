@@ -1,0 +1,58 @@
+# Release build of the ringline-bench binaries for phase e of the #622 step 6
+# matrix (generate.py): the io_uring build, plus bench-server-mio, a force-mio
+# build of the same source. They link glibc; the log prints the newest glibc symbol
+# version each needs (Debian 12 has 2.36, Ubuntu 24.04 2.39).
+name = "ringline #622 step 6 phase e bench build"
+
+[params]
+repo   = "https://github.com/brayniac/ringline"
+branch = "exp/recv-epoll-compare"
+
+[[jobs]]
+name = "build"
+tags = ["validation"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+shape = "z4.c"
+image = "spool/images/debian-13-ci-20260912.1@golden"
+slots = 1
+memory_gib = 8
+ports = 0
+gpu = false
+payload_timeout = 5400
+artifacts = ["/home/anvil/bins.tgz", "/home/anvil/build.log"]
+upload = true
+payload = '''
+set -uo pipefail
+cd /home/anvil
+{
+  export CARGO_PROFILE_RELEASE_DEBUG=0 CARGO_PROFILE_RELEASE_STRIP=true
+  mkdir -p out
+  git clone -q {repo} src && git -C src checkout -q {branch}
+  echo "src: $(git -C src log --oneline -1)"
+  ( cd src && cargo build -p ringline-bench --release --locked \
+      --bin bench-server --bin bench-client --bin proxy-load --bin proxy-drain )
+  rc=$?
+  ( cd src && cargo build -p ringline-bench --release --locked --features force-mio \
+      --target-dir target-mio --bin bench-server )
+  rc_mio=$?
+  [ $rc -eq 0 ] && rc=$rc_mio
+  echo "build_status=$rc"
+  for b in bench-server bench-client proxy-load proxy-drain; do cp src/target/release/$b out/; done
+  cp src/target-mio/release/bench-server out/bench-server-mio
+  ./out/bench-server --print-backend
+  ./out/bench-server-mio --print-backend
+  sha256sum out/*
+  for f in out/*; do echo "GLIBC_MAX $f $(objdump -T $f | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)"; done
+  tar czf bins.tgz out
+} 2>&1 | tee /home/anvil/build.log
+exit 0
+'''
+
+[[jobs.steps]]
+type = "shell"
+command = '''
+grep -q "build_status=0" build.log || { echo "build failed"; exit 1; }
+echo ok
+'''

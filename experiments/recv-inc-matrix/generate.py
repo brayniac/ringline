@@ -128,6 +128,32 @@ DIAG_R16K256_ARMS = {a: RING_ARMS[a] for a in ("m16-b4k", "m64-b16k", "m64-b4k",
 DIAG_SETS = {"r16k": (DIAG_R16K_CELLS, DIAG_R16K_ARMS), "r16k256": (DIAG_R16K256_CELLS, DIAG_R16K256_ARMS)}
 SS_EVERY = 4
 
+# Phase e: the receive path on io_uring against the mio (epoll) backend.
+# The mio arm runs `bench-server-mio`, a `force-mio` build of the same
+# source; the others are io_uring rings. One boot per message size, as in
+# phase r. The load generator sets tcp_tw_reuse=1 so back-to-back cells of
+# 16,384 connections do not run out of local ports to TIME_WAIT, and each
+# arm records the server's CPU time.
+E_ARMS = {
+    "mio": "",
+    "p256x16k": "--recv-buffer-bytes 16384 --recv-ring-size 256",
+    "p4096x64k": "--recv-buffer-bytes 65536 --recv-ring-size 4096",
+    "p16384x4k": "--recv-buffer-bytes 4096 --recv-ring-size 16384",
+    "inc": "--recv-incremental",
+}
+E_MSGS = [256, 4 * KIB, 64 * KIB, 1 * MIB]
+E_CONNS = [64, 1024, 4096, 16384]
+SERVER_BIN_LINE = "/home/anvil/out/bench-server \\"
+CPU_LINE = (
+    "echo \"CPU_TICKS $(awk '{print $14, $15}' /proc/$pid/stat) HZ $(getconf CLK_TCK)\" "
+    ">> /home/anvil/results/{aid}.server.log\n"
+)
+
+
+def e_cells(msg):
+    return [{"kind": "echo", "msg": msg, "conns": n, "depth": 1}
+            for n in E_CONNS if not (msg >= MIB and n > 4096)]
+
 
 def diag_server(text, aid):
     """Phase d: dump open connections at server exit and snapshot `ss`
@@ -637,13 +663,16 @@ def render(kernel, rep, phase, bins, workers, warmup, duration, rates, only=None
         return render_search(kernel, rep, bins, workers, warmup, duration, rates, only, reuse, label,
                              cooldown)
     r16k = phase == "d" and diag_set in DIAG_SETS
-    arms = RING_ARMS if phase == "r" else DIAG_SETS[diag_set][1] if r16k else ARMS
+    arms = (RING_ARMS if phase == "r" else E_ARMS if phase == "e"
+            else DIAG_SETS[diag_set][1] if r16k else ARMS)
     names = list(arms)
     k = (rep - 1) % len(names)
     order = names[k:] + names[:k]
     server, client = [], []
     n = 0
-    for c in (ring_cells(msg) if phase == "r" else DIAG_SETS[diag_set][0] if r16k else cells()):
+    all_cells = (ring_cells(msg) if phase == "r" else e_cells(msg) if phase == "e"
+                 else DIAG_SETS[diag_set][0] if r16k else cells())
+    for c in all_cells:
         cid = cell_id(c)
         if phase == "l" and (c["kind"] == "proxy" or cid not in rates):
             continue
@@ -669,6 +698,15 @@ def render(kernel, rep, phase, bins, workers, warmup, duration, rates, only=None
             if phase == "d":
                 arm_text = diag_server(arm_text, aid)
                 cc = diag_client(cc, aid, warmup + duration + slack)
+            if phase == "e":
+                if arm == "mio":
+                    assert SERVER_BIN_LINE in arm_text
+                    arm_text = arm_text.replace(
+                        SERVER_BIN_LINE, SERVER_BIN_LINE.replace("bench-server", "bench-server-mio"))
+                stop = 'echo "stop seen=$seen'
+                assert arm_text.count(stop) == 1
+                arm_text = arm_text.replace(stop, CPU_LINE.replace("{aid}", aid) + stop)
+                cc = "sudo sysctl -qw net.ipv4.tcp_tw_reuse=1; " + cc
             server.append(arm_text)
             client.append(CLIENT_ARM.format(aid=aid, client_cmd=cc))
             n += 1
@@ -676,6 +714,10 @@ def render(kernel, rep, phase, bins, workers, warmup, duration, rates, only=None
         phase=phase + label, kernel=kernel, rep=rep, n=n, bins=bins,
         image=KERNELS[kernel], workers=workers,
     )
+    if phase == "e":
+        probe = "./out/bench-server --print-backend\n"
+        assert head.count(probe) == 1
+        head = head.replace(probe, probe + "./out/bench-server-mio --print-backend\n")
     return head + "".join(server) + SERVER_TAIL + "".join(client) + CLIENT_TAIL, n
 
 
@@ -733,7 +775,7 @@ def render_ladder(kernel, rep, bins, workers, warmup, duration, ladder, first=No
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bins-artifact", required=True)
-    ap.add_argument("--phase", default="t", choices=["t", "l", "s", "q", "r", "d"])
+    ap.add_argument("--phase", default="t", choices=["t", "l", "s", "q", "r", "d", "e"])
     ap.add_argument("--rates", default=None, help="phase l: JSON of cell id -> rate; phase s and q: kernel -> cell id -> base median")
     ap.add_argument("--kernels", default=",".join(KERNELS))
     ap.add_argument("--reps", type=int, default=5)
@@ -757,7 +799,7 @@ def main():
 
     out_dir = pathlib.Path(args.out or pathlib.Path(__file__).parent / f"phase-{args.phase}")
     total = 0
-    msgs = RING_MSGS if args.phase == "r" else [None]
+    msgs = RING_MSGS if args.phase == "r" else E_MSGS if args.phase == "e" else [None]
     for kernel in args.kernels.split(","):
         for rep in range(1, args.reps + 1):
             for msg in msgs:
