@@ -476,7 +476,7 @@ mod ringline_client {
                             }
                             None => {
                                 if let Err(e) = spawn(async move {
-                                    run_ringline_client(s).await;
+                                    run_ringline_client(s, worker_id).await;
                                 }) {
                                     eprintln!("  ringline client spawn failed: {e}");
                                 }
@@ -517,7 +517,7 @@ mod ringline_client {
     /// refused and counted in [`super::send_pool_full`].
     const SEND_POOL_SLOTS: u16 = 8192;
 
-    async fn run_ringline_client(state: Arc<ClientState>) {
+    async fn run_ringline_client(state: Arc<ClientState>, worker_id: usize) {
         let msg_size = state.msg_size;
 
         let conn = match connect(state.next_target()).await {
@@ -527,10 +527,17 @@ mod ringline_client {
                 return;
             }
         };
+        let conn_index = conn.token().index();
         // Reading an outbound connection goes through its read half.
         let (mut conn_tx, mut conn_rx) = conn.split();
 
         let mut rec = ConnRecord::new(state.clone());
+        rec.trace = Some(ConnTrace {
+            worker: worker_id,
+            index: conn_index,
+            connected_ms: since_start_ms(),
+            ..ConnTrace::default()
+        });
 
         // Pipeline depth: `depth` requests go out in one send, then their
         // responses are matched in order. At depth 1 this is byte-identical to
@@ -545,7 +552,14 @@ mod ringline_client {
 
             if let Err(e) = conn_tx.send_nowait(&batch) {
                 super::count_refused_send(&e);
+                if let Some(t) = rec.trace.as_mut() {
+                    t.end = "send_refused";
+                }
                 break;
+            }
+            if let Some(t) = rec.trace.as_mut() {
+                t.sent += batch.len() as u64;
+                t.last_send_ms = since_start_ms();
             }
 
             // Responses come back in order, so response `i` is complete once
@@ -563,9 +577,16 @@ mod ringline_client {
                     })
                     .await;
                 if consumed == 0 {
+                    if let Some(t) = rec.trace.as_mut() {
+                        t.end = "eof";
+                    }
                     return; // EOF; `rec` reports on drop
                 }
                 got += consumed;
+                if let Some(t) = rec.trace.as_mut() {
+                    t.received += consumed as u64;
+                    t.last_recv_ms = since_start_ms();
+                }
                 // Only responses completed after warmup are recorded, so
                 // `total_ops` and the latency samples cover the same window.
                 let measuring = state.measure.load(Ordering::Relaxed);
@@ -577,6 +598,9 @@ mod ringline_client {
                 }
             }
             debug_assert_eq!(recorded, depth);
+        }
+        if let Some(t) = rec.trace.as_mut() {
+            t.end = "stopped";
         }
         // `rec` reports on drop.
     }
@@ -779,7 +803,37 @@ mod ringline_client {
         drained_for: Option<u64>,
         /// This connection's slot in the live controller's counters.
         slot: Option<usize>,
+        /// Closed-loop progress, reported for a connection with no response
+        /// in the measured window.
+        trace: Option<ConnTrace>,
     }
+
+    /// Where a closed-loop connection got to. Times are ms since the
+    /// client runtime started.
+    #[derive(Default)]
+    struct ConnTrace {
+        worker: usize,
+        index: usize,
+        connected_ms: u64,
+        sent: u64,
+        received: u64,
+        last_send_ms: u64,
+        last_recv_ms: u64,
+        /// How the task ended: `stopped` (left its loop on the stop flag),
+        /// `eof`, `send_refused`, or empty when the task was dropped at
+        /// shutdown while it waited for a response.
+        end: &'static str,
+    }
+
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+    pub fn since_start_ms() -> u64 {
+        START.get_or_init(Instant::now).elapsed().as_millis() as u64
+    }
+
+    /// JSON lines for the connections that had no response in the measured
+    /// window; printed by `run_bench_ringline`.
+    pub static ZERO_TRACES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
     impl ConnRecord {
         fn new(state: Arc<ClientState>) -> Self {
@@ -791,6 +845,7 @@ mod ringline_client {
                 local_ops: 0,
                 drained_for: None,
                 slot: None,
+                trace: None,
             }
         }
 
@@ -807,6 +862,24 @@ mod ringline_client {
 
     impl Drop for ConnRecord {
         fn drop(&mut self) {
+            if self.samples.is_empty()
+                && let Some(t) = &self.trace
+            {
+                ZERO_TRACES.lock().unwrap().push(format!(
+                    "{{\"type\":\"zero_conn\",\"worker\":{},\"index\":{},\"connected_ms\":{},\
+                     \"sent\":{},\"received\":{},\"last_send_ms\":{},\"last_recv_ms\":{},\
+                     \"dropped_ms\":{},\"end\":\"{}\"}}",
+                    t.worker,
+                    t.index,
+                    t.connected_ms,
+                    t.sent,
+                    t.received,
+                    t.last_send_ms,
+                    t.last_recv_ms,
+                    since_start_ms(),
+                    t.end
+                ));
+            }
             let state = &self.state;
             if let Some(l) = state.live.as_deref() {
                 // A connection that closes mid-drain leaves the drained count
@@ -854,6 +927,7 @@ mod ringline_client {
             let clients = state.num_clients;
 
             *GLOBAL_STATE.lock().unwrap() = Some(state);
+            since_start_ms();
 
             // Room for every requested connection, and at least 4096.
             let max_conns = (clients as u32).next_power_of_two().max(4096);
@@ -1190,6 +1264,7 @@ fn run_bench_ringline(
     std::thread::sleep(warmup);
     ops.store(0, Ordering::Relaxed);
     measure.store(true, Ordering::Relaxed);
+    let measure_start_ms = ringline_client::since_start_ms();
 
     let cpu_before = process_cpu_time_ns();
     let start = Instant::now();
@@ -1197,6 +1272,7 @@ fn run_bench_ringline(
     // Responses that complete while the tasks wind down are outside the
     // window `elapsed` measures, so recording stops with it.
     measure.store(false, Ordering::Relaxed);
+    let measure_end_ms = ringline_client::since_start_ms();
     let elapsed = start.elapsed();
     let cpu_after = process_cpu_time_ns();
     stop.store(true, Ordering::Relaxed);
@@ -1204,6 +1280,14 @@ fn run_bench_ringline(
     // Give tasks a moment to finish and push their histograms.
     std::thread::sleep(Duration::from_millis(200));
     client_rt.stop();
+
+    eprintln!(
+        "{{\"type\":\"window\",\"measure_start_ms\":{},\"measure_end_ms\":{}}}",
+        measure_start_ms, measure_end_ms
+    );
+    for line in ringline_client::ZERO_TRACES.lock().unwrap().drain(..) {
+        eprintln!("{line}");
+    }
 
     let mut merged = LatencyHistogram::new();
     let per_conn;

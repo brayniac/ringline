@@ -304,6 +304,12 @@ impl ConnectionTable {
         }
     }
 
+    /// Number of slots, active or not.
+    #[cfg_attr(not(has_io_uring), allow(dead_code))]
+    pub fn capacity(&self) -> u32 {
+        self.slots.len() as u32
+    }
+
     /// Get a reference to a connection's state.
     pub fn get(&self, idx: u32) -> Option<&ConnectionState> {
         self.slots.get(idx as usize).filter(|s| s.active)

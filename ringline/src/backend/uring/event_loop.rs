@@ -449,6 +449,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                         diag_work_ns_max as f64 / 1_000_000.0,
                     );
                 }
+                self.dump_open_connections();
                 self.driver.run_shutdown();
                 return Ok(());
             }
@@ -1000,6 +1001,86 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// after `flush()`, and the eventfd read is not re-armed once
     /// `shutdown_flag` is set. With no tick timeout, a blocking wait would
     /// never return in either case.
+    /// Diagnostic for the bench: when `RINGLINE_DUMP_OPEN` names a path
+    /// prefix, write every connection still active at shutdown to
+    /// `<prefix>-w<worker>-<pid>.jsonl`, one JSON object per line, and print
+    /// a one-line summary to stderr. Fields are the connection's state words
+    /// and the receive-side bookkeeping that decides whether it will be
+    /// re-armed.
+    fn dump_open_connections(&mut self) {
+        let Ok(prefix) = std::env::var("RINGLINE_DUMP_OPEN") else {
+            return;
+        };
+        use std::fmt::Write as _;
+        let d = &mut self.driver;
+        let worker = d.worker_index;
+        let mut out = String::new();
+        let mut summary: std::collections::BTreeMap<String, u32> = Default::default();
+        for idx in 0..d.connections.capacity() {
+            let Some(cs) = d.connections.get(idx) else {
+                continue;
+            };
+            let (lifecycle, recv_arm, read, write, outbound, generation, armed) = (
+                cs.lifecycle,
+                cs.recv_arm,
+                cs.read,
+                cs.write,
+                cs.outbound,
+                cs.generation,
+                cs.recv_multishot_armed,
+            );
+            let peer = match &cs.peer_addr {
+                Some(crate::connection::PeerAddr::Tcp(a)) => a.to_string(),
+                Some(crate::connection::PeerAddr::Unix(p)) => p.display().to_string(),
+                None => String::new(),
+            };
+            let i = idx as usize;
+            let parked = d.recv_starved.contains(idx);
+            let fallback = d.recv_fallback_inflight.get(i).copied().unwrap_or(false);
+            let forward_active = d.forward_recv_active.get(i).copied().unwrap_or(false);
+            let throttled = d.throttled_recvs.contains(&idx)
+                || d.forward_hold_throttled.get(i).copied().unwrap_or(false);
+            let rearm_retry = d.recv_rearm_retries.iter().any(|&(c, _)| c == idx);
+            let pending_buf = d.pending_recv_bufs.get(i).is_some_and(|b| b.is_some());
+            let hold = d.recv_hold.get(i).map_or(0, |h| h.len());
+            let accum = d.accumulators.data(idx).len();
+            let waiter = self.executor.recv_waiters.get(i).copied().unwrap_or(false);
+            let (sq_in_flight, sq_len, sq_parked, close_pending) = d
+                .send_queues
+                .get(i)
+                .map_or((false, 0, false, false), |q| {
+                    (q.in_flight, q.queue.len(), q.parked, q.close_pending)
+                });
+            let _ = writeln!(
+                out,
+                "{{\"worker\":{worker},\"idx\":{idx},\"gen\":{generation},\"outbound\":{outbound},\
+                 \"peer\":\"{peer}\",\"lifecycle\":\"{lifecycle:?}\",\"recv_arm\":\"{recv_arm:?}\",\"armed\":{armed},\
+                 \"read\":\"{read:?}\",\"write\":\"{write:?}\",\"parked\":{parked},\
+                 \"fallback_inflight\":{fallback},\"forward_active\":{forward_active},\
+                 \"throttled\":{throttled},\"rearm_retry\":{rearm_retry},\
+                 \"pending_recv_buf\":{pending_buf},\"recv_hold\":{hold},\"accum\":{accum},\
+                 \"recv_waiter\":{waiter},\"send_in_flight\":{sq_in_flight},\"send_queue\":{sq_len},\
+                 \"send_parked\":{sq_parked},\"close_pending\":{close_pending}}}"
+            );
+            *summary
+                .entry(format!(
+                    "{lifecycle:?}/{read:?}/armed={armed}/parked={parked}/fallback={fallback}/throttled={throttled}/waiter={waiter}"
+                ))
+                .or_default() += 1;
+        }
+        let path = format!("{prefix}-w{worker}-{}.jsonl", std::process::id());
+        if let Err(e) = std::fs::write(&path, &out) {
+            eprintln!("[ringline open] could not write {path}: {e}");
+        }
+        eprintln!(
+            "[ringline open] worker={worker} free_bufs={} parked={} rearm_deferred={} {:?}",
+            d.provided_bufs.free(),
+            d.recv_starved.len(),
+            d.rearm_deferred,
+            summary
+        );
+    }
+
     fn may_block(&self) -> bool {
         let shutting_down =
             self.driver.shutdown_local || self.driver.shutdown_flag.load(Ordering::Relaxed);
