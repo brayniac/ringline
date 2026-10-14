@@ -2,8 +2,9 @@
 
 - **Status:** open
 - **Span:** 2026-10-12 to 2026-10-14 · #657 (open), #658 (issue) · rig
-  experiments on branch `exp/inc-step6-matrix` of the brayniac fork,
-  `experiments/recv-inc-matrix/` (not on `main`)
+  experiment specs on branch `exp/inc-step6-matrix` of the brayniac fork,
+  `experiments/recv-inc-matrix/`; the builds they ran are on that fork's
+  `exp/inc-step6-rearm` (neither is on `main`)
 
 ## Goal
 
@@ -74,7 +75,7 @@ configuration per boot), 80 runs in all:
 
 | Cell, 256 × 16 KiB ring | Before | After |
 |---|---|---|
-| 256 B × 10,000, req/s | 6.1–6.12: 39k–47k; 7.1: 42k–164k, median 136k | 6.1–6.12: 88k–124k; 7.1: 162k–165k |
+| 256 B × 10,000, req/s | 6.1–6.12: 39k–46k; 7.1: 42k–164k, median 136k | 6.1–6.12: 88k–124k; 7.1: 162k–165k |
 | 64 KiB × 10,000, req/s | 6.5k–8.7k | 12.3k–15.3k |
 | Runs with unanswered connections | 75 of 80, most in the thousands | 3 of 80 (75, 1, 340) |
 
@@ -134,10 +135,10 @@ From phase r, 2 workers, at a fixed memory budget per worker:
   ring at most about 21,000 times per run. At 256 B it matched the
   incremental ring on 6.12 (127.6k against 127.8k req/s) and ran 25% slower
   on 7.1 (118k against 158k).
-- At 64 KiB and above, buffer size decides. m64-b64k came within about 10%
-  of the incremental ring at 64 KiB × 16,384, with about a fifth of its
-  memory, but left 233 and 1,916 connections unanswered in its two runs on
-  6.12; m4-b64k ran 30% slower. 4 KiB buffers cost 16 completions per
+- At 64 KiB, buffer size decides. m64-b64k came within about 10% of the
+  incremental ring at 64 KiB × 16,384, with about a fifth of its peak RSS
+  (295 against 1,509 MiB; both rings are 64 MiB per worker), but left 233 and 1,916 connections unanswered in its two runs on
+  6.12; m4-b64k ran 30% slower than the incremental ring. 4 KiB buffers cost 16 completions per
   message: m64-b4k ran 7.3k req/s at 64 KiB × 16,384 against 23.3k.
 - No fixed geometry was best at every message size.
 - At 1 MiB × 16,384 every configuration left 36–99% of connections
@@ -168,19 +169,21 @@ copy stays allocated until the zero-copy notification. Each active
 connection then holds one to two messages on the heap. Nothing bounds the
 total except `recv_accumulator_max` per connection (1 GiB by default).
 
-A plain ring copies too: on the `with_data` path a completion is held in
-place only when the accumulator is empty and no other buffer is held, and is
-appended to the accumulator otherwise. There the copy is at most one buffer,
-and it happens only when a second completion arrives before the task has
-taken the first. In the local runs below, the 1024 × 64 KiB ring forwarded
-84% of completions at 1 MiB × 512 straight from ring buffers and sent no
-accumulator zero-copy; the incremental ring forwarded 22% from ring buffers
-and sent 25% as zero-copy accumulators.
+A plain ring copies too: a completion is appended to the accumulator
+whenever the accumulator already holds bytes or the task has not yet taken
+the previous buffer, and a task that returns `NeedMore` or consumes part of
+a buffer has the rest copied. A forward echo forwards each buffer without
+parsing, so it rarely copies. In the local runs below at 1 MiB × 512, the
+1024 × 64 KiB ring forwarded 99.9% of data completions (completions other
+than `ENOBUFS`) from ring buffers. The incremental ring forwarded 51–62%
+from ring buffers and sent the rest as zero-copy accumulator sends, one per
+refused lend.
 
 Measured locally (one worker, Linux 7.2, arm64, loopback). The build was
-#657's branch at 68fed94 with an experimental accumulator patch; in two of
-the incremental runs per cell its shrink-on-drain switch was on, which did
-not change the result:
+68fed94 on the brayniac fork's `exp/inc-step6-rearm` branch (#657's commits
+on an experiment branch based on 5a88595), with an experimental accumulator
+patch; in two of the incremental runs per cell its shrink-on-drain switch
+was on, which did not change the result:
 
 | Cell | Lends refused | Peak RSS |
 |---|---|---|
@@ -196,7 +199,7 @@ grew are the cells that refused lends; the 4 KiB × 16,384 cell refused
 The memory also stays after the connections close. After every connection
 of a 1 MiB × 512 run closed, RSS was 868 MiB. `RecvAccumulator::reset`
 clears an accumulator but keeps its allocation, and it runs only when a
-slot is reused (`install_accepted_with_pending`), so every slot keeps the
+new connection takes the slot (accept or connect), so every slot keeps the
 largest buffer it grew. An experimental patch that drops the allocation in
 `reset` and calls it at close brought RSS after close to 336 MiB. The rest
 is glibc's arenas: with `MALLOC_MMAP_THRESHOLD_=131072` as well, it was

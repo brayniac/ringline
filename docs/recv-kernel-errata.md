@@ -10,8 +10,10 @@ Sources: the stable tree (branches `linux-6.1.y` at 6.1.189, `linux-6.6.y`,
 mainline at 7.3-rc6), the kernel CVE records (`vulns.git`), and Ubuntu's
 `noble` kernel git. A stable version is the first stable tag that has the
 backport; a dash means none was found. Claims marked "unverified" rest on a
-secondary source; the rest were read from the commit or the source at the
-named tag. Commits are at `https://git.kernel.org/torvalds/c/<id>`.
+secondary source. The rest were read from the commit, its diff or the
+source at the named tag, except that for some fixes only the mapping from
+the mainline commit to its stable backport was checked, and the Debian
+package versions come from Debian's security tracker. Commits are at `https://git.kernel.org/torvalds/c/<id>`.
 
 Version numbers do not identify the fix level of a distribution kernel,
 which can carry backports or lack them. That is why ringline checks the
@@ -60,7 +62,7 @@ Fixes that affect a receive path:
 | 8802766324e1 | reallocate buf lists on upgrade | 6.14 | 6.6.79, 6.12.16 | CVE-2025-21836: a ring registered at a bgid used before for legacy buffers reused a live structure |
 | c2c185be5c85 | check if target buffer list is still legacy on recycle | 7.0 | 6.1.167, 6.6.130, 6.12.78, 6.18.19 | CVE-2026-43366: legacy-buffer recycle into a list upgraded to a ring |
 | 46800585ae04 | validate ring provided buffer addresses with access_ok() | 7.2 | none | an entry with an address outside user space makes single-buffer selection return `-ENOBUFS` without consuming it |
-| cd053d788c3f, f1596ba3e6b3 | bundle grow fixes | 7.2-rc3, rc4 | none | double frees introduced by 46800585ae04; 7.2-rc1 to rc3 have at least one of them |
+| cd053d788c3f, f1596ba3e6b3 | fix dangling iovec after bundle grow failure; free the replaced iovec after a successful grow | 7.2-rc3, rc4 | none | double frees introduced by 46800585ae04; 7.2-rc1 and rc2 have them, and rc3 has the second (inferred from the rc each fix landed in) |
 
 From 7.2, a runtime that answers `-ENOBUFS` by re-arming after the next
 replenish would re-arm onto the same bad entry. That needs a bad address,
@@ -99,7 +101,7 @@ Fixes:
 |---|---|---|---|---|
 | b00c51ef8f7 | cache provided buffer group value for multishot receives | 6.2 | 6.1.9 | multishot lost its bgid after the first buffer on some paths |
 | 8ede3db5061b and two more | multishot recvmsg overflow check, retry setup | 6.9 | 6.1.83/84, 6.6.23/24 | CVE-2024-35827 |
-| d63b0e8a628e | fix multishot with selected buffers | 6.14 | 6.1.129, 6.6.78, 6.12.14 | buffer ring state not flushed between iterations |
+| d63b0e8a628e | fix multishots with selected buffers | 6.14 | 6.1.129, 6.6.78, 6.12.14 | buffer ring state not flushed between iterations |
 | 687b2bae0eff | ensure deferred completions are flushed for multishot | 6.15 | 6.12.29; applied to 6.1.139 and 6.6.91, then reverted | without it a multishot completion can be posted before an earlier deferred completion |
 | a7d755ed9ce9 | fix overflow resched cqe reordering | 6.15 | 6.1.141, 6.6.93, 6.12.31 | completions reordered while flushing the overflow list |
 | 2c7f02321996 | only consider msg_inq if larger than 1 | 6.16 | 6.12.36 | retries need `msg_inq > 1`; `SOCK_NONEMPTY` can be set when only a FIN is pending (from the commit message) |
@@ -139,10 +141,11 @@ after 6.12.81 differ in structure as well as in fixes.
 These are the fixes the design doc refers to ("non-pollable files, bundles,
 zero-length transfers and multishot `RECVMSG` with little space left"):
 non-pollable files are ed123c948d06 and 418eab7a6f3c, bundles are
-cf9536e550dd, b948f9d5d305 and ed46f39c47eb, zero-length transfers are
-3ecd3e03144b, and `RECVMSG` with little space left is 7deba791ad49. Debian
-13's 6.12.107 and 6.12.111 have every fix through 6.12.94 and lack
-6028b543884f; so does 7.2.6.
+cf9536e550dd, b948f9d5d305, ed46f39c47eb and 70f4886bcbb9, zero-length
+transfers are 3ecd3e03144b, and `RECVMSG` with little space left is
+7deba791ad49. Debian 13's 6.12.107 and 6.12.111 have every fix through
+6.12.94 and lack 6028b543884f. 7.2.6 also lacks 6028b543884f, which is in
+7.2.7.
 
 For ringline:
 
@@ -249,8 +252,9 @@ exactly when the reserved words are zero, the form every other kernel
 requires. `IORING_UNREGISTER_PBUF_RING` and `IORING_REGISTER_PBUF_STATUS`
 have the same inversion. It is in tags Ubuntu-6.8.0-136 through
 Ubuntu-6.8.0-148 and `master-next`, and not in 6.8.0-130. It came with
-Launchpad bug 2156956 (the stable patchset of 2026-06-16). No fix was found
-queued, and no Launchpad bug for the regression. Reports from netty (#17636,
+Launchpad bug 2156956 (the stable patchset of 2026-06-16). No Launchpad bug
+for the regression was found, and whether a fix is queued was not
+established. Reports from netty (#17636,
 on `6.8.0-1064-azure`) suggest the cloud derivatives have it too
 (unverified).
 
@@ -283,8 +287,8 @@ By base version; a distribution kernel can differ.
 - The commits that introduced provided-buffer rings, `SOCK_NONEMPTY` and
   `POLL_FIRST` in 5.19 predate the history examined.
 - Which Ubuntu 6.8 build first reached the updates pocket with the inverted
-  check (6.8.0-136 has it in source; reports say 6.8.0-139), and which
-  derivative kernels have it.
+  check (6.8.0-136 has it in source; reports say 6.8.0-139), whether a fix
+  is queued, and which derivative kernels have it.
 - Which receive fixes RHEL 10 and Amazon Linux 2023 carry beyond their base
   versions.
 - Whether `tcp_inq` reports 1 when only a FIN is pending.
