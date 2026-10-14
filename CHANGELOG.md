@@ -422,16 +422,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   measurement window of a benchmark run. When any buffer was free, each pass
   re-armed every connection parked on `ENOBUFS`; most re-arms got `ENOBUFS`
   again, and the order of the parked list decided which connections were
-  re-armed first. Parked connections are now re-armed oldest first, at most
-  one per free buffer across the passes between two waits for completions,
-  and a connection that parks again goes to the back.
-  Measured on loopback with one worker, 10,000 closed-loop connections, the
-  default one-shot receive, a handler that echoes with `with_data` and
-  `forward_recv_buf`, and a 256 × 16 KiB ring, 4 runs each: at 64 KiB per
-  request, throughput went from 9.2–10.5k to 28.7–30.5k requests/s and the
-  connections without a response from 61–1216 to 0. At 256 B, 3 of 4 runs
-  before the change had 100–355 such connections at 49–52k requests/s; the
-  fourth had none at 362k. All 4 runs after had none, at 346–360k requests/s.
+  re-armed first. Parked connections are now re-armed oldest first, the passes
+  of one event-loop iteration share a budget of one re-arm per free buffer,
+  and a connection that parks again goes to the back. Measured on loopback
+  with one worker, 10,000 closed-loop connections, the default one-shot
+  receive, a handler that echoes with `with_data` and `forward_recv_buf`, and
+  a 256 × 16 KiB ring, 4 runs each: at 64 KiB per request, throughput went
+  from 10.5–10.7k to 31.1–33.7k requests/s, p99 from 4.2–7.1 s to
+  0.31–0.40 s, and the connections without a response from 0–486 to 0. At
+  256 B, one of 4 runs before the change fell to 54k requests/s with 664
+  connections without a response; all 4 runs after stayed at 399–408k.
 - io_uring: the error text of a failed buffer registration names a failed
   page migration as a cause, and the `EFAULT` text names io_uring's 1 GiB
   per-buffer limit. A long-term pin migrates pages in `ZONE_MOVABLE` or in

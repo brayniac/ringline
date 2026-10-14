@@ -1030,7 +1030,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
     /// Commit pending provided-buffer returns to the kernel ring and re-arm
     /// connections parked in `recv_starved`, oldest first. The passes between
-    /// two waits together re-arm at most one connection per free buffer
+    /// two waits share a budget of one re-arm per free buffer
     /// (`rearms_since_wait`).
     ///
     /// Safe because every bid pushed to `pending_replenish` had its contents
@@ -1098,17 +1098,17 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         //
         // Connections are visited oldest first. One that stays parked goes to
         // the back of the queue, so it keeps its place relative to the others.
-        let mut free_bytes = u64::from(self.driver.provided_bufs.free())
-            * u64::from(self.driver.provided_bufs.buffer_size());
         // A re-armed recv on a connection with data waiting takes a buffer
         // as soon as it runs; one with no data waiting takes none. Re-arming
         // more connections than there are free buffers parks again those of
-        // the excess that have data waiting. `free()` does not yet count the
-        // buffers taken by recvs re-armed since the last wait, so those
-        // re-arms come out of this pass's budget.
+        // the excess that have data waiting. Re-arms issued since the last
+        // wait come out of this pass's budget (`rearms_since_wait`).
         let free = self.driver.provided_bufs.free();
-        let mut rearms_left = free.saturating_sub(self.driver.rearms_since_wait) as usize;
+        let unclaimed = free.saturating_sub(self.driver.rearms_since_wait);
+        let mut rearms_left = unclaimed as usize;
         let had_free = free > 0;
+        let mut free_bytes =
+            u64::from(unclaimed) * u64::from(self.driver.provided_bufs.buffer_size());
         for _ in 0..self.driver.recv_starved.len() {
             let Some(conn_index) = self.driver.recv_starved.pop_front() else {
                 break;
@@ -1149,12 +1149,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             {
                 continue;
             }
-            // Re-arm while this pass's budget lasts. The budget counts every
-            // free buffer, including buffers returned before this pass, so a
-            // connection parked while the ring was empty is re-armed once
-            // buffers are back, even when no recv completes in between (for
-            // example, a fallback completion that re-parks it after the
-            // flush).
+            // Re-arm while this pass's budget lasts, whether or not this pass
+            // returned bids. A connection parked while the ring was empty is
+            // then re-armed once buffers are free, even if no recv completes
+            // in between (for example, a fallback completion that re-parks it
+            // after the flush).
             if rearms_left > 0 {
                 rearms_left -= 1;
                 self.driver.rearms_since_wait += 1;
@@ -14673,8 +14672,8 @@ mod tests {
             "the loop must run another pass instead of blocking"
         );
 
-        // Before the loop waits, a second pass re-arms nothing: `free()`
-        // does not yet count the buffers the first two re-arms may take.
+        // Before the loop waits, a second pass re-arms nothing: the two
+        // passes share one budget.
         el.flush_replenish_and_rearm();
         assert_eq!(parked_in_order(&el), conns[2..]);
         assert!(el.driver.rearm_deferred);
