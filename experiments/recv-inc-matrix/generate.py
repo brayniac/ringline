@@ -111,6 +111,49 @@ def cells():
     return out
 
 
+# Phase d: the cells where connections stalled in phase t, with the
+# open-connection dump (RINGLINE_DUMP_OPEN) on both sides and `ss`
+# snapshots of every connection every SS_EVERY seconds.
+DIAG_CELLS = {"echo-65536b-c10000", "echo-256b-c10000"}
+SS_EVERY = 4
+
+
+def diag_server(text, aid):
+    """Phase d: dump open connections at server exit and snapshot `ss`
+    while the client's connections are up."""
+    text = text.replace(
+        "/home/anvil/out/bench-server \\",
+        f"RINGLINE_DUMP_OPEN=/home/anvil/results/{aid}.open /home/anvil/out/bench-server \\",
+    )
+    text = text.replace(
+        "seen=0\n",
+        "seen=0\nlast_ss=0\n",
+    )
+    text = text.replace(
+        "  sleep 0.5\ndone\n",
+        "  if [ $seen -eq 1 ] && [ $((SECONDS - last_ss)) -ge " + str(SS_EVERY) + " ]; then\n"
+        f"    {{ echo \"T $SECONDS\"; ss -Htn \"( sport = :{{port}} )\"; }} >> /home/anvil/results/{aid}.ss\n"
+        "    last_ss=$SECONDS\n"
+        "  fi\n"
+        "  sleep 0.5\ndone\n",
+    )
+    assert text.count("RINGLINE_DUMP_OPEN") == 1 and text.count("last_ss=$SECONDS") == 1, aid
+    return text
+
+
+def diag_client(cmd, aid, secs):
+    """Phase d: the client command with the open-connection dump, after a
+    background loop that snapshots `ss` while bench-client runs (at most
+    `secs` seconds)."""
+    loop = (
+        f"( sleep 1; end=$((SECONDS + {secs})); "
+        f"while [ $SECONDS -lt $end ] && pgrep -x bench-client >/dev/null; do "
+        f"echo \"T $SECONDS\"; ss -Htn '( dport = :{{port}} )'; sleep {SS_EVERY}; "
+        f"done > results/{aid}.ss ) &\n"
+    )
+    return loop + f"RINGLINE_DUMP_OPEN=/home/anvil/results/{aid}.client-open " + cmd
+
+
 def cell_id(c) -> str:
     s = f"{c['kind']}-{c['msg']}b-c{c['conns']}"
     if c["depth"] > 1:
@@ -594,6 +637,8 @@ def render(kernel, rep, phase, bins, workers, warmup, duration, rates, only=None
             continue
         if only and cid not in only:
             continue
+        if phase == "d" and cid not in DIAG_CELLS:
+            continue
         # 10,000 connections take longer to open than 64.
         slack = 60 if c["conns"] >= 50000 else 40 if c["conns"] >= 10000 else 20
         server_secs = warmup + duration + slack
@@ -609,6 +654,9 @@ def render(kernel, rep, phase, bins, workers, warmup, duration, rates, only=None
                 ports = " or ".join(f"sport = :{PORT + i}" for i in range(c["ports"]))
                 arm_text = arm_text.replace('"( sport = :{port} )"', f'"( {ports} )"')
                 assert ports in arm_text
+            if phase == "d":
+                arm_text = diag_server(arm_text, aid)
+                cc = diag_client(cc, aid, warmup + duration + slack)
             server.append(arm_text)
             client.append(CLIENT_ARM.format(aid=aid, client_cmd=cc))
             n += 1
@@ -673,7 +721,7 @@ def render_ladder(kernel, rep, bins, workers, warmup, duration, ladder, first=No
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bins-artifact", required=True)
-    ap.add_argument("--phase", default="t", choices=["t", "l", "s", "q", "r"])
+    ap.add_argument("--phase", default="t", choices=["t", "l", "s", "q", "r", "d"])
     ap.add_argument("--rates", default=None, help="phase l: JSON of cell id -> rate; phase s and q: kernel -> cell id -> base median")
     ap.add_argument("--kernels", default=",".join(KERNELS))
     ap.add_argument("--reps", type=int, default=5)

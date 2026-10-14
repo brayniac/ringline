@@ -59,6 +59,13 @@ def fetch(exp, dest):
             t.extractall(dest / name.split("-")[0], filter="data")
 
 
+def split_aid(aid):
+    """An arm id is `<cell>-<arm>`. The cell ends at its connection count
+    (and depth); phase r arm names contain a dash (`m16-b4k`)."""
+    m = re.match(r"^(.*-c\d+(?:-d\d+)?)-(.+)$", aid)
+    return (m[1], m[2]) if m else tuple(aid.rsplit("-", 1))
+
+
 def rows(ids_path, out_path):
     out = open(out_path, "w")
     for line in open(ids_path):
@@ -72,7 +79,7 @@ def rows(ids_path, out_path):
             for cj in sorted((d / "client" / "results").glob("*.json")):
                 # phase s names each ladder step <aid>.sNN.json
                 aid, _, step = cj.stem.partition(".")
-                cell, arm = aid.rsplit("-", 1)
+                cell, arm = split_aid(aid)
                 row = {"kernel": kernel, "rep": int(rep), "exp": exp, "cell": cell, "arm": arm, "ok": False}
                 if step:
                     row["step"] = step
@@ -93,7 +100,7 @@ def rows(ids_path, out_path):
                 out.write(json.dumps(row) + "\n")
             for sj in sorted((d / "client" / "results").glob("*.search.jsonl")):
                 aid = sj.name.removesuffix(".search.jsonl")
-                cell, arm = aid.rsplit("-", 1)
+                cell, arm = split_aid(aid)
                 key = {"kernel": kernel, "rep": int(rep), "exp": exp, "cell": cell, "arm": arm}
                 result = None
                 for line in sj.read_text().splitlines():
