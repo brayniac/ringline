@@ -115,6 +115,10 @@ def cells():
 # open-connection dump (RINGLINE_DUMP_OPEN) on both sides and `ss`
 # snapshots of every connection every SS_EVERY seconds.
 DIAG_CELLS = {"echo-65536b-c10000", "echo-256b-c10000"}
+# Phase d with --diag-set r16k: the phase r cell where accepted connections
+# went unanswered by the thousands, with the ring arms that showed it.
+DIAG_R16K_CELLS = [{"kind": "echo", "msg": 64 * KIB, "conns": 16384, "depth": 1}]
+DIAG_R16K_ARMS = {a: RING_ARMS[a] for a in ("m16-b4k", "m16-b16k", "m64-b16k", "m64-b64k", "inc")}
 SS_EVERY = 4
 
 
@@ -619,25 +623,26 @@ def render_search(kernel, rep, bins, workers, warmup, duration, ladder, only=Non
 
 
 def render(kernel, rep, phase, bins, workers, warmup, duration, rates, only=None, reuse=True,
-           first=None, label="", cooldown=0, msg=None):
+           first=None, label="", cooldown=0, msg=None, diag_set="c10000"):
     if phase == "s":
         return render_ladder(kernel, rep, bins, workers, warmup, duration, rates, first, label)
     if phase == "q":
         return render_search(kernel, rep, bins, workers, warmup, duration, rates, only, reuse, label,
                              cooldown)
-    arms = RING_ARMS if phase == "r" else ARMS
+    r16k = phase == "d" and diag_set == "r16k"
+    arms = RING_ARMS if phase == "r" else DIAG_R16K_ARMS if r16k else ARMS
     names = list(arms)
     k = (rep - 1) % len(names)
     order = names[k:] + names[:k]
     server, client = [], []
     n = 0
-    for c in (ring_cells(msg) if phase == "r" else cells()):
+    for c in (ring_cells(msg) if phase == "r" else DIAG_R16K_CELLS if r16k else cells()):
         cid = cell_id(c)
         if phase == "l" and (c["kind"] == "proxy" or cid not in rates):
             continue
         if only and cid not in only:
             continue
-        if phase == "d" and cid not in DIAG_CELLS:
+        if phase == "d" and not r16k and cid not in DIAG_CELLS:
             continue
         # 10,000 connections take longer to open than 64.
         slack = 60 if c["conns"] >= 50000 else 40 if c["conns"] >= 10000 else 20
@@ -734,6 +739,7 @@ def main():
     ap.add_argument("--first", default=None, help="phase s: run this cell id first in each boot")
     ap.add_argument("--label", default="", help="appended to the phase in experiment names and file names")
     ap.add_argument("--cooldown", type=int, default=0, help="phase q with reuse: seconds at the start rate after each failed step")
+    ap.add_argument("--diag-set", default="c10000", choices=["c10000", "r16k"], help="phase d: which cells and arms")
     ap.add_argument("--dry", action="store_true")
     args = ap.parse_args()
     rates = json.load(open(args.rates)) if args.rates else {}
@@ -753,6 +759,7 @@ def main():
                     args.warmup, args.duration, rates,
                     set(args.cells.split(",")) if args.cells else None,
                     not args.fresh, args.first, args.label, args.cooldown, msg,
+                    args.diag_set,
                 )
                 if n == 0:
                     continue
