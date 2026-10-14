@@ -119,6 +119,13 @@ DIAG_CELLS = {"echo-65536b-c10000", "echo-256b-c10000"}
 # went unanswered by the thousands, with the ring arms that showed it.
 DIAG_R16K_CELLS = [{"kind": "echo", "msg": 64 * KIB, "conns": 16384, "depth": 1}]
 DIAG_R16K_ARMS = {a: RING_ARMS[a] for a in ("m16-b4k", "m16-b16k", "m64-b16k", "m64-b64k", "inc")}
+# --diag-set r16k256: the 256 B x 16384 cell. The two 4,096-entry arms
+# emptied the ring millions of times in some phase r runs and left
+# accepted connections unanswered in three of them; m64-b4k (16,384
+# entries) and inc never emptied it.
+DIAG_R16K256_CELLS = [{"kind": "echo", "msg": 256, "conns": 16384, "depth": 1}]
+DIAG_R16K256_ARMS = {a: RING_ARMS[a] for a in ("m16-b4k", "m64-b16k", "m64-b4k", "inc")}
+DIAG_SETS = {"r16k": (DIAG_R16K_CELLS, DIAG_R16K_ARMS), "r16k256": (DIAG_R16K256_CELLS, DIAG_R16K256_ARMS)}
 SS_EVERY = 4
 
 
@@ -629,14 +636,14 @@ def render(kernel, rep, phase, bins, workers, warmup, duration, rates, only=None
     if phase == "q":
         return render_search(kernel, rep, bins, workers, warmup, duration, rates, only, reuse, label,
                              cooldown)
-    r16k = phase == "d" and diag_set == "r16k"
-    arms = RING_ARMS if phase == "r" else DIAG_R16K_ARMS if r16k else ARMS
+    r16k = phase == "d" and diag_set in DIAG_SETS
+    arms = RING_ARMS if phase == "r" else DIAG_SETS[diag_set][1] if r16k else ARMS
     names = list(arms)
     k = (rep - 1) % len(names)
     order = names[k:] + names[:k]
     server, client = [], []
     n = 0
-    for c in (ring_cells(msg) if phase == "r" else DIAG_R16K_CELLS if r16k else cells()):
+    for c in (ring_cells(msg) if phase == "r" else DIAG_SETS[diag_set][0] if r16k else cells()):
         cid = cell_id(c)
         if phase == "l" and (c["kind"] == "proxy" or cid not in rates):
             continue
@@ -739,7 +746,7 @@ def main():
     ap.add_argument("--first", default=None, help="phase s: run this cell id first in each boot")
     ap.add_argument("--label", default="", help="appended to the phase in experiment names and file names")
     ap.add_argument("--cooldown", type=int, default=0, help="phase q with reuse: seconds at the start rate after each failed step")
-    ap.add_argument("--diag-set", default="c10000", choices=["c10000", "r16k"], help="phase d: which cells and arms")
+    ap.add_argument("--diag-set", default="c10000", choices=["c10000", "r16k", "r16k256"], help="phase d: which cells and arms")
     ap.add_argument("--dry", action="store_true")
     args = ap.parse_args()
     rates = json.load(open(args.rates)) if args.rates else {}
