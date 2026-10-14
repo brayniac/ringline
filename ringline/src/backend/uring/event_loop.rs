@@ -394,6 +394,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             } else {
                 self.driver.ring.submit_and_get_events()?;
             }
+            self.driver.rearms_since_wait = 0;
             let mut wait_ns: u64 = 0;
             if let Some(start) = wait_start {
                 wait_ns = start.elapsed().as_nanos() as u64;
@@ -1088,8 +1089,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     }
 
     /// Commit pending provided-buffer returns to the kernel ring and re-arm
-    /// connections parked in `recv_starved`, oldest first, at most one per
-    /// free buffer.
+    /// connections parked in `recv_starved`, oldest first. The passes between
+    /// two waits together re-arm at most one connection per free buffer
+    /// (`rearms_since_wait`).
     ///
     /// Safe because every bid pushed to `pending_replenish` had its contents
     /// copied out (into the accumulator / recv sink / TLS state) before being
@@ -1161,11 +1163,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // A re-armed recv on a connection with data waiting takes a buffer
         // as soon as it runs; one with no data waiting takes none. Re-arming
         // more connections than there are free buffers parks again those of
-        // the excess that have data waiting. With 10,000 connections and 256
-        // buffers, re-arming every parked connection gave one worker about
-        // 55M ENOBUFS completions (`buffer_ring_empty`) in a 15 s run.
-        let mut rearms_left = self.driver.provided_bufs.free() as usize;
-        let had_free = rearms_left > 0;
+        // the excess that have data waiting. `free()` does not yet count the
+        // buffers taken by recvs re-armed since the last wait, so those
+        // re-arms come out of this pass's budget.
+        let free = self.driver.provided_bufs.free();
+        let mut rearms_left = free.saturating_sub(self.driver.rearms_since_wait) as usize;
+        let had_free = free > 0;
         for _ in 0..self.driver.recv_starved.len() {
             let Some(conn_index) = self.driver.recv_starved.pop_front() else {
                 break;
@@ -1206,14 +1209,15 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             {
                 continue;
             }
-            // Re-arm while this pass's budget lasts, whether or not this pass
-            // returned bids. A connection parked while the ring was dry, whose
-            // bids came back in a pass that did not visit it (a fallback
-            // completion re-parks it after the flush), would otherwise stay
-            // parked against a full ring: no recv completes, so no bid returns
-            // and no later pass re-arms it.
+            // Re-arm while this pass's budget lasts. The budget counts every
+            // free buffer, including buffers returned before this pass, so a
+            // connection parked while the ring was empty is re-armed once
+            // buffers are back, even when no recv completes in between (for
+            // example, a fallback completion that re-parks it after the
+            // flush).
             if rearms_left > 0 {
                 rearms_left -= 1;
+                self.driver.rearms_since_wait += 1;
                 let generation = self.driver.connections.generation(conn_index);
                 if self.driver.submit_tcp_recv(conn_index, generation).is_err() {
                     metrics::RING.increment(metrics::ring::RECV_ARM_FAILURES);
@@ -1226,11 +1230,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
             // With no free buffer at the start of the pass, a returned bid
             // (from a completion, or from a task dropping a hold) is committed
-            // by the next flush, which runs the next pass. Otherwise
-            // the pass re-armed one connection per free buffer. A re-armed
-            // connection with no data waiting takes no buffer and produces no
-            // completion, so `rearm_deferred` keeps the loop from blocking
-            // while connections are left over.
+            // by the next flush, which runs the next pass. Otherwise the
+            // budget is spent. A re-armed connection with no data waiting
+            // takes no buffer and produces no completion, so `rearm_deferred`
+            // keeps the loop from blocking while connections are left over;
+            // the wait resets `rearms_since_wait` and the next pass has a
+            // budget again.
             if had_free {
                 self.driver.rearm_deferred = true;
             }
@@ -14707,12 +14712,21 @@ mod tests {
             "the loop must run another pass instead of blocking"
         );
 
-        // The re-armed recvs have not completed, so the buffers are still
-        // free and the next pass takes the next two.
+        // Before the loop waits, a second pass re-arms nothing: `free()`
+        // does not yet count the buffers the first two re-arms may take.
+        el.flush_replenish_and_rearm();
+        assert_eq!(parked_in_order(&el), conns[2..]);
+        assert!(el.driver.rearm_deferred);
+        assert!(!el.may_block());
+
+        // The re-armed recvs had no data waiting and took no buffer, so after
+        // the wait the next pass takes the next two.
+        el.driver.rearms_since_wait = 0;
         el.flush_replenish_and_rearm();
         assert_eq!(parked_in_order(&el), conns[4..]);
         assert!(el.driver.rearm_deferred);
 
+        el.driver.rearms_since_wait = 0;
         el.flush_replenish_and_rearm();
         assert!(el.driver.recv_starved.is_empty());
         assert!(!el.driver.rearm_deferred);
@@ -14735,6 +14749,22 @@ mod tests {
             "a dry ring must let the loop block until a bid returns"
         );
         assert!(el.may_block());
+    }
+
+    #[test]
+    fn closing_a_parked_connection_does_not_rearm_the_next_occupant() {
+        let mut el = make_test_loop();
+        let conn = park_connection(&mut el);
+        recycle_connection(&mut el, conn);
+        assert!(
+            !el.driver.recv_starved.contains(conn),
+            "the Close CQE must drop the old occupant's park entry"
+        );
+
+        // The new occupant already has its recv armed; a pass with free
+        // buffers must not arm a second one.
+        el.flush_replenish_and_rearm();
+        assert_eq!(el.driver.rearms_since_wait, 0);
     }
 
     #[test]
