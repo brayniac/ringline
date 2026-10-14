@@ -21,7 +21,12 @@ The gate per cell compares inc's median with the 2 x reps runs of base and
 base2 together: throughput below their minimum, or p99 above their maximum,
 fails the cell. inc's `buffer_ring_empty` fails the cell when its median is
 above RING_EMPTY_RATIO times the smallest count among the base and base2
-runs; when that smallest count is 0, any nonzero median fails.
+runs; when that smallest count is 0, any nonzero median fails. inc fails
+the cell as "unanswered" when its median count of connections with no
+response in the measured window is above the largest base or base2 count.
+"base-unanswered" marks a cell where a base or base2 run left a connection
+without a response: that run's throughput and p99 cover only the
+connections it served.
 """
 
 import json
@@ -178,7 +183,7 @@ def table(path):
     bad = [r for r in rs if not r["ok"] or r.get("panic")]
     for r in bad:
         print(f"FAILED ARM {r['kernel']} rep{r['rep']} {r['cell']} {r['arm']} panic={r.get('panic')}")
-    hdr = f"{'kernel':5} {'cell':24} {'base':>10} {'A/A min-max':>21} {'inc':>10} {'d%':>6} {'p99 base':>9} {'p99 inc':>8} {'rss b/i MiB':>12} {'ring_empty b/i':>16} {'i/bmin':>6} gate"
+    hdr = f"{'kernel':5} {'cell':24} {'base':>10} {'A/A min-max':>21} {'inc':>10} {'d%':>6} {'p99 base':>9} {'p99 inc':>8} {'rss b/i MiB':>12} {'ring_empty b/i':>16} {'i/bmin':>6} {'zero b/i':>11} gate"
     print(hdr)
     for (kernel, cell), arms in sorted(group([r for r in rs if r["ok"]]).items()):
         baseline = arms.get("base", []) + arms.get("base2", [])
@@ -198,6 +203,14 @@ def table(path):
         be_min = min((r.get("buffer_ring_empty") or 0) for r in baseline)
         if ie > RING_EMPTY_RATIO * be_min:
             fails.append("ring_empty")
+        zero = lambda r: (r.get("per_conn") or {}).get("zero")
+        bz = [zero(r) for r in baseline if zero(r) is not None]
+        iz = med(zero(r) for r in inc)
+        if bz and iz is not None and iz > max(bz):
+            fails.append("unanswered")
+        if bz and max(bz) > 0:
+            fails.append("base-unanswered")
+        zcol = f"{max(bz) if bz else '-'}/{iz if iz is not None else '-'}"
         unit = 1e6 if "proxy" in cell else 1e3
         p99 = lambda v: f"{v / 1e6:.2f}" if v else "-"
         print(
@@ -205,9 +218,10 @@ def table(path):
             f"{100 * (i_med / b_med - 1):6.1f} {p99(med(bp)):>9} {p99(ip):>8} "
             f"{med(r.get('rss_mib') for r in arms.get('base', [])) or 0:5.0f}/{med(r.get('rss_mib') for r in inc) or 0:<6.0f} "
             f"{med(r.get('buffer_ring_empty') for r in arms.get('base', [])) or 0:>7}/{ie:<8} {100 * ie / be_min if be_min else 0:5.1f}% "
-            f"{','.join(fails) or 'pass'}"
+            f"{zcol:>11} {','.join(fails) or 'pass'}"
         )
     print("throughput: k ops/s, or MB/s for proxy cells; p99 in ms; ring_empty is a whole-run count")
+    print("zero b/i: connections with no response, largest base/base2 run / inc median")
 
 
 def rates(path):
