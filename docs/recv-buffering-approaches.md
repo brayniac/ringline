@@ -61,9 +61,9 @@ completion is appended to the connection's accumulator, a heap buffer,
 whenever the accumulator already holds bytes or the task has not yet taken
 the previous buffer; its ring buffer then returns at once. A task that
 returns `NeedMore`, or consumes part of a buffer, has the rest copied too.
-On the `with_bytes` path every completion is copied into the accumulator
-when the task reads it. For a parser of messages larger than one buffer,
-the accumulator holds up to one message per connection when each
+On the `with_bytes` path every completion is copied into the accumulator, at
+the latest when the task reads it. For a parser of messages larger than one
+buffer, the accumulator holds up to one message per connection when each
 connection has one request in flight. Accumulators are bounded per
 connection by `recv_accumulator_max` (1 GiB by default), not in total. A
 forward echo, which forwards each buffer without parsing, copies rarely. In
@@ -97,9 +97,8 @@ sweep at 16,384 connections:
   5.7 million times in most runs, and, on 7.1, in some runs of the same
   configuration not at all. Throughput varied by up to 1.8× between such
   runs (7.1, 256 B, 16 MiB of 16 KiB buffers: 89k with 5.0 million empties,
-  163k with 746),
-  and some connections went unanswered in the emptying runs.
-  Configurations that rarely emptied the ring varied by at most 12%.
+  163k with 746), and some connections went unanswered in the emptying
+  runs. Configurations that rarely emptied the ring varied by at most 12%.
 
 No single geometry was best at every message size. A ring sized for a known
 load (connections per worker × buffers per message, at the message size)
@@ -124,14 +123,15 @@ throttle on a 256 × 16 KiB ring on Linux 6.12 (#638).
 ### Fallback receive on `ENOBUFS` (#274)
 
 A parked connection on the plaintext `with_data` or `with_bytes` path that
-has part of a message in its accumulator gets a one-shot receive into a
-slot of a per-worker pool instead of waiting for ring buffers. The pool has 32 slots
-of `max(4 × buffer size, 1 MiB)`, or 1 MiB with `recv_incremental`, and is
-allocated on first use. The bytes are then appended to the accumulator. The
-fallback keeps the connection's TCP window open while the ring is empty.
-TLS, recv-sink, segmented, recv-forward and direct-echo connections keep
-waiting for ring buffers. With `recv_incremental`, a parked connection
-re-arms on the ring instead when the ring's free bytes exceed one chunk.
+has part of a message in its accumulator gets a one-shot receive into a slot
+of a per-worker pool instead of waiting for ring buffers. The pool has 32
+slots of `max(4 × buffer size, 1 MiB)`, or 1 MiB with `recv_incremental`,
+and is allocated on first use. The bytes are then appended to the
+accumulator. The fallback keeps the connection's TCP window open while the
+ring is empty. TLS, recv-sink, segmented, recv-forward and direct-echo
+connections keep waiting for ring buffers. With `recv_incremental`, a parked
+connection re-arms on the ring instead when the ring's free bytes exceed one
+chunk.
 
 ## Incremental ring (`recv_incremental`)
 

@@ -115,8 +115,8 @@ the connections opened, `accept_backlog_dropped` 0).
 At 256 B and 4 KiB the pattern is tied to ring exhaustion more cleanly. At
 256 B × 16,384, the two 4,096-entry configurations either never emptied the
 ring (two runs on 7.1, about 158k req/s, p99 about 0.1 s) or emptied it
-3.4M–4.8M times (108k–119k req/s, p99 0.6–1.6 s), in the same configuration
-across runs.
+3.4M–4.8M times (108k–119k req/s, p99 0.6–1.6 s), in the same
+configuration across runs.
 Three runs in the second regime left 60, 89 and 1,481 connections
 unanswered, all accepted. Configurations that never emptied the ring left
 nobody unanswered except through classes 1 and 2.
@@ -170,16 +170,15 @@ copy stays allocated until the zero-copy notification. Each active
 connection then holds one to two messages on the heap. Nothing bounds the
 total except `recv_accumulator_max` per connection (1 GiB by default).
 
-A plain ring copies too: on the `with_data` path a completion is appended
-to the accumulator
-whenever the accumulator already holds bytes or the task has not yet taken
-the previous buffer, and a task that returns `NeedMore` or consumes part of
-a buffer has the rest copied. A forward echo forwards each buffer without
-parsing, so it rarely copies. In the local runs below at 1 MiB × 512, the
-1024 × 64 KiB ring forwarded 99.9% of data completions (completions other
-than `ENOBUFS`) from ring buffers. The incremental ring forwarded 51–62%
-from ring buffers and sent the rest as zero-copy accumulator sends, one per
-refused lend.
+A plain ring copies too: on the `with_data` path a completion is appended to
+the accumulator whenever the accumulator already holds bytes or the task has
+not yet taken the previous buffer, and a task that returns `NeedMore` or
+consumes part of a buffer has the rest copied. A forward echo forwards each
+buffer without parsing, so it rarely copies. In the local runs below at
+1 MiB × 512, the 1024 × 64 KiB ring forwarded 99.9% of data completions
+(completions other than `ENOBUFS`) from ring buffers. The incremental ring
+forwarded 51–62% from ring buffers and sent the rest as zero-copy
+accumulator sends, one per refused lend.
 
 Measured locally (one worker, Linux 7.2, arm64, loopback). The build was
 68fed94 on the brayniac fork's `exp/inc-step6-rearm` branch (#657's first

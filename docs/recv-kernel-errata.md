@@ -10,12 +10,11 @@ Sources: the stable tree (branches `linux-6.1.y` at 6.1.189, `linux-6.6.y`,
 mainline at 7.3-rc6), the kernel CVE records (`vulns.git`), and Ubuntu's
 `noble` kernel git. A stable version is the first stable tag that has the
 backport; a dash means none was found. Claims marked "unverified" rest on a
-secondary source. The rest were read from the commit, its diff or the
-source at the named tag. For two older fixes listed here, 561e4f9451d and
+secondary source. The rest were read from the commit, its diff or the source
+at the named tag. For two older fixes listed here, 561e4f9451d and
 b00c51ef8f7, only the mapping from the mainline commit to its stable
-backport was checked. The Debian package
-versions come from Debian's security tracker. Commits are at
-`https://git.kernel.org/torvalds/c/<id>`.
+backport was checked. The Debian package versions come from Debian's
+security tracker. Commits are at `https://git.kernel.org/torvalds/c/<id>`.
 
 Version numbers do not identify the fix level of a distribution kernel,
 which can carry backports or lack them. That is why ringline checks the
