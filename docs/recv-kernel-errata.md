@@ -11,9 +11,11 @@ mainline at 7.3-rc6), the kernel CVE records (`vulns.git`), and Ubuntu's
 `noble` kernel git. A stable version is the first stable tag that has the
 backport; a dash means none was found. Claims marked "unverified" rest on a
 secondary source. The rest were read from the commit, its diff or the
-source at the named tag, except that for some fixes only the mapping from
-the mainline commit to its stable backport was checked, and the Debian
-package versions come from Debian's security tracker. Commits are at `https://git.kernel.org/torvalds/c/<id>`.
+source at the named tag. For two older fixes listed here, 561e4f9451d and
+b00c51ef8f7, only the mapping from the mainline commit to its stable
+backport was checked. The Debian package
+versions come from Debian's security tracker. Commits are at
+`https://git.kernel.org/torvalds/c/<id>`.
 
 Version numbers do not identify the fix level of a distribution kernel,
 which can carry backports or lack them. That is why ringline checks the
@@ -62,7 +64,7 @@ Fixes that affect a receive path:
 | 8802766324e1 | reallocate buf lists on upgrade | 6.14 | 6.6.79, 6.12.16 | CVE-2025-21836: a ring registered at a bgid used before for legacy buffers reused a live structure |
 | c2c185be5c85 | check if target buffer list is still legacy on recycle | 7.0 | 6.1.167, 6.6.130, 6.12.78, 6.18.19 | CVE-2026-43366: legacy-buffer recycle into a list upgraded to a ring |
 | 46800585ae04 | validate ring provided buffer addresses with access_ok() | 7.2 | none | an entry with an address outside user space makes single-buffer selection return `-ENOBUFS` without consuming it |
-| cd053d788c3f, f1596ba3e6b3 | fix dangling iovec after bundle grow failure; free the replaced iovec after a successful grow | 7.2-rc3, rc4 | none | double frees introduced by 46800585ae04; 7.2-rc1 and rc2 have them, and rc3 has the second (inferred from the rc each fix landed in) |
+| cd053d788c3f, f1596ba3e6b3 | fix dangling iovec after provided-buffer bundle grow failure; free the replaced iovec after a successful grow | 7.2-rc3, rc4 | none | 46800585ae04 introduced a double free on bundle grow failure (7.2-rc1, rc2); cd053d788c3f's fix introduced a second (7.2-rc3), fixed by f1596ba3e6b3, per the commits' `Fixes:` tags |
 
 From 7.2, a runtime that answers `-ENOBUFS` by re-arming after the next
 replenish would re-arm onto the same bad entry. That needs a bad address,

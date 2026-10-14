@@ -137,8 +137,9 @@ From phase r, 2 workers, at a fixed memory budget per worker:
   on 7.1 (118k against 158k).
 - At 64 KiB, buffer size decides. m64-b64k came within about 10% of the
   incremental ring at 64 KiB × 16,384, with about a fifth of its peak RSS
-  (295 against 1,509 MiB; both rings are 64 MiB per worker), but left 233 and 1,916 connections unanswered in its two runs on
-  6.12; m4-b64k ran 30% slower than the incremental ring. 4 KiB buffers cost 16 completions per
+  (295 against 1,509 MiB; both rings are 64 MiB per worker), but left 233
+  and 1,916 connections unanswered in its two runs on 6.12. m4-b64k ran 30%
+  slower than the incremental ring. 4 KiB buffers cost 16 completions per
   message: m64-b4k ran 7.3k req/s at 64 KiB × 16,384 against 23.3k.
 - No fixed geometry was best at every message size.
 - At 1 MiB × 16,384 every configuration left 36–99% of connections
@@ -169,7 +170,8 @@ copy stays allocated until the zero-copy notification. Each active
 connection then holds one to two messages on the heap. Nothing bounds the
 total except `recv_accumulator_max` per connection (1 GiB by default).
 
-A plain ring copies too: a completion is appended to the accumulator
+A plain ring copies too: on the `with_data` path a completion is appended
+to the accumulator
 whenever the accumulator already holds bytes or the task has not yet taken
 the previous buffer, and a task that returns `NeedMore` or consumes part of
 a buffer has the rest copied. A forward echo forwards each buffer without
@@ -180,10 +182,10 @@ from ring buffers and sent the rest as zero-copy accumulator sends, one per
 refused lend.
 
 Measured locally (one worker, Linux 7.2, arm64, loopback). The build was
-68fed94 on the brayniac fork's `exp/inc-step6-rearm` branch (#657's commits
-on an experiment branch based on 5a88595), with an experimental accumulator
-patch; in two of the incremental runs per cell its shrink-on-drain switch
-was on, which did not change the result:
+68fed94 on the brayniac fork's `exp/inc-step6-rearm` branch (#657's first
+two commits on an experiment branch based on 5a88595), with an
+experimental accumulator patch; in two of the incremental runs per cell its
+shrink-on-drain switch was on, which did not change the result:
 
 | Cell | Lends refused | Peak RSS |
 |---|---|---|

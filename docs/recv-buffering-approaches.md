@@ -56,26 +56,29 @@ parks the connection and re-arms it when a buffer returns
 (`flush_replenish_and_rearm`). Bytes stay in the socket's receive queue,
 and once it fills TCP advertises a zero window, so the peer is slowed.
 
-Ring buffers are not the only receive memory. On the `with_data` and
-`with_bytes` paths a completion is appended to the connection's
-accumulator, a heap buffer, whenever the accumulator already holds bytes or
-the task has not yet taken the previous buffer; its ring buffer then returns
-at once. A task that returns `NeedMore`, or consumes part of a buffer, has
-the rest copied too. For a parser of messages larger than one buffer, the
-accumulator therefore holds up to one message per connection.
-Accumulators are bounded per connection by `recv_accumulator_max` (1 GiB by
-default), not in total. A forward echo, which forwards each buffer without
-parsing, copies rarely: at 1 MiB × 512 on a 1024 × 64 KiB ring, 99.9% of
-data completions were forwarded from ring buffers, and peak RSS stayed at
-147 MiB.
+Ring buffers are not the only receive memory. On the `with_data` path a
+completion is appended to the connection's accumulator, a heap buffer,
+whenever the accumulator already holds bytes or the task has not yet taken
+the previous buffer; its ring buffer then returns at once. A task that
+returns `NeedMore`, or consumes part of a buffer, has the rest copied too.
+On the `with_bytes` path every completion is copied into the accumulator
+when the task reads it. For a parser of messages larger than one buffer,
+the accumulator holds up to one message per connection when each
+connection has one request in flight. Accumulators are bounded per
+connection by `recv_accumulator_max` (1 GiB by default), not in total. A
+forward echo, which forwards each buffer without parsing, copies rarely. In
+the local one-worker forward echo at 1 MiB × 512 on a 1024 × 64 KiB ring,
+99.9% of data completions were forwarded from ring buffers, and peak RSS
+stayed at 147 MiB.
 
 Which parked connection re-arms first decides fairness. A pass re-arms every
 parked connection while any buffer is free, in the order `swap_remove`
 leaves the list, so which connection gets a buffer is arbitrary. At 10,000
 connections on a 256 × 16 KiB ring, 75 of 80 runs left connections with no
 response for the whole run, most of them thousands. #657, not merged at the
-time of writing, re-arms the oldest first, at most one per free buffer; in
-the same test it left connections unanswered in 3 of 80 runs.
+time of writing, re-arms the oldest first, at most one per free buffer;
+with its first commit, the same test left connections unanswered in 3 of
+80 runs.
 
 The geometry decides how often the ring empties. In ringline's two-worker
 sweep at 16,384 connections:
@@ -91,16 +94,17 @@ sweep at 16,384 connections:
   and 1,916 connections unanswered in its two runs on 6.12. 4 MiB of 64 KiB
   buffers ran 30% slower than the incremental ring.
 - A ring with too few entries for the connections emptied 0.5 million to
-  5.7 million times in most runs, and in some runs of the same
+  5.7 million times in most runs, and, on 7.1, in some runs of the same
   configuration not at all. Throughput varied by up to 1.8× between such
-  runs (7.1, 256 B, m16-b16k: 89k with 5.0 million empties, 163k with 746),
+  runs (7.1, 256 B, 16 MiB of 16 KiB buffers: 89k with 5.0 million empties,
+  163k with 746),
   and some connections went unanswered in the emptying runs.
   Configurations that rarely emptied the ring varied by at most 12%.
 
 No single geometry was best at every message size. A ring sized for a known
 load (connections per worker × buffers per message, at the message size)
-avoids running out. That works when the load is known in advance, and not
-when peers set it.
+avoids running out. A runtime whose load is set by its peers cannot size
+the ring this way.
 
 ### Multishot receive (`recv_multishot(true)`)
 
@@ -120,9 +124,8 @@ throttle on a 256 × 16 KiB ring on Linux 6.12 (#638).
 ### Fallback receive on `ENOBUFS` (#274)
 
 A parked connection on the plaintext `with_data` or `with_bytes` path that
-has part of a
-message in its accumulator gets a one-shot receive into a slot of a
-per-worker pool instead of waiting for ring buffers. The pool has 32 slots
+has part of a message in its accumulator gets a one-shot receive into a
+slot of a per-worker pool instead of waiting for ring buffers. The pool has 32 slots
 of `max(4 × buffer size, 1 MiB)`, or 1 MiB with `recv_incremental`, and is
 allocated on first use. The bytes are then appended to the accumulator. The
 fallback keeps the connection's TCP window open while the ring is empty.
