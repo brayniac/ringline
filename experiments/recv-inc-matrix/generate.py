@@ -34,8 +34,14 @@ Phase `r` sweeps the plain ring's geometry for base: RING_ARMS, nine
 `recv_buffer` configurations at three fixed sizes per worker (4, 16 and
 64 MiB) and three buffer sizes (4, 16 and 64 KiB), plus inc for reference.
 Its cells are echo at 256 B, 4 KiB, 64 KiB and 1 MiB against 16 to 16,384
-connections in powers of 4, closed loop, one boot per (kernel, rep, message
-size). There is no A/A pair; the spread comes from reps.
+connections in powers of 4, and 65,536 connections at the three smaller
+sizes, closed loop, one boot per (kernel, rep, message size). There is no
+A/A pair; the spread comes from reps. A 65,536-connection cell listens on
+two ports (`--listen-ports 2`): one client address has about 64,500 source
+ports per destination port. Its server allows 65,536 connections per
+worker, so its fixed per-connection tables are larger than in the other
+cells. 65,536 connections at 1 MiB would need about 128 GiB of client
+buffers and are left out.
 
 Usage:
     ./generate.py --bins-artifact <id> --phase t [--dry]
@@ -76,10 +82,15 @@ RING_ARMS["inc"] = ARMS["inc"]
 
 RING_MSGS = [256, 4 * KIB, 64 * KIB, 1 * MIB]
 RING_CONNS = [16, 64, 256, 1024, 4096, 16384]
+RING_BIG_CONNS = 65536
+PORT = 7878
 
 
 def ring_cells(msg):
-    return [{"kind": "echo", "msg": msg, "conns": n, "depth": 1} for n in RING_CONNS]
+    out = [{"kind": "echo", "msg": msg, "conns": n, "depth": 1} for n in RING_CONNS]
+    if msg <= 64 * KIB:
+        out.append({"kind": "echo", "msg": msg, "conns": RING_BIG_CONNS, "depth": 1, "ports": 2})
+    return out
 
 
 def cells():
@@ -377,8 +388,13 @@ def arm_cmds(c, arm, phase, rate, warmup, duration, arms=ARMS):
     server_args = f"--echo-mode forward --msg-size {c['msg']} {arms[arm]}"
     if c["kind"] == "slow":
         server_args += f" --service-time-us {c['service_us']}"
+    addr = "{server_ip}:{port}"
+    ports = c.get("ports", 1)
+    if ports > 1:
+        server_args += f" --listen-ports {ports} --max-connections {c['conns']}"
+        addr = ",".join(f"{{server_ip}}:{PORT + i}" for i in range(ports))
     client_cmd = (
-        "./out/bench-client --runtime ringline --addr {server_ip}:{port} "
+        f"./out/bench-client --runtime ringline --addr {addr} "
         f"--clients {c['conns']} --threads {threads} --msg-size {c['msg']} "
         f"--warmup {warmup} --duration {duration}"
     )
@@ -579,15 +595,21 @@ def render(kernel, rep, phase, bins, workers, warmup, duration, rates, only=None
         if only and cid not in only:
             continue
         # 10,000 connections take longer to open than 64.
-        slack = 40 if c["conns"] >= 10000 else 20
+        slack = 60 if c["conns"] >= 50000 else 40 if c["conns"] >= 10000 else 20
         server_secs = warmup + duration + slack
         for arm in order:
             aid = f"{cid}-{arm}"
             sa, cc = arm_cmds(c, arm, phase, rates.get(cid), warmup, duration, arms)
-            server.append(SERVER_ARM.format(
+            arm_text = SERVER_ARM.format(
                 aid=aid, conns=c["conns"], quiet=0, server_secs=server_secs, server_args=sa,
                 pre="",
-            ))
+            )
+            if c.get("ports", 1) > 1:
+                # Count established connections on every listening port.
+                ports = " or ".join(f"sport = :{PORT + i}" for i in range(c["ports"]))
+                arm_text = arm_text.replace('"( sport = :{port} )"', f'"( {ports} )"')
+                assert ports in arm_text
+            server.append(arm_text)
             client.append(CLIENT_ARM.format(aid=aid, client_cmd=cc))
             n += 1
     head = HEAD.format(
@@ -684,6 +706,8 @@ def main():
                     set(args.cells.split(",")) if args.cells else None,
                     not args.fresh, args.first, args.label, args.cooldown, msg,
                 )
+                if n == 0:
+                    continue
                 total += n
                 part = f"-{msg}b" if msg else ""
                 path = out_dir / f"{kernel}{args.label}{part}-rep{rep}.toml"
