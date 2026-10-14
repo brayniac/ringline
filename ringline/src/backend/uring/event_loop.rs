@@ -4640,6 +4640,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // Clear their claims before the slot is reused, or the next occupant
         // inherits them.
         self.driver.clear_conn_claims(conn_index);
+        self.driver.accumulators.release(conn_index);
         self.driver.connections.release(conn_index);
     }
 
@@ -9142,6 +9143,26 @@ mod tests {
         assert_eq!(
             reused, conn_index,
             "the free list must hand the same slot back"
+        );
+    }
+
+    /// A closed connection's accumulator gives its allocation back, so a
+    /// slot does not keep the largest message its last connection buffered.
+    #[test]
+    fn close_releases_the_accumulator_allocation() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        el.driver
+            .accumulators
+            .append(conn_index, &vec![0u8; 1024 * 1024]);
+        assert!(el.driver.accumulators.capacity(conn_index) >= 1024 * 1024);
+
+        recycle_connection(&mut el, conn_index);
+
+        assert_eq!(
+            el.driver.accumulators.capacity(conn_index),
+            4096,
+            "the default recv_accumulator_capacity"
         );
     }
 
