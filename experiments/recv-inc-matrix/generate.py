@@ -30,8 +30,16 @@ base's phase t median on that kernel; `--rates` from `collect.py ladder`),
 one client run per rate against one server per arm. collect.py `knees`
 reports the highest rate per arm whose p99 meets the cell's SLO.
 
+Phase `r` sweeps the plain ring's geometry for base: RING_ARMS, nine
+`recv_buffer` configurations at three fixed sizes per worker (4, 16 and
+64 MiB) and three buffer sizes (4, 16 and 64 KiB), plus inc for reference.
+Its cells are echo at 256 B, 4 KiB, 64 KiB and 1 MiB against 16 to 16,384
+connections in powers of 4, closed loop, one boot per (kernel, rep, message
+size). There is no A/A pair; the spread comes from reps.
+
 Usage:
     ./generate.py --bins-artifact <id> --phase t [--dry]
+    ./generate.py --bins-artifact <id> --phase r --kernels k612 --reps 2
     ./generate.py --bins-artifact <id> --phase l --rates rates.json
     ./generate.py --bins-artifact <id> --phase s --rates ladder.json --kernels k612,k71 --reps 3 --warmup 2 --duration 6
 """
@@ -56,6 +64,22 @@ ARMS = {
     "base2": "--recv-buffer-bytes 16384 --recv-ring-size 256",
     "inc": "--recv-incremental",
 }
+
+
+# Phase r: name -> server args. `m<MiB per worker>-b<KiB per buffer>`.
+RING_ARMS = {
+    f"m{mib}-b{kib}k": f"--recv-buffer-bytes {kib * KIB} --recv-ring-size {mib * MIB // (kib * KIB)}"
+    for mib in (4, 16, 64)
+    for kib in (4, 16, 64)
+}
+RING_ARMS["inc"] = ARMS["inc"]
+
+RING_MSGS = [256, 4 * KIB, 64 * KIB, 1 * MIB]
+RING_CONNS = [16, 64, 256, 1024, 4096, 16384]
+
+
+def ring_cells(msg):
+    return [{"kind": "echo", "msg": msg, "conns": n, "depth": 1} for n in RING_CONNS]
 
 
 def cells():
@@ -337,12 +361,12 @@ LADDER = [round(0.5 * 1.12 ** i, 3) for i in range(19)]
 SLO_P99_NS = {256: 1_000_000, 4096: 1_000_000, 65536: 10_000_000, 1048576: 100_000_000}
 
 
-def arm_cmds(c, arm, phase, rate, warmup, duration):
+def arm_cmds(c, arm, phase, rate, warmup, duration, arms=ARMS):
     threads = min(48, max(16, c["conns"] // 32))
     if c["kind"] == "proxy":
         server_args = (
             "--proxy-backend {client_ip}:{drain_port} --proxy-api conn "
-            f"--msg-size {c['msg']} {ARMS[arm]}"
+            f"--msg-size {c['msg']} {arms[arm]}"
         )
         client_cmd = (
             "./out/proxy-load --addr {server_ip}:{port} "
@@ -350,7 +374,7 @@ def arm_cmds(c, arm, phase, rate, warmup, duration):
             f"--warmup {warmup} --duration {duration}"
         )
         return server_args, client_cmd
-    server_args = f"--echo-mode forward --msg-size {c['msg']} {ARMS[arm]}"
+    server_args = f"--echo-mode forward --msg-size {c['msg']} {arms[arm]}"
     if c["kind"] == "slow":
         server_args += f" --service-time-us {c['service_us']}"
     client_cmd = (
@@ -536,18 +560,19 @@ def render_search(kernel, rep, bins, workers, warmup, duration, ladder, only=Non
 
 
 def render(kernel, rep, phase, bins, workers, warmup, duration, rates, only=None, reuse=True,
-           first=None, label="", cooldown=0):
+           first=None, label="", cooldown=0, msg=None):
     if phase == "s":
         return render_ladder(kernel, rep, bins, workers, warmup, duration, rates, first, label)
     if phase == "q":
         return render_search(kernel, rep, bins, workers, warmup, duration, rates, only, reuse, label,
                              cooldown)
-    names = list(ARMS)
+    arms = RING_ARMS if phase == "r" else ARMS
+    names = list(arms)
     k = (rep - 1) % len(names)
     order = names[k:] + names[:k]
     server, client = [], []
     n = 0
-    for c in cells():
+    for c in (ring_cells(msg) if phase == "r" else cells()):
         cid = cell_id(c)
         if phase == "l" and (c["kind"] == "proxy" or cid not in rates):
             continue
@@ -558,7 +583,7 @@ def render(kernel, rep, phase, bins, workers, warmup, duration, rates, only=None
         server_secs = warmup + duration + slack
         for arm in order:
             aid = f"{cid}-{arm}"
-            sa, cc = arm_cmds(c, arm, phase, rates.get(cid), warmup, duration)
+            sa, cc = arm_cmds(c, arm, phase, rates.get(cid), warmup, duration, arms)
             server.append(SERVER_ARM.format(
                 aid=aid, conns=c["conns"], quiet=0, server_secs=server_secs, server_args=sa,
                 pre="",
@@ -626,7 +651,7 @@ def render_ladder(kernel, rep, bins, workers, warmup, duration, ladder, first=No
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bins-artifact", required=True)
-    ap.add_argument("--phase", default="t", choices=["t", "l", "s", "q"])
+    ap.add_argument("--phase", default="t", choices=["t", "l", "s", "q", "r"])
     ap.add_argument("--rates", default=None, help="phase l: JSON of cell id -> rate; phase s and q: kernel -> cell id -> base median")
     ap.add_argument("--kernels", default=",".join(KERNELS))
     ap.add_argument("--reps", type=int, default=5)
@@ -649,20 +674,23 @@ def main():
 
     out_dir = pathlib.Path(args.out or pathlib.Path(__file__).parent / f"phase-{args.phase}")
     total = 0
+    msgs = RING_MSGS if args.phase == "r" else [None]
     for kernel in args.kernels.split(","):
         for rep in range(1, args.reps + 1):
-            text, n = render(
-                kernel, rep, args.phase, args.bins_artifact, args.workers,
-                args.warmup, args.duration, rates,
-                set(args.cells.split(",")) if args.cells else None,
-                not args.fresh, args.first, args.label, args.cooldown,
-            )
-            total += n
-            path = out_dir / f"{kernel}{args.label}-rep{rep}.toml"
-            if not args.dry:
-                out_dir.mkdir(parents=True, exist_ok=True)
-                path.write_text(text)
-            print(f"{path} {n} arms")
+            for msg in msgs:
+                text, n = render(
+                    kernel, rep, args.phase, args.bins_artifact, args.workers,
+                    args.warmup, args.duration, rates,
+                    set(args.cells.split(",")) if args.cells else None,
+                    not args.fresh, args.first, args.label, args.cooldown, msg,
+                )
+                total += n
+                part = f"-{msg}b" if msg else ""
+                path = out_dir / f"{kernel}{args.label}{part}-rep{rep}.toml"
+                if not args.dry:
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    path.write_text(text)
+                print(f"{path} {n} arms")
     per = args.warmup + args.duration + 8
     if args.phase == "s":
         per *= len(LADDER)
