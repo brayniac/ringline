@@ -10,7 +10,7 @@ in `docs/recv-kernel-errata.md`. Measurements are cited by source:
 - the journal entry `docs/journal/2026-09-incremental-buffer-consumption.md`
   (the standalone `recv-strategies` benchmark, one worker);
 - the journal entry `docs/journal/2026-10-receive-starvation.md` (ringline's
-  `bench-server`, two workers).
+  `bench-server`, two workers on two hosts, and one worker locally).
 
 ## What a receive path has to hold
 
@@ -54,27 +54,44 @@ whatever buffers its task still holds.
 When the ring is empty the receive completes with `-ENOBUFS`. The worker
 parks the connection and re-arms it when a buffer returns
 (`flush_replenish_and_rearm`). Bytes stay in the socket's receive queue, and
-TCP closes the window, so the peer is slowed and memory is bounded by the
-ring.
+TCP closes the window, so the peer is slowed.
 
-Which parked connection re-arms first decides fairness. Before #657 the
-order was arbitrary. At 10,000 connections on a 256 × 16 KiB ring, 75 of 80
-runs left connections with no response for the whole run, most in the
-thousands. #657 re-arms the oldest first, one per free buffer. With it, 3 of
-80 runs had any unanswered connections.
+Ring buffers are not the only receive memory. On the `with_data` path a
+completion is held in place only when the connection's accumulator is empty
+and no other buffer is held; otherwise it is appended to the accumulator, a
+heap buffer, and its ring buffer returns at once. Accumulators are bounded
+per connection by `recv_accumulator_max` (1 GiB by default), not in total.
+With a plain ring a copy is at most one buffer, and happens when a second
+completion arrives before the task has taken the first. In a local forward
+echo at 1 MiB × 512 on a 1024 × 64 KiB ring, 84% of completions were
+forwarded from ring buffers and peak RSS stayed at 147 MiB.
+
+Which parked connection re-arms first decides fairness. A pass re-arms every
+parked connection while any buffer is free, in the order `swap_remove`
+leaves the list, so which connection gets a buffer is arbitrary. At 10,000
+connections on a 256 × 16 KiB ring, 75 of 80 runs left connections with no
+response for the whole run, most of them thousands. #657 (open) re-arms the
+oldest first, at most one per free buffer; with its first commit, 3 of 80
+runs had any unanswered connections.
 
 The geometry decides how often the ring empties. In ringline's two-worker
 sweep at 16,384 connections:
 
 - Up to 4 KiB messages, entries per connection decide. 16,384 4 KiB buffers
-  per worker (64 MiB, two entries per connection) never emptied and matched
-  the incremental ring.
+  per worker (64 MiB, two entries per connection) emptied the ring at most
+  about 21,000 times per run. At 256 B it matched the incremental ring on
+  6.12 (127.6k against 127.8k req/s) and ran 25% slower on 7.1 (118k
+  against 158k).
 - At 64 KiB, buffer size decides. 4 KiB buffers cost 16 completions per
   message, and that configuration ran at a third of the incremental ring's
-  rate. 64 KiB buffers came within about 10% of it.
-- A ring that does not cover the connections empties it millions of times
-  per run. Throughput then varies by up to 1.5× between runs of one
-  configuration, and some connections go unanswered.
+  rate. 64 MiB of 64 KiB buffers came within about 10% of it, but left 233
+  and 1,916 connections unanswered in its two runs on 6.12. 4 MiB of 64 KiB
+  buffers ran 30% slower.
+- A ring with too few entries for the connections empties often, from about
+  0.5 million to over 5 million times per run. Throughput then varied by up
+  to 1.8× between runs of one configuration (7.1, 256 B: 89k and 163k), and
+  some connections went unanswered. Configurations that rarely emptied the
+  ring varied by at most 12%.
 
 No single geometry was best at every message size. A ring sized for a known
 load (connections per worker × buffers per message, at the message size)
@@ -98,12 +115,15 @@ throttle on a 256 × 16 KiB ring on Linux 6.12 (#638).
 
 ### Fallback receive on `ENOBUFS` (#274)
 
-A parked connection whose task is waiting for a message larger than the ring
-can hold gets a one-shot receive into its own accumulator memory instead of
-waiting for ring buffers. This lets a message larger than the ring
-complete. The fallback reads chunks of `max(4 × buffer size, 1 MiB)`, or
-1 MiB with `recv_incremental`. Its memory comes from the heap, per
-connection.
+A parked connection on the plaintext `with_data` path that has part of a
+message in its accumulator gets a one-shot receive into a slot of a
+per-worker pool instead of waiting for ring buffers. The pool has 32 slots
+of `max(4 × buffer size, 1 MiB)`, or 1 MiB with `recv_incremental`, and is
+allocated on first use. The bytes are then appended to the accumulator. The
+fallback keeps the connection's TCP window open while the ring is empty.
+TLS, recv-sink, segmented, recv-forward and direct-echo connections keep
+waiting for ring buffers. With `recv_incremental`, a parked connection
+re-arms on the ring instead when the ring's free bytes exceed one chunk.
 
 ## Incremental ring (`recv_incremental`)
 
@@ -118,7 +138,7 @@ Measured:
 
 - In the benchmark it matched or beat the 256 × 16 KiB ring on throughput in
   every cell. Its gains over a 1024 × 64 KiB plain ring were at 1 MiB
-  messages and on streaming.
+  messages on one host (not across hosts) and on streaming.
 - In ringline's sweep it never left a connection unanswered through the
   receive path, at 16 to 16,384 connections, at 256 B to 64 KiB.
 
@@ -126,13 +146,16 @@ A held range pins its whole shared buffer. To keep held lends from pinning
 the whole ring, ringline lends a completion only while at most half the
 ring's buffers have a hold (`Driver::may_lend`). Above that, the completion
 is copied to the heap: into the accumulator for `with_data` and
-`with_bytes`, into an owned buffer for recv-forward and direct echo. The
-copies have no total bound. In ringline's forward echo they reached 1.5 GiB
-at 64 KiB × 16,384 and 5.6 GiB at 1 MiB × 4,096, against 64 MiB of ring per
-worker. Accumulators are also not freed when their connection closes. This
-is a property of the lend cap and the accumulator, not of the incremental
-ring, and it has to be fixed before `recv_incremental` is the default
-(journal, 2026-10).
+`with_bytes`, and into an owned buffer for recv-forward and direct echo,
+at most one ring's worth of owned buffers in total. The accumulator copies
+have no total bound. An incremental completion can be a whole message, so
+each copy can be a whole message. In ringline's forward echo, peak RSS
+reached 1.5 GiB at 64 KiB × 16,384 and 5.6 GiB at 1 MiB × 4,096, against
+64 MiB of ring per worker. An accumulator keeps its allocation after its
+connection closes. The lend cap and the accumulator cause this; the
+incremental ring's own memory stays at 64 MiB per worker. Both have to be
+fixed before `recv_incremental` is the default
+(`docs/journal/2026-10-receive-starvation.md`).
 
 The kernel behaviour the driver relies on is checked at startup on the
 running kernel (`docs/recv-incremental-ring-design.md`, "Selecting the ring
@@ -158,8 +181,8 @@ not chosen:
 - The variant that moves a connection's region by rewriting the posted ring
   entry delivered wrong bytes with a 64-entry CQ and 32-entry SQ, on 6.12
   and 7.1.
-- The variant that never rewrites a posted entry delivered no wrong byte. It
-  lost one connection in three small-queue streaming runs, which is
+- The variant that never rewrites a posted entry delivered no wrong byte.
+  Three of its small-queue streaming runs each lost one connection, which is
   unexplained.
 - On 7.1 each ring is charged a page of `RLIMIT_MEMLOCK`. Under the default
   8 MiB, 2,041 rings registered before `ENOMEM`, so 10,000 connections did
@@ -175,10 +198,10 @@ kernel cannot run out of shared buffers, and memory is
 `connections × buffer size`, allocated whether or not data arrives.
 
 In the benchmark (`oneshot`) it led at 256 B and 64 KiB with 64
-connections and fell behind at 1,000 and more: 64 KiB × 1,000 at 28.8k against 38.1k for the incremental
-ring, and mixed traffic at 47.2k against 74.0k. ringline's fallback receive
-is this approach used only for a connection whose message does not fit the
-ring.
+connections and fell behind at 1,000 and more: 64 KiB × 1,000 at 28.8k
+against 38.1k for the incremental ring, and mixed traffic at 47.2k against
+74.0k. ringline's fallback receive reads into memory it owns in the same
+way, for parked connections with a partial message.
 
 ## Bundles
 
@@ -200,9 +223,9 @@ fell. The errata document records the kernel versions.
 io_uring zero-copy receive (`IORING_REGISTER_ZCRX_IFQ`, Linux 6.15) has the
 NIC write payload into memory the application registered, on a dedicated
 hardware queue with header split and flow steering. It removes the copy into
-the accumulator. It needs NIC and driver support and a queue per worker, and
-it does not apply to loopback (`docs/io-uring-primer.md`). It has not been
-measured here.
+the accumulator. It needs NIC and driver support and a hardware queue per
+worker (the kernel's `iou-zcrx` documentation). It has not been measured
+here.
 
 ## Choosing between copying and waiting
 
@@ -211,21 +234,21 @@ wait or copies its bytes somewhere else:
 
 | Approach | When memory runs short | Memory bound |
 |---|---|---|
-| Plain ring, one-shot or multishot | the connection parks; TCP holds the bytes and slows the peer | the ring |
-| Plain ring with the fallback receive | a connection waiting for a large message reads into its accumulator | the ring, plus `recv_accumulator_max` per connection using the fallback |
-| Incremental ring with the lend cap | above half the ring held, completions are copied to the heap | none in total; `recv_accumulator_max` per connection |
+| Plain ring, one-shot or multishot | the connection parks; TCP holds the bytes and slows the peer | the ring for buffers held in place; accumulators up to `recv_accumulator_max` per connection |
+| Plain ring with the fallback receive | a connection with a partial message reads into a pool slot (32 per worker), then into its accumulator | as above, plus the pool |
+| Incremental ring with the lend cap | above half the ring held, completions are copied to the heap | the ring, one ring's worth of owned copies, and accumulators up to `recv_accumulator_max` per connection |
 | Per-connection memory | never short; each connection has its own | connections × region size, allocated up front |
 
-Waiting bounds memory and puts the cost on the waiting connection's latency,
-and fairness then depends on the re-arm order (#657). Copying keeps every
-connection moving and puts the cost on memory. A runtime can bound the copy
+Waiting puts the cost on the waiting connection's latency, and fairness
+then depends on the re-arm order (#657). Copying keeps every connection
+moving and puts the cost on memory. A runtime can bound the copy
 path with a per-worker copy budget and wait once the budget is used. That is
 not implemented.
 
 ## What is not known
 
 - Whether the final version of #657 still starves connections at 16,384
-  connections (journal 2026-10, pending).
+  connections (`docs/journal/2026-10-receive-starvation.md`, pending).
 - ringline's own measurements cover echo and forward workloads with two
   workers on one pair of hosts. The benchmark's cover more workloads with
   one worker.

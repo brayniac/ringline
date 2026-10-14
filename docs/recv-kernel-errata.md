@@ -60,7 +60,7 @@ Fixes that affect a receive path:
 | 8802766324e1 | reallocate buf lists on upgrade | 6.14 | 6.6.79, 6.12.16 | CVE-2025-21836: a ring registered at a bgid used before for legacy buffers reused a live structure |
 | c2c185be5c85 | check if target buffer list is still legacy on recycle | 7.0 | 6.1.167, 6.6.130, 6.12.78, 6.18.19 | CVE-2026-43366: legacy-buffer recycle into a list upgraded to a ring |
 | 46800585ae04 | validate ring provided buffer addresses with access_ok() | 7.2 | none | an entry with an address outside user space makes single-buffer selection return `-ENOBUFS` without consuming it |
-| cd053d788c3f, f1596ba3e6b3 | bundle grow fixes | 7.2-rc3, rc4 | none | double frees introduced by 46800585ae04; 7.2-rc1 and rc2 have them |
+| cd053d788c3f, f1596ba3e6b3 | bundle grow fixes | 7.2-rc3, rc4 | none | double frees introduced by 46800585ae04; 7.2-rc1 to rc3 have at least one of them |
 
 From 7.2, a runtime that answers `-ENOBUFS` by re-arming after the next
 replenish would re-arm onto the same bad entry. That needs a bad address,
@@ -71,8 +71,8 @@ which only a runtime bug produces.
 `IORING_RECV_MULTISHOT` on `RECV` and `RECVMSG`: 6.0 (b3fdea6ecb55,
 9bb66906f23e). `IORING_CQE_F_SOCK_NONEMPTY` and
 `IORING_RECVSEND_POLL_FIRST`: 5.19 (liburing man pages; unverified as to
-commit). Before 6.17 a multishot `RECV` requires buffer select and
-`sqe->len == 0`, and rejects `MSG_WAITALL`.
+commit). A multishot `RECV` requires buffer select and rejects
+`MSG_WAITALL`; before 6.17 it also requires `sqe->len == 0`.
 
 An empty ring ends the arm with `-ENOBUFS` and no `F_MORE` on every kernel
 from 6.0 to 7.3-rc6.

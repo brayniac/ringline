@@ -66,9 +66,11 @@ so the order connections were re-armed in was arbitrary. With the
 64 KiB) left 3,000 or more connections unanswered, all of them accepted.
 
 #657 re-arms parked connections oldest first, at most one per free buffer.
-Its first commit counted each re-arm against the budget twice; the second
-fixes that. With the first commit, 10 runs per kernel and cell (5 boots, two
-identical copies of the configuration per boot), 80 runs in all:
+Its first commit gave each pass between two waits a full budget, so up to
+twice as many re-arms as free buffers reached the kernel; a later commit
+(e1cf14d) shares one budget across those passes. With the first commit,
+10 runs per kernel and cell (5 boots, two identical copies of the
+configuration per boot), 80 runs in all:
 
 | Cell, 256 × 16 KiB ring | Before | After |
 |---|---|---|
@@ -111,38 +113,41 @@ the connections opened, `accept_backlog_dropped` 0).
 
 At 256 B and 4 KiB the pattern is tied to ring exhaustion more cleanly. At
 256 B × 16,384, the two 4,096-entry configurations either never emptied the
-ring (about 158k req/s, p99 about 0.1 s) or emptied it 3.4M–4.8M times
-(108k–119k req/s, p99 0.6–1.6 s), in the same configuration across runs.
+ring (two runs on 7.1, about 158k req/s, p99 about 0.1 s) or emptied it
+3.4M–4.8M times (108k–119k req/s, p99 0.6–1.6 s), in the same configuration
+across runs.
 Three runs in the second regime left 60, 89 and 1,481 connections
 unanswered, all accepted. Configurations that never emptied the ring left
 nobody unanswered except through classes 1 and 2.
 
 At 64 KiB the link is weaker: m4-b64k emptied the ring 0.5M times in both
-of its runs and left 0 and 4,004 connections unanswered. A connection that
-misses its first re-arms appears to stay out for the rest of the run. These
-runs used #657's first commit; whether the final version still starves at
-16,384 connections is measured by phase d (pending, below).
+of its runs and left 0 and 4,004 connections unanswered. These runs used
+#657's first commit; whether the final version still starves at 16,384
+connections is measured by phase d (pending, below).
 
 ### Ring geometry
 
 From phase r, 2 workers, at a fixed memory budget per worker:
 
 - Up to 4 KiB messages, entries per connection decide. m64-b4k (16,384
-  entries per worker, two per connection at 16,384 connections) never
-  emptied the ring and matched the incremental ring: 127.6k against 127.8k
-  req/s at 256 B on 6.12.
-- At 64 KiB and above, buffer size decides. 64 KiB buffers came within
-  about 10% of the incremental ring at 64 KiB, with about a fifth of its
-  memory at 16,384 connections. 4 KiB buffers cost 16 completions per
+  entries per worker, two per connection at 16,384 connections) emptied the
+  ring at most about 21,000 times per run. At 256 B it matched the
+  incremental ring on 6.12 (127.6k against 127.8k req/s) and ran 25% slower
+  on 7.1 (118k against 158k).
+- At 64 KiB and above, buffer size decides. m64-b64k came within about 10%
+  of the incremental ring at 64 KiB × 16,384, with about a fifth of its
+  memory, but left 233 and 1,916 connections unanswered in its two runs on
+  6.12; m4-b64k ran 30% slower. 4 KiB buffers cost 16 completions per
   message: m64-b4k ran 7.3k req/s at 64 KiB × 16,384 against 23.3k.
 - No fixed geometry was best at every message size.
-- At 1 MiB × 16,384 every configuration left most connections unanswered,
-  the incremental ring included. Throughput was 0.6k–1.1k req/s, under one
-  response per connection in 12 s even if shared evenly, so that cell is too
-  short to judge.
-- At 16,384 connections the same configuration varied by up to 1.5× in
-  throughput between runs when it emptied the ring (4 KiB on 7.1: m4-b16k
-  71k and 111k). Configurations that did not empty it varied by under 10%.
+- At 1 MiB × 16,384 every configuration left 36–99% of connections
+  unanswered, the incremental ring included. Throughput was 11–1,238 req/s,
+  under one response per connection in 12 s even if shared evenly, so that
+  cell is too short to judge.
+- At 16,384 connections the same configuration varied by up to 1.8× in
+  throughput between runs when it emptied the ring (256 B on 7.1: m16-b16k
+  89k and 163k). Configurations that rarely emptied it varied by at most
+  12%.
 
 ### Incremental ring memory
 
@@ -154,38 +159,51 @@ worker.
 
 With `recv_incremental` a completion is lent only while at most half the
 ring's buffers have a hold (`Driver::may_lend`, 32 of 64). A forward holds
-its buffer until the send completes, so above about 32 forwards in flight
-per worker every arrival is refused a lend and copied into the connection's
-accumulator. `forward_recv_buf` then sends the whole accumulator zero-copy
-(`take_frozen` under an `AccumulatorGuard`), and the copy stays allocated
-until the zero-copy notification. Each active connection then holds one to
-two messages on the heap. Nothing bounds the total except
-`recv_accumulator_max` per connection (1 GiB by default).
+its buffer until the send completes, so once more than 32 of the 64 buffers
+hold a lend, every arrival is refused a lend and copied into the
+connection's accumulator. An incremental completion can be a whole message,
+so the copy is a whole message. `forward_recv_buf` then sends the whole
+accumulator zero-copy (`take_frozen` under an `AccumulatorGuard`), and the
+copy stays allocated until the zero-copy notification. Each active
+connection then holds one to two messages on the heap. Nothing bounds the
+total except `recv_accumulator_max` per connection (1 GiB by default).
 
-Measured locally (one worker, Linux 7.2, arm64, loopback):
+A plain ring copies too: on the `with_data` path a completion is held in
+place only when the accumulator is empty and no other buffer is held, and is
+appended to the accumulator otherwise. There the copy is at most one buffer,
+and it happens only when a second completion arrives before the task has
+taken the first. In the local runs below, the 1024 × 64 KiB ring forwarded
+84% of completions at 1 MiB × 512 straight from ring buffers and sent no
+accumulator zero-copy; the incremental ring forwarded 22% from ring buffers
+and sent 25% as zero-copy accumulators.
+
+Measured locally (one worker, Linux 7.2, arm64, loopback). The build was
+#657's branch at 68fed94 with an experimental accumulator patch; in two of
+the incremental runs per cell its shrink-on-drain switch was on, which did
+not change the result:
 
 | Cell | Lends refused | Peak RSS |
 |---|---|---|
-| 256 × 16 KiB ring, 64 KiB × 2,048 and 1 MiB × 512 | 0 | 151 MiB |
-| incremental, 64 KiB × 2,048, three runs | 0 | 151 MiB |
-| incremental, 64 KiB × 2,048, one run | 1,637 | 251 MiB |
-| incremental, 1 MiB × 512, four runs | 10,591–32,055 | 862–920 MiB |
+| 1024 × 64 KiB ring, 64 KiB × 2,048 and 1 MiB × 512 | 0 | 147 MiB |
+| incremental, 64 KiB × 2,048, three runs | 0 | 147 MiB |
+| incremental, 64 KiB × 2,048, one run | 1,637 | 246 MiB |
+| incremental, 1 MiB × 512, four runs | 10,591–32,055 | 841–899 MiB |
 
 RSS rose only in runs that refused lends. On the rig, the cells where it
 grew are the cells that refused lends; the 4 KiB × 16,384 cell refused
-44k–76k lends with flat RSS, because each copy there is 4 KiB.
+30k–76k lends with RSS at 295–326 MiB, because each copy there is 4 KiB.
 
 The memory also stays after the connections close. After every connection
-of a 1 MiB × 512 run closed, RSS was 888 MiB. Accumulators are reset when a
-slot is reused (`install_accepted_with_pending`), not when a connection
-closes, so each closed slot keeps its allocation. Freeing the accumulator at
-close (an experimental patch) brought RSS after close to 344 MiB. The rest
+of a 1 MiB × 512 run closed, RSS was 868 MiB. `RecvAccumulator::reset`
+clears an accumulator but keeps its allocation, and it runs only when a
+slot is reused (`install_accepted_with_pending`), so every slot keeps the
+largest buffer it grew. An experimental patch that drops the allocation in
+`reset` and calls it at close brought RSS after close to 336 MiB. The rest
 is glibc's arenas: with `MALLOC_MMAP_THRESHOLD_=131072` as well, it was
-181 MiB.
+177 MiB.
 
-The fixed rings never refuse a lend (they have no lend cap). When they run
-out, the receive gets `ENOBUFS`, the connection parks, and TCP holds the
-bytes in the socket.
+The fixed rings have no lend cap. When they run out, the receive gets
+`ENOBUFS`, the connection parks, and TCP holds the bytes in the socket.
 
 ### Test artifacts found on the way
 
@@ -193,11 +211,12 @@ bytes in the socket.
   `EADDRNOTAVAIL` on the load generator. The load generator closes first, so
   it holds the TIME_WAIT sockets (checked on loopback: 2,001 TIME_WAIT
   sockets on the load generator's side, none on the server's). The phase r
-  and phase d specs do not set `tcp_tw_reuse`, and Debian's default (2)
+  and phase d specs do not set `tcp_tw_reuse`, and the kernel's default (2)
   reuses only on loopback. Four configurations of 16,386 connections in a
-  row need 65,544 ports against 64,512 in `ip_local_port_range`, 1,032
-  short, which matches the failures; they fell on every fourth
-  configuration in a boot. Runs at 10,000 connections are not affected.
+  row need 65,544 ports against the 64,512 in the range the specs set
+  (`ip_local_port_range` 1024–65535), 1,032 short, which matches the
+  failures; they fell on every fourth configuration in a boot. Runs at
+  10,000 connections are not affected.
 - A connection the server never accepted, or that the acceptor closed, looks
   the same to the load generator as a starved one. Check `accepted` and
   `accept_backlog_dropped` before attributing an unanswered connection to
@@ -220,10 +239,11 @@ bytes in the socket.
   connections, and in which state are they (parked, armed with no buffer,
   or something else)?
 - Why does starvation at 64 KiB not track the number of times the ring
-  emptied?
+  emptied? One hypothesis, untested: a connection that misses its first
+  re-arms stays out for the rest of the run.
 - Should a refused lend copy at all, or should the receive wait for a buffer
-  instead, as the fixed rings do? A copy keeps the connection moving at the
-  cost of unbounded memory; waiting bounds memory at the cost of the
-  connection's latency.
+  instead, as the fixed rings do when they run out? A copy keeps the
+  connection moving at the cost of unbounded memory; waiting bounds memory
+  at the cost of the connection's latency.
 - Phase r ran one or two runs per cell, which cannot rank the fixed rings
   against each other at 16,384 connections.
