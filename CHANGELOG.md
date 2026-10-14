@@ -422,8 +422,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   measurement window of a benchmark run. When any buffer was free, each pass
   re-armed every connection parked on `ENOBUFS`; most re-arms got `ENOBUFS`
   again, and the order of the parked list decided which connections were
-  re-armed first. A pass now re-arms parked connections oldest first, at most
-  one per free buffer, and a connection that parks again goes to the back.
+  re-armed first. Parked connections are now re-armed oldest first, at most
+  one per free buffer across the passes between two waits for completions,
+  and a connection that parks again goes to the back.
   Measured on loopback with one worker, 10,000 closed-loop connections, the
   default one-shot receive, a handler that echoes with `with_data` and
   `forward_recv_buf`, and a 256 × 16 KiB ring, 4 runs each: at 64 KiB per
