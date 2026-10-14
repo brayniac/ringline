@@ -394,7 +394,9 @@ mod ringline_client {
 
     /// Shared state passed into ringline worker tasks.
     pub struct ClientState {
-        pub target: std::net::SocketAddr,
+        /// Server addresses; connections take them in turn
+        /// ([`ClientState::next_target`]).
+        pub targets: Vec<std::net::SocketAddr>,
         pub msg_size: usize,
         /// Total client connections (used to split the aggregate open-loop rate).
         pub num_clients: usize,
@@ -497,6 +499,17 @@ mod ringline_client {
         }
     }
 
+    impl ClientState {
+        /// The address for the next connection: `targets` in turn, so that
+        /// with several server ports each port takes an equal share and the
+        /// connection count is not limited to one port's source-port range.
+        pub fn next_target(&self) -> std::net::SocketAddr {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let i = NEXT.fetch_add(1, Ordering::Relaxed);
+            self.targets[i % self.targets.len()]
+        }
+    }
+
     static GLOBAL_STATE: Mutex<Option<Arc<ClientState>>> = Mutex::new(None);
 
     /// Send pool slots per client worker. A connection holds a slot for each
@@ -507,7 +520,7 @@ mod ringline_client {
     async fn run_ringline_client(state: Arc<ClientState>) {
         let msg_size = state.msg_size;
 
-        let conn = match connect(state.target).await {
+        let conn = match connect(state.next_target()).await {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("  ringline client connect failed: {e}");
@@ -572,7 +585,7 @@ mod ringline_client {
     /// wake targets the owning task), and a separate spawned task is the
     /// *sender* (fire-and-forget `send_nowait`, never awaits recv).
     async fn run_ringline_open_client(state: Arc<ClientState>, ol: OpenLoop) {
-        let conn = match ringline::connect(state.target).await {
+        let conn = match ringline::connect(state.next_target()).await {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("  ringline client connect failed: {e}");
@@ -887,7 +900,7 @@ mod ringline_client {
         fn dropping_a_live_connection_marks_its_slot_closed() {
             let ctl = Arc::new(LiveCtl::new(1000, 2));
             let state = Arc::new(ClientState {
-                target: "127.0.0.1:1".parse().unwrap(),
+                targets: vec!["127.0.0.1:1".parse().unwrap()],
                 msg_size: 1,
                 num_clients: 2,
                 depth: 1,
@@ -918,14 +931,31 @@ mod ringline_client {
 
 // ── Shared ─────────────────────────────────────────────────────────
 
+/// Parses `addr`: one `host:port`, or several separated by commas.
+/// Connections take the addresses in turn.
+pub fn parse_targets(addr: &str) -> Result<Vec<std::net::SocketAddr>, String> {
+    addr.split(',')
+        .map(|a| {
+            a.trim()
+                .parse()
+                .map_err(|e| format!("invalid addr {a}: {e}"))
+        })
+        .collect()
+}
+
 fn wait_for_server(addr: &str) {
-    for _ in 0..100 {
-        if std::net::TcpStream::connect(addr).is_ok() {
-            return;
+    for a in addr.split(',') {
+        let a = a.trim();
+        let mut up = false;
+        for _ in 0..100 {
+            if std::net::TcpStream::connect(a).is_ok() {
+                up = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
         }
-        std::thread::sleep(Duration::from_millis(50));
+        assert!(up, "server did not start on {a}");
     }
-    panic!("server did not start on {addr}");
 }
 
 /// Run a benchmark against a server already listening on `addr`.
@@ -1007,9 +1037,10 @@ fn run_bench_tokio(
     let svc = Arc::new(Mutex::new(Vec::new()));
     let lag = Arc::new(Mutex::new(Vec::new()));
 
+    let targets: Vec<&str> = addr.split(',').map(str::trim).collect();
     let mut task_handles = Vec::with_capacity(num_clients);
-    for _ in 0..num_clients {
-        let addr = addr.to_string();
+    for i in 0..num_clients {
+        let addr = targets[i % targets.len()].to_string();
         let stop = stop.clone();
         let ops = ops.clone();
         if let Some(o) = open {
@@ -1126,7 +1157,7 @@ fn run_bench_ringline(
     let measure = Arc::new(AtomicBool::new(false));
 
     let state = Arc::new(ringline_client::ClientState {
-        target: addr.parse().expect("invalid addr for ringline client"),
+        targets: parse_targets(addr).expect("invalid addr for ringline client"),
         msg_size,
         num_clients,
         depth,
@@ -1248,9 +1279,7 @@ impl LiveOpenLoop {
         let ctl = Arc::new(LiveCtl::new(rate, num_clients));
         let stop = Arc::new(AtomicBool::new(false));
         let state = Arc::new(ringline_client::ClientState {
-            target: addr
-                .parse()
-                .map_err(|e| format!("invalid addr {addr}: {e}"))?,
+            targets: parse_targets(addr)?,
             msg_size,
             num_clients,
             depth: 1,

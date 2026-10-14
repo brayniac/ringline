@@ -78,6 +78,10 @@ struct EchoCfg {
     send_slab_slots: u16,
     /// Simulated per-request application work, microseconds.
     service_time_us: u64,
+    /// Listeners on `addr`'s port and the `listen_ports - 1` ports after it.
+    listen_ports: u16,
+    /// Connections per worker; also the timer slots per worker.
+    max_connections: u32,
 }
 
 /// Simulated per-request application work, nanoseconds. Same reason as
@@ -286,6 +290,20 @@ struct Args {
     #[arg(long, default_value_t = 512)]
     send_slab_slots: u16,
 
+    /// (ringline echo only) Listen on `--addr`'s port and the N - 1 ports
+    /// after it. A client connecting from one address gets at most one
+    /// source port per connection to each destination port, about 64,500
+    /// with `ip_local_port_range` at 1024-65535, so more connections than
+    /// that need more than one server port.
+    #[arg(long, default_value_t = 1)]
+    listen_ports: u16,
+
+    /// (ringline echo only) Connections each worker accepts
+    /// (`ConfigBuilder::max_connections`), and its timer slots: a forward
+    /// echo connection holds one while it waits to retry a forward.
+    #[arg(long, default_value_t = 16384)]
+    max_connections: u32,
+
     /// Simulated per-request application work in MICROSECONDS, burned as a busy
     /// spin before each response.
     ///
@@ -433,7 +451,7 @@ struct Args {
 /// Established TCP connections whose local port is `port`, from
 /// /proc/net/tcp and /proc/net/tcp6. A file that cannot be read counts as
 /// none.
-fn established_on_port(port: u16) -> usize {
+fn established_on_ports(ports: &std::ops::RangeInclusive<u16>) -> usize {
     const ESTABLISHED: &str = "01";
     let mut n = 0;
     for path in ["/proc/net/tcp", "/proc/net/tcp6"] {
@@ -450,7 +468,7 @@ fn established_on_port(port: u16) -> usize {
             let local_port = local
                 .rsplit_once(':')
                 .and_then(|(_, p)| u16::from_str_radix(p, 16).ok());
-            if state == ESTABLISHED && local_port == Some(port) {
+            if state == ESTABLISHED && local_port.is_some_and(|p| ports.contains(&p)) {
                 n += 1;
             }
         }
@@ -459,7 +477,7 @@ fn established_on_port(port: u16) -> usize {
 }
 
 /// Starts the thread behind `--exit-when-idle` and `--exit-after`.
-fn spawn_exit_watch(port: u16, idle_secs: u64, after_secs: u64) {
+fn spawn_exit_watch(ports: std::ops::RangeInclusive<u16>, idle_secs: u64, after_secs: u64) {
     if idle_secs == 0 && after_secs == 0 {
         return;
     }
@@ -472,7 +490,7 @@ fn spawn_exit_watch(port: u16, idle_secs: u64, after_secs: u64) {
             let reason = if after_secs > 0 && start.elapsed().as_secs() >= after_secs {
                 Some(format!("--exit-after {after_secs} s reached"))
             } else if idle_secs > 0 {
-                let n = established_on_port(port);
+                let n = established_on_ports(&ports);
                 if n > 0 {
                     seen = true;
                     idle_since = None;
@@ -635,13 +653,42 @@ fn main() {
         eprintln!("bench-server: --send-slab-slots applies to the ringline echo server only");
         std::process::exit(2);
     }
+    if (args.listen_ports != 1 || args.max_connections != 16384)
+        && (runtime != Runtime::Ringline || args.proxy_backend.is_some())
+    {
+        eprintln!(
+            "bench-server: --listen-ports and --max-connections apply to the ringline echo server only"
+        );
+        std::process::exit(2);
+    }
+    if args.listen_ports == 0
+        || (args.listen_ports > 1 && args.addr.port() == 0)
+        || u32::from(args.addr.port()) + u32::from(args.listen_ports) > 65536
+    {
+        eprintln!(
+            "bench-server: --listen-ports must be at least 1, needs a fixed port above 1, \
+             and must end at port 65535 or below"
+        );
+        std::process::exit(2);
+    }
 
     eprintln!(
-        "bench-server: {} runtime, {} workers, listening on {}",
-        runtime_name, workers, args.addr,
+        "bench-server: {} runtime, {} workers, listening on {}{}",
+        runtime_name,
+        workers,
+        args.addr,
+        if args.listen_ports > 1 {
+            format!(" and the next {} ports", args.listen_ports - 1)
+        } else {
+            String::new()
+        },
     );
 
-    spawn_exit_watch(args.addr.port(), args.exit_when_idle, args.exit_after);
+    spawn_exit_watch(
+        args.addr.port()..=args.addr.port() + (args.listen_ports - 1),
+        args.exit_when_idle,
+        args.exit_after,
+    );
     if args.counters_interval_ms > 0 {
         let every = std::time::Duration::from_millis(args.counters_interval_ms);
         std::thread::spawn(move || {
@@ -693,6 +740,8 @@ fn main() {
             tick_timeout_us: args.tick_timeout_us,
             send_slab_slots: args.send_slab_slots,
             service_time_us: args.service_time_us,
+            listen_ports: args.listen_ports,
+            max_connections: args.max_connections,
         }),
         Runtime::Tokio => {
             use ringline_bench::servers::tokio_arms;
@@ -946,6 +995,8 @@ fn run_ringline(cfg: EchoCfg) {
         tick_timeout_us,
         send_slab_slots,
         service_time_us,
+        listen_ports,
+        max_connections,
     } = cfg;
     use ringline::ParseResult;
     use ringline::{AsyncEventHandler, RinglineBuilder};
@@ -1158,10 +1209,10 @@ fn run_ringline(cfg: EchoCfg) {
         .prefault_buffers(prefault_buffers)
         .recv_multishot(recv_multishot)
         .recv_incremental(recv_incremental)
-        .max_connections(16384)
+        .max_connections(max_connections)
         // A forward echo connection whose forward fails waits on a timer
         // between retries (`forward_echo_loop`); one slot per connection.
-        .timer_slots(16384)
+        .timer_slots(max_connections)
         .send_pool(512, msg_size.next_power_of_two().max(4096) as u32)
         .conn_chunk_size(conn_chunk_size)
         .accept_mode(accept_mode.into())
@@ -1198,7 +1249,9 @@ fn run_ringline(cfg: EchoCfg) {
     };
     let config = staged.build().expect("valid config");
 
-    let builder = RinglineBuilder::new(config).bind(addr);
+    let builder = (0..listen_ports).fold(RinglineBuilder::new(config), |b, i| {
+        b.bind(SocketAddr::new(addr.ip(), addr.port() + i))
+    });
     let (shutdown, handles) = match echo_mode {
         EchoMode::RecvForward => builder.launch::<RecvForwardEchoHandler>(),
         EchoMode::Forward => builder.launch::<ForwardEchoHandler>(),
