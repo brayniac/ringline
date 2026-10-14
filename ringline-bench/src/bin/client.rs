@@ -36,7 +36,9 @@ struct Args {
     #[arg(long)]
     runtime: Runtime,
 
-    /// Server address
+    /// Server address, or several separated by commas. Connections take
+    /// them in turn, so N ports on one host give N times the source ports
+    /// one client address has for a single destination.
     #[arg(long)]
     addr: String,
 
