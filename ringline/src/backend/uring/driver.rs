@@ -807,12 +807,30 @@ pub(crate) struct Driver {
     pub(crate) tls_out_scratch: Vec<crate::handler::BuiltSend>,
     /// Monotonic disk-I/O sequence (see DriverCtx::disk_io_key).
     pub(crate) next_disk_io_seq: u16,
-    /// Connections whose multishot recv hit ENOBUFS and is parked until
-    /// provided-ring buffers return. Re-arming immediately (the old
-    /// behavior) completed instantly with ENOBUFS again while data was
-    /// pending and the ring was empty — a 100% CPU spin until some task
-    /// released a bid.
-    pub(crate) recv_starved: Vec<u32>,
+    /// Connections waiting for `flush_replenish_and_rearm` to re-arm their
+    /// recv, oldest first: those whose recv completed with ENOBUFS, and
+    /// those whose fallback recv completed or was cancelled. Re-arming on
+    /// ENOBUFS immediately completes with ENOBUFS again while data is pending
+    /// and the ring is empty, a 100% CPU spin until some task releases a bid.
+    pub(crate) recv_starved: super::parked::ParkedConns,
+    /// Set when a pass of `flush_replenish_and_rearm` that started with a
+    /// free buffer used all its re-arms while a connection it would have
+    /// re-armed was still parked. The event loop does not block while it is
+    /// set, so the next pass runs even if none of the re-armed recvs
+    /// completes.
+    pub(crate) rearm_deferred: bool,
+    /// Re-arms `flush_replenish_and_rearm` has issued since the run loop's
+    /// last `submit_and_wait` or `submit_and_get_events`, which reset it.
+    /// Each pass subtracts it from its budget, so the passes between two of
+    /// those calls (after each of the two drains, then before the next wait)
+    /// share one budget of one re-arm per free buffer.
+    ///
+    /// A re-arm whose recv completed in the drain after the mid-iteration
+    /// `flush()`, and whose buffer is still held (a `forward_recv_buf` or
+    /// zero-copy hold), is counted both here and in the lower `free()`.
+    /// Resetting at each reap instead, which counts each re-arm once,
+    /// measured worse tail latency (#657).
+    pub(crate) rearms_since_wait: u32,
     /// Lifetime count of ENOBUFS parks on this worker (pushes onto
     /// `recv_starved`). Reported in the shutdown diag line; sustained
     /// growth means responses exceed the provided ring and receive
@@ -1407,7 +1425,9 @@ impl Driver {
             close_notify_timeout: std::time::Duration::from_millis(config.close_notify_timeout_ms),
             tls_out_scratch: Vec::new(),
             next_disk_io_seq: 0,
-            recv_starved: Vec::new(),
+            recv_starved: super::parked::ParkedConns::new(),
+            rearm_deferred: false,
+            rearms_since_wait: 0,
             recv_park_count: 0,
             recv_fallback_inflight: vec![false; config.max_connections as usize],
             fallback_recv_pool: None,
