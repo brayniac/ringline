@@ -114,9 +114,10 @@ impl Drop for DriverStateGuard {
 // The connection whose reader callback is running on this thread, if any.
 //
 // `offer_for_park` declines an offer made from inside a reader callback.
-// `with_bytes`, and a `with_data` callback that calls `forward_recv_buf`, have
-// already taken the request out of the driver, where `holds_unread` cannot see
-// it (#669).
+// `with_bytes` takes the request out of the driver before its callback runs,
+// and so does a `forward_recv_buf` that sends the whole lent buffer or the
+// whole accumulator. `holds_unread` cannot see a request taken out this way
+// (#669).
 #[cfg(has_io_uring)]
 thread_local! {
     static READER_CALLBACK_CONN: std::cell::Cell<Option<u32>> =
@@ -1154,8 +1155,9 @@ impl ConnCtx {
     /// handler offers is therefore never parked. Only the innermost
     /// running callback is detected. An offer for connection A made from
     /// inside a callback on connection B, itself inside A's callback, is
-    /// declined only while the runtime still holds A's bytes, which it does
-    /// not in a `with_bytes` callback or after `forward_recv_buf`.
+    /// declined only while the runtime still holds A's bytes. It does not
+    /// hold them in a `with_bytes` callback, or after a `forward_recv_buf`
+    /// that sent the whole lent buffer or the whole accumulator.
     /// `metrics::park_diag::OFFER_DECLINED` counts ignored offers.
     ///
     /// The runtime does not see bytes the handler has taken into its own
@@ -1163,9 +1165,10 @@ impl ConnCtx {
     /// `Bytes` kept from `with_bytes`, or requests the handler has queued. Do
     /// not offer while holding any.
     ///
-    /// Park also requires Linux 6.8 (`IORING_OP_FIXED_FD_INSTALL`) and the
-    /// io_uring backend. On mio this does nothing; on io_uring below 6.8
-    /// the offer is recorded and never acted on.
+    /// Park also requires the io_uring backend and a kernel with
+    /// `IORING_OP_FIXED_FD_INSTALL` (mainline 6.8). On mio this does
+    /// nothing; on io_uring without that operation the offer is recorded
+    /// and never acted on.
     pub fn offer_for_park(&self, state: Option<crate::park::ParkState>) {
         let _ = try_with_state(|driver, _| {
             #[cfg(has_io_uring)]

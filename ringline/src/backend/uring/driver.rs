@@ -2379,10 +2379,10 @@ impl Driver {
     /// (`ConnCtx::offer_for_park`). Returns whether the offer stands.
     ///
     /// The offer is declined, and any earlier offer and deposit cleared,
-    /// while the connection holds unread bytes, or when it comes from inside
-    /// one of the connection's reader callbacks. In both cases the handler
-    /// has a request it has not answered, so it is not at an idle point
-    /// (#669). An offer that stands therefore means the driver held no unread
+    /// while the connection holds unread bytes, or while the connection's
+    /// reader callback is the innermost one running on this thread. Either
+    /// way the handler may be partway through a request, so it is not at an
+    /// idle point (#669). An offer that stands therefore means the driver held no unread
     /// bytes when it was made, and arriving bytes withdraw it
     /// (`withdraw_park_offer`).
     pub(crate) fn offer_park(

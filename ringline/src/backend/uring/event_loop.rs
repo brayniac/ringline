@@ -6766,6 +6766,11 @@ mod tests {
                 el.driver.accumulators.append(conn_index, b"GET y");
             }
 
+            // Set a standing offer directly, so the assertions below need
+            // `offer_for_park` to clear it.
+            el.driver.park_offered[idx] = true;
+            el.driver.park_carry.insert(conn_index, ParkState::new(0u8));
+
             // The handler finishes response 1 and offers, through the public
             // handle.
             let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
@@ -6826,6 +6831,11 @@ mod tests {
             } else {
                 el.driver.accumulators.append(conn_index, data);
             }
+
+            // A standing offer that only `offer_for_park` reaching
+            // `offer_park` clears.
+            el.driver.park_offered[conn_index as usize] = true;
+            el.driver.park_carry.insert(conn_index, ParkState::new(0u8));
 
             let ctx = ConnCtx::new(conn_index, generation);
             let waker = noop_waker();
@@ -6905,6 +6915,10 @@ mod tests {
         let conn_b = accept_connection(&mut el);
         el.driver.accumulators.append(conn_a, b"GET a");
         el.driver.accumulators.append(conn_b, b"GET b");
+        // A standing offer that only `offer_for_park` reaching `offer_park`
+        // clears.
+        el.driver.park_offered[conn_a as usize] = true;
+        el.driver.park_carry.insert(conn_a, ParkState::new(0u8));
         let ctx_a = ConnCtx::new(conn_a, el.driver.connections.generation(conn_a));
         let ctx_b = ConnCtx::new(conn_b, el.driver.connections.generation(conn_b));
         let waker = noop_waker();
@@ -6939,13 +6953,14 @@ mod tests {
         assert!(!el.driver.park_carry.contains_key(&conn_index));
     }
 
-    /// The other half of `offer_park`: at an idle point the offer stands and
-    /// its state is deposited.
+    /// The other half of `offer_park`: at an idle point an offer made
+    /// through the public handle stands and its state is deposited.
     #[test]
     fn an_offer_at_an_idle_point_stands() {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
-        assert!(el.driver.offer_park(conn_index, Some(ParkState::new(2u8))));
+        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        with_driver_state(&mut el, || ctx.offer_for_park(Some(ParkState::new(2u8))));
         assert!(el.driver.park_offered[conn_index as usize]);
         assert!(el.driver.park_carry.contains_key(&conn_index));
         assert_eq!(el.driver.park_blocker(conn_index), None);

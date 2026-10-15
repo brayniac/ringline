@@ -165,14 +165,11 @@ pub mod park_drain_us {
     }
 }
 
-/// Why suppressing the `ECANCELED` re-arm did not stop offers being withdrawn.
+/// Park diagnostic counters.
 ///
-/// Suppressing the re-arm left `not_offered` at 95.2% of abandonments, unchanged
-/// (`docs/journal/2026-09-two-phase-park.md`). The first four answer the question the
-/// abandonment counters cannot: whether the cancel is submitted at all, whether
-/// the suppression fires, and whether data still reaches the connection while it
-/// is supposed to be draining. Between them there is only one consistent story,
-/// which is the point — six hypotheses have already died here.
+/// The first four show whether `begin_park` submits the recv cancel, whether
+/// the `ECANCELED` re-arm suppression fires, and whether data reaches a
+/// connection while it drains (`docs/journal/2026-09-two-phase-park.md`).
 ///
 /// `OFFER_DECLINED` counts `offer_for_park` calls declined because bytes were
 /// unread or a reader callback was running (#669).
