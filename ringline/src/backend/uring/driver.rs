@@ -565,7 +565,7 @@ pub(crate) struct Driver {
     /// means a new request began and the quiescent point the handler offered
     /// at is gone — so the handler never has to remember to revoke. Set only
     /// through `offer_park`, which declines while bytes are unread or from
-    /// inside a reader callback.
+    /// inside the connection's innermost running reader callback.
     pub(crate) park_offered: Vec<bool>,
     /// Per connection: a park cancelled this connection's multishot recv and is
     /// waiting for the handler to come back to a quiescent point.
@@ -2381,8 +2381,8 @@ impl Driver {
     /// The offer is declined, and any earlier offer and deposit cleared,
     /// while the connection holds unread bytes, or while the connection's
     /// reader callback is the innermost one running on this thread. Either
-    /// way the handler may be partway through a request, so it is not at an
-    /// idle point (#669). An offer that stands therefore means the driver held no unread
+    /// way the handler may be partway through a request, so the offer is not
+    /// treated as made at an idle point (#669). An offer that stands therefore means the driver held no unread
     /// bytes when it was made, and arriving bytes withdraw it
     /// (`withdraw_park_offer`).
     pub(crate) fn offer_park(

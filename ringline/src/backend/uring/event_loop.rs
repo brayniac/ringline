@@ -6796,20 +6796,24 @@ mod tests {
         }
     }
 
-    /// An offer made from inside a reader callback is declined, whichever
-    /// reader and wherever the bytes sat. `with_bytes`, and `with_data` after
-    /// `forward_recv_buf`, take the bytes out of the driver before the offer,
-    /// so only the callback guard catches those cases; the plain `with_data`
-    /// and `try_with_data` cases are also caught by `holds_unread` (#669).
+    /// An offer made from inside a `with_data`, `with_bytes` or
+    /// `try_with_data` callback is declined, with the request lent or
+    /// accumulated. `with_bytes`, and a `forward_recv_buf` of the whole lent
+    /// buffer or accumulator, take the bytes out of the driver before the
+    /// offer, so only the callback guard catches those cases; the plain
+    /// `with_data` and `try_with_data` cases are also caught by
+    /// `holds_unread` (#669).
     #[test]
     fn an_offer_from_inside_a_reader_callback_is_declined() {
         for (reader, lent) in [
             ("with_data", false),
             ("with_data", true),
             ("with_data_forward", true),
+            ("with_data_forward", false),
             ("with_bytes", false),
             ("with_bytes", true),
             ("try_with_data", false),
+            ("try_with_data_forward", false),
         ] {
             let mut el = make_test_loop();
             let conn_index = accept_connection(&mut el);
@@ -6875,8 +6879,12 @@ mod tests {
                     })
                 }
                 _ => {
+                    let forward = reader == "try_with_data_forward";
                     let r = with_driver_state(&mut el, || {
                         ctx.try_with_data(|d| {
+                            if forward {
+                                ctx.forward_recv_buf(d).expect("forward");
+                            }
                             ctx.offer_for_park(Some(ParkState::new(3u8)));
                             crate::runtime::io::ParseResult::Consumed(d.len())
                         })

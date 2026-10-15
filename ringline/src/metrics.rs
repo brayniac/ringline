@@ -168,8 +168,9 @@ pub mod park_drain_us {
 /// Park diagnostic counters.
 ///
 /// The first four show whether `begin_park` submits the recv cancel, whether
-/// the `ECANCELED` re-arm suppression fires, and whether data reaches a
-/// connection while it drains (`docs/journal/2026-09-two-phase-park.md`).
+/// the `ECANCELED` re-arm suppression fires, and whether an arrival withdraws
+/// an offer while the connection drains
+/// (`docs/journal/2026-09-two-phase-park.md`).
 ///
 /// `OFFER_DECLINED` counts `offer_for_park` calls declined because bytes were
 /// unread or a reader callback was running (#669).
