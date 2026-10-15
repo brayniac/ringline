@@ -1069,8 +1069,9 @@ fn arrival_mark(driver: &Driver, conn_index: u32) -> usize {
 
 /// Settle a reporting reader's resolving poll in the connection's arrival
 /// log. `before` is the poll's [`arrival_mark`]; `report` is false when the
-/// call resolved without reporting (end of stream, a close, or a hold
-/// overflow), which leaves `recv_arrival` at `None`.
+/// call resolved without reporting (nothing buffered for `try_with_data`, end
+/// of stream, a close, or a hold overflow), which leaves `recv_arrival` at
+/// `None`.
 fn arrival_settle(driver: &mut Driver, conn_index: u32, before: usize, report: bool) {
     #[cfg(not(ringline_no_arrival_log))]
     {

@@ -98,8 +98,8 @@ The log is cleared when a slot is set up for a connection: io_uring
 `handle_connect` (before its orphaned-future branch) and
 `install_accepted_with_pending` (before the record above), and mio accept. It
 is cleared at teardown by io_uring `handle_close` and mio `finish_close`,
-which also replace the deque with an empty, unallocated one. Mio `start_connect` reuses a slot that `finish_close`
-already cleared.
+which also replace the deque with an empty, unallocated one. Mio
+`start_connect` reuses a slot that `finish_close` already cleared.
 
 ## Which bytes a reader consumed
 
@@ -445,9 +445,12 @@ It is not part of this design.
   `recv_hold`.
 - Memory, fixed: about 96 bytes per connection slot (the deque header, four
   `u64`s and `latest`).
-- Allocation: one heap allocation per connection, at its first record, freed
-  at teardown. The A/B cells use long-lived connections and do not measure
-  it.
+- Allocation: the deque allocates at a connection's first record (capacity
+  4) and reallocates as it doubles, which happens when more than four
+  batches' entries are held at once, for example under a consumer that does
+  not report. A trim shrinks a deque above 256 to 64, and teardown frees it.
+  The A/B cells use long-lived connections and do not measure the first
+  allocation.
 - Memory, per worker: about 1.5 MB at the default `max_connections` of
   16,000.
 - Cache: one or two more per-connection cache lines touched per record and per
@@ -461,7 +464,8 @@ hv02 through SystemsLab, with the log compiled in (B) and compiled out (A) by
 a `ringline_no_arrival_log` `cfg`. The `cfg` is declared in `check-cfg` in
 `ringline/Cargo.toml`; only ringline references it. Build A compiles out the
 records, the `recv_buffered` sums that feed them and the lookups; the
-per-slot logs and the batch counter remain. In build A, `recv_arrival`
+per-slot logs, their clear at setup and release at teardown, and the batch
+counter remain. In build A, `recv_arrival`
 returns `None` and the client crates report `None`. The `cfg` is removed
 before merge if B is kept. The plan, fixed before running:
 
@@ -476,11 +480,13 @@ before merge if B is kept. The plan, fixed before running:
    tool builds against this branch.
 2. Closed-loop cells: 64 and 4,096 connections, `--depth` 1 and 16. The
    4,096-connection cells are where a per-connection cache miss would show.
-   The server runs fewer workers than the client has threads, so the client
-   is not the limit; each run checks that client CPU stays below 70%. The
+   The server runs fewer workers than the client has threads; each run checks
+   that client CPU stays below 70%, so the client is not the limit. The
    64-connection depth-1 cell may be limited by round-trip time rather than
-   server CPU, in which case its throughput does not show a per-operation
-   cost; its p99 and the open-loop CPU time per request do.
+   server CPU, in which case its throughput and p99 move by the added time
+   per operation as a share of the round trip, not of server CPU time, and a
+   small cost falls inside the A spread there; the open-loop CPU time per
+   request shows it.
    Statistics: throughput and p99 latency.
 3. Open-loop cells: 64 and 4,096 connections, `--open --rate` at half the
    median throughput of the five A closed-loop runs at depth 1 with that

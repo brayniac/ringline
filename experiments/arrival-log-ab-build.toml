@@ -36,11 +36,13 @@ cd /home/anvil
   git clone -q {repo} src && git -C src checkout -q {ref}
   cd src
   echo "== $(git log --oneline -1)"
-  # Separate target dirs: a RUSTFLAGS change rebuilds everything anyway, and
+  # Separate target dirs: a rustflags change rebuilds everything anyway, and
   # one dir per arm keeps a failed build from leaving the other arm's binary
   # in place under this arm's name.
-  # `--config build.rustflags` adds to any rustflags in the image's cargo
-  # config; a RUSTFLAGS variable would replace them for arm A only.
+  # `--config build.rustflags` is appended to `build.rustflags` from cargo
+  # config files. Cargo ignores it when RUSTFLAGS, CARGO_ENCODED_RUSTFLAGS
+  # or a `target.*.rustflags` is set; the cmp check below then fails the
+  # build.
   CARGO_TARGET_DIR=/home/anvil/target-a \
     cargo build --locked --release --config 'build.rustflags=["--cfg","ringline_no_arrival_log"]' \
     -p ringline-bench --bin bench-server --bin bench-client || exit 1

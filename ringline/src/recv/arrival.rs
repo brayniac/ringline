@@ -12,8 +12,8 @@
 //!
 //! Building with `--cfg ringline_no_arrival_log` compiles out the records,
 //! the `recv_buffered` sums that feed them and the lookups, for measuring
-//! their cost; `recv_arrival` then returns `None`. The per-slot logs and the
-//! batch counter remain.
+//! their cost; `recv_arrival` then returns `None`. The per-slot logs, their
+//! clear at setup and release at teardown, and the batch counter remain.
 
 #![cfg_attr(ringline_no_arrival_log, allow(dead_code))]
 
@@ -192,8 +192,8 @@ impl ArrivalLog {
     /// Settle a reporting reader call. `before` and `after` are the
     /// connection's `buffered` count at the start of the call's resolving poll
     /// and once it has applied the parser's result. `report` is false for a
-    /// call that resolved without reporting (end of stream, a close, or a
-    /// hold overflow).
+    /// call that resolved without reporting (nothing buffered for
+    /// `try_with_data`, end of stream, a close, or a hold overflow).
     ///
     /// The bytes the call removed are `before - after`, starting at
     /// `delivered - before`. Their first and last times become `latest`, and
@@ -259,6 +259,8 @@ mod tests {
 
     /// A `RECV_ARRIVAL` slot's total. The counters are process-wide; nextest
     /// runs each test in its own process, and other tests only add to them.
+    /// Under `cargo test` a concurrent test's count can hide a missing
+    /// increment.
     fn counter(idx: usize) -> u64 {
         crate::metrics::RECV_ARRIVAL.value(idx).unwrap_or(0)
     }

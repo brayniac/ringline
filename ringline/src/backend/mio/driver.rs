@@ -305,6 +305,7 @@ impl Driver {
     /// Bytes the connection holds that no consumer has taken: the
     /// accumulator. The arrival log takes the first unread stream offset as
     /// `delivered - recv_buffered`.
+    #[cfg_attr(ringline_no_arrival_log, allow(dead_code))]
     pub(crate) fn recv_buffered(&self, conn_index: u32) -> usize {
         self.accumulators.len(conn_index)
     }
