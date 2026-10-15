@@ -276,8 +276,8 @@ becomes permanently unparkable either: the handler re-offers at its next idle
 point and the park happens then. Park is best-effort by construction.
 
 So the gate refuses while anything is unconsumed —
-accumulator, `recv_hold`, `segment_hold` or `segment_pinned`
-(`ParkBlocker::DataPending`). Stating it as a property of *state* rather than
+accumulator, a lent buffer in `pending_recv_bufs`, `recv_hold`,
+`segment_hold` or `segment_pinned` (`ParkBlocker::DataPending`). Stating it as a property of *state* rather than
 as a withdraw hook on each delivery path is deliberate: the review found two
 recv paths that delivered bytes without withdrawing the offer, and a
 state-based gate means the next one added fails closed instead. The refusals are the states where

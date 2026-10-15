@@ -392,13 +392,10 @@ while the accumulator is empty and the held buffer is the older data:
   keeps it held.
 
 `park_blocker` reports `DataPending` while `pending_recv_bufs[conn]` is
-`Some` (today it checks the accumulator, `segment_hold`, `recv_hold` and
-`segment_pinned`, `driver.rs`), and `take_pending_for_park` drains that
-slot as well, after the accumulator, since the held rest is the newer
-data. From step 1 a rest can stay held after a parse of the accumulator
-returns `Consumed(k)` (and, from the views step, after the fast path's);
-a connection offered for park then would otherwise be parked and its rest
-replenished uncopied (`event_loop.rs` park teardown).
+`Some`, and `take_pending_for_park` does not drain that slot. From step 1
+a rest can stay held after a parse of the accumulator returns
+`Consumed(k)` (and, from the views step, after the fast path's); the gate
+refuses such a connection until the handler reads the rest.
 
 A hold at an offset needs the data-address changes in "Changes in the
 driver" (`PendingRecvBuf`'s pointer and `handle_send_recv_buf`'s short-send

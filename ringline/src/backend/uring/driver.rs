@@ -2265,9 +2265,9 @@ impl Driver {
         }
     }
 
-    /// Drain everything this connection has received but not yet consumed
-    /// into owned bytes, in wire order, releasing every provided-buffer bid
-    /// back to the ring (tier 3, #443).
+    /// Drain the accumulator and the receive holds (`segment_pinned`,
+    /// `segment_hold`, `recv_hold`) into owned bytes, in wire order,
+    /// releasing each held bid back to the ring (tier 3, #443).
     ///
     /// **Normally returns nothing, and that is the intended state.**
     /// `park_blocker` refuses while any bytes are unconsumed
@@ -2275,7 +2275,9 @@ impl Driver {
     /// empty accumulator and empty holds. This stayed after that gate term
     /// was added because it is the one thing standing between a gap in the
     /// gate and silently discarding a peer's bytes: if anything does slip
-    /// through, the data travels rather than vanishing.
+    /// through, the data travels rather than vanishing. A lent buffer in
+    /// `pending_recv_bufs` is not carried; `park_blocker` refuses a
+    /// connection that has one.
     ///
     /// It supersedes the rule in #463 that held bids should be copied and
     /// carried rather than blocking a park. That reasoning was about the
@@ -2359,23 +2361,15 @@ impl Driver {
 
     /// The park gate (tier 3, #443). `None` means quiescent and movable.
     ///
-    /// Deliberately **not** blockers, because each would make park refuse
-    /// almost always or can be resolved without waiting:
+    /// `recv_half_taken` / `send_half_taken` are deliberately not blockers.
+    /// Since #427 the halves are the normal API and a typical handler holds
+    /// both for the connection's whole life. They are owned by the future,
+    /// which park drops, so they clear as part of the move rather than
+    /// blocking it.
     ///
-    /// - `recv_half_taken` / `send_half_taken`. Since #427 the halves are the
-    ///   normal API and a typical handler holds both for the connection's
-    ///   whole life. They are owned by the future, which park drops, so they
-    ///   clear as part of the move rather than blocking it.
-    /// - `recv_hold`, `segment_hold`, `segment_pinned`. These can hold
-    ///   `HeldRecvBuf::Pinned { bid, .. }`, a bid index into *this* worker's
-    ///   `ProvidedBufRing` that addresses a different ring on the target.
-    ///   Waiting for a reader to drain them would let a slow reader make a
-    ///   connection permanently unparkable, so the move copies them to `Owned`
-    ///   instead — bounded work that always succeeds. That conversion is the
-    ///   next step; this predicate only decides whether the connection is
-    ///   quiescent enough to attempt it.
-    /// - The accumulator and the TLS state, which are plain owned data and
-    ///   move as values (see the design doc's open questions 4 and 5).
+    /// Unread bytes block as `ParkBlocker::DataPending`: the accumulator, a
+    /// lent buffer in `pending_recv_bufs`, `segment_hold`, `recv_hold` and
+    /// `segment_pinned`.
     pub(crate) fn park_blocker(&self, conn_index: u32) -> Option<ParkBlocker> {
         let Some(conn) = self.connections.get(conn_index) else {
             return Some(ParkBlocker::NotOpen);
@@ -2424,6 +2418,7 @@ impl Driver {
         // the path that delivered them remembered to withdraw the offer. A
         // delivery path added later gets this for free.
         if !self.accumulators.is_empty(conn_index)
+            || self.pending_recv_bufs[conn_index as usize].is_some()
             || !self.segment_hold[conn_index as usize].is_empty()
             || !self.recv_hold[conn_index as usize].is_empty()
             || self.segment_pinned[conn_index as usize].is_some()

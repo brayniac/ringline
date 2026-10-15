@@ -2087,10 +2087,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// one-shot: the handler offers once when idle and never has to remember
     /// to revoke.
     ///
-    /// **Every path that delivers bytes to a connection must call this**. The
-    /// fallback recv path once did not. `park_blocker` carries a state-based
-    /// backstop (`ParkBlocker::DataPending`) for that reason, so a path added
-    /// later fails closed rather than parking mid-request.
+    /// **Every path that delivers bytes to a connection must call this**.
+    /// `park_blocker` also returns `ParkBlocker::DataPending` while bytes are
+    /// unconsumed, so a path that misses this call cannot park the connection
+    /// while those bytes are unread.
     fn withdraw_park_offer(&mut self, conn_index: u32) {
         let idx = conn_index as usize;
         // Read first: the common case is no offer, and a predictable branch
@@ -6084,6 +6084,17 @@ mod tests {
                     );
                 }),
             ),
+            (
+                "lent",
+                Box::new(|el: &mut AsyncEventLoop<NoopHandler>, c: u32| {
+                    el.driver.pending_recv_bufs[c as usize] =
+                        Some(crate::backend::uring::driver::PendingRecvBuf {
+                            bid: 3,
+                            len: 5,
+                            ptr: std::ptr::null(),
+                        });
+                }),
+            ),
         ] {
             let mut el = make_test_loop();
             let conn_index = accept_connection(&mut el);
@@ -6688,6 +6699,40 @@ mod tests {
         assert!(
             !el.driver.park_carry.contains_key(&conn_index),
             "and the state with it, or it would be carried at the wrong moment"
+        );
+    }
+
+    /// Bytes lent before the handler offers are unread when the offer is
+    /// made, so the arrival's withdrawal does not cover them. `park_blocker`
+    /// must refuse: `take_pending_for_park` does not carry a lent buffer, and
+    /// the close on this worker would replenish it.
+    #[test]
+    fn bytes_lent_before_the_offer_block_the_park() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+
+        let data = b"GET x";
+        let bid: u16 = 0;
+        let (buf_ptr, _) = el.driver.provided_bufs.get_buffer(bid);
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr as *mut u8, data.len());
+        }
+        let flags = 1u32 | 2u32 | ((bid as u32) << 16);
+        let ud = UserData::encode(OpTag::RecvMulti, conn_index, generation);
+        el.test_dispatch_cqe(ud.raw(), data.len() as i32, flags);
+        assert!(
+            el.driver.pending_recv_bufs[conn_index as usize].is_some(),
+            "precondition: the bytes are lent, not copied"
+        );
+
+        // The handler offers without reading the lent bytes.
+        el.driver.park_offered[conn_index as usize] = true;
+
+        assert_eq!(
+            el.driver.park_blocker(conn_index),
+            Some(ParkBlocker::DataPending),
+            "a lent buffer is unread data"
         );
     }
 
