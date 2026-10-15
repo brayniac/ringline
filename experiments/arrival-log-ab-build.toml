@@ -39,8 +39,11 @@ cd /home/anvil
   # Separate target dirs: a RUSTFLAGS change rebuilds everything anyway, and
   # one dir per arm keeps a failed build from leaving the other arm's binary
   # in place under this arm's name.
-  RUSTFLAGS="--cfg ringline_no_arrival_log" CARGO_TARGET_DIR=/home/anvil/target-a \
-    cargo build --locked --release -p ringline-bench --bin bench-server --bin bench-client || exit 1
+  # `--config build.rustflags` adds to any rustflags in the image's cargo
+  # config; a RUSTFLAGS variable would replace them for arm A only.
+  CARGO_TARGET_DIR=/home/anvil/target-a \
+    cargo build --locked --release --config 'build.rustflags=["--cfg","ringline_no_arrival_log"]' \
+    -p ringline-bench --bin bench-server --bin bench-client || exit 1
   cp /home/anvil/target-a/release/bench-server ../out/bench-server-a
   cp /home/anvil/target-a/release/bench-client ../out/bench-client-a
   CARGO_TARGET_DIR=/home/anvil/target-b \

@@ -1673,8 +1673,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.driver.pending_replenish.push(bid);
             // The feed's plaintext is recorded as the growth of
             // `recv_buffered`, all at this batch's time.
-            self.driver.arrival_trim_if_due(conn_index);
-            let buffered_before_feed = self.driver.recv_buffered(conn_index);
+            let buffered_before_feed = self.driver.arrival_feed_start(conn_index);
             {
                 // Route decrypted plaintext by recv domain. In the segmented
                 // domain, each drained plaintext chunk becomes an owned segment
@@ -1716,11 +1715,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     data,
                     &mut self.driver.tls_out_scratch,
                 );
-                let plaintext = self
-                    .driver
-                    .recv_buffered(conn_index)
-                    .saturating_sub(buffered_before_feed);
-                self.driver.arrival_add(conn_index, plaintext);
+                self.driver
+                    .arrival_feed_end(conn_index, buffered_before_feed);
 
                 // Route collected TLS output (handshake responses, alerts)
                 // through the per-connection send queue — including on the
@@ -14603,6 +14599,25 @@ mod tests {
         el.drain_completions();
         el.driver.record_arrival(conn_index, 1);
         assert_eq!(el.driver.arrival[idx].len(), 2);
+    }
+
+    /// A `try_with_data` that finds nothing buffered returns `None` and
+    /// clears the previous call's times.
+    #[test]
+    fn try_with_data_on_an_empty_connection_clears_the_arrival() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        el.driver.recv_batch.begin_at(Instant::now());
+        el.driver.record_arrival(conn_index, 2);
+        el.driver.accumulators.append(conn_index, b"a\n");
+        let (_, a) = read_line(&mut el, ctx);
+        assert!(a.is_some());
+        let r = with_driver_state(&mut el, || {
+            ctx.try_with_data(|_| crate::runtime::io::ParseResult::Consumed(1))
+        });
+        assert!(r.is_none(), "nothing is buffered");
+        assert!(with_driver_state(&mut el, || ctx.recv_arrival()).is_none());
     }
 
     /// A reader call that consumes nothing leaves `recv_arrival` at `None`.

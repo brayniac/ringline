@@ -10,8 +10,10 @@
 //! received bytes enter the connection, and supplies `buffered`, the bytes the
 //! connection holds that no consumer has taken.
 //!
-//! Building with `--cfg ringline_no_arrival_log` compiles the records and
-//! lookups out, for measuring their cost; `recv_arrival` then returns `None`.
+//! Building with `--cfg ringline_no_arrival_log` compiles out the records,
+//! the `recv_buffered` sums that feed them and the lookups, for measuring
+//! their cost; `recv_arrival` then returns `None`. The per-slot logs and the
+//! batch counter remain.
 
 #![cfg_attr(ringline_no_arrival_log, allow(dead_code))]
 
@@ -190,7 +192,8 @@ impl ArrivalLog {
     /// Settle a reporting reader call. `before` and `after` are the
     /// connection's `buffered` count at the start of the call's resolving poll
     /// and once it has applied the parser's result. `report` is false for a
-    /// call that resolved without consuming input (an EOF or a close).
+    /// call that resolved without reporting (end of stream, a close, or a
+    /// hold overflow).
     ///
     /// The bytes the call removed are `before - after`, starting at
     /// `delivered - before`. Their first and last times become `latest`, and
@@ -216,7 +219,7 @@ impl ArrivalLog {
 
     /// The arrival time of the byte at `offset`. An offset outside the log
     /// returns the nearest end's time and counts `CLAMPED`; an empty log
-    /// returns `None`.
+    /// returns `None` and counts `CLAMPED` too.
     fn time_at(&self, offset: u64) -> Option<Instant> {
         let (Some(oldest), Some(newest)) = (self.entries.front(), self.entries.back()) else {
             crate::metrics::RECV_ARRIVAL.increment(crate::metrics::recv_arrival::CLAMPED);
@@ -252,6 +255,12 @@ mod tests {
 
     fn t(base: Instant, ms: u64) -> Instant {
         base + Duration::from_millis(ms)
+    }
+
+    /// A `RECV_ARRIVAL` slot's total. The counters are process-wide; nextest
+    /// runs each test in its own process, and other tests only add to them.
+    fn counter(idx: usize) -> u64 {
+        crate::metrics::RECV_ARRIVAL.value(idx).unwrap_or(0)
     }
 
     #[test]
@@ -319,11 +328,14 @@ mod tests {
         let base = Instant::now();
         let mut clock = BatchClock::new();
         let mut log = ArrivalLog::default();
+        let merged_before = counter(crate::metrics::recv_arrival::MERGED);
         for i in 0..=MAX_ENTRIES as u64 {
             clock.begin_at(t(base, i));
             log.add(1, &mut clock);
         }
+        let merged_after = counter(crate::metrics::recv_arrival::MERGED);
         assert_eq!(log.len(), MAX_ENTRIES);
+        assert!(merged_after > merged_before, "the merge is counted");
         // Bytes 0 and 1 share the merged entry, which kept batch 0's time.
         log.settle_read(MAX_ENTRIES + 1, MAX_ENTRIES - 1, true);
         let a = log.latest().unwrap();
@@ -344,7 +356,12 @@ mod tests {
         // Bytes 0..4 are dropped by a trim that ran without a read.
         log.trim(4);
         // A read that claims 6 bytes held starts at offset 2, below base.
+        let clamped_before = counter(crate::metrics::recv_arrival::CLAMPED);
         log.settle_read(6, 0, true);
+        assert!(
+            counter(crate::metrics::recv_arrival::CLAMPED) > clamped_before,
+            "the lookup below base is counted"
+        );
         let a = log.latest().unwrap();
         assert_eq!((a.first(), a.last()), (t(base, 2), t(base, 2)));
     }

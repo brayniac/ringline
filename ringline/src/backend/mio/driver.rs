@@ -333,6 +333,33 @@ impl Driver {
         let _ = conn_index;
     }
 
+    /// Start recording a TLS feed: step 1 of a record, then the
+    /// `recv_buffered` count the feed's plaintext is measured against.
+    pub(crate) fn arrival_feed_start(&mut self, conn_index: u32) -> usize {
+        self.arrival_trim_if_due(conn_index);
+        #[cfg(not(ringline_no_arrival_log))]
+        {
+            self.recv_buffered(conn_index)
+        }
+        #[cfg(ringline_no_arrival_log)]
+        {
+            0
+        }
+    }
+
+    /// Finish recording a TLS feed: add the growth of `recv_buffered` since
+    /// [`arrival_feed_start`](Self::arrival_feed_start) returned `before`,
+    /// which is the plaintext the feed delivered.
+    pub(crate) fn arrival_feed_end(&mut self, conn_index: u32, before: usize) {
+        #[cfg(not(ringline_no_arrival_log))]
+        {
+            let plaintext = self.recv_buffered(conn_index).saturating_sub(before);
+            self.arrival_add(conn_index, plaintext);
+        }
+        #[cfg(ringline_no_arrival_log)]
+        let _ = (conn_index, before);
+    }
+
     /// Step 2 of a record: add `n` bytes at the current batch's time.
     pub(crate) fn arrival_add(&mut self, conn_index: u32, n: usize) {
         #[cfg(not(ringline_no_arrival_log))]

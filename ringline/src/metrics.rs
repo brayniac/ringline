@@ -311,8 +311,10 @@ pub mod recv_ring {
 /// Slot indices for `RECV_ARRIVAL`.
 pub mod recv_arrival {
     /// A reader's lookup of an offset below the oldest entry or at or above
-    /// the newest end, which returned the nearest end's time. Bytes held out
-    /// of stream order return wrong times without counting here.
+    /// the newest end, which returned the nearest end's time, or a lookup in
+    /// an empty log, which returned none. One reader call can count twice.
+    /// Bytes held out of stream order return wrong times without counting
+    /// here.
     pub const CLAMPED: usize = 0;
     /// A push into a log at its 1024-entry cap, which merged the two oldest
     /// entries. The merged entry keeps the earlier time.

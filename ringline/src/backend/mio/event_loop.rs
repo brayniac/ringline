@@ -827,8 +827,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 // The feed's plaintext is recorded as the growth of
                 // `recv_buffered`, before the `Ok` arm moves any of it to a
                 // forward.
-                self.driver.arrival_trim_if_due(conn_index);
-                let buffered_before_feed = self.driver.recv_buffered(conn_index);
+                let buffered_before_feed = self.driver.arrival_feed_start(conn_index);
                 let tls_table = self.driver.tls_table.as_mut().unwrap();
                 let result = crate::tls::feed_tls_recv_mio(
                     tls_table,
@@ -837,11 +836,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     conn_index,
                     &recv_buf[..n],
                 );
-                let plaintext = self
-                    .driver
-                    .recv_buffered(conn_index)
-                    .saturating_sub(buffered_before_feed);
-                self.driver.arrival_add(conn_index, plaintext);
+                self.driver
+                    .arrival_feed_end(conn_index, buffered_before_feed);
 
                 // Put the stream back.
                 self.driver.tcp_streams[idx] = Some(stream);
@@ -2525,5 +2521,32 @@ mod tests {
             "precondition: slot 0"
         );
         assert_eq!(el.driver.arrival[0].delivered(), 0);
+    }
+
+    /// A forward source re-read by `drain_forward_resumes` is read in a batch
+    /// of its own, not in the batch of the reads before the tasks ran.
+    #[test]
+    fn a_forward_resume_begins_a_batch() {
+        use std::io::Write;
+        let config = test_config();
+        let (mut el, _wake) = test_loop(&config);
+        let (source, mut client) = attach_conn(&mut el.driver);
+        let (sink, _sink_client) = attach_conn(&mut el.driver);
+        el.driver.forward_conn[source as usize] =
+            Some(crate::backend::mio::driver::MioForwardState {
+                sink_index: sink,
+                sink_generation: el.driver.connections.generation(sink),
+                len: 1 << 20,
+                forwarded: 0,
+            });
+        // A read in the loop's batch, before the tasks ran.
+        el.driver.recv_batch.begin_at(Instant::now());
+        el.driver.record_arrival(source, 1);
+        client.write_all(b"x").expect("client write");
+        el.driver.mark_forward_resume(source);
+        let mut buf = vec![0u8; 4096];
+        assert!(el.drain_forward_resumes(&mut buf));
+        assert_eq!(el.driver.arrival[source as usize].delivered(), 2);
+        assert_eq!(el.driver.arrival[source as usize].len(), 2);
     }
 }

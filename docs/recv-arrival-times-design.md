@@ -29,9 +29,10 @@ A batch begins:
 - on mio, after `poll` returns, and in `drain_forward_resumes`, which reads
   sockets after tasks have run.
 
-Tests set the batch state through a `#[cfg(test)]` method on each driver
-before dispatching a completion (`test_dispatch_cqe` on io_uring) or calling
-`handle_readable` (mio). The tests then control batch boundaries and times.
+Tests start a batch with a given time through the `#[cfg(test)]`
+`BatchClock::begin_at` (`driver.recv_batch.begin_at`) before dispatching a
+completion (`test_dispatch_cqe` on io_uring) or calling `handle_readable`
+(mio). The tests then control batch boundaries and times.
 
 ## The arrival log
 
@@ -97,8 +98,7 @@ The log is cleared when a slot is set up for a connection: io_uring
 `handle_connect` (before its orphaned-future branch) and
 `install_accepted_with_pending` (before the record above), and mio accept. It
 is cleared at teardown by io_uring `handle_close` and mio `finish_close`,
-which also replace the deque with a small one, as `accumulators.release` does
-for the accumulator. Mio `start_connect` reuses a slot that `finish_close`
+which also replace the deque with an empty, unallocated one. Mio `start_connect` reuses a slot that `finish_close`
 already cleared.
 
 ## Which bytes a reader consumed
@@ -172,8 +172,10 @@ Cases at the edges:
 
 A lookup of an offset below `base` returns the oldest entry's time, and a
 lookup at or above `delivered` returns the newest entry's time. Both count
-`metrics::recv_arrival::CLAMPED`. The counter counts only lookups outside the
-log; the reordering cases under "Limits" return wrong times without it.
+`metrics::recv_arrival::CLAMPED`, as does a lookup in an empty log, which
+returns no time; one reader call can count twice. The counter counts only
+these lookups; the reordering cases under "Limits" return wrong times without
+it.
 
 The reporting readers are the public readers on `Connection` and `RecvHalf`:
 `with_data`, `with_data_result`, `with_bytes`, `try_with_data`, and, on
@@ -443,6 +445,9 @@ It is not part of this design.
   `recv_hold`.
 - Memory, fixed: about 96 bytes per connection slot (the deque header, four
   `u64`s and `latest`).
+- Allocation: one heap allocation per connection, at its first record, freed
+  at teardown. The A/B cells use long-lived connections and do not measure
+  it.
 - Memory, per worker: about 1.5 MB at the default `max_connections` of
   16,000.
 - Cache: one or two more per-connection cache lines touched per record and per
@@ -454,7 +459,9 @@ It is not part of this design.
 The log is always on. Before the PR merges, its cost is measured on hv01 and
 hv02 through SystemsLab, with the log compiled in (B) and compiled out (A) by
 a `ringline_no_arrival_log` `cfg`. The `cfg` is declared in `check-cfg` in
-`ringline/Cargo.toml`; only ringline references it. In build A, `recv_arrival`
+`ringline/Cargo.toml`; only ringline references it. Build A compiles out the
+records, the `recv_buffered` sums that feed them and the lookups; the
+per-slot logs and the batch counter remain. In build A, `recv_arrival`
 returns `None` and the client crates report `None`. The `cfg` is removed
 before merge if B is kept. The plan, fixed before running:
 
@@ -469,8 +476,11 @@ before merge if B is kept. The plan, fixed before running:
    tool builds against this branch.
 2. Closed-loop cells: 64 and 4,096 connections, `--depth` 1 and 16. The
    4,096-connection cells are where a per-connection cache miss would show.
-   The server runs fewer workers than the client has threads, so the server is
-   the saturated side; each run checks that client CPU stays below 70%.
+   The server runs fewer workers than the client has threads, so the client
+   is not the limit; each run checks that client CPU stays below 70%. The
+   64-connection depth-1 cell may be limited by round-trip time rather than
+   server CPU, in which case its throughput does not show a per-operation
+   cost; its p99 and the open-loop CPU time per request do.
    Statistics: throughput and p99 latency.
 3. Open-loop cells: 64 and 4,096 connections, `--open --rate` at half the
    median throughput of the five A closed-loop runs at depth 1 with that
@@ -508,10 +518,11 @@ below or, by default, removing the record or trim it covers.
   batch's time. Mutation: swap steps 1 and 2 of the record.
 - Trim recovery: 600 unread batches, a non-reporting consumer drains them,
   then records continue until the log reaches 1024 entries. That record trims
-  the log to one entry, and `MERGED` stays 0. Mutation: drop the `min`; the
+  the log to one entry, so no merge happens. Mutation: drop the `min`; the
   log then merges at 1024 and never trims.
 - The offset stays correct after `forward_to` (with overshoot), a recv sink
-  installed with nothing buffered, and `ConnStream`.
+  installed with nothing buffered, and a consumer that does not report
+  (`accumulators.consume`, standing in for `ConnStream`).
 - A parser that returns more than it was shown, through `with_bytes` and the
   lent-buffer path.
 - Completions recorded while a `RecvSegment` is live, followed by the segment
@@ -526,7 +537,10 @@ below or, by default, removing the record or trim it covers.
   worker.
 - A slot reused by a new connection starts with an empty log and
   `recv_arrival() == None`.
-- A reader call that consumes nothing leaves `recv_arrival() == None`.
+- A reader call that consumes nothing leaves `recv_arrival() == None`, and so
+  does a `try_with_data` that finds nothing buffered.
+- On mio, a forward source re-read by `drain_forward_resumes` gets a batch of
+  its own.
 - The client crates report `ttfb_ns <= ttlb_ns <= latency_ns`; an operation
   that fails at send reports `ttfb_ns == None` and `rx_bytes == 0`; an error
   reply reports both times, including through the guarded SET paths.
