@@ -22,9 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   ServerHello can downgrade later connections to classical key exchange).
   The `ringline` crate now takes rustls from the workspace pin; its own
   requirement was `0.23`. Of the other published crates, only `ringline-quic`
-  depends on rustls outside its dev-dependencies, and its only release, 0.6.0,
-  predates #399 and requires rustls 0.23.18, so the 0.23.45 floor from #399
-  reached no downstream user.
+  depends on rustls outside its dev-dependencies, and every `ringline-quic`
+  release predates #399; the latest, 0.6.0, requires rustls 0.23.18. So the
+  0.23.45 floor from #399 reached no user of the published crates.
 
 ## [0.6.10] - 2026-10-11
 
