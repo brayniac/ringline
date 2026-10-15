@@ -93,6 +93,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Breaking:** every worker has 65536 timer slots, and
+  `ConfigBuilder::timer_slots` is removed. The pool defaulted to 256 and could
+  be raised to 65535, one fewer than the 16-bit slot field in a timer's
+  io_uring completion can name. At 65536 it takes about 1.7 MiB per worker.
+  `ringline::TIMER_SLOTS` is the size. Remove `.timer_slots(n)` calls;
+  `try_sleep` and `try_timeout` still report a full pool.
 - **Breaking, behaviour:** on io_uring, TCP connections arm a one-shot
   buffer-select recv and re-arm it when it completes, instead of one
   multishot recv per connection. `ConfigBuilder::recv_multishot(true)`

@@ -5981,8 +5981,9 @@ pub(crate) fn release_connect(
 ///
 /// # Panics
 ///
-/// Panics if the timer slot pool is exhausted, or if called outside the
-/// ringline async executor.
+/// Panics if all 65536 of the worker's timer slots are held (a slot is held
+/// from a timer's creation until its future is dropped), or if called outside
+/// the ringline async executor.
 pub fn sleep(duration: Duration) -> SleepFuture {
     SleepFuture {
         duration,
@@ -6036,7 +6037,7 @@ impl Future for SleepFuture {
                     // sleep() loop became a busy-spin keeping the pool
                     // exhausted.
                     panic!(
-                        "timer slot pool exhausted ({} slots) — raise Config::timer_slots or use try_sleep()/try_timeout()",
+                        "timer slot pool exhausted ({} slots) — use try_sleep()/try_timeout() to handle it",
                         executor.timer_pool.capacity()
                     );
                 }

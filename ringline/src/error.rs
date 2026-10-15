@@ -575,9 +575,10 @@ pub enum UdpSendError {
 /// Error returned by [`try_sleep`](crate::try_sleep) and
 /// [`try_timeout`](crate::try_timeout) when the timer slot pool is full.
 ///
-/// The timer pool is pre-allocated to avoid allocations during async
-/// execution. When exhausted, use the infallible variants [`sleep()`]
-/// and [`timeout()`] which will panic instead (preferred in most cases).
+/// Each worker pre-allocates 65536 timer slots, one per pending timer, so
+/// that no allocation happens during async execution. When exhausted, use
+/// the infallible variants [`sleep()`] and [`timeout()`] which will panic
+/// instead (preferred in most cases).
 ///
 /// [`sleep()`]: crate::sleep
 /// [`timeout()`]: crate::timeout

@@ -333,10 +333,6 @@ pub struct Config {
     /// per worker. Used with [`spawn()`](crate::spawn).
     /// Default: 256.
     pub(crate) standalone_task_capacity: u32,
-    /// Maximum number of concurrent timer slots per worker.
-    /// Used by [`sleep()`](crate::sleep) and [`timeout()`](crate::timeout).
-    /// Default: 256.
-    pub(crate) timer_slots: u32,
     /// UDP bind addresses. Each worker creates its own socket with SO_REUSEPORT.
     /// Empty = no UDP sockets.
     pub(crate) udp_bind: Vec<SocketAddr>,
@@ -498,7 +494,6 @@ impl Default for Config {
             timestamps: false,
             max_chain_length: 16,
             standalone_task_capacity: 256,
-            timer_slots: 256,
             udp_bind: Vec::new(),
             udp_connect_peers: Vec::new(),
             udp_reserved: std::sync::Arc::from(Vec::new()),
@@ -615,11 +610,6 @@ impl Config {
         if self.accept_queue_capacity == 0 {
             return Err(crate::error::Error::RingSetup(
                 "accept_queue_capacity must be > 0".into(),
-            ));
-        }
-        if self.timer_slots == 0 || self.timer_slots > 65535 {
-            return Err(crate::error::Error::RingSetup(
-                "timer_slots must be > 0 and <= 65535".into(),
             ));
         }
         if self.send_slab_slots == 0 {
@@ -847,7 +837,6 @@ impl Default for WorkerConfig {
 ///     .tcp_nodelay(true)
 ///     .recv_buffer(256, 4096)
 ///     .send_pool(512, 8192)
-///     .timer_slots(1024)
 ///     .build()
 ///     .expect("invalid config");
 /// ```
@@ -1225,12 +1214,6 @@ impl ConfigBuilder {
         self
     }
 
-    /// Set the maximum number of concurrent timer slots per worker.
-    pub fn timer_slots(mut self, n: u32) -> Self {
-        self.config.timer_slots = n;
-        self
-    }
-
     // ── Timing settings ──────────────────────────────────────────────
 
     /// Set the tick timeout in microseconds. 0 = block indefinitely.
@@ -1531,11 +1514,6 @@ mod tests {
     }
 
     #[test]
-    fn validate_timer_slots_zero_rejected() {
-        assert!(config_with(|c| c.timer_slots = 0).validate().is_err());
-    }
-
-    #[test]
     fn validate_send_slab_slots_zero_rejected() {
         assert!(config_with(|c| c.send_slab_slots = 0).validate().is_err());
     }
@@ -1668,11 +1646,6 @@ mod tests {
                 .validate()
                 .is_err()
         );
-    }
-
-    #[test]
-    fn validate_timer_slots_too_large_rejected() {
-        assert!(config_with(|c| c.timer_slots = 65536).validate().is_err());
     }
 
     #[test]

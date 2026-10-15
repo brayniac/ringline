@@ -1755,6 +1755,11 @@ impl AsyncEventHandler for SelectSleepHandler {
     fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             let (mut tx, mut rx) = conn.split();
+            // After the first message, hold all but 16 timer slots, so a leak
+            // exhausts the pool within the run. Waiting for data first keeps
+            // the readiness probe's connection, which sends nothing, from
+            // taking them.
+            let mut held = Vec::new();
             // Run 300 iterations of select(with_data, sleep).
             // Each iteration where data arrives drops the SleepFuture,
             // which must correctly cancel the io_uring timeout and release
@@ -1770,7 +1775,12 @@ impl AsyncEventHandler for SelectSleepHandler {
                 .await
                 {
                     ringline::Either::Left(0) => break,
-                    ringline::Either::Left(_) => {} // got data, sleep was dropped
+                    ringline::Either::Left(_) => {
+                        // Got data; the sleep was dropped.
+                        if held.is_empty() {
+                            held = hold_timer_slots(ringline::TIMER_SLOTS as usize - 16);
+                        }
+                    }
                     ringline::Either::Right(()) => {
                         // Timeout — shouldn't happen with 60s timeout.
                         let _ = tx.send_nowait(b"TIMEOUT");
@@ -1788,11 +1798,7 @@ impl AsyncEventHandler for SelectSleepHandler {
 
 #[test]
 fn async_select_with_sleep() {
-    // Use a config with limited timer slots to make leaks detectable.
-    let config = test_config_builder()
-        .timer_slots(16)
-        .build()
-        .expect("valid config");
+    let config = test_config_builder().build().expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)
         .bind("127.0.0.1:0".parse().unwrap())
         .launch::<SelectSleepHandler>()
@@ -2507,6 +2513,15 @@ fn async_send_chain_await_basic() {
 
 // ── try_sleep / try_timeout exhaustion tests ────────────────────────
 
+/// Take `n` of the worker's timer slots with sleeps that outlast the test,
+/// so a test can reach exhaustion with a few more. Dropping the result
+/// releases them.
+fn hold_timer_slots(n: usize) -> Vec<ringline::SleepFuture> {
+    (0..n)
+        .map(|_| ringline::try_sleep(Duration::from_secs(600)).expect("a free timer slot"))
+        .collect()
+}
+
 /// Handler that tests try_sleep exhaustion.
 struct TrySleepHandler;
 
@@ -2521,12 +2536,14 @@ impl AsyncEventHandler for TrySleepHandler {
             }
 
             let exhausted = {
-                // Allocate all timer slots (config has timer_slots = 2).
-                let _s1 = ringline::try_sleep(Duration::from_secs(60));
-                let _s2 = ringline::try_sleep(Duration::from_secs(60));
+                // Take every timer slot but two, then the last two.
+                let _held = hold_timer_slots(ringline::TIMER_SLOTS as usize - 2);
+                let s1 = ringline::try_sleep(Duration::from_secs(60));
+                let s2 = ringline::try_sleep(Duration::from_secs(60));
 
-                // Third attempt should fail with TimerExhausted.
-                ringline::try_sleep(Duration::from_secs(60)).is_err()
+                // The last two succeed, so the pool has exactly TIMER_SLOTS
+                // slots; a third fails with TimerExhausted.
+                s1.is_ok() && s2.is_ok() && ringline::try_sleep(Duration::from_secs(60)).is_err()
                 // _s1, _s2 dropped here — slots released.
             };
 
@@ -2546,10 +2563,7 @@ impl AsyncEventHandler for TrySleepHandler {
 
 #[test]
 fn async_try_sleep_exhaustion() {
-    let config = test_config_builder()
-        .timer_slots(2)
-        .build()
-        .expect("valid config");
+    let config = test_config_builder().build().expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)
         .bind("127.0.0.1:0".parse().unwrap())
         .launch::<TrySleepHandler>()
@@ -2609,15 +2623,19 @@ impl AsyncEventHandler for TryTimeoutHandler {
             }
 
             let exhausted = {
-                // Allocate all timer slots (config has timer_slots = 2).
-                let _t1 =
+                // Take every timer slot but two, then the last two.
+                let _held = hold_timer_slots(ringline::TIMER_SLOTS as usize - 2);
+                let t1 =
                     ringline::try_timeout(Duration::from_secs(60), std::future::pending::<()>());
-                let _t2 =
+                let t2 =
                     ringline::try_timeout(Duration::from_secs(60), std::future::pending::<()>());
 
-                // Third attempt should fail with TimerExhausted.
-                ringline::try_timeout(Duration::from_secs(60), std::future::pending::<()>())
-                    .is_err()
+                // The last two succeed, so the pool has exactly TIMER_SLOTS
+                // slots; a third fails with TimerExhausted.
+                t1.is_ok()
+                    && t2.is_ok()
+                    && ringline::try_timeout(Duration::from_secs(60), std::future::pending::<()>())
+                        .is_err()
                 // _t1, _t2 dropped here — timer slots released.
             };
 
@@ -2637,10 +2655,7 @@ impl AsyncEventHandler for TryTimeoutHandler {
 
 #[test]
 fn async_try_timeout_exhaustion() {
-    let config = test_config_builder()
-        .timer_slots(2)
-        .build()
-        .expect("valid config");
+    let config = test_config_builder().build().expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)
         .bind("127.0.0.1:0".parse().unwrap())
         .launch::<TryTimeoutHandler>()
