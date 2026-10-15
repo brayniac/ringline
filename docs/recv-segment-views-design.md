@@ -37,26 +37,27 @@ On io_uring a connection receives in one of two domains
   while a parse remainder is held (`put_back` after `NeedMore`) are copied
   again when `unfreeze` merges them into the remainder.
 - Segmented domain, entered by `segments`, `recv_owned_segment`,
-  `with_segments`, `forward_to` and `forward_to_conn`. Completions queue in
-  `segment_hold` as `HeldRecvBuf::Pinned { bid, off, len }`, or as
-  `HeldRecvBuf::Owned(Bytes)` when the lend is refused: by the lend cap with
-  `recv_incremental`, or at or below `recv_segment_reserve` free buffers
-  without it (`handle_recv_multi`, `backend/uring/event_loop.rs`).
-  `throttle_if_held` stops re-arming the receive (and cancels an armed
-  multishot receive) when `at_hold_cap` is true. `at_hold_cap` has two
-  terms. The segment term is true when the hold plus the buffers a
-  `forward_to` write pins reaches `forward_hold_cap` entries with a lend
-  cap, or `quarter_ring_cap` without one. The forward term is true when
-  `recv_hold` plus `send_held_recv` reaches `quarter_ring_cap`.
-  `quarter_ring_cap` is `min(forward_hold_cap, max(ring entries / 4, 1))`.
-  `rearm_throttled_recvs` re-arms it once the hold drains below the cap.
-  `close_connection` leaves the hold, so a reader woken by a FIN can still
-  parse it; `handle_close` (teardown) releases what is still held. A
-  segmented connection is not eligible for the `ENOBUFS` fallback receive
-  (`fallback_eligible`). The TLS branch of `handle_recv_multi` does not call
-  `throttle_if_held`. `end_segments` (`settle_forward_end`) copies what is
-  still held into the accumulator and returns the connection to the default
-  domain.
+  `with_segments`, `forward_to` and `forward_to_conn`.
+  - Completions queue in `segment_hold` as `HeldRecvBuf::Pinned { bid, off,
+    len }`, or as `HeldRecvBuf::Owned(Bytes)` when the lend is refused: by
+    the lend cap with `recv_incremental`, or at or below
+    `recv_segment_reserve` free buffers without it (`handle_recv_multi`,
+    `backend/uring/event_loop.rs`).
+  - `throttle_if_held` stops re-arming the receive (and cancels an armed
+    multishot receive) when `at_hold_cap` is true, and
+    `rearm_throttled_recvs` re-arms it once the hold drains below the cap.
+    The TLS branch of `handle_recv_multi` does not call `throttle_if_held`.
+  - `at_hold_cap` has two terms. The segment term is true when the hold plus
+    the buffers a `forward_to` write pins reaches `forward_hold_cap` entries
+    with a lend cap, or `quarter_ring_cap` without one. The forward term is
+    true when `recv_hold` plus `send_held_recv` reaches `quarter_ring_cap`.
+    `quarter_ring_cap` is `min(forward_hold_cap, max(ring entries / 4, 1))`.
+  - `close_connection` leaves the hold, so a reader woken by a FIN can still
+    parse it; `handle_close` (teardown) releases what is still held.
+  - A segmented connection is not eligible for the `ENOBUFS` fallback
+    receive (`fallback_eligible`).
+  - `end_segments` (`settle_forward_end`) copies what is still held into the
+    accumulator and returns the connection to the default domain.
 - `with_segments` presents the held bytes as a `SegChain` of `&[u8]` slices,
   borrowed for the callback only. After the callback it copies every
   unconsumed byte into the accumulator, so a parser that needs more than is
@@ -85,17 +86,21 @@ impl RecvHalf {
 
 `Connection` has the same method and forwards to `RecvHalf`'s, which
 forwards to a `pub(crate)` method on `ConnCtx`, as `with_bytes` does. The
-future resolves to `io::Result<usize>`: `Ok(k)` for `k` bytes consumed,
-`Ok(0)` at EOF, for a stale handle, or after closing the connection because
-buffered bytes exceed `recv_accumulator_max`, as `with_segments` does, and
-`Err(EBUSY)` when a forward runs or a `SegmentReader` is live.
+future resolves to `io::Result<usize>`:
+
+- `Ok(k)` for `k` bytes consumed;
+- `Ok(0)` at EOF, for a stale handle, or after closing the connection
+  because buffered bytes exceed `recv_accumulator_max`, as `with_segments`
+  does;
+- `Err(EBUSY)` when a forward runs, a `SegmentReader` is live, or another
+  reader used the connection while the future was parked (below).
 
 It uses `ParseResult` because its callers are the parsers that already use
 `with_bytes`: a parser over `&[Bytes]` returns `Consumed(k)`, `NeedMore` or
 `NeedAtLeast(n)` as it does over one `Bytes`. `with_bytes` tolerates an `n`
 that is too large, since it only reserves with it. This reader does not call
 the parser again until `n` more bytes arrive, the hold cap is reached, or
-the receive side finishes, so an `n` that is too large stalls it; on mio,
+the receive side finishes, so an `n` that is too large stalls it. On mio,
 which has no hold cap, it stalls until EOF, or until the accumulator reaches
 `recv_accumulator_max` and the connection is closed. Landing step 2 updates
 the `ParseResult::NeedAtLeast` rustdoc to say so.
@@ -103,51 +108,72 @@ the `ParseResult::NeedAtLeast` rustdoc to say so.
 Each call's first poll enters the segmented domain through
 `enter_segmented_domain` (`runtime/io.rs`), with `SegmentedEntry::ViaHalf`
 and `exclusive` false (true would set `segment_reader_live`, and every later
-call would return `EBUSY`), and maps its refusals: a stale handle (`EPIPE`
-there) resolves to `Ok(0)`, a running forward or a live `SegmentReader` to
-`Err(EBUSY)`. The future does not borrow the half, so while it is parked a
-forward or a `SegmentReader` can start, and a forward, a `SegmentReader` or
-`end_segments` can also finish. Every later poll therefore repeats the
-checks. It resolves to `Ok(0)` for a stale handle. It resolves to
-`Err(EBUSY)` without touching the hold if `forward_progress` or
-`segment_reader_live` is set; otherwise it would parse the hold a forward
-owns, and at the cap copy it into the accumulator, which a forward never
-reads. A forward that ended, a dropped `SegmentReader` or `end_segments`
-runs `settle_forward_end`, which copies the hold into the accumulator and
-returns the connection to the default domain, where the next completion is
-lent into `pending_recv_bufs`. A later poll that finds `recv_domain` not
-`Segmented`, or a lend pending, calls `enter_segmented_domain` again;
-without that, the reader would park with the lend unread. Entering moves any
-accumulator bytes to the front of the hold as one `Owned` entry. It copies a
-`pending_recv_bufs` lend into an `Owned` entry today; step 2 changes
-`enter_segmented_domain` to convert the lend into a `Pinned` entry, which
-copies nothing. `PendingRecvBuf` holds `bid`, `len` and the data pointer;
-the offset is the pointer less `ProvidedBufRing::data_ptr(bid, 0)`. The
-conversion applies to every caller of `enter_segmented_domain`, so
+call would return `EBUSY`). It maps the refusals: a stale handle (`EPIPE`
+there) resolves to `Ok(0)`, and a running forward or a live `SegmentReader`
+to `Err(EBUSY)`.
+
+Entering moves any accumulator bytes to the front of the hold as one `Owned`
+entry. It copies a `pending_recv_bufs` lend into an `Owned` entry today;
+step 2 changes `enter_segmented_domain` to convert the lend into a `Pinned`
+entry, which copies nothing. `PendingRecvBuf` holds `bid`, `len` and the
+data pointer; the offset is the pointer less `ProvidedBufRing::data_ptr(bid,
+0)`. The conversion applies to every caller of `enter_segmented_domain`, so
 `segments` and `recv_owned_segment` gain it too; both already read `Pinned`
 entries.
+
+The future does not borrow the half, so while it is parked the caller can
+run another reader on the connection: start a forward or a `SegmentReader`,
+call `with_segments`, `recv_owned_segment`, `end_segments` or another
+`with_bytes_segments`. Any of them can consume bytes the future was shown,
+and a forward that ends, a dropped `SegmentReader` and `end_segments` return
+the connection to the default domain (`settle_forward_end`). A later poll
+that continued would act on stale state: a recorded `NeedAtLeast(n)` counts
+bytes that are gone, and in the default domain the next completion is lent
+where this reader does not look. Step 2 therefore adds a per-connection
+counter, `segment_epoch`. It is incremented by `settle_forward_end` and
+whenever a reader removes bytes from the hold or the accumulator while the
+connection is in the segmented domain, this reader included. The future
+records the counter at the end of each poll. Every later poll first checks
+the handle (stale: `Ok(0)`), `forward_progress` and `segment_reader_live`
+(`Err(EBUSY)`), and then the counter: if it changed, the poll resolves to
+`Err(EBUSY)` without touching the hold, and the caller calls again. Without
+the first two checks a poll would parse the hold a forward owns, and at the
+cap copy it into the accumulator, which a forward never reads.
+
+The executor keeps one receive waiter per connection (`recv_waiters`,
+`owner_task`), so a reader parked in one task is not woken when a reader in
+another task on the same connection finishes; that holds for every reader in
+ringline today. The checks above apply when the future is polled again,
+which happens when both readers run in one task.
 
 On io_uring the slice then holds one `Bytes` per `segment_hold` entry, in
 order: a view for a `Pinned` entry, a clone of the `Bytes` for an `Owned`
 one. Whenever the accumulator has bytes it is presented first, as one frozen
 `Bytes` (`take_frozen`, as `with_bytes` does). Its bytes are older than
-anything held: they come from a hold-cap copy, or from a `with_segments`
-call between two polls, which copies every unconsumed held byte into it. A
-TLS connection in the segmented domain pushes each decrypted plaintext chunk
-to the hold as an `Owned` entry (`feed_tls_recv` with
+anything held, because they come from this future's hold-cap copy. A TLS
+connection in the segmented domain pushes each decrypted plaintext chunk to
+the hold as an `Owned` entry (`feed_tls_recv` with
 `PlaintextSink::Segments`), so its pieces are heap `Bytes`, not views; a
 value inside one chunk is still not copied again.
 
-The `timestamps` feature is removed before step 2 lands (owner decision,
-2026-10-15). Its receive path appends every completion to the accumulator in
-either domain, which would present new bytes ahead of held ones.
+The `timestamps` feature is removed before step 2 lands (#TSPR). Its receive
+path appends every completion to the accumulator in either domain, which
+would present new bytes ahead of held ones.
 
-On mio the slice has at most one element, the accumulator. The mio path
-follows the io_uring reader in three places: at EOF with nothing buffered it
-resolves to `Ok(0)` without calling the parser; it applies the `NeedAtLeast`
-skip; and a stale handle resolves to `Ok(0)`. Mio has no `SegmentReader` or
-forward, so it never returns `EBUSY`. A client crate calls one method on
-both backends.
+On mio the slice has at most one element, the accumulator. Mio has no
+`SegmentReader`, and has a forward (`forward_to_conn`, `forward_conn`). The
+mio path follows the io_uring reader:
+
+- at EOF with nothing buffered it resolves to `Ok(0)` without calling the
+  parser;
+- it applies the `NeedAtLeast` skip;
+- a stale handle resolves to `Ok(0)`;
+- while a forward runs it resolves to `Err(EBUSY)`;
+- its `segment_epoch` is incremented when a forward starts or ends and when
+  a reader consumes accumulator bytes, and a changed counter resolves a
+  later poll to `Err(EBUSY)`.
+
+A client crate calls one method on both backends and gets the same errors.
 
 The connection stays in the segmented domain after the future resolves;
 `end_segments` returns it to the default domain. `end_segments` is io_uring
@@ -185,28 +211,38 @@ streaming reads.
   call from a hold of H entries creates at least H views per message, and H
   more for each re-parse.
 - At the hold cap the poll ignores the `NeedAtLeast` skip and calls the
-  parser over the pieces. If the parse is incomplete, every held entry is
-  copied into the accumulator, in order, their buffer holds are released,
-  and the future parks; its next poll presents the accumulator first. If the
-  skip applied at the cap, a parser that returned `NeedAtLeast` would not be
-  called while the receive is throttled, and the hold would never drain. A
-  message that arrives in more completions than the hold cap completes only
-  through this copy. Step 2 adds an `AccumulatorTable` method that reclaims
-  the frozen remainder (`unfreeze` with nothing appended, recovering the
+  parser over the pieces. If the skip applied at the cap, a parser that
+  returned `NeedAtLeast` would not be called while the receive is throttled,
+  and the hold would never drain.
+- If that parse is incomplete, every held entry is copied into the
+  accumulator, in order, their buffer holds are released, and the future
+  parks; its next poll presents the accumulator first. A message that
+  arrives in more completions than the hold cap completes only through this
+  copy.
+- Before the copy, step 2's new `AccumulatorTable` method reclaims the
+  frozen remainder (`unfreeze` with nothing appended, recovering the
   allocation with `try_into_mut`). That costs nothing once the presented
   clone and any slice the parser kept of it have dropped; if a slice is
   still alive, the method copies the remainder once into a buffer of the
-  reserve target's size. Before appending, the copy calls `reserve` with the
-  held bytes plus the recorded `n`, so the accumulator grows once, and each
-  held byte is copied once by this path. An `Owned` entry (a refused lend, a
-  TLS chunk, a fallback receive completion in flight at entry, or the
-  accumulator moved in on entry) was copied once already, so its bytes are
-  copied twice. The accumulator bound (`recv_accumulator_max`) applies to
-  it; past the bound the connection is closed and the future resolves to
-  `Ok(0)`, as in `with_segments`. On a TLS connection, whose receive is not
-  throttled, the same copy runs whenever the hold reaches the cap. The hold
-  and the accumulator are bounded separately, so a TLS connection can hold
-  up to twice `recv_accumulator_max`.
+  reserve target's size. The copy then calls `reserve` with the held bytes
+  plus the recorded `n`, so the accumulator grows once, and each held byte
+  is copied once by this path.
+- An `Owned` entry (a refused lend, a TLS chunk, a fallback receive
+  completion in flight at entry, or the accumulator moved in on entry) was
+  copied once already, so its bytes are copied twice.
+- The accumulator bound (`recv_accumulator_max`) applies to the copy; past
+  the bound the connection is closed and the future resolves to `Ok(0)`, as
+  in `with_segments`.
+- On a TLS connection, whose receive is not throttled, the same copy runs
+  whenever the hold reaches the cap. The hold and the accumulator are
+  bounded separately, so a TLS connection can hold up to twice
+  `recv_accumulator_max`.
+- Bytes the copy leaves in the accumulator after the future resolves are
+  moved into the hold by the next segmented reader: `enter_segmented_domain`
+  for the next call of this reader, or `adopt_stranded_accumulator` for a
+  `SegmentReader`, which increments `SEGMENT_STRANDED_ADOPTED`. That
+  counter's comment (`runtime/io.rs`) says a nonzero value means bytes were
+  stranded after entry; step 2 adds the hold-cap copy as a second cause.
 - The future checks only the segment term of `at_hold_cap`, split out into a
   `Driver` method (its inputs are all `Driver` fields). The forward term
   would run the hold-cap copy while a lend sent by `forward_recv_buf` is in
@@ -219,9 +255,11 @@ parser for the accumulator is the accumulator's own frozen buffer, as in
 
 ## Views
 
-A view is `Bytes::from_owner(RecvView { .. })`. `RecvView` holds an `Arc` of
-the ring's `RingMemory`, the range it covers, the buffer's bid, and the id
-of the worker that created it; the allocation id is read from the `Arc`.
+Step 1 moves a ring's buffer memory into `RingMemory`, an anonymous mapping
+shared through an `Arc`, with a process-unique memory id. A view is
+`Bytes::from_owner(RecvView { .. })`. `RecvView` holds an `Arc` of the
+ring's `RingMemory`, the range it covers, the buffer's bid, and the id of
+the worker that created it; the memory id is read from the `Arc`.
 
 - Creating a view takes one buffer hold (`BufState::holds += 1`), so the
   buffer stays out of the ring and counts in `held()`, under the lend cap.
@@ -230,29 +268,29 @@ of the worker that created it; the allocation id is read from the `Arc`.
   has also been dropped.
 - Dropping the last clone of a view (Bytes's owner refcount) releases its
   buffer hold. While the creating worker is current on the dropping thread,
-  the drop queues `Orphan::RecvView { alloc, bid }` with `defer_release`.
-  `release_orphans` queues the bid for the flush, which releases the buffer
-  hold (`release_batch`) and posts the buffer if rule 3 allows it. The drop
-  never takes the driver, so a view dropped inside a parser callback, a
-  `with_state` closure or `on_tick` is safe.
+  the drop queues `Orphan::RecvView { alloc, bid }` with `defer_release`,
+  where `alloc` is the memory id. `release_orphans` queues the bid for the
+  flush, which releases the buffer hold (`release_batch`) and posts the
+  buffer if rule 3 allows it. The drop never takes the driver, so a view
+  dropped inside a parser callback, a `with_state` closure or `on_tick` is
+  safe.
 - Otherwise (another thread, or a later worker on the same thread), the drop
   pushes `(alloc, bid)` onto a release list in the creating worker's inbox
   (`runtime/waker.rs`), sets that list's own nonempty flag, and writes the
   worker's wake fd if the flag was clear. `release_orphans` drains the list.
   A worker that has exited has no inbox; the release is dropped.
-- `release_orphans` ignores a release whose `alloc` is not the current
-  worker's `RingMemory`. A thread can run more than one worker in turn, and
-  a later worker's `RingMemory` can reuse a freed one's address, so the id
-  is a process-unique counter, not an address.
-- The buffer memory moves from `ProvidedBufRing`'s `Vec<u8>` into an
-  `Arc`-shared anonymous mapping (`RingMemory`). Like the `calloc` behind
-  `vec![0; n]`, a mapping leaves untouched pages unbacked; a page-aligned
-  `alloc_zeroed` would zero, and so make resident, the whole ring at
-  startup. `Driver` drops its `ring` first (fields drop in declaration
-  order), then `provided_bufs` drops its reference; the memory is freed when
-  the last view drops. The memory is freed no earlier than the `Vec` is
-  today, after the ring is dropped, so the change adds no case where the
-  kernel can write to freed buffer memory.
+- `release_orphans` ignores a release whose memory id is not the current
+  worker's `RingMemory`'s. A thread can run more than one worker in turn,
+  and a later worker's `RingMemory` can reuse a freed one's address, so the
+  memory id is a process-unique counter and not an address.
+- The buffer memory moves from `ProvidedBufRing`'s `Vec<u8>` into
+  `RingMemory`. Like the `calloc` behind `vec![0; n]`, a mapping leaves
+  untouched pages unbacked; a page-aligned `alloc_zeroed` would zero, and so
+  make resident, the whole ring at startup. `Driver` drops its `ring` first
+  (fields drop in declaration order), then `provided_bufs` drops its
+  reference; the memory is freed when the last view drops. The memory is
+  freed no earlier than the `Vec` is today, after the ring is dropped, so
+  the change adds no case where the kernel can write to freed buffer memory.
 - Under `IOU_PBUF_RING_INC` the kernel keeps writing a buffer past `written`
   while views of its earlier bytes are alive. The ranges are disjoint, and
   the allocation is reached only through raw pointers, so no `&mut [u8]` to
@@ -337,7 +375,7 @@ the bytes, up to the hold cap. A client with many connections and small
 pipelined responses therefore holds more buffers at once than it does today.
 Without a lend cap, deliveries at or below `recv_segment_reserve` free
 buffers are copied. Views count in `free()`, so with a nonzero reserve they
-leave at least that many buffers free; with a reserve of 0, which validation
+leave at least that many buffers free. With a reserve of 0, which validation
 allows, a segmented delivery is still copied when no buffer is free
 (`delivery_decision(0, 0)` is `ForceCopy`), so segmented holds and views pin
 at most all but one buffer. Most receives then get `ENOBUFS` and re-arm one
@@ -389,7 +427,7 @@ Each test below is written to fail on the regression it names. The mutations
 that check the first five: no buffer hold at view creation and a release
 never queued (first and second); the inbox never drained and the wake fd
 never written (third); a view that does not keep the memory alive (fourth);
-no allocation check (fifth). The ring memory's own test fails if the memory
+no memory id check (fifth). The ring memory's own test fails if the memory
 is zeroed eagerly, which would make the whole ring resident at startup.
 
 - A view kept past the callback keeps its buffer out of the ring; dropping
@@ -426,10 +464,17 @@ is zeroed eagerly, which would make the whole ring resident at startup.
 - Entering converts a pending lend into a `Pinned` entry at its offset with
   no copy.
 - A stale handle resolves to `Ok(0)`; a live `SegmentReader` or a running
-  forward gives `Err(EBUSY)`, on the first poll and on a later one.
-- A forward that runs to completion, a `SegmentReader` created and dropped,
-  and an `end_segments` call, each between two polls of a parked reader, are
-  followed by a reply that arrives in one completion; the reader returns it.
+  forward gives `Err(EBUSY)`, on the first poll and on a later one, on both
+  backends where they exist.
+- In one task, a parked reader followed by a forward that runs to
+  completion, a `SegmentReader` created and dropped, an `end_segments` call,
+  a `with_segments` call and a `recv_owned_segment` call, one per test: the
+  reader's next poll resolves to `Err(EBUSY)`, and a new call reads the next
+  reply, including one that arrives in one completion. The same on mio with
+  a forward.
+- A reader that recorded `NeedAtLeast(n)`, then another reader consumes the
+  bytes it was shown: the next poll resolves to `Err(EBUSY)` instead of
+  waiting for `n` more bytes.
 - `Consumed(k)` with `k` past the bytes presented consumes only the bytes
   presented.
 - `end_segments` on mio returns `Ok(())`.
@@ -438,22 +483,37 @@ is zeroed eagerly, which would make the whole ring resident at startup.
 
 ## Landing
 
+Before step 2, the `timestamps` feature is removed (#TSPR).
+
 1. View machinery: `RingMemory`, `RecvView`, `Orphan::RecvView`, the inbox
-   release, the allocation id check, and the view counters. No public API;
-   tests create views through a crate-private constructor.
-   `Bytes::from_owner` raises ringline's `bytes` requirement to 1.9; the
-   CHANGELOG names the floor.
-2. `with_bytes_segments` on both backends, the `NeedAtLeast` skip, the
-   hold-cap copy with its counter, the bytes-copied counter, `end_segments`
-   on mio, and `with_bytes_segments` in the `RecvHalf` rustdoc's list of
-   methods whose futures carry no borrow.
+   release, the memory id check, and the view counters. No public API; tests
+   create views through a crate-private constructor. `Bytes::from_owner`
+   raises ringline's `bytes` requirement to 1.9; the CHANGELOG names the
+   floor.
+2. The reader:
+   - `with_bytes_segments` on both backends, with the `NeedAtLeast` skip and
+     the `segment_epoch` check;
+   - the `Pinned` conversion in `enter_segmented_domain`, which also changes
+     `segments` and `recv_owned_segment`;
+   - the hold-cap copy, its counter, and the `AccumulatorTable` reclaim
+     method;
+   - the segment term of `at_hold_cap` split into its own `Driver` method;
+   - the bytes-copied counter;
+   - `end_segments` on mio;
+   - rustdoc: `ParseResult::NeedAtLeast`, the `RecvHalf` note that mio has
+     no segmented domain, `with_bytes_segments` in `RecvHalf`'s list of
+     methods whose futures carry no borrow, and the
+     `SEGMENT_STRANDED_ADOPTED` comment.
 3. `recv_zc_threshold`, its helper and metric.
-4. Release resp-proto and memcache-proto with `parse_segments`. The
-   workspace lock pins resp-proto 0.0.2 and memcache-proto 0.0.5, which do
-   not have it.
-5. Measure two builds of the same benchmark: main, and a branch where
-   ringline-redis and ringline-memcache read with `with_bytes_segments`,
-   `parse_segments` and the helper. The branch is the change step 6 merges.
+4. Release resp-proto and memcache-proto with `parse_segments`, and move
+   ringline's workspace requirements and `Cargo.lock` on main to those
+   releases. The lock pins resp-proto 0.0.2 and memcache-proto 0.0.5, which
+   do not have `parse_segments`, and resp-proto's unreleased main also
+   rewrites the parser `with_bytes` uses.
+5. Measure two builds that differ only in the client read path: main after
+   step 4, and a branch from it where ringline-redis and ringline-memcache
+   read with `with_bytes_segments`, `parse_segments` and the helper. The
+   branch is the change step 6 merges.
    - Hosts and kernels: hv01, and hv01 to hv02; Linux 6.1, 6.12 and 7.1.
    - Rings: default, and incremental on 6.12 and 7.1 (6.1 has no incremental
      rings).
@@ -503,7 +563,13 @@ The owner accepted these on 2026-10-15.
 - A refused lend copies the completion and the connection keeps receiving,
   as in the other segmented readers; no new throttle (see "Lend refusals").
 - The client crates switch only on step 5's measurement.
-- The view counters count views; see "Metrics".
+- The view counters count views; the per-buffer count the 2026-10-08
+  decision asked for waits on step 5 (see "Metrics").
+- A parked reader resolves to `Err(EBUSY)` when another reader used the
+  connection since its last poll (`segment_epoch`), instead of re-entering
+  the segmented domain. Re-entering would take the connection back from a
+  reader the caller had switched to, and would leave a recorded
+  `NeedAtLeast(n)` counting bytes another reader consumed.
 
 ## Not measured
 
