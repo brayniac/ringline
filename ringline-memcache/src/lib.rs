@@ -681,8 +681,8 @@ impl Client {
         }
         #[cfg(not(feature = "timestamps"))]
         {
-            // When timestamps feature is disabled, only use Instant::now() if callbacks are registered
-            if self.on_result.is_some() {
+            // Only read the clock if callbacks or metrics are configured.
+            if self.is_instrumented() {
                 (0, Some(Instant::now()))
             } else {
                 (0, None)
