@@ -105,12 +105,18 @@ pub(crate) fn clear_driver_state() {
 /// slabs unwind — a use-after-free.
 pub(crate) struct DriverStateGuard(());
 
+impl Drop for DriverStateGuard {
+    fn drop(&mut self) {
+        clear_driver_state();
+    }
+}
+
 // The connection whose reader callback is running on this thread, if any.
 //
-// `offer_for_park` declines an offer made from inside a reader callback: the
-// request being parsed is still the handler's to answer, and `with_bytes`
-// has already taken it out of the driver, where `holds_unread` cannot see it
-// (#669).
+// `offer_for_park` declines an offer made from inside a reader callback.
+// `with_bytes`, and a `with_data` callback that calls `forward_recv_buf`, have
+// already taken the request out of the driver, where `holds_unread` cannot see
+// it (#669).
 #[cfg(has_io_uring)]
 thread_local! {
     static READER_CALLBACK_CONN: std::cell::Cell<Option<u32>> =
@@ -138,16 +144,11 @@ impl Drop for ReaderCallback {
     }
 }
 
-/// Whether `conn_index`'s reader callback is running on this thread.
+/// Whether the innermost reader callback running on this thread is
+/// `conn_index`'s.
 #[cfg(has_io_uring)]
 pub(crate) fn in_reader_callback(conn_index: u32) -> bool {
     READER_CALLBACK_CONN.with(|c| c.get() == Some(conn_index))
-}
-
-impl Drop for DriverStateGuard {
-    fn drop(&mut self) {
-        clear_driver_state();
-    }
 }
 
 /// Set the thread-local driver pointer, returning a guard that clears it
@@ -1139,21 +1140,22 @@ impl ConnCtx {
     /// **This is the opt-in.** A connection whose handler never calls this is
     /// never parked, whatever the load imbalance.
     ///
-    /// The offer is **cleared automatically when more data arrives**, since
-    /// that means a new request started and the boundary is gone. So a
-    /// handler offers once per idle point and never has to revoke.
+    /// The offer is cleared when more data arrives, since that means a new
+    /// request started and the boundary is gone. So a handler offers once per
+    /// idle point and never has to revoke.
     ///
     /// Call it outside any reader callback, after the response to every
     /// request read so far has been queued. An offer is ignored when it
     /// is made from inside one of the connection's reader callbacks
     /// (`with_data`, `with_bytes`, `with_segments`, `try_with_data`), or
     /// while the runtime holds received bytes for the connection, such as
-    /// the next request. The handler offers again at its next idle point.
+    /// the next request. Offer again at the next idle point.
     /// A connection whose next request has always arrived by the time the
     /// handler offers is therefore never parked. Only the innermost
-    /// running callback is detected: an offer for connection A made from
+    /// running callback is detected. An offer for connection A made from
     /// inside a callback on connection B, itself inside A's callback, is
-    /// not declined.
+    /// declined only while the runtime still holds A's bytes, which it does
+    /// not in a `with_bytes` callback or after `forward_recv_buf`.
     /// `metrics::park_diag::OFFER_DECLINED` counts ignored offers.
     ///
     /// The runtime does not see bytes the handler has taken into its own
@@ -1162,8 +1164,8 @@ impl ConnCtx {
     /// not offer while holding any.
     ///
     /// Park also requires Linux 6.8 (`IORING_OP_FIXED_FD_INSTALL`) and the
-    /// io_uring backend; elsewhere this is recorded and simply never acted
-    /// on.
+    /// io_uring backend. On mio this does nothing; on io_uring below 6.8
+    /// the offer is recorded and never acted on.
     pub fn offer_for_park(&self, state: Option<crate::park::ParkState>) {
         let _ = try_with_state(|driver, _| {
             #[cfg(has_io_uring)]

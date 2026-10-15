@@ -2381,11 +2381,10 @@ impl Driver {
     /// The offer is declined, and any earlier offer and deposit cleared,
     /// while the connection holds unread bytes, or when it comes from inside
     /// one of the connection's reader callbacks. In both cases the handler
-    /// has a request it has not answered, so it is not at an idle point. A
-    /// recorded offer would stay set, and once the handler read the request
-    /// nothing would refuse a park while the handler was still working on it
-    /// (#669). An offer that stands therefore means nothing was unread when it
-    /// was made, and arriving bytes withdraw it (`withdraw_park_offer`).
+    /// has a request it has not answered, so it is not at an idle point
+    /// (#669). An offer that stands therefore means the driver held no unread
+    /// bytes when it was made, and arriving bytes withdraw it
+    /// (`withdraw_park_offer`).
     pub(crate) fn offer_park(
         &mut self,
         conn_index: u32,

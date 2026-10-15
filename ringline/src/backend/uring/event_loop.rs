@@ -6894,6 +6894,38 @@ mod tests {
         }
     }
 
+    /// A reader callback on another connection, run from inside A's
+    /// callback, restores A as the running callback when it returns. A's
+    /// reader is `with_bytes`, so A's bytes are out of the driver and only the
+    /// restored guard declines the offer.
+    #[test]
+    fn a_nested_reader_callback_restores_the_outer_connection() {
+        let mut el = make_test_loop();
+        let conn_a = accept_connection(&mut el);
+        let conn_b = accept_connection(&mut el);
+        el.driver.accumulators.append(conn_a, b"GET a");
+        el.driver.accumulators.append(conn_b, b"GET b");
+        let ctx_a = ConnCtx::new(conn_a, el.driver.connections.generation(conn_a));
+        let ctx_b = ConnCtx::new(conn_b, el.driver.connections.generation(conn_b));
+        let waker = noop_waker();
+        let mut fut = std::pin::pin!(ctx_a.with_bytes(|b| {
+            let inner = ctx_b.try_with_data(|d| crate::runtime::io::ParseResult::Consumed(d.len()));
+            assert!(inner.is_some(), "B's callback ran");
+            ctx_a.offer_for_park(Some(ParkState::new(5u8)));
+            crate::runtime::io::ParseResult::Consumed(b.len())
+        }));
+        let consumed = with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            fut.as_mut().poll(&mut cx)
+        });
+        assert!(matches!(consumed, std::task::Poll::Ready(5)));
+        assert!(
+            !el.driver.park_offered[conn_a as usize],
+            "A's callback is still running once B's returns: the offer must not stand"
+        );
+        assert!(!el.driver.park_carry.contains_key(&conn_a));
+    }
+
     /// A declined offer also clears an offer and deposit already standing.
     #[test]
     fn a_declined_offer_clears_an_earlier_offer() {

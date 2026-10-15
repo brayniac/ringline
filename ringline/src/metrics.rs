@@ -168,7 +168,7 @@ pub mod park_drain_us {
 /// Why suppressing the `ECANCELED` re-arm did not stop offers being withdrawn.
 ///
 /// Suppressing the re-arm left `not_offered` at 95.2% of abandonments, unchanged
-/// (`docs/journal/2026-09-two-phase-park.md`). These four answer the question the
+/// (`docs/journal/2026-09-two-phase-park.md`). The first four answer the question the
 /// abandonment counters cannot: whether the cancel is submitted at all, whether
 /// the suppression fires, and whether data still reaches the connection while it
 /// is supposed to be draining. Between them there is only one consistent story,
