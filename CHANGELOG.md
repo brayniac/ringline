@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security
+
+- The `quinn-proto` floor is raised to 0.11.19 for RUSTSEC-2026-0338,
+  RUSTSEC-2026-0339, RUSTSEC-2026-0340, RUSTSEC-2026-0341, RUSTSEC-2026-0342,
+  RUSTSEC-2026-0343, GHSA-53rm-773f-4q8c and GHSA-wppq-2f6r-wfvm. Downstream
+  resolvers respect the pin, so they cannot land on a vulnerable 0.11.x
+  through ringline-quic or ringline-h3.
+- The `rustls` floor is raised to 0.23.46 for RUSTSEC-2026-0346 (`Debug`
+  output of client session values exposes TLS secrets), RUSTSEC-2026-0347
+  (buffered application data sent to the outer server after ECH rejection),
+  RUSTSEC-2026-0348 (Brotli certificate decompression can allocate up to
+  1 GiB before authentication) and RUSTSEC-2026-0349 (an unauthenticated
+  ServerHello can downgrade later connections to classical key exchange).
+  The `ringline` crate now takes rustls from the workspace pin; its own
+  requirement was `0.23`. Of the other published crates, only `ringline-quic`
+  depends on rustls outside its dev-dependencies, and every `ringline-quic`
+  release predates #399; the latest, 0.6.0, requires rustls 0.23.18. So the
+  0.23.45 floor from #399 reached no user of the published crates.
+
 ## [0.6.10] - 2026-10-11
 
 ### Changed
