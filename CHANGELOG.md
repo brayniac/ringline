@@ -434,10 +434,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `ringline-redis` and `ringline-memcache`: a client built with
   `with_metrics()` and no `on_result` callback records the latency of
   `fire_*`/`recv` operations. It read the clock only when a callback was
-  set, so those operations recorded `latency_ns = 0` in `ClientMetrics` and
-  in `CompletedOp`. Builds with the removed `timestamps` feature already
-  timed them. Such a client now reads the clock twice per operation, as the
-  sequential API already did.
+  set, so those operations recorded `latency_ns = 0` in `ClientMetrics`,
+  `CompletedOp` and redis `RespMeta`. Builds with the removed `timestamps`
+  feature already timed them. Such a client now reads the clock when an
+  operation is sent (once per batch when batching) and again when its
+  response is parsed, as the sequential API already did.
 - A connection's receive accumulator gives its allocation back when the
   connection closes. An accumulator grows to the largest message its
   connection buffered, and `reset` keeps the allocation, so each slot kept

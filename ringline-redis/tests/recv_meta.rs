@@ -302,7 +302,7 @@ async fn run_recv_meta(addr: SocketAddr) -> Result<(), String> {
         }
     }
 
-    // (g) A client with metrics and no `on_result` callback times fire/recv
+    // (h) A client with metrics and no `on_result` callback times fire/recv
     // ops: `recv` reports a nonzero latency.
     #[cfg(feature = "metrics")]
     {
