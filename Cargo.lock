@@ -1626,7 +1626,7 @@ dependencies = [
 
 [[package]]
 name = "ringline"
-version = "0.6.10"
+version = "0.6.11"
 dependencies = [
  "bytes",
  "criterion",
@@ -1776,7 +1776,7 @@ dependencies = [
 
 [[package]]
 name = "ringline-quic"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "bytes",
  "quinn-proto",

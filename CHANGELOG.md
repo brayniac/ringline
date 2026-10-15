@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.11] - 2026-10-14
+
+`ringline` 0.6.11 and `ringline-quic` 0.6.1 carry both floors below.
+
 ### Security
 
 - The `quinn-proto` floor is raised to 0.11.19 for RUSTSEC-2026-0338,
@@ -23,7 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   The `ringline` crate now takes rustls from the workspace pin; its own
   requirement was `0.23`. Of the other published crates, only `ringline-quic`
   depends on rustls outside its dev-dependencies, and every `ringline-quic`
-  release predates #399; the latest, 0.6.0, requires rustls 0.23.18. So the
+  release before 0.6.1 predates #399; 0.6.0 requires rustls 0.23.18. So the
   0.23.45 floor from #399 reached no user of the published crates.
 
 ## [0.6.10] - 2026-10-11
