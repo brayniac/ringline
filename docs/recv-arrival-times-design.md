@@ -425,11 +425,10 @@ It is not part of this design.
 
 ## Dependencies
 
-- #670 (merged) made `park_blocker` refuse a connection with a lent buffer in
+- #670 made `park_blocker` refuse a connection with a lent buffer in
   `pending_recv_bufs`.
-- The fix for #669 (not merged) adds `Driver::holds_unread`, which
-  `park_blocker` and `offer_park` share. This work rewrites it in terms of
-  `buffered`, so it lands after that fix.
+- #671 (the fix for #669) added `Driver::holds_unread`, which `park_blocker`
+  and `offer_park` share. This work rewrites it in terms of `recv_buffered`.
 
 ## Cost
 
