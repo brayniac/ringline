@@ -203,6 +203,7 @@ pub mod park_diag {
 /// Counter slot indices for park-abandonment reasons.
 ///
 /// One slot per `ParkBlocker`, plus the two failures that are not blockers.
+/// Slot 2 is unused.
 /// Nothing is collapsed: an earlier version grouped the variants believed
 /// unreachable at the install re-check into a single `other_blocker`, and that
 /// slot then absorbed 97.8% of abandonments (18,844 of 19,268 in a saturated

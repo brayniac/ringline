@@ -275,17 +275,17 @@ adopting worker gets a stale session next to a partial message. Nothing
 becomes permanently unparkable either: the handler re-offers at its next idle
 point and the park happens then. Park is best-effort by construction.
 
-So the gate refuses while anything is unconsumed —
-accumulator, `recv_hold`, `segment_hold` or `segment_pinned`
+So the gate refuses while anything is unconsumed — accumulator, a lent buffer
+in `pending_recv_bufs`, `recv_hold`, `segment_hold` or `segment_pinned`
 (`ParkBlocker::DataPending`). Stating it as a property of *state* rather than
 as a withdraw hook on each delivery path is deliberate: the review found two
 recv paths that delivered bytes without withdrawing the offer, and a
-state-based gate means the next one added fails closed instead. The refusals are the states where
-the handler or the kernel is mid-operation, and the gate names each one
-(`ParkBlocker`): not open or still handshaking; teardown already requested;
-queued or in-flight sends; an in-flight Mode A forward write; an active send
-chain; a live `SegmentReader`; an in-flight fallback recv; a queued
-direct-echo response.
+state-based gate means the next one added fails closed instead. The refusals
+are the states where the handler or the kernel is mid-operation, and the gate
+names each one (`ParkBlocker`): not open or still handshaking; teardown
+already requested; queued or in-flight sends; an in-flight Mode A forward
+write; an active send chain; a live `SegmentReader`; an in-flight fallback
+recv; a queued direct-echo response.
 
 One non-obvious exclusion. `recv_half_taken` / `send_half_taken` look like
 blockers and are not: since #427 the halves are the normal API and a typical

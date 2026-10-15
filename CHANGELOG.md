@@ -431,6 +431,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- io_uring: a connection with a lent receive buffer is not parked. The park
+  check refused a connection holding unread bytes in its accumulator or
+  receive holds, but not one whose bytes were in a lent provided buffer
+  (`pending_recv_bufs`), and the park does not carry that buffer. Bytes that
+  arrived before the handler offered to park, and that the handler had not
+  read when the park completed, were discarded when the park closed the
+  connection on the old worker. Found by reading the code; not observed.
+  Park (#443) is not in a release.
 - `ringline-redis` and `ringline-memcache`: a client built with
   `with_metrics()` and no `on_result` callback records the latency of
   `fire_*`/`recv` operations. It read the clock only when a callback was
