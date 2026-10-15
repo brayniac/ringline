@@ -93,6 +93,12 @@ impl RecvAccumulator {
         self.total_len() == 0
     }
 
+    /// Total buffered bytes — O(1) and non-merging, like
+    /// [`is_empty`](Self::is_empty).
+    pub fn len(&self) -> usize {
+        self.total_len()
+    }
+
     /// Merge a held frozen remainder into `buf` so the contents are one
     /// contiguous mutable region again. One copy of the remainder; only
     /// needed when new data arrived while a remainder was held, or when a
@@ -282,6 +288,12 @@ impl AccumulatorTable {
     /// [`RecvAccumulator::is_empty`]).
     pub fn is_empty(&self, index: u32) -> bool {
         self.accumulators[index as usize].is_empty()
+    }
+
+    /// Bytes held by the accumulator at the given index — O(1) and
+    /// non-merging (see [`RecvAccumulator::len`]).
+    pub fn len(&self, index: u32) -> usize {
+        self.accumulators[index as usize].len()
     }
 
     /// Consume `n` bytes from the accumulator at the given index.

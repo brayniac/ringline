@@ -6,5 +6,6 @@
 //! testable on both backends (including macOS/mio, where the io_uring path
 //! cannot be built).
 
+pub(crate) mod arrival;
 pub(crate) mod domain;
 pub(crate) mod occupancy;

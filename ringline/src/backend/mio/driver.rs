@@ -134,6 +134,11 @@ pub(crate) fn clear_pending_sends_into(
 pub(crate) struct Driver {
     pub(crate) connections: ConnectionTable,
     pub(crate) accumulators: AccumulatorTable,
+    /// Per-connection receive arrival log (`recv::arrival`).
+    pub(crate) arrival: Vec<crate::recv::arrival::ArrivalLog>,
+    /// The current batch, whose time the arrival logs record. A batch begins
+    /// after `poll` returns and in `drain_forward_resumes`.
+    pub(crate) recv_batch: crate::recv::arrival::BatchClock,
     pub(crate) send_copy_pool: SendCopyPool,
     pub(crate) send_queues: Vec<ConnSendState>,
     pub(crate) accept_rx: Option<crossbeam_channel::Receiver<crate::acceptor::AcceptedConn>>,
@@ -297,6 +302,45 @@ pub(crate) struct Driver {
 }
 
 impl Driver {
+    /// Bytes the connection holds that no consumer has taken: the
+    /// accumulator. The arrival log takes the first unread stream offset as
+    /// `delivered - recv_buffered`.
+    pub(crate) fn recv_buffered(&self, conn_index: u32) -> usize {
+        self.accumulators.len(conn_index)
+    }
+
+    /// Record `n` bytes delivered to the connection in the current batch.
+    /// Runs before the bytes are placed anywhere.
+    pub(crate) fn record_arrival(&mut self, conn_index: u32, n: usize) {
+        if n == 0 {
+            return;
+        }
+        self.arrival_trim_if_due(conn_index);
+        self.arrival_add(conn_index, n);
+    }
+
+    /// Step 1 of a record: trim the arrival log if it is due, using the
+    /// current `delivered` and `recv_buffered`.
+    pub(crate) fn arrival_trim_if_due(&mut self, conn_index: u32) {
+        #[cfg(not(ringline_no_arrival_log))]
+        if self.arrival[conn_index as usize].trim_due() {
+            let unread = self.arrival[conn_index as usize]
+                .delivered()
+                .saturating_sub(self.recv_buffered(conn_index) as u64);
+            self.arrival[conn_index as usize].trim(unread);
+        }
+        #[cfg(ringline_no_arrival_log)]
+        let _ = conn_index;
+    }
+
+    /// Step 2 of a record: add `n` bytes at the current batch's time.
+    pub(crate) fn arrival_add(&mut self, conn_index: u32, n: usize) {
+        #[cfg(not(ringline_no_arrival_log))]
+        self.arrival[conn_index as usize].add(n as u64, &mut self.recv_batch);
+        #[cfg(ringline_no_arrival_log)]
+        let _ = (conn_index, n);
+    }
+
     /// Create a new mio-backed driver.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -389,6 +433,10 @@ impl Driver {
                 config.recv_buffer.buffer_size as usize,
                 config.recv_accumulator_max,
             ),
+            arrival: (0..config.max_connections)
+                .map(|_| crate::recv::arrival::ArrivalLog::default())
+                .collect(),
+            recv_batch: crate::recv::arrival::BatchClock::new(),
             send_copy_pool: {
                 let mut pool =
                     SendCopyPool::new(config.send_copy_count, config.send_copy_slot_size);
@@ -621,6 +669,7 @@ impl Driver {
             self.connect_pending -= 1;
         }
         self.accumulators.release(conn_index);
+        self.arrival[idx].release();
 
         self.send_queues[idx].queue.clear();
         self.send_queues[idx].in_flight = false;

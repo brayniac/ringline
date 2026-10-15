@@ -313,6 +313,16 @@ pub(crate) enum HeldRecvBuf {
     Owned(bytes::Bytes),
 }
 
+impl HeldRecvBuf {
+    /// Bytes the entry holds.
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            HeldRecvBuf::Pinned { len, .. } => *len as usize,
+            HeldRecvBuf::Owned(b) => b.len(),
+        }
+    }
+}
+
 /// Held buffers gathered into one forward write.
 ///
 /// Bounded rather than unbounded: a batch is one operation whose completion
@@ -558,6 +568,11 @@ pub(crate) struct Driver {
     /// under `try_with_state`, or `close_connection` under `&mut Driver`)
     /// replenishes the bid exactly once; the other sees `None` and does nothing.
     pub(crate) segment_pinned: Vec<Option<HeldRecvBuf>>,
+    /// Per-connection receive arrival log (`recv::arrival`).
+    pub(crate) arrival: Vec<crate::recv::arrival::ArrivalLog>,
+    /// The current completion batch, whose time the arrival logs record. A
+    /// batch begins in `drain_completions` after each reap.
+    pub(crate) recv_batch: crate::recv::arrival::BatchClock,
     /// The handler has offered this connection for park (tier 3, #443).
     ///
     /// Depositing is the opt-in: a connection whose handler never offered it
@@ -1343,6 +1358,10 @@ impl Driver {
                 .map(|_| std::collections::VecDeque::new())
                 .collect(),
             segment_pinned: vec![None; config.max_connections as usize],
+            arrival: (0..config.max_connections)
+                .map(|_| crate::recv::arrival::ArrivalLog::default())
+                .collect(),
+            recv_batch: crate::recv::arrival::BatchClock::new(),
             adopt_pending: std::collections::HashMap::new(),
             park_offered: vec![false; config.max_connections as usize],
             park_drain: vec![None; config.max_connections as usize],
@@ -2361,18 +2380,65 @@ impl Driver {
         owned
     }
 
-    /// Whether the connection holds received bytes that no consumer has
-    /// finished with: the accumulator, a lent buffer in `pending_recv_bufs`,
-    /// `segment_hold`, `recv_hold` or a pinned segment. `park_blocker` refuses
-    /// a park while this holds (`ParkBlocker::DataPending`), and `offer_park`
-    /// declines an offer.
-    pub(crate) fn holds_unread(&self, conn_index: u32) -> bool {
+    /// Bytes the connection holds that no consumer has taken: the
+    /// accumulator, a lent buffer in `pending_recv_bufs`, `segment_hold` and
+    /// `recv_hold`. A buffer in `segment_pinned` has been handed to a
+    /// `RecvSegment`, so its bytes are not counted.
+    ///
+    /// The arrival log takes the first unread stream offset as
+    /// `delivered - recv_buffered`.
+    pub(crate) fn recv_buffered(&self, conn_index: u32) -> usize {
         let idx = conn_index as usize;
-        !self.accumulators.is_empty(conn_index)
-            || self.pending_recv_bufs[idx].is_some()
-            || !self.segment_hold[idx].is_empty()
-            || !self.recv_hold[idx].is_empty()
-            || self.segment_pinned[idx].is_some()
+        self.accumulators.len(conn_index)
+            + self.pending_recv_bufs[idx].map_or(0, |p| p.len as usize)
+            + self.segment_hold[idx]
+                .iter()
+                .map(HeldRecvBuf::len)
+                .sum::<usize>()
+            + self.recv_hold[idx]
+                .iter()
+                .map(|p| p.len as usize)
+                .sum::<usize>()
+    }
+
+    /// Record `n` bytes delivered to the connection in the current batch.
+    /// Runs before the bytes are placed anywhere.
+    pub(crate) fn record_arrival(&mut self, conn_index: u32, n: usize) {
+        if n == 0 {
+            return;
+        }
+        self.arrival_trim_if_due(conn_index);
+        self.arrival_add(conn_index, n);
+    }
+
+    /// Step 1 of a record: trim the arrival log if it is due, using the
+    /// current `delivered` and `recv_buffered`.
+    pub(crate) fn arrival_trim_if_due(&mut self, conn_index: u32) {
+        #[cfg(not(ringline_no_arrival_log))]
+        if self.arrival[conn_index as usize].trim_due() {
+            let unread = self.arrival[conn_index as usize]
+                .delivered()
+                .saturating_sub(self.recv_buffered(conn_index) as u64);
+            self.arrival[conn_index as usize].trim(unread);
+        }
+        #[cfg(ringline_no_arrival_log)]
+        let _ = conn_index;
+    }
+
+    /// Step 2 of a record: add `n` bytes at the current batch's time.
+    pub(crate) fn arrival_add(&mut self, conn_index: u32, n: usize) {
+        #[cfg(not(ringline_no_arrival_log))]
+        self.arrival[conn_index as usize].add(n as u64, &mut self.recv_batch);
+        #[cfg(ringline_no_arrival_log)]
+        let _ = (conn_index, n);
+    }
+
+    /// Whether the connection holds received bytes that no consumer has
+    /// finished with: `recv_buffered` is nonzero, or a buffer is pinned by a
+    /// live `RecvSegment`. `park_blocker` refuses a park while this holds
+    /// (`ParkBlocker::DataPending`), and `offer_park` declines an offer.
+    pub(crate) fn holds_unread(&self, conn_index: u32) -> bool {
+        self.recv_buffered(conn_index) > 0 || self.segment_pinned[conn_index as usize].is_some()
     }
 
     /// Record a handler's park offer, with the state to carry

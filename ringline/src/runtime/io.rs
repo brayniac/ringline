@@ -1052,6 +1052,35 @@ pub struct ConnCtx {
     pub(crate) _not_send: PhantomData<*const ()>,
 }
 
+/// The connection's `recv_buffered` count at the start of a reporting
+/// reader's poll, taken after the generation check
+/// (`docs/recv-arrival-times-design.md`).
+fn arrival_mark(driver: &Driver, conn_index: u32) -> usize {
+    #[cfg(not(ringline_no_arrival_log))]
+    {
+        driver.recv_buffered(conn_index)
+    }
+    #[cfg(ringline_no_arrival_log)]
+    {
+        let _ = (driver, conn_index);
+        0
+    }
+}
+
+/// Settle a reporting reader's resolving poll in the connection's arrival
+/// log. `before` is the poll's [`arrival_mark`]; `report` is false when the
+/// call resolved without consuming input, which leaves `recv_arrival` at
+/// `None`.
+fn arrival_settle(driver: &mut Driver, conn_index: u32, before: usize, report: bool) {
+    #[cfg(not(ringline_no_arrival_log))]
+    {
+        let after = driver.recv_buffered(conn_index);
+        driver.arrival[conn_index as usize].settle_read(before, after, report);
+    }
+    #[cfg(ringline_no_arrival_log)]
+    let _ = (driver, conn_index, before, report);
+}
+
 /// Bytes a zero-copy `forward_recv_buf` detached from the accumulator during
 /// the closure that just ran, cleared as it is read.
 ///
@@ -1968,6 +1997,17 @@ impl ConnCtx {
         }
     }
 
+    /// Crate-internal body of [`Connection::recv_arrival`]; see that method.
+    pub(crate) fn recv_arrival(&self) -> Option<crate::RecvArrival> {
+        try_with_state(|driver, _| {
+            if driver.connections.generation(self.conn_index) != self.generation {
+                return None;
+            }
+            driver.arrival[self.conn_index as usize].latest()
+        })
+        .flatten()
+    }
+
     /// Non-blocking accumulator access. Calls `f` with buffered data if any,
     /// returning `Some(result)`. Returns `None` if the accumulator is empty.
     pub(crate) fn try_with_data<F: FnOnce(&[u8]) -> ParseResult>(
@@ -1981,8 +2021,10 @@ impl ConnCtx {
             if driver.connections.generation(self.conn_index) != self.generation {
                 return None;
             }
+            let before = arrival_mark(driver, self.conn_index);
             let data = driver.accumulators.data(self.conn_index);
             if data.is_empty() {
+                arrival_settle(driver, self.conn_index, before, false);
                 return None;
             }
             let result = {
@@ -1999,6 +2041,7 @@ impl ConnCtx {
                     .accumulators
                     .consume(self.conn_index, consumed.saturating_sub(forwarded));
             }
+            arrival_settle(driver, self.conn_index, before, true);
             Some(result)
         })
     }
@@ -3155,155 +3198,165 @@ impl<F: FnMut(&[u8]) -> ParseResult + Unpin> Future for WithDataFuture<F> {
                 self.f.take();
                 return Poll::Ready(0);
             }
-            // Zero-copy fast path: check pending recv buffer before accumulator.
-            // Only available on io_uring where kernel-provided buffers are used.
-            #[cfg(has_io_uring)]
-            if driver.pending_recv_bufs[self.conn_index as usize].is_some() {
-                // Non-merging emptiness check — `data()` would merge a held
-                // frozen remainder just to answer a boolean.
-                let acc_empty = driver.accumulators.is_empty(self.conn_index);
-                if acc_empty {
-                    // Borrow the kernel buffer in-place — no copy.
-                    let pending = driver.pending_recv_bufs[self.conn_index as usize].unwrap();
-                    let data =
-                        unsafe { std::slice::from_raw_parts(pending.ptr, pending.len as usize) };
-                    #[cfg(has_io_uring)]
-                    let cb_conn = self.conn_index;
-                    let f = self.f.as_mut().expect("WithDataFuture polled after Ready");
-                    let result = {
-                        #[cfg(has_io_uring)]
-                        let _cb = ReaderCallback::enter(cb_conn);
-                        f(data)
-                    };
-                    match result {
-                        ParseResult::Consumed(consumed) if consumed > 0 => {
-                            // The closure may have called forward_recv_buf(), which
-                            // takes the pending slot. Only replenish if still present.
-                            if let Some(pending) =
-                                driver.pending_recv_bufs[self.conn_index as usize].take()
-                            {
-                                if consumed < pending.len as usize {
-                                    // Partial consume: copy remainder to accumulator.
-                                    let remainder = unsafe {
-                                        std::slice::from_raw_parts(
-                                            pending.ptr.add(consumed),
-                                            pending.len as usize - consumed,
-                                        )
-                                    };
-                                    driver.accumulators.append(self.conn_index, remainder);
-                                }
-                                driver.pending_replenish.push(pending.bid);
-                            }
-                            self.f.take();
-                            return Poll::Ready(consumed);
-                        }
-                        _ => {
-                            // NeedMore / Consumed(0): flush pending to accumulator
-                            // and fall through to the existing accumulator path.
-                            if let Some(pending) =
-                                driver.pending_recv_bufs[self.conn_index as usize].take()
-                            {
-                                let pending_data = unsafe {
-                                    std::slice::from_raw_parts(pending.ptr, pending.len as usize)
-                                };
-                                driver.accumulators.append(self.conn_index, pending_data);
-                                driver.pending_replenish.push(pending.bid);
-                            }
-                            // Fall through to accumulator path below.
-                        }
-                    }
-                } else {
-                    // Accumulator has data AND there's a pending buffer.
-                    // Flush pending to accumulator (prepend — it arrived first).
-                    let pending = driver.pending_recv_bufs[self.conn_index as usize]
-                        .take()
-                        .unwrap();
-                    let pending_data =
-                        unsafe { std::slice::from_raw_parts(pending.ptr, pending.len as usize) };
-                    driver.accumulators.prepend(self.conn_index, pending_data);
-                    driver.pending_replenish.push(pending.bid);
-                    // Fall through to accumulator path below.
-                }
+            let before = arrival_mark(driver, self.conn_index);
+            let poll = self.poll_current(driver, executor);
+            if let Poll::Ready(consumed) = poll {
+                arrival_settle(driver, self.conn_index, before, consumed > 0);
             }
+            poll
+        })
+    }
+}
 
-            let data = driver.accumulators.data(self.conn_index);
-            if data.is_empty() {
-                // Check if the connection has been closed — return 0 (EOF)
-                // so the caller can detect disconnection.
-                let is_closed = driver
-                    .connections
-                    .get(self.conn_index)
-                    .map(|c| c.recv_finished())
-                    .unwrap_or(true); // connection already released
-                if is_closed {
-                    #[cfg(has_io_uring)]
-                    let cb_conn = self.conn_index;
-                    let f = self.f.as_mut().expect("WithDataFuture polled after Ready");
-                    let result = {
-                        #[cfg(has_io_uring)]
-                        let _cb = ReaderCallback::enter(cb_conn);
-                        f(&[])
-                    };
-                    self.f.take();
-                    return Poll::Ready(match result {
-                        ParseResult::Consumed(n) => n,
-                        ParseResult::NeedMore | ParseResult::NeedAtLeast(_) => 0,
-                    });
-                }
-
-                // No data available — register as recv waiter and park.
-                executor.owner_task[self.conn_index as usize] =
-                    Some(CURRENT_TASK_ID.with(|c| c.get()));
-                executor.recv_waiters[self.conn_index as usize] = true;
-                return Poll::Pending;
-            }
-
-            // Data available — call closure immediately (zero-overhead hot path).
-            #[cfg(has_io_uring)]
-            let cb_conn = self.conn_index;
-            let f = self.f.as_mut().expect("WithDataFuture polled after Ready");
-            let result = {
+impl<F: FnMut(&[u8]) -> ParseResult + Unpin> WithDataFuture<F> {
+    /// `poll` for a future whose generation matches the connection's.
+    fn poll_current(&mut self, driver: &mut Driver, executor: &mut Executor) -> Poll<usize> {
+        // Zero-copy fast path: check pending recv buffer before accumulator.
+        // Only available on io_uring where kernel-provided buffers are used.
+        #[cfg(has_io_uring)]
+        if driver.pending_recv_bufs[self.conn_index as usize].is_some() {
+            // Non-merging emptiness check — `data()` would merge a held
+            // frozen remainder just to answer a boolean.
+            let acc_empty = driver.accumulators.is_empty(self.conn_index);
+            if acc_empty {
+                // Borrow the kernel buffer in-place — no copy.
+                let pending = driver.pending_recv_bufs[self.conn_index as usize].unwrap();
+                let data = unsafe { std::slice::from_raw_parts(pending.ptr, pending.len as usize) };
                 #[cfg(has_io_uring)]
-                let _cb = ReaderCallback::enter(cb_conn);
-                f(data)
-            };
-            #[cfg(has_io_uring)]
-            let forwarded = take_forward_zc_consumed(driver, self.conn_index);
-            #[cfg(not(has_io_uring))]
-            let forwarded = 0usize;
-            match result {
-                ParseResult::Consumed(consumed) if consumed > 0 => {
-                    driver
-                        .accumulators
-                        .consume(self.conn_index, consumed.saturating_sub(forwarded));
-                    self.f.take();
-                    return Poll::Ready(consumed);
+                let cb_conn = self.conn_index;
+                let f = self.f.as_mut().expect("WithDataFuture polled after Ready");
+                let result = {
+                    #[cfg(has_io_uring)]
+                    let _cb = ReaderCallback::enter(cb_conn);
+                    f(data)
+                };
+                match result {
+                    ParseResult::Consumed(consumed) if consumed > 0 => {
+                        // The closure may have called forward_recv_buf(), which
+                        // takes the pending slot. Only replenish if still present.
+                        if let Some(pending) =
+                            driver.pending_recv_bufs[self.conn_index as usize].take()
+                        {
+                            if consumed < pending.len as usize {
+                                // Partial consume: copy remainder to accumulator.
+                                let remainder = unsafe {
+                                    std::slice::from_raw_parts(
+                                        pending.ptr.add(consumed),
+                                        pending.len as usize - consumed,
+                                    )
+                                };
+                                driver.accumulators.append(self.conn_index, remainder);
+                            }
+                            driver.pending_replenish.push(pending.bid);
+                        }
+                        self.f.take();
+                        return Poll::Ready(consumed);
+                    }
+                    _ => {
+                        // NeedMore / Consumed(0): flush pending to accumulator
+                        // and fall through to the existing accumulator path.
+                        if let Some(pending) =
+                            driver.pending_recv_bufs[self.conn_index as usize].take()
+                        {
+                            let pending_data = unsafe {
+                                std::slice::from_raw_parts(pending.ptr, pending.len as usize)
+                            };
+                            driver.accumulators.append(self.conn_index, pending_data);
+                            driver.pending_replenish.push(pending.bid);
+                        }
+                        // Fall through to accumulator path below.
+                    }
                 }
-                _ => {}
+            } else {
+                // Accumulator has data AND there's a pending buffer.
+                // Flush pending to accumulator (prepend — it arrived first).
+                let pending = driver.pending_recv_bufs[self.conn_index as usize]
+                    .take()
+                    .unwrap();
+                let pending_data =
+                    unsafe { std::slice::from_raw_parts(pending.ptr, pending.len as usize) };
+                driver.accumulators.prepend(self.conn_index, pending_data);
+                driver.pending_replenish.push(pending.bid);
+                // Fall through to accumulator path below.
             }
-            // A length-prefixed parser announced the remainder — reserve
-            // once so the arriving chunks append without regrowth.
-            if let ParseResult::NeedAtLeast(additional) = result {
-                driver.accumulators.reserve(self.conn_index, additional);
-            }
+        }
 
-            // NeedMore or Consumed(0) on non-empty data: incomplete parse.
-            // Check if the connection is closed (EOF with leftover partial data).
+        let data = driver.accumulators.data(self.conn_index);
+        if data.is_empty() {
+            // Check if the connection has been closed — return 0 (EOF)
+            // so the caller can detect disconnection.
             let is_closed = driver
                 .connections
                 .get(self.conn_index)
                 .map(|c| c.recv_finished())
-                .unwrap_or(true);
+                .unwrap_or(true); // connection already released
             if is_closed {
+                #[cfg(has_io_uring)]
+                let cb_conn = self.conn_index;
+                let f = self.f.as_mut().expect("WithDataFuture polled after Ready");
+                let result = {
+                    #[cfg(has_io_uring)]
+                    let _cb = ReaderCallback::enter(cb_conn);
+                    f(&[])
+                };
                 self.f.take();
-                return Poll::Ready(0);
+                return Poll::Ready(match result {
+                    ParseResult::Consumed(n) => n,
+                    ParseResult::NeedMore | ParseResult::NeedAtLeast(_) => 0,
+                });
             }
 
-            // Connection still open — wait for more data before retrying.
+            // No data available — register as recv waiter and park.
             executor.owner_task[self.conn_index as usize] = Some(CURRENT_TASK_ID.with(|c| c.get()));
             executor.recv_waiters[self.conn_index as usize] = true;
-            Poll::Pending
-        })
+            return Poll::Pending;
+        }
+
+        // Data available — call closure immediately (zero-overhead hot path).
+        #[cfg(has_io_uring)]
+        let cb_conn = self.conn_index;
+        let f = self.f.as_mut().expect("WithDataFuture polled after Ready");
+        let result = {
+            #[cfg(has_io_uring)]
+            let _cb = ReaderCallback::enter(cb_conn);
+            f(data)
+        };
+        #[cfg(has_io_uring)]
+        let forwarded = take_forward_zc_consumed(driver, self.conn_index);
+        #[cfg(not(has_io_uring))]
+        let forwarded = 0usize;
+        match result {
+            ParseResult::Consumed(consumed) if consumed > 0 => {
+                driver
+                    .accumulators
+                    .consume(self.conn_index, consumed.saturating_sub(forwarded));
+                self.f.take();
+                return Poll::Ready(consumed);
+            }
+            _ => {}
+        }
+        // A length-prefixed parser announced the remainder — reserve
+        // once so the arriving chunks append without regrowth.
+        if let ParseResult::NeedAtLeast(additional) = result {
+            driver.accumulators.reserve(self.conn_index, additional);
+        }
+
+        // NeedMore or Consumed(0) on non-empty data: incomplete parse.
+        // Check if the connection is closed (EOF with leftover partial data).
+        let is_closed = driver
+            .connections
+            .get(self.conn_index)
+            .map(|c| c.recv_finished())
+            .unwrap_or(true);
+        if is_closed {
+            self.f.take();
+            return Poll::Ready(0);
+        }
+
+        // Connection still open — wait for more data before retrying.
+        executor.owner_task[self.conn_index as usize] = Some(CURRENT_TASK_ID.with(|c| c.get()));
+        executor.recv_waiters[self.conn_index as usize] = true;
+        Poll::Pending
     }
 }
 
@@ -3384,90 +3437,106 @@ impl<F: FnMut(Bytes) -> ParseResult + Unpin> Future for WithBytesFuture<F> {
                 self.f.take();
                 return Poll::Ready(0);
             }
-
-            // Flush any pending zero-copy recv buffer to accumulator so
-            // take_frozen() will include it (io_uring only).
-            #[cfg(has_io_uring)]
-            if let Some(pending) = driver.pending_recv_bufs[self.conn_index as usize].take() {
-                let pending_data =
-                    unsafe { std::slice::from_raw_parts(pending.ptr, pending.len as usize) };
-                driver.accumulators.append(self.conn_index, pending_data);
-                driver.pending_replenish.push(pending.bid);
+            let before = arrival_mark(driver, self.conn_index);
+            let poll = self.poll_current(driver, executor, is_closed);
+            if let Poll::Ready(consumed) = poll {
+                arrival_settle(driver, self.conn_index, before, consumed > 0);
             }
+            poll
+        })
+    }
+}
 
-            let data = driver.accumulators.data(self.conn_index);
-            if data.is_empty() {
-                // No data yet — check closed state from the lookup above.
-                if is_closed {
-                    #[cfg(has_io_uring)]
-                    let cb_conn = self.conn_index;
-                    let f = self.f.as_mut().expect("WithBytesFuture polled after Ready");
-                    let result = {
-                        #[cfg(has_io_uring)]
-                        let _cb = ReaderCallback::enter(cb_conn);
-                        f(Bytes::new())
-                    };
-                    self.f.take();
-                    return Poll::Ready(match result {
-                        ParseResult::Consumed(n) => n,
-                        ParseResult::NeedMore | ParseResult::NeedAtLeast(_) => 0,
-                    });
-                }
+impl<F: FnMut(Bytes) -> ParseResult + Unpin> WithBytesFuture<F> {
+    /// `poll` for a future whose generation matches the connection's.
+    /// `is_closed` is the connection's `recv_finished()`.
+    fn poll_current(
+        &mut self,
+        driver: &mut Driver,
+        executor: &mut Executor,
+        is_closed: bool,
+    ) -> Poll<usize> {
+        // Flush any pending zero-copy recv buffer to accumulator so
+        // take_frozen() will include it (io_uring only).
+        #[cfg(has_io_uring)]
+        if let Some(pending) = driver.pending_recv_bufs[self.conn_index as usize].take() {
+            let pending_data =
+                unsafe { std::slice::from_raw_parts(pending.ptr, pending.len as usize) };
+            driver.accumulators.append(self.conn_index, pending_data);
+            driver.pending_replenish.push(pending.bid);
+        }
 
-                executor.owner_task[self.conn_index as usize] =
-                    Some(CURRENT_TASK_ID.with(|c| c.get()));
-                executor.recv_waiters[self.conn_index as usize] = true;
-                return Poll::Pending;
-            }
-
-            // Detach accumulator as frozen Bytes (O(1), tail capacity retained).
-            let frozen = driver.accumulators.take_frozen(self.conn_index);
-            let len = frozen.len();
-
-            #[cfg(has_io_uring)]
-            let cb_conn = self.conn_index;
-            let f = self.f.as_mut().expect("WithBytesFuture polled after Ready");
-            // clone is an O(1) Bytes refcount bump; the original `frozen` is retained for the prepend calls below.
-            let result = {
-                #[cfg(has_io_uring)]
-                let _cb = ReaderCallback::enter(cb_conn);
-                f(frozen.clone())
-            };
-
-            match result {
-                ParseResult::Consumed(consumed) if consumed > 0 => {
-                    // Put back the unconsumed remainder (if any) as a
-                    // refcounted slice handoff.
-                    if consumed < len {
-                        driver
-                            .accumulators
-                            .put_back(self.conn_index, frozen.slice(consumed..));
-                    }
-                    self.f.take();
-                    return Poll::Ready(consumed);
-                }
-                _ => {}
-            }
-
-            // NeedMore or Consumed(0) on non-empty data: incomplete parse.
-            // Put everything back and use closed state from the lookup above.
-            driver.accumulators.put_back(self.conn_index, frozen);
-            // A length-prefixed parser announced the remainder — record the
-            // reserve target so the unfreeze merge allocates once at full
-            // size when the next chunks arrive.
-            if let ParseResult::NeedAtLeast(additional) = result {
-                driver.accumulators.reserve(self.conn_index, additional);
-            }
-
+        let data = driver.accumulators.data(self.conn_index);
+        if data.is_empty() {
+            // No data yet — check closed state from the lookup above.
             if is_closed {
+                #[cfg(has_io_uring)]
+                let cb_conn = self.conn_index;
+                let f = self.f.as_mut().expect("WithBytesFuture polled after Ready");
+                let result = {
+                    #[cfg(has_io_uring)]
+                    let _cb = ReaderCallback::enter(cb_conn);
+                    f(Bytes::new())
+                };
                 self.f.take();
-                return Poll::Ready(0);
+                return Poll::Ready(match result {
+                    ParseResult::Consumed(n) => n,
+                    ParseResult::NeedMore | ParseResult::NeedAtLeast(_) => 0,
+                });
             }
 
             executor.owner_task[self.conn_index as usize] = Some(CURRENT_TASK_ID.with(|c| c.get()));
             executor.recv_waiters[self.conn_index as usize] = true;
-            Poll::Pending
-        })
+            return Poll::Pending;
+        }
+
+        // Detach accumulator as frozen Bytes (O(1), tail capacity retained).
+        let frozen = driver.accumulators.take_frozen(self.conn_index);
+        let len = frozen.len();
+
+        #[cfg(has_io_uring)]
+        let cb_conn = self.conn_index;
+        let f = self.f.as_mut().expect("WithBytesFuture polled after Ready");
+        // clone is an O(1) Bytes refcount bump; the original `frozen` is retained for the prepend calls below.
+        let result = {
+            #[cfg(has_io_uring)]
+            let _cb = ReaderCallback::enter(cb_conn);
+            f(frozen.clone())
+        };
+
+        match result {
+            ParseResult::Consumed(consumed) if consumed > 0 => {
+                // Put back the unconsumed remainder (if any) as a
+                // refcounted slice handoff.
+                if consumed < len {
+                    driver
+                        .accumulators
+                        .put_back(self.conn_index, frozen.slice(consumed..));
+                }
+                self.f.take();
+                return Poll::Ready(consumed);
+            }
+            _ => {}
+        }
+
+        // NeedMore or Consumed(0) on non-empty data: incomplete parse.
+        // Put everything back and use closed state from the lookup above.
+        driver.accumulators.put_back(self.conn_index, frozen);
+        // A length-prefixed parser announced the remainder — record the
+        // reserve target so the unfreeze merge allocates once at full
+        // size when the next chunks arrive.
+        if let ParseResult::NeedAtLeast(additional) = result {
+            driver.accumulators.reserve(self.conn_index, additional);
+        }
+
+        if is_closed {
+            self.f.take();
+            return Poll::Ready(0);
+        }
+
+        executor.owner_task[self.conn_index as usize] = Some(CURRENT_TASK_ID.with(|c| c.get()));
+        executor.recv_waiters[self.conn_index as usize] = true;
+        Poll::Pending
     }
 }
 
@@ -3610,6 +3679,11 @@ impl RecvHalf {
     /// See [`Connection::eof_truncated`].
     pub fn eof_truncated(&self) -> bool {
         self.conn.eof_truncated()
+    }
+
+    /// See [`Connection::recv_arrival`].
+    pub fn recv_arrival(&self) -> Option<crate::RecvArrival> {
+        self.conn.recv_arrival()
     }
 
     /// See [`Connection::try_with_data`].
@@ -3943,6 +4017,29 @@ impl Connection {
     /// See [`Connection::eof_truncated`].
     pub fn eof_truncated(&self) -> bool {
         self.rx.as_conn_ref().eof_truncated()
+    }
+
+    /// When the bytes consumed by the most recent reader call on this
+    /// connection arrived.
+    ///
+    /// The reader calls that set it are `with_data`, `with_data_result`,
+    /// `with_bytes`, `try_with_data` and, on io_uring, `with_segments`, on
+    /// this connection or its [`RecvHalf`]. The call's bytes are the ones it
+    /// removed from the connection, whatever the parser returned.
+    /// Forwards, recv sinks, `ConnStream` and segment readers do not set it.
+    ///
+    /// Returns `None` until a reader call has consumed a byte, after a call
+    /// that consumed none or resolved at end of stream, and once the
+    /// connection's slot has been reused.
+    ///
+    /// Read it before the task's next `.await`. A task that runs two reader
+    /// calls on one connection at once, for example with `join!`, cannot tell
+    /// which call set it.
+    ///
+    /// See [`RecvArrival`](crate::RecvArrival) for what an arrival time
+    /// measures.
+    pub fn recv_arrival(&self) -> Option<crate::RecvArrival> {
+        self.rx.recv_arrival()
     }
 
     /// See [`Connection::try_with_data`].
@@ -5094,195 +5191,61 @@ impl<F: FnMut(&SegChain<'_>) -> SegConsumed + Unpin> Future for WithSegmentsFutu
 
     fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
         with_state(|driver, executor| {
-            let conn = self.conn_index;
-            let idx = conn as usize;
-
             // Stale future (slot closed-then-reused): surface EOF so the caller's
             // read loop terminates rather than reading the new occupant's data.
-            if driver.connections.generation(conn) != self.generation {
+            if driver.connections.generation(self.conn_index) != self.generation {
                 self.f.take();
                 return Poll::Ready(Ok(0));
             }
-
-            if !self.entered {
-                // A live `SegmentReader` owns the hold; handing the same
-                // buffers to a second consumer would double-deliver them.
-                if driver.segment_reader_live[idx] {
-                    self.f.take();
-                    return Poll::Ready(Err(io::Error::from_raw_os_error(libc::EBUSY)));
-                }
-                driver.recv_domain[idx] = crate::recv::domain::RecvDomain::Segmented;
-                self.entered = true;
+            let before = arrival_mark(driver, self.conn_index);
+            let poll = self.poll_current(driver, executor);
+            if let Poll::Ready(ref result) = poll {
+                let report = matches!(result, Ok(consumed) if *consumed > 0);
+                arrival_settle(driver, self.conn_index, before, report);
             }
+            poll
+        })
+    }
+}
 
-            // Flush a leftover single-buffer zero-copy recv (from a pre-`segments`
-            // `with_data` cycle on this slot) into the accumulator so it is
-            // presented accumulator-first, in order, ahead of any held buffers.
-            if let Some(pending) = driver.pending_recv_bufs[idx].take() {
-                let pending_data =
-                    unsafe { std::slice::from_raw_parts(pending.ptr, pending.len as usize) };
-                // Intermediate buffer shuffle: on breach the authoritative cap
-                // check below (during settle) closes the connection.
-                let _ = driver.accumulators.append(conn, pending_data);
-                driver.pending_replenish.push(pending.bid);
-            }
+#[cfg(has_io_uring)]
+impl<F: FnMut(&SegChain<'_>) -> SegConsumed + Unpin> WithSegmentsFuture<F> {
+    /// `poll` for a future whose generation matches the connection's.
+    fn poll_current(
+        &mut self,
+        driver: &mut Driver,
+        executor: &mut Executor,
+    ) -> Poll<io::Result<usize>> {
+        let conn = self.conn_index;
+        let idx = conn as usize;
 
-            // Nothing to present yet?
-            let acc_empty = driver.accumulators.is_empty(conn);
-            let hold_empty = driver.segment_hold[idx].is_empty();
-            if acc_empty && hold_empty {
-                let is_closed = driver
-                    .connections
-                    .get(conn)
-                    .map(|c| c.recv_finished())
-                    .unwrap_or(true);
-                if is_closed {
-                    self.f.take();
-                    return Poll::Ready(Ok(0));
-                }
-                // Open + nothing buffered → park; `handle_recv_multi` holds a
-                // buffer and calls `wake_recv` on the next arrival.
-                executor.owner_task[idx] = Some(CURRENT_TASK_ID.with(|c| c.get()));
-                executor.recv_waiters[idx] = true;
-                return Poll::Pending;
-            }
-
-            // Gather the ordered borrowed view: accumulator remainder first, then
-            // each held provided buffer. `held_meta` records (bid, len) by value so
-            // the settle below can run after the borrows are released.
-            let hold_len = driver.segment_hold[idx].len();
-            let mut slices: Vec<&[u8]> = Vec::with_capacity(1 + hold_len);
-            let mut held_meta: Vec<SegSettle> = Vec::with_capacity(hold_len);
-            let acc = driver.accumulators.data(conn);
-            let acc_len = acc.len();
-            if !acc.is_empty() {
-                slices.push(acc);
-            }
-            for held in &driver.segment_hold[idx] {
-                match held {
-                    crate::backend::HeldRecvBuf::Pinned { bid, off, len } => {
-                        // `data_ptr` returns a raw pointer (no borrow tie), so the
-                        // held slice does not alias the `provided_bufs` field borrow.
-                        let ptr = driver.provided_bufs.data_ptr(*bid, *off);
-                        let s = unsafe { std::slice::from_raw_parts(ptr, *len as usize) };
-                        slices.push(s);
-                        held_meta.push(SegSettle::Pinned {
-                            bid: *bid,
-                            off: *off,
-                            len: *len as usize,
-                        });
-                    }
-                    crate::backend::HeldRecvBuf::Owned(b) => {
-                        // Borrow the owned bytes for the chain; keep an O(1)
-                        // refcount clone in `held_meta` so the remainder survives
-                        // the `segment_hold.clear()` below (which drops the
-                        // original).
-                        slices.push(&b[..]);
-                        held_meta.push(SegSettle::Owned(b.clone()));
-                    }
-                }
-            }
-
-            // Present to the callback; clamp its answer to what we actually showed.
-            let consumed = {
-                let chain = SegChain { segs: &slices };
-                let total = chain.total_len();
-                #[cfg(has_io_uring)]
-                let cb_conn = self.conn_index;
-                let f = self
-                    .f
-                    .as_mut()
-                    .expect("WithSegmentsFuture polled after Ready");
-                let SegConsumed(c) = {
-                    #[cfg(has_io_uring)]
-                    let _cb = ReaderCallback::enter(cb_conn);
-                    f(&chain)
-                };
-                c.min(total)
-            };
-            // Release the accumulator/provided-buffer borrows before mutating.
-            drop(slices);
-
-            // ── Settle ──────────────────────────────────────────────────────
-            // All held buffers are being resolved this call, so drain the hold up
-            // front; each bid is either replenished (consumed) or gathered +
-            // replenished (remainder). Net: hold empties, un-consumed bytes live
-            // contiguously at the accumulator front, in order.
-            driver.segment_hold[idx].clear();
-
-            let mut rem_n = consumed;
-            // (1) Consume from the accumulator front (O(1) advance). If only part
-            // of the accumulator was consumed, `rem_n` is now 0 and every held
-            // buffer is untouched → gathered behind the accumulator remainder.
-            let acc_consumed = rem_n.min(acc_len);
-            driver.accumulators.consume(conn, acc_consumed);
-            rem_n -= acc_consumed;
-
-            // (2) Walk the held buffers in order.
-            let mut overflowed = false;
-            for meta in held_meta {
-                match meta {
-                    SegSettle::Pinned { bid, off, len } => {
-                        if rem_n >= len {
-                            // Wholly consumed by the callback — just replenish.
-                            rem_n -= len;
-                            driver.pending_replenish.push(bid);
-                        } else {
-                            // Partially consumed (or untouched, when rem_n == 0):
-                            // copy the unconsumed remainder [rem_n..len] into the
-                            // accumulator, in order, then replenish. Push the bid
-                            // even on breach so it is never leaked.
-                            if !overflowed {
-                                let ptr = driver.provided_bufs.data_ptr(bid, off);
-                                let remainder = unsafe {
-                                    std::slice::from_raw_parts(ptr.add(rem_n), len - rem_n)
-                                };
-                                if !driver.accumulators.append(conn, remainder) {
-                                    overflowed = true;
-                                }
-                            }
-                            rem_n = 0;
-                            driver.pending_replenish.push(bid);
-                        }
-                    }
-                    SegSettle::Owned(bytes) => {
-                        let len = bytes.len();
-                        if rem_n >= len {
-                            // Wholly consumed; the bid was replenished at delivery,
-                            // so there is nothing to return to the ring here.
-                            rem_n -= len;
-                        } else {
-                            // Copy the unconsumed remainder into the accumulator,
-                            // in order. No replenish (owned copy holds no bid).
-                            if !overflowed && !driver.accumulators.append(conn, &bytes[rem_n..]) {
-                                overflowed = true;
-                            }
-                            rem_n = 0;
-                        }
-                    }
-                }
-            }
-
-            if overflowed {
-                // The under-drain gather streamed past `recv_accumulator_max`
-                // (a misbehaving whole-frame consumer). Close rather than OOM;
-                // held bids were already queued for replenish above.
+        if !self.entered {
+            // A live `SegmentReader` owns the hold; handing the same
+            // buffers to a second consumer would double-deliver them.
+            if driver.segment_reader_live[idx] {
                 self.f.take();
-                driver.close_connection(conn);
-                return Poll::Ready(Ok(0));
+                return Poll::Ready(Err(io::Error::from_raw_os_error(libc::EBUSY)));
             }
+            driver.recv_domain[idx] = crate::recv::domain::RecvDomain::Segmented;
+            self.entered = true;
+        }
 
-            if consumed > 0 {
-                // Progress made — return it. Any carried-over remainder now sits at
-                // the accumulator front and is re-presented next call.
-                self.f.take();
-                return Poll::Ready(Ok(consumed));
-            }
+        // Flush a leftover single-buffer zero-copy recv (from a pre-`segments`
+        // `with_data` cycle on this slot) into the accumulator so it is
+        // presented accumulator-first, in order, ahead of any held buffers.
+        if let Some(pending) = driver.pending_recv_bufs[idx].take() {
+            let pending_data =
+                unsafe { std::slice::from_raw_parts(pending.ptr, pending.len as usize) };
+            // Intermediate buffer shuffle: on breach the authoritative cap
+            // check below (during settle) closes the connection.
+            let _ = driver.accumulators.append(conn, pending_data);
+            driver.pending_replenish.push(pending.bid);
+        }
 
-            // consumed == 0 (need a bigger frame): everything is gathered to the
-            // accumulator. Park for more data (bounded by recv_accumulator_max),
-            // or surface EOF if the recv side already closed. This mirrors
-            // `with_data`'s NeedMore idiom — never a busy loop.
+        // Nothing to present yet?
+        let acc_empty = driver.accumulators.is_empty(conn);
+        let hold_empty = driver.segment_hold[idx].is_empty();
+        if acc_empty && hold_empty {
             let is_closed = driver
                 .connections
                 .get(conn)
@@ -5292,10 +5255,160 @@ impl<F: FnMut(&SegChain<'_>) -> SegConsumed + Unpin> Future for WithSegmentsFutu
                 self.f.take();
                 return Poll::Ready(Ok(0));
             }
+            // Open + nothing buffered → park; `handle_recv_multi` holds a
+            // buffer and calls `wake_recv` on the next arrival.
             executor.owner_task[idx] = Some(CURRENT_TASK_ID.with(|c| c.get()));
             executor.recv_waiters[idx] = true;
-            Poll::Pending
-        })
+            return Poll::Pending;
+        }
+
+        // Gather the ordered borrowed view: accumulator remainder first, then
+        // each held provided buffer. `held_meta` records (bid, len) by value so
+        // the settle below can run after the borrows are released.
+        let hold_len = driver.segment_hold[idx].len();
+        let mut slices: Vec<&[u8]> = Vec::with_capacity(1 + hold_len);
+        let mut held_meta: Vec<SegSettle> = Vec::with_capacity(hold_len);
+        let acc = driver.accumulators.data(conn);
+        let acc_len = acc.len();
+        if !acc.is_empty() {
+            slices.push(acc);
+        }
+        for held in &driver.segment_hold[idx] {
+            match held {
+                crate::backend::HeldRecvBuf::Pinned { bid, off, len } => {
+                    // `data_ptr` returns a raw pointer (no borrow tie), so the
+                    // held slice does not alias the `provided_bufs` field borrow.
+                    let ptr = driver.provided_bufs.data_ptr(*bid, *off);
+                    let s = unsafe { std::slice::from_raw_parts(ptr, *len as usize) };
+                    slices.push(s);
+                    held_meta.push(SegSettle::Pinned {
+                        bid: *bid,
+                        off: *off,
+                        len: *len as usize,
+                    });
+                }
+                crate::backend::HeldRecvBuf::Owned(b) => {
+                    // Borrow the owned bytes for the chain; keep an O(1)
+                    // refcount clone in `held_meta` so the remainder survives
+                    // the `segment_hold.clear()` below (which drops the
+                    // original).
+                    slices.push(&b[..]);
+                    held_meta.push(SegSettle::Owned(b.clone()));
+                }
+            }
+        }
+
+        // Present to the callback; clamp its answer to what we actually showed.
+        let consumed = {
+            let chain = SegChain { segs: &slices };
+            let total = chain.total_len();
+            #[cfg(has_io_uring)]
+            let cb_conn = self.conn_index;
+            let f = self
+                .f
+                .as_mut()
+                .expect("WithSegmentsFuture polled after Ready");
+            let SegConsumed(c) = {
+                #[cfg(has_io_uring)]
+                let _cb = ReaderCallback::enter(cb_conn);
+                f(&chain)
+            };
+            c.min(total)
+        };
+        // Release the accumulator/provided-buffer borrows before mutating.
+        drop(slices);
+
+        // ── Settle ──────────────────────────────────────────────────────
+        // All held buffers are being resolved this call, so drain the hold up
+        // front; each bid is either replenished (consumed) or gathered +
+        // replenished (remainder). Net: hold empties, un-consumed bytes live
+        // contiguously at the accumulator front, in order.
+        driver.segment_hold[idx].clear();
+
+        let mut rem_n = consumed;
+        // (1) Consume from the accumulator front (O(1) advance). If only part
+        // of the accumulator was consumed, `rem_n` is now 0 and every held
+        // buffer is untouched → gathered behind the accumulator remainder.
+        let acc_consumed = rem_n.min(acc_len);
+        driver.accumulators.consume(conn, acc_consumed);
+        rem_n -= acc_consumed;
+
+        // (2) Walk the held buffers in order.
+        let mut overflowed = false;
+        for meta in held_meta {
+            match meta {
+                SegSettle::Pinned { bid, off, len } => {
+                    if rem_n >= len {
+                        // Wholly consumed by the callback — just replenish.
+                        rem_n -= len;
+                        driver.pending_replenish.push(bid);
+                    } else {
+                        // Partially consumed (or untouched, when rem_n == 0):
+                        // copy the unconsumed remainder [rem_n..len] into the
+                        // accumulator, in order, then replenish. Push the bid
+                        // even on breach so it is never leaked.
+                        if !overflowed {
+                            let ptr = driver.provided_bufs.data_ptr(bid, off);
+                            let remainder =
+                                unsafe { std::slice::from_raw_parts(ptr.add(rem_n), len - rem_n) };
+                            if !driver.accumulators.append(conn, remainder) {
+                                overflowed = true;
+                            }
+                        }
+                        rem_n = 0;
+                        driver.pending_replenish.push(bid);
+                    }
+                }
+                SegSettle::Owned(bytes) => {
+                    let len = bytes.len();
+                    if rem_n >= len {
+                        // Wholly consumed; the bid was replenished at delivery,
+                        // so there is nothing to return to the ring here.
+                        rem_n -= len;
+                    } else {
+                        // Copy the unconsumed remainder into the accumulator,
+                        // in order. No replenish (owned copy holds no bid).
+                        if !overflowed && !driver.accumulators.append(conn, &bytes[rem_n..]) {
+                            overflowed = true;
+                        }
+                        rem_n = 0;
+                    }
+                }
+            }
+        }
+
+        if overflowed {
+            // The under-drain gather streamed past `recv_accumulator_max`
+            // (a misbehaving whole-frame consumer). Close rather than OOM;
+            // held bids were already queued for replenish above.
+            self.f.take();
+            driver.close_connection(conn);
+            return Poll::Ready(Ok(0));
+        }
+
+        if consumed > 0 {
+            // Progress made — return it. Any carried-over remainder now sits at
+            // the accumulator front and is re-presented next call.
+            self.f.take();
+            return Poll::Ready(Ok(consumed));
+        }
+
+        // consumed == 0 (need a bigger frame): everything is gathered to the
+        // accumulator. Park for more data (bounded by recv_accumulator_max),
+        // or surface EOF if the recv side already closed. This mirrors
+        // `with_data`'s NeedMore idiom — never a busy loop.
+        let is_closed = driver
+            .connections
+            .get(conn)
+            .map(|c| c.recv_finished())
+            .unwrap_or(true);
+        if is_closed {
+            self.f.take();
+            return Poll::Ready(Ok(0));
+        }
+        executor.owner_task[idx] = Some(CURRENT_TASK_ID.with(|c| c.get()));
+        executor.recv_waiters[idx] = true;
+        Poll::Pending
     }
 }
 

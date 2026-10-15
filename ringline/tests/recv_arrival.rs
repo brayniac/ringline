@@ -1,0 +1,352 @@
+//! `Connection::recv_arrival` over real sockets, on both backends.
+//!
+//! A client writes lines with pauses between writes and records the instant
+//! before each write. The server reads one line per `with_data` call and
+//! records `recv_arrival`. A byte cannot arrive before it was sent, so every
+//! line's first-byte time must be at or after the instant its first byte was
+//! written. A reader that looked up the wrong offset would return the time of
+//! an earlier write, which fails that check.
+
+use std::future::Future;
+use std::io::Write;
+use std::net::TcpStream;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use ringline::{
+    AsyncEventHandler, Config, ConfigBuilder, Connection, ParseResult, RinglineBuilder, TlsConfig,
+};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+
+/// One line the server read: its bytes and `recv_arrival` after the read.
+type Seen = (Vec<u8>, Option<(Instant, Instant)>);
+
+fn test_config() -> Config {
+    ConfigBuilder::new()
+        .workers(1)
+        .pin_to_core(false)
+        .sq_entries(64)
+        .recv_buffer(64, 4096)
+        .max_connections(16)
+        .send_pool(16, 16384)
+        .build()
+        .expect("valid config")
+}
+
+/// Shut the server down and join its workers.
+fn stop(
+    shutdown: ringline::Runtime,
+    handles: Vec<std::thread::JoinHandle<Result<(), ringline::Error>>>,
+) {
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
+/// Pause between client writes, so each write is read in its own batch.
+const GAP: Duration = Duration::from_millis(30);
+
+/// Read `\n`-terminated lines from `conn` until EOF, recording each.
+async fn read_lines(conn: &mut Connection, seen: &Mutex<Vec<Seen>>) {
+    loop {
+        let mut line = Vec::new();
+        let n = conn
+            .with_data(|d| match d.iter().position(|&b| b == b'\n') {
+                Some(i) => {
+                    line.extend_from_slice(&d[..=i]);
+                    ParseResult::Consumed(i + 1)
+                }
+                None => ParseResult::NeedMore,
+            })
+            .await;
+        if n == 0 {
+            return;
+        }
+        let arrival = conn.recv_arrival().map(|a| (a.first(), a.last()));
+        seen.lock().unwrap().push((line, arrival));
+    }
+}
+
+/// Wait until the server has recorded `count` lines.
+fn wait_for_lines(seen: &Mutex<Vec<Seen>>, count: usize) -> Vec<Seen> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let got = seen.lock().unwrap().clone();
+        if got.len() >= count {
+            return got;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "server read {} of {count} lines",
+            got.len()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Write each chunk, `GAP` apart, and return the instant before each write.
+fn write_chunks(stream: &mut impl Write, chunks: &[&[u8]]) -> Vec<Instant> {
+    let mut sent = Vec::new();
+    for (i, chunk) in chunks.iter().enumerate() {
+        if i > 0 {
+            std::thread::sleep(GAP);
+        }
+        sent.push(Instant::now());
+        stream.write_all(chunk).expect("client write");
+        stream.flush().expect("client flush");
+    }
+    sent
+}
+
+/// The lines every test sends: a line, a line split over two writes, and
+/// two pipelined lines in one write.
+const CHUNKS: [&[u8]; 4] = [b"one\n", b"tw", b"o\n", b"three\nfour\n"];
+
+/// Check the four lines of `CHUNKS` against the instants their writes began.
+fn check_lines(seen: &[Seen], sent: &[Instant]) {
+    let lines: Vec<&[u8]> = seen.iter().map(|(l, _)| l.as_slice()).collect();
+    assert_eq!(lines, [&b"one\n"[..], b"two\n", b"three\n", b"four\n"]);
+    let times: Vec<(Instant, Instant)> = seen
+        .iter()
+        .map(|(l, a)| a.unwrap_or_else(|| panic!("no arrival for {l:?}")))
+        .collect();
+    for (i, (first, last)) in times.iter().enumerate() {
+        assert!(first <= last, "line {i}: first after last");
+    }
+    // A line's first byte was sent by the write that began at `sent[k]`.
+    assert!(times[0].0 >= sent[0], "one: arrival before it was sent");
+    assert!(times[1].0 >= sent[1], "two: arrival before it was sent");
+    assert!(times[1].1 >= sent[2], "two: last byte before its write");
+    assert!(times[2].0 >= sent[3], "three: arrival before it was sent");
+    assert!(times[3].0 >= sent[3], "four: arrival before it was sent");
+}
+
+// ── Plaintext ───────────────────────────────────────────────────────────
+
+static PLAIN: Mutex<Vec<Seen>> = Mutex::new(Vec::new());
+
+struct PlainLines;
+
+impl AsyncEventHandler for PlainLines {
+    #[allow(clippy::manual_async_fn)]
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
+        async move { read_lines(&mut conn, &PLAIN).await }
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        PlainLines
+    }
+}
+
+#[test]
+fn plaintext_lines_report_times_no_earlier_than_their_writes() {
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
+        .bind("127.0.0.1:0".parse().unwrap())
+        .launch::<PlainLines>()
+        .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address");
+
+    let mut client = TcpStream::connect(addr).expect("connect");
+    let sent = write_chunks(&mut client, &CHUNKS);
+    let seen = wait_for_lines(&PLAIN, 4);
+    check_lines(&seen, &sent);
+
+    drop(client);
+    stop(shutdown, handles);
+}
+
+// ── A recv sink, then lines ─────────────────────────────────────────────
+
+static SINK: Mutex<Vec<Seen>> = Mutex::new(Vec::new());
+
+/// Takes the first 4 bytes through a recv sink, which does not report, then
+/// reads lines.
+struct SinkThenLines;
+
+impl AsyncEventHandler for SinkThenLines {
+    #[allow(clippy::manual_async_fn)]
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
+        async move {
+            let mut head = [0u8; 4];
+            // SAFETY: `head` outlives the sink, which is taken below before
+            // `head` is read or dropped.
+            unsafe { conn.as_conn().set_recv_sink(head.as_mut_ptr(), head.len()) };
+            // The 8-byte first write arrives in one read: 4 bytes to the
+            // sink, the rest to the accumulator.
+            conn.recv_ready().await;
+            assert_eq!(conn.take_recv_sink(), head.len());
+            assert_eq!(&head, b"skip");
+            read_lines(&mut conn, &SINK).await;
+        }
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        SinkThenLines
+    }
+}
+
+#[test]
+fn lines_after_a_recv_sink_report_their_own_times() {
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
+        .bind("127.0.0.1:0".parse().unwrap())
+        .launch::<SinkThenLines>()
+        .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address");
+
+    let mut client = TcpStream::connect(addr).expect("connect");
+    // The sink's bytes share the first write with the first line.
+    let first: Vec<u8> = [&b"skip"[..], CHUNKS[0]].concat();
+    let chunks: Vec<&[u8]> = std::iter::once(first.as_slice())
+        .chain(CHUNKS[1..].iter().copied())
+        .collect();
+    let sent = write_chunks(&mut client, &chunks);
+    let seen = wait_for_lines(&SINK, 4);
+    check_lines(&seen, &sent);
+
+    drop(client);
+    stop(shutdown, handles);
+}
+
+// ── TLS ─────────────────────────────────────────────────────────────────
+
+static TLS: Mutex<Vec<Seen>> = Mutex::new(Vec::new());
+
+struct TlsLines;
+
+impl AsyncEventHandler for TlsLines {
+    #[allow(clippy::manual_async_fn)]
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
+        async move { read_lines(&mut conn, &TLS).await }
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        TlsLines
+    }
+}
+
+fn self_signed() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let key = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+    (vec![CertificateDer::from(cert.cert)], key.into())
+}
+
+#[test]
+fn tls_lines_report_times_no_earlier_than_their_writes() {
+    let (certs, key) = self_signed();
+    let server = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs.clone(), key)
+        .unwrap();
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
+        .bind_tls(
+            "127.0.0.1:0".parse().unwrap(),
+            TlsConfig::new(Arc::new(server)),
+        )
+        .launch::<TlsLines>()
+        .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address");
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(certs[0].clone()).unwrap();
+    let client_config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let name: ServerName<'_> = "localhost".try_into().unwrap();
+    let mut tls = rustls::ClientConnection::new(Arc::new(client_config), name).unwrap();
+    let mut tcp = TcpStream::connect(addr).expect("connect");
+    tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    // Finish the handshake before timing anything.
+    while tls.is_handshaking() {
+        tls.complete_io(&mut tcp).expect("handshake");
+    }
+    let mut stream = rustls::Stream::new(&mut tls, &mut tcp);
+    let sent = write_chunks(&mut stream, &CHUNKS);
+    let seen = wait_for_lines(&TLS, 4);
+    check_lines(&seen, &sent);
+
+    drop(tcp);
+    stop(shutdown, handles);
+}
+
+// ── forward_to with a tail past the forwarded length (io_uring) ─────────
+
+#[cfg(has_io_uring)]
+static FORWARD: Mutex<Vec<Seen>> = Mutex::new(Vec::new());
+
+/// Reads a 4-byte length, forwards that many bytes to a file with
+/// `forward_to`, then reads lines. The write that carries the forwarded body
+/// also carries the first line, so the forward ends inside a received buffer
+/// and leaves that line in the accumulator.
+#[cfg(has_io_uring)]
+struct ForwardThenLines;
+
+#[cfg(has_io_uring)]
+impl AsyncEventHandler for ForwardThenLines {
+    #[allow(clippy::manual_async_fn)]
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
+        async move {
+            use std::os::fd::AsFd;
+            let mut hdr = [0u8; 4];
+            let n = conn
+                .with_data(|d| {
+                    if d.len() < 4 {
+                        return ParseResult::NeedMore;
+                    }
+                    hdr.copy_from_slice(&d[..4]);
+                    ParseResult::Consumed(4)
+                })
+                .await;
+            if n == 0 {
+                return;
+            }
+            let len = u32::from_be_bytes(hdr) as usize;
+            let file = tempfile_sink();
+            let sink = ringline::SinkFd::file(file.as_fd()).expect("file sink");
+            let forwarded = conn.forward_to(&sink, len).await.expect("forward");
+            assert_eq!(forwarded, len);
+            read_lines(&mut conn, &FORWARD).await;
+        }
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        ForwardThenLines
+    }
+}
+
+#[cfg(has_io_uring)]
+fn tempfile_sink() -> std::fs::File {
+    let path = std::env::temp_dir().join(format!("ringline-arrival-fwd-{}", std::process::id()));
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)
+        .expect("open sink file");
+    let _ = std::fs::remove_file(&path);
+    file
+}
+
+#[cfg(has_io_uring)]
+#[test]
+fn lines_after_a_forward_to_report_their_own_times() {
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
+        .bind("127.0.0.1:0".parse().unwrap())
+        .launch::<ForwardThenLines>()
+        .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address");
+
+    let mut client = TcpStream::connect(addr).expect("connect");
+    let body = vec![b'x'; 10_000];
+    let first: Vec<u8> = [&(body.len() as u32).to_be_bytes()[..], &body, CHUNKS[0]].concat();
+    let chunks: Vec<&[u8]> = std::iter::once(first.as_slice())
+        .chain(CHUNKS[1..].iter().copied())
+        .collect();
+    let sent = write_chunks(&mut client, &chunks);
+    let seen = wait_for_lines(&FORWARD, 4);
+    check_lines(&seen, &sent);
+
+    drop(client);
+    stop(shutdown, handles);
+}
