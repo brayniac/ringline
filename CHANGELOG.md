@@ -402,6 +402,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A connection's receive accumulator gives its allocation back when the
+  connection closes. An accumulator grows to the largest message its
+  connection buffered, and `reset` keeps the allocation, so each slot kept
+  that size until a new connection took it, and then for that connection's
+  lifetime. After a 1 MiB forward echo at 512 connections on one io_uring
+  worker with `recv_incremental`, RSS once every connection had closed was
+  791 and 874 MiB in two runs without this change and 276 and 336 MiB with
+  it (measured on a development branch whose bench server has
+  `--recv-incremental`). Both backends.
 - io_uring: the error text of a failed buffer registration names a failed
   page migration as a cause, and the `EFAULT` text names io_uring's 1 GiB
   per-buffer limit. A long-term pin migrates pages in `ZONE_MOVABLE` or in
