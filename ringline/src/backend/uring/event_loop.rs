@@ -2090,7 +2090,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// **Every path that delivers bytes to a connection must call this**.
     /// `park_blocker` also returns `ParkBlocker::DataPending` while bytes are
     /// unconsumed, so a path that misses this call cannot park the connection
-    /// while those bytes are unread.
+    /// while those bytes sit in the accumulator or a held or lent receive
+    /// buffer.
     fn withdraw_park_offer(&mut self, conn_index: u32) {
         let idx = conn_index as usize;
         // Read first: the common case is no offer, and a predictable branch

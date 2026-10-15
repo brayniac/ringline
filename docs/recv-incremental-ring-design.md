@@ -392,7 +392,7 @@ while the accumulator is empty and the held buffer is the older data:
   keeps it held.
 
 `park_blocker` reports `DataPending` while `pending_recv_bufs[conn]` is
-`Some`, and `take_pending_for_park` does not drain that slot. From step 1
+`Some` (#670), and `take_pending_for_park` does not drain that slot. From step 1
 a rest can stay held after a parse of the accumulator returns
 `Consumed(k)` (and, from the views step, after the fast path's); the gate
 refuses such a connection until the handler reads the rest.
@@ -758,8 +758,7 @@ buffers held by `with_bytes` views, values copied by the
    non-empty, the flush of a held buffer before any append,
    `WithDataFuture` parsing the accumulator before the held buffer, the
    move of held bytes into the accumulator, with a re-parse, before the
-   future parks or resolves at EOF, and `park_blocker` and
-   `take_pending_for_park` covering `pending_recv_bufs`. It needs the
+   future parks or resolves at EOF. It needs the
    data-address changes to `PendingRecvBuf` and `handle_send_recv_buf`
    from step 3; land those here. `with_bytes` views over held buffers (see
    "`with_bytes`"), with `recv_zc_threshold`, its helper, the client

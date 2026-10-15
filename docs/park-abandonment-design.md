@@ -73,11 +73,12 @@ At the install re-check, do not re-require the offer flag; require the **state**
 blockers only.
 
 The argument that this is safe is in the code already. The comment on
-`withdraw_park_offer` says `ParkBlocker::DataPending` is a state-based backstop:
-a delivery path that misses the withdrawal cannot park the connection while its
-bytes are unread. The state check is what guarantees the handler holds
-nothing, and the 6% shows it firing correctly when data genuinely is pending. The flag is defence in depth on
-top of that, and it currently costs 94% of all parks.
+`withdraw_park_offer` says `park_blocker` also returns
+`ParkBlocker::DataPending` while bytes are unconsumed, so a delivery path that
+misses the withdrawal cannot park the connection while its bytes are unread.
+The state check is what guarantees the handler holds nothing, and the 6% shows
+it firing correctly when data genuinely is pending. The flag is defence in
+depth on top of that, and it currently costs 94% of all parks.
 
 `NotOffered` conflates two things at the re-check: "this handler never opted in"
 and "it opted in, then bytes arrived". The first must still refuse. But by the
