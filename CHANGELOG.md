@@ -16,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `latency_ns = 0` in `ClientMetrics`, `CompletedOp` and redis `RespMeta`.
   Such a client now reads the clock when an operation is sent (once per
   batch when batching) and again when its response is parsed, as the
-  sequential API already did.
+  sequential API already did. Backport of #667 (#668).
 
 ## [0.6.11] - 2026-10-14
 
