@@ -197,10 +197,10 @@ RSS rose only in runs that refused lends. On the rig, the cells where it
 grew are the cells that refused lends; the 4 KiB × 16,384 cell refused
 30k–76k lends with RSS at 295–326 MiB, because each copy there is 4 KiB.
 
-The memory also stays after the connections close. After every connection
+The memory also stayed after the connections closed. After every connection
 of a 1 MiB × 512 run closed, RSS was 868 MiB. `RecvAccumulator::reset`
 clears an accumulator but keeps its allocation, and it runs only when a
-new connection takes the slot (accept or connect), so every slot keeps the
+new connection takes the slot (accept or connect), so every slot kept the
 largest buffer it grew. An experimental patch that drops the allocation in
 `reset` and calls it at close brought RSS after close to 336 MiB. The rest
 is glibc's arenas: with `MALLOC_MMAP_THRESHOLD_=131072` as well, it was
