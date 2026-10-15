@@ -134,14 +134,13 @@ pub use cluster::{ClusterClient, ClusterConfig};
 pub use pool::{Pool, PoolConfig, PooledClient};
 pub use sharded::{ShardedClient, ShardedConfig};
 
-use std::cell::Cell;
 use std::collections::VecDeque;
 use std::io;
 use std::time::Instant;
 
 use bytes::Bytes;
 use resp_proto::{Request, Value};
-use ringline::{Connection, GuardBox, ParseResult, RecvHalf, SendGuard, SendHalf};
+use ringline::{Connection, GuardBox, ParseResult, RecvArrival, RecvHalf, SendGuard, SendHalf};
 
 /// Maximum guards per scatter-gather send (matches ringline core limit).
 const MAX_FLUSH_GUARDS: usize = 8;
@@ -268,11 +267,20 @@ pub enum CommandType {
 
 /// Result metadata for a completed command, passed to the `on_result` callback.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct CommandResult {
     /// The command type.
     pub command: CommandType,
     /// Latency in nanoseconds (send → response parsed).
     pub latency_ns: u64,
+    /// Nanoseconds from the start of `latency_ns` to the arrival of the
+    /// response's first byte ([`RecvArrival::first`]). `None` if no byte was
+    /// read, or if the byte arrived before the start.
+    pub ttfb_ns: Option<u64>,
+    /// Nanoseconds from the start of `latency_ns` to the arrival of the
+    /// response's last byte ([`RecvArrival::last`]). `None` as for
+    /// `ttfb_ns`.
+    pub ttlb_ns: Option<u64>,
     /// For GET: `Some(true)` = hit, `Some(false)` = miss. `None` for others.
     pub hit: Option<bool>,
     /// Whether the command succeeded (no Redis error).
@@ -562,7 +570,6 @@ impl ClientBuilder {
             rx,
             on_result,
             pending: VecDeque::with_capacity(16),
-            last_rx_bytes: Cell::new(0),
             write_buf: Vec::new(),
             write_guards: Vec::new(),
             flushed_count: 0,
@@ -593,7 +600,6 @@ pub struct Client {
     rx: RecvHalf,
     on_result: Option<ResultCallback>,
     pending: VecDeque<PendingOp>,
-    last_rx_bytes: Cell<u32>,
     /// Write buffer for coalescing `fire_*` commands. Contains all copy data
     /// (command framing, prefixes, suffixes, non-guard values). Guard values
     /// are stored separately in `write_guards` with byte offsets into this buffer.
@@ -632,8 +638,7 @@ pub struct Client {
 /// to read pipeline responses — a second reader on a connection someone else
 /// was already reading, which is precisely what the split forbids.
 ///
-/// Returns the value and the byte count, so the caller can update its own
-/// `last_rx_bytes` bookkeeping.
+/// Returns the value and the byte count.
 pub(crate) async fn read_value_from(
     rx: &mut RecvHalf,
     tx: &mut SendHalf,
@@ -719,7 +724,6 @@ impl Client {
             rx,
             on_result: None,
             pending: VecDeque::new(),
-            last_rx_bytes: Cell::new(0),
             write_buf: Vec::new(),
             write_guards: Vec::new(),
             flushed_count: 0,
@@ -1173,7 +1177,8 @@ impl Client {
         let pending = self.pending.pop_front().ok_or(Error::NoPending)?;
         self.flushed_count = self.flushed_count.saturating_sub(1);
 
-        let resp = match self.read_value().await {
+        let (resp, rx_bytes, arrival) = self.read_reply().await;
+        let resp = match resp {
             Ok(v) => v,
             Err(e) => {
                 // Connection is broken — clear remaining pending ops so
@@ -1191,7 +1196,7 @@ impl Client {
             Some(start) => elapsed_ns(start),
             None => 0,
         };
-        let rx_bytes = self.last_rx_bytes.get();
+        let (ttfb_ns, ttlb_ns) = ArrivalSpan::from_arrival(arrival.as_ref()).ns(pending.start);
         let tx_bytes = pending.tx_bytes;
 
         let op = match pending.kind {
@@ -1212,6 +1217,8 @@ impl Client {
                 self.record(&CommandResult {
                     command: CommandType::Get,
                     latency_ns,
+                    ttfb_ns,
+                    ttlb_ns,
                     hit,
                     success,
                     tx_bytes,
@@ -1234,6 +1241,8 @@ impl Client {
                 self.record(&CommandResult {
                     command: CommandType::Set,
                     latency_ns,
+                    ttfb_ns,
+                    ttlb_ns,
                     hit: None,
                     success: result.is_ok(),
                     tx_bytes,
@@ -1256,6 +1265,8 @@ impl Client {
                 self.record(&CommandResult {
                     command: CommandType::Del,
                     latency_ns,
+                    ttfb_ns,
+                    ttlb_ns,
                     hit: None,
                     success: result.is_ok(),
                     tx_bytes,
@@ -1353,6 +1364,10 @@ impl Client {
         // Ok(Some(len)) = hit, Ok(None) = miss, Err = server error / unexpected.
         let mut outcome: Result<Option<usize>, Error> = Ok(None);
         let mut total_consumed: usize = 0;
+        // The reply's first byte arrives in the first call that reads any of
+        // it, and its last byte in the final call.
+        let instrumented = self.is_instrumented();
+        let mut arrival = ArrivalSpan::default();
 
         loop {
             let n = self
@@ -1417,6 +1432,9 @@ impl Client {
                 })
                 .await?;
             total_consumed += n;
+            if n > 0 && instrumented {
+                arrival.extend(self.rx.recv_arrival().as_ref());
+            }
             if matches!(phase, Phase::Done) {
                 break;
             }
@@ -1442,9 +1460,12 @@ impl Client {
             Ok(None) => (true, Some(false)),
             Err(_) => (false, None),
         };
+        let (ttfb_ns, ttlb_ns) = arrival.ns(pending.start);
         self.record(&CommandResult {
             command: CommandType::Get,
             latency_ns,
+            ttfb_ns,
+            ttlb_ns,
             hit,
             success,
             tx_bytes: pending.tx_bytes,
@@ -1500,6 +1521,10 @@ impl Client {
         let mut trailing_remaining: usize = 0;
         let mut outcome: Result<Option<usize>, Error> = Ok(None);
         let mut total_consumed: usize = 0;
+        // The reply's first byte arrives in the first call that reads any of
+        // it, and its last byte in the final call.
+        let instrumented = self.is_instrumented();
+        let mut arrival = ArrivalSpan::default();
 
         loop {
             let n = self
@@ -1566,6 +1591,9 @@ impl Client {
                 })
                 .await;
             total_consumed += n;
+            if n > 0 && instrumented {
+                arrival.extend(self.rx.recv_arrival().as_ref());
+            }
             if matches!(phase, Phase::Done) {
                 break;
             }
@@ -1585,9 +1613,12 @@ impl Client {
             Ok(None) => (true, Some(false)),
             Err(_) => (false, None),
         };
+        let (ttfb_ns, ttlb_ns) = arrival.ns(pending.start);
         self.record(&CommandResult {
             command: CommandType::Get,
             latency_ns,
+            ttfb_ns,
+            ttlb_ns,
             hit,
             success,
             tx_bytes: pending.tx_bytes,
@@ -1674,7 +1705,8 @@ impl Client {
         pending: &PendingOp,
         kind: OpKind,
     ) -> Result<RespMeta, Error> {
-        let resp = match self.read_value().await {
+        let (resp, rx_bytes, arrival) = self.read_reply().await;
+        let resp = match resp {
             Ok(v) => v,
             Err(e) => {
                 self.pending.clear();
@@ -1686,7 +1718,7 @@ impl Client {
             Some(start) => elapsed_ns(start),
             None => 0,
         };
-        let rx_bytes = self.last_rx_bytes.get();
+        let (ttfb_ns, ttlb_ns) = ArrivalSpan::from_arrival(arrival.as_ref()).ns(pending.start);
         let (success, error) = match resp {
             Value::Error(msg) => (false, Some(String::from_utf8_lossy(&msg).into_owned())),
             other => {
@@ -1708,6 +1740,8 @@ impl Client {
         self.record(&CommandResult {
             command,
             latency_ns,
+            ttfb_ns,
+            ttlb_ns,
             hit: None,
             success,
             tx_bytes: pending.tx_bytes,
@@ -1731,9 +1765,19 @@ impl Client {
     /// bulk string values are `Bytes::slice()` references into the
     /// accumulator's buffer rather than freshly allocated `Vec<u8>`.
     pub(crate) async fn read_value(&mut self) -> Result<Value, Error> {
+        self.read_reply().await.0
+    }
+
+    /// [`read_value`](Self::read_value), with the bytes read and, on an
+    /// instrumented client, their arrival times.
+    async fn read_reply(&mut self) -> Reply<Value> {
         let (value, n) = read_value_from(&mut self.rx, &mut self.tx).await;
-        self.last_rx_bytes.set(n as u32);
-        value
+        let arrival = if n > 0 && self.is_instrumented() {
+            self.rx.recv_arrival()
+        } else {
+            None
+        };
+        (value, n as u32, arrival)
     }
 
     /// Send a SET command via scatter-gather (prefix + value + suffix as
@@ -1742,16 +1786,16 @@ impl Client {
         &mut self,
         set_req: &resp_proto::SetRequest<'_>,
         value: &[u8],
-    ) -> Result<Value, Error> {
+    ) -> Reply<Value> {
         let (prefix, suffix) = set_req.encode_parts();
-        self.tx
+        if let Err(e) = self
+            .tx
             .send_parts()
-            .build(|b| b.copy(&prefix).copy(value).copy(&suffix).submit())?;
-        let resp = self.read_value().await?;
-        if let Value::Error(ref msg) = resp {
-            return Err(Error::Redis(String::from_utf8_lossy(msg).into_owned()));
+            .build(|b| b.copy(&prefix).copy(value).copy(&suffix).submit())
+        {
+            return (Err(e.into()), 0, None);
         }
-        Ok(resp)
+        map_reply(self.read_reply().await, redis_error)
     }
 
     /// Send an encoded command and read the response, converting Redis
@@ -1773,22 +1817,16 @@ impl Client {
     /// immutable borrow of all of `self` across the call. Borrowing `tx` and
     /// `encode_buf` as separate fields inside the method is disjoint, so the
     /// scratch buffer keeps being reused — no copy, no per-op allocation.
-    async fn execute_encoded(&mut self) -> Result<Value, Error> {
-        self.tx.send(&self.encode_buf)?;
-        let value = self.read_value().await?;
-        if let Value::Error(ref msg) = value {
-            return Err(Error::Redis(String::from_utf8_lossy(msg).into_owned()));
+    async fn execute_encoded(&mut self) -> Reply<Value> {
+        if let Err(e) = self.tx.send(&self.encode_buf) {
+            return (Err(e.into()), 0, None);
         }
-        Ok(value)
+        map_reply(self.read_reply().await, redis_error)
     }
 
     async fn execute(&mut self, encoded: &[u8]) -> Result<Value, Error> {
         self.tx.send(encoded)?;
-        let value = self.read_value().await?;
-        if let Value::Error(ref msg) = value {
-            return Err(Error::Redis(String::from_utf8_lossy(msg).into_owned()));
-        }
-        Ok(value)
+        redis_error(self.read_value().await?)
     }
 
     /// Execute a command and expect a SimpleString response (e.g. +OK).
@@ -1803,21 +1841,21 @@ impl Client {
     /// Execute a command and expect an Integer response.
     /// [`execute_int`](Self::execute_int) over the reusable `encode_buf`.
     /// See [`execute_encoded`](Self::execute_encoded) for why this exists.
-    async fn execute_int_encoded(&mut self) -> Result<i64, Error> {
-        match self.execute_encoded().await? {
+    async fn execute_int_encoded(&mut self) -> Reply<i64> {
+        map_reply(self.execute_encoded().await, |value| match value {
             Value::Integer(n) => Ok(n),
             _ => Err(Error::UnexpectedResponse),
-        }
+        })
     }
 
     /// [`execute_bulk`](Self::execute_bulk) over the reusable `encode_buf`.
     /// See [`execute_encoded`](Self::execute_encoded) for why this exists.
-    async fn execute_bulk_encoded(&mut self) -> Result<Option<Bytes>, Error> {
-        match self.execute_encoded().await? {
+    async fn execute_bulk_encoded(&mut self) -> Reply<Option<Bytes>> {
+        map_reply(self.execute_encoded().await, |value| match value {
             Value::BulkString(data) => Ok(Some(data)),
             Value::Null => Ok(None),
             _ => Err(Error::UnexpectedResponse),
-        }
+        })
     }
 
     async fn execute_int(&mut self, encoded: &[u8]) -> Result<i64, Error> {
@@ -1880,13 +1918,13 @@ impl Client {
         self.encode_buf.clear();
         Self::encode_request_into(&Request::get(key), &mut self.encode_buf);
         if !self.is_instrumented() {
-            return self.execute_bulk_encoded().await;
+            return self.execute_bulk_encoded().await.0;
         }
         let tx_bytes = self.encode_buf.len() as u32;
         let start = Instant::now();
-        let result = self.execute_bulk_encoded().await;
+        let (result, rx_bytes, arrival) = self.execute_bulk_encoded().await;
         let latency_ns = elapsed_ns(start);
-        let rx_bytes = self.last_rx_bytes.get();
+        let (ttfb_ns, ttlb_ns) = ArrivalSpan::from_arrival(arrival.as_ref()).ns(Some(start));
         let (success, hit) = match &result {
             Ok(Some(_)) => (true, Some(true)),
             Ok(None) => (true, Some(false)),
@@ -1895,6 +1933,8 @@ impl Client {
         self.record(&CommandResult {
             command: CommandType::Get,
             latency_ns,
+            ttfb_ns,
+            ttlb_ns,
             hit,
             success,
             tx_bytes,
@@ -1913,7 +1953,7 @@ impl Client {
         let value = value.as_ref();
         let set_req = Request::set(key, value);
         if !self.is_instrumented() {
-            let resp = self.execute_set(&set_req, value).await?;
+            let resp = self.execute_set(&set_req, value).await.0?;
             return match resp {
                 Value::SimpleString(_) | Value::Null => Ok(()),
                 _ => Err(Error::UnexpectedResponse),
@@ -1921,9 +1961,9 @@ impl Client {
         }
         let tx_bytes = set_req.encoded_len() as u32;
         let start = Instant::now();
-        let result = self.execute_set(&set_req, value).await;
+        let (result, rx_bytes, arrival) = self.execute_set(&set_req, value).await;
         let latency_ns = elapsed_ns(start);
-        let rx_bytes = self.last_rx_bytes.get();
+        let (ttfb_ns, ttlb_ns) = ArrivalSpan::from_arrival(arrival.as_ref()).ns(Some(start));
         let success = result.is_ok();
         let final_result = match result {
             Ok(Value::SimpleString(_) | Value::Null) => Ok(()),
@@ -1933,6 +1973,8 @@ impl Client {
         self.record(&CommandResult {
             command: CommandType::Set,
             latency_ns,
+            ttfb_ns,
+            ttlb_ns,
             hit: None,
             success,
             tx_bytes,
@@ -1952,7 +1994,7 @@ impl Client {
         let value = value.as_ref();
         let set_req = Request::set(key, value).ex(ttl_secs);
         if !self.is_instrumented() {
-            let resp = self.execute_set(&set_req, value).await?;
+            let resp = self.execute_set(&set_req, value).await.0?;
             return match resp {
                 Value::SimpleString(_) => Ok(()),
                 _ => Err(Error::UnexpectedResponse),
@@ -1960,9 +2002,9 @@ impl Client {
         }
         let tx_bytes = set_req.encoded_len() as u32;
         let start = Instant::now();
-        let result = self.execute_set(&set_req, value).await;
+        let (result, rx_bytes, arrival) = self.execute_set(&set_req, value).await;
         let latency_ns = elapsed_ns(start);
-        let rx_bytes = self.last_rx_bytes.get();
+        let (ttfb_ns, ttlb_ns) = ArrivalSpan::from_arrival(arrival.as_ref()).ns(Some(start));
         let success = result.is_ok();
         let final_result = match result {
             Ok(Value::SimpleString(_)) => Ok(()),
@@ -1972,6 +2014,8 @@ impl Client {
         self.record(&CommandResult {
             command: CommandType::Set,
             latency_ns,
+            ttfb_ns,
+            ttlb_ns,
             hit: None,
             success,
             tx_bytes,
@@ -1991,7 +2035,8 @@ impl Client {
         let value = value.as_ref();
         let resp = self
             .execute_set(&Request::set(key, value).px(ttl_ms), value)
-            .await?;
+            .await
+            .0?;
         match resp {
             Value::SimpleString(_) => Ok(()),
             _ => Err(Error::UnexpectedResponse),
@@ -2008,7 +2053,8 @@ impl Client {
         let value = value.as_ref();
         let resp = self
             .execute_set(&Request::set(key, value).nx(), value)
-            .await?;
+            .await
+            .0?;
         match resp {
             Value::SimpleString(_) => Ok(true),
             Value::Null => Ok(false),
@@ -2022,16 +2068,19 @@ impl Client {
         self.encode_buf.clear();
         Self::encode_request_into(&Request::del(key), &mut self.encode_buf);
         if !self.is_instrumented() {
-            return self.execute_int_encoded().await.map(|n| n as u64);
+            return self.execute_int_encoded().await.0.map(|n| n as u64);
         }
         let tx_bytes = self.encode_buf.len() as u32;
         let start = Instant::now();
-        let result = self.execute_int_encoded().await.map(|n| n as u64);
+        let (result, rx_bytes, arrival) = self.execute_int_encoded().await;
+        let result = result.map(|n| n as u64);
         let latency_ns = elapsed_ns(start);
-        let rx_bytes = self.last_rx_bytes.get();
+        let (ttfb_ns, ttlb_ns) = ArrivalSpan::from_arrival(arrival.as_ref()).ns(Some(start));
         self.record(&CommandResult {
             command: CommandType::Del,
             latency_ns,
+            ttfb_ns,
+            ttlb_ns,
             hit: None,
             success: result.is_ok(),
             tx_bytes,
@@ -2666,7 +2715,7 @@ impl Client {
         self.encode_buf.clear();
         Self::encode_request_into(&Request::ping(), &mut self.encode_buf);
         if !self.is_instrumented() {
-            let value = self.execute_encoded().await?;
+            let value = self.execute_encoded().await.0?;
             return match value {
                 Value::SimpleString(_) => Ok(()),
                 _ => Err(Error::UnexpectedResponse),
@@ -2674,9 +2723,9 @@ impl Client {
         }
         let tx_bytes = self.encode_buf.len() as u32;
         let start = Instant::now();
-        let result = self.execute_encoded().await;
+        let (result, rx_bytes, arrival) = self.execute_encoded().await;
         let latency_ns = elapsed_ns(start);
-        let rx_bytes = self.last_rx_bytes.get();
+        let (ttfb_ns, ttlb_ns) = ArrivalSpan::from_arrival(arrival.as_ref()).ns(Some(start));
         let success = result.is_ok();
         let final_result = match result {
             Ok(Value::SimpleString(_)) => Ok(()),
@@ -2686,6 +2735,8 @@ impl Client {
         self.record(&CommandResult {
             command: CommandType::Ping,
             latency_ns,
+            ttfb_ns,
+            ttlb_ns,
             hit: None,
             success,
             tx_bytes,
@@ -2806,26 +2857,29 @@ impl Client {
         let tx_bytes = (self.encode_buf.len() + value_len as usize + 2) as u32;
         let start = Instant::now();
         let prefix: &[u8] = &self.encode_buf;
-        self.tx.send_parts().build(move |b| {
+        let sent = self.tx.send_parts().build(move |b| {
             b.copy(prefix)
                 .guard(GuardBox::new(guard))
                 .copy(b"\r\n")
                 .submit()
-        })?;
-        let resp = self.read_value().await?;
-        let latency_ns = elapsed_ns(start);
-        let rx_bytes = self.last_rx_bytes.get();
-        let result = if let Value::Error(ref msg) = resp {
-            Err(Error::Redis(String::from_utf8_lossy(msg).into_owned()))
-        } else {
-            match resp {
-                Value::SimpleString(_) | Value::Null => Ok(()),
-                _ => Err(Error::UnexpectedResponse),
-            }
+        });
+        // A send error is recorded too, with nothing read.
+        let (resp, rx_bytes, arrival) = match sent {
+            Ok(_) => self.read_reply().await,
+            Err(e) => (Err(e.into()), 0, None),
         };
+        let latency_ns = elapsed_ns(start);
+        let (ttfb_ns, ttlb_ns) = ArrivalSpan::from_arrival(arrival.as_ref()).ns(Some(start));
+        // A read error and an error reply are recorded as failures.
+        let result = resp.and_then(redis_error).and_then(|resp| match resp {
+            Value::SimpleString(_) | Value::Null => Ok(()),
+            _ => Err(Error::UnexpectedResponse),
+        });
         self.record(&CommandResult {
             command: CommandType::Set,
             latency_ns,
+            ttfb_ns,
+            ttlb_ns,
             hit: None,
             success: result.is_ok(),
             tx_bytes,
@@ -2871,26 +2925,29 @@ impl Client {
         let tx_bytes = (self.encode_buf.len() + value_len as usize) as u32;
         let start = Instant::now();
         let (prefix, suffix) = self.encode_buf.split_at(split);
-        self.tx.send_parts().build(move |b| {
+        let sent = self.tx.send_parts().build(move |b| {
             b.copy(prefix)
                 .guard(GuardBox::new(guard))
                 .copy(suffix)
                 .submit()
-        })?;
-        let resp = self.read_value().await?;
-        let latency_ns = elapsed_ns(start);
-        let rx_bytes = self.last_rx_bytes.get();
-        let result = if let Value::Error(ref msg) = resp {
-            Err(Error::Redis(String::from_utf8_lossy(msg).into_owned()))
-        } else {
-            match resp {
-                Value::SimpleString(_) => Ok(()),
-                _ => Err(Error::UnexpectedResponse),
-            }
+        });
+        // A send error is recorded too, with nothing read.
+        let (resp, rx_bytes, arrival) = match sent {
+            Ok(_) => self.read_reply().await,
+            Err(e) => (Err(e.into()), 0, None),
         };
+        let latency_ns = elapsed_ns(start);
+        let (ttfb_ns, ttlb_ns) = ArrivalSpan::from_arrival(arrival.as_ref()).ns(Some(start));
+        // A read error and an error reply are recorded as failures.
+        let result = resp.and_then(redis_error).and_then(|resp| match resp {
+            Value::SimpleString(_) => Ok(()),
+            _ => Err(Error::UnexpectedResponse),
+        });
         self.record(&CommandResult {
             command: CommandType::Set,
             latency_ns,
+            ttfb_ns,
+            ttlb_ns,
             hit: None,
             success: result.is_ok(),
             tx_bytes,
@@ -3397,6 +3454,60 @@ impl Drop for ValueStream<'_> {
 #[inline]
 fn elapsed_ns(start: Instant) -> u64 {
     start.elapsed().as_nanos() as u64
+}
+
+/// A reply read from the connection: the result, the bytes read, and, on an
+/// instrumented client, the arrival times of those bytes. An operation that
+/// fails before it reads has 0 bytes and no arrival.
+type Reply<T> = (Result<T, Error>, u32, Option<RecvArrival>);
+
+/// Map the result of a [`Reply`], keeping its byte count and arrival.
+fn map_reply<T, U>(reply: Reply<T>, f: impl FnOnce(T) -> Result<U, Error>) -> Reply<U> {
+    let (result, rx_bytes, arrival) = reply;
+    (result.and_then(f), rx_bytes, arrival)
+}
+
+/// Turn a RESP error reply into `Error::Redis`.
+fn redis_error(value: Value) -> Result<Value, Error> {
+    match value {
+        Value::Error(msg) => Err(Error::Redis(String::from_utf8_lossy(&msg).into_owned())),
+        other => Ok(other),
+    }
+}
+
+/// The arrival times of a response read over one or more reader calls: the
+/// first byte's from the first call that read any, the last byte's from the
+/// last.
+#[derive(Default)]
+struct ArrivalSpan {
+    first: Option<Instant>,
+    last: Option<Instant>,
+}
+
+impl ArrivalSpan {
+    fn from_arrival(arrival: Option<&RecvArrival>) -> Self {
+        let mut span = ArrivalSpan::default();
+        span.extend(arrival);
+        span
+    }
+
+    fn extend(&mut self, arrival: Option<&RecvArrival>) {
+        if let Some(a) = arrival {
+            self.first.get_or_insert(a.first());
+            self.last = Some(a.last());
+        }
+    }
+
+    /// Nanoseconds from `start` to the first and last byte's arrival, for
+    /// [`CommandResult::ttfb_ns`] and [`CommandResult::ttlb_ns`].
+    fn ns(&self, start: Option<Instant>) -> (Option<u64>, Option<u64>) {
+        let since = |t: Option<Instant>| {
+            t.zip(start)
+                .and_then(|(t, start)| t.checked_duration_since(start))
+                .map(|d| d.as_nanos() as u64)
+        };
+        (since(self.first), since(self.last))
+    }
 }
 
 // ── Zero-copy SET encoding helpers ──────────────────────────────────────

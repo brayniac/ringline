@@ -126,7 +126,6 @@ pub mod sharded;
 pub use pool::{Pool, PoolConfig, PooledClient};
 pub use sharded::{ShardedClient, ShardedConfig};
 
-use std::cell::Cell;
 use std::collections::VecDeque;
 use std::io;
 use std::time::Instant;
@@ -134,7 +133,7 @@ use std::time::Instant;
 use bytes::Bytes;
 use memcache_proto::binary::BinaryRequest;
 use memcache_proto::{Request as McRequest, ResponseBytes as McResponseBytes, ValueBytes};
-use ringline::{Connection, GuardBox, ParseResult, RecvHalf, SendGuard, SendHalf};
+use ringline::{Connection, GuardBox, ParseResult, RecvArrival, RecvHalf, SendGuard, SendHalf};
 
 /// Callback type invoked after each command completes.
 type ResultCallback = Box<dyn Fn(&CommandResult)>;
@@ -269,11 +268,20 @@ pub enum CommandType {
 
 /// Result metadata for a completed command, passed to the `on_result` callback.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct CommandResult {
     /// The command type.
     pub command: CommandType,
     /// Latency in nanoseconds (send → response parsed).
     pub latency_ns: u64,
+    /// Nanoseconds from the start of `latency_ns` to the arrival of the
+    /// response's first byte ([`RecvArrival::first`]). `None` if no byte was
+    /// read, or if the byte arrived before the start.
+    pub ttfb_ns: Option<u64>,
+    /// Nanoseconds from the start of `latency_ns` to the arrival of the
+    /// response's last byte ([`RecvArrival::last`]). `None` as for
+    /// `ttfb_ns`.
+    pub ttlb_ns: Option<u64>,
     /// For GET: `Some(true)` = hit, `Some(false)` = miss. `None` for others.
     pub hit: Option<bool>,
     /// Whether the command succeeded (no error response).
@@ -535,7 +543,6 @@ impl ClientBuilder {
             rx,
             on_result,
             pending: VecDeque::with_capacity(16),
-            last_rx_bytes: Cell::new(0),
             write_buf: Vec::new(),
             write_guards: Vec::new(),
             flushed_count: 0,
@@ -567,7 +574,6 @@ pub struct Client {
     rx: RecvHalf,
     on_result: Option<ResultCallback>,
     pending: VecDeque<PendingOp>,
-    last_rx_bytes: Cell<u32>,
     /// Write buffer for coalescing `fire_*` commands. Contains all copy data
     /// (command framing, prefixes, suffixes, non-guard values). Guard values
     /// are stored separately in `write_guards` with byte offsets into this buffer.
@@ -612,7 +618,6 @@ impl Client {
             rx,
             on_result: None,
             pending: VecDeque::new(),
-            last_rx_bytes: Cell::new(0),
             write_buf: Vec::new(),
             write_guards: Vec::new(),
             flushed_count: 0,
@@ -1002,7 +1007,8 @@ impl Client {
         let pending = self.pending.pop_front().ok_or(Error::NoPending)?;
         self.flushed_count = self.flushed_count.saturating_sub(1);
 
-        let response = match self.read_response().await {
+        let (response, rx_bytes, arrival) = self.read_reply().await;
+        let response = match response {
             Ok(v) => v,
             Err(e) => {
                 // Connection is broken — clear remaining pending ops so
@@ -1019,7 +1025,7 @@ impl Client {
             Some(start) => elapsed_ns(start),
             None => 0,
         };
-        let rx_bytes = self.last_rx_bytes.get();
+        let (ttfb_ns, ttlb_ns) = arrival_ns(arrival.as_ref(), pending.start);
         let tx_bytes = pending.tx_bytes;
 
         let op = match pending.kind {
@@ -1050,6 +1056,8 @@ impl Client {
                 self.record(&CommandResult {
                     command: CommandType::Get,
                     latency_ns,
+                    ttfb_ns,
+                    ttlb_ns,
                     hit,
                     success,
                     tx_bytes,
@@ -1072,6 +1080,8 @@ impl Client {
                 self.record(&CommandResult {
                     command: CommandType::Set,
                     latency_ns,
+                    ttfb_ns,
+                    ttlb_ns,
                     hit: None,
                     success: result.is_ok(),
                     tx_bytes,
@@ -1095,6 +1105,8 @@ impl Client {
                 self.record(&CommandResult {
                     command: CommandType::Delete,
                     latency_ns,
+                    ttfb_ns,
+                    ttlb_ns,
                     hit: None,
                     success: result.is_ok(),
                     tx_bytes,
@@ -1126,6 +1138,12 @@ impl Client {
     /// terminal error matches the recv() pending-queue clear and avoids
     /// silently desynced clients.
     pub(crate) async fn read_response(&mut self) -> Result<McResponseBytes, Error> {
+        self.read_reply().await.0
+    }
+
+    /// [`read_response`](Self::read_response), with the bytes read and, on an
+    /// instrumented client, their arrival times.
+    async fn read_reply(&mut self) -> Reply<McResponseBytes> {
         let mut result: Option<Result<McResponseBytes, Error>> = None;
         let binary = self.binary;
         let n = self
@@ -1158,15 +1176,19 @@ impl Client {
                 }
             })
             .await;
-        self.last_rx_bytes.set(n as u32);
+        let arrival = if n > 0 && self.is_instrumented() {
+            self.rx.recv_arrival()
+        } else {
+            None
+        };
         if n == 0 {
-            return result.unwrap_or(Err(Error::ConnectionClosed));
+            return (result.unwrap_or(Err(Error::ConnectionClosed)), 0, arrival);
         }
         let r = result.unwrap();
         if matches!(r, Err(Error::Protocol(_))) {
             self.tx.close();
         }
-        r
+        (r, n as u32, arrival)
     }
 
     /// Send an already-encoded command on this client's write half.
@@ -1197,11 +1219,13 @@ impl Client {
     /// call. Borrowing `tx` and `encode_buf` as separate fields *inside* the
     /// method is disjoint, so the scratch buffer keeps being reused — no copy
     /// and no per-op allocation, which is the whole point of `encode_buf`.
-    async fn execute_encoded(&mut self) -> Result<McResponseBytes, Error> {
-        self.tx.send(&self.encode_buf)?;
-        let response = self.read_response().await?;
-        check_error_bytes(&response)?;
-        Ok(response)
+    async fn execute_encoded(&mut self) -> Reply<McResponseBytes> {
+        if let Err(e) = self.tx.send(&self.encode_buf) {
+            return (Err(e.into()), 0, None);
+        }
+        let (result, rx_bytes, arrival) = self.read_reply().await;
+        let result = result.and_then(|r| check_error_bytes(&r).map(|()| r));
+        (result, rx_bytes, arrival)
     }
 
     // -- Commands (instrumented hot-path) ---------------------------------
@@ -1213,7 +1237,7 @@ impl Client {
         encode_request_into(&McRequest::get(key), &mut self.encode_buf)?;
 
         if !self.is_instrumented() {
-            let response = self.execute_encoded().await?;
+            let response = self.execute_encoded().await.0?;
             return match response {
                 McResponseBytes::Values(mut values) => {
                     if values.is_empty() {
@@ -1232,9 +1256,9 @@ impl Client {
 
         let tx_bytes = self.encode_buf.len() as u32;
         let start = Instant::now();
-        let response = self.execute_encoded().await;
+        let (response, rx_bytes, arrival) = self.execute_encoded().await;
         let latency_ns = elapsed_ns(start);
-        let rx_bytes = self.last_rx_bytes.get();
+        let (ttfb_ns, ttlb_ns) = arrival_ns(arrival.as_ref(), Some(start));
 
         let result = match response {
             Ok(McResponseBytes::Values(mut values)) => {
@@ -1260,6 +1284,8 @@ impl Client {
         self.record(&CommandResult {
             command: CommandType::Get,
             latency_ns,
+            ttfb_ns,
+            ttlb_ns,
             hit,
             success,
             tx_bytes,
@@ -1320,7 +1346,7 @@ impl Client {
         )?;
 
         if !self.is_instrumented() {
-            let response = self.execute_encoded().await?;
+            let response = self.execute_encoded().await.0?;
             return match response {
                 McResponseBytes::Stored => Ok(()),
                 _ => Err(Error::UnexpectedResponse),
@@ -1329,9 +1355,9 @@ impl Client {
 
         let tx_bytes = self.encode_buf.len() as u32;
         let start = Instant::now();
-        let response = self.execute_encoded().await;
+        let (response, rx_bytes, arrival) = self.execute_encoded().await;
         let latency_ns = elapsed_ns(start);
-        let rx_bytes = self.last_rx_bytes.get();
+        let (ttfb_ns, ttlb_ns) = arrival_ns(arrival.as_ref(), Some(start));
 
         let result = match response {
             Ok(McResponseBytes::Stored) => Ok(()),
@@ -1341,6 +1367,8 @@ impl Client {
         self.record(&CommandResult {
             command: CommandType::Set,
             latency_ns,
+            ttfb_ns,
+            ttlb_ns,
             hit: None,
             success: result.is_ok(),
             tx_bytes,
@@ -1480,7 +1508,7 @@ impl Client {
         encode_request_into(&McRequest::delete(key), &mut self.encode_buf)?;
 
         if !self.is_instrumented() {
-            let response = self.execute_encoded().await?;
+            let response = self.execute_encoded().await.0?;
             return match response {
                 McResponseBytes::Deleted => Ok(true),
                 McResponseBytes::NotFound => Ok(false),
@@ -1490,9 +1518,9 @@ impl Client {
 
         let tx_bytes = self.encode_buf.len() as u32;
         let start = Instant::now();
-        let response = self.execute_encoded().await;
+        let (response, rx_bytes, arrival) = self.execute_encoded().await;
         let latency_ns = elapsed_ns(start);
-        let rx_bytes = self.last_rx_bytes.get();
+        let (ttfb_ns, ttlb_ns) = arrival_ns(arrival.as_ref(), Some(start));
 
         let result = match response {
             Ok(McResponseBytes::Deleted) => Ok(true),
@@ -1503,6 +1531,8 @@ impl Client {
         self.record(&CommandResult {
             command: CommandType::Delete,
             latency_ns,
+            ttfb_ns,
+            ttlb_ns,
             hit: None,
             success: result.is_ok(),
             tx_bytes,
@@ -1583,30 +1613,34 @@ impl Client {
         let start = Instant::now();
 
         let prefix: &[u8] = &self.encode_buf;
-        self.tx.send_parts().build(move |b| {
+        let sent = self.tx.send_parts().build(move |b| {
             b.copy(prefix)
                 .guard(GuardBox::new(guard))
                 .copy(b"\r\n")
                 .submit()
-        })?;
+        });
 
-        let response = self.read_response().await;
-        let latency_ns = elapsed_ns(start);
-        let rx_bytes = self.last_rx_bytes.get();
-
-        let result = match response {
-            Ok(ref r) => {
-                check_error_bytes(r)?;
-                match r {
-                    McResponseBytes::Stored => Ok(()),
-                    _ => Err(Error::UnexpectedResponse),
-                }
-            }
-            Err(e) => Err(e),
+        // A send error is recorded too, with nothing read.
+        let (response, rx_bytes, arrival) = match sent {
+            Ok(_) => self.read_reply().await,
+            Err(e) => (Err(e.into()), 0, None),
         };
+        let latency_ns = elapsed_ns(start);
+        let (ttfb_ns, ttlb_ns) = arrival_ns(arrival.as_ref(), Some(start));
+
+        // A read error and an error reply are recorded as failures.
+        let result = response.and_then(|r| {
+            check_error_bytes(&r)?;
+            match r {
+                McResponseBytes::Stored => Ok(()),
+                _ => Err(Error::UnexpectedResponse),
+            }
+        });
         self.record(&CommandResult {
             command: CommandType::Set,
             latency_ns,
+            ttfb_ns,
+            ttlb_ns,
             hit: None,
             success: result.is_ok(),
             tx_bytes,
@@ -2760,6 +2794,27 @@ pub(crate) fn check_error_bytes(response: &McResponseBytes) -> Result<(), Error>
 #[inline]
 fn elapsed_ns(start: Instant) -> u64 {
     start.elapsed().as_nanos() as u64
+}
+
+/// A reply read from the connection: the result, the bytes read, and, on an
+/// instrumented client, the arrival times of those bytes. An operation that
+/// fails before it reads has 0 bytes and no arrival.
+type Reply<T> = (Result<T, Error>, u32, Option<RecvArrival>);
+
+/// Nanoseconds from `start` to the arrival of the first and of the last
+/// response byte, for [`CommandResult::ttfb_ns`] and
+/// [`CommandResult::ttlb_ns`]. `None` when there is no arrival or no start,
+/// or for a time before the start.
+fn arrival_ns(arrival: Option<&RecvArrival>, start: Option<Instant>) -> (Option<u64>, Option<u64>) {
+    let since = |t: Instant| {
+        start
+            .and_then(|start| t.checked_duration_since(start))
+            .map(|d| d.as_nanos() as u64)
+    };
+    match arrival {
+        Some(a) => (since(a.first()), since(a.last())),
+        None => (None, None),
+    }
 }
 
 #[cfg(test)]

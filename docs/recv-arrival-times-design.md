@@ -1,6 +1,6 @@
 # Receive arrival times
 
-Status: implemented in ringline; the client crates do not report it yet.
+Status: implemented. The cost measurement under "Cost" has not run.
 
 A reader on a TCP connection can ask when the first and the last byte it
 consumed arrived. The client crates use this to report time to first byte and
@@ -271,22 +271,23 @@ taken before the send call.
 
 ### Carrying the arrival to the record
 
-Today the response readers store the byte count in a per-client cell
-(`last_rx_bytes: Cell<u32>`): redis `read_value`, memcache and ping
-`read_response`. The sequential operations read it back through the
-`execute*` helpers, for example redis `get` → `execute_bulk_encoded` →
-`execute_encoded` → `read_value`. A send error returns before the read, so the
-cell still holds the previous operation's count, and `rx_bytes` reports it.
-An arrival kept in a cell would have the same fault.
+The response readers return the byte count and the arrival beside the
+result, `(Result<T, Error>, u32, Option<RecvArrival>)` (the `Reply<T>` alias
+in redis and memcache): redis and memcache `read_reply`, and ping
+`read_response`. The arrival is read only on an instrumented client. Redis
+`read_value` and memcache `read_response` return the `Result` alone, for the
+sharded and cluster clients.
 
-The change: the response readers return the byte count and the arrival beside
-the result, `(Result<T, Error>, u32, Option<RecvArrival>)`, and the cell is
-removed. The helpers that feed a `CommandResult` pass the tuple up: redis
+The helpers that feed a `CommandResult` pass the tuple up: redis
 `execute_encoded`, `execute_bulk_encoded`, `execute_int_encoded` and
-`execute_set`, memcache `execute_encoded`, and ping `execute`. The other
-helpers (`execute`, `execute_int`, `execute_ok`, `execute_bulk`) keep
-returning `Result` and drop the extra values, so their callers, and
+`execute_set`, memcache `execute_encoded`, and ping `execute`. A send error
+returns `0` bytes and no arrival. The other helpers (`execute`, `execute_int`,
+`execute_ok`, `execute_bulk`) return `Result`, so their callers, and
 `Pipeline`, do not change.
+
+Before this change the readers stored the byte count in a per-client cell
+(`last_rx_bytes`), and an operation that failed at send reported the previous
+operation's count as its `rx_bytes`.
 
 The arrival sits outside the `Result` because an error can follow a read. At
 the reader, an unparseable reply is `Err(Error::Protocol)` after consuming its
@@ -297,14 +298,16 @@ an error reply. An operation that fails before it reads reports
 `rx_bytes`.
 
 The guarded SET paths (redis `set_with_guard` and `set_ex_with_guard`,
-memcache `set_with_guard`) record no `CommandResult` on a send error, and the
-redis ones none on a read error; memcache's returns through
-`check_error_bytes(r)?` before it records. They are changed to record on send
-error, read error and error reply, as the other instrumented paths do.
+memcache `set_with_guard`) record a `CommandResult` on a send error, a read
+error and an error reply, as the other instrumented paths do. Before this
+change they recorded none on a send error, the redis ones none on a read
+error, and memcache's none on an error reply.
 
-`recv`, `recv_meta`, `recv_meta_simple` and the GET state machines already
-read through a reader call per response that consumes bytes, and take the
-arrival from those calls.
+`recv`, `recv_meta`, `recv_meta_simple` and the GET state machines read
+through a reader call per response that consumes bytes, and take the arrival
+from those calls. The GET state machines (`run_get_state_machine`,
+`run_get_drain_mio`) keep the first call's first time and the last call's last
+time (`ArrivalSpan`).
 
 Both fields are `None` when the client is not instrumented. `latency_ns`
 stays the time from the start to the parsed response, so

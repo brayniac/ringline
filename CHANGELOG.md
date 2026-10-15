@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `Connection::recv_arrival` and `RecvHalf::recv_arrival` return a
+  `RecvArrival`: when the first and the last byte consumed by the
+  connection's most recent reader call arrived. The reader calls are
+  `with_data`, `with_data_result`, `with_bytes`, `try_with_data` and, on
+  io_uring, `with_segments`. An arrival time is the time of the batch in
+  which the worker handled the receive that delivered the byte: one pass
+  over the reaped completions on io_uring, or over the readable sockets on
+  mio. Each TCP connection keeps a log of arrival times against stream
+  offsets, of at most 1024 entries of 24 bytes. The `ringline/recv_arrival`
+  metric group counts lookups outside the log and merges at the cap. See
+  `docs/recv-arrival-times-design.md`.
+- `ringline-redis`, `ringline-memcache`, `ringline-ping`:
+  `CommandResult::ttlb_ns`, the time from the operation's start to the
+  arrival of the response's last byte.
 - io_uring: `ConfigBuilder::recv_incremental(true)` registers each worker's
   TCP receive ring as incremental (`IOU_PBUF_RING_INC`), where successive
   receives share a buffer at increasing offsets (#622). Each worker first
@@ -93,6 +107,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Breaking (`ringline-redis`, `ringline-memcache`, `ringline-ping`):**
+  `CommandResult` is `#[non_exhaustive]`. Code outside the crates reads it
+  in an `on_result` callback and can no longer construct it.
+- **Breaking, behaviour (`ringline-redis`, `ringline-memcache`,
+  `ringline-ping`):** `CommandResult::ttfb_ns` is `Some` for every
+  instrumented operation that read a byte: the time from the operation's
+  start to the arrival of the response's first byte, from `RecvArrival`. In
+  0.6 it was `None` unless the removed kernel timestamp mode was on. Values
+  are not comparable with ones recorded under that mode.
 - **Breaking:** every worker has 65536 timer slots, and
   `ConfigBuilder::timer_slots` is removed. The pool defaulted to 256 and could
   be raised to 65535, one fewer than the 16-bit slot field in a timer's
@@ -411,7 +434,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `ringline-redis` and `ringline-ping`, `ConfigBuilder::timestamps`,
   `Connection::recv_timestamp` and `RecvHalf::recv_timestamp`
   (`ConnCtx::recv_timestamp` in 0.6), and `ClientBuilder::kernel_timestamps`
-  and `CommandResult::ttfb_ns` in the three client crates. A connection held
+  in the three client crates. A connection held
   one timestamp, which each receive completion overwrote, so with pipelining
   or a task that ran late a response was timed against a later completion's
   timestamp. The send side of each measurement was a user-space
@@ -424,13 +447,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   already buffered did not complete until the peer closed and then returned
   short, and bytes held for a segment reader could be delivered after newer
   ones. UDP `recv_batch_timed` is unchanged. Client latency is timed with
-  `Instant`. Remove `.timestamps(..)` and `.kernel_timestamps(..)` calls,
-  the `timestamps` feature from `Cargo.toml`, and any read or construction
-  of `CommandResult::ttfb_ns`, which was `None` unless kernel timestamps
-  were on. Nothing in this change replaces `ttfb_ns`.
+  `Instant`. Remove `.timestamps(..)` and `.kernel_timestamps(..)` calls and
+  the `timestamps` feature from `Cargo.toml`.
 
 ### Fixed
 
+- `ringline-redis`, `ringline-memcache`, `ringline-ping`:
+  `CommandResult::rx_bytes` is 0 for an operation that fails at send. It
+  reported the previous operation's byte count. The guarded SET paths
+  (`ringline-redis` `set_with_guard` and `set_ex_with_guard`,
+  `ringline-memcache` `set_with_guard`) record a `CommandResult` when the
+  send fails, the read fails, or the server replies with an error. They
+  recorded none.
 - io_uring: a park offer made while the connection holds request bytes the
   handler has not read, or from inside one of its reader callbacks, is
   ignored. Such an offer stayed set, so once the handler read the request
