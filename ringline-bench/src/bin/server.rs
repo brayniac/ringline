@@ -1211,8 +1211,9 @@ fn run_ringline(cfg: EchoCfg) {
         .recv_incremental(recv_incremental)
         .max_connections(max_connections)
         // A forward echo connection whose forward fails waits on a timer
-        // between retries (`forward_echo_loop`); one slot per connection.
-        .timer_slots(max_connections)
+        // between retries (`forward_echo_loop`); one slot per connection, up
+        // to the 65535 this base's validation allows.
+        .timer_slots(max_connections.min(65_535))
         .send_pool(512, msg_size.next_power_of_two().max(4096) as u32)
         .conn_chunk_size(conn_chunk_size)
         .accept_mode(accept_mode.into())
