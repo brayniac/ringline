@@ -96,7 +96,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let executor = Executor::new(
             config.max_connections,
             config.standalone_task_capacity,
-            config.timer_slots,
+            crate::runtime::TIMER_SLOTS,
             config.udp_bind.len() as u32,
             config.udp_recv_queue_capacity,
         );

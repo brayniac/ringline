@@ -266,6 +266,7 @@ pub use listen_gate::ListenHandle;
 pub use listen_gate::begin_listening;
 /// Begin listening on every deferred listener, from any code on a worker.
 pub use listen_gate::begin_listening_all;
+pub use runtime::TIMER_SLOTS;
 /// Trait for async event handlers (one task per connection).
 pub use runtime::handler::AsyncEventHandler;
 #[cfg(has_io_uring)]

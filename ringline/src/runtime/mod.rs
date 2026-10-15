@@ -190,6 +190,13 @@ thread_local! {
     pub(crate) static CURRENT_TASK_ID: Cell<u32> = const { Cell::new(0) };
 }
 
+/// Timer slots per worker: the most [`sleep()`](crate::sleep),
+/// [`timeout()`](crate::timeout) and related timers one worker can have
+/// pending at once. A timer's io_uring completion carries its slot in 16 bits,
+/// which this fills. On io_uring the pool takes about 1.7 MiB per worker; on
+/// mio, a heap entry per pending timer adds up to about 1.5 MiB more.
+pub const TIMER_SLOTS: u32 = 1 << 16;
+
 /// Pool of timer slots backed by stable memory for the I/O backend.
 ///
 /// Each `sleep()` call allocates a slot and metadata. Generation counters
@@ -1544,6 +1551,22 @@ mod tests {
         let (slot, generation) = TimerSlotPool::decode_payload(payload);
         assert_eq!(slot, 0);
         assert_eq!(generation, 0);
+    }
+
+    /// Every slot of a full-size pool is distinct and survives the 16-bit
+    /// slot field of the completion payload.
+    #[test]
+    fn every_timer_slot_round_trips_through_the_payload() {
+        let mut pool = TimerSlotPool::new(TIMER_SLOTS);
+        let mut seen = vec![false; TIMER_SLOTS as usize];
+        for _ in 0..TIMER_SLOTS {
+            let (slot, generation) = pool.allocate(0).unwrap();
+            let payload = TimerSlotPool::encode_payload(slot, generation);
+            assert_eq!(TimerSlotPool::decode_payload(payload), (slot, generation));
+            assert!(!seen[slot as usize], "slot {slot} allocated twice");
+            seen[slot as usize] = true;
+        }
+        assert!(pool.allocate(0).is_none());
     }
 
     #[test]

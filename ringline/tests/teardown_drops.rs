@@ -18,6 +18,11 @@ static SERIAL: Mutex<()> = Mutex::new(());
 static ARMED: AtomicUsize = AtomicUsize::new(0);
 static EXHAUSTED: AtomicUsize = AtomicUsize::new(0);
 static SLEEPERS_DROPPED: AtomicUsize = AtomicUsize::new(0);
+/// Timer slots the first connection of a test leaves free; it holds the rest.
+static FREE_SLOTS: AtomicUsize = AtomicUsize::new(0);
+/// Set by the first connection of a test once it holds its slots.
+static FILLER_HOLDING: AtomicBool = AtomicBool::new(false);
+static FILLER_TAKEN: AtomicBool = AtomicBool::new(false);
 
 /// Counts the connection tasks that have been dropped.
 struct CountDrop;
@@ -35,6 +40,16 @@ struct SleepsInConnection;
 impl AsyncEventHandler for SleepsInConnection {
     fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
+            // The first connection holds all but `FREE_SLOTS` timer slots, so
+            // the rest of the test works against a small pool.
+            if !FILLER_TAKEN.swap(true, Ordering::SeqCst) {
+                let hold = ringline::TIMER_SLOTS as usize - FREE_SLOTS.load(Ordering::SeqCst);
+                let _held: Vec<_> = (0..hold)
+                    .map(|_| ringline::try_sleep(Duration::from_secs(600)).expect("free slot"))
+                    .collect();
+                FILLER_HOLDING.store(true, Ordering::SeqCst);
+                std::future::pending::<()>().await;
+            }
             let _guard = CountDrop;
             match ringline::try_sleep(Duration::from_secs(60)) {
                 Ok(sleep) => {
@@ -50,6 +65,21 @@ impl AsyncEventHandler for SleepsInConnection {
     fn create_for_worker(_id: usize) -> Self {
         SleepsInConnection
     }
+}
+
+/// Open the connection that holds all but `free` timer slots, and wait until
+/// it holds them. Keep the returned stream open for the rest of the test.
+fn hold_all_but(addr: std::net::SocketAddr, free: usize) -> std::net::TcpStream {
+    FREE_SLOTS.store(free, Ordering::SeqCst);
+    FILLER_TAKEN.store(false, Ordering::SeqCst);
+    FILLER_HOLDING.store(false, Ordering::SeqCst);
+    let stream = std::net::TcpStream::connect(addr).expect("connect");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !FILLER_HOLDING.load(Ordering::SeqCst) {
+        assert!(Instant::now() < deadline, "the filler never took its slots");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    stream
 }
 
 /// Connect, wait for the server to accept and settle, then close.
@@ -78,7 +108,6 @@ fn a_sleep_dropped_with_its_connection_frees_its_timer_slot() {
         .recv_buffer(16, 1024)
         .max_connections(16)
         .send_pool(16, 16384)
-        .timer_slots(8)
         .blocking_threads(0)
         .resolver_threads(0)
         .spawner_threads(0)
@@ -89,6 +118,7 @@ fn a_sleep_dropped_with_its_connection_frees_its_timer_slot() {
         .launch::<SleepsInConnection>()
         .expect("launch");
     let addr = runtime.bound_addr().unwrap();
+    let _filler = hold_all_but(addr, 8);
     for _ in 0..20 {
         connect_and_close(addr);
     }
@@ -128,7 +158,6 @@ fn a_freed_timer_slot_is_available_to_the_next_connection() {
         .recv_buffer(16, 1024)
         .max_connections(16)
         .send_pool(16, 16384)
-        .timer_slots(4)
         .blocking_threads(0)
         .resolver_threads(0)
         .spawner_threads(0)
@@ -139,6 +168,7 @@ fn a_freed_timer_slot_is_available_to_the_next_connection() {
         .launch::<SleepsInConnection>()
         .expect("launch");
     let addr = runtime.bound_addr().unwrap();
+    let filler = hold_all_but(addr, 4);
     let wait_for = |n: usize| {
         let deadline = Instant::now() + Duration::from_secs(5);
         while ARMED.load(Ordering::SeqCst) + EXHAUSTED.load(Ordering::SeqCst) < n
@@ -162,6 +192,7 @@ fn a_freed_timer_slot_is_available_to_the_next_connection() {
         wait_for(5 + round);
     }
     drop(open);
+    drop(filler);
     runtime.shutdown();
     for h in handles {
         h.join().expect("worker panicked").expect("worker failed");
