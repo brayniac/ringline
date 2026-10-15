@@ -173,7 +173,8 @@ pub mod park_drain_us {
 /// (`docs/journal/2026-09-two-phase-park.md`).
 ///
 /// `OFFER_DECLINED` counts `offer_for_park` calls declined because bytes were
-/// unread or a reader callback was running (#669).
+/// unread or the connection's reader callback was the innermost one running
+/// (#669).
 pub mod park_diag {
     /// `begin_park` submitted a recv-cancel, because a multishot was armed.
     pub const CANCEL_SUBMITTED: usize = 0;
@@ -197,9 +198,9 @@ pub mod park_diag {
     /// A drain was dropped because the slot had been recycled under it.
     pub const DRAIN_STALE: usize = 6;
 
-    /// `offer_for_park` was ignored: the connection held unread bytes, or the
-    /// offer came from inside one of its reader callbacks. A handler whose
-    /// offers all land here is never parked.
+    /// `offer_for_park` was ignored: the connection held unread bytes, or its
+    /// reader callback was the innermost one running. A handler whose offers
+    /// all land here is never parked.
     pub const OFFER_DECLINED: usize = 7;
 
     /// Number of slots.

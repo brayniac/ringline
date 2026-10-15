@@ -117,8 +117,8 @@ impl Drop for DriverStateGuard {
 // reader callback, while it is the innermost one running. `with_bytes` takes
 // the request out of the driver before its callback runs. A
 // `forward_recv_buf` that sends the whole lent buffer or the whole
-// accumulator takes it out during the callback. `holds_unread` cannot see a
-// request taken out either way (#669).
+// accumulator takes it out during the callback. `holds_unread` returns false
+// for a request taken out either way (#669).
 #[cfg(has_io_uring)]
 thread_local! {
     static READER_CALLBACK_CONN: std::cell::Cell<Option<u32>> =
@@ -1159,8 +1159,8 @@ impl ConnCtx {
     /// declined only while the runtime still holds A's bytes. It does not
     /// hold them in a `with_bytes` callback, or after a `forward_recv_buf`
     /// that sent the whole lent buffer or the whole accumulator.
-    /// `metrics::park_diag::OFFER_DECLINED` counts offers ignored for these
-    /// reasons.
+    /// `metrics::park_diag::OFFER_DECLINED` counts offers ignored because of
+    /// a running reader callback or held bytes.
     ///
     /// The runtime does not see bytes the handler has taken into its own
     /// memory, for example a `ConnStream`'s buffered data, a recv sink,

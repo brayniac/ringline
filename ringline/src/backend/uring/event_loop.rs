@@ -6855,9 +6855,9 @@ mod tests {
                     })
                 }
                 "with_data_forward" => {
-                    // Forwarding the lent buffer takes it out of
-                    // `pending_recv_bufs`, so only the callback guard sees
-                    // that the request is still being handled.
+                    // Forwarding the whole lent buffer or accumulator takes it
+                    // out of `pending_recv_bufs` or the accumulator, so only
+                    // the callback guard declines the offer.
                     let mut fut = std::pin::pin!(ctx.with_data(|d| {
                         ctx.forward_recv_buf(d).expect("forward");
                         ctx.offer_for_park(Some(ParkState::new(3u8)));
