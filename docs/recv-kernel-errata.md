@@ -158,9 +158,9 @@ For ringline:
   kernel that reports it differently fails the preflight and gets a plain
   ring. The exact completion such a kernel posts was not checked here.
 - Do not combine incremental rings with bundles on 6.12 before 6.12.94.
-- Timestamped connections use multishot `RECVMSG`. On an incremental ring
-  they need `min_left` of at least the header size, which needs 6.12.90 or
-  7.1; ringline gives them a plain ring.
+- Multishot `RECVMSG` on an incremental ring needs `min_left` of at least
+  the header size, which needs 6.12.90 or 7.1. ringline issues `RECVMSG`
+  only for UDP, on a plain ring.
 - Do not use `MSG_TRUNC` on receives into an incremental ring before
   6.12.112, 6.18.53 or 7.2.7.
 

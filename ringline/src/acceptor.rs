@@ -42,9 +42,6 @@ pub struct AcceptorConfig {
     /// Connections to assign to each worker before moving to the next.
     /// 1 = round-robin. See [`ConfigBuilder::conn_chunk_size`](crate::ConfigBuilder::conn_chunk_size).
     pub conn_chunk_size: usize,
-    /// Whether to set SO_TIMESTAMPING on accepted connections.
-    #[cfg(feature = "timestamps")]
-    pub timestamps: bool,
 }
 
 /// Apply the per-connection socket options an accepted fd needs.
@@ -57,11 +54,7 @@ pub struct AcceptorConfig {
 /// pool with its workers idle (#460).
 ///
 /// One function, called from both paths, so the two cannot drift again.
-pub(crate) fn apply_accepted_sockopts(
-    fd: RawFd,
-    nodelay: bool,
-    #[cfg(feature = "timestamps")] timestamps: bool,
-) {
+pub(crate) fn apply_accepted_sockopts(fd: RawFd, nodelay: bool) {
     if nodelay {
         let optval: libc::c_int = 1;
         unsafe {
@@ -70,22 +63,6 @@ pub(crate) fn apply_accepted_sockopts(
                 libc::IPPROTO_TCP,
                 libc::TCP_NODELAY,
                 &optval as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-        }
-    }
-
-    // Kernel-level RX timestamps (Linux only).
-    #[cfg(all(target_os = "linux", feature = "timestamps"))]
-    if timestamps {
-        let flags: libc::c_int =
-            (libc::SOF_TIMESTAMPING_SOFTWARE | libc::SOF_TIMESTAMPING_RX_SOFTWARE) as libc::c_int;
-        unsafe {
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_TIMESTAMPING,
-                &flags as *const _ as *const libc::c_void,
                 std::mem::size_of::<libc::c_int>() as libc::socklen_t,
             );
         }
@@ -148,12 +125,7 @@ pub fn run_acceptor(config: AcceptorConfig) {
         }
 
         let is_unix = addr_storage.ss_family == libc::AF_UNIX as libc::sa_family_t;
-        apply_accepted_sockopts(
-            fd,
-            config.tcp_nodelay && !is_unix,
-            #[cfg(feature = "timestamps")]
-            config.timestamps,
-        );
+        apply_accepted_sockopts(fd, config.tcp_nodelay && !is_unix);
 
         // Parse peer address from the sockaddr_storage filled by accept4.
         // A Unix accept has no `SocketAddr` — its peer is normally unnamed, so
@@ -304,8 +276,6 @@ mod tests {
             listen_gates: Arc::clone(&gates),
             tcp_nodelay: false,
             conn_chunk_size: 1,
-            #[cfg(feature = "timestamps")]
-            timestamps: false,
         };
 
         let handle = std::thread::spawn(move || run_acceptor(config));
@@ -366,8 +336,6 @@ mod tests {
             listen_gates: Arc::clone(&gates),
             tcp_nodelay: false,
             conn_chunk_size: 1,
-            #[cfg(feature = "timestamps")]
-            timestamps: false,
         };
         let before = crate::metrics::CONNECTIONS
             .value(crate::metrics::conn::ACCEPT_BACKLOG_DROPPED)
@@ -431,8 +399,6 @@ mod tests {
             listen_gates: Arc::clone(&gates),
             tcp_nodelay: false,
             conn_chunk_size: 1,
-            #[cfg(feature = "timestamps")]
-            timestamps: false,
         };
         let handle = std::thread::spawn(move || run_acceptor(config));
         std::thread::sleep(std::time::Duration::from_millis(30));
@@ -486,12 +452,7 @@ mod tests {
         }
         assert_eq!(read_nodelay(accepted.as_raw_fd()), 0, "precondition");
 
-        apply_accepted_sockopts(
-            accepted.as_raw_fd(),
-            true,
-            #[cfg(feature = "timestamps")]
-            false,
-        );
+        apply_accepted_sockopts(accepted.as_raw_fd(), true);
         // Non-zero, not `== 1`: Linux reports 1, macOS reports the internal
         // TF_NODELAY flag bits (4). The contract is on-versus-off.
         assert_ne!(
@@ -519,12 +480,7 @@ mod tests {
                 std::mem::size_of::<libc::c_int>() as libc::socklen_t,
             );
         }
-        apply_accepted_sockopts(
-            accepted.as_raw_fd(),
-            false,
-            #[cfg(feature = "timestamps")]
-            false,
-        );
+        apply_accepted_sockopts(accepted.as_raw_fd(), false);
         assert_eq!(read_nodelay(accepted.as_raw_fd()), 0);
         drop(client);
     }

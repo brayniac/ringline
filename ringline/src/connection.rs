@@ -38,9 +38,6 @@ pub enum RecvArm {
     /// `recv_multishot(true)`; a direct-echo or recv-forward connection
     /// always arms one-shot (`Driver::recv_single`).
     Multi,
-    /// Multishot recvmsg with cmsg timestamps (io_uring, `timestamps`).
-    #[cfg(feature = "timestamps")]
-    MsgMulti,
 }
 
 /// The TCP read half as this end observed it.
@@ -128,10 +125,6 @@ pub struct ConnectionState {
     pub listener: Option<crate::ListenerId>,
     /// Whether a connect timeout SQE is armed for this connection.
     pub connect_timeout_armed: bool,
-    /// Most recent kernel RX timestamp (nanoseconds since epoch, CLOCK_REALTIME).
-    /// Set when a `RecvMsgMulti` completion delivers a `SCM_TIMESTAMPING` cmsg.
-    #[cfg(feature = "timestamps")]
-    pub recv_timestamp_ns: u64,
     /// When true, `handle_recv_multi` echoes received data directly from the CQE
     /// handler instead of waking the connection's task. This eliminates the
     /// task-wakeup overhead (collect_wakeups → poll_ready_tasks) on the hot echo
@@ -145,8 +138,6 @@ pub struct ConnectionState {
     /// cancel the still-armed recv so its reference on the socket file is
     /// dropped and the kernel actually sends the peer a FIN — closing the fixed
     /// descriptor alone does not, since the in-flight recv pins the socket.
-    /// (Only tracked for the plain `RecvMulti` path, not the timestamped
-    /// `RecvMsgMulti` path.)
     #[cfg(has_io_uring)]
     pub recv_multishot_armed: bool,
     /// The socket was handed to another worker (a park install, #443), so
@@ -177,8 +168,6 @@ impl ConnectionState {
             peer_addr: None,
             listener: None,
             connect_timeout_armed: false,
-            #[cfg(feature = "timestamps")]
-            recv_timestamp_ns: 0,
             #[cfg(has_io_uring)]
             direct_echo: false,
             #[cfg(has_io_uring)]
@@ -248,10 +237,6 @@ impl ConnectionState {
         // next occupant of this slot to whichever listener used it last.
         self.listener = None;
         self.connect_timeout_armed = false;
-        #[cfg(feature = "timestamps")]
-        {
-            self.recv_timestamp_ns = 0;
-        }
         #[cfg(has_io_uring)]
         {
             self.direct_echo = false;

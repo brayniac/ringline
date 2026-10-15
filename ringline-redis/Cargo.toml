@@ -19,7 +19,6 @@ check-cfg = ["cfg(has_io_uring)"]
 [features]
 default = ["metrics"]
 metrics = ["dep:histogram"]
-timestamps = ["ringline/timestamps", "dep:libc"]
 # Forward the runtime's mio-backend override. Needed so this crate's build.rs
 # sees `CARGO_FEATURE_FORCE_MIO` and gates the io_uring-only streaming API
 # (`get_stream`/`ValueStream`) out in lockstep with `ringline` being built as
@@ -32,7 +31,6 @@ bytes = { workspace = true }
 histogram = { workspace = true, optional = true }
 itoa = { workspace = true }
 ketama = { workspace = true }
-libc = { workspace = true, optional = true }
 ringline = { workspace = true }
 resp-proto = { workspace = true }
 thiserror = { workspace = true }

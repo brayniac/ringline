@@ -1623,8 +1623,6 @@ impl RinglineBuilder {
                         listen_gates: listen_gates.clone(),
                         // A Unix listener has no TCP_NODELAY to set.
                         tcp_nodelay: !spec.addr.is_unix() && self.config.tcp_nodelay,
-                        #[cfg(feature = "timestamps")]
-                        timestamps: self.config.timestamps,
                         conn_chunk_size: self.config.conn_chunk_size,
                     };
                     thread::Builder::new()

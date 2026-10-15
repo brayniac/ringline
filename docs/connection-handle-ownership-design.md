@@ -129,9 +129,9 @@ The ownership claim is recorded by the event loop at accept time
 
 The read entry points — `with_data`, `with_data_result`, `with_bytes`,
 `recv_ready`, `segments`, `recv_owned_segment`, `with_segments`,
-`end_segments`, `recv_timestamp`, `try_with_data`, `eof_truncated`,
-`take_recv_sink` — are crate-private. Reading goes through `Connection` or
-`RecvHalf`, neither of which is `Copy`, so the read side cannot be aliased.
+`end_segments`, `try_with_data`, `eof_truncated`, `take_recv_sink` — are
+crate-private. Reading goes through `Connection` or `RecvHalf`, neither of
+which is `Copy`, so the read side cannot be aliased.
 `ConnCtx` is now a send/identity/lifecycle handle plus a way to *obtain* the
 read side (`take_recv`, `split`).
 

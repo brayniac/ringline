@@ -235,7 +235,7 @@ probe was run and its output is in the experiment log.
 | P-9 | AES-GCM's confidentiality limit is 2^24 records under rustls; ChaCha20-Poly1305 has none | **Verified** | `rustls-0.23.41/src/crypto/ring/tls13.rs:28` (`u64::MAX` for ChaCha20), `:48` / `:70` (`1 << 24` for AES-256-GCM / AES-128-GCM). rustls' `KernelConnection` explicitly does **not** track this: `src/conn/kernel.rs:37-52` |
 | P-10 | A control record read with plain `recv()` fails with **EIO** | **Verified in source and measured** | `net/tls/tls_sw.c:1752-1772` — `tls_record_content_type` returns `-EIO` when the record is not `TLS_RECORD_TYPE_DATA` and `put_cmsg` failed or `MSG_CTRUNC` is set. hv01 probe: `PASS plain recv() of a control record fails with EIO` |
 | P-11 | `IORING_OP_URING_CMD` / `SOCKET_URING_OP_SETSOCKOPT` accepts **any** level, so kTLS keys can be installed on a **fixed** descriptor | **Verified in source** | `io_uring/uring_cmd.c:313-329` (`io_uring_cmd_setsockopt`) has **no** level check, unlike `io_uring_cmd_getsockopt` at `:287-297` which is `SOL_SOCKET`-only. Exposed by the pinned `io-uring` 0.7.12 crate as `opcode::SetSockOpt`, whose `fd` is `impl sealed::UseFixed` (`opcode.rs:645-673`). `io_uring_cmd_sock` also requires `prot->ioctl` to be non-NULL (`uring_cmd.c:337-341`); the TLS ULP copies the base `tcp_prot` wholesale (`net/tls/tls_main.c:904`, `prot[TLS_BASE][TLS_BASE] = *base;`) and never overrides `.ioctl`, so it survives the ULP swap |
-| P-12 | ringline's default TCP recv path is a buffer-select recv on io_uring (one-shot `RecvSelect` by default, multishot `RecvMulti` with `recv_multishot(true)`) and `Read::read` on mio, neither of which can carry cmsgs | **Verified** | `backend/uring/event_loop.rs:5245` `arm_recv` — the `timestamps` branch is `:5250-5268`, the unconditional fallthrough is `:5269` `Driver::submit_tcp_recv` (`backend/uring/driver.rs:143`), which submits `RecvSelect` or `submit_multishot_recv` (`backend/uring/ring.rs:294`); mio `backend/mio/event_loop.rs:740` `handle_readable`, `stream.read` at `:778` and `:920`. The `RecvMsgMulti` TCP path exists only behind the default-off, CI-untested `timestamps` feature (`ringline/Cargo.toml:21`; handler `handle_recv_msg_multi_ts`, `backend/uring/event_loop.rs:1979-2136`) |
+| P-12 | ringline's default TCP recv path is a buffer-select recv on io_uring (one-shot `RecvSelect` by default, multishot `RecvMulti` with `recv_multishot(true)`) and `Read::read` on mio, neither of which can carry cmsgs | **Verified** | `arm_recv` (`backend/uring/event_loop.rs`) calls `Driver::submit_tcp_recv` (`backend/uring/driver.rs`), which submits `RecvSelect` or `submit_multishot_recv` (`backend/uring/ring.rs`); mio `backend/mio/event_loop.rs:740` `handle_readable`, `stream.read` at `:778` and `:920`. The `RecvMsgMulti` TCP path that existed behind the default-off `timestamps` feature (handler `handle_recv_msg_multi_ts`) has been removed; see the CHANGELOG entry for the kernel receive-timestamp mode |
 | P-13 | ringline has **no** `splice`/`sendfile` path in either direction | **Verified** | `grep -rn 'splice\|sendfile' ringline/src/` returns nothing. `ConnCtx::forward_to` is `opcode::Send` from a provided recv buffer (`backend/uring/ring.rs:340-355`); the file sink is `opcode::Write` (`:364`); NVMe is `IORING_OP_URING_CMD` into user memory (`ring.rs:912`) |
 | P-14 | rustls has a **dedicated kTLS API** that survives the handover and handles key updates and session tickets | **Verified** | `rustls-0.23.41/src/conn/kernel.rs` (whole module); entry points `UnbufferedClientConnection::dangerous_into_kernel_connection` (`src/client/client_conn.rs:944`) and the server twin (`src/server/server_conn.rs:974`). `dangerous_extract_secrets` is **`#[deprecated]`** in favour of it (`client_conn.rs:929-931`) |
 | P-15 | `enable_secret_extraction` is required, defaults to `false`, and ringline never sets it | **Verified** | Gate at `rustls-0.23.41/src/conn.rs:1198-1203`. `grep -rn enable_secret_extraction` over the ringline tree: zero hits. ringline never *builds* a rustls config — it wraps a caller-supplied `Arc` (`ringline/src/config.rs:14`, `:28`) |
@@ -524,7 +524,7 @@ reference point.
 | 3 | TCP `RecvMsgMulti` on **both** backends | **Large** | See 3.3 |
 | 4 | `setsockopt` on a fixed descriptor | **Small** | `opcode::SetSockOpt` exists in the pinned `io-uring` 0.7.12 and takes `impl UseFixed` [P-11]; the kernel imposes no level restriction on the setsockopt direction, and both `TCP_ULP` and `TLS_TX` were **measured** installing successfully on a fixed descriptor [P-20]. Note the `optval` (which holds **key material**) must satisfy Domain Invariant 1 — live until the CQE — and be zeroized after |
 | 5 | A second short-send strategy | **Medium, and unbudgeted anywhere** | kTLS refuses `MSG_WAITALL` [P-19], so kTLS connections need the userspace partial-resubmit loop that `MSG_WAITALL` was landed to remove. Two strategies coexisting in `submit_next_queued`/`handle_send`, keyed on connection type |
-| 6 | A cmsg helper | **Small** | Two hardcoded single-option parsers duplicate the same walk today (`backend/uring/event_loop.rs:1589-1631`, `backend/udp_gro.rs:21-52`). Extract one iterator |
+| 6 | A cmsg helper | **Small** | The one cmsg parser, `backend/udp_gro.rs:21-52`, reads a single hardcoded option. Extract an iterator from it |
 
 ### 3.2 The unbuffered engine is genuinely the prerequisite — and better than we knew
 
@@ -593,31 +593,22 @@ source and measured. So the TCP recv path must become `recvmsg`-shaped.
 
 What exists today is *not* infrastructure to build on:
 
-- **Every default build's TCP recv is plain `RecvMulti`** (io_uring) or
-  `Read::read` (mio) [P-12]. Neither can carry cmsgs.
-- The `RecvMsgMulti` TCP handler exists only behind the **default-off,
-  CI-untested** `timestamps` feature (`ringline/Cargo.toml:21`; handler at
-  `backend/uring/event_loop.rs:1453-1584`), and it has three gaps a kTLS path
-  must not inherit:
-  1. **It never consults `tls_table`** — no counterpart to the TLS dispatch at
-     `event_loop.rs:1120-1126`. A TLS connection with `timestamps` on today
-     would feed raw ciphertext to the accumulator.
-  2. **It ignores `recv_domain`/segmented delivery, `direct_echo`, and the
-     zero-copy `pending_recv_bufs` hold.**
-  3. **Close-path cancel is hardcoded to `OpTag::RecvMulti`**
-     (`backend/uring/driver.rs:1180-1184`), so an armed `RecvMsgMultiTs` is
-     never cancelled on close.
-- The msghdr template is a **single per-worker `Box<libc::msghdr>`**
-  (`backend/uring/driver.rs:330-333`, `:634-640`), so TLS and non-TLS
-  connections on the same worker cannot have different control-region sizes.
-  Sizing matters: `MSG_CTRUNC` on a control record is `EIO` [P-10].
+- **Every build's TCP recv is a buffer-select recv** (`RecvSelect`
+  or `RecvMulti` on io_uring) or `Read::read` (mio) [P-12]. Neither can
+  carry cmsgs.
+- There is no TCP `recvmsg` path on either backend. The `timestamps`
+  feature's `RecvMsgMulti` handler, since removed (see the CHANGELOG entry
+  for the kernel receive-timestamp mode), never consulted `tls_table` and
+  ignored segmented delivery, `direct_echo` and the zero-copy recv-buffer
+  hold, so it was not a precedent to build on.
+- A TCP `recvmsg` path must size its msghdr control buffer for TLS control
+  records: `MSG_CTRUNC` on a control record is `EIO` [P-10].
 - Two other io_uring TCP recv paths reach the accumulator and bypass the TLS
   dispatch entirely: `handle_recv_fallback` (`event_loop.rs:862`, appends at
   `:936`) and `flush_replenish_and_rearm` (`:729`). Both need the kTLS demux
   too.
-- **mio has no `recvmsg` path at all** — it reads through
-  `std::io::Read::read`. A kTLS mio backend needs a `libc::recvmsg` path built
-  from nothing.
+- mio reads TCP through `std::io::Read::read`; its only `recvmsg` is for
+  UDP. A kTLS mio backend needs a TCP `libc::recvmsg` path.
 
 **Size: Large.** This is comparable to, or larger than, the whole unbuffered
 engine, and it touches the recv hot path that segmented recv also wants to
@@ -721,7 +712,7 @@ engine's precedent: a default-off cargo feature, decided later.
 
 | Cluster | Size | Why |
 |---|---|---|
-| TCP `RecvMsgMulti` conversion, both backends | **Large** | 3.3. Touches the recv hot path, has no usable precedent (the `timestamps` path is TLS-, segment-, and cancel-unaware), and mio needs a `recvmsg` path written from nothing |
+| TCP `RecvMsgMulti` conversion, both backends | **Large** | 3.3. Touches the recv hot path, has no precedent in the tree, and mio needs a `recvmsg` path written from nothing |
 | Second short-send strategy | **Medium** | 3.1 item 5 / [P-19]. Undoes a shipped decision and adds a per-connection branch to the send path |
 | Handshake → kTLS switch (ordering + drain preconditions) | **Medium** | [Question 4](#4-what-breaks). Small in lines, large in ways to get silently wrong — the class of bug the unbuffered engine hit three times |
 | Key updates + confidentiality-limit accounting | **Medium on 6.14+, blocked on 6.12** | 3.4 / [P-5] / [P-9] |
@@ -762,7 +753,7 @@ Checked against `CLAUDE.md`'s *Domain Invariants* and
 | **3. Stale CQEs are normal** | **Survives, extended.** The `SetSockOpt` CQE needs generation validation like any other, and the recv re-arm across the switch will produce in-flight `RecvMulti` CQEs for a connection that is now `RecvMsgMulti` |
 | **4. No CQE-skip for pool-backed sends** | **Survives unchanged** |
 | **5. Short sends happen** | **BROKEN — this is the sharpest finding in the document.** kTLS refuses `MSG_WAITALL` with `-EOPNOTSUPP` [P-19], measured, and ringline sets it on every stream send. See below |
-| **6. `ENOBUFS` on multishot recv** | **Survives**, but the re-arm path must be reproduced for `RecvMsgMulti`, which today only exists behind `timestamps` |
+| **6. `ENOBUFS` on multishot recv** | **Survives**, but the re-arm path must be written for `RecvMsgMulti`, which ringline does not have on TCP |
 | **7. `EINTR`/`EBUSY` on submit is backpressure** | **New hazard.** `EBUSY` from `SOCKET_URING_OP_SETSOCKOPT` is *not* backpressure — it is the rekey refusal [P-5]. Retrying it forever is a hang. The two must not be conflated |
 
 ### `MSG_WAITALL` is refused, and that undoes a shipped decision

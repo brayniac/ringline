@@ -2693,27 +2693,6 @@ impl ConnCtx {
         })
     }
 
-    // ── Timestamps ─────────────────────────────────────────────────
-
-    /// Returns the most recent kernel RX software timestamp as nanoseconds
-    /// since epoch (`CLOCK_REALTIME`), or 0 if no timestamp has been received
-    /// or the handle is stale.
-    ///
-    /// Updated each time a `RecvMsgMulti` completion delivers an
-    /// `SCM_TIMESTAMPING` cmsg. Only available when the `timestamps` feature
-    /// is enabled and `Config::timestamps(true)` is set.
-    #[cfg(feature = "timestamps")]
-    pub(crate) fn recv_timestamp(&self) -> u64 {
-        with_state(|driver, _| {
-            driver
-                .connections
-                .get(self.conn_index)
-                .filter(|cs| cs.generation == self.generation)
-                .map(|cs| cs.recv_timestamp_ns)
-                .unwrap_or(0)
-        })
-    }
-
     // ── Close / metadata ─────────────────────────────────────────────
 
     /// Close this connection.
@@ -3556,13 +3535,6 @@ impl RecvHalf {
         self.conn.take_recv_sink()
     }
 
-    /// See [`Connection::recv_timestamp`]. Read-side state, so it lives here
-    /// rather than on [`SendHalf`].
-    #[cfg(feature = "timestamps")]
-    pub fn recv_timestamp(&self) -> u64 {
-        self.conn.recv_timestamp()
-    }
-
     /// See [`Connection::recv_ready`].
     pub fn recv_ready(&mut self) -> RecvReadyFuture {
         self.conn.recv_ready()
@@ -3811,12 +3783,6 @@ impl Connection {
         len: usize,
     ) -> ForwardToConnFuture<'s> {
         self.rx.forward_to_conn(sink, len)
-    }
-
-    /// See [`Connection::recv_timestamp`].
-    #[cfg(feature = "timestamps")]
-    pub fn recv_timestamp(&self) -> u64 {
-        self.rx.recv_timestamp()
     }
 
     // ── send ────────────────────────────────────────────────────────────

@@ -39,9 +39,6 @@ pub enum OpTag {
     NvmeCmd = 15,
     /// Direct I/O command (read, write, fsync via O_DIRECT + IORING_OP_READ/WRITE).
     DirectIo = 16,
-    /// Multishot recvmsg for TCP connections with SO_TIMESTAMPING.
-    #[cfg(feature = "timestamps")]
-    RecvMsgMultiTs = 17,
     /// Filesystem I/O command (open, read, write, fsync, stat, rename, unlink, mkdir).
     Fs = 18,
     /// PollAdd on a pidfd for async child process exit notification.
@@ -146,8 +143,6 @@ impl OpTag {
             14 => Some(OpTag::SendMsgUdp),
             15 => Some(OpTag::NvmeCmd),
             16 => Some(OpTag::DirectIo),
-            #[cfg(feature = "timestamps")]
-            17 => Some(OpTag::RecvMsgMultiTs),
             18 => Some(OpTag::Fs),
             19 => Some(OpTag::PidfdPoll),
             20 => Some(OpTag::SendRecvBuf),
@@ -195,8 +190,6 @@ impl OpTag {
             OpTag::SendMsgUdp => "send_msg_udp",
             OpTag::NvmeCmd => "nvme_cmd",
             OpTag::DirectIo => "direct_io",
-            #[cfg(feature = "timestamps")]
-            OpTag::RecvMsgMultiTs => "recv_msg_multi_ts",
             OpTag::Fs => "fs",
             OpTag::PidfdPoll => "pidfd_poll",
             OpTag::SendRecvBuf => "send_recv_buf",

@@ -681,9 +681,9 @@ machine that would decrypt inbound records, and `KernelConnection` does not
 decrypt at all.
 
 That makes kTLS strictly larger than it first appears: Linux-only, restricted to
-kernel-supported ciphers, requiring the `RecvMsgMulti` + cmsg path (which already
-exists for the `timestamps` feature) to read TLS control records, plus KeyUpdate
-handling, kernel-version gating, and a fallback for every unsupported case.
+kernel-supported ciphers, requiring a `RecvMsgMulti` + cmsg path to read TLS
+control records, plus KeyUpdate handling, kernel-version gating, and a fallback
+for every unsupported case.
 
 This design gets the same send-side copy count, on **both** backends including
 macOS, with none of that. *(Correction: it does not — the copy count is
