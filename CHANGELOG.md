@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- `ringline-redis` and `ringline-memcache`: a client built with
+  `with_metrics()` and no `on_result` callback records the latency of
+  `fire_*`/`recv` operations. Without the `timestamps` feature it read the
+  clock only when a callback was set, so those operations recorded
+  `latency_ns = 0` in `ClientMetrics`, `CompletedOp` and redis `RespMeta`.
+  Such a client now reads the clock when an operation is sent (once per
+  batch when batching) and again when its response is parsed, as the
+  sequential API already did.
+
 ## [0.6.11] - 2026-10-14
 
 `ringline` 0.6.11 and `ringline-quic` 0.6.1 carry both floors below.
