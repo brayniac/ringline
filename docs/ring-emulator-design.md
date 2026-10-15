@@ -295,7 +295,7 @@ conformance tests confirm against the real ring first.
 | OpTag(s) | Opcode | Emulation | |
 |---|---|---|---|
 | RecvMulti, RecvMultiLarge | RECV multishot, buffer select | Try at arm, then on each readable edge: take buffer space from the arm's group, `read` into it, and repeat until `EAGAIN` or a per-pass cap *(verify the kernel's cap)*, so one fast sender cannot empty a shared group. On a plain group a read takes the head buffer whole and posts `(res, F_BUFFER\|bid<<16\|F_MORE)`. On an incremental group it reads into the head buffer at its current offset, posts `F_BUF_MORE` while the buffer has space left, and moves to the next buffer when it is used up. Each CQE is held until the next read of the same pass returns: if that read returned data, the held CQE gets `IORING_CQE_F_SOCK_NONEMPTY`; if it returned `EAGAIN`, it does not. When the pass stops at the cap, or because the group has no space left, one `ioctl(FIONREAD)` decides the flag. The flag also counts bytes that arrived after the held CQE's read, which the kernel's does not. A pass posts its held CQE before another connection's pass takes space from the same incremental group. A read that returns `0`, `EAGAIN` or an error puts the space back. A `0` or error CQE carries no `F_BUFFER`, and an `EAGAIN` read posts no CQE. A pass that stops at its cap goes on a list the engine keeps, since no new readiness edge arrives for data already queued. A listed pass leaves the list when it is resumed, and when its arm ends (`-ENOBUFS`, EOF, an error, a cancel by user_data or by fixed slot, a Close, or a group move). `wait` resumes each listed pass at most once, before it polls readiness; `submit` does not resume them. After the resumes, `wait(None)` polls readiness with a zero timeout if the list is non-empty or a completion is ready, and blocks otherwise. Resuming listed passes first lets capped connections take buffer space before newly readable ones; each pass is capped, so this bounds the wait of the others *(verify against the kernel's task_work order)*. No buffer: post `-ENOBUFS` without `F_MORE` (the arm ends; the driver re-arms on replenish, Domain Invariant 6). EOF: post `0` without `F_MORE`. Other errors: `-errno` without `F_MORE`. | C |
-| RecvMsgMultiTs, RecvMsgUdp | RECVMSG multishot | As RecvMulti, and write the `io_uring_recvmsg_out` header, name and control data into the buffer in the kernel's layout so `RecvMsgOut::parse` (or its replacement) reads it. On Linux the control data is what `recvmsg` returns (`SCM_TIMESTAMPING`, `UDP_GRO`). Off Linux: timestamps come from `SO_TIMESTAMP` and are written as a software `SCM_TIMESTAMPING` entry (there are no hardware timestamps); there is no GRO, so each completion carries one datagram and no segment-size control message, which the driver already reads as a single datagram. | C, P |
+| RecvMsgUdp | RECVMSG multishot | As RecvMulti, and write the `io_uring_recvmsg_out` header, name and control data into the buffer in the kernel's layout so `RecvMsgOut::parse` (or its replacement) reads it. On Linux the control data is what `recvmsg` returns (`UDP_GRO`). Off Linux there is no GRO, so each completion carries one datagram and no segment-size control message, which the driver already reads as a single datagram. | C, P |
 | RecvUdp | RECV multishot | As RecvMulti on a UDP socket. | B |
 | RecvFallback | RECV one-shot into a pool slot | Try at submit, then on readable; one CQE. | A |
 | Send, TlsSend, SendRecvBuf, *Drain | SEND, `MSG_WAITALL` | `write` until all bytes are sent, waiting for writable in between. Post the total, or, on an error, the bytes written before it if any *(verify)*, otherwise `-errno`. | B |
@@ -463,11 +463,11 @@ Each step is a separate PR. Steps 1–6 keep both backends working.
    process; NVMe on Linux.
 5. **macOS.** Build the io_uring driver on the emulator on macOS and run
    the full suite in CI.
-6. **Parity on macOS.** The **P** rows: timestamps, UDP without
-   GRO/GSO, accept without `accept4`, process exit through kqueue,
-   file-backed NVMe, `fstatat` and `F_NOCACHE`. Every public API is
-   available on every platform, and the `#[cfg(has_io_uring)]` gates on
-   public items are removed.
+6. **Parity on macOS.** The **P** rows: UDP without GRO/GSO, accept
+   without `accept4`, process exit through kqueue, file-backed NVMe,
+   `fstatat` and `F_NOCACHE`. Every public API is available on every
+   platform, and the `#[cfg(has_io_uring)]` gates on public items are
+   removed.
 7. **Retire the mio backend** once the emulator passes everything the
    mio backend passes and #628 has landed, so pipelined plaintext and TLS
    sends cost the emulator no more syscalls than mio. `force-mio` becomes

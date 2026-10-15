@@ -302,6 +302,33 @@ async fn run_recv_meta(addr: SocketAddr) -> Result<(), String> {
         }
     }
 
+    // (g) A client with metrics and no `on_result` callback times fire/recv
+    // ops: `recv` reports a nonzero latency.
+    #[cfg(feature = "metrics")]
+    {
+        let conn = ringline::connect(addr)
+            .await
+            .map_err(|e| format!("connect: {e}"))?;
+        let mut client = Client::builder(conn).with_metrics().build();
+        client
+            .fire_get(b"meta:small", 20)
+            .map_err(|e| format!("fire: {e}"))?;
+        let op = client
+            .recv()
+            .await
+            .map_err(|e| format!("metrics get: {e}"))?;
+        let ringline_redis::CompletedOp::Get { latency_ns, .. } = op else {
+            return Err("metrics get: not a Get".into());
+        };
+        if latency_ns == 0 {
+            return Err("metrics-only client recorded latency 0".into());
+        }
+        let metrics = client.metrics().ok_or("metrics not enabled")?;
+        if metrics.requests != 1 {
+            return Err(format!("metrics requests = {}", metrics.requests));
+        }
+    }
+
     Ok(())
 }
 

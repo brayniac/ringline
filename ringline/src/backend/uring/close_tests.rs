@@ -45,7 +45,7 @@ impl AsyncEventHandler for EndsOnBye {
 
 /// Whether a connection closed by its task, with `lead` ahead of the
 /// `Close`, reaches the peer as EOF within 3 s.
-fn fin_arrives(lead: CloseLead, timestamps: bool) -> bool {
+fn fin_arrives(lead: CloseLead) -> bool {
     let mut config = ConfigBuilder::new()
         .workers(1)
         .pin_to_core(false)
@@ -58,12 +58,6 @@ fn fin_arrives(lead: CloseLead, timestamps: bool) -> bool {
         .spawner_threads(0)
         .build()
         .expect("valid config");
-    #[cfg(feature = "timestamps")]
-    {
-        config.timestamps = timestamps;
-    }
-    #[cfg(not(feature = "timestamps"))]
-    assert!(!timestamps, "timestamps need the `timestamps` feature");
     config.close_lead_override = Some(lead);
     // Up to 5 s for earlier rings' memlock charge to be released (#589).
     let mut attempts = 0;
@@ -92,35 +86,13 @@ fn fin_arrives(lead: CloseLead, timestamps: bool) -> bool {
 
 #[test]
 fn a_close_led_by_a_shutdown_sends_its_fin() {
-    assert!(fin_arrives(CloseLead::Shutdown, false));
+    assert!(fin_arrives(CloseLead::Shutdown));
 }
 
 /// Passes without the lead: the close's own `RecvMulti` cancel ends the
-/// plain recv. The timestamped and stuck-send tests guard the cancel.
+/// recv. `a_forced_close_led_by_a_cancel_releases_a_stuck_send` and its
+/// control in `event_loop.rs` guard the cancel.
 #[test]
 fn a_close_led_by_a_cancel_sends_its_fin() {
-    assert!(fin_arrives(CloseLead::CancelAll, false));
-}
-
-/// A timestamped connection's recv is a `RecvMsgMulti`, which the close's
-/// own recv cancel does not reach. The lead must end it.
-#[cfg(feature = "timestamps")]
-#[test]
-fn a_timestamped_close_led_by_a_cancel_sends_its_fin() {
-    assert!(fin_arrives(CloseLead::CancelAll, true));
-}
-
-#[cfg(feature = "timestamps")]
-#[test]
-fn a_timestamped_close_led_by_a_shutdown_sends_its_fin() {
-    assert!(fin_arrives(CloseLead::Shutdown, true));
-}
-
-/// The control: with nothing ahead of the `Close`, the timestamped recv
-/// holds the socket open and no FIN arrives. Without this, the two tests
-/// above could pass for a reason other than the lead.
-#[cfg(feature = "timestamps")]
-#[test]
-fn a_timestamped_close_led_by_nothing_sends_no_fin() {
-    assert!(!fin_arrives(CloseLead::Nothing, true));
+    assert!(fin_arrives(CloseLead::CancelAll));
 }

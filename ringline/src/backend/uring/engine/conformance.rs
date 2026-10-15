@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use super::{ActiveEngine, Engine, RingKind};
 use crate::backend::ProvidedBufRing;
-use crate::backend::uring::abi::{RecvMsgOut, cqueue};
+use crate::backend::uring::abi::cqueue;
 use crate::backend::uring::ring::is_memlock_enomem;
 use crate::backend::uring::sqe::{Fd, Op, Sqe};
 use crate::config::ConfigBuilder;
@@ -508,47 +508,4 @@ fn inc_eof_leaves_a_partly_used_buffer_posted() {
     assert_eq!(data(next[0]), (3, Some(0), true, true, false));
     assert_eq!(bytes(&ring, 0, 0, 6), b"abcxyz");
     e.unregister_buf_ring(7).expect("unregister");
-}
-
-/// Multishot `RECVMSG` (the `timestamps` feature) on an incremental ring:
-/// each completion's `io_uring_recvmsg_out` header and payload are written
-/// at the completion's offset in the buffer.
-#[test]
-fn inc_recvmsg_multishot_writes_each_message_at_its_offset() {
-    let ring = ProvidedBufRing::new(8, 1, 4096).expect("ring");
-    let mut e = engine();
-    if !incremental(&e) {
-        return;
-    }
-    e.register_buf_ring(&ring, RingKind::Incremental)
-        .expect("register");
-    let (mut client, server) = pair();
-    // Safety: a zeroed msghdr is valid; no name or control space.
-    let msghdr: libc::msghdr = unsafe { std::mem::zeroed() };
-    let sqe = Sqe::new(
-        Op::RecvMsgMulti {
-            fd: Fd::Raw(server.as_raw_fd()),
-            msg: &msghdr,
-            buf_group: 8,
-        },
-        9,
-    );
-    // Safety: the kernel copies `msghdr` when it prepares the request; a
-    // multishot RECVMSG does not read it again.
-    unsafe { e.push(&sqe) }.expect("push");
-    let mut offset = 0usize;
-    for m in [&b"hello"[..], b"world!"] {
-        client.write_all(m).expect("write");
-        let cqes = reap(&mut e, 1);
-        assert_eq!(cqes.len(), 1, "{cqes:?}");
-        let (_, res, flags) = cqes[0];
-        assert!(res > 0, "res {res}");
-        assert_eq!(cqueue::buffer_select(flags), Some(0));
-        assert!(cqueue::buf_more(flags));
-        let buf = bytes(&ring, 0, offset, res as usize);
-        let out = RecvMsgOut::parse(&buf, &msghdr).expect("recvmsg header");
-        assert_eq!(out.payload_data(), m);
-        offset += res as usize;
-    }
-    e.unregister_buf_ring(8).expect("unregister");
 }

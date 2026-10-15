@@ -223,34 +223,6 @@ impl Ring {
     pub(crate) fn iowq_max_workers(&self) -> io::Result<[u32; 2]> {
         self.engine.iowq_max_workers()
     }
-    /// Submit a multishot recvmsg with provided buffer ring for a connection.
-    /// Used when SO_TIMESTAMPING is enabled to receive cmsg ancillary data
-    /// (kernel timestamps) alongside TCP payload.
-    ///
-    /// `generation` is the connection's generation at arm time and is carried
-    /// whole in the payload — see `Ring::submit_multishot_recv` for why.
-    /// Any cancel targeting this request must encode the same payload.
-    #[cfg(feature = "timestamps")]
-    pub fn submit_multishot_recvmsg(
-        &mut self,
-        conn_index: u32,
-        generation: u32,
-        msghdr: *const libc::msghdr,
-    ) -> io::Result<()> {
-        let user_data = UserData::encode(OpTag::RecvMsgMultiTs, conn_index, generation);
-        let entry = Sqe::new(
-            Op::RecvMsgMulti {
-                fd: sqe::Fd::Fixed(conn_index),
-                msg: msghdr,
-                buf_group: self.bgid,
-            },
-            user_data.raw(),
-        );
-        unsafe {
-            self.push_sqe(&entry)?;
-        }
-        Ok(())
-    }
 
     /// Submit a one-shot fallback recv into fallback-pool memory for a
     /// connection whose multishot recv is parked on ENOBUFS. The pool slot

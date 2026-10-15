@@ -88,9 +88,9 @@ struct RecvMsgHeader {
     flags: u32,
 }
 
-/// One datagram (or stream chunk) in a multishot `recvmsg` buffer. The
-/// buffer holds the header, then `msg_namelen` bytes for the name, then
-/// `msg_controllen` bytes for control data, then the payload.
+/// One datagram in a multishot `recvmsg` buffer. The buffer holds the
+/// header, then `msg_namelen` bytes for the name, then `msg_controllen`
+/// bytes for control data, then the payload.
 pub(crate) struct RecvMsgOut<'buf> {
     header: RecvMsgHeader,
     name_field_len: usize,

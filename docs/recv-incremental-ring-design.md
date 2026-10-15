@@ -205,7 +205,6 @@ rerun with #627.
 | No buffer left | `-ENOBUFS` without `F_MORE`, ending the arm. |
 | CQ overflow | A multishot completion that finds the CQ full goes to the overflow list and ends its arm (no `F_MORE`), whether or not data is still queued; the driver re-arms it. The byte order holds across the overflow and the re-arm. From 6.13, on a `DEFER_TASKRUN` ring, the kernel runs at most 20 deferred task_work items per pass (`IO_LOCAL_TW_DEFAULT_MAX`), and an `io_uring_enter` makes at most two passes, so a burst of single-completion receives no longer fills the CQ; receives that each post several completions still do. |
 | EOF on a partly used INC buffer | A completion with `res` 0, no `F_BUFFER` and no `F_MORE`. The buffer stays posted, and another connection's next data lands at the following offset. |
-| Multishot `RECVMSG` on an INC ring | Each message, header included, lands at the buffer's next offset, as `RECV` data does. |
 | `RLIMIT_MEMLOCK` (6.14+) | Charged for each ring's entry array, not the buffers: 16 bytes per entry, at least a page per ring. |
 
 The offset order was checked byte for byte on Linux 6.12 and 7.1 with a
@@ -246,9 +245,8 @@ The rules:
    `len = buffer_size`), and `written` resets to zero.
 4. Every completion takes one hold, and every path releases it once by
    pushing the bid to `pending_replenish`: a copy path (the accumulator
-   copy, TLS, recv sinks, `ForceCopy`, timestamps, the stale-CQE early
-   returns) in the completion handler, a lend path when it is done with
-   the bytes. `flush_replenish_and_rearm` releases the pushed bids
+   copy, TLS, recv sinks, `ForceCopy`, the stale-CQE early returns) in the
+   completion handler, a lend path when it is done with the bytes. `flush_replenish_and_rearm` releases the pushed bids
    (`Driver::release_pending`, which frees owned copies and passes ring
    bids to `ProvidedBufRing::release_batch`).
 5. On a plain ring every completion exhausts its buffer, at offset 0. One
@@ -293,11 +291,8 @@ buffers; each now also names the group:
 - `OpTag::SendRecvBuf`'s payload carries the bid in its low 16 bits and
   `SEND_RECV_BUF_REMAINDER` at bit 16 (`completion.rs`); bit 17 carries the
   group. The payload is built in `driver.rs`, `io.rs` and `event_loop.rs`.
-- `RecvMsgMultiTs` (the `timestamps` feature) has no large-group tag.
-  Timestamped connections are not promoted.
-- The completion handlers (`event_loop.rs` `handle_recv_multi`,
-  `handle_recv_msg_multi_ts`) read the data at the offset `complete`
-  returns (steps 2 and 3).
+- The completion handler (`event_loop.rs` `handle_recv_multi`) reads the
+  data at the offset `complete` returns (steps 2 and 3).
 - `HeldRecvBuf::Pinned` (`driver.rs`), `SegBacking::Pinned` and
   `SegSettle::Pinned` (`runtime/io.rs`) carry `off`, and their readers use
   `data_ptr(bid, off)`: `driver.rs` forward-write iovecs, the Mode A split,
@@ -710,17 +705,6 @@ receive queue, and TCP closes the window until the worker re-arms.
   `recv_large_demote_quiet(Duration)` the demotion quiet period, default
   1 s. `build()` rejects a large-group bgid equal to the TCP bgid
   (default 0), or the UDP bgid (default 1) when UDP is in use.
-- With INC on and the `timestamps` feature built in, timestamped
-  connections get their own plain ring from step 5. Until then a worker
-  with `timestamps(true)` uses a plain ring for every connection.
-  Timestamped connections' multishot `RECVMSG` works on an INC ring
-  (conformance tests), but before the 6.12.y change that lets a ring
-  require a minimum length left in a buffer it can fail when the space
-  left is smaller than the message header; that failure is not reproduced
-  here. The ring's geometry is the plain small group's, its bgid
-  (`recv_timestamp_buffer_bgid`, default 3) is validated against the TCP,
-  UDP and large-group bgids, and its entries count in the memlock
-  preflight.
 
 ## Unchanged
 
@@ -766,10 +750,10 @@ buffers held by `with_bytes` views, values copied by the
 ## Landing
 
 0. Probe and conformance tests: each row of the behaviour table, the
-   byte-verified offset order (a CQ overflow, SQPOLL), EOF on a partly
-   used buffer, and multishot `RECVMSG` on an INC ring; run on CI and as
-   SystemsLab experiments on 6.1, 6.8, 6.12 and 7.1. Ring selection uses
-   a behaviour preflight instead of a 6.12.y minimum.
+   byte-verified offset order (a CQ overflow, SQPOLL), and EOF on a partly
+   used buffer; run on CI and as SystemsLab experiments on 6.1, 6.8, 6.12
+   and 7.1. Ring selection uses a behaviour preflight instead of a 6.12.y
+   minimum.
 1. Bounded accumulator: the target length from `NeedAtLeast` and the
    sites that clear it (reset, close, `ConnStream` reads, the segmented
    entry's `take_frozen`, `settle_forward_end`), the hold of a
@@ -797,24 +781,21 @@ buffers held by `with_bytes` views, values copied by the
    so these paths are exercised only from step 4.
 4. INC and the plain geometry, behind `recv_incremental` (default
    `false`), in two changes. 4a: ring-kind selection with the behaviour
-   preflight (about 0.1 ms per worker on Linux 6.12, arm64), a plain ring
-   for a worker with `timestamps(true)`, `MADV_NOHUGEPAGE`, the geometry
-   per ring kind, the memlock preflight and the ring-kind metrics. 4b-1:
-   the lend cap with the copy paths that exist (`pending_recv_bufs` into
-   the accumulator, segments and Mode A into `HeldRecvBuf::Owned`),
-   `recv_segment_reserve` ignored, the 1 MiB fallback chunk with the
-   free-space re-arm, and the lends-refused count; all only with
-   `recv_incremental`. 4b-2: the owned `recv_hold` entry for recv-forward
-   and direct echo.
+   preflight (about 0.1 ms per worker on Linux 6.12, arm64),
+   `MADV_NOHUGEPAGE`, the geometry per ring kind, the memlock preflight
+   and the ring-kind metrics. 4b-1: the lend cap with the copy paths that
+   exist (`pending_recv_bufs` into the accumulator, segments and Mode A
+   into `HeldRecvBuf::Owned`), `recv_segment_reserve` ignored, the 1 MiB
+   fallback chunk with the free-space re-arm, and the lends-refused count;
+   all only with `recv_incremental`. 4b-2: the owned `recv_hold` entry for
+   recv-forward and direct echo.
 5. The large group, behind `recv_large_group` (default `false`): its bgid
    and validation, the arm taking the group per call,
    `OpTag::RecvMultiLarge` and the `SendRecvBuf` group bit, `group` in
    `PendingRecvBuf` and the send slab, the cancel sites, promotion,
    migration and demotion with `recv_large_demote_quiet`, the two-group
-   memlock preflight, the timestamps ring with
-   `recv_timestamp_buffer_bgid`, and the per-group gauges and `ENOBUFS`
-   count. Migration is timed in ringline's
-   metrics.
+   memlock preflight, and the per-group gauges and `ENOBUFS` count.
+   Migration is timed in ringline's metrics.
 6. Measure ringline on hv01 and across hv01/hv02, on Linux 6.1, 6.8, 6.12
    and 7.1: the geometry per ring kind with and without the large group
    against the 256 × 16 KiB ring, with the bench suite (echo at 256 B to

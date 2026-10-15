@@ -277,8 +277,6 @@ pub struct CommandResult {
     pub hit: Option<bool>,
     /// Whether the command succeeded (no Redis error).
     pub success: bool,
-    /// Time-to-first-byte in nanoseconds (not available in sequential mode).
-    pub ttfb_ns: Option<u64>,
     /// Bytes transmitted for this command (RESP-encoded request size).
     pub tx_bytes: u32,
     /// Bytes received for this command (RESP-encoded response size).
@@ -362,7 +360,6 @@ enum PendingOpKind {
 
 struct PendingOp {
     kind: PendingOpKind,
-    send_ts: u64,
     start: Option<Instant>,
     user_data: u64,
     tx_bytes: u32,
@@ -451,8 +448,6 @@ pub struct ClientBuilder {
     max_batch_size: usize,
     max_in_flight: usize,
     zc_threshold: u32,
-    #[cfg(feature = "timestamps")]
-    use_kernel_ts: bool,
     #[cfg(feature = "metrics")]
     with_metrics: bool,
 }
@@ -465,8 +460,6 @@ impl ClientBuilder {
             max_batch_size: 1,
             max_in_flight: usize::MAX,
             zc_threshold: DEFAULT_ZC_THRESHOLD,
-            #[cfg(feature = "timestamps")]
-            use_kernel_ts: false,
             #[cfg(feature = "metrics")]
             with_metrics: false,
         }
@@ -503,13 +496,6 @@ impl ClientBuilder {
     /// Register a callback invoked after each command completes.
     pub fn on_result<F: Fn(&CommandResult) + 'static>(mut self, f: F) -> Self {
         self.on_result = Some(Box::new(f));
-        self
-    }
-
-    /// Enable kernel SO_TIMESTAMPING for latency measurement (requires `timestamps` feature).
-    #[cfg(feature = "timestamps")]
-    pub fn kernel_timestamps(mut self, enabled: bool) -> Self {
-        self.use_kernel_ts = enabled;
         self
     }
 
@@ -567,8 +553,6 @@ impl ClientBuilder {
             max_batch_size,
             max_in_flight,
             zc_threshold,
-            #[cfg(feature = "timestamps")]
-            use_kernel_ts,
             #[cfg(feature = "metrics")]
             with_metrics,
         } = self;
@@ -587,8 +571,6 @@ impl ClientBuilder {
             zc_threshold,
             buffered_ops: 0,
             encode_buf: Vec::new(),
-            #[cfg(feature = "timestamps")]
-            use_kernel_ts,
             #[cfg(feature = "metrics")]
             metrics: if with_metrics {
                 Some(ClientMetrics::new())
@@ -604,8 +586,8 @@ impl ClientBuilder {
 /// A ringline-native RESP client wrapping a single connection.
 ///
 /// `Client::new(conn)` creates a zero-overhead client with no callbacks or
-/// metrics. Use `Client::builder(conn)` to configure per-request callbacks,
-/// kernel timestamps, and built-in histogram tracking.
+/// metrics. Use `Client::builder(conn)` to configure per-request callbacks
+/// and built-in histogram tracking.
 pub struct Client {
     tx: SendHalf,
     rx: RecvHalf,
@@ -620,7 +602,7 @@ pub struct Client {
     /// `offset` is the byte position in `write_buf` where the guard value
     /// should be inserted in the byte stream.
     write_guards: Vec<(usize, GuardBox)>,
-    /// Number of pending ops whose send_ts has been finalized (at flush time).
+    /// Number of pending ops whose start time has been finalized (at flush time).
     flushed_count: usize,
     /// Maximum `fire_*` commands to coalesce before flushing. 1 = send each
     /// command immediately (default, matching pre-coalescing behavior).
@@ -639,8 +621,6 @@ pub struct Client {
     /// its capacity across requests so steady-state encoding is
     /// allocation-free.
     encode_buf: Vec<u8>,
-    #[cfg(feature = "timestamps")]
-    use_kernel_ts: bool,
     #[cfg(feature = "metrics")]
     metrics: Option<ClientMetrics>,
 }
@@ -726,7 +706,7 @@ pub(crate) async fn read_value_from(
 impl Client {
     /// Create a new client wrapping an established connection.
     ///
-    /// No callbacks, no metrics, no kernel timestamps — zero overhead.
+    /// No callbacks, no metrics — zero overhead.
     /// `max_batch_size` defaults to 1 (each `fire_*` sends immediately).
     ///
     /// Cannot fail: a [`Connection`] already owns both halves (#528).
@@ -748,8 +728,6 @@ impl Client {
             zc_threshold: DEFAULT_ZC_THRESHOLD,
             buffered_ops: 0,
             encode_buf: Vec::new(),
-            #[cfg(feature = "timestamps")]
-            use_kernel_ts: false,
             #[cfg(feature = "metrics")]
             metrics: None,
         }
@@ -801,40 +779,6 @@ impl Client {
         false
     }
 
-    #[cfg(feature = "timestamps")]
-    #[inline]
-    fn send_timestamp(&self) -> u64 {
-        if self.use_kernel_ts {
-            now_realtime_ns()
-        } else {
-            0
-        }
-    }
-
-    #[cfg(not(feature = "timestamps"))]
-    #[inline]
-    fn send_timestamp(&self) -> u64 {
-        0
-    }
-
-    #[cfg(feature = "timestamps")]
-    #[inline]
-    fn finish_timing(&self, send_ts: u64, start: Instant) -> u64 {
-        if self.use_kernel_ts {
-            let recv_ts = self.rx.recv_timestamp();
-            if recv_ts > 0 && recv_ts > send_ts {
-                return recv_ts - send_ts;
-            }
-        }
-        start.elapsed().as_nanos() as u64
-    }
-
-    #[cfg(not(feature = "timestamps"))]
-    #[inline]
-    fn finish_timing(&self, _send_ts: u64, start: Instant) -> u64 {
-        start.elapsed().as_nanos() as u64
-    }
-
     /// Record a command result: invoke callback and update metrics.
     #[inline]
     fn record(&mut self, result: &CommandResult) {
@@ -850,58 +794,26 @@ impl Client {
     // ── Fire/recv pipelining API ─────────────────────────────────────────
 
     #[inline]
-    fn timing_start(&self) -> (u64, Option<Instant>) {
-        #[cfg(feature = "timestamps")]
-        {
-            if self.is_instrumented() {
-                (self.send_timestamp(), Some(Instant::now()))
-            } else {
-                (0, None)
-            }
-        }
-        #[cfg(not(feature = "timestamps"))]
-        {
-            // When timestamps feature is disabled, only use Instant::now() if callbacks are registered
-            if self.on_result.is_some() {
-                (0, Some(Instant::now()))
-            } else {
-                (0, None)
-            }
+    fn timing_start(&self) -> Option<Instant> {
+        // Only read the clock if callbacks or metrics are configured.
+        if self.is_instrumented() {
+            Some(Instant::now())
+        } else {
+            None
         }
     }
 
-    /// `timing_start()` for `fire_*` call sites, evaluated *after* the op
-    /// has been buffered/sent. When this op is buffered behind another op
-    /// (`buffered_ops > 1`), `flush()` will unconditionally re-stamp
-    /// `send_ts`/`start` for every op in the batch, so the fire-time clock
-    /// read would be discarded — skip it. `buffered_ops` is monotonic
-    /// between flushes, so if it is > 1 now, the rewriting branch in
-    /// `flush()` (`buffered_ops > 1`) is guaranteed to run for this op.
+    /// `timing_start()` for `fire_*` call sites, evaluated after the op has
+    /// been buffered or sent. A buffered op (`buffered_ops >= 1`) gets its
+    /// start time from `flush()`, which stamps every op it sends, so a clock
+    /// read here would be discarded.
     #[inline]
-    fn timing_start_buffered(&self) -> (u64, Option<Instant>) {
+    fn timing_start_buffered(&self) -> Option<Instant> {
         if self.buffered_ops >= 1 {
-            (0, None)
+            None
         } else {
             self.timing_start()
         }
-    }
-
-    #[cfg(feature = "timestamps")]
-    #[inline]
-    fn compute_ttfb(&self, send_ts: u64) -> Option<u64> {
-        if self.use_kernel_ts {
-            let recv_ts = self.rx.recv_timestamp();
-            if recv_ts > 0 && recv_ts > send_ts {
-                return Some(recv_ts - send_ts);
-            }
-        }
-        None
-    }
-
-    #[cfg(not(feature = "timestamps"))]
-    #[inline]
-    fn compute_ttfb(&self, _send_ts: u64) -> Option<u64> {
-        None
     }
 
     /// Number of in-flight requests.
@@ -995,13 +907,11 @@ impl Client {
             return Err(e);
         }
 
-        // Only rewrite send timestamps when batching multiple ops —
-        // for a single buffered op the timestamp captured at fire time
-        // is already accurate.
+        // Stamp every op this flush sent. A buffered op got no start time
+        // at fire time (see `timing_start_buffered`).
         if self.buffered_ops >= 1 {
-            let (send_ts, start) = self.timing_start();
+            let start = self.timing_start();
             for pending in self.pending.iter_mut().skip(self.flushed_count) {
-                pending.send_ts = send_ts;
                 pending.start = start;
             }
         }
@@ -1031,10 +941,9 @@ impl Client {
             tx_bytes = (self.write_buf.len() - before) as u32;
             self.buffered_ops += 1;
         }
-        let (send_ts, start) = self.timing_start_buffered();
+        let start = self.timing_start_buffered();
         self.pending.push_back(PendingOp {
             kind: PendingOpKind::Get,
-            send_ts,
             start,
             user_data,
             tx_bytes,
@@ -1068,10 +977,9 @@ impl Client {
             tx_bytes = (self.write_buf.len() - before) as u32;
             self.buffered_ops += 1;
         }
-        let (send_ts, start) = self.timing_start_buffered();
+        let start = self.timing_start_buffered();
         self.pending.push_back(PendingOp {
             kind: PendingOpKind::Set,
-            send_ts,
             start,
             user_data,
             tx_bytes,
@@ -1121,10 +1029,9 @@ impl Client {
         self.write_buf.extend_from_slice(b"\r\n");
         let tx_bytes = (self.write_buf.len() - before + value_len as usize) as u32;
         self.buffered_ops += 1;
-        let (send_ts, start) = self.timing_start_buffered();
+        let start = self.timing_start_buffered();
         self.pending.push_back(PendingOp {
             kind: PendingOpKind::Set,
-            send_ts,
             start,
             user_data,
             tx_bytes,
@@ -1156,10 +1063,9 @@ impl Client {
             tx_bytes = (self.write_buf.len() - before) as u32;
             self.buffered_ops += 1;
         }
-        let (send_ts, start) = self.timing_start_buffered();
+        let start = self.timing_start_buffered();
         self.pending.push_back(PendingOp {
             kind: PendingOpKind::Set,
-            send_ts,
             start,
             user_data,
             tx_bytes,
@@ -1210,10 +1116,9 @@ impl Client {
         append_set_guard_suffix_ex(&mut self.write_buf, ttl_secs);
         let tx_bytes = (self.write_buf.len() - before + value_len as usize) as u32;
         self.buffered_ops += 1;
-        let (send_ts, start) = self.timing_start_buffered();
+        let start = self.timing_start_buffered();
         self.pending.push_back(PendingOp {
             kind: PendingOpKind::Set,
-            send_ts,
             start,
             user_data,
             tx_bytes,
@@ -1239,10 +1144,9 @@ impl Client {
             tx_bytes = (self.write_buf.len() - before) as u32;
             self.buffered_ops += 1;
         }
-        let (send_ts, start) = self.timing_start_buffered();
+        let start = self.timing_start_buffered();
         self.pending.push_back(PendingOp {
             kind: PendingOpKind::Del,
-            send_ts,
             start,
             user_data,
             tx_bytes,
@@ -1276,19 +1180,15 @@ impl Client {
                 // subsequent recv() calls return NoPending instead of
                 // reading stale/misaligned responses. Reset
                 // `flushed_count` too — otherwise a stale count > 0 makes
-                // the next batched `flush()` skip the send_ts rewrite for
+                // the next batched `flush()` skip the start-time rewrite for
                 // newly-buffered ops.
                 self.pending.clear();
                 self.flushed_count = 0;
                 return Err(e);
             }
         };
-        // TTFB from the kernel timestamp of the data that completed THIS
-        // read. Sampling before the read used the PREVIOUS response's
-        // arrival time for every op after the first in a pipelined batch.
-        let ttfb_ns = self.compute_ttfb(pending.send_ts);
         let latency_ns = match pending.start {
-            Some(start) => self.finish_timing(pending.send_ts, start),
+            Some(start) => elapsed_ns(start),
             None => 0,
         };
         let rx_bytes = self.last_rx_bytes.get();
@@ -1314,7 +1214,6 @@ impl Client {
                     latency_ns,
                     hit,
                     success,
-                    ttfb_ns,
                     tx_bytes,
                     rx_bytes,
                 });
@@ -1337,7 +1236,6 @@ impl Client {
                     latency_ns,
                     hit: None,
                     success: result.is_ok(),
-                    ttfb_ns,
                     tx_bytes,
                     rx_bytes,
                 });
@@ -1360,7 +1258,6 @@ impl Client {
                     latency_ns,
                     hit: None,
                     success: result.is_ok(),
-                    ttfb_ns,
                     tx_bytes,
                     rx_bytes,
                 });
@@ -1536,9 +1433,8 @@ impl Client {
         self.rx.end_segments()?;
 
         // Metrics, mirroring `recv()`.
-        let ttfb_ns = self.compute_ttfb(pending.send_ts);
         let latency_ns = match pending.start {
-            Some(start) => self.finish_timing(pending.send_ts, start),
+            Some(start) => elapsed_ns(start),
             None => 0,
         };
         let (success, hit) = match &outcome {
@@ -1551,7 +1447,6 @@ impl Client {
             latency_ns,
             hit,
             success,
-            ttfb_ns,
             tx_bytes: pending.tx_bytes,
             rx_bytes: total_consumed as u32,
         });
@@ -1681,9 +1576,8 @@ impl Client {
         }
 
         // Metrics, mirroring `recv()` and the io_uring GET path.
-        let ttfb_ns = self.compute_ttfb(pending.send_ts);
         let latency_ns = match pending.start {
-            Some(start) => self.finish_timing(pending.send_ts, start),
+            Some(start) => elapsed_ns(start),
             None => 0,
         };
         let (success, hit) = match &outcome {
@@ -1696,7 +1590,6 @@ impl Client {
             latency_ns,
             hit,
             success,
-            ttfb_ns,
             tx_bytes: pending.tx_bytes,
             rx_bytes: total_consumed as u32,
         });
@@ -1789,9 +1682,8 @@ impl Client {
                 return Err(e);
             }
         };
-        let ttfb_ns = self.compute_ttfb(pending.send_ts);
         let latency_ns = match pending.start {
-            Some(start) => self.finish_timing(pending.send_ts, start),
+            Some(start) => elapsed_ns(start),
             None => 0,
         };
         let rx_bytes = self.last_rx_bytes.get();
@@ -1818,7 +1710,6 @@ impl Client {
             latency_ns,
             hit: None,
             success,
-            ttfb_ns,
             tx_bytes: pending.tx_bytes,
             rx_bytes,
         });
@@ -1992,10 +1883,9 @@ impl Client {
             return self.execute_bulk_encoded().await;
         }
         let tx_bytes = self.encode_buf.len() as u32;
-        let send_ts = self.send_timestamp();
         let start = Instant::now();
         let result = self.execute_bulk_encoded().await;
-        let latency_ns = self.finish_timing(send_ts, start);
+        let latency_ns = elapsed_ns(start);
         let rx_bytes = self.last_rx_bytes.get();
         let (success, hit) = match &result {
             Ok(Some(_)) => (true, Some(true)),
@@ -2007,7 +1897,6 @@ impl Client {
             latency_ns,
             hit,
             success,
-            ttfb_ns: None,
             tx_bytes,
             rx_bytes,
         });
@@ -2031,10 +1920,9 @@ impl Client {
             };
         }
         let tx_bytes = set_req.encoded_len() as u32;
-        let send_ts = self.send_timestamp();
         let start = Instant::now();
         let result = self.execute_set(&set_req, value).await;
-        let latency_ns = self.finish_timing(send_ts, start);
+        let latency_ns = elapsed_ns(start);
         let rx_bytes = self.last_rx_bytes.get();
         let success = result.is_ok();
         let final_result = match result {
@@ -2047,7 +1935,6 @@ impl Client {
             latency_ns,
             hit: None,
             success,
-            ttfb_ns: None,
             tx_bytes,
             rx_bytes,
         });
@@ -2072,10 +1959,9 @@ impl Client {
             };
         }
         let tx_bytes = set_req.encoded_len() as u32;
-        let send_ts = self.send_timestamp();
         let start = Instant::now();
         let result = self.execute_set(&set_req, value).await;
-        let latency_ns = self.finish_timing(send_ts, start);
+        let latency_ns = elapsed_ns(start);
         let rx_bytes = self.last_rx_bytes.get();
         let success = result.is_ok();
         let final_result = match result {
@@ -2088,7 +1974,6 @@ impl Client {
             latency_ns,
             hit: None,
             success,
-            ttfb_ns: None,
             tx_bytes,
             rx_bytes,
         });
@@ -2140,17 +2025,15 @@ impl Client {
             return self.execute_int_encoded().await.map(|n| n as u64);
         }
         let tx_bytes = self.encode_buf.len() as u32;
-        let send_ts = self.send_timestamp();
         let start = Instant::now();
         let result = self.execute_int_encoded().await.map(|n| n as u64);
-        let latency_ns = self.finish_timing(send_ts, start);
+        let latency_ns = elapsed_ns(start);
         let rx_bytes = self.last_rx_bytes.get();
         self.record(&CommandResult {
             command: CommandType::Del,
             latency_ns,
             hit: None,
             success: result.is_ok(),
-            ttfb_ns: None,
             tx_bytes,
             rx_bytes,
         });
@@ -2790,10 +2673,9 @@ impl Client {
             };
         }
         let tx_bytes = self.encode_buf.len() as u32;
-        let send_ts = self.send_timestamp();
         let start = Instant::now();
         let result = self.execute_encoded().await;
-        let latency_ns = self.finish_timing(send_ts, start);
+        let latency_ns = elapsed_ns(start);
         let rx_bytes = self.last_rx_bytes.get();
         let success = result.is_ok();
         let final_result = match result {
@@ -2806,7 +2688,6 @@ impl Client {
             latency_ns,
             hit: None,
             success,
-            ttfb_ns: None,
             tx_bytes,
             rx_bytes,
         });
@@ -2923,7 +2804,6 @@ impl Client {
         self.encode_buf.clear();
         append_set_guard_prefix(&mut self.encode_buf, key, value_len as usize);
         let tx_bytes = (self.encode_buf.len() + value_len as usize + 2) as u32;
-        let send_ts = self.send_timestamp();
         let start = Instant::now();
         let prefix: &[u8] = &self.encode_buf;
         self.tx.send_parts().build(move |b| {
@@ -2933,7 +2813,7 @@ impl Client {
                 .submit()
         })?;
         let resp = self.read_value().await?;
-        let latency_ns = self.finish_timing(send_ts, start);
+        let latency_ns = elapsed_ns(start);
         let rx_bytes = self.last_rx_bytes.get();
         let result = if let Value::Error(ref msg) = resp {
             Err(Error::Redis(String::from_utf8_lossy(msg).into_owned()))
@@ -2948,7 +2828,6 @@ impl Client {
             latency_ns,
             hit: None,
             success: result.is_ok(),
-            ttfb_ns: None,
             tx_bytes,
             rx_bytes,
         });
@@ -2990,7 +2869,6 @@ impl Client {
         let split = self.encode_buf.len();
         append_set_guard_suffix_ex(&mut self.encode_buf, ttl_secs);
         let tx_bytes = (self.encode_buf.len() + value_len as usize) as u32;
-        let send_ts = self.send_timestamp();
         let start = Instant::now();
         let (prefix, suffix) = self.encode_buf.split_at(split);
         self.tx.send_parts().build(move |b| {
@@ -3000,7 +2878,7 @@ impl Client {
                 .submit()
         })?;
         let resp = self.read_value().await?;
-        let latency_ns = self.finish_timing(send_ts, start);
+        let latency_ns = elapsed_ns(start);
         let rx_bytes = self.last_rx_bytes.get();
         let result = if let Value::Error(ref msg) = resp {
             Err(Error::Redis(String::from_utf8_lossy(msg).into_owned()))
@@ -3015,7 +2893,6 @@ impl Client {
             latency_ns,
             hit: None,
             success: result.is_ok(),
-            ttfb_ns: None,
             tx_bytes,
             rx_bytes,
         });
@@ -3514,19 +3391,12 @@ impl Drop for ValueStream<'_> {
     }
 }
 
-// ── Timestamp helper ────────────────────────────────────────────────────
+// ── Timing helper ──────────────────────────────────────────────────────────
 
-/// Get the current time as nanoseconds since epoch using CLOCK_REALTIME.
-#[cfg(feature = "timestamps")]
-fn now_realtime_ns() -> u64 {
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    unsafe {
-        libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts);
-    }
-    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+/// Nanoseconds elapsed since `start`.
+#[inline]
+fn elapsed_ns(start: Instant) -> u64 {
+    start.elapsed().as_nanos() as u64
 }
 
 // ── Zero-copy SET encoding helpers ──────────────────────────────────────

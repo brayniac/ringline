@@ -214,8 +214,7 @@ pub mod park_abandon {
     pub const NOT_OPEN: usize = 0;
     /// Bytes arrived and were not consumed.
     pub const DATA_PENDING: usize = 1;
-    /// The armed recv was not one `begin_park` could cancel.
-    pub const RECV_ARM_NOT_CANCELLABLE: usize = 2;
+    // Slot 2 has no blocker.
     /// An outbound connection, which park does not move.
     pub const OUTBOUND: usize = 3;
     /// The handler's offer is no longer standing. The offer is withdrawn the
@@ -494,11 +493,6 @@ pub fn init_metadata() {
         "op".into(),
         "data_pending".into(),
     );
-    PARK_ABANDONED.insert_metadata(
-        park_abandon::RECV_ARM_NOT_CANCELLABLE,
-        "op".into(),
-        "recv_arm_not_cancellable".into(),
-    );
     PARK_ABANDONED.insert_metadata(park_abandon::OUTBOUND, "op".into(), "outbound".into());
     PARK_ABANDONED.insert_metadata(park_abandon::NOT_OFFERED, "op".into(), "not_offered".into());
     PARK_ABANDONED.insert_metadata(park_abandon::TLS_SESSION, "op".into(), "tls_session".into());
@@ -776,21 +770,12 @@ mod cqe_tag_tests {
     /// which gaps we expect, rather than letting an unnoticed new one look
     /// normal — an unregistered slot reads as a counter stuck at zero.
     ///
-    /// Slot 1 is skipped by the enum outright. Slot 17 (`RecvMsgMultiTs`) exists
-    /// only under the `timestamps` feature, so the expected gap set is
-    /// feature-dependent; this test found that the hard way.
+    /// Slots 1 and 17 have no `OpTag` variant.
     #[test]
     fn expected_slots_are_unused() {
         let unused: Vec<usize> = (0..cqe_tag::COUNT)
             .filter(|i| OpTag::from_u8(*i as u8).is_none())
             .collect();
-        #[cfg(feature = "timestamps")]
-        let expected = vec![1];
-        #[cfg(not(feature = "timestamps"))]
-        let expected = vec![1, 17];
-        assert_eq!(
-            unused, expected,
-            "unexpected unused CQE_BY_TAG slots (timestamps feature changes this)"
-        );
+        assert_eq!(unused, vec![1, 17], "unexpected unused CQE_BY_TAG slots");
     }
 }

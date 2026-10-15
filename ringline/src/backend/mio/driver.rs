@@ -496,8 +496,6 @@ impl Driver {
             shutdown_requested: &mut self.shutdown_local,
             connect_addrs: &mut self.connect_addrs,
             tcp_nodelay: self.tcp_nodelay,
-            #[cfg(feature = "timestamps")]
-            timestamps: false,
             send_queues: &mut self.send_queues,
             pending_sends: &mut self.pending_sends,
             sends_dirty: &mut self.sends_dirty,

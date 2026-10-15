@@ -319,11 +319,6 @@ pub struct Config {
     /// (`[ringline stall]`). The stall buckets cost ~4 clock reads per
     /// iteration while enabled. io_uring backend only. Default: false.
     pub(crate) loop_diag: bool,
-    /// Enable SO_TIMESTAMPING for kernel-level receive timestamps.
-    /// When enabled, connections use `RecvMsgMulti` instead of `RecvMulti`
-    /// to receive ancillary data containing kernel RX timestamps.
-    #[cfg(feature = "timestamps")]
-    pub(crate) timestamps: bool,
     /// Maximum number of SQEs per IOSQE_IO_LINK chain. 0 disables chaining.
     /// When disabled, sends exceeding MAX_IOVECS fall back to sequential
     /// round-trips (one SQE at a time via on_send_complete).
@@ -490,8 +485,6 @@ impl Default for Config {
             peer_park: Vec::new(),
             park_rx: None,
             loop_diag: false,
-            #[cfg(feature = "timestamps")]
-            timestamps: false,
             max_chain_length: 16,
             standalone_task_capacity: 256,
             udp_bind: Vec::new(),
@@ -1025,10 +1018,8 @@ impl ConfigBuilder {
     /// fifth less per second with one-shot receives.
     ///
     /// Direct-echo and recv-forward connections arm one-shot receives with
-    /// either setting. With the `timestamps` feature and `timestamps(true)`,
-    /// every TCP receive, including those connections', is multishot
-    /// `recvmsg`. io_uring only; the mio
-    /// backend reads on readiness. **Default: false**.
+    /// either setting. io_uring only; the mio backend reads on readiness.
+    /// **Default: false**.
     pub fn recv_multishot(mut self, enabled: bool) -> Self {
         self.config.recv_multishot = enabled;
         self
@@ -1043,8 +1034,7 @@ impl ConfigBuilder {
     /// [`recv_buffer`](Self::recv_buffer) call the geometry follows the ring
     /// kind: 64 × 1 MiB incremental, or 4096 × 64 KiB plain, and `build()`
     /// then requires `recv_accumulator_max` to be at least 1 MiB on either
-    /// backend. With the `timestamps` feature and `timestamps(true)`, every
-    /// worker uses a plain ring.
+    /// backend.
     ///
     /// With this on, data is lent (held in place for a task, a segment or a
     /// `forward_to` source) only while at most half the TCP ring's buffers
@@ -1225,15 +1215,6 @@ impl ConfigBuilder {
     /// Set the deadline-based flush interval in microseconds. 0 = disabled.
     pub fn flush_interval_us(mut self, us: u64) -> Self {
         self.config.flush_interval_us = us;
-        self
-    }
-
-    // ── Timestamp settings ────────────────────────────────────────────
-
-    /// Enable SO_TIMESTAMPING for kernel-level receive timestamps.
-    #[cfg(feature = "timestamps")]
-    pub fn timestamps(mut self, enable: bool) -> Self {
-        self.config.timestamps = enable;
         self
     }
 

@@ -90,8 +90,6 @@ pub struct CommandResult {
     pub latency_ns: u64,
     /// Whether the command succeeded (no error response).
     pub success: bool,
-    /// Time-to-first-byte in nanoseconds (not available in sequential mode).
-    pub ttfb_ns: Option<u64>,
     /// Bytes transmitted for this command (protocol-encoded request size).
     pub tx_bytes: u32,
     /// Bytes received for this command (protocol-encoded response size).
@@ -140,8 +138,6 @@ type ResultCallback = Box<dyn Fn(&CommandResult)>;
 pub struct ClientBuilder {
     conn: Connection,
     on_result: Option<ResultCallback>,
-    #[cfg(feature = "timestamps")]
-    use_kernel_ts: bool,
     #[cfg(feature = "metrics")]
     with_metrics: bool,
 }
@@ -151,8 +147,6 @@ impl ClientBuilder {
         Self {
             conn,
             on_result: None,
-            #[cfg(feature = "timestamps")]
-            use_kernel_ts: false,
             #[cfg(feature = "metrics")]
             with_metrics: false,
         }
@@ -161,13 +155,6 @@ impl ClientBuilder {
     /// Register a callback invoked after each command completes.
     pub fn on_result<F: Fn(&CommandResult) + 'static>(mut self, f: F) -> Self {
         self.on_result = Some(Box::new(f));
-        self
-    }
-
-    /// Enable kernel SO_TIMESTAMPING for latency measurement (requires `timestamps` feature).
-    #[cfg(feature = "timestamps")]
-    pub fn kernel_timestamps(mut self, enabled: bool) -> Self {
-        self.use_kernel_ts = enabled;
         self
     }
 
@@ -187,8 +174,6 @@ impl ClientBuilder {
         let Self {
             conn,
             on_result,
-            #[cfg(feature = "timestamps")]
-            use_kernel_ts,
             #[cfg(feature = "metrics")]
             with_metrics,
         } = self;
@@ -198,8 +183,6 @@ impl ClientBuilder {
             rx,
             on_result,
             last_rx_bytes: Cell::new(0),
-            #[cfg(feature = "timestamps")]
-            use_kernel_ts,
             #[cfg(feature = "metrics")]
             metrics: if with_metrics {
                 Some(ClientMetrics::new())
@@ -215,15 +198,13 @@ impl ClientBuilder {
 /// A ringline-native Ping client wrapping a single connection.
 ///
 /// `Client::new(conn)` creates a zero-overhead client with no callbacks or
-/// metrics. Use `Client::builder(conn)` to configure per-request callbacks,
-/// kernel timestamps, and built-in histogram tracking.
+/// metrics. Use `Client::builder(conn)` to configure per-request callbacks
+/// and built-in histogram tracking.
 pub struct Client {
     tx: SendHalf,
     rx: RecvHalf,
     on_result: Option<ResultCallback>,
     last_rx_bytes: Cell<u32>,
-    #[cfg(feature = "timestamps")]
-    use_kernel_ts: bool,
     #[cfg(feature = "metrics")]
     metrics: Option<ClientMetrics>,
 }
@@ -231,7 +212,7 @@ pub struct Client {
 impl Client {
     /// Create a new client wrapping an established connection.
     ///
-    /// No callbacks, no metrics, no kernel timestamps — zero overhead.
+    /// No callbacks, no metrics — zero overhead.
     ///
     /// Cannot fail: a [`Connection`] already owns both halves (#528).
     pub fn new(conn: Connection) -> Self {
@@ -241,8 +222,6 @@ impl Client {
             rx,
             on_result: None,
             last_rx_bytes: Cell::new(0),
-            #[cfg(feature = "timestamps")]
-            use_kernel_ts: false,
             #[cfg(feature = "metrics")]
             metrics: None,
         }
@@ -292,40 +271,6 @@ impl Client {
             return true;
         }
         false
-    }
-
-    #[cfg(feature = "timestamps")]
-    #[inline]
-    fn send_timestamp(&self) -> u64 {
-        if self.use_kernel_ts {
-            now_realtime_ns()
-        } else {
-            0
-        }
-    }
-
-    #[cfg(not(feature = "timestamps"))]
-    #[inline]
-    fn send_timestamp(&self) -> u64 {
-        0
-    }
-
-    #[cfg(feature = "timestamps")]
-    #[inline]
-    fn finish_timing(&self, send_ts: u64, start: Instant) -> u64 {
-        if self.use_kernel_ts {
-            let recv_ts = self.rx.recv_timestamp();
-            if recv_ts > 0 && recv_ts > send_ts {
-                return recv_ts - send_ts;
-            }
-        }
-        start.elapsed().as_nanos() as u64
-    }
-
-    #[cfg(not(feature = "timestamps"))]
-    #[inline]
-    fn finish_timing(&self, _send_ts: u64, start: Instant) -> u64 {
-        start.elapsed().as_nanos() as u64
     }
 
     fn record(&mut self, result: &CommandResult) {
@@ -398,10 +343,9 @@ impl Client {
         }
 
         let tx_bytes = len as u32;
-        let send_ts = self.send_timestamp();
         let start = Instant::now();
         let response = self.execute(&buf[..len]).await;
-        let latency_ns = self.finish_timing(send_ts, start);
+        let latency_ns = elapsed_ns(start);
         let rx_bytes = self.last_rx_bytes.get();
 
         let result = match response {
@@ -413,7 +357,6 @@ impl Client {
             command: CommandType::Ping,
             latency_ns,
             success: result.is_ok(),
-            ttfb_ns: None,
             tx_bytes,
             rx_bytes,
         });
@@ -421,16 +364,10 @@ impl Client {
     }
 }
 
-// ── Kernel timestamp helper ─────────────────────────────────────────────
+// ── Timing helper ──────────────────────────────────────────────────────────
 
-#[cfg(feature = "timestamps")]
-fn now_realtime_ns() -> u64 {
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    unsafe {
-        libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts);
-    }
-    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+/// Nanoseconds elapsed since `start`.
+#[inline]
+fn elapsed_ns(start: Instant) -> u64 {
+    start.elapsed().as_nanos() as u64
 }

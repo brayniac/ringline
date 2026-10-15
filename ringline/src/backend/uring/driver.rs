@@ -265,15 +265,11 @@ impl Driver {
 }
 
 /// Whether the worker registers its TCP receive ring as incremental: only
-/// with `recv_incremental` on, the `timestamps` option off, and the kernel
-/// passing the incremental-ring preflight. A failed preflight is counted by
-/// step and selects a plain ring.
+/// with `recv_incremental` on and the kernel passing the incremental-ring
+/// preflight. A failed preflight is counted by step and selects a plain
+/// ring.
 fn select_incremental(config: &Config, ring: &mut Ring) -> Result<bool, crate::error::Error> {
     if !config.recv_incremental {
-        return Ok(false);
-    }
-    #[cfg(feature = "timestamps")]
-    if config.timestamps {
         return Ok(false);
     }
     use crate::backend::uring::engine::preflight::{IncPreflight, inc_preflight};
@@ -781,13 +777,6 @@ pub(crate) struct Driver {
     /// the bytes never touch the accumulator but the same flood-kill contract
     /// (`Config::recv_accumulator_max`) must hold.
     pub(crate) recv_accumulator_max: usize,
-    /// Whether SO_TIMESTAMPING is enabled for connections.
-    #[cfg(feature = "timestamps")]
-    pub(crate) timestamps: bool,
-    /// Pinned msghdr template for RecvMsgMulti with SO_TIMESTAMPING.
-    /// Used as the SQE template and for parsing CQE buffers via RecvMsgOut.
-    #[cfg(feature = "timestamps")]
-    pub(crate) recvmsg_msghdr: Box<libc::msghdr>,
     /// Per-connection send chain tracking for IOSQE_IO_LINK chains.
     pub(crate) chain_table: SendChainTable,
     /// Maximum SQEs per chain (0 = disabled).
@@ -1043,9 +1032,6 @@ pub(crate) enum ParkBlocker {
     /// Bytes have arrived and not been consumed. Whatever the handler
     /// offered at, this connection is no longer idle.
     DataPending,
-    /// The armed recv is not one `begin_park` can cancel, so the socket
-    /// cannot safely leave this worker.
-    RecvArmNotCancellable,
     /// An outbound connection. It has no listener, so it was never placed by
     /// accept and there is no placement imbalance for park to repair.
     Outbound,
@@ -1094,7 +1080,6 @@ impl ParkBlocker {
         match self {
             ParkBlocker::NotOpen => pa::NOT_OPEN,
             ParkBlocker::DataPending => pa::DATA_PENDING,
-            ParkBlocker::RecvArmNotCancellable => pa::RECV_ARM_NOT_CANCELLABLE,
             ParkBlocker::Outbound => pa::OUTBOUND,
             ParkBlocker::NotOffered => pa::NOT_OFFERED,
             ParkBlocker::TlsSession => pa::TLS_SESSION,
@@ -1124,7 +1109,6 @@ mod park_blocker_tests {
         let all = [
             ParkBlocker::NotOpen,
             ParkBlocker::DataPending,
-            ParkBlocker::RecvArmNotCancellable,
             ParkBlocker::Outbound,
             ParkBlocker::NotOffered,
             ParkBlocker::TlsSession,
@@ -1407,17 +1391,6 @@ impl Driver {
             send_zc_threshold: config.send_zc_threshold,
             recv_segment_reserve: config.recv_segment_reserve,
             recv_accumulator_max: config.recv_accumulator_max,
-            #[cfg(feature = "timestamps")]
-            timestamps: config.timestamps,
-            #[cfg(feature = "timestamps")]
-            recvmsg_msghdr: {
-                let mut hdr: Box<libc::msghdr> = Box::new(unsafe { std::mem::zeroed() });
-                // TCP: no source address needed.
-                hdr.msg_namelen = 0;
-                // Room for SCM_TIMESTAMPING cmsg: cmsghdr(16) + 3×timespec(48) = 64 bytes.
-                hdr.msg_controllen = 64;
-                hdr
-            },
             chain_table: SendChainTable::new(config.max_connections),
             max_chain_length: config.max_chain_length,
             send_queues,
@@ -1571,8 +1544,6 @@ impl Driver {
             connect_addrs: &mut self.connect_addrs,
             tcp_nodelay: self.tcp_nodelay,
             send_zc_threshold: self.send_zc_threshold,
-            #[cfg(feature = "timestamps")]
-            timestamps: self.timestamps,
             connect_timespecs: &mut self.connect_timespecs,
             chain_table: &mut self.chain_table,
             max_chain_length: self.max_chain_length,
@@ -2458,16 +2429,6 @@ impl Driver {
             || self.segment_pinned[conn_index as usize].is_some()
         {
             return Some(ParkBlocker::DataPending);
-        }
-
-        // `begin_park` cancels the armed recv by its `RecvMulti` user_data.
-        // A `MsgMulti` arm (the `timestamps` feature) would not match, so the
-        // socket would be handed over with a recv still draining it here.
-        if !matches!(
-            self.connections.get(conn_index).map(|c| c.recv_arm),
-            Some(crate::connection::RecvArm::Multi) | Some(crate::connection::RecvArm::Idle)
-        ) {
-            return Some(ParkBlocker::RecvArmNotCancellable);
         }
 
         // The handler's offer is the opt-in, and it is checked before any

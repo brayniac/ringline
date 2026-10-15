@@ -1447,8 +1447,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             OpTag::SendRecvBufsCoalescedDrain => self.handle_send_recv_bufs_coalesced(ud, result),
             OpTag::ForwardWrite => self.handle_forward_write(ud, result),
             OpTag::ForwardWriteDrain => self.handle_forward_write(ud, result),
-            #[cfg(feature = "timestamps")]
-            OpTag::RecvMsgMultiTs => self.handle_recv_msg_multi_ts(ud, result, flags),
         }
     }
 
@@ -2019,218 +2017,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
     }
 
-    /// Handle a RecvMsgMulti CQE (multishot recvmsg with SO_TIMESTAMPING).
-    ///
-    /// The provided buffer contains an `io_uring_recvmsg_out` header followed by
-    /// name (0 bytes for TCP), control data (cmsg with SCM_TIMESTAMPING), and
-    /// the TCP payload.
-    #[cfg(feature = "timestamps")]
-    fn handle_recv_msg_multi_ts(&mut self, ud: UserData, result: i32, flags: u32) {
-        let conn_index = ud.conn_index();
-        let has_more = cqueue::more(flags);
-
-        // Identity check — same reasoning as `handle_recv_multi`: the slot must
-        // still be occupied by the connection this recvmsg was armed for, or the
-        // completion belongs to a previous occupant of a reused index.
-        if self.driver.connections.get(conn_index).is_none()
-            || self.driver.connections.generation(conn_index) != ud.payload()
-        {
-            if result > 0
-                && let Some(bid) = cqueue::buffer_select(flags)
-            {
-                self.driver
-                    .provided_bufs
-                    .complete(bid, result as u32, cqueue::buf_more(flags));
-                self.driver.pending_replenish.push(bid);
-            }
-            return;
-        }
-
-        if result <= 0 {
-            if result == 0 {
-                if let Some(cs) = self.driver.connections.get_mut(conn_index) {
-                    cs.note_eof(false);
-                }
-                self.executor.wake_recv(conn_index);
-                self.driver.close_connection(conn_index);
-                return;
-            }
-            let errno = -result;
-            if errno == libc::ENOBUFS {
-                metrics::POOL.increment(metrics::pool::BUFFER_RING_EMPTY);
-                if !has_more {
-                    let generation = self.driver.connections.generation(conn_index);
-                    let msghdr_ptr = &*self.driver.recvmsg_msghdr as *const libc::msghdr;
-                    let _ = self
-                        .driver
-                        .ring
-                        .submit_multishot_recvmsg(conn_index, generation, msghdr_ptr);
-                }
-            } else if errno == libc::ECANCELED {
-                return;
-            } else if !has_more {
-                if let Some(cs) = self.driver.connections.get_mut(conn_index) {
-                    cs.read = ReadHalf::Error;
-                }
-                let generation = self.driver.connections.generation(conn_index);
-                self.executor.fail_recv(
-                    conn_index,
-                    generation,
-                    io::Error::from_raw_os_error(errno),
-                );
-                self.driver.close_connection(conn_index);
-            }
-            return;
-        }
-
-        let bid = match cqueue::buffer_select(flags) {
-            Some(bid) => bid,
-            None => {
-                if !has_more {
-                    self.executor.wake_recv(conn_index);
-                    self.driver.close_connection(conn_index);
-                }
-                return;
-            }
-        };
-
-        // Same rule as the multishot and fallback paths: bytes are about to be
-        // delivered, so any park offer is stale (#443 tier 3).
-        self.withdraw_park_offer(conn_index);
-
-        let buf_len = result as u32;
-        let buf_off = self
-            .driver
-            .provided_bufs
-            .complete(bid, buf_len, cqueue::buf_more(flags));
-        let buf_ptr = self.driver.provided_bufs.data_ptr(bid, buf_off);
-        let buf = unsafe { std::slice::from_raw_parts(buf_ptr, buf_len as usize) };
-
-        self.driver.pending_replenish.push(bid);
-
-        // Parse the io_uring_recvmsg_out header to extract control data + payload.
-        let msg_out =
-            match crate::backend::uring::abi::RecvMsgOut::parse(buf, &self.driver.recvmsg_msghdr) {
-                Ok(out) => out,
-                Err(()) => {
-                    // Parse failed — treat as regular data (shouldn't happen).
-                    return;
-                }
-            };
-
-        let payload = msg_out.payload_data();
-        if payload.is_empty() {
-            // EOF via recvmsg.
-            if let Some(cs) = self.driver.connections.get_mut(conn_index) {
-                cs.note_eof(false);
-            }
-            self.executor.wake_recv(conn_index);
-            self.driver.close_connection(conn_index);
-            return;
-        }
-
-        metrics::BYTES.add(metrics::bytes::RECEIVED, payload.len() as u64);
-
-        // Extract SCM_TIMESTAMPING from control data.
-        let control = msg_out.control_data();
-        if let Some(ts_ns) = Self::parse_scm_timestamp(control)
-            && let Some(cs) = self.driver.connections.get_mut(conn_index)
-        {
-            cs.recv_timestamp_ns = ts_ns;
-        }
-
-        // Route payload through accumulator (same as plaintext RecvMulti path).
-        if let Some(sink) = &mut self.executor.recv_sinks[conn_index as usize] {
-            let remaining_cap = sink.cap - sink.pos;
-            let to_sink = payload.len().min(remaining_cap);
-            if to_sink > 0 {
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        payload.as_ptr(),
-                        sink.ptr.add(sink.pos),
-                        to_sink,
-                    );
-                }
-                sink.pos += to_sink;
-            }
-            if to_sink < payload.len()
-                && !self
-                    .driver
-                    .accumulators
-                    .append(conn_index, &payload[to_sink..])
-            {
-                self.executor.wake_recv(conn_index);
-                self.driver.close_connection(conn_index);
-                return;
-            }
-        } else if !self.driver.accumulators.append(conn_index, payload) {
-            self.executor.wake_recv(conn_index);
-            self.driver.close_connection(conn_index);
-            return;
-        }
-        self.executor.wake_recv(conn_index);
-
-        if !has_more
-            && let Some(conn) = self.driver.connections.get(conn_index)
-            && matches!(conn.lifecycle, Lifecycle::Open)
-            && matches!(conn.recv_arm, RecvArm::MsgMulti)
-        {
-            let generation = self.driver.connections.generation(conn_index);
-            let msghdr_ptr = &*self.driver.recvmsg_msghdr as *const libc::msghdr;
-            let _ = self
-                .driver
-                .ring
-                .submit_multishot_recvmsg(conn_index, generation, msghdr_ptr);
-        }
-    }
-
-    /// Parse SCM_TIMESTAMPING from cmsg control data.
-    /// Returns the software RX timestamp as nanoseconds since epoch, or None.
-    #[cfg(feature = "timestamps")]
-    fn parse_scm_timestamp(control: &[u8]) -> Option<u64> {
-        // cmsg layout: cmsghdr { cmsg_len (usize), cmsg_level (i32), cmsg_type (i32) }
-        // followed by payload data, then padding to align next cmsghdr.
-        let hdr_size = std::mem::size_of::<libc::cmsghdr>();
-        let align = std::mem::align_of::<libc::cmsghdr>();
-        let mut offset = 0usize;
-
-        while offset + hdr_size <= control.len() {
-            // Safety: read_unaligned handles the case where control is not
-            // aligned to cmsghdr's alignment requirement.
-            let hdr_ptr = control[offset..].as_ptr() as *const libc::cmsghdr;
-            let hdr = unsafe { std::ptr::read_unaligned(hdr_ptr) };
-
-            if hdr.cmsg_len < hdr_size {
-                break;
-            }
-
-            let data_offset = offset + hdr_size;
-            let data_len = hdr.cmsg_len - hdr_size;
-
-            if hdr.cmsg_level == libc::SOL_SOCKET && hdr.cmsg_type == libc::SO_TIMESTAMPING {
-                // Payload is 3 × struct timespec: [software, hw_transformed, hw_raw].
-                // We want the software timestamp (index 0).
-                let ts_size = std::mem::size_of::<libc::timespec>();
-                if data_len >= ts_size && data_offset + ts_size <= control.len() {
-                    let ts_ptr = control[data_offset..].as_ptr() as *const libc::timespec;
-                    let ts = unsafe { std::ptr::read_unaligned(ts_ptr) };
-                    if ts.tv_sec != 0 || ts.tv_nsec != 0 {
-                        return Some(ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64);
-                    }
-                }
-            }
-
-            // Advance to next cmsg (aligned).
-            let next = offset + ((hdr.cmsg_len + align - 1) & !(align - 1));
-            if next <= offset {
-                break;
-            }
-            offset = next;
-        }
-
-        None
-    }
-
     /// Install an accepted fd into a connection slot and start serving it.
     ///
     /// Shared by the two ways a connection arrives: the acceptor channel (pool
@@ -2301,10 +2087,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// one-shot: the handler offers once when idle and never has to remember
     /// to revoke.
     ///
-    /// **Every path that delivers bytes to a connection must call this**, and
-    /// missing one is not hypothetical — the fallback and timestamped recv
-    /// paths both did. `park_blocker` carries a state-based backstop
-    /// (`ParkBlocker::DataPending`) for exactly that reason, so a path added
+    /// **Every path that delivers bytes to a connection must call this**. The
+    /// fallback recv path once did not. `park_blocker` carries a state-based
+    /// backstop (`ParkBlocker::DataPending`) for that reason, so a path added
     /// later fails closed rather than parking mid-request.
     fn withdraw_park_offer(&mut self, conn_index: u32) {
         let idx = conn_index as usize;
@@ -2954,12 +2739,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // TCP only: a merged listener is never a Unix socket
             // (SO_REUSEPORT does not apply to one), so there is no is_unix case
             // to consider as there is in the acceptor.
-            crate::acceptor::apply_accepted_sockopts(
-                raw_fd,
-                self.driver.tcp_nodelay,
-                #[cfg(feature = "timestamps")]
-                self.driver.timestamps,
-            );
+            crate::acceptor::apply_accepted_sockopts(raw_fd, self.driver.tcp_nodelay);
             let peer = crate::backend::sockaddr::getpeername_peer_addr(raw_fd).unwrap_or(
                 crate::connection::PeerAddr::Tcp(std::net::SocketAddr::from(([0, 0, 0, 0], 0))),
             );
@@ -5272,36 +5052,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.executor.wake_pidfd(seq, result);
     }
 
-    /// Arm the recv for a connection.
-    ///
-    /// When the `timestamps` feature is enabled and configured, uses
-    /// `RecvMsgMulti` (multishot recvmsg) to receive cmsg ancillary data
-    /// containing kernel timestamps. Otherwise, `Driver::submit_tcp_recv`
-    /// arms a one-shot or multishot recv.
+    /// Arm the recv for a connection. `Driver::submit_tcp_recv` arms a
+    /// one-shot or multishot recv.
     fn arm_recv(&mut self, conn_index: u32) {
         // Carried in the completion's payload so a CQE that outlives this
         // connection is rejected instead of being applied to the next occupant
         // of the slot. Valid even for an inactive slot.
         let generation = self.driver.connections.generation(conn_index);
-        #[cfg(feature = "timestamps")]
-        if self.driver.timestamps {
-            let msghdr_ptr = &*self.driver.recvmsg_msghdr as *const libc::msghdr;
-            if self
-                .driver
-                .ring
-                .submit_multishot_recvmsg(conn_index, generation, msghdr_ptr)
-                .is_err()
-            {
-                metrics::RING.increment(metrics::ring::RECV_ARM_FAILURES);
-                self.executor.wake_recv(conn_index);
-                self.driver.close_connection(conn_index);
-                return;
-            }
-            if let Some(cs) = self.driver.connections.get_mut(conn_index) {
-                cs.recv_arm = RecvArm::MsgMulti;
-            }
-            return;
-        }
         if self.driver.submit_tcp_recv(conn_index, generation).is_err() {
             metrics::RING.increment(metrics::ring::RECV_ARM_FAILURES);
             self.executor.wake_recv(conn_index);
@@ -9335,30 +9092,6 @@ mod tests {
         assert_eq!(el.driver.accumulators.data(conn_index), b"kept");
     }
 
-    /// The timestamps handler's stale-CQE branch counts and releases the
-    /// buffer exactly once, as `handle_recv_multi`'s does.
-    #[cfg(feature = "timestamps")]
-    #[test]
-    fn handle_recv_msg_multi_ts_stale_generation_releases_buffer_once() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let stale_generation = el.driver.connections.generation(conn_index);
-        recycle_connection(&mut el, conn_index);
-        el.driver.pending_replenish.clear();
-        let free_before = el.driver.provided_bufs.free();
-
-        let bid: u16 = 3;
-        let flags = 1u32 | 2u32 | ((bid as u32) << 16);
-        let stale_ud = UserData::encode(OpTag::RecvMsgMultiTs, conn_index, stale_generation);
-        el.test_dispatch_cqe(stale_ud.raw(), 40, flags);
-
-        assert_eq!(el.driver.pending_replenish, [bid]);
-        assert_eq!(el.driver.provided_bufs.free(), free_before - 1);
-        let r: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
-        el.driver.provided_bufs.release_batch(&r);
-        assert_eq!(el.driver.provided_bufs.free(), free_before);
-    }
-
     #[test]
     fn handle_recv_multi_stale_generation_replenishes_buffer_once() {
         let mut el = make_test_loop();
@@ -12199,29 +11932,6 @@ mod tests {
 
         with_driver_state(&mut el, || current.take_recv_sink());
         assert!(el.executor.recv_sinks[conn_index as usize].is_none());
-    }
-
-    /// A stale handle reads 0, not the new occupant's timestamp.
-    #[cfg(feature = "timestamps")]
-    #[test]
-    fn recv_timestamp_ignores_a_stale_handle() {
-        let mut el = make_test_loop_with_config(config_with_reserve(16));
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        el.driver
-            .connections
-            .get_mut(conn_index)
-            .unwrap()
-            .recv_timestamp_ns = 42;
-        let current = ConnCtx::new(conn_index, generation);
-        let stale = ConnCtx::new(conn_index, generation.wrapping_add(1));
-
-        assert_eq!(with_driver_state(&mut el, || current.recv_timestamp()), 42);
-        assert_eq!(
-            with_driver_state(&mut el, || stale.recv_timestamp()),
-            0,
-            "a stale handle must not read the new occupant's timestamp"
-        );
     }
 
     /// A stale handle's `forward_recv_buf` must not send the slot's new

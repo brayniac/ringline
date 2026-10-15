@@ -102,8 +102,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **Breaking, behaviour:** on io_uring, TCP connections arm a one-shot
   buffer-select recv and re-arm it when it completes, instead of one
   multishot recv per connection. `ConfigBuilder::recv_multishot(true)`
-  restores multishot. With `timestamps` configured, TCP receives stay
-  multishot `recvmsg`. Direct-echo and recv-forward connections arm one-shot
+  restores multishot. Direct-echo and recv-forward connections arm one-shot
   recvs in either mode (#638). A multishot recv keeps taking provided
   buffers while its socket has data, so with many connections and large
   messages some connections held the ring while others were served nothing.
@@ -374,9 +373,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   halves move together, because the forward path returns each received
   buffer as one send, so a buffer holding *k* pipelined requests costs one
   recv completion and one send completion. Two slots are never registered
-  (the enum skips discriminant 1, and 17 exists only under the `timestamps`
-  feature); a metrics dump reports those as `idx1`/`idx17` at zero rather
-  than omitting them (#486).
+  (the enum skips discriminants 1 and 17); a metrics dump reports those as
+  `idx1`/`idx17` at zero rather than omitting them (#486).
 - `ConnCtx::with_data_result`: like `with_data`, but resolves to
   `io::Result<usize>` so a handler can tell a clean peer close (`Ok(0)`)
   from a transport failure (`Err(e)`, e.g. `ConnectionReset` after an RST).
@@ -406,8 +404,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `ringline::spawn` starts one from `on_tick` or `on_notify`. They will be
   removed in the next breaking release (#579).
 
+### Removed
+
+- **Breaking:** the TCP kernel receive-timestamp mode is removed: the
+  `timestamps` cargo features of `ringline`, `ringline-memcache`,
+  `ringline-redis` and `ringline-ping`, `ConfigBuilder::timestamps`,
+  `Connection::recv_timestamp` and `RecvHalf::recv_timestamp`
+  (`ConnCtx::recv_timestamp` in 0.6), and `ClientBuilder::kernel_timestamps`
+  and `CommandResult::ttfb_ns` in the three client crates. A connection held
+  one timestamp, which each receive completion overwrote, so with pipelining
+  or a task that ran late a response was timed against a later completion's
+  timestamp. The send side of each measurement was a user-space
+  `CLOCK_REALTIME` read. The mode also replaced the receive path under
+  measurement with a separate multishot `recvmsg` handler. That handler
+  copied every byte out of the provided buffer (into the accumulator, or a
+  recv sink when one was set), lent no buffers, ran only on plain rings, and
+  had no TLS or segmented-receive handling. A TLS connection appended
+  ciphertext to its accumulator, a `forward_to` longer than the bytes
+  already buffered did not complete until the peer closed and then returned
+  short, and bytes held for a segment reader could be delivered after newer
+  ones. UDP `recv_batch_timed` is unchanged. Client latency is timed with
+  `Instant`. Remove `.timestamps(..)` and `.kernel_timestamps(..)` calls,
+  the `timestamps` feature from `Cargo.toml`, and any read or construction
+  of `CommandResult::ttfb_ns`, which was `None` unless kernel timestamps
+  were on. Nothing in this change replaces `ttfb_ns`.
+
 ### Fixed
 
+- `ringline-redis` and `ringline-memcache`: a client built with
+  `with_metrics()` and no `on_result` callback records the latency of
+  `fire_*`/`recv` operations. It read the clock only when a callback was
+  set, so those operations recorded `latency_ns = 0` in `ClientMetrics` and
+  in `CompletedOp`. Builds with the removed `timestamps` feature already
+  timed them. Such a client now reads the clock twice per operation, as the
+  sequential API already did.
 - A connection's receive accumulator gives its allocation back when the
   connection closes. An accumulator grows to the largest message its
   connection buffered, and `reset` keeps the allocation, so each slot kept
