@@ -1,7 +1,7 @@
 # Receive starvation at high connection counts, and what holds receive memory
 
 - **Status:** open
-- **Span:** 2026-10-12 to 2026-10-14 · #657 (open), #658 (issue) · rig
+- **Span:** 2026-10-12 to 2026-10-14 · #657, #658 (issue), #660 · rig
   experiment specs on branch `exp/inc-step6-matrix` of the brayniac fork,
   `experiments/recv-inc-matrix/`; the builds they ran are on that fork's
   `exp/inc-step6-rearm` (neither is on `main`)
@@ -204,7 +204,9 @@ new connection takes the slot (accept or connect), so every slot keeps the
 largest buffer it grew. An experimental patch that drops the allocation in
 `reset` and calls it at close brought RSS after close to 336 MiB. The rest
 is glibc's arenas: with `MALLOC_MMAP_THRESHOLD_=131072` as well, it was
-177 MiB.
+177 MiB. #660 releases an accumulator's allocation when its connection
+closes; with it, RSS after close was 276 and 336 MiB in two runs, against
+791 and 874 MiB without.
 
 The fixed rings have no lend cap. When they run out, the receive gets
 `ENOBUFS`, the connection parks, and TCP holds the bytes in the socket.
@@ -228,14 +230,14 @@ The fixed rings have no lend cap. When they run out, the receive gets
 
 ## Outcome
 
-- #657 (fair re-arm) is open. Its merge waits for phase d, which runs the
-  final version with a dump of every open connection's state at shutdown:
-  10 boots at 10,000 connections on 6.8, 4 at 64 KiB × 16,384 and 6 at
-  256 B × 16,384 on 6.12 and 7.1.
+- #657 is the fair re-arm. Phase d runs its final version with a dump of
+  every open connection's state at shutdown: 10 boots at 10,000
+  connections on 6.8, 4 at 64 KiB × 16,384 and 6 at 256 B × 16,384 on 6.12
+  and 7.1.
 - #658 tracks the accept-path losses. No design is chosen.
-- The incremental ring's copy path has no memory bound, and accumulators
-  outlive their connections. Both need fixing before `recv_incremental` is
-  on by default (step 7 of #622).
+- #660 releases accumulators when their connections close.
+- The incremental ring's copy path has no memory bound. That needs fixing
+  before `recv_incremental` is on by default (step 7 of #622).
 
 ## Open questions
 

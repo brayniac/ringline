@@ -159,11 +159,11 @@ at most one ring's worth of owned buffers in total. The accumulator copies
 have no total bound. An incremental completion can be a whole message, so
 each copy can be a whole message. In ringline's forward echo, peak RSS
 reached 1.5 GiB at 64 KiB × 16,384 and 5.6 GiB at 1 MiB × 4,096, against
-128 MiB of ring (two workers). An accumulator keeps its allocation after
-its connection closes. The RSS growth and the retention come from the lend
-cap and the accumulator; the incremental ring's own memory stays at 64 MiB
-per worker. Both have to be fixed before `recv_incremental` is the default
-(`docs/journal/2026-10-receive-starvation.md`).
+128 MiB of ring (two workers). The growth comes from the lend cap and the
+accumulator; the incremental ring's own memory stays at 64 MiB per worker.
+It has to be bounded before `recv_incremental` is the default
+(`docs/journal/2026-10-receive-starvation.md`). An accumulator releases its
+allocation when its connection closes (#660).
 
 The kernel behaviour the driver relies on is checked at startup on the
 running kernel (`docs/recv-incremental-ring-design.md`, "Selecting the ring
