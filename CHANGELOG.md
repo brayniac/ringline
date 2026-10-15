@@ -431,6 +431,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- io_uring: a park offer made while the connection holds request bytes the
+  handler has not read, or from inside one of its reader callbacks, is
+  ignored. Such an offer stayed set, so once the handler read the request
+  nothing refused the park. A handler that then awaited something other than
+  the connection (a backend call, for example) could be parked mid-request,
+  and the request got no reply. Offer outside reader callbacks, after the
+  response is queued. A connection whose next request has always arrived by
+  the time the handler offers is not parked.
+  `metrics::park_diag::OFFER_DECLINED` counts ignored offers. Found by
+  reading the code; not observed. Park (#443) is not in a release. (#669)
 - io_uring: a connection with a lent receive buffer is not parked. The park
   check refused a connection holding unread bytes in its accumulator or
   receive holds, but not one whose bytes were in a lent provided buffer

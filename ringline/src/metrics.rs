@@ -173,6 +173,9 @@ pub mod park_drain_us {
 /// the suppression fires, and whether data still reaches the connection while it
 /// is supposed to be draining. Between them there is only one consistent story,
 /// which is the point — six hypotheses have already died here.
+///
+/// `OFFER_DECLINED` counts `offer_for_park` calls declined because bytes were
+/// unread or a reader callback was running (#669).
 pub mod park_diag {
     /// `begin_park` submitted a recv-cancel, because a multishot was armed.
     pub const CANCEL_SUBMITTED: usize = 0;
@@ -196,8 +199,13 @@ pub mod park_diag {
     /// A drain was dropped because the slot had been recycled under it.
     pub const DRAIN_STALE: usize = 6;
 
+    /// `offer_for_park` was ignored: the connection held unread bytes, or the
+    /// offer came from inside one of its reader callbacks. A handler whose
+    /// offers all land here is never parked.
+    pub const OFFER_DECLINED: usize = 7;
+
     /// Number of slots.
-    pub const COUNT: usize = 7;
+    pub const COUNT: usize = 8;
 }
 
 /// Counter slot indices for park-abandonment reasons.
@@ -487,6 +495,11 @@ pub fn init_metadata() {
         "drain_timeout".into(),
     );
     PARK_DIAG.insert_metadata(park_diag::DRAIN_STALE, "op".into(), "drain_stale".into());
+    PARK_DIAG.insert_metadata(
+        park_diag::OFFER_DECLINED,
+        "op".into(),
+        "offer_declined".into(),
+    );
 
     PARK_ABANDONED.insert_metadata(park_abandon::NOT_OPEN, "op".into(), "not_open".into());
     PARK_ABANDONED.insert_metadata(
