@@ -563,7 +563,9 @@ pub(crate) struct Driver {
     /// Depositing is the opt-in: a connection whose handler never offered it
     /// is never parked. Cleared whenever recv delivers, because new data
     /// means a new request began and the quiescent point the handler offered
-    /// at is gone — so the handler never has to remember to revoke.
+    /// at is gone — so the handler never has to remember to revoke. Set only
+    /// through `offer_park`, which declines while bytes are unread or while
+    /// the innermost running reader callback is this connection's.
     pub(crate) park_offered: Vec<bool>,
     /// Per connection: a park cancelled this connection's multishot recv and is
     /// waiting for the handler to come back to a quiescent point.
@@ -2359,6 +2361,56 @@ impl Driver {
         owned
     }
 
+    /// Whether the connection holds received bytes that no consumer has
+    /// finished with: the accumulator, a lent buffer in `pending_recv_bufs`,
+    /// `segment_hold`, `recv_hold` or a pinned segment. `park_blocker` refuses
+    /// a park while this holds (`ParkBlocker::DataPending`), and `offer_park`
+    /// declines an offer.
+    pub(crate) fn holds_unread(&self, conn_index: u32) -> bool {
+        let idx = conn_index as usize;
+        !self.accumulators.is_empty(conn_index)
+            || self.pending_recv_bufs[idx].is_some()
+            || !self.segment_hold[idx].is_empty()
+            || !self.recv_hold[idx].is_empty()
+            || self.segment_pinned[idx].is_some()
+    }
+
+    /// Record a handler's park offer, with the state to carry
+    /// (`ConnCtx::offer_for_park`). Returns whether the offer stands.
+    ///
+    /// The offer is declined, and any earlier offer and deposit cleared,
+    /// while the connection holds unread bytes, or while the connection's
+    /// reader callback is the innermost one running on this thread. Either
+    /// way the handler may be partway through a request, so the offer is not
+    /// treated as made at an idle point (#669). An offer that stands
+    /// therefore means the driver held no unread bytes when it was made, and
+    /// arriving bytes withdraw it (`withdraw_park_offer`).
+    pub(crate) fn offer_park(
+        &mut self,
+        conn_index: u32,
+        state: Option<crate::park::ParkState>,
+    ) -> bool {
+        let idx = conn_index as usize;
+        if self.holds_unread(conn_index) || crate::runtime::io::in_reader_callback(conn_index) {
+            self.park_offered[idx] = false;
+            self.park_carry.remove(&conn_index);
+            crate::metrics::PARK_DIAG.increment(crate::metrics::park_diag::OFFER_DECLINED);
+            return false;
+        }
+        self.park_offered[idx] = true;
+        match state {
+            Some(s) => {
+                self.park_carry.insert(conn_index, s);
+            }
+            // An offer with nothing to carry still clears any earlier
+            // deposit, so a stale one is never shipped.
+            None => {
+                self.park_carry.remove(&conn_index);
+            }
+        }
+        true
+    }
+
     /// The park gate (tier 3, #443). `None` means quiescent and movable.
     ///
     /// `recv_half_taken` / `send_half_taken` are deliberately not blockers.
@@ -2417,12 +2469,7 @@ impl Driver {
         // have not been consumed make the connection un-idle whether or not
         // the path that delivered them remembered to withdraw the offer. A
         // delivery path added later gets this for free.
-        if !self.accumulators.is_empty(conn_index)
-            || self.pending_recv_bufs[conn_index as usize].is_some()
-            || !self.segment_hold[conn_index as usize].is_empty()
-            || !self.recv_hold[conn_index as usize].is_empty()
-            || self.segment_pinned[conn_index as usize].is_some()
-        {
+        if self.holds_unread(conn_index) {
             return Some(ParkBlocker::DataPending);
         }
 

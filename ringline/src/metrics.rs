@@ -165,14 +165,16 @@ pub mod park_drain_us {
     }
 }
 
-/// Why suppressing the `ECANCELED` re-arm did not stop offers being withdrawn.
+/// Park diagnostic counters.
 ///
-/// Suppressing the re-arm left `not_offered` at 95.2% of abandonments, unchanged
-/// (`docs/journal/2026-09-two-phase-park.md`). These four answer the question the
-/// abandonment counters cannot: whether the cancel is submitted at all, whether
-/// the suppression fires, and whether data still reaches the connection while it
-/// is supposed to be draining. Between them there is only one consistent story,
-/// which is the point — six hypotheses have already died here.
+/// The first four show whether `begin_park` submits the recv cancel, whether
+/// the `ECANCELED` re-arm suppression fires, and whether an arrival withdraws
+/// an offer while the connection drains
+/// (`docs/journal/2026-09-two-phase-park.md`).
+///
+/// `OFFER_DECLINED` counts `offer_for_park` calls declined because bytes were
+/// unread or the connection's reader callback was the innermost one running
+/// (#669).
 pub mod park_diag {
     /// `begin_park` submitted a recv-cancel, because a multishot was armed.
     pub const CANCEL_SUBMITTED: usize = 0;
@@ -196,8 +198,13 @@ pub mod park_diag {
     /// A drain was dropped because the slot had been recycled under it.
     pub const DRAIN_STALE: usize = 6;
 
+    /// `offer_for_park` was ignored: the connection held unread bytes, or its
+    /// reader callback was the innermost one running. A handler whose offers
+    /// all land here is never parked.
+    pub const OFFER_DECLINED: usize = 7;
+
     /// Number of slots.
-    pub const COUNT: usize = 7;
+    pub const COUNT: usize = 8;
 }
 
 /// Counter slot indices for park-abandonment reasons.
@@ -487,6 +494,11 @@ pub fn init_metadata() {
         "drain_timeout".into(),
     );
     PARK_DIAG.insert_metadata(park_diag::DRAIN_STALE, "op".into(), "drain_stale".into());
+    PARK_DIAG.insert_metadata(
+        park_diag::OFFER_DECLINED,
+        "op".into(),
+        "offer_declined".into(),
+    );
 
     PARK_ABANDONED.insert_metadata(park_abandon::NOT_OPEN, "op".into(), "not_open".into());
     PARK_ABANDONED.insert_metadata(

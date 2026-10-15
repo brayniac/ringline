@@ -794,11 +794,10 @@ fn run_ringline(cfg: EchoCfg) {
             if n == 0 {
                 break;
             }
-            // A response has gone out and nothing is half-read: the quiescent
-            // point park is defined against. The offer is withdrawn
-            // automatically the moment the next request's bytes arrive, so
-            // offering every time costs a bool store and can never leave a
-            // stale offer behind.
+            // The response is queued: the quiescent point park is defined
+            // against. If the next request's bytes are already buffered, the
+            // offer is ignored; otherwise it is withdrawn when they arrive.
+            // Offering after every response is therefore safe.
             if PARK_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
                 tx.offer_for_park(None);
             }

@@ -111,6 +111,48 @@ impl Drop for DriverStateGuard {
     }
 }
 
+// The connection whose reader callback is running on this thread, if any.
+//
+// `offer_for_park` declines an offer made from inside the connection's own
+// reader callback, while it is the innermost one running. `with_bytes` takes
+// the request out of the driver before its callback runs. A
+// `forward_recv_buf` that sends the whole lent buffer or the whole
+// accumulator takes it out during the callback. `holds_unread` returns false
+// for a request taken out either way (#669).
+#[cfg(has_io_uring)]
+thread_local! {
+    static READER_CALLBACK_CONN: std::cell::Cell<Option<u32>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Marks `conn_index`'s reader callback as running until dropped, then
+/// restores the previous value. Only the innermost running callback is
+/// recorded, so while a nested callback on another connection runs, the
+/// outer connection is not detected.
+#[cfg(has_io_uring)]
+struct ReaderCallback(Option<u32>);
+
+#[cfg(has_io_uring)]
+impl ReaderCallback {
+    fn enter(conn_index: u32) -> Self {
+        ReaderCallback(READER_CALLBACK_CONN.with(|c| c.replace(Some(conn_index))))
+    }
+}
+
+#[cfg(has_io_uring)]
+impl Drop for ReaderCallback {
+    fn drop(&mut self) {
+        READER_CALLBACK_CONN.with(|c| c.set(self.0));
+    }
+}
+
+/// Whether the innermost reader callback running on this thread is
+/// `conn_index`'s.
+#[cfg(has_io_uring)]
+pub(crate) fn in_reader_callback(conn_index: u32) -> bool {
+    READER_CALLBACK_CONN.with(|c| c.get() == Some(conn_index))
+}
+
 /// Set the thread-local driver pointer, returning a guard that clears it
 /// when dropped (normally or during unwind).
 ///
@@ -1100,30 +1142,41 @@ impl ConnCtx {
     /// **This is the opt-in.** A connection whose handler never calls this is
     /// never parked, whatever the load imbalance.
     ///
-    /// The offer is **cleared automatically when more data arrives**, since
-    /// that means a new request started and the boundary is gone. So a
-    /// handler offers once per idle point and never has to revoke.
+    /// The offer is cleared when more data arrives, since that means a new
+    /// request started and the boundary is gone. So a handler offers once per
+    /// idle point and never has to revoke.
     ///
-    /// Park also requires Linux 6.8 (`IORING_OP_FIXED_FD_INSTALL`) and the
-    /// io_uring backend; elsewhere this is recorded and simply never acted
-    /// on.
+    /// Call it outside any reader callback, after the response to every
+    /// request read so far has been queued. An offer is ignored when it
+    /// is made from inside one of the connection's reader callbacks
+    /// (`with_data`, `with_bytes`, `with_segments`, `try_with_data`), or
+    /// while the runtime holds received bytes for the connection, such as
+    /// the next request. Offer again at the next idle point.
+    /// A connection whose next request has always arrived by the time the
+    /// handler offers is therefore never parked. Only the innermost
+    /// running callback is detected. An offer for connection A made from
+    /// inside a callback on connection B, itself inside A's callback, is
+    /// declined only while the runtime still holds A's bytes. It does not
+    /// hold them in a `with_bytes` callback, or after a `forward_recv_buf`
+    /// that sent the whole lent buffer or the whole accumulator.
+    /// `metrics::park_diag::OFFER_DECLINED` counts offers ignored because of
+    /// a running reader callback or held bytes.
+    ///
+    /// The runtime does not see bytes the handler has taken into its own
+    /// memory, for example a `ConnStream`'s buffered data, a recv sink,
+    /// `Bytes` kept from `with_bytes`, or requests the handler has queued. Do
+    /// not offer while holding any.
+    ///
+    /// Park also requires the io_uring backend and a kernel with
+    /// `IORING_OP_FIXED_FD_INSTALL` (mainline 6.8). On mio this does
+    /// nothing; on io_uring without that operation the offer is recorded
+    /// and never acted on.
     pub fn offer_for_park(&self, state: Option<crate::park::ParkState>) {
         let _ = try_with_state(|driver, _| {
             #[cfg(has_io_uring)]
             {
-                let idx = self.conn_index as usize;
                 if driver.connections.generation(self.conn_index) == self.generation {
-                    driver.park_offered[idx] = true;
-                    match state {
-                        Some(s) => {
-                            driver.park_carry.insert(self.conn_index, s);
-                        }
-                        // An offer with nothing to carry still clears any
-                        // earlier deposit, so a stale one is never shipped.
-                        None => {
-                            driver.park_carry.remove(&self.conn_index);
-                        }
-                    }
+                    driver.offer_park(self.conn_index, state);
                 }
             }
             #[cfg(not(has_io_uring))]
@@ -1932,7 +1985,11 @@ impl ConnCtx {
             if data.is_empty() {
                 return None;
             }
-            let result = f(data);
+            let result = {
+                #[cfg(has_io_uring)]
+                let _cb = ReaderCallback::enter(self.conn_index);
+                f(data)
+            };
             #[cfg(has_io_uring)]
             let forwarded = take_forward_zc_consumed(driver, self.conn_index);
             #[cfg(not(has_io_uring))]
@@ -3110,8 +3167,14 @@ impl<F: FnMut(&[u8]) -> ParseResult + Unpin> Future for WithDataFuture<F> {
                     let pending = driver.pending_recv_bufs[self.conn_index as usize].unwrap();
                     let data =
                         unsafe { std::slice::from_raw_parts(pending.ptr, pending.len as usize) };
+                    #[cfg(has_io_uring)]
+                    let cb_conn = self.conn_index;
                     let f = self.f.as_mut().expect("WithDataFuture polled after Ready");
-                    let result = f(data);
+                    let result = {
+                        #[cfg(has_io_uring)]
+                        let _cb = ReaderCallback::enter(cb_conn);
+                        f(data)
+                    };
                     match result {
                         ParseResult::Consumed(consumed) if consumed > 0 => {
                             // The closure may have called forward_recv_buf(), which
@@ -3173,8 +3236,14 @@ impl<F: FnMut(&[u8]) -> ParseResult + Unpin> Future for WithDataFuture<F> {
                     .map(|c| c.recv_finished())
                     .unwrap_or(true); // connection already released
                 if is_closed {
+                    #[cfg(has_io_uring)]
+                    let cb_conn = self.conn_index;
                     let f = self.f.as_mut().expect("WithDataFuture polled after Ready");
-                    let result = f(&[]);
+                    let result = {
+                        #[cfg(has_io_uring)]
+                        let _cb = ReaderCallback::enter(cb_conn);
+                        f(&[])
+                    };
                     self.f.take();
                     return Poll::Ready(match result {
                         ParseResult::Consumed(n) => n,
@@ -3190,8 +3259,14 @@ impl<F: FnMut(&[u8]) -> ParseResult + Unpin> Future for WithDataFuture<F> {
             }
 
             // Data available — call closure immediately (zero-overhead hot path).
+            #[cfg(has_io_uring)]
+            let cb_conn = self.conn_index;
             let f = self.f.as_mut().expect("WithDataFuture polled after Ready");
-            let result = f(data);
+            let result = {
+                #[cfg(has_io_uring)]
+                let _cb = ReaderCallback::enter(cb_conn);
+                f(data)
+            };
             #[cfg(has_io_uring)]
             let forwarded = take_forward_zc_consumed(driver, self.conn_index);
             #[cfg(not(has_io_uring))]
@@ -3324,8 +3399,14 @@ impl<F: FnMut(Bytes) -> ParseResult + Unpin> Future for WithBytesFuture<F> {
             if data.is_empty() {
                 // No data yet — check closed state from the lookup above.
                 if is_closed {
+                    #[cfg(has_io_uring)]
+                    let cb_conn = self.conn_index;
                     let f = self.f.as_mut().expect("WithBytesFuture polled after Ready");
-                    let result = f(Bytes::new());
+                    let result = {
+                        #[cfg(has_io_uring)]
+                        let _cb = ReaderCallback::enter(cb_conn);
+                        f(Bytes::new())
+                    };
                     self.f.take();
                     return Poll::Ready(match result {
                         ParseResult::Consumed(n) => n,
@@ -3343,9 +3424,15 @@ impl<F: FnMut(Bytes) -> ParseResult + Unpin> Future for WithBytesFuture<F> {
             let frozen = driver.accumulators.take_frozen(self.conn_index);
             let len = frozen.len();
 
+            #[cfg(has_io_uring)]
+            let cb_conn = self.conn_index;
             let f = self.f.as_mut().expect("WithBytesFuture polled after Ready");
             // clone is an O(1) Bytes refcount bump; the original `frozen` is retained for the prepend calls below.
-            let result = f(frozen.clone());
+            let result = {
+                #[cfg(has_io_uring)]
+                let _cb = ReaderCallback::enter(cb_conn);
+                f(frozen.clone())
+            };
 
             match result {
                 ParseResult::Consumed(consumed) if consumed > 0 => {
@@ -5100,11 +5187,17 @@ impl<F: FnMut(&SegChain<'_>) -> SegConsumed + Unpin> Future for WithSegmentsFutu
             let consumed = {
                 let chain = SegChain { segs: &slices };
                 let total = chain.total_len();
+                #[cfg(has_io_uring)]
+                let cb_conn = self.conn_index;
                 let f = self
                     .f
                     .as_mut()
                     .expect("WithSegmentsFuture polled after Ready");
-                let SegConsumed(c) = f(&chain);
+                let SegConsumed(c) = {
+                    #[cfg(has_io_uring)]
+                    let _cb = ReaderCallback::enter(cb_conn);
+                    f(&chain)
+                };
                 c.min(total)
             };
             // Release the accumulator/provided-buffer borrows before mutating.

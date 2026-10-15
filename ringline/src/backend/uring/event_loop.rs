@@ -6727,7 +6727,9 @@ mod tests {
             "precondition: the bytes are lent, not copied"
         );
 
-        // The handler offers without reading the lent bytes.
+        // Set the flag directly: `offer_park` declines here. This checks
+        // `DataPending` as the backstop for a delivery path that does not call
+        // `withdraw_park_offer`.
         el.driver.park_offered[conn_index as usize] = true;
 
         assert_eq!(
@@ -6735,6 +6737,241 @@ mod tests {
             Some(ParkBlocker::DataPending),
             "a lent buffer is unread data"
         );
+    }
+
+    /// #669: an offer made while the next request is buffered must not stand
+    /// once the handler reads that request. The handler is mid-request then,
+    /// and a park would drop its future without a reply.
+    #[test]
+    fn an_offer_made_with_a_request_buffered_does_not_survive_the_read() {
+        for lent in [true, false] {
+            let mut el = make_test_loop();
+            let conn_index = accept_connection(&mut el);
+            let idx = conn_index as usize;
+
+            if lent {
+                // Request 2 arrives while the handler is busy and is lent.
+                let generation = el.driver.connections.generation(conn_index);
+                let data = b"GET y";
+                let bid: u16 = 0;
+                let (buf_ptr, _) = el.driver.provided_bufs.get_buffer(bid);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr as *mut u8, data.len());
+                }
+                let flags = 1u32 | 2u32 | ((bid as u32) << 16);
+                let ud = UserData::encode(OpTag::RecvMulti, conn_index, generation);
+                el.test_dispatch_cqe(ud.raw(), data.len() as i32, flags);
+                assert!(el.driver.pending_recv_bufs[idx].is_some(), "precondition");
+            } else {
+                el.driver.accumulators.append(conn_index, b"GET y");
+            }
+
+            // Set a standing offer directly, so the assertions below need
+            // `offer_for_park` to clear it.
+            el.driver.park_offered[idx] = true;
+            el.driver.park_carry.insert(conn_index, ParkState::new(0u8));
+
+            // The handler finishes response 1 and offers, through the public
+            // handle.
+            let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+            with_driver_state(&mut el, || ctx.offer_for_park(Some(ParkState::new(1u8))));
+
+            // The handler reads request 2.
+            if lent {
+                let pending = el.driver.pending_recv_bufs[idx].take().expect("lent");
+                el.driver.pending_replenish.push(pending.bid);
+            } else {
+                el.driver.accumulators.consume(conn_index, 5);
+            }
+
+            assert_eq!(
+                el.driver.park_blocker(conn_index),
+                Some(ParkBlocker::NotOffered),
+                "lent={lent}: the handler is mid-request; the offer must not stand"
+            );
+            assert!(
+                !el.driver.park_carry.contains_key(&conn_index),
+                "lent={lent}: a declined offer must not leave state to ship"
+            );
+        }
+    }
+
+    /// An offer made from inside a `with_data`, `with_bytes` or
+    /// `try_with_data` callback is declined, with the request lent or
+    /// accumulated. `with_bytes`, and a `forward_recv_buf` of the whole lent
+    /// buffer or accumulator, take the bytes out of the driver before the
+    /// offer, so only the callback guard catches those cases; the plain
+    /// `with_data` and `try_with_data` cases are also caught by
+    /// `holds_unread` (#669).
+    #[test]
+    fn an_offer_from_inside_a_reader_callback_is_declined() {
+        for (reader, lent) in [
+            ("with_data", false),
+            ("with_data", true),
+            ("with_data_forward", true),
+            ("with_data_forward", false),
+            ("with_bytes", false),
+            ("with_bytes", true),
+            ("try_with_data", false),
+            ("try_with_data_forward", false),
+        ] {
+            let mut el = make_test_loop();
+            let conn_index = accept_connection(&mut el);
+            let generation = el.driver.connections.generation(conn_index);
+            let data = b"GET z";
+            if lent {
+                let bid: u16 = 0;
+                let (buf_ptr, _) = el.driver.provided_bufs.get_buffer(bid);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr as *mut u8, data.len());
+                }
+                let flags = 1u32 | 2u32 | ((bid as u32) << 16);
+                let ud = UserData::encode(OpTag::RecvMulti, conn_index, generation);
+                el.test_dispatch_cqe(ud.raw(), data.len() as i32, flags);
+                assert!(
+                    el.driver.pending_recv_bufs[conn_index as usize].is_some(),
+                    "{reader}: precondition"
+                );
+            } else {
+                el.driver.accumulators.append(conn_index, data);
+            }
+
+            // A standing offer that only `offer_for_park` reaching
+            // `offer_park` clears.
+            el.driver.park_offered[conn_index as usize] = true;
+            el.driver.park_carry.insert(conn_index, ParkState::new(0u8));
+
+            let ctx = ConnCtx::new(conn_index, generation);
+            let waker = noop_waker();
+            let consumed = match reader {
+                "with_data" => {
+                    let mut fut = std::pin::pin!(ctx.with_data(|d| {
+                        ctx.offer_for_park(Some(ParkState::new(3u8)));
+                        crate::runtime::io::ParseResult::Consumed(d.len())
+                    }));
+                    with_driver_state(&mut el, || {
+                        let mut cx = std::task::Context::from_waker(&waker);
+                        fut.as_mut().poll(&mut cx)
+                    })
+                }
+                "with_data_forward" => {
+                    // Forwarding the whole lent buffer or accumulator takes it
+                    // out of `pending_recv_bufs` or the accumulator, so only
+                    // the callback guard declines the offer.
+                    let mut fut = std::pin::pin!(ctx.with_data(|d| {
+                        ctx.forward_recv_buf(d).expect("forward");
+                        ctx.offer_for_park(Some(ParkState::new(3u8)));
+                        crate::runtime::io::ParseResult::Consumed(d.len())
+                    }));
+                    with_driver_state(&mut el, || {
+                        let mut cx = std::task::Context::from_waker(&waker);
+                        fut.as_mut().poll(&mut cx)
+                    })
+                }
+                "with_bytes" => {
+                    let mut fut = std::pin::pin!(ctx.with_bytes(|b| {
+                        ctx.offer_for_park(Some(ParkState::new(3u8)));
+                        crate::runtime::io::ParseResult::Consumed(b.len())
+                    }));
+                    with_driver_state(&mut el, || {
+                        let mut cx = std::task::Context::from_waker(&waker);
+                        fut.as_mut().poll(&mut cx)
+                    })
+                }
+                _ => {
+                    let forward = reader == "try_with_data_forward";
+                    let r = with_driver_state(&mut el, || {
+                        ctx.try_with_data(|d| {
+                            if forward {
+                                ctx.forward_recv_buf(d).expect("forward");
+                            }
+                            ctx.offer_for_park(Some(ParkState::new(3u8)));
+                            crate::runtime::io::ParseResult::Consumed(d.len())
+                        })
+                    });
+                    assert!(
+                        matches!(r, Some(crate::runtime::io::ParseResult::Consumed(5))),
+                        "{reader}"
+                    );
+                    std::task::Poll::Ready(5)
+                }
+            };
+            assert!(
+                matches!(consumed, std::task::Poll::Ready(5)),
+                "{reader} lent={lent}: the read resolves with the request"
+            );
+            assert_eq!(
+                el.driver.park_blocker(conn_index),
+                Some(ParkBlocker::NotOffered),
+                "{reader} lent={lent}: an offer from inside the callback must not stand"
+            );
+            assert!(
+                !el.driver.park_carry.contains_key(&conn_index),
+                "{reader} lent={lent}: and must not leave state to ship"
+            );
+        }
+    }
+
+    /// A reader callback on another connection, run from inside A's
+    /// callback, restores A as the running callback when it returns. A's
+    /// reader is `with_bytes`, so A's bytes are out of the driver and only the
+    /// restored guard declines the offer.
+    #[test]
+    fn a_nested_reader_callback_restores_the_outer_connection() {
+        let mut el = make_test_loop();
+        let conn_a = accept_connection(&mut el);
+        let conn_b = accept_connection(&mut el);
+        el.driver.accumulators.append(conn_a, b"GET a");
+        el.driver.accumulators.append(conn_b, b"GET b");
+        // A standing offer that only `offer_for_park` reaching `offer_park`
+        // clears.
+        el.driver.park_offered[conn_a as usize] = true;
+        el.driver.park_carry.insert(conn_a, ParkState::new(0u8));
+        let ctx_a = ConnCtx::new(conn_a, el.driver.connections.generation(conn_a));
+        let ctx_b = ConnCtx::new(conn_b, el.driver.connections.generation(conn_b));
+        let waker = noop_waker();
+        let mut fut = std::pin::pin!(ctx_a.with_bytes(|b| {
+            let inner = ctx_b.try_with_data(|d| crate::runtime::io::ParseResult::Consumed(d.len()));
+            assert!(inner.is_some(), "B's callback ran");
+            ctx_a.offer_for_park(Some(ParkState::new(5u8)));
+            crate::runtime::io::ParseResult::Consumed(b.len())
+        }));
+        let consumed = with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            fut.as_mut().poll(&mut cx)
+        });
+        assert!(matches!(consumed, std::task::Poll::Ready(5)));
+        assert!(
+            !el.driver.park_offered[conn_a as usize],
+            "A's callback is still running once B's returns: the offer must not stand"
+        );
+        assert!(!el.driver.park_carry.contains_key(&conn_a));
+    }
+
+    /// A declined offer also clears an offer and deposit already standing.
+    #[test]
+    fn a_declined_offer_clears_an_earlier_offer() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        assert!(el.driver.offer_park(conn_index, Some(ParkState::new(4u8))));
+        // Bytes reach the slot by a path that does not withdraw the offer.
+        el.driver.accumulators.append(conn_index, b"GET w");
+        assert!(!el.driver.offer_park(conn_index, None));
+        assert!(!el.driver.park_offered[conn_index as usize]);
+        assert!(!el.driver.park_carry.contains_key(&conn_index));
+    }
+
+    /// The other half of `offer_park`: at an idle point an offer made
+    /// through the public handle stands and its state is deposited.
+    #[test]
+    fn an_offer_at_an_idle_point_stands() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        with_driver_state(&mut el, || ctx.offer_for_park(Some(ParkState::new(2u8))));
+        assert!(el.driver.park_offered[conn_index as usize]);
+        assert!(el.driver.park_carry.contains_key(&conn_index));
+        assert_eq!(el.driver.park_blocker(conn_index), None);
     }
 
     /// Slots are recycled by generation. A new occupant inheriting the
