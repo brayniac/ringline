@@ -1,0 +1,69 @@
+# Build the arrival-log A/B binaries once (validation host) and upload them as
+# one artifact for every measurement run (`arrival-log-ab.toml`).
+#
+# One tree, two builds: A with `--cfg ringline_no_arrival_log` (the receive
+# arrival log compiled out), B without (the log on). Server and client are
+# built for each, since the log runs on every connection, the load
+# generator's included (docs/recv-arrival-times-design.md, "Cost").
+# No target-cpu=native: the validation host and the hypervisors differ.
+name = "ringline arrival-log A/B build ({ref})"
+
+[params]
+ref  = "feat/recv-arrival-times"
+repo = "https://github.com/brayniac/ringline"
+
+[[jobs]]
+name = "build"
+tags = ["validation"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+shape = "z4.c"
+image = "spool/images/debian-13-ci-20260912.1@golden"
+slots = 1
+memory_gib = 4
+ports = 0
+gpu = false
+payload_timeout = 3600
+artifacts = ["/home/anvil/bench-bins.tgz", "/home/anvil/build.log"]
+upload = true
+payload = '''
+set -uo pipefail
+cd /home/anvil
+{
+  cat /etc/anvil-instance.json
+  mkdir -p out
+  git clone -q {repo} src && git -C src checkout -q {ref}
+  cd src
+  echo "== $(git log --oneline -1)"
+  # Separate target dirs: a RUSTFLAGS change rebuilds everything anyway, and
+  # one dir per arm keeps a failed build from leaving the other arm's binary
+  # in place under this arm's name.
+  RUSTFLAGS="--cfg ringline_no_arrival_log" CARGO_TARGET_DIR=/home/anvil/target-a \
+    cargo build --locked --release -p ringline-bench --bin bench-server --bin bench-client || exit 1
+  cp /home/anvil/target-a/release/bench-server ../out/bench-server-a
+  cp /home/anvil/target-a/release/bench-client ../out/bench-client-a
+  CARGO_TARGET_DIR=/home/anvil/target-b \
+    cargo build --locked --release -p ringline-bench --bin bench-server --bin bench-client || exit 1
+  cp /home/anvil/target-b/release/bench-server ../out/bench-server-b
+  cp /home/anvil/target-b/release/bench-client ../out/bench-client-b
+  cd ..
+  ( cd out && sha256sum * )
+  # Each server must be io_uring, and A and B must differ. Two arms that are
+  # the same binary report a dead heat, which reads as a result.
+  for arm in a b; do
+    got=$(./out/bench-server-$arm --print-backend)
+    [ "$got" = "io_uring" ] || { echo "BACKEND MISMATCH: $arm built as $got"; exit 1; }
+  done
+  for bin in bench-server bench-client; do
+    if cmp -s out/$bin-a out/$bin-b; then
+      echo "IDENTICAL: $bin-a and $bin-b"; exit 1
+    fi
+  done
+  echo "arms differ"
+  tar czf bench-bins.tgz out
+} 2>&1 | tee /home/anvil/build.log
+rc=${PIPESTATUS[0]}
+echo "build_status=$rc" | tee -a /home/anvil/build.log
+exit 0
+'''
