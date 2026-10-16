@@ -5,14 +5,15 @@
 # from `ref`. Server and client are built for each, since the log runs on
 # every connection, the load generator's included
 # (docs/recv-arrival-times-design.md, "Cost"). A and B differ in everything
-# between the two commits, not only the log.
+# between the two commits, not only the log. Both must be reachable from a
+# clone of `repo`; pass `repo` and `ref` to build an unmerged branch.
 # No target-cpu=native: the validation host and the hypervisors differ.
 name = "ringline arrival-log A/B build ({ref})"
 
 [params]
-ref  = "feat/recv-arrival-times"
+ref   = "main"
 ref_a = "811c489"
-repo = "https://github.com/brayniac/ringline"
+repo  = "https://github.com/ringline-rs/ringline"
 
 [[jobs]]
 name = "build"

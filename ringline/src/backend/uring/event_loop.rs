@@ -14353,8 +14353,8 @@ mod tests {
     }
 
     /// A log whose bytes a non-reporting consumer took is trimmed by a
-    /// record once it reaches the 1024-entry cap, rather than merging there
-    /// for good. 600 unread batches set the trim threshold past 512 entries;
+    /// record once it reaches the 1024-entry cap, instead of merging on
+    /// every later record. 600 unread batches set the trim threshold past 512 entries;
     /// the threshold is capped at 1024.
     #[test]
     fn a_log_drained_without_readers_is_trimmed_at_the_cap() {
@@ -14559,7 +14559,7 @@ mod tests {
     }
 
     /// A slot reused by a new connection starts with an empty log, and the
-    /// old handle reads `None`.
+    /// old handle reads `None`, also after the new connection has read.
     #[test]
     fn a_reused_slot_starts_with_an_empty_arrival_log() {
         let mut el = make_test_loop();
@@ -14583,6 +14583,15 @@ mod tests {
         assert_eq!(el.driver.arrival[reused as usize].len(), 0);
         with_driver_state(&mut el, || {
             assert!(new.recv_arrival().is_none());
+            assert!(old.recv_arrival().is_none());
+        });
+
+        // Once the new connection has read, the old handle still reads None.
+        deliver_in_batch(&mut el, reused, 1, b"c\n", at(base, 2));
+        let (_, a) = read_line(&mut el, new);
+        assert_eq!(times(a), Some((at(base, 2), at(base, 2))));
+        with_driver_state(&mut el, || {
+            assert!(new.recv_arrival().is_some());
             assert!(old.recv_arrival().is_none());
         });
     }

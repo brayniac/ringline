@@ -103,6 +103,10 @@ pub(crate) struct ArrivalLog {
     after_trim: usize,
     /// Times of the bytes the most recent reporting reader call consumed.
     latest: Option<RecvArrival>,
+    /// Reader calls that counted `CLAMPED`. The metric is process-wide, so
+    /// tests read this.
+    #[cfg(test)]
+    clamped: u32,
 }
 
 impl ArrivalLog {
@@ -223,6 +227,10 @@ impl ArrivalLog {
     fn range_times(&mut self, start: u64, end: u64) -> Option<RecvArrival> {
         if self.entries.is_empty() || start < self.base || end > self.delivered {
             crate::metrics::RECV_ARRIVAL.increment(crate::metrics::recv_arrival::CLAMPED);
+            #[cfg(test)]
+            {
+                self.clamped += 1;
+            }
         }
         self.drop_ending_by(start, 1);
         let first = self.entries.front()?.1;
@@ -282,6 +290,7 @@ mod tests {
         let a = log.latest().unwrap();
         assert_eq!((a.first(), a.last()), (t(base, 1), t(base, 2)));
         assert_eq!(log.len(), 0);
+        assert_eq!(log.clamped, 0, "reads inside the log are not clamped");
     }
 
     #[test]
@@ -358,6 +367,7 @@ mod tests {
             counter(crate::metrics::recv_arrival::CLAMPED) > clamped_before,
             "the lookup below base is counted"
         );
+        assert_eq!(log.clamped, 1, "counted once");
         let a = log.latest().unwrap();
         assert_eq!((a.first(), a.last()), (t(base, 2), t(base, 2)));
     }
@@ -378,6 +388,7 @@ mod tests {
         assert_eq!((a.first(), a.last()), (t(base, 3), t(base, 4)));
         assert_eq!(log.len(), 1);
         assert_eq!(log.base, 12);
+        assert_eq!(log.clamped, 0);
     }
 
     #[test]
@@ -396,6 +407,7 @@ mod tests {
             counter(crate::metrics::recv_arrival::CLAMPED) > clamped_before,
             "the range past delivered is counted"
         );
+        assert_eq!(log.clamped, 1, "counted once");
         let a = log.latest().unwrap();
         assert_eq!((a.first(), a.last()), (t(base, 1), t(base, 2)));
         assert_eq!(log.len(), 0);
@@ -407,6 +419,7 @@ mod tests {
         let clamped_before = counter(crate::metrics::recv_arrival::CLAMPED);
         log.settle_read(4, 0, true);
         assert!(counter(crate::metrics::recv_arrival::CLAMPED) > clamped_before);
+        assert_eq!(log.clamped, 1, "counted once");
         assert!(log.latest().is_none());
     }
 

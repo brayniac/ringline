@@ -4018,7 +4018,7 @@ impl Connection {
     ///
     /// Returns `None` until a reader call has consumed a byte, after a call
     /// that consumed none or resolved at end of stream, and once the
-    /// connection's slot has been reused.
+    /// connection has been torn down, whether or not its slot is reused.
     ///
     /// Read it before the task's next `.await`. A task that runs two reader
     /// calls on one connection at once, for example with `join!`, cannot tell

@@ -19,8 +19,9 @@
 #
 # With `profile = "1"` the server records a system-wide `perf` profile (no
 # call graphs) for 10 s, starting 12 s after the server is ready, and uploads
-# the reports in `profile.tgz`. The client's first cell has started by then
-# (5 s warmup, 20 s measured). Profiled runs are for attribution only; the
+# the reports in `profile.tgz`. The profile covers the first cell in `cells`,
+# which has started by then (5 s warmup, 20 s measured); pass
+# `cells = "64:16"` to profile that cell alone. Profiled runs are for attribution only; the
 # sampling costs CPU, so their CPU time per request is not compared with
 # unprofiled runs. `perf_artifact` is a tarball of Debian's `perf` and the
 # libraries it needs (`out/perf/perf`, `out/perf/lib`), which the base image
@@ -116,7 +117,7 @@ if [ "{profile}" = "1" ] && command -v perf >/dev/null; then
   sudo perf report -i prof/perf.data --stdio --no-children --sort comm,dso,sym --percent-limit 0.01 2>/dev/null | grep -v '^#' | grep -v '^$' | head -1000 > prof/comm-sym.txt
   sudo rm -f prof/perf.data
   echo "-- dso"; head -15 prof/dso.txt
-  echo "-- arrival symbols"; grep -E "arrival|recv_buffered|settle_read|time_at|clock_gettime" prof/sym.txt
+  echo "-- arrival symbols"; grep -E "arrival|recv_buffered|settle_read|clock_gettime" prof/sym.txt
 fi
 tar czf profile.tgz prof
 '''

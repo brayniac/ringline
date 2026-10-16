@@ -472,27 +472,44 @@ SystemsLab with `experiments/arrival-log-ab-build.toml` and
 forward` (`with_data` and `forward_recv_buf`, so its reads report) with 4
 workers; the load generator is `bench-client --runtime ringline` with 16
 threads, whose reads also use `with_data`. Arm B has the log; arm A was built
-from the same tree with the log compiled out by a `cfg` that has since been
+from the same commit with the log compiled out by a `cfg` that has since been
 removed. The build spec now builds arm A from `ref_a`, a commit without the
 log. Client CPU stayed below 13 of 56 cores in every run.
 
-| Measurement | Runs | Result |
-|---|---|---|
-| Closed loop, 64 and 4,096 connections, depth 1 and 16: throughput, p99 | 5 A, 5 B per cell | Inconclusive in every cell: the A spread (range over median) was 5.5–18% |
-| Open loop, 64 conns at 141,038/s and 4,096 at 174,945/s: server CPU per request | 5 A, 5 B | B−A −2.10% and +0.34%, A spread 1.4% and 1.2%. At 27–30 µs per request this cannot show a cost below about 0.4 µs |
-| Closed loop 64:16, server CPU per request | 5 A, 5 B | B−A +2.7%, A spread 1.5% |
-| The same, repeated | 8 A, 8 B | B−A −0.58%, A spread 8.6% |
-| `perf record -a` in the server VM, 10 s at 64:16 | 3 B | The log's functions (`recv_buffered`, `settle_read`, `add`, `record_arrival`, `arrival_settle`) take 0.33–0.43% of samples, about 0.5% of the server's busy CPU or 13 ns per request |
+Two B builds were measured. The first batch ran a7d9abc, whose reader calls
+binary-searched the log for both ends of the range. The repeat and the
+profiles ran 2158324, whose reader calls read the front of the log, as the
+code does now.
 
-The +2.7% did not reproduce, and the closed-loop CPU time per request varies
-by up to 9% between runs on this rig, so it cannot resolve a cost of a few
-percent. The profile gives the cost directly. In the same profile the server
-spends about 75% of its samples in the kernel and about 3% in user space.
-Timer sampling charges a cache miss to the function that waits on it, so
-the 0.5% includes the log's own misses.
+| Measurement | B build | Runs | Result |
+|---|---|---|---|
+| Closed loop, 64 and 4,096 connections, depth 1 and 16: throughput, p99 | a7d9abc | 5 A, 5 B per cell | Inconclusive in every cell: the A spread (range over median) was 5.5–18% |
+| The same cells: server CPU per request | a7d9abc | 5 A, 5 B per cell | B−A −0.63% (64:1), +2.71% (64:16), +4.46% (4,096:1), +0.55% (4,096:16); A spread 4.5%, 1.5%, 8.8%, 7.3% |
+| Open loop, 64 conns at 141,038/s and 4,096 at 174,945/s: server CPU per request | a7d9abc | 5 A, 5 B | B−A −2.10% and +0.34%, A spread 1.4% and 1.2%. At 27–30 µs per request this cannot show a cost below about 0.4 µs |
+| Closed loop 64:16, server CPU per request | 2158324 | 8 A, 8 B | B−A −0.58%, A spread 8.6% |
+| `perf record -a` in the server VM, 10 s at 64:16 | 2158324 | 1 A, 3 B | The self time of the log's functions (`recv_buffered`, `settle_read`, `add`, `record_arrival`, `arrival_settle`) is 0.33–0.43% of samples, 0.40–0.52% of non-idle samples, 10–13 ns per request. The server binary's share of samples is 3.02% in A and 3.37–3.52% in B |
 
-A loopback profile on an 8-vCPU arm64 VM (2 server workers) gives 0.53–0.76%
-of the server's samples.
+The 64:16 CPU result of +2.7% was not repeated on a7d9abc; the repeat on
+2158324 showed −0.58%, and closed-loop CPU time per request varies by up to
+9% between runs on this rig. A loopback profile gives the log's functions
+the same share in both builds (0.56% and 0.55% of the server's samples, one
+run each).
+
+The profile counts the self time of the log's functions. Code inlined into
+callers and cache misses the log causes in other code are not attributed to
+them. The difference in the server binary's share between A and B, 0.35–0.50
+points, matches the attributed share. Timer sampling charges a cache miss to
+the function that waits on it, so the attributed share includes the misses
+in the log's own functions. Only 64:16 was profiled. At 4,096 connections
+each worker holds about 1,024 logs, where misses on per-connection data are
+more likely; that case has no profile.
+
+In the same profile the server spends about 75% of its samples in the kernel
+and about 3% in user space. A loopback profile on an 8-vCPU arm64 VM (2
+server workers, 64 connections, depth 16) gives the log's functions
+0.53–0.76% of the server's samples over four runs whose throughput differed
+fourfold (2.0–8.7 M requests/s) under contention from other load on the
+host.
 
 ## Tests
 
@@ -525,11 +542,13 @@ below or, by default, removing the record or trim it covers.
 - A batch whose records consume and refill the log in one batch extends or
   pushes correctly (a recv sink, then a lend).
 - 1025 unread batches merge entries, count the merge, and leave 1024 entries.
-- A lookup below `base` counts `CLAMPED`.
+- A read whose range starts below `base` or ends past `delivered`, or that
+  reads an empty log, counts `CLAMPED` once.
 - A park that carries bytes leaves `delivered >= buffered` on the adopting
   worker.
 - A slot reused by a new connection starts with an empty log and
-  `recv_arrival() == None`.
+  `recv_arrival() == None`; the old connection's handle reads `None`, also
+  after the new connection has read.
 - A reader call that consumes nothing leaves `recv_arrival() == None`, and so
   does a `try_with_data` that finds nothing buffered.
 - On mio, a forward source re-read by `drain_forward_resumes` gets a batch of
