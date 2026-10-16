@@ -14354,8 +14354,8 @@ mod tests {
 
     /// A log whose bytes a non-reporting consumer took is trimmed by a
     /// record once it reaches the 1024-entry cap, instead of merging on
-    /// every later record. 600 unread batches set the trim threshold past 512 entries;
-    /// the threshold is capped at 1024.
+    /// every later record. 600 unread batches set the trim threshold past
+    /// 512 entries; the threshold is capped at 1024.
     #[test]
     fn a_log_drained_without_readers_is_trimmed_at_the_cap() {
         let mut el = make_test_loop();

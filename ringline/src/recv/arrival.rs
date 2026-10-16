@@ -482,7 +482,7 @@ mod tests {
     }
 
     #[test]
-    fn clear_resets_every_field() {
+    fn clear_resets_offsets_entries_and_latest() {
         let base = Instant::now();
         let mut clock = BatchClock::new();
         let mut log = ArrivalLog::default();
