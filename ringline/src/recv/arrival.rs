@@ -148,13 +148,7 @@ impl ArrivalLog {
     /// Drop the entries whose run ends at or below `consumed`, the first
     /// offset not yet consumed.
     pub(crate) fn trim(&mut self, consumed: u64) {
-        while let Some(&(end, _)) = self.entries.front() {
-            if end > consumed {
-                break;
-            }
-            self.base = end;
-            self.entries.pop_front();
-        }
+        self.drop_ending_by(consumed, 0);
         self.after_trim = self.entries.len();
         if self.entries.len() < TRIM_MIN_ENTRIES && self.entries.capacity() > SHRINK_ABOVE {
             self.entries.shrink_to(TRIM_MIN_ENTRIES);
@@ -189,6 +183,18 @@ impl ArrivalLog {
         self.newest_batch = seq;
     }
 
+    /// Drop entries from the front while their run ends at or below
+    /// `offset` and more than `keep` entries remain.
+    fn drop_ending_by(&mut self, offset: u64, keep: usize) {
+        while self.entries.len() > keep
+            && let Some(&(end, _)) = self.entries.front()
+            && end <= offset
+        {
+            self.base = end;
+            self.entries.pop_front();
+        }
+    }
+
     /// Settle a reporting reader call. `before` and `after` are the
     /// connection's `buffered` count at the start of the call's resolving poll
     /// and once it has applied the parser's result. `report` is false for a
@@ -207,34 +213,29 @@ impl ArrivalLog {
         let start = self.delivered.saturating_sub(before as u64);
         let end = start + k;
         self.latest = if report {
-            match (self.time_at(start), self.time_at(end - 1)) {
-                (Some(first), Some(last)) => Some(RecvArrival { first, last }),
-                _ => None,
-            }
+            self.range_times(start, end)
         } else {
             None
         };
         self.trim(end);
     }
 
-    /// The arrival time of the byte at `offset`. An offset outside the log
-    /// returns the nearest end's time and counts `CLAMPED`; an empty log
+    /// The times of the first and last byte of `start..end`. Drops the
+    /// entries whose run ends before the last byte, so each lookup reads the
+    /// front entry: the first after dropping the entries that end at or
+    /// below `start`, the last after dropping those that end at or below
+    /// `end - 1`. A range that starts below `base` or ends past `delivered`
+    /// takes the nearest entry's time and counts `CLAMPED`; an empty log
     /// returns `None` and counts `CLAMPED` too.
-    fn time_at(&self, offset: u64) -> Option<Instant> {
-        let (Some(oldest), Some(newest)) = (self.entries.front(), self.entries.back()) else {
+    fn range_times(&mut self, start: u64, end: u64) -> Option<RecvArrival> {
+        if self.entries.is_empty() || start < self.base || end > self.delivered {
             crate::metrics::RECV_ARRIVAL.increment(crate::metrics::recv_arrival::CLAMPED);
-            return None;
-        };
-        if offset < self.base {
-            crate::metrics::RECV_ARRIVAL.increment(crate::metrics::recv_arrival::CLAMPED);
-            return Some(oldest.1);
         }
-        if offset >= self.delivered {
-            crate::metrics::RECV_ARRIVAL.increment(crate::metrics::recv_arrival::CLAMPED);
-            return Some(newest.1);
-        }
-        let i = self.entries.partition_point(|&(end, _)| end <= offset);
-        Some(self.entries[i].1)
+        self.drop_ending_by(start, 1);
+        let first = self.entries.front()?.1;
+        self.drop_ending_by(end - 1, 1);
+        let last = self.entries.front()?.1;
+        Some(RecvArrival { first, last })
     }
 
     #[cfg(test)]
@@ -366,6 +367,54 @@ mod tests {
         );
         let a = log.latest().unwrap();
         assert_eq!((a.first(), a.last()), (t(base, 2), t(base, 2)));
+    }
+
+    #[test]
+    fn a_read_skips_entries_consumed_without_a_settle() {
+        let base = Instant::now();
+        let mut clock = BatchClock::new();
+        let mut log = ArrivalLog::default();
+        for i in 1..=4 {
+            clock.begin_at(t(base, i));
+            log.add(4, &mut clock);
+        }
+        // Bytes 0..8 were taken by a non-reporting consumer: 8 remain held.
+        // The read takes 8..14, which spans batches 3 and 4.
+        log.settle_read(8, 2, true);
+        let a = log.latest().unwrap();
+        assert_eq!((a.first(), a.last()), (t(base, 3), t(base, 4)));
+        assert_eq!(log.len(), 1);
+        assert_eq!(log.base, 12);
+    }
+
+    #[test]
+    fn a_range_past_delivered_takes_the_newest_time() {
+        let base = Instant::now();
+        let mut clock = BatchClock::new();
+        let mut log = ArrivalLog::default();
+        clock.begin_at(t(base, 1));
+        log.add(4, &mut clock);
+        clock.begin_at(t(base, 2));
+        log.add(4, &mut clock);
+        // A held count larger than delivered puts the range's end past it.
+        let clamped_before = counter(crate::metrics::recv_arrival::CLAMPED);
+        log.settle_read(10, 0, true);
+        assert!(
+            counter(crate::metrics::recv_arrival::CLAMPED) > clamped_before,
+            "the range past delivered is counted"
+        );
+        let a = log.latest().unwrap();
+        assert_eq!((a.first(), a.last()), (t(base, 1), t(base, 2)));
+        assert_eq!(log.len(), 0);
+    }
+
+    #[test]
+    fn a_read_of_an_empty_log_reports_nothing() {
+        let mut log = ArrivalLog::default();
+        let clamped_before = counter(crate::metrics::recv_arrival::CLAMPED);
+        log.settle_read(4, 0, true);
+        assert!(counter(crate::metrics::recv_arrival::CLAMPED) > clamped_before);
+        assert!(log.latest().is_none());
     }
 
     #[test]

@@ -151,10 +151,16 @@ in debug builds.)
 When `k > 0`, the call:
 
 1. Sets `start = delivered - before`.
-2. Looks up the entries covering `start` and `start + k - 1`, and stores both
-   times in `latest`.
-3. Drops entries whose end is at or below `start + k`, sets `base` to the end
+2. Drops entries whose end is at or below `start`; the front entry then
+   covers `start`, and its time is the first time.
+3. Drops entries whose end is at or below `start + k - 1`; the front entry
+   then covers the last byte, and its time is the last time. Both times are
+   stored in `latest`.
+4. Drops entries whose end is at or below `start + k`, sets `base` to the end
    of the last one dropped, and sets `after_trim`.
+
+Steps 2 and 3 never drop the newest entry. Each step reads the front of the
+deque, so a call costs one pop per entry it drops and no search.
 
 When the resolving poll has `k == 0`, or `try_with_data` returns `None` with a
 matching generation, `latest` is set to `None`.
@@ -170,12 +176,12 @@ Cases at the edges:
 - `with_segments` closes the connection when the hold overflows and resolves
   to `Ok(0)` with `k > 0`. It trims by `k` and sets `latest` to `None`.
 
-A lookup of an offset below `base` returns the oldest entry's time, and a
-lookup at or above `delivered` returns the newest entry's time. Both count
-`metrics::recv_arrival::CLAMPED`, as does a lookup in an empty log, which
-returns no time; one reader call can count twice. The counter counts only
-these lookups; the reordering cases under "Limits" return wrong times without
-it.
+A range that starts below `base` takes the oldest entry's time for its first
+byte, and a range that ends past `delivered` takes the newest entry's time for
+its last byte. Both count `metrics::recv_arrival::CLAMPED`, as does a lookup in
+an empty log, which returns no time; a reader call counts at most once. The
+counter counts only these lookups; the reordering cases under "Limits" return
+wrong times without it.
 
 The reporting readers are the public readers on `Connection` and `RecvHalf`:
 `with_data`, `with_data_result`, `with_bytes`, `try_with_data`, and, on
@@ -440,7 +446,7 @@ It is not part of this design.
   backlog of more than 1024 batches) sums `buffered` on every record.
 - Per TLS feed: two `buffered` sums.
 - Per poll of a reporting reader: one `buffered` sum, and on the resolving
-  poll a second, two binary searches over the log, and a trim from the front.
+  poll a second, and pops from the front of the log, one per entry dropped.
   `buffered` is a few lengths plus the entries of `segment_hold` and
   `recv_hold`.
 - Memory, fixed: about 96 bytes per connection slot (the deque header, four
