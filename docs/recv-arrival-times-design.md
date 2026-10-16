@@ -331,23 +331,9 @@ it; cachecannon and cachecannon-pools only read it.
 
 ### CHANGELOG
 
-In `Unreleased`, under the first `### Changed`, `### Added` and `### Fixed`
-headings:
-
-- `Changed`, breaking: `CommandResult` is `#[non_exhaustive]`.
-- `Changed`, breaking in behaviour: `CommandResult::ttfb_ns` is `Some` for
-  every instrumented operation that read a byte. In 0.6 it was `None` unless
-  the removed kernel timestamp mode was on, and values are not comparable with
-  ones recorded under that mode.
-- `Added`: `CommandResult::ttlb_ns`, `RecvArrival`,
-  `Connection::recv_arrival` / `RecvHalf::recv_arrival`, and the
-  `recv_arrival` metric group.
-- `Fixed`: `CommandResult::rx_bytes` no longer reports the previous
-  operation's count after a send error, and the guarded SET paths record a
-  `CommandResult` on errors.
-- The removal entry for the kernel timestamp mode drops
-  `CommandResult::ttfb_ns` from its list and from its migration text,
-  including the sentence "Nothing in this change replaces `ttfb_ns`."
+The entries are in `CHANGELOG.md` under `Unreleased`: `Changed` for
+`#[non_exhaustive]` and `ttfb_ns`, `Added` for the log and `ttlb_ns`, `Fixed`
+for `rx_bytes` and the guarded SET records.
 
 ## What the time measures
 
@@ -366,7 +352,9 @@ until the reading task is polled and parses, which `latency_ns` does.
 - The request side is the client's own `Instant` (see "Client crates").
 
 I don't know how large the gap between receipt and batch time is under a
-loaded client. Measuring it needs a build used only for the measurement.
+loaded client. Measuring it needs a build used only for the measurement and
+a bpftrace script. Neither exists yet; the rest of this section describes them
+as proposed.
 
 The build logs, per record, the connection's socket 4-tuple, the batch time
 and `delivered` after the record. The batch time is raw `CLOCK_MONOTONIC`
@@ -436,7 +424,8 @@ It is not part of this design.
 - #670 made `park_blocker` refuse a connection with a lent buffer in
   `pending_recv_bufs`.
 - #671 (the fix for #669) added `Driver::holds_unread`, which `park_blocker`
-  and `offer_park` share. This work rewrites it in terms of `recv_buffered`.
+  and `offer_park` share. It is now `recv_buffered(conn) > 0 ||
+  segment_pinned.is_some()`.
 
 ## Cost
 
@@ -464,7 +453,7 @@ It is not part of this design.
   headers that `recv_buffered` reads are touched per record and per read.
 - Memory, worst case: a connection whose peer sends more than 1024 small
   segments while its parser returns `NeedMore` holds a 24 KiB log, six times
-  the default 4 KiB accumulator.
+  the accumulator's default initial capacity of 4 KiB.
 
 The log is always on. The arrival times were judged worth a cost estimated
 at about 1–3% of server CPU per request. The estimate comes from

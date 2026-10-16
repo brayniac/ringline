@@ -2432,9 +2432,29 @@ mod tests {
         base + Duration::from_millis(ms)
     }
 
+    /// Wait until the server side of `conn_index` holds at least `n` unread
+    /// bytes. On macOS, loopback bytes are not always readable when the
+    /// client's `write_all` returns.
+    fn wait_for_bytes(el: &AsyncEventLoop<NoopHandler>, conn_index: u32, n: usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut peek = vec![0u8; n];
+        loop {
+            let stream = el.driver.tcp_streams[conn_index as usize]
+                .as_ref()
+                .expect("the connection has a stream");
+            match stream.peek(&mut peek) {
+                Ok(got) if got >= n => return,
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => panic!("peek: {e}"),
+            }
+            assert!(Instant::now() < deadline, "the written bytes never arrived");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     /// Write `data` from the client and read it in a batch whose time is
-    /// `time`. Waits until the server socket holds all of `data`: on macOS
-    /// loopback bytes are not always readable when `write_all` returns.
+    /// `time`. The socket must hold no unread bytes before the write.
     fn read_in_batch(
         el: &mut AsyncEventLoop<NoopHandler>,
         client: &mut std::net::TcpStream,
@@ -2444,21 +2464,7 @@ mod tests {
     ) {
         use std::io::Write;
         client.write_all(data).expect("client write");
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut peek = vec![0u8; data.len()];
-        loop {
-            let stream = el.driver.tcp_streams[conn_index as usize]
-                .as_ref()
-                .expect("the connection has a stream");
-            match stream.peek(&mut peek) {
-                Ok(n) if n >= data.len() => break,
-                Ok(_) => {}
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                Err(e) => panic!("peek: {e}"),
-            }
-            assert!(Instant::now() < deadline, "the written bytes never arrived");
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        wait_for_bytes(el, conn_index, data.len());
         el.driver.recv_batch.begin_at(time);
         let mut buf = vec![0u8; 4096];
         el.handle_readable(conn_index, &mut buf);
@@ -2559,6 +2565,7 @@ mod tests {
         el.driver.recv_batch.begin_at(Instant::now());
         el.driver.record_arrival(source, 1);
         client.write_all(b"x").expect("client write");
+        wait_for_bytes(&el, source, 1);
         el.driver.mark_forward_resume(source);
         let mut buf = vec![0u8; 4096];
         assert!(el.drain_forward_resumes(&mut buf));
