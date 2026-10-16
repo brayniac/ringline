@@ -467,8 +467,7 @@ It is not part of this design.
   the default 4 KiB accumulator.
 
 The log is always on. The arrival times were judged worth a cost estimated
-at about 1–3% of server CPU per request. The basis of that estimate and its
-limits are below.
+at about 1–3% of server CPU per request.
 
 The cost was measured on hv01 and hv02 through SystemsLab with
 `experiments/arrival-log-ab-build.toml` and `experiments/arrival-log-ab.toml`.
@@ -477,57 +476,62 @@ The server is `bench-server --echo-mode forward` (`with_data` and
 is `bench-client --runtime ringline` with 16 threads, whose reads also use
 `with_data`. Each arm's client was built from the same commit as its server,
 so arm B also adds the log to the load generator. Arm A was built from the
-same commit as arm B with a `cfg`, since removed, that compiled out the
-records, the `buffered` sums and the lookups; the per-slot logs, their clear
-at setup and release at teardown, and the batch counter remained. The build
-spec now builds arm A from `ref_a`, a commit without the log. Client CPU
-stayed below 13 of 56 cores in every run. A and B runs alternated (A B A B
-...), and each B run is compared with the A run before it.
+same commit as arm B with `--cfg ringline_no_arrival_log`, since removed,
+which compiled out the records, the `buffered` sums and the lookups; the
+per-slot logs, their clear at setup and release at teardown, and the batch
+counter remained. The build spec now builds arm A from `ref_a`, a commit
+without the log, so a rerun measures a different arm A. Client CPU stayed
+below 13 of 56 cores in every run. A and B runs alternated (A B A B ...),
+and each B run is compared with the A run before it.
 
-Two B builds were measured. The first set of runs used a7d9abc, whose reader
-calls binary-searched the log for both ends of the range. The repeat and the
+Two B builds were measured, both commits in the history of the pull request
+that added the log. The first set of runs used a7d9abc, whose reader calls
+binary-searched the log for both ends of the range. The 64:16 repeat and the
 profiles used 2158324, whose reader calls read the front of the log, as the
 code does now.
 
 | Measurement | B build | Runs | Result |
 |---|---|---|---|
-| Closed loop, 64 and 4,096 connections, depth 1 and 16: throughput, B/A per pair | a7d9abc | 5 pairs per cell | Median of the pairs +0.9% (64:1), −6.3% (64:16), −2.8% (4,096:1), −2.7% (4,096:16); B below A in 2, 3, 5 and 5 of 5 pairs. The A spread (range over median) was 5.5–18%. p99 was lower in B in every 4,096:1 pair and higher in every 4,096:16 pair, and mixed at 64 connections |
+| Closed loop, 64 and 4,096 connections, depth 1 and 16: throughput and p99, B/A per pair | a7d9abc | 5 pairs per cell | Throughput: median of the pairs +0.9% (64:1), −6.3% (64:16), −2.8% (4,096:1), −2.7% (4,096:16); B below A in 2, 3, 5 and 5 of 5 pairs. The A throughput spread (range over median) was 7.2–9.4%. p99 was lower in B in every 4,096:1 pair and higher in every 4,096:16 pair, and mixed at 64 connections; the A p99 spread was 5.5–18% |
 | The same cells: server CPU per request, B/A per pair | a7d9abc | 5 pairs per cell | Median of the pairs +0.3% (+73 ns, 64:1), +2.5% (+63 ns, 64:16), +3.0% (+577 ns, 4,096:1), +1.3% (+28 ns, 4,096:16); B above A in 3, 5, 5 and 5 of 5 pairs |
-| Open loop, 64 conns at 141,038/s and 4,096 at 174,945/s: server CPU per request, B/A per pair | a7d9abc | 5 pairs | Median of the pairs −2.1% (−619 ns, 64) and +0.2% (+43 ns, 4,096); B above A in 2 and 4 of 5 pairs. The A spread was 1.4% of 30 µs per request at 64 connections and 1.2% of 27 µs at 4,096, about 0.4 µs and 0.3 µs; the B spread was 7.3% and 2.0% |
+| The same cells: server CPU time per second, B/A per pair | a7d9abc | 5 pairs per cell | Median of the pairs +0.4% (64:1), −5.2% (64:16), +0.6% (4,096:1), −1.3% (4,096:16) |
+| Open loop, 64 conns at 141,038/s and 4,096 at 174,945/s (target rates): server CPU per request, B/A per pair | a7d9abc | 5 pairs | Median of the pairs −2.1% (−619 ns, 64) and +0.2% (+43 ns, 4,096); B above A in 2 and 4 of 5 pairs. The A spread was 1.4% of 30 µs per request at 64 connections and 1.2% of 27 µs at 4,096, about 0.4 µs and 0.3 µs; the B spread was 7.3% and 2.0% |
 | Closed loop 64:16, server CPU per request, B/A per pair | 2158324 | 8 pairs | Median of the pairs +0.4% (+10 ns); B above A in 5 of 8 pairs, which ranged from −4.6% to +6.5% |
 | `perf record -a` in the server VM, 10 s at 64:16 | 2158324 | 1 A, 3 B | The self time of the log's functions (`recv_buffered`, `settle_read`, `add`, `record_arrival`, `arrival_settle`) is 0.33–0.43% of samples, 8–11 ns per request. The server binary's share of samples is 3.01% in A and 3.39–3.58% in B |
 
 The 1–3% estimate rests on the a7d9abc runs at 64:16, 4,096:1 and 4,096:16,
 where B used more server CPU per request than the A run before it in every
-pair, and on the 4,096-connection throughput pairs, where B was lower in
-every pair. The reader code that ships is 2158324's. It was measured at
-64:16 only: its paired median, +0.4% or 10 ns per request, agrees with the
-profile, but its pairs spread too widely to exclude 2.5%. The
-4,096-connection cells were not measured on it.
+pair. In those runs B's server used about as much CPU time per second as
+A's; the higher CPU per request comes from B completing fewer requests. At
+4,096 connections the server ran at a nearly fixed 6.6–7.9 cores in both
+arms, so there the CPU-per-request and throughput rows are one result. These
+runs do not show whether the server's log or the client's lowered
+throughput.
+
+The reader code that ships is 2158324's. It was measured at 64:16 only: its
+paired median, +0.4% or 10 ns per request, agrees with the profile, but its
+pairs spread too widely to exclude 2.5%. The 4,096-connection cells were not
+measured on it.
 
 The a7d9abc cost is not a fixed time per request: 63 ns at 64:16, 577 ns at
 4,096:1 and 28 ns at 4,096:16. In the open-loop 4,096-connection cell, 577 ns
-would read as about +2.1%; it measured +0.2%. The open-loop 64-connection
-cell measured −2.1%, beyond its A spread in B's favour, with a B spread of
-7.3%. In closed loop the server's CPU per request moves with throughput, and
-arm B's client also runs the log, so part of the closed-loop difference may
-come from the client. I don't know how much.
+would read as about +2.1%; it measured +0.2%. Neither open-loop cell shows a
+cost.
 
 The profile attributes 0.33–0.43% of the server's samples to the log's own
 functions. The idle task takes 15–18% of the samples, and almost all of
-those are network softirq symbols; the idle-loop symbols take under 1%. A
-halted vCPU is not sampled, so the share of samples approximates the share of
-busy CPU: the samples per request (2.37–2.49 µs) match the CPU per request
-rezolus measured in the unprofiled 2158324 runs at 64:16 (2.38–2.63 µs). The
-server binary's share is 0.38–0.57 points higher in B than in the one A
-profile, 9–14 ns per request against the 8–11 ns attributed to the log's
-functions, so at 64:16 code inlined into the server binary or moved by layout
-adds a few ns per request at most. Only 64:16 was profiled. At 4,096
-connections each worker holds about 1,024 logs, where misses on
-per-connection data are more likely; that case has no profile.
-
-In the same profile the server spends about 75% of its samples in the kernel
-and about 3% in user space.
+those are network softirq symbols; the idle-loop symbols take under 1%. If a
+halted vCPU is not sampled, the share of samples is the share of busy CPU.
+As a consistency check, the samples per request in the profiled runs (2.37–2.49
+µs, at 2.60–2.74 M requests/s) fall in the range of the CPU per request
+rezolus measured in the unprofiled 2158324 runs at 64:16 (2.38–2.63 µs, at
+higher throughput). The server binary's share is 0.38–0.57 points higher in
+B than in the one A profile, 9–14 ns per request against the 8–11 ns
+attributed to the log's functions. With one A profile the A-to-A variation
+is unknown. Misses the log causes in kernel code are not attributed to it.
+Only 64:16 was profiled. At 4,096 connections each worker holds about 1,024
+logs, where misses on per-connection data are more likely; that case has no
+profile.
 
 ## Tests
 
