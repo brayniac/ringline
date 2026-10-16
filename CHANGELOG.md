@@ -19,10 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   mio. Each TCP connection keeps a log of arrival times against stream
   offsets, of at most 1024 entries of 24 bytes. The `ringline/recv_arrival`
   metric group counts lookups outside the log and merges at the cap. The
-  log is always on. In an A/B of a 64-byte echo server it added about 1–3%
-  to server CPU per request in closed loop; a profile attributes 0.3–0.4%
-  of the server's CPU time to the log's own functions. See
-  `docs/recv-arrival-times-design.md`.
+  log is always on, at an estimated 1–3% of server CPU per request: in an
+  A/B of a 64-byte echo server on an earlier reader, the paired medians were
+  +1.3% to +3.0% in three of four closed-loop cells. On the current reader a
+  profile attributes 0.3–0.4% of the server's CPU time to the log's own
+  functions. See `docs/recv-arrival-times-design.md`.
 - `ringline-redis`, `ringline-memcache`, `ringline-ping`:
   `CommandResult::ttlb_ns`, the time from the operation's start to the
   arrival of the response's last byte.

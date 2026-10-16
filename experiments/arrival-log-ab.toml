@@ -23,9 +23,9 @@
 # which has started by then (5 s warmup, 20 s measured); pass
 # `cells = "64:16"` to profile that cell alone. Profiled runs are for
 # attribution only; the sampling costs CPU, so their CPU time per request is
-# not compared with unprofiled runs. `perf_artifact` is a tarball of Debian's `perf` and the
-# libraries it needs (`out/perf/perf`, `out/perf/lib`), which the base image
-# lacks.
+# not compared with unprofiled runs. `perf_artifact` is a tarball of
+# Debian's `perf` and the libraries it needs (`out/perf/perf`,
+# `out/perf/lib`), which the base image lacks.
 #
 # Plan, fixed before running: five `a` and five `b` runs per mode,
 # alternating a b a b ..., closed-loop first. The open-loop rates are half
