@@ -478,7 +478,7 @@ log. Client CPU stayed below 13 of 56 cores in every run.
 
 | Measurement | Runs | Result |
 |---|---|---|
-| Closed loop, 64 and 4,096 connections, depth 1 and 16: throughput, p99 | 5 A, 5 B per cell | Inconclusive in every cell: the A spread (range over median) was 5.5–20% |
+| Closed loop, 64 and 4,096 connections, depth 1 and 16: throughput, p99 | 5 A, 5 B per cell | Inconclusive in every cell: the A spread (range over median) was 5.5–18% |
 | Open loop, 64 conns at 141,038/s and 4,096 at 174,945/s: server CPU per request | 5 A, 5 B | B−A −2.10% and +0.34%, A spread 1.4% and 1.2%. At 27–30 µs per request this cannot show a cost below about 0.4 µs |
 | Closed loop 64:16, server CPU per request | 5 A, 5 B | B−A +2.7%, A spread 1.5% |
 | The same, repeated | 8 A, 8 B | B−A −0.58%, A spread 8.6% |
