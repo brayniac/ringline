@@ -20,12 +20,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   offsets, of at most 1024 entries of 24 bytes. The `ringline/recv_arrival`
   metric group counts lookups outside the log and merges at the cap. The
   log is always on, at an estimated 1–3% of server CPU per request: in an
-  A/B of a 64-byte echo server with an earlier version of the lookup,
-  server CPU per request rose 1.3% to 3.0% in three of four closed-loop
-  cells, at 4,096 connections through lower throughput at the same server
-  CPU time; at fixed request rates no cost was measured. With the current
-  lookup, paired runs at one cell measured +0.4%, and a profile attributes
-  0.3–0.4% of the server's samples to the log's own functions. See
+  A/B of a 64-byte echo server with an earlier version of the lookup, the
+  median paired rise in server CPU per request was 1.3% to 3.0% in three
+  of four closed-loop cells, at 4,096 connections through lower throughput
+  at about the same server CPU time. In the open-loop 4,096-connection
+  cell, where that difference would have read as about +2%, none was
+  measured. With the current lookup, paired runs at one cell gave a median
+  of +0.4%, too spread to exclude 2.5%, and a profile attributes 0.3–0.4%
+  of the server's samples to the log's own functions. See
   `docs/recv-arrival-times-design.md`.
 - `ringline-redis`, `ringline-memcache`, `ringline-ping`:
   `CommandResult::ttlb_ns`, the time from the operation's start to the
