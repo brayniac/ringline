@@ -489,8 +489,8 @@ without the log, so a rerun measures a different arm A. Client CPU stayed
 below 13 of 56 cores in every run. A and B runs alternated (A B A B ...),
 and each B run is compared with the A run before it.
 
-Two B builds were measured, both commits in the history of the pull request
-that added the log. The first set of runs used a7d9abc, whose reader calls
+Two B builds were measured, both commits on #672 (`git fetch origin
+pull/672/head`). The first set of runs used a7d9abc, whose reader calls
 binary-searched the log for both ends of the range. The 64:16 repeat and the
 profiles used 2158324, whose reader calls read the front of the log, as the
 code does now.
