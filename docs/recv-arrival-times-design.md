@@ -471,7 +471,7 @@ at about 1–3% of server CPU per request. The estimate comes from
 closed-loop runs of an earlier version of the lookup; at 4,096 connections
 it appears as lower throughput at about the same server CPU time per second.
 In the open-loop 4,096-connection cell, where the closed-loop difference
-would have read as about +2%, none was measured. A profile of the current
+would have read as about +2%, it measured +0.2%. A profile of the current
 lookup attributes 0.33–0.43% of the server's samples to the log's functions.
 
 The cost was measured on hv01 and hv02 through SystemsLab with
@@ -525,9 +525,9 @@ measured on it.
 The a7d9abc difference in CPU per request is not a fixed time: 63 ns at
 64:16, 577 ns at 4,096:1 and 28 ns at 4,096:16. In the open-loop
 4,096-connection cell, 577 ns would read as about +2.1%; it measured +0.2%.
-In the open-loop 64-connection cell, 63–73 ns is about 0.2% of the 30 µs per
-request, below that cell's A spread of 1.4%, so that cell could not show
-it.
+In the open-loop 64-connection cell, 63 ns (64:16) to 73 ns (64:1) is about
+0.2% of the 30 µs of server CPU per request, and that cell's pairs ranged
+from −5.0% to +2.3%, so it could not show a difference that small.
 
 The profile attributes 0.33–0.43% of the server's samples to the log's own
 functions. The idle task takes 15–18% of the samples, and almost all of
@@ -540,9 +540,9 @@ of CPU per request rezolus measured in the unprofiled 2158324 runs at 64:16
 share is 0.38–0.57 points higher in B than in the one A profile, 9–14 ns per
 request against the 8–11 ns attributed to the log's functions. With one A
 profile the A-to-A variation is unknown. Misses the log causes in kernel
-code are not attributed to it. Only 64:16 was profiled. At 4,096 connections each worker holds about 1,024
-logs, where misses on per-connection data are more likely; that case has no
-profile.
+code are not attributed to it. Only 64:16 was profiled. At 4,096
+connections each worker holds about 1,024 logs, where misses on
+per-connection data are more likely; that case has no profile.
 
 ## Tests
 

@@ -24,8 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   median paired rise in server CPU per request was 1.3% to 3.0% in three
   of four closed-loop cells, at 4,096 connections through lower throughput
   at about the same server CPU time. In the open-loop 4,096-connection
-  cell, where that difference would have read as about +2%, none was
-  measured. With the current lookup, paired runs at one cell gave a median
+  cell, where that difference would have read as about +2%, it measured
+  +0.2%. With the current lookup, paired runs at one cell gave a median
   of +0.4%, too spread to exclude 2.5%, and a profile attributes 0.3–0.4%
   of the server's samples to the log's own functions. See
   `docs/recv-arrival-times-design.md`.
