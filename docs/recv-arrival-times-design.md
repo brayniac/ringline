@@ -467,7 +467,11 @@ It is not part of this design.
   the default 4 KiB accumulator.
 
 The log is always on. The arrival times were judged worth a cost estimated
-at about 1–3% of server CPU per request.
+at about 1–3% of server CPU per request. The estimate comes from
+closed-loop runs of an earlier version of the lookup; at 4,096 connections
+it appears as lower throughput at the same server CPU time per second. At
+fixed request rates no cost was measured, and a profile of the current
+lookup attributes 0.33–0.43% of the server's samples to the log's functions.
 
 The cost was measured on hv01 and hv02 through SystemsLab with
 `experiments/arrival-log-ab-build.toml` and `experiments/arrival-log-ab.toml`.
@@ -501,19 +505,23 @@ code does now.
 
 The 1–3% estimate rests on the a7d9abc runs at 64:16, 4,096:1 and 4,096:16,
 where B used more server CPU per request than the A run before it in every
-pair. In those runs B's server used about as much CPU time per second as
-A's; the higher CPU per request comes from B completing fewer requests. At
-4,096 connections the server ran at a nearly fixed 6.6–7.9 cores in both
-arms, so there the CPU-per-request and throughput rows are one result. These
-runs do not show whether the server's log or the client's lowered
-throughput.
+pair. Server CPU here is rezolus' CPU time summed over all vCPUs of the
+server VM, network softirq included. At 4,096 connections B's server used
+about as much CPU time per second as A's (medians +0.6% and −1.3%; 6.6–6.9
+cores at depth 1 and 7.3–7.9 at depth 16 in both arms), so there the higher
+CPU per request comes from B completing fewer requests, and the
+CPU-per-request and throughput rows are nearly one result. These runs do not
+show whether the server's log or the client's lowered throughput. At 64:16
+the server's CPU time per second moved with throughput in each pair, and B
+used more CPU per request in all five pairs, including the two where it
+completed more requests.
 
 The reader code that ships is 2158324's. It was measured at 64:16 only: its
 paired median, +0.4% or 10 ns per request, agrees with the profile, but its
 pairs spread too widely to exclude 2.5%. The 4,096-connection cells were not
 measured on it.
 
-The a7d9abc cost is not a fixed time per request: 63 ns at 64:16, 577 ns at
+The a7d9abc difference in CPU per request is not a fixed time: 63 ns at 64:16, 577 ns at
 4,096:1 and 28 ns at 4,096:16. In the open-loop 4,096-connection cell, 577 ns
 would read as about +2.1%; it measured +0.2%. Neither open-loop cell shows a
 cost.
@@ -522,10 +530,10 @@ The profile attributes 0.33–0.43% of the server's samples to the log's own
 functions. The idle task takes 15–18% of the samples, and almost all of
 those are network softirq symbols; the idle-loop symbols take under 1%. If a
 halted vCPU is not sampled, the share of samples is the share of busy CPU.
-As a consistency check, the samples per request in the profiled runs (2.37–2.49
-µs, at 2.60–2.74 M requests/s) fall in the range of the CPU per request
-rezolus measured in the unprofiled 2158324 runs at 64:16 (2.38–2.63 µs, at
-higher throughput). The server binary's share is 0.38–0.57 points higher in
+As a consistency check, the samples per request in the profiled runs
+(2.37–2.49 µs, at 2.60–2.74 M requests/s) are within 0.02 µs of the range of
+CPU per request rezolus measured in the unprofiled 2158324 runs at 64:16
+(2.38–2.63 µs, at higher throughput). The server binary's share is 0.38–0.57 points higher in
 B than in the one A profile, 9–14 ns per request against the 8–11 ns
 attributed to the log's functions. With one A profile the A-to-A variation
 is unknown. Misses the log causes in kernel code are not attributed to it.
