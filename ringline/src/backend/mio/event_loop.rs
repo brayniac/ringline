@@ -217,6 +217,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 Err(e) => return Err(crate::error::Error::Io(e)),
             }
 
+            // The readable sockets handled below are one batch: the reads
+            // among them share one arrival time, read by the first.
+            self.driver.recv_batch.begin();
+
             // 4. Handle events.
             // Collect events into a temporary vec to avoid borrow conflict
             // (self.driver.events borrows driver, but handlers need &mut driver).
@@ -490,6 +494,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             let idx = conn_index as usize;
             self.driver.tcp_streams[idx] = Some(mio_stream);
             self.driver.accumulators.reset(conn_index);
+            self.driver.arrival[idx].clear();
             // Defensive: a freshly allocated slot should have an empty send
             // queue, but if anything survived, its awaited sends must be
             // failed and its permits returned rather than dropped.
@@ -711,6 +716,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
         self.driver.forward_resume = still_blocked;
         let progressed = !ready.is_empty();
+        // These reads run after tasks, so they are a batch of their own.
+        if progressed {
+            self.driver.recv_batch.begin();
+        }
         for source in ready {
             // A TLS source's plaintext is already decrypted into the
             // accumulator, so it has to be moved on before another read is
@@ -815,6 +824,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     }
                 };
 
+                // The feed's plaintext is recorded as the growth of
+                // `recv_buffered`, before the `Ok` arm moves any of it to a
+                // forward.
+                let buffered_before_feed = self.driver.arrival_feed_start(conn_index);
                 let tls_table = self.driver.tls_table.as_mut().unwrap();
                 let result = crate::tls::feed_tls_recv_mio(
                     tls_table,
@@ -823,6 +836,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     conn_index,
                     &recv_buf[..n],
                 );
+                self.driver
+                    .arrival_feed_end(conn_index, buffered_before_feed);
 
                 // Put the stream back.
                 self.driver.tcp_streams[idx] = Some(stream);
@@ -931,6 +946,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 }
                 Ok(n) => {
                     metrics::BYTES.add(metrics::bytes::RECEIVED, n as u64);
+                    self.driver.record_arrival(conn_index, n);
                     // A forward owns this connection's bytes: they go to the
                     // sink's send queue, not to the accumulator or a recv sink.
                     if self.driver.forward_conn[idx].is_some() {
@@ -2408,5 +2424,152 @@ mod tests {
                 ),
             }
         }
+    }
+
+    // ── Receive arrival log ────────────────────────────────────────
+
+    fn at(base: Instant, ms: u64) -> Instant {
+        base + Duration::from_millis(ms)
+    }
+
+    /// Wait until the server side of `conn_index` holds at least `n` unread
+    /// bytes. On macOS, loopback bytes are not always readable when the
+    /// client's `write_all` returns.
+    fn wait_for_bytes(el: &AsyncEventLoop<NoopHandler>, conn_index: u32, n: usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut peek = vec![0u8; n];
+        loop {
+            let stream = el.driver.tcp_streams[conn_index as usize]
+                .as_ref()
+                .expect("the connection has a stream");
+            match stream.peek(&mut peek) {
+                Ok(got) if got >= n => return,
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => panic!("peek: {e}"),
+            }
+            assert!(Instant::now() < deadline, "the written bytes never arrived");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Write `data` from the client and read it in a batch whose time is
+    /// `time`. The socket must hold no unread bytes before the write.
+    fn read_in_batch(
+        el: &mut AsyncEventLoop<NoopHandler>,
+        client: &mut std::net::TcpStream,
+        conn_index: u32,
+        data: &[u8],
+        time: Instant,
+    ) {
+        use std::io::Write;
+        client.write_all(data).expect("client write");
+        wait_for_bytes(el, conn_index, data.len());
+        el.driver.recv_batch.begin_at(time);
+        let mut buf = vec![0u8; 4096];
+        el.handle_readable(conn_index, &mut buf);
+    }
+
+    /// Read one `\n`-terminated line with `with_data` and return the
+    /// connection's `recv_arrival` afterwards.
+    fn read_line(el: &mut AsyncEventLoop<NoopHandler>, ctx: ConnCtx) -> Option<(Instant, Instant)> {
+        let waker = std::task::Waker::noop();
+        let mut fut = std::pin::pin!(ctx.with_data(|d| match d.iter().position(|&b| b == b'\n') {
+            Some(i) => crate::ParseResult::Consumed(i + 1),
+            None => crate::ParseResult::NeedMore,
+        }));
+        in_poll(el, || {
+            let mut cx = std::task::Context::from_waker(waker);
+            assert!(
+                fut.as_mut().poll(&mut cx).is_ready(),
+                "the line is complete"
+            );
+            ctx.recv_arrival().map(|a| (a.first(), a.last()))
+        })
+    }
+
+    /// Each read records its bytes at its batch's time, and a pipelined
+    /// line reports the batch of its own first byte.
+    #[test]
+    fn reads_report_the_batch_that_read_each_byte() {
+        let config = test_config();
+        let (mut el, _wake) = test_loop(&config);
+        let (conn_index, mut client) = attach_conn(&mut el.driver);
+        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        let base = Instant::now();
+
+        read_in_batch(&mut el, &mut client, conn_index, b"a\n", at(base, 1));
+        assert_eq!(read_line(&mut el, ctx), Some((at(base, 1), at(base, 1))));
+
+        read_in_batch(&mut el, &mut client, conn_index, b"b\nc", at(base, 2));
+        read_in_batch(&mut el, &mut client, conn_index, b"c\n", at(base, 3));
+        assert_eq!(read_line(&mut el, ctx), Some((at(base, 2), at(base, 2))));
+        assert_eq!(read_line(&mut el, ctx), Some((at(base, 2), at(base, 3))));
+    }
+
+    /// `finish_close` empties the slot's arrival log.
+    #[test]
+    fn a_closed_slot_releases_its_arrival_log() {
+        let config = test_config();
+        let (mut el, _wake) = test_loop(&config);
+        let (conn_index, mut client) = attach_conn(&mut el.driver);
+        read_in_batch(&mut el, &mut client, conn_index, b"a\nb", Instant::now());
+        assert_eq!(el.driver.arrival[conn_index as usize].delivered(), 3);
+        el.driver.finish_close(conn_index);
+        assert_eq!(el.driver.arrival[conn_index as usize].delivered(), 0);
+        assert_eq!(el.driver.arrival[conn_index as usize].len(), 0);
+    }
+
+    /// An accepted connection starts with an empty log, whatever the slot's
+    /// log held.
+    #[test]
+    fn an_accepted_slot_starts_with_an_empty_arrival_log() {
+        let config = test_config();
+        let (accept_tx, accept_rx) = crossbeam_channel::unbounded();
+        let (mut el, _wake) = test_loop_with_accept(&config, Some(accept_rx));
+        el.driver.recv_batch.begin();
+        el.driver.record_arrival(0, 100);
+        let (fd, _client, peer) = accepted_socket();
+        accept_tx
+            .send(crate::acceptor::AcceptedConn {
+                fd: unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) },
+                listener: crate::ListenerId::from_index(0),
+                peer: crate::connection::PeerAddr::Tcp(peer),
+            })
+            .expect("send");
+        el.drain_channels();
+        assert!(
+            el.driver.connections.get(0).is_some(),
+            "precondition: slot 0"
+        );
+        assert_eq!(el.driver.arrival[0].delivered(), 0);
+    }
+
+    /// A forward source re-read by `drain_forward_resumes` is read in a batch
+    /// of its own, not in the batch of the reads before the tasks ran.
+    #[test]
+    fn a_forward_resume_begins_a_batch() {
+        use std::io::Write;
+        let config = test_config();
+        let (mut el, _wake) = test_loop(&config);
+        let (source, mut client) = attach_conn(&mut el.driver);
+        let (sink, _sink_client) = attach_conn(&mut el.driver);
+        el.driver.forward_conn[source as usize] =
+            Some(crate::backend::mio::driver::MioForwardState {
+                sink_index: sink,
+                sink_generation: el.driver.connections.generation(sink),
+                len: 1 << 20,
+                forwarded: 0,
+            });
+        // A read in the loop's batch, before the tasks ran.
+        el.driver.recv_batch.begin_at(Instant::now());
+        el.driver.record_arrival(source, 1);
+        client.write_all(b"x").expect("client write");
+        wait_for_bytes(&el, source, 1);
+        el.driver.mark_forward_resume(source);
+        let mut buf = vec![0u8; 4096];
+        assert!(el.drain_forward_resumes(&mut buf));
+        assert_eq!(el.driver.arrival[source as usize].delivered(), 2);
+        assert_eq!(el.driver.arrival[source as usize].len(), 2);
     }
 }

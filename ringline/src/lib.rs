@@ -253,6 +253,8 @@ pub use handler::SendPart;
 pub use handler::UdpToken;
 /// Handler state carried across a park (tier 3, #443).
 pub use park::ParkState;
+/// When the bytes a connection's most recent reader call consumed arrived.
+pub use recv::arrival::RecvArrival;
 
 // ── Re-exports: Async API ───────────────────────────────────────────────
 

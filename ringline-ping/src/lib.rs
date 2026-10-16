@@ -26,12 +26,11 @@
 pub mod pool;
 pub use pool::{Pool, PoolConfig, PooledClient};
 
-use std::cell::Cell;
 use std::io;
 use std::time::Instant;
 
 use ping_proto::{Request as PingRequest, Response as PingResponse};
-use ringline::{Connection, ParseResult, RecvHalf, SendHalf};
+use ringline::{Connection, ParseResult, RecvArrival, RecvHalf, SendHalf};
 
 // -- Error -------------------------------------------------------------------
 
@@ -83,11 +82,20 @@ pub enum CommandType {
 
 /// Result metadata for a completed command, passed to the `on_result` callback.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct CommandResult {
     /// The command type.
     pub command: CommandType,
     /// Latency in nanoseconds (send → response parsed).
     pub latency_ns: u64,
+    /// Nanoseconds from the start of `latency_ns` to the arrival of the
+    /// response's first byte ([`RecvArrival::first`]). `None` if no byte was
+    /// read, or if the byte arrived before the start.
+    pub ttfb_ns: Option<u64>,
+    /// Nanoseconds from the start of `latency_ns` to the arrival of the
+    /// response's last byte ([`RecvArrival::last`]). `None` as for
+    /// `ttfb_ns`.
+    pub ttlb_ns: Option<u64>,
     /// Whether the command succeeded (no error response).
     pub success: bool,
     /// Bytes transmitted for this command (protocol-encoded request size).
@@ -182,7 +190,6 @@ impl ClientBuilder {
             tx,
             rx,
             on_result,
-            last_rx_bytes: Cell::new(0),
             #[cfg(feature = "metrics")]
             metrics: if with_metrics {
                 Some(ClientMetrics::new())
@@ -204,7 +211,6 @@ pub struct Client {
     tx: SendHalf,
     rx: RecvHalf,
     on_result: Option<ResultCallback>,
-    last_rx_bytes: Cell<u32>,
     #[cfg(feature = "metrics")]
     metrics: Option<ClientMetrics>,
 }
@@ -221,7 +227,6 @@ impl Client {
             tx,
             rx,
             on_result: None,
-            last_rx_bytes: Cell::new(0),
             #[cfg(feature = "metrics")]
             metrics: None,
         }
@@ -287,13 +292,18 @@ impl Client {
 
     /// Read and parse a single Ping response from the connection.
     ///
+    /// Returns the result, the bytes read, and, on an instrumented client,
+    /// the arrival times of those bytes.
+    ///
     /// On `Error::Protocol` (parse failure) the underlying connection is
     /// closed: even though the parser advanced past the malformed bytes,
     /// the request/response framing is now irrecoverably misaligned and
     /// the next `ping()` would read garbage. Surfacing `Protocol` as a
     /// terminal error matches the memcache client (PR #177) and avoids
     /// silently desynced clients.
-    pub(crate) async fn read_response(&mut self) -> Result<PingResponse, Error> {
+    pub(crate) async fn read_response(
+        &mut self,
+    ) -> (Result<PingResponse, Error>, u32, Option<RecvArrival>) {
         let mut result: Option<Result<PingResponse, Error>> = None;
         let n = self
             .rx
@@ -309,20 +319,30 @@ impl Client {
                 }
             })
             .await;
-        self.last_rx_bytes.set(n as u32);
+        let arrival = if self.is_instrumented() {
+            self.rx.recv_arrival()
+        } else {
+            None
+        };
         if n == 0 {
-            return result.unwrap_or(Err(Error::ConnectionClosed));
+            return (result.unwrap_or(Err(Error::ConnectionClosed)), 0, arrival);
         }
         let r = result.unwrap();
         if matches!(r, Err(Error::Protocol(_))) {
             self.tx.close();
         }
-        r
+        (r, n as u32, arrival)
     }
 
-    /// Send an encoded command and read the response.
-    async fn execute(&mut self, encoded: &[u8]) -> Result<PingResponse, Error> {
-        self.tx.send(encoded)?;
+    /// Send an encoded command and read the response. A send error reads
+    /// nothing: 0 bytes and no arrival.
+    async fn execute(
+        &mut self,
+        encoded: &[u8],
+    ) -> (Result<PingResponse, Error>, u32, Option<RecvArrival>) {
+        if let Err(e) = self.tx.send(encoded) {
+            return (Err(e.into()), 0, None);
+        }
         self.read_response().await
     }
 
@@ -334,7 +354,7 @@ impl Client {
         let len = PingRequest::Ping.encode(&mut buf);
 
         if !self.is_instrumented() {
-            let response = self.execute(&buf[..len]).await?;
+            let response = self.execute(&buf[..len]).await.0?;
             return match response {
                 PingResponse::Pong => Ok(()),
                 #[allow(unreachable_patterns)]
@@ -344,9 +364,9 @@ impl Client {
 
         let tx_bytes = len as u32;
         let start = Instant::now();
-        let response = self.execute(&buf[..len]).await;
+        let (response, rx_bytes, arrival) = self.execute(&buf[..len]).await;
         let latency_ns = elapsed_ns(start);
-        let rx_bytes = self.last_rx_bytes.get();
+        let (ttfb_ns, ttlb_ns) = arrival_ns(arrival.as_ref(), start);
 
         let result = match response {
             Ok(PingResponse::Pong) => Ok(()),
@@ -356,6 +376,8 @@ impl Client {
         self.record(&CommandResult {
             command: CommandType::Ping,
             latency_ns,
+            ttfb_ns,
+            ttlb_ns,
             success: result.is_ok(),
             tx_bytes,
             rx_bytes,
@@ -370,4 +392,15 @@ impl Client {
 #[inline]
 fn elapsed_ns(start: Instant) -> u64 {
     start.elapsed().as_nanos() as u64
+}
+
+/// Nanoseconds from `start` to the arrival of the first and of the last
+/// response byte. `None` when there is no arrival, or for a time before
+/// `start`.
+fn arrival_ns(arrival: Option<&RecvArrival>, start: Instant) -> (Option<u64>, Option<u64>) {
+    let since = |t: Instant| t.checked_duration_since(start).map(|d| d.as_nanos() as u64);
+    match arrival {
+        Some(a) => (since(a.first()), since(a.last())),
+        None => (None, None),
+    }
 }

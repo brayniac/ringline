@@ -51,6 +51,13 @@ pub static UDP: ShardedCounterGroup = ShardedCounterGroup::new(4);
 )]
 pub static PARK_ABANDONED: ShardedCounterGroup = ShardedCounterGroup::new(park_abandon::COUNT);
 
+/// Receive arrival log lookups and merges (`docs/recv-arrival-times-design.md`).
+#[metric(
+    name = "ringline/recv_arrival",
+    description = "Receive arrival log: lookups outside the log, and entries merged at the cap"
+)]
+pub static RECV_ARRIVAL: ShardedCounterGroup = ShardedCounterGroup::new(recv_arrival::COUNT);
+
 // ── Gauge (not sharded) ─────────────────────────────────────────
 
 #[metric(
@@ -301,6 +308,20 @@ pub mod recv_ring {
     pub const COUNT: usize = 3;
 }
 
+/// Slot indices for `RECV_ARRIVAL`.
+pub mod recv_arrival {
+    /// A reader call whose range started below the oldest entry or ended
+    /// past the newest end, which took the nearest entry's time, or that
+    /// read an empty log, which gave no time. A call counts at most once.
+    /// Bytes held out of stream order return wrong times without counting
+    /// here.
+    pub const CLAMPED: usize = 0;
+    /// A push into a log at its 1024-entry cap, which merged the two oldest
+    /// entries. The merged entry keeps the earlier time.
+    pub const MERGED: usize = 1;
+    pub const COUNT: usize = 2;
+}
+
 /// Slot indices for `RECV_PREFLIGHT_FAILED`: the step of the
 /// incremental-ring preflight that did not behave as the receive path
 /// relies on (`backend/uring/engine/preflight.rs`). A failed preflight
@@ -500,6 +521,9 @@ pub fn init_metadata() {
         "offer_declined".into(),
     );
 
+    RECV_ARRIVAL.insert_metadata(recv_arrival::CLAMPED, "op".into(), "clamped".into());
+    RECV_ARRIVAL.insert_metadata(recv_arrival::MERGED, "op".into(), "merged".into());
+
     PARK_ABANDONED.insert_metadata(park_abandon::NOT_OPEN, "op".into(), "not_open".into());
     PARK_ABANDONED.insert_metadata(
         park_abandon::DATA_PENDING,
@@ -686,6 +710,12 @@ mod tests {
                 "RECV_PREFLIGHT_FAILED[{idx}] out of bounds"
             );
         }
+        for idx in [recv_arrival::CLAMPED, recv_arrival::MERGED] {
+            assert!(
+                RECV_ARRIVAL.increment(idx),
+                "RECV_ARRIVAL[{idx}] out of bounds"
+            );
+        }
     }
 
     /// Every slot of the receive-ring groups is labelled, so an exporter
@@ -715,6 +745,14 @@ mod tests {
                     .load_metadata(idx)
                     .is_some_and(|m| m.contains_key("op")),
                 "RECV_PREFLIGHT_FAILED[{idx}] has no op label"
+            );
+        }
+        for idx in 0..recv_arrival::COUNT {
+            assert!(
+                RECV_ARRIVAL
+                    .load_metadata(idx)
+                    .is_some_and(|m| m.contains_key("op")),
+                "RECV_ARRIVAL[{idx}] has no op label"
             );
         }
     }

@@ -927,6 +927,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.driver.cqe_batch.clear();
 
         self.driver.ring.reap(&mut self.driver.cqe_batch);
+        // The completions just reaped are one batch: the receives among them
+        // share one arrival time, read by the first.
+        self.driver.recv_batch.begin();
 
         if let Some(interval) = self.driver.flush_interval {
             let mut last_flush = Instant::now();
@@ -1323,6 +1326,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let bytes_received = result as u32;
         metrics::BYTES.add(metrics::bytes::RECEIVED, bytes_received as u64);
         metrics::BYTES.add(metrics::bytes::FALLBACK_RECEIVED, bytes_received as u64);
+        self.driver
+            .record_arrival(conn_index, bytes_received as usize);
 
         let pool = self
             .driver
@@ -1652,11 +1657,23 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             .as_ref()
             .is_some_and(|t| t.has(conn_index));
 
+        // Every plaintext delivery is recorded before the bytes go to a
+        // segment hold, a recv-forward or direct-echo hold, a recv sink, a
+        // lend or the accumulator. TLS records the plaintext the feed
+        // delivers, below.
+        if !is_tls_conn {
+            self.driver
+                .record_arrival(conn_index, bytes_received as usize);
+        }
+
         if is_tls_conn {
             // The ciphertext bid is replenished immediately (TLS decrypts into
             // rustls's own buffer, so the provided buffer is free at feed time);
             // TLS segments never pin the ring.
             self.driver.pending_replenish.push(bid);
+            // The feed's plaintext is recorded as the growth of
+            // `recv_buffered`, all at this batch's time.
+            let buffered_before_feed = self.driver.arrival_feed_start(conn_index);
             {
                 // Route decrypted plaintext by recv domain. In the segmented
                 // domain, each drained plaintext chunk becomes an owned segment
@@ -1698,6 +1715,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     data,
                     &mut self.driver.tls_out_scratch,
                 );
+                self.driver
+                    .arrival_feed_end(conn_index, buffered_before_feed);
 
                 // Route collected TLS output (handshake responses, alerts)
                 // through the per-connection send queue — including on the
@@ -2546,6 +2565,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.driver.pending_replenish.push(pending.bid);
         }
         self.driver.accumulators.reset(conn_index);
+        self.driver.arrival[conn_index as usize].clear();
         self.driver.reset_segment_state(conn_index);
         self.driver.reset_send_state(conn_index);
         // A slot is recycled by generation, so without this a new occupant
@@ -2563,6 +2583,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 self.driver.adopt_pending.remove(&conn_index);
             }
         }
+        // Bytes a park carried arrive here at this batch's time.
+        // `park_blocker` refuses a connection with bytes buffered, so this is
+        // normally zero.
+        self.driver
+            .record_arrival(conn_index, pending.iter().map(bytes::Bytes::len).sum());
         for chunk in &pending {
             self.driver.accumulators.append(conn_index, chunk);
         }
@@ -4261,6 +4286,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
         }
 
+        self.driver.arrival[conn_index as usize].clear();
+
         // Orphaned-future guard: if the ConnectFuture was dropped while the
         // SQE was in flight (e.g. `select!` with a timeout that won), no
         // task will pick up this connection — and we don't have an
@@ -4436,6 +4463,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // inherits them.
         self.driver.clear_conn_claims(conn_index);
         self.driver.accumulators.release(conn_index);
+        self.driver.arrival[conn_index as usize].release();
         self.driver.connections.release(conn_index);
     }
 
@@ -14170,6 +14198,454 @@ mod tests {
         el.test_dispatch_cqe(ud.raw(), -libc::ENOBUFS, 0);
         assert!(el.driver.recv_starved.contains(conn_index));
         conn_index
+    }
+
+    // ── Receive arrival log ────────────────────────────────────────
+
+    /// Parse one `\n`-terminated line.
+    fn arrival_line(d: &[u8]) -> crate::runtime::io::ParseResult {
+        match d.iter().position(|&b| b == b'\n') {
+            Some(i) => crate::runtime::io::ParseResult::Consumed(i + 1),
+            None => crate::runtime::io::ParseResult::NeedMore,
+        }
+    }
+
+    fn at(base: Instant, ms: u64) -> Instant {
+        base + std::time::Duration::from_millis(ms)
+    }
+
+    /// Deliver `data` in buffer `bid` as the first completion of a batch
+    /// whose time is `time`.
+    fn deliver_in_batch(
+        el: &mut AsyncEventLoop<NoopHandler>,
+        conn_index: u32,
+        bid: u16,
+        data: &[u8],
+        time: Instant,
+    ) {
+        el.driver.recv_batch.begin_at(time);
+        deliver_segment(el, conn_index, bid, data);
+    }
+
+    /// Read one line with `with_data` and return the bytes consumed and the
+    /// connection's `recv_arrival` afterwards. Panics if the read does not
+    /// resolve on its first poll.
+    fn read_line(
+        el: &mut AsyncEventLoop<NoopHandler>,
+        ctx: ConnCtx,
+    ) -> (usize, Option<crate::RecvArrival>) {
+        let waker = noop_waker();
+        let mut fut = std::pin::pin!(ctx.with_data(arrival_line));
+        with_driver_state(el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            match fut.as_mut().poll(&mut cx) {
+                std::task::Poll::Ready(n) => (n, ctx.recv_arrival()),
+                std::task::Poll::Pending => panic!("the line is not complete"),
+            }
+        })
+    }
+
+    fn times(a: Option<crate::RecvArrival>) -> Option<(Instant, Instant)> {
+        a.map(|a| (a.first(), a.last()))
+    }
+
+    /// Lines delivered in separate batches report their own batch's time;
+    /// lines delivered in one batch report the same time.
+    #[test]
+    fn arrival_times_follow_the_batch_that_delivered_each_line() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        let base = Instant::now();
+
+        deliver_in_batch(&mut el, conn_index, 0, b"a\n", at(base, 1));
+        let (n, a) = read_line(&mut el, ctx);
+        assert_eq!((n, times(a)), (2, Some((at(base, 1), at(base, 1)))));
+
+        deliver_in_batch(&mut el, conn_index, 1, b"b\n", at(base, 2));
+        let (n, a) = read_line(&mut el, ctx);
+        assert_eq!((n, times(a)), (2, Some((at(base, 2), at(base, 2)))));
+
+        // Two completions in one batch: the first is lent, the second moves
+        // both into the accumulator.
+        deliver_in_batch(&mut el, conn_index, 2, b"c\n", at(base, 3));
+        deliver_segment(&mut el, conn_index, 3, b"d\n");
+        let (_, a) = read_line(&mut el, ctx);
+        assert_eq!(times(a), Some((at(base, 3), at(base, 3))));
+        let (_, a) = read_line(&mut el, ctx);
+        assert_eq!(times(a), Some((at(base, 3), at(base, 3))));
+    }
+
+    /// A line that arrives over two batches takes its first byte's time from
+    /// the first and its last byte's from the second, although the read
+    /// polled in between and moved the first part to the accumulator.
+    #[test]
+    fn a_line_spanning_two_batches_reports_both_times() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        let base = Instant::now();
+        let waker = noop_waker();
+        let mut fut = std::pin::pin!(ctx.with_data(arrival_line));
+
+        deliver_in_batch(&mut el, conn_index, 0, b"hel", at(base, 1));
+        let first = with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            fut.as_mut().poll(&mut cx)
+        });
+        assert!(first.is_pending(), "the line is not complete yet");
+
+        deliver_in_batch(&mut el, conn_index, 1, b"lo\n", at(base, 2));
+        let (second, a) = with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            (fut.as_mut().poll(&mut cx), ctx.recv_arrival())
+        });
+        assert!(matches!(second, std::task::Poll::Ready(6)));
+        assert_eq!(times(a), Some((at(base, 1), at(base, 2))));
+    }
+
+    /// The second of two pipelined lines starts in the first line's batch.
+    #[test]
+    fn a_pipelined_line_reports_the_batch_of_its_own_first_byte() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        let base = Instant::now();
+
+        deliver_in_batch(&mut el, conn_index, 0, b"a\nbb", at(base, 1));
+        deliver_in_batch(&mut el, conn_index, 1, b"b\n", at(base, 2));
+        let (_, a) = read_line(&mut el, ctx);
+        assert_eq!(times(a), Some((at(base, 1), at(base, 1))));
+        let (n, a) = read_line(&mut el, ctx);
+        assert_eq!(n, 4);
+        assert_eq!(times(a), Some((at(base, 1), at(base, 2))));
+    }
+
+    /// A record trims before it adds. With 65 unread batches, the trim due
+    /// at the next completion must use the counts from before that
+    /// completion; counting its bytes as delivered but not yet buffered would
+    /// drop the oldest unread entry.
+    #[test]
+    fn a_record_trims_before_it_adds_its_bytes() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        let base = Instant::now();
+        // 65 one-byte batches on the accumulator path, as `handle_recv_multi`
+        // records and appends them.
+        for i in 0..65u64 {
+            el.driver.recv_batch.begin_at(at(base, i));
+            el.driver.record_arrival(conn_index, 1);
+            el.driver.accumulators.append(conn_index, b"x");
+        }
+        assert!(el.driver.arrival[conn_index as usize].trim_due());
+
+        deliver_in_batch(&mut el, conn_index, 0, b"\n", at(base, 100));
+        let waker = noop_waker();
+        let mut fut =
+            std::pin::pin!(ctx.with_data(|_| crate::runtime::io::ParseResult::Consumed(1)));
+        let a = with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            assert!(fut.as_mut().poll(&mut cx).is_ready());
+            ctx.recv_arrival()
+        });
+        assert_eq!(times(a), Some((at(base, 0), at(base, 0))));
+    }
+
+    /// A log whose bytes a non-reporting consumer took is trimmed by a
+    /// record once it reaches the 1024-entry cap, instead of merging on
+    /// every later record. 600 unread batches set the trim threshold past
+    /// 512 entries; the threshold is capped at 1024.
+    #[test]
+    fn a_log_drained_without_readers_is_trimmed_at_the_cap() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let idx = conn_index as usize;
+        let base = Instant::now();
+        for i in 0..600u64 {
+            el.driver.recv_batch.begin_at(at(base, i));
+            el.driver.record_arrival(conn_index, 1);
+            el.driver.accumulators.append(conn_index, b"x");
+        }
+        assert_eq!(el.driver.arrival[idx].len(), 600);
+        // A `ConnStream` or forward takes them without reporting.
+        el.driver.accumulators.consume(conn_index, 600);
+        // Later batches go straight to a consumer that holds nothing, as a
+        // recv sink does.
+        for i in 600..1024u64 {
+            el.driver.recv_batch.begin_at(at(base, i));
+            el.driver.record_arrival(conn_index, 1);
+        }
+        assert_eq!(el.driver.arrival[idx].len(), 1024);
+        el.driver.recv_batch.begin_at(at(base, 1024));
+        el.driver.record_arrival(conn_index, 1);
+        assert_eq!(
+            el.driver.arrival[idx].len(),
+            1,
+            "the record at the cap trims every consumed entry instead of merging"
+        );
+    }
+
+    /// A parser that reports more than it was shown is credited with the
+    /// bytes the read removed, on the accumulator and the lent-buffer paths,
+    /// and the next read still finds its own batch.
+    #[test]
+    fn a_parser_claiming_more_than_it_was_shown_reports_what_was_removed() {
+        for reader in ["with_bytes", "with_data_lent"] {
+            let mut el = make_test_loop();
+            let conn_index = accept_connection(&mut el);
+            let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+            let base = Instant::now();
+            deliver_in_batch(&mut el, conn_index, 0, b"ab\n", at(base, 1));
+            let waker = noop_waker();
+            let a = if reader == "with_bytes" {
+                let mut fut = std::pin::pin!(
+                    ctx.with_bytes(|_| crate::runtime::io::ParseResult::Consumed(100))
+                );
+                with_driver_state(&mut el, || {
+                    let mut cx = std::task::Context::from_waker(&waker);
+                    assert!(fut.as_mut().poll(&mut cx).is_ready());
+                    ctx.recv_arrival()
+                })
+            } else {
+                assert!(el.driver.pending_recv_bufs[conn_index as usize].is_some());
+                let mut fut = std::pin::pin!(
+                    ctx.with_data(|_| crate::runtime::io::ParseResult::Consumed(100))
+                );
+                with_driver_state(&mut el, || {
+                    let mut cx = std::task::Context::from_waker(&waker);
+                    assert!(fut.as_mut().poll(&mut cx).is_ready());
+                    ctx.recv_arrival()
+                })
+            };
+            assert_eq!(times(a), Some((at(base, 1), at(base, 1))), "{reader}");
+            deliver_in_batch(&mut el, conn_index, 1, b"c\n", at(base, 2));
+            let (_, a) = read_line(&mut el, ctx);
+            assert_eq!(times(a), Some((at(base, 2), at(base, 2))), "{reader}");
+        }
+    }
+
+    /// Bytes a recv sink takes are recorded and count as consumed, and a
+    /// lend later in the same batch extends the batch's entry.
+    #[test]
+    fn a_recv_sink_then_a_lend_in_one_batch_share_an_entry() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        let base = Instant::now();
+        let mut sink = [0u8; 3];
+        with_driver_state(&mut el, || unsafe {
+            ctx.set_recv_sink(sink.as_mut_ptr(), sink.len())
+        });
+        deliver_in_batch(&mut el, conn_index, 0, b"xyz", at(base, 1));
+        assert_eq!(with_driver_state(&mut el, || ctx.take_recv_sink()), 3);
+        deliver_segment(&mut el, conn_index, 1, b"q\n");
+        assert!(el.driver.pending_recv_bufs[conn_index as usize].is_some());
+        assert_eq!(el.driver.arrival[conn_index as usize].len(), 1);
+        let (_, a) = read_line(&mut el, ctx);
+        assert_eq!(times(a), Some((at(base, 1), at(base, 1))));
+        deliver_in_batch(&mut el, conn_index, 2, b"r\n", at(base, 2));
+        let (_, a) = read_line(&mut el, ctx);
+        assert_eq!(times(a), Some((at(base, 2), at(base, 2))));
+        assert_eq!(&sink, b"xyz");
+    }
+
+    /// Bytes handed out as a `RecvSegment` count as consumed. A completion
+    /// that arrives while the segment is live is read, once the segment
+    /// reader is dropped, with its own batch's time.
+    #[test]
+    fn bytes_after_a_dropped_segment_reader_keep_their_batch() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let ctx = ConnCtx::new(conn_index, generation);
+        let base = Instant::now();
+        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
+        deliver_in_batch(&mut el, conn_index, 0, b"seg", at(base, 1));
+
+        let mut reader = with_driver_state(&mut el, || ctx.segments()).expect("segments()");
+        let waker = noop_waker();
+        {
+            let mut next = std::pin::pin!(reader.next());
+            let seg = match with_driver_state(&mut el, || {
+                let mut cx = std::task::Context::from_waker(&waker);
+                next.as_mut().poll(&mut cx)
+            }) {
+                std::task::Poll::Ready(Ok(Some(seg))) => seg,
+                _ => panic!("expected a segment"),
+            };
+            deliver_in_batch(&mut el, conn_index, 1, b"x\n", at(base, 2));
+            with_driver_state(&mut el, || drop(seg));
+        }
+        with_driver_state(&mut el, || drop(reader));
+        let (n, a) = read_line(&mut el, ctx);
+        assert_eq!(n, 2);
+        assert_eq!(times(a), Some((at(base, 2), at(base, 2))));
+    }
+
+    /// `with_segments` reports the times of the bytes its callback consumed
+    /// across held buffers from two batches.
+    #[test]
+    fn with_segments_reports_the_consumed_range() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        let base = Instant::now();
+        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
+        deliver_in_batch(&mut el, conn_index, 0, b"ab", at(base, 1));
+        deliver_in_batch(&mut el, conn_index, 1, b"cd", at(base, 2));
+        deliver_in_batch(&mut el, conn_index, 2, b"ef", at(base, 3));
+        let waker = noop_waker();
+        // Consume "abc": the first byte from batch 1, the last from batch 2.
+        let mut fut = std::pin::pin!(ctx.with_segments(|_| SegConsumed(3)));
+        let (r, a) = with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            (fut.as_mut().poll(&mut cx), ctx.recv_arrival())
+        });
+        assert!(matches!(r, std::task::Poll::Ready(Ok(3))));
+        assert_eq!(times(a), Some((at(base, 1), at(base, 2))));
+    }
+
+    /// Bytes from a fallback recv are recorded like a multishot's.
+    #[test]
+    fn a_fallback_recv_records_its_bytes() {
+        let mut el = make_test_loop();
+        let conn_index = park_connection(&mut el);
+        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        let base = Instant::now();
+        el.driver.recv_batch.begin_at(at(base, 1));
+        el.driver.record_arrival(conn_index, 5);
+        assert!(el.driver.accumulators.append(conn_index, b"part-"));
+        el.flush_replenish_and_rearm();
+        assert!(el.driver.recv_fallback_inflight[conn_index as usize]);
+
+        let pool = el.driver.fallback_recv_pool.as_mut().expect("pool built");
+        let slot: u16 = 0;
+        let (ptr, _) = pool.current_ptr_remaining(slot);
+        unsafe { std::ptr::copy_nonoverlapping(b"chunk\n".as_ptr(), ptr as *mut u8, 6) };
+        el.driver.recv_batch.begin_at(at(base, 2));
+        let ud = UserData::encode(OpTag::RecvFallback, conn_index, slot as u32);
+        el.test_dispatch_cqe(ud.raw(), 6, 0);
+
+        let (n, a) = read_line(&mut el, ctx);
+        assert_eq!(n, 11);
+        assert_eq!(times(a), Some((at(base, 1), at(base, 2))));
+    }
+
+    /// Bytes a park carried are recorded on the adopting worker into a
+    /// cleared log, so the slot's previous occupant leaves nothing behind
+    /// and `delivered` covers what the accumulator holds.
+    #[test]
+    fn an_adopted_connection_records_its_carried_bytes() {
+        let mut el = make_test_loop();
+        // The slot the adopt will take held another connection's log.
+        el.driver.recv_batch.begin_at(Instant::now());
+        el.driver.record_arrival(0, 100);
+        let (tx, rx) = crossbeam_channel::bounded::<crate::park::ParkedFd>(4);
+        el.driver.park_rx = Some(rx);
+        tx.try_send(parked_entry(0, b"carried\n")).expect("queue");
+        drop(tx);
+        let base = Instant::now();
+        el.driver.recv_batch.begin_at(at(base, 1));
+
+        el.drain_adopted();
+
+        let installed = 0u32;
+        assert_eq!(el.driver.arrival[0].delivered(), 8);
+        assert_eq!(el.driver.recv_buffered(installed), 8);
+        let ctx = ConnCtx::new(installed, el.driver.connections.generation(installed));
+        let (_, a) = read_line(&mut el, ctx);
+        assert_eq!(times(a), Some((at(base, 1), at(base, 1))));
+    }
+
+    /// A slot reused by a new connection starts with an empty log, and the
+    /// old handle reads `None`, also after the new connection has read.
+    #[test]
+    fn a_reused_slot_starts_with_an_empty_arrival_log() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let old = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        let base = Instant::now();
+        // Leave an unread line behind.
+        deliver_in_batch(&mut el, conn_index, 0, b"a\nb\n", at(base, 1));
+        let (_, a) = read_line(&mut el, old);
+        assert!(a.is_some());
+
+        el.driver.close_connection(conn_index);
+        let ud = UserData::encode(OpTag::Close, conn_index, 0);
+        el.test_dispatch_cqe(ud.raw(), 0, 0);
+        assert!(el.driver.connections.get(conn_index).is_none());
+
+        let reused = accept_connection(&mut el);
+        assert_eq!(reused, conn_index, "precondition: the slot is reused");
+        let new = ConnCtx::new(reused, el.driver.connections.generation(reused));
+        assert_eq!(el.driver.arrival[reused as usize].delivered(), 0);
+        assert_eq!(el.driver.arrival[reused as usize].len(), 0);
+        with_driver_state(&mut el, || {
+            assert!(new.recv_arrival().is_none());
+            assert!(old.recv_arrival().is_none());
+        });
+
+        // Once the new connection has read, the old handle still reads None.
+        deliver_in_batch(&mut el, reused, 1, b"c\n", at(base, 2));
+        let (_, a) = read_line(&mut el, new);
+        assert_eq!(times(a), Some((at(base, 2), at(base, 2))));
+        with_driver_state(&mut el, || {
+            assert!(new.recv_arrival().is_some());
+            assert!(old.recv_arrival().is_none());
+        });
+    }
+
+    /// Each `drain_completions` begins a batch: a record after the second
+    /// drain does not extend the first drain's entry or reuse its time.
+    #[test]
+    fn each_completion_drain_begins_a_batch() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let idx = conn_index as usize;
+        el.drain_completions();
+        el.driver.record_arrival(conn_index, 1);
+        el.drain_completions();
+        el.driver.record_arrival(conn_index, 1);
+        assert_eq!(el.driver.arrival[idx].len(), 2);
+    }
+
+    /// A `try_with_data` that finds nothing buffered returns `None` and
+    /// clears the previous call's times.
+    #[test]
+    fn try_with_data_on_an_empty_connection_clears_the_arrival() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        el.driver.recv_batch.begin_at(Instant::now());
+        el.driver.record_arrival(conn_index, 2);
+        el.driver.accumulators.append(conn_index, b"a\n");
+        let (_, a) = read_line(&mut el, ctx);
+        assert!(a.is_some());
+        let r = with_driver_state(&mut el, || {
+            ctx.try_with_data(|_| crate::runtime::io::ParseResult::Consumed(1))
+        });
+        assert!(r.is_none(), "nothing is buffered");
+        assert!(with_driver_state(&mut el, || ctx.recv_arrival()).is_none());
+    }
+
+    /// A reader call that consumes nothing leaves `recv_arrival` at `None`.
+    #[test]
+    fn a_read_that_consumes_nothing_reports_none() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        let base = Instant::now();
+        el.driver.recv_batch.begin_at(at(base, 1));
+        el.driver.record_arrival(conn_index, 4);
+        el.driver.accumulators.append(conn_index, b"a\nbb");
+        let (_, a) = read_line(&mut el, ctx);
+        assert!(a.is_some());
+        let r = with_driver_state(&mut el, || {
+            ctx.try_with_data(|_| crate::runtime::io::ParseResult::NeedMore)
+        });
+        assert!(matches!(r, Some(crate::runtime::io::ParseResult::NeedMore)));
+        assert!(with_driver_state(&mut el, || ctx.recv_arrival()).is_none());
     }
 
     // ── Direct-echo gather (#397) ──────────────────────────────────

@@ -1,0 +1,214 @@
+# Cost of the receive arrival log (docs/recv-arrival-times-design.md, "Cost").
+#
+# bench-server on hv02 (z1, 24 vCPU) with `--echo-mode forward`, whose reads
+# go through `with_data` and so report arrivals; the default direct echo
+# never calls a reporting reader. bench-client on hv01 (z2, 56 vCPU) with
+# `--runtime ringline`, whose reads also use `with_data`. Both binaries come
+# from `arrival-log-ab-build.toml`: arm `a` is built from a commit without
+# the log, arm `b` with it, and server and client always come from the same
+# arm.
+#
+# The server runs fewer workers than the client has threads, so the server
+# is the saturated side. Client CPU must stay below 70% for a run to count;
+# rezolus records both hosts for the check and for CPU time per request.
+#
+# One run measures every cell in `cells`, in order. A cell is
+# `clients:depth` in closed-loop mode, or `clients:rate` in open-loop mode
+# (`--open --rate`, rate in requests/sec). `results/cells.txt` gives each
+# cell's start and end (`date +%s.%N`) to slice the rezolus recordings.
+#
+# With `profile = "1"` the server records a system-wide `perf` profile (no
+# call graphs) for 10 s, starting 12 s after the server is ready, and uploads
+# the reports in `profile.tgz`. The profile covers the first cell in `cells`,
+# which has started by then (5 s warmup, 20 s measured); pass
+# `cells = "64:16"` to profile that cell alone. Profiled runs are for
+# attribution only; the sampling costs CPU, so their CPU time per request is
+# not used as a cost measurement. `perf_artifact` is a tarball of
+# Debian's `perf` and the libraries it needs (`out/perf/perf`,
+# `out/perf/lib`), which the base image lacks.
+#
+# Plan, fixed before running: five `a` and five `b` runs per mode,
+# alternating a b a b ..., closed-loop first. The open-loop rates are half
+# the median throughput of the five `a` closed-loop runs at depth 1 with the
+# same connection count.
+name = "ringline arrival-log A/B {mode} arm={arm} rep{rep}"
+
+[params]
+bins_artifact  = "REPLACE-WITH-ARTIFACT-ID"
+perf_artifact  = "01a128b3-b76b-7345-0ea5-165591a7fc64"
+profile        = "0"
+arm            = "a"
+rep            = "1"
+mode           = "closed"
+cells          = "64:1 64:16 4096:1 4096:16"
+image          = "spool/images/debian-13-base-20260912.1@golden"
+server_ip      = "172.31.0.1"
+client_ip      = "172.31.0.2"
+port           = "7878"
+server_workers = "4"
+client_threads = "16"
+msg_size       = "64"
+warmup         = "5"
+duration       = "20"
+
+# ── server: hv02 ───────────────────────────────────────────────────────────
+
+[[jobs]]
+name = "server"
+tags = ["z1.baremetal"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "start"
+shape = "z1.c"
+image = "{image}"
+gpu = false
+data_address = "{server_ip}/24"
+boot_timeout = 600
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "exec"
+inputs = [
+  { artifact = "{bins_artifact}", name = "bench-bins.tgz", dest = "/home/anvil" },
+  { artifact = "{perf_artifact}", name = "perf.tgz", dest = "/home/anvil" },
+]
+payload = '''
+set -uo pipefail
+cd /home/anvil && tar xzf bench-bins.tgz && tar xzf perf.tgz && chmod +x out/bench-*
+cat /etc/anvil-instance.json
+sudo sysctl -w net.core.somaxconn=65535 net.ipv4.tcp_max_syn_backlog=65535 net.core.rmem_max=134217728 net.core.wmem_max=134217728 kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
+if ! command -v perf >/dev/null && [ -x out/perf/perf ]; then
+  printf '#!/bin/sh\nLD_LIBRARY_PATH=/home/anvil/out/perf/lib exec /home/anvil/out/perf/perf "$@"\n' | sudo tee /usr/local/bin/perf >/dev/null
+  sudo chmod +x /usr/local/bin/perf
+fi
+command -v perf >/dev/null && echo "perf: $(perf --version)" || echo "perf: unavailable"
+ip -4 -brief addr show
+ls -l out/bench-server-{arm}
+'''
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "exec"
+detach = true
+unit = "ringline-server"
+metrics = true
+payload = "ulimit -n 500000; exec /home/anvil/out/bench-server-{arm} --runtime ringline --echo-mode forward --addr {server_ip}:{port} --workers {server_workers}"
+
+[[jobs.steps]]
+type = "barrier"
+name = "server-ready"
+timeout = 1800
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "exec"
+upload = true
+artifacts = ["/home/anvil/profile.tgz"]
+payload = '''
+set -uo pipefail
+cd /home/anvil
+mkdir -p prof
+if [ "{profile}" = "1" ] && command -v perf >/dev/null; then
+  sleep 12
+  sudo perf record -a -F 999 -o prof/perf.data -- sleep 10 2> prof/perf.err
+  sudo perf report -i prof/perf.data --stdio --no-children --sort comm,dso 2>/dev/null | grep -v '^#' | grep -v '^$' | head -40 > prof/dso.txt
+  sudo perf report -i prof/perf.data --stdio --no-children --sort sym --percent-limit 0.01 2>/dev/null | grep -v '^#' | grep -v '^$' | head -600 > prof/sym.txt
+  sudo perf report -i prof/perf.data --stdio --no-children --sort comm,dso,sym --percent-limit 0.01 2>/dev/null | grep -v '^#' | grep -v '^$' | head -1000 > prof/comm-sym.txt
+  sudo rm -f prof/perf.data
+  echo "-- dso"; head -15 prof/dso.txt
+  echo "-- arrival symbols"; grep -E "arrival|recv_buffered|settle_read|clock_gettime" prof/sym.txt
+fi
+tar czf profile.tgz prof
+'''
+
+[[jobs.steps]]
+type = "barrier"
+name = "bench-done"
+timeout = 7200
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "stop"
+upload = true
+
+# ── client: hv01 ───────────────────────────────────────────────────────────
+
+[[jobs]]
+name = "client"
+tags = ["z2.baremetal"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "start"
+shape = "z2.c"
+image = "{image}"
+gpu = false
+data_address = "{client_ip}/24"
+boot_timeout = 600
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "exec"
+inputs = [{ artifact = "{bins_artifact}", name = "bench-bins.tgz", dest = "/home/anvil" }]
+payload = '''
+set -uo pipefail
+cd /home/anvil && tar xzf bench-bins.tgz && chmod +x out/*
+cat /etc/anvil-instance.json
+sudo sysctl -w net.core.rmem_max=134217728 net.core.wmem_max=134217728 net.ipv4.ip_local_port_range="1024 65535"
+ip -4 -brief addr show
+ping -c 2 -W 2 {server_ip} || echo "WARN: server address not reachable yet"
+'''
+
+[[jobs.steps]]
+type = "barrier"
+name = "server-ready"
+timeout = 1800
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "exec"
+metrics = true
+upload = true
+artifacts = ["/home/anvil/results.tgz"]
+payload = '''
+set -uo pipefail
+cd /home/anvil
+mkdir -p results
+echo "arm={arm} rep={rep} mode={mode} cells={cells}" | tee results/arm.txt
+for i in $(seq 1 120); do
+  (exec 3<>/dev/tcp/{server_ip}/{port}) 2>/dev/null && { exec 3>&-; echo "server reachable after ${i}s"; break; }
+  sleep 1
+done
+ulimit -n 500000
+for cell in {cells}; do
+  clients=${cell%%:*}
+  value=${cell##*:}
+  if [ "{mode}" = "open" ]; then
+    load="--open --rate $value"
+  else
+    load="--depth $value"
+  fi
+  tag="{mode}-$clients-$value"
+  echo "$tag start $(date +%s.%N)" >> results/cells.txt
+  ./out/bench-client-{arm} --runtime ringline --addr {server_ip}:{port} --clients $clients \
+    --msg-size {msg_size} --warmup {warmup} --duration {duration} --threads {client_threads} $load \
+    > results/results-$tag.json 2> results/client-$tag.log
+  rc=$?
+  echo "$tag end $(date +%s.%N) rc=$rc" >> results/cells.txt
+  echo "== $tag rc=$rc"; cat results/results-$tag.json; echo
+  sleep 5
+done
+cat results/cells.txt
+tar czf /home/anvil/results.tgz -C /home/anvil results
+exit 0
+'''
+
+[[jobs.steps]]
+type = "barrier"
+name = "bench-done"
+timeout = 7200
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "stop"
