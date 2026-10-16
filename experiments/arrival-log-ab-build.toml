@@ -1,15 +1,17 @@
 # Build the arrival-log A/B binaries once (validation host) and upload them as
 # one artifact for every measurement run (`arrival-log-ab.toml`).
 #
-# One tree, two builds: A with `--cfg ringline_no_arrival_log` (the receive
-# arrival log compiled out), B without (the log on). Server and client are
-# built for each, since the log runs on every connection, the load
-# generator's included (docs/recv-arrival-times-design.md, "Cost").
+# Two builds: A from `ref_a`, a commit without the receive arrival log, and B
+# from `ref`. Server and client are built for each, since the log runs on
+# every connection, the load generator's included
+# (docs/recv-arrival-times-design.md, "Cost"). A and B differ in everything
+# between the two commits, not only the log.
 # No target-cpu=native: the validation host and the hypervisors differ.
 name = "ringline arrival-log A/B build ({ref})"
 
 [params]
 ref  = "feat/recv-arrival-times"
+ref_a = "811c489"
 repo = "https://github.com/brayniac/ringline"
 
 [[jobs]]
@@ -33,21 +35,16 @@ cd /home/anvil
 {
   cat /etc/anvil-instance.json
   mkdir -p out
-  git clone -q {repo} src && git -C src checkout -q {ref}
+  git clone -q {repo} src
   cd src
-  echo "== $(git log --oneline -1)"
-  # Separate target dirs: a rustflags change rebuilds everything anyway, and
-  # one dir per arm keeps a failed build from leaving the other arm's binary
-  # in place under this arm's name.
-  # `--config build.rustflags` is appended to `build.rustflags` from cargo
-  # config files. Cargo ignores it when RUSTFLAGS, CARGO_ENCODED_RUSTFLAGS
-  # or a `target.*.rustflags` is set; the cmp check below then fails the
-  # build.
+  # One target dir per arm keeps a failed build from leaving the other arm's
+  # binary in place under this arm's name.
+  git checkout -q {ref_a} && echo "== A: $(git log --oneline -1)"
   CARGO_TARGET_DIR=/home/anvil/target-a \
-    cargo build --locked --release --config 'build.rustflags=["--cfg","ringline_no_arrival_log"]' \
-    -p ringline-bench --bin bench-server --bin bench-client || exit 1
+    cargo build --locked --release -p ringline-bench --bin bench-server --bin bench-client || exit 1
   cp /home/anvil/target-a/release/bench-server ../out/bench-server-a
   cp /home/anvil/target-a/release/bench-client ../out/bench-client-a
+  git checkout -q {ref} && echo "== B: $(git log --oneline -1)"
   CARGO_TARGET_DIR=/home/anvil/target-b \
     cargo build --locked --release -p ringline-bench --bin bench-server --bin bench-client || exit 1
   cp /home/anvil/target-b/release/bench-server ../out/bench-server-b

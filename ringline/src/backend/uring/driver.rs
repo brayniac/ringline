@@ -2414,50 +2414,32 @@ impl Driver {
     /// Step 1 of a record: trim the arrival log if it is due, using the
     /// current `delivered` and `recv_buffered`.
     pub(crate) fn arrival_trim_if_due(&mut self, conn_index: u32) {
-        #[cfg(not(ringline_no_arrival_log))]
         if self.arrival[conn_index as usize].trim_due() {
             let unread = self.arrival[conn_index as usize]
                 .delivered()
                 .saturating_sub(self.recv_buffered(conn_index) as u64);
             self.arrival[conn_index as usize].trim(unread);
         }
-        #[cfg(ringline_no_arrival_log)]
-        let _ = conn_index;
     }
 
     /// Start recording a TLS feed: step 1 of a record, then the
     /// `recv_buffered` count the feed's plaintext is measured against.
     pub(crate) fn arrival_feed_start(&mut self, conn_index: u32) -> usize {
         self.arrival_trim_if_due(conn_index);
-        #[cfg(not(ringline_no_arrival_log))]
-        {
-            self.recv_buffered(conn_index)
-        }
-        #[cfg(ringline_no_arrival_log)]
-        {
-            0
-        }
+        self.recv_buffered(conn_index)
     }
 
     /// Finish recording a TLS feed: add the growth of `recv_buffered` since
     /// [`arrival_feed_start`](Self::arrival_feed_start) returned `before`,
     /// which is the plaintext the feed delivered.
     pub(crate) fn arrival_feed_end(&mut self, conn_index: u32, before: usize) {
-        #[cfg(not(ringline_no_arrival_log))]
-        {
-            let plaintext = self.recv_buffered(conn_index).saturating_sub(before);
-            self.arrival_add(conn_index, plaintext);
-        }
-        #[cfg(ringline_no_arrival_log)]
-        let _ = (conn_index, before);
+        let plaintext = self.recv_buffered(conn_index).saturating_sub(before);
+        self.arrival_add(conn_index, plaintext);
     }
 
     /// Step 2 of a record: add `n` bytes at the current batch's time.
     pub(crate) fn arrival_add(&mut self, conn_index: u32, n: usize) {
-        #[cfg(not(ringline_no_arrival_log))]
         self.arrival[conn_index as usize].add(n as u64, &mut self.recv_batch);
-        #[cfg(ringline_no_arrival_log)]
-        let _ = (conn_index, n);
     }
 
     /// Whether the connection holds received bytes that no consumer has

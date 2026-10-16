@@ -9,13 +9,6 @@
 //! connection slot and one [`BatchClock`], calls [`ArrivalLog::add`] where
 //! received bytes enter the connection, and supplies `buffered`, the bytes the
 //! connection holds that no consumer has taken.
-//!
-//! Building with `--cfg ringline_no_arrival_log` compiles out the records,
-//! the `recv_buffered` sums that feed them and the lookups, for measuring
-//! their cost; `recv_arrival` then returns `None`. The per-slot logs, their
-//! clear at setup and release at teardown, and the batch counter remain.
-
-#![cfg_attr(ringline_no_arrival_log, allow(dead_code))]
 
 use std::collections::VecDeque;
 use std::time::Instant;

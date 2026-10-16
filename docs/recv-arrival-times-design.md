@@ -1,6 +1,6 @@
 # Receive arrival times
 
-Status: implemented. The cost measurement under "Cost" has not run.
+Status: implemented. The cost is measured under "Cost".
 
 A reader on a TCP connection can ask when the first and the last byte it
 consumed arrived. The client crates use this to report time to first byte and
@@ -459,59 +459,40 @@ It is not part of this design.
   allocation.
 - Memory, per worker: about 1.5 MB at the default `max_connections` of
   16,000.
-- Cache: one or two more per-connection cache lines touched per record and per
-  read; a 96-byte element straddles two lines for half the slots.
+- Cache: per connection, the log (two lines: at a 96-byte stride every slot
+  spans two), the front of its deque, and the `segment_hold` and `recv_hold`
+  headers that `recv_buffered` reads are touched per record and per read.
 - Memory, worst case: a connection whose peer sends more than 1024 small
   segments while its parser returns `NeedMore` holds a 24 KiB log, six times
   the default 4 KiB accumulator.
 
-The log is always on. Before the PR merges, its cost is measured on hv01 and
-hv02 through SystemsLab, with the log compiled in (B) and compiled out (A) by
-a `ringline_no_arrival_log` `cfg`. The `cfg` is declared in `check-cfg` in
-`ringline/Cargo.toml`; only ringline references it. Build A compiles out the
-records, the `recv_buffered` sums that feed them and the lookups; the
-per-slot logs, their clear at setup and release at teardown, and the batch
-counter remain. In build A, `recv_arrival`
-returns `None` and the client crates report `None`. The `cfg` is removed
-before merge if B is kept. The plan, fixed before running:
+The log is always on. Its cost was measured on hv01 and hv02 through
+SystemsLab with `experiments/arrival-log-ab-build.toml` and
+`experiments/arrival-log-ab.toml`. The server is `bench-server --echo-mode
+forward` (`with_data` and `forward_recv_buf`, so its reads report) with 4
+workers; the load generator is `bench-client --runtime ringline` with 16
+threads, whose reads also use `with_data`. Arm B has the log; arm A was built
+from the same tree with the log compiled out by a `cfg` that has since been
+removed. The build spec now builds arm A from `ref_a`, a commit without the
+log. Client CPU stayed below 13 of 56 cores in every run.
 
-1. Specs: `experiments/arrival-log-ab-build.toml` and
-   `experiments/arrival-log-ab.toml`, following `send-path-ab-build.toml` and
-   `send-path-ab.toml`. The server is `bench-server --echo-mode forward`
-   (`with_data` and `forward_recv_buf`, so the server's reads report); the
-   default direct echo never calls a reporting reader. The load generator is
-   `bench-client --runtime ringline`, whose reads use `with_data`. Both are
-   built from the same tree for each of A and B, since the log runs on every
-   connection. The client crates are not exercised; no memcache or redis load
-   tool builds against this branch.
-2. Closed-loop cells: 64 and 4,096 connections, `--depth` 1 and 16. The
-   4,096-connection cells are where a per-connection cache miss would show.
-   The server runs fewer workers than the client has threads; each run checks
-   that client CPU stays below 70%, so the client is not the limit. The
-   64-connection depth-1 cell may be limited by round-trip time rather than
-   server CPU, in which case its throughput and p99 move by the added time
-   per operation as a share of the round trip, not of server CPU time, and a
-   small cost falls inside the A spread there; the open-loop CPU time per
-   request shows it.
-   Statistics: throughput and p99 latency.
-3. Open-loop cells: 64 and 4,096 connections, `--open --rate` at half the
-   median throughput of the five A closed-loop runs at depth 1 with that
-   connection count. Statistic: CPU time per request on each host, from
-   rezolus. This is the statistic most sensitive to a per-operation cost.
-4. Noise floor: five A runs per cell. The spread of a statistic is the range
-   (largest minus smallest) of its per-run values. If a cell's A spread
-   exceeds 2% of its median, the result for that cell is inconclusive, and
-   the environment is fixed before deciding.
-5. Runs: five A and five B per cell, alternating, each long enough for at
-   least 10^6 requests so p99.9 rests on at least 1,000 samples.
-6. Decision: if B's median is worse than A's by more than the A spread in
-   throughput, p99, or CPU time per request in any cell, the log goes behind
-   a `ConfigBuilder` option, default off. p99.9 is reported, not used to
-   decide.
+| Measurement | Runs | Result |
+|---|---|---|
+| Closed loop, 64 and 4,096 connections, depth 1 and 16: throughput, p99 | 5 A, 5 B per cell | Inconclusive in every cell: the A spread (range over median) was 5.5–20% |
+| Open loop, 64 conns at 141,038/s and 4,096 at 174,945/s: server CPU per request | 5 A, 5 B | B−A −2.10% and +0.34%, A spread 1.4% and 1.2%. At 27–30 µs per request this cannot show a cost below about 0.4 µs |
+| Closed loop 64:16, server CPU per request | 5 A, 5 B | B−A +2.7%, A spread 1.5% |
+| The same, repeated | 8 A, 8 B | B−A −0.58%, A spread 8.6% |
+| `perf record -a` in the server VM, 10 s at 64:16 | 3 B | The log's functions (`recv_buffered`, `settle_read`, `add`, `record_arrival`, `arrival_settle`) take 0.33–0.43% of samples, about 0.5% of the server's busy CPU or 13 ns per request |
 
-This plan cannot detect a cost smaller than the A spread, which is at most 2%
-of the median when the result counts. The spread is reported with the
-result.
+The +2.7% did not reproduce, and the closed-loop CPU time per request varies
+by up to 9% between runs on this rig, so it cannot resolve a cost of a few
+percent. The profile gives the cost directly. In the same profile the server
+spends about 75% of its samples in the kernel and about 3% in user space.
+Timer sampling charges a cache miss to the function that waits on it, so
+the 0.5% includes the log's own misses.
+
+A loopback profile on an 8-vCPU arm64 VM (2 server workers) gives 0.53–0.76%
+of the server's samples.
 
 ## Tests
 

@@ -4,8 +4,9 @@
 # go through `with_data` and so report arrivals; the default direct echo
 # never calls a reporting reader. bench-client on hv01 (z2, 56 vCPU) with
 # `--runtime ringline`, whose reads also use `with_data`. Both binaries come
-# from `arrival-log-ab-build.toml`: arm `a` has the log compiled out, arm `b`
-# has it on, and server and client always come from the same arm.
+# from `arrival-log-ab-build.toml`: arm `a` is built from a commit without
+# the log, arm `b` with it, and server and client always come from the same
+# arm.
 #
 # The server runs fewer workers than the client has threads, so the server
 # is the saturated side. Client CPU must stay below 70% for a run to count;
@@ -21,9 +22,9 @@
 # the reports in `profile.tgz`. The client's first cell has started by then
 # (5 s warmup, 20 s measured). Profiled runs are for attribution only; the
 # sampling costs CPU, so their CPU time per request is not compared with
-# unprofiled runs. `perf_artifact` is `perf.tgz` from
-# `perf-bundle-build.toml` on the `ringline-ab` campaign branch: Debian's perf
-# and its libraries, which the base image lacks.
+# unprofiled runs. `perf_artifact` is a tarball of Debian's `perf` and the
+# libraries it needs (`out/perf/perf`, `out/perf/lib`), which the base image
+# lacks.
 #
 # Plan, fixed before running: five `a` and five `b` runs per mode,
 # alternating a b a b ..., closed-loop first. The open-loop rates are half

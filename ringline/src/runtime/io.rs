@@ -1056,15 +1056,7 @@ pub struct ConnCtx {
 /// reader's poll, taken after the generation check
 /// (`docs/recv-arrival-times-design.md`).
 fn arrival_mark(driver: &Driver, conn_index: u32) -> usize {
-    #[cfg(not(ringline_no_arrival_log))]
-    {
-        driver.recv_buffered(conn_index)
-    }
-    #[cfg(ringline_no_arrival_log)]
-    {
-        let _ = (driver, conn_index);
-        0
-    }
+    driver.recv_buffered(conn_index)
 }
 
 /// Settle a reporting reader's resolving poll in the connection's arrival
@@ -1073,13 +1065,8 @@ fn arrival_mark(driver: &Driver, conn_index: u32) -> usize {
 /// of stream, a close, or a hold overflow), which leaves `recv_arrival` at
 /// `None`.
 fn arrival_settle(driver: &mut Driver, conn_index: u32, before: usize, report: bool) {
-    #[cfg(not(ringline_no_arrival_log))]
-    {
-        let after = driver.recv_buffered(conn_index);
-        driver.arrival[conn_index as usize].settle_read(before, after, report);
-    }
-    #[cfg(ringline_no_arrival_log)]
-    let _ = (driver, conn_index, before, report);
+    let after = driver.recv_buffered(conn_index);
+    driver.arrival[conn_index as usize].settle_read(before, after, report);
 }
 
 /// Bytes a zero-copy `forward_recv_buf` detached from the accumulator during
