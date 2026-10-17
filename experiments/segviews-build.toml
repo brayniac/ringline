@@ -1,0 +1,51 @@
+# Build cachecannon twice for step 5 of docs/recv-segment-views-design.md and
+# upload both binaries as one artifact:
+#   cachecannon-a  brayniac/cachecannon exp/segviews-a (ringline main with the
+#                  proto crates' main branches by git rev)
+#   cachecannon-b  brayniac/cachecannon exp/segviews-b (the client crates read
+#                  with with_bytes_segments)
+# The builds differ only in the pins in Cargo.toml and Cargo.lock. Same
+# profile for both; no target-cpu=native.
+name = "segviews build (a={ref_a}, b={ref_b})"
+
+[params]
+repo  = "https://github.com/brayniac/cachecannon"
+ref_a = "exp/segviews-a"
+ref_b = "exp/segviews-b"
+
+[[jobs]]
+name = "build"
+tags = ["validation"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+shape = "z4.c"
+image = "spool/images/debian-13-ci-20260912.1@golden"
+slots = 1
+memory_gib = 8
+ports = 0
+gpu = false
+payload_timeout = 5400
+artifacts = ["/home/anvil/bins.tgz", "/home/anvil/build.log"]
+upload = true
+payload = '''
+set -uo pipefail
+cd /home/anvil
+{
+  cat /etc/anvil-instance.json
+  mkdir -p out
+  status=0
+  for arm in a b; do
+    case $arm in a) ref={ref_a};; b) ref={ref_b};; esac
+    git clone -q {repo} cc-$arm && git -C cc-$arm checkout -q $ref
+    echo "cachecannon-$arm: $(git -C cc-$arm log --oneline -1)"
+    grep -E '^(ringline|resp-proto|memcache-proto)[a-z-]* = \{ git' cc-$arm/Cargo.toml
+    ( cd cc-$arm && CARGO_PROFILE_RELEASE_LTO=thin CARGO_PROFILE_RELEASE_DEBUG=0 CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 cargo build --release --locked -j 2 ) || status=1
+    cp cc-$arm/target/release/cachecannon out/cachecannon-$arm || status=1
+  done
+  ( cd out && sha256sum * )
+  tar czf bins.tgz out
+  echo "build_status=$status"
+} 2>&1 | tee /home/anvil/build.log
+exit 0
+'''

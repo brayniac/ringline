@@ -1,0 +1,258 @@
+# Step 5, stage 1 of docs/recv-segment-views-design.md: screen cachecannon A
+# against B (experiments/segviews-build.toml), the client under test, on one
+# kernel and one host pair.
+#
+# Server: Valkey (RESP) and memcached on z1 (Debian 13, Linux 6.12), the same
+# for both builds. Client: cachecannon on z2 (Debian 13, Linux 6.12), 16
+# threads, 1,000 connections, GET only, read_values on.
+#
+# Cells: RESP and memcache text GET at value sizes 64 B, 4 KiB, 8 KiB and
+# 64 KiB, pipeline depth 1 and 16, and 1 MiB at depth 1 (depth 16 would hold
+# 16 GB in flight). 18 cells.
+#
+# phase = saturate: build A only, no rate limit, one pass: each cell's
+#   throughput, from which the fixed-rate pass takes 70%.
+# phase = fixed: builds A, B and A again (the A/A pair), in an order that
+#   rotates with rep, each at the cell's rate from `rates`
+#   ("resp-v64-d1=123456,..."). Submit with rep = 1, 2, 3.
+#
+# Each run records cachecannon's JSON result, its parquet metrics (ringline's
+# RECV_RING copy and view counters among them), and user and system CPU and
+# peak RSS from /usr/bin/time. Keys are written once per protocol and value
+# size by a prefill run that is not measured.
+name = "segviews screen {phase} rep{rep}"
+
+[params]
+bins_artifact  = "SET_AT_SUBMIT"
+phase          = "saturate"
+rep            = "1"
+rates          = ""
+image          = "spool/images/debian-13-base-20260912.1@golden"
+server_ip      = "172.31.0.1"
+client_ip      = "172.31.0.2"
+client_threads = "16"
+connections    = "1000"
+warmup         = "10s"
+duration       = "40s"
+
+[[jobs]]
+name = "server"
+tags = ["z1.baremetal"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "start"
+shape = "z1.c"
+image = "{image}"
+gpu = false
+data_address = "{server_ip}/24"
+boot_timeout = 600
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "exec"
+payload_timeout = 1200
+payload = '''
+set -uo pipefail
+cat /etc/anvil-instance.json
+uname -r
+sudo sysctl -w net.core.somaxconn=65535 net.ipv4.tcp_max_syn_backlog=65535 net.core.rmem_max=134217728 net.core.wmem_max=134217728
+sudo apt-get update -qq
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq valkey-server memcached >/dev/null || exit 1
+sudo systemctl stop valkey-server memcached 2>/dev/null || true
+valkey-server --version
+memcached -V
+'''
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "exec"
+detach = true
+unit = "valkey"
+metrics = true
+payload = "ulimit -n 1048576; exec valkey-server --bind {server_ip} --port 6379 --protected-mode no --save '' --appendonly no --io-threads 8 --maxclients 65000"
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "exec"
+detach = true
+unit = "memcached"
+payload = "ulimit -n 1048576; exec memcached -l {server_ip} -p 11211 -t 16 -m 16384 -c 65000 -I 2m -U 0"
+
+[[jobs.steps]]
+type = "barrier"
+name = "server-ready"
+timeout = 1800
+
+[[jobs.steps]]
+type = "barrier"
+name = "bench-done"
+timeout = 14400
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "stop"
+upload = true
+
+[[jobs]]
+name = "client"
+tags = ["z2.baremetal"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "start"
+shape = "z2.c"
+image = "{image}"
+gpu = false
+data_address = "{client_ip}/24"
+boot_timeout = 600
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "exec"
+payload_timeout = 1200
+inputs = [{ artifact = "{bins_artifact}", name = "bins.tgz", dest = "/home/anvil" }]
+payload = '''
+set -uo pipefail
+cd /home/anvil && tar xzf bins.tgz && chmod +x out/*
+( cd out && sha256sum * )
+uname -r
+sudo sysctl -w net.core.rmem_max=134217728 net.core.wmem_max=134217728 net.ipv4.ip_local_port_range="1024 65535"
+sudo apt-get update -qq
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq time >/dev/null || exit 1
+'''
+
+[[jobs.steps]]
+type = "barrier"
+name = "server-ready"
+timeout = 1800
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "exec"
+metrics = true
+upload = true
+artifacts = ["/home/anvil/results.tgz"]
+payload_timeout = 14000
+payload = '''
+set -uo pipefail
+cd /home/anvil
+mkdir -p results
+ulimit -n 1048576
+# Linux 6.14+ charges io_uring rings to RLIMIT_MEMLOCK; harmless on 6.12.
+ulimit -l unlimited 2>/dev/null || sudo prlimit --memlock=unlimited:unlimited --pid $$
+echo "client-limits memlock=$(ulimit -l) nofile=$(ulimit -n)"
+for port in 6379 11211; do
+  for i in $(seq 1 120); do
+    (exec 3<>/dev/tcp/{server_ip}/$port) 2>/dev/null && { exec 3>&-; echo "port $port reachable after $i s"; break; }
+    sleep 1
+  done
+done
+
+case "{phase}" in
+  saturate) order="a" ;;
+  fixed)
+    case "{rep}" in
+      1) order="a b a2" ;;
+      2) order="b a2 a" ;;
+      *) order="a2 a b" ;;
+    esac ;;
+  *) echo "BAD PHASE {phase}"; exit 1 ;;
+esac
+echo "phase={phase} rep={rep} order=$order"
+
+# config FILE PROTO PORT VLEN KEYS DEPTH RATE PREFILL DURATION WARMUP PARQUET
+config() {
+  local file=$1 proto=$2 port=$3 vlen=$4 keys=$5 depth=$6 rate=$7 prefill=$8 dur=$9
+  shift 9
+  local warm=$1 parquet=$2
+  local rate_line="" prefill_line="prefill = false"
+  [ -n "$rate" ] && rate_line="rate_limit = $rate"
+  [ "$prefill" = true ] && prefill_line=$'prefill = true\nprefill_settle = "0s"'
+  cat > "$file" <<CFG
+[general]
+duration = "$dur"
+warmup = "$warm"
+threads = {client_threads}
+ringline_diag = true
+
+[target]
+endpoints = ["{server_ip}:$port"]
+protocol = "$proto"
+
+[connection]
+connections = {connections}
+pipeline_depth = $depth
+connect_timeout = "10s"
+request_timeout = "5s"
+
+[workload]
+read_values = true
+$rate_line
+$prefill_line
+
+[workload.keyspace]
+length = 16
+count = $keys
+distribution = "uniform"
+
+[workload.commands]
+get = 100
+
+[workload.values]
+length = $vlen
+
+[admin]
+format = "json"
+parquet = "$parquet"
+CFG
+}
+
+for proto in resp memcache; do
+  case $proto in resp) port=6379;; memcache) port=11211;; esac
+  for vlen in 64 4096 8192 65536 1048576; do
+    case $vlen in
+      64) keys=1000000; depths="1 16";;
+      4096) keys=100000; depths="1 16";;
+      8192) keys=50000; depths="1 16";;
+      65536) keys=5000; depths="1 16";;
+      1048576) keys=400; depths="1";;
+    esac
+    # Write every key once; not measured.
+    config results/prefill-$proto-v$vlen.toml $proto $port $vlen $keys 1 "" true 1s 0s results/prefill-$proto-v$vlen.parquet
+    ./out/cachecannon-a results/prefill-$proto-v$vlen.toml > results/prefill-$proto-v$vlen.json 2> results/prefill-$proto-v$vlen.log
+    echo "== prefill $proto v$vlen rc=$?"
+    for depth in $depths; do
+      cell="$proto-v$vlen-d$depth"
+      rate=""
+      if [ "{phase}" = fixed ]; then
+        rate=$(echo "{rates}" | tr ',' '\n' | grep "^$cell=" | cut -d= -f2)
+        [ -n "$rate" ] || { echo "NO RATE for $cell"; continue; }
+      fi
+      for b in $order; do
+        case $b in b) bin=out/cachecannon-b ;; *) bin=out/cachecannon-a ;; esac
+        run="$cell-$b"
+        config results/$run.toml $proto $port $vlen $keys $depth "$rate" false {duration} {warmup} results/$run.parquet
+        /usr/bin/time -f "time user_s=%U sys_s=%S maxrss_kb=%M" -o results/$run.time \
+          $bin results/$run.toml > results/$run.json 2> results/$run.log
+        rc=$?
+        shown_rate=$rate; [ -n "$shown_rate" ] || shown_rate=max
+        echo "== phase={phase} rep={rep} cell=$cell build=$b rate=$shown_rate rc=$rc $(cat results/$run.time)"
+        grep '"type":"result"' results/$run.json || { echo "NO RESULT"; tail -5 results/$run.log; }
+        sleep 3
+      done
+    done
+  done
+done
+tar czf /home/anvil/results.tgz -C /home/anvil results
+exit 0
+'''
+
+[[jobs.steps]]
+type = "barrier"
+name = "bench-done"
+timeout = 14400
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "stop"
