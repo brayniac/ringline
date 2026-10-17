@@ -1,12 +1,16 @@
-//! An array reply that arrives in many pieces is not copied again on each
-//! arrival.
+//! An array reply that arrives in many pieces is parsed once, when complete.
 //!
-//! A stub server sends an `MGET` reply of 12 values of 4096 bytes in 4 KiB
-//! chunks, 2 ms apart, so the client reads after each chunk. Each value
-//! spans two receive buffers, so a parse of the whole reply copies about
-//! 48 KiB. A parse after every chunk would copy the values buffered so far
-//! each time, several times that. The allocator counts bytes allocated on
-//! the client's thread during the call. The bound applies on io_uring.
+//! A stub server answers `MGET` in 4 KiB chunks, 2 ms apart, so the client
+//! reads after each chunk. The allocator counts bytes allocated on the
+//! client's thread during one call. The bounds apply on io_uring.
+//!
+//! - 12 values of 4096 bytes, 49 KB: below the hold cap, so the reply is
+//!   presented in several pieces. Each value spans two receive buffers, so
+//!   one parse copies about 48 KiB; a parse after every chunk would copy the
+//!   values buffered so far each time.
+//! - 20,000 values of 10 bytes, 340 KB: above the hold cap, so after the
+//!   hold-cap copy the reply is presented as one piece. A parse after every
+//!   chunk would rebuild the array each time.
 
 mod common;
 
@@ -52,15 +56,32 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static ALLOCATOR: Counting = Counting;
 
-const VALUES: usize = 12;
-const VALUE_LEN: usize = 4096;
+/// A reply's shape: the values and their length.
+#[derive(Clone, Copy)]
+struct Shape {
+    values: usize,
+    len: usize,
+}
+
+/// Asked for with any key but `small`.
+const LARGE: Shape = Shape {
+    values: 12,
+    len: 4096,
+};
+
+/// Asked for with the key `small`.
+const SMALL: Shape = Shape {
+    values: 20_000,
+    len: 10,
+};
+
 const CHUNK: usize = 4096;
 
-fn reply() -> Vec<u8> {
-    let mut out = format!("*{VALUES}\r\n").into_bytes();
-    for i in 0..VALUES {
-        out.extend_from_slice(format!("${VALUE_LEN}\r\n").as_bytes());
-        out.extend(std::iter::repeat_n(b'a' + i as u8, VALUE_LEN));
+fn reply(shape: Shape) -> Vec<u8> {
+    let mut out = format!("*{}\r\n", shape.values).into_bytes();
+    for i in 0..shape.values {
+        out.extend_from_slice(format!("${}\r\n", shape.len).as_bytes());
+        out.extend(std::iter::repeat_n(b'a' + (i % 26) as u8, shape.len));
         out.extend_from_slice(b"\r\n");
     }
     out
@@ -79,7 +100,8 @@ fn test_config() -> ringline::Config {
         .expect("valid config")
 }
 
-/// Answers any command array with `reply()`, sent in `CHUNK`-byte pieces.
+/// Answers each command array with a reply of the shape it asks for, sent
+/// in `CHUNK`-byte pieces.
 struct StubServer;
 
 impl AsyncEventHandler for StubServer {
@@ -88,21 +110,23 @@ impl AsyncEventHandler for StubServer {
         async move {
             let (mut tx, mut rx) = conn.split();
             loop {
-                let mut requests = 0;
+                let mut shapes = Vec::new();
                 let n = rx
                     .with_bytes(|bytes| match Value::parse_bytes(bytes) {
-                        Ok((_, consumed)) => {
-                            requests += 1;
+                        Ok((Value::Array(items), consumed)) => {
+                            let small = items.iter().any(|item| item.as_bytes() == Some(b"small"));
+                            shapes.push(if small { SMALL } else { LARGE });
                             ParseResult::Consumed(consumed)
                         }
+                        Ok((_, consumed)) => ParseResult::Consumed(consumed),
                         Err(_) => ParseResult::NeedMore,
                     })
                     .await;
                 if n == 0 {
                     break;
                 }
-                for _ in 0..requests {
-                    for chunk in reply().chunks(CHUNK) {
+                for shape in shapes {
+                    for chunk in reply(shape).chunks(CHUNK) {
                         if tx.send_nowait(chunk).is_err() {
                             return;
                         }
@@ -119,7 +143,7 @@ impl AsyncEventHandler for StubServer {
 }
 
 static SERVER_ADDR: OnceLock<SocketAddr> = OnceLock::new();
-static RESULT: OnceLock<Result<usize, String>> = OnceLock::new();
+static RESULT: OnceLock<Result<[usize; 2], String>> = OnceLock::new();
 
 struct ClientHandler;
 
@@ -142,27 +166,18 @@ impl AsyncEventHandler for ClientHandler {
     }
 }
 
-/// The bytes allocated on this thread while one `MGET` reply is read.
-async fn run(addr: SocketAddr) -> Result<usize, String> {
-    let conn = ringline::connect(addr)
-        .await
-        .map_err(|e| format!("connect: {e}"))?;
-    let mut client = Client::new(conn);
-    let keys: Vec<Vec<u8>> = (0..VALUES).map(|i| format!("k{i}").into_bytes()).collect();
-    let key_refs: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
-    // The first read decides the read path; it is not counted.
-    client
-        .mget(&key_refs)
-        .await
-        .map_err(|e| format!("mget: {e}"))?;
-
+/// The bytes allocated on this thread while one reply of `shape` is read.
+async fn counted(client: &mut Client, key: &[u8], shape: Shape) -> Result<usize, String> {
     ALLOCATED.with(|a| a.set(0));
     COUNTING.with(|c| c.set(true));
-    let values = client.mget(&key_refs).await;
+    let values = client.mget(&[key]).await;
     COUNTING.with(|c| c.set(false));
     let values = values.map_err(|e| format!("mget: {e}"))?;
+    if values.len() != shape.values {
+        return Err(format!("{} values, want {}", values.len(), shape.values));
+    }
     for (i, value) in values.iter().enumerate() {
-        let want = vec![b'a' + i as u8; VALUE_LEN];
+        let want = vec![b'a' + (i % 26) as u8; shape.len];
         if value.as_deref() != Some(&want[..]) {
             return Err(format!("value {i} is wrong"));
         }
@@ -170,8 +185,21 @@ async fn run(addr: SocketAddr) -> Result<usize, String> {
     Ok(ALLOCATED.with(Cell::get))
 }
 
+async fn run(addr: SocketAddr) -> Result<[usize; 2], String> {
+    let conn = ringline::connect(addr)
+        .await
+        .map_err(|e| format!("connect: {e}"))?;
+    let mut client = Client::new(conn);
+    // The first read decides the read path; it is not counted.
+    counted(&mut client, b"large", LARGE).await?;
+    Ok([
+        counted(&mut client, b"large", LARGE).await?,
+        counted(&mut client, b"small", SMALL).await?,
+    ])
+}
+
 #[test]
-fn an_array_reply_in_many_pieces_is_copied_once() {
+fn an_array_reply_in_many_pieces_is_parsed_once() {
     let (s_shutdown, s_handles) = RinglineBuilder::new(test_config())
         .bind("127.0.0.1:0".parse().unwrap())
         .launch::<StubServer>()
@@ -188,18 +216,21 @@ fn an_array_reply_in_many_pieces_is_copied_once() {
         h.join().unwrap().unwrap();
     }
 
-    let allocated = match RESULT.get().expect("client did not set result") {
+    let [large, small] = match RESULT.get().expect("client did not set result") {
         Ok(allocated) => *allocated,
         Err(e) => panic!("{e}"),
     };
-    let reply_len = reply().len();
-    println!("allocated {allocated} bytes for a {reply_len}-byte reply");
+    let large_len = reply(LARGE).len();
+    let small_len = reply(SMALL).len();
+    println!("allocated {large} bytes for a {large_len}-byte reply of 12 values");
+    println!("allocated {small} bytes for a {small_len}-byte reply of 20,000 values");
     // On mio the reply is read into the accumulator, which reallocates as it
-    // grows; the values are slices of it.
+    // grows, and parsed on each read.
     if cfg!(has_io_uring) {
-        assert!(
-            allocated < 2 * reply_len,
-            "allocated {allocated} bytes for a {reply_len}-byte reply"
-        );
+        assert!(large < 2 * large_len, "{large} for {large_len} bytes");
+        // The array of values, the `Vec` `mget` returns, and the
+        // accumulator's growth: about 9 bytes per reply byte. A parse after
+        // every chunk allocates about 47.
+        assert!(small < 16 * small_len, "{small} for {small_len} bytes");
     }
 }

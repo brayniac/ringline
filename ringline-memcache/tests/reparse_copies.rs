@@ -1,12 +1,17 @@
-//! A multi-key reply that arrives in many pieces is not copied again on each
-//! arrival.
+//! A multi-key reply that arrives in many pieces is parsed once, when
+//! complete.
 //!
-//! A stub server sends a `gets` reply of 12 values of 4096 bytes in 4 KiB
-//! chunks, 2 ms apart, so the client reads after each chunk. Each value
-//! spans two receive buffers, so a parse of the whole reply copies about
-//! 48 KiB. A parse after every chunk would copy the values buffered so far
-//! each time, several times that. The allocator counts bytes allocated on
-//! the client's thread during the call. The bound applies on io_uring.
+//! A stub server answers `gets` in 4 KiB chunks, 2 ms apart, so the client
+//! reads after each chunk. The allocator counts bytes allocated on the
+//! client's thread during one call. The bounds apply on io_uring.
+//!
+//! - 12 values of 4096 bytes, 49 KB: below the hold cap, so the reply is
+//!   presented in several pieces. Each value spans two receive buffers, so
+//!   one parse copies about 48 KiB; a parse after every chunk would copy the
+//!   values buffered so far each time.
+//! - 5,000 values of 10 bytes, 159 KB: above the hold cap, so after the
+//!   hold-cap copy the reply is presented as one piece. A parse after every
+//!   chunk would rebuild the values each time.
 
 mod common;
 
@@ -51,15 +56,32 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static ALLOCATOR: Counting = Counting;
 
-const VALUES: usize = 12;
-const VALUE_LEN: usize = 4096;
+/// A reply's shape: the values and their length.
+#[derive(Clone, Copy)]
+struct Shape {
+    values: usize,
+    len: usize,
+}
+
+/// Asked for with any key but `small`.
+const LARGE: Shape = Shape {
+    values: 12,
+    len: 4096,
+};
+
+/// Asked for with the key `small`.
+const SMALL: Shape = Shape {
+    values: 5_000,
+    len: 10,
+};
+
 const CHUNK: usize = 4096;
 
-fn reply() -> Vec<u8> {
+fn reply(shape: Shape) -> Vec<u8> {
     let mut out = Vec::new();
-    for i in 0..VALUES {
-        out.extend_from_slice(format!("VALUE k{i} 0 {VALUE_LEN} 7\r\n").as_bytes());
-        out.extend(std::iter::repeat_n(b'a' + i as u8, VALUE_LEN));
+    for i in 0..shape.values {
+        out.extend_from_slice(format!("VALUE k{i} 0 {} 7\r\n", shape.len).as_bytes());
+        out.extend(std::iter::repeat_n(b'a' + (i % 26) as u8, shape.len));
         out.extend_from_slice(b"\r\n");
     }
     out.extend_from_slice(b"END\r\n");
@@ -79,7 +101,8 @@ fn test_config() -> ringline::Config {
         .expect("valid config")
 }
 
-/// Answers each request line with `reply()`, sent in `CHUNK`-byte pieces.
+/// Answers each request line with a reply of the shape it asks for, sent in
+/// `CHUNK`-byte pieces.
 struct StubServer;
 
 impl AsyncEventHandler for StubServer {
@@ -88,21 +111,24 @@ impl AsyncEventHandler for StubServer {
         async move {
             let (mut tx, mut rx) = conn.split();
             loop {
-                let mut requests = 0;
+                let mut shapes = Vec::new();
                 let n = rx
-                    .with_data(|bytes| match bytes.windows(2).position(|w| w == b"\r\n") {
-                        Some(end) => {
-                            requests += 1;
-                            ParseResult::Consumed(end + 2)
+                    .with_data(|bytes| {
+                        let mut at = 0;
+                        while let Some(end) = bytes[at..].windows(2).position(|w| w == b"\r\n") {
+                            let line = &bytes[at..at + end];
+                            let small = line.split(|&b| b == b' ').any(|word| word == b"small");
+                            shapes.push(if small { SMALL } else { LARGE });
+                            at += end + 2;
                         }
-                        None => ParseResult::NeedMore,
+                        ParseResult::Consumed(at)
                     })
                     .await;
                 if n == 0 {
                     break;
                 }
-                for _ in 0..requests {
-                    for chunk in reply().chunks(CHUNK) {
+                for shape in shapes {
+                    for chunk in reply(shape).chunks(CHUNK) {
                         if tx.send_nowait(chunk).is_err() {
                             return;
                         }
@@ -119,7 +145,7 @@ impl AsyncEventHandler for StubServer {
 }
 
 static SERVER_ADDR: OnceLock<SocketAddr> = OnceLock::new();
-static RESULT: OnceLock<Result<usize, String>> = OnceLock::new();
+static RESULT: OnceLock<Result<[usize; 2], String>> = OnceLock::new();
 
 struct ClientHandler;
 
@@ -142,27 +168,18 @@ impl AsyncEventHandler for ClientHandler {
     }
 }
 
-/// The bytes allocated on this thread while one `gets` reply is read.
-async fn run(addr: SocketAddr) -> Result<usize, String> {
-    let conn = ringline::connect(addr)
-        .await
-        .map_err(|e| format!("connect: {e}"))?;
-    let mut client = Client::new(conn);
-    let keys: Vec<Vec<u8>> = (0..VALUES).map(|i| format!("k{i}").into_bytes()).collect();
-    let key_refs: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
-    // The first read decides the read path; it is not counted.
-    client
-        .gets(&key_refs)
-        .await
-        .map_err(|e| format!("gets: {e}"))?;
-
+/// The bytes allocated on this thread while one reply of `shape` is read.
+async fn counted(client: &mut Client, key: &[u8], shape: Shape) -> Result<usize, String> {
     ALLOCATED.with(|a| a.set(0));
     COUNTING.with(|c| c.set(true));
-    let values = client.gets(&key_refs).await;
+    let values = client.gets(&[key]).await;
     COUNTING.with(|c| c.set(false));
     let values = values.map_err(|e| format!("gets: {e}"))?;
+    if values.len() != shape.values {
+        return Err(format!("{} values, want {}", values.len(), shape.values));
+    }
     for (i, value) in values.iter().enumerate() {
-        let want = vec![b'a' + i as u8; VALUE_LEN];
+        let want = vec![b'a' + (i % 26) as u8; shape.len];
         if value.data[..] != want[..] {
             return Err(format!("value {i} is wrong"));
         }
@@ -170,8 +187,21 @@ async fn run(addr: SocketAddr) -> Result<usize, String> {
     Ok(ALLOCATED.with(Cell::get))
 }
 
+async fn run(addr: SocketAddr) -> Result<[usize; 2], String> {
+    let conn = ringline::connect(addr)
+        .await
+        .map_err(|e| format!("connect: {e}"))?;
+    let mut client = Client::new(conn);
+    // The first read decides the read path; it is not counted.
+    counted(&mut client, b"large", LARGE).await?;
+    Ok([
+        counted(&mut client, b"large", LARGE).await?,
+        counted(&mut client, b"small", SMALL).await?,
+    ])
+}
+
 #[test]
-fn a_multi_key_reply_in_many_pieces_is_copied_once() {
+fn a_multi_key_reply_in_many_pieces_is_parsed_once() {
     let (s_shutdown, s_handles) = RinglineBuilder::new(test_config())
         .bind("127.0.0.1:0".parse().unwrap())
         .launch::<StubServer>()
@@ -188,18 +218,21 @@ fn a_multi_key_reply_in_many_pieces_is_copied_once() {
         h.join().unwrap().unwrap();
     }
 
-    let allocated = match RESULT.get().expect("client did not set result") {
+    let [large, small] = match RESULT.get().expect("client did not set result") {
         Ok(allocated) => *allocated,
         Err(e) => panic!("{e}"),
     };
-    let reply_len = reply().len();
-    println!("allocated {allocated} bytes for a {reply_len}-byte reply");
+    let large_len = reply(LARGE).len();
+    let small_len = reply(SMALL).len();
+    println!("allocated {large} bytes for a {large_len}-byte reply of 12 values");
+    println!("allocated {small} bytes for a {small_len}-byte reply of 5,000 values");
     // On mio the reply is read into the accumulator, which reallocates as it
-    // grows; the values are slices of it.
+    // grows, and parsed on each read.
     if cfg!(has_io_uring) {
-        assert!(
-            allocated < 2 * reply_len,
-            "allocated {allocated} bytes for a {reply_len}-byte reply"
-        );
+        assert!(large < 2 * large_len, "{large} for {large_len} bytes");
+        // The values, the `Vec` `gets` returns with a copy of each short
+        // key, and the accumulator's growth: about 15 bytes per reply byte.
+        // A parse after every chunk allocates about 177.
+        assert!(small < 32 * small_len, "{small} for {small_len} bytes");
     }
 }

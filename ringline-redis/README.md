@@ -4,7 +4,8 @@
 
 A RESP protocol client built on [`ringline::ConnCtx`](https://docs.rs/ringline) for
 use inside the ringline async runtime. Single-threaded, single-connection. On
-io_uring a value inside one receive buffer is returned without a copy.
+io_uring, over plaintext, a value inside one receive buffer and at least
+`recv_zc_threshold` long is returned without a copy.
 
 ## Quick Start
 
@@ -36,7 +37,7 @@ async fn example(conn: ConnCtx) -> Result<(), ringline_redis::Error> {
 
 | Path | Copies | Mechanism |
 |------|--------|-----------|
-| **Recv (values)** | 0 or 1; 2 next to a refused lend | `with_bytes_segments()` + `Value::parse_segments()`. See the crate documentation's copy semantics. |
+| **Recv (values)** | 0 or 1; 2 across a copied piece | `with_bytes_segments()` + `Value::parse_segments()`. See the crate documentation's copy semantics. |
 | **Send (commands)** | 1 | RESP serialized into `Vec<u8>`, then copied into the send pool. |
 | **Send (SET value, standard)** | 1 | All parts gathered into one send-pool slot via `send_parts().copy()`. |
 | **Send (SET value, guard)** | 0 (value) | `set_with_guard` / `set_ex_with_guard`: RESP prefix+suffix copied to pool, value stays in-place via `SendGuard`. |

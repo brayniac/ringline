@@ -2,8 +2,9 @@
 //!
 //! This client wraps a [`ringline::ConnCtx`] and provides typed Memcache command
 //! methods that read text-protocol replies with `with_bytes_segments()` +
-//! `ResponseBytes::parse_segments()`. On io_uring a value inside one receive
-//! buffer is returned as a slice of it. It is designed for
+//! `ResponseBytes::parse_segments()`. On io_uring, over plaintext, a value
+//! inside one receive buffer and at least `recv_zc_threshold` long is
+//! returned as a slice of it. It is designed for
 //! single-threaded, single-connection use within ringline's
 //! `AsyncEventHandler::on_start()` or connection tasks.
 //!
@@ -116,7 +117,7 @@
 //!
 //! | Path | Copies | Mechanism |
 //! |------|--------|-----------|
-//! | **Recv (values)** | 0 or 1; 2 next to a refused lend | `with_bytes_segments()` + `ResponseBytes::parse_segments()`. On io_uring a value inside one ring buffer and at least `recv_zc_threshold` long is a view of that buffer (0 copies); a shorter one is copied out of it (`ringline::copy_small_view`); one that spans buffers is copied by the parser. Keys are copied the same way where a call returns them ([`Client::gets`]). A value in a reply longer than the hold cap is copied into the accumulator by the runtime, as the reply arrives, and sliced (1). A reply in several pieces is scanned (`ResponseBytes::scan_segments`) on each arrival and parsed once, when complete. A value that spans a refused lend's copy and another piece is copied twice. TLS connections read with `with_bytes`, and on mio values are slices of the accumulator, which the bytes were copied into (1). |
+//! | **Recv (values)** | 0 or 1; 2 across a copied piece | `with_bytes_segments()` + `ResponseBytes::parse_segments()`. On io_uring a value inside one ring buffer and at least `recv_zc_threshold` long is a view of that buffer (0 copies); a shorter one is copied out of it (`ringline::copy_small_view`); one that spans buffers is copied by the parser. Keys are copied the same way where a call returns them ([`Client::gets`]). A value in a reply longer than the hold cap is copied into the accumulator by the runtime, as the reply arrives, and sliced (1). A reply in several pieces is scanned (`ResponseBytes::scan_segments`) on each arrival and parsed once, when complete. A value that starts in a copied piece (a refused lend's copy, or bytes left in the accumulator by a reply longer than the hold cap or by `end_segments`) and ends in a later buffer is copied twice. TLS connections read with `with_bytes`, and on mio values are slices of the accumulator, which the bytes were copied into (1). |
 //! | **Recv (binary protocol)** | 1 | [`BinaryClient`] reads with `with_bytes()`; values are slices of the accumulator, which the bytes were copied into. |
 //! | **Send (commands)** | 1 | Requests are encoded into a reusable per-client buffer (no per-request allocation), then `conn.send()` copies into the send pool. |
 //! | **Send (SET value, guard)** | 0 (value) | [`Client::set_with_guard`]: prefix+suffix copied to pool, value stays in-place via `SendGuard`. |
@@ -1157,6 +1158,7 @@ impl Client {
     /// instrumented client, their arrival times.
     async fn read_reply(&mut self) -> Reply<McResponseBytes> {
         let mut result: Option<Result<McResponseBytes, Error>> = None;
+        let mut incomplete = false;
         let segmented = !self.binary
             && *self
                 .segmented
@@ -1180,8 +1182,8 @@ impl Client {
                 .await
         } else if !segmented {
             self.rx
-                .with_bytes(
-                    |bytes| match read_response_in(std::slice::from_ref(&bytes)) {
+                .with_bytes(|bytes| {
+                    match read_response_in(std::slice::from_ref(&bytes), &mut incomplete) {
                         ResponseIn::Done(response, consumed) => {
                             result = Some(Ok(response));
                             ParseResult::Consumed(consumed)
@@ -1191,13 +1193,13 @@ impl Client {
                             result = Some(Err(Error::Protocol(e)));
                             ParseResult::Consumed(bytes.len())
                         }
-                    },
-                )
+                    }
+                })
                 .await
         } else {
             let read = self
                 .rx
-                .with_bytes_segments(|pieces| match read_response_in(pieces) {
+                .with_bytes_segments(|pieces| match read_response_in(pieces, &mut incomplete) {
                     ResponseIn::Done(response, consumed) => {
                         let copied = parser_copied(&response, pieces);
                         if copied > 0 {
@@ -2857,32 +2859,41 @@ enum ResponseIn {
     Done(McResponseBytes, usize),
     /// An incomplete response that needs at least this many more bytes.
     Needs(usize),
-    /// Bytes that are not a text-protocol response.
+    /// Bytes the parser rejects: not a text-protocol response, or a line
+    /// past the line limit.
     Bad(memcache_proto::ParseError),
 }
 
 /// Parse the text-protocol response at the start of `pieces`, or find how
-/// many more bytes it needs.
+/// many more bytes it needs. `incomplete` is the read's state across calls:
+/// whether an earlier call found the response incomplete.
 ///
-/// Over several pieces the response is scanned first and parsed only once it
-/// is complete: a parse of an incomplete response copies each key and value
-/// that spans pieces and discards the copies when it reaches the end. Over
-/// one piece a parse copies nothing, so it runs first, and the scan only
-/// sizes the wait.
-fn read_response_in(pieces: &[Bytes]) -> ResponseIn {
-    if pieces.len() > 1 {
+/// A parse of an incomplete response builds the values it reaches (copying
+/// each key and value that spans pieces) and discards them. So once a
+/// response is known to be incomplete, and whenever it is in several pieces,
+/// it is scanned first and parsed only when complete. The first call over
+/// one piece parses first, since the response is usually complete then;
+/// after an incomplete parse, the scan computes the `NeedAtLeast` bound.
+fn read_response_in(pieces: &[Bytes], incomplete: &mut bool) -> ResponseIn {
+    if *incomplete || pieces.len() > 1 {
         match McResponseBytes::scan_segments(pieces) {
             Ok(Frame::Complete(_)) => {}
-            Ok(Frame::Incomplete(more)) => return ResponseIn::Needs(more),
+            Ok(Frame::Incomplete(more)) => {
+                *incomplete = true;
+                return ResponseIn::Needs(more);
+            }
             Err(e) => return ResponseIn::Bad(e),
         }
     }
     match McResponseBytes::parse_segments(pieces) {
         Ok((response, consumed)) => ResponseIn::Done(response, consumed),
-        Err(e) if e.is_incomplete() => match McResponseBytes::scan_segments(pieces) {
-            Ok(Frame::Incomplete(more)) => ResponseIn::Needs(more),
-            Ok(Frame::Complete(_)) | Err(_) => ResponseIn::Needs(1),
-        },
+        Err(e) if e.is_incomplete() => {
+            *incomplete = true;
+            match McResponseBytes::scan_segments(pieces) {
+                Ok(Frame::Incomplete(more)) => ResponseIn::Needs(more),
+                Ok(Frame::Complete(_)) | Err(_) => ResponseIn::Needs(1),
+            }
+        }
         Err(e) => ResponseIn::Bad(e),
     }
 }
@@ -3760,7 +3771,7 @@ mod segment_read_tests {
     }
 
     fn read(parts: &[&[u8]]) -> ResponseIn {
-        read_response_in(&pieces(parts))
+        read_response_in(&pieces(parts), &mut false)
     }
 
     /// Once a `VALUE` line is in, the need is the data, its CRLF and

@@ -184,8 +184,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   with `with_bytes`.
 - `with_bytes_segments`: after a hold-cap copy, bytes that arrive before the
   call resolves are copied to the accumulator too, so the message is
-  presented as one piece and a value spanning the copy is not copied again
-  by the parser.
+  presented as one piece and a value inside it is not copied again by the
+  parser. A value that starts in bytes left in the accumulator when the call
+  resolves and ends in a later buffer is still copied twice.
 - `ringline` takes `bytes` from the workspace, so it requires 1.11.1 or
   later, as the other crates do; views use `Bytes::from_owner` (1.9). On
   io_uring a provided-buffer ring's buffers are an anonymous mapping, shared

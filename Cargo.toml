@@ -86,5 +86,5 @@ webpki-roots = "0.26"
 # branches with `Value::for_each_bytes_mut` and the `scan_segments` scanners.
 # Not for main.
 [patch.crates-io]
-resp-proto = { git = "https://github.com/brayniac/resp-proto", rev = "76827c3348b1ad94fe4ef3eba98365b60caef79e" }
-memcache-proto = { git = "https://github.com/brayniac/memcache-proto", rev = "90ac1398561d631d00f7955b73169cce8b9fedb4" }
+resp-proto = { git = "https://github.com/brayniac/resp-proto", rev = "4edb129eaff7cf9b831a83da156713fdd024472a" }
+memcache-proto = { git = "https://github.com/brayniac/memcache-proto", rev = "aa2e39c6f7692fa798bab7c753ad6fa2c26d4b01" }

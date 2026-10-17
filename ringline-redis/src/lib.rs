@@ -2,8 +2,9 @@
 //!
 //! This client wraps a [`ringline::ConnCtx`] and provides typed Redis command
 //! methods that read replies with `with_bytes_segments()` +
-//! `Value::parse_segments()`. On io_uring a value inside one receive buffer
-//! is returned as a slice of it. It is designed for single-threaded,
+//! `Value::parse_segments()`. On io_uring, over plaintext, a value inside one
+//! receive buffer and at least `recv_zc_threshold` long is returned as a
+//! slice of it. It is designed for single-threaded,
 //! single-connection use within ringline's `AsyncEventHandler::on_start()` or
 //! connection tasks.
 //!
@@ -143,7 +144,7 @@
 //!
 //! | Path | Copies | Mechanism |
 //! |------|--------|-----------|
-//! | **Recv (values)** | 0 or 1; 2 next to a refused lend | `with_bytes_segments()` + `Value::parse_segments()`. On io_uring a string inside one ring buffer and at least `recv_zc_threshold` long is a view of that buffer (0 copies); a shorter one is copied out of it (`ringline::copy_small_view`); one that spans buffers is copied by the parser. `OK`, `PONG` and `QUEUED` are returned as static `Bytes`. A string in a reply longer than the hold cap is copied into the accumulator by the runtime, as the reply arrives, and sliced (1). A reply in several pieces is scanned (`Value::scan_segments`) on each arrival and parsed once, when complete. A string that spans a refused lend's copy and another piece is copied twice. TLS connections read with `with_bytes`, and on mio strings are slices of the accumulator, which the bytes were copied into (1). |
+//! | **Recv (values)** | 0 or 1; 2 across a copied piece | `with_bytes_segments()` + `Value::parse_segments()`. On io_uring a string inside one ring buffer and at least `recv_zc_threshold` long is a view of that buffer (0 copies); a shorter one is copied out of it (`ringline::copy_small_view`); one that spans buffers is copied by the parser. `OK`, `PONG` and `QUEUED` are returned as static `Bytes`. A string in a reply longer than the hold cap is copied into the accumulator by the runtime, as the reply arrives, and sliced (1). A reply in several pieces is scanned (`Value::scan_segments`) on each arrival and parsed once, when complete. A string that starts in a copied piece (a refused lend's copy, or bytes left in the accumulator by a reply longer than the hold cap or by `end_segments`) and ends in a later buffer is copied twice. TLS connections read with `with_bytes`, and on mio strings are slices of the accumulator, which the bytes were copied into (1). |
 //! | **Send (commands)** | 1 | `encode_request()` serializes RESP into `Vec<u8>`, then `conn.send()` copies into the send pool. |
 //! | **Send (SET value, standard)** | 1 | All parts gathered into one send-pool slot via `send_parts().copy()`. |
 //! | **Send (SET value, guard)** | 0 (value) | [`Client::set_with_guard`] / [`Client::set_ex_with_guard`]: RESP prefix+suffix copied to pool, value stays in-place via `SendGuard`. |
@@ -767,10 +768,11 @@ pub(crate) async fn read_value_from(
         .max_bulk_string_len(usize::MAX)
         .max_collection_elements(MAX_COLLECTION)
         .max_total_items(MAX_COLLECTION);
+    let mut incomplete = false;
     if !segmented {
         let n = rx
-            .with_bytes(
-                |bytes| match read_reply_in(std::slice::from_ref(&bytes), &options) {
+            .with_bytes(|bytes| {
+                match read_reply_in(std::slice::from_ref(&bytes), &options, &mut incomplete) {
                     ReplyIn::Done(value, consumed) => {
                         result = Some(Ok(value));
                         ParseResult::Consumed(consumed)
@@ -780,31 +782,33 @@ pub(crate) async fn read_value_from(
                         result = Some(Err(Error::Protocol(e)));
                         ParseResult::Consumed(bytes.len())
                     }
-                },
-            )
+                }
+            })
             .await;
         return finish_read(result, n, tx);
     }
     let threshold = ringline::recv_zc_threshold();
     let n = match rx
-        .with_bytes_segments(|pieces| match read_reply_in(pieces, &options) {
-            ReplyIn::Done(mut value, consumed) => {
-                let copied = parser_copied(&mut value, pieces);
-                if copied > 0 {
-                    ringline::metrics::RECV_RING.add(
-                        ringline::metrics::recv_ring::SEGMENT_PARSE_COPIED,
-                        copied as u64,
-                    );
+        .with_bytes_segments(
+            |pieces| match read_reply_in(pieces, &options, &mut incomplete) {
+                ReplyIn::Done(mut value, consumed) => {
+                    let copied = parser_copied(&mut value, pieces);
+                    if copied > 0 {
+                        ringline::metrics::RECV_RING.add(
+                            ringline::metrics::recv_ring::SEGMENT_PARSE_COPIED,
+                            copied as u64,
+                        );
+                    }
+                    result = Some(Ok(value));
+                    ParseResult::Consumed(consumed)
                 }
-                result = Some(Ok(value));
-                ParseResult::Consumed(consumed)
-            }
-            ReplyIn::Needs(more) => ParseResult::NeedAtLeast(more),
-            ReplyIn::Bad(e) => {
-                result = Some(Err(Error::Protocol(e)));
-                ParseResult::Consumed(pieces.iter().map(Bytes::len).sum())
-            }
-        })
+                ReplyIn::Needs(more) => ParseResult::NeedAtLeast(more),
+                ReplyIn::Bad(e) => {
+                    result = Some(Err(Error::Protocol(e)));
+                    ParseResult::Consumed(pieces.iter().map(Bytes::len).sum())
+                }
+            },
+        )
         .await
     {
         Ok(n) => n,
@@ -4001,31 +4005,45 @@ enum ReplyIn {
     Done(Value, usize),
     /// An incomplete reply that needs at least this many more bytes.
     Needs(usize),
-    /// Bytes that are not RESP.
+    /// Bytes the parser rejects: not RESP, or past a limit in the parse
+    /// options.
     Bad(resp_proto::ParseError),
 }
 
 /// Parse the reply at the start of `pieces`, or find how many more bytes it
-/// needs.
+/// needs. `incomplete` is the read's state across calls: whether an earlier
+/// call found the reply incomplete.
 ///
-/// Over several pieces the reply is scanned first and parsed only once it is
-/// complete: a parse of an incomplete reply copies each string that spans
-/// pieces and discards the copies when it reaches the end. Over one piece a
-/// parse copies nothing, so it runs first, and the scan only sizes the wait.
-fn read_reply_in(pieces: &[Bytes], options: &resp_proto::ParseOptions) -> ReplyIn {
-    if pieces.len() > 1 {
+/// A parse of an incomplete reply builds the values it reaches (copying each
+/// string that spans pieces) and discards them. So once a reply is known to
+/// be incomplete, and whenever it is in several pieces, it is scanned first
+/// and parsed only when complete. The first call over one piece parses
+/// first, since the reply is usually complete then; after an incomplete
+/// parse, the scan computes the `NeedAtLeast` bound.
+fn read_reply_in(
+    pieces: &[Bytes],
+    options: &resp_proto::ParseOptions,
+    incomplete: &mut bool,
+) -> ReplyIn {
+    if *incomplete || pieces.len() > 1 {
         match Value::scan_segments_with_options(pieces, options) {
             Ok(Frame::Complete(_)) => {}
-            Ok(Frame::Incomplete(more)) => return ReplyIn::Needs(more),
+            Ok(Frame::Incomplete(more)) => {
+                *incomplete = true;
+                return ReplyIn::Needs(more);
+            }
             Err(e) => return ReplyIn::Bad(e),
         }
     }
     match Value::parse_segments_with_options(pieces, options) {
         Ok((value, consumed)) => ReplyIn::Done(value, consumed),
-        Err(e) if e.is_incomplete() => match Value::scan_segments_with_options(pieces, options) {
-            Ok(Frame::Incomplete(more)) => ReplyIn::Needs(more),
-            Ok(Frame::Complete(_)) | Err(_) => ReplyIn::Needs(1),
-        },
+        Err(e) if e.is_incomplete() => {
+            *incomplete = true;
+            match Value::scan_segments_with_options(pieces, options) {
+                Ok(Frame::Incomplete(more)) => ReplyIn::Needs(more),
+                Ok(Frame::Complete(_)) | Err(_) => ReplyIn::Needs(1),
+            }
+        }
         Err(e) => ReplyIn::Bad(e),
     }
 }
@@ -4038,8 +4056,7 @@ fn read_reply_in(pieces: &[Bytes], options: &resp_proto::ParseOptions) -> ReplyI
 fn copy_small_views(value: &mut Value, threshold: u32) {
     value.for_each_bytes_mut(|b| {
         *b = match &b[..] {
-            // The replies to SET, PING and MULTI's commands, which callers
-            // discard.
+            // The replies to SET, PING and the commands queued by MULTI.
             b"OK" => Bytes::from_static(b"OK"),
             b"PONG" => Bytes::from_static(b"PONG"),
             b"QUEUED" => Bytes::from_static(b"QUEUED"),
@@ -4079,7 +4096,7 @@ mod segment_read_tests {
     }
 
     fn read(parts: &[&[u8]]) -> ReplyIn {
-        read_reply_in(&pieces(parts), &resp_proto::ParseOptions::new())
+        read_reply_in(&pieces(parts), &resp_proto::ParseOptions::new(), &mut false)
     }
 
     #[test]

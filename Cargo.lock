@@ -1047,7 +1047,7 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 [[package]]
 name = "memcache-proto"
 version = "0.0.5"
-source = "git+https://github.com/brayniac/memcache-proto?rev=90ac1398561d631d00f7955b73169cce8b9fedb4#90ac1398561d631d00f7955b73169cce8b9fedb4"
+source = "git+https://github.com/brayniac/memcache-proto?rev=aa2e39c6f7692fa798bab7c753ad6fa2c26d4b01#aa2e39c6f7692fa798bab7c753ad6fa2c26d4b01"
 dependencies = [
  "bytes",
  "itoa",
@@ -1615,7 +1615,7 @@ dependencies = [
 [[package]]
 name = "resp-proto"
 version = "0.0.2"
-source = "git+https://github.com/brayniac/resp-proto?rev=76827c3348b1ad94fe4ef3eba98365b60caef79e#76827c3348b1ad94fe4ef3eba98365b60caef79e"
+source = "git+https://github.com/brayniac/resp-proto?rev=4edb129eaff7cf9b831a83da156713fdd024472a#4edb129eaff7cf9b831a83da156713fdd024472a"
 dependencies = [
  "bytes",
  "itoa",

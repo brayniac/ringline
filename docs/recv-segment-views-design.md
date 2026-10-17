@@ -1,7 +1,8 @@
 # Segment views: `Bytes` over held receive buffers for segment parsers
 
 Status: landing steps 1 (the view machinery), 2 (the reader) and 3
-(`recv_zc_threshold`) are implemented; steps 4 to 6 are a proposal.
+(`recv_zc_threshold`) are on main. Steps 4 and 6 are on the unmerged
+branch that carries this text; step 5 has not run.
 
 Related: `docs/recv-incremental-ring-design.md` ("`with_bytes`", the owner
 decisions of 2026-10-08 on views and `recv_zc_threshold`),
@@ -696,8 +697,13 @@ is zeroed eagerly, which would make the whole ring resident at startup.
      copies; parsing on every arrival of a reply of 12 values of 4 KiB
      allocated 337 KB against 62 KB. The scan's lower bound on the bytes
      still needed is returned as `NeedAtLeast`, so the parser is not called
-     again until they arrive. A reply in one piece is parsed first, since
-     that parse copies nothing;
+     again until they arrive. On a read's first call a reply in one piece is
+     parsed first, since it is usually complete then and that parse copies
+     nothing; after an incomplete result every call scans first, because a
+     parse of an incomplete reply in one piece still builds the values it
+     reaches (20,000 values of 10 bytes, presented as one piece after a
+     hold-cap copy, allocated 15.9 MB parsed on every arrival and 3.1 MB
+     scanned first);
    - reads TLS connections with `with_bytes`, as before. Their plaintext is
      copied out of the TLS engine anyway, into heap pieces, and the parser
      would copy a value spanning two of them again; through the
