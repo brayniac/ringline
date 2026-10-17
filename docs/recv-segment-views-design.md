@@ -156,10 +156,6 @@ the hold as an `Owned` entry (`feed_tls_recv` with
 `PlaintextSink::Segments`), so its pieces are heap `Bytes`, not views; a
 value inside one chunk is still not copied again.
 
-The `timestamps` feature is removed before step 2 lands (#TSPR). Its receive
-path appends every completion to the accumulator in either domain, which
-would present new bytes ahead of held ones.
-
 On mio the slice has at most one element, the accumulator. Mio has no
 `SegmentReader`, and has a forward (`forward_to_conn`, `forward_conn`). The
 mio path follows the io_uring reader:
@@ -253,6 +249,23 @@ next; the parser can keep them past the callback. The `Bytes` handed to the
 parser for the accumulator is the accumulator's own frozen buffer, as in
 `with_bytes`, and slices of it are not views.
 
+## Arrival times
+
+`with_bytes_segments` is a reporting reader of the arrival log
+(`docs/recv-arrival-times-design.md`, "The consumed range"), and settles as
+`with_segments` does: each poll whose handle matches takes `arrival_mark`,
+and a poll that returns `Ready` calls `arrival_settle`, with `report` true
+only for `Ok(k)` with `k > 0`. `Err(EBUSY)`, end of stream and a close at
+`recv_accumulator_max` leave `Connection::recv_arrival` at `None`; a stale
+handle does not touch the log.
+
+`recv_buffered` counts the accumulator, `pending_recv_bufs` and
+`segment_hold`. Entering the domain, converting a lend to a `Pinned` entry
+and the hold-cap copy move bytes between those three without changing the
+sum, so the range a call reports is the `k` bytes its `Consumed(k)` removed.
+A view the parser keeps holds consumed bytes, which are not in
+`recv_buffered` and do not delay the arrival log's trim.
+
 ## Views
 
 Step 1 moves a ring's buffer memory into `RingMemory`, an anonymous mapping
@@ -300,6 +313,11 @@ the worker that created it; the memory id is read from the `Arc`.
   because `at_hold_cap` counts `segment_hold` entries. With a lend cap, kept
   views count in `held()` against it; without one, they count in `free()`
   against `recv_segment_reserve`.
+- A view does not block a park. `park_blocker` refuses a park while
+  `holds_unread` is true, which covers `segment_hold` and `segment_pinned`
+  but not views. A view's buffer hold belongs to the worker's ring, and a
+  view of a parked connection is released to the worker that created it,
+  like any other view.
 
 The default-domain `with_bytes` views decided in
 `docs/recv-incremental-ring-design.md` ("`with_bytes`") can use `RecvView`
@@ -478,12 +496,14 @@ is zeroed eagerly, which would make the whole ring resident at startup.
 - `Consumed(k)` with `k` past the bytes presented consumes only the bytes
   presented.
 - `end_segments` on mio returns `Ok(())`.
+- `recv_arrival` after a `Consumed(k)` call over several pieces reports the
+  arrival of the first and last consumed byte, on both backends, and after
+  a hold-cap copy; after a call that resolved to `Err(EBUSY)` it is `None`.
+- A connection with a view alive and nothing held can be parked.
 - Client crates: a value inside one piece is a view; a value across pieces
   is owned; a view below the threshold is copied by the helper.
 
 ## Landing
-
-Before step 2, the `timestamps` feature is removed (#TSPR).
 
 1. View machinery: `RingMemory`, `RecvView`, `Orphan::RecvView`, the inbox
    release, the memory id check, and the view counters. No public API; tests
@@ -500,6 +520,9 @@ Before step 2, the `timestamps` feature is removed (#TSPR).
    - the segment term of `at_hold_cap` split into its own `Driver` method;
    - the bytes-copied counter;
    - `end_segments` on mio;
+   - arrival reporting, with `with_bytes_segments` added to the list of
+     reporting readers in `Connection::recv_arrival` and in
+     `docs/recv-arrival-times-design.md`;
    - rustdoc: `ParseResult::NeedAtLeast`, the `RecvHalf` note that mio has
      no segmented domain, `with_bytes_segments` in `RecvHalf`'s list of
      methods whose futures carry no borrow, and the
