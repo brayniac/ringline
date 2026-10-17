@@ -344,6 +344,8 @@ pub use runtime::io::UdpRecvFuture;
 pub use runtime::io::UnixConnect;
 /// Future that provides received data as zero-copy `Bytes`.
 pub use runtime::io::WithBytesFuture;
+/// Future returned by [`Connection::with_bytes_segments()`].
+pub use runtime::io::WithBytesSegmentsFuture;
 /// Future that provides received data.
 pub use runtime::io::WithDataFuture;
 /// Future that resolves with recv data, `Ok(0)` on clean close, or the transport error.

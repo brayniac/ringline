@@ -184,9 +184,10 @@ counter counts only these lookups; the reordering cases under "Limits" return
 wrong times without it.
 
 The reporting readers are the public readers on `Connection` and `RecvHalf`:
-`with_data`, `with_data_result`, `with_bytes`, `try_with_data`, and, on
-io_uring, `with_segments`. Forwards, recv sinks, direct echo, `ConnStream`,
-`SegmentReader::next` and `recv_owned_segment` do not set `latest`.
+`with_data`, `with_data_result`, `with_bytes`, `with_bytes_segments`,
+`try_with_data`, and, on io_uring, `with_segments`. Forwards, recv sinks,
+direct echo, `ConnStream`, `SegmentReader::next` and `recv_owned_segment` do
+not set `latest`.
 
 ### Bounding the log
 

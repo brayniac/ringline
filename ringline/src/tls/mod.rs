@@ -868,6 +868,7 @@ fn drain_tls_plaintext(
                 hold.push_back(crate::backend::HeldRecvBuf::Owned(
                     bytes::Bytes::copy_from_slice(chunk),
                 ));
+                crate::accumulator::note_copied(n);
                 *outstanding += n;
             }
         }

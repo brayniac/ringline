@@ -495,6 +495,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.driver.tcp_streams[idx] = Some(mio_stream);
             self.driver.accumulators.reset(conn_index);
             self.driver.arrival[idx].clear();
+            self.driver.recv_dropped[idx] = 0;
             // Defensive: a freshly allocated slot should have an empty send
             // queue, but if anything survived, its awaited sends must be
             // failed and its permits returned rather than dropped.
@@ -683,6 +684,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.executor.wake_recv(conn_index);
             return true;
         }
+        self.driver.recv_dropped[conn_index as usize] += data.len() as u64;
         self.executor.wake_recv(conn_index);
         self.driver.close_connection(conn_index);
         false
@@ -966,6 +968,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     }
                     // Check if the connection has a recv sink (direct-to-buffer).
                     let sink = &mut self.executor.recv_sinks[idx];
+                    let mut to_accumulator = n;
                     let appended = if let Some(recv_sink) = sink {
                         let remaining = recv_sink.cap - recv_sink.pos;
                         let to_copy = n.min(remaining);
@@ -980,6 +983,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                             recv_sink.pos += to_copy;
                         }
                         // If there's overflow beyond the sink, put it in accumulator.
+                        to_accumulator = n - to_copy;
                         if n > to_copy {
                             self.driver
                                 .accumulators
@@ -995,6 +999,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                         // already read off the socket, so the stream cannot
                         // continue coherently — close rather than OOM,
                         // matching the uring and mio-TLS overflow paths.
+                        self.driver.recv_dropped[idx] += to_accumulator as u64;
                         self.executor.wake_recv(conn_index);
                         self.driver.close_connection(conn_index);
                         break;
@@ -2571,5 +2576,225 @@ mod tests {
         assert!(el.drain_forward_resumes(&mut buf));
         assert_eq!(el.driver.arrival[source as usize].delivered(), 2);
         assert_eq!(el.driver.arrival[source as usize].len(), 2);
+    }
+
+    // ── with_bytes_segments on mio ──────────────────────────────────────
+
+    /// Deliver `data` into `conn_index`'s accumulator, as the read path does.
+    fn deliver(el: &mut AsyncEventLoop<NoopHandler>, conn_index: u32, data: &[u8]) {
+        el.driver.record_arrival(conn_index, data.len());
+        assert!(el.driver.accumulators.append(conn_index, data));
+    }
+
+    fn poll_in<F: Future>(
+        el: &mut AsyncEventLoop<NoopHandler>,
+        fut: std::pin::Pin<&mut F>,
+    ) -> std::task::Poll<F::Output> {
+        in_poll(el, || {
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            fut.poll(&mut cx)
+        })
+    }
+
+    fn is_ebusy(poll: &std::task::Poll<io::Result<usize>>) -> bool {
+        matches!(poll, std::task::Poll::Ready(Err(e)) if e.raw_os_error() == Some(libc::EBUSY))
+    }
+
+    /// The parser sees the accumulator as one piece and consumes from it as a
+    /// `with_bytes` parser does; after `NeedAtLeast(n)` it is not called
+    /// until `n` more bytes are buffered.
+    #[test]
+    fn bytes_segments_presents_the_accumulator_as_one_piece() {
+        use crate::runtime::io::ParseResult;
+        let config = test_config();
+        let (mut el, _wake) = test_loop(&config);
+        let (conn_index, _peer) = attach_conn(&mut el.driver);
+        let ctx = crate::ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        deliver(&mut el, conn_index, b"abcdef");
+
+        let mut fut = std::pin::pin!(ctx.with_bytes_segments(|pieces| {
+            assert_eq!(pieces.len(), 1);
+            assert_eq!(&pieces[0][..], b"abcdef");
+            ParseResult::Consumed(4)
+        }));
+        assert!(matches!(
+            poll_in(&mut el, fut.as_mut()),
+            std::task::Poll::Ready(Ok(4))
+        ));
+        assert_eq!(el.driver.accumulators.data(conn_index), b"ef");
+
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let calls_cb = std::rc::Rc::clone(&calls);
+        let mut fut = std::pin::pin!(ctx.with_bytes_segments(move |pieces| {
+            calls_cb.set(calls_cb.get() + 1);
+            let total: usize = pieces.iter().map(|p| p.len()).sum();
+            if total < 6 {
+                ParseResult::NeedAtLeast(6 - total)
+            } else {
+                ParseResult::Consumed(6)
+            }
+        }));
+        assert!(poll_in(&mut el, fut.as_mut()).is_pending());
+        deliver(&mut el, conn_index, b"gh");
+        assert!(poll_in(&mut el, fut.as_mut()).is_pending());
+        assert_eq!(calls.get(), 1, "4 of the 6 bytes: the parser is not called");
+        deliver(&mut el, conn_index, b"ij");
+        assert!(matches!(
+            poll_in(&mut el, fut.as_mut()),
+            std::task::Poll::Ready(Ok(6))
+        ));
+        assert_eq!(calls.get(), 2);
+    }
+
+    /// At end of stream with nothing buffered the call resolves to `Ok(0)`
+    /// without calling the parser.
+    #[test]
+    fn bytes_segments_at_end_of_stream_does_not_call_the_parser() {
+        use crate::runtime::io::ParseResult;
+        let config = test_config();
+        let (mut el, _wake) = test_loop(&config);
+        let (conn_index, _peer) = attach_conn(&mut el.driver);
+        el.driver
+            .connections
+            .get_mut(conn_index)
+            .expect("open")
+            .note_eof(false);
+        let ctx = crate::ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        let mut fut = std::pin::pin!(ctx.with_bytes_segments(|_| -> ParseResult {
+            panic!("the parser is called at end of stream")
+        }));
+        assert!(matches!(
+            poll_in(&mut el, fut.as_mut()),
+            std::task::Poll::Ready(Ok(0))
+        ));
+    }
+
+    /// A running forward gives `EBUSY` on the first poll and on a later one,
+    /// and so does a `with_data` call that consumed bytes while the call was
+    /// parked. A stale handle resolves to `Ok(0)`.
+    #[test]
+    fn bytes_segments_returns_ebusy_after_another_reader_on_mio() {
+        use crate::runtime::io::ParseResult;
+        for case in [
+            "forward_first",
+            "forward_later",
+            "with_data",
+            "with_data_after_fin",
+            "stale",
+        ] {
+            let config = test_config();
+            let (mut el, _wake) = test_loop(&config);
+            let (conn_index, _peer) = attach_conn(&mut el.driver);
+            let mut generation = el.driver.connections.generation(conn_index);
+            if case == "stale" {
+                generation = generation.wrapping_add(1);
+            }
+            let ctx = crate::ConnCtx::new(conn_index, generation);
+            deliver(&mut el, conn_index, b"ab");
+            let mut fut = std::pin::pin!(ctx.with_bytes_segments(|_| ParseResult::NeedMore));
+            let forward = crate::backend::mio::driver::MioForwardState {
+                sink_index: 0,
+                sink_generation: 0,
+                len: 10,
+                forwarded: 0,
+            };
+            let poll = match case {
+                "forward_first" => {
+                    el.driver.forward_conn[conn_index as usize] = Some(forward);
+                    poll_in(&mut el, fut.as_mut())
+                }
+                "forward_later" => {
+                    assert!(poll_in(&mut el, fut.as_mut()).is_pending());
+                    el.driver.forward_conn[conn_index as usize] = Some(forward);
+                    poll_in(&mut el, fut.as_mut())
+                }
+                "with_data" | "with_data_after_fin" => {
+                    assert!(poll_in(&mut el, fut.as_mut()).is_pending());
+                    if case == "with_data_after_fin" {
+                        el.driver
+                            .connections
+                            .get_mut(conn_index)
+                            .expect("open")
+                            .note_eof(false);
+                    }
+                    let mut read = std::pin::pin!(ctx.with_data(|_| ParseResult::Consumed(1)));
+                    assert!(matches!(
+                        poll_in(&mut el, read.as_mut()),
+                        std::task::Poll::Ready(1)
+                    ));
+                    poll_in(&mut el, fut.as_mut())
+                }
+                _ => {
+                    let poll = poll_in(&mut el, fut.as_mut());
+                    assert!(matches!(poll, std::task::Poll::Ready(Ok(0))), "{poll:?}");
+                    continue;
+                }
+            };
+            assert!(is_ebusy(&poll), "{case}: {poll:?}");
+        }
+    }
+
+    /// A read past `recv_accumulator_max` closes the connection while a call
+    /// is parked; the call resolves to `Ok(0)`, not `EBUSY`. The read path
+    /// records the dropped bytes as delivered, and `recv_dropped` keeps them
+    /// out of `recv_consumed`.
+    #[test]
+    fn bytes_segments_resolves_to_zero_after_an_accumulator_overflow_on_mio() {
+        use crate::runtime::io::ParseResult;
+        use std::io::Write;
+        let config = ConfigBuilder::new()
+            .workers(1)
+            .pin_to_core(false)
+            .max_connections(16)
+            .send_pool(4, 64)
+            .no_fs()
+            .recv_accumulator_max(16384)
+            .build()
+            .expect("valid test config");
+        let (mut el, _wake) = test_loop(&config);
+        let (conn_index, mut peer) = attach_conn(&mut el.driver);
+        let ctx = crate::ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        let mut buf = vec![0u8; 65536];
+        let read_all = |el: &mut AsyncEventLoop<NoopHandler>, buf: &mut [u8], want: usize| {
+            for _ in 0..1000 {
+                el.handle_readable(conn_index, buf);
+                if el.driver.arrival[conn_index as usize].delivered() >= want as u64 {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            panic!("the read path did not take {want} bytes");
+        };
+        peer.write_all(&[0u8; 16000]).expect("write");
+        read_all(&mut el, &mut buf, 16000);
+        let mut fut =
+            std::pin::pin!(ctx.with_bytes_segments(|_| ParseResult::NeedAtLeast(1 << 20)));
+        assert!(poll_in(&mut el, fut.as_mut()).is_pending());
+
+        peer.write_all(&[0u8; 1000]).expect("write");
+        read_all(&mut el, &mut buf, 17000);
+        assert!(
+            el.driver
+                .connections
+                .get(conn_index)
+                .is_some_and(|c| c.close_requested()),
+            "the overflow closes the connection"
+        );
+
+        let poll = poll_in(&mut el, fut.as_mut());
+        assert!(matches!(poll, std::task::Poll::Ready(Ok(0))), "{poll:?}");
+    }
+
+    /// `end_segments` on mio returns `Ok(())`, for a stale handle too.
+    #[test]
+    fn end_segments_on_mio_returns_ok() {
+        let config = test_config();
+        let (mut el, _wake) = test_loop(&config);
+        let (conn_index, _peer) = attach_conn(&mut el.driver);
+        let generation = el.driver.connections.generation(conn_index);
+        for generation in [generation, generation.wrapping_add(1)] {
+            let ctx = crate::ConnCtx::new(conn_index, generation);
+            assert!(in_poll(&mut el, || ctx.end_segments()).is_ok());
+        }
     }
 }

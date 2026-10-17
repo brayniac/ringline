@@ -25,7 +25,7 @@ pub static POOL: ShardedCounterGroup = ShardedCounterGroup::new(9);
 
 #[metric(
     name = "ringline/recv_ring",
-    description = "TCP receive ring: the kind each worker selected, and lends refused"
+    description = "TCP receive: the ring kind each worker selected, lends refused, views, and receive copies"
 )]
 pub static RECV_RING: ShardedCounterGroup = ShardedCounterGroup::new(recv_ring::COUNT);
 
@@ -319,7 +319,19 @@ pub mod recv_ring {
     /// View releases with no live worker to go to: the view's worker had
     /// exited when its last clone dropped.
     pub const VIEW_RELEASE_DROPPED: usize = 6;
-    pub const COUNT: usize = 7;
+    /// `segment_hold` entries a `with_bytes_segments` call copied into the
+    /// accumulator because the hold reached its cap with the message
+    /// incomplete. Entries released without a copy, after the copy reached
+    /// `recv_accumulator_max`, are not counted.
+    pub const HOLD_CAP_COPIED: usize = 7;
+    /// Bytes copied into receive storage, on both backends: appended to or
+    /// merged in a connection's accumulator (with the bytes a reallocation
+    /// moves), prepended to it, or copied into an owned `segment_hold` entry
+    /// or an owned `recv_hold` copy, and TLS plaintext the unbuffered engine
+    /// stashes when the send path decrypts it. Ciphertext staged for TLS is
+    /// not counted.
+    pub const BYTES_COPIED: usize = 8;
+    pub const COUNT: usize = 9;
 }
 
 /// Slot indices for `RECV_ARRIVAL`.
@@ -422,9 +434,10 @@ pub mod pool {
     /// here, which is why this one exists.
     ///
     /// Entering the segmented domain adopts what is already buffered, so a
-    /// non-zero count means some path reached segmented delivery without
-    /// adopting. The adoption keeps a live system correct; the count is how
-    /// you find out it happened.
+    /// non-zero count means bytes reached the accumulator after entry. The
+    /// known ways are a `RecvOwnedSegment` future created before one of
+    /// these and polled after it: a `with_bytes_segments` hold-cap copy, or
+    /// a `with_segments` under-drain. Any other is a path that strands bytes.
     pub const SEGMENT_STRANDED_ADOPTED: usize = 7;
     /// A zero-copy send (`SendMsgZc`) returned `-ENOMEM`, and the rest of
     /// that send went out as plain `send`s. On Linux the usual cause is
@@ -472,6 +485,12 @@ pub fn init_metadata() {
         "op".into(),
         "view_release_dropped".into(),
     );
+    RECV_RING.insert_metadata(
+        recv_ring::HOLD_CAP_COPIED,
+        "op".into(),
+        "hold_cap_copied".into(),
+    );
+    RECV_RING.insert_metadata(recv_ring::BYTES_COPIED, "op".into(), "bytes_copied".into());
     for (step, name) in [
         (recv_preflight::SOCKETPAIR, "socketpair"),
         (recv_preflight::IO_ERROR, "io_error"),
@@ -735,6 +754,8 @@ mod tests {
             recv_ring::VIEW_RELEASED,
             recv_ring::VIEW_RELEASE_REMOTE,
             recv_ring::VIEW_RELEASE_DROPPED,
+            recv_ring::HOLD_CAP_COPIED,
+            recv_ring::BYTES_COPIED,
         ] {
             assert!(RECV_RING.increment(idx), "RECV_RING[{idx}] out of bounds");
         }
@@ -778,6 +799,11 @@ mod tests {
             op(recv_ring::VIEW_RELEASE_DROPPED).as_deref(),
             Some("view_release_dropped")
         );
+        assert_eq!(
+            op(recv_ring::HOLD_CAP_COPIED).as_deref(),
+            Some("hold_cap_copied")
+        );
+        assert_eq!(op(recv_ring::BYTES_COPIED).as_deref(), Some("bytes_copied"));
         for idx in 0..recv_ring::COUNT {
             assert!(
                 RECV_RING

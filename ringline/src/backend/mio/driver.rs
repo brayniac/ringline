@@ -136,6 +136,10 @@ pub(crate) struct Driver {
     pub(crate) accumulators: AccumulatorTable,
     /// Per-connection receive arrival log (`recv::arrival`).
     pub(crate) arrival: Vec<crate::recv::arrival::ArrivalLog>,
+    /// Per connection, bytes recorded in the arrival log and then dropped
+    /// because the accumulator could not take them (the connection closes).
+    /// `recv_consumed` subtracts them, so they do not count as consumed.
+    pub(crate) recv_dropped: Vec<u64>,
     /// The current batch, whose time the arrival logs record. A batch begins
     /// after `poll` returns and in `drain_forward_resumes`.
     pub(crate) recv_batch: crate::recv::arrival::BatchClock,
@@ -309,6 +313,18 @@ impl Driver {
         self.accumulators.len(conn_index)
     }
 
+    /// Bytes of the connection's stream that readers have removed from it:
+    /// those delivered (`ArrivalLog::delivered`) less `recv_buffered` and
+    /// less the bytes dropped on an accumulator overflow (`recv_dropped`). A
+    /// reader that consumes bytes raises it.
+    pub(crate) fn recv_consumed(&self, conn_index: u32) -> u64 {
+        let idx = conn_index as usize;
+        self.arrival[idx]
+            .delivered()
+            .saturating_sub(self.recv_buffered(conn_index) as u64)
+            .saturating_sub(self.recv_dropped[idx])
+    }
+
     /// Record `n` bytes delivered to the connection in the current batch.
     /// Runs before the bytes are placed anywhere.
     pub(crate) fn record_arrival(&mut self, conn_index: u32, n: usize) {
@@ -445,6 +461,7 @@ impl Driver {
             arrival: (0..config.max_connections)
                 .map(|_| crate::recv::arrival::ArrivalLog::default())
                 .collect(),
+            recv_dropped: vec![0; config.max_connections as usize],
             recv_batch: crate::recv::arrival::BatchClock::new(),
             send_copy_pool: {
                 let mut pool =
@@ -679,6 +696,7 @@ impl Driver {
         }
         self.accumulators.release(conn_index);
         self.arrival[idx].release();
+        self.recv_dropped[idx] = 0;
 
         self.send_queues[idx].queue.clear();
         self.send_queues[idx].in_flight = false;
