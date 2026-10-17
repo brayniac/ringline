@@ -2,9 +2,10 @@
 # against B (experiments/segviews-build.toml), the client under test, on one
 # kernel and one host pair.
 #
-# Server: Valkey (RESP) and memcached on z1 (Debian 13, Linux 6.12), the same
-# for both builds. Client: cachecannon on z2 (Debian 13, Linux 6.12), 16
-# threads, 1,000 connections, GET only, read_values on.
+# Server: Valkey (RESP) and memcached on z1, the same for both builds.
+# Client: cachecannon on z2, 16 threads, 1,000 connections, GET only,
+# read_values on. Both VMs boot the current debian-13-ci image; each logs its
+# kernel (uname -r).
 #
 # Cells: RESP and memcache text GET at value sizes 64 B, 4 KiB, 8 KiB and
 # 64 KiB, pipeline depth 1 and 16, and 1 MiB at depth 1 (depth 16 would hold
@@ -27,7 +28,7 @@ bins_artifact  = "SET_AT_SUBMIT"
 phase          = "saturate"
 rep            = "1"
 rates          = ""
-image          = "spool/images/debian-13-base-20260912.1@golden"
+image          = "debian-13-ci"
 server_ip      = "172.31.0.1"
 client_ip      = "172.31.0.2"
 client_threads = "16"
@@ -117,6 +118,7 @@ set -uo pipefail
 cd /home/anvil && tar xzf bins.tgz && chmod +x out/*
 ( cd out && sha256sum * )
 uname -r
+uname -r
 sudo sysctl -w net.core.rmem_max=134217728 net.core.wmem_max=134217728 net.ipv4.ip_local_port_range="1024 65535"
 sudo apt-get update -qq
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq time >/dev/null || exit 1
@@ -139,7 +141,7 @@ set -uo pipefail
 cd /home/anvil
 mkdir -p results
 ulimit -n 1048576
-# Linux 6.14+ charges io_uring rings to RLIMIT_MEMLOCK; harmless on 6.12.
+# Linux 6.14+ charges io_uring rings to RLIMIT_MEMLOCK; harmless before.
 ulimit -l unlimited 2>/dev/null || sudo prlimit --memlock=unlimited:unlimited --pid $$
 echo "client-limits memlock=$(ulimit -l) nofile=$(ulimit -n)"
 for port in 6379 11211; do
