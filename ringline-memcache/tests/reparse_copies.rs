@@ -227,12 +227,15 @@ fn a_multi_key_reply_in_many_pieces_is_parsed_once() {
     println!("allocated {large} bytes for a {large_len}-byte reply of 12 values");
     println!("allocated {small} bytes for a {small_len}-byte reply of 5,000 values");
     // On mio the reply is read into the accumulator, which reallocates as it
-    // grows, and parsed on each read.
+    // grows, so the first phase's bound applies on io_uring only. The second
+    // phase's reply is one piece on both backends: on mio it is in one piece
+    // from the start, on io_uring after the hold-cap copy.
     if cfg!(has_io_uring) {
         assert!(large < 2 * large_len, "{large} for {large_len} bytes");
-        // The values, the `Vec` `gets` returns with a copy of each short
-        // key, and the accumulator's growth: about 15 bytes per reply byte.
-        // A parse after every chunk allocates about 177.
-        assert!(small < 32 * small_len, "{small} for {small_len} bytes");
     }
+    // The values, the `Vec` `gets` returns with a copy of each short key, and
+    // the accumulator's growth: about 15 bytes per reply byte on io_uring and
+    // 16 on mio. A parse after every chunk allocates about 177 and 148.
+    let bound = if cfg!(has_io_uring) { 32 } else { 64 };
+    assert!(small < bound * small_len, "{small} for {small_len} bytes");
 }

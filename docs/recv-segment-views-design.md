@@ -1,8 +1,9 @@
 # Segment views: `Bytes` over held receive buffers for segment parsers
 
 Status: landing steps 1 (the view machinery), 2 (the reader) and 3
-(`recv_zc_threshold`) are on main. Steps 4 and 6 are on the unmerged
-branch that carries this text; step 5 has not run.
+(`recv_zc_threshold`) are on main. Step 4 and the client changes step 6
+would merge are on the unmerged branch that carries this text; step 5 has
+not run.
 
 Related: `docs/recv-incremental-ring-design.md` ("`with_bytes`", the owner
 decisions of 2026-10-08 on views and `recv_zc_threshold`),
@@ -751,7 +752,9 @@ The owner accepted these on 2026-10-15.
 
 ## Not measured
 
-- Nothing in this design has been measured. The `recv-strategies` benchmark
+- Throughput, latency and RSS: nothing in this design has been measured
+  under load. Step 6 quotes allocations counted in the client tests. The
+  `recv-strategies` benchmark
   (`docs/journal/2026-09-incremental-buffer-consumption.md`, "2026-10:
   kernels, two rings, tiered caches") cut RSS from 2.3 GiB to 262 MiB with a
   bounded accumulator that parses each completion's remainder in place, in

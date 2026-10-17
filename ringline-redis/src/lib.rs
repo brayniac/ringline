@@ -144,7 +144,7 @@
 //!
 //! | Path | Copies | Mechanism |
 //! |------|--------|-----------|
-//! | **Recv (values)** | 0 or 1; 2 across a copied piece | `with_bytes_segments()` + `Value::parse_segments()`. On io_uring a string inside one ring buffer and at least `recv_zc_threshold` long is a view of that buffer (0 copies); a shorter one is copied out of it (`ringline::copy_small_view`); one that spans buffers is copied by the parser. `OK`, `PONG` and `QUEUED` are returned as static `Bytes`. A string in a reply longer than the hold cap is copied into the accumulator by the runtime, as the reply arrives, and sliced (1). A reply in several pieces is scanned (`Value::scan_segments`) on each arrival and parsed once, when complete. A string that starts in a copied piece (a refused lend's copy, or bytes left in the accumulator by a reply longer than the hold cap or by `end_segments`) and ends in a later buffer is copied twice. TLS connections read with `with_bytes`, and on mio strings are slices of the accumulator, which the bytes were copied into (1). |
+//! | **Recv (values)** | 0 or 1; 2 across a copied piece | `with_bytes_segments()` + `Value::parse_segments()`. On io_uring a string inside one ring buffer and at least `recv_zc_threshold` long is a view of that buffer (0 copies); a shorter one is copied out of it (`ringline::copy_small_view`); one that spans buffers is copied by the parser. `OK`, `PONG` and `QUEUED` are returned as static `Bytes`. A string in a reply longer than the hold cap is copied into the accumulator by the runtime, as the reply arrives, and sliced (1). A reply in several pieces is scanned (`Value::scan_segments`) on each arrival and parsed once, when complete. A string that spans a copied piece (a refused lend's copy, or bytes left in the accumulator by a reply longer than the hold cap or by `end_segments`) and another piece is copied by the parser, so its bytes in the copied piece are copied twice. TLS connections read with `with_bytes`, and on mio strings are slices of the accumulator, which the bytes were copied into (1). |
 //! | **Send (commands)** | 1 | `encode_request()` serializes RESP into `Vec<u8>`, then `conn.send()` copies into the send pool. |
 //! | **Send (SET value, standard)** | 1 | All parts gathered into one send-pool slot via `send_parts().copy()`. |
 //! | **Send (SET value, guard)** | 0 (value) | [`Client::set_with_guard`] / [`Client::set_ex_with_guard`]: RESP prefix+suffix copied to pool, value stays in-place via `SendGuard`. |
@@ -4133,6 +4133,27 @@ mod segment_read_tests {
             value,
             Value::array(vec![Value::bulk_string(b"abc"), Value::integer(7)])
         );
+    }
+
+    /// An incomplete reply sets the read's flag, whether it was found by a
+    /// parse (one piece) or a scan (several); a complete reply read with the
+    /// flag set is parsed.
+    #[test]
+    fn an_incomplete_reply_sets_the_flag() {
+        let options = resp_proto::ParseOptions::new();
+        for parts in [&[&b"*2\r\n:1\r\n"[..]][..], &[b"*2\r\n", b":1\r\n"]] {
+            let mut incomplete = false;
+            assert!(matches!(
+                read_reply_in(&pieces(parts), &options, &mut incomplete),
+                ReplyIn::Needs(_)
+            ));
+            assert!(incomplete, "{parts:?}");
+        }
+        let mut incomplete = true;
+        assert!(matches!(
+            read_reply_in(&pieces(&[b"*1\r\n:1\r\n"]), &options, &mut incomplete),
+            ReplyIn::Done(_, 8)
+        ));
     }
 
     #[test]

@@ -117,7 +117,7 @@
 //!
 //! | Path | Copies | Mechanism |
 //! |------|--------|-----------|
-//! | **Recv (values)** | 0 or 1; 2 across a copied piece | `with_bytes_segments()` + `ResponseBytes::parse_segments()`. On io_uring a value inside one ring buffer and at least `recv_zc_threshold` long is a view of that buffer (0 copies); a shorter one is copied out of it (`ringline::copy_small_view`); one that spans buffers is copied by the parser. Keys are copied the same way where a call returns them ([`Client::gets`]). A value in a reply longer than the hold cap is copied into the accumulator by the runtime, as the reply arrives, and sliced (1). A reply in several pieces is scanned (`ResponseBytes::scan_segments`) on each arrival and parsed once, when complete. A value that starts in a copied piece (a refused lend's copy, or bytes left in the accumulator by a reply longer than the hold cap or by `end_segments`) and ends in a later buffer is copied twice. TLS connections read with `with_bytes`, and on mio values are slices of the accumulator, which the bytes were copied into (1). |
+//! | **Recv (values)** | 0 or 1; 2 across a copied piece | `with_bytes_segments()` + `ResponseBytes::parse_segments()`. On io_uring a value inside one ring buffer and at least `recv_zc_threshold` long is a view of that buffer (0 copies); a shorter one is copied out of it (`ringline::copy_small_view`); one that spans buffers is copied by the parser. Keys are copied the same way where a call returns them ([`Client::gets`]). A value in a reply longer than the hold cap is copied into the accumulator by the runtime, as the reply arrives, and sliced (1). A reply in several pieces is scanned (`ResponseBytes::scan_segments`) on each arrival and parsed once, when complete. A value that spans a copied piece (a refused lend's copy, or bytes left in the accumulator by a reply longer than the hold cap or by `end_segments`) and another piece is copied by the parser, so its bytes in the copied piece are copied twice. TLS connections read with `with_bytes`, and on mio values are slices of the accumulator, which the bytes were copied into (1). |
 //! | **Recv (binary protocol)** | 1 | [`BinaryClient`] reads with `with_bytes()`; values are slices of the accumulator, which the bytes were copied into. |
 //! | **Send (commands)** | 1 | Requests are encoded into a reusable per-client buffer (no per-request allocation), then `conn.send()` copies into the send pool. |
 //! | **Send (SET value, guard)** | 0 (value) | [`Client::set_with_guard`]: prefix+suffix copied to pool, value stays in-place via `SendGuard`. |
@@ -3809,6 +3809,29 @@ mod segment_read_tests {
         };
         assert_eq!(consumed, 23);
         assert_eq!(&values[0].data[..], b"abc");
+    }
+
+    /// An incomplete response sets the read's flag, whether it was found by a
+    /// parse (one piece) or a scan (several); a complete response read with
+    /// the flag set is parsed.
+    #[test]
+    fn an_incomplete_response_sets_the_flag() {
+        for parts in [
+            &[&b"VALUE k 0 3\r\nab"[..]][..],
+            &[b"VALUE k 0 3\r\n", b"ab"],
+        ] {
+            let mut incomplete = false;
+            assert!(matches!(
+                read_response_in(&pieces(parts), &mut incomplete),
+                ResponseIn::Needs(_)
+            ));
+            assert!(incomplete, "{parts:?}");
+        }
+        let mut incomplete = true;
+        assert!(matches!(
+            read_response_in(&pieces(&[b"STORED\r\n"]), &mut incomplete),
+            ResponseIn::Done(McResponseBytes::Stored, 8)
+        ));
     }
 
     #[test]

@@ -225,12 +225,15 @@ fn an_array_reply_in_many_pieces_is_parsed_once() {
     println!("allocated {large} bytes for a {large_len}-byte reply of 12 values");
     println!("allocated {small} bytes for a {small_len}-byte reply of 20,000 values");
     // On mio the reply is read into the accumulator, which reallocates as it
-    // grows, and parsed on each read.
+    // grows, so the first phase's bound applies on io_uring only. The second
+    // phase's reply is one piece on both backends: on mio it is in one piece
+    // from the start, on io_uring after the hold-cap copy.
     if cfg!(has_io_uring) {
         assert!(large < 2 * large_len, "{large} for {large_len} bytes");
-        // The array of values, the `Vec` `mget` returns, and the
-        // accumulator's growth: about 9 bytes per reply byte. A parse after
-        // every chunk allocates about 47.
-        assert!(small < 16 * small_len, "{small} for {small_len} bytes");
     }
+    // The array of values, the `Vec` `mget` returns, and the accumulator's
+    // growth: about 9 bytes per reply byte on io_uring and 12 on mio. A parse
+    // after every chunk allocates about 47 and 38.
+    let bound = if cfg!(has_io_uring) { 16 } else { 24 };
+    assert!(small < bound * small_len, "{small} for {small_len} bytes");
 }
