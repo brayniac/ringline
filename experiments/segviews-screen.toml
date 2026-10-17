@@ -60,7 +60,10 @@ uname -r
 sudo sysctl -w net.core.somaxconn=65535 net.ipv4.tcp_max_syn_backlog=65535 net.core.rmem_max=134217728 net.core.wmem_max=134217728
 sudo apt-get update -qq
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq valkey-server memcached >/dev/null || exit 1
-sudo systemctl stop valkey-server memcached 2>/dev/null || true
+# The packages start their own services on localhost; stop them. The bench
+# servers run as units named bench-*, because the packages' unit names
+# (valkey, memcached) are taken.
+sudo systemctl disable --now valkey-server memcached 2>/dev/null || true
 valkey-server --version
 memcached -V
 '''
@@ -69,7 +72,7 @@ memcached -V
 type = "anvil-vm"
 mode = "exec"
 detach = true
-unit = "valkey"
+unit = "bench-valkey"
 metrics = true
 payload = "ulimit -n 1048576; exec valkey-server --bind {server_ip} --port 6379 --protected-mode no --save '' --appendonly no --io-threads 8 --maxclients 65000"
 
@@ -77,7 +80,7 @@ payload = "ulimit -n 1048576; exec valkey-server --bind {server_ip} --port 6379 
 type = "anvil-vm"
 mode = "exec"
 detach = true
-unit = "memcached"
+unit = "bench-memcached"
 payload = "ulimit -n 1048576; exec memcached -l {server_ip} -p 11211 -t 16 -m 16384 -c 65000 -I 2m -U 0"
 
 [[jobs.steps]]
