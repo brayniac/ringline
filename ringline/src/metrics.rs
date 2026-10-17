@@ -293,8 +293,8 @@ pub mod ring {
 }
 
 /// Slot indices for `RECV_RING`: one count per worker by the TCP receive
-/// ring it registered (`ConfigBuilder::recv_incremental`), and the lends the
-/// lend cap refused.
+/// ring it registered (`ConfigBuilder::recv_incremental`), the lends the
+/// lend cap refused, receive views, and copies in the receive path.
 pub mod recv_ring {
     /// An incremental ring (`IOU_PBUF_RING_INC`).
     pub const INCREMENTAL: usize = 0;
@@ -329,12 +329,11 @@ pub mod recv_ring {
     /// moves), prepended to it, or copied into an owned `segment_hold` entry
     /// or an owned `recv_hold` copy, TLS plaintext the unbuffered engine
     /// stashes when the send path decrypts it, and values `copy_small_view`
-    /// copies. Ciphertext staged for TLS is
-    /// not counted.
+    /// copies. Ciphertext staged for TLS is not counted.
     pub const BYTES_COPIED: usize = 8;
-    /// Receive views `copy_small_view` copied because they were shorter
-    /// than the threshold it was given. Their bytes also count in
-    /// `BYTES_COPIED`.
+    /// Values `copy_small_view` copied: views shorter than its threshold,
+    /// and, on io_uring outside a ringline task, any value shorter than it.
+    /// Their bytes also count in `BYTES_COPIED`.
     pub const THRESHOLD_COPIED: usize = 9;
     pub const COUNT: usize = 10;
 }

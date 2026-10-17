@@ -5538,7 +5538,7 @@ impl<F: FnMut(&SegChain<'_>) -> SegConsumed + Unpin> WithSegmentsFuture<F> {
 
 /// The calling worker's receive view threshold
 /// ([`ConfigBuilder::recv_zc_threshold`](crate::ConfigBuilder::recv_zc_threshold)),
-/// or the default, 4096, when called outside a task on a worker.
+/// or the default, 4096, when called outside a ringline task, on any thread.
 ///
 /// A client passes it to [`copy_small_view`] when it has no threshold of its
 /// own.
@@ -5552,22 +5552,29 @@ pub fn recv_zc_threshold() -> u32 {
 ///
 /// On io_uring, [`Connection::with_bytes_segments`] presents held receive
 /// buffers as views of the ring's memory, and a value sliced from one is a
-/// view too. A view keeps its whole ring buffer (16 KiB by default, 1 MiB
-/// on an incremental ring) from being reused until it drops, whatever its
-/// length. A client that keeps parsed values calls this on each one, so a
-/// small kept value holds a heap copy instead of a ring buffer. A copied
-/// view is dropped here, which releases its hold on the buffer.
+/// view too. A view keeps its whole ring buffer (16 KiB by default;
+/// [`ConfigBuilder::recv_incremental`](crate::ConfigBuilder::recv_incremental)
+/// and `recv_buffer` give other sizes) from being reused until it drops,
+/// whatever its length. A client that keeps parsed values calls this on
+/// each one, so a small kept value holds a heap copy instead of a ring
+/// buffer. When `value` is copied it is dropped here; the buffer returns to
+/// the ring once no clone or slice of the view remains.
 ///
 /// A view is recognised by its data pointer lying in the calling worker's
-/// ring memory. Called outside a task on a worker, every `Bytes` is treated
-/// as a view. A view made on one worker and passed here on another is not
-/// recognised and is returned unchanged. On mio nothing is a view, and
-/// `value` is always returned unchanged.
+/// ring memory. Called outside a ringline task, on any thread, every
+/// `Bytes` is treated as a view. A view made on one worker and passed here
+/// on another is not recognised and is returned unchanged. On mio nothing
+/// is a view, and `value` is always returned unchanged.
 ///
-/// A `threshold` of 0 never copies. Copies count in
+/// An empty `value` is returned as an empty `Bytes` that holds nothing. A
+/// `threshold` of 0 never copies. Copies count in
 /// `metrics::recv_ring::THRESHOLD_COPIED` and `BYTES_COPIED`.
 pub fn copy_small_view(value: Bytes, threshold: u32) -> Bytes {
-    if value.is_empty() || value.len() >= threshold as usize || !is_recv_view(&value) {
+    // An empty slice of a view can still hold the view's buffer.
+    if value.is_empty() {
+        return Bytes::new();
+    }
+    if value.len() >= threshold as usize || !is_recv_view(&value) {
         return value;
     }
     let copy = Bytes::copy_from_slice(&value);
@@ -5577,7 +5584,7 @@ pub fn copy_small_view(value: Bytes, threshold: u32) -> Bytes {
 }
 
 /// Whether `value`'s data lies in the calling worker's TCP receive ring
-/// memory; `true` outside a task on a worker.
+/// memory; `true` outside a ringline task.
 #[cfg(has_io_uring)]
 fn is_recv_view(value: &Bytes) -> bool {
     try_with_state(|driver, _| {

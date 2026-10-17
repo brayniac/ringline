@@ -146,18 +146,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   accumulator as one piece. Reported by `recv_arrival`.
 - `ConfigBuilder::recv_zc_threshold` (default 4096),
   `ringline::recv_zc_threshold` and `ringline::copy_small_view`.
-  `copy_small_view(value, threshold)`
-  returns an owned copy of a receive view shorter than `threshold`, so a
-  small value a client keeps does not hold a whole ring buffer, and returns
-  any other `Bytes` unchanged. `recv_zc_threshold()` returns the worker's
-  configured value. `metrics::recv_ring::THRESHOLD_COPIED` counts the
-  copies.
+  `copy_small_view(value, threshold)` returns an owned copy of a receive
+  view shorter than `threshold` and returns any other `Bytes` unchanged; a
+  small value a client keeps then does not hold a whole ring buffer.
+  `recv_zc_threshold()` returns the worker's configured value, or 4096
+  outside a ringline task. The runtime does not apply the threshold itself;
+  a client applies it by calling `copy_small_view`.
+  `metrics::recv_ring::THRESHOLD_COPIED` counts the copies.
 - `Connection::end_segments` and `RecvHalf::end_segments` exist on mio,
   where they return `Ok(())`.
 - `metrics::recv_ring::HOLD_CAP_COPIED` counts held entries
   `with_bytes_segments` copied at the hold cap, and `BYTES_COPIED` counts
   bytes copied into receive storage (the accumulator, owned held entries,
-  owned forward copies and queued TLS plaintext) on both backends.
+  owned forward copies, queued TLS plaintext and `copy_small_view` copies)
+  on both backends.
 
 ### Changed
 

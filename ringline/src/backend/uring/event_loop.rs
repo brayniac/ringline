@@ -21127,6 +21127,12 @@ mod tests {
 
     // ── copy_small_view and recv_zc_threshold ───────────────────────────
 
+    fn threshold_copied() -> u64 {
+        crate::metrics::RECV_RING
+            .value(crate::metrics::recv_ring::THRESHOLD_COPIED)
+            .unwrap_or(0)
+    }
+
     /// A view shorter than the threshold is copied, and the copy releases
     /// the view's hold on its buffer.
     #[test]
@@ -21137,10 +21143,13 @@ mod tests {
         let view = el.driver.recv_view(0, 0, 5);
         consume_entry(&mut el, conn_index);
         let copied = crate::accumulator::test_bytes_copied();
+        let counted = threshold_copied();
         let copy = with_driver_state(&mut el, || crate::copy_small_view(view, 4096));
         assert_eq!(&copy[..], b"hello");
         assert_ne!(copy.as_ptr(), el.driver.provided_bufs.data_ptr(0, 0));
         assert_eq!(crate::accumulator::test_bytes_copied() - copied, 5);
+        // The metric is process-wide; other tests in the process only raise it.
+        assert!(threshold_copied() > counted);
         release_views(&mut el);
         assert_eq!(
             el.driver.provided_bufs.free(),
@@ -21164,10 +21173,40 @@ mod tests {
         }
     }
 
-    /// On a worker, a value outside the ring is returned unchanged; outside
-    /// a task, every value is treated as a view.
+    /// An empty `Bytes` that still holds a view is returned as an empty
+    /// `Bytes` that holds nothing, so the buffer returns to the ring.
     #[test]
-    fn copy_small_view_recognises_views_by_the_workers_ring() {
+    fn copy_small_view_releases_an_empty_view() {
+        let mut el = make_test_loop();
+        let entries = el.driver.provided_bufs.ring_entries();
+        let conn_index = held_segment(&mut el, 0, b"hello");
+        let mut view = el.driver.recv_view(0, 0, 5);
+        view.truncate(0);
+        consume_entry(&mut el, conn_index);
+        let empty = with_driver_state(&mut el, || crate::copy_small_view(view, 4096));
+        assert!(empty.is_empty());
+        release_views(&mut el);
+        assert_eq!(el.driver.provided_bufs.free(), entries);
+    }
+
+    /// A view made by another worker's ring is not recognised and is
+    /// returned unchanged.
+    #[test]
+    fn copy_small_view_returns_another_workers_view_unchanged() {
+        let mut first = make_test_loop();
+        held_segment(&mut first, 0, b"hello");
+        let view = first.driver.recv_view(0, 0, 5);
+        let ptr = view.as_ptr();
+        let mut second = make_test_loop();
+        let kept = with_driver_state(&mut second, || crate::copy_small_view(view, 4096));
+        assert_eq!(kept.as_ptr(), ptr);
+        with_driver_state(&mut first, || drop(kept));
+    }
+
+    /// On a worker, a heap value is returned unchanged; outside a task, every
+    /// value is treated as a view and copied when short.
+    #[test]
+    fn copy_small_view_treats_heap_values_by_where_it_is_called() {
         let mut el = make_test_loop();
         let heap = Bytes::from(b"small".to_vec());
         let ptr = heap.as_ptr();

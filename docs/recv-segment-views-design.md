@@ -399,16 +399,18 @@ for a value of any size: 16 KiB on the default ring, 1 MiB on an incremental
 ring, and 64 KiB on the plain ring used when `recv_incremental` is on and
 the kernel has no incremental rings or fails the preflight. These are the
 default geometries; an explicit `recv_buffer` overrides them. The
-`recv_zc_threshold` decision (owner, 2026-10-08) applies unchanged:
+`recv_zc_threshold` decision (owner, 2026-10-08) applies, except that on
+mio nothing is a view, and a worker thread outside a ringline task is
+treated as off a worker:
 
 - `ConfigBuilder::recv_zc_threshold(bytes)`, default 4096, which
   `ringline::recv_zc_threshold()` returns on the worker (4096 outside a
-  task).
+  ringline task). The runtime does not apply it itself.
 - `ringline::copy_small_view(value, threshold)` returns `value` unchanged if
   it is not a view or is at least `threshold` bytes, and an owned copy
   otherwise. It identifies a view by checking whether the data pointer lies
-  in the calling worker's `RingMemory`. Outside a task on a worker it treats
-  every `Bytes` as a view; on mio nothing is a view.
+  in the calling worker's `RingMemory`. Outside a ringline task, on any
+  thread, it treats every `Bytes` as a view; on mio nothing is a view.
 - ringline-redis and ringline-memcache apply it to every `Bytes` in a parsed
   response, with a client-level override (step 6).
 
