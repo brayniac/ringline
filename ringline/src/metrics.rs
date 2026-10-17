@@ -305,7 +305,21 @@ pub mod recv_ring {
     /// (`recv_incremental` only). A per-completion event, unlike the
     /// per-worker kind counts.
     pub const LEND_REFUSED: usize = 2;
-    pub const COUNT: usize = 3;
+    /// Receive views created (`backend/uring/view.rs`). `VIEW_CREATED` minus
+    /// `VIEW_RELEASED` is the number of view holds outstanding plus the
+    /// releases that are still queued (including those queued while a worker
+    /// shuts down, which are never applied), dropped (`VIEW_RELEASE_DROPPED`),
+    /// or ignored because they named another ring's memory.
+    pub const VIEW_CREATED: usize = 3;
+    /// View holds released by their worker.
+    pub const VIEW_RELEASED: usize = 4;
+    /// Views dropped on a thread other than their worker's, whose release
+    /// went through the worker's inbox.
+    pub const VIEW_RELEASE_REMOTE: usize = 5;
+    /// View releases with no live worker to go to: the view's worker had
+    /// exited when its last clone dropped.
+    pub const VIEW_RELEASE_DROPPED: usize = 6;
+    pub const COUNT: usize = 7;
 }
 
 /// Slot indices for `RECV_ARRIVAL`.
@@ -442,6 +456,22 @@ pub fn init_metadata() {
     RECV_RING.insert_metadata(recv_ring::INCREMENTAL, "op".into(), "incremental".into());
     RECV_RING.insert_metadata(recv_ring::PLAIN, "op".into(), "plain".into());
     RECV_RING.insert_metadata(recv_ring::LEND_REFUSED, "op".into(), "lend_refused".into());
+    RECV_RING.insert_metadata(recv_ring::VIEW_CREATED, "op".into(), "view_created".into());
+    RECV_RING.insert_metadata(
+        recv_ring::VIEW_RELEASED,
+        "op".into(),
+        "view_released".into(),
+    );
+    RECV_RING.insert_metadata(
+        recv_ring::VIEW_RELEASE_REMOTE,
+        "op".into(),
+        "view_release_remote".into(),
+    );
+    RECV_RING.insert_metadata(
+        recv_ring::VIEW_RELEASE_DROPPED,
+        "op".into(),
+        "view_release_dropped".into(),
+    );
     for (step, name) in [
         (recv_preflight::SOCKETPAIR, "socketpair"),
         (recv_preflight::IO_ERROR, "io_error"),
@@ -701,6 +731,10 @@ mod tests {
             recv_ring::INCREMENTAL,
             recv_ring::PLAIN,
             recv_ring::LEND_REFUSED,
+            recv_ring::VIEW_CREATED,
+            recv_ring::VIEW_RELEASED,
+            recv_ring::VIEW_RELEASE_REMOTE,
+            recv_ring::VIEW_RELEASE_DROPPED,
         ] {
             assert!(RECV_RING.increment(idx), "RECV_RING[{idx}] out of bounds");
         }
@@ -731,6 +765,19 @@ mod tests {
         assert_eq!(op(recv_ring::INCREMENTAL).as_deref(), Some("incremental"));
         assert_eq!(op(recv_ring::PLAIN).as_deref(), Some("plain"));
         assert_eq!(op(recv_ring::LEND_REFUSED).as_deref(), Some("lend_refused"));
+        assert_eq!(op(recv_ring::VIEW_CREATED).as_deref(), Some("view_created"));
+        assert_eq!(
+            op(recv_ring::VIEW_RELEASED).as_deref(),
+            Some("view_released")
+        );
+        assert_eq!(
+            op(recv_ring::VIEW_RELEASE_REMOTE).as_deref(),
+            Some("view_release_remote")
+        );
+        assert_eq!(
+            op(recv_ring::VIEW_RELEASE_DROPPED).as_deref(),
+            Some("view_release_dropped")
+        );
         for idx in 0..recv_ring::COUNT {
             assert!(
                 RECV_RING

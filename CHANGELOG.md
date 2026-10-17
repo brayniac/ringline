@@ -125,9 +125,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - `ListenerId::from_index` is public. Ids follow `bind()` call order, so a
   listener can be named before any connection has arrived.
+- `metrics::recv_ring::VIEW_CREATED`, `VIEW_RELEASED`, `VIEW_RELEASE_REMOTE`
+  and `VIEW_RELEASE_DROPPED` count `Bytes` views of io_uring receive buffers
+  and their releases (`docs/recv-segment-views-design.md`). No reader hands
+  out views yet, so they stay at 0.
 
 ### Changed
 
+- `ringline` takes `bytes` from the workspace, so it requires 1.11.1 or
+  later, as the other crates do; views use `Bytes::from_owner` (1.9). On
+  io_uring a provided-buffer ring's buffers are an anonymous mapping, shared
+  through an `Arc` with views of them, instead of a heap `Vec`.
 - **Breaking (`ringline-redis`, `ringline-memcache`, `ringline-ping`):**
   `CommandResult` is `#[non_exhaustive]`. Code outside the crates reads it
   in an `on_result` callback and can no longer construct it.

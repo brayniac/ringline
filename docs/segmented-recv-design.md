@@ -211,7 +211,7 @@ impl ConnCtx {
 impl RecvSegment<'_> { pub fn into_owned(self) -> Bytes; } // copy + release-once
 ```
 
-- Copy at delivery: `copy_nonoverlapping` from `buf_backing[bid]` into an owned
+- Copy at delivery: `copy_nonoverlapping` from buffer `bid` of `ProvidedBufRing::mem` into an owned
   buffer (or a reusable recv-copy pool, cf. `SendCopyPool`), **then**
   `pending_replenish.push((origin_class, bid))` — the INC copy-before-replenish
   ordering, origin class captured at receive time.

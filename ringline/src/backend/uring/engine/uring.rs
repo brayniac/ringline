@@ -632,7 +632,7 @@ impl Engine for UringEngine {
         // `io_uring/memmap.c`), and the kernel reads entries through its own
         // mapping of those pages. The kernel unpins them only when the group
         // is unregistered or the io_uring instance is freed. The buffers the
-        // entries point at (`buf_backing`) are a separate, unpinned
+        // entries point at (`ProvidedBufRing::mem`) are a separate, unpinned
         // allocation that the kernel writes through the user addresses in the
         // entries; this argument does not cover them.
         let first = if self.pbuf_resv_set {

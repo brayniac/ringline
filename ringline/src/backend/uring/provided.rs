@@ -1,6 +1,9 @@
 use std::io;
 use std::ptr;
+use std::sync::Arc;
 use std::sync::atomic::{self, AtomicU16};
+
+use super::view::RingMemory;
 
 /// A ring-mapped provided buffer ring for multishot recv operations.
 ///
@@ -11,8 +14,9 @@ pub struct ProvidedBufRing {
     ring_ptr: *mut u8,
     /// Size of the mmap'd ring region.
     ring_mmap_len: usize,
-    /// Backing memory for all buffers.
-    buf_backing: Vec<u8>,
+    /// Backing memory for all buffers, shared with the views of them
+    /// (`view.rs`).
+    mem: Arc<RingMemory>,
     /// Buffer group ID.
     bgid: u16,
     /// Number of buffers (must be power of 2).
@@ -43,8 +47,8 @@ pub struct ProvidedBufRing {
 struct BufState {
     /// Bytes the kernel has written into the buffer.
     written: u32,
-    /// Completions whose data is still in use: each completion takes one,
-    /// and each release drops one.
+    /// Completions and views whose data is still in use: each completion and
+    /// each view (`add_hold`) takes one, and each release drops one.
     holds: u32,
     /// The kernel is done with the buffer.
     exhausted: bool,
@@ -71,7 +75,7 @@ impl ProvidedBufRing {
         assert!(ring_size.is_power_of_two(), "ring_size must be power of 2");
 
         let ring_mmap_len = ring_size as usize * Self::ENTRY_SIZE;
-        let buf_backing = vec![0u8; ring_size as usize * buf_size as usize];
+        let mem = Arc::new(RingMemory::new(ring_size as usize * buf_size as usize)?);
 
         // mmap anonymous memory for the ring (page-aligned, shared with kernel)
         let ring_ptr = unsafe {
@@ -91,7 +95,7 @@ impl ProvidedBufRing {
         let mut ring = ProvidedBufRing {
             ring_ptr: ring_ptr as *mut u8,
             ring_mmap_len,
-            buf_backing,
+            mem,
             bgid,
             ring_size,
             buf_size,
@@ -119,12 +123,12 @@ impl ProvidedBufRing {
     pub(crate) fn advise_no_huge_pages(&mut self) {
         // Safety: sysconf has no preconditions.
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
-        let start = self.buf_backing.as_ptr() as usize;
-        let end = start + self.buf_backing.len();
+        let start = self.mem.as_ptr() as usize;
+        let end = start + self.mem.len();
         let aligned = start.next_multiple_of(page);
         let len = end.saturating_sub(aligned) / page * page;
         if len > 0 {
-            // Safety: `[aligned, aligned + len)` lies inside `buf_backing`,
+            // Safety: `[aligned, aligned + len)` lies inside `mem`,
             // which this ring owns; the advice changes no contents.
             unsafe { libc::madvise(aligned as *mut libc::c_void, len, libc::MADV_NOHUGEPAGE) };
         }
@@ -137,7 +141,8 @@ impl ProvidedBufRing {
     /// path. See [`crate::buffer::prefault`]; this must run on the worker
     /// thread that owns the ring, which is where the driver is built.
     pub(crate) fn prefault(&mut self) {
-        crate::buffer::prefault::prefault(&mut self.buf_backing);
+        let mem = Arc::get_mut(&mut self.mem).expect("no views before the ring is armed");
+        crate::buffer::prefault::prefault(mem.as_mut_slice());
     }
 
     /// Get the ring pointer for `register_buf_ring()`.
@@ -210,13 +215,13 @@ impl ProvidedBufRing {
         offset
     }
 
-    /// Drop one completion's hold on each bid in `bids`, and post every
-    /// buffer that is then exhausted with no holds back to the ring, whole.
-    /// A bid may appear more than once, once per hold it drops.
+    /// Drop one hold (a completion's or a view's) on each bid in `bids`, and
+    /// post every buffer that is then exhausted with no holds back to the
+    /// ring, whole. A bid may appear more than once, once per hold it drops.
     ///
     /// # Panics
-    /// If a bid has no hold to drop: it was released more times than it
-    /// completed. A duplicate release that arrives after the buffer was
+    /// If a bid has no hold to drop: it was released more times than it was
+    /// held (completions plus views). A duplicate release that arrives after the buffer was
     /// posted and completed again takes that completion's hold and is not
     /// detected.
     pub(crate) fn release_batch(&mut self, bids: &[u16]) {
@@ -249,9 +254,35 @@ impl ProvidedBufRing {
     }
 
     /// Buffers with at least one hold: completions whose data a lend still
-    /// holds, plus those whose release is queued for the next flush.
+    /// holds, buffers a view still holds, plus those whose release is queued
+    /// for the next flush.
     pub(crate) fn held(&self) -> u32 {
         self.held
+    }
+
+    /// Take one more hold on `bid`, for a view of its bytes up to offset
+    /// `end`. The buffer must already have a hold, the one of the entry the
+    /// view is made from, so it has not been posted again since those bytes
+    /// completed. `end` must be within the bytes the kernel has completed, so
+    /// the kernel does not write the view's range while the view is alive.
+    ///
+    /// # Panics
+    /// If `bid` has no hold, or `end` is past the completed bytes.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn add_hold(&mut self, bid: u16, end: u32) {
+        let s = &mut self.state[bid as usize];
+        assert!(s.holds > 0, "view of buffer {bid}, which has no hold");
+        assert!(
+            end <= s.written,
+            "view of buffer {bid} to offset {end}, past its {} completed bytes",
+            s.written
+        );
+        s.holds += 1;
+    }
+
+    /// The buffers' memory, for views of them.
+    pub(crate) fn memory(&self) -> &Arc<RingMemory> {
+        &self.mem
     }
 
     /// Size of each buffer in bytes.
@@ -282,14 +313,14 @@ impl ProvidedBufRing {
     /// that `complete` placed at that offset.
     pub(crate) fn data_ptr(&self, bid: u16, off: u32) -> *const u8 {
         debug_assert!(off <= self.buf_size);
-        // Safety: `off` is within buffer `bid`, which is inside `buf_backing`.
+        // Safety: `off` is within buffer `bid`, which is inside `mem`.
         unsafe { self.get_buffer(bid).0.add(off as usize) }
     }
 
     /// Get a pointer and length for a buffer by its ID.
     pub fn get_buffer(&self, bid: u16) -> (*const u8, u32) {
         let offset = bid as usize * self.buf_size as usize;
-        let ptr = unsafe { self.buf_backing.as_ptr().add(offset) };
+        let ptr = unsafe { self.mem.as_ptr().add(offset) as *const u8 };
         (ptr, self.buf_size)
     }
 
@@ -324,7 +355,7 @@ impl ProvidedBufRing {
                 .cast::<BufRingEntry>()
         };
         let buf_offset = bid as usize * self.buf_size as usize;
-        let buf_addr = unsafe { self.buf_backing.as_ptr().add(buf_offset) };
+        let buf_addr = unsafe { self.mem.as_ptr().add(buf_offset) };
         unsafe {
             ptr::write(
                 entry_ptr,

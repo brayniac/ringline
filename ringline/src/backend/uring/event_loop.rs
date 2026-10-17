@@ -166,7 +166,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         blocking_pool: Option<std::sync::Arc<crate::blocking::BlockingPool>>,
         region_rx: crate::region_registry::RegionControlRx,
     ) -> Result<Self, crate::error::Error> {
-        let driver = Driver::new(
+        let mut driver = Driver::new(
             config,
             accept_rx,
             eventfd,
@@ -200,6 +200,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             config.udp_bind.len() as u32,
             udp_queue_capacity,
         );
+        driver.worker_id = executor.wakes.id();
         // A waker woken off this thread rings the worker's own wake fd.
         if let Some(handle) = config
             .wake_keep_alive
@@ -21083,6 +21084,210 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── Receive views (`backend/uring/view.rs`) ──────────────────────────
+
+    /// Apply the view releases queued on this thread or pushed to the
+    /// worker's inbox, then post the released buffers, as the event loop
+    /// does before it waits.
+    fn release_views(el: &mut AsyncEventLoop<NoopHandler>) {
+        crate::fs::release_orphans(&mut el.driver, &mut el.executor);
+        el.driver.release_pending();
+    }
+
+    /// Give the worker's inbox a wake handle, and return its eventfd.
+    fn set_wake_fd(el: &mut AsyncEventLoop<NoopHandler>) -> std::os::fd::RawFd {
+        let (wake_fd, wake) = crate::wakeup::create_wake_fd().expect("wake fd");
+        el.executor.wakes.set_wake_handle(wake);
+        wake_fd
+    }
+
+    /// Whether the wake eventfd was written since it was last read.
+    fn read_wake(wake_fd: std::os::fd::RawFd) -> bool {
+        let mut count = 0u64;
+        // Safety: `wake_fd` is a nonblocking eventfd the inbox's handle keeps
+        // open, and `count` is 8 bytes.
+        let n = unsafe { libc::read(wake_fd, (&raw mut count).cast(), 8) };
+        n == 8 && count > 0
+    }
+
+    /// A connection in the segmented domain with `data` held in buffer `bid`.
+    fn held_segment(el: &mut AsyncEventLoop<NoopHandler>, bid: u16, data: &[u8]) -> u32 {
+        let conn_index = accept_connection(el);
+        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
+        deliver_segment(el, conn_index, bid, data);
+        conn_index
+    }
+
+    /// Release the hold of the connection's first held entry, as a reader
+    /// that consumed it does, and post what that frees.
+    fn consume_entry(el: &mut AsyncEventLoop<NoopHandler>, conn_index: u32) {
+        match el.driver.segment_hold[conn_index as usize].pop_front() {
+            Some(crate::backend::HeldRecvBuf::Pinned { bid, .. }) => {
+                el.driver.pending_replenish.push(bid);
+            }
+            _ => panic!("expected a pinned entry"),
+        }
+        el.driver.release_pending();
+    }
+
+    /// A view keeps its buffer out of the ring after the entry it was made
+    /// from is consumed, and so does a slice of it; the buffer is posted
+    /// once both have dropped and the worker has applied the releases. The
+    /// slice drops inside a driver borrow, where the release must not take
+    /// the driver. Both drops are on the worker's thread, so neither goes
+    /// through the inbox or writes the wake fd.
+    #[test]
+    fn a_view_keeps_its_buffer_until_its_last_slice_drops() {
+        let mut el = make_test_loop();
+        let wake_fd = set_wake_fd(&mut el);
+        let entries = el.driver.provided_bufs.ring_entries();
+        let conn_index = held_segment(&mut el, 0, b"hello");
+
+        let view = el.driver.recv_view(0, 0, 5);
+        assert_eq!(&view[..], b"hello");
+        let slice = view.slice(1..4);
+        consume_entry(&mut el, conn_index);
+        assert_eq!(
+            el.driver.provided_bufs.free(),
+            entries - 1,
+            "the view holds the buffer after its entry is consumed"
+        );
+
+        drop(view);
+        release_views(&mut el);
+        assert_eq!(
+            el.driver.provided_bufs.free(),
+            entries - 1,
+            "a slice of the view still holds the buffer"
+        );
+        assert_eq!(&slice[..], b"ell");
+
+        with_driver_state(&mut el, || drop(slice));
+        assert_eq!(
+            el.driver.provided_bufs.free(),
+            entries - 1,
+            "the release waits for the worker to apply it"
+        );
+        assert!(
+            !read_wake(wake_fd),
+            "a drop on the worker's thread is local"
+        );
+        release_views(&mut el);
+        assert_eq!(el.driver.provided_bufs.free(), entries);
+    }
+
+    /// A view ends within the bytes the kernel has completed in its buffer.
+    #[test]
+    #[should_panic(expected = "view of buffer 0 to offset 100, past its 2 completed bytes")]
+    fn a_view_past_the_completed_bytes_panics() {
+        let mut el = make_test_loop();
+        held_segment(&mut el, 0, b"hi");
+        let _ = el.driver.recv_view(0, 0, 100);
+    }
+
+    /// A view's release reaches the worker whose driver made it, when another
+    /// worker was registered on the thread after it and before the view.
+    #[test]
+    fn a_view_releases_to_its_own_worker_with_two_on_the_thread() {
+        let mut first = make_test_loop();
+        let entries = first.driver.provided_bufs.ring_entries();
+        let conn_index = held_segment(&mut first, 0, b"first");
+        let mut second = make_test_loop();
+        let view = first.driver.recv_view(0, 0, 5);
+        consume_entry(&mut first, conn_index);
+
+        drop(view);
+        release_views(&mut second);
+        release_views(&mut first);
+        assert_eq!(first.driver.provided_bufs.free(), entries);
+    }
+
+    /// Two views of one buffer take a hold each, and the buffer returns only
+    /// after both drop.
+    #[test]
+    fn two_views_of_one_buffer_each_hold_it() {
+        let mut el = make_test_loop();
+        let entries = el.driver.provided_bufs.ring_entries();
+        let conn_index = held_segment(&mut el, 3, b"abcdef");
+
+        let first = el.driver.recv_view(3, 0, 2);
+        let second = el.driver.recv_view(3, 2, 4);
+        assert_eq!((&first[..], &second[..]), (&b"ab"[..], &b"cdef"[..]));
+        consume_entry(&mut el, conn_index);
+
+        drop(first);
+        release_views(&mut el);
+        assert_eq!(el.driver.provided_bufs.free(), entries - 1);
+        drop(second);
+        release_views(&mut el);
+        assert_eq!(el.driver.provided_bufs.free(), entries);
+    }
+
+    /// A view dropped on another thread releases its hold through the
+    /// worker's inbox, and writes the worker's wake fd so a worker blocked
+    /// in its wait applies the release.
+    #[test]
+    fn a_view_dropped_on_another_thread_releases_through_the_inbox() {
+        let mut el = make_test_loop();
+        let wake_fd = set_wake_fd(&mut el);
+        let entries = el.driver.provided_bufs.ring_entries();
+        let conn_index = held_segment(&mut el, 1, b"remote");
+
+        let view = el.driver.recv_view(1, 0, 6);
+        consume_entry(&mut el, conn_index);
+        assert!(!read_wake(wake_fd), "no wake before the drop");
+        std::thread::spawn(move || {
+            assert_eq!(&view[..], b"remote");
+            drop(view);
+        })
+        .join()
+        .expect("dropping thread");
+        assert!(read_wake(wake_fd), "the drop wakes the worker");
+        assert_eq!(el.driver.provided_bufs.free(), entries - 1);
+
+        release_views(&mut el);
+        assert_eq!(el.driver.provided_bufs.free(), entries);
+    }
+
+    /// A view outlives its worker: the ring memory stays allocated while the
+    /// view is alive and is freed when it drops, and the release, which has
+    /// no worker to go to, is dropped.
+    #[test]
+    fn a_view_outlives_its_worker() {
+        let mut el = make_test_loop();
+        held_segment(&mut el, 2, b"survivor");
+        let view = el.driver.recv_view(2, 0, 8);
+        let memory = Arc::downgrade(el.driver.provided_bufs.memory());
+
+        drop(el);
+        assert!(memory.upgrade().is_some(), "the view keeps the memory");
+        assert_eq!(&view[..], b"survivor");
+        drop(view);
+        assert!(memory.upgrade().is_none(), "the last view frees the memory");
+    }
+
+    /// A release naming another ring's memory, as one queued by an earlier
+    /// worker on this thread does, is ignored: applying it would drop a
+    /// hold this worker's buffer still needs.
+    #[test]
+    fn a_release_for_another_rings_memory_is_ignored() {
+        let mut el = make_test_loop();
+        let entries = el.driver.provided_bufs.ring_entries();
+        held_segment(&mut el, 0, b"mine");
+        let other = super::super::view::RingMemory::new(4096).expect("ring memory");
+
+        crate::runtime::defer_release(crate::runtime::Orphan::RecvView {
+            alloc: other.id(),
+            bid: 0,
+        });
+        release_views(&mut el);
+        assert_eq!(
+            el.driver.provided_bufs.free(),
+            entries - 1,
+            "the held entry's buffer stays out of the ring"
+        );
     }
 }
 
