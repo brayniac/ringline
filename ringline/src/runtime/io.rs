@@ -5552,19 +5552,20 @@ pub fn recv_zc_threshold() -> u32 {
 ///
 /// On io_uring, [`Connection::with_bytes_segments`] presents held receive
 /// buffers as views of the ring's memory, and a value sliced from one is a
-/// view too. A view keeps its whole ring buffer (16 KiB by default;
+/// view too. A view keeps its whole ring buffer from being reused until it
+/// drops, whatever its length. Ring buffers are 16 KiB by default;
 /// [`ConfigBuilder::recv_incremental`](crate::ConfigBuilder::recv_incremental)
-/// and `recv_buffer` give other sizes) from being reused until it drops,
-/// whatever its length. A client that keeps parsed values calls this on
-/// each one, so a small kept value holds a heap copy instead of a ring
-/// buffer. When `value` is copied it is dropped here; the buffer returns to
-/// the ring once no clone or slice of the view remains.
+/// and [`ConfigBuilder::recv_buffer`](crate::ConfigBuilder::recv_buffer)
+/// give other sizes. A client that keeps parsed values calls this on each
+/// one, so a small kept value holds a heap copy instead of a ring buffer.
+/// When `value` is copied it is dropped here; the view's hold on its buffer
+/// is released once no clone or slice of the view remains.
 ///
 /// A view is recognised by its data pointer lying in the calling worker's
-/// ring memory. Called outside a ringline task, on any thread, every
-/// `Bytes` is treated as a view. A view made on one worker and passed here
-/// on another is not recognised and is returned unchanged. On mio nothing
-/// is a view, and `value` is always returned unchanged.
+/// ring memory. On io_uring, called outside a ringline task, on any thread,
+/// every `Bytes` is treated as a view. A view made on one worker and passed
+/// here on another is not recognised and is returned unchanged. On mio
+/// nothing is a view, and a non-empty `value` is returned unchanged.
 ///
 /// An empty `value` is returned as an empty `Bytes` that holds nothing. A
 /// `threshold` of 0 never copies. Copies count in
@@ -5579,8 +5580,18 @@ pub fn copy_small_view(value: Bytes, threshold: u32) -> Bytes {
     }
     let copy = Bytes::copy_from_slice(&value);
     crate::metrics::RECV_RING.increment(crate::metrics::recv_ring::THRESHOLD_COPIED);
+    #[cfg(test)]
+    TEST_THRESHOLD_COPIED.with(|c| c.set(c.get() + 1));
     crate::accumulator::note_copied(copy.len());
     copy
+}
+
+#[cfg(test)]
+thread_local! {
+    /// This thread's `THRESHOLD_COPIED` total, for tests: the process-wide
+    /// metric is also moved by concurrent tests in one process.
+    pub(crate) static TEST_THRESHOLD_COPIED: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
 }
 
 /// Whether `value`'s data lies in the calling worker's TCP receive ring

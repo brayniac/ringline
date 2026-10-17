@@ -147,8 +147,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `ConfigBuilder::recv_zc_threshold` (default 4096),
   `ringline::recv_zc_threshold` and `ringline::copy_small_view`.
   `copy_small_view(value, threshold)` returns an owned copy of a receive
-  view shorter than `threshold` and returns any other `Bytes` unchanged; a
-  small value a client keeps then does not hold a whole ring buffer.
+  view shorter than `threshold`, and on io_uring outside a ringline task of
+  any `Bytes` shorter than it; it returns other non-empty values unchanged.
+  A small value a client keeps then does not hold a whole ring buffer.
   `recv_zc_threshold()` returns the worker's configured value, or 4096
   outside a ringline task. The runtime does not apply the threshold itself;
   a client applies it by calling `copy_small_view`.

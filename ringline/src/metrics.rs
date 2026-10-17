@@ -332,7 +332,8 @@ pub mod recv_ring {
     /// copies. Ciphertext staged for TLS is not counted.
     pub const BYTES_COPIED: usize = 8;
     /// Values `copy_small_view` copied: views shorter than its threshold,
-    /// and, on io_uring outside a ringline task, any value shorter than it.
+    /// and, on io_uring outside a ringline task, any non-empty value shorter
+    /// than it.
     /// Their bytes also count in `BYTES_COPIED`.
     pub const THRESHOLD_COPIED: usize = 9;
     pub const COUNT: usize = 10;

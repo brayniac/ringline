@@ -21128,9 +21128,7 @@ mod tests {
     // ── copy_small_view and recv_zc_threshold ───────────────────────────
 
     fn threshold_copied() -> u64 {
-        crate::metrics::RECV_RING
-            .value(crate::metrics::recv_ring::THRESHOLD_COPIED)
-            .unwrap_or(0)
+        crate::runtime::io::TEST_THRESHOLD_COPIED.with(|c| c.get())
     }
 
     /// A view shorter than the threshold is copied, and the copy releases
@@ -21148,8 +21146,7 @@ mod tests {
         assert_eq!(&copy[..], b"hello");
         assert_ne!(copy.as_ptr(), el.driver.provided_bufs.data_ptr(0, 0));
         assert_eq!(crate::accumulator::test_bytes_copied() - copied, 5);
-        // The metric is process-wide; other tests in the process only raise it.
-        assert!(threshold_copied() > counted);
+        assert_eq!(threshold_copied() - counted, 1);
         release_views(&mut el);
         assert_eq!(
             el.driver.provided_bufs.free(),
@@ -21183,7 +21180,8 @@ mod tests {
         let mut view = el.driver.recv_view(0, 0, 5);
         view.truncate(0);
         consume_entry(&mut el, conn_index);
-        let empty = with_driver_state(&mut el, || crate::copy_small_view(view, 4096));
+        // Threshold 0 never copies, so only the empty check releases it.
+        let empty = with_driver_state(&mut el, || crate::copy_small_view(view, 0));
         assert!(empty.is_empty());
         release_views(&mut el);
         assert_eq!(el.driver.provided_bufs.free(), entries);
@@ -21194,13 +21192,17 @@ mod tests {
     #[test]
     fn copy_small_view_returns_another_workers_view_unchanged() {
         let mut first = make_test_loop();
-        held_segment(&mut first, 0, b"hello");
+        let entries = first.driver.provided_bufs.ring_entries();
+        let conn_index = held_segment(&mut first, 0, b"hello");
         let view = first.driver.recv_view(0, 0, 5);
         let ptr = view.as_ptr();
+        consume_entry(&mut first, conn_index);
         let mut second = make_test_loop();
         let kept = with_driver_state(&mut second, || crate::copy_small_view(view, 4096));
         assert_eq!(kept.as_ptr(), ptr);
-        with_driver_state(&mut first, || drop(kept));
+        drop(kept);
+        release_views(&mut first);
+        assert_eq!(first.driver.provided_bufs.free(), entries);
     }
 
     /// On a worker, a heap value is returned unchanged; outside a task, every
