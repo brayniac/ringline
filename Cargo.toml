@@ -80,3 +80,9 @@ slab = "0.4"
 rcgen = "0.13"
 rustls-pki-types = "1"
 webpki-roots = "0.26"
+
+# Step 5 of docs/recv-segment-views-design.md measures against the proto
+# crates' unreleased main branches, which have `parse_segments`. Not for main.
+[patch.crates-io]
+resp-proto = { git = "https://github.com/ringline-rs/resp-proto", rev = "d0054e338fa200a73b6b40692faa7094363779d3" }
+memcache-proto = { git = "https://github.com/ringline-rs/memcache-proto", rev = "aa93e3ca2528f431607b4a4bfbdfabfd63ba0bf3" }
