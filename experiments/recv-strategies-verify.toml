@@ -7,7 +7,7 @@
 name = "ringline recv INC verify {image} (#622)"
 
 [params]
-image    = "spool/images/debian-13-ci-20260912.1@golden"
+image    = "debian-13-ci"
 branch   = "exp/recv-strategies"
 repo     = "https://github.com/brayniac/ringline"
 reps     = "3"

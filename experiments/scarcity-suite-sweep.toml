@@ -46,7 +46,7 @@ tags = ["validation"]
 [[jobs.steps]]
 type = "anvil-vm"
 shape = "z4.c"
-image = "spool/images/debian-13-ci-20260912.1@golden"
+image = "debian-13-ci"
 slots = 1
 memory_gib = 4
 ports = 0
