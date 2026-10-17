@@ -212,6 +212,10 @@ impl RecvSegment<'_> { pub fn into_owned(self) -> Bytes; } // copy + release-onc
 
 ## Rejected: user-held zero-copy (`Bytes` over a provided buffer)
 
+The 2026-10-08 owner decision in `docs/recv-incremental-ring-design.md`
+("`with_bytes`") reverses this rejection. `docs/recv-segment-views-design.md`
+proposes views and answers the three objections below.
+
 An earlier draft returned a `Bytes::from_owner` over the provided buffer with
 replenish-on-drop, plus a "spill valve." **Removed as unsound** (recorded so it
 is not re-proposed):

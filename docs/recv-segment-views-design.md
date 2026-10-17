@@ -74,6 +74,20 @@ On io_uring a connection receives in one of two domains
   task-poll pass and before the worker waits for I/O
   (`backend/uring/event_loop.rs`).
 
+`docs/segmented-recv-design.md` ("Rejected: user-held zero-copy") rejected a
+`Bytes::from_owner` over a provided buffer as unsound, and the 2026-10-08
+decision in `docs/recv-incremental-ring-design.md` ("`with_bytes`") reversed
+that. This design answers its three objections:
+
+- A view dropped on another thread releases through the creating worker's
+  inbox and never touches `pending_replenish` from that thread ("Views").
+- There is no spill valve. A kept view keeps its buffer out of the ring
+  until it drops, and the kept buffers are bounded by the lend cap or
+  `recv_segment_reserve` ("Ring pressure").
+- A view holds its buffer by a buffer hold of its own, not through the
+  connection's slot. Close releases each held entry's buffer hold once and
+  leaves the views' holds in place (see "Tests").
+
 ## API
 
 ```rust
@@ -112,6 +126,12 @@ call would return `EBUSY`). It maps the refusals: a stale handle (`EPIPE`
 there) resolves to `Ok(0)`, and a running forward or a live `SegmentReader`
 to `Err(EBUSY)`.
 
+On io_uring the parser runs under `ReaderCallback::enter`, as every
+reader's callback does, so `offer_park` declines a park offer made from
+inside it (#671). The reader takes the accumulator out with `take_frozen`
+before the callback, so `holds_unread` can be false while a request is half
+read.
+
 Entering moves any accumulator bytes to the front of the hold as one `Owned`
 entry. It copies a `pending_recv_bufs` lend into an `Owned` entry today;
 step 2 changes `enter_segmented_domain` to convert the lend into a `Pinned`
@@ -129,7 +149,7 @@ and a forward that ends, a dropped `SegmentReader` and `end_segments` return
 the connection to the default domain (`settle_forward_end`). A later poll
 that continued would act on stale state: a recorded `NeedAtLeast(n)` counts
 bytes that are gone, and in the default domain the next completion is lent
-where this reader does not look. Step 2 therefore adds a per-connection
+into `pending_recv_bufs`, which this reader does not read. Step 2 therefore adds a per-connection
 counter, `segment_epoch`. It is incremented by `settle_forward_end` and
 whenever a reader removes bytes from the hold or the accumulator while the
 connection is in the segmented domain, this reader included. The future
@@ -259,10 +279,10 @@ only for `Ok(k)` with `k > 0`. `Err(EBUSY)`, end of stream and a close at
 `recv_accumulator_max` leave `Connection::recv_arrival` at `None`; a stale
 handle does not touch the log.
 
-`recv_buffered` counts the accumulator, `pending_recv_bufs` and
-`segment_hold`. Entering the domain, converting a lend to a `Pinned` entry
-and the hold-cap copy move bytes between those three without changing the
-sum, so the range a call reports is the `k` bytes its `Consumed(k)` removed.
+`recv_buffered` counts the accumulator, `pending_recv_bufs`,
+`segment_hold` and `recv_hold`. Entering the domain, converting a lend to a
+`Pinned` entry and the hold-cap copy move bytes among the first three
+without changing the sum, so the range a call reports is the `k` bytes its `Consumed(k)` removed.
 A view the parser keeps holds consumed bytes, which are not in
 `recv_buffered` and do not delay the arrival log's trim.
 
@@ -276,6 +296,13 @@ the worker that created it; the memory id is read from the `Arc`.
 
 - Creating a view takes one buffer hold (`BufState::holds += 1`), so the
   buffer stays out of the ring and counts in `held()`, under the lend cap.
+  It asserts that the buffer already has a hold and that the range ends
+  within the bytes the kernel has completed in the buffer
+  (`BufState::written`), so the kernel does not write a view's range.
+- A view records the id of the worker whose driver made it
+  (`Driver::worker_id`, set by the event loop), not the thread's current
+  worker, so its release reaches that worker when a thread has run more
+  than one.
   The `segment_hold` entry's own buffer hold is separate: popping the entry
   releases it, and the buffer returns to the ring only when every view of it
   has also been dropped.
@@ -313,11 +340,13 @@ the worker that created it; the memory id is read from the `Arc`.
   because `at_hold_cap` counts `segment_hold` entries. With a lend cap, kept
   views count in `held()` against it; without one, they count in `free()`
   against `recv_segment_reserve`.
-- A view does not block a park. `park_blocker` refuses a park while
-  `holds_unread` is true, which covers `segment_hold` and `segment_pinned`
-  but not views. A view's buffer hold belongs to the worker's ring, and a
-  view of a parked connection is released to the worker that created it,
-  like any other view.
+- A view does not block a park. `park_blocker` and `offer_park` refuse
+  while `holds_unread` is true: while `recv_buffered` counts bytes, or a
+  buffer is in `segment_pinned`. A view holds bytes already consumed and is
+  not tied to the connection's slot. The park's `close_connection` drops the
+  handler future on the creating worker, and any view the future holds with
+  it. A view carried in `ParkState` drops on the target worker and releases
+  through the creating worker's inbox.
 
 The default-domain `with_bytes` views decided in
 `docs/recv-incremental-ring-design.md` ("`with_bytes`") can use `RecvView`
@@ -496,9 +525,12 @@ is zeroed eagerly, which would make the whole ring resident at startup.
 - `Consumed(k)` with `k` past the bytes presented consumes only the bytes
   presented.
 - `end_segments` on mio returns `Ok(())`.
-- `recv_arrival` after a `Consumed(k)` call over several pieces reports the
-  arrival of the first and last consumed byte, on both backends, and after
-  a hold-cap copy; after a call that resolved to `Err(EBUSY)` it is `None`.
+- On io_uring, `recv_arrival` after a `Consumed(k)` call over several
+  pieces, and after one that follows a hold-cap copy, reports the arrival
+  of the first and last consumed byte. On mio it reports what `with_bytes`
+  reports for the same bytes. On both backends it is `None` after a call
+  that resolved to `Err(EBUSY)`.
+- A parser that calls `offer_for_park` has its offer declined.
 - A connection with a view alive and nothing held can be parked.
 - Client crates: a value inside one piece is a view; a value across pieces
   is owned; a view below the threshold is copied by the helper.
@@ -525,8 +557,9 @@ is zeroed eagerly, which would make the whole ring resident at startup.
      `docs/recv-arrival-times-design.md`;
    - rustdoc: `ParseResult::NeedAtLeast`, the `RecvHalf` note that mio has
      no segmented domain, `with_bytes_segments` in `RecvHalf`'s list of
-     methods whose futures carry no borrow, and the
-     `SEGMENT_STRANDED_ADOPTED` comment.
+     methods whose futures carry no borrow, the entry points listed in
+     `ConnCtx::take_recv`, and the `SEGMENT_STRANDED_ADOPTED` comment;
+   - the parser run under `ReaderCallback::enter`.
 3. `recv_zc_threshold`, its helper and metric.
 4. Release resp-proto and memcache-proto with `parse_segments`, and move
    ringline's workspace requirements and `Cargo.lock` on main to those
@@ -551,16 +584,18 @@ is zeroed eagerly, which would make the whole ring resident at startup.
      the hold cap; views created per response.
    - Five reps per cell, with an A/A pair.
 6. Switch ringline-redis (`read_value_from`) and ringline-memcache
-   (`read_response`) to `with_bytes_segments`, with the helper, if no cell
+   (`read_reply`, behind `read_response`) to `with_bytes_segments`, with the helper, if no cell
    of step 5 is worse beyond its A/A spread. memcache-proto has no
    binary-protocol `parse_segments`, so `BinaryClient`
    (`ClientBuilder::build_binary`) keeps reading with `with_bytes` and never
-   enters the segmented domain. ringline-memcache's `read_response` returns
+   enters the segmented domain. ringline-memcache's `read_reply` returns
    `Consumed(0)` when a response is incomplete and gains a length hint.
    ringline-redis's `bulk_remainder_hint` reads only a `$` reply in one
    contiguous slice, and is changed to read a header split across pieces.
    Without a hint each arrival re-parses and re-creates a view for every
-   held entry, up to the hold cap.
+   held entry, up to the hold cap. The receive copy counts in
+   `docs/syscalls-and-copies.md` and in CLAUDE.md ("Copy Semantics") change
+   in the same PR.
 
 ## Decisions
 
@@ -574,7 +609,9 @@ The owner accepted these on 2026-10-15.
   `with_segments`, `enter_segmented_domain`, `arm_forward_source`,
   `forward_recv_buf`, `DirectEchoFuture`, `ConnStream`, `handle_recv_multi`,
   the starved drain in `flush_replenish_and_rearm`,
-  `install_accepted_with_pending`, `handle_connect` and `handle_close`. Both
+  `install_accepted_with_pending`, `handle_connect`, `handle_close`, and
+  `Driver::recv_buffered` (through it `holds_unread` and the arrival log).
+  Both
   remove the copy into the accumulator.
 - The name is `with_bytes_segments`. It is to `with_segments` what
   `with_bytes` is to `with_data`, and the proto crates name the parser
