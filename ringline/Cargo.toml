@@ -30,7 +30,7 @@ tls-unbuffered = []
 
 [dependencies]
 futures-io = "0.3"
-bytes = "1"
+bytes = { workspace = true }
 crossbeam-channel = "0.5"
 libc = "0.2"
 mio = { version = "1", features = ["os-poll", "net", "os-ext"] }
@@ -43,7 +43,7 @@ rustls = { workspace = true, features = ["std", "ring"] }
 io-uring = "0.7"
 
 [dev-dependencies]
-bytes = "1"
+bytes = { workspace = true }
 criterion = { version = "0.5", features = ["async_tokio"] }
 futures-io = "0.3"
 futures-util = { version = "0.3", features = ["io"] }

@@ -92,8 +92,8 @@ pub(crate) enum PendingUdpBuf {
     Owned(Vec<u8>),
     /// Reference into a kernel-provided buffer (io_uring backend, zero-copy).
     ///
-    /// The pointer is into `ProvidedBufRing::buf_backing`, which is allocated
-    /// once and not resized, so it remains valid until `bid` is replenished.
+    /// The pointer is into `ProvidedBufRing::mem` (a `RingMemory`), which is
+    /// allocated once and not resized, so it remains valid until `bid` is replenished.
     /// `payload_len` is the datagram payload length (excludes recvmsg header).
     #[cfg(has_io_uring)]
     Kernel {
@@ -445,6 +445,13 @@ pub(crate) enum Orphan {
     Blocking(u64),
     /// A `ResolveFuture`'s `pending_resolves` entry.
     Resolve(u64),
+    /// A receive view's hold on TCP ring buffer `bid` of the ring memory
+    /// with id `alloc` (`backend/uring/view.rs`). Queued by the view's drop
+    /// on its worker's thread; a view dropped on another thread releases
+    /// through the worker's inbox instead.
+    #[cfg(has_io_uring)]
+    #[cfg_attr(not(test), allow(dead_code))]
+    RecvView { alloc: u64, bid: u16 },
 }
 
 thread_local! {
@@ -491,7 +498,24 @@ pub(crate) fn release_orphans(driver: &mut crate::backend::Driver, executor: &mu
             Orphan::Resolve(request_id) => {
                 executor.pending_resolves.remove(&request_id);
             }
+            #[cfg(has_io_uring)]
+            Orphan::RecvView { alloc, bid } => release_recv_view(driver, alloc, bid),
         }
+    }
+    #[cfg(has_io_uring)]
+    executor
+        .wakes
+        .drain_view_releases(|alloc, bid| release_recv_view(driver, alloc, bid));
+}
+
+/// Release a receive view's hold on `bid` if `alloc` is this worker's TCP
+/// ring memory. A release for another allocation was queued by an earlier
+/// worker on this thread, whose ring is gone, and is ignored.
+#[cfg(has_io_uring)]
+fn release_recv_view(driver: &mut crate::backend::Driver, alloc: u64, bid: u16) {
+    if driver.provided_bufs.memory().id() == alloc {
+        driver.pending_replenish.push(bid);
+        crate::metrics::RECV_RING.increment(crate::metrics::recv_ring::VIEW_RELEASED);
     }
 }
 

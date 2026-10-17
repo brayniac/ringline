@@ -93,8 +93,8 @@ pub(crate) struct UdpSocketState {
 
 /// A kernel recv buffer held in-place for zero-copy access.
 ///
-/// The pointer is into `ProvidedBufRing::buf_backing`, which is allocated once
-/// and never resized, so it remains valid until its hold is released.
+/// The pointer is into `ProvidedBufRing::mem` (a `RingMemory`), which is
+/// allocated once and never resized, so it remains valid until its hold is released.
 #[derive(Clone, Copy)]
 pub(crate) struct PendingRecvBuf {
     pub(crate) bid: u16,
@@ -118,6 +118,31 @@ impl Driver {
                 false
             }
         }
+    }
+}
+
+impl Driver {
+    /// A `Bytes` view of `len` bytes at offset `off` in TCP ring buffer `bid`,
+    /// which must have a hold (the held entry the view is made from). The
+    /// view takes a hold of its own, released when the view and every clone
+    /// and slice of it have dropped (`backend/uring/view.rs`), so the buffer
+    /// is not posted again while any of them is alive. The hold counts in
+    /// `ProvidedBufRing::held`, under the lend cap.
+    ///
+    /// # Panics
+    /// If `bid` has no hold, or the range ends past the bytes the kernel has
+    /// completed in the buffer.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn recv_view(&mut self, bid: u16, off: u32, len: u32) -> bytes::Bytes {
+        let end = off.checked_add(len).expect("view range overflows");
+        self.provided_bufs.add_hold(bid, end);
+        super::view::view(
+            self.provided_bufs.memory(),
+            self.provided_bufs.data_ptr(bid, off),
+            len as usize,
+            bid,
+            self.worker_id,
+        )
     }
 }
 
@@ -491,10 +516,14 @@ pub(crate) struct Driver {
     pub(crate) send_copy_pool: SendCopyPool,
     pub(crate) send_slab: InFlightSendSlab,
     pub(crate) accumulators: AccumulatorTable,
-    /// TCP bids whose completion hold is released at the next
+    /// TCP bids whose hold (a completion's or a view's) is released at the next
     /// `flush_replenish_and_rearm` (`ProvidedBufRing::release_batch`): one
     /// entry per hold.
     pub(crate) pending_replenish: Vec<u16>,
+    /// The id of the worker that runs this driver (`WorkerWakes::id`). Views
+    /// carry it so their releases reach this worker. 0 until
+    /// `AsyncEventLoop::new` sets it, before any view can be made.
+    pub(crate) worker_id: u32,
     /// Per-connection pending recv buffer for zero-copy recv. When `Some`, the
     /// buffer ID has NOT been pushed to `pending_replenish` and must be
     /// replenished when the slot is cleared.
@@ -1338,6 +1367,7 @@ impl Driver {
             send_slab,
             accumulators,
             pending_replenish: Vec::with_capacity(recv_ring_size as usize),
+            worker_id: 0,
             pending_recv_bufs: vec![None; config.max_connections as usize],
             send_recv_buf_original_lens: vec![0; config.max_connections as usize],
             send_recv_buf_offs: vec![0; config.max_connections as usize],

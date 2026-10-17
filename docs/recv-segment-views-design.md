@@ -1,6 +1,7 @@
 # Segment views: `Bytes` over held receive buffers for segment parsers
 
-Status: proposal. Nothing here is implemented.
+Status: landing step 1 (the view machinery) is implemented; the reader and
+the later steps are a proposal.
 
 Related: `docs/recv-incremental-ring-design.md` ("`with_bytes`", the owner
 decisions of 2026-10-08 on views and `recv_zc_threshold`),
@@ -63,8 +64,10 @@ On io_uring a connection receives in one of two domains
   unconsumed byte into the accumulator, so a parser that needs more than is
   buffered (`SegConsumed(0)`) copies every unconsumed held byte it was
   shown.
-- The buffers are a `Vec<u8>` owned by `ProvidedBufRing` (`provided.rs`), so
-  no `Bytes` can refer to them beyond a borrow inside the driver.
+- The buffers are a `RingMemory` mapping that `ProvidedBufRing` shares
+  through an `Arc` (`provided.rs`, `view.rs`). `Driver::recv_view` makes a
+  `Bytes` view of a held range (landing step 1); no reader hands views out
+  yet, so outside the driver's tests no `Bytes` refers to the buffers.
 - `BufState::holds` counts uses of a buffer's bytes. A buffer returns to the
   ring when it is exhausted and has no buffer hold (rule 3 of "Buffer state"
   in `docs/recv-incremental-ring-design.md`). `ProvidedBufRing::held` counts
