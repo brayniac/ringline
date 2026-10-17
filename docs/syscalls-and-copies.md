@@ -175,14 +175,17 @@ count; zero-copy send is the exception the ZC rows note.
 | Step | Copies | Mechanism |
 |---|---:|---|
 | Kernel → provided buffer | 0 | Multishot recv fills `ProvidedBufRing` buffers selected at completion time (io_uring). On mio, `read()` into a scratch buffer instead. |
-| Provided buffer → `RecvAccumulator` | 1 | `extend_from_slice` into the per-connection contiguous accumulator. This is the one mandatory receive copy on the ordinary path. |
+| Provided buffer → `RecvAccumulator` | 1 | `extend_from_slice` into the per-connection contiguous accumulator. Every reader but `with_bytes_segments` reads from here. |
+| Provided buffer → `with_bytes_segments(\|&[Bytes]\|)` | 0 | io_uring: each held buffer is presented as a `Bytes` view of the ring buffer's memory, and a value inside one buffer is a slice of a view. A view keeps its whole buffer from the ring until it drops, so the client crates copy a value shorter than `recv_zc_threshold` (default 4096) out of it (`copy_small_view`, 1 copy). A value that spans buffers is copied by the parser (1 copy). A message longer than the hold cap is copied into the accumulator (1 copy). On mio this reader presents the accumulator. |
 | Accumulator → `with_data(\|&[u8]\|)` | 0 borrowed | The parser sees a borrowed slice and must copy anything it keeps. |
 | Accumulator → `with_bytes(\|Bytes\|)` | 0 | `BytesMut::freeze()` and `Bytes::slice()` are O(1) refcount operations; parsed values are refcounted sub-slices that stay valid after the accumulator advances. |
 | TLS receive | +1 | rustls must decrypt; plaintext is drained into the accumulator through `BufRead` with no intermediate scratch buffer. |
 
 `with_data` vs `with_bytes` is the single biggest receive-side copy decision a
-client makes: `with_bytes` plus a `Bytes`-aware parser makes value extraction
-fully zero-copy.
+client makes: `with_bytes` plus a `Bytes`-aware parser takes values out of the
+accumulator without a further copy. `with_bytes_segments` with a segment
+parser also skips the copy into the accumulator for a value that lies inside
+one provided buffer.
 
 ### Send path
 
@@ -258,9 +261,12 @@ only.
 The client crates (`ringline-redis`, `ringline-memcache`) compose these
 primitives; their READMEs carry the full per-path tables. The shape:
 
-- **Receive is fully zero-copy.** Both use `with_bytes` with `Bytes`-based
-  parsers (`resp-proto`, `memcache-proto`); returned values are refcounted
-  slices into the accumulator.
+- **Receive copies a value once at most.** Both read with
+  `with_bytes_segments` and the proto crates' `parse_segments`
+  (memcache's binary protocol reads with `with_bytes`). On io_uring a value
+  inside one provided buffer and at least `recv_zc_threshold` long is a view
+  of it, with no copy; a shorter value, or one that spans buffers, is copied
+  once. On mio values are slices of the accumulator.
 - **The command envelope always costs one copy.** Commands are encoded into a
   *reused* scratch buffer (no per-op allocation) and copied into the send
   pool — as are all fired commands coalesced into a batch

@@ -1,8 +1,9 @@
 //! ringline-native RESP client for use inside the ringline async runtime.
 //!
 //! This client wraps a [`ringline::ConnCtx`] and provides typed Redis command
-//! methods that use `with_bytes()` + `Value::parse_bytes()` for zero-copy
-//! incremental RESP parsing. It is designed for single-threaded,
+//! methods that read replies with `with_bytes_segments()` +
+//! `Value::parse_segments()`, which return values without copying them out
+//! of the receive buffers where they can. It is designed for single-threaded,
 //! single-connection use within ringline's `AsyncEventHandler::on_start()` or
 //! connection tasks.
 //!
@@ -142,7 +143,7 @@
 //!
 //! | Path | Copies | Mechanism |
 //! |------|--------|-----------|
-//! | **Recv (values)** | **0** | `with_bytes()` + `Value::parse_bytes()`. Bulk strings are `Bytes::slice()` references into the accumulator — zero allocation, O(1) refcount. |
+//! | **Recv (values)** | 0 or 1 | `with_bytes_segments()` + `Value::parse_segments()`. On io_uring a string inside one ring buffer and at least `recv_zc_threshold` long is a view of that buffer (0 copies); a shorter one is copied out of it (`ringline::copy_small_view`); one that spans buffers is copied by the parser. Bytes the runtime copied into the accumulator (TLS plaintext, a refused lend, a reply longer than the hold cap) are sliced from it. On mio strings are slices of the accumulator, which the bytes were copied into. |
 //! | **Send (commands)** | 1 | `encode_request()` serializes RESP into `Vec<u8>`, then `conn.send()` copies into the send pool. |
 //! | **Send (SET value, standard)** | 1 | All parts gathered into one send-pool slot via `send_parts().copy()`. |
 //! | **Send (SET value, guard)** | 0 (value) | [`Client::set_with_guard`] / [`Client::set_ex_with_guard`]: RESP prefix+suffix copied to pool, value stays in-place via `SendGuard`. |
@@ -759,21 +760,26 @@ pub(crate) async fn read_value_from(
         .max_bulk_string_len(usize::MAX)
         .max_collection_elements(MAX_COLLECTION)
         .max_total_items(MAX_COLLECTION);
-    let n = rx
-        .with_bytes(|bytes| {
-            let len = bytes.len();
-            // Peek the bulk-string header before the parse takes
-            // ownership: RESP announces payload length up front, so an
-            // incomplete parse can tell the runtime exactly how much
-            // more is coming and the recv accumulator reserves once
-            // instead of doubling through a multi-MB value.
-            let hint = bulk_remainder_hint(&bytes);
-            match Value::parse_bytes_with_options(bytes, &options) {
-                Ok((value, consumed)) => {
+    let threshold = ringline::recv_zc_threshold();
+    let n = match rx
+        .with_bytes_segments(|pieces| {
+            let len = pieces.iter().map(Bytes::len).sum();
+            match Value::parse_segments_with_options(pieces, &options) {
+                Ok((mut value, consumed)) => {
+                    let copied = copy_small_views(&mut value, pieces, threshold);
+                    if copied > 0 {
+                        ringline::metrics::RECV_RING.add(
+                            ringline::metrics::recv_ring::SEGMENT_PARSE_COPIED,
+                            copied as u64,
+                        );
+                    }
                     result = Some(Ok(value));
                     ParseResult::Consumed(consumed)
                 }
-                Err(e) if e.is_incomplete() => match hint {
+                // RESP announces a bulk string's length up front, so an
+                // incomplete parse can say how many more bytes complete it,
+                // and the parser is not called again until they arrive.
+                Err(e) if e.is_incomplete() => match bulk_remainder_hint(pieces, len) {
                     Some(additional) => ParseResult::NeedAtLeast(additional),
                     None => ParseResult::Consumed(0),
                 },
@@ -783,7 +789,14 @@ pub(crate) async fn read_value_from(
                 }
             }
         })
-        .await;
+        .await
+    {
+        Ok(n) => n,
+        Err(e) => {
+            tx.close();
+            return (Err(Error::Io(e)), 0);
+        }
+    };
     if n == 0 {
         return (result.unwrap_or(Err(Error::ConnectionClosed)), n);
     }
@@ -1859,9 +1872,8 @@ impl Client {
 
     /// Read and parse a single RESP value from the connection.
     ///
-    /// Uses zero-copy parsing via `with_bytes` + `Value::parse_bytes_with_options`:
-    /// bulk string values are `Bytes::slice()` references into the
-    /// accumulator's buffer rather than freshly allocated `Vec<u8>`.
+    /// Reads with `with_bytes_segments` + `Value::parse_segments_with_options`;
+    /// see the crate's copy semantics for which strings are copied.
     pub(crate) async fn read_value(&mut self) -> Result<Value, Error> {
         self.read_reply().await.0
     }
@@ -3929,16 +3941,36 @@ pub(crate) fn parse_bytes_array(value: Value) -> Result<Vec<Bytes>, Error> {
 }
 
 /// For an incomplete reply that starts with a bulk string (`$<len>\r\n…`),
-/// compute how many more bytes complete the frame. Returns `None` when the
-/// head isn't a bulk string, the length header is itself incomplete, the
-/// length is negative (`$-1` null reply), or the frame is already fully
-/// buffered (the parse was incomplete for some other reason).
+/// compute how many more bytes complete the frame, given the reply's pieces
+/// and their total length `buffered`. Returns `None` when the head isn't a
+/// bulk string, the length header is itself incomplete, the length is
+/// negative (`$-1` null reply), or the frame is already fully buffered (the
+/// parse was incomplete for some other reason).
 ///
-/// The hint drives [`ParseResult::NeedAtLeast`]: the runtime reserves the
-/// recv accumulator once at full size instead of doubling through a
-/// multi-MB value arriving in chunks (~2× the payload in avoided memcpy).
-fn bulk_remainder_hint(bytes: &[u8]) -> Option<usize> {
-    let rest = bytes.strip_prefix(b"$")?;
+/// The hint is returned as [`ParseResult::NeedAtLeast`], so the parser is
+/// not called again for each piece of a large value.
+fn bulk_remainder_hint(pieces: &[Bytes], buffered: usize) -> Option<usize> {
+    // '$', up to 16 digits and CRLF; the header may span pieces.
+    let mut head = [0u8; 19];
+    let mut filled = 0;
+    for piece in pieces {
+        let take = piece.len().min(head.len() - filled);
+        head[filled..filled + take].copy_from_slice(&piece[..take]);
+        filled += take;
+        if filled == head.len() {
+            break;
+        }
+    }
+    bulk_frame_len(&head[..filled])?
+        .checked_sub(buffered)
+        .filter(|&a| a > 0)
+}
+
+/// The length of a bulk string frame (`$<len>\r\n<payload>\r\n`) whose
+/// header starts `head`, or `None` when `head` does not hold a complete
+/// header for a non-negative length.
+fn bulk_frame_len(head: &[u8]) -> Option<usize> {
+    let rest = head.strip_prefix(b"$")?;
     // Redis 7's proto-max-bulk-len ceiling is 512MB — 10 digits covers it;
     // scan a few extra so a corrupt header falls through to the parser's
     // own error handling rather than being mis-hinted.
@@ -3959,13 +3991,47 @@ fn bulk_remainder_hint(bytes: &[u8]) -> Option<usize> {
         .parse()
         .ok()?;
     // '$' + digits + CRLF + payload + trailing CRLF
-    let total = 1 + digits_end + 2 + len.checked_add(2)?;
-    total.checked_sub(bytes.len()).filter(|&a| a > 0)
+    Some(1 + digits_end + 2 + len.checked_add(2)?)
+}
+
+/// Replace each string in `value` that is a receive view shorter than
+/// `threshold` with a copy ([`ringline::copy_small_view`]), so a kept value
+/// does not hold a whole ring buffer. Returns the bytes of the strings that
+/// lie in none of `pieces`: the parser copied them because they spanned
+/// pieces.
+fn copy_small_views(value: &mut Value, pieces: &[Bytes], threshold: u32) -> usize {
+    let mut copied = 0;
+    value.for_each_bytes_mut(|b| {
+        if !b.is_empty() && !in_a_piece(b, pieces) {
+            copied += b.len();
+        }
+        *b = ringline::copy_small_view(std::mem::take(b), threshold);
+    });
+    copied
+}
+
+/// Whether `b` lies inside one of `pieces`.
+fn in_a_piece(b: &[u8], pieces: &[Bytes]) -> bool {
+    let start = b.as_ptr() as usize;
+    pieces.iter().any(|piece| {
+        let at = piece.as_ptr() as usize;
+        start >= at && start + b.len() <= at + piece.len()
+    })
 }
 
 #[cfg(test)]
-mod bulk_hint_tests {
-    use super::bulk_remainder_hint;
+mod segment_read_tests {
+    use super::{Value, bulk_remainder_hint as hint_over, copy_small_views};
+    use bytes::Bytes;
+
+    /// The hint for `buf` presented as one piece.
+    fn bulk_remainder_hint(buf: &[u8]) -> Option<usize> {
+        hint_over(&[Bytes::copy_from_slice(buf)], buf.len())
+    }
+
+    fn pieces(parts: &[&[u8]]) -> Vec<Bytes> {
+        parts.iter().map(|p| Bytes::copy_from_slice(p)).collect()
+    }
 
     #[test]
     fn partial_bulk_reports_remainder() {
@@ -4007,6 +4073,39 @@ mod bulk_hint_tests {
     fn malformed_header_no_hint() {
         assert_eq!(bulk_remainder_hint(b"$12x4\r\nzz"), None);
         assert_eq!(bulk_remainder_hint(b"$99999999999999999999\r\nzz"), None);
+    }
+
+    #[test]
+    fn header_split_across_pieces_reports_remainder() {
+        // $16\r\n + 2 payload bytes in three pieces: 23 - 7 = 16.
+        let parts = pieces(&[b"$1", b"6\r", b"\nab"]);
+        assert_eq!(hint_over(&parts, 7), Some(16));
+        let bytes: Vec<&[u8]> = b"$16\r\nab".iter().map(std::slice::from_ref).collect();
+        assert_eq!(hint_over(&pieces(&bytes), 7), Some(16));
+    }
+
+    #[test]
+    fn header_incomplete_across_pieces_no_hint() {
+        assert_eq!(hint_over(&pieces(&[b"$1", b"6\r"]), 4), None);
+    }
+
+    /// A string that spans pieces is a copy the parser made; one inside a
+    /// piece is a slice of it. A zero threshold leaves every string as the
+    /// parser returned it.
+    #[test]
+    fn copy_small_views_counts_strings_the_parser_copied() {
+        let parts = pieces(&[b"*2\r\n$3\r\nab", b"c\r\n$2\r\nde\r\n"]);
+        let (mut value, consumed) = Value::parse_segments(&parts).unwrap();
+        assert_eq!(consumed, 21);
+        assert_eq!(copy_small_views(&mut value, &parts, 0), 3);
+        assert_eq!(
+            value,
+            Value::array(vec![Value::bulk_string(b"abc"), Value::bulk_string(b"de")])
+        );
+
+        let one = pieces(&[b"$3\r\nabc\r\n"]);
+        let (mut value, _) = Value::parse_segments(&one).unwrap();
+        assert_eq!(copy_small_views(&mut value, &one, 0), 0);
     }
 }
 

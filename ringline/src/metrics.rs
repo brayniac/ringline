@@ -336,7 +336,11 @@ pub mod recv_ring {
     /// other non-empty value shorter than it.
     /// Their bytes also count in `BYTES_COPIED`.
     pub const THRESHOLD_COPIED: usize = 9;
-    pub const COUNT: usize = 10;
+    /// Bytes of values that ringline-redis and ringline-memcache read with
+    /// `with_bytes_segments` and that the protocol parser copied because
+    /// they spanned pieces. Not counted in `BYTES_COPIED`.
+    pub const SEGMENT_PARSE_COPIED: usize = 10;
+    pub const COUNT: usize = 11;
 }
 
 /// Slot indices for `RECV_ARRIVAL`.
@@ -500,6 +504,11 @@ pub fn init_metadata() {
         recv_ring::THRESHOLD_COPIED,
         "op".into(),
         "threshold_copied".into(),
+    );
+    RECV_RING.insert_metadata(
+        recv_ring::SEGMENT_PARSE_COPIED,
+        "op".into(),
+        "segment_parse_copied".into(),
     );
     for (step, name) in [
         (recv_preflight::SOCKETPAIR, "socketpair"),
@@ -767,6 +776,7 @@ mod tests {
             recv_ring::HOLD_CAP_COPIED,
             recv_ring::BYTES_COPIED,
             recv_ring::THRESHOLD_COPIED,
+            recv_ring::SEGMENT_PARSE_COPIED,
         ] {
             assert!(RECV_RING.increment(idx), "RECV_RING[{idx}] out of bounds");
         }
@@ -818,6 +828,10 @@ mod tests {
         assert_eq!(
             op(recv_ring::THRESHOLD_COPIED).as_deref(),
             Some("threshold_copied")
+        );
+        assert_eq!(
+            op(recv_ring::SEGMENT_PARSE_COPIED).as_deref(),
+            Some("segment_parse_copied")
         );
         for idx in 0..recv_ring::COUNT {
             assert!(

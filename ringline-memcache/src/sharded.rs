@@ -293,7 +293,8 @@ impl ShardedClient {
             McResponseBytes::Values(values) => Ok(values
                 .into_iter()
                 .map(|v| GetValue {
-                    key: v.key,
+                    // A short key would otherwise hold its receive buffer.
+                    key: ringline::copy_small_view(v.key, ringline::recv_zc_threshold()),
                     data: v.data,
                     flags: v.flags,
                     cas: v.cas,

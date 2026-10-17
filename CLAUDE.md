@@ -241,6 +241,7 @@ Ringline aims to minimize data copies on the hot path. Understanding where copie
 |------|-------------|--------|
 | Kernel → ProvidedBufRing | DMA into ring-provided buffer | 0 |
 | ProvidedBufRing → RecvAccumulator | `BytesMut::extend_from_slice()` | 1 |
+| ProvidedBufRing → `with_bytes_segments()` callback (io_uring) | Each held buffer presented as a `Bytes` view of ring memory; no copy into the accumulator | 0 |
 | Accumulator → `with_data()` callback | Borrowed `&[u8]` into accumulator | 0 |
 | Accumulator → `with_bytes()` callback | `BytesMut::freeze()` → `Bytes` (O(1)), slicing via `Bytes::slice()` is O(1) refcount | 0 |
 | TLS recv | rustls plaintext drained into accumulator via `BufRead` | 1 |
@@ -248,6 +249,8 @@ Ringline aims to minimize data copies on the hot path. Understanding where copie
 TLS recv is unchanged at 1 copy under the `tls-unbuffered` feature too: rustls 0.23's unbuffered `ReadTraffic::next_record` pops an owned plaintext chunk rather than decrypting in place, so the copy into the `RecvAccumulator` remains. The `tls-unbuffered` feature only changes the send path.
 
 The key difference: `with_data(|&[u8]|)` provides a borrowed slice — the parser must copy any values it wants to keep. `with_bytes(|Bytes|)` provides a refcounted handle — the parser can return `Bytes::slice()` sub-references with zero copies.
+
+`with_bytes_segments(|&[Bytes]|)` skips the accumulator on io_uring: a value inside one provided buffer is a slice of a view and is not copied. A view keeps its whole buffer from the ring until it drops, so `copy_small_view` copies values shorter than `recv_zc_threshold` (default 4096). A segment parser copies a value that spans buffers, and a message longer than the hold cap is copied into the accumulator. On mio it presents the accumulator as one piece. Design: `docs/recv-segment-views-design.md`.
 
 **Send path** (user → kernel):
 
@@ -294,17 +297,17 @@ On the mio backend all of these degrade to copy sends (guards are consumed by co
 
 | Path | Copies | Mechanism |
 |------|--------|-----------|
-| **Recv (values)** | **0** | `with_bytes()` + `resp-proto`'s Bytes-based parser. Bulk strings are `Bytes::slice()` into the accumulator — no allocation, O(1) refcount. Returned `Bytes` stays valid after accumulator advances. |
+| **Recv (values)** | 0 or 1 | `with_bytes_segments()` + `resp-proto`'s `parse_segments`. On io_uring a string inside one provided buffer and ≥ `recv_zc_threshold` is a view (0); a shorter one is copied by `copy_small_view`, and one that spans buffers by the parser (1). On mio strings are slices of the accumulator (after the accumulator's copy). Returned `Bytes` stay valid after the reader moves on. `RECV_RING` `THRESHOLD_COPIED` and `SEGMENT_PARSE_COPIED` count the copies. |
 | **Send (commands)** | 1 | RESP encoded into a **reused** scratch buffer (`encode_buf`/`write_buf` — no per-op allocation), then `send_nowait()` copies into pool. |
 | **Send (SET value, standard)** | 1 | All parts gathered into one pool slot. |
 | **Send (SET value, guard)** | 1 (metadata only) | `set_with_guard()` / `set_ex_with_guard()`: prefix+suffix copied to pool, value stays in-place via `SendGuard` — if the value is ≥ the client `zc_threshold`; smaller guarded values fold into the copy/coalescing buffer. |
 | **Pipeline** | 1 | All commands accumulated into one buffer, single send to pool. |
 
-**Summary**: Recv is fully zero-copy (refcounted slices). Send always copies the command envelope (key names, RESP framing) into the pool. For large values, `set_with_guard()` avoids copying the value itself.
+**Summary**: Recv copies a value at most once, and not at all for a value of at least 4 KiB inside one provided buffer on io_uring. Send always copies the command envelope (key names, RESP framing) into the pool. For large values, `set_with_guard()` avoids copying the value itself.
 
 #### ringline-memcache
 
-Same shape as redis: recv is zero-copy via `with_bytes()` + `memcache-proto`'s `ResponseBytes` parser; sends encode into reused scratch and copy the envelope to the pool; `set_with_guard()` keeps large values zero-copy.
+Same shape as redis: the text protocol reads with `with_bytes_segments()` + `memcache-proto`'s `ResponseBytes::parse_segments`, with the same copies (keys are copied where `gets` returns them); the binary protocol reads with `with_bytes()`; sends encode into reused scratch and copy the envelope to the pool; `set_with_guard()` keeps large values zero-copy.
 
 #### ringline-ping
 
@@ -312,7 +315,7 @@ Minimal — `with_data()` recv (pattern-match `PONG\r\n`, no value extraction), 
 
 ### Copy Semantics Design Principles
 
-1. **Recv buffer ownership**: The kernel writes into `ProvidedBufRing` (zero-copy DMA), then data is appended to the per-connection `RecvAccumulator` (1 mandatory copy). After that, `with_bytes()` enables zero-copy parsing via `Bytes::slice()`. `with_data()` requires the parser to copy out any data it needs to keep.
+1. **Recv buffer ownership**: The kernel writes into `ProvidedBufRing` (zero-copy DMA), then data is appended to the per-connection `RecvAccumulator` (1 copy). After that, `with_bytes()` enables zero-copy parsing via `Bytes::slice()`. `with_data()` requires the parser to copy out any data it needs to keep. `with_bytes_segments()` skips the accumulator on io_uring by lending the provided buffers as `Bytes` views.
 
 2. **Send buffer ownership**: Ringline must own all memory referenced by SQEs (the submission must outlive the syscall). `SendCopyPool` provides pre-allocated slots for this. `SendGuard` is the escape hatch for zero-copy — it pins user memory and holds it alive until the kernel confirms completion.
 
@@ -331,7 +334,7 @@ Minimal — `with_data()` recv (pattern-match `PONG\r\n`, no value extraction), 
    to encrypt in place into `outgoing_tls`, which it does not do. See
    `docs/tls-unbuffered-design.md`.
 
-4. **Client choice of `with_data` vs `with_bytes`**: This is the single biggest design decision for recv-side copy count. `with_bytes` enables true zero-copy parsing but requires the protocol parser to work with `Bytes` (refcounted slices). `with_data` is simpler but forces a copy.
+4. **Client choice of `with_data` vs `with_bytes` vs `with_bytes_segments`**: This is the single biggest design decision for recv-side copy count. `with_bytes` enables zero-copy parsing out of the accumulator but requires the protocol parser to work with `Bytes` (refcounted slices). `with_data` is simpler but forces a copy. `with_bytes_segments` needs a parser over `&[Bytes]` and removes the accumulator copy for values inside one provided buffer.
 
 ## Fire/Recv Pipelining API
 

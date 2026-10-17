@@ -1,7 +1,8 @@
 # Segment views: `Bytes` over held receive buffers for segment parsers
 
 Status: landing steps 1 (the view machinery), 2 (the reader) and 3
-(`recv_zc_threshold`) are implemented; steps 4 to 6 are a proposal.
+(`recv_zc_threshold`) are implemented. Step 4's pins and step 6's branch
+exist, unmerged; step 5 has not run.
 
 Related: `docs/recv-incremental-ring-design.md` ("`with_bytes`", the owner
 decisions of 2026-10-08 on views and `recv_zc_threshold`),
@@ -413,7 +414,8 @@ worker:
   in the calling worker's `RingMemory`. Elsewhere, on any thread, it treats
   every `Bytes` as a view; on mio nothing is a view.
 - ringline-redis and ringline-memcache apply it to every `Bytes` in a parsed
-  response, with a client-level override (step 6).
+  response that a call returns, with the threshold `recv_zc_threshold()`
+  returns (step 6). A client-level override is not built.
 
 A value that spans pieces was already copied by the parser, so the helper
 returns it unchanged. A slice of an `Owned` piece (a refused lend's copy, up
@@ -620,43 +622,61 @@ is zeroed eagerly, which would make the whole ring resident at startup.
      `metrics.rs`;
    - the parser run under `ReaderCallback::enter`.
 3. `recv_zc_threshold`, its helper and metric.
-4. Release resp-proto and memcache-proto with `parse_segments`, and move
-   ringline's workspace requirements and `Cargo.lock` on main to those
-   releases. The lock pins resp-proto 0.0.2 and memcache-proto 0.0.5, which
-   do not have `parse_segments`, and resp-proto's unreleased main also
-   rewrites the parser `with_bytes` uses.
-5. Measure two builds that differ only in the client read path: main after
-   step 4, and a branch from it where ringline-redis and ringline-memcache
-   read with `with_bytes_segments`, `parse_segments` and the helper. The
-   branch is the change step 6 merges.
+4. Build the measurement branches against resp-proto and memcache-proto
+   main by git rev (`[patch.crates-io]`). The released resp-proto 0.0.2 and
+   memcache-proto 0.0.5 do not have `parse_segments`, and resp-proto's main
+   also changes the parser `with_bytes` uses, so both builds of step 5 carry
+   that change. resp-proto also gains `Value::for_each_bytes_mut`, which
+   visits every `Bytes` in a value, RESP3 variants included: ringline-redis
+   cannot match those variants itself, because they exist only under
+   resp-proto's `resp3` feature, which another crate in a build can turn on.
+   Nothing is released in this step (see "Decisions").
+5. Measure two builds that differ only in the client read path: main with
+   step 4's pins, and a branch from it where ringline-redis and
+   ringline-memcache read with `with_bytes_segments`, `parse_segments` and
+   the helper. The branch is the change step 6 merges.
+   - Load generator: cachecannon built against each branch. Its RESP GETs
+     read through `recv_meta`, which discards values through `with_segments`
+     and never calls `read_value_from`, so the RESP cells set
+     `workload.read_values`.
    - Hosts and kernels: hv01, and hv01 to hv02; Linux 6.1, 6.12 and 7.1.
    - Rings: default, and incremental on 6.12 and 7.1 (6.1 has no incremental
      rings).
    - Loads: a RESP GET load and a memcache text-protocol GET load, at value
      sizes 64 B, 4 KiB, 64 KiB and 1 MiB, 64 to 10,000 connections,
-     pipelined and not.
+     pipelined and not. With the default 16 KiB buffers a 64 KiB or 1 MiB
+     value always spans buffers, so the parser copies it and the switch
+     saves no copy at those sizes.
    - Recorded: throughput; p50, p99 and p999 at fixed offered load; RSS;
-     bytes received; bytes copied (the bytes-copied counter, plus, in the
-     benchmark client, the bytes of each parsed value that is neither a view
-     nor a slice of a presented piece, which the parser copied); `ENOBUFS`;
-     `ENOBUFS` parks; fallback receives; lends refused; entries copied at
-     the hold cap; views created per response.
+     bytes received; bytes copied (`BYTES_COPIED`, and
+     `SEGMENT_PARSE_COPIED`, the bytes of values the parser copied because
+     they spanned pieces); `ENOBUFS`; `ENOBUFS` parks; fallback receives;
+     lends refused; entries copied at the hold cap; views created per
+     response.
    - Five reps per cell, with an A/A pair.
-6. Switch ringline-redis (`read_value_from`) and ringline-memcache
-   (`read_reply`, shared by every response read and by `BinaryClient`
-   through `self.binary`; step 6 keeps the binary branch on `with_bytes`)
-   to `with_bytes_segments`, with the helper, if no cell of step 5 is worse
-   beyond its A/A spread. memcache-proto has no binary-protocol
-   `parse_segments`, so `BinaryClient`
-   (`ClientBuilder::build_binary`) keeps reading with `with_bytes` and never
-   enters the segmented domain. ringline-memcache's `read_reply` returns
-   `Consumed(0)` when a response is incomplete and gains a length hint.
-   ringline-redis's `bulk_remainder_hint` reads only a `$` reply in one
-   contiguous slice, and is changed to read a header split across pieces.
-   Without a hint each arrival re-parses and re-creates a view for every
-   held entry, up to the hold cap. The receive copy counts in
-   `docs/syscalls-and-copies.md` and in CLAUDE.md ("Copy Semantics") change
-   in the same PR.
+6. If no cell of step 5 is worse beyond its A/A spread: release
+   resp-proto and memcache-proto, move ringline's workspace requirements and
+   `Cargo.lock` to those releases, and merge the branch. The branch cannot
+   merge before the releases: a published crate cannot depend on a git
+   revision. The branch:
+   - switches ringline-redis (`read_value_from`) and the text protocol of
+     ringline-memcache (`read_reply`) to `with_bytes_segments`.
+     memcache-proto has no binary-protocol `parse_segments`, so
+     `BinaryClient` (`ClientBuilder::build_binary`) keeps reading with
+     `with_bytes` and never enters the segmented domain;
+   - copies each string shorter than `recv_zc_threshold` out of its view
+     with `copy_small_view`. ringline-memcache copies keys only where a call
+     returns them (`gets`), so a `get` does not allocate for its key;
+   - counts the bytes the parser copied in `RECV_RING`
+     `SEGMENT_PARSE_COPIED`: those of strings that lie in none of the
+     presented pieces;
+   - gives both incomplete reads a length hint over the pieces. Without a
+     hint each arrival re-parses and re-creates a view for every held entry,
+     up to the hold cap. ringline-redis reads a `$` header split across
+     pieces; ringline-memcache reads the first `VALUE` line and returns a
+     lower bound: the line, the value, its CRLF and `END\r\n`;
+   - changes the receive copy counts in `docs/syscalls-and-copies.md` and
+     in CLAUDE.md ("Copy Semantics").
 
 ## Decisions
 
@@ -683,6 +703,10 @@ The owner accepted these on 2026-10-15.
 - A refused lend copies the completion and the connection keeps receiving,
   as in the other segmented readers; no new throttle (see "Lend refusals").
 - The client crates switch only on step 5's measurement.
+- No release of resp-proto, memcache-proto or ringline carries this design
+  until the switch is tested and judged better for users than the previous
+  release (owner, 2026-10-17). Step 5 builds against the proto crates by git
+  revision.
 - The view counters count views; the per-buffer count the 2026-10-08
   decision asked for waits on step 5 (see "Metrics").
 - A parked reader resolves to `Err(EBUSY)` when another reader used the
