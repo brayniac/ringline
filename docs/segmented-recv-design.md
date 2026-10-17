@@ -31,6 +31,16 @@ see *Rejected: user-held zero-copy*. Two adversarial passes reduced to one
 invariant: **holdable ⇒ copied-at-delivery**, and zero-copy lives only where the
 runtime keeps ownership (Mode A) or a `!Send` non-escaping borrow does (Mode B).
 
+The 2026-10-08 owner decision (`docs/recv-incremental-ring-design.md`,
+"`with_bytes`") drops this invariant for `Bytes` views of provided buffers. A
+view takes a buffer hold of its own and releases it through the worker that
+created it, so a holdable `Bytes` can be zero-copy.
+`docs/recv-segment-views-design.md` applies this to segment parsers. Modes A, B
+and C below are unchanged. If its landing step 6 lands, ringline-redis and
+ringline-memcache values move from Mode C to views, and a view's hold becomes a
+fourth kind of held bid alongside those in "Buffer lifetime and replenish
+soundness".
+
 ## Motivation
 
 1. **Large-object recv is copy-bound.** On real 200 GbE (kernel 6.12), 64 MB
@@ -212,9 +222,13 @@ impl RecvSegment<'_> { pub fn into_owned(self) -> Bytes; } // copy + release-onc
 
 ## Rejected: user-held zero-copy (`Bytes` over a provided buffer)
 
+The 2026-10-08 owner decision in `docs/recv-incremental-ring-design.md`
+("`with_bytes`") reverses this rejection. `docs/recv-segment-views-design.md`
+proposes views and answers the three objections below.
+
 An earlier draft returned a `Bytes::from_owner` over the provided buffer with
-replenish-on-drop, plus a "spill valve." **Removed as unsound** (recorded so it
-is not re-proposed):
+replenish-on-drop, plus a "spill valve." **Removed as unsound** (recorded with
+the objections the later design answers):
 
 - `Bytes` is `Send + Sync`; it can drop on a foreign thread or after the task
   ends → data race on the single-threaded `pending_replenish` / bid leak / panic.
@@ -225,7 +239,7 @@ is not re-proposed):
 - Close with such a segment outstanding → double-replenish or bid leak;
   generation guards *slots*, not *bids*.
 
-Every use it was meant to serve maps to Mode A, B, or C.
+At the time, every use it was meant to serve mapped to Mode A, B, or C.
 
 ## Contiguity as opt-in gather (unchanged consumers)
 
