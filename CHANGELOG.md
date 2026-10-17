@@ -24,8 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `Connection::recv_arrival` and `RecvHalf::recv_arrival` return a
   `RecvArrival`: when the first and the last byte consumed by the
   connection's most recent reader call arrived. The reader calls are
-  `with_data`, `with_data_result`, `with_bytes`, `try_with_data` and, on
-  io_uring, `with_segments`. An arrival time is the time of the batch in
+  `with_data`, `with_data_result`, `with_bytes`, `with_bytes_segments`,
+  `try_with_data` and, on io_uring, `with_segments`. An arrival time is the time of the batch in
   which the worker handled the receive that delivered the byte: one pass
   over the reaped completions on io_uring, or over the readable sockets on
   mio. Each TCP connection keeps a log of arrival times against stream
@@ -127,8 +127,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   listener can be named before any connection has arrived.
 - `metrics::recv_ring::VIEW_CREATED`, `VIEW_RELEASED`, `VIEW_RELEASE_REMOTE`
   and `VIEW_RELEASE_DROPPED` count `Bytes` views of io_uring receive buffers
-  and their releases (`docs/recv-segment-views-design.md`). No reader hands
-  out views yet, so they stay at 0.
+  and their releases (`docs/recv-segment-views-design.md`).
+- `Connection::with_bytes_segments` and `RecvHalf::with_bytes_segments`, on
+  both backends, hand a parser the connection's buffered bytes as `&[Bytes]`
+  and take a `ParseResult`, for segment parsers such as resp-proto's
+  `Value::parse_segments`. On io_uring the call enters the segmented receive
+  domain and presents each held receive buffer as a `Bytes` view of the
+  ring buffer, so a value inside one buffer is not copied; a view the caller
+  keeps holds its whole buffer until it drops. After `NeedAtLeast(n)` the
+  parser is not called again until `n` more bytes are buffered. When the
+  hold reaches the receive throttle's cap with the message incomplete, the
+  held bytes are copied into the accumulator. The call resolves to
+  `Err(EBUSY)` while a forward or a `SegmentReader` owns the connection, or
+  when another reader consumed bytes or `end_segments` ran since it last
+  parked. On mio the parser is shown the accumulator as one piece. Reported
+  by `recv_arrival`.
+- `Connection::end_segments` and `RecvHalf::end_segments` exist on mio,
+  where they return `Ok(())`.
+- `metrics::recv_ring::HOLD_CAP_COPIED` counts held entries
+  `with_bytes_segments` copied at the hold cap, and `BYTES_COPIED` counts
+  bytes copied into receive storage (the accumulator, owned held entries and
+  owned forward copies) on both backends.
 
 ### Changed
 
@@ -136,6 +155,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   later, as the other crates do; views use `Bytes::from_owner` (1.9). On
   io_uring a provided-buffer ring's buffers are an anonymous mapping, shared
   through an `Arc` with views of them, instead of a heap `Vec`.
+- On io_uring, `RecvHalf::segments` and `RecvHalf::recv_owned_segment` hold a
+  completion that was lent to the connection before the call in place, as a
+  pinned entry, instead of copying it into an owned one.
 - **Breaking (`ringline-redis`, `ringline-memcache`, `ringline-ping`):**
   `CommandResult` is `#[non_exhaustive]`. Code outside the crates reads it
   in an `on_result` callback and can no longer construct it.

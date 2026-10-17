@@ -197,6 +197,27 @@ impl Driver {
         let _ = self.ring.submit_async_cancel(ud.raw(), conn_index);
     }
 
+    /// `forward_hold_cap`, but at most a quarter of the TCP ring's buffers.
+    pub(crate) fn quarter_ring_cap(&self) -> usize {
+        let quarter = (self.provided_bufs.ring_entries() as usize / 4).max(1);
+        self.forward_hold_cap.min(quarter)
+    }
+
+    /// The segment term of the receive throttle's hold cap
+    /// (`AsyncEventLoop::at_hold_cap`): the connection's `segment_hold`
+    /// entries plus the ring buffers its `forward_to` write pins reach
+    /// `forward_hold_cap` with a lend cap, or `quarter_ring_cap` without one.
+    pub(crate) fn segment_at_hold_cap(&self, conn_index: u32) -> bool {
+        let ci = conn_index as usize;
+        let segment_cap = if self.lend_cap.is_some() {
+            self.forward_hold_cap
+        } else {
+            self.quarter_ring_cap()
+        };
+        let writing = self.forward_write[ci].as_ref().map_or(0, |w| w.pinned());
+        self.segment_hold[ci].len() + writing >= segment_cap
+    }
+
     /// Record that `n` received buffers of `conn_index` were released by the
     /// send that held them (`send_held_recv`).
     pub(crate) fn release_send_held(&mut self, conn_index: u32, n: u32) {
@@ -230,6 +251,7 @@ impl Driver {
             None => return None,
         };
         let copy: Box<[u8]> = data.into();
+        crate::accumulator::note_copied(copy.len());
         let ptr = copy.as_ptr();
         self.owned_recv[index] = Some(copy);
         Some(((first + index) as u16, ptr))
@@ -597,6 +619,11 @@ pub(crate) struct Driver {
     /// under `try_with_state`, or `close_connection` under `&mut Driver`)
     /// replenishes the bid exactly once; the other sees `None` and does nothing.
     pub(crate) segment_pinned: Vec<Option<HeldRecvBuf>>,
+    /// Per connection, the number of times `settle_forward_end` has returned
+    /// it to the default domain (wrapping). A parked `with_bytes_segments`
+    /// future compares it, with `recv_consumed`, against the values at the
+    /// end of its previous poll and resolves to `EBUSY` if either changed.
+    pub(crate) segment_epoch: Vec<u32>,
     /// Per-connection receive arrival log (`recv::arrival`).
     pub(crate) arrival: Vec<crate::recv::arrival::ArrivalLog>,
     /// The current completion batch, whose time the arrival logs record. A
@@ -1388,6 +1415,7 @@ impl Driver {
                 .map(|_| std::collections::VecDeque::new())
                 .collect(),
             segment_pinned: vec![None; config.max_connections as usize],
+            segment_epoch: vec![0; config.max_connections as usize],
             arrival: (0..config.max_connections)
                 .map(|_| crate::recv::arrival::ArrivalLog::default())
                 .collect(),
@@ -1694,6 +1722,8 @@ impl Driver {
     /// in which case the caller must close the connection.
     #[must_use]
     pub(crate) fn settle_forward_end(&mut self, conn_index: u32) -> bool {
+        let epoch = &mut self.segment_epoch[conn_index as usize];
+        *epoch = epoch.wrapping_add(1);
         let mut ok = true;
         while let Some(held) = self.segment_hold[conn_index as usize].pop_front() {
             match held {
@@ -2429,6 +2459,16 @@ impl Driver {
                 .iter()
                 .map(|p| p.len as usize)
                 .sum::<usize>()
+    }
+
+    /// Bytes of the connection's stream that readers have removed from it:
+    /// those delivered (`ArrivalLog::delivered`) less `recv_buffered`. A
+    /// reader that consumes bytes raises it; moving bytes between the
+    /// accumulator and the holds does not change it.
+    pub(crate) fn recv_consumed(&self, conn_index: u32) -> u64 {
+        self.arrival[conn_index as usize]
+            .delivered()
+            .saturating_sub(self.recv_buffered(conn_index) as u64)
     }
 
     /// Record `n` bytes delivered to the connection in the current batch.

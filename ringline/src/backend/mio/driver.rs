@@ -309,6 +309,16 @@ impl Driver {
         self.accumulators.len(conn_index)
     }
 
+    /// Bytes of the connection's stream that readers have removed from it:
+    /// those delivered (`ArrivalLog::delivered`) less `recv_buffered`. A
+    /// reader that consumes bytes raises it; moving bytes between the
+    /// accumulator and the holds does not change it.
+    pub(crate) fn recv_consumed(&self, conn_index: u32) -> u64 {
+        self.arrival[conn_index as usize]
+            .delivered()
+            .saturating_sub(self.recv_buffered(conn_index) as u64)
+    }
+
     /// Record `n` bytes delivered to the connection in the current batch.
     /// Runs before the bytes are placed anywhere.
     pub(crate) fn record_arrival(&mut self, conn_index: u32, n: usize) {

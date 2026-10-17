@@ -1,7 +1,7 @@
 # Segment views: `Bytes` over held receive buffers for segment parsers
 
-Status: landing step 1 (the view machinery) is implemented; the reader and
-the later steps are a proposal.
+Status: landing steps 1 (the view machinery) and 2 (the reader) are
+implemented; steps 3 to 6 are a proposal.
 
 Related: `docs/recv-incremental-ring-design.md` ("`with_bytes`", the owner
 decisions of 2026-10-08 on views and `recv_zc_threshold`),
@@ -66,8 +66,8 @@ On io_uring a connection receives in one of two domains
   shown.
 - The buffers are a `RingMemory` mapping that `ProvidedBufRing` shares
   through an `Arc` (`provided.rs`, `view.rs`). `Driver::recv_view` makes a
-  `Bytes` view of a held range (landing step 1); no reader hands views out
-  yet, so outside the driver's tests no `Bytes` refers to the buffers.
+  `Bytes` view of a held range (landing step 1), and `with_bytes_segments`
+  hands views to a parser (landing step 2).
 - `BufState::holds` counts uses of a buffer's bytes. A buffer returns to the
   ring when it is exhausted and has no buffer hold (rule 3 of "Buffer state"
   in `docs/recv-incremental-ring-design.md`). `ProvidedBufRing::held` counts
@@ -133,8 +133,8 @@ that is too large, since it only reserves with it. This reader does not call
 the parser again until `n` more bytes arrive, the hold cap is reached, or
 the receive side finishes, so an `n` that is too large stalls it. On mio,
 which has no hold cap, it stalls until EOF, or until the accumulator reaches
-`recv_accumulator_max` and the connection is closed. Landing step 2 updates
-the `ParseResult::NeedAtLeast` rustdoc to say so.
+`recv_accumulator_max` and the connection is closed. The
+`ParseResult::NeedAtLeast` rustdoc says so.
 
 Each call's first poll enters the segmented domain through
 `enter_segmented_domain` (`runtime/io.rs`), with `SegmentedEntry::ViaHalf`
@@ -152,13 +152,13 @@ accumulator, which `take_frozen` has taken out, and then `holds_unread` is
 false while a request is half read.
 
 Entering moves any accumulator bytes to the front of the hold as one `Owned`
-entry. It copies a `pending_recv_bufs` lend into an `Owned` entry today;
-step 2 changes `enter_segmented_domain` to convert the lend into a `Pinned`
-entry, which copies nothing. `PendingRecvBuf` holds `bid`, `len` and the
-data pointer; the offset is the pointer less `ProvidedBufRing::data_ptr(bid,
-0)`. The conversion applies to every caller of `enter_segmented_domain`, so
-`segments` and `recv_owned_segment` gain it too; both already read `Pinned`
-entries.
+entry, and converts a `pending_recv_bufs` lend into a `Pinned` entry at the
+back, which copies nothing: the lend's buffer hold becomes the entry's.
+`PendingRecvBuf` holds `bid`, `len` and the data pointer; the offset is the
+pointer less `ProvidedBufRing::data_ptr(bid, 0)`. The conversion applies to
+every caller of `enter_segmented_domain`, so `segments` and
+`recv_owned_segment` read the lend as a `Pinned` entry too. Before step 2
+they read it as an `Owned` copy.
 
 The future does not borrow the half, so while it is parked the caller can
 run another reader on the connection: start a forward or a `SegmentReader`,
@@ -168,17 +168,24 @@ and a forward that ends, a dropped `SegmentReader` and `end_segments` return
 the connection to the default domain (`settle_forward_end`). A later poll
 that continued would act on stale state: a recorded `NeedAtLeast(n)` counts
 bytes that are gone, and in the default domain the next completion is lent
-into `pending_recv_bufs`, which this reader does not read. Step 2 therefore
-adds a per-connection counter, `segment_epoch`. It is incremented by
-`settle_forward_end` and whenever a reader removes bytes from the hold or
-the accumulator while the connection is in the segmented domain, this reader
-included. The future records the counter at the end of each poll. Every
-later poll first checks the handle (stale: `Ok(0)`), `forward_progress` and
-`segment_reader_live` (`Err(EBUSY)`), and then the counter: if it changed,
-the poll resolves to `Err(EBUSY)` without touching the hold, and the caller
-calls again. Without
-the first two checks a poll would parse the hold a forward owns, and at the
-cap copy it into the accumulator, which a forward never reads.
+into `pending_recv_bufs`, which this reader does not read. The future
+therefore records two per-connection values at the end of each poll that
+parks:
+
+- `segment_epoch`, a counter `settle_forward_end` increments, so it changes
+  when a forward ends, a `SegmentReader` drops or `end_segments` runs;
+- `Driver::recv_consumed`, the bytes of the stream readers have removed:
+  the arrival log's `delivered` less `recv_buffered`. A reader that consumes
+  bytes raises it, and moving bytes between the accumulator, the lend and the
+  holds does not change it. It counts consumption by every reader without an
+  increment at each reader's consume site.
+
+Every later poll first checks the handle (stale: `Ok(0)`), `forward_progress`
+and `segment_reader_live` (`Err(EBUSY)`), and then the two values: if either
+changed, the poll resolves to `Err(EBUSY)` without touching the hold, and
+the caller calls again. Without the first two checks a poll would parse the
+hold a forward owns, and at the cap copy it into the accumulator, which a
+forward never reads.
 
 The executor keeps one receive waiter per connection (`recv_waiters`,
 `owner_task`), so a reader parked in one task is not woken when a reader in
@@ -205,18 +212,17 @@ mio path follows the io_uring reader:
 - it applies the `NeedAtLeast` skip;
 - a stale handle resolves to `Ok(0)`;
 - while a forward runs it resolves to `Err(EBUSY)`;
-- its `segment_epoch` is incremented when a forward starts or ends and when
-  a reader consumes accumulator bytes, and a changed counter resolves a
-  later poll to `Err(EBUSY)`.
+- a later poll resolves to `Err(EBUSY)` when `Driver::recv_consumed`
+  changed since the previous poll: another reader or a forward consumed
+  accumulator bytes. Mio has no domain to leave, so it has no
+  `segment_epoch`.
 
 A client crate calls one method on both backends and gets the same errors.
 
 The connection stays in the segmented domain after the future resolves;
-`end_segments` returns it to the default domain. `end_segments` is io_uring
-only today; landing step 2 adds a mio version that returns `Ok(())`, so a
-caller leaves the domain with one call on both backends; unlike the io_uring
-version it returns `Ok(())` for a stale handle too. Step 2 also updates the
-`RecvHalf` rustdoc, which says mio has no segmented recv domain. Until
+`end_segments` returns it to the default domain. On mio `end_segments`
+returns `Ok(())`, for a stale handle too, so a caller leaves the domain with
+one call on both backends. Until
 `end_segments` runs, on io_uring, `with_data`, `with_bytes`, `recv_ready`,
 `ConnStream` and recv sinks never see bytes that arrive, because those bytes
 go to `segment_hold`; a caller that switches readers calls `end_segments`
@@ -255,7 +261,7 @@ streaming reads.
   parks; its next poll presents the accumulator first. A message that
   arrives in more completions than the hold cap completes only through this
   copy.
-- Before the copy, step 2's new `AccumulatorTable` method reclaims the
+- Before the copy, `AccumulatorTable::reclaim` reclaims the
   frozen remainder (`unfreeze` with nothing appended, recovering the
   allocation with `try_into_mut`). That costs nothing once the presented
   clone and any slice the parser kept of it have dropped; if a slice is
@@ -277,10 +283,10 @@ streaming reads.
   moved into the hold by the next segmented reader: `enter_segmented_domain`
   for the next call of this reader, or `adopt_stranded_accumulator` for a
   `SegmentReader`, which increments `SEGMENT_STRANDED_ADOPTED`. That
-  counter's comment (`runtime/io.rs`) says a nonzero value means bytes were
-  stranded after entry; step 2 adds the hold-cap copy as a second cause.
-- The future checks only the segment term of `at_hold_cap`, split out into a
-  `Driver` method (its inputs are all `Driver` fields). The forward term
+  counter's comments name the hold-cap copy as one cause of a nonzero
+  value, and a path that strands bytes after entry as the other.
+- The future checks only the segment term of `at_hold_cap`,
+  `Driver::segment_at_hold_cap`. The forward term
   would run the hold-cap copy while a lend sent by `forward_recv_buf` is in
   flight, with `segment_hold` under the cap.
 
@@ -472,20 +478,23 @@ New counters in `RECV_RING`:
 - Releases sent through the inbox, from another thread or by a later worker
   on the same thread.
 - Releases dropped after the worker exited.
-- Values copied by the `recv_zc_threshold` helper.
-- Entries copied at the hold cap.
-- Bytes copied in the receive path.
+- Values copied by the `recv_zc_threshold` helper (step 3).
+- Entries copied at the hold cap (`HOLD_CAP_COPIED`).
+- Bytes copied in the receive path (`BYTES_COPIED`), on both backends.
 
 The bytes-copied counter is incremented where bytes are copied into receive
 storage:
 
 - `append` and the `unfreeze` merge, including the existing bytes copied
   when either reallocates;
-- both copies in `prepend`;
-- a copy into an `Owned` entry, except the accumulator moved in on entry;
+- both copies in `prepend`, and `AccumulatorTable::reclaim`'s copy;
+- a copy into an `Owned` entry (a refused lend, a fallback receive
+  completion, a lend copied by `arm_forward_source`, a TLS plaintext chunk),
+  except the accumulator moved in on entry;
+- a copy into a `recv_hold` entry's owned buffer (`own_recv_copy`);
 - the threshold helper.
 
-The hold-cap copy is counted through `append`. TLS ciphertext staging is not
+The hold-cap copy is counted through `append` and `reclaim`. TLS ciphertext staging is not
 counted; it is the same for both readers.
 
 The 2026-10-08 decision asked for a count of buffers held by views. These
@@ -571,7 +580,7 @@ is zeroed eagerly, which would make the whole ring resident at startup.
    and the CHANGELOG names that floor.
 2. The reader:
    - `with_bytes_segments` on both backends, with the `NeedAtLeast` skip and
-     the `segment_epoch` check;
+     the `segment_epoch` and `recv_consumed` checks;
    - the `Pinned` conversion in `enter_segmented_domain`, which also changes
      `segments` and `recv_owned_segment`;
    - the hold-cap copy, its counter, and the `AccumulatorTable` reclaim

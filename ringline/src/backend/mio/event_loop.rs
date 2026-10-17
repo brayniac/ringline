@@ -2572,4 +2572,160 @@ mod tests {
         assert_eq!(el.driver.arrival[source as usize].delivered(), 2);
         assert_eq!(el.driver.arrival[source as usize].len(), 2);
     }
+
+    // ── with_bytes_segments on mio ──────────────────────────────────────
+
+    /// Deliver `data` into `conn_index`'s accumulator, as the read path does.
+    fn deliver(el: &mut AsyncEventLoop<NoopHandler>, conn_index: u32, data: &[u8]) {
+        el.driver.record_arrival(conn_index, data.len());
+        assert!(el.driver.accumulators.append(conn_index, data));
+    }
+
+    fn poll_in<F: Future>(
+        el: &mut AsyncEventLoop<NoopHandler>,
+        fut: std::pin::Pin<&mut F>,
+    ) -> std::task::Poll<F::Output> {
+        in_poll(el, || {
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            fut.poll(&mut cx)
+        })
+    }
+
+    fn is_ebusy(poll: &std::task::Poll<io::Result<usize>>) -> bool {
+        matches!(poll, std::task::Poll::Ready(Err(e)) if e.raw_os_error() == Some(libc::EBUSY))
+    }
+
+    /// The parser sees the accumulator as one piece and consumes from it as a
+    /// `with_bytes` parser does; after `NeedAtLeast(n)` it is not called
+    /// until `n` more bytes are buffered.
+    #[test]
+    fn bytes_segments_presents_the_accumulator_as_one_piece() {
+        use crate::runtime::io::ParseResult;
+        let config = test_config();
+        let (mut el, _wake) = test_loop(&config);
+        let (conn_index, _peer) = attach_conn(&mut el.driver);
+        let ctx = crate::ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        deliver(&mut el, conn_index, b"abcdef");
+
+        let mut fut = std::pin::pin!(ctx.with_bytes_segments(|pieces| {
+            assert_eq!(pieces.len(), 1);
+            assert_eq!(&pieces[0][..], b"abcdef");
+            ParseResult::Consumed(4)
+        }));
+        assert!(matches!(
+            poll_in(&mut el, fut.as_mut()),
+            std::task::Poll::Ready(Ok(4))
+        ));
+        assert_eq!(el.driver.accumulators.data(conn_index), b"ef");
+
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let calls_cb = std::rc::Rc::clone(&calls);
+        let mut fut = std::pin::pin!(ctx.with_bytes_segments(move |pieces| {
+            calls_cb.set(calls_cb.get() + 1);
+            let total: usize = pieces.iter().map(|p| p.len()).sum();
+            if total < 6 {
+                ParseResult::NeedAtLeast(6 - total)
+            } else {
+                ParseResult::Consumed(6)
+            }
+        }));
+        assert!(poll_in(&mut el, fut.as_mut()).is_pending());
+        deliver(&mut el, conn_index, b"gh");
+        assert!(poll_in(&mut el, fut.as_mut()).is_pending());
+        assert_eq!(calls.get(), 1, "4 of the 6 bytes: the parser is not called");
+        deliver(&mut el, conn_index, b"ij");
+        assert!(matches!(
+            poll_in(&mut el, fut.as_mut()),
+            std::task::Poll::Ready(Ok(6))
+        ));
+        assert_eq!(calls.get(), 2);
+    }
+
+    /// At end of stream with nothing buffered the call resolves to `Ok(0)`
+    /// without calling the parser.
+    #[test]
+    fn bytes_segments_at_end_of_stream_does_not_call_the_parser() {
+        use crate::runtime::io::ParseResult;
+        let config = test_config();
+        let (mut el, _wake) = test_loop(&config);
+        let (conn_index, _peer) = attach_conn(&mut el.driver);
+        el.driver
+            .connections
+            .get_mut(conn_index)
+            .expect("open")
+            .note_eof(false);
+        let ctx = crate::ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        let mut fut = std::pin::pin!(ctx.with_bytes_segments(|_| -> ParseResult {
+            panic!("the parser is called at end of stream")
+        }));
+        assert!(matches!(
+            poll_in(&mut el, fut.as_mut()),
+            std::task::Poll::Ready(Ok(0))
+        ));
+    }
+
+    /// A running forward gives `EBUSY` on the first poll and on a later one,
+    /// and so does a `with_data` call that consumed bytes while the call was
+    /// parked. A stale handle resolves to `Ok(0)`.
+    #[test]
+    fn bytes_segments_returns_ebusy_after_another_reader_on_mio() {
+        use crate::runtime::io::ParseResult;
+        for case in ["forward_first", "forward_later", "with_data", "stale"] {
+            let config = test_config();
+            let (mut el, _wake) = test_loop(&config);
+            let (conn_index, _peer) = attach_conn(&mut el.driver);
+            let mut generation = el.driver.connections.generation(conn_index);
+            if case == "stale" {
+                generation = generation.wrapping_add(1);
+            }
+            let ctx = crate::ConnCtx::new(conn_index, generation);
+            deliver(&mut el, conn_index, b"ab");
+            let mut fut = std::pin::pin!(ctx.with_bytes_segments(|_| ParseResult::NeedMore));
+            let forward = crate::backend::mio::driver::MioForwardState {
+                sink_index: 0,
+                sink_generation: 0,
+                len: 10,
+                forwarded: 0,
+            };
+            let poll = match case {
+                "forward_first" => {
+                    el.driver.forward_conn[conn_index as usize] = Some(forward);
+                    poll_in(&mut el, fut.as_mut())
+                }
+                "forward_later" => {
+                    assert!(poll_in(&mut el, fut.as_mut()).is_pending());
+                    el.driver.forward_conn[conn_index as usize] = Some(forward);
+                    poll_in(&mut el, fut.as_mut())
+                }
+                "with_data" => {
+                    assert!(poll_in(&mut el, fut.as_mut()).is_pending());
+                    let mut read = std::pin::pin!(ctx.with_data(|_| ParseResult::Consumed(1)));
+                    assert!(matches!(
+                        poll_in(&mut el, read.as_mut()),
+                        std::task::Poll::Ready(1)
+                    ));
+                    poll_in(&mut el, fut.as_mut())
+                }
+                _ => {
+                    let poll = poll_in(&mut el, fut.as_mut());
+                    assert!(matches!(poll, std::task::Poll::Ready(Ok(0))), "{poll:?}");
+                    continue;
+                }
+            };
+            assert!(is_ebusy(&poll), "{case}: {poll:?}");
+        }
+    }
+
+    /// `end_segments` on mio returns `Ok(())`, for a stale handle too.
+    #[test]
+    fn end_segments_on_mio_returns_ok() {
+        let config = test_config();
+        let (mut el, _wake) = test_loop(&config);
+        let (conn_index, _peer) = attach_conn(&mut el.driver);
+        let generation = el.driver.connections.generation(conn_index);
+        for generation in [generation, generation.wrapping_add(1)] {
+            let ctx = crate::ConnCtx::new(conn_index, generation);
+            assert!(in_poll(&mut el, || ctx.end_segments()).is_ok());
+        }
+    }
 }

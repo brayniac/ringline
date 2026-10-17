@@ -402,6 +402,7 @@ fn drive_inner<C: UnbufferedEngine>(
                                     hold.push_back(crate::backend::HeldRecvBuf::Owned(
                                         bytes::Bytes::copy_from_slice(r.payload),
                                     ));
+                                    crate::accumulator::note_copied(r.payload.len());
                                     *outstanding += r.payload.len();
                                 }
                                 None => pending.push_back(r.payload.to_vec()),
@@ -1062,6 +1063,7 @@ fn drain_pending_plaintext(
                 hold.push_back(crate::backend::HeldRecvBuf::Owned(
                     bytes::Bytes::copy_from_slice(chunk),
                 ));
+                crate::accumulator::note_copied(chunk.len());
                 *outstanding += chunk.len();
             }
         }

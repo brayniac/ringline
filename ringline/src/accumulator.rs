@@ -4,6 +4,23 @@
 /// Unconsumed bytes are retained via O(1) `advance()` instead of shifting.
 use bytes::{Bytes, BytesMut};
 
+/// Count `n` bytes copied into receive storage (`recv_ring::BYTES_COPIED`).
+pub(crate) fn note_copied(n: usize) {
+    if n > 0 {
+        crate::metrics::RECV_RING.add(crate::metrics::recv_ring::BYTES_COPIED, n as u64);
+    }
+}
+
+/// Bytes `buf` held before an operation that may have moved them: `kept` if
+/// its data pointer is no longer `before`, otherwise 0.
+fn moved(buf: &BytesMut, before: *const u8, kept: usize) -> usize {
+    if kept > 0 && buf.as_ptr() != before {
+        kept
+    } else {
+        0
+    }
+}
+
 pub struct RecvAccumulator {
     buf: BytesMut,
     /// Unconsumed remainder of a previously frozen (`take_frozen`) view,
@@ -68,6 +85,8 @@ impl RecvAccumulator {
         if total.saturating_add(data.len()) > self.max_size {
             return false;
         }
+        let before = self.buf.as_ptr();
+        let kept = self.buf.len();
         // When a growth is imminent and a reserve target was announced,
         // size the allocation for the whole remaining message up front.
         if self.buf.capacity() - self.buf.len() < data.len() {
@@ -75,6 +94,7 @@ impl RecvAccumulator {
             self.buf.reserve(want);
         }
         self.buf.extend_from_slice(data);
+        note_copied(data.len() + moved(&self.buf, before, kept));
         true
     }
 
@@ -124,21 +144,26 @@ impl RecvAccumulator {
                         .reserve_target
                         .saturating_sub(recovered.len() + self.buf.len())
                         .saturating_add(self.buf.len());
+                    let before = recovered.as_ptr();
+                    let kept = recovered.len();
                     if recovered.capacity() - recovered.len() < want {
                         recovered.reserve(want);
                     }
                     recovered.extend_from_slice(&self.buf);
+                    note_copied(self.buf.len() + moved(&recovered, before, kept));
                 }
                 self.buf = recovered;
             }
             Err(rem) => {
                 if self.buf.is_empty() {
                     self.buf.extend_from_slice(&rem);
+                    note_copied(rem.len());
                 } else {
                     let merged_len = rem.len() + self.buf.len();
                     let mut merged = BytesMut::with_capacity(merged_len.max(self.reserve_target));
                     merged.extend_from_slice(&rem);
                     merged.extend_from_slice(&self.buf);
+                    note_copied(merged_len);
                     self.buf = merged;
                 }
             }
@@ -399,6 +424,35 @@ impl AccumulatorTable {
         acc.frozen = Some(data);
     }
 
+    /// Make a remainder held by [`put_back`](Self::put_back) the mutable
+    /// buffer again, with nothing appended, before a caller appends a run of
+    /// data behind it. When the remainder is the only reference to its
+    /// allocation (the parser kept no slice of it), `try_into_mut` recovers
+    /// the allocation with the bytes in place and nothing is copied.
+    /// Otherwise the remainder is copied once into a new buffer sized for the
+    /// reserve target ([`reserve`](Self::reserve)), so a caller that reserves
+    /// first grows the buffer once.
+    pub fn reclaim(&mut self, index: u32) {
+        let acc = &mut self.accumulators[index as usize];
+        if !acc.buf.is_empty() {
+            // Bytes were appended since the put-back: the ordinary merge.
+            acc.unfreeze();
+            return;
+        }
+        let Some(rem) = acc.frozen.take() else {
+            return;
+        };
+        match rem.try_into_mut() {
+            Ok(recovered) => acc.buf = recovered,
+            Err(rem) => {
+                let mut buf = BytesMut::with_capacity(rem.len().max(acc.reserve_target));
+                buf.extend_from_slice(&rem);
+                note_copied(rem.len());
+                acc.buf = buf;
+            }
+        }
+    }
+
     /// Put unconsumed data back into the accumulator.
     ///
     /// Called after `take_frozen()` when the parser didn't consume
@@ -420,6 +474,7 @@ impl AccumulatorTable {
             // Fast path (invariant): buffer is empty, tail capacity is
             // retained from `take_frozen`'s `split_to` — no allocation.
             acc.buf.extend_from_slice(data);
+            note_copied(data.len());
         } else {
             // Slow path: new data already present (cannot happen in the
             // single-threaded runtime). Prepend by building a new buffer
@@ -427,6 +482,7 @@ impl AccumulatorTable {
             let mut new_buf = BytesMut::with_capacity(data.len() + acc.buf.len());
             new_buf.extend_from_slice(data);
             new_buf.extend_from_slice(&acc.buf);
+            note_copied(new_buf.len());
             acc.buf = new_buf;
         }
     }
@@ -435,6 +491,52 @@ impl AccumulatorTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bytes_copied() -> u64 {
+        use metriken::CounterGroupMetric;
+        crate::metrics::RECV_RING
+            .counter_value(crate::metrics::recv_ring::BYTES_COPIED)
+            .unwrap_or(0)
+    }
+
+    /// An append counts its bytes, and a growth that moves the existing
+    /// bytes counts those too.
+    #[test]
+    fn bytes_copied_counts_appends_and_the_bytes_a_growth_moves() {
+        let mut acc = RecvAccumulator::new(8);
+        let start = bytes_copied();
+        acc.append(b"abcd");
+        assert_eq!(bytes_copied() - start, 4);
+        let start = bytes_copied();
+        acc.append(&[0u8; 64]);
+        assert_eq!(bytes_copied() - start, 64 + 4, "the growth moved 4 bytes");
+    }
+
+    /// Reclaiming a remainder nothing else references copies nothing;
+    /// reclaiming one a parser kept a slice of copies it once, into a buffer
+    /// of the reserve target's size.
+    #[test]
+    fn reclaim_copies_a_remainder_only_while_a_slice_of_it_is_alive() {
+        let mut table = AccumulatorTable::new(1, 64);
+        table.append(0, b"0123456789");
+        let frozen = table.take_frozen(0);
+        table.put_back(0, frozen);
+        let start = bytes_copied();
+        table.reclaim(0);
+        assert_eq!(bytes_copied(), start);
+        assert_eq!(table.data(0), b"0123456789");
+
+        let frozen = table.take_frozen(0);
+        let kept = frozen.slice(0..2);
+        table.put_back(0, frozen);
+        table.reserve(0, 1000);
+        let start = bytes_copied();
+        table.reclaim(0);
+        assert_eq!(bytes_copied() - start, 10);
+        assert!(table.capacity(0) >= 1010);
+        assert_eq!(table.data(0), b"0123456789");
+        assert_eq!(&kept[..], b"01");
+    }
 
     #[test]
     fn reserve_sizes_append_growth_once() {
