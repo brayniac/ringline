@@ -140,9 +140,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   with the message incomplete, the held bytes are copied into the
   accumulator. The call resolves to `Err(EBUSY)` while a forward or a
   `SegmentReader` owns the connection, or when, since it last parked,
-  another reader consumed bytes or the connection left the segmented domain,
-  and on io_uring for a connection with `enable_recv_forward` on. On mio the parser is shown the accumulator as one piece. Reported by
-  `recv_arrival`.
+  another reader consumed bytes or the connection left the segmented domain.
+  On io_uring it also resolves to `Err(EBUSY)` once `enable_recv_forward`
+  has been called on the connection. On mio the parser is shown the
+  accumulator as one piece. Reported by `recv_arrival`.
 - `Connection::end_segments` and `RecvHalf::end_segments` exist on mio,
   where they return `Ok(())`.
 - `metrics::recv_ring::HOLD_CAP_COPIED` counts held entries

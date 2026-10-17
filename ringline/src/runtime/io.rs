@@ -3938,11 +3938,10 @@ impl Connection {
     /// - `Err(EBUSY)` while a forward runs or a `SegmentReader` is live. A
     ///   new call also resolves to `Err(EBUSY)`, without waiting, until the
     ///   forward ends or the reader drops;
-    /// - `Err(EBUSY)` on io_uring, for the life of the connection, once
-    ///   [`enable_recv_forward`](RecvHalf::enable_recv_forward) has been
-    ///   called: its bytes are held for `forward_held`, which this reader
-    ///   does not read. On mio `enable_recv_forward` does nothing and this
-    ///   call reads normally.
+    /// - `Err(EBUSY)` on io_uring for a call first polled after
+    ///   [`enable_recv_forward`](RecvHalf::enable_recv_forward) was called on
+    ///   the connection, until the connection starts closing. On mio
+    ///   `enable_recv_forward` does nothing and this call reads normally.
     pub fn with_bytes_segments<F>(&mut self, f: F) -> WithBytesSegmentsFuture<F>
     where
         F: FnMut(&[Bytes]) -> ParseResult,
@@ -5619,9 +5618,10 @@ impl<F: FnMut(&[Bytes]) -> ParseResult + Unpin> WithBytesSegmentsFuture<F> {
         let idx = conn as usize;
 
         if !self.entered {
-            // A recv-forward connection's bytes wait in `recv_hold`, which this
-            // reader does not read; entering would present later bytes ahead
-            // of them.
+            // On a plaintext recv-forward connection in the default domain,
+            // received bytes go to `recv_hold`, the hold `forward_held` sends
+            // from, which this reader does not read; entering would present
+            // later bytes ahead of them.
             if driver.recv_forward[idx] {
                 return self.busy();
             }

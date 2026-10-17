@@ -141,9 +141,11 @@ Each call's first poll enters the segmented domain through
 and `exclusive` false (true would set `segment_reader_live`, and every later
 call would return `EBUSY`). It maps the refusals: a stale handle (`EPIPE`
 there) resolves to `Ok(0)`, and a running forward or a live `SegmentReader`
-to `Err(EBUSY)`. A connection with `enable_recv_forward` on also gets
-`Err(EBUSY)`: its bytes wait in `recv_hold`, which this reader does not
-read, so entering would present later bytes ahead of them.
+to `Err(EBUSY)`. A call first polled after `enable_recv_forward` was called
+on the connection also gets `Err(EBUSY)`, until the connection starts
+closing. On a plaintext connection in the default domain, received bytes go
+to `recv_hold`, the hold `forward_held` sends from, and this reader does not
+read that hold, so entering would present later bytes ahead of them.
 
 On io_uring the parser runs under `ReaderCallback::enter`, as the callbacks
 of `with_data`, `with_bytes`, `with_segments` and `try_with_data` do, so
@@ -219,12 +221,11 @@ mio path follows the io_uring reader:
   bytes. The mio plaintext read path records a read before it appends it, so
   bytes it drops past `recv_accumulator_max` are counted in a per-connection
   `recv_dropped`, which `recv_consumed` subtracts. Mio has no domain to
-  leave, so it has no `segment_epoch`;
-- `enable_recv_forward` does nothing on mio, so there is no recv-forward
-  refusal.
+  leave, so it has no `segment_epoch`.
 
 A client crate calls one method on both backends and gets the same errors,
-except the io_uring refusal of a recv-forward connection.
+except that io_uring refuses a call once `enable_recv_forward` has been
+called; on mio `enable_recv_forward` does nothing.
 
 The connection stays in the segmented domain after the future resolves;
 `end_segments` returns it to the default domain. On mio `end_segments`
