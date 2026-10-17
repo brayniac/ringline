@@ -512,16 +512,33 @@ mod tests {
     }
 
     /// An append counts its bytes, and a growth that moves the existing
-    /// bytes counts those too.
+    /// bytes counts those too. A growth the allocator does in place moves
+    /// nothing; a second handle on the allocation forces a move.
     #[test]
     fn bytes_copied_counts_appends_and_the_bytes_a_growth_moves() {
         let mut acc = RecvAccumulator::new(8);
         let start = bytes_copied();
         acc.append(b"abcd");
         assert_eq!(bytes_copied() - start, 4);
+        let before = acc.buf.as_ptr();
         let start = bytes_copied();
         acc.append(&[0u8; 64]);
+        let moved = if acc.buf.as_ptr() == before { 0 } else { 4 };
+        assert_eq!(bytes_copied() - start, 64 + moved);
+
+        let mut acc = RecvAccumulator::new(8);
+        acc.append(b"abcd");
+        let tail = acc.buf.split_off(acc.buf.len());
+        let before = acc.buf.as_ptr();
+        let start = bytes_copied();
+        acc.append(&[0u8; 64]);
+        assert_ne!(
+            acc.buf.as_ptr(),
+            before,
+            "a shared allocation is not grown in place"
+        );
         assert_eq!(bytes_copied() - start, 64 + 4, "the growth moved 4 bytes");
+        drop(tail);
     }
 
     /// Reclaiming a remainder nothing else references copies nothing;
