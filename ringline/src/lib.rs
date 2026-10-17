@@ -357,6 +357,8 @@ pub use runtime::io::WithSegmentsFuture;
 pub use runtime::io::connect;
 /// Begin an outbound Unix-domain connection; awaiting resolves to a `Connection`.
 pub use runtime::io::connect_unix;
+/// Copy a receive view shorter than a threshold.
+pub use runtime::io::copy_small_view;
 /// Submit a Direct I/O read and return a future for the result.
 pub use runtime::io::direct_io_read;
 /// Submit a Direct I/O write and return a future for the result.
@@ -371,6 +373,8 @@ pub use runtime::io::nvme_write;
 pub use runtime::io::open_direct_io_file;
 /// Open an NVMe device from any async task.
 pub use runtime::io::open_nvme_device;
+/// The calling worker's receive view threshold.
+pub use runtime::io::recv_zc_threshold;
 /// Request graceful shutdown from any async task.
 pub use runtime::io::request_shutdown;
 /// Resolve a hostname to a `SocketAddr` using the dedicated resolver pool.

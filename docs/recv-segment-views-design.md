@@ -1,7 +1,7 @@
 # Segment views: `Bytes` over held receive buffers for segment parsers
 
-Status: landing steps 1 (the view machinery) and 2 (the reader) are
-implemented; steps 3 to 6 are a proposal.
+Status: landing steps 1 (the view machinery), 2 (the reader) and 3
+(`recv_zc_threshold`) are implemented; steps 4 to 6 are a proposal.
 
 Related: `docs/recv-incremental-ring-design.md` ("`with_bytes`", the owner
 decisions of 2026-10-08 on views and `recv_zc_threshold`),
@@ -401,13 +401,16 @@ the kernel has no incremental rings or fails the preflight. These are the
 default geometries; an explicit `recv_buffer` overrides them. The
 `recv_zc_threshold` decision (owner, 2026-10-08) applies unchanged:
 
-- `ConfigBuilder::recv_zc_threshold(bytes)`, default 4096.
-- A helper returns a `Bytes` unchanged if it is not a view or is at least
-  the threshold, and an owned copy otherwise. It identifies a view by
-  checking whether the data pointer lies in the calling worker's
-  `RingMemory`.
+- `ConfigBuilder::recv_zc_threshold(bytes)`, default 4096, which
+  `ringline::recv_zc_threshold()` returns on the worker (4096 outside a
+  task).
+- `ringline::copy_small_view(value, threshold)` returns `value` unchanged if
+  it is not a view or is at least `threshold` bytes, and an owned copy
+  otherwise. It identifies a view by checking whether the data pointer lies
+  in the calling worker's `RingMemory`. Outside a task on a worker it treats
+  every `Bytes` as a view; on mio nothing is a view.
 - ringline-redis and ringline-memcache apply it to every `Bytes` in a parsed
-  response, with a client-level override.
+  response, with a client-level override (step 6).
 
 A value that spans pieces was already copied by the parser, so the helper
 returns it unchanged. A slice of an `Owned` piece (a refused lend's copy, up
@@ -487,7 +490,7 @@ New counters in `RECV_RING`:
 - Releases sent through the inbox, from another thread or by a later worker
   on the same thread.
 - Releases dropped after the worker exited.
-- Values copied by the `recv_zc_threshold` helper (step 3).
+- Values copied by `copy_small_view` (`THRESHOLD_COPIED`).
 - Entries copied at the hold cap (`HOLD_CAP_COPIED`).
 - Bytes copied in the receive path (`BYTES_COPIED`), on both backends.
 
@@ -503,7 +506,7 @@ storage:
 - a copy into a `recv_hold` entry's owned buffer (`own_recv_copy`);
 - TLS plaintext the unbuffered engine stashes when the send path decrypts
   it;
-- the threshold helper.
+- `copy_small_view`.
 
 The hold-cap copy is counted through `append` and `reclaim`. TLS ciphertext
 staging is not counted; it is the same for both readers.

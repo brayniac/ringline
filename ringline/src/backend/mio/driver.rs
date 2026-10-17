@@ -140,6 +140,8 @@ pub(crate) struct Driver {
     /// because the accumulator could not take them (the connection closes).
     /// `recv_consumed` subtracts them, so they do not count as consumed.
     pub(crate) recv_dropped: Vec<u64>,
+    /// `Config::recv_zc_threshold`, returned by `crate::recv_zc_threshold`.
+    pub(crate) recv_zc_threshold: u32,
     /// The current batch, whose time the arrival logs record. A batch begins
     /// after `poll` returns and in `drain_forward_resumes`.
     pub(crate) recv_batch: crate::recv::arrival::BatchClock,
@@ -462,6 +464,7 @@ impl Driver {
                 .map(|_| crate::recv::arrival::ArrivalLog::default())
                 .collect(),
             recv_dropped: vec![0; config.max_connections as usize],
+            recv_zc_threshold: config.recv_zc_threshold,
             recv_batch: crate::recv::arrival::BatchClock::new(),
             send_copy_pool: {
                 let mut pool =

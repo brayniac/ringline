@@ -2785,6 +2785,29 @@ mod tests {
         assert!(matches!(poll, std::task::Poll::Ready(Ok(0))), "{poll:?}");
     }
 
+    /// On mio nothing is a receive view: `copy_small_view` returns every
+    /// value unchanged, on the worker and off it, and `recv_zc_threshold`
+    /// reads the worker's configured value.
+    #[test]
+    fn copy_small_view_returns_values_unchanged_on_mio() {
+        let config = ConfigBuilder::new()
+            .workers(1)
+            .pin_to_core(false)
+            .max_connections(16)
+            .send_pool(4, 64)
+            .no_fs()
+            .recv_zc_threshold(77)
+            .build()
+            .expect("valid test config");
+        let (mut el, _wake) = test_loop(&config);
+        let value = bytes::Bytes::from(b"small".to_vec());
+        let ptr = value.as_ptr();
+        let kept = in_poll(&mut el, || crate::copy_small_view(value.clone(), 4096));
+        assert_eq!(kept.as_ptr(), ptr);
+        assert_eq!(crate::copy_small_view(value, 4096).as_ptr(), ptr);
+        assert_eq!(in_poll(&mut el, crate::recv_zc_threshold), 77);
+    }
+
     /// `end_segments` on mio returns `Ok(())`, for a stale handle too.
     #[test]
     fn end_segments_on_mio_returns_ok() {

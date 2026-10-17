@@ -327,11 +327,16 @@ pub mod recv_ring {
     /// Bytes copied into receive storage, on both backends: appended to or
     /// merged in a connection's accumulator (with the bytes a reallocation
     /// moves), prepended to it, or copied into an owned `segment_hold` entry
-    /// or an owned `recv_hold` copy, and TLS plaintext the unbuffered engine
-    /// stashes when the send path decrypts it. Ciphertext staged for TLS is
+    /// or an owned `recv_hold` copy, TLS plaintext the unbuffered engine
+    /// stashes when the send path decrypts it, and values `copy_small_view`
+    /// copies. Ciphertext staged for TLS is
     /// not counted.
     pub const BYTES_COPIED: usize = 8;
-    pub const COUNT: usize = 9;
+    /// Receive views `copy_small_view` copied because they were shorter
+    /// than the threshold it was given. Their bytes also count in
+    /// `BYTES_COPIED`.
+    pub const THRESHOLD_COPIED: usize = 9;
+    pub const COUNT: usize = 10;
 }
 
 /// Slot indices for `RECV_ARRIVAL`.
@@ -491,6 +496,11 @@ pub fn init_metadata() {
         "hold_cap_copied".into(),
     );
     RECV_RING.insert_metadata(recv_ring::BYTES_COPIED, "op".into(), "bytes_copied".into());
+    RECV_RING.insert_metadata(
+        recv_ring::THRESHOLD_COPIED,
+        "op".into(),
+        "threshold_copied".into(),
+    );
     for (step, name) in [
         (recv_preflight::SOCKETPAIR, "socketpair"),
         (recv_preflight::IO_ERROR, "io_error"),
@@ -756,6 +766,7 @@ mod tests {
             recv_ring::VIEW_RELEASE_DROPPED,
             recv_ring::HOLD_CAP_COPIED,
             recv_ring::BYTES_COPIED,
+            recv_ring::THRESHOLD_COPIED,
         ] {
             assert!(RECV_RING.increment(idx), "RECV_RING[{idx}] out of bounds");
         }
@@ -804,6 +815,10 @@ mod tests {
             Some("hold_cap_copied")
         );
         assert_eq!(op(recv_ring::BYTES_COPIED).as_deref(), Some("bytes_copied"));
+        assert_eq!(
+            op(recv_ring::THRESHOLD_COPIED).as_deref(),
+            Some("threshold_copied")
+        );
         for idx in 0..recv_ring::COUNT {
             assert!(
                 RECV_RING
