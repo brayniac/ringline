@@ -1047,7 +1047,7 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 [[package]]
 name = "memcache-proto"
 version = "0.0.5"
-source = "git+https://github.com/ringline-rs/memcache-proto?rev=aa93e3ca2528f431607b4a4bfbdfabfd63ba0bf3#aa93e3ca2528f431607b4a4bfbdfabfd63ba0bf3"
+source = "git+https://github.com/brayniac/memcache-proto?rev=90ac1398561d631d00f7955b73169cce8b9fedb4#90ac1398561d631d00f7955b73169cce8b9fedb4"
 dependencies = [
  "bytes",
  "itoa",
@@ -1615,7 +1615,7 @@ dependencies = [
 [[package]]
 name = "resp-proto"
 version = "0.0.2"
-source = "git+https://github.com/brayniac/resp-proto?rev=4ab04efe3cc04270a280c710966cbe268288dcb2#4ab04efe3cc04270a280c710966cbe268288dcb2"
+source = "git+https://github.com/brayniac/resp-proto?rev=76827c3348b1ad94fe4ef3eba98365b60caef79e#76827c3348b1ad94fe4ef3eba98365b60caef79e"
 dependencies = [
  "bytes",
  "itoa",

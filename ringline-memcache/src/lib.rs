@@ -116,7 +116,7 @@
 //!
 //! | Path | Copies | Mechanism |
 //! |------|--------|-----------|
-//! | **Recv (values)** | 0 to 2 | `with_bytes_segments()` + `ResponseBytes::parse_segments()`. On io_uring a value inside one ring buffer and at least `recv_zc_threshold` long is a view of that buffer (0 copies); a shorter one is copied out of it (`ringline::copy_small_view`); one that spans buffers is copied by the parser. Keys are copied the same way where a call returns them ([`Client::gets`]). A value in a reply longer than the hold cap is copied into the accumulator by the runtime and copied again by the parser if it spans the accumulator and later buffers; TLS plaintext and a refused lend's copy are heap pieces, and a value that spans them is likewise copied twice. On mio values are slices of the accumulator, which the bytes were copied into. |
+//! | **Recv (values)** | 0 or 1; 2 next to a refused lend | `with_bytes_segments()` + `ResponseBytes::parse_segments()`. On io_uring a value inside one ring buffer and at least `recv_zc_threshold` long is a view of that buffer (0 copies); a shorter one is copied out of it (`ringline::copy_small_view`); one that spans buffers is copied by the parser. Keys are copied the same way where a call returns them ([`Client::gets`]). A value in a reply longer than the hold cap is copied into the accumulator by the runtime, as the reply arrives, and sliced (1). A reply in several pieces is scanned (`ResponseBytes::scan_segments`) on each arrival and parsed once, when complete. A value that spans a refused lend's copy and another piece is copied twice. TLS connections read with `with_bytes`, and on mio values are slices of the accumulator, which the bytes were copied into (1). |
 //! | **Recv (binary protocol)** | 1 | [`BinaryClient`] reads with `with_bytes()`; values are slices of the accumulator, which the bytes were copied into. |
 //! | **Send (commands)** | 1 | Requests are encoded into a reusable per-client buffer (no per-request allocation), then `conn.send()` copies into the send pool. |
 //! | **Send (SET value, guard)** | 0 (value) | [`Client::set_with_guard`]: prefix+suffix copied to pool, value stays in-place via `SendGuard`. |
@@ -135,7 +135,7 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use memcache_proto::binary::BinaryRequest;
-use memcache_proto::{Request as McRequest, ResponseBytes as McResponseBytes, ValueBytes};
+use memcache_proto::{Frame, Request as McRequest, ResponseBytes as McResponseBytes, ValueBytes};
 use ringline::{Connection, GuardBox, ParseResult, RecvArrival, RecvHalf, SendGuard, SendHalf};
 
 /// Callback type invoked after each command completes.
@@ -1180,50 +1180,39 @@ impl Client {
                 .await
         } else if !segmented {
             self.rx
-                .with_bytes(|bytes| {
-                    let len = bytes.len();
-                    let hint = value_remainder_hint(std::slice::from_ref(&bytes), len);
-                    match McResponseBytes::parse(bytes) {
-                        Ok((response, consumed)) => {
+                .with_bytes(
+                    |bytes| match read_response_in(std::slice::from_ref(&bytes)) {
+                        ResponseIn::Done(response, consumed) => {
                             result = Some(Ok(response));
                             ParseResult::Consumed(consumed)
                         }
-                        Err(e) if e.is_incomplete() => match hint {
-                            Some(additional) => ParseResult::NeedAtLeast(additional),
-                            None => ParseResult::Consumed(0),
-                        },
-                        Err(e) => {
+                        ResponseIn::Needs(more) => ParseResult::NeedAtLeast(more),
+                        ResponseIn::Bad(e) => {
                             result = Some(Err(Error::Protocol(e)));
-                            ParseResult::Consumed(len)
+                            ParseResult::Consumed(bytes.len())
                         }
-                    }
-                })
+                    },
+                )
                 .await
         } else {
             let read = self
                 .rx
-                .with_bytes_segments(|pieces| {
-                    let len = pieces.iter().map(Bytes::len).sum();
-                    match McResponseBytes::parse_segments(pieces) {
-                        Ok((response, consumed)) => {
-                            let copied = parser_copied(&response, pieces);
-                            if copied > 0 {
-                                ringline::metrics::RECV_RING.add(
-                                    ringline::metrics::recv_ring::SEGMENT_PARSE_COPIED,
-                                    copied as u64,
-                                );
-                            }
-                            result = Some(Ok(response));
-                            ParseResult::Consumed(consumed)
+                .with_bytes_segments(|pieces| match read_response_in(pieces) {
+                    ResponseIn::Done(response, consumed) => {
+                        let copied = parser_copied(&response, pieces);
+                        if copied > 0 {
+                            ringline::metrics::RECV_RING.add(
+                                ringline::metrics::recv_ring::SEGMENT_PARSE_COPIED,
+                                copied as u64,
+                            );
                         }
-                        Err(e) if e.is_incomplete() => match value_remainder_hint(pieces, len) {
-                            Some(additional) => ParseResult::NeedAtLeast(additional),
-                            None => ParseResult::Consumed(0),
-                        },
-                        Err(e) => {
-                            result = Some(Err(Error::Protocol(e)));
-                            ParseResult::Consumed(len)
-                        }
+                        result = Some(Ok(response));
+                        ParseResult::Consumed(consumed)
+                    }
+                    ResponseIn::Needs(more) => ParseResult::NeedAtLeast(more),
+                    ResponseIn::Bad(e) => {
+                        result = Some(Err(Error::Protocol(e)));
+                        ParseResult::Consumed(pieces.iter().map(Bytes::len).sum())
                     }
                 })
                 .await;
@@ -2862,35 +2851,40 @@ fn elapsed_ns(start: Instant) -> u64 {
     start.elapsed().as_nanos() as u64
 }
 
-/// For an incomplete text-protocol reply that starts with a `VALUE` line,
-/// a lower bound on how many more bytes complete it, given the reply's
-/// pieces and their total length `buffered`: the line, the value, its CRLF
-/// and `END\r\n`. Returns `None` when the head isn't a complete `VALUE`
-/// line or the bound is already buffered (a multi-key reply whose first value
-/// is complete).
-fn value_remainder_hint(pieces: &[Bytes], buffered: usize) -> Option<usize> {
-    // "VALUE ", a key of up to 250 bytes, flags, length, CAS and CRLF; the
-    // line may span pieces.
-    let mut head = [0u8; 320];
-    let mut filled = 0;
-    for piece in pieces {
-        let take = piece.len().min(head.len() - filled);
-        head[filled..filled + take].copy_from_slice(&piece[..take]);
-        filled += take;
-        if filled == head.len() {
-            break;
+/// What [`read_response_in`] found at the start of a reply's pieces.
+enum ResponseIn {
+    /// A response, and the bytes it took.
+    Done(McResponseBytes, usize),
+    /// An incomplete response that needs at least this many more bytes.
+    Needs(usize),
+    /// Bytes that are not a text-protocol response.
+    Bad(memcache_proto::ParseError),
+}
+
+/// Parse the text-protocol response at the start of `pieces`, or find how
+/// many more bytes it needs.
+///
+/// Over several pieces the response is scanned first and parsed only once it
+/// is complete: a parse of an incomplete response copies each key and value
+/// that spans pieces and discards the copies when it reaches the end. Over
+/// one piece a parse copies nothing, so it runs first, and the scan only
+/// sizes the wait.
+fn read_response_in(pieces: &[Bytes]) -> ResponseIn {
+    if pieces.len() > 1 {
+        match McResponseBytes::scan_segments(pieces) {
+            Ok(Frame::Complete(_)) => {}
+            Ok(Frame::Incomplete(more)) => return ResponseIn::Needs(more),
+            Err(e) => return ResponseIn::Bad(e),
         }
     }
-    let head = &head[..filled];
-    let line_end = head.windows(2).position(|w| w == b"\r\n")?;
-    let mut fields = head[..line_end]
-        .strip_prefix(b"VALUE ")?
-        .split(|&b| b == b' ');
-    let _key = fields.next()?;
-    let _flags = fields.next()?;
-    let len: usize = std::str::from_utf8(fields.next()?).ok()?.parse().ok()?;
-    let total = (line_end + 2).checked_add(len)?.checked_add(2 + 5)?;
-    total.checked_sub(buffered).filter(|&a| a > 0)
+    match McResponseBytes::parse_segments(pieces) {
+        Ok((response, consumed)) => ResponseIn::Done(response, consumed),
+        Err(e) if e.is_incomplete() => match McResponseBytes::scan_segments(pieces) {
+            Ok(Frame::Incomplete(more)) => ResponseIn::Needs(more),
+            Ok(Frame::Complete(_)) | Err(_) => ResponseIn::Needs(1),
+        },
+        Err(e) => ResponseIn::Bad(e),
+    }
 }
 
 /// Replace each value in `response` that is a receive view shorter than
@@ -3758,50 +3752,61 @@ mod binary_tests {
 
 #[cfg(test)]
 mod segment_read_tests {
-    use super::{McResponseBytes, parser_copied, value_remainder_hint};
+    use super::{McResponseBytes, ResponseIn, parser_copied, read_response_in};
     use bytes::Bytes;
 
     fn pieces(parts: &[&[u8]]) -> Vec<Bytes> {
         parts.iter().map(|p| Bytes::copy_from_slice(p)).collect()
     }
 
+    fn read(parts: &[&[u8]]) -> ResponseIn {
+        read_response_in(&pieces(parts))
+    }
+
+    /// Once a `VALUE` line is in, the need is the data, its CRLF and
+    /// `END\r\n`.
     #[test]
-    fn value_line_reports_remainder() {
-        // "VALUE k 0 16\r\n" (14) + 16 + CRLF + "END\r\n" = 37; 18 buffered.
-        let parts = pieces(&[b"VALUE k 0 16\r\nabcd"]);
-        assert_eq!(value_remainder_hint(&parts, 18), Some(19));
+    fn an_incomplete_value_needs_its_data_and_the_end_line() {
+        // "VALUE k 0 16\r\n" + 4 of 16 bytes: 12 + 2 + 5.
+        assert!(matches!(
+            read(&[b"VALUE k 0 16\r\nabcd"]),
+            ResponseIn::Needs(19)
+        ));
+        assert!(matches!(
+            read(&[b"VAL", b"UE k 0 1", b"6\r", b"\nab"]),
+            ResponseIn::Needs(21)
+        ));
+    }
+
+    /// A multi-key reply whose first value is complete still needs the
+    /// second.
+    #[test]
+    fn an_incomplete_second_value_needs_its_data() {
+        // The second value's 2 missing bytes, its CRLF and END.
+        assert!(matches!(
+            read(&[b"VALUE a 0 1\r\nx\r\n", b"VALUE b 0 4\r\nyy"]),
+            ResponseIn::Needs(9)
+        ));
     }
 
     #[test]
-    fn value_line_split_across_pieces_reports_remainder() {
-        let parts = pieces(&[b"VAL", b"UE k 0 1", b"6\r", b"\nab"]);
-        assert_eq!(value_remainder_hint(&parts, 16), Some(21));
-        let parts = pieces(&[b"VALUE k 0 16 99\r\n"]);
-        assert_eq!(value_remainder_hint(&parts, 17), Some(23));
+    fn a_complete_response_is_parsed_once() {
+        let ResponseIn::Done(McResponseBytes::Values(values), consumed) =
+            read(&[b"VALUE k 0 3\r\nab", b"c\r\nEND\r\nSTORED"])
+        else {
+            panic!("complete");
+        };
+        assert_eq!(consumed, 23);
+        assert_eq!(&values[0].data[..], b"abc");
     }
 
     #[test]
-    fn no_hint_without_a_complete_value_line() {
-        assert_eq!(
-            value_remainder_hint(&pieces(&[b"VALUE k 0 16\r"]), 13),
-            None
-        );
-        assert_eq!(value_remainder_hint(&pieces(&[b"VALUE k 0\r\n"]), 11), None);
-        assert_eq!(
-            value_remainder_hint(&pieces(&[b"VALUE k 0 x\r\n"]), 13),
-            None
-        );
-        assert_eq!(value_remainder_hint(&pieces(&[b"STORED\r"]), 7), None);
-        assert_eq!(value_remainder_hint(&pieces(&[b"EN"]), 2), None);
-        assert_eq!(value_remainder_hint(&[], 0), None);
-    }
-
-    /// A multi-key reply whose first value is complete: the bound for the
-    /// first value is already buffered.
-    #[test]
-    fn no_hint_once_the_first_value_is_buffered() {
-        let parts = pieces(&[b"VALUE a 0 1\r\nx\r\nVALUE b 0 4\r\nyy"]);
-        assert_eq!(value_remainder_hint(&parts, 31), None);
+    fn bytes_that_are_not_a_response_are_bad() {
+        assert!(matches!(read(&[b"BOGUS\r\n"]), ResponseIn::Bad(_)));
+        assert!(matches!(
+            read(&[b"VALUE k x", b" 3\r\n"]),
+            ResponseIn::Bad(_)
+        ));
     }
 
     /// A key, value or message that spans pieces is a copy the parser made;

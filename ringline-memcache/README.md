@@ -35,7 +35,7 @@ async fn example(conn: ConnCtx) -> Result<(), ringline_memcache::Error> {
 
 | Path | Copies | Mechanism |
 |------|--------|-----------|
-| **Recv (values)** | 0 to 2 | `with_bytes_segments()` + `ResponseBytes::parse_segments()`. See the crate documentation's copy semantics. |
+| **Recv (values)** | 0 or 1; 2 next to a refused lend | `with_bytes_segments()` + `ResponseBytes::parse_segments()`. See the crate documentation's copy semantics. |
 | **Send (commands)** | 1 | Serialized into `Vec<u8>`, then copied into the send pool. |
 | **Send (SET value, guard)** | 0 (value) | `set_with_guard`: prefix+suffix copied to pool, value stays in-place via `SendGuard`. |
 

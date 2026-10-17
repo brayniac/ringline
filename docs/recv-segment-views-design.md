@@ -507,8 +507,7 @@ New counters in `RECV_RING`:
 - Bytes copied in the receive path (`BYTES_COPIED`), on both backends.
 - Bytes of strings in a completed reply that the client crates' parsers
   copied because they spanned pieces (`SEGMENT_PARSE_COPIED`), counted by
-  ringline-redis and ringline-memcache. Copies an incomplete parse makes and
-  discards are not counted.
+  ringline-redis and ringline-memcache.
 
 The bytes-copied counter is incremented where bytes are copied into receive
 storage:
@@ -638,7 +637,8 @@ is zeroed eagerly, which would make the whole ring resident at startup.
    memcache-proto commits by git rev (`[patch.crates-io]`). The released
    resp-proto 0.0.2 and memcache-proto 0.0.5 do not have `parse_segments`,
    and resp-proto's main also changes the parser `with_bytes` uses, so both
-   builds of step 5 carry that change. Build B also needs
+   builds of step 5 carry that change. Build B also needs the scanners
+   `Value::scan_segments` and `ResponseBytes::scan_segments` (step 6), and
    `Value::for_each_bytes_mut` (ringline-rs/resp-proto#9), which visits
    every `Bytes` in a value, RESP3 variants included: ringline-redis cannot
    match those variants itself, because they exist only under resp-proto's
@@ -690,11 +690,19 @@ is zeroed eagerly, which would make the whole ring resident at startup.
    - counts the bytes the parser copied in `RECV_RING`
      `SEGMENT_PARSE_COPIED`: those of strings that lie in none of the
      presented pieces;
-   - gives both incomplete reads a length hint over the pieces. Without a
-     hint each arrival re-parses and re-creates a view for every held entry,
-     up to the hold cap. ringline-redis reads a `$` header split across
-     pieces; ringline-memcache reads the first `VALUE` line and returns a
-     lower bound: the line, the value, its CRLF and `END\r\n`;
+   - scans a reply that spans several pieces with the proto crates'
+     `scan_segments` and parses it only once it is complete. A parse of an
+     incomplete reply copies each string that spans pieces and discards the
+     copies; parsing on every arrival of a reply of 12 values of 4 KiB
+     allocated 337 KB against 62 KB. The scan's lower bound on the bytes
+     still needed is returned as `NeedAtLeast`, so the parser is not called
+     again until they arrive. A reply in one piece is parsed first, since
+     that parse copies nothing;
+   - reads TLS connections with `with_bytes`, as before. Their plaintext is
+     copied out of the TLS engine anyway, into heap pieces, and the parser
+     would copy a value spanning two of them again; through the
+     accumulator it is copied once and sliced. The client decides on its
+     first read, since `tls_info` needs the worker's driver;
    - changes the receive copy counts in `docs/syscalls-and-copies.md` and
      in CLAUDE.md ("Copy Semantics").
 

@@ -175,13 +175,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   least `recv_zc_threshold` long is a view of that buffer instead of a slice
   of the accumulator, so its bytes are not copied. A shorter value is copied
   out of its buffer (`copy_small_view`), and a value that spans buffers is
-  copied by the parser. A value in a reply longer than the hold cap, or one
-  that spans TLS plaintext chunks, is copied twice. ringline-redis returns
-  `OK`, `PONG` and `QUEUED` as static `Bytes`. ringline-memcache's `gets`
-  copies keys the same way as values; `get` does not keep the key. An
-  incomplete redis `$` reply or memcache `VALUE` reply hints its remaining
-  length across pieces. memcache's binary protocol still reads with
-  `with_bytes`.
+  copied by the parser. A reply in several pieces is scanned
+  (`scan_segments`) on each arrival and parsed once, when complete, and the
+  scan's bound on the bytes still needed is returned as `NeedAtLeast`.
+  ringline-redis returns `OK`, `PONG` and `QUEUED` as static `Bytes`.
+  ringline-memcache's `gets` copies keys the same way as values; `get` does
+  not keep the key. TLS connections and memcache's binary protocol still read
+  with `with_bytes`.
+- `with_bytes_segments`: after a hold-cap copy, bytes that arrive before the
+  call resolves are copied to the accumulator too, so the message is
+  presented as one piece and a value spanning the copy is not copied again
+  by the parser.
 - `ringline` takes `bytes` from the workspace, so it requires 1.11.1 or
   later, as the other crates do; views use `Bytes::from_owner` (1.9). On
   io_uring a provided-buffer ring's buffers are an anonymous mapping, shared

@@ -82,8 +82,9 @@ rustls-pki-types = "1"
 webpki-roots = "0.26"
 
 # Step 5 of docs/recv-segment-views-design.md measures against the proto
-# crates' unreleased main branches, which have `parse_segments`; resp-proto
-# also carries `Value::for_each_bytes_mut` from a fork branch. Not for main.
+# crates' unreleased main branches, which have `parse_segments`, plus fork
+# branches with `Value::for_each_bytes_mut` and the `scan_segments` scanners.
+# Not for main.
 [patch.crates-io]
-resp-proto = { git = "https://github.com/brayniac/resp-proto", rev = "4ab04efe3cc04270a280c710966cbe268288dcb2" }
-memcache-proto = { git = "https://github.com/ringline-rs/memcache-proto", rev = "aa93e3ca2528f431607b4a4bfbdfabfd63ba0bf3" }
+resp-proto = { git = "https://github.com/brayniac/resp-proto", rev = "76827c3348b1ad94fe4ef3eba98365b60caef79e" }
+memcache-proto = { git = "https://github.com/brayniac/memcache-proto", rev = "90ac1398561d631d00f7955b73169cce8b9fedb4" }
