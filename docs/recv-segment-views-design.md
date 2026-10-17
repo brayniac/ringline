@@ -141,7 +141,9 @@ Each call's first poll enters the segmented domain through
 and `exclusive` false (true would set `segment_reader_live`, and every later
 call would return `EBUSY`). It maps the refusals: a stale handle (`EPIPE`
 there) resolves to `Ok(0)`, and a running forward or a live `SegmentReader`
-to `Err(EBUSY)`.
+to `Err(EBUSY)`. A connection with `enable_recv_forward` on also gets
+`Err(EBUSY)`: its bytes wait in `recv_hold`, which this reader does not
+read, so entering would present later bytes ahead of them.
 
 On io_uring the parser runs under `ReaderCallback::enter`, as the callbacks
 of `with_data`, `with_bytes`, `with_segments` and `try_with_data` do, so
@@ -214,10 +216,10 @@ mio path follows the io_uring reader:
 - while a forward runs it resolves to `Err(EBUSY)`;
 - a later poll resolves to `Err(EBUSY)` when `Driver::recv_consumed`
   changed since the previous poll: another reader or a forward consumed
-  accumulator bytes. The check is skipped once the receive side has
-  finished, because a read past `recv_accumulator_max` is recorded and then
-  dropped as the connection closes. Mio has no domain to leave, so it has
-  no `segment_epoch`.
+  accumulator bytes. The mio read path records a read before it appends it,
+  so bytes it drops past `recv_accumulator_max` are counted in a
+  per-connection `recv_dropped`, which `recv_consumed` subtracts. Mio has no
+  domain to leave, so it has no `segment_epoch`.
 
 A client crate calls one method on both backends and gets the same errors.
 

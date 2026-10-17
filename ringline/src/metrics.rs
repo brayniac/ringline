@@ -434,12 +434,12 @@ pub mod pool {
     /// here, which is why this one exists.
     ///
     /// Entering the segmented domain adopts what is already buffered, so a
-    /// non-zero count means bytes reached the accumulator after entry. One
-    /// known way is a `RecvOwnedSegment` future made before a
-    /// `with_bytes_segments` call whose hold-cap copy left bytes there, and
-    /// polled after it. Any other is a path that reached segmented delivery
-    /// without adopting. The adoption keeps a live system correct; the count
-    /// is how you find out it happened.
+    /// non-zero count means bytes reached the accumulator after entry. The
+    /// known ways are a `RecvOwnedSegment` future made before a
+    /// `with_bytes_segments` hold-cap copy or a `with_segments` under-drain
+    /// that left bytes there, and polled after it. Any other is a path that
+    /// reached segmented delivery without adopting. A non-zero count means
+    /// the adoption ran.
     pub const SEGMENT_STRANDED_ADOPTED: usize = 7;
     /// A zero-copy send (`SendMsgZc`) returned `-ENOMEM`, and the rest of
     /// that send went out as plain `send`s. On Linux the usual cause is

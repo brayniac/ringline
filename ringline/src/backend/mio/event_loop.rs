@@ -495,6 +495,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.driver.tcp_streams[idx] = Some(mio_stream);
             self.driver.accumulators.reset(conn_index);
             self.driver.arrival[idx].clear();
+            self.driver.recv_dropped[idx] = 0;
             // Defensive: a freshly allocated slot should have an empty send
             // queue, but if anything survived, its awaited sends must be
             // failed and its permits returned rather than dropped.
@@ -683,6 +684,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.executor.wake_recv(conn_index);
             return true;
         }
+        self.driver.recv_dropped[conn_index as usize] += data.len() as u64;
         self.executor.wake_recv(conn_index);
         self.driver.close_connection(conn_index);
         false
@@ -966,6 +968,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     }
                     // Check if the connection has a recv sink (direct-to-buffer).
                     let sink = &mut self.executor.recv_sinks[idx];
+                    let mut to_accumulator = n;
                     let appended = if let Some(recv_sink) = sink {
                         let remaining = recv_sink.cap - recv_sink.pos;
                         let to_copy = n.min(remaining);
@@ -980,6 +983,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                             recv_sink.pos += to_copy;
                         }
                         // If there's overflow beyond the sink, put it in accumulator.
+                        to_accumulator = n - to_copy;
                         if n > to_copy {
                             self.driver
                                 .accumulators
@@ -995,6 +999,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                         // already read off the socket, so the stream cannot
                         // continue coherently — close rather than OOM,
                         // matching the uring and mio-TLS overflow paths.
+                        self.driver.recv_dropped[idx] += to_accumulator as u64;
                         self.executor.wake_recv(conn_index);
                         self.driver.close_connection(conn_index);
                         break;
@@ -2670,7 +2675,13 @@ mod tests {
     #[test]
     fn bytes_segments_returns_ebusy_after_another_reader_on_mio() {
         use crate::runtime::io::ParseResult;
-        for case in ["forward_first", "forward_later", "with_data", "stale"] {
+        for case in [
+            "forward_first",
+            "forward_later",
+            "with_data",
+            "with_data_after_fin",
+            "stale",
+        ] {
             let config = test_config();
             let (mut el, _wake) = test_loop(&config);
             let (conn_index, _peer) = attach_conn(&mut el.driver);
@@ -2697,8 +2708,15 @@ mod tests {
                     el.driver.forward_conn[conn_index as usize] = Some(forward);
                     poll_in(&mut el, fut.as_mut())
                 }
-                "with_data" => {
+                "with_data" | "with_data_after_fin" => {
                     assert!(poll_in(&mut el, fut.as_mut()).is_pending());
+                    if case == "with_data_after_fin" {
+                        el.driver
+                            .connections
+                            .get_mut(conn_index)
+                            .expect("open")
+                            .note_eof(false);
+                    }
                     let mut read = std::pin::pin!(ctx.with_data(|_| ParseResult::Consumed(1)));
                     assert!(matches!(
                         poll_in(&mut el, read.as_mut()),
@@ -2717,11 +2735,13 @@ mod tests {
     }
 
     /// A read past `recv_accumulator_max` closes the connection while a call
-    /// is parked; the call resolves to `Ok(0)`, not `EBUSY`, although the
-    /// dropped bytes were recorded as delivered.
+    /// is parked; the call resolves to `Ok(0)`, not `EBUSY`. The read path
+    /// records the dropped bytes as delivered, and `recv_dropped` keeps them
+    /// out of `recv_consumed`.
     #[test]
     fn bytes_segments_resolves_to_zero_after_an_accumulator_overflow_on_mio() {
         use crate::runtime::io::ParseResult;
+        use std::io::Write;
         let config = ConfigBuilder::new()
             .workers(1)
             .pin_to_core(false)
@@ -2732,17 +2752,34 @@ mod tests {
             .build()
             .expect("valid test config");
         let (mut el, _wake) = test_loop(&config);
-        let (conn_index, _peer) = attach_conn(&mut el.driver);
+        let (conn_index, mut peer) = attach_conn(&mut el.driver);
         let ctx = crate::ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
-        deliver(&mut el, conn_index, &[0u8; 16000]);
+        let mut buf = vec![0u8; 65536];
+        let read_all = |el: &mut AsyncEventLoop<NoopHandler>, buf: &mut [u8], want: usize| {
+            for _ in 0..1000 {
+                el.handle_readable(conn_index, buf);
+                if el.driver.arrival[conn_index as usize].delivered() >= want as u64 {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            panic!("the read path did not take {want} bytes");
+        };
+        peer.write_all(&[0u8; 16000]).expect("write");
+        read_all(&mut el, &mut buf, 16000);
         let mut fut =
             std::pin::pin!(ctx.with_bytes_segments(|_| ParseResult::NeedAtLeast(1 << 20)));
         assert!(poll_in(&mut el, fut.as_mut()).is_pending());
 
-        // What the read path does with a read the accumulator cannot take.
-        el.driver.record_arrival(conn_index, 1000);
-        assert!(!el.driver.accumulators.append(conn_index, &[0u8; 1000]));
-        el.driver.close_connection(conn_index);
+        peer.write_all(&[0u8; 1000]).expect("write");
+        read_all(&mut el, &mut buf, 17000);
+        assert!(
+            el.driver
+                .connections
+                .get(conn_index)
+                .is_some_and(|c| c.close_requested()),
+            "the overflow closes the connection"
+        );
 
         let poll = poll_in(&mut el, fut.as_mut());
         assert!(matches!(poll, std::task::Poll::Ready(Ok(0))), "{poll:?}");

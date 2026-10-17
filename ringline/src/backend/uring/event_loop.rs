@@ -21776,6 +21776,23 @@ mod tests {
         }
     }
 
+    /// A connection with recv-forward on is refused: its bytes wait in
+    /// `recv_hold`, which this reader does not read.
+    #[test]
+    fn bytes_segments_refuses_a_recv_forward_connection() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        el.driver.recv_forward[conn_index as usize] = true;
+        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        let mut fut = std::pin::pin!(ctx.with_bytes_segments(|_| ParseResult::NeedMore));
+        let poll = poll_in(&mut el, fut.as_mut());
+        assert!(is_ebusy(&poll), "{poll:?}");
+        assert_eq!(
+            el.driver.recv_domain[conn_index as usize],
+            crate::recv::domain::RecvDomain::default()
+        );
+    }
+
     /// A parked call whose connection another reader used in the meantime
     /// resolves to `EBUSY` on its next poll, and a new call then reads the
     /// next reply, which arrives in one completion.

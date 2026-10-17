@@ -1557,8 +1557,8 @@ impl ConnCtx {
     /// would never observe further data (it keeps getting held as segments).
     ///
     /// Any buffers still held (bytes received *past* what the consumer pulled) are
-    /// gathered, in arrival order, into the front of the accumulator so the next
-    /// read sees them first.
+    /// appended, in arrival order, behind any bytes already in the accumulator,
+    /// and the next read sees them in that order.
     ///
     /// Returns an error (and closes the connection) if gathering the leftover
     /// segments overflows the recv accumulator bound (`recv_accumulator_max`).
@@ -3937,7 +3937,10 @@ impl Connection {
     ///   again to read with the connection's current state;
     /// - `Err(EBUSY)` while a forward runs or a `SegmentReader` is live. A
     ///   new call also resolves to `Err(EBUSY)`, without waiting, until the
-    ///   forward ends or the reader drops.
+    ///   forward ends or the reader drops;
+    /// - `Err(EBUSY)` on io_uring for a connection with
+    ///   [`enable_recv_forward`](RecvHalf::enable_recv_forward) on, whose
+    ///   bytes go to the `forward_held` hold.
     pub fn with_bytes_segments<F>(&mut self, f: F) -> WithBytesSegmentsFuture<F>
     where
         F: FnMut(&[Bytes]) -> ParseResult,
@@ -3951,9 +3954,10 @@ impl Connection {
     ///
     /// On io_uring the held bytes no reader has consumed are appended, in
     /// order, behind any bytes already in the accumulator, and the next
-    /// `with_data` or `with_bytes` call reads them in that order. If that copy would exceed
-    /// `recv_accumulator_max`, the connection is closed and an `OutOfMemory`
-    /// error returned; for a stale handle the error is `EPIPE`.
+    /// `with_data` or `with_bytes` call reads them in that order. If that
+    /// copy would exceed `recv_accumulator_max`, the connection is closed and
+    /// an `OutOfMemory` error returned; for a stale handle the error is
+    /// `EPIPE`.
     ///
     /// On mio, which has no segmented domain, it returns `Ok(())`.
     pub fn end_segments(&mut self) -> io::Result<()> {
@@ -4068,8 +4072,9 @@ impl Connection {
     ///
     /// The reader calls that set it are `with_data`, `with_data_result`,
     /// `with_bytes`, `with_bytes_segments`, `try_with_data` and, on io_uring,
-    /// `with_segments`, on this connection or its [`RecvHalf`]. The call's bytes are the ones it
-    /// removed from the connection, whatever the parser returned.
+    /// `with_segments`, on this connection or its [`RecvHalf`]. The call's
+    /// bytes are the ones it removed from the connection, whatever the parser
+    /// returned.
     /// Forwards, recv sinks, `ConnStream` and segment readers do not set it.
     ///
     /// Returns `None` until a reader call has consumed a byte, after a call
@@ -4515,10 +4520,10 @@ impl Drop for SegmentReader<'_> {
 ///
 /// `enter_segmented_domain` adopts on entry, so a non-zero
 /// `SEGMENT_STRANDED_ADOPTED` means bytes reached the accumulator *after*
-/// entry. One known way is a `RecvOwnedSegment` future made before a
-/// `with_bytes_segments` call whose hold-cap copy left bytes there, and
-/// polled after it; any other is a path that strands bytes, and this
-/// adoption is the only reason the connection kept working.
+/// entry. The known ways are a `RecvOwnedSegment` future made before a
+/// `with_bytes_segments` hold-cap copy or a `with_segments` under-drain that
+/// left bytes there, and polled after it. Any other is a path that strands
+/// bytes, and this adoption is the only reason the connection kept working.
 #[cfg(has_io_uring)]
 fn adopt_stranded_accumulator(driver: &mut Driver, conn: u32) {
     if driver.accumulators.is_empty(conn) {
@@ -5612,6 +5617,12 @@ impl<F: FnMut(&[Bytes]) -> ParseResult + Unpin> WithBytesSegmentsFuture<F> {
         let idx = conn as usize;
 
         if !self.entered {
+            // A recv-forward connection's bytes wait in `recv_hold`, which this
+            // reader does not read; entering would present later bytes ahead
+            // of them.
+            if driver.recv_forward[idx] {
+                return self.busy();
+            }
             match enter_segmented(
                 driver,
                 conn,
@@ -5752,21 +5763,17 @@ impl<F: FnMut(&[Bytes]) -> ParseResult + Unpin> WithBytesSegmentsFuture<F> {
     ) -> Poll<io::Result<usize>> {
         let conn = self.conn_index;
         let idx = conn as usize;
-        let finished = driver
-            .connections
-            .get(conn)
-            .is_none_or(|c| c.recv_finished());
-        // Once the receive side has finished, `recv_consumed` can also rise
-        // without a reader: a read past `recv_accumulator_max` is recorded,
-        // then dropped as the connection closes. Mio has no domain for
-        // another reader to take, so the check is skipped then.
         if driver.forward_conn[idx].is_some()
-            || (self.entered && !finished && driver.recv_consumed(conn) != self.consumed)
+            || (self.entered && driver.recv_consumed(conn) != self.consumed)
         {
             return self.busy();
         }
         self.entered = true;
 
+        let finished = driver
+            .connections
+            .get(conn)
+            .is_none_or(|c| c.recv_finished());
         let total = driver.accumulators.len(conn);
         if total == 0 {
             if finished {
