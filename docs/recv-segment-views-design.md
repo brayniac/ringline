@@ -214,8 +214,10 @@ mio path follows the io_uring reader:
 - while a forward runs it resolves to `Err(EBUSY)`;
 - a later poll resolves to `Err(EBUSY)` when `Driver::recv_consumed`
   changed since the previous poll: another reader or a forward consumed
-  accumulator bytes. Mio has no domain to leave, so it has no
-  `segment_epoch`.
+  accumulator bytes. The check is skipped once the receive side has
+  finished, because a read past `recv_accumulator_max` is recorded and then
+  dropped as the connection closes. Mio has no domain to leave, so it has
+  no `segment_epoch`.
 
 A client crate calls one method on both backends and gets the same errors.
 
@@ -258,19 +260,18 @@ streaming reads.
   and the hold would never drain.
 - If that parse is incomplete and the receive side has not finished, every
   held entry is copied into the accumulator, in order, their buffer holds
-  are released, and the future parks; its next poll presents the
-  accumulator first. At end of stream the future resolves to `Ok(0)` and
-  teardown releases the hold. A message that
-  arrives in more completions than the hold cap completes only through this
-  copy.
-- Before the copy, `AccumulatorTable::reclaim` reclaims the
-  frozen remainder (`unfreeze` with nothing appended, recovering the
-  allocation with `try_into_mut`). That costs nothing once the presented
-  clone and any slice the parser kept of it have dropped; if a slice is
-  still alive, the method copies the remainder once into a buffer of the
-  reserve target's size. The copy then calls `reserve` with the held bytes
-  plus the recorded `n`, so the accumulator grows once, and each held byte
-  is copied once by this path.
+  are released, and the future parks; its next poll presents the accumulator
+  first. At end of stream the future resolves to `Ok(0)` and teardown
+  releases the hold. A message that arrives in more completions than the
+  hold cap completes only through this copy.
+- Before the copy, `AccumulatorTable::reclaim` reclaims the frozen remainder
+  (`unfreeze` with nothing appended, recovering the allocation with
+  `try_into_mut`). That costs nothing once the presented clone and any slice
+  the parser kept of it have dropped; if a slice is still alive, the method
+  copies the remainder once into a buffer of the reserve target's size. The
+  copy then calls `reserve` with the held bytes plus the recorded `n`, so
+  the accumulator grows once, and each held byte is copied once by this
+  path.
 - An `Owned` entry (a refused lend, a TLS chunk, a fallback receive
   completion in flight at entry, or the accumulator moved in on entry) was
   copied once already, so its bytes are copied twice.
@@ -494,12 +495,12 @@ storage:
   completion, a lend copied by `arm_forward_source`, a TLS plaintext chunk),
   except the accumulator moved in on entry;
 - a copy into a `recv_hold` entry's owned buffer (`own_recv_copy`);
-- TLS plaintext the unbuffered engine queues before the connection has a
-  receive destination;
+- TLS plaintext the unbuffered engine stashes when the send path decrypts
+  it;
 - the threshold helper.
 
-The hold-cap copy is counted through `append` and `reclaim`. TLS ciphertext staging is not
-counted; it is the same for both readers.
+The hold-cap copy is counted through `append` and `reclaim`. TLS ciphertext
+staging is not counted; it is the same for both readers.
 
 The 2026-10-08 decision asked for a count of buffers held by views. These
 counters count views, and several views of one buffer count several times. A

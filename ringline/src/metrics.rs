@@ -327,8 +327,8 @@ pub mod recv_ring {
     /// Bytes copied into receive storage, on both backends: appended to or
     /// merged in a connection's accumulator (with the bytes a reallocation
     /// moves), prepended to it, or copied into an owned `segment_hold` entry
-    /// or an owned `recv_hold` copy, and TLS plaintext queued before the
-    /// connection has a receive destination. Ciphertext staged for TLS is
+    /// or an owned `recv_hold` copy, and TLS plaintext the unbuffered engine
+    /// stashes when the send path decrypts it. Ciphertext staged for TLS is
     /// not counted.
     pub const BYTES_COPIED: usize = 8;
     pub const COUNT: usize = 9;
@@ -434,9 +434,12 @@ pub mod pool {
     /// here, which is why this one exists.
     ///
     /// Entering the segmented domain adopts what is already buffered, so a
-    /// non-zero count means some path reached segmented delivery without
-    /// adopting. The adoption keeps a live system correct; the count is how
-    /// you find out it happened.
+    /// non-zero count means bytes reached the accumulator after entry. One
+    /// known way is a `RecvOwnedSegment` future made before a
+    /// `with_bytes_segments` call whose hold-cap copy left bytes there, and
+    /// polled after it. Any other is a path that reached segmented delivery
+    /// without adopting. The adoption keeps a live system correct; the count
+    /// is how you find out it happened.
     pub const SEGMENT_STRANDED_ADOPTED: usize = 7;
     /// A zero-copy send (`SendMsgZc`) returned `-ENOMEM`, and the rest of
     /// that send went out as plain `send`s. On Linux the usual cause is

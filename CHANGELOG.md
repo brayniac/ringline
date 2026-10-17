@@ -25,22 +25,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `RecvArrival`: when the first and the last byte consumed by the
   connection's most recent reader call arrived. The reader calls are
   `with_data`, `with_data_result`, `with_bytes`, `with_bytes_segments`,
-  `try_with_data` and, on io_uring, `with_segments`. An arrival time is the time of the batch in
-  which the worker handled the receive that delivered the byte: one pass
-  over the reaped completions on io_uring, or over the readable sockets on
-  mio. Each TCP connection keeps a log of arrival times against stream
-  offsets, of at most 1024 entries of 24 bytes. The `ringline/recv_arrival`
-  metric group counts lookups outside the log and merges at the cap. The
-  log is always on, at an estimated 1–3% of server CPU per request: in an
-  A/B of a 64-byte echo server with an earlier version of the lookup, the
-  median paired rise in server CPU per request was 1.3% to 3.0% in three
-  of four closed-loop cells, at 4,096 connections through lower throughput
-  at about the same server CPU time. In the open-loop 4,096-connection
-  cell, where that difference would have read as about +2%, it measured
-  +0.2%. With the current lookup, paired runs at one cell gave a median
-  of +0.4%, too spread to exclude 2.5%, and a profile attributes 0.3–0.4%
-  of the server's samples to the log's own functions. See
-  `docs/recv-arrival-times-design.md`.
+  `try_with_data` and, on io_uring, `with_segments`. An arrival time is the
+  time of the batch in which the worker handled the receive that delivered
+  the byte: one pass over the reaped completions on io_uring, or over the
+  readable sockets on mio. Each TCP connection keeps a log of arrival times
+  against stream offsets, of at most 1024 entries of 24 bytes. The
+  `ringline/recv_arrival` metric group counts lookups outside the log and
+  merges at the cap. The log is always on, at an estimated 1–3% of server
+  CPU per request: in an A/B of a 64-byte echo server with an earlier
+  version of the lookup, the median paired rise in server CPU per request
+  was 1.3% to 3.0% in three of four closed-loop cells, at 4,096 connections
+  through lower throughput at about the same server CPU time. In the
+  open-loop 4,096-connection cell, where that difference would have read as
+  about +2%, it measured +0.2%. With the current lookup, paired runs at one
+  cell gave a median of +0.4%, too spread to exclude 2.5%, and a profile
+  attributes 0.3–0.4% of the server's samples to the log's own functions.
+  See `docs/recv-arrival-times-design.md`.
 - `ringline-redis`, `ringline-memcache`, `ringline-ping`:
   `CommandResult::ttlb_ns`, the time from the operation's start to the
   arrival of the response's last byte.
@@ -131,17 +131,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `Connection::with_bytes_segments` and `RecvHalf::with_bytes_segments`, on
   both backends, hand a parser the connection's buffered bytes as `&[Bytes]`
   and take a `ParseResult`, for parsers that parse a message split across
-  pieces and return a value inside one piece as a slice of it. On io_uring the call enters the segmented receive
-  domain and presents each held receive buffer as a `Bytes` view of the
-  ring buffer, so a value inside one buffer is not copied; a view the caller
-  keeps holds its whole buffer until it drops. After `NeedAtLeast(n)` the
-  parser is not called again until `n` more bytes are buffered. When the
-  hold reaches the receive throttle's cap with the message incomplete, the
-  held bytes are copied into the accumulator. The call resolves to
-  `Err(EBUSY)` while a forward or a `SegmentReader` owns the connection, or
-  when another reader consumed bytes or `end_segments` ran since it last
-  parked. On mio the parser is shown the accumulator as one piece. Reported
-  by `recv_arrival`.
+  pieces and return a value inside one piece as a slice of it. On io_uring
+  the call enters the segmented receive domain and presents each held
+  receive buffer as a `Bytes` view of the ring buffer, so a value inside one
+  buffer is not copied; a view the caller keeps holds its whole buffer until
+  it drops. After `NeedAtLeast(n)` the parser is not called again until `n`
+  more bytes are buffered. When the hold reaches the receive throttle's cap
+  with the message incomplete, the held bytes are copied into the
+  accumulator. The call resolves to `Err(EBUSY)` while a forward or a
+  `SegmentReader` owns the connection, or when, since it last parked,
+  another reader consumed bytes or the connection left the segmented domain.
+  On mio the parser is shown the accumulator as one piece. Reported by
+  `recv_arrival`.
 - `Connection::end_segments` and `RecvHalf::end_segments` exist on mio,
   where they return `Ok(())`.
 - `metrics::recv_ring::HOLD_CAP_COPIED` counts held entries

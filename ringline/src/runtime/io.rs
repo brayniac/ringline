@@ -3896,9 +3896,9 @@ impl Connection {
     ///
     /// For a segment parser: one that parses a message split across pieces
     /// and returns a value inside one piece as a slice of it. The parser
-    /// returns a
-    /// [`ParseResult`] for the bytes consumed from the front of the pieces,
-    /// as a [`with_bytes`](Self::with_bytes) parser does for its one `Bytes`.
+    /// returns a [`ParseResult`] for the bytes consumed from the front of the
+    /// pieces, as a [`with_bytes`](Self::with_bytes) parser does for its one
+    /// `Bytes`.
     ///
     /// On io_uring the call puts the connection in the segmented receive
     /// domain, where each completion's buffer is held in place. Each held
@@ -3931,9 +3931,10 @@ impl Connection {
     /// - `Ok(0)` at end of stream, for a stale handle, or after the
     ///   connection is closed because the buffered bytes exceed
     ///   `recv_accumulator_max`;
-    /// - `Err(EBUSY)` when another reader consumed bytes, or `end_segments`
-    ///   ran, since the future last parked; call again to read with the
-    ///   connection's current state;
+    /// - `Err(EBUSY)` when, since the future last parked, another reader
+    ///   consumed bytes or the connection left the segmented domain
+    ///   (`end_segments`, a forward ending, a `SegmentReader` dropping); call
+    ///   again to read with the connection's current state;
     /// - `Err(EBUSY)` while a forward runs or a `SegmentReader` is live. A
     ///   new call also resolves to `Err(EBUSY)`, without waiting, until the
     ///   forward ends or the reader drops.
@@ -3948,9 +3949,9 @@ impl Connection {
     /// [`with_bytes_segments`](Self::with_bytes_segments) or another
     /// segmented reader.
     ///
-    /// On io_uring the held bytes no reader has consumed are copied, in
-    /// order, to the front of the accumulator, where the next `with_data` or
-    /// `with_bytes` call reads them first. If that copy would exceed
+    /// On io_uring the held bytes no reader has consumed are appended, in
+    /// order, behind any bytes already in the accumulator, and the next
+    /// `with_data` or `with_bytes` call reads them in that order. If that copy would exceed
     /// `recv_accumulator_max`, the connection is closed and an `OutOfMemory`
     /// error returned; for a stale handle the error is `EPIPE`.
     ///
@@ -4513,8 +4514,11 @@ impl Drop for SegmentReader<'_> {
 /// panic; asserting here would contradict that.)
 ///
 /// `enter_segmented_domain` adopts on entry, so a non-zero
-/// `SEGMENT_STRANDED_ADOPTED` means bytes were stranded *after* entry and this
-/// path is the only reason the connection kept working.
+/// `SEGMENT_STRANDED_ADOPTED` means bytes reached the accumulator *after*
+/// entry. One known way is a `RecvOwnedSegment` future made before a
+/// `with_bytes_segments` call whose hold-cap copy left bytes there, and
+/// polled after it; any other is a path that strands bytes, and this
+/// adoption is the only reason the connection kept working.
 #[cfg(has_io_uring)]
 fn adopt_stranded_accumulator(driver: &mut Driver, conn: u32) {
     if driver.accumulators.is_empty(conn) {
@@ -4564,7 +4568,7 @@ fn enter_segmented(
     // segmented domain through the `ConnCtx` path behind its back is
     // the mixing this design exists to stop, so refuse it wherever the
     // signature can say so. (`with_data` and friends still cannot
-    // report it; step 3 of `docs/connection-handle-ownership-design.md`
+    // report it; step 4 of `docs/connection-handle-ownership-design.md`
     // removes that.)
     //
     // `ViaHalf` is exempt: the half holds this claim by construction,
@@ -5748,17 +5752,21 @@ impl<F: FnMut(&[Bytes]) -> ParseResult + Unpin> WithBytesSegmentsFuture<F> {
     ) -> Poll<io::Result<usize>> {
         let conn = self.conn_index;
         let idx = conn as usize;
+        let finished = driver
+            .connections
+            .get(conn)
+            .is_none_or(|c| c.recv_finished());
+        // Once the receive side has finished, `recv_consumed` can also rise
+        // without a reader: a read past `recv_accumulator_max` is recorded,
+        // then dropped as the connection closes. Mio has no domain for
+        // another reader to take, so the check is skipped then.
         if driver.forward_conn[idx].is_some()
-            || (self.entered && driver.recv_consumed(conn) != self.consumed)
+            || (self.entered && !finished && driver.recv_consumed(conn) != self.consumed)
         {
             return self.busy();
         }
         self.entered = true;
 
-        let finished = driver
-            .connections
-            .get(conn)
-            .is_none_or(|c| c.recv_finished());
         let total = driver.accumulators.len(conn);
         if total == 0 {
             if finished {

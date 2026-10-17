@@ -2716,6 +2716,38 @@ mod tests {
         }
     }
 
+    /// A read past `recv_accumulator_max` closes the connection while a call
+    /// is parked; the call resolves to `Ok(0)`, not `EBUSY`, although the
+    /// dropped bytes were recorded as delivered.
+    #[test]
+    fn bytes_segments_resolves_to_zero_after_an_accumulator_overflow_on_mio() {
+        use crate::runtime::io::ParseResult;
+        let config = ConfigBuilder::new()
+            .workers(1)
+            .pin_to_core(false)
+            .max_connections(16)
+            .send_pool(4, 64)
+            .no_fs()
+            .recv_accumulator_max(16384)
+            .build()
+            .expect("valid test config");
+        let (mut el, _wake) = test_loop(&config);
+        let (conn_index, _peer) = attach_conn(&mut el.driver);
+        let ctx = crate::ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        deliver(&mut el, conn_index, &[0u8; 16000]);
+        let mut fut =
+            std::pin::pin!(ctx.with_bytes_segments(|_| ParseResult::NeedAtLeast(1 << 20)));
+        assert!(poll_in(&mut el, fut.as_mut()).is_pending());
+
+        // What the read path does with a read the accumulator cannot take.
+        el.driver.record_arrival(conn_index, 1000);
+        assert!(!el.driver.accumulators.append(conn_index, &[0u8; 1000]));
+        el.driver.close_connection(conn_index);
+
+        let poll = poll_in(&mut el, fut.as_mut());
+        assert!(matches!(poll, std::task::Poll::Ready(Ok(0))), "{poll:?}");
+    }
+
     /// `end_segments` on mio returns `Ok(())`, for a stale handle too.
     #[test]
     fn end_segments_on_mio_returns_ok() {
