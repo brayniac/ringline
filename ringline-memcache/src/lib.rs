@@ -553,6 +553,7 @@ impl ClientBuilder {
             max_in_flight,
             zc_threshold,
             binary: false,
+            segmented: None,
             buffered_ops: 0,
             encode_buf: Vec::new(),
             #[cfg(feature = "metrics")]
@@ -599,6 +600,12 @@ pub struct Client {
     zc_threshold: u32,
     /// Use the Memcache binary protocol (framing + parsing) instead of ASCII.
     binary: bool,
+    /// Whether to read text-protocol replies with `with_bytes_segments`,
+    /// decided on the first read (the query needs the worker's driver).
+    /// `false` on a TLS connection, whose plaintext is copied out of the TLS
+    /// engine anyway: it reads with `with_bytes`, which copies it once into
+    /// the accumulator.
+    segmented: Option<bool>,
     /// Number of ops buffered in `write_buf` that have not yet been flushed.
     buffered_ops: usize,
     /// Reusable scratch buffer for encoding requests. Cleared before each
@@ -628,6 +635,7 @@ impl Client {
             max_in_flight: usize::MAX,
             zc_threshold: DEFAULT_ZC_THRESHOLD,
             binary: false,
+            segmented: None,
             buffered_ops: 0,
             encode_buf: Vec::new(),
             #[cfg(feature = "metrics")]
@@ -1149,6 +1157,10 @@ impl Client {
     /// instrumented client, their arrival times.
     async fn read_reply(&mut self) -> Reply<McResponseBytes> {
         let mut result: Option<Result<McResponseBytes, Error>> = None;
+        let segmented = !self.binary
+            && *self
+                .segmented
+                .get_or_insert_with(|| self.tx.tls_info().is_none());
         let n = if self.binary {
             self.rx
                 .with_bytes(|bytes| {
@@ -1159,6 +1171,27 @@ impl Client {
                             ParseResult::Consumed(consumed)
                         }
                         Ok(None) => ParseResult::Consumed(0),
+                        Err(e) => {
+                            result = Some(Err(Error::Protocol(e)));
+                            ParseResult::Consumed(len)
+                        }
+                    }
+                })
+                .await
+        } else if !segmented {
+            self.rx
+                .with_bytes(|bytes| {
+                    let len = bytes.len();
+                    let hint = value_remainder_hint(std::slice::from_ref(&bytes), len);
+                    match McResponseBytes::parse(bytes) {
+                        Ok((response, consumed)) => {
+                            result = Some(Ok(response));
+                            ParseResult::Consumed(consumed)
+                        }
+                        Err(e) if e.is_incomplete() => match hint {
+                            Some(additional) => ParseResult::NeedAtLeast(additional),
+                            None => ParseResult::Consumed(0),
+                        },
                         Err(e) => {
                             result = Some(Err(Error::Protocol(e)));
                             ParseResult::Consumed(len)
@@ -1213,8 +1246,8 @@ impl Client {
         let mut r = result.unwrap();
         // After the read, not in the parser: `copy_small_view` reaches the
         // worker's driver, which the reader holds while the parser runs.
-        // Binary replies are slices of the accumulator, never views.
-        if let (false, Ok(response)) = (self.binary, &mut r) {
+        // Binary and TLS replies are slices of the accumulator, never views.
+        if let (true, Ok(response)) = (segmented, &mut r) {
             copy_small_views(response, ringline::recv_zc_threshold());
         }
         if matches!(r, Err(Error::Protocol(_))) {

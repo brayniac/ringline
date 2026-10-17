@@ -21538,8 +21538,8 @@ mod tests {
 
     /// At the hold cap the parser is called although its `NeedAtLeast` is
     /// not met. An incomplete parse copies the hold into the accumulator,
-    /// the receive re-arms, and the next parse presents the accumulator
-    /// first.
+    /// the receive re-arms, and the next arrival is copied after it, so the
+    /// next parse sees the message as one piece.
     #[test]
     fn bytes_segments_at_the_hold_cap_copies_an_incomplete_message() {
         let mut el = make_test_loop();
@@ -21583,12 +21583,61 @@ mod tests {
         );
 
         deliver_segment(&mut el, conn_index, cap as u16, b"zz");
+        let copied = hold_cap_copied();
         assert_eq!(ready_ok(poll_in(&mut el, fut.as_mut())), want);
+        assert_eq!(hold_cap_copied() - copied, 1, "the arrival is copied");
         let last = seen.borrow().last().cloned().expect("a third call");
-        let front: Vec<u8> = (0..cap)
+        let mut message: Vec<u8> = (0..cap)
             .flat_map(|i| format!("m{i}").into_bytes())
             .collect();
-        assert_eq!(last, vec![front, b"zz".to_vec()]);
+        message.extend_from_slice(b"zz");
+        assert_eq!(last, vec![message]);
+        assert!(el.driver.pending_replenish.contains(&(cap as u16)));
+    }
+
+    /// The copying after a hold-cap copy ends with the call: the next call
+    /// presents its arrivals as views after the accumulator's remainder.
+    #[test]
+    fn bytes_segments_after_a_hold_cap_copy_the_next_call_reads_views() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
+        let cap = fill_to_hold_cap(&mut el, conn_index, b"ab");
+        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        let message = 2 * cap + 2;
+        let mut fut = std::pin::pin!(ctx.with_bytes_segments(move |pieces| {
+            let total: usize = pieces.iter().map(Bytes::len).sum();
+            if total < message {
+                ParseResult::NeedMore
+            } else {
+                ParseResult::Consumed(message)
+            }
+        }));
+        assert!(poll_in(&mut el, fut.as_mut()).is_pending());
+        // The message's last two bytes and the start of the next one.
+        deliver_segment(&mut el, conn_index, cap as u16, b"zzNE");
+        assert_eq!(ready_ok(poll_in(&mut el, fut.as_mut())), message);
+        assert_eq!(el.driver.accumulators.len(conn_index), 2);
+
+        deliver_segment(&mut el, conn_index, cap as u16 + 1, b"XT");
+        let seen: Rc<RefCell<Vec<Bytes>>> = Rc::default();
+        let seen_cb = Rc::clone(&seen);
+        let mut fut = std::pin::pin!(ctx.with_bytes_segments(move |pieces| {
+            seen_cb.borrow_mut().extend(pieces.iter().cloned());
+            ParseResult::Consumed(4)
+        }));
+        assert_eq!(ready_ok(poll_in(&mut el, fut.as_mut())), 4);
+        let seen = std::mem::take(&mut *seen.borrow_mut());
+        assert_eq!(seen.len(), 2);
+        assert_eq!(&seen[0][..], b"NE");
+        assert_eq!(&seen[1][..], b"XT");
+        assert_eq!(
+            seen[1].as_ptr(),
+            el.driver.provided_bufs.data_ptr(cap as u16 + 1, 0),
+            "a view"
+        );
+        with_driver_state(&mut el, || drop(seen));
+        release_views(&mut el);
     }
 
     /// Fill `conn_index`'s hold to its cap with one `data` entry per buffer,
@@ -21616,7 +21665,7 @@ mod tests {
         let cap = fill_to_hold_cap(&mut el, conn_index, b"ab");
         let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
         let mut fut = std::pin::pin!(ctx.with_bytes_segments(|pieces| {
-            if pieces.last().is_some_and(|p| p[..] == b"zz"[..]) {
+            if pieces.last().is_some_and(|p| p.ends_with(b"zz")) {
                 ParseResult::Consumed(3)
             } else {
                 ParseResult::NeedMore
@@ -22023,7 +22072,7 @@ mod tests {
         assert!(el.driver.segment_at_hold_cap(conn_index));
         let mut fut = std::pin::pin!(ctx.with_bytes_segments(|pieces| {
             let total: usize = pieces.iter().map(Bytes::len).sum();
-            if pieces.len() > 1 && pieces[1][..] == b"zz"[..] {
+            if pieces.last().is_some_and(|p| p.ends_with(b"zz")) {
                 ParseResult::Consumed(total)
             } else {
                 ParseResult::NeedMore

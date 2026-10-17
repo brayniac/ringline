@@ -1778,7 +1778,10 @@ dependencies = [
  "itoa",
  "ketama",
  "memcache-proto",
+ "rcgen",
  "ringline",
+ "rustls",
+ "rustls-pki-types",
  "thiserror",
 ]
 
@@ -1815,8 +1818,11 @@ dependencies = [
  "histogram 0.11.5",
  "itoa",
  "ketama",
+ "rcgen",
  "resp-proto",
  "ringline",
+ "rustls",
+ "rustls-pki-types",
  "thiserror",
 ]
 

@@ -14,18 +14,23 @@ mod common;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use ringline::metrics::{RECV_RING, recv_ring};
 use ringline::{
-    AsyncEventHandler, Config, ConfigBuilder, Connection, ParseResult, RinglineBuilder,
+    AsyncEventHandler, Config, ConfigBuilder, Connection, ParseResult, RinglineBuilder, TlsConfig,
 };
 use ringline_memcache::{Client, CompletedOp};
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 /// 64 buffers of 4 KiB: a 16 KiB value spans four buffers, and the hold cap
 /// (a quarter of the ring) is 64 KiB. A reserve of 8 lets the ring lend
 /// buffers as views; at the default of 64 every completion is copied.
 fn test_config() -> Config {
+    test_config_builder().build().expect("valid config")
+}
+
+fn test_config_builder() -> ConfigBuilder {
     ConfigBuilder::new()
         .workers(1)
         .pin_to_core(false)
@@ -34,8 +39,6 @@ fn test_config() -> Config {
         .recv_segment_reserve(8)
         .max_connections(16)
         .send_pool(128, 16384)
-        .build()
-        .expect("valid config")
 }
 
 const SIZES: [usize; 8] = [0, 1, 100, 3000, 4096, 16 * 1024, 70 * 1024, 200 * 1024];
@@ -120,6 +123,8 @@ impl AsyncEventHandler for StubServer {
 
 static SERVER_ADDR: OnceLock<SocketAddr> = OnceLock::new();
 static RESULT: OnceLock<Result<(), String>> = OnceLock::new();
+static TLS_SERVER_ADDR: OnceLock<SocketAddr> = OnceLock::new();
+static TLS_RESULT: OnceLock<Result<(), String>> = OnceLock::new();
 
 struct ClientHandler;
 
@@ -132,13 +137,42 @@ impl AsyncEventHandler for ClientHandler {
     fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
         let addr = *SERVER_ADDR.get().expect("server addr");
         Some(Box::pin(async move {
-            RESULT.set(run(addr).await).ok();
+            let result = match ringline::connect(addr).await {
+                Ok(conn) => run(conn, false).await,
+                Err(e) => Err(format!("connect: {e}")),
+            };
+            RESULT.set(result).ok();
             ringline::request_shutdown().ok();
         }))
     }
 
     fn create_for_worker(_id: usize) -> Self {
         ClientHandler
+    }
+}
+
+struct TlsClientHandler;
+
+impl AsyncEventHandler for TlsClientHandler {
+    #[allow(clippy::manual_async_fn)]
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
+        async {}
+    }
+
+    fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        let addr = *TLS_SERVER_ADDR.get().expect("server addr");
+        Some(Box::pin(async move {
+            let result = match ringline::connect(addr).tls("localhost").await {
+                Ok(conn) => run(conn, true).await,
+                Err(e) => Err(format!("connect: {e}")),
+            };
+            TLS_RESULT.set(result).ok();
+            ringline::request_shutdown().ok();
+        }))
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        TlsClientHandler
     }
 }
 
@@ -150,10 +184,7 @@ fn check(len: usize, got: Option<&[u8]>) -> Result<(), String> {
     }
 }
 
-async fn run(addr: SocketAddr) -> Result<(), String> {
-    let conn = ringline::connect(addr)
-        .await
-        .map_err(|e| format!("connect: {e}"))?;
+async fn run(conn: Connection, tls: bool) -> Result<(), String> {
     let mut client = Client::new(conn);
 
     // One at a time. Each small value is kept until the end, so a view that
@@ -209,8 +240,9 @@ async fn run(addr: SocketAddr) -> Result<(), String> {
         check(*len, Some(&value.data))?;
     }
 
-    // A reply that fits one buffer is one view, so each key and each
-    // non-empty value shorter than the threshold is copied out of it.
+    // Over plaintext a reply that fits one buffer is one view, so each key
+    // and each non-empty value shorter than the threshold is copied out of
+    // it. Over TLS the reply is a slice of the accumulator.
     let small = [0usize, 1, 100, 3000];
     let keys: Vec<Vec<u8>> = small.iter().map(|&len| key_of(len)).collect();
     let key_refs: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
@@ -223,7 +255,7 @@ async fn run(addr: SocketAddr) -> Result<(), String> {
     for (len, value) in small.iter().zip(&values) {
         check(*len, Some(&value.data))?;
     }
-    let want = if cfg!(has_io_uring) { 4 + 3 } else { 0 };
+    let want = if cfg!(has_io_uring) && !tls { 4 + 3 } else { 0 };
     if copied != want {
         return Err(format!("small gets: {copied} copies, want {want}"));
     }
@@ -284,5 +316,62 @@ fn values_of_every_size_read_through_segment_views() {
         assert_eq!(threshold_copied, 0);
         assert_eq!(hold_cap_copied, 0);
         assert_eq!(parse_copied, 0);
+    }
+
+    // TLS connections read with `with_bytes`: plaintext is copied into the
+    // accumulator and sliced, with no views and no parser copies.
+    let threshold_copied = count(recv_ring::THRESHOLD_COPIED);
+    let parse_copied = count(recv_ring::SEGMENT_PARSE_COPIED);
+    let views = count(recv_ring::VIEW_CREATED);
+    run_tls();
+    assert_eq!(count(recv_ring::THRESHOLD_COPIED) - threshold_copied, 0);
+    assert_eq!(count(recv_ring::SEGMENT_PARSE_COPIED) - parse_copied, 0);
+    assert_eq!(count(recv_ring::VIEW_CREATED) - views, 0);
+}
+
+/// Runs the same client against the stub server behind TLS.
+fn run_tls() {
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let key: PrivateKeyDer<'static> =
+        PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()).into();
+    let certs = vec![CertificateDer::from(cert.cert)];
+    let server = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs.clone(), key)
+        .unwrap();
+    let (s_shutdown, s_handles) = RinglineBuilder::new(
+        test_config_builder()
+            .tls(TlsConfig::new(Arc::new(server)))
+            .build()
+            .expect("valid config"),
+    )
+    .bind("127.0.0.1:0".parse().unwrap())
+    .launch::<StubServer>()
+    .expect("server launch failed");
+    TLS_SERVER_ADDR
+        .set(s_shutdown.bound_addr().expect("bound address"))
+        .ok();
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(certs[0].clone()).unwrap();
+    let client = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let (c_shutdown, c_handles) = RinglineBuilder::new(
+        test_config_builder()
+            .tls_client(ringline::TlsClientConfig::new(Arc::new(client)))
+            .build()
+            .expect("valid config"),
+    )
+    .launch::<TlsClientHandler>()
+    .expect("client launch failed");
+    common::join_workers(&c_shutdown, c_handles);
+
+    if let Err(e) = TLS_RESULT.get().expect("client did not set result") {
+        panic!("TLS: {e}");
+    }
+    s_shutdown.shutdown();
+    for h in s_handles {
+        h.join().unwrap().unwrap();
     }
 }

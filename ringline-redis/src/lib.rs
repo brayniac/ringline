@@ -666,6 +666,7 @@ impl ClientBuilder {
             buffered_ops: 0,
             encode_buf: Vec::new(),
             command_names,
+            segmented: None,
             #[cfg(feature = "metrics")]
             metrics: if with_metrics {
                 Some(ClientMetrics::new())
@@ -719,6 +720,11 @@ pub struct Client {
     /// sends `GET` and `SET`: resp-proto's encoders on the copy paths, and
     /// `append_set_prefix` on the guard and streaming paths.
     command_names: Option<Box<CommandNames>>,
+    /// Whether to read replies with `with_bytes_segments`, decided on the
+    /// first read (the query needs the worker's driver). `false` on a TLS
+    /// connection, whose plaintext is copied out of the TLS engine anyway: it
+    /// reads with `with_bytes`, which copies it once into the accumulator.
+    segmented: Option<bool>,
     #[cfg(feature = "metrics")]
     metrics: Option<ClientMetrics>,
 }
@@ -734,6 +740,7 @@ pub struct Client {
 pub(crate) async fn read_value_from(
     rx: &mut RecvHalf,
     tx: &mut SendHalf,
+    segmented: bool,
 ) -> (Result<Value, Error>, usize) {
     let mut result: Option<Result<Value, Error>> = None;
     // resp-proto's `parse_bytes` defaults to a 1 MiB bulk-string cap
@@ -760,6 +767,29 @@ pub(crate) async fn read_value_from(
         .max_bulk_string_len(usize::MAX)
         .max_collection_elements(MAX_COLLECTION)
         .max_total_items(MAX_COLLECTION);
+    if !segmented {
+        let n = rx
+            .with_bytes(|bytes| {
+                let len = bytes.len();
+                let hint = bulk_remainder_hint(std::slice::from_ref(&bytes), len);
+                match Value::parse_bytes_with_options(bytes, &options) {
+                    Ok((value, consumed)) => {
+                        result = Some(Ok(value));
+                        ParseResult::Consumed(consumed)
+                    }
+                    Err(e) if e.is_incomplete() => match hint {
+                        Some(additional) => ParseResult::NeedAtLeast(additional),
+                        None => ParseResult::Consumed(0),
+                    },
+                    Err(e) => {
+                        result = Some(Err(Error::Protocol(e)));
+                        ParseResult::Consumed(len)
+                    }
+                }
+            })
+            .await;
+        return finish_read(result, n, tx);
+    }
     let threshold = ringline::recv_zc_threshold();
     let n = match rx
         .with_bytes_segments(|pieces| {
@@ -797,15 +827,25 @@ pub(crate) async fn read_value_from(
             return (Err(Error::Io(e)), 0);
         }
     };
+    // After the read, not in the parser: `copy_small_view` reaches the
+    // worker's driver, which the reader holds while the parser runs.
+    if let Some(Ok(value)) = &mut result {
+        copy_small_views(value, threshold);
+    }
+    finish_read(result, n, tx)
+}
+
+/// The end of [`read_value_from`]: the result of a read that consumed `n`
+/// bytes.
+fn finish_read(
+    result: Option<Result<Value, Error>>,
+    n: usize,
+    tx: &mut SendHalf,
+) -> (Result<Value, Error>, usize) {
     if n == 0 {
         return (result.unwrap_or(Err(Error::ConnectionClosed)), n);
     }
-    // After the read, not in the parser: `copy_small_view` reaches the
-    // worker's driver, which the reader holds while the parser runs.
-    let value = result.unwrap().map(|mut value| {
-        copy_small_views(&mut value, threshold);
-        value
-    });
+    let value = result.unwrap();
     // A protocol error means the RESP framing is irrecoverably
     // misaligned (the failed parse consumed the whole accumulator,
     // possibly swallowing the fronts of pipelined responses). Close the
@@ -842,6 +882,7 @@ impl Client {
             buffered_ops: 0,
             encode_buf: Vec::new(),
             command_names: None,
+            segmented: None,
             #[cfg(feature = "metrics")]
             metrics: None,
         }
@@ -1886,7 +1927,10 @@ impl Client {
     /// [`read_value`](Self::read_value), with the bytes read and, on an
     /// instrumented client, their arrival times.
     async fn read_reply(&mut self) -> Reply<Value> {
-        let (value, n) = read_value_from(&mut self.rx, &mut self.tx).await;
+        let segmented = *self
+            .segmented
+            .get_or_insert_with(|| self.tx.tls_info().is_none());
+        let (value, n) = read_value_from(&mut self.rx, &mut self.tx, segmented).await;
         let arrival = if n > 0 && self.is_instrumented() {
             self.rx.recv_arrival()
         } else {
@@ -2943,7 +2987,12 @@ impl Client {
     /// pipeline responses are positional, and a command issued on the side
     /// would consume one of them and desync the batch.
     pub fn pipeline(&mut self) -> Pipeline<'_> {
-        Pipeline::new(&mut self.tx, &mut self.rx, self.command_names.as_deref())
+        Pipeline::new(
+            &mut self.tx,
+            &mut self.rx,
+            self.command_names.as_deref(),
+            self.segmented,
+        )
     }
 
     // ── Zero-copy SET ───────────────────────────────────────────────────
@@ -3829,16 +3878,24 @@ pub struct Pipeline<'a> {
     tx: &'a mut SendHalf,
     rx: &'a mut RecvHalf,
     names: Option<&'a CommandNames>,
+    /// See `Client::segmented`.
+    segmented: Option<bool>,
     buf: Vec<u8>,
     count: usize,
 }
 
 impl<'a> Pipeline<'a> {
-    fn new(tx: &'a mut SendHalf, rx: &'a mut RecvHalf, names: Option<&'a CommandNames>) -> Self {
+    fn new(
+        tx: &'a mut SendHalf,
+        rx: &'a mut RecvHalf,
+        names: Option<&'a CommandNames>,
+        segmented: Option<bool>,
+    ) -> Self {
         Self {
             tx,
             rx,
             names,
+            segmented,
             buf: Vec::new(),
             count: 0,
         }
@@ -3894,10 +3951,13 @@ impl<'a> Pipeline<'a> {
             return Ok(Vec::new());
         }
         self.tx.send(&self.buf)?;
+        let segmented = self
+            .segmented
+            .unwrap_or_else(|| self.tx.tls_info().is_none());
 
         let mut results = Vec::with_capacity(self.count);
         for _ in 0..self.count {
-            let value = match read_value_from(self.rx, self.tx).await.0 {
+            let value = match read_value_from(self.rx, self.tx, segmented).await.0 {
                 Ok(v) => v,
                 Err(e) => {
                     self.tx.close();
@@ -3913,7 +3973,11 @@ impl<'a> Pipeline<'a> {
                 // behaviour and is correct for pipelined Redis.)
                 let err = Error::Redis(String::from_utf8_lossy(msg).into_owned());
                 for _ in (results.len() + 1)..self.count {
-                    if read_value_from(self.rx, self.tx).await.0.is_err() {
+                    if read_value_from(self.rx, self.tx, segmented)
+                        .await
+                        .0
+                        .is_err()
+                    {
                         // *Now* the stream is broken — close.
                         self.tx.close();
                         return Err(err);

@@ -270,6 +270,14 @@ streaming reads.
   first. At end of stream the future resolves to `Ok(0)` and teardown
   releases the hold. A message that arrives in more completions than the
   hold cap completes only through this copy.
+- After that copy, each poll of the same future first copies the held
+  entries into the accumulator, so the rest of the message is appended to
+  its start and presented as one piece. Presented as views, a value that
+  spanned the copy and a view would be copied a second time, by the parser.
+  The copying ends when the future resolves, on the first `Consumed`, so on
+  a pipelined connection it covers the message that reached the cap and the
+  bytes that arrived with its end; the next call presents later arrivals as
+  views after the accumulator's remainder.
 - Before the copy, `AccumulatorTable::reclaim` reclaims the frozen remainder
   (`unfreeze` with nothing appended, recovering the allocation with
   `try_into_mut`). That costs nothing once the presented clone and any slice
@@ -552,7 +560,8 @@ is zeroed eagerly, which would make the whole ring resident at startup.
 - At the hold cap, a parser that reported `NeedAtLeast` is still called;
   complete messages in the hold are consumed without a copy; an incomplete
   parse copies the hold into the accumulator and parks, and the receive
-  re-arms.
+  re-arms. Later arrivals are copied after it until the call resolves, and
+  the next call reads views.
 - A message whose completions are partly lent and partly refused (`Pinned`
   and `Owned` entries) parses in order and completes.
 - `end_segments` with entries held, then `with_bytes`, sees the held bytes
@@ -650,9 +659,9 @@ is zeroed eagerly, which would make the whole ring resident at startup.
      sizes 64 B, 4 KiB, 64 KiB and 1 MiB, 64 to 10,000 connections,
      pipelined and not. With the default 16 KiB buffers a 64 KiB or 1 MiB
      value always spans buffers, so the parser copies it and the switch
-     saves no copy at 64 KiB. A 1 MiB value is longer than the hold cap, so
-     the runtime copies it into the accumulator and the parser copies it
-     again: one copy more than build A.
+     saves no copy at 64 KiB or 1 MiB. A 1 MiB value is longer than the
+     hold cap, so the runtime copies it into the accumulator, where the
+     parser slices it, as in build A.
    - Recorded: throughput; p50, p99 and p999 at fixed offered load; RSS;
      bytes received; bytes copied (`BYTES_COPIED`, and
      `SEGMENT_PARSE_COPIED`, the bytes of values the parser copied because

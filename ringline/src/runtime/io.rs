@@ -1670,6 +1670,8 @@ impl ConnCtx {
             epoch: 0,
             consumed: 0,
             call_at: None,
+            #[cfg(has_io_uring)]
+            absorbing: false,
         }
     }
 
@@ -3917,7 +3919,9 @@ impl Connection {
     /// until `n` more bytes are buffered, the receive side finishes, or, on
     /// io_uring, the hold reaches the receive throttle's cap. At the cap an
     /// incomplete parse copies the held bytes into the accumulator, so a
-    /// message longer than the cap still completes.
+    /// message longer than the cap still completes. Until the call resolves,
+    /// bytes that arrive after that copy are copied to the accumulator too,
+    /// so the message is presented as one piece.
     ///
     /// The connection stays in the segmented domain after the future
     /// resolves. Call [`end_segments`](Self::end_segments) before reading
@@ -5636,6 +5640,11 @@ pub struct WithBytesSegmentsFuture<F> {
     /// After `NeedAtLeast(n)`, the buffered byte count at which the parser
     /// is called again: the bytes it was shown plus `n`.
     call_at: Option<usize>,
+    /// Set by a hold-cap copy. Each later poll first copies the held entries
+    /// into the accumulator, so the rest of the message is presented in the
+    /// same piece as its start. Ends with the future.
+    #[cfg(has_io_uring)]
+    absorbing: bool,
 }
 
 impl<F: FnMut(&[Bytes]) -> ParseResult + Unpin> Future for WithBytesSegmentsFuture<F> {
@@ -5733,6 +5742,18 @@ impl<F: FnMut(&[Bytes]) -> ParseResult + Unpin> WithBytesSegmentsFuture<F> {
                 .get(conn)
                 .is_none_or(|c| c.recv_finished())
         };
+        // After a hold-cap copy, the rest of the message is copied to the
+        // accumulator as it arrives. Presented as views after the copy, a
+        // value that spanned the copy and a view would be copied a second
+        // time, by the parser.
+        if self.absorbing
+            && !driver.segment_hold[idx].is_empty()
+            && !finished(driver)
+            && !copy_hold_to_accumulator(driver, conn, 0)
+        {
+            driver.close_connection(conn);
+            return self.resolve(Ok(0));
+        }
         let acc_len = driver.accumulators.len(conn);
         let total = acc_len
             + driver.segment_hold[idx]
@@ -5824,12 +5845,12 @@ impl<F: FnMut(&[Bytes]) -> ParseResult + Unpin> WithBytesSegmentsFuture<F> {
         if finished(driver) {
             return self.resolve(Ok(0));
         }
-        if driver.segment_at_hold_cap(conn)
-            && !driver.segment_hold[idx].is_empty()
-            && !copy_hold_to_accumulator(driver, conn, need)
-        {
-            driver.close_connection(conn);
-            return self.resolve(Ok(0));
+        if driver.segment_at_hold_cap(conn) && !driver.segment_hold[idx].is_empty() {
+            if !copy_hold_to_accumulator(driver, conn, need) {
+                driver.close_connection(conn);
+                return self.resolve(Ok(0));
+            }
+            self.absorbing = true;
         }
         self.park(driver, executor)
     }

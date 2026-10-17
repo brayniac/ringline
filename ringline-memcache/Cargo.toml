@@ -37,3 +37,6 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 ringline = { workspace = true, features = ["testing"] }
+rcgen = { workspace = true }
+rustls = { workspace = true, features = ["ring", "std"] }
+rustls-pki-types = { workspace = true }
