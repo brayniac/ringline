@@ -3938,9 +3938,11 @@ impl Connection {
     /// - `Err(EBUSY)` while a forward runs or a `SegmentReader` is live. A
     ///   new call also resolves to `Err(EBUSY)`, without waiting, until the
     ///   forward ends or the reader drops;
-    /// - `Err(EBUSY)` on io_uring for a connection with
-    ///   [`enable_recv_forward`](RecvHalf::enable_recv_forward) on, whose
-    ///   bytes go to the `forward_held` hold.
+    /// - `Err(EBUSY)` on io_uring, for the life of the connection, once
+    ///   [`enable_recv_forward`](RecvHalf::enable_recv_forward) has been
+    ///   called: its bytes are held for `forward_held`, which this reader
+    ///   does not read. On mio `enable_recv_forward` does nothing and this
+    ///   call reads normally.
     pub fn with_bytes_segments<F>(&mut self, f: F) -> WithBytesSegmentsFuture<F>
     where
         F: FnMut(&[Bytes]) -> ParseResult,
@@ -4520,10 +4522,10 @@ impl Drop for SegmentReader<'_> {
 ///
 /// `enter_segmented_domain` adopts on entry, so a non-zero
 /// `SEGMENT_STRANDED_ADOPTED` means bytes reached the accumulator *after*
-/// entry. The known ways are a `RecvOwnedSegment` future made before a
-/// `with_bytes_segments` hold-cap copy or a `with_segments` under-drain that
-/// left bytes there, and polled after it. Any other is a path that strands
-/// bytes, and this adoption is the only reason the connection kept working.
+/// entry. The known ways are a `RecvOwnedSegment` future created before one
+/// of these and polled after it: a `with_bytes_segments` hold-cap copy, or a
+/// `with_segments` under-drain. Any other is a path that strands bytes, and
+/// this adoption is the only reason the connection kept working.
 #[cfg(has_io_uring)]
 fn adopt_stranded_accumulator(driver: &mut Driver, conn: u32) {
     if driver.accumulators.is_empty(conn) {

@@ -214,14 +214,17 @@ mio path follows the io_uring reader:
 - it applies the `NeedAtLeast` skip;
 - a stale handle resolves to `Ok(0)`;
 - while a forward runs it resolves to `Err(EBUSY)`;
-- a later poll resolves to `Err(EBUSY)` when `Driver::recv_consumed`
-  changed since the previous poll: another reader or a forward consumed
-  accumulator bytes. The mio read path records a read before it appends it,
-  so bytes it drops past `recv_accumulator_max` are counted in a
-  per-connection `recv_dropped`, which `recv_consumed` subtracts. Mio has no
-  domain to leave, so it has no `segment_epoch`.
+- a later poll resolves to `Err(EBUSY)` when `Driver::recv_consumed` changed
+  since the previous poll: another reader or a forward consumed accumulator
+  bytes. The mio plaintext read path records a read before it appends it, so
+  bytes it drops past `recv_accumulator_max` are counted in a per-connection
+  `recv_dropped`, which `recv_consumed` subtracts. Mio has no domain to
+  leave, so it has no `segment_epoch`;
+- `enable_recv_forward` does nothing on mio, so there is no recv-forward
+  refusal.
 
-A client crate calls one method on both backends and gets the same errors.
+A client crate calls one method on both backends and gets the same errors,
+except the io_uring refusal of a recv-forward connection.
 
 The connection stays in the segmented domain after the future resolves;
 `end_segments` returns it to the default domain. On mio `end_segments`
