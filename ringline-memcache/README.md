@@ -3,8 +3,8 @@
 **ringline-native Memcache client.**
 
 A Memcache ASCII protocol client built on [`ringline::ConnCtx`](https://docs.rs/ringline)
-for use inside the ringline async runtime. Single-threaded, single-connection,
-zero-copy recv.
+for use inside the ringline async runtime. Single-threaded, single-connection. On
+io_uring a value inside one receive buffer is returned without a copy.
 
 ## Quick Start
 
@@ -35,7 +35,7 @@ async fn example(conn: ConnCtx) -> Result<(), ringline_memcache::Error> {
 
 | Path | Copies | Mechanism |
 |------|--------|-----------|
-| **Recv (values)** | **0** | `with_bytes()` + `ResponseBytes::parse()`. Keys and values are `Bytes::slice()` references into the accumulator -- zero allocation, O(1) refcount. |
+| **Recv (values)** | 0 to 2 | `with_bytes_segments()` + `ResponseBytes::parse_segments()`. See the crate documentation's copy semantics. |
 | **Send (commands)** | 1 | Serialized into `Vec<u8>`, then copied into the send pool. |
 | **Send (SET value, guard)** | 0 (value) | `set_with_guard`: prefix+suffix copied to pool, value stays in-place via `SendGuard`. |
 

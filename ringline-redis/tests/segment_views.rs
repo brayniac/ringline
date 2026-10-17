@@ -49,23 +49,46 @@ fn key_of(len: usize) -> Vec<u8> {
     format!("k:{len}").into_bytes()
 }
 
-/// `GET k:<n>` gets an `n`-byte bulk string.
-fn reply(items: &[Value]) -> Vec<u8> {
-    let len = match items {
-        [Value::BulkString(verb), Value::BulkString(key)] if verb.eq_ignore_ascii_case(b"GET") => {
-            std::str::from_utf8(key)
-                .ok()
-                .and_then(|k| k.strip_prefix("k:"))
-                .and_then(|n| n.parse::<usize>().ok())
-        }
-        _ => None,
-    };
-    let Some(len) = len else {
-        return b"-ERR unknown\r\n".to_vec();
-    };
-    let mut out = format!("${len}\r\n").into_bytes();
+/// The length a key `k:<n>` names.
+fn len_of(key: &[u8]) -> Option<usize> {
+    std::str::from_utf8(key)
+        .ok()?
+        .strip_prefix("k:")?
+        .parse()
+        .ok()
+}
+
+fn bulk(len: usize, out: &mut Vec<u8>) {
+    out.extend_from_slice(format!("${len}\r\n").as_bytes());
     out.extend_from_slice(&value_of(len));
     out.extend_from_slice(b"\r\n");
+}
+
+/// `GET k:<n>` gets an `n`-byte bulk string, `MGET` an array of them, and
+/// `SET` `+OK`.
+fn reply(items: &[Value]) -> Vec<u8> {
+    let mut out = Vec::new();
+    match items {
+        [Value::BulkString(verb), Value::BulkString(key)] if verb.eq_ignore_ascii_case(b"GET") => {
+            match len_of(key) {
+                Some(len) => bulk(len, &mut out),
+                None => out.extend_from_slice(b"-ERR bad key\r\n"),
+            }
+        }
+        [Value::BulkString(verb), keys @ ..] if verb.eq_ignore_ascii_case(b"MGET") => {
+            out.extend_from_slice(format!("*{}\r\n", keys.len()).as_bytes());
+            for key in keys {
+                match key {
+                    Value::BulkString(key) => bulk(len_of(key).unwrap_or(0), &mut out),
+                    _ => out.extend_from_slice(b"$-1\r\n"),
+                }
+            }
+        }
+        [Value::BulkString(verb), ..] if verb.eq_ignore_ascii_case(b"SET") => {
+            out.extend_from_slice(b"+OK\r\n");
+        }
+        _ => out.extend_from_slice(b"-ERR unknown\r\n"),
+    }
     out
 }
 
@@ -182,6 +205,34 @@ async fn run(addr: SocketAddr) -> Result<(), String> {
             }
             _ => return Err(format!("recv k:{len}: not the GET fired as {i}")),
         }
+    }
+
+    // One array whose elements span buffers, and one larger than the hold
+    // cap.
+    let keys: Vec<Vec<u8>> = SIZES.iter().map(|&len| key_of(len)).collect();
+    let key_refs: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+    let values = client
+        .mget(&key_refs)
+        .await
+        .map_err(|e| format!("mget: {e}"))?;
+    if values.len() != SIZES.len() {
+        return Err(format!("mget: {} values", values.len()));
+    }
+    for (len, value) in SIZES.iter().zip(values) {
+        check(*len, value.as_deref())?;
+    }
+
+    // `+OK` replies are not copied.
+    let before = count(recv_ring::THRESHOLD_COPIED);
+    for _ in 0..16 {
+        client
+            .set(b"k:1", b"v")
+            .await
+            .map_err(|e| format!("set: {e}"))?;
+    }
+    let copied = count(recv_ring::THRESHOLD_COPIED) - before;
+    if copied != 0 {
+        return Err(format!("set: {copied} replies copied"));
     }
 
     for (len, value) in kept {

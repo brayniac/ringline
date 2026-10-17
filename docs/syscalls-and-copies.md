@@ -175,8 +175,8 @@ count; zero-copy send is the exception the ZC rows note.
 | Step | Copies | Mechanism |
 |---|---:|---|
 | Kernel → provided buffer | 0 | Multishot recv fills `ProvidedBufRing` buffers selected at completion time (io_uring). On mio, `read()` into a scratch buffer instead. |
-| Provided buffer → `RecvAccumulator` | 1 | `extend_from_slice` into the per-connection contiguous accumulator. Every reader but `with_bytes_segments` reads from here. |
-| Provided buffer → `with_bytes_segments(\|&[Bytes]\|)` | 0 | io_uring: each held buffer is presented as a `Bytes` view of the ring buffer's memory, and a value inside one buffer is a slice of a view. A view keeps its whole buffer from the ring until it drops, so the client crates copy a value shorter than `recv_zc_threshold` (default 4096) out of it (`copy_small_view`, 1 copy). A value that spans buffers is copied by the parser (1 copy). A message longer than the hold cap is copied into the accumulator (1 copy). On mio this reader presents the accumulator. |
+| Provided buffer → `RecvAccumulator` | 1 | `extend_from_slice` into the per-connection contiguous accumulator, which `with_data`, `with_bytes`, `recv_ready` and `ConnStream` read. The segmented readers (`with_segments`, `segments`, `recv_owned_segment`, `with_bytes_segments`) and forwards read held buffers instead. |
+| Provided buffer → `with_bytes_segments(\|&[Bytes]\|)` | 0 | io_uring: each held buffer is presented as a `Bytes` view of the ring buffer's memory, and a value inside one buffer is a slice of a view. A view keeps its whole buffer from the ring until it drops, so the client crates copy a value shorter than `recv_zc_threshold` (default 4096) out of it (`copy_small_view`, 1 copy). A value that spans buffers is copied by the parser (1 copy). A message longer than the hold cap is copied into the accumulator, and the parser copies a value that spans the accumulator and later buffers again (2 copies). TLS plaintext and a refused lend's copy are separate heap pieces, so a value that spans them is also copied twice. On mio this reader presents the accumulator. |
 | Accumulator → `with_data(\|&[u8]\|)` | 0 borrowed | The parser sees a borrowed slice and must copy anything it keeps. |
 | Accumulator → `with_bytes(\|Bytes\|)` | 0 | `BytesMut::freeze()` and `Bytes::slice()` are O(1) refcount operations; parsed values are refcounted sub-slices that stay valid after the accumulator advances. |
 | TLS receive | +1 | rustls must decrypt; plaintext is drained into the accumulator through `BufRead` with no intermediate scratch buffer. |
@@ -259,14 +259,18 @@ only.
 ### Protocol clients
 
 The client crates (`ringline-redis`, `ringline-memcache`) compose these
-primitives; their READMEs carry the full per-path tables. The shape:
+primitives; their crate documentation carries the per-path tables. The shape:
 
-- **Receive copies a value once at most.** Both read with
+- **Receive copies a value 0 to 2 times.** Both read with
   `with_bytes_segments` and the proto crates' `parse_segments`
   (memcache's binary protocol reads with `with_bytes`). On io_uring a value
   inside one provided buffer and at least `recv_zc_threshold` long is a view
   of it, with no copy; a shorter value, or one that spans buffers, is copied
-  once. On mio values are slices of the accumulator.
+  once; a value in a reply longer than the hold cap, or one that spans TLS
+  plaintext chunks, is copied twice. An array or multi-key reply that is
+  incomplete is parsed again on each arrival, and each parse copies the
+  elements that span buffers. On mio values are slices of the accumulator,
+  after the one copy into it.
 - **The command envelope always costs one copy.** Commands are encoded into a
   *reused* scratch buffer (no per-op allocation) and copied into the send
   pool — as are all fired commands coalesced into a batch

@@ -2,8 +2,8 @@
 //!
 //! This client wraps a [`ringline::ConnCtx`] and provides typed Memcache command
 //! methods that read text-protocol replies with `with_bytes_segments()` +
-//! `ResponseBytes::parse_segments()`, which return values without copying
-//! them out of the receive buffers where they can. It is designed for
+//! `ResponseBytes::parse_segments()`. On io_uring a value inside one receive
+//! buffer is returned as a slice of it. It is designed for
 //! single-threaded, single-connection use within ringline's
 //! `AsyncEventHandler::on_start()` or connection tasks.
 //!
@@ -116,8 +116,8 @@
 //!
 //! | Path | Copies | Mechanism |
 //! |------|--------|-----------|
-//! | **Recv (values)** | 0 or 1 | `with_bytes_segments()` + `ResponseBytes::parse_segments()`. On io_uring a value inside one ring buffer and at least `recv_zc_threshold` long is a view of that buffer (0 copies); a shorter one is copied out of it (`ringline::copy_small_view`); one that spans buffers is copied by the parser. Keys are copied the same way where a call returns them ([`Client::gets`]). Bytes the runtime copied into the accumulator (TLS plaintext, a refused lend, a reply longer than the hold cap) are sliced from it. On mio values are slices of the accumulator, which the bytes were copied into. |
-//! | **Recv (binary protocol)** | 0 | [`BinaryClient`] reads with `with_bytes()`; values are slices of the accumulator, which the bytes were copied into. |
+//! | **Recv (values)** | 0 to 2 | `with_bytes_segments()` + `ResponseBytes::parse_segments()`. On io_uring a value inside one ring buffer and at least `recv_zc_threshold` long is a view of that buffer (0 copies); a shorter one is copied out of it (`ringline::copy_small_view`); one that spans buffers is copied by the parser. Keys are copied the same way where a call returns them ([`Client::gets`]). A value in a reply longer than the hold cap is copied into the accumulator by the runtime and copied again by the parser if it spans the accumulator and later buffers; TLS plaintext and a refused lend's copy are heap pieces, and a value that spans them is likewise copied twice. On mio values are slices of the accumulator, which the bytes were copied into. |
+//! | **Recv (binary protocol)** | 1 | [`BinaryClient`] reads with `with_bytes()`; values are slices of the accumulator, which the bytes were copied into. |
 //! | **Send (commands)** | 1 | Requests are encoded into a reusable per-client buffer (no per-request allocation), then `conn.send()` copies into the send pool. |
 //! | **Send (SET value, guard)** | 0 (value) | [`Client::set_with_guard`]: prefix+suffix copied to pool, value stays in-place via `SendGuard`. |
 //!
@@ -1167,14 +1167,13 @@ impl Client {
                 })
                 .await
         } else {
-            let threshold = ringline::recv_zc_threshold();
             let read = self
                 .rx
                 .with_bytes_segments(|pieces| {
                     let len = pieces.iter().map(Bytes::len).sum();
                     match McResponseBytes::parse_segments(pieces) {
-                        Ok((mut response, consumed)) => {
-                            let copied = copy_small_views(&mut response, pieces, threshold);
+                        Ok((response, consumed)) => {
+                            let copied = parser_copied(&response, pieces);
                             if copied > 0 {
                                 ringline::metrics::RECV_RING.add(
                                     ringline::metrics::recv_ring::SEGMENT_PARSE_COPIED,
@@ -1211,7 +1210,13 @@ impl Client {
         if n == 0 {
             return (result.unwrap_or(Err(Error::ConnectionClosed)), 0, arrival);
         }
-        let r = result.unwrap();
+        let mut r = result.unwrap();
+        // After the read, not in the parser: `copy_small_view` reaches the
+        // worker's driver, which the reader holds while the parser runs.
+        // Binary replies are slices of the accumulator, never views.
+        if let (false, Ok(response)) = (self.binary, &mut r) {
+            copy_small_views(response, ringline::recv_zc_threshold());
+        }
         if matches!(r, Err(Error::Protocol(_))) {
             self.tx.close();
         }
@@ -2855,13 +2860,23 @@ fn value_remainder_hint(pieces: &[Bytes], buffered: usize) -> Option<usize> {
     total.checked_sub(buffered).filter(|&a| a > 0)
 }
 
-/// Replace each value and message in `response` that is a receive view
-/// shorter than `threshold` with a copy ([`ringline::copy_small_view`]), so
-/// a kept value does not hold a whole ring buffer. Keys are copied where a
-/// caller keeps them (`gets`). Returns the bytes of keys, values and
-/// messages that lie in none of `pieces`: the parser copied them because
-/// they spanned pieces.
-fn copy_small_views(response: &mut McResponseBytes, pieces: &[Bytes], threshold: u32) -> usize {
+/// Replace each value in `response` that is a receive view shorter than
+/// `threshold` with a copy ([`ringline::copy_small_view`]), so a kept value
+/// does not hold a whole ring buffer. Keys are copied where a call returns
+/// them (`gets`); callers turn messages into strings. Not for a parser
+/// callback: `copy_small_view` reaches the worker's driver, which the reader
+/// holds there.
+fn copy_small_views(response: &mut McResponseBytes, threshold: u32) {
+    if let McResponseBytes::Values(values) = response {
+        for value in values {
+            value.data = ringline::copy_small_view(std::mem::take(&mut value.data), threshold);
+        }
+    }
+}
+
+/// The bytes of the keys, values and messages in `response` that lie in none
+/// of `pieces`: the parser copied them because they spanned pieces.
+fn parser_copied(response: &McResponseBytes, pieces: &[Bytes]) -> usize {
     let mut copied = 0;
     let mut count = |b: &Bytes| {
         if !b.is_empty() && !in_a_piece(b, pieces) {
@@ -2873,15 +2888,11 @@ fn copy_small_views(response: &mut McResponseBytes, pieces: &[Bytes], threshold:
             for value in values {
                 count(&value.key);
                 count(&value.data);
-                value.data = ringline::copy_small_view(std::mem::take(&mut value.data), threshold);
             }
         }
         McResponseBytes::Version(b)
         | McResponseBytes::ClientError(b)
-        | McResponseBytes::ServerError(b) => {
-            count(b);
-            *b = ringline::copy_small_view(std::mem::take(b), threshold);
-        }
+        | McResponseBytes::ServerError(b) => count(b),
         McResponseBytes::Stored
         | McResponseBytes::NotStored
         | McResponseBytes::Deleted
@@ -3714,7 +3725,7 @@ mod binary_tests {
 
 #[cfg(test)]
 mod segment_read_tests {
-    use super::{McResponseBytes, copy_small_views, value_remainder_hint};
+    use super::{McResponseBytes, parser_copied, value_remainder_hint};
     use bytes::Bytes;
 
     fn pieces(parts: &[&[u8]]) -> Vec<Bytes> {
@@ -3760,26 +3771,25 @@ mod segment_read_tests {
         assert_eq!(value_remainder_hint(&parts, 31), None);
     }
 
-    /// A key or value that spans pieces is a copy the parser made; one
-    /// inside a piece is a slice of it. A zero threshold leaves every field
-    /// as the parser returned it.
+    /// A key, value or message that spans pieces is a copy the parser made;
+    /// one inside a piece is a slice of it.
     #[test]
-    fn copy_small_views_counts_fields_the_parser_copied() {
+    fn parser_copied_counts_fields_that_span_pieces() {
         let parts = pieces(&[b"VALUE ke", b"y 0 3\r\nabc\r\nEND\r\n"]);
-        let (mut response, consumed) = McResponseBytes::parse_segments(&parts).unwrap();
+        let (response, consumed) = McResponseBytes::parse_segments(&parts).unwrap();
         assert_eq!(consumed, 25);
-        assert_eq!(copy_small_views(&mut response, &parts, 0), 3);
+        assert_eq!(parser_copied(&response, &parts), 3);
 
         let parts = pieces(&[b"VALUE key 0 3\r\nab", b"c\r\nEND\r\n"]);
-        let (mut response, _) = McResponseBytes::parse_segments(&parts).unwrap();
-        assert_eq!(copy_small_views(&mut response, &parts, 0), 3);
+        let (response, _) = McResponseBytes::parse_segments(&parts).unwrap();
+        assert_eq!(parser_copied(&response, &parts), 3);
 
         let parts = pieces(&[b"SERVER_ERROR o", b"ut of memory\r\n"]);
-        let (mut response, _) = McResponseBytes::parse_segments(&parts).unwrap();
-        assert_eq!(copy_small_views(&mut response, &parts, 0), 13);
+        let (response, _) = McResponseBytes::parse_segments(&parts).unwrap();
+        assert_eq!(parser_copied(&response, &parts), 13);
 
         let parts = pieces(&[b"VALUE key 0 3\r\nabc\r\nEND\r\n"]);
-        let (mut response, _) = McResponseBytes::parse_segments(&parts).unwrap();
-        assert_eq!(copy_small_views(&mut response, &parts, 0), 0);
+        let (response, _) = McResponseBytes::parse_segments(&parts).unwrap();
+        assert_eq!(parser_copied(&response, &parts), 0);
     }
 }

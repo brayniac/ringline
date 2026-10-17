@@ -2,8 +2,8 @@
 //!
 //! This client wraps a [`ringline::ConnCtx`] and provides typed Redis command
 //! methods that read replies with `with_bytes_segments()` +
-//! `Value::parse_segments()`, which return values without copying them out
-//! of the receive buffers where they can. It is designed for single-threaded,
+//! `Value::parse_segments()`. On io_uring a value inside one receive buffer
+//! is returned as a slice of it. It is designed for single-threaded,
 //! single-connection use within ringline's `AsyncEventHandler::on_start()` or
 //! connection tasks.
 //!
@@ -143,7 +143,7 @@
 //!
 //! | Path | Copies | Mechanism |
 //! |------|--------|-----------|
-//! | **Recv (values)** | 0 or 1 | `with_bytes_segments()` + `Value::parse_segments()`. On io_uring a string inside one ring buffer and at least `recv_zc_threshold` long is a view of that buffer (0 copies); a shorter one is copied out of it (`ringline::copy_small_view`); one that spans buffers is copied by the parser. Bytes the runtime copied into the accumulator (TLS plaintext, a refused lend, a reply longer than the hold cap) are sliced from it. On mio strings are slices of the accumulator, which the bytes were copied into. |
+//! | **Recv (values)** | 0 to 2 | `with_bytes_segments()` + `Value::parse_segments()`. On io_uring a string inside one ring buffer and at least `recv_zc_threshold` long is a view of that buffer (0 copies); a shorter one is copied out of it (`ringline::copy_small_view`); one that spans buffers is copied by the parser. `OK`, `PONG` and `QUEUED` are returned as static `Bytes`. A string in a reply longer than the hold cap is copied into the accumulator by the runtime and copied again by the parser if it spans the accumulator and later buffers; TLS plaintext and a refused lend's copy are heap pieces, and a string that spans them is likewise copied twice. On mio strings are slices of the accumulator, which the bytes were copied into. |
 //! | **Send (commands)** | 1 | `encode_request()` serializes RESP into `Vec<u8>`, then `conn.send()` copies into the send pool. |
 //! | **Send (SET value, standard)** | 1 | All parts gathered into one send-pool slot via `send_parts().copy()`. |
 //! | **Send (SET value, guard)** | 0 (value) | [`Client::set_with_guard`] / [`Client::set_ex_with_guard`]: RESP prefix+suffix copied to pool, value stays in-place via `SendGuard`. |
@@ -766,7 +766,7 @@ pub(crate) async fn read_value_from(
             let len = pieces.iter().map(Bytes::len).sum();
             match Value::parse_segments_with_options(pieces, &options) {
                 Ok((mut value, consumed)) => {
-                    let copied = copy_small_views(&mut value, pieces, threshold);
+                    let copied = parser_copied(&mut value, pieces);
                     if copied > 0 {
                         ringline::metrics::RECV_RING.add(
                             ringline::metrics::recv_ring::SEGMENT_PARSE_COPIED,
@@ -800,7 +800,12 @@ pub(crate) async fn read_value_from(
     if n == 0 {
         return (result.unwrap_or(Err(Error::ConnectionClosed)), n);
     }
-    let value = result.unwrap();
+    // After the read, not in the parser: `copy_small_view` reaches the
+    // worker's driver, which the reader holds while the parser runs.
+    let value = result.unwrap().map(|mut value| {
+        copy_small_views(&mut value, threshold);
+        value
+    });
     // A protocol error means the RESP framing is irrecoverably
     // misaligned (the failed parse consumed the whole accumulator,
     // possibly swallowing the fronts of pipelined responses). Close the
@@ -3996,16 +4001,30 @@ fn bulk_frame_len(head: &[u8]) -> Option<usize> {
 
 /// Replace each string in `value` that is a receive view shorter than
 /// `threshold` with a copy ([`ringline::copy_small_view`]), so a kept value
-/// does not hold a whole ring buffer. Returns the bytes of the strings that
-/// lie in none of `pieces`: the parser copied them because they spanned
-/// pieces.
-fn copy_small_views(value: &mut Value, pieces: &[Bytes], threshold: u32) -> usize {
+/// does not hold a whole ring buffer. `OK`, `PONG` and `QUEUED` become static
+/// `Bytes` without a copy. Not for a parser callback: `copy_small_view`
+/// reaches the worker's driver, which the reader holds there.
+fn copy_small_views(value: &mut Value, threshold: u32) {
+    value.for_each_bytes_mut(|b| {
+        *b = match &b[..] {
+            // The replies to SET, PING and MULTI's commands, which callers
+            // discard.
+            b"OK" => Bytes::from_static(b"OK"),
+            b"PONG" => Bytes::from_static(b"PONG"),
+            b"QUEUED" => Bytes::from_static(b"QUEUED"),
+            _ => ringline::copy_small_view(std::mem::take(b), threshold),
+        };
+    });
+}
+
+/// The bytes of the strings in `value` that lie in none of `pieces`: the
+/// parser copied them because they spanned pieces.
+fn parser_copied(value: &mut Value, pieces: &[Bytes]) -> usize {
     let mut copied = 0;
     value.for_each_bytes_mut(|b| {
         if !b.is_empty() && !in_a_piece(b, pieces) {
             copied += b.len();
         }
-        *b = ringline::copy_small_view(std::mem::take(b), threshold);
     });
     copied
 }
@@ -4021,7 +4040,7 @@ fn in_a_piece(b: &[u8], pieces: &[Bytes]) -> bool {
 
 #[cfg(test)]
 mod segment_read_tests {
-    use super::{Value, bulk_remainder_hint as hint_over, copy_small_views};
+    use super::{Value, bulk_remainder_hint as hint_over, parser_copied};
     use bytes::Bytes;
 
     /// The hint for `buf` presented as one piece.
@@ -4090,14 +4109,13 @@ mod segment_read_tests {
     }
 
     /// A string that spans pieces is a copy the parser made; one inside a
-    /// piece is a slice of it. A zero threshold leaves every string as the
-    /// parser returned it.
+    /// piece is a slice of it.
     #[test]
-    fn copy_small_views_counts_strings_the_parser_copied() {
+    fn parser_copied_counts_strings_that_span_pieces() {
         let parts = pieces(&[b"*2\r\n$3\r\nab", b"c\r\n$2\r\nde\r\n"]);
         let (mut value, consumed) = Value::parse_segments(&parts).unwrap();
         assert_eq!(consumed, 21);
-        assert_eq!(copy_small_views(&mut value, &parts, 0), 3);
+        assert_eq!(parser_copied(&mut value, &parts), 3);
         assert_eq!(
             value,
             Value::array(vec![Value::bulk_string(b"abc"), Value::bulk_string(b"de")])
@@ -4105,7 +4123,7 @@ mod segment_read_tests {
 
         let one = pieces(&[b"$3\r\nabc\r\n"]);
         let (mut value, _) = Value::parse_segments(&one).unwrap();
-        assert_eq!(copy_small_views(&mut value, &one, 0), 0);
+        assert_eq!(parser_copied(&mut value, &one), 0);
     }
 }
 

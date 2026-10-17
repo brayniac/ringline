@@ -336,9 +336,12 @@ pub mod recv_ring {
     /// other non-empty value shorter than it.
     /// Their bytes also count in `BYTES_COPIED`.
     pub const THRESHOLD_COPIED: usize = 9;
-    /// Bytes of values that ringline-redis and ringline-memcache read with
-    /// `with_bytes_segments` and that the protocol parser copied because
-    /// they spanned pieces. Not counted in `BYTES_COPIED`.
+    /// Bytes of the strings (values, keys, messages) in replies that
+    /// ringline-redis and ringline-memcache read with `with_bytes_segments`
+    /// and that the protocol parser copied because they spanned pieces.
+    /// Counted for the parse that completes a reply; copies an incomplete
+    /// parse makes and discards are not counted. Not counted in
+    /// `BYTES_COPIED`.
     pub const SEGMENT_PARSE_COPIED: usize = 10;
     pub const COUNT: usize = 11;
 }

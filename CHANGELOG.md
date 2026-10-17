@@ -162,9 +162,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   bytes copied into receive storage (the accumulator, owned held entries,
   owned forward copies, queued TLS plaintext and `copy_small_view` copies)
   on both backends.
-- `metrics::recv_ring::SEGMENT_PARSE_COPIED` counts the bytes of values
-  ringline-redis and ringline-memcache read with `with_bytes_segments` that
-  the protocol parser copied because they spanned pieces.
+- `metrics::recv_ring::SEGMENT_PARSE_COPIED` counts the bytes of strings
+  (values, keys, messages) in replies ringline-redis and ringline-memcache
+  read with `with_bytes_segments` that the protocol parser copied because
+  they spanned pieces.
 
 ### Changed
 
@@ -174,10 +175,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   least `recv_zc_threshold` long is a view of that buffer instead of a slice
   of the accumulator, so its bytes are not copied. A shorter value is copied
   out of its buffer (`copy_small_view`), and a value that spans buffers is
-  copied by the parser. ringline-memcache's `gets` copies keys the same way;
-  `get` does not keep the key. Both clients hint an incomplete reply's
-  remaining length across pieces. memcache's binary protocol still reads
-  with `with_bytes`.
+  copied by the parser. A value in a reply longer than the hold cap, or one
+  that spans TLS plaintext chunks, is copied twice. ringline-redis returns
+  `OK`, `PONG` and `QUEUED` as static `Bytes`. ringline-memcache's `gets`
+  copies keys the same way as values; `get` does not keep the key. An
+  incomplete redis `$` reply or memcache `VALUE` reply hints its remaining
+  length across pieces. memcache's binary protocol still reads with
+  `with_bytes`.
 - `ringline` takes `bytes` from the workspace, so it requires 1.11.1 or
   later, as the other crates do; views use `Bytes::from_owner` (1.9). On
   io_uring a provided-buffer ring's buffers are an anonymous mapping, shared
