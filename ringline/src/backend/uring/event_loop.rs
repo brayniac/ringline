@@ -21125,6 +21125,118 @@ mod tests {
         el.driver.release_pending();
     }
 
+    // ── copy_small_view and recv_zc_threshold ───────────────────────────
+
+    fn threshold_copied() -> u64 {
+        crate::runtime::io::TEST_THRESHOLD_COPIED.with(|c| c.get())
+    }
+
+    /// A view shorter than the threshold is copied, and the copy releases
+    /// the view's hold on its buffer.
+    #[test]
+    fn copy_small_view_copies_a_small_view_and_releases_its_buffer() {
+        let mut el = make_test_loop();
+        let entries = el.driver.provided_bufs.ring_entries();
+        let conn_index = held_segment(&mut el, 0, b"hello");
+        let view = el.driver.recv_view(0, 0, 5);
+        consume_entry(&mut el, conn_index);
+        let copied = crate::accumulator::test_bytes_copied();
+        let counted = threshold_copied();
+        let copy = with_driver_state(&mut el, || crate::copy_small_view(view, 4096));
+        assert_eq!(&copy[..], b"hello");
+        assert_ne!(copy.as_ptr(), el.driver.provided_bufs.data_ptr(0, 0));
+        assert_eq!(crate::accumulator::test_bytes_copied() - copied, 5);
+        assert_eq!(threshold_copied() - counted, 1);
+        release_views(&mut el);
+        assert_eq!(
+            el.driver.provided_bufs.free(),
+            entries,
+            "the copied view no longer holds its buffer"
+        );
+    }
+
+    /// A view at or above the threshold, and any view with a threshold of 0,
+    /// is returned unchanged.
+    #[test]
+    fn copy_small_view_keeps_a_view_at_or_above_the_threshold() {
+        let mut el = make_test_loop();
+        held_segment(&mut el, 0, b"hello");
+        for threshold in [5, 0] {
+            let view = el.driver.recv_view(0, 0, 5);
+            let ptr = view.as_ptr();
+            let kept = with_driver_state(&mut el, || crate::copy_small_view(view, threshold));
+            assert_eq!(kept.as_ptr(), ptr, "threshold {threshold}");
+            with_driver_state(&mut el, || drop(kept));
+        }
+    }
+
+    /// An empty `Bytes` that still holds a view is returned as an empty
+    /// `Bytes` that holds nothing, so the buffer returns to the ring.
+    #[test]
+    fn copy_small_view_releases_an_empty_view() {
+        let mut el = make_test_loop();
+        let entries = el.driver.provided_bufs.ring_entries();
+        let conn_index = held_segment(&mut el, 0, b"hello");
+        let mut view = el.driver.recv_view(0, 0, 5);
+        view.truncate(0);
+        consume_entry(&mut el, conn_index);
+        // Threshold 0 never copies, so only the empty check releases it.
+        let empty = with_driver_state(&mut el, || crate::copy_small_view(view, 0));
+        assert!(empty.is_empty());
+        release_views(&mut el);
+        assert_eq!(el.driver.provided_bufs.free(), entries);
+    }
+
+    /// A view made by another worker's ring is not recognised and is
+    /// returned unchanged.
+    #[test]
+    fn copy_small_view_returns_another_workers_view_unchanged() {
+        let mut first = make_test_loop();
+        let entries = first.driver.provided_bufs.ring_entries();
+        let conn_index = held_segment(&mut first, 0, b"hello");
+        let view = first.driver.recv_view(0, 0, 5);
+        let ptr = view.as_ptr();
+        consume_entry(&mut first, conn_index);
+        let mut second = make_test_loop();
+        let kept = with_driver_state(&mut second, || crate::copy_small_view(view, 4096));
+        assert_eq!(kept.as_ptr(), ptr);
+        drop(kept);
+        release_views(&mut first);
+        assert_eq!(first.driver.provided_bufs.free(), entries);
+    }
+
+    /// On a worker, a heap value is returned unchanged; outside a task, every
+    /// value is treated as a view and copied when short.
+    #[test]
+    fn copy_small_view_treats_heap_values_by_where_it_is_called() {
+        let mut el = make_test_loop();
+        let heap = Bytes::from(b"small".to_vec());
+        let ptr = heap.as_ptr();
+        let kept = with_driver_state(&mut el, || crate::copy_small_view(heap.clone(), 4096));
+        assert_eq!(
+            kept.as_ptr(),
+            ptr,
+            "a heap value on the worker is not a view"
+        );
+        let copy = crate::copy_small_view(heap, 4096);
+        assert_ne!(copy.as_ptr(), ptr, "outside a task every value is a view");
+        assert_eq!(&copy[..], b"small");
+    }
+
+    /// `recv_zc_threshold` returns the worker's configured value, and the
+    /// default outside a task.
+    #[test]
+    fn recv_zc_threshold_reads_the_workers_config() {
+        let mut el = make_test_loop_with_config(
+            test_config_builder()
+                .recv_zc_threshold(123)
+                .build()
+                .expect("valid config"),
+        );
+        assert_eq!(with_driver_state(&mut el, crate::recv_zc_threshold), 123);
+        assert_eq!(crate::recv_zc_threshold(), 4096);
+    }
+
     /// A view keeps its buffer out of the ring after the entry it was made
     /// from is consumed, and so does a slice of it; the buffer is posted
     /// once both have dropped and the worker has applied the releases. The

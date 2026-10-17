@@ -5534,6 +5534,86 @@ impl<F: FnMut(&SegChain<'_>) -> SegConsumed + Unpin> WithSegmentsFuture<F> {
     }
 }
 
+// ── Receive view threshold ───────────────────────────────────────────
+
+/// The calling worker's receive view threshold
+/// ([`ConfigBuilder::recv_zc_threshold`](crate::ConfigBuilder::recv_zc_threshold)),
+/// or the default, 4096, when called anywhere other than a worker's tasks
+/// and its `on_tick` and `on_notify` callbacks.
+///
+/// A client passes it to [`copy_small_view`] when it has no threshold of its
+/// own.
+pub fn recv_zc_threshold() -> u32 {
+    try_with_state(|driver, _| driver.recv_zc_threshold)
+        .unwrap_or(crate::config::DEFAULT_RECV_ZC_THRESHOLD)
+}
+
+/// Return an owned copy of `value` if it is a receive view shorter than
+/// `threshold` bytes; otherwise return `value` unchanged.
+///
+/// On io_uring, [`Connection::with_bytes_segments`] presents held receive
+/// buffers as views of the ring's memory, and a value sliced from one is a
+/// view too. A view keeps its whole ring buffer from being reused until it
+/// drops, whatever its length. Ring buffers are 16 KiB by default;
+/// [`ConfigBuilder::recv_incremental`](crate::ConfigBuilder::recv_incremental)
+/// and [`ConfigBuilder::recv_buffer`](crate::ConfigBuilder::recv_buffer)
+/// give other sizes. A client that keeps parsed values calls this on each
+/// one, so a small kept value holds a heap copy instead of a ring buffer.
+/// When `value` is copied it is dropped here; the view's hold on its buffer
+/// is released once no clone or slice of the view remains.
+///
+/// A view is recognised by its data pointer lying in the calling worker's
+/// ring memory. On io_uring, called anywhere other than a worker's tasks and
+/// its `on_tick` and `on_notify` callbacks, every `Bytes` is treated as a
+/// view. A view made on one worker and passed
+/// here on another is not recognised and is returned unchanged. On mio
+/// nothing is a view, and a non-empty `value` is returned unchanged.
+///
+/// An empty `value` is returned as an empty `Bytes` that holds nothing. A
+/// `threshold` of 0 never copies. Copies count in
+/// `metrics::recv_ring::THRESHOLD_COPIED` and `BYTES_COPIED`.
+pub fn copy_small_view(value: Bytes, threshold: u32) -> Bytes {
+    // An empty slice of a view can still hold the view's buffer.
+    if value.is_empty() {
+        return Bytes::new();
+    }
+    if value.len() >= threshold as usize || !is_recv_view(&value) {
+        return value;
+    }
+    let copy = Bytes::copy_from_slice(&value);
+    crate::metrics::RECV_RING.increment(crate::metrics::recv_ring::THRESHOLD_COPIED);
+    #[cfg(test)]
+    TEST_THRESHOLD_COPIED.with(|c| c.set(c.get() + 1));
+    crate::accumulator::note_copied(copy.len());
+    copy
+}
+
+#[cfg(test)]
+thread_local! {
+    /// This thread's `THRESHOLD_COPIED` total, for tests: the process-wide
+    /// metric is also moved by concurrent tests in one process.
+    pub(crate) static TEST_THRESHOLD_COPIED: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Whether `value`'s data lies in the calling worker's TCP receive ring
+/// memory; `true` where no worker's driver is current.
+#[cfg(has_io_uring)]
+fn is_recv_view(value: &Bytes) -> bool {
+    try_with_state(|driver, _| {
+        let memory = driver.provided_bufs.memory();
+        let start = memory.as_ptr() as usize;
+        let at = value.as_ptr() as usize;
+        at >= start && at < start + memory.len()
+    })
+    .unwrap_or(true)
+}
+
+#[cfg(not(has_io_uring))]
+fn is_recv_view(_value: &Bytes) -> bool {
+    false
+}
+
 // ── WithBytesSegmentsFuture ──────────────────────────────────────────
 
 /// Future returned by [`Connection::with_bytes_segments`]. Resolves to the

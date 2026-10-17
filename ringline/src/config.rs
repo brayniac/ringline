@@ -60,6 +60,9 @@ impl TlsClientConfig {
     }
 }
 
+/// Default receive view threshold ([`ConfigBuilder::recv_zc_threshold`]).
+pub(crate) const DEFAULT_RECV_ZC_THRESHOLD: u32 = 4096;
+
 /// Configuration for the io_uring driver.
 #[derive(Clone)]
 pub struct Config {
@@ -231,6 +234,10 @@ pub struct Config {
     /// Sends at or above the threshold, or that don't fit a send pool slot,
     /// use the zero-copy path as before. Default: `4096`.
     pub(crate) send_zc_threshold: u32,
+    /// Receive views shorter than this many bytes are copied by
+    /// [`copy_small_view`](crate::copy_small_view) when a client passes this
+    /// value as its threshold. See [`ConfigBuilder::recv_zc_threshold`].
+    pub(crate) recv_zc_threshold: u32,
     /// Number of InFlightSendSlab slots for in-flight scatter-gather sends
     /// (i.e., `send_parts()` calls that include at least one guard).
     /// Each slot is held until all ZC notifications arrive.
@@ -465,6 +472,7 @@ impl Default for Config {
             send_copy_count: 1024,
             send_copy_slot_size: 16448,
             send_zc_threshold: 4096,
+            recv_zc_threshold: DEFAULT_RECV_ZC_THRESHOLD,
             send_slab_slots: 512,
             flush_interval_us: 100,
             tick_timeout_us: 1000,
@@ -520,6 +528,12 @@ impl Config {
     /// [`ConfigBuilder::send_zc_threshold`].
     pub fn send_zc_threshold(&self) -> u32 {
         self.send_zc_threshold
+    }
+
+    /// The receive view threshold in bytes. See
+    /// [`ConfigBuilder::recv_zc_threshold`].
+    pub fn recv_zc_threshold(&self) -> u32 {
+        self.recv_zc_threshold
     }
 
     /// Validate configuration values. Returns an error if any value is out of range.
@@ -1190,6 +1204,23 @@ impl ConfigBuilder {
         self
     }
 
+    /// Set the receive view threshold in bytes (0 = never copy). Default:
+    /// 4096, the send side's default; it has not been measured for receive.
+    ///
+    /// On io_uring, `with_bytes_segments` presents held receive buffers as
+    /// `Bytes` views of the ring, and a view a client keeps holds its whole
+    /// ring buffer until it drops. The runtime does not apply this value
+    /// itself. [`recv_zc_threshold`](crate::recv_zc_threshold) returns it in
+    /// the worker's tasks and its `on_tick` and `on_notify` callbacks. A
+    /// client passes it to
+    /// [`copy_small_view`](crate::copy_small_view), which copies a view
+    /// shorter than the threshold, so a small kept value does not hold a
+    /// ring buffer.
+    pub fn recv_zc_threshold(mut self, bytes: u32) -> Self {
+        self.config.recv_zc_threshold = bytes;
+        self
+    }
+
     /// Set the number of scatter-gather send slab slots.
     pub fn send_slab_slots(mut self, n: u16) -> Self {
         self.config.send_slab_slots = n;
@@ -1771,5 +1802,15 @@ mod tests {
             .build()
             .expect("zero send_zc_threshold should be valid");
         assert_eq!(cfg.send_zc_threshold, 0);
+    }
+
+    #[test]
+    fn recv_zc_threshold_default_and_builder() {
+        assert_eq!(Config::default().recv_zc_threshold(), 4096);
+        let cfg = ConfigBuilder::default()
+            .recv_zc_threshold(0)
+            .build()
+            .expect("zero recv_zc_threshold should be valid");
+        assert_eq!(cfg.recv_zc_threshold(), 0);
     }
 }

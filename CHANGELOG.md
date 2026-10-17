@@ -144,12 +144,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   On io_uring it also resolves to `Err(EBUSY)` once `enable_recv_forward`
   has been called on the connection. On mio the parser is shown the
   accumulator as one piece. Reported by `recv_arrival`.
+- `ConfigBuilder::recv_zc_threshold` (default 4096),
+  `ringline::recv_zc_threshold` and `ringline::copy_small_view`.
+  `copy_small_view(value, threshold)` returns an owned copy of a receive
+  view shorter than `threshold`. On io_uring, called anywhere other than a
+  worker's tasks and its `on_tick` and `on_notify` callbacks, it copies any
+  `Bytes` shorter than `threshold`. It returns other non-empty values
+  unchanged, and an empty value as an empty `Bytes`. A small value a client
+  keeps then does not hold a whole ring buffer. `recv_zc_threshold()`
+  returns the worker's configured value there, or 4096 elsewhere. The runtime does not apply the threshold itself;
+  a client applies it by calling `copy_small_view`.
+  `metrics::recv_ring::THRESHOLD_COPIED` counts the copies.
 - `Connection::end_segments` and `RecvHalf::end_segments` exist on mio,
   where they return `Ok(())`.
 - `metrics::recv_ring::HOLD_CAP_COPIED` counts held entries
   `with_bytes_segments` copied at the hold cap, and `BYTES_COPIED` counts
   bytes copied into receive storage (the accumulator, owned held entries,
-  owned forward copies and queued TLS plaintext) on both backends.
+  owned forward copies, queued TLS plaintext and `copy_small_view` copies)
+  on both backends.
 
 ### Changed
 

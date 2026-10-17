@@ -839,6 +839,8 @@ pub(crate) struct Driver {
     pub(crate) loop_diag: bool,
     /// Guard sends below this total length fall back to copy (0 = always ZC).
     pub(crate) send_zc_threshold: u32,
+    /// `Config::recv_zc_threshold`, returned by `crate::recv_zc_threshold`.
+    pub(crate) recv_zc_threshold: u32,
     /// Aggregate low-water reserve for segmented recv (Config::recv_segment_reserve).
     /// When `provided_bufs.free() <= recv_segment_reserve`, an arriving segmented
     /// buffer is force-copied (Mode C) and its bid replenished immediately instead
@@ -1468,6 +1470,7 @@ impl Driver {
             tcp_nodelay: config.tcp_nodelay,
             loop_diag: config.loop_diag,
             send_zc_threshold: config.send_zc_threshold,
+            recv_zc_threshold: config.recv_zc_threshold,
             recv_segment_reserve: config.recv_segment_reserve,
             recv_accumulator_max: config.recv_accumulator_max,
             chain_table: SendChainTable::new(config.max_connections),
