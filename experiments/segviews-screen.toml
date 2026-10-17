@@ -118,7 +118,6 @@ set -uo pipefail
 cd /home/anvil && tar xzf bins.tgz && chmod +x out/*
 ( cd out && sha256sum * )
 uname -r
-uname -r
 sudo sysctl -w net.core.rmem_max=134217728 net.core.wmem_max=134217728 net.ipv4.ip_local_port_range="1024 65535"
 sudo apt-get update -qq
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq time >/dev/null || exit 1
