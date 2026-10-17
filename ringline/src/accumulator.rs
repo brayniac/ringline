@@ -539,6 +539,21 @@ mod tests {
         );
         assert_eq!(bytes_copied() - start, 64 + 4, "the growth moved 4 bytes");
         drop(tail);
+
+        // With the other half dropped the allocation is uniquely owned and
+        // has room, so the growth reuses it in place and moves nothing.
+        let mut acc = RecvAccumulator::new(8);
+        acc.append(b"abcd");
+        drop(acc.buf.split_off(acc.buf.len()));
+        let before = acc.buf.as_ptr();
+        let start = bytes_copied();
+        acc.append(b"efgh");
+        assert_eq!(
+            acc.buf.as_ptr(),
+            before,
+            "a unique shared buffer grows in place"
+        );
+        assert_eq!(bytes_copied() - start, 4);
     }
 
     /// Reclaiming a remainder nothing else references copies nothing;
