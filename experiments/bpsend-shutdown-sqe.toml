@@ -98,7 +98,7 @@ tags = ["validation"]
 [[jobs.steps]]
 type = "anvil-vm"
 shape = "z4.c"
-image = "spool/images/debian-13-ci-20260912.1@golden"
+image = "debian-13-ci"
 slots = 1
 memory_gib = 4
 ports = 0
@@ -108,6 +108,9 @@ artifacts = ["/home/anvil/diag.log"]
 upload = true
 payload = '''
 set -uo pipefail
+# The image family moves; record which image, rustc and kernel ran.
+cat /etc/anvil-instance.json 2>/dev/null; echo
+rustc -V 2>/dev/null; uname -r
 cd /home/anvil
 {
   uname -srm; nproc
