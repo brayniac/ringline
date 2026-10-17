@@ -23,6 +23,10 @@ name = "ringline uring gate ({branch})"
 # Override `repo` to gate a branch that only exists on a fork — and check the
 # `git log --oneline -1` line in the output before reading the result, because a
 # stale fork silently gates the wrong commit.
+# The guest's sccache is shared with other projects, and a build runs build.rs
+# and proc macros, so a build can write cache entries those projects read. Gate
+# a fork only for a maintainer's own branch; a contributor's branch needs a
+# security review first (flake-census.toml says what the guest can reach).
 branch = "main"
 repo   = "https://github.com/ringline-rs/ringline"
 
@@ -49,6 +53,9 @@ artifacts = ["/home/anvil/gate.log"]
 upload = true
 payload = '''
 set -uo pipefail
+# The image family moves; record which image, rustc and kernel ran.
+cat /etc/anvil-instance.json 2>/dev/null; echo
+rustc -V 2>/dev/null; uname -r
 cd /home/anvil
 {
   uname -srm

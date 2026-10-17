@@ -30,6 +30,9 @@ artifacts = ["/home/anvil/run.log"]
 upload = true
 payload = '''
 set -uo pipefail
+# The image family moves; record which image, rustc and kernel ran.
+cat /etc/anvil-instance.json 2>/dev/null; echo
+rustc -V 2>/dev/null; uname -r
 cd /home/anvil
 {
   uname -srm; n=$(nproc); echo "nproc=$n"; lscpu | grep -E "Model name|MHz" | head -3

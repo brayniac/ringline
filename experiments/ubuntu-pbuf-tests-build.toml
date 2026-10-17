@@ -27,6 +27,9 @@ artifacts = ["/home/anvil/tests.tgz", "/home/anvil/build.log"]
 upload = true
 payload = '''
 set -uo pipefail
+# The image family moves; record which image, rustc and kernel ran.
+cat /etc/anvil-instance.json 2>/dev/null; echo
+rustc -V 2>/dev/null; uname -r
 cd /home/anvil
 {
   export CARGO_PROFILE_RELEASE_DEBUG=0 CARGO_PROFILE_RELEASE_STRIP=true
