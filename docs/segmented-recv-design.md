@@ -36,7 +36,10 @@ The 2026-10-08 owner decision (`docs/recv-incremental-ring-design.md`,
 view takes a buffer hold of its own and releases it through the worker that
 created it, so a holdable `Bytes` can be zero-copy.
 `docs/recv-segment-views-design.md` applies this to segment parsers. Modes A, B
-and C below are unchanged.
+and C below are unchanged. If its landing step 6 lands, ringline-redis and
+ringline-memcache values move from Mode C to views, and a view's hold becomes a
+fourth kind of held bid alongside those in "Buffer lifetime and replenish
+soundness".
 
 ## Motivation
 

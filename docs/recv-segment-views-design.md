@@ -87,15 +87,20 @@ pressure"):
 - There is no spill valve, and the runtime never returns a buffer a view
   holds. Kept views count against the lend cap (`held()`) or, without one,
   against `recv_segment_reserve` (`free()`). Once a bound is reached, later
-  completions are copied rather than lent, so the ring keeps buffers to
-  receive into. A view's range ends within `BufState::written`, and the
-  kernel writes only past those bytes, on incremental rings too.
+  segmented completions are copied rather than lent, so segmented holds and
+  views leave at least half the ring unheld with a lend cap, or
+  `recv_segment_reserve` buffers free without one (one buffer at a reserve
+  of 0; see "Ring pressure"). A view's range ends within
+  `BufState::written`, and the kernel writes only past those bytes, on
+  incremental rings too.
 - A view holds its buffer by a buffer hold of its own, not through the
   connection's slot. `release_batch` posts a buffer only when its last hold
   is released, so close's release of each held entry (`handle_close`) and a
   view's release are separate decrements, and neither posts a buffer the
-  other still holds. A bid is not posted again while a view holds it, so a
-  view's release cannot apply to a later use of the bid.
+  other still holds. A buffer is posted again only after every hold on it
+  is released, so a view's release always lands before the bid's next
+  posting. It cannot take the hold of a completion after that posting, the
+  duplicate-release case `release_batch` does not detect.
 
 ## API
 
@@ -164,11 +169,11 @@ into `pending_recv_bufs`, which this reader does not read. Step 2 therefore
 adds a per-connection counter, `segment_epoch`. It is incremented by
 `settle_forward_end` and whenever a reader removes bytes from the hold or
 the accumulator while the connection is in the segmented domain, this reader
-included. The future
-records the counter at the end of each poll. Every later poll first checks
-the handle (stale: `Ok(0)`), `forward_progress` and `segment_reader_live`
-(`Err(EBUSY)`), and then the counter: if it changed, the poll resolves to
-`Err(EBUSY)` without touching the hold, and the caller calls again. Without
+included. The future records the counter at the end of each poll. Every
+later poll first checks the handle (stale: `Ok(0)`), `forward_progress` and
+`segment_reader_live` (`Err(EBUSY)`), and then the counter: if it changed,
+the poll resolves to `Err(EBUSY)` without touching the hold, and the caller
+calls again. Without
 the first two checks a poll would parse the hold a forward owns, and at the
 cap copy it into the accumulator, which a forward never reads.
 
@@ -307,7 +312,8 @@ ring's `RingMemory`, the range it covers, the buffer's bid, and the id of
 the worker that created it; the memory id is read from the `Arc`.
 
 - Creating a view takes one buffer hold (`BufState::holds += 1`), so the
-  buffer stays out of the ring and counts in `held()`, under the lend cap.
+  buffer is not posted again after it is exhausted, and counts in
+  `held()`, under the lend cap.
   It asserts that the buffer already has a hold and that the range ends
   within the bytes the kernel has completed in the buffer
   (`BufState::written`); the kernel writes only past those bytes. The
@@ -359,8 +365,10 @@ the worker that created it; the memory id is read from the `Arc`.
   connection on the creating worker, and `handle_close` drops the handler
   future there, with any view it holds. A view in `ParkState` that drops on
   another worker releases through the creating worker's inbox; one dropped
-  on the creating worker (an abandoned park, `park_carry.remove` in
-  `close_connection`) queues an `Orphan`.
+  on the creating worker (a deposit cleared by `offer_park`,
+  `withdraw_park_offer`, `close_connection` or slot reuse, or a `ParkedFd`
+  that `drain_park_ready` drops because its target worker has gone) queues
+  an `Orphan`.
 
 The default-domain `with_bytes` views decided in
 `docs/recv-incremental-ring-design.md` ("`with_bytes`") can use `RecvView`
@@ -368,7 +376,7 @@ when they land.
 
 ## Kept values
 
-A view the caller retains keeps its whole buffer from returning to the ring,
+A view the caller retains keeps its whole buffer from being posted again,
 for a value of any size: 16 KiB on the default ring, 1 MiB on an incremental
 ring, and 64 KiB on the plain ring used when `recv_incremental` is on and
 the kernel has no incremental rings or fails the preflight. These are the
@@ -491,8 +499,8 @@ never written (third); a view that does not keep the memory alive (fourth);
 no memory id check (fifth). The ring memory's own test fails if the memory
 is zeroed eagerly, which would make the whole ring resident at startup.
 
-- A view kept past the callback keeps its buffer out of the ring; dropping
-  it posts the buffer at the next flush.
+- A view kept past the callback keeps its buffer from being posted again;
+  dropping it posts the buffer at the next flush.
 - A buffer with two views (an incremental buffer shared by two completions,
   or two slices of one view) returns only after both drop.
 - A view dropped on another thread releases its buffer hold and wakes a
@@ -556,8 +564,8 @@ is zeroed eagerly, which would make the whole ring resident at startup.
 1. View machinery: `RingMemory`, `RecvView`, `Orphan::RecvView`, the inbox
    release, the memory id check, and the view counters. No public API; tests
    create views through a crate-private constructor. `Bytes::from_owner`
-   raises ringline's `bytes` requirement to 1.9; the CHANGELOG names the
-   floor.
+   needs `bytes` 1.9; ringline takes `bytes` from the workspace (1.11.1),
+   and the CHANGELOG names that floor.
 2. The reader:
    - `with_bytes_segments` on both backends, with the `NeedAtLeast` skip and
      the `segment_epoch` check;
@@ -576,9 +584,11 @@ is zeroed eagerly, which would make the whole ring resident at startup.
      methods whose futures carry no borrow, the list of nine recv entry
      points in the rustdoc that begins "Take this connection's exclusive
      recv half" (`runtime/io.rs`), `with_bytes_segments` in
-     `ConnCtx::offer_for_park`'s list of reader callbacks and in the
-     `READER_CALLBACK_CONN` comment, and the `SEGMENT_STRANDED_ADOPTED`
-     comment;
+     `ConnCtx::offer_for_park`'s list of reader callbacks and in its list
+     of callbacks during which the runtime does not hold the request's
+     bytes, the `READER_CALLBACK_CONN` comment, and the
+     `SEGMENT_STRANDED_ADOPTED` comments in `runtime/io.rs` and
+     `metrics.rs`;
    - the parser run under `ReaderCallback::enter`.
 3. `recv_zc_threshold`, its helper and metric.
 4. Release resp-proto and memcache-proto with `parse_segments`, and move
@@ -604,10 +614,11 @@ is zeroed eagerly, which would make the whole ring resident at startup.
      the hold cap; views created per response.
    - Five reps per cell, with an A/A pair.
 6. Switch ringline-redis (`read_value_from`) and ringline-memcache
-   (`read_reply`, which `read_response` and `recv` call) to
-   `with_bytes_segments`, with the helper, if no cell of step 5 is worse
-   beyond its A/A spread. memcache-proto has no
-   binary-protocol `parse_segments`, so `BinaryClient`
+   (`read_reply`, shared by every response read and by `BinaryClient`
+   through `self.binary`; step 6 keeps the binary branch on `with_bytes`)
+   to `with_bytes_segments`, with the helper, if no cell of step 5 is worse
+   beyond its A/A spread. memcache-proto has no binary-protocol
+   `parse_segments`, so `BinaryClient`
    (`ClientBuilder::build_binary`) keeps reading with `with_bytes` and never
    enters the segmented domain. ringline-memcache's `read_reply` returns
    `Consumed(0)` when a response is incomplete and gains a length hint.
