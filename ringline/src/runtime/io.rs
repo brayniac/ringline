@@ -5538,7 +5538,8 @@ impl<F: FnMut(&SegChain<'_>) -> SegConsumed + Unpin> WithSegmentsFuture<F> {
 
 /// The calling worker's receive view threshold
 /// ([`ConfigBuilder::recv_zc_threshold`](crate::ConfigBuilder::recv_zc_threshold)),
-/// or the default, 4096, when called outside a ringline task, on any thread.
+/// or the default, 4096, when called anywhere other than a worker's tasks
+/// and its `on_tick` and `on_notify` callbacks.
 ///
 /// A client passes it to [`copy_small_view`] when it has no threshold of its
 /// own.
@@ -5562,8 +5563,9 @@ pub fn recv_zc_threshold() -> u32 {
 /// is released once no clone or slice of the view remains.
 ///
 /// A view is recognised by its data pointer lying in the calling worker's
-/// ring memory. On io_uring, called outside a ringline task, on any thread,
-/// every `Bytes` is treated as a view. A view made on one worker and passed
+/// ring memory. On io_uring, called anywhere other than a worker's tasks and
+/// its `on_tick` and `on_notify` callbacks, every `Bytes` is treated as a
+/// view. A view made on one worker and passed
 /// here on another is not recognised and is returned unchanged. On mio
 /// nothing is a view, and a non-empty `value` is returned unchanged.
 ///
@@ -5595,7 +5597,7 @@ thread_local! {
 }
 
 /// Whether `value`'s data lies in the calling worker's TCP receive ring
-/// memory; `true` outside a ringline task.
+/// memory; `true` where no worker's driver is current.
 #[cfg(has_io_uring)]
 fn is_recv_view(value: &Bytes) -> bool {
     try_with_state(|driver, _| {

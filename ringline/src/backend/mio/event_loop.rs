@@ -2786,7 +2786,7 @@ mod tests {
     }
 
     /// On mio nothing is a receive view: `copy_small_view` returns every
-    /// value unchanged, on the worker and off it, and `recv_zc_threshold`
+    /// non-empty value unchanged, on the worker and off it, and `recv_zc_threshold`
     /// reads the worker's configured value.
     #[test]
     fn copy_small_view_returns_values_unchanged_on_mio() {

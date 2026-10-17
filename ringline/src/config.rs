@@ -1210,8 +1210,9 @@ impl ConfigBuilder {
     /// On io_uring, `with_bytes_segments` presents held receive buffers as
     /// `Bytes` views of the ring, and a view a client keeps holds its whole
     /// ring buffer until it drops. The runtime does not apply this value
-    /// itself. [`recv_zc_threshold`](crate::recv_zc_threshold) returns it
-    /// inside a ringline task on the worker. A client passes it to
+    /// itself. [`recv_zc_threshold`](crate::recv_zc_threshold) returns it in
+    /// the worker's tasks and its `on_tick` and `on_notify` callbacks. A
+    /// client passes it to
     /// [`copy_small_view`](crate::copy_small_view), which copies a view
     /// shorter than the threshold, so a small kept value does not hold a
     /// ring buffer.
