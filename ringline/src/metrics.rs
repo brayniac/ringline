@@ -321,13 +321,15 @@ pub mod recv_ring {
     pub const VIEW_RELEASE_DROPPED: usize = 6;
     /// `segment_hold` entries a `with_bytes_segments` call copied into the
     /// accumulator because the hold reached its cap with the message
-    /// incomplete.
+    /// incomplete. Entries released without a copy, after the copy reached
+    /// `recv_accumulator_max`, are not counted.
     pub const HOLD_CAP_COPIED: usize = 7;
     /// Bytes copied into receive storage, on both backends: appended to or
     /// merged in a connection's accumulator (with the bytes a reallocation
     /// moves), prepended to it, or copied into an owned `segment_hold` entry
-    /// or an owned `recv_hold` copy. Ciphertext staged for TLS is not
-    /// counted.
+    /// or an owned `recv_hold` copy, and TLS plaintext queued before the
+    /// connection has a receive destination. Ciphertext staged for TLS is
+    /// not counted.
     pub const BYTES_COPIED: usize = 8;
     pub const COUNT: usize = 9;
 }
@@ -432,9 +434,7 @@ pub mod pool {
     /// here, which is why this one exists.
     ///
     /// Entering the segmented domain adopts what is already buffered, so a
-    /// non-zero count means bytes reached the accumulator after entry: a
-    /// `with_bytes_segments` call's hold-cap copy leaves them there when the
-    /// call resolves, or some path reached segmented delivery without
+    /// non-zero count means some path reached segmented delivery without
     /// adopting. The adoption keeps a live system correct; the count is how
     /// you find out it happened.
     pub const SEGMENT_STRANDED_ADOPTED: usize = 7;

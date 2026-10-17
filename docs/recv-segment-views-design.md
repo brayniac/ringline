@@ -256,9 +256,11 @@ streaming reads.
   parser over the pieces. If the skip applied at the cap, a parser that
   returned `NeedAtLeast` would not be called while the receive is throttled,
   and the hold would never drain.
-- If that parse is incomplete, every held entry is copied into the
-  accumulator, in order, their buffer holds are released, and the future
-  parks; its next poll presents the accumulator first. A message that
+- If that parse is incomplete and the receive side has not finished, every
+  held entry is copied into the accumulator, in order, their buffer holds
+  are released, and the future parks; its next poll presents the
+  accumulator first. At end of stream the future resolves to `Ok(0)` and
+  teardown releases the hold. A message that
   arrives in more completions than the hold cap completes only through this
   copy.
 - Before the copy, `AccumulatorTable::reclaim` reclaims the
@@ -280,11 +282,11 @@ streaming reads.
   bounded separately, so a TLS connection can hold up to twice
   `recv_accumulator_max`.
 - Bytes the copy leaves in the accumulator after the future resolves are
-  moved into the hold by the next segmented reader: `enter_segmented_domain`
-  for the next call of this reader, or `adopt_stranded_accumulator` for a
-  `SegmentReader`, which increments `SEGMENT_STRANDED_ADOPTED`. That
-  counter's comments name the hold-cap copy as one cause of a nonzero
-  value, and a path that strands bytes after entry as the other.
+  moved into the hold by the next segmented reader's entry
+  (`enter_segmented_domain`), which does not count them. Only a
+  `RecvOwnedSegment` future made before the copy and polled after it adopts
+  them through `adopt_stranded_accumulator`, which increments
+  `SEGMENT_STRANDED_ADOPTED`.
 - The future checks only the segment term of `at_hold_cap`,
   `Driver::segment_at_hold_cap`. The forward term
   would run the hold-cap copy while a lend sent by `forward_recv_buf` is in
@@ -492,6 +494,8 @@ storage:
   completion, a lend copied by `arm_forward_source`, a TLS plaintext chunk),
   except the accumulator moved in on entry;
 - a copy into a `recv_hold` entry's owned buffer (`own_recv_copy`);
+- TLS plaintext the unbuffered engine queues before the connection has a
+  receive destination;
 - the threshold helper.
 
 The hold-cap copy is counted through `append` and `reclaim`. TLS ciphertext staging is not

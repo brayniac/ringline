@@ -130,8 +130,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   and their releases (`docs/recv-segment-views-design.md`).
 - `Connection::with_bytes_segments` and `RecvHalf::with_bytes_segments`, on
   both backends, hand a parser the connection's buffered bytes as `&[Bytes]`
-  and take a `ParseResult`, for segment parsers such as resp-proto's
-  `Value::parse_segments`. On io_uring the call enters the segmented receive
+  and take a `ParseResult`, for parsers that parse a message split across
+  pieces and return a value inside one piece as a slice of it. On io_uring the call enters the segmented receive
   domain and presents each held receive buffer as a `Bytes` view of the
   ring buffer, so a value inside one buffer is not copied; a view the caller
   keeps holds its whole buffer until it drops. After `NeedAtLeast(n)` the
@@ -146,8 +146,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   where they return `Ok(())`.
 - `metrics::recv_ring::HOLD_CAP_COPIED` counts held entries
   `with_bytes_segments` copied at the hold cap, and `BYTES_COPIED` counts
-  bytes copied into receive storage (the accumulator, owned held entries and
-  owned forward copies) on both backends.
+  bytes copied into receive storage (the accumulator, owned held entries,
+  owned forward copies and queued TLS plaintext) on both backends.
 
 ### Changed
 
@@ -155,9 +155,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   later, as the other crates do; views use `Bytes::from_owner` (1.9). On
   io_uring a provided-buffer ring's buffers are an anonymous mapping, shared
   through an `Arc` with views of them, instead of a heap `Vec`.
-- On io_uring, `RecvHalf::segments` and `RecvHalf::recv_owned_segment` hold a
-  completion that was lent to the connection before the call in place, as a
-  pinned entry, instead of copying it into an owned one.
+- On io_uring, `RecvHalf::segments` and `RecvHalf::recv_owned_segment` keep a
+  completion lent before the call in its ring buffer, as a pinned entry,
+  instead of copying it into an owned one.
 - **Breaking (`ringline-redis`, `ringline-memcache`, `ringline-ping`):**
   `CommandResult` is `#[non_exhaustive]`. Code outside the crates reads it
   in an `on_result` callback and can no longer construct it.

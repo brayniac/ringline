@@ -213,16 +213,17 @@ fn self_signed() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
     (vec![CertificateDer::from(cert.cert)], key.into())
 }
 
-/// Launch `H` behind TLS and return the runtime, its workers, and a client
-/// connection that has finished its handshake.
-fn tls_server<H: AsyncEventHandler>(
-    config: Config,
-) -> (
+/// A running server, its workers, and a client connection that has finished
+/// its TLS handshake.
+type TlsServer = (
     ringline::Runtime,
     Vec<std::thread::JoinHandle<Result<(), ringline::Error>>>,
     rustls::ClientConnection,
     TcpStream,
-) {
+);
+
+/// Launch `H` behind TLS and connect a client to it.
+fn tls_server<H: AsyncEventHandler>(config: Config) -> TlsServer {
     let (certs, key) = self_signed();
     let server = rustls::ServerConfig::builder()
         .with_no_client_auth()

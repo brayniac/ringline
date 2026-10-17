@@ -21315,17 +21315,11 @@ mod tests {
     }
 
     fn bytes_copied() -> u64 {
-        use metriken::CounterGroupMetric;
-        crate::metrics::RECV_RING
-            .counter_value(crate::metrics::recv_ring::BYTES_COPIED)
-            .unwrap_or(0)
+        crate::accumulator::test_bytes_copied()
     }
 
     fn hold_cap_copied() -> u64 {
-        use metriken::CounterGroupMetric;
-        crate::metrics::RECV_RING
-            .counter_value(crate::metrics::recv_ring::HOLD_CAP_COPIED)
-            .unwrap_or(0)
+        crate::runtime::io::TEST_HOLD_CAP_COPIED.with(|c| c.get())
     }
 
     /// Each held buffer is presented as a view of the ring buffer's bytes, in
@@ -21483,6 +21477,121 @@ mod tests {
             .flat_map(|i| format!("m{i}").into_bytes())
             .collect();
         assert_eq!(last, vec![front, b"zz".to_vec()]);
+    }
+
+    /// Fill `conn_index`'s hold to its cap with one `data` entry per buffer,
+    /// starting at buffer 0, and return the cap.
+    fn fill_to_hold_cap(
+        el: &mut AsyncEventLoop<NoopHandler>,
+        conn_index: u32,
+        data: &[u8],
+    ) -> usize {
+        let cap = el.driver.quarter_ring_cap();
+        for bid in 0..cap as u16 {
+            deliver_segment(el, conn_index, bid, data);
+        }
+        assert!(el.driver.segment_at_hold_cap(conn_index));
+        cap
+    }
+
+    /// After a hold-cap copy, consuming part of the accumulator piece leaves
+    /// only its unconsumed bytes for the next call, ahead of the hold.
+    #[test]
+    fn bytes_segments_consumes_part_of_the_accumulator_after_a_hold_cap_copy() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
+        let cap = fill_to_hold_cap(&mut el, conn_index, b"ab");
+        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        let mut fut = std::pin::pin!(ctx.with_bytes_segments(|pieces| {
+            if pieces.last().is_some_and(|p| p[..] == b"zz"[..]) {
+                ParseResult::Consumed(3)
+            } else {
+                ParseResult::NeedMore
+            }
+        }));
+        assert!(poll_in(&mut el, fut.as_mut()).is_pending());
+        assert_eq!(el.driver.accumulators.len(conn_index), 2 * cap);
+        deliver_segment(&mut el, conn_index, cap as u16, b"zz");
+        assert_eq!(ready_ok(poll_in(&mut el, fut.as_mut())), 3);
+
+        let seen: Rc<RefCell<Vec<Vec<u8>>>> = Rc::default();
+        let seen_cb = Rc::clone(&seen);
+        let mut fut = std::pin::pin!(ctx.with_bytes_segments(move |pieces| {
+            seen_cb
+                .borrow_mut()
+                .extend(pieces.iter().map(|p| p.to_vec()));
+            ParseResult::NeedMore
+        }));
+        assert!(poll_in(&mut el, fut.as_mut()).is_pending());
+        let mut rest = b"ab".repeat(cap)[3..].to_vec();
+        rest.extend_from_slice(b"zz");
+        assert_eq!(seen.borrow().concat(), rest);
+    }
+
+    /// A hold-cap copy that reaches `recv_accumulator_max` closes the
+    /// connection and resolves to `Ok(0)`, and releases every entry's buffer
+    /// hold once, copied or not.
+    #[test]
+    fn bytes_segments_hold_cap_copy_past_the_accumulator_bound_closes() {
+        let mut el = make_test_loop_with_config(
+            test_config_builder()
+                .recv_accumulator_max(4096)
+                .build()
+                .expect("valid config"),
+        );
+        let conn_index = accept_connection(&mut el);
+        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
+        let cap = fill_to_hold_cap(&mut el, conn_index, &[7u8; 2000]);
+        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        let copied = hold_cap_copied();
+        let mut fut = std::pin::pin!(ctx.with_bytes_segments(|_| ParseResult::NeedMore));
+        assert_eq!(ready_ok(poll_in(&mut el, fut.as_mut())), 0);
+        assert!(
+            el.driver
+                .connections
+                .get(conn_index)
+                .is_some_and(|c| c.close_requested())
+        );
+        assert!(el.driver.segment_hold[conn_index as usize].is_empty());
+        for bid in 0..cap as u16 {
+            assert_eq!(
+                el.driver
+                    .pending_replenish
+                    .iter()
+                    .filter(|&&b| b == bid)
+                    .count(),
+                1,
+                "buffer {bid}'s hold is released once"
+            );
+        }
+        assert_eq!(
+            hold_cap_copied() - copied,
+            2,
+            "two entries fit in 4096 bytes"
+        );
+    }
+
+    /// At end of stream with the hold at its cap and the message incomplete,
+    /// the call resolves to `Ok(0)` without copying the hold.
+    #[test]
+    fn bytes_segments_at_end_of_stream_does_not_copy_the_hold() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
+        let cap = fill_to_hold_cap(&mut el, conn_index, b"ab");
+        el.driver
+            .connections
+            .get_mut(conn_index)
+            .expect("open")
+            .note_eof(false);
+        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        let copied = hold_cap_copied();
+        let mut fut = std::pin::pin!(ctx.with_bytes_segments(|_| ParseResult::NeedMore));
+        assert_eq!(ready_ok(poll_in(&mut el, fut.as_mut())), 0);
+        assert_eq!(hold_cap_copied(), copied);
+        assert_eq!(el.driver.segment_hold[conn_index as usize].len(), cap);
+        assert!(el.driver.accumulators.is_empty(conn_index));
     }
 
     /// At the hold cap, complete messages are consumed from the hold without

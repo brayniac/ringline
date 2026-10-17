@@ -8,7 +8,22 @@ use bytes::{Bytes, BytesMut};
 pub(crate) fn note_copied(n: usize) {
     if n > 0 {
         crate::metrics::RECV_RING.add(crate::metrics::recv_ring::BYTES_COPIED, n as u64);
+        #[cfg(test)]
+        TEST_BYTES_COPIED.with(|c| c.set(c.get() + n as u64));
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// This thread's `note_copied` total. Tests read it instead of the
+    /// process-wide metric, which concurrent tests in one process also move.
+    static TEST_BYTES_COPIED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// This thread's `note_copied` total.
+#[cfg(test)]
+pub(crate) fn test_bytes_copied() -> u64 {
+    TEST_BYTES_COPIED.with(|c| c.get())
 }
 
 /// Bytes `buf` held before an operation that may have moved them: `kept` if
@@ -493,10 +508,7 @@ mod tests {
     use super::*;
 
     fn bytes_copied() -> u64 {
-        use metriken::CounterGroupMetric;
-        crate::metrics::RECV_RING
-            .counter_value(crate::metrics::recv_ring::BYTES_COPIED)
-            .unwrap_or(0)
+        test_bytes_copied()
     }
 
     /// An append counts its bytes, and a growth that moves the existing

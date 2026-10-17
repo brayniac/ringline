@@ -405,7 +405,10 @@ fn drive_inner<C: UnbufferedEngine>(
                                     crate::accumulator::note_copied(r.payload.len());
                                     *outstanding += r.payload.len();
                                 }
-                                None => pending.push_back(r.payload.to_vec()),
+                                None => {
+                                    crate::accumulator::note_copied(r.payload.len());
+                                    pending.push_back(r.payload.to_vec());
+                                }
                             }
                         }
                         Err(e) => {

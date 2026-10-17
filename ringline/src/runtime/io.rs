@@ -33,8 +33,8 @@ use crate::runtime::{CURRENT_TASK_ID, Executor, IoResult};
 ///
 /// When the closure returns `NeedMore` or `Consumed(0)`, the future parks and
 /// retries when more data arrives. `Consumed(0)` on a non-empty buffer is
-/// treated identically to `NeedMore`. When the connection is closed (EOF),
-/// the future resolves with `0` regardless of the parse result.
+/// treated identically to `NeedMore`. At end of stream the closure is shown
+/// what is buffered; if it consumes nothing, the future resolves with `0`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ParseResult {
@@ -53,13 +53,14 @@ pub enum ParseResult {
     /// doubling-regrowth cascade (~2× the payload in extra memcpy for a
     /// multi-MB message arriving in chunks).
     ///
-    /// `with_data` and `with_bytes` only reserve with `additional`, so a
-    /// value that is too large costs memory. `with_bytes_segments` does not
-    /// call the parser again until `additional` more bytes are buffered, so a
-    /// value that is too large stalls it: on io_uring until the hold reaches
-    /// the receive throttle's cap or the receive side finishes, and on mio
-    /// until end of stream, or until the accumulator reaches
-    /// `recv_accumulator_max` and the connection is closed.
+    /// `with_data` and `with_bytes` only reserve with `additional`, so an
+    /// `additional` that is too large costs memory. `with_bytes_segments`
+    /// does not call the parser again until `additional` more bytes are
+    /// buffered, so an `additional` that is too large stalls it. On io_uring
+    /// it stalls until the hold reaches the receive throttle's cap or the
+    /// receive side finishes. On mio it stalls until end of stream, or until
+    /// the accumulator reaches `recv_accumulator_max` and the connection is
+    /// closed.
     NeedAtLeast(usize),
 }
 
@@ -124,7 +125,7 @@ impl Drop for DriverStateGuard {
 // `offer_for_park` declines an offer made from inside the connection's own
 // reader callback, while it is the innermost one running. `with_bytes` takes
 // the request out of the driver before its callback runs, and so does
-// `with_bytes_segments` for the accumulator bytes it presents. A
+// `with_bytes_segments` for accumulator bytes a hold-cap copy left there. A
 // `forward_recv_buf` that sends the whole lent buffer or the whole
 // accumulator takes it out during the callback. `holds_unread` returns false
 // for a request taken out either way (#669).
@@ -1185,7 +1186,7 @@ impl ConnCtx {
     /// inside a callback on connection B, itself inside A's callback, is
     /// declined only while the runtime still holds A's bytes. It does not
     /// hold them in a `with_bytes` callback, in a `with_bytes_segments`
-    /// callback shown only bytes the runtime copied into the accumulator,
+    /// callback shown only bytes a hold-cap copy left in the accumulator,
     /// or after a `forward_recv_buf` that sent the whole lent buffer or the
     /// whole accumulator.
     /// `metrics::park_diag::OFFER_DECLINED` counts offers ignored because of
@@ -3893,9 +3894,9 @@ impl Connection {
     /// Wait until received data is available, then hand the parser the
     /// connection's buffered bytes as an ordered list of `Bytes` pieces.
     ///
-    /// For a segment parser such as resp-proto's `Value::parse_segments` or
-    /// memcache-proto's `ResponseBytes::parse_segments`, which return a value
-    /// inside one piece as a slice of it. The parser returns a
+    /// For a segment parser: one that parses a message split across pieces
+    /// and returns a value inside one piece as a slice of it. The parser
+    /// returns a
     /// [`ParseResult`] for the bytes consumed from the front of the pieces,
     /// as a [`with_bytes`](Self::with_bytes) parser does for its one `Bytes`.
     ///
@@ -3921,7 +3922,8 @@ impl Connection {
     /// The connection stays in the segmented domain after the future
     /// resolves. Call [`end_segments`](Self::end_segments) before reading
     /// with `with_data`, `with_bytes`, `recv_ready`, a `ConnStream` or a recv
-    /// sink, which on io_uring see no bytes until it runs.
+    /// sink. On io_uring, until it runs, those see only bytes a hold-cap copy
+    /// left in the accumulator, and none that arrive later.
     ///
     /// Resolves to:
     ///
@@ -3929,9 +3931,12 @@ impl Connection {
     /// - `Ok(0)` at end of stream, for a stale handle, or after the
     ///   connection is closed because the buffered bytes exceed
     ///   `recv_accumulator_max`;
-    /// - `Err(EBUSY)` while a forward runs or a `SegmentReader` is live, or
-    ///   when another reader consumed bytes, or `end_segments` ran, since
-    ///   the future last parked. Call again.
+    /// - `Err(EBUSY)` when another reader consumed bytes, or `end_segments`
+    ///   ran, since the future last parked; call again to read with the
+    ///   connection's current state;
+    /// - `Err(EBUSY)` while a forward runs or a `SegmentReader` is live. A
+    ///   new call also resolves to `Err(EBUSY)`, without waiting, until the
+    ///   forward ends or the reader drops.
     pub fn with_bytes_segments<F>(&mut self, f: F) -> WithBytesSegmentsFuture<F>
     where
         F: FnMut(&[Bytes]) -> ParseResult,
@@ -3939,8 +3944,17 @@ impl Connection {
         self.rx.with_bytes_segments(f)
     }
 
-    /// See [`Connection::end_segments`]. On mio, which has no segmented
-    /// domain, returns `Ok(())`.
+    /// Return the connection to the default receive domain, after
+    /// [`with_bytes_segments`](Self::with_bytes_segments) or another
+    /// segmented reader.
+    ///
+    /// On io_uring the held bytes no reader has consumed are copied, in
+    /// order, to the front of the accumulator, where the next `with_data` or
+    /// `with_bytes` call reads them first. If that copy would exceed
+    /// `recv_accumulator_max`, the connection is closed and an `OutOfMemory`
+    /// error returned; for a stale handle the error is `EPIPE`.
+    ///
+    /// On mio, which has no segmented domain, it returns `Ok(())`.
     pub fn end_segments(&mut self) -> io::Result<()> {
         self.rx.end_segments()
     }
@@ -4499,11 +4513,8 @@ impl Drop for SegmentReader<'_> {
 /// panic; asserting here would contradict that.)
 ///
 /// `enter_segmented_domain` adopts on entry, so a non-zero
-/// `SEGMENT_STRANDED_ADOPTED` means bytes were left in the accumulator after
-/// entry: by a `with_bytes_segments` call's hold-cap copy, which leaves the
-/// copied bytes there when the call resolves, or by a path that strands
-/// them, for which this adoption is the only reason the connection kept
-/// working.
+/// `SEGMENT_STRANDED_ADOPTED` means bytes were stranded *after* entry and this
+/// path is the only reason the connection kept working.
 #[cfg(has_io_uring)]
 fn adopt_stranded_accumulator(driver: &mut Driver, conn: u32) {
     if driver.accumulators.is_empty(conn) {
@@ -4553,7 +4564,8 @@ fn enter_segmented(
     // segmented domain through the `ConnCtx` path behind its back is
     // the mixing this design exists to stop, so refuse it wherever the
     // signature can say so. (`with_data` and friends still cannot
-    // report it — that is what step 3 removes.)
+    // report it; step 3 of `docs/connection-handle-ownership-design.md`
+    // removes that.)
     //
     // `ViaHalf` is exempt: the half holds this claim by construction,
     // so treating it like any other caller made it refuse itself.
@@ -5636,8 +5648,10 @@ impl<F: FnMut(&[Bytes]) -> ParseResult + Unpin> WithBytesSegmentsFuture<F> {
             }
             return self.park(driver, executor);
         }
-        // The skip does not apply at the hold cap: the receive is throttled
-        // there, so no more bytes arrive until the hold drains.
+        // The skip does not apply at the hold cap: there a plaintext
+        // connection's receive is throttled, so no more bytes arrive until the
+        // hold drains, and a TLS connection's later chunks would only grow
+        // the hold.
         if let Some(call_at) = self.call_at
             && total < call_at
             && !finished(driver)
@@ -5708,14 +5722,16 @@ impl<F: FnMut(&[Bytes]) -> ParseResult + Unpin> WithBytesSegmentsFuture<F> {
             ParseResult::NeedAtLeast(n) => Some(total.saturating_add(n)),
             _ => None,
         };
+        // At end of stream no more bytes can complete the message, so the
+        // hold is left for teardown rather than copied.
+        if finished(driver) {
+            return self.resolve(Ok(0));
+        }
         if driver.segment_at_hold_cap(conn)
             && !driver.segment_hold[idx].is_empty()
             && !copy_hold_to_accumulator(driver, conn, need)
         {
             driver.close_connection(conn);
-            return self.resolve(Ok(0));
-        }
-        if finished(driver) {
             return self.resolve(Ok(0));
         }
         self.park(driver, executor)
@@ -5839,9 +5855,8 @@ fn copy_hold_to_accumulator(driver: &mut Driver, conn: u32, need: usize) -> bool
     driver.accumulators.reserve(conn, held.saturating_add(need));
     driver.accumulators.reclaim(conn);
     let mut ok = true;
-    let mut entries = 0u64;
+    let mut copied = 0u64;
     while let Some(entry) = driver.segment_hold[idx].pop_front() {
-        entries += 1;
         match entry {
             crate::backend::HeldRecvBuf::Pinned { bid, off, len } => {
                 if ok {
@@ -5855,18 +5870,30 @@ fn copy_hold_to_accumulator(driver: &mut Driver, conn: u32, need: usize) -> bool
                         )
                     };
                     ok = driver.accumulators.append(conn, data);
+                    copied += u64::from(ok);
                 }
                 driver.pending_replenish.push(bid);
             }
             crate::backend::HeldRecvBuf::Owned(bytes) => {
                 if ok {
                     ok = driver.accumulators.append(conn, &bytes);
+                    copied += u64::from(ok);
                 }
             }
         }
     }
-    crate::metrics::RECV_RING.add(crate::metrics::recv_ring::HOLD_CAP_COPIED, entries);
+    crate::metrics::RECV_RING.add(crate::metrics::recv_ring::HOLD_CAP_COPIED, copied);
+    #[cfg(test)]
+    TEST_HOLD_CAP_COPIED.with(|c| c.set(c.get() + copied));
     ok
+}
+
+#[cfg(all(test, has_io_uring))]
+thread_local! {
+    /// This thread's `HOLD_CAP_COPIED` total, for tests: the process-wide
+    /// metric is also moved by concurrent tests in one process.
+    pub(crate) static TEST_HOLD_CAP_COPIED: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
 }
 
 // ── RecvReadyFuture ──────────────────────────────────────────────────
