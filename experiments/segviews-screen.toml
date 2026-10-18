@@ -16,6 +16,15 @@
 # phase = fixed: builds A, B and A again (the A/A pair), in an order that
 #   rotates with rep, each at the cell's rate from `rates`
 #   ("resp-v64-d1=123456,..."). Submit with rep = 1, 2, 3.
+# phase = latency or profile: the cells named in `rates`, at those rates, in
+#   the build order `order` (for example "a b a b a b"). Set `connections`
+#   to change the load. With profile = "1" the client records a
+#   system-wide perf profile with call graphs for `profile_secs` seconds,
+#   starting `profile_delay` seconds into each run, and keeps the reports
+#   in results/prof: by process and DSO for the whole VM, and by symbol
+#   for ringline's worker threads. Profile with the frame-pointer build (segviews-build.toml
+#   with rustflags = "-C force-frame-pointers=yes"); sampling costs CPU, so a
+#   profiled run's CPU time and latency are not measurements.
 #
 # Each run records cachecannon's JSON result, its parquet metrics (ringline's
 # RECV_RING copy and view counters among them), and user and system CPU and
@@ -35,6 +44,10 @@ client_threads = "16"
 connections    = "1000"
 warmup         = "10s"
 duration       = "40s"
+order          = ""
+profile        = "0"
+profile_delay  = "15"
+profile_secs   = "20"
 
 [[jobs]]
 name = "server"
@@ -125,6 +138,11 @@ uname -r
 sudo sysctl -w net.core.rmem_max=134217728 net.core.wmem_max=134217728 net.ipv4.ip_local_port_range="1024 65535"
 sudo apt-get update -qq
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq time >/dev/null || exit 1
+if [ "{profile}" = "1" ]; then
+  sudo sysctl -w kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq linux-perf >/dev/null || exit 1
+  perf --version
+fi
 '''
 
 [[jobs.steps]]
@@ -142,7 +160,7 @@ payload_timeout = 14000
 payload = '''
 set -uo pipefail
 cd /home/anvil
-mkdir -p results
+mkdir -p results/prof
 ulimit -n 1048576
 # Linux 6.14+ charges io_uring rings to RLIMIT_MEMLOCK; harmless before.
 ulimit -l unlimited 2>/dev/null || sudo prlimit --memlock=unlimited:unlimited --pid $$
@@ -162,8 +180,10 @@ case "{phase}" in
       2) order="b a2 a" ;;
       *) order="a2 a b" ;;
     esac ;;
+  latency|profile) order="{order}" ;;
   *) echo "BAD PHASE {phase}"; exit 1 ;;
 esac
+[ -n "$order" ] || { echo "NO ORDER for phase {phase}"; exit 1; }
 echo "phase={phase} rep={rep} order=$order"
 
 # config FILE PROTO PORT VLEN KEYS DEPTH RATE PREFILL DURATION WARMUP PARQUET
@@ -230,16 +250,37 @@ for proto in resp memcache; do
     for depth in $depths; do
       cell="$proto-v$vlen-d$depth"
       rate=""
-      if [ "{phase}" = fixed ]; then
+      if [ "{phase}" != saturate ]; then
         rate=$(echo "{rates}" | tr ',' '\n' | grep "^$cell=" | cut -d= -f2)
-        [ -n "$rate" ] || { echo "NO RATE for $cell"; continue; }
+        if [ -z "$rate" ]; then
+          [ "{phase}" = fixed ] && echo "NO RATE for $cell"
+          continue
+        fi
       fi
+      # A build named twice in `order` runs twice; the second run is <b>2,
+      # the third <b>3, and so on.
+      seen=" "
       for b in $order; do
-        case $b in b) bin=out/cachecannon-b ;; *) bin=out/cachecannon-a ;; esac
+        case $b in b*) bin=out/cachecannon-b ;; *) bin=out/cachecannon-a ;; esac
+        n=$(echo "$seen" | tr ' ' '\n' | grep -c "^$b$")
+        seen="$seen$b "
         run="$cell-$b"
+        [ "$n" -gt 0 ] && run="$cell-$b$((n + 1))"
         config results/$run.toml $proto $port $vlen $keys $depth "$rate" false {duration} {warmup} results/$run.parquet
         /usr/bin/time -f "time user_s=%U sys_s=%S maxrss_kb=%M" -o results/$run.time \
-          $bin results/$run.toml > results/$run.json 2> results/$run.log
+          $bin results/$run.toml > results/$run.json 2> results/$run.log &
+        pid=$!
+        if [ "{profile}" = "1" ]; then
+          sleep {profile_delay}
+          sudo perf record -a -g -F 499 -o results/prof/$run.data -- sleep {profile_secs} 2> results/prof/$run.err
+          sudo perf report -i results/prof/$run.data --stdio --no-children --sort comm,dso 2>/dev/null | grep -v '^#' | grep -v '^$' | head -40 > results/prof/$run-dso.txt
+          sudo perf report -i results/prof/$run.data --stdio --no-children --comm ringline-worker --sort sym -g none --percent-limit 0.05 2>/dev/null | grep -v '^#' | grep -v '^$' | head -600 > results/prof/$run-self.txt
+          sudo perf report -i results/prof/$run.data --stdio --children --comm ringline-worker --sort sym -g none --percent-limit 0.2 2>/dev/null | grep -v '^#' | grep -v '^$' | head -600 > results/prof/$run-children.txt
+          sudo perf report -i results/prof/$run.data --stdio --no-children --comm ringline-worker --sort sym -g caller,0.5,callee --percent-limit 1 2>/dev/null | head -4000 > results/prof/$run-graph.txt
+          sudo rm -f results/prof/$run.data
+          echo "-- profile $run"; head -8 results/prof/$run-dso.txt
+        fi
+        wait $pid
         rc=$?
         shown_rate=$rate; [ -n "$shown_rate" ] || shown_rate=max
         echo "== phase={phase} rep={rep} cell=$cell build=$b rate=$shown_rate rc=$rc $(cat results/$run.time)"

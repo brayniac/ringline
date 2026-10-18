@@ -6,12 +6,19 @@
 #                  with with_bytes_segments)
 # The builds differ only in the pins in Cargo.toml and Cargo.lock. Same
 # profile for both; no target-cpu=native.
-name = "segviews build (a={ref_a}, b={ref_b})"
+#
+# For profiling, submit with rustflags = "-C force-frame-pointers=yes" and
+# debug = "line-tables-only", so `perf record -g` can walk the Rust frames
+# and reports name source lines. Measure CPU and latency with the default
+# build (rustflags empty, debug = 0), not this one.
+name = "segviews build (a={ref_a}, b={ref_b}, rustflags={rustflags}, debug={debug})"
 
 [params]
 repo  = "https://github.com/brayniac/cachecannon"
 ref_a = "exp/segviews-a"
 ref_b = "exp/segviews-b"
+rustflags = ""
+debug = "0"
 
 [[jobs]]
 name = "build"
@@ -33,6 +40,7 @@ set -uo pipefail
 cd /home/anvil
 {
   cat /etc/anvil-instance.json
+  echo "rustflags={rustflags} debug={debug}"
   mkdir -p out
   status=0
   for arm in a b; do
@@ -40,7 +48,7 @@ cd /home/anvil
     git clone -q {repo} cc-$arm && git -C cc-$arm checkout -q $ref
     echo "cachecannon-$arm: $(git -C cc-$arm log --oneline -1)"
     grep -E '^(ringline|resp-proto|memcache-proto)[a-z-]* = \{ git' cc-$arm/Cargo.toml
-    ( cd cc-$arm && CARGO_PROFILE_RELEASE_LTO=thin CARGO_PROFILE_RELEASE_DEBUG=0 CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 cargo build --release --locked -j 2 ) || status=1
+    ( cd cc-$arm && RUSTFLAGS="{rustflags}" CARGO_PROFILE_RELEASE_LTO=thin CARGO_PROFILE_RELEASE_DEBUG={debug} CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 cargo build --release --locked -j 2 ) || status=1
     cp cc-$arm/target/release/cachecannon out/cachecannon-$arm || status=1
   done
   ( cd out && sha256sum * )
