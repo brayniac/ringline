@@ -615,6 +615,7 @@ pub fn connect(addr: SocketAddr) -> TcpConnect {
         addr,
         server_name: None,
         timeout: None,
+        recv_direct: false,
     }
 }
 
@@ -650,6 +651,7 @@ pub struct TcpConnect {
     addr: SocketAddr,
     server_name: Option<String>,
     timeout: Option<Duration>,
+    recv_direct: bool,
 }
 
 impl TcpConnect {
@@ -673,6 +675,25 @@ impl TcpConnect {
     /// immediately rather than meaning "no timeout"; omit the call for that.
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
+        self
+    }
+
+    /// Receive into this connection's own accumulator instead of the
+    /// worker's provided-buffer ring (io_uring only).
+    ///
+    /// When a read on the connection parks (`with_data`, `with_bytes` and
+    /// the other receive futures), the runtime submits a one-shot receive
+    /// whose destination is the free space of the connection's accumulator,
+    /// so the received bytes are not copied out of a ring buffer. After a
+    /// parser returns [`ParseResult::NeedAtLeast`], the receive asks for
+    /// exactly the missing bytes. Otherwise it asks for the free space,
+    /// grown to [`ConfigBuilder::recv_direct_region`](crate::ConfigBuilder::recv_direct_region)
+    /// when less than half of that is free, and an idle connection keeps an
+    /// accumulator of about that size.
+    ///
+    /// Ignored on a TLS connection and on the mio backend.
+    pub fn recv_direct(mut self, enabled: bool) -> Self {
+        self.recv_direct = enabled;
         self
     }
 }
@@ -707,6 +728,7 @@ impl std::future::IntoFuture for TcpConnect {
                 target: ConnectTarget::Tcp {
                     addr: self.addr,
                     server_name: self.server_name,
+                    recv_direct: self.recv_direct,
                 },
                 timeout: self.timeout,
             },
@@ -733,6 +755,8 @@ enum ConnectTarget {
     Tcp {
         addr: SocketAddr,
         server_name: Option<String>,
+        #[cfg_attr(not(has_io_uring), allow(dead_code))]
+        recv_direct: bool,
     },
     Unix {
         path: std::path::PathBuf,
@@ -3150,6 +3174,25 @@ impl<'a> MioSendBuilder<'a> {
 
 // ── WithDataFuture ───────────────────────────────────────────────────
 
+/// Register the current task as `conn_index`'s receive waiter. On a direct
+/// connection (`TcpConnect::recv_direct`) also arm its receive, which the
+/// caller does only after its parser has seen every buffered byte. `need` is
+/// the parser's `NeedAtLeast` value, if it returned one.
+fn park_recv(
+    #[allow(unused_variables)] driver: &mut Driver,
+    executor: &mut Executor,
+    conn_index: u32,
+    #[allow(unused_variables)] need: Option<usize>,
+) {
+    executor.owner_task[conn_index as usize] = Some(CURRENT_TASK_ID.with(|c| c.get()));
+    executor.recv_waiters[conn_index as usize] = true;
+    #[cfg(has_io_uring)]
+    if driver.arm_direct_recv_or_close(conn_index, need) {
+        // The connection closed instead: poll again to resolve the read.
+        executor.wake_recv(conn_index);
+    }
+}
+
 /// Future returned by [`Connection::with_data`].
 pub struct WithDataFuture<F> {
     conn_index: u32,
@@ -3284,8 +3327,7 @@ impl<F: FnMut(&[u8]) -> ParseResult + Unpin> WithDataFuture<F> {
             }
 
             // No data available — register as recv waiter and park.
-            executor.owner_task[self.conn_index as usize] = Some(CURRENT_TASK_ID.with(|c| c.get()));
-            executor.recv_waiters[self.conn_index as usize] = true;
+            park_recv(driver, executor, self.conn_index, None);
             return Poll::Pending;
         }
 
@@ -3331,8 +3373,11 @@ impl<F: FnMut(&[u8]) -> ParseResult + Unpin> WithDataFuture<F> {
         }
 
         // Connection still open — wait for more data before retrying.
-        executor.owner_task[self.conn_index as usize] = Some(CURRENT_TASK_ID.with(|c| c.get()));
-        executor.recv_waiters[self.conn_index as usize] = true;
+        let need = match result {
+            ParseResult::NeedAtLeast(additional) => Some(additional),
+            _ => None,
+        };
+        park_recv(driver, executor, self.conn_index, need);
         Poll::Pending
     }
 }
@@ -3462,8 +3507,7 @@ impl<F: FnMut(Bytes) -> ParseResult + Unpin> WithBytesFuture<F> {
                 });
             }
 
-            executor.owner_task[self.conn_index as usize] = Some(CURRENT_TASK_ID.with(|c| c.get()));
-            executor.recv_waiters[self.conn_index as usize] = true;
+            park_recv(driver, executor, self.conn_index, None);
             return Poll::Pending;
         }
 
@@ -3511,8 +3555,11 @@ impl<F: FnMut(Bytes) -> ParseResult + Unpin> WithBytesFuture<F> {
             return Poll::Ready(0);
         }
 
-        executor.owner_task[self.conn_index as usize] = Some(CURRENT_TASK_ID.with(|c| c.get()));
-        executor.recv_waiters[self.conn_index as usize] = true;
+        let need = match result {
+            ParseResult::NeedAtLeast(additional) => Some(additional),
+            _ => None,
+        };
+        park_recv(driver, executor, self.conn_index, need);
         Poll::Pending
     }
 }
@@ -6055,8 +6102,7 @@ impl Future for RecvReadyFuture {
             }
 
             // Not ready — register as recv waiter and park.
-            executor.owner_task[self.conn_index as usize] = Some(CURRENT_TASK_ID.with(|c| c.get()));
-            executor.recv_waiters[self.conn_index as usize] = true;
+            park_recv(driver, executor, self.conn_index, None);
             Poll::Pending
         })
     }
@@ -6584,10 +6630,12 @@ impl ConnectFuture {
             ConnectTarget::Tcp {
                 addr,
                 server_name: Some(name),
+                ..
             } => ctx.start_connect_tls(*addr, name),
             ConnectTarget::Tcp {
                 addr,
                 server_name: None,
+                ..
             } => ctx.start_connect(*addr),
             ConnectTarget::Unix { path } => ctx.start_connect_unix(path.as_path()),
         }
@@ -6595,6 +6643,16 @@ impl ConnectFuture {
         if let Some(timeout) = timeout {
             let ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
             ctx.arm_connect_timeout(token.index, ms);
+        }
+        #[cfg(has_io_uring)]
+        if let ConnectTarget::Tcp {
+            server_name: None,
+            recv_direct: true,
+            ..
+        } = target
+            && let Some(cs) = driver.connections.get_mut(token.index)
+        {
+            cs.recv_direct = true;
         }
         let calling_task = CURRENT_TASK_ID.with(|c| c.get());
         executor.owner_task[token.index as usize] = Some(calling_task);

@@ -146,6 +146,15 @@ pub struct ConnectionState {
     /// 6.13) ahead of closing the fixed descriptor (#581, #586).
     #[cfg(has_io_uring)]
     pub socket_handed_off: bool,
+    /// The connection receives with one-shot receives into its own
+    /// accumulator (`TcpConnect::recv_direct`) instead of the provided
+    /// ring. Set when the connect is submitted, for the connection's life.
+    #[cfg(has_io_uring)]
+    pub recv_direct: bool,
+    /// A direct receive is in flight; the accumulator's buffer is held by
+    /// its `Driver::direct_recvs` entry until the completion.
+    #[cfg(has_io_uring)]
+    pub recv_direct_armed: bool,
 }
 
 impl Default for ConnectionState {
@@ -174,6 +183,10 @@ impl ConnectionState {
             recv_multishot_armed: false,
             #[cfg(has_io_uring)]
             socket_handed_off: false,
+            #[cfg(has_io_uring)]
+            recv_direct: false,
+            #[cfg(has_io_uring)]
+            recv_direct_armed: false,
         }
     }
 
@@ -242,6 +255,8 @@ impl ConnectionState {
             self.direct_echo = false;
             self.recv_multishot_armed = false;
             self.socket_handed_off = false;
+            self.recv_direct = false;
+            self.recv_direct_armed = false;
         }
         self.generation = self.generation.wrapping_add(1);
     }
