@@ -3535,6 +3535,17 @@ impl<F: FnMut(Bytes) -> ParseResult + Unpin> WithBytesFuture<F> {
                     driver
                         .accumulators
                         .put_back(self.conn_index, frozen.slice(consumed..));
+                } else {
+                    // A direct connection's next receive reuses this
+                    // allocation if no slice of it is alive by then.
+                    #[cfg(has_io_uring)]
+                    if driver
+                        .connections
+                        .get(self.conn_index)
+                        .is_some_and(|cs| cs.recv_direct)
+                    {
+                        driver.accumulators.keep_spent(self.conn_index, frozen);
+                    }
                 }
                 #[cfg(has_io_uring)]
                 driver.accumulators.note_consumed(self.conn_index, consumed);
