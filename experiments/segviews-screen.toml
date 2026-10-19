@@ -16,15 +16,23 @@
 # phase = fixed: builds A, B and A again (the A/A pair), in an order that
 #   rotates with rep, each at the cell's rate from `rates`
 #   ("resp-v64-d1=123456,..."). Submit with rep = 1, 2, 3.
-# phase = latency or profile: the cells named in `rates`, at those rates, in
-#   the build order `order` (for example "a b a b a b"). Set `connections`
-#   to change the load. With profile = "1" the client records a
-#   system-wide perf profile with call graphs for `profile_secs` seconds,
-#   starting `profile_delay` seconds into each run, and keeps the reports
-#   in results/prof: by process and DSO for the whole VM, and by symbol
-#   for ringline's worker threads. Profile with the frame-pointer build (segviews-build.toml
-#   with rustflags = "-C force-frame-pointers=yes"); sampling costs CPU, so a
+# phase = latency, cpu or profile: the cells named in `rates`, at those
+#   rates, in the build order `order` (for example "a b a b a b"). Set
+#   `connections` to change the load. With profile = "1" the client records
+#   a system-wide perf profile with call graphs for `profile_secs` seconds,
+#   starting `profile_delay` seconds into each run, and keeps in
+#   results/prof: samples by process and DSO for the whole VM, ringline's
+#   worker threads by symbol, and the worker threads' full call stacks
+#   folded one per line (root first, then the sample count), gzipped.
+#   Profile with the frame-pointer build (segviews-build.toml with
+#   rustflags = "-C force-frame-pointers=yes"); sampling costs CPU, so a
 #   profiled run's CPU time and latency are not measurements.
+#
+# Builds in `order`: a and b use cachecannon's default receive ring, plain
+# 256 x 16 KiB. ai and bi are the same binaries with an incremental ring of
+# 64 x 1 MiB (general.recv_incremental); ringline uses a plain ring of that
+# geometry on a kernel without incremental rings, and RECV_RING's first two
+# counters say which ring each worker got.
 #
 # Each run records cachecannon's JSON result, its parquet metrics (ringline's
 # RECV_RING copy and view counters among them), and user and system CPU and
@@ -140,7 +148,8 @@ sudo apt-get update -qq
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq time >/dev/null || exit 1
 if [ "{profile}" = "1" ]; then
   sudo sysctl -w kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
-  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq linux-perf >/dev/null || exit 1
+  # libc6-dbg names libc's memmove variants, which are otherwise unresolved.
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq linux-perf libc6-dbg >/dev/null || exit 1
   perf --version
 fi
 '''
@@ -180,26 +189,28 @@ case "{phase}" in
       2) order="b a2 a" ;;
       *) order="a2 a b" ;;
     esac ;;
-  latency|profile) order="{order}" ;;
+  latency|cpu|profile) order="{order}" ;;
   *) echo "BAD PHASE {phase}"; exit 1 ;;
 esac
 [ -n "$order" ] || { echo "NO ORDER for phase {phase}"; exit 1; }
 echo "phase={phase} rep={rep} order=$order"
 
-# config FILE PROTO PORT VLEN KEYS DEPTH RATE PREFILL DURATION WARMUP PARQUET
+# config FILE PROTO PORT VLEN KEYS DEPTH RATE PREFILL DURATION WARMUP PARQUET INC
 config() {
   local file=$1 proto=$2 port=$3 vlen=$4 keys=$5 depth=$6 rate=$7 prefill=$8 dur=$9
   shift 9
-  local warm=$1 parquet=$2
-  local rate_line="" prefill_line="prefill = false"
+  local warm=$1 parquet=$2 inc=$3
+  local rate_line="" prefill_line="prefill = false" ring_lines=""
   [ -n "$rate" ] && rate_line="rate_limit = $rate"
   [ "$prefill" = true ] && prefill_line=$'prefill = true\nprefill_settle = "0s"'
+  [ "$inc" = true ] && ring_lines=$'recv_incremental = true\nrecv_ring_size = 64\nrecv_buffer_size = 1048576'
   cat > "$file" <<CFG
 [general]
 duration = "$dur"
 warmup = "$warm"
 threads = {client_threads}
 ringline_diag = true
+$ring_lines
 
 [target]
 endpoints = ["{server_ip}:$port"]
@@ -244,7 +255,7 @@ for proto in resp memcache; do
       1048576) keys=400; depths="1";;
     esac
     # Write every key once; not measured.
-    config results/prefill-$proto-v$vlen.toml $proto $port $vlen $keys 1 "" true 1s 0s results/prefill-$proto-v$vlen.parquet
+    config results/prefill-$proto-v$vlen.toml $proto $port $vlen $keys 1 "" true 1s 0s results/prefill-$proto-v$vlen.parquet false
     ./out/cachecannon-a results/prefill-$proto-v$vlen.toml > results/prefill-$proto-v$vlen.json 2> results/prefill-$proto-v$vlen.log
     echo "== prefill $proto v$vlen rc=$?"
     for depth in $depths; do
@@ -262,11 +273,12 @@ for proto in resp memcache; do
       seen=" "
       for b in $order; do
         case $b in b*) bin=out/cachecannon-b ;; *) bin=out/cachecannon-a ;; esac
+        case $b in ?i*) inc=true ;; *) inc=false ;; esac
         n=$(echo "$seen" | tr ' ' '\n' | grep -c "^$b$")
         seen="$seen$b "
         run="$cell-$b"
         [ "$n" -gt 0 ] && run="$cell-$b$((n + 1))"
-        config results/$run.toml $proto $port $vlen $keys $depth "$rate" false {duration} {warmup} results/$run.parquet
+        config results/$run.toml $proto $port $vlen $keys $depth "$rate" false {duration} {warmup} results/$run.parquet $inc
         /usr/bin/time -f "time user_s=%U sys_s=%S maxrss_kb=%M" -o results/$run.time \
           $bin results/$run.toml > results/$run.json 2> results/$run.log &
         pid=$!
@@ -275,8 +287,16 @@ for proto in resp memcache; do
           sudo perf record -a -g -F 499 -o results/prof/$run.data -- sleep {profile_secs} 2> results/prof/$run.err
           sudo perf report -i results/prof/$run.data --stdio --no-children --sort comm,dso 2>/dev/null | grep -v '^#' | grep -v '^$' | head -40 > results/prof/$run-dso.txt
           sudo perf report -i results/prof/$run.data --stdio --no-children --comm ringline-worker --sort sym -g none --percent-limit 0.05 2>/dev/null | grep -v '^#' | grep -v '^$' | head -600 > results/prof/$run-self.txt
-          sudo perf report -i results/prof/$run.data --stdio --children --comm ringline-worker --sort sym -g none --percent-limit 0.2 2>/dev/null | grep -v '^#' | grep -v '^$' | head -600 > results/prof/$run-children.txt
-          sudo perf report -i results/prof/$run.data --stdio --no-children --comm ringline-worker --sort sym -g caller,0.5,callee --percent-limit 1 2>/dev/null | head -4000 > results/prof/$run-graph.txt
+          # Fold each worker sample's call stack into one line, root first:
+          # perf script prints a header line per sample, then one
+          # tab-indented frame per line, leaf first, then a blank line.
+          sudo perf script -i results/prof/$run.data --comms ringline-worker -F comm,ip,sym,dso --no-inline 2>/dev/null | awk '
+            function emit(  k, line) { line = "ringline-worker"; for (k = n - 1; k >= 0; k--) line = line ";" f[k]; c[line]++; n = 0 }
+            /^\t/ { s = $2; for (i = 3; i < NF; i++) s = s " " $i; if (s == "[unknown]") s = $NF "?"; gsub(/;/, ":", s); f[n++] = s; next }
+            /^$/ { if (n) emit(); next }
+            { if (n) emit() }
+            END { if (n) emit(); for (l in c) print l, c[l] }' | gzip > results/prof/$run-folded.txt.gz
+          echo "folded stacks: $(zcat results/prof/$run-folded.txt.gz | wc -l) distinct, $(zcat results/prof/$run-folded.txt.gz | awk '{ t += $NF } END { print t }') samples"
           sudo rm -f results/prof/$run.data
           echo "-- profile $run"; head -8 results/prof/$run-dso.txt
         fi
