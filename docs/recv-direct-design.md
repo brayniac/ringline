@@ -1,7 +1,8 @@
 # Direct receive: one-shot receives into the connection's accumulator
 
-Status: prototype on `feat/recv-direct`, measured. Open: the measurement of
-the 64 B fix (build C3), and the owner decisions at the end.
+Status: prototype on `feat/recv-direct`, measured; owner decisions made
+(see Decisions). Open: the measurement of the 64 B fix (build C3) and the
+scale run.
 
 Related: `docs/recv-buffering-approaches.md` ("One-shot receive into
 connection-owned memory", "Per-connection rings"),
@@ -199,28 +200,29 @@ increase measured at RESP 1 MiB.
 
 When the parser returns `NeedAtLeast(additional)` with `additional` of at
 least `recv_direct_region`, the buffer is grown to hold the rest of the
-message and the receive asks for exactly `additional` bytes with
-`MSG_WAITALL`. Growing copies the part of the message already received. The
-kernel retries a short `MSG_WAITALL` receive on a stream socket without
-buffer select (`io_net_retry` in `io_uring/net.c`, read for 6.1, 6.12 and
-master), so the rest of the message arrives in one completion. 72bd80252fee
-concerns buffer select and does not apply.
+message before the receive is armed. Growing copies the part of the message
+already received, once. The receive asks for all the spare capacity, like
+any other, and every completion wakes the reader, whose parser sees the
+bytes so far and returns a smaller `NeedAtLeast` or `Consumed`. The receives
+that follow land behind the bytes already received, in place, because the
+buffer already holds the whole message.
 
-Two consequences follow, and the first needs an owner decision:
+So a parser that overestimates `additional` costs memory and nothing else,
+as the `NeedAtLeast` contract documents (`an_overestimated_need_does_not_stall_a_direct_read`).
+A reset in the middle of a message completes the next receive with
+`ECONNRESET`, which `with_data_result` returns as an error
+(`a_reset_in_the_middle_of_a_message_is_an_error`).
 
-- The receive waits until the peer has sent `additional` bytes or closes. A
-  parser that overestimates `additional` stalls the connection, where the
-  documented `NeedAtLeast` contract says an overestimate only costs memory.
-  ringline-redis's estimate is exact; ringline-memcache returns no
-  `NeedAtLeast`.
-- On EOF or an error after partial progress, the completion carries the
-  partial byte count and no error. The next receive then returns 0, so a
-  reset in the middle of a value may be reported as a clean EOF. Not
-  verified.
+An earlier version of the prototype asked for exactly `additional` bytes with
+`MSG_WAITALL`, so that a large value arrived in one completion. Both tests
+above fail against it: the overestimating reader stalled, and a reset after
+part of the rest had arrived was reported as a clean EOF, because the kernel
+returns the partial byte count without the error.
 
-In the screen only RESP 1 MiB used it (about 45,000 `MSG_WAITALL` receives
-per run). memcache 1 MiB copied 0 bytes per byte without a length, because
-receives sized by the largest message hold whole values.
+In the build C screen only RESP 1 MiB had a known length (about 45,000 such
+receives per run, then with `MSG_WAITALL`). memcache 1 MiB copied 0 bytes per
+byte without a length, because receives sized by the largest message hold
+whole values.
 
 ### Accumulator cap
 
@@ -254,13 +256,18 @@ checked whether the cancel can still be pending after 10 s.
 ## Which reads a direct connection supports
 
 - `with_data`, `with_bytes`, `with_data_result`, `recv_ready`: supported.
-- `with_bytes_segments`, `segments`, `forward_to*`, `forward_recv_buf`,
-  `enable_recv_forward`, direct echo: the prototype does not arm a receive
-  for them, so they wait until EOF or close. Proposed: each returns
-  `io::ErrorKind::Unsupported` on a direct connection.
-- TLS: `.tls(..).recv_direct(true)` ignores `recv_direct`. The kernel's bytes
-  are ciphertext and rustls copies the plaintext into the accumulator in any
-  case. Proposed: the connect fails with `Unsupported`.
+- `segments`, `recv_owned_segment`, `with_segments`, `with_bytes_segments`,
+  `forward_to`, `forward_to_conn` and `forward_held` return
+  `io::ErrorKind::Unsupported`. They read held provided buffers, and a
+  direct connection has none.
+- `enable_recv_forward` does nothing on a direct connection, because it
+  returns `()`; `forward_held` then returns `Unsupported`. `run_direct_echo`
+  resolves at once, because its output is `()`.
+- `forward_recv_buf` is a send from the accumulator and is not refused. It
+  has not been tested on a direct connection.
+- TLS: `.tls(..).recv_direct(true)` fails the connect with `Unsupported`, on
+  both backends. The kernel's bytes are ciphertext, and rustls copies the
+  plaintext into the accumulator in any case.
 - mio: `recv_direct` is ignored. The mio backend reads into one 8 KiB buffer
   per worker and appends to the accumulator (`handle_readable`); reading
   plaintext connections into the accumulator's spare capacity is a separate
@@ -272,33 +279,44 @@ checked whether the cancel can still be pending after 10 s.
 - `TcpConnect::recv_direct(bool)`, set before the connect is awaited. The
   choice holds for the connection's life.
 - `ConfigBuilder::recv_direct_region(bytes)`, default 64 KiB, at least 1.
+- `PoolConfig::recv_direct(bool)` in ringline-redis and ringline-memcache,
+  default off, passed to every connection the pool opens. On io_uring, the
+  client methods that read with segments fail with an `Unsupported` I/O
+  error on such a pool: ringline-redis `recv_meta`, `recv_get_discard` and
+  `recv_get_segments`, and ringline-memcache `get_stream` and `get_cas`.
 
-The protocol crates cannot pass the option today. `ClientBuilder::new` takes
-a `Connection` that is already open. The crates' own connects are in
-ringline-redis `pool.rs`, `sharded.rs` and `cluster.rs`, and ringline-memcache
-`pool.rs` and `sharded.rs`. `PoolConfig` can take a builder method.
-`ShardedConfig` and `ClusterConfig` have public fields and no
-`#[non_exhaustive]`, so adding a field to them is a breaking change.
-cachecannon opens its own connections, so build C needed only a cachecannon
-change.
+`ClientBuilder::new` takes a `Connection` that is already open, so a caller
+that connects itself passes `recv_direct` to `connect`. The sharded and
+cluster clients open their own connections from `ShardedConfig` and
+`ClusterConfig`, which have public fields and no `#[non_exhaustive]`; their
+option waits for the next breaking release. cachecannon opens its own
+connections, so build C needed only a cachecannon change.
 
 ## Metrics
 
-`ringline/recv_direct`: `ARMED` (receives submitted), `WAITALL` (of those,
-exact-length), `BYTES` (bytes the kernel wrote into accumulators), `STALE`
-(completions for a closed or reused slot). Copies on a direct connection
-still count in `ringline/recv_ring` `BYTES_COPIED`.
+`ringline/recv_direct`: `ARMED` (receives submitted), `KNOWN_LENGTH` (of
+those, receives into a buffer grown for a `NeedAtLeast` of at least
+`recv_direct_region`), `BYTES` (bytes the kernel wrote into accumulators),
+`STALE` (completions for a closed or reused slot). Copies on a direct
+connection still count in `ringline/recv_ring` `BYTES_COPIED`.
 
 ## Tests
 
-On the branch:
+- `tests/recv_direct.rs`:
+  - Patterned messages from 1 B to 1 MiB + 3, written in uneven pieces with
+    pauses, read and checked byte by byte with `with_bytes` (keeping every
+    fourth value alive across the next read) and with `with_data`.
+  - A connection closed with a receive armed, followed by a connection on the
+    same slot that must read only its own bytes.
+  - A reader whose `NeedAtLeast` is 10 MiB for 200,000-byte frames reads
+    every frame without an EOF.
+  - A reset after 2,000 bytes of a 100,000-byte frame is returned as
+    `ConnectionReset`.
+  - Every refusal listed above, the TLS connect refusal, and a `with_data`
+    read on the same connection afterwards.
 
-- `tests/recv_direct.rs`: patterned messages from 1 B to 1 MiB + 3, written
-  in uneven pieces with pauses, read and checked byte by byte with
-  `with_bytes` (keeping every fourth value alive across the next read) and
-  with `with_data`. A connection closed with a receive armed, followed by a
-  connection on the same slot that must read only its own bytes. Dropping one
-  received byte fails all three tests.
+  Dropping one received byte fails the first three tests. The overestimate,
+  reset and refusal tests fail against the `MSG_WAITALL` version.
 - `tests/recv_direct_alloc.rs` (its own binary, for the counting global
   allocator): 2,000 batches of 16 messages, each batch requested after the
   previous one is consumed, make fewer than one allocation of 32 KiB or more
@@ -306,54 +324,51 @@ On the branch:
 - `tests/recv_direct_copies.rs` (its own binary, for the process-wide
   counters): 70,000-byte messages in 64 KiB and 1 MiB writes copy at most a
   quarter of a byte per byte received; 500 B messages at most 1/20; 1 MiB
-  messages at most 1/5, with at least one `MSG_WAITALL` receive.
+  messages at most 1/5, with at least one known-length receive.
 - `event_loop.rs` unit tests: a synthetic `RecvDirect` completion with data
   for a connection whose generation moved on is dropped and counted stale
   (fails with the generation check removed); a direct connection whose
   accumulator is at the cap is closed instead of armed.
+- The ringline-redis and ringline-memcache `streaming` tests read small and
+  100,000-byte values through a pool with `recv_direct(true)` and check that
+  a segment read is refused (fails when the pool does not pass the option).
 
-To add: a short `MSG_WAITALL` completion followed by EOF (`eof_truncated`);
-the error returns for unsupported reads and TLS; worker exit with a receive
-armed.
+Not tested: worker exit with a receive armed.
 
 ## Landing
 
 1. Measure the 64 B fix (build C3) against A and `c0`.
-2. The owner decisions below, then the unsupported-read errors and the
-   remaining tests, and an errata entry for `MSG_WAITALL` without buffer
-   select if it stays.
-3. A scale run: 16 workers with 4,000 and 16,000 connections, cells up to
+2. A scale run: 16 workers with 4,000 and 16,000 connections, cells up to
    64 KiB (1 MiB values at 16,000 connections would hold about 20 GiB of
    accumulators).
-4. PR for the runtime change, with a fresh review.
-5. Client-crate option, per decision 3.
-6. mio: read plaintext connections into the accumulator (separate PR).
+3. PR for the runtime change and the `PoolConfig` option, with a fresh
+   review.
+4. `ShardedConfig` and `ClusterConfig` option in the next breaking release.
+5. mio: read plaintext connections into the accumulator (separate PR).
 
-## Decisions for the owner
+## Decisions
 
-1. `MSG_WAITALL`. Either drop it, and on a short completion re-arm a plain
-   receive into the reserved space without waking the task until
-   `additional` bytes have arrived; or keep it and change the `NeedAtLeast`
-   contract for direct connections so an overestimate stalls. I recommend
-   dropping it: the contract stays as documented and a reset is reported as an
-   error. The cost is a completion per kernel receive instead of one per value
-   at 1 MiB.
-2. Unsupported reads and TLS with `recv_direct` return `Unsupported`, as
-   proposed above.
-3. Client crates: a `PoolConfig` builder method in the next release, and
-   `ShardedConfig`/`ClusterConfig` in the next breaking release.
-4. A length hint for ringline-memcache: not needed for copies (0 bytes per
-   byte at 1 MiB without one). I recommend not adding it.
-5. Opt-in per connection, off by default, until C3 and the scale run show
-   no cell where it costs more than the ring.
+Made by the owner on 2026-10-19:
+
+1. No `MSG_WAITALL`: a known length grows the buffer, and every completion
+   wakes the reader.
+2. Reads that need the provided-buffer ring, and TLS with `recv_direct`,
+   return `Unsupported`.
+3. Client crates: `PoolConfig::recv_direct` in the next release;
+   `ShardedConfig` and `ClusterConfig` in the next breaking release.
+4. No length hint for ringline-memcache: memcache 1 MiB copied 0 bytes per
+   byte without one.
+5. Opt-in per connection, off by default, until C3 and the scale run show no
+   cell where it costs more than the ring.
 6. Segment views: the client switch on `feat/segment-clients` and the proto
-   releases it needs are not pursued. The open scanner PRs in `resp-proto`
-   and `memcache-proto` need a decision: close, or merge without a release.
+   releases it needs are not pursued.
+
+Open: whether the scanner PRs in `resp-proto` and `memcache-proto` are
+closed or merged without a release.
 
 ## Not known
 
 - Whether 06c6c43 removes all of the 64 B regression (C3 pending).
 - Behaviour above 63 connections per worker.
-- Whether a reset after partial `MSG_WAITALL` progress is reported as EOF.
 - Whether a cancelled direct receive can still be in flight when the worker
   exit bound runs out.
