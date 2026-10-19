@@ -468,6 +468,93 @@ impl AccumulatorTable {
         }
     }
 
+    /// Detach the accumulator's buffer, with its unconsumed bytes, as the
+    /// destination of a direct receive (`TcpConnect::recv_direct`). The
+    /// kernel writes into the returned buffer's spare capacity, starting at
+    /// its length; [`attach_received`](Self::attach_received) puts it back.
+    /// While it is detached the accumulator is empty.
+    ///
+    /// Returns the buffer, the number of bytes to receive, and whether that
+    /// number is exact. `need` is the parser's last `NeedAtLeast` value, the
+    /// bytes still missing from the message. When it is at least `region`,
+    /// the receive asks for exactly that many, so the message arrives in one
+    /// completion. Otherwise the receive asks for all the spare capacity,
+    /// after growing the buffer to hold `need` and at least `region` bytes
+    /// when less than that, or less than half of `region`, is spare. Returns
+    /// `None` when the accumulator is at `max_size`.
+    ///
+    /// A remainder held by `put_back` is made mutable first (`reclaim`), so
+    /// a remainder the parser kept no slice of is received behind in place.
+    #[cfg(has_io_uring)]
+    pub(crate) fn detach_for_recv(
+        &mut self,
+        index: u32,
+        region: usize,
+        need: Option<usize>,
+    ) -> Option<(BytesMut, usize, bool)> {
+        self.reclaim(index);
+        let acc = &mut self.accumulators[index as usize];
+        debug_assert!(acc.frozen.is_none(), "reclaim leaves no frozen remainder");
+        let len = acc.buf.len();
+        let room = acc.max_size.saturating_sub(len);
+        if room == 0 {
+            return None;
+        }
+        let need = need.unwrap_or(0).min(room);
+        let exact = need >= region;
+        let spare = acc.buf.capacity() - len;
+        let (grow, want) = if exact {
+            (spare < need, need)
+        } else {
+            (
+                spare < need || spare < region / 2,
+                need.max(region).min(room),
+            )
+        };
+        if grow {
+            let before = acc.buf.as_ptr();
+            acc.buf.reserve(want);
+            note_copied(moved(&acc.buf, before, len));
+        }
+        let spare = acc.buf.capacity() - len;
+        let n = if exact { need } else { spare.min(room) };
+        let n = n.min(u32::MAX as usize);
+        Some((std::mem::take(&mut acc.buf), n, exact))
+    }
+
+    /// Put back a buffer detached by [`detach_for_recv`](Self::detach_for_recv)
+    /// with `received` more bytes written behind its contents.
+    ///
+    /// # Safety
+    ///
+    /// The kernel must have written `received` initialized bytes into `buf`'s
+    /// spare capacity, starting at `buf.len()`.
+    #[cfg(has_io_uring)]
+    pub(crate) unsafe fn attach_received(
+        &mut self,
+        index: u32,
+        mut buf: BytesMut,
+        received: usize,
+    ) {
+        debug_assert!(received <= buf.capacity() - buf.len());
+        // SAFETY: the caller guarantees the bytes are initialized.
+        unsafe { buf.set_len(buf.len() + received) };
+        let acc = &mut self.accumulators[index as usize];
+        if acc.frozen.is_none() && acc.buf.is_empty() {
+            acc.buf = buf;
+            return;
+        }
+        // Nothing appends to a direct connection's accumulator while its
+        // buffer is detached, so this is not reached. Keep the order anyway:
+        // the detached bytes are older.
+        debug_assert!(false, "accumulator changed while its buffer was detached");
+        let newer = acc.data().to_vec();
+        acc.frozen = None;
+        acc.buf = buf;
+        acc.buf.extend_from_slice(&newer);
+        note_copied(newer.len());
+    }
+
     /// Put unconsumed data back into the accumulator.
     ///
     /// Called after `take_frozen()` when the parser didn't consume

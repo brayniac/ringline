@@ -137,6 +137,10 @@ pub struct Config {
     /// slow-consumer workloads (where kernel recv CQEs batch faster than
     /// the handler runs); it must be at least `recv_buffer_size`.
     pub(crate) recv_accumulator_max: usize,
+    /// Bytes a direct receive (`TcpConnect::recv_direct`) asks for when the
+    /// parser has not announced a length. See
+    /// `ConfigBuilder::recv_direct_region`.
+    pub(crate) recv_direct_region: usize,
     /// Aggregate low-water reserve for segmented recv (see
     /// `docs/segmented-recv-design.md`, "Backpressure and ring safety").
     ///
@@ -458,6 +462,7 @@ impl Default for Config {
             max_connections: 16000,
             recv_accumulator_capacity: 4096,
             recv_accumulator_max: 1024 * 1024 * 1024,
+            recv_direct_region: 64 * 1024,
             recv_segment_reserve: 64,
             forward_hold_cap: 64,
             // Off by default while the trade is being measured: prefaulting
@@ -605,6 +610,11 @@ impl Config {
                 "recv_accumulator_max must be >= the TCP receive buffer size, {largest_buffer} \
                  (use usize::MAX to disable the cap)"
             )));
+        }
+        if self.recv_direct_region == 0 {
+            return Err(crate::error::Error::RingSetup(
+                "recv_direct_region must be > 0".into(),
+            ));
         }
         if self.max_connections == 0 || self.max_connections >= (1 << 24) {
             return Err(crate::error::Error::RingSetup(
@@ -1092,6 +1102,16 @@ impl ConfigBuilder {
     /// than the largest reply they expect.
     pub fn recv_accumulator_max(mut self, n: usize) -> Self {
         self.config.recv_accumulator_max = n;
+        self
+    }
+
+    /// Set how many bytes a direct receive asks for when the parser has not
+    /// announced a length (`ParseResult::NeedAtLeast`). A connection made with
+    /// [`TcpConnect::recv_direct`](crate::TcpConnect::recv_direct) receives
+    /// into its own accumulator, and an idle one holds an accumulator of
+    /// about this size. Defaults to 64 KiB; must be at least 1.
+    pub fn recv_direct_region(mut self, n: usize) -> Self {
+        self.config.recv_direct_region = n;
         self
     }
 
