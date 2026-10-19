@@ -62,6 +62,12 @@ pub struct RecvAccumulator {
     /// (`note_consumed`), until `reset` or `release`. Sizes direct receives
     /// (`detach_for_recv`).
     largest_message: usize,
+    /// The last frozen view of a direct connection's buffer that a parser
+    /// consumed whole (`keep_spent`). `detach_for_recv` takes the allocation
+    /// back from it when no slice of it is alive, instead of allocating a
+    /// new receive buffer.
+    #[cfg(has_io_uring)]
+    spent: Option<Bytes>,
     /// Capacity `buf` is allocated with, and returns to on
     /// [`release`](Self::release).
     initial_capacity: usize,
@@ -87,6 +93,8 @@ impl RecvAccumulator {
             max_size,
             reserve_target: 0,
             largest_message: 0,
+            #[cfg(has_io_uring)]
+            spent: None,
             initial_capacity: capacity,
         }
     }
@@ -262,6 +270,10 @@ impl RecvAccumulator {
         self.buf.clear();
         self.reserve_target = 0;
         self.largest_message = 0;
+        #[cfg(has_io_uring)]
+        {
+            self.spent = None;
+        }
     }
 
     /// Discard all data and the allocation, and allocate the initial
@@ -278,6 +290,10 @@ impl RecvAccumulator {
         self.buf = BytesMut::with_capacity(self.initial_capacity);
         self.reserve_target = 0;
         self.largest_message = 0;
+        #[cfg(has_io_uring)]
+        {
+            self.spent = None;
+        }
     }
 
     /// Return the current backing-buffer capacity. Test-only.
@@ -510,6 +526,19 @@ impl AccumulatorTable {
         self.reclaim(index);
         let acc = &mut self.accumulators[index as usize];
         debug_assert!(acc.frozen.is_none(), "reclaim leaves no frozen remainder");
+        if let Some(spent) = acc.spent.take()
+            && acc.buf.is_empty()
+            && acc.buf.capacity() < region
+        {
+            // `buf` is empty, so it is at most the tail of the spent
+            // allocation; its reference would keep `try_into_mut` from
+            // succeeding.
+            acc.buf = BytesMut::new();
+            if let Ok(mut recovered) = spent.try_into_mut() {
+                recovered.clear();
+                acc.buf = recovered;
+            }
+        }
         let len = acc.buf.len();
         let room = acc.max_size.saturating_sub(len);
         if room == 0 {
@@ -541,6 +570,13 @@ impl AccumulatorTable {
         let n = if exact { need } else { spare.min(room) };
         let n = n.min(u32::MAX as usize);
         Some((std::mem::take(&mut acc.buf), n, exact))
+    }
+
+    /// Keep `consumed`, a frozen view a direct connection's parser consumed
+    /// whole, for `detach_for_recv` to take its allocation back.
+    #[cfg(has_io_uring)]
+    pub(crate) fn keep_spent(&mut self, index: u32, consumed: Bytes) {
+        self.accumulators[index as usize].spent = Some(consumed);
     }
 
     /// Record that a parser consumed a message of `n` bytes in one call.
