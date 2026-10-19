@@ -58,6 +58,11 @@ pub struct RecvAccumulator {
     /// multi-chunk message allocates once at full size instead of running
     /// the doubling-regrowth cascade. Cleared when the contents drain.
     reserve_target: usize,
+    /// The most bytes this accumulator has held after a direct receive
+    /// (`attach_received`), until `reset` or `release`. A direct receive
+    /// into an empty buffer asks for at least this much, so a message as
+    /// large as one seen before arrives in one piece.
+    direct_high_water: usize,
     /// Capacity `buf` is allocated with, and returns to on
     /// [`release`](Self::release).
     initial_capacity: usize,
@@ -82,6 +87,7 @@ impl RecvAccumulator {
             frozen: None,
             max_size,
             reserve_target: 0,
+            direct_high_water: 0,
             initial_capacity: capacity,
         }
     }
@@ -256,6 +262,7 @@ impl RecvAccumulator {
         self.frozen = None;
         self.buf.clear();
         self.reserve_target = 0;
+        self.direct_high_water = 0;
     }
 
     /// Discard all data and the allocation, and allocate the initial
@@ -271,6 +278,7 @@ impl RecvAccumulator {
         self.frozen = None;
         self.buf = BytesMut::with_capacity(self.initial_capacity);
         self.reserve_target = 0;
+        self.direct_high_water = 0;
     }
 
     /// Return the current backing-buffer capacity. Test-only.
@@ -480,8 +488,12 @@ impl AccumulatorTable {
     /// the receive asks for exactly that many, so the message arrives in one
     /// completion. Otherwise the receive asks for all the spare capacity,
     /// after growing the buffer to hold `need` and at least `region` bytes
-    /// when less than that, or less than half of `region`, is spare. Returns
-    /// `None` when the accumulator is at `max_size`.
+    /// when less than that, or less than half of `region`, is spare. An empty
+    /// buffer is grown to the most bytes the accumulator has held after a
+    /// direct receive, so a message as large as an earlier one is not split
+    /// at the end of the allocation; growing an empty buffer whose allocation
+    /// is not shared moves nothing. Returns `None` when the accumulator is at
+    /// `max_size`.
     ///
     /// A remainder held by `put_back` is made mutable first (`reclaim`), so
     /// a remainder the parser kept no slice of is received behind in place.
@@ -505,6 +517,9 @@ impl AccumulatorTable {
         let spare = acc.buf.capacity() - len;
         let (grow, want) = if exact {
             (spare < need, need)
+        } else if len == 0 {
+            let want = region.max(acc.direct_high_water).min(room);
+            (spare < want, want)
         } else {
             (
                 spare < need || spare < region / 2,
@@ -540,6 +555,7 @@ impl AccumulatorTable {
         // SAFETY: the caller guarantees the bytes are initialized.
         unsafe { buf.set_len(buf.len() + received) };
         let acc = &mut self.accumulators[index as usize];
+        acc.direct_high_water = acc.direct_high_water.max(buf.len());
         if acc.frozen.is_none() && acc.buf.is_empty() {
             acc.buf = buf;
             return;
