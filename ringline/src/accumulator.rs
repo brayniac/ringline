@@ -68,6 +68,11 @@ pub struct RecvAccumulator {
     /// new receive buffer.
     #[cfg(has_io_uring)]
     spent: Option<Bytes>,
+    /// A direct connection's own buffer while `buf` is one borrowed from the
+    /// worker's [`DirectPool`] for a message larger than it. `None` when
+    /// `buf` is the connection's own.
+    #[cfg(has_io_uring)]
+    own: Option<BytesMut>,
     /// Capacity `buf` is allocated with, and returns to on
     /// [`release`](Self::release).
     initial_capacity: usize,
@@ -95,6 +100,8 @@ impl RecvAccumulator {
             largest_message: 0,
             #[cfg(has_io_uring)]
             spent: None,
+            #[cfg(has_io_uring)]
+            own: None,
             initial_capacity: capacity,
         }
     }
@@ -293,6 +300,7 @@ impl RecvAccumulator {
         #[cfg(has_io_uring)]
         {
             self.spent = None;
+            self.own = None;
         }
     }
 
@@ -303,12 +311,102 @@ impl RecvAccumulator {
     }
 }
 
+/// Smallest buffer a direct connection borrows from its worker's
+/// [`DirectPool`]: 64 KiB.
+#[cfg(has_io_uring)]
+const DIRECT_BORROW_MIN: usize = 64 * 1024;
+/// Default for `ConfigBuilder::recv_direct_pool_max`: 16 MiB.
+#[cfg(has_io_uring)]
+pub(crate) const DIRECT_POOL_MAX_DEFAULT: usize = 16 << 20;
+
+/// The size of a new borrowed buffer for `n` bytes: at least
+/// `DIRECT_BORROW_MIN`; up to 2 MiB, `n` rounded up to one of eight steps per
+/// power of two (about 9% apart), so that messages of nearly the same size
+/// reuse each other's buffers; above 2 MiB, a multiple of 2 MiB, the size of a
+/// transparent huge page.
+#[cfg(has_io_uring)]
+fn direct_borrow_size(n: usize) -> usize {
+    const HUGE_PAGE: usize = 2 << 20;
+    if n <= DIRECT_BORROW_MIN {
+        return DIRECT_BORROW_MIN;
+    }
+    let step = if n > HUGE_PAGE {
+        HUGE_PAGE
+    } else {
+        1usize << (usize::BITS - 1 - n.leading_zeros() - 3)
+    };
+    n.div_ceil(step).saturating_mul(step)
+}
+
+/// Free buffers that a worker's direct connections borrow for messages
+/// larger than their own buffer, so that a buffer moves from one connection
+/// to the next without going back to the allocator. Keyed by capacity: the
+/// sizes are the ones the workload produced, not fixed classes.
+#[cfg(has_io_uring)]
+struct DirectPool {
+    free: std::collections::BTreeMap<usize, Vec<BytesMut>>,
+    free_bytes: usize,
+    /// The most bytes of free buffers kept; a buffer put back beyond this is
+    /// freed.
+    max_free_bytes: usize,
+}
+
+#[cfg(has_io_uring)]
+impl DirectPool {
+    fn new(max_free_bytes: usize) -> Self {
+        DirectPool {
+            free: std::collections::BTreeMap::new(),
+            free_bytes: 0,
+            max_free_bytes,
+        }
+    }
+
+    /// An empty buffer of at least `n` bytes: the smallest free one that
+    /// holds `n` and is at most twice `direct_borrow_size(n)`, or a new one
+    /// of `direct_borrow_size(n)`.
+    fn take(&mut self, n: usize) -> BytesMut {
+        let size = direct_borrow_size(n);
+        let fit = self
+            .free
+            .range(n..=size.saturating_mul(2))
+            .next()
+            .map(|(&cap, _)| cap);
+        if let Some(cap) = fit {
+            let list = self.free.get_mut(&cap).expect("key from range");
+            let buf = list.pop().expect("lists are not left empty");
+            if list.is_empty() {
+                self.free.remove(&cap);
+            }
+            self.free_bytes -= cap;
+            crate::metrics::RECV_DIRECT.increment(crate::metrics::recv_direct::POOL_REUSED);
+            return buf;
+        }
+        crate::metrics::RECV_DIRECT.increment(crate::metrics::recv_direct::POOL_ALLOCATED);
+        BytesMut::with_capacity(size)
+    }
+
+    /// Keep `buf` for reuse if it is at least `DIRECT_BORROW_MIN` and the
+    /// free buffers have room for it; otherwise free it.
+    fn put(&mut self, mut buf: BytesMut) {
+        buf.clear();
+        let cap = buf.capacity();
+        if cap < DIRECT_BORROW_MIN || self.free_bytes + cap > self.max_free_bytes {
+            return;
+        }
+        self.free_bytes += cap;
+        self.free.entry(cap).or_default().push(buf);
+    }
+}
+
 use bytes::Buf;
 
 /// Parallel `Vec<RecvAccumulator>` indexed by connection index.
 /// Stored as a separate field in EventLoop for borrow splitting.
 pub struct AccumulatorTable {
     accumulators: Vec<RecvAccumulator>,
+    /// Buffers direct connections borrow for messages larger than their own.
+    #[cfg(has_io_uring)]
+    direct_pool: DirectPool,
 }
 
 impl AccumulatorTable {
@@ -326,7 +424,11 @@ impl AccumulatorTable {
         for _ in 0..count {
             accumulators.push(RecvAccumulator::new_with_max(capacity, max_size));
         }
-        AccumulatorTable { accumulators }
+        AccumulatorTable {
+            accumulators,
+            #[cfg(has_io_uring)]
+            direct_pool: DirectPool::new(DIRECT_POOL_MAX_DEFAULT),
+        }
     }
 
     /// Append data to the accumulator at the given index. Returns `false`
@@ -378,7 +480,26 @@ impl AccumulatorTable {
     /// Discard the accumulator's data and allocation at the given index.
     /// See [`RecvAccumulator::release`].
     pub fn release(&mut self, index: u32) {
+        #[cfg(has_io_uring)]
+        {
+            let acc = &mut self.accumulators[index as usize];
+            if acc.own.is_some() {
+                self.direct_pool.put(std::mem::take(&mut acc.buf));
+            }
+        }
         self.accumulators[index as usize].release();
+    }
+
+    /// Set the most bytes of free buffers the direct-receive pool keeps.
+    #[cfg(has_io_uring)]
+    pub(crate) fn set_direct_pool_max(&mut self, bytes: usize) {
+        self.direct_pool.max_free_bytes = bytes;
+    }
+
+    /// Give a direct receive's buffer whose connection is gone to the pool.
+    #[cfg(has_io_uring)]
+    pub(crate) fn recycle_direct(&mut self, buf: BytesMut) {
+        self.direct_pool.put(buf);
     }
 
     /// Return the current backing-buffer capacity for the accumulator at
@@ -497,25 +618,27 @@ impl AccumulatorTable {
     /// its length; [`attach_received`](Self::attach_received) puts it back.
     /// While it is detached the accumulator is empty.
     ///
-    /// Returns the buffer, the number of bytes to receive, and whether the
-    /// buffer was sized for a known message length. `need` is the parser's
-    /// last `NeedAtLeast` value, the bytes still missing from the message.
-    /// When it is at least `region`, the buffer is grown to hold the rest of
-    /// the message. Otherwise it is grown when less than `need`, or less than
-    /// half of `region`, is spare. An empty buffer is grown when less than the
-    /// receive size is spare, which moves nothing when its allocation is not
-    /// shared. The receive asks for all the spare capacity.
+    /// Returns the buffer, the number of bytes to receive (all its spare
+    /// capacity, up to `max_size`), and whether it was sized for a known
+    /// message length. `None` when the accumulator is at `max_size`.
     ///
-    /// The receive size is `region`, or for a connection whose largest
-    /// message (`note_consumed`) is `m`, the larger of `region` and
-    /// `min(4m, m + 4 * region)`. A receive that ends inside a message
-    /// leaves that part to be moved to the front when the buffer is grown
-    /// again; a receive several messages long makes that move once per
-    /// several messages. Returns `None` when the accumulator is at
-    /// `max_size`.
+    /// With nothing buffered, the receive goes into the connection's own
+    /// buffer of `region` bytes, and a buffer borrowed for an earlier message
+    /// goes back to the pool. With part of a message buffered, the buffer
+    /// grows when less than `need` (the parser's `NeedAtLeast` value), or
+    /// less than half of `region`, is spare, by `need` or, without a known
+    /// length of at least `region`, by the larger of `need` and the receive
+    /// size. The connection's own buffer grows by borrowing one from the
+    /// pool, into which the buffered bytes are copied; a borrowed buffer
+    /// grows with `reserve`. The receive size is `region`, or for a
+    /// connection whose largest message (`note_consumed`) is `m`, the larger
+    /// of `region` and `min(4m, m + 4 * region)`; a receive several messages
+    /// long moves a partial message once per several messages.
     ///
     /// A remainder held by `put_back` is made mutable first (`reclaim`), so
-    /// a remainder the parser kept no slice of is received behind in place.
+    /// a remainder the parser kept no slice of is received behind in place,
+    /// and a view the parser consumed whole (`keep_spent`) gives its
+    /// allocation back when no slice of it is alive.
     #[cfg(has_io_uring)]
     pub(crate) fn detach_for_recv(
         &mut self,
@@ -528,7 +651,6 @@ impl AccumulatorTable {
         debug_assert!(acc.frozen.is_none(), "reclaim leaves no frozen remainder");
         if let Some(spent) = acc.spent.take()
             && acc.buf.is_empty()
-            && acc.buf.capacity() < region
         {
             // `buf` is empty, so it is at most the tail of the spent
             // allocation; its reference would keep `try_into_mut` from
@@ -544,27 +666,44 @@ impl AccumulatorTable {
         if room == 0 {
             return None;
         }
+        if len == 0 {
+            if let Some(own) = acc.own.take() {
+                self.direct_pool.put(std::mem::replace(&mut acc.buf, own));
+            }
+            if acc.buf.capacity() < region {
+                // Empty, so this moves nothing.
+                acc.buf.reserve(region);
+            }
+            let n = acc.buf.capacity().min(room).min(u32::MAX as usize);
+            return Some((std::mem::take(&mut acc.buf), n, false));
+        }
         let need = need.unwrap_or(0).min(room);
         let known = need >= region;
         let spare = acc.buf.capacity() - len;
-        let m = acc.largest_message;
-        let size = region
-            .max(
+        if spare < need || spare < region / 2 {
+            let m = acc.largest_message;
+            let size = region.max(
                 m.saturating_mul(4)
                     .min(m.saturating_add(region.saturating_mul(4))),
-            )
-            .min(room);
-        let (grow, want) = if known {
-            (spare < need, need)
-        } else if len == 0 {
-            (spare < size, size)
-        } else {
-            (spare < need || spare < region / 2, need.max(size).min(room))
-        };
-        if grow {
-            let before = acc.buf.as_ptr();
-            acc.buf.reserve(want);
-            note_copied(moved(&acc.buf, before, len));
+            );
+            let more = if known { need } else { need.max(size) }.min(room);
+            if acc.own.is_none() {
+                // The connection's own buffer is too small: borrow one and
+                // copy the part of the message received so far.
+                let mut bigger = self.direct_pool.take(len.saturating_add(more));
+                bigger.extend_from_slice(&acc.buf);
+                note_copied(len);
+                let mut own = std::mem::replace(&mut acc.buf, bigger);
+                own.clear();
+                acc.own = Some(own);
+            } else {
+                // A borrowed buffer grows in place where the allocator can
+                // (`realloc`, which moves pages rather than bytes for large
+                // allocations), and moves its bytes otherwise.
+                let before = acc.buf.as_ptr();
+                acc.buf.reserve(more);
+                note_copied(moved(&acc.buf, before, len));
+            }
         }
         let spare = acc.buf.capacity() - len;
         let n = spare.min(room).min(u32::MAX as usize);
@@ -655,6 +794,79 @@ impl AccumulatorTable {
 
 #[cfg(test)]
 mod tests {
+
+    #[cfg(has_io_uring)]
+    #[test]
+    fn borrowed_buffer_sizes_round_to_steps_and_huge_pages() {
+        assert_eq!(direct_borrow_size(1), 64 * 1024);
+        assert_eq!(direct_borrow_size(64 * 1024 + 1), 72 * 1024);
+        assert_eq!(direct_borrow_size(1 << 20), 1 << 20);
+        assert_eq!(direct_borrow_size((1 << 20) + 1), 1152 * 1024);
+        assert_eq!(direct_borrow_size((2 << 20) + 1), 4 << 20);
+        assert_eq!(direct_borrow_size(100 << 20), 100 << 20);
+        assert_eq!(direct_borrow_size((100 << 20) + 13), 102 << 20);
+    }
+
+    #[cfg(has_io_uring)]
+    #[test]
+    fn the_pool_reuses_a_fitting_buffer_and_keeps_at_most_its_cap() {
+        // Room for the 4 MiB buffer and less than another 1 MiB.
+        let mut pool = DirectPool::new((4 << 20) + (512 << 10));
+        let a = pool.take(3 << 20);
+        let a_ptr = a.as_ptr();
+        assert_eq!(a.capacity(), 4 << 20);
+        pool.put(a);
+        // A later message of nearly the same size gets the same buffer.
+        let b = pool.take((3 << 20) + 100);
+        assert_eq!(b.as_ptr(), a_ptr);
+        // One more than twice the size it needs is not taken.
+        pool.put(b);
+        let small = pool.take(1 << 20);
+        assert_ne!(small.as_ptr(), a_ptr);
+        assert_eq!(pool.free_bytes, 4 << 20);
+        // Past the cap, a buffer given back is freed.
+        pool.put(small);
+        assert_eq!(pool.free_bytes, 4 << 20);
+        // Below the smallest borrowed size, nothing is kept.
+        pool.put(BytesMut::with_capacity(4096));
+        assert_eq!(pool.free_bytes, 4 << 20);
+    }
+
+    #[cfg(has_io_uring)]
+    #[test]
+    fn a_direct_connection_returns_a_borrowed_buffer_when_nothing_is_buffered() {
+        let mut table = AccumulatorTable::new(1, 4096);
+        let region = 32 * 1024;
+        // Part of a 1 MiB message, with the parser asking for the rest.
+        let (mut buf, n, _) = table.detach_for_recv(0, region, None).unwrap();
+        assert_eq!(n, region);
+        buf.extend_from_slice(&[7u8; 1000]);
+        unsafe { table.attach_received(0, buf, 0) };
+        let (buf, n, known) = table
+            .detach_for_recv(0, region, Some((1 << 20) - 1000))
+            .unwrap();
+        assert!(known);
+        assert!(n >= (1 << 20) - 1000);
+        let borrowed = buf.as_ptr();
+        unsafe { table.attach_received(0, buf, 0) };
+        // The parser consumes the message whole and keeps nothing.
+        let frozen = table.take_frozen(0);
+        table.keep_spent(0, frozen);
+        let (buf, n, _) = table.detach_for_recv(0, region, None).unwrap();
+        assert_eq!(n, buf.capacity());
+        assert!(buf.capacity() < 64 * 1024, "the own buffer is back");
+        unsafe { table.attach_received(0, buf, 0) };
+        assert_eq!(table.direct_pool.free_bytes, 1 << 20);
+        // The next large message borrows the same buffer.
+        let (mut buf, _, _) = table.detach_for_recv(0, region, None).unwrap();
+        buf.extend_from_slice(&[7u8; 10]);
+        unsafe { table.attach_received(0, buf, 0) };
+        let (buf, _, _) = table
+            .detach_for_recv(0, region, Some((1 << 20) - 10))
+            .unwrap();
+        assert_eq!(buf.as_ptr(), borrowed);
+        unsafe { table.attach_received(0, buf, 0) };
+    }
     use super::*;
 
     fn bytes_copied() -> u64 {

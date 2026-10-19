@@ -32,7 +32,7 @@ pub static RECV_RING: ShardedCounterGroup = ShardedCounterGroup::new(recv_ring::
 /// Direct receives (`TcpConnect::recv_direct`).
 #[metric(
     name = "ringline/recv_direct",
-    description = "Direct receives into connection accumulators: armed, sized for a known length, bytes, stale"
+    description = "Direct receives into connection accumulators: armed, sized for a known length, bytes, stale, pooled buffers reused and allocated"
 )]
 pub static RECV_DIRECT: ShardedCounterGroup = ShardedCounterGroup::new(recv_direct::COUNT);
 
@@ -358,7 +358,13 @@ pub mod recv_direct {
     pub const BYTES: usize = 2;
     /// Completions whose connection had closed or whose slot was reused.
     pub const STALE: usize = 3;
-    pub const COUNT: usize = 4;
+    /// Buffers a direct connection borrowed for a large message that came
+    /// from the worker's free buffers.
+    pub const POOL_REUSED: usize = 4;
+    /// Buffers a direct connection borrowed for a large message that were
+    /// allocated because no free buffer fit.
+    pub const POOL_ALLOCATED: usize = 5;
+    pub const COUNT: usize = 6;
 }
 
 /// Slot indices for `RECV_ARRIVAL`.
@@ -501,6 +507,12 @@ pub fn init_metadata() {
     );
     RECV_DIRECT.insert_metadata(recv_direct::BYTES, "op".into(), "bytes".into());
     RECV_DIRECT.insert_metadata(recv_direct::STALE, "op".into(), "stale".into());
+    RECV_DIRECT.insert_metadata(recv_direct::POOL_REUSED, "op".into(), "pool_reused".into());
+    RECV_DIRECT.insert_metadata(
+        recv_direct::POOL_ALLOCATED,
+        "op".into(),
+        "pool_allocated".into(),
+    );
     RECV_RING.insert_metadata(recv_ring::INCREMENTAL, "op".into(), "incremental".into());
     RECV_RING.insert_metadata(recv_ring::PLAIN, "op".into(), "plain".into());
     RECV_RING.insert_metadata(recv_ring::LEND_REFUSED, "op".into(), "lend_refused".into());

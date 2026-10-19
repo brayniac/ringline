@@ -1408,6 +1408,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
         if !live {
             metrics::RECV_DIRECT.increment(metrics::recv_direct::STALE);
+            self.driver.accumulators.recycle_direct(entry.buf);
             return;
         }
         let received = result.max(0) as usize;
