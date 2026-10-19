@@ -171,30 +171,68 @@ is allocated as before. `tests/recv_direct_alloc.rs` counts allocations of
 32 KiB or more over 2,000 request-response batches: 0 with the change, 1,999
 without it.
 
-### Receive size
+### Buffers
 
-When the parser has not given a length of at least `recv_direct_region`, a
-receive asks for all the buffer's spare capacity. The buffer is grown first
-when it is empty and has less spare than the receive size, or when it holds a
-partial message and has less spare than the parser's `NeedAtLeast` value or
-less than half of `recv_direct_region`.
+Each direct connection owns one buffer of `recv_direct_region` bytes
+(default 32 KiB). With nothing buffered, a receive goes into it, so an idle
+connection holds that much and no more. A message that does not fit borrows
+a larger buffer from the worker's pool (`DirectPool` in `accumulator.rs`):
+the part of the message received so far, at most `recv_direct_region` bytes,
+is copied into the borrowed buffer, and the rest of the message is received
+behind it. When the parser has consumed everything and no value read from
+the borrowed buffer is alive (the `keep_spent` check above), the next receive
+goes into the connection's own buffer again and the borrowed one goes back to
+the pool.
 
-The receive size is `recv_direct_region` (default 64 KiB) or, for a
-connection whose largest `Consumed` value so far is `m`, the larger of
-`recv_direct_region` and `min(4m, m + 4 * recv_direct_region)`. For 64 KiB
-messages that is 256 KiB; for 1 MiB messages, 1.25 MiB.
+A buffer grows when it holds part of a message and less than the parser's
+`NeedAtLeast` value, or less than half of `recv_direct_region`, is spare. It
+grows by the `NeedAtLeast` value when that is at least `recv_direct_region`,
+and otherwise by the larger of that value and the receive size:
+`recv_direct_region`, or for a connection whose largest `Consumed` value so
+far is `m`, the larger of `recv_direct_region` and
+`min(4m, m + 4 * recv_direct_region)`. The own buffer grows by borrowing; a
+borrowed buffer grows with `BytesMut::reserve`, which calls `realloc`, and
+glibc grows large allocations with `mremap` without copying their bytes.
+
+The pool keeps free buffers by capacity, with no fixed classes. A borrow takes
+the smallest free buffer that holds the message and is at most twice the size
+it would allocate; otherwise it allocates one of at least 64 KiB, rounded up
+to one of eight steps per power of two up to 2 MiB, and to a multiple of
+2 MiB (a transparent huge page) above that. Messages of nearly the same size
+therefore share buffers, and a 100 MiB value wastes at most 2 MiB. Free
+buffers are kept up to `recv_direct_pool_max` bytes per worker (default
+16 MiB); one given back beyond that is freed. A workload with 100 MiB values
+reuses their buffers only with `recv_direct_pool_max` above 100 MiB.
 
 A receive that ends inside a message leaves that part to be moved to the
-front of a new buffer at the next growth. Sizing receives to several messages
+front of the buffer at the next growth. Sizing receives to several messages
 makes that move once per several messages. On loopback with 70,000-byte
 messages at pipeline depth 16, sizing a receive to the most the connection
 had buffered before copied 0.82 bytes per byte received, because each receive
 ended at the same point inside a message; sizing by the largest message
 copied 0.011.
 
-The buffer keeps its grown capacity while the connection is open. An idle
-connection that has seen 1 MiB values holds about 1.25 MiB, which is the RSS
-increase measured at RESP 1 MiB.
+Before the pool, a connection kept the largest buffer it had grown to until
+it closed. That is the 945 MiB RSS increase measured at RESP 1 MiB with 1,000
+connections, and it would have been about 20 GiB at 16,000.
+
+`tests/recv_direct_alloc.rs` reads request-response batches of 16 × 60 B,
+1 × 64 KiB, 4 × 64 KiB and 1 × 1 MiB messages: after four warmup batches,
+none allocates 32 KiB or more. With the pool keeping nothing, 1 × 64 KiB
+makes 196 such allocations in 200 batches.
+
+In THP mode `always`, the kernel backs each aligned 2 MiB range inside a large
+borrowed buffer with a huge page at first touch, so a contiguous buffer gets
+huge pages without being split into 2 MiB chunks. Mode `madvise` would need
+`MADV_HUGEPAGE` on borrowed buffers, which under `defrag=madvise` compacts
+memory at fault time. Which mode the measurement hosts use is not recorded
+yet.
+
+A chain of 2 MiB chunks would need no size classes, but a message spanning
+chunks is not contiguous, so `with_bytes` could not hand it to the parser
+as one `Bytes` without a copy. It fits a reader that streams huge values
+(`get_stream`), which a direct connection refuses today, and is not part of
+this design.
 
 ### Known lengths
 
@@ -278,7 +316,10 @@ checked whether the cancel can still be pending after 10 s.
 
 - `TcpConnect::recv_direct(bool)`, set before the connect is awaited. The
   choice holds for the connection's life.
-- `ConfigBuilder::recv_direct_region(bytes)`, default 64 KiB, at least 1.
+- `ConfigBuilder::recv_direct_region(bytes)`, the size of a connection's
+  own buffer, default 32 KiB, at least 1.
+- `ConfigBuilder::recv_direct_pool_max(bytes)`, the most free borrowed
+  buffers a worker keeps, default 16 MiB.
 - `PoolConfig::recv_direct(bool)` in ringline-redis and ringline-memcache,
   default off, passed to every connection the pool opens. On io_uring, the
   client methods that read with segments fail with an `Unsupported` I/O
@@ -297,8 +338,10 @@ connections, so build C needed only a cachecannon change.
 `ringline/recv_direct`: `ARMED` (receives submitted), `KNOWN_LENGTH` (of
 those, receives into a buffer grown for a `NeedAtLeast` of at least
 `recv_direct_region`), `BYTES` (bytes the kernel wrote into accumulators),
-`STALE` (completions for a closed or reused slot). Copies on a direct
-connection still count in `ringline/recv_ring` `BYTES_COPIED`.
+`STALE` (completions for a closed or reused slot), `POOL_REUSED` and
+`POOL_ALLOCATED` (borrowed buffers that came from the pool, and ones
+allocated because none fit). Copies on a direct connection still count in
+`ringline/recv_ring` `BYTES_COPIED`.
 
 ## Tests
 
@@ -318,9 +361,14 @@ connection still count in `ringline/recv_ring` `BYTES_COPIED`.
   Dropping one received byte fails the first three tests. The overestimate,
   reset and refusal tests fail against the `MSG_WAITALL` version.
 - `tests/recv_direct_alloc.rs` (its own binary, for the counting global
-  allocator): 2,000 batches of 16 messages, each batch requested after the
-  previous one is consumed, make fewer than one allocation of 32 KiB or more
-  per 20 batches.
+  allocator): request-response batches of small, 64 KiB and 1 MiB messages
+  make fewer than one allocation of 32 KiB or more per 20 batches after the
+  warmup (see Buffers).
+- `accumulator.rs` unit tests: borrowed sizes round to the steps and to
+  2 MiB; the pool reuses a fitting buffer, refuses one more than twice the
+  size, and keeps no more than its cap; a connection returns its borrowed
+  buffer once nothing is buffered and borrows the same one for the next
+  large message. Both pool tests fail when the pool keeps nothing.
 - `tests/recv_direct_copies.rs` (its own binary, for the process-wide
   counters): 70,000-byte messages in 64 KiB and 1 MiB writes copy at most a
   quarter of a byte per byte received; 500 B messages at most 1/20; 1 MiB
@@ -338,13 +386,17 @@ Not tested: worker exit with a receive armed.
 ## Landing
 
 1. Measure the 64 B fix (build C3) against A and `c0`.
-2. A scale run: 16 workers with 4,000 and 16,000 connections, cells up to
-   64 KiB (1 MiB values at 16,000 connections would hold about 20 GiB of
-   accumulators).
-3. PR for the runtime change and the `PoolConfig` option, with a fresh
+2. Measure the pool (build C4, this branch): the C screen plus a cell with
+   mixed value sizes and a cell that leaves connections idle after large
+   values, with peak RSS and the hosts' THP mode recorded.
+3. A scale run: 16 workers with 4,000 and 16,000 connections, cells up to
+   64 KiB. With 1 MiB values at depth 1, almost every connection is partway
+   through a value, so 16,000 connections would hold about 16 GiB of
+   borrowed buffers, as the ring path's accumulators would.
+4. PR for the runtime change and the `PoolConfig` option, with a fresh
    review.
-4. `ShardedConfig` and `ClusterConfig` option in the next breaking release.
-5. mio: read plaintext connections into the accumulator (separate PR).
+5. `ShardedConfig` and `ClusterConfig` option in the next breaking release.
+6. mio: read plaintext connections into the accumulator (separate PR).
 
 ## Decisions
 
@@ -369,6 +421,10 @@ closed or merged without a release.
 ## Not known
 
 - Whether 06c6c43 removes all of the 64 B regression (C3 pending).
+- What the 32 KiB own buffer costs where a pipelined batch is a little larger
+  than it: at memcache 4 KiB depth 16 a batch is about 64 KiB, and the first
+  32 KiB of each batch may be copied into a borrowed buffer.
+- Whether the measurement hosts run THP in mode `always`.
 - Behaviour above 63 connections per worker.
 - Whether a cancelled direct receive can still be in flight when the worker
   exit bound runs out.

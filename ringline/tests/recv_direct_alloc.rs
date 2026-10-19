@@ -43,42 +43,45 @@ unsafe impl GlobalAlloc for CountLarge {
 #[global_allocator]
 static ALLOC: CountLarge = CountLarge;
 
-const BATCHES: usize = 2_000;
-const FRAMES: usize = 16;
-const SIZE: usize = 60;
+/// Batches, messages per batch, and message size for the current run.
+static SHAPE: Mutex<(usize, usize, usize)> = Mutex::new((0, 0, 0));
+/// Batches read before counting starts: the first receives allocate the
+/// connection's buffer and the pool's.
+const WARMUP: usize = 4;
 
 static SERVER: Mutex<Option<SocketAddr>> = Mutex::new(None);
 static RESULT: Mutex<Option<Result<u64, String>>> = Mutex::new(None);
 
-/// Read `BATCHES` batches of `FRAMES` frames (a 4-byte length and `SIZE`
-/// payload bytes) with `with_bytes`, dropping each payload before the next
-/// read, and send one byte after each batch to ask for the next.
+/// Read the batches `SHAPE` describes, each message a 4-byte length and its
+/// payload, with `with_bytes` and no length hint, dropping each payload
+/// before the next read, and send one byte after each batch to ask for the
+/// next.
 struct Client;
 
 impl AsyncEventHandler for Client {
     fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
         Some(Box::pin(async {
             let addr = SERVER.lock().unwrap().unwrap();
+            let (batches, frames, size) = *SHAPE.lock().unwrap();
             let r = async {
                 let mut conn = ringline::connect(addr)
                     .recv_direct(true)
                     .await
                     .map_err(|e| format!("connect: {e}"))?;
                 let mut start = 0;
-                for batch in 0..BATCHES {
-                    if batch == 1 {
-                        // The first receive allocates the buffer.
+                for batch in 0..batches {
+                    if batch == WARMUP {
                         start = LARGE.load(Ordering::Relaxed);
                     }
-                    for m in 0..FRAMES {
+                    for m in 0..frames {
                         let mut value = None;
                         let n = conn
                             .with_bytes(|b| {
-                                if b.len() < 4 + SIZE {
+                                if b.len() < 4 + size {
                                     return ParseResult::NeedMore;
                                 }
-                                value = Some(b.slice(4..4 + SIZE));
-                                ParseResult::Consumed(4 + SIZE)
+                                value = Some(b.slice(4..4 + size));
+                                ParseResult::Consumed(4 + size)
                             })
                             .await;
                         if n == 0 {
@@ -103,21 +106,24 @@ impl AsyncEventHandler for Client {
     }
 }
 
-#[test]
-fn a_direct_receive_reuses_a_consumed_buffer() {
+/// Run the client against a server that sends `batches` batches of
+/// `frames` messages of `size` bytes, and return the allocations of 32 KiB or
+/// more after the warmup.
+fn run(batches: usize, frames: usize, size: usize) -> u64 {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     *SERVER.lock().unwrap() = Some(listener.local_addr().unwrap());
+    *SHAPE.lock().unwrap() = (batches, frames, size);
     let server = std::thread::spawn(move || {
         let (mut s, _) = listener.accept().unwrap();
         let mut batch = Vec::new();
-        for _ in 0..FRAMES {
-            batch.extend_from_slice(&(SIZE as u32).to_be_bytes());
-            batch.resize(batch.len() + SIZE, 0x5a);
+        for _ in 0..frames {
+            batch.extend_from_slice(&(size as u32).to_be_bytes());
+            batch.resize(batch.len() + size, 0x5a);
         }
         let mut ask = [0u8; 1];
-        for b in 0..BATCHES {
+        for b in 0..batches {
             s.write_all(&batch).unwrap();
-            if b + 1 < BATCHES {
+            if b + 1 < batches {
                 s.read_exact(&mut ask).unwrap();
             }
         }
@@ -139,9 +145,32 @@ fn a_direct_receive_reuses_a_consumed_buffer() {
         .take()
         .expect("client did not finish")
         .expect("client");
-    eprintln!("{BATCHES} batches: {large} allocations of 32 KiB or more");
+    eprintln!("{batches} batches of {frames} x {size} B: {large} allocations of 32 KiB or more");
+    large
+}
+
+/// Small messages fit the connection's own buffer, which a receive reuses
+/// once the parser has consumed it.
+#[test]
+fn a_direct_receive_reuses_a_consumed_buffer() {
+    let batches = 2_000;
+    let large = run(batches, 16, 60);
     assert!(
-        large * 20 <= BATCHES as u64,
-        "{large} allocations of 32 KiB or more in {BATCHES} batches"
+        large * 20 <= batches as u64,
+        "{large} allocations of 32 KiB or more in {batches} batches"
     );
+}
+
+/// Messages larger than the connection's own buffer borrow one from the
+/// pool and give it back, so after the warmup no batch allocates.
+#[test]
+fn large_messages_reuse_pooled_buffers() {
+    for (frames, size) in [(1, 64 * 1024), (4, 64 * 1024), (1, 1 << 20)] {
+        let batches = 200;
+        let large = run(batches, frames, size);
+        assert!(
+            large * 20 <= batches as u64,
+            "{frames} x {size} B: {large} allocations of 32 KiB or more in {batches} batches"
+        );
+    }
 }

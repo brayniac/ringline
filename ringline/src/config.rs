@@ -137,10 +137,12 @@ pub struct Config {
     /// slow-consumer workloads (where kernel recv CQEs batch faster than
     /// the handler runs); it must be at least `recv_buffer_size`.
     pub(crate) recv_accumulator_max: usize,
-    /// Bytes a direct receive (`TcpConnect::recv_direct`) asks for when the
-    /// parser has not announced a length. See
+    /// Size of a direct connection's own receive buffer. See
     /// `ConfigBuilder::recv_direct_region`.
     pub(crate) recv_direct_region: usize,
+    /// Most bytes of free buffers a worker keeps for direct connections to
+    /// borrow. See `ConfigBuilder::recv_direct_pool_max`.
+    pub(crate) recv_direct_pool_max: usize,
     /// Aggregate low-water reserve for segmented recv (see
     /// `docs/segmented-recv-design.md`, "Backpressure and ring safety").
     ///
@@ -462,7 +464,8 @@ impl Default for Config {
             max_connections: 16000,
             recv_accumulator_capacity: 4096,
             recv_accumulator_max: 1024 * 1024 * 1024,
-            recv_direct_region: 64 * 1024,
+            recv_direct_region: 32 * 1024,
+            recv_direct_pool_max: 16 << 20,
             recv_segment_reserve: 64,
             forward_hold_cap: 64,
             // Off by default while the trade is being measured: prefaulting
@@ -1105,13 +1108,29 @@ impl ConfigBuilder {
         self
     }
 
-    /// Set how many bytes a direct receive asks for when the parser has not
-    /// announced a length (`ParseResult::NeedAtLeast`). A connection made with
-    /// [`TcpConnect::recv_direct`](crate::TcpConnect::recv_direct) receives
-    /// into its own accumulator, and an idle one holds an accumulator of
-    /// about this size. Defaults to 64 KiB; must be at least 1.
+    /// Set the size of the buffer a direct connection
+    /// ([`TcpConnect::recv_direct`](crate::TcpConnect::recv_direct)) receives
+    /// into when it has nothing buffered. An idle direct connection holds a
+    /// buffer of this size. A message that does not fit borrows a larger
+    /// buffer from the worker (see
+    /// [`recv_direct_pool_max`](Self::recv_direct_pool_max)), and the bytes
+    /// already received for it, at most this many, are copied once. Defaults
+    /// to 32 KiB; must be at least 1.
     pub fn recv_direct_region(mut self, n: usize) -> Self {
         self.config.recv_direct_region = n;
+        self
+    }
+
+    /// Set the most bytes of free buffers each worker keeps for direct
+    /// connections to borrow. A direct connection receiving a message larger
+    /// than [`recv_direct_region`](Self::recv_direct_region) borrows a buffer
+    /// of at least 64 KiB, the smallest free one that fits, and gives it back
+    /// when nothing is buffered and no value read from it is alive. A buffer
+    /// given back when the free buffers already hold this many bytes is
+    /// freed, so a workload with values of 100 MiB reuses their buffers only
+    /// with this above 100 MiB. Defaults to 16 MiB.
+    pub fn recv_direct_pool_max(mut self, bytes: usize) -> Self {
+        self.config.recv_direct_pool_max = bytes;
         self
     }
 

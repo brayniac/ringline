@@ -1413,11 +1413,12 @@ impl Driver {
             send_copy_pool.prefault();
         }
         let send_slab = InFlightSendSlab::new(config.send_slab_slots);
-        let accumulators = AccumulatorTable::new_with_max(
+        let mut accumulators = AccumulatorTable::new_with_max(
             config.max_connections,
             config.recv_accumulator_capacity,
             config.recv_accumulator_max,
         );
+        accumulators.set_direct_pool_max(config.recv_direct_pool_max);
 
         // Deadline flush: disabled when SQPOLL (kernel polls SQ) or interval is 0.
         let flush_interval = if config.sqpoll || config.flush_interval_us == 0 {
