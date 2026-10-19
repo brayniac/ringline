@@ -3345,6 +3345,8 @@ impl<F: FnMut(&[u8]) -> ParseResult + Unpin> WithDataFuture<F> {
                 driver
                     .accumulators
                     .consume(self.conn_index, consumed.saturating_sub(forwarded));
+                #[cfg(has_io_uring)]
+                driver.accumulators.note_consumed(self.conn_index, consumed);
                 self.f.take();
                 return Poll::Ready(consumed);
             }
@@ -3530,6 +3532,8 @@ impl<F: FnMut(Bytes) -> ParseResult + Unpin> WithBytesFuture<F> {
                         .accumulators
                         .put_back(self.conn_index, frozen.slice(consumed..));
                 }
+                #[cfg(has_io_uring)]
+                driver.accumulators.note_consumed(self.conn_index, consumed);
                 self.f.take();
                 return Poll::Ready(consumed);
             }

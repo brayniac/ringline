@@ -137,6 +137,18 @@ fn run(count: usize, size: usize, chunk: usize) -> Counts {
 fn direct_receives_copy_little() {
     // Small frames: a receive holds many frames, and the only copies are
     // the partial frame moved when the accumulator's buffer is grown.
+    // 70,000-byte frames sent back to back: a receive ends inside a frame,
+    // and that part is moved when the buffer grows again. Receives several
+    // frames long make the move once per several frames.
+    for chunk in [1 << 16, 1 << 20] {
+        let pipelined = run(500, 70_000, chunk);
+        assert!(
+            pipelined.copied * 4 <= pipelined.received,
+            "70,000-byte frames in {chunk}-byte writes: {} bytes copied of {} received",
+            pipelined.copied,
+            pipelined.received
+        );
+    }
     let small = run(20_000, 500, 1 << 16);
     assert_eq!(small.received, 20_000 * 504, "bytes received");
     assert!(small.armed > 0);
