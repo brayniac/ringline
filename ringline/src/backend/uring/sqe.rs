@@ -53,12 +53,11 @@ pub(crate) enum Op {
         msg: *const libc::msghdr,
         buf_group: u16,
     },
-    /// One-shot recv into `buf`; `flags` are `recv(2)` flags.
+    /// One-shot recv into `buf`.
     Recv {
         fd: Fd,
         buf: *mut u8,
         len: u32,
-        flags: i32,
     },
     /// Multishot accept; `flags` are `accept4(2)` flags.
     AcceptMulti {

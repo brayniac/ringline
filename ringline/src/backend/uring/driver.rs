@@ -161,8 +161,10 @@ impl Driver {
     /// byte: the receive detaches the accumulator's buffer, so arming earlier
     /// would hide buffered bytes from the parser until more arrive.
     ///
-    /// `need` is the parser's `NeedAtLeast` value, if it returned one. Then
-    /// the receive asks for exactly that many bytes with `MSG_WAITALL`.
+    /// `need` is the parser's `NeedAtLeast` value, if it returned one. When
+    /// it is at least `recv_direct_region`, the buffer is first grown to hold
+    /// the rest of the message. A receive that returns less wakes the task
+    /// like any other, and its parser sees the bytes so far.
     ///
     /// On a push failure, or with the accumulator at `recv_accumulator_max`,
     /// the connection is closed, as for a multishot re-arm failure and an
@@ -184,7 +186,7 @@ impl Driver {
             return false;
         }
         let generation = cs.generation;
-        let Some((mut buf, len, exact)) =
+        let Some((mut buf, len, known)) =
             self.accumulators
                 .detach_for_recv(conn_index, self.recv_direct_region, need)
         else {
@@ -199,10 +201,9 @@ impl Driver {
                 (self.direct_recvs.len() - 1) as u32
             }
         };
-        let flags = if exact { libc::MSG_WAITALL } else { 0 };
         if self
             .ring
-            .submit_recv_direct(conn_index, ptr, len as u32, flags, slot)
+            .submit_recv_direct(conn_index, ptr, len as u32, slot)
             .is_err()
         {
             metrics::RING.increment(metrics::ring::RECV_ARM_FAILURES);
@@ -221,8 +222,8 @@ impl Driver {
             cs.recv_direct_armed = true;
         }
         metrics::RECV_DIRECT.increment(metrics::recv_direct::ARMED);
-        if exact {
-            metrics::RECV_DIRECT.increment(metrics::recv_direct::WAITALL);
+        if known {
+            metrics::RECV_DIRECT.increment(metrics::recv_direct::KNOWN_LENGTH);
         }
         false
     }

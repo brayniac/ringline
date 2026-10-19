@@ -68,7 +68,7 @@ struct Counts {
     received: u64,
     copied: u64,
     armed: u64,
-    waitall: u64,
+    known: u64,
 }
 
 fn counts() -> Counts {
@@ -76,7 +76,7 @@ fn counts() -> Counts {
         received: RECV_DIRECT.value(recv_direct::BYTES).unwrap_or(0),
         copied: RECV_RING.value(recv_ring::BYTES_COPIED).unwrap_or(0),
         armed: RECV_DIRECT.value(recv_direct::ARMED).unwrap_or(0),
-        waitall: RECV_DIRECT.value(recv_direct::WAITALL).unwrap_or(0),
+        known: RECV_DIRECT.value(recv_direct::KNOWN_LENGTH).unwrap_or(0),
     }
 }
 
@@ -119,17 +119,17 @@ fn run(count: usize, size: usize, chunk: usize) -> Counts {
     );
     let after = counts();
     eprintln!(
-        "{count} x {size} B: received {}, copied {}, armed {}, waitall {}",
+        "{count} x {size} B: received {}, copied {}, armed {}, known length {}",
         after.received - before.received,
         after.copied - before.copied,
         after.armed - before.armed,
-        after.waitall - before.waitall
+        after.known - before.known
     );
     Counts {
         received: after.received - before.received,
         copied: after.copied - before.copied,
         armed: after.armed - before.armed,
-        waitall: after.waitall - before.waitall,
+        known: after.known - before.known,
     }
 }
 
@@ -159,12 +159,12 @@ fn direct_receives_copy_little() {
         small.received
     );
 
-    // 1 MiB frames: once the header is in, the rest of the frame arrives in
-    // one exact-length receive, and the bytes already received for it are
-    // copied once when the buffer grows to the frame's size.
+    // 1 MiB frames: once the header is in, the buffer grows to hold the rest
+    // of the frame, which copies the bytes already received for it once; the
+    // receives that follow land behind them in place.
     let large = run(32, 1 << 20, 1 << 16);
     assert_eq!(large.received, 32 * ((1 << 20) + 4), "bytes received");
-    assert!(large.waitall > 0, "no exact-length receive was armed");
+    assert!(large.known > 0, "no receive was sized for a known length");
     assert!(
         large.copied * 5 <= large.received,
         "1 MiB frames: {} bytes copied of {} received",

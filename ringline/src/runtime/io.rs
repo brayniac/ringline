@@ -681,17 +681,30 @@ impl TcpConnect {
     /// Receive into this connection's own accumulator instead of the
     /// worker's provided-buffer ring (io_uring only).
     ///
-    /// When a read on the connection parks (`with_data`, `with_bytes` and
-    /// the other receive futures), the runtime submits a one-shot receive
-    /// whose destination is the free space of the connection's accumulator,
-    /// so the received bytes are not copied out of a ring buffer. After a
-    /// parser returns [`ParseResult::NeedAtLeast`], the receive asks for
-    /// exactly the missing bytes. Otherwise it asks for the free space,
-    /// grown to [`ConfigBuilder::recv_direct_region`](crate::ConfigBuilder::recv_direct_region)
-    /// when less than half of that is free, and an idle connection keeps an
-    /// accumulator of about that size.
+    /// When `with_data`, `with_bytes` or `recv_ready` parks, the runtime
+    /// submits a one-shot receive whose destination is the free space of the
+    /// connection's accumulator, so the received bytes are not copied out of
+    /// a ring buffer. The receive asks for all the free space. When the
+    /// parser returned a [`ParseResult::NeedAtLeast`] of at least
+    /// [`ConfigBuilder::recv_direct_region`](crate::ConfigBuilder::recv_direct_region),
+    /// the accumulator is first grown to hold the rest of the message;
+    /// otherwise it is grown to that region when less than half of it is
+    /// free. An idle connection keeps an accumulator of about the size of its
+    /// largest receive.
     ///
-    /// Ignored on a TLS connection and on the mio backend.
+    /// The reads that use the provided-buffer ring are refused on a direct
+    /// connection: `segments`, `recv_owned_segment`, `with_segments`,
+    /// `with_bytes_segments`, `forward_to`, `forward_to_conn` and
+    /// `forward_held` return [`io::ErrorKind::Unsupported`],
+    /// `enable_recv_forward` does nothing, and `run_direct_echo` resolves at
+    /// once.
+    ///
+    /// Ignored on the mio backend.
+    ///
+    /// # Errors
+    ///
+    /// Together with [`tls`](Self::tls), the connect fails with
+    /// [`io::ErrorKind::Unsupported`].
     pub fn recv_direct(mut self, enabled: bool) -> Self {
         self.recv_direct = enabled;
         self
@@ -755,7 +768,6 @@ enum ConnectTarget {
     Tcp {
         addr: SocketAddr,
         server_name: Option<String>,
-        #[cfg_attr(not(has_io_uring), allow(dead_code))]
         recv_direct: bool,
     },
     Unix {
@@ -1750,6 +1762,11 @@ impl ConnCtx {
             if driver.forward_progress[idx].is_some() {
                 return Err(libc::EBUSY);
             }
+            // A direct connection's bytes go to its accumulator, not to a
+            // hold a forward could send from.
+            if is_recv_direct(driver, self.conn_index) {
+                return Err(libc::EOPNOTSUPP);
+            }
             // Sink-side refusals: the source is live and no forward owns its
             // hold, so anything already held would be stranded — the provided
             // buffer leaked per attempt that
@@ -2410,10 +2427,14 @@ impl ConnCtx {
     #[cfg(has_io_uring)]
     /// A stale handle is a no-op: this returns `()` and so has no way to
     /// report a refusal, and flipping the flag on a recycled slot would make a
-    /// *different* connection start holding its recv buffers. See #429.
+    /// *different* connection start holding its recv buffers. See #429. On a
+    /// [`recv_direct`](TcpConnect::recv_direct) connection it is also a no-op,
+    /// and [`forward_held`](Self::forward_held) returns `Unsupported`.
     pub fn enable_recv_forward(&self) {
         with_state(|driver, _| {
-            if driver.connections.generation(self.conn_index) != self.generation {
+            if driver.connections.generation(self.conn_index) != self.generation
+                || is_recv_direct(driver, self.conn_index)
+            {
                 return;
             }
             driver.recv_forward[self.conn_index as usize] = true;
@@ -2453,6 +2474,9 @@ impl ConnCtx {
                     io::ErrorKind::NotConnected,
                     "stale connection",
                 ));
+            }
+            if is_recv_direct(driver, conn_index) {
+                return Err(recv_direct_unsupported());
             }
 
             let n = driver.recv_hold[conn_index as usize]
@@ -3173,6 +3197,28 @@ impl<'a> MioSendBuilder<'a> {
 }
 
 // ── WithDataFuture ───────────────────────────────────────────────────
+
+/// Whether `conn_index` receives directly into its accumulator
+/// (`TcpConnect::recv_direct`). Such a connection has no receive from the
+/// provided-buffer ring, so the reads that hold ring buffers (segments,
+/// forwarding, recv-forward, direct echo) are refused on it.
+#[cfg(has_io_uring)]
+fn is_recv_direct(driver: &Driver, conn_index: u32) -> bool {
+    driver
+        .connections
+        .get(conn_index)
+        .is_some_and(|cs| cs.recv_direct)
+}
+
+/// The error a read that needs the provided-buffer ring returns on a direct
+/// connection.
+#[cfg(has_io_uring)]
+fn recv_direct_unsupported() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        "not supported on a recv_direct connection",
+    )
+}
 
 /// Register the current task as `conn_index`'s receive waiter. On a direct
 /// connection (`TcpConnect::recv_direct`) also arm its receive, which the
@@ -4630,6 +4676,9 @@ fn enter_segmented(
     if driver.connections.generation(conn_index) != generation {
         return Err(io::Error::from_raw_os_error(libc::EPIPE));
     }
+    if is_recv_direct(driver, conn_index) {
+        return Err(recv_direct_unsupported());
+    }
     // A running Mode A forward owns this connection's hold, and its
     // `advance_forward` gathers whatever is in front. Adopting the
     // accumulator here would push post-`len` overshoot into the
@@ -5393,6 +5442,10 @@ impl<F: FnMut(&SegChain<'_>) -> SegConsumed + Unpin> Future for WithSegmentsFutu
             if driver.connections.generation(self.conn_index) != self.generation {
                 self.f.take();
                 return Poll::Ready(Ok(0));
+            }
+            if is_recv_direct(driver, self.conn_index) {
+                self.f.take();
+                return Poll::Ready(Err(recv_direct_unsupported()));
             }
             let before = arrival_mark(driver, self.conn_index);
             let poll = self.poll_current(driver, executor);
@@ -6528,6 +6581,11 @@ impl Future for DirectEchoFuture {
                 return Poll::Ready(());
             }
 
+            // A direct connection has no ring receive to echo from.
+            if is_recv_direct(driver, self.conn_index) {
+                return Poll::Ready(());
+            }
+
             if !self.armed {
                 // Arm direct-echo mode on the connection.
                 if let Some(cs) = driver.connections.get_mut(self.conn_index) {
@@ -6640,6 +6698,19 @@ impl ConnectFuture {
         driver: &mut crate::backend::Driver,
         executor: &mut crate::runtime::Executor,
     ) -> io::Result<(u32, u32)> {
+        // A TLS connection's received bytes are ciphertext; the plaintext is
+        // copied into the accumulator in any case.
+        if let ConnectTarget::Tcp {
+            server_name: Some(_),
+            recv_direct: true,
+            ..
+        } = target
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "recv_direct is not supported on a TLS connection",
+            ));
+        }
         let mut ctx = driver.make_ctx();
         let token = match target {
             ConnectTarget::Tcp {
