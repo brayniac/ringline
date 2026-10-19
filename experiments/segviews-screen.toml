@@ -265,9 +265,12 @@ for proto in resp memcache; do
       65536) keys=5000; depths="1 16";;
       1048576) keys=400; depths="1";;
     esac
-    # Write every key once; not measured.
+    # Write every key once; not measured. A bins artifact without
+    # cachecannon-a (a profiling build of c only) prefills with
+    # cachecannon-c on the plain ring.
     config results/prefill-$proto-v$vlen.toml $proto $port $vlen $keys 1 "" true 1s 0s results/prefill-$proto-v$vlen.parquet plain
-    ./out/cachecannon-a results/prefill-$proto-v$vlen.toml > results/prefill-$proto-v$vlen.json 2> results/prefill-$proto-v$vlen.log
+    prefill_bin=out/cachecannon-a; [ -x $prefill_bin ] || prefill_bin=out/cachecannon-c
+    ./$prefill_bin results/prefill-$proto-v$vlen.toml > results/prefill-$proto-v$vlen.json 2> results/prefill-$proto-v$vlen.log
     echo "== prefill $proto v$vlen rc=$?"
     for depth in $depths; do
       cell="$proto-v$vlen-d$depth"
