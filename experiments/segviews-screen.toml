@@ -32,7 +32,12 @@
 # 256 x 16 KiB. ai and bi are the same binaries with an incremental ring of
 # 64 x 1 MiB (general.recv_incremental); ringline uses a plain ring of that
 # geometry on a kernel without incremental rings, and RECV_RING's first two
-# counters say which ring each worker got.
+# counters say which ring each worker got. c, c0 and c1 run cachecannon-c, which
+# is A with ringline's direct receive (TcpConnect::recv_direct): c receives
+# directly into each connection's accumulator (general.recv_direct), c0 uses
+# A's multishot ring receives, and c1 one-shot ring receives
+# (general.recv_multishot = false), the control for the extra submissions of
+# one-shot receives.
 #
 # Each run records cachecannon's JSON result, its parquet metrics (ringline's
 # RECV_RING copy and view counters among them), and user and system CPU and
@@ -195,15 +200,21 @@ esac
 [ -n "$order" ] || { echo "NO ORDER for phase {phase}"; exit 1; }
 echo "phase={phase} rep={rep} order=$order"
 
-# config FILE PROTO PORT VLEN KEYS DEPTH RATE PREFILL DURATION WARMUP PARQUET INC
+# config FILE PROTO PORT VLEN KEYS DEPTH RATE PREFILL DURATION WARMUP PARQUET RECV
+# RECV: plain, inc (incremental ring), direct, or oneshot (one-shot ring
+# receives).
 config() {
   local file=$1 proto=$2 port=$3 vlen=$4 keys=$5 depth=$6 rate=$7 prefill=$8 dur=$9
   shift 9
-  local warm=$1 parquet=$2 inc=$3
+  local warm=$1 parquet=$2 recv=$3
   local rate_line="" prefill_line="prefill = false" ring_lines=""
   [ -n "$rate" ] && rate_line="rate_limit = $rate"
   [ "$prefill" = true ] && prefill_line=$'prefill = true\nprefill_settle = "0s"'
-  [ "$inc" = true ] && ring_lines=$'recv_incremental = true\nrecv_ring_size = 64\nrecv_buffer_size = 1048576'
+  case $recv in
+    inc) ring_lines=$'recv_incremental = true\nrecv_ring_size = 64\nrecv_buffer_size = 1048576' ;;
+    direct) ring_lines='recv_direct = true' ;;
+    oneshot) ring_lines='recv_multishot = false' ;;
+  esac
   cat > "$file" <<CFG
 [general]
 duration = "$dur"
@@ -255,7 +266,7 @@ for proto in resp memcache; do
       1048576) keys=400; depths="1";;
     esac
     # Write every key once; not measured.
-    config results/prefill-$proto-v$vlen.toml $proto $port $vlen $keys 1 "" true 1s 0s results/prefill-$proto-v$vlen.parquet false
+    config results/prefill-$proto-v$vlen.toml $proto $port $vlen $keys 1 "" true 1s 0s results/prefill-$proto-v$vlen.parquet plain
     ./out/cachecannon-a results/prefill-$proto-v$vlen.toml > results/prefill-$proto-v$vlen.json 2> results/prefill-$proto-v$vlen.log
     echo "== prefill $proto v$vlen rc=$?"
     for depth in $depths; do
@@ -272,13 +283,13 @@ for proto in resp memcache; do
       # the third <b>3, and so on.
       seen=" "
       for b in $order; do
-        case $b in b*) bin=out/cachecannon-b ;; *) bin=out/cachecannon-a ;; esac
-        case $b in ?i*) inc=true ;; *) inc=false ;; esac
+        case $b in b*) bin=out/cachecannon-b ;; c*) bin=out/cachecannon-c ;; *) bin=out/cachecannon-a ;; esac
+        case $b in ?i*) recv=inc ;; c) recv=direct ;; c1) recv=oneshot ;; *) recv=plain ;; esac
         n=$(echo "$seen" | tr ' ' '\n' | grep -c "^$b$")
         seen="$seen$b "
         run="$cell-$b"
         [ "$n" -gt 0 ] && run="$cell-$b$((n + 1))"
-        config results/$run.toml $proto $port $vlen $keys $depth "$rate" false {duration} {warmup} results/$run.parquet $inc
+        config results/$run.toml $proto $port $vlen $keys $depth "$rate" false {duration} {warmup} results/$run.parquet $recv
         /usr/bin/time -f "time user_s=%U sys_s=%S maxrss_kb=%M" -o results/$run.time \
           $bin results/$run.toml > results/$run.json 2> results/$run.log &
         pid=$!

@@ -4,6 +4,9 @@
 #                  proto crates' main branches by git rev)
 #   cachecannon-b  brayniac/cachecannon exp/segviews-b (the client crates read
 #                  with with_bytes_segments)
+#   cachecannon-c  brayniac/cachecannon exp/segviews-c (A with ringline's
+#                  direct receive, general.recv_direct); built when `arms`
+#                  includes c
 # The builds differ only in the pins in Cargo.toml and Cargo.lock. Same
 # profile for both; no target-cpu=native.
 #
@@ -11,12 +14,14 @@
 # debug = "line-tables-only", so `perf record -g` can walk the Rust frames
 # and reports name source lines. Measure CPU and latency with the default
 # build (rustflags empty, debug = 0), not this one.
-name = "segviews build (a={ref_a}, b={ref_b}, rustflags={rustflags}, debug={debug})"
+name = "segviews build ({arms}: a={ref_a}, b={ref_b}, c={ref_c}, rustflags={rustflags}, debug={debug})"
 
 [params]
 repo  = "https://github.com/brayniac/cachecannon"
 ref_a = "exp/segviews-a"
 ref_b = "exp/segviews-b"
+ref_c = "exp/segviews-c"
+arms  = "a b"
 rustflags = ""
 debug = "0"
 
@@ -43,8 +48,8 @@ cd /home/anvil
   echo "rustflags={rustflags} debug={debug}"
   mkdir -p out
   status=0
-  for arm in a b; do
-    case $arm in a) ref={ref_a};; b) ref={ref_b};; esac
+  for arm in {arms}; do
+    case $arm in a) ref={ref_a};; b) ref={ref_b};; c) ref={ref_c};; esac
     git clone -q {repo} cc-$arm && git -C cc-$arm checkout -q $ref
     echo "cachecannon-$arm: $(git -C cc-$arm log --oneline -1)"
     grep -E '^(ringline|resp-proto|memcache-proto)[a-z-]* = \{ git' cc-$arm/Cargo.toml
