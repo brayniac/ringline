@@ -117,6 +117,11 @@ pub enum OpTag {
     /// `SendMsgCoalescedDrain`. It posts no notification. Payload =
     /// InFlightSendSlab index.
     SendMsgZcDrain = 35,
+    /// Direct receive (`TcpConnect::recv_direct`): a one-shot recv into the
+    /// spare capacity of the connection's accumulator buffer. Payload =
+    /// `Driver::direct_recvs` index, whose entry holds the buffer and the
+    /// connection generation.
+    RecvDirect = 36,
 }
 
 /// Set in an `OpTag::SendRecvBuf` payload, above the 16-bit bid, when the send
@@ -161,6 +166,7 @@ impl OpTag {
             33 => Some(OpTag::CloseShutdown),
             34 => Some(OpTag::CloseCancel),
             35 => Some(OpTag::SendMsgZcDrain),
+            36 => Some(OpTag::RecvDirect),
             _ => None,
         }
     }
@@ -208,6 +214,7 @@ impl OpTag {
             OpTag::CloseShutdown => "close_shutdown",
             OpTag::CloseCancel => "close_cancel",
             OpTag::SendMsgZcDrain => "send_msg_zc_drain",
+            OpTag::RecvDirect => "recv_direct",
         }
     }
 }
