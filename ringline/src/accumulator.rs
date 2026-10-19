@@ -497,14 +497,14 @@ impl AccumulatorTable {
     /// its length; [`attach_received`](Self::attach_received) puts it back.
     /// While it is detached the accumulator is empty.
     ///
-    /// Returns the buffer, the number of bytes to receive, and whether that
-    /// number is exact. `need` is the parser's last `NeedAtLeast` value, the
-    /// bytes still missing from the message. When it is at least `region`,
-    /// the receive asks for exactly that many, so the message arrives in one
-    /// completion. Otherwise the receive asks for all the spare capacity,
-    /// after growing it when less than `need`, or less than half of `region`,
-    /// is spare. An empty buffer is grown when less than the receive size is
-    /// spare, which moves nothing when its allocation is not shared.
+    /// Returns the buffer, the number of bytes to receive, and whether the
+    /// buffer was sized for a known message length. `need` is the parser's
+    /// last `NeedAtLeast` value, the bytes still missing from the message.
+    /// When it is at least `region`, the buffer is grown to hold the rest of
+    /// the message. Otherwise it is grown when less than `need`, or less than
+    /// half of `region`, is spare. An empty buffer is grown when less than the
+    /// receive size is spare, which moves nothing when its allocation is not
+    /// shared. The receive asks for all the spare capacity.
     ///
     /// The receive size is `region`, or for a connection whose largest
     /// message (`note_consumed`) is `m`, the larger of `region` and
@@ -545,7 +545,7 @@ impl AccumulatorTable {
             return None;
         }
         let need = need.unwrap_or(0).min(room);
-        let exact = need >= region;
+        let known = need >= region;
         let spare = acc.buf.capacity() - len;
         let m = acc.largest_message;
         let size = region
@@ -554,7 +554,7 @@ impl AccumulatorTable {
                     .min(m.saturating_add(region.saturating_mul(4))),
             )
             .min(room);
-        let (grow, want) = if exact {
+        let (grow, want) = if known {
             (spare < need, need)
         } else if len == 0 {
             (spare < size, size)
@@ -567,9 +567,8 @@ impl AccumulatorTable {
             note_copied(moved(&acc.buf, before, len));
         }
         let spare = acc.buf.capacity() - len;
-        let n = if exact { need } else { spare.min(room) };
-        let n = n.min(u32::MAX as usize);
-        Some((std::mem::take(&mut acc.buf), n, exact))
+        let n = spare.min(room).min(u32::MAX as usize);
+        Some((std::mem::take(&mut acc.buf), n, known))
     }
 
     /// Keep `consumed`, a frozen view a direct connection's parser consumed

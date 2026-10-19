@@ -37,6 +37,8 @@ pub struct PoolConfig {
     /// TLS server name (SNI) for outbound connections. `None` means plain TCP.
     /// Requires a client configuration from `ConfigBuilder::tls_client`.
     pub(crate) tls_server_name: Option<String>,
+    /// Receive with `TcpConnect::recv_direct`.
+    pub(crate) recv_direct: bool,
 }
 
 impl PoolConfig {
@@ -48,6 +50,7 @@ impl PoolConfig {
             pool_size,
             connect_timeout_ms: 0,
             tls_server_name: None,
+            recv_direct: false,
         }
     }
 
@@ -60,6 +63,20 @@ impl PoolConfig {
     /// Set the TLS server name (SNI) for outbound connections; enables TLS.
     pub fn tls_server_name(mut self, name: impl Into<String>) -> Self {
         self.tls_server_name = Some(name.into());
+        self
+    }
+
+    /// Receive into each connection's own accumulator instead of the
+    /// worker's provided-buffer ring
+    /// ([`TcpConnect::recv_direct`](ringline::TcpConnect::recv_direct)).
+    /// Off by default, and ignored on the mio backend. Not supported with
+    /// [`tls_server_name`](Self::tls_server_name): connecting fails.
+    ///
+    /// `Client::get_stream` and `Client::get_cas` (io_uring only) read with
+    /// segments, which a direct connection refuses: on a pool with this set
+    /// they fail with an `Unsupported` I/O error.
+    pub fn recv_direct(mut self, enabled: bool) -> Self {
+        self.recv_direct = enabled;
         self
     }
 }
@@ -213,6 +230,7 @@ pub struct Pool {
     shared: Rc<Shared>,
     connect_timeout_ms: u64,
     tls_server_name: Option<String>,
+    recv_direct: bool,
 }
 
 impl Pool {
@@ -230,6 +248,7 @@ impl Pool {
             }),
             connect_timeout_ms: config.connect_timeout_ms,
             tls_server_name: config.tls_server_name,
+            recv_direct: config.recv_direct,
         }
     }
 
@@ -424,7 +443,7 @@ impl Pool {
 
     async fn do_connect(&self) -> Result<Client, Error> {
         // TLS and the timeout are set on the builder (#528).
-        let mut connect = ringline::connect(self.addr);
+        let mut connect = ringline::connect(self.addr).recv_direct(self.recv_direct);
         if let Some(sni) = &self.tls_server_name {
             connect = connect.tls(sni.as_str());
         }

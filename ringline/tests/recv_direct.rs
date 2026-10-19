@@ -307,3 +307,313 @@ fn a_receive_armed_at_close_does_not_reach_the_next_connection() {
         Ok(1)
     );
 }
+
+// ── A NeedAtLeast larger than the message ───────────────────────────
+
+/// Frames of `OVER_SIZE` payload bytes, parsed by a reader that announces
+/// `OVER_NEED` missing bytes until the frame is complete. The documented
+/// contract is that an overestimate costs memory; a direct connection must
+/// still wake the reader with each receive.
+const OVER_SIZE: usize = 200_000;
+const OVER_COUNT: usize = 5;
+const OVER_NEED: usize = 10 << 20;
+
+struct Overestimate;
+
+impl AsyncEventHandler for Overestimate {
+    fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        Some(Box::pin(async {
+            let addr = SERVER.lock().unwrap().unwrap();
+            let r = async {
+                let mut conn = ringline::connect(addr)
+                    .recv_direct(true)
+                    .await
+                    .map_err(|e| format!("connect: {e}"))?;
+                for m in 0..OVER_COUNT {
+                    let n = conn
+                        .with_bytes(|b| {
+                            if b.len() < 4 + OVER_SIZE {
+                                return ParseResult::NeedAtLeast(OVER_NEED);
+                            }
+                            ParseResult::Consumed(4 + OVER_SIZE)
+                        })
+                        .await;
+                    if n == 0 {
+                        return Err(format!("EOF before frame {m}"));
+                    }
+                }
+                Ok(OVER_COUNT)
+            }
+            .await;
+            *RESULT.lock().unwrap() = Some(r);
+            let _ = ringline::request_shutdown();
+        }))
+    }
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
+        async {}
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        Overestimate
+    }
+}
+
+#[test]
+fn an_overestimated_need_does_not_stall_a_direct_read() {
+    let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    *SERVER.lock().unwrap() = Some(listener.local_addr().unwrap());
+    *RESULT.lock().unwrap() = None;
+    let server = std::thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        for _ in 0..OVER_COUNT {
+            s.write_all(&(OVER_SIZE as u32).to_be_bytes()).unwrap();
+            s.write_all(&vec![0x5a; OVER_SIZE]).unwrap();
+        }
+        // Hold the connection open: the reader must finish on the bytes
+        // alone, not on EOF.
+        let mut rest = [0u8; 1];
+        let _ = std::io::Read::read(&mut s, &mut rest);
+    });
+    let config = ConfigBuilder::new()
+        .workers(1)
+        .pin_to_core(false)
+        .max_connections(16)
+        .build()
+        .expect("config");
+    let (runtime, handles) = RinglineBuilder::new(config)
+        .launch::<Overestimate>()
+        .expect("launch");
+    common::join_workers(&runtime, handles);
+    server.join().unwrap();
+    assert_eq!(
+        RESULT
+            .lock()
+            .unwrap()
+            .take()
+            .expect("client did not finish"),
+        Ok(OVER_COUNT)
+    );
+}
+
+// ── A reset in the middle of a message ──────────────────────────────
+
+struct ResetMidMessage;
+
+static RESET_RESULT: Mutex<Option<Result<(), String>>> = Mutex::new(None);
+
+impl AsyncEventHandler for ResetMidMessage {
+    fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        Some(Box::pin(async {
+            let addr = SERVER.lock().unwrap().unwrap();
+            let r = async {
+                let mut conn = ringline::connect(addr)
+                    .recv_direct(true)
+                    .await
+                    .map_err(|e| format!("connect: {e}"))?;
+                // A 100,000-byte frame of which the peer sends 2,000 bytes,
+                // in two writes, before resetting the connection.
+                let r = conn
+                    .with_data_result(|b| {
+                        if b.len() < 4 {
+                            return ParseResult::NeedMore;
+                        }
+                        let n = u32::from_be_bytes(b[..4].try_into().unwrap()) as usize;
+                        if b.len() < 4 + n {
+                            return ParseResult::NeedAtLeast(4 + n - b.len());
+                        }
+                        ParseResult::Consumed(4 + n)
+                    })
+                    .await;
+                match r {
+                    Ok(0) => Err("the reset was reported as a clean EOF".into()),
+                    Ok(n) => Err(format!("read a whole frame of {n} bytes")),
+                    Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => Ok(()),
+                    Err(e) => Err(format!("unexpected error: {e}")),
+                }
+            }
+            .await;
+            *RESET_RESULT.lock().unwrap() = Some(r);
+            let _ = ringline::request_shutdown();
+        }))
+    }
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
+        async {}
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        ResetMidMessage
+    }
+}
+
+#[test]
+fn a_reset_in_the_middle_of_a_message_is_an_error() {
+    use std::os::fd::AsRawFd;
+    let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    *SERVER.lock().unwrap() = Some(listener.local_addr().unwrap());
+    *RESET_RESULT.lock().unwrap() = None;
+    let server = std::thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        s.write_all(&100_000u32.to_be_bytes()).unwrap();
+        s.write_all(&[0x5a; 1000]).unwrap();
+        // By now the reader has parsed the header and armed a receive for
+        // the rest of the frame; it gets 1,000 more bytes before the reset.
+        std::thread::sleep(Duration::from_millis(100));
+        s.write_all(&[0x5a; 1000]).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        // SO_LINGER with a zero timeout: close sends a RST.
+        let linger = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        let rc = unsafe {
+            libc::setsockopt(
+                s.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                (&linger as *const libc::linger).cast(),
+                std::mem::size_of::<libc::linger>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(rc, 0, "setsockopt SO_LINGER");
+        drop(s);
+    });
+    let config = ConfigBuilder::new()
+        .workers(1)
+        .pin_to_core(false)
+        .max_connections(16)
+        .build()
+        .expect("config");
+    let (runtime, handles) = RinglineBuilder::new(config)
+        .launch::<ResetMidMessage>()
+        .expect("launch");
+    common::join_workers(&runtime, handles);
+    server.join().unwrap();
+    assert_eq!(
+        RESET_RESULT
+            .lock()
+            .unwrap()
+            .take()
+            .expect("client did not finish"),
+        Ok(())
+    );
+}
+
+// ── Reads a direct connection refuses ───────────────────────────────
+
+struct Refusals;
+
+static REFUSALS: Mutex<Option<Result<(), String>>> = Mutex::new(None);
+
+fn expect_unsupported<T>(what: &str, r: std::io::Result<T>) -> Result<(), String> {
+    match r {
+        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => Ok(()),
+        Err(e) => Err(format!("{what}: {e}")),
+        Ok(_) => Err(format!("{what}: accepted")),
+    }
+}
+
+impl AsyncEventHandler for Refusals {
+    fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        Some(Box::pin(async {
+            let addr = SERVER.lock().unwrap().unwrap();
+            let r = async {
+                expect_unsupported(
+                    "tls",
+                    ringline::connect(addr)
+                        .tls("localhost")
+                        .recv_direct(true)
+                        .await,
+                )?;
+                let mut conn = ringline::connect(addr)
+                    .recv_direct(true)
+                    .await
+                    .map_err(|e| format!("connect: {e}"))?;
+                expect_unsupported("segments", conn.segments().map(|_| ()))?;
+                expect_unsupported("recv_owned_segment", conn.recv_owned_segment().map(|_| ()))?;
+                expect_unsupported(
+                    "with_bytes_segments",
+                    conn.with_bytes_segments(|_| ParseResult::NeedMore).await,
+                )?;
+                expect_unsupported(
+                    "with_segments",
+                    conn.with_segments(|_| ringline::SegConsumed(0)).await,
+                )?;
+                conn.enable_recv_forward();
+                expect_unsupported("forward_held", conn.forward_held().map(|_| ()))?;
+                let sink = ringline::connect(addr)
+                    .await
+                    .map_err(|e| format!("connect sink: {e}"))?;
+                let (mut sink_tx, _sink_rx) = sink.split();
+                expect_unsupported(
+                    "forward_to_conn",
+                    conn.forward_to_conn(&mut sink_tx, 10).await,
+                )?;
+                // Resolves at once rather than waiting for an EOF.
+                ringline::timeout(Duration::from_secs(5), conn.run_direct_echo())
+                    .await
+                    .map_err(|_| "run_direct_echo did not resolve".to_string())?;
+                // The connection still reads with `with_data`.
+                let mut got = Vec::new();
+                while got.len() < 4 {
+                    let n = conn
+                        .with_data(|b| {
+                            got.extend_from_slice(b);
+                            ParseResult::Consumed(b.len())
+                        })
+                        .await;
+                    if n == 0 {
+                        break;
+                    }
+                }
+                if got != b"ping" {
+                    return Err(format!("read {got:?} after the refusals"));
+                }
+                Ok(())
+            }
+            .await;
+            *REFUSALS.lock().unwrap() = Some(r);
+            let _ = ringline::request_shutdown();
+        }))
+    }
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
+        async {}
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        Refusals
+    }
+}
+
+#[test]
+fn a_direct_connection_refuses_reads_that_need_the_ring() {
+    let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    *SERVER.lock().unwrap() = Some(listener.local_addr().unwrap());
+    *REFUSALS.lock().unwrap() = None;
+    let server = std::thread::spawn(move || {
+        // The direct connection, then the sink.
+        let (mut direct, _) = listener.accept().unwrap();
+        let (_sink, _) = listener.accept().unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        direct.write_all(b"ping").unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+    });
+    let config = ConfigBuilder::new()
+        .workers(1)
+        .pin_to_core(false)
+        .max_connections(16)
+        .build()
+        .expect("config");
+    let (runtime, handles) = RinglineBuilder::new(config)
+        .launch::<Refusals>()
+        .expect("launch");
+    common::join_workers(&runtime, handles);
+    server.join().unwrap();
+    assert_eq!(
+        REFUSALS
+            .lock()
+            .unwrap()
+            .take()
+            .expect("client did not finish"),
+        Ok(())
+    );
+}

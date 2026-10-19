@@ -377,6 +377,7 @@ async fn run_client(addr: SocketAddr) -> Result<(), String> {
 
     run_set_stream(addr).await?;
     run_pool_stream(addr).await?;
+    run_pool_direct(addr).await?;
     run_borrow_get(addr).await?;
     run_recv_meta(addr).await?;
 
@@ -659,6 +660,45 @@ async fn run_borrow_get(addr: SocketAddr) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+// ── A pool whose connections receive directly ─────────────────────────────
+
+async fn run_pool_direct(addr: SocketAddr) -> Result<(), String> {
+    use ringline_redis::{Pool, PoolConfig};
+
+    let pool = Pool::new(PoolConfig::new(addr, 1).recv_direct(true));
+    let mut client = pool
+        .client()
+        .await
+        .map_err(|e| format!("direct pool client: {e}"))?;
+    let small = client
+        .get(b"stream:small")
+        .await
+        .map_err(|e| format!("direct pool small get: {e}"))?
+        .ok_or("direct pool small: None")?;
+    if small.as_ref() != SMALL {
+        return Err("direct pool small mismatch".into());
+    }
+    // Larger than `recv_direct_region`, so the parser's length hint sizes
+    // the receive.
+    let large = client
+        .get(b"stream:large")
+        .await
+        .map_err(|e| format!("direct pool large get: {e}"))?
+        .ok_or("direct pool large: None")?;
+    if large.as_ref() != large_value().as_slice() {
+        return Err("direct pool large mismatch".into());
+    }
+    // `recv_get_discard` reads with segments, which a direct connection
+    // refuses.
+    client
+        .fire_get(b"stream:small", 1)
+        .map_err(|e| format!("direct pool fire: {e}"))?;
+    match client.recv_get_discard().await {
+        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::Unsupported => Ok(()),
+        other => Err(format!("direct pool recv_get_discard: {other:?}")),
+    }
 }
 
 // ── Pooled streaming get_stream (poison-eviction) ──────────────────────────

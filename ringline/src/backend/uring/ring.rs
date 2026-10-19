@@ -242,7 +242,6 @@ impl Ring {
                 fd: sqe::Fd::Fixed(conn_index),
                 buf: ptr,
                 len,
-                flags: 0,
             },
             user_data.raw(),
         );
@@ -254,14 +253,12 @@ impl Ring {
 
     /// Submit a direct receive: a one-shot recv of `len` bytes into `ptr`,
     /// the spare capacity of a connection's accumulator buffer held by
-    /// `Driver::direct_recvs[slot]` until the CQE. `flags` is 0 or
-    /// `MSG_WAITALL`.
+    /// `Driver::direct_recvs[slot]` until the CQE.
     pub fn submit_recv_direct(
         &mut self,
         conn_index: u32,
         ptr: *mut u8,
         len: u32,
-        flags: i32,
         slot: u32,
     ) -> io::Result<()> {
         let user_data = UserData::encode(OpTag::RecvDirect, conn_index, slot);
@@ -270,7 +267,6 @@ impl Ring {
                 fd: sqe::Fd::Fixed(conn_index),
                 buf: ptr,
                 len,
-                flags,
             },
             user_data.raw(),
         );

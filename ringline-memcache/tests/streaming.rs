@@ -437,12 +437,44 @@ async fn run_client(addr: SocketAddr) -> Result<(), String> {
     }
 
     run_get_cas(addr).await?;
+    run_pool_direct(addr).await?;
     run_set_stream(addr).await?;
 
     Ok(())
 }
 
 // ── get_cas (streaming get-with-CAS) ──────────────────────────────────────
+
+// ── A pool whose connections receive directly ─────────────────────────────
+
+async fn run_pool_direct(addr: SocketAddr) -> Result<(), String> {
+    use ringline_memcache::{Pool, PoolConfig};
+
+    let pool = Pool::new(PoolConfig::new(addr, 1).recv_direct(true));
+    let mut client = pool
+        .client()
+        .await
+        .map_err(|e| format!("direct pool client: {e}"))?;
+    for (key, want) in [
+        (&b"stream:small"[..], SMALL.to_vec()),
+        (&b"stream:large"[..], large_value()),
+    ] {
+        let got = client
+            .get(key)
+            .await
+            .map_err(|e| format!("direct pool get: {e}"))?
+            .ok_or("direct pool get: None")?;
+        if got.data.as_ref() != want.as_slice() {
+            return Err("direct pool get mismatch".into());
+        }
+    }
+    // `get_stream` reads with segments, which a direct connection refuses.
+    match client.get_stream(b"stream:small").await {
+        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::Unsupported => Ok(()),
+        Err(e) => Err(format!("direct pool get_stream: {e}")),
+        Ok(_) => Err("direct pool get_stream: accepted".into()),
+    }
+}
 
 async fn run_get_cas(addr: SocketAddr) -> Result<(), String> {
     let mut client = connect(addr).await?;

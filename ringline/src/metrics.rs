@@ -32,7 +32,7 @@ pub static RECV_RING: ShardedCounterGroup = ShardedCounterGroup::new(recv_ring::
 /// Direct receives (`TcpConnect::recv_direct`).
 #[metric(
     name = "ringline/recv_direct",
-    description = "Direct receives into connection accumulators: armed, exact-length, bytes, stale"
+    description = "Direct receives into connection accumulators: armed, sized for a known length, bytes, stale"
 )]
 pub static RECV_DIRECT: ShardedCounterGroup = ShardedCounterGroup::new(recv_direct::COUNT);
 
@@ -350,9 +350,10 @@ pub mod recv_ring {
 pub mod recv_direct {
     /// Direct receives submitted.
     pub const ARMED: usize = 0;
-    /// Of those, exact-length receives with `MSG_WAITALL`, armed after the
-    /// parser returned `NeedAtLeast`.
-    pub const WAITALL: usize = 1;
+    /// Of those, receives armed after the parser returned a `NeedAtLeast` of
+    /// at least `recv_direct_region`, into a buffer grown to hold the rest of
+    /// the message.
+    pub const KNOWN_LENGTH: usize = 1;
     /// Bytes the kernel wrote into accumulators.
     pub const BYTES: usize = 2;
     /// Completions whose connection had closed or whose slot was reused.
@@ -493,7 +494,11 @@ pub mod udp {
 /// Call once at startup before metrics are scraped.
 pub fn init_metadata() {
     RECV_DIRECT.insert_metadata(recv_direct::ARMED, "op".into(), "armed".into());
-    RECV_DIRECT.insert_metadata(recv_direct::WAITALL, "op".into(), "waitall".into());
+    RECV_DIRECT.insert_metadata(
+        recv_direct::KNOWN_LENGTH,
+        "op".into(),
+        "known_length".into(),
+    );
     RECV_DIRECT.insert_metadata(recv_direct::BYTES, "op".into(), "bytes".into());
     RECV_DIRECT.insert_metadata(recv_direct::STALE, "op".into(), "stale".into());
     RECV_RING.insert_metadata(recv_ring::INCREMENTAL, "op".into(), "incremental".into());
