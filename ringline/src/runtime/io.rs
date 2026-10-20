@@ -2409,9 +2409,10 @@ impl ConnCtx {
     ///
     /// Gate calls on `recv_ready`, which becomes ready when the connection
     /// holds received bytes or has closed. When the hold is empty (e.g. the
-    /// connection closed), the returned future resolves to `0`. Bytes received
-    /// before `enable_recv_forward` are not in the hold, and `forward_held`
-    /// returns 0 for them, so enable forwarding before the first receive.
+    /// connection closed), the returned future resolves to `0`. `recv_ready`
+    /// is also ready for bytes outside the hold, for which `forward_held`
+    /// returns 0: bytes received before `enable_recv_forward`, and every byte
+    /// on a TLS connection, which decrypts into the accumulator.
     ///
     /// One forward is in flight per connection at a time (await the returned
     /// future before calling again); buffers received during the send accumulate

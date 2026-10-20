@@ -24,10 +24,13 @@
 # dropped-future tests pass: `recv` reads the lent buffer. If 3 passes, the
 # tests do not reach the lent or held path and say nothing about the fix.
 #
-# RESULT (01a157e3, ea78d78, Linux 6.12.63 x86_64, io_uring): 1 and 2
-# passed. In 3 the two ringline tests failed and the redis tests failed 4 of
-# 6 and memcache 5 of 6 (that file then had no dropped-future test), each
-# with the message predicted above; peer close, TLS and NoPending passed.
+# RESULT (SystemsLab experiment 01a157e3, commit ea78d78, Linux 6.12.63
+# x86_64, io_uring): 1 and 2 passed. In 3 the two ringline tests failed and
+# the redis tests failed 4 of 6 and memcache 5 of 6 (that file then had no
+# dropped-future test), each with the failure predicted above ("whole reply"
+# in redis, "whole response" in memcache); peer close, TLS and NoPending
+# passed. Experiment 01a157ea, commit 3cf3422: the same, with memcache's
+# added dropped-future test passing in 2 and in 3.
 # The prediction for the first-bytes and dropped-future tests was written
 # after the run, from a review of the code; the rest before it.
 name = "recv-ready-uring-verify {branch}"
