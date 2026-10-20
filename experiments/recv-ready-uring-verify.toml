@@ -1,0 +1,96 @@
+# Does `recv_ready` resolve for lent and segment-held receives on io_uring?
+#
+# The change makes `RecvReadyFuture::poll` check `driver.recv_buffered` in
+# place of the accumulator and the recv-forward hold. On mio the two are the
+# same check, so macOS cannot tell them apart; only io_uring lends a receive
+# in `pending_recv_bufs` or holds it in `segment_hold`.
+#
+# WHAT IT RUNS:
+#   1. clippy --all-targets -D warnings on io_uring.
+#   2. The new recv_ready tests (ringline, ringline-redis, ringline-memcache)
+#      and the existing recv_ready callers (echo, recv_arrival, recv_lend_cap,
+#      forward_held_cap, segment_backpressure, bytes_segments).
+#   3. Mutation: restore the old accumulator + recv_hold check and rerun the
+#      new tests.
+#
+# PREDICTION: 1 and 2 pass. In 3, ringline's
+# `resolves_for_a_reply_on_an_empty_accumulator` and
+# `resolves_for_bytes_in_the_segment_hold` fail (the server records Hung),
+# and the redis and memcache tests that wait on `recv_ready` for a reply
+# fail on a timeout. If 3 passes, the tests do not reach the lent or held
+# path and say nothing about the fix.
+name = "recv-ready-uring-verify {branch}"
+
+[matrix]
+context_name = "ringline: recv_ready on io_uring (Option A)"
+branch = ["recv-ready"]
+
+[params]
+repo = "https://github.com/brayniac/ringline"
+
+[[jobs]]
+name = "verify"
+tags = ["validation"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+shape = "z4.c"
+image = "debian-13-ci"
+memory_gib = 4
+slots = 1
+ports = 0
+gpu = false
+payload_timeout = 5400
+artifacts = ["/home/anvil/verify.log"]
+upload = true
+payload = '''
+set -uo pipefail
+cd /home/anvil
+{
+  uname -srm; nproc
+  cargo --version || { echo "FATAL: no cargo in the CI image"; exit 1; }
+  git clone -q {repo} src || { echo "FATAL: clone failed"; exit 1; }
+  cd src
+  git checkout -q {branch} || { echo "FATAL: no such ref: {branch}"; exit 1; }
+  git log --oneline -1
+  grep -q "recv_buffered(self.conn_index) > 0" ringline/src/runtime/io.rs \
+    || { echo "FATAL: branch lacks the recv_buffered check"; exit 1; }
+
+  hard=$(ulimit -Hn)
+  [ "$hard" = "unlimited" ] && hard=1048576
+  ulimit -n "$hard" 2>/dev/null || true
+  [ "$(ulimit -Sn)" -ge 65536 ] || { echo "FATAL: fd soft limit $(ulimit -Sn) too low"; exit 1; }
+
+  cargo run --locked -q -p ringline-bench --bin bench-server -- --print-backend > bk.txt 2>/dev/null || true
+  got=$(cat bk.txt 2>/dev/null || echo unknown)
+  [ "$got" = "io_uring" ] || { echo "BACKEND MISMATCH: $got -- refusing to report a pass"; exit 1; }
+  echo "backend ok: $got"
+
+  run() {
+    name=$1; shift
+    echo "=== $name ==="
+    "$@" > "/home/anvil/${name}.out" 2>&1
+    rc=$?
+    grep -E "^test |test result|panicked|Seen::|recv_ready" "/home/anvil/${name}.out" | tail -40
+    echo "${name}_rc=${rc}"
+    return 0
+  }
+
+  TESTS="--test recv_ready"
+  run clippy cargo clippy --locked --all-targets -- -D warnings
+  run core cargo test --locked -p ringline --test recv_ready --test echo --test recv_arrival \
+    --test recv_lend_cap --test forward_held_cap --test segment_backpressure --test bytes_segments
+  run redis cargo test --locked -p ringline-redis $TESTS
+  run memcache cargo test --locked -p ringline-memcache $TESTS
+
+  # Mutation: the poll as it was before the change.
+  sed -i 's/if driver.recv_buffered(self.conn_index) > 0 {/if !driver.accumulators.is_empty(self.conn_index) || !driver.recv_hold[self.conn_index as usize].is_empty() {/' ringline/src/runtime/io.rs
+  grep -q "recv_hold\[self.conn_index as usize\].is_empty() {" ringline/src/runtime/io.rs \
+    || { echo "FATAL: mutation did not apply"; exit 1; }
+  run mut_core cargo test --locked -p ringline --test recv_ready
+  run mut_redis cargo test --locked -p ringline-redis $TESTS
+  run mut_memcache cargo test --locked -p ringline-memcache $TESTS
+  git checkout -q ringline/src/runtime/io.rs
+} 2>&1 | tee /home/anvil/verify.log
+exit 0
+'''
