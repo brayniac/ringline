@@ -161,11 +161,18 @@ fn a_direct_receive_reuses_a_consumed_buffer() {
     );
 }
 
-/// Messages larger than the connection's own buffer borrow one from the
-/// pool and give it back, so after the warmup no batch allocates.
+/// Messages larger than the connection's own buffer, and batches of smaller
+/// messages that together are larger, borrow a buffer from the pool and give
+/// it back, so after the warmup no batch allocates.
 #[test]
 fn large_messages_reuse_pooled_buffers() {
-    for (frames, size) in [(1, 64 * 1024), (4, 64 * 1024), (1, 1 << 20)] {
+    for (frames, size) in [
+        (1, 64 * 1024),
+        (4, 64 * 1024),
+        (1, 1 << 20),
+        (16, 4096),
+        (16, 8192),
+    ] {
         let batches = 200;
         let large = run(batches, frames, size);
         assert!(
