@@ -385,8 +385,10 @@ impl DirectPool {
         BytesMut::with_capacity(size)
     }
 
-    /// Keep `buf` for reuse if it is at least `DIRECT_BORROW_MIN` and the
-    /// free buffers have room for it; otherwise free it.
+    /// Keep `buf` for reuse if it is at least `DIRECT_BORROW_MIN` and at
+    /// most the cap on free bytes; otherwise free it. When the free buffers
+    /// have no room for it, the largest free buffers larger than `buf` are
+    /// freed to make room, and `buf` is freed if that is not enough.
     ///
     /// A buffer recovered from a view (`keep_spent`) starts where the view
     /// started, so its `capacity()` excludes the bytes before that;
@@ -396,8 +398,22 @@ impl DirectPool {
         buf.clear();
         let _ = buf.try_reclaim(buf.capacity() + 1);
         let cap = buf.capacity();
-        if cap < DIRECT_BORROW_MIN || self.free_bytes + cap > self.max_free_bytes {
+        if cap < DIRECT_BORROW_MIN || cap > self.max_free_bytes {
             return;
+        }
+        while self.free_bytes + cap > self.max_free_bytes {
+            let Some(mut largest) = self.free.last_entry() else {
+                break;
+            };
+            if *largest.key() <= cap {
+                return;
+            }
+            let freed = *largest.key();
+            largest.get_mut().pop();
+            if largest.get().is_empty() {
+                largest.remove();
+            }
+            self.free_bytes -= freed;
         }
         self.free_bytes += cap;
         self.free.entry(cap).or_default().push(buf);
@@ -692,23 +708,44 @@ impl AccumulatorTable {
                 m.saturating_mul(4)
                     .min(m.saturating_add(region.saturating_mul(4))),
             );
-            let more = if known { need } else { need.max(size) }.min(room);
-            if acc.own.is_none() {
-                // The connection's own buffer is too small: borrow one and
-                // copy the part of the message received so far.
-                let mut bigger = self.direct_pool.take(len.saturating_add(more));
-                bigger.extend_from_slice(&acc.buf);
-                note_copied(len);
-                let mut own = std::mem::replace(&mut acc.buf, bigger);
-                own.clear();
-                acc.own = Some(own);
+            // The capacity to hold: with a known length, the rest of the
+            // message; otherwise the receive size, or the buffered bytes and
+            // a region more when the message is already longer than it.
+            let want = if known {
+                len.saturating_add(need)
             } else {
-                // A borrowed buffer grows in place where the allocator can
-                // (`realloc`, which moves pages rather than bytes for large
-                // allocations), and moves its bytes otherwise.
+                size.max(len.saturating_add(need.max(region)))
+            }
+            .min(len.saturating_add(room));
+            if acc.own.is_some() && !known && want > size {
+                // A message longer than any before it: grow geometrically
+                // (`reserve`), in place where the allocator can (`realloc`
+                // moves pages rather than bytes for large allocations).
                 let before = acc.buf.as_ptr();
-                acc.buf.reserve(more);
+                acc.buf.reserve(want - len);
                 note_copied(moved(&acc.buf, before, len));
+            } else {
+                // Move the buffered bytes to the front of this allocation if
+                // that makes room, else into a buffer of `want` from the
+                // pool. `reserve` would double the allocation instead.
+                let before = acc.buf.as_ptr();
+                if acc.own.is_some() && acc.buf.try_reclaim(want - len) {
+                    note_copied(moved(&acc.buf, before, len));
+                } else {
+                    let mut bigger = self.direct_pool.take(want);
+                    bigger.extend_from_slice(&acc.buf);
+                    note_copied(len);
+                    let old = std::mem::replace(&mut acc.buf, bigger);
+                    if acc.own.is_some() {
+                        self.direct_pool.put(old);
+                    } else {
+                        // The connection's own buffer, kept for the next
+                        // message that fits it.
+                        let mut own = old;
+                        own.clear();
+                        acc.own = Some(own);
+                    }
+                }
             }
         }
         let spare = acc.buf.capacity() - len;
@@ -830,12 +867,20 @@ mod tests {
         let small = pool.take(1 << 20);
         assert_ne!(small.as_ptr(), a_ptr);
         assert_eq!(pool.free_bytes, 4 << 20);
-        // Past the cap, a buffer given back is freed.
+        // Past the cap, a smaller buffer given back replaces the largest
+        // free one.
+        let small_ptr = small.as_ptr();
         pool.put(small);
-        assert_eq!(pool.free_bytes, 4 << 20);
+        assert_eq!(pool.free_bytes, 1 << 20);
+        // A larger one does not replace a smaller one: it is freed.
+        let mut big = BytesMut::with_capacity(4 << 20);
+        big.extend_from_slice(&[1]);
+        pool.put(big);
+        assert_eq!(pool.free_bytes, 1 << 20);
+        assert_eq!(pool.take(1 << 20).as_ptr(), small_ptr);
         // Below the smallest borrowed size, nothing is kept.
         pool.put(BytesMut::with_capacity(4096));
-        assert_eq!(pool.free_bytes, 4 << 20);
+        assert_eq!(pool.free_bytes, 0);
     }
 
     #[cfg(has_io_uring)]
@@ -871,6 +916,57 @@ mod tests {
             .detach_for_recv(0, region, Some((1 << 20) - 10))
             .unwrap();
         assert_eq!(buf.as_ptr(), borrowed);
+        unsafe { table.attach_received(0, buf, 0) };
+    }
+
+    /// A borrowed buffer that runs out of room with part of a message of no
+    /// known length buffered grows to the receive size, not to double its
+    /// capacity: here the buffered bytes move to the front of the same
+    /// allocation.
+    #[cfg(has_io_uring)]
+    #[test]
+    fn a_borrowed_buffer_grows_to_the_receive_size() {
+        let mut table = AccumulatorTable::new(1, 4096);
+        let region = 32 * 1024;
+        let mib = 1 << 20;
+        table.note_consumed(0, mib);
+        // The own buffer receives a 4 KiB message and the start of a 1 MiB
+        // one; the parser consumes the 4 KiB message.
+        let (mut buf, n, _) = table.detach_for_recv(0, region, None).unwrap();
+        assert_eq!(n, region);
+        buf.resize(region, 1);
+        unsafe { table.attach_received(0, buf, 0) };
+        let frozen = table.take_frozen(0);
+        table.put_back(0, frozen.slice(4096..));
+        drop(frozen);
+        // The rest of the 1 MiB message goes into a borrowed buffer of the
+        // receive size, 1 MiB and four regions.
+        let (mut buf, _, known) = table.detach_for_recv(0, region, None).unwrap();
+        assert!(!known);
+        let borrowed = buf.as_ptr();
+        let cap = buf.capacity();
+        assert_eq!(cap, mib + 4 * region);
+        buf.resize(cap, 2);
+        unsafe { table.attach_received(0, buf, 0) };
+        // The parser consumes that message and three 4 KiB messages; the
+        // start of the next 1 MiB message stays buffered.
+        let frozen = table.take_frozen(0);
+        let consumed = mib + 3 * 4096;
+        table.put_back(0, frozen.slice(consumed..));
+        drop(frozen);
+        let (buf, n, _) = table.detach_for_recv(0, region, None).unwrap();
+        assert_eq!(
+            buf.capacity(),
+            cap,
+            "the buffer did not grow past the receive size"
+        );
+        assert_eq!(
+            buf.as_ptr(),
+            borrowed,
+            "the bytes moved within the allocation"
+        );
+        assert_eq!(buf.len(), cap - consumed);
+        assert_eq!(n, consumed);
         unsafe { table.attach_received(0, buf, 0) };
     }
     use super::*;
