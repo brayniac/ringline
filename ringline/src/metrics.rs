@@ -364,7 +364,30 @@ pub mod recv_direct {
     /// Buffers a direct connection borrowed for a large message that were
     /// allocated because no free buffer fit.
     pub const POOL_ALLOCATED: usize = 5;
-    pub const COUNT: usize = 6;
+    /// Diagnostics (exp/segviews-c6): a borrowed buffer handed back at a
+    /// detach with nothing buffered.
+    pub const RETURNED: usize = 6;
+    /// Of those, the borrowed allocation was not recovered (a slice of it
+    /// was alive), so nothing went to the pool.
+    pub const RETURNED_LOST: usize = 7;
+    /// `put` dropped a buffer smaller than `DIRECT_BORROW_MIN`.
+    pub const PUT_SMALL: usize = 8;
+    /// `put` dropped a buffer because the free buffers were at their cap.
+    pub const PUT_FULL: usize = 9;
+    /// Sum of the capacities `put` was given (at least `DIRECT_BORROW_MIN`).
+    pub const PUT_CAP_BYTES: usize = 10;
+    /// Detaches of a borrowed buffer holding part of a message.
+    pub const BORROWED_PARTIAL: usize = 11;
+    /// Of those, the borrowed buffer was grown with `reserve`.
+    pub const BORROWED_GROW: usize = 12;
+    /// `reclaim` copied a remainder into a new buffer while the connection
+    /// held a borrowed buffer.
+    pub const RECLAIM_COPY_BORROWED: usize = 13;
+    /// `take` found free buffers but none that fit.
+    pub const TAKE_NO_FIT: usize = 14;
+    /// A spent view's allocation was not recovered (a slice was alive).
+    pub const SPENT_FAILED: usize = 15;
+    pub const COUNT: usize = 16;
 }
 
 /// Slot indices for `RECV_ARRIVAL`.
@@ -513,6 +536,20 @@ pub fn init_metadata() {
         "op".into(),
         "pool_allocated".into(),
     );
+    for (i, name) in [
+        (recv_direct::RETURNED, "returned"),
+        (recv_direct::RETURNED_LOST, "returned_lost"),
+        (recv_direct::PUT_SMALL, "put_small"),
+        (recv_direct::PUT_FULL, "put_full"),
+        (recv_direct::PUT_CAP_BYTES, "put_cap_bytes"),
+        (recv_direct::BORROWED_PARTIAL, "borrowed_partial"),
+        (recv_direct::BORROWED_GROW, "borrowed_grow"),
+        (recv_direct::RECLAIM_COPY_BORROWED, "reclaim_copy_borrowed"),
+        (recv_direct::TAKE_NO_FIT, "take_no_fit"),
+        (recv_direct::SPENT_FAILED, "spent_failed"),
+    ] {
+        RECV_DIRECT.insert_metadata(i, "op".into(), name.into());
+    }
     RECV_RING.insert_metadata(recv_ring::INCREMENTAL, "op".into(), "incremental".into());
     RECV_RING.insert_metadata(recv_ring::PLAIN, "op".into(), "plain".into());
     RECV_RING.insert_metadata(recv_ring::LEND_REFUSED, "op".into(), "lend_refused".into());
