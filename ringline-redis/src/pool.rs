@@ -78,10 +78,12 @@ impl PoolConfig {
     /// Off by default, and ignored on the mio backend. Not supported with
     /// [`tls_server_name`](Self::tls_server_name): connecting fails.
     ///
-    /// On io_uring, `Client::recv_meta`, `recv_get_discard` and
+    /// On io_uring, `Client::get_stream`, `recv_get_discard` and
     /// `recv_get_segments` read with segments, which a direct connection
-    /// refuses: on a pool with this set they fail with an `Unsupported` I/O
-    /// error.
+    /// refuses: on a pool with this set they return an `Unsupported` I/O
+    /// error before sending the request or taking the pending GET, and the
+    /// connection stays usable. `recv_meta` reads a GET reply through
+    /// `with_bytes` on such a connection.
     pub fn recv_direct(mut self, enabled: bool) -> Self {
         self.recv_direct = enabled;
         self

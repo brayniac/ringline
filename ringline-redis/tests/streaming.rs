@@ -691,14 +691,63 @@ async fn run_pool_direct(addr: SocketAddr) -> Result<(), String> {
         return Err("direct pool large mismatch".into());
     }
     // `recv_get_discard` reads with segments, which a direct connection
-    // refuses.
+    // refuses. It refuses before taking the pending GET, so `recv` still
+    // reads that reply and the connection stays aligned.
     client
         .fire_get(b"stream:small", 1)
         .map_err(|e| format!("direct pool fire: {e}"))?;
     match client.recv_get_discard().await {
-        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::Unsupported => Ok(()),
-        other => Err(format!("direct pool recv_get_discard: {other:?}")),
+        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::Unsupported => {}
+        other => return Err(format!("direct pool recv_get_discard: {other:?}")),
     }
+    match client.recv().await {
+        Ok(ringline_redis::CompletedOp::Get {
+            result: Ok(Some(v)),
+            user_data: 1,
+            ..
+        }) if v.as_ref() == SMALL => {}
+        Ok(_) => return Err("direct pool recv after refusal: wrong reply".into()),
+        Err(e) => return Err(format!("direct pool recv after refusal: {e}")),
+    }
+    // `get_stream` refuses before sending, so the next command reads its
+    // own reply.
+    match client.get_stream(b"stream:large").await {
+        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::Unsupported => {}
+        Err(e) => return Err(format!("direct pool get_stream: {e}")),
+        Ok(_) => return Err("direct pool get_stream: accepted".into()),
+    }
+    let small = client
+        .get(b"stream:small")
+        .await
+        .map_err(|e| format!("direct pool get after get_stream: {e}"))?
+        .ok_or("direct pool get after get_stream: None")?;
+    if small.as_ref() != SMALL {
+        return Err(format!(
+            "direct pool get after get_stream read {} bytes",
+            small.len()
+        ));
+    }
+    // `recv_meta` drains a GET reply with `with_bytes` on a direct
+    // connection.
+    client
+        .fire_get(b"stream:large", 2)
+        .map_err(|e| format!("direct pool fire large: {e}"))?;
+    let m = client
+        .recv_meta()
+        .await
+        .map_err(|e| format!("direct pool recv_meta: {e}"))?;
+    if m.value_len != Some(large_value().len()) || m.user_data != 2 {
+        return Err(format!("direct pool recv_meta: {m:?}"));
+    }
+    let small = client
+        .get(b"stream:small")
+        .await
+        .map_err(|e| format!("direct pool get after recv_meta: {e}"))?
+        .ok_or("direct pool get after recv_meta: None")?;
+    if small.as_ref() != SMALL {
+        return Err("direct pool get after recv_meta mismatch".into());
+    }
+    Ok(())
 }
 
 // ── Pooled streaming get_stream (poison-eviction) ──────────────────────────

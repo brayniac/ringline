@@ -1114,7 +1114,7 @@ impl ConfigBuilder {
     /// buffer of this size. A message that does not fit borrows a larger
     /// buffer from the worker (see
     /// [`recv_direct_pool_max`](Self::recv_direct_pool_max)), and the bytes
-    /// already received for it, at most this many, are copied once. Defaults
+    /// already received for it, at most this many, are copied into it. Defaults
     /// to 32 KiB; must be at least 1.
     pub fn recv_direct_region(mut self, n: usize) -> Self {
         self.config.recv_direct_region = n;

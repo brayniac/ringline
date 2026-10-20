@@ -74,7 +74,8 @@ impl PoolConfig {
     ///
     /// `Client::get_stream` and `Client::get_cas` (io_uring only) read with
     /// segments, which a direct connection refuses: on a pool with this set
-    /// they fail with an `Unsupported` I/O error.
+    /// they return an `Unsupported` I/O error before sending the request, and
+    /// the connection stays usable.
     pub fn recv_direct(mut self, enabled: bool) -> Self {
         self.recv_direct = enabled;
         self

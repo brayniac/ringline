@@ -219,10 +219,13 @@ the completion arrives (domain invariant 1).
 
 On completion (`handle_recv_direct`), the driver frees the slab entry and
 checks the connection: the generation must match and the lifecycle must be
-`Open`. Otherwise the completion is stale, the buffer is dropped, and
-`RECV_DIRECT` `STALE` is incremented. For a live connection,
-`attach_received` sets the buffer's length to include the received bytes and
-puts it back as the accumulator's buffer, without a copy. Then:
+`Open`. Otherwise the completion is stale, the buffer goes to the pool
+(`recycle_direct`), and `RECV_DIRECT` `STALE` is incremented. For a live
+connection, the arrival is recorded first, while `recv_direct_held` still
+counts the bytes the buffer held, as the multishot path records it before
+appending. `attach_received` then sets the buffer's length to include the
+received bytes and puts it back as the accumulator's buffer, without a copy.
+Then:
 
 - `n > 0`: count the bytes, record the arrival, wake the reader.
 - `0`: the peer closed; mark EOF, wake the reader, close.
@@ -277,7 +280,7 @@ with `BytesMut::reserve` instead, which doubles the allocation, so a 100 MiB
 value is not copied once per region; glibc grows large allocations with
 `mremap` without copying their bytes.
 
-The pool keeps free buffers by capacity, with no fixed classes. A borrow takes
+The pool keeps free buffers by capacity. A borrow takes
 the smallest free buffer that holds the message and is at most twice the size
 it would allocate; otherwise it allocates one of at least 64 KiB, rounded up
 to one of eight steps per power of two up to 2 MiB, and to a multiple of
@@ -373,8 +376,8 @@ receive is ended by the close's lead instead: `shutdown` before 6.13,
 `ASYNC_CANCEL` of every request on the fixed file from 6.13. Outbound
 connections are never handed to another worker, and a handed-off socket is
 the only case that closes without a lead. The buffer stays in its slab entry
-until the receive's completion, which arrives before the `Close` completion
-that frees the connection slot.
+until the receive's completion. If that completion arrives after the slot
+holds another connection, the generation check treats it as stale.
 
 ### Worker exit
 
@@ -389,7 +392,11 @@ checked whether the cancel can still be pending after 10 s.
 
 ## Which reads a direct connection supports
 
-- `with_data`, `with_bytes`, `with_data_result`, `recv_ready`: supported.
+- `with_data`, `with_bytes`, `with_data_result`, `recv_ready` and
+  `ConnStream` reads: supported. Each arms the receive when it parks
+  (`park_recv`).
+- `try_with_data` does not park, so it sees only bytes an earlier read
+  received: no receive is in flight while the task works.
 - `segments`, `recv_owned_segment`, `with_segments`, `with_bytes_segments`,
   `forward_to`, `forward_to_conn` and `forward_held` return
   `io::ErrorKind::Unsupported`. They read held provided buffers, and a
@@ -416,11 +423,17 @@ checked whether the cancel can still be pending after 10 s.
   own buffer, default 32 KiB, at least 1.
 - `ConfigBuilder::recv_direct_pool_max(bytes)`, the most free borrowed
   buffers a worker keeps, default 16 MiB.
+- `ConnCtx::is_recv_direct()` (and on `Connection` and `RecvHalf`): whether
+  the connection receives this way.
 - `PoolConfig::recv_direct(bool)` in ringline-redis and ringline-memcache,
   default off, passed to every connection the pool opens. On io_uring, the
-  client methods that read with segments fail with an `Unsupported` I/O
-  error on such a pool: ringline-redis `recv_meta`, `recv_get_discard` and
-  `recv_get_segments`, and ringline-memcache `get_stream` and `get_cas`.
+  client methods that read with segments return an `Unsupported` I/O error
+  on such a connection, checked with `is_recv_direct` before they send the
+  request or take the pending operation, so the connection stays aligned:
+  ringline-redis `get_stream`, `recv_get_discard` and `recv_get_segments`,
+  and ringline-memcache `get_stream` and `get_cas`. ringline-redis
+  `recv_meta` drains a GET reply through `with_bytes` on such a
+  connection, as it does on mio.
 
 `ClientBuilder::new` takes a `Connection` that is already open, so a caller
 that connects itself passes `recv_direct` to `connect`. The sharded and
@@ -456,6 +469,8 @@ allocated because none fit). Copies on a direct connection still count in
   - `recv_ready` resolves at once when a read gave up with part of a message
     held in the buffer of an armed receive (fails when `recv_buffered` does
     not count `recv_direct_held`).
+  - `ConnStream` `read_exact` and `fill_buf` on a direct connection (fail
+    when they park without `park_recv`).
 
   Dropping one received byte fails the first three tests. The overestimate,
   reset and refusal tests fail against the `MSG_WAITALL` version.
@@ -470,8 +485,11 @@ allocated because none fit). Copies on a direct connection still count in
   buffer once nothing is buffered and borrows the same one for the next
   large message; a borrowed buffer holding a 1 MiB message, three 4 KiB
   messages and the start of the next 1 MiB message grows to the receive size
-  in place (fails against `reserve`, which grows it to 1.49 MiB). Both pool
-  tests fail when the pool keeps nothing.
+  in place (fails against `reserve`, which grows it to 1.49 MiB); a 1 MiB
+  message of known length whose start arrived while a value from the same
+  buffer was held leaves the idle connection with its own buffer and the
+  large one in the pool (fails when `reclaim` sizes its copy by the reserve
+  target). Both pool tests fail when the pool keeps nothing.
 - `tests/recv_direct_copies.rs` (its own binary, for the process-wide
   counters): 70,000-byte messages in 64 KiB and 1 MiB writes copy at most a
   quarter of a byte per byte received; 500 B messages at most 1/20; 1 MiB
@@ -481,8 +499,11 @@ allocated because none fit). Copies on a direct connection still count in
   (fails with the generation check removed); a direct connection whose
   accumulator is at the cap is closed instead of armed.
 - The ringline-redis and ringline-memcache `streaming` tests read small and
-  100,000-byte values through a pool with `recv_direct(true)` and check that
-  a segment read is refused (fails when the pool does not pass the option).
+  100,000-byte values through a pool with `recv_direct(true)`, check that
+  each segment read is refused, and read the next reply correctly after
+  each refusal (fails when the pool does not pass the option, and when a
+  refusal comes after the request is sent or the pending GET is taken).
+  The redis test also drains a 100,000-byte GET with `recv_meta`.
 
 Not tested: worker exit with a receive armed.
 

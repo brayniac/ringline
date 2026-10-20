@@ -681,16 +681,25 @@ impl TcpConnect {
     /// Receive into this connection's own accumulator instead of the
     /// worker's provided-buffer ring (io_uring only).
     ///
-    /// When `with_data`, `with_bytes` or `recv_ready` parks, the runtime
-    /// submits a one-shot receive whose destination is the free space of the
+    /// When a read parks (`with_data`, `with_bytes`, `recv_ready`, or a
+    /// [`ConnStream`](crate::ConnStream) read), the runtime submits a
+    /// one-shot receive whose destination is the free space of the
     /// connection's accumulator, so the received bytes are not copied out of
-    /// a ring buffer. The receive asks for all the free space. When the
-    /// parser returned a [`ParseResult::NeedAtLeast`] of at least
-    /// [`ConfigBuilder::recv_direct_region`](crate::ConfigBuilder::recv_direct_region),
-    /// the accumulator is first grown to hold the rest of the message;
-    /// otherwise it is grown to that region when less than half of it is
-    /// free. An idle connection keeps an accumulator of about the size of its
-    /// largest receive.
+    /// a ring buffer. The receive asks for all the free space. With nothing
+    /// buffered, the connection receives into its own buffer of
+    /// [`ConfigBuilder::recv_direct_region`](crate::ConfigBuilder::recv_direct_region)
+    /// bytes. With part of a message buffered, the buffer grows when less
+    /// than the parser's [`ParseResult::NeedAtLeast`] value, or less than
+    /// half of `recv_direct_region`, is free: to hold the rest of the message
+    /// when that value is at least `recv_direct_region`, and otherwise to the
+    /// larger of the receive size and the buffered bytes plus
+    /// `recv_direct_region`. A buffer larger than the connection's own is
+    /// borrowed from the worker's free buffers
+    /// ([`ConfigBuilder::recv_direct_pool_max`](crate::ConfigBuilder::recv_direct_pool_max)).
+    ///
+    /// No receive is in flight while the task works on what it has read, so
+    /// `try_with_data`, which does not park, sees only the bytes an earlier
+    /// read received.
     ///
     /// The reads that use the provided-buffer ring are refused on a direct
     /// connection: `segments`, `recv_owned_segment`, `with_segments`,
@@ -2909,6 +2918,29 @@ impl ConnCtx {
         })
         .unwrap_or(false)
     }
+
+    /// Whether the connection receives into its accumulator
+    /// ([`TcpConnect::recv_direct`]). The reads that need the provided-buffer
+    /// ring return [`io::ErrorKind::Unsupported`] on such a connection, so a
+    /// caller can check this before sending a request whose reply it would
+    /// read with one of them. Always `false` on the mio backend, and `false`
+    /// outside the executor or once the connection's slot has been reused.
+    pub fn is_recv_direct(&self) -> bool {
+        #[cfg(has_io_uring)]
+        {
+            try_with_state(|driver, _| {
+                driver
+                    .connections
+                    .get(self.conn_index)
+                    .is_some_and(|cs| cs.generation == self.generation && cs.recv_direct)
+            })
+            .unwrap_or(false)
+        }
+        #[cfg(not(has_io_uring))]
+        {
+            false
+        }
+    }
 }
 
 // ── AsyncSendBuilder ─────────────────────────────────────────────────
@@ -3224,7 +3256,7 @@ fn recv_direct_unsupported() -> io::Error {
 /// connection (`TcpConnect::recv_direct`) also arm its receive, which the
 /// caller does only after its parser has seen every buffered byte. `need` is
 /// the parser's `NeedAtLeast` value, if it returned one.
-fn park_recv(
+pub(crate) fn park_recv(
     #[allow(unused_variables)] driver: &mut Driver,
     executor: &mut Executor,
     conn_index: u32,
@@ -3753,6 +3785,11 @@ impl RecvHalf {
         self.conn.is_alive()
     }
 
+    /// See [`ConnCtx::is_recv_direct`].
+    pub fn is_recv_direct(&self) -> bool {
+        self.conn.is_recv_direct()
+    }
+
     /// The underlying handle, for the read-side APIs that are still only on
     /// `ConnCtx`. Crate-internal: it hands back the full surface.
     pub(crate) fn as_conn_ref(&self) -> ConnCtx {
@@ -4159,6 +4196,11 @@ impl Connection {
     /// See [`ConnCtx::is_alive`].
     pub fn is_alive(&self) -> bool {
         self.tx.is_alive()
+    }
+
+    /// See [`ConnCtx::is_recv_direct`].
+    pub fn is_recv_direct(&self) -> bool {
+        self.rx.is_recv_direct()
     }
 
     /// See [`ConnCtx::peer_addr`].

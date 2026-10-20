@@ -1382,10 +1382,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// The payload is the `direct_recvs` entry holding the accumulator
     /// buffer the kernel wrote into. The entry is removed here and only
     /// here. A completion whose connection closed, or whose slot now holds
-    /// another connection, drops the buffer. Otherwise the buffer goes back
-    /// into the accumulator with the received bytes behind its contents,
-    /// including on EOF and errors, so the bytes received before stay
-    /// readable.
+    /// another connection, gives the buffer to the pool. Otherwise the
+    /// buffer goes back into the accumulator with the received bytes behind
+    /// its contents, including on EOF and errors, so the bytes received
+    /// before stay readable. The arrival is recorded before the bytes are
+    /// placed, while `recv_direct_held` still counts the bytes the buffer
+    /// held, as the multishot path records it before appending.
     fn handle_recv_direct(&mut self, ud: UserData, result: i32) {
         let slot = ud.payload() as usize;
         let Some(entry) = self
@@ -1405,14 +1407,21 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             && cs.generation == entry.generation
         {
             cs.recv_direct_armed = false;
-            cs.recv_direct_held = 0;
         }
         if !live {
+            if let Some(cs) = self.driver.connections.get_mut(conn_index)
+                && cs.generation == entry.generation
+            {
+                cs.recv_direct_held = 0;
+            }
             metrics::RECV_DIRECT.increment(metrics::recv_direct::STALE);
             self.driver.accumulators.recycle_direct(entry.buf);
             return;
         }
         let received = result.max(0) as usize;
+        if result > 0 {
+            self.driver.record_arrival(conn_index, received);
+        }
         // SAFETY: a non-negative result is the number of bytes the kernel
         // wrote at the buffer's length; a negative one wrote none.
         unsafe {
@@ -1420,10 +1429,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 .accumulators
                 .attach_received(conn_index, entry.buf, received);
         }
+        if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+            cs.recv_direct_held = 0;
+        }
         if result > 0 {
             metrics::BYTES.add(metrics::bytes::RECEIVED, received as u64);
             metrics::RECV_DIRECT.add(metrics::recv_direct::BYTES, received as u64);
-            self.driver.record_arrival(conn_index, received);
             self.withdraw_park_offer(conn_index);
             self.executor.wake_recv(conn_index);
             return;

@@ -340,14 +340,15 @@ fn direct_borrow_size(n: usize) -> usize {
 
 /// Free buffers that a worker's direct connections borrow for messages
 /// larger than their own buffer, so that a buffer moves from one connection
-/// to the next without going back to the allocator. Keyed by capacity: the
-/// sizes are the ones the workload produced, not fixed classes.
+/// to the next without going back to the allocator. Keyed by capacity. New
+/// buffers are allocated at one of eight sizes per power of two up to 2 MiB
+/// and at multiples of 2 MiB above (`direct_borrow_size`); a buffer given
+/// back keeps the capacity it has.
 #[cfg(has_io_uring)]
 struct DirectPool {
     free: std::collections::BTreeMap<usize, Vec<BytesMut>>,
     free_bytes: usize,
-    /// The most bytes of free buffers kept; a buffer put back beyond this is
-    /// freed.
+    /// The most bytes of free buffers kept (see `put`).
     max_free_bytes: usize,
 }
 
@@ -648,14 +649,18 @@ impl AccumulatorTable {
     /// buffer of `region` bytes, and a buffer borrowed for an earlier message
     /// goes back to the pool. With part of a message buffered, the buffer
     /// grows when less than `need` (the parser's `NeedAtLeast` value), or
-    /// less than half of `region`, is spare, by `need` or, without a known
-    /// length of at least `region`, by the larger of `need` and the receive
-    /// size. The connection's own buffer grows by borrowing one from the
-    /// pool, into which the buffered bytes are copied; a borrowed buffer
-    /// grows with `reserve`. The receive size is `region`, or for a
-    /// connection whose largest message (`note_consumed`) is `m`, the larger
-    /// of `region` and `min(4m, m + 4 * region)`; a receive several messages
-    /// long moves a partial message once per several messages.
+    /// less than half of `region`, is spare: to hold the rest of the message
+    /// when `need` is at least `region`, and otherwise to the larger of the
+    /// receive size and the buffered bytes plus `region`. The receive size is
+    /// `region`, or for a connection whose largest message (`note_consumed`)
+    /// is `m`, the larger of `region` and `min(4m, m + 4 * region)`; a
+    /// receive several messages long moves a partial message once per
+    /// several messages. The connection's own buffer grows by borrowing one
+    /// from the pool, into which the buffered bytes are copied. A borrowed
+    /// buffer moves the buffered bytes to the front of its allocation when
+    /// that makes room, and otherwise takes a buffer of the new size from the
+    /// pool and gives the old one back; for a message longer than any before
+    /// it on the connection, it grows with `reserve`.
     ///
     /// A remainder held by `put_back` is made mutable first (`reclaim`), so
     /// a remainder the parser kept no slice of is received behind in place,
@@ -668,6 +673,12 @@ impl AccumulatorTable {
         region: usize,
         need: Option<usize>,
     ) -> Option<(BytesMut, usize, bool)> {
+        // A direct connection sizes its buffer here, from `need` and the
+        // pool, so the reserve target `with_bytes` records for a
+        // `NeedAtLeast` must not size the copy `reclaim` makes of a shared
+        // remainder: that copy would become the connection's own buffer, at
+        // the size of the message, outside the pool.
+        self.accumulators[index as usize].reserve_target = 0;
         self.reclaim(index);
         let acc = &mut self.accumulators[index as usize];
         debug_assert!(acc.frozen.is_none(), "reclaim leaves no frozen remainder");
@@ -691,6 +702,10 @@ impl AccumulatorTable {
         if len == 0 {
             if let Some(own) = acc.own.take() {
                 self.direct_pool.put(std::mem::replace(&mut acc.buf, own));
+            } else if acc.buf.capacity() > region.saturating_mul(2) {
+                // An own buffer larger than twice the region goes to the
+                // pool, and the connection receives into a new one.
+                self.direct_pool.put(std::mem::take(&mut acc.buf));
             }
             if acc.buf.capacity() < region {
                 // Empty, so this moves nothing.
@@ -968,6 +983,51 @@ mod tests {
         assert_eq!(buf.len(), cap - consumed);
         assert_eq!(n, consumed);
         unsafe { table.attach_received(0, buf, 0) };
+    }
+
+    /// A message of known length whose start arrived while the parser held a
+    /// value from the same buffer goes into a borrowed buffer, so once it is
+    /// consumed the idle connection is back to its own buffer and the large
+    /// one is in the pool.
+    #[cfg(has_io_uring)]
+    #[test]
+    fn a_held_value_does_not_leave_a_large_own_buffer() {
+        let mut table = AccumulatorTable::new(1, 4096);
+        let region = 32 * 1024;
+        let mib = 1 << 20;
+        // The own buffer receives a 100-byte message and the start of a
+        // 1 MiB one.
+        let (mut buf, _, _) = table.detach_for_recv(0, region, None).unwrap();
+        buf.resize(region, 1);
+        unsafe { table.attach_received(0, buf, 0) };
+        // The parser keeps the 100-byte value and asks for the rest of the
+        // 1 MiB message, as `with_bytes` records a `NeedAtLeast`.
+        let frozen = table.take_frozen(0);
+        let value = frozen.slice(..100);
+        table.put_back(0, frozen.slice(100..));
+        drop(frozen);
+        let need = mib - (region - 100);
+        table.reserve(0, need);
+        let (mut buf, _, known) = table.detach_for_recv(0, region, Some(need)).unwrap();
+        assert!(known);
+        let len = buf.len();
+        buf.resize(len + need, 2);
+        unsafe { table.attach_received(0, buf, 0) };
+        // The parser consumes the message whole, then drops the value.
+        let frozen = table.take_frozen(0);
+        table.keep_spent(0, frozen);
+        drop(value);
+        let (buf, _, _) = table.detach_for_recv(0, region, None).unwrap();
+        assert!(
+            buf.capacity() < 64 * 1024,
+            "idle with a buffer of {} bytes",
+            buf.capacity()
+        );
+        unsafe { table.attach_received(0, buf, 0) };
+        assert!(
+            table.direct_pool.free_bytes >= mib,
+            "the large buffer is in the pool"
+        );
     }
     use super::*;
 

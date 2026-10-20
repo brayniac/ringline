@@ -468,12 +468,31 @@ async fn run_pool_direct(addr: SocketAddr) -> Result<(), String> {
             return Err("direct pool get mismatch".into());
         }
     }
-    // `get_stream` reads with segments, which a direct connection refuses.
-    match client.get_stream(b"stream:small").await {
-        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::Unsupported => Ok(()),
-        Err(e) => Err(format!("direct pool get_stream: {e}")),
-        Ok(_) => Err("direct pool get_stream: accepted".into()),
+    // `get_stream` and `get_cas` read with segments, which a direct
+    // connection refuses. They refuse before sending, so the next command
+    // reads its own reply.
+    match client.get_stream(b"stream:large").await {
+        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::Unsupported => {}
+        Err(e) => return Err(format!("direct pool get_stream: {e}")),
+        Ok(_) => return Err("direct pool get_stream: accepted".into()),
     }
+    match client.get_cas(b"stream:large").await {
+        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::Unsupported => {}
+        Err(e) => return Err(format!("direct pool get_cas: {e}")),
+        Ok(_) => return Err("direct pool get_cas: accepted".into()),
+    }
+    let got = client
+        .get(b"stream:small")
+        .await
+        .map_err(|e| format!("direct pool get after refusals: {e}"))?
+        .ok_or("direct pool get after refusals: None")?;
+    if got.data.as_ref() != SMALL {
+        return Err(format!(
+            "direct pool get after refusals read {} bytes",
+            got.data.len()
+        ));
+    }
+    Ok(())
 }
 
 async fn run_get_cas(addr: SocketAddr) -> Result<(), String> {

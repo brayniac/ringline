@@ -696,3 +696,89 @@ fn recv_ready_counts_the_bytes_a_direct_receive_holds() {
         Ok(())
     );
 }
+
+static STREAM: Mutex<Option<Result<(), String>>> = Mutex::new(None);
+
+/// Read with `ConnStream` on a direct connection: `read` and `fill_buf`
+/// each arm a receive when they park.
+struct StreamRead;
+
+impl AsyncEventHandler for StreamRead {
+    fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        Some(Box::pin(async {
+            use futures_util::io::{AsyncBufReadExt, AsyncReadExt};
+            let addr = SERVER.lock().unwrap().unwrap();
+            let r = async {
+                let conn = ringline::connect(addr)
+                    .recv_direct(true)
+                    .await
+                    .map_err(|e| format!("connect: {e}"))?;
+                let mut stream = ringline::ConnStream::new(conn.as_conn());
+                let mut buf = [0u8; 5];
+                ringline::timeout(Duration::from_secs(2), stream.read_exact(&mut buf))
+                    .await
+                    .map_err(|_| "read did not resolve".to_string())?
+                    .map_err(|e| format!("read: {e}"))?;
+                if &buf != b"hello" {
+                    return Err(format!("read {buf:?}"));
+                }
+                let got = ringline::timeout(Duration::from_secs(2), stream.fill_buf())
+                    .await
+                    .map_err(|_| "fill_buf did not resolve".to_string())?
+                    .map_err(|e| format!("fill_buf: {e}"))?
+                    .to_vec();
+                if got != b"world" {
+                    return Err(format!("fill_buf {got:?}"));
+                }
+                stream.consume_unpin(got.len());
+                Ok(())
+            }
+            .await;
+            *STREAM.lock().unwrap() = Some(r);
+            let _ = ringline::request_shutdown();
+        }))
+    }
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
+        async {}
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        StreamRead
+    }
+}
+
+#[test]
+fn conn_stream_reads_a_direct_connection() {
+    let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    *SERVER.lock().unwrap() = Some(listener.local_addr().unwrap());
+    *STREAM.lock().unwrap() = None;
+    let server = std::thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        // Each write after the client has parked, so each read arms a receive.
+        std::thread::sleep(Duration::from_millis(200));
+        s.write_all(b"hello").unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        s.write_all(b"world").unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let _ = std::io::Read::read(&mut s, &mut [0u8; 1]);
+    });
+    let config = ConfigBuilder::new()
+        .workers(1)
+        .pin_to_core(false)
+        .max_connections(16)
+        .build()
+        .expect("config");
+    let (runtime, handles) = RinglineBuilder::new(config)
+        .launch::<StreamRead>()
+        .expect("launch");
+    common::join_workers(&runtime, handles);
+    server.join().unwrap();
+    assert_eq!(
+        STREAM
+            .lock()
+            .unwrap()
+            .take()
+            .expect("client did not finish"),
+        Ok(())
+    );
+}

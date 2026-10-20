@@ -220,6 +220,18 @@ pub enum Error {
     LengthMismatch,
 }
 
+/// The error a method that reads with segments returns on a connection that
+/// receives into its accumulator ([`ringline::TcpConnect::recv_direct`]).
+/// The method returns it before sending a request or taking a pending
+/// operation, so the connection stays usable.
+#[cfg(has_io_uring)]
+fn recv_direct_refused() -> Error {
+    Error::Io(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "not supported on a recv_direct connection",
+    ))
+}
+
 /// Maximum key length per memcache text-protocol spec.
 pub const MAX_KEY_LEN: usize = 250;
 
@@ -1866,10 +1878,17 @@ impl Client {
     /// connection is **closed** (its slot generation bumped). The next operation
     /// on this client then fails, matching the "poison = close" recovery
     /// discipline.
+    ///
+    /// On a connection that receives into its accumulator
+    /// ([`ringline::TcpConnect::recv_direct`]) this returns [`Error::Io`] of
+    /// kind `Unsupported` without sending the request.
     pub async fn get_stream(
         &mut self,
         key: impl AsRef<[u8]>,
     ) -> Result<Option<StreamValue<'_>>, Error> {
+        if self.rx.is_recv_direct() {
+            return Err(recv_direct_refused());
+        }
         let key = key.as_ref();
         // Fire the GET, then opt the connection into segmented delivery. The
         // reply body then arrives as held segments instead of being gathered
@@ -2234,10 +2253,17 @@ impl Client {
     ///
     /// The same sequential-use, short-FIN-error, and undrained-drop-poison
     /// contracts as [`get_stream`](Self::get_stream) apply.
+    ///
+    /// On a connection that receives into its accumulator
+    /// ([`ringline::TcpConnect::recv_direct`]) this returns [`Error::Io`] of
+    /// kind `Unsupported` without sending the request.
     pub async fn get_cas(
         &mut self,
         key: impl AsRef<[u8]>,
     ) -> Result<Option<CasStreamValue<'_>>, Error> {
+        if self.rx.is_recv_direct() {
+            return Err(recv_direct_refused());
+        }
         let key = key.as_ref();
         // Fire `gets <key>\r\n`, then opt into segmented delivery (synchronous,
         // before the await) so the reply arrives as held segments.
