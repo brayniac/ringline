@@ -251,6 +251,31 @@ impl Ring {
         Ok(())
     }
 
+    /// Submit a direct receive: a one-shot recv of `len` bytes into `ptr`,
+    /// the spare capacity of a connection's accumulator buffer held by
+    /// `Driver::direct_recvs[slot]` until the CQE.
+    pub fn submit_recv_direct(
+        &mut self,
+        conn_index: u32,
+        ptr: *mut u8,
+        len: u32,
+        slot: u32,
+    ) -> io::Result<()> {
+        let user_data = UserData::encode(OpTag::RecvDirect, conn_index, slot);
+        let entry = Sqe::new(
+            Op::Recv {
+                fd: sqe::Fd::Fixed(conn_index),
+                buf: ptr,
+                len,
+            },
+            user_data.raw(),
+        );
+        unsafe {
+            self.push_sqe(&entry)?;
+        }
+        Ok(())
+    }
+
     /// Submit a multishot recv with provided buffer ring for a connection.
     ///
     /// `generation` is the connection's generation at arm time. It occupies the

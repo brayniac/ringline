@@ -377,6 +377,7 @@ async fn run_client(addr: SocketAddr) -> Result<(), String> {
 
     run_set_stream(addr).await?;
     run_pool_stream(addr).await?;
+    run_pool_direct(addr).await?;
     run_borrow_get(addr).await?;
     run_recv_meta(addr).await?;
 
@@ -658,6 +659,94 @@ async fn run_borrow_get(addr: SocketAddr) -> Result<(), String> {
         }
     }
 
+    Ok(())
+}
+
+// ── A pool whose connections receive directly ─────────────────────────────
+
+async fn run_pool_direct(addr: SocketAddr) -> Result<(), String> {
+    use ringline_redis::{Pool, PoolConfig};
+
+    let pool = Pool::new(PoolConfig::new(addr, 1).recv_direct(true));
+    let mut client = pool
+        .client()
+        .await
+        .map_err(|e| format!("direct pool client: {e}"))?;
+    let small = client
+        .get(b"stream:small")
+        .await
+        .map_err(|e| format!("direct pool small get: {e}"))?
+        .ok_or("direct pool small: None")?;
+    if small.as_ref() != SMALL {
+        return Err("direct pool small mismatch".into());
+    }
+    // Larger than `recv_direct_region`, so the parser's length hint sizes
+    // the receive.
+    let large = client
+        .get(b"stream:large")
+        .await
+        .map_err(|e| format!("direct pool large get: {e}"))?
+        .ok_or("direct pool large: None")?;
+    if large.as_ref() != large_value().as_slice() {
+        return Err("direct pool large mismatch".into());
+    }
+    // `recv_get_discard` reads with segments, which a direct connection
+    // refuses. It refuses before taking the pending GET, so `recv` still
+    // reads that reply and the connection stays aligned.
+    client
+        .fire_get(b"stream:small", 1)
+        .map_err(|e| format!("direct pool fire: {e}"))?;
+    match client.recv_get_discard().await {
+        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::Unsupported => {}
+        other => return Err(format!("direct pool recv_get_discard: {other:?}")),
+    }
+    match client.recv().await {
+        Ok(ringline_redis::CompletedOp::Get {
+            result: Ok(Some(v)),
+            user_data: 1,
+            ..
+        }) if v.as_ref() == SMALL => {}
+        Ok(_) => return Err("direct pool recv after refusal: wrong reply".into()),
+        Err(e) => return Err(format!("direct pool recv after refusal: {e}")),
+    }
+    // `get_stream` refuses before sending, so the next command reads its
+    // own reply.
+    match client.get_stream(b"stream:large").await {
+        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::Unsupported => {}
+        Err(e) => return Err(format!("direct pool get_stream: {e}")),
+        Ok(_) => return Err("direct pool get_stream: accepted".into()),
+    }
+    let small = client
+        .get(b"stream:small")
+        .await
+        .map_err(|e| format!("direct pool get after get_stream: {e}"))?
+        .ok_or("direct pool get after get_stream: None")?;
+    if small.as_ref() != SMALL {
+        return Err(format!(
+            "direct pool get after get_stream read {} bytes",
+            small.len()
+        ));
+    }
+    // `recv_meta` drains a GET reply with `with_bytes` on a direct
+    // connection.
+    client
+        .fire_get(b"stream:large", 2)
+        .map_err(|e| format!("direct pool fire large: {e}"))?;
+    let m = client
+        .recv_meta()
+        .await
+        .map_err(|e| format!("direct pool recv_meta: {e}"))?;
+    if m.value_len != Some(large_value().len()) || m.user_data != 2 {
+        return Err(format!("direct pool recv_meta: {m:?}"));
+    }
+    let small = client
+        .get(b"stream:small")
+        .await
+        .map_err(|e| format!("direct pool get after recv_meta: {e}"))?
+        .ok_or("direct pool get after recv_meta: None")?;
+    if small.as_ref() != SMALL {
+        return Err("direct pool get after recv_meta mismatch".into());
+    }
     Ok(())
 }
 

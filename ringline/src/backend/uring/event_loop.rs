@@ -1377,6 +1377,97 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.driver.recv_starved.push(conn_index);
     }
 
+    /// Completion of a direct receive (`OpTag::RecvDirect`).
+    ///
+    /// The payload is the `direct_recvs` entry holding the accumulator
+    /// buffer the kernel wrote into. The entry is removed here and only
+    /// here. A completion whose connection closed, or whose slot now holds
+    /// another connection, passes the buffer to `recycle_direct`: a buffer
+    /// of at least 64 KiB for which `DirectPool::put` finds room stays in
+    /// the pool, and any other is freed. For a live connection, the buffer
+    /// goes back into the accumulator with the received bytes behind its
+    /// contents, including on EOF and errors, so the bytes received before
+    /// stay readable. The arrival is recorded before the bytes are placed,
+    /// while `recv_direct_held` still counts the bytes the buffer held, as
+    /// the multishot path records it before appending.
+    fn handle_recv_direct(&mut self, ud: UserData, result: i32) {
+        let slot = ud.payload() as usize;
+        let Some(entry) = self
+            .driver
+            .direct_recvs
+            .get_mut(slot)
+            .and_then(Option::take)
+        else {
+            return;
+        };
+        self.driver.direct_recv_free.push(slot as u32);
+        let conn_index = entry.conn_index;
+        let live = self.driver.connections.get(conn_index).is_some_and(|c| {
+            c.generation == entry.generation && matches!(c.lifecycle, Lifecycle::Open)
+        });
+        if let Some(cs) = self.driver.connections.get_mut(conn_index)
+            && cs.generation == entry.generation
+        {
+            cs.recv_direct_armed = false;
+        }
+        if !live {
+            if let Some(cs) = self.driver.connections.get_mut(conn_index)
+                && cs.generation == entry.generation
+            {
+                cs.recv_direct_held = 0;
+            }
+            metrics::RECV_DIRECT.increment(metrics::recv_direct::STALE);
+            self.driver.accumulators.recycle_direct(entry.buf);
+            return;
+        }
+        let received = result.max(0) as usize;
+        if result > 0 {
+            self.driver.record_arrival(conn_index, received);
+        }
+        // SAFETY: a non-negative result is the number of bytes the kernel
+        // wrote at the buffer's length; a negative one wrote none.
+        unsafe {
+            self.driver
+                .accumulators
+                .attach_received(conn_index, entry.buf, received);
+        }
+        if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+            cs.recv_direct_held = 0;
+        }
+        if result > 0 {
+            metrics::BYTES.add(metrics::bytes::RECEIVED, received as u64);
+            metrics::RECV_DIRECT.add(metrics::recv_direct::BYTES, received as u64);
+            self.withdraw_park_offer(conn_index);
+            self.executor.wake_recv(conn_index);
+            return;
+        }
+        if result == 0 {
+            // Peer FIN. `truncated` is the TLS case, which a direct
+            // connection is not.
+            if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+                cs.note_eof(false);
+            }
+            self.executor.wake_recv(conn_index);
+            self.driver.close_connection(conn_index);
+            return;
+        }
+        if -result == libc::ECANCELED {
+            // Cancelled with the connection open: the task re-arms when it
+            // parks again.
+            self.executor.wake_recv(conn_index);
+            return;
+        }
+        if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+            cs.read = ReadHalf::Error;
+        }
+        self.executor.fail_recv(
+            conn_index,
+            entry.generation,
+            io::Error::from_raw_os_error(-result),
+        );
+        self.driver.close_connection(conn_index);
+    }
+
     fn dispatch_cqe(&mut self, user_data_raw: u64, result: i32, flags: u32) {
         metrics::RING.increment(metrics::ring::CQE_PROCESSED);
         let ud = UserData(user_data_raw);
@@ -1409,6 +1500,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             OpTag::ParkInstall => self.handle_park_install(ud, result),
             OpTag::RecvMulti => self.handle_recv_multi(ud, result, flags),
             OpTag::RecvFallback => self.handle_recv_fallback(ud, result),
+            OpTag::RecvDirect => self.handle_recv_direct(ud, result),
             OpTag::Send => self.handle_send(ud, result),
             OpTag::SendMsgZc => self.handle_send_msg_zc(ud, result, flags),
             OpTag::Close => self.handle_close(ud),
@@ -4348,7 +4440,15 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             cs.established = true;
             cs.mark_connected();
         }
-        self.arm_recv(conn_index);
+        // A direct connection's receive is armed by its first parked read.
+        if !self
+            .driver
+            .connections
+            .get(conn_index)
+            .is_some_and(|c| c.recv_direct)
+        {
+            self.arm_recv(conn_index);
+        }
 
         self.executor.wake_connect(conn_index, Ok(()));
     }
@@ -9219,6 +9319,101 @@ mod tests {
         assert_eq!(
             reused, conn_index,
             "the free list must hand the same slot back"
+        );
+    }
+
+    /// Write `data` where the kernel would: into the spare capacity of the
+    /// buffer held by direct-receive entry `slot`.
+    fn write_direct_landing(el: &mut AsyncEventLoop<NoopHandler>, slot: usize, data: &[u8]) {
+        let entry = el.driver.direct_recvs[slot].as_mut().expect("entry in use");
+        let spare = entry.buf.spare_capacity_mut();
+        for (d, &b) in spare.iter_mut().zip(data) {
+            d.write(b);
+        }
+    }
+
+    /// A direct receive holds the accumulator's buffer from arm to
+    /// completion: through a close and the slot's reuse, and its completion
+    /// for the closed connection does not reach the new occupant.
+    #[test]
+    fn a_direct_receive_outlives_its_connection_and_its_completion_is_stale() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        el.driver
+            .connections
+            .get_mut(conn_index)
+            .unwrap()
+            .recv_direct = true;
+        el.driver.accumulators.append(conn_index, b"abc");
+        assert!(!el.driver.arm_direct_recv_or_close(conn_index, None));
+        assert!(
+            el.driver.accumulators.is_empty(conn_index),
+            "buffer detached"
+        );
+        assert_eq!(el.driver.direct_recvs.len(), 1);
+        write_direct_landing(&mut el, 0, b"XYZ");
+
+        recycle_connection(&mut el, conn_index);
+        assert!(
+            el.driver.direct_recvs[0].is_some(),
+            "the entry must stay until its completion, not the close"
+        );
+
+        let ud = UserData::encode(OpTag::RecvDirect, conn_index, 0);
+        el.test_dispatch_cqe(ud.raw(), 3, 0);
+        assert!(
+            el.driver.direct_recvs[0].is_none(),
+            "freed at its completion"
+        );
+        assert!(
+            el.driver.accumulators.is_empty(conn_index),
+            "a stale completion's bytes reached the next connection"
+        );
+
+        // The new occupant's own receive delivers behind its contents.
+        el.driver
+            .connections
+            .get_mut(conn_index)
+            .unwrap()
+            .recv_direct = true;
+        el.driver.accumulators.append(conn_index, b"ab");
+        assert!(!el.driver.arm_direct_recv_or_close(conn_index, None));
+        write_direct_landing(&mut el, 0, b"cde");
+        el.test_dispatch_cqe(ud.raw(), 3, 0);
+        assert_eq!(el.driver.accumulators.data(conn_index), b"abcde");
+        assert!(
+            !el.driver
+                .connections
+                .get(conn_index)
+                .unwrap()
+                .recv_direct_armed
+        );
+    }
+
+    /// At `recv_accumulator_max` a direct connection closes instead of
+    /// waiting with no receive armed.
+    #[test]
+    fn a_direct_connection_at_the_accumulator_cap_closes() {
+        let config = ConfigBuilder::new()
+            .recv_buffer(16, 1024)
+            .recv_accumulator_max(4096)
+            .recv_direct_region(1024)
+            .build()
+            .unwrap();
+        let mut el = make_test_loop_with_config(config);
+        let conn_index = accept_connection(&mut el);
+        el.driver
+            .connections
+            .get_mut(conn_index)
+            .unwrap()
+            .recv_direct = true;
+        el.driver.accumulators.append(conn_index, &[0u8; 4096]);
+        assert!(el.driver.arm_direct_recv_or_close(conn_index, None));
+        assert!(
+            el.driver
+                .connections
+                .get(conn_index)
+                .is_none_or(|c| c.close_requested())
         );
     }
 

@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- io_uring: `TcpConnect::recv_direct(true)` makes an outbound plaintext
+  connection receive into its own accumulator instead of the shared provided
+  buffer ring: a one-shot `RECV` into the accumulator's free space, armed
+  when a read parks. `with_data`, `with_bytes`, `with_data_result` and
+  `recv_ready` read it unchanged, without the copy from a provided buffer.
+  An idle connection holds a buffer of `ConfigBuilder::recv_direct_region`
+  bytes (default 32 KiB), or of `recv_accumulator_capacity` if that is
+  larger and at most twice the region; a larger message borrows a buffer
+  from a per-worker pool of up to `ConfigBuilder::recv_direct_pool_max` free
+  bytes (default 16 MiB) and gives it back when nothing is buffered and no
+  `Bytes` read from it is alive. A `ConnStream` read arms the receive the
+  same way. Reads that need provided buffers (`segments`,
+  `recv_owned_segment`, `with_segments`, `with_bytes_segments`,
+  `forward_to`, `forward_to_conn`, `forward_held`) return
+  `io::ErrorKind::Unsupported` on such a connection, and a TLS connect with
+  `recv_direct` fails with it. Ignored on mio. Counters in
+  `ringline/recv_direct`. `ConnCtx::is_recv_direct` (also on `Connection`
+  and `RecvHalf`) tells whether a connection receives this way. Against
+  Valkey and memcached with 1,000 connections, client CPU at a fixed rate
+  was 1.8 to 6.8% lower than the ring at 4 KiB pipelined and larger values,
+  and within 1% at 64 B and 4 KiB unpipelined. See
+  `docs/recv-direct-design.md`.
+- `ringline-redis`, `ringline-memcache`: `PoolConfig::recv_direct` opens
+  every pooled connection with `TcpConnect::recv_direct`. On io_uring the
+  client methods that read segments return an `Unsupported` I/O error on
+  such a connection before sending the request or taking the pending
+  operation, so the connection stays usable: ringline-redis `get_stream`,
+  `recv_get_discard` and `recv_get_segments`, and ringline-memcache
+  `get_stream` and `get_cas`. ringline-redis `recv_meta` reads a GET reply
+  through `with_bytes` on such a connection.
 - `direct_io_fsync` returns a future for an fsync of a direct I/O file. The
   fsync that `DriverCtx::direct_io_fsync` submits has no future, so a task
   could not wait for it.

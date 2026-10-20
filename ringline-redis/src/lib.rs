@@ -245,6 +245,18 @@ pub enum Error {
     LengthMismatch,
 }
 
+/// The error a method that reads with segments returns on a connection that
+/// receives into its accumulator ([`ringline::TcpConnect::recv_direct`]).
+/// The method returns it before sending a request or taking a pending
+/// operation, so the connection stays usable.
+#[cfg(has_io_uring)]
+fn recv_direct_refused() -> Error {
+    Error::Io(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "not supported on a recv_direct connection",
+    ))
+}
+
 impl Error {
     /// `true` for transient server-side conditions where the same command
     /// is expected to succeed if retried after a short delay:
@@ -1426,6 +1438,11 @@ impl Client {
     ///
     /// Zero value copy: under pipelining only the few-byte boundary remainder
     /// between this reply and the next is gathered. io_uring only (segmented recv).
+    ///
+    /// On a connection that receives into its accumulator
+    /// ([`ringline::TcpConnect::recv_direct`]) this returns [`Error::Io`] of
+    /// kind `Unsupported` without taking the pending GET, which
+    /// [`recv`](Self::recv) can then read.
     #[cfg(has_io_uring)]
     pub async fn recv_get_discard(&mut self) -> Result<GetMeta, Error> {
         self.recv_get_segments(|_| {}).await
@@ -1439,6 +1456,9 @@ impl Client {
         &mut self,
         on_value: impl FnMut(&[u8]),
     ) -> Result<GetMeta, Error> {
+        if self.rx.is_recv_direct() {
+            return Err(recv_direct_refused());
+        }
         self.flush()?;
         let pending = self.pending.pop_front().ok_or(Error::NoPending)?;
         if !matches!(pending.kind, PendingOpKind::Get) {
@@ -1625,19 +1645,19 @@ impl Client {
     }
 
     /// Runs the RESP GET reply state machine on an already-popped GET `pending`
-    /// over the mio accumulator (`with_bytes`): parses the header, then drains
-    /// the value body incrementally so the accumulator stays bounded (~one
-    /// kernel-drain burst), never materializing the value. The mio counterpart
-    /// of [`run_get_state_machine`](Self::run_get_state_machine) — SAME parse and
-    /// poison semantics, minus provided-buffer zero-copy (a `read()` copy per
-    /// burst is unavoidable on mio). Intentionally duplicates the state machine
-    /// (over `with_bytes` vs `with_segments`) to leave the reviewed io_uring path
-    /// untouched.
+    /// over the accumulator (`with_bytes`): parses the header, then drains the
+    /// value body incrementally so the accumulator stays bounded (about one
+    /// receive), never materializing the value. Used on mio and, on io_uring,
+    /// on a connection that receives into its accumulator
+    /// (`TcpConnect::recv_direct`), which cannot read with segments. Same parse
+    /// and poison semantics as
+    /// [`run_get_state_machine`](Self::run_get_state_machine), which reads
+    /// provided buffers without a copy; the state machine is duplicated (over
+    /// `with_bytes` and `with_segments`) to leave that path unchanged.
     ///
     /// Returns `(outcome, total_consumed, latency_ns)`; a desync
     /// (`UnexpectedResponse`) poisons; a short FIN returns `ConnectionClosed`.
-    #[cfg(not(has_io_uring))]
-    async fn run_get_drain_mio(
+    async fn run_get_drain_bytes(
         &mut self,
         pending: &PendingOp,
     ) -> Result<(Result<Option<usize>, Error>, usize, u64), Error> {
@@ -1773,8 +1793,8 @@ impl Client {
     }
 
     /// Read the next pending reply as zero-copy metadata, for ANY op kind (GET /
-    /// SET / DEL). GET drains the value body via the borrow-and-discard segmented
-    /// path; SET/DEL read the small reply normally. The value bytes are never
+    /// SET / DEL). GET drains the value body without materializing it (see
+    /// below); SET/DEL read the small reply normally. The value bytes are never
     /// materialized — only the header / control metadata is surfaced
     /// ([`RespMeta`]), which is all a load generator needs.
     ///
@@ -1783,21 +1803,28 @@ impl Client {
     /// inspect it (e.g. cluster redirects). `Err` is reserved for
     /// connection/desync failures — a GET desync poisons the connection.
     ///
-    /// io_uring only (segmented recv).
+    /// On io_uring a GET's value is drained from provided buffers without a
+    /// copy. On mio, and on a connection that receives into its accumulator
+    /// ([`ringline::TcpConnect::recv_direct`]), it is drained through
+    /// `with_bytes`.
     pub async fn recv_meta(&mut self) -> Result<RespMeta, Error> {
         self.flush()?;
         let pending = self.pending.pop_front().ok_or(Error::NoPending)?;
         self.flushed_count = self.flushed_count.saturating_sub(1);
         match pending.kind {
             PendingOpKind::Get => {
-                // io_uring: zero-copy borrow-and-discard over provided buffers.
+                // io_uring: zero-copy borrow-and-discard over provided buffers,
+                // except on a direct connection, which has none. There and on
                 // mio: header-parse + streaming drain over `with_bytes` — bounded
                 // memory (never materializes the value), same `RespMeta` contract.
                 #[cfg(has_io_uring)]
-                let (outcome, _consumed, latency_ns) =
-                    self.run_get_state_machine(&pending, |_| {}).await?;
+                let (outcome, _consumed, latency_ns) = if self.rx.is_recv_direct() {
+                    self.run_get_drain_bytes(&pending).await?
+                } else {
+                    self.run_get_state_machine(&pending, |_| {}).await?
+                };
                 #[cfg(not(has_io_uring))]
-                let (outcome, _consumed, latency_ns) = self.run_get_drain_mio(&pending).await?;
+                let (outcome, _consumed, latency_ns) = self.run_get_drain_bytes(&pending).await?;
                 let meta = match outcome {
                     Ok(value_len) => RespMeta {
                         kind: OpKind::Get,
@@ -3285,10 +3312,17 @@ impl Client {
     /// wire bytes cannot be drained synchronously in `Drop`, so the connection is
     /// **closed** (its slot generation bumped). The next operation on this client
     /// then fails, matching the "poison = close" recovery discipline.
+    ///
+    /// On a connection that receives into its accumulator
+    /// ([`ringline::TcpConnect::recv_direct`]) this returns [`Error::Io`] of
+    /// kind `Unsupported` without sending the request.
     pub async fn get_stream(
         &mut self,
         key: impl AsRef<[u8]>,
     ) -> Result<Option<ValueStream<'_>>, Error> {
+        if self.rx.is_recv_direct() {
+            return Err(recv_direct_refused());
+        }
         let key = key.as_ref();
         // Fire the GET, then opt the connection into segmented delivery. The
         // reply body then arrives as held segments instead of being gathered

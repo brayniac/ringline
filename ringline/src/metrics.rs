@@ -29,6 +29,13 @@ pub static POOL: ShardedCounterGroup = ShardedCounterGroup::new(9);
 )]
 pub static RECV_RING: ShardedCounterGroup = ShardedCounterGroup::new(recv_ring::COUNT);
 
+/// Direct receives (`TcpConnect::recv_direct`).
+#[metric(
+    name = "ringline/recv_direct",
+    description = "Direct receives into connection accumulators: armed, sized for a known length, bytes, stale, pooled buffers reused and allocated"
+)]
+pub static RECV_DIRECT: ShardedCounterGroup = ShardedCounterGroup::new(recv_direct::COUNT);
+
 #[metric(
     name = "ringline/recv_preflight_failed",
     description = "Incremental-ring preflights that failed, by step"
@@ -339,6 +346,27 @@ pub mod recv_ring {
     pub const COUNT: usize = 10;
 }
 
+/// Slot indices for `RECV_DIRECT`.
+pub mod recv_direct {
+    /// Direct receives submitted.
+    pub const ARMED: usize = 0;
+    /// Of those, receives armed after the parser returned a `NeedAtLeast` of
+    /// at least `recv_direct_region`, into a buffer grown to hold the rest of
+    /// the message.
+    pub const KNOWN_LENGTH: usize = 1;
+    /// Bytes the kernel wrote into accumulators.
+    pub const BYTES: usize = 2;
+    /// Completions whose connection had closed or whose slot was reused.
+    pub const STALE: usize = 3;
+    /// Buffers a direct connection borrowed for a large message that came
+    /// from the worker's free buffers.
+    pub const POOL_REUSED: usize = 4;
+    /// Buffers a direct connection borrowed for a large message that were
+    /// allocated because no free buffer fit.
+    pub const POOL_ALLOCATED: usize = 5;
+    pub const COUNT: usize = 6;
+}
+
 /// Slot indices for `RECV_ARRIVAL`.
 pub mod recv_arrival {
     /// A reader call whose range started below the oldest entry or ended
@@ -380,14 +408,14 @@ pub mod recv_preflight {
 /// Slot indices for per-`OpTag` completion counters: the slot *is* the
 /// discriminant.
 pub mod cqe_tag {
-    /// One past the largest `OpTag` discriminant (`CloseCancel = 34`).
+    /// One past the largest `OpTag` discriminant (`RecvDirect = 36`).
     ///
     /// Deliberately not derived from the enum: `ShardedCounterGroup::new` needs
     /// a const, and there is no const way to ask an enum for its maximum
     /// discriminant. `count_covers_every_tag` in the tests below fails if a new
     /// tag is added above this, which is the case that would otherwise drop
     /// completions silently.
-    pub const COUNT: usize = 36;
+    pub const COUNT: usize = 37;
 }
 
 /// Counter slot indices for pool exhaustion metrics.
@@ -471,6 +499,20 @@ pub mod udp {
 ///
 /// Call once at startup before metrics are scraped.
 pub fn init_metadata() {
+    RECV_DIRECT.insert_metadata(recv_direct::ARMED, "op".into(), "armed".into());
+    RECV_DIRECT.insert_metadata(
+        recv_direct::KNOWN_LENGTH,
+        "op".into(),
+        "known_length".into(),
+    );
+    RECV_DIRECT.insert_metadata(recv_direct::BYTES, "op".into(), "bytes".into());
+    RECV_DIRECT.insert_metadata(recv_direct::STALE, "op".into(), "stale".into());
+    RECV_DIRECT.insert_metadata(recv_direct::POOL_REUSED, "op".into(), "pool_reused".into());
+    RECV_DIRECT.insert_metadata(
+        recv_direct::POOL_ALLOCATED,
+        "op".into(),
+        "pool_allocated".into(),
+    );
     RECV_RING.insert_metadata(recv_ring::INCREMENTAL, "op".into(), "incremental".into());
     RECV_RING.insert_metadata(recv_ring::PLAIN, "op".into(), "plain".into());
     RECV_RING.insert_metadata(recv_ring::LEND_REFUSED, "op".into(), "lend_refused".into());

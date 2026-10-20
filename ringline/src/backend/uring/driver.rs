@@ -146,7 +146,90 @@ impl Driver {
     }
 }
 
+/// An in-flight direct receive: the connection it was armed for and the
+/// accumulator buffer the kernel writes into, behind its existing contents.
+pub(crate) struct DirectRecv {
+    pub(crate) conn_index: u32,
+    pub(crate) generation: u32,
+    pub(crate) buf: bytes::BytesMut,
+}
+
 impl Driver {
+    /// Arm a direct receive on `conn_index` if it is a direct connection
+    /// (`TcpConnect::recv_direct`), open, and has none in flight. Called by a
+    /// receive future that parks, after its parser has seen every buffered
+    /// byte: the receive detaches the accumulator's buffer, so arming earlier
+    /// would hide buffered bytes from the parser until more arrive.
+    ///
+    /// `need` is the parser's `NeedAtLeast` value, if it returned one. When
+    /// it is at least `recv_direct_region`, the buffer is first grown to hold
+    /// the rest of the message. A receive that returns less wakes the task
+    /// like any other, and its parser sees the bytes so far.
+    ///
+    /// On a push failure, or with the accumulator at `recv_accumulator_max`,
+    /// the connection is closed, as for a multishot re-arm failure and an
+    /// accumulator overflow, and this returns `true`: the caller wakes the
+    /// task so its read resolves.
+    pub(crate) fn arm_direct_recv_or_close(
+        &mut self,
+        conn_index: u32,
+        need: Option<usize>,
+    ) -> bool {
+        let Some(cs) = self.connections.get(conn_index) else {
+            return false;
+        };
+        if !cs.recv_direct
+            || cs.recv_direct_armed
+            || !matches!(cs.lifecycle, Lifecycle::Open)
+            || cs.recv_finished()
+        {
+            return false;
+        }
+        let generation = cs.generation;
+        let Some((mut buf, len, known)) =
+            self.accumulators
+                .detach_for_recv(conn_index, self.recv_direct_region, need)
+        else {
+            self.close_connection(conn_index);
+            return true;
+        };
+        let held = buf.len();
+        let ptr = unsafe { buf.as_mut_ptr().add(held) };
+        let slot = match self.direct_recv_free.pop() {
+            Some(slot) => slot,
+            None => {
+                self.direct_recvs.push(None);
+                (self.direct_recvs.len() - 1) as u32
+            }
+        };
+        if self
+            .ring
+            .submit_recv_direct(conn_index, ptr, len as u32, slot)
+            .is_err()
+        {
+            metrics::RING.increment(metrics::ring::RECV_ARM_FAILURES);
+            // SAFETY: nothing was submitted, so nothing was written.
+            unsafe { self.accumulators.attach_received(conn_index, buf, 0) };
+            self.direct_recv_free.push(slot);
+            self.close_connection(conn_index);
+            return true;
+        }
+        self.direct_recvs[slot as usize] = Some(DirectRecv {
+            conn_index,
+            generation,
+            buf,
+        });
+        if let Some(cs) = self.connections.get_mut(conn_index) {
+            cs.recv_direct_armed = true;
+            cs.recv_direct_held = held;
+        }
+        metrics::RECV_DIRECT.increment(metrics::recv_direct::ARMED);
+        if known {
+            metrics::RECV_DIRECT.increment(metrics::recv_direct::KNOWN_LENGTH);
+        }
+        false
+    }
+
     /// Whether `conn_index` arms a one-shot recv rather than a multishot one:
     /// every TCP connection unless `Config::recv_multishot` is set, and
     /// always a direct-echo or recv-forward connection, whose completions
@@ -166,6 +249,15 @@ impl Driver {
     /// Arm a TCP recv on `conn_index`: one-shot when `recv_single`,
     /// multishot otherwise. Both carry the `RecvMulti` user_data.
     pub(crate) fn submit_tcp_recv(&mut self, conn_index: u32, generation: u32) -> io::Result<()> {
+        // A direct connection never takes a provided buffer; its receive is
+        // armed by the parked receive future (`arm_direct_recv_or_close`).
+        if self
+            .connections
+            .get(conn_index)
+            .is_some_and(|c| c.recv_direct)
+        {
+            return Ok(());
+        }
         if self.recv_single(conn_index) {
             self.ring.submit_single_recv(conn_index, generation)
         } else {
@@ -941,6 +1033,16 @@ pub(crate) struct Driver {
     /// Lifetime count of fallback recv submissions on this worker
     /// (reported in the shutdown diag line).
     pub(crate) recv_fallback_count: u64,
+    /// Buffers of in-flight direct receives (`TcpConnect::recv_direct`),
+    /// indexed by the `RecvDirect` payload. An entry holds the accumulator
+    /// buffer the kernel writes into and is removed only by that receive's
+    /// completion, so the memory outlives the operation across close and
+    /// slot reuse (Domain Invariant 1). `None` is a free index
+    /// (`direct_recv_free`).
+    pub(crate) direct_recvs: Vec<Option<DirectRecv>>,
+    pub(crate) direct_recv_free: Vec<u32>,
+    /// `Config::recv_direct_region`.
+    pub(crate) recv_direct_region: usize,
     /// Arrival timestamp shared by all UDP datagrams queued in one CQE
     /// drain batch. One clock read per batch instead of one per datagram;
     /// precision loss is bounded by the drain duration (microseconds).
@@ -1313,11 +1415,12 @@ impl Driver {
             send_copy_pool.prefault();
         }
         let send_slab = InFlightSendSlab::new(config.send_slab_slots);
-        let accumulators = AccumulatorTable::new_with_max(
+        let mut accumulators = AccumulatorTable::new_with_max(
             config.max_connections,
             config.recv_accumulator_capacity,
             config.recv_accumulator_max,
         );
+        accumulators.set_direct_pool_max(config.recv_direct_pool_max);
 
         // Deadline flush: disabled when SQPOLL (kernel polls SQ) or interval is 0.
         let flush_interval = if config.sqpoll || config.flush_interval_us == 0 {
@@ -1505,6 +1608,9 @@ impl Driver {
             owned_recv: Vec::new(),
             owned_recv_free: Vec::new(),
             recv_fallback_count: 0,
+            direct_recvs: Vec::new(),
+            direct_recv_free: Vec::new(),
+            recv_direct_region: config.recv_direct_region,
             udp_batch_recv_at: std::time::Instant::now(),
             tick_timeout_ts: if config.tick_timeout_us > 0 {
                 Some(
@@ -2444,8 +2550,9 @@ impl Driver {
     }
 
     /// Bytes the connection holds that no consumer has taken: the
-    /// accumulator, a lent buffer in `pending_recv_bufs`, `segment_hold` and
-    /// `recv_hold`. A buffer in `segment_pinned` has been handed to a
+    /// accumulator, the bytes in the buffer a direct receive holds
+    /// (`recv_direct_held`), a lent buffer in `pending_recv_bufs`,
+    /// `segment_hold` and `recv_hold`. A buffer in `segment_pinned` has been handed to a
     /// `RecvSegment`, so its bytes are not counted.
     ///
     /// The arrival log takes the first unread stream offset as
@@ -2453,6 +2560,10 @@ impl Driver {
     pub(crate) fn recv_buffered(&self, conn_index: u32) -> usize {
         let idx = conn_index as usize;
         self.accumulators.len(conn_index)
+            + self
+                .connections
+                .get(conn_index)
+                .map_or(0, |c| c.recv_direct_held)
             + self.pending_recv_bufs[idx].map_or(0, |p| p.len as usize)
             + self.segment_hold[idx]
                 .iter()
@@ -3912,6 +4023,7 @@ impl Driver {
             if self.connections.active_count() == 0
                 && !self.send_slab.has_in_flight()
                 && self.forward_write.iter().all(Option::is_none)
+                && self.direct_recvs.iter().all(Option::is_none)
             {
                 break;
             }
@@ -4011,6 +4123,15 @@ impl Driver {
                                     self.send_copy_pool.release(pool_slot);
                                 }
                             }
+                        }
+                    }
+                    // The cancel lead ended the receive; the kernel is done
+                    // with the buffer.
+                    OpTag::RecvDirect => {
+                        let slot = ud.payload() as usize;
+                        if self.direct_recvs.get(slot).is_some_and(Option::is_some) {
+                            self.direct_recvs[slot] = None;
+                            self.direct_recv_free.push(slot as u32);
                         }
                     }
                     OpTag::Close => {

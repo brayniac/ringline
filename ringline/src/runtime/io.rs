@@ -615,6 +615,7 @@ pub fn connect(addr: SocketAddr) -> TcpConnect {
         addr,
         server_name: None,
         timeout: None,
+        recv_direct: false,
     }
 }
 
@@ -650,6 +651,7 @@ pub struct TcpConnect {
     addr: SocketAddr,
     server_name: Option<String>,
     timeout: Option<Duration>,
+    recv_direct: bool,
 }
 
 impl TcpConnect {
@@ -673,6 +675,53 @@ impl TcpConnect {
     /// immediately rather than meaning "no timeout"; omit the call for that.
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
+        self
+    }
+
+    /// Receive into this connection's own accumulator instead of the
+    /// worker's provided-buffer ring (io_uring only).
+    ///
+    /// When a read parks (`with_data`, `with_bytes`, `recv_ready`, or a
+    /// [`ConnStream`](crate::ConnStream) read), the runtime submits a
+    /// one-shot receive whose destination is the free space of the
+    /// connection's accumulator, so the received bytes are not copied out of
+    /// a ring buffer. The receive asks for all the free space. With nothing
+    /// buffered, the connection receives into its own buffer of
+    /// [`ConfigBuilder::recv_direct_region`](crate::ConfigBuilder::recv_direct_region)
+    /// bytes, or of the initial accumulator capacity if that is larger and at
+    /// most twice the region. With part of a message buffered, the buffer grows when less
+    /// than the parser's [`ParseResult::NeedAtLeast`] value, or less than
+    /// half of `recv_direct_region`, is free: to hold the rest of the message
+    /// when that value is at least `recv_direct_region`, and otherwise to the
+    /// larger of the receive size and the buffered bytes plus
+    /// `recv_direct_region`. The receive size is `recv_direct_region`, or for
+    /// a connection whose largest [`ParseResult::Consumed`] value from
+    /// `with_data` or `with_bytes` so far is `m`, the larger of
+    /// `recv_direct_region` and `min(4m, m + 4 * recv_direct_region)`. A
+    /// buffer larger than the connection's own is borrowed from the worker's
+    /// free buffers
+    /// ([`ConfigBuilder::recv_direct_pool_max`](crate::ConfigBuilder::recv_direct_pool_max)).
+    ///
+    /// `try_with_data` does not park or arm a receive. While a receive is in
+    /// flight, for example after a parked read was dropped, the buffered
+    /// bytes are in that receive's buffer and `try_with_data` returns
+    /// `None`.
+    ///
+    /// The reads that use the provided-buffer ring are refused on a direct
+    /// connection: `segments`, `recv_owned_segment`, `with_segments`,
+    /// `with_bytes_segments`, `forward_to`, `forward_to_conn` and
+    /// `forward_held` return [`io::ErrorKind::Unsupported`],
+    /// `enable_recv_forward` does nothing, and `run_direct_echo` resolves at
+    /// once.
+    ///
+    /// Ignored on the mio backend.
+    ///
+    /// # Errors
+    ///
+    /// Together with [`tls`](Self::tls), the connect fails with
+    /// [`io::ErrorKind::Unsupported`].
+    pub fn recv_direct(mut self, enabled: bool) -> Self {
+        self.recv_direct = enabled;
         self
     }
 }
@@ -707,6 +756,7 @@ impl std::future::IntoFuture for TcpConnect {
                 target: ConnectTarget::Tcp {
                     addr: self.addr,
                     server_name: self.server_name,
+                    recv_direct: self.recv_direct,
                 },
                 timeout: self.timeout,
             },
@@ -733,6 +783,7 @@ enum ConnectTarget {
     Tcp {
         addr: SocketAddr,
         server_name: Option<String>,
+        recv_direct: bool,
     },
     Unix {
         path: std::path::PathBuf,
@@ -1726,6 +1777,11 @@ impl ConnCtx {
             if driver.forward_progress[idx].is_some() {
                 return Err(libc::EBUSY);
             }
+            // A direct connection's bytes go to its accumulator, not to a
+            // hold a forward could send from.
+            if is_recv_direct(driver, self.conn_index) {
+                return Err(libc::EOPNOTSUPP);
+            }
             // Sink-side refusals: the source is live and no forward owns its
             // hold, so anything already held would be stranded — the provided
             // buffer leaked per attempt that
@@ -2386,10 +2442,14 @@ impl ConnCtx {
     #[cfg(has_io_uring)]
     /// A stale handle is a no-op: this returns `()` and so has no way to
     /// report a refusal, and flipping the flag on a recycled slot would make a
-    /// *different* connection start holding its recv buffers. See #429.
+    /// *different* connection start holding its recv buffers. See #429. On a
+    /// [`recv_direct`](TcpConnect::recv_direct) connection it is also a no-op,
+    /// and [`forward_held`](Self::forward_held) returns `Unsupported`.
     pub fn enable_recv_forward(&self) {
         with_state(|driver, _| {
-            if driver.connections.generation(self.conn_index) != self.generation {
+            if driver.connections.generation(self.conn_index) != self.generation
+                || is_recv_direct(driver, self.conn_index)
+            {
                 return;
             }
             driver.recv_forward[self.conn_index as usize] = true;
@@ -2429,6 +2489,9 @@ impl ConnCtx {
                     io::ErrorKind::NotConnected,
                     "stale connection",
                 ));
+            }
+            if is_recv_direct(driver, conn_index) {
+                return Err(recv_direct_unsupported());
             }
 
             let n = driver.recv_hold[conn_index as usize]
@@ -2861,6 +2924,30 @@ impl ConnCtx {
         })
         .unwrap_or(false)
     }
+
+    /// Whether the connection receives into its accumulator
+    /// ([`TcpConnect::recv_direct`]). The reads that need the provided-buffer
+    /// ring return [`io::ErrorKind::Unsupported`] on such a connection, so a
+    /// caller can check this before sending a request whose reply it would
+    /// read with one of them. Always `false` on the mio backend, outside the
+    /// executor, and once the runtime has released the connection's slot
+    /// after its close completes.
+    pub fn is_recv_direct(&self) -> bool {
+        #[cfg(has_io_uring)]
+        {
+            try_with_state(|driver, _| {
+                driver
+                    .connections
+                    .get(self.conn_index)
+                    .is_some_and(|cs| cs.generation == self.generation && cs.recv_direct)
+            })
+            .unwrap_or(false)
+        }
+        #[cfg(not(has_io_uring))]
+        {
+            false
+        }
+    }
 }
 
 // ── AsyncSendBuilder ─────────────────────────────────────────────────
@@ -3150,6 +3237,47 @@ impl<'a> MioSendBuilder<'a> {
 
 // ── WithDataFuture ───────────────────────────────────────────────────
 
+/// Whether `conn_index` receives directly into its accumulator
+/// (`TcpConnect::recv_direct`). Such a connection has no receive from the
+/// provided-buffer ring, so the reads that hold ring buffers (segments,
+/// forwarding, recv-forward, direct echo) are refused on it.
+#[cfg(has_io_uring)]
+fn is_recv_direct(driver: &Driver, conn_index: u32) -> bool {
+    driver
+        .connections
+        .get(conn_index)
+        .is_some_and(|cs| cs.recv_direct)
+}
+
+/// The error a read that needs the provided-buffer ring returns on a direct
+/// connection.
+#[cfg(has_io_uring)]
+fn recv_direct_unsupported() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        "not supported on a recv_direct connection",
+    )
+}
+
+/// Register the current task as `conn_index`'s receive waiter. On a direct
+/// connection (`TcpConnect::recv_direct`) also arm its receive, which the
+/// caller does only after its parser has seen every buffered byte. `need` is
+/// the parser's `NeedAtLeast` value, if it returned one.
+pub(crate) fn park_recv(
+    #[allow(unused_variables)] driver: &mut Driver,
+    executor: &mut Executor,
+    conn_index: u32,
+    #[allow(unused_variables)] need: Option<usize>,
+) {
+    executor.owner_task[conn_index as usize] = Some(CURRENT_TASK_ID.with(|c| c.get()));
+    executor.recv_waiters[conn_index as usize] = true;
+    #[cfg(has_io_uring)]
+    if driver.arm_direct_recv_or_close(conn_index, need) {
+        // The connection closed instead: poll again to resolve the read.
+        executor.wake_recv(conn_index);
+    }
+}
+
 /// Future returned by [`Connection::with_data`].
 pub struct WithDataFuture<F> {
     conn_index: u32,
@@ -3284,8 +3412,7 @@ impl<F: FnMut(&[u8]) -> ParseResult + Unpin> WithDataFuture<F> {
             }
 
             // No data available — register as recv waiter and park.
-            executor.owner_task[self.conn_index as usize] = Some(CURRENT_TASK_ID.with(|c| c.get()));
-            executor.recv_waiters[self.conn_index as usize] = true;
+            park_recv(driver, executor, self.conn_index, None);
             return Poll::Pending;
         }
 
@@ -3307,6 +3434,8 @@ impl<F: FnMut(&[u8]) -> ParseResult + Unpin> WithDataFuture<F> {
                 driver
                     .accumulators
                     .consume(self.conn_index, consumed.saturating_sub(forwarded));
+                #[cfg(has_io_uring)]
+                driver.accumulators.note_consumed(self.conn_index, consumed);
                 self.f.take();
                 return Poll::Ready(consumed);
             }
@@ -3331,8 +3460,11 @@ impl<F: FnMut(&[u8]) -> ParseResult + Unpin> WithDataFuture<F> {
         }
 
         // Connection still open — wait for more data before retrying.
-        executor.owner_task[self.conn_index as usize] = Some(CURRENT_TASK_ID.with(|c| c.get()));
-        executor.recv_waiters[self.conn_index as usize] = true;
+        let need = match result {
+            ParseResult::NeedAtLeast(additional) => Some(additional),
+            _ => None,
+        };
+        park_recv(driver, executor, self.conn_index, need);
         Poll::Pending
     }
 }
@@ -3462,8 +3594,7 @@ impl<F: FnMut(Bytes) -> ParseResult + Unpin> WithBytesFuture<F> {
                 });
             }
 
-            executor.owner_task[self.conn_index as usize] = Some(CURRENT_TASK_ID.with(|c| c.get()));
-            executor.recv_waiters[self.conn_index as usize] = true;
+            park_recv(driver, executor, self.conn_index, None);
             return Poll::Pending;
         }
 
@@ -3489,7 +3620,20 @@ impl<F: FnMut(Bytes) -> ParseResult + Unpin> WithBytesFuture<F> {
                     driver
                         .accumulators
                         .put_back(self.conn_index, frozen.slice(consumed..));
+                } else {
+                    // A direct connection's next receive reuses this
+                    // allocation if no slice of it is alive by then.
+                    #[cfg(has_io_uring)]
+                    if driver
+                        .connections
+                        .get(self.conn_index)
+                        .is_some_and(|cs| cs.recv_direct)
+                    {
+                        driver.accumulators.keep_spent(self.conn_index, frozen);
+                    }
                 }
+                #[cfg(has_io_uring)]
+                driver.accumulators.note_consumed(self.conn_index, consumed);
                 self.f.take();
                 return Poll::Ready(consumed);
             }
@@ -3511,8 +3655,11 @@ impl<F: FnMut(Bytes) -> ParseResult + Unpin> WithBytesFuture<F> {
             return Poll::Ready(0);
         }
 
-        executor.owner_task[self.conn_index as usize] = Some(CURRENT_TASK_ID.with(|c| c.get()));
-        executor.recv_waiters[self.conn_index as usize] = true;
+        let need = match result {
+            ParseResult::NeedAtLeast(additional) => Some(additional),
+            _ => None,
+        };
+        park_recv(driver, executor, self.conn_index, need);
         Poll::Pending
     }
 }
@@ -3643,6 +3790,11 @@ impl RecvHalf {
     /// See [`ConnCtx::is_alive`].
     pub fn is_alive(&self) -> bool {
         self.conn.is_alive()
+    }
+
+    /// See [`ConnCtx::is_recv_direct`].
+    pub fn is_recv_direct(&self) -> bool {
+        self.conn.is_recv_direct()
     }
 
     /// The underlying handle, for the read-side APIs that are still only on
@@ -4051,6 +4203,11 @@ impl Connection {
     /// See [`ConnCtx::is_alive`].
     pub fn is_alive(&self) -> bool {
         self.tx.is_alive()
+    }
+
+    /// See [`ConnCtx::is_recv_direct`].
+    pub fn is_recv_direct(&self) -> bool {
+        self.rx.is_recv_direct()
     }
 
     /// See [`ConnCtx::peer_addr`].
@@ -4567,6 +4724,9 @@ fn enter_segmented(
     // way (EPIPE); the caller's own poll then resolves to EOF.
     if driver.connections.generation(conn_index) != generation {
         return Err(io::Error::from_raw_os_error(libc::EPIPE));
+    }
+    if is_recv_direct(driver, conn_index) {
+        return Err(recv_direct_unsupported());
     }
     // A running Mode A forward owns this connection's hold, and its
     // `advance_forward` gathers whatever is in front. Adopting the
@@ -5332,6 +5492,10 @@ impl<F: FnMut(&SegChain<'_>) -> SegConsumed + Unpin> Future for WithSegmentsFutu
                 self.f.take();
                 return Poll::Ready(Ok(0));
             }
+            if is_recv_direct(driver, self.conn_index) {
+                self.f.take();
+                return Poll::Ready(Err(recv_direct_unsupported()));
+            }
             let before = arrival_mark(driver, self.conn_index);
             let poll = self.poll_current(driver, executor);
             if let Poll::Ready(ref result) = poll {
@@ -6055,8 +6219,7 @@ impl Future for RecvReadyFuture {
             }
 
             // Not ready — register as recv waiter and park.
-            executor.owner_task[self.conn_index as usize] = Some(CURRENT_TASK_ID.with(|c| c.get()));
-            executor.recv_waiters[self.conn_index as usize] = true;
+            park_recv(driver, executor, self.conn_index, None);
             Poll::Pending
         })
     }
@@ -6467,6 +6630,11 @@ impl Future for DirectEchoFuture {
                 return Poll::Ready(());
             }
 
+            // A direct connection has no ring receive to echo from.
+            if is_recv_direct(driver, self.conn_index) {
+                return Poll::Ready(());
+            }
+
             if !self.armed {
                 // Arm direct-echo mode on the connection.
                 if let Some(cs) = driver.connections.get_mut(self.conn_index) {
@@ -6579,15 +6747,30 @@ impl ConnectFuture {
         driver: &mut crate::backend::Driver,
         executor: &mut crate::runtime::Executor,
     ) -> io::Result<(u32, u32)> {
+        // A TLS connection's received bytes are ciphertext; the plaintext is
+        // copied into the accumulator in any case.
+        if let ConnectTarget::Tcp {
+            server_name: Some(_),
+            recv_direct: true,
+            ..
+        } = target
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "recv_direct is not supported on a TLS connection",
+            ));
+        }
         let mut ctx = driver.make_ctx();
         let token = match target {
             ConnectTarget::Tcp {
                 addr,
                 server_name: Some(name),
+                ..
             } => ctx.start_connect_tls(*addr, name),
             ConnectTarget::Tcp {
                 addr,
                 server_name: None,
+                ..
             } => ctx.start_connect(*addr),
             ConnectTarget::Unix { path } => ctx.start_connect_unix(path.as_path()),
         }
@@ -6595,6 +6778,16 @@ impl ConnectFuture {
         if let Some(timeout) = timeout {
             let ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
             ctx.arm_connect_timeout(token.index, ms);
+        }
+        #[cfg(has_io_uring)]
+        if let ConnectTarget::Tcp {
+            server_name: None,
+            recv_direct: true,
+            ..
+        } = target
+            && let Some(cs) = driver.connections.get_mut(token.index)
+        {
+            cs.recv_direct = true;
         }
         let calling_task = CURRENT_TASK_ID.with(|c| c.get());
         executor.owner_task[token.index as usize] = Some(calling_task);
