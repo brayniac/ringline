@@ -155,6 +155,11 @@ pub struct ConnectionState {
     /// its `Driver::direct_recvs` entry until the completion.
     #[cfg(has_io_uring)]
     pub recv_direct_armed: bool,
+    /// Bytes of the stream in the buffer a direct receive holds, received
+    /// before it was armed. `Driver::recv_buffered` counts them. Zero with no
+    /// direct receive in flight.
+    #[cfg(has_io_uring)]
+    pub recv_direct_held: usize,
 }
 
 impl Default for ConnectionState {
@@ -187,6 +192,8 @@ impl ConnectionState {
             recv_direct: false,
             #[cfg(has_io_uring)]
             recv_direct_armed: false,
+            #[cfg(has_io_uring)]
+            recv_direct_held: 0,
         }
     }
 
@@ -257,6 +264,7 @@ impl ConnectionState {
             self.socket_handed_off = false;
             self.recv_direct = false;
             self.recv_direct_armed = false;
+            self.recv_direct_held = 0;
         }
         self.generation = self.generation.wrapping_add(1);
     }

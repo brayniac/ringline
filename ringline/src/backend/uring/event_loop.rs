@@ -1405,6 +1405,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             && cs.generation == entry.generation
         {
             cs.recv_direct_armed = false;
+            cs.recv_direct_held = 0;
         }
         if !live {
             metrics::RECV_DIRECT.increment(metrics::recv_direct::STALE);

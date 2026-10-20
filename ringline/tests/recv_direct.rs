@@ -617,3 +617,82 @@ fn a_direct_connection_refuses_reads_that_need_the_ring() {
         Ok(())
     );
 }
+
+static READY: Mutex<Option<Result<(), String>>> = Mutex::new(None);
+
+/// Read part of a message, give up on the rest so the direct receive stays
+/// armed with the part in its buffer, then wait with `recv_ready`, which
+/// resolves at once because the part counts as buffered.
+struct ReadyWithPart;
+
+impl AsyncEventHandler for ReadyWithPart {
+    fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        Some(Box::pin(async {
+            let addr = SERVER.lock().unwrap().unwrap();
+            let r = async {
+                let mut conn = ringline::connect(addr)
+                    .recv_direct(true)
+                    .await
+                    .map_err(|e| format!("connect: {e}"))?;
+                let read = ringline::timeout(
+                    Duration::from_millis(300),
+                    conn.with_data(|b| {
+                        if b.len() < 200 {
+                            ParseResult::NeedMore
+                        } else {
+                            ParseResult::Consumed(200)
+                        }
+                    }),
+                )
+                .await;
+                if read.is_ok() {
+                    return Err("the read finished without the rest of the message".into());
+                }
+                ringline::timeout(Duration::from_secs(2), conn.recv_ready())
+                    .await
+                    .map_err(|_| {
+                        "recv_ready did not resolve with part of a message held".to_string()
+                    })
+            }
+            .await;
+            *READY.lock().unwrap() = Some(r);
+            let _ = ringline::request_shutdown();
+        }))
+    }
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
+        async {}
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        ReadyWithPart
+    }
+}
+
+#[test]
+fn recv_ready_counts_the_bytes_a_direct_receive_holds() {
+    let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    *SERVER.lock().unwrap() = Some(listener.local_addr().unwrap());
+    *READY.lock().unwrap() = None;
+    let server = std::thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        s.write_all(&[7u8; 100]).unwrap();
+        // Hold the rest until the client has finished or 5 s have passed.
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let _ = std::io::Read::read(&mut s, &mut [0u8; 1]);
+    });
+    let config = ConfigBuilder::new()
+        .workers(1)
+        .pin_to_core(false)
+        .max_connections(16)
+        .build()
+        .expect("config");
+    let (runtime, handles) = RinglineBuilder::new(config)
+        .launch::<ReadyWithPart>()
+        .expect("launch");
+    common::join_workers(&runtime, handles);
+    server.join().unwrap();
+    assert_eq!(
+        READY.lock().unwrap().take().expect("client did not finish"),
+        Ok(())
+    );
+}

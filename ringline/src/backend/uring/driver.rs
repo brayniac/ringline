@@ -193,7 +193,8 @@ impl Driver {
             self.close_connection(conn_index);
             return true;
         };
-        let ptr = unsafe { buf.as_mut_ptr().add(buf.len()) };
+        let held = buf.len();
+        let ptr = unsafe { buf.as_mut_ptr().add(held) };
         let slot = match self.direct_recv_free.pop() {
             Some(slot) => slot,
             None => {
@@ -220,6 +221,7 @@ impl Driver {
         });
         if let Some(cs) = self.connections.get_mut(conn_index) {
             cs.recv_direct_armed = true;
+            cs.recv_direct_held = held;
         }
         metrics::RECV_DIRECT.increment(metrics::recv_direct::ARMED);
         if known {
@@ -2548,8 +2550,9 @@ impl Driver {
     }
 
     /// Bytes the connection holds that no consumer has taken: the
-    /// accumulator, a lent buffer in `pending_recv_bufs`, `segment_hold` and
-    /// `recv_hold`. A buffer in `segment_pinned` has been handed to a
+    /// accumulator, the bytes in the buffer a direct receive holds
+    /// (`recv_direct_held`), a lent buffer in `pending_recv_bufs`,
+    /// `segment_hold` and `recv_hold`. A buffer in `segment_pinned` has been handed to a
     /// `RecvSegment`, so its bytes are not counted.
     ///
     /// The arrival log takes the first unread stream offset as
@@ -2557,6 +2560,10 @@ impl Driver {
     pub(crate) fn recv_buffered(&self, conn_index: u32) -> usize {
         let idx = conn_index as usize;
         self.accumulators.len(conn_index)
+            + self
+                .connections
+                .get(conn_index)
+                .map_or(0, |c| c.recv_direct_held)
             + self.pending_recv_bufs[idx].map_or(0, |p| p.len as usize)
             + self.segment_hold[idx]
                 .iter()
