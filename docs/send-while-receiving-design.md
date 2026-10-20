@@ -1,6 +1,6 @@
 # Sending while a reply is pending on the redis and memcache clients
 
-Status: proposal. Nothing implemented.
+Status: Option A implemented (`Client::recv_ready`). Option B not implemented.
 
 Related: `docs/connection-handle-ownership-design.md` (the runtime's
 `SendHalf`/`RecvHalf`, and the decision against a shared send handle).

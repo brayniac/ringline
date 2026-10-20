@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `ringline-redis`, `ringline-memcache`: `Client::recv_ready` (and
+  `BinaryClient::recv_ready`) sends buffered `fire_*` requests and returns a
+  future that resolves when bytes of the next reply have arrived or the
+  connection has finished receiving. The future does not borrow the client,
+  so a caller can fire more requests while it waits, and call `recv` once it
+  resolves. Returns `Error::NoPending` with nothing in flight. See
+  `docs/send-while-receiving-design.md`, Option A.
 - `ringline-redis`: `ClientBuilder::get_command` and
   `ClientBuilder::set_command` set the command names a `Client` sends in
   place of `GET` and `SET`. They apply to `fire_get`, the `fire_set*`
@@ -517,6 +524,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- io_uring: `recv_ready` resolves for every byte the driver holds for the
+  connection (`recv_buffered`). It checked only the accumulator and the
+  recv-forward hold, so it stayed pending for a receive lent in place on a
+  connection with an empty accumulator, or held in the segment hold, until a
+  later receive or the close. `RecvReadyFuture::poll` now checks
+  `recv_buffered`, which on mio is the accumulator, as before.
 - `ringline-redis`, `ringline-memcache`, `ringline-ping`:
   `CommandResult::rx_bytes` is 0 for an operation that fails at send. It
   reported the previous operation's byte count. The guarded SET paths

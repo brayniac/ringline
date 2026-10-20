@@ -1958,8 +1958,9 @@ impl ConnCtx {
         })
     }
 
-    /// Returns a future that becomes ready when any recv data is available
-    /// (in the accumulator, recv sink, or connection is closed).
+    /// Returns a future that becomes ready when received bytes are buffered
+    /// for the connection, when a recv sink has received data, or when the
+    /// connection has finished receiving.
     ///
     /// Use this with [`set_recv_sink()`](Self::set_recv_sink) to wait for
     /// direct-to-buffer writes without processing accumulator data.
@@ -3865,7 +3866,16 @@ impl Connection {
         self.rx.with_bytes(f)
     }
 
-    /// See [`Connection::recv_ready`].
+    /// Returns a future that resolves when received bytes are buffered for
+    /// the connection, when a recv sink has received data, or when the
+    /// connection has finished receiving.
+    ///
+    /// The future consumes nothing and does not borrow the connection, so a
+    /// reader started after it resolves sees the same bytes, and dropping it
+    /// loses none. It registers the task that polls it and wakes that task
+    /// by id; it does not use the [`Context`]'s waker. A combinator that
+    /// re-polls only the child whose own waker fired, such as
+    /// `FuturesUnordered`, never re-polls it.
     pub fn recv_ready(&mut self) -> RecvReadyFuture {
         self.rx.recv_ready()
     }
@@ -5997,8 +6007,10 @@ thread_local! {
 
 /// Future returned by [`Connection::recv_ready`]. Resolves when:
 /// 1. The recv sink has received data (`pos > 0`), OR
-/// 2. The accumulator has data, OR
-/// 3. The connection is closed.
+/// 2. The driver holds received bytes for the connection: in the
+///    accumulator, or on io_uring in a lent buffer, the segment hold or the
+///    recv-forward hold, OR
+/// 3. The connection has finished receiving.
 pub struct RecvReadyFuture {
     conn_index: u32,
     /// See `WithDataFuture` for the role of `generation`.
@@ -6022,14 +6034,10 @@ impl Future for RecvReadyFuture {
                 return Poll::Ready(());
             }
 
-            // Check accumulator.
-            if !driver.accumulators.is_empty(self.conn_index) {
-                return Poll::Ready(());
-            }
-
-            // Check the zero-copy recv-forward hold.
-            #[cfg(has_io_uring)]
-            if !driver.recv_hold[self.conn_index as usize].is_empty() {
+            // Bytes the driver holds for the connection: the accumulator, and
+            // on io_uring a lent buffer, the segment hold and the
+            // recv-forward hold.
+            if driver.recv_buffered(self.conn_index) > 0 {
                 return Poll::Ready(());
             }
 

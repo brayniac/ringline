@@ -164,7 +164,9 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use resp_proto::{Request, Value};
-use ringline::{Connection, GuardBox, ParseResult, RecvArrival, RecvHalf, SendGuard, SendHalf};
+use ringline::{
+    Connection, GuardBox, ParseResult, RecvArrival, RecvHalf, RecvReadyFuture, SendGuard, SendHalf,
+};
 
 /// Maximum guards per scatter-gather send (matches ringline core limit).
 const MAX_FLUSH_GUARDS: usize = 8;
@@ -1018,6 +1020,36 @@ impl Client {
         self.buffered_ops = 0;
 
         Ok(())
+    }
+
+    /// Send any buffered `fire_*` requests, then return a future that resolves
+    /// when bytes of the next reply have arrived or the connection has
+    /// finished receiving.
+    ///
+    /// The future consumes nothing and does not borrow the client, so the
+    /// caller can fire more requests while it is pending. A caller that sends
+    /// while a reply is pending waits on this future together with its own
+    /// source of requests: when a request is ready it calls `fire_*` and then
+    /// `recv_ready` again, which flushes; when the future resolves it calls
+    /// [`recv`](Self::recv), which then waits only for the rest of a reply
+    /// that has started arriving. A caller that keeps one future pending
+    /// across fires must call [`flush`](Self::flush) after firing, or a
+    /// buffered request is not sent until the next `recv_ready` or `recv`.
+    ///
+    /// The future registers the task that polls it and does not use the
+    /// `Context`'s waker, so it works in a `poll_fn` or a select that polls
+    /// every branch on each wake, and never resolves under a combinator that
+    /// re-polls only the child whose own waker fired, such as
+    /// `FuturesUnordered`. Dropping it while pending loses no bytes.
+    ///
+    /// Returns `Err(Error::NoPending)` if no request is in flight after the
+    /// flush, and the flush's error if the flush fails.
+    pub fn recv_ready(&mut self) -> Result<RecvReadyFuture, Error> {
+        self.flush()?;
+        if self.pending.is_empty() {
+            return Err(Error::NoPending);
+        }
+        Ok(self.rx.recv_ready())
     }
 
     /// Fire a GET request without waiting for the response.
