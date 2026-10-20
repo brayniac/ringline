@@ -1,0 +1,384 @@
+# segviews-screen.toml with the hosts swapped: the server (Valkey and
+# memcached) runs on z2 (Zen 2, 7 CCX slots, 28 cores) and the client on z1
+# (Zen 1, 3 CCX slots, 12 cores) with 12 client threads, one per core, so
+# that the client, not the server or the link, limits throughput in more
+# cells. Everything else is as in segviews-screen.toml; its notes follow and
+# describe the unswapped hosts.
+#
+# Step 5, stage 1 of docs/recv-segment-views-design.md: screen cachecannon A
+# against B (experiments/segviews-build.toml), the client under test, on one
+# kernel and one host pair.
+#
+# Server: Valkey (RESP) and memcached on z1, the same for both builds.
+# Client: cachecannon on z2, 16 threads, 1,000 connections, GET only,
+# read_values on. Both VMs boot the current debian-13-ci image; each logs its
+# kernel (uname -r).
+#
+# Cells: RESP and memcache text GET at value sizes 64 B, 4 KiB, 8 KiB and
+# 64 KiB, pipeline depth 1 and 16, and 1 MiB at depth 1 (depth 16 would hold
+# 16 GB in flight). 18 cells.
+#
+# phase = saturate: build A only, no rate limit, one pass: each cell's
+#   throughput, from which the fixed-rate pass takes 70%.
+# phase = fixed: builds A, B and A again (the A/A pair), in an order that
+#   rotates with rep, each at the cell's rate from `rates`
+#   ("resp-v64-d1=123456,..."). Submit with rep = 1, 2, 3.
+# phase = latency, cpu or profile: the cells named in `rates`, at those
+#   rates, in the build order `order` (for example "a b a b a b"). Set
+#   `connections` to change the load. With profile = "1" the client records
+#   a system-wide perf profile with call graphs for `profile_secs` seconds,
+#   starting `profile_delay` seconds into each run, and keeps in
+#   results/prof: samples by process and DSO for the whole VM, ringline's
+#   worker threads by symbol, and the worker threads' full call stacks
+#   folded one per line (root first, then the sample count), gzipped.
+#   Profile with the frame-pointer build (segviews-build.toml with
+#   rustflags = "-C force-frame-pointers=yes"); sampling costs CPU, so a
+#   profiled run's CPU time and latency are not measurements.
+#
+# Builds in `order`: a and b use cachecannon's default receive ring, plain
+# 256 x 16 KiB. ai and bi are the same binaries with an incremental ring of
+# 64 x 1 MiB (general.recv_incremental); ringline uses a plain ring of that
+# geometry on a kernel without incremental rings, and RECV_RING's first two
+# counters say which ring each worker got. c, c0 and c1 run cachecannon-c, which
+# is A with ringline's direct receive (TcpConnect::recv_direct): c receives
+# directly into each connection's accumulator (general.recv_direct), c0 uses
+# A's multishot ring receives, and c1 one-shot ring receives
+# (general.recv_multishot = false), the control for the extra submissions of
+# one-shot receives.
+#
+# Two more cells run when `rates` names them, after the others:
+#   memcache-v1048576-d1-idle: 1 MiB values at a rate low enough that most
+#     connections are idle after a large value (peak RSS shows what an idle
+#     connection holds).
+#   memcache-mixed-d1, memcache-mixed-d16: all 400 keys written at 1 MiB, then
+#     the first 300 at 4 KiB, so a quarter of GETs return 1 MiB and a
+#     connection keeps moving between small and large values.
+#
+# Each run records cachecannon's JSON result, its parquet metrics (ringline's
+# RECV_RING copy and view counters among them), user and system CPU and peak
+# RSS from /usr/bin/time, and, halfway through the measured period, the
+# process's RSS and AnonHugePages (results/<run>.smaps). The client logs its
+# transparent huge page mode. Keys are written once per protocol and value
+# size by a prefill run that is not measured.
+name = "segviews screen flipped {phase} rep{rep}"
+
+[params]
+bins_artifact  = "SET_AT_SUBMIT"
+phase          = "saturate"
+rep            = "1"
+rates          = ""
+image          = "debian-13-ci"
+server_ip      = "172.31.0.1"
+client_ip      = "172.31.0.2"
+client_threads = "12"
+connections    = "1000"
+warmup         = "10s"
+duration       = "40s"
+order          = ""
+profile        = "0"
+profile_delay  = "15"
+profile_secs   = "20"
+
+[[jobs]]
+name = "server"
+tags = ["z2.baremetal"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "start"
+shape = "z2.c"
+image = "{image}"
+gpu = false
+data_address = "{server_ip}/24"
+boot_timeout = 600
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "exec"
+payload_timeout = 1200
+payload = '''
+set -uo pipefail
+cat /etc/anvil-instance.json
+uname -r
+sudo sysctl -w net.core.somaxconn=65535 net.ipv4.tcp_max_syn_backlog=65535 net.core.rmem_max=134217728 net.core.wmem_max=134217728
+sudo apt-get update -qq
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq valkey-server memcached >/dev/null || exit 1
+# The packages start their own services on localhost; stop them. The bench
+# servers run as units named bench-*, because the packages' unit names
+# (valkey, memcached) are taken.
+sudo systemctl disable --now valkey-server memcached 2>/dev/null || true
+valkey-server --version
+memcached -V
+'''
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "exec"
+detach = true
+unit = "bench-valkey"
+metrics = true
+payload = "ulimit -n 1048576; exec valkey-server --bind {server_ip} --port 6379 --protected-mode no --save '' --appendonly no --io-threads 8 --maxclients 65000"
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "exec"
+detach = true
+unit = "bench-memcached"
+payload = "ulimit -n 1048576; exec memcached -l {server_ip} -p 11211 -t 16 -m 16384 -c 65000 -I 2m -U 0"
+
+[[jobs.steps]]
+type = "barrier"
+name = "server-ready"
+timeout = 1800
+
+[[jobs.steps]]
+type = "barrier"
+name = "bench-done"
+timeout = 14400
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "stop"
+upload = true
+
+[[jobs]]
+name = "client"
+tags = ["z1.baremetal"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "start"
+shape = "z1.c"
+image = "{image}"
+gpu = false
+data_address = "{client_ip}/24"
+boot_timeout = 600
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "exec"
+payload_timeout = 1200
+inputs = [{ artifact = "{bins_artifact}", name = "bins.tgz", dest = "/home/anvil" }]
+payload = '''
+set -uo pipefail
+cd /home/anvil && tar xzf bins.tgz && chmod +x out/*
+( cd out && sha256sum * )
+cat /etc/anvil-instance.json; echo
+uname -r
+free -m
+nproc
+sudo sysctl -w net.core.rmem_max=134217728 net.core.wmem_max=134217728 net.ipv4.ip_local_port_range="1024 65535"
+echo "thp enabled: $(cat /sys/kernel/mm/transparent_hugepage/enabled)"
+echo "thp defrag: $(cat /sys/kernel/mm/transparent_hugepage/defrag)"
+sudo apt-get update -qq
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq time >/dev/null || exit 1
+if [ "{profile}" = "1" ]; then
+  sudo sysctl -w kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
+  # libc6-dbg names libc's memmove variants, which are otherwise unresolved.
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq linux-perf libc6-dbg >/dev/null || exit 1
+  perf --version
+fi
+'''
+
+[[jobs.steps]]
+type = "barrier"
+name = "server-ready"
+timeout = 1800
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "exec"
+metrics = true
+upload = true
+artifacts = ["/home/anvil/results.tgz"]
+payload_timeout = 14000
+payload = '''
+set -uo pipefail
+cd /home/anvil
+mkdir -p results/prof
+ulimit -n 1048576
+# Linux 6.14+ charges io_uring rings to RLIMIT_MEMLOCK; harmless before.
+ulimit -l unlimited 2>/dev/null || sudo prlimit --memlock=unlimited:unlimited --pid $$
+echo "client-limits memlock=$(ulimit -l) nofile=$(ulimit -n)"
+for port in 6379 11211; do
+  for i in $(seq 1 120); do
+    (exec 3<>/dev/tcp/{server_ip}/$port) 2>/dev/null && { exec 3>&-; echo "port $port reachable after $i s"; break; }
+    sleep 1
+  done
+done
+
+case "{phase}" in
+  saturate) order="a" ;;
+  fixed)
+    case "{rep}" in
+      1) order="a b a2" ;;
+      2) order="b a2 a" ;;
+      *) order="a2 a b" ;;
+    esac ;;
+  latency|cpu|profile) order="{order}" ;;
+  *) echo "BAD PHASE {phase}"; exit 1 ;;
+esac
+[ -n "$order" ] || { echo "NO ORDER for phase {phase}"; exit 1; }
+echo "phase={phase} rep={rep} order=$order"
+
+# config FILE PROTO PORT VLEN KEYS DEPTH RATE PREFILL DURATION WARMUP PARQUET RECV
+# RECV: plain, inc (incremental ring), direct, or oneshot (one-shot ring
+# receives).
+config() {
+  local file=$1 proto=$2 port=$3 vlen=$4 keys=$5 depth=$6 rate=$7 prefill=$8 dur=$9
+  shift 9
+  local warm=$1 parquet=$2 recv=$3
+  local rate_line="" prefill_line="prefill = false" ring_lines=""
+  [ -n "$rate" ] && rate_line="rate_limit = $rate"
+  [ "$prefill" = true ] && prefill_line=$'prefill = true\nprefill_settle = "0s"'
+  case $recv in
+    inc) ring_lines=$'recv_incremental = true\nrecv_ring_size = 64\nrecv_buffer_size = 1048576' ;;
+    direct) ring_lines='recv_direct = true' ;;
+    oneshot) ring_lines='recv_multishot = false' ;;
+  esac
+  cat > "$file" <<CFG
+[general]
+duration = "$dur"
+warmup = "$warm"
+threads = {client_threads}
+ringline_diag = true
+$ring_lines
+
+[target]
+endpoints = ["{server_ip}:$port"]
+protocol = "$proto"
+
+[connection]
+connections = {connections}
+pipeline_depth = $depth
+connect_timeout = "10s"
+request_timeout = "5s"
+
+[workload]
+read_values = true
+$rate_line
+$prefill_line
+
+[workload.keyspace]
+length = 16
+count = $keys
+distribution = "uniform"
+
+[workload.commands]
+get = 100
+
+[workload.values]
+length = $vlen
+
+[admin]
+format = "json"
+parquet = "$parquet"
+CFG
+}
+
+# run_cell CELL PROTO PORT VLEN KEYS DEPTH: run every build in `order` on
+# one cell at its rate from `rates`; skip the cell when `rates` has none
+# (saturate runs every cell unlimited).
+run_cell() {
+  local cell=$1 proto=$2 port=$3 vlen=$4 keys=$5 depth=$6
+  local rate="" seen=" " b bin recv n run pid rc shown_rate half
+  if [ "{phase}" != saturate ]; then
+    rate=$(echo "{rates}" | tr ',' '\n' | grep "^$cell=" | cut -d= -f2)
+    if [ -z "$rate" ]; then
+      [ "{phase}" = fixed ] && echo "NO RATE for $cell"
+      return
+    fi
+  fi
+  # A build named twice in `order` runs twice; the second run is <b>2,
+  # the third <b>3, and so on.
+  seen=" "
+  for b in $order; do
+    case $b in b*) bin=out/cachecannon-b ;; c*) bin=out/cachecannon-c ;; *) bin=out/cachecannon-a ;; esac
+    case $b in ?i*) recv=inc ;; c) recv=direct ;; c1) recv=oneshot ;; *) recv=plain ;; esac
+    n=$(echo "$seen" | tr ' ' '\n' | grep -c "^$b$")
+    seen="$seen$b "
+    run="$cell-$b"
+    [ "$n" -gt 0 ] && run="$cell-$b$((n + 1))"
+    config results/$run.toml $proto $port $vlen $keys $depth "$rate" false {duration} {warmup} results/$run.parquet $recv
+    /usr/bin/time -f "time user_s=%U sys_s=%S maxrss_kb=%M" -o results/$run.time \
+      $bin results/$run.toml > results/$run.json 2> results/$run.log &
+    pid=$!
+    # RSS and huge pages halfway through the measured period.
+    half=$(( $(echo {warmup} | tr -d s) + $(echo {duration} | tr -d s) / 2 ))
+    ( sleep $half; c=$(pgrep -P $pid | head -1); [ -n "$c" ] && grep -E '^(Rss|AnonHugePages):' /proc/$c/smaps_rollup > results/$run.smaps ) &
+    if [ "{profile}" = "1" ]; then
+      sleep {profile_delay}
+      sudo perf record -a -g -F 499 -o results/prof/$run.data -- sleep {profile_secs} 2> results/prof/$run.err
+      sudo perf report -i results/prof/$run.data --stdio --no-children --sort comm,dso 2>/dev/null | grep -v '^#' | grep -v '^$' | head -40 > results/prof/$run-dso.txt
+      sudo perf report -i results/prof/$run.data --stdio --no-children --comm ringline-worker --sort sym -g none --percent-limit 0.05 2>/dev/null | grep -v '^#' | grep -v '^$' | head -600 > results/prof/$run-self.txt
+      # Fold each worker sample's call stack into one line, root first:
+      # perf script prints a header line per sample, then one
+      # tab-indented frame per line, leaf first, then a blank line.
+      sudo perf script -i results/prof/$run.data --comms ringline-worker -F comm,ip,sym,dso --no-inline 2>/dev/null | awk '
+        function emit(  k, line) { line = "ringline-worker"; for (k = n - 1; k >= 0; k--) line = line ";" f[k]; c[line]++; n = 0 }
+        /^\t/ { s = $2; for (i = 3; i < NF; i++) s = s " " $i; if (s == "[unknown]") s = $NF "?"; gsub(/;/, ":", s); f[n++] = s; next }
+        /^$/ { if (n) emit(); next }
+        { if (n) emit() }
+        END { if (n) emit(); for (l in c) print l, c[l] }' | gzip > results/prof/$run-folded.txt.gz
+      echo "folded stacks: $(zcat results/prof/$run-folded.txt.gz | wc -l) distinct, $(zcat results/prof/$run-folded.txt.gz | awk '{ t += $NF } END { print t }') samples"
+      sudo rm -f results/prof/$run.data
+      echo "-- profile $run"; head -8 results/prof/$run-dso.txt
+    fi
+    wait $pid
+    rc=$?
+    shown_rate=$rate; [ -n "$shown_rate" ] || shown_rate=max
+    echo "== phase={phase} rep={rep} cell=$cell build=$b rate=$shown_rate rc=$rc $(cat results/$run.time)"
+    grep '"type":"result"' results/$run.json || { echo "NO RESULT"; tail -5 results/$run.log; }
+    sleep 3
+  done
+}
+
+for proto in resp memcache; do
+  case $proto in resp) port=6379;; memcache) port=11211;; esac
+  for vlen in 64 4096 8192 65536 1048576; do
+    case $vlen in
+      64) keys=1000000; depths="1 16";;
+      4096) keys=100000; depths="1 16";;
+      8192) keys=50000; depths="1 16";;
+      65536) keys=5000; depths="1 16";;
+      1048576) keys=400; depths="1";;
+    esac
+    # Write every key once; not measured. A bins artifact without
+    # cachecannon-a (a profiling build of c only) prefills with
+    # cachecannon-c on the plain ring.
+    config results/prefill-$proto-v$vlen.toml $proto $port $vlen $keys 1 "" true 1s 0s results/prefill-$proto-v$vlen.parquet plain
+    prefill_bin=out/cachecannon-a; [ -x $prefill_bin ] || prefill_bin=out/cachecannon-c
+    ./$prefill_bin results/prefill-$proto-v$vlen.toml > results/prefill-$proto-v$vlen.json 2> results/prefill-$proto-v$vlen.log
+    echo "== prefill $proto v$vlen rc=$?"
+    for depth in $depths; do
+      run_cell "$proto-v$vlen-d$depth" $proto $port $vlen $keys $depth
+    done
+  done
+done
+
+if echo "{rates}" | tr ',' '\n' | grep -q "^memcache-v1048576-d1-idle="; then
+  run_cell memcache-v1048576-d1-idle memcache 11211 1048576 400 1
+fi
+if echo "{rates}" | tr ',' '\n' | grep -q "^memcache-mixed-"; then
+  config results/prefill-mixed-large.toml memcache 11211 1048576 400 1 "" true 1s 0s results/prefill-mixed-large.parquet plain
+  ./$prefill_bin results/prefill-mixed-large.toml > results/prefill-mixed-large.json 2> results/prefill-mixed-large.log
+  echo "== prefill mixed 400 x 1 MiB rc=$?"
+  config results/prefill-mixed-small.toml memcache 11211 4096 300 1 "" true 1s 0s results/prefill-mixed-small.parquet plain
+  ./$prefill_bin results/prefill-mixed-small.toml > results/prefill-mixed-small.json 2> results/prefill-mixed-small.log
+  echo "== prefill mixed first 300 x 4 KiB rc=$?"
+  for depth in 1 16; do
+    run_cell memcache-mixed-d$depth memcache 11211 4096 400 $depth
+  done
+fi
+tar czf /home/anvil/results.tgz -C /home/anvil results
+exit 0
+'''
+
+[[jobs.steps]]
+type = "barrier"
+name = "bench-done"
+timeout = 14400
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "stop"
