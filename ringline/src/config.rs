@@ -1125,10 +1125,12 @@ impl ConfigBuilder {
     /// connections to borrow. A direct connection receiving a message larger
     /// than [`recv_direct_region`](Self::recv_direct_region) borrows a buffer
     /// of at least 64 KiB, the smallest free one that fits, and gives it back
-    /// when nothing is buffered and no value read from it is alive. A buffer
-    /// given back when the free buffers already hold this many bytes is
-    /// freed, so a workload with values of 100 MiB reuses their buffers only
-    /// with this above 100 MiB. Defaults to 16 MiB.
+    /// when nothing is buffered and no value read from it is alive. When a
+    /// buffer given back does not fit under this many bytes, the largest
+    /// free buffers larger than it are freed to make room; if that is not
+    /// enough, it is freed instead. A buffer larger than this is never kept,
+    /// so a workload with values of 100 MiB reuses their buffers only with
+    /// this above 100 MiB. Defaults to 16 MiB.
     pub fn recv_direct_pool_max(mut self, bytes: usize) -> Self {
         self.config.recv_direct_pool_max = bytes;
         self

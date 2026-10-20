@@ -1,8 +1,8 @@
 # Direct receive: one-shot receives into the connection's accumulator
 
-Status: prototype on `feat/recv-direct`, measured; owner decisions made
-(see Decisions). Open: the measurement of the 64 B fix (build C3) and the
-scale run.
+Status: on `feat/recv-direct`, measured through build C8; owner decisions
+made (see Decisions). Open: the scale run, and the last runs of build C8
+(see Landing).
 
 Related: `docs/recv-buffering-approaches.md` ("One-shot receive into
 connection-owned memory", "Per-connection rings"),
@@ -87,13 +87,90 @@ received:
   and glibc trimmed the thread's heap on the free (see "Reusing a consumed
   buffer"). Counted on loopback with an `LD_PRELOAD` allocator shim: 92,594
   allocations of 32 KiB or more in 66,315 direct receives, against 641 on the
-  ring. The fix is commit 06c6c43; build C3 measures it.
+  ring. Commit 06c6c43 fixed it: in build C3, `c` at memcache 64 B was 1.004
+  of `c0`'s CPU, mean of three runs (`01a1556b-604f-710c-e4bc-1f4aaa2ee165`,
+  `01a1556b-60d2-716b-893f-80d6a1500614`,
+  `01a1556b-6146-7100-d5c4-9bfde714bafe`).
 - p50 and p99 are unchanged within run-to-run spread, except memcache 64 B
   p50, which rose from about 400 µs to about 430 µs.
 - Peak RSS: 510 MiB lower than A at memcache 1 MiB, 945 MiB higher at RESP
   1 MiB, within 60 MiB elsewhere.
 - No completion arrived for a closed connection (`STALE` 0), and the bytes
   the direct receives counted equal the bytes received.
+
+### The pool (builds C5 to C8)
+
+Build C5 is ringline ff61e77: the per-worker pool, a 32 KiB own buffer, no
+`MSG_WAITALL`. Its screen adds two cells: 1 MiB values at 100 requests per
+second, which leaves most connections idle after a large value, and mixed
+values, where all 400 keys hold 1 MiB and then the first 300 are rewritten at
+4 KiB, so a quarter of GETs return 1 MiB. Experiments
+`01a157db-d318-7132-bb08-a01d91b2363e`,
+`01a157db-d38e-71ed-a8ff-f6a91eaee037` and
+`01a157db-d3fd-71b3-f1cc-c584357eb3b1`; mean of three runs:
+
+| Cell | `c` CPU / A | `c` / `c0` | `c` copies | A copies | Peak RSS A | Peak RSS `c` |
+|---|---|---|---|---|---|---|
+| memcache 64 B, depth 16 | 0.992 | 1.008 | 0.000 | 1.01 | 2,412 MiB | 2,368 MiB |
+| RESP 64 B, depth 16 | 0.995 | 0.992 | 0.000 | 1.00 | 2,410 MiB | 2,368 MiB |
+| memcache 4 KiB, depth 1 | 1.007 | 1.006 | 0.000 | 1.35 | 2,410 MiB | 2,367 MiB |
+| memcache 4 KiB, depth 16 | 0.978 | 0.978 | 0.047 | 2.37 | 2,452 MiB | 2,444 MiB |
+| memcache 8 KiB, depth 16 | 0.972 | 0.970 | 0.108 | 2.55 | 2,481 MiB | 2,451 MiB |
+| memcache 64 KiB, depth 1 | 0.982 | 0.984 | 0.454 | 2.07 | 2,494 MiB | 2,542 MiB |
+| memcache 64 KiB, depth 16 | 0.954 | 0.953 | 0.191 | 3.09 | 2,822 MiB | 2,703 MiB |
+| RESP 64 KiB, depth 16 | 0.944 | 0.950 | 0.183 | 2.91 | 2,789 MiB | 2,890 MiB |
+| memcache 1 MiB, depth 1 | 0.936 | 0.935 | 0.028 | 2.86 | 3,921 MiB | 3,566 MiB |
+| RESP 1 MiB, depth 1 | 0.965 | 0.962 | 0.018 | 1.98 | 3,423 MiB | 3,381 MiB |
+| memcache 1 MiB, idle | 0.939 | 0.963 | 0.031 | 3.47 | 3,911 MiB | 3,389 MiB |
+| mixed, depth 1 | 0.932 | 0.935 | 0.029 | 3.18 | 3,935 MiB | 2,947 MiB |
+| mixed, depth 16 | 0.959 | 0.956 | 0.190 | 3.51 | 3,225 MiB | 5,891 MiB |
+
+Every build's client holds about 2.4 GiB, 1.1 GiB of it in huge pages, at
+64 B values, so the differences in the RSS columns are what the receive path
+holds. The client hosts run THP in mode `always` with `defrag` `madvise`.
+
+- 4 KiB depth 16 costs about 1% more than in C3 (0.968). A 64 KiB batch no
+  longer fits the 32 KiB own buffer, so its first part is copied into a
+  borrowed buffer. 64 KiB depth 1 costs about 2.5% more than in C3 (0.956)
+  for the same reason, at 0.45 bytes copied per byte.
+- RESP 1 MiB costs 0.965 against C3's 0.943 (see Known lengths).
+- Mixed values at depth 16 held 2.7 GB more than A, and no borrowed buffer
+  was reused. Diagnostic counters (build C6, `01a159c1-ad72-7117-17a8-5a3f5bb6909c`)
+  showed borrowed buffers averaging 2.4 MiB when given back: a buffer that
+  ran out of room with part of a message of no known length buffered grew by
+  the whole receive size with `BytesMut::reserve`, which doubles the
+  allocation. A few buffers of about 5 MiB filled each worker's 16 MiB of
+  free buffers, no borrow could use them, and every buffer given back after
+  that was freed. Commit c67d328 sizes a grown buffer to the receive size and
+  evicts the largest free buffers (see Buffers).
+
+Build C7 is c67d328 with the diagnostic counters (experiments
+`01a159d3-e857-71bf-0a65-6c6903c6bb6e`,
+`01a159d3-e8ce-718e-c651-340efa5fda70`,
+`01a159d3-e946-7148-afb8-545333526581`). At mixed depth 16, CPU is 0.936 of
+A, peak RSS 4,392 MiB, and every borrow after the warmup reused a free
+buffer. The buffers given back average 2.0 MiB: a connection's first 1 MiB
+value grows by doubling, because no message has set its receive size yet, and
+a borrow accepts a free buffer up to twice the size it needs, so those
+buffers stay in use. Moving partial messages raised copies there from 0.19 to
+0.74 bytes per byte. The other C7 cells match C5 within 1%.
+
+Build C8 is c67d328 without the counters (binaries
+`01a159f3-e054-73af-bc3f-8b6ea08f60b1`).
+
+- Throughput with no rate limit (`01a159f3-edbf-7115-c5dd-6d420d46108d`,
+  `01a159f3-ee2e-71c3-e05d-043c27ea7fee`; a third run lost its client VM):
+  every memcache cell from 4 KiB depth 16 up reaches 37.4 Gb/s with A and with
+  `c`, so the link limits them. memcache throughput of `c` is 0.994 to 1.009
+  of A's in every cell. The RESP cells are limited by Valkey and move by 2 to
+  7% between runs in both directions. At the same throughput `c` uses up to
+  9% less client CPU (memcache 1 MiB: 710 against 642 CPU-seconds).
+- Latency at the C5 rates, one run so far (`01a159f3-ee9e-719d-b861-353068a62e55`):
+  p50 of `c` is at or below A's in 11 of 13 cells, and 2 to 4% lower in the
+  depth-16 cells of 8 KiB and up. p99 of `c` is above A's at memcache 64 B
+  (1,925 against 1,679 µs), RESP 64 B (909 against 692 µs) and RESP 1 MiB
+  (4,653 against 4,014 µs); `c0` falls between them in two of the three, and
+  p99 has moved by up to 15% between runs of one build.
 
 The standalone benchmark's `oneshot` strategy
 (`docs/recv-buffering-approaches.md`) fell behind the shared ring at 1,000
@@ -186,13 +263,19 @@ the pool.
 
 A buffer grows when it holds part of a message and less than the parser's
 `NeedAtLeast` value, or less than half of `recv_direct_region`, is spare. It
-grows by the `NeedAtLeast` value when that is at least `recv_direct_region`,
-and otherwise by the larger of that value and the receive size:
+grows to hold the rest of the message when the `NeedAtLeast` value is at
+least `recv_direct_region`, and otherwise to the larger of the receive size
+and the buffered bytes plus `recv_direct_region`. The receive size is
 `recv_direct_region`, or for a connection whose largest `Consumed` value so
 far is `m`, the larger of `recv_direct_region` and
-`min(4m, m + 4 * recv_direct_region)`. The own buffer grows by borrowing; a
-borrowed buffer grows with `BytesMut::reserve`, which calls `realloc`, and
-glibc grows large allocations with `mremap` without copying their bytes.
+`min(4m, m + 4 * recv_direct_region)`. The own buffer grows by borrowing. A
+borrowed buffer moves the buffered bytes to the front of its allocation when
+that makes room (`BytesMut::try_reclaim`), and otherwise takes a buffer of
+the new size from the pool, copies the buffered bytes into it, and gives the
+old one back. A message longer than any before it on the connection grows
+with `BytesMut::reserve` instead, which doubles the allocation, so a 100 MiB
+value is not copied once per region; glibc grows large allocations with
+`mremap` without copying their bytes.
 
 The pool keeps free buffers by capacity, with no fixed classes. A borrow takes
 the smallest free buffer that holds the message and is at most twice the size
@@ -201,8 +284,18 @@ to one of eight steps per power of two up to 2 MiB, and to a multiple of
 2 MiB (a transparent huge page) above that. Messages of nearly the same size
 therefore share buffers, and a 100 MiB value wastes at most 2 MiB. Free
 buffers are kept up to `recv_direct_pool_max` bytes per worker (default
-16 MiB); one given back beyond that is freed. A workload with 100 MiB values
-reuses their buffers only with `recv_direct_pool_max` above 100 MiB.
+16 MiB). A buffer given back when there is no room frees the largest free
+buffers that are larger than it until it fits; if they are not enough, it is
+freed itself. A buffer larger than `recv_direct_pool_max` is never kept, so a
+workload with 100 MiB values reuses their buffers only with
+`recv_direct_pool_max` above 100 MiB.
+
+A buffer recovered from a consumed view starts where that view started, so
+its `capacity()` leaves out the bytes before it. `put` moves its start back
+to the start of the allocation (`try_reclaim`) before keeping it; without
+that, a buffer that had held several messages measured under 64 KiB and was
+freed, and every batch of 16 × 4 KiB allocated a new one (C5's 1.94 million
+allocations per run before ff61e77, 0 after).
 
 A receive that ends inside a message leaves that part to be moved to the
 front of the buffer at the next growth. Sizing receives to several messages
@@ -214,19 +307,20 @@ copied 0.011.
 
 Before the pool, a connection kept the largest buffer it had grown to until
 it closed. That is the 945 MiB RSS increase measured at RESP 1 MiB with 1,000
-connections, and it would have been about 20 GiB at 16,000.
+connections in build C, and it would have been about 20 GiB at 16,000.
 
 `tests/recv_direct_alloc.rs` reads request-response batches of 16 × 60 B,
-1 × 64 KiB, 4 × 64 KiB and 1 × 1 MiB messages: after four warmup batches,
-none allocates 32 KiB or more. With the pool keeping nothing, 1 × 64 KiB
-makes 196 such allocations in 200 batches.
+1 × 64 KiB, 4 × 64 KiB, 1 × 1 MiB, 16 × 4 KiB and 16 × 8 KiB messages: after
+four warmup batches, none allocates 32 KiB or more. With the pool keeping
+nothing, 1 × 64 KiB makes 196 such allocations in 200 batches, and so do
+16 × 4 KiB without the `try_reclaim` in `put`.
 
 In THP mode `always`, the kernel backs each aligned 2 MiB range inside a large
 borrowed buffer with a huge page at first touch, so a contiguous buffer gets
-huge pages without being split into 2 MiB chunks. Mode `madvise` would need
-`MADV_HUGEPAGE` on borrowed buffers, which under `defrag=madvise` compacts
-memory at fault time. Which mode the measurement hosts use is not recorded
-yet.
+huge pages without being split into 2 MiB chunks. A buffer of about 1.1 MiB
+contains no aligned 2 MiB range, so at 1 MiB values `c` holds no more huge
+pages than A. Mode `madvise` would need `MADV_HUGEPAGE` on borrowed buffers,
+which under `defrag=madvise` compacts memory at fault time.
 
 A chain of 2 MiB chunks would need no size classes, but a message spanning
 chunks is not contiguous, so `with_bytes` could not hand it to the parser
@@ -260,7 +354,9 @@ returns the partial byte count without the error.
 In the build C screen only RESP 1 MiB had a known length (about 45,000 such
 receives per run, then with `MSG_WAITALL`). memcache 1 MiB copied 0 bytes per
 byte without a length, because receives sized by the largest message hold
-whole values.
+whole values. Without `MSG_WAITALL`, RESP 1 MiB takes about 27 completions
+per value, each of which wakes the reader, and costs 0.965 of A's CPU (C5)
+against 0.943 with it (C3).
 
 ### Accumulator cap
 
@@ -357,18 +453,25 @@ allocated because none fit). Copies on a direct connection still count in
     `ConnectionReset`.
   - Every refusal listed above, the TLS connect refusal, and a `with_data`
     read on the same connection afterwards.
+  - `recv_ready` resolves at once when a read gave up with part of a message
+    held in the buffer of an armed receive (fails when `recv_buffered` does
+    not count `recv_direct_held`).
 
   Dropping one received byte fails the first three tests. The overestimate,
   reset and refusal tests fail against the `MSG_WAITALL` version.
 - `tests/recv_direct_alloc.rs` (its own binary, for the counting global
-  allocator): request-response batches of small, 64 KiB and 1 MiB messages
-  make fewer than one allocation of 32 KiB or more per 20 batches after the
-  warmup (see Buffers).
+  allocator): request-response batches of small, 64 KiB, 1 MiB and
+  16 × 4 KiB and 16 × 8 KiB messages make fewer than one allocation of
+  32 KiB or more per 20 batches after the warmup (see Buffers).
 - `accumulator.rs` unit tests: borrowed sizes round to the steps and to
   2 MiB; the pool reuses a fitting buffer, refuses one more than twice the
-  size, and keeps no more than its cap; a connection returns its borrowed
+  size, keeps no more than its cap, gives a smaller buffer room by freeing the
+  largest free one, and frees a larger one; a connection returns its borrowed
   buffer once nothing is buffered and borrows the same one for the next
-  large message. Both pool tests fail when the pool keeps nothing.
+  large message; a borrowed buffer holding a 1 MiB message, three 4 KiB
+  messages and the start of the next 1 MiB message grows to the receive size
+  in place (fails against `reserve`, which grows it to 1.49 MiB). Both pool
+  tests fail when the pool keeps nothing.
 - `tests/recv_direct_copies.rs` (its own binary, for the process-wide
   counters): 70,000-byte messages in 64 KiB and 1 MiB writes copy at most a
   quarter of a byte per byte received; 500 B messages at most 1/20; 1 MiB
@@ -385,18 +488,22 @@ Not tested: worker exit with a receive armed.
 
 ## Landing
 
-1. Measure the 64 B fix (build C3) against A and `c0`.
-2. Measure the pool (build C4, this branch): the C screen plus a cell with
-   mixed value sizes and a cell that leaves connections idle after large
-   values, with peak RSS and the hosts' THP mode recorded.
-3. A scale run: 16 workers with 4,000 and 16,000 connections, cells up to
+Done: the 64 B fix (C3), the pool (C5), its growth and eviction fix (C7),
+throughput and latency of the commit (C8).
+
+1. PR for the runtime change and the `PoolConfig` option, with a fresh
+   review, before the remaining C8 runs: latency runs 2 and 3
+   (`01a159f3-ef0a-71ed-fef5-60c8b2cad632`,
+   `01a159f3-ef74-71da-d9a7-9f3283f547b1`) and throughput with the client on
+   the smaller host (`experiments/segviews-screen-flip.toml`: client on Zen 1
+   with 12 threads, servers on Zen 2), where more cells are limited by the
+   client. Their results go into this section before the merge.
+2. A scale run: 16 workers with 4,000 and 16,000 connections, cells up to
    64 KiB. With 1 MiB values at depth 1, almost every connection is partway
    through a value, so 16,000 connections would hold about 16 GiB of
    borrowed buffers, as the ring path's accumulators would.
-4. PR for the runtime change and the `PoolConfig` option, with a fresh
-   review.
-5. `ShardedConfig` and `ClusterConfig` option in the next breaking release.
-6. mio: read plaintext connections into the accumulator (separate PR).
+3. `ShardedConfig` and `ClusterConfig` option in the next breaking release.
+4. mio: read plaintext connections into the accumulator (separate PR).
 
 ## Decisions
 
@@ -415,16 +522,24 @@ Made by the owner on 2026-10-19:
 6. Segment views: the client switch on `feat/segment-clients` and the proto
    releases it needs are not pursued.
 
+Made by the owner on 2026-10-20:
+
+7. Accept the cost of no `MSG_WAITALL` at RESP 1 MiB (0.965 of A's CPU
+   against 0.943).
+8. Keep the borrow fit at twice the size: at mixed depth 16 a tighter fit
+   would save about 0.8 GB of the 4.4 GB, which is not worth more early
+   allocations.
+9. Open the PR on the C8 results so far, assuming the remaining runs agree.
+
 Open: whether the scanner PRs in `resp-proto` and `memcache-proto` are
 closed or merged without a release.
 
 ## Not known
 
-- Whether 06c6c43 removes all of the 64 B regression (C3 pending).
-- What the 32 KiB own buffer costs where a pipelined batch is a little larger
-  than it: at memcache 4 KiB depth 16 a batch is about 64 KiB, and the first
-  32 KiB of each batch may be copied into a borrowed buffer.
-- Whether the measurement hosts run THP in mode `always`.
+- Whether `c`'s higher p99 in three cells of the first C8 latency run
+  (memcache 64 B, RESP 64 B, RESP 1 MiB) holds over three runs.
+- Whether `c` raises throughput where the client, not the link or the
+  server, is the limit (the flipped-host runs).
 - Behaviour above 63 connections per worker.
 - Whether a cancelled direct receive can still be in flight when the worker
   exit bound runs out.
