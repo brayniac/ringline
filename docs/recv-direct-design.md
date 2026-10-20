@@ -185,19 +185,25 @@ Build C8 is c67d328 without the counters (binaries
   The first three are 1 to 9% higher; RESP 64 B is 12 to 31% higher, in a
   cell where A's own p99 varies by 75% between runs. In the other nine
   cells `c`'s p99 is above A's in at most two runs.
-- Throughput with the client limited (`experiments/segviews-screen-flip.toml`:
-  client on the Zen 1 host with 12 threads, servers on the Zen 2 host), one
-  run (`01a15aad-c9c5-7104-23a5-5be594d89ccd`): A's client uses about
-  600 CPU-seconds, all 12 threads for the 50 s run, in every cell but
-  RESP 64 B. `c`'s throughput relative to A is 1.098 at memcache 4 KiB
-  depth 16, 1.100 at 8 KiB depth 16, 1.058 at 64 KiB depth 1, 1.026 at
-  64 KiB depth 16, 1.029 at 1 MiB, 1.045 at RESP 64 KiB depth 16, 1.121 at
-  RESP 1 MiB and 1.032 at memcache 64 B depth 16. At memcache 4 KiB depth 1
-  it is 0.998, and at RESP 64 B, which Valkey limits (the client uses 130
-  CPU-seconds), 0.943. The gains at 4 KiB and 8 KiB depth 16 are larger than
-  `c`'s CPU saving at a fixed rate there (2 to 3%); I do not know why.
-  Two more runs were cancelled before they started, so this rests on one
-  run.
+- Throughput with the hosts swapped (`experiments/segviews-screen-flip.toml`
+  on `feat/segment-clients`: client on the Zen 1 host with 12 threads,
+  servers on the Zen 2 host), one run (`01a15aad-c9c5-7104-23a5-5be594d89ccd`).
+  A's client uses 597 to 604 CPU-seconds, all 12 cores for the 50 s of
+  warmup and measurement, in six cells; at memcache 64 KiB depth 16,
+  memcache 1 MiB and RESP 64 KiB depth 16 it uses 542 to 548 at about
+  26 Gb/s, and at RESP 64 B 131. `c`'s throughput relative to A is 1.098 at
+  memcache 4 KiB depth 16, 1.100 at 8 KiB depth 16, 1.058 at 64 KiB depth 1,
+  1.026 at 64 KiB depth 16, 1.029 at 1 MiB, 1.045 at RESP 64 KiB depth 16,
+  1.121 at RESP 1 MiB, 1.032 at memcache 64 B depth 16 and 0.998 at 4 KiB
+  depth 1. At RESP 64 B, which Valkey limits, it is 0.943, within the 2 to 7%
+  the Valkey-limited cells moved between runs above.
+  At 8 KiB depth 16 and in every cell of 64 KiB and up except 64 KiB depth
+  1, `c` stops at 26.4 to 27.0 Gb/s with 474 to 555 CPU-seconds, so its
+  ratios there are bounded by that rate; I do not know what sets it. At
+  4 KiB depth 16, where both builds use all 12 cores, `c`'s throughput is
+  1.098 of A's, more than its CPU saving at a fixed rate there (2%, C5 and
+  C8); I do not know why. Two more runs were cancelled before they started,
+  so this rests on one run.
 
 The standalone benchmark's `oneshot` strategy
 (`docs/recv-buffering-approaches.md`) fell behind the shared ring at 1,000
@@ -592,6 +598,7 @@ Made by the owner on 2026-10-20:
    would save about 0.8 GB of the 4.4 GB, which is not worth more early
    allocations.
 9. Open the PR on the C8 results so far, assuming the remaining runs agree.
+   They did not on p99; see 10.
 10. Merge with `c`'s higher p99 in four cells recorded here, and look for its
     cause afterwards.
 
@@ -601,9 +608,10 @@ closed or merged without a release.
 ## Not known
 
 - Why `c`'s p99 is higher than A's in four cells (Evidence, C8 latency).
-- Why `c`'s throughput gain with the client limited at 4 KiB and 8 KiB
-  depth 16 (about 10%, one run) is larger than its CPU saving there at a
-  fixed rate, and whether more runs agree.
+- Why `c`'s throughput gain at 4 KiB depth 16 with the client limited
+  (about 10%, one run) is larger than its fixed-rate CPU saving, and whether
+  more runs agree.
+- What limits both builds near 27 Gb/s with the hosts swapped.
 - Behaviour above 63 connections per worker.
 - Whether a cancelled direct receive can still be in flight when the worker
   exit bound runs out.
