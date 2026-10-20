@@ -5,6 +5,12 @@
 use bytes::{Bytes, BytesMut};
 
 /// Count `n` bytes copied into receive storage (`recv_ring::BYTES_COPIED`).
+/// Add `n` to a diagnostic `RECV_DIRECT` slot (exp/segviews-c6).
+#[cfg(has_io_uring)]
+fn diag(slot: usize, n: u64) {
+    crate::metrics::RECV_DIRECT.add(slot, n);
+}
+
 pub(crate) fn note_copied(n: usize) {
     if n > 0 {
         crate::metrics::RECV_RING.add(crate::metrics::recv_ring::BYTES_COPIED, n as u64);
@@ -371,6 +377,9 @@ impl DirectPool {
             .range(n..=size.saturating_mul(2))
             .next()
             .map(|(&cap, _)| cap);
+        if fit.is_none() && !self.free.is_empty() {
+            diag(crate::metrics::recv_direct::TAKE_NO_FIT, 1);
+        }
         if let Some(cap) = fit {
             let list = self.free.get_mut(&cap).expect("key from range");
             let buf = list.pop().expect("lists are not left empty");
@@ -398,7 +407,13 @@ impl DirectPool {
         buf.clear();
         let _ = buf.try_reclaim(buf.capacity() + 1);
         let cap = buf.capacity();
-        if cap < DIRECT_BORROW_MIN || cap > self.max_free_bytes {
+        if cap < DIRECT_BORROW_MIN {
+            diag(crate::metrics::recv_direct::PUT_SMALL, 1);
+            return;
+        }
+        diag(crate::metrics::recv_direct::PUT_CAP_BYTES, cap as u64);
+        if cap > self.max_free_bytes {
+            diag(crate::metrics::recv_direct::PUT_FULL, 1);
             return;
         }
         while self.free_bytes + cap > self.max_free_bytes {
@@ -406,8 +421,10 @@ impl DirectPool {
                 break;
             };
             if *largest.key() <= cap {
+                diag(crate::metrics::recv_direct::PUT_FULL, 1);
                 return;
             }
+            diag(crate::metrics::recv_direct::EVICTED, 1);
             let freed = *largest.key();
             largest.get_mut().pop();
             if largest.get().is_empty() {
@@ -626,6 +643,10 @@ impl AccumulatorTable {
         match rem.try_into_mut() {
             Ok(recovered) => acc.buf = recovered,
             Err(rem) => {
+                #[cfg(has_io_uring)]
+                if acc.own.is_some() {
+                    diag(crate::metrics::recv_direct::RECLAIM_COPY_BORROWED, 1);
+                }
                 let mut buf = BytesMut::with_capacity(rem.len().max(acc.reserve_target));
                 buf.extend_from_slice(&rem);
                 note_copied(rem.len());
@@ -681,6 +702,8 @@ impl AccumulatorTable {
             if let Ok(mut recovered) = spent.try_into_mut() {
                 recovered.clear();
                 acc.buf = recovered;
+            } else {
+                diag(crate::metrics::recv_direct::SPENT_FAILED, 1);
             }
         }
         let len = acc.buf.len();
@@ -690,6 +713,10 @@ impl AccumulatorTable {
         }
         if len == 0 {
             if let Some(own) = acc.own.take() {
+                diag(crate::metrics::recv_direct::RETURNED, 1);
+                if acc.buf.capacity() == 0 {
+                    diag(crate::metrics::recv_direct::RETURNED_LOST, 1);
+                }
                 self.direct_pool.put(std::mem::replace(&mut acc.buf, own));
             }
             if acc.buf.capacity() < region {
@@ -702,7 +729,13 @@ impl AccumulatorTable {
         let need = need.unwrap_or(0).min(room);
         let known = need >= region;
         let spare = acc.buf.capacity() - len;
+        if acc.own.is_some() {
+            diag(crate::metrics::recv_direct::BORROWED_PARTIAL, 1);
+        }
         if spare < need || spare < region / 2 {
+            if acc.own.is_some() {
+                diag(crate::metrics::recv_direct::BORROWED_GROW, 1);
+            }
             let m = acc.largest_message;
             let size = region.max(
                 m.saturating_mul(4)
