@@ -1382,14 +1382,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// The payload is the `direct_recvs` entry holding the accumulator
     /// buffer the kernel wrote into. The entry is removed here and only
     /// here. A completion whose connection closed, or whose slot now holds
-    /// another connection, passes the buffer to `recycle_direct`, which
-    /// keeps it in the pool if it is at least 64 KiB and there is room, and
-    /// frees it otherwise. Otherwise the
-    /// buffer goes back into the accumulator with the received bytes behind
-    /// its contents, including on EOF and errors, so the bytes received
-    /// before stay readable. The arrival is recorded before the bytes are
-    /// placed, while `recv_direct_held` still counts the bytes the buffer
-    /// held, as the multishot path records it before appending.
+    /// another connection, passes the buffer to `recycle_direct`: a buffer
+    /// of at least 64 KiB for which `DirectPool::put` finds room stays in
+    /// the pool, and any other is freed. For a live connection, the buffer
+    /// goes back into the accumulator with the received bytes behind its
+    /// contents, including on EOF and errors, so the bytes received before
+    /// stay readable. The arrival is recorded before the bytes are placed,
+    /// while `recv_direct_held` still counts the bytes the buffer held, as
+    /// the multishot path records it before appending.
     fn handle_recv_direct(&mut self, ud: UserData, result: i32) {
         let slot = ud.payload() as usize;
         let Some(entry) = self

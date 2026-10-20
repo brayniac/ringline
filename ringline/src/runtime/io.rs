@@ -688,13 +688,15 @@ impl TcpConnect {
     /// a ring buffer. The receive asks for all the free space. With nothing
     /// buffered, the connection receives into its own buffer of
     /// [`ConfigBuilder::recv_direct_region`](crate::ConfigBuilder::recv_direct_region)
-    /// bytes. With part of a message buffered, the buffer grows when less
+    /// bytes, or of the initial accumulator capacity if that is larger and at
+    /// most twice the region. With part of a message buffered, the buffer grows when less
     /// than the parser's [`ParseResult::NeedAtLeast`] value, or less than
     /// half of `recv_direct_region`, is free: to hold the rest of the message
     /// when that value is at least `recv_direct_region`, and otherwise to the
     /// larger of the receive size and the buffered bytes plus
     /// `recv_direct_region`. The receive size is `recv_direct_region`, or for
-    /// a connection whose largest message so far is `m` bytes, the larger of
+    /// a connection whose largest [`ParseResult::Consumed`] value from
+    /// `with_data` or `with_bytes` so far is `m`, the larger of
     /// `recv_direct_region` and `min(4m, m + 4 * recv_direct_region)`. A
     /// buffer larger than the connection's own is borrowed from the worker's
     /// free buffers
@@ -2928,7 +2930,8 @@ impl ConnCtx {
     /// ring return [`io::ErrorKind::Unsupported`] on such a connection, so a
     /// caller can check this before sending a request whose reply it would
     /// read with one of them. Always `false` on the mio backend, outside the
-    /// executor, and once the connection has closed.
+    /// executor, and once the runtime has released the connection's slot
+    /// after its close completes.
     pub fn is_recv_direct(&self) -> bool {
         #[cfg(has_io_uring)]
         {

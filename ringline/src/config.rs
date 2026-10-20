@@ -1111,7 +1111,9 @@ impl ConfigBuilder {
     /// Set the size of the buffer a direct connection
     /// ([`TcpConnect::recv_direct`](crate::TcpConnect::recv_direct)) receives
     /// into when it has nothing buffered. An idle direct connection holds a
-    /// buffer of this size. A message that does not fit borrows a larger
+    /// buffer of this size, or of
+    /// [`recv_accumulator_capacity`](Self::recv_accumulator_capacity) if
+    /// that is larger and at most twice this. A message that does not fit borrows a larger
     /// buffer from the worker (see
     /// [`recv_direct_pool_max`](Self::recv_direct_pool_max)), and the bytes
     /// already received for it, at most this many, are copied into it. Defaults

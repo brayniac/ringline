@@ -192,7 +192,8 @@ when a read parks: `with_data`, `with_bytes` or `recv_ready` returns
 `Pending` after the parser has seen every buffered byte and returned
 `NeedMore` or `NeedAtLeast` (`park_recv` in `runtime/io.rs`). Nothing is
 armed at connect or at a completion. While the task works on what it has,
-no receive is in flight; data that arrives in that time waits in the socket's
+no receive is in flight, unless a read that parked was dropped before its
+receive completed; data that arrives in that time waits in the socket's
 receive queue, and a FIN is seen at the next read.
 
 Arming after the parse means no receive is outstanding while `with_bytes`
@@ -219,15 +220,16 @@ the completion arrives (domain invariant 1).
 
 On completion (`handle_recv_direct`), the driver frees the slab entry and
 checks the connection: the generation must match and the lifecycle must be
-`Open`. Otherwise the completion is stale, the buffer goes to
-`recycle_direct`, which keeps it in the pool if it is at least 64 KiB and
-there is room and frees it otherwise, and `RECV_DIRECT` `STALE` is
-incremented. For a live
-connection, the arrival is recorded first, while `recv_direct_held` still
-counts the bytes the buffer held, as the multishot path records it before
-appending. `attach_received` then sets the buffer's length to include the
-received bytes and puts it back as the accumulator's buffer, without a copy.
-Then:
+`Open`. Otherwise the completion is stale and `RECV_DIRECT` `STALE` is
+incremented. The buffer goes to `recycle_direct`: a buffer of at least
+64 KiB for which `DirectPool::put` finds room stays in the pool, and any
+other is freed.
+
+For a live connection, the arrival is recorded first, while
+`recv_direct_held` still counts the bytes the buffer held, as the multishot
+path records it before appending. `attach_received` then sets the buffer's
+length to include the received bytes and puts it back as the accumulator's
+buffer, without a copy. Then:
 
 - `n > 0`: count the bytes and wake the reader.
 - `0`: the peer closed; mark EOF, wake the reader, close.
@@ -257,7 +259,9 @@ without it.
 
 Each direct connection owns one buffer of `recv_direct_region` bytes
 (default 32 KiB). With nothing buffered, a receive goes into it, so an idle
-connection holds that much and no more. A message that does not fit borrows
+connection holds that much, or the initial accumulator capacity
+(`recv_accumulator_capacity`) if that is larger and at most twice the
+region. A message that does not fit borrows
 a larger buffer from the worker's pool (`DirectPool` in `accumulator.rs`):
 the part of the message received so far, at most `recv_direct_region` bytes,
 is copied into the borrowed buffer, and the rest of the message is received
@@ -490,22 +494,23 @@ allocated because none fit). Copies on a direct connection still count in
   messages and the start of the next 1 MiB message grows to the receive size
   in place (fails against `reserve`, which grows it to 1.49 MiB); a 1 MiB
   message of known length whose start arrived while a value from the same
-  buffer was held leaves the connection's own buffer at the region while
-  the message is borrowed, and at exactly the region when idle, with the
+  buffer was held leaves the connection's own buffer no larger than the
+  region while the message is borrowed, and at exactly the region when
+  idle, with the
   large one in the pool (fails when `reclaim` sizes its copy by the reserve
   target, and when an idle buffer smaller than the region grows with
   `reserve`, to 65,336 bytes); an own buffer larger than twice the region
-  goes to the pool when idle (fails without that check). The reuse and fit
-  pool tests fail when the pool keeps nothing.
+  goes to the pool when idle (fails without that check). All four tests
+  that check the pool's free bytes fail when the pool keeps nothing.
 - `tests/recv_direct_copies.rs` (its own binary, for the process-wide
   counters): 70,000-byte messages in 64 KiB and 1 MiB writes copy at most a
   quarter of a byte per byte received; 500 B messages at most 1/20; 1 MiB
   messages at most 1/5, with at least one known-length receive.
 - `event_loop.rs` unit tests: a synthetic `RecvDirect` completion with data
-  for a connection whose generation moved on is not attached and is counted
-  stale
-  (fails with the generation check removed); a direct connection whose
-  accumulator is at the cap is closed instead of armed.
+  for a connection whose generation moved on is not attached to the slot's
+  new occupant, and its slab entry is freed (fails with the generation
+  check removed); a direct connection whose accumulator is at the cap is
+  closed instead of armed. No test checks the `STALE` counter.
 - The ringline-redis and ringline-memcache `streaming` tests read small and
   100,000-byte values through a pool with `recv_direct(true)`, check that
   each segment read is refused, and read the next reply correctly after
