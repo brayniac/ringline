@@ -219,15 +219,17 @@ the completion arrives (domain invariant 1).
 
 On completion (`handle_recv_direct`), the driver frees the slab entry and
 checks the connection: the generation must match and the lifecycle must be
-`Open`. Otherwise the completion is stale, the buffer goes to the pool
-(`recycle_direct`), and `RECV_DIRECT` `STALE` is incremented. For a live
+`Open`. Otherwise the completion is stale, the buffer goes to
+`recycle_direct`, which keeps it in the pool if it is at least 64 KiB and
+there is room and frees it otherwise, and `RECV_DIRECT` `STALE` is
+incremented. For a live
 connection, the arrival is recorded first, while `recv_direct_held` still
 counts the bytes the buffer held, as the multishot path records it before
 appending. `attach_received` then sets the buffer's length to include the
 received bytes and puts it back as the accumulator's buffer, without a copy.
 Then:
 
-- `n > 0`: count the bytes, record the arrival, wake the reader.
+- `n > 0`: count the bytes and wake the reader.
 - `0`: the peer closed; mark EOF, wake the reader, close.
 - `-ECANCELED`: wake the reader, which re-arms when it parks again.
 - Any other error: mark the read half failed, fail the read with the error,
@@ -395,8 +397,9 @@ checked whether the cancel can still be pending after 10 s.
 - `with_data`, `with_bytes`, `with_data_result`, `recv_ready` and
   `ConnStream` reads: supported. Each arms the receive when it parks
   (`park_recv`).
-- `try_with_data` does not park, so it sees only bytes an earlier read
-  received: no receive is in flight while the task works.
+- `try_with_data` does not park or arm a receive. While a receive is in
+  flight, for example after a parked read was dropped, the buffered bytes
+  are in that receive's buffer and `try_with_data` returns `None`.
 - `segments`, `recv_owned_segment`, `with_segments`, `with_bytes_segments`,
   `forward_to`, `forward_to_conn` and `forward_held` return
   `io::ErrorKind::Unsupported`. They read held provided buffers, and a
@@ -487,15 +490,20 @@ allocated because none fit). Copies on a direct connection still count in
   messages and the start of the next 1 MiB message grows to the receive size
   in place (fails against `reserve`, which grows it to 1.49 MiB); a 1 MiB
   message of known length whose start arrived while a value from the same
-  buffer was held leaves the idle connection with its own buffer and the
+  buffer was held leaves the connection's own buffer at the region while
+  the message is borrowed, and at exactly the region when idle, with the
   large one in the pool (fails when `reclaim` sizes its copy by the reserve
-  target). Both pool tests fail when the pool keeps nothing.
+  target, and when an idle buffer smaller than the region grows with
+  `reserve`, to 65,336 bytes); an own buffer larger than twice the region
+  goes to the pool when idle (fails without that check). The reuse and fit
+  pool tests fail when the pool keeps nothing.
 - `tests/recv_direct_copies.rs` (its own binary, for the process-wide
   counters): 70,000-byte messages in 64 KiB and 1 MiB writes copy at most a
   quarter of a byte per byte received; 500 B messages at most 1/20; 1 MiB
   messages at most 1/5, with at least one known-length receive.
 - `event_loop.rs` unit tests: a synthetic `RecvDirect` completion with data
-  for a connection whose generation moved on is dropped and counted stale
+  for a connection whose generation moved on is not attached and is counted
+  stale
   (fails with the generation check removed); a direct connection whose
   accumulator is at the cap is closed instead of armed.
 - The ringline-redis and ringline-memcache `streaming` tests read small and
@@ -505,7 +513,10 @@ allocated because none fit). Copies on a direct connection still count in
   refusal comes after the request is sent or the pending GET is taken).
   The redis test also drains a 100,000-byte GET with `recv_meta`.
 
-Not tested: worker exit with a receive armed.
+Not tested: worker exit with a receive armed; the order of `record_arrival`
+and `attach_received` in `handle_recv_direct` (no test fails if the arrival
+is recorded after the bytes are attached); arrival times on a direct
+connection.
 
 ## Landing
 

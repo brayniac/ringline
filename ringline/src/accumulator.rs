@@ -707,9 +707,10 @@ impl AccumulatorTable {
                 // pool, and the connection receives into a new one.
                 self.direct_pool.put(std::mem::take(&mut acc.buf));
             }
-            if acc.buf.capacity() < region {
-                // Empty, so this moves nothing.
-                acc.buf.reserve(region);
+            if acc.buf.capacity() < region && !acc.buf.try_reclaim(region) {
+                // A new buffer of the region: `reserve` would double a
+                // buffer a little smaller than the region.
+                acc.buf = BytesMut::with_capacity(region);
             }
             let n = acc.buf.capacity().min(room).min(u32::MAX as usize);
             return Some((std::mem::take(&mut acc.buf), n, false));
@@ -1010,6 +1011,13 @@ mod tests {
         table.reserve(0, need);
         let (mut buf, _, known) = table.detach_for_recv(0, region, Some(need)).unwrap();
         assert!(known);
+        // The message went into a borrowed buffer; the connection's own
+        // buffer is the remainder's copy, no larger than the region.
+        let own = table.accumulators[0].own.as_ref().map(BytesMut::capacity);
+        assert!(
+            own.is_some_and(|c| c <= region),
+            "own buffer {own:?} while the message is borrowed"
+        );
         let len = buf.len();
         buf.resize(len + need, 2);
         unsafe { table.attach_received(0, buf, 0) };
@@ -1018,16 +1026,28 @@ mod tests {
         table.keep_spent(0, frozen);
         drop(value);
         let (buf, _, _) = table.detach_for_recv(0, region, None).unwrap();
-        assert!(
-            buf.capacity() < 64 * 1024,
-            "idle with a buffer of {} bytes",
-            buf.capacity()
-        );
+        assert_eq!(buf.capacity(), region, "the idle connection's buffer");
         unsafe { table.attach_received(0, buf, 0) };
         assert!(
             table.direct_pool.free_bytes >= mib,
             "the large buffer is in the pool"
         );
+    }
+
+    /// An own buffer larger than twice the region goes to the pool when
+    /// nothing is buffered, and the connection receives into a buffer of
+    /// the region.
+    #[cfg(has_io_uring)]
+    #[test]
+    fn an_idle_connection_gives_a_large_own_buffer_to_the_pool() {
+        let mut table = AccumulatorTable::new(1, 4096);
+        let region = 32 * 1024;
+        table.accumulators[0].buf = BytesMut::with_capacity(1 << 20);
+        let (buf, n, _) = table.detach_for_recv(0, region, None).unwrap();
+        assert_eq!(buf.capacity(), region);
+        assert_eq!(n, region);
+        unsafe { table.attach_received(0, buf, 0) };
+        assert_eq!(table.direct_pool.free_bytes, 1 << 20);
     }
     use super::*;
 

@@ -1382,7 +1382,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// The payload is the `direct_recvs` entry holding the accumulator
     /// buffer the kernel wrote into. The entry is removed here and only
     /// here. A completion whose connection closed, or whose slot now holds
-    /// another connection, gives the buffer to the pool. Otherwise the
+    /// another connection, passes the buffer to `recycle_direct`, which
+    /// keeps it in the pool if it is at least 64 KiB and there is room, and
+    /// frees it otherwise. Otherwise the
     /// buffer goes back into the accumulator with the received bytes behind
     /// its contents, including on EOF and errors, so the bytes received
     /// before stay readable. The arrival is recorded before the bytes are

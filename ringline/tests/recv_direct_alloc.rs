@@ -50,6 +50,10 @@ static SHAPE: Mutex<(usize, usize, usize)> = Mutex::new((0, 0, 0));
 const WARMUP: usize = 4;
 
 static SERVER: Mutex<Option<SocketAddr>> = Mutex::new(None);
+/// Held by each test for its whole run: the tests share `SERVER`, `SHAPE`,
+/// `RESULT` and the allocation counter, and `cargo test` runs them on
+/// parallel threads.
+static TEST_LOCK: Mutex<()> = Mutex::new(());
 static RESULT: Mutex<Option<Result<u64, String>>> = Mutex::new(None);
 
 /// Read the batches `SHAPE` describes, each message a 4-byte length and its
@@ -153,6 +157,7 @@ fn run(batches: usize, frames: usize, size: usize) -> u64 {
 /// once the parser has consumed it.
 #[test]
 fn a_direct_receive_reuses_a_consumed_buffer() {
+    let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let batches = 2_000;
     let large = run(batches, 16, 60);
     assert!(
@@ -166,6 +171,7 @@ fn a_direct_receive_reuses_a_consumed_buffer() {
 /// it back, so after the warmup no batch allocates.
 #[test]
 fn large_messages_reuse_pooled_buffers() {
+    let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     for (frames, size) in [
         (1, 64 * 1024),
         (4, 64 * 1024),

@@ -1793,8 +1793,8 @@ impl Client {
     }
 
     /// Read the next pending reply as zero-copy metadata, for ANY op kind (GET /
-    /// SET / DEL). GET drains the value body via the borrow-and-discard segmented
-    /// path; SET/DEL read the small reply normally. The value bytes are never
+    /// SET / DEL). GET drains the value body without materializing it (see
+    /// below); SET/DEL read the small reply normally. The value bytes are never
     /// materialized — only the header / control metadata is surfaced
     /// ([`RespMeta`]), which is all a load generator needs.
     ///
@@ -1813,7 +1813,8 @@ impl Client {
         self.flushed_count = self.flushed_count.saturating_sub(1);
         match pending.kind {
             PendingOpKind::Get => {
-                // io_uring: zero-copy borrow-and-discard over provided buffers.
+                // io_uring: zero-copy borrow-and-discard over provided buffers,
+                // except on a direct connection, which has none. There and on
                 // mio: header-parse + streaming drain over `with_bytes` — bounded
                 // memory (never materializes the value), same `RespMeta` contract.
                 #[cfg(has_io_uring)]

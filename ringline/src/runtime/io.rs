@@ -693,13 +693,17 @@ impl TcpConnect {
     /// half of `recv_direct_region`, is free: to hold the rest of the message
     /// when that value is at least `recv_direct_region`, and otherwise to the
     /// larger of the receive size and the buffered bytes plus
-    /// `recv_direct_region`. A buffer larger than the connection's own is
-    /// borrowed from the worker's free buffers
+    /// `recv_direct_region`. The receive size is `recv_direct_region`, or for
+    /// a connection whose largest message so far is `m` bytes, the larger of
+    /// `recv_direct_region` and `min(4m, m + 4 * recv_direct_region)`. A
+    /// buffer larger than the connection's own is borrowed from the worker's
+    /// free buffers
     /// ([`ConfigBuilder::recv_direct_pool_max`](crate::ConfigBuilder::recv_direct_pool_max)).
     ///
-    /// No receive is in flight while the task works on what it has read, so
-    /// `try_with_data`, which does not park, sees only the bytes an earlier
-    /// read received.
+    /// `try_with_data` does not park or arm a receive. While a receive is in
+    /// flight, for example after a parked read was dropped, the buffered
+    /// bytes are in that receive's buffer and `try_with_data` returns
+    /// `None`.
     ///
     /// The reads that use the provided-buffer ring are refused on a direct
     /// connection: `segments`, `recv_owned_segment`, `with_segments`,
@@ -2923,8 +2927,8 @@ impl ConnCtx {
     /// ([`TcpConnect::recv_direct`]). The reads that need the provided-buffer
     /// ring return [`io::ErrorKind::Unsupported`] on such a connection, so a
     /// caller can check this before sending a request whose reply it would
-    /// read with one of them. Always `false` on the mio backend, and `false`
-    /// outside the executor or once the connection's slot has been reused.
+    /// read with one of them. Always `false` on the mio backend, outside the
+    /// executor, and once the connection has closed.
     pub fn is_recv_direct(&self) -> bool {
         #[cfg(has_io_uring)]
         {
