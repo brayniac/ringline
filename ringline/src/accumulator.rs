@@ -387,8 +387,14 @@ impl DirectPool {
 
     /// Keep `buf` for reuse if it is at least `DIRECT_BORROW_MIN` and the
     /// free buffers have room for it; otherwise free it.
+    ///
+    /// A buffer recovered from a view (`keep_spent`) starts where the view
+    /// started, so its `capacity()` excludes the bytes before that;
+    /// `try_reclaim` moves its start back to the start of the allocation
+    /// without allocating.
     fn put(&mut self, mut buf: BytesMut) {
         buf.clear();
+        let _ = buf.try_reclaim(buf.capacity() + 1);
         let cap = buf.capacity();
         if cap < DIRECT_BORROW_MIN || self.free_bytes + cap > self.max_free_bytes {
             return;
