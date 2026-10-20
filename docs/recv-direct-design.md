@@ -199,7 +199,9 @@ Build C8 is c67d328 without the counters (binaries
   the Valkey-limited cells moved between runs above.
   At 8 KiB depth 16 and in every cell of 64 KiB and up except 64 KiB depth
   1, `c` stops at 26.4 to 27.0 Gb/s with 474 to 555 CPU-seconds, so its
-  ratios there are bounded by that rate; I do not know what sets it. At
+  ratios there are bounded by that rate. The network sets it: the data path
+  is a bond of four 10 Gb/s links (802.3ad, `layer3+4` hashing), and 1,000
+  connections do not spread the traffic evenly enough across the four. At
   4 KiB depth 16, where both builds use all 12 cores, `c`'s throughput is
   1.098 of A's, more than its CPU saving at a fixed rate there (2%, C5 and
   C8); I do not know why. Two more runs were cancelled before they started,
@@ -611,7 +613,6 @@ closed or merged without a release.
 - Why `c`'s throughput gain at 4 KiB depth 16 with the client limited
   (about 10%, one run) is larger than its fixed-rate CPU saving, and whether
   more runs agree.
-- What limits both builds near 27 Gb/s with the hosts swapped.
 - Behaviour above 63 connections per worker.
 - Whether a cancelled direct receive can still be in flight when the worker
   exit bound runs out.
