@@ -26,7 +26,10 @@ All runs below are cachecannon with 16 client workers and 1,000 connections
 fixed request rate per cell, in `experiments/segviews-screen.toml` on branch
 `feat/segment-clients`. Client CPU is the cachecannon process's user plus
 system time for the run. Each build runs in every cell of a SystemsLab
-experiment, and the three experiments rotate the build order.
+experiment, and the three experiments rotate the build order. The ringline
+commits named below (06c6c43, ff61e77, c67d328) are the measured builds,
+from before this branch was rebased onto main; they are on branch
+`exp/segviews-c8-ringline` of `brayniac/ringline`.
 
 ### What the ring path copies
 
