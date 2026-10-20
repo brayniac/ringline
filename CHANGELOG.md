@@ -524,12 +524,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
-- io_uring: `recv_ready` resolves for every byte the driver holds for the
-  connection (`recv_buffered`). It checked only the accumulator and the
-  recv-forward hold, so it stayed pending for a receive lent in place on a
-  connection with an empty accumulator, or held in the segment hold, until a
-  later receive or the close. `RecvReadyFuture::poll` now checks
-  `recv_buffered`, which on mio is the accumulator, as before.
+- io_uring: `recv_ready` resolves for bytes in a lent receive buffer and in
+  the segment hold, as well as for bytes in the accumulator and the
+  recv-forward hold. It stayed pending for a receive lent in place on a
+  connection with an empty accumulator until the next receive or the close,
+  and for bytes in the segment hold until the close or until the hold was
+  moved into the accumulator. mio is unchanged.
 - `ringline-redis`, `ringline-memcache`, `ringline-ping`:
   `CommandResult::rx_bytes` is 0 for an operation that fails at send. It
   reported the previous operation's byte count. The guarded SET paths

@@ -2407,9 +2407,11 @@ impl ConnCtx {
     /// that were not forwarded are discarded.
     /// Requires [`enable_recv_forward`](Self::enable_recv_forward).
     ///
-    /// Gate calls on `recv_ready`, which becomes ready when
-    /// the hold is non-empty (or the connection closed). When the hold is empty
-    /// (e.g. the connection closed), the returned future resolves to `0`.
+    /// Gate calls on `recv_ready`, which becomes ready when the connection
+    /// holds received bytes or has closed. When the hold is empty (e.g. the
+    /// connection closed), the returned future resolves to `0`. Bytes received
+    /// before `enable_recv_forward` are not in the hold, and `forward_held`
+    /// returns 0 for them, so enable forwarding before the first receive.
     ///
     /// One forward is in flight per connection at a time (await the returned
     /// future before calling again); buffers received during the send accumulate
@@ -3872,8 +3874,8 @@ impl Connection {
     ///
     /// The future consumes nothing and does not borrow the connection, so a
     /// reader started after it resolves sees the same bytes, and dropping it
-    /// loses none. It registers the task that polls it and wakes that task
-    /// by id; it does not use the [`Context`]'s waker. A combinator that
+    /// loses none. Polling it registers the polling task, and an arrival
+    /// wakes that task by id; the [`Context`]'s waker is not used. A combinator that
     /// re-polls only the child whose own waker fired, such as
     /// `FuturesUnordered`, never re-polls it.
     pub fn recv_ready(&mut self) -> RecvReadyFuture {

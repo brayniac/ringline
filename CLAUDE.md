@@ -369,7 +369,7 @@ Two `ClientBuilder` knobs control batching of fired requests:
 
 ### Sending while a reply is pending
 
-`recv` takes `&mut self` and is not cancel-safe (it pops the pending op before its first await), so a task inside `recv` cannot fire. `recv_ready()` flushes and returns a `RecvReadyFuture` that does not borrow the client and resolves when bytes of the next reply have arrived. A caller waits on it together with its own request source, fires (and calls `recv_ready` again, which flushes) when a request is ready, and calls `recv` when it resolves. The future wakes its task by id and ignores the `Context` waker, so combine it with `select` or a `poll_fn` that polls every branch, not `FuturesUnordered`. Design: `docs/send-while-receiving-design.md` (Option B, a split `Sender`/`Receiver`, is not implemented).
+`recv` takes `&mut self` and is not cancel-safe (it pops the pending op before its first await), so a task inside `recv` cannot fire. `recv_ready()` flushes and returns a `RecvReadyFuture` that does not borrow the client and resolves when bytes of the next reply have arrived or the connection has finished receiving. A caller waits on it together with its own request source, fires (and calls `recv_ready` again, which flushes) when a request is ready, and calls `recv` when it resolves. Polling it registers the task, an arrival wakes that task by id, and the `Context` waker is not used, so combine it with `select` or a `poll_fn` that polls every branch, not `FuturesUnordered`. Design: `docs/send-while-receiving-design.md` (Option B, a split `Sender`/`Receiver`, is not implemented).
 
 ### Design Notes
 

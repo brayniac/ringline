@@ -9,7 +9,7 @@
 //! accumulator.
 
 use std::future::Future;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -106,10 +106,13 @@ async fn read_line(conn: &mut Connection, segmented: bool) -> Option<Vec<u8>> {
     if n == 0 { None } else { line }
 }
 
-/// Read the first line, check `recv_ready` stays pending for `QUIET`, then wait
-/// for it and read what follows.
+/// Read the first line and acknowledge it with one byte, check `recv_ready`
+/// stays pending for `QUIET`, then wait for it and read what follows. The peer
+/// starts `GAP` only after the acknowledgement, so the quiet period falls
+/// inside it however long the server took to read the first line.
 async fn wait_then_read(conn: &mut Connection, segmented: bool) -> Seen {
     read_line(conn, segmented).await.expect("the first line");
+    conn.send_nowait(b"+").expect("acknowledge");
     if let Either::Left(()) = ringline::select(conn.recv_ready(), ringline::sleep(QUIET)).await {
         return Seen::Early;
     }
@@ -152,6 +155,13 @@ server!(Segmented, SEGMENTED, true);
 server!(PeerClose, PEER_CLOSE, false);
 server!(Tls, TLS, false);
 
+/// Wait for the server's acknowledgement of the first line.
+fn await_ack(stream: &mut impl Read) {
+    let mut ack = [0u8; 1];
+    stream.read_exact(&mut ack).expect("acknowledgement");
+    assert_eq!(&ack, b"+");
+}
+
 fn plain_server<H: AsyncEventHandler>() -> (
     ringline::Runtime,
     Vec<std::thread::JoinHandle<Result<(), ringline::Error>>>,
@@ -163,6 +173,7 @@ fn plain_server<H: AsyncEventHandler>() -> (
         .expect("launch failed");
     let addr = shutdown.bound_addr().expect("bound address");
     let peer = TcpStream::connect(addr).expect("connect");
+    peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     (shutdown, handles, peer)
 }
 
@@ -172,6 +183,7 @@ fn plain_server<H: AsyncEventHandler>() -> (
 fn resolves_for_a_reply_on_an_empty_accumulator() {
     let (shutdown, handles, mut peer) = plain_server::<Copy>();
     peer.write_all(b"first\n").expect("write");
+    await_ack(&mut peer);
     std::thread::sleep(GAP);
     peer.write_all(b"second\n").expect("write");
     assert_eq!(wait_for(&COPY), Seen::Line(b"second\n".to_vec()));
@@ -185,6 +197,7 @@ fn resolves_for_a_reply_on_an_empty_accumulator() {
 fn resolves_for_bytes_in_the_segment_hold() {
     let (shutdown, handles, mut peer) = plain_server::<Segmented>();
     peer.write_all(b"first\n").expect("write");
+    await_ack(&mut peer);
     std::thread::sleep(GAP);
     peer.write_all(b"second\n").expect("write");
     assert_eq!(wait_for(&SEGMENTED), Seen::Line(b"second\n".to_vec()));
@@ -196,6 +209,7 @@ fn resolves_for_bytes_in_the_segment_hold() {
 fn resolves_when_the_peer_closes() {
     let (shutdown, handles, mut peer) = plain_server::<PeerClose>();
     peer.write_all(b"first\n").expect("write");
+    await_ack(&mut peer);
     std::thread::sleep(GAP);
     drop(peer);
     assert_eq!(wait_for(&PEER_CLOSE), Seen::Closed);
@@ -239,16 +253,17 @@ fn tls_does_not_resolve_on_a_partial_record() {
         tls.complete_io(&mut tcp).expect("handshake");
     }
 
-    rustls::Stream::new(&mut tls, &mut tcp)
-        .write_all(b"first\n")
-        .expect("write");
+    let mut stream = rustls::Stream::new(&mut tls, &mut tcp);
+    stream.write_all(b"first\n").expect("write");
+    await_ack(&mut stream);
     tls.writer().write_all(b"second\n").expect("encrypt");
     let mut record = Vec::new();
     while tls.wants_write() {
         tls.write_tls(&mut record).expect("write_tls");
     }
     let half = record.len() / 2;
-    std::thread::sleep(QUIET / 2);
+    // Inside the quiet period, which starts when the acknowledgement is sent.
+    std::thread::sleep(QUIET / 4);
     tcp.write_all(&record[..half]).expect("write");
     std::thread::sleep(GAP);
     tcp.write_all(&record[half..]).expect("write");

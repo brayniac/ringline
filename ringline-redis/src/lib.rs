@@ -1034,7 +1034,8 @@ impl Client {
     /// [`recv`](Self::recv), which then waits only for the rest of a reply
     /// that has started arriving. A caller that keeps one future pending
     /// across fires must call [`flush`](Self::flush) after firing, or a
-    /// buffered request is not sent until the next `recv_ready` or `recv`.
+    /// buffered request waits until the batch fills or the next `flush`,
+    /// `recv_ready` or `recv`.
     ///
     /// The future registers the task that polls it and does not use the
     /// `Context`'s waker, so it works in a `poll_fn` or a select that polls

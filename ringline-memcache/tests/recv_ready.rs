@@ -281,3 +281,29 @@ fn binary_sends_a_buffered_request() {
         expect_get(op, 1, None)
     }));
 }
+
+/// A `recv_ready` dropped while pending leaves its registration behind. The
+/// `recv` that follows still wakes for the response and reads all of it.
+#[test]
+fn a_dropped_recv_ready_loses_nothing() {
+    let addr = stub_server(|s| {
+        read_bytes(s, TEXT_GET);
+        std::thread::sleep(GAP);
+        s.write_all(b"VALUE k 0 5\r\nhello\r\nEND\r\n").unwrap();
+    });
+    run_client!(addr, |conn| Box::pin(async move {
+        let mut client = Client::builder(conn).build();
+        client.fire_get(b"k", 1).map_err(|e| format!("fire: {e}"))?;
+        let ready = client
+            .recv_ready()
+            .map_err(|e| format!("recv_ready: {e}"))?;
+        if let Either::Left(()) = ringline::select(ready, ringline::sleep(QUIET)).await {
+            return Err("recv_ready resolved before any response bytes".into());
+        }
+        let op = ringline::timeout(LIMIT, client.recv())
+            .await
+            .map_err(|_| "recv timed out")?
+            .map_err(|e| format!("recv: {e}"))?;
+        expect_get(op, 1, Some(b"hello"))
+    }));
+}

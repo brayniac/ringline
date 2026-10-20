@@ -15,10 +15,21 @@
 #
 # PREDICTION: 1 and 2 pass. In 3, ringline's
 # `resolves_for_a_reply_on_an_empty_accumulator` and
-# `resolves_for_bytes_in_the_segment_hold` fail (the server records Hung),
-# and the redis and memcache tests that wait on `recv_ready` for a reply
-# fail on a timeout. If 3 passes, the tests do not reach the lent or held
-# path and say nothing about the fix.
+# `resolves_for_bytes_in_the_segment_hold` fail (the server records Hung).
+# In the redis and memcache files, `sends_a_buffered_request`, both
+# `fire_while_pending_*` and `binary_sends_a_buffered_request` time out:
+# their only reply is lent and nothing follows it. The first-bytes tests
+# fail with "resolved only after the whole reply", because the second
+# half's completion copies the lent first half into the accumulator. The
+# dropped-future tests pass: `recv` reads the lent buffer. If 3 passes, the
+# tests do not reach the lent or held path and say nothing about the fix.
+#
+# RESULT (01a157e3, ea78d78, Linux 6.12.63 x86_64, io_uring): 1 and 2
+# passed. In 3 the two ringline tests failed and the redis tests failed 4 of
+# 6 and memcache 5 of 6 (that file then had no dropped-future test), each
+# with the message predicted above; peer close, TLS and NoPending passed.
+# The prediction for the first-bytes and dropped-future tests was written
+# after the run, from a review of the code; the rest before it.
 name = "recv-ready-uring-verify {branch}"
 
 [matrix]
