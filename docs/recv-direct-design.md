@@ -1,8 +1,8 @@
 # Direct receive: one-shot receives into the connection's accumulator
 
-Status: on `feat/recv-direct`, measured through build C8; owner decisions
-made (see Decisions). Open: the scale run, and the last runs of build C8
-(see Landing).
+Status: merged (#684), opt-in; measured through build C8; owner decisions
+made (see Decisions). Open: the scale run, and the cause of `c`'s higher
+p99 in four cells (see Not known).
 
 Related: `docs/recv-buffering-approaches.md` ("One-shot receive into
 connection-owned memory", "Per-connection rings"),
@@ -168,12 +168,36 @@ Build C8 is c67d328 without the counters (binaries
   of A's in every cell. The RESP cells are limited by Valkey and move by 2 to
   7% between runs in both directions. At the same throughput `c` uses up to
   9% less client CPU (memcache 1 MiB: 710 against 642 CPU-seconds).
-- Latency at the C5 rates, one run so far (`01a159f3-ee9e-719d-b861-353068a62e55`):
-  p50 of `c` is at or below A's in 11 of 13 cells, and 2 to 4% lower in the
-  depth-16 cells of 8 KiB and up. p99 of `c` is above A's at memcache 64 B
-  (1,925 against 1,679 µs), RESP 64 B (909 against 692 µs) and RESP 1 MiB
-  (4,653 against 4,014 µs); `c0` falls between them in two of the three, and
-  p99 has moved by up to 15% between runs of one build.
+- Latency at the C5 rates, three runs (`01a159f3-ee9e-719d-b861-353068a62e55`,
+  `01a159f3-ef0a-71ed-fef5-60c8b2cad632`,
+  `01a159f3-ef74-71da-d9a7-9f3283f547b1`): mean p50 of `c` is at or below
+  A's in 11 of 13 cells, and 4% lower at memcache 8 KiB depth 16 and RESP
+  64 KiB depth 16; it is 1.5% higher at mixed depth 16 and 1.3% higher at
+  RESP 1 MiB. p99 of `c` is above A's in all three runs in four cells:
+
+  | Cell | p99 A (µs) | p99 `c` (µs) |
+  |---|---|---|
+  | memcache 4 KiB, depth 16 | 929 / 929 / 925 | 946 / 983 / 942 |
+  | mixed, depth 16 | 21,495 / 22,020 / 20,840 | 21,757 / 22,544 / 22,675 |
+  | memcache 1 MiB, idle | 2,162 / 2,473 / 2,359 | 2,293 / 2,506 / 2,441 |
+  | RESP 64 B, depth 16 | 692 / 942 / 1,212 | 909 / 1,056 / 1,400 |
+
+  The first three are 1 to 9% higher; RESP 64 B is 12 to 31% higher, in a
+  cell where A's own p99 varies by 75% between runs. In the other nine
+  cells `c`'s p99 is above A's in at most two runs.
+- Throughput with the client limited (`experiments/segviews-screen-flip.toml`:
+  client on the Zen 1 host with 12 threads, servers on the Zen 2 host), one
+  run (`01a15aad-c9c5-7104-23a5-5be594d89ccd`): A's client uses about
+  600 CPU-seconds, all 12 threads for the 50 s run, in every cell but
+  RESP 64 B. `c`'s throughput relative to A is 1.098 at memcache 4 KiB
+  depth 16, 1.100 at 8 KiB depth 16, 1.058 at 64 KiB depth 1, 1.026 at
+  64 KiB depth 16, 1.029 at 1 MiB, 1.045 at RESP 64 KiB depth 16, 1.121 at
+  RESP 1 MiB and 1.032 at memcache 64 B depth 16. At memcache 4 KiB depth 1
+  it is 0.998, and at RESP 64 B, which Valkey limits (the client uses 130
+  CPU-seconds), 0.943. The gains at 4 KiB and 8 KiB depth 16 are larger than
+  `c`'s CPU saving at a fixed rate there (2 to 3%); I do not know why.
+  Two more runs were cancelled before they started, so this rests on one
+  run.
 
 The standalone benchmark's `oneshot` strategy
 (`docs/recv-buffering-approaches.md`) fell behind the shared ring at 1,000
@@ -529,15 +553,13 @@ connection.
 ## Landing
 
 Done: the 64 B fix (C3), the pool (C5), its growth and eviction fix (C7),
-throughput and latency of the commit (C8).
+throughput and latency of the commit (C8), and the PR (#684).
 
-1. PR for the runtime change and the `PoolConfig` option, with a fresh
-   review, before the remaining C8 runs: latency runs 2 and 3
-   (`01a159f3-ef0a-71ed-fef5-60c8b2cad632`,
-   `01a159f3-ef74-71da-d9a7-9f3283f547b1`) and throughput with the client on
-   the smaller host (`experiments/segviews-screen-flip.toml`: client on Zen 1
-   with 12 threads, servers on Zen 2), where more cells are limited by the
-   client. Their results go into this section before the merge.
+1. The cause of `c`'s higher p99 at memcache 4 KiB depth 16, mixed depth 16,
+   1 MiB idle and RESP 64 B (Evidence): a profile of the 4 KiB depth-16
+   cell. One candidate is the submit round trip of arming a receive only
+   after the reader parks, which the multishot ring does not pay; I have not
+   checked it.
 2. A scale run: 16 workers with 4,000 and 16,000 connections, cells up to
    64 KiB. With 1 MiB values at depth 1, almost every connection is partway
    through a value, so 16,000 connections would hold about 16 GiB of
@@ -570,16 +592,18 @@ Made by the owner on 2026-10-20:
    would save about 0.8 GB of the 4.4 GB, which is not worth more early
    allocations.
 9. Open the PR on the C8 results so far, assuming the remaining runs agree.
+10. Merge with `c`'s higher p99 in four cells recorded here, and look for its
+    cause afterwards.
 
 Open: whether the scanner PRs in `resp-proto` and `memcache-proto` are
 closed or merged without a release.
 
 ## Not known
 
-- Whether `c`'s higher p99 in three cells of the first C8 latency run
-  (memcache 64 B, RESP 64 B, RESP 1 MiB) holds over three runs.
-- Whether `c` raises throughput where the client, not the link or the
-  server, is the limit (the flipped-host runs).
+- Why `c`'s p99 is higher than A's in four cells (Evidence, C8 latency).
+- Why `c`'s throughput gain with the client limited at 4 KiB and 8 KiB
+  depth 16 (about 10%, one run) is larger than its CPU saving there at a
+  fixed rate, and whether more runs agree.
 - Behaviour above 63 connections per worker.
 - Whether a cancelled direct receive can still be in flight when the worker
   exit bound runs out.
