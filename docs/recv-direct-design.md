@@ -479,9 +479,9 @@ checked whether the cancel can still be pending after 10 s.
 
 `ClientBuilder::new` takes a `Connection` that is already open, so a caller
 that connects itself passes `recv_direct` to `connect`. The sharded and
-cluster clients open their own connections from `ShardedConfig` and
-`ClusterConfig`, which have public fields and no `#[non_exhaustive]`; their
-option waits for the next breaking release. cachecannon opens its own
+cluster clients open their own connections, and `ShardedConfig::recv_direct`
+(ringline-redis and ringline-memcache) and `ClusterConfig::recv_direct`
+(ringline-redis) pass the option to each. cachecannon opens its own
 connections, so build C needed only a cachecannon change.
 
 ## Metrics
@@ -561,7 +561,9 @@ connection.
 ## Landing
 
 Done: the 64 B fix (C3), the pool (C5), its growth and eviction fix (C7),
-throughput and latency of the commit (C8), and the PR (#684).
+throughput and latency of the commit (C8), the PR (#684), and
+`ShardedConfig::recv_direct` and `ClusterConfig::recv_direct`, with the
+three configs made opaque, for the ringline 0.7.0 release.
 
 1. The cause of `c`'s higher p99 at memcache 4 KiB depth 16, mixed depth 16,
    1 MiB idle and RESP 64 B (Evidence): a profile of the 4 KiB depth-16
@@ -572,8 +574,7 @@ throughput and latency of the commit (C8), and the PR (#684).
    64 KiB. With 1 MiB values at depth 1, almost every connection is partway
    through a value, so 16,000 connections would hold about 16 GiB of
    borrowed buffers, as the ring path's accumulators would.
-3. `ShardedConfig` and `ClusterConfig` option in the next breaking release.
-4. mio: read plaintext connections into the accumulator (separate PR).
+3. mio: read plaintext connections into the accumulator (separate PR).
 
 ## Decisions
 

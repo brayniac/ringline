@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `ringline-redis` `ShardedConfig::recv_direct` and
+  `ClusterConfig::recv_direct`, and `ringline-memcache`
+  `ShardedConfig::recv_direct`, open every connection the sharded or cluster
+  client makes with `TcpConnect::recv_direct`, as `PoolConfig::recv_direct`
+  does for a pool.
+
 - io_uring: `TcpConnect::recv_direct(true)` makes an outbound plaintext
   connection receive into its own accumulator instead of the shared provided
   buffer ring: a one-shot `RECV` into the accumulator's free space, armed
@@ -213,6 +219,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Breaking:** `ringline-redis` `ShardedConfig` and `ClusterConfig` and
+  `ringline-memcache` `ShardedConfig` have private fields. Build them with
+  `ShardedConfig::new(servers)` or `ClusterConfig::new(seeds)` and builder
+  methods: `pool_size` (sharded configs), `connect_timeout_ms`,
+  `tls_server_name` and `recv_direct`. ringline-redis also has `password`
+  and `username`. An `Option` field becomes a call made only when it is
+  `Some`. `new` sets what a struct literal with `pool_size: 1`,
+  `connect_timeout_ms: 0` and `None` options did: one connection per
+  server, no connect timeout, plain TCP, no AUTH. A `pool_size` of 0 is
+  still treated as 1. Adding an option to them is no longer a breaking
+  change, as for `PoolConfig`.
 - `ringline` takes `bytes` from the workspace, so it requires 1.11.1 or
   later, as the other crates do; views use `Bytes::from_owner` (1.9). On
   io_uring a provided-buffer ring's buffers are an anonymous mapping, shared

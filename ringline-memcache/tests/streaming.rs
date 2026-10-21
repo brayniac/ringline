@@ -438,6 +438,7 @@ async fn run_client(addr: SocketAddr) -> Result<(), String> {
 
     run_get_cas(addr).await?;
     run_pool_direct(addr).await?;
+    run_sharded_direct(addr).await?;
     run_set_stream(addr).await?;
 
     Ok(())
@@ -446,6 +447,37 @@ async fn run_client(addr: SocketAddr) -> Result<(), String> {
 // ── get_cas (streaming get-with-CAS) ──────────────────────────────────────
 
 // ── A pool whose connections receive directly ─────────────────────────────
+
+/// A sharded client with `recv_direct` opens direct connections: values
+/// read correctly, and a segment read is refused.
+async fn run_sharded_direct(addr: SocketAddr) -> Result<(), String> {
+    use ringline_memcache::{ShardedClient, ShardedConfig};
+
+    let mut sharded = ShardedClient::new(ShardedConfig::new(vec![addr]).recv_direct(true));
+    sharded
+        .connect_all()
+        .await
+        .map_err(|e| format!("sharded connect: {e}"))?;
+    let large = sharded
+        .get("stream:large")
+        .await
+        .map_err(|e| format!("sharded large get: {e}"))?
+        .ok_or("sharded large: None")?;
+    if large.data.as_ref() != large_value().as_slice() {
+        return Err("sharded large mismatch".into());
+    }
+    let client = sharded
+        .shard_client(0)
+        .await
+        .map_err(|e| format!("shard_client: {e}"))?;
+    match client.get_stream(b"stream:small").await {
+        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::Unsupported => {}
+        Err(e) => return Err(format!("sharded get_stream: {e}")),
+        Ok(_) => return Err("sharded get_stream: accepted, so not direct".into()),
+    }
+    sharded.close_all();
+    Ok(())
+}
 
 async fn run_pool_direct(addr: SocketAddr) -> Result<(), String> {
     use ringline_memcache::{Pool, PoolConfig};
