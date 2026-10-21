@@ -184,7 +184,9 @@ fn wait_for_server(addr: &str) {
 ///
 /// [`wait_for_server`] proves readiness by connecting and discarding the
 /// stream, and the server accepts that probe like any other client: it becomes
-/// a connection whose peer has already closed before its handler runs. For the
+/// a connection whose peer closes, usually before its handler runs and
+/// sometimes after, when the probing thread is descheduled between `connect`
+/// returning and the stream being dropped. For the
 /// reactive tests that is harmless — the probe sends nothing, so an echo
 /// handler never sends and simply parks until teardown. For a handler that
 /// sends *unprompted* on accept it is not harmless, and it is the whole of
@@ -3431,23 +3433,47 @@ impl AsyncEventHandler for Join3Handler {
     }
 }
 
-/// Counts accepts and send outcomes without ever panicking, so the probe's fate
-/// is observable instead of fatal.
+/// Counts accepts, send outcomes and whether the handler observed that its
+/// peer is gone, without ever panicking, so the probe's fate is observable
+/// instead of fatal.
 struct ProbeWitnessHandler;
 
 static PROBE_ACCEPTED: AtomicU32 = AtomicU32::new(0);
 static PROBE_SEND_OK: AtomicU32 = AtomicU32::new(0);
+static PROBE_PEER_GONE: AtomicU32 = AtomicU32::new(0);
+
+/// Counts the peer as gone when the handler is dropped before it finishes,
+/// which is what tearing the connection down under it does.
+struct PeerGoneOnDrop(bool);
+
+impl Drop for PeerGoneOnDrop {
+    fn drop(&mut self) {
+        if self.0 {
+            PROBE_PEER_GONE.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
 
 impl AsyncEventHandler for ProbeWitnessHandler {
     fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             PROBE_ACCEPTED.fetch_add(1, Ordering::SeqCst);
+            let mut guard = PeerGoneOnDrop(true);
             let payload = vec![b'Z'; BP_CHUNK];
             for _ in 0..BP_CHUNKS {
                 if conn.send_backpressured(&payload).await.is_err() {
+                    // A send failed: the peer has reset the connection.
                     return;
                 }
                 PROBE_SEND_OK.fetch_add(1, Ordering::SeqCst);
+            }
+            // Every send completed, either because the client had not yet
+            // closed or because its reset came after them. `with_data`
+            // returns 0 for a FIN and for a reset.
+            let n = conn.with_data(|d| ParseResult::Consumed(d.len())).await;
+            guard.0 = false;
+            if n == 0 {
+                PROBE_PEER_GONE.fetch_add(1, Ordering::SeqCst);
             }
             conn.shutdown_write();
         }
@@ -3462,16 +3488,19 @@ impl AsyncEventHandler for ProbeWitnessHandler {
 /// #518 read the failure as "a parked send resolved `connection closing` on a
 /// connection the client had not closed". The client *had* closed it: that was
 /// not one of the test's sixteen readers but [`wait_for_server`]'s readiness
-/// probe, accepted as connection 0 with its peer already gone. This asserts
-/// both halves of that — the probe reaches a handler, and a handler that sends
-/// unprompted cannot complete its sends on it — which is why the
-/// send-on-accept tests use [`connect_retry`] instead.
+/// probe, accepted as connection 0 with its peer closing. This asserts both
+/// halves of that: the probe reaches a handler, and that handler's peer goes
+/// away. That is why the send-on-accept tests use [`connect_retry`] instead.
 ///
-/// Deliberately asserts "did not finish all eight", not a specific error: the
-/// handler either sees the failure (`EPIPE`, or `NotConnected` when the
-/// FIN-driven close is finalized first) or is dropped mid-sequence when the
-/// connection is torn down under it. Which one lands is a race, and the
-/// hazard is the same either way.
+/// The handler observes the closed peer in one of three ways: a send fails
+/// (`EPIPE` or `ECONNRESET`, or `NotConnected` when the FIN-driven close is
+/// finalized first), the handler is dropped mid-sequence when the connection
+/// is torn down under it, or every send completes and the read that follows
+/// returns 0 (EOF, or the reset sent by a client that closed with the sends
+/// unread). How many sends complete is not asserted: the probing thread can be
+/// descheduled between `connect` returning and the stream being dropped, and
+/// the eight sends then complete to a live peer. That happened on a CI
+/// runner.
 #[test]
 fn wait_for_server_probe_reaches_a_send_on_accept_handler() {
     let config = test_config_builder()
@@ -3488,9 +3517,13 @@ fn wait_for_server_probe_reaches_a_send_on_accept_handler() {
 
     // The probe, and nothing else: no real client connects in this test.
     wait_for_server(&addr);
-    std::thread::sleep(Duration::from_millis(500));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while PROBE_PEER_GONE.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
 
     let accepted = PROBE_ACCEPTED.load(Ordering::SeqCst);
+    let gone = PROBE_PEER_GONE.load(Ordering::SeqCst);
     let oks = PROBE_SEND_OK.load(Ordering::SeqCst);
 
     shutdown.shutdown();
@@ -3503,9 +3536,10 @@ fn wait_for_server_probe_reaches_a_send_on_accept_handler() {
         "the readiness probe is accepted as a connection and runs a handler"
     );
     assert!(
-        oks < BP_CHUNKS as u32,
-        "a send-on-accept handler cannot complete its sends on the probe \
-         connection: its peer closed before the handler ran (got {oks} of {BP_CHUNKS})"
+        gone >= 1,
+        "the probe's handler observes that its peer is gone (a send failed, the \
+         handler was torn down, or its read returned 0); {oks} of {BP_CHUNKS} sends \
+         completed"
     );
 }
 
