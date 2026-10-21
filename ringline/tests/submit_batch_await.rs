@@ -3,10 +3,9 @@
 //! batch byte-exactly *and* resolves its `SendFuture`.
 //!
 //! The awaited variant exists so a caller can pace itself against send
-//! completion instead of firing and forgetting. Yielding to the executor is
-//! not a substitute: a self-wake is re-polled inside the same ready-queue
-//! drain pass, before the event loop revisits the ring, so it never lets a
-//! send CQE land. These tests pin the two properties a caller depends on:
+//! completion instead of firing and forgetting. Awaiting `yield_now` is not
+//! a substitute: the task resumes without waiting for the send to complete.
+//! These tests pin the two properties a caller depends on:
 //! the wire bytes are unchanged from `submit_batch`, and awaiting the future
 //! actually returns (with the full byte count) rather than hanging.
 //!

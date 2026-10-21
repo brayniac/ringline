@@ -1502,7 +1502,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // See that backend's poll_ready_tasks for the full safety argument,
         // including the initial_len boundary that prevents lost wakeups when
         // the internal wake path re-queues a task mid-pass, and why a
-        // Context-driven self-wake instead resumes on the next iteration.
+        // Context-driven self-wake is not polled again within the same pass.
 
         let initial_len = executor.ready_queue.len();
 

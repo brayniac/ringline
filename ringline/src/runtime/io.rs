@@ -3032,9 +3032,9 @@ impl AsyncSendBuilder {
     /// Use this when the caller needs completion-paced backpressure rather
     /// than fire-and-forget. Awaiting the future parks the task until the
     /// kernel signals the send, which returns control to the event loop so
-    /// completions are reaped and send-pool slots recycled. Yielding to the
-    /// executor is *not* a substitute: a self-wake is re-polled within the
-    /// same ready-queue drain pass, before the loop revisits the ring.
+    /// completions are reaped and send-pool slots recycled. Awaiting
+    /// [`yield_now`] is not a substitute: the task resumes without waiting
+    /// for the send to complete.
     ///
     /// Batch limits and the all-or-nothing rejection behavior are identical
     /// to [`submit_batch`](Self::submit_batch). A batch that is empty or
@@ -6926,6 +6926,80 @@ pub(crate) fn release_connect(
         .is_some_and(|c| c.lifecycle == crate::connection::Lifecycle::Open);
     if open {
         driver.close_connection(conn_index);
+    }
+}
+
+// ── Yield ────────────────────────────────────────────────────────────
+
+/// Return control to the worker's event loop once.
+///
+/// A task runs until it awaits a future that is not ready. Until then no
+/// other task on its worker is polled, and no I/O completion, readiness event
+/// or timer is processed. A task that does a long stretch of work without such
+/// an await, such as many `send_nowait` calls in a row, can await
+/// `yield_now()` between parts of it.
+///
+/// The first poll wakes the task and returns `Pending`; the second returns
+/// `Ready`. Tasks already in the worker's ready queue are polled before the
+/// second poll. Tasks woken by the completions, readiness events or timers
+/// that the event loop processes before the second poll, and tasks woken
+/// from other threads, may be polled after it. The event loop does not block
+/// while a task is runnable.
+///
+/// The second poll can come later in the same loop iteration. On io_uring it
+/// follows the loop's flush of queued SQEs and its dispatch of the
+/// completions the kernel has posted. On mio it follows the write of queued
+/// sends, when that write completes an awaited send.
+pub fn yield_now() -> YieldNow {
+    YieldNow { yielded: false }
+}
+
+/// Future returned by [`yield_now`].
+#[must_use = "futures do nothing unless awaited"]
+pub struct YieldNow {
+    yielded: bool,
+}
+
+impl Future for YieldNow {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if self.yielded {
+            return Poll::Ready(());
+        }
+        self.yielded = true;
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    }
+}
+
+#[cfg(test)]
+mod yield_now_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Wake, Waker};
+
+    struct CountWakes(AtomicUsize);
+
+    impl Wake for CountWakes {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// The first poll wakes the task once and returns `Pending`; the second
+    /// returns `Ready` without waking it. No executor is involved.
+    #[test]
+    fn yield_now_is_pending_once_then_ready() {
+        let wakes = Arc::new(CountWakes(AtomicUsize::new(0)));
+        let waker = Waker::from(wakes.clone());
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = yield_now();
+        assert!(Pin::new(&mut fut).poll(&mut cx).is_pending());
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
+        assert!(Pin::new(&mut fut).poll(&mut cx).is_ready());
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
     }
 }
 

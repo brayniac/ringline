@@ -14,7 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `ShardedConfig::recv_direct`, open every connection the sharded or cluster
   client makes with `TcpConnect::recv_direct`, as `PoolConfig::recv_direct`
   does for a pool.
-
+- `yield_now()` wakes the calling task and returns `Pending` once, so a task
+  that makes many `send_nowait` calls without awaiting anything lets the
+  worker poll its other queued tasks and process I/O between batches. Callers
+  had each written this future themselves. Tasks woken by I/O or timers
+  processed during the yield are polled after the yielding task resumes, and
+  the task can resume within the same loop iteration on both backends.
+  `tests/ready_queue_fairness.rs` uses it.
 - io_uring: `TcpConnect::recv_direct(true)` makes an outbound plaintext
   connection receive into its own accumulator instead of the shared provided
   buffer ring: a one-shot `RECV` into the accumulator's free space, armed
