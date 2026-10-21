@@ -108,9 +108,8 @@ impl ShardedConfig {
     /// [`tls_server_name`](Self::tls_server_name): connecting fails.
     ///
     /// On io_uring, the client methods that read with segments return an
-    /// `Unsupported` I/O error on such a connection before sending the
-    /// request; [`PoolConfig::recv_direct`](crate::PoolConfig::recv_direct)
-    /// lists them.
+    /// `Unsupported` I/O error on such a connection, which stays usable;
+    /// [`PoolConfig::recv_direct`](crate::PoolConfig::recv_direct) lists them.
     pub fn recv_direct(mut self, enabled: bool) -> Self {
         self.recv_direct = enabled;
         self
