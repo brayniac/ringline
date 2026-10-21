@@ -1148,6 +1148,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   connection, like a write error. Series PR 4 of #318 (design:
   `docs/copied-send-reservation-design.md`).
 
+## [0.6.12] - 2026-10-21
+
+`ringline` 0.6.12 and `ringline-quic` 0.6.2 carry the `rustls-webpki` floor
+below.
+
 ### Security
 
 - `ringline` and `ringline-quic` require `rustls-webpki` 0.103.16 or later
@@ -1157,7 +1162,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - The workspace takes `webpki-roots` 1.0.10 or later for RUSTSEC-2026-0381
   (bundled emSign ECC Root CA - G3 allows paths through distrusted emSign
   intermediates); 0.26.x has no fixed release. Only dev-dependencies and the
-  unpublished ringline-benchmarks use it.
+  unpublished ringline-benchmarks use it. Backport of #686 (#689).
 
 ## [ringline-redis 0.7.1] - 2026-10-17
 
