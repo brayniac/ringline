@@ -766,9 +766,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // only reaches executor.ready_queue via
         // collect_wakeups() once this pass has ended. So a future that wakes
         // itself through its Context (the usual "yield to the executor"
-        // pattern) resumes on the NEXT event-loop iteration — after
-        // submit_and_wait and drain_completions — not within this pass.
-        // tests/ready_queue_fairness.rs pins that property.
+        // pattern, `yield_now`) is not polled again within this pass. It is
+        // polled in the next pass: the fast path after flush() and
+        // drain_completions() in this iteration, or the next iteration.
+        // tests/ready_queue_fairness.rs pins that it does not starve the
+        // worker.
         //
         // This boundary is essential: without it, a future that parks itself
         // and then is immediately re-woken by another task in the same batch

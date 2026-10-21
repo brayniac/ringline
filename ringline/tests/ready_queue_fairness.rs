@@ -20,27 +20,12 @@ use std::future::Future;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use ringline::{AsyncEventHandler, Connection, ParseResult, RinglineBuilder};
 
 /// Set by the test to release the spinning task so shutdown can complete.
 static STOP: AtomicBool = AtomicBool::new(false);
-
-/// Yield to the executor once: wake our own waker, then return `Pending`.
-fn yield_once() -> impl Future<Output = ()> {
-    let mut yielded = false;
-    std::future::poll_fn(move |cx| {
-        if yielded {
-            Poll::Ready(())
-        } else {
-            yielded = true;
-            cx.waker().wake_by_ref();
-            Poll::Pending
-        }
-    })
-}
 
 /// `spin` → self-wake until released. `ping` → reply `pong`.
 struct SpinOrPong;
@@ -64,7 +49,7 @@ impl AsyncEventHandler for SpinOrPong {
                 // suite forever -- the assertion still fails first.
                 let deadline = Instant::now() + Duration::from_secs(30);
                 while !STOP.load(Ordering::Relaxed) && Instant::now() < deadline {
-                    yield_once().await;
+                    ringline::yield_now().await;
                 }
                 return;
             }

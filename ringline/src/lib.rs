@@ -353,6 +353,8 @@ pub use runtime::io::WithDataResultFuture;
 /// Future returned by [`ConnCtx::with_segments()`] (segmented recv, Mode B).
 #[cfg(has_io_uring)]
 pub use runtime::io::WithSegmentsFuture;
+/// Future returned by [`yield_now()`].
+pub use runtime::io::YieldNow;
 /// Begin an outbound TCP connection; awaiting resolves to a `Connection`.
 pub use runtime::io::connect;
 /// Begin an outbound Unix-domain connection; awaiting resolves to a `Connection`.
@@ -405,6 +407,8 @@ pub use runtime::io::try_sleep_until;
 pub use runtime::io::try_timeout;
 /// Fallible timeout_at that returns an error if the timer pool is exhausted.
 pub use runtime::io::try_timeout_at;
+/// Return control to the worker's event loop once.
+pub use runtime::io::yield_now;
 /// Future returned by [`join()`].
 pub use runtime::join::Join;
 /// Future returned by [`join3()`].
