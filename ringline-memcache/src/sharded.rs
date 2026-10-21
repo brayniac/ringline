@@ -10,15 +10,12 @@
 //! use ringline_memcache::{ShardedClient, ShardedConfig};
 //!
 //! async fn example() -> Result<(), ringline_memcache::Error> {
-//!     let config = ShardedConfig {
-//!         servers: vec![
-//!             "127.0.0.1:11211".parse().unwrap(),
-//!             "127.0.0.1:11212".parse().unwrap(),
-//!         ],
-//!         pool_size: 2,
-//!         connect_timeout_ms: 1000,
-//!         tls_server_name: None,
-//!     };
+//!     let config = ShardedConfig::new(vec![
+//!         "127.0.0.1:11211".parse().unwrap(),
+//!         "127.0.0.1:11212".parse().unwrap(),
+//!     ])
+//!     .pool_size(2)
+//!     .connect_timeout_ms(1000);
 //!     let mut sharded = ShardedClient::new(config);
 //!     sharded.connect_all().await?;
 //!     sharded.set("hello", "world").await?;
@@ -39,16 +36,68 @@ use crate::{
 };
 use memcache_proto::Request as McRequest;
 
-/// Configuration for a ketama-sharded client.
+/// Configuration for a ketama-sharded client. Build it with
+/// [`new`](Self::new) and the builder methods.
 pub struct ShardedConfig {
     /// List of independent Memcache server addresses.
-    pub servers: Vec<SocketAddr>,
-    /// Number of connections per server (default: 1).
-    pub pool_size: usize,
+    pub(crate) servers: Vec<SocketAddr>,
+    /// Number of connections per server.
+    pub(crate) pool_size: usize,
     /// Connect timeout in milliseconds. 0 means no timeout.
-    pub connect_timeout_ms: u64,
+    pub(crate) connect_timeout_ms: u64,
     /// TLS server name (SNI) for outbound connections. `None` means plain TCP.
-    pub tls_server_name: Option<String>,
+    pub(crate) tls_server_name: Option<String>,
+    /// Receive with `TcpConnect::recv_direct`.
+    pub(crate) recv_direct: bool,
+}
+
+impl ShardedConfig {
+    /// Create a config for the independent Memcache servers at `servers`.
+    /// Defaults: one connection per server, no connect timeout, plain TCP,
+    /// receives from the provided-buffer ring.
+    pub fn new(servers: Vec<SocketAddr>) -> Self {
+        Self {
+            servers,
+            pool_size: 1,
+            connect_timeout_ms: 0,
+            tls_server_name: None,
+            recv_direct: false,
+        }
+    }
+
+    /// Set the number of connections per server. Defaults to 1; 0 is
+    /// treated as 1.
+    pub fn pool_size(mut self, n: usize) -> Self {
+        self.pool_size = n;
+        self
+    }
+
+    /// Set the connect timeout in milliseconds. `0` (the default) disables it.
+    pub fn connect_timeout_ms(mut self, ms: u64) -> Self {
+        self.connect_timeout_ms = ms;
+        self
+    }
+
+    /// Set the TLS server name (SNI) for outbound connections; enables TLS.
+    pub fn tls_server_name(mut self, name: impl Into<String>) -> Self {
+        self.tls_server_name = Some(name.into());
+        self
+    }
+
+    /// Receive into each connection's own accumulator instead of the
+    /// worker's provided-buffer ring
+    /// ([`TcpConnect::recv_direct`](ringline::TcpConnect::recv_direct)).
+    /// Off by default, and ignored on the mio backend. Not supported with
+    /// [`tls_server_name`](Self::tls_server_name): connecting fails.
+    ///
+    /// On io_uring, the client methods that read with segments return an
+    /// `Unsupported` I/O error on such a connection before sending the
+    /// request; [`PoolConfig::recv_direct`](crate::PoolConfig::recv_direct)
+    /// lists them.
+    pub fn recv_direct(mut self, enabled: bool) -> Self {
+        self.recv_direct = enabled;
+        self
+    }
 }
 
 enum ShardConn {
@@ -86,6 +135,7 @@ pub struct ShardedClient {
     ring: ketama::Ring,
     connect_timeout_ms: u64,
     tls_server_name: Option<String>,
+    recv_direct: bool,
     encode_buf: Vec<u8>,
 }
 
@@ -118,6 +168,7 @@ impl ShardedClient {
             ring,
             connect_timeout_ms: config.connect_timeout_ms,
             tls_server_name: config.tls_server_name,
+            recv_direct: config.recv_direct,
             encode_buf: Vec::new(),
         }
     }
@@ -155,6 +206,7 @@ impl ShardedClient {
         ConnectOpts {
             connect_timeout_ms: self.connect_timeout_ms,
             tls_server_name: self.tls_server_name.clone(),
+            recv_direct: self.recv_direct,
         }
     }
 
@@ -593,6 +645,7 @@ async fn version_on_shard(shard: &mut Shard, opts: &ConnectOpts) -> Result<Box<s
 struct ConnectOpts {
     connect_timeout_ms: u64,
     tls_server_name: Option<String>,
+    recv_direct: bool,
 }
 
 /// Borrow a client from a shard, lazily reconnecting if needed.
@@ -628,7 +681,7 @@ async fn get_conn<'a>(shard: &'a mut Shard, opts: &ConnectOpts) -> Result<&'a mu
 
 async fn do_connect(addr: SocketAddr, opts: &ConnectOpts) -> Result<Client, Error> {
     // TLS and the timeout are set on the builder (#528).
-    let mut connect = ringline::connect(addr);
+    let mut connect = ringline::connect(addr).recv_direct(opts.recv_direct);
     if let Some(ref sni) = opts.tls_server_name {
         connect = connect.tls(sni.as_str());
     }
@@ -645,12 +698,7 @@ mod tests {
 
     #[test]
     fn test_single_server_always_routes_to_zero() {
-        let config = ShardedConfig {
-            servers: vec!["127.0.0.1:11211".parse().unwrap()],
-            pool_size: 1,
-            connect_timeout_ms: 0,
-            tls_server_name: None,
-        };
+        let config = ShardedConfig::new(vec!["127.0.0.1:11211".parse().unwrap()]);
         let client = ShardedClient::new(config);
         assert_eq!(client.ring.route(b"any-key"), 0);
         assert_eq!(client.ring.route(b"another-key"), 0);
@@ -659,16 +707,11 @@ mod tests {
 
     #[test]
     fn test_deterministic_routing() {
-        let config = ShardedConfig {
-            servers: vec![
-                "127.0.0.1:11211".parse().unwrap(),
-                "127.0.0.1:11212".parse().unwrap(),
-                "127.0.0.1:11213".parse().unwrap(),
-            ],
-            pool_size: 1,
-            connect_timeout_ms: 0,
-            tls_server_name: None,
-        };
+        let config = ShardedConfig::new(vec![
+            "127.0.0.1:11211".parse().unwrap(),
+            "127.0.0.1:11212".parse().unwrap(),
+            "127.0.0.1:11213".parse().unwrap(),
+        ]);
         let client = ShardedClient::new(config);
 
         let a = client.ring.route(b"test-key");
@@ -682,15 +725,12 @@ mod tests {
 
     #[test]
     fn test_config_defaults() {
-        let config = ShardedConfig {
-            servers: vec![
-                "127.0.0.1:11211".parse().unwrap(),
-                "127.0.0.1:11212".parse().unwrap(),
-            ],
-            pool_size: 4,
-            connect_timeout_ms: 500,
-            tls_server_name: None,
-        };
+        let config = ShardedConfig::new(vec![
+            "127.0.0.1:11211".parse().unwrap(),
+            "127.0.0.1:11212".parse().unwrap(),
+        ])
+        .pool_size(4)
+        .connect_timeout_ms(500);
         let client = ShardedClient::new(config);
         assert_eq!(client.shard_count(), 2);
         assert_eq!(client.ring.node_count(), 2);
@@ -699,28 +739,29 @@ mod tests {
     }
 
     #[test]
+    fn new_sets_the_defaults() {
+        let addr: SocketAddr = "127.0.0.1:11211".parse().unwrap();
+        let config = ShardedConfig::new(vec![addr]);
+        assert_eq!(config.servers, vec![addr]);
+        assert_eq!(config.pool_size, 1);
+        assert_eq!(config.connect_timeout_ms, 0);
+        assert_eq!(config.tls_server_name, None);
+        assert!(!config.recv_direct);
+    }
+
+    #[test]
     fn test_pool_size_minimum() {
-        let config = ShardedConfig {
-            servers: vec!["127.0.0.1:11211".parse().unwrap()],
-            pool_size: 0,
-            connect_timeout_ms: 0,
-            tls_server_name: None,
-        };
+        let config = ShardedConfig::new(vec!["127.0.0.1:11211".parse().unwrap()]).pool_size(0);
         let client = ShardedClient::new(config);
         assert_eq!(client.shards[0].conns.len(), 1);
     }
 
     #[test]
     fn test_require_same_shard_matching() {
-        let config = ShardedConfig {
-            servers: vec![
-                "127.0.0.1:11211".parse().unwrap(),
-                "127.0.0.1:11212".parse().unwrap(),
-            ],
-            pool_size: 1,
-            connect_timeout_ms: 0,
-            tls_server_name: None,
-        };
+        let config = ShardedConfig::new(vec![
+            "127.0.0.1:11211".parse().unwrap(),
+            "127.0.0.1:11212".parse().unwrap(),
+        ]);
         let client = ShardedClient::new(config);
         let keys: &[&[u8]] = &[b"same-key", b"same-key"];
         assert!(client.require_same_shard(keys).is_ok());
@@ -728,15 +769,10 @@ mod tests {
 
     #[test]
     fn test_require_same_shard_single_key() {
-        let config = ShardedConfig {
-            servers: vec![
-                "127.0.0.1:11211".parse().unwrap(),
-                "127.0.0.1:11212".parse().unwrap(),
-            ],
-            pool_size: 1,
-            connect_timeout_ms: 0,
-            tls_server_name: None,
-        };
+        let config = ShardedConfig::new(vec![
+            "127.0.0.1:11211".parse().unwrap(),
+            "127.0.0.1:11212".parse().unwrap(),
+        ]);
         let client = ShardedClient::new(config);
         let keys: &[&[u8]] = &[b"anykey"];
         assert!(client.require_same_shard(keys).is_ok());
