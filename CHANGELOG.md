@@ -69,18 +69,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   so a caller can fire more requests while it waits, and call `recv` once it
   resolves. Returns `Error::NoPending` with nothing in flight. See
   `docs/send-while-receiving-design.md`, Option A.
-- `ringline-redis`: `ClientBuilder::get_command` and
-  `ClientBuilder::set_command` set the command names a `Client` sends in
-  place of `GET` and `SET`. They apply to `fire_get`, the `fire_set*`
-  methods (zero-copy guard path included), the async `get` and `set*`
-  methods, `Pipeline::get` and `Pipeline::set`, `set_stream` and, on
-  io_uring, `get_stream`. Only the name changes: the TTL and condition forms
-  send the same `EX`, `PX` or `NX` arguments under the configured name.
-  Replies are parsed and counted as GET and SET replies. A client built
-  without them sends the same bytes as before: resp-proto's encoders on the
-  copy paths, and a hand-written prefix that produces the same bytes on the
-  guard and streaming paths. `Pool`, `ShardedClient` and `ClusterClient`
-  always send `GET` and `SET`.
 - `Connection::recv_arrival` and `RecvHalf::recv_arrival` return a
   `RecvArrival`: when the first and the last byte consumed by the
   connection's most recent reader call arrived. The reader calls are
@@ -222,6 +210,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   bytes copied into receive storage (the accumulator, owned held entries,
   owned forward copies, queued TLS plaintext and `copy_small_view` copies)
   on both backends.
+- `metrics::CQE_BY_TAG`: completions processed, split by `OpTag`, with
+  `metrics::cqe_tag::COUNT` sizing the group. The slot index is the tag's
+  discriminant, and `CQE_BY_TAG` plus `ring::CQE_UNKNOWN_TAG` partition
+  `ring::CQE_PROCESSED` exactly, so the split is arithmetic rather than a
+  sample. `ring/cqe_processed` on its own is a single total, and questions
+  about per-operation cost reduce to *which* completions: a 64-byte echo
+  costs ~0.81 completions per operation at 4 workers and ~1.70 at 8, against
+  a ceiling of one recv plus one send, and that total is equally consistent
+  with recv batching, send coalescing, or both. The split answers it — both
+  halves move together, because the forward path returns each received
+  buffer as one send, so a buffer holding *k* pipelined requests costs one
+  recv completion and one send completion. Two slots are never registered
+  (the enum skips discriminants 1 and 17); a metrics dump reports those as
+  `idx1`/`idx17` at zero rather than omitting them (#486).
+- `ConnCtx::with_data_result`: like `with_data`, but resolves to
+  `io::Result<usize>` so a handler can tell a clean peer close (`Ok(0)`)
+  from a transport failure (`Err(e)`, e.g. `ConnectionReset` after an RST).
+  Buffered bytes are delivered before the error, and the error is reported
+  once. `with_data` is unchanged and still reports `0` for both. First PR of
+  the series that lands #318 (design:
+  `docs/backpressured-sends-series-design.md`).
+- `ConnCtx::send_backpressured` and `BackpressuredSendFuture`: a send that
+  waits for send-pool capacity instead of failing when the pool is full.
+  Admission is first-come-first-served per worker, so a large message cannot
+  be starved by a stream of small ones, and a message that could never fit
+  the pool is rejected with `InvalidInput` before it joins the queue rather
+  than waiting forever. Nothing is submitted until the future is polled, so
+  dropping one you never awaited does nothing; dropping a parked one hands
+  the queue to the next waiter. `send` is unchanged and still fails fast —
+  use it when a full pool means you would rather shed the message than wait.
+  On a TLS connection admission is sized by the *ciphertext* bound. Final PR
+  of the series that lands #318.
 
 ### Changed
 
@@ -533,41 +553,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the forward and stale cases added in #425 — could only be refused silently,
   because the signature had no error channel. Callers add `?` or a `match`.
   Step 1 of `docs/connection-handle-ownership-design.md`.
+- mio: the connection lifecycle now follows io_uring's model. A peer FIN or
+  a read error requests teardown immediately (`close_connection`), and
+  teardown finalizes once queued sends have drained — a response sent after
+  the peer's FIN is delivered in full — after which the connection task is
+  dropped. (io_uring itself commits the Close before the task can respond
+  when nothing was queued at the FIN; tracked as #371.) Previously a mio task could keep running indefinitely after
+  EOF. `RecvMode::Closed` is now set only by `close_connection` on both
+  backends. The deferral is unbounded on mio (`close_notify_timeout_ms`
+  is inert there). Design: `docs/mio-close-lifecycle-design.md`.
 
-### Added
+- Internal: connection lifecycle state is now three explicit fields on
+  `ConnectionState` (`recv_arm`, `read`, `lifecycle`) instead of
+  `RecvMode` doing triple duty; readers use `recv_finished()` and
+  `close_requested()`. No observable change except that a connection whose
+  receive was cancelled via `DriverCtx::cancel` (io_uring) can now be
+  closed afterwards — it used to leak its slot — and reports
+  `is_alive() == true` until it is closed. Design:
+  `docs/connection-state-model-design.md`.
 
-- `metrics::CQE_BY_TAG`: completions processed, split by `OpTag`, with
-  `metrics::cqe_tag::COUNT` sizing the group. The slot index is the tag's
-  discriminant, and `CQE_BY_TAG` plus `ring::CQE_UNKNOWN_TAG` partition
-  `ring::CQE_PROCESSED` exactly, so the split is arithmetic rather than a
-  sample. `ring/cqe_processed` on its own is a single total, and questions
-  about per-operation cost reduce to *which* completions: a 64-byte echo
-  costs ~0.81 completions per operation at 4 workers and ~1.70 at 8, against
-  a ceiling of one recv plus one send, and that total is equally consistent
-  with recv batching, send coalescing, or both. The split answers it — both
-  halves move together, because the forward path returns each received
-  buffer as one send, so a buffer holding *k* pipelined requests costs one
-  recv completion and one send completion. Two slots are never registered
-  (the enum skips discriminants 1 and 17); a metrics dump reports those as
-  `idx1`/`idx17` at zero rather than omitting them (#486).
-- `ConnCtx::with_data_result`: like `with_data`, but resolves to
-  `io::Result<usize>` so a handler can tell a clean peer close (`Ok(0)`)
-  from a transport failure (`Err(e)`, e.g. `ConnectionReset` after an RST).
-  Buffered bytes are delivered before the error, and the error is reported
-  once. `with_data` is unchanged and still reports `0` for both. First PR of
-  the series that lands #318 (design:
-  `docs/backpressured-sends-series-design.md`).
-- `ConnCtx::send_backpressured` and `BackpressuredSendFuture`: a send that
-  waits for send-pool capacity instead of failing when the pool is full.
-  Admission is first-come-first-served per worker, so a large message cannot
-  be starved by a stream of small ones, and a message that could never fit
-  the pool is rejected with `InvalidInput` before it joins the queue rather
-  than waiting forever. Nothing is submitted until the future is polled, so
-  dropping one you never awaited does nothing; dropping a parked one hands
-  the queue to the next waiter. `send` is unchanged and still fails fast —
-  use it when a full pool means you would rather shed the message than wait.
-  On a TLS connection admission is sized by the *ciphertext* bound. Final PR
-  of the series that lands #318.
+- Internal: the write half is explicit state on both backends
+  (`ConnectionState::write`: `Open` / `ShutdownPending` / `Shutdown`),
+  replacing the `shutdown_pending` flag on the send state. No policy
+  change: sends after `shutdown_write` still fail at the socket. Design:
+  `docs/write-half-design.md`.
 
 ### Deprecated
 
@@ -635,14 +644,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   read when the park completed, were discarded when the park closed the
   connection on the old worker. Found by reading the code; not observed.
   Park (#443) is not in a release.
-- `ringline-redis` and `ringline-memcache`: a client built with
-  `with_metrics()` and no `on_result` callback records the latency of
-  `fire_*`/`recv` operations. It read the clock only when a callback was
-  set, so those operations recorded `latency_ns = 0` in `ClientMetrics`,
-  `CompletedOp` and redis `RespMeta`. Builds with the removed `timestamps`
-  feature already timed them. Such a client now reads the clock when an
-  operation is sent (once per batch when batching) and again when its
-  response is parsed, as the sequential API already did.
+- `ringline-memcache`: a client built with `with_metrics()` and no
+  `on_result` callback records the latency of `fire_*`/`recv` operations.
+  It read the clock only when a callback was set, so those operations
+  recorded `latency_ns = 0` in `ClientMetrics` and `CompletedOp`. Builds
+  with the removed `timestamps` feature already timed them. Such a client
+  now reads the clock when an operation is sent (once per batch when
+  batching) and again when its response is parsed, as the sequential API
+  already did. The same fix for `ringline-redis` shipped in ringline-redis
+  0.7.1.
 - A connection's receive accumulator gives its allocation back when the
   connection closes. An accumulator grows to the largest message its
   connection buffered, and `reset` keeps the allocation, so each slot kept
@@ -1100,36 +1110,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   re-running the logical send. Under TLS the latter mattered most: re-running
   meant re-encrypting after rustls had already advanced its record sequence,
   which the peer sees as a gap and rejects with `bad_record_mac`.
-
-### Changed
-
-- mio: the connection lifecycle now follows io_uring's model. A peer FIN or
-  a read error requests teardown immediately (`close_connection`), and
-  teardown finalizes once queued sends have drained — a response sent after
-  the peer's FIN is delivered in full — after which the connection task is
-  dropped. (io_uring itself commits the Close before the task can respond
-  when nothing was queued at the FIN; tracked as #371.) Previously a mio task could keep running indefinitely after
-  EOF. `RecvMode::Closed` is now set only by `close_connection` on both
-  backends. The deferral is unbounded on mio (`close_notify_timeout_ms`
-  is inert there). Design: `docs/mio-close-lifecycle-design.md`.
-
-- Internal: connection lifecycle state is now three explicit fields on
-  `ConnectionState` (`recv_arm`, `read`, `lifecycle`) instead of
-  `RecvMode` doing triple duty; readers use `recv_finished()` and
-  `close_requested()`. No observable change except that a connection whose
-  receive was cancelled via `DriverCtx::cancel` (io_uring) can now be
-  closed afterwards — it used to leak its slot — and reports
-  `is_alive() == true` until it is closed. Design:
-  `docs/connection-state-model-design.md`.
-
-- Internal: the write half is explicit state on both backends
-  (`ConnectionState::write`: `Open` / `ShutdownPending` / `Shutdown`),
-  replacing the `shutdown_pending` flag on the send state. No policy
-  change: sends after `shutdown_write` still fail at the socket. Design:
-  `docs/write-half-design.md`.
-
-### Fixed
-
 - mio: a connection whose peer closed first, or whose read failed, was never
   torn down — the `TcpStream` stayed registered and the slot was never
   released, so every such connection permanently consumed one slot and one
@@ -1178,6 +1158,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (bundled emSign ECC Root CA - G3 allows paths through distrusted emSign
   intermediates); 0.26.x has no fixed release. Only dev-dependencies and the
   unpublished ringline-benchmarks use it.
+
+## [ringline-redis 0.7.1] - 2026-10-17
+
+Patch release of `ringline-redis` only, for ringline 0.6.
+
+### Added
+
+- `ringline-redis`: `ClientBuilder::get_command` and
+  `ClientBuilder::set_command` set the command names a `Client` sends in
+  place of `GET` and `SET`. They apply to `fire_get`, the `fire_set*`
+  methods (zero-copy guard path included), the async `get` and `set*`
+  methods, `Pipeline::get` and `Pipeline::set`, `set_stream` and, on
+  io_uring, `get_stream`. Only the name changes: the TTL and condition forms
+  send the same `EX`, `PX` or `NX` arguments under the configured name.
+  Replies are parsed and counted as GET and SET replies. A client built
+  without them sends the same bytes as before: resp-proto's encoders on the
+  copy paths, and a hand-written prefix that produces the same bytes on the
+  guard and streaming paths. `Pool`, `ShardedClient` and `ClusterClient`
+  always send `GET` and `SET`.
+
+### Fixed
+
+- `ringline-redis`: a client built with `with_metrics()` and no
+  `on_result` callback records the latency of `fire_*`/`recv` operations.
+  Without the `timestamps` feature it read the clock only when a callback
+  was set, so those operations recorded `latency_ns = 0` in `ClientMetrics`,
+  `CompletedOp` and `RespMeta`. Such a client now reads the clock when an
+  operation is sent (once per batch when batching) and again when its
+  response is parsed, as the sequential API already did. Backport of #667
+  (#668).
 
 ## [0.6.11] - 2026-10-14
 
