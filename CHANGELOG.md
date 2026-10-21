@@ -17,6 +17,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   sent (once per batch when batching) and again when its response is
   parsed, as the sequential API already did. Backport of #667 (#668).
 
+### Security
+
+- `ringline` and `ringline-quic` require `rustls-webpki` 0.103.16 or later
+  for RUSTSEC-2026-0382 (certificate verification may accept distrusted
+  intermediates). rustls 0.23.46 accepts 0.103.14, so the two crates depend
+  on rustls-webpki directly to carry the floor to downstream resolvers.
+- The workspace takes `webpki-roots` 1.0.10 or later for RUSTSEC-2026-0381
+  (bundled emSign ECC Root CA - G3 allows paths through distrusted emSign
+  intermediates); 0.26.x has no fixed release. Only dev-dependencies and the
+  unpublished ringline-benchmarks use it. Backport of #686 (#689).
+
 ## [ringline-redis 0.7.1] - 2026-10-17
 
 Patch release of `ringline-redis` only, for ringline 0.6.
