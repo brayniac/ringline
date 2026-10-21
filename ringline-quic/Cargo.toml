@@ -12,6 +12,8 @@ description = "QUIC transport layer wrapping quinn-proto for ringline"
 bytes = { workspace = true }
 quinn-proto = { workspace = true }
 rustls = { workspace = true, features = ["std", "ring"] }
+# A version floor only (RUSTSEC-2026-0382); see the workspace Cargo.toml.
+rustls-webpki = { workspace = true }
 slab = { workspace = true }
 thiserror = { workspace = true }
 

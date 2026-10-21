@@ -38,6 +38,8 @@ metriken = "0.11.3"
 pin-project-lite = "0.2"
 thiserror = "2"
 rustls = { workspace = true, features = ["std", "ring"] }
+# A version floor only (RUSTSEC-2026-0382); see the workspace Cargo.toml.
+rustls-webpki = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"
