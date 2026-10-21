@@ -112,10 +112,7 @@ fn a_read_dropped_with_its_connection_frees_its_buffer() {
         .resolver_threads(0)
         .spawner_threads(0)
         .disk_io_threads(1)
-        .fs(FsConfig {
-            max_files: 4,
-            max_commands_in_flight: 64,
-        })
+        .fs(FsConfig::default().max_files(4).max_commands_in_flight(64))
         .build()
         .expect("valid config");
     let (runtime, handles) = RinglineBuilder::new(config)

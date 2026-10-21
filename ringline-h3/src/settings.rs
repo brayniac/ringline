@@ -1,14 +1,18 @@
 use crate::frame::{decode_varint, encode_varint, varint_len};
 
 /// HTTP/3 SETTINGS parameters (RFC 9114 Section 7.2.4.1).
+///
+/// Read each value with its getter and set it with the `with_` method of
+/// the same name.
 #[derive(Debug, Clone)]
 pub struct Settings {
     /// SETTINGS_QPACK_MAX_TABLE_CAPACITY (0x01). Default 0 (no dynamic table).
-    pub qpack_max_table_capacity: u64,
-    /// SETTINGS_MAX_FIELD_SECTION_SIZE (0x06). Default unlimited.
-    pub max_field_section_size: u64,
+    pub(crate) qpack_max_table_capacity: u64,
+    /// SETTINGS_MAX_FIELD_SECTION_SIZE (0x06). Default
+    /// `DEFAULT_MAX_FIELD_SECTION_SIZE`; `u64::MAX` is unlimited.
+    pub(crate) max_field_section_size: u64,
     /// SETTINGS_QPACK_BLOCKED_STREAMS (0x07). Default 0.
-    pub qpack_blocked_streams: u64,
+    pub(crate) qpack_blocked_streams: u64,
 }
 
 /// Default `SETTINGS_MAX_FIELD_SECTION_SIZE`. Comfortably accommodates
@@ -25,6 +29,41 @@ impl Default for Settings {
             max_field_section_size: DEFAULT_MAX_FIELD_SECTION_SIZE,
             qpack_blocked_streams: 0,
         }
+    }
+}
+
+impl Settings {
+    /// SETTINGS_QPACK_MAX_TABLE_CAPACITY (0x01). Default 0 (no dynamic table).
+    pub fn qpack_max_table_capacity(&self) -> u64 {
+        self.qpack_max_table_capacity
+    }
+
+    /// Set SETTINGS_QPACK_MAX_TABLE_CAPACITY (0x01). Default 0 (no dynamic table).
+    pub fn with_qpack_max_table_capacity(mut self, qpack_max_table_capacity: u64) -> Self {
+        self.qpack_max_table_capacity = qpack_max_table_capacity;
+        self
+    }
+
+    /// SETTINGS_MAX_FIELD_SECTION_SIZE (0x06). Default `DEFAULT_MAX_FIELD_SECTION_SIZE`; `u64::MAX` is unlimited.
+    pub fn max_field_section_size(&self) -> u64 {
+        self.max_field_section_size
+    }
+
+    /// Set SETTINGS_MAX_FIELD_SECTION_SIZE (0x06). Default `DEFAULT_MAX_FIELD_SECTION_SIZE`; `u64::MAX` is unlimited.
+    pub fn with_max_field_section_size(mut self, max_field_section_size: u64) -> Self {
+        self.max_field_section_size = max_field_section_size;
+        self
+    }
+
+    /// SETTINGS_QPACK_BLOCKED_STREAMS (0x07). Default 0.
+    pub fn qpack_blocked_streams(&self) -> u64 {
+        self.qpack_blocked_streams
+    }
+
+    /// Set SETTINGS_QPACK_BLOCKED_STREAMS (0x07). Default 0.
+    pub fn with_qpack_blocked_streams(mut self, qpack_blocked_streams: u64) -> Self {
+        self.qpack_blocked_streams = qpack_blocked_streams;
+        self
     }
 }
 
@@ -95,6 +134,21 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn with_methods_set_what_the_getters_read() {
+        let d = Settings::default();
+        assert_eq!(d.qpack_max_table_capacity(), 0);
+        assert_eq!(d.max_field_section_size(), DEFAULT_MAX_FIELD_SECTION_SIZE);
+        assert_eq!(d.qpack_blocked_streams(), 0);
+        let s = Settings::default()
+            .with_qpack_max_table_capacity(1)
+            .with_max_field_section_size(2)
+            .with_qpack_blocked_streams(3);
+        assert_eq!(s.qpack_max_table_capacity(), 1);
+        assert_eq!(s.max_field_section_size(), 2);
+        assert_eq!(s.qpack_blocked_streams(), 3);
+    }
 
     #[test]
     fn duplicate_setting_id_rejected() {

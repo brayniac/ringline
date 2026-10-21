@@ -35,10 +35,9 @@ fn config(max_files: u16, disk_io_threads: usize) -> Config {
         .resolver_threads(0)
         .spawner_threads(0)
         .disk_io_threads(disk_io_threads)
-        .fs(FsConfig {
-            max_files,
-            max_commands_in_flight: 64,
-        })
+        .fs(FsConfig::default()
+            .max_files(max_files)
+            .max_commands_in_flight(64))
         .build()
         .expect("valid config")
 }

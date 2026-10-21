@@ -236,6 +236,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   server, no connect timeout, plain TCP, no AUTH. A `pool_size` of 0 is
   still treated as 1. Adding an option to them is no longer a breaking
   change, as for `PoolConfig`.
+- **Breaking:** the public config structs of `ringline`, `ringline-quic`,
+  `ringline-h2` and `ringline-h3` have private fields and builder methods,
+  as `Config` and `PoolConfig` do:
+  - `ringline` `NvmeConfig`, `FsConfig` and `DirectIoConfig`: start from
+    `Default::default()` and set `max_devices` (NVMe) or `max_files`, and
+    `max_commands_in_flight`.
+  - `ringline-quic` `QuicConfig`: start from `QuicConfig::server` or
+    `QuicConfig::client` and set `endpoint_config`, `server_config`,
+    `client_config` (an endpoint can take both), `send_queue_capacity`,
+    `max_transmit_datagrams`, `allow_mtud` and `rng_seed`. An endpoint with
+    neither a server nor a client config, which could neither accept nor
+    connect, can no longer be built.
+  - `ringline-h2` `Settings` and `ringline-h3` `Settings`, which decoded
+    SETTINGS frames also return: each value has a getter of the field's name
+    and a `with_` setter (`with_max_field_section_size`, which the h3 docs
+    already named, now exists).
 - `ringline` takes `bytes` from the workspace, so it requires 1.11.1 or
   later, as the other crates do; views use `Bytes::from_owner` (1.9). On
   io_uring a provided-buffer ring's buffers are an anonymous mapping, shared

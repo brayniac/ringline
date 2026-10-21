@@ -528,21 +528,12 @@ fn client_endpoint_without_client_config_cannot_connect() {
 
 #[test]
 fn server_drops_incoming_when_no_server_config() {
-    // Endpoint with neither client nor server config.
-    let endpoint_cfg = QuicConfig {
-        endpoint_config: Arc::new(quinn_proto::EndpointConfig::default()),
-        server_config: None,
-        client_config: None,
-        send_queue_capacity: 4096,
-        max_transmit_datagrams: 10,
-        allow_mtud: false,
-        rng_seed: None,
-    };
+    // An endpoint with no server config: a client-only one.
+    let (certs, _key) = self_signed();
+    let endpoint_cfg = client_config(&certs).allow_mtud(false);
     let mut server = QuicEndpoint::new(endpoint_cfg, "127.0.0.1:60100".parse().unwrap());
 
-    // Build a separate client that *is* configured, and let it try to
-    // initiate a handshake.
-    let (certs, _key) = self_signed();
+    // Build a separate client and let it try to initiate a handshake.
     let mut client = QuicEndpoint::new(client_config(&certs), "127.0.0.1:60101".parse().unwrap());
     let _ = client.connect(
         common::now(),
@@ -560,7 +551,9 @@ fn server_drops_incoming_when_no_server_config() {
         }
     }
 
-    // No NewConnection from server.
+    // No NewConnection from server. In this single pass no event fires even
+    // for an accepted connection, so the connection count is the assertion
+    // that tells the two apart.
     let mut saw_new = false;
     while let Some(ev) = server.poll_event() {
         if matches!(ev, QuicEvent::NewConnection(_)) {
@@ -847,10 +840,8 @@ fn send_queue_capacity_caps_queued_packets() {
     // and the connection must not corrupt itself).
     let (certs, key) = self_signed();
 
-    let mut client_cfg = client_config(&certs);
-    client_cfg.send_queue_capacity = 4;
-    let mut server_cfg = server_config(certs, key);
-    server_cfg.send_queue_capacity = 4;
+    let client_cfg = client_config(&certs).send_queue_capacity(4);
+    let server_cfg = server_config(certs, key).send_queue_capacity(4);
 
     let ca: SocketAddr = "127.0.0.1:51000".parse().unwrap();
     let sa: SocketAddr = "127.0.0.1:51001".parse().unwrap();
@@ -1773,10 +1764,8 @@ fn quic_drain_transmits_preserves_gso_segments() {
     //   2. Every individual datagram (after iterating
     //      `OutgoingPacket::datagrams`) stays under the MTU.
     let (certs, key) = self_signed();
-    let mut client_cfg = client_config(&certs);
-    client_cfg.max_transmit_datagrams = 16;
-    let mut server_cfg = server_config(certs, key);
-    server_cfg.max_transmit_datagrams = 16;
+    let client_cfg = client_config(&certs).max_transmit_datagrams(16);
+    let server_cfg = server_config(certs, key).max_transmit_datagrams(16);
 
     let ca: SocketAddr = "127.0.0.1:53400".parse().unwrap();
     let sa: SocketAddr = "127.0.0.1:53401".parse().unwrap();
