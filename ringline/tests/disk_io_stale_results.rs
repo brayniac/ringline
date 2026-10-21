@@ -135,10 +135,7 @@ fn a_stale_result_does_not_free_a_pending_reads_buffer() {
         .blocking_threads(0)
         .resolver_threads(0)
         .spawner_threads(0)
-        .fs(FsConfig {
-            max_files: 4,
-            max_commands_in_flight: 64,
-        })
+        .fs(FsConfig::default().max_files(4).max_commands_in_flight(64))
         .build()
         .expect("valid config");
     let (runtime, handles) = RinglineBuilder::new(config)
@@ -337,10 +334,11 @@ fn a_futureless_operations_result_is_not_taken_by_a_later_one() {
         .blocking_threads(0)
         .resolver_threads(0)
         .spawner_threads(0)
-        .direct_io(ringline::direct_io::DirectIoConfig {
-            max_files: 4,
-            max_commands_in_flight: 32,
-        })
+        .direct_io(
+            ringline::direct_io::DirectIoConfig::default()
+                .max_files(4)
+                .max_commands_in_flight(32),
+        )
         .build()
         .expect("valid config");
     let (runtime, handles) = RinglineBuilder::new(config)
@@ -464,10 +462,7 @@ fn a_future_dropped_with_its_connection_leaves_no_result() {
         .blocking_threads(0)
         .resolver_threads(0)
         .spawner_threads(0)
-        .fs(FsConfig {
-            max_files: 4,
-            max_commands_in_flight: 64,
-        })
+        .fs(FsConfig::default().max_files(4).max_commands_in_flight(64))
         .build()
         .expect("valid config");
     let (runtime, handles) = RinglineBuilder::new(config)
@@ -576,10 +571,7 @@ fn a_held_key_is_not_reused() {
         .blocking_threads(0)
         .resolver_threads(0)
         .spawner_threads(0)
-        .fs(FsConfig {
-            max_files: 4,
-            max_commands_in_flight: 64,
-        })
+        .fs(FsConfig::default().max_files(4).max_commands_in_flight(64))
         .build()
         .expect("valid config");
     let (runtime, handles) = RinglineBuilder::new(config)

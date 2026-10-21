@@ -251,9 +251,9 @@ impl DirectIoCompletion {
 #[derive(Clone, Debug)]
 pub struct DirectIoConfig {
     /// Maximum number of files that can be opened simultaneously.
-    pub max_files: u16,
+    pub(crate) max_files: u16,
     /// Maximum I/O commands in flight across all files per worker.
-    pub max_commands_in_flight: u16,
+    pub(crate) max_commands_in_flight: u16,
 }
 
 impl Default for DirectIoConfig {
@@ -265,9 +265,33 @@ impl Default for DirectIoConfig {
     }
 }
 
+impl DirectIoConfig {
+    /// Set the most files open at once on each worker. Defaults to 8.
+    pub fn max_files(mut self, max_files: u16) -> Self {
+        self.max_files = max_files;
+        self
+    }
+
+    /// Set the most I/O commands in flight across all files, per worker. Defaults to 256.
+    pub fn max_commands_in_flight(mut self, max_commands_in_flight: u16) -> Self {
+        self.max_commands_in_flight = max_commands_in_flight;
+        self
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn builder_sets_each_field_and_default_keeps_the_rest() {
+        let d = DirectIoConfig::default();
+        assert_eq!((d.max_files, d.max_commands_in_flight), (8, 256));
+        let c = DirectIoConfig::default()
+            .max_files(3)
+            .max_commands_in_flight(7);
+        assert_eq!((c.max_files, c.max_commands_in_flight), (3, 7));
+    }
 
     #[test]
     fn dsync_adds_o_dsync_and_the_default_adds_nothing() {

@@ -31,10 +31,11 @@ fn direct_io_test_config_builder() -> ConfigBuilder {
         .max_connections(8)
         .send_pool(8, 16384)
         .tick_timeout_us(1000)
-        .direct_io(DirectIoConfig {
-            max_files: 4,
-            max_commands_in_flight: 32,
-        })
+        .direct_io(
+            DirectIoConfig::default()
+                .max_files(4)
+                .max_commands_in_flight(32),
+        )
 }
 
 fn direct_io_test_config() -> Config {

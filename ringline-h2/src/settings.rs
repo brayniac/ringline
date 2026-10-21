@@ -24,20 +24,24 @@ pub const MAX_PEER_HEADER_TABLE_SIZE: u32 = 65536;
 pub const DEFAULT_MAX_HEADER_LIST_SIZE: u32 = 262_144;
 
 /// HTTP/2 SETTINGS parameters.
+///
+/// Read each value with its getter and set it with the `with_` method of
+/// the same name.
 #[derive(Debug, Clone)]
 pub struct Settings {
     /// SETTINGS_HEADER_TABLE_SIZE (0x1). Default 4096.
-    pub header_table_size: u32,
-    /// SETTINGS_ENABLE_PUSH (0x2). Default 1 (enabled).
-    pub enable_push: bool,
+    pub(crate) header_table_size: u32,
+    /// SETTINGS_ENABLE_PUSH (0x2). Default enabled.
+    pub(crate) enable_push: bool,
     /// SETTINGS_MAX_CONCURRENT_STREAMS (0x3). Default unlimited.
-    pub max_concurrent_streams: Option<u32>,
+    pub(crate) max_concurrent_streams: Option<u32>,
     /// SETTINGS_INITIAL_WINDOW_SIZE (0x4). Default 65535.
-    pub initial_window_size: u32,
+    pub(crate) initial_window_size: u32,
     /// SETTINGS_MAX_FRAME_SIZE (0x5). Default 16384.
-    pub max_frame_size: u32,
-    /// SETTINGS_MAX_HEADER_LIST_SIZE (0x6). Default unlimited.
-    pub max_header_list_size: Option<u32>,
+    pub(crate) max_frame_size: u32,
+    /// SETTINGS_MAX_HEADER_LIST_SIZE (0x6); `None` is unlimited. Default
+    /// `Some(DEFAULT_MAX_HEADER_LIST_SIZE)`.
+    pub(crate) max_header_list_size: Option<u32>,
 }
 
 impl Default for Settings {
@@ -50,6 +54,74 @@ impl Default for Settings {
             max_frame_size: 16384,
             max_header_list_size: Some(DEFAULT_MAX_HEADER_LIST_SIZE),
         }
+    }
+}
+
+impl Settings {
+    /// SETTINGS_HEADER_TABLE_SIZE (0x1). Default 4096.
+    pub fn header_table_size(&self) -> u32 {
+        self.header_table_size
+    }
+
+    /// Set SETTINGS_HEADER_TABLE_SIZE (0x1). Default 4096.
+    pub fn with_header_table_size(mut self, header_table_size: u32) -> Self {
+        self.header_table_size = header_table_size;
+        self
+    }
+
+    /// SETTINGS_ENABLE_PUSH (0x2). Default enabled.
+    pub fn enable_push(&self) -> bool {
+        self.enable_push
+    }
+
+    /// Set SETTINGS_ENABLE_PUSH (0x2). Default enabled.
+    pub fn with_enable_push(mut self, enable_push: bool) -> Self {
+        self.enable_push = enable_push;
+        self
+    }
+
+    /// SETTINGS_MAX_CONCURRENT_STREAMS (0x3); `None` is unlimited, the default.
+    pub fn max_concurrent_streams(&self) -> Option<u32> {
+        self.max_concurrent_streams
+    }
+
+    /// Set SETTINGS_MAX_CONCURRENT_STREAMS (0x3); `None` is unlimited, the default.
+    pub fn with_max_concurrent_streams(mut self, max_concurrent_streams: Option<u32>) -> Self {
+        self.max_concurrent_streams = max_concurrent_streams;
+        self
+    }
+
+    /// SETTINGS_INITIAL_WINDOW_SIZE (0x4). Default 65535.
+    pub fn initial_window_size(&self) -> u32 {
+        self.initial_window_size
+    }
+
+    /// Set SETTINGS_INITIAL_WINDOW_SIZE (0x4). Default 65535.
+    pub fn with_initial_window_size(mut self, initial_window_size: u32) -> Self {
+        self.initial_window_size = initial_window_size;
+        self
+    }
+
+    /// SETTINGS_MAX_FRAME_SIZE (0x5). Default 16384.
+    pub fn max_frame_size(&self) -> u32 {
+        self.max_frame_size
+    }
+
+    /// Set SETTINGS_MAX_FRAME_SIZE (0x5). Default 16384.
+    pub fn with_max_frame_size(mut self, max_frame_size: u32) -> Self {
+        self.max_frame_size = max_frame_size;
+        self
+    }
+
+    /// SETTINGS_MAX_HEADER_LIST_SIZE (0x6); `None` is unlimited. Default `Some(DEFAULT_MAX_HEADER_LIST_SIZE)`.
+    pub fn max_header_list_size(&self) -> Option<u32> {
+        self.max_header_list_size
+    }
+
+    /// Set SETTINGS_MAX_HEADER_LIST_SIZE (0x6); `None` is unlimited. Default `Some(DEFAULT_MAX_HEADER_LIST_SIZE)`.
+    pub fn with_max_header_list_size(mut self, max_header_list_size: Option<u32>) -> Self {
+        self.max_header_list_size = max_header_list_size;
+        self
     }
 }
 
@@ -152,6 +224,30 @@ fn encode_setting(buf: &mut Vec<u8>, id: u16, value: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn with_methods_set_what_the_getters_read() {
+        let d = Settings::default();
+        assert_eq!(d.header_table_size(), 4096);
+        assert!(d.enable_push());
+        assert_eq!(d.max_concurrent_streams(), None);
+        assert_eq!(d.initial_window_size(), 65535);
+        assert_eq!(d.max_frame_size(), 16384);
+        assert_eq!(d.max_header_list_size(), Some(DEFAULT_MAX_HEADER_LIST_SIZE));
+        let s = Settings::default()
+            .with_header_table_size(1)
+            .with_enable_push(false)
+            .with_max_concurrent_streams(Some(2))
+            .with_initial_window_size(3)
+            .with_max_frame_size(20000)
+            .with_max_header_list_size(None);
+        assert_eq!(s.header_table_size(), 1);
+        assert!(!s.enable_push());
+        assert_eq!(s.max_concurrent_streams(), Some(2));
+        assert_eq!(s.initial_window_size(), 3);
+        assert_eq!(s.max_frame_size(), 20000);
+        assert_eq!(s.max_header_list_size(), None);
+    }
 
     #[test]
     fn default_settings_round_trip() {

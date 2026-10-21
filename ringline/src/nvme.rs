@@ -351,9 +351,9 @@ impl NvmeCompletion {
 #[derive(Clone, Debug)]
 pub struct NvmeConfig {
     /// Maximum number of NVMe devices that can be opened simultaneously.
-    pub max_devices: u16,
+    pub(crate) max_devices: u16,
     /// Maximum NVMe commands in flight across all devices per worker.
-    pub max_commands_in_flight: u16,
+    pub(crate) max_commands_in_flight: u16,
 }
 
 impl Default for NvmeConfig {
@@ -365,9 +365,33 @@ impl Default for NvmeConfig {
     }
 }
 
+impl NvmeConfig {
+    /// Set the most NVMe devices open at once on each worker. Defaults to 4.
+    pub fn max_devices(mut self, max_devices: u16) -> Self {
+        self.max_devices = max_devices;
+        self
+    }
+
+    /// Set the most NVMe commands in flight across all devices, per worker. Defaults to 256.
+    pub fn max_commands_in_flight(mut self, max_commands_in_flight: u16) -> Self {
+        self.max_commands_in_flight = max_commands_in_flight;
+        self
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn builder_sets_each_field_and_default_keeps_the_rest() {
+        let d = NvmeConfig::default();
+        assert_eq!((d.max_devices, d.max_commands_in_flight), (4, 256));
+        let c = NvmeConfig::default()
+            .max_devices(2)
+            .max_commands_in_flight(32);
+        assert_eq!((c.max_devices, c.max_commands_in_flight), (2, 32));
+    }
 
     #[test]
     fn nvme_uring_cmd_size() {

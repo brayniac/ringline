@@ -193,9 +193,9 @@ impl Metadata {
 #[derive(Clone, Debug)]
 pub struct FsConfig {
     /// Maximum number of files that can be opened simultaneously.
-    pub max_files: u16,
+    pub(crate) max_files: u16,
     /// Maximum I/O commands in flight across all files per worker.
-    pub max_commands_in_flight: u16,
+    pub(crate) max_commands_in_flight: u16,
 }
 
 impl Default for FsConfig {
@@ -204,6 +204,20 @@ impl Default for FsConfig {
             max_files: 64,
             max_commands_in_flight: 256,
         }
+    }
+}
+
+impl FsConfig {
+    /// Set the most files open at once on each worker. Defaults to 64.
+    pub fn max_files(mut self, max_files: u16) -> Self {
+        self.max_files = max_files;
+        self
+    }
+
+    /// Set the most I/O commands in flight across all files, per worker. Defaults to 256.
+    pub fn max_commands_in_flight(mut self, max_commands_in_flight: u16) -> Self {
+        self.max_commands_in_flight = max_commands_in_flight;
+        self
     }
 }
 
@@ -1134,6 +1148,14 @@ pub fn mkdir(path: impl AsRef<std::path::Path>, mode: u32) -> io::Result<DiskIoF
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn builder_sets_each_field_and_default_keeps_the_rest() {
+        let d = FsConfig::default();
+        assert_eq!((d.max_files, d.max_commands_in_flight), (64, 256));
+        let c = FsConfig::default().max_files(3).max_commands_in_flight(7);
+        assert_eq!((c.max_files, c.max_commands_in_flight), (3, 7));
+    }
 
     #[test]
     fn file_table_alloc_release() {
