@@ -196,6 +196,8 @@ pub struct Config {
     /// Arm multishot TCP receives instead of one-shot ones. See
     /// `ConfigBuilder::recv_multishot`.
     pub(crate) recv_multishot: bool,
+    /// `ConfigBuilder::recv_direct_inbound`.
+    pub(crate) recv_direct_inbound: bool,
     /// Bound on the per-worker accept channel. If a worker can't drain its
     /// queue fast enough, the acceptor will skip past it (and possibly
     /// close the incoming fd if every worker is full) rather than
@@ -475,6 +477,7 @@ impl Default for Config {
             prefault_buffers: false,
             recv_incremental: false,
             recv_multishot: false,
+            recv_direct_inbound: false,
             accept_queue_capacity: 1024,
             conn_chunk_size: 1,
             send_copy_count: 1024,
@@ -1049,6 +1052,16 @@ impl ConfigBuilder {
     /// **Default: false**.
     pub fn recv_multishot(mut self, enabled: bool) -> Self {
         self.config.recv_multishot = enabled;
+        self
+    }
+
+    /// Experiment: accepted plaintext connections receive directly into
+    /// their accumulators, as outbound plaintext connections do (see
+    /// [`connect`](crate::connect)), instead of through the provided-buffer
+    /// ring. A connection accepted on a TLS listener is not affected. Such a
+    /// connection is never parked. io_uring only. **Default: false**.
+    pub fn recv_direct_inbound(mut self, enabled: bool) -> Self {
+        self.config.recv_direct_inbound = enabled;
         self
     }
 

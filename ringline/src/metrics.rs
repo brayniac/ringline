@@ -266,10 +266,12 @@ pub mod park_abandon {
     /// The `FixedFdInstall` failed, or the linked recv-cancel returned
     /// `ECANCELED` because the recv had self-terminated.
     pub const INSTALL_FAILED: usize = 14;
+    /// The connection receives directly into its accumulator.
+    pub const DIRECT_RECEIVE: usize = 15;
 
     /// Number of slots. Sizing the group from this keeps the width and the
     /// range check from drifting apart.
-    pub const COUNT: usize = 15;
+    pub const COUNT: usize = 16;
 }
 
 /// Counter slot indices for byte metrics.
@@ -663,6 +665,11 @@ pub fn init_metadata() {
         park_abandon::INSTALL_FAILED,
         "op".into(),
         "install_failed".into(),
+    );
+    PARK_ABANDONED.insert_metadata(
+        park_abandon::DIRECT_RECEIVE,
+        "op".into(),
+        "direct_receive".into(),
     );
 
     BYTES.insert_metadata(bytes::RECEIVED, "op".into(), "received".into());

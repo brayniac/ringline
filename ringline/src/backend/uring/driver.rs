@@ -856,6 +856,9 @@ pub(crate) struct Driver {
     pub(crate) forward_hold_cap: usize,
     /// `Config::recv_multishot`: TCP connections arm multishot receives.
     pub(crate) recv_multishot: bool,
+    /// `Config::recv_direct_inbound`: accepted plaintext connections receive
+    /// directly into their accumulators.
+    pub(crate) recv_direct_inbound: bool,
     pub(crate) accept_rx: Option<crossbeam_channel::Receiver<crate::acceptor::AcceptedConn>>,
     /// Merged accept mode: every merged listener's sockets, `(listener index,
     /// sockets)`. This worker accepts on socket `worker_index` of each, and
@@ -1241,6 +1244,10 @@ pub(crate) enum ParkBlocker {
     RecvFallback,
     /// A direct-echo response is queued for this worker's next flush.
     DirectEcho,
+    /// The connection receives directly into its accumulator. Its receive
+    /// buffer is in this worker's `direct_recvs` while a receive is armed,
+    /// and carrying it is not implemented.
+    DirectReceive,
 }
 
 impl ParkBlocker {
@@ -1267,6 +1274,7 @@ impl ParkBlocker {
             ParkBlocker::SegmentReader => pa::SEGMENT_READER,
             ParkBlocker::RecvFallback => pa::RECV_FALLBACK,
             ParkBlocker::DirectEcho => pa::DIRECT_ECHO,
+            ParkBlocker::DirectReceive => pa::DIRECT_RECEIVE,
         }
     }
 }
@@ -1296,6 +1304,7 @@ mod park_blocker_tests {
             ParkBlocker::SegmentReader,
             ParkBlocker::RecvFallback,
             ParkBlocker::DirectEcho,
+            ParkBlocker::DirectReceive,
         ];
         let mut seen = std::collections::HashMap::new();
         for b in all {
@@ -1547,6 +1556,7 @@ impl Driver {
             recv_rearm_retries: Vec::new(),
             forward_hold_cap: config.forward_hold_cap,
             recv_multishot: config.recv_multishot,
+            recv_direct_inbound: config.recv_direct_inbound,
             accept_rx,
             merged_listeners: config.merged_listeners.clone(),
             merged_accept_live: config.merged_accept_live.clone(),
@@ -2711,6 +2721,10 @@ impl Driver {
         // wedge the connection waiting for a ClientHello.
         if conn.listener.is_none() {
             return Some(ParkBlocker::Outbound);
+        }
+
+        if conn.recv_direct {
+            return Some(ParkBlocker::DirectReceive);
         }
 
         // A TLS connection's session lives in this worker's `TlsTable`, and

@@ -2688,7 +2688,20 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         for chunk in &pending {
             self.driver.accumulators.append(conn_index, chunk);
         }
-        self.arm_recv(conn_index);
+        let tls_listener = self
+            .driver
+            .tls_table
+            .as_ref()
+            .is_some_and(|t| t.has_server_config_for(Some(listener)));
+        if self.driver.recv_direct_inbound && !tls_listener {
+            // Receives directly into its accumulator: armed by the first
+            // parked read, as for an outbound plaintext connection.
+            if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+                cs.recv_direct = true;
+            }
+        } else {
+            self.arm_recv(conn_index);
+        }
 
         // TLS path: defer accept until handshake completes.
         if let Some(ref mut tls_table) = self.driver.tls_table
