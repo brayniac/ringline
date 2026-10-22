@@ -1,5 +1,5 @@
-//! Direct receives (`TcpConnect::recv_direct`): one-shot receives into the
-//! connection's own accumulator.
+//! Direct receives: a plaintext connection from `connect` or `connect_unix`
+//! receives with one-shot receives into its own accumulator.
 #![cfg(has_io_uring)]
 #![allow(clippy::manual_async_fn)]
 
@@ -155,7 +155,7 @@ impl AsyncEventHandler for BytesClient {
     fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
         Some(Box::pin(async {
             let addr = SERVER.lock().unwrap().unwrap();
-            let r = match ringline::connect(addr).recv_direct(true).await {
+            let r = match ringline::connect(addr).await {
                 Ok(conn) => read_all(conn, true).await,
                 Err(e) => Err(format!("connect: {e}")),
             };
@@ -177,7 +177,7 @@ impl AsyncEventHandler for DataClient {
     fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
         Some(Box::pin(async {
             let addr = SERVER.lock().unwrap().unwrap();
-            let r = match ringline::connect(addr).recv_direct(true).await {
+            let r = match ringline::connect(addr).await {
                 Ok(conn) => read_all(conn, false).await,
                 Err(e) => Err(format!("connect: {e}")),
             };
@@ -222,7 +222,6 @@ impl AsyncEventHandler for CloseWhileArmed {
             let addr = SERVER2.lock().unwrap().unwrap();
             let r = async {
                 let mut first = ringline::connect(addr)
-                    .recv_direct(true)
                     .await
                     .map_err(|e| format!("connect 1: {e}"))?;
                 let waited = ringline::timeout(
@@ -238,7 +237,6 @@ impl AsyncEventHandler for CloseWhileArmed {
                 // Let the Close complete so the slot is free to reuse.
                 ringline::sleep(Duration::from_millis(50)).await;
                 let mut second = ringline::connect(addr)
-                    .recv_direct(true)
                     .await
                     .map_err(|e| format!("connect 2: {e}"))?;
                 let mut got = Vec::new();
@@ -326,7 +324,6 @@ impl AsyncEventHandler for Overestimate {
             let addr = SERVER.lock().unwrap().unwrap();
             let r = async {
                 let mut conn = ringline::connect(addr)
-                    .recv_direct(true)
                     .await
                     .map_err(|e| format!("connect: {e}"))?;
                 for m in 0..OVER_COUNT {
@@ -407,7 +404,6 @@ impl AsyncEventHandler for ResetMidMessage {
             let addr = SERVER.lock().unwrap().unwrap();
             let r = async {
                 let mut conn = ringline::connect(addr)
-                    .recv_direct(true)
                     .await
                     .map_err(|e| format!("connect: {e}"))?;
                 // A 100,000-byte frame of which the peer sends 2,000 bytes,
@@ -517,17 +513,12 @@ impl AsyncEventHandler for Refusals {
         Some(Box::pin(async {
             let addr = SERVER.lock().unwrap().unwrap();
             let r = async {
-                expect_unsupported(
-                    "tls",
-                    ringline::connect(addr)
-                        .tls("localhost")
-                        .recv_direct(true)
-                        .await,
-                )?;
                 let mut conn = ringline::connect(addr)
-                    .recv_direct(true)
                     .await
                     .map_err(|e| format!("connect: {e}"))?;
+                if !conn.is_recv_direct() {
+                    return Err("a plaintext connect is not direct".into());
+                }
                 expect_unsupported("segments", conn.segments().map(|_| ()))?;
                 expect_unsupported("recv_owned_segment", conn.recv_owned_segment().map(|_| ()))?;
                 expect_unsupported(
@@ -540,14 +531,6 @@ impl AsyncEventHandler for Refusals {
                 )?;
                 conn.enable_recv_forward();
                 expect_unsupported("forward_held", conn.forward_held().map(|_| ()))?;
-                let sink = ringline::connect(addr)
-                    .await
-                    .map_err(|e| format!("connect sink: {e}"))?;
-                let (mut sink_tx, _sink_rx) = sink.split();
-                expect_unsupported(
-                    "forward_to_conn",
-                    conn.forward_to_conn(&mut sink_tx, 10).await,
-                )?;
                 // Resolves at once rather than waiting for an EOF.
                 ringline::timeout(Duration::from_secs(5), conn.run_direct_echo())
                     .await
@@ -590,9 +573,7 @@ fn a_direct_connection_refuses_reads_that_need_the_ring() {
     *SERVER.lock().unwrap() = Some(listener.local_addr().unwrap());
     *REFUSALS.lock().unwrap() = None;
     let server = std::thread::spawn(move || {
-        // The direct connection, then the sink.
         let (mut direct, _) = listener.accept().unwrap();
-        let (_sink, _) = listener.accept().unwrap();
         std::thread::sleep(Duration::from_millis(200));
         direct.write_all(b"ping").unwrap();
         std::thread::sleep(Duration::from_millis(500));
@@ -631,7 +612,6 @@ impl AsyncEventHandler for ReadyWithPart {
             let addr = SERVER.lock().unwrap().unwrap();
             let r = async {
                 let mut conn = ringline::connect(addr)
-                    .recv_direct(true)
                     .await
                     .map_err(|e| format!("connect: {e}"))?;
                 let read = ringline::timeout(
@@ -710,7 +690,6 @@ impl AsyncEventHandler for StreamRead {
             let addr = SERVER.lock().unwrap().unwrap();
             let r = async {
                 let conn = ringline::connect(addr)
-                    .recv_direct(true)
                     .await
                     .map_err(|e| format!("connect: {e}"))?;
                 let mut stream = ringline::ConnStream::new(conn.as_conn());
@@ -781,4 +760,251 @@ fn conn_stream_reads_a_direct_connection() {
             .expect("client did not finish"),
         Ok(())
     );
+}
+
+static UNIX_PATH: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+static UNIX: Mutex<Option<Result<(), String>>> = Mutex::new(None);
+
+/// A connection from `connect_unix` is direct and reads what the peer sent.
+struct UnixRead;
+
+impl AsyncEventHandler for UnixRead {
+    fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        Some(Box::pin(async {
+            let path = UNIX_PATH.lock().unwrap().clone().unwrap();
+            let r = async {
+                let mut conn = ringline::connect_unix(&path)
+                    .await
+                    .map_err(|e| format!("connect_unix: {e}"))?;
+                if !conn.is_recv_direct() {
+                    return Err("a connect_unix connection is not direct".into());
+                }
+                let mut got = Vec::new();
+                while got.len() < 5 {
+                    let n = ringline::timeout(
+                        Duration::from_secs(2),
+                        conn.with_data(|b| {
+                            got.extend_from_slice(b);
+                            ParseResult::Consumed(b.len())
+                        }),
+                    )
+                    .await
+                    .map_err(|_| "with_data did not resolve".to_string())?;
+                    if n == 0 {
+                        break;
+                    }
+                }
+                if got != b"hello" {
+                    return Err(format!("read {got:?}"));
+                }
+                Ok(())
+            }
+            .await;
+            *UNIX.lock().unwrap() = Some(r);
+            let _ = ringline::request_shutdown();
+        }))
+    }
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
+        async {}
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        UnixRead
+    }
+}
+
+#[test]
+fn a_unix_connection_receives_directly() {
+    let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = std::env::temp_dir().join(format!("ringline-recv-direct-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("sock");
+    let _ = std::fs::remove_file(&path);
+    let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    *UNIX_PATH.lock().unwrap() = Some(path.clone());
+    *UNIX.lock().unwrap() = None;
+    let server = std::thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        // After the client has parked, so the read arms a receive.
+        std::thread::sleep(Duration::from_millis(200));
+        s.write_all(b"hello").unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let _ = std::io::Read::read(&mut s, &mut [0u8; 1]);
+    });
+    let config = ConfigBuilder::new()
+        .workers(1)
+        .pin_to_core(false)
+        .max_connections(16)
+        .build()
+        .expect("config");
+    let (runtime, handles) = RinglineBuilder::new(config)
+        .launch::<UnixRead>()
+        .expect("launch");
+    common::join_workers(&runtime, handles);
+    server.join().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(
+        UNIX.lock().unwrap().take().expect("client did not finish"),
+        Ok(())
+    );
+}
+
+static FWD_SINK: Mutex<Option<SocketAddr>> = Mutex::new(None);
+static FORWARD: Mutex<Option<Result<(), String>>> = Mutex::new(None);
+
+/// Bytes the source peer sends before closing.
+const FWD_TOTAL: usize = 100_000;
+/// The first forward's length, short of `FWD_TOTAL`.
+const FWD_FIRST: usize = 60_000;
+
+/// Forward from a direct connection: a forward of `FWD_FIRST` bytes stops
+/// there and leaves the rest readable, and a forward asking for more than
+/// the peer sends resolves with what arrived before its FIN.
+struct DirectForwardClient;
+
+impl AsyncEventHandler for DirectForwardClient {
+    fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        Some(Box::pin(async {
+            let source_addr = SERVER.lock().unwrap().unwrap();
+            let sink_addr = FWD_SINK.lock().unwrap().unwrap();
+            let r = async {
+                let mut source = ringline::connect(source_addr)
+                    .await
+                    .map_err(|e| format!("connect source: {e}"))?;
+                let sink = ringline::connect(sink_addr)
+                    .await
+                    .map_err(|e| format!("connect sink: {e}"))?;
+                // A second forward from the same connection is refused while
+                // the first is alive, and allowed once it is dropped. The sink
+                // is a connection whose send half was split off and dropped,
+                // so its send half is not claimed and the only refusal left is
+                // the running forward.
+                {
+                    let spare = ringline::connect(sink_addr)
+                        .await
+                        .map_err(|e| format!("connect spare sink: {e}"))?;
+                    let (spare_tx, _spare_rx) = spare.split();
+                    let dst = spare_tx.as_conn();
+                    drop(spare_tx);
+                    let src = source.as_conn();
+                    let first = src.forward_to_conn(&dst, 1);
+                    match src.forward_to_conn(&dst, 1).await {
+                        Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {}
+                        other => return Err(format!("second forward: {other:?}")),
+                    }
+                    drop(first);
+                    match src.forward_to_conn(&dst, 0).await {
+                        Ok(0) => {}
+                        other => return Err(format!("forward after drop: {other:?}")),
+                    }
+                }
+                let (mut sink_tx, _sink_rx) = sink.split();
+                let n = ringline::timeout(
+                    Duration::from_secs(5),
+                    source.forward_to_conn(&mut sink_tx, FWD_FIRST),
+                )
+                .await
+                .map_err(|_| "first forward did not resolve".to_string())?
+                .map_err(|e| format!("first forward: {e}"))?;
+                if n != FWD_FIRST {
+                    return Err(format!("first forward moved {n}"));
+                }
+                // The next byte is the first one the forward left.
+                let mut first = None;
+                source
+                    .with_data(|b| {
+                        first = b.first().copied();
+                        ParseResult::Consumed(1)
+                    })
+                    .await;
+                if first != Some(pattern(0, FWD_FIRST)) {
+                    return Err(format!("byte after the forward: {first:?}"));
+                }
+                let n = ringline::timeout(
+                    Duration::from_secs(5),
+                    source.forward_to_conn(&mut sink_tx, FWD_TOTAL),
+                )
+                .await
+                .map_err(|_| "second forward did not resolve".to_string())?
+                .map_err(|e| format!("second forward: {e}"))?;
+                if n != FWD_TOTAL - FWD_FIRST - 1 {
+                    return Err(format!("second forward moved {n}"));
+                }
+                Ok(())
+            }
+            .await;
+            *FORWARD.lock().unwrap() = Some(r);
+            let _ = ringline::request_shutdown();
+        }))
+    }
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
+        async {}
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        DirectForwardClient
+    }
+}
+
+#[test]
+fn a_direct_connection_forwards_to_another_connection() {
+    let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let source = TcpListener::bind("127.0.0.1:0").unwrap();
+    let sink = TcpListener::bind("127.0.0.1:0").unwrap();
+    *SERVER.lock().unwrap() = Some(source.local_addr().unwrap());
+    *FWD_SINK.lock().unwrap() = Some(sink.local_addr().unwrap());
+    *FORWARD.lock().unwrap() = None;
+    let source_peer = std::thread::spawn(move || {
+        let (mut s, _) = source.accept().unwrap();
+        let data: Vec<u8> = (0..FWD_TOTAL).map(|i| pattern(0, i)).collect();
+        // In pieces, so the forward sees several receives.
+        // A failed write means the client closed the connection; its result
+        // says why.
+        for piece in data.chunks(7_000) {
+            if s.write_all(piece).is_err() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    });
+    let sink_peer = std::thread::spawn(move || {
+        let (mut s, _) = sink.accept().unwrap();
+        // The spare sink of the EBUSY check; it receives nothing.
+        let (_spare, _) = sink.accept().unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut got = Vec::new();
+        let mut buf = [0u8; 16_384];
+        while got.len() < FWD_TOTAL - 1 {
+            match std::io::Read::read(&mut s, &mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => got.extend_from_slice(&buf[..n]),
+            }
+        }
+        got
+    });
+    let config = ConfigBuilder::new()
+        .workers(1)
+        .pin_to_core(false)
+        .max_connections(16)
+        .build()
+        .expect("config");
+    let (runtime, handles) = RinglineBuilder::new(config)
+        .launch::<DirectForwardClient>()
+        .expect("launch");
+    common::join_workers(&runtime, handles);
+    source_peer.join().unwrap();
+    let got = sink_peer.join().unwrap();
+    assert_eq!(
+        FORWARD
+            .lock()
+            .unwrap()
+            .take()
+            .expect("client did not finish"),
+        Ok(())
+    );
+    // Everything but the one byte read between the forwards, in order.
+    let want: Vec<u8> = (0..FWD_TOTAL)
+        .filter(|&i| i != FWD_FIRST)
+        .map(|i| pattern(0, i))
+        .collect();
+    assert_eq!(got.len(), want.len());
+    assert!(got == want, "the sink received the bytes out of order");
 }

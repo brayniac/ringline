@@ -49,14 +49,12 @@ pub struct ShardedConfig {
     pub(crate) password: Option<String>,
     /// Username for ACL-based AUTH (Redis 6.0+). Only used when `password` is set.
     pub(crate) username: Option<String>,
-    /// Receive with `TcpConnect::recv_direct`.
-    pub(crate) recv_direct: bool,
 }
 
 impl ShardedConfig {
     /// Create a config for the independent Redis servers at `servers`.
     /// Defaults: one connection per server, no connect timeout, plain TCP,
-    /// no AUTH, receives from the provided-buffer ring.
+    /// no AUTH.
     pub fn new(servers: Vec<SocketAddr>) -> Self {
         Self {
             servers,
@@ -65,7 +63,6 @@ impl ShardedConfig {
             tls_server_name: None,
             password: None,
             username: None,
-            recv_direct: false,
         }
     }
 
@@ -98,20 +95,6 @@ impl ShardedConfig {
     /// password is set.
     pub fn username(mut self, username: impl Into<String>) -> Self {
         self.username = Some(username.into());
-        self
-    }
-
-    /// Receive into each connection's own accumulator instead of the
-    /// worker's provided-buffer ring
-    /// ([`TcpConnect::recv_direct`](ringline::TcpConnect::recv_direct)).
-    /// Off by default, and ignored on the mio backend. Not supported with
-    /// [`tls_server_name`](Self::tls_server_name): connecting fails.
-    ///
-    /// On io_uring, the client methods that read with segments return an
-    /// `Unsupported` I/O error on such a connection, which stays usable;
-    /// [`PoolConfig::recv_direct`](crate::PoolConfig::recv_direct) lists them.
-    pub fn recv_direct(mut self, enabled: bool) -> Self {
-        self.recv_direct = enabled;
         self
     }
 }
@@ -158,7 +141,6 @@ pub struct ShardedClient {
     tls_server_name: Option<String>,
     password: Option<String>,
     username: Option<String>,
-    recv_direct: bool,
     encode_buf: Vec<u8>,
 }
 
@@ -193,7 +175,6 @@ impl ShardedClient {
             tls_server_name: config.tls_server_name,
             password: config.password,
             username: config.username,
-            recv_direct: config.recv_direct,
             encode_buf: Vec::new(),
         }
     }
@@ -233,7 +214,6 @@ impl ShardedClient {
             tls_server_name: self.tls_server_name.clone(),
             password: self.password.clone(),
             username: self.username.clone(),
-            recv_direct: self.recv_direct,
         }
     }
 
@@ -1149,7 +1129,6 @@ struct ConnectOpts {
     tls_server_name: Option<String>,
     password: Option<String>,
     username: Option<String>,
-    recv_direct: bool,
 }
 
 /// Borrow the first connected client on a shard, without reconnecting.
@@ -1195,7 +1174,7 @@ async fn get_conn<'a>(shard: &'a mut Shard, opts: &ConnectOpts) -> Result<&'a mu
 
 async fn do_connect(addr: SocketAddr, opts: &ConnectOpts) -> Result<Client, Error> {
     // TLS and the timeout are set on the builder (#528).
-    let mut connect = ringline::connect(addr).recv_direct(opts.recv_direct);
+    let mut connect = ringline::connect(addr);
     if let Some(ref sni) = opts.tls_server_name {
         connect = connect.tls(sni.as_str());
     }
@@ -1269,7 +1248,6 @@ mod tests {
         assert_eq!(config.tls_server_name, None);
         assert_eq!(config.password, None);
         assert_eq!(config.username, None);
-        assert!(!config.recv_direct);
     }
 
     #[test]

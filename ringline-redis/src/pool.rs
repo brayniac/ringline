@@ -41,8 +41,6 @@ pub struct PoolConfig {
     pub(crate) password: Option<String>,
     /// Username for ACL-based AUTH (Redis 6.0+). Only used when `password` is set.
     pub(crate) username: Option<String>,
-    /// Receive with `TcpConnect::recv_direct`.
-    pub(crate) recv_direct: bool,
 }
 
 impl PoolConfig {
@@ -56,7 +54,6 @@ impl PoolConfig {
             tls_server_name: None,
             password: None,
             username: None,
-            recv_direct: false,
         }
     }
 
@@ -69,23 +66,6 @@ impl PoolConfig {
     /// Set the TLS server name (SNI) for outbound connections; enables TLS.
     pub fn tls_server_name(mut self, name: impl Into<String>) -> Self {
         self.tls_server_name = Some(name.into());
-        self
-    }
-
-    /// Receive into each connection's own accumulator instead of the
-    /// worker's provided-buffer ring
-    /// ([`TcpConnect::recv_direct`](ringline::TcpConnect::recv_direct)).
-    /// Off by default, and ignored on the mio backend. Not supported with
-    /// [`tls_server_name`](Self::tls_server_name): connecting fails.
-    ///
-    /// On io_uring, `Client::get_stream`, `recv_get_discard` and
-    /// `recv_get_segments` read with segments, which a direct connection
-    /// refuses: on a pool with this set they return an `Unsupported` I/O
-    /// error before sending the request or taking the pending GET, and the
-    /// connection stays usable. `recv_meta` reads a GET reply through
-    /// `with_bytes` on such a connection.
-    pub fn recv_direct(mut self, enabled: bool) -> Self {
-        self.recv_direct = enabled;
         self
     }
 
@@ -212,8 +192,9 @@ impl Drop for PooledClient {
         // `close` does nothing in each of those cases, so the gate only skips
         // a redundant call.
         //
-        // A `ValueStream` dropped mid-value calls `close()`, which marks the
-        // driver connection closing synchronously, so `is_alive` is false here.
+        // A client that read a desynced reply has called `close()`, which marks
+        // the driver connection closing synchronously, so `is_alive` is false
+        // here.
         let alive = client.is_alive();
 
         // The pool is gone and this is the last handle on the table, so there
@@ -254,7 +235,6 @@ pub struct Pool {
     shared: Rc<Shared>,
     connect_timeout_ms: u64,
     tls_server_name: Option<String>,
-    recv_direct: bool,
     password: Option<String>,
     username: Option<String>,
 }
@@ -274,7 +254,6 @@ impl Pool {
             }),
             connect_timeout_ms: config.connect_timeout_ms,
             tls_server_name: config.tls_server_name,
-            recv_direct: config.recv_direct,
             password: config.password,
             username: config.username,
         }
@@ -318,7 +297,7 @@ impl Pool {
         Ok(())
     }
 
-    /// Get a [`Client`] bound to the next healthy connection.
+    /// Get a [`Client`] bound to the next connected slot.
     ///
     /// Advances the round-robin cursor and returns a guard for a connected
     /// slot. Disconnected slots are reconnected on demand; slots already
@@ -329,6 +308,11 @@ impl Pool {
     /// The client is moved out of its slot and the slot is marked lent, so the
     /// returned [`PooledClient`] does not borrow the pool and several may be
     /// held at once.
+    ///
+    /// A connection the server closed while it sat idle in the pool is handed
+    /// out like any other: on io_uring a plaintext connection sees the close
+    /// only at its next read (see `ringline::ConnCtx::is_alive`), so a command
+    /// sent on it fails when it reads the close.
     pub async fn client(&self) -> Result<PooledClient, Error> {
         let (idx, client) = self.checkout().await?;
         Ok(PooledClient {
@@ -410,7 +394,7 @@ impl Pool {
         }
     }
 
-    /// Get a [`Client`] on the next healthy connection, ready to pipeline.
+    /// Get a [`Client`] on the next connected slot, ready to pipeline.
     ///
     /// Deprecated. Hold the client and call
     /// [`Client::pipeline`](crate::Client::pipeline) on it; the pipeline borrows
@@ -494,7 +478,7 @@ impl Pool {
 
     async fn do_connect(&self) -> Result<Client, Error> {
         // TLS and the timeout are set on the builder (#528).
-        let mut connect = ringline::connect(self.addr).recv_direct(self.recv_direct);
+        let mut connect = ringline::connect(self.addr);
         if let Some(sni) = &self.tls_server_name {
             connect = connect.tls(sni.as_str());
         }

@@ -584,6 +584,51 @@ impl<T: 'static> Future for BlockingJoinHandle<T> {
 /// Callable from a connection task, a task spawned with [`spawn()`], or an
 /// [`on_start`](crate::AsyncEventHandler::on_start) future.
 ///
+/// # Receiving
+///
+/// On io_uring a plaintext connection, from this function or
+/// [`connect_unix`], receives directly into its own accumulator. When a read
+/// parks (`with_data`, `with_bytes`, `recv_ready`, or a
+/// [`ConnStream`](crate::ConnStream) read), the runtime submits a one-shot
+/// receive whose destination is the free space of the connection's
+/// accumulator, so the received bytes are not copied out of a ring buffer.
+/// The receive asks for all the free space. With nothing buffered, the
+/// connection receives into its own buffer of
+/// [`ConfigBuilder::recv_direct_region`](crate::ConfigBuilder::recv_direct_region)
+/// bytes, or of the initial accumulator capacity if that is larger and at
+/// most twice the region. With part of a message buffered, the buffer grows
+/// when less than the parser's [`ParseResult::NeedAtLeast`] value, or less
+/// than half of `recv_direct_region`, is free: to hold the rest of the
+/// message when that value is at least `recv_direct_region`, and otherwise to
+/// the larger of the receive size and the buffered bytes plus
+/// `recv_direct_region`. The receive size is `recv_direct_region`, or for a
+/// connection whose largest [`ParseResult::Consumed`] value from `with_data`
+/// or `with_bytes` so far is `m`, the larger of `recv_direct_region` and
+/// `min(4m, m + 4 * recv_direct_region)`. A buffer larger than the
+/// connection's own is borrowed from the worker's free buffers
+/// ([`ConfigBuilder::recv_direct_pool_max`](crate::ConfigBuilder::recv_direct_pool_max)).
+///
+/// `try_with_data` does not park or arm a receive. While a receive is in
+/// flight, for example after a parked read was dropped, the buffered bytes
+/// are in that receive's buffer and `try_with_data` returns `None`.
+///
+/// The reads that use the provided-buffer ring are refused on such a
+/// connection: `segments`, `recv_owned_segment`, `with_segments`,
+/// `with_bytes_segments`, `forward_to` and `forward_held` return
+/// [`io::ErrorKind::Unsupported`], `enable_recv_forward` does nothing,
+/// `run_direct_echo` resolves at once, and a recv sink
+/// ([`ConnCtx::set_recv_sink`]) is not filled: the received bytes go to the
+/// accumulator. `forward_to_conn` sends from the accumulator (see
+/// [`ConnCtx::forward_to_conn`]).
+///
+/// A receive is armed only while a read is parked or a receive is in flight.
+/// A FIN or reset from the peer on a connection that nothing reads is seen
+/// at the next read; until then [`ConnCtx::is_alive`] returns `true` and
+/// sends are accepted.
+///
+/// A TLS connection receives ciphertext through the worker's provided-buffer
+/// ring. On mio every connection reads into its accumulator.
+///
 /// # Concurrency
 ///
 /// Submission happens on the first poll, so two builders awaited one after the
@@ -615,7 +660,6 @@ pub fn connect(addr: SocketAddr) -> TcpConnect {
         addr,
         server_name: None,
         timeout: None,
-        recv_direct: false,
     }
 }
 
@@ -651,7 +695,6 @@ pub struct TcpConnect {
     addr: SocketAddr,
     server_name: Option<String>,
     timeout: Option<Duration>,
-    recv_direct: bool,
 }
 
 impl TcpConnect {
@@ -675,53 +718,6 @@ impl TcpConnect {
     /// immediately rather than meaning "no timeout"; omit the call for that.
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
-        self
-    }
-
-    /// Receive into this connection's own accumulator instead of the
-    /// worker's provided-buffer ring (io_uring only).
-    ///
-    /// When a read parks (`with_data`, `with_bytes`, `recv_ready`, or a
-    /// [`ConnStream`](crate::ConnStream) read), the runtime submits a
-    /// one-shot receive whose destination is the free space of the
-    /// connection's accumulator, so the received bytes are not copied out of
-    /// a ring buffer. The receive asks for all the free space. With nothing
-    /// buffered, the connection receives into its own buffer of
-    /// [`ConfigBuilder::recv_direct_region`](crate::ConfigBuilder::recv_direct_region)
-    /// bytes, or of the initial accumulator capacity if that is larger and at
-    /// most twice the region. With part of a message buffered, the buffer grows when less
-    /// than the parser's [`ParseResult::NeedAtLeast`] value, or less than
-    /// half of `recv_direct_region`, is free: to hold the rest of the message
-    /// when that value is at least `recv_direct_region`, and otherwise to the
-    /// larger of the receive size and the buffered bytes plus
-    /// `recv_direct_region`. The receive size is `recv_direct_region`, or for
-    /// a connection whose largest [`ParseResult::Consumed`] value from
-    /// `with_data` or `with_bytes` so far is `m`, the larger of
-    /// `recv_direct_region` and `min(4m, m + 4 * recv_direct_region)`. A
-    /// buffer larger than the connection's own is borrowed from the worker's
-    /// free buffers
-    /// ([`ConfigBuilder::recv_direct_pool_max`](crate::ConfigBuilder::recv_direct_pool_max)).
-    ///
-    /// `try_with_data` does not park or arm a receive. While a receive is in
-    /// flight, for example after a parked read was dropped, the buffered
-    /// bytes are in that receive's buffer and `try_with_data` returns
-    /// `None`.
-    ///
-    /// The reads that use the provided-buffer ring are refused on a direct
-    /// connection: `segments`, `recv_owned_segment`, `with_segments`,
-    /// `with_bytes_segments`, `forward_to`, `forward_to_conn` and
-    /// `forward_held` return [`io::ErrorKind::Unsupported`],
-    /// `enable_recv_forward` does nothing, and `run_direct_echo` resolves at
-    /// once.
-    ///
-    /// Ignored on the mio backend.
-    ///
-    /// # Errors
-    ///
-    /// Together with [`tls`](Self::tls), the connect fails with
-    /// [`io::ErrorKind::Unsupported`].
-    pub fn recv_direct(mut self, enabled: bool) -> Self {
-        self.recv_direct = enabled;
         self
     }
 }
@@ -756,7 +752,6 @@ impl std::future::IntoFuture for TcpConnect {
                 target: ConnectTarget::Tcp {
                     addr: self.addr,
                     server_name: self.server_name,
-                    recv_direct: self.recv_direct,
                 },
                 timeout: self.timeout,
             },
@@ -783,7 +778,6 @@ enum ConnectTarget {
     Tcp {
         addr: SocketAddr,
         server_name: Option<String>,
-        recv_direct: bool,
     },
     Unix {
         path: std::path::PathBuf,
@@ -1968,6 +1962,7 @@ impl ConnCtx {
             generation: self.generation,
             epoch: armed.unwrap_or(0),
             refused: armed.err(),
+            direct: None,
             _borrow: PhantomData,
         }
     }
@@ -2249,7 +2244,7 @@ impl ConnCtx {
     }
 
     /// Forward the next `len` received bytes to **another connection on this
-    /// worker**, with no copy through user space.
+    /// worker**.
     ///
     /// The proxy form of `forward_to`. Where `forward_to`
     /// names its sink as a borrowed descriptor, this names it as a
@@ -2263,10 +2258,14 @@ impl ConnCtx {
     /// conn.forward_to_conn(&backend, len).await?;
     /// ```
     ///
-    /// Same mechanics and same truncation semantics as `forward_to`: arriving
-    /// provided buffers are held driver-side and written straight to the sink,
-    /// one serialized write at a time, each bid released on its own write
-    /// completion; a result `< len` means the peer sent FIN first.
+    /// From a source that receives through the provided-buffer ring (an
+    /// accepted connection, or a TLS one), the mechanics are those of
+    /// `forward_to`: arriving provided buffers are held driver-side and written
+    /// straight to the sink with no copy through user space, one serialized
+    /// write at a time, each bid released on its own write completion. A
+    /// source that receives directly into its accumulator is covered under
+    /// "A direct source" below. Either way a result `< len` means the peer sent
+    /// FIN first.
     ///
     /// # Thread affinity
     ///
@@ -2277,11 +2276,12 @@ impl ConnCtx {
     ///
     /// # Do not send on the sink concurrently
     ///
-    /// The forward writes to the sink directly rather than through its send
-    /// queue, so a `send` on the sink from elsewhere while a forward is running
-    /// is not ordered against it and will interleave on the wire. io_uring does
-    /// not order independent SQEs. Forward *or* send on a given connection, not
-    /// both at once.
+    /// From a ring source the forward writes to the sink directly rather than
+    /// through its send queue, so a `send` on the sink from elsewhere while a
+    /// forward is running is not ordered against it and will interleave on the
+    /// wire. io_uring does not order independent SQEs. Forward *or* send on a
+    /// given connection, not both at once. A direct source's sends go through
+    /// the sink's queue and are ordered with other sends on the sink.
     ///
     /// # TLS
     ///
@@ -2306,20 +2306,99 @@ impl ConnCtx {
     /// The mio backend exposes the same signature, but as a copy path — see
     /// the `not(has_io_uring)` sibling below. Both backends refuse the same
     /// three conditions with the same errnos.
+    ///
+    /// # A direct source
+    ///
+    /// A source that receives directly into its accumulator (a plaintext
+    /// connection from [`connect`] or [`connect_unix`]) has no held buffers.
+    /// The forward takes the bytes its accumulator holds, up to what is left
+    /// of `len`, and sends them on the sink through the sink's send queue
+    /// under a guard: zero-copy at or above `send_zc_threshold`, copied into a
+    /// pool slot below it. One send is in flight at a time, and the source
+    /// receives the next chunk while it is. Because the sends go through the
+    /// sink's queue, they are ordered with other sends on the sink. The
+    /// truncation semantics and the refusals are the same. A send the runtime
+    /// cannot submit, for example with the worker's send slab
+    /// ([`ConfigBuilder::send_slab_slots`](crate::ConfigBuilder::send_slab_slots))
+    /// full, resolves the forward with that error and leaves the chunk
+    /// buffered on the source. Dropping the future lets a chunk already
+    /// submitted go out and leaves the rest buffered.
     #[cfg(has_io_uring)]
     pub fn forward_to_conn<'a>(&self, sink: &'a ConnCtx, len: usize) -> ForwardToFuture<'a> {
         let target = crate::backend::uring::driver::SinkTarget::Conn {
             index: sink.conn_index,
             generation: sink.generation,
         };
+        if let Some(direct) = self.direct_forward(sink.conn_index, sink.generation, len, false) {
+            return direct;
+        }
         let armed = self.arm_forward_source(target, len as u64, false);
         ForwardToFuture {
             conn_index: self.conn_index,
             generation: self.generation,
             epoch: armed.unwrap_or(0),
             refused: armed.err(),
+            direct: None,
             _borrow: PhantomData,
         }
+    }
+
+    /// A forward from this connection to the sink connection, if this
+    /// connection receives directly into its accumulator; `None` otherwise.
+    /// Refuses the same conditions as `arm_forward_source`: a forward already
+    /// running from this connection (`EBUSY`), a stale sink (`EPIPE`), a TLS
+    /// sink (`EPROTOTYPE`), and, unless the caller holds the sink's
+    /// [`SendHalf`], a sink whose send half is claimed (`EBUSY`).
+    #[cfg(has_io_uring)]
+    fn direct_forward<'a>(
+        &self,
+        sink_index: u32,
+        sink_generation: u32,
+        len: usize,
+        sink_owned: bool,
+    ) -> Option<ForwardToFuture<'a>> {
+        let refusal = with_state(|driver, _| {
+            if driver.connections.generation(self.conn_index) != self.generation
+                || !is_recv_direct(driver, self.conn_index)
+            {
+                return None;
+            }
+            let refusal = if driver
+                .connections
+                .get(self.conn_index)
+                .is_some_and(|c| c.direct_forwarding)
+            {
+                Some(libc::EBUSY)
+            } else if driver.connections.generation(sink_index) != sink_generation {
+                Some(libc::EPIPE)
+            } else if driver.tls_table.as_ref().is_some_and(|t| t.has(sink_index)) {
+                Some(libc::EPROTOTYPE)
+            } else if !sink_owned && driver.send_half_taken[sink_index as usize] {
+                Some(libc::EBUSY)
+            } else {
+                None
+            };
+            if refusal.is_none()
+                && let Some(cs) = driver.connections.get_mut(self.conn_index)
+            {
+                cs.direct_forwarding = true;
+            }
+            Some(refusal)
+        })?;
+        Some(ForwardToFuture {
+            conn_index: self.conn_index,
+            generation: self.generation,
+            epoch: 0,
+            refused: refusal,
+            direct: refusal.is_none().then_some(DirectForward {
+                sink_index,
+                sink_generation,
+                len: len as u64,
+                forwarded: 0,
+                in_flight: None,
+            }),
+            _borrow: PhantomData,
+        })
     }
 
     /// Forward the next `len` received bytes to another connection on this
@@ -2332,8 +2411,9 @@ impl ConnCtx {
     ///
     /// # This is a copy path
     ///
-    /// The io_uring version holds provided recv buffers and writes them
-    /// straight to the sink, touching the bytes zero times in user space. mio
+    /// From a source that receives through the provided-buffer ring, the
+    /// io_uring version holds provided recv buffers and writes them straight
+    /// to the sink, touching the bytes zero times in user space. mio
     /// has no provided-buffer ring, so bytes are read into a queued send on
     /// the sink and copied on the way. It exists so that a proxy built on
     /// ringline runs at all without io_uring.
@@ -2443,7 +2523,7 @@ impl ConnCtx {
     /// A stale handle is a no-op: this returns `()` and so has no way to
     /// report a refusal, and flipping the flag on a recycled slot would make a
     /// *different* connection start holding its recv buffers. See #429. On a
-    /// [`recv_direct`](TcpConnect::recv_direct) connection it is also a no-op,
+    /// direct connection (see [`connect`]) it is also a no-op,
     /// and [`forward_held`](Self::forward_held) returns `Unsupported`.
     pub fn enable_recv_forward(&self) {
         with_state(|driver, _| {
@@ -2898,13 +2978,14 @@ impl ConnCtx {
     /// (`close()` was called — `lifecycle` is `Closing` — even before the Close
     /// CQE has released the slot). Because a proactive `close()` flips the state
     /// synchronously, this is a *deterministic* poison probe: a caller that owns
-    /// a `ConnCtx` copy (e.g. a connection pool) can detect an
-    /// undrained-`ValueStream` poison on the very next turn, without waiting for
-    /// the Close CQE to bump the generation.
+    /// a `ConnCtx` copy (e.g. a connection pool) can detect a client's poison
+    /// close on the very next turn, without waiting for the Close CQE to bump
+    /// the generation.
     ///
-    /// A clean, fully-drained streaming read (which restores the default read
-    /// path via `end_segments`) leaves the connection `Multi`/armed, so this
-    /// returns `true` and the connection stays reusable.
+    /// On io_uring a plaintext outbound connection (see [`connect`]) has a
+    /// receive armed only while a read is parked. A FIN or reset from the peer
+    /// on such a connection while nothing reads it is not seen until the next
+    /// read, so this returns `true` until then.
     pub fn is_alive(&self) -> bool {
         // `try_with_state`, not `with_state`: this is reachable from a `Drop`
         // that runs outside a task poll. A connection-bound task is dropped by
@@ -2925,11 +3006,12 @@ impl ConnCtx {
         .unwrap_or(false)
     }
 
-    /// Whether the connection receives into its accumulator
-    /// ([`TcpConnect::recv_direct`]). The reads that need the provided-buffer
-    /// ring return [`io::ErrorKind::Unsupported`] on such a connection, so a
-    /// caller can check this before sending a request whose reply it would
-    /// read with one of them. Always `false` on the mio backend, outside the
+    /// Whether the connection receives directly into its accumulator: on
+    /// io_uring, a plaintext connection from [`connect`] or [`connect_unix`].
+    /// The reads that need the provided-buffer ring return
+    /// [`io::ErrorKind::Unsupported`] on such a connection, so a caller can
+    /// check this before sending a request whose reply it would read with one
+    /// of them. Always `false` on the mio backend, outside the
     /// executor, and once the runtime has released the connection's slot
     /// after its close completes.
     pub fn is_recv_direct(&self) -> bool {
@@ -3237,10 +3319,10 @@ impl<'a> MioSendBuilder<'a> {
 
 // ── WithDataFuture ───────────────────────────────────────────────────
 
-/// Whether `conn_index` receives directly into its accumulator
-/// (`TcpConnect::recv_direct`). Such a connection has no receive from the
-/// provided-buffer ring, so the reads that hold ring buffers (segments,
-/// forwarding, recv-forward, direct echo) are refused on it.
+/// Whether `conn_index` receives directly into its accumulator (a plaintext
+/// connection from `connect` or `connect_unix`). Such a connection has no
+/// receive from the provided-buffer ring, so the reads that hold ring buffers
+/// (segments, `forward_to`, recv-forward, direct echo) are refused on it.
 #[cfg(has_io_uring)]
 fn is_recv_direct(driver: &Driver, conn_index: u32) -> bool {
     driver
@@ -3255,12 +3337,12 @@ fn is_recv_direct(driver: &Driver, conn_index: u32) -> bool {
 fn recv_direct_unsupported() -> io::Error {
     io::Error::new(
         io::ErrorKind::Unsupported,
-        "not supported on a recv_direct connection",
+        "not supported on a direct-receive connection (outbound plaintext, io_uring)",
     )
 }
 
 /// Register the current task as `conn_index`'s receive waiter. On a direct
-/// connection (`TcpConnect::recv_direct`) also arm its receive, which the
+/// connection (a plaintext connection from `connect` or `connect_unix`) also arm its receive, which the
 /// caller does only after its parser has seen every buffered byte. `need` is
 /// the parser's `NeedAtLeast` value, if it returned one.
 pub(crate) fn park_recv(
@@ -3851,12 +3933,14 @@ impl RecvHalf {
     /// Forward the next `len` received bytes into another connection.
     ///
     /// The sink is its [`SendHalf`], borrowed mutably for as long as the
-    /// forward runs. That borrow is the point: a forward submits its own SQE
-    /// straight to the ring rather than through the sink's send queue, so a
-    /// concurrent `send` to the same socket would interleave with it — and
-    /// io_uring does not order independent SQEs (Domain Invariant 2). Holding
-    /// the half is both the permission to write and the proof that nobody else
-    /// is; the borrow checker now says so instead of a comment.
+    /// forward runs. That borrow is the point: from a source that receives
+    /// through the provided-buffer ring, a forward submits its own SQE straight
+    /// to the ring rather than through the sink's send queue, so a concurrent
+    /// `send` to the same socket would interleave with it — and io_uring does
+    /// not order independent SQEs (Domain Invariant 2). Holding the half is
+    /// both the permission to write and the proof that nobody else is. A
+    /// direct source sends through the sink's queue; see
+    /// [`ConnCtx::forward_to_conn`].
     #[cfg(has_io_uring)]
     pub fn forward_to_conn<'h, 's: 'h>(
         &'h mut self,
@@ -3867,12 +3951,19 @@ impl RecvHalf {
             index: sink.conn.conn_index,
             generation: sink.conn.generation,
         };
+        if let Some(direct) =
+            self.conn
+                .direct_forward(sink.conn.conn_index, sink.conn.generation, len, true)
+        {
+            return direct;
+        }
         let armed = self.conn.arm_forward_source(target, len as u64, true);
         ForwardToFuture {
             conn_index: self.conn.conn_index,
             generation: self.conn.generation,
             epoch: armed.unwrap_or(0),
             refused: armed.err(),
+            direct: None,
             _borrow: PhantomData,
         }
     }
@@ -3880,15 +3971,18 @@ impl RecvHalf {
     /// Forward the next `len` received bytes into another connection.
     ///
     /// The sink is its [`SendHalf`], borrowed mutably for as long as the
-    /// forward runs. That borrow is the point: a forward submits its own SQE
-    /// straight to the ring rather than through the sink's send queue, so a
-    /// concurrent `send` to the same socket would interleave with it — and
-    /// io_uring does not order independent SQEs (Domain Invariant 2). Holding
-    /// the half is both the permission to write and the proof that nobody else
-    /// is; the borrow checker now says so instead of a comment.
+    /// forward runs. That borrow is the point: from a source that receives
+    /// through the provided-buffer ring, a forward submits its own SQE straight
+    /// to the ring rather than through the sink's send queue, so a concurrent
+    /// `send` to the same socket would interleave with it — and io_uring does
+    /// not order independent SQEs (Domain Invariant 2). Holding the half is
+    /// both the permission to write and the proof that nobody else is. A
+    /// direct source sends through the sink's queue; see
+    /// [`ConnCtx::forward_to_conn`].
     ///
     /// The two backends return different futures (io_uring forwards from the
-    /// held provided buffers; mio pumps through the accumulator), so this is
+    /// held provided buffers or, for a direct source, from the accumulator;
+    /// mio pumps through the accumulator), so this is
     /// two signatures rather than one.
     #[cfg(not(has_io_uring))]
     pub fn forward_to_conn<'h, 's: 'h>(
@@ -5300,9 +5394,165 @@ pub struct ForwardToFuture<'a> {
     /// running (`EBUSY`), a stale source or sink slot (`EPIPE`), or a TLS sink
     /// (`EPROTOTYPE`). Reported on the first poll; nothing was mutated.
     refused: Option<i32>,
+    /// Set for a forward from a direct connection (see [`connect`]), which
+    /// sends from its accumulator instead of from held ring buffers.
+    direct: Option<DirectForward>,
     /// Ties the future to whatever the caller borrowed — a `SinkFd`, or the
     /// sink `ConnCtx` — so the sink cannot be dropped mid-forward.
     _borrow: PhantomData<&'a ()>,
+}
+
+/// State of a [`ForwardToFuture`] whose source receives directly into its
+/// accumulator.
+///
+/// Each step takes the bytes the accumulator holds, up to what is left of
+/// `len`, and sends them on the sink through its send queue under a guard:
+/// zero-copy at or above `send_zc_threshold`, copied into a pool slot below
+/// it. One send is in flight at a time. While it is, the source receives
+/// into an empty accumulator, so at most one more chunk is buffered and the
+/// source's TCP window closes when the sink falls behind.
+#[cfg(has_io_uring)]
+struct DirectForward {
+    sink_index: u32,
+    sink_generation: u32,
+    len: u64,
+    forwarded: u64,
+    /// The send in flight and the chunk it carries.
+    in_flight: Option<(SendFuture, Bytes)>,
+}
+
+/// Mark the direct forward from `source` ended, so another may start.
+#[cfg(has_io_uring)]
+fn end_direct_forward(source: u32, generation: u32) {
+    let _ = try_with_state(|driver, _| {
+        if let Some(cs) = driver.connections.get_mut(source)
+            && cs.generation == generation
+        {
+            cs.direct_forwarding = false;
+        }
+    });
+}
+
+/// One step of a direct forward, decided under the driver borrow.
+#[cfg(has_io_uring)]
+enum DirectStep {
+    /// The source closed or finished receiving: resolve with the count.
+    Done,
+    /// Nothing buffered; a receive is armed.
+    Park,
+    /// A chunk went to the sink.
+    Sent(SendFuture, Bytes),
+    Fail(io::Error),
+}
+
+#[cfg(has_io_uring)]
+impl DirectForward {
+    fn poll(
+        &mut self,
+        source: u32,
+        generation: u32,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<usize>> {
+        loop {
+            if let Some((send, chunk)) = self.in_flight.as_mut() {
+                match Pin::new(send).poll(cx) {
+                    Poll::Pending => {
+                        // Receive the next chunk while this one is sent.
+                        with_state(|driver, executor| {
+                            if driver
+                                .connections
+                                .get(source)
+                                .is_some_and(|c| c.generation == generation && !c.recv_finished())
+                                && driver.accumulators.is_empty(source)
+                            {
+                                park_recv(driver, executor, source, None);
+                            }
+                        });
+                        return Poll::Pending;
+                    }
+                    Poll::Ready(Err(e)) => {
+                        let sink_gone = with_state(|driver, _| {
+                            driver.connections.generation(self.sink_index) != self.sink_generation
+                        });
+                        self.in_flight = None;
+                        return Poll::Ready(Err(if sink_gone {
+                            io::Error::from_raw_os_error(libc::EPIPE)
+                        } else {
+                            e
+                        }));
+                    }
+                    Poll::Ready(Ok(_)) => {
+                        let chunk = chunk.clone();
+                        self.forwarded += chunk.len() as u64;
+                        self.in_flight = None;
+                        // The next receive reuses the chunk's allocation if
+                        // the guard has released it by then.
+                        with_state(|driver, _| {
+                            if driver.connections.generation(source) == generation {
+                                driver.accumulators.keep_spent(source, chunk);
+                            }
+                        });
+                    }
+                }
+            }
+            if self.forwarded >= self.len {
+                return Poll::Ready(Ok(self.forwarded as usize));
+            }
+            let step = with_state(|driver, executor| {
+                match driver.connections.get(source) {
+                    Some(c) if c.generation == generation => {}
+                    _ => return DirectStep::Done,
+                }
+                if driver.connections.generation(self.sink_index) != self.sink_generation {
+                    return DirectStep::Fail(io::Error::from_raw_os_error(libc::EPIPE));
+                }
+                if driver.accumulators.is_empty(source) {
+                    if driver
+                        .connections
+                        .get(source)
+                        .is_none_or(|c| c.recv_finished())
+                    {
+                        return DirectStep::Done;
+                    }
+                    park_recv(driver, executor, source, None);
+                    return DirectStep::Park;
+                }
+                let frozen = driver.accumulators.take_frozen(source);
+                let take = (frozen.len() as u64).min(self.len - self.forwarded) as usize;
+                let chunk = frozen.slice(..take);
+                if take < frozen.len() {
+                    driver.accumulators.put_back(source, frozen.slice(take..));
+                }
+                driver.accumulators.note_consumed(source, take);
+                let id = executor.register_send(self.sink_index);
+                let token = ConnToken::new(self.sink_index, self.sink_generation);
+                let submitted = driver
+                    .make_ctx()
+                    .send_parts(token)
+                    .guard(crate::guard::GuardBox::new(AccumulatorGuard(chunk.clone())))
+                    .submit_awaited(id);
+                match submitted {
+                    Ok(()) => DirectStep::Sent(
+                        SendFuture::pending(self.sink_index, self.sink_generation, id),
+                        chunk,
+                    ),
+                    Err(e) => {
+                        // Nothing was sent: the chunk goes back in front of
+                        // whatever the accumulator still holds.
+                        executor.withdraw_send(id);
+                        driver.accumulators.prepend(source, &chunk);
+                        DirectStep::Fail(e)
+                    }
+                }
+            });
+            match step {
+                DirectStep::Done => return Poll::Ready(Ok(self.forwarded as usize)),
+                DirectStep::Park => return Poll::Pending,
+                DirectStep::Fail(e) => return Poll::Ready(Err(e)),
+                DirectStep::Sent(send, chunk) => self.in_flight = Some((send, chunk)),
+            }
+        }
+    }
 }
 
 #[cfg(has_io_uring)]
@@ -5330,6 +5580,12 @@ impl Drop for ForwardToFuture<'_> {
     /// dropped, via the same `settle_forward_end` the normal end of a forward
     /// uses — so a cancel loses no data the peer already sent.
     fn drop(&mut self) {
+        // A direct forward holds nothing in the driver: a chunk already on
+        // its way to the sink goes out, and the rest stays buffered.
+        if self.direct.is_some() {
+            end_direct_forward(self.conn_index, self.generation);
+            return;
+        }
         // A refused forward installed nothing — in particular it may have been
         // refused *because* another forward is running, which this must not
         // cancel.
@@ -5363,10 +5619,20 @@ impl Drop for ForwardToFuture<'_> {
 impl Future for ForwardToFuture<'_> {
     type Output = io::Result<usize>;
 
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let me = self.get_mut();
         if let Some(errno) = me.refused {
             return Poll::Ready(Err(io::Error::from_raw_os_error(errno)));
+        }
+        if let Some(direct) = me.direct.as_mut() {
+            let poll = direct.poll(me.conn_index, me.generation, cx);
+            if poll.is_ready() {
+                me.direct = None;
+                end_direct_forward(me.conn_index, me.generation);
+                // A poll after this one reports a closed forward.
+                me.refused = Some(libc::EPIPE);
+            }
+            return poll;
         }
         with_state(|driver, executor| {
             let conn = me.conn_index;
@@ -6747,19 +7013,6 @@ impl ConnectFuture {
         driver: &mut crate::backend::Driver,
         executor: &mut crate::runtime::Executor,
     ) -> io::Result<(u32, u32)> {
-        // A TLS connection's received bytes are ciphertext; the plaintext is
-        // copied into the accumulator in any case.
-        if let ConnectTarget::Tcp {
-            server_name: Some(_),
-            recv_direct: true,
-            ..
-        } = target
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "recv_direct is not supported on a TLS connection",
-            ));
-        }
         let mut ctx = driver.make_ctx();
         let token = match target {
             ConnectTarget::Tcp {
@@ -6779,13 +7032,16 @@ impl ConnectFuture {
             let ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
             ctx.arm_connect_timeout(token.index, ms);
         }
+        // A plaintext connection receives directly into its accumulator. A
+        // TLS connection receives ciphertext through the provided-buffer ring.
         #[cfg(has_io_uring)]
-        if let ConnectTarget::Tcp {
-            server_name: None,
-            recv_direct: true,
-            ..
-        } = target
-            && let Some(cs) = driver.connections.get_mut(token.index)
+        if !matches!(
+            target,
+            ConnectTarget::Tcp {
+                server_name: Some(_),
+                ..
+            }
+        ) && let Some(cs) = driver.connections.get_mut(token.index)
         {
             cs.recv_direct = true;
         }

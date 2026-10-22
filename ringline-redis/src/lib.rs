@@ -245,18 +245,6 @@ pub enum Error {
     LengthMismatch,
 }
 
-/// The error a method that reads with segments returns on a connection that
-/// receives into its accumulator ([`ringline::TcpConnect::recv_direct`]).
-/// The method returns it before sending a request or taking a pending
-/// operation, so the connection stays usable.
-#[cfg(has_io_uring)]
-fn recv_direct_refused() -> Error {
-    Error::Io(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "not supported on a recv_direct connection",
-    ))
-}
-
 impl Error {
     /// `true` for transient server-side conditions where the same command
     /// is expected to succeed if retried after a short delay:
@@ -434,20 +422,6 @@ pub enum CompletedOp {
     },
 }
 
-/// Result metadata from a Mode-B borrow GET
-/// ([`recv_get_discard`](Client::recv_get_discard) /
-/// [`recv_get_segments`](Client::recv_get_segments)): the value length (`None`
-/// for a miss) and the fired `user_data`. The value bytes are never retained —
-/// they are parsed from borrowed, zero-copy segments and released.
-#[cfg(has_io_uring)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GetMeta {
-    /// Value length in bytes, or `None` for a cache miss (`$-1`).
-    pub value_len: Option<usize>,
-    /// The `user_data` passed to the corresponding [`fire_get`](Client::fire_get).
-    pub user_data: u64,
-}
-
 /// The kind of operation a reply corresponds to (a public mirror of the
 /// internal `PendingOpKind`), surfaced on [`RespMeta`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -517,7 +491,7 @@ impl ClientBuilder {
 
     /// Send `name` in place of `GET` as the command name of every GET this
     /// client sends: [`fire_get`](Client::fire_get), [`get`](Client::get),
-    /// [`Pipeline::get`] and, on io_uring, `get_stream`. The arguments are
+    /// [`Pipeline::get`]. The arguments are
     /// unchanged (`name key`), and the reply is parsed as a GET reply: a bulk
     /// string is a hit, a nil is a miss.
     ///
@@ -1427,233 +1401,10 @@ impl Client {
         Ok(op)
     }
 
-    /// Recv the next pending GET as a Mode-B **borrow-and-discard**: the value
-    /// body is parsed from borrowed, zero-copy segments and released without ever
-    /// being gathered into a contiguous buffer or [`Bytes`]. Returns the value
-    /// length (`None` = miss) and the fired `user_data`.
-    ///
-    /// The next pending fire/recv op MUST be a GET (fired via
-    /// [`fire_get`](Self::fire_get)); a non-GET pending op yields
-    /// [`Error::UnexpectedResponse`].
-    ///
-    /// Zero value copy: under pipelining only the few-byte boundary remainder
-    /// between this reply and the next is gathered. io_uring only (segmented recv).
-    ///
-    /// On a connection that receives into its accumulator
-    /// ([`ringline::TcpConnect::recv_direct`]) this returns [`Error::Io`] of
-    /// kind `Unsupported` without taking the pending GET, which
-    /// [`recv`](Self::recv) can then read.
-    #[cfg(has_io_uring)]
-    pub async fn recv_get_discard(&mut self) -> Result<GetMeta, Error> {
-        self.recv_get_segments(|_| {}).await
-    }
-
-    /// Like [`recv_get_discard`](Self::recv_get_discard), but invokes `on_value`
-    /// on each borrowed span of value bytes, in order — for a checksum or
-    /// validator that must not retain the value. Still zero value copy.
-    #[cfg(has_io_uring)]
-    pub async fn recv_get_segments(
-        &mut self,
-        on_value: impl FnMut(&[u8]),
-    ) -> Result<GetMeta, Error> {
-        if self.rx.is_recv_direct() {
-            return Err(recv_direct_refused());
-        }
-        self.flush()?;
-        let pending = self.pending.pop_front().ok_or(Error::NoPending)?;
-        if !matches!(pending.kind, PendingOpKind::Get) {
-            // This specialized recv only decodes a GET reply. A different pending
-            // kind is caller misuse (mixed op kinds); surface it.
-            return Err(Error::UnexpectedResponse);
-        }
-        self.flushed_count = self.flushed_count.saturating_sub(1);
-        let (outcome, _consumed, _latency_ns) =
-            self.run_get_state_machine(&pending, on_value).await?;
-        match outcome {
-            Ok(value_len) => Ok(GetMeta {
-                value_len,
-                user_data: pending.user_data,
-            }),
-            // A server error (`-ERR`/`-WRONGTYPE`) is wire-aligned; surface it as
-            // `Err` so the connection stays usable. Desync/connection errors were
-            // already turned into the OUTER `Err` (and poisoned) by the helper.
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Runs the RESP GET reply state machine on an already-popped GET `pending`,
-    /// draining the value via `on_value` (Mode-B borrow-and-discard). Shared by
-    /// [`recv_get_segments`](Self::recv_get_segments) and
-    /// [`recv_meta`](Self::recv_meta).
-    ///
-    /// Returns `(outcome, total_consumed)` where `outcome` is `Ok(Some(len))` =
-    /// hit, `Ok(None)` = miss, or `Err(Error::Redis(_))` = a wire-aligned server
-    /// error. Restores the default read path (`end_segments`) and records `GET`
-    /// metrics. A desync (`Error::UnexpectedResponse` — only partially consumed,
-    /// rest left on the wire) or a short FIN (`Error::ConnectionClosed`) is
-    /// returned as the OUTER `Err`; the desync case also POISONS the connection
-    /// (close + clear pipeline) so it is never reused.
-    #[cfg(has_io_uring)]
-    async fn run_get_state_machine(
-        &mut self,
-        pending: &PendingOp,
-        mut on_value: impl FnMut(&[u8]),
-    ) -> Result<(Result<Option<usize>, Error>, usize, u64), Error> {
-        // RESP GET reply parse state, carried across `with_segments` calls. Each
-        // call consumes every value byte it is shown (so nothing is re-gathered)
-        // and stops only at the reply boundary, leaving the next reply's bytes to
-        // be gathered — the only copy on the path.
-        enum Phase {
-            Header,
-            Value,
-            Trailing,
-            Done,
-        }
-        let mut phase = Phase::Header;
-        let mut header_buf: Vec<u8> = Vec::with_capacity(16);
-        let mut value_remaining: usize = 0;
-        let mut trailing_remaining: usize = 0;
-        // Ok(Some(len)) = hit, Ok(None) = miss, Err = server error / unexpected.
-        let mut outcome: Result<Option<usize>, Error> = Ok(None);
-        let mut total_consumed: usize = 0;
-        // The reply's first byte arrives in the first call that reads any of
-        // it, and its last byte in the final call.
-        let instrumented = self.is_instrumented();
-        let mut arrival = ArrivalSpan::default();
-
-        loop {
-            let n = self
-                .rx
-                .with_segments(|chain| {
-                    let mut consumed = 0usize;
-                    'outer: for slice in chain.iter() {
-                        let mut pos = 0usize;
-                        while pos < slice.len() {
-                            match phase {
-                                Phase::Header => {
-                                    header_buf.push(slice[pos]);
-                                    pos += 1;
-                                    consumed += 1;
-                                    match parse_get_header(&header_buf) {
-                                        Ok(None) => {} // need more header bytes
-                                        Ok(Some(GetHeader::Nil)) => {
-                                            outcome = Ok(None);
-                                            phase = Phase::Done;
-                                            break 'outer;
-                                        }
-                                        Ok(Some(GetHeader::Bulk { len, .. })) => {
-                                            value_remaining = len;
-                                            trailing_remaining = 2;
-                                            outcome = Ok(Some(len));
-                                            phase = Phase::Value;
-                                        }
-                                        Err(e) => {
-                                            outcome = Err(e);
-                                            phase = Phase::Done;
-                                            break 'outer;
-                                        }
-                                    }
-                                }
-                                Phase::Value => {
-                                    let take = value_remaining.min(slice.len() - pos);
-                                    if take > 0 {
-                                        on_value(&slice[pos..pos + take]);
-                                    }
-                                    value_remaining -= take;
-                                    pos += take;
-                                    consumed += take;
-                                    if value_remaining == 0 {
-                                        phase = Phase::Trailing;
-                                    }
-                                }
-                                Phase::Trailing => {
-                                    let take = trailing_remaining.min(slice.len() - pos);
-                                    trailing_remaining -= take;
-                                    pos += take;
-                                    consumed += take;
-                                    if trailing_remaining == 0 {
-                                        phase = Phase::Done;
-                                        break 'outer;
-                                    }
-                                }
-                                Phase::Done => break 'outer,
-                            }
-                        }
-                    }
-                    ringline::SegConsumed(consumed)
-                })
-                .await?;
-            total_consumed += n;
-            if n > 0 && instrumented {
-                arrival.extend(self.rx.recv_arrival().as_ref());
-            }
-            if matches!(phase, Phase::Done) {
-                break;
-            }
-            if n == 0 {
-                // EOF before the reply completed (short FIN) — desynced.
-                let _ = self.rx.end_segments();
-                return Err(Error::ConnectionClosed);
-            }
-        }
-
-        // Restore the default read path (the next reply's leftover bytes were
-        // already gathered into the accumulator by the last `with_segments`
-        // settle, and are presented to the following read).
-        self.rx.end_segments()?;
-
-        // Metrics, mirroring `recv()`.
-        let latency_ns = match pending.start {
-            Some(start) => elapsed_ns(start),
-            None => 0,
-        };
-        let (success, hit) = match &outcome {
-            Ok(Some(_)) => (true, Some(true)),
-            Ok(None) => (true, Some(false)),
-            Err(_) => (false, None),
-        };
-        let (ttfb_ns, ttlb_ns) = arrival.ns(pending.start);
-        self.record(&CommandResult {
-            command: CommandType::Get,
-            latency_ns,
-            ttfb_ns,
-            ttlb_ns,
-            hit,
-            success,
-            tx_bytes: pending.tx_bytes,
-            rx_bytes: total_consumed as u32,
-        });
-
-        // A reply whose first byte is not `$`/`-` (`UnexpectedResponse`) is only
-        // *partially* consumed by the byte-at-a-time header parse:
-        // `parse_get_header`'s catch-all errors on the first byte, so the rest of
-        // the reply is left on the wire. We cannot know how many bytes to skip for
-        // an arbitrary reply type, so the connection is desynced and MUST NOT be
-        // reused — poison it (close) and clear the pipeline, mirroring `recv()`'s
-        // broken-read path. A genuine server error (`-ERR`/`-WRONGTYPE`,
-        // `Error::Redis`) consumed its whole `\r\n`-terminated line via the `-`
-        // arm, so the wire stays aligned and the connection stays valid — surface
-        // it as the inner `outcome` `Err`, not the outer one.
-        if let Err(Error::UnexpectedResponse) = &outcome {
-            self.tx.close();
-            self.pending.clear();
-            self.flushed_count = 0;
-            return Err(Error::UnexpectedResponse);
-        }
-
-        Ok((outcome, total_consumed, latency_ns))
-    }
-
     /// Runs the RESP GET reply state machine on an already-popped GET `pending`
     /// over the accumulator (`with_bytes`): parses the header, then drains the
     /// value body incrementally so the accumulator stays bounded (about one
-    /// receive), never materializing the value. Used on mio and, on io_uring,
-    /// on a connection that receives into its accumulator
-    /// (`TcpConnect::recv_direct`), which cannot read with segments. Same parse
-    /// and poison semantics as
-    /// [`run_get_state_machine`](Self::run_get_state_machine), which reads
-    /// provided buffers without a copy; the state machine is duplicated (over
-    /// `with_bytes` and `with_segments`) to leave that path unchanged.
+    /// receive), never materializing the value.
     ///
     /// Returns `(outcome, total_consumed, latency_ns)`; a desync
     /// (`UnexpectedResponse`) poisons; a short FIN returns `ConnectionClosed`.
@@ -1755,7 +1506,7 @@ impl Client {
             }
         }
 
-        // Metrics, mirroring `recv()` and the io_uring GET path.
+        // Metrics, mirroring `recv()`.
         let latency_ns = match pending.start {
             Some(start) => elapsed_ns(start),
             None => 0,
@@ -1777,11 +1528,11 @@ impl Client {
             rx_bytes: total_consumed as u32,
         });
 
-        // Same poison discipline as the io_uring path: an unexpected reply type
-        // (first byte not `$`/`-`) is only partially consumed (the header parse
-        // stops on that byte), leaving the rest on the wire → desync, poison. A
-        // server error (`-...`) consumed its whole line → wire aligned, surfaced
-        // as the inner `outcome` Err.
+        // Poison discipline: an unexpected reply type (first byte not `$`/`-`)
+        // is only partially consumed (the header parse stops on that byte),
+        // leaving the rest on the wire → desync, poison. A server error
+        // (`-...`) consumed its whole line → wire aligned, surfaced as the
+        // inner `outcome` Err.
         if let Err(Error::UnexpectedResponse) = &outcome {
             self.tx.close();
             self.pending.clear();
@@ -1803,27 +1554,15 @@ impl Client {
     /// inspect it (e.g. cluster redirects). `Err` is reserved for
     /// connection/desync failures — a GET desync poisons the connection.
     ///
-    /// On io_uring a GET's value is drained from provided buffers without a
-    /// copy. On mio, and on a connection that receives into its accumulator
-    /// ([`ringline::TcpConnect::recv_direct`]), it is drained through
-    /// `with_bytes`.
+    /// A GET's value is drained through `with_bytes`.
     pub async fn recv_meta(&mut self) -> Result<RespMeta, Error> {
         self.flush()?;
         let pending = self.pending.pop_front().ok_or(Error::NoPending)?;
         self.flushed_count = self.flushed_count.saturating_sub(1);
         match pending.kind {
             PendingOpKind::Get => {
-                // io_uring: zero-copy borrow-and-discard over provided buffers,
-                // except on a direct connection, which has none. There and on
-                // mio: header-parse + streaming drain over `with_bytes` — bounded
-                // memory (never materializes the value), same `RespMeta` contract.
-                #[cfg(has_io_uring)]
-                let (outcome, _consumed, latency_ns) = if self.rx.is_recv_direct() {
-                    self.run_get_drain_bytes(&pending).await?
-                } else {
-                    self.run_get_state_machine(&pending, |_| {}).await?
-                };
-                #[cfg(not(has_io_uring))]
+                // Header parse, then a streaming drain over `with_bytes`: the
+                // value is never materialized.
                 let (outcome, _consumed, latency_ns) = self.run_get_drain_bytes(&pending).await?;
                 let meta = match outcome {
                     Ok(value_len) => RespMeta {
@@ -1855,7 +1594,7 @@ impl Client {
 
     /// Read a small SET/DEL reply and classify it into [`RespMeta`], mirroring
     /// `recv()`'s SET/DEL classification, without materializing anything the
-    /// caller keeps. Unlike the GET segmented path, `read_value` consumes a
+    /// caller keeps. Unlike the GET drain, `read_value` consumes a
     /// *complete* RESP value, so an unexpected reply type is wire-aligned and is
     /// reported as `success = false` WITHOUT poisoning. A broken read clears the
     /// pipeline and returns `Err` (mirroring `recv()`).
@@ -3266,147 +3005,13 @@ impl Client {
     }
 }
 
-// ── Streaming GET (segmented recv, single-connection Client only) ─────────
-//
-// `get_stream` returns a `ValueStream` instead of a materialized `Bytes`: the
-// value body is delivered as segments over the runtime's segmented-recv API
-// (`ConnCtx::recv_owned_segment`), so a consumer that discards or streams the
-// value never forces the whole thing into one contiguous allocation. Only
-// `collect()` materializes.
-//
-// io_uring only — segmented recv is backed by the provided-buffer ring, and the
-// underlying `recv_owned_segment` / `end_segments` methods are `#[cfg(has_io_uring)]`.
-// This crate's build.rs emits `has_io_uring` in lockstep with `ringline`.
-//
-// SCOPE (v1): redis `get_stream` on the single-connection `Client` (here) and on
-// `Pool` (see `pool.rs`, which reuses this `ValueStream` machinery with
-// poison-eviction). Deferred: `recv_streaming()` fire/recv integration, and
-// `ShardedClient` streaming. `ClusterClient` streaming stays out of scope
-// (MOVED/ASK re-read cannot be expressed by a length-bounded single-conn stream).
-
-#[cfg(has_io_uring)]
-impl Client {
-    /// Streaming GET (single-connection [`Client`] only).
-    ///
-    /// Like [`get`](Self::get), but the value body is delivered as a
-    /// [`ValueStream`] of segments rather than a single materialized [`Bytes`].
-    /// A consumer that only needs to discard or checksum the value pays no
-    /// gather copy; [`ValueStream::collect`] is the one materialization.
-    ///
-    /// Returns `Ok(None)` for a missing key (`$-1\r\n` nil reply).
-    ///
-    /// # Sequential use only
-    ///
-    /// The returned stream borrows `&mut self`, so a second concurrent stream (or
-    /// any other client call) while it is alive is a compile error. `get_stream`
-    /// must be called on an *idle* connection — not interleaved with pending
-    /// `fire_*` operations or a half-read pipeline, whose responses would arrive
-    /// ahead of the GET reply and desync the segmented read.
-    ///
-    /// # Dropping mid-stream poisons the connection
-    ///
-    /// If a [`ValueStream`] is dropped before its value (and the trailing
-    /// delimiter) is fully consumed — via [`collect`](ValueStream::collect),
-    /// [`discard`](ValueStream::discard), or reading
-    /// [`next_segment`](ValueStream::next_segment) to the end — the undrained
-    /// wire bytes cannot be drained synchronously in `Drop`, so the connection is
-    /// **closed** (its slot generation bumped). The next operation on this client
-    /// then fails, matching the "poison = close" recovery discipline.
-    ///
-    /// On a connection that receives into its accumulator
-    /// ([`ringline::TcpConnect::recv_direct`]) this returns [`Error::Io`] of
-    /// kind `Unsupported` without sending the request.
-    pub async fn get_stream(
-        &mut self,
-        key: impl AsRef<[u8]>,
-    ) -> Result<Option<ValueStream<'_>>, Error> {
-        if self.rx.is_recv_direct() {
-            return Err(recv_direct_refused());
-        }
-        let key = key.as_ref();
-        // Fire the GET, then opt the connection into segmented delivery. The
-        // reply body then arrives as held segments instead of being gathered
-        // into the accumulator. `recv_owned_segment()` sets the domain
-        // synchronously (before we await), so the reply can't be processed under
-        // the default path first.
-        self.encode_buf.clear();
-        encode_get_into(self.command_names.as_deref(), key, &mut self.encode_buf);
-        self.tx.send_nowait(&self.encode_buf)?;
-
-        // Read the tiny `$<len>\r\n` (or `$-1\r\n`) bulk-string header. It always
-        // fits in the first received buffer; the rare split-across-buffers case is
-        // handled by accumulating into `acc` and retrying.
-        //
-        // Demarcation is exact: `parse_get_header` measures only the header bytes
-        // (`header_len`), never the value. Everything after `header_len` in the
-        // buffer we already pulled is value-body bytes, handed to the stream as an
-        // O(1) `Bytes::slice` — so no value byte is lost or double-read, and the
-        // read cursor is a single monotonic position across header + body.
-        let mut acc: Option<Vec<u8>> = None;
-        loop {
-            let seg = match self.rx.recv_owned_segment()?.await {
-                Ok(Some(b)) => b,
-                Ok(None) => {
-                    // Peer closed before any header arrived.
-                    let _ = self.rx.end_segments();
-                    return Err(Error::ConnectionClosed);
-                }
-                Err(e) => {
-                    // Recv I/O error mid-header: the read is broken and the
-                    // connection is still in the segmented domain. Poison it
-                    // (close) so it is not reused stuck in that domain / desynced,
-                    // rather than leaking the error while leaving the domain set.
-                    self.tx.close();
-                    return Err(e.into());
-                }
-            };
-            let combined: Bytes = match acc.take() {
-                None => seg,
-                Some(mut a) => {
-                    a.extend_from_slice(&seg);
-                    Bytes::from(a)
-                }
-            };
-            match parse_get_header(&combined) {
-                Ok(Some(GetHeader::Nil)) => {
-                    // Missing key. `$-1\r\n` carries no value/trailing; restore
-                    // the default read path so the next command works.
-                    self.rx.end_segments()?;
-                    return Ok(None);
-                }
-                Ok(Some(GetHeader::Bulk { len, header_len })) => {
-                    let leftover = combined.slice(header_len..);
-                    return Ok(Some(ValueStream::new(self, len, leftover)));
-                }
-                Ok(None) => {
-                    // Header not yet complete — stash and pull the next buffer.
-                    acc = Some(combined.to_vec());
-                }
-                Err(e) => {
-                    // Server error reply (e.g. `-WRONGTYPE`) or malformed header.
-                    // In sequential use the whole reply line is in `combined`;
-                    // restore the read path and surface the error.
-                    let _ = self.rx.end_segments();
-                    return Err(e);
-                }
-            }
-        }
-    }
-}
-
 /// Parsed shape of a GET reply header.
 enum GetHeader {
     /// The key does not exist: RESP2 `$-1\r\n` or RESP3 `_\r\n`.
     Nil,
     /// `$<len>\r\n` — a bulk string of `len` value bytes follows (then a trailing
-    /// CRLF). `header_len` is the byte length of the `$<len>\r\n` header itself.
-    /// `header_len` is used only by the io_uring `get_stream` path; the mio GET
-    /// drainer parses the header byte-at-a-time and ignores it.
-    Bulk {
-        len: usize,
-        #[cfg_attr(not(has_io_uring), allow(dead_code))]
-        header_len: usize,
-    },
+    /// CRLF).
+    Bulk { len: usize },
 }
 
 /// Position of the first `\r\n` in `buf` (the index of the `\r`), or `None`.
@@ -3431,13 +3036,12 @@ fn parse_get_header(buf: &[u8]) -> Result<Option<GetHeader>, Error> {
                 return Ok(None);
             };
             let digits = &buf[1..cr];
-            let header_len = cr + 2; // '$' .. through the "\r\n"
             if digits == b"-1" {
                 return Ok(Some(GetHeader::Nil));
             }
             let s = std::str::from_utf8(digits).map_err(|_| Error::UnexpectedResponse)?;
             let len: usize = s.parse().map_err(|_| Error::UnexpectedResponse)?;
-            Ok(Some(GetHeader::Bulk { len, header_len }))
+            Ok(Some(GetHeader::Bulk { len }))
         }
         Some(b'_') => {
             // RESP3 null (`_\r\n`) — a GET miss on a RESP3 (`HELLO 3`)
@@ -3457,180 +3061,6 @@ fn parse_get_header(buf: &[u8]) -> Result<Option<GetHeader>, Error> {
             ))
         }
         Some(_) => Err(Error::UnexpectedResponse),
-    }
-}
-
-/// A streaming Redis GET value (see [`Client::get_stream`]).
-///
-/// Borrows the [`Client`] exclusively (`&mut`) and is bounded to the value length
-/// parsed from the `$<len>\r\n` header, so it can neither over-read into a
-/// following reply nor be used concurrently with another client operation.
-///
-/// The value body is delivered via the runtime's segmented-recv API. In v1 each
-/// [`next_segment`](Self::next_segment) chunk (and the [`collect`](Self::collect)
-/// gather) is an owned [`Bytes`] copied at delivery (Mode C). A zero-copy
-/// [`discard`](Self::discard) over the borrowed `segments()` reader is a
-/// documented follow-up; v1 `discard` still copies each chunk at delivery but
-/// performs no *gather* copy.
-#[cfg(has_io_uring)]
-pub struct ValueStream<'a> {
-    client: &'a mut Client,
-    /// Full bulk-string length from the header.
-    len: usize,
-    /// Value bytes not yet handed to the caller.
-    value_left: usize,
-    /// Trailing CRLF bytes not yet consumed (starts at 2).
-    trail_left: usize,
-    /// Bytes pulled from the wire but not yet consumed (value + maybe trailing +,
-    /// in non-sequential misuse, following-reply bytes which are discarded).
-    buf: Bytes,
-    /// Set once value + trailing CRLF are fully consumed and the recv domain has
-    /// been restored. `false` at drop time ⇒ the stream was abandoned mid-value ⇒
-    /// poison (close) the connection.
-    finished: bool,
-}
-
-#[cfg(has_io_uring)]
-impl<'a> ValueStream<'a> {
-    fn new(client: &'a mut Client, len: usize, leftover: Bytes) -> Self {
-        Self {
-            client,
-            len,
-            value_left: len,
-            trail_left: 2,
-            buf: leftover,
-            finished: false,
-        }
-    }
-
-    /// The value length in bytes, from the `$<len>\r\n` header.
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    /// Whether the value is zero-length.
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    /// Pull the next non-empty received buffer into `self.buf`.
-    ///
-    /// A `None` from the runtime here means the peer closed (FIN) before the
-    /// whole value + trailing CRLF arrived — a **short FIN**, surfaced as an
-    /// error (never a truncated value), per the design's bounded-`len` contract.
-    async fn refill(&mut self) -> Result<(), Error> {
-        loop {
-            match self.client.rx.recv_owned_segment()?.await {
-                Ok(Some(b)) if !b.is_empty() => {
-                    self.buf = b;
-                    return Ok(());
-                }
-                Ok(Some(_)) => continue,
-                Ok(None) => return Err(Error::ConnectionClosed),
-                Err(e) => return Err(Error::Io(e)),
-            }
-        }
-    }
-
-    /// The next chunk of the value body, or `Ok(None)` once the whole value has
-    /// been delivered. Chunks are owned [`Bytes`] (Mode C copy-at-delivery); the
-    /// caller may hold them freely.
-    ///
-    /// After the final chunk the trailing CRLF is consumed and the connection is
-    /// restored for the next command, so a caller need not read past the last
-    /// value byte — though calling again simply returns `Ok(None)`.
-    pub async fn next_segment(&mut self) -> Result<Option<Bytes>, Error> {
-        if self.value_left == 0 {
-            self.finish().await?;
-            return Ok(None);
-        }
-        if self.buf.is_empty() {
-            self.refill().await?;
-        }
-        let take = self.value_left.min(self.buf.len());
-        let chunk = self.buf.split_to(take);
-        self.value_left -= take;
-        if self.value_left == 0 {
-            self.finish().await?;
-        }
-        Ok(Some(chunk))
-    }
-
-    /// Materialize the whole value into one contiguous [`Bytes`] (the copy).
-    ///
-    /// Single-buffer values return an O(1) `Bytes` slice with no extra gather;
-    /// multi-buffer values are gathered into one allocation (still one logical
-    /// copy of the value from the caller's perspective).
-    pub async fn collect(mut self) -> Result<Bytes, Error> {
-        // Fast path: the whole value is already contiguous in `buf`.
-        if self.buf.len() >= self.value_left {
-            let out = self.buf.split_to(self.value_left);
-            self.value_left = 0;
-            self.finish().await?;
-            return Ok(out);
-        }
-        let mut out = bytes::BytesMut::with_capacity(self.len);
-        while self.value_left > 0 {
-            if self.buf.is_empty() {
-                self.refill().await?;
-            }
-            let take = self.value_left.min(self.buf.len());
-            out.extend_from_slice(&self.buf.split_to(take));
-            self.value_left -= take;
-        }
-        self.finish().await?;
-        Ok(out.freeze())
-    }
-
-    /// Consume and release the whole value without materializing it, leaving the
-    /// connection usable for the next command. No gather copy.
-    pub async fn discard(mut self) -> Result<(), Error> {
-        while self.value_left > 0 {
-            if self.buf.is_empty() {
-                self.refill().await?;
-            }
-            let take = self.value_left.min(self.buf.len());
-            let _ = self.buf.split_to(take);
-            self.value_left -= take;
-        }
-        self.finish().await
-    }
-
-    /// Consume the trailing CRLF, restore the default `with_data`/`with_bytes`
-    /// read path, and mark the stream finished so `Drop` does not poison the
-    /// connection.
-    async fn finish(&mut self) -> Result<(), Error> {
-        if self.finished {
-            return Ok(());
-        }
-        while self.trail_left > 0 {
-            if self.buf.is_empty() {
-                self.refill().await?;
-            }
-            let take = self.trail_left.min(self.buf.len());
-            let _ = self.buf.split_to(take);
-            self.trail_left -= take;
-        }
-        // Restore the default read path. Any bytes still in `self.buf` past the
-        // trailing CRLF would belong to a *following* reply — none exist in the
-        // documented sequential use; they are dropped rather than reinjected.
-        self.client.rx.end_segments()?;
-        self.finished = true;
-        Ok(())
-    }
-}
-
-#[cfg(has_io_uring)]
-impl Drop for ValueStream<'_> {
-    fn drop(&mut self) {
-        if !self.finished {
-            // Abandoned mid-value (or a short FIN left the stream broken):
-            // undrained bytes remain inbound and the wire cannot be drained
-            // synchronously here, so poison the connection. `close()` bumps the
-            // slot generation, making the client's stored handle stale so the
-            // next operation fails.
-            self.client.tx.close();
-        }
     }
 }
 
@@ -4417,14 +3847,14 @@ mod audit_tests {
     }
 }
 
-/// Locks the `parse_get_header` contract that `recv_get_segments`'s poison
-/// decision depends on. The Mode-B state machine feeds the header **one byte at
+/// Locks the `parse_get_header` contract that `recv_meta`'s poison decision
+/// depends on. The GET drain (`run_get_drain_bytes`) feeds the header **one byte at
 /// a time** and stops the instant `parse_get_header` returns non-`Ok(None)`, so:
 ///
 /// - An unexpected reply type (`:`/`+`/`*`, …) errors on the **first byte** with
 ///   `UnexpectedResponse` — only 1 byte is consumed, the rest of the reply is
 ///   left on the wire, and we cannot know how many bytes to skip. The connection
-///   is desynced, so `recv_get_segments` **must poison** it.
+///   is desynced, so `recv_meta` **must poison** it.
 /// - A genuine server error (`-...\r\n`) errors only once the whole `\r\n`-
 ///   terminated line is buffered (`Error::Redis`), so the wire stays aligned and
 ///   the connection is **reusable** — it must NOT be poisoned.
@@ -4439,8 +3869,7 @@ mod get_header_resp3_tests {
     #[test]
     fn resp3_null_header_is_a_miss() {
         // RESP3 GET miss is `_\r\n` (vs RESP2 `$-1\r\n`). It must classify as a
-        // miss, not an `UnexpectedResponse`. `parse_get_header` feeds both the
-        // io_uring and mio GET drains, so this is not io_uring-gated.
+        // miss, not an `UnexpectedResponse`.
         assert!(matches!(
             parse_get_header(b"_\r\n"),
             Ok(Some(GetHeader::Nil))
@@ -4452,7 +3881,7 @@ mod get_header_resp3_tests {
     }
 }
 
-#[cfg(all(test, has_io_uring))]
+#[cfg(test)]
 mod get_header_poison_contract_tests {
     use super::*;
 

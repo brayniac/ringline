@@ -29,7 +29,8 @@ pub static POOL: ShardedCounterGroup = ShardedCounterGroup::new(9);
 )]
 pub static RECV_RING: ShardedCounterGroup = ShardedCounterGroup::new(recv_ring::COUNT);
 
-/// Direct receives (`TcpConnect::recv_direct`).
+/// Direct receives, on plaintext connections from `connect` and
+/// `connect_unix`.
 #[metric(
     name = "ringline/recv_direct",
     description = "Direct receives into connection accumulators: armed, sized for a known length, bytes, stale, pooled buffers reused and allocated"

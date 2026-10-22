@@ -7480,8 +7480,11 @@ fn half_close_waits_for_queued_sends_to_drain() {
 /// same way.
 ///
 /// The point of running it on both backends is that the same handler has to
-/// behave identically on each — zero-copy through held provided buffers on
-/// io_uring, a queued copy on mio. It also pins the case the API exists for:
+/// behave identically on each. On io_uring the client-to-backend leg forwards
+/// held provided buffers from the accepted connection with no copy, and the
+/// backend-to-client leg forwards from the backend connection's accumulator,
+/// which receives directly, through the client's send queue; on mio both legs
+/// are a queued copy. It also pins the case the API exists for:
 /// the length comes from a header, so bytes of the body have already landed in
 /// the accumulator by the time the forward starts, and they must come out
 /// first.

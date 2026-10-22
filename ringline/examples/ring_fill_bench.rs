@@ -1,11 +1,11 @@
-//! Recv buffer-ring throughput harness.
+//! Recv throughput harness.
 //!
-//! Reproduces the concurrency/large-response throughput cliff and reports the
-//! ring-starvation counters (parked multishot recvs, fallback one-shot recvs)
-//! alongside throughput, so the mechanism is visible — not just the symptom.
-//! Used to (a) de-risk provided-buffer geometry and (b) validate that the
-//! adaptive-recv-buffering work flattens the cliff. See
-//! `docs/recv-buffer-adaptive-design.md`.
+//! On io_uring the client's connection is a plaintext outbound connection,
+//! which receives directly into its accumulator (`docs/recv-direct-design.md`),
+//! so `RING`, `BUF` and the ring counters in the result line do not apply to
+//! it, and `MODE=segments` and `MODE=forward`, which need the ring, exit with
+//! an error. MODE=whole, bytes and mixed measure direct receive. On mio they
+//! measure the mio read path.
 //!
 //! Protocol: the ringline client sends a 4-byte little-endian length request;
 //! the in-process std-thread server echoes back exactly that many bytes. This
@@ -26,7 +26,8 @@
 //!             mixed    = with_data, alternate SMALL/LARGE per round (index-derived)
 //!             segments = Mode B borrowed segment reader, process-and-release (0 copy)
 //!             forward  = Mode A forward_to a /dev/null sink (0 userspace copy)
-//!             (segments/forward are io_uring-only; fall back to whole on mio)
+//!             (segments/forward exit with status 2 on io_uring, where the
+//!             connection receives directly; on mio they run as whole)
 //!   PORT      server port (default 7891)
 #![allow(clippy::manual_async_fn)]
 
@@ -122,6 +123,14 @@ impl AsyncEventHandler for Bench {
                     let conn = connect(target).await.expect("connect");
                     // Reading an outbound connection goes through its read half.
                     let (mut conn_tx, mut conn_rx) = conn.split();
+                    #[cfg(has_io_uring)]
+                    if (mode == "segments" || mode == "forward") && conn_rx.is_recv_direct() {
+                        eprintln!(
+                            "[ring_fill_bench] MODE={mode} needs the provided-buffer ring, \
+                             and an outbound plaintext connection receives directly"
+                        );
+                        std::process::exit(2);
+                    }
                     // MODE=forward forwards each response straight to a discard
                     // sink (/dev/null) with no userspace copy. Opened once per task.
                     #[cfg(has_io_uring)]
