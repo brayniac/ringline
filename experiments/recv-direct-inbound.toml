@@ -125,7 +125,9 @@ cd /home/anvil && tar xzf bins.tgz && chmod +x out/*
 ( cd out && sha256sum * )
 uname -r
 sudo sysctl -w net.core.rmem_max=134217728 net.core.wmem_max=134217728 net.ipv4.ip_local_port_range="1024 65535" net.ipv4.tcp_tw_reuse=1
-sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq time >/dev/null 2>&1 || true
+sudo apt-get update -qq
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq time >/dev/null || exit 1
+[ -x /usr/bin/time ] || { echo "NO /usr/bin/time"; exit 1; }
 '''
 
 [[jobs.steps]]
@@ -193,6 +195,7 @@ format = "json"
 CFG
 }
 
+[ -x /usr/bin/time ] || { echo "NO /usr/bin/time"; exit 1; }
 warm_s=$(echo {warmup} | tr -d s)
 dur_s=$(echo {duration} | tr -d s)
 # run_cell CELL CMD VLEN KEYS DEPTH CONNS
