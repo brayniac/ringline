@@ -1108,10 +1108,10 @@ impl ConfigBuilder {
         self
     }
 
-    /// Set the size of the buffer a direct connection
-    /// ([`TcpConnect::recv_direct`](crate::TcpConnect::recv_direct)) receives
-    /// into when it has nothing buffered. An idle direct connection holds a
-    /// buffer of this size, or of
+    /// Set the size of the buffer that a plaintext connection from
+    /// [`connect`](crate::connect) or [`connect_unix`](crate::connect_unix)
+    /// receives into on io_uring when it has nothing buffered. An idle
+    /// connection of that kind holds a buffer of this size, or of
     /// [`recv_accumulator_capacity`](Self::recv_accumulator_capacity) if
     /// that is larger and at most twice this. A message that does not fit borrows a larger
     /// buffer from the worker (see

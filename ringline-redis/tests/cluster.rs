@@ -1,12 +1,7 @@
-//! `ClusterConfig::recv_direct`: a cluster client opens its node connections
-//! with `TcpConnect::recv_direct`.
+//! A cluster client discovers its slot map and reads a value.
 //!
 //! A std-thread stub answers `CLUSTER SLOTS` with one slot range on itself
-//! and every `GET` with `hello`. The client reads a value through the cluster
-//! client, then checks that a segment read on the node's connection is
-//! refused, which happens only on a direct connection. io_uring only: the
-//! segment read does not exist on mio.
-#![cfg(has_io_uring)]
+//! and every `GET` with `hello`.
 #![allow(clippy::manual_async_fn)]
 
 mod common;
@@ -18,7 +13,7 @@ use std::pin::Pin;
 use std::sync::Mutex;
 
 use ringline::{AsyncEventHandler, ConfigBuilder, Connection, RinglineBuilder};
-use ringline_redis::{ClusterClient, ClusterConfig, Error};
+use ringline_redis::{ClusterClient, ClusterConfig};
 
 static SERVER: Mutex<Option<SocketAddr>> = Mutex::new(None);
 static RESULT: Mutex<Option<Result<(), String>>> = Mutex::new(None);
@@ -62,15 +57,14 @@ fn serve_conn(stream: TcpStream, port: u16) {
     }
 }
 
-struct ClusterDirect;
+struct ClusterGet;
 
-impl AsyncEventHandler for ClusterDirect {
+impl AsyncEventHandler for ClusterGet {
     fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
         Some(Box::pin(async {
             let addr = SERVER.lock().unwrap().unwrap();
             let r = async {
-                let mut cluster =
-                    ClusterClient::new(ClusterConfig::new(vec![addr]).recv_direct(true));
+                let mut cluster = ClusterClient::new(ClusterConfig::new(vec![addr]));
                 cluster
                     .connect()
                     .await
@@ -82,15 +76,6 @@ impl AsyncEventHandler for ClusterDirect {
                     .ok_or("cluster get: None")?;
                 if v.as_ref() != b"hello" {
                     return Err(format!("cluster get read {v:?}"));
-                }
-                let client = cluster
-                    .node_client(&addr.to_string())
-                    .await
-                    .map_err(|e| format!("node_client: {e}"))?;
-                match client.get_stream(b"k").await {
-                    Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::Unsupported => {}
-                    Err(e) => return Err(format!("get_stream: {e}")),
-                    Ok(_) => return Err("get_stream accepted, so not direct".into()),
                 }
                 cluster.close_all();
                 Ok(())
@@ -104,12 +89,12 @@ impl AsyncEventHandler for ClusterDirect {
         async {}
     }
     fn create_for_worker(_id: usize) -> Self {
-        ClusterDirect
+        ClusterGet
     }
 }
 
 #[test]
-fn a_cluster_client_with_recv_direct_opens_direct_connections() {
+fn a_cluster_client_discovers_and_gets() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     *SERVER.lock().unwrap() = Some(addr);
@@ -126,7 +111,7 @@ fn a_cluster_client_with_recv_direct_opens_direct_connections() {
         .build()
         .expect("config");
     let (runtime, handles) = RinglineBuilder::new(config)
-        .launch::<ClusterDirect>()
+        .launch::<ClusterGet>()
         .expect("launch");
     common::join_workers(&runtime, handles);
     assert_eq!(

@@ -156,7 +156,7 @@ pub(crate) struct DirectRecv {
 
 impl Driver {
     /// Arm a direct receive on `conn_index` if it is a direct connection
-    /// (`TcpConnect::recv_direct`), open, and has none in flight. Called by a
+    /// (a plaintext connection from `connect` or `connect_unix`), open, and has none in flight. Called by a
     /// receive future that parks, after its parser has seen every buffered
     /// byte: the receive detaches the accumulator's buffer, so arming earlier
     /// would hide buffered bytes from the parser until more arrive.
@@ -1033,7 +1033,7 @@ pub(crate) struct Driver {
     /// Lifetime count of fallback recv submissions on this worker
     /// (reported in the shutdown diag line).
     pub(crate) recv_fallback_count: u64,
-    /// Buffers of in-flight direct receives (`TcpConnect::recv_direct`),
+    /// Buffers of in-flight direct receives,
     /// indexed by the `RecvDirect` payload. An entry holds the accumulator
     /// buffer the kernel writes into and is removed only by that receive's
     /// completion, so the memory outlives the operation across close and

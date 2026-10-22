@@ -234,8 +234,8 @@ one call on both backends. Until
 `end_segments` runs, on io_uring, `with_data`, `with_bytes`, `recv_ready`,
 `ConnStream` and recv sinks never see bytes that arrive, because those bytes
 go to `segment_hold`; a caller that switches readers calls `end_segments`
-first. The client crates do this today after `recv_get_segments` and their
-streaming reads.
+first. No client crate reads with segments (decision 12 in
+`docs/recv-direct-design.md`).
 
 ## After the callback
 

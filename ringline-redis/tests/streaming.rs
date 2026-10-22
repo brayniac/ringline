@@ -1,14 +1,9 @@
-//! Streaming GET (`Client::get_stream` / `ValueStream`) integration tests.
+//! `set_stream`, pooled and sharded GETs, and `recv_meta` against an
+//! in-process stub server.
 //!
-//! Mirrors the in-process stub-server pattern in `parse_error.rs` (no real Redis
-//! needed): a `StreamStubServer` handler answers GETs with canned `$<len>\r\n…`
-//! bulk replies, and a client handler drives `get_stream` against it over a real
-//! loopback io_uring connection.
-//!
-//! The whole file is gated on `has_io_uring` — segmented recv (and therefore
-//! `get_stream`) is an io_uring-only API. On the mio backend / macOS the file
-//! compiles to nothing, matching the runtime.
-#![cfg(has_io_uring)]
+//! Mirrors the stub-server pattern in `parse_error.rs` (no real Redis needed):
+//! a `StreamStubServer` handler answers commands with canned replies over a
+//! loopback connection.
 
 mod common;
 
@@ -32,8 +27,9 @@ fn test_config() -> Config {
         .workers(1)
         .pin_to_core(false)
         .sq_entries(256)
-        // Small provided buffers so a large value spans many recv segments
-        // (exercises the multi-buffer path).
+        // recv_buffer sizes the provided buffers of the stub server's accepted
+        // connections. On io_uring the client's outbound connection receives
+        // directly and does not use them.
         .recv_buffer(128, 4096)
         .max_connections(64)
         // Large send-pool slot so the server can push a 100 KB value in one send.
@@ -46,7 +42,6 @@ fn test_config() -> Config {
 
 const SMALL: &[u8] = b"hello-streaming-world";
 const LARGE_LEN: usize = 100_000;
-const POISON_LEN: usize = 20_000;
 
 /// Streaming-SET value: a deterministic pattern of `SET_LEN` bytes the client
 /// streams via `set_stream` and the stub server re-derives to verify it received
@@ -65,9 +60,6 @@ const SHORT_SENT: &[u8] = b"0123456789";
 fn large_value() -> Vec<u8> {
     (0..LARGE_LEN).map(|i| (i % 251) as u8).collect()
 }
-fn poison_value() -> Vec<u8> {
-    (0..POISON_LEN).map(|i| (i % 241) as u8).collect()
-}
 
 /// Encode a RESP bulk-string reply `$<len>\r\n<value>\r\n`.
 fn bulk_reply(value: &[u8]) -> Vec<u8> {
@@ -84,7 +76,6 @@ fn decide(key: &[u8]) -> (Vec<u8>, bool) {
     match key {
         b"stream:small" => (bulk_reply(SMALL), false),
         b"stream:large" => (bulk_reply(&large_value()), false),
-        b"stream:poison" => (bulk_reply(&poison_value()), false),
         b"stream:short" => {
             // Claim SHORT_CLAIMED_LEN bytes but send only SHORT_SENT, then FIN.
             let mut out = format!("${SHORT_CLAIMED_LEN}\r\n").into_bytes();
@@ -92,7 +83,7 @@ fn decide(key: &[u8]) -> (Vec<u8>, bool) {
             (out, true)
         }
         b"borrow:unexpected" => {
-            // A non-`$`/`-` reply type (RESP integer) to a GET. The borrow-GET's
+            // A non-`$`/`-` reply type (RESP integer) to a GET. `recv_meta`'s
             // byte-at-a-time header parse errors on the first byte, leaving
             // `5\r\n` on the wire → the connection is desynced and must poison.
             (b":5\r\n".to_vec(), false)
@@ -202,184 +193,9 @@ async fn connect(addr: SocketAddr) -> Result<Client, String> {
 }
 
 async fn run_client(addr: SocketAddr) -> Result<(), String> {
-    // ── (a) small value: collect() == get() ──────────────────────────────
-    let mut client = connect(addr).await?;
-    {
-        let stream = client
-            .get_stream(b"stream:small")
-            .await
-            .map_err(|e| format!("small get_stream: {e}"))?
-            .ok_or("small: unexpected None")?;
-        if stream.len() != SMALL.len() {
-            return Err(format!("small len: {} != {}", stream.len(), SMALL.len()));
-        }
-        let collected = stream
-            .collect()
-            .await
-            .map_err(|e| format!("small collect: {e}"))?;
-        if collected.as_ref() != SMALL {
-            return Err(format!("small collect mismatch: {collected:?}"));
-        }
-    }
-    // Same value via the materialized get() — connection still usable, results equal.
-    let materialized = client
-        .get(b"stream:small")
-        .await
-        .map_err(|e| format!("small get: {e}"))?
-        .ok_or("small get: None")?;
-    if materialized.as_ref() != SMALL {
-        return Err("small get != get_stream".into());
-    }
-
-    // ── (b) large value: collect() reassembles across many buffers ────────
-    let expected_large = large_value();
-    {
-        let stream = client
-            .get_stream(b"stream:large")
-            .await
-            .map_err(|e| format!("large get_stream: {e}"))?
-            .ok_or("large: None")?;
-        if stream.len() != LARGE_LEN {
-            return Err(format!("large len: {}", stream.len()));
-        }
-        let collected = stream
-            .collect()
-            .await
-            .map_err(|e| format!("large collect: {e}"))?;
-        if collected.len() != LARGE_LEN || collected.as_ref() != expected_large.as_slice() {
-            return Err("large collect mismatch".into());
-        }
-    }
-
-    // Large value via next_segment(): chunks must reassemble to the same bytes,
-    // and no chunk may exceed the remaining value length (bounded to len).
-    {
-        let mut stream = client
-            .get_stream(b"stream:large")
-            .await
-            .map_err(|e| format!("large2 get_stream: {e}"))?
-            .ok_or("large2: None")?;
-        let mut assembled = Vec::with_capacity(LARGE_LEN);
-        while let Some(chunk) = stream
-            .next_segment()
-            .await
-            .map_err(|e| format!("large2 next_segment: {e}"))?
-        {
-            assembled.extend_from_slice(&chunk);
-            if assembled.len() > LARGE_LEN {
-                return Err("next_segment over-read past len".into());
-            }
-        }
-        if assembled != expected_large {
-            return Err("large next_segment reassembly mismatch".into());
-        }
-    }
-
-    // ── (b') discard() leaves the connection usable for the NEXT command ──
-    {
-        let stream = client
-            .get_stream(b"stream:large")
-            .await
-            .map_err(|e| format!("discard get_stream: {e}"))?
-            .ok_or("discard: None")?;
-        stream
-            .discard()
-            .await
-            .map_err(|e| format!("discard: {e}"))?;
-    }
-    // No desync: a plain command right after discard must succeed and be correct.
-    let after_discard = client
-        .get(b"stream:small")
-        .await
-        .map_err(|e| format!("get after discard: {e}"))?
-        .ok_or("get after discard: None")?;
-    if after_discard.as_ref() != SMALL {
-        return Err("desync after discard".into());
-    }
-
-    // ── (c) nil → Ok(None) ────────────────────────────────────────────────
-    // `.is_some()` consumes the Option immediately so the `&mut client` borrow
-    // (held by the `ValueStream`'s Drop) is released before the next call.
-    let nil_present = client
-        .get_stream(b"stream:nil")
-        .await
-        .map_err(|e| format!("nil get_stream: {e}"))?
-        .is_some();
-    if nil_present {
-        return Err("nil: expected None".into());
-    }
-    // Connection still usable after a nil stream.
-    let after_nil = client
-        .get(b"stream:small")
-        .await
-        .map_err(|e| format!("get after nil: {e}"))?
-        .ok_or("get after nil: None")?;
-    if after_nil.as_ref() != SMALL {
-        return Err("desync after nil".into());
-    }
-
-    // ── (c') short FIN: server claims N bytes, sends fewer, then closes ───
-    // The header parses fine and a `ValueStream` is created, but the value body
-    // is truncated by a peer FIN mid-stream. `ValueStream::refill` maps the
-    // runtime EOF (`recv_owned_segment() -> Ok(None)`) to a short-read error, so
-    // `collect()` must ERROR (not hang, not return truncated bytes). Regression
-    // for: a parked segmented reader must observe a peer FIN as EOF.
-    {
-        let stream = client
-            .get_stream(b"stream:short")
-            .await
-            .map_err(|e| format!("short get_stream: {e}"))?
-            .ok_or("short: unexpected None")?;
-        // Header claimed SHORT_CLAIMED_LEN value bytes.
-        if stream.len() != SHORT_CLAIMED_LEN {
-            return Err(format!(
-                "short len: {} != {SHORT_CLAIMED_LEN}",
-                stream.len()
-            ));
-        }
-        match stream.collect().await {
-            Ok(v) => {
-                return Err(format!(
-                    "short: expected an error on truncated value, got {} bytes",
-                    v.len()
-                ));
-            }
-            Err(_) => { /* expected: peer FIN mid-value surfaces as an error */ }
-        }
-    }
-
-    // ── (d) undrained drop poisons the connection ────────────────────────
-    {
-        let mut pclient = connect(addr).await?;
-        {
-            let mut stream = pclient
-                .get_stream(b"stream:poison")
-                .await
-                .map_err(|e| format!("poison get_stream: {e}"))?
-                .ok_or("poison: None")?;
-            // Pull one chunk (value not fully consumed), then drop mid-stream.
-            let first = stream
-                .next_segment()
-                .await
-                .map_err(|e| format!("poison next_segment: {e}"))?
-                .ok_or("poison: first chunk None")?;
-            if first.len() >= POISON_LEN {
-                return Err("poison value did not span multiple buffers".into());
-            }
-            // `stream` dropped here undrained → connection poisoned (close()).
-        }
-        // The next op must error (stale slot after the poison close).
-        match pclient.get(b"stream:small").await {
-            Ok(_) => return Err("poison: next op unexpectedly succeeded".into()),
-            Err(_) => { /* expected */ }
-        }
-    }
-
     run_set_stream(addr).await?;
-    run_pool_stream(addr).await?;
-    run_pool_direct(addr).await?;
-    run_sharded_direct(addr).await?;
-    run_borrow_get(addr).await?;
+    run_pool_get(addr).await?;
+    run_sharded_get(addr).await?;
     run_recv_meta(addr).await?;
 
     Ok(())
@@ -531,146 +347,28 @@ async fn run_recv_meta(addr: SocketAddr) -> Result<(), String> {
         }
     }
 
-    Ok(())
-}
-
-// ── Borrow GET (Mode-B recv_get_discard / recv_get_segments) ───────────────
-
-async fn run_borrow_get(addr: SocketAddr) -> Result<(), String> {
-    // (a) hit: recv_get_discard returns the value length (no copy).
+    // (h) the peer closes partway through a GET value → `ConnectionClosed`.
     {
         let mut client = connect(addr).await?;
         client
-            .fire_get(b"stream:small", 1)
-            .map_err(|e| format!("fire: {e}"))?;
-        let meta = client
-            .recv_get_discard()
-            .await
-            .map_err(|e| format!("recv_get_discard: {e}"))?;
-        if meta.value_len != Some(SMALL.len()) {
-            return Err(format!(
-                "borrow hit len: got {:?}, want {}",
-                meta.value_len,
-                SMALL.len()
-            ));
-        }
-        if meta.user_data != 1 {
-            return Err("borrow user_data mismatch".into());
-        }
-    }
-
-    // (b) miss: `$-1` → value_len None.
-    {
-        let mut client = connect(addr).await?;
-        client
-            .fire_get(b"stream:absent", 2)
-            .map_err(|e| format!("fire: {e}"))?;
-        let meta = client
-            .recv_get_discard()
-            .await
-            .map_err(|e| format!("recv miss: {e}"))?;
-        if meta.value_len.is_some() {
-            return Err(format!(
-                "borrow miss should be None, got {:?}",
-                meta.value_len
-            ));
-        }
-    }
-
-    // (c) recv_get_segments delivers the exact value bytes (zero-copy borrow),
-    // reassembling a large value that spans many provided buffers.
-    {
-        let large = large_value();
-        let mut client = connect(addr).await?;
-        client
-            .fire_get(b"stream:large", 3)
-            .map_err(|e| format!("fire: {e}"))?;
-        let mut collected = Vec::new();
-        let meta = client
-            .recv_get_segments(|seg| collected.extend_from_slice(seg))
-            .await
-            .map_err(|e| format!("recv_get_segments: {e}"))?;
-        if meta.value_len != Some(large.len()) {
-            return Err(format!(
-                "borrow large len: got {:?}, want {}",
-                meta.value_len,
-                large.len()
-            ));
-        }
-        if collected != large {
-            return Err("borrow large value bytes mismatch".into());
-        }
-    }
-
-    // (d) pipelined: fire several GETs, recv in order — exercises the inter-reply
-    // boundary gathering (the only copy on the path).
-    {
-        let mut client = connect(addr).await?;
-        client
-            .fire_get(b"stream:small", 10)
-            .map_err(|e| format!("fire: {e}"))?;
-        client
-            .fire_get(b"stream:absent", 11)
-            .map_err(|e| format!("fire: {e}"))?;
-        client
-            .fire_get(b"stream:small", 12)
-            .map_err(|e| format!("fire: {e}"))?;
-        let m0 = client
-            .recv_get_discard()
-            .await
-            .map_err(|e| format!("pipe 0: {e}"))?;
-        let m1 = client
-            .recv_get_discard()
-            .await
-            .map_err(|e| format!("pipe 1: {e}"))?;
-        let m2 = client
-            .recv_get_discard()
-            .await
-            .map_err(|e| format!("pipe 2: {e}"))?;
-        if m0.user_data != 10 || m0.value_len != Some(SMALL.len()) {
-            return Err(format!("pipe 0 mismatch: {m0:?}"));
-        }
-        if m1.user_data != 11 || m1.value_len.is_some() {
-            return Err(format!("pipe 1 (miss) mismatch: {m1:?}"));
-        }
-        if m2.user_data != 12 || m2.value_len != Some(SMALL.len()) {
-            return Err(format!("pipe 2 mismatch: {m2:?}"));
-        }
-    }
-
-    // (e) an unexpected reply type (`:`/`+`/`*`) to a borrow-GET is only
-    // partially consumed by the header parse → the connection is desynced and
-    // MUST be poisoned, so the next op on it fails rather than reading the stray
-    // bytes as the head of a bogus reply. (A genuine `-ERR` stays reusable — see
-    // the `get_header_poison_contract_tests` unit tests.)
-    {
-        let mut client = connect(addr).await?;
-        client
-            .fire_get(b"borrow:unexpected", 20)
-            .map_err(|e| format!("fire: {e}"))?;
-        match client.recv_get_discard().await {
-            Ok(m) => return Err(format!("unexpected-reply borrow should Err, got {m:?}")),
-            Err(Error::UnexpectedResponse) => { /* expected */ }
-            Err(e) => return Err(format!("unexpected-reply borrow wrong error: {e}")),
-        }
-        // Poisoned: the next op must fail (stale slot after the close()), not run
-        // on the desynced connection.
-        if client.get(b"stream:small").await.is_ok() {
-            return Err("unexpected-reply borrow: next op unexpectedly succeeded".into());
+            .fire_get(b"stream:short", 20)
+            .map_err(|e| format!("fire short: {e}"))?;
+        match client.recv_meta().await {
+            Err(Error::ConnectionClosed) => {}
+            other => return Err(format!("short recv_meta: {other:?}")),
         }
     }
 
     Ok(())
 }
 
-// ── A pool whose connections receive directly ─────────────────────────────
+// ── Pool and sharded GETs ──────────────────────────────────────────────────
 
-/// A sharded client with `recv_direct` opens direct connections: values
-/// read correctly, and a segment read is refused.
-async fn run_sharded_direct(addr: SocketAddr) -> Result<(), String> {
+/// A sharded client reads a value larger than one receive buffer.
+async fn run_sharded_get(addr: SocketAddr) -> Result<(), String> {
     use ringline_redis::{ShardedClient, ShardedConfig};
 
-    let mut sharded = ShardedClient::new(ShardedConfig::new(vec![addr]).recv_direct(true));
+    let mut sharded = ShardedClient::new(ShardedConfig::new(vec![addr]));
     sharded
         .connect_all()
         .await
@@ -683,235 +381,59 @@ async fn run_sharded_direct(addr: SocketAddr) -> Result<(), String> {
     if large.as_ref() != large_value().as_slice() {
         return Err("sharded large mismatch".into());
     }
-    let client = sharded
-        .shard_client(0)
-        .await
-        .map_err(|e| format!("shard_client: {e}"))?;
-    match client.get_stream(b"stream:small").await {
-        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::Unsupported => {}
-        Err(e) => return Err(format!("sharded get_stream: {e}")),
-        Ok(_) => return Err("sharded get_stream: accepted, so not direct".into()),
-    }
     sharded.close_all();
     Ok(())
 }
 
-async fn run_pool_direct(addr: SocketAddr) -> Result<(), String> {
+/// A pooled client reads small and large values with `get` and `recv_meta`.
+async fn run_pool_get(addr: SocketAddr) -> Result<(), String> {
     use ringline_redis::{Pool, PoolConfig};
 
-    let pool = Pool::new(PoolConfig::new(addr, 1).recv_direct(true));
+    let pool = Pool::new(PoolConfig::new(addr, 1));
     let mut client = pool
         .client()
         .await
-        .map_err(|e| format!("direct pool client: {e}"))?;
+        .map_err(|e| format!("pool client: {e}"))?;
     let small = client
         .get(b"stream:small")
         .await
-        .map_err(|e| format!("direct pool small get: {e}"))?
-        .ok_or("direct pool small: None")?;
+        .map_err(|e| format!("pool small get: {e}"))?
+        .ok_or("pool small: None")?;
     if small.as_ref() != SMALL {
-        return Err("direct pool small mismatch".into());
+        return Err("pool small mismatch".into());
     }
-    // Larger than `recv_direct_region`, so the parser's length hint sizes
-    // the receive.
+    // Larger than the connection's receive buffer, so the parser's length
+    // hint sizes the receive.
     let large = client
         .get(b"stream:large")
         .await
-        .map_err(|e| format!("direct pool large get: {e}"))?
-        .ok_or("direct pool large: None")?;
+        .map_err(|e| format!("pool large get: {e}"))?
+        .ok_or("pool large: None")?;
     if large.as_ref() != large_value().as_slice() {
-        return Err("direct pool large mismatch".into());
+        return Err("pool large mismatch".into());
     }
-    // `recv_get_discard` reads with segments, which a direct connection
-    // refuses. It refuses before taking the pending GET, so `recv` still
-    // reads that reply and the connection stays aligned.
-    client
-        .fire_get(b"stream:small", 1)
-        .map_err(|e| format!("direct pool fire: {e}"))?;
-    match client.recv_get_discard().await {
-        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::Unsupported => {}
-        other => return Err(format!("direct pool recv_get_discard: {other:?}")),
-    }
-    match client.recv().await {
-        Ok(ringline_redis::CompletedOp::Get {
-            result: Ok(Some(v)),
-            user_data: 1,
-            ..
-        }) if v.as_ref() == SMALL => {}
-        Ok(_) => return Err("direct pool recv after refusal: wrong reply".into()),
-        Err(e) => return Err(format!("direct pool recv after refusal: {e}")),
-    }
-    // `get_stream` refuses before sending, so the next command reads its
-    // own reply.
-    match client.get_stream(b"stream:large").await {
-        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::Unsupported => {}
-        Err(e) => return Err(format!("direct pool get_stream: {e}")),
-        Ok(_) => return Err("direct pool get_stream: accepted".into()),
-    }
-    let small = client
-        .get(b"stream:small")
-        .await
-        .map_err(|e| format!("direct pool get after get_stream: {e}"))?
-        .ok_or("direct pool get after get_stream: None")?;
-    if small.as_ref() != SMALL {
-        return Err(format!(
-            "direct pool get after get_stream read {} bytes",
-            small.len()
-        ));
-    }
-    // `recv_meta` drains a GET reply with `with_bytes` on a direct
-    // connection.
+    // `recv_meta` drains a large GET reply without materializing it.
     client
         .fire_get(b"stream:large", 2)
-        .map_err(|e| format!("direct pool fire large: {e}"))?;
+        .map_err(|e| format!("pool fire large: {e}"))?;
     let m = client
         .recv_meta()
         .await
-        .map_err(|e| format!("direct pool recv_meta: {e}"))?;
+        .map_err(|e| format!("pool recv_meta: {e}"))?;
     if m.value_len != Some(large_value().len()) || m.user_data != 2 {
-        return Err(format!("direct pool recv_meta: {m:?}"));
+        return Err(format!("pool recv_meta: {m:?}"));
     }
     let small = client
         .get(b"stream:small")
         .await
-        .map_err(|e| format!("direct pool get after recv_meta: {e}"))?
-        .ok_or("direct pool get after recv_meta: None")?;
+        .map_err(|e| format!("pool get after recv_meta: {e}"))?
+        .ok_or("pool get after recv_meta: None")?;
     if small.as_ref() != SMALL {
-        return Err("direct pool get after recv_meta mismatch".into());
+        return Err("pool get after recv_meta mismatch".into());
     }
     Ok(())
 }
 
-// ── Pooled streaming get_stream (poison-eviction) ──────────────────────────
-
-async fn run_pool_stream(addr: SocketAddr) -> Result<(), String> {
-    use ringline_redis::{Pool, PoolConfig};
-
-    // `pool_size == 1` forces every checkout onto the SAME slot, so the poison
-    // path below actually re-checks-out the poisoned connection (with 2+ slots
-    // round-robin would dodge it, never exercising the eviction).
-    let pool = Pool::new(PoolConfig::new(addr, 1));
-
-    let expected_large = large_value();
-
-    // (a) happy path: pooled streaming collect() reassembles the large value
-    //     across many recv buffers, just like the single-connection Client.
-    {
-        let mut client = pool
-            .client()
-            .await
-            .map_err(|e| format!("pool large client: {e}"))?;
-        let stream = client
-            .get_stream(b"stream:large")
-            .await
-            .map_err(|e| format!("pool large get_stream: {e}"))?
-            .ok_or("pool large: None")?;
-        if stream.len() != LARGE_LEN {
-            return Err(format!("pool large len: {}", stream.len()));
-        }
-        let collected = stream
-            .collect()
-            .await
-            .map_err(|e| format!("pool large collect: {e}"))?;
-        if collected.as_ref() != expected_large.as_slice() {
-            return Err("pool large collect mismatch".into());
-        }
-    }
-
-    // A drained stream leaves the connection HEALTHY: the next pooled op reuses
-    // the same slot (no reconnect) and returns correct results.
-    {
-        let small = pool
-            .client()
-            .await
-            .map_err(|e| format!("pool client after healthy stream: {e}"))?
-            .get(b"stream:small")
-            .await
-            .map_err(|e| format!("pool get after healthy stream: {e}"))?
-            .ok_or("pool get after healthy stream: None")?;
-        if small.as_ref() != SMALL {
-            return Err("pool desync after healthy stream".into());
-        }
-    }
-
-    // (b) undrained drop POISONS the pooled connection. The pool must evict the
-    //     slot and lazily reconnect on the next checkout — never hand the
-    //     desynced connection back out.
-    {
-        let mut client = pool
-            .client()
-            .await
-            .map_err(|e| format!("pool poison client: {e}"))?;
-        {
-            let mut stream = client
-                .get_stream(b"stream:poison")
-                .await
-                .map_err(|e| format!("pool poison get_stream: {e}"))?
-                .ok_or("pool poison: None")?;
-            let first = stream
-                .next_segment()
-                .await
-                .map_err(|e| format!("pool poison next_segment: {e}"))?
-                .ok_or("pool poison: first chunk None")?;
-            if first.len() >= POISON_LEN {
-                return Err("pool poison value did not span multiple buffers".into());
-            }
-            // `stream` dropped here undrained, which closes the connection.
-        }
-        // `client` dropped here. Its `Drop` sees the connection is no longer
-        // alive and marks the slot disconnected, so the next checkout
-        // reconnects.
-    }
-
-    // The NEXT pooled op must get a healthy, freshly reconnected connection with
-    // CORRECT results — proving the abandoned inbound value bytes did not desync
-    // a reused connection (the whole point of the eviction).
-    let mut client = pool
-        .client()
-        .await
-        .map_err(|e| format!("pool client after poison: {e}"))?;
-    let reconnected = client.token();
-    let after_poison = client
-        .get_stream(b"stream:small")
-        .await
-        .map_err(|e| format!("pool get_stream after poison: {e}"))?
-        .ok_or("pool after poison: None")?
-        .collect()
-        .await
-        .map_err(|e| format!("pool collect after poison: {e}"))?;
-    if after_poison.as_ref() != SMALL {
-        return Err("pool desync after poison-evict-reconnect".into());
-    }
-    // The pool has one slot. The guard has to go back before the next
-    // checkout, or that checkout is `PoolExhausted`.
-    drop(client);
-
-    // A second op on the reconnected slot confirms steady-state reuse (a large
-    // value, so any residual desync from the abandoned poison read would surface
-    // as a mismatch).
-    let mut client = pool
-        .client()
-        .await
-        .map_err(|e| format!("pool client 2: {e}"))?;
-    if client.token() != reconnected {
-        return Err("the second checkout did not reuse the reconnected slot".into());
-    }
-    let again = client
-        .get(b"stream:large")
-        .await
-        .map_err(|e| format!("pool get large after poison: {e}"))?
-        .ok_or("pool get large after poison: None")?;
-    if again.as_ref() != expected_large.as_slice() {
-        return Err("pool desync on reconnected slot".into());
-    }
-
-    Ok(())
-}
-
-// ── set_stream (streaming SET) ────────────────────────────────────────────
-
-/// Split `value` into `chunk`-byte `Bytes` pieces (an `Iterator<Item = Bytes>`,
-/// which is a `SegmentSource` via the blanket impl).
 fn chunked(value: &[u8], chunk: usize) -> std::vec::IntoIter<Bytes> {
     value
         .chunks(chunk)
@@ -1034,7 +556,7 @@ fn wait_for_server(addr: &str) {
 }
 
 #[test]
-fn get_stream_end_to_end() {
+fn streaming_and_metadata_end_to_end() {
     let (s_shutdown, s_handles) = RinglineBuilder::new(test_config())
         .bind("127.0.0.1:0".parse().unwrap())
         .launch::<StreamStubServer>()

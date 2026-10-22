@@ -56,14 +56,11 @@ pub struct ClusterConfig {
     pub(crate) password: Option<String>,
     /// Username for ACL-based AUTH (Redis 6.0+). Only used when `password` is set.
     pub(crate) username: Option<String>,
-    /// Receive with `TcpConnect::recv_direct`.
-    pub(crate) recv_direct: bool,
 }
 
 impl ClusterConfig {
     /// Create a config that discovers the cluster from the seed nodes at
-    /// `seeds`. Defaults: no connect timeout, plain TCP, no AUTH, receives
-    /// from the provided-buffer ring.
+    /// `seeds`. Defaults: no connect timeout, plain TCP, no AUTH.
     pub fn new(seeds: Vec<SocketAddr>) -> Self {
         Self {
             seeds,
@@ -71,7 +68,6 @@ impl ClusterConfig {
             tls_server_name: None,
             password: None,
             username: None,
-            recv_direct: false,
         }
     }
 
@@ -97,20 +93,6 @@ impl ClusterConfig {
     /// password is set.
     pub fn username(mut self, username: impl Into<String>) -> Self {
         self.username = Some(username.into());
-        self
-    }
-
-    /// Receive into each connection's own accumulator instead of the
-    /// worker's provided-buffer ring
-    /// ([`TcpConnect::recv_direct`](ringline::TcpConnect::recv_direct)).
-    /// Off by default, and ignored on the mio backend. Not supported with
-    /// [`tls_server_name`](Self::tls_server_name): connecting fails.
-    ///
-    /// On io_uring, the client methods that read with segments return an
-    /// `Unsupported` I/O error on such a connection, which stays usable;
-    /// [`PoolConfig::recv_direct`](crate::PoolConfig::recv_direct) lists them.
-    pub fn recv_direct(mut self, enabled: bool) -> Self {
-        self.recv_direct = enabled;
         self
     }
 }
@@ -155,7 +137,6 @@ pub struct ClusterClient {
     tls_server_name: Option<String>,
     password: Option<String>,
     username: Option<String>,
-    recv_direct: bool,
     encode_buf: Vec<u8>,
 }
 
@@ -175,7 +156,6 @@ impl ClusterClient {
             tls_server_name: config.tls_server_name,
             password: config.password,
             username: config.username,
-            recv_direct: config.recv_direct,
             encode_buf: Vec::new(),
         }
     }
@@ -339,7 +319,7 @@ impl ClusterClient {
 
     async fn do_connect(&self, addr: SocketAddr) -> Result<Client, Error> {
         // TLS and the timeout are set on the builder (#528).
-        let mut connect = ringline::connect(addr).recv_direct(self.recv_direct);
+        let mut connect = ringline::connect(addr);
         if let Some(sni) = &self.tls_server_name {
             connect = connect.tls(sni.as_str());
         }
@@ -1458,7 +1438,6 @@ mod tests {
         assert_eq!(config.tls_server_name, None);
         assert_eq!(config.password, None);
         assert_eq!(config.username, None);
-        assert!(!config.recv_direct);
     }
 
     #[test]

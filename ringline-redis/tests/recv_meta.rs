@@ -1,10 +1,6 @@
-//! Backend-agnostic integration tests for `Client::recv_meta` — the uniform
-//! zero-copy reply-metadata recv (GET/SET/DEL). Unlike `streaming.rs` (which is
-//! `#![cfg(has_io_uring)]`), this file has NO backend gate: `recv_meta` works on
-//! both the io_uring provided-buffer path AND the mio streaming-drain path, so
-//! this runs under `cargo test` (io_uring) and `cargo test --features force-mio`
-//! (mio), and on macOS. A large value forces the value body across many recv
-//! bursts, exercising the mio `run_get_drain_mio` incremental drain.
+//! Integration tests for `Client::recv_meta`, the reply-metadata recv for
+//! GET, SET and DEL. The file runs on both backends. A large value spans many
+//! receives, exercising the incremental GET drain.
 //!
 //! In-process stub-server pattern, mirroring `parse_error.rs` / `streaming.rs`.
 
@@ -29,7 +25,9 @@ fn test_config() -> Config {
         .workers(1)
         .pin_to_core(false)
         .sq_entries(256)
-        // Small provided buffers so a large value spans many recv segments/bursts.
+        // recv_buffer sizes the provided buffers of the stub server's accepted
+        // connections. On io_uring the client's outbound connection receives
+        // directly and does not use them.
         .recv_buffer(128, 4096)
         .max_connections(64)
         // Large send-pool slot so the server can push the whole value in one send.

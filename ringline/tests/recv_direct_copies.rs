@@ -1,4 +1,4 @@
-//! What direct receives (`TcpConnect::recv_direct`) copy, read from the
+//! What direct receives (plaintext connections from `connect`) copy, read from the
 //! process-wide `ringline/recv_direct` and `ringline/recv_ring` counters. In
 //! its own test binary, with one test, so no other launch moves them.
 #![cfg(has_io_uring)]
@@ -28,7 +28,6 @@ impl AsyncEventHandler for Client {
             let (addr, count, _) = SERVER.lock().unwrap().unwrap();
             let r = async {
                 let mut conn = ringline::connect(addr)
-                    .recv_direct(true)
                     .await
                     .map_err(|e| format!("connect: {e}"))?;
                 for m in 0..count {

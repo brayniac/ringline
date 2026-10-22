@@ -117,7 +117,8 @@ pub enum OpTag {
     /// `SendMsgCoalescedDrain`. It posts no notification. Payload =
     /// InFlightSendSlab index.
     SendMsgZcDrain = 35,
-    /// Direct receive (`TcpConnect::recv_direct`): a one-shot recv into the
+    /// Direct receive, on a plaintext connection from `connect` or
+    /// `connect_unix`: a one-shot recv into the
     /// spare capacity of the connection's accumulator buffer. Payload =
     /// `Driver::direct_recvs` index, whose entry holds the buffer and the
     /// connection generation.

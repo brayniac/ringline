@@ -1,6 +1,6 @@
-//! Allocations made by direct receives (`TcpConnect::recv_direct`) when every
-//! receive ends at a message boundary and `with_bytes` consumes all of it. In
-//! its own test binary, for the counting global allocator.
+//! Allocations made by direct receives (plaintext connections from `connect`)
+//! when every receive ends at a message boundary and `with_bytes` consumes all
+//! of it. In its own test binary, for the counting global allocator.
 #![cfg(has_io_uring)]
 #![allow(clippy::manual_async_fn)]
 
@@ -69,7 +69,6 @@ impl AsyncEventHandler for Client {
             let (batches, frames, size) = *SHAPE.lock().unwrap();
             let r = async {
                 let mut conn = ringline::connect(addr)
-                    .recv_direct(true)
                     .await
                     .map_err(|e| format!("connect: {e}"))?;
                 let mut start = 0;
