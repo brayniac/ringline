@@ -1,8 +1,8 @@
 //! `has_io_uring` is emitted per crate, and a `check-cfg` entry only tells the
 //! lint the cfg is expected — it never sets it. Without this file every
 //! `#[cfg(has_io_uring)]` block in this crate is dead on every platform, and
-//! `bench-server --runtime ringline` silently runs its non-io_uring
-//! branches (the `forward_to` proxy arm, for one) on an io_uring build.
+//! `bench-server --print-backend` and its ready line report `mio` on an
+//! io_uring build.
 //!
 //! Must stay in step with `ringline/build.rs`; the two decide the same thing
 //! and disagreeing would put the bench on a different path than the runtime it

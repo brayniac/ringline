@@ -308,7 +308,7 @@ depth-1 cells), and by 0 to 5% in the cells below.
   recur in two later runs of the same build.
 - The server's per-connection flush counts per 5 s interval show no
   starved connection in any arm: the least-served connection had 84 to 98%
-  of the median in both arms.
+  of the median in the ring and direct arms.
 
 ## Mechanism
 
@@ -796,7 +796,7 @@ Made by the owner on 2026-10-21:
 Made by the owner on 2026-10-22 and 2026-10-23:
 
 15. Every accepted plaintext connection on io_uring receives directly, with
-    no option, on the accepted-connection runs.
+    no option, based on the accepted-connection runs.
 16. Remove `enable_recv_forward`, `forward_held`, `run_direct_echo` and
     `set_recv_sink` on both backends: after 15 no io_uring connection
     receives through the path they read, except a TLS one, where they did

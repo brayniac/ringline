@@ -205,8 +205,8 @@ struct Args {
     #[arg(long, default_value_t = 4096)]
     msg_size: usize,
 
-    /// (ringline only, required with `--runtime ringline`) Which echo
-    /// strategy the handler uses:
+    /// (ringline only, required with `--runtime ringline` unless
+    /// `--proxy-backend` is set) Which echo strategy the handler uses:
     ///
     /// - `copy`: `with_data` + `send_nowait`, which copies the received bytes
     ///   into a send.

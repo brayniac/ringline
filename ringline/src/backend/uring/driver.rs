@@ -2582,6 +2582,12 @@ impl Driver {
         {
             return Some(ParkBlocker::Closing);
         }
+        // A hangup peek took the socket's error and kept it here for the read
+        // that finds the end. The socket no longer holds it, so moving the
+        // connection would turn that error into a clean end of stream.
+        if conn.hangup_error != 0 {
+            return Some(ParkBlocker::Closing);
+        }
 
         // Park exists to repair accept-time placement, and an outbound
         // connection was never placed by accept — it has no listener at all.

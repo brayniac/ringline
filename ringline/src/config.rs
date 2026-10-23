@@ -1083,9 +1083,9 @@ impl ConfigBuilder {
     /// receive buffers. **Default: false**, which keeps the plain ring
     /// `recv_buffer` sets (256 × 16 KiB by default).
     ///
-    /// On io_uring this affects TLS connections only: a plaintext
-    /// connection receives directly into its accumulator (see
-    /// [`connect`](crate::connect)).
+    /// On io_uring this sets the ring kind TLS connections receive into; a
+    /// plaintext connection receives directly into its accumulator (see
+    /// [`connect`](crate::connect)), so the lend cap affects no connection.
     pub fn recv_incremental(mut self, enabled: bool) -> Self {
         self.config.recv_incremental = enabled;
         self
@@ -1163,9 +1163,10 @@ impl ConfigBuilder {
     ///
     /// Default: 64 (a quarter of the default 256-buffer recv ring).
     ///
-    /// On io_uring this affects TLS connections only: a plaintext
-    /// connection receives directly into its accumulator (see
-    /// [`connect`](crate::connect)).
+    /// On io_uring no connection uses this: a plaintext connection receives
+    /// directly into its accumulator (see [`connect`](crate::connect)), and a
+    /// TLS connection's segment hold is bounded by
+    /// [`recv_accumulator_max`](Self::recv_accumulator_max).
     pub fn recv_segment_reserve(mut self, reserve: u32) -> Self {
         self.config.recv_segment_reserve = reserve;
         self
@@ -1220,9 +1221,10 @@ impl ConfigBuilder {
     ///
     /// Default: 64 (2× `MAX_IOVECS`).
     ///
-    /// On io_uring this affects TLS connections only: a plaintext
-    /// connection receives directly into its accumulator (see
-    /// [`connect`](crate::connect)).
+    /// On io_uring no connection uses this: a plaintext connection receives
+    /// directly into its accumulator (see [`connect`](crate::connect)), and a
+    /// TLS connection's segment hold is bounded by
+    /// [`recv_accumulator_max`](Self::recv_accumulator_max).
     pub fn forward_hold_cap(mut self, cap: usize) -> Self {
         self.config.forward_hold_cap = cap;
         self

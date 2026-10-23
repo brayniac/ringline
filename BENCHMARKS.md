@@ -206,9 +206,10 @@ Server: `bench-server --runtime <ringline|tokio|tokio-uring> --workers 8`, plus
 `--tokio-scheduler {multi-thread,per-core}` / `--tokio-echo {copy,splice}` for
 tokio. The mio arm is a `--features force-mio` build; `tokio-uring` needs
 `--features tokio-uring-arm`. The `uring` and `rfwd` arms cannot be rerun:
-ringline has no `run_direct_echo` or `forward_held`. `--echo-mode copy`, the
-default, is a `with_data` + `send_nowait` loop, and `--echo-mode direct` is
-refused.
+ringline has no `run_direct_echo` or `forward_held`. `--echo-mode` is
+required with `--runtime ringline`: `copy` is a `with_data` + `send_nowait`
+loop and `forward` is `with_data` + `forward_recv_buf`; `direct` and
+`recv-forward` are refused.
 
 Client: `bench-client --clients <n> --msg-size <bytes> --threads 16 --warmup 5
 --duration 20`.

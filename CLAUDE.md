@@ -181,7 +181,7 @@ Async futures access the driver via `CURRENT_DRIVER` thread-local (raw pointer, 
 
 ### Connection Lifecycle
 
-Inbound: acceptor → round-robin to worker → allocate `ConnectionTable` slot → arm receive → spawn `on_accept` task. Outbound: `connect(addr)` → allocate slot → submit connect SQE (optionally IO_LINK'd with timeout) → `ConnectFuture` resolves to new `ConnCtx`. On io_uring every plaintext connection, accepted or outbound, arms no ring receive: it receives directly into its accumulator, with a one-shot `RECV` armed when a read parks, and one `POLL_ADD(POLLRDHUP)` armed when it opens so a peer close is seen while nothing reads (`docs/recv-direct-design.md`). A TLS connection receives through the provided-buffer ring (one-shot, re-armed per completion, unless `recv_multishot(true)` arms a multishot).
+Inbound: acceptor → round-robin to worker → allocate `ConnectionTable` slot → arm the ring receive (TLS) or the hangup poll (plaintext) → spawn `on_accept` task. Outbound: `connect(addr)` → allocate slot → submit connect SQE (optionally IO_LINK'd with timeout) → `ConnectFuture` resolves to new `ConnCtx`. On io_uring every plaintext connection, accepted or outbound, arms no ring receive: it receives directly into its accumulator, with a one-shot `RECV` armed when a read parks, and one `POLL_ADD(POLLRDHUP)` armed when it opens so a peer close is seen while nothing reads (`docs/recv-direct-design.md`). A TLS connection receives through the provided-buffer ring (one-shot, re-armed per completion, unless `recv_multishot(true)` arms a multishot).
 
 Close, on both backends: only `close_connection` (and the `DriverCtx` close) moves the connection to `Lifecycle::Closing`; it also sets `ConnSendState::close_pending`, and teardown finalizes once queued sends drain (io_uring: `try_finalize_close` submits the Close SQE, with a `shutdown` hard-linked ahead of it; mio: `drain_pending_closes` defers `finish_close`). A backend site that marks the connection closing directly leaks the slot — that was #368.
 
@@ -195,7 +195,7 @@ Zero-allocation wakers encode the `conn_index` (or `task_idx | STANDALONE_BIT`) 
 
 ### Buffer Systems
 
-- **ProvidedBufRing** — kernel-managed recv pool (one-shot and multishot recvs select buffers at completion time; io_uring only)
+- **ProvidedBufRing** — kernel-managed recv pool for TLS and UDP (one-shot and multishot recvs select buffers at completion time; io_uring only); a plaintext TCP or Unix connection receives into its accumulator
 - **SendCopyPool** — pre-allocated slots for copy sends (and TLS ciphertext)
 - **InFlightSendSlab** — tracks scatter-gather ZC sends until kernel notification
 - **RecvAccumulator** — per-connection contiguous recv buffer with O(1) advance; `with_bytes` take/put-back is O(1) via refcounted remainders (zero-copy holds even for pipelined parsing)

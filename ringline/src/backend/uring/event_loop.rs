@@ -6533,6 +6533,51 @@ mod tests {
         );
     }
 
+    /// A connection holding the error a hangup peek took from its socket is
+    /// not parked: the adopting worker would see a clean end of stream.
+    #[test]
+    fn a_connection_holding_a_hangup_error_is_not_parkable() {
+        let mut el = make_test_loop();
+        let conn_index = accept_direct_connection(&mut el);
+        el.driver.park_offered[conn_index as usize] = true;
+        assert!(el.driver.park_blocker(conn_index).is_none(), "precondition");
+        el.driver
+            .connections
+            .get_mut(conn_index)
+            .unwrap()
+            .hangup_error = libc::ECONNRESET;
+        assert_eq!(
+            el.driver.park_blocker(conn_index),
+            Some(crate::backend::uring::driver::ParkBlocker::Closing)
+        );
+    }
+
+    /// No recheck peek is pushed while a park of the connection is pending.
+    #[test]
+    fn a_recheck_waits_for_a_pending_park() {
+        let mut el = make_test_loop();
+        let conn_index = accept_direct_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        {
+            let c = el.driver.connections.get_mut(conn_index).unwrap();
+            c.hangup_recheck = true;
+            c.hangup_recheck_due = true;
+        }
+        el.driver.hangup_rechecks.push((conn_index, generation));
+        el.driver.park_in_flight[conn_index as usize] =
+            Some(crate::backend::uring::driver::ParkInFlight {
+                target: 1,
+                generation,
+            });
+        el.recheck_hangups();
+        let c = el.driver.connections.get(conn_index).unwrap();
+        assert!(
+            !c.hangup_peek_armed,
+            "no peek while the install is in flight"
+        );
+        assert!(c.hangup_recheck_due, "the recheck is still owed");
+    }
+
     /// A direct connection with nothing armed installs at once.
     #[test]
     fn a_direct_connection_with_nothing_armed_installs_at_once() {
