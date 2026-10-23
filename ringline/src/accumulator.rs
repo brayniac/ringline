@@ -636,7 +636,7 @@ impl AccumulatorTable {
     }
 
     /// Detach the accumulator's buffer, with its unconsumed bytes, as the
-    /// destination of a direct receive (`TcpConnect::recv_direct`). The
+    /// destination of a direct receive. The
     /// kernel writes into the returned buffer's spare capacity, starting at
     /// its length; [`attach_received`](Self::attach_received) puts it back.
     /// While it is detached the accumulator is empty.

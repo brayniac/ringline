@@ -122,7 +122,7 @@ task-waker scheme are shared. The I/O mechanisms are not:
 | Concern | io_uring | Mio |
 | --- | --- | --- |
 | Socket readiness/completion | CQEs identified by `UserData` and `OpTag` | `mio::Poll` readable/writable events |
-| TCP receive | Multishot receive with provided buffers | Readiness read into owned memory |
+| TCP receive | Outbound plaintext: one-shot receive into the connection's accumulator. Others: one-shot receive with provided buffers, multishot with `recv_multishot(true)` | Readiness read into owned memory |
 | File descriptors | Fixed-file table for connections | Registered ordinary sockets |
 | Sends | Copy pool plus guarded `SendMsgZc` scatter/gather | Owned/copy pending-send buffers |
 | Send retry | CQE handling, retry lists, and drain sends after `EAGAIN` | Writable readiness and dirty lists |
@@ -183,9 +183,10 @@ register `owner_task` and `recv_waiters` and park without spinning;
 zero, and a stale generation behaves as EOF rather than exposing the new slot
 occupant.
 
-On the usual io_uring receive path, the kernel first writes into a provided
-buffer. A parser can consume a pending buffer directly in the immediate fast
-path; otherwise the runtime copies it into the per-connection accumulator and
+A plaintext outbound connection on io_uring receives directly into its
+accumulator (`docs/recv-direct-design.md`). On the receive path of every other
+io_uring connection, the kernel first writes into a provided buffer. A parser
+can consume a pending buffer directly in the immediate fast path; otherwise the runtime copies it into the per-connection accumulator and
 returns its buffer ID to the ring. `with_bytes` provides zero-copy slicing after
 that gather step, not a permanent reference to kernel-owned ring memory.
 

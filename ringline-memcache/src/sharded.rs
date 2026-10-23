@@ -47,21 +47,17 @@ pub struct ShardedConfig {
     pub(crate) connect_timeout_ms: u64,
     /// TLS server name (SNI) for outbound connections. `None` means plain TCP.
     pub(crate) tls_server_name: Option<String>,
-    /// Receive with `TcpConnect::recv_direct`.
-    pub(crate) recv_direct: bool,
 }
 
 impl ShardedConfig {
     /// Create a config for the independent Memcache servers at `servers`.
-    /// Defaults: one connection per server, no connect timeout, plain TCP,
-    /// receives from the provided-buffer ring.
+    /// Defaults: one connection per server, no connect timeout, plain TCP.
     pub fn new(servers: Vec<SocketAddr>) -> Self {
         Self {
             servers,
             pool_size: 1,
             connect_timeout_ms: 0,
             tls_server_name: None,
-            recv_direct: false,
         }
     }
 
@@ -81,21 +77,6 @@ impl ShardedConfig {
     /// Set the TLS server name (SNI) for outbound connections; enables TLS.
     pub fn tls_server_name(mut self, name: impl Into<String>) -> Self {
         self.tls_server_name = Some(name.into());
-        self
-    }
-
-    /// Receive into each connection's own accumulator instead of the
-    /// worker's provided-buffer ring
-    /// ([`TcpConnect::recv_direct`](ringline::TcpConnect::recv_direct)).
-    /// Off by default, and ignored on the mio backend. Not supported with
-    /// [`tls_server_name`](Self::tls_server_name): connecting fails.
-    ///
-    /// On io_uring, the client methods that read with segments return an
-    /// `Unsupported` I/O error on such a connection before sending the
-    /// request; [`PoolConfig::recv_direct`](crate::PoolConfig::recv_direct)
-    /// lists them.
-    pub fn recv_direct(mut self, enabled: bool) -> Self {
-        self.recv_direct = enabled;
         self
     }
 }
@@ -135,7 +116,6 @@ pub struct ShardedClient {
     ring: ketama::Ring,
     connect_timeout_ms: u64,
     tls_server_name: Option<String>,
-    recv_direct: bool,
     encode_buf: Vec<u8>,
 }
 
@@ -168,7 +148,6 @@ impl ShardedClient {
             ring,
             connect_timeout_ms: config.connect_timeout_ms,
             tls_server_name: config.tls_server_name,
-            recv_direct: config.recv_direct,
             encode_buf: Vec::new(),
         }
     }
@@ -206,7 +185,6 @@ impl ShardedClient {
         ConnectOpts {
             connect_timeout_ms: self.connect_timeout_ms,
             tls_server_name: self.tls_server_name.clone(),
-            recv_direct: self.recv_direct,
         }
     }
 
@@ -645,7 +623,6 @@ async fn version_on_shard(shard: &mut Shard, opts: &ConnectOpts) -> Result<Box<s
 struct ConnectOpts {
     connect_timeout_ms: u64,
     tls_server_name: Option<String>,
-    recv_direct: bool,
 }
 
 /// Borrow a client from a shard, lazily reconnecting if needed.
@@ -681,7 +658,7 @@ async fn get_conn<'a>(shard: &'a mut Shard, opts: &ConnectOpts) -> Result<&'a mu
 
 async fn do_connect(addr: SocketAddr, opts: &ConnectOpts) -> Result<Client, Error> {
     // TLS and the timeout are set on the builder (#528).
-    let mut connect = ringline::connect(addr).recv_direct(opts.recv_direct);
+    let mut connect = ringline::connect(addr);
     if let Some(ref sni) = opts.tls_server_name {
         connect = connect.tls(sni.as_str());
     }
@@ -746,7 +723,6 @@ mod tests {
         assert_eq!(config.pool_size, 1);
         assert_eq!(config.connect_timeout_ms, 0);
         assert_eq!(config.tls_server_name, None);
-        assert!(!config.recv_direct);
     }
 
     #[test]

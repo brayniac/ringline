@@ -8,11 +8,8 @@ use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 
 use bytes::{Bytes, BytesMut};
-use ringline::{RecvHalf, SendHalf};
-// `ParseResult` is only used by the mio/portable `with_data` recv path; the
-// io_uring path feeds h2 via `with_segments` (returns `SegConsumed`).
-#[cfg(not(has_io_uring))]
 use ringline::ParseResult;
+use ringline::{RecvHalf, SendHalf};
 use ringline_h2::hpack::HeaderField;
 use ringline_h2::settings::Settings;
 use ringline_h2::{H2Connection, H2Event};
@@ -231,11 +228,7 @@ struct BlockedSend {
 }
 
 /// Drain and dispatch all queued H2 events into the pending streams, then retry
-/// any flow-control-blocked sends. Shared by both recv feed paths (io_uring
-/// `with_segments` and the mio/portable `with_data` fallback) so the two paths
-/// differ *only* in how socket bytes reach `h2.recv` — all protocol handling
-/// (headers, data, resets, GOAWAY, connection errors, blocked-send retry) is
-/// byte-for-byte identical.
+/// any flow-control-blocked sends.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_h2_events(
     h2: &mut H2Connection,
@@ -603,47 +596,8 @@ impl H2AsyncConn {
         // this once the closure unwinds.
         let mut connection_error: Option<HttpError> = None;
 
-        // Feed socket bytes into the h2 codec. On io_uring, read via
-        // `with_segments` and hand each borrowed provided-buffer segment
-        // straight to `h2.recv` (which re-accumulates into its own `recv_buf`),
-        // eliminating the redundant `RecvAccumulator` copy — h2 drains fully
-        // every call, so we return `SegConsumed(total_len)`. On mio (no
-        // `with_segments`), keep the existing `with_data` path: h2 buffers
-        // internally, so we consume all input.
-        #[cfg(has_io_uring)]
-        let n = self
-            .rx
-            .with_segments(|chain| {
-                // Feed each borrowed segment, in order, to H2. Stop on the
-                // first codec error (h2 is now dead) — mirrors the `with_data`
-                // path's early return, skipping event dispatch so the captured
-                // error surfaces below.
-                for seg in chain.iter() {
-                    if let Err(e) = h2.recv(seg) {
-                        connection_error = Some(HttpError::H2(e));
-                        return ringline::SegConsumed(chain.total_len());
-                    }
-                }
-
-                dispatch_h2_events(
-                    h2,
-                    pending,
-                    blocked,
-                    settings_acked,
-                    goaway_received,
-                    max_header_section,
-                    max_body_size,
-                    &mut connection_error,
-                );
-
-                // h2.recv consumes all input into its own recv_buf; report the
-                // whole chain as consumed so the runtime replenishes every held
-                // buffer and keeps no redundant accumulator copy.
-                ringline::SegConsumed(chain.total_len())
-            })
-            .await?;
-
-        #[cfg(not(has_io_uring))]
+        // Feed socket bytes into the h2 codec. h2 buffers internally, so every
+        // call consumes all input.
         let n = self
             .rx
             .with_data(|data| {

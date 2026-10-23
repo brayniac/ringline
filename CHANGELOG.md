@@ -9,11 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- `ringline-redis` `ShardedConfig::recv_direct` and
-  `ClusterConfig::recv_direct`, and `ringline-memcache`
-  `ShardedConfig::recv_direct`, open every connection the sharded or cluster
-  client makes with `TcpConnect::recv_direct`, as `PoolConfig::recv_direct`
-  does for a pool.
 - `yield_now()` wakes the calling task and returns `Pending` once, so a task
   that makes many `send_nowait` calls without awaiting anything lets the
   worker poll its other queued tasks and process I/O between batches. Callers
@@ -21,10 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   processed during the yield are polled after the yielding task resumes, and
   the task can resume within the same loop iteration on both backends.
   `tests/ready_queue_fairness.rs` uses it.
-- io_uring: `TcpConnect::recv_direct(true)` makes an outbound plaintext
-  connection receive into its own accumulator instead of the shared provided
-  buffer ring: a one-shot `RECV` into the accumulator's free space, armed
-  when a read parks. `with_data`, `with_bytes`, `with_data_result` and
+- io_uring: an outbound plaintext connection, from `connect` or
+  `connect_unix`, receives into its own accumulator instead of the shared
+  provided buffer ring: a one-shot `RECV` into the accumulator's free space,
+  armed when a read parks. There is no option to turn it off; a TLS
+  connection receives through the ring. `with_data`, `with_bytes`, `with_data_result` and
   `recv_ready` read it unchanged, without the copy from a provided buffer.
   An idle connection holds a buffer of `ConfigBuilder::recv_direct_region`
   bytes (default 32 KiB), or of `recv_accumulator_capacity` if that is
@@ -34,23 +30,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `Bytes` read from it is alive. A `ConnStream` read arms the receive the
   same way. Reads that need provided buffers (`segments`,
   `recv_owned_segment`, `with_segments`, `with_bytes_segments`,
-  `forward_to`, `forward_to_conn`, `forward_held`) return
-  `io::ErrorKind::Unsupported` on such a connection, and a TLS connect with
-  `recv_direct` fails with it. Ignored on mio. Counters in
-  `ringline/recv_direct`. `ConnCtx::is_recv_direct` (also on `Connection`
-  and `RecvHalf`) tells whether a connection receives this way. Against
-  Valkey and memcached with 1,000 connections, client CPU at a fixed rate
-  was 1.8 to 6.8% lower than the ring at 4 KiB pipelined and larger values,
-  and within 1% at 64 B and 4 KiB unpipelined. See
+  `forward_to`, `forward_held`) return `io::ErrorKind::Unsupported` on such
+  a connection. `forward_to_conn` from such a connection sends each received
+  chunk from the accumulator through the sink's send queue, zero-copy at or
+  above `send_zc_threshold`. Counters in `ringline/recv_direct`.
+  `ConnCtx::is_recv_direct` (also on `Connection` and `RecvHalf`) tells
+  whether a connection receives this way. Against Valkey and memcached with
+  1,000 connections (63 per worker), client CPU at a fixed rate was 1.8 to
+  6.8% lower than the ring at 4 KiB pipelined and larger values, and within
+  1% at 64 B and 4 KiB unpipelined. Against memcached with 16,000
+  connections (1,000 per worker) and no rate limit, client CPU per GET was
+  11% lower at 4 KiB depth 16 (two runs) and 12% lower at 64 KiB depth 1
+  (one run), and 2 to 4% higher at 64 B depth 1. See
   `docs/recv-direct-design.md`.
-- `ringline-redis`, `ringline-memcache`: `PoolConfig::recv_direct` opens
-  every pooled connection with `TcpConnect::recv_direct`. On io_uring the
-  client methods that read segments return an `Unsupported` I/O error on
-  such a connection before sending the request or taking the pending
-  operation, so the connection stays usable: ringline-redis `get_stream`,
-  `recv_get_discard` and `recv_get_segments`, and ringline-memcache
-  `get_stream` and `get_cas`. ringline-redis `recv_meta` reads a GET reply
-  through `with_bytes` on such a connection.
 - `direct_io_fsync` returns a future for an fsync of a direct I/O file. The
   fsync that `DriverCtx::direct_io_fsync` submits has no future, so a task
   could not wait for it.
@@ -245,6 +237,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Breaking:** on io_uring, a plaintext connection from `connect` or
+  `connect_unix` always receives directly into its accumulator (see Added),
+  and no option gives it the provided-buffer ring. On such a connection
+  `segments`, `recv_owned_segment`, `with_segments`, `with_bytes_segments`,
+  `forward_to` and `forward_held` return `io::ErrorKind::Unsupported`;
+  `enable_recv_forward` does nothing; `run_direct_echo` resolves at once; a
+  recv sink (`set_recv_sink`) is not filled; and `try_with_data` returns
+  `None` while a receive is in flight. These work on accepted and TLS
+  connections as before, and there is no replacement for them on a
+  plaintext outbound connection. Such a connection has a receive armed only
+  while a read is parked, so a FIN or reset from its peer is seen at the next
+  read: until then `is_alive` returns `true` and sends are accepted, and the
+  ringline-redis and ringline-memcache pools return a connection whose
+  server closed it while idle, and a command sent on it fails when it reads
+  the close.
+- ringline-http's HTTP/2 connection reads with `with_data` on every backend,
+  which a plaintext connection (`H2AsyncConn::from_conn` over `connect`)
+  needs. Over TLS it copies as many bytes as before and allocates less.
 - On io_uring, a copy send wider than one send-pool slot (`send`,
   `send_nowait`, `send_backpressured`), and TLS ciphertext from one send
   that fills two or more slots, go to the kernel as one `sendmsg` over up to
@@ -255,8 +265,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **Breaking:** `ringline-redis` `ShardedConfig` and `ClusterConfig` and
   `ringline-memcache` `ShardedConfig` have private fields. Build them with
   `ShardedConfig::new(servers)` or `ClusterConfig::new(seeds)` and builder
-  methods: `pool_size` (sharded configs), `connect_timeout_ms`,
-  `tls_server_name` and `recv_direct`. ringline-redis also has `password`
+  methods: `pool_size` (sharded configs), `connect_timeout_ms` and
+  `tls_server_name`. ringline-redis also has `password`
   and `username`. An `Option` field becomes a call made only when it is
   `Some`. `new` sets what a struct literal with `pool_size: 1`,
   `connect_timeout_ms: 0` and `None` options did: one connection per
@@ -483,15 +493,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   distinct from `AllConnectionsFailed`; `connect_all` connects only the slots that
   are disconnected, so it can be called again or while clients are out (#528).
 
-- **Breaking:** `Pool::get_stream` is removed. Call `get_stream` on a client
-  from `Pool::client` instead; the stream then borrows that client, so the guard
-  must be bound first. The guard's drop performs the slot health check.
-
-  ```rust
-  let mut client = pool.client().await?;
-  let stream = client.get_stream(b"key").await?;
-  ```
-
 - Accept-time placement now hands a connection to an **idle** worker as soon as
   the accepting worker holds one, instead of waiting for a gap of two. The flat
   margin meant a worker first shed on its *third* connection, so when a pooled
@@ -597,6 +598,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Removed
 
+- **Breaking:** the client methods that read a value from provided-buffer
+  segments, which an outbound plaintext connection no longer has:
+  ringline-redis `Client::get_stream` and `Pool::get_stream` (and
+  `ValueStream`),
+  `Client::recv_get_discard`, `Client::recv_get_segments` and `GetMeta`, and
+  ringline-memcache `Client::get_stream` (and `StreamValue`),
+  `Client::get_cas` (and `CasStreamValue`). Use `get`, or `recv_meta` in
+  ringline-redis to read a GET reply without keeping the value; for a CAS
+  token, ringline-memcache `gets`. ringline-redis `recv_meta` reads a GET
+  reply through `with_bytes` on every connection, as it already did on
+  mio. No remaining method hands a caller a value's bytes in pieces as
+  they arrive; `get` and `gets` return the whole value.
 - **Breaking:** the TCP kernel receive-timestamp mode is removed: the
   `timestamps` cargo features of `ringline`, `ringline-memcache`,
   `ringline-redis` and `ringline-ping`, `ConfigBuilder::timestamps`,

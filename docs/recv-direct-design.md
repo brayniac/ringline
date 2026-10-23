@@ -1,8 +1,11 @@
 # Direct receive: one-shot receives into the connection's accumulator
 
-Status: merged (#684), opt-in; measured through build C8; owner decisions
-made (see Decisions). Open: the scale run, and the cause of `c`'s higher
-p99 in four cells (see Not known).
+Status: merged (#684). Since decision 11, every outbound plaintext
+connection on io_uring receives this way, with no option. Measured through
+build C8 and at 250 and 1,000 connections per worker (Evidence, "Scale");
+owner decisions made (see Decisions). Open: the cause of `c`'s higher p99 in
+four cells and of its higher CPU at 64 B unpipelined (see Not known), and
+accepted connections.
 
 Related: `docs/recv-buffering-approaches.md` ("One-shot receive into
 connection-owned memory", "Per-connection rings"),
@@ -10,7 +13,8 @@ connection-owned memory", "Per-connection rings"),
 
 ## Goal
 
-A TCP connection that opts in receives without a provided buffer. Each
+A plaintext outbound connection on io_uring, from `connect` or
+`connect_unix`, receives without a provided buffer. Each
 receive is a one-shot `RECV` whose destination is the free space of the
 connection's `RecvAccumulator`. The kernel writes the bytes where `with_data`
 and `with_bytes` read them, so the copy from a provided buffer into the
@@ -207,11 +211,57 @@ Build C8 is c67d328 without the counters (binaries
   C8); I do not know why. Two more runs were cancelled before they started,
   so this rests on one run.
 
+### Scale (C8 binaries, 4,000 and 16,000 connections)
+
+`experiments/recv-direct-scale.toml` ran the C8 binaries with cachecannon's 16 threads, so 250 and 1,000
+connections per worker, against the same Valkey and memcached, with no rate
+limit. Three builds: `a` (multishot ring, 256 × 16 KiB per worker), `ar`
+(the same with 1,024 × 16 KiB, at least one buffer per connection) and `c`.
+Runs: 4,000 connections `01a15fe3-a1f6-71ef-7e8a-98c63220f424`; 16,000
+connections `01a15fe3-a2ce-713a-458f-3f22fbe7aa4a` and
+`01a15fe3-a333-7140-e7c5-8701e5846dcd`. A second 4,000-connection run
+(`01a15fe3-a266-7134-c38f-188c9111e5b6`) lost its client VM partway
+through and is not used. The second 16,000-connection run lost its client
+VM after the memcache 4 KiB cells; its figures below are from the run log.
+I do not know why the VMs dropped.
+
+Client CPU per GET relative to `a`, memcache:
+
+| Cell | 4,000: `ar` | 4,000: `c` | 16,000: `ar` | 16,000: `c` |
+|---|---|---|---|---|
+| 64 B, depth 1 | 1.002 | 1.031 | 1.010 / 0.997 | 1.041 / 1.021 |
+| 64 B, depth 16 | 1.010 | 1.027 | 0.991 / 0.990 | 1.006 / 1.008 |
+| 4 KiB, depth 1 | 0.993 | 0.999 | 0.975 / 0.979 | 1.003 / 1.012 |
+| 4 KiB, depth 16 | 1.000 | 0.973 | 1.017 / 1.023 | 0.890 / 0.887 |
+| 64 KiB, depth 1 | 0.996 | 0.959 | 1.059 | 0.879 |
+| 64 KiB, depth 16 | 1.073 | 0.925 | – | – |
+
+- At 4 KiB depth 16 and 16,000 connections `c` reached 37.1 Gb/s, the link
+  limit, in both runs, and `a` 36.1; `c`'s throughput was 1.028 of `a`'s and
+  its p99 518 and 505 ms against `a`'s 1,258 and 1,242. At 64 KiB depth 1
+  its p99 was 604 ms against 1,166.
+- At 64 B depth 1 `c` used 2.1 to 4.1% more CPU per GET than `a` in all
+  three runs, with the same throughput. In the second 16,000-connection run
+  `c` spent less user time and more system time than `a` there, which fits
+  one submission per message to re-arm (the multishot ring re-arms without
+  one); that is an inference, and ringline's default ring, one-shot since
+  #647, was not run.
+- `ar` was 0.975 to 1.073 of `a`'s client CPU per GET, with no consistent
+  direction.
+- Peak RSS at 4,000 connections: `c` the same as `a` or lower in every
+  memcache cell, 1.8 GiB lower at 64 KiB depth 16. At 16,000, `c` was 0.1
+  GiB higher at 64 B depth 1 (`c` 2.60 GiB, `a` 2.49) and 0.2 GiB higher at
+  4 KiB depth 16 (`c` 3.63 and 3.69, `a` 3.44 and 3.45).
+- Not usable: every RESP cell, and memcache 64 KiB depth 16 at 16,000
+  connections. With no rate limit Valkey fell behind, and requests timed
+  out at 5 s and connections failed, in all three builds; memcached at 64 KiB
+  depth 16 timed out too. RESP at scale is not measured.
+
 The standalone benchmark's `oneshot` strategy
 (`docs/recv-buffering-approaches.md`) fell behind the shared ring at 1,000
 connections per worker. That strategy grew its regions from 4 KiB and parsed
-in the completion handler; this design does neither. It has not been run
-above 63 connections per worker.
+in the completion handler; this design does neither, and at 1,000
+connections per worker it did not fall behind.
 
 Per-connection provided rings are not proposed. The benchmark measured them
 and recorded wrong bytes in the variant that rewrites a posted entry, one
@@ -369,8 +419,7 @@ which under `defrag=madvise` compacts memory at fault time.
 A chain of 2 MiB chunks would need no size classes, but a message spanning
 chunks is not contiguous, so `with_bytes` could not hand it to the parser
 as one `Bytes` without a copy. It fits a reader that streams huge values
-(`get_stream`), which a direct connection refuses today, and is not part of
-this design.
+(the removed `get_stream`), and is not part of this design.
 
 ### Known lengths
 
@@ -440,18 +489,26 @@ checked whether the cancel can still be pending after 10 s.
   flight, for example after a parked read was dropped, the buffered bytes
   are in that receive's buffer and `try_with_data` returns `None`.
 - `segments`, `recv_owned_segment`, `with_segments`, `with_bytes_segments`,
-  `forward_to`, `forward_to_conn` and `forward_held` return
-  `io::ErrorKind::Unsupported`. They read held provided buffers, and a
-  direct connection has none.
+  `forward_to` and `forward_held` return `io::ErrorKind::Unsupported`. They
+  read held provided buffers, and a direct connection has none.
+- `forward_to_conn` sends from the accumulator (`DirectForward` in
+  `runtime/io.rs`): it takes what the accumulator holds, up to what is left
+  of the length, and sends it on the sink through the sink's send queue
+  under a guard, zero-copy at or above `send_zc_threshold`. One send is in
+  flight at a time; while it is, the source receives into an empty
+  accumulator, so at most one more chunk is buffered. A second forward from
+  the same connection is refused with `EBUSY` (`direct_forwarding` on
+  `ConnectionState`). A send the runtime cannot submit resolves the forward
+  with that error and puts the chunk back in front of the accumulator.
 - `enable_recv_forward` does nothing on a direct connection, because it
   returns `()`; `forward_held` then returns `Unsupported`. `run_direct_echo`
   resolves at once, because its output is `()`.
 - `forward_recv_buf` is a send from the accumulator and is not refused. It
   has not been tested on a direct connection.
-- TLS: `.tls(..).recv_direct(true)` fails the connect with `Unsupported`, on
-  both backends. The kernel's bytes are ciphertext, and rustls copies the
-  plaintext into the accumulator in any case.
-- mio: `recv_direct` is ignored. The mio backend reads into one 8 KiB buffer
+- TLS: a TLS connection receives through the provided-buffer ring. The
+  kernel's bytes are ciphertext, and rustls copies the plaintext into the
+  accumulator in any case.
+- mio: unchanged. The mio backend reads into one 8 KiB buffer
   per worker and appends to the accumulator (`handle_readable`); reading
   plaintext connections into the accumulator's spare capacity is a separate
   change.
@@ -459,30 +516,19 @@ checked whether the cancel can still be pending after 10 s.
 
 ## API
 
-- `TcpConnect::recv_direct(bool)`, set before the connect is awaited. The
-  choice holds for the connection's life.
+- None to choose it: `connect` and `connect_unix` connections receive this
+  way on io_uring unless they use TLS (decision 11). `TcpConnect::recv_direct`
+  and the client crates' `recv_direct` config options were removed.
 - `ConfigBuilder::recv_direct_region(bytes)`, the size of a connection's
   own buffer, default 32 KiB, at least 1.
 - `ConfigBuilder::recv_direct_pool_max(bytes)`, the most free borrowed
   buffers a worker keeps, default 16 MiB.
 - `ConnCtx::is_recv_direct()` (and on `Connection` and `RecvHalf`): whether
   the connection receives this way.
-- `PoolConfig::recv_direct(bool)` in ringline-redis and ringline-memcache,
-  default off, passed to every connection the pool opens. On io_uring, the
-  client methods that read with segments return an `Unsupported` I/O error
-  on such a connection, checked with `is_recv_direct` before they send the
-  request or take the pending operation, so the connection stays aligned:
+- The client methods that read with segments were removed (decision 12):
   ringline-redis `get_stream`, `recv_get_discard` and `recv_get_segments`,
   and ringline-memcache `get_stream` and `get_cas`. ringline-redis
-  `recv_meta` drains a GET reply through `with_bytes` on such a
-  connection, as it does on mio.
-
-`ClientBuilder::new` takes a `Connection` that is already open, so a caller
-that connects itself passes `recv_direct` to `connect`. The sharded and
-cluster clients open their own connections, and `ShardedConfig::recv_direct`
-(ringline-redis and ringline-memcache) and `ClusterConfig::recv_direct`
-(ringline-redis) pass the option to each. cachecannon opens its own
-connections, so build C needed only a cachecannon change.
+  `recv_meta` drains a GET reply through `with_bytes` on every connection.
 
 ## Metrics
 
@@ -506,16 +552,25 @@ allocated because none fit). Copies on a direct connection still count in
     every frame without an EOF.
   - A reset after 2,000 bytes of a 100,000-byte frame is returned as
     `ConnectionReset`.
-  - Every refusal listed above, the TLS connect refusal, and a `with_data`
-    read on the same connection afterwards.
+  - A plaintext `connect` is direct; every refusal listed above, and a
+    `with_data` read on the same connection afterwards.
   - `recv_ready` resolves at once when a read gave up with part of a message
     held in the buffer of an armed receive (fails when `recv_buffered` does
     not count `recv_direct_held`).
   - `ConnStream` `read_exact` and `fill_buf` on a direct connection (fail
     when they park without `park_recv`).
+  - A `connect_unix` connection is direct and reads what its peer wrote.
+  - `forward_to_conn` from a direct connection: a second forward is refused
+    with `EBUSY` while the first is alive; a forward of 60,000 of 100,000
+    bytes stops there and leaves the next byte readable; a forward of more
+    than the peer sends resolves with what arrived before the FIN; the sink
+    receives the bytes in order (fails when the forward ignores its
+    length). `echo.rs`'s `forward_to_conn_proxies_both_directions` forwards
+    a proxy's outbound leg the same way.
 
-  Dropping one received byte fails the first three tests. The overestimate,
-  reset and refusal tests fail against the `MSG_WAITALL` version.
+  Dropping one received byte fails the first three tests. The overestimate
+  and reset tests fail against the `MSG_WAITALL` version; the refusal test
+  as changed for decision 11 has not been run against it.
 - `tests/recv_direct_alloc.rs` (its own binary, for the counting global
   allocator): request-response batches of small, 64 KiB, 1 MiB and
   16 × 4 KiB and 16 × 8 KiB messages make fewer than one allocation of
@@ -546,12 +601,12 @@ allocated because none fit). Copies on a direct connection still count in
   new occupant, and its slab entry is freed (fails with the generation
   check removed); a direct connection whose accumulator is at the cap is
   closed instead of armed. No test checks the `STALE` counter.
-- The ringline-redis and ringline-memcache `streaming` tests read small and
-  100,000-byte values through a pool with `recv_direct(true)`, check that
-  each segment read is refused, and read the next reply correctly after
-  each refusal (fails when the pool does not pass the option, and when a
-  refusal comes after the request is sent or the pending GET is taken).
-  The redis test also drains a 100,000-byte GET with `recv_meta`.
+- The ringline-redis and ringline-memcache `streaming` tests, on both
+  backends, read small and 100,000-byte values through a pool and a sharded
+  client. The redis test drains GET replies with `recv_meta`, including a
+  100,000-byte value, a desynced reply that poisons the connection, and a
+  value cut short by the peer's FIN; the memcache test reads values with
+  their CAS tokens through `gets` and a value cut short by a FIN.
 
 Not tested: worker exit with a receive armed; the order of `record_arrival`
 and `attach_received` in `handle_recv_direct` (no test fails if the arrival
@@ -561,19 +616,17 @@ connection.
 ## Landing
 
 Done: the 64 B fix (C3), the pool (C5), its growth and eviction fix (C7),
-throughput and latency of the commit (C8), the PR (#684), and
-`ShardedConfig::recv_direct` and `ClusterConfig::recv_direct`, with the
-three configs made opaque, for the ringline 0.7.0 release.
+throughput and latency of the commit (C8), the PR (#684), the three client
+configs made opaque, the scale run, and direct receive for every outbound
+plaintext connection (decision 11).
 
 1. The cause of `c`'s higher p99 at memcache 4 KiB depth 16, mixed depth 16,
    1 MiB idle and RESP 64 B (Evidence): a profile of the 4 KiB depth-16
    cell. One candidate is the submit round trip of arming a receive only
    after the reader parks, which the multishot ring does not pay; I have not
    checked it.
-2. A scale run: 16 workers with 4,000 and 16,000 connections, cells up to
-   64 KiB. With 1 MiB values at depth 1, almost every connection is partway
-   through a value, so 16,000 connections would hold about 16 GiB of
-   borrowed buffers, as the ring path's accumulators would.
+2. Accepted connections: measure whether the same decision holds for a
+   server.
 3. mio: read plaintext connections into the accumulator (separate PR).
 
 ## Decisions
@@ -605,6 +658,20 @@ Made by the owner on 2026-10-20:
 10. Merge with `c`'s higher p99 in four cells recorded here, and look for its
     cause afterwards.
 
+Made by the owner on 2026-10-21:
+
+11. Every outbound plaintext connection on io_uring receives directly, with
+    no option, on the scale run's results. This replaces 5, and 3 for
+    `PoolConfig`, `ShardedConfig` and `ClusterConfig`. A TLS connection
+    receives through the ring instead of failing, which replaces the TLS
+    half of 2.
+12. Remove the client methods that read with segments instead of making
+    them read from the accumulator.
+13. `forward_to_conn` from a direct connection sends from the accumulator,
+    so a proxy's outbound leg keeps working.
+14. No control run with the one-shot ring for the 64 B cost, and no second
+    4,000-connection run.
+
 Open: whether the scanner PRs in `resp-proto` and `memcache-proto` are
 closed or merged without a release.
 
@@ -614,6 +681,20 @@ closed or merged without a release.
 - Why `c`'s throughput gain at 4 KiB depth 16 with the client limited
   (about 10%, one run) is larger than its fixed-rate CPU saving, and whether
   more runs agree.
-- Behaviour above 63 connections per worker.
+- Why `c` costs 2 to 4% more CPU per GET at 64 B depth 1 (Evidence,
+  "Scale").
+- An idle direct connection has no receive armed, so a FIN or reset from
+  its peer is not seen until the next read; `is_alive` stays `true` and a
+  pool returns the connection for reuse. On the ring path a receive was
+  always armed and the close was seen at once. Arming a receive whenever
+  nothing is buffered would restore that; it has not been built or
+  measured.
+- A `ForwardToFuture` dropped by `handle_close` (which tears down another
+  connection's task without `CURRENT_DRIVER` set) cannot clear
+  `direct_forwarding`, so later forwards from its source are refused with
+  `EBUSY` until the source's slot resets. The ring forward leaves its
+  `forward_progress` set the same way.
+- How a direct forward compares with the ring forward in throughput and CPU;
+  neither has been measured against the other.
 - Whether a cancelled direct receive can still be in flight when the worker
   exit bound runs out.
