@@ -285,25 +285,42 @@ A FIN or reset is seen without a read. When the connection opens, the
 runtime arms a one-shot `POLL_ADD` for `POLLRDHUP` on its fixed file
 (`OpTag::HangupPoll`, `arm_hangup_poll`). `POLLERR` and `POLLHUP` are always
 reported, so it completes on a FIN, a reset or a socket error, and data
-alone does not complete it. With a receive in flight, that receive sees the
-end. With none, the runtime submits a non-blocking one-byte `recv` with
-`MSG_PEEK` (`OpTag::HangupPeek`), which consumes nothing. A positive result
-means bytes are queued ahead of the FIN; they stay in the socket with it,
-and the next parked read's receive delivers both in order, as it would have
-without the poll. A result of 0 or an error means the stream has ended with
-nothing queued: if no receive is in flight and nothing is buffered in the
-accumulator, the connection closes as under a parked read. Bytes buffered in
-the accumulator keep it open until a read finds the end itself. Because no
-receive is armed on the hangup path, the accumulator does not take more
-than a parked read would. A poll that cannot be pushed is counted
-(`ring::RECV_ARM_FAILURES`) and the connection goes without it.
+alone does not complete it. With a receive in flight, the completion does
+nothing more: that receive returns the queued bytes or the end, and the end
+reaches the first read that parks after the bytes are consumed. With none,
+the runtime submits a non-blocking one-byte `recv` with `MSG_PEEK`
+(`OpTag::HangupPeek`), which consumes no bytes.
+
+- A positive result means bytes are queued ahead of the end. They stay in
+  the socket, and the connection goes on `Driver::hangup_rechecks`: after a
+  receive has delivered bytes, and once nothing is buffered and nothing is
+  armed, `recheck_hangups` peeks again, so the end closes the connection
+  even if no read parks after the bytes are consumed.
+- A result of 0 or an error means the stream has ended with nothing queued.
+  If no receive is in flight and nothing is buffered in the accumulator, the
+  connection closes as under a parked read. Otherwise it stays open until a
+  read finds the end itself. A peek that returns an error has cleared the
+  socket's pending error, so the error is kept in
+  `ConnectionState::hangup_error`, and the receive that later returns 0
+  reports it.
+
+No receive is armed on the hangup path, so the accumulator does not take
+more than a parked read would. A poll or peek that cannot be pushed is
+counted (`ring::RECV_ARM_FAILURES`); without the poll, a FIN or reset is
+seen at the next read. TCP does not tell a half-close from a close, so a
+FIN closes a connection whose task only sends.
 
 Cost: one `POLL_ADD` SQE per connection, its completion at a hangup or at
 the close's lead (`shutdown` before 6.13 completes it with `POLLHUP`, the
 cancel from 6.13 with `-ECANCELED`), and one peek SQE and completion per
-hangup with no receive in flight. While armed, the poll is on the socket's
-wait queue, so every wakeup of the socket also runs its wake callback,
-which rejects the event unless it is a hangup. That cost is not measured.
+hangup with no receive in flight, plus one per recheck. While armed, the
+poll is on the socket's wait queue, so every wakeup of the socket also runs
+its wake callback, which rejects the event unless it is a hangup. That cost
+is not measured. Before 6.13 the kernel releases the files of removed fixed
+slots in order, so a request held for a connection's life (this poll, as
+the ring path's always-armed receive did) keeps every socket closed after
+it on the ring from being freed until that request completes; the
+`shutdown` lead still sends the FIN (Domain Invariant 8 in CLAUDE.md).
 
 Arming after the parse means no receive is outstanding while `with_bytes`
 holds the accumulator frozen, so the remainder the parser left can be taken
@@ -702,9 +719,9 @@ closed or merged without a release.
 ## Not known
 
 - The cost of the hangup poll's wait-queue entry on busy connections (every
-  socket wakeup runs its callback) and, before 6.13, of a long-lived request
-  on every connection for closes on the same ring (Domain Invariant 8 in
-  CLAUDE.md).
+  socket wakeup runs its callback), and how much memory the delayed release
+  of closed sockets holds before 6.13 on a ring with long-lived idle
+  connections (Mechanism, the hangup poll).
 
 - Why `c`'s p99 is higher than A's in four cells (Evidence, C8 latency).
 - Why `c`'s throughput gain at 4 KiB depth 16 with the client limited

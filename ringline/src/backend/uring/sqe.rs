@@ -53,9 +53,8 @@ pub(crate) enum Op {
         msg: *const libc::msghdr,
         buf_group: u16,
     },
-    /// One-shot recv into `buf`.
-    /// `recv(2)` of `len` bytes into `buf`, with `msg_flags` (`MSG_PEEK`,
-    /// `MSG_DONTWAIT`, or 0).
+    /// One-shot `recv(2)` of up to `len` bytes into `buf` with `flags` (0, or
+    /// `MSG_PEEK | MSG_DONTWAIT` for the hangup peek).
     Recv {
         fd: Fd,
         buf: *mut u8,

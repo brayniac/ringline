@@ -234,8 +234,8 @@ impl Driver {
     /// open. A direct connection has a receive in flight only while a read
     /// is parked, so without the poll a peer FIN or reset on a connection
     /// whose task is not reading would not be seen until the task next
-    /// reads. If the SQE cannot be pushed the connection goes without it, as
-    /// before the poll existed, and the failure is counted in
+    /// reads. If the SQE cannot be pushed the connection goes without it: a
+    /// FIN or reset is then seen at the next read. The failure is counted in
     /// `ring::RECV_ARM_FAILURES`.
     pub(crate) fn arm_hangup_poll(&mut self, conn_index: u32) {
         let Some(cs) = self.connections.get(conn_index) else {
@@ -256,6 +256,26 @@ impl Driver {
         if let Some(cs) = self.connections.get_mut(conn_index) {
             cs.hangup_poll_armed = true;
         }
+    }
+
+    /// Submit a hangup peek on `conn_index` (`OpTag::HangupPeek`) and record
+    /// it as in flight. Returns whether it was pushed; a failure is counted
+    /// in `ring::RECV_ARM_FAILURES`.
+    pub(crate) fn submit_hangup_peek(&mut self, conn_index: u32) -> bool {
+        let generation = self.connections.generation(conn_index);
+        let buf = self.hangup_peek_buf.as_mut_ptr();
+        if self
+            .ring
+            .submit_hangup_peek(conn_index, generation, buf)
+            .is_err()
+        {
+            metrics::RING.increment(metrics::ring::RECV_ARM_FAILURES);
+            return false;
+        }
+        if let Some(cs) = self.connections.get_mut(conn_index) {
+            cs.hangup_peek_armed = true;
+        }
+        true
     }
 
     /// Whether `conn_index` arms a one-shot recv rather than a multishot one:
@@ -1073,6 +1093,12 @@ pub(crate) struct Driver {
     /// never read; it only has to stay valid while a peek is in flight, which
     /// a buffer the driver owns does.
     pub(crate) hangup_peek_buf: Box<[u8; 1]>,
+    /// `(conn_index, generation)` of direct connections whose hangup peek
+    /// found bytes queued ahead of the end of the stream
+    /// (`ConnectionState::hangup_recheck`). `recheck_hangups` peeks again
+    /// once a receive has delivered bytes and nothing is buffered, so the end
+    /// is seen even if no read parks after the bytes are consumed.
+    pub(crate) hangup_rechecks: Vec<(u32, u32)>,
     /// `Config::recv_direct_region`.
     pub(crate) recv_direct_region: usize,
     /// Arrival timestamp shared by all UDP datagrams queued in one CQE
@@ -1643,6 +1669,7 @@ impl Driver {
             direct_recvs: Vec::new(),
             direct_recv_free: Vec::new(),
             hangup_peek_buf: Box::new([0]),
+            hangup_rechecks: Vec::new(),
             recv_direct_region: config.recv_direct_region,
             udp_batch_recv_at: std::time::Instant::now(),
             tick_timeout_ts: if config.tick_timeout_us > 0 {

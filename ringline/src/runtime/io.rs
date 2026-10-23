@@ -628,8 +628,12 @@ impl<T: 'static> Future for BlockingJoinHandle<T> {
 /// socket. When no bytes are queued in the socket and none are buffered in
 /// the accumulator, the connection closes as it would under a parked read,
 /// and [`ConnCtx::is_alive`] returns `false`. Otherwise the connection stays
-/// open: the bytes and the end of the stream reach the next reads in order,
-/// and the read that finds the end closes it.
+/// open, and the bytes reach the next reads in order. Once they have been
+/// read, the end of the stream closes the connection, whether or not a read
+/// parks again, and a reset is reported to the read as an error.
+///
+/// TCP does not tell a half-close from a close: a FIN closes the connection
+/// even when the task only sends, and sends after it fail.
 ///
 /// A TLS connection receives ciphertext through the worker's provided-buffer
 /// ring. On mio every connection reads into its accumulator.
@@ -2990,9 +2994,9 @@ impl ConnCtx {
     /// A FIN or reset from the peer closes the connection whether or not a
     /// read is parked, so this returns `false` once the runtime has seen it.
     /// On io_uring a plaintext connection from [`connect`] or
-    /// [`connect_unix`] sees it through a `POLLRDHUP` poll, and stays open,
-    /// with this returning `true`, while bytes the peer sent before it are
-    /// unread (see [`connect`]).
+    /// [`connect_unix`] sees it through a `POLLRDHUP` poll. When bytes the
+    /// peer sent before it are queued or buffered, the connection stays open,
+    /// and this returns `true`, until they have been read (see [`connect`]).
     pub fn is_alive(&self) -> bool {
         // `try_with_state`, not `with_state`: this is reachable from a `Drop`
         // that runs outside a task poll. A connection-bound task is dropped by

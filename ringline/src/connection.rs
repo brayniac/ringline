@@ -171,6 +171,19 @@ pub struct ConnectionState {
     /// The hangup peek (`OpTag::HangupPeek`) is in flight.
     #[cfg(has_io_uring)]
     pub hangup_peek_armed: bool,
+    /// A hangup peek found bytes queued ahead of the end of the stream, so
+    /// the connection is on `Driver::hangup_rechecks` until the end is seen.
+    #[cfg(has_io_uring)]
+    pub hangup_recheck: bool,
+    /// A direct receive delivered bytes since the last recheck peek, so the
+    /// next time nothing is buffered or armed, another peek is due.
+    #[cfg(has_io_uring)]
+    pub hangup_recheck_due: bool,
+    /// The errno a hangup peek returned while the connection stayed open (bytes
+    /// buffered or a receive in flight), or 0. The peek clears the socket's
+    /// pending error, so the receive that later returns 0 reports this one.
+    #[cfg(has_io_uring)]
+    pub hangup_error: i32,
 }
 
 impl Default for ConnectionState {
@@ -211,6 +224,12 @@ impl ConnectionState {
             hangup_poll_armed: false,
             #[cfg(has_io_uring)]
             hangup_peek_armed: false,
+            #[cfg(has_io_uring)]
+            hangup_recheck: false,
+            #[cfg(has_io_uring)]
+            hangup_recheck_due: false,
+            #[cfg(has_io_uring)]
+            hangup_error: 0,
         }
     }
 
@@ -285,6 +304,9 @@ impl ConnectionState {
             self.direct_forwarding = false;
             self.hangup_poll_armed = false;
             self.hangup_peek_armed = false;
+            self.hangup_recheck = false;
+            self.hangup_recheck_due = false;
+            self.hangup_error = 0;
         }
         self.generation = self.generation.wrapping_add(1);
     }
