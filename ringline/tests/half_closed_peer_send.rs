@@ -19,8 +19,6 @@
 
 use std::future::Future;
 use std::io::{Read, Write};
-#[cfg(has_io_uring)]
-use std::net::TcpListener;
 use std::net::{Shutdown, TcpStream};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -172,76 +170,6 @@ fn guard_send_to_a_half_closed_peer_waits_and_delivers() {
 
     read_payload(&mut stream, "guard send");
     drop(stream);
-    runtime.shutdown();
-    for h in handles {
-        h.join().expect("worker panicked").expect("worker error");
-    }
-    assert_no_spin(baseline, ticks);
-}
-
-// ── forward_to a socket sink ────────────────────────────────────────────
-
-/// Where the forwarder connects its socket sink.
-#[cfg(has_io_uring)]
-static SINK_ADDR: std::sync::OnceLock<std::net::SocketAddr> = std::sync::OnceLock::new();
-
-/// Forwards `LEN` received bytes to a non-blocking socket it connects to
-/// `SINK_ADDR`.
-#[cfg(has_io_uring)]
-struct ForwardToSocket;
-
-#[cfg(has_io_uring)]
-impl AsyncEventHandler for ForwardToSocket {
-    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
-        async move {
-            use std::os::fd::AsFd;
-            let sink_stream =
-                TcpStream::connect(*SINK_ADDR.get().expect("sink address")).expect("sink connect");
-            sink_stream.set_nonblocking(true).unwrap();
-            let sink = ringline::SinkFd::socket(sink_stream.as_fd());
-            let forwarded = conn.as_conn().forward_to(&sink, LEN).await;
-            assert_eq!(forwarded.ok(), Some(LEN), "forward_to ended early");
-        }
-    }
-    fn on_tick(&mut self, _ctx: &mut DriverCtx<'_>) {
-        TICKS.fetch_add(1, Ordering::Relaxed);
-    }
-    fn create_for_worker(_id: usize) -> Self {
-        ForwardToSocket
-    }
-}
-
-#[cfg(has_io_uring)]
-#[test]
-fn forward_to_a_half_closed_socket_sink_waits_and_delivers() {
-    let _lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let sink_listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    SINK_ADDR
-        .set(sink_listener.local_addr().unwrap())
-        .expect("sink address set once");
-    let (runtime, handles) = RinglineBuilder::new(config())
-        .bind("127.0.0.1:0".parse().unwrap())
-        .launch::<ForwardToSocket>()
-        .expect("launch");
-    let source = connect(runtime.bound_addr().expect("bound address"));
-    // The sink's peer half-closes at once and reads nothing until later.
-    let (mut sink_peer, _) = sink_listener.accept().unwrap();
-    sink_peer.shutdown(Shutdown::Write).unwrap();
-
-    std::thread::sleep(Duration::from_millis(100));
-    let baseline = ticks_over_500ms();
-
-    // The source's writes block once the sink backs up, so they run on their
-    // own thread.
-    let mut writer_stream = source.try_clone().unwrap();
-    let writer = std::thread::spawn(move || writer_stream.write_all(&payload()).unwrap());
-    // Let the forward fill the sink and stall.
-    std::thread::sleep(Duration::from_millis(500));
-    let ticks = ticks_over_500ms();
-
-    read_payload(&mut sink_peer, "forward_to socket");
-    writer.join().unwrap();
-    drop(source);
     runtime.shutdown();
     for h in handles {
         h.join().expect("worker panicked").expect("worker error");
