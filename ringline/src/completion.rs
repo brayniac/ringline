@@ -123,6 +123,11 @@ pub enum OpTag {
     /// `Driver::direct_recvs` index, whose entry holds the buffer and the
     /// connection generation.
     RecvDirect = 36,
+    /// `POLL_ADD` for `POLLRDHUP` on a direct connection, armed once when it
+    /// opens. It completes on a peer FIN, a reset or a socket error, and
+    /// not on data, so a connection whose task is not reading still sees
+    /// the peer leave. Payload = connection generation.
+    HangupPoll = 37,
 }
 
 /// Set in an `OpTag::SendRecvBuf` payload, above the 16-bit bid, when the send
@@ -168,6 +173,7 @@ impl OpTag {
             34 => Some(OpTag::CloseCancel),
             35 => Some(OpTag::SendMsgZcDrain),
             36 => Some(OpTag::RecvDirect),
+            37 => Some(OpTag::HangupPoll),
             _ => None,
         }
     }
@@ -216,6 +222,7 @@ impl OpTag {
             OpTag::CloseCancel => "close_cancel",
             OpTag::SendMsgZcDrain => "send_msg_zc_drain",
             OpTag::RecvDirect => "recv_direct",
+            OpTag::HangupPoll => "hangup_poll",
         }
     }
 }

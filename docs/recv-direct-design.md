@@ -279,7 +279,20 @@ when a read parks: `with_data`, `with_bytes` or `recv_ready` returns
 armed at connect or at a completion. While the task works on what it has,
 no receive is in flight, unless a read that parked was dropped before its
 receive completed; data that arrives in that time waits in the socket's
-receive queue, and a FIN is seen at the next read.
+receive queue.
+
+A FIN or reset is seen without a read. When the connection opens, the
+runtime arms a one-shot `POLL_ADD` for `POLLRDHUP` on its fixed file
+(`OpTag::HangupPoll`, `arm_hangup_poll_or_close`). `POLLERR` and `POLLHUP`
+are always reported, so it completes on a FIN, a reset or a socket error,
+and data alone does not complete it. On completion it sets
+`peer_hangup`; if no receive is in flight it arms one, and while
+`peer_hangup` is set each receive that returns data arms the next, until the
+receive that returns 0 or an error closes the connection, as under a parked
+read. Bytes that arrived before the FIN go to the accumulator. The poll
+costs one SQE per connection and a completion at close, when the close's
+lead ends it: `shutdown` before 6.13 completes it with `POLLHUP`, and the
+cancel from 6.13 with `-ECANCELED`.
 
 Arming after the parse means no receive is outstanding while `with_bytes`
 holds the accumulator frozen, so the remainder the parser left can be taken
@@ -683,12 +696,6 @@ closed or merged without a release.
   more runs agree.
 - Why `c` costs 2 to 4% more CPU per GET at 64 B depth 1 (Evidence,
   "Scale").
-- An idle direct connection has no receive armed, so a FIN or reset from
-  its peer is not seen until the next read; `is_alive` stays `true` and a
-  pool returns the connection for reuse. On the ring path a receive was
-  always armed and the close was seen at once. Arming a receive whenever
-  nothing is buffered would restore that; it has not been built or
-  measured.
 - A `ForwardToFuture` dropped by `handle_close` (which tears down another
   connection's task without `CURRENT_DRIVER` set) cannot clear
   `direct_forwarding`, so later forwards from its source are refused with

@@ -972,7 +972,9 @@ fn a_direct_connection_forwards_to_another_connection() {
         s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
         let mut got = Vec::new();
         let mut buf = [0u8; 16_384];
-        while got.len() < FWD_TOTAL - 1 {
+        // Read until the client closes: closing first would close the sink
+        // connection while the forward still waits for the source's FIN.
+        loop {
             match std::io::Read::read(&mut s, &mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => got.extend_from_slice(&buf[..n]),
@@ -1007,4 +1009,97 @@ fn a_direct_connection_forwards_to_another_connection() {
         .collect();
     assert_eq!(got.len(), want.len());
     assert!(got == want, "the sink received the bytes out of order");
+}
+
+// ── Peer close on a connection nobody reads ─────────────────────────
+
+static HANGUP: Mutex<Option<Result<(), String>>> = Mutex::new(None);
+static HANGUP_SERVERS: Mutex<Vec<SocketAddr>> = Mutex::new(Vec::new());
+
+/// Bytes the second server writes before it closes: several 32 KiB
+/// receives' worth, so the stream ends only after the runtime re-arms more
+/// than once, and less than a loopback receive buffer, so the write
+/// completes while the client does not read.
+const HANGUP_TAIL: usize = 100_000;
+
+/// Connects to each server and never reads. Each server closes its end,
+/// the second after writing `HANGUP_TAIL` bytes. Each connection must stop
+/// being alive.
+struct IdleClient;
+
+impl AsyncEventHandler for IdleClient {
+    fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        Some(Box::pin(async {
+            let addrs = HANGUP_SERVERS.lock().unwrap().clone();
+            let r = async {
+                let mut conns = Vec::new();
+                for addr in addrs {
+                    conns.push(
+                        ringline::connect(addr)
+                            .await
+                            .map_err(|e| format!("connect: {e}"))?,
+                    );
+                }
+                for _ in 0..500 {
+                    if conns.iter().all(|c| !c.is_alive()) {
+                        return Ok(());
+                    }
+                    ringline::sleep(Duration::from_millis(10)).await;
+                }
+                let alive: Vec<usize> = (0..conns.len()).filter(|&i| conns[i].is_alive()).collect();
+                Err(format!(
+                    "connections {alive:?} still alive 5 s after the peer closed"
+                ))
+            }
+            .await;
+            *HANGUP.lock().unwrap() = Some(r);
+            let _ = ringline::request_shutdown();
+        }))
+    }
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
+        async {}
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        IdleClient
+    }
+}
+
+#[test]
+fn a_connection_that_is_not_read_sees_the_peer_close() {
+    let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    *HANGUP.lock().unwrap() = None;
+    let mut servers = Vec::new();
+    let mut addrs = Vec::new();
+    for tail in [0, HANGUP_TAIL] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        addrs.push(listener.local_addr().unwrap());
+        servers.push(std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+            let data: Vec<u8> = (0..tail).map(|i| pattern(2, i)).collect();
+            let _ = s.write_all(&data);
+        }));
+    }
+    *HANGUP_SERVERS.lock().unwrap() = addrs;
+    let config = ConfigBuilder::new()
+        .workers(1)
+        .pin_to_core(false)
+        .max_connections(16)
+        .build()
+        .expect("config");
+    let (runtime, handles) = RinglineBuilder::new(config)
+        .launch::<IdleClient>()
+        .expect("launch");
+    common::join_workers(&runtime, handles);
+    for s in servers {
+        s.join().unwrap();
+    }
+    assert_eq!(
+        HANGUP
+            .lock()
+            .unwrap()
+            .take()
+            .expect("client did not finish"),
+        Ok(())
+    );
 }

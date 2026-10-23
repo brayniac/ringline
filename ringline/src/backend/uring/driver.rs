@@ -230,6 +230,36 @@ impl Driver {
         false
     }
 
+    /// Arm `conn_index`'s hangup poll (`OpTag::HangupPoll`) once it is
+    /// open. A direct connection has a receive in flight only while a read
+    /// is parked, so without the poll a peer FIN or reset on a connection
+    /// whose task is not reading would not be seen until the task next
+    /// reads. If the SQE cannot be pushed, the connection is closed, as for
+    /// a failed receive arm, and this returns `true`: the caller wakes the
+    /// task so its read resolves.
+    pub(crate) fn arm_hangup_poll_or_close(&mut self, conn_index: u32) -> bool {
+        let Some(cs) = self.connections.get(conn_index) else {
+            return false;
+        };
+        if !cs.recv_direct || cs.hangup_poll_armed || cs.recv_finished() {
+            return false;
+        }
+        let generation = cs.generation;
+        if self
+            .ring
+            .submit_hangup_poll(conn_index, generation)
+            .is_err()
+        {
+            metrics::RING.increment(metrics::ring::RECV_ARM_FAILURES);
+            self.close_connection(conn_index);
+            return true;
+        }
+        if let Some(cs) = self.connections.get_mut(conn_index) {
+            cs.hangup_poll_armed = true;
+        }
+        false
+    }
+
     /// Whether `conn_index` arms a one-shot recv rather than a multishot one:
     /// every TCP connection unless `Config::recv_multishot` is set, and
     /// always a direct-echo or recv-forward connection, whose completions

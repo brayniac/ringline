@@ -622,9 +622,12 @@ impl<T: 'static> Future for BlockingJoinHandle<T> {
 /// [`ConnCtx::forward_to_conn`]).
 ///
 /// A receive is armed only while a read is parked or a receive is in flight.
-/// A FIN or reset from the peer on a connection that nothing reads is seen
-/// at the next read; until then [`ConnCtx::is_alive`] returns `true` and
-/// sends are accepted.
+/// A poll for `POLLRDHUP`, armed when the connection opens, completes on a
+/// FIN, a reset or a socket error from the peer, and not on data. If no
+/// receive is in flight then, the runtime arms receives until the read half
+/// ends, and the connection closes as it would under a parked read: bytes
+/// that arrived before the FIN go to the accumulator, and
+/// [`ConnCtx::is_alive`] returns `false` once the close is requested.
 ///
 /// A TLS connection receives ciphertext through the worker's provided-buffer
 /// ring. On mio every connection reads into its accumulator.
@@ -2982,10 +2985,10 @@ impl ConnCtx {
     /// close on the very next turn, without waiting for the Close CQE to bump
     /// the generation.
     ///
-    /// On io_uring a plaintext outbound connection (see [`connect`]) has a
-    /// receive armed only while a read is parked. A FIN or reset from the peer
-    /// on such a connection while nothing reads it is not seen until the next
-    /// read, so this returns `true` until then.
+    /// A FIN or reset from the peer closes the connection whether or not a
+    /// read is parked, so this returns `false` once the runtime has seen it.
+    /// On io_uring a plaintext connection sees it through a `POLLRDHUP` poll
+    /// (see [`connect`]).
     pub fn is_alive(&self) -> bool {
         // `try_with_state`, not `with_state`: this is reachable from a `Drop`
         // that runs outside a task poll. A connection-bound task is dropped by
