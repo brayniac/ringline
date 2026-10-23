@@ -202,10 +202,12 @@ through SystemsLab anvil-vm jobs on two hosts with the X710 PFs passed through
 (`ports = 4`, bonded, fixed `172.31.0.1/.2`).
 
 Server: `bench-server --runtime <ringline|tokio|tokio-uring> --workers 8`, plus
-`--echo-mode {direct,forward,recv-forward}` for ringline and
+`--echo-mode forward` for ringline and
 `--tokio-scheduler {multi-thread,per-core}` / `--tokio-echo {copy,splice}` for
 tokio. The mio arm is a `--features force-mio` build; `tokio-uring` needs
-`--features tokio-uring-arm`.
+`--features tokio-uring-arm`. The `uring` and `rfwd` arms cannot be rerun:
+ringline has no `run_direct_echo` or `forward_held`, and `--echo-mode direct`
+is a `with_data` + `send_nowait` loop.
 
 Client: `bench-client --clients <n> --msg-size <bytes> --threads 16 --warmup 5
 --duration 20`.

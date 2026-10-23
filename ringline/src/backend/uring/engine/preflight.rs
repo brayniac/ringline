@@ -61,8 +61,7 @@ pub(crate) fn inc_preflight<E: Engine>(engine: &mut E) -> Result<IncPreflight, E
         return Ok(IncPreflight::Unsupported);
     }
     // TCP receives are one-shot by default and multishot with
-    // `recv_multishot(true)`, and direct-echo and recv-forward connections
-    // are always one-shot, so check both.
+    // `recv_multishot(true)`, so check both.
     match inc_pass(engine, false)? {
         IncPreflight::Passed => inc_pass(engine, true),
         other => Ok(other),

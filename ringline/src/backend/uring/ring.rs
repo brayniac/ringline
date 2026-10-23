@@ -536,36 +536,11 @@ impl Ring {
         unsafe { self.push_sqe(&entry) }
     }
 
-    /// Submit a zero-copy recv-forward send: one plain (non-ZC) `sendmsg` whose
-    /// iovecs point directly into held provided recv buffers. The slab index is
-    /// in the payload; the slab entry holds the bids to replenish on completion.
-    pub fn submit_send_recv_bufs_coalesced(
-        &mut self,
-        conn_index: u32,
-        msg: *const libc::msghdr,
-        slab_idx: u16,
-    ) -> io::Result<()> {
-        let user_data = UserData::encode(OpTag::SendRecvBufsCoalesced, conn_index, slab_idx as u32);
-        let entry = Sqe::new(
-            Op::SendMsg {
-                fd: sqe::Fd::Fixed(conn_index),
-                msg,
-                flags: crate::completion::STREAM_SEND_FLAGS as u32,
-            },
-            user_data.raw(),
-        );
-        unsafe {
-            self.push_sqe(&entry)?;
-        }
-        Ok(())
-    }
-
     /// Submit a **gathered** Mode A forward write to a socket sink: several
     /// held provided buffers in one `sendmsg`.
     ///
     /// This is what makes forwarding cost one completion per *batch* rather
-    /// than one per provided buffer — the asymmetry `run_direct_echo` has
-    /// always exploited by gathering a drain's worth into a single send (#397).
+    /// than one per provided buffer (#397).
     /// Ordering is preserved: `sendmsg` writes the iovecs in order, and the
     /// caller still keeps one write in flight per connection.
     ///

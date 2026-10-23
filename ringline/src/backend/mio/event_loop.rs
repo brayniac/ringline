@@ -327,8 +327,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
 
             // 6b. Finish teardown of connections closed during this
-            // iteration: executor cleanup (parked futures, waiter flags,
-            // recv sinks) before the slot is released for reuse.
+            // iteration: executor cleanup (parked futures, waiter flags)
+            // before the slot is released for reuse.
             self.drain_pending_closes();
 
             // 7. on_tick callback (synchronous). Set the executor's
@@ -950,7 +950,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     metrics::BYTES.add(metrics::bytes::RECEIVED, n as u64);
                     self.driver.record_arrival(conn_index, n);
                     // A forward owns this connection's bytes: they go to the
-                    // sink's send queue, not to the accumulator or a recv sink.
+                    // sink's send queue, not to the accumulator.
                     if self.driver.forward_conn[idx].is_some() {
                         if !self.forward_bytes(conn_index, &recv_buf[..n]) {
                             break;
@@ -966,40 +966,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                         }
                         continue;
                     }
-                    // Check if the connection has a recv sink (direct-to-buffer).
-                    let sink = &mut self.executor.recv_sinks[idx];
-                    let mut to_accumulator = n;
-                    let appended = if let Some(recv_sink) = sink {
-                        let remaining = recv_sink.cap - recv_sink.pos;
-                        let to_copy = n.min(remaining);
-                        if to_copy > 0 {
-                            unsafe {
-                                std::ptr::copy_nonoverlapping(
-                                    recv_buf.as_ptr(),
-                                    recv_sink.ptr.add(recv_sink.pos),
-                                    to_copy,
-                                );
-                            }
-                            recv_sink.pos += to_copy;
-                        }
-                        // If there's overflow beyond the sink, put it in accumulator.
-                        to_accumulator = n - to_copy;
-                        if n > to_copy {
-                            self.driver
-                                .accumulators
-                                .append(conn_index, &recv_buf[to_copy..n])
-                        } else {
-                            true
-                        }
-                    } else {
-                        self.driver.accumulators.append(conn_index, &recv_buf[..n])
-                    };
+                    let appended = self.driver.accumulators.append(conn_index, &recv_buf[..n]);
                     if !appended {
                         // Streamed past recv_accumulator_max. The bytes were
                         // already read off the socket, so the stream cannot
                         // continue coherently — close rather than OOM,
                         // matching the uring and mio-TLS overflow paths.
-                        self.driver.recv_dropped[idx] += to_accumulator as u64;
+                        self.driver.recv_dropped[idx] += n as u64;
                         self.executor.wake_recv(conn_index);
                         self.driver.close_connection(conn_index);
                         break;

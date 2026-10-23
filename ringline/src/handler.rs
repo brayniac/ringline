@@ -3050,8 +3050,7 @@ impl<'a> DriverCtx<'a> {
     /// Close a connection. Marks it Closed and defers teardown (socket,
     /// buffers, executor cleanup, slot release) to the event loop's
     /// drain_pending_closes — releasing the slot here left the executor's
-    /// parked future, waiter flags, and recv sink alive into the slot's
-    /// next occupant.
+    /// parked future and waiter flags alive into the slot's next occupant.
     pub fn close(&mut self, conn: ConnToken) {
         if let Some(cs) = self.connections.get_mut(conn.index) {
             if cs.generation != conn.generation {

@@ -35,8 +35,7 @@ pub enum RecvArm {
     Idle,
     /// Recv with the provided buffer ring (io_uring) / readable interest
     /// (mio). On io_uring each arm is one-shot by default and multishot with
-    /// `recv_multishot(true)`; a direct-echo or recv-forward connection
-    /// always arms one-shot (`Driver::recv_single`).
+    /// `recv_multishot(true)`.
     Multi,
 }
 
@@ -125,12 +124,6 @@ pub struct ConnectionState {
     pub listener: Option<crate::ListenerId>,
     /// Whether a connect timeout SQE is armed for this connection.
     pub connect_timeout_armed: bool,
-    /// When true, `handle_recv_multi` echoes received data directly from the CQE
-    /// handler instead of waking the connection's task. This eliminates the
-    /// task-wakeup overhead (collect_wakeups → poll_ready_tasks) on the hot echo
-    /// path, reducing per-message latency from ~2 event-loop iterations to ~1.
-    #[cfg(has_io_uring)]
-    pub direct_echo: bool,
     /// Whether a plain multishot `RecvMulti` SQE is currently in-flight in the
     /// kernel (armed). Set when the multishot is (re-)armed; cleared when a
     /// completion arrives without `IORING_CQE_F_MORE` (the kernel terminated
@@ -211,8 +204,6 @@ impl ConnectionState {
             peer_addr: None,
             listener: None,
             connect_timeout_armed: false,
-            #[cfg(has_io_uring)]
-            direct_echo: false,
             #[cfg(has_io_uring)]
             recv_multishot_armed: false,
             #[cfg(has_io_uring)]
@@ -300,7 +291,6 @@ impl ConnectionState {
         self.connect_timeout_armed = false;
         #[cfg(has_io_uring)]
         {
-            self.direct_echo = false;
             self.recv_multishot_armed = false;
             self.socket_handed_off = false;
             self.recv_direct = false;

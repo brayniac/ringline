@@ -529,12 +529,6 @@ impl AsyncEventHandler for Refusals {
                     "with_segments",
                     conn.with_segments(|_| ringline::SegConsumed(0)).await,
                 )?;
-                conn.enable_recv_forward();
-                expect_unsupported("forward_held", conn.forward_held().map(|_| ()))?;
-                // Resolves at once rather than waiting for an EOF.
-                ringline::timeout(Duration::from_secs(5), conn.run_direct_echo())
-                    .await
-                    .map_err(|_| "run_direct_echo did not resolve".to_string())?;
                 // The connection still reads with `with_data`.
                 let mut got = Vec::new();
                 while got.len() < 4 {

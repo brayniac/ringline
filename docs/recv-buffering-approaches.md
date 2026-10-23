@@ -128,8 +128,8 @@ of a per-worker pool instead of waiting for ring buffers. The pool has 32
 slots of `max(4 × buffer size, 1 MiB)`, or 1 MiB with `recv_incremental`,
 and is allocated on first use. The bytes are then appended to the
 accumulator. The fallback keeps the connection's TCP window open while the
-ring is empty. TLS, recv-sink, segmented, recv-forward and direct-echo
-connections keep waiting for ring buffers. With `recv_incremental`, a parked
+ring is empty. TLS and segmented connections keep waiting for ring
+buffers. With `recv_incremental`, a parked
 connection re-arms on the ring instead when the ring's free bytes exceed one
 chunk.
 
@@ -153,14 +153,13 @@ Measured:
 A held range pins its whole shared buffer. To keep held lends from pinning
 the whole ring, ringline lends a completion only while at most half the
 ring's buffers have a hold (`Driver::may_lend`). Above that, the completion
-is copied to the heap: into the accumulator for `with_data` and
-`with_bytes`, and into an owned buffer for recv-forward and direct echo,
-at most one ring's worth of owned buffers in total. The accumulator copies
-have no total bound. An incremental completion can be a whole message, so
-each copy can be a whole message. In ringline's forward echo, peak RSS
-reached 1.5 GiB at 64 KiB × 16,384 and 5.6 GiB at 1 MiB × 4,096, against
-128 MiB of ring (two workers). The growth comes from the lend cap and the
-accumulator; the incremental ring's own memory stays at 64 MiB per worker.
+is copied into the accumulator for `with_data` and `with_bytes`. The
+accumulator copies have no total bound. An incremental completion can be a
+whole message, so each copy can be a whole message. In ringline's forward
+echo, peak RSS reached 1.5 GiB at 64 KiB × 16,384 and 5.6 GiB at 1 MiB ×
+4,096, against 128 MiB of ring (two workers). The growth comes from the
+lend cap and the accumulator; the incremental ring's own memory stays at 64
+MiB per worker.
 It has to be bounded before `recv_incremental` is the default
 (`docs/journal/2026-10-receive-starvation.md`). An accumulator releases its
 allocation when its connection closes (#660).

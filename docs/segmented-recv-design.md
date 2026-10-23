@@ -296,10 +296,10 @@ nothing. The mechanism is **aggregate**, built on the occupancy counter:
   bounds monopolization; past it, that connection's deliveries go Mode C. It is
   anti-monopoly, not the depletion guard.
 - **Hold-cap throttle** (above) stops one slow consumer from pinning the ring:
-  a `forward_to` source, a segment reader, a recv-forward or direct-echo
-  connection, at `forward_hold_cap` held entries, lowered to a quarter of the
-  ring's buffers for recv-forward and direct echo and for segment holds
-  without `recv_incremental`.
+  a `forward_to` source or a segment reader, at `forward_hold_cap` held
+  entries, lowered to a quarter of the ring's buffers without
+  `recv_incremental`. The lent buffers a connection's `forward_recv_buf`
+  sends hold are capped at a quarter of the ring's buffers.
 - **Per-class-aware class selection & re-arm.** `arm_multishot_recv` must pick
   the smallest class ≥ target **with free buffers**, falling back to a deeper
   smaller non-empty class rather than arming against a drained ring. The re-arm

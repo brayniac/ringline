@@ -156,58 +156,6 @@ fn plaintext_lines_report_times_no_earlier_than_their_writes() {
     stop(shutdown, handles);
 }
 
-// ── A recv sink, then lines ─────────────────────────────────────────────
-
-static SINK: Mutex<Vec<Seen>> = Mutex::new(Vec::new());
-
-/// Takes the first 4 bytes through a recv sink, which does not report, then
-/// reads lines.
-struct SinkThenLines;
-
-impl AsyncEventHandler for SinkThenLines {
-    #[allow(clippy::manual_async_fn)]
-    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
-        async move {
-            let mut head = [0u8; 4];
-            // SAFETY: `head` outlives the sink, which is taken below before
-            // `head` is read or dropped.
-            unsafe { conn.as_conn().set_recv_sink(head.as_mut_ptr(), head.len()) };
-            // The 8-byte first write arrives in one read: 4 bytes to the
-            // sink, the rest to the accumulator.
-            conn.recv_ready().await;
-            assert_eq!(conn.take_recv_sink(), head.len());
-            assert_eq!(&head, b"skip");
-            read_lines(&mut conn, &SINK).await;
-        }
-    }
-
-    fn create_for_worker(_id: usize) -> Self {
-        SinkThenLines
-    }
-}
-
-#[test]
-fn lines_after_a_recv_sink_report_their_own_times() {
-    let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind("127.0.0.1:0".parse().unwrap())
-        .launch::<SinkThenLines>()
-        .expect("launch failed");
-    let addr = shutdown.bound_addr().expect("bound address");
-
-    let mut client = TcpStream::connect(addr).expect("connect");
-    // The sink's bytes share the first write with the first line.
-    let first: Vec<u8> = [&b"skip"[..], CHUNKS[0]].concat();
-    let chunks: Vec<&[u8]> = std::iter::once(first.as_slice())
-        .chain(CHUNKS[1..].iter().copied())
-        .collect();
-    let sent = write_chunks(&mut client, &chunks);
-    let seen = wait_for_lines(&SINK, 4);
-    check_lines(&seen, &sent);
-
-    drop(client);
-    stop(shutdown, handles);
-}
-
 // ── TLS ─────────────────────────────────────────────────────────────────
 
 static TLS: Mutex<Vec<Seen>> = Mutex::new(Vec::new());

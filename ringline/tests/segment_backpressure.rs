@@ -4,11 +4,8 @@
 //! shared receive ring: its receive is throttled once the buffers it holds,
 //! including those its sends hold, reach its cap, and another connection on
 //! the same worker keeps working. The tests that run cover the cases where
-//! that holds. On a plain 16-buffer ring an unread direct-echo or
-//! `forward_held` peer can still empty the ring, because one multishot
-//! receive takes buffers past the cap before its cancel lands, and the
-//! ignored `forward_recv_buf` test records a case that is not throttled at
-//! all; see #638.
+//! that holds. The ignored `forward_recv_buf` test records a case that is not
+//! throttled at all; see #638.
 #![cfg(has_io_uring)]
 #![allow(clippy::manual_async_fn)]
 
@@ -20,9 +17,8 @@ use std::time::Duration;
 use ringline::{AsyncEventHandler, ConfigBuilder, Connection, ParseResult, RinglineBuilder};
 
 /// The first byte picks the mode: `S` takes a segment reader and never
-/// reads, `D` runs direct echo, `F` echoes with `forward_held`, `R` echoes
-/// each buffer with `forward_recv_buf`, `T` echoes with `forward_to_conn`,
-/// and anything else echoes through `with_data`.
+/// reads, `R` echoes each buffer with `forward_recv_buf`, `T` echoes with
+/// `forward_to_conn`, and anything else echoes through `with_data`.
 struct Modes;
 
 impl AsyncEventHandler for Modes {
@@ -43,22 +39,6 @@ impl AsyncEventHandler for Modes {
                     let _reader = conn.segments().expect("segment reader");
                     loop {
                         ringline::sleep(Duration::from_secs(1)).await;
-                    }
-                }
-                b'D' => {
-                    let _ = conn.run_direct_echo().await;
-                }
-                b'F' => {
-                    conn.enable_recv_forward();
-                    loop {
-                        conn.recv_ready().await;
-                        let n = match conn.forward_held() {
-                            Ok(f) => f.await.unwrap_or(0),
-                            Err(_) => break,
-                        };
-                        if n == 0 {
-                            break;
-                        }
                     }
                 }
                 b'R' => {
@@ -111,17 +91,6 @@ fn idle_peer_is_throttled_alone(mode: u8, incremental: bool, reserve: u32) {
 /// `idle_peer_is_throttled_alone` with `peers` idle connections in mode
 /// `mode`, each flooded in turn.
 fn idle_peers_are_throttled_alone(mode: u8, incremental: bool, reserve: u32, peers: usize) {
-    idle_peers_are_throttled_alone_with(mode, incremental, reserve, peers, false);
-}
-
-/// `idle_peers_are_throttled_alone` with `recv_multishot` set as given.
-fn idle_peers_are_throttled_alone_with(
-    mode: u8,
-    incremental: bool,
-    reserve: u32,
-    peers: usize,
-    multishot: bool,
-) {
     const LIMIT: u64 = 64 << 20;
     let config = ConfigBuilder::new()
         .workers(1)
@@ -131,7 +100,6 @@ fn idle_peers_are_throttled_alone_with(
         .recv_buffer(16, 64 << 10)
         .recv_segment_reserve(reserve)
         .recv_incremental(incremental)
-        .recv_multishot(multishot)
         .build()
         .expect("config");
     let (shutdown, handles) = RinglineBuilder::new(config)
@@ -193,42 +161,6 @@ fn an_idle_segment_reader_is_throttled_alone() {
     idle_peer_is_throttled_alone(b'S', false, 16);
     idle_peer_is_throttled_alone(b'S', false, 4);
     idle_peer_is_throttled_alone(b'S', true, 0);
-}
-
-#[test]
-fn an_unread_direct_echo_is_throttled_alone() {
-    idle_peer_is_throttled_alone(b'D', true, 0);
-}
-
-/// The buffers an echo's or a forward's sends hold count toward its cap
-/// (#638). With an incremental ring, two unread echoes or forwards leave the
-/// other connection room to answer.
-#[test]
-fn two_unread_echoes_or_forwards_are_throttled_alone() {
-    for mode in *b"DF" {
-        idle_peers_are_throttled_alone(mode, true, 0, 2);
-    }
-}
-
-/// A direct-echo or `forward_held` connection receives one buffer per arm,
-/// so on a plain ring it holds no more than its cap: three unread ones, a
-/// quarter of a 16-buffer ring each, leave the fourth quarter to the echo
-/// connection (#638).
-#[test]
-fn unread_echoes_and_forwards_are_throttled_alone_on_a_plain_ring() {
-    for mode in *b"DF" {
-        idle_peers_are_throttled_alone(mode, false, 0, 3);
-    }
-}
-
-/// With `recv_multishot`, an unread direct-echo or recv-forward connection
-/// is still throttled alone: it arms one-shot recvs once it enters that
-/// mode (#638).
-#[test]
-fn unread_echoes_and_forwards_are_throttled_alone_with_multishot() {
-    for mode in *b"DF" {
-        idle_peers_are_throttled_alone_with(mode, false, 0, 3, true);
-    }
 }
 
 /// A `forward_to_conn` write's pinned buffers count toward the segment cap.

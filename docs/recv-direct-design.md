@@ -537,9 +537,9 @@ checked whether the cancel can still be pending after 10 s.
 - `try_with_data` does not park or arm a receive. While a receive is in
   flight, for example after a parked read was dropped, the buffered bytes
   are in that receive's buffer and `try_with_data` returns `None`.
-- `segments`, `recv_owned_segment`, `with_segments`, `with_bytes_segments`,
-  `forward_to` and `forward_held` return `io::ErrorKind::Unsupported`. They
-  read held provided buffers, and a direct connection has none.
+- `segments`, `recv_owned_segment`, `with_segments`, `with_bytes_segments`
+  and `forward_to` return `io::ErrorKind::Unsupported`. They read held
+  provided buffers, and a direct connection has none.
 - `forward_to_conn` sends from the accumulator (`DirectForward` in
   `runtime/io.rs`): it takes what the accumulator holds, up to what is left
   of the length, and sends it on the sink through the sink's send queue
@@ -549,9 +549,6 @@ checked whether the cancel can still be pending after 10 s.
   the same connection is refused with `EBUSY` (`direct_forwarding` on
   `ConnectionState`). A send the runtime cannot submit resolves the forward
   with that error and puts the chunk back in front of the accumulator.
-- `enable_recv_forward` does nothing on a direct connection, because it
-  returns `()`; `forward_held` then returns `Unsupported`. `run_direct_echo`
-  resolves at once, because its output is `()`.
 - `forward_recv_buf` is a send from the accumulator and is not refused. It
   has not been tested on a direct connection.
 - TLS: a TLS connection receives through the provided-buffer ring. The

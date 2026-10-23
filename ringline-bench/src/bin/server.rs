@@ -172,12 +172,10 @@ enum TokioEcho {
 /// Which ringline echo strategy `bench-server` drives.
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum EchoMode {
-    /// `run_direct_echo` — submit the echo from the CQE handler.
+    /// `with_data` + `send_nowait`.
     Direct,
     /// `with_data` + `forward_recv_buf`.
     Forward,
-    /// `enable_recv_forward` + `forward_held`.
-    RecvForward,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -211,22 +209,13 @@ struct Args {
     #[arg(long, default_value_t = 4096)]
     msg_size: usize,
 
-    /// (ringline only) Echo via the multi-buffer zero-copy recv-forward path.
-    /// Equivalent to `--echo-mode recv-forward`; kept because the campaign
-    /// specs pass it.
-    #[arg(long, default_value_t = false)]
-    recv_forward: bool,
-
-    /// (ringline only) Which echo strategy the handler uses. These are three
-    /// genuinely different runtime paths, and which one a measurement
-    /// exercises has been easy to get wrong:
+    /// (ringline only) Which echo strategy the handler uses:
     ///
-    /// - `direct` (default): `run_direct_echo`, echo submitted straight from
-    ///   the CQE handler with no task wakeup. io_uring only.
+    /// - `direct` (default): `with_data` + `send_nowait`, which copies the
+    ///   received bytes into a send.
     /// - `forward`: `with_data` + `forward_recv_buf` — the ordinary
-    ///   parse-then-forward loop a protocol server would write.
-    /// - `recv-forward`: `enable_recv_forward` + `forward_held`. A byte pipe;
-    ///   `with_data`/`with_bytes` observe nothing while it is on.
+    ///   parse-then-forward loop a protocol server would write. It sends a
+    ///   lent receive buffer without copying it where the connection has one.
     #[arg(long, value_enum, default_value_t = EchoMode::Direct)]
     echo_mode: EchoMode,
 
@@ -303,8 +292,7 @@ struct Args {
 
     /// (tokio only) How the bytes move. `copy` is the canonical echo loop
     /// (read into a reused buffer, write back out); `splice` moves them
-    /// socket -> pipe -> socket without entering user memory, the counterpart
-    /// to ringline's recv-forward byte pipe. Linux only.
+    /// socket -> pipe -> socket without entering user memory. Linux only.
     #[arg(long, value_enum, default_value_t = TokioEcho::Copy)]
     tokio_echo: TokioEcho,
 
@@ -527,11 +515,7 @@ fn main() {
             prefault_buffers: args.prefault_buffers,
             recv_multishot: args.recv_multishot,
             iowq_max_workers: args.iowq_max_workers,
-            echo_mode: if args.recv_forward {
-                EchoMode::RecvForward
-            } else {
-                args.echo_mode
-            },
+            echo_mode: args.echo_mode,
             conn_chunk_size: args.conn_chunk_size,
             pin_to_core,
             accept_mode: args.accept_mode,
@@ -744,24 +728,11 @@ fn run_ringline(cfg: EchoCfg) {
     use ringline::ParseResult;
     use ringline::{AsyncEventHandler, RinglineBuilder};
 
-    // Direct-echo path (default): no task wakeup per message — echo SQEs are
-    // submitted directly from handle_recv_multi, bypassing collect_wakeups and
-    // poll_ready_tasks entirely. Falls back to the forward_recv_buf loop on the
-    // mio backend (macOS / non-io_uring builds).
+    // `direct` (default): copy the received bytes into a send.
     struct EchoHandler;
     impl AsyncEventHandler for EchoHandler {
         fn on_accept(&self, conn: Connection) -> impl std::future::Future<Output = ()> + 'static {
-            async move {
-                #[cfg(has_io_uring)]
-                {
-                    // No `return` needed: the fallback below is cfg'd out
-                    // whenever this arm is compiled in. (Never linted before
-                    // #402, because this block was dead on every platform.)
-                    conn.as_conn().run_direct_echo().await;
-                }
-                #[cfg(not(has_io_uring))]
-                forward_echo_loop(conn).await;
-            }
+            async move { copy_echo_loop(conn).await }
         }
         fn create_for_worker(_id: usize) -> Self {
             EchoHandler
@@ -773,8 +744,31 @@ fn run_ringline(cfg: EchoCfg) {
     /// justify threading a field through every one of them.
     static PARK_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+    /// `with_data` + `send_nowait`: the bytes are copied into a send.
+    async fn copy_echo_loop(conn: Connection) {
+        let (mut tx, mut rx) = conn.split();
+        loop {
+            let n = rx
+                .with_data(|data| {
+                    burn_for(data.len());
+                    if let Err(e) = tx.send_nowait(data) {
+                        eprintln!("echo: send_nowait failed: {e}");
+                        return ParseResult::NeedMore;
+                    }
+                    ParseResult::Consumed(data.len())
+                })
+                .await;
+            if n == 0 {
+                break;
+            }
+            if PARK_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+                tx.offer_for_park(None);
+            }
+        }
+    }
+
     /// `with_data` + `forward_recv_buf` — what a protocol server's read loop
-    /// looks like, and the only mode available on the mio backend.
+    /// looks like.
     async fn forward_echo_loop(conn: Connection) {
         // The send happens inside the recv closure, so the two halves have to
         // be separately borrowable.
@@ -814,33 +808,6 @@ fn run_ringline(cfg: EchoCfg) {
         }
     }
 
-    // Multi-buffer zero-copy recv-forward path: hold provided recv buffers and
-    // scatter-gather them back in one sendmsg — no accumulator copy at all.
-    struct RecvForwardEchoHandler;
-    impl AsyncEventHandler for RecvForwardEchoHandler {
-        fn on_accept(
-            &self,
-            mut conn: Connection,
-        ) -> impl std::future::Future<Output = ()> + 'static {
-            async move {
-                conn.enable_recv_forward();
-                loop {
-                    conn.recv_ready().await;
-                    let n = match conn.forward_held() {
-                        Ok(f) => f.await.unwrap_or(0),
-                        Err(_) => break,
-                    };
-                    if n == 0 {
-                        break;
-                    }
-                }
-            }
-        }
-        fn create_for_worker(_id: usize) -> Self {
-            RecvForwardEchoHandler
-        }
-    }
-
     let recv_buf = if recv_buffer_bytes > 0 {
         recv_buffer_bytes
     } else {
@@ -854,22 +821,6 @@ fn run_ringline(cfg: EchoCfg) {
         std::sync::atomic::Ordering::Relaxed,
     );
     SERVICE_MSG_SIZE.store(msg_size as u64, std::sync::atomic::Ordering::Relaxed);
-    // `direct` submits the echo from inside the CQE handler and never reaches a
-    // `with_data` closure, so simulated work would be silently ignored there --
-    // an arm that looks like "application work costs nothing", which is the most
-    // misleading result this knob could produce. Refuse instead.
-    if service_time_us > 0 && echo_mode != EchoMode::Forward {
-        eprintln!(
-            "bench-server: --service-time-us needs --echo-mode forward; `{}` never \
-             enters a with_data closure, so the work would be silently skipped",
-            match echo_mode {
-                EchoMode::Direct => "direct",
-                EchoMode::RecvForward => "recv-forward",
-                EchoMode::Forward => "forward",
-            }
-        );
-        std::process::exit(2);
-    }
 
     let staged = ConfigBuilder::new()
         .workers(workers)
@@ -893,19 +844,6 @@ fn run_ringline(cfg: EchoCfg) {
         Some(n) => staged.iowq_max_workers(n),
         None => staged,
     };
-    // `direct` echoes the bytes as they arrived, straight from the CQE
-    // handler. Under TLS those bytes are ciphertext, so the server would
-    // reflect the client's own ciphertext instead of re-encrypting plaintext —
-    // every handshake fails and the arm reports 0 conns/sec, which reads as a
-    // tie rather than as a broken run. Refuse the combination instead.
-    if tls && echo_mode == EchoMode::Direct {
-        eprintln!(
-            "bench-server: --tls needs --echo-mode forward; `direct` submits the \
-             echo from the CQE handler and would send ciphertext back unencrypted"
-        );
-        std::process::exit(2);
-    }
-
     let staged = if tls {
         staged.tls(ringline::TlsConfig::new(self_signed_server_config()))
     } else {
@@ -915,7 +853,6 @@ fn run_ringline(cfg: EchoCfg) {
 
     let builder = RinglineBuilder::new(config).bind(addr);
     let (shutdown, handles) = match echo_mode {
-        EchoMode::RecvForward => builder.launch::<RecvForwardEchoHandler>(),
         EchoMode::Forward => builder.launch::<ForwardEchoHandler>(),
         EchoMode::Direct => builder.launch::<EchoHandler>(),
     }
@@ -965,18 +902,9 @@ fn run_ringline(cfg: EchoCfg) {
     let mode = match echo_mode {
         EchoMode::Direct => "direct",
         EchoMode::Forward => "forward",
-        EchoMode::RecvForward => "recv-forward",
-    };
-    // Say which path is live: on a non-io_uring build `direct` silently means
-    // the forward loop, and a run that reported the wrong path is how #397
-    // ended up with the wrong root cause.
-    let effective = if cfg!(has_io_uring) {
-        mode
-    } else {
-        "forward (no io_uring)"
     };
     eprintln!(
-        "bench-server: ready (backend={RINGLINE_BACKEND}, echo_mode={mode}, effective={effective}, service_time={service_time_us}us/req, recv_buffer={recv_ring_size}x{recv_buf} = {} MiB/worker)",
+        "bench-server: ready (backend={RINGLINE_BACKEND}, echo_mode={mode}, service_time={service_time_us}us/req, recv_buffer={recv_ring_size}x{recv_buf} = {} MiB/worker)",
         (recv_ring_size as u64 * recv_buf as u64) / (1024 * 1024)
     );
 

@@ -50,8 +50,9 @@ On io_uring a connection receives in one of two domains
     The TLS branch of `handle_recv_multi` does not call `throttle_if_held`.
   - `at_hold_cap` has two terms. The segment term is true when the hold plus
     the buffers a `forward_to` write pins reaches `forward_hold_cap` entries
-    with a lend cap, or `quarter_ring_cap` without one. The forward term is
-    true when `recv_hold` plus `send_held_recv` reaches `quarter_ring_cap`.
+    with a lend cap, or `quarter_ring_cap` without one. The send term is
+    true when `send_held_recv`, the lent buffers held by the connection's
+    `forward_recv_buf` sends, reaches `quarter_ring_cap`.
     `quarter_ring_cap` is `min(forward_hold_cap, max(ring entries / 4, 1))`.
   - `close_connection` leaves the hold, so a reader woken by a FIN can still
     parse it; `handle_close` (teardown) releases what is still held.
@@ -141,11 +142,7 @@ Each call's first poll enters the segmented domain through
 and `exclusive` false (true would set `segment_reader_live`, and every later
 call would return `EBUSY`). It maps the refusals: a stale handle (`EPIPE`
 there) resolves to `Ok(0)`, and a running forward or a live `SegmentReader`
-to `Err(EBUSY)`. A call first polled after `enable_recv_forward` was called
-on the connection also gets `Err(EBUSY)`, until the connection starts
-closing. On a plaintext connection in the default domain, received bytes go
-to `recv_hold`, the hold `forward_held` sends from, and this reader does not
-read that hold, so entering would present later bytes ahead of them.
+to `Err(EBUSY)`.
 
 On io_uring the parser runs under `ReaderCallback::enter`, as the callbacks
 of `with_data`, `with_bytes`, `with_segments` and `try_with_data` do, so
@@ -224,18 +221,17 @@ mio path follows the io_uring reader:
   leave, so it has no `segment_epoch`.
 
 A client crate calls one method on both backends and gets the same errors,
-except that io_uring refuses a call once `enable_recv_forward` has been
-called; on mio `enable_recv_forward` does nothing.
+except on an io_uring connection that receives directly, where the call
+returns `Unsupported` (`docs/recv-direct-design.md`).
 
 The connection stays in the segmented domain after the future resolves;
 `end_segments` returns it to the default domain. On mio `end_segments`
 returns `Ok(())`, for a stale handle too, so a caller leaves the domain with
-one call on both backends. Until
-`end_segments` runs, on io_uring, `with_data`, `with_bytes`, `recv_ready`,
-`ConnStream` and recv sinks never see bytes that arrive, because those bytes
-go to `segment_hold`; a caller that switches readers calls `end_segments`
-first. No client crate reads with segments (decision 12 in
-`docs/recv-direct-design.md`).
+one call on both backends. Until `end_segments` runs, on io_uring,
+`with_data`, `with_bytes`, `recv_ready` and `ConnStream` never see bytes that
+arrive, because those bytes go to `segment_hold`; a caller that switches
+readers calls `end_segments` first. No client crate reads with segments
+(decision 12 in `docs/recv-direct-design.md`).
 
 ## After the callback
 
@@ -314,11 +310,12 @@ only for `Ok(k)` with `k > 0`. `Err(EBUSY)`, end of stream and a close at
 `recv_accumulator_max` leave `Connection::recv_arrival` at `None`; a stale
 handle does not touch the log.
 
-`recv_buffered` counts the accumulator, `pending_recv_bufs`,
-`segment_hold` and `recv_hold`. Entering the domain, converting a lend to a
-`Pinned` entry and the hold-cap copy move bytes among the first three
-without changing the sum, so the range a call reports is the `k` bytes its
-`Consumed(k)` removed. A view the parser keeps holds consumed bytes, which
+`recv_buffered` counts the accumulator, `recv_direct_held`,
+`pending_recv_bufs` and `segment_hold`. Entering the domain, converting a
+lend to a `Pinned` entry and the hold-cap copy move bytes among the
+accumulator, `pending_recv_bufs` and `segment_hold` without changing the
+sum, so the range a call reports is the `k` bytes its `Consumed(k)`
+removed. A view the parser keeps holds consumed bytes, which
 are not in `recv_buffered` and do not delay the arrival log's trim.
 
 ## Views
@@ -506,7 +503,6 @@ storage:
 - a copy into an `Owned` entry (a refused lend, a fallback receive
   completion, a lend copied by `arm_forward_source`, a TLS plaintext chunk),
   except the accumulator moved in on entry;
-- a copy into a `recv_hold` entry's owned buffer (`own_recv_copy`);
 - TLS plaintext the unbuffered engine stashes when the send path decrypts
   it;
 - `copy_small_view`.

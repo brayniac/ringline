@@ -69,15 +69,12 @@ The record sites:
 
 - io_uring `handle_recv_multi`, in the non-TLS arm, once per completion that
   passes the stale-slot check. The record runs before the branch on receive
-  domain and mode: segment hold, recv-forward hold, direct echo, recv sink,
-  lend, or accumulator. Direct echo and recv-forward bytes are recorded too,
-  because `recv_hold` counts as buffered until they are sent.
+  domain and mode: segment hold, lend, or accumulator.
 - io_uring `handle_recv_fallback`, before the segmented or accumulator
   append. `fallback_eligible` excludes TLS connections, so the fallback has
   no TLS arm.
 - mio `handle_readable`, once per `read` that returns bytes on a non-TLS
-  connection, before the bytes go to a forward, a recv sink or the
-  accumulator.
+  connection, before the bytes go to a forward or the accumulator.
 - TLS on both backends, around the feed of one ciphertext completion or read
   (`feed_tls_recv`, `feed_tls_recv_mio`). Step 1 runs before the feed. Step 2
   runs immediately after the feed and adds the growth of `buffered`, which is
@@ -103,10 +100,10 @@ which also replace the deque with an empty, unallocated one. Mio
 
 ## Which bytes a reader consumed
 
-Bytes leave a connection through readers, forwards, recv sinks, direct echo,
-`ConnStream` and close. `ConnStream`'s `AsyncBufRead::consume` happens outside
-the driver. Instead of counting consumption at each of these, the reader derives
-the first unread offset from what the connection still holds:
+Bytes leave a connection through readers, forwards, `ConnStream` and close.
+`ConnStream`'s `AsyncBufRead::consume` happens outside the driver. Instead of
+counting consumption at each of these, the reader derives the first unread
+offset from what the connection still holds:
 
 ```text
 unread = delivered - buffered(conn)
@@ -114,8 +111,9 @@ unread = delivered - buffered(conn)
 
 `buffered(conn)` is the bytes the connection holds that no consumer has taken:
 
-- io_uring: the accumulator, the lent buffer in `pending_recv_bufs`,
-  `segment_hold` and `recv_hold`;
+- io_uring: the accumulator, the buffer a direct receive holds
+  (`recv_direct_held`), the lent buffer in `pending_recv_bufs` and
+  `segment_hold`;
 - mio: the accumulator.
 
 The accumulator term uses a new `AccumulatorTable::len`, which does not merge
@@ -185,9 +183,8 @@ wrong times without it.
 
 The reporting readers are the public readers on `Connection` and `RecvHalf`:
 `with_data`, `with_data_result`, `with_bytes`, `with_bytes_segments`,
-`try_with_data`, and, on io_uring, `with_segments`. Forwards, recv sinks,
-direct echo, `ConnStream`, `SegmentReader::next` and `recv_owned_segment` do
-not set `latest`.
+`try_with_data`, and, on io_uring, `with_segments`. Forwards, `ConnStream`,
+`SegmentReader::next` and `recv_owned_segment` do not set `latest`.
 
 ### Bounding the log
 
@@ -407,18 +404,10 @@ It is not part of this design.
 
 ## Limits
 
-- `set_recv_sink`, called while older bytes are buffered, makes the sink
-  receive newer bytes before the buffered ones (`handle_recv_multi`, mio
-  `handle_readable`). The held bytes are then not contiguous with
-  `delivered`, and lookups for them return later entries' times.
-- `enable_recv_forward` leaves bytes already in the accumulator behind while
-  new arrivals go to `recv_hold`; the same applies.
 - Under `tls-unbuffered`, plaintext stashed by a flush with no sink
   (`flush_tls_output` on io_uring, `flush_tls_output_mio_queued` on mio) is
   recorded at the next feed. These flushes run during the handshake.
 - Bytes taken by `ConnStream::poll_fill_buf` count as consumed when taken.
-- A reader callback that closes a recv-forward connection drains `recv_hold`
-  (`close_connection`), so `k` includes the drained bytes.
 
 ## Dependencies
 
@@ -437,8 +426,7 @@ It is not part of this design.
 - Per TLS feed: two `buffered` sums.
 - Per poll of a reporting reader: one `buffered` sum, and on the resolving
   poll a second, and pops from the front of the log, one per entry dropped.
-  `buffered` is a few lengths plus the entries of `segment_hold` and
-  `recv_hold`.
+  `buffered` is a few lengths plus the entries of `segment_hold`.
 - Memory, fixed: about 96 bytes per connection slot (the deque header, four
   `u64`s and `latest`).
 - Allocation: the deque allocates at a connection's first record (capacity
@@ -450,8 +438,8 @@ It is not part of this design.
 - Memory, per worker: about 1.5 MB at the default `max_connections` of
   16,000.
 - Cache: per connection, the log (two lines: at a 96-byte stride every slot
-  spans two), the front of its deque, and the `segment_hold` and `recv_hold`
-  headers that `recv_buffered` reads are touched per record and per read.
+  spans two), the front of its deque, and the `segment_hold` header that
+  `recv_buffered` reads are touched per record and per read.
 - Memory, worst case: a connection whose peer sends more than 1024 small
   segments while its parser returns `NeedMore` holds a 24 KiB log, six times
   the accumulator's default initial capacity of 4 KiB.
@@ -553,17 +541,15 @@ below or, for a test that names none, removing the record or trim it covers.
   then records continue until the log reaches 1024 entries. That record trims
   the log to one entry, so no merge happens. Mutation: drop the `min`; the
   log then merges at 1024 and never trims.
-- The offset stays correct after `forward_to` (with overshoot), a recv sink
-  installed with nothing buffered, and a consumer that does not report
-  (`accumulators.consume`, standing in for `ConnStream`).
+- The offset stays correct after `forward_to` (with overshoot) and a
+  consumer that does not report (`accumulators.consume`, standing in for
+  `ConnStream`).
 - A parser that returns more than it was shown, through `with_bytes` and the
   lent-buffer path.
 - Completions recorded while a `RecvSegment` is live, followed by the segment
   reader dropping, leave the next `with_data`'s `first` at the time of the
   first byte after the segments handed out.
 - TLS on both backends, segmented reads, the fallback recv path, and mio.
-- A batch whose records consume and refill the log in one batch extends or
-  pushes correctly (a recv sink, then a lend).
 - 1025 unread batches merge entries, count the merge, and leave 1024 entries.
 - A read whose range starts below `base` or ends past `delivered`, or that
   reads an empty log, counts `CLAMPED` once. Mutation: count once per

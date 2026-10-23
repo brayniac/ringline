@@ -278,24 +278,8 @@ impl Driver {
         true
     }
 
-    /// Whether `conn_index` arms a one-shot recv rather than a multishot one:
-    /// every TCP connection unless `Config::recv_multishot` is set, and
-    /// always a direct-echo or recv-forward connection, whose completions
-    /// stay held after the completion handler returns. A multishot recv
-    /// takes every buffer the socket's queued data fills before the
-    /// throttle's cancel lands; a one-shot recv takes one per arm, and the
-    /// throttle skips the re-arm at the hold cap (#638).
-    pub(crate) fn recv_single(&self, conn_index: u32) -> bool {
-        !self.recv_multishot
-            || self.recv_forward[conn_index as usize]
-            || self
-                .connections
-                .get(conn_index)
-                .is_some_and(|c| c.direct_echo)
-    }
-
-    /// Arm a TCP recv on `conn_index`: one-shot when `recv_single`,
-    /// multishot otherwise. Both carry the `RecvMulti` user_data.
+    /// Arm a TCP recv on `conn_index`: one-shot unless
+    /// `Config::recv_multishot` is set, multishot otherwise. Both carry the `RecvMulti` user_data.
     pub(crate) fn submit_tcp_recv(&mut self, conn_index: u32, generation: u32) -> io::Result<()> {
         // A direct connection never takes a provided buffer; its receive is
         // armed by the parked receive future (`arm_direct_recv_or_close`).
@@ -306,35 +290,11 @@ impl Driver {
         {
             return Ok(());
         }
-        if self.recv_single(conn_index) {
+        if !self.recv_multishot {
             self.ring.submit_single_recv(conn_index, generation)
         } else {
             self.ring.submit_multishot_recv(conn_index, generation)
         }
-    }
-
-    /// Cancel `conn_index`'s armed recv after it enters a mode that arms a
-    /// one-shot recv (`recv_single`), so the multishot armed before stops
-    /// taking buffers. Its `-ECANCELED` completion re-arms the recv
-    /// (`rearm_multishot_if_idle`), which `submit_tcp_recv` makes one-shot.
-    pub(crate) fn cancel_recv_for_single(&mut self, conn_index: u32) {
-        // Without `recv_multishot` the armed recv is already one-shot.
-        if !self.recv_multishot {
-            return;
-        }
-        let armed = self
-            .connections
-            .get(conn_index)
-            .is_some_and(|c| c.recv_multishot_armed && matches!(c.recv_arm, RecvArm::Multi));
-        if !armed {
-            return;
-        }
-        let ud = crate::completion::UserData::encode(
-            crate::completion::OpTag::RecvMulti,
-            conn_index,
-            self.connections.generation(conn_index),
-        );
-        let _ = self.ring.submit_async_cancel(ud.raw(), conn_index);
     }
 
     /// `forward_hold_cap`, but at most a quarter of the TCP ring's buffers.
@@ -366,88 +326,15 @@ impl Driver {
         *held = held.saturating_sub(n);
     }
 
-    /// Whether `bid` names an owned copy (`owned_recv`) rather than a
-    /// provided-ring buffer.
-    pub(crate) fn is_owned_recv(&self, bid: u16) -> bool {
-        u32::from(bid) >= self.provided_bufs.ring_entries()
-    }
-
-    /// Copy `data` into an owned buffer for a `recv_hold` entry, and return
-    /// the entry's bid and the copy's address. At most `ring_entries()`
-    /// copies exist, each at most one completion, so owned copies hold at
-    /// most one more ring's worth of bytes. `None` when all are in use; the
-    /// caller then lends the provided buffer, so a peer that sends without
-    /// reading drains the ring and meets `ENOBUFS` backpressure.
-    pub(crate) fn own_recv_copy(&mut self, data: &[u8]) -> Option<(u16, *const u8)> {
-        let first = self.provided_bufs.ring_entries() as usize;
-        let index = match self.owned_recv_free.pop() {
-            Some(i) => i as usize,
-            None if self.owned_recv.len() < first
-                && first + self.owned_recv.len() < u16::MAX as usize =>
-            {
-                self.owned_recv.push(None);
-                self.owned_recv.len() - 1
-            }
-            None => return None,
-        };
-        let copy: Box<[u8]> = data.into();
-        crate::accumulator::note_copied(copy.len());
-        let ptr = copy.as_ptr();
-        self.owned_recv[index] = Some(copy);
-        Some(((first + index) as u16, ptr))
-    }
-
-    /// Release every queued bid: owned copies are freed, and provided-ring
-    /// buffers released through `ProvidedBufRing::release_batch`.
+    /// Release every queued bid through `ProvidedBufRing::release_batch`.
     ///
     /// # Panics
-    /// If an owned copy is released twice, or a ring buffer has no hold.
+    /// If a ring buffer has no hold.
     pub(crate) fn release_pending(&mut self) {
         let mut bids = std::mem::take(&mut self.pending_replenish);
-        let ring = self.provided_bufs.ring_entries();
-        if bids.iter().any(|&b| u32::from(b) >= ring) {
-            bids.retain(|&b| {
-                if u32::from(b) < ring {
-                    return true;
-                }
-                let index = b as usize - ring as usize;
-                self.owned_recv[index]
-                    .take()
-                    .unwrap_or_else(|| panic!("owned receive copy {b} released twice"));
-                self.owned_recv_free.push(index as u16);
-                false
-            });
-        }
         self.provided_bufs.release_batch(&bids);
         bids.clear();
         self.pending_replenish = bids;
-    }
-
-    /// Length of the memory a `recv_hold` entry's bid names: an owned copy's
-    /// length, or a provided buffer's size.
-    fn recv_data_len(&self, bid: u16) -> usize {
-        if self.is_owned_recv(bid) {
-            let index = bid as usize - self.provided_bufs.ring_entries() as usize;
-            self.owned_recv[index].as_ref().map_or(0, |c| c.len())
-        } else {
-            self.provided_bufs.buffer_size() as usize
-        }
-    }
-
-    /// Address of byte `off` of the data a `recv_hold` entry's bid names: a
-    /// provided-ring buffer or an owned copy.
-    pub(crate) fn recv_data_ptr(&self, bid: u16, off: u32) -> *const u8 {
-        if self.is_owned_recv(bid) {
-            let index = bid as usize - self.provided_bufs.ring_entries() as usize;
-            let copy = self.owned_recv[index]
-                .as_ref()
-                .expect("a live recv_hold entry's owned copy");
-            debug_assert!(off as usize <= copy.len());
-            // Safety: `off` is within the copy.
-            unsafe { copy.as_ptr().add(off as usize) }
-        } else {
-            self.provided_bufs.data_ptr(bid, off)
-        }
     }
 }
 
@@ -523,11 +410,11 @@ const MAX_FORWARD_IOV: usize = 16;
 ///
 /// This used to live in `ForwardToFuture`, which is why every completed write
 /// had to wake the task just so the future could pop the next held buffer and
-/// submit it. Holding it here lets the completion handler do that itself —
-/// `run_direct_echo` has always worked this way, and the mio backend's
-/// `MioForwardState` has held the equivalent since #415. Measured motivation:
-/// Mode A ran 1.26 instructions/byte against direct echo's 0.985 at the same
-/// 16 KiB buffer, over a ~0.86 kernel floor (#416).
+/// submit it. Holding it here lets the completion handler do that itself;
+/// the mio backend's `MioForwardState` holds the equivalent (#415). Measured
+/// motivation: Mode A ran 1.26 instructions/byte against 0.985 for an echo
+/// that submitted from the completion handler, at the same 16 KiB buffer,
+/// over a ~0.86 kernel floor (#416).
 #[derive(Clone, Copy)]
 pub(crate) struct ForwardProgress {
     /// Where the bytes go; a file sink writes at `forwarded` as its offset.
@@ -704,42 +591,21 @@ pub(crate) struct Driver {
     /// Stored here rather than in the CQE payload so that buffer sizes > u16::MAX are
     /// supported.
     pub(crate) send_recv_buf_remaining: Vec<u32>,
-    /// Per-connection multi-buffer zero-copy recv hold. When `recv_forward` is
-    /// set for a connection, incoming provided buffers are pushed here (bids NOT
-    /// replenished) instead of copied into the accumulator, then forwarded back
-    /// in one coalesced `sendmsg` via `forward_held`. Backpressure is natural:
-    /// unreplenished bids deplete the provided-buffer ring (ENOBUFS) until a
-    /// forward completes and replenishes them. Above the lend cap an entry is
-    /// an owned copy instead (`own_recv_copy`), at most `ring_entries()` of
-    /// them per worker; past that, entries hold ring buffers again.
-    /// `recv_hold` is also the staging area for direct-echo connections, which
-    /// gather it the same way from the CQE handler (see `flush_direct_echo`).
-    pub(crate) recv_hold: Vec<std::collections::VecDeque<PendingRecvBuf>>,
-    /// Per connection, the received buffers (ring buffers or owned copies)
-    /// held by its queued or in-flight sends: a direct-echo gather or single
-    /// send, a `forward_held` send, or a `forward_recv_buf` send of a lent
-    /// receive buffer (`SendRecvBuf`).
-    /// Raised when an entry leaves `recv_hold` or `pending_recv_bufs` for a
+    /// Per connection, the received ring buffers held by its queued or
+    /// in-flight `forward_recv_buf` sends of a lent receive buffer
+    /// (`SendRecvBuf`).
+    /// Raised when a buffer leaves `pending_recv_bufs` for a
     /// send, lowered when the send releases its bids (`release_send_held`,
     /// or `release_queued_sends` for a queued `SendRecvBuf`). The receive
     /// throttle counts it (`at_hold_cap`): against a peer that does not read,
     /// the send never completes and keeps these buffers held (#638).
     pub(crate) send_held_recv: Vec<u32>,
-    /// Per-connection opt-in flag for the zero-copy recv-forward path.
-    pub(crate) recv_forward: Vec<bool>,
     /// Bytes already detached from the accumulator by a zero-copy
     /// `forward_recv_buf` during the current `with_data` / `with_bytes`
     /// closure. The delivery future subtracts this from what the closure
     /// reports consuming, because the forward already removed those bytes
     /// (see `ConnCtx::forward_recv_buf`).
     pub(crate) forward_zc_consumed: Vec<u32>,
-    /// Direct-echo connections with buffers waiting in `recv_hold`. Entries
-    /// persist until the hold drains, so the end-of-drain flush pass never has
-    /// to ask which completion handler should have re-armed it.
-    pub(crate) direct_echo_pending: Vec<u32>,
-    /// Membership test for `direct_echo_pending` (one bool per connection),
-    /// so a burst of recv CQEs on one connection enqueues it once.
-    pub(crate) direct_echo_queued: Vec<bool>,
     /// Per-connection recv delivery domain (segmented-recv). `CopyOrConsume`
     /// (default) uses the accumulator / single-buffer zero-copy path;
     /// `Segmented` holds arriving provided buffers in `segment_hold` instead.
@@ -1070,14 +936,6 @@ pub(crate) struct Driver {
     /// while `held()` is at or below it; above it, each lend path copies
     /// instead. `None` leaves lends uncapped, as without `recv_incremental`.
     pub(crate) lend_cap: Option<u32>,
-    /// Owned copies standing in `recv_hold` entries (recv-forward, direct
-    /// echo) for completions the lend cap refused. An entry's bid is
-    /// `ring_entries() + index`, above every provided-ring bid, so the
-    /// existing release paths push it to `pending_replenish` unchanged and
-    /// `release_pending` frees it here instead of releasing a ring buffer.
-    /// `None` is a free index (`owned_recv_free`).
-    pub(crate) owned_recv: Vec<Option<Box<[u8]>>>,
-    pub(crate) owned_recv_free: Vec<u16>,
     /// Lifetime count of fallback recv submissions on this worker
     /// (reported in the shutdown diag line).
     pub(crate) recv_fallback_count: u64,
@@ -1131,9 +989,6 @@ pub(crate) struct Driver {
     /// partial remainder, or a drain `send` that could not be pushed) found the
     /// SQ full.
     pub(crate) pending_coalesced_retries: Vec<(u32, u32, u16, u8)>,
-    /// Pending recv-forward send resubmissions that failed (SQ full):
-    /// (conn_index, generation, slab_idx, retries). Drained each tick.
-    pub(crate) pending_recv_forward_retries: Vec<(u32, u32, u16, u8)>,
     /// Pending close retries: (conn_index, retries). Drained each tick.
     pub(crate) pending_close_retries: Vec<(u32, u8)>,
     /// Connections whose queued head send could not be pushed (SQ still
@@ -1194,7 +1049,6 @@ pub(crate) struct Driver {
     pub(crate) copy_retry_scratch: Vec<(u32, u32, u16, u8, OpTag)>,
     pub(crate) send_pollout_retry_scratch: Vec<(u32, u32, u16, u8, bool)>,
     pub(crate) coalesced_retry_scratch: Vec<(u32, u32, u16, u8)>,
-    pub(crate) recv_forward_retry_scratch: Vec<(u32, u32, u16, u8)>,
     pub(crate) send_retry_scratch: Vec<(u32, u32, u8)>,
     /// Per-worker UDP socket state.
     pub(crate) udp_sockets: Vec<UdpSocketState>,
@@ -1300,8 +1154,6 @@ pub(crate) enum ParkBlocker {
     SegmentReader,
     /// A fallback recv is in flight against this worker's send pool.
     RecvFallback,
-    /// A direct-echo response is queued for this worker's next flush.
-    DirectEcho,
     /// The connection receives directly into its accumulator. Its receive
     /// buffer is in this worker's `direct_recvs` while a receive is armed,
     /// and carrying it is not implemented.
@@ -1331,7 +1183,6 @@ impl ParkBlocker {
             ParkBlocker::Chain => pa::CHAIN,
             ParkBlocker::SegmentReader => pa::SEGMENT_READER,
             ParkBlocker::RecvFallback => pa::RECV_FALLBACK,
-            ParkBlocker::DirectEcho => pa::DIRECT_ECHO,
             ParkBlocker::DirectReceive => pa::DIRECT_RECEIVE,
         }
     }
@@ -1361,7 +1212,6 @@ mod park_blocker_tests {
             ParkBlocker::Chain,
             ParkBlocker::SegmentReader,
             ParkBlocker::RecvFallback,
-            ParkBlocker::DirectEcho,
             ParkBlocker::DirectReceive,
         ];
         let mut seen = std::collections::HashMap::new();
@@ -1571,14 +1421,8 @@ impl Driver {
             send_recv_buf_original_lens: vec![0; config.max_connections as usize],
             send_recv_buf_offs: vec![0; config.max_connections as usize],
             send_recv_buf_remaining: vec![0; config.max_connections as usize],
-            recv_hold: (0..config.max_connections)
-                .map(|_| std::collections::VecDeque::new())
-                .collect(),
             send_held_recv: vec![0; config.max_connections as usize],
-            recv_forward: vec![false; config.max_connections as usize],
             forward_zc_consumed: vec![0; config.max_connections as usize],
-            direct_echo_pending: Vec::new(),
-            direct_echo_queued: vec![false; config.max_connections as usize],
             recv_domain: vec![
                 crate::recv::domain::RecvDomain::default();
                 config.max_connections as usize
@@ -1672,8 +1516,6 @@ impl Driver {
                 recv_buffer_size.saturating_mul(4).max(1 << 20)
             },
             lend_cap: config.recv_incremental.then_some(recv_ring_size as u32 / 2),
-            owned_recv: Vec::new(),
-            owned_recv_free: Vec::new(),
             recv_fallback_count: 0,
             direct_recvs: Vec::new(),
             direct_recv_free: Vec::new(),
@@ -1697,7 +1539,6 @@ impl Driver {
             pending_copy_retries: Vec::new(),
             pending_send_pollout_retries: Vec::new(),
             pending_coalesced_retries: Vec::new(),
-            pending_recv_forward_retries: Vec::new(),
             pending_close_retries: Vec::new(),
             pending_send_retries: Vec::new(),
             settled_sends: VecDeque::new(),
@@ -1707,7 +1548,6 @@ impl Driver {
             copy_retry_scratch: Vec::new(),
             send_pollout_retry_scratch: Vec::new(),
             coalesced_retry_scratch: Vec::new(),
-            recv_forward_retry_scratch: Vec::new(),
             send_retry_scratch: Vec::new(),
             udp_sockets,
             nvme_devices: config
@@ -2018,10 +1858,8 @@ impl Driver {
         }
 
         // Gather a batch: as many held buffers as the remaining length and the
-        // iovec cap allow, written as one `sendmsg`/`writev`. This is the whole
-        // point — `run_direct_echo` has always coalesced a drain's worth into a
-        // single send (#397), and doing one completion per buffer is what left
-        // Mode A at 1.24 instructions/byte against direct echo's 0.985.
+        // iovec cap allow, written as one `sendmsg`/`writev`. One completion
+        // per buffer is what left Mode A at 1.24 instructions/byte (#397).
         let mut remaining = progress.len - progress.forwarded;
         let mut backings: Vec<HeldRecvBuf> = Vec::new();
         let mut lens: Vec<u32> = Vec::new();
@@ -2373,19 +2211,7 @@ impl Driver {
         } else {
             return;
         }
-        // Release every held (not-yet-forwarded) entry, ring buffer or owned
-        // copy, so its bid is not leaked, and clear the opt-in flag for slot
-        // reuse. An
-        // in-flight forward's bids live in its slab entry (already drained from
-        // recv_hold) and are replenished by its own completion handler.
-        // Direct-echo connections stage in the same hold, so this drains
-        // unconditionally rather than only under the recv-forward flag; the
-        // flush pass drops the queue entry once it sees an empty hold.
-        for pending in self.recv_hold[conn_index as usize].drain(..) {
-            self.pending_replenish.push(pending.bid);
-        }
         self.forward_zc_consumed[conn_index as usize] = 0;
-        self.recv_forward[conn_index as usize] = false;
         // Release handler state here rather than waiting for the slot to be
         // reused: a `ParkState` is an arbitrary user value, and a slot that is
         // never reused would hold it for the life of the process.
@@ -2525,7 +2351,7 @@ impl Driver {
     }
 
     /// Drain the accumulator and the receive holds (`segment_pinned`,
-    /// `segment_hold`, `recv_hold`) into owned bytes, in wire order,
+    /// `segment_hold`) into owned bytes, in wire order,
     /// releasing each held bid back to the ring (tier 3, #443).
     ///
     /// **Normally returns nothing, and that is the intended state.**
@@ -2547,14 +2373,9 @@ impl Driver {
     /// **Order is the correctness property.** The accumulator holds bytes that
     /// arrived before anything still held, and `segment_pinned` was popped
     /// from the front of `segment_hold`, so the sequence is: accumulator,
-    /// pinned, held, then the Mode A hold. Getting this wrong reorders the
+    /// pinned, then held. Getting this wrong reorders the
     /// peer's byte stream, which no test of "did the bytes arrive" would
     /// catch.
-    ///
-    /// `segment_hold` and `recv_hold` belong to different `RecvDomain`s, so at
-    /// most one is ever non-empty. Both are drained regardless: it costs a
-    /// pair of empty pops and leaves no dependence on which domain the
-    /// connection happened to be in.
     ///
     /// Follows the copy-before-replenish discipline of the segment reader
     /// (`runtime/io.rs`): the bid goes back to the ring only after its bytes
@@ -2587,18 +2408,11 @@ impl Driver {
             }
         }
 
-        let forward: Vec<PendingRecvBuf> = self.recv_hold[idx].drain(..).collect();
-        for pending in forward {
-            if let Some(b) = self.copy_out_bid(pending.bid, pending.ptr, pending.len) {
-                out.push(b);
-            }
-        }
-
         out
     }
 
-    /// Copy `len` bytes from `ptr`, the data of the buffer `bid` names (a
-    /// ring buffer or an owned copy), then release the bid. `None` for an empty buffer, which carries no bytes and would
+    /// Copy `len` bytes from `ptr`, the data of the ring buffer `bid`, then
+    /// release the bid. `None` for an empty buffer, which carries no bytes and would
     /// only add an empty chunk to the stream.
     ///
     /// Copy first, replenish second, nothing in between — a bid handed back
@@ -2620,8 +2434,8 @@ impl Driver {
 
     /// Bytes the connection holds that no consumer has taken: the
     /// accumulator, the bytes in the buffer a direct receive holds
-    /// (`recv_direct_held`), a lent buffer in `pending_recv_bufs`,
-    /// `segment_hold` and `recv_hold`. A buffer in `segment_pinned` has been handed to a
+    /// (`recv_direct_held`), a lent buffer in `pending_recv_bufs` and
+    /// `segment_hold`. A buffer in `segment_pinned` has been handed to a
     /// `RecvSegment`, so its bytes are not counted.
     ///
     /// The arrival log takes the first unread stream offset as
@@ -2637,10 +2451,6 @@ impl Driver {
             + self.segment_hold[idx]
                 .iter()
                 .map(HeldRecvBuf::len)
-                .sum::<usize>()
-            + self.recv_hold[idx]
-                .iter()
-                .map(|p| p.len as usize)
                 .sum::<usize>()
     }
 
@@ -2748,7 +2558,7 @@ impl Driver {
     /// blocking it.
     ///
     /// Unread bytes block as `ParkBlocker::DataPending`: the accumulator, a
-    /// lent buffer in `pending_recv_bufs`, `segment_hold`, `recv_hold` and
+    /// lent buffer in `pending_recv_bufs`, `segment_hold` and
     /// `segment_pinned`.
     pub(crate) fn park_blocker(&self, conn_index: u32) -> Option<ParkBlocker> {
         let Some(conn) = self.connections.get(conn_index) else {
@@ -2830,12 +2640,6 @@ impl Driver {
         }
         if self.recv_fallback_inflight[conn_index as usize] {
             return Some(ParkBlocker::RecvFallback);
-        }
-        // `direct_echo_queued` is the per-connection membership bool;
-        // `direct_echo_pending` is the queue of connection indices it guards,
-        // so it is not indexed by `conn_index` (it starts empty).
-        if self.direct_echo_queued[conn_index as usize] {
-            return Some(ParkBlocker::DirectEcho);
         }
         None
     }
@@ -3133,8 +2937,8 @@ impl Driver {
             };
         }
         // Fire a deferred close now that nothing is in flight and the
-        // queue is empty. The ZC and recv-forward completion paths
-        // reach here without a note_send_finalized call, so without
+        // queue is empty. The ZC completion path
+        // reaches here without a note_send_finalized call, so without
         // this a close_pending connection would leak its fd and slot.
         self.try_finalize_close(conn_index);
         false
@@ -3151,134 +2955,6 @@ impl Driver {
     /// `pending_send_retries`; `drain_send_retries` re-pushes it. A parked
     /// `SendRecvBuf` keeps its provided buffer exactly as a queued one does —
     /// the bid is replenished by its completion, not by the caller.
-    /// Stage a direct-echo recv buffer for the next flush.
-    ///
-    /// The connection stays on `direct_echo_pending` until its hold drains, so
-    /// the flush pass never has to work out which completion handler owed it a
-    /// re-arm.
-    pub(crate) fn hold_direct_echo(&mut self, conn_index: u32, pending: PendingRecvBuf) {
-        let ci = conn_index as usize;
-        self.recv_hold[ci].push_back(pending);
-        if !self.direct_echo_queued[ci] {
-            self.direct_echo_queued[ci] = true;
-            self.direct_echo_pending.push(conn_index);
-        }
-    }
-
-    /// Submit the next direct-echo send for `conn_index`, gathering every
-    /// buffer currently held (up to `MAX_IOVECS`) into one operation.
-    ///
-    /// Direct echo used to submit one `Send` per recv completion. A message
-    /// larger than a single completion's worth of bytes therefore left as
-    /// several segments — the tail was already sitting in the send queue behind
-    /// the head, but as a separate, non-coalescable op. Gathering here makes
-    /// the reply's packetization follow the message rather than the arrival
-    /// pattern of the request (#397).
-    ///
-    /// A lone held buffer still takes the plain `Send` path: it needs neither a
-    /// slab entry nor an `msghdr`, and it is the common case for any message
-    /// that fits one completion.
-    pub(crate) fn flush_direct_echo(&mut self, conn_index: u32) {
-        use crate::buffer::send_slab::MAX_IOVECS;
-        let ci = conn_index as usize;
-
-        // `recv_hold` is shared with recv-forward, where draining the hold is
-        // the owning task's job. Only gather for a slot that is still in
-        // direct-echo mode.
-        if !self
-            .connections
-            .get(conn_index)
-            .is_some_and(|c| c.direct_echo)
-        {
-            return;
-        }
-
-        // One send in flight per connection; anything that arrives meanwhile
-        // accumulates in the hold and goes out in the next gather. A non-empty
-        // queue implies `in_flight`, but both are checked so this can never
-        // overtake a send that is already ordered ahead of it.
-        if self.send_queues[ci].in_flight || !self.send_queues[ci].queue.is_empty() {
-            return;
-        }
-        let n = self.recv_hold[ci].len().min(MAX_IOVECS);
-        if n == 0 {
-            return;
-        }
-
-        if n >= 2 {
-            let mut iovecs = [libc::iovec {
-                iov_base: std::ptr::null_mut(),
-                iov_len: 0,
-            }; MAX_IOVECS];
-            let mut bids = [0u16; MAX_IOVECS];
-            let mut total: u32 = 0;
-            for i in 0..n {
-                let p = self.recv_hold[ci][i];
-                iovecs[i] = libc::iovec {
-                    iov_base: p.ptr as *mut libc::c_void,
-                    iov_len: p.len as usize,
-                };
-                bids[i] = p.bid;
-                total += p.len;
-            }
-            let generation = self.connections.generation(conn_index);
-            if let Some((slab_idx, msg_ptr)) = self.send_slab.allocate_recv_forward(
-                conn_index,
-                generation,
-                &iovecs[..n],
-                &bids[..n],
-                total,
-            ) {
-                // The slab entry owns the buffers from here: its completion
-                // replenishes the bids whether the send succeeds, is retried,
-                // or is released on close.
-                for _ in 0..n {
-                    self.recv_hold[ci].pop_front();
-                }
-                self.send_held_recv[ci] += n as u32;
-                self.send_queues[ci].in_flight = true;
-                if self
-                    .ring
-                    .submit_send_recv_bufs_coalesced(conn_index, msg_ptr, slab_idx)
-                    .is_err()
-                {
-                    // SQ full: the same retry path the coalesced completion
-                    // handler uses. Nothing is dropped and no bid is leaked.
-                    self.pending_recv_forward_retries
-                        .push((conn_index, generation, slab_idx, 0));
-                }
-                return;
-            }
-            // Slab exhausted — fall through and send the head buffer alone
-            // rather than stalling the connection.
-        }
-
-        let pending = self.recv_hold[ci]
-            .pop_front()
-            .expect("hold is non-empty: n >= 1 was checked above");
-        self.send_held_recv[ci] += 1;
-        let ud = UserData::encode(OpTag::SendRecvBuf, conn_index, pending.bid as u32);
-        let entry = crate::backend::uring::sqe::Sqe::stream_send(
-            conn_index,
-            pending.ptr,
-            pending.len,
-            ud.raw(),
-        );
-        // Infallible: under SQ pressure the echo is parked at the queue head
-        // and retried, holding the buffer its bid names (a ring buffer or an
-        // owned copy) exactly as a queued echo
-        // does; the bid is replenished by its completion.
-        self.submit_or_queue_send(
-            conn_index,
-            crate::handler::BuiltSend {
-                entry,
-                pool_slot: u16::MAX,
-                slab_idx: u16::MAX,
-                total_len: pending.len,
-            },
-        );
-    }
-
     pub(crate) fn submit_or_queue_send(
         &mut self,
         conn_index: u32,
@@ -3334,10 +3010,10 @@ impl Driver {
             unreachable!("a SendRecvBuf is a plain send");
         };
         let bid = ud.payload() as u16;
-        let base = self.recv_data_ptr(bid, 0);
+        let base = self.provided_bufs.data_ptr(bid, 0);
         let off = (buf as usize).wrapping_sub(base as usize);
         debug_assert!(
-            buf >= base && off < self.recv_data_len(bid),
+            buf >= base && off < self.provided_bufs.buffer_size() as usize,
             "send outside its data"
         );
         self.send_recv_buf_offs[ci] = off as u32;
@@ -3394,9 +3070,9 @@ impl Driver {
     /// Release all entries from a send queue, returning the awaited sends
     /// they were carrying.
     ///
-    /// A queued `SendRecvBuf` entry (recv-buffer forward / direct echo) owns
-    /// neither a pool slot nor a slab entry; it owns the buffer whose bid is
-    /// the SQE's payload (a ring buffer or an owned copy). No CQE will ever replenish it, so the
+    /// A queued `SendRecvBuf` entry (`forward_recv_buf`) owns
+    /// neither a pool slot nor a slab entry; it owns the ring buffer whose bid
+    /// is the SQE's payload. No CQE will ever replenish it, so the
     /// bid is recovered from the entry's user_data here, exactly as the
     /// completion handler would have done.
     ///
@@ -3893,25 +3569,6 @@ impl Driver {
         self.send_slab.release(slab_idx);
     }
 
-    /// At shutdown, release a recv-forward send's slab entry. Its bids go to
-    /// `pending_replenish`, as in the normal handler; nothing replenishes
-    /// them, since the buffer ring is unregistered when the worker exits.
-    fn release_recv_forward_at_shutdown(&mut self, slab_idx: u16) {
-        if !self.send_slab.in_use(slab_idx) {
-            return;
-        }
-        let mut bids = [u16::MAX; crate::buffer::send_slab::MAX_IOVECS];
-        let mut n = 0;
-        for &bid in self.send_slab.recv_forward_bids(slab_idx) {
-            bids[n] = bid;
-            n += 1;
-        }
-        self.pending_replenish.extend_from_slice(&bids[..n]);
-        let owner = self.send_slab.conn_index(slab_idx);
-        self.release_send_held(owner, n as u32);
-        self.send_slab.release(slab_idx);
-    }
-
     /// Shutdown: close all connections and drain remaining CQEs. The eventfd
     /// is closed by `WakeHandle`, not here.
     pub(crate) fn run_shutdown(&mut self) {
@@ -3928,9 +3585,6 @@ impl Driver {
         //    earlier operations owe.
         for (_, _, slab_idx, _) in std::mem::take(&mut self.pending_coalesced_retries) {
             self.release_coalesced_at_shutdown(slab_idx);
-        }
-        for (_, _, slab_idx, _) in std::mem::take(&mut self.pending_recv_forward_retries) {
-            self.release_recv_forward_at_shutdown(slab_idx);
         }
         for (_, _, slab_idx, _) in std::mem::take(&mut self.pending_zc_retries) {
             if !self.send_slab.in_use(slab_idx) {
@@ -4045,9 +3699,6 @@ impl Driver {
                     // releases too.
                     OpTag::SendMsgCoalesced | OpTag::SendMsgCoalescedDrain => {
                         self.release_coalesced_at_shutdown(ud.payload() as u16);
-                    }
-                    OpTag::SendRecvBufsCoalesced | OpTag::SendRecvBufsCoalescedDrain => {
-                        self.release_recv_forward_at_shutdown(ud.payload() as u16);
                     }
                     // A forward write, or its drain: the kernel is done with
                     // the backing, so the state (and the backing) can go.

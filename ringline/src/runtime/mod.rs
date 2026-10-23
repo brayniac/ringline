@@ -42,20 +42,6 @@ pub(crate) enum IoResult {
     Connect(stdio::Result<()>),
 }
 
-/// A recv sink that allows CQE data to be written directly to a target buffer,
-/// bypassing the per-connection accumulator.
-///
-/// # Safety
-///
-/// The pointer is set by the async task before yielding and cleared after wakeup.
-/// ringline is single-threaded per worker — CQE processing and task polling never
-/// interleave — so the raw pointer is safe to dereference during CQE processing.
-pub(crate) struct RecvSink {
-    pub(crate) ptr: *mut u8,
-    pub(crate) cap: usize,
-    pub(crate) pos: usize,
-}
-
 /// A queued UDP datagram waiting for an async consumer.
 ///
 /// On the io_uring backend the buffer is borrowed from the kernel-provided buffer
@@ -602,8 +588,6 @@ pub(crate) struct Executor {
     /// to wake the correct task even when the connection index differs from the
     /// task index.
     pub(crate) owner_task: Vec<Option<u32>>,
-    /// Per-connection recv sink for direct-to-buffer writes.
-    pub(crate) recv_sinks: Vec<Option<RecvSink>>,
     /// Per-UDP-socket datagram recv queue for async tasks.
     ///
     /// Holds buffer references into the kernel-provided UDP recv ring (zero-copy)
@@ -736,13 +720,6 @@ impl Executor {
                 v
             },
             owner_task: vec![None; cap],
-            recv_sinks: {
-                let mut v = Vec::with_capacity(cap);
-                for _ in 0..cap {
-                    v.push(None);
-                }
-                v
-            },
             udp_recv_queues: (0..udp).map(|_| VecDeque::new()).collect(),
             udp_recv_queue_capacity,
             udp_recv_waiters: vec![None; udp],
@@ -783,11 +760,6 @@ impl Executor {
     /// Reset all per-connection state for a connection that was closed.
     pub(crate) fn remove_connection(&mut self, conn_index: u32) {
         let idx = conn_index as usize;
-        // Clear recv sink before removing the task — the task owns the memory
-        // the sink points to, so the sink must be invalidated first.
-        if idx < self.recv_sinks.len() {
-            self.recv_sinks[idx] = None;
-        }
         self.task_slab.remove(conn_index);
         // Awaited sends waiting on or in flight for this connection resolve
         // to ConnectionAborted; wake their owners (standalone or cross-index

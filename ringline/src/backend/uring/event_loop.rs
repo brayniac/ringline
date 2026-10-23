@@ -381,7 +381,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.executor.collect_wakeups();
             // Commit buffer returns from the poll pass and revive
             // ENOBUFS-parked receivers before we block.
-            self.flush_direct_echoes();
             self.flush_replenish_and_rearm();
             // A task polled in the second pass may have consumed the bytes
             // ahead of a hangup; peek before blocking rather than at the next
@@ -479,7 +478,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // (SQ was full). The SQ has been flushed by submit_and_wait above.
             self.drain_zc_retries();
             self.drain_coalesced_retries();
-            self.drain_recv_forward_retries();
             self.drain_copy_retries();
             self.drain_send_retries();
             self.drain_close_retries();
@@ -961,66 +959,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
         }
 
-        // Gather the batch's direct-echo arrivals before anything is submitted,
-        // so a message that spanned several recv CQEs leaves as one send.
-        self.flush_direct_echoes();
-
         // Eagerly return consumed recv buffers to the kernel ring in the same
         // iteration they were consumed, keeping the ring fuller under burst.
         self.flush_replenish_and_rearm();
-    }
-
-    /// Flush every direct-echo connection holding staged buffers.
-    ///
-    /// A connection stays on the queue while its hold is non-empty — because a
-    /// send is already in flight, because the gather hit `MAX_IOVECS`, or
-    /// because more arrived during the flush — and drops off once it drains
-    /// (including when `close_connection` drains it). That means no completion
-    /// handler has to remember to re-arm the connection: the next drain's pass
-    /// finds it still queued. When the hold of a connection whose read side
-    /// has finished drains, it wakes the direct-echo future and requests the
-    /// close.
-    fn flush_direct_echoes(&mut self) {
-        if self.driver.direct_echo_pending.is_empty() {
-            return;
-        }
-        let mut i = 0;
-        while i < self.driver.direct_echo_pending.len() {
-            let conn_index = self.driver.direct_echo_pending[i];
-            self.driver.flush_direct_echo(conn_index);
-            // Drop the entry once the hold drains, and also if the slot is no
-            // longer a direct-echo connection: `recv_hold` is shared with
-            // recv-forward, whose hold is the task's to drain, and a stale
-            // entry left over from a closed connection must not start
-            // gathering for whatever occupies the slot next.
-            if !self
-                .driver
-                .connections
-                .get(conn_index)
-                .is_some_and(|c| c.direct_echo)
-                || self.driver.recv_hold[conn_index as usize].is_empty()
-            {
-                self.driver.direct_echo_queued[conn_index as usize] = false;
-                self.driver.direct_echo_pending.swap_remove(i);
-                // The read side has finished and the hold is empty, because
-                // every held byte was submitted or a close drained them. Wake
-                // the direct-echo future, which the FIN branch did not wake
-                // while bytes were held, and request the close, which waits
-                // for the last send (#604). An already-closing connection
-                // ignores the second request.
-                if self
-                    .driver
-                    .connections
-                    .get(conn_index)
-                    .is_some_and(|c| c.direct_echo && c.recv_finished())
-                {
-                    self.executor.wake_recv(conn_index);
-                    self.driver.close_connection(conn_index);
-                }
-            } else {
-                i += 1;
-            }
-        }
     }
 
     /// Whether the run loop may block in `submit_and_wait(1)`. It may not
@@ -1045,10 +986,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// (`rearms_since_wait`).
     ///
     /// Safe because every bid pushed to `pending_replenish` had its contents
-    /// copied out (into the accumulator / recv sink / TLS state) before being
+    /// copied out (into the accumulator or TLS state) before being
     /// pushed — dispatch has fully completed, so no handler still references
     /// these buffers. Zero-copy held buffers are tracked in
-    /// `pending_recv_bufs` / `recv_hold` slots and are never in this queue.
+    /// `pending_recv_bufs` / `segment_hold` slots and are never in this queue.
     ///
     /// Also called from the run loop right before the blocking wait: bids
     /// released by tasks during the poll pass would otherwise sit uncommitted
@@ -1194,9 +1135,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     }
 
     /// Whether a parked connection may take the fallback recv path:
-    /// plaintext accumulator route only (no TLS, recv sink, segmented
-    /// delivery, zero-copy forward, or direct echo — those paths keep the
-    /// park-until-replenish behavior) with a partial message already
+    /// plaintext accumulator route only (no TLS or segmented delivery —
+    /// those paths keep the park-until-replenish behavior) with a partial
+    /// message already
     /// accumulated. The caller has already checked liveness and that no
     /// fallback is in flight.
     fn fallback_eligible(&mut self, conn_index: u32) -> bool {
@@ -1206,11 +1147,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             .tls_table
             .as_ref()
             .is_some_and(|t| t.has(conn_index));
-        let is_direct_echo = self
-            .driver
-            .connections
-            .get(conn_index)
-            .is_some_and(|c| c.direct_echo);
         // Segmented delivery (`forward_to`/`forward_to_conn`, `with_segments`)
         // is defined over provided buffers: a segment is a held bid, and the
         // hold is where a reader looks. The fallback reads into a pool slot and
@@ -1225,12 +1161,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // message" this path takes as its cue.
         let is_segmented =
             self.driver.recv_domain[ci] == crate::recv::domain::RecvDomain::Segmented;
-        if is_tls
-            || is_direct_echo
-            || is_segmented
-            || self.driver.recv_forward[ci]
-            || self.executor.recv_sinks[ci].is_some()
-        {
+        if is_tls || is_segmented {
             return false;
         }
         // Only degrade when a message is half-delivered; an empty
@@ -1720,27 +1651,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             OpTag::SendMsgCoalescedDrain => self.handle_send_msg_coalesced(ud, result),
             // No notification follows a plain `send`.
             OpTag::SendMsgZcDrain => self.handle_send_msg_zc(ud, result, 0),
-            OpTag::SendRecvBufsCoalesced => self.handle_send_recv_bufs_coalesced(ud, result),
-            OpTag::SendRecvBufsCoalescedDrain => self.handle_send_recv_bufs_coalesced(ud, result),
             OpTag::ForwardWrite => self.handle_forward_write(ud, result),
             OpTag::ForwardWriteDrain => self.handle_forward_write(ud, result),
-        }
-    }
-
-    /// The bid and address a `recv_hold` entry holds for a completion of
-    /// `bid` at `ptr`: the provided buffer itself when the lend cap allows a
-    /// lend, otherwise an owned copy of `data`, with the completion's hold
-    /// queued for release. If no owned bid is free, the buffer is lent.
-    fn lend_or_own(&mut self, bid: u16, ptr: *const u8, data: &[u8]) -> (u16, *const u8) {
-        if self.driver.may_lend() {
-            return (bid, ptr);
-        }
-        match self.driver.own_recv_copy(data) {
-            Some(owned) => {
-                self.driver.pending_replenish.push(bid);
-                owned
-            }
-            None => (bid, ptr),
         }
     }
 
@@ -1800,21 +1712,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     .map(|tc| tc.peer_sent_close_notify);
                 if let Some(cs) = self.driver.connections.get_mut(conn_index) {
                     cs.note_eof(close_notify_seen == Some(false));
-                }
-                // A direct-echo connection may still hold bytes received
-                // before the FIN that the flush pass has not echoed yet.
-                // Closing now would drop them (#604): leave the connection
-                // open, and let `flush_direct_echoes` wake its future once
-                // the hold has drained. The flush pass then requests the
-                // close, which waits for the last send (`try_finalize_close`).
-                let echo_pending = self
-                    .driver
-                    .connections
-                    .get(conn_index)
-                    .is_some_and(|c| c.direct_echo)
-                    && !self.driver.recv_hold[conn_index as usize].is_empty();
-                if echo_pending {
-                    return;
                 }
                 // Wake recv waiter before closing so the owning task can
                 // detect EOF (with_data will see `recv_finished()` and return 0).
@@ -1930,9 +1827,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             .is_some_and(|t| t.has(conn_index));
 
         // Every plaintext delivery is recorded before the bytes go to a
-        // segment hold, a recv-forward or direct-echo hold, a recv sink, a
-        // lend or the accumulator. TLS records the plaintext the feed
-        // delivers, below.
+        // segment hold, a lend or the accumulator. TLS records the plaintext
+        // the feed delivers, below.
         if !is_tls_conn {
             self.driver
                 .record_arrival(conn_index, bytes_received as usize);
@@ -2085,7 +1981,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     // reader. The buffer stays pinned until the reader or
                     // `close_connection` drains the hold. Backpressure is natural
                     // — unreplenished bids deplete the ring (ENOBUFS) until a
-                    // reader releases them, exactly like the recv-forward hold.
+                    // reader releases them.
                     self.driver.segment_hold[conn_index as usize].push_back(
                         crate::backend::HeldRecvBuf::Pinned {
                             bid,
@@ -2116,139 +2012,58 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             } else {
                 self.executor.wake_recv(conn_index);
             }
-        } else if self.driver.recv_forward[conn_index as usize] {
-            // Zero-copy recv-forward path: hold the provided buffer in-place
-            // (bid NOT replenished) for scatter-gather forwarding via
-            // `forward_held`. No accumulator copy. Backpressure is natural —
-            // unreplenished bids deplete the ring (ENOBUFS) until a forward
-            // completes. The hold is drained on close (see close_connection).
-            // Over the lend cap the bytes are copied into an owned entry, up
-            // to `ring_entries()` owned copies per worker; past that the ring
-            // buffer is held and the same backpressure applies.
-            let (hold_bid, hold_ptr) = self.lend_or_own(bid, buf_ptr, data);
-            self.driver.recv_hold[conn_index as usize].push_back(crate::backend::PendingRecvBuf {
-                bid: hold_bid,
-                len: bytes_received,
-                ptr: hold_ptr,
-            });
-            self.throttle_if_held(conn_index);
-            self.executor.wake_recv(conn_index);
         } else {
-            // Direct echo fast path: submit the echo SQE directly from the CQE
-            // handler, bypassing task wakeup entirely. This eliminates the
-            // collect_wakeups → poll_ready_tasks roundtrip (~1 full event-loop
-            // iteration of latency) on the hot single-connection echo path.
-            let is_direct_echo = self
-                .driver
-                .connections
-                .get(conn_index)
-                .is_some_and(|c| c.direct_echo);
+            // Zero-copy fast path: if no pending buffer AND accumulator is
+            // empty, hold the kernel buffer in-place instead of copying.
+            // NOTE: must be the non-merging `is_empty` — `data()` here
+            // would merge a held frozen remainder on every recv CQE,
+            // a full-remainder copy per chunk while a large response
+            // streams in (O(N·K)).
+            let acc_empty = self.driver.accumulators.is_empty(conn_index);
+            let lend = acc_empty
+                && self.driver.pending_recv_bufs[conn_index as usize].is_none()
+                && self.driver.may_lend();
+            let slot = &mut self.driver.pending_recv_bufs[conn_index as usize];
 
-            if is_direct_echo {
-                // Stage the buffer rather than submitting a Send for it now.
-                // The flush pass at the end of this drain gathers everything
-                // that arrived in the batch into one operation, so a message
-                // spanning several recv completions echoes as one message
-                // instead of one segment per completion (#397). Over the
-                // lend cap the bytes are copied into an owned entry.
-                let (hold_bid, hold_ptr) = self.lend_or_own(bid, buf_ptr, data);
-                self.driver.hold_direct_echo(
-                    conn_index,
-                    crate::backend::PendingRecvBuf {
-                        bid: hold_bid,
-                        len: bytes_received,
-                        ptr: hold_ptr,
-                    },
-                );
-                self.throttle_if_held(conn_index);
-                // Do NOT call wake_recv here. DirectEchoFuture is woken only
-                // when the read side finishes: by the result <= 0 path above,
-                // or by `flush_direct_echoes` once a FIN's held bytes have
-                // drained.
+            if lend {
+                *slot = Some(crate::backend::PendingRecvBuf {
+                    bid,
+                    len: bytes_received,
+                    ptr: buf_ptr,
+                });
             } else {
-                // Plaintext path: route through recv sink if active, else zero-copy/accumulator.
-                if let Some(sink) = &mut self.executor.recv_sinks[conn_index as usize] {
-                    self.driver.pending_replenish.push(bid);
-                    let remaining_cap = sink.cap - sink.pos;
-                    let to_sink = data.len().min(remaining_cap);
-                    if to_sink > 0 {
-                        unsafe {
-                            std::ptr::copy_nonoverlapping(
-                                data.as_ptr(),
-                                sink.ptr.add(sink.pos),
-                                to_sink,
-                            );
-                        }
-                        sink.pos += to_sink;
+                // Flush any existing pending buffer to accumulator first.
+                let mut accumulator_overflowed = false;
+                if let Some(pending) = slot.take() {
+                    let pending_data =
+                        unsafe { std::slice::from_raw_parts(pending.ptr, pending.len as usize) };
+                    if !self.driver.accumulators.append(conn_index, pending_data) {
+                        accumulator_overflowed = true;
                     }
-                    // Overflow (trailing CRLF, next commands) goes to accumulator.
-                    if to_sink < data.len()
-                        && !self
-                            .driver
-                            .accumulators
-                            .append(conn_index, &data[to_sink..])
-                    {
-                        self.executor.wake_recv(conn_index);
-                        self.driver.close_connection(conn_index);
-                        return;
-                    }
-                } else {
-                    // Zero-copy fast path: if no pending buffer AND accumulator is
-                    // empty, hold the kernel buffer in-place instead of copying.
-                    // NOTE: must be the non-merging `is_empty` — `data()` here
-                    // would merge a held frozen remainder on every recv CQE,
-                    // a full-remainder copy per chunk while a large response
-                    // streams in (O(N·K)).
-                    let acc_empty = self.driver.accumulators.is_empty(conn_index);
-                    let lend = acc_empty
-                        && self.driver.pending_recv_bufs[conn_index as usize].is_none()
-                        && self.driver.may_lend();
-                    let slot = &mut self.driver.pending_recv_bufs[conn_index as usize];
-
-                    if lend {
-                        *slot = Some(crate::backend::PendingRecvBuf {
-                            bid,
-                            len: bytes_received,
-                            ptr: buf_ptr,
-                        });
-                    } else {
-                        // Flush any existing pending buffer to accumulator first.
-                        let mut accumulator_overflowed = false;
-                        if let Some(pending) = slot.take() {
-                            let pending_data = unsafe {
-                                std::slice::from_raw_parts(pending.ptr, pending.len as usize)
-                            };
-                            if !self.driver.accumulators.append(conn_index, pending_data) {
-                                accumulator_overflowed = true;
-                            }
-                            self.driver.pending_replenish.push(pending.bid);
-                        }
-                        if !accumulator_overflowed
-                            && !self.driver.accumulators.append(conn_index, data)
-                        {
-                            accumulator_overflowed = true;
-                        }
-                        self.driver.pending_replenish.push(bid);
-                        if accumulator_overflowed {
-                            // Handler kept returning NeedMore while the peer
-                            // streamed past `recv_accumulator_max`. Close the
-                            // connection rather than OOM the worker.
-                            self.executor.wake_recv(conn_index);
-                            self.driver.close_connection(conn_index);
-                            return;
-                        }
-                    }
+                    self.driver.pending_replenish.push(pending.bid);
                 }
-                // A lent buffer (`pending_recv_bufs`) that the handler forwards
-                // with `forward_recv_buf` becomes a `SendRecvBuf` counted in
-                // `send_held_recv`. The check runs before the task forwards the
-                // buffer lent by this completion, so it lags by one send.
-                // Forwards of accumulator-backed data are not counted (#638).
-                if self.driver.send_held_recv[conn_index as usize] != 0 {
-                    self.throttle_if_held(conn_index);
+                if !accumulator_overflowed && !self.driver.accumulators.append(conn_index, data) {
+                    accumulator_overflowed = true;
                 }
-                self.executor.wake_recv(conn_index);
+                self.driver.pending_replenish.push(bid);
+                if accumulator_overflowed {
+                    // Handler kept returning NeedMore while the peer
+                    // streamed past `recv_accumulator_max`. Close the
+                    // connection rather than OOM the worker.
+                    self.executor.wake_recv(conn_index);
+                    self.driver.close_connection(conn_index);
+                    return;
+                }
             }
+            // A lent buffer (`pending_recv_bufs`) that the handler forwards
+            // with `forward_recv_buf` becomes a `SendRecvBuf` counted in
+            // `send_held_recv`. The check runs before the task forwards the
+            // buffer lent by this completion, so it lags by one send.
+            // Forwards of accumulator-backed data are not counted (#638).
+            if self.driver.send_held_recv[conn_index as usize] != 0 {
+                self.throttle_if_held(conn_index);
+            }
+            self.executor.wake_recv(conn_index);
         }
 
         // A receive that ends with data (`F_MORE` clear: every one-shot
@@ -3736,111 +3551,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
     }
 
-    /// Replenish the held provided-buffer bids backing a recv-forward entry and
-    /// release the slab slot. The bids become available in the `ProvidedBufRing`
-    /// again (resuming recv if it was ENOBUFS-stalled).
-    fn release_recv_forward(&mut self, slab_idx: u16) {
-        let mut bids = [u16::MAX; crate::buffer::send_slab::MAX_IOVECS];
-        let mut n = 0;
-        for &b in self.driver.send_slab.recv_forward_bids(slab_idx) {
-            bids[n] = b;
-            n += 1;
-        }
-        for &b in &bids[..n] {
-            self.driver.pending_replenish.push(b);
-        }
-        let owner = self.driver.send_slab.conn_index(slab_idx);
-        self.driver.release_send_held(owner, n as u32);
-        self.driver.send_slab.release(slab_idx);
-    }
-
-    /// Handle completion of a zero-copy recv-forward `sendmsg`
-    /// (OpTag::SendRecvBufsCoalesced). Mirrors `handle_send_msg_coalesced` but
-    /// the backing is held provided buffers whose bids are replenished (not pool
-    /// slots released) on completion. Partial sends advance the iovec array via
-    /// `try_advance`; the bids stay held (memory valid) until full completion.
-    fn handle_send_recv_bufs_coalesced(&mut self, ud: UserData, result: i32) {
-        let conn_index = ud.conn_index();
-        let slab_idx = ud.payload() as u16;
-
-        if !self.driver.send_slab.in_use(slab_idx) {
-            return;
-        }
-        // Identity: the CQE outlived its connection slot — replenish the held
-        // bids and release the entry; touch no per-connection state, and
-        // settle nothing (teardown recorded the abort).
-        if !self.slab_identity_ok(conn_index, slab_idx) {
-            for (id, _len) in self.driver.send_slab.take_sends(slab_idx) {
-                self.executor.forget_send(id);
-            }
-            self.release_recv_forward(slab_idx);
-            return;
-        }
-
-        if result > 0 {
-            // Partial send: advance the iovec array and resubmit the remainder.
-            // Bids are NOT replenished yet — the provided-buffer memory must stay
-            // valid for the resubmitted iovecs.
-            if let Some(msg_ptr) = self.driver.send_slab.try_advance(slab_idx, result as u32) {
-                if self.close_submitted(conn_index) {
-                    self.settle_slab_err(slab_idx, io::Error::from_raw_os_error(libc::ECANCELED));
-                    self.release_recv_forward(slab_idx);
-                    return;
-                }
-                if self
-                    .driver
-                    .ring
-                    .submit_send_recv_bufs_coalesced(conn_index, msg_ptr, slab_idx)
-                    .is_err()
-                {
-                    let generation = self.driver.connections.generation(conn_index);
-                    self.driver
-                        .pending_recv_forward_retries
-                        .push((conn_index, generation, slab_idx, 0));
-                }
-                return;
-            }
-            // Fully sent.
-            let total = self.driver.send_slab.total_len(slab_idx);
-            metrics::BYTES.add(metrics::bytes::SENT, total as u64);
-            // `forward_held` attached an id; a direct echo's entry has none.
-            self.settle_slab_ok(slab_idx);
-            self.release_recv_forward(slab_idx);
-            self.driver.submit_next_queued(conn_index);
-            self.driver.note_send_finalized(conn_index);
-            return;
-        }
-
-        // EAGAIN/EWOULDBLOCK: keep the slab entry (and the held buffers) alive
-        // and drain its first unsent iovec with a plain `send`, as in
-        // `handle_send_msg_coalesced`.
-        let errno = -result;
-        if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
-            if self.close_submitted(conn_index) {
-                self.settle_slab_err(slab_idx, io::Error::from_raw_os_error(libc::ECANCELED));
-                self.release_recv_forward(slab_idx);
-                return;
-            }
-            if self
-                .submit_slab_drain(OpTag::SendRecvBufsCoalescedDrain, conn_index, slab_idx)
-                .is_err()
-            {
-                let generation = self.driver.connections.generation(conn_index);
-                self.driver
-                    .pending_recv_forward_retries
-                    .push((conn_index, generation, slab_idx, 0));
-            }
-            metrics::POOL.increment(metrics::pool::SEND_EAGAIN);
-            return;
-        }
-
-        // Real error — replenish bids, release, and unwind the connection.
-        self.settle_slab_err(slab_idx, Self::send_error(result));
-        self.release_recv_forward(slab_idx);
-        self.driver.submit_next_queued(conn_index);
-        self.driver.note_send_finalized(conn_index);
-    }
-
     /// Release the backing of the in-flight forward write, record an error for
     /// the `ForwardToFuture`, and wake it. A pinned bid returns to the ring.
     fn fail_forward_write(&mut self, conn_index: u32, errno: i32) {
@@ -3957,8 +3667,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     }
 
     /// Throttle a connection that holds as much received data as it may
-    /// (`at_hold_cap`): a reader, forwarder or echo
-    /// peer that is not keeping up would otherwise hold ring buffers until
+    /// (`at_hold_cap`): a reader or forwarder
+    /// that is not keeping up would otherwise hold ring buffers until
     /// the ring is empty, stalling every connection on the worker, or grow
     /// heap copies without bound. Cancel its multishot recv so its TCP
     /// receive window closes and only its peer stops sending. The event loop
@@ -4018,25 +3728,18 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// (`recv_incremental`) the lend cap bounds the buffers lends pin on the
     /// worker, and the rest are heap copies.
     ///
-    /// The recv-forward or direct-echo hold is always held to a quarter of the
-    /// ring: its copies come from `Driver::own_recv_copy`, at most one ring's
-    /// worth per worker, and past that its entries pin ring buffers.
-    ///
-    /// The entries held by the connection's direct-echo and `forward_held`
-    /// sends, and by its `forward_recv_buf` sends of lent receive buffers
-    /// (`SendRecvBuf`), are counted in `send_held_recv` and added to the
-    /// `recv_hold` count, and the ring buffers a `forward_to` write pins are
+    /// The lent receive buffers held by the connection's `forward_recv_buf`
+    /// sends (`SendRecvBuf`), counted in `send_held_recv`, are held to a
+    /// quarter of the ring. The ring buffers a `forward_to` write pins are
     /// added to the `segment_hold` count. Both stay held until the send
     /// completes or fails (#638).
     fn at_hold_cap(&self, conn_index: u32) -> bool {
-        let ci = conn_index as usize;
-        let sending = self.driver.send_held_recv[ci] as usize;
-        self.driver.segment_at_hold_cap(conn_index)
-            || self.driver.recv_hold[ci].len() + sending >= self.quarter_ring_cap()
+        let sending = self.driver.send_held_recv[conn_index as usize] as usize;
+        self.driver.segment_at_hold_cap(conn_index) || sending >= self.quarter_ring_cap()
     }
 
     /// Re-arm every throttled connection whose hold has drained below the
-    /// cap. A segment reader or a recv-forward task drains its hold from task
+    /// cap. A segment reader drains its hold from task
     /// code, which has no completion to re-arm from, so the event loop checks
     /// the throttled connections on each pass.
     fn rearm_throttled_recvs(&mut self) {
@@ -4225,7 +3928,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 let original_len = self.driver.send_recv_buf_original_lens[conn_index as usize];
                 let offset = self.driver.send_recv_buf_offs[conn_index as usize] + original_len
                     - new_remaining;
-                let new_ptr = self.driver.recv_data_ptr(bid, offset);
+                let new_ptr = self.driver.provided_bufs.data_ptr(bid, offset);
                 let new_payload = bid as u32 | crate::completion::SEND_RECV_BUF_REMAINDER;
                 let new_ud = UserData::encode(
                     crate::completion::OpTag::SendRecvBuf,
@@ -4264,8 +3967,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             return;
         }
 
-        // Error or zero-length send. A `SendRecvBuf` (`forward_recv_buf`,
-        // direct echo) is never awaited, so there is nothing to settle.
+        // Error or zero-length send. A `SendRecvBuf` (`forward_recv_buf`) is
+        // never awaited, so there is nothing to settle.
         self.driver.pending_replenish.push(bid);
         self.driver.release_send_held(conn_index, 1);
         self.driver.submit_next_queued(conn_index);
@@ -5600,59 +5303,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.driver.coalesced_retry_scratch.clear();
     }
 
-    /// Retry recv-forward send resubmissions that failed (SQ was full).
-    fn drain_recv_forward_retries(&mut self) {
-        if self.driver.pending_recv_forward_retries.is_empty() {
-            return;
-        }
-        std::mem::swap(
-            &mut self.driver.pending_recv_forward_retries,
-            &mut self.driver.recv_forward_retry_scratch,
-        );
-        for idx in 0..self.driver.recv_forward_retry_scratch.len() {
-            let (conn_index, generation, slab_idx, retries) =
-                self.driver.recv_forward_retry_scratch[idx];
-            if !self.driver.send_slab.in_use(slab_idx) {
-                continue; // slab released meanwhile
-            }
-            // Connection closed or reused — replenish bids and release only.
-            let identity_ok = self.driver.connections.get(conn_index).is_some()
-                && self.driver.connections.generation(conn_index) == generation;
-            if !identity_ok || self.close_submitted(conn_index) {
-                self.settle_abandoned_retry(slab_idx, identity_ok);
-                self.release_recv_forward(slab_idx);
-                continue;
-            }
-            if retries >= 2 {
-                // Give up: forwarded bytes were dropped mid-stream, so close
-                // instead of forwarding the rest of the queue after the gap.
-                self.settle_slab_err(
-                    slab_idx,
-                    io::Error::other("max retries during recv-forward resubmit"),
-                );
-                self.release_recv_forward(slab_idx);
-                self.driver.drain_conn_send_queue(conn_index);
-                self.driver.close_connection(conn_index);
-                continue;
-            }
-            let msg_ptr = self.driver.send_slab.msghdr_ptr(slab_idx);
-            if self
-                .driver
-                .ring
-                .submit_send_recv_bufs_coalesced(conn_index, msg_ptr, slab_idx)
-                .is_err()
-            {
-                self.driver.pending_recv_forward_retries.push((
-                    conn_index,
-                    generation,
-                    slab_idx,
-                    retries + 1,
-                ));
-            }
-        }
-        self.driver.recv_forward_retry_scratch.clear();
-    }
-
     /// Retry copy send resubmissions that failed (SQ was full).
     fn drain_copy_retries(&mut self) {
         if self.driver.pending_copy_retries.is_empty() {
@@ -6265,7 +5915,7 @@ mod tests {
     }
 
     /// Register an awaited send on `conn_index` and attach it to slab entry
-    /// `slab_idx` with `len`, as `submit_batch_await` and `forward_held` do.
+    /// `slab_idx` with `len`, as `submit_batch_await` does.
     fn await_slab(
         el: &mut AsyncEventLoop<NoopHandler>,
         conn_index: u32,
@@ -6413,18 +6063,6 @@ mod tests {
                             bid: 1,
                             off: 0,
                             len: 5,
-                        },
-                    );
-                }),
-            ),
-            (
-                "recv_hold",
-                Box::new(|el: &mut AsyncEventLoop<NoopHandler>, c: u32| {
-                    el.driver.recv_hold[c as usize].push_back(
-                        crate::backend::uring::driver::PendingRecvBuf {
-                            bid: 2,
-                            len: 5,
-                            ptr: std::ptr::null(),
                         },
                     );
                 }),
@@ -6638,7 +6276,7 @@ mod tests {
     fn a_throttled_rearm_waits_for_a_pending_park() {
         let mut el = make_test_loop_with_config(config_with_forward_cap(1));
         let conn_index = accept_connection(&mut el);
-        el.driver.recv_forward[conn_index as usize] = true;
+        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
         el.driver
             .set_park_drain(conn_index, Some(park_drain_for(&el, conn_index)));
         let ud = UserData::encode(
@@ -6649,8 +6287,10 @@ mod tests {
         // IORING_CQE_F_BUFFER with bid 0, and no IORING_CQE_F_MORE.
         el.test_dispatch_cqe(ud.raw(), 5, 1);
         assert!(el.driver.forward_hold_throttled[conn_index as usize]);
-        for held in el.driver.recv_hold[conn_index as usize].drain(..) {
-            el.driver.pending_replenish.push(held.bid);
+        for held in el.driver.segment_hold[conn_index as usize].drain(..) {
+            if let crate::backend::HeldRecvBuf::Pinned { bid, .. } = held {
+                el.driver.pending_replenish.push(bid);
+            }
         }
         el.rearm_throttled_recvs();
         assert!(!recv_armed(&el, conn_index), "re-armed during the drain");
@@ -6821,15 +6461,17 @@ mod tests {
     fn a_forward_end_waits_for_a_pending_park() {
         let mut el = make_test_loop_with_config(config_with_forward_cap(1));
         let conn_index = accept_connection(&mut el);
-        el.driver.recv_forward[conn_index as usize] = true;
+        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
         el.driver
             .set_park_drain(conn_index, Some(park_drain_for(&el, conn_index)));
         let generation = el.driver.connections.generation(conn_index);
         let ud = UserData::encode(OpTag::RecvMulti, conn_index, generation);
         el.test_dispatch_cqe(ud.raw(), 5, 1);
         assert!(el.driver.forward_hold_throttled[conn_index as usize]);
-        for held in el.driver.recv_hold[conn_index as usize].drain(..) {
-            el.driver.pending_replenish.push(held.bid);
+        for held in el.driver.segment_hold[conn_index as usize].drain(..) {
+            if let crate::backend::HeldRecvBuf::Pinned { bid, .. } = held {
+                el.driver.pending_replenish.push(bid);
+            }
         }
         let _ = el.driver.settle_forward_end(conn_index);
         assert!(!recv_armed(&el, conn_index), "re-armed during the drain");
@@ -8032,7 +7674,6 @@ mod tests {
         assert!(el.driver.accumulators.is_empty(conn_index), "accumulator");
         assert!(el.driver.segment_pinned[idx].is_none(), "pin slot");
         assert!(el.driver.segment_hold[idx].is_empty(), "segment hold");
-        assert!(el.driver.recv_hold[idx].is_empty(), "recv hold");
     }
 
     #[test]
@@ -9824,7 +9465,7 @@ mod tests {
         el.driver.provided_bufs.release_batch(&r);
     }
 
-    /// A partial direct-echo send resumes from the original data's offset in
+    /// A partial `SendRecvBuf` send resumes from the original data's offset in
     /// its buffer plus the bytes sent, not from the buffer's base. The
     /// remainder is parked by a forced push failure so its SQE can be read.
     #[test]
@@ -9849,10 +9490,10 @@ mod tests {
         assert_eq!(len, 40);
     }
 
-    /// Pushing a direct-echo send records its data's offset in the buffer,
+    /// Pushing a `SendRecvBuf` send records its data's offset in the buffer,
     /// which a partial send resumes from.
     #[test]
-    fn a_pushed_direct_echo_send_records_its_offset() {
+    fn a_pushed_send_recv_buf_records_its_offset() {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
         let bid: u16 = 1;
@@ -11527,130 +11168,22 @@ mod tests {
         el.test_dispatch_cqe(ud.raw(), msg.len() as i32, 1 | 2 | ((bid as u32) << 16));
     }
 
-    /// An owned copy's bid lies above the ring, its bytes are the copy's,
-    /// and releasing it frees the copy for reuse.
+    /// A `forward_recv_buf` send of a lent buffer goes out as a `SendRecvBuf`,
+    /// counted in `send_held_recv` until it completes or fails.
     #[test]
-    fn an_owned_receive_copy_is_freed_by_its_release() {
-        let mut el = make_test_loop();
-        let ring = el.driver.provided_bufs.ring_entries();
-        let (bid, ptr) = el.driver.own_recv_copy(b"copy").expect("owned bid");
-        assert_eq!(u32::from(bid), ring);
-        assert!(el.driver.is_owned_recv(bid));
-        assert_eq!(unsafe { std::slice::from_raw_parts(ptr, 4) }, b"copy");
-        assert_eq!(el.driver.recv_data_ptr(bid, 1), unsafe { ptr.add(1) });
-        el.driver.pending_replenish.push(bid);
-        el.driver.release_pending();
-        assert!(el.driver.owned_recv[0].is_none());
-        let (again, _) = el.driver.own_recv_copy(b"next").expect("owned bid");
-        assert_eq!(again, bid, "a freed index is reused");
-    }
-
-    #[test]
-    #[should_panic(expected = "released twice")]
-    fn an_owned_receive_copy_released_twice_panics() {
-        let mut el = make_test_loop();
-        let (bid, _) = el.driver.own_recv_copy(b"copy").expect("owned bid");
-        el.driver.pending_replenish.extend([bid, bid]);
-        el.driver.release_pending();
-    }
-
-    /// At most `ring_entries()` owned copies exist; past that the caller
-    /// lends the ring buffer.
-    #[test]
-    fn owned_receive_copies_stop_at_one_ring() {
-        let mut el = make_test_loop();
-        let ring = el.driver.provided_bufs.ring_entries();
-        for _ in 0..ring {
-            assert!(el.driver.own_recv_copy(b"x").is_some());
-        }
-        assert!(el.driver.own_recv_copy(b"x").is_none());
-    }
-
-    /// A direct-echo owned copy is freed when its send completes.
-    #[test]
-    fn a_direct_echo_owned_copy_is_freed_by_its_send() {
-        let mut el = make_test_loop();
-        let conn = accept_connection(&mut el);
-        el.driver.connections.get_mut(conn).unwrap().direct_echo = true;
-        el.driver.lend_cap = Some(0);
-        deliver(&mut el, conn, 2, b"echo-me");
-        let entry = el.driver.recv_hold[conn as usize].pop_front().unwrap();
-        let ci = conn as usize;
-        el.driver.send_recv_buf_original_lens[ci] = 7;
-        el.driver.send_recv_buf_remaining[ci] = 7;
-        el.driver.send_queues[ci].in_flight = true;
-        let ud = UserData::encode(OpTag::SendRecvBuf, conn, entry.bid as u32);
-        // A real send raised the count when it took the buffer.
-        el.driver.send_held_recv[conn as usize] = 1;
-        el.test_dispatch_cqe(ud.raw(), 7, 0);
-        assert!(el.driver.pending_replenish.contains(&entry.bid));
-        el.driver.release_pending();
-        assert!(el.driver.owned_recv.iter().all(Option::is_none));
-    }
-
-    /// Owned copies gathered into one coalesced send are freed when it
-    /// completes; the coalesced path is recv-forward's normal release.
-    #[test]
-    fn a_coalesced_owned_copy_is_freed_by_its_send() {
-        let mut el = make_test_loop();
-        let conn = accept_connection(&mut el);
-        el.driver.connections.get_mut(conn).unwrap().direct_echo = true;
-        el.driver.lend_cap = Some(0);
-        deliver(&mut el, conn, 2, b"first");
-        deliver(&mut el, conn, 3, b"second");
-        assert_eq!(el.driver.owned_recv.iter().flatten().count(), 2);
-        el.flush_direct_echoes();
-        let bids = el.driver.send_slab.recv_forward_bids(0).to_vec();
-        assert_eq!(bids.len(), 2);
-        assert!(bids.iter().all(|&b| el.driver.is_owned_recv(b)));
-        let ud = UserData::encode(OpTag::SendRecvBufsCoalesced, conn, 0);
-        el.test_dispatch_cqe(ud.raw(), 11, 0);
-        assert!(!el.driver.send_slab.in_use(0));
-        el.driver.release_pending();
-        assert!(el.driver.owned_recv.iter().all(Option::is_none));
-    }
-
-    /// A direct-echo gather counts its buffers in `send_held_recv` until its
-    /// send completes, and the count reaches the hold cap (#638).
-    #[test]
-    fn a_direct_echo_gather_is_counted_until_its_send_completes() {
-        let mut el = make_test_loop();
-        let conn = accept_connection(&mut el);
-        el.driver.connections.get_mut(conn).unwrap().direct_echo = true;
-        deliver(&mut el, conn, 2, b"first");
-        deliver(&mut el, conn, 3, b"second");
-        el.flush_direct_echoes();
-        assert!(el.driver.recv_hold[conn as usize].is_empty());
-        assert_eq!(el.driver.send_held_recv[conn as usize], 2);
-        let ud = UserData::encode(OpTag::SendRecvBufsCoalesced, conn, 0);
-        el.test_dispatch_cqe(ud.raw(), 11, 0);
-        assert_eq!(el.driver.send_held_recv[conn as usize], 0);
-    }
-
-    /// A failed coalesced send releases its count.
-    #[test]
-    fn a_failed_direct_echo_gather_releases_its_count() {
-        let mut el = make_test_loop();
-        let conn = accept_connection(&mut el);
-        el.driver.connections.get_mut(conn).unwrap().direct_echo = true;
-        deliver(&mut el, conn, 2, b"first");
-        deliver(&mut el, conn, 3, b"second");
-        el.flush_direct_echoes();
-        let ud = UserData::encode(OpTag::SendRecvBufsCoalesced, conn, 0);
-        el.test_dispatch_cqe(ud.raw(), -libc::ECONNRESET, 0);
-        assert_eq!(el.driver.send_held_recv[conn as usize], 0);
-    }
-
-    /// A lone held buffer goes out as a `SendRecvBuf`, counted until it
-    /// completes or fails.
-    #[test]
-    fn a_single_direct_echo_send_is_counted_until_it_completes() {
-        for result in [7, -libc::ECONNRESET] {
+    fn a_forward_recv_buf_send_is_counted_until_it_completes() {
+        for result in [5, -libc::ECONNRESET] {
             let mut el = make_test_loop();
             let conn = accept_connection(&mut el);
-            el.driver.connections.get_mut(conn).unwrap().direct_echo = true;
-            deliver(&mut el, conn, 2, b"echo-me");
-            el.flush_direct_echoes();
+            let (ptr, _) = el.driver.provided_bufs.get_buffer(4);
+            el.driver.pending_recv_bufs[conn as usize] = Some(crate::backend::PendingRecvBuf {
+                bid: 4,
+                len: 5,
+                ptr,
+            });
+            let ctx = ConnCtx::new(conn, el.driver.connections.generation(conn));
+            let data = unsafe { std::slice::from_raw_parts(ptr, 5) };
+            with_driver_state(&mut el, || ctx.forward_recv_buf(data)).expect("forwarded");
             assert_eq!(el.driver.send_held_recv[conn as usize], 1);
             let ud = UserData(el.driver.ring.last_pushed.as_ref().unwrap().user_data);
             assert_eq!(ud.tag(), Some(OpTag::SendRecvBuf));
@@ -11868,49 +11401,46 @@ mod tests {
         );
     }
 
-    /// With `recv_multishot` set, a direct-echo or recv-forward connection
-    /// still re-arms a one-shot recv, and any other connection re-arms a
-    /// multishot one. Both carry the `RecvMulti` user_data.
+    /// With `recv_multishot` set, a connection re-arms a multishot recv
+    /// carrying the `RecvMulti` user_data.
     #[test]
-    fn holding_connections_re_arm_a_one_shot_recv() {
+    fn with_recv_multishot_a_connection_re_arms_a_multishot_recv() {
         use crate::backend::uring::sqe::Op;
-        for mode in ["plain", "direct echo", "recv forward"] {
-            let mut el = make_test_loop();
-            let conn = accept_connection(&mut el);
-            match mode {
-                "direct echo" => el.driver.connections.get_mut(conn).unwrap().direct_echo = true,
-                "recv forward" => el.driver.recv_forward[conn as usize] = true,
-                _ => {}
-            }
-            deliver_single(&mut el, conn, 2, b"x");
-            let pushed = el.driver.ring.last_pushed.as_ref().expect("re-armed");
-            let ud = UserData(pushed.user_data);
-            assert_eq!(ud.tag(), Some(OpTag::RecvMulti), "{mode}");
-            assert_eq!(
-                ud.payload(),
-                el.driver.connections.generation(conn),
-                "{mode}"
-            );
-            let single = matches!(pushed.op, Op::RecvSelect { .. });
-            assert_eq!(single, mode != "plain", "{mode}: {:?}", pushed.op);
-            assert!(
-                el.driver
-                    .connections
-                    .get(conn)
-                    .unwrap()
-                    .recv_multishot_armed
-            );
-        }
+        let mut el = make_test_loop();
+        assert!(
+            el.driver.recv_multishot,
+            "precondition: test_config sets it"
+        );
+        let conn = accept_connection(&mut el);
+        deliver_single(&mut el, conn, 2, b"x");
+        let pushed = el.driver.ring.last_pushed.as_ref().expect("re-armed");
+        let ud = UserData(pushed.user_data);
+        assert_eq!(ud.tag(), Some(OpTag::RecvMulti));
+        assert_eq!(ud.payload(), el.driver.connections.generation(conn));
+        assert!(
+            !matches!(pushed.op, Op::RecvSelect { .. }),
+            "{:?}",
+            pushed.op
+        );
+        assert!(
+            el.driver
+                .connections
+                .get(conn)
+                .unwrap()
+                .recv_multishot_armed
+        );
     }
 
-    /// A one-shot direct-echo connection stops re-arming at the hold cap, so
+    /// A one-shot segmented connection stops re-arming at the hold cap, so
     /// it holds no more buffers than the cap.
     #[test]
     fn a_one_shot_recv_stops_at_the_hold_cap() {
         use crate::backend::uring::sqe::Op;
-        let mut el = make_test_loop_with_config(config_with_forward_cap(64));
+        let mut config = config_with_forward_cap(64);
+        config.recv_multishot = false;
+        let mut el = make_test_loop_with_config(config);
         let conn = accept_connection(&mut el);
-        el.driver.connections.get_mut(conn).unwrap().direct_echo = true;
+        el.driver.recv_domain[conn as usize] = crate::recv::domain::RecvDomain::Segmented;
         let cap = el.quarter_ring_cap();
         assert!(cap >= 2, "the arms before the cap are checked");
         for bid in 0..cap as u16 - 1 {
@@ -11928,72 +11458,7 @@ mod tests {
                 .unwrap()
                 .recv_multishot_armed
         );
-        assert_eq!(el.driver.recv_hold[conn as usize].len(), cap);
-    }
-
-    /// Entering a holding mode cancels an armed recv, so the multishot armed
-    /// before stops taking buffers; with nothing armed it submits nothing.
-    #[test]
-    fn entering_a_holding_mode_cancels_the_armed_recv() {
-        use crate::backend::uring::sqe::Op;
-        let mut el = make_test_loop();
-        let conn = accept_connection(&mut el);
-        el.driver.ring.last_pushed = None;
-        el.driver.cancel_recv_for_single(conn);
-        assert!(el.driver.ring.last_pushed.is_none());
-        el.driver
-            .connections
-            .get_mut(conn)
-            .unwrap()
-            .recv_multishot_armed = true;
-        el.driver.cancel_recv_for_single(conn);
-        let target = UserData::encode(
-            OpTag::RecvMulti,
-            conn,
-            el.driver.connections.generation(conn),
-        );
-        assert!(
-            matches!(last_pushed_op(&el), Op::Cancel { target: t } if t == target.raw()),
-            "{:?}",
-            last_pushed_op(&el)
-        );
-    }
-
-    /// `enable_recv_forward` cancels an armed multishot so the connection
-    /// re-arms one-shot; under the one-shot default there is nothing to
-    /// cancel and no SQE is pushed.
-    #[test]
-    fn enabling_recv_forward_cancels_an_armed_multishot() {
-        use crate::backend::uring::sqe::Op;
-        for multishot in [true, false] {
-            let mut config = test_config();
-            config.recv_multishot = multishot;
-            let mut el = make_test_loop_with_config(config);
-            let conn = accept_connection(&mut el);
-            let generation = el.driver.connections.generation(conn);
-            // As after a multishot arm; `accept_connection` arms nothing.
-            el.driver
-                .connections
-                .get_mut(conn)
-                .unwrap()
-                .recv_multishot_armed = true;
-            el.driver.ring.last_pushed = None;
-            let ctx = ConnCtx::new(conn, generation);
-            with_driver_state(&mut el, || ctx.enable_recv_forward());
-            if multishot {
-                let target = UserData::encode(OpTag::RecvMulti, conn, generation);
-                assert!(
-                    matches!(last_pushed_op(&el), Op::Cancel { target: t } if t == target.raw()),
-                    "{:?}",
-                    last_pushed_op(&el)
-                );
-            } else {
-                assert!(
-                    el.driver.ring.last_pushed.is_none(),
-                    "multishot={multishot}"
-                );
-            }
-        }
+        assert_eq!(el.driver.segment_hold[conn as usize].len(), cap);
     }
 
     /// Buffers held by sends count toward the hold cap.
@@ -12018,7 +11483,6 @@ mod tests {
         config.recv_multishot = false;
         let mut el = make_test_loop_with_config(config);
         let conn = accept_connection(&mut el);
-        el.driver.recv_forward[conn as usize] = true;
         el.driver.send_held_recv[conn as usize] = el.quarter_ring_cap() as u32;
         let count = || {
             crate::metrics::POOL
@@ -12029,69 +11493,6 @@ mod tests {
         deliver_single(&mut el, conn, 2, b"x");
         assert!(el.driver.forward_hold_throttled[conn as usize]);
         assert_eq!(count(), before + 1);
-    }
-
-    /// A recv-forward owned copy is freed when its connection closes.
-    #[test]
-    fn a_recv_forward_owned_copy_is_freed_on_close() {
-        let mut el = make_test_loop();
-        let conn = accept_connection(&mut el);
-        el.driver.recv_forward[conn as usize] = true;
-        el.driver.lend_cap = Some(0);
-        deliver(&mut el, conn, 3, b"forward");
-        el.driver.close_connection(conn);
-        el.driver.release_pending();
-        assert!(el.driver.owned_recv.iter().all(Option::is_none));
-    }
-
-    /// Over the lend cap, a recv-forward completion is held as an owned
-    /// copy, and its ring buffer is queued for release at once.
-    #[test]
-    fn over_the_lend_cap_recv_forward_holds_an_owned_copy() {
-        let mut el = make_test_loop();
-        let conn = accept_connection(&mut el);
-        el.driver.recv_forward[conn as usize] = true;
-        el.driver.lend_cap = Some(0);
-        deliver(&mut el, conn, 3, b"forward");
-        let entry = el.driver.recv_hold[conn as usize][0];
-        assert!(el.driver.is_owned_recv(entry.bid));
-        assert_eq!(
-            unsafe { std::slice::from_raw_parts(entry.ptr, entry.len as usize) },
-            b"forward"
-        );
-        assert_eq!(el.driver.pending_replenish, [3]);
-        el.driver.release_pending();
-        assert_eq!(el.driver.provided_bufs.held(), 0);
-    }
-
-    /// Over the lend cap, a direct-echo completion is held as an owned copy;
-    /// a partial send of it resumes inside the copy.
-    #[test]
-    fn over_the_lend_cap_direct_echo_holds_an_owned_copy() {
-        let mut el = make_test_loop();
-        let conn = accept_connection(&mut el);
-        el.driver.connections.get_mut(conn).unwrap().direct_echo = true;
-        el.driver.lend_cap = Some(0);
-        deliver(&mut el, conn, 2, b"echo-me");
-        let entry = el.driver.recv_hold[conn as usize][0];
-        assert!(el.driver.is_owned_recv(entry.bid));
-        assert_eq!(el.driver.pending_replenish, [2]);
-
-        let ci = conn as usize;
-        el.driver.send_recv_buf_offs[ci] = 0;
-        el.driver.send_recv_buf_original_lens[ci] = 7;
-        el.driver.send_recv_buf_remaining[ci] = 7;
-        el.driver.send_queues[ci].in_flight = true;
-        el.driver.ring.force_push_failures(1);
-        let ud = UserData::encode(OpTag::SendRecvBuf, conn, entry.bid as u32);
-        el.test_dispatch_cqe(ud.raw(), 3, 0);
-        let crate::backend::uring::sqe::Op::Send { buf, len, .. } =
-            el.driver.send_queues[ci].queue[0].entry.op
-        else {
-            panic!("the parked remainder is a plain send");
-        };
-        assert_eq!(buf, unsafe { entry.ptr.add(3) });
-        assert_eq!(len, 4);
     }
 
     /// Without a lend cap, a partial message still takes the fallback even
@@ -12641,22 +12042,6 @@ mod tests {
         );
     }
 
-    /// A stale handle must not flip the new occupant into recv-forward mode:
-    /// it would start holding its recv buffers for a forward nobody will issue.
-    #[test]
-    fn enable_recv_forward_ignores_a_stale_handle() {
-        let mut el = make_test_loop_with_config(config_with_reserve(16));
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        let stale = ConnCtx::new(conn_index, generation.wrapping_add(1));
-
-        with_driver_state(&mut el, || stale.enable_recv_forward());
-        assert!(
-            !el.driver.recv_forward[conn_index as usize],
-            "a stale handle must not enable recv-forward on the new occupant"
-        );
-    }
-
     /// A stale handle must not close the slot's new occupant (#535).
     ///
     /// A `ConnCtx` can outlive its connection, and the slot can be reused by
@@ -12688,55 +12073,6 @@ mod tests {
                 .is_none_or(|c| c.close_requested()),
             "the current handle must still close its own connection"
         );
-    }
-
-    /// A stale handle must not install a recv sink on the slot's new occupant:
-    /// that connection's bytes would be written into the stale caller's
-    /// buffer instead of reaching its own reader.
-    #[test]
-    fn set_recv_sink_ignores_a_stale_handle() {
-        let mut el = make_test_loop_with_config(config_with_reserve(16));
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        let stale = ConnCtx::new(conn_index, generation.wrapping_add(1));
-        let mut buf = [0u8; 64];
-
-        // SAFETY: no CQE is delivered before the test returns, so nothing
-        // writes through the sink even if one is installed.
-        with_driver_state(&mut el, || unsafe {
-            stale.set_recv_sink(buf.as_mut_ptr(), buf.len())
-        });
-        assert!(
-            el.executor.recv_sinks[conn_index as usize].is_none(),
-            "a stale handle must not install a recv sink on the new occupant"
-        );
-    }
-
-    /// A stale handle must not take the slot's new occupant's recv sink.
-    #[test]
-    fn take_recv_sink_ignores_a_stale_handle() {
-        let mut el = make_test_loop_with_config(config_with_reserve(16));
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        let current = ConnCtx::new(conn_index, generation);
-        let stale = ConnCtx::new(conn_index, generation.wrapping_add(1));
-        let mut buf = [0u8; 64];
-
-        // SAFETY: `buf` outlives the sink, which is removed below.
-        with_driver_state(&mut el, || unsafe {
-            current.set_recv_sink(buf.as_mut_ptr(), buf.len())
-        });
-        assert!(el.executor.recv_sinks[conn_index as usize].is_some());
-
-        let taken = with_driver_state(&mut el, || stale.take_recv_sink());
-        assert_eq!(taken, 0);
-        assert!(
-            el.executor.recv_sinks[conn_index as usize].is_some(),
-            "a stale handle must not take the new occupant's recv sink"
-        );
-
-        with_driver_state(&mut el, || current.take_recv_sink());
-        assert!(el.executor.recv_sinks[conn_index as usize].is_none());
     }
 
     /// A stale handle's `forward_recv_buf` must not send the slot's new
@@ -12958,31 +12294,18 @@ mod tests {
     }
 
     /// A handle made stale by real teardown (close, the Close CQE, release)
-    /// and the slot's re-accept must not close the new occupant or take its
-    /// recv sink. Teardown clears the old occupant's sink before the slot is
-    /// released.
+    /// and the slot's re-accept must not close the new occupant.
     #[test]
     fn close_ignores_a_handle_made_stale_by_teardown() {
         let mut el = make_test_loop_with_config(config_with_reserve(16));
         let conn_index = accept_connection(&mut el);
         let old_gen = el.driver.connections.generation(conn_index);
         let old = ConnCtx::new(conn_index, old_gen);
-        let mut buf = [0u8; 64];
-
-        // SAFETY: `buf` outlives the sink, which teardown removes below.
-        with_driver_state(&mut el, || unsafe {
-            old.set_recv_sink(buf.as_mut_ptr(), buf.len())
-        });
-        assert!(el.executor.recv_sinks[conn_index as usize].is_some());
 
         el.driver.close_connection(conn_index);
         let ud = UserData::encode(OpTag::Close, conn_index, 0);
         el.test_dispatch_cqe(ud.raw(), 0, 0);
         assert!(el.driver.connections.get(conn_index).is_none());
-        assert!(
-            el.executor.recv_sinks[conn_index as usize].is_none(),
-            "teardown must clear the old occupant's sink"
-        );
 
         let new_index = accept_connection(&mut el);
         assert_eq!(new_index, conn_index, "the test needs the slot reused");
@@ -12999,18 +12322,6 @@ mod tests {
             "the stale handle closed the new occupant"
         );
         let current = ConnCtx::new(conn_index, new_gen);
-        let mut new_buf = [0u8; 64];
-        // SAFETY: `new_buf` outlives the sink, which is taken below.
-        with_driver_state(&mut el, || unsafe {
-            current.set_recv_sink(new_buf.as_mut_ptr(), new_buf.len())
-        });
-        assert_eq!(with_driver_state(&mut el, || old.take_recv_sink()), 0);
-        assert!(
-            el.executor.recv_sinks[conn_index as usize].is_some(),
-            "the stale handle took the new occupant's recv sink"
-        );
-        with_driver_state(&mut el, || current.take_recv_sink());
-
         with_driver_state(&mut el, || current.close());
         assert!(
             el.driver
@@ -14864,8 +14175,7 @@ mod tests {
         assert_eq!(el.driver.arrival[idx].len(), 600);
         // A `ConnStream` or forward takes them without reporting.
         el.driver.accumulators.consume(conn_index, 600);
-        // Later batches go straight to a consumer that holds nothing, as a
-        // recv sink does.
+        // Later batches go straight to a consumer that holds nothing.
         for i in 600..1024u64 {
             el.driver.recv_batch.begin_at(at(base, i));
             el.driver.record_arrival(conn_index, 1);
@@ -14917,31 +14227,6 @@ mod tests {
             let (_, a) = read_line(&mut el, ctx);
             assert_eq!(times(a), Some((at(base, 2), at(base, 2))), "{reader}");
         }
-    }
-
-    /// Bytes a recv sink takes are recorded and count as consumed, and a
-    /// lend later in the same batch extends the batch's entry.
-    #[test]
-    fn a_recv_sink_then_a_lend_in_one_batch_share_an_entry() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
-        let base = Instant::now();
-        let mut sink = [0u8; 3];
-        with_driver_state(&mut el, || unsafe {
-            ctx.set_recv_sink(sink.as_mut_ptr(), sink.len())
-        });
-        deliver_in_batch(&mut el, conn_index, 0, b"xyz", at(base, 1));
-        assert_eq!(with_driver_state(&mut el, || ctx.take_recv_sink()), 3);
-        deliver_segment(&mut el, conn_index, 1, b"q\n");
-        assert!(el.driver.pending_recv_bufs[conn_index as usize].is_some());
-        assert_eq!(el.driver.arrival[conn_index as usize].len(), 1);
-        let (_, a) = read_line(&mut el, ctx);
-        assert_eq!(times(a), Some((at(base, 1), at(base, 1))));
-        deliver_in_batch(&mut el, conn_index, 2, b"r\n", at(base, 2));
-        let (_, a) = read_line(&mut el, ctx);
-        assert_eq!(times(a), Some((at(base, 2), at(base, 2))));
-        assert_eq!(&sink, b"xyz");
     }
 
     /// Bytes handed out as a `RecvSegment` count as consumed. A completion
@@ -15140,325 +14425,6 @@ mod tests {
         });
         assert!(matches!(r, Some(crate::runtime::io::ParseResult::NeedMore)));
         assert!(with_driver_state(&mut el, || ctx.recv_arrival()).is_none());
-    }
-
-    // ── Direct-echo gather (#397) ──────────────────────────────────
-
-    /// Arm a connection for direct echo and stage `bids` worth of held
-    /// buffers, as `handle_recv_multi` would for arrivals in one drain.
-    fn stage_direct_echo(el: &mut AsyncEventLoop<NoopHandler>, bids: &[u16], len: u32) -> u32 {
-        let conn_index = accept_connection(el);
-        if let Some(cs) = el.driver.connections.get_mut(conn_index) {
-            cs.direct_echo = true;
-        }
-        for &bid in bids {
-            let (ptr, _) = el.driver.provided_bufs.get_buffer(bid);
-            el.driver
-                .hold_direct_echo(conn_index, crate::backend::PendingRecvBuf { bid, len, ptr });
-        }
-        conn_index
-    }
-
-    /// A FIN that arrives while direct-echo bytes are held leaves the
-    /// connection open without waking the future; the flush that drains the
-    /// hold wakes it and requests the close (#604).
-    #[test]
-    fn a_fin_with_bytes_held_waits_for_the_flush_to_close() {
-        use std::future::Future;
-        let mut el = make_test_loop();
-        let conn_index = stage_direct_echo(&mut el, &[0, 1], 256);
-        let ci = conn_index as usize;
-        let generation = el.driver.connections.generation(conn_index);
-        let ctx = ConnCtx::new(conn_index, generation);
-        let mut fut = std::pin::pin!(with_driver_state(&mut el, || ctx.run_direct_echo()));
-        let waker = noop_waker();
-        let first = with_driver_state(&mut el, || {
-            let mut cx = std::task::Context::from_waker(&waker);
-            fut.as_mut().poll(&mut cx)
-        });
-        assert!(first.is_pending());
-        assert!(el.executor.recv_waiters[ci], "the future parked");
-
-        let fin = UserData::encode(OpTag::RecvMulti, conn_index, generation);
-        el.test_dispatch_cqe(fin.raw(), 0, 0);
-        let cs = el.driver.connections.get(conn_index).expect("connection");
-        assert!(cs.recv_finished(), "the FIN was recorded");
-        assert!(!cs.close_requested(), "the FIN closed the connection");
-        assert_eq!(
-            el.driver.recv_hold[ci].len(),
-            2,
-            "the held bytes were dropped"
-        );
-        assert!(el.executor.recv_waiters[ci], "the FIN woke the future");
-
-        el.flush_direct_echoes();
-        assert!(el.driver.recv_hold[ci].is_empty());
-        assert!(
-            !el.executor.recv_waiters[ci],
-            "the flush did not wake the future"
-        );
-        assert!(
-            el.driver
-                .connections
-                .get(conn_index)
-                .is_some_and(|c| c.close_requested()),
-            "the flush did not request the close"
-        );
-        let second = with_driver_state(&mut el, || {
-            let mut cx = std::task::Context::from_waker(&waker);
-            fut.as_mut().poll(&mut cx)
-        });
-        assert!(second.is_ready());
-    }
-
-    /// A direct-echo future stays pending while bytes received before the
-    /// peer's FIN are still held, and resolves once they have been taken
-    /// for echo; resolving earlier would end its task and close the
-    /// connection with them unsent (#604).
-    #[test]
-    fn direct_echo_future_waits_for_the_hold_after_eof() {
-        use std::future::Future;
-        let mut el = make_test_loop();
-        let conn_index = stage_direct_echo(&mut el, &[0], 256);
-        if let Some(cs) = el.driver.connections.get_mut(conn_index) {
-            cs.note_eof(false);
-        }
-        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
-        let mut fut = std::pin::pin!(with_driver_state(&mut el, || ctx.run_direct_echo()));
-        let waker = noop_waker();
-        let first = with_driver_state(&mut el, || {
-            let mut cx = std::task::Context::from_waker(&waker);
-            fut.as_mut().poll(&mut cx)
-        });
-        assert!(
-            first.is_pending(),
-            "the future resolved with a byte still held"
-        );
-
-        el.flush_direct_echoes();
-        assert!(el.driver.recv_hold[conn_index as usize].is_empty());
-        let second = with_driver_state(&mut el, || {
-            let mut cx = std::task::Context::from_waker(&waker);
-            fut.as_mut().poll(&mut cx)
-        });
-        assert!(
-            second.is_ready(),
-            "the future stayed pending after the hold drained"
-        );
-    }
-
-    #[test]
-    fn direct_echo_gathers_a_multi_buffer_message_into_one_send() {
-        // The #397 regression: two recv completions carrying one message used
-        // to produce two Sends, so the reply left as two segments.
-        let mut el = make_test_loop();
-        let conn_index = stage_direct_echo(&mut el, &[0, 1], 8192);
-
-        el.flush_direct_echoes();
-
-        assert!(
-            el.driver.recv_hold[conn_index as usize].is_empty(),
-            "both buffers should have been gathered"
-        );
-        assert!(
-            el.driver.send_slab.in_use(0),
-            "no coalesced entry allocated"
-        );
-        assert_eq!(
-            el.driver.send_slab.recv_forward_bids(0),
-            &[0, 1],
-            "both bids must be owned by the one send"
-        );
-        assert!(el.driver.send_queues[conn_index as usize].in_flight);
-        assert!(
-            !el.driver.direct_echo_queued[conn_index as usize],
-            "a drained connection should leave the flush queue"
-        );
-    }
-
-    #[test]
-    fn direct_echo_sends_a_lone_buffer_without_a_slab_entry() {
-        // The common case — a message that fits one completion — must not pay
-        // for an msghdr and a slab entry.
-        let mut el = make_test_loop();
-        let conn_index = stage_direct_echo(&mut el, &[0], 256);
-
-        el.flush_direct_echoes();
-
-        assert!(el.driver.recv_hold[conn_index as usize].is_empty());
-        assert!(
-            !el.driver.send_slab.in_use(0),
-            "single buffer should take the plain Send path"
-        );
-        assert_eq!(el.driver.send_recv_buf_remaining[conn_index as usize], 256);
-        assert_eq!(
-            el.driver.send_recv_buf_original_lens[conn_index as usize],
-            256
-        );
-    }
-
-    #[test]
-    fn direct_echo_holds_arrivals_behind_an_in_flight_send() {
-        // One send in flight per connection: the rest accumulate for the next
-        // gather rather than racing ahead of it.
-        let mut el = make_test_loop();
-        let conn_index = stage_direct_echo(&mut el, &[0, 1], 4096);
-        el.driver.send_queues[conn_index as usize].in_flight = true;
-
-        el.flush_direct_echoes();
-
-        assert_eq!(
-            el.driver.recv_hold[conn_index as usize].len(),
-            2,
-            "nothing may be submitted while a send is in flight"
-        );
-        assert!(
-            el.driver.direct_echo_queued[conn_index as usize],
-            "connection must stay queued so the next flush retries it"
-        );
-
-        // The send completes and the connection is picked back up without any
-        // handler having re-armed it.
-        el.driver.send_queues[conn_index as usize].in_flight = false;
-        el.flush_direct_echoes();
-        assert!(el.driver.recv_hold[conn_index as usize].is_empty());
-    }
-
-    #[test]
-    fn direct_echo_close_replenishes_staged_buffers() {
-        let mut el = make_test_loop();
-        let conn_index = stage_direct_echo(&mut el, &[0, 1], 1024);
-
-        el.driver.close_connection(conn_index);
-
-        assert!(el.driver.recv_hold[conn_index as usize].is_empty());
-        assert!(el.driver.pending_replenish.contains(&0));
-        assert!(el.driver.pending_replenish.contains(&1));
-
-        // And the stale queue entry is dropped by the next pass.
-        el.flush_direct_echoes();
-        assert!(el.driver.direct_echo_pending.is_empty());
-        assert!(!el.driver.direct_echo_queued[conn_index as usize]);
-    }
-
-    #[test]
-    fn direct_echo_flush_leaves_a_recv_forward_hold_alone() {
-        // `recv_hold` is shared with recv-forward, where the owning task
-        // drains it. A queue entry that outlived its direct-echo connection
-        // must not start gathering for whatever takes the slot next.
-        let mut el = make_test_loop();
-        let conn_index = stage_direct_echo(&mut el, &[0, 1], 4096);
-
-        // The slot is now a recv-forward connection instead.
-        if let Some(cs) = el.driver.connections.get_mut(conn_index) {
-            cs.direct_echo = false;
-        }
-        el.driver.recv_forward[conn_index as usize] = true;
-
-        el.flush_direct_echoes();
-
-        assert_eq!(
-            el.driver.recv_hold[conn_index as usize].len(),
-            2,
-            "the hold belongs to forward_held now"
-        );
-        assert!(!el.driver.send_slab.in_use(0));
-        assert!(
-            el.driver.direct_echo_pending.is_empty(),
-            "the stale entry must still be dropped"
-        );
-    }
-
-    /// A recv-forward connection with `bids` held, ready for `forward_held`.
-    fn stage_recv_forward(el: &mut AsyncEventLoop<NoopHandler>, bids: &[u16], len: u32) -> u32 {
-        let conn_index = accept_connection(el);
-        el.driver.recv_forward[conn_index as usize] = true;
-        for &bid in bids {
-            let (ptr, _) = el.driver.provided_bufs.get_buffer(bid);
-            el.driver.recv_hold[conn_index as usize].push_back(crate::backend::PendingRecvBuf {
-                bid,
-                len,
-                ptr,
-            });
-        }
-        conn_index
-    }
-
-    fn forward_held_on(
-        el: &mut AsyncEventLoop<NoopHandler>,
-        conn_index: u32,
-    ) -> io::Result<crate::runtime::io::SendFuture> {
-        let conn = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
-        with_driver_state(el, || conn.forward_held())
-    }
-
-    #[test]
-    fn forward_held_submits_on_an_idle_connection() {
-        let mut el = make_test_loop();
-        let conn_index = stage_recv_forward(&mut el, &[0, 1], 1024);
-
-        let _fut = forward_held_on(&mut el, conn_index).expect("an idle connection forwards");
-
-        assert!(el.driver.recv_hold[conn_index as usize].is_empty());
-        assert_eq!(el.driver.send_slab.recv_forward_bids(0), &[0, 1]);
-        assert!(el.driver.send_queues[conn_index as usize].in_flight);
-    }
-
-    /// A forward is its own SQE, and io_uring does not order independent
-    /// SQEs, so pushing it while earlier sends are in flight, queued, parked
-    /// or chained lets the echoed bytes overtake them. It is refused with
-    /// `WouldBlock` before anything is allocated, and the hold is untouched
-    /// so a later call forwards the same bytes.
-    #[test]
-    fn forward_held_refuses_while_earlier_sends_are_outstanding() {
-        type Setup = fn(&mut AsyncEventLoop<NoopHandler>, u32);
-        let cases: [(&str, Setup); 3] = [
-            ("in flight", |el, c| {
-                el.driver.send_queues[c as usize].in_flight = true;
-            }),
-            ("parked in the queue", |el, c| {
-                let (slot, ptr, len) = el.driver.send_copy_pool.copy_in(b"first").unwrap();
-                let state = &mut el.driver.send_queues[c as usize];
-                state.queue.push_back(crate::handler::BuiltSend {
-                    entry: crate::backend::uring::sqe::Sqe::new(
-                        crate::backend::uring::sqe::Op::Send {
-                            fd: crate::backend::uring::sqe::Fd::Fixed(c),
-                            buf: ptr,
-                            len,
-                            flags: 0,
-                        },
-                        0,
-                    ),
-                    pool_slot: slot,
-                    slab_idx: u16::MAX,
-                    total_len: len,
-                });
-                state.in_flight = true;
-                state.parked = true;
-            }),
-            ("behind an active chain", |el, c| {
-                el.driver.chain_table.start(c, 1);
-            }),
-        ];
-        for (what, setup) in cases {
-            let mut el = make_test_loop();
-            let conn_index = stage_recv_forward(&mut el, &[0, 1], 1024);
-            setup(&mut el, conn_index);
-
-            let err = forward_held_on(&mut el, conn_index)
-                .err()
-                .unwrap_or_else(|| panic!("a forward {what} must be refused"));
-            assert_eq!(err.kind(), io::ErrorKind::WouldBlock, "{what}");
-            assert_eq!(
-                el.driver.recv_hold[conn_index as usize].len(),
-                2,
-                "{what}: a refused forward must leave the hold in place"
-            );
-            assert!(
-                !el.driver.send_slab.in_use(0),
-                "{what}: a refused forward must not allocate a slab entry"
-            );
-        }
     }
 
     #[test]
@@ -16215,24 +15181,45 @@ mod tests {
         assert_eq!(ud.payload(), 0, "the drain names the same slab entry");
     }
 
-    #[test]
-    fn direct_echo_eagain_drains_with_a_plain_send() {
-        let mut el = make_test_loop();
-        let conn_index = stage_direct_echo(&mut el, &[0, 1], 4096);
-        el.flush_direct_echoes();
-        assert!(
-            el.driver.send_slab.in_use(0),
-            "the gather uses slab entry 0"
-        );
+    /// A coalesced copy send of two 4096-byte pool slots in slab entry 0,
+    /// submitted on a new connection.
+    fn stage_coalesced(el: &mut AsyncEventLoop<NoopHandler>) -> u32 {
+        let conn_index = accept_connection(el);
+        let data = [7u8; 4096];
+        let mut iovecs = Vec::new();
+        let mut slots = Vec::new();
+        for _ in 0..2 {
+            let (slot, ptr, len) = el.driver.send_copy_pool.copy_in(&data).unwrap();
+            iovecs.push(libc::iovec {
+                iov_base: ptr as *mut libc::c_void,
+                iov_len: len as usize,
+            });
+            slots.push(slot);
+        }
+        let generation = el.driver.connections.generation(conn_index);
+        let (idx, _) = el
+            .driver
+            .send_slab
+            .allocate_coalesced(conn_index, generation, &iovecs, &slots, 8192, [], false)
+            .unwrap();
+        assert_eq!(idx, 0, "the send uses slab entry 0");
+        el.driver.send_queues[conn_index as usize].in_flight = true;
+        conn_index
+    }
 
-        let ud = UserData::encode(OpTag::SendRecvBufsCoalesced, conn_index, 0);
+    #[test]
+    fn coalesced_eagain_drains_with_a_plain_send() {
+        let mut el = make_test_loop();
+        let conn_index = stage_coalesced(&mut el);
+
+        let ud = UserData::encode(OpTag::SendMsgCoalesced, conn_index, 0);
         el.test_dispatch_cqe(ud.raw(), -libc::EAGAIN, 0);
-        assert_eagain_drains(&el, OpTag::SendRecvBufsCoalescedDrain, conn_index);
+        assert_eagain_drains(&el, OpTag::SendMsgCoalescedDrain, conn_index);
         assert!(el.driver.send_slab.in_use(0), "the entry stays alive");
 
-        // The drain sends the first buffer; its completion is a partial write
+        // The drain sends the first iovec; its completion is a partial write
         // of the entry, and the rest goes out as a sendmsg.
-        let drain = UserData::encode(OpTag::SendRecvBufsCoalescedDrain, conn_index, 0);
+        let drain = UserData::encode(OpTag::SendMsgCoalescedDrain, conn_index, 0);
         el.test_dispatch_cqe(drain.raw(), 4096, 0);
         assert!(
             matches!(
@@ -16243,7 +15230,7 @@ mod tests {
         );
         assert!(el.driver.send_slab.in_use(0));
 
-        let rest = UserData::encode(OpTag::SendRecvBufsCoalesced, conn_index, 0);
+        let rest = UserData::encode(OpTag::SendMsgCoalesced, conn_index, 0);
         el.test_dispatch_cqe(rest.raw(), 4096, 0);
         assert!(!el.driver.send_slab.in_use(0), "fully sent: entry released");
     }
@@ -16251,15 +15238,14 @@ mod tests {
     #[test]
     fn a_failed_drain_releases_the_entry() {
         let mut el = make_test_loop();
-        let conn_index = stage_direct_echo(&mut el, &[0, 1], 4096);
-        el.flush_direct_echoes();
-        let ud = UserData::encode(OpTag::SendRecvBufsCoalesced, conn_index, 0);
+        let conn_index = stage_coalesced(&mut el);
+        let ud = UserData::encode(OpTag::SendMsgCoalesced, conn_index, 0);
         el.test_dispatch_cqe(ud.raw(), -libc::EAGAIN, 0);
-        assert_eagain_drains(&el, OpTag::SendRecvBufsCoalescedDrain, conn_index);
+        assert_eagain_drains(&el, OpTag::SendMsgCoalescedDrain, conn_index);
 
         // The peer reset the connection while the drain waited.
         let pushed_before = el.driver.ring.last_pushed.as_ref().map(|e| e.user_data);
-        let drain = UserData::encode(OpTag::SendRecvBufsCoalescedDrain, conn_index, 0);
+        let drain = UserData::encode(OpTag::SendMsgCoalescedDrain, conn_index, 0);
         el.test_dispatch_cqe(drain.raw(), -libc::EPIPE, 0);
         assert!(!el.driver.send_slab.in_use(0), "the entry is released");
         assert_eq!(
@@ -16466,7 +15452,7 @@ mod tests {
             iov_len: 100,
         }];
         let mut parked = Vec::new();
-        for list in 0..3 {
+        for list in 0..2 {
             let guards = [const { None }; crate::buffer::send_slab::MAX_GUARDS];
             let (slab_idx, _) = el
                 .driver
@@ -16476,7 +15462,6 @@ mod tests {
             let entry = (conn_index, generation, slab_idx, 0);
             match list {
                 0 => el.driver.pending_coalesced_retries.push(entry),
-                1 => el.driver.pending_recv_forward_retries.push(entry),
                 _ => el.driver.pending_zc_retries.push(entry),
             }
             parked.push(slab_idx);
@@ -17525,9 +16510,9 @@ mod tests {
 
     #[test]
     fn submit_next_queued_empty_finalizes_deferred_close() {
-        // A close deferred behind an in-flight ZC/recv-forward send must
-        // finalize when the queue empties, even though those completion
-        // paths never call note_send_finalized.
+        // A close deferred behind an in-flight ZC send must finalize when
+        // the queue empties, even though that completion path never calls
+        // note_send_finalized.
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
 
@@ -19144,84 +18129,6 @@ mod tests {
         assert_eq!(&buf[..5], b"aabbb");
     }
 
-    /// Completes a recv-forward entry, carrying an awaited send or not, and
-    /// returns that send's result, or `None` when no send was attached.
-    fn complete_recv_forward(awaited: bool) -> Option<io::Result<u32>> {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        el.driver.send_queues[conn_index as usize].in_flight = true;
-        let iovecs = [libc::iovec {
-            iov_base: std::ptr::null_mut(),
-            iov_len: 100,
-        }];
-        let (slab_idx, _msg) = el
-            .driver
-            .send_slab
-            .allocate_recv_forward(conn_index, generation, &iovecs, &[3], 100)
-            .expect("slab room");
-        // A real forward raised the count when it took the buffer.
-        el.driver.send_held_recv[conn_index as usize] = 1;
-        let id = awaited.then(|| await_slab(&mut el, conn_index, slab_idx, 100));
-        let ud = UserData::encode(OpTag::SendRecvBufsCoalesced, conn_index, slab_idx as u32);
-        el.test_dispatch_cqe(ud.raw(), 100, 0);
-        assert!(
-            el.driver.pending_replenish.contains(&3),
-            "the held buffer is replenished either way"
-        );
-        assert!(!el.driver.send_slab.in_use(slab_idx));
-        id.and_then(|id| send_result(&mut el, id))
-    }
-
-    /// `forward_held`'s recv-forward entry carries its send, and the entry's
-    /// completion settles it with the forwarded length.
-    #[test]
-    fn a_recv_forward_settles_the_send_it_carries() {
-        assert_eq!(
-            complete_recv_forward(true)
-                .expect("the forward settled its send")
-                .expect("the forward succeeded"),
-            100
-        );
-    }
-
-    /// A direct echo's recv-forward entry carries no send and completes
-    /// without one.
-    #[test]
-    fn a_recv_forward_with_no_send_completes() {
-        assert!(complete_recv_forward(false).is_none());
-    }
-
-    /// A recv-forward entry that fails settles its send with the errno.
-    #[test]
-    fn a_failed_recv_forward_settles_its_send_with_the_errno() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        el.driver.send_queues[conn_index as usize].in_flight = true;
-        let iovecs = [libc::iovec {
-            iov_base: std::ptr::null_mut(),
-            iov_len: 100,
-        }];
-        let (slab_idx, _msg) = el
-            .driver
-            .send_slab
-            .allocate_recv_forward(conn_index, generation, &iovecs, &[3], 100)
-            .expect("slab room");
-        // A real forward raised the count when it took the buffer.
-        el.driver.send_held_recv[conn_index as usize] = 1;
-        let id = await_slab(&mut el, conn_index, slab_idx, 100);
-        let ud = UserData::encode(OpTag::SendRecvBufsCoalesced, conn_index, slab_idx as u32);
-        el.test_dispatch_cqe(ud.raw(), -libc::ECONNRESET, 0);
-        assert_eq!(
-            send_result(&mut el, id)
-                .expect("the failure settled the send")
-                .expect_err("the forward failed")
-                .raw_os_error(),
-            Some(libc::ECONNRESET)
-        );
-    }
-
     /// An awaited send queued behind a send that fails is drained with the
     /// queue, and fails `ConnectionAborted`: its bytes never reach the wire.
     #[test]
@@ -19414,65 +18321,36 @@ mod tests {
         assert!(send_result(&mut el, id).is_none());
     }
 
-    /// A zero-copy or recv-forward retry dropped because its connection's
-    /// Close is submitted fails the send it carries with `ECANCELED`.
+    /// A zero-copy retry dropped because its connection's Close is submitted
+    /// fails the send it carries with `ECANCELED`.
     #[test]
     fn a_retry_dropped_at_close_fails_its_send() {
-        for recv_forward in [false, true] {
-            let mut el = make_test_loop();
-            let conn_index = accept_connection(&mut el);
-            let generation = el.driver.connections.generation(conn_index);
-            let iovecs = [libc::iovec {
-                iov_base: std::ptr::null_mut(),
-                iov_len: 100,
-            }];
-            let (slab_idx, _msg) = if recv_forward {
-                el.driver.send_slab.allocate_recv_forward(
-                    conn_index,
-                    generation,
-                    &iovecs,
-                    &[3],
-                    100,
-                )
-            } else {
-                let guards = [const { None }; crate::buffer::send_slab::MAX_GUARDS];
-                el.driver.send_slab.allocate(
-                    conn_index,
-                    generation,
-                    &iovecs,
-                    u16::MAX,
-                    guards,
-                    0,
-                    100,
-                )
-            }
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let iovecs = [libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 100,
+        }];
+        let guards = [const { None }; crate::buffer::send_slab::MAX_GUARDS];
+        let (slab_idx, _msg) = el
+            .driver
+            .send_slab
+            .allocate(conn_index, generation, &iovecs, u16::MAX, guards, 0, 100)
             .expect("slab room");
-            if recv_forward {
-                // A real forward raised the count when it took the buffer.
-                el.driver.send_held_recv[conn_index as usize] = 1;
-            }
-            let id = await_slab(&mut el, conn_index, slab_idx, 100);
-            el.driver.send_queues[conn_index as usize].close_submitted = true;
-            if recv_forward {
-                el.driver
-                    .pending_recv_forward_retries
-                    .push((conn_index, generation, slab_idx, 0));
-                el.drain_recv_forward_retries();
-            } else {
-                el.driver
-                    .pending_zc_retries
-                    .push((conn_index, generation, slab_idx, 0));
-                el.drain_zc_retries();
-            }
-            assert_eq!(
-                send_result(&mut el, id)
-                    .expect("the dropped retry settled its send")
-                    .expect_err("it never went out")
-                    .raw_os_error(),
-                Some(libc::ECANCELED),
-                "recv_forward = {recv_forward}"
-            );
-        }
+        let id = await_slab(&mut el, conn_index, slab_idx, 100);
+        el.driver.send_queues[conn_index as usize].close_submitted = true;
+        el.driver
+            .pending_zc_retries
+            .push((conn_index, generation, slab_idx, 0));
+        el.drain_zc_retries();
+        assert_eq!(
+            send_result(&mut el, id)
+                .expect("the dropped retry settled its send")
+                .expect_err("it never went out")
+                .raw_os_error(),
+            Some(libc::ECANCELED)
+        );
     }
 
     /// A zero-copy send whose completion reports zero bytes fails
@@ -22401,23 +21279,6 @@ mod tests {
                 assert!(is_ebusy(&poll), "{owner}, later poll {later}: {poll:?}");
             }
         }
-    }
-
-    /// A connection with recv-forward on is refused: its bytes wait in
-    /// `recv_hold`, which this reader does not read.
-    #[test]
-    fn bytes_segments_refuses_a_recv_forward_connection() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        el.driver.recv_forward[conn_index as usize] = true;
-        let ctx = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
-        let mut fut = std::pin::pin!(ctx.with_bytes_segments(|_| ParseResult::NeedMore));
-        let poll = poll_in(&mut el, fut.as_mut());
-        assert!(is_ebusy(&poll), "{poll:?}");
-        assert_eq!(
-            el.driver.recv_domain[conn_index as usize],
-            crate::recv::domain::RecvDomain::default()
-        );
     }
 
     /// A parked call whose connection another reader used in the meantime

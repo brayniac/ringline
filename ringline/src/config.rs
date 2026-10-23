@@ -168,18 +168,17 @@ pub struct Config {
     ///
     /// A connection can hold arriving data in place or as copies until its
     /// consumer drains it: a `forward_to` source until each buffer is written to
-    /// the sink, a segment reader (`segments`, `with_segments`) until it reads,
-    /// a recv-forward or direct-echo connection until its send goes out. A slow
-    /// consumer would otherwise accumulate an unbounded backlog, pinning the
-    /// shared per-worker recv ring (starving every other connection on the
+    /// the sink, a segment reader (`segments`, `with_segments`) until it reads.
+    /// A slow consumer would otherwise accumulate an unbounded backlog, pinning
+    /// the shared per-worker recv ring (starving every other connection on the
     /// worker) or growing heap copies without limit. When a connection's held
     /// entries reach this cap (lowered to a quarter of the recv ring's buffers
-    /// for recv-forward and direct echo, and for a segment hold without
-    /// `recv_incremental`), the runtime stops its recv (a one-shot recv is not
-    /// re-armed, a multishot one is cancelled) so its TCP receive window closes
-    /// and only its peer stops sending; the recv is re-armed once the hold
-    /// drains below the cap. The buffers a recv-forward or direct-echo
-    /// connection's pending sends carry count toward its cap (#638).
+    /// for a segment hold without `recv_incremental`), the runtime stops its
+    /// recv (a one-shot recv is not re-armed, a multishot one is cancelled) so
+    /// its TCP receive window closes and only its peer stops sending; the recv
+    /// is re-armed once the hold drains below the cap. The lent receive
+    /// buffers a connection's unfinished `forward_recv_buf` sends carry are
+    /// held to the same quarter-ring cap (#638).
     ///
     /// Larger values allow more recv in flight (higher single-forward throughput)
     /// at the cost of more pinned ring buffers / held heap under a slow sink;
@@ -1044,8 +1043,7 @@ impl ConfigBuilder {
     /// submission: one connection streaming large messages receives about a
     /// fifth less per second with one-shot receives.
     ///
-    /// Direct-echo and recv-forward connections arm one-shot receives with
-    /// either setting. io_uring only; the mio backend reads on readiness.
+    /// io_uring only; the mio backend reads on readiness.
     /// **Default: false**.
     pub fn recv_multishot(mut self, enabled: bool) -> Self {
         self.config.recv_multishot = enabled;
@@ -1067,7 +1065,7 @@ impl ConfigBuilder {
     /// `forward_to` source) only while at most half the TCP ring's buffers
     /// have a hold (a lend, or a completion whose release is queued for the
     /// next flush); above that, each path copies, and `recv_segment_reserve`
-    /// is ignored. Recv-forward and direct echo copy into an owned buffer.
+    /// is ignored.
     /// The fallback receive reads 1 MiB chunks, and a parked connection
     /// re-arms its receive instead when the ring's free buffers hold more.
     /// With `prefault_buffers(true)` a plain ring makes 256 MiB per worker
@@ -1189,16 +1187,15 @@ impl ConfigBuilder {
     /// A connection holds received data until its consumer drains it: a
     /// `forward_to` source until each buffer is written to the sink, a
     /// segment reader (`segments`, `with_segments`, `recv_owned_segment`)
-    /// until it reads, a recv-forward or direct-echo connection until its
-    /// send goes out. When a connection holds this many entries the runtime
+    /// until it reads. When a connection holds this many entries the runtime
     /// stops its recv (a one-shot recv is not re-armed, a multishot one is
     /// cancelled), closing its TCP receive window so only its peer stops
     /// sending, and re-arms it on an event-loop pass once the hold drains
-    /// below the cap. A recv-forward or direct-echo hold, and without
-    /// `recv_incremental` a segment hold, is held to at most a quarter of the
-    /// recv ring's buffers, since each such entry can pin one.
-    /// The buffers a recv-forward or direct-echo connection's pending sends
-    /// carry count toward its cap (#638).
+    /// below the cap. Without `recv_incremental` a segment hold is held to at
+    /// most a quarter of the recv ring's buffers, since each entry can pin
+    /// one. The lent receive buffers a connection's unfinished
+    /// `forward_recv_buf` sends carry are held to the same quarter-ring cap
+    /// (#638).
     /// Larger values allow more recv in flight at the cost of more held
     /// buffers or copies under a slow consumer: with `recv_incremental` a
     /// segment hold can reach this many copies of up to one buffer each

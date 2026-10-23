@@ -36,8 +36,8 @@ What this gives:
 - One implementation of every send, recv, close and teardown rule.
 - The io_uring driver builds and runs its tests on macOS. Today it cannot
   be type-checked there.
-- The io_uring-only API (`send_chain`, segmented recv, `forward_to`,
-  direct echo) becomes available everywhere.
+- The io_uring-only API (`send_chain`, segmented recv, `forward_to`)
+  becomes available everywhere.
 - The gaps the mio backend has today close: `ConnCtx::cancel`,
   `connect_unix`, `ChildProcess::wait`, NVMe and merged accept are
   unsupported or ignored on mio, and all exist in the io_uring driver.
@@ -75,8 +75,8 @@ Every operation already reads from or writes into memory ringline owns:
 | Memory | Owner | Used by |
 |---|---|---|
 | Send-pool slots | `SendCopyPool` | copy sends, TLS records |
-| Slab entries (iovecs, guards) | `InFlightSendSlab` | coalesced, zero-copy and recv-forward sends |
-| Provided recv buffers | `ProvidedBufRing` | multishot recv, UDP recv, recv forward |
+| Slab entries (iovecs, guards) | `InFlightSendSlab` | coalesced and zero-copy sends |
+| Provided recv buffers | `ProvidedBufRing` | multishot recv, UDP recv, `forward_to`, `forward_recv_buf` |
 | Fallback recv slots | `fallback_recv_pool` (a `SendCopyPool`) | one-shot recv |
 | Disk buffers | caller, held by the disk-I/O future | fs, direct I/O |
 
@@ -299,7 +299,7 @@ conformance tests confirm against the real ring first.
 | RecvUdp | RECV multishot | As RecvMulti on a UDP socket. | B |
 | RecvFallback | RECV one-shot into a pool slot | Try at submit, then on readable; one CQE. | A |
 | Send, TlsSend, SendRecvBuf, *Drain | SEND, `MSG_WAITALL` | `write` until all bytes are sent, waiting for writable in between. Post the total, or, on an error, the bytes written before it if any *(verify)*, otherwise `-errno`. | B |
-| SendMsgCoalesced, SendRecvBufsCoalesced | SENDMSG, `MSG_WAITALL` | `writev` the iovecs with the same rule. The emulator need not reproduce `-EAGAIN` after a peer's half-close (#603); the driver's drain path is correct either way. | B |
+| SendMsgCoalesced | SENDMSG, `MSG_WAITALL` | `writev` the iovecs with the same rule. The emulator need not reproduce `-EAGAIN` after a peer's half-close (#603); the driver's drain path is correct either way. | B |
 | ForwardWrite | SENDMSG to a socket; WRITEV to a regular file | Socket sink: as SendMsgCoalesced. File sink: readiness does not apply to regular files, so the `pwritev` runs on the disk-I/O pool. | B |
 | SendMsgZc | SENDMSG_ZC (no `MSG_WAITALL`) | One `writev` attempt per readable-to-writable cycle, posting a short count when that is all the socket took, as the kernel can *(verify)*. Then post the operation CQE with `F_MORE` and a separate `F_NOTIF` CQE in the same reap. A notification follows exactly when `F_MORE` is set, including on error and zero-length results (#487). The `writev` reads the guard's memory in place; the kernel copies it into the socket buffer, so the send is not zero-copy, but ringline makes no copy of its own. | C |
 | SendPollOut | POLL_ADD POLLOUT | Check writability at submit; otherwise post on the writable edge. | A |
