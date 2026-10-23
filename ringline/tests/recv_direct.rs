@@ -1519,3 +1519,159 @@ fn the_end_behind_queued_bytes_closes_a_connection_read_once() {
         Ok(())
     );
 }
+
+// ── End of stream behind buffered bytes ─────────────────────────────
+
+static BUFFERED_READ_ONCE: Mutex<Option<Result<(), String>>> = Mutex::new(None);
+static TICKLESS_READ_ONCE: Mutex<Option<Result<(), String>>> = Mutex::new(None);
+
+/// Consumes 2 of the peer's 5 bytes, sleeps while the peer closes (so the
+/// hangup peek finds the other 3 buffered and nothing queued), reads the 3
+/// once and never reads again. The connection must still stop being alive.
+struct BufferedReadOnce;
+
+impl AsyncEventHandler for BufferedReadOnce {
+    fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        Some(Box::pin(async {
+            let addr = SERVER.lock().unwrap().unwrap();
+            let r = async {
+                let mut conn = ringline::connect(addr)
+                    .await
+                    .map_err(|e| format!("connect: {e}"))?;
+                let mut got = Vec::new();
+                conn.with_data(|b| {
+                    if b.len() < 5 {
+                        return ParseResult::NeedMore;
+                    }
+                    got.extend_from_slice(&b[..2]);
+                    ParseResult::Consumed(2)
+                })
+                .await;
+                ringline::sleep(Duration::from_millis(300)).await;
+                conn.with_data(|b| {
+                    got.extend_from_slice(b);
+                    ParseResult::Consumed(b.len())
+                })
+                .await;
+                if got != b"hello" {
+                    return Err(format!("read {got:?}"));
+                }
+                for _ in 0..200 {
+                    if !conn.is_alive() {
+                        return Ok(());
+                    }
+                    ringline::sleep(Duration::from_millis(10)).await;
+                }
+                Err("alive 2 s after the last byte was read".into())
+            }
+            .await;
+            *BUFFERED_READ_ONCE.lock().unwrap() = Some(r);
+            let _ = ringline::request_shutdown();
+        }))
+    }
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
+        async {}
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        BufferedReadOnce
+    }
+}
+
+#[test]
+fn the_end_behind_buffered_bytes_closes_a_connection_read_once() {
+    let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    *SERVER.lock().unwrap() = Some(listener.local_addr().unwrap());
+    *BUFFERED_READ_ONCE.lock().unwrap() = None;
+    let server = std::thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        let _ = s.write_all(b"hello");
+        std::thread::sleep(Duration::from_millis(100));
+    });
+    let config = ConfigBuilder::new()
+        .workers(1)
+        .pin_to_core(false)
+        .max_connections(16)
+        .build()
+        .expect("config");
+    let (runtime, handles) = RinglineBuilder::new(config)
+        .launch::<BufferedReadOnce>()
+        .expect("launch");
+    common::join_workers(&runtime, handles);
+    server.join().unwrap();
+    assert_eq!(
+        BUFFERED_READ_ONCE
+            .lock()
+            .unwrap()
+            .take()
+            .expect("client did not finish"),
+        Ok(())
+    );
+}
+
+/// With `tick_timeout_us(0)` the worker blocks until a completion. The
+/// peer writes 5 bytes and closes while the client does not read; the
+/// client reads them once, sleeps once and checks: the recheck must have
+/// run before the worker blocked, not at an unrelated later completion.
+struct TicklessReadOnce;
+
+impl AsyncEventHandler for TicklessReadOnce {
+    fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        Some(Box::pin(async {
+            let addr = SERVER.lock().unwrap().unwrap();
+            let r = async {
+                let mut conn = ringline::connect(addr)
+                    .await
+                    .map_err(|e| format!("connect: {e}"))?;
+                ringline::sleep(Duration::from_millis(200)).await;
+                conn.with_data(|b| ParseResult::Consumed(b.len())).await;
+                ringline::sleep(Duration::from_millis(500)).await;
+                if conn.is_alive() {
+                    return Err("alive 500 ms after the read".into());
+                }
+                Ok(())
+            }
+            .await;
+            *TICKLESS_READ_ONCE.lock().unwrap() = Some(r);
+            let _ = ringline::request_shutdown();
+        }))
+    }
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
+        async {}
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        TicklessReadOnce
+    }
+}
+
+#[test]
+fn a_recheck_runs_before_a_tickless_worker_blocks() {
+    let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    *SERVER.lock().unwrap() = Some(listener.local_addr().unwrap());
+    *TICKLESS_READ_ONCE.lock().unwrap() = None;
+    let server = std::thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        let _ = s.write_all(b"hello");
+    });
+    let config = ConfigBuilder::new()
+        .workers(1)
+        .pin_to_core(false)
+        .max_connections(16)
+        .tick_timeout_us(0)
+        .build()
+        .expect("config");
+    let (runtime, handles) = RinglineBuilder::new(config)
+        .launch::<TicklessReadOnce>()
+        .expect("launch");
+    common::join_workers(&runtime, handles);
+    server.join().unwrap();
+    assert_eq!(
+        TICKLESS_READ_ONCE
+            .lock()
+            .unwrap()
+            .take()
+            .expect("client did not finish"),
+        Ok(())
+    );
+}

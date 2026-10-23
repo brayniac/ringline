@@ -298,11 +298,12 @@ the runtime submits a non-blocking one-byte `recv` with `MSG_PEEK`
   even if no read parks after the bytes are consumed.
 - A result of 0 or an error means the stream has ended with nothing queued.
   If no receive is in flight and nothing is buffered in the accumulator, the
-  connection closes as under a parked read. Otherwise it stays open until a
-  read finds the end itself. A peek that returns an error has cleared the
-  socket's pending error, so the error is kept in
-  `ConnectionState::hangup_error`, and the receive that later returns 0
-  reports it.
+  connection closes as under a parked read. Otherwise it stays open and goes
+  on `hangup_rechecks`, so the end closes it once the buffered bytes are
+  read, whether or not a read parks. A peek that returns an error has
+  cleared the socket's pending error, so the error is kept in
+  `ConnectionState::hangup_error`, and the receive or recheck peek that
+  later finds the end reports it.
 
 No receive is armed on the hangup path, so the accumulator does not take
 more than a parked read would. A poll or peek that cannot be pushed is
@@ -316,11 +317,13 @@ cancel from 6.13 with `-ECANCELED`), and one peek SQE and completion per
 hangup with no receive in flight, plus one per recheck. While armed, the
 poll is on the socket's wait queue, so every wakeup of the socket also runs
 its wake callback, which rejects the event unless it is a hangup. That cost
-is not measured. Before 6.13 the kernel releases the files of removed fixed
-slots in order, so a request held for a connection's life (this poll, as
-the ring path's always-armed receive did) keeps every socket closed after
-it on the ring from being freed until that request completes; the
-`shutdown` lead still sends the FIN (Domain Invariant 8 in CLAUDE.md).
+is not measured.
+
+Before 6.13 the kernel frees removed fixed files in order. A request held
+for a connection's life, such as this poll or the ring path's receive,
+keeps every socket closed after it on the same ring from being freed until
+the request completes. The `shutdown` lead still sends the FIN (Domain
+Invariant 8 in CLAUDE.md).
 
 Arming after the parse means no receive is outstanding while `with_bytes`
 holds the accumulator frozen, so the remainder the parser left can be taken

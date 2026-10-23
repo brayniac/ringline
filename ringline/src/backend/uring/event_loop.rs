@@ -383,6 +383,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // ENOBUFS-parked receivers before we block.
             self.flush_direct_echoes();
             self.flush_replenish_and_rearm();
+            // A task polled in the second pass may have consumed the bytes
+            // ahead of a hangup; peek before blocking rather than at the next
+            // completion.
+            self.recheck_hangups();
             // Declining to block still has to reap: under DEFER_TASKRUN the
             // kernel runs task_work only on a GETEVENTS enter, and
             // `submit_and_wait(0)` carries no such flag. Going through
@@ -1515,9 +1519,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// the FIN alone, or an error) the stream has ended with nothing left in
     /// the socket. If no receive is in flight and nothing is buffered, the
     /// connection closes as it would under a parked read. Otherwise it stays
-    /// open: buffered bytes stay readable, and a peek error is kept in
+    /// open and goes on `hangup_rechecks`: buffered bytes stay readable, and
+    /// once they are read the recheck peeks again. A peek error is kept in
     /// `hangup_error`, because the peek cleared the socket's pending error
-    /// and the receive that later returns 0 has to report it.
+    /// and whatever later finds the end has to report it.
     fn handle_hangup_peek(&mut self, ud: UserData, result: i32) {
         let conn_index = ud.conn_index();
         let Some(cs) = self.driver.connections.get_mut(conn_index) else {
@@ -1543,13 +1548,26 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             return;
         }
         if cs.recv_direct_armed || self.driver.recv_buffered(conn_index) > 0 {
-            if result < 0
-                && let Some(cs) = self.driver.connections.get_mut(conn_index)
-            {
-                cs.hangup_error = -result;
+            // The end stays unseen until the buffered bytes are read; the
+            // recheck peeks again then, whether or not a read parks.
+            if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+                if result < 0 {
+                    cs.hangup_error = -result;
+                }
+                cs.hangup_recheck_due = true;
+                if !cs.hangup_recheck {
+                    cs.hangup_recheck = true;
+                    let generation = cs.generation;
+                    self.driver.hangup_rechecks.push((conn_index, generation));
+                }
             }
             return;
         }
+        // An earlier peek may have taken the socket's error.
+        let result = match self.driver.connections.get(conn_index) {
+            Some(cs) if result == 0 && cs.hangup_error != 0 => -cs.hangup_error,
+            _ => result,
+        };
         metrics::RECV_DIRECT.increment(metrics::recv_direct::HANGUP);
         if let Some(cs) = self.driver.connections.get_mut(conn_index) {
             if result == 0 {
