@@ -429,6 +429,8 @@ pub use runtime::select::Select3;
 pub use runtime::select::select;
 /// Poll three futures concurrently, returning whichever completes first.
 pub use runtime::select::select3;
+/// Writer handed to the closure of [`SendHalf::send_with()`].
+pub use runtime::send_writer::SendWriter;
 /// Opaque handle for a standalone spawned task.
 pub use runtime::task::TaskId;
 /// Why a task's handle did not produce a value: it panicked or was cancelled.

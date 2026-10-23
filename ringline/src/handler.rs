@@ -956,6 +956,69 @@ impl<'a> DriverCtx<'a> {
         }
     }
 
+    /// Queue the pool slots a `SendWriter` filled, in order, as one send:
+    /// the same entries `send_inner` builds after its copy step. On `Err`
+    /// nothing was queued and the slots are still the writer's.
+    pub(crate) fn commit_writer_slots(&mut self, conn: ConnToken, slots: &[u16]) -> io::Result<()> {
+        if self
+            .connections
+            .get(conn.index)
+            .is_none_or(|c| c.generation != conn.generation)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "stale connection",
+            ));
+        }
+        if self.send_queues[conn.index as usize].close_submitted {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "connection closing",
+            ));
+        }
+        // A slot the writer took and left empty is released, not sent.
+        let mut nonempty = 0;
+        for &slot in slots {
+            if self.send_copy_pool.current_ptr_remaining(slot).1 == 0 {
+                self.send_copy_pool.release(slot);
+            } else {
+                nonempty += 1;
+            }
+        }
+        let several = nonempty >= 2;
+        for &slot in slots {
+            if !self.send_copy_pool.in_use(slot) {
+                continue;
+            }
+            let (ptr, len) = self.send_copy_pool.current_ptr_remaining(slot);
+            let user_data = crate::completion::UserData::encode(
+                crate::completion::OpTag::Send,
+                conn.index,
+                crate::completion::UserData::send_payload(slot, conn.generation),
+            );
+            let built = BuiltSend {
+                entry: crate::backend::uring::sqe::Sqe::stream_send(
+                    conn.index,
+                    ptr,
+                    len,
+                    user_data.raw(),
+                ),
+                pool_slot: slot,
+                slab_idx: u16::MAX,
+                total_len: len,
+            };
+            if several {
+                self.send_queues[conn.index as usize].queue.push_back(built);
+            } else {
+                self.submit_or_queue(conn.index, built);
+            }
+        }
+        if several {
+            self.submit_queued_run(conn.index);
+        }
+        Ok(())
+    }
+
     /// Submit the sends just queued on `conn_index`, as one `sendmsg`
     /// (`submit_coalesced_run`), or the head alone if the run cannot be
     /// coalesced. With a send already in flight

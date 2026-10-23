@@ -558,6 +558,24 @@ impl Driver {
         })
     }
 
+    /// For a `SendWriter`: on mio every writer buffers and sends at commit.
+    pub(crate) fn writer_pool(
+        &mut self,
+        conn: crate::handler::ConnToken,
+    ) -> std::io::Result<Option<(usize, usize)>> {
+        if self
+            .connections
+            .get(conn.index)
+            .is_none_or(|c| c.generation != conn.generation)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "stale connection",
+            ));
+        }
+        Ok(None)
+    }
+
     /// Create a `DriverCtx` borrow for issuing operations.
     pub(crate) fn make_ctx(&mut self) -> DriverCtx<'_> {
         let tls_ptr = self

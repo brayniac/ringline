@@ -69,6 +69,12 @@ struct Args {
     /// `--stream-sets`, whose recv sink a direct connection does not fill.
     #[arg(long)]
     recv_direct: bool,
+    /// ringline only: write each response into send-pool slots with
+    /// `SendHalf::send_with`. GET values go from the store into the pool
+    /// with one copy, where the default path copies them into a response
+    /// buffer and then into the pool. Not with `--zc-get`.
+    #[arg(long)]
+    writer: bool,
     /// Seconds between diag lines.
     #[arg(long, default_value_t = 10)]
     diag_secs: u64,
@@ -77,7 +83,8 @@ struct Args {
 impl Args {
     fn opts(&self) -> resp::Opts {
         resp::Opts {
-            zc_min: self.zc_get,
+            // The writer arm takes every GET value from `Out::vals`.
+            zc_min: if self.writer { 1 } else { self.zc_get },
             stream_min: self.stream_sets,
         }
     }
@@ -86,7 +93,7 @@ impl Args {
 fn main() {
     let args = Args::parse();
     eprintln!(
-        "resp-server: runtime={:?} workers={} multishot={} direct={} incremental={} recv_buffers={} send_slot={} zc_get={} stream_sets={} addr={}",
+        "resp-server: runtime={:?} workers={} multishot={} direct={} incremental={} recv_buffers={} send_slot={} zc_get={} stream_sets={} writer={} addr={}",
         args.runtime,
         args.workers,
         args.recv_multishot,
@@ -96,11 +103,16 @@ fn main() {
         args.send_slot,
         args.zc_get,
         args.stream_sets,
+        args.writer,
         args.addr
     );
     assert!(
         !(args.recv_direct && args.stream_sets > 0),
         "--recv-direct and --stream-sets do not combine"
+    );
+    assert!(
+        !(args.writer && (args.zc_get > 0 || args.runtime != Runtime::Ringline)),
+        "--writer is a ringline arm and replaces --zc-get"
     );
     diag::spawn(matches!(args.runtime, Runtime::Ringline), args.diag_secs);
     match args.runtime {
@@ -263,6 +275,7 @@ mod ringline_arm {
     use std::sync::OnceLock;
 
     static OPTS: OnceLock<resp::Opts> = OnceLock::new();
+    static WRITER: OnceLock<bool> = OnceLock::new();
 
     struct BytesGuard(bytes::Bytes);
     impl SendGuard for BytesGuard {
@@ -277,7 +290,45 @@ mod ringline_arm {
     /// Send `out`: copy parts and zero-copy values, in order, in batches of
     /// at most 8 guards and 32 parts. Falls back to one copied send if a
     /// batch is refused.
+    /// Write `out` into send-pool slots: the response bytes, with each value
+    /// written from the store at its offset. Falls back to one copied send,
+    /// waiting for capacity, if the pool cannot take it now.
+    async fn flush_writer(tx: &mut ringline::SendHalf, out: &mut resp::Out) -> bool {
+        use std::io::Write as _;
+        let r = tx.send_with(|w| {
+            let mut at = 0;
+            for (off, v) in out.vals.iter() {
+                w.write_all(&out.buf[at..*off])?;
+                w.write_all(v)?;
+                at = *off;
+            }
+            w.write_all(&out.buf[at..])
+        });
+        let ok = match r {
+            Ok(Ok(())) => true,
+            _ => {
+                let mut all = Vec::new();
+                let mut at = 0;
+                for (off, v) in out.vals.iter() {
+                    all.extend_from_slice(&out.buf[at..*off]);
+                    all.extend_from_slice(v);
+                    at = *off;
+                }
+                all.extend_from_slice(&out.buf[at..]);
+                let t = std::time::Instant::now();
+                let r = tx.send_backpressured(&all).await.is_ok();
+                crate::diag::note_wait(t.elapsed().as_micros() as u64);
+                r
+            }
+        };
+        out.clear();
+        ok
+    }
+
     async fn flush(tx: &mut ringline::SendHalf, out: &mut resp::Out) -> bool {
+        if *WRITER.get().unwrap_or(&false) {
+            return flush_writer(tx, out).await;
+        }
         if out.vals.is_empty() {
             let ok = tx.send_nowait(&out.buf).is_ok() || {
                 let t = std::time::Instant::now();
@@ -404,6 +455,7 @@ mod ringline_arm {
 
     pub fn run(args: &Args) {
         OPTS.set(args.opts()).ok();
+        WRITER.set(args.writer).ok();
         let mut builder = ConfigBuilder::new()
             .workers(args.workers)
             .pin_to_core(true)

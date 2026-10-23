@@ -1721,6 +1721,39 @@ impl Driver {
         Ok(driver)
     }
 
+    /// For a `SendWriter`: `Some((slot_size, slot_count))` when `conn` can
+    /// be written into pool slots (a plaintext connection), `None` when the
+    /// writer buffers and sends at commit (TLS). `NotConnected` for a stale
+    /// or closing connection.
+    pub(crate) fn writer_pool(
+        &mut self,
+        conn: crate::handler::ConnToken,
+    ) -> std::io::Result<Option<(usize, usize)>> {
+        if self
+            .connections
+            .get(conn.index)
+            .is_none_or(|c| c.generation != conn.generation)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "stale connection",
+            ));
+        }
+        if self.send_queues[conn.index as usize].close_submitted {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "connection closing",
+            ));
+        }
+        if self.tls_table.as_ref().is_some_and(|t| t.has(conn.index)) {
+            return Ok(None);
+        }
+        Ok(Some((
+            self.send_copy_pool.slot_size() as usize,
+            self.send_copy_pool.slot_count(),
+        )))
+    }
+
     /// Construct a [`DriverCtx`] by borrowing driver fields.
     ///
     /// Borrows `self` mutably, so callers cannot access individual driver

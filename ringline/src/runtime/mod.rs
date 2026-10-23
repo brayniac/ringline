@@ -25,6 +25,7 @@ pub(crate) mod io;
 pub(crate) mod join;
 pub(crate) mod select;
 pub(crate) mod send_completion;
+pub(crate) mod send_writer;
 pub(crate) mod stream;
 pub(crate) mod task;
 pub(crate) mod waker;

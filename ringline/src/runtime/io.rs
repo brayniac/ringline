@@ -4266,6 +4266,14 @@ impl Connection {
         self.tx.send_nowait(data)
     }
 
+    /// See [`SendHalf::send_with`].
+    pub fn send_with<R>(
+        &mut self,
+        f: impl FnOnce(&mut crate::runtime::send_writer::SendWriter<'_>) -> R,
+    ) -> io::Result<R> {
+        self.tx.send_with(f)
+    }
+
     /// See [`SendHalf::send_parts`].
     pub fn send_parts(&mut self) -> AsyncSendBuilder {
         self.tx.send_parts()
@@ -4466,6 +4474,25 @@ impl SendHalf {
     /// See [`SendHalf::send_nowait`].
     pub fn send_nowait(&mut self, data: &[u8]) -> io::Result<()> {
         self.conn.send_nowait(data)
+    }
+
+    /// Run `f` with a writer over send-pool slots, then queue what it wrote
+    /// on this connection, as one send. Fire-and-forget, like
+    /// [`send_nowait`](Self::send_nowait).
+    ///
+    /// On io_uring a plaintext connection's bytes are written straight into
+    /// send-pool slots, so the send costs no copy beyond the encoding. On a
+    /// TLS connection, and on mio, the writer fills a buffer that is then
+    /// sent as `send_nowait` sends it.
+    ///
+    /// If a write found the pool exhausted, nothing is sent and this returns
+    /// `Err`, whatever `f` returned. `NotConnected` for a stale or closing
+    /// connection.
+    pub fn send_with<R>(
+        &mut self,
+        f: impl FnOnce(&mut crate::runtime::send_writer::SendWriter<'_>) -> R,
+    ) -> io::Result<R> {
+        crate::runtime::send_writer::send_with(self.conn.token(), f)
     }
 
     /// See [`SendHalf::send_parts`].

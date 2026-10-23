@@ -9,6 +9,9 @@
 #   ring    --runtime ringline                (one-shot ring receives, the
 #                                               default)
 #   direct  --runtime ringline --recv-direct
+#   writer  --runtime ringline --recv-direct --writer  (responses encoded
+#                                               into send-pool slots with
+#                                               SendHalf::send_with)
 # Both ringline arms take `send_slot` (send-pool slot size, default 16384;
 # resp-server keeps the pool at 256 MiB per worker). At 131072 a batch of
 # sixteen 4 KiB GET replies goes out as one send instead of five.
@@ -75,6 +78,7 @@ sudo sysctl -w net.core.somaxconn=65535 net.ipv4.tcp_max_syn_backlog=65535 net.c
 case "{arm}" in
   ring)   args="--runtime ringline --send-slot {send_slot}" ;;
   direct) args="--runtime ringline --recv-direct --send-slot {send_slot}" ;;
+  writer) args="--runtime ringline --recv-direct --writer --send-slot {send_slot}" ;;
   tokio)  args="--runtime tokio-pc" ;;
   *) echo "BAD ARM {arm}"; exit 1 ;;
 esac
