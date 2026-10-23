@@ -554,15 +554,17 @@ impl<'a> DriverCtx<'a> {
         };
 
         // Chunk data that exceeds the send copy slot size. Each chunk gets its
-        // own pool slot and SQE; the per-connection send queue ensures they are
-        // transmitted in order. Only the final chunk carries the send's id, so
-        // the send settles once.
+        // own pool slot; only the final chunk carries the send's id, so the
+        // send settles once. A send of one chunk goes through
+        // `submit_or_queue`. The chunks of a larger send are queued together
+        // and then submitted by `submit_queued_run`, which sends up to 32 of
+        // them as one `sendmsg` when nothing is in flight and the send slab
+        // has a free entry, instead of the first slot alone.
         //
-        // `submit_or_queue` is infallible: it pushes to the ring only while
-        // nothing is in flight (the first chunk) and parks that chunk at the
-        // queue head if the SQ is full; every later chunk is queued behind
-        // it. So once the reservation is granted the whole buffer is
+        // Both are infallible: an SQE that cannot be pushed is parked at the
+        // queue head. So once the reservation is granted the whole buffer is
         // committed, in order.
+        let several = needed >= 2;
         let mut chunks = data.chunks(slot_size).peekable();
         if chunks.peek().is_none()
             && let Some(id) = id
@@ -594,7 +596,14 @@ impl<'a> DriverCtx<'a> {
                 total_len: chunk.len() as u32,
             };
 
-            self.submit_or_queue(conn.index, built);
+            if several {
+                self.send_queues[conn.index as usize].queue.push_back(built);
+            } else {
+                self.submit_or_queue(conn.index, built);
+            }
+        }
+        if several {
+            self.submit_queued_run(conn.index);
         }
 
         // Every promised slot was filled; this returns a zero remainder.
@@ -777,6 +786,8 @@ impl<'a> DriverCtx<'a> {
             }
         };
 
+        // Queued together and submitted as one run, as in `send_inner`.
+        let several = needed >= 2;
         let mut chunks = data.chunks(slot_size).peekable();
         let mut attached = false;
         while let Some(chunk) = chunks.next() {
@@ -807,7 +818,14 @@ impl<'a> DriverCtx<'a> {
                 total_len: chunk.len() as u32,
             };
 
-            self.submit_or_queue(conn.index, built);
+            if several {
+                self.send_queues[conn.index as usize].queue.push_back(built);
+            } else {
+                self.submit_or_queue(conn.index, built);
+            }
+        }
+        if several {
+            self.submit_queued_run(conn.index);
         }
 
         // Every promised slot was filled; this returns a zero remainder.
@@ -886,13 +904,18 @@ impl<'a> DriverCtx<'a> {
     }
 
     /// Queue a batch of built sends in order through the per-connection
-    /// send queue. Infallible: `submit_or_queue` parks under SQ pressure
-    /// rather than failing, so every entry is committed in order and nothing
-    /// needs releasing here.
+    /// send queue. Two or more go out as one run (`submit_queued_run`).
+    /// Infallible: both paths park under SQ pressure rather than failing, so
+    /// every entry is committed in order and nothing needs releasing here.
     pub(crate) fn queue_built_sends(&mut self, conn_index: u32, sends: Vec<BuiltSend>) {
-        for built in sends {
-            self.submit_or_queue(conn_index, built);
+        if sends.len() < 2 {
+            for built in sends {
+                self.submit_or_queue(conn_index, built);
+            }
+            return;
         }
+        self.send_queues[conn_index as usize].queue.extend(sends);
+        self.submit_queued_run(conn_index);
     }
 
     /// Submit a built send SQE, or queue it if a send is already in flight.
@@ -928,6 +951,52 @@ impl<'a> DriverCtx<'a> {
                 state.in_flight = true;
                 state.parked = true;
                 let generation = self.connections.generation(conn_index);
+                self.pending_send_retries.push((conn_index, generation, 0));
+            }
+        }
+    }
+
+    /// Submit the sends just queued on `conn_index`, as one `sendmsg`
+    /// (`submit_coalesced_run`), or the head alone if the run cannot be
+    /// coalesced. With a send already in flight
+    /// or a chain active they wait in the queue, as in `submit_or_queue`.
+    /// Infallible in the same way: on a full SQ the head is parked and the
+    /// connection goes on `pending_send_retries`.
+    pub(crate) fn submit_queued_run(&mut self, conn_index: u32) {
+        let chain_active = self.chain_table.is_active(conn_index);
+        let ci = conn_index as usize;
+        let state = &mut self.send_queues[ci];
+        if state.in_flight || chain_active || state.queue.is_empty() {
+            state.in_flight |= !state.queue.is_empty();
+            return;
+        }
+        state.in_flight = true;
+        let generation = self.connections.generation(conn_index);
+        // SAFETY: see the `tls_table` field.
+        let conn_is_tls = !self.tls_table.is_null() && unsafe { (*self.tls_table).has(conn_index) };
+        let pushed = crate::backend::uring::driver::submit_coalesced_run(
+            crate::backend::uring::driver::RunParts {
+                ring: self.ring,
+                send_slab: self.send_slab,
+                send_copy_pool: self.send_copy_pool,
+                send_queues: self.send_queues,
+                pending_send_retries: self.pending_send_retries,
+            },
+            conn_index,
+            generation,
+            conn_is_tls,
+            0,
+        );
+        if pushed.is_some() {
+            return;
+        }
+        let state = &mut self.send_queues[ci];
+        match unsafe { self.ring.push_sqe(&state.queue[0].entry) } {
+            Ok(()) => {
+                state.queue.pop_front();
+            }
+            Err(_) => {
+                state.parked = true;
                 self.pending_send_retries.push((conn_index, generation, 0));
             }
         }

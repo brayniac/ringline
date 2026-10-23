@@ -151,6 +151,12 @@ Ok(())
 parking made `submit_or_queue` infallible that arm became unreachable and was
 removed.)
 
+(Superseded for sends of two or more slots: their chunks are queued
+together and submitted as one run, `DriverCtx::submit_queued_run`. The
+conclusion below still holds: queueing cannot fail, and a push that finds
+the SQ full parks the run, or its head, instead of failing. The paragraph's
+"releasing that slot" predates parking.)
+
 Why this is transactional: `submit_or_queue` pushes to the ring only when
 the connection has no send in flight, i.e. only for chunk 1; once chunk 1 is
 accepted, `in_flight` is set and every later chunk is queued, which cannot

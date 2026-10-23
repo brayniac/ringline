@@ -2990,130 +2990,24 @@ impl Driver {
     /// restarting at zero; every other caller goes through the public
     /// wrapper with `0`.
     pub(crate) fn submit_next_queued_inner(&mut self, conn_index: u32, attempts: u8) -> bool {
-        use crate::buffer::send_slab::MAX_IOVECS;
-
         let ci = conn_index as usize;
 
-        // Coalesce a run of consecutive copy sends (pool_slot set, no ZC
-        // slab), plaintext or TLS ciphertext, at the front of the queue into a
-        // single `sendmsg`, so more than one queued send is pipelined per CQE
-        // round-trip (#628). Order is preserved (one SQE; iovec order = FIFO
-        // queue order), which keeps TLS records in sequence. ZC-guard sends
-        // and recv-buffer forwards are not coalescable and fall through to the
-        // single-submit path below. A run can span several logical sends: the
-        // slab entry records each one's id and where its bytes end, and the
-        // completion settles each with its own result.
-        let coalescable =
-            |b: &crate::handler::BuiltSend| b.pool_slot != u16::MAX && b.slab_idx == u16::MAX;
-        let n = self.send_queues[ci]
-            .queue
-            .iter()
-            .take(MAX_IOVECS)
-            .take_while(|b| coalescable(b))
-            .count();
-        if n >= 2 {
-            let mut pool_slots = [u16::MAX; MAX_IOVECS];
-            {
-                let q = &self.send_queues[ci].queue;
-                for (i, slot) in pool_slots.iter_mut().enumerate().take(n) {
-                    *slot = q[i].pool_slot;
-                }
-            }
-            let mut iovecs = [libc::iovec {
-                iov_base: std::ptr::null_mut(),
-                iov_len: 0,
-            }; MAX_IOVECS];
-            let mut total: u32 = 0;
-            // The awaited sends the run settles, lifted off the final slots
-            // that carry them (see below), each with where its bytes end in
-            // the run, and the slot each came from.
-            let mut sends = [None; MAX_IOVECS];
-            let mut send_count = 0;
-            for i in 0..n {
-                let (ptr, len) = self.send_copy_pool.current_ptr_remaining(pool_slots[i]);
-                iovecs[i] = libc::iovec {
-                    iov_base: ptr as *mut libc::c_void,
-                    iov_len: len as usize,
-                };
-                total += len;
-                if let Some((id, logical_len)) = self.send_copy_pool.take_send_id(pool_slots[i]) {
-                    sends[send_count] = Some((pool_slots[i], id, logical_len, total));
-                    send_count += 1;
-                }
-            }
-            // A run with TLS ciphertext closes the connection on a send error.
-            let tls_run = self.tls_table.as_ref().is_some_and(|t| t.has(conn_index))
-                || self.send_queues[ci].queue.iter().take(n).any(|b| {
-                    crate::completion::UserData(b.entry.user_data).tag() == Some(OpTag::TlsSend)
-                });
-            // Put every lifted id back on its slot, for the paths that leave
-            // the run queued and still owning its slots.
-            let restore = |pool: &mut crate::buffer::send_copy::SendCopyPool| {
-                for &(slot, id, logical_len, _) in sends[..send_count].iter().flatten() {
-                    pool.set_send_id(slot, id, logical_len);
-                }
-            };
-            // The coalesced completion releases every pool slot in the run, so
-            // an id cannot stay on the final slot that carried it; it
-            // moves onto the slab entry, which outlives them. Taken, not
-            // peeked: leaving a copy behind would let both the slab entry and
-            // the slot claim the same operation, and `SendCopyPool::release`
-            // would then trip on the slot the handler is about to free.
-            // Both failure paths below put the ids back (`restore`), because
-            // they leave the run queued and still owning its slots.
-            //
-            // Only commit to coalescing if the slab has room; otherwise fall
-            // through to single-submit (nothing popped yet).
-            if let Some((slab_idx, msg_ptr)) = self.send_slab.allocate_coalesced(
-                conn_index,
-                self.connections.generation(conn_index),
-                &iovecs[..n],
-                &pool_slots[..n],
-                total,
-                sends[..send_count]
-                    .iter()
-                    .flatten()
-                    .map(|&(_, id, logical_len, end)| (id, logical_len, end)),
-                tls_run,
-            ) {
-                match self
-                    .ring
-                    .submit_send_msg_coalesced(conn_index, msg_ptr, slab_idx)
-                {
-                    Ok(()) => {
-                        // Pushed: the slab entry now owns the run's pool
-                        // slots (released by the coalesced completion).
-                        for _ in 0..n {
-                            self.send_queues[ci].queue.pop_front();
-                        }
-                        self.send_queues[ci].parked = false;
-                        return true;
-                    }
-                    Err(_) => {
-                        // SQ still full after submit. `allocate_coalesced`
-                        // only *recorded* the pool slots in the slab entry;
-                        // the `BuiltSend`s still at the queue head own them.
-                        // Release just the slab entry and park: the run stays
-                        // queued in order, `in_flight` stays true, and
-                        // `drain_send_retries` re-pushes next iteration.
-                        // The lifted send id goes back on its slot
-                        // for the same reason — the retry re-lifts it, and
-                        // if teardown gets there first the slot is what
-                        // teardown reads.
-                        self.send_slab.release(slab_idx);
-                        restore(&mut self.send_copy_pool);
-                        self.send_queues[ci].parked = true;
-                        let generation = self.connections.generation(conn_index);
-                        self.pending_send_retries
-                            .push((conn_index, generation, attempts));
-                        return false;
-                    }
-                }
-            }
-            // slab full → fall through to single-submit. Nothing was popped
-            // and the run still owns its slots, so the lifted ids go back
-            // where the single-submit path (and teardown) will find them.
-            restore(&mut self.send_copy_pool);
+        let generation = self.connections.generation(conn_index);
+        let conn_is_tls = self.tls_table.as_ref().is_some_and(|t| t.has(conn_index));
+        if let Some(pushed) = submit_coalesced_run(
+            RunParts {
+                ring: &mut self.ring,
+                send_slab: &mut self.send_slab,
+                send_copy_pool: &mut self.send_copy_pool,
+                send_queues: &mut self.send_queues,
+                pending_send_retries: &mut self.pending_send_retries,
+            },
+            conn_index,
+            generation,
+            conn_is_tls,
+            attempts,
+        ) {
+            return pushed;
         }
 
         let state = &mut self.send_queues[ci];
@@ -4168,6 +4062,156 @@ impl Driver {
         // the last clone drops), so don't close it here: a double-close would
         // race against fd-number reuse.
     }
+}
+
+/// The driver state that [`submit_coalesced_run`] reads and changes,
+/// borrowed from the `Driver` or from a `DriverCtx`.
+pub(crate) struct RunParts<'a> {
+    pub(crate) ring: &'a mut crate::backend::Ring,
+    pub(crate) send_slab: &'a mut crate::buffer::send_slab::InFlightSendSlab,
+    pub(crate) send_copy_pool: &'a mut crate::buffer::send_copy::SendCopyPool,
+    pub(crate) send_queues: &'a mut [crate::handler::ConnSendState],
+    pub(crate) pending_send_retries: &'a mut Vec<(u32, u32, u8)>,
+}
+
+/// Submit the run of consecutive copy sends at the head of `conn_index`'s
+/// send queue as one `sendmsg`. Returns `None` when the head is not a run
+/// of at least two or the send slab is full, with nothing changed, and the
+/// caller submits the head alone. Returns `Some(true)` when the run was
+/// pushed and popped off the queue, and `Some(false)` when the SQ was full:
+/// the run stays queued, parked, and on `pending_send_retries` with
+/// `attempts`.
+pub(crate) fn submit_coalesced_run(
+    p: RunParts<'_>,
+    conn_index: u32,
+    generation: u32,
+    conn_is_tls: bool,
+    attempts: u8,
+) -> Option<bool> {
+    use crate::buffer::send_slab::MAX_IOVECS;
+
+    let ci = conn_index as usize;
+    // Coalesce a run of consecutive copy sends (pool_slot set, no ZC
+    // slab), plaintext or TLS ciphertext, at the front of the queue into a
+    // single `sendmsg`, so more than one queued send is pipelined per CQE
+    // round-trip (#628). Order is preserved (one SQE; iovec order = FIFO
+    // queue order), which keeps TLS records in sequence. ZC-guard sends
+    // and recv-buffer forwards are not coalescable and fall through to the
+    // single-submit path below. A run can span several logical sends: the
+    // slab entry records each one's id and where its bytes end, and the
+    // completion settles each with its own result.
+    let coalescable =
+        |b: &crate::handler::BuiltSend| b.pool_slot != u16::MAX && b.slab_idx == u16::MAX;
+    let n = p.send_queues[ci]
+        .queue
+        .iter()
+        .take(MAX_IOVECS)
+        .take_while(|b| coalescable(b))
+        .count();
+    if n >= 2 {
+        let mut pool_slots = [u16::MAX; MAX_IOVECS];
+        {
+            let q = &p.send_queues[ci].queue;
+            for (i, slot) in pool_slots.iter_mut().enumerate().take(n) {
+                *slot = q[i].pool_slot;
+            }
+        }
+        let mut iovecs = [libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 0,
+        }; MAX_IOVECS];
+        let mut total: u32 = 0;
+        // The awaited sends the run settles, lifted off the final slots
+        // that carry them (see below), each with where its bytes end in
+        // the run, and the slot each came from.
+        let mut sends = [None; MAX_IOVECS];
+        let mut send_count = 0;
+        for i in 0..n {
+            let (ptr, len) = p.send_copy_pool.current_ptr_remaining(pool_slots[i]);
+            iovecs[i] = libc::iovec {
+                iov_base: ptr as *mut libc::c_void,
+                iov_len: len as usize,
+            };
+            total += len;
+            if let Some((id, logical_len)) = p.send_copy_pool.take_send_id(pool_slots[i]) {
+                sends[send_count] = Some((pool_slots[i], id, logical_len, total));
+                send_count += 1;
+            }
+        }
+        // A run with TLS ciphertext closes the connection on a send error.
+        let tls_run = conn_is_tls
+            || p.send_queues[ci].queue.iter().take(n).any(|b| {
+                crate::completion::UserData(b.entry.user_data).tag() == Some(OpTag::TlsSend)
+            });
+        // Put every lifted id back on its slot, for the paths that leave
+        // the run queued and still owning its slots.
+        let restore = |pool: &mut crate::buffer::send_copy::SendCopyPool| {
+            for &(slot, id, logical_len, _) in sends[..send_count].iter().flatten() {
+                pool.set_send_id(slot, id, logical_len);
+            }
+        };
+        // The coalesced completion releases every pool slot in the run, so
+        // an id cannot stay on the final slot that carried it; it
+        // moves onto the slab entry, which outlives them. Taken, not
+        // peeked: leaving a copy behind would let both the slab entry and
+        // the slot claim the same operation, and `SendCopyPool::release`
+        // would then trip on the slot the handler is about to free.
+        // Both failure paths below put the ids back (`restore`), because
+        // they leave the run queued and still owning its slots.
+        //
+        // Only commit to coalescing if the slab has room; otherwise fall
+        // through to single-submit (nothing popped yet).
+        if let Some((slab_idx, msg_ptr)) = p.send_slab.allocate_coalesced(
+            conn_index,
+            generation,
+            &iovecs[..n],
+            &pool_slots[..n],
+            total,
+            sends[..send_count]
+                .iter()
+                .flatten()
+                .map(|&(_, id, logical_len, end)| (id, logical_len, end)),
+            tls_run,
+        ) {
+            match p
+                .ring
+                .submit_send_msg_coalesced(conn_index, msg_ptr, slab_idx)
+            {
+                Ok(()) => {
+                    // Pushed: the slab entry now owns the run's pool
+                    // slots (released by the coalesced completion).
+                    for _ in 0..n {
+                        p.send_queues[ci].queue.pop_front();
+                    }
+                    p.send_queues[ci].parked = false;
+                    return Some(true);
+                }
+                Err(_) => {
+                    // SQ still full after submit. `allocate_coalesced`
+                    // only *recorded* the pool slots in the slab entry;
+                    // the `BuiltSend`s still at the queue head own them.
+                    // Release just the slab entry and park: the run stays
+                    // queued in order, `in_flight` stays true, and
+                    // `drain_send_retries` re-pushes next iteration.
+                    // The lifted send id goes back on its slot
+                    // for the same reason — the retry re-lifts it, and
+                    // if teardown gets there first the slot is what
+                    // teardown reads.
+                    p.send_slab.release(slab_idx);
+                    restore(p.send_copy_pool);
+                    p.send_queues[ci].parked = true;
+                    p.pending_send_retries
+                        .push((conn_index, generation, attempts));
+                    return Some(false);
+                }
+            }
+        }
+        // slab full → fall through to single-submit. Nothing was popped
+        // and the run still owns its slots, so the lifted ids go back
+        // where the single-submit path (and teardown) will find them.
+        restore(p.send_copy_pool);
+    }
+    None
 }
 
 #[cfg(test)]
