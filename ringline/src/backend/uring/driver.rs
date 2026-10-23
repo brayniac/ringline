@@ -1097,8 +1097,9 @@ pub(crate) struct Driver {
     /// found bytes queued ahead of the end of the stream, or found the end
     /// with bytes buffered or a receive in flight
     /// (`ConnectionState::hangup_recheck`). `recheck_hangups` peeks again
-    /// once a receive has delivered bytes and nothing is buffered, so the end
-    /// is seen even if no read parks after the bytes are consumed.
+    /// once `hangup_recheck_due` is set and nothing is buffered, armed or
+    /// parking, so the end is seen even if no read parks after the bytes are
+    /// consumed.
     pub(crate) hangup_rechecks: Vec<(u32, u32)>,
     /// `Config::recv_direct_region`.
     pub(crate) recv_direct_region: usize,

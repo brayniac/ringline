@@ -178,7 +178,7 @@ pub struct ConnectionState {
     pub hangup_recheck: bool,
     /// A direct receive delivered bytes since the last recheck peek, or a
     /// peek found the end with bytes buffered or a receive in flight, so the
-    /// next time nothing is buffered or armed, another peek is due.
+    /// next time nothing is buffered, armed or parking, another peek is due.
     #[cfg(has_io_uring)]
     pub hangup_recheck_due: bool,
     /// The errno a hangup peek returned while the connection stayed open (bytes
