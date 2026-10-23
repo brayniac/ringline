@@ -1024,6 +1024,10 @@ impl ConfigBuilder {
     // ── Buffer settings ──────────────────────────────────────────────
 
     /// Set recv buffer configuration.
+    ///
+    /// On io_uring this affects TLS connections only: a plaintext
+    /// connection receives directly into its accumulator (see
+    /// [`connect`](crate::connect)).
     pub fn recv_buffer(mut self, ring_size: u16, buffer_size: u32) -> Self {
         self.config.recv_buffer.ring_size = ring_size;
         self.config.recv_buffer.buffer_size = buffer_size;
@@ -1045,6 +1049,10 @@ impl ConfigBuilder {
     ///
     /// io_uring only; the mio backend reads on readiness.
     /// **Default: false**.
+    ///
+    /// On io_uring this affects TLS connections only: a plaintext
+    /// connection receives directly into its accumulator (see
+    /// [`connect`](crate::connect)).
     pub fn recv_multishot(mut self, enabled: bool) -> Self {
         self.config.recv_multishot = enabled;
         self
@@ -1074,6 +1082,10 @@ impl ConfigBuilder {
     /// The ring kind is an io_uring choice; the mio backend uses its own
     /// receive buffers. **Default: false**, which keeps the plain ring
     /// `recv_buffer` sets (256 × 16 KiB by default).
+    ///
+    /// On io_uring this affects TLS connections only: a plaintext
+    /// connection receives directly into its accumulator (see
+    /// [`connect`](crate::connect)).
     pub fn recv_incremental(mut self, enabled: bool) -> Self {
         self.config.recv_incremental = enabled;
         self
@@ -1150,6 +1162,10 @@ impl ConfigBuilder {
     /// with `recv_incremental(true)`, where the lend cap decides.
     ///
     /// Default: 64 (a quarter of the default 256-buffer recv ring).
+    ///
+    /// On io_uring this affects TLS connections only: a plaintext
+    /// connection receives directly into its accumulator (see
+    /// [`connect`](crate::connect)).
     pub fn recv_segment_reserve(mut self, reserve: u32) -> Self {
         self.config.recv_segment_reserve = reserve;
         self
@@ -1203,6 +1219,10 @@ impl ConfigBuilder {
     /// (64 MiB at the default 64 × 1 MiB). Must be `>= 1`.
     ///
     /// Default: 64 (2× `MAX_IOVECS`).
+    ///
+    /// On io_uring this affects TLS connections only: a plaintext
+    /// connection receives directly into its accumulator (see
+    /// [`connect`](crate::connect)).
     pub fn forward_hold_cap(mut self, cap: usize) -> Self {
         self.config.forward_hold_cap = cap;
         self

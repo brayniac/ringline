@@ -184,12 +184,11 @@ zero, and a stale generation behaves as EOF rather than exposing the new slot
 occupant.
 
 A plaintext connection on io_uring, accepted or outbound, receives directly
-into its accumulator (`docs/recv-direct-design.md`). On the receive path of a
-TLS connection on io_uring, the kernel first writes ciphertext into a provided
-buffer. A parser
-can consume a pending buffer directly in the immediate fast path; otherwise the runtime copies it into the per-connection accumulator and
-returns its buffer ID to the ring. `with_bytes` provides zero-copy slicing after
-that gather step, not a permanent reference to kernel-owned ring memory.
+into its accumulator (`docs/recv-direct-design.md`). A TLS connection on
+io_uring receives ciphertext into a provided buffer, feeds it to rustls and
+returns the buffer to the ring; rustls copies the plaintext into the
+accumulator. `with_bytes` provides zero-copy slicing of the accumulator, not a
+reference to kernel-owned ring memory.
 
 `send_nowait` eagerly submits an owned copy and returns without a future.
 `send` also submits eagerly but returns `SendFuture`, which waits for the

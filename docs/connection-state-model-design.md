@@ -125,7 +125,7 @@ so it can be reconsidered separately (see Follow-ups).
   `docs/send-completion-design.md`. Their docs gain one sentence each
   tying them to `Lifecycle::Closing`.
 - `active`, `established`, `outbound`, `generation`, `peer_addr`,
-  `connect_timeout_armed`, `recv_multishot_armed`, `direct_echo`.
+  `connect_timeout_armed`, `recv_multishot_armed`.
   `recv_multishot_armed` overlaps `recv_arm == Multi` on io_uring; leaving
   it is deliberate (its semantics include "the kernel still pins the
   socket", which the arming field does not promise). Follow-up.

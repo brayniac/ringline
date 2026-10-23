@@ -264,7 +264,7 @@ pub mod park_abandon {
     /// The `FixedFdInstall` failed, or the linked recv-cancel returned
     /// `ECANCELED` because the recv had self-terminated.
     pub const INSTALL_FAILED: usize = 13;
-    /// A direct receive or the hangup poll was armed when the install
+    /// A receive, a hangup poll or a hangup peek was armed when the install
     /// completed. Arms are refused while a park is pending, so this counts
     /// a path that armed one anyway.
     pub const RECEIVE_ARMED: usize = 14;

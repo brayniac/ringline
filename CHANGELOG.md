@@ -20,28 +20,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `connect_unix`, receives into its own accumulator instead of the shared
   provided buffer ring: a one-shot `RECV` into the accumulator's free space,
   armed when a read parks. There is no option to turn it off; a TLS
-  connection receives through the ring. `with_data`, `with_bytes`, `with_data_result` and
-  `recv_ready` read it unchanged, without the copy from a provided buffer.
-  An idle connection holds a buffer of `ConfigBuilder::recv_direct_region`
-  bytes (default 32 KiB), or of `recv_accumulator_capacity` if that is
-  larger and at most twice the region; a larger message borrows a buffer
-  from a per-worker pool of up to `ConfigBuilder::recv_direct_pool_max` free
-  bytes (default 16 MiB) and gives it back when nothing is buffered and no
-  `Bytes` read from it is alive. A `ConnStream` read arms the receive the
-  same way. Reads that need provided buffers (`segments`,
-  `recv_owned_segment`, `with_segments`, `with_bytes_segments`,
-  `forward_to`) return `io::ErrorKind::Unsupported` on such a connection. `forward_to_conn` from such a connection sends each received
-  chunk from the accumulator through the sink's send queue, zero-copy at or
-  above `send_zc_threshold`. Counters in `ringline/recv_direct`.
-  `ConnCtx::is_recv_direct` (also on `Connection` and `RecvHalf`) tells
-  whether a connection receives this way. Against Valkey and memcached with
-  1,000 connections (63 per worker), client CPU at a fixed rate was 1.8 to
-  6.8% lower than the ring at 4 KiB pipelined and larger values, and within
-  1% at 64 B and 4 KiB unpipelined. Against memcached with 16,000
-  connections (1,000 per worker) and no rate limit, client CPU per GET was
-  11% lower at 4 KiB depth 16 (two runs) and 12% lower at 64 KiB depth 1
-  (one run), and 2 to 4% higher at 64 B depth 1. See
-  `docs/recv-direct-design.md`.
+  connection receives through the ring. `with_data`, `with_bytes`,
+  `with_data_result` and `recv_ready` read it unchanged, without the copy
+  from a provided buffer. An idle connection holds a buffer of
+  `ConfigBuilder::recv_direct_region` bytes (default 32 KiB), or of
+  `recv_accumulator_capacity` if that is larger and at most twice the
+  region; a larger message borrows a buffer from a per-worker pool of up to
+  `ConfigBuilder::recv_direct_pool_max` free bytes (default 16 MiB) and gives
+  it back when nothing is buffered and no `Bytes` read from it is alive. A
+  `ConnStream` read arms the receive the same way. Reads that need provided
+  buffers (`segments`, `recv_owned_segment`, `with_segments`,
+  `with_bytes_segments`, `forward_to`) return `io::ErrorKind::Unsupported`
+  on such a connection. `forward_to_conn` from such a connection sends each
+  received chunk from the accumulator through the sink's send queue,
+  zero-copy at or above `send_zc_threshold`. Counters in
+  `ringline/recv_direct`. `ConnCtx::is_recv_direct` (also on `Connection`
+  and `RecvHalf`) tells whether a connection receives this way.
+  - As a client, against Valkey and memcached with 1,000 connections (63 per
+    worker), client CPU at a fixed rate was 1.8 to 6.8% lower than the ring
+    at 4 KiB pipelined and larger values, and within 1% at 64 B and 4 KiB
+    unpipelined. Against memcached with 16,000 connections (1,000 per
+    worker) and no rate limit, client CPU per GET was 11% lower at 4 KiB
+    depth 16 (two runs) and 12% lower at 64 KiB depth 1 (one run), and 2 to
+    4% higher at 64 B depth 1.
+  - As a RESP server with 8 workers and no rate limit, GET throughput and
+    server CPU per request matched the ring within the run-to-run spread,
+    and SET throughput was 6 to 13% higher. At 8,000 connections, GET p99 at
+    depth 16 was higher (86 to 94 ms against 68 to 75 ms at 64 B) and
+    resident memory was 0.3 to 0.6 GiB higher.
+  - See `docs/recv-direct-design.md`.
 - `direct_io_fsync` returns a future for an fsync of a direct I/O file. The
   fsync that `DriverCtx::direct_io_fsync` submits has no future, so a task
   could not wait for it.
@@ -590,9 +597,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **Breaking:** `enable_recv_forward`, `forward_held`, `run_direct_echo`
   (io_uring only, with `DirectEchoFuture`), `set_recv_sink` and
   `take_recv_sink`, wherever `ConnCtx`, `Connection` or `RecvHalf` had them,
-  on both backends. They read from the provided-buffer ring, which no io_uring
-  connection receives through except a TLS one, where they did nothing.
-  Echo or forward with `with_data` and `send_nowait` or
+  on both backends. On io_uring they read from the provided-buffer ring,
+  which no connection receives through any more except a TLS one, where they
+  did nothing. On mio `set_recv_sink`, `enable_recv_forward` and
+  `forward_held` worked on every connection, and code that used them there
+  no longer compiles. Echo or forward with `with_data` and `send_nowait` or
   `forward_recv_buf`, or with `forward_to_conn`.
 - **Breaking:** the client methods that read a value from provided-buffer
   segments, which a plaintext connection no longer has:
@@ -630,10 +639,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Fixed
 
 - io_uring: `recv_ready` resolves for bytes in a lent receive buffer and in
-  the segment hold, as well as for bytes in the accumulator. It stayed pending for a receive lent in place on a
-  connection with an empty accumulator until the next receive or the close,
-  and for bytes in the segment hold until the close or until the hold was
-  moved into the accumulator. mio is unchanged.
+  the segment hold, as well as for bytes in the accumulator. It stayed pending
+  for a receive lent in place on a connection with an empty accumulator until
+  the next receive or the close, and for bytes in the segment hold until the
+  close or until the hold was moved into the accumulator. mio is unchanged.
 - `ringline-redis`, `ringline-memcache`, `ringline-ping`:
   `CommandResult::rx_bytes` is 0 for an operation that fails at send. It
   reported the previous operation's byte count. The guarded SET paths
@@ -808,10 +817,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   recorded when each send is submitted to the kernel (#614).
 
 - On io_uring, a receive buffer sent in part by `forward_recv_buf` (on
-  `ConnCtx` or `SendHalf`) lost the rest of its bytes when the submission queue was full. The buffer went back to
-  the ring and the next send went out, leaving a gap in the stream. The rest
-  is now parked at the head of the send queue and retried. If it still
-  cannot be submitted, the connection is closed (#613).
+  `ConnCtx` or `SendHalf`) lost the rest of its bytes when the submission
+  queue was full. The buffer went back to the ring and the next send went out,
+  leaving a gap in the stream. The rest is now parked at the head of the send
+  queue and retried. If it still cannot be submitted, the connection is closed
+  (#613).
 
 - On io_uring, a send that filled the socket of a peer that had half-closed
   (sent its FIN) and was not reading made the worker's event loop spin until

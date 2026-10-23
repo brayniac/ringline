@@ -1452,6 +1452,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
             return;
         }
+        // A pending park waits for nothing to be armed. The hangup stays
+        // pending on the socket: the adopting worker's poll, or this one
+        // re-armed when the park is abandoned, completes at once.
+        if self.driver.park_pending(conn_index) {
+            return;
+        }
         // A peek that cannot be pushed leaves the connection as it was
         // without the poll: a read still sees the FIN.
         self.driver.submit_hangup_peek(conn_index);
@@ -2162,10 +2168,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
     /// Adopt connections other workers parked onto this one.
     ///
-    /// The parking worker cancelled its multishot recv before recovering the
-    /// fd — linked ahead of the install, so the cancel is guaranteed to have
-    /// run by the time the entry reached its channel. That is what makes it
-    /// safe to arm a recv here: no other worker is still reading this socket.
+    /// The parking worker installed the fd only once nothing was armed on the
+    /// socket there: its receive (a ring connection's multishot, or a direct
+    /// connection's receive and hangup poll) had ended (`drive_park_drains`).
+    /// That is what makes it safe to arm here: no other worker is still
+    /// reading this socket.
     fn drain_adopted(&mut self) {
         let Some(rx) = self.driver.park_rx.clone() else {
             return;
@@ -2256,7 +2263,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // receive armed, so it also waits for this park's cancel to end
             // the receive.
             let armed = self.driver.connections.get(conn_index).is_some_and(|c| {
-                c.recv_multishot_armed || c.recv_direct_armed || c.hangup_poll_armed
+                c.recv_multishot_armed
+                    || c.recv_direct_armed
+                    || c.hangup_poll_armed
+                    || c.hangup_peek_armed
             });
             if !armed && self.driver.park_blocker(conn_index).is_none() {
                 if self
@@ -2554,12 +2564,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // The install went out with nothing armed, and arms are refused while
         // the park is pending. One armed now would read on this worker after
         // the socket moved, so the park is abandoned instead.
-        if self
-            .driver
-            .connections
-            .get(conn_index)
-            .is_some_and(|c| c.recv_multishot_armed || c.recv_direct_armed || c.hangup_poll_armed)
-        {
+        if self.driver.connections.get(conn_index).is_some_and(|c| {
+            c.recv_multishot_armed
+                || c.recv_direct_armed
+                || c.hangup_poll_armed
+                || c.hangup_peek_armed
+        }) {
             debug_assert!(false, "a receive was armed while the park was pending");
             metrics::PARK_ABANDONED.increment(metrics::park_abandon::RECEIVE_ARMED);
             self.rearm_multishot_if_idle(conn_index);
@@ -2621,10 +2631,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// that arrived before the connection got here — the unconsumed remainder
     /// carried by a park (tier 3, #443).
     ///
-    /// Seeded *before* `arm_recv`, so a handler polled on this worker sees the
-    /// carried bytes ahead of anything the new recv delivers. Appending after
-    /// would put freshly received bytes in front of older ones and silently
-    /// reorder the peer's stream.
+    /// Seeded before any receive is armed (`arm_recv` for a TLS listener, the
+    /// first parked read for a plaintext one), so a handler polled on this
+    /// worker sees the carried bytes ahead of anything the new receive
+    /// delivers. Appending after would put freshly received bytes in front of
+    /// older ones and reorder the peer's stream.
     fn install_accepted_with_pending(
         &mut self,
         raw_fd: std::os::fd::RawFd,
@@ -2735,9 +2746,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         if let Some(cs) = self.driver.connections.get_mut(conn_index) {
             cs.established = true;
         }
-        if self.driver.arm_hangup_poll_or_close(conn_index) {
-            return;
-        }
+        self.driver.arm_hangup_poll(conn_index);
         metrics::CONNECTIONS.increment(metrics::conn::ACCEPTED);
         metrics::CONNECTIONS_ACTIVE.increment();
         self.spawn_accept_task(conn_index);
@@ -3703,24 +3712,18 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     }
 
     /// Give a direct connection back what a park cancelled or held off: its
-    /// hangup poll, a receive if the poll has already seen the peer leave,
-    /// and a wake for a reader that parked during the drain, whose receive
-    /// was refused then and is armed when it polls again.
+    /// hangup poll, and a wake for a reader that parked during the drain,
+    /// whose receive was refused then and is armed when it polls again. A
+    /// hangup the poll missed while it was cancelled is still pending on the
+    /// socket, so the new poll completes at once. The wake also goes to a
+    /// connection whose read half ended during the drain, so its reader
+    /// resolves.
     fn rearm_direct_after_park(&mut self, conn_index: u32) {
         let Some(c) = self.driver.connections.get(conn_index) else {
             return;
         };
-        if !matches!(c.lifecycle, Lifecycle::Open) || c.recv_finished() {
-            return;
-        }
-        let (poll_armed, hangup, recv_armed) =
-            (c.hangup_poll_armed, c.peer_hangup, c.recv_direct_armed);
-        // Either arm closes the connection if it cannot be pushed; the wake
-        // below then resolves the reader.
-        if !poll_armed && !hangup {
-            self.driver.arm_hangup_poll_or_close(conn_index);
-        } else if hangup && !recv_armed {
-            self.driver.arm_direct_recv_or_close(conn_index, None);
+        if matches!(c.lifecycle, Lifecycle::Open) && !c.recv_finished() && !c.hangup_poll_armed {
+            self.driver.arm_hangup_poll(conn_index);
         }
         self.executor.wake_recv(conn_index);
     }
@@ -6334,9 +6337,13 @@ mod tests {
         if !el.driver.ring.supports_park() {
             return;
         }
+        // Another connection's receive takes `direct_recvs` slot 0, so this
+        // connection's slot differs from its generation.
+        let other = accept_direct_connection(&mut el);
+        assert!(!el.driver.arm_direct_recv_or_close(other, None));
         let conn_index = accept_direct_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
-        assert!(!el.driver.arm_hangup_poll_or_close(conn_index));
+        el.driver.arm_hangup_poll(conn_index);
         assert!(!el.driver.arm_direct_recv_or_close(conn_index, None));
         assert_eq!(direct_flags(&el, conn_index), (true, true), "precondition");
         let slot = el
@@ -6347,7 +6354,16 @@ mod tests {
             .recv_direct_slot;
         el.driver.park_offered[conn_index as usize] = true;
 
+        el.driver.ring.pushed_cancels.clear();
         assert!(el.begin_park(conn_index, 1), "the park starts");
+        assert_eq!(
+            el.driver.ring.pushed_cancels,
+            vec![
+                UserData::encode(OpTag::RecvDirect, conn_index, slot).raw(),
+                UserData::encode(OpTag::HangupPoll, conn_index, generation).raw(),
+            ],
+            "the park cancels the direct receive by its slot and the hangup poll"
+        );
         assert!(
             el.driver.park_drain[conn_index as usize].is_some(),
             "it drains: there was something to cancel"
@@ -6418,6 +6434,29 @@ mod tests {
             (true, true),
             "the reader's next poll arms its receive"
         );
+    }
+
+    /// A connection installed on a plaintext listener is direct, with no
+    /// ring receive and `RecvArm::Idle`, so the re-arm paths gated on
+    /// `RecvArm::Multi` skip it, and its hangup poll is armed.
+    #[test]
+    fn an_accepted_plaintext_connection_is_installed_direct() {
+        let mut el = make_test_loop();
+        let (a, _b) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let fd = std::os::fd::IntoRawFd::into_raw_fd(a);
+        el.install_accepted(
+            fd,
+            crate::ListenerId::from_index(0),
+            crate::connection::PeerAddr::Tcp(std::net::SocketAddr::from(([127, 0, 0, 1], 1))),
+        );
+        let conn_index = (0..64u32)
+            .find(|&i| el.driver.connections.get(i).is_some_and(|c| c.established))
+            .expect("installed");
+        let c = el.driver.connections.get(conn_index).unwrap();
+        assert!(c.recv_direct, "direct");
+        assert_eq!(c.recv_arm, RecvArm::Idle);
+        assert!(!c.recv_multishot_armed, "no ring receive");
+        assert!(c.hangup_poll_armed, "the hangup poll is armed");
     }
 
     /// A direct connection with nothing armed installs at once.
@@ -9967,11 +10006,17 @@ mod tests {
             .get(conn_index)
             .unwrap()
             .recv_direct_slot;
+        el.driver.ring.pushed_cancels.clear();
         {
             let mut ctx = el.driver.make_ctx();
             ctx.cancel(crate::handler::ConnToken::new(conn_index, generation))
                 .expect("cancel");
         }
+        assert_eq!(
+            el.driver.ring.pushed_cancels,
+            vec![UserData::encode(OpTag::RecvDirect, conn_index, slot).raw()],
+            "cancel targets the direct receive by its slot"
+        );
         assert!(
             el.driver
                 .connections

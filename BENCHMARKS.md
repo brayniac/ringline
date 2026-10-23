@@ -44,9 +44,9 @@ default without saying so.
 
 | config | what it is | can a protocol use it? |
 |---|---|---|
-| `uring` | `run_direct_echo` — echo submitted from the completion handler, no task wakeup | no, echo only |
+| `uring` | `run_direct_echo` — echo submitted from the completion handler, no task wakeup (removed; see Reproducing) | no, echo only |
 | `uring-fwd` | `with_data` + `forward_recv_buf` — the ordinary read loop | **yes, this is the general path** |
-| `rfwd` | `enable_recv_forward` + `forward_held` — byte pipe | no, proxy only |
+| `rfwd` | `enable_recv_forward` + `forward_held` — byte pipe (removed; see Reproducing) | no, proxy only |
 | `mio` | ringline's epoll fallback (always the forward loop) | yes |
 | `tokio` | multi-thread work-stealing, canonical echo loop | yes, **tokio's default** |
 | `tokio-pc` | one `current_thread` runtime per core + `SO_REUSEPORT` | yes |
@@ -206,8 +206,9 @@ Server: `bench-server --runtime <ringline|tokio|tokio-uring> --workers 8`, plus
 `--tokio-scheduler {multi-thread,per-core}` / `--tokio-echo {copy,splice}` for
 tokio. The mio arm is a `--features force-mio` build; `tokio-uring` needs
 `--features tokio-uring-arm`. The `uring` and `rfwd` arms cannot be rerun:
-ringline has no `run_direct_echo` or `forward_held`, and `--echo-mode direct`
-is a `with_data` + `send_nowait` loop.
+ringline has no `run_direct_echo` or `forward_held`. `--echo-mode copy`, the
+default, is a `with_data` + `send_nowait` loop, and `--echo-mode direct` is
+refused.
 
 Client: `bench-client --clients <n> --msg-size <bytes> --threads 16 --warmup 5
 --duration 20`.

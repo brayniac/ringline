@@ -239,9 +239,9 @@ Ringline aims to minimize data copies on the hot path. Understanding where copie
 
 | Step | What happens | Copies |
 |------|-------------|--------|
-| Kernel → ProvidedBufRing | DMA into ring-provided buffer | 0 |
-| ProvidedBufRing → RecvAccumulator | `BytesMut::extend_from_slice()` | 1 |
-| Kernel → RecvAccumulator (plaintext, io_uring) | One-shot `RECV` into the accumulator's free space, armed when a read parks; replaces the two rows above, which apply to TLS ciphertext on io_uring (`docs/recv-direct-design.md`) | 0 |
+| Kernel → RecvAccumulator (plaintext, io_uring) | One-shot `RECV` into the accumulator's free space, armed when a read parks (`docs/recv-direct-design.md`) | 0 |
+| Kernel → ProvidedBufRing (TLS, io_uring) | DMA of ciphertext into a ring-provided buffer, which goes to rustls; the plaintext is the TLS recv row below | 0 |
+| Kernel → read buffer → RecvAccumulator (mio) | `read()` into a per-worker buffer, then `extend_from_slice()` | 1 |
 | Accumulator → `with_data()` callback | Borrowed `&[u8]` into accumulator | 0 |
 | Accumulator → `with_bytes()` callback | `BytesMut::freeze()` → `Bytes` (O(1)), slicing via `Bytes::slice()` is O(1) refcount | 0 |
 | TLS recv | rustls plaintext drained into accumulator via `BufRead` | 1 |
@@ -313,7 +313,7 @@ Minimal — `with_data()` recv (pattern-match `PONG\r\n`, no value extraction), 
 
 ### Copy Semantics Design Principles
 
-1. **Recv buffer ownership**: The kernel writes into `ProvidedBufRing` (zero-copy DMA), then data is appended to the per-connection `RecvAccumulator` (1 copy). A plaintext connection on io_uring skips the ring: the kernel writes into the accumulator directly (0 copies). After that, `with_bytes()` enables zero-copy parsing via `Bytes::slice()`. `with_data()` requires the parser to copy out any data it needs to keep.
+1. **Recv buffer ownership**: On io_uring a plaintext connection's receive writes into its `RecvAccumulator` directly (0 copies). A TLS connection's ciphertext lands in a `ProvidedBufRing` buffer and rustls copies the plaintext into the accumulator (1 copy). On mio, `read()` fills a per-worker buffer that is appended to the accumulator (1 copy). After that, `with_bytes()` enables zero-copy parsing via `Bytes::slice()`. `with_data()` requires the parser to copy out any data it needs to keep.
 
 2. **Send buffer ownership**: Ringline must own all memory referenced by SQEs (the submission must outlive the syscall). `SendCopyPool` provides pre-allocated slots for this. `SendGuard` is the escape hatch for zero-copy — it pins user memory and holds it alive until the kernel confirms completion.
 

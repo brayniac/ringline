@@ -1950,13 +1950,16 @@ impl ConnCtx {
     /// intermediate aligned copy (which defeats the purpose). [`SinkFd::file`]
     /// **rejects** an `O_DIRECT` descriptor with [`io::ErrorKind::InvalidInput`].
     ///
-    /// io_uring only — Mode A is backed by the provided-buffer ring.
+    /// io_uring only — Mode A is backed by the provided-buffer ring, which on
+    /// io_uring only a TLS connection receives through.
     ///
     /// # Errors
     ///
     /// Refused at the call, resolving on the first poll without having
-    /// installed anything: `EBUSY` if a forward is already running on this
-    /// connection, `EPIPE` if this connection's slot is already stale. (The
+    /// installed anything: `EOPNOTSUPP` on a plaintext connection, which
+    /// receives directly into its accumulator (see [`connect`]); `EBUSY` if a
+    /// forward is already running on this connection; `EPIPE` if this
+    /// connection's slot is already stale. (The
     /// sink is a borrowed descriptor, so the sink-side `EPIPE`/`EPROTOTYPE`
     /// of [`forward_to_conn`](Self::forward_to_conn) do not apply.)
     #[cfg(has_io_uring)]
@@ -2755,7 +2758,8 @@ impl ConnCtx {
     }
 
     /// Whether the connection receives directly into its accumulator: on
-    /// io_uring, a plaintext connection from [`connect`] or [`connect_unix`].
+    /// io_uring, every plaintext connection, accepted or from [`connect`] or
+    /// [`connect_unix`].
     /// The reads that need the provided-buffer ring return
     /// [`io::ErrorKind::Unsupported`] on such a connection, so a caller can
     /// check this before sending a request whose reply it would read with one

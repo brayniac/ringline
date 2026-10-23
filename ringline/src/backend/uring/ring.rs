@@ -89,6 +89,10 @@ pub struct Ring {
     /// `last_pushed` does not show.
     #[cfg(test)]
     pub(crate) last_drain_index: Option<u32>,
+    /// Test-only: the target user_data of every `Op::Cancel` pushed, in
+    /// order, so a test can check what a handler cancelled.
+    #[cfg(test)]
+    pub(crate) pushed_cancels: Vec<u64>,
 }
 
 impl Ring {
@@ -101,6 +105,8 @@ impl Ring {
             last_pushed: None,
             #[cfg(test)]
             last_drain_index: None,
+            #[cfg(test)]
+            pushed_cancels: Vec::new(),
         })
     }
 
@@ -1027,6 +1033,9 @@ impl Ring {
         #[cfg(test)]
         {
             self.last_pushed = Some(*sqe);
+            if let Op::Cancel { target } = sqe.op {
+                self.pushed_cancels.push(target);
+            }
         }
         Ok(())
     }

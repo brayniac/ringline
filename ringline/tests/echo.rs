@@ -6446,8 +6446,9 @@ fn cancellation_token_with_select() {
 
 // ── Zero-copy forward tests ────────────────────────────────────────
 //
-// These tests exercise the forward_recv_buf path, which sends directly
-// from the kernel recv buffer without copying into the send pool.
+// These tests exercise forward_recv_buf, which sends the received bytes
+// from where they were received (a lent ring buffer, or the accumulator of a
+// direct connection) instead of copying them into the send pool.
 
 struct ForwardEcho;
 

@@ -174,9 +174,9 @@ count; zero-copy send is the exception the ZC rows note.
 
 | Step | Copies | Mechanism |
 |---|---:|---|
-| Kernel → provided buffer | 0 | Multishot recv fills `ProvidedBufRing` buffers selected at completion time (io_uring). On mio, `read()` into a scratch buffer instead. |
-| Provided buffer → `RecvAccumulator` | 1 | `extend_from_slice` into the per-connection contiguous accumulator. On io_uring only TLS ciphertext takes this path. |
-| Kernel → `RecvAccumulator` (plaintext, io_uring) | 0 | A one-shot `RECV` into the accumulator's free space, armed when a read parks, replaces the two rows above. Growing the accumulator for a longer message can copy the part already received (`docs/recv-direct-design.md`). |
+| Kernel → provided buffer (TLS, io_uring) | 0 | The receive fills a `ProvidedBufRing` buffer selected at completion time; the ciphertext goes to rustls (the TLS receive row). |
+| Read buffer → `RecvAccumulator` (mio) | 1 | `read()` into a per-worker buffer, then `extend_from_slice` into the per-connection contiguous accumulator. |
+| Kernel → `RecvAccumulator` (plaintext, io_uring) | 0 | A one-shot `RECV` into the accumulator's free space, armed when a read parks. Growing the accumulator for a longer message can copy the part already received (`docs/recv-direct-design.md`). |
 | Accumulator → `with_data(\|&[u8]\|)` | 0 borrowed | The parser sees a borrowed slice and must copy anything it keeps. |
 | Accumulator → `with_bytes(\|Bytes\|)` | 0 | `BytesMut::freeze()` and `Bytes::slice()` are O(1) refcount operations; parsed values are refcounted sub-slices that stay valid after the accumulator advances. |
 | TLS receive | +1 | rustls must decrypt; plaintext is drained into the accumulator through `BufRead` with no intermediate scratch buffer. |

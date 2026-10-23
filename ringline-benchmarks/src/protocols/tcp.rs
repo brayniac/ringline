@@ -113,8 +113,8 @@ fn start_tokio_server(
 }
 
 /// Native ringline TCP echo server. Echoes via `forward_recv_buf`, the loop
-/// `bench-server --echo-mode forward` runs: a lent receive buffer is handed
-/// back to a send without an accumulator copy.
+/// `bench-server --echo-mode forward` runs: the received bytes are sent from
+/// the accumulator under a guard instead of being copied into a send.
 struct RinglineEchoHandler;
 
 impl ringline::AsyncEventHandler for RinglineEchoHandler {

@@ -285,8 +285,9 @@ directly) and `tokio` (one current-thread runtime per core, reading into a
 128 KiB send-pool slots `01a16631-073f-719c-03aa-d21614dfc776`,
 `01a16631-087e-7112-eff4-8c1091346236` (ring),
 `01a16631-07b0-7180-c61e-a43f144647ee` and
-`01a16631-0813-718f-adf3-9ed51d31ac45` (direct). Two runs of one arm
-differed by 4 to 8% on the GET cells. The table lists the 16 KiB runs.
+`01a16631-0813-718f-adf3-9ed51d31ac45` (direct). The table lists the
+16 KiB runs. Two runs of one arm differed by up to 9% on a GET cell (the
+depth-1 cells), and by 0 to 5% in the cells below.
 
 | Cell | ring ops/s | direct ops/s | tokio ops/s |
 |---|---:|---:|---:|
@@ -297,8 +298,9 @@ differed by 4 to 8% on the GET cells. The table lists the 16 KiB runs.
 
 - GET throughput and server CPU per request: equal within the run-to-run
   spread.
-- SET: direct is ahead, by 6 to 8% at 64 KiB and 13% at 4 KiB depth 16 with
-  8,000 connections, where its p99 was 155 ms against 313 ms. The ring arm's
+- SET: direct is ahead on the means of the two runs, by 7.5% at 64 KiB with
+  1,000 connections, 6% at 64 KiB with 8,000 and 13% at 4 KiB depth 16 with
+  8,000, where its p99 was 155 ms against 313 ms. The ring arm's
   provided ring went empty 1M to 16M times per cell at 8,000 connections.
 - RSS: direct is 0.3 to 0.6 GiB higher at 8,000 connections.
 - p99 at GET depth 16 with 8,000 connections is higher on direct (Not
@@ -604,8 +606,9 @@ checked whether the cancel can still be pending after 10 s.
   the same connection is refused with `EBUSY` (`direct_forwarding` on
   `ConnectionState`). A send the runtime cannot submit resolves the forward
   with that error and puts the chunk back in front of the accumulator.
-- `forward_recv_buf` is a send from the accumulator and is not refused. It
-  has not been tested on a direct connection.
+- `forward_recv_buf` is a send from the accumulator and is not refused. The
+  `forward_echo_*` tests in `ringline/tests/echo.rs` run it on accepted
+  direct connections.
 - TLS: a TLS connection receives through the provided-buffer ring. The
   kernel's bytes are ciphertext, and rustls copies the plaintext into the
   accumulator in any case.
@@ -804,6 +807,10 @@ Open: whether the scanner PRs in `resp-proto` and `memcache-proto` are
 closed or merged without a release.
 
 ## Not known
+
+- The cost of the TCP provided-buffer ring that every worker still
+  registers (256 × 16 KiB by default) for a server with no TLS listener,
+  which now never receives through it.
 
 - The cost of the hangup poll's wait-queue entry on busy connections (every
   socket wakeup runs its callback), and how much memory the delayed release
