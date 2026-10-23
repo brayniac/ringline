@@ -1069,13 +1069,6 @@ impl ConfigBuilder {
     /// then requires `recv_accumulator_max` to be at least 1 MiB on either
     /// backend.
     ///
-    /// With this on, data is lent (held in place for a task, a segment or a
-    /// `forward_to` source) only while at most half the TCP ring's buffers
-    /// have a hold (a lend, or a completion whose release is queued for the
-    /// next flush); above that, each path copies, and `recv_segment_reserve`
-    /// is ignored.
-    /// The fallback receive reads 1 MiB chunks, and a parked connection
-    /// re-arms its receive instead when the ring's free buffers hold more.
     /// With `prefault_buffers(true)` a plain ring makes 256 MiB per worker
     /// resident, against 4 MiB for the 256 × 16 KiB default.
     ///
@@ -1085,7 +1078,7 @@ impl ConfigBuilder {
     ///
     /// On io_uring this sets the ring kind TLS connections receive into; a
     /// plaintext connection receives directly into its accumulator (see
-    /// [`connect`](crate::connect)), so the lend cap affects no connection.
+    /// [`connect`](crate::connect)).
     pub fn recv_incremental(mut self, enabled: bool) -> Self {
         self.config.recv_incremental = enabled;
         self
@@ -1270,9 +1263,10 @@ impl ConfigBuilder {
     /// Set the receive view threshold in bytes (0 = never copy). Default:
     /// 4096, the send side's default; it has not been measured for receive.
     ///
-    /// On io_uring, `with_bytes_segments` presents held receive buffers as
-    /// `Bytes` views of the ring, and a view a client keeps holds its whole
-    /// ring buffer until it drops. The runtime does not apply this value
+    /// No connection currently produces a receive view: on io_uring a
+    /// plaintext connection refuses `with_bytes_segments` and a TLS
+    /// connection's pieces are heap copies. A view a client keeps would hold
+    /// its whole ring buffer until it drops. The runtime does not apply this value
     /// itself. [`recv_zc_threshold`](crate::recv_zc_threshold) returns it in
     /// the worker's tasks and its `on_tick` and `on_notify` callbacks. A
     /// client passes it to

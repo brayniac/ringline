@@ -247,8 +247,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   connection `segments`, `recv_owned_segment`, `with_segments`,
   `with_bytes_segments` and `forward_to` return `io::ErrorKind::Unsupported`,
   and `try_with_data` returns `None` while a receive is in flight. They work
-  on TLS connections, and on mio, and there is no replacement for them on a
-  plaintext connection on io_uring. Such a connection has a receive armed
+  on TLS connections; on mio only `with_bytes_segments` exists, and it
+  presents the accumulator. There is no replacement for them on a plaintext
+  connection on io_uring. Such a connection has a receive armed
   only when a read parks, and a `POLLRDHUP` poll armed when it opens. A
   FIN or reset from the peer closes a connection that nothing reads, and
   `is_alive` returns `false`. If bytes the peer sent before it are queued or

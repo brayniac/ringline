@@ -3895,15 +3895,12 @@ impl Connection {
     /// pieces, as a [`with_bytes`](Self::with_bytes) parser does for its one
     /// `Bytes`.
     ///
-    /// On io_uring the call puts the connection in the segmented receive
-    /// domain, where each completion's buffer is held in place. Each held
-    /// buffer is presented as a `Bytes` view of the ring buffer's memory, so
-    /// a value the parser slices out of one piece is not copied. A view keeps
-    /// its whole ring buffer from being reused until the view and every
-    /// clone and slice of it have dropped. A completion the runtime copied
-    /// instead (lend refused, the ring at its reserve, or a TLS connection's
-    /// decrypted plaintext) is presented as a heap `Bytes`. Bytes the
-    /// runtime copied into the accumulator come first, as one piece.
+    /// On io_uring a plaintext connection receives directly into its
+    /// accumulator and refuses this with [`io::ErrorKind::Unsupported`] (see
+    /// [`connect`]). A TLS connection is put in the segmented receive domain,
+    /// and each completion's decrypted plaintext is presented as a heap
+    /// `Bytes`; bytes the runtime copied into the accumulator come first, as
+    /// one piece.
     ///
     /// On mio the pieces are the accumulator, as one piece.
     ///
@@ -3916,8 +3913,8 @@ impl Connection {
     ///
     /// The connection stays in the segmented domain after the future
     /// resolves. Call [`end_segments`](Self::end_segments) before reading
-    /// with `with_data`, `with_bytes`, `recv_ready`, a `ConnStream` or a recv
-    /// sink. On io_uring, until it runs, those see only bytes a hold-cap copy
+    /// with `with_data`, `with_bytes`, `recv_ready` or a `ConnStream`. On
+    /// io_uring, until it runs, those see only bytes a hold-cap copy
     /// left in the accumulator, and none that arrive later.
     ///
     /// Resolves to:
@@ -5705,9 +5702,11 @@ pub fn recv_zc_threshold() -> u32 {
 /// Return an owned copy of `value` if it is a receive view shorter than
 /// `threshold` bytes; otherwise return `value` unchanged.
 ///
-/// On io_uring, [`Connection::with_bytes_segments`] presents held receive
-/// buffers as views of the ring's memory, and a value sliced from one is a
-/// view too. A view keeps its whole ring buffer from being reused until it
+/// No connection currently produces a receive view, so this returns `value`
+/// unchanged: on io_uring a plaintext connection refuses
+/// [`Connection::with_bytes_segments`] and a TLS connection's pieces are heap
+/// copies, and on mio the pieces are the accumulator. A view is a `Bytes`
+/// over the ring's memory, and a value sliced from one is a view too. A view keeps its whole ring buffer from being reused until it
 /// drops, whatever its length. Ring buffers are 16 KiB by default;
 /// [`ConfigBuilder::recv_incremental`](crate::ConfigBuilder::recv_incremental)
 /// and [`ConfigBuilder::recv_buffer`](crate::ConfigBuilder::recv_buffer)
