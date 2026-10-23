@@ -321,10 +321,13 @@ by it.
 When the closure returns, the call seals the tail slot and walks the chain.
 For `send_with_awaited` and the backpressured form, the last slot carries
 the send's id and total length (`set_send_id`), so the send settles once.
-Each slot becomes one `Sqe::stream_send` through `submit_or_queue`, the
-same loop as `DriverCtx::send_inner` after its copy step, inside one
-`with_state`. The coalescing in `submit_next_queued` applies to these
-entries as it does to any queued send.
+Inside one `with_state`, each slot becomes one `Sqe::stream_send` entry, as
+in `DriverCtx::send_inner` after its copy step. A chain of one slot goes
+through `submit_or_queue`. A longer chain is queued whole and submitted by
+`submit_queued_run` (#697), so with nothing in flight up to 32 slots go to
+the kernel as one `sendmsg`; a longer chain continues through the queue's
+coalescing in `submit_next_queued`. A slot the writer took and left empty
+is released at the commit and not sent.
 
 ## TLS
 
