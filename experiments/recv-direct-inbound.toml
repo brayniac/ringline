@@ -26,7 +26,7 @@
 # as unix_ms, so the server CPU over a window is the difference of the diag
 # lines inside it. Results: the client's results.tgz (cachecannon JSON per
 # cell, windows.txt) and the server's unit log.
-name = "recv-direct inbound {arm} slot{send_slot} rep{rep}"
+name = "recv-direct inbound {arm} slot{send_slot}{tag} rep{rep}"
 
 [params]
 bins_artifact  = "SET_AT_SUBMIT"
@@ -40,6 +40,8 @@ port           = "6379"
 workers        = "8"
 client_threads = "16"
 send_slot      = "16384"
+# Appended to the name: marks runs of a different build of the same arm.
+tag            = ""
 conns_list     = "1000 8000"
 warmup         = "10s"
 duration       = "40s"
