@@ -2864,7 +2864,20 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         for chunk in &pending {
             self.driver.accumulators.append(conn_index, chunk);
         }
-        self.arm_recv(conn_index);
+        let tls_listener = self
+            .driver
+            .tls_table
+            .as_ref()
+            .is_some_and(|t| t.has_server_config_for(Some(listener)));
+        if tls_listener {
+            self.arm_recv(conn_index);
+        } else if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+            // A plaintext connection receives directly into its accumulator.
+            // Its receive is armed by its first parked read, as for an
+            // outbound plaintext connection, and its hangup poll below, once
+            // it is open.
+            cs.recv_direct = true;
+        }
 
         // TLS path: defer accept until handshake completes.
         if let Some(ref mut tls_table) = self.driver.tls_table
@@ -2879,6 +2892,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // Plaintext path: mark established and spawn async task.
         if let Some(cs) = self.driver.connections.get_mut(conn_index) {
             cs.established = true;
+        }
+        if self.driver.arm_hangup_poll_or_close(conn_index) {
+            return;
         }
         metrics::CONNECTIONS.increment(metrics::conn::ACCEPTED);
         metrics::CONNECTIONS_ACTIVE.increment();

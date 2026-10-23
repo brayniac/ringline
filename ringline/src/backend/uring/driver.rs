@@ -1302,6 +1302,10 @@ pub(crate) enum ParkBlocker {
     RecvFallback,
     /// A direct-echo response is queued for this worker's next flush.
     DirectEcho,
+    /// The connection receives directly into its accumulator. Its receive
+    /// buffer is in this worker's `direct_recvs` while a receive is armed,
+    /// and carrying it is not implemented.
+    DirectReceive,
 }
 
 impl ParkBlocker {
@@ -1328,6 +1332,7 @@ impl ParkBlocker {
             ParkBlocker::SegmentReader => pa::SEGMENT_READER,
             ParkBlocker::RecvFallback => pa::RECV_FALLBACK,
             ParkBlocker::DirectEcho => pa::DIRECT_ECHO,
+            ParkBlocker::DirectReceive => pa::DIRECT_RECEIVE,
         }
     }
 }
@@ -1357,6 +1362,7 @@ mod park_blocker_tests {
             ParkBlocker::SegmentReader,
             ParkBlocker::RecvFallback,
             ParkBlocker::DirectEcho,
+            ParkBlocker::DirectReceive,
         ];
         let mut seen = std::collections::HashMap::new();
         for b in all {
@@ -2774,6 +2780,10 @@ impl Driver {
         // wedge the connection waiting for a ClientHello.
         if conn.listener.is_none() {
             return Some(ParkBlocker::Outbound);
+        }
+
+        if conn.recv_direct {
+            return Some(ParkBlocker::DirectReceive);
         }
 
         // A TLS connection's session lives in this worker's `TlsTable`, and
