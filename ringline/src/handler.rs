@@ -557,9 +557,9 @@ impl<'a> DriverCtx<'a> {
         // own pool slot; only the final chunk carries the send's id, so the
         // send settles once. A send of one chunk goes through
         // `submit_or_queue`. The chunks of a larger send are queued together
-        // and then submitted by `submit_queued_run`, which sends them as one
-        // `sendmsg` when nothing is in flight, so the kernel gets the whole
-        // buffer in one operation instead of the first slot alone.
+        // and then submitted by `submit_queued_run`, which sends up to 32 of
+        // them as one `sendmsg` when nothing is in flight and the send slab
+        // has a free entry, instead of the first slot alone.
         //
         // Both are infallible: an SQE that cannot be pushed is parked at the
         // queue head. So once the reservation is granted the whole buffer is

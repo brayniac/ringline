@@ -391,7 +391,8 @@ plaintext or TLS ciphertext, coalesce into one `SendMsgCoalesced` of up to
 32 iovecs when the in-flight send completes (#628), each awaited send
 settling with its own length, so N pipelined responses cost the first
 response's operation and one more per 32 queued behind it, and a TLS
-response's ciphertext slots after the first go out together. The emulator
+response's ciphertext slots go out as one `SendMsgCoalesced` when nothing is
+in flight. The emulator
 still pays at least one more `write` than mio's single `writev` per flush
 for a pipelined batch; the `FIONREAD` when a
 pass stops at its cap or for lack of space is the other extra syscall.

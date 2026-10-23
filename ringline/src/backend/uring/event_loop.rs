@@ -7892,7 +7892,9 @@ mod tests {
     #[test]
     fn handle_send_multichunk_wakes_once_with_total() {
         // A logical send larger than one pool slot is split into several
-        // chunks that complete as separate CQEs. Only the final chunk's slot
+        // chunks, which complete as separate CQEs when they are submitted
+        // one at a time (with no free slab entry for a run). Only the final
+        // chunk's slot
         // carries the send's id, so the send settles once — when the whole
         // logical send has drained — with its full length, not the first
         // chunk's short count.
@@ -8656,6 +8658,88 @@ mod tests {
             assert_eq!(slots, expected_slots[1..].to_vec());
             assert!(state.in_flight);
         }
+        assert!(el.driver.pending_send_retries.is_empty());
+    }
+
+    /// Two TLS ciphertext slots from one send go to the kernel as one
+    /// `sendmsg` whose entry closes the connection on a send error.
+    #[test]
+    fn queue_built_sends_submits_two_tls_slots_as_one_sendmsg() {
+        let mut el = make_test_loop_with_config(
+            test_config_builder()
+                .send_pool(8, 64)
+                .build()
+                .expect("valid config"),
+        );
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let tls_send = |el: &mut AsyncEventLoop<NoopHandler>, data: &[u8]| {
+            let (slot, ptr, len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+            let ud = UserData::encode(
+                OpTag::TlsSend,
+                conn_index,
+                UserData::send_payload(slot, generation),
+            );
+            crate::handler::BuiltSend {
+                entry: crate::backend::uring::sqe::Sqe::stream_send(conn_index, ptr, len, ud.raw()),
+                pool_slot: slot,
+                slab_idx: u16::MAX,
+                total_len: data.len() as u32,
+            }
+        };
+        let first = tls_send(&mut el, b"record one");
+        let second = tls_send(&mut el, b"record two");
+        {
+            let mut ctx = el.driver.make_ctx();
+            ctx.queue_built_sends(conn_index, vec![first, second]);
+        }
+        let state = &el.driver.send_queues[conn_index as usize];
+        assert!(state.queue.is_empty(), "both slots went out as one SQE");
+        assert!(state.in_flight);
+        let pushed = UserData(el.driver.ring.last_pushed.as_ref().unwrap().user_data);
+        assert_eq!(pushed.tag(), Some(OpTag::SendMsgCoalesced));
+        assert!(
+            el.driver.send_slab.close_on_error(pushed.payload() as u16),
+            "a TLS run closes the connection on a send error"
+        );
+    }
+
+    /// A multi-slot send that finds the SQ full parks its whole run, with
+    /// the first attempt recorded, and the retry sends the run as one
+    /// `sendmsg`.
+    #[test]
+    fn a_multi_slot_send_parks_its_run_when_the_sq_is_full() {
+        let mut el = make_test_loop_with_config(
+            test_config_builder()
+                .send_pool(8, 64)
+                .build()
+                .expect("valid config"),
+        );
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let token = crate::handler::ConnToken::new(conn_index, generation);
+        el.driver.ring.force_push_failures(1);
+        el.driver
+            .make_ctx()
+            .send(token, &[b'p'; 150])
+            .expect("send");
+        {
+            let state = &el.driver.send_queues[conn_index as usize];
+            assert_eq!(state.queue.len(), 3, "the run stays queued");
+            assert!(state.in_flight && state.parked);
+        }
+        assert_eq!(
+            el.driver.pending_send_retries,
+            vec![(conn_index, generation, 0)],
+            "registered once, at attempt 0"
+        );
+        el.drain_send_retries();
+        let state = &el.driver.send_queues[conn_index as usize];
+        assert!(state.queue.is_empty(), "the retry sent the whole run");
+        assert_eq!(
+            UserData(el.driver.ring.last_pushed.as_ref().unwrap().user_data).tag(),
+            Some(OpTag::SendMsgCoalesced)
+        );
         assert!(el.driver.pending_send_retries.is_empty());
     }
 
