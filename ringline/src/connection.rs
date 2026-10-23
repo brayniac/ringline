@@ -171,17 +171,20 @@ pub struct ConnectionState {
     /// The hangup peek (`OpTag::HangupPeek`) is in flight.
     #[cfg(has_io_uring)]
     pub hangup_peek_armed: bool,
-    /// A hangup peek found bytes queued ahead of the end of the stream, so
-    /// the connection is on `Driver::hangup_rechecks` until the end is seen.
+    /// A hangup peek found bytes queued ahead of the end of the stream, or
+    /// found the end with bytes buffered or a receive in flight, so the
+    /// connection is on `Driver::hangup_rechecks` until the end is seen.
     #[cfg(has_io_uring)]
     pub hangup_recheck: bool,
-    /// A direct receive delivered bytes since the last recheck peek, so the
+    /// A direct receive delivered bytes since the last recheck peek, or a
+    /// peek found the end with bytes buffered or a receive in flight, so the
     /// next time nothing is buffered or armed, another peek is due.
     #[cfg(has_io_uring)]
     pub hangup_recheck_due: bool,
     /// The errno a hangup peek returned while the connection stayed open (bytes
     /// buffered or a receive in flight), or 0. The peek clears the socket's
-    /// pending error, so the receive that later returns 0 reports this one.
+    /// pending error, so the receive or recheck peek that later finds the end
+    /// reports this one.
     #[cfg(has_io_uring)]
     pub hangup_error: i32,
 }

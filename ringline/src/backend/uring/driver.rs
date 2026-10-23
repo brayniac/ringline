@@ -1094,7 +1094,8 @@ pub(crate) struct Driver {
     /// a buffer the driver owns does.
     pub(crate) hangup_peek_buf: Box<[u8; 1]>,
     /// `(conn_index, generation)` of direct connections whose hangup peek
-    /// found bytes queued ahead of the end of the stream
+    /// found bytes queued ahead of the end of the stream, or found the end
+    /// with bytes buffered or a receive in flight
     /// (`ConnectionState::hangup_recheck`). `recheck_hangups` peeks again
     /// once a receive has delivered bytes and nothing is buffered, so the end
     /// is seen even if no read parks after the bytes are consumed.

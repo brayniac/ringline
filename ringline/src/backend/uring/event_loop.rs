@@ -1588,10 +1588,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     }
 
     /// Peek again on the connections in `hangup_rechecks` whose receive has
-    /// delivered bytes since their last peek, once nothing is buffered and
-    /// nothing is armed, so the end of the stream behind those bytes closes
-    /// the connection even if no read parks after they are consumed. Drops
-    /// connections that closed, were recycled or finished reading.
+    /// delivered bytes since their last peek, or whose peek found the end
+    /// with bytes buffered or a receive in flight, once nothing is buffered
+    /// and nothing is armed, so the end of the stream behind those bytes
+    /// closes the connection even if no read parks after they are consumed.
+    /// Drops connections that closed, were recycled or finished reading.
     fn recheck_hangups(&mut self) {
         if self.driver.hangup_rechecks.is_empty() {
             return;
