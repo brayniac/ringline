@@ -285,7 +285,7 @@ are the states where the handler or the kernel is mid-operation, and the gate
 names each one (`ParkBlocker`): not open or still handshaking; teardown
 already requested; queued or in-flight sends; an in-flight Mode A forward
 write; an active send chain; a live `SegmentReader`; an in-flight fallback
-recv; a connection that receives directly into its accumulator.
+recv.
 
 One non-obvious exclusion. `recv_half_taken` / `send_half_taken` look like
 blockers and are not: since #427 the halves are the normal API and a typical

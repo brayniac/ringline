@@ -599,9 +599,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `take_recv_sink`, wherever `ConnCtx`, `Connection` or `RecvHalf` had them,
   on both backends. On io_uring they read from the provided-buffer ring,
   which no connection receives through any more except a TLS one, where they
-  did nothing. On mio `set_recv_sink`, `enable_recv_forward` and
-  `forward_held` worked on every connection, and code that used them there
-  no longer compiles. Echo or forward with `with_data` and `send_nowait` or
+  did nothing. On mio `set_recv_sink` and `forward_held` worked on every
+  connection (`enable_recv_forward` did nothing), and code that used them
+  there no longer compiles. Echo or forward with `with_data` and `send_nowait` or
   `forward_recv_buf`, or with `forward_to_conn`.
 - **Breaking:** the client methods that read a value from provided-buffer
   segments, which a plaintext connection no longer has:
@@ -795,7 +795,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - On io_uring, an awaited send could resolve with another send's result. A
   connection had one send waiter, and any send completion on it woke the
   waiter: a `send().await` behind a `send_nowait`, an unawaited chain, a
-  direct echo, a `forward_recv_buf` or a `send_backpressured` resolved with
+  `forward_recv_buf` or a `send_backpressured` resolved with
   that send's byte count, and the awaited send's own completion then found no
   waiter. Two awaited sends in flight at once on one connection could hang;
   on mio they resolved with each other's lengths.

@@ -2393,6 +2393,16 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         if !self.driver.is_parkable(conn_index) {
             return false;
         }
+        // A hangup peek completes at once and may close the connection; the
+        // next tick decides once it has.
+        if self
+            .driver
+            .connections
+            .get(conn_index)
+            .is_some_and(|c| c.hangup_peek_armed)
+        {
+            return false;
+        }
         let generation = self.driver.connections.generation(conn_index);
 
         // Cancel what is armed on the socket before the install. A receive
@@ -6459,6 +6469,70 @@ mod tests {
         assert!(c.hangup_poll_armed, "the hangup poll is armed");
     }
 
+    /// No park starts while a hangup peek is in flight, and a peek that
+    /// finds the stream ended closes the connection instead.
+    #[test]
+    fn a_hangup_peek_in_flight_holds_off_the_park() {
+        let mut el = make_test_loop();
+        if !el.driver.ring.supports_park() {
+            return;
+        }
+        let conn_index = accept_direct_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        el.driver.park_offered[conn_index as usize] = true;
+        assert!(el.driver.submit_hangup_peek(conn_index));
+        assert!(!el.begin_park(conn_index, 1), "no park behind a peek");
+        assert!(el.driver.park_in_flight[conn_index as usize].is_none());
+        let ud = UserData::encode(OpTag::HangupPeek, conn_index, generation);
+        el.test_dispatch_cqe(ud.raw(), 0, 0);
+        assert!(
+            el.driver
+                .connections
+                .get(conn_index)
+                .unwrap()
+                .close_requested(),
+            "the peek found the end and closed the connection"
+        );
+        assert!(
+            !el.begin_park(conn_index, 1),
+            "a closing connection is not parked"
+        );
+    }
+
+    /// A hangup poll that completes during a park drain pushes no peek: the
+    /// drain waits for nothing to be armed, and the hangup stays pending on
+    /// the socket for the poll armed after the park.
+    #[test]
+    fn a_hangup_during_a_park_drain_pushes_no_peek() {
+        let mut el = make_test_loop();
+        let conn_index = accept_direct_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        el.driver.arm_hangup_poll(conn_index);
+        el.driver
+            .set_park_drain(conn_index, Some(park_drain_for(&el, conn_index)));
+        let ud = UserData::encode(OpTag::HangupPoll, conn_index, generation);
+        el.test_dispatch_cqe(ud.raw(), libc::POLLRDHUP as i32, 0);
+        let c = el.driver.connections.get(conn_index).unwrap();
+        assert!(!c.hangup_poll_armed);
+        assert!(!c.hangup_peek_armed, "no peek while the park drains");
+    }
+
+    /// Abandoning a direct park wakes a reader that parked during the drain,
+    /// so it arms its receive.
+    #[test]
+    fn abandoning_a_direct_park_wakes_the_reader() {
+        let mut el = make_test_loop();
+        let conn_index = accept_direct_connection(&mut el);
+        el.driver
+            .set_park_drain(conn_index, Some(park_drain_for(&el, conn_index)));
+        el.executor.recv_waiters[conn_index as usize] = true;
+        el.abandon_park_drain(conn_index);
+        assert!(
+            !el.executor.recv_waiters[conn_index as usize],
+            "the parked reader was woken"
+        );
+    }
+
     /// A direct connection with nothing armed installs at once.
     #[test]
     fn a_direct_connection_with_nothing_armed_installs_at_once() {
@@ -9997,6 +10071,10 @@ mod tests {
     #[test]
     fn cancel_on_a_direct_connection_ends_its_receive() {
         let mut el = make_test_loop();
+        // Another connection's receive takes `direct_recvs` slot 0, so this
+        // connection's slot differs from its generation.
+        let other = accept_direct_connection(&mut el);
+        assert!(!el.driver.arm_direct_recv_or_close(other, None));
         let conn_index = accept_direct_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
         assert!(!el.driver.arm_direct_recv_or_close(conn_index, None));

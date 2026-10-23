@@ -205,15 +205,16 @@ struct Args {
     #[arg(long, default_value_t = 4096)]
     msg_size: usize,
 
-    /// (ringline only) Which echo strategy the handler uses:
+    /// (ringline only, required with `--runtime ringline`) Which echo
+    /// strategy the handler uses:
     ///
-    /// - `copy` (default): `with_data` + `send_nowait`, which copies the
-    ///   received bytes into a send.
+    /// - `copy`: `with_data` + `send_nowait`, which copies the received bytes
+    ///   into a send.
     /// - `forward`: `with_data` + `forward_recv_buf` — the ordinary
     ///   parse-then-forward loop a protocol server would write. It sends a
     ///   lent receive buffer without copying it where the connection has one.
-    #[arg(long, value_enum, default_value_t = EchoMode::Copy)]
-    echo_mode: EchoMode,
+    #[arg(long, value_enum)]
+    echo_mode: Option<EchoMode>,
 
     /// (ringline only) Which accept path the echo arm runs. `merged` is
     /// io_uring only and is ignored on a mio build.
@@ -508,7 +509,12 @@ fn main() {
             prefault_buffers: args.prefault_buffers,
             recv_multishot: args.recv_multishot,
             iowq_max_workers: args.iowq_max_workers,
-            echo_mode: args.echo_mode,
+            echo_mode: args.echo_mode.unwrap_or_else(|| {
+                // The default was a different loop until it was removed;
+                // naming the mode keeps a spec from measuring another one.
+                eprintln!("bench-server: --runtime ringline needs --echo-mode copy or forward");
+                std::process::exit(2);
+            }),
             conn_chunk_size: args.conn_chunk_size,
             pin_to_core,
             accept_mode: args.accept_mode,
@@ -678,7 +684,7 @@ fn run_ringline(cfg: EchoCfg) {
     use ringline::ParseResult;
     use ringline::{AsyncEventHandler, RinglineBuilder};
 
-    // `direct` (default): copy the received bytes into a send.
+    // `copy`: copy the received bytes into a send.
     struct EchoHandler;
     impl AsyncEventHandler for EchoHandler {
         fn on_accept(&self, conn: Connection) -> impl std::future::Future<Output = ()> + 'static {

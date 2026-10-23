@@ -47,7 +47,7 @@ default without saying so.
 | `uring` | `run_direct_echo` — echo submitted from the completion handler, no task wakeup (removed; see Reproducing) | no, echo only |
 | `uring-fwd` | `with_data` + `forward_recv_buf` — the ordinary read loop | **yes, this is the general path** |
 | `rfwd` | `enable_recv_forward` + `forward_held` — byte pipe (removed; see Reproducing) | no, proxy only |
-| `mio` | ringline's epoll fallback (always the forward loop) | yes |
+| `mio` | ringline's epoll fallback, run with `--echo-mode forward` | yes |
 | `tokio` | multi-thread work-stealing, canonical echo loop | yes, **tokio's default** |
 | `tokio-pc` | one `current_thread` runtime per core + `SO_REUSEPORT` | yes |
 | `tokio-splice` | multi-thread, `splice(2)` socket → pipe → socket | no, byte pipe |

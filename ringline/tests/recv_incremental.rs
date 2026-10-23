@@ -1,6 +1,10 @@
-//! `ConfigBuilder::recv_incremental` end to end (#622). In its own test
-//! binary because it reads the process-wide `ringline/recv_ring` counters,
-//! which every other launch in the same process would also move.
+//! `ConfigBuilder::recv_incremental` (#622): which ring kind each worker
+//! selects, with an echo running beside it. The echo's connections are
+//! plaintext, so they receive directly into their accumulators and do not
+//! take buffers from the ring; TLS connections are the ones that use it. In
+//! its own test binary because it reads the process-wide
+//! `ringline/recv_ring` counters, which every other launch in the same
+//! process would also move.
 #![cfg(has_io_uring)]
 #![allow(clippy::manual_async_fn)]
 
@@ -65,14 +69,14 @@ fn echo_round_trip(addr: &str, msg: &[u8]) -> Vec<u8> {
     buf
 }
 
-/// With `recv_incremental(true)` the runtime echoes messages from 22 B to
-/// 1 MiB, with the geometry that follows the ring kind (64 × 1 MiB on a
-/// kernel with incremental rings) and with a small explicit one (16 × 1 KiB,
-/// which runs out of buffers within each message). Each worker records the
-/// ring kind it selected; from Linux 6.12, an incremental ring with no failed
-/// preflight step.
+/// With `recv_incremental(true)` and the ring geometry that follows the
+/// ring kind (64 × 1 MiB on a kernel with incremental rings) or a small
+/// explicit one (16 × 1 KiB), the runtime echoes messages from 22 B to 1 MiB
+/// on plaintext connections, and each worker records the ring kind it
+/// selected; from Linux 6.12, an incremental ring with no failed preflight
+/// step.
 #[test]
-fn async_echo_with_recv_incremental() {
+fn recv_incremental_selects_its_ring_kind_beside_an_echo() {
     use ringline::metrics::{RECV_PREFLIGHT_FAILED, RECV_RING, recv_preflight, recv_ring};
     let count = |slot| RECV_RING.value(slot).unwrap_or(0);
     let failed = || {

@@ -1,11 +1,10 @@
-//! A peer whose data is held faster than its reader drains it (a segment
-//! reader that never reads, an echo or forward whose peer never reads the
-//! reply) is stopped by its own TCP window, not by draining the worker's
-//! shared receive ring: its receive is throttled once the buffers it holds,
-//! including those its sends hold, reach its cap, and another connection on
-//! the same worker keeps working. The tests that run cover the cases where
-//! that holds. The ignored `forward_recv_buf` test records a case that is not
-//! throttled at all; see #638.
+//! A peer whose data arrives faster than its reader drains it (a reader that
+//! never reads, a forward whose peer never reads the reply) is stopped by its
+//! own TCP window, and another connection on the same worker keeps working.
+//! The accepted connections here are plaintext, so they receive directly: a
+//! receive is armed only while a read is parked, and a reader that does not
+//! read takes nothing off the socket. The ignored `forward_recv_buf` test
+//! records a case that is not throttled at all; see #638.
 #![cfg(has_io_uring)]
 #![allow(clippy::manual_async_fn)]
 
@@ -16,9 +15,9 @@ use std::time::Duration;
 
 use ringline::{AsyncEventHandler, ConfigBuilder, Connection, ParseResult, RinglineBuilder};
 
-/// The first byte picks the mode: `S` takes a segment reader and never
-/// reads, `R` echoes each buffer with `forward_recv_buf`, `T` echoes with
-/// `forward_to_conn`, and anything else echoes through `with_data`.
+/// The first byte picks the mode: `N` never reads again, `R` echoes each
+/// buffer with `forward_recv_buf`, `T` echoes with `forward_to_conn`, and
+/// anything else echoes through `with_data`.
 struct Modes;
 
 impl AsyncEventHandler for Modes {
@@ -35,12 +34,9 @@ impl AsyncEventHandler for Modes {
                 return;
             }
             match first {
-                b'S' => {
-                    let _reader = conn.segments().expect("segment reader");
-                    loop {
-                        ringline::sleep(Duration::from_secs(1)).await;
-                    }
-                }
+                b'N' => loop {
+                    ringline::sleep(Duration::from_secs(1)).await;
+                },
                 b'R' => {
                     let (mut tx, mut rx) = conn.split();
                     loop {
@@ -154,16 +150,15 @@ fn idle_peers_are_throttled_alone(mode: u8, incremental: bool, reserve: u32, pee
     assert!(echoed, "{label}: another connection on the worker stalled");
 }
 
-/// A reserve equal to the ring sends every segmented delivery to the copy
-/// fallback.
+/// A reader that never reads arms no receive, so its peer's writes stall.
 #[test]
-fn an_idle_segment_reader_is_throttled_alone() {
-    idle_peer_is_throttled_alone(b'S', false, 16);
-    idle_peer_is_throttled_alone(b'S', false, 4);
-    idle_peer_is_throttled_alone(b'S', true, 0);
+fn an_idle_reader_is_throttled_alone() {
+    idle_peer_is_throttled_alone(b'N', false, 0);
 }
 
-/// A `forward_to_conn` write's pinned buffers count toward the segment cap.
+/// A `forward_to_conn` from a direct connection stops receiving while its
+/// sends to a peer that does not read are stuck, so that peer's writes
+/// stall.
 #[test]
 fn unread_forward_to_peers_are_throttled_alone() {
     for incremental in [false, true] {
