@@ -18618,12 +18618,11 @@ mod tests {
         assert_eq!(&buf[..5], b"hello");
     }
 
-    /// A message wider than one pool slot completes as several CQEs, but the
-    /// id rides only the final chunk: the intermediate completion
-    /// settles nothing, and the final one reports the *logical* length — not
-    /// the 36 bytes its own chunk carried.
+    /// A message wider than one pool slot goes to the kernel as one
+    /// `sendmsg` over its slots, and its one completion reports the logical
+    /// length and returns every slot.
     #[test]
-    fn bounded_send_multi_slot_settles_only_on_the_final_chunk() {
+    fn a_multi_slot_bounded_send_is_one_sendmsg_and_settles_once() {
         let mut el = bounded_test_loop();
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
@@ -18638,34 +18637,21 @@ mod tests {
             6,
             "the premise of this test: the message really is two slots"
         );
-        assert_eq!(
-            el.driver.send_queues[conn_index as usize].queue.len(),
-            1,
-            "the first chunk went to the ring, the second queued behind it"
-        );
-
-        // The first chunk completes.
-        complete_one_cqe(&mut el);
-        assert_eq!(
-            el.driver.send_copy_pool.free_count(),
-            7,
-            "the first chunk's completion really did run and return its slot"
-        );
         assert!(
-            el.executor.take_send_result(id).is_none(),
-            "an intermediate chunk carries no id and must settle nothing"
+            el.driver.send_queues[conn_index as usize].queue.is_empty(),
+            "both chunks went to the ring as one sendmsg; nothing is queued"
         );
 
-        // The final chunk completes.
+        // The one completion carries both chunks and settles the operation.
         complete_one_cqe(&mut el);
         let result = el
             .executor
             .take_send_result(id)
-            .expect("the final chunk settles the operation");
+            .expect("the run's completion settles the operation");
         assert_eq!(
             result.expect("the send succeeded"),
             100,
-            "the logical length, not the 36-byte final chunk"
+            "the logical length, not a chunk's"
         );
         assert_eq!(
             el.driver.send_copy_pool.free_count(),
@@ -18675,6 +18661,35 @@ mod tests {
 
         let mut buf = [0u8; 128];
         assert_eq!(drain_peer(&peer, &mut buf), 100);
+    }
+
+    /// A plain `send` wider than one pool slot also goes to the kernel as one
+    /// `sendmsg`, whose completion returns every slot.
+    #[test]
+    fn a_multi_slot_send_is_one_sendmsg() {
+        let mut el = bounded_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let token = crate::handler::ConnToken::new(conn_index, generation);
+        let (_ours, peer) = attach_socketpair(&mut el, conn_index);
+
+        // 150 bytes over 64-byte slots: chunks of 64, 64 and 22.
+        let payload = vec![b'n'; 150];
+        el.driver.make_ctx().send(token, &payload).expect("send");
+        assert_eq!(el.driver.send_copy_pool.free_count(), 5, "three slots");
+        assert!(
+            el.driver.send_queues[conn_index as usize].queue.is_empty(),
+            "all three chunks went to the ring as one sendmsg"
+        );
+
+        complete_one_cqe(&mut el);
+        assert_eq!(
+            el.driver.send_copy_pool.free_count(),
+            8,
+            "one completion returned every slot"
+        );
+        let mut buf = [0u8; 256];
+        assert_eq!(drain_peer(&peer, &mut buf), 150);
     }
 
     /// A zero-length bounded send queues no SQE, so no CQE will ever settle
