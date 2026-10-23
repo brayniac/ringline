@@ -248,8 +248,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - On io_uring, a copy send wider than one send-pool slot (`send`,
   `send_nowait`, `send_backpressured`), and TLS ciphertext from one send
   that fills two or more slots, go to the kernel as one `sendmsg` over up to
-  32 of their slots when nothing else is in flight on the connection. Before,
-  the first slot went out as a `send` of its own and the rest followed as
+  32 of their slots when nothing else is in flight on the connection; with
+  the send slab full, the first slot goes alone, as before. Before, the
+  first slot always went out as a `send` of its own and the rest followed as
   one `sendmsg` after its completion.
 - **Breaking:** `ringline-redis` `ShardedConfig` and `ClusterConfig` and
   `ringline-memcache` `ShardedConfig` have private fields. Build them with

@@ -7892,12 +7892,11 @@ mod tests {
     #[test]
     fn handle_send_multichunk_wakes_once_with_total() {
         // A logical send larger than one pool slot is split into several
-        // chunks, which complete as separate CQEs when they are submitted
-        // one at a time (with no free slab entry for a run). Only the final
-        // chunk's slot
-        // carries the send's id, so the send settles once — when the whole
-        // logical send has drained — with its full length, not the first
-        // chunk's short count.
+        // chunks. They complete as separate CQEs when a run cannot carry them
+        // (no free slab entry, or more than 32 slots); this test builds that
+        // state by hand. Only the final chunk's slot carries the send's id,
+        // so the send settles once, when the whole logical send has drained,
+        // with its full length, not the first chunk's short count.
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
 
@@ -8649,8 +8648,8 @@ mod tests {
             "parking must not touch the pool"
         );
 
-        // The retry pushes the head (each entry is its own logical send, so
-        // the coalescing run stops at one); the second stays queued.
+        // The retry pushes the head alone (the slab has no entry for a run);
+        // the second stays queued.
         el.drain_send_retries();
         {
             let state = &el.driver.send_queues[conn_index as usize];
