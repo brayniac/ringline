@@ -168,11 +168,9 @@ pub struct ConnectionState {
     /// The hangup poll (`OpTag::HangupPoll`) is in flight.
     #[cfg(has_io_uring)]
     pub hangup_poll_armed: bool,
-    /// The hangup poll completed: the peer sent a FIN or reset, or the
-    /// socket has an error. Direct receives are re-armed until the read
-    /// half ends.
+    /// The hangup peek (`OpTag::HangupPeek`) is in flight.
     #[cfg(has_io_uring)]
-    pub peer_hangup: bool,
+    pub hangup_peek_armed: bool,
 }
 
 impl Default for ConnectionState {
@@ -212,7 +210,7 @@ impl ConnectionState {
             #[cfg(has_io_uring)]
             hangup_poll_armed: false,
             #[cfg(has_io_uring)]
-            peer_hangup: false,
+            hangup_peek_armed: false,
         }
     }
 
@@ -286,7 +284,7 @@ impl ConnectionState {
             self.recv_direct_held = 0;
             self.direct_forwarding = false;
             self.hangup_poll_armed = false;
-            self.peer_hangup = false;
+            self.hangup_peek_armed = false;
         }
         self.generation = self.generation.wrapping_add(1);
     }

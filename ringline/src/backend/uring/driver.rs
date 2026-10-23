@@ -234,15 +234,15 @@ impl Driver {
     /// open. A direct connection has a receive in flight only while a read
     /// is parked, so without the poll a peer FIN or reset on a connection
     /// whose task is not reading would not be seen until the task next
-    /// reads. If the SQE cannot be pushed, the connection is closed, as for
-    /// a failed receive arm, and this returns `true`: the caller wakes the
-    /// task so its read resolves.
-    pub(crate) fn arm_hangup_poll_or_close(&mut self, conn_index: u32) -> bool {
+    /// reads. If the SQE cannot be pushed the connection goes without it, as
+    /// before the poll existed, and the failure is counted in
+    /// `ring::RECV_ARM_FAILURES`.
+    pub(crate) fn arm_hangup_poll(&mut self, conn_index: u32) {
         let Some(cs) = self.connections.get(conn_index) else {
-            return false;
+            return;
         };
         if !cs.recv_direct || cs.hangup_poll_armed || cs.recv_finished() {
-            return false;
+            return;
         }
         let generation = cs.generation;
         if self
@@ -251,13 +251,11 @@ impl Driver {
             .is_err()
         {
             metrics::RING.increment(metrics::ring::RECV_ARM_FAILURES);
-            self.close_connection(conn_index);
-            return true;
+            return;
         }
         if let Some(cs) = self.connections.get_mut(conn_index) {
             cs.hangup_poll_armed = true;
         }
-        false
     }
 
     /// Whether `conn_index` arms a one-shot recv rather than a multishot one:
@@ -1071,6 +1069,10 @@ pub(crate) struct Driver {
     /// (`direct_recv_free`).
     pub(crate) direct_recvs: Vec<Option<DirectRecv>>,
     pub(crate) direct_recv_free: Vec<u32>,
+    /// Destination of every hangup peek (`OpTag::HangupPeek`). The byte is
+    /// never read; it only has to stay valid while a peek is in flight, which
+    /// a buffer the driver owns does.
+    pub(crate) hangup_peek_buf: Box<[u8; 1]>,
     /// `Config::recv_direct_region`.
     pub(crate) recv_direct_region: usize,
     /// Arrival timestamp shared by all UDP datagrams queued in one CQE
@@ -1640,6 +1642,7 @@ impl Driver {
             recv_fallback_count: 0,
             direct_recvs: Vec::new(),
             direct_recv_free: Vec::new(),
+            hangup_peek_buf: Box::new([0]),
             recv_direct_region: config.recv_direct_region,
             udp_batch_recv_at: std::time::Instant::now(),
             tick_timeout_ts: if config.tick_timeout_us > 0 {

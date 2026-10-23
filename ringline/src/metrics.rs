@@ -365,8 +365,8 @@ pub mod recv_direct {
     /// Buffers a direct connection borrowed for a large message that were
     /// allocated because no free buffer fit.
     pub const POOL_ALLOCATED: usize = 5;
-    /// Hangup polls that completed on an open connection with no receive in
-    /// flight, and armed one to read the rest of the stream.
+    /// Connections closed because their hangup peek found the stream ended
+    /// with no receive in flight and nothing buffered.
     pub const HANGUP: usize = 6;
     pub const COUNT: usize = 7;
 }
@@ -412,14 +412,14 @@ pub mod recv_preflight {
 /// Slot indices for per-`OpTag` completion counters: the slot *is* the
 /// discriminant.
 pub mod cqe_tag {
-    /// One past the largest `OpTag` discriminant (`HangupPoll = 37`).
+    /// One past the largest `OpTag` discriminant (`HangupPeek = 38`).
     ///
     /// Deliberately not derived from the enum: `ShardedCounterGroup::new` needs
     /// a const, and there is no const way to ask an enum for its maximum
     /// discriminant. `count_covers_every_tag` in the tests below fails if a new
     /// tag is added above this, which is the case that would otherwise drop
     /// completions silently.
-    pub const COUNT: usize = 38;
+    pub const COUNT: usize = 39;
 }
 
 /// Counter slot indices for pool exhaustion metrics.

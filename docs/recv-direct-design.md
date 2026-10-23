@@ -283,16 +283,27 @@ receive queue.
 
 A FIN or reset is seen without a read. When the connection opens, the
 runtime arms a one-shot `POLL_ADD` for `POLLRDHUP` on its fixed file
-(`OpTag::HangupPoll`, `arm_hangup_poll_or_close`). `POLLERR` and `POLLHUP`
-are always reported, so it completes on a FIN, a reset or a socket error,
-and data alone does not complete it. On completion it sets
-`peer_hangup`; if no receive is in flight it arms one, and while
-`peer_hangup` is set each receive that returns data arms the next, until the
-receive that returns 0 or an error closes the connection, as under a parked
-read. Bytes that arrived before the FIN go to the accumulator. The poll
-costs one SQE per connection and a completion at close, when the close's
-lead ends it: `shutdown` before 6.13 completes it with `POLLHUP`, and the
-cancel from 6.13 with `-ECANCELED`.
+(`OpTag::HangupPoll`, `arm_hangup_poll`). `POLLERR` and `POLLHUP` are always
+reported, so it completes on a FIN, a reset or a socket error, and data
+alone does not complete it. With a receive in flight, that receive sees the
+end. With none, the runtime submits a non-blocking one-byte `recv` with
+`MSG_PEEK` (`OpTag::HangupPeek`), which consumes nothing. A positive result
+means bytes are queued ahead of the FIN; they stay in the socket with it,
+and the next parked read's receive delivers both in order, as it would have
+without the poll. A result of 0 or an error means the stream has ended with
+nothing queued: if no receive is in flight and nothing is buffered in the
+accumulator, the connection closes as under a parked read. Bytes buffered in
+the accumulator keep it open until a read finds the end itself. Because no
+receive is armed on the hangup path, the accumulator does not take more
+than a parked read would. A poll that cannot be pushed is counted
+(`ring::RECV_ARM_FAILURES`) and the connection goes without it.
+
+Cost: one `POLL_ADD` SQE per connection, its completion at a hangup or at
+the close's lead (`shutdown` before 6.13 completes it with `POLLHUP`, the
+cancel from 6.13 with `-ECANCELED`), and one peek SQE and completion per
+hangup with no receive in flight. While armed, the poll is on the socket's
+wait queue, so every wakeup of the socket also runs its wake callback,
+which rejects the event unless it is a hangup. That cost is not measured.
 
 Arming after the parse means no receive is outstanding while `with_bytes`
 holds the accumulator frozen, so the remainder the parser left can be taken
@@ -689,6 +700,11 @@ Open: whether the scanner PRs in `resp-proto` and `memcache-proto` are
 closed or merged without a release.
 
 ## Not known
+
+- The cost of the hangup poll's wait-queue entry on busy connections (every
+  socket wakeup runs its callback) and, before 6.13, of a long-lived request
+  on every connection for closes on the same ring (Domain Invariant 8 in
+  CLAUDE.md).
 
 - Why `c`'s p99 is higher than A's in four cells (Evidence, C8 latency).
 - Why `c`'s throughput gain at 4 KiB depth 16 with the client limited

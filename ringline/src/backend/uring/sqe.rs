@@ -54,10 +54,13 @@ pub(crate) enum Op {
         buf_group: u16,
     },
     /// One-shot recv into `buf`.
+    /// `recv(2)` of `len` bytes into `buf`, with `msg_flags` (`MSG_PEEK`,
+    /// `MSG_DONTWAIT`, or 0).
     Recv {
         fd: Fd,
         buf: *mut u8,
         len: u32,
+        flags: i32,
     },
     /// Multishot accept; `flags` are `accept4(2)` flags.
     AcceptMulti {

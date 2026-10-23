@@ -249,7 +249,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   plaintext outbound connection. Such a connection has a receive armed only
   while a read is parked, and a `POLLRDHUP` poll armed when it opens: a FIN
   or reset from the peer on a connection that nothing reads closes it as a
-  read would, and `is_alive` returns `false`.
+  read would, and `is_alive` returns `false`, unless bytes the peer sent
+  before it are still unread; those reach the next reads, and the read that
+  finds the end of the stream closes the connection.
 - ringline-http's HTTP/2 connection reads with `with_data` on every backend,
   which a plaintext connection (`H2AsyncConn::from_conn` over `connect`)
   needs. Over TLS it copies as many bytes as before and allocates less.

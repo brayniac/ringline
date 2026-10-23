@@ -1441,16 +1441,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             metrics::RECV_DIRECT.add(metrics::recv_direct::BYTES, received as u64);
             self.withdraw_park_offer(conn_index);
             self.executor.wake_recv(conn_index);
-            // After a hangup the stream ends without the task reading: keep
-            // receiving until the FIN or the error arrives.
-            if self
-                .driver
-                .connections
-                .get(conn_index)
-                .is_some_and(|c| c.peer_hangup)
-            {
-                self.driver.arm_direct_recv_or_close(conn_index, None);
-            }
             return;
         }
         if result == 0 {
@@ -1481,11 +1471,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     }
 
     /// Completion of a direct connection's hangup poll
-    /// (`OpTag::HangupPoll`). On an open connection with no receive in
-    /// flight it arms a direct receive, which reads any bytes still queued
-    /// and then the FIN or the error, and closes the connection as a
-    /// parked read would. With a receive in flight that receive sees the
-    /// FIN. `-ECANCELED` comes from a close or a park and changes nothing.
+    /// (`OpTag::HangupPoll`): the peer sent a FIN or a reset, or the socket
+    /// has an error. With a receive in flight, that receive sees it. With
+    /// none, the hangup peek finds out whether bytes are queued ahead of it.
+    /// `-ECANCELED` comes from the close's cancel lead or worker shutdown and
+    /// changes nothing.
     fn handle_hangup_poll(&mut self, ud: UserData, result: i32) {
         let conn_index = ud.conn_index();
         let Some(cs) = self.driver.connections.get_mut(conn_index) else {
@@ -1498,14 +1488,69 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         if result < 0 || !matches!(cs.lifecycle, Lifecycle::Open) || cs.recv_finished() {
             return;
         }
-        cs.peer_hangup = true;
-        if cs.recv_direct_armed {
+        if cs.recv_direct_armed || cs.hangup_peek_armed {
+            return;
+        }
+        let generation = cs.generation;
+        let buf = self.driver.hangup_peek_buf.as_mut_ptr();
+        // A peek that cannot be pushed leaves the connection as it was
+        // before the poll: a read still sees the FIN.
+        if self
+            .driver
+            .ring
+            .submit_hangup_peek(conn_index, generation, buf)
+            .is_ok()
+            && let Some(cs) = self.driver.connections.get_mut(conn_index)
+        {
+            cs.hangup_peek_armed = true;
+        }
+    }
+
+    /// Completion of a hangup peek (`OpTag::HangupPeek`). A positive result
+    /// means bytes are queued ahead of the FIN: they stay in the socket with
+    /// it, and a reader's receive delivers both in order. Otherwise (0, the
+    /// FIN alone, or an error) the stream has ended with nothing left to
+    /// read in the socket, and if no receive is in flight and nothing is
+    /// buffered the connection closes as it would under a parked read.
+    /// Buffered bytes stay readable: the reader's next parked read arms a
+    /// receive, which sees the end itself.
+    fn handle_hangup_peek(&mut self, ud: UserData, result: i32) {
+        let conn_index = ud.conn_index();
+        let Some(cs) = self.driver.connections.get_mut(conn_index) else {
+            return;
+        };
+        if cs.generation != ud.payload() {
+            return;
+        }
+        cs.hangup_peek_armed = false;
+        if result > 0
+            || matches!(-result, libc::ECANCELED | libc::EAGAIN | libc::EINTR)
+            || !matches!(cs.lifecycle, Lifecycle::Open)
+            || cs.recv_finished()
+            || cs.recv_direct_armed
+        {
+            return;
+        }
+        if self.driver.recv_buffered(conn_index) > 0 {
             return;
         }
         metrics::RECV_DIRECT.increment(metrics::recv_direct::HANGUP);
-        if self.driver.arm_direct_recv_or_close(conn_index, None) {
-            self.executor.wake_recv(conn_index);
+        if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+            if result == 0 {
+                cs.note_eof(false);
+            } else {
+                cs.read = ReadHalf::Error;
+            }
         }
+        if result < 0 {
+            self.executor.fail_recv(
+                conn_index,
+                ud.payload(),
+                io::Error::from_raw_os_error(-result),
+            );
+        }
+        self.executor.wake_recv(conn_index);
+        self.driver.close_connection(conn_index);
     }
 
     fn dispatch_cqe(&mut self, user_data_raw: u64, result: i32, flags: u32) {
@@ -1542,6 +1587,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             OpTag::RecvFallback => self.handle_recv_fallback(ud, result),
             OpTag::RecvDirect => self.handle_recv_direct(ud, result),
             OpTag::HangupPoll => self.handle_hangup_poll(ud, result),
+            OpTag::HangupPeek => self.handle_hangup_peek(ud, result),
             OpTag::Send => self.handle_send(ud, result),
             OpTag::SendMsgZc => self.handle_send_msg_zc(ud, result, flags),
             OpTag::Close => self.handle_close(ud),
@@ -4489,7 +4535,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             .get(conn_index)
             .is_some_and(|c| c.recv_direct)
         {
-            self.driver.arm_hangup_poll_or_close(conn_index);
+            self.driver.arm_hangup_poll(conn_index);
         } else {
             self.arm_recv(conn_index);
         }
