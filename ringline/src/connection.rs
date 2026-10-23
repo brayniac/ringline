@@ -140,8 +140,9 @@ pub struct ConnectionState {
     #[cfg(has_io_uring)]
     pub socket_handed_off: bool,
     /// The connection receives with one-shot receives into its own
-    /// accumulator instead of the provided ring: a plaintext connection from
-    /// `connect` or `connect_unix`. Set when the connect is submitted, for the
+    /// accumulator instead of the provided ring: every plaintext TCP or Unix
+    /// connection, accepted or from `connect` or `connect_unix`. Set when the
+    /// connect is submitted or the connection is installed, for the
     /// connection's life.
     #[cfg(has_io_uring)]
     pub recv_direct: bool,
@@ -154,6 +155,11 @@ pub struct ConnectionState {
     /// direct receive in flight.
     #[cfg(has_io_uring)]
     pub recv_direct_held: usize,
+    /// The `direct_recvs` index of the direct receive in flight, which its
+    /// `OpTag::RecvDirect` user_data carries. Valid while
+    /// `recv_direct_armed`.
+    #[cfg(has_io_uring)]
+    pub recv_direct_slot: u32,
     /// A `forward_to_conn` from this direct connection is running. A second
     /// one is refused with `EBUSY`.
     #[cfg(has_io_uring)]
@@ -214,6 +220,8 @@ impl ConnectionState {
             recv_direct_armed: false,
             #[cfg(has_io_uring)]
             recv_direct_held: 0,
+            #[cfg(has_io_uring)]
+            recv_direct_slot: 0,
             #[cfg(has_io_uring)]
             direct_forwarding: false,
             #[cfg(has_io_uring)]
@@ -296,6 +304,7 @@ impl ConnectionState {
             self.recv_direct = false;
             self.recv_direct_armed = false;
             self.recv_direct_held = 0;
+            self.recv_direct_slot = 0;
             self.direct_forwarding = false;
             self.hangup_poll_armed = false;
             self.hangup_peek_armed = false;

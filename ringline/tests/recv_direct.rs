@@ -1,5 +1,5 @@
-//! Direct receives: a plaintext connection from `connect` or `connect_unix`
-//! receives with one-shot receives into its own accumulator.
+//! Direct receives: a plaintext connection, accepted or from `connect` or
+//! `connect_unix`, receives with one-shot receives into its own accumulator.
 #![cfg(has_io_uring)]
 #![allow(clippy::manual_async_fn)]
 

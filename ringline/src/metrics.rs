@@ -264,8 +264,10 @@ pub mod park_abandon {
     /// The `FixedFdInstall` failed, or the linked recv-cancel returned
     /// `ECANCELED` because the recv had self-terminated.
     pub const INSTALL_FAILED: usize = 13;
-    /// The connection receives directly into its accumulator.
-    pub const DIRECT_RECEIVE: usize = 14;
+    /// A direct receive or the hangup poll was armed when the install
+    /// completed. Arms are refused while a park is pending, so this counts
+    /// a path that armed one anyway.
+    pub const RECEIVE_ARMED: usize = 14;
 
     /// Number of slots. Sizing the group from this keeps the width and the
     /// range check from drifting apart.
@@ -669,9 +671,9 @@ pub fn init_metadata() {
         "install_failed".into(),
     );
     PARK_ABANDONED.insert_metadata(
-        park_abandon::DIRECT_RECEIVE,
+        park_abandon::RECEIVE_ARMED,
         "op".into(),
-        "direct_receive".into(),
+        "receive_armed".into(),
     );
 
     BYTES.insert_metadata(bytes::RECEIVED, "op".into(), "received".into());

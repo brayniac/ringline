@@ -2255,11 +2255,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // condition the install needs. The install goes out only with no
             // receive armed, so it also waits for this park's cancel to end
             // the receive.
-            let armed = self
-                .driver
-                .connections
-                .get(conn_index)
-                .is_some_and(|c| c.recv_multishot_armed);
+            let armed = self.driver.connections.get(conn_index).is_some_and(|c| {
+                c.recv_multishot_armed || c.recv_direct_armed || c.hangup_poll_armed
+            });
             if !armed && self.driver.park_blocker(conn_index).is_none() {
                 if self
                     .driver
@@ -2387,38 +2385,53 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
         let generation = self.driver.connections.generation(conn_index);
 
-        // Cancel the armed multishot recv *ahead of* the install, linked, so
-        // the kernel orders them. A recv left armed here would keep draining a
-        // socket that now belongs to another worker.
-        let cancel_target = self
-            .driver
-            .connections
-            .get(conn_index)
-            .is_some_and(|c| c.recv_multishot_armed)
-            .then(|| {
-                crate::completion::UserData::encode(
-                    crate::completion::OpTag::RecvMulti,
-                    conn_index,
-                    generation,
-                )
-                .raw()
-            });
+        // Cancel what is armed on the socket before the install. A receive
+        // left armed here would keep reading a socket that now belongs to
+        // another worker. A ring connection has its multishot receive. A
+        // direct connection has the direct receive of a parked read, if one
+        // is in flight, and its hangup poll.
+        let mut cancel_targets = [0u64; 2];
+        let mut cancel_count = 0;
+        if let Some(c) = self.driver.connections.get(conn_index) {
+            use crate::completion::{OpTag, UserData};
+            if c.recv_multishot_armed {
+                cancel_targets[cancel_count] =
+                    UserData::encode(OpTag::RecvMulti, conn_index, generation).raw();
+                cancel_count += 1;
+            }
+            if c.recv_direct_armed {
+                cancel_targets[cancel_count] =
+                    UserData::encode(OpTag::RecvDirect, conn_index, c.recv_direct_slot).raw();
+                cancel_count += 1;
+            }
+            if c.hangup_poll_armed && cancel_count < cancel_targets.len() {
+                cancel_targets[cancel_count] =
+                    UserData::encode(OpTag::HangupPoll, conn_index, generation).raw();
+                cancel_count += 1;
+            }
+        }
 
         // Phase 1: cancel the recv and wait. The install is NOT submitted here
         // and NOT linked to the cancel — a cancel cannot retract recv CQEs the
         // kernel already posted, so an install behind it lands while those are
         // still being delivered and finds the offer withdrawn. Measured: that
         // accounted for 9,427 of 9,427 abandonments.
-        match cancel_target {
-            Some(t) => {
+        match cancel_count {
+            1.. => {
+                // SQ pressure is backpressure, not failure (Invariant 7). A
+                // first cancel that fails leaves nothing changed. A second
+                // that fails leaves its target armed, so the drain waits for
+                // it until `DRAIN_TIMEOUT` abandons the park and re-arms.
                 if self
                     .driver
                     .ring
-                    .submit_park_recv_cancel(conn_index, t)
+                    .submit_park_recv_cancel(conn_index, cancel_targets[0])
                     .is_err()
                 {
-                    // SQ pressure is backpressure, not failure (Invariant 7).
                     return false;
+                }
+                for &t in &cancel_targets[1..cancel_count] {
+                    let _ = self.driver.ring.submit_park_recv_cancel(conn_index, t);
                 }
                 metrics::PARK_DIAG.increment(metrics::park_diag::CANCEL_SUBMITTED);
                 self.driver.set_park_drain(
@@ -2431,7 +2444,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     }),
                 );
             }
-            None => {
+            0 => {
                 // Nothing armed to cancel, so nothing can arrive: install now.
                 metrics::PARK_DIAG.increment(metrics::park_diag::CANCEL_ABSENT);
                 if self
@@ -2535,6 +2548,20 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // a matter of inference rather than measurement.
         if let Some(blocker) = self.driver.park_blocker(conn_index) {
             metrics::PARK_ABANDONED.increment(blocker.abandon_metric());
+            self.rearm_multishot_if_idle(conn_index);
+            return; // `fd` drops.
+        }
+        // The install went out with nothing armed, and arms are refused while
+        // the park is pending. One armed now would read on this worker after
+        // the socket moved, so the park is abandoned instead.
+        if self
+            .driver
+            .connections
+            .get(conn_index)
+            .is_some_and(|c| c.recv_multishot_armed || c.recv_direct_armed || c.hangup_poll_armed)
+        {
+            debug_assert!(false, "a receive was armed while the park was pending");
+            metrics::PARK_ABANDONED.increment(metrics::park_abandon::RECEIVE_ARMED);
             self.rearm_multishot_if_idle(conn_index);
             return; // `fd` drops.
         }
@@ -2688,10 +2715,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.arm_recv(conn_index);
         } else if let Some(cs) = self.driver.connections.get_mut(conn_index) {
             // A plaintext connection receives directly into its accumulator.
-            // Its receive is armed by its first parked read, as for an
-            // outbound plaintext connection, and its hangup poll below, once
-            // it is open.
+            // Its receive is armed by its first parked read, and its hangup
+            // poll below, once it is open.
             cs.recv_direct = true;
+            cs.recv_arm = RecvArm::Idle;
         }
 
         // TLS path: defer accept until handshake completes.
@@ -3645,6 +3672,15 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// multishot mode, or is throttled by the Mode A hold cap — that last one
     /// owns its own re-arm and must not have a second multishot armed under it.
     fn rearm_multishot_if_idle(&mut self, conn_index: u32) {
+        if self
+            .driver
+            .connections
+            .get(conn_index)
+            .is_some_and(|c| c.recv_direct)
+        {
+            self.rearm_direct_after_park(conn_index);
+            return;
+        }
         if self.driver.forward_hold_throttled[conn_index as usize] {
             return;
         }
@@ -3664,6 +3700,29 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         } else if let Some(cs) = self.driver.connections.get_mut(conn_index) {
             cs.recv_multishot_armed = true;
         }
+    }
+
+    /// Give a direct connection back what a park cancelled or held off: its
+    /// hangup poll, a receive if the poll has already seen the peer leave,
+    /// and a wake for a reader that parked during the drain, whose receive
+    /// was refused then and is armed when it polls again.
+    fn rearm_direct_after_park(&mut self, conn_index: u32) {
+        let Some(c) = self.driver.connections.get(conn_index) else {
+            return;
+        };
+        if !matches!(c.lifecycle, Lifecycle::Open) || c.recv_finished() {
+            return;
+        }
+        let (poll_armed, hangup, recv_armed) =
+            (c.hangup_poll_armed, c.peer_hangup, c.recv_direct_armed);
+        // Either arm closes the connection if it cannot be pushed; the wake
+        // below then resolves the reader.
+        if !poll_armed && !hangup {
+            self.driver.arm_hangup_poll_or_close(conn_index);
+        } else if hangup && !recv_armed {
+            self.driver.arm_direct_recv_or_close(conn_index, None);
+        }
+        self.executor.wake_recv(conn_index);
     }
 
     /// Throttle a connection that holds as much received data as it may
@@ -6248,6 +6307,131 @@ mod tests {
                 .is_some_and(|c| c.recv_multishot_armed),
             "abandoning the park must re-arm"
         );
+    }
+
+    /// An accepted direct connection as `install_accepted_with_pending`
+    /// leaves it: open, direct, no ring receive.
+    fn accept_direct_connection(el: &mut AsyncEventLoop<NoopHandler>) -> u32 {
+        let conn_index = accept_connection(el);
+        if let Some(cs) = el.driver.connections.get_mut(conn_index) {
+            cs.recv_direct = true;
+            cs.recv_arm = RecvArm::Idle;
+        }
+        conn_index
+    }
+
+    fn direct_flags(el: &AsyncEventLoop<NoopHandler>, conn_index: u32) -> (bool, bool) {
+        let c = el.driver.connections.get(conn_index).unwrap();
+        (c.recv_direct_armed, c.hangup_poll_armed)
+    }
+
+    /// A direct connection with a read parked and its hangup poll armed is
+    /// parked by cancelling both. The install waits until both have ended,
+    /// and no receive is armed in between, even when the reader polls again.
+    #[test]
+    fn a_direct_park_cancels_the_receive_and_the_poll_before_the_install() {
+        let mut el = make_test_loop();
+        if !el.driver.ring.supports_park() {
+            return;
+        }
+        let conn_index = accept_direct_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        assert!(!el.driver.arm_hangup_poll_or_close(conn_index));
+        assert!(!el.driver.arm_direct_recv_or_close(conn_index, None));
+        assert_eq!(direct_flags(&el, conn_index), (true, true), "precondition");
+        let slot = el
+            .driver
+            .connections
+            .get(conn_index)
+            .unwrap()
+            .recv_direct_slot;
+        el.driver.park_offered[conn_index as usize] = true;
+
+        assert!(el.begin_park(conn_index, 1), "the park starts");
+        assert!(
+            el.driver.park_drain[conn_index as usize].is_some(),
+            "it drains: there was something to cancel"
+        );
+        el.drive_park_drains();
+        assert!(
+            el.driver.park_in_flight[conn_index as usize].is_none(),
+            "no install while the receive and the poll are armed"
+        );
+
+        // The receive ends cancelled; the reader polls again and parks.
+        let recv_ud = UserData::encode(OpTag::RecvDirect, conn_index, slot);
+        el.test_dispatch_cqe(recv_ud.raw(), -libc::ECANCELED, 0);
+        assert!(!el.driver.arm_direct_recv_or_close(conn_index, None));
+        assert_eq!(
+            direct_flags(&el, conn_index),
+            (false, true),
+            "no receive is armed while the park is pending"
+        );
+        el.drive_park_drains();
+        assert!(
+            el.driver.park_in_flight[conn_index as usize].is_none(),
+            "no install while the poll is armed"
+        );
+
+        let poll_ud = UserData::encode(OpTag::HangupPoll, conn_index, generation);
+        el.test_dispatch_cqe(poll_ud.raw(), -libc::ECANCELED, 0);
+        el.drive_park_drains();
+        assert!(
+            el.driver.park_in_flight[conn_index as usize].is_some(),
+            "the install goes out once nothing is armed"
+        );
+        assert!(el.driver.park_drain[conn_index as usize].is_none());
+    }
+
+    /// An abandoned park of a direct connection gives it its hangup poll
+    /// back, and a reader that parked during the drain can arm again.
+    #[test]
+    fn abandoning_a_direct_park_rearms_the_poll_and_allows_a_receive() {
+        let mut el = make_test_loop();
+        let conn_index = accept_direct_connection(&mut el);
+        el.driver
+            .set_park_drain(conn_index, Some(park_drain_for(&el, conn_index)));
+        assert!(!el.driver.arm_direct_recv_or_close(conn_index, None));
+        assert_eq!(
+            direct_flags(&el, conn_index),
+            (false, false),
+            "precondition"
+        );
+
+        el.abandon_park_drain(conn_index);
+
+        assert!(el.driver.park_drain[conn_index as usize].is_none());
+        let (recv, poll) = direct_flags(&el, conn_index);
+        assert!(poll, "the hangup poll is armed again");
+        assert!(!recv, "the abandon itself arms no receive");
+        assert!(
+            !el.driver
+                .connections
+                .get(conn_index)
+                .unwrap()
+                .recv_multishot_armed,
+            "a direct connection is never marked as having a multishot receive"
+        );
+        assert!(!el.driver.arm_direct_recv_or_close(conn_index, None));
+        assert_eq!(
+            direct_flags(&el, conn_index),
+            (true, true),
+            "the reader's next poll arms its receive"
+        );
+    }
+
+    /// A direct connection with nothing armed installs at once.
+    #[test]
+    fn a_direct_connection_with_nothing_armed_installs_at_once() {
+        let mut el = make_test_loop();
+        if !el.driver.ring.supports_park() {
+            return;
+        }
+        let conn_index = accept_direct_connection(&mut el);
+        el.driver.park_offered[conn_index as usize] = true;
+        assert!(el.begin_park(conn_index, 1));
+        assert!(el.driver.park_drain[conn_index as usize].is_none());
+        assert!(el.driver.park_in_flight[conn_index as usize].is_some());
     }
 
     fn park_drain_for(
@@ -9767,6 +9951,50 @@ mod tests {
         let cs = el.driver.connections.get(conn_index).unwrap();
         assert!(cs.close_requested(), "close after cancel must be honoured");
         assert!(el.driver.pending_finalize_closes.contains(&conn_index));
+    }
+
+    /// Cancelling a direct connection's receive finishes its read half and
+    /// ends the direct receive in flight; no receive is armed afterwards.
+    #[test]
+    fn cancel_on_a_direct_connection_ends_its_receive() {
+        let mut el = make_test_loop();
+        let conn_index = accept_direct_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        assert!(!el.driver.arm_direct_recv_or_close(conn_index, None));
+        let slot = el
+            .driver
+            .connections
+            .get(conn_index)
+            .unwrap()
+            .recv_direct_slot;
+        {
+            let mut ctx = el.driver.make_ctx();
+            ctx.cancel(crate::handler::ConnToken::new(conn_index, generation))
+                .expect("cancel");
+        }
+        assert!(
+            el.driver
+                .connections
+                .get(conn_index)
+                .unwrap()
+                .recv_finished(),
+            "cancel finishes the read half"
+        );
+        let ud = UserData::encode(OpTag::RecvDirect, conn_index, slot);
+        el.test_dispatch_cqe(ud.raw(), -libc::ECANCELED, 0);
+        assert!(!el.driver.arm_direct_recv_or_close(conn_index, None));
+        assert_eq!(
+            direct_flags(&el, conn_index),
+            (false, false),
+            "a cancelled connection arms no receive"
+        );
+        assert!(
+            !el.driver
+                .connections
+                .get(conn_index)
+                .unwrap()
+                .close_requested()
+        );
     }
 
     // ── Recv data delivery tests ───────────────────────────────────

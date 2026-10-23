@@ -16,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   processed during the yield are polled after the yielding task resumes, and
   the task can resume within the same loop iteration on both backends.
   `tests/ready_queue_fairness.rs` uses it.
-- io_uring: an outbound plaintext connection, from `connect` or
+- io_uring: a plaintext connection, accepted or from `connect` or
   `connect_unix`, receives into its own accumulator instead of the shared
   provided buffer ring: a one-shot `RECV` into the accumulator's free space,
   armed when a read parks. There is no option to turn it off; a TLS
@@ -234,20 +234,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- **Breaking:** on io_uring, a plaintext connection from `connect` or
-  `connect_unix` always receives directly into its accumulator (see Added),
-  and no option gives it the provided-buffer ring. On such a connection
-  `segments`, `recv_owned_segment`, `with_segments`, `with_bytes_segments`
-  and `forward_to` return `io::ErrorKind::Unsupported`, and `try_with_data`
-  returns `None` while a receive is in flight. These work on accepted and TLS
-  connections as before, and there is no replacement for them on a
-  plaintext outbound connection. Such a connection has a receive armed only
-  when a read parks, and a `POLLRDHUP` poll armed when it opens. A FIN
-  or reset from the peer closes a connection that nothing reads, and
+- **Breaking:** on io_uring, every plaintext connection, accepted or from
+  `connect` or `connect_unix`, receives directly into its accumulator (see
+  Added), and no option gives it the provided-buffer ring. On such a
+  connection `segments`, `recv_owned_segment`, `with_segments`,
+  `with_bytes_segments` and `forward_to` return `io::ErrorKind::Unsupported`,
+  and `try_with_data` returns `None` while a receive is in flight. They work
+  on TLS connections, and on mio, and there is no replacement for them on a
+  plaintext connection on io_uring. Such a connection has a receive armed
+  only when a read parks, and a `POLLRDHUP` poll armed when it opens. A
+  FIN or reset from the peer closes a connection that nothing reads, and
   `is_alive` returns `false`. If bytes the peer sent before it are queued or
   buffered, the connection stays open until they have been read, and a
   reset is then reported to the read as an error. A FIN closes the
-  connection even when the task only sends.
+  connection even when the task only sends. `cancel` finishes the read half
+  and cancels the receive in flight. A park (`offer_for_park`) cancels the
+  connection's receive and poll before it moves the socket; the adopting
+  worker arms the poll, and the reader's next parked read arms a receive.
 - ringline-http's HTTP/2 connection reads with `with_data` on every backend,
   which a plaintext connection (`H2AsyncConn::from_conn` over `connect`)
   needs. Over TLS it copies as many bytes as before and allocates less.
@@ -592,7 +595,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Echo or forward with `with_data` and `send_nowait` or
   `forward_recv_buf`, or with `forward_to_conn`.
 - **Breaking:** the client methods that read a value from provided-buffer
-  segments, which an outbound plaintext connection no longer has:
+  segments, which a plaintext connection no longer has:
   ringline-redis `Client::get_stream` and `Pool::get_stream` (and
   `ValueStream`),
   `Client::recv_get_discard`, `Client::recv_get_segments` and `GetMeta`, and

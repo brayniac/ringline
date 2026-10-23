@@ -1583,6 +1583,25 @@ impl<'a> DriverCtx<'a> {
             return Ok(());
         }
 
+        // A direct connection has a receive in flight only while a read is
+        // parked; it is cancelled by the `direct_recvs` slot its user_data
+        // carries. Reads resolve to EOF from here on, as below, and the
+        // receive's `-ECANCELED` completion wakes a parked reader.
+        if cs.recv_direct && !matches!(cs.lifecycle, crate::connection::Lifecycle::Connecting) {
+            if matches!(cs.read, crate::connection::ReadHalf::Open) {
+                cs.read = crate::connection::ReadHalf::Cancelled;
+            }
+            if cs.recv_direct_armed {
+                let target_ud = crate::completion::UserData::encode(
+                    crate::completion::OpTag::RecvDirect,
+                    conn.index,
+                    cs.recv_direct_slot,
+                );
+                self.ring.submit_async_cancel(target_ud.raw(), conn.index)?;
+            }
+            return Ok(());
+        }
+
         // Determine target op to cancel.
         let target_tag = if matches!(cs.lifecycle, crate::connection::Lifecycle::Connecting) {
             crate::completion::OpTag::Connect

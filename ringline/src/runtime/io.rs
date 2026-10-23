@@ -586,8 +586,9 @@ impl<T: 'static> Future for BlockingJoinHandle<T> {
 ///
 /// # Receiving
 ///
-/// On io_uring a plaintext connection, from this function or
-/// [`connect_unix`], receives directly into its own accumulator. When a read
+/// On io_uring a plaintext connection, from this function, from
+/// [`connect_unix`] or accepted on a plaintext listener, receives directly
+/// into its own accumulator. When a read
 /// parks (`with_data`, `with_bytes`, `recv_ready`, or a
 /// [`ConnStream`](crate::ConnStream) read), the runtime submits a one-shot
 /// receive whose destination is the free space of the connection's
@@ -3067,7 +3068,7 @@ impl<'a> MioSendBuilder<'a> {
 // ── WithDataFuture ───────────────────────────────────────────────────
 
 /// Whether `conn_index` receives directly into its accumulator (a plaintext
-/// connection from `connect` or `connect_unix`). Such a connection has no
+/// TCP or Unix connection). Such a connection has no
 /// receive from the provided-buffer ring, so the reads that hold ring buffers
 /// (segments, `forward_to`) are refused on it.
 #[cfg(has_io_uring)]
@@ -3084,12 +3085,12 @@ fn is_recv_direct(driver: &Driver, conn_index: u32) -> bool {
 fn recv_direct_unsupported() -> io::Error {
     io::Error::new(
         io::ErrorKind::Unsupported,
-        "not supported on a direct-receive connection (outbound plaintext, io_uring)",
+        "not supported on a direct-receive connection (plaintext, io_uring)",
     )
 }
 
 /// Register the current task as `conn_index`'s receive waiter. On a direct
-/// connection (a plaintext connection from `connect` or `connect_unix`) also arm its receive, which the
+/// connection (a plaintext TCP or Unix connection) also arm its receive, which the
 /// caller does only after its parser has seen every buffered byte. `need` is
 /// the parser's `NeedAtLeast` value, if it returned one.
 pub(crate) fn park_recv(

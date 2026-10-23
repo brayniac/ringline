@@ -155,8 +155,9 @@ pub(crate) struct DirectRecv {
 }
 
 impl Driver {
-    /// Arm a direct receive on `conn_index` if it is a direct connection
-    /// (a plaintext connection from `connect` or `connect_unix`), open, and has none in flight. Called by a
+    /// Arm a direct receive on `conn_index` if it is a direct connection (a
+    /// plaintext TCP or Unix connection), open, and has none in flight, and
+    /// no park of it is pending. Called by a
     /// receive future that parks, after its parser has seen every buffered
     /// byte: the receive detaches the accumulator's buffer, so arming earlier
     /// would hide buffered bytes from the parser until more arrive.
@@ -183,6 +184,13 @@ impl Driver {
             || !matches!(cs.lifecycle, Lifecycle::Open)
             || cs.recv_finished()
         {
+            return false;
+        }
+        // A pending park moves the socket to another worker once nothing is
+        // armed on it here; a receive armed now would read bytes meant for
+        // that worker. The reader stays parked, and an abandoned park wakes
+        // it (`rearm_direct_after_park`).
+        if self.park_pending(conn_index) {
             return false;
         }
         let generation = cs.generation;
@@ -222,6 +230,7 @@ impl Driver {
         if let Some(cs) = self.connections.get_mut(conn_index) {
             cs.recv_direct_armed = true;
             cs.recv_direct_held = held;
+            cs.recv_direct_slot = slot;
         }
         metrics::RECV_DIRECT.increment(metrics::recv_direct::ARMED);
         if known {
@@ -1154,10 +1163,6 @@ pub(crate) enum ParkBlocker {
     SegmentReader,
     /// A fallback recv is in flight against this worker's send pool.
     RecvFallback,
-    /// The connection receives directly into its accumulator. Its receive
-    /// buffer is in this worker's `direct_recvs` while a receive is armed,
-    /// and carrying it is not implemented.
-    DirectReceive,
 }
 
 impl ParkBlocker {
@@ -1183,7 +1188,6 @@ impl ParkBlocker {
             ParkBlocker::Chain => pa::CHAIN,
             ParkBlocker::SegmentReader => pa::SEGMENT_READER,
             ParkBlocker::RecvFallback => pa::RECV_FALLBACK,
-            ParkBlocker::DirectReceive => pa::DIRECT_RECEIVE,
         }
     }
 }
@@ -1212,7 +1216,6 @@ mod park_blocker_tests {
             ParkBlocker::Chain,
             ParkBlocker::SegmentReader,
             ParkBlocker::RecvFallback,
-            ParkBlocker::DirectReceive,
         ];
         let mut seen = std::collections::HashMap::new();
         for b in all {
@@ -2590,10 +2593,6 @@ impl Driver {
         // wedge the connection waiting for a ClientHello.
         if conn.listener.is_none() {
             return Some(ParkBlocker::Outbound);
-        }
-
-        if conn.recv_direct {
-            return Some(ParkBlocker::DirectReceive);
         }
 
         // A TLS connection's session lives in this worker's `TlsTable`, and
