@@ -281,8 +281,10 @@ impl Driver {
     /// park is pending. Once its handshake is done, a TLS connection's receive
     /// is armed this way by a parked read (`park_recv`), by a segment reader or
     /// Mode A forward entering the segmented domain or waiting on its hold, and
-    /// by its hangup poll. After a completion, `handle_recv_multi` re-arms it
-    /// only while `rearms_after_completion` holds. A failed push goes to
+    /// by its hangup poll. After a data completion, `handle_recv_multi` re-arms
+    /// it only while `rearms_after_completion` holds; a receive stopped by the
+    /// hold-cap throttle is re-armed when the throttle lifts, even after the
+    /// segmented session has ended. A failed push goes to
     /// `recv_rearm_retries`.
     pub(crate) fn arm_tls_recv_if_idle(&mut self, conn_index: u32) {
         let ci = conn_index as usize;

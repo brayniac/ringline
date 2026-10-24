@@ -110,8 +110,7 @@ the ring this way.
 One receive stays armed and takes a new buffer for each arrival until it
 ends. It saves an SQE per buffer and the wait for the next arm. With
 one-shot receives, one connection streaming large messages receives about
-a fifth less per second, measured when
-`ConfigBuilder::recv_multishot(true)` still made TCP receives multishot.
+a fifth less per second (#647).
 
 A multishot receive keeps taking buffers while its socket has data, so a few
 connections with large messages can take most of the ring while others get

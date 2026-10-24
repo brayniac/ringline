@@ -259,25 +259,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   bytes, as on a plaintext connection. A TLS connection now arms the
   `POLLRDHUP` hangup poll, so a peer FIN or reset is seen, and `is_alive`
   returns `false`, while nothing reads. The poll does not fire on a
-  close_notify the peer sends without closing TCP: that alert is read, and
-  closes the connection, when a ring receive next completes, which outside
-  the segmented domain needs a read to have parked; on mio it is read when
-  it arrives. `forward_to_conn` from a TLS source takes the bytes from the
-  accumulator and sends them through the sink's send queue, as from a
-  plaintext source: ordered with other sends on the sink, with one chunk
-  buffered rather than up to `forward_hold_cap` entries, and below
-  `send_zc_threshold` copied into a pool slot. A zero-copy send of such a
-  forward to a sink that does not read holds worker exit for up to its
-  bound, as any guarded send does. A `forward_to_conn` from a TLS source in
-  the segmented domain forwards from its hold and writes to the sink
-  directly, unordered with other sends on the sink. A TLS source is in that
-  domain while a `segments` reader is live, after `recv_owned_segment`,
-  `with_segments` or `with_bytes_segments` until `end_segments`, and after a
-  `forward_to` that failed on a write. A segment reader or `forward_to`
-  started while a `forward_to_conn` sends from the accumulator gets `EBUSY`,
-  and so does `with_segments` while any forward runs. `recv_multishot` has
-  no effect: TLS connections, the only ones it affected, always arm one-shot
-  receives.
+  close_notify the peer sends without closing TCP: that alert is read when a
+  ring receive next completes; on mio it is read when it arrives.
+  `forward_to_conn` from a TLS source takes the bytes from the accumulator
+  and sends them through the sink's send queue, as from a plaintext source:
+  ordered with other sends on the sink, with one chunk buffered rather than
+  up to `forward_hold_cap` entries, and below `send_zc_threshold` copied
+  into a pool slot. A zero-copy send of such a forward to a sink that does
+  not read holds worker exit for up to its bound, as any guarded send does.
+  A `forward_to_conn` from a TLS source in the segmented domain forwards
+  from its hold and writes to the sink directly, unordered with other sends
+  on the sink. A TLS source is in that domain while a `segments` reader is
+  live, after `recv_owned_segment`, `with_segments` or `with_bytes_segments`
+  until `end_segments`, and after a `forward_to` that failed on a write. A
+  segment reader or `forward_to` started while a `forward_to_conn` sends
+  from the accumulator gets `EBUSY`, and so does `with_segments` while any
+  forward runs. `recv_multishot` has no effect: TLS connections, the only
+  ones it affected, always arm one-shot receives.
 - **Breaking:** `metrics::park_abandon::SLOT_RECYCLED` is 12 and
   `INSTALL_FAILED` 13, after the removal of `DIRECT_ECHO`.
 - **Breaking:** on io_uring, every plaintext connection, accepted or from

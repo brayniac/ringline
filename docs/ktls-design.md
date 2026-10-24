@@ -595,7 +595,7 @@ source and measured. So the TCP recv path must become `recvmsg`-shaped.
 What exists today is *not* infrastructure to build on:
 
 - **TLS receives are a one-shot buffer-select recv** (`RecvSelect`) and
-  plaintext receives a direct `Recv` on io_uring, or `Read::read` on mio
+  plaintext receives are a direct `Recv` on io_uring; mio uses `Read::read`
   [P-12]. None can carry cmsgs.
 - There is no TCP `recvmsg` path on either backend. The `timestamps`
   feature's `RecvMsgMulti` handler, since removed (see the CHANGELOG entry
