@@ -2613,6 +2613,11 @@ impl ConnCtx {
 
     /// Close this connection.
     ///
+    /// Queued sends drain first, then, on a TLS connection, a close_notify
+    /// alert, then the FIN. The drain has no time bound: a peer that stops
+    /// reading holds the connection until it reads, resets, or the worker
+    /// exits.
+    ///
     /// Does nothing if the connection has already been released (its slot may
     /// now hold another connection), or when called outside the worker's
     /// executor.
