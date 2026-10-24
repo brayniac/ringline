@@ -1,6 +1,10 @@
 # Two shared receive rings per worker, consumed incrementally where supported
 
-Status: proposal. Nothing here is implemented. The measurements behind it,
+Status: proposal. Nothing here is implemented. Since 0.7.0-alpha.5 a
+plaintext connection on io_uring receives directly into its accumulator, so
+the shared rings serve TLS and UDP only, and recv-forward, direct echo,
+`recv_hold` and the recv sink this design refers to were removed. The
+measurements behind it,
 and the alternatives that were measured and not chosen, are in
 `docs/journal/2026-09-incremental-buffer-consumption.md`, sections
 "2026-10: measurements" and "2026-10: kernels, two rings, tiered caches".

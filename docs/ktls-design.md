@@ -196,7 +196,8 @@ Those are `sk_msg_zerocopy_from_iter` call counts. Reading them:
   100 GbE connection hits it in ~22 s. On kernel 6.12 that is a forced close.
 - **N3** — the RX conversion (`RecvMulti` → `RecvMsgMulti` on TCP, both
   backends) cannot be done without regressing the segmented-recv or
-  direct-echo paths. [P-12]
+  direct-echo paths. [P-12] (Direct echo was removed in 0.7.0-alpha.5, and a
+  plaintext TCP connection on io_uring no longer arms `RecvMulti`.)
 - **N4** — the send-ordering hazard at the handshake→kTLS switch (see
   [Question 4](#4-what-breaks), "The switch is the sharp edge") has no clean
   answer within the per-connection send queue.

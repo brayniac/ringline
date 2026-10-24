@@ -1,6 +1,9 @@
 # Segmented recv — design
 
-**Status:** Draft / design (two adversarial passes; not yet planned or implemented)
+**Status:** Implemented in #286 (Modes A, B and C). On io_uring only a TLS
+connection can use it: a plaintext connection receives directly into its
+accumulator, and these reads return `io::ErrorKind::Unsupported` on it
+(`docs/recv-direct-design.md`).
 **Date:** 2026-07-19
 **Related:** `docs/recv-buffer-adaptive-design.md`, `docs/send-completion-design.md`, the 200 GbE 64 MB buffer-geometry sweep (project memory).
 

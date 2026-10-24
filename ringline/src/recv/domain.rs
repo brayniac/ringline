@@ -5,13 +5,15 @@
 //! - `CopyOrConsume` (the default) — the established path: bytes are copied into
 //!   the `RecvAccumulator` (or held in the single-buffer zero-copy slot) and
 //!   surfaced through `with_data`/`with_bytes`.
-//! - `Segmented` — buffers are held in-place (bid NOT replenished, no
-//!   accumulator copy) for later zero-copy / copy-at-delivery segment reads
-//!   (Mode B/C). TLS connections are excluded from segmented delivery.
+//! - `Segmented` — received bytes are held in `segment_hold` instead of the
+//!   accumulator, for segment reads (Modes B and C) and `forward_to` /
+//!   `forward_to_conn` sources (Mode A). Only a TLS connection enters it: its
+//!   decrypted plaintext is held as owned entries. A plaintext connection
+//!   receives directly into its accumulator and is refused with
+//!   `io::ErrorKind::Unsupported`.
 //!
 //! This is a minimal per-connection selector; the holding machinery lives on the
-//! `Driver` (`segment_hold`). The reader that consumes held buffers lands in a
-//! later increment — until then `Segmented` is set only in tests.
+//! `Driver` (`segment_hold`).
 
 /// How received provided buffers are delivered for a connection.
 ///
