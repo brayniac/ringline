@@ -338,6 +338,16 @@ pub struct DriverCtx<'a> {
     pub(crate) next_disk_io_seq: &'a mut u16,
 }
 
+/// The refusal of a TLS send made after this side's close_notify was queued:
+/// the record would follow the alert, and the peer discards it.
+#[cfg(has_io_uring)]
+fn close_notify_sent_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::NotConnected,
+        "connection closing: close_notify already sent",
+    )
+}
+
 #[cfg(has_io_uring)]
 impl<'a> DriverCtx<'a> {
     /// Request shutdown of this worker's event loop.
@@ -400,6 +410,10 @@ impl<'a> DriverCtx<'a> {
     ///
     /// The caller has checked that `conn` is current and has TLS state.
     fn encrypt_tls_send(&mut self, conn: ConnToken, data: &[u8]) -> io::Result<Vec<BuiltSend>> {
+        // SAFETY: read-only probe; see the `tls_table` field's contract.
+        if unsafe { (*self.tls_table).close_notify_sent(conn.index) } {
+            return Err(close_notify_sent_error());
+        }
         let slot_size = self.send_copy_pool.slot_size() as usize;
         // SAFETY: same single-threaded borrow-splitting contract as every
         // other `tls_table` use in this module; no other reference to the
@@ -675,6 +689,10 @@ impl<'a> DriverCtx<'a> {
 
         // SAFETY: read-only probe; see the `tls_table` field's contract.
         if !self.tls_table.is_null() && unsafe { (*self.tls_table).has(conn.index) } {
+            // SAFETY: as above.
+            if unsafe { (*self.tls_table).close_notify_sent(conn.index) } {
+                return Err(close_notify_sent_error());
+            }
             {
                 // Admission has to happen *before* rustls mutates: past the
                 // first record, departure 1 turns a shortfall into a closed

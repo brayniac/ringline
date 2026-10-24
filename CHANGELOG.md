@@ -695,7 +695,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `close_notify_timeout_ms`. A close the runtime makes after a receive
   error, a reset, a send that could not be pushed, or the peer closing first
   sends no alert; neither does `ConnCtx::close()` or a handler return after
-  the write side was shut down.
+  `shutdown_write`, including one still waiting for queued sends to drain.
+  A TLS send made after the alert is queued returns `NotConnected`, since
+  the peer discards records that follow it; on mio such a send goes out
+  ahead of the alert.
 - io_uring: a TLS connection that is a `forward_to` source, or has a segment
   reader, stops receiving once its hold reaches the hold cap
   (`forward_hold_cap`; without `recv_incremental`, at most a quarter of the

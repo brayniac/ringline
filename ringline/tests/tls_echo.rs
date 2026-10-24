@@ -1139,6 +1139,203 @@ fn a_slow_reader_gets_the_whole_reply_before_close_notify() {
     assert!(peer_closed, "no close_notify after the reply");
 }
 
+/// Read one byte, queue an 8 MiB reply, shut the write side down while the
+/// reply is still queued, and return.
+#[cfg(has_io_uring)]
+struct TlsBigReplyShutdownThenReturn;
+
+#[cfg(has_io_uring)]
+impl AsyncEventHandler for TlsBigReplyShutdownThenReturn {
+    #[allow(clippy::manual_async_fn)]
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
+        async move {
+            let n = conn
+                .with_data(|d| {
+                    if d.is_empty() {
+                        ParseResult::NeedMore
+                    } else {
+                        ParseResult::Consumed(1)
+                    }
+                })
+                .await;
+            if n == 0 {
+                return;
+            }
+            let chunk = vec![0x5au8; 64 * 1024];
+            for _ in 0..BIG_REPLY / chunk.len() {
+                conn.send_nowait(&chunk).expect("queue the reply");
+            }
+            conn.shutdown_write();
+        }
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        TlsBigReplyShutdownThenReturn
+    }
+}
+
+/// Connect to `addr` with a 64 KiB receive buffer, send one byte, wait
+/// `delay`, then read until the server's close. Returns the plaintext and
+/// whether a close_notify arrived.
+#[cfg(has_io_uring)]
+fn read_reply_until_close(
+    addr: &str,
+    certs: &[rustls::pki_types::CertificateDer<'static>],
+    delay: Duration,
+) -> (Vec<u8>, bool) {
+    use std::os::fd::AsRawFd;
+    let server_name: ServerName<'_> = "localhost".try_into().unwrap();
+    let mut tls_conn =
+        rustls::ClientConnection::new(client_tls_config(certs), server_name).unwrap();
+    let mut tcp = TcpStream::connect(addr).unwrap();
+    let rcvbuf: libc::c_int = 64 * 1024;
+    let rc = unsafe {
+        libc::setsockopt(
+            tcp.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &rcvbuf as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(rc, 0, "setsockopt(SO_RCVBUF)");
+    tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    {
+        let mut stream = rustls::Stream::new(&mut tls_conn, &mut tcp);
+        stream.write_all(b"g").unwrap();
+        stream.flush().unwrap();
+    }
+    std::thread::sleep(delay);
+    let mut plaintext = Vec::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        match tls_conn.read_tls(&mut tcp) {
+            Ok(0) => return (plaintext, false),
+            Ok(_) => {}
+            Err(e) => panic!("read_tls failed after {} bytes: {e}", plaintext.len()),
+        }
+        let state = tls_conn
+            .process_new_packets()
+            .expect("server sent a malformed record");
+        loop {
+            match tls_conn.reader().read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => plaintext.extend_from_slice(&buf[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("plaintext read failed: {e}"),
+            }
+        }
+        if state.peer_has_closed() {
+            return (plaintext, true);
+        }
+    }
+}
+
+/// A handler that shuts its write side down while sends are still queued and
+/// then returns sends no close_notify: the FIN is already ordered behind the
+/// queue, and an alert after it would never be read.
+#[cfg(has_io_uring)]
+#[test]
+fn no_close_notify_after_a_pending_write_shutdown() {
+    let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
+    let (certs, key) = generate_self_signed();
+    let config = test_config_builder()
+        .tls(TlsConfig::new(server_tls_config(certs.clone(), key)))
+        .send_pool(1024, 16448)
+        .build()
+        .expect("valid config");
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind("127.0.0.1:0".parse().unwrap())
+        .launch::<TlsBigReplyShutdownThenReturn>()
+        .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
+    wait_for_server(&addr);
+
+    // The client does not read for 300 ms, so the reply is still queued when
+    // the handler shuts the write side down and returns.
+    let (plaintext, peer_closed) =
+        read_reply_until_close(&addr, &certs, Duration::from_millis(300));
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().expect("worker panicked").expect("worker failed");
+    }
+    assert_eq!(plaintext.len(), BIG_REPLY, "the reply was cut short");
+    assert!(!peer_closed, "a close_notify followed the write shutdown");
+}
+
+/// The result of the send `TlsSendAfterClose` makes after `close()`.
+#[cfg(has_io_uring)]
+static TLS_SEND_AFTER_CLOSE: Mutex<Option<std::io::Result<()>>> = Mutex::new(None);
+
+/// Read one byte, send "early", close, then try to send "late".
+#[cfg(has_io_uring)]
+struct TlsSendAfterClose;
+
+#[cfg(has_io_uring)]
+impl AsyncEventHandler for TlsSendAfterClose {
+    #[allow(clippy::manual_async_fn)]
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
+        async move {
+            let n = conn
+                .with_data(|d| {
+                    if d.is_empty() {
+                        ParseResult::NeedMore
+                    } else {
+                        ParseResult::Consumed(1)
+                    }
+                })
+                .await;
+            if n == 0 {
+                return;
+            }
+            conn.send_nowait(b"early").expect("send before close");
+            conn.close();
+            *TLS_SEND_AFTER_CLOSE.lock().unwrap() = Some(conn.send_nowait(b"late"));
+        }
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        TlsSendAfterClose
+    }
+}
+
+/// On io_uring a TLS send after `close()` is refused: its record would follow
+/// the close_notify, and the peer discards records after the alert.
+#[cfg(has_io_uring)]
+#[test]
+fn a_tls_send_after_close_is_refused() {
+    let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
+    *TLS_SEND_AFTER_CLOSE.lock().unwrap() = None;
+    let (certs, key) = generate_self_signed();
+    let config = test_config_builder()
+        .tls(TlsConfig::new(server_tls_config(certs.clone(), key)))
+        .build()
+        .expect("valid config");
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind("127.0.0.1:0".parse().unwrap())
+        .launch::<TlsSendAfterClose>()
+        .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
+    wait_for_server(&addr);
+
+    let (plaintext, peer_closed) = read_reply_until_close(&addr, &certs, Duration::ZERO);
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().expect("worker panicked").expect("worker failed");
+    }
+    assert_eq!(plaintext, b"early");
+    assert!(peer_closed, "no close_notify");
+    let late = TLS_SEND_AFTER_CLOSE
+        .lock()
+        .unwrap()
+        .take()
+        .expect("handler ran");
+    let err = late.expect_err("a send after close() was accepted");
+    assert_eq!(err.kind(), std::io::ErrorKind::NotConnected);
+}
+
 // ── Test 6: Server-initiated clean TLS close from on_tick (io_uring) ─────
 
 /// Where `on_accept` parks the connection's `ConnToken` for `on_tick` to close.

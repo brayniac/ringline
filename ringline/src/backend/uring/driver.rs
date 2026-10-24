@@ -3123,9 +3123,9 @@ impl Driver {
 
     /// Close a connection the application asked to close (`ConnCtx::close`, or
     /// its task finishing). A TLS connection first queues its close_notify, so
-    /// the peer can tell the close from a truncation; a close after an error
-    /// goes through [`close_connection`](Self::close_connection) and sends no
-    /// alert.
+    /// the peer can tell the close from a truncation. A close the backend makes
+    /// after a receive or send failure goes through
+    /// [`close_connection`](Self::close_connection) and sends no alert.
     pub(crate) fn close_connection_graceful(&mut self, conn_index: u32) {
         if self
             .connections
@@ -3141,10 +3141,11 @@ impl Driver {
     /// it goes out after any queued sends and ahead of the FIN. No deadline is
     /// armed: the queue drains however long the peer takes, as for a plaintext
     /// connection. Does nothing for a plaintext connection, a socket handed off
-    /// to another worker, or one whose write side is already shut down.
+    /// to another worker, or one whose write side is shut down or has a
+    /// shutdown pending behind its queued sends.
     fn queue_tls_close_notify(&mut self, conn_index: u32) {
         if self.connections.get(conn_index).is_some_and(|c| {
-            c.socket_handed_off || matches!(c.write, crate::connection::WriteHalf::Shutdown)
+            c.socket_handed_off || !matches!(c.write, crate::connection::WriteHalf::Open)
         }) {
             return;
         }

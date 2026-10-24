@@ -243,10 +243,9 @@ pub struct TlsConn {
     /// True once this side's close_notify alert has been generated, by
     /// whichever call the driving engine uses for it (the buffered engine's
     /// `send_close_notify`, the unbuffered engine's
-    /// `WriteTraffic::queue_close_notify`). Recorded for the close_notify
-    /// timeout machinery; the deadline itself is armed by `DriverCtx::close`
-    /// for any TLS connection, without consulting this, so nothing outside
-    /// this module reads it today.
+    /// `WriteTraffic::queue_close_notify`). On io_uring the send paths refuse
+    /// application data once it is set, since the peer discards any record
+    /// after the alert.
     pub close_notify_sent: bool,
     /// Plaintext bytes rustls will put in one outgoing record on this
     /// connection, **with the 5-byte record header already subtracted**.
@@ -687,6 +686,14 @@ impl TlsTable {
     /// Check if a connection has TLS state.
     pub fn has(&self, conn_index: u32) -> bool {
         self.conns[conn_index as usize].is_some()
+    }
+
+    /// Whether this side's close_notify has been generated on a connection.
+    #[cfg(has_io_uring)]
+    pub fn close_notify_sent(&self, conn_index: u32) -> bool {
+        self.conns[conn_index as usize]
+            .as_ref()
+            .is_some_and(|c| c.close_notify_sent)
     }
 
     /// Remove TLS state for a connection.

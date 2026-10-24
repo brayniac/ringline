@@ -2641,7 +2641,13 @@ impl ConnCtx {
     /// Queued sends drain first, then, on a TLS connection, a close_notify
     /// alert, then the FIN. The drain has no time bound: a peer that stops
     /// reading holds the connection until it reads, resets, or the worker
-    /// exits.
+    /// exits. If a close is already pending, for example because the peer
+    /// closed first, this sends no alert. No alert follows a write shutdown
+    /// (`shutdown_write`).
+    ///
+    /// On io_uring a TLS send made after `close()` returns `NotConnected`,
+    /// because it would follow the alert. On mio it is queued and sent ahead of
+    /// the alert, which mio writes once the queue drains.
     ///
     /// Does nothing if the connection has already been released (its slot may
     /// now hold another connection), or when called outside the worker's
