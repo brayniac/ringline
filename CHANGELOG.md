@@ -255,20 +255,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `connect` or `connect_unix`, receives directly into its accumulator (see
   Added), and no option gives it the provided-buffer ring. On such a
   connection `segments`, `recv_owned_segment`, `with_segments`,
-  `with_bytes_segments` and `forward_to` return `io::ErrorKind::Unsupported`,
-  and `try_with_data` returns `None` while a receive is in flight. They work
-  on TLS connections; on mio only `with_bytes_segments` exists, and it
-  presents the accumulator. There is no replacement for them on a plaintext
-  connection on io_uring. Such a connection has a receive armed
-  only when a read parks, and a `POLLRDHUP` poll armed when it opens. A
-  FIN or reset from the peer closes a connection that nothing reads, and
-  `is_alive` returns `false`. If bytes the peer sent before it are queued or
-  buffered, the connection stays open until they have been read, and a
-  reset is then reported to the read as an error. A FIN closes the
-  connection even when the task only sends. `cancel` finishes the read half
-  and cancels the receive in flight. A park (`offer_for_park`) cancels the
-  connection's receive and poll before it moves the socket; the adopting
-  worker arms the poll, and the reader's next parked read arms a receive.
+  `with_bytes_segments` and `forward_to` return
+  `io::ErrorKind::Unsupported`, and `try_with_data` returns `None` while a
+  receive is in flight. They work on TLS connections; on mio only
+  `with_bytes_segments` exists, and it presents the accumulator. There is no
+  replacement for them on a plaintext connection on io_uring. Such a
+  connection has a receive armed only when a read parks, and a `POLLRDHUP`
+  poll armed when it opens. A FIN or reset from the peer closes a connection
+  that nothing reads, and `is_alive` returns `false`. If bytes the peer sent
+  before it are queued or buffered, the connection stays open until they
+  have been read, and a reset is then reported to the read as an error. A
+  poll, or the peek it triggers, that cannot be submitted is submitted again
+  on a later loop iteration. A FIN closes the connection even when the task
+  only sends. `cancel` finishes the read half and cancels the receive in
+  flight. A park (`offer_for_park`) cancels the connection's receive and
+  poll before it moves the socket; the adopting worker arms the poll, and
+  the reader's next parked read arms a receive.
 - ringline-http's HTTP/2 connection reads with `with_data` on every backend,
   which a plaintext connection (`H2AsyncConn::from_conn` over `connect`)
   needs. Over TLS it copies as many bytes as before and allocates less.

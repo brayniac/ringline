@@ -172,16 +172,22 @@ pub struct ConnectionState {
     pub hangup_peek_armed: bool,
     /// A hangup peek found bytes queued ahead of the end of the stream, or
     /// found the end with bytes buffered or a receive in flight, or the
-    /// hangup poll completed with a receive in flight, so the connection is
-    /// on `Driver::hangup_rechecks` until the end is seen.
+    /// hangup poll completed with a receive in flight, or the hangup poll or
+    /// peek could not be submitted, so the connection is on
+    /// `Driver::hangup_rechecks` until the end is seen.
     #[cfg(has_io_uring)]
     pub hangup_recheck: bool,
     /// A direct receive delivered bytes since the last recheck peek, a peek
-    /// found the end with bytes buffered or a receive in flight, or the
-    /// hangup poll completed with a receive in flight, so the next time
-    /// nothing is buffered, armed or parking, another peek is due.
+    /// found the end with bytes buffered or a receive in flight, the hangup
+    /// poll completed with a receive in flight, or the peek the hangup poll
+    /// triggered could not be submitted, so the next time nothing is
+    /// buffered, armed or parking, another peek is due.
     #[cfg(has_io_uring)]
     pub hangup_recheck_due: bool,
+    /// The hangup poll could not be submitted. `recheck_hangups` submits it
+    /// again while no park is pending.
+    #[cfg(has_io_uring)]
+    pub hangup_poll_retry: bool,
     /// The errno a hangup peek returned while the connection stayed open (bytes
     /// buffered or a receive in flight), or 0. The peek clears the socket's
     /// pending error, so the receive or recheck peek that later finds the end
@@ -232,6 +238,8 @@ impl ConnectionState {
             hangup_recheck: false,
             #[cfg(has_io_uring)]
             hangup_recheck_due: false,
+            #[cfg(has_io_uring)]
+            hangup_poll_retry: false,
             #[cfg(has_io_uring)]
             hangup_error: 0,
         }
