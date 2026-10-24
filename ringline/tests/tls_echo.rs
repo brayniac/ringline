@@ -1348,13 +1348,13 @@ fn forward_to_conn_from_a_tls_source() {
 /// Forwards everything the TLS client sends to a sink that never reads.
 struct TlsForwardToStuckSink;
 
-static TLS_STUCK_SINK: OnceLock<SocketAddr> = OnceLock::new();
+static TLS_STUCK_SINK: Mutex<Option<SocketAddr>> = Mutex::new(None);
 
 impl AsyncEventHandler for TlsForwardToStuckSink {
     #[allow(clippy::manual_async_fn)]
     fn on_accept(&self, mut client: Connection) -> impl Future<Output = ()> + 'static {
         async move {
-            let addr = *TLS_STUCK_SINK.get().expect("sink addr not set");
+            let addr = TLS_STUCK_SINK.lock().unwrap().expect("sink addr not set");
             let Ok(sink) = ringline::connect(addr).await else {
                 return;
             };
@@ -1393,19 +1393,26 @@ impl AsyncEventHandler for TlsForwardToStuckSink {
 #[test]
 fn a_tls_forward_source_with_a_stuck_sink_is_throttled() {
     let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
+    for multishot in [false, true] {
+        tls_forward_to_stuck_sink(multishot);
+    }
+}
+
+/// One run of `a_tls_forward_source_with_a_stuck_sink_is_throttled`, with
+/// one-shot or multishot ring receives.
+fn tls_forward_to_stuck_sink(multishot: bool) {
     const LIMIT: u64 = 64 << 20;
 
     // Accepts the forward's sink connection and never reads from it.
     let sink = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    TLS_STUCK_SINK
-        .set(sink.local_addr().unwrap())
-        .expect("sink addr set once");
+    *TLS_STUCK_SINK.lock().unwrap() = Some(sink.local_addr().unwrap());
     let held = std::thread::spawn(move || sink.accept().map(|(s, _)| s));
 
     let (certs, key) = generate_self_signed();
     let config = test_config_builder()
         .tls(TlsConfig::new(server_tls_config(certs.clone(), key)))
         .forward_hold_cap(8)
+        .recv_multishot(multishot)
         .build()
         .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)
@@ -1419,32 +1426,47 @@ fn a_tls_forward_source_with_a_stuck_sink_is_throttled() {
     let mut tls_conn =
         rustls::ClientConnection::new(client_tls_config(&certs), server_name).unwrap();
     let mut tcp = TcpStream::connect(&addr).unwrap();
-    tcp.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
     tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
     let mut stream = rustls::Stream::new(&mut tls_conn, &mut tcp);
     stream.write_all(b"g").unwrap();
     stream.flush().unwrap();
     let mut ack = [0u8; 1];
     stream.read_exact(&mut ack).expect("forward armed ack");
-    let started = Instant::now();
-    let chunk = vec![7u8; 1 << 20];
-    let mut sent = 0u64;
-    while sent < LIMIT {
-        match stream.write(&chunk) {
-            Ok(n) => sent += n as u64,
-            Err(_) => break,
-        }
-    }
-    eprintln!("sent {sent} bytes in {:?}", started.elapsed());
-
     let _ = stream;
-    drop(tcp);
+
+    // Flood from a thread for a fixed time, then shut the socket down to end
+    // a write the throttle has stalled. Unthrottled, 64 MiB goes in under a
+    // second.
+    let sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let counter = Arc::clone(&sent);
+    let control = tcp.try_clone().unwrap();
+    let writer = std::thread::spawn(move || {
+        let mut stream = rustls::Stream::new(&mut tls_conn, &mut tcp);
+        let chunk = vec![7u8; 1 << 20];
+        while counter.load(std::sync::atomic::Ordering::Relaxed) < LIMIT {
+            match stream.write(&chunk) {
+                Ok(n) => {
+                    counter.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    std::thread::sleep(Duration::from_secs(3));
+    let sent = sent.load(std::sync::atomic::Ordering::Relaxed);
+    let _ = control.shutdown(std::net::Shutdown::Both);
+    writer.join().unwrap();
+    eprintln!("multishot {multishot}: sent {sent} bytes in 3 s");
+
     shutdown.shutdown();
     for h in handles {
-        let _ = h.join();
+        h.join().expect("worker panicked").expect("worker failed");
     }
     drop(held.join());
-    assert!(sent < LIMIT, "the TLS forward source accepted {sent} bytes");
+    assert!(
+        sent < LIMIT,
+        "multishot {multishot}: the TLS forward source accepted {sent} bytes"
+    );
 }
 
 // ── A TLS connection may not be a forward sink (EPROTOTYPE, both backends) ──

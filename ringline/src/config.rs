@@ -1211,9 +1211,9 @@ impl ConfigBuilder {
     /// since plaintext connections receive into their accumulators and TLS
     /// ones copy.
     /// Larger values allow more recv in flight at the cost of more held
-    /// buffers or copies under a slow consumer: with `recv_incremental` a
-    /// segment hold can reach this many copies of up to one buffer each
-    /// (64 MiB at the default 64 × 1 MiB). Must be `>= 1`.
+    /// copies under a slow consumer. A TLS connection's entries are one
+    /// record's plaintext each, at most 16 KiB, so its hold is at most this
+    /// many × 16 KiB (1 MiB at the default). Must be `>= 1`.
     ///
     /// Default: 64 (2× `MAX_IOVECS`).
     ///

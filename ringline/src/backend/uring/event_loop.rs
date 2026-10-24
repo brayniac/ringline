@@ -3929,9 +3929,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.driver.forward_hold_throttled[ci] = false;
         let generation = self.driver.connections.generation(conn_index);
         if self.driver.submit_tcp_recv(conn_index, generation).is_err() {
+            // A failed push is backpressure: retry on the next pass.
             metrics::RING.increment(metrics::ring::RECV_ARM_FAILURES);
-            self.executor.wake_recv(conn_index);
-            self.driver.close_connection(conn_index);
+            self.driver
+                .recv_rearm_retries
+                .push((conn_index, generation));
         } else if let Some(cs) = self.driver.connections.get_mut(conn_index) {
             cs.recv_multishot_armed = true;
         }
@@ -6712,6 +6714,31 @@ mod tests {
         let c = el.driver.connections.get(conn_index).unwrap();
         assert!(c.hangup_peek_armed, "the recheck submitted the peek");
         assert!(!c.hangup_recheck_due);
+    }
+
+    /// A throttled connection whose re-arm push fails once its hold drains is
+    /// queued for a retry, not closed: a failed push is backpressure.
+    #[test]
+    fn a_throttle_rearm_that_cannot_be_pushed_is_retried() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        el.driver.forward_hold_throttled[conn_index as usize] = true;
+        el.driver.ring.force_push_failures(1);
+        el.maybe_rearm_throttled_forward(conn_index);
+        let c = el.driver.connections.get(conn_index).unwrap();
+        assert!(matches!(c.lifecycle, Lifecycle::Open), "not closed");
+        assert!(!c.recv_multishot_armed, "the push failed");
+        assert_eq!(el.driver.recv_rearm_retries, vec![(conn_index, generation)]);
+        el.drain_recv_rearm_retries();
+        assert!(
+            el.driver
+                .connections
+                .get(conn_index)
+                .unwrap()
+                .recv_multishot_armed,
+            "the retry armed the receive"
+        );
     }
 
     /// No recheck peek is pushed while a park of the connection is pending.
