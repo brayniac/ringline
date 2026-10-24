@@ -288,11 +288,12 @@ fn make_ringline_client_config(
         // `recv_buffer.buffer_size` at 65535 (the user_data encoding
         // reserves 16 bits for the remaining-len field), so use that
         // ceiling — comfortably above the bench's worst case.
-        // Default send_copy_slot_size is 16384; keep it. ringline-http
+        // The default send_copy_slot_size, 16448, holds one whole TLS
+        // record, which the unbuffered TLS engine requires. ringline-http
         // can flush a request's HEADERS + DATA + WINDOW_UPDATE into one
         // send_nowait call, so the slot must accommodate the worst-case
         // batch size we expect to send in a single iteration.
-        .send_pool(1024, 16384)
+        .send_pool(1024, 16448)
         .standalone_task_capacity((num_clients + 1).next_power_of_two().max(64) as u32)
         .tls_client(make_ringline_client_tls(cert))
         .build()

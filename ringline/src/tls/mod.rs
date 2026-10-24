@@ -434,8 +434,9 @@ impl CiphertextCapacity {
     /// under `unbuffered::MIN_ENCRYPT_DST` the engine cannot make progress at
     /// all. Callers must turn `None` into an error rather than a guess.
     ///
-    /// The default `send_copy_slot_size` (16448) clears `F + 29` = 16413 for
-    /// the default fragment size, so the common configuration is `Some`.
+    /// `Config::validate` rejects a `send_copy_slot_size` below `F + 29` for
+    /// every configured rustls config on the unbuffered engine, so a running
+    /// connection gets `Some`.
     pub fn slots_unbuffered(&self, slot_size: usize) -> Option<usize> {
         if slot_size < self.max_plaintext_per_record + MAX_RECORD_OVERHEAD {
             return None;

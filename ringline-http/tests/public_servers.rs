@@ -35,7 +35,7 @@ fn test_config(alpn: &[&[u8]]) -> Config {
         .sq_entries(64)
         .recv_buffer(64, 4096)
         .max_connections(64)
-        .send_pool(64, 16384)
+        .send_pool(64, 16448)
         .tls_client(TlsClientConfig::new(Arc::new(tls)))
         .build()
         .expect("valid config")

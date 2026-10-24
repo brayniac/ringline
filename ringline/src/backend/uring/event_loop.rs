@@ -18308,10 +18308,11 @@ mod tests {
         assert_eq!(peer.decrypt(&wire).as_deref(), Ok(&b"hello"[..]));
     }
 
-    /// Where no bound can be expressed — the unbuffered engine with a slot too
-    /// small to hold one whole record — a plain send is still attempted, as it
-    /// was (refusing would break deployments running such slots). If the pool
-    /// then runs dry mid-encryption the records already sealed have spent
+    /// Where no bound can be expressed (the unbuffered engine with a slot too
+    /// small to hold one whole record) a plain send is attempted without one.
+    /// `Config::validate` rejects such a slot for every configured rustls
+    /// config, so this test installs TLS state directly, after validation. If
+    /// the pool runs dry mid-encryption the records already sealed have spent
     /// their sequence numbers, so the connection is closed rather than left
     /// open to emit records the peer will reject.
     #[cfg(not(feature = "tls-buffered"))]

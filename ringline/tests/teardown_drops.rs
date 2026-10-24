@@ -577,7 +577,7 @@ fn drop_a_connect_to(
         .sq_entries(64)
         .recv_buffer(16, 1024)
         .max_connections(16)
-        .send_pool(16, 16384)
+        .send_pool(16, 16448)
         .blocking_threads(0)
         .resolver_threads(0)
         .spawner_threads(0)

@@ -58,7 +58,7 @@ fn test_config_builder() -> ConfigBuilder {
         .sq_entries(64)
         .recv_buffer(64, 4096)
         .max_connections(64)
-        .send_pool(64, 16384)
+        .send_pool(64, 16448)
 }
 
 fn wait_for_server(addr: SocketAddr) {

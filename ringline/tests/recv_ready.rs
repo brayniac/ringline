@@ -30,7 +30,7 @@ fn test_config() -> Config {
         .recv_buffer(64, 4096)
         .recv_segment_reserve(8)
         .max_connections(16)
-        .send_pool(16, 16384)
+        .send_pool(16, 16448)
         .build()
         .expect("valid config")
 }
