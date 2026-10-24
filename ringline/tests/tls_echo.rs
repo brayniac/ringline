@@ -1343,6 +1343,110 @@ fn forward_to_conn_from_a_tls_source() {
     }
 }
 
+// ── A TLS forward source stops at the hold cap ─────────────────────────
+
+/// Forwards everything the TLS client sends to a sink that never reads.
+struct TlsForwardToStuckSink;
+
+static TLS_STUCK_SINK: OnceLock<SocketAddr> = OnceLock::new();
+
+impl AsyncEventHandler for TlsForwardToStuckSink {
+    #[allow(clippy::manual_async_fn)]
+    fn on_accept(&self, mut client: Connection) -> impl Future<Output = ()> + 'static {
+        async move {
+            let addr = *TLS_STUCK_SINK.get().expect("sink addr not set");
+            let Ok(sink) = ringline::connect(addr).await else {
+                return;
+            };
+            let (mut sink_tx, _sink_rx) = sink.split();
+            // Wait for the client's first byte, so its flood starts after the
+            // forward is armed rather than landing in the accumulator first.
+            let n = client
+                .with_data(|d| {
+                    if d.is_empty() {
+                        ParseResult::NeedMore
+                    } else {
+                        ParseResult::Consumed(1)
+                    }
+                })
+                .await;
+            if n == 0 {
+                return;
+            }
+            // The ack is queued before the forward is armed, but both happen
+            // in this poll, before the ack's send is submitted, so the
+            // client's flood arrives after the forward is armed.
+            let _ = client.send_nowait(b"a");
+            let _ = client.forward_to_conn(&mut sink_tx, 1 << 30).await;
+        }
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        TlsForwardToStuckSink
+    }
+}
+
+/// A TLS `forward_to_conn` source whose sink does not read stops receiving
+/// once its hold reaches the cap, so its peer's writes stall. Without the
+/// throttle the source reads until its hold reaches `recv_accumulator_max`
+/// (1 GiB by default).
+#[test]
+fn a_tls_forward_source_with_a_stuck_sink_is_throttled() {
+    let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
+    const LIMIT: u64 = 64 << 20;
+
+    // Accepts the forward's sink connection and never reads from it.
+    let sink = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    TLS_STUCK_SINK
+        .set(sink.local_addr().unwrap())
+        .expect("sink addr set once");
+    let held = std::thread::spawn(move || sink.accept().map(|(s, _)| s));
+
+    let (certs, key) = generate_self_signed();
+    let config = test_config_builder()
+        .tls(TlsConfig::new(server_tls_config(certs.clone(), key)))
+        .forward_hold_cap(8)
+        .build()
+        .expect("valid config");
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind("127.0.0.1:0".parse().unwrap())
+        .launch::<TlsForwardToStuckSink>()
+        .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
+    wait_for_server(&addr);
+
+    let server_name: ServerName<'_> = "localhost".try_into().unwrap();
+    let mut tls_conn =
+        rustls::ClientConnection::new(client_tls_config(&certs), server_name).unwrap();
+    let mut tcp = TcpStream::connect(&addr).unwrap();
+    tcp.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
+    tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut stream = rustls::Stream::new(&mut tls_conn, &mut tcp);
+    stream.write_all(b"g").unwrap();
+    stream.flush().unwrap();
+    let mut ack = [0u8; 1];
+    stream.read_exact(&mut ack).expect("forward armed ack");
+    let started = Instant::now();
+    let chunk = vec![7u8; 1 << 20];
+    let mut sent = 0u64;
+    while sent < LIMIT {
+        match stream.write(&chunk) {
+            Ok(n) => sent += n as u64,
+            Err(_) => break,
+        }
+    }
+    eprintln!("sent {sent} bytes in {:?}", started.elapsed());
+
+    let _ = stream;
+    drop(tcp);
+    shutdown.shutdown();
+    for h in handles {
+        let _ = h.join();
+    }
+    drop(held.join());
+    assert!(sent < LIMIT, "the TLS forward source accepted {sent} bytes");
+}
+
 // ── A TLS connection may not be a forward sink (EPROTOTYPE, both backends) ──
 
 /// Forwarding *into* a TLS connection must be refused.

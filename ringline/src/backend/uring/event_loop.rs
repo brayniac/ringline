@@ -2002,6 +2002,21 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     }
                 }
             }
+            // A segmented TLS connection (a forward source or a segment
+            // reader) holds decrypted plaintext until the forward or the
+            // reader drains it. Stop receiving at the hold cap, as the
+            // plaintext segmented path does, so a slow sink or reader stops
+            // the peer instead of growing the hold to `recv_accumulator_max`.
+            if self.driver.recv_domain[conn_index as usize]
+                == crate::recv::domain::RecvDomain::Segmented
+                && self
+                    .driver
+                    .connections
+                    .get(conn_index)
+                    .is_some_and(|c| matches!(c.lifecycle, Lifecycle::Open))
+            {
+                self.throttle_if_held(conn_index);
+            }
         } else if self.driver.recv_domain[conn_index as usize]
             == crate::recv::domain::RecvDomain::Segmented
         {

@@ -1891,12 +1891,13 @@ impl ConnCtx {
     ///
     /// # Backpressure
     ///
-    /// Nothing stops the source reading. The plaintext waiting in the hold, not
-    /// counting the write in flight, is bounded by `recv_accumulator_max`
-    /// ([`ConfigBuilder::recv_accumulator_max`](crate::ConfigBuilder::recv_accumulator_max),
-    /// default 1 GiB); a sink slower than the source lets it grow to that bound,
-    /// and the source connection is then closed. `forward_hold_cap` does not
-    /// apply.
+    /// The source stops receiving once its hold, counting the entries the write
+    /// in flight carries, reaches the hold cap
+    /// ([`ConfigBuilder::forward_hold_cap`](crate::ConfigBuilder::forward_hold_cap)
+    /// entries; without `recv_incremental`, at most a quarter of the receive
+    /// ring's buffers), so a sink slower than the source closes the source's
+    /// TCP window. It receives again once the sink drains the hold below the
+    /// cap.
     ///
     /// # Sink ownership
     ///
@@ -5833,10 +5834,9 @@ impl<F: FnMut(&[Bytes]) -> ParseResult + Unpin> WithBytesSegmentsFuture<F> {
             }
             return self.park(driver, executor);
         }
-        // The skip does not apply at the hold cap: there a plaintext
-        // connection's receive is throttled, so no more bytes arrive until the
-        // hold drains, and a TLS connection's later chunks would only grow
-        // the hold.
+        // The skip does not apply at the hold cap: there the connection's
+        // receive is throttled, so no more bytes arrive until the hold
+        // drains.
         if let Some(call_at) = self.call_at
             && total < call_at
             && !finished(driver)

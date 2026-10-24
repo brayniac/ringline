@@ -1159,8 +1159,8 @@ impl ConfigBuilder {
     ///
     /// On io_uring no connection uses this: a plaintext connection receives
     /// directly into its accumulator (see [`connect`](crate::connect)), and a
-    /// TLS connection's segment hold is bounded by
-    /// [`recv_accumulator_max`](Self::recv_accumulator_max).
+    /// TLS connection's segment entries are heap copies, held to the hold cap
+    /// (see [`forward_hold_cap`](Self::forward_hold_cap)).
     pub fn recv_segment_reserve(mut self, reserve: u32) -> Self {
         self.config.recv_segment_reserve = reserve;
         self
@@ -1217,10 +1217,10 @@ impl ConfigBuilder {
     ///
     /// Default: 64 (2× `MAX_IOVECS`).
     ///
-    /// On io_uring no connection uses this: a plaintext connection receives
-    /// directly into its accumulator (see [`connect`](crate::connect)), and a
-    /// TLS connection's segment hold is bounded by
-    /// [`recv_accumulator_max`](Self::recv_accumulator_max).
+    /// On io_uring only a TLS connection uses this, when it is a `forward_to`
+    /// or `forward_to_conn` source or has a segment reader: a plaintext
+    /// connection receives directly into its accumulator (see
+    /// [`connect`](crate::connect)).
     pub fn forward_hold_cap(mut self, cap: usize) -> Self {
         self.config.forward_hold_cap = cap;
         self
