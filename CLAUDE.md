@@ -240,7 +240,7 @@ Ringline aims to minimize data copies on the hot path. Understanding where copie
 | Step | What happens | Copies |
 |------|-------------|--------|
 | Kernel → RecvAccumulator (plaintext, io_uring) | One-shot `RECV` into the accumulator's free space, armed when a read parks (`docs/recv-direct-design.md`) | 0 |
-| Kernel → ProvidedBufRing (TLS, io_uring) | DMA of ciphertext into a ring-provided buffer, which goes to rustls; the plaintext is the TLS recv row below | 0 |
+| Kernel → ProvidedBufRing (TLS, io_uring) | The kernel copies ciphertext into a ring-provided buffer, which goes to rustls; the plaintext is the TLS recv row below | 0 |
 | Kernel → read buffer → RecvAccumulator (mio) | `read()` into a per-worker buffer, then `extend_from_slice()` | 1 |
 | Accumulator → `with_data()` callback | Borrowed `&[u8]` into accumulator | 0 |
 | Accumulator → `with_bytes()` callback | `BytesMut::freeze()` → `Bytes` (O(1)), slicing via `Bytes::slice()` is O(1) refcount | 0 |
@@ -409,7 +409,7 @@ These reflect deliberate owner decisions — follow them for any public-surface 
 
 ## Release Process
 
-Use the shared `release` skill from the custom-skills plugin (`/cs:release`; it discovers this repo's mechanism from the files below; there is no in-repo release skill). `/cs:pr` opens feature-branch PRs. Releases are **coordinated across all publishable crates**:
+Use the shared `release` skill from the custom-skills plugin (`/cs:release`; it discovers this repo's mechanism from the files below; there is no in-repo release skill). `/cs:open-pr` opens feature-branch PRs. Releases are **coordinated across all publishable crates**:
 
 1. Bump all package versions, the workspace `ringline` dependency requirement, AND the inter-crate exact-version requirements (http→h2, grpc→h2, h3→quic) — a stale `version = "0.x.0"` req excludes the new major and breaks publishing mid-sequence. Under 0.x a breaking release is `minor`, not `major`. The three `publish = false` crates (`ringline-bench`, `ringline-benchmarks`, `tools/doc-diagrams`) keep their own versions.
 2. Update the committed `Cargo.lock` (CI is `--locked`).

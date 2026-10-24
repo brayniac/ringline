@@ -43,10 +43,15 @@ MSG_WAITALL those intermediate round trips collapse into one final CQE.
 
 ## 3. io_uring zero-copy RX (kernel 6.15+) — scoping
 
-The last mandatory copy on the ringline recv path is
-ProvidedBufRing → RecvAccumulator (`extend_from_slice`). io_uring zcrx
-(`IORING_OP_RECV_ZC`, netdev queue + refill ring, merged ~6.15) DMA-places
-packet payload into user-registered memory; completions carry
+On io_uring a plaintext connection receives directly into its accumulator:
+the kernel copies from its socket buffers into the accumulator, and no copy
+follows in user space, except when the accumulator grows to fit a longer
+message and moves the part already received. A TLS connection's ciphertext
+lands in a provided buffer and goes to rustls; the copies on that path are
+counted in `docs/syscalls-and-copies.md`.
+io_uring zcrx (`IORING_OP_RECV_ZC`, netdev queue + refill ring, merged
+~6.15) removes the kernel's copy: it DMA-places packet payload into
+user-registered memory; completions carry
 (offset, len) into that area, and userspace returns regions via the refill
 ring.
 
@@ -57,23 +62,24 @@ What adopting it would mean for ringline:
   This is a deployment feature, not a default.
 - **Accumulator model changes**: data arrives as non-contiguous regions of
   the registered area with kernel-controlled lifetime (region is pinned
-  until returned via refill). Either (a) copy into the accumulator —
-  pointless, that's the copy we're removing — or (b) make the accumulator
+  until returned via refill). Either (a) copy into the accumulator, which
+  adds a user-space copy in place of the kernel's, or (b) make the accumulator
   a rope over zcrx regions with `Bytes`-like refcounts driving refill
   returns. (b) is real surgery: `with_data(&[u8])` needs a contiguous
   view, so a rope must linearize on demand (copy only when a message
   spans regions) or the parser API must accept iovecs.
 - **Interaction with #246**: the frozen-remainder design already
-  refcounts; a zcrx region handle could slot into `PendingUdpBuf`-style
-  enum arms of the accumulator. The `try_into_mut` recovery path would not
+  refcounts; a zcrx region handle could slot into a new enum arm of the
+  accumulator. The `try_into_mut` recovery path would not
   apply (region memory is never uniquely owned by the accumulator).
 - **Sizing**: refill-ring starvation replaces ENOBUFS as the stall mode;
   the #245 event-driven re-arm pattern transfers.
 
-Verdict: large, worthwhile only after a workload shows the recv memcpy at
-the top of a profile on >=6.15 kernels with capable NICs. Not this phase.
-Prereq checklist for revisiting: kernel >= 6.15 on the rig, NIC with HDS
-(mlx5/bnxt/ice), a profile showing accumulator append >= ~5% of worker CPU.
+Verdict: large, worthwhile only after a workload shows the kernel's receive
+copy at the top of a profile on >=6.15 kernels with capable NICs. Not this
+phase. Prereq checklist for revisiting: kernel >= 6.15 on the rig, NIC with
+HDS (mlx5/bnxt/ice), a profile showing the kernel's receive copy >= ~5% of
+worker CPU.
 
 ## 4. Waiting for room after `EAGAIN`
 

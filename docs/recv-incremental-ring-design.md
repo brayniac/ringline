@@ -1,9 +1,16 @@
 # Two shared receive rings per worker, consumed incrementally where supported
 
-Status: proposal. Nothing here is implemented. The measurements behind it,
-and the alternatives that were measured and not chosen, are in
-`docs/journal/2026-09-incremental-buffer-consumption.md`, sections
-"2026-10: measurements" and "2026-10: kernels, two rings, tiered caches".
+Status: steps 0, 2 and 3 are implemented (#632, #633), and step 4 behind
+`recv_incremental` (#634–#636; 4b-2's recv-forward and direct-echo paths
+were removed in 0.7.0-alpha.5). Steps 1, 5, 6 and 7 are not. The receive
+views (#677–#679) landed; on io_uring no TCP connection receives one now.
+Since 0.7.0-alpha.5 a plaintext connection on io_uring receives directly
+into its accumulator, so the TCP provided-buffer ring serves only TLS
+connections (UDP has its own ring). recv-forward, direct echo, `recv_hold`
+and the recv sink this design refers to were removed. The measurements
+behind it, and the alternatives that were measured and not chosen, are in
+`docs/journal/2026-09-incremental-buffer-consumption.md`, sections "2026-10:
+measurements" and "2026-10: kernels, two rings, tiered caches".
 
 Related: `docs/segmented-recv-design.md` (the bid lifecycle of the lending
 paths), `docs/journal/2026-07-enobufs-fallback-recv.md` (#274, the fallback
@@ -11,13 +18,14 @@ recv).
 
 ## Goal
 
-Today a TCP receive on io_uring lands in a buffer from one provided-buffer
-ring shared by the worker's connections, 256 buffers of 16 KiB
+A TLS receive on io_uring lands in a buffer from one provided-buffer ring
+shared by the worker's connections, 256 buffers of 16 KiB
 (`config.rs` `RecvBufferConfig::default`). Buffer size sets how much one
 completion can deliver; at a fixed memory budget, larger buffers mean fewer
-of them. Messages larger than a buffer pay a completion per buffer, and a
-connection whose task holds its bytes keeps buffers every other connection
-needs.
+of them. Messages larger than a buffer pay a completion per buffer. (Before
+0.7.0-alpha.5, plaintext connections whose task held their bytes kept
+buffers every other connection needed; a TLS connection returns its buffer
+when rustls reads it.)
 
 This design gives each worker two shared TCP rings, registered as two buffer
 groups. The defaults follow the ring kind selected (see "Selecting the ring

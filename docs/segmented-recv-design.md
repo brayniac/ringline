@@ -1,14 +1,23 @@
 # Segmented recv — design
 
-**Status:** Draft / design (two adversarial passes; not yet planned or implemented)
+**Status:** Implemented in #286 (Modes A, B and C). On io_uring only a TLS
+connection enters the segmented domain. On io_uring a plaintext connection
+receives directly into its accumulator (`docs/recv-direct-design.md`): `segments`,
+`recv_owned_segment`, `with_segments`, `with_bytes_segments` and `forward_to`
+return `io::ErrorKind::Unsupported` on it, and `forward_to_conn` sends from
+its accumulator without entering the domain.
 **Date:** 2026-07-19
 **Related:** `docs/recv-buffer-adaptive-design.md`, `docs/send-completion-design.md`, the 200 GbE 64 MB buffer-geometry sweep (project memory).
 
 `recv_hold`, `forward_held`, `release_recv_forward` and the per-connection
 `recv_forward` flag (`enable_recv_forward`) were removed in 0.7.0-alpha.5.
 `RecvDomain::Forward` was dropped before this design's implementation merged
-(#286). References to them below describe the code this design was written
-against.
+(#286). The streaming value APIs (`ValueStream`, `get_stream`, `get_cas`,
+`StreamValue`) and ringline-http's Mode B1 feed shipped in #286 and were
+removed in 0.7.0-alpha.3 (#696). References to them below describe the code
+this design was written against. The size classes described under
+"Backpressure and ring safety" were not built; there is one TCP ring, with or
+without `recv_incremental`.
 
 ## Goal
 
