@@ -68,7 +68,7 @@ together with the length the send reports on success.
 | `send`, `send_backpressured`, copy-only batch (io_uring) | Final pool slot (`SendCopyPool`), lifted onto the coalesced slab entry when the run is coalesced |
 | TLS send (io_uring) | The final ciphertext chunk's pool slot (`OpTag::Send`) |
 | Zero-copy batch (io_uring) | The `SendMsgZc` slab entry |
-| `send_chain` (io_uring) | The chain's `ChainState` |
+| `send_chain` (io_uring) | The chain's `ChainState`; on a TLS connection, the final ciphertext chunk's pool slot |
 | Any awaited send (mio) | The last `PendingSend` the call queued |
 
 Sends nothing awaits (`send_nowait`, `send_chain_nowait`,

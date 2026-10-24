@@ -336,9 +336,10 @@ pub struct DriverCtx<'a> {
     pub(crate) capacity_released: &'a mut bool,
     pub(crate) close_notify_timeout: std::time::Duration,
     pub(crate) next_disk_io_seq: &'a mut u16,
-    /// Set when a `send_chain` on a TLS connection queued its sends with the
-    /// chain's id attached, so `ConnCtx::send_chain` knows the id will settle.
-    /// A TLS chain does not use `chain_table`.
+    /// Set when `finish` on a TLS chain attached the chain's id to its last
+    /// record. `ConnCtx::send_chain` reads it to return a pending future,
+    /// because a TLS chain does not use `chain_table`, so
+    /// `chain_table.carries` is false for it.
     pub(crate) tls_chain_carried: bool,
 }
 
@@ -4696,7 +4697,8 @@ pub struct ChainPartsBuilder<'b, 'a> {
 impl<'b, 'a> ChainPartsBuilder<'b, 'a> {
     /// Add a copy part to this scatter-gather SQE. The data reference must
     /// outlive the builder (guaranteed by the `'b` lifetime) — the bytes are
-    /// only read when `.add()` gathers them into the send pool.
+    /// only read when `.add()` gathers them into the send pool, or on a TLS
+    /// connection into the chain's plaintext.
     pub fn copy(mut self, data: &'b [u8]) -> Self {
         if self.chain.error.is_some() {
             return self;
