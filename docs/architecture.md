@@ -238,11 +238,11 @@ parallel TLS record submissions can interleave records.
 On a close the application requests (`ConnCtx::close()`, a handler return,
 `DriverCtx::close`), the runtime queues `close_notify` behind the
 connection's queued sends and closes the socket once they drain. On io_uring,
-a close the runtime makes after an error or after the peer closed sends no
-alert, a TLS send after the alert is refused, and `close_notify_timeout_ms`
-bounds the drain only for `DriverCtx::close`. On mio every TLS close writes
-the alert once, without blocking, after the queued sends drain, and the
-timeout is not used. `ConnCtx::eof_truncated` distinguishes a TCP FIN without
+a close the runtime makes after a receive error, a reset, a send that could
+not be pushed, or after the peer closed sends no alert, a TLS send after the
+alert is refused, and `close_notify_timeout_ms` bounds the drain only for
+`DriverCtx::close`. On mio every TLS close attempts to write the alert once,
+without blocking, after the queued sends drain, and the timeout is not used. `ConnCtx::eof_truncated` distinguishes a TCP FIN without
 peer `close_notify` from a clean TLS EOF.
 
 ## Backpressure, shutdown, and failures

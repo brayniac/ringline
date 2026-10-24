@@ -1264,7 +1264,7 @@ fn no_close_notify_after_a_pending_write_shutdown() {
     assert!(!peer_closed, "a close_notify followed the write shutdown");
 }
 
-/// The result of the send `TlsSendAfterClose` makes after `close()`.
+/// The result of the send a handler makes after `close()`.
 #[cfg(has_io_uring)]
 static TLS_SEND_AFTER_CLOSE: Mutex<Option<std::io::Result<()>>> = Mutex::new(None);
 
@@ -1300,21 +1300,73 @@ impl AsyncEventHandler for TlsSendAfterClose {
     }
 }
 
-/// On io_uring a TLS send after `close()` is refused: its record would follow
-/// the close_notify, and the peer discards records after the alert.
+/// Read one byte, send "early", close, then try `send_backpressured("late")`.
+#[cfg(has_io_uring)]
+struct TlsBackpressuredSendAfterClose;
+
+#[cfg(has_io_uring)]
+impl AsyncEventHandler for TlsBackpressuredSendAfterClose {
+    #[allow(clippy::manual_async_fn)]
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
+        async move {
+            let n = conn
+                .with_data(|d| {
+                    if d.is_empty() {
+                        ParseResult::NeedMore
+                    } else {
+                        ParseResult::Consumed(1)
+                    }
+                })
+                .await;
+            if n == 0 {
+                return;
+            }
+            conn.send_nowait(b"early").expect("send before close");
+            conn.close();
+            let late = conn.send_backpressured(b"late").await.map(|_| ());
+            *TLS_SEND_AFTER_CLOSE.lock().unwrap() = Some(late);
+        }
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        TlsBackpressuredSendAfterClose
+    }
+}
+
+/// On io_uring a TLS `send_nowait` after `close()` is refused: its record
+/// would follow the close_notify, and the peer discards records after the
+/// alert.
 #[cfg(has_io_uring)]
 #[test]
 fn a_tls_send_after_close_is_refused() {
+    send_after_close_is_refused::<TlsSendAfterClose>();
+}
+
+/// The same for `send_backpressured`.
+#[cfg(has_io_uring)]
+#[test]
+fn a_tls_backpressured_send_after_close_is_refused() {
+    send_after_close_is_refused::<TlsBackpressuredSendAfterClose>();
+}
+
+/// Run `H`, which sends "early", closes, and records the result of a later
+/// send in `TLS_SEND_AFTER_CLOSE`; check the client got "early" and the
+/// alert, and the later send was refused.
+#[cfg(has_io_uring)]
+fn send_after_close_is_refused<H: AsyncEventHandler>() {
     let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
     *TLS_SEND_AFTER_CLOSE.lock().unwrap() = None;
     let (certs, key) = generate_self_signed();
+    // A slot that holds a whole record, which a bounded TLS send needs on the
+    // unbuffered engine.
     let config = test_config_builder()
         .tls(TlsConfig::new(server_tls_config(certs.clone(), key)))
+        .send_pool(256, 16448)
         .build()
         .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)
         .bind("127.0.0.1:0".parse().unwrap())
-        .launch::<TlsSendAfterClose>()
+        .launch::<H>()
         .expect("launch failed");
     let addr = shutdown.bound_addr().expect("bound address").to_string();
     wait_for_server(&addr);

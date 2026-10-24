@@ -243,9 +243,9 @@ pub struct TlsConn {
     /// True once this side's close_notify alert has been generated, by
     /// whichever call the driving engine uses for it (the buffered engine's
     /// `send_close_notify`, the unbuffered engine's
-    /// `WriteTraffic::queue_close_notify`). On io_uring the send paths refuse
-    /// application data once it is set, since the peer discards any record
-    /// after the alert.
+    /// `WriteTraffic::queue_close_notify`). On io_uring `encrypt_tls_send`,
+    /// `send_bounded` and `send_backpressured` refuse application data once it
+    /// is set, since the peer discards any record after the alert.
     pub close_notify_sent: bool,
     /// Plaintext bytes rustls will put in one outgoing record on this
     /// connection, **with the 5-byte record header already subtracted**.

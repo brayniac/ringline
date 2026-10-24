@@ -2641,8 +2641,9 @@ impl ConnCtx {
     /// Queued sends drain first, then, on a TLS connection, a close_notify
     /// alert, then the FIN. The drain has no time bound: a peer that stops
     /// reading holds the connection until it reads, resets, or the worker
-    /// exits. If a close is already pending, for example because the peer
-    /// closed first, this sends no alert. No alert follows a write shutdown
+    /// exits. On io_uring, if a close is already pending, for example because
+    /// the peer closed first, this sends no alert; mio writes the alert at
+    /// teardown regardless. No alert follows a write shutdown
     /// (`shutdown_write`).
     ///
     /// On io_uring a TLS send made after `close()` returns `NotConnected`,
@@ -6261,7 +6262,9 @@ enum BackpressuredState {
 ///   or was shut down while this send was waiting.
 /// - [`ConnectionAborted`](io::ErrorKind::ConnectionAborted) — the connection
 ///   closed while waiting or in flight.
-/// - [`NotConnected`](io::ErrorKind::NotConnected) — the connection's close was
+/// - [`NotConnected`](io::ErrorKind::NotConnected) — on io_uring, the
+///   connection is TLS and its close_notify is already queued (`close()`, a
+///   handler return or `DriverCtx::close`); or the connection's close was
 ///   *committed* while this send waited for capacity. A waiter in the admission
 ///   FIFO is neither in flight nor in the per-connection send queue, so it does
 ///   not hold off `try_finalize_close`; if the close is finalized while it
@@ -6350,6 +6353,16 @@ impl Future for BackpressuredSendFuture<'_> {
                             io::ErrorKind::BrokenPipe,
                             "write half is shut down",
                         )));
+                    }
+                    // Likewise a TLS connection whose close_notify is queued:
+                    // the send would be refused once it won capacity.
+                    #[cfg(has_io_uring)]
+                    if driver
+                        .tls_table
+                        .as_ref()
+                        .is_some_and(|t| t.close_notify_sent(this.conn_index))
+                    {
+                        return this.finish(Err(crate::handler::close_notify_sent_error()));
                     }
                     let needed = {
                         let ctx = driver.make_ctx();

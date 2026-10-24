@@ -3124,8 +3124,10 @@ impl Driver {
     /// Close a connection the application asked to close (`ConnCtx::close`, or
     /// its task finishing). A TLS connection first queues its close_notify, so
     /// the peer can tell the close from a truncation. A close the backend makes
-    /// after a receive or send failure goes through
-    /// [`close_connection`](Self::close_connection) and sends no alert.
+    /// after a receive error, a reset or a failed send CQE goes through
+    /// [`close_connection`](Self::close_connection) and sends no alert; an
+    /// encryption failure closes through `DriverCtx::close`, which still queues
+    /// one.
     pub(crate) fn close_connection_graceful(&mut self, conn_index: u32) {
         if self
             .connections

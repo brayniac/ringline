@@ -341,7 +341,7 @@ pub struct DriverCtx<'a> {
 /// The refusal of a TLS send made after this side's close_notify was queued:
 /// the record would follow the alert, and the peer discards it.
 #[cfg(has_io_uring)]
-fn close_notify_sent_error() -> io::Error {
+pub(crate) fn close_notify_sent_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::NotConnected,
         "connection closing: close_notify already sent",

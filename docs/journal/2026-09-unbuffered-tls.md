@@ -176,8 +176,8 @@ engine**, and stays that way until follow-on work. rustls has no equivalent of
 the buffered `ServerConnection`. Recovering it needs a `ClientHello` callback
 on `ServerConfig`. Real, user-visible, in the CHANGELOG.
 
-**A pre-existing io_uring bug, found but not fixed here** (fixed in #706; see open
-item 3). `ConnCtx::close()`
+**A pre-existing io_uring bug, found but not fixed here** (fixed in #706;
+see open item 3). `ConnCtx::close()`
 (`runtime/io.rs`) calls `Driver::close_connection`, which on io_uring only sets
 `recv_mode = Closed` and tears down recv/forward-write state — it never queues
 close_notify. The TLS close_notify queueing lives in `DriverCtx::close(conn:
