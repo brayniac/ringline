@@ -235,7 +235,9 @@ fully zero-copy.
 > **What the feature actually buys:** a small (~1–2%) send-side *bookkeeping*
 > win at ≥64 KiB (not data movement), a 4–8% win on the isolated recv path (weaker
 > numbers — 10–20% spread, treat as ±2%), and a systematic extra TLS record
-> whenever the payload is a multiple of `send_copy_slot_size`. At a 16 KiB
+> whenever the payload is a multiple of `send_copy_slot_size`, at a
+> `send_copy_slot_size` of 16384, which the unbuffered engine now rejects; at
+> any accepted slot size both engines emit `ceil(len / F)` records. At a 16 KiB
 > payload the buffered path emits one 16406-byte record and lets `PoolWriter`
 > straddle it across two slots; the unbuffered path must fit a whole record
 > inside one slot, so `encrypt_chunk` shrinks and emits two (17 records vs 16 at

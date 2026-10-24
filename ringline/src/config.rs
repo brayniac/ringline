@@ -219,13 +219,12 @@ pub struct Config {
     /// Size of each copy-send pool slot in bytes. A single `send()` or the
     /// combined copy parts of one `send_parts()` call must fit in one slot.
     ///
-    /// The default is 16448, not 16384, so that one maximum-size TLS 1.3
-    /// record fits in a single slot: 5-byte record header + 2^14 plaintext +
-    /// the inner content-type byte + a 16-byte AEAD tag = 16406, rounded up to
-    /// a 64-byte boundary. A 16384-byte slot is 22 bytes short of that, which
-    /// forces the unbuffered engine (the default) to shrink its plaintext
-    /// chunk and emit an extra record per send (17 rather than 16 for a
-    /// 256 KiB payload). Costs 64 bytes per slot — 0.4% of the pool.
+    /// The default is 16448, not 16384, so that one whole worst-case TLS
+    /// record (16413 bytes: 5-byte header + 2^14 plaintext + 8-byte explicit
+    /// nonce + 16-byte tag) fits in one slot, rounded up to a 64-byte
+    /// boundary. On the unbuffered TLS engine (the default) `Config::validate`
+    /// rejects a smaller slot when TLS is configured; see
+    /// `ConfigBuilder::send_pool`. Costs 64 bytes per slot, 0.4% of the pool.
     pub(crate) send_copy_slot_size: u32,
     /// Minimum total send size (bytes) for the zero-copy guard send path.
     ///
