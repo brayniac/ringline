@@ -660,12 +660,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - io_uring: a TLS connection closed by `ConnCtx::close()`,
   `Connection::close()` or `SendHalf::close()`, or by its handler returning,
-  sends a close_notify alert before the FIN, as on mio. Only
-  `DriverCtx::close` queued the alert, so those paths sent a bare FIN, which
-  the peer cannot tell from a truncation. The alert is queued behind any
-  queued sends and bounded by `close_notify_timeout_ms`. A close after an
-  error (a send that could not be pushed, a TLS error, a reset) sends no
-  alert.
+  sends a close_notify alert before the FIN. Only `DriverCtx::close` queued
+  the alert, so those paths sent a bare FIN, which the peer cannot tell from
+  a truncation. The alert is queued behind any queued sends, and the queue
+  drains however long the peer takes, as before and as for a plaintext
+  connection; only `DriverCtx::close` bounds the drain with
+  `close_notify_timeout_ms`. A close the runtime makes after a receive
+  error, a reset, or a send that could not be pushed sends no alert; neither
+  does a close after the write side was shut down.
 - io_uring: a TLS connection that is a `forward_to` or `forward_to_conn`
   source, or has a segment reader, stops receiving once its hold reaches the
   hold cap (`forward_hold_cap`; without `recv_incremental`, at most a quarter
