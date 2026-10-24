@@ -172,13 +172,15 @@ pub struct ConnectionState {
     #[cfg(has_io_uring)]
     pub hangup_peek_armed: bool,
     /// A hangup peek found bytes queued ahead of the end of the stream, or
-    /// found the end with bytes buffered or a receive in flight, so the
-    /// connection is on `Driver::hangup_rechecks` until the end is seen.
+    /// found the end with bytes buffered or a receive in flight, or the
+    /// hangup poll completed with a receive in flight, so the connection is
+    /// on `Driver::hangup_rechecks` until the end is seen.
     #[cfg(has_io_uring)]
     pub hangup_recheck: bool,
-    /// A direct receive delivered bytes since the last recheck peek, or a
-    /// peek found the end with bytes buffered or a receive in flight, so the
-    /// next time nothing is buffered, armed or parking, another peek is due.
+    /// A direct receive delivered bytes since the last recheck peek, a peek
+    /// found the end with bytes buffered or a receive in flight, or the
+    /// hangup poll completed with a receive in flight, so the next time
+    /// nothing is buffered, armed or parking, another peek is due.
     #[cfg(has_io_uring)]
     pub hangup_recheck_due: bool,
     /// The errno a hangup peek returned while the connection stayed open (bytes

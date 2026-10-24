@@ -630,13 +630,13 @@ impl<T: 'static> Future for BlockingJoinHandle<T> {
 /// and [`ConnCtx::is_alive`] returns `false`. Otherwise the connection stays
 /// open, and the bytes reach the next reads in order. Once they have been
 /// read, the end of the stream closes the connection, whether or not a read
-/// parks again, and a reset is reported to the read as an error. If the poll
-/// cannot be submitted (counted in `ring::RECV_ARM_FAILURES`), the end is
-/// seen at the next read.
+/// parks again, and a reset is reported to the read as an error. If the poll,
+/// or the peek it triggers, cannot be submitted (counted in
+/// `ring::RECV_ARM_FAILURES`), the end is seen when a read next parks.
 ///
 /// TCP does not tell a half-close from a close: a FIN closes the connection
-/// even when the task only sends, and sends made after the close is
-/// committed fail with `NotConnected`.
+/// even when the task only sends, and sends made once the Close is submitted
+/// (after queued sends drain) fail with `NotConnected`.
 ///
 /// A TLS connection receives ciphertext through the worker's provided-buffer
 /// ring. On mio every connection reads into its accumulator.

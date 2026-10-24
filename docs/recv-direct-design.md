@@ -309,8 +309,9 @@ the runtime submits a non-blocking one-byte `recv` with `MSG_PEEK`
 
 No receive is armed on the hangup path, so the accumulator does not take
 more than a parked read would. A poll or peek that cannot be pushed is
-counted (`ring::RECV_ARM_FAILURES`); without the poll, a FIN or reset is
-seen at the next read. TCP does not tell a half-close from a close, so a
+counted (`ring::RECV_ARM_FAILURES`). Without the poll, or when the peek the
+poll triggers cannot be pushed, a FIN or reset is seen when a read next
+parks; a recheck peek that cannot be pushed is retried on the next pass. TCP does not tell a half-close from a close, so a
 FIN closes a connection whose task only sends.
 
 Cost: one `POLL_ADD` SQE per connection, its completion at a hangup or at
@@ -625,8 +626,10 @@ buffered). Copies on a direct connection still count in
     read once is reported as a reset.
 
   Dropping one received byte fails the first three tests. The overestimate
-  and reset tests fail against the `MSG_WAITALL` version; the refusal test
-  as changed for decision 11 has not been run against it.
+  test and the mid-message reset test
+  (`a_reset_in_the_middle_of_a_message_is_an_error`) fail against the
+  `MSG_WAITALL` version; the refusal test as changed for decision 11 has not
+  been run against it.
 - `event_loop.rs` unit test `a_hangup_with_a_receive_in_flight_is_rechecked`:
   a hangup poll that completes with a receive in flight puts the connection
   on `hangup_rechecks`.

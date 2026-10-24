@@ -231,11 +231,11 @@ impl Driver {
     }
 
     /// Arm `conn_index`'s hangup poll (`OpTag::HangupPoll`) once it is
-    /// open. A direct connection has a receive in flight only while a read
-    /// is parked, so without the poll a peer FIN or reset on a connection
-    /// whose task is not reading would not be seen until the task next
-    /// reads. If the SQE cannot be pushed the connection goes without it: a
-    /// FIN or reset is then seen at the next read. The failure is counted in
+    /// open. A direct connection arms a receive only when a read parks, so
+    /// without the poll a peer FIN or reset on a connection whose task is
+    /// not reading would not be seen until a read next parks. If the SQE
+    /// cannot be pushed the connection goes without it: a FIN or reset is
+    /// then seen when a read next parks. The failure is counted in
     /// `ring::RECV_ARM_FAILURES`.
     pub(crate) fn arm_hangup_poll(&mut self, conn_index: u32) {
         let Some(cs) = self.connections.get(conn_index) else {
@@ -1095,7 +1095,8 @@ pub(crate) struct Driver {
     pub(crate) hangup_peek_buf: Box<[u8; 1]>,
     /// `(conn_index, generation)` of direct connections whose hangup peek
     /// found bytes queued ahead of the end of the stream, or found the end
-    /// with bytes buffered or a receive in flight
+    /// with bytes buffered or a receive in flight, or whose hangup poll
+    /// completed with a receive in flight
     /// (`ConnectionState::hangup_recheck`). `recheck_hangups` peeks again
     /// once `hangup_recheck_due` is set and nothing is buffered, armed or
     /// parking, so the end is seen even if no read parks after the bytes are

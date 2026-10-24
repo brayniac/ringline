@@ -247,7 +247,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `None` while a receive is in flight. These work on accepted and TLS
   connections as before, and there is no replacement for them on a
   plaintext outbound connection. Such a connection has a receive armed only
-  while a read is parked, and a `POLLRDHUP` poll armed when it opens. A FIN
+  when a read parks, and a `POLLRDHUP` poll armed when it opens. A FIN
   or reset from the peer closes a connection that nothing reads, and
   `is_alive` returns `false`. If bytes the peer sent before it are queued or
   buffered, the connection stays open until they have been read, and a
