@@ -257,8 +257,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the peer closes, the receive is re-armed after each completion. A loop
   that polls `try_with_data` without ever parking a read no longer sees new
   bytes, as on a plaintext connection. A TLS connection now arms the
-  `POLLRDHUP` hangup poll, so a peer close is seen, and `is_alive` returns
-  `false`, while nothing reads. `forward_to_conn` from a TLS source takes
+  `POLLRDHUP` hangup poll, so a peer FIN or reset is seen, and `is_alive`
+  returns `false`, while nothing reads. A close_notify the peer sends
+  without closing TCP is read, and closes the connection, only when a read
+  parks; on mio it is read when it arrives. `forward_to_conn` from a TLS source takes
   the bytes from the accumulator and sends them through the sink's send
   queue, as from a plaintext source: ordered with other sends on the sink,
   with one chunk buffered rather than up to `forward_hold_cap` entries, and
@@ -271,9 +273,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `with_segments` or `with_bytes_segments` until `end_segments`, and after a
   `forward_to` that failed on a write. A segment reader or `forward_to`
   started while a `forward_to_conn` sends from the accumulator gets `EBUSY`,
-  and so does `with_segments` while any forward runs. `recv_multishot` no
-  longer affects TLS connections, which were the only ones it affected, so
-  it has no effect.
+  and so does `with_segments` while any forward runs. `recv_multishot` has
+  no effect: TLS connections, the only ones it affected, always arm one-shot
+  receives.
 - **Breaking:** `metrics::park_abandon::SLOT_RECYCLED` is 12 and
   `INSTALL_FAILED` 13, after the removal of `DIRECT_ECHO`.
 - **Breaking:** on io_uring, every plaintext connection, accepted or from

@@ -60,8 +60,8 @@ pub(crate) fn inc_preflight<E: Engine>(engine: &mut E) -> Result<IncPreflight, E
     })? {
         return Ok(IncPreflight::Unsupported);
     }
-    // TLS receives are one-shot. The multishot pass checks a receive no TCP
-    // connection arms; removing the TCP ring removes it.
+    // TLS receives are one-shot; the multishot pass is kept for the unit tests
+    // that arm a multishot TCP receive.
     match inc_pass(engine, false)? {
         IncPreflight::Passed => inc_pass(engine, true),
         other => Ok(other),

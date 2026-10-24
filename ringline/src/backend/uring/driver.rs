@@ -276,9 +276,9 @@ impl Driver {
         }
     }
 
-    /// Arm a TLS connection's ring receive if none is armed and nothing holds
-    /// it back: the connection is open and still reading, no throttle,
-    /// fallback receive, ENOBUFS parking or park is pending. Once its
+    /// Arm a TLS connection's ring receive if no receive is armed, the
+    /// connection is open and reading, and it is not throttled, starved or
+    /// pending a park. Once its
     /// handshake is done, a TLS connection's receive is armed this way by a
     /// parked read (`park_recv`), by a segment reader or Mode A forward
     /// entering the segmented domain or waiting on its hold, and by its hangup
