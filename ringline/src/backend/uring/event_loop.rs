@@ -1488,8 +1488,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
     /// Completion of a direct connection's hangup poll
     /// (`OpTag::HangupPoll`): the peer sent a FIN or a reset, or the socket
-    /// has an error. With a receive in flight, that receive sees it. With
-    /// none, the hangup peek finds out whether bytes are queued ahead of it.
+    /// has an error. With a receive in flight, that receive sees it, and the
+    /// connection goes on `hangup_rechecks` in case the receive returns bytes
+    /// queued ahead of the end. With none, the hangup peek finds out whether
+    /// bytes are queued ahead of it.
     /// `-ECANCELED` comes from the close's cancel lead or worker shutdown and
     /// changes nothing.
     fn handle_hangup_poll(&mut self, ud: UserData, result: i32) {
@@ -1504,7 +1506,19 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         if result < 0 || !matches!(cs.lifecycle, Lifecycle::Open) || cs.recv_finished() {
             return;
         }
-        if cs.recv_direct_armed || cs.hangup_peek_armed {
+        if cs.hangup_peek_armed {
+            return;
+        }
+        if cs.recv_direct_armed {
+            // The receive returns the queued bytes or the end. If it returns
+            // bytes, the recheck peeks once they are read and nothing is
+            // armed, whether or not a read parks again.
+            cs.hangup_recheck_due = true;
+            if !cs.hangup_recheck {
+                cs.hangup_recheck = true;
+                let generation = cs.generation;
+                self.driver.hangup_rechecks.push((conn_index, generation));
+            }
             return;
         }
         // A peek that cannot be pushed leaves the connection as it was
@@ -1588,8 +1602,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     }
 
     /// Peek again on the connections in `hangup_rechecks` whose receive has
-    /// delivered bytes since their last peek, or whose peek found the end
-    /// with bytes buffered or a receive in flight, once nothing is buffered,
+    /// delivered bytes since their last peek, whose hangup poll completed
+    /// with a receive in flight, or whose peek found the end with bytes
+    /// buffered or a receive in flight, once nothing is buffered,
     /// armed or parking, so the end of the stream behind those bytes
     /// closes the connection even if no read parks after they are consumed.
     /// Drops connections that closed, were recycled or finished reading.
@@ -6193,6 +6208,28 @@ mod tests {
             cs.listener = Some(crate::ListenerId::from_index(0));
         }
         conn_index
+    }
+
+    /// A hangup poll that completes while a direct receive is in flight puts
+    /// the connection on the recheck list, so if that receive returns bytes
+    /// the end behind them is found after they are read, without a read
+    /// parking again.
+    #[test]
+    fn a_hangup_with_a_receive_in_flight_is_rechecked() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        if let Some(cs) = el.driver.connections.get_mut(conn_index) {
+            cs.recv_direct = true;
+            cs.recv_arm = RecvArm::Idle;
+            cs.recv_direct_armed = true;
+        }
+        let ud = UserData::encode(OpTag::HangupPoll, conn_index, generation);
+        el.test_dispatch_cqe(ud.raw(), libc::POLLRDHUP as i32, 0);
+        let c = el.driver.connections.get(conn_index).unwrap();
+        assert!(!c.hangup_peek_armed, "the receive in flight reports the end");
+        assert!(c.hangup_recheck && c.hangup_recheck_due);
+        assert_eq!(el.driver.hangup_rechecks, vec![(conn_index, generation)]);
     }
 
     /// Register an awaited send on `conn_index` and attach it to pool slot

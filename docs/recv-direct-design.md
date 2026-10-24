@@ -275,8 +275,9 @@ stayed (`recv-buffering-approaches.md`).
 A direct connection has at most one receive in flight, and it is armed only
 when a read parks: `with_data`, `with_bytes` or `recv_ready` returns
 `Pending` after the parser has seen every buffered byte and returned
-`NeedMore` or `NeedAtLeast` (`park_recv` in `runtime/io.rs`). Nothing is
-armed at connect or at a completion. While the task works on what it has,
+`NeedMore` or `NeedAtLeast` (`park_recv` in `runtime/io.rs`). No receive
+into the accumulator is armed at connect or at a completion; the hangup poll
+and peek below take no bytes. While the task works on what it has,
 no receive is in flight, unless a read that parked was dropped before its
 receive completed; data that arrives in that time waits in the socket's
 receive queue.
@@ -285,9 +286,10 @@ A FIN or reset is seen without a read. When the connection opens, the
 runtime arms a one-shot `POLL_ADD` for `POLLRDHUP` on its fixed file
 (`OpTag::HangupPoll`, `arm_hangup_poll`). `POLLERR` and `POLLHUP` are always
 reported, so it completes on a FIN, a reset or a socket error, and data
-alone does not complete it. With a receive in flight, the completion does
-nothing more: that receive returns the queued bytes or the end, and the end
-reaches the first read that parks after the bytes are consumed. With none,
+alone does not complete it. With a receive in flight, that receive returns
+the queued bytes or the end, and the connection goes on
+`Driver::hangup_rechecks`, so an end behind those bytes closes the
+connection once they are read, whether or not a read parks again. With none,
 the runtime submits a non-blocking one-byte `recv` with `MSG_PEEK`
 (`OpTag::HangupPeek`), which consumes no bytes.
 
@@ -581,7 +583,9 @@ those, receives into a buffer grown for a `NeedAtLeast` of at least
 `recv_direct_region`), `BYTES` (bytes the kernel wrote into accumulators),
 `STALE` (completions for a closed or reused slot), `POOL_REUSED` and
 `POOL_ALLOCATED` (borrowed buffers that came from the pool, and ones
-allocated because none fit). Copies on a direct connection still count in
+allocated because none fit), `HANGUP` (connections closed because a hangup
+peek found the stream ended with no receive in flight and nothing
+buffered). Copies on a direct connection still count in
 `ringline/recv_ring` `BYTES_COPIED`.
 
 ## Tests
@@ -611,10 +615,21 @@ allocated because none fit). Copies on a direct connection still count in
     receives the bytes in order (fails when the forward ignores its
     length). `echo.rs`'s `forward_to_conn_proxies_both_directions` forwards
     a proxy's outbound leg the same way.
+  - Hangup: a connection that is not read sees its peer's FIN
+    (`a_connection_that_is_not_read_sees_the_peer_close`); a forward
+    delivers every byte when the source's peer closed behind them; bytes
+    buffered ahead of a FIN or a reset stay readable, and the reset is
+    reported as a reset; the end behind queued or buffered bytes closes a
+    connection that reads them once and does not park again; the recheck
+    runs before a worker with no tick blocks; a reset behind buffered bytes
+    read once is reported as a reset.
 
   Dropping one received byte fails the first three tests. The overestimate
   and reset tests fail against the `MSG_WAITALL` version; the refusal test
   as changed for decision 11 has not been run against it.
+- `event_loop.rs` unit test `a_hangup_with_a_receive_in_flight_is_rechecked`:
+  a hangup poll that completes with a receive in flight puts the connection
+  on `hangup_rechecks`.
 - `tests/recv_direct_alloc.rs` (its own binary, for the counting global
   allocator): request-response batches of small, 64 KiB, 1 MiB and
   16 × 4 KiB and 16 × 8 KiB messages make fewer than one allocation of

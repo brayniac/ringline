@@ -77,7 +77,7 @@ Everything a request needs rides inside those batched enters as SQEs and CQEs:
 | Send a response | **0 dedicated** | `send()`/`send_nowait()` push an `opcode::Send` SQE (`MSG_WAITALL`, so the kernel retries short sends in place), and a send wider than one send-pool slot goes out as `opcode::SendMsg` SQEs of up to 32 slots each (per-slot `opcode::Send`s if the send slab is full); coalesced sends are one `opcode::SendMsg` SQE gathering several queued sends; zero-copy sends are `opcode::SendMsgZc`. All are submitted by the iteration's shared enter. |
 | Zero-copy notification | **0** | The "DMA done, guard can drop" signal is a second CQE on the same SQE, not a syscall. |
 | Timer arm/fire | **0** | Timeout SQE / timeout CQE. |
-| Outbound connect | **0 dedicated** | Connect SQE, optionally `IO_LINK`ed with a timeout SQE. |
+| Outbound connect | **0 dedicated** | Connect SQE, optionally `IO_LINK`ed with a timeout SQE. A plaintext connection then arms one `POLL_ADD(POLLRDHUP)` SQE (`docs/recv-direct-design.md`). |
 | Accept | 1 per connection | The dedicated acceptor thread runs blocking `accept4()` and hands the fd to a worker over a channel, waking it via eventfd write. The worker's side of that wake is an eventfd-read *SQE* — no syscall on the worker. This is one-time per connection, not per request. |
 
 So in steady state:

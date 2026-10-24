@@ -621,7 +621,7 @@ impl<T: 'static> Future for BlockingJoinHandle<T> {
 /// accumulator. `forward_to_conn` sends from the accumulator (see
 /// [`ConnCtx::forward_to_conn`]).
 ///
-/// A receive is armed only while a read is parked or a receive is in flight.
+/// A receive into the accumulator is armed only when a read parks.
 /// A poll for `POLLRDHUP`, armed when the connection opens, completes on a
 /// FIN, a reset or a socket error from the peer, and not on data. If no
 /// receive is in flight then, a one-byte `MSG_PEEK` receive checks the
@@ -630,10 +630,13 @@ impl<T: 'static> Future for BlockingJoinHandle<T> {
 /// and [`ConnCtx::is_alive`] returns `false`. Otherwise the connection stays
 /// open, and the bytes reach the next reads in order. Once they have been
 /// read, the end of the stream closes the connection, whether or not a read
-/// parks again, and a reset is reported to the read as an error.
+/// parks again, and a reset is reported to the read as an error. If the poll
+/// cannot be submitted (counted in `ring::RECV_ARM_FAILURES`), the end is
+/// seen at the next read.
 ///
 /// TCP does not tell a half-close from a close: a FIN closes the connection
-/// even when the task only sends, and sends after it fail.
+/// even when the task only sends, and sends made after the close is
+/// committed fail with `NotConnected`.
 ///
 /// A TLS connection receives ciphertext through the worker's provided-buffer
 /// ring. On mio every connection reads into its accumulator.
@@ -2993,8 +2996,8 @@ impl ConnCtx {
     ///
     /// A FIN or reset from the peer closes the connection whether or not a
     /// read is parked, so this returns `false` once the runtime has seen it.
-    /// On io_uring a plaintext connection from [`connect`] or
-    /// [`connect_unix`] sees it through a `POLLRDHUP` poll. When bytes the
+    /// On io_uring the runtime detects it on a plaintext connection from
+    /// [`connect`] or [`connect_unix`] with a `POLLRDHUP` poll. When bytes the
     /// peer sent before it are queued or buffered, the connection stays open,
     /// and this returns `true`, until they have been read (see [`connect`]).
     pub fn is_alive(&self) -> bool {
