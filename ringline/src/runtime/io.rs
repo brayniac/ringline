@@ -1869,17 +1869,23 @@ impl ConnCtx {
     /// (see Errors). The connection enters the segmented delivery domain:
     /// rustls' plaintext is copied into entries held driver-side as it is
     /// decrypted, and the ciphertext buffers go back to the provided ring when
-    /// rustls reads them. The held entries are written to `sink` — a **socket**
-    /// (`sendmsg` with `MSG_WAITALL`) or a **buffered file** (`pwritev` at an
-    /// advancing offset starting at 0) — gathering up to 16 entries per write.
+    /// rustls reads them. The held entries are written to `sink`, a socket
+    /// (`sendmsg` with `MSG_WAITALL`) or a buffered file (`writev` at an offset
+    /// that advances from 0), gathering up to 16 entries per write.
     ///
-    /// Writes to `sink` are strictly serialized — one in flight at a time — so the
+    /// Writes to `sink` are strictly serialized, one in flight at a time, so the
     /// byte stream cannot be reordered (io_uring does not order independent SQEs).
     ///
-    /// Bytes already buffered on this connection when the forward starts — the
-    /// remainder of the record that carried the length header, typically — are
-    /// the front of the forward and are moved into the hold, not left behind in
-    /// the accumulator.
+    /// Bytes already buffered on this connection when the forward starts (the
+    /// bytes received with the length header, typically) are the front of the
+    /// forward and are moved into the hold, not left behind in the accumulator.
+    ///
+    /// # Backpressure
+    ///
+    /// The held plaintext is bounded by `recv_accumulator_max`
+    /// ([`ConfigBuilder::recv_accumulator_max`](crate::ConfigBuilder::recv_accumulator_max)).
+    /// A sink slower than the source lets it grow to that bound, and the source
+    /// connection is then closed. `forward_hold_cap` does not apply.
     ///
     /// Resolves to `Ok(bytes_forwarded)`. `bytes_forwarded == len` on success; a
     /// value `< len` means the peer closed (FIN) before `len` bytes arrived — the
@@ -1900,7 +1906,7 @@ impl ConnCtx {
     ///
     /// Not supported: the held entries are unaligned heap buffers, so
     /// `O_DIRECT`'s alignment contract cannot be met without an intermediate
-    /// aligned copy. [`SinkFd::file`] **rejects** an `O_DIRECT` descriptor with
+    /// aligned copy. [`SinkFd::file`] rejects an `O_DIRECT` descriptor with
     /// [`io::ErrorKind::InvalidInput`].
     ///
     /// io_uring only.
@@ -2310,8 +2316,7 @@ impl ConnCtx {
     /// # Backpressure
     ///
     /// The source stops reading once it holds the hold cap of entries
-    /// awaiting the sink (`forward_hold_cap`; on io_uring without
-    /// `recv_incremental`, at most a quarter of the receive ring), which closes
+    /// awaiting the sink (`forward_hold_cap`), which closes
     /// the source's TCP window rather than growing the queue without bound,
     /// and resumes when the sink drains.
     ///
@@ -4890,9 +4895,9 @@ impl Future for RecvOwnedSegment {
 ///
 /// Two sink kinds are supported:
 /// - [`socket`](Self::socket): a stream socket.
-/// - [`file`](Self::file): a **buffered** regular file (written at an offset).
+/// - [`file`](Self::file): a buffered regular file (written at an offset).
 ///
-/// `O_DIRECT` / NVMe sinks are **not** supported (the held entries are
+/// `O_DIRECT` / NVMe sinks are not supported (the held entries are
 /// unaligned) and are rejected by [`file`](Self::file).
 #[cfg(has_io_uring)]
 #[derive(Debug)]
@@ -4907,7 +4912,7 @@ pub struct SinkFd<'a> {
 
 #[cfg(has_io_uring)]
 impl<'a> SinkFd<'a> {
-    /// A **socket** sink. Forwarded bytes are written with
+    /// A socket sink. Forwarded bytes are written with
     /// `sendmsg`(`MSG_WAITALL`), so the kernel retries short stream sends in
     /// place.
     pub fn socket(fd: BorrowedFd<'a>) -> Self {
@@ -4918,7 +4923,7 @@ impl<'a> SinkFd<'a> {
         }
     }
 
-    /// A **buffered file** sink. Forwarded bytes are written with `writev` at
+    /// A buffered file sink. Forwarded bytes are written with `writev` at
     /// an offset that advances from 0 as bytes are forwarded; short writes
     /// resubmit the remainder at the advanced offset.
     ///

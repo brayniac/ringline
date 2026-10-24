@@ -64,6 +64,10 @@ fan-in dependent — 1 MiB × 4 is best at c64 (17.07 Gbit/s vs 11.32) while 256
 KiB × 16 is best at c1024 (11.96 vs 9.82) — so the note should give a range and
 say why, not a number.
 
+(That note was removed in 0.7.0-alpha.6. No plaintext connection receives
+through the provided-buffer ring, so `forward_to` takes only TLS sources, and
+these measurements do not apply to them.)
+
 **Cross-validation.** The forward arms reproduce #415 on an independently built
 harness: 11.32 Gbit/s at the default here vs 11.2 there, 14.26 at 64 KiB vs
 14.0. Two harnesses, same operating point, within 2%.

@@ -26,8 +26,8 @@
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum RecvDomain {
-    /// Copy into the accumulator / single-buffer zero-copy hold, surfaced via
-    /// `with_data`/`with_bytes`. The default for every connection.
+    /// Deliver into the accumulator, surfaced via `with_data`/`with_bytes`. The
+    /// default for every connection.
     #[default]
     CopyOrConsume,
     /// Hold received bytes in `segment_hold` for segment reads and Mode A
