@@ -1039,7 +1039,10 @@ impl RinglineBuilder {
         // udp_bind AFTER ConfigBuilder::build() ran validate(), and every
         // UDP check is gated on !udp_bind.is_empty() — so builder-bound UDP
         // sockets used to skip validation entirely (e.g. GRO with a
-        // too-small buffer silently truncates datagrams).
+        // too-small buffer silently truncates datagrams). `bind_tls` adds TLS
+        // the same way, so the per-listener configs are filled in first for
+        // the TLS slot-size check.
+        self.config.listener_tls = self.listeners.iter().map(|l| l.tls.clone()).collect();
         self.config.validate()?;
         self.validate_listeners()?;
 

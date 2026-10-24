@@ -18101,9 +18101,9 @@ mod tests {
     /// [`install_handshaked_tls_with_peer`], able to decrypt what the server
     /// end sends.
     struct TlsTestPeer {
-        #[cfg(feature = "tls-unbuffered")]
+        #[cfg(not(feature = "tls-buffered"))]
         conn: crate::tls::TlsConn,
-        #[cfg(not(feature = "tls-unbuffered"))]
+        #[cfg(feature = "tls-buffered")]
         conn: crate::tls::buffered::BufferedKind,
     }
 
@@ -18112,9 +18112,9 @@ mod tests {
         /// record sealed and then dropped leaves a sequence gap, which the
         /// next record reports as `bad_record_mac`.
         fn decrypt(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>, String> {
-            #[cfg(feature = "tls-unbuffered")]
+            #[cfg(not(feature = "tls-buffered"))]
             return crate::tls::unbuffered::tests::decrypt_at(&mut self.conn, ciphertext);
-            #[cfg(not(feature = "tls-unbuffered"))]
+            #[cfg(feature = "tls-buffered")]
             return crate::tls::buffered::test_support::decrypt_at(&mut self.conn, ciphertext);
         }
     }
@@ -18126,13 +18126,13 @@ mod tests {
     ) -> TlsTestPeer {
         let max = el.driver.connections.max_slots();
         let mut table = crate::tls::TlsTable::with_listener_configs(max, None, None, Vec::new());
-        #[cfg(feature = "tls-unbuffered")]
+        #[cfg(not(feature = "tls-buffered"))]
         let peer = {
             let (server, client) = crate::tls::unbuffered::tests::handshaked_pair();
             table.insert_for_test(conn_index, server);
             TlsTestPeer { conn: client }
         };
-        #[cfg(not(feature = "tls-unbuffered"))]
+        #[cfg(feature = "tls-buffered")]
         let peer = {
             let (server, client) = crate::tls::buffered::test_support::handshaked();
             table.insert_for_test(
@@ -18314,7 +18314,7 @@ mod tests {
     /// then runs dry mid-encryption the records already sealed have spent
     /// their sequence numbers, so the connection is closed rather than left
     /// open to emit records the peer will reject.
-    #[cfg(feature = "tls-unbuffered")]
+    #[cfg(not(feature = "tls-buffered"))]
     #[test]
     fn plain_tls_send_that_fails_mid_encryption_closes_the_connection() {
         let mut el = make_test_loop_with_config(

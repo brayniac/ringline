@@ -101,7 +101,7 @@ cd /home/anvil
   cargo fmt --all --check; echo "gate_fmt=$?"
   cargo clippy --locked --all-targets -- -D warnings; echo "gate_clippy_uring=$?"
   cargo clippy --locked --all-targets --features force-mio -- -D warnings; echo "gate_clippy_mio=$?"
-  cargo clippy --locked --all-targets --features tls-unbuffered -- -D warnings; echo "gate_clippy_tls=$?"
+  cargo clippy --locked --all-targets --features tls-buffered -- -D warnings; echo "gate_clippy_tls=$?"
   cargo test --locked --all; echo "gate_test_uring=$?"
 } 2>&1 | tee /home/anvil/gate.log
 # The tee pipeline masks the payload's own exit code, so the statuses above are

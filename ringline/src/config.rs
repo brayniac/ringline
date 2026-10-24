@@ -223,9 +223,9 @@ pub struct Config {
     /// record fits in a single slot: 5-byte record header + 2^14 plaintext +
     /// the inner content-type byte + a 16-byte AEAD tag = 16406, rounded up to
     /// a 64-byte boundary. A 16384-byte slot is 22 bytes short of that, which
-    /// forces the `tls-unbuffered` engine to shrink its plaintext chunk and
-    /// emit an extra record per send (17 rather than 16 for a 256 KiB
-    /// payload). Costs 64 bytes per slot — 0.4% of the pool.
+    /// forces the unbuffered engine (the default) to shrink its plaintext
+    /// chunk and emit an extra record per send (17 rather than 16 for a
+    /// 256 KiB payload). Costs 64 bytes per slot — 0.4% of the pool.
     pub(crate) send_copy_slot_size: u32,
     /// Minimum total send size (bytes) for the zero-copy guard send path.
     ///
@@ -561,20 +561,24 @@ impl Config {
     /// bound is expressible on the unbuffered engine — see
     /// `docs/tls-premutation-bound-design.md`. Plain TLS sends work below it on
     /// both engines: the buffered engine straddles slots freely, and the
-    /// unbuffered engine still encrypts, just emitting more records. This
-    /// repo's own `tls_echo` tests run at 16384, 29 bytes under it. Rejecting
-    /// that at startup would break working deployments to pre-empt a hazard
-    /// that only reaches bounded sends, which already refuse themselves with a
-    /// message naming the same knob.
-    #[cfg(feature = "tls-unbuffered")]
+    /// unbuffered engine still encrypts, emitting more records. Below it the
+    /// unbuffered engine has no up-front slot bound, so on io_uring a plain
+    /// send that finds the pool short returns an error and closes the
+    /// connection, and bounded sends refuse themselves with a message naming
+    /// the same knob.
+    /// This repo's own `tls_echo` tests run at 16384, 29 bytes under it.
+    #[cfg(not(feature = "tls-buffered"))]
     fn validate_tls_slot_size(&self) -> Result<(), crate::error::Error> {
-        if self.tls.is_none() && self.tls_client.is_none() {
+        if self.tls.is_none()
+            && self.tls_client.is_none()
+            && self.listener_tls.iter().all(Option::is_none)
+        {
             return Ok(());
         }
         let min = crate::tls::unbuffered::MIN_ENCRYPT_DST;
         if (self.send_copy_slot_size as usize) < min {
             return Err(crate::error::Error::RingSetup(format!(
-                "send_copy_slot_size is {} but the tls-unbuffered record layer cannot encrypt \
+                "send_copy_slot_size is {} but the unbuffered TLS record layer cannot encrypt \
                  into a destination smaller than {min} bytes, so every TLS send would fail; \
                  raise send_copy_slot_size",
                 self.send_copy_slot_size,
@@ -585,7 +589,7 @@ impl Config {
 
     /// The buffered record layer packs ciphertext across slots through
     /// `PoolWriter`, so no slot size is too small for it to make progress.
-    #[cfg(not(feature = "tls-unbuffered"))]
+    #[cfg(feature = "tls-buffered")]
     fn validate_tls_slot_size(&self) -> Result<(), crate::error::Error> {
         Ok(())
     }
@@ -1794,7 +1798,7 @@ mod tests {
     // every TLS send on every connection fails. Better at startup than
     // per-send. The buffered engine has no such floor, so this is gated.
     #[test]
-    #[cfg(feature = "tls-unbuffered")]
+    #[cfg(not(feature = "tls-buffered"))]
     fn validate_rejects_a_slot_the_unbuffered_engine_cannot_encrypt_into() {
         let err = config_with(|c| {
             c.tls = Some(tls_server_config(None));
@@ -1811,7 +1815,7 @@ mod tests {
     // A client config reaches the same check — outbound TLS connections
     // encrypt through the same pool.
     #[test]
-    #[cfg(feature = "tls-unbuffered")]
+    #[cfg(not(feature = "tls-buffered"))]
     fn validate_checks_the_client_config_too() {
         let cc: std::sync::Arc<rustls::ClientConfig> = rustls::ClientConfig::builder()
             .with_root_certificates(rustls::RootCertStore::empty())

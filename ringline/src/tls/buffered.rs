@@ -1,12 +1,12 @@
-// With `tls-unbuffered` on, `TlsTable::create`/`create_client` select the other
-// engine and the dispatchers in `backend_mio`/`backend_uring` never route here,
-// so every item in this file is compiled-but-unselected. That is the point of
-// the feature, not dead code to delete: dropping the feature must bring the
-// whole engine back, and an item-by-item allow would just spell the same
-// statement out nine times. On mio this is invisible (`lib.rs` masks the whole
-// `tls` module); a Linux io_uring build with the feature is what fails
-// `-D warnings` without it.
-#![cfg_attr(feature = "tls-unbuffered", allow(dead_code))]
+// Without the `tls-buffered` feature, `TlsTable::create`/`create_client` select
+// the unbuffered engine and the dispatchers in `backend_mio`/`backend_uring`
+// never route here, so every item in this file is compiled-but-unselected.
+// That is not dead code to delete: enabling `tls-buffered` brings the whole
+// engine back, and an item-by-item allow would just spell the same statement
+// out nine times. On mio this is invisible (`lib.rs` masks the whole `tls`
+// module); a Linux io_uring build without `tls-buffered` fails `-D warnings`
+// without this allow.
+#![cfg_attr(not(feature = "tls-buffered"), allow(dead_code))]
 
 #[allow(unused_imports)]
 use std::io::{self, Read as _, Write as _};
@@ -29,15 +29,15 @@ use super::*;
 /// A rustls connection driven through the *buffered* API
 /// (`read_tls` / `process_new_packets` / `write_tls` / `send_close_notify`).
 ///
-/// With `tls-unbuffered` on, `TlsTable::create`/`create_client` build the
-/// other engine, so nothing constructs these variants — the buffered engine
-/// is compiled but unselected. That is the point of the feature, not dead
-/// code to delete: dropping the feature must bring the whole engine back.
+/// Without the `tls-buffered` feature, `TlsTable::create`/`create_client`
+/// build the unbuffered engine, so nothing constructs these variants — the
+/// buffered engine is compiled but unselected. That is not dead code to
+/// delete: enabling `tls-buffered` brings the whole engine back.
 /// Subsumed by the module-level allow at the top of this file, and kept
 /// anyway: these two constructors are the root of why the rest of the module
 /// is unselected, so the statement belongs on them even if the file-level
 /// attribute is what silences the lint.
-#[cfg_attr(feature = "tls-unbuffered", allow(dead_code))]
+#[cfg_attr(not(feature = "tls-buffered"), allow(dead_code))]
 pub enum BufferedKind {
     Server(ServerConnection),
     Client(ClientConnection),

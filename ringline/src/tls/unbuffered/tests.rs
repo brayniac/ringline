@@ -714,8 +714,32 @@ fn a_whole_record_destination_encrypts_whole_records() {
     }
 }
 
-/// The 16384-byte default send slot misses a full record by 22 bytes, so there
-/// is no whole-record answer for it. It must fall back to the retry loop and
+/// The default send slot (`send_pool`'s slot size) holds one full record, so a
+/// send that is a multiple of 16 KiB costs one record per 16 KiB, as on the
+/// buffered engine.
+#[test]
+fn the_default_send_slot_takes_one_full_record() {
+    let (mut server, mut client) = conn_pair();
+    let mut accs = AccumulatorTable::new(2, 4096);
+    handshake(&mut server, &mut client, &mut accs);
+
+    let slot = crate::ConfigBuilder::new()
+        .build()
+        .expect("default config")
+        .send_copy_slot_size as usize;
+    let big = vec![0x44u8; 64 * 1024];
+    let mut dst = vec![0u8; slot];
+    super::encrypt_chunk(&mut client, &big, &mut dst).expect("encrypt");
+    let (used_pt, used_ct) = super::encrypt_chunk(&mut client, &big, &mut dst).expect("encrypt");
+    assert_eq!(
+        used_pt, DEFAULT_MAX_PLAINTEXT_PER_RECORD,
+        "one full fragment"
+    );
+    assert_eq!(used_ct, DEFAULT_RECORD_WIRE_LEN, "in one record");
+}
+
+/// A 16384-byte send slot misses a full record by 22 bytes, so there is no
+/// whole-record answer for it. It must fall back to the retry loop and
 /// still converge on the largest chunk that fits, rather than failing or
 /// stalling.
 #[test]

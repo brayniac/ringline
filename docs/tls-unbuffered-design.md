@@ -1,7 +1,9 @@
 # Unbuffered TLS send path — design
 
-**Status:** Implemented behind the default-off `tls-unbuffered` feature (PRs
-#338, #341, #345, #350). **This design's central premise is falsified — read
+**Status:** Implemented (PRs #338, #341, #345, #350) and the default engine;
+the `tls-buffered` feature selects the buffered one, and
+`tls-unbuffered` has no effect. The unbuffered engine captures the SNI hostname
+through the certificate resolver. **This design's central premise is falsified — read
 the correction immediately below before anything else.** The `> **Correction**`
 blocks further down record where *building* it falsified the design; this one
 records where *measuring* it did.
@@ -64,8 +66,9 @@ records where *measuring* it did.
 > copy would have widened sharply there; this did not.
 >
 > **The +5.7% at 16 KiB is structural, not noise.** At a payload that is a
-> multiple of `send_copy_slot_size` (16384 by default) the buffered path emits
-> **one** 16406-byte record and lets `PoolWriter` straddle it across two slots.
+> multiple of `send_copy_slot_size` (16384 at the time; the default is now
+> 16448) the buffered path emits **one** 16406-byte record and lets
+> `PoolWriter` straddle it across two slots.
 > The unbuffered path must fit a whole record inside one slot, so
 > `encrypt_chunk` shrinks the chunk and emits **two** records — 17 vs 16 at
 > 256 KiB, 65 vs 64 at 1 MiB. The extra record costs ~245 ns, which accounts
@@ -528,16 +531,18 @@ buffer" and "these bytes are ready" events. Only the transport differs
 (`BuiltSend` + SQE vs. direct `TcpStream` write), mirroring how `encrypt_to_sends`
 and `encrypt_for_send_mio` split today.
 
-## Path selection (provisional)
+## Path selection
 
 Both engines compile; a connection uses one for its lifetime, chosen at
 `TlsTable::create` time.
 
-**Provisional mechanism: a cargo feature `tls-unbuffered`, default off.** It adds
-no public config surface, lets CI build and test both, and leaves the eventual
-decision cheap — flip the default, or delete `buffered.rs`.
+**Mechanism: the unbuffered engine is the default; the `tls-buffered` cargo
+feature selects the buffered one.** It adds no public config surface and lets CI
+build and test both. The engine was first a default-off `tls-unbuffered`
+feature; that feature now has no effect. A default feature could not be turned
+off across the workspace, because dependent crates enable ringline's defaults.
 
-This is explicitly the deferred decision. Alternatives, for when it is taken:
+The alternatives considered:
 
 - **Feature flag** (above) — no public surface, but every TLS fix lands twice
   while both exist.
@@ -717,3 +722,4 @@ offload, which is where the *remaining* copy goes.
    rig sweep shows the cap binding.
 3. **Does the buffered path stay as the mio default** while the unbuffered path
    proves out on the rig, or do both backends switch together?
+   **Resolved:** both backends switched together.

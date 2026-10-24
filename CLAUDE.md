@@ -244,9 +244,10 @@ Ringline aims to minimize data copies on the hot path. Understanding where copie
 | Kernel → read buffer → RecvAccumulator (mio) | `read()` into a per-worker buffer, then `extend_from_slice()` | 1 |
 | Accumulator → `with_data()` callback | Borrowed `&[u8]` into accumulator | 0 |
 | Accumulator → `with_bytes()` callback | `BytesMut::freeze()` → `Bytes` (O(1)), slicing via `Bytes::slice()` is O(1) refcount | 0 |
-| TLS recv | rustls plaintext drained into accumulator via `BufRead` | 1 |
+| TLS recv, unbuffered engine (default) | Ciphertext → ringline's `CiphertextBuf` (`append`); rustls decrypts in place there, then copies each record's plaintext into a new `Vec` (`take_received_plaintext`, one heap allocation per record); `ReadTraffic::next_record` lends that `Vec` and ringline copies it into the accumulator or an owned segment. Plus `CiphertextBuf::compact`: measured 0.94× the payload at 16 KiB records arriving in 16 KiB buffers, 0.02–0.04× at 1 KiB records | 3 + conditional |
+| TLS recv, buffered engine (`tls-buffered`) | Ciphertext → rustls' deframer buffer (`read_tls`); rustls decrypts in place, then copies each record's plaintext into a new `Vec` (`take_received_plaintext`); `drain_tls_plaintext` copies that into the accumulator, or into an owned segment in the segmented domain. Plus a ciphertext memmove in `DeframerVecBuffer::discard` of the bytes behind each processed record: measured 0.12× the payload at 16 KiB records, 2.3× at 1 KiB records | 3 + conditional |
 
-TLS recv is unchanged at 1 copy under the `tls-unbuffered` feature too: rustls 0.23's unbuffered `ReadTraffic::next_record` pops an owned plaintext chunk rather than decrypting in place, so the copy into the `RecvAccumulator` remains. The `tls-unbuffered` feature only changes the send path.
+TLS recv costs 3 copies on both engines, measured with rustls 0.23.46 on both backends: ciphertext into a contiguous buffer (`CiphertextBuf`, or rustls' deframer buffer), decrypted plaintext into a per-record `Vec` (`CommonState::take_received_plaintext` → `Payload::into_vec`, where the payload is always `Borrowed`), and that `Vec` into the accumulator or an owned segment. The unbuffered engine decrypts in place, but `ReadTraffic::next_record` hands out the copied `Vec`, not the in-place plaintext. `note_copied` counts only ringline's own copy.
 
 The key difference: `with_data(|&[u8]|)` provides a borrowed slice — the parser must copy any values it wants to keep. `with_bytes(|Bytes|)` provides a refcounted handle — the parser can return `Bytes::slice()` sub-references with zero copies.
 
@@ -258,8 +259,8 @@ The key difference: `with_data(|&[u8]|)` provides a borrowed slice — the parse
 | `send_parts()` with `.copy()` only | All copy parts gathered into one `SendCopyPool` slot | 1 |
 | `send_parts()` with `.guard()` only | Guard memory used in-place via `SendMsgZc` iovec | 0 |
 | `send_parts()` mixed `.copy()` + `.guard()` | Copy parts → pool; guard parts zero-copy via iovec | 1 (copy parts only) |
-| Any send with TLS (buffered engine, default) | Gather plaintext, then rustls encrypts **directly into a pool slot** | 2 |
-| Application-data send with TLS (`tls-unbuffered` feature) | Also 2. `WriteTraffic::encrypt` copies the plaintext into a fresh per-record `PrefixedPayload`, seals it in place, then `copy_from_slice`s the finished record into the pool slot (io_uring) or the queued buffer (mio). The engine changes *which* two copies are paid, not how many | 2 |
+| Any send with TLS (buffered engine, `tls-buffered`) | Gather plaintext, then rustls encrypts **directly into a pool slot** | 2 |
+| Application-data send with TLS (unbuffered engine, default) | Also 2. `WriteTraffic::encrypt` copies the plaintext into a fresh per-record `PrefixedPayload`, seals it in place, then `copy_from_slice`s the finished record into the pool slot (io_uring) or the queued buffer (mio). The engine changes *which* two copies are paid, not how many | 2 |
 
 The `tls-unbuffered` feature was merged (#350) claiming it took application-data
 sends from 2 copies to 1. **That claim was false and the row above corrects it.**
@@ -277,11 +278,13 @@ plaintext on both engines. An allocation counter inside the measured call agrees
 
 What the feature *does* deliver, measured in isolation on hv01 (Linux 6.12,
 rustc 1.98.1, io_uring): a small (~1–2%) send-side bookkeeping win at ≥64 KiB, a 4–8%
-recv-side win, and a systematic **extra TLS record** whenever the payload is a
-multiple of `send_copy_slot_size` (the buffered path lets `PoolWriter` straddle
-one 16406-byte record across two slots; the unbuffered path must fit a whole
-record inside one slot, so it emits two) — worth +5.7% on a 16 KiB send. It
-remains the prerequisite for kTLS. See
+recv-side win, and, at a 16384-byte `send_copy_slot_size`, an **extra TLS
+record** whenever the payload is a multiple of the slot size (the buffered path
+lets `PoolWriter` straddle one 16406-byte record across two slots; the
+unbuffered path must fit a whole record inside one slot, so it emits two) —
+worth +5.7% on a 16 KiB send. The default slot (16448 bytes) holds a whole
+record, so at the default both engines emit one record per 16 KiB. It remains
+the prerequisite for kTLS. See
 [docs/tls-unbuffered-design.md](docs/tls-unbuffered-design.md) and
 [docs/journal/2026-09-unbuffered-tls.md](docs/journal/2026-09-unbuffered-tls.md).
 
@@ -313,23 +316,24 @@ Minimal — `with_data()` recv (pattern-match `PONG\r\n`, no value extraction), 
 
 ### Copy Semantics Design Principles
 
-1. **Recv buffer ownership**: On io_uring a plaintext connection's receive writes into its `RecvAccumulator` directly (0 copies). A TLS connection's ciphertext lands in a `ProvidedBufRing` buffer and rustls copies the plaintext into the accumulator (1 copy). On mio, `read()` fills a per-worker buffer that is appended to the accumulator (1 copy). After that, `with_bytes()` enables zero-copy parsing via `Bytes::slice()`. `with_data()` requires the parser to copy out any data it needs to keep.
+1. **Recv buffer ownership**: On io_uring a plaintext connection's receive writes into its `RecvAccumulator` directly (0 copies). A TLS connection's ciphertext lands in a `ProvidedBufRing` buffer, and a TLS receive costs 3 copies per received byte (see the table). On mio, `read()` fills a per-worker buffer that is appended to the accumulator (1 copy). After that, `with_bytes()` enables zero-copy parsing via `Bytes::slice()`. `with_data()` requires the parser to copy out any data it needs to keep.
 
 2. **Send buffer ownership**: Ringline must own all memory referenced by SQEs (the submission must outlive the syscall). `SendCopyPool` provides pre-allocated slots for this. `SendGuard` is the escape hatch for zero-copy — it pins user memory and holds it alive until the kernel confirms completion.
 
-3. **TLS caps out at one extra copy**: encryption must read plaintext and write ciphertext, so `SendGuard` zero-copy is impossible under TLS — but ciphertext is encrypted directly into the send-pool slot (no intermediate scratch buffer), and it is serialized through the per-connection send queue for record ordering.
+3. **TLS caps out at one extra copy**: encryption must read plaintext and write ciphertext, so `SendGuard` zero-copy is impossible under TLS. Application data costs 2 copies on both engines (see the send table), and records are serialized through the per-connection send queue for ordering.
 
-   The `tls-unbuffered` cargo feature (default off) swaps the record layer for
-   rustls' unbuffered API. It does **not** reduce the copy count: application
-   data still costs 2 copies, because rustls encrypts each record into a fresh
-   per-record buffer and copies the result into the destination
-   (`write_fragments`), and because the copy the feature was meant to remove
-   (`sendable_plaintext`) only happens *before* the handshake completes. Recv
-   is unchanged. Handshake ciphertext on io_uring pays one copy *more* than the
-   buffered engine (`EncodeTlsData::encode` needs one contiguous buffer that can
-   exceed a pool slot, so it goes through a scratch `Vec` first) — a one-time
-   per-connection cost. Getting the intended 1-copy send would require rustls
-   to encrypt in place into `outgoing_tls`, which it does not do. See
+   The unbuffered engine (the default; the `tls-buffered` feature selects the
+   buffered one) uses rustls' unbuffered API for the record layer. It does
+   **not** reduce the copy count: application data still costs 2 copies,
+   because rustls encrypts each record into a fresh per-record buffer and
+   copies the result into the destination (`write_fragments`), and because the
+   copy the unbuffered engine was meant to remove (`sendable_plaintext`) only
+   happens *before* the handshake completes. Recv costs 3 copies on both
+   engines. Handshake ciphertext on io_uring pays one copy *more* than the
+   buffered engine (`EncodeTlsData::encode` needs one contiguous buffer that
+   can exceed a pool slot, so it goes through a scratch `Vec` first) — a
+   one-time per-connection cost. Getting the intended 1-copy send would require
+   rustls to encrypt in place into `outgoing_tls`, which it does not do. See
    `docs/tls-unbuffered-design.md`.
 
 4. **Client choice of `with_data` vs `with_bytes`**: This is the single biggest design decision for recv-side copy count. `with_bytes` enables true zero-copy parsing but requires the protocol parser to work with `Bytes` (refcounted slices). `with_data` is simpler but forces a copy.

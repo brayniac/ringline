@@ -1,6 +1,6 @@
 [package]
 name = "ringline"
-version = "0.7.0-alpha.11"
+version = "0.7.0-alpha.12"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
@@ -18,14 +18,15 @@ check-cfg = ["cfg(has_io_uring)", "cfg(uring_engine)"]
 [features]
 force-mio = []
 testing = []
-# Selects rustls' unbuffered API (`UnbufferedConnectionCommon`) for the TLS
-# record layer instead of `writer()`/`write_tls()`. This does NOT reduce the
-# copy count -- application-data sends cost 2 copies on both engines, measured
-# and verified against rustls 0.23.41 (see docs/tls-unbuffered-design.md's
-# top correction block). It is kept as the prerequisite for kTLS: rustls'
-# `dangerous_into_kernel_connection` is public only on
-# `UnbufferedClientConnection`/`UnbufferedServerConnection`.
-# Off by default.
+# Selects rustls' buffered API (`ServerConnection`/`ClientConnection`,
+# `writer()`/`write_tls()`) for the TLS record layer. Without it the
+# unbuffered API (`UnbufferedConnectionCommon`) is used: rustls'
+# `dangerous_into_kernel_connection`, the path to kTLS, exists only there.
+# Application-data sends cost 2 copies on both engines (see
+# docs/tls-unbuffered-design.md).
+tls-buffered = []
+# The unbuffered engine is the default; this feature has no effect and is
+# kept so existing `features = ["tls-unbuffered"]` builds still resolve.
 tls-unbuffered = []
 
 [dependencies]

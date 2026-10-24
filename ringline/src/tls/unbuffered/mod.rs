@@ -22,9 +22,9 @@
 //! measures ~4-8% faster on the recv path, which is not a copy-count effect
 //! and is not yet explained.
 //!
-//! Selected per connection by the `tls-unbuffered` feature in
-//! `TlsTable::create`, and driven end-to-end on both backends through their
-//! dispatcher modules (`super::backend_mio`, `super::backend_uring`). The
+//! The default engine, selected per connection in `TlsTable::create` unless the
+//! `tls-buffered` feature is on, and driven end-to-end on both backends through
+//! their dispatcher modules (`super::backend_mio`, `super::backend_uring`). The
 //! backends differ only in where the ciphertext lands: a `Vec` on the
 //! connection's pending-send FIFO for mio, `SendCopyPool` slots for io_uring
 //! (see `docs/journal/2026-09-unbuffered-tls.md`).
@@ -91,21 +91,6 @@ impl UnbufferedKind {
         }
     }
 
-    /// Always `None`: `UnbufferedServerConnection` does not expose the SNI
-    /// hostname rustls parsed from the ClientHello — unlike the buffered
-    /// `ServerConnection::server_name()`, no equivalent accessor exists on
-    /// `UnbufferedServerConnection` or on `CommonState`, which is all that
-    /// `UnbufferedConnectionCommon` derefs to (verified against rustls
-    /// 0.23.41 source; `server_name()` lives only on the handshake-callback
-    /// `ClientHello` type and on the buffered `ServerConnection`). Capturing
-    /// SNI for the unbuffered engine would need a `ClientHello` callback on
-    /// `ServerConfig` to stash it on `TlsConn` at handshake time — tracked as
-    /// follow-on work, out of scope here. See `TlsInfo::sni_hostname` for the
-    /// documented limitation this produces.
-    pub fn sni_hostname(&self) -> Option<&str> {
-        None
-    }
-
     // No `send_close_notify` here: it's buffered-only, not just
     // differently-shaped for this engine. `CommonState::send_close_notify(&mut
     // self)` is unreachable from here at all --
@@ -163,6 +148,9 @@ pub struct UnbufferedConn {
     /// that. Widen the cache then, against the real io_uring shape, not
     /// speculatively now.
     chunk_basis: usize,
+    /// The SNI hostname from the ClientHello (a server connection), set
+    /// during the handshake.
+    sni: Option<String>,
 }
 
 impl UnbufferedConn {
@@ -188,7 +176,14 @@ impl UnbufferedConn {
             pending_plaintext: VecDeque::new(),
             max_plaintext_per_chunk: 0,
             chunk_basis: 0,
+            sni: None,
         }
+    }
+
+    /// The SNI hostname the client sent, captured from the ClientHello by
+    /// [`sni::capture_server_names`]'s certificate resolver.
+    pub fn sni_hostname(&self) -> Option<&str> {
+        self.sni.as_deref()
     }
 
     /// Test-only: rebuild the incoming-ciphertext buffer with a `cap` below
@@ -295,6 +290,27 @@ pub(crate) enum DriveOutcome {
 /// applies across the chunks of a [`feed`]; its doc comment carries the
 /// reasoning, and the rule is stated there alone so the two cannot drift.
 pub(crate) fn drive(
+    tls_conn: &mut TlsConn,
+    sink: Option<&mut PlaintextSink<'_>>,
+    out: &mut Vec<u8>,
+    conn_index: u32,
+) -> DriveOutcome {
+    let handshaking = !tls_conn.handshake_complete;
+    if handshaking {
+        sni::clear();
+    }
+    let outcome = drive_records(tls_conn, sink, out, conn_index);
+    if handshaking
+        && let Some(name) = sni::take()
+        && let Some(conn) = tls_conn.conn.as_unbuffered_mut()
+        && conn.sni.is_none()
+    {
+        conn.sni = Some(name);
+    }
+    outcome
+}
+
+fn drive_records(
     tls_conn: &mut TlsConn,
     mut sink: Option<&mut PlaintextSink<'_>>,
     out: &mut Vec<u8>,
@@ -1077,3 +1093,62 @@ fn drain_pending_plaintext(
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+/// SNI capture for the unbuffered engine. `UnbufferedServerConnection` does not
+/// expose the server name rustls parsed from the ClientHello (the buffered
+/// `ServerConnection::server_name()` has no unbuffered equivalent), but every
+/// handshake passes the ClientHello to the config's certificate resolver
+/// before it decides on resumption. The server configs are cloned with a
+/// resolver that records the name in a worker-thread slot and delegates to
+/// the caller's resolver; [`drive`] moves it onto the connection.
+pub(crate) mod sni {
+    use std::cell::RefCell;
+    use std::sync::Arc;
+
+    thread_local! {
+        static CAPTURED: RefCell<Option<String>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn clear() {
+        CAPTURED.with(|c| c.borrow_mut().take());
+    }
+
+    pub(super) fn take() -> Option<String> {
+        CAPTURED.with(|c| c.borrow_mut().take())
+    }
+
+    /// Wraps the caller's resolver and records the ClientHello's server name.
+    /// Forwards both `ResolvesServerCert` methods rustls 0.23.46 has
+    /// (`resolve`, `only_raw_public_keys`); a method a later release adds
+    /// with a default would get the default here, not the caller's.
+    #[derive(Debug)]
+    struct CaptureServerName {
+        inner: Arc<dyn rustls::server::ResolvesServerCert>,
+    }
+
+    impl rustls::server::ResolvesServerCert for CaptureServerName {
+        fn resolve(
+            &self,
+            client_hello: rustls::server::ClientHello<'_>,
+        ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+            let name = client_hello.server_name().map(str::to_owned);
+            CAPTURED.with(|c| *c.borrow_mut() = name);
+            self.inner.resolve(client_hello)
+        }
+
+        fn only_raw_public_keys(&self) -> bool {
+            self.inner.only_raw_public_keys()
+        }
+    }
+
+    /// A copy of `config` whose certificate resolver records the server name.
+    pub(crate) fn capture_server_names(
+        config: &Arc<rustls::ServerConfig>,
+    ) -> Arc<rustls::ServerConfig> {
+        let mut config = (**config).clone();
+        config.cert_resolver = Arc::new(CaptureServerName {
+            inner: config.cert_resolver.clone(),
+        });
+        Arc::new(config)
+    }
+}
