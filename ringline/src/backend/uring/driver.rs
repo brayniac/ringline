@@ -3121,11 +3121,6 @@ impl Driver {
         self.pending_send_retries.push((conn_index, generation, 0));
     }
 
-    /// Queue a batch of built sends in order through the per-connection
-    /// send queue. Infallible: `submit_or_queue_send` parks under SQ
-    /// pressure rather than failing, so every entry is committed in order
-    /// and nothing needs releasing here. `sends` is drained, not consumed,
-    /// so the caller can keep the `Vec`'s allocation as scratch.
     /// Close a connection the application asked to close (`ConnCtx::close`, or
     /// its task finishing). A TLS connection first queues its close_notify, so
     /// the peer can tell the close from a truncation; a close after an error
@@ -3143,16 +3138,14 @@ impl Driver {
     }
 
     /// Queue a TLS connection's close_notify alert through its send queue, so
-    /// it goes out after any queued sends and ahead of the FIN, and arm the
-    /// close_notify deadline (`Config::close_notify_timeout_ms`), which closes
-    /// the connection if the queue does not drain. Does nothing for a
-    /// plaintext connection or a socket handed off to another worker.
+    /// it goes out after any queued sends and ahead of the FIN. No deadline is
+    /// armed: the queue drains however long the peer takes, as for a plaintext
+    /// connection. Does nothing for a plaintext connection, a socket handed off
+    /// to another worker, or one whose write side is already shut down.
     fn queue_tls_close_notify(&mut self, conn_index: u32) {
-        if self
-            .connections
-            .get(conn_index)
-            .is_some_and(|c| c.socket_handed_off)
-        {
+        if self.connections.get(conn_index).is_some_and(|c| {
+            c.socket_handed_off || matches!(c.write, crate::connection::WriteHalf::Shutdown)
+        }) {
             return;
         }
         let generation = self.connections.generation(conn_index);
@@ -3169,13 +3162,13 @@ impl Driver {
         if !sends.is_empty() {
             self.queue_built_sends(conn_index, &mut sends);
         }
-        self.send_queues[conn_index as usize].close_notify_deadline =
-            Some(std::time::Instant::now() + self.close_notify_timeout);
-        if !self.close_notify_armed.contains(&conn_index) {
-            self.close_notify_armed.push(conn_index);
-        }
     }
 
+    /// Queue a batch of built sends in order through the per-connection
+    /// send queue. Infallible: `submit_or_queue_send` parks under SQ
+    /// pressure rather than failing, so every entry is committed in order
+    /// and nothing needs releasing here. `sends` is drained, not consumed,
+    /// so the caller can keep the `Vec`'s allocation as scratch.
     pub(crate) fn queue_built_sends(
         &mut self,
         conn_index: u32,
