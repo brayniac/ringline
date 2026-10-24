@@ -263,10 +263,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   client configs, and by `launch()` for a `bind_tls` listener's. One whole
   record is `F + 29` bytes, where `F` is the config's `max_fragment_size`
   minus its 5-byte header: 16413 bytes at the default fragment size, so a
-  TLS config with a 16384-byte slot no longer builds. Below that size a
-  bounded send (`send_backpressured`) had no admission bound and was
-  refused, and on io_uring a plain send that found the pool short closed
-  the connection. The default slot (16448 bytes) holds one whole record.
+  TLS config with a 16384-byte slot no longer builds. Below that size the
+  engine cannot bound in advance how many slots a send uses. The default
+  slot (16448 bytes) holds one whole record.
   With the `tls-buffered` feature any slot size works. On io_uring,
   handshake output pays one more copy than on the buffered engine.
 - io_uring: a TLS connection's ring receive is armed when a read parks once

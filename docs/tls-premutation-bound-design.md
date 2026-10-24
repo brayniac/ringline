@@ -96,10 +96,10 @@ therefore adds **one whole record** of headroom unconditionally.
 slot, i.e. `slot_size >= F + 29`. In the shipped default that is
 `send_copy_slot_size = 16448` against `F + 29 = 16413` — **a margin of 35
 bytes**. Any configuration that lowers the slot size a little, or raises the
-fragment size, makes the bound inexpressible. Since the unbuffered engine
-became the default, `Config::validate` rejects such a configuration for every
-configured rustls config, so the refusal below is reached only by TLS state
-installed without validation (unit tests).
+fragment size, makes the bound inexpressible. On the unbuffered engine
+`Config::validate` rejects such a configuration for every configured rustls
+config, so the refusal below is reached only by TLS state installed without
+validation (unit tests).
 
 What matters is what happens below that threshold, and it is not a progress
 failure: the unbuffered engine still encrypts (its shrink loop converges,

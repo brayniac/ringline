@@ -685,6 +685,8 @@ pub(crate) fn encrypt_chunk(
         .as_unbuffered_mut()
         .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
 
+    let record_wire_len = fragment_len + record_overhead;
+    let whole = dst.len() / record_wire_len;
     let hint = if conn.chunk_basis == dst.len() && conn.max_plaintext_per_chunk > 0 {
         conn.max_plaintext_per_chunk
     } else {
@@ -728,8 +730,6 @@ pub(crate) fn encrypt_chunk(
         // must fit under whichever version this connection negotiated — the
         // admission bound's version-agnostic worst case would leave a whole
         // TLS 1.3 record of `dst` unused and drop back into the retry loop.
-        let record_wire_len = fragment_len + record_overhead;
-        let whole = dst.len() / record_wire_len;
         if whole == 0 {
             dst.len()
         } else {
@@ -740,11 +740,16 @@ pub(crate) fn encrypt_chunk(
 
     // Set only when rustls actually made us shrink. A short final send would
     // otherwise cache its own tiny size as the connection's ceiling and every
-    // later send would start from there. The cache only ever shrinks for a
-    // given `dst` size, so a one-off inflation of `required_size` — a queued
-    // `key_update` riding along in the same buffer — leaves it slightly
-    // pessimistic until `dst` changes. That costs a few bytes per record, not
-    // correctness.
+    // later send would start from there.
+    //
+    // Cached only when `dst` cannot hold one whole record (`whole == 0`),
+    // where the retry loop is the only way to find a chunk that fits. With
+    // `whole >= 1` the whole-record hint fits by construction, so a shrink
+    // there comes from a record rustls had queued (a key_update reply) riding
+    // in the same `dst`, and applies to this call only. Caching it would leave
+    // every later chunk under one record for this `dst` size, and
+    // `CiphertextCapacity::slots_unbuffered` (one record per slot) would then
+    // under-count.
     let mut learned: Option<usize> = None;
 
     let (kind, incoming, _) = conn.split_mut();
@@ -763,7 +768,9 @@ pub(crate) fn encrypt_chunk(
     }
     let written = result?;
 
-    if let Some(learned) = learned {
+    if let Some(learned) = learned
+        && whole == 0
+    {
         let conn = tls_conn
             .conn
             .as_unbuffered_mut()

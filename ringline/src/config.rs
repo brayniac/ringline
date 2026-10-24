@@ -582,8 +582,9 @@ impl Config {
             return Err(crate::error::Error::RingSetup(format!(
                 "send_copy_slot_size is {} but the unbuffered TLS record layer needs a slot of \
                  at least {min} bytes to hold one whole TLS record for the configured \
-                 max_fragment_size; raise send_copy_slot_size (ConfigBuilder::send_pool) or \
-                 lower max_fragment_size in the rustls config",
+                 max_fragment_size; raise send_copy_slot_size (ConfigBuilder::send_pool), \
+                 lower max_fragment_size in the rustls config, or build with the \
+                 tls-buffered feature",
                 self.send_copy_slot_size,
             )));
         }
