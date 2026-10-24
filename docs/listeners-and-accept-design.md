@@ -275,15 +275,15 @@ adopting worker gets a stale session next to a partial message. Nothing
 becomes permanently unparkable either: the handler re-offers at its next idle
 point and the park happens then. Park is best-effort by construction.
 
-So the gate refuses while anything is unconsumed — accumulator, a lent buffer
-in `pending_recv_bufs`, `segment_hold` or `segment_pinned`
-(`ParkBlocker::DataPending`). Stating it as a property of *state* rather than
+So the gate refuses while anything is unconsumed — accumulator, the buffer a
+direct receive holds, a lent buffer in `pending_recv_bufs`, `segment_hold` or
+`segment_pinned` (`ParkBlocker::DataPending`). Stating it as a property of *state* rather than
 as a withdraw hook on each delivery path is deliberate: the review found two
 recv paths that delivered bytes without withdrawing the offer, and a
 state-based gate means the next one added fails closed instead. The refusals
 are the states where the handler or the kernel is mid-operation, and the gate
 names each one (`ParkBlocker`): not open or still handshaking; teardown
-already requested; queued or in-flight sends; an in-flight Mode A forward
+already requested, or a hangup error kept for the reader; queued or in-flight sends; an in-flight Mode A forward
 write; an active send chain; a live `SegmentReader`; an in-flight fallback
 recv.
 
@@ -293,12 +293,13 @@ handler holds both for the connection's whole life, so gating on them would
 refuse essentially every park. They are owned by the future, which park drops
 as part of the move.
 
-Sequence: quiesce on the predicate above → convert any pinned segment to owned
-→ cancel the multishot recv and unregister the fd from A → package
-`(OwnedFd, leftover accumulator bytes, TLS state, ListenerId, PeerAddr,
-handler payload)`, all `Send` → send over the tier-1 channel → B allocates a
-slot, registers the fd, seeds the accumulator, re-arms multishot recv, and calls
-a new `on_adopt` hook.
+Sequence: quiesce on the predicate above → cancel the direct receive, if a
+read is parked, and the hangup poll, and wait until neither is armed →
+unregister the fd from A → package `(OwnedFd, leftover accumulator bytes,
+TLS state, ListenerId, PeerAddr, handler payload)`, all `Send` → send over
+the tier-1 channel → B allocates a slot, registers the fd, seeds the accumulator, arms
+the hangup poll, and calls `on_adopt`; the new task's first parked read arms
+a receive.
 
 "TLS state" is the whole `UnbufferedConn` (or its buffered counterpart) moved as
 one value, not a reconstructed session — see open question 4. Both engines take

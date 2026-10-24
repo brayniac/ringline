@@ -1578,3 +1578,127 @@ fn tls_segments_installed_after_data_still_delivers_it() {
         h.join().unwrap().unwrap();
     }
 }
+
+#[cfg(has_io_uring)]
+static TLS_FILE_SINK_PATH: OnceLock<std::path::PathBuf> = OnceLock::new();
+
+/// Reads a 4-byte length, forwards that many plaintext bytes to a file with
+/// `forward_to`, and replies with the count forwarded.
+#[cfg(has_io_uring)]
+struct TlsFileForwarder;
+
+#[cfg(has_io_uring)]
+impl AsyncEventHandler for TlsFileForwarder {
+    #[allow(clippy::manual_async_fn)]
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
+        async move {
+            use std::os::fd::AsFd;
+            let mut hdr = [0u8; 4];
+            let n = conn
+                .with_data(|data| {
+                    if data.len() < 4 {
+                        return ParseResult::NeedMore;
+                    }
+                    hdr.copy_from_slice(&data[..4]);
+                    ParseResult::Consumed(4)
+                })
+                .await;
+            if n == 0 {
+                return;
+            }
+            let len = u32::from_be_bytes(hdr) as usize;
+            let path = TLS_FILE_SINK_PATH.get().expect("path set before launch");
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(path)
+                .expect("open sink file");
+            let sink = ringline::SinkFd::file(file.as_fd()).expect("file sink");
+            let forwarded = match conn.forward_to(&sink, len).await {
+                Ok(n) => n,
+                Err(e) => {
+                    eprintln!("tls file forwarder: forward_to failed: {e}");
+                    0
+                }
+            };
+            // The client reads the file once it sees the reply.
+            let _ = file.sync_all();
+            let _ = conn.send_nowait(&(forwarded as u32).to_be_bytes());
+            while conn
+                .with_data(|data| ParseResult::Consumed(data.len()))
+                .await
+                > 0
+            {}
+        }
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        TlsFileForwarder
+    }
+}
+
+/// `forward_to` with a TLS source writes the decrypted bytes to a file sink,
+/// in order, including bytes that arrive after the forward starts. On
+/// io_uring a plaintext accepted connection refuses `forward_to`, so a TLS
+/// connection is the only accepted source it serves.
+#[cfg(has_io_uring)]
+#[test]
+fn forward_to_a_file_from_a_tls_source() {
+    let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = std::env::temp_dir().join(format!("ringline-tls-file-fwd-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("sink.bin");
+    TLS_FILE_SINK_PATH.set(path.clone()).expect("set once");
+
+    let (certs, key) = generate_self_signed();
+    let config = test_config_builder()
+        .tls(TlsConfig::new(server_tls_config(certs.clone(), key)))
+        .build()
+        .expect("valid config");
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind("127.0.0.1:0".parse().unwrap())
+        .launch::<TlsFileForwarder>()
+        .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
+    wait_for_server(&addr);
+
+    let client_config = client_tls_config(&certs);
+    let server_name: ServerName<'_> = "localhost".try_into().unwrap();
+    let mut tls_conn = rustls::ClientConnection::new(client_config, server_name).unwrap();
+    let mut tcp = TcpStream::connect(&addr).unwrap();
+    tcp.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    tcp.set_write_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    let mut stream = rustls::Stream::new(&mut tls_conn, &mut tcp);
+
+    let size = 300_000;
+    let payload: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+    // The header alone first, so the forward starts before the body arrives.
+    stream.write_all(&(size as u32).to_be_bytes()).unwrap();
+    stream.flush().unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    for chunk in payload.chunks(16 * 1024) {
+        stream.write_all(chunk).unwrap();
+        stream.flush().unwrap();
+    }
+
+    let mut reply = [0u8; 4];
+    read_until_full_or_stalled(
+        &mut stream,
+        &mut reply,
+        Duration::from_secs(30),
+        "TLS-source file forward reply",
+    );
+    assert_eq!(u32::from_be_bytes(reply) as usize, size, "bytes forwarded");
+    let written = std::fs::read(&path).expect("read back the sink file");
+    assert!(written == payload, "the file differs from what was sent");
+
+    let _ = stream;
+    drop(tcp);
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -209,7 +209,10 @@ tokio. The mio arm is a `--features force-mio` build; `tokio-uring` needs
 ringline has no `run_direct_echo` or `forward_held`. `--echo-mode` is
 required with `--runtime ringline`: `copy` is a `with_data` + `send_nowait`
 loop and `forward` is `with_data` + `forward_recv_buf`; `direct` and
-`recv-forward` are refused.
+`recv-forward` are refused. From 0.7.0-alpha.5 an accepted plaintext
+connection receives into its accumulator and `forward_recv_buf` sends the
+accumulator under a guard, so a rerun of `--echo-mode forward` measures that
+path, not the one in the `uring-fwd` row.
 
 Client: `bench-client --clients <n> --msg-size <bytes> --threads 16 --warmup 5
 --duration 20`.

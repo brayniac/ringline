@@ -211,8 +211,9 @@ struct Args {
     /// - `copy`: `with_data` + `send_nowait`, which copies the received bytes
     ///   into a send.
     /// - `forward`: `with_data` + `forward_recv_buf` — the ordinary
-    ///   parse-then-forward loop a protocol server would write. It sends a
-    ///   lent receive buffer without copying it where the connection has one.
+    ///   parse-then-forward loop a protocol server would write. On io_uring
+    ///   it sends the accumulator under a guard (zero-copy at or above
+    ///   `send_zc_threshold`); on mio it copies.
     #[arg(long, value_enum)]
     echo_mode: Option<EchoMode>,
 
@@ -510,8 +511,7 @@ fn main() {
             recv_multishot: args.recv_multishot,
             iowq_max_workers: args.iowq_max_workers,
             echo_mode: args.echo_mode.unwrap_or_else(|| {
-                // The default was a different loop until it was removed;
-                // naming the mode keeps a spec from measuring another one.
+                // No default: a spec must name the loop it measures.
                 eprintln!("bench-server: --runtime ringline needs --echo-mode copy or forward");
                 std::process::exit(2);
             }),

@@ -76,7 +76,7 @@ Every operation already reads from or writes into memory ringline owns:
 |---|---|---|
 | Send-pool slots | `SendCopyPool` | copy sends, TLS records |
 | Slab entries (iovecs, guards) | `InFlightSendSlab` | coalesced and zero-copy sends |
-| Provided recv buffers | `ProvidedBufRing` | multishot recv, UDP recv, `forward_to`, `forward_recv_buf` |
+| Provided recv buffers | `ProvidedBufRing` | multishot recv, UDP recv, `forward_to` |
 | Fallback recv slots | `fallback_recv_pool` (a `SendCopyPool`) | one-shot recv |
 | Disk buffers | caller, held by the disk-I/O future | fs, direct I/O |
 

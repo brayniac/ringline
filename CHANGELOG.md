@@ -48,6 +48,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     and SET throughput was 6 to 13% higher. At 8,000 connections, GET p99 at
     depth 16 was higher (86 to 94 ms against 68 to 75 ms at 64 B) and
     resident memory was 0.3 to 0.6 GiB higher.
+  - These runs were taken on builds without the `POLLRDHUP` poll each
+    plaintext connection now arms; its cost is not measured. The server
+    runs also predate the single-`sendmsg` multi-slot send, which changes
+    both ringline arms alike.
   - See `docs/recv-direct-design.md`.
 - `direct_io_fsync` returns a future for an fsync of a direct I/O file. The
   fsync that `DriverCtx::direct_io_fsync` submits has no future, so a task
@@ -604,6 +608,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   connection (`enable_recv_forward` did nothing), and code that used them
   there no longer compiles. Echo or forward with `with_data` and `send_nowait` or
   `forward_recv_buf`, or with `forward_to_conn`.
+- **Breaking:** `metrics::park_abandon::DIRECT_ECHO` and the `direct_echo`
+  op of `ringline/park_abandoned`. `park_abandon::SLOT_RECYCLED` is now 12
+  and `INSTALL_FAILED` 13; the new `RECEIVE_ARMED` is 14 (`op=receive_armed`,
+  a park whose install found a receive, hangup poll or hangup peek armed).
 - **Breaking:** the client methods that read a value from provided-buffer
   segments, which a plaintext connection no longer has:
   ringline-redis `Client::get_stream` and `Pool::get_stream` (and
