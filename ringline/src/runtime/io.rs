@@ -4275,10 +4275,10 @@ impl SendHalf {
     /// On a plaintext connection, `finish` returns `WouldBlock` while a send on
     /// the connection is in flight or queued, or another chain is active, since
     /// a linked chain would overtake them; retry once they complete. On a TLS
-    /// connection the parts are not
-    /// linked SQEs: `finish` gathers them, guard parts included, encrypts them
-    /// as one send, and queues it behind the connection's other sends, so it
-    /// does not refuse while earlier sends are in flight.
+    /// connection the parts are not linked SQEs: `finish` gathers them, guard
+    /// parts included, encrypts them as one send, and queues it behind the
+    /// connection's other sends, so it does not refuse while earlier sends are
+    /// in flight.
     ///
     /// For fire-and-forget chained sending, use `send_chain_nowait()`.
     #[cfg(has_io_uring)]

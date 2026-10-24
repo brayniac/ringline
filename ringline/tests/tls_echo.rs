@@ -1448,8 +1448,9 @@ impl ringline::SendGuard for ChainGuard {
 #[cfg(has_io_uring)]
 const CHAIN_GUARD_LEN: usize = 8192;
 
-/// Large enough that the send before the chain is still in flight when the
-/// chain is submitted.
+/// The send before the chain spans several TLS records. It is in flight when
+/// the chain is submitted whatever its size: the handler submits both in one
+/// poll, and completions are processed only between polls.
 #[cfg(has_io_uring)]
 const CHAIN_BEFORE_LEN: usize = 100_000;
 

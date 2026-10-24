@@ -4546,10 +4546,10 @@ impl<'b, 'a> SendChainBuilder<'b, 'a> {
     /// Submit the chain.
     ///
     /// On a plaintext connection the SQEs are linked with IO_LINK except the
-    /// last; it returns `WouldBlock` while a send on the connection is in
-    /// flight or queued, or another chain is active. On a TLS connection the
-    /// parts are encrypted as one send and queued behind the connection's other
-    /// sends.
+    /// last. A chain with at least one part returns `WouldBlock` while a send
+    /// on the connection is in flight or queued, or another chain is active.
+    /// On a TLS connection the parts are encrypted as one send and queued
+    /// behind the connection's other sends.
     pub fn finish(mut self) -> io::Result<()> {
         if let Some(e) = self.error.take() {
             // finished stays false — Drop will call release_all().
