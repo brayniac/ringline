@@ -2169,8 +2169,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
         let retries = std::mem::take(&mut self.driver.recv_rearm_retries);
         for &(conn_index, generation) in &retries {
+            // A connection parked in `recv_starved` is armed by the starved
+            // pass; arming it here too would put two receives with one
+            // user_data in flight.
             let ready = self.driver.connections.generation(conn_index) == generation
                 && !self.driver.forward_hold_throttled[conn_index as usize]
+                && !self.driver.recv_starved.contains(conn_index)
                 && !self.driver.park_pending(conn_index)
                 && self.driver.connections.get(conn_index).is_some_and(|c| {
                     matches!(c.lifecycle, Lifecycle::Open)
@@ -14219,8 +14223,10 @@ mod tests {
         assert!(el.driver.recv_starved.contains(conn_index), "precondition");
 
         el.driver.segment_hold[ci].pop_front();
+        let before = el.driver.ring.sq_len();
         assert!(el.driver.settle_forward_end(conn_index));
         let after_settle = el.driver.ring.sq_len();
+        assert_eq!(after_settle, before + 1, "settle armed the receive");
         el.flush_replenish_and_rearm();
         assert_eq!(
             el.driver.ring.sq_len(),

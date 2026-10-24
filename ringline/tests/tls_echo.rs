@@ -1463,7 +1463,9 @@ fn tls_forward_to_stuck_sink(multishot: bool) {
         if now != last {
             (last, still_since) = (now, Instant::now());
         } else if still_since.elapsed() >= Duration::from_secs(1) {
-            break true;
+            // A writer that stopped on an error (the server closed the
+            // connection) also stops the count; only a blocked write is a stall.
+            break !writer.is_finished();
         }
     };
     let sent = sent.load(std::sync::atomic::Ordering::Relaxed);

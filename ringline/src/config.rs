@@ -1213,9 +1213,11 @@ impl ConfigBuilder {
     /// Larger values allow more recv in flight at the cost of more held
     /// copies under a slow consumer. On io_uring a TLS connection's entries
     /// are one record's plaintext each (at most 16 KiB), apart from the bytes
-    /// buffered when the hold was entered, so its hold is about this many ×
-    /// 16 KiB, plus what the receive that crosses the cap delivers and the
-    /// entries of the write in flight. Must be `>= 1`.
+    /// buffered when the hold was entered, so its hold is about the effective
+    /// cap × 16 KiB, plus what the receives completed before the throttle
+    /// takes effect deliver (one with one-shot receives; with multishot
+    /// receives, each completion posted before the cancel is submitted) and
+    /// the entries of the write in flight. Must be `>= 1`.
     ///
     /// Default: 64 (2× `MAX_IOVECS`).
     ///
