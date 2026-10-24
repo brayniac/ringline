@@ -4,9 +4,11 @@
 **Date:** 2026-07-19
 **Related:** `docs/recv-buffer-adaptive-design.md`, `docs/send-completion-design.md`, the 200 GbE 64 MB buffer-geometry sweep (project memory).
 
-`recv_hold`, `forward_held` and the Forward domain were removed in
-0.7.0-alpha.5. References to them below describe the code this design was
-written against.
+`recv_hold`, `forward_held`, `release_recv_forward` and the per-connection
+`recv_forward` flag (`enable_recv_forward`) were removed in 0.7.0-alpha.5.
+`RecvDomain::Forward` was dropped before this design's implementation merged
+(#286). References to them below describe the code this design was written
+against.
 
 ## Goal
 

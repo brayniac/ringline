@@ -298,13 +298,16 @@ defers the start) → cancel the direct receive, if one is in flight, and
 the hangup poll → wait until no receive, hangup poll or hangup peek is
 armed and the connection is still parkable (bytes that arrived during the
 cancel withdraw the offer, and the handler must offer again) → install the
-fd → when the install completes, check the predicate and the armed flags
-again, and abandon the park if either fails → take the leftover
-accumulator bytes and handler payload → close A's fixed-file slot without
-a shutdown → send `(OwnedFd, leftover bytes, ListenerId, PeerAddr, handler
-payload)`, all `Send`, over the park channel (`peer_park`) → B allocates a
-slot, registers the fd, seeds the accumulator, arms the hangup poll, and
-calls `on_adopt`; the new task's first parked read arms a receive.
+fd → when the install completes, abandon the park if the install failed,
+the slot now holds another connection (generation check), the gate
+(`park_blocker`) refuses, or a receive, hangup poll or hangup peek is
+armed; every abandon except the recycled slot gives the connection its
+receive or hangup poll back → take the leftover accumulator bytes and
+handler payload → close A's fixed-file slot without a shutdown → send
+`(OwnedFd, leftover bytes, ListenerId, PeerAddr, handler payload)`, all
+`Send`, over the park channel (`peer_park`) → B allocates a slot,
+registers the fd, seeds the accumulator, arms the hangup poll, and calls
+`on_adopt`; the new task's first parked read arms a receive.
 
 A TLS connection is not parked (`ParkBlocker::TlsSession`). Carrying its
 session would move the whole `UnbufferedConn` (or its buffered counterpart)

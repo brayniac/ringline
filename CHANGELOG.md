@@ -616,7 +616,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `with_data` and `send_nowait` or `forward_recv_buf`, or with
   `forward_to_conn`. A recv sink is replaced by copying out of `with_data`
   into the caller's buffer, which on mio is one copy more than the sink.
-  Every replacement for `run_direct_echo` wakes a task per receive.
+  On io_uring every replacement for `run_direct_echo` wakes a task per
+  receive.
 - **Breaking:** `metrics::park_abandon::DIRECT_ECHO` and the `direct_echo`
   op of `ringline/park_abandoned`.
 - **Breaking:** the client methods that read a value from provided-buffer
