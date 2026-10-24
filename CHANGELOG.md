@@ -254,12 +254,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   task that does not read stops its peer instead of buffering up to
   `recv_accumulator_max` (1 GiB by default). During the handshake, in the
   segmented domain (a `forward_to` source or a segment reader), and after
-  the peer closes, the receive is re-armed after each completion. A TLS
-  connection now arms the `POLLRDHUP` hangup poll, so a peer close is seen,
-  and `is_alive` returns `false`, while nothing reads. `forward_to_conn`
-  from a TLS source takes the bytes from the accumulator and sends them
-  through the sink's send queue, as from a plaintext source; before, it
-  wrote to the sink directly, unordered against other sends on the sink.
+  the peer closes, the receive is re-armed after each completion. A loop
+  that polls `try_with_data` without ever parking a read no longer sees new
+  bytes, as on a plaintext connection. A TLS connection now arms the
+  `POLLRDHUP` hangup poll, so a peer close is seen, and `is_alive` returns
+  `false`, while nothing reads. `forward_to_conn` from a TLS source takes
+  the bytes from the accumulator and sends them through the sink's send
+  queue, as from a plaintext source: ordered with other sends on the sink,
+  with one chunk buffered rather than up to `forward_hold_cap` entries, and
+  below `send_zc_threshold` copied into a pool slot. A zero-copy send of
+  such a forward to a sink that does not read holds worker exit for up to
+  its bound, as any guarded send does. A TLS source that a segment reader or
+  `forward_to` left in the segmented domain still forwards from its hold.
   `recv_multishot` no longer affects TLS connections, which were the only
   ones it affected, so it has no effect.
 - **Breaking:** `metrics::park_abandon::SLOT_RECYCLED` is 12 and

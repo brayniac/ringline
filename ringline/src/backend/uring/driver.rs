@@ -240,9 +240,10 @@ impl Driver {
     }
 
     /// Arm `conn_index`'s hangup poll (`OpTag::HangupPoll`) once it is
-    /// open. A direct connection arms a receive only when a read parks, so
-    /// without the poll a peer FIN or reset is not seen until a receive
-    /// completes, and while no read is parked none may be in flight. If the
+    /// open, on a direct or a TLS connection. Both arm a receive only when a
+    /// read parks (a TLS connection once its handshake is done), so without
+    /// the poll a peer FIN or reset is not seen until a receive completes, and
+    /// while no read is parked none may be in flight. If the
     /// SQE cannot be pushed, the failure is counted in
     /// `ring::RECV_ARM_FAILURES` and the connection goes on
     /// `hangup_poll_retries`, so `retry_hangup_polls` submits the poll again.
@@ -279,8 +280,9 @@ impl Driver {
     /// it back: the connection is open and still reading, no throttle,
     /// fallback receive, ENOBUFS parking or park is pending. Once its
     /// handshake is done, a TLS connection's receive is armed this way by a
-    /// parked read (`park_recv`), by entering the segmented domain, and by
-    /// its hangup poll, not after every completion. A failed push goes to
+    /// parked read (`park_recv`), by a segment reader or Mode A forward
+    /// entering the segmented domain or waiting on its hold, and by its hangup
+    /// poll, not after every completion. A failed push goes to
     /// `recv_rearm_retries`.
     pub(crate) fn arm_tls_recv_if_idle(&mut self, conn_index: u32) {
         let ci = conn_index as usize;
@@ -345,8 +347,9 @@ impl Driver {
         true
     }
 
-    /// Arm a TCP recv on `conn_index`: one-shot unless
-    /// `Config::recv_multishot` is set, multishot otherwise. Both carry the `RecvMulti` user_data.
+    /// Arm a TCP ring recv on `conn_index`, carrying the `RecvMulti`
+    /// user_data: one-shot for a TLS connection; for any other ring
+    /// connection, multishot when `Config::recv_multishot` is set.
     pub(crate) fn submit_tcp_recv(&mut self, conn_index: u32, generation: u32) -> io::Result<()> {
         // A direct connection never takes a provided buffer; its receive is
         // armed by the parked receive future (`arm_direct_recv_or_close`).

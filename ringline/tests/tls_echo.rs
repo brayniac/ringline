@@ -1400,7 +1400,7 @@ fn tls_flood_after_ack(addr: &str, certs: &[CertificateDer<'static>], limit: u64
     (sent, stalled)
 }
 
-// ── A TLS forward source stops at the hold cap ─────────────────────────
+// ── TLS forward sources whose sink does not read ───────────────────────
 
 /// Forwards everything the TLS client sends to a sink that never reads.
 struct TlsForwardToStuckSink;
@@ -1443,19 +1443,18 @@ impl AsyncEventHandler for TlsForwardToStuckSink {
     }
 }
 
-/// A TLS `forward_to_conn` source whose sink does not read stops receiving
-/// once its hold reaches the cap, so its peer's writes stall. Without the
-/// throttle the source reads until its hold reaches `recv_accumulator_max`
-/// (1 GiB by default).
+/// A TLS `forward_to_conn` source whose sink does not read stops receiving:
+/// the direct forward has one send in flight and arms the next receive only
+/// when the accumulator is empty, so its peer's writes stall.
 #[test]
-fn a_tls_forward_source_with_a_stuck_sink_is_throttled() {
+fn a_tls_forward_to_conn_source_with_a_stuck_sink_stops_its_peer() {
     let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
     tls_forward_to_stuck_sink(false);
     // `recv_multishot` has no effect on a TLS connection's receive.
     tls_forward_to_stuck_sink(true);
 }
 
-/// One run of `a_tls_forward_source_with_a_stuck_sink_is_throttled`, with
+/// One run of `a_tls_forward_to_conn_source_with_a_stuck_sink_stops_its_peer`, with
 /// one-shot or multishot ring receives.
 fn tls_forward_to_stuck_sink(multishot: bool) {
     const LIMIT: u64 = 64 << 20;
@@ -1491,7 +1490,90 @@ fn tls_forward_to_stuck_sink(multishot: bool) {
     }
     assert!(
         stalled && sent > 0 && sent < LIMIT,
-        "multishot {multishot}: the TLS forward source accepted {sent} bytes without stalling"
+        "multishot {multishot}: the TLS forward_to_conn source accepted {sent} bytes without stalling"
+    );
+}
+
+/// Forwards everything the TLS client sends to a socket that never reads,
+/// with `forward_to` (Mode A: the source's plaintext is held in its segment
+/// hold).
+#[cfg(has_io_uring)]
+struct TlsForwardToStuckSocket;
+
+#[cfg(has_io_uring)]
+static TLS_STUCK_SOCKET: Mutex<Option<SocketAddr>> = Mutex::new(None);
+
+#[cfg(has_io_uring)]
+impl AsyncEventHandler for TlsForwardToStuckSocket {
+    #[allow(clippy::manual_async_fn)]
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
+        async move {
+            use std::os::fd::AsFd;
+            let addr = TLS_STUCK_SOCKET.lock().unwrap().expect("sink addr not set");
+            let Ok(sink_socket) = std::net::TcpStream::connect(addr) else {
+                return;
+            };
+            let n = conn
+                .with_data(|d| {
+                    if d.is_empty() {
+                        ParseResult::NeedMore
+                    } else {
+                        ParseResult::Consumed(1)
+                    }
+                })
+                .await;
+            if n == 0 {
+                return;
+            }
+            let sink = ringline::SinkFd::socket(sink_socket.as_fd());
+            // The ack is submitted after this poll returns, by which time the
+            // forward below is armed.
+            let _ = conn.send_nowait(b"a");
+            let _ = conn.forward_to(&sink, 1 << 30).await;
+        }
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        TlsForwardToStuckSocket
+    }
+}
+
+/// A TLS `forward_to` source whose socket sink does not read stops
+/// receiving once its segment hold reaches the hold cap, so its peer's writes
+/// stall instead of the hold growing to `recv_accumulator_max`.
+#[cfg(has_io_uring)]
+#[test]
+fn a_tls_forward_to_source_with_a_stuck_socket_is_throttled() {
+    let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
+    const LIMIT: u64 = 64 << 20;
+    let sink = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    *TLS_STUCK_SOCKET.lock().unwrap() = Some(sink.local_addr().unwrap());
+    let held = std::thread::spawn(move || sink.accept().map(|(s, _)| s));
+
+    let (certs, key) = generate_self_signed();
+    let config = test_config_builder()
+        .tls(TlsConfig::new(server_tls_config(certs.clone(), key)))
+        .forward_hold_cap(8)
+        .build()
+        .expect("valid config");
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind("127.0.0.1:0".parse().unwrap())
+        .launch::<TlsForwardToStuckSocket>()
+        .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
+    wait_for_server(&addr);
+
+    let (sent, stalled) = tls_flood_after_ack(&addr, &certs, LIMIT);
+    eprintln!("TLS forward_to: sent {sent} bytes, stalled {stalled}");
+
+    drop(held.join());
+    shutdown.shutdown();
+    for h in handles {
+        h.join().expect("worker panicked").expect("worker failed");
+    }
+    assert!(
+        stalled && sent > 0 && sent < LIMIT,
+        "the TLS forward_to source accepted {sent} bytes without stalling"
     );
 }
 
@@ -2025,4 +2107,185 @@ fn forward_to_a_file_from_a_tls_source() {
         h.join().unwrap().unwrap();
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── Segment reads and forwards on a TLS connection after the handshake ──
+
+/// Acks, then reads with `with_segments`.
+#[cfg(has_io_uring)]
+struct TlsWithSegmentsReader;
+#[cfg(has_io_uring)]
+static TLS_WITH_SEGMENTS_READ: Mutex<Option<usize>> = Mutex::new(None);
+
+#[cfg(has_io_uring)]
+impl AsyncEventHandler for TlsWithSegmentsReader {
+    #[allow(clippy::manual_async_fn)]
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
+        async move {
+            let _ = conn.send_nowait(b"a");
+            let r = conn
+                .with_segments(|chain| ringline::SegConsumed(chain.total_len()))
+                .await;
+            if let Ok(n) = r {
+                *TLS_WITH_SEGMENTS_READ.lock().unwrap() = Some(n);
+                let _ = conn.send_nowait(b"b");
+            }
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        TlsWithSegmentsReader
+    }
+}
+
+/// A `with_segments` read that waits after the handshake arms the TLS
+/// connection's receive: the bytes the client sends later reach it.
+#[cfg(has_io_uring)]
+#[test]
+fn with_segments_on_a_tls_connection_after_the_handshake() {
+    let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
+    let (certs, key) = generate_self_signed();
+    let config = test_config_builder()
+        .tls(TlsConfig::new(server_tls_config(certs.clone(), key)))
+        .build()
+        .expect("valid config");
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind("127.0.0.1:0".parse().unwrap())
+        .launch::<TlsWithSegmentsReader>()
+        .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
+    wait_for_server(&addr);
+    let server_name: ServerName<'_> = "localhost".try_into().unwrap();
+    let mut tls_conn =
+        rustls::ClientConnection::new(client_tls_config(&certs), server_name).unwrap();
+    let mut tcp = TcpStream::connect(&addr).unwrap();
+    tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut stream = rustls::Stream::new(&mut tls_conn, &mut tcp);
+    let mut b = [0u8; 1];
+    stream.read_exact(&mut b).expect("ack");
+    std::thread::sleep(Duration::from_millis(300));
+    stream.write_all(b"hello").unwrap();
+    stream.flush().unwrap();
+    let r = stream.read_exact(&mut b);
+    let got = *TLS_WITH_SEGMENTS_READ.lock().unwrap();
+    let _ = stream;
+    drop(tcp);
+    shutdown.shutdown();
+    for h in handles {
+        let _ = h.join();
+    }
+    assert!(
+        r.is_ok() && got == Some(5),
+        "with_segments never resolved: {r:?} {got:?}"
+    );
+}
+
+/// Reads a length header with `with_bytes_segments`, then forwards the body
+/// to a backend with `forward_to_conn`.
+#[cfg(has_io_uring)]
+struct TlsSegmentsThenForward;
+#[cfg(has_io_uring)]
+static TLS_SEG_FORWARD_BACKEND: OnceLock<SocketAddr> = OnceLock::new();
+#[cfg(has_io_uring)]
+static TLS_SEG_FORWARD_RESULT: Mutex<Option<String>> = Mutex::new(None);
+
+#[cfg(has_io_uring)]
+impl AsyncEventHandler for TlsSegmentsThenForward {
+    #[allow(clippy::manual_async_fn)]
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
+        async move {
+            let backend = match ringline::connect(*TLS_SEG_FORWARD_BACKEND.get().unwrap()).await {
+                Ok(b) => b,
+                Err(_) => return,
+            };
+            let (mut btx, _brx) = backend.split();
+            let mut hdr = [0u8; 4];
+            let r = conn
+                .with_bytes_segments(|pieces| {
+                    let mut v = Vec::new();
+                    for p in pieces {
+                        v.extend_from_slice(p);
+                    }
+                    if v.len() < 4 {
+                        return ParseResult::NeedMore;
+                    }
+                    hdr.copy_from_slice(&v[..4]);
+                    ParseResult::Consumed(4)
+                })
+                .await;
+            if r.is_err() {
+                *TLS_SEG_FORWARD_RESULT.lock().unwrap() = Some(format!("hdr {r:?}"));
+                return;
+            }
+            let len = u32::from_be_bytes(hdr) as usize;
+            let f = conn.forward_to_conn(&mut btx, len).await;
+            *TLS_SEG_FORWARD_RESULT.lock().unwrap() = Some(format!("forward {f:?} of {len}"));
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        TlsSegmentsThenForward
+    }
+}
+
+/// A `forward_to_conn` from a TLS source that a segment reader left in the
+/// segmented domain forwards from the hold (Mode A), not from the empty
+/// accumulator.
+#[cfg(has_io_uring)]
+#[test]
+fn forward_to_conn_after_bytes_segments_on_a_tls_source() {
+    let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    TLS_SEG_FORWARD_BACKEND
+        .set(listener.local_addr().unwrap())
+        .unwrap();
+    const LEN: usize = 20_000;
+    let backend = std::thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut got = Vec::new();
+        let mut buf = [0u8; 65536];
+        while got.len() < LEN {
+            match s.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => got.extend_from_slice(&buf[..n]),
+            }
+        }
+        got
+    });
+    let (certs, key) = generate_self_signed();
+    let config = test_config_builder()
+        .tls(TlsConfig::new(server_tls_config(certs.clone(), key)))
+        .build()
+        .expect("valid config");
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind("127.0.0.1:0".parse().unwrap())
+        .launch::<TlsSegmentsThenForward>()
+        .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
+    wait_for_server(&addr);
+    let server_name: ServerName<'_> = "localhost".try_into().unwrap();
+    let mut tls_conn =
+        rustls::ClientConnection::new(client_tls_config(&certs), server_name).unwrap();
+    let mut tcp = TcpStream::connect(&addr).unwrap();
+    let mut stream = rustls::Stream::new(&mut tls_conn, &mut tcp);
+    stream.write_all(&(LEN as u32).to_be_bytes()).unwrap();
+    stream.flush().unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    let payload: Vec<u8> = (0..LEN).map(|i| (i * 7) as u8).collect();
+    for c in payload.chunks(4096) {
+        stream.write_all(c).unwrap();
+        stream.flush().unwrap();
+    }
+    let got = backend.join().unwrap();
+    let res = TLS_SEG_FORWARD_RESULT.lock().unwrap().clone();
+    let _ = stream;
+    drop(tcp);
+    shutdown.shutdown();
+    for h in handles {
+        let _ = h.join();
+    }
+    assert!(
+        got == payload,
+        "backend got {} of {LEN} bytes; handler: {res:?}",
+        got.len()
+    );
 }

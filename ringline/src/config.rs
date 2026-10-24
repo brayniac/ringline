@@ -1036,13 +1036,10 @@ impl ConfigBuilder {
         self
     }
 
-    /// Arm multishot receives on the TCP provided-buffer ring instead of
-    /// one-shot ones.
-    ///
-    /// Has no effect on any TCP connection: a plaintext connection receives
-    /// directly into its accumulator (see [`connect`](crate::connect)), and a
-    /// TLS connection's ring receive is one-shot, armed when a read parks,
-    /// so a task that does not read stops its peer.
+    /// Has no effect on TCP connections. On io_uring a plaintext connection
+    /// receives directly into its accumulator (see [`connect`](crate::connect)),
+    /// and a TLS connection's ring receive is one-shot, armed when a read
+    /// parks, so a task that does not read stops its peer.
     ///
     /// io_uring only; the mio backend reads on readiness.
     /// **Default: false**.

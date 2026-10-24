@@ -639,11 +639,11 @@ impl<T: 'static> Future for BlockingJoinHandle<T> {
 /// (after queued sends drain) fail with `NotConnected`.
 ///
 /// A TLS connection receives ciphertext through the worker's provided-buffer
-/// ring: during the handshake a receive is re-armed after each completion;
-/// after it, a receive is armed when a read parks, as on a plaintext
-/// connection, and the same `POLLRDHUP` poll arms one when the peer closes
-/// while nothing reads, so rustls sees the close_notify or the FIN. On mio
-/// every connection reads into its accumulator.
+/// ring. During the handshake a receive is re-armed after each completion.
+/// After it, a receive is armed when a read parks, as on a plaintext
+/// connection. The same `POLLRDHUP` poll arms one when the peer closes while
+/// nothing reads, so rustls sees the close_notify or the FIN. On mio every
+/// connection reads into its accumulator.
 ///
 /// # Concurrency
 ///
@@ -1337,10 +1337,11 @@ impl ConnCtx {
     /// connection is an explicit queue drained by the owning task.
     ///
     /// It is also what lets a forward refuse a sink somebody else is already
-    /// writing to. A forward submits its own SQE straight to the ring instead
-    /// of going through the per-connection send queue, so a concurrent send to
-    /// that socket interleaves with it — and io_uring does not order
-    /// independent SQEs (Domain Invariant 2).
+    /// writing to. A forward from a TLS source in the segmented domain (after a
+    /// segment reader or a `forward_to`) submits its own SQE straight to the
+    /// ring instead of going through the per-connection send queue, so a
+    /// concurrent send to that socket interleaves with it — and io_uring does
+    /// not order independent SQEs (Domain Invariant 2).
     ///
     /// # Errors
     ///
@@ -1786,6 +1787,14 @@ impl ConnCtx {
             if driver.forward_progress[idx].is_some() {
                 return Err(libc::EBUSY);
             }
+            // A direct forward from this connection is running.
+            if driver
+                .connections
+                .get(self.conn_index)
+                .is_some_and(|c| c.direct_forwarding)
+            {
+                return Err(libc::EBUSY);
+            }
             // A direct connection's bytes go to its accumulator, not to a
             // hold a forward could send from.
             if is_recv_direct(driver, self.conn_index) {
@@ -2175,7 +2184,10 @@ impl ConnCtx {
     ///
     /// On io_uring the forward takes the bytes the source's accumulator holds
     /// and sends them through the sink's send queue; see "The source" below.
-    /// A result `< len` means the peer sent FIN first.
+    /// A TLS source that a segment reader or a `forward_to` left in the
+    /// segmented domain forwards as `forward_to` does instead, from its segment
+    /// hold, writing to the sink directly: do not send on the sink while that
+    /// forward runs. A result `< len` means the peer sent FIN first.
     ///
     /// # Thread affinity
     ///
@@ -2260,11 +2272,17 @@ impl ConnCtx {
     ) -> Option<ForwardToFuture<'a>> {
         let refusal = with_state(|driver, _| {
             // A TLS source's plaintext lands in its accumulator too, so it
-            // forwards the same way.
+            // forwards the same way, unless it is in the segmented domain (a
+            // segment reader or a Mode A forward put it there), where its
+            // plaintext goes to the hold: Mode A forwards it from there.
+            let idx = self.conn_index as usize;
             let tls_source = driver
                 .tls_table
                 .as_ref()
-                .is_some_and(|t| t.has(self.conn_index));
+                .is_some_and(|t| t.has(self.conn_index))
+                && driver.recv_domain[idx] != crate::recv::domain::RecvDomain::Segmented
+                && driver.forward_progress[idx].is_none()
+                && !driver.segment_reader_live[idx];
             if driver.connections.generation(self.conn_index) != self.generation
                 || !(is_recv_direct(driver, self.conn_index) || tls_source)
             {
@@ -2681,9 +2699,12 @@ impl ConnCtx {
     /// A FIN or reset from the peer closes the connection whether or not a
     /// read is parked, so this returns `false` once the runtime has seen it.
     /// On io_uring the runtime detects it on every plaintext or TLS
-    /// connection with a `POLLRDHUP` poll. When bytes the
-    /// peer sent before it are queued or buffered, the connection stays open,
-    /// and this returns `true`, until they have been read (see [`connect`]).
+    /// connection with a `POLLRDHUP` poll. On a plaintext connection, when
+    /// bytes the peer sent before it are queued or buffered, the connection
+    /// stays open, and this returns `true`, until they have been read (see
+    /// [`connect`]). On a TLS connection the close takes effect when the
+    /// receive reads the close_notify or the FIN; plaintext already decrypted
+    /// stays readable.
     pub fn is_alive(&self) -> bool {
         // `try_with_state`, not `with_state`: this is reachable from a `Drop`
         // that runs outside a task poll. A connection-bound task is dropped by
@@ -3061,6 +3082,16 @@ pub(crate) fn park_recv(
         }
         driver.arm_tls_recv_if_idle(conn_index);
     }
+}
+
+/// Register the current task as `conn_index`'s receive waiter for a segment
+/// reader or a Mode A forward, which wait on the segment hold rather than
+/// through [`park_recv`], and arm a TLS connection's receive if none is armed.
+#[cfg(has_io_uring)]
+fn park_segment_waiter(driver: &mut Driver, executor: &mut Executor, conn_index: u32) {
+    executor.owner_task[conn_index as usize] = Some(CURRENT_TASK_ID.with(|c| c.get()));
+    executor.recv_waiters[conn_index as usize] = true;
+    driver.arm_tls_recv_if_idle(conn_index);
 }
 
 /// Future returned by [`Connection::with_data`].
@@ -3621,14 +3652,14 @@ impl RecvHalf {
     /// Forward the next `len` received bytes into another connection.
     ///
     /// The sink is its [`SendHalf`], borrowed mutably for as long as the
-    /// forward runs. That borrow is the point: from a source that receives
-    /// through the provided-buffer ring, a forward submits its own SQE straight
-    /// to the ring rather than through the sink's send queue, so a concurrent
-    /// `send` to the same socket would interleave with it — and io_uring does
-    /// not order independent SQEs (Domain Invariant 2). Holding the half is
-    /// both the permission to write and the proof that nobody else is. A
-    /// direct source sends through the sink's queue; see
-    /// [`ConnCtx::forward_to_conn`].
+    /// forward runs. That borrow is the point: from a TLS source in the
+    /// segmented domain (after a segment reader or a `forward_to`), a forward
+    /// submits its own SQE straight to the ring rather than through the sink's
+    /// send queue, so a concurrent `send` to the same socket would interleave
+    /// with it — and io_uring does not order independent SQEs (Domain
+    /// Invariant 2). Holding the half is both the permission to write and the
+    /// proof that nobody else is. Every other forward sends through the sink's
+    /// queue; see [`ConnCtx::forward_to_conn`].
     #[cfg(has_io_uring)]
     pub fn forward_to_conn<'h, 's: 'h>(
         &'h mut self,
@@ -3659,19 +3690,19 @@ impl RecvHalf {
     /// Forward the next `len` received bytes into another connection.
     ///
     /// The sink is its [`SendHalf`], borrowed mutably for as long as the
-    /// forward runs. That borrow is the point: from a source that receives
-    /// through the provided-buffer ring, a forward submits its own SQE straight
-    /// to the ring rather than through the sink's send queue, so a concurrent
-    /// `send` to the same socket would interleave with it — and io_uring does
-    /// not order independent SQEs (Domain Invariant 2). Holding the half is
-    /// both the permission to write and the proof that nobody else is. A
-    /// direct source sends through the sink's queue; see
-    /// [`ConnCtx::forward_to_conn`].
+    /// forward runs. That borrow is the point: from a TLS source in the
+    /// segmented domain (after a segment reader or a `forward_to`), a forward
+    /// submits its own SQE straight to the ring rather than through the sink's
+    /// send queue, so a concurrent `send` to the same socket would interleave
+    /// with it — and io_uring does not order independent SQEs (Domain
+    /// Invariant 2). Holding the half is both the permission to write and the
+    /// proof that nobody else is. Every other forward sends through the sink's
+    /// queue; see [`ConnCtx::forward_to_conn`].
     ///
     /// The two backends return different futures (io_uring forwards from the
-    /// held provided buffers or, for a direct source, from the accumulator;
-    /// mio pumps through the accumulator), so this is
-    /// two signatures rather than one.
+    /// accumulator, or from the segment hold for a TLS source in the
+    /// segmented domain; mio pumps through the accumulator), so this is two
+    /// signatures rather than one.
     #[cfg(not(has_io_uring))]
     pub fn forward_to_conn<'h, 's: 'h>(
         &'h mut self,
@@ -4107,8 +4138,9 @@ impl Connection {
 /// are independent.
 ///
 /// Note the write side has an exclusivity rule of its own that is **not yet
-/// enforced** — a connection that is the sink of a `forward_to_conn` must not
-/// be sent to concurrently. See `docs/connection-handle-ownership-design.md`.
+/// enforced** — a connection that is the sink of a `forward_to_conn` from a
+/// TLS source in the segmented domain must not be sent to concurrently. See
+/// `docs/connection-handle-ownership-design.md`.
 ///
 /// Available on both backends.
 pub struct SendHalf {
@@ -4620,8 +4652,7 @@ impl<'a> Future for SegmentNext<'a> {
 
             // Open and nothing held yet — park as a recv waiter. `handle_recv_multi`
             // pushes into `segment_hold` and calls `wake_recv` on the next arrival.
-            executor.owner_task[idx] = Some(CURRENT_TASK_ID.with(|c| c.get()));
-            executor.recv_waiters[idx] = true;
+            park_segment_waiter(driver, executor, idx as u32);
             Poll::Pending
         })
     }
@@ -4890,8 +4921,7 @@ impl Future for RecvOwnedSegment {
 
             // Open and nothing held yet — park as a recv waiter, resumed by
             // `handle_recv_multi`'s `wake_recv` on the next arrival.
-            executor.owner_task[idx] = Some(CURRENT_TASK_ID.with(|c| c.get()));
-            executor.recv_waiters[idx] = true;
+            park_segment_waiter(driver, executor, idx as u32);
             Poll::Pending
         })
     }
@@ -5008,8 +5038,7 @@ impl Future for ForwardToConnFuture<'_> {
                 let forwarded = driver.forward_conn[idx].take().map_or(0, |st| st.forwarded);
                 return Poll::Ready(Ok(forwarded as usize));
             }
-            executor.owner_task[idx] = Some(CURRENT_TASK_ID.with(|c| c.get()));
-            executor.recv_waiters[idx] = true;
+            park_segment_waiter(driver, executor, idx as u32);
             Poll::Pending
         })
     }
@@ -5147,10 +5176,12 @@ impl DirectForward {
                         let chunk = chunk.clone();
                         self.forwarded += chunk.len() as u64;
                         self.in_flight = None;
-                        // The next receive reuses the chunk's allocation if
-                        // the guard has released it by then.
+                        // The next direct receive reuses the chunk's
+                        // allocation if the guard has released it by then.
                         with_state(|driver, _| {
-                            if driver.connections.generation(source) == generation {
+                            if driver.connections.generation(source) == generation
+                                && is_recv_direct(driver, source)
+                            {
                                 driver.accumulators.keep_spent(source, chunk);
                             }
                         });
@@ -5333,8 +5364,7 @@ impl Future for ForwardToFuture<'_> {
                 return Poll::Ready(res.map(|n| n as usize));
             }
 
-            executor.owner_task[idx] = Some(CURRENT_TASK_ID.with(|c| c.get()));
-            executor.recv_waiters[idx] = true;
+            park_segment_waiter(driver, executor, idx as u32);
             Poll::Pending
         })
     }
@@ -5484,8 +5514,7 @@ impl<F: FnMut(&SegChain<'_>) -> SegConsumed + Unpin> WithSegmentsFuture<F> {
             }
             // Open + nothing buffered → park; `handle_recv_multi` holds a
             // buffer and calls `wake_recv` on the next arrival.
-            executor.owner_task[idx] = Some(CURRENT_TASK_ID.with(|c| c.get()));
-            executor.recv_waiters[idx] = true;
+            park_segment_waiter(driver, executor, idx as u32);
             return Poll::Pending;
         }
 
@@ -5633,8 +5662,7 @@ impl<F: FnMut(&SegChain<'_>) -> SegConsumed + Unpin> WithSegmentsFuture<F> {
             self.f.take();
             return Poll::Ready(Ok(0));
         }
-        executor.owner_task[idx] = Some(CURRENT_TASK_ID.with(|c| c.get()));
-        executor.recv_waiters[idx] = true;
+        park_segment_waiter(driver, executor, idx as u32);
         Poll::Pending
     }
 }
@@ -5782,15 +5810,14 @@ impl<F: FnMut(&[Bytes]) -> ParseResult + Unpin> WithBytesSegmentsFuture<F> {
 
     /// Record the connection's state for the next poll's checks and wait
     /// for the next receive.
-    fn park(&mut self, driver: &Driver, executor: &mut Executor) -> Poll<io::Result<usize>> {
+    fn park(&mut self, driver: &mut Driver, executor: &mut Executor) -> Poll<io::Result<usize>> {
         let idx = self.conn_index as usize;
         #[cfg(has_io_uring)]
         {
             self.epoch = driver.segment_epoch[idx];
         }
         self.consumed = driver.recv_consumed(self.conn_index);
-        executor.owner_task[idx] = Some(CURRENT_TASK_ID.with(|c| c.get()));
-        executor.recv_waiters[idx] = true;
+        park_segment_waiter(driver, executor, idx as u32);
         Poll::Pending
     }
 

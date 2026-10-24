@@ -1417,9 +1417,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.driver.close_connection(conn_index);
     }
 
-    /// Completion of a direct connection's hangup poll
+    /// Completion of a direct or TLS connection's hangup poll
     /// (`OpTag::HangupPoll`): the peer sent a FIN or a reset, or the socket
-    /// has an error. With a receive in flight, that receive sees it, and the
+    /// has an error. On a TLS connection it sets `hangup_seen` and arms a
+    /// ring receive, which is then re-armed after each completion until the
+    /// end is read. On a direct connection: with a receive in flight, that
+    /// receive sees it, and the
     /// connection goes on `hangup_rechecks` in case the receive returns bytes
     /// queued ahead of the end. With none, the hangup peek finds out whether
     /// bytes are queued ahead of it.

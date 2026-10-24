@@ -352,9 +352,9 @@ struct Args {
     #[arg(long, default_value_t = false)]
     prefault_buffers: bool,
 
-    /// (ringline) Arm multishot TCP receives instead of the default one-shot
-    /// receives (`ConfigBuilder::recv_multishot`). The checked-in
-    /// `BENCHMARKS.md` baseline predates the one-shot default.
+    /// (ringline) Sets `ConfigBuilder::recv_multishot`, which has no effect on
+    /// TCP connections: plaintext receives directly and TLS receives are
+    /// one-shot. The checked-in `BENCHMARKS.md` baseline predates both.
     #[arg(long, default_value_t = false)]
     recv_multishot: bool,
 

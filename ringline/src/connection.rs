@@ -34,8 +34,7 @@ pub enum RecvArm {
     /// the recv ended and has not been re-armed.
     Idle,
     /// Recv with the provided buffer ring (io_uring) / readable interest
-    /// (mio). On io_uring each arm is one-shot by default and multishot with
-    /// `recv_multishot(true)`.
+    /// (mio). On io_uring each arm of a TLS connection is one-shot.
     Multi,
 }
 
