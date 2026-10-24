@@ -880,10 +880,8 @@ fn tls_segmented_recv_reassembles_and_eofs() {
 // ── Test 5: Server-initiated clean TLS close ────────────────────────────
 
 /// Echo one message, then close the connection from the server side.
-#[cfg(not(has_io_uring))]
 struct TlsCloseHandler;
 
-#[cfg(not(has_io_uring))]
 impl AsyncEventHandler for TlsCloseHandler {
     #[allow(clippy::manual_async_fn)]
     fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
@@ -913,20 +911,42 @@ impl AsyncEventHandler for TlsCloseHandler {
 /// The assertion is `peer_has_closed()`, not "the read returned 0": a server
 /// that sends only a FIN also ends the client's reads, and rustls reports that
 /// as `UnexpectedEof` instead.
-///
-/// **mio only, and not because the contract is mio's.** `ConnCtx::close()`
-/// calls `Driver::close_connection`, and only the mio one reaches a TLS close
-/// path (`finish_close` → `flush_tls_output_mio_direct`). The io_uring
-/// `close_connection` just marks `close_pending`; the close_notify queueing
-/// lives in `DriverCtx::close(ConnToken)` instead, which `ConnCtx::close()`
-/// does not go through — so an io_uring server closing from inside its handler
-/// sends a bare FIN today. That gap predates the unbuffered engine (this test
-/// fails against the *buffered* engine on io_uring too) and fixing it is not
-/// this change's business; the gate is here so the guard on the path that does
-/// work is not lost.
-#[cfg(not(has_io_uring))]
 #[test]
 fn tls_server_close_sends_close_notify() {
+    server_close_sends_close_notify::<TlsCloseHandler>();
+}
+
+/// Echo one message, then return without closing: the runtime closes the
+/// connection when its task finishes.
+struct TlsReturnHandler;
+
+impl AsyncEventHandler for TlsReturnHandler {
+    #[allow(clippy::manual_async_fn)]
+    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
+        async move {
+            let (mut tx, mut rx) = conn.split();
+            rx.with_data(|data| {
+                let _ = tx.send_nowait(data);
+                ParseResult::Consumed(data.len())
+            })
+            .await;
+        }
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        TlsReturnHandler
+    }
+}
+
+/// A handler that returns closes its connection with a close_notify too.
+#[test]
+fn tls_handler_return_sends_close_notify() {
+    server_close_sends_close_notify::<TlsReturnHandler>();
+}
+
+/// Echo one message through a server running `H`, then check that the
+/// server's close carried a close_notify.
+fn server_close_sends_close_notify<H: AsyncEventHandler>() {
     let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
 
     let (certs, key) = generate_self_signed();
@@ -938,7 +958,7 @@ fn tls_server_close_sends_close_notify() {
         .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)
         .bind("127.0.0.1:0".parse().unwrap())
-        .launch::<TlsCloseHandler>()
+        .launch::<H>()
         .expect("launch failed");
     let addr = shutdown.bound_addr().expect("bound address").to_string();
 

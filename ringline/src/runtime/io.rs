@@ -2652,6 +2652,9 @@ impl ConnCtx {
         if driver.connections.generation(self.conn_index) != self.generation {
             return;
         }
+        #[cfg(has_io_uring)]
+        driver.close_connection_graceful(self.conn_index);
+        #[cfg(not(has_io_uring))]
         driver.close_connection(self.conn_index);
     }
 
