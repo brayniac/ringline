@@ -4,6 +4,12 @@
 **Date:** 2026-07-19
 **Related:** `docs/recv-buffer-adaptive-design.md`, `docs/send-completion-design.md`, the 200 GbE 64 MB buffer-geometry sweep (project memory).
 
+`recv_hold`, `forward_held`, `release_recv_forward` and the per-connection
+`recv_forward` flag (`enable_recv_forward`) were removed in 0.7.0-alpha.5.
+`RecvDomain::Forward` was dropped before this design's implementation merged
+(#286). References to them below describe the code this design was written
+against.
+
 ## Goal
 
 Deliver received bytes to a consumer as a **stream of discontiguous, buffer-sized
@@ -296,10 +302,12 @@ nothing. The mechanism is **aggregate**, built on the occupancy counter:
   bounds monopolization; past it, that connection's deliveries go Mode C. It is
   anti-monopoly, not the depletion guard.
 - **Hold-cap throttle** (above) stops one slow consumer from pinning the ring:
-  a `forward_to` source, a segment reader, a recv-forward or direct-echo
-  connection, at `forward_hold_cap` held entries, lowered to a quarter of the
-  ring's buffers for recv-forward and direct echo and for segment holds
-  without `recv_incremental`.
+  a `forward_to` source or a segment reader, at `forward_hold_cap` held
+  entries, lowered to a quarter of the ring's buffers without
+  `recv_incremental`. The lent buffers a connection's `forward_recv_buf`
+  sends hold are capped at a quarter of the ring's buffers; no TCP
+  connection lends one on io_uring since every plaintext connection a task
+  can read from receives directly, and TLS ones copy.
 - **Per-class-aware class selection & re-arm.** `arm_multishot_recv` must pick
   the smallest class ≥ target **with free buffers**, falling back to a deeper
   smaller non-empty class rather than arming against a drained ring. The re-arm

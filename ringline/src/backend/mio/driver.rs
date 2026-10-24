@@ -204,9 +204,8 @@ pub(crate) struct Driver {
     /// `try_finalize_close` defers the same way for sends already queued at
     /// the FIN; see #371 for the post-EOF send it does not yet cover). Deferring the release also
     /// (a) lets `Executor::remove_connection` run first (stale parked
-    /// futures, waiter flags, and recv sinks used to survive into the
-    /// slot's next occupant — a use-after-free via the recv-sink raw
-    /// pointer), and (b) closes the reuse window between a task closing a
+    /// futures and waiter flags used to survive into the slot's next
+    /// occupant), and (b) closes the reuse window between a task closing a
     /// connection and its own post-poll cleanup.
     pub(crate) pending_closes: Vec<u32>,
     /// Per-connection `forward_to_conn` state, indexed by the **source**.
@@ -236,10 +235,6 @@ pub(crate) struct Driver {
     /// `Config::forward_hold_cap` with the io_uring hold cap: same intent —
     /// bound one slow forward — applied to the queue mio actually has.
     pub(crate) forward_hold_cap: usize,
-    /// The most bytes one `forward_held` call forwards:
-    /// `FORWARD_HELD_MAX_BUFFERS` receive buffers' worth, the most one
-    /// io_uring call forwards.
-    pub(crate) forward_held_max_bytes: usize,
     /// Results of bounded (`send_backpressured`) sends, in completion order
     /// and keyed by the id the submitting future holds. Not per-connection:
     /// a [`SendId`] is unique on the worker, and the consumer
@@ -523,8 +518,6 @@ impl Driver {
             recv_half_taken: vec![false; max_conn],
             send_half_taken: vec![false; max_conn],
             forward_hold_cap: config.forward_hold_cap,
-            forward_held_max_bytes: crate::buffer::FORWARD_HELD_MAX_BUFFERS
-                * config.recv_buffer.buffer_size as usize,
             settled_sends: VecDeque::new(),
             capacity_released: false,
             udp_sockets,

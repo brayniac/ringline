@@ -3,9 +3,6 @@ use crate::runtime::send_completion::SendId;
 
 pub(crate) const MAX_IOVECS: usize = 32;
 
-// `forward_held` gathers up to `FORWARD_HELD_MAX_BUFFERS` held buffers into
-// an iovec array of `MAX_IOVECS` entries.
-const _: () = assert!(crate::buffer::FORWARD_HELD_MAX_BUFFERS <= MAX_IOVECS);
 /// Raised from 4 after rig measurement showed the guard-flush batching cap
 /// costing ~17% on guarded-SET pipelines vs the copy path (each flush pays a
 /// syscall + slab entry; deeper batches amortize it). 8 guards need 2*8+1 =
@@ -36,12 +33,6 @@ struct InFlightSendEntry {
     /// ZC-guard path (which uses `pool_slot` + `guards`).
     pool_slots: [u16; MAX_IOVECS],
     pool_slot_count: u8,
-    /// Provided-buffer ids backing a zero-copy recv-forward send — one per
-    /// held recv buffer gathered into the coalesced `sendmsg`. Replenished
-    /// into the `ProvidedBufRing` together on the operation CQE. Empty for all
-    /// other send paths (which use `pool_slot`/`pool_slots`/`guards`).
-    bids: [u16; MAX_IOVECS],
-    bid_count: u8,
     guards: [Option<GuardBox>; MAX_GUARDS],
     guard_count: u8,
     conn_index: u32,
@@ -58,8 +49,7 @@ struct InFlightSendEntry {
     /// (`submit_next_queued_inner` lifts them, since the
     /// coalesced completion releases the slots), and by
     /// [`set_send_id`](InFlightSendSlab::set_send_id) for a zero-copy
-    /// (`submit_batch_await`) or recv-forward (`forward_held`) entry, which
-    /// carries at most one.
+    /// (`submit_batch_await`) entry, which carries at most one.
     sends: SendRun,
     /// Bytes of the entry the kernel has sent so far (`try_advance`).
     sent: u32,
@@ -91,8 +81,6 @@ impl InFlightSendSlab {
                 pool_slot: u16::MAX,
                 pool_slots: [u16::MAX; MAX_IOVECS],
                 pool_slot_count: 0,
-                bids: [u16::MAX; MAX_IOVECS],
-                bid_count: 0,
                 guards: [const { None }; MAX_GUARDS],
                 guard_count: 0,
                 conn_index: 0,
@@ -222,62 +210,6 @@ impl InFlightSendSlab {
         &entry.pool_slots[..entry.pool_slot_count as usize]
     }
 
-    /// Allocate a slot for a zero-copy recv-forward send: one `sendmsg` whose
-    /// iovecs point directly into held provided recv buffers (no copy). `bids`
-    /// are the provided-buffer ids to replenish together on the operation CQE.
-    /// `iovecs_slice` and `bids` must be the same length and <= MAX_IOVECS.
-    pub fn allocate_recv_forward(
-        &mut self,
-        conn_index: u32,
-        generation: u32,
-        iovecs_slice: &[libc::iovec],
-        bids: &[u16],
-        total_len: u32,
-    ) -> Option<(u16, *const libc::msghdr)> {
-        debug_assert!(iovecs_slice.len() <= MAX_IOVECS);
-        debug_assert_eq!(iovecs_slice.len(), bids.len());
-        let idx = self.free_list.pop()?;
-        let entry = &mut self.entries[idx as usize];
-
-        for (i, iov) in iovecs_slice.iter().enumerate() {
-            entry.iovecs[i] = *iov;
-        }
-        entry.iov_count = iovecs_slice.len() as u8;
-        entry.iov_start = 0;
-        entry.pool_slot = u16::MAX;
-        entry.pool_slot_count = 0;
-        for (i, &bid) in bids.iter().enumerate() {
-            entry.bids[i] = bid;
-        }
-        entry.bid_count = bids.len() as u8;
-        entry.guard_count = 0;
-        entry.conn_index = conn_index;
-        entry.generation = generation;
-        entry.total_len = total_len;
-        // As in `allocate`: a recycled entry must not carry a previous
-        // occupant's id.
-        entry.sends.clear();
-        entry.sent = 0;
-        entry.close_on_error = false;
-        entry.plain_send = false;
-        entry.pending_notifs = 0;
-        entry.awaiting_notifications = false;
-        entry.in_use = true;
-
-        entry.msghdr = unsafe { std::mem::zeroed() };
-        entry.msghdr.msg_iov = entry.iovecs.as_mut_ptr();
-        entry.msghdr.msg_iovlen = entry.iov_count as _;
-
-        Some((idx, &entry.msghdr as *const libc::msghdr))
-    }
-
-    /// The provided-buffer ids backing a recv-forward entry, to be replenished
-    /// into the `ProvidedBufRing` by the caller. Empty for all other entries.
-    pub fn recv_forward_bids(&self, idx: u16) -> &[u16] {
-        let entry = &self.entries[idx as usize];
-        &entry.bids[..entry.bid_count as usize]
-    }
-
     /// Advance past `bytes_sent` bytes in the iovec array.
     /// Returns `Some(msghdr_ptr)` if there are remaining bytes to send (partial resubmit).
     /// Returns `None` if all data has been sent.
@@ -395,7 +327,6 @@ impl InFlightSendSlab {
         entry.guard_count = 0;
         entry.pool_slot = u16::MAX;
         entry.pool_slot_count = 0;
-        entry.bid_count = 0;
         // Cleared unconditionally so a recycled entry cannot name a dead
         // operation. A handler that means to settle its sends must call
         // `take_sends` *before* releasing; there is no
@@ -523,10 +454,6 @@ mod tests {
             .allocate_coalesced(0, 0, &iov, &[0], 4, [], false)
             .unwrap();
         assert!(!slab.plain_send(idx), "allocate_coalesced");
-        mark_and_release(&mut slab, idx);
-
-        let (idx, _) = slab.allocate_recv_forward(0, 0, &iov, &[0], 4).unwrap();
-        assert!(!slab.plain_send(idx), "allocate_recv_forward");
     }
 
     struct TestGuard {

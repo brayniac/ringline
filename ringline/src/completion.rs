@@ -66,15 +66,6 @@ pub enum OpTag {
     /// (#603). Its result is a partial write of the same entry.
     /// Payload = InFlightSendSlab index.
     SendMsgCoalescedDrain = 25,
-    /// Zero-copy recv-forward: one `sendmsg` whose iovecs point directly into
-    /// held provided recv buffers (no accumulator copy). Payload =
-    /// InFlightSendSlab index; the slab entry holds the bids to replenish on
-    /// completion.
-    SendRecvBufsCoalesced = 26,
-    /// Plain `send` of the first non-empty unsent iovec of a recv-forward send
-    /// whose `sendmsg` returned `-EAGAIN`; see `SendMsgCoalescedDrain`.
-    /// Payload = InFlightSendSlab index.
-    SendRecvBufsCoalescedDrain = 27,
     /// One-shot fallback recv into a fallback-pool slot, submitted when a
     /// connection parked on ENOBUFS holds a partial message in its
     /// accumulator (the provided ring is smaller than one response).
@@ -117,8 +108,8 @@ pub enum OpTag {
     /// `SendMsgCoalescedDrain`. It posts no notification. Payload =
     /// InFlightSendSlab index.
     SendMsgZcDrain = 35,
-    /// Direct receive, on a plaintext connection from `connect` or
-    /// `connect_unix`: a one-shot recv into the
+    /// Direct receive, on a plaintext TCP or Unix connection: a one-shot
+    /// recv into the
     /// spare capacity of the connection's accumulator buffer. Payload =
     /// `Driver::direct_recvs` index, whose entry holds the buffer and the
     /// connection generation.
@@ -165,8 +156,6 @@ impl OpTag {
             23 => Some(OpTag::SendUdp),
             24 => Some(OpTag::SendMsgCoalesced),
             25 => Some(OpTag::SendMsgCoalescedDrain),
-            26 => Some(OpTag::SendRecvBufsCoalesced),
-            27 => Some(OpTag::SendRecvBufsCoalescedDrain),
             28 => Some(OpTag::RecvFallback),
             29 => Some(OpTag::ForwardWrite),
             30 => Some(OpTag::ForwardWriteDrain),
@@ -215,8 +204,6 @@ impl OpTag {
             OpTag::SendUdp => "send_udp",
             OpTag::SendMsgCoalesced => "send_msg_coalesced",
             OpTag::SendMsgCoalescedDrain => "send_msg_coalesced_drain",
-            OpTag::SendRecvBufsCoalesced => "send_recv_bufs_coalesced",
-            OpTag::SendRecvBufsCoalescedDrain => "send_recv_bufs_coalesced_drain",
             OpTag::RecvFallback => "recv_fallback",
             OpTag::ForwardWrite => "forward_write",
             OpTag::ForwardWriteDrain => "forward_write_drain",

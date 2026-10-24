@@ -151,6 +151,7 @@ macro_rules! server {
 }
 
 server!(Copy, COPY, false);
+#[cfg(not(has_io_uring))]
 server!(Segmented, SEGMENTED, true);
 server!(PeerClose, PEER_CLOSE, false);
 server!(Tls, TLS, false);
@@ -191,8 +192,10 @@ fn resolves_for_a_reply_on_an_empty_accumulator() {
     stop(shutdown, handles);
 }
 
-/// The connection stays in the segmented domain after the first line, so on
-/// io_uring the second goes to the segment hold.
+/// The connection stays in the segmented domain after the first line. mio
+/// only: on io_uring an accepted plaintext connection refuses segmented
+/// reads.
+#[cfg(not(has_io_uring))]
 #[test]
 fn resolves_for_bytes_in_the_segment_hold() {
     let (shutdown, handles, mut peer) = plain_server::<Segmented>();

@@ -8,10 +8,10 @@ obvious-looking fix — `IOSQE_CQE_SKIP_SUCCESS` on fire-and-forget sends —
 is unsound here, for two independent reasons:
 
 1. **Slot lifecycle runs on the CQE.** Every send references ringline-owned
-   memory (SendCopyPool slot, InFlightSendSlab entry, provided-buffer bids
-   for recv-forward). The completion CQE is the *only* signal that the
-   kernel is done with that memory; skipping it leaks the slot. There is no
-   send path with no resource to release.
+   memory (SendCopyPool slot, InFlightSendSlab entry, the provided buffer
+   a `forward_recv_buf` send lends). The completion CQE is the *only*
+   signal that the kernel is done with that memory; skipping it leaks the
+   slot. There is no send path with no resource to release.
 2. **Partial sends are silent with skip.** CQE_SKIP_SUCCESS suppresses all
    `res >= 0` completions, including short writes. A short send with no CQE
    means the remainder is never resubmitted — data loss on backpressure.
@@ -95,12 +95,12 @@ So a vectored send (`sendmsg`, `SendMsgZc`, `writev`) that returns `-EAGAIN`
 is not retried behind a `POLLOUT` poll: that loop never waits and spins the
 worker's event loop (#603). The handler instead submits a plain `send` of the
 entry's first non-empty unsent iovec, under a `*Drain` tag
-(`SendMsgCoalescedDrain`, `SendRecvBufsCoalescedDrain`, `SendMsgZcDrain`,
-`ForwardWriteDrain`). Its result is a partial write of the same entry, so the
-drain tag's completion goes through the entry's own handler, which advances
-the iovecs and resubmits the rest with the entry's own operation. The entry
-stays the one operation in flight on the connection, so byte order holds. A
-zero-copy entry's drain is a copying `send` and posts no notification.
+(`SendMsgCoalescedDrain`, `SendMsgZcDrain`, `ForwardWriteDrain`). Its result
+is a partial write of the same entry, so the drain tag's completion goes
+through the entry's own handler, which advances the iovecs and resubmits the
+rest with the entry's own operation. The entry stays the one operation in
+flight on the connection, so byte order holds. A zero-copy entry's drain is
+a copying `send` and posts no notification.
 Zero-copy sends inside a `send_chain` are linked SQEs and are not drained: an
 `-EAGAIN` there fails the chain.
 
@@ -136,7 +136,7 @@ chain (#642).
 
 `run_shutdown` closes every connection with the `CancelAll` lead, on every
 kernel, so a send waiting for room on a connection is cancelled, and a
-coalesced or recv-forward send's slab entry is released on its completion. A
+coalesced send's slab entry is released on its completion. A
 forward write's operation is on its sink's file, which that lead does not
 reach, so it is cancelled by its user_data. Entries parked on a retry list,
 with no operation in flight, are released first. It then waits, for at most

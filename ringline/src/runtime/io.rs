@@ -586,8 +586,9 @@ impl<T: 'static> Future for BlockingJoinHandle<T> {
 ///
 /// # Receiving
 ///
-/// On io_uring a plaintext connection, from this function or
-/// [`connect_unix`], receives directly into its own accumulator. When a read
+/// On io_uring a plaintext connection, from this function, from
+/// [`connect_unix`] or accepted on a plaintext listener, receives directly
+/// into its own accumulator. When a read
 /// parks (`with_data`, `with_bytes`, `recv_ready`, or a
 /// [`ConnStream`](crate::ConnStream) read), the runtime submits a one-shot
 /// receive whose destination is the free space of the connection's
@@ -614,12 +615,9 @@ impl<T: 'static> Future for BlockingJoinHandle<T> {
 ///
 /// The reads that use the provided-buffer ring are refused on such a
 /// connection: `segments`, `recv_owned_segment`, `with_segments`,
-/// `with_bytes_segments`, `forward_to` and `forward_held` return
-/// [`io::ErrorKind::Unsupported`], `enable_recv_forward` does nothing,
-/// `run_direct_echo` resolves at once, and a recv sink
-/// ([`ConnCtx::set_recv_sink`]) is not filled: the received bytes go to the
-/// accumulator. `forward_to_conn` sends from the accumulator (see
-/// [`ConnCtx::forward_to_conn`]).
+/// `with_bytes_segments` and `forward_to` return
+/// [`io::ErrorKind::Unsupported`]. `forward_to_conn` sends from the
+/// accumulator (see [`ConnCtx::forward_to_conn`]).
 ///
 /// A receive into the accumulator is armed only when a read parks.
 /// A poll for `POLLRDHUP`, armed when the connection opens, completes on a
@@ -941,9 +939,8 @@ pub fn request_shutdown() -> io::Result<()> {
 /// plus a way to *obtain* the read side ([`take_recv`](Self::take_recv),
 /// [`split`](Self::split)).
 ///
-/// The forwarding entry points (`forward_to`, `forward_to_conn`,
-/// `forward_held`, `enable_recv_forward`, `run_direct_echo`) stay public on
-/// purpose: they move bytes kernel-side from source to sink and never surface
+/// The forwarding entry points (`forward_to`, `forward_to_conn`) stay public
+/// on purpose: they move bytes kernel-side from source to sink and never surface
 /// them to the caller, so they cannot be used to observe a stream someone else
 /// is reading. Their own "one forward at a time" rule is refused at runtime by
 /// the driver, and that refusal stays reachable — and therefore testable —
@@ -1251,9 +1248,9 @@ impl ConnCtx {
     /// a running reader callback or held bytes.
     ///
     /// The runtime does not see bytes the handler has taken into its own
-    /// memory, for example a `ConnStream`'s buffered data, a recv sink,
-    /// `Bytes` kept from `with_bytes`, or requests the handler has queued. Do
-    /// not offer while holding any.
+    /// memory, for example a `ConnStream`'s buffered data, `Bytes` kept from
+    /// `with_bytes`, or requests the handler has queued. Do not offer while
+    /// holding any.
     ///
     /// Park also requires the io_uring backend and a kernel with
     /// `IORING_OP_FIXED_FD_INSTALL` (mainline 6.8). On mio this does
@@ -1953,13 +1950,16 @@ impl ConnCtx {
     /// intermediate aligned copy (which defeats the purpose). [`SinkFd::file`]
     /// **rejects** an `O_DIRECT` descriptor with [`io::ErrorKind::InvalidInput`].
     ///
-    /// io_uring only — Mode A is backed by the provided-buffer ring.
+    /// io_uring only — Mode A is backed by the provided-buffer ring, which on
+    /// io_uring only a TLS connection receives through.
     ///
     /// # Errors
     ///
     /// Refused at the call, resolving on the first poll without having
-    /// installed anything: `EBUSY` if a forward is already running on this
-    /// connection, `EPIPE` if this connection's slot is already stale. (The
+    /// installed anything: `EOPNOTSUPP` on a plaintext connection, which
+    /// receives directly into its accumulator (see [`connect`]); `EBUSY` if a
+    /// forward is already running on this connection; `EPIPE` if this
+    /// connection's slot is already stale. (The
     /// sink is a borrowed descriptor, so the sink-side `EPIPE`/`EPROTOTYPE`
     /// of [`forward_to_conn`](Self::forward_to_conn) do not apply.)
     #[cfg(has_io_uring)]
@@ -1980,54 +1980,8 @@ impl ConnCtx {
         }
     }
 
-    /// Install a recv sink so that CQE data is written directly to the
-    /// target buffer instead of the per-connection accumulator.
-    ///
-    /// Does nothing if the handle is stale (its connection has been
-    /// released); `recv_ready` then resolves immediately and
-    /// `take_recv_sink` returns 0.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure that `target` points to writable memory of at
-    /// least `len` bytes, and that the memory remains valid until
-    /// `take_recv_sink()` is called. In practice this
-    /// is guaranteed because ringline is single-threaded: the task sets the sink,
-    /// yields, and the CQE handler (same thread) writes to it before the task
-    /// resumes and clears the sink.
-    pub unsafe fn set_recv_sink(&self, target: *mut u8, len: usize) {
-        with_state(|driver, executor| {
-            if driver.connections.generation(self.conn_index) != self.generation {
-                return;
-            }
-            executor.recv_sinks[self.conn_index as usize] = Some(crate::runtime::RecvSink {
-                ptr: target,
-                cap: len,
-                pos: 0,
-            });
-        });
-    }
-
-    /// Remove the recv sink and return the number of bytes written to it.
-    /// Returns 0 if no sink was active, or if the handle is stale.
-    pub(crate) fn take_recv_sink(&self) -> usize {
-        with_state(|driver, executor| {
-            if driver.connections.generation(self.conn_index) != self.generation {
-                return 0;
-            }
-            match executor.recv_sinks[self.conn_index as usize].take() {
-                Some(sink) => sink.pos,
-                None => 0,
-            }
-        })
-    }
-
     /// Returns a future that becomes ready when received bytes are buffered
-    /// for the connection, when a recv sink has received data, or when the
-    /// connection has finished receiving.
-    ///
-    /// Use this with [`set_recv_sink()`](Self::set_recv_sink) to wait for
-    /// direct-to-buffer writes without processing accumulator data.
+    /// for the connection, or when the connection has finished receiving.
     pub(crate) fn recv_ready(&self) -> RecvReadyFuture {
         RecvReadyFuture {
             conn_index: self.conn_index,
@@ -2229,31 +2183,6 @@ impl ConnCtx {
             let mut ctx = driver.make_ctx();
             ctx.send(self.token(), data)
         })
-    }
-
-    /// Run a direct-echo event loop for this connection (io_uring only).
-    ///
-    /// Instead of the standard task-driven approach where each recv CQE wakes
-    /// the owning task, which then calls `with_data` → `forward_recv_buf`, this
-    /// mode sets a flag on the connection that tells `handle_recv_multi` to
-    /// submit the echo SQE directly from the CQE handler — bypassing the
-    /// `collect_wakeups` → `poll_ready_tasks` roundtrip entirely.
-    ///
-    /// The returned future resolves once the peer has closed its write side
-    /// (or the read failed) and every byte received before that has been
-    /// submitted for echo. The connection then closes, after the last send
-    /// completes. Any data buffered before the flag was set is drained on the
-    /// first poll.
-    ///
-    /// Available only on io_uring; on mio, use a `with_data` /
-    /// `forward_recv_buf` loop.
-    #[cfg(has_io_uring)]
-    pub fn run_direct_echo(&self) -> DirectEchoFuture {
-        DirectEchoFuture {
-            conn_index: self.conn_index,
-            generation: self.generation,
-            armed: false,
-        }
     }
 
     /// Forward the next `len` received bytes to **another connection on this
@@ -2517,199 +2446,6 @@ impl ConnCtx {
             refused: armed.err(),
             _borrow: PhantomData,
         }
-    }
-
-    /// Enable the zero-copy recv-forward path for this connection.
-    ///
-    /// Once enabled, incoming provided recv buffers are *held in place* (not
-    /// copied into the accumulator) and can be echoed back zero-copy via
-    /// [`forward_held`](Self::forward_held), which gathers up to 32 held
-    /// buffers into one scatter-gather `sendmsg`. Intended for byte-pipe workloads (echo,
-    /// proxy) where the handler does not parse the stream. While enabled,
-    /// `with_data` / `with_bytes` will not
-    /// observe data (it never reaches the accumulator).
-    ///
-    /// Backpressure is automatic: held buffer ids are not returned to the
-    /// provided-buffer ring until their forward completes, so a slow peer
-    /// naturally throttles recv (`ENOBUFS`) rather than growing memory.
-    #[cfg(has_io_uring)]
-    /// A stale handle is a no-op: this returns `()` and so has no way to
-    /// report a refusal, and flipping the flag on a recycled slot would make a
-    /// *different* connection start holding its recv buffers. See #429. On a
-    /// direct connection (see [`connect`]) it is also a no-op,
-    /// and [`forward_held`](Self::forward_held) returns `Unsupported`.
-    pub fn enable_recv_forward(&self) {
-        with_state(|driver, _| {
-            if driver.connections.generation(self.conn_index) != self.generation
-                || is_recv_direct(driver, self.conn_index)
-            {
-                return;
-            }
-            driver.recv_forward[self.conn_index as usize] = true;
-            // Recv-forward holds its buffers past the completion, so it
-            // receives one buffer per arm (`Driver::recv_single`).
-            driver.cancel_recv_for_single(self.conn_index);
-        });
-    }
-
-    /// Forward the held recv buffers back to the peer in one zero-copy
-    /// scatter-gather `sendmsg`, returning a [`SendFuture`] that resolves with
-    /// the bytes sent. A call forwards at most 32 buffers. While the
-    /// connection is open, buffers beyond that stay held for the next call,
-    /// and `recv_ready` is ready at once. When the peer closes, held buffers
-    /// that were not forwarded are discarded.
-    /// Requires [`enable_recv_forward`](Self::enable_recv_forward).
-    ///
-    /// Gate calls on `recv_ready`, which becomes ready when the connection
-    /// holds received bytes or has closed. When the hold is empty (e.g. the
-    /// connection closed), the returned future resolves to `0`. `recv_ready`
-    /// is also ready for bytes outside the hold, for which `forward_held`
-    /// returns 0: bytes received before `enable_recv_forward`, and every byte
-    /// on a TLS connection, which decrypts into the accumulator.
-    ///
-    /// One forward is in flight per connection at a time (await the returned
-    /// future before calling again); buffers received during the send accumulate
-    /// in the hold and are picked up by the next call. The same holds for any
-    /// other send on the connection: while one is queued or in flight, or a
-    /// send chain is active, this returns `WouldBlock` rather than let the
-    /// forward overtake it, and the held buffers stay in the hold.
-    #[cfg(has_io_uring)]
-    pub fn forward_held(&self) -> io::Result<SendFuture> {
-        with_state(|driver, executor| {
-            let conn_index = self.conn_index;
-            if driver.connections.generation(conn_index) != self.generation {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotConnected,
-                    "stale connection",
-                ));
-            }
-            if is_recv_direct(driver, conn_index) {
-                return Err(recv_direct_unsupported());
-            }
-
-            let n = driver.recv_hold[conn_index as usize]
-                .len()
-                .min(crate::buffer::FORWARD_HELD_MAX_BUFFERS);
-
-            // Nothing held (connection closed or spurious wake) — resolve to 0.
-            if n == 0 {
-                return Ok(SendFuture::ready(conn_index, self.generation, Ok(0)));
-            }
-
-            // Earlier sends queued, in flight or parked, or a chain active: the
-            // forward is its own SQE and io_uring does not order independent
-            // SQEs, so pushing it now would let the echoed bytes overtake them.
-            // Refuse before allocating anything; the hold stays put and the
-            // next call forwards the same bytes. Await the earlier send first.
-            let state = &driver.send_queues[conn_index as usize];
-            if state.in_flight
-                || !state.queue.is_empty()
-                || driver.chain_table.is_active(conn_index)
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "earlier sends are still in flight on this connection",
-                ));
-            }
-
-            // Gather iovecs over the held provided-buffer memory (PendingRecvBuf
-            // is Copy, so each index read releases the recv_hold borrow).
-            let mut iovecs = [libc::iovec {
-                iov_base: std::ptr::null_mut(),
-                iov_len: 0,
-            }; crate::buffer::send_slab::MAX_IOVECS];
-            let mut bids = [0u16; crate::buffer::send_slab::MAX_IOVECS];
-            let mut total: u32 = 0;
-            for i in 0..n {
-                let p = driver.recv_hold[conn_index as usize][i];
-                iovecs[i] = libc::iovec {
-                    iov_base: p.ptr as *mut libc::c_void,
-                    iov_len: p.len as usize,
-                };
-                bids[i] = p.bid;
-                total += p.len;
-            }
-
-            let generation = driver.connections.generation(conn_index);
-            let (slab_idx, msg_ptr) = driver
-                .send_slab
-                .allocate_recv_forward(conn_index, generation, &iovecs[..n], &bids[..n], total)
-                .ok_or_else(|| io::Error::other("send slab exhausted"))?;
-
-            let id = executor.register_send(conn_index);
-            driver.send_slab.set_send_id(slab_idx, id, total);
-            match driver
-                .ring
-                .submit_send_recv_bufs_coalesced(conn_index, msg_ptr, slab_idx)
-            {
-                Ok(()) => {
-                    // Buffers are now owned by the slab entry (bids replenished on
-                    // completion) — remove them from the hold.
-                    for _ in 0..n {
-                        driver.recv_hold[conn_index as usize].pop_front();
-                    }
-                    driver.send_held_recv[conn_index as usize] += n as u32;
-                    driver.send_queues[conn_index as usize].in_flight = true;
-                    Ok(SendFuture::pending(conn_index, self.generation, id))
-                }
-                Err(e) => {
-                    // Submission failed — release the slab entry; buffers stay in
-                    // the hold (bids un-replenished, still valid) for a later retry.
-                    driver.send_slab.release(slab_idx);
-                    executor.withdraw_send(id);
-                    Err(e)
-                }
-            }
-        })
-    }
-
-    /// Enable the recv-forward path for this connection.
-    ///
-    /// mio fallback: no-op. There is no provided-buffer ring to hold, so recv
-    /// data flows through the accumulator as usual and
-    /// [`forward_held`](Self::forward_held) copy-sends it, at most 32
-    /// receive buffers' worth per call (no zero-copy). Keeps the API portable across backends.
-    #[cfg(not(has_io_uring))]
-    pub fn enable_recv_forward(&self) {}
-
-    /// Forward currently-buffered recv data back to the peer.
-    ///
-    /// mio fallback: copy-sends the start of the accumulator and consumes it,
-    /// returning a [`SendFuture`] that resolves with the bytes sent (`0` when
-    /// empty). A call forwards at most 32 receive buffers' worth of bytes
-    /// (`ConfigBuilder::recv_buffer`'s `buffer_size` each), the most one
-    /// io_uring call forwards. The rest stays buffered for the next call,
-    /// and `recv_ready` is ready at once. After the peer closes, the rest
-    /// survives only while each call follows the previous one's completion
-    /// directly: the connection's teardown discards it once nothing is
-    /// queued to send. Gate calls on `recv_ready` as on the io_uring
-    /// backend.
-    #[cfg(not(has_io_uring))]
-    pub fn forward_held(&self) -> io::Result<SendFuture> {
-        with_state(|driver, executor| {
-            let conn_index = self.conn_index;
-            if driver.connections.generation(conn_index) != self.generation {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotConnected,
-                    "stale connection",
-                ));
-            }
-            // Copy out the accumulated bytes (releases the accumulator borrow so
-            // we can take a DriverCtx), then consume them once the send is queued.
-            let held = driver.accumulators.data(conn_index);
-            let data = held[..held.len().min(driver.forward_held_max_bytes)].to_vec();
-            if data.is_empty() {
-                return Ok(SendFuture::ready(conn_index, self.generation, Ok(0)));
-            }
-            let id = executor.register_send(conn_index);
-            let mut ctx = driver.make_ctx();
-            if let Err(e) = ctx.send_awaited(self.token(), &data, id) {
-                executor.withdraw_send(id);
-                return Err(e);
-            }
-            driver.accumulators.consume(conn_index, data.len());
-            Ok(SendFuture::pending(conn_index, self.generation, id))
-        })
     }
 
     /// Begin building a scatter-gather send with mixed copy + zero-copy guard parts.
@@ -3022,7 +2758,8 @@ impl ConnCtx {
     }
 
     /// Whether the connection receives directly into its accumulator: on
-    /// io_uring, a plaintext connection from [`connect`] or [`connect_unix`].
+    /// io_uring, every plaintext connection, accepted or from [`connect`] or
+    /// [`connect_unix`].
     /// The reads that need the provided-buffer ring return
     /// [`io::ErrorKind::Unsupported`] on such a connection, so a caller can
     /// check this before sending a request whose reply it would read with one
@@ -3335,9 +3072,9 @@ impl<'a> MioSendBuilder<'a> {
 // ── WithDataFuture ───────────────────────────────────────────────────
 
 /// Whether `conn_index` receives directly into its accumulator (a plaintext
-/// connection from `connect` or `connect_unix`). Such a connection has no
+/// TCP or Unix connection). Such a connection has no
 /// receive from the provided-buffer ring, so the reads that hold ring buffers
-/// (segments, `forward_to`, recv-forward, direct echo) are refused on it.
+/// (segments, `forward_to`) are refused on it.
 #[cfg(has_io_uring)]
 fn is_recv_direct(driver: &Driver, conn_index: u32) -> bool {
     driver
@@ -3352,12 +3089,12 @@ fn is_recv_direct(driver: &Driver, conn_index: u32) -> bool {
 fn recv_direct_unsupported() -> io::Error {
     io::Error::new(
         io::ErrorKind::Unsupported,
-        "not supported on a direct-receive connection (outbound plaintext, io_uring)",
+        "not supported on a direct-receive connection (plaintext, io_uring)",
     )
 }
 
 /// Register the current task as `conn_index`'s receive waiter. On a direct
-/// connection (a plaintext connection from `connect` or `connect_unix`) also arm its receive, which the
+/// connection (a plaintext TCP or Unix connection) also arm its receive, which the
 /// caller does only after its parser has seen every buffered byte. `need` is
 /// the parser's `NeedAtLeast` value, if it returned one.
 pub(crate) fn park_recv(
@@ -3900,16 +3637,6 @@ impl RecvHalf {
         self.conn
     }
 
-    /// See [`ConnCtx::enable_recv_forward`].
-    pub fn enable_recv_forward(&mut self) {
-        self.conn.enable_recv_forward();
-    }
-
-    /// See [`ConnCtx::forward_held`].
-    pub fn forward_held(&mut self) -> io::Result<SendFuture> {
-        self.conn.forward_held()
-    }
-
     /// See [`Connection::eof_truncated`].
     pub fn eof_truncated(&self) -> bool {
         self.conn.eof_truncated()
@@ -3923,11 +3650,6 @@ impl RecvHalf {
     /// See [`Connection::try_with_data`].
     pub fn try_with_data<F: FnOnce(&[u8]) -> ParseResult>(&mut self, f: F) -> Option<ParseResult> {
         self.conn.try_with_data(f)
-    }
-
-    /// See [`Connection::take_recv_sink`].
-    pub fn take_recv_sink(&mut self) -> usize {
-        self.conn.take_recv_sink()
     }
 
     /// See [`Connection::recv_ready`].
@@ -4131,8 +3853,7 @@ impl Connection {
     }
 
     /// Returns a future that resolves when received bytes are buffered for
-    /// the connection, when a recv sink has received data, or when the
-    /// connection has finished receiving.
+    /// the connection, or when the connection has finished receiving.
     ///
     /// The future consumes nothing and does not borrow the connection, so a
     /// reader started after it resolves sees the same bytes, and dropping it
@@ -4174,15 +3895,12 @@ impl Connection {
     /// pieces, as a [`with_bytes`](Self::with_bytes) parser does for its one
     /// `Bytes`.
     ///
-    /// On io_uring the call puts the connection in the segmented receive
-    /// domain, where each completion's buffer is held in place. Each held
-    /// buffer is presented as a `Bytes` view of the ring buffer's memory, so
-    /// a value the parser slices out of one piece is not copied. A view keeps
-    /// its whole ring buffer from being reused until the view and every
-    /// clone and slice of it have dropped. A completion the runtime copied
-    /// instead (lend refused, the ring at its reserve, or a TLS connection's
-    /// decrypted plaintext) is presented as a heap `Bytes`. Bytes the
-    /// runtime copied into the accumulator come first, as one piece.
+    /// On io_uring a plaintext connection receives directly into its
+    /// accumulator and refuses this with [`io::ErrorKind::Unsupported`] (see
+    /// [`connect`]). A TLS connection is put in the segmented receive domain,
+    /// and each completion's decrypted plaintext is presented as a heap
+    /// `Bytes`; bytes the runtime copied into the accumulator come first, as
+    /// one piece.
     ///
     /// On mio the pieces are the accumulator, as one piece.
     ///
@@ -4195,8 +3913,8 @@ impl Connection {
     ///
     /// The connection stays in the segmented domain after the future
     /// resolves. Call [`end_segments`](Self::end_segments) before reading
-    /// with `with_data`, `with_bytes`, `recv_ready`, a `ConnStream` or a recv
-    /// sink. On io_uring, until it runs, those see only bytes a hold-cap copy
+    /// with `with_data`, `with_bytes`, `recv_ready` or a `ConnStream`. On
+    /// io_uring, until it runs, those see only bytes a hold-cap copy
     /// left in the accumulator, and none that arrive later.
     ///
     /// Resolves to:
@@ -4211,11 +3929,7 @@ impl Connection {
     ///   again to read with the connection's current state;
     /// - `Err(EBUSY)` while a forward runs or a `SegmentReader` is live. A
     ///   new call also resolves to `Err(EBUSY)`, without waiting, until the
-    ///   forward ends or the reader drops;
-    /// - `Err(EBUSY)` on io_uring for a call first polled after
-    ///   [`enable_recv_forward`](RecvHalf::enable_recv_forward) was called on
-    ///   the connection, until the connection starts closing. On mio
-    ///   `enable_recv_forward` does nothing and this call reads normally.
+    ///   forward ends or the reader drops.
     pub fn with_bytes_segments<F>(&mut self, f: F) -> WithBytesSegmentsFuture<F>
     where
         F: FnMut(&[Bytes]) -> ParseResult,
@@ -4355,7 +4069,7 @@ impl Connection {
     /// `with_segments`, on this connection or its [`RecvHalf`]. The call's
     /// bytes are the ones it removed from the connection, whatever the parser
     /// returned.
-    /// Forwards, recv sinks, `ConnStream` and segment readers do not set it.
+    /// Forwards, `ConnStream` and segment readers do not set it.
     ///
     /// Returns `None` until a reader call has consumed a byte, after a call
     /// that consumed none or resolved at end of stream, and once the
@@ -4376,30 +4090,9 @@ impl Connection {
         self.rx.as_conn_ref().try_with_data(f)
     }
 
-    /// See [`Connection::take_recv_sink`].
-    pub fn take_recv_sink(&mut self) -> usize {
-        self.rx.as_conn_ref().take_recv_sink()
-    }
-
-    /// See [`ConnCtx::enable_recv_forward`].
-    pub fn enable_recv_forward(&mut self) {
-        self.rx.enable_recv_forward();
-    }
-
-    /// See [`ConnCtx::forward_held`].
-    pub fn forward_held(&mut self) -> io::Result<SendFuture> {
-        self.rx.forward_held()
-    }
-
     /// See [`SendHalf::forward_recv_buf`].
     pub fn forward_recv_buf(&mut self, data: &[u8]) -> io::Result<()> {
         self.tx.as_conn().forward_recv_buf(data)
-    }
-
-    /// See [`ConnCtx::run_direct_echo`].
-    #[cfg(has_io_uring)]
-    pub fn run_direct_echo(&mut self) -> DirectEchoFuture {
-        self.tx.as_conn().run_direct_echo()
     }
 
     /// See [`SendHalf::send_chain`].
@@ -6009,9 +5702,11 @@ pub fn recv_zc_threshold() -> u32 {
 /// Return an owned copy of `value` if it is a receive view shorter than
 /// `threshold` bytes; otherwise return `value` unchanged.
 ///
-/// On io_uring, [`Connection::with_bytes_segments`] presents held receive
-/// buffers as views of the ring's memory, and a value sliced from one is a
-/// view too. A view keeps its whole ring buffer from being reused until it
+/// No connection currently produces a receive view, so this returns `value`
+/// unchanged: on io_uring a plaintext connection refuses
+/// [`Connection::with_bytes_segments`] and a TLS connection's pieces are heap
+/// copies, and on mio the pieces are the accumulator. A view is a `Bytes`
+/// over the ring's memory, and a value sliced from one is a view too. A view keeps its whole ring buffer from being reused until it
 /// drops, whatever its length. Ring buffers are 16 KiB by default;
 /// [`ConfigBuilder::recv_incremental`](crate::ConfigBuilder::recv_incremental)
 /// and [`ConfigBuilder::recv_buffer`](crate::ConfigBuilder::recv_buffer)
@@ -6156,13 +5851,6 @@ impl<F: FnMut(&[Bytes]) -> ParseResult + Unpin> WithBytesSegmentsFuture<F> {
         let idx = conn as usize;
 
         if !self.entered {
-            // On a plaintext recv-forward connection in the default domain,
-            // received bytes go to `recv_hold`, the hold `forward_held` sends
-            // from, which this reader does not read; entering would present
-            // later bytes ahead of them.
-            if driver.recv_forward[idx] {
-                return self.busy();
-            }
             match enter_segmented(
                 driver,
                 conn,
@@ -6454,11 +6142,9 @@ thread_local! {
 // ── RecvReadyFuture ──────────────────────────────────────────────────
 
 /// Future returned by [`Connection::recv_ready`]. Resolves when:
-/// 1. The recv sink has received data (`pos > 0`), OR
-/// 2. The driver holds received bytes for the connection: in the
-///    accumulator, or on io_uring in a lent buffer, the segment hold or the
-///    recv-forward hold, OR
-/// 3. The connection has finished receiving.
+/// 1. The driver holds received bytes for the connection: in the
+///    accumulator, or on io_uring in a lent buffer or the segment hold, OR
+/// 2. The connection has finished receiving.
 pub struct RecvReadyFuture {
     conn_index: u32,
     /// See `WithDataFuture` for the role of `generation`.
@@ -6475,16 +6161,8 @@ impl Future for RecvReadyFuture {
             if driver.connections.generation(self.conn_index) != self.generation {
                 return Poll::Ready(());
             }
-            // Check recv sink.
-            if let Some(sink) = &executor.recv_sinks[self.conn_index as usize]
-                && sink.pos > 0
-            {
-                return Poll::Ready(());
-            }
-
             // Bytes the driver holds for the connection: the accumulator, and
-            // on io_uring a lent buffer, the segment hold and the
-            // recv-forward hold.
+            // on io_uring a lent buffer and the segment hold.
             if driver.recv_buffered(self.conn_index) > 0 {
                 return Poll::Ready(());
             }
@@ -6815,6 +6493,7 @@ impl SendFuture {
     }
 
     /// A future that resolves with `result` on its first poll.
+    #[cfg(has_io_uring)]
     fn ready(conn_index: u32, generation: u32, result: io::Result<u32>) -> Self {
         SendFuture {
             conn_index,
@@ -6877,107 +6556,6 @@ impl Drop for SendFuture {
         // In flight: marked abandoned, so the completion still coming frees
         // the entry. Already resolved: freed now.
         executor.cancel_send(id);
-    }
-}
-
-// ── DirectEchoFuture ─────────────────────────────────────────────────
-
-/// Future that drives a connection in direct-echo mode (io_uring only).
-///
-/// On first poll it sets `ConnectionState::direct_echo = true` so that all
-/// subsequent recv CQEs are echoed directly from `handle_recv_multi` without
-/// waking this task — eliminating the `collect_wakeups` → `poll_ready_tasks`
-/// roundtrip on the hot path. Any data buffered before the flag was set is
-/// drained on the first poll. The future resolves once the peer has closed
-/// its write side (or the read failed) and every byte received before that
-/// has been submitted for echo.
-///
-/// Created by [`ConnCtx::run_direct_echo`].
-#[cfg(has_io_uring)]
-pub struct DirectEchoFuture {
-    conn_index: u32,
-    generation: u32,
-    armed: bool,
-}
-
-#[cfg(has_io_uring)]
-impl Future for DirectEchoFuture {
-    type Output = ();
-
-    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
-        with_state(|driver, executor| {
-            // Generation check: the slot was reused while we were parked.
-            if driver.connections.generation(self.conn_index) != self.generation {
-                return Poll::Ready(());
-            }
-
-            // A direct connection has no ring receive to echo from.
-            if is_recv_direct(driver, self.conn_index) {
-                return Poll::Ready(());
-            }
-
-            if !self.armed {
-                // Arm direct-echo mode on the connection.
-                if let Some(cs) = driver.connections.get_mut(self.conn_index) {
-                    cs.direct_echo = true;
-                }
-                // Direct echo holds its buffers past the completion, so it
-                // receives one buffer per arm (`Driver::recv_single`).
-                driver.cancel_recv_for_single(self.conn_index);
-                self.armed = true;
-
-                // Drain any buffer that arrived before the flag was set.
-                // After this, all new bufs are echoed directly by handle_recv_multi.
-                if let Some(pending) = driver.pending_recv_bufs[self.conn_index as usize].take() {
-                    // Staged like any other direct-echo arrival; the event
-                    // loop's flush pass submits it before the next blocking
-                    // wait, gathered with anything that landed alongside it.
-                    driver.hold_direct_echo(self.conn_index, pending);
-                }
-            }
-
-            // Done once the read side has finished and every byte received
-            // before it has been submitted for echo; until the hold drains,
-            // ending the task would close the connection and drop them
-            // (#604).
-            let done = driver
-                .connections
-                .get(self.conn_index)
-                .map(|c| c.recv_finished())
-                .unwrap_or(true)
-                && driver.recv_hold[self.conn_index as usize].is_empty();
-
-            if done {
-                return Poll::Ready(());
-            }
-
-            // Park until done. handle_recv_multi calls wake_recv on EOF or
-            // error, and flush_direct_echoes calls it when the hold of a
-            // connection whose read side has finished drains.
-            executor.owner_task[self.conn_index as usize] = Some(CURRENT_TASK_ID.with(|c| c.get()));
-            executor.recv_waiters[self.conn_index as usize] = true;
-            Poll::Pending
-        })
-    }
-}
-
-#[cfg(has_io_uring)]
-impl Drop for DirectEchoFuture {
-    fn drop(&mut self) {
-        let opt_non_null = CURRENT_DRIVER.with(|c| c.get());
-        if opt_non_null.is_none() {
-            return;
-        }
-        let mut non_null = opt_non_null.unwrap();
-        let state = unsafe { non_null.as_mut() };
-        let driver = unsafe { &mut *state.driver.as_mut() };
-        // Verify the slot still belongs to this connection before clearing
-        // its waiter — a close/reuse cycle gives the slot a new generation.
-        if driver.connections.generation(self.conn_index) != self.generation {
-            return;
-        }
-        let executor = unsafe { &mut *state.executor.as_mut() };
-        executor.recv_waiters[self.conn_index as usize] = false;
     }
 }
 

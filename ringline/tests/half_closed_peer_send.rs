@@ -11,16 +11,14 @@
 //! and compare the count with the loop's idle rate; the `shutdown_*` tests
 //! check that a worker exits promptly while such a send waits. The spin check
 //! for coalesced copy sends is `deferred_close_does_not_spin_on_half_closed_peer`
-//! in `echo.rs`, and the `run_direct_echo` drain is covered by
-//! `direct_echo_eagain_drains_with_a_plain_send` in the io_uring event loop's
+//! in `echo.rs`, and the coalesced send's drain is covered by
+//! `coalesced_eagain_drains_with_a_plain_send` in the io_uring event loop's
 //! unit tests.
 //!
 //! The tests share the tick counter, so they take a lock.
 
 use std::future::Future;
 use std::io::{Read, Write};
-#[cfg(has_io_uring)]
-use std::net::TcpListener;
 use std::net::{Shutdown, TcpStream};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -179,76 +177,6 @@ fn guard_send_to_a_half_closed_peer_waits_and_delivers() {
     assert_no_spin(baseline, ticks);
 }
 
-// ── forward_to a socket sink ────────────────────────────────────────────
-
-/// Where the forwarder connects its socket sink.
-#[cfg(has_io_uring)]
-static SINK_ADDR: std::sync::OnceLock<std::net::SocketAddr> = std::sync::OnceLock::new();
-
-/// Forwards `LEN` received bytes to a non-blocking socket it connects to
-/// `SINK_ADDR`.
-#[cfg(has_io_uring)]
-struct ForwardToSocket;
-
-#[cfg(has_io_uring)]
-impl AsyncEventHandler for ForwardToSocket {
-    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
-        async move {
-            use std::os::fd::AsFd;
-            let sink_stream =
-                TcpStream::connect(*SINK_ADDR.get().expect("sink address")).expect("sink connect");
-            sink_stream.set_nonblocking(true).unwrap();
-            let sink = ringline::SinkFd::socket(sink_stream.as_fd());
-            let forwarded = conn.as_conn().forward_to(&sink, LEN).await;
-            assert_eq!(forwarded.ok(), Some(LEN), "forward_to ended early");
-        }
-    }
-    fn on_tick(&mut self, _ctx: &mut DriverCtx<'_>) {
-        TICKS.fetch_add(1, Ordering::Relaxed);
-    }
-    fn create_for_worker(_id: usize) -> Self {
-        ForwardToSocket
-    }
-}
-
-#[cfg(has_io_uring)]
-#[test]
-fn forward_to_a_half_closed_socket_sink_waits_and_delivers() {
-    let _lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let sink_listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    SINK_ADDR
-        .set(sink_listener.local_addr().unwrap())
-        .expect("sink address set once");
-    let (runtime, handles) = RinglineBuilder::new(config())
-        .bind("127.0.0.1:0".parse().unwrap())
-        .launch::<ForwardToSocket>()
-        .expect("launch");
-    let source = connect(runtime.bound_addr().expect("bound address"));
-    // The sink's peer half-closes at once and reads nothing until later.
-    let (mut sink_peer, _) = sink_listener.accept().unwrap();
-    sink_peer.shutdown(Shutdown::Write).unwrap();
-
-    std::thread::sleep(Duration::from_millis(100));
-    let baseline = ticks_over_500ms();
-
-    // The source's writes block once the sink backs up, so they run on their
-    // own thread.
-    let mut writer_stream = source.try_clone().unwrap();
-    let writer = std::thread::spawn(move || writer_stream.write_all(&payload()).unwrap());
-    // Let the forward fill the sink and stall.
-    std::thread::sleep(Duration::from_millis(500));
-    let ticks = ticks_over_500ms();
-
-    read_payload(&mut sink_peer, "forward_to socket");
-    writer.join().unwrap();
-    drop(source);
-    runtime.shutdown();
-    for h in handles {
-        h.join().expect("worker panicked").expect("worker error");
-    }
-    assert_no_spin(baseline, ticks);
-}
-
 // ── Shutdown while a send waits ─────────────────────────────────────────
 
 /// Reads until the peer's FIN, then sends 4 MiB as one copy send. On io_uring
@@ -321,97 +249,4 @@ fn shutdown_does_not_wait_out_copy_sends_to_a_half_closed_peer() {
         took < Duration::from_secs(2),
         "worker took {took:?} to exit with copy sends waiting"
     );
-}
-
-/// Echoes with `run_direct_echo`, whose sends gather held provided buffers into
-/// recv-forward `sendmsg`s.
-#[cfg(has_io_uring)]
-struct DirectEcho;
-
-#[cfg(has_io_uring)]
-impl AsyncEventHandler for DirectEcho {
-    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
-        async move {
-            conn.as_conn().run_direct_echo().await;
-        }
-    }
-    fn create_for_worker(_id: usize) -> Self {
-        DirectEcho
-    }
-}
-
-/// As `shutdown_does_not_wait_out_copy_sends_to_a_half_closed_peer`, for a
-/// recv-forward send: the client sends until the echo backs up, half-closes,
-/// and never reads.
-#[cfg(has_io_uring)]
-#[test]
-fn shutdown_does_not_wait_out_a_direct_echo_to_a_half_closed_peer() {
-    let _lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let (runtime, handles) = RinglineBuilder::new(config())
-        .bind("127.0.0.1:0".parse().unwrap())
-        .launch::<DirectEcho>()
-        .expect("launch");
-    let mut stream = connect(runtime.bound_addr().expect("bound address"));
-    stream.set_nonblocking(true).unwrap();
-    let chunk = vec![0x5Au8; 64 * 1024];
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    let mut idle_since = std::time::Instant::now();
-    // Write until the echo has backed up all the way: no write has gone
-    // through for 200 ms.
-    while std::time::Instant::now() < deadline && idle_since.elapsed() < Duration::from_millis(200)
-    {
-        match stream.write(&chunk) {
-            Ok(_) => idle_since = std::time::Instant::now(),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(5))
-            }
-            Err(e) => panic!("write: {e}"),
-        }
-    }
-    stream.shutdown(Shutdown::Write).unwrap();
-    std::thread::sleep(Duration::from_millis(300));
-
-    let start = std::time::Instant::now();
-    runtime.shutdown();
-    for h in handles {
-        h.join().expect("worker panicked").expect("worker error");
-    }
-    let took = start.elapsed();
-    drop(stream);
-    assert!(
-        took < Duration::from_secs(2),
-        "worker took {took:?} to exit with a direct echo waiting"
-    );
-}
-
-/// Every byte a direct-echo server receives is echoed, including the bytes
-/// that arrive in the same completion batch as the client's FIN (#604).
-#[cfg(has_io_uring)]
-#[test]
-fn direct_echo_echoes_every_byte_before_closing_on_fin() {
-    let _lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let (runtime, handles) = RinglineBuilder::new(config())
-        .bind("127.0.0.1:0".parse().unwrap())
-        .launch::<DirectEcho>()
-        .expect("launch");
-    let mut stream = connect(runtime.bound_addr().expect("bound address"));
-
-    // Send everything and half-close on another thread; the echo comes back
-    // while it is still writing.
-    let mut writer_stream = stream.try_clone().unwrap();
-    let writer = std::thread::spawn(move || {
-        writer_stream.write_all(&payload()).unwrap();
-        writer_stream.shutdown(Shutdown::Write).unwrap();
-    });
-    read_payload(&mut stream, "direct echo");
-    writer.join().unwrap();
-    // After the whole echo, the server closes.
-    let mut b = [0u8; 1];
-    assert_eq!(stream.read(&mut b).expect("read after the echo"), 0);
-
-    drop(stream);
-    runtime.shutdown();
-    for h in handles {
-        h.join().expect("worker panicked").expect("worker error");
-    }
 }

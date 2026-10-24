@@ -12,6 +12,9 @@
 #      forward_held_cap, segment_backpressure, bytes_segments).
 #   3. Mutation: restore the old accumulator + recv_hold check and rerun the
 #      new tests.
+# recv_lend_cap and forward_held_cap, and the `recv_hold` field the step 3
+# mutation restores, were removed in 0.7.0-alpha.5, so this spec runs only
+# against commits before that version.
 #
 # PREDICTION: 1 and 2 pass. In 3, ringline's
 # `resolves_for_a_reply_on_an_empty_accumulator` and

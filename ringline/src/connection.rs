@@ -35,8 +35,7 @@ pub enum RecvArm {
     Idle,
     /// Recv with the provided buffer ring (io_uring) / readable interest
     /// (mio). On io_uring each arm is one-shot by default and multishot with
-    /// `recv_multishot(true)`; a direct-echo or recv-forward connection
-    /// always arms one-shot (`Driver::recv_single`).
+    /// `recv_multishot(true)`.
     Multi,
 }
 
@@ -125,12 +124,6 @@ pub struct ConnectionState {
     pub listener: Option<crate::ListenerId>,
     /// Whether a connect timeout SQE is armed for this connection.
     pub connect_timeout_armed: bool,
-    /// When true, `handle_recv_multi` echoes received data directly from the CQE
-    /// handler instead of waking the connection's task. This eliminates the
-    /// task-wakeup overhead (collect_wakeups → poll_ready_tasks) on the hot echo
-    /// path, reducing per-message latency from ~2 event-loop iterations to ~1.
-    #[cfg(has_io_uring)]
-    pub direct_echo: bool,
     /// Whether a plain multishot `RecvMulti` SQE is currently in-flight in the
     /// kernel (armed). Set when the multishot is (re-)armed; cleared when a
     /// completion arrives without `IORING_CQE_F_MORE` (the kernel terminated
@@ -147,8 +140,9 @@ pub struct ConnectionState {
     #[cfg(has_io_uring)]
     pub socket_handed_off: bool,
     /// The connection receives with one-shot receives into its own
-    /// accumulator instead of the provided ring: a plaintext connection from
-    /// `connect` or `connect_unix`. Set when the connect is submitted, for the
+    /// accumulator instead of the provided ring: every plaintext TCP or Unix
+    /// connection, accepted or from `connect` or `connect_unix`. Set when the
+    /// connect is submitted or the connection is installed, for the
     /// connection's life.
     #[cfg(has_io_uring)]
     pub recv_direct: bool,
@@ -161,6 +155,11 @@ pub struct ConnectionState {
     /// direct receive in flight.
     #[cfg(has_io_uring)]
     pub recv_direct_held: usize,
+    /// The `direct_recvs` index of the direct receive in flight, which its
+    /// `OpTag::RecvDirect` user_data carries. Valid while
+    /// `recv_direct_armed`.
+    #[cfg(has_io_uring)]
+    pub recv_direct_slot: u32,
     /// A `forward_to_conn` from this direct connection is running. A second
     /// one is refused with `EBUSY`.
     #[cfg(has_io_uring)]
@@ -212,8 +211,6 @@ impl ConnectionState {
             listener: None,
             connect_timeout_armed: false,
             #[cfg(has_io_uring)]
-            direct_echo: false,
-            #[cfg(has_io_uring)]
             recv_multishot_armed: false,
             #[cfg(has_io_uring)]
             socket_handed_off: false,
@@ -223,6 +220,8 @@ impl ConnectionState {
             recv_direct_armed: false,
             #[cfg(has_io_uring)]
             recv_direct_held: 0,
+            #[cfg(has_io_uring)]
+            recv_direct_slot: 0,
             #[cfg(has_io_uring)]
             direct_forwarding: false,
             #[cfg(has_io_uring)]
@@ -300,12 +299,12 @@ impl ConnectionState {
         self.connect_timeout_armed = false;
         #[cfg(has_io_uring)]
         {
-            self.direct_echo = false;
             self.recv_multishot_armed = false;
             self.socket_handed_off = false;
             self.recv_direct = false;
             self.recv_direct_armed = false;
             self.recv_direct_held = 0;
+            self.recv_direct_slot = 0;
             self.direct_forwarding = false;
             self.hangup_poll_armed = false;
             self.hangup_peek_armed = false;

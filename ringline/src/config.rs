@@ -168,18 +168,18 @@ pub struct Config {
     ///
     /// A connection can hold arriving data in place or as copies until its
     /// consumer drains it: a `forward_to` source until each buffer is written to
-    /// the sink, a segment reader (`segments`, `with_segments`) until it reads,
-    /// a recv-forward or direct-echo connection until its send goes out. A slow
-    /// consumer would otherwise accumulate an unbounded backlog, pinning the
-    /// shared per-worker recv ring (starving every other connection on the
+    /// the sink, a segment reader (`segments`, `with_segments`) until it reads.
+    /// A slow consumer would otherwise accumulate an unbounded backlog, pinning
+    /// the shared per-worker recv ring (starving every other connection on the
     /// worker) or growing heap copies without limit. When a connection's held
     /// entries reach this cap (lowered to a quarter of the recv ring's buffers
-    /// for recv-forward and direct echo, and for a segment hold without
-    /// `recv_incremental`), the runtime stops its recv (a one-shot recv is not
-    /// re-armed, a multishot one is cancelled) so its TCP receive window closes
-    /// and only its peer stops sending; the recv is re-armed once the hold
-    /// drains below the cap. The buffers a recv-forward or direct-echo
-    /// connection's pending sends carry count toward its cap (#638).
+    /// for a segment hold without `recv_incremental`), the runtime stops its
+    /// recv (a one-shot recv is not re-armed, a multishot one is cancelled) so
+    /// its TCP receive window closes and only its peer stops sending; the recv
+    /// is re-armed once the hold drains below the cap. The lent receive
+    /// buffers a connection's unfinished `forward_recv_buf` sends carry are
+    /// held to the same quarter-ring cap (#638); on io_uring no TCP
+    /// connection a task can read from lends one.
     ///
     /// Larger values allow more recv in flight (higher single-forward throughput)
     /// at the cost of more pinned ring buffers / held heap under a slow sink;
@@ -1025,6 +1025,10 @@ impl ConfigBuilder {
     // ── Buffer settings ──────────────────────────────────────────────
 
     /// Set recv buffer configuration.
+    ///
+    /// On io_uring this affects TLS connections only: a plaintext
+    /// connection receives directly into its accumulator (see
+    /// [`connect`](crate::connect)).
     pub fn recv_buffer(mut self, ring_size: u16, buffer_size: u32) -> Self {
         self.config.recv_buffer.ring_size = ring_size;
         self.config.recv_buffer.buffer_size = buffer_size;
@@ -1044,9 +1048,12 @@ impl ConfigBuilder {
     /// submission: one connection streaming large messages receives about a
     /// fifth less per second with one-shot receives.
     ///
-    /// Direct-echo and recv-forward connections arm one-shot receives with
-    /// either setting. io_uring only; the mio backend reads on readiness.
+    /// io_uring only; the mio backend reads on readiness.
     /// **Default: false**.
+    ///
+    /// On io_uring this affects TLS connections only: a plaintext
+    /// connection receives directly into its accumulator (see
+    /// [`connect`](crate::connect)).
     pub fn recv_multishot(mut self, enabled: bool) -> Self {
         self.config.recv_multishot = enabled;
         self
@@ -1063,19 +1070,16 @@ impl ConfigBuilder {
     /// then requires `recv_accumulator_max` to be at least 1 MiB on either
     /// backend.
     ///
-    /// With this on, data is lent (held in place for a task, a segment or a
-    /// `forward_to` source) only while at most half the TCP ring's buffers
-    /// have a hold (a lend, or a completion whose release is queued for the
-    /// next flush); above that, each path copies, and `recv_segment_reserve`
-    /// is ignored. Recv-forward and direct echo copy into an owned buffer.
-    /// The fallback receive reads 1 MiB chunks, and a parked connection
-    /// re-arms its receive instead when the ring's free buffers hold more.
     /// With `prefault_buffers(true)` a plain ring makes 256 MiB per worker
     /// resident, against 4 MiB for the 256 × 16 KiB default.
     ///
     /// The ring kind is an io_uring choice; the mio backend uses its own
     /// receive buffers. **Default: false**, which keeps the plain ring
     /// `recv_buffer` sets (256 × 16 KiB by default).
+    ///
+    /// On io_uring this sets the ring kind TLS connections receive into; a
+    /// plaintext connection receives directly into its accumulator (see
+    /// [`connect`](crate::connect)).
     pub fn recv_incremental(mut self, enabled: bool) -> Self {
         self.config.recv_incremental = enabled;
         self
@@ -1108,9 +1112,10 @@ impl ConfigBuilder {
         self
     }
 
-    /// Set the size of the buffer that a plaintext connection from
-    /// [`connect`](crate::connect) or [`connect_unix`](crate::connect_unix)
-    /// receives into on io_uring when it has nothing buffered. An idle
+    /// Set the size of the buffer that a plaintext connection (accepted, or
+    /// from [`connect`](crate::connect) or
+    /// [`connect_unix`](crate::connect_unix)) receives into on io_uring when
+    /// it has nothing buffered. An idle
     /// connection of that kind holds a buffer of this size, or of
     /// [`recv_accumulator_capacity`](Self::recv_accumulator_capacity) if
     /// that is larger and at most twice this. A message that does not fit borrows a larger
@@ -1151,6 +1156,11 @@ impl ConfigBuilder {
     /// with `recv_incremental(true)`, where the lend cap decides.
     ///
     /// Default: 64 (a quarter of the default 256-buffer recv ring).
+    ///
+    /// On io_uring no connection uses this: a plaintext connection receives
+    /// directly into its accumulator (see [`connect`](crate::connect)), and a
+    /// TLS connection's segment hold is bounded by
+    /// [`recv_accumulator_max`](Self::recv_accumulator_max).
     pub fn recv_segment_reserve(mut self, reserve: u32) -> Self {
         self.config.recv_segment_reserve = reserve;
         self
@@ -1189,22 +1199,28 @@ impl ConfigBuilder {
     /// A connection holds received data until its consumer drains it: a
     /// `forward_to` source until each buffer is written to the sink, a
     /// segment reader (`segments`, `with_segments`, `recv_owned_segment`)
-    /// until it reads, a recv-forward or direct-echo connection until its
-    /// send goes out. When a connection holds this many entries the runtime
+    /// until it reads. When a connection holds this many entries the runtime
     /// stops its recv (a one-shot recv is not re-armed, a multishot one is
     /// cancelled), closing its TCP receive window so only its peer stops
     /// sending, and re-arms it on an event-loop pass once the hold drains
-    /// below the cap. A recv-forward or direct-echo hold, and without
-    /// `recv_incremental` a segment hold, is held to at most a quarter of the
-    /// recv ring's buffers, since each such entry can pin one.
-    /// The buffers a recv-forward or direct-echo connection's pending sends
-    /// carry count toward its cap (#638).
+    /// below the cap. Without `recv_incremental` a segment hold is held to at
+    /// most a quarter of the recv ring's buffers, since each entry can pin
+    /// one. The lent receive buffers a connection's unfinished
+    /// `forward_recv_buf` sends carry are held to the same quarter-ring cap
+    /// (#638); on io_uring no TCP connection a task can read from lends one,
+    /// since plaintext connections receive into their accumulators and TLS
+    /// ones copy.
     /// Larger values allow more recv in flight at the cost of more held
     /// buffers or copies under a slow consumer: with `recv_incremental` a
     /// segment hold can reach this many copies of up to one buffer each
     /// (64 MiB at the default 64 × 1 MiB). Must be `>= 1`.
     ///
     /// Default: 64 (2× `MAX_IOVECS`).
+    ///
+    /// On io_uring no connection uses this: a plaintext connection receives
+    /// directly into its accumulator (see [`connect`](crate::connect)), and a
+    /// TLS connection's segment hold is bounded by
+    /// [`recv_accumulator_max`](Self::recv_accumulator_max).
     pub fn forward_hold_cap(mut self, cap: usize) -> Self {
         self.config.forward_hold_cap = cap;
         self
@@ -1250,9 +1266,10 @@ impl ConfigBuilder {
     /// Set the receive view threshold in bytes (0 = never copy). Default:
     /// 4096, the send side's default; it has not been measured for receive.
     ///
-    /// On io_uring, `with_bytes_segments` presents held receive buffers as
-    /// `Bytes` views of the ring, and a view a client keeps holds its whole
-    /// ring buffer until it drops. The runtime does not apply this value
+    /// No connection currently produces a receive view: on io_uring a
+    /// plaintext connection refuses `with_bytes_segments` and a TLS
+    /// connection's pieces are heap copies. A view a client keeps would hold
+    /// its whole ring buffer until it drops. The runtime does not apply this value
     /// itself. [`recv_zc_threshold`](crate::recv_zc_threshold) returns it in
     /// the worker's tasks and its `on_tick` and `on_notify` callbacks. A
     /// client passes it to

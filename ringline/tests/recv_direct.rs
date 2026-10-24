@@ -1,5 +1,5 @@
-//! Direct receives: a plaintext connection from `connect` or `connect_unix`
-//! receives with one-shot receives into its own accumulator.
+//! Direct receives: a plaintext connection, accepted or from `connect` or
+//! `connect_unix`, receives with one-shot receives into its own accumulator.
 #![cfg(has_io_uring)]
 #![allow(clippy::manual_async_fn)]
 
@@ -529,12 +529,6 @@ impl AsyncEventHandler for Refusals {
                     "with_segments",
                     conn.with_segments(|_| ringline::SegConsumed(0)).await,
                 )?;
-                conn.enable_recv_forward();
-                expect_unsupported("forward_held", conn.forward_held().map(|_| ()))?;
-                // Resolves at once rather than waiting for an EOF.
-                ringline::timeout(Duration::from_secs(5), conn.run_direct_echo())
-                    .await
-                    .map_err(|_| "run_direct_echo did not resolve".to_string())?;
                 // The connection still reads with `with_data`.
                 let mut got = Vec::new();
                 while got.len() < 4 {
@@ -1770,4 +1764,102 @@ fn a_reset_behind_buffered_bytes_read_once_is_reported_as_a_reset() {
             .expect("client did not finish"),
         Ok(())
     );
+}
+
+// ── Accepted connections ────────────────────────────────────────────
+
+static INBOUND: Mutex<Option<Result<(), String>>> = Mutex::new(None);
+
+/// An accepted plaintext connection is direct: it refuses the reads that
+/// need the ring, reads a message larger than its region in order, and
+/// answers it.
+struct InboundEcho;
+
+impl AsyncEventHandler for InboundEcho {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
+        async move {
+            let r = async {
+                if !conn.is_recv_direct() {
+                    return Err("an accepted plaintext connection is not direct".to_string());
+                }
+                expect_unsupported("segments", conn.segments().map(|_| ()))?;
+                expect_unsupported("recv_owned_segment", conn.recv_owned_segment().map(|_| ()))?;
+                expect_unsupported(
+                    "with_bytes_segments",
+                    conn.with_bytes_segments(|_| ParseResult::NeedMore).await,
+                )?;
+                let mut got = Vec::new();
+                while got.len() < FWD_TOTAL {
+                    let n = conn
+                        .with_bytes(|b| {
+                            got.extend_from_slice(&b);
+                            ParseResult::Consumed(b.len())
+                        })
+                        .await;
+                    if n == 0 {
+                        break;
+                    }
+                }
+                let want: Vec<u8> = (0..FWD_TOTAL).map(|i| pattern(1, i)).collect();
+                if got != want {
+                    return Err(format!("read {} bytes, not the pattern", got.len()));
+                }
+                conn.send(b"done")
+                    .map_err(|e| format!("send: {e}"))?
+                    .await
+                    .map_err(|e| format!("send: {e}"))?;
+                Ok(())
+            }
+            .await;
+            *INBOUND.lock().unwrap() = Some(r);
+            let _ = ringline::request_shutdown();
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        InboundEcho
+    }
+}
+
+#[test]
+fn an_accepted_plaintext_connection_receives_directly() {
+    let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    *INBOUND.lock().unwrap() = None;
+    let config = ConfigBuilder::new()
+        .workers(1)
+        .pin_to_core(false)
+        .max_connections(16)
+        .build()
+        .expect("config");
+    let (runtime, handles) = RinglineBuilder::new(config)
+        .bind("127.0.0.1:0".parse().unwrap())
+        .launch::<InboundEcho>()
+        .expect("launch");
+    let addr = runtime.bound_addr().expect("bound address");
+    let client = std::thread::spawn(move || {
+        let mut s = std::net::TcpStream::connect(addr).unwrap();
+        let data: Vec<u8> = (0..FWD_TOTAL).map(|i| pattern(1, i)).collect();
+        for piece in data.chunks(9_000) {
+            if s.write_all(piece).is_err() {
+                return Vec::new();
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut reply = [0u8; 4];
+        match std::io::Read::read_exact(&mut s, &mut reply) {
+            Ok(()) => reply.to_vec(),
+            Err(_) => Vec::new(),
+        }
+    });
+    common::join_workers(&runtime, handles);
+    let reply = client.join().unwrap();
+    assert_eq!(
+        INBOUND
+            .lock()
+            .unwrap()
+            .take()
+            .expect("handler did not finish"),
+        Ok(())
+    );
+    assert_eq!(reply, b"done");
 }

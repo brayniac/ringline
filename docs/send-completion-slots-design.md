@@ -68,11 +68,10 @@ together with the length the send reports on success.
 | `send`, `send_backpressured`, copy-only batch (io_uring) | Final pool slot (`SendCopyPool`), lifted onto the coalesced slab entry when the run is coalesced |
 | TLS send (io_uring) | The final ciphertext chunk's pool slot (`OpTag::Send`) |
 | Zero-copy batch (io_uring) | The `SendMsgZc` slab entry |
-| `forward_held` (io_uring) | The recv-forward slab entry |
 | `send_chain` (io_uring) | The chain's `ChainState` |
 | Any awaited send (mio) | The last `PendingSend` the call queued |
 
-Sends nothing awaits (`send_nowait`, `send_chain_nowait`, direct echo,
+Sends nothing awaits (`send_nowait`, `send_chain_nowait`,
 `forward_recv_buf`, TLS handshake and alert records) carry no id, and
 their completions settle nothing.
 
@@ -85,8 +84,7 @@ bytes its operations' CQEs reported.
 ## Failure
 
 - The in-flight operation fails: its id settles with the errno
-  (`WriteZero` for a zero-byte completion of a copy, zero-copy or
-  recv-forward send).
+  (`WriteZero` for a zero-byte completion of a copy or zero-copy send).
 - A failure, close or give-up drains the connection's queue: every id on
   a drained entry settles `ConnectionAborted`.
 - A completion, or a dropped retry, that arrives after `close_submitted`:
@@ -107,10 +105,11 @@ The slab entry's `release` clears the id without a check, and
 
 ## The futures
 
-`SendFuture` holds either a `SendId` or a result known at submission (an
-empty `forward_held` resolves `Ok(0)` without a send). Polling takes the
-result or records the polling task as the owner. Dropping it cancels the
-id: the entry becomes `Abandoned`, and the send itself continues.
+`SendFuture` holds either a `SendId` or a result known at submission (a
+`send_chain` whose closure submitted nothing resolves `Ok(0)` without a
+send). Polling takes the result or records the polling task as the owner.
+Dropping it cancels the id: the entry becomes `Abandoned`, and the send
+itself continues.
 
 Two awaited sends on one connection each resolve with their own result.
 

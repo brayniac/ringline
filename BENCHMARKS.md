@@ -44,10 +44,10 @@ default without saying so.
 
 | config | what it is | can a protocol use it? |
 |---|---|---|
-| `uring` | `run_direct_echo` — echo submitted from the completion handler, no task wakeup | no, echo only |
+| `uring` | `run_direct_echo` — echo submitted from the completion handler, no task wakeup (removed; see Reproducing) | no, echo only |
 | `uring-fwd` | `with_data` + `forward_recv_buf` — the ordinary read loop | **yes, this is the general path** |
-| `rfwd` | `enable_recv_forward` + `forward_held` — byte pipe | no, proxy only |
-| `mio` | ringline's epoll fallback (always the forward loop) | yes |
+| `rfwd` | `enable_recv_forward` + `forward_held` — byte pipe (removed; see Reproducing) | no, proxy only |
+| `mio` | ringline's epoll fallback (the forward loop; `--echo-mode forward` to rerun) | yes |
 | `tokio` | multi-thread work-stealing, canonical echo loop | yes, **tokio's default** |
 | `tokio-pc` | one `current_thread` runtime per core + `SO_REUSEPORT` | yes |
 | `tokio-splice` | multi-thread, `splice(2)` socket → pipe → socket | no, byte pipe |
@@ -202,10 +202,17 @@ through SystemsLab anvil-vm jobs on two hosts with the X710 PFs passed through
 (`ports = 4`, bonded, fixed `172.31.0.1/.2`).
 
 Server: `bench-server --runtime <ringline|tokio|tokio-uring> --workers 8`, plus
-`--echo-mode {direct,forward,recv-forward}` for ringline and
+`--echo-mode forward` for ringline and
 `--tokio-scheduler {multi-thread,per-core}` / `--tokio-echo {copy,splice}` for
 tokio. The mio arm is a `--features force-mio` build; `tokio-uring` needs
-`--features tokio-uring-arm`.
+`--features tokio-uring-arm`. The `uring` and `rfwd` arms cannot be rerun:
+ringline has no `run_direct_echo` or `forward_held`. `--echo-mode` is
+required with `--runtime ringline`: `copy` is a `with_data` + `send_nowait`
+loop and `forward` is `with_data` + `forward_recv_buf`; `direct` and
+`recv-forward` are refused. From 0.7.0-alpha.5 an accepted plaintext
+connection receives into its accumulator and `forward_recv_buf` sends the
+accumulator under a guard, so a rerun of `--echo-mode forward` measures that
+path, not the one in the `uring-fwd` row.
 
 Client: `bench-client --clients <n> --msg-size <bytes> --threads 16 --warmup 5
 --duration 20`.

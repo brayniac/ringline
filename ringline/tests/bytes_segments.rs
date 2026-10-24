@@ -159,10 +159,13 @@ fn check_lines(seen: &[Line], sent: &[Instant]) {
 
 // ── Lines, plaintext ────────────────────────────────────────────────────
 
+#[cfg(not(has_io_uring))]
 static PLAIN: Mutex<Vec<Line>> = Mutex::new(Vec::new());
 
+#[cfg(not(has_io_uring))]
 struct PlainLines;
 
+#[cfg(not(has_io_uring))]
 impl AsyncEventHandler for PlainLines {
     #[allow(clippy::manual_async_fn)]
     fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
@@ -174,6 +177,9 @@ impl AsyncEventHandler for PlainLines {
     }
 }
 
+// On io_uring an accepted plaintext connection receives directly and refuses
+// segmented reads (`recv_direct.rs`); the TLS tests cover io_uring.
+#[cfg(not(has_io_uring))]
 #[test]
 fn plaintext_lines_are_read_in_order() {
     let (shutdown, handles) = RinglineBuilder::new(test_config())
@@ -266,12 +272,15 @@ fn tls_lines_are_read_in_order() {
 
 // ── end_segments, then with_data ────────────────────────────────────────
 
+#[cfg(not(has_io_uring))]
 static AFTER_END: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 
 /// Reads the first line with `with_bytes_segments`, calls `end_segments`,
 /// and reads the next line with `with_data`.
+#[cfg(not(has_io_uring))]
 struct EndThenData;
 
+#[cfg(not(has_io_uring))]
 impl AsyncEventHandler for EndThenData {
     #[allow(clippy::manual_async_fn)]
     fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
@@ -311,6 +320,9 @@ impl AsyncEventHandler for EndThenData {
     }
 }
 
+// On io_uring an accepted plaintext connection receives directly and refuses
+// segmented reads (`recv_direct.rs`); the TLS tests cover io_uring.
+#[cfg(not(has_io_uring))]
 #[test]
 fn with_data_after_end_segments_reads_the_held_bytes() {
     let (shutdown, handles) = RinglineBuilder::new(test_config())
@@ -332,14 +344,18 @@ fn with_data_after_end_segments_reads_the_held_bytes() {
 
 /// Lines the client sends after the kept one: 3000 bytes each, about 150
 /// buffers of the 64-buffer ring.
+#[cfg(not(has_io_uring))]
 const FILLER_LINES: usize = 200;
 
+#[cfg(not(has_io_uring))]
 static KEPT: Mutex<Vec<bool>> = Mutex::new(Vec::new());
 
 /// Keeps the first line, reads `FILLER_LINES` more, then records whether the
 /// kept line is unchanged.
+#[cfg(not(has_io_uring))]
 struct KeepFirst;
 
+#[cfg(not(has_io_uring))]
 impl AsyncEventHandler for KeepFirst {
     #[allow(clippy::manual_async_fn)]
     fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
@@ -371,6 +387,9 @@ impl AsyncEventHandler for KeepFirst {
     }
 }
 
+// On io_uring an accepted plaintext connection receives directly and refuses
+// segmented reads (`recv_direct.rs`); the TLS tests cover io_uring.
+#[cfg(not(has_io_uring))]
 #[test]
 fn a_kept_value_is_unchanged_after_the_ring_is_reused() {
     let (shutdown, handles) = RinglineBuilder::new(test_config())
@@ -447,6 +466,7 @@ fn hold_cap_copied() -> u64 {
     recv_ring_count(ringline::metrics::recv_ring::HOLD_CAP_COPIED)
 }
 
+#[cfg(not(has_io_uring))]
 static LONG_PLAIN: Mutex<Vec<bool>> = Mutex::new(Vec::new());
 static LONG_TLS: Mutex<Vec<bool>> = Mutex::new(Vec::new());
 
@@ -460,8 +480,10 @@ async fn read_long(conn: &mut Connection, seen: &Mutex<Vec<bool>>) {
     seen.lock().unwrap().push(ok.expect("parsed"));
 }
 
+#[cfg(not(has_io_uring))]
 struct LongPlain;
 
+#[cfg(not(has_io_uring))]
 impl AsyncEventHandler for LongPlain {
     #[allow(clippy::manual_async_fn)]
     fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
@@ -489,6 +511,9 @@ impl AsyncEventHandler for LongTls {
 // The hold-cap counter is process-wide. Under nextest each test runs in its
 // own process, so a count here is this test's.
 
+// On io_uring an accepted plaintext connection receives directly and refuses
+// segmented reads (`recv_direct.rs`); the TLS tests cover io_uring.
+#[cfg(not(has_io_uring))]
 #[test]
 fn a_message_longer_than_the_hold_cap_completes() {
     let (shutdown, handles) = RinglineBuilder::new(test_config())

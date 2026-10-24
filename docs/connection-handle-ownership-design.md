@@ -129,15 +129,14 @@ The ownership claim is recorded by the event loop at accept time
 
 The read entry points — `with_data`, `with_data_result`, `with_bytes`,
 `recv_ready`, `segments`, `recv_owned_segment`, `with_segments`,
-`end_segments`, `try_with_data`, `eof_truncated`, `take_recv_sink` — are
-crate-private. Reading goes through `Connection` or `RecvHalf`, neither of
-which is `Copy`, so the read side cannot be aliased.
+`end_segments`, `try_with_data`, `eof_truncated` — are crate-private.
+Reading goes through `Connection` or `RecvHalf`, neither of which is `Copy`,
+so the read side cannot be aliased.
 `ConnCtx` is now a send/identity/lifecycle handle plus a way to *obtain* the
 read side (`take_recv`, `split`).
 
-The **forwarding** entry points stay public on purpose: `forward_to`,
-`forward_to_conn`, `forward_held`, `enable_recv_forward` and `run_direct_echo`
-move bytes kernel-side from source to sink and never surface them to the
+The **forwarding** entry points stay public on purpose: `forward_to` and
+`forward_to_conn` move bytes from source to sink and never surface them to the
 caller, so they cannot be used to observe a stream another reader owns. Their
 own "one forward at a time" rule is refused at runtime by the driver — and with
 the read methods private, that refusal is now reachable *only* through
@@ -269,11 +268,11 @@ halves. It grants no read or write of its own — which is what makes it being
 
 ### Why forwarding stayed on the token
 
-`forward_to`, `forward_to_conn`, `forward_held`, `enable_recv_forward` and
-`run_direct_echo` move bytes kernel-side and never surface them to the caller,
-so they cannot be used to observe a stream another reader owns. With the read
-*and* write methods private they also cannot be paired with an external
-operation on the same connection. Their own exclusivity is enforced two ways:
+`forward_to` and `forward_to_conn` move bytes from source to sink and never
+surface them to the caller, so they cannot be used to observe a stream another
+reader owns. With the read *and* write methods private they also cannot be
+paired with an external operation on the same connection. Their own
+exclusivity is enforced two ways:
 `RecvHalf::forward_to_conn` takes the sink's `&mut SendHalf` (compile time),
 and the token-named form refuses `EBUSY` when the sink's write half is out
 (run time). Keeping the latter reachable is what keeps that runtime refusal

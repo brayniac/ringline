@@ -181,7 +181,7 @@ Async futures access the driver via `CURRENT_DRIVER` thread-local (raw pointer, 
 
 ### Connection Lifecycle
 
-Inbound: acceptor → round-robin to worker → allocate `ConnectionTable` slot → submit a recv SQE (one-shot, re-armed per completion, unless `recv_multishot(true)` arms a multishot; direct-echo and recv-forward connections are one-shot in either mode, `Driver::recv_single`) → spawn `on_accept` task. Outbound: `connect(addr)` → allocate slot → submit connect SQE (optionally IO_LINK'd with timeout) → `ConnectFuture` resolves to new `ConnCtx`. On io_uring a plaintext outbound connection (`connect`, `connect_unix`) arms no ring receive: it receives directly into its accumulator, with a one-shot `RECV` armed when a read parks (`docs/recv-direct-design.md`). A TLS one uses the ring.
+Inbound: acceptor → round-robin to worker → allocate `ConnectionTable` slot → arm the ring receive (TLS) or the hangup poll (plaintext) → spawn `on_accept` task. Outbound: `connect(addr)` → allocate slot → submit connect SQE (optionally IO_LINK'd with timeout) → `ConnectFuture` resolves to new `ConnCtx`. On io_uring every plaintext connection, accepted or outbound, arms no ring receive: it receives directly into its accumulator, with a one-shot `RECV` armed when a read parks, and one `POLL_ADD(POLLRDHUP)` armed when it opens so a peer close is seen while nothing reads (`docs/recv-direct-design.md`). A TLS connection receives through the provided-buffer ring (one-shot, re-armed per completion, unless `recv_multishot(true)` arms a multishot).
 
 Close, on both backends: only `close_connection` (and the `DriverCtx` close) moves the connection to `Lifecycle::Closing`; it also sets `ConnSendState::close_pending`, and teardown finalizes once queued sends drain (io_uring: `try_finalize_close` submits the Close SQE, with a `shutdown` hard-linked ahead of it; mio: `drain_pending_closes` defers `finish_close`). A backend site that marks the connection closing directly leaks the slot — that was #368.
 
@@ -195,7 +195,7 @@ Zero-allocation wakers encode the `conn_index` (or `task_idx | STANDALONE_BIT`) 
 
 ### Buffer Systems
 
-- **ProvidedBufRing** — kernel-managed recv pool (one-shot and multishot recvs select buffers at completion time; io_uring only)
+- **ProvidedBufRing** — kernel-managed recv pool for TLS and UDP (one-shot and multishot recvs select buffers at completion time; io_uring only); a plaintext TCP or Unix connection receives into its accumulator
 - **SendCopyPool** — pre-allocated slots for copy sends (and TLS ciphertext)
 - **InFlightSendSlab** — tracks scatter-gather ZC sends until kernel notification
 - **RecvAccumulator** — per-connection contiguous recv buffer with O(1) advance; `with_bytes` take/put-back is O(1) via refcounted remainders (zero-copy holds even for pipelined parsing)
@@ -239,9 +239,9 @@ Ringline aims to minimize data copies on the hot path. Understanding where copie
 
 | Step | What happens | Copies |
 |------|-------------|--------|
-| Kernel → ProvidedBufRing | DMA into ring-provided buffer | 0 |
-| ProvidedBufRing → RecvAccumulator | `BytesMut::extend_from_slice()` | 1 |
-| Kernel → RecvAccumulator (outbound plaintext, io_uring) | One-shot `RECV` into the accumulator's free space, armed when a read parks; replaces the two rows above (`docs/recv-direct-design.md`) | 0 |
+| Kernel → RecvAccumulator (plaintext, io_uring) | One-shot `RECV` into the accumulator's free space, armed when a read parks (`docs/recv-direct-design.md`) | 0 |
+| Kernel → ProvidedBufRing (TLS, io_uring) | DMA of ciphertext into a ring-provided buffer, which goes to rustls; the plaintext is the TLS recv row below | 0 |
+| Kernel → read buffer → RecvAccumulator (mio) | `read()` into a per-worker buffer, then `extend_from_slice()` | 1 |
 | Accumulator → `with_data()` callback | Borrowed `&[u8]` into accumulator | 0 |
 | Accumulator → `with_bytes()` callback | `BytesMut::freeze()` → `Bytes` (O(1)), slicing via `Bytes::slice()` is O(1) refcount | 0 |
 | TLS recv | rustls plaintext drained into accumulator via `BufRead` | 1 |
@@ -313,7 +313,7 @@ Minimal — `with_data()` recv (pattern-match `PONG\r\n`, no value extraction), 
 
 ### Copy Semantics Design Principles
 
-1. **Recv buffer ownership**: The kernel writes into `ProvidedBufRing` (zero-copy DMA), then data is appended to the per-connection `RecvAccumulator` (1 copy). A plaintext outbound connection on io_uring skips the ring: the kernel writes into the accumulator directly (0 copies). After that, `with_bytes()` enables zero-copy parsing via `Bytes::slice()`. `with_data()` requires the parser to copy out any data it needs to keep.
+1. **Recv buffer ownership**: On io_uring a plaintext connection's receive writes into its `RecvAccumulator` directly (0 copies). A TLS connection's ciphertext lands in a `ProvidedBufRing` buffer and rustls copies the plaintext into the accumulator (1 copy). On mio, `read()` fills a per-worker buffer that is appended to the accumulator (1 copy). After that, `with_bytes()` enables zero-copy parsing via `Bytes::slice()`. `with_data()` requires the parser to copy out any data it needs to keep.
 
 2. **Send buffer ownership**: Ringline must own all memory referenced by SQEs (the submission must outlive the syscall). `SendCopyPool` provides pre-allocated slots for this. `SendGuard` is the escape hatch for zero-copy — it pins user memory and holds it alive until the kernel confirms completion.
 

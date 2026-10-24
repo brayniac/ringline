@@ -17,8 +17,7 @@
 //! per core, each with its own `SO_REUSEPORT` listener, which is as close to
 //! ringline's structure as tokio gets. [`TokioEcho::Splice`] isolates the
 //! second: `splice(2)` through a pipe moves the bytes without them ever
-//! entering user memory, which is the honest counterpart to ringline's
-//! `recv_forward`/`forward_held` byte pipe.
+//! entering user memory.
 //!
 //! Neither is a strawman-removal exercise. Both exist so that a published
 //! "ringline is N% faster than tokio" survives the obvious objection that it
@@ -237,8 +236,7 @@ async fn copy_echo(mut stream: tokio::net::TcpStream, msg_size: usize) {
 }
 
 /// Zero-copy echo: `splice(2)` socket → pipe → socket. The bytes never enter
-/// user memory, which is what ringline's `forward_held` achieves by holding
-/// the kernel's own recv buffers.
+/// user memory.
 #[cfg(target_os = "linux")]
 async fn splice_echo(stream: tokio::net::TcpStream) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;

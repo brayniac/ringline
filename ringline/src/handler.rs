@@ -1583,6 +1583,26 @@ impl<'a> DriverCtx<'a> {
             return Ok(());
         }
 
+        // A direct connection's receive is armed when a read parks and stays
+        // in flight until it completes, even if that read is dropped; it is
+        // cancelled by the `direct_recvs` slot its user_data carries. Reads
+        // resolve to EOF from here on, as below, and the receive's
+        // `-ECANCELED` completion wakes a parked reader.
+        if cs.recv_direct && !matches!(cs.lifecycle, crate::connection::Lifecycle::Connecting) {
+            if matches!(cs.read, crate::connection::ReadHalf::Open) {
+                cs.read = crate::connection::ReadHalf::Cancelled;
+            }
+            if cs.recv_direct_armed {
+                let target_ud = crate::completion::UserData::encode(
+                    crate::completion::OpTag::RecvDirect,
+                    conn.index,
+                    cs.recv_direct_slot,
+                );
+                self.ring.submit_async_cancel(target_ud.raw(), conn.index)?;
+            }
+            return Ok(());
+        }
+
         // Determine target op to cancel.
         let target_tag = if matches!(cs.lifecycle, crate::connection::Lifecycle::Connecting) {
             crate::completion::OpTag::Connect
@@ -3050,8 +3070,7 @@ impl<'a> DriverCtx<'a> {
     /// Close a connection. Marks it Closed and defers teardown (socket,
     /// buffers, executor cleanup, slot release) to the event loop's
     /// drain_pending_closes — releasing the slot here left the executor's
-    /// parked future, waiter flags, and recv sink alive into the slot's
-    /// next occupant.
+    /// parked future and waiter flags alive into the slot's next occupant.
     pub fn close(&mut self, conn: ConnToken) {
         if let Some(cs) = self.connections.get_mut(conn.index) {
             if cs.generation != conn.generation {

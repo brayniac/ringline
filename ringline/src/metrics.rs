@@ -259,13 +259,15 @@ pub mod park_abandon {
     pub const SEGMENT_READER: usize = 10;
     /// A fallback recv is in flight against this worker's send pool.
     pub const RECV_FALLBACK: usize = 11;
-    /// A direct-echo response is queued for the next flush.
-    pub const DIRECT_ECHO: usize = 12;
     /// The slot was recycled while the install was in flight.
-    pub const SLOT_RECYCLED: usize = 13;
+    pub const SLOT_RECYCLED: usize = 12;
     /// The `FixedFdInstall` failed, or the linked recv-cancel returned
     /// `ECANCELED` because the recv had self-terminated.
-    pub const INSTALL_FAILED: usize = 14;
+    pub const INSTALL_FAILED: usize = 13;
+    /// A receive, a hangup poll or a hangup peek was armed when the install
+    /// completed. Arms are refused while a park is pending, so this counts
+    /// a path that armed one anyway.
+    pub const RECEIVE_ARMED: usize = 14;
 
     /// Number of slots. Sizing the group from this keeps the width and the
     /// range check from drifting apart.
@@ -334,8 +336,8 @@ pub mod recv_ring {
     pub const HOLD_CAP_COPIED: usize = 7;
     /// Bytes copied into receive storage, on both backends: appended to or
     /// merged in a connection's accumulator (with the bytes a reallocation
-    /// moves), prepended to it, or copied into an owned `segment_hold` entry
-    /// or an owned `recv_hold` copy, TLS plaintext the unbuffered engine
+    /// moves), prepended to it, or copied into an owned `segment_hold` entry,
+    /// TLS plaintext the unbuffered engine
     /// stashes when the send path decrypts it, and values `copy_small_view`
     /// copies. Ciphertext staged for TLS is not counted.
     pub const BYTES_COPIED: usize = 8;
@@ -451,7 +453,8 @@ pub mod pool {
     /// response exceeds the provided ring.
     pub const RECV_FALLBACK: usize = 5;
     /// A connection holding received data (a `forward_to` source, a segment
-    /// reader, a recv-forward or direct-echo connection) reached its hold cap
+    /// reader, or a connection whose `forward_recv_buf` sends are unfinished)
+    /// reached its hold cap
     /// (`forward_hold_cap`, lowered as `ConfigBuilder::forward_hold_cap` says)
     /// and had its recv stopped (a one-shot recv not re-armed, a multishot one
     /// cancelled), so its TCP window closes and its peer is backpressured;
@@ -657,7 +660,6 @@ pub fn init_metadata() {
         "op".into(),
         "recv_fallback".into(),
     );
-    PARK_ABANDONED.insert_metadata(park_abandon::DIRECT_ECHO, "op".into(), "direct_echo".into());
     PARK_ABANDONED.insert_metadata(
         park_abandon::SLOT_RECYCLED,
         "op".into(),
@@ -667,6 +669,11 @@ pub fn init_metadata() {
         park_abandon::INSTALL_FAILED,
         "op".into(),
         "install_failed".into(),
+    );
+    PARK_ABANDONED.insert_metadata(
+        park_abandon::RECEIVE_ARMED,
+        "op".into(),
+        "receive_armed".into(),
     );
 
     BYTES.insert_metadata(bytes::RECEIVED, "op".into(), "received".into());
@@ -956,12 +963,16 @@ mod cqe_tag_tests {
     /// which gaps we expect, rather than letting an unnoticed new one look
     /// normal — an unregistered slot reads as a counter stuck at zero.
     ///
-    /// Slots 1 and 17 have no `OpTag` variant.
+    /// Slots 1, 17, 26 and 27 have no `OpTag` variant.
     #[test]
     fn expected_slots_are_unused() {
         let unused: Vec<usize> = (0..cqe_tag::COUNT)
             .filter(|i| OpTag::from_u8(*i as u8).is_none())
             .collect();
-        assert_eq!(unused, vec![1, 17], "unexpected unused CQE_BY_TAG slots");
+        assert_eq!(
+            unused,
+            vec![1, 17, 26, 27],
+            "unexpected unused CQE_BY_TAG slots"
+        );
     }
 }

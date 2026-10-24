@@ -1,11 +1,11 @@
 # Direct receive: one-shot receives into the connection's accumulator
 
-Status: merged (#684). Since decision 11, every outbound plaintext
-connection on io_uring receives this way, with no option. Measured through
-build C8 and at 250 and 1,000 connections per worker (Evidence, "Scale");
-owner decisions made (see Decisions). Open: the cause of `c`'s higher p99 in
-four cells and of its higher CPU at 64 B unpipelined (see Not known), and
-accepted connections.
+Status: merged (#684). Since decisions 11 and 15, every plaintext
+connection on io_uring, outbound or accepted, receives this way, with no
+option. Measured through build C8 and at 250 and 1,000 connections per
+worker (Evidence, "Scale"), and for accepted connections in a RESP server
+(Evidence, "Accepted connections"); owner decisions made (see Decisions).
+Open: the causes listed under Not known.
 
 Related: `docs/recv-buffering-approaches.md` ("One-shot receive into
 connection-owned memory", "Per-connection rings"),
@@ -13,7 +13,7 @@ connection-owned memory", "Per-connection rings"),
 
 ## Goal
 
-A plaintext outbound connection on io_uring, from `connect` or
+A plaintext connection on io_uring, accepted or from `connect` or
 `connect_unix`, receives without a provided buffer. Each
 receive is a one-shot `RECV` whose destination is the free space of the
 connection's `RecvAccumulator`. The kernel writes the bytes where `with_data`
@@ -21,7 +21,8 @@ and `with_bytes` read them, so the copy from a provided buffer into the
 accumulator does not happen, and neither does the move of buffered bytes when
 the accumulator grows. Parsers and the protocol crates do not change.
 
-The intended user is a client making outbound plaintext connections.
+The first user was a client making outbound plaintext connections;
+decision 15 extends it to accepted connections.
 
 ## Evidence
 
@@ -268,6 +269,54 @@ and recorded wrong bytes in the variant that rewrites a posted entry, one
 `RLIMIT_MEMLOCK` page per ring on 7.1, and regions that grew to their cap and
 stayed (`recv-buffering-approaches.md`).
 
+### Accepted connections (RESP server, 1,000 and 8,000 connections)
+
+These runs used a prototype of this change (brayniac/ringline d960afe; specs
+at 060260f) that had neither the hangup poll nor the single-`sendmsg`
+multi-slot send (#697). The poll's cost is not measured. #697 changes only
+the GET 4 KiB depth-16 cells at 16 KiB send slots, where a flush spans up to
+5 slots. Both ringline arms send through the same path, so #697 is expected
+to affect them alike; this is not measured.
+
+A RESP server (`ringline-bench` `resp-server` at d960afe, bins
+`01a164ab-e6aa-73c2-fd0b-2feb02733191`) ran with 8 workers on one VM and
+cachecannon with 16 threads on another, no rate limit, at 1,000 and 8,000
+connections. Arms: `ring` (one-shot receives from the provided-buffer ring),
+`direct` (accepted connections receive directly) and `tokio` (one
+current-thread runtime per core, reading into a 64 KiB `BytesMut`). Runs
+`01a164e0-24aa-71bc-ce35-4a84ec0c51bc`,
+`01a164e0-2817-71bf-da2b-238030fa20ce` (ring),
+`01a164e0-26a5-7121-403d-f1bebde5c2c4`,
+`01a164e0-27a2-71b3-ef7b-45731668ff1e` (direct) and
+`01a164e0-2718-7185-c1fe-34adadde25f1` (tokio, one run), and with 128 KiB
+send-pool slots `01a16631-073f-719c-03aa-d21614dfc776`,
+`01a16631-087e-7112-eff4-8c1091346236` (ring),
+`01a16631-07b0-7180-c61e-a43f144647ee` and
+`01a16631-0813-718f-adf3-9ed51d31ac45` (direct). The table lists the 16 KiB
+runs. Two runs of one arm differed by up to 9% on a GET cell (the depth-1
+cells), and by 0 to 5% in the cells below.
+
+| Cell | ring ops/s | direct ops/s | tokio ops/s |
+|---|---:|---:|---:|
+| GET 4 KiB, depth 16, 1,000 conns | 1.88M / 1.79M | 1.83M / 1.83M | 2.28M |
+| GET 64 B, depth 16, 8,000 conns | 2.07M / 2.02M | 1.99M / 2.07M | 2.35M |
+| SET 4 KiB, depth 16, 8,000 conns | 891k / 866k | 984k / 1,006k | 1,087k |
+| SET 64 KiB, depth 1, 1,000 conns | 68.0k / 66.3k | 71.3k / 73.1k | 75.6k |
+
+- GET throughput and server CPU per request: equal within the run-to-run
+  spread.
+- SET: direct is ahead on the means of the two runs, by 7.5% at 64 KiB with
+  1,000 connections, 6% at 64 KiB with 8,000 and 13% at 4 KiB depth 16 with
+  8,000, where its p99 was 155 ms against 313 ms. The ring arm's
+  provided ring went empty 1M to 16M times per cell at 8,000 connections.
+- RSS: direct is 0.3 to 0.6 GiB higher at 8,000 connections.
+- p99 at GET depth 16 with 8,000 connections is higher on direct (Not
+  known). A depth-1 p99 difference in the first two direct runs did not
+  recur in two later runs of the same build.
+- The server's per-connection flush counts per 5 s interval show no
+  starved connection in any arm: the least-served connection had 84 to 98%
+  of the median in the ring and direct arms.
+
 ## Mechanism
 
 ### When a receive is armed
@@ -512,11 +561,26 @@ documents "The connection is closed if the cap is exceeded").
 `try_finalize_close` cancels a multishot receive by its user data, gated on
 `recv_multishot_armed`, which a direct connection never sets. The direct
 receive is ended by the close's lead instead: `shutdown` before 6.13,
-`ASYNC_CANCEL` of every request on the fixed file from 6.13. Outbound
-connections are never handed to another worker, and a handed-off socket is
-the only case that closes without a lead. The buffer stays in its slab entry
+`ASYNC_CANCEL` of every request on the fixed file from 6.13. A handed-off
+socket (park, below) is the only case that closes without a lead, and a
+park ends the receive and the hangup poll before the hand-off. The buffer stays in its slab entry
 until the receive's completion. If that completion arrives after the slot
 holds another connection, the generation check treats it as stale.
+
+### Park
+
+A park (`offer_for_park`, merged accept mode) moves an accepted connection's
+socket to another worker. On a direct connection `begin_park` cancels the
+direct receive of a parked read, if one is in flight (its user_data carries
+the `direct_recvs` index, kept in `ConnectionState::recv_direct_slot`), and
+the hangup poll. The install waits until neither is armed
+(`drive_park_drains`), and `arm_direct_recv_or_close` refuses to arm while a
+park is pending (`Driver::park_pending`), so a reader that polls again in
+that time stays parked with no receive. Bytes received before the cancel
+withdraw the offer, as on the ring path. The adopting worker arms the
+hangup poll when it installs the connection, and its reader arms a receive
+when it parks. An abandoned park arms the hangup poll again and wakes the
+reader (`rearm_direct_after_park`).
 
 ### Worker exit
 
@@ -537,9 +601,9 @@ checked whether the cancel can still be pending after 10 s.
 - `try_with_data` does not park or arm a receive. While a receive is in
   flight, for example after a parked read was dropped, the buffered bytes
   are in that receive's buffer and `try_with_data` returns `None`.
-- `segments`, `recv_owned_segment`, `with_segments`, `with_bytes_segments`,
-  `forward_to` and `forward_held` return `io::ErrorKind::Unsupported`. They
-  read held provided buffers, and a direct connection has none.
+- `segments`, `recv_owned_segment`, `with_segments`, `with_bytes_segments`
+  and `forward_to` return `io::ErrorKind::Unsupported`. They read held
+  provided buffers, and a direct connection has none.
 - `forward_to_conn` sends from the accumulator (`DirectForward` in
   `runtime/io.rs`): it takes what the accumulator holds, up to what is left
   of the length, and sends it on the sink through the sink's send queue
@@ -549,11 +613,9 @@ checked whether the cancel can still be pending after 10 s.
   the same connection is refused with `EBUSY` (`direct_forwarding` on
   `ConnectionState`). A send the runtime cannot submit resolves the forward
   with that error and puts the chunk back in front of the accumulator.
-- `enable_recv_forward` does nothing on a direct connection, because it
-  returns `()`; `forward_held` then returns `Unsupported`. `run_direct_echo`
-  resolves at once, because its output is `()`.
-- `forward_recv_buf` is a send from the accumulator and is not refused. It
-  has not been tested on a direct connection.
+- `forward_recv_buf` is a send from the accumulator and is not refused. The
+  `forward_echo_*` tests in `ringline/tests/echo.rs` run it on accepted
+  direct connections.
 - TLS: a TLS connection receives through the provided-buffer ring. The
   kernel's bytes are ciphertext, and rustls copies the plaintext into the
   accumulator in any case.
@@ -561,12 +623,13 @@ checked whether the cancel can still be pending after 10 s.
   per worker and appends to the accumulator (`handle_readable`); reading
   plaintext connections into the accumulator's spare capacity is a separate
   change.
-- Accepted connections: not covered.
+- `cancel`: finishes the read half and cancels the receive in flight.
 
 ## API
 
-- None to choose it: `connect` and `connect_unix` connections receive this
-  way on io_uring unless they use TLS (decision 11). `TcpConnect::recv_direct`
+- None to choose it: accepted, `connect` and `connect_unix` connections
+  receive this way on io_uring unless they use TLS (decisions 11 and 15).
+  `TcpConnect::recv_direct`
   and the client crates' `recv_direct` config options were removed.
 - `ConfigBuilder::recv_direct_region(bytes)`, the size of a connection's
   own buffer, default 32 KiB, at least 1.
@@ -681,8 +744,9 @@ connection.
 
 Done: the 64 B fix (C3), the pool (C5), its growth and eviction fix (C7),
 throughput and latency of the commit (C8), the PR (#684), the three client
-configs made opaque, the scale run, and direct receive for every outbound
-plaintext connection (decision 11).
+configs made opaque, the scale run, direct receive for every outbound
+plaintext connection (decision 11), and for every accepted one, with the
+hangup poll and park (decisions 15 to 17).
 
 1. The cause of `c`'s higher p99 at memcache 4 KiB depth 16, mixed depth 16,
    1 MiB idle and RESP 64 B (Evidence): a profile of the 4 KiB depth-16
@@ -736,15 +800,33 @@ Made by the owner on 2026-10-21:
 14. No control run with the one-shot ring for the 64 B cost, and no second
     4,000-connection run.
 
+Made by the owner on 2026-10-22 and 2026-10-23:
+
+15. Every accepted plaintext connection on io_uring receives directly, with
+    no option, based on the accepted-connection runs.
+16. Remove `enable_recv_forward`, `forward_held`, `run_direct_echo` and
+    `set_recv_sink` on both backends: after 15 no io_uring connection
+    receives through the path they read, except a TLS one, where they did
+    nothing.
+17. Park carries a direct connection, instead of refusing it.
+
 Open: whether the scanner PRs in `resp-proto` and `memcache-proto` are
 closed or merged without a release.
 
 ## Not known
 
+- The cost of the TCP provided-buffer ring that every worker still
+  registers (256 × 16 KiB by default) for a server with no TLS listener,
+  which now never receives through it.
+
 - The cost of the hangup poll's wait-queue entry on busy connections (every
   socket wakeup runs its callback), and how much memory the delayed release
   of closed sockets holds before 6.13 on a ring with long-lived idle
   connections (Mechanism, the hangup poll).
+- Why GET p99 at depth 16 with 8,000 accepted connections is higher on
+  direct than on the ring (86 to 94 ms against 68 to 75 ms at 64 B, four
+  runs each, two with 16 KiB and two with 128 KiB send slots), with a lower
+  p50. The 5 s flush counts cannot show stalls shorter than the interval.
 
 - Why `c`'s p99 is higher than A's in four cells (Evidence, C8 latency).
 - Why `c`'s throughput gain at 4 KiB depth 16 with the client limited
