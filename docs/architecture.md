@@ -235,10 +235,16 @@ zero-copy through encryption. All TLS ciphertext chunks are serialized through
 the same connection queue: independent io_uring SQEs are not wire-ordered, so
 parallel TLS record submissions can interleave records.
 
-On close, the runtime emits `close_notify`, drains its queued ciphertext, then
-closes the socket. `close_notify_timeout_ms` bounds this graceful phase; an
-expired deadline forces close. `ConnCtx::eof_truncated` distinguishes a TCP FIN
-without peer `close_notify` from a clean TLS EOF.
+On a close the application requests (`ConnCtx::close()`, a handler return,
+`DriverCtx::close`), the runtime queues `close_notify` behind the
+connection's queued sends and closes the socket once they drain. On io_uring,
+a close the runtime makes after a receive error, a reset, a send that could
+not be pushed, or after the peer closed sends no alert, a TLS send after the
+alert is refused, and `close_notify_timeout_ms` bounds the drain only for
+`DriverCtx::close`. On mio every TLS close attempts to write the alert once,
+without blocking, after the queued sends drain, and the timeout is not used.
+`ConnCtx::eof_truncated` distinguishes a TCP FIN without peer `close_notify`
+from a clean TLS EOF.
 
 ## Backpressure, shutdown, and failures
 

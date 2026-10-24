@@ -3121,6 +3121,52 @@ impl Driver {
         self.pending_send_retries.push((conn_index, generation, 0));
     }
 
+    /// Close a connection the application asked to close (`ConnCtx::close`, or
+    /// its task finishing). A TLS connection first queues its close_notify, so
+    /// the peer can tell the close from a truncation. A close the backend makes
+    /// after a receive error, a reset or a failed send CQE goes through
+    /// [`close_connection`](Self::close_connection) and sends no alert; an
+    /// encryption failure closes through `DriverCtx::close`, which still queues
+    /// one.
+    pub(crate) fn close_connection_graceful(&mut self, conn_index: u32) {
+        if self
+            .connections
+            .get(conn_index)
+            .is_some_and(|c| !c.close_requested())
+        {
+            self.queue_tls_close_notify(conn_index);
+        }
+        self.close_connection(conn_index);
+    }
+
+    /// Queue a TLS connection's close_notify alert through its send queue, so
+    /// it goes out after any queued sends and ahead of the FIN. No deadline is
+    /// armed: the queue drains however long the peer takes, as for a plaintext
+    /// connection. Does nothing for a plaintext connection, a socket handed off
+    /// to another worker, or one whose write side is shut down or has a
+    /// shutdown pending behind its queued sends.
+    fn queue_tls_close_notify(&mut self, conn_index: u32) {
+        if self.connections.get(conn_index).is_some_and(|c| {
+            c.socket_handed_off || !matches!(c.write, crate::connection::WriteHalf::Open)
+        }) {
+            return;
+        }
+        let generation = self.connections.generation(conn_index);
+        let mut sends = Vec::new();
+        match self.tls_table.as_mut() {
+            Some(tls) if tls.has(conn_index) => tls.send_close_notify_queued(
+                conn_index,
+                generation,
+                &mut self.send_copy_pool,
+                &mut sends,
+            ),
+            _ => return,
+        }
+        if !sends.is_empty() {
+            self.queue_built_sends(conn_index, &mut sends);
+        }
+    }
+
     /// Queue a batch of built sends in order through the per-connection
     /// send queue. Infallible: `submit_or_queue_send` parks under SQ
     /// pressure rather than failing, so every entry is committed in order

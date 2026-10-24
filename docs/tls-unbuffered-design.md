@@ -514,7 +514,8 @@ one. Out of scope.
 
 `queue_close_notify(outgoing_tls)` encrypts the alert into a pool slot, which is
 then queued like any other send. The existing `close_notify_timeout_ms` deadline
-and force-close behavior (fixed in #325's batch) apply unchanged.
+and force-close behavior (fixed in #325's batch) apply unchanged (to
+`DriverCtx::close`; the application-close paths arm no deadline).
 
 ### Both backends
 

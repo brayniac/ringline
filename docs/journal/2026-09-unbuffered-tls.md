@@ -176,7 +176,8 @@ engine**, and stays that way until follow-on work. rustls has no equivalent of
 the buffered `ServerConnection`. Recovering it needs a `ClientHello` callback
 on `ServerConfig`. Real, user-visible, in the CHANGELOG.
 
-**A pre-existing io_uring bug, found but not fixed here.** `ConnCtx::close()`
+**A pre-existing io_uring bug, found but not fixed here** (fixed in #706;
+see open item 3). `ConnCtx::close()`
 (`runtime/io.rs`) calls `Driver::close_connection`, which on io_uring only sets
 `recv_mode = Closed` and tears down recv/forward-write state — it never queues
 close_notify. The TLS close_notify queueing lives in `DriverCtx::close(conn:
@@ -299,7 +300,9 @@ PR scoped.
    that is currently wrong on both engines.
 2. **`ConnCtx::send(&[])` on a TLS connection never resolves** — the waiter is
    set but no SQE is submitted. Same shape as the plaintext path.
-3. **`ConnCtx::close()` on io_uring sends a bare FIN.** It routes to
+3. **`ConnCtx::close()` on io_uring sends a bare FIN.** (Fixed in #706: both
+   `ConnCtx::close()` and a handler return now go through
+   `Driver::close_connection_graceful`, which queues the alert.) It routed to
    `Driver::close_connection`, which only sets `close_pending`; close_notify
    queueing lives in `DriverCtx::close(ConnToken)`, which that path never
    reaches. The peer cannot distinguish clean shutdown from truncation.

@@ -868,7 +868,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     match result {
                         Ok(std::task::Poll::Ready(())) => {
                             // Task completed — connection handler is done.
-                            driver.close_connection(conn_index);
+                            driver.close_connection_graceful(conn_index);
                             executor.remove_connection(conn_index);
                         }
                         Ok(std::task::Poll::Pending) => {

@@ -431,10 +431,11 @@ pub struct Config {
     /// 0 = disabled (filesystem/direct I/O operations return `Unsupported`).
     /// Default: 2.
     pub(crate) disk_io_threads: usize,
-    /// Maximum time in milliseconds to wait for a TLS close_notify send to
-    /// complete before force-closing the connection. When a TLS connection
-    /// sends close_notify but the send never completes (e.g., due to pool
-    /// exhaustion), this prevents the connection from hanging indefinitely.
+    /// How long, in milliseconds, a TLS close requested through
+    /// `DriverCtx::close` waits for its queued sends and close_notify to drain
+    /// before the connection is closed without them. `ConnCtx::close()` and a
+    /// handler return are not bounded: their queued sends drain until the peer
+    /// reads them or the connection fails. Not used on the mio backend.
     /// Default: 5000.
     pub(crate) close_notify_timeout_ms: u64,
 }
@@ -1438,7 +1439,12 @@ impl ConfigBuilder {
         self
     }
 
-    /// Set the TLS close_notify timeout in milliseconds. Default: 5000.
+    /// How long, in milliseconds, a TLS close requested through
+    /// `DriverCtx::close` waits for its queued sends and close_notify to drain
+    /// before the connection is closed without them. `ConnCtx::close()` and a
+    /// handler return are not bounded: their queued sends drain until the peer
+    /// reads them or the connection fails. Not used on the mio backend.
+    /// Default: 5000.
     pub fn close_notify_timeout_ms(mut self, ms: u64) -> Self {
         self.config.close_notify_timeout_ms = ms;
         self

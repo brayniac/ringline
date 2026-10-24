@@ -2638,6 +2638,18 @@ impl ConnCtx {
 
     /// Close this connection.
     ///
+    /// Queued sends drain first, then, on a TLS connection, a close_notify
+    /// alert, then the FIN. The drain has no time bound: a peer that stops
+    /// reading holds the connection until it reads, resets, or the worker
+    /// exits. On io_uring, if a close is already pending, for example because
+    /// the peer closed first, this sends no alert; mio writes the alert at
+    /// teardown regardless. No alert follows a write shutdown
+    /// (`shutdown_write`).
+    ///
+    /// On io_uring a TLS send made after `close()` returns `NotConnected`,
+    /// because it would follow the alert. On mio it is queued and sent ahead of
+    /// the alert, which mio writes once the queue drains.
+    ///
     /// Does nothing if the connection has already been released (its slot may
     /// now hold another connection), or when called outside the worker's
     /// executor.
@@ -2652,6 +2664,9 @@ impl ConnCtx {
         if driver.connections.generation(self.conn_index) != self.generation {
             return;
         }
+        #[cfg(has_io_uring)]
+        driver.close_connection_graceful(self.conn_index);
+        #[cfg(not(has_io_uring))]
         driver.close_connection(self.conn_index);
     }
 
@@ -6247,7 +6262,9 @@ enum BackpressuredState {
 ///   or was shut down while this send was waiting.
 /// - [`ConnectionAborted`](io::ErrorKind::ConnectionAborted) — the connection
 ///   closed while waiting or in flight.
-/// - [`NotConnected`](io::ErrorKind::NotConnected) — the connection's close was
+/// - [`NotConnected`](io::ErrorKind::NotConnected) — on io_uring, the
+///   connection is TLS and its close_notify is already queued (`close()`, a
+///   handler return or `DriverCtx::close`); or the connection's close was
 ///   *committed* while this send waited for capacity. A waiter in the admission
 ///   FIFO is neither in flight nor in the per-connection send queue, so it does
 ///   not hold off `try_finalize_close`; if the close is finalized while it
@@ -6336,6 +6353,16 @@ impl Future for BackpressuredSendFuture<'_> {
                             io::ErrorKind::BrokenPipe,
                             "write half is shut down",
                         )));
+                    }
+                    // Likewise a TLS connection whose close_notify is queued:
+                    // the send would be refused once it won capacity.
+                    #[cfg(has_io_uring)]
+                    if driver
+                        .tls_table
+                        .as_ref()
+                        .is_some_and(|t| t.close_notify_sent(this.conn_index))
+                    {
+                        return this.finish(Err(crate::handler::close_notify_sent_error()));
                     }
                     let needed = {
                         let ctx = driver.make_ctx();
