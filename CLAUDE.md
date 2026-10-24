@@ -327,13 +327,13 @@ Minimal — `with_data()` recv (pattern-match `PONG\r\n`, no value extraction), 
    **not** reduce the copy count: application data still costs 2 copies,
    because rustls encrypts each record into a fresh per-record buffer and
    copies the result into the destination (`write_fragments`), and because the
-   copy the feature was meant to remove (`sendable_plaintext`) only happens
-   *before* the handshake completes. Recv costs 3 copies on both engines.
-   Handshake ciphertext on io_uring pays one copy *more* than the buffered
-   engine (`EncodeTlsData::encode` needs one contiguous buffer that can exceed
-   a pool slot, so it goes through a scratch `Vec` first) — a one-time
-   per-connection cost. Getting the intended 1-copy send would require rustls
-   to encrypt in place into `outgoing_tls`, which it does not do. See
+   copy the unbuffered engine was meant to remove (`sendable_plaintext`) only
+   happens *before* the handshake completes. Recv costs 3 copies on both
+   engines. Handshake ciphertext on io_uring pays one copy *more* than the
+   buffered engine (`EncodeTlsData::encode` needs one contiguous buffer that
+   can exceed a pool slot, so it goes through a scratch `Vec` first) — a
+   one-time per-connection cost. Getting the intended 1-copy send would require
+   rustls to encrypt in place into `outgoing_tls`, which it does not do. See
    `docs/tls-unbuffered-design.md`.
 
 4. **Client choice of `with_data` vs `with_bytes`**: This is the single biggest design decision for recv-side copy count. `with_bytes` enables true zero-copy parsing but requires the protocol parser to work with `Bytes` (refcounted slices). `with_data` is simpler but forces a copy.

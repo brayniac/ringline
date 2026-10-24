@@ -22,12 +22,12 @@
 //! Which engine drives a connection is decided once, in
 //! [`TlsTable::create`]/[`TlsTable::create_client`]: the unbuffered engine,
 //! unless the `tls-buffered` cargo feature selects the buffered one. Backends
-//! never see that choice: `backend_mio` and `backend_uring` each dispatch their backend's entry points to whichever
-//! engine is compiled in, keeping the names and signatures the backend already
-//! called. `drain_tls_plaintext` below is the buffered engine's plaintext
-//! drain and is reached only from `buffered` (the unbuffered engine drains
-//! `ReadTraffic` itself); it is not an engine-agnostic helper despite living
-//! here.
+//! never see that choice: `backend_mio` and `backend_uring` each dispatch their
+//! backend's entry points to whichever engine is compiled in, keeping the names
+//! and signatures the backend already called. `drain_tls_plaintext` below is
+//! the buffered engine's plaintext drain and is reached only from `buffered`
+//! (the unbuffered engine drains `ReadTraffic` itself); it is not an
+//! engine-agnostic helper despite living here.
 
 #[allow(unused_imports)]
 use std::io::{self, Read as _, Write as _};

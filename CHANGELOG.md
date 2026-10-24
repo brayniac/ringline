@@ -261,10 +261,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (`send_backpressured`) on a TLS connection is refused when
   `send_copy_slot_size` is below one whole record (16413 bytes at the
   default fragment size), and below that size plain TLS sends emit one
-  record per slot; such a send that finds the pool short closes the
-  connection instead of returning an error, and if it had already sealed
-  records the peer reports a decryption failure instead of receiving
-  close_notify. The default slot (16448 bytes) holds one whole record.
+  record per slot; on io_uring such a send that finds the pool short returns
+  an error and closes the connection, and if it had already sealed records
+  the peer reports a decryption failure instead of receiving close_notify.
+  The default slot (16448 bytes) holds one whole record.
   `send_copy_slot_size` below 64 is rejected at build time when TLS is
   configured, and at launch when a `bind_tls` listener is. On io_uring,
   handshake output pays one more copy than on the buffered engine.

@@ -674,10 +674,9 @@ Under kTLS:
 
 - `tls_info()` must still work. `KernelConnection` exposes
   `negotiated_cipher_suite()` and `protocol_version()`, so those survive; ALPN
-  and SNI do **not** — they live on the consumed `CommonState`. **They must be
-  snapshotted into a `TlsInfo` before the handover.** (On the unbuffered
-  engine SNI is ringline's own field, `UnbufferedConn::sni`, so the snapshot
-  copies it.)
+  does **not** — it lives on the consumed `CommonState` — and SNI is
+  ringline's own field (`UnbufferedConn::sni`). **Both must be snapshotted
+  into a `TlsInfo` before the handover.**
 - `eof_truncated()` must keep distinguishing a peer `close_notify` from a bare
   FIN. Under kTLS that signal arrives as a control record via cmsg, not from
   rustls. New plumbing, same contract.

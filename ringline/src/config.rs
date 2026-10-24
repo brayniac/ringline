@@ -562,9 +562,10 @@ impl Config {
     /// `docs/tls-premutation-bound-design.md`. Plain TLS sends work below it on
     /// both engines: the buffered engine straddles slots freely, and the
     /// unbuffered engine still encrypts, emitting more records. Below it the
-    /// unbuffered engine has no up-front slot bound, so a plain send that finds
-    /// the pool short closes the connection instead of returning an error, and
-    /// bounded sends refuse themselves with a message naming the same knob.
+    /// unbuffered engine has no up-front slot bound, so on io_uring a plain
+    /// send that finds the pool short returns an error and closes the
+    /// connection, and bounded sends refuse themselves with a message naming
+    /// the same knob.
     /// This repo's own `tls_echo` tests run at 16384, 29 bytes under it.
     #[cfg(not(feature = "tls-buffered"))]
     fn validate_tls_slot_size(&self) -> Result<(), crate::error::Error> {
