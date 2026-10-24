@@ -4272,9 +4272,10 @@ impl SendHalf {
     /// resolves with the bytes the chain sent, or `Ok(0)` when the closure
     /// submitted nothing.
     ///
-    /// On a plaintext connection, `finish` returns `WouldBlock` while earlier
-    /// sends on the connection are in flight, since a linked chain would
-    /// overtake them; await them first. On a TLS connection the parts are not
+    /// On a plaintext connection, `finish` returns `WouldBlock` while a send on
+    /// the connection is in flight or queued, or another chain is active, since
+    /// a linked chain would overtake them; retry once they complete. On a TLS
+    /// connection the parts are not
     /// linked SQEs: `finish` gathers them, guard parts included, encrypts them
     /// as one send, and queues it behind the connection's other sends, so it
     /// does not refuse while earlier sends are in flight.

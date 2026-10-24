@@ -1033,8 +1033,8 @@ impl<'a> DriverCtx<'a> {
     /// Begin building an IO_LINK send chain for a connection.
     ///
     /// Multiple sends (copy-only or scatter-gather) are collected and submitted
-    /// as a linked SQE chain. The kernel executes them sequentially, and a single
-    /// `on_send_complete` fires when the entire chain is done.
+    /// as a linked SQE chain. The kernel executes them sequentially, and the
+    /// chain completes once, when every SQE in it has.
     ///
     /// On a TLS connection the parts are gathered, guard parts included,
     /// encrypted as one send and queued behind the connection's other sends.
@@ -4456,6 +4456,10 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
 /// as an atomic chain. The kernel executes linked SQEs sequentially. If any
 /// SQE fails, subsequent linked SQEs are cancelled with -ECANCELED.
 ///
+/// On a TLS connection the parts are not SQEs: they are gathered, encrypted
+/// as one send and queued behind the connection's other sends, so the chain
+/// completes as one send does.
+///
 /// Created via [`DriverCtx::send_chain`].
 pub struct SendChainBuilder<'b, 'a> {
     ctx: &'b mut DriverCtx<'a>,
@@ -4539,10 +4543,13 @@ impl<'b, 'a> SendChainBuilder<'b, 'a> {
         }
     }
 
-    /// Finalize and submit the chain.
+    /// Submit the chain.
     ///
-    /// All SQEs are linked with IO_LINK except the last. Registers chain
-    /// state in the SendChainTable for CQE tracking.
+    /// On a plaintext connection the SQEs are linked with IO_LINK except the
+    /// last; it returns `WouldBlock` while a send on the connection is in
+    /// flight or queued, or another chain is active. On a TLS connection the
+    /// parts are encrypted as one send and queued behind the connection's other
+    /// sends.
     pub fn finish(mut self) -> io::Result<()> {
         if let Some(e) = self.error.take() {
             // finished stays false — Drop will call release_all().
@@ -4711,7 +4718,9 @@ impl<'b, 'a> ChainPartsBuilder<'b, 'a> {
         self
     }
 
-    /// Add a zero-copy guard part to this scatter-gather SQE.
+    /// Add a zero-copy guard part to this scatter-gather SQE. On a TLS
+    /// connection its bytes are copied into the chain's plaintext in `add`,
+    /// and the guard is dropped there.
     pub fn guard(mut self, guard: GuardBox) -> Self {
         if self.chain.error.is_some() {
             return self;
