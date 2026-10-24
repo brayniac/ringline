@@ -2,8 +2,8 @@
 //! never reads, a forward whose peer never reads the reply) is stopped by its
 //! own TCP window, and another connection on the same worker keeps working.
 //! The accepted connections here are plaintext, so they receive directly: a
-//! receive is armed only while a read is parked, and a reader that does not
-//! read takes nothing off the socket. The ignored `forward_recv_buf` test
+//! receive is armed when a read parks, and a reader that does not read takes
+//! nothing off the socket. The ignored `forward_recv_buf` test
 //! records a case that is not throttled at all; see #638.
 #![cfg(has_io_uring)]
 #![allow(clippy::manual_async_fn)]

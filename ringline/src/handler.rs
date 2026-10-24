@@ -1583,9 +1583,9 @@ impl<'a> DriverCtx<'a> {
             return Ok(());
         }
 
-        // A direct connection has a receive in flight only while a read is
-        // parked; it is cancelled by the `direct_recvs` slot its user_data
-        // carries. Reads resolve to EOF from here on, as below, and the
+        // A direct connection's receive is armed when a read parks and stays
+        // in flight until it completes, even if that read is dropped; it is
+        // cancelled by the `direct_recvs` slot its user_data carries. Reads resolve to EOF from here on, as below, and the
         // receive's `-ECANCELED` completion wakes a parked reader.
         if cs.recv_direct && !matches!(cs.lifecycle, crate::connection::Lifecycle::Connecting) {
             if matches!(cs.read, crate::connection::ReadHalf::Open) {

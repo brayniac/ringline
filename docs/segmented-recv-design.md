@@ -301,7 +301,7 @@ nothing. The mechanism is **aggregate**, built on the occupancy counter:
   `recv_incremental`. The lent buffers a connection's `forward_recv_buf`
   sends hold are capped at a quarter of the ring's buffers; no TCP
   connection lends one on io_uring since every plaintext connection a task
-  can read from receives directly.
+  can read from receives directly, and TLS ones copy.
 - **Per-class-aware class selection & re-arm.** `arm_multishot_recv` must pick
   the smallest class ≥ target **with free buffers**, falling back to a deeper
   smaller non-empty class rather than arming against a drained ring. The re-arm

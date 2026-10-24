@@ -271,30 +271,30 @@ stayed (`recv-buffering-approaches.md`).
 
 ### Accepted connections (RESP server, 1,000 and 8,000 connections)
 
-These runs used a prototype of this change (brayniac/ringline d960afe;
-specs at 060260f, branch `exp/recv-direct-inbound`) that had neither the
-hangup poll nor the single-`sendmsg` multi-slot send (#697). The poll's cost
-is not measured. #697 changes only the GET 4 KiB depth-16 cells at 16 KiB
-send slots, where a flush spans up to 5 slots. Both ringline arms send
-through the same path, so #697 is expected to affect them alike; this is not
-measured.
+These runs used a prototype of this change (brayniac/ringline d960afe; specs
+at 060260f) that had neither the hangup poll nor the single-`sendmsg`
+multi-slot send (#697). The poll's cost is not measured. #697 changes only
+the GET 4 KiB depth-16 cells at 16 KiB send slots, where a flush spans up to
+5 slots. Both ringline arms send through the same path, so #697 is expected
+to affect them alike; this is not measured.
 
 A RESP server (`ringline-bench` `resp-server` at d960afe, bins
-`01a164ab-e6aa-73c2-fd0b-2feb02733191`) ran with 8 workers on one VM and cachecannon with 16 threads on another, no
-rate limit, at 1,000 and 8,000 connections. Arms: `ring` (one-shot receives
-from the provided-buffer ring), `direct` (accepted connections receive
-directly) and `tokio` (one current-thread runtime per core, reading into a
-64 KiB `BytesMut`). Runs `01a164e0-24aa-71bc-ce35-4a84ec0c51bc`,
+`01a164ab-e6aa-73c2-fd0b-2feb02733191`) ran with 8 workers on one VM and
+cachecannon with 16 threads on another, no rate limit, at 1,000 and 8,000
+connections. Arms: `ring` (one-shot receives from the provided-buffer ring),
+`direct` (accepted connections receive directly) and `tokio` (one
+current-thread runtime per core, reading into a 64 KiB `BytesMut`). Runs
+`01a164e0-24aa-71bc-ce35-4a84ec0c51bc`,
 `01a164e0-2817-71bf-da2b-238030fa20ce` (ring),
 `01a164e0-26a5-7121-403d-f1bebde5c2c4`,
 `01a164e0-27a2-71b3-ef7b-45731668ff1e` (direct) and
-`01a164e0-2718-7185-c1fe-34adadde25f1` (tokio, one run), and with
-128 KiB send-pool slots `01a16631-073f-719c-03aa-d21614dfc776`,
+`01a164e0-2718-7185-c1fe-34adadde25f1` (tokio, one run), and with 128 KiB
+send-pool slots `01a16631-073f-719c-03aa-d21614dfc776`,
 `01a16631-087e-7112-eff4-8c1091346236` (ring),
 `01a16631-07b0-7180-c61e-a43f144647ee` and
-`01a16631-0813-718f-adf3-9ed51d31ac45` (direct). The table lists the
-16 KiB runs. Two runs of one arm differed by up to 9% on a GET cell (the
-depth-1 cells), and by 0 to 5% in the cells below.
+`01a16631-0813-718f-adf3-9ed51d31ac45` (direct). The table lists the 16 KiB
+runs. Two runs of one arm differed by up to 9% on a GET cell (the depth-1
+cells), and by 0 to 5% in the cells below.
 
 | Cell | ring ops/s | direct ops/s | tokio ops/s |
 |---|---:|---:|---:|
