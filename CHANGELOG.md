@@ -658,6 +658,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- io_uring: a TLS connection that is a `forward_to` or `forward_to_conn`
+  source, or has a segment reader, stops receiving once its hold reaches the
+  hold cap (`forward_hold_cap`; without `recv_incremental`, at most a quarter
+  of the receive ring's buffers) and receives again once the hold drains.
+  Before, it kept receiving whatever its sink or reader did, its hold grew to
+  `recv_accumulator_max` (1 GiB by default), and the connection was then
+  closed. A plaintext connection receives only when a read or a forward
+  asks for bytes, so it was already stopped.
 - `ringline-redis`, `ringline-memcache` and `ringline-ping` `Pool::client`
   reconnect a slot whose connection is no longer alive (`is_alive()` is
   `false`) instead of handing it out. A connection the server closed while

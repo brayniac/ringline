@@ -1789,9 +1789,8 @@ impl Driver {
         // `with_data`/`with_bytes` reads resume — the domain is now the default,
         // so newly received bytes land in the accumulator. If the throttle-cancel
         // is still in flight, the re-arm has to wait for its ECANCELED, so the
-        // throttle flag is left set and that branch does it. On a re-arm failure
-        // the connection is left unarmed; the caller's next read errors and
-        // closes it (standard recovery).
+        // throttle flag is left set and that branch does it. A re-arm whose
+        // push fails is retried by `drain_recv_rearm_retries`.
         self.forward_recv_active[conn_index as usize] = false;
         if self.forward_hold_throttled[conn_index as usize] {
             let armed = self
@@ -1810,16 +1809,21 @@ impl Driver {
                 return ok;
             }
             self.forward_hold_throttled[conn_index as usize] = false;
+            // A multishot that ended with ENOBUFS before the cancel landed
+            // parked the connection in `recv_starved`; take it back, or the
+            // starved pass arms a second receive with the same user_data.
+            self.recv_starved.remove(conn_index);
             let open = self.connections.get(conn_index).is_some_and(|c| {
                 matches!(c.lifecycle, Lifecycle::Open) && matches!(c.recv_arm, RecvArm::Multi)
             });
             let generation = self.connections.generation(conn_index);
-            if open
-                && !self.park_pending(conn_index)
-                && self.submit_tcp_recv(conn_index, generation).is_ok()
-                && let Some(cs) = self.connections.get_mut(conn_index)
-            {
-                cs.recv_multishot_armed = true;
+            if open && !self.park_pending(conn_index) {
+                if self.submit_tcp_recv(conn_index, generation).is_err() {
+                    metrics::RING.increment(metrics::ring::RECV_ARM_FAILURES);
+                    self.recv_rearm_retries.push((conn_index, generation));
+                } else if let Some(cs) = self.connections.get_mut(conn_index) {
+                    cs.recv_multishot_armed = true;
+                }
             }
         }
         ok

@@ -1159,8 +1159,8 @@ impl ConfigBuilder {
     ///
     /// On io_uring no connection uses this: a plaintext connection receives
     /// directly into its accumulator (see [`connect`](crate::connect)), and a
-    /// TLS connection's segment hold is bounded by
-    /// [`recv_accumulator_max`](Self::recv_accumulator_max).
+    /// TLS connection's segment entries are heap copies, held to the hold cap
+    /// (see [`forward_hold_cap`](Self::forward_hold_cap)).
     pub fn recv_segment_reserve(mut self, reserve: u32) -> Self {
         self.config.recv_segment_reserve = reserve;
         self
@@ -1211,16 +1211,20 @@ impl ConfigBuilder {
     /// since plaintext connections receive into their accumulators and TLS
     /// ones copy.
     /// Larger values allow more recv in flight at the cost of more held
-    /// buffers or copies under a slow consumer: with `recv_incremental` a
-    /// segment hold can reach this many copies of up to one buffer each
-    /// (64 MiB at the default 64 × 1 MiB). Must be `>= 1`.
+    /// copies under a slow consumer. On io_uring a TLS connection's entries
+    /// are one record's plaintext each (at most 16 KiB), apart from the bytes
+    /// buffered when the hold was entered, so its hold is about the effective
+    /// cap × 16 KiB, plus what the receives completed before the throttle
+    /// takes effect deliver (one with one-shot receives; with multishot
+    /// receives, each completion posted before the cancel is submitted) and
+    /// the entries of the write in flight. Must be `>= 1`.
     ///
     /// Default: 64 (2× `MAX_IOVECS`).
     ///
-    /// On io_uring no connection uses this: a plaintext connection receives
-    /// directly into its accumulator (see [`connect`](crate::connect)), and a
-    /// TLS connection's segment hold is bounded by
-    /// [`recv_accumulator_max`](Self::recv_accumulator_max).
+    /// On io_uring only a TLS connection uses this, when it is a `forward_to`
+    /// or `forward_to_conn` source or has a segment reader: a plaintext
+    /// connection receives directly into its accumulator (see
+    /// [`connect`](crate::connect)).
     pub fn forward_hold_cap(mut self, cap: usize) -> Self {
         self.config.forward_hold_cap = cap;
         self

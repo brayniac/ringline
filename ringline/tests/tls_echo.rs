@@ -1343,6 +1343,150 @@ fn forward_to_conn_from_a_tls_source() {
     }
 }
 
+// ── A TLS forward source stops at the hold cap ─────────────────────────
+
+/// Forwards everything the TLS client sends to a sink that never reads.
+struct TlsForwardToStuckSink;
+
+static TLS_STUCK_SINK: Mutex<Option<SocketAddr>> = Mutex::new(None);
+
+impl AsyncEventHandler for TlsForwardToStuckSink {
+    #[allow(clippy::manual_async_fn)]
+    fn on_accept(&self, mut client: Connection) -> impl Future<Output = ()> + 'static {
+        async move {
+            let addr = TLS_STUCK_SINK.lock().unwrap().expect("sink addr not set");
+            let Ok(sink) = ringline::connect(addr).await else {
+                return;
+            };
+            let (mut sink_tx, _sink_rx) = sink.split();
+            // Wait for the client's first byte, so its flood starts after the
+            // forward is armed rather than landing in the accumulator first.
+            let n = client
+                .with_data(|d| {
+                    if d.is_empty() {
+                        ParseResult::NeedMore
+                    } else {
+                        ParseResult::Consumed(1)
+                    }
+                })
+                .await;
+            if n == 0 {
+                return;
+            }
+            // The ack is queued before the forward is armed, but both happen
+            // in this poll, before the ack's send is submitted, so the
+            // client's flood arrives after the forward is armed.
+            let _ = client.send_nowait(b"a");
+            let _ = client.forward_to_conn(&mut sink_tx, 1 << 30).await;
+        }
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        TlsForwardToStuckSink
+    }
+}
+
+/// A TLS `forward_to_conn` source whose sink does not read stops receiving
+/// once its hold reaches the cap, so its peer's writes stall. Without the
+/// throttle the source reads until its hold reaches `recv_accumulator_max`
+/// (1 GiB by default).
+#[test]
+fn a_tls_forward_source_with_a_stuck_sink_is_throttled() {
+    let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
+    for multishot in [false, true] {
+        tls_forward_to_stuck_sink(multishot);
+    }
+}
+
+/// One run of `a_tls_forward_source_with_a_stuck_sink_is_throttled`, with
+/// one-shot or multishot ring receives.
+fn tls_forward_to_stuck_sink(multishot: bool) {
+    const LIMIT: u64 = 64 << 20;
+
+    // Accepts the forward's sink connection and never reads from it.
+    let sink = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    *TLS_STUCK_SINK.lock().unwrap() = Some(sink.local_addr().unwrap());
+    let held = std::thread::spawn(move || sink.accept().map(|(s, _)| s));
+
+    let (certs, key) = generate_self_signed();
+    let config = test_config_builder()
+        .tls(TlsConfig::new(server_tls_config(certs.clone(), key)))
+        .forward_hold_cap(8)
+        .recv_multishot(multishot)
+        .build()
+        .expect("valid config");
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind("127.0.0.1:0".parse().unwrap())
+        .launch::<TlsForwardToStuckSink>()
+        .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
+    wait_for_server(&addr);
+
+    let server_name: ServerName<'_> = "localhost".try_into().unwrap();
+    let mut tls_conn =
+        rustls::ClientConnection::new(client_tls_config(&certs), server_name).unwrap();
+    let mut tcp = TcpStream::connect(&addr).unwrap();
+    tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut stream = rustls::Stream::new(&mut tls_conn, &mut tcp);
+    stream.write_all(b"g").unwrap();
+    stream.flush().unwrap();
+    let mut ack = [0u8; 1];
+    stream.read_exact(&mut ack).expect("forward armed ack");
+    let _ = stream;
+
+    // Flood from a thread until the count stops moving (throttled) or
+    // reaches the limit (not throttled), then shut the socket down to end a
+    // write the throttle has stalled.
+    let sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let counter = Arc::clone(&sent);
+    let control = tcp.try_clone().unwrap();
+    let writer = std::thread::spawn(move || {
+        let mut stream = rustls::Stream::new(&mut tls_conn, &mut tcp);
+        let chunk = vec![7u8; 1 << 20];
+        while counter.load(std::sync::atomic::Ordering::Relaxed) < LIMIT {
+            match stream.write(&chunk) {
+                Ok(n) => {
+                    counter.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    let started = Instant::now();
+    let (mut last, mut still_since) = (0u64, Instant::now());
+    let stalled = loop {
+        std::thread::sleep(Duration::from_millis(250));
+        let now = sent.load(std::sync::atomic::Ordering::Relaxed);
+        if now >= LIMIT || started.elapsed() > Duration::from_secs(30) {
+            break false;
+        }
+        if now != last {
+            (last, still_since) = (now, Instant::now());
+        } else if still_since.elapsed() >= Duration::from_secs(1) {
+            // A writer that stopped on an error (the server closed the
+            // connection) also stops the count; only a blocked write is a stall.
+            break !writer.is_finished();
+        }
+    };
+    let sent = sent.load(std::sync::atomic::Ordering::Relaxed);
+    let _ = control.shutdown(std::net::Shutdown::Both);
+    writer.join().unwrap();
+    eprintln!(
+        "multishot {multishot}: sent {sent} bytes, stalled {stalled}, in {:?}",
+        started.elapsed()
+    );
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().expect("worker panicked").expect("worker failed");
+    }
+    drop(held.join());
+    assert!(
+        stalled && sent > 0 && sent < LIMIT,
+        "multishot {multishot}: the TLS forward source accepted {sent} bytes without stalling"
+    );
+}
+
 // ── A TLS connection may not be a forward sink (EPROTOTYPE, both backends) ──
 
 /// Forwarding *into* a TLS connection must be refused.

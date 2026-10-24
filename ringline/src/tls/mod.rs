@@ -819,8 +819,8 @@ pub(crate) enum PlaintextSink<'a> {
 ///
 /// rustls's `Reader` implements `BufRead`: `fill_buf()` exposes the decrypted
 /// plaintext in rustls's own buffer, and `consume()` advances past what we copied.
-/// The chunk `fill_buf` returns is *not* one ≤16 KiB record — it is as much
-/// contiguous plaintext as rustls has buffered, so segment sizes are arbitrary.
+/// rustls 0.23 keeps one `Vec` per record and `fill_buf` returns the front
+/// one, so each chunk is one record's plaintext, at most 16 KiB.
 ///
 /// Returns `false` if the sink hit its outstanding bound (accumulator
 /// `max_size`, or the held-plaintext `max` for the segmented domain) — the

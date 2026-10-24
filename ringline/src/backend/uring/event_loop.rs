@@ -2002,6 +2002,21 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     }
                 }
             }
+            // A segmented TLS connection (a forward source or a segment
+            // reader) holds decrypted plaintext until the forward or the
+            // reader drains it. Stop receiving at the hold cap, as the
+            // plaintext segmented path does, so a slow sink or reader stops
+            // the peer instead of growing the hold to `recv_accumulator_max`.
+            if self.driver.recv_domain[conn_index as usize]
+                == crate::recv::domain::RecvDomain::Segmented
+                && self
+                    .driver
+                    .connections
+                    .get(conn_index)
+                    .is_some_and(|c| matches!(c.lifecycle, Lifecycle::Open))
+            {
+                self.throttle_if_held(conn_index);
+            }
         } else if self.driver.recv_domain[conn_index as usize]
             == crate::recv::domain::RecvDomain::Segmented
         {
@@ -2154,8 +2169,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
         let retries = std::mem::take(&mut self.driver.recv_rearm_retries);
         for &(conn_index, generation) in &retries {
+            // A connection parked in `recv_starved` is armed by the starved
+            // pass; arming it here too would put two receives with one
+            // user_data in flight.
             let ready = self.driver.connections.generation(conn_index) == generation
                 && !self.driver.forward_hold_throttled[conn_index as usize]
+                && !self.driver.recv_starved.contains(conn_index)
                 && !self.driver.park_pending(conn_index)
                 && self.driver.connections.get(conn_index).is_some_and(|c| {
                     matches!(c.lifecycle, Lifecycle::Open)
@@ -3914,9 +3933,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.driver.forward_hold_throttled[ci] = false;
         let generation = self.driver.connections.generation(conn_index);
         if self.driver.submit_tcp_recv(conn_index, generation).is_err() {
+            // A failed push is backpressure: retry on the next pass.
             metrics::RING.increment(metrics::ring::RECV_ARM_FAILURES);
-            self.executor.wake_recv(conn_index);
-            self.driver.close_connection(conn_index);
+            self.driver
+                .recv_rearm_retries
+                .push((conn_index, generation));
         } else if let Some(cs) = self.driver.connections.get_mut(conn_index) {
             cs.recv_multishot_armed = true;
         }
@@ -6697,6 +6718,31 @@ mod tests {
         let c = el.driver.connections.get(conn_index).unwrap();
         assert!(c.hangup_peek_armed, "the recheck submitted the peek");
         assert!(!c.hangup_recheck_due);
+    }
+
+    /// A throttled connection whose re-arm push fails once its hold drains is
+    /// queued for a retry, not closed: a failed push is backpressure.
+    #[test]
+    fn a_throttle_rearm_that_cannot_be_pushed_is_retried() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        el.driver.forward_hold_throttled[conn_index as usize] = true;
+        el.driver.ring.force_push_failures(1);
+        el.maybe_rearm_throttled_forward(conn_index);
+        let c = el.driver.connections.get(conn_index).unwrap();
+        assert!(matches!(c.lifecycle, Lifecycle::Open), "not closed");
+        assert!(!c.recv_multishot_armed, "the push failed");
+        assert_eq!(el.driver.recv_rearm_retries, vec![(conn_index, generation)]);
+        el.drain_recv_rearm_retries();
+        assert!(
+            el.driver
+                .connections
+                .get(conn_index)
+                .unwrap()
+                .recv_multishot_armed,
+            "the retry armed the receive"
+        );
     }
 
     /// No recheck peek is pushed while a park of the connection is pending.
@@ -14147,6 +14193,69 @@ mod tests {
                 .unwrap()
                 .recv_multishot_armed,
             "the connection must be reading again once the forward is over"
+        );
+    }
+
+    /// A forward that ends throttled after its multishot ended with ENOBUFS
+    /// (so the cancel matched nothing and the connection is parked in
+    /// `recv_starved`) arms one receive, not two.
+    #[test]
+    fn settle_forward_end_after_enobufs_arms_one_receive() {
+        let mut el = make_test_loop_with_config(config_with_forward_cap(1));
+        let conn_index = accept_connection(&mut el);
+        let ci = conn_index as usize;
+        el.driver.recv_domain[ci] = crate::recv::domain::RecvDomain::Segmented;
+        el.driver.forward_recv_active[ci] = true;
+        el.driver
+            .connections
+            .get_mut(conn_index)
+            .unwrap()
+            .recv_multishot_armed = true;
+        deliver_segment(&mut el, conn_index, 0, b"x");
+        assert!(el.driver.forward_hold_throttled[ci], "throttled at the cap");
+
+        let recv_ud = UserData::encode(
+            OpTag::RecvMulti,
+            conn_index,
+            el.driver.connections.generation(conn_index),
+        );
+        el.test_dispatch_cqe(recv_ud.raw(), -libc::ENOBUFS, 0);
+        assert!(el.driver.recv_starved.contains(conn_index), "precondition");
+
+        el.driver.segment_hold[ci].pop_front();
+        let before = el.driver.ring.sq_len();
+        assert!(el.driver.settle_forward_end(conn_index));
+        let after_settle = el.driver.ring.sq_len();
+        assert_eq!(after_settle, before + 1, "settle armed the receive");
+        el.flush_replenish_and_rearm();
+        assert_eq!(
+            el.driver.ring.sq_len(),
+            after_settle,
+            "the starved pass armed a second receive"
+        );
+    }
+
+    /// A throttled forward that ends with its hold drained and a re-arm push
+    /// that fails is queued for a retry.
+    #[test]
+    fn settle_forward_end_retries_a_rearm_that_cannot_be_pushed() {
+        let mut el = make_test_loop_with_config(config_with_forward_cap(1));
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let ci = conn_index as usize;
+        el.driver.forward_recv_active[ci] = true;
+        el.driver.forward_hold_throttled[ci] = true;
+        el.driver.ring.force_push_failures(1);
+        assert!(el.driver.settle_forward_end(conn_index));
+        assert_eq!(el.driver.recv_rearm_retries, vec![(conn_index, generation)]);
+        el.drain_recv_rearm_retries();
+        assert!(
+            el.driver
+                .connections
+                .get(conn_index)
+                .unwrap()
+                .recv_multishot_armed,
+            "the retry armed the receive"
         );
     }
 

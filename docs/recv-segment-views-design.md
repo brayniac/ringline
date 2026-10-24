@@ -47,7 +47,8 @@ On io_uring a connection receives in one of two domains
   - `throttle_if_held` stops re-arming the receive (and cancels an armed
     multishot receive) when `at_hold_cap` is true, and
     `rearm_throttled_recvs` re-arms it once the hold drains below the cap.
-    The TLS branch of `handle_recv_multi` does not call `throttle_if_held`.
+    The TLS branch of `handle_recv_multi` calls it too when the connection
+    is in the segmented domain.
   - `at_hold_cap` has two terms. The segment term is true when the hold plus
     the buffers a `forward_to` write pins reaches `forward_hold_cap` entries
     with a lend cap, or `quarter_ring_cap` without one. The send term is
@@ -280,10 +281,7 @@ readers calls `end_segments` first. No client crate reads with segments
 - The accumulator bound (`recv_accumulator_max`) applies to the copy; past
   the bound the connection is closed and the future resolves to `Ok(0)`, as
   in `with_segments`.
-- On a TLS connection, whose receive is not throttled, the same copy runs
-  whenever the hold reaches the cap. The hold and the accumulator are
-  bounded separately, so a TLS connection can hold up to twice
-  `recv_accumulator_max`.
+- On a TLS connection the same copy runs whenever the hold reaches the cap.
 - Bytes the copy leaves in the accumulator after the future resolves are
   moved into the hold by the next segmented reader's entry
   (`enter_segmented_domain`), which does not count them. Only a
