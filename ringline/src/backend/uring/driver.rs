@@ -247,6 +247,12 @@ impl Driver {
     /// then seen by the next receive to complete. The failure is counted in
     /// `ring::RECV_ARM_FAILURES`.
     pub(crate) fn arm_hangup_poll(&mut self, conn_index: u32) {
+        // Experiment branch only: measure the poll's cost by leaving it out.
+        static NO_HANGUP_POLL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *NO_HANGUP_POLL.get_or_init(|| std::env::var_os("RINGLINE_EXP_NO_HANGUP_POLL").is_some())
+        {
+            return;
+        }
         let Some(cs) = self.connections.get(conn_index) else {
             return;
         };

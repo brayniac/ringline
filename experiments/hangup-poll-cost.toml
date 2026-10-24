@@ -1,0 +1,240 @@
+# What does the hangup poll cost? Every plaintext connection on io_uring
+# arms one POLL_ADD(POLLRDHUP) when it opens (#698). It completes only on a
+# FIN, reset or socket error, but while armed it sits on the socket's wait
+# queue, so every arrival runs its wake callback. This compares server CPU
+# per request with the poll armed and with it left out.
+#
+# Server: resp-server (bins from hangup-poll-cost-build.toml, branch
+# exp/hangup-poll-cost at main 62adfe3 plus the bench binary and the switch)
+# on z1 with 8 workers, --runtime ringline, one arm per experiment:
+#   on   the poll armed on every connection (main's behaviour)
+#   off  RINGLINE_EXP_NO_HANGUP_POLL=1: Driver::arm_hangup_poll returns
+#        without arming it
+# Client: cachecannon from the C8 bins (client_bins) on z2, 16 threads, no
+# rate limit, persistent connections, so connection setup is outside the
+# measured window and each connection arms the poll once.
+#
+# Cells, each at `conns_list` connections (125 and 1,000 per server worker):
+#   get-v64-d1    the most arrivals per request
+#   get-v64-d16
+#   set-v4096-d1
+#
+# Prediction: if the wake callback costs measurably, `off` uses less server
+# CPU per request than `on`, most in get-v64-d1, by more than the spread
+# between reps of the same arm. Otherwise the two arms differ by less than
+# that spread. Three reps per arm, submitted interleaved.
+#
+# The server logs a diag line every 5 s with unix_ms, cpu_us (process user
+# plus system time) and rss_kb. The client logs each cell's measured window
+# as unix_ms, so the server CPU over a window is the difference of the diag
+# lines inside it. Results: the client's results.tgz (cachecannon JSON per
+# cell, windows.txt) and the server's unit log.
+name = "hangup poll cost {poll} rep{rep}"
+
+[params]
+bins_artifact  = "SET_AT_SUBMIT"
+client_bins    = "01a159f3-e054-73af-bc3f-8b6ea08f60b1"
+poll           = "on"
+rep            = "1"
+image          = "debian-13-ci"
+server_ip      = "172.31.0.1"
+client_ip      = "172.31.0.2"
+port           = "6379"
+workers        = "8"
+client_threads = "16"
+conns_list     = "1000 8000"
+warmup         = "10s"
+duration       = "40s"
+
+[[jobs]]
+name = "server"
+tags = ["z1.baremetal"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "start"
+shape = "z1.c"
+image = "{image}"
+gpu = false
+data_address = "{server_ip}/24"
+boot_timeout = 600
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "exec"
+inputs = [{ artifact = "{bins_artifact}", name = "bins.tgz", dest = "/home/anvil" }]
+payload = '''
+set -uo pipefail
+cd /home/anvil && tar xzf bins.tgz && chmod +x out/*
+( cd out && sha256sum * )
+cat /etc/anvil-instance.json; echo
+uname -r
+free -m
+nproc
+sudo sysctl -w net.core.somaxconn=65535 net.ipv4.tcp_max_syn_backlog=65535 net.core.rmem_max=134217728 net.core.wmem_max=134217728
+case "{poll}" in
+  on)  env="" ;;
+  off) env="RINGLINE_EXP_NO_HANGUP_POLL=1" ;;
+  *) echo "BAD POLL {poll}"; exit 1 ;;
+esac
+echo "exec env $env /home/anvil/out/resp-server --runtime ringline --addr {server_ip}:{port} --workers {workers} --diag-secs 5" > /home/anvil/run-server.sh
+chmod +x /home/anvil/run-server.sh
+cat /home/anvil/run-server.sh
+'''
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "exec"
+detach = true
+unit = "resp-server"
+metrics = true
+# Linux 6.14+ charges io_uring rings to RLIMIT_MEMLOCK; the guest's 8 MiB
+# hard limit refuses 8 ringline workers there.
+payload = "ulimit -n 1048576; ulimit -l unlimited 2>/dev/null || sudo prlimit --memlock=unlimited:unlimited --pid $$; echo resp-server-limits memlock=$(ulimit -l) nofile=$(ulimit -n) >&2; exec bash /home/anvil/run-server.sh"
+
+[[jobs.steps]]
+type = "barrier"
+name = "server-ready"
+timeout = 1800
+
+[[jobs.steps]]
+type = "barrier"
+name = "bench-done"
+timeout = 7200
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "stop"
+upload = true
+
+[[jobs]]
+name = "client"
+tags = ["z2.baremetal"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "start"
+shape = "z2.c"
+image = "{image}"
+gpu = false
+data_address = "{client_ip}/24"
+boot_timeout = 600
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "exec"
+inputs = [{ artifact = "{client_bins}", name = "bins.tgz", dest = "/home/anvil" }]
+payload = '''
+set -uo pipefail
+cd /home/anvil && tar xzf bins.tgz && chmod +x out/*
+( cd out && sha256sum * )
+uname -r
+sudo sysctl -w net.core.rmem_max=134217728 net.core.wmem_max=134217728 net.ipv4.ip_local_port_range="1024 65535" net.ipv4.tcp_tw_reuse=1
+sudo apt-get update -qq
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq time >/dev/null || exit 1
+[ -x /usr/bin/time ] || { echo "NO /usr/bin/time"; exit 1; }
+'''
+
+[[jobs.steps]]
+type = "barrier"
+name = "server-ready"
+timeout = 1800
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "exec"
+metrics = true
+upload = true
+artifacts = ["/home/anvil/results.tgz"]
+payload_timeout = 7000
+payload = '''
+set -uo pipefail
+cd /home/anvil
+mkdir -p results
+ulimit -n 1048576
+ulimit -l unlimited 2>/dev/null || sudo prlimit --memlock=unlimited:unlimited --pid $$
+echo "client-limits memlock=$(ulimit -l) nofile=$(ulimit -n)"
+for i in $(seq 1 120); do
+  (exec 3<>/dev/tcp/{server_ip}/{port}) 2>/dev/null && { exec 3>&-; echo "server reachable after ${i}s"; break; }
+  sleep 1
+done
+
+# config FILE CMD VLEN KEYS DEPTH CONNS PREFILL DURATION WARMUP
+config() {
+  local file=$1 cmd=$2 vlen=$3 keys=$4 depth=$5 conns=$6 prefill=$7 dur=$8 warm=$9
+  local prefill_line="prefill = false"
+  [ "$prefill" = true ] && prefill_line=$'prefill = true\nprefill_settle = "0s"'
+  cat > "$file" <<CFG
+[general]
+duration = "$dur"
+warmup = "$warm"
+threads = {client_threads}
+
+[target]
+endpoints = ["{server_ip}:{port}"]
+protocol = "resp"
+
+[connection]
+connections = $conns
+pipeline_depth = $depth
+connect_timeout = "10s"
+request_timeout = "5s"
+
+[workload]
+read_values = true
+$prefill_line
+
+[workload.keyspace]
+length = 16
+count = $keys
+distribution = "uniform"
+
+[workload.commands]
+$cmd = 100
+
+[workload.values]
+length = $vlen
+
+[admin]
+format = "json"
+CFG
+}
+
+[ -x /usr/bin/time ] || { echo "NO /usr/bin/time"; exit 1; }
+warm_s=$(echo {warmup} | tr -d s)
+dur_s=$(echo {duration} | tr -d s)
+# run_cell CELL CMD VLEN KEYS DEPTH CONNS
+run_cell() {
+  local cell=$1 cmd=$2 vlen=$3 keys=$4 depth=$5 conns=$6 start
+  config results/$cell.toml $cmd $vlen $keys $depth $conns false {duration} {warmup}
+  start=$(date +%s%3N)
+  /usr/bin/time -f "time user_s=%U sys_s=%S maxrss_kb=%M" -o results/$cell.time \
+    ./out/cachecannon-a results/$cell.toml > results/$cell.json 2> results/$cell.log
+  # The measured window: after the warmup, for the duration.
+  echo "$cell $((start + warm_s * 1000)) $((start + (warm_s + dur_s) * 1000))" >> results/windows.txt
+  echo "== poll={poll} rep={rep} cell=$cell $(cat results/$cell.time)"
+  grep '"type":"result"' results/$cell.json || { echo "NO RESULT"; tail -5 results/$cell.log; }
+  sleep 5
+}
+
+for conns in {conns_list}; do
+  config results/prefill-v64-c$conns.toml set 64 100000 1 1000 true 1s 0s
+  ./out/cachecannon-a results/prefill-v64-c$conns.toml > results/prefill-v64-c$conns.json 2> results/prefill-v64-c$conns.log
+  echo "== prefill v64 rc=$?"
+  for depth in 1 16; do
+    run_cell get-v64-d$depth-c$conns get 64 100000 $depth $conns
+  done
+  run_cell set-v4096-d1-c$conns set 4096 20000 1 $conns
+done
+tar czf /home/anvil/results.tgz -C /home/anvil results
+exit 0
+'''
+
+[[jobs.steps]]
+type = "barrier"
+name = "bench-done"
+timeout = 7200
+
+[[jobs.steps]]
+type = "anvil-vm"
+mode = "stop"
