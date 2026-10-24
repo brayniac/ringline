@@ -312,8 +312,15 @@ impl Pool {
     /// A slot whose connection is no longer alive (`ringline::ConnCtx::is_alive`
     /// is `false`, for example because the server closed it while it sat idle
     /// in the pool) is reconnected instead of handed out. A close the worker
-    /// has not yet seen, or one that arrived after bytes no read has consumed,
-    /// is not detected, and a command sent on that connection fails.
+    /// has not yet seen is not detected, and a command sent on that connection
+    /// fails. On io_uring, a plaintext connection that has unread bytes when
+    /// the peer's FIN arrives stays open until they are read (see
+    /// `ringline::connect`), so it is handed out, and the next read returns
+    /// those bytes first.
+    ///
+    /// The reconnect runs inside `client()`: the call waits for the connect
+    /// (and AUTH, when a password is set), bounded per slot by
+    /// `connect_timeout_ms`; with the default of 0 there is no bound.
     pub async fn client(&self) -> Result<PooledClient, Error> {
         let (idx, client) = self.checkout().await?;
         Ok(PooledClient {

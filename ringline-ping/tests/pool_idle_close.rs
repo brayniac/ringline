@@ -63,8 +63,8 @@ impl AsyncEventHandler for OneReplyServer {
                 .await;
             if n > 0 {
                 ANSWERED.fetch_add(1, Ordering::SeqCst);
-                // Close after the client has read the reply and returned the
-                // connection to the pool, so it sits there alive.
+                // Wait 50 ms before closing, so the client reads the reply and
+                // returns the connection to the pool before the FIN arrives.
                 ringline::sleep(Duration::from_millis(50)).await;
             }
             tx.close();
