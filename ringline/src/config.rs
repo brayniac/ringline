@@ -1211,9 +1211,11 @@ impl ConfigBuilder {
     /// since plaintext connections receive into their accumulators and TLS
     /// ones copy.
     /// Larger values allow more recv in flight at the cost of more held
-    /// copies under a slow consumer. A TLS connection's entries are one
-    /// record's plaintext each, at most 16 KiB, so its hold is at most this
-    /// many × 16 KiB (1 MiB at the default). Must be `>= 1`.
+    /// copies under a slow consumer. On io_uring a TLS connection's entries
+    /// are one record's plaintext each (at most 16 KiB), apart from the bytes
+    /// buffered when the hold was entered, so its hold is about this many ×
+    /// 16 KiB, plus what the receive that crosses the cap delivers and the
+    /// entries of the write in flight. Must be `>= 1`.
     ///
     /// Default: 64 (2× `MAX_IOVECS`).
     ///

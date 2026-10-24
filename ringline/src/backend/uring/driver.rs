@@ -1809,6 +1809,10 @@ impl Driver {
                 return ok;
             }
             self.forward_hold_throttled[conn_index as usize] = false;
+            // A multishot that ended with ENOBUFS before the cancel landed
+            // parked the connection in `recv_starved`; take it back, or the
+            // starved pass arms a second receive with the same user_data.
+            self.recv_starved.remove(conn_index);
             let open = self.connections.get(conn_index).is_some_and(|c| {
                 matches!(c.lifecycle, Lifecycle::Open) && matches!(c.recv_arm, RecvArm::Multi)
             });

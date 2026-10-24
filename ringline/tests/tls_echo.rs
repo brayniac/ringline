@@ -1434,9 +1434,9 @@ fn tls_forward_to_stuck_sink(multishot: bool) {
     stream.read_exact(&mut ack).expect("forward armed ack");
     let _ = stream;
 
-    // Flood from a thread for a fixed time, then shut the socket down to end
-    // a write the throttle has stalled. Unthrottled, 64 MiB goes in under a
-    // second.
+    // Flood from a thread until the count stops moving (throttled) or
+    // reaches the limit (not throttled), then shut the socket down to end a
+    // write the throttle has stalled.
     let sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let counter = Arc::clone(&sent);
     let control = tcp.try_clone().unwrap();
@@ -1452,11 +1452,27 @@ fn tls_forward_to_stuck_sink(multishot: bool) {
             }
         }
     });
-    std::thread::sleep(Duration::from_secs(3));
+    let started = Instant::now();
+    let (mut last, mut still_since) = (0u64, Instant::now());
+    let stalled = loop {
+        std::thread::sleep(Duration::from_millis(250));
+        let now = sent.load(std::sync::atomic::Ordering::Relaxed);
+        if now >= LIMIT || started.elapsed() > Duration::from_secs(30) {
+            break false;
+        }
+        if now != last {
+            (last, still_since) = (now, Instant::now());
+        } else if still_since.elapsed() >= Duration::from_secs(1) {
+            break true;
+        }
+    };
     let sent = sent.load(std::sync::atomic::Ordering::Relaxed);
     let _ = control.shutdown(std::net::Shutdown::Both);
     writer.join().unwrap();
-    eprintln!("multishot {multishot}: sent {sent} bytes in 3 s");
+    eprintln!(
+        "multishot {multishot}: sent {sent} bytes, stalled {stalled}, in {:?}",
+        started.elapsed()
+    );
 
     shutdown.shutdown();
     for h in handles {
@@ -1464,8 +1480,8 @@ fn tls_forward_to_stuck_sink(multishot: bool) {
     }
     drop(held.join());
     assert!(
-        sent < LIMIT,
-        "multishot {multishot}: the TLS forward source accepted {sent} bytes"
+        stalled && sent > 0 && sent < LIMIT,
+        "multishot {multishot}: the TLS forward source accepted {sent} bytes without stalling"
     );
 }
 

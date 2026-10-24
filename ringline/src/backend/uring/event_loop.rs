@@ -14192,6 +14192,67 @@ mod tests {
         );
     }
 
+    /// A forward that ends throttled after its multishot ended with ENOBUFS
+    /// (so the cancel matched nothing and the connection is parked in
+    /// `recv_starved`) arms one receive, not two.
+    #[test]
+    fn settle_forward_end_after_enobufs_arms_one_receive() {
+        let mut el = make_test_loop_with_config(config_with_forward_cap(1));
+        let conn_index = accept_connection(&mut el);
+        let ci = conn_index as usize;
+        el.driver.recv_domain[ci] = crate::recv::domain::RecvDomain::Segmented;
+        el.driver.forward_recv_active[ci] = true;
+        el.driver
+            .connections
+            .get_mut(conn_index)
+            .unwrap()
+            .recv_multishot_armed = true;
+        deliver_segment(&mut el, conn_index, 0, b"x");
+        assert!(el.driver.forward_hold_throttled[ci], "throttled at the cap");
+
+        let recv_ud = UserData::encode(
+            OpTag::RecvMulti,
+            conn_index,
+            el.driver.connections.generation(conn_index),
+        );
+        el.test_dispatch_cqe(recv_ud.raw(), -libc::ENOBUFS, 0);
+        assert!(el.driver.recv_starved.contains(conn_index), "precondition");
+
+        el.driver.segment_hold[ci].pop_front();
+        assert!(el.driver.settle_forward_end(conn_index));
+        let after_settle = el.driver.ring.sq_len();
+        el.flush_replenish_and_rearm();
+        assert_eq!(
+            el.driver.ring.sq_len(),
+            after_settle,
+            "the starved pass armed a second receive"
+        );
+    }
+
+    /// A throttled forward that ends with its hold drained and a re-arm push
+    /// that fails is queued for a retry.
+    #[test]
+    fn settle_forward_end_retries_a_rearm_that_cannot_be_pushed() {
+        let mut el = make_test_loop_with_config(config_with_forward_cap(1));
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let ci = conn_index as usize;
+        el.driver.forward_recv_active[ci] = true;
+        el.driver.forward_hold_throttled[ci] = true;
+        el.driver.ring.force_push_failures(1);
+        assert!(el.driver.settle_forward_end(conn_index));
+        assert_eq!(el.driver.recv_rearm_retries, vec![(conn_index, generation)]);
+        el.drain_recv_rearm_retries();
+        assert!(
+            el.driver
+                .connections
+                .get(conn_index)
+                .unwrap()
+                .recv_multishot_armed,
+            "the retry armed the receive"
+        );
+    }
+
     /// Arming a forward must also take the zero-copy pending recv buffer, not
     /// just the accumulator.
     ///

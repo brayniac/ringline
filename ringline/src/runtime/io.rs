@@ -1897,8 +1897,10 @@ impl ConnCtx {
     /// entries; without `recv_incremental`, at most a quarter of the receive
     /// ring's buffers), so a sink slower than the source closes the source's
     /// TCP window. The up to 16 entries the write in flight carries are not
-    /// counted. Each entry is one TLS record's plaintext, at most 16 KiB. The
-    /// source receives again once the sink drains the hold below the cap.
+    /// counted. Each entry after the first is one TLS record's plaintext, at
+    /// most 16 KiB; the first holds whatever was buffered when the forward
+    /// started. The source receives again once the sink drains the hold below
+    /// the cap.
     ///
     /// # Sink ownership
     ///
@@ -5835,9 +5837,9 @@ impl<F: FnMut(&[Bytes]) -> ParseResult + Unpin> WithBytesSegmentsFuture<F> {
             }
             return self.park(driver, executor);
         }
-        // The skip does not apply at the hold cap: there the next receive
-        // completion throttles the connection, so no more bytes arrive until
-        // the hold drains.
+        // The skip does not apply at the hold cap: there the receive that
+        // filled the hold has throttled the connection, so only receives
+        // already in flight add bytes until the hold drains.
         if let Some(call_at) = self.call_at
             && total < call_at
             && !finished(driver)

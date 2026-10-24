@@ -271,9 +271,8 @@ doc accepts copies — do not segment it.
 
 TLS is a copy-per-chunk source (rustls owns its decrypted plaintext buffer, so
 TLS recv can never be zero-copy). Each `Reader::fill_buf` drain is an owned
-segment. Corrections carried from review: the chunk is **not** "one ≤16 KiB
-record" — `fill_buf` returns as much contiguous plaintext as rustls has buffered;
-segment sizes are arbitrary. The decrypt copy *is* a release boundary (ciphertext
+segment. Each chunk is one record's plaintext, at most 16 KiB: rustls 0.23 keeps
+one `Vec` per record and `fill_buf` returns the front one. The decrypt copy *is* a release boundary (ciphertext
 bid frees at feed), so TLS never pins the ring. **Keep the outstanding-plaintext
 bound + connection-kill** (`recv_accumulator_max`, the current `#[must_use]`
 `append` contract) — owned TLS segments must not drop it.
