@@ -336,8 +336,9 @@ pub struct DriverCtx<'a> {
     pub(crate) capacity_released: &'a mut bool,
     pub(crate) close_notify_timeout: std::time::Duration,
     pub(crate) next_disk_io_seq: &'a mut u16,
-    /// Set when `finish` on a TLS chain attached the chain's id to its last
-    /// ciphertext send. `ConnCtx::send_chain` reads it to return a pending
+    /// Set when `finish` on a TLS chain gave the chain's id to
+    /// `attach_send_id`: on its last ciphertext send, or settled at once if the
+    /// plaintext was empty. `ConnCtx::send_chain` reads it to return a pending
     /// future, because a TLS chain does not use `chain_table`, so
     /// `chain_table.carries` is false for it.
     pub(crate) tls_chain_carried: bool,
@@ -4474,7 +4475,8 @@ pub struct SendChainBuilder<'b, 'a> {
     tls_parts: usize,
     error: Option<io::Error>,
     finished: bool,
-    /// Carried into the chain's `ChainState` by `finish`.
+    /// Carried by `finish` into the chain's `ChainState`; on a TLS connection,
+    /// `finish_tls` attaches it to the last ciphertext send.
     send_id: Option<crate::runtime::send_completion::SendId>,
 }
 
