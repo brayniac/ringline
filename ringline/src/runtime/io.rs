@@ -1876,16 +1876,10 @@ impl ConnCtx {
     /// Writes to `sink` are strictly serialized, one in flight at a time, so the
     /// byte stream cannot be reordered (io_uring does not order independent SQEs).
     ///
-    /// Bytes already buffered on this connection when the forward starts (the
-    /// bytes received with the length header, typically) are the front of the
-    /// forward and are moved into the hold, not left behind in the accumulator.
-    ///
-    /// # Backpressure
-    ///
-    /// The held plaintext is bounded by `recv_accumulator_max`
-    /// ([`ConfigBuilder::recv_accumulator_max`](crate::ConfigBuilder::recv_accumulator_max)).
-    /// A sink slower than the source lets it grow to that bound, and the source
-    /// connection is then closed. `forward_hold_cap` does not apply.
+    /// Bytes already buffered on this connection when the forward starts
+    /// (typically the bytes that arrived after the length header in the same
+    /// read) are the front of the forward and are moved into the hold, not left
+    /// behind in the accumulator.
     ///
     /// Resolves to `Ok(bytes_forwarded)`. `bytes_forwarded == len` on success; a
     /// value `< len` means the peer closed (FIN) before `len` bytes arrived — the
@@ -1893,6 +1887,15 @@ impl ConnCtx {
     /// connection unwinds). After the forward the delivery domain is reset to the
     /// default, and any bytes received *past* `len` are preserved at the front of
     /// the accumulator for the next `with_data`/`with_bytes` read.
+    ///
+    /// # Backpressure
+    ///
+    /// Nothing stops the source reading. The plaintext waiting in the hold, not
+    /// counting the write in flight, is bounded by `recv_accumulator_max`
+    /// ([`ConfigBuilder::recv_accumulator_max`](crate::ConfigBuilder::recv_accumulator_max),
+    /// default 1 GiB); a sink slower than the source lets it grow to that bound,
+    /// and the source connection is then closed. `forward_hold_cap` does not
+    /// apply.
     ///
     /// # Sink ownership
     ///
