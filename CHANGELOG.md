@@ -610,10 +610,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `take_recv_sink`, wherever `ConnCtx`, `Connection` or `RecvHalf` had them,
   on both backends. On io_uring they read from the provided-buffer ring,
   which no connection receives through any more except a TLS one, where they
-  did nothing. On mio `set_recv_sink` and `forward_held` worked on every
-  connection (`enable_recv_forward` did nothing), and code that used them
-  there no longer compiles. Echo or forward with `with_data` and `send_nowait` or
-  `forward_recv_buf`, or with `forward_to_conn`.
+  did nothing. On mio `forward_held` worked on every connection and
+  `set_recv_sink` on every plaintext one (`enable_recv_forward` did nothing),
+  and code that used them there no longer compiles. Echo or forward with
+  `with_data` and `send_nowait` or `forward_recv_buf`, or with
+  `forward_to_conn`. A recv sink is replaced by copying out of `with_data`
+  into the caller's buffer, which on mio is one copy more than the sink.
+  Every replacement for `run_direct_echo` wakes a task per receive.
 - **Breaking:** `metrics::park_abandon::DIRECT_ECHO` and the `direct_echo`
   op of `ringline/park_abandoned`.
 - **Breaking:** the client methods that read a value from provided-buffer

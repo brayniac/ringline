@@ -664,7 +664,7 @@ The owner accepted these on 2026-10-15.
   lends in the default domain, which would change every site that reads
   `pending_recv_bufs`: `with_data`, `with_data_result`, `with_bytes`,
   `with_segments`, `enter_segmented_domain`, `arm_forward_source`,
-  `forward_recv_buf`, `DirectEchoFuture`, `ConnStream`, `handle_recv_multi`,
+  `forward_recv_buf`, `ConnStream`, `handle_recv_multi`,
   the starved drain in `flush_replenish_and_rearm`,
   `install_accepted_with_pending`, `handle_connect`, `handle_close`, and
   `Driver::recv_buffered` (through it `holds_unread` and the arrival log).
