@@ -3086,11 +3086,16 @@ pub(crate) fn park_recv(
 
 /// Register the current task as `conn_index`'s receive waiter for a segment
 /// reader or a Mode A forward, which wait on the segment hold rather than
-/// through [`park_recv`], and arm a TLS connection's receive if none is armed.
-#[cfg(has_io_uring)]
-fn park_segment_waiter(driver: &mut Driver, executor: &mut Executor, conn_index: u32) {
+/// through [`park_recv`]. On io_uring, also arm a TLS connection's receive if
+/// none is armed.
+fn park_segment_waiter(
+    #[allow(unused_variables)] driver: &mut Driver,
+    executor: &mut Executor,
+    conn_index: u32,
+) {
     executor.owner_task[conn_index as usize] = Some(CURRENT_TASK_ID.with(|c| c.get()));
     executor.recv_waiters[conn_index as usize] = true;
+    #[cfg(has_io_uring)]
     driver.arm_tls_recv_if_idle(conn_index);
 }
 
