@@ -1546,17 +1546,51 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.driver.close_connection(conn_index);
     }
 
-    /// Peek again on the connections in `hangup_rechecks` whose receive has
-    /// delivered bytes since their last peek, whose hangup poll completed
-    /// with a receive in flight, whose peek found the end with bytes
-    /// buffered or a receive in flight, or whose peek could not be
-    /// submitted, once nothing is buffered, armed or parking, so the end of
-    /// the stream behind those bytes closes the connection even if no read
-    /// parks after they are consumed. Submits the hangup poll again on
-    /// connections whose poll could not be submitted, while no park is
-    /// pending. Drops connections that closed, were recycled or finished
-    /// reading.
+    /// Submit the hangup polls that could not be submitted
+    /// (`Driver::hangup_poll_retries`), skipping connections with a park
+    /// pending. Drops entries whose poll is armed and connections that
+    /// closed, were recycled or finished reading.
+    fn retry_hangup_polls(&mut self) {
+        if self.driver.hangup_poll_retries.is_empty() {
+            return;
+        }
+        let mut list = std::mem::take(&mut self.driver.hangup_poll_retries);
+        list.retain(|&(conn_index, generation)| {
+            let Some(cs) = self.driver.connections.get(conn_index) else {
+                return false;
+            };
+            if cs.generation != generation || !cs.hangup_poll_retry {
+                return false;
+            }
+            if !matches!(cs.lifecycle, Lifecycle::Open) || cs.recv_finished() {
+                if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+                    cs.hangup_poll_retry = false;
+                }
+                return false;
+            }
+            if self.driver.park_pending(conn_index) {
+                return true;
+            }
+            // Clears `hangup_poll_retry` once the poll is armed; a failed
+            // push leaves the entry, and pushes no second one.
+            self.driver.arm_hangup_poll(conn_index);
+            self.driver
+                .connections
+                .get(conn_index)
+                .is_some_and(|cs| cs.hangup_poll_retry)
+        });
+        list.append(&mut self.driver.hangup_poll_retries);
+        self.driver.hangup_poll_retries = list;
+    }
+
+    /// Submit owed hangup polls (`retry_hangup_polls`), then peek again on
+    /// the connections in `hangup_rechecks` whose `hangup_recheck_due` is
+    /// set, once nothing is buffered, armed or parking. The end of the
+    /// stream behind bytes already delivered then closes the connection
+    /// even if no read parks after they are consumed. Drops connections that
+    /// closed, were recycled or finished reading.
     fn recheck_hangups(&mut self) {
+        self.retry_hangup_polls();
         if self.driver.hangup_rechecks.is_empty() {
             return;
         }
@@ -1575,15 +1609,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 }
                 return false;
             }
-            if cs.hangup_poll_retry
-                && !cs.hangup_poll_armed
-                && !self.driver.park_pending(conn_index)
-            {
-                self.driver.arm_hangup_poll(conn_index);
-            }
-            let Some(cs) = self.driver.connections.get(conn_index) else {
-                return false;
-            };
             if cs.hangup_recheck_due
                 && !cs.recv_direct_armed
                 && !cs.hangup_peek_armed
@@ -6573,7 +6598,7 @@ mod tests {
     }
 
     /// A hangup poll that cannot be submitted puts the connection on the
-    /// recheck list, and the recheck submits it.
+    /// poll retry list, and the recheck submits it and drops the entry.
     #[test]
     fn a_hangup_poll_that_cannot_be_submitted_is_retried() {
         let mut el = make_test_loop();
@@ -6583,13 +6608,19 @@ mod tests {
         el.driver.arm_hangup_poll(conn_index);
         let c = el.driver.connections.get(conn_index).unwrap();
         assert!(!c.hangup_poll_armed, "the push failed");
-        assert!(c.hangup_poll_retry && c.hangup_recheck);
-        assert_eq!(el.driver.hangup_rechecks, vec![(conn_index, generation)]);
+        assert!(c.hangup_poll_retry);
+        assert!(!c.hangup_recheck, "a poll retry owes no peek");
+        assert_eq!(
+            el.driver.hangup_poll_retries,
+            vec![(conn_index, generation)]
+        );
         el.recheck_hangups();
         let c = el.driver.connections.get(conn_index).unwrap();
         assert!(c.hangup_poll_armed, "the recheck submitted the poll");
         assert!(!c.hangup_poll_retry);
         assert!(!c.hangup_peek_armed, "no peek is due");
+        assert!(el.driver.hangup_poll_retries.is_empty(), "entry dropped");
+        assert!(el.driver.hangup_rechecks.is_empty());
     }
 
     /// A hangup poll retry waits while a park of the connection is pending:
@@ -6613,6 +6644,10 @@ mod tests {
             "no poll while the install is in flight"
         );
         assert!(c.hangup_poll_retry, "the retry is still owed");
+        assert_eq!(
+            el.driver.hangup_poll_retries,
+            vec![(conn_index, generation)]
+        );
     }
 
     /// A peek that the hangup poll triggers and that cannot be submitted puts

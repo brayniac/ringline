@@ -245,8 +245,7 @@ impl Driver {
     /// completes, and while no read is parked none may be in flight. If the
     /// SQE cannot be pushed, the failure is counted in
     /// `ring::RECV_ARM_FAILURES` and the connection goes on
-    /// `hangup_rechecks` with `hangup_poll_retry` set, so `recheck_hangups`
-    /// submits the poll again.
+    /// `hangup_poll_retries`, so `retry_hangup_polls` submits the poll again.
     pub(crate) fn arm_hangup_poll(&mut self, conn_index: u32) {
         let Some(cs) = self.connections.get(conn_index) else {
             return;
@@ -261,12 +260,11 @@ impl Driver {
             .is_err()
         {
             metrics::RING.increment(metrics::ring::RECV_ARM_FAILURES);
-            if let Some(cs) = self.connections.get_mut(conn_index) {
+            if let Some(cs) = self.connections.get_mut(conn_index)
+                && !cs.hangup_poll_retry
+            {
                 cs.hangup_poll_retry = true;
-                if !cs.hangup_recheck {
-                    cs.hangup_recheck = true;
-                    self.hangup_rechecks.push((conn_index, generation));
-                }
+                self.hangup_poll_retries.push((conn_index, generation));
             }
             return;
         }
@@ -969,16 +967,25 @@ pub(crate) struct Driver {
     /// never read; it only has to stay valid while a peek is in flight, which
     /// a buffer the driver owns does.
     pub(crate) hangup_peek_buf: Box<[u8; 1]>,
-    /// `(conn_index, generation)` of direct connections whose hangup peek
-    /// found bytes queued ahead of the end of the stream, or found the end
-    /// with bytes buffered or a receive in flight, or whose hangup poll
-    /// completed with a receive in flight, or whose hangup poll or peek could
-    /// not be submitted (`ConnectionState::hangup_recheck`).
+    /// `(conn_index, generation)` of direct connections that need another
+    /// hangup peek once their bytes are read
+    /// (`ConnectionState::hangup_recheck`). A connection goes on it when:
+    ///
+    /// - a hangup peek found bytes queued ahead of the end of the stream;
+    /// - a hangup peek found the end with bytes buffered or a receive in
+    ///   flight;
+    /// - the hangup poll completed with a receive in flight;
+    /// - the peek the hangup poll triggered could not be submitted.
+    ///
     /// `recheck_hangups` peeks again once `hangup_recheck_due` is set and
     /// nothing is buffered, armed or parking, so the end is seen even if no
-    /// read parks after the bytes are consumed, and submits the poll again
-    /// while `hangup_poll_retry` is set and no park is pending.
+    /// read parks after the bytes are consumed.
     pub(crate) hangup_rechecks: Vec<(u32, u32)>,
+    /// `(conn_index, generation)` of direct connections whose hangup poll
+    /// could not be submitted (`ConnectionState::hangup_poll_retry`).
+    /// `retry_hangup_polls` submits it again while no park is pending, and
+    /// drops the entry once it is armed.
+    pub(crate) hangup_poll_retries: Vec<(u32, u32)>,
     /// `Config::recv_direct_region`.
     pub(crate) recv_direct_region: usize,
     /// Arrival timestamp shared by all UDP datagrams queued in one CQE
@@ -1534,6 +1541,7 @@ impl Driver {
             direct_recv_free: Vec::new(),
             hangup_peek_buf: Box::new([0]),
             hangup_rechecks: Vec::new(),
+            hangup_poll_retries: Vec::new(),
             recv_direct_region: config.recv_direct_region,
             udp_batch_recv_at: std::time::Instant::now(),
             tick_timeout_ts: if config.tick_timeout_us > 0 {
