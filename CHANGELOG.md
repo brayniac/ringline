@@ -249,6 +249,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- io_uring: a TLS connection's ring receive is armed when a read parks once
+  its handshake is done, as a plaintext connection's direct receive is, so a
+  task that does not read stops its peer instead of buffering up to
+  `recv_accumulator_max` (1 GiB by default). During the handshake, in the
+  segmented domain (a `forward_to` source or a segment reader), and after
+  the peer closes, the receive is re-armed after each completion. A TLS
+  connection now arms the `POLLRDHUP` hangup poll, so a peer close is seen,
+  and `is_alive` returns `false`, while nothing reads. `forward_to_conn`
+  from a TLS source takes the bytes from the accumulator and sends them
+  through the sink's send queue, as from a plaintext source; before, it
+  wrote to the sink directly, unordered against other sends on the sink.
+  `recv_multishot` no longer affects TLS connections, which were the only
+  ones it affected, so it has no effect.
 - **Breaking:** `metrics::park_abandon::SLOT_RECYCLED` is 12 and
   `INSTALL_FAILED` 13, after the removal of `DIRECT_ECHO`.
 - **Breaking:** on io_uring, every plaintext connection, accepted or from
@@ -658,14 +671,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
-- io_uring: a TLS connection that is a `forward_to` or `forward_to_conn`
-  source, or has a segment reader, stops receiving once its hold reaches the
-  hold cap (`forward_hold_cap`; without `recv_incremental`, at most a quarter
-  of the receive ring's buffers) and receives again once the hold drains.
-  Before, it kept receiving whatever its sink or reader did, its hold grew to
+- io_uring: a TLS connection that is a `forward_to` source, or has a segment
+  reader, stops receiving once its hold reaches the hold cap
+  (`forward_hold_cap`; without `recv_incremental`, at most a quarter of the
+  receive ring's buffers) and receives again once the hold drains. Before,
+  it kept receiving whatever its sink or reader did, its hold grew to
   `recv_accumulator_max` (1 GiB by default), and the connection was then
-  closed. A plaintext connection receives only when a read or a forward
-  asks for bytes, so it was already stopped.
+  closed. A plaintext connection receives only when a read or a forward asks
+  for bytes, so it was already stopped.
 - `ringline-redis`, `ringline-memcache` and `ringline-ping` `Pool::client`
   reconnect a slot whose connection is no longer alive (`is_alive()` is
   `false`) instead of handing it out. A connection the server closed while

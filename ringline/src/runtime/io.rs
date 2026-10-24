@@ -639,7 +639,11 @@ impl<T: 'static> Future for BlockingJoinHandle<T> {
 /// (after queued sends drain) fail with `NotConnected`.
 ///
 /// A TLS connection receives ciphertext through the worker's provided-buffer
-/// ring. On mio every connection reads into its accumulator.
+/// ring: during the handshake a receive is re-armed after each completion;
+/// after it, a receive is armed when a read parks, as on a plaintext
+/// connection, and the same `POLLRDHUP` poll arms one when the peer closes
+/// while nothing reads, so rustls sees the close_notify or the FIN. On mio
+/// every connection reads into its accumulator.
 ///
 /// # Concurrency
 ///
@@ -1859,6 +1863,9 @@ impl ConnCtx {
                 crate::accumulator::note_copied(data.len());
                 driver.pending_replenish.push(pending.bid);
             }
+            // The forward is driven from completions, so a TLS source's
+            // receive is armed here; the segmented domain re-arms it.
+            driver.arm_tls_recv_if_idle(self.conn_index);
             Ok(epoch)
         })
     }
@@ -2166,13 +2173,9 @@ impl ConnCtx {
     /// conn.forward_to_conn(&backend, len).await?;
     /// ```
     ///
-    /// From a TLS source, the mechanics are those of `forward_to`: rustls'
-    /// plaintext is copied into entries held driver-side as it is decrypted,
-    /// and they are written to the sink one serialized write at a time; the
-    /// ciphertext buffers go back to the ring when rustls reads them. A
-    /// plaintext source, which receives directly into its accumulator, is
-    /// covered under "A direct source" below. Either way a result `< len`
-    /// means the peer sent FIN first.
+    /// On io_uring the forward takes the bytes the source's accumulator holds
+    /// and sends them through the sink's send queue; see "The source" below.
+    /// A result `< len` means the peer sent FIN first.
     ///
     /// # Thread affinity
     ///
@@ -2180,15 +2183,6 @@ impl ConnCtx {
     /// break: [`ConnCtx`] is `!Send`, so a handle from another worker cannot
     /// reach this call. A sink obtained from [`connect`](crate::connect) inside
     /// the handler is always on the right worker.
-    ///
-    /// # Do not send on the sink concurrently
-    ///
-    /// From a TLS source the forward writes to the sink directly rather than
-    /// through its send queue, so a `send` on the sink from elsewhere while a
-    /// forward is running is not ordered against it and will interleave on the
-    /// wire. io_uring does not order independent SQEs. Forward *or* send on a
-    /// given connection, not both at once. A direct source's sends go through
-    /// the sink's queue and are ordered with other sends on the sink.
     ///
     /// # TLS
     ///
@@ -2214,11 +2208,11 @@ impl ConnCtx {
     /// the `not(has_io_uring)` sibling below. Both backends refuse the same
     /// three conditions with the same errnos.
     ///
-    /// # A direct source
+    /// # The source
     ///
-    /// A source that receives directly into its accumulator (on io_uring,
-    /// every plaintext connection) has no held buffers.
-    /// The forward takes the bytes its accumulator holds, up to what is left
+    /// A plaintext source receives directly into its accumulator, and a TLS
+    /// source's decrypted plaintext lands there too. The forward takes the
+    /// bytes the accumulator holds, up to what is left
     /// of `len`, and sends them on the sink through the sink's send queue
     /// under a guard: zero-copy at or above `send_zc_threshold`, copied into a
     /// pool slot below it. One send is in flight at a time, and the source
@@ -2265,8 +2259,14 @@ impl ConnCtx {
         sink_owned: bool,
     ) -> Option<ForwardToFuture<'a>> {
         let refusal = with_state(|driver, _| {
+            // A TLS source's plaintext lands in its accumulator too, so it
+            // forwards the same way.
+            let tls_source = driver
+                .tls_table
+                .as_ref()
+                .is_some_and(|t| t.has(self.conn_index));
             if driver.connections.generation(self.conn_index) != self.generation
-                || !is_recv_direct(driver, self.conn_index)
+                || !(is_recv_direct(driver, self.conn_index) || tls_source)
             {
                 return None;
             }
@@ -2680,8 +2680,8 @@ impl ConnCtx {
     ///
     /// A FIN or reset from the peer closes the connection whether or not a
     /// read is parked, so this returns `false` once the runtime has seen it.
-    /// On io_uring the runtime detects it on every plaintext connection with
-    /// a `POLLRDHUP` poll. When bytes the
+    /// On io_uring the runtime detects it on every plaintext or TLS
+    /// connection with a `POLLRDHUP` poll. When bytes the
     /// peer sent before it are queued or buffered, the connection stays open,
     /// and this returns `true`, until they have been read (see [`connect`]).
     pub fn is_alive(&self) -> bool {
@@ -3040,9 +3040,10 @@ fn recv_direct_unsupported() -> io::Error {
     )
 }
 
-/// Register the current task as `conn_index`'s receive waiter. On a direct
-/// connection (a plaintext TCP or Unix connection) also arm its receive, which the
-/// caller does only after its parser has seen every buffered byte. `need` is
+/// Register the current task as `conn_index`'s receive waiter and arm the
+/// connection's receive, which the caller does only after its parser has seen
+/// every buffered byte: a direct receive on a plaintext TCP or Unix
+/// connection, a ring receive on a TLS one whose handshake is done. `need` is
 /// the parser's `NeedAtLeast` value, if it returned one.
 pub(crate) fn park_recv(
     #[allow(unused_variables)] driver: &mut Driver,
@@ -3053,9 +3054,12 @@ pub(crate) fn park_recv(
     executor.owner_task[conn_index as usize] = Some(CURRENT_TASK_ID.with(|c| c.get()));
     executor.recv_waiters[conn_index as usize] = true;
     #[cfg(has_io_uring)]
-    if driver.arm_direct_recv_or_close(conn_index, need) {
-        // The connection closed instead: poll again to resolve the read.
-        executor.wake_recv(conn_index);
+    {
+        if driver.arm_direct_recv_or_close(conn_index, need) {
+            // The connection closed instead: poll again to resolve the read.
+            executor.wake_recv(conn_index);
+        }
+        driver.arm_tls_recv_if_idle(conn_index);
     }
 }
 
@@ -4524,6 +4528,10 @@ fn enter_segmented(
             len: pending.len,
         });
     }
+    // A segment reader waits on the hold rather than through `park_recv`, so
+    // a TLS connection's receive is armed here; the segmented domain re-arms
+    // it after each completion.
+    driver.arm_tls_recv_if_idle(conn_index);
     Ok(())
 }
 

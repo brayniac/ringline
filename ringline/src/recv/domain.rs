@@ -5,14 +5,14 @@
 //! - `CopyOrConsume` (the default) — bytes go to the `RecvAccumulator` and are
 //!   surfaced through `with_data`/`with_bytes`.
 //! - `Segmented` — received bytes are held in `segment_hold` instead of the
-//!   accumulator, for segment reads (Modes B and C) and `forward_to` /
-//!   `forward_to_conn` sources (Mode A). Only a TLS connection enters it, and
-//!   its decrypted plaintext is held as owned entries. On io_uring a
-//!   plaintext connection receives directly into its accumulator. `segments`,
-//!   `recv_owned_segment`, `with_segments`, `with_bytes_segments` and
-//!   `forward_to` return `io::ErrorKind::Unsupported` on it; `forward_to_conn`
-//!   sends from its accumulator through the sink's send queue without
-//!   entering this domain.
+//!   accumulator, for segment reads (Modes B and C) and `forward_to` sources
+//!   (Mode A). Only a TLS connection enters it, and its decrypted plaintext
+//!   is held as owned entries. On io_uring a plaintext connection receives
+//!   directly into its accumulator. `segments`, `recv_owned_segment`,
+//!   `with_segments`, `with_bytes_segments` and `forward_to` return
+//!   `io::ErrorKind::Unsupported` on it. `forward_to_conn`, from a plaintext
+//!   or a TLS source, sends from the accumulator through the sink's send
+//!   queue without entering this domain.
 //!
 //! This is a minimal per-connection selector; the holding machinery lives on the
 //! `Driver` (`segment_hold`).

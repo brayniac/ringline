@@ -1036,24 +1036,16 @@ impl ConfigBuilder {
         self
     }
 
-    /// Arm multishot TCP receives instead of one-shot ones.
+    /// Arm multishot receives on the TCP provided-buffer ring instead of
+    /// one-shot ones.
     ///
-    /// With one-shot receives (the default), a connection has one receive
-    /// in flight, which takes one provided buffer, and the next is armed
-    /// when it completes. A multishot receive keeps taking buffers for as
-    /// long as the socket has data, so with many connections and large
-    /// messages some connections can hold the ring's buffers while others
-    /// get none, and those wait until buffers return. A multishot receive
-    /// saves one SQE per received buffer, and the wait for the next arm's
-    /// submission: one connection streaming large messages receives about a
-    /// fifth less per second with one-shot receives.
+    /// Has no effect on any TCP connection: a plaintext connection receives
+    /// directly into its accumulator (see [`connect`](crate::connect)), and a
+    /// TLS connection's ring receive is one-shot, armed when a read parks,
+    /// so a task that does not read stops its peer.
     ///
     /// io_uring only; the mio backend reads on readiness.
     /// **Default: false**.
-    ///
-    /// On io_uring this affects TLS connections only: a plaintext
-    /// connection receives directly into its accumulator (see
-    /// [`connect`](crate::connect)).
     pub fn recv_multishot(mut self, enabled: bool) -> Self {
         self.config.recv_multishot = enabled;
         self
@@ -1222,7 +1214,7 @@ impl ConfigBuilder {
     /// Default: 64 (2× `MAX_IOVECS`).
     ///
     /// On io_uring only a TLS connection uses this, when it is a `forward_to`
-    /// or `forward_to_conn` source or has a segment reader: a plaintext
+    /// source or has a segment reader: a plaintext
     /// connection receives directly into its accumulator (see
     /// [`connect`](crate::connect)).
     pub fn forward_hold_cap(mut self, cap: usize) -> Self {

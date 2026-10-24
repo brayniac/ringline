@@ -250,7 +250,8 @@ impl Driver {
         let Some(cs) = self.connections.get(conn_index) else {
             return;
         };
-        if !cs.recv_direct || cs.hangup_poll_armed || cs.recv_finished() {
+        let tls = self.tls_table.as_ref().is_some_and(|t| t.has(conn_index));
+        if !(cs.recv_direct || tls) || cs.hangup_poll_armed || cs.recv_finished() {
             return;
         }
         let generation = cs.generation;
@@ -272,6 +273,56 @@ impl Driver {
             cs.hangup_poll_armed = true;
             cs.hangup_poll_retry = false;
         }
+    }
+
+    /// Arm a TLS connection's ring receive if none is armed and nothing holds
+    /// it back: the connection is open and still reading, no throttle,
+    /// fallback receive, ENOBUFS parking or park is pending. Once its
+    /// handshake is done, a TLS connection's receive is armed this way by a
+    /// parked read (`park_recv`), by entering the segmented domain, and by
+    /// its hangup poll, not after every completion. A failed push goes to
+    /// `recv_rearm_retries`.
+    pub(crate) fn arm_tls_recv_if_idle(&mut self, conn_index: u32) {
+        let ci = conn_index as usize;
+        let Some(cs) = self.connections.get(conn_index) else {
+            return;
+        };
+        if !self.tls_table.as_ref().is_some_and(|t| t.has(conn_index))
+            || cs.recv_multishot_armed
+            || cs.recv_finished()
+            || !matches!(cs.lifecycle, Lifecycle::Open)
+            || !matches!(cs.recv_arm, RecvArm::Multi)
+            || self.forward_hold_throttled[ci]
+            || self.recv_fallback_inflight[ci]
+            || self.recv_starved.contains(conn_index)
+            || self.park_pending(conn_index)
+        {
+            return;
+        }
+        let generation = cs.generation;
+        if self.submit_tcp_recv(conn_index, generation).is_err() {
+            metrics::RING.increment(metrics::ring::RECV_ARM_FAILURES);
+            self.recv_rearm_retries.push((conn_index, generation));
+        } else if let Some(cs) = self.connections.get_mut(conn_index) {
+            cs.recv_multishot_armed = true;
+        }
+    }
+
+    /// Whether a ring receive that completed should be re-armed at once. A
+    /// TLS connection whose handshake is done re-arms only in the segmented
+    /// domain (a forward source or a segment reader, throttled at the hold
+    /// cap) or after its hangup poll has completed; otherwise its next
+    /// parked read arms the receive, so a task that does not read stops its
+    /// peer. Every other ring connection re-arms.
+    pub(crate) fn rearms_after_completion(&self, conn_index: u32) -> bool {
+        let tls = self.tls_table.as_ref().is_some_and(|t| t.has(conn_index));
+        if !tls {
+            return true;
+        }
+        self.connections
+            .get(conn_index)
+            .is_some_and(|c| !c.established || c.hangup_seen)
+            || self.recv_domain[conn_index as usize] == crate::recv::domain::RecvDomain::Segmented
     }
 
     /// Submit a hangup peek on `conn_index` (`OpTag::HangupPeek`) and record
@@ -306,7 +357,11 @@ impl Driver {
         {
             return Ok(());
         }
-        if !self.recv_multishot {
+        // A TLS connection's receive is one-shot: it is armed when a read
+        // parks, and a multishot would keep receiving whether or not the
+        // task reads.
+        let tls = self.tls_table.as_ref().is_some_and(|t| t.has(conn_index));
+        if !self.recv_multishot || tls {
             self.ring.submit_single_recv(conn_index, generation)
         } else {
             self.ring.submit_multishot_recv(conn_index, generation)

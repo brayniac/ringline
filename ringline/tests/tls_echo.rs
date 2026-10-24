@@ -1343,6 +1343,63 @@ fn forward_to_conn_from_a_tls_source() {
     }
 }
 
+/// Connect a TLS client to `addr`, send one byte, wait for the server's
+/// one-byte ack, then flood from a thread until the sent count stops moving
+/// with the write blocked (`stalled`) or reaches `limit`. Returns the bytes
+/// sent and whether the flood stalled.
+fn tls_flood_after_ack(addr: &str, certs: &[CertificateDer<'static>], limit: u64) -> (u64, bool) {
+    let server_name: ServerName<'_> = "localhost".try_into().unwrap();
+    let mut tls_conn =
+        rustls::ClientConnection::new(client_tls_config(certs), server_name).unwrap();
+    let mut tcp = TcpStream::connect(addr).unwrap();
+    tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut stream = rustls::Stream::new(&mut tls_conn, &mut tcp);
+    stream.write_all(b"g").unwrap();
+    stream.flush().unwrap();
+    let mut ack = [0u8; 1];
+    stream.read_exact(&mut ack).expect("forward armed ack");
+    let _ = stream;
+
+    // Flood from a thread until the count stops moving (throttled) or
+    // reaches the limit (not throttled), then shut the socket down to end a
+    // write the throttle has stalled.
+    let sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let counter = Arc::clone(&sent);
+    let control = tcp.try_clone().unwrap();
+    let writer = std::thread::spawn(move || {
+        let mut stream = rustls::Stream::new(&mut tls_conn, &mut tcp);
+        let chunk = vec![7u8; 1 << 20];
+        while counter.load(std::sync::atomic::Ordering::Relaxed) < limit {
+            match stream.write(&chunk) {
+                Ok(n) => {
+                    counter.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    let started = Instant::now();
+    let (mut last, mut still_since) = (0u64, Instant::now());
+    let stalled = loop {
+        std::thread::sleep(Duration::from_millis(250));
+        let now = sent.load(std::sync::atomic::Ordering::Relaxed);
+        if now >= limit || started.elapsed() > Duration::from_secs(30) {
+            break false;
+        }
+        if now != last {
+            (last, still_since) = (now, Instant::now());
+        } else if still_since.elapsed() >= Duration::from_secs(1) {
+            // A writer that stopped on an error (the server closed the
+            // connection) also stops the count; only a blocked write is a stall.
+            break !writer.is_finished();
+        }
+    };
+    let sent = sent.load(std::sync::atomic::Ordering::Relaxed);
+    let _ = control.shutdown(std::net::Shutdown::Both);
+    writer.join().unwrap();
+    (sent, stalled)
+}
+
 // ── A TLS forward source stops at the hold cap ─────────────────────────
 
 /// Forwards everything the TLS client sends to a sink that never reads.
@@ -1393,9 +1450,9 @@ impl AsyncEventHandler for TlsForwardToStuckSink {
 #[test]
 fn a_tls_forward_source_with_a_stuck_sink_is_throttled() {
     let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
-    for multishot in [false, true] {
-        tls_forward_to_stuck_sink(multishot);
-    }
+    tls_forward_to_stuck_sink(false);
+    // `recv_multishot` has no effect on a TLS connection's receive.
+    tls_forward_to_stuck_sink(true);
 }
 
 /// One run of `a_tls_forward_source_with_a_stuck_sink_is_throttled`, with
@@ -1422,69 +1479,179 @@ fn tls_forward_to_stuck_sink(multishot: bool) {
     let addr = shutdown.bound_addr().expect("bound address").to_string();
     wait_for_server(&addr);
 
-    let server_name: ServerName<'_> = "localhost".try_into().unwrap();
-    let mut tls_conn =
-        rustls::ClientConnection::new(client_tls_config(&certs), server_name).unwrap();
-    let mut tcp = TcpStream::connect(&addr).unwrap();
-    tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    let mut stream = rustls::Stream::new(&mut tls_conn, &mut tcp);
-    stream.write_all(b"g").unwrap();
-    stream.flush().unwrap();
-    let mut ack = [0u8; 1];
-    stream.read_exact(&mut ack).expect("forward armed ack");
-    let _ = stream;
+    let (sent, stalled) = tls_flood_after_ack(&addr, &certs, LIMIT);
+    eprintln!("multishot {multishot}: sent {sent} bytes, stalled {stalled}");
 
-    // Flood from a thread until the count stops moving (throttled) or
-    // reaches the limit (not throttled), then shut the socket down to end a
-    // write the throttle has stalled.
-    let sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let counter = Arc::clone(&sent);
-    let control = tcp.try_clone().unwrap();
-    let writer = std::thread::spawn(move || {
-        let mut stream = rustls::Stream::new(&mut tls_conn, &mut tcp);
-        let chunk = vec![7u8; 1 << 20];
-        while counter.load(std::sync::atomic::Ordering::Relaxed) < LIMIT {
-            match stream.write(&chunk) {
-                Ok(n) => {
-                    counter.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
-                }
-                Err(_) => break,
+    // Close the sink's peer first: the forward's send to it holds worker exit
+    // until the kernel releases the data it queued.
+    drop(held.join());
+    shutdown.shutdown();
+    for h in handles {
+        h.join().expect("worker panicked").expect("worker failed");
+    }
+    assert!(
+        stalled && sent > 0 && sent < LIMIT,
+        "multishot {multishot}: the TLS forward source accepted {sent} bytes without stalling"
+    );
+}
+
+// ── A TLS connection's receive follows its reads ───────────────────────
+
+/// Reads the client's first byte, acks it, then never reads again.
+#[cfg(has_io_uring)]
+struct TlsIdleReader;
+
+#[cfg(has_io_uring)]
+impl AsyncEventHandler for TlsIdleReader {
+    #[allow(clippy::manual_async_fn)]
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
+        async move {
+            let n = conn
+                .with_data(|d| {
+                    if d.is_empty() {
+                        ParseResult::NeedMore
+                    } else {
+                        ParseResult::Consumed(1)
+                    }
+                })
+                .await;
+            if n == 0 {
+                return;
+            }
+            let _ = conn.send_nowait(b"a");
+            loop {
+                ringline::sleep(Duration::from_secs(1)).await;
             }
         }
-    });
-    let started = Instant::now();
-    let (mut last, mut still_since) = (0u64, Instant::now());
-    let stalled = loop {
-        std::thread::sleep(Duration::from_millis(250));
-        let now = sent.load(std::sync::atomic::Ordering::Relaxed);
-        if now >= LIMIT || started.elapsed() > Duration::from_secs(30) {
-            break false;
-        }
-        if now != last {
-            (last, still_since) = (now, Instant::now());
-        } else if still_since.elapsed() >= Duration::from_secs(1) {
-            // A writer that stopped on an error (the server closed the
-            // connection) also stops the count; only a blocked write is a stall.
-            break !writer.is_finished();
-        }
-    };
-    let sent = sent.load(std::sync::atomic::Ordering::Relaxed);
-    let _ = control.shutdown(std::net::Shutdown::Both);
-    writer.join().unwrap();
-    eprintln!(
-        "multishot {multishot}: sent {sent} bytes, stalled {stalled}, in {:?}",
-        started.elapsed()
-    );
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        TlsIdleReader
+    }
+}
+
+/// A TLS connection whose task does not read stops receiving, so its peer's
+/// writes stall instead of filling the accumulator up to
+/// `recv_accumulator_max`. io_uring only: mio reads on readiness whether or
+/// not the task reads.
+#[cfg(has_io_uring)]
+#[test]
+fn a_tls_reader_that_does_not_read_stops_its_peer() {
+    let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
+    const LIMIT: u64 = 64 << 20;
+    let (certs, key) = generate_self_signed();
+    let config = test_config_builder()
+        .tls(TlsConfig::new(server_tls_config(certs.clone(), key)))
+        .build()
+        .expect("valid config");
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind("127.0.0.1:0".parse().unwrap())
+        .launch::<TlsIdleReader>()
+        .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
+    wait_for_server(&addr);
+
+    let (sent, stalled) = tls_flood_after_ack(&addr, &certs, LIMIT);
+    eprintln!("idle TLS reader: sent {sent} bytes, stalled {stalled}");
 
     shutdown.shutdown();
     for h in handles {
         h.join().expect("worker panicked").expect("worker failed");
     }
-    drop(held.join());
     assert!(
         stalled && sent > 0 && sent < LIMIT,
-        "multishot {multishot}: the TLS forward source accepted {sent} bytes without stalling"
+        "an idle TLS reader accepted {sent} bytes without stalling"
     );
+}
+
+/// Acks the handshake with one byte, then watches `is_alive` without reading.
+struct TlsCloseWatcher;
+
+static TLS_CLOSE_SEEN: Mutex<Option<bool>> = Mutex::new(None);
+
+/// Reports the close if the runtime drops the watcher's task when the
+/// connection closes, before the watcher sees `is_alive` turn false.
+struct ReportCloseOnDrop;
+
+impl Drop for ReportCloseOnDrop {
+    fn drop(&mut self) {
+        let mut seen = TLS_CLOSE_SEEN.lock().unwrap();
+        if seen.is_none() {
+            *seen = Some(true);
+        }
+    }
+}
+
+impl AsyncEventHandler for TlsCloseWatcher {
+    #[allow(clippy::manual_async_fn)]
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
+        async move {
+            let _report = ReportCloseOnDrop;
+            let _ = conn.send_nowait(b"a");
+            let started = Instant::now();
+            while started.elapsed() < Duration::from_secs(5) {
+                if !conn.is_alive() {
+                    *TLS_CLOSE_SEEN.lock().unwrap() = Some(true);
+                    return;
+                }
+                ringline::sleep(Duration::from_millis(10)).await;
+            }
+            *TLS_CLOSE_SEEN.lock().unwrap() = Some(false);
+        }
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        TlsCloseWatcher
+    }
+}
+
+/// A TLS connection that nothing reads sees its peer's close_notify and FIN:
+/// the hangup poll arms a receive, so `is_alive` turns false.
+#[test]
+fn a_tls_peer_close_is_seen_while_nothing_reads() {
+    let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
+    *TLS_CLOSE_SEEN.lock().unwrap() = None;
+    let (certs, key) = generate_self_signed();
+    let config = test_config_builder()
+        .tls(TlsConfig::new(server_tls_config(certs.clone(), key)))
+        .build()
+        .expect("valid config");
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind("127.0.0.1:0".parse().unwrap())
+        .launch::<TlsCloseWatcher>()
+        .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
+    wait_for_server(&addr);
+
+    let server_name: ServerName<'_> = "localhost".try_into().unwrap();
+    let mut tls_conn =
+        rustls::ClientConnection::new(client_tls_config(&certs), server_name).unwrap();
+    let mut tcp = TcpStream::connect(&addr).unwrap();
+    tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    {
+        let mut stream = rustls::Stream::new(&mut tls_conn, &mut tcp);
+        let mut ack = [0u8; 1];
+        stream.read_exact(&mut ack).expect("handshake ack");
+    }
+    tls_conn.send_close_notify();
+    while tls_conn.wants_write() {
+        tls_conn.write_tls(&mut tcp).unwrap();
+    }
+    drop(tcp);
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let seen = loop {
+        if let Some(seen) = *TLS_CLOSE_SEEN.lock().unwrap() {
+            break seen;
+        }
+        assert!(Instant::now() < deadline, "the handler never reported");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    shutdown.shutdown();
+    for h in handles {
+        h.join().expect("worker panicked").expect("worker failed");
+    }
+    assert!(seen, "the TLS connection did not see its peer close");
 }
 
 // ── A TLS connection may not be a forward sink (EPROTOTYPE, both backends) ──

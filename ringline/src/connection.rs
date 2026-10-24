@@ -188,6 +188,11 @@ pub struct ConnectionState {
     /// while set, the connection has an entry on `Driver::hangup_poll_retries`.
     #[cfg(has_io_uring)]
     pub hangup_poll_retry: bool,
+    /// A TLS connection's hangup poll completed: its peer sent a FIN or a
+    /// reset, or the socket has an error. Its receive is then re-armed after
+    /// every completion until the end is read, whether or not a read parks.
+    #[cfg(has_io_uring)]
+    pub hangup_seen: bool,
     /// The errno a hangup peek returned while the connection stayed open (bytes
     /// buffered or a receive in flight), or 0. The peek clears the socket's
     /// pending error, so the receive or recheck peek that later finds the end
@@ -240,6 +245,8 @@ impl ConnectionState {
             hangup_recheck_due: false,
             #[cfg(has_io_uring)]
             hangup_poll_retry: false,
+            #[cfg(has_io_uring)]
+            hangup_seen: false,
             #[cfg(has_io_uring)]
             hangup_error: 0,
         }
@@ -319,6 +326,7 @@ impl ConnectionState {
             self.hangup_recheck = false;
             self.hangup_recheck_due = false;
             self.hangup_poll_retry = false;
+            self.hangup_seen = false;
             self.hangup_error = 0;
         }
         self.generation = self.generation.wrapping_add(1);
