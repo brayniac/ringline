@@ -658,6 +658,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- `ringline-redis`, `ringline-memcache` and `ringline-ping` `Pool::client`
+  reconnect a slot whose connection is no longer alive (`is_alive()` is
+  `false`) instead of handing it out. A connection the server closed while
+  it sat idle in the pool was handed out, and the first command on it
+  failed. With the server down, a pool whose slots have all closed now
+  returns `Error::AllConnectionsFailed` from `client()` instead of a client
+  whose first command fails. A close the worker has not yet seen is still
+  handed out, and so, on io_uring, is a plaintext connection whose FIN
+  arrived while it had unread bytes. The reconnect runs inside `client()`,
+  which waits for the connect (and AUTH on redis), bounded per slot by
+  `connect_timeout_ms`; with the default of 0 there is no bound.
 - io_uring: `recv_ready` resolves for bytes in a lent receive buffer and in
   the segment hold, as well as for bytes in the accumulator. It stayed pending
   for a receive lent in place on a connection with an empty accumulator until
