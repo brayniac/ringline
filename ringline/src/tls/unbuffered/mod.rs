@@ -133,8 +133,10 @@ pub struct UnbufferedConn {
     /// throughput, not bytes.
     pending_plaintext: VecDeque<Vec<u8>>,
     /// Largest plaintext slice known to encrypt into one output buffer of
-    /// `chunk_basis` bytes. Learned from rustls' `required_size` on the first
-    /// `InsufficientSize`, then reused. `0` means "not yet learned".
+    /// `chunk_basis` bytes. Learned from rustls' `required_size` and reused
+    /// only when the output buffer cannot hold one whole record, which only
+    /// TLS state installed without `Config::validate` reaches. `0` means "not
+    /// learned".
     max_plaintext_per_chunk: usize,
     /// Output buffer size `max_plaintext_per_chunk` was learned against. A
     /// different size invalidates it.
@@ -652,8 +654,9 @@ pub(crate) const MIN_ENCRYPT_DST: usize = 64;
 /// nothing and reports `required_size` for the payload it was handed. The
 /// chunk size is therefore shrunk from that report — never from a hardcoded
 /// record overhead, which differs between TLS 1.2 (explicit nonce) and TLS 1.3
-/// (content-type byte). The converged size is cached on the connection so
-/// steady-state sends do not pay the retry.
+/// (content-type byte). When `dst` cannot hold one whole record the
+/// converged size is cached on the connection so later sends do not pay the
+/// retry.
 ///
 /// `dst` also carries any TLS records rustls had queued for sending — a
 /// TLS 1.3 `key_update`, most notably: `write_plaintext` drains `sendable_tls`
@@ -697,20 +700,20 @@ pub(crate) fn encrypt_chunk(
         // the ciphertext is larger than the plaintext: rustls fragments the
         // request, reports `required_size`, and the retry loop scales the chunk
         // down *proportionally* — which lands just under a fragment boundary
-        // rather than on it. At the 16384-byte default slot that caches 16362,
-        // so a 256 KiB send is split into 17 records where the buffered engine
-        // emits 16. Worse, for any `dst` in (16428, 2 * MAX_RECORD_WIRE_LEN)
-        // the loop converges on a chunk spanning a full record *plus a sliver*,
-        // doubling the record count outright (31 records for 256 KiB at a
-        // 16512-byte slot).
+        // rather than on it. At a 16384-byte slot, the default fragment size
+        // and TLS 1.3, that caches 16362, so a 256 KiB send is split into 17
+        // records where the buffered engine emits 16. Worse, for any `dst` in
+        // (16428, 2 * MAX_RECORD_WIRE_LEN) the loop converges on a chunk
+        // spanning a full record *plus a sliver*, doubling the record count
+        // outright (31 records for 256 KiB at a 16512-byte slot).
         //
         // Whole records avoid both: `whole * MAX_FRAGMENT_LEN` of plaintext
         // encrypts to exactly `whole * MAX_RECORD_WIRE_LEN` of ciphertext,
         // which fits by construction, so the common case needs no retry at all
         // and each call fills `dst` with none of it wasted on a sliver record.
         //
-        // `whole == 0` means `dst` cannot hold even one full record — the
-        // 16384-byte default slot is exactly this case, missing it by 22
+        // `whole == 0` means `dst` cannot hold even one full record; at the
+        // default fragment size on TLS 1.3 a 16384-byte slot misses it by 22
         // bytes. There is no whole-record answer, so fall back to the previous
         // behaviour and let the retry loop find the largest chunk that fits.
         //
@@ -725,11 +728,10 @@ pub(crate) fn encrypt_chunk(
         // (`slots = records`) is an upper bound only while a slot carries at
         // least one whole record, so caching less than `F` turns admission
         // into an under-estimate — and by departure 1 an under-estimate closes
-        // the connection rather than applying backpressure. The wire term uses
-        // the TLS 1.2 worst case for the same reason the bound does: the hint
-        // must fit under whichever version this connection negotiated — the
-        // admission bound's version-agnostic worst case would leave a whole
-        // TLS 1.3 record of `dst` unused and drop back into the retry loop.
+        // the connection rather than applying backpressure. The wire term is
+        // the connection's negotiated record overhead
+        // (`negotiated_record_overhead`), so the hint is sized for the version
+        // this connection uses.
         if whole == 0 {
             dst.len()
         } else {
@@ -745,9 +747,10 @@ pub(crate) fn encrypt_chunk(
     // Cached only when `dst` cannot hold one whole record (`whole == 0`),
     // where the retry loop is the only way to find a chunk that fits. With
     // `whole >= 1` the whole-record hint fits by construction, so a shrink
-    // there comes from a record rustls had queued (a key_update reply) riding
-    // in the same `dst`, and applies to this call only. Caching it would leave
-    // every later chunk under one record for this `dst` size, and
+    // there comes from records rustls had queued (a key_update reply, the
+    // key_update rustls sends when its traffic keys near their limit, or both)
+    // riding in the same `dst`, and applies to this call only. Caching it
+    // would leave every later chunk under one record for this `dst` size, and
     // `CiphertextCapacity::slots_unbuffered` (one record per slot) would then
     // under-count.
     let mut learned: Option<usize> = None;

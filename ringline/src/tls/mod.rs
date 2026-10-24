@@ -415,16 +415,14 @@ impl CiphertextCapacity {
     /// `encrypt_chunk` writes whole records into one slot and cannot straddle,
     /// so the byte formula *under*-estimates this engine — at a 32768-byte slot
     /// and 49152 bytes of plaintext the byte formula says 2 slots and the
-    /// engine takes 3. One record per slot is the engine's own worst case and
-    /// is always safe. It over-reserves whenever a slot holds several records,
-    /// which costs admission latency and nothing else.
+    /// engine takes 3. One record per slot is safe under the condition below.
+    /// It over-reserves whenever a slot holds several records, which costs
+    /// admission latency and nothing else.
     ///
-    /// The engine's real per-slot capacity is **not** a closed form and must
-    /// not be derived from one: it is a cached `max_plaintext_per_chunk` that
-    /// only ever shrinks for a given destination size, and the hint seeding it
-    /// hardcodes the *default* fragment constants — so with an overridden
-    /// fragment size the hint is wrong and the shrink loop converges instead.
-    /// A tighter bound has to be **measured**, not calculated.
+    /// The bound holds while each slot carries at least `F` plaintext, apart
+    /// from the last and from calls that also carry records rustls had queued
+    /// (a key_update); the `+ 1` slack record covers the plaintext those calls
+    /// give up.
     ///
     /// Returns `None` when `slot_size` cannot hold one whole worst-case record
     /// (`F + 29`). That is not a nicety: below that size the shrink loop

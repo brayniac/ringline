@@ -749,13 +749,12 @@ impl<'a> DriverCtx<'a> {
                         return Err(e);
                     }
                 };
-                // The tripwire. Three hazards are modelled rather than
-                // measured — unbuffered record waste, a pessimistic
-                // `max_plaintext_per_chunk` cache, and rustls draining a
-                // queued alert or key_update into the same destination — and
-                // a bound that is only checked by the tests written for it
-                // drifts. If any of them is ever beaten, a debug build says
-                // so here instead of closing a connection in production.
+                // The tripwire. Two hazards are modelled rather than measured
+                // — unbuffered record waste, and rustls draining a queued
+                // alert or key_update into the same destination — and a bound
+                // that is only checked by the tests written for it drifts. If
+                // either is ever beaten, a debug build says so here instead of
+                // closing a connection in production.
                 debug_assert!(
                     free_before.saturating_sub(self.send_copy_pool.free_count()) <= needed,
                     "TLS ciphertext bound beaten: reserved {needed} slots, encryption took {}",
@@ -3010,12 +3009,12 @@ impl<'a> DriverCtx<'a> {
                     return Err(e);
                 }
             };
-            // The tripwire. Three hazards are modelled rather than measured —
-            // unbuffered record waste, a pessimistic `max_plaintext_per_chunk`
-            // cache, and rustls draining a queued alert or key_update into the
-            // same destination. A bound checked only by the tests written for
-            // it drifts; if one is ever beaten, a debug build says so here
-            // rather than closing a connection in production.
+            // The tripwire. Two hazards are modelled rather than measured —
+            // unbuffered record waste, and rustls draining a queued alert or
+            // key_update into the same destination. A bound checked only by
+            // the tests written for it drifts; if one is ever beaten, a debug
+            // build says so here rather than closing a connection in
+            // production.
             debug_assert!(
                 ciphertext.len() <= bound.bytes(),
                 "TLS ciphertext bound beaten: bounded {} bytes, rustls produced {}",
