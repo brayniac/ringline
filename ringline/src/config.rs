@@ -193,8 +193,7 @@ pub struct Config {
     /// Try an incremental TCP receive ring. See
     /// `ConfigBuilder::recv_incremental`.
     pub(crate) recv_incremental: bool,
-    /// Arm multishot TCP receives instead of one-shot ones. See
-    /// `ConfigBuilder::recv_multishot`.
+    /// `ConfigBuilder::recv_multishot`; has no effect on TCP connections.
     pub(crate) recv_multishot: bool,
     /// Bound on the per-worker accept channel. If a worker can't drain its
     /// queue fast enough, the acceptor will skip past it (and possibly

@@ -1400,6 +1400,129 @@ fn tls_flood_after_ack(addr: &str, certs: &[CertificateDer<'static>], limit: u64
     (sent, stalled)
 }
 
+/// Starts a `forward_to_conn` to a backend, then tries a segment reader and a
+/// `forward_to` on the same TLS source while the forward runs.
+#[cfg(has_io_uring)]
+struct TlsSegmentDuringDirectForward;
+
+#[cfg(has_io_uring)]
+static TLS_DURING_FORWARD_BACKEND: Mutex<Option<SocketAddr>> = Mutex::new(None);
+#[cfg(has_io_uring)]
+static TLS_DURING_FORWARD_RESULT: Mutex<Option<String>> = Mutex::new(None);
+
+#[cfg(has_io_uring)]
+impl AsyncEventHandler for TlsSegmentDuringDirectForward {
+    #[allow(clippy::manual_async_fn)]
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
+        async move {
+            use std::os::fd::AsFd;
+            let addr = TLS_DURING_FORWARD_BACKEND
+                .lock()
+                .unwrap()
+                .expect("backend addr");
+            let Ok(backend) = ringline::connect(addr).await else {
+                return;
+            };
+            // Release the backend's send-half claim, so a `ConnCtx` can name
+            // it as the sink; the receive half keeps the connection open.
+            let (backend_tx, _backend_rx) = backend.split();
+            let sink_ctx = backend_tx.as_conn();
+            drop(backend_tx);
+            let src = conn.as_conn();
+            let fwd = src.forward_to_conn(&sink_ctx, 5);
+            // A segment reader is refused on its first poll.
+            let segment = match conn.recv_owned_segment() {
+                Ok(read) => read.await.map(|_| ()),
+                Err(e) => Err(e),
+            };
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/null")
+                .expect("open /dev/null");
+            let sink = ringline::SinkFd::file(file.as_fd()).expect("file sink");
+            let mode_a = conn.forward_to(&sink, 5).await;
+            let forwarded = fwd.await;
+            *TLS_DURING_FORWARD_RESULT.lock().unwrap() = Some(format!(
+                "segment {:?} forward_to {:?} forward_to_conn {forwarded:?}",
+                segment.map_err(|e| e.raw_os_error()),
+                mode_a.map_err(|e| e.raw_os_error()),
+            ));
+        }
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        TlsSegmentDuringDirectForward
+    }
+}
+
+/// While a TLS source's `forward_to_conn` runs on the direct path, a segment
+/// reader and a `forward_to` on the same source are refused with `EBUSY`; the
+/// forward still delivers its bytes.
+#[cfg(has_io_uring)]
+#[test]
+fn a_tls_direct_forward_refuses_a_segment_reader_and_forward_to() {
+    let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
+    *TLS_DURING_FORWARD_RESULT.lock().unwrap() = None;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    *TLS_DURING_FORWARD_BACKEND.lock().unwrap() = Some(listener.local_addr().unwrap());
+    let backend = std::thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut got = Vec::new();
+        let mut buf = [0u8; 64];
+        while got.len() < 5 {
+            match s.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => got.extend_from_slice(&buf[..n]),
+            }
+        }
+        got
+    });
+    let (certs, key) = generate_self_signed();
+    let config = test_config_builder()
+        .tls(TlsConfig::new(server_tls_config(certs.clone(), key)))
+        .build()
+        .expect("valid config");
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind("127.0.0.1:0".parse().unwrap())
+        .launch::<TlsSegmentDuringDirectForward>()
+        .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
+    wait_for_server(&addr);
+    let server_name: ServerName<'_> = "localhost".try_into().unwrap();
+    let mut tls_conn =
+        rustls::ClientConnection::new(client_tls_config(&certs), server_name).unwrap();
+    let mut tcp = TcpStream::connect(&addr).unwrap();
+    {
+        let mut stream = rustls::Stream::new(&mut tls_conn, &mut tcp);
+        std::thread::sleep(Duration::from_millis(200));
+        stream.write_all(b"hello").unwrap();
+        stream.flush().unwrap();
+    }
+    let got = backend.join().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let result = loop {
+        if let Some(r) = TLS_DURING_FORWARD_RESULT.lock().unwrap().clone() {
+            break r;
+        }
+        assert!(Instant::now() < deadline, "the handler never reported");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    drop(tcp);
+    shutdown.shutdown();
+    for h in handles {
+        h.join().expect("worker panicked").expect("worker failed");
+    }
+    assert_eq!(got, b"hello", "handler: {result}");
+    assert_eq!(
+        result,
+        format!(
+            "segment Err(Some({ebusy})) forward_to Err(Some({ebusy})) forward_to_conn Ok(5)",
+            ebusy = libc::EBUSY
+        )
+    );
+}
+
 // ── TLS forward sources whose sink does not read ───────────────────────
 
 /// Forwards everything the TLS client sends to a sink that never reads.

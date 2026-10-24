@@ -4523,8 +4523,15 @@ fn enter_segmented(
     // accumulator here would push post-`len` overshoot into the
     // forward's next write and corrupt the relayed stream, so leave a
     // forwarding connection strictly alone — exactly as
-    // `arm_forward_source` refuses a second forward with EBUSY.
-    if driver.forward_progress[idx].is_some() {
+    // `arm_forward_source` refuses a second forward with EBUSY. A direct
+    // forward (a TLS source) reads the accumulator, which entering the
+    // domain would empty into the hold.
+    if driver.forward_progress[idx].is_some()
+        || driver
+            .connections
+            .get(conn_index)
+            .is_some_and(|c| c.direct_forwarding)
+    {
         return Err(io::Error::from_raw_os_error(libc::EBUSY));
     }
     // A live `SegmentReader` owns the delivery discipline until it
@@ -5483,8 +5490,15 @@ impl<F: FnMut(&SegChain<'_>) -> SegConsumed + Unpin> WithSegmentsFuture<F> {
 
         if !self.entered {
             // A live `SegmentReader` owns the hold; handing the same
-            // buffers to a second consumer would double-deliver them.
-            if driver.segment_reader_live[idx] {
+            // buffers to a second consumer would double-deliver them. A
+            // forward owns the hold (Mode A) or the accumulator (direct).
+            if driver.segment_reader_live[idx]
+                || driver.forward_progress[idx].is_some()
+                || driver
+                    .connections
+                    .get(conn)
+                    .is_some_and(|c| c.direct_forwarding)
+            {
                 self.f.take();
                 return Poll::Ready(Err(io::Error::from_raw_os_error(libc::EBUSY)));
             }

@@ -348,8 +348,8 @@ impl Driver {
     }
 
     /// Arm a TCP ring recv on `conn_index`, carrying the `RecvMulti`
-    /// user_data: one-shot for a TLS connection; for any other ring
-    /// connection, multishot when `Config::recv_multishot` is set.
+    /// user_data. A TLS connection's is one-shot; the multishot branch is
+    /// reached only by the ring connections unit tests build.
     pub(crate) fn submit_tcp_recv(&mut self, conn_index: u32, generation: u32) -> io::Result<()> {
         // A direct connection never takes a provided buffer; its receive is
         // armed by the parked receive future (`arm_direct_recv_or_close`).
@@ -842,7 +842,8 @@ pub(crate) struct Driver {
     /// Per-connection cap on held receive entries (`Config::forward_hold_cap`);
     /// `throttle_if_held` applies it, lowered to a quarter of the ring.
     pub(crate) forward_hold_cap: usize,
-    /// `Config::recv_multishot`: TCP connections arm multishot receives.
+    /// `Config::recv_multishot`. No TCP connection arms a multishot receive:
+    /// plaintext ones receive directly and TLS ones one-shot.
     pub(crate) recv_multishot: bool,
     pub(crate) accept_rx: Option<crossbeam_channel::Receiver<crate::acceptor::AcceptedConn>>,
     /// Merged accept mode: every merged listener's sockets, `(listener index,
