@@ -23,8 +23,8 @@
 //! and is not yet explained.
 //!
 //! The default engine, selected per connection in `TlsTable::create` unless
-//! the `tls-buffered` feature is on, and driven end-to-end on both backends through their
-//! dispatcher modules (`super::backend_mio`, `super::backend_uring`). The
+//! the `tls-buffered` feature is on, and driven end-to-end on both backends
+//! through their dispatcher modules (`super::backend_mio`, `super::backend_uring`). The
 //! backends differ only in where the ciphertext lands: a `Vec` on the
 //! connection's pending-send FIFO for mio, `SendCopyPool` slots for io_uring
 //! (see `docs/journal/2026-09-unbuffered-tls.md`).

@@ -21,8 +21,8 @@
 //!
 //! Which engine drives a connection is decided once, in
 //! [`TlsTable::create`]/[`TlsTable::create_client`]: the unbuffered engine,
-//! unless the `tls-buffered` cargo feature selects the buffered one. Backends never see that choice: `backend_mio` and
-//! `backend_uring` each dispatch their backend's entry points to whichever
+//! unless the `tls-buffered` cargo feature selects the buffered one. Backends
+//! never see that choice: `backend_mio` and `backend_uring` each dispatch their backend's entry points to whichever
 //! engine is compiled in, keeping the names and signatures the backend already
 //! called. `drain_tls_plaintext` below is the buffered engine's plaintext
 //! drain and is reached only from `buffered` (the unbuffered engine drains
@@ -51,8 +51,8 @@ mod backend_mio;
 mod backend_uring;
 pub(crate) mod buffered;
 // The incoming-ciphertext buffer belongs to the unbuffered engine and has no
-// other consumer, so it shares the engine's gate; without it every item in the
-// module is dead code in a default build.
+// other consumer, so it shares the engine's gate; under `tls-buffered` every
+// item in the module would be dead code.
 #[cfg(not(feature = "tls-buffered"))]
 mod ciphertext;
 #[cfg(not(feature = "tls-buffered"))]

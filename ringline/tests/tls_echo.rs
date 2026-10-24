@@ -644,6 +644,18 @@ impl AsyncEventHandler for TlsInfoHandler {
 
 #[test]
 fn tls_info_accessors() {
+    tls_info_accessors_with(false);
+}
+
+/// The same with the TLS config given per listener (`bind_tls`) rather than
+/// process-wide: the unbuffered engine wraps each listener's config to capture
+/// the SNI hostname, as it wraps the process-wide one.
+#[test]
+fn tls_info_accessors_on_a_bind_tls_listener() {
+    tls_info_accessors_with(true);
+}
+
+fn tls_info_accessors_with(per_listener: bool) {
     let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
 
     // Reset shared state from any prior test run.
@@ -652,14 +664,25 @@ fn tls_info_accessors() {
     let (certs, key) = generate_self_signed();
     let server_config = server_tls_config(certs.clone(), key);
 
-    let config = test_config_builder()
-        .tls(TlsConfig::new(server_config))
-        .build()
-        .expect("valid config");
-    let (shutdown, handles) = RinglineBuilder::new(config)
-        .bind("127.0.0.1:0".parse().unwrap())
-        .launch::<TlsInfoHandler>()
-        .expect("launch failed");
+    let (shutdown, handles) = if per_listener {
+        let config = test_config_builder().build().expect("valid config");
+        RinglineBuilder::new(config)
+            .bind_tls(
+                "127.0.0.1:0".parse().unwrap(),
+                TlsConfig::new(server_config),
+            )
+            .launch::<TlsInfoHandler>()
+            .expect("launch failed")
+    } else {
+        let config = test_config_builder()
+            .tls(TlsConfig::new(server_config))
+            .build()
+            .expect("valid config");
+        RinglineBuilder::new(config)
+            .bind("127.0.0.1:0".parse().unwrap())
+            .launch::<TlsInfoHandler>()
+            .expect("launch failed")
+    };
     let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
@@ -728,6 +751,39 @@ fn tls_info_accessors() {
         snap.sni_hostname.as_deref(),
         Some("localhost"),
         "sni_hostname() should reflect the client's SNI value"
+    );
+}
+
+/// A send-pool slot too small for the unbuffered engine to encrypt into is
+/// refused at launch when the only TLS is a per-listener config (`bind_tls`),
+/// as it is for a process-wide one.
+#[cfg(not(feature = "tls-buffered"))]
+#[test]
+fn a_bind_tls_listener_with_a_slot_too_small_for_tls_is_refused() {
+    let (certs, key) = generate_self_signed();
+    let config = test_config_builder()
+        .send_pool(64, 32)
+        .build()
+        .expect("valid without TLS");
+    let result = RinglineBuilder::new(config)
+        .bind_tls(
+            "127.0.0.1:0".parse().unwrap(),
+            TlsConfig::new(server_tls_config(certs, key)),
+        )
+        .launch::<TlsInfoHandler>();
+    let err = match result {
+        Ok((shutdown, handles)) => {
+            shutdown.shutdown();
+            for h in handles {
+                let _ = h.join();
+            }
+            panic!("launched with a 32-byte send slot and a TLS listener");
+        }
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains("send_copy_slot_size"),
+        "unexpected error: {err}"
     );
 }
 

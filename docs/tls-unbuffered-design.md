@@ -66,8 +66,9 @@ records where *measuring* it did.
 > copy would have widened sharply there; this did not.
 >
 > **The +5.7% at 16 KiB is structural, not noise.** At a payload that is a
-> multiple of `send_copy_slot_size` (16384 by default) the buffered path emits
-> **one** 16406-byte record and lets `PoolWriter` straddle it across two slots.
+> multiple of `send_copy_slot_size` (16384 at the time; the default is now
+> 16448) the buffered path emits **one** 16406-byte record and lets
+> `PoolWriter` straddle it across two slots.
 > The unbuffered path must fit a whole record inside one slot, so
 > `encrypt_chunk` shrinks the chunk and emits **two** records — 17 vs 16 at
 > 256 KiB, 65 vs 64 at 1 MiB. The extra record costs ~245 ns, which accounts

@@ -320,18 +320,18 @@ Minimal — `with_data()` recv (pattern-match `PONG\r\n`, no value extraction), 
 
 2. **Send buffer ownership**: Ringline must own all memory referenced by SQEs (the submission must outlive the syscall). `SendCopyPool` provides pre-allocated slots for this. `SendGuard` is the escape hatch for zero-copy — it pins user memory and holds it alive until the kernel confirms completion.
 
-3. **TLS caps out at one extra copy**: encryption must read plaintext and write ciphertext, so `SendGuard` zero-copy is impossible under TLS — but ciphertext is encrypted directly into the send-pool slot (no intermediate scratch buffer), and it is serialized through the per-connection send queue for record ordering.
+3. **TLS caps out at one extra copy**: encryption must read plaintext and write ciphertext, so `SendGuard` zero-copy is impossible under TLS. Application data costs 2 copies on both engines (see the send table), and records are serialized through the per-connection send queue for ordering.
 
    The unbuffered engine (the default; the `tls-buffered` feature selects the
    buffered one) uses rustls' unbuffered API for the record layer. It does
-   **not** reduce the copy count: application
-   data still costs 2 copies, because rustls encrypts each record into a fresh
-   per-record buffer and copies the result into the destination
-   (`write_fragments`), and because the copy the feature was meant to remove
-   (`sendable_plaintext`) only happens *before* the handshake completes. Recv
-   costs 3 copies on both engines. Handshake ciphertext on io_uring pays one copy *more* than the
-   buffered engine (`EncodeTlsData::encode` needs one contiguous buffer that can
-   exceed a pool slot, so it goes through a scratch `Vec` first) — a one-time
+   **not** reduce the copy count: application data still costs 2 copies,
+   because rustls encrypts each record into a fresh per-record buffer and
+   copies the result into the destination (`write_fragments`), and because the
+   copy the feature was meant to remove (`sendable_plaintext`) only happens
+   *before* the handshake completes. Recv costs 3 copies on both engines.
+   Handshake ciphertext on io_uring pays one copy *more* than the buffered
+   engine (`EncodeTlsData::encode` needs one contiguous buffer that can exceed
+   a pool slot, so it goes through a scratch `Vec` first) — a one-time
    per-connection cost. Getting the intended 1-copy send would require rustls
    to encrypt in place into `outgoing_tls`, which it does not do. See
    `docs/tls-unbuffered-design.md`.

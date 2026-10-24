@@ -561,14 +561,17 @@ impl Config {
     /// bound is expressible on the unbuffered engine — see
     /// `docs/tls-premutation-bound-design.md`. Plain TLS sends work below it on
     /// both engines: the buffered engine straddles slots freely, and the
-    /// unbuffered engine still encrypts, just emitting more records. This
-    /// repo's own `tls_echo` tests run at 16384, 29 bytes under it. Rejecting
-    /// that at startup would break working deployments to pre-empt a hazard
-    /// that only reaches bounded sends, which already refuse themselves with a
-    /// message naming the same knob.
+    /// unbuffered engine still encrypts, emitting more records. Below it the
+    /// unbuffered engine has no up-front slot bound, so a plain send that finds
+    /// the pool short closes the connection instead of returning an error, and
+    /// bounded sends refuse themselves with a message naming the same knob.
+    /// This repo's own `tls_echo` tests run at 16384, 29 bytes under it.
     #[cfg(not(feature = "tls-buffered"))]
     fn validate_tls_slot_size(&self) -> Result<(), crate::error::Error> {
-        if self.tls.is_none() && self.tls_client.is_none() {
+        if self.tls.is_none()
+            && self.tls_client.is_none()
+            && self.listener_tls.iter().all(Option::is_none)
+        {
             return Ok(());
         }
         let min = crate::tls::unbuffered::MIN_ENCRYPT_DST;

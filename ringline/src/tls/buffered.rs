@@ -4,8 +4,8 @@
 // That is not dead code to delete: enabling `tls-buffered` brings the whole
 // engine back, and an item-by-item allow would just spell the same statement
 // out nine times. On mio this is invisible (`lib.rs` masks the whole `tls`
-// module); a Linux io_uring build without the feature is what fails
-// `-D warnings` without it.
+// module); a Linux io_uring build without `tls-buffered` fails `-D warnings`
+// without this allow.
 #![cfg_attr(not(feature = "tls-buffered"), allow(dead_code))]
 
 #[allow(unused_imports)]
