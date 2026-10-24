@@ -172,16 +172,22 @@ pub struct ConnectionState {
     pub hangup_peek_armed: bool,
     /// A hangup peek found bytes queued ahead of the end of the stream, or
     /// found the end with bytes buffered or a receive in flight, or the
-    /// hangup poll completed with a receive in flight, so the connection is
-    /// on `Driver::hangup_rechecks` until the end is seen.
+    /// hangup poll completed with a receive in flight, or the peek it
+    /// triggered could not be submitted, so the connection is on
+    /// `Driver::hangup_rechecks` until the end is seen.
     #[cfg(has_io_uring)]
     pub hangup_recheck: bool,
     /// A direct receive delivered bytes since the last recheck peek, a peek
-    /// found the end with bytes buffered or a receive in flight, or the
-    /// hangup poll completed with a receive in flight, so the next time
-    /// nothing is buffered, armed or parking, another peek is due.
+    /// found the end with bytes buffered or a receive in flight, the hangup
+    /// poll completed with a receive in flight, or the peek the hangup poll
+    /// triggered could not be submitted, so the next time nothing is
+    /// buffered, armed or parking, another peek is due.
     #[cfg(has_io_uring)]
     pub hangup_recheck_due: bool,
+    /// Set when the hangup poll could not be submitted and cleared when it is;
+    /// while set, the connection has an entry on `Driver::hangup_poll_retries`.
+    #[cfg(has_io_uring)]
+    pub hangup_poll_retry: bool,
     /// The errno a hangup peek returned while the connection stayed open (bytes
     /// buffered or a receive in flight), or 0. The peek clears the socket's
     /// pending error, so the receive or recheck peek that later finds the end
@@ -232,6 +238,8 @@ impl ConnectionState {
             hangup_recheck: false,
             #[cfg(has_io_uring)]
             hangup_recheck_due: false,
+            #[cfg(has_io_uring)]
+            hangup_poll_retry: false,
             #[cfg(has_io_uring)]
             hangup_error: 0,
         }
@@ -310,6 +318,7 @@ impl ConnectionState {
             self.hangup_peek_armed = false;
             self.hangup_recheck = false;
             self.hangup_recheck_due = false;
+            self.hangup_poll_retry = false;
             self.hangup_error = 0;
         }
         self.generation = self.generation.wrapping_add(1);
@@ -564,6 +573,16 @@ mod tests {
         assert!(!cs.connect_timeout_armed);
         assert!(cs.peer_addr.is_none());
         assert!(cs.lifecycle == Lifecycle::Inactive);
+    }
+
+    #[cfg(has_io_uring)]
+    #[test]
+    fn deactivate_clears_an_owed_hangup_poll_retry() {
+        let mut cs = ConnectionState::new();
+        cs.activate();
+        cs.hangup_poll_retry = true;
+        cs.deactivate();
+        assert!(!cs.hangup_poll_retry);
     }
 
     #[test]

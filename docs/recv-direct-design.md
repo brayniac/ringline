@@ -358,12 +358,14 @@ the runtime submits a non-blocking one-byte `recv` with `MSG_PEEK`
 
 No receive is armed on the hangup path, so the accumulator does not take
 more than a parked read would. A poll or peek that cannot be pushed is
-counted (`ring::RECV_ARM_FAILURES`). Without the poll, or when the peek the
-poll triggers cannot be pushed, a FIN or reset is seen by the next receive
-to complete, which a read arms when it parks; a recheck peek that cannot be
-pushed is retried the next time `recheck_hangups` runs. TCP does not tell a
-half-close from a close, so a FIN closes a connection whose task only
-sends.
+counted (`ring::RECV_ARM_FAILURES`). A poll goes on
+`Driver::hangup_poll_retries`, and `retry_hangup_polls`, which runs before
+each wait for completions, submits it again while no park is pending. A
+peek goes on `hangup_rechecks`, and `recheck_hangups` submits it once
+nothing is buffered, armed or parking. Until the poll is armed, a FIN or
+reset is seen by the next receive to complete, which a read arms when it
+parks. TCP does not tell a half-close from a close, so a FIN closes a
+connection whose task only sends.
 
 Cost: one `POLL_ADD` SQE per connection, its completion at a hangup or at
 the close's lead (`shutdown` before 6.13 completes it with `POLLHUP`, the
