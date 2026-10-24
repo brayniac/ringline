@@ -699,11 +699,11 @@ Under kTLS:
   kernel copy. Note it also means the send path would carry *three* shapes
   (pool-slot copy, guard-with-notification for plaintext, guard-without for
   kTLS), which is scope, not a freebie.
-- **`send_chain` has no TLS check at all** (`handler.rs`, last `tls` reference
-  at `:2917`). `ConnCtx::send_chain` builds `Send`/`SendMsgZc` SQEs straight
-  from user memory with no encryption. On a TLS connection today that is a
-  latent bug; under kTLS it would accidentally become *correct*. Worth an
-  audit either way, and worth not "fixing" by accident.
+- **`send_chain` encrypts in userspace on a TLS connection.** The builder
+  gathers the parts, and `SendChainBuilder::finish_tls` encrypts them and
+  queues the records; `finish_tls` encrypts through `encrypt_tls_send`, the
+  function `send` uses. Under kTLS the chain must send the plaintext:
+  ciphertext written to a kTLS socket is encrypted again by the kernel.
 
 **No new public config surface is proposed.** Following the unbuffered
 engine's precedent: a default-off cargo feature, decided later.

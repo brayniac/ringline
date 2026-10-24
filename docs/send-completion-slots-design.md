@@ -66,9 +66,9 @@ together with the length the send reports on success.
 | Send | Carrier |
 |---|---|
 | `send`, `send_backpressured`, copy-only batch (io_uring) | Final pool slot (`SendCopyPool`), lifted onto the coalesced slab entry when the run is coalesced |
-| TLS send (io_uring) | The final ciphertext chunk's pool slot (`OpTag::Send`) |
+| TLS send (io_uring) | The final ciphertext chunk's pool slot (`OpTag::Send`), lifted onto the coalesced slab entry when the run is coalesced |
 | Zero-copy batch (io_uring) | The `SendMsgZc` slab entry |
-| `send_chain` (io_uring) | The chain's `ChainState` |
+| `send_chain` (io_uring) | The chain's `ChainState`; on a TLS connection, the final ciphertext chunk's pool slot, lifted onto the coalesced slab entry when the run is coalesced |
 | Any awaited send (mio) | The last `PendingSend` the call queued |
 
 Sends nothing awaits (`send_nowait`, `send_chain_nowait`,
@@ -79,7 +79,8 @@ their completions settle nothing.
 
 A send settles with the length its caller passed: the plaintext length
 under TLS, and the sum of the parts for a batch. A chain settles with the
-bytes its operations' CQEs reported.
+bytes its operations' CQEs reported; on a TLS connection, with its plaintext
+length, as a TLS send does.
 
 ## Failure
 

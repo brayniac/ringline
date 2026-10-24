@@ -704,6 +704,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- io_uring: `send_chain` and `send_chain_nowait` on a TLS connection sent
+  the chain's bytes unencrypted, so the peer saw a record it could not
+  parse. The parts, guard parts included, are now gathered and encrypted
+  as one send, queued behind the connection's other sends, with one
+  completion for the chain. They are not linked SQEs, and `finish` does not
+  return `WouldBlock` for earlier sends in flight.
 - io_uring: a TLS connection closed by `ConnCtx::close()`,
   `Connection::close()` or `SendHalf::close()`, or by its handler returning,
   sends a close_notify alert before the FIN. Only `DriverCtx::close` queued
