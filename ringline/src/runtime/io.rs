@@ -621,10 +621,23 @@ impl<T: 'static> Future for BlockingJoinHandle<T> {
 /// accumulator. `forward_to_conn` sends from the accumulator (see
 /// [`ConnCtx::forward_to_conn`]).
 ///
-/// A receive is armed only while a read is parked or a receive is in flight.
-/// A FIN or reset from the peer on a connection that nothing reads is seen
-/// at the next read; until then [`ConnCtx::is_alive`] returns `true` and
-/// sends are accepted.
+/// A receive into the accumulator is armed only when a read parks.
+/// A poll for `POLLRDHUP`, armed when the connection opens, completes on a
+/// FIN, a reset or a socket error from the peer, and not on data. If no
+/// receive is in flight then, a one-byte `MSG_PEEK` receive checks the
+/// socket. When no bytes are queued in the socket and none are buffered in
+/// the accumulator, the connection closes as it would under a parked read,
+/// and [`ConnCtx::is_alive`] returns `false`. Otherwise the connection stays
+/// open, and the bytes reach the next reads in order. Once they have been
+/// read, the end of the stream closes the connection, whether or not a read
+/// parks again, and a reset is reported to the read as an error. If the poll,
+/// or the peek it triggers, cannot be submitted (counted in
+/// `ring::RECV_ARM_FAILURES`), the end is seen by the next receive, which a
+/// read arms when it parks.
+///
+/// TCP does not tell a half-close from a close: a FIN closes the connection
+/// even when the task only sends, and sends made once the Close is submitted
+/// (after queued sends drain) fail with `NotConnected`.
 ///
 /// A TLS connection receives ciphertext through the worker's provided-buffer
 /// ring. On mio every connection reads into its accumulator.
@@ -2982,10 +2995,12 @@ impl ConnCtx {
     /// close on the very next turn, without waiting for the Close CQE to bump
     /// the generation.
     ///
-    /// On io_uring a plaintext outbound connection (see [`connect`]) has a
-    /// receive armed only while a read is parked. A FIN or reset from the peer
-    /// on such a connection while nothing reads it is not seen until the next
-    /// read, so this returns `true` until then.
+    /// A FIN or reset from the peer closes the connection whether or not a
+    /// read is parked, so this returns `false` once the runtime has seen it.
+    /// On io_uring the runtime detects it on a plaintext connection from
+    /// [`connect`] or [`connect_unix`] with a `POLLRDHUP` poll. When bytes the
+    /// peer sent before it are queued or buffered, the connection stays open,
+    /// and this returns `true`, until they have been read (see [`connect`]).
     pub fn is_alive(&self) -> bool {
         // `try_with_state`, not `with_state`: this is reachable from a `Drop`
         // that runs outside a task poll. A connection-bound task is dropped by

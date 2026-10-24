@@ -383,6 +383,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // ENOBUFS-parked receivers before we block.
             self.flush_direct_echoes();
             self.flush_replenish_and_rearm();
+            // A task polled in the second pass may have consumed the bytes
+            // ahead of a hangup; peek before blocking rather than at the next
+            // completion.
+            self.recheck_hangups();
             // Declining to block still has to reap: under DEFER_TASKRUN the
             // kernel runs task_work only on a GETEVENTS enter, and
             // `submit_and_wait(0)` carries no such flag. Going through
@@ -500,6 +504,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // submits this pass's SQEs, so an open whose future was dropped
             // during the pass is marked abandoned before it can complete.
             crate::fs::release_orphans(&mut self.driver, &mut self.executor);
+            self.recheck_hangups();
             diag_tasks_1st += tasks_before as u64;
             if tasks_before == 0 {
                 diag_dead_iters += 1;
@@ -1439,10 +1444,21 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         if result > 0 {
             metrics::BYTES.add(metrics::bytes::RECEIVED, received as u64);
             metrics::RECV_DIRECT.add(metrics::recv_direct::BYTES, received as u64);
+            if let Some(cs) = self.driver.connections.get_mut(conn_index)
+                && cs.hangup_recheck
+            {
+                cs.hangup_recheck_due = true;
+            }
             self.withdraw_park_offer(conn_index);
             self.executor.wake_recv(conn_index);
             return;
         }
+        // A hangup peek took the socket's pending error: this end of the
+        // stream is that error, not a FIN.
+        let result = match self.driver.connections.get(conn_index) {
+            Some(cs) if result == 0 && cs.hangup_error != 0 => -cs.hangup_error,
+            _ => result,
+        };
         if result == 0 {
             // Peer FIN. `truncated` is the TLS case, which a direct
             // connection is not.
@@ -1468,6 +1484,164 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             io::Error::from_raw_os_error(-result),
         );
         self.driver.close_connection(conn_index);
+    }
+
+    /// Completion of a direct connection's hangup poll
+    /// (`OpTag::HangupPoll`): the peer sent a FIN or a reset, or the socket
+    /// has an error. With a receive in flight, that receive sees it, and the
+    /// connection goes on `hangup_rechecks` in case the receive returns bytes
+    /// queued ahead of the end. With none, the hangup peek finds out whether
+    /// bytes are queued ahead of it.
+    /// `-ECANCELED` comes from the close's cancel lead or worker shutdown and
+    /// changes nothing.
+    fn handle_hangup_poll(&mut self, ud: UserData, result: i32) {
+        let conn_index = ud.conn_index();
+        let Some(cs) = self.driver.connections.get_mut(conn_index) else {
+            return;
+        };
+        if cs.generation != ud.payload() {
+            return;
+        }
+        cs.hangup_poll_armed = false;
+        if result < 0 || !matches!(cs.lifecycle, Lifecycle::Open) || cs.recv_finished() {
+            return;
+        }
+        if cs.hangup_peek_armed {
+            return;
+        }
+        if cs.recv_direct_armed {
+            // The receive returns the queued bytes or the end. If it returns
+            // bytes, the recheck peeks once they are read and nothing is
+            // armed, whether or not a read parks again.
+            cs.hangup_recheck_due = true;
+            if !cs.hangup_recheck {
+                cs.hangup_recheck = true;
+                let generation = cs.generation;
+                self.driver.hangup_rechecks.push((conn_index, generation));
+            }
+            return;
+        }
+        // A peek that cannot be pushed leaves the connection as it was
+        // without the poll: a read still sees the FIN.
+        self.driver.submit_hangup_peek(conn_index);
+    }
+
+    /// Completion of a hangup peek (`OpTag::HangupPeek`). A positive result
+    /// means bytes are queued ahead of the end of the stream: they stay in
+    /// the socket with it, the connection goes on `hangup_rechecks`, and a
+    /// reader's receives deliver the bytes and then the end. Otherwise (0,
+    /// the FIN alone, or an error) the stream has ended with nothing left in
+    /// the socket. If no receive is in flight and nothing is buffered, the
+    /// connection closes as it would under a parked read. Otherwise it stays
+    /// open and goes on `hangup_rechecks`: buffered bytes stay readable, and
+    /// once they are read the recheck peeks again. A peek error is kept in
+    /// `hangup_error`, because the peek cleared the socket's pending error
+    /// and whatever later finds the end has to report it.
+    fn handle_hangup_peek(&mut self, ud: UserData, result: i32) {
+        let conn_index = ud.conn_index();
+        let Some(cs) = self.driver.connections.get_mut(conn_index) else {
+            return;
+        };
+        if cs.generation != ud.payload() {
+            return;
+        }
+        cs.hangup_peek_armed = false;
+        if !matches!(cs.lifecycle, Lifecycle::Open)
+            || cs.recv_finished()
+            || matches!(-result, libc::ECANCELED | libc::EAGAIN | libc::EINTR)
+        {
+            return;
+        }
+        if result > 0 {
+            cs.hangup_recheck_due = false;
+            if !cs.hangup_recheck {
+                cs.hangup_recheck = true;
+                let generation = cs.generation;
+                self.driver.hangup_rechecks.push((conn_index, generation));
+            }
+            return;
+        }
+        if cs.recv_direct_armed || self.driver.recv_buffered(conn_index) > 0 {
+            // The end stays unseen until the buffered bytes are read; the
+            // recheck peeks again then, whether or not a read parks.
+            if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+                if result < 0 {
+                    cs.hangup_error = -result;
+                }
+                cs.hangup_recheck_due = true;
+                if !cs.hangup_recheck {
+                    cs.hangup_recheck = true;
+                    let generation = cs.generation;
+                    self.driver.hangup_rechecks.push((conn_index, generation));
+                }
+            }
+            return;
+        }
+        // An earlier peek may have taken the socket's error.
+        let result = match self.driver.connections.get(conn_index) {
+            Some(cs) if result == 0 && cs.hangup_error != 0 => -cs.hangup_error,
+            _ => result,
+        };
+        metrics::RECV_DIRECT.increment(metrics::recv_direct::HANGUP);
+        if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+            if result == 0 {
+                cs.note_eof(false);
+            } else {
+                cs.read = ReadHalf::Error;
+            }
+        }
+        if result < 0 {
+            self.executor.fail_recv(
+                conn_index,
+                ud.payload(),
+                io::Error::from_raw_os_error(-result),
+            );
+        }
+        self.executor.wake_recv(conn_index);
+        self.driver.close_connection(conn_index);
+    }
+
+    /// Peek again on the connections in `hangup_rechecks` whose receive has
+    /// delivered bytes since their last peek, whose hangup poll completed
+    /// with a receive in flight, or whose peek found the end with bytes
+    /// buffered or a receive in flight, once nothing is buffered,
+    /// armed or parking, so the end of the stream behind those bytes
+    /// closes the connection even if no read parks after they are consumed.
+    /// Drops connections that closed, were recycled or finished reading.
+    fn recheck_hangups(&mut self) {
+        if self.driver.hangup_rechecks.is_empty() {
+            return;
+        }
+        let mut list = std::mem::take(&mut self.driver.hangup_rechecks);
+        list.retain(|&(conn_index, generation)| {
+            let Some(cs) = self.driver.connections.get(conn_index) else {
+                return false;
+            };
+            if cs.generation != generation {
+                return false;
+            }
+            if !matches!(cs.lifecycle, Lifecycle::Open) || cs.recv_finished() {
+                if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+                    cs.hangup_recheck = false;
+                    cs.hangup_recheck_due = false;
+                }
+                return false;
+            }
+            if cs.hangup_recheck_due
+                && !cs.recv_direct_armed
+                && !cs.hangup_peek_armed
+                && self.driver.recv_buffered(conn_index) == 0
+                && !self.driver.park_pending(conn_index)
+                && self.driver.submit_hangup_peek(conn_index)
+                && let Some(cs) = self.driver.connections.get_mut(conn_index)
+            {
+                cs.hangup_recheck_due = false;
+            }
+            true
+        });
+        // Entries added while this ran went onto the list swapped in.
+        list.append(&mut self.driver.hangup_rechecks);
+        self.driver.hangup_rechecks = list;
     }
 
     fn dispatch_cqe(&mut self, user_data_raw: u64, result: i32, flags: u32) {
@@ -1503,6 +1677,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             OpTag::RecvMulti => self.handle_recv_multi(ud, result, flags),
             OpTag::RecvFallback => self.handle_recv_fallback(ud, result),
             OpTag::RecvDirect => self.handle_recv_direct(ud, result),
+            OpTag::HangupPoll => self.handle_hangup_poll(ud, result),
+            OpTag::HangupPeek => self.handle_hangup_peek(ud, result),
             OpTag::Send => self.handle_send(ud, result),
             OpTag::SendMsgZc => self.handle_send_msg_zc(ud, result, flags),
             OpTag::Close => self.handle_close(ud),
@@ -4442,13 +4618,16 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             cs.established = true;
             cs.mark_connected();
         }
-        // A direct connection's receive is armed by its first parked read.
-        if !self
+        // A direct connection's receive is armed by its first parked read,
+        // and its hangup poll now.
+        if self
             .driver
             .connections
             .get(conn_index)
             .is_some_and(|c| c.recv_direct)
         {
+            self.driver.arm_hangup_poll(conn_index);
+        } else {
             self.arm_recv(conn_index);
         }
 
@@ -6029,6 +6208,31 @@ mod tests {
             cs.listener = Some(crate::ListenerId::from_index(0));
         }
         conn_index
+    }
+
+    /// A hangup poll that completes while a direct receive is in flight puts
+    /// the connection on the recheck list, so if that receive returns bytes
+    /// the end behind them is found after they are read, without a read
+    /// parking again.
+    #[test]
+    fn a_hangup_with_a_receive_in_flight_is_rechecked() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        if let Some(cs) = el.driver.connections.get_mut(conn_index) {
+            cs.recv_direct = true;
+            cs.recv_arm = RecvArm::Idle;
+            cs.recv_direct_armed = true;
+        }
+        let ud = UserData::encode(OpTag::HangupPoll, conn_index, generation);
+        el.test_dispatch_cqe(ud.raw(), libc::POLLRDHUP as i32, 0);
+        let c = el.driver.connections.get(conn_index).unwrap();
+        assert!(
+            !c.hangup_peek_armed,
+            "the receive in flight reports the end"
+        );
+        assert!(c.hangup_recheck && c.hangup_recheck_due);
+        assert_eq!(el.driver.hangup_rechecks, vec![(conn_index, generation)]);
     }
 
     /// Register an awaited send on `conn_index` and attach it to pool slot

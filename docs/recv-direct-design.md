@@ -275,11 +275,60 @@ stayed (`recv-buffering-approaches.md`).
 A direct connection has at most one receive in flight, and it is armed only
 when a read parks: `with_data`, `with_bytes` or `recv_ready` returns
 `Pending` after the parser has seen every buffered byte and returned
-`NeedMore` or `NeedAtLeast` (`park_recv` in `runtime/io.rs`). Nothing is
-armed at connect or at a completion. While the task works on what it has,
+`NeedMore` or `NeedAtLeast` (`park_recv` in `runtime/io.rs`). No receive
+into the accumulator is armed at connect or at a completion; the hangup poll
+and peek below take no bytes. While the task works on what it has,
 no receive is in flight, unless a read that parked was dropped before its
 receive completed; data that arrives in that time waits in the socket's
-receive queue, and a FIN is seen at the next read.
+receive queue.
+
+A FIN or reset is seen without a read. When the connection opens, the
+runtime arms a one-shot `POLL_ADD` for `POLLRDHUP` on its fixed file
+(`OpTag::HangupPoll`, `arm_hangup_poll`). `POLLERR` and `POLLHUP` are always
+reported, so it completes on a FIN, a reset or a socket error, and data
+alone does not complete it. With a receive in flight, that receive returns
+the queued bytes or the end, and the connection goes on
+`Driver::hangup_rechecks`, so an end behind those bytes closes the
+connection once they are read, whether or not a read parks again. With none,
+the runtime submits a non-blocking one-byte `recv` with `MSG_PEEK`
+(`OpTag::HangupPeek`), which consumes no bytes.
+
+- A positive result means bytes are queued ahead of the end. They stay in
+  the socket, and the connection goes on `Driver::hangup_rechecks`: after a
+  receive has delivered bytes, and once nothing is buffered and nothing is
+  armed, `recheck_hangups` peeks again, so the end closes the connection
+  even if no read parks after the bytes are consumed.
+- A result of 0 or an error means the stream has ended with nothing queued.
+  If no receive is in flight and nothing is buffered in the accumulator, the
+  connection closes as under a parked read. Otherwise it stays open and goes
+  on `hangup_rechecks`, so the end closes it once the buffered bytes are
+  read, whether or not a read parks. A peek that returns an error has
+  cleared the socket's pending error, so the error is kept in
+  `ConnectionState::hangup_error`, and the receive or recheck peek that
+  later finds the end reports it.
+
+No receive is armed on the hangup path, so the accumulator does not take
+more than a parked read would. A poll or peek that cannot be pushed is
+counted (`ring::RECV_ARM_FAILURES`). Without the poll, or when the peek the
+poll triggers cannot be pushed, a FIN or reset is seen by the next receive
+to complete, which a read arms when it parks; a recheck peek that cannot be
+pushed is retried the next time `recheck_hangups` runs. TCP does not tell a
+half-close from a close, so a FIN closes a connection whose task only
+sends.
+
+Cost: one `POLL_ADD` SQE per connection, its completion at a hangup or at
+the close's lead (`shutdown` before 6.13 completes it with `POLLHUP`, the
+cancel from 6.13 with `-ECANCELED`), and one peek SQE and completion per
+hangup with no receive in flight, plus one per recheck. While armed, the
+poll is on the socket's wait queue, so every wakeup of the socket also runs
+its wake callback, which rejects the event unless it is a hangup. That cost
+is not measured.
+
+Before 6.13 the kernel frees removed fixed files in order. A request held
+for a connection's life, such as this poll or the ring path's receive,
+keeps every socket closed after it on the same ring from being freed until
+the request completes. The `shutdown` lead still sends the FIN (Domain
+Invariant 8 in CLAUDE.md).
 
 Arming after the parse means no receive is outstanding while `with_bytes`
 holds the accumulator frozen, so the remainder the parser left can be taken
@@ -537,7 +586,9 @@ those, receives into a buffer grown for a `NeedAtLeast` of at least
 `recv_direct_region`), `BYTES` (bytes the kernel wrote into accumulators),
 `STALE` (completions for a closed or reused slot), `POOL_REUSED` and
 `POOL_ALLOCATED` (borrowed buffers that came from the pool, and ones
-allocated because none fit). Copies on a direct connection still count in
+allocated because none fit), `HANGUP` (connections closed because a hangup
+peek found the stream ended with no receive in flight and nothing
+buffered). Copies on a direct connection still count in
 `ringline/recv_ring` `BYTES_COPIED`.
 
 ## Tests
@@ -567,10 +618,23 @@ allocated because none fit). Copies on a direct connection still count in
     receives the bytes in order (fails when the forward ignores its
     length). `echo.rs`'s `forward_to_conn_proxies_both_directions` forwards
     a proxy's outbound leg the same way.
+  - Hangup: a connection that is not read sees its peer's FIN
+    (`a_connection_that_is_not_read_sees_the_peer_close`); a forward
+    delivers every byte when the source's peer closed behind them; bytes
+    buffered ahead of a FIN or a reset stay readable, and the reset is
+    reported as a reset; the end behind queued or buffered bytes closes a
+    connection that reads them once and does not park again; the recheck
+    runs before a worker with no tick blocks; a reset behind buffered bytes
+    read once is reported as a reset.
 
   Dropping one received byte fails the first three tests. The overestimate
-  and reset tests fail against the `MSG_WAITALL` version; the refusal test
-  as changed for decision 11 has not been run against it.
+  test and the mid-message reset test
+  (`a_reset_in_the_middle_of_a_message_is_an_error`) fail against the
+  `MSG_WAITALL` version; the refusal test as changed for decision 11 has not
+  been run against it.
+- `event_loop.rs` unit test `a_hangup_with_a_receive_in_flight_is_rechecked`:
+  a hangup poll that completes with a receive in flight puts the connection
+  on `hangup_rechecks`.
 - `tests/recv_direct_alloc.rs` (its own binary, for the counting global
   allocator): request-response batches of small, 64 KiB, 1 MiB and
   16 × 4 KiB and 16 × 8 KiB messages make fewer than one allocation of
@@ -677,18 +741,17 @@ closed or merged without a release.
 
 ## Not known
 
+- The cost of the hangup poll's wait-queue entry on busy connections (every
+  socket wakeup runs its callback), and how much memory the delayed release
+  of closed sockets holds before 6.13 on a ring with long-lived idle
+  connections (Mechanism, the hangup poll).
+
 - Why `c`'s p99 is higher than A's in four cells (Evidence, C8 latency).
 - Why `c`'s throughput gain at 4 KiB depth 16 with the client limited
   (about 10%, one run) is larger than its fixed-rate CPU saving, and whether
   more runs agree.
 - Why `c` costs 2 to 4% more CPU per GET at 64 B depth 1 (Evidence,
   "Scale").
-- An idle direct connection has no receive armed, so a FIN or reset from
-  its peer is not seen until the next read; `is_alive` stays `true` and a
-  pool returns the connection for reuse. On the ring path a receive was
-  always armed and the close was seen at once. Arming a receive whenever
-  nothing is buffered would restore that; it has not been built or
-  measured.
 - A `ForwardToFuture` dropped by `handle_close` (which tears down another
   connection's task without `CURRENT_DRIVER` set) cannot clear
   `direct_forwarding`, so later forwards from its source are refused with

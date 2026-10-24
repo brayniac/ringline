@@ -310,9 +310,9 @@ impl Pool {
     /// held at once.
     ///
     /// A connection the server closed while it sat idle in the pool is handed
-    /// out like any other: on io_uring a plaintext connection sees the close
-    /// only at its next read (see `ringline::ConnCtx::is_alive`), so a command
-    /// sent on it fails when it reads the close.
+    /// out like any other, and a command sent on it fails. When the client is
+    /// returned, `ringline::ConnCtx::is_alive` is `false`, so the slot
+    /// reconnects at a later checkout.
     pub async fn client(&self) -> Result<PooledClient, Error> {
         let (idx, client) = self.checkout().await?;
         Ok(PooledClient {

@@ -242,6 +242,7 @@ impl Ring {
                 fd: sqe::Fd::Fixed(conn_index),
                 buf: ptr,
                 len,
+                flags: 0,
             },
             user_data.raw(),
         );
@@ -267,6 +268,51 @@ impl Ring {
                 fd: sqe::Fd::Fixed(conn_index),
                 buf: ptr,
                 len,
+                flags: 0,
+            },
+            user_data.raw(),
+        );
+        unsafe {
+            self.push_sqe(&entry)?;
+        }
+        Ok(())
+    }
+
+    /// Submit a direct connection's hangup poll: a one-shot `POLL_ADD` for
+    /// `POLLRDHUP` on its fixed file. `POLLERR` and `POLLHUP` are always
+    /// reported, so it completes on a peer FIN, a reset or a socket error.
+    pub fn submit_hangup_poll(&mut self, conn_index: u32, generation: u32) -> io::Result<()> {
+        let user_data = UserData::encode(OpTag::HangupPoll, conn_index, generation);
+        let entry = Sqe::new(
+            Op::PollAdd {
+                fd: sqe::Fd::Fixed(conn_index),
+                mask: libc::POLLRDHUP as u32,
+            },
+            user_data.raw(),
+        );
+        unsafe {
+            self.push_sqe(&entry)?;
+        }
+        Ok(())
+    }
+
+    /// Submit a direct connection's hangup peek: a non-blocking one-byte
+    /// `recv` with `MSG_PEEK` into `buf`, which says whether bytes are queued
+    /// ahead of the FIN (a positive result) or not (0 or an error), and
+    /// consumes nothing.
+    pub fn submit_hangup_peek(
+        &mut self,
+        conn_index: u32,
+        generation: u32,
+        buf: *mut u8,
+    ) -> io::Result<()> {
+        let user_data = UserData::encode(OpTag::HangupPeek, conn_index, generation);
+        let entry = Sqe::new(
+            Op::Recv {
+                fd: sqe::Fd::Fixed(conn_index),
+                buf,
+                len: 1,
+                flags: libc::MSG_PEEK | libc::MSG_DONTWAIT,
             },
             user_data.raw(),
         );

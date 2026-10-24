@@ -165,6 +165,30 @@ pub struct ConnectionState {
     /// one is refused with `EBUSY`.
     #[cfg(has_io_uring)]
     pub direct_forwarding: bool,
+    /// The hangup poll (`OpTag::HangupPoll`) is in flight.
+    #[cfg(has_io_uring)]
+    pub hangup_poll_armed: bool,
+    /// The hangup peek (`OpTag::HangupPeek`) is in flight.
+    #[cfg(has_io_uring)]
+    pub hangup_peek_armed: bool,
+    /// A hangup peek found bytes queued ahead of the end of the stream, or
+    /// found the end with bytes buffered or a receive in flight, or the
+    /// hangup poll completed with a receive in flight, so the connection is
+    /// on `Driver::hangup_rechecks` until the end is seen.
+    #[cfg(has_io_uring)]
+    pub hangup_recheck: bool,
+    /// A direct receive delivered bytes since the last recheck peek, a peek
+    /// found the end with bytes buffered or a receive in flight, or the
+    /// hangup poll completed with a receive in flight, so the next time
+    /// nothing is buffered, armed or parking, another peek is due.
+    #[cfg(has_io_uring)]
+    pub hangup_recheck_due: bool,
+    /// The errno a hangup peek returned while the connection stayed open (bytes
+    /// buffered or a receive in flight), or 0. The peek clears the socket's
+    /// pending error, so the receive or recheck peek that later finds the end
+    /// reports this one.
+    #[cfg(has_io_uring)]
+    pub hangup_error: i32,
 }
 
 impl Default for ConnectionState {
@@ -201,6 +225,16 @@ impl ConnectionState {
             recv_direct_held: 0,
             #[cfg(has_io_uring)]
             direct_forwarding: false,
+            #[cfg(has_io_uring)]
+            hangup_poll_armed: false,
+            #[cfg(has_io_uring)]
+            hangup_peek_armed: false,
+            #[cfg(has_io_uring)]
+            hangup_recheck: false,
+            #[cfg(has_io_uring)]
+            hangup_recheck_due: false,
+            #[cfg(has_io_uring)]
+            hangup_error: 0,
         }
     }
 
@@ -273,6 +307,11 @@ impl ConnectionState {
             self.recv_direct_armed = false;
             self.recv_direct_held = 0;
             self.direct_forwarding = false;
+            self.hangup_poll_armed = false;
+            self.hangup_peek_armed = false;
+            self.hangup_recheck = false;
+            self.hangup_recheck_due = false;
+            self.hangup_error = 0;
         }
         self.generation = self.generation.wrapping_add(1);
     }

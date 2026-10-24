@@ -247,11 +247,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `None` while a receive is in flight. These work on accepted and TLS
   connections as before, and there is no replacement for them on a
   plaintext outbound connection. Such a connection has a receive armed only
-  while a read is parked, so a FIN or reset from its peer is seen at the next
-  read: until then `is_alive` returns `true` and sends are accepted, and the
-  ringline-redis and ringline-memcache pools return a connection whose
-  server closed it while idle, and a command sent on it fails when it reads
-  the close.
+  when a read parks, and a `POLLRDHUP` poll armed when it opens. A FIN
+  or reset from the peer closes a connection that nothing reads, and
+  `is_alive` returns `false`. If bytes the peer sent before it are queued or
+  buffered, the connection stays open until they have been read, and a
+  reset is then reported to the read as an error. A FIN closes the
+  connection even when the task only sends.
 - ringline-http's HTTP/2 connection reads with `with_data` on every backend,
   which a plaintext connection (`H2AsyncConn::from_conn` over `connect`)
   needs. Over TLS it copies as many bytes as before and allocates less.
