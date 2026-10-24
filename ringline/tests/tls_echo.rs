@@ -1101,8 +1101,9 @@ fn a_slow_reader_gets_the_whole_reply_before_close_notify() {
         stream.flush().unwrap();
     }
 
-    // Read 64 KiB at a time with a 5 ms pause: the drain takes well over the
-    // 300 ms deadline, but no gap between completions comes near it.
+    // Sleep 5 ms after each `read_tls` (rustls reads at most a few KiB per
+    // call): the drain takes about 3.5 s, well over the 300 ms
+    // `close_notify_timeout_ms`.
     let started = Instant::now();
     let mut received = 0usize;
     let mut buf = vec![0u8; 64 * 1024];
