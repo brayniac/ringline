@@ -184,8 +184,8 @@ pub struct ConnectionState {
     /// buffered, armed or parking, another peek is due.
     #[cfg(has_io_uring)]
     pub hangup_recheck_due: bool,
-    /// The hangup poll could not be submitted, so the connection is on
-    /// `Driver::hangup_poll_retries` until it is.
+    /// Set when the hangup poll could not be submitted and cleared when it is;
+    /// while set, the connection has an entry on `Driver::hangup_poll_retries`.
     #[cfg(has_io_uring)]
     pub hangup_poll_retry: bool,
     /// The errno a hangup peek returned while the connection stayed open (bytes

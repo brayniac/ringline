@@ -265,9 +265,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   that nothing reads, and `is_alive` returns `false`. If bytes the peer sent
   before it are queued or buffered, the connection stays open until they
   have been read, and a reset is then reported to the read as an error. A
-  poll, or the peek it triggers, that cannot be submitted is submitted again
-  by the worker after its next poll pass. A FIN closes the connection even
-  when the task only sends. `cancel` finishes the read half and cancels the
+  poll that cannot be submitted is submitted again before the worker next
+  waits for completions, unless the connection is being parked; a peek, once
+  nothing is buffered or in flight. A FIN closes the connection even when
+  the task only sends. `cancel` finishes the read half and cancels the
   receive in flight. A park (`offer_for_park`) cancels the connection's
   receive and poll before it moves the socket; the adopting worker arms the
   poll, and the reader's next parked read arms a receive.

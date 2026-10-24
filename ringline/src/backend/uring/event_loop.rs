@@ -6623,6 +6623,33 @@ mod tests {
         assert!(el.driver.hangup_rechecks.is_empty());
     }
 
+    /// A poll retry whose push keeps failing keeps one entry on the retry
+    /// list, and the entry is dropped once the poll is armed.
+    #[test]
+    fn a_failed_poll_retry_keeps_one_entry() {
+        let mut el = make_test_loop();
+        let conn_index = accept_direct_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        el.driver.ring.force_push_failures(4);
+        el.driver.arm_hangup_poll(conn_index);
+        el.recheck_hangups();
+        el.recheck_hangups();
+        el.recheck_hangups();
+        assert_eq!(
+            el.driver.hangup_poll_retries,
+            vec![(conn_index, generation)]
+        );
+        el.recheck_hangups();
+        assert!(
+            el.driver
+                .connections
+                .get(conn_index)
+                .unwrap()
+                .hangup_poll_armed
+        );
+        assert!(el.driver.hangup_poll_retries.is_empty());
+    }
+
     /// A hangup poll retry waits while a park of the connection is pending:
     /// the install requires nothing to be armed.
     #[test]
