@@ -271,13 +271,15 @@ stayed (`recv-buffering-approaches.md`).
 
 ### Accepted connections (RESP server, 1,000 and 8,000 connections)
 
-These runs used a prototype of this change (060260f, on d960afe) that had
-neither the hangup poll nor the single-`sendmsg` multi-slot send (#697). The
-poll's cost is not measured. #697 changes only the GET 4 KiB depth-16 cells
-at 16 KiB send slots, where a flush spans 5 slots, and changes both ringline
-arms alike.
+These runs used a prototype of this change (brayniac/ringline d960afe;
+specs at 060260f, branch `exp/recv-direct-inbound`) that had neither the
+hangup poll nor the single-`sendmsg` multi-slot send (#697). The poll's cost
+is not measured. #697 changes only the GET 4 KiB depth-16 cells at 16 KiB
+send slots, where a flush spans up to 5 slots. Both ringline arms send
+through the same path, so #697 is expected to affect them alike; this is not
+measured.
 
-A RESP server (`ringline-bench` `resp-server` at 060260f, bins
+A RESP server (`ringline-bench` `resp-server` at d960afe, bins
 `01a164ab-e6aa-73c2-fd0b-2feb02733191`) ran with 8 workers on one VM and cachecannon with 16 threads on another, no
 rate limit, at 1,000 and 8,000 connections. Arms: `ring` (one-shot receives
 from the provided-buffer ring), `direct` (accepted connections receive

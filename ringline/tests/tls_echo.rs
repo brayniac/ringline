@@ -1583,7 +1583,8 @@ fn tls_segments_installed_after_data_still_delivers_it() {
 static TLS_FILE_SINK_PATH: OnceLock<std::path::PathBuf> = OnceLock::new();
 
 /// Reads a 4-byte length, forwards that many plaintext bytes to a file with
-/// `forward_to`, and replies with the count forwarded.
+/// `forward_to`, and replies with the count forwarded. A one-byte ack, sent
+/// as the forward is armed, tells the client to send the body.
 #[cfg(has_io_uring)]
 struct TlsFileForwarder;
 
@@ -1615,6 +1616,10 @@ impl AsyncEventHandler for TlsFileForwarder {
                 .open(path)
                 .expect("open sink file");
             let sink = ringline::SinkFd::file(file.as_fd()).expect("file sink");
+            // The ack is submitted after this poll returns, by which time
+            // `forward_to` below has armed the forward, so the client's body
+            // arrives while the forward is running.
+            let _ = conn.send_nowait(b"a");
             let forwarded = match conn.forward_to(&sink, len).await {
                 Ok(n) => n,
                 Err(e) => {
@@ -1674,10 +1679,18 @@ fn forward_to_a_file_from_a_tls_source() {
 
     let size = 300_000;
     let payload: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
-    // The header alone first, so the forward starts before the body arrives.
+    // The header alone first; the body goes once the server has armed the
+    // forward, which its ack shows.
     stream.write_all(&(size as u32).to_be_bytes()).unwrap();
     stream.flush().unwrap();
-    std::thread::sleep(Duration::from_millis(50));
+    let mut ack = [0u8; 1];
+    read_until_full_or_stalled(
+        &mut stream,
+        &mut ack,
+        Duration::from_secs(30),
+        "TLS-source file forward ack",
+    );
+    assert_eq!(&ack, b"a");
     for chunk in payload.chunks(16 * 1024) {
         stream.write_all(chunk).unwrap();
         stream.flush().unwrap();

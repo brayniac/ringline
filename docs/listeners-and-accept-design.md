@@ -293,17 +293,19 @@ handler holds both for the connection's whole life, so gating on them would
 refuse essentially every park. They are owned by the future, which park drops
 as part of the move.
 
-Sequence: quiesce on the predicate above → cancel the direct receive, if a
-read is parked, and the hangup poll, and wait until neither is armed →
-unregister the fd from A → package `(OwnedFd, leftover accumulator bytes,
-TLS state, ListenerId, PeerAddr, handler payload)`, all `Send` → send over
-the tier-1 channel → B allocates a slot, registers the fd, seeds the accumulator, arms
-the hangup poll, and calls `on_adopt`; the new task's first parked read arms
-a receive.
+Sequence: quiesce on the predicate above (a hangup peek in flight also
+defers the start) → cancel the direct receive, if a read is parked, and the
+hangup poll → wait until no receive, hangup poll or hangup peek is armed and
+the handler offers again → install the fd and unregister it from A →
+package `(OwnedFd, leftover accumulator bytes, ListenerId, PeerAddr, handler
+payload)`, all `Send` → send over the tier-1 channel → B allocates a slot,
+registers the fd, seeds the accumulator, arms the hangup poll, and calls
+`on_adopt`; the new task's first parked read arms a receive.
 
-"TLS state" is the whole `UnbufferedConn` (or its buffered counterpart) moved as
-one value, not a reconstructed session — see open question 4. Both engines take
-the same path.
+A TLS connection is not parked (`ParkBlocker::TlsSession`). Carrying its
+session would move the whole `UnbufferedConn` (or its buffered counterpart)
+as one value rather than reconstructing it (open question 4); that transfer
+is not implemented.
 
 **Park is opt-in** (owner decision, 2026-09-23). The future is dropped and
 recreated, so a handler that kept anything — negotiated protocol,

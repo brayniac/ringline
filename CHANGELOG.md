@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `metrics::park_abandon::RECEIVE_ARMED` (14, `op=receive_armed` on
+  `ringline/park_abandoned`): a park whose install found a receive, hangup
+  poll or hangup peek armed.
 - `yield_now()` wakes the calling task and returns `Pending` once, so a task
   that makes many `send_nowait` calls without awaiting anything lets the
   worker poll its other queued tasks and process I/O between batches. Callers
@@ -50,8 +53,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     resident memory was 0.3 to 0.6 GiB higher.
   - These runs were taken on builds without the `POLLRDHUP` poll each
     plaintext connection now arms; its cost is not measured. The server
-    runs also predate the single-`sendmsg` multi-slot send, which changes
-    both ringline arms alike.
+    runs also predate the single-`sendmsg` multi-slot send. Both ringline
+    arms send through the same path, so it is expected to affect them alike;
+    this is not measured.
   - See `docs/recv-direct-design.md`.
 - `direct_io_fsync` returns a future for an fsync of a direct I/O file. The
   fsync that `DriverCtx::direct_io_fsync` submits has no future, so a task
@@ -245,6 +249,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Breaking:** `metrics::park_abandon::SLOT_RECYCLED` is 12 and
+  `INSTALL_FAILED` 13, after the removal of `DIRECT_ECHO`.
 - **Breaking:** on io_uring, every plaintext connection, accepted or from
   `connect` or `connect_unix`, receives directly into its accumulator (see
   Added), and no option gives it the provided-buffer ring. On such a
@@ -609,9 +615,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   there no longer compiles. Echo or forward with `with_data` and `send_nowait` or
   `forward_recv_buf`, or with `forward_to_conn`.
 - **Breaking:** `metrics::park_abandon::DIRECT_ECHO` and the `direct_echo`
-  op of `ringline/park_abandoned`. `park_abandon::SLOT_RECYCLED` is now 12
-  and `INSTALL_FAILED` 13; the new `RECEIVE_ARMED` is 14 (`op=receive_armed`,
-  a park whose install found a receive, hangup poll or hangup peek armed).
+  op of `ringline/park_abandoned`.
 - **Breaking:** the client methods that read a value from provided-buffer
   segments, which a plaintext connection no longer has:
   ringline-redis `Client::get_stream` and `Pool::get_stream` (and

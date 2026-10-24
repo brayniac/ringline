@@ -178,7 +178,8 @@ pub struct Config {
     /// its TCP receive window closes and only its peer stops sending; the recv
     /// is re-armed once the hold drains below the cap. The lent receive
     /// buffers a connection's unfinished `forward_recv_buf` sends carry are
-    /// held to the same quarter-ring cap (#638).
+    /// held to the same quarter-ring cap (#638); on io_uring no TCP
+    /// connection a task can read from lends one.
     ///
     /// Larger values allow more recv in flight (higher single-forward throughput)
     /// at the cost of more pinned ring buffers / held heap under a slow sink;
@@ -1206,8 +1207,9 @@ impl ConfigBuilder {
     /// most a quarter of the recv ring's buffers, since each entry can pin
     /// one. The lent receive buffers a connection's unfinished
     /// `forward_recv_buf` sends carry are held to the same quarter-ring cap
-    /// (#638); on io_uring no TCP connection lends one, since plaintext
-    /// connections receive into their accumulators and TLS ones copy.
+    /// (#638); on io_uring no TCP connection a task can read from lends one,
+    /// since plaintext connections receive into their accumulators and TLS
+    /// ones copy.
     /// Larger values allow more recv in flight at the cost of more held
     /// buffers or copies under a slow consumer: with `recv_incremental` a
     /// segment hold can reach this many copies of up to one buffer each
