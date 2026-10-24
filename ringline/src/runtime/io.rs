@@ -2200,8 +2200,8 @@ impl ConnCtx {
     /// conn.forward_to_conn(&backend, len).await?;
     /// ```
     ///
-    /// From a source that receives through the provided-buffer ring (an
-    /// accepted connection, or a TLS one), the mechanics are those of
+    /// From a source that receives through the provided-buffer ring (a TLS
+    /// connection), the mechanics are those of
     /// `forward_to`: arriving provided buffers are held driver-side and written
     /// straight to the sink with no copy through user space, one serialized
     /// write at a time, each bid released on its own write completion. A
@@ -2251,8 +2251,8 @@ impl ConnCtx {
     ///
     /// # A direct source
     ///
-    /// A source that receives directly into its accumulator (a plaintext
-    /// connection from [`connect`] or [`connect_unix`]) has no held buffers.
+    /// A source that receives directly into its accumulator (on io_uring,
+    /// every plaintext connection) has no held buffers.
     /// The forward takes the bytes its accumulator holds, up to what is left
     /// of `len`, and sends them on the sink through the sink's send queue
     /// under a guard: zero-copy at or above `send_zc_threshold`, copied into a
@@ -2733,8 +2733,8 @@ impl ConnCtx {
     ///
     /// A FIN or reset from the peer closes the connection whether or not a
     /// read is parked, so this returns `false` once the runtime has seen it.
-    /// On io_uring the runtime detects it on a plaintext connection from
-    /// [`connect`] or [`connect_unix`] with a `POLLRDHUP` poll. When bytes the
+    /// On io_uring the runtime detects it on every plaintext connection with
+    /// a `POLLRDHUP` poll. When bytes the
     /// peer sent before it are queued or buffered, the connection stays open,
     /// and this returns `true`, until they have been read (see [`connect`]).
     pub fn is_alive(&self) -> bool {

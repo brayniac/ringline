@@ -73,8 +73,8 @@ completion rather than a corrupted pool.
   the absence is a documented, reasoned invariant tied to
   `force_finalize_close` being TLS-only. Adding guards "for symmetry" is
   risk with no bounded-send value.
-- **No id on `InFlightSendSlab::allocate` or `allocate_recv_forward`**
-  (removed in 0.7.0-alpha.5 with recv-forward).
+- **No id on `InFlightSendSlab::allocate` or `allocate_recv_forward`.**
+  (`allocate_recv_forward` was removed in 0.7.0-alpha.5 with recv-forward.)
   `send_backpressured` is copy-only, so the ZC and recv-forward allocators
   would carry a field nothing ever sets. Only `allocate_coalesced` needs it.
 - **TLS admission sizing stays as it is.** The permit is sized by plaintext;

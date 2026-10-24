@@ -1,8 +1,10 @@
 # Two shared receive rings per worker, consumed incrementally where supported
 
-Status: proposal. Nothing here is implemented. Since 0.7.0-alpha.5 a
-plaintext connection on io_uring receives directly into its accumulator, so
-the shared rings serve TLS and UDP only, and recv-forward, direct echo,
+Status: landing steps 0 and 2 to 4 are implemented (#632–#636, behind
+`recv_incremental`). The large group (step 5) and the new defaults (step 7)
+are not. Since 0.7.0-alpha.5 a plaintext connection on io_uring receives
+directly into its accumulator, so the TCP provided-buffer ring serves only
+TLS connections (UDP has its own ring). recv-forward, direct echo,
 `recv_hold` and the recv sink this design refers to were removed. The
 measurements behind it,
 and the alternatives that were measured and not chosen, are in
@@ -15,8 +17,8 @@ recv).
 
 ## Goal
 
-Today a TCP receive on io_uring lands in a buffer from one provided-buffer
-ring shared by the worker's connections, 256 buffers of 16 KiB
+A TLS receive on io_uring lands in a buffer from one provided-buffer ring
+shared by the worker's connections, 256 buffers of 16 KiB
 (`config.rs` `RecvBufferConfig::default`). Buffer size sets how much one
 completion can deliver; at a fixed memory budget, larger buffers mean fewer
 of them. Messages larger than a buffer pay a completion per buffer, and a
