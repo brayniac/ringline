@@ -3065,6 +3065,56 @@ impl Driver {
     /// pressure rather than failing, so every entry is committed in order
     /// and nothing needs releasing here. `sends` is drained, not consumed,
     /// so the caller can keep the `Vec`'s allocation as scratch.
+    /// Close a connection the application asked to close (`ConnCtx::close`, or
+    /// its task finishing). A TLS connection first queues its close_notify, so
+    /// the peer can tell the close from a truncation; a close after an error
+    /// goes through [`close_connection`](Self::close_connection) and sends no
+    /// alert.
+    pub(crate) fn close_connection_graceful(&mut self, conn_index: u32) {
+        if self
+            .connections
+            .get(conn_index)
+            .is_some_and(|c| !c.close_requested())
+        {
+            self.queue_tls_close_notify(conn_index);
+        }
+        self.close_connection(conn_index);
+    }
+
+    /// Queue a TLS connection's close_notify alert through its send queue, so
+    /// it goes out after any queued sends and ahead of the FIN, and arm the
+    /// close_notify deadline (`Config::close_notify_timeout_ms`), which closes
+    /// the connection if the queue does not drain. Does nothing for a
+    /// plaintext connection or a socket handed off to another worker.
+    fn queue_tls_close_notify(&mut self, conn_index: u32) {
+        if self
+            .connections
+            .get(conn_index)
+            .is_some_and(|c| c.socket_handed_off)
+        {
+            return;
+        }
+        let generation = self.connections.generation(conn_index);
+        let mut sends = Vec::new();
+        match self.tls_table.as_mut() {
+            Some(tls) if tls.has(conn_index) => tls.send_close_notify_queued(
+                conn_index,
+                generation,
+                &mut self.send_copy_pool,
+                &mut sends,
+            ),
+            _ => return,
+        }
+        if !sends.is_empty() {
+            self.queue_built_sends(conn_index, &mut sends);
+        }
+        self.send_queues[conn_index as usize].close_notify_deadline =
+            Some(std::time::Instant::now() + self.close_notify_timeout);
+        if !self.close_notify_armed.contains(&conn_index) {
+            self.close_notify_armed.push(conn_index);
+        }
+    }
+
     pub(crate) fn queue_built_sends(
         &mut self,
         conn_index: u32,
