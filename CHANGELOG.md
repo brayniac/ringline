@@ -249,6 +249,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- io_uring: a TLS connection's ring receive is armed when a read parks once
+  its handshake is done, as a plaintext connection's direct receive is, so a
+  task that does not read stops its peer instead of buffering up to
+  `recv_accumulator_max` (1 GiB by default). During the handshake, in the
+  segmented domain (a `forward_to` source or a segment reader), and after
+  the peer closes, the receive is re-armed after each completion. A loop
+  that polls `try_with_data` without ever parking a read no longer sees new
+  bytes, as on a plaintext connection. A TLS connection now arms the
+  `POLLRDHUP` hangup poll, so a peer FIN or reset is seen, and `is_alive`
+  returns `false`, while nothing reads. The poll does not fire on a
+  close_notify the peer sends without closing TCP: that alert is read when a
+  ring receive next completes; on mio it is read when it arrives.
+  `forward_to_conn` from a TLS source takes the bytes from the accumulator
+  and sends them through the sink's send queue, as from a plaintext source:
+  ordered with other sends on the sink, with one chunk buffered rather than
+  up to `forward_hold_cap` entries, and below `send_zc_threshold` copied
+  into a pool slot. A zero-copy send of such a forward to a sink that does
+  not read holds worker exit for up to its bound, as any guarded send does.
+  A `forward_to_conn` from a TLS source in the segmented domain forwards
+  from its hold and writes to the sink directly, unordered with other sends
+  on the sink. A TLS source is in that domain while a `segments` reader is
+  live, after `recv_owned_segment`, `with_segments` or `with_bytes_segments`
+  until `end_segments`, and after a `forward_to` that failed on a write. A
+  segment reader or `forward_to` started while a `forward_to_conn` sends
+  from the accumulator gets `EBUSY`, and so does `with_segments` while any
+  forward runs. `recv_multishot` has no effect: TLS connections, the only
+  ones it affected, always arm one-shot receives.
 - **Breaking:** `metrics::park_abandon::SLOT_RECYCLED` is 12 and
   `INSTALL_FAILED` 13, after the removal of `DIRECT_ECHO`.
 - **Breaking:** on io_uring, every plaintext connection, accepted or from
@@ -658,14 +685,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
-- io_uring: a TLS connection that is a `forward_to` or `forward_to_conn`
-  source, or has a segment reader, stops receiving once its hold reaches the
-  hold cap (`forward_hold_cap`; without `recv_incremental`, at most a quarter
-  of the receive ring's buffers) and receives again once the hold drains.
-  Before, it kept receiving whatever its sink or reader did, its hold grew to
+- io_uring: a TLS connection that is a `forward_to` source, or has a segment
+  reader, stops receiving once its hold reaches the hold cap
+  (`forward_hold_cap`; without `recv_incremental`, at most a quarter of the
+  receive ring's buffers) and receives again once the hold drains. Before,
+  it kept receiving whatever its sink or reader did, its hold grew to
   `recv_accumulator_max` (1 GiB by default), and the connection was then
-  closed. A plaintext connection receives only when a read or a forward
-  asks for bytes, so it was already stopped.
+  closed. A plaintext connection receives only when a read or a forward asks
+  for bytes, so it was already stopped.
 - `ringline-redis`, `ringline-memcache` and `ringline-ping` `Pool::client`
   reconnect a slot whose connection is no longer alive (`is_alive()` is
   `false`) instead of handing it out. A connection the server closed while

@@ -1147,7 +1147,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             .tls_table
             .as_ref()
             .is_some_and(|t| t.has(conn_index));
-        // Segmented delivery (`forward_to`/`forward_to_conn`, `with_segments`)
+        // Segmented delivery (`forward_to`, `with_segments`)
         // is defined over provided buffers: a segment is a held bid, and the
         // hold is where a reader looks. The fallback reads into a pool slot and
         // can only append to the accumulator, so on a segmented connection it
@@ -1417,9 +1417,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.driver.close_connection(conn_index);
     }
 
-    /// Completion of a direct connection's hangup poll
+    /// Completion of a direct or TLS connection's hangup poll
     /// (`OpTag::HangupPoll`): the peer sent a FIN or a reset, or the socket
-    /// has an error. With a receive in flight, that receive sees it, and the
+    /// has an error. On a TLS connection it sets `hangup_seen` and arms a
+    /// ring receive, which is then re-armed after each completion until the
+    /// end is read. On a direct connection: with a receive in flight, that
+    /// receive sees it, and the
     /// connection goes on `hangup_rechecks` in case the receive returns bytes
     /// queued ahead of the end. With none, the hangup peek finds out whether
     /// bytes are queued ahead of it.
@@ -1435,6 +1438,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
         cs.hangup_poll_armed = false;
         if result < 0 || !matches!(cs.lifecycle, Lifecycle::Open) || cs.recv_finished() {
+            return;
+        }
+        if !cs.recv_direct {
+            // A TLS connection reads the rest of the stream through its ring
+            // receive: re-armed after every completion from here until it reads
+            // the close_notify, returns 0 at the FIN, or fails.
+            cs.hangup_seen = true;
+            self.driver.arm_tls_recv_if_idle(conn_index);
             return;
         }
         if cs.hangup_peek_armed {
@@ -2140,6 +2151,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         if !has_more
             && !self.driver.forward_hold_throttled[conn_index as usize]
             && !self.driver.park_pending(conn_index)
+            && self.driver.rearms_after_completion(conn_index)
             && let Some(conn) = self.driver.connections.get(conn_index)
             && matches!(conn.lifecycle, Lifecycle::Open)
             && matches!(conn.recv_arm, RecvArm::Multi)
@@ -2796,9 +2808,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             .tls_table
             .as_ref()
             .is_some_and(|t| t.has_server_config_for(Some(listener)));
-        if tls_listener {
-            self.arm_recv(conn_index);
-        } else if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+        // A TLS connection's receive and hangup poll are armed below, once its
+        // TLS state exists.
+        if !tls_listener && let Some(cs) = self.driver.connections.get_mut(conn_index) {
             // A plaintext connection receives directly into its accumulator.
             // Its receive is armed by its first parked read, and its hangup
             // poll below, once it is open.
@@ -2812,7 +2824,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         {
             if tls_table.create(conn_index, Some(listener)).is_err() {
                 self.driver.close_connection(conn_index);
+                return;
             }
+            // The handshake's receives are armed after each completion; once
+            // it is done, a parked read arms them. The hangup poll covers a
+            // peer close while nothing reads.
+            self.arm_recv(conn_index);
+            self.driver.arm_hangup_poll(conn_index);
             return;
         }
 
@@ -4467,6 +4485,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 cs.mark_connected();
             }
             self.arm_recv(conn_index);
+            self.driver.arm_hangup_poll(conn_index);
             return;
         }
 

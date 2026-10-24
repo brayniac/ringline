@@ -34,8 +34,7 @@ pub enum RecvArm {
     /// the recv ended and has not been re-armed.
     Idle,
     /// Recv with the provided buffer ring (io_uring) / readable interest
-    /// (mio). On io_uring each arm is one-shot by default and multishot with
-    /// `recv_multishot(true)`.
+    /// (mio). On io_uring each arm of a TLS connection is one-shot.
     Multi,
 }
 
@@ -160,8 +159,10 @@ pub struct ConnectionState {
     /// `recv_direct_armed`.
     #[cfg(has_io_uring)]
     pub recv_direct_slot: u32,
-    /// A `forward_to_conn` from this direct connection is running. A second
-    /// one is refused with `EBUSY`.
+    /// A `forward_to_conn` that sends from this connection's accumulator (a
+    /// plaintext source, or a TLS source outside the segmented domain) is
+    /// running; another forward, a segment reader and `forward_to` get
+    /// `EBUSY`.
     #[cfg(has_io_uring)]
     pub direct_forwarding: bool,
     /// The hangup poll (`OpTag::HangupPoll`) is in flight.
@@ -188,6 +189,11 @@ pub struct ConnectionState {
     /// while set, the connection has an entry on `Driver::hangup_poll_retries`.
     #[cfg(has_io_uring)]
     pub hangup_poll_retry: bool,
+    /// A TLS connection's hangup poll completed: its peer sent a FIN or a
+    /// reset, or the socket has an error. Its receive is then re-armed after
+    /// every completion until the end is read, whether or not a read parks.
+    #[cfg(has_io_uring)]
+    pub hangup_seen: bool,
     /// The errno a hangup peek returned while the connection stayed open (bytes
     /// buffered or a receive in flight), or 0. The peek clears the socket's
     /// pending error, so the receive or recheck peek that later finds the end
@@ -240,6 +246,8 @@ impl ConnectionState {
             hangup_recheck_due: false,
             #[cfg(has_io_uring)]
             hangup_poll_retry: false,
+            #[cfg(has_io_uring)]
+            hangup_seen: false,
             #[cfg(has_io_uring)]
             hangup_error: 0,
         }
@@ -319,6 +327,7 @@ impl ConnectionState {
             self.hangup_recheck = false;
             self.hangup_recheck_due = false;
             self.hangup_poll_retry = false;
+            self.hangup_seen = false;
             self.hangup_error = 0;
         }
         self.generation = self.generation.wrapping_add(1);

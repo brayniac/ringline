@@ -99,7 +99,7 @@ io_uring backend, each worker also owns:
 |---------|---------|
 | One-shot recv into the connection's buffer | Plaintext TCP and Unix receives, armed when a read parks — no copy from a shared buffer |
 | Ring-provided buffers | Kernel-managed recv buffer pool for TLS and UDP — kernel picks buffer at completion time |
-| Multishot recv | TLS with `recv_multishot(true)`, and UDP — one SQE, many completions |
+| Multishot recv | UDP — one SQE, many completions |
 | SendMsgZc | Zero-copy scatter-gather send — kernel DMAs directly from app buffers |
 | Fixed file table | Direct descriptors — no per-syscall fd table lookup |
 | IO_LINK chains | Atomic multi-step operations (connect + timeout) |

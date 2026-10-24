@@ -225,9 +225,8 @@ fn plain_ring_without_buffers_ends_the_arm_with_enobufs() {
 
 /// A one-shot recv with buffer select (`Op::RecvSelect`) takes one buffer
 /// and ends: one completion with `IORING_CQE_F_BUFFER` and without
-/// `IORING_CQE_F_MORE`, and none after it while data stays queued. A TCP
-/// connection arms it unless `recv_multishot` is set
-/// (`Driver::submit_tcp_recv`).
+/// `IORING_CQE_F_MORE`, and none after it while data stays queued. A TLS
+/// connection arms it (`Driver::submit_tcp_recv`).
 #[test]
 fn a_one_shot_recv_takes_one_buffer() {
     for kind in [RingKind::Plain, RingKind::Incremental] {

@@ -240,9 +240,10 @@ impl Driver {
     }
 
     /// Arm `conn_index`'s hangup poll (`OpTag::HangupPoll`) once it is
-    /// open. A direct connection arms a receive only when a read parks, so
-    /// without the poll a peer FIN or reset is not seen until a receive
-    /// completes, and while no read is parked none may be in flight. If the
+    /// open, on a direct or a TLS connection. Both arm a receive only when a
+    /// read parks (a TLS connection once its handshake is done), so without
+    /// the poll a peer FIN or reset is not seen until a receive completes, and
+    /// while no read is parked none may be in flight. If the
     /// SQE cannot be pushed, the failure is counted in
     /// `ring::RECV_ARM_FAILURES` and the connection goes on
     /// `hangup_poll_retries`, so `retry_hangup_polls` submits the poll again.
@@ -250,7 +251,8 @@ impl Driver {
         let Some(cs) = self.connections.get(conn_index) else {
             return;
         };
-        if !cs.recv_direct || cs.hangup_poll_armed || cs.recv_finished() {
+        let tls = self.tls_table.as_ref().is_some_and(|t| t.has(conn_index));
+        if !(cs.recv_direct || tls) || cs.hangup_poll_armed || cs.recv_finished() {
             return;
         }
         let generation = cs.generation;
@@ -274,6 +276,59 @@ impl Driver {
         }
     }
 
+    /// Arm a TLS connection's ring receive if no receive is armed, the
+    /// connection is open and reading, it is not throttled or starved, and no
+    /// park is pending. Once its handshake is done, a TLS connection's receive
+    /// is armed this way by a parked read (`park_recv`), by a segment reader or
+    /// Mode A forward entering the segmented domain or waiting on its hold, and
+    /// by its hangup poll. After a data completion, `handle_recv_multi` re-arms
+    /// it only while `rearms_after_completion` holds; a receive stopped by the
+    /// hold-cap throttle is re-armed when the throttle lifts, even after the
+    /// segmented session has ended. A failed push goes to
+    /// `recv_rearm_retries`.
+    pub(crate) fn arm_tls_recv_if_idle(&mut self, conn_index: u32) {
+        let ci = conn_index as usize;
+        let Some(cs) = self.connections.get(conn_index) else {
+            return;
+        };
+        if !self.tls_table.as_ref().is_some_and(|t| t.has(conn_index))
+            || cs.recv_multishot_armed
+            || cs.recv_finished()
+            || !matches!(cs.lifecycle, Lifecycle::Open)
+            || !matches!(cs.recv_arm, RecvArm::Multi)
+            || self.forward_hold_throttled[ci]
+            || self.recv_fallback_inflight[ci]
+            || self.recv_starved.contains(conn_index)
+            || self.park_pending(conn_index)
+        {
+            return;
+        }
+        let generation = cs.generation;
+        if self.submit_tcp_recv(conn_index, generation).is_err() {
+            metrics::RING.increment(metrics::ring::RECV_ARM_FAILURES);
+            self.recv_rearm_retries.push((conn_index, generation));
+        } else if let Some(cs) = self.connections.get_mut(conn_index) {
+            cs.recv_multishot_armed = true;
+        }
+    }
+
+    /// Whether a ring receive that completed should be re-armed at once. A
+    /// TLS connection whose handshake is done re-arms only in the segmented
+    /// domain (a forward source or a segment reader, throttled at the hold
+    /// cap) or after its hangup poll has completed; otherwise its next
+    /// parked read arms the receive, so a task that does not read stops its
+    /// peer. Every other ring connection re-arms.
+    pub(crate) fn rearms_after_completion(&self, conn_index: u32) -> bool {
+        let tls = self.tls_table.as_ref().is_some_and(|t| t.has(conn_index));
+        if !tls {
+            return true;
+        }
+        self.connections
+            .get(conn_index)
+            .is_some_and(|c| !c.established || c.hangup_seen)
+            || self.recv_domain[conn_index as usize] == crate::recv::domain::RecvDomain::Segmented
+    }
+
     /// Submit a hangup peek on `conn_index` (`OpTag::HangupPeek`) and record
     /// it as in flight. Returns whether it was pushed; a failure is counted
     /// in `ring::RECV_ARM_FAILURES`.
@@ -294,8 +349,9 @@ impl Driver {
         true
     }
 
-    /// Arm a TCP recv on `conn_index`: one-shot unless
-    /// `Config::recv_multishot` is set, multishot otherwise. Both carry the `RecvMulti` user_data.
+    /// Arm a TCP ring recv on `conn_index`, carrying the `RecvMulti`
+    /// user_data. A TLS connection's is one-shot; the multishot branch is
+    /// reached only by plaintext ring connections that unit tests construct.
     pub(crate) fn submit_tcp_recv(&mut self, conn_index: u32, generation: u32) -> io::Result<()> {
         // A direct connection never takes a provided buffer; its receive is
         // armed by the parked receive future (`arm_direct_recv_or_close`).
@@ -306,7 +362,11 @@ impl Driver {
         {
             return Ok(());
         }
-        if !self.recv_multishot {
+        // A TLS connection's receive is one-shot: it is armed when a read
+        // parks, and a multishot would keep receiving whether or not the
+        // task reads.
+        let tls = self.tls_table.as_ref().is_some_and(|t| t.has(conn_index));
+        if !self.recv_multishot || tls {
             self.ring.submit_single_recv(conn_index, generation)
         } else {
             self.ring.submit_multishot_recv(conn_index, generation)
@@ -784,7 +844,8 @@ pub(crate) struct Driver {
     /// Per-connection cap on held receive entries (`Config::forward_hold_cap`);
     /// `throttle_if_held` applies it, lowered to a quarter of the ring.
     pub(crate) forward_hold_cap: usize,
-    /// `Config::recv_multishot`: TCP connections arm multishot receives.
+    /// `Config::recv_multishot`. No TCP connection arms a multishot receive:
+    /// plaintext ones receive directly and TLS ones one-shot.
     pub(crate) recv_multishot: bool,
     pub(crate) accept_rx: Option<crossbeam_channel::Receiver<crate::acceptor::AcceptedConn>>,
     /// Merged accept mode: every merged listener's sockets, `(listener index,

@@ -105,20 +105,21 @@ load (connections per worker × buffers per message, at the message size)
 avoids running out. A runtime whose load is set by its peers cannot size
 the ring this way.
 
-### Multishot receive (`recv_multishot(true)`)
+### Multishot receive
 
 One receive stays armed and takes a new buffer for each arrival until it
 ends. It saves an SQE per buffer and the wait for the next arm. With
 one-shot receives, one connection streaming large messages receives about
-a fifth less per second (`ConfigBuilder::recv_multishot`).
+a fifth less per second (#647).
 
 A multishot receive keeps taking buffers while its socket has data, so a few
 connections with large messages can take most of the ring while others get
 none. The arm ends with `-ENOBUFS` when the ring is empty, and the same
 park and re-arm path applies. ringline made one-shot the default for this
-reason (#647). A multishot receive also takes buffers past a connection's
-hold cap before the cancel that throttles it lands: 2 to 72 buffers per
-throttle on a 256 × 16 KiB ring on Linux 6.12 (#638).
+reason (#647). TLS receives are always one-shot (#705), so that a task that
+does not read stops its peer. A multishot receive also takes buffers past a
+connection's hold cap before the cancel that throttles it lands: 2 to 72
+buffers per throttle on a 256 × 16 KiB ring on Linux 6.12 (#638).
 
 ### Fallback receive on `ENOBUFS` (#274)
 

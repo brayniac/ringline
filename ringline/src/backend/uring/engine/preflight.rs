@@ -60,8 +60,10 @@ pub(crate) fn inc_preflight<E: Engine>(engine: &mut E) -> Result<IncPreflight, E
     })? {
         return Ok(IncPreflight::Unsupported);
     }
-    // TCP receives are one-shot by default and multishot with
-    // `recv_multishot(true)`, so check both.
+    // TLS receives are one-shot, and the unit tests that arm a multishot TCP
+    // receive use a plain ring, so no connection arms the receive the
+    // multishot pass checks. It still runs, first, so a kernel that fails
+    // only the multishot pass gets a plain ring.
     match inc_pass(engine, false)? {
         IncPreflight::Passed => inc_pass(engine, true),
         other => Ok(other),
