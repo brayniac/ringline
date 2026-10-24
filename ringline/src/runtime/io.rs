@@ -644,8 +644,8 @@ impl<T: 'static> Future for BlockingJoinHandle<T> {
 /// connection. When the `POLLRDHUP` poll fires because the peer sent a FIN or
 /// reset while nothing reads, the runtime arms one and re-arms it after each
 /// completion until the receive reads the close_notify, returns 0 at the FIN,
-/// or fails. A close_notify sent without a FIN is read when a read parks, or
-/// after each completion in the segmented domain. On mio every connection
+/// or fails. The poll does not fire on a close_notify sent without a FIN; the
+/// alert is read when a ring receive next completes. On mio every connection
 /// reads into its accumulator.
 ///
 /// # Concurrency
@@ -2712,8 +2712,8 @@ impl ConnCtx {
     /// [`connect`]). On a TLS connection the close takes effect when the
     /// receive reads the close_notify or the FIN; plaintext already decrypted
     /// stays readable. On io_uring, a close_notify the peer sends without a FIN
-    /// is read only when a read parks or while the connection is in the
-    /// segmented domain, so until then this returns `true`.
+    /// is read when a ring receive next completes (see [`connect`] for when one
+    /// is armed), and this returns `true` until then.
     pub fn is_alive(&self) -> bool {
         // `try_with_state`, not `with_state`: this is reachable from a `Drop`
         // that runs outside a task poll. A connection-bound task is dropped by

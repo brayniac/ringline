@@ -177,7 +177,8 @@ Steps 1 to 5 run twice: once with a multishot `RECV`, and once with a
 one-shot buffer-select `RECV` armed again after each completion, where each
 completion has `F_MORE` clear. TCP receives on the ring are one-shot, and
 the unit tests that arm a multishot TCP receive use a plain ring, so no
-connection arms the receive the multishot pass checks.
+connection arms the receive the multishot pass checks. It still runs, first,
+so a kernel that fails only the multishot pass gets a plain ring.
 
 Each step waits at most 1 s for its completion; a step that times out does
 not match. A registration refused with `EINVAL` (no INC), a step that does

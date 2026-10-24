@@ -258,16 +258,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   that polls `try_with_data` without ever parking a read no longer sees new
   bytes, as on a plaintext connection. A TLS connection now arms the
   `POLLRDHUP` hangup poll, so a peer FIN or reset is seen, and `is_alive`
-  returns `false`, while nothing reads. Outside the segmented domain, a
-  close_notify the peer sends without closing TCP is read, and closes the
-  connection, only when a read parks; on mio it is read when it arrives.
-  `forward_to_conn` from a TLS source takes the bytes from the accumulator
-  and sends them through the sink's send queue, as from a plaintext source: ordered with other sends on the sink,
-  with one chunk buffered rather than up to `forward_hold_cap` entries, and
-  below `send_zc_threshold` copied into a pool slot. A zero-copy send of
-  such a forward to a sink that does not read holds worker exit for up to
-  its bound, as any guarded send does. A `forward_to_conn` from a TLS source
-  in the segmented domain forwards from its hold and writes to the sink
+  returns `false`, while nothing reads. The poll does not fire on a
+  close_notify the peer sends without closing TCP: that alert is read, and
+  closes the connection, when a ring receive next completes, which outside
+  the segmented domain needs a read to have parked; on mio it is read when
+  it arrives. `forward_to_conn` from a TLS source takes the bytes from the
+  accumulator and sends them through the sink's send queue, as from a
+  plaintext source: ordered with other sends on the sink, with one chunk
+  buffered rather than up to `forward_hold_cap` entries, and below
+  `send_zc_threshold` copied into a pool slot. A zero-copy send of such a
+  forward to a sink that does not read holds worker exit for up to its
+  bound, as any guarded send does. A `forward_to_conn` from a TLS source in
+  the segmented domain forwards from its hold and writes to the sink
   directly, unordered with other sends on the sink. A TLS source is in that
   domain while a `segments` reader is live, after `recv_owned_segment`,
   `with_segments` or `with_bytes_segments` until `end_segments`, and after a
