@@ -337,8 +337,8 @@ pub struct DriverCtx<'a> {
     pub(crate) close_notify_timeout: std::time::Duration,
     pub(crate) next_disk_io_seq: &'a mut u16,
     /// Set when `finish` on a TLS chain attached the chain's id to its last
-    /// record. `ConnCtx::send_chain` reads it to return a pending future,
-    /// because a TLS chain does not use `chain_table`, so
+    /// ciphertext send. `ConnCtx::send_chain` reads it to return a pending
+    /// future, because a TLS chain does not use `chain_table`, so
     /// `chain_table.carries` is false for it.
     pub(crate) tls_chain_carried: bool,
 }
@@ -4618,7 +4618,8 @@ impl<'b, 'a> SendChainBuilder<'b, 'a> {
     }
 
     /// TLS: encrypt the chain's plaintext as one send and queue it behind the
-    /// connection's other sends, with the chain's id on the last record.
+    /// connection's other sends, with the chain's id on the last ciphertext
+    /// send.
     fn finish_tls(mut self, plaintext: Vec<u8>) -> io::Result<()> {
         self.finished = true;
         if self.tls_parts == 0 {
