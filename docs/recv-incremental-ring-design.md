@@ -1,8 +1,8 @@
 # Two shared receive rings per worker, consumed incrementally where supported
 
-Status: landing steps 0 and 2 to 4 are implemented (#632–#636, behind
-`recv_incremental`). The large group (step 5) and the new defaults (step 7)
-are not. Since 0.7.0-alpha.5 a plaintext connection on io_uring receives
+Status: steps 0, 2 and 3 are implemented (#632, #633), and step 4 behind
+`recv_incremental` (#634–#636; 4b-2's recv-forward and direct-echo paths were
+removed in 0.7.0-alpha.5). Steps 1, 5, 6 and 7 are not. Since 0.7.0-alpha.5 a plaintext connection on io_uring receives
 directly into its accumulator, so the TCP provided-buffer ring serves only
 TLS connections (UDP has its own ring). recv-forward, direct echo,
 `recv_hold` and the recv sink this design refers to were removed. The
@@ -21,9 +21,10 @@ A TLS receive on io_uring lands in a buffer from one provided-buffer ring
 shared by the worker's connections, 256 buffers of 16 KiB
 (`config.rs` `RecvBufferConfig::default`). Buffer size sets how much one
 completion can deliver; at a fixed memory budget, larger buffers mean fewer
-of them. Messages larger than a buffer pay a completion per buffer, and a
-connection whose task holds its bytes keeps buffers every other connection
-needs.
+of them. Messages larger than a buffer pay a completion per buffer. (Before
+0.7.0-alpha.5, plaintext connections whose task held their bytes kept
+buffers every other connection needed; a TLS connection returns its buffer
+when rustls reads it.)
 
 This design gives each worker two shared TCP rings, registered as two buffer
 groups. The defaults follow the ring kind selected (see "Selecting the ring

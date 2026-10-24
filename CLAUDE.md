@@ -240,7 +240,7 @@ Ringline aims to minimize data copies on the hot path. Understanding where copie
 | Step | What happens | Copies |
 |------|-------------|--------|
 | Kernel → RecvAccumulator (plaintext, io_uring) | One-shot `RECV` into the accumulator's free space, armed when a read parks (`docs/recv-direct-design.md`) | 0 |
-| Kernel → ProvidedBufRing (TLS, io_uring) | DMA of ciphertext into a ring-provided buffer, which goes to rustls; the plaintext is the TLS recv row below | 0 |
+| Kernel → ProvidedBufRing (TLS, io_uring) | The kernel copies ciphertext into a ring-provided buffer, which goes to rustls; the plaintext is the TLS recv row below | 0 |
 | Kernel → read buffer → RecvAccumulator (mio) | `read()` into a per-worker buffer, then `extend_from_slice()` | 1 |
 | Accumulator → `with_data()` callback | Borrowed `&[u8]` into accumulator | 0 |
 | Accumulator → `with_bytes()` callback | `BytesMut::freeze()` → `Bytes` (O(1)), slicing via `Bytes::slice()` is O(1) refcount | 0 |

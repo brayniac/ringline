@@ -45,8 +45,10 @@ MSG_WAITALL those intermediate round trips collapse into one final CQE.
 
 On io_uring a plaintext connection receives directly into its accumulator:
 the kernel copies from its socket buffers into the accumulator, and no copy
-follows in user space. A TLS connection's ciphertext lands in a provided
-buffer and goes to rustls, which copies the plaintext into the accumulator.
+follows in user space, except when the accumulator grows to fit a longer
+message and moves the part already received. A TLS connection's ciphertext
+lands in a provided buffer, rustls copies it into its own buffer
+(`read_tls`), and rustls copies the plaintext into the accumulator.
 io_uring zcrx (`IORING_OP_RECV_ZC`, netdev queue + refill ring, merged
 ~6.15) removes the kernel's copy: it DMA-places packet payload into
 user-registered memory; completions carry
@@ -67,16 +69,17 @@ What adopting it would mean for ringline:
   view, so a rope must linearize on demand (copy only when a message
   spans regions) or the parser API must accept iovecs.
 - **Interaction with #246**: the frozen-remainder design already
-  refcounts; a zcrx region handle could slot into `PendingUdpBuf`-style
-  enum arms of the accumulator. The `try_into_mut` recovery path would not
+  refcounts; a zcrx region handle could slot into a new enum arm of the
+  accumulator. The `try_into_mut` recovery path would not
   apply (region memory is never uniquely owned by the accumulator).
 - **Sizing**: refill-ring starvation replaces ENOBUFS as the stall mode;
   the #245 event-driven re-arm pattern transfers.
 
-Verdict: large, worthwhile only after a workload shows the recv memcpy at
-the top of a profile on >=6.15 kernels with capable NICs. Not this phase.
-Prereq checklist for revisiting: kernel >= 6.15 on the rig, NIC with HDS
-(mlx5/bnxt/ice), a profile showing accumulator append >= ~5% of worker CPU.
+Verdict: large, worthwhile only after a workload shows the kernel's receive
+copy at the top of a profile on >=6.15 kernels with capable NICs. Not this
+phase. Prereq checklist for revisiting: kernel >= 6.15 on the rig, NIC with
+HDS (mlx5/bnxt/ice), a profile showing the kernel's receive copy >= ~5% of
+worker CPU.
 
 ## 4. Waiting for room after `EAGAIN`
 

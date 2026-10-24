@@ -2,8 +2,7 @@
 //! `docs/segmented-recv-design.md`).
 //!
 //! Selects how a connection's received bytes are delivered:
-//! - `CopyOrConsume` (the default) — the established path: bytes are copied into
-//!   the `RecvAccumulator` (or held in the single-buffer zero-copy slot) and
+//! - `CopyOrConsume` (the default) — bytes go to the `RecvAccumulator` and are
 //!   surfaced through `with_data`/`with_bytes`.
 //! - `Segmented` — received bytes are held in `segment_hold` instead of the
 //!   accumulator, for segment reads (Modes B and C) and `forward_to` /

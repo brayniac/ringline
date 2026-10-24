@@ -1862,71 +1862,24 @@ impl ConnCtx {
         })
     }
 
-    /// Forward the next `len` received bytes straight to `sink` (Mode A —
-    /// "Forward", zero userspace copy; see `docs/segmented-recv-design.md`).
+    /// Forward the next `len` received bytes to `sink` (Mode A; see
+    /// `docs/segmented-recv-design.md`).
     ///
-    /// Opts this connection into *segmented* delivery, then interleaves recv and
-    /// write: arriving provided buffers are held driver-side and written directly
-    /// to `sink` — a **socket** (zero-copy proxy, `send` with `MSG_WAITALL`) or a
-    /// **buffered file** (`pwrite` at an advancing offset starting at 0). No
-    /// intermediate copy into the accumulator or a user buffer. Each held buffer's
-    /// bid is released back to the provided ring on **its own write completion**.
+    /// The source must be a TLS connection; a plaintext connection is refused
+    /// (see Errors). The connection enters the segmented delivery domain:
+    /// rustls' plaintext is copied into entries held driver-side as it is
+    /// decrypted, and the ciphertext buffers go back to the provided ring when
+    /// rustls reads them. The held entries are written to `sink` — a **socket**
+    /// (`sendmsg` with `MSG_WAITALL`) or a **buffered file** (`pwritev` at an
+    /// advancing offset starting at 0) — gathering up to 16 entries per write.
     ///
     /// Writes to `sink` are strictly serialized — one in flight at a time — so the
-    /// byte stream cannot be reordered (io_uring does not order independent SQEs);
-    /// a large `len` therefore becomes a sequence of serialized buffer-sized
-    /// writes. Shared-ring safety under fan-in is provided by the low-water
-    /// reserve (`recv_segment_reserve`): when the ring runs low, arriving buffers
-    /// are force-copied and their bids returned immediately, so a slow sink cannot
-    /// deplete the shared ring and starve other connections.
+    /// byte stream cannot be reordered (io_uring does not order independent SQEs).
     ///
     /// Bytes already buffered on this connection when the forward starts — the
-    /// remainder of the segment that carried the length header, typically — are
+    /// remainder of the record that carried the length header, typically — are
     /// the front of the forward and are moved into the hold, not left behind in
     /// the accumulator.
-    ///
-    /// # Size the provided buffers for forwarding, not for echo
-    ///
-    /// This path pays its per-completion cost **once per provided buffer**: a
-    /// CQE, a push to the hold, a task wake, a future poll, one write SQE, one
-    /// write CQE, one bid replenish — about 6,600 instructions, measured. One
-    /// write is in flight per connection at a time, so the buffer size sets
-    /// how many bytes that cycle covers.
-    ///
-    /// Relaying a byte stream between two 40 GbE hosts, moving
-    /// `recv_buffer(256, 16384)` to `recv_buffer(64, 65536)` — the same 4 MiB
-    /// of provided-buffer memory, a quarter as many buffers, four times the
-    /// size — took the proxy from 11.2 to 14.0 Gbit/s at the same CPU, and
-    /// from 1.26 to 0.96 instructions per byte. The fixed cost falls from 32%
-    /// of all work to 10%; the remaining ~0.86 instructions/byte is the
-    /// kernel's copy and TCP work, which no buffer size touches.
-    ///
-    /// A geometry sweep (#416) put a number on how much the default costs a
-    /// forwarding workload: **34% at 64 connections, 18% at 1024**. It is the
-    /// only workload measured where the default is systematically far from
-    /// best — for request/response it is within ~6%.
-    ///
-    /// # Sizing
-    ///
-    /// **The default is fine.** A forward write gathers up to 16 held buffers
-    /// into one `sendmsg`, so the payload per completion follows what the
-    /// socket had queued rather than what one buffer holds. Measured on two
-    /// 40 GbE hosts at the same 4 MiB/worker budget: 14.60 Gbit/s at the
-    /// default `recv_buffer(256, 16384)`, 15.13 at `recv_buffer(64, 65536)`,
-    /// 14.22 at `recv_buffer(16, 262144)`. A few percent, either way.
-    ///
-    /// This used to matter a great deal. Before gathering, one write carried
-    /// one buffer, so buffer size *was* payload per completion: the same
-    /// default measured 11.23 Gbit/s against 14.29 at 64 KiB, and #416 found
-    /// forwarding 34% behind the best geometry — the one workload where
-    /// ringline's default was badly wrong. Gathering removed the cause, and
-    /// with it the need to tune.
-    ///
-    /// Going *larger* is now mildly counterproductive: at 256 KiB a
-    /// sixteen-buffer batch would be 4 MiB of iovec against a socket that
-    /// rarely has more than ~100 KB queued, so batches stay short while the
-    /// ring gets shallower — and ring depth is what bounds concurrent arrivals
-    /// at high fan-in, where a 4-deep ring measured a 1.03-second p99.
     ///
     /// Resolves to `Ok(bytes_forwarded)`. `bytes_forwarded == len` on success; a
     /// value `< len` means the peer closed (FIN) before `len` bytes arrived — the
@@ -1945,13 +1898,12 @@ impl ConnCtx {
     ///
     /// # NVMe / `O_DIRECT`
     ///
-    /// Not supported for zero-copy: provided buffers are mid-ring, unaligned, and
-    /// unregistered, so `O_DIRECT`'s alignment contract cannot be met without an
-    /// intermediate aligned copy (which defeats the purpose). [`SinkFd::file`]
-    /// **rejects** an `O_DIRECT` descriptor with [`io::ErrorKind::InvalidInput`].
+    /// Not supported: the held entries are unaligned heap buffers, so
+    /// `O_DIRECT`'s alignment contract cannot be met without an intermediate
+    /// aligned copy. [`SinkFd::file`] **rejects** an `O_DIRECT` descriptor with
+    /// [`io::ErrorKind::InvalidInput`].
     ///
-    /// io_uring only — Mode A is backed by the provided-buffer ring, which on
-    /// io_uring only a TLS connection receives through.
+    /// io_uring only.
     ///
     /// # Errors
     ///
@@ -2200,14 +2152,13 @@ impl ConnCtx {
     /// conn.forward_to_conn(&backend, len).await?;
     /// ```
     ///
-    /// From a source that receives through the provided-buffer ring (a TLS
-    /// connection), the mechanics are those of
-    /// `forward_to`: arriving provided buffers are held driver-side and written
-    /// straight to the sink with no copy through user space, one serialized
-    /// write at a time, each bid released on its own write completion. A
-    /// source that receives directly into its accumulator is covered under
-    /// "A direct source" below. Either way a result `< len` means the peer sent
-    /// FIN first.
+    /// From a TLS source, the mechanics are those of `forward_to`: rustls'
+    /// plaintext is copied into entries held driver-side as it is decrypted,
+    /// and they are written to the sink one serialized write at a time; the
+    /// ciphertext buffers go back to the ring when rustls reads them. A
+    /// plaintext source, which receives directly into its accumulator, is
+    /// covered under "A direct source" below. Either way a result `< len`
+    /// means the peer sent FIN first.
     ///
     /// # Thread affinity
     ///
@@ -2218,7 +2169,7 @@ impl ConnCtx {
     ///
     /// # Do not send on the sink concurrently
     ///
-    /// From a ring source the forward writes to the sink directly rather than
+    /// From a TLS source the forward writes to the sink directly rather than
     /// through its send queue, so a `send` on the sink from elsewhere while a
     /// forward is running is not ordered against it and will interleave on the
     /// wire. io_uring does not order independent SQEs. Forward *or* send on a
@@ -2353,25 +2304,8 @@ impl ConnCtx {
     ///
     /// # This is a copy path
     ///
-    /// From a source that receives through the provided-buffer ring, the
-    /// io_uring version holds provided recv buffers and writes them straight
-    /// to the sink, touching the bytes zero times in user space. mio
-    /// has no provided-buffer ring, so bytes are read into a queued send on
-    /// the sink and copied on the way. It exists so that a proxy built on
-    /// ringline runs at all without io_uring.
-    ///
-    /// It is not, however, automatically the slower of the two. Measured on
-    /// two 40 GbE hosts relaying a byte stream (64 connections, one proxy
-    /// worker pair, medians of three interleaved runs): this path moved
-    /// **12.8 Gbit/s at 1.12 instructions per byte**, against **11.2 Gbit/s
-    /// at 1.26** for the io_uring path using 16 KiB provided buffers — the
-    /// copy path ahead by 14%. Raising the io_uring side to 64 KiB provided
-    /// buffers put it back in front at **14.0 Gbit/s and 0.96
-    /// instructions/byte**. The bookkeeping io_uring adds per buffer (hold,
-    /// bid lifecycle, task wake, one serialized write per buffer — about
-    /// 6,600 instructions a completion) costs more than the copy it removes,
-    /// until the buffer is large enough to amortize it. `forward_to`, which
-    /// exists only on the io_uring backend, carries the sizing guidance.
+    /// Bytes are read into a queued send on the sink and copied on the way.
+    /// It exists so that a proxy built on ringline runs without io_uring.
     ///
     /// # Backpressure
     ///
@@ -4954,18 +4888,18 @@ impl Future for RecvOwnedSegment {
 /// [`forward_to`](ConnCtx::forward_to) future borrows the `SinkFd`, so the borrow
 /// checker keeps the fd alive until the forward resolves.
 ///
-/// Two sink kinds are supported for **zero userspace copy**:
-/// - [`socket`](Self::socket): a stream socket (zero-copy proxy).
-/// - [`file`](Self::file): a **buffered** regular file (`pwrite` at offset).
+/// Two sink kinds are supported:
+/// - [`socket`](Self::socket): a stream socket.
+/// - [`file`](Self::file): a **buffered** regular file (written at an offset).
 ///
-/// `O_DIRECT` / NVMe sinks are **not** supported for zero-copy (provided buffers
-/// are unaligned) and are rejected by [`file`](Self::file).
+/// `O_DIRECT` / NVMe sinks are **not** supported (the held entries are
+/// unaligned) and are rejected by [`file`](Self::file).
 #[cfg(has_io_uring)]
 #[derive(Debug)]
 pub struct SinkFd<'a> {
     fd: RawFd,
-    /// Seekable buffered file (`pwrite` at an advancing offset) vs. stream socket
-    /// (`send` with `MSG_WAITALL`, no offset).
+    /// Seekable buffered file (`writev` at an advancing offset) vs. stream
+    /// socket (`sendmsg` with `MSG_WAITALL`, no offset).
     is_file: bool,
     /// Ties this handle to the borrowed descriptor's lifetime.
     _borrow: PhantomData<BorrowedFd<'a>>,
@@ -4973,8 +4907,9 @@ pub struct SinkFd<'a> {
 
 #[cfg(has_io_uring)]
 impl<'a> SinkFd<'a> {
-    /// A **socket** sink (zero-copy proxy). Forwarded bytes are written with
-    /// `send`(`MSG_WAITALL`), so the kernel retries short stream sends in place.
+    /// A **socket** sink. Forwarded bytes are written with
+    /// `sendmsg`(`MSG_WAITALL`), so the kernel retries short stream sends in
+    /// place.
     pub fn socket(fd: BorrowedFd<'a>) -> Self {
         SinkFd {
             fd: fd.as_raw_fd(),
@@ -4983,21 +4918,19 @@ impl<'a> SinkFd<'a> {
         }
     }
 
-    /// A **buffered file** sink. Forwarded bytes are written with `pwrite` at an
-    /// offset that advances from 0 as bytes are forwarded; short writes resubmit
-    /// the remainder at the advanced offset.
+    /// A **buffered file** sink. Forwarded bytes are written with `writev` at
+    /// an offset that advances from 0 as bytes are forwarded; short writes
+    /// resubmit the remainder at the advanced offset.
     ///
     /// # Errors
     ///
     /// Returns [`io::ErrorKind::InvalidInput`] if the descriptor was opened with
-    /// `O_DIRECT`: zero-copy forwarding requires buffered I/O because provided
-    /// recv buffers are mid-ring, unaligned, and unregistered — `O_DIRECT`'s
-    /// alignment contract cannot be met without an intermediate aligned copy,
-    /// which defeats the purpose. Use a buffered file (or copy the bytes out via
-    /// Mode C).
+    /// `O_DIRECT`: the held entries are unaligned heap buffers, so `O_DIRECT`'s
+    /// alignment contract cannot be met without an intermediate aligned copy.
+    /// Use a buffered file (or copy the bytes out via Mode C).
     pub fn file(fd: BorrowedFd<'a>) -> io::Result<Self> {
         let raw = fd.as_raw_fd();
-        // Reject O_DIRECT: unaligned provided buffers cannot be its source.
+        // Reject O_DIRECT: unaligned held entries cannot be its source.
         let flags = unsafe { libc::fcntl(raw, libc::F_GETFL) };
         if flags < 0 {
             return Err(io::Error::last_os_error());
