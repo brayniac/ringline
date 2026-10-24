@@ -658,6 +658,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- `ringline-redis` and `ringline-memcache` `Pool::client` reconnect a slot
+  whose connection is no longer alive (`is_alive()` is `false`) instead of
+  handing it out. A connection the server closed while it sat idle in the
+  pool was handed out, and the first command on it failed. A close the
+  worker has not yet seen is still handed out.
 - io_uring: `recv_ready` resolves for bytes in a lent receive buffer and in
   the segment hold, as well as for bytes in the accumulator. It stayed pending
   for a receive lent in place on a connection with an empty accumulator until
