@@ -264,11 +264,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   with one chunk buffered rather than up to `forward_hold_cap` entries, and
   below `send_zc_threshold` copied into a pool slot. A zero-copy send of
   such a forward to a sink that does not read holds worker exit for up to
-  its bound, as any guarded send does. A TLS source still in the segmented
-  domain after a segment reader (until `end_segments`) or a failed
-  `forward_to` forwards from its hold, writing to the sink directly,
-  unordered with other sends on the sink. A segment reader or `forward_to`
-  started while a direct forward runs gets `EBUSY`. `recv_multishot` no
+  its bound, as any guarded send does. A `forward_to_conn` from a TLS source
+  in the segmented domain forwards from its hold and writes to the sink
+  directly, unordered with other sends on the sink. A TLS source is in that
+  domain while a `segments` reader is live, after `recv_owned_segment`,
+  `with_segments` or `with_bytes_segments` until `end_segments`, and after a
+  `forward_to` that failed on a write. A segment reader or `forward_to`
+  started while a `forward_to_conn` sends from the accumulator gets `EBUSY`,
+  and so does `with_segments` while any forward runs. `recv_multishot` no
   longer affects TLS connections, which were the only ones it affected, so
   it has no effect.
 - **Breaking:** `metrics::park_abandon::SLOT_RECYCLED` is 12 and

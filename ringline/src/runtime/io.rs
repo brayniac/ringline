@@ -1524,8 +1524,10 @@ impl ConnCtx {
     /// Refused before any reader exists, so a conflict is reported where it is
     /// caused rather than one poll later:
     ///
-    /// - `EBUSY` — a [`SegmentReader`] is already live on this connection, or a
-    ///   Mode A forward is running (the forward owns the hold).
+    /// - `EBUSY` — a [`SegmentReader`] is already live on this connection, a
+    ///   Mode A forward is running (the forward owns the hold), or a
+    ///   `forward_to_conn` from this TLS source is sending from the
+    ///   accumulator.
     /// - `EPIPE` — this handle is stale: the slot was closed and recycled for a
     ///   different connection.
     ///
@@ -1577,8 +1579,10 @@ impl ConnCtx {
     /// Refused before any reader exists, so a conflict is reported where it is
     /// caused rather than one poll later:
     ///
-    /// - `EBUSY` — a [`SegmentReader`] is already live on this connection, or a
-    ///   Mode A forward is running (the forward owns the hold).
+    /// - `EBUSY` — a [`SegmentReader`] is already live on this connection, a
+    ///   Mode A forward is running (the forward owns the hold), or a
+    ///   `forward_to_conn` from this TLS source is sending from the
+    ///   accumulator.
     /// - `EPIPE` — this handle is stale: the slot was closed and recycled for a
     ///   different connection.
     ///
@@ -2256,8 +2260,9 @@ impl ConnCtx {
         }
     }
 
-    /// A forward from this connection to the sink connection, if this
-    /// connection receives directly into its accumulator; `None` otherwise.
+    /// A forward from this connection to the sink connection that sends from
+    /// this connection's accumulator, if it is a plaintext source or a TLS
+    /// source outside the segmented domain; `None` otherwise.
     /// Refuses the same conditions as `arm_forward_source`: a forward already
     /// running from this connection (`EBUSY`), a stale sink (`EPIPE`), a TLS
     /// sink (`EPROTOTYPE`), and, unless the caller holds the sink's
@@ -5097,16 +5102,16 @@ pub struct ForwardToFuture<'a> {
     /// running (`EBUSY`), a stale source or sink slot (`EPIPE`), or a TLS sink
     /// (`EPROTOTYPE`). Reported on the first poll; nothing was mutated.
     refused: Option<i32>,
-    /// Set for a forward from a direct connection (see [`connect`]), which
-    /// sends from its accumulator instead of from held ring buffers.
+    /// Set for a forward that sends from the source's accumulator: a
+    /// plaintext source, or a TLS source outside the segmented domain.
     direct: Option<DirectForward>,
     /// Ties the future to whatever the caller borrowed — a `SinkFd`, or the
     /// sink `ConnCtx` — so the sink cannot be dropped mid-forward.
     _borrow: PhantomData<&'a ()>,
 }
 
-/// State of a [`ForwardToFuture`] whose source receives directly into its
-/// accumulator.
+/// State of a [`ForwardToFuture`] that sends from its source's accumulator
+/// (a plaintext source, or a TLS source outside the segmented domain).
 ///
 /// Each step takes the bytes the accumulator holds, up to what is left of
 /// `len`, and sends them on the sink through its send queue under a guard:

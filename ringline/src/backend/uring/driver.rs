@@ -349,7 +349,7 @@ impl Driver {
 
     /// Arm a TCP ring recv on `conn_index`, carrying the `RecvMulti`
     /// user_data. A TLS connection's is one-shot; the multishot branch is
-    /// reached only by the ring connections unit tests build.
+    /// reached only by plaintext ring connections that unit tests construct.
     pub(crate) fn submit_tcp_recv(&mut self, conn_index: u32, generation: u32) -> io::Result<()> {
         // A direct connection never takes a provided buffer; its receive is
         // armed by the parked receive future (`arm_direct_recv_or_close`).

@@ -193,7 +193,7 @@ pub struct Config {
     /// Try an incremental TCP receive ring. See
     /// `ConfigBuilder::recv_incremental`.
     pub(crate) recv_incremental: bool,
-    /// `ConfigBuilder::recv_multishot`; has no effect on TCP connections.
+    /// `ConfigBuilder::recv_multishot`. Has no effect outside unit tests.
     pub(crate) recv_multishot: bool,
     /// Bound on the per-worker accept channel. If a worker can't drain its
     /// queue fast enough, the acceptor will skip past it (and possibly
@@ -1035,7 +1035,7 @@ impl ConfigBuilder {
         self
     }
 
-    /// Has no effect on TCP connections. On io_uring a plaintext connection
+    /// Has no effect. On io_uring a plaintext connection
     /// receives directly into its accumulator (see [`connect`](crate::connect)),
     /// and a TLS connection's ring receive is one-shot, armed when a read
     /// parks, so a task that does not read stops its peer.

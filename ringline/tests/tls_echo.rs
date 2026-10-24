@@ -1423,18 +1423,23 @@ impl AsyncEventHandler for TlsSegmentDuringDirectForward {
             let Ok(backend) = ringline::connect(addr).await else {
                 return;
             };
-            // Release the backend's send-half claim, so a `ConnCtx` can name
-            // it as the sink; the receive half keeps the connection open.
+            // Dropping the send half releases only its claim (`send_half_taken`)
+            // and leaves the backend open, so a `ConnCtx` can name it as the
+            // sink.
             let (backend_tx, _backend_rx) = backend.split();
             let sink_ctx = backend_tx.as_conn();
             drop(backend_tx);
             let src = conn.as_conn();
             let fwd = src.forward_to_conn(&sink_ctx, 5);
-            // A segment reader is refused on its first poll.
+            // A segment reader is refused at the call.
             let segment = match conn.recv_owned_segment() {
                 Ok(read) => read.await.map(|_| ()),
                 Err(e) => Err(e),
             };
+            let with_segments = conn
+                .with_segments(|_| ringline::SegConsumed(0))
+                .await
+                .map(|_| ());
             let file = std::fs::OpenOptions::new()
                 .write(true)
                 .open("/dev/null")
@@ -1442,10 +1447,21 @@ impl AsyncEventHandler for TlsSegmentDuringDirectForward {
             let sink = ringline::SinkFd::file(file.as_fd()).expect("file sink");
             let mode_a = conn.forward_to(&sink, 5).await;
             let forwarded = fwd.await;
+            // With the direct forward done, a running `forward_to` (Mode A)
+            // refuses `with_segments` too.
+            let running = src.forward_to(&sink, 1 << 20);
+            let with_segments_mode_a = conn
+                .with_segments(|_| ringline::SegConsumed(0))
+                .await
+                .map(|_| ());
+            drop(running);
             *TLS_DURING_FORWARD_RESULT.lock().unwrap() = Some(format!(
-                "segment {:?} forward_to {:?} forward_to_conn {forwarded:?}",
+                "segment {:?} with_segments {:?} forward_to {:?} forward_to_conn {forwarded:?} \
+                 with_segments_during_forward_to {:?}",
                 segment.map_err(|e| e.raw_os_error()),
+                with_segments.map_err(|e| e.raw_os_error()),
                 mode_a.map_err(|e| e.raw_os_error()),
+                with_segments_mode_a.map_err(|e| e.raw_os_error()),
             ));
         }
     }
@@ -1455,9 +1471,10 @@ impl AsyncEventHandler for TlsSegmentDuringDirectForward {
     }
 }
 
-/// While a TLS source's `forward_to_conn` runs on the direct path, a segment
-/// reader and a `forward_to` on the same source are refused with `EBUSY`; the
-/// forward still delivers its bytes.
+/// While a TLS source's `forward_to_conn` sends from the accumulator, a
+/// segment reader, `with_segments` and a `forward_to` on the same source are
+/// refused with `EBUSY`, and the forward still delivers its bytes; while a
+/// `forward_to` runs, `with_segments` is refused too.
 #[cfg(has_io_uring)]
 #[test]
 fn a_tls_direct_forward_refuses_a_segment_reader_and_forward_to() {
@@ -1517,7 +1534,8 @@ fn a_tls_direct_forward_refuses_a_segment_reader_and_forward_to() {
     assert_eq!(
         result,
         format!(
-            "segment Err(Some({ebusy})) forward_to Err(Some({ebusy})) forward_to_conn Ok(5)",
+            "segment Err(Some({ebusy})) with_segments Err(Some({ebusy})) forward_to Err(Some({ebusy})) \
+             forward_to_conn Ok(5) with_segments_during_forward_to Err(Some({ebusy}))",
             ebusy = libc::EBUSY
         )
     );
