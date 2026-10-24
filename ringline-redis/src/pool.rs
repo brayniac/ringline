@@ -312,8 +312,8 @@ impl Pool {
     /// A slot whose connection is no longer alive (`ringline::ConnCtx::is_alive`
     /// is `false`, for example because the server closed it while it sat idle
     /// in the pool) is reconnected instead of handed out. A close the worker
-    /// has not yet seen is not detected, and a command sent on that
-    /// connection fails.
+    /// has not yet seen, or one that arrived after bytes no read has consumed,
+    /// is not detected, and a command sent on that connection fails.
     pub async fn client(&self) -> Result<PooledClient, Error> {
         let (idx, client) = self.checkout().await?;
         Ok(PooledClient {

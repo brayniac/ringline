@@ -282,6 +282,12 @@ impl Pool {
     /// The client is moved out of its slot and the slot is marked lent, so the
     /// returned [`PooledClient`] does not borrow the pool and several may be
     /// held at once.
+    ///
+    /// A slot whose connection is no longer alive (`ringline::ConnCtx::is_alive`
+    /// is `false`, for example because the server closed it while it sat idle
+    /// in the pool) is reconnected instead of handed out. A close the worker
+    /// has not yet seen, or one that arrived after bytes no read has consumed,
+    /// is not detected, and a command sent on that connection fails.
     pub async fn client(&self) -> Result<PooledClient, Error> {
         let size = self.len();
         if size == 0 {
@@ -314,7 +320,11 @@ impl Pool {
             let next = {
                 let mut slots = self.shared.slots.borrow_mut();
                 match std::mem::replace(&mut slots[idx], Slot::Lent) {
-                    Slot::Connected(client) => Next::Ready(client),
+                    Slot::Connected(client) if client.is_alive() => Next::Ready(client),
+                    // Closed while idle: left reserved and reconnected. The
+                    // connection is already closing or released, so dropping
+                    // the client leaks nothing.
+                    Slot::Connected(_) => Next::Connect,
                     // Already out: put it back and move on.
                     Slot::Lent => {
                         slots[idx] = Slot::Lent;

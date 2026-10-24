@@ -64,6 +64,9 @@ impl AsyncEventHandler for OneReplyServer {
                 .await;
             if n > 0 {
                 ANSWERED.fetch_add(1, Ordering::SeqCst);
+                // Close after the client has read the reply and returned the
+                // connection to the pool, so it sits there alive.
+                ringline::sleep(Duration::from_millis(50)).await;
             }
             tx.close();
         }
@@ -92,8 +95,12 @@ async fn run_client(addr: SocketAddr) -> Result<(), String> {
             return Err(format!("first get: {v:?}"));
         }
     }
-    // The server closes the connection after its reply. Give the client's
-    // worker time to see the close while the client sits in the pool.
+    // The connection went back into the pool alive.
+    if pool.connected_count() != 1 {
+        return Err("the first client was not returned alive".into());
+    }
+    // The server closes the connection 50 ms after its reply. Give the
+    // client's worker time to see the close while the client sits in the pool.
     ringline::sleep(Duration::from_millis(200)).await;
     let mut client = pool
         .client()
