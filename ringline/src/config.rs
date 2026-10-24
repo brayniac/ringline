@@ -566,7 +566,7 @@ impl Config {
     /// that at startup would break working deployments to pre-empt a hazard
     /// that only reaches bounded sends, which already refuse themselves with a
     /// message naming the same knob.
-    #[cfg(feature = "tls-unbuffered")]
+    #[cfg(not(feature = "tls-buffered"))]
     fn validate_tls_slot_size(&self) -> Result<(), crate::error::Error> {
         if self.tls.is_none() && self.tls_client.is_none() {
             return Ok(());
@@ -585,7 +585,7 @@ impl Config {
 
     /// The buffered record layer packs ciphertext across slots through
     /// `PoolWriter`, so no slot size is too small for it to make progress.
-    #[cfg(not(feature = "tls-unbuffered"))]
+    #[cfg(feature = "tls-buffered")]
     fn validate_tls_slot_size(&self) -> Result<(), crate::error::Error> {
         Ok(())
     }
@@ -1800,7 +1800,7 @@ mod tests {
     // every TLS send on every connection fails. Better at startup than
     // per-send. The buffered engine has no such floor, so this is gated.
     #[test]
-    #[cfg(feature = "tls-unbuffered")]
+    #[cfg(not(feature = "tls-buffered"))]
     fn validate_rejects_a_slot_the_unbuffered_engine_cannot_encrypt_into() {
         let err = config_with(|c| {
             c.tls = Some(tls_server_config(None));
@@ -1817,7 +1817,7 @@ mod tests {
     // A client config reaches the same check — outbound TLS connections
     // encrypt through the same pool.
     #[test]
-    #[cfg(feature = "tls-unbuffered")]
+    #[cfg(not(feature = "tls-buffered"))]
     fn validate_checks_the_client_config_too() {
         let cc: std::sync::Arc<rustls::ClientConfig> = rustls::ClientConfig::builder()
             .with_root_certificates(rustls::RootCertStore::empty())

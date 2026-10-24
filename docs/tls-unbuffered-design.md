@@ -1,7 +1,9 @@
 # Unbuffered TLS send path — design
 
-**Status:** Implemented behind the default-off `tls-unbuffered` feature (PRs
-#338, #341, #345, #350). **This design's central premise is falsified — read
+**Status:** Implemented (PRs #338, #341, #345, #350) and the default engine;
+the `tls-buffered` feature selects the buffered one, and
+`tls-unbuffered` has no effect. The unbuffered engine captures the SNI hostname
+through the certificate resolver. **This design's central premise is falsified — read
 the correction immediately below before anything else.** The `> **Correction**`
 blocks further down record where *building* it falsified the design; this one
 records where *measuring* it did.

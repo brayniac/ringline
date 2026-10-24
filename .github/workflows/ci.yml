@@ -51,8 +51,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --locked --all-targets --features force-mio -- -D warnings
 
-  clippy-tls-unbuffered:
-    name: Clippy (tls-unbuffered)
+  clippy-tls-buffered:
+    name: Clippy (tls-buffered)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -60,7 +60,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --locked --all-targets --features tls-unbuffered -- -D warnings
+      - run: cargo clippy --locked --all-targets --features tls-buffered -- -D warnings
 
   clippy-stub-engine:
     # The io_uring driver on the stub engine: only the engine may use the
@@ -286,8 +286,8 @@ jobs:
       - run: cargo nextest run --locked --workspace --profile ci --features force-mio
       - run: cargo test --locked --workspace --doc --features force-mio
 
-  test-tls-unbuffered:
-    name: Test (tls-unbuffered)
+  test-tls-buffered:
+    name: Test (tls-buffered)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -302,8 +302,8 @@ jobs:
       # starts a new one.
       - run: |
           sudo prlimit --pid $$ --memlock=67108864:67108864
-          cargo nextest run --locked --workspace --profile ci --features tls-unbuffered
-          cargo test --locked --workspace --doc --features tls-unbuffered
+          cargo nextest run --locked --workspace --profile ci --features tls-buffered
+          cargo test --locked --workspace --doc --features tls-buffered
 
   test-macos:
     name: Test (macOS)

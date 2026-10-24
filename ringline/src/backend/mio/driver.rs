@@ -656,7 +656,7 @@ impl Driver {
                 // `flush_tls_output_mio_direct` via
                 // `WriteTraffic::queue_close_notify`. Both are best-effort --
                 // the socket is going away.
-                #[cfg(not(feature = "tls-unbuffered"))]
+                #[cfg(feature = "tls-buffered")]
                 if let Some(tls_conn) = tls_table.get_mut(conn_index)
                     && let Some(buffered) = tls_conn.conn.as_buffered_mut()
                 {
@@ -1313,11 +1313,11 @@ pub(crate) mod tests {
     /// size slots differently — the buffered one straddles them, the
     /// unbuffered one cannot.
     fn handshaked_tls_conn() -> crate::tls::TlsConn {
-        #[cfg(feature = "tls-unbuffered")]
+        #[cfg(not(feature = "tls-buffered"))]
         {
             crate::tls::unbuffered::tests::handshaked_pair().0
         }
-        #[cfg(not(feature = "tls-unbuffered"))]
+        #[cfg(feature = "tls-buffered")]
         {
             let (server, _peer) = crate::tls::buffered::test_support::handshaked();
             crate::tls::buffered::test_support::wrap_server(server)
@@ -1498,12 +1498,12 @@ pub(crate) mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         // Either way the message has to name the knob the operator can change.
         let msg = err.to_string();
-        #[cfg(feature = "tls-unbuffered")]
+        #[cfg(not(feature = "tls-buffered"))]
         assert!(
             msg.contains("send_copy_slot_size"),
             "no bound is expressible, so the refusal names the slot size: {msg}"
         );
-        #[cfg(not(feature = "tls-unbuffered"))]
+        #[cfg(feature = "tls-buffered")]
         assert!(
             msg.contains("send-pool slots") && msg.contains("Config::send_pool"),
             "the bound is expressible but exceeds the pool: {msg}"

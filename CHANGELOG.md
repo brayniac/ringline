@@ -249,6 +249,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Breaking:** the unbuffered TLS engine (rustls' unbuffered API) is the
+  default on both backends. The new `tls-buffered` feature selects the
+  buffered engine; `tls-unbuffered` has no effect and is kept so builds that
+  name it still resolve. Application data costs the same copies on both
+  engines. The unbuffered engine now reports the SNI hostname
+  (`TlsInfo::sni_hostname`): ringline clones each server config and wraps
+  its certificate resolver to record the name the ClientHello carries, so a
+  `ServerConfig` passed in is not the one the connection uses. At the
+  default send-pool slot (16448 bytes) a 16 KiB send is one record on both
+  engines.
 - **Breaking:** `metrics::park_abandon::SLOT_RECYCLED` is 12 and
   `INSTALL_FAILED` 13, after the removal of `DIRECT_ECHO`.
 - **Breaking:** on io_uring, every plaintext connection, accepted or from

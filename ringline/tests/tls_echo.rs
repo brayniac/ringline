@@ -720,29 +720,14 @@ fn tls_info_accessors() {
         snap.alpn_protocol, None,
         "expected alpn_protocol() == None (no ALPN configured)"
     );
-    // rustls ServerConnection::server_name() returns the SNI hostname from the
-    // client's ClientHello.  The client above used "localhost" as ServerName.
-    //
-    // The unbuffered engine cannot answer this: rustls exposes no equivalent of
-    // `ServerConnection::server_name()` on `UnbufferedServerConnection`
-    // (verified against rustls 0.23.41 — it lives only on the buffered type and
-    // on the handshake-callback `ClientHello`). That is the documented
-    // limitation on `TlsInfo::sni_hostname`, and recovering it needs a
-    // `ClientHello` callback on `ServerConfig`. Assert the documented value in
-    // each build rather than dropping the check, so a regression to `None` on
-    // the buffered path still fails here and an unbuffered engine that starts
-    // reporting SNI fails too, prompting the doc to be corrected.
-    #[cfg(not(feature = "tls-unbuffered"))]
+    // The client above used "localhost" as its ServerName, so its ClientHello
+    // carries that SNI. The buffered engine reads it from
+    // `ServerConnection::server_name()`; the unbuffered engine captures it from
+    // the ClientHello through the certificate resolver (`unbuffered::sni`).
     assert_eq!(
         snap.sni_hostname.as_deref(),
         Some("localhost"),
         "sni_hostname() should reflect the client's SNI value"
-    );
-    #[cfg(feature = "tls-unbuffered")]
-    assert_eq!(
-        snap.sni_hostname.as_deref(),
-        None,
-        "the unbuffered engine has no SNI accessor; see TlsInfo::sni_hostname"
     );
 }
 

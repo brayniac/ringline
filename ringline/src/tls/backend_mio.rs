@@ -28,7 +28,7 @@ use crate::backend::mio::driver::PendingSend;
 
 use super::{TlsRecvResult, TlsTable, buffered};
 
-#[cfg(feature = "tls-unbuffered")]
+#[cfg(not(feature = "tls-buffered"))]
 use super::{PlaintextSink, unbuffered};
 
 /// Feed received ciphertext, decrypt into the accumulator, and queue any TLS
@@ -43,7 +43,7 @@ pub fn feed_tls_recv_mio(
     conn_index: u32,
     ciphertext: &[u8],
 ) -> TlsRecvResult {
-    #[cfg(feature = "tls-unbuffered")]
+    #[cfg(not(feature = "tls-buffered"))]
     {
         let (conn_slot, write_buf) = buffered::borrow_conn_and_buf(tls_table, conn_index);
         let Some(tls_conn) = conn_slot.as_mut() else {
@@ -67,7 +67,7 @@ pub fn feed_tls_recv_mio(
             unbuffered::DriveOutcome::Error(e) => TlsRecvResult::Error(e),
         }
     }
-    #[cfg(not(feature = "tls-unbuffered"))]
+    #[cfg(feature = "tls-buffered")]
     buffered::feed_tls_recv_mio_buffered(tls_table, accumulators, pending, conn_index, ciphertext)
 }
 
@@ -78,7 +78,7 @@ pub fn flush_tls_output_mio_queued(
     pending: &mut std::collections::VecDeque<PendingSend>,
     conn_index: u32,
 ) {
-    #[cfg(feature = "tls-unbuffered")]
+    #[cfg(not(feature = "tls-buffered"))]
     {
         let (conn_slot, write_buf) = buffered::borrow_conn_and_buf(tls_table, conn_index);
         let Some(tls_conn) = conn_slot.as_mut() else {
@@ -93,7 +93,7 @@ pub fn flush_tls_output_mio_queued(
             pending.push_back(PendingSend::plain(std::mem::take(write_buf)));
         }
     }
-    #[cfg(not(feature = "tls-unbuffered"))]
+    #[cfg(feature = "tls-buffered")]
     buffered::flush_tls_output_mio_queued_buffered(tls_table, pending, conn_index)
 }
 
@@ -112,7 +112,7 @@ pub fn flush_tls_output_mio_direct(
     stream: &mut mio::net::TcpStream,
     conn_index: u32,
 ) {
-    #[cfg(feature = "tls-unbuffered")]
+    #[cfg(not(feature = "tls-buffered"))]
     {
         use std::io::Write as _;
 
@@ -134,7 +134,7 @@ pub fn flush_tls_output_mio_direct(
             }
         }
     }
-    #[cfg(not(feature = "tls-unbuffered"))]
+    #[cfg(feature = "tls-buffered")]
     buffered::flush_tls_output_mio_direct_buffered(tls_table, stream, conn_index)
 }
 
@@ -144,7 +144,7 @@ pub fn encrypt_for_send_mio(
     conn_index: u32,
     plaintext: &[u8],
 ) -> io::Result<Vec<u8>> {
-    #[cfg(feature = "tls-unbuffered")]
+    #[cfg(not(feature = "tls-buffered"))]
     {
         let (conn_slot, _) = buffered::borrow_conn_and_buf(tls_table, conn_index);
         let tls_conn = conn_slot.as_mut().ok_or_else(|| {
@@ -154,6 +154,6 @@ pub fn encrypt_for_send_mio(
         unbuffered::encrypt_to_vec(tls_conn, plaintext, &mut out)?;
         Ok(out)
     }
-    #[cfg(not(feature = "tls-unbuffered"))]
+    #[cfg(feature = "tls-buffered")]
     buffered::encrypt_for_send_mio_buffered(tls_table, conn_index, plaintext)
 }
