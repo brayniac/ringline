@@ -6227,7 +6227,10 @@ mod tests {
         let ud = UserData::encode(OpTag::HangupPoll, conn_index, generation);
         el.test_dispatch_cqe(ud.raw(), libc::POLLRDHUP as i32, 0);
         let c = el.driver.connections.get(conn_index).unwrap();
-        assert!(!c.hangup_peek_armed, "the receive in flight reports the end");
+        assert!(
+            !c.hangup_peek_armed,
+            "the receive in flight reports the end"
+        );
         assert!(c.hangup_recheck && c.hangup_recheck_due);
         assert_eq!(el.driver.hangup_rechecks, vec![(conn_index, generation)]);
     }
