@@ -2551,9 +2551,12 @@ impl ConnCtx {
                 executor.withdraw_send(id);
                 return Err(e);
             }
+            // A TLS chain is queued as one encrypted send, not through
+            // `chain_table`.
+            let tls_carried = ctx.tls_chain_carried;
             // A closure that submitted nothing (an empty chain, or no
             // `finish`) sent nothing.
-            if !driver.chain_table.carries(self.conn_index, id) {
+            if !tls_carried && !driver.chain_table.carries(self.conn_index, id) {
                 executor.withdraw_send(id);
                 return Ok(SendFuture::ready(self.conn_index, self.generation, Ok(0)));
             }
@@ -4261,7 +4264,22 @@ impl SendHalf {
         self.conn.request_shutdown();
     }
 
-    /// See [`SendHalf::send_chain`].
+    /// Build an IO_LINK chained send and await completion.
+    ///
+    /// The closure receives a [`SendChainBuilder`](crate::handler::SendChainBuilder)
+    /// for constructing linked SQEs. Call `.copy()`, `.parts()...add()` to build
+    /// the chain, then `.finish()` to submit it. Returns a [`SendFuture`] that
+    /// resolves with the bytes the chain sent, or `Ok(0)` when the closure
+    /// submitted nothing.
+    ///
+    /// On a plaintext connection, `finish` returns `WouldBlock` while earlier
+    /// sends on the connection are in flight, since a linked chain would
+    /// overtake them; await them first. On a TLS connection the parts are not
+    /// linked SQEs: `finish` gathers them, guard parts included, encrypts them
+    /// as one send, and queues it behind the connection's other sends, so it
+    /// does not refuse while earlier sends are in flight.
+    ///
+    /// For fire-and-forget chained sending, use `send_chain_nowait()`.
     #[cfg(has_io_uring)]
     pub fn send_chain<F>(&mut self, f: F) -> io::Result<SendFuture>
     where
@@ -4270,7 +4288,15 @@ impl SendHalf {
         self.conn.send_chain(f)
     }
 
-    /// See [`SendHalf::send_chain_nowait`].
+    /// Build an IO_LINK chained send on this connection (fire-and-forget).
+    ///
+    /// The closure receives a [`SendChainBuilder`](crate::handler::SendChainBuilder)
+    /// for constructing linked SQEs. Call `.copy()`, `.parts()...add()` to add
+    /// SQEs, then `.finish()` to submit the chain. On a TLS connection the
+    /// chain is encrypted and queued as one send; see
+    /// [`send_chain`](Self::send_chain).
+    ///
+    /// For backpressure-aware chained sending, use `send_chain()`.
     #[cfg(has_io_uring)]
     pub fn send_chain_nowait<F, R>(&mut self, f: F) -> R
     where

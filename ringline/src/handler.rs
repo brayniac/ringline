@@ -336,6 +336,10 @@ pub struct DriverCtx<'a> {
     pub(crate) capacity_released: &'a mut bool,
     pub(crate) close_notify_timeout: std::time::Duration,
     pub(crate) next_disk_io_seq: &'a mut u16,
+    /// Set when a `send_chain` on a TLS connection queued its sends with the
+    /// chain's id attached, so `ConnCtx::send_chain` knows the id will settle.
+    /// A TLS chain does not use `chain_table`.
+    pub(crate) tls_chain_carried: bool,
 }
 
 /// The refusal of a TLS send made after this side's close_notify was queued:
@@ -1032,13 +1036,20 @@ impl<'a> DriverCtx<'a> {
     /// as a linked SQE chain. The kernel executes them sequentially, and a single
     /// `on_send_complete` fires when the entire chain is done.
     ///
+    /// On a TLS connection the parts are gathered, guard parts included,
+    /// encrypted as one send and queued behind the connection's other sends.
+    ///
     /// Returns a [`SendChainBuilder`]. Call `.copy()`, `.parts()...add()` to
     /// add SQEs, then `.finish()` to submit.
     pub fn send_chain(&mut self, conn: ConnToken) -> SendChainBuilder<'_, 'a> {
+        // SAFETY: read-only probe; see the `tls_table` field's contract.
+        let tls = !self.tls_table.is_null() && unsafe { (*self.tls_table).has(conn.index) };
         SendChainBuilder {
             ctx: self,
             conn,
             built: Vec::new(),
+            tls_plaintext: tls.then(Vec::new),
+            tls_parts: 0,
             error: None,
             finished: false,
             send_id: None,
@@ -4450,6 +4461,12 @@ pub struct SendChainBuilder<'b, 'a> {
     ctx: &'b mut DriverCtx<'a>,
     conn: ConnToken,
     built: Vec<BuiltSend>,
+    /// On a TLS connection, the chain's plaintext in order. The parts are not
+    /// sent as linked SQEs: `finish` encrypts them as one send through the
+    /// connection's send queue, which keeps the records in order.
+    tls_plaintext: Option<Vec<u8>>,
+    /// Parts added to `tls_plaintext`, counted against `max_chain_length`.
+    tls_parts: usize,
     error: Option<io::Error>,
     finished: bool,
     /// Carried into the chain's `ChainState` by `finish`.
@@ -4463,11 +4480,16 @@ impl<'b, 'a> SendChainBuilder<'b, 'a> {
         if self.error.is_some() {
             return self;
         }
-        if self.built.len() >= self.ctx.max_chain_length as usize {
+        if self.built.len() + self.tls_parts >= self.ctx.max_chain_length as usize {
             self.error = Some(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "chain exceeds max_chain_length",
             ));
+            return self;
+        }
+        if let Some(plaintext) = self.tls_plaintext.as_mut() {
+            plaintext.extend_from_slice(data);
+            self.tls_parts += 1;
             return self;
         }
 
@@ -4526,6 +4548,9 @@ impl<'b, 'a> SendChainBuilder<'b, 'a> {
             // finished stays false — Drop will call release_all().
             return Err(e);
         }
+        if let Some(plaintext) = self.tls_plaintext.take() {
+            return self.finish_tls(plaintext);
+        }
 
         let count = self.built.len();
         if count == 0 {
@@ -4581,6 +4606,41 @@ impl<'b, 'a> SendChainBuilder<'b, 'a> {
         self.built.clear();
 
         self.finished = true;
+        Ok(())
+    }
+
+    /// TLS: encrypt the chain's plaintext as one send and queue it behind the
+    /// connection's other sends, with the chain's id on the last record.
+    fn finish_tls(mut self, plaintext: Vec<u8>) -> io::Result<()> {
+        self.finished = true;
+        if self.tls_parts == 0 {
+            return Ok(());
+        }
+        let conn = self.conn;
+        let current = self
+            .ctx
+            .connections
+            .get(conn.index)
+            .is_some_and(|c| c.generation == conn.generation);
+        if !current {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "stale connection",
+            ));
+        }
+        if self.ctx.send_queues[conn.index as usize].close_submitted {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "connection closing",
+            ));
+        }
+        let sends = self.ctx.encrypt_tls_send(conn, &plaintext)?;
+        if let Some(id) = self.send_id {
+            self.ctx
+                .attach_send_id(sends.last(), id, plaintext.len() as u32);
+            self.ctx.tls_chain_carried = true;
+        }
+        self.ctx.queue_built_sends(conn.index, sends);
         Ok(())
     }
 
@@ -4688,11 +4748,42 @@ impl<'b, 'a> ChainPartsBuilder<'b, 'a> {
             return self.chain;
         }
 
-        if self.chain.built.len() >= self.chain.ctx.max_chain_length as usize {
+        if self.chain.built.len() + self.chain.tls_parts >= self.chain.ctx.max_chain_length as usize
+        {
             self.chain.error = Some(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "chain exceeds max_chain_length",
             ));
+            return self.chain;
+        }
+
+        // TLS: append this SQE's parts, guard bytes included, to the chain's
+        // plaintext; the guards drop here, as on `SendBuilder`'s TLS path.
+        if let Some(plaintext) = self.chain.tls_plaintext.as_mut() {
+            for i in 0..self.part_count as usize {
+                match self.parts[i] {
+                    PartSlot::Copy { slice_idx } => {
+                        let (ptr, len) = self.copy_slices[slice_idx as usize];
+                        // SAFETY: the slice was borrowed for 'b by `copy`.
+                        plaintext
+                            .extend_from_slice(unsafe { std::slice::from_raw_parts(ptr, len) });
+                    }
+                    PartSlot::Guard { guard_idx } => {
+                        if let Some(ref g) = self.guards[guard_idx as usize] {
+                            let (ptr, len) = g.as_ptr_len();
+                            // SAFETY: the guard keeps its memory alive while held.
+                            plaintext.extend_from_slice(unsafe {
+                                std::slice::from_raw_parts(ptr, len as usize)
+                            });
+                        }
+                    }
+                    PartSlot::Empty => {}
+                }
+            }
+            for g in self.guards.iter_mut() {
+                *g = None;
+            }
+            self.chain.tls_parts += 1;
             return self.chain;
         }
 

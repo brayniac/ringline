@@ -1429,6 +1429,121 @@ fn send_after_close_is_refused<H: AsyncEventHandler>() {
     assert_eq!(err.kind(), std::io::ErrorKind::NotConnected);
 }
 
+/// Owns the heap bytes a chain's guard part sends.
+#[cfg(has_io_uring)]
+struct ChainGuard(Vec<u8>);
+
+#[cfg(has_io_uring)]
+impl ringline::SendGuard for ChainGuard {
+    fn as_ptr_len(&self) -> (*const u8, u32) {
+        (self.0.as_ptr(), self.0.len() as u32)
+    }
+    fn region(&self) -> ringline::RegionId {
+        ringline::RegionId::UNREGISTERED
+    }
+}
+
+/// Above `send_zc_threshold`, so on a plaintext connection the guard part
+/// would go out zero-copy.
+#[cfg(has_io_uring)]
+const CHAIN_GUARD_LEN: usize = 8192;
+
+/// Read one byte, send once, then send a `send_chain` of a copy part, a
+/// scatter-gather part with a guard, and another copy part; wait for it, send
+/// an empty chain, and close.
+#[cfg(has_io_uring)]
+struct TlsSendChain;
+
+#[cfg(has_io_uring)]
+impl AsyncEventHandler for TlsSendChain {
+    #[allow(clippy::manual_async_fn)]
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
+        async move {
+            let n = conn
+                .with_data(|d| {
+                    if d.is_empty() {
+                        ParseResult::NeedMore
+                    } else {
+                        ParseResult::Consumed(1)
+                    }
+                })
+                .await;
+            if n == 0 {
+                return;
+            }
+            // A chain is refused while earlier sends are in flight, so wait
+            // for this one first.
+            conn.send(b"before-")
+                .expect("send before the chain")
+                .await
+                .expect("send before the chain completes");
+            let guard = ringline::GuardBox::new(ChainGuard(vec![b'g'; CHAIN_GUARD_LEN]));
+            let sent = conn
+                .send_chain(|chain| {
+                    chain
+                        .copy(b"chain-a")
+                        .parts()
+                        .copy(b"-")
+                        .guard(guard)
+                        .copy(b"-")
+                        .add()
+                        .copy(b"-chain-b")
+                        .finish()
+                })
+                .expect("submit the chain")
+                .await;
+            assert_eq!(
+                sent.expect("chain completes"),
+                (CHAIN_GUARD_LEN + 17) as u32,
+                "the chain's bytes"
+            );
+            // An empty chain sends nothing and resolves to 0.
+            let empty = conn
+                .send_chain(|chain| chain.finish())
+                .expect("submit the empty chain")
+                .await;
+            assert_eq!(empty.expect("empty chain completes"), 0);
+            conn.close();
+        }
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        TlsSendChain
+    }
+}
+
+/// A `send_chain` on a TLS connection, copy and guard parts alike, is
+/// encrypted and ordered with the connection's other sends, and resolves with
+/// its plaintext length.
+#[cfg(has_io_uring)]
+#[test]
+fn a_tls_send_chain_is_encrypted() {
+    let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
+    let (certs, key) = generate_self_signed();
+    let config = test_config_builder()
+        .tls(TlsConfig::new(server_tls_config(certs.clone(), key)))
+        .build()
+        .expect("valid config");
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind("127.0.0.1:0".parse().unwrap())
+        .launch::<TlsSendChain>()
+        .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
+    wait_for_server(&addr);
+
+    let (plaintext, peer_closed) = read_reply_until_close(&addr, &certs, Duration::ZERO);
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().expect("worker panicked").expect("worker failed");
+    }
+    let mut expected = b"before-chain-a-".to_vec();
+    expected.extend(std::iter::repeat_n(b'g', CHAIN_GUARD_LEN));
+    expected.extend_from_slice(b"--chain-b");
+    assert_eq!(plaintext, expected);
+    assert!(peer_closed, "no close_notify after the chain");
+}
+
 // ── Test 6: Server-initiated clean TLS close from on_tick (io_uring) ─────
 
 /// Where `on_accept` parks the connection's `ConnToken` for `on_tick` to close.

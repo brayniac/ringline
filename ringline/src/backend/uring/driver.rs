@@ -1744,6 +1744,7 @@ impl Driver {
             capacity_released: &mut self.capacity_released,
             close_notify_timeout: self.close_notify_timeout,
             next_disk_io_seq: &mut self.next_disk_io_seq,
+            tls_chain_carried: false,
         }
     }
 
