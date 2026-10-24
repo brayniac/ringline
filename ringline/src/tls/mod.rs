@@ -36,7 +36,7 @@ use std::sync::Arc;
 use rustls::pki_types::ServerName;
 // Only the buffered engine constructs these directly; the unbuffered build
 // reaches rustls through `unbuffered::UnbufferedConn` instead.
-#[cfg(not(feature = "tls-unbuffered"))]
+#[cfg(feature = "tls-buffered")]
 use rustls::{ClientConnection, ServerConnection};
 
 #[allow(unused_imports)]
@@ -53,9 +53,9 @@ pub(crate) mod buffered;
 // The incoming-ciphertext buffer belongs to the unbuffered engine and has no
 // other consumer, so it shares the engine's gate; without it every item in the
 // module is dead code in a default build.
-#[cfg(feature = "tls-unbuffered")]
+#[cfg(not(feature = "tls-buffered"))]
 mod ciphertext;
-#[cfg(feature = "tls-unbuffered")]
+#[cfg(not(feature = "tls-buffered"))]
 pub(crate) mod unbuffered;
 
 // Glob re-export keeps call sites at `crate::tls::*`. Both backends' shared
@@ -91,19 +91,7 @@ impl TlsInfo {
         self.alpn_protocol.as_deref()
     }
 
-    /// The SNI hostname the peer requested, if any.
-    ///
-    /// **Known limitation:** on a server connection driven by the
-    /// `tls-unbuffered` engine, this is always `None`. rustls does not
-    /// expose an equivalent of `ServerConnection::server_name()` on
-    /// `UnbufferedServerConnection` (verified against rustls 0.23.41 —
-    /// `server_name()` lives only on the handshake-callback `ClientHello`
-    /// type and on the buffered `ServerConnection`; `UnbufferedServerConnection`
-    /// derefs only as far as `CommonState`, which doesn't carry it either).
-    /// Buffered connections are unaffected. Recovering SNI for the
-    /// unbuffered engine would need a `ClientHello` callback on
-    /// `ServerConfig` to capture it at handshake time and stash it on
-    /// `TlsConn` — tracked as follow-on work, not yet implemented.
+    /// The SNI hostname the peer requested, if any, on a server connection.
     pub fn sni_hostname(&self) -> Option<&str> {
         self.sni_hostname.as_deref()
     }
@@ -118,9 +106,9 @@ impl TlsInfo {
 pub enum TlsConnKind {
     /// Never constructed in a `tls-unbuffered` build — see
     /// [`buffered::BufferedKind`] for why the allow is scoped this narrowly.
-    #[cfg_attr(feature = "tls-unbuffered", allow(dead_code))]
+    #[cfg_attr(not(feature = "tls-buffered"), allow(dead_code))]
     Buffered(buffered::BufferedKind),
-    #[cfg(feature = "tls-unbuffered")]
+    #[cfg(not(feature = "tls-buffered"))]
     Unbuffered(unbuffered::UnbufferedConn),
 }
 
@@ -138,7 +126,7 @@ impl TlsConnKind {
     pub fn as_buffered_mut(&mut self) -> Option<&mut buffered::BufferedKind> {
         match self {
             Self::Buffered(k) => Some(k),
-            #[cfg(feature = "tls-unbuffered")]
+            #[cfg(not(feature = "tls-buffered"))]
             Self::Unbuffered(_) => None,
         }
     }
@@ -150,7 +138,7 @@ impl TlsConnKind {
     /// unreachable in practice today. It is still spelled out rather than
     /// assumed: that build keeps both variants, and both backend dispatchers
     /// route on the engine tag rather than on the feature alone.
-    #[cfg(feature = "tls-unbuffered")]
+    #[cfg(not(feature = "tls-buffered"))]
     pub fn as_unbuffered_mut(&mut self) -> Option<&mut unbuffered::UnbufferedConn> {
         match self {
             Self::Buffered(_) => None,
@@ -165,7 +153,7 @@ impl TlsConnKind {
     pub fn is_unbuffered(&self) -> bool {
         match self {
             Self::Buffered(_) => false,
-            #[cfg(feature = "tls-unbuffered")]
+            #[cfg(not(feature = "tls-buffered"))]
             Self::Unbuffered(_) => true,
         }
     }
@@ -173,7 +161,7 @@ impl TlsConnKind {
     pub fn wants_write(&self) -> bool {
         match self {
             Self::Buffered(k) => k.wants_write(),
-            #[cfg(feature = "tls-unbuffered")]
+            #[cfg(not(feature = "tls-buffered"))]
             Self::Unbuffered(c) => c.kind().wants_write(),
         }
     }
@@ -181,7 +169,7 @@ impl TlsConnKind {
     pub fn is_handshaking(&self) -> bool {
         match self {
             Self::Buffered(k) => k.is_handshaking(),
-            #[cfg(feature = "tls-unbuffered")]
+            #[cfg(not(feature = "tls-buffered"))]
             Self::Unbuffered(c) => c.kind().is_handshaking(),
         }
     }
@@ -189,7 +177,7 @@ impl TlsConnKind {
     pub fn alpn_protocol(&self) -> Option<&[u8]> {
         match self {
             Self::Buffered(k) => k.alpn_protocol(),
-            #[cfg(feature = "tls-unbuffered")]
+            #[cfg(not(feature = "tls-buffered"))]
             Self::Unbuffered(c) => c.kind().alpn_protocol(),
         }
     }
@@ -197,7 +185,7 @@ impl TlsConnKind {
     pub fn negotiated_cipher_suite(&self) -> Option<rustls::SupportedCipherSuite> {
         match self {
             Self::Buffered(k) => k.negotiated_cipher_suite(),
-            #[cfg(feature = "tls-unbuffered")]
+            #[cfg(not(feature = "tls-buffered"))]
             Self::Unbuffered(c) => c.kind().negotiated_cipher_suite(),
         }
     }
@@ -205,24 +193,18 @@ impl TlsConnKind {
     pub fn protocol_version(&self) -> Option<rustls::ProtocolVersion> {
         match self {
             Self::Buffered(k) => k.protocol_version(),
-            #[cfg(feature = "tls-unbuffered")]
+            #[cfg(not(feature = "tls-buffered"))]
             Self::Unbuffered(c) => c.kind().protocol_version(),
         }
     }
 
-    /// The SNI hostname the peer requested, if any.
-    ///
-    /// Unbuffered server connections always report `None` here — see
-    /// [`unbuffered::UnbufferedKind::sni_hostname`] for why no equivalent to
-    /// `ServerConnection::server_name()` is reachable from
-    /// `UnbufferedServerConnection`. This is a real, documented limitation
-    /// of the unbuffered engine (tracked on [`TlsInfo::sni_hostname`]), not
-    /// a bug in this accessor — the buffered path is unaffected.
+    /// The SNI hostname the peer requested, if any. The unbuffered engine
+    /// captures it from the ClientHello (see `unbuffered::sni`).
     pub fn sni_hostname(&self) -> Option<&str> {
         match self {
             Self::Buffered(k) => k.sni_hostname(),
-            #[cfg(feature = "tls-unbuffered")]
-            Self::Unbuffered(c) => c.kind().sni_hostname(),
+            #[cfg(not(feature = "tls-buffered"))]
+            Self::Unbuffered(c) => c.sni_hostname(),
         }
     }
 
@@ -353,7 +335,7 @@ pub(crate) fn plaintext_per_record(max_fragment_size: Option<usize>) -> usize {
 /// answers in this area already.
 /// Only the unbuffered engine sizes encryption chunks against a destination,
 /// so it is the only caller; gated rather than `allow(dead_code)`d.
-#[cfg(feature = "tls-unbuffered")]
+#[cfg(not(feature = "tls-buffered"))]
 pub(crate) fn negotiated_record_overhead(conn: &TlsConnKind) -> usize {
     match conn.protocol_version() {
         Some(rustls::ProtocolVersion::TLSv1_3) => TLS_RECORD_HEADER_LEN + 1 + 16,
@@ -523,6 +505,16 @@ impl TlsTable {
     ) -> Self {
         let mut conns = Vec::with_capacity(max_connections as usize);
         conns.resize_with(max_connections as usize, || None);
+        // The unbuffered engine learns the SNI hostname through the
+        // certificate resolver; see `unbuffered::sni`.
+        #[cfg(not(feature = "tls-buffered"))]
+        let (server_config, listener_configs) = (
+            server_config.map(|c| unbuffered::sni::capture_server_names(&c)),
+            listener_configs
+                .into_iter()
+                .map(|c| c.map(|c| unbuffered::sni::capture_server_names(&c)))
+                .collect(),
+        );
         TlsTable {
             conns,
             server_config,
@@ -574,9 +566,9 @@ impl TlsTable {
         // Read before the config is moved into the connection, and before any
         // engine selection: the value is the same either way.
         let max_plaintext_per_record = plaintext_per_record(server_config.max_fragment_size);
-        #[cfg(feature = "tls-unbuffered")]
+        #[cfg(not(feature = "tls-buffered"))]
         let conn = TlsConnKind::Unbuffered(unbuffered::UnbufferedConn::new_server(server_config)?);
-        #[cfg(not(feature = "tls-unbuffered"))]
+        #[cfg(feature = "tls-buffered")]
         let conn = TlsConnKind::Buffered(buffered::BufferedKind::Server(ServerConnection::new(
             server_config,
         )?));
@@ -603,12 +595,12 @@ impl TlsTable {
             .expect("create_client() called without client_config")
             .clone();
         let max_plaintext_per_record = plaintext_per_record(client_config.max_fragment_size);
-        #[cfg(feature = "tls-unbuffered")]
+        #[cfg(not(feature = "tls-buffered"))]
         let conn = TlsConnKind::Unbuffered(unbuffered::UnbufferedConn::new_client(
             client_config,
             server_name,
         )?);
-        #[cfg(not(feature = "tls-unbuffered"))]
+        #[cfg(feature = "tls-buffered")]
         let conn = TlsConnKind::Buffered(buffered::BufferedKind::Client(ClientConnection::new(
             client_config,
             server_name,
@@ -740,7 +732,7 @@ impl TlsTable {
         let Some(tls_conn) = self.get_mut(conn_index) else {
             return;
         };
-        #[cfg(feature = "tls-unbuffered")]
+        #[cfg(not(feature = "tls-buffered"))]
         {
             // `queue_close_notify` signals "nothing to queue" by leaving
             // `scratch` untouched, not by an error or a count. Anything rustls
@@ -766,7 +758,7 @@ impl TlsTable {
         }
         // Bound as `b`, not `buffered`: the module of that name is used on the
         // next line, and a value/module name collision here reads as a bug.
-        #[cfg(not(feature = "tls-unbuffered"))]
+        #[cfg(feature = "tls-buffered")]
         if let Some(b) = tls_conn.conn.as_buffered_mut() {
             b.send_close_notify();
             tls_conn.close_notify_sent = true;
@@ -939,7 +931,7 @@ mod tests {
         table.create(0, None).expect("create a server connection");
         let conn = table.get_mut(0).expect("connection exists");
 
-        #[cfg(feature = "tls-unbuffered")]
+        #[cfg(not(feature = "tls-buffered"))]
         {
             assert!(
                 conn.conn.as_unbuffered_mut().is_some(),
@@ -947,7 +939,7 @@ mod tests {
             );
             assert!(conn.conn.as_buffered_mut().is_none());
         }
-        #[cfg(not(feature = "tls-unbuffered"))]
+        #[cfg(feature = "tls-buffered")]
         assert!(
             conn.conn.as_buffered_mut().is_some(),
             "default build must select the buffered engine"
@@ -1204,9 +1196,9 @@ mod tests {
         let table = table_with_server(None);
         let cap = table.ciphertext_capacity(0, 16384 * 4).unwrap();
 
-        #[cfg(feature = "tls-unbuffered")]
+        #[cfg(not(feature = "tls-buffered"))]
         assert_eq!(cap.slots(16448 * 4), cap.slots_unbuffered(16448 * 4));
-        #[cfg(not(feature = "tls-unbuffered"))]
+        #[cfg(feature = "tls-buffered")]
         assert_eq!(cap.slots(16448 * 4), cap.slots_buffered(16448 * 4));
 
         // The two disagree at this slot size, so the assertion above is not

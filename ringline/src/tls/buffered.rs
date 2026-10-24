@@ -6,7 +6,7 @@
 // statement out nine times. On mio this is invisible (`lib.rs` masks the whole
 // `tls` module); a Linux io_uring build with the feature is what fails
 // `-D warnings` without it.
-#![cfg_attr(feature = "tls-unbuffered", allow(dead_code))]
+#![cfg_attr(not(feature = "tls-buffered"), allow(dead_code))]
 
 #[allow(unused_imports)]
 use std::io::{self, Read as _, Write as _};
@@ -37,7 +37,7 @@ use super::*;
 /// anyway: these two constructors are the root of why the rest of the module
 /// is unselected, so the statement belongs on them even if the file-level
 /// attribute is what silences the lint.
-#[cfg_attr(feature = "tls-unbuffered", allow(dead_code))]
+#[cfg_attr(not(feature = "tls-buffered"), allow(dead_code))]
 pub enum BufferedKind {
     Server(ServerConnection),
     Client(ClientConnection),

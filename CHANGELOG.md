@@ -249,6 +249,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Breaking:** the unbuffered TLS engine (rustls' unbuffered API) is the
+  default on both backends. The new `tls-buffered` feature selects the
+  buffered engine; `tls-unbuffered` has no effect and is kept so builds that
+  name it still resolve. Application data costs the same copies on both
+  engines. The unbuffered engine now reports the SNI hostname
+  (`TlsInfo::sni_hostname`): ringline clones each server config and wraps
+  its certificate resolver to record the name the ClientHello carries, so a
+  `ServerConfig` passed in is not the one the connection uses. At the
+  default send-pool slot (16448 bytes) a 16 KiB send is one record on both
+  engines.
 - io_uring: a TLS connection's ring receive is armed when a read parks once
   its handshake is done, as a plaintext connection's direct receive is, so a
   task that does not read stops its peer instead of buffering up to

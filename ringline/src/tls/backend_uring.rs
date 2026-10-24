@@ -41,12 +41,12 @@ use crate::handler::BuiltSend;
 
 use super::{PlaintextSink, TlsRecvResult, TlsTable};
 
-#[cfg(not(feature = "tls-unbuffered"))]
+#[cfg(feature = "tls-buffered")]
 use super::buffered;
 
-#[cfg(feature = "tls-unbuffered")]
+#[cfg(not(feature = "tls-buffered"))]
 use super::{build_pool_send, unbuffered};
-#[cfg(feature = "tls-unbuffered")]
+#[cfg(not(feature = "tls-buffered"))]
 use crate::completion::OpTag;
 
 /// Copy `ciphertext` into pool slots and append the resulting sends to `out`,
@@ -65,7 +65,7 @@ use crate::completion::OpTag;
 /// success, for the same reason.
 ///
 /// An empty `ciphertext` appends nothing and succeeds.
-#[cfg(feature = "tls-unbuffered")]
+#[cfg(not(feature = "tls-buffered"))]
 pub(super) fn ciphertext_to_sends(
     pool: &mut SendCopyPool,
     conn_index: u32,
@@ -125,7 +125,7 @@ pub fn feed_tls_recv(
     ciphertext: &[u8],
     out_sends: &mut Vec<BuiltSend>,
 ) -> TlsRecvResult {
-    #[cfg(feature = "tls-unbuffered")]
+    #[cfg(not(feature = "tls-buffered"))]
     {
         let mut sink = sink;
         let Some(tls_conn) = tls_table.get_mut(conn_index) else {
@@ -155,7 +155,7 @@ pub fn feed_tls_recv(
             unbuffered::DriveOutcome::Error(e) => TlsRecvResult::Error(e),
         }
     }
-    #[cfg(not(feature = "tls-unbuffered"))]
+    #[cfg(feature = "tls-buffered")]
     buffered::feed_tls_recv_buffered(
         tls_table,
         sink,
@@ -179,7 +179,7 @@ pub fn flush_tls_output(
     generation: u32,
     out_sends: &mut Vec<BuiltSend>,
 ) -> bool {
-    #[cfg(feature = "tls-unbuffered")]
+    #[cfg(not(feature = "tls-buffered"))]
     {
         let Some(tls_conn) = tls_table.get_mut(conn_index) else {
             return true;
@@ -195,7 +195,7 @@ pub fn flush_tls_output(
         }
         ciphertext_to_sends(send_copy_pool, conn_index, generation, &scratch, out_sends)
     }
-    #[cfg(not(feature = "tls-unbuffered"))]
+    #[cfg(feature = "tls-buffered")]
     buffered::flush_tls_output_buffered(
         tls_table,
         send_copy_pool,
@@ -226,7 +226,7 @@ pub fn encrypt_to_sends(
     generation: u32,
     plaintext: &[u8],
 ) -> io::Result<Vec<BuiltSend>> {
-    #[cfg(feature = "tls-unbuffered")]
+    #[cfg(not(feature = "tls-buffered"))]
     {
         let tls_conn = tls_table.get_mut(conn_index).ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotConnected, "no TLS state for connection")
@@ -283,7 +283,7 @@ pub fn encrypt_to_sends(
         }
         Ok(built)
     }
-    #[cfg(not(feature = "tls-unbuffered"))]
+    #[cfg(feature = "tls-buffered")]
     buffered::encrypt_to_sends_buffered(
         tls_table,
         send_copy_pool,
@@ -295,14 +295,14 @@ pub fn encrypt_to_sends(
 
 /// Return every slot in `filled` to the pool. Error paths only: a slot that
 /// never becomes an SQE has no CQE coming to release it.
-#[cfg(feature = "tls-unbuffered")]
+#[cfg(not(feature = "tls-buffered"))]
 fn release_all(pool: &mut SendCopyPool, filled: &[(u16, u32)]) {
     for &(slot, _) in filled {
         pool.release(slot);
     }
 }
 
-#[cfg(all(test, feature = "tls-unbuffered"))]
+#[cfg(all(test, not(feature = "tls-buffered")))]
 mod tests {
     use super::*;
 
