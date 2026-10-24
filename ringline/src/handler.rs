@@ -4476,7 +4476,8 @@ pub struct SendChainBuilder<'b, 'a> {
     error: Option<io::Error>,
     finished: bool,
     /// Carried by `finish` into the chain's `ChainState`; on a TLS connection,
-    /// `finish_tls` attaches it to the last ciphertext send.
+    /// `finish_tls` passes it to `attach_send_id` with the last ciphertext
+    /// send.
     send_id: Option<crate::runtime::send_completion::SendId>,
 }
 

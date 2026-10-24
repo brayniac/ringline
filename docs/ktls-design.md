@@ -701,11 +701,9 @@ Under kTLS:
   kTLS), which is scope, not a freebie.
 - **`send_chain` encrypts in userspace on a TLS connection.** The builder
   gathers the parts, and `SendChainBuilder::finish_tls` encrypts them and
-  queues the records. `finish_tls` encrypts through `encrypt_tls_send`, the
-  same path as `send`, and `send_chain` takes its TLS branch on the same
-  `tls_table` membership check as `send`, so a kTLS change at either point
-  covers both. Under kTLS the chain must send the plaintext: ciphertext
-  written to a kTLS socket is encrypted again by the kernel.
+  queues the records; `finish_tls` encrypts through `encrypt_tls_send`, the
+  function `send` uses. Under kTLS the chain must send the plaintext:
+  ciphertext written to a kTLS socket is encrypted again by the kernel.
 
 **No new public config surface is proposed.** Following the unbuffered
 engine's precedent: a default-off cargo feature, decided later.
