@@ -122,7 +122,7 @@ task-waker scheme are shared. The I/O mechanisms are not:
 | Concern | io_uring | Mio |
 | --- | --- | --- |
 | Socket readiness/completion | CQEs identified by `UserData` and `OpTag` | `mio::Poll` readable/writable events |
-| TCP receive | Plaintext: one-shot receive into the connection's accumulator, and a `POLLRDHUP` poll for the peer's close. TLS: one-shot receive with provided buffers, armed when a read parks after the handshake, and a `POLLRDHUP` poll | Readiness read into owned memory |
+| TCP receive | Plaintext: one-shot receive into the connection's accumulator, and a `POLLRDHUP` poll for the peer's close. TLS: one-shot receive with provided buffers, after the handshake armed when a read parks, and a `POLLRDHUP` poll | Readiness read into owned memory |
 | File descriptors | Fixed-file table for connections | Registered ordinary sockets |
 | Sends | Copy pool plus guarded `SendMsgZc` scatter/gather | Owned/copy pending-send buffers |
 | Send retry | CQE handling, retry lists, and drain sends after `EAGAIN` | Writable readiness and dirty lists |

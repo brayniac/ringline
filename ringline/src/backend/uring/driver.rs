@@ -277,12 +277,11 @@ impl Driver {
     }
 
     /// Arm a TLS connection's ring receive if no receive is armed, the
-    /// connection is open and reading, and it is not throttled, starved or
-    /// pending a park. Once its
-    /// handshake is done, a TLS connection's receive is armed this way by a
-    /// parked read (`park_recv`), by a segment reader or Mode A forward
-    /// entering the segmented domain or waiting on its hold, and by its hangup
-    /// poll, not after every completion. A failed push goes to
+    /// connection is open and reading, it is not throttled or starved, and no
+    /// park is pending. Once its handshake is done, a TLS connection's receive
+    /// is armed this way by a parked read (`park_recv`), by a segment reader or
+    /// Mode A forward entering the segmented domain or waiting on its hold, and
+    /// by its hangup poll, not after every completion. A failed push goes to
     /// `recv_rearm_retries`.
     pub(crate) fn arm_tls_recv_if_idle(&mut self, conn_index: u32) {
         let ci = conn_index as usize;

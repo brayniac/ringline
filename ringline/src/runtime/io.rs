@@ -642,9 +642,11 @@ impl<T: 'static> Future for BlockingJoinHandle<T> {
 /// ring. During the handshake a receive is re-armed after each completion.
 /// After it, a receive is armed when a read parks, as on a plaintext
 /// connection. When the `POLLRDHUP` poll fires because the peer sent a FIN or
-/// reset while nothing reads, the runtime arms one, so the receive reads the
-/// close_notify, or returns 0 at the FIN. A close_notify sent without a FIN is
-/// read when a read parks. On mio every connection reads into its accumulator.
+/// reset while nothing reads, the runtime arms one and re-arms it after each
+/// completion until the receive reads the close_notify, returns 0 at the FIN,
+/// or fails. A close_notify sent without a FIN is read when a read parks, or
+/// after each completion in the segmented domain. On mio every connection
+/// reads into its accumulator.
 ///
 /// # Concurrency
 ///
@@ -2229,13 +2231,13 @@ impl ConnCtx {
     ///
     /// A plaintext source receives directly into its accumulator, and a TLS
     /// source's decrypted plaintext lands there too. The forward takes the
-    /// bytes the accumulator holds, up to what is left
-    /// of `len`, and sends them on the sink through the sink's send queue
-    /// under a guard: zero-copy at or above `send_zc_threshold`, copied into a
-    /// pool slot below it. One send is in flight at a time, and the source
-    /// receives the next chunk while it is. Because the sends go through the
-    /// sink's queue, they are ordered with other sends on the sink. A send the runtime
-    /// cannot submit, for example with the worker's send slab
+    /// bytes the accumulator holds, up to what is left of `len`, and sends
+    /// them on the sink through the sink's send queue under a guard: zero-copy
+    /// at or above `send_zc_threshold`, copied into a pool slot below it. One
+    /// send is in flight at a time, and the source receives the next chunk
+    /// while it is. Because the sends go through the sink's queue, they are
+    /// ordered with other sends on the sink. A send the runtime cannot submit,
+    /// for example with the worker's send slab
     /// ([`ConfigBuilder::send_slab_slots`](crate::ConfigBuilder::send_slab_slots))
     /// full, resolves the forward with that error and leaves the chunk
     /// buffered on the source. Dropping the future lets a chunk already
@@ -2710,7 +2712,8 @@ impl ConnCtx {
     /// [`connect`]). On a TLS connection the close takes effect when the
     /// receive reads the close_notify or the FIN; plaintext already decrypted
     /// stays readable. On io_uring, a close_notify the peer sends without a FIN
-    /// is read only when a read parks, so until then this returns `true`.
+    /// is read only when a read parks or while the connection is in the
+    /// segmented domain, so until then this returns `true`.
     pub fn is_alive(&self) -> bool {
         // `try_with_state`, not `with_state`: this is reachable from a `Drop`
         // that runs outside a task poll. A connection-bound task is dropped by

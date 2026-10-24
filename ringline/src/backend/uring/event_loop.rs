@@ -1442,9 +1442,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
         if !cs.recv_direct {
             // A TLS connection reads the rest of the stream through its ring
-            // receive, so the receive reads the close_notify, or returns 0 at
-            // the FIN: re-armed after every completion from here until the end
-            // is read.
+            // receive: re-armed after every completion from here until it reads
+            // the close_notify, returns 0 at the FIN, or fails.
             cs.hangup_seen = true;
             self.driver.arm_tls_recv_if_idle(conn_index);
             return;
