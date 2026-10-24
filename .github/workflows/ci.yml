@@ -104,6 +104,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.88
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --locked --all-features --all-targets
+      # `--all-features` selects the buffered TLS engine; check the default
+      # (unbuffered) engine at the MSRV too.
+      - run: cargo check --locked --all-targets
 
   doc:
     name: Doc
@@ -304,6 +307,7 @@ jobs:
           sudo prlimit --pid $$ --memlock=67108864:67108864
           cargo nextest run --locked --workspace --profile ci --features tls-buffered
           cargo test --locked --workspace --doc --features tls-buffered
+          cargo nextest run --locked --workspace --profile ci --features tls-buffered,force-mio
 
   test-macos:
     name: Test (macOS)

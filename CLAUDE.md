@@ -244,7 +244,7 @@ Ringline aims to minimize data copies on the hot path. Understanding where copie
 | Kernel → read buffer → RecvAccumulator (mio) | `read()` into a per-worker buffer, then `extend_from_slice()` | 1 |
 | Accumulator → `with_data()` callback | Borrowed `&[u8]` into accumulator | 0 |
 | Accumulator → `with_bytes()` callback | `BytesMut::freeze()` → `Bytes` (O(1)), slicing via `Bytes::slice()` is O(1) refcount | 0 |
-| TLS recv, unbuffered engine (default) | Ciphertext → ringline's `CiphertextBuf` (`append`); rustls decrypts in place there, then copies each record's plaintext into a new `Vec` (`take_received_plaintext`, one heap allocation per record); `ReadTraffic::next_record` lends that `Vec` and ringline copies it into the accumulator or an owned segment. Plus `CiphertextBuf::compact`: measured 0.94× the payload at 16 KiB records arriving in ≤16 KiB pieces, 0.02–0.04× at 1 KiB records | 3 + conditional |
+| TLS recv, unbuffered engine (default) | Ciphertext → ringline's `CiphertextBuf` (`append`); rustls decrypts in place there, then copies each record's plaintext into a new `Vec` (`take_received_plaintext`, one heap allocation per record); `ReadTraffic::next_record` lends that `Vec` and ringline copies it into the accumulator or an owned segment. Plus `CiphertextBuf::compact`: measured 0.94× the payload at 16 KiB records arriving in 16 KiB buffers, 0.02–0.04× at 1 KiB records | 3 + conditional |
 | TLS recv, buffered engine (`tls-buffered`) | Ciphertext → rustls' deframer buffer (`read_tls`); rustls decrypts in place, then copies each record's plaintext into a new `Vec` (`take_received_plaintext`); `drain_tls_plaintext` copies that into the accumulator, or into an owned segment in the segmented domain. Plus a ciphertext memmove in `DeframerVecBuffer::discard` of the bytes behind each processed record: measured 0.12× the payload at 16 KiB records, 2.3× at 1 KiB records | 3 + conditional |
 
 TLS recv costs 3 copies on both engines, measured with rustls 0.23.46 on both backends: ciphertext into a contiguous buffer (`CiphertextBuf`, or rustls' deframer buffer), decrypted plaintext into a per-record `Vec` (`CommonState::take_received_plaintext` → `Payload::into_vec`, where the payload is always `Borrowed`), and that `Vec` into the accumulator or an owned segment. The unbuffered engine decrypts in place, but `ReadTraffic::next_record` hands out the copied `Vec`, not the in-place plaintext. `note_copied` counts only ringline's own copy.
@@ -278,11 +278,13 @@ plaintext on both engines. An allocation counter inside the measured call agrees
 
 What the feature *does* deliver, measured in isolation on hv01 (Linux 6.12,
 rustc 1.98.1, io_uring): a small (~1–2%) send-side bookkeeping win at ≥64 KiB, a 4–8%
-recv-side win, and a systematic **extra TLS record** whenever the payload is a
-multiple of `send_copy_slot_size` (the buffered path lets `PoolWriter` straddle
-one 16406-byte record across two slots; the unbuffered path must fit a whole
-record inside one slot, so it emits two) — worth +5.7% on a 16 KiB send. It
-remains the prerequisite for kTLS. See
+recv-side win, and, at a 16384-byte `send_copy_slot_size`, an **extra TLS
+record** whenever the payload is a multiple of the slot size (the buffered path
+lets `PoolWriter` straddle one 16406-byte record across two slots; the
+unbuffered path must fit a whole record inside one slot, so it emits two) —
+worth +5.7% on a 16 KiB send. The default slot (16448 bytes) holds a whole
+record, so at the default both engines emit one record per 16 KiB. It remains
+the prerequisite for kTLS. See
 [docs/tls-unbuffered-design.md](docs/tls-unbuffered-design.md) and
 [docs/journal/2026-09-unbuffered-tls.md](docs/journal/2026-09-unbuffered-tls.md).
 
@@ -314,7 +316,7 @@ Minimal — `with_data()` recv (pattern-match `PONG\r\n`, no value extraction), 
 
 ### Copy Semantics Design Principles
 
-1. **Recv buffer ownership**: On io_uring a plaintext connection's receive writes into its `RecvAccumulator` directly (0 copies). A TLS connection's ciphertext lands in a `ProvidedBufRing` buffer and rustls copies the plaintext into the accumulator (1 copy). On mio, `read()` fills a per-worker buffer that is appended to the accumulator (1 copy). After that, `with_bytes()` enables zero-copy parsing via `Bytes::slice()`. `with_data()` requires the parser to copy out any data it needs to keep.
+1. **Recv buffer ownership**: On io_uring a plaintext connection's receive writes into its `RecvAccumulator` directly (0 copies). A TLS connection's ciphertext lands in a `ProvidedBufRing` buffer, and a TLS receive costs 3 copies per received byte (see the table). On mio, `read()` fills a per-worker buffer that is appended to the accumulator (1 copy). After that, `with_bytes()` enables zero-copy parsing via `Bytes::slice()`. `with_data()` requires the parser to copy out any data it needs to keep.
 
 2. **Send buffer ownership**: Ringline must own all memory referenced by SQEs (the submission must outlive the syscall). `SendCopyPool` provides pre-allocated slots for this. `SendGuard` is the escape hatch for zero-copy — it pins user memory and holds it alive until the kernel confirms completion.
 

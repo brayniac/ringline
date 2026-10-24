@@ -1432,7 +1432,7 @@ impl AsyncEventHandler for TlsTickCloseHandler {
 /// unbuffered one encrypts it through `WriteTraffic::queue_close_notify`), so
 /// this is the guard on `TlsTable::send_close_notify_queued` dispatching by
 /// engine at all — it must pass in the default build and under
-/// `--features tls-unbuffered`.
+/// `--features tls-buffered`.
 ///
 /// **io_uring only, and `DriverCtx::close` specifically.** That is the
 /// handler-facing close reachable from `on_tick`/`on_notify` against any live

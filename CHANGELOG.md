@@ -256,9 +256,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   engines. The unbuffered engine now reports the SNI hostname
   (`TlsInfo::sni_hostname`): ringline clones each server config and wraps
   its certificate resolver to record the name the ClientHello carries, so a
-  `ServerConfig` passed in is not the one the connection uses. At the
-  default send-pool slot (16448 bytes) a 16 KiB send is one record on both
-  engines.
+  `ServerConfig` passed in is not the one the connection uses. On the
+  unbuffered engine a TLS record cannot span send-pool slots: a bounded send
+  (`send_backpressured`) on a TLS connection is refused when
+  `send_copy_slot_size` is below one whole record (16413 bytes at the
+  default fragment size), and below that size plain TLS sends emit one
+  record per slot. The default slot (16448 bytes) holds one whole record.
+  `send_copy_slot_size` below 64 is rejected at build time when TLS is
+  configured. On io_uring, handshake output pays one more copy than on the
+  buffered engine.
 - io_uring: a TLS connection's ring receive is armed when a read parks once
   its handshake is done, as a plaintext connection's direct receive is, so a
   task that does not read stops its peer instead of buffering up to

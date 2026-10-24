@@ -530,16 +530,18 @@ buffer" and "these bytes are ready" events. Only the transport differs
 (`BuiltSend` + SQE vs. direct `TcpStream` write), mirroring how `encrypt_to_sends`
 and `encrypt_for_send_mio` split today.
 
-## Path selection (provisional)
+## Path selection
 
 Both engines compile; a connection uses one for its lifetime, chosen at
 `TlsTable::create` time.
 
-**Provisional mechanism: a cargo feature `tls-unbuffered`, default off.** It adds
-no public config surface, lets CI build and test both, and leaves the eventual
-decision cheap — flip the default, or delete `buffered.rs`.
+**Mechanism: the unbuffered engine is the default; the `tls-buffered` cargo
+feature selects the buffered one.** It adds no public config surface and lets CI
+build and test both. The engine was first a default-off `tls-unbuffered`
+feature; that feature now has no effect. A default feature could not be turned
+off across the workspace, because dependent crates enable ringline's defaults.
 
-This is explicitly the deferred decision. Alternatives, for when it is taken:
+The alternatives considered:
 
 - **Feature flag** (above) — no public surface, but every TLS fix lands twice
   while both exist.
@@ -719,3 +721,4 @@ offload, which is where the *remaining* copy goes.
    rig sweep shows the cap binding.
 3. **Does the buffered path stay as the mio default** while the unbuffered path
    proves out on the rig, or do both backends switch together?
+   **Resolved:** both backends switched together.
